@@ -298,12 +298,12 @@ class ModelAnalyzer:
         with open(output_dir / 'speed_benchmark.json', 'w') as f:
             json.dump(speed_results, f, indent=2)
 
-        # Generation samples
-        print(f"  Generating samples (max {self.gen_tokens} tokens)...")
+        # Generation samples (streaming output)
+        print(f"\n  ┌─ Generation Samples (max {self.gen_tokens} tokens) ────────────────────────")
         samples = self._generate_samples(max_new_tokens=self.gen_tokens)
         results['generation'] = samples
 
-        # Group by category
+        # Group by category for file output
         categories = {}
         for s in samples:
             cat = s['category']
@@ -311,26 +311,12 @@ class ModelAnalyzer:
                 categories[cat] = []
             categories[cat].append(s)
 
-        print(f"\n  ┌─ Generation Samples ─────────────────────────────────────────────────────")
-        for category, cat_samples in categories.items():
-            print(f"  │")
-            print(f"  │ [{category.upper()}]")
-            for s in cat_samples:
-                # Truncate long outputs for display
-                gen_display = s['generated']
-                if len(gen_display) > 100:
-                    gen_display = gen_display[:100] + "..."
-                print(f"  │   Prompt: \"{s['prompt']}\"")
-                print(f"  │   → {gen_display}")
-                print(f"  │   ({s['new_tokens']} tokens, {s['time_ms']:.0f}ms, {s['tokens_per_sec']:.1f} tok/s)")
-        print(f"  │")
-
         # Summary stats
         total_tokens = sum(s['new_tokens'] for s in samples)
         total_time = sum(s['time_ms'] for s in samples)
         avg_speed = total_tokens / (total_time / 1000) if total_time > 0 else 0
-        print(f"  │ Summary: {len(samples)} prompts, {total_tokens} tokens generated")
-        print(f"  │          Avg speed: {avg_speed:.1f} tokens/sec")
+        print(f"  ├─────────────────────────────────────────────────────────────────────────────")
+        print(f"  │ Summary: {len(samples)} prompts, {total_tokens} tokens, avg {avg_speed:.1f} tok/s")
         print(f"  └─────────────────────────────────────────────────────────────────────────────\n")
 
         with open(output_dir / 'generation_samples.json', 'w') as f:
@@ -390,7 +376,7 @@ class ModelAnalyzer:
         }
 
     def _generate_samples(self, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 50) -> List[Dict]:
-        """Generate text samples with top-k sampling."""
+        """Generate text samples with top-k sampling and streaming output."""
         import time
         import torch.nn.functional as F
 
@@ -435,6 +421,9 @@ class ModelAnalyzer:
                 generated = input_ids.clone()
                 prompt_len = input_ids.shape[1]
 
+                # Print prompt with streaming indicator
+                print(f"  [{category}] {prompt}", end="", flush=True)
+
                 with torch.no_grad():
                     for _ in range(max_new_tokens):
                         output = self.model(generated, attention_mask=None)
@@ -450,6 +439,10 @@ class ModelAnalyzer:
                         next_token = torch.multinomial(probs, num_samples=1)
                         generated = torch.cat([generated, next_token], dim=1)
 
+                        # Print token as it's generated (streaming)
+                        token_text = self.tokenizer.decode([next_token.item()])
+                        print(token_text, end="", flush=True)
+
                         # Stop if EOS token generated
                         if next_token.item() == eos_token_id:
                             break
@@ -457,6 +450,9 @@ class ModelAnalyzer:
                 elapsed = time.perf_counter() - start_time
                 generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
                 new_tokens = generated.shape[1] - prompt_len
+
+                # End line with stats
+                print(f"  ({new_tokens} tok, {elapsed*1000:.0f}ms)", flush=True)
 
                 results.append({
                     'category': category,
