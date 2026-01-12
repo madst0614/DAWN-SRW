@@ -704,4 +704,14 @@ class BehavioralAnalyzer(BaseAnalyzer):
             print(f"  ERROR in visualization: {e}", flush=True)
             traceback.print_exc()
 
+        # Save results to JSON
+        import json
+        results_path = os.path.join(output_dir, 'behavioral_results.json')
+        try:
+            with open(results_path, 'w') as f:
+                json.dump(results, f, indent=2, default=str)
+            print(f"  Results saved to: {results_path}", flush=True)
+        except Exception as e:
+            print(f"  ERROR saving results: {e}", flush=True)
+
         return results
