@@ -765,14 +765,48 @@ class ModelAnalyzer:
         )
         results = analyzer.run_all(str(output_dir), pool_type=pool_type, max_sentences=max_sentences)
 
-        # Print summary
+        # Print detailed summary
+        pos_counts = results.get('pos_token_counts', {})
+        top_neurons = results.get('top_neurons_per_pos', {})
         specificity = results.get('neuron_specificity', {})
+
+        if pos_counts:
+            print(f"\n  ┌─ POS Token Distribution ───────────────────────────────────────────────")
+            total_tokens = sum(pos_counts.values())
+            print(f"  │ Total tokens analyzed: {total_tokens:,}")
+            print(f"  │")
+            # Sort by count and show top POS
+            sorted_pos = sorted(pos_counts.items(), key=lambda x: x[1], reverse=True)
+            print(f"  │ {'POS':<10} {'Count':>10} {'Ratio':>10}")
+            print(f"  │ {'─'*30}")
+            for pos, count in sorted_pos[:10]:
+                ratio = count / total_tokens * 100 if total_tokens > 0 else 0
+                print(f"  │ {pos:<10} {count:>10,} {ratio:>9.1f}%")
+            if len(sorted_pos) > 10:
+                print(f"  │ ... and {len(sorted_pos) - 10} more POS tags")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if top_neurons:
+            print(f"\n  ┌─ Top Neurons per POS ──────────────────────────────────────────────────")
+            print(f"  │ {'POS':<10} {'Top Neurons (id:freq)':<50}")
+            print(f"  │ {'─'*60}")
+            for pos in ['NOUN', 'VERB', 'ADJ', 'ADV', 'DET', 'PUNCT']:
+                if pos in top_neurons and top_neurons[pos]:
+                    neurons = top_neurons[pos][:5]
+                    neuron_str = ', '.join(f'{n}:{f:.2f}' for n, f in neurons)
+                    print(f"  │ {pos:<10} {neuron_str}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
         if specificity:
-            top_specific = list(specificity.items())[:5]
-            print(f"\n  ┌─ Top POS-Specific Neurons ───────────")
+            print(f"\n  ┌─ POS-Specific Neurons (High Selectivity) ──────────────────────────────")
+            top_specific = list(specificity.items())[:10]
+            print(f"  │ {'Neuron':<10} {'Top POS':<10} {'Score':>10} {'Specificity':>12}")
+            print(f"  │ {'─'*42}")
             for neuron_id, data in top_specific:
-                print(f"  │ N{neuron_id}: {data['top_pos']} (specificity={data['specificity']:.3f})")
-            print(f"  └───────────────────────────────────────\n")
+                print(f"  │ N{neuron_id:<9} {data['top_pos']:<10} {data['top_score']:>10.3f} {data['specificity']:>12.1f}x")
+            print(f"  │")
+            print(f"  │ Total specific neurons: {len(specificity)}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['pos'] = results
         return results
@@ -870,28 +904,61 @@ class ModelAnalyzer:
         probing = results.get('probing', {})
 
         if trajectory and 'error' not in trajectory:
-            print(f"\n  ┌─ Token Trajectory Analysis ────────────────────────────────────────────")
+            print(f"\n  ┌─ Token Trajectory (Entropy by Position) ─────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Early (<10)':<12} {'Late (≥10)':<12} {'Δ Change':<12}")
+            print(f"  │ {'─'*48}")
             for pool, data in trajectory.items():
                 if isinstance(data, dict) and 'early_avg' in data:
                     display = data.get('display', pool)
-                    print(f"  │ {display}: early={data['early_avg']:.1f}%, late={data['late_avg']:.1f}%")
+                    early = data['early_avg']
+                    late = data['late_avg']
+                    delta = late - early
+                    sign = '+' if delta >= 0 else ''
+                    print(f"  │ {display:<12} {early:>10.1f}% {late:>10.1f}% {sign}{delta:>10.1f}%")
+            n_layers = trajectory.get('n_layers', 0)
+            if n_layers:
+                print(f"  │ {'─'*48}")
+                print(f"  │ Analyzed {n_layers} layers")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if probing and 'error' not in probing:
-            print(f"\n  ┌─ Probing Analysis ──────────────────────────────────────────────────────")
-            # Print overall stats
+            print(f"\n  ┌─ Probing Classifier (POS Prediction from Routing Weights) ───────────────")
             overall = probing.get('overall', {})
             if overall:
-                print(f"  │ Overall: mean={overall.get('mean_accuracy', 0)*100:.1f}%, "
-                      f"max={overall.get('max_accuracy', 0)*100:.1f}%, "
-                      f"classifiers={overall.get('n_classifiers', 0)}")
-            # Print per-routing summary
+                print(f"  │ Overall: {overall.get('n_classifiers', 0)} classifiers trained")
+                print(f"  │   Mean accuracy: {overall.get('mean_accuracy', 0)*100:.1f}% (±{overall.get('std_accuracy', 0)*100:.1f}%)")
+                print(f"  │   Range: {overall.get('min_accuracy', 0)*100:.1f}% ~ {overall.get('max_accuracy', 0)*100:.1f}%")
+
+            # Per-routing type summary
             summary = probing.get('summary', {})
             if summary:
                 print(f"  │")
-                for rkey, data in summary.items():
+                print(f"  │ {'Routing':<12} {'Mean Acc':<12} {'Max Acc':<12}")
+                print(f"  │ {'─'*36}")
+                for rkey, data in sorted(summary.items()):
                     if isinstance(data, dict) and 'mean_accuracy' in data:
-                        print(f"  │ {rkey}: mean={data['mean_accuracy']*100:.1f}%, max={data['max_accuracy']*100:.1f}%")
+                        print(f"  │ {rkey:<12} {data['mean_accuracy']*100:>10.1f}% {data['max_accuracy']*100:>10.1f}%")
+
+            # Best/worst layers
+            per_layer = probing.get('per_layer', {})
+            if per_layer:
+                layer_accs = []
+                for layer_key, layer_data in per_layer.items():
+                    accs = [d['accuracy'] for d in layer_data.values() if isinstance(d, dict) and 'accuracy' in d]
+                    if accs:
+                        layer_accs.append((layer_key, sum(accs)/len(accs)))
+                if layer_accs:
+                    layer_accs.sort(key=lambda x: x[1], reverse=True)
+                    print(f"  │")
+                    print(f"  │ Best layers:  {layer_accs[0][0]} ({layer_accs[0][1]*100:.1f}%)", end='')
+                    if len(layer_accs) > 1:
+                        print(f", {layer_accs[1][0]} ({layer_accs[1][1]*100:.1f}%)", end='')
+                    print()
+                    print(f"  │ Worst layers: {layer_accs[-1][0]} ({layer_accs[-1][1]*100:.1f}%)", end='')
+                    if len(layer_accs) > 1:
+                        print(f", {layer_accs[-2][0]} ({layer_accs[-2][1]*100:.1f}%)", end='')
+                    print()
+
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['behavioral'] = results
