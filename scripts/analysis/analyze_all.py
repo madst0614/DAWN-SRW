@@ -514,22 +514,22 @@ class ModelAnalyzer:
         # Diversity metrics
         if diversity:
             print(f"\n  ┌─ Diversity Metrics ────────────────────────────────────────────────────")
-            print(f"  │ {'Pool':<12} {'Entropy':>10} {'Max Entropy':>12} {'Eff. Neurons':>14} {'Utilization':>12}")
+            print(f"  │ {'Pool':<12} {'Entropy':>10} {'Norm. Ent':>12} {'Eff. Count':>14} {'Coverage':>12}")
             print(f"  │ {'─'*12} {'─'*10} {'─'*12} {'─'*14} {'─'*12}")
             for name, data in diversity.items():
                 if isinstance(data, dict) and 'entropy' in data:
-                    print(f"  │ {data.get('display', name):<12} {data['entropy']:>10.3f} {data.get('max_entropy', 0):>12.3f} "
-                          f"{data.get('effective_neurons', 0):>14.1f} {data.get('utilization', 0)*100:>11.1f}%")
+                    print(f"  │ {data.get('display', name):<12} {data['entropy']:>10.3f} {data.get('normalized_entropy', 0):>12.3f} "
+                          f"{data.get('effective_count', 0):>14.1f} {data.get('coverage', 0)*100:>11.1f}%")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         # Q/K overlap for v18.x
         if qk_overlap and 'error' not in qk_overlap:
             print(f"\n  ┌─ Q/K EMA Overlap (v18.x) ──────────────────────────────────────────────")
             for pool_name, overlap_data in qk_overlap.items():
-                if isinstance(overlap_data, dict):
+                if isinstance(overlap_data, dict) and 'q_only' in overlap_data:
                     print(f"  │ {pool_name}:")
-                    print(f"  │   Both Active: {overlap_data.get('both_active', 0):>6d}  |  Q-only: {overlap_data.get('q_only_active', 0):>6d}  |  K-only: {overlap_data.get('k_only_active', 0):>6d}")
-                    print(f"  │   Jaccard: {overlap_data.get('jaccard', 0):.3f}  |  Q Active: {overlap_data.get('q_active_ratio', 0)*100:.1f}%  |  K Active: {overlap_data.get('k_active_ratio', 0)*100:.1f}%")
+                    print(f"  │   Shared: {overlap_data.get('shared', 0):>6d}  |  Q-only: {overlap_data.get('q_only', 0):>6d}  |  K-only: {overlap_data.get('k_only', 0):>6d}  |  Dead: {overlap_data.get('dead', 0):>6d}")
+                    print(f"  │   Corr: {overlap_data.get('correlation', 0):.3f}  |  Jaccard: {overlap_data.get('jaccard', 0):.3f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['health'] = results
@@ -583,9 +583,18 @@ class ModelAnalyzer:
 
         if selection_div:
             print(f"\n  ┌─ Selection Diversity ─────────────────────────────────────────────────")
-            for pool, data in selection_div.items():
-                if isinstance(data, dict):
-                    print(f"  │ {pool}: gini={data.get('gini', 0):.3f}, effective={data.get('effective_neurons', 0):.0f}")
+            print(f"  │ {'Key':<20} {'Union':>8} {'Total':>8} {'Coverage':>10} {'Ratio':>8}")
+            print(f"  │ {'─'*20} {'─'*8} {'─'*8} {'─'*10} {'─'*8}")
+            for key, data in selection_div.items():
+                if isinstance(data, dict) and 'union_count' in data:
+                    print(f"  │ {data.get('display', key):<20} {data.get('union_count', 0):>8d} "
+                          f"{data.get('n_total', 0):>8d} {data.get('union_coverage', 0)*100:>9.1f}% "
+                          f"{data.get('diversity_ratio', 0):>8.2f}")
+            # Summary
+            summary = selection_div.get('summary', {})
+            if summary:
+                print(f"  │")
+                print(f"  │ Processed: {summary.get('n_batches_processed', 0)} batches, {summary.get('n_layers', 0)} layers")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if qk_overlap:
@@ -630,16 +639,18 @@ class ModelAnalyzer:
             print(f"  │ {'Pool':<12} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
             print(f"  │ {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*10}")
             for pool, data in sim.items():
-                if isinstance(data, dict) and 'mean' in data:
-                    print(f"  │ {pool:<12} {data['mean']:>10.4f} {data.get('std', 0):>10.4f} "
-                          f"{data.get('min', 0):>10.4f} {data.get('max', 0):>10.4f}")
+                if isinstance(data, dict) and 'avg_similarity' in data:
+                    print(f"  │ {data.get('display', pool):<12} {data['avg_similarity']:>10.4f} {data.get('std_similarity', 0):>10.4f} "
+                          f"{data.get('min_similarity', 0):>10.4f} {data.get('max_similarity', 0):>10.4f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if cross_sim:
             print(f"\n  ┌─ Cross-Type Similarity ────────────────────────────────────────────────")
-            for pair, data in cross_sim.items():
-                if isinstance(data, dict) and 'mean' in data:
-                    print(f"  │ {pair}: mean={data['mean']:.4f}, std={data.get('std', 0):.4f}")
+            for pair, value in cross_sim.items():
+                if isinstance(value, (int, float)):
+                    print(f"  │ {pair}: {value:.4f}")
+                elif isinstance(value, dict) and 'mean' in value:
+                    print(f"  │ {pair}: {value['mean']:.4f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if clustering:
