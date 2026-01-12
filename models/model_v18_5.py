@@ -1015,17 +1015,22 @@ class GlobalRouters(nn.Module):
         if self.training:
             self.neuron_router.update_usage(f_mask.float(), 'feature_know', attention_mask)
 
+        # Build routing info
+        know_info = {}
+
+        # Store weights for analysis
+        if self.store_pref_tensors:
+            know_info['feature_know_w'] = f_weights  # [B, S, N_feature_know]
+
         # Debug info
         if self.debug_mode:
             with torch.no_grad():
-                know_info = {
+                know_info.update({
                     'top_k': self.path_max_k * self.max_paths,
                     'selected_feature': f_mask.float().sum(dim=-1).mean().item(),
                     'tau_offset_feature': tau_offset_f.mean().item() if self.learnable_tau else 0.0,
                     'gstr_feature': torch.tanh((torch.exp(f_gate) - 1).max(dim=-1).values).mean().item(),
-                }
-        else:
-            know_info = {}
+                })
 
         return (f_paths, f_gstr), know_info, aux_loss  # f_gstr: list of [B, S, 1] per path
 
@@ -1102,8 +1107,14 @@ class GlobalRouters(nn.Module):
         if self.training:
             self.neuron_router.update_usage(mask.float(), 'restore_know', attention_mask)
 
-        # Debug info
+        # Build routing info
         routing_info = {}
+
+        # Store weights for analysis
+        if self.store_pref_tensors:
+            routing_info['restore_know_w'] = weights  # [B, S, N_restore_know]
+
+        # Debug info
         if self.debug_mode:
             with torch.no_grad():
                 selected = mask.float().sum(dim=-1).mean().item()

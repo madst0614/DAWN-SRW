@@ -1422,13 +1422,15 @@ class ModelAnalyzer:
                 traceback.print_exc()
                 self.results[name] = {'error': str(e)}
 
-        # Paper outputs
-        print(f"\n[{total_analyses+1}/{total_analyses+2}] PAPER")
-        self.generate_paper_outputs()
+        # Paper outputs (only if not filtering or 'paper' in filter)
+        if not only or 'paper' in only:
+            print(f"\n[{total_analyses+1}/{total_analyses+2}] PAPER")
+            self.generate_paper_outputs()
 
-        # Report
-        print(f"\n[{total_analyses+2}/{total_analyses+2}] REPORT")
-        self.generate_report()
+        # Report (only if not filtering or 'report' in filter)
+        if not only or 'report' in only:
+            print(f"\n[{total_analyses+2}/{total_analyses+2}] REPORT")
+            self.generate_report()
 
         # Final summary
         self._print_final_summary()

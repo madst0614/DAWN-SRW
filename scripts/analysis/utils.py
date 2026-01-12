@@ -699,21 +699,33 @@ class RoutingDataExtractor:
 
     def enable_weight_storage(self):
         """Enable weight tensor storage in routing_info."""
+        # v17.x style: model.router
         if hasattr(self.model, 'router'):
             router = self.model.router
             if hasattr(router, 'store_pref_tensors'):
                 router.store_pref_tensors = True
             if hasattr(router, 'neuron_router') and hasattr(router.neuron_router, 'store_pref_tensors'):
                 router.neuron_router.store_pref_tensors = True
+        # v18.x style: model.global_routers
+        if hasattr(self.model, 'global_routers'):
+            global_routers = self.model.global_routers
+            if hasattr(global_routers, 'store_pref_tensors'):
+                global_routers.store_pref_tensors = True
 
     def disable_weight_storage(self):
         """Disable weight tensor storage."""
+        # v17.x style: model.router
         if hasattr(self.model, 'router'):
             router = self.model.router
             if hasattr(router, 'store_pref_tensors'):
                 router.store_pref_tensors = False
             if hasattr(router, 'neuron_router') and hasattr(router.neuron_router, 'store_pref_tensors'):
                 router.neuron_router.store_pref_tensors = False
+        # v18.x style: model.global_routers
+        if hasattr(self.model, 'global_routers'):
+            global_routers = self.model.global_routers
+            if hasattr(global_routers, 'store_pref_tensors'):
+                global_routers.store_pref_tensors = False
 
     def analysis_context(self):
         """Context manager for analysis (enables/disables weight storage)."""
