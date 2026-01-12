@@ -191,17 +191,21 @@ class BehavioralAnalyzer(BaseAnalyzer):
         results['n_layers'] = len(layer_position_routing)
         return results
 
-    def run_probing(self, dataloader, max_batches: int = 50, layer_idx: int = None) -> Dict:
+    def run_probing(self, dataloader, max_batches: int = 50, layer_idx: int = None,
+                     max_samples_per_layer: int = 20000) -> Dict:
         """
-        Run probing classifier for POS prediction across ALL layers.
+        Memory-efficient probing classifier for POS prediction.
 
-        Uses routing weights to predict part-of-speech tags.
-        Optimized with vectorized tensor operations.
+        Optimizations:
+        - Single dataloader pass with per-layer sample limits
+        - Train and free memory per layer (not all at once)
+        - Skip layers that already have enough samples
 
         Args:
             dataloader: DataLoader for input data
             max_batches: Maximum batches to process
-            layer_idx: Specific layer to analyze (None = all layers aggregated)
+            layer_idx: Specific layer to analyze (None = all layers)
+            max_samples_per_layer: Max samples per layer (default 20k)
 
         Returns:
             Dictionary with probing accuracy per layer/routing key
@@ -209,9 +213,19 @@ class BehavioralAnalyzer(BaseAnalyzer):
         if not HAS_SKLEARN:
             return {'error': 'sklearn not available'}
 
-        # {layer_key: {routing_key: tensor list}}
-        X_tensors = defaultdict(lambda: defaultdict(list))
-        y_labels = defaultdict(list)
+        import gc
+
+        n_layers = getattr(self.model, 'n_layers', 12)
+        layers_to_process = [layer_idx] if layer_idx is not None else list(range(n_layers))
+
+        # Per-layer storage with sample count tracking
+        layer_data = {
+            lidx: {
+                'X': defaultdict(list),
+                'y': [],
+                'count': 0
+            } for lidx in layers_to_process
+        }
 
         self.model.eval()
         with self.extractor.analysis_context():
@@ -219,10 +233,13 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 if batch_idx >= max_batches:
                     break
 
+                # Check if all layers have enough samples
+                if all(layer_data[lidx]['count'] >= max_samples_per_layer for lidx in layers_to_process):
+                    break
+
                 input_ids = get_batch_input_ids(batch, self.device)
                 B, S = input_ids.shape
 
-                # Get attention mask if available
                 if isinstance(batch, dict):
                     attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
                 else:
@@ -237,92 +254,87 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 except Exception:
                     continue
 
-                # Flatten mask for vectorized selection
-                flat_mask = attention_mask.view(-1).bool()  # [B*S]
+                flat_mask = attention_mask.view(-1).bool()
                 valid_count = flat_mask.sum().item()
-
                 if valid_count == 0:
                     continue
 
-                # Get valid token ids and compute POS labels once per batch
-                flat_input_ids = input_ids.view(-1)  # [B*S]
+                # Compute POS labels once per batch
+                flat_input_ids = input_ids.view(-1)
                 valid_token_ids = flat_input_ids[flat_mask].cpu().tolist()
                 valid_tokens = self.tokenizer.convert_ids_to_tokens(valid_token_ids)
                 batch_pos_labels = [simple_pos_tag(t) for t in valid_tokens]
 
-                # Process ALL layers using extractor
                 for layer in routing:
                     lidx = layer.layer_idx
-                    if layer_idx is not None and lidx != layer_idx:
+                    if lidx not in layers_to_process:
                         continue
 
-                    layer_key = f'L{lidx}'
+                    ld = layer_data[lidx]
 
-                    # Collect attention routing weights - vectorized, using standardized keys
-                    for key in ROUTING_KEYS.keys():
+                    # Skip if already have enough samples
+                    if ld['count'] >= max_samples_per_layer:
+                        continue
+
+                    # Calculate remaining samples needed
+                    remaining = max_samples_per_layer - ld['count']
+                    sample_size = min(valid_count, remaining)
+
+                    # Random sampling if needed
+                    if sample_size < valid_count:
+                        sample_indices = torch.randperm(valid_count)[:sample_size]
+                        sampled_labels = [batch_pos_labels[i] for i in sample_indices.tolist()]
+                    else:
+                        sample_indices = None
+                        sampled_labels = batch_pos_labels
+
+                    # Collect routing weights
+                    all_keys = list(ROUTING_KEYS.keys()) + list(KNOWLEDGE_ROUTING_KEYS.keys())
+                    for key in all_keys:
                         w = layer.get_weight(key)
-                        if w is not None:
-                            if w.dim() == 3:  # [B, S, N] token-level
-                                flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
-                                valid_w = flat_w[flat_mask]  # [valid_count, N]
-                            elif w.dim() == 2:  # [B, N] batch-level
-                                # Expand and flatten
-                                expanded = w.unsqueeze(1).expand(-1, S, -1)  # [B, S, N]
-                                flat_w = expanded.reshape(-1, w.shape[-1])  # [B*S, N]
-                                valid_w = flat_w[flat_mask]  # [valid_count, N]
-                            else:
-                                continue
-                            X_tensors[layer_key][key].append(valid_w.cpu())
+                        if w is None:
+                            continue
 
-                    # Collect knowledge routing weights - vectorized, using standardized keys
-                    for key in KNOWLEDGE_ROUTING_KEYS.keys():
-                        w = layer.get_weight(key)
-                        if w is not None:
-                            if w.dim() == 3:  # [B, S, N] token-level
-                                flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
-                                valid_w = flat_w[flat_mask]  # [valid_count, N]
-                            elif w.dim() == 2:  # [B, N] batch-level
-                                expanded = w.unsqueeze(1).expand(-1, S, -1)  # [B, S, N]
-                                flat_w = expanded.reshape(-1, w.shape[-1])  # [B*S, N]
-                                valid_w = flat_w[flat_mask]  # [valid_count, N]
-                            else:
-                                continue
-                            X_tensors[layer_key][key].append(valid_w.cpu())
+                        if w.dim() == 3:
+                            flat_w = w.view(-1, w.shape[-1])
+                            valid_w = flat_w[flat_mask]
+                        elif w.dim() == 2:
+                            expanded = w.unsqueeze(1).expand(-1, S, -1)
+                            flat_w = expanded.reshape(-1, w.shape[-1])
+                            valid_w = flat_w[flat_mask]
+                        else:
+                            continue
 
-                    # Add POS labels for this layer
-                    y_labels[layer_key].extend(batch_pos_labels)
+                        # Apply sampling
+                        if sample_indices is not None:
+                            valid_w = valid_w[sample_indices]
 
-        # Convert tensors to numpy arrays
-        X_data = defaultdict(lambda: defaultdict(list))
-        for layer_key, routing_data in X_tensors.items():
-            for routing_key, tensor_list in routing_data.items():
-                if tensor_list:
-                    # Concatenate all tensors and convert to numpy
-                    combined = torch.cat(tensor_list, dim=0).numpy()
-                    X_data[layer_key][routing_key] = combined
+                        ld['X'][key].append(valid_w.cpu())
 
-        # Train and evaluate classifiers per layer/routing key
+                    ld['y'].extend(sampled_labels)
+                    ld['count'] += sample_size
+
+        # Train classifiers per layer and free memory immediately
         results = {'per_layer': {}}
 
-        # Count total classifiers to train
-        total_classifiers = sum(len(routing_data) for routing_data in X_data.values())
-        classifier_idx = 0
-        print(f"  Training {total_classifiers} classifiers...", flush=True)
+        total_classifiers = sum(
+            len(layer_data[lidx]['X']) for lidx in layers_to_process
+            if layer_data[lidx]['count'] >= 100
+        )
+        print(f"  Training ~{total_classifiers} classifiers...", flush=True)
 
-        for layer_key in sorted(X_data.keys()):
+        for lidx in layers_to_process:
+            layer_key = f'L{lidx}'
             results['per_layer'][layer_key] = {}
 
-            for routing_key in X_data[layer_key].keys():
-                classifier_idx += 1
-                X = np.array(X_data[layer_key][routing_key])
-                y = np.array(y_labels[layer_key][:len(X)])
+            ld = layer_data[lidx]
 
-                # Limit samples for faster training (max 50k samples)
-                max_samples = 50000
-                if len(X) > max_samples:
-                    indices = np.random.choice(len(X), max_samples, replace=False)
-                    X = X[indices]
-                    y = y[indices]
+            for routing_key, tensor_list in ld['X'].items():
+                if not tensor_list:
+                    continue
+
+                X = torch.cat(tensor_list, dim=0).numpy()
+                y = np.array(ld['y'][:len(X)])
 
                 if len(X) < 100 or len(np.unique(y)) < 2:
                     results['per_layer'][layer_key][routing_key] = {'error': 'Not enough data'}
@@ -333,7 +345,6 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         X, y, test_size=0.2, random_state=42
                     )
 
-                    # Use faster solver for large datasets
                     solver = 'saga' if len(X_train) > 10000 else 'lbfgs'
                     clf = LogisticRegression(max_iter=500, random_state=42, solver=solver, n_jobs=-1)
                     clf.fit(X_train, y_train)
@@ -341,7 +352,6 @@ class BehavioralAnalyzer(BaseAnalyzer):
 
                     accuracy = accuracy_score(y_test, y_pred)
 
-                    # Get display name
                     if routing_key in ROUTING_KEYS:
                         display = ROUTING_KEYS[routing_key][0]
                     elif routing_key in KNOWLEDGE_ROUTING_KEYS:
@@ -358,22 +368,39 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 except Exception as e:
                     results['per_layer'][layer_key][routing_key] = {'error': str(e)}
 
-        # Summary: best accuracy per routing type across layers
-        results['summary'] = {}
-        all_routing_keys = set()
-        for layer_data in results['per_layer'].values():
-            all_routing_keys.update(layer_data.keys())
+            # Free memory for this layer immediately
+            del layer_data[lidx]
+            gc.collect()
 
+        # Summary statistics
+        all_accuracies = []
+        all_routing_keys = set()
+        for layer_key, routing_data in results['per_layer'].items():
+            for routing_key, data in routing_data.items():
+                all_routing_keys.add(routing_key)
+                if 'accuracy' in data:
+                    all_accuracies.append(data['accuracy'])
+
+        results['summary'] = {}
         for rkey in all_routing_keys:
             accuracies = []
-            for layer_key, layer_data in results['per_layer'].items():
-                if rkey in layer_data and 'accuracy' in layer_data[rkey]:
-                    accuracies.append(layer_data[rkey]['accuracy'])
+            for layer_key, layer_data_result in results['per_layer'].items():
+                if rkey in layer_data_result and 'accuracy' in layer_data_result[rkey]:
+                    accuracies.append(layer_data_result[rkey]['accuracy'])
             if accuracies:
                 results['summary'][rkey] = {
                     'max_accuracy': max(accuracies),
                     'mean_accuracy': float(np.mean(accuracies)),
                 }
+
+        if all_accuracies:
+            results['overall'] = {
+                'mean_accuracy': float(np.mean(all_accuracies)),
+                'std_accuracy': float(np.std(all_accuracies)),
+                'max_accuracy': float(np.max(all_accuracies)),
+                'min_accuracy': float(np.min(all_accuracies)),
+                'n_classifiers': len(all_accuracies),
+            }
 
         return results
 
