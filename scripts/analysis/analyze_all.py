@@ -75,6 +75,7 @@ CLI Arguments:
         --max_samples     Max samples for dataloader (default: 5000)
         --n_clusters      Clusters for embedding analysis (default: 5)
         --pool_type       Neuron pool type: fv, fqk, rv, rqk (default: fv)
+        --gen_tokens      Max tokens to generate per sample (default: 50)
 """
 
 import os
@@ -125,6 +126,7 @@ class ModelAnalyzer:
         max_samples: int = 5000,
         n_clusters: int = 5,
         pool_type: str = 'fv',
+        gen_tokens: int = 50,
     ):
         self.checkpoint_path = checkpoint_path
         self.val_data_path = val_data_path
@@ -140,6 +142,7 @@ class ModelAnalyzer:
         self.max_samples = max_samples
         self.n_clusters = n_clusters
         self.pool_type = pool_type
+        self.gen_tokens = gen_tokens
 
         self.model = None
         self.tokenizer = None
@@ -296,8 +299,8 @@ class ModelAnalyzer:
             json.dump(speed_results, f, indent=2)
 
         # Generation samples
-        print("  Generating samples...")
-        samples = self._generate_samples()
+        print(f"  Generating samples (max {self.gen_tokens} tokens)...")
+        samples = self._generate_samples(max_new_tokens=self.gen_tokens)
         results['generation'] = samples
 
         # Group by category
@@ -1376,6 +1379,7 @@ class MultiModelAnalyzer:
         max_samples: int = 5000,
         n_clusters: int = 5,
         pool_type: str = 'fv',
+        gen_tokens: int = 50,
     ):
         self.checkpoint_paths = checkpoint_paths
         self.val_data_path = val_data_path
@@ -1391,6 +1395,7 @@ class MultiModelAnalyzer:
         self.max_samples = max_samples
         self.n_clusters = n_clusters
         self.pool_type = pool_type
+        self.gen_tokens = gen_tokens
 
         self.analyzers = []
         self.results = {}
@@ -1424,6 +1429,7 @@ class MultiModelAnalyzer:
                 max_samples=self.max_samples,
                 n_clusters=self.n_clusters,
                 pool_type=self.pool_type,
+                gen_tokens=self.gen_tokens,
             )
             analyzer.run_all(paper_only=paper_only, only=only)
 
@@ -1727,6 +1733,7 @@ Examples:
     parser.add_argument('--max_samples', type=int, default=5000, help='Max samples for dataloader (default: 5000)')
     parser.add_argument('--n_clusters', type=int, default=5, help='Number of clusters for embedding analysis (default: 5)')
     parser.add_argument('--pool_type', type=str, default='fv', help='Neuron pool type: fv, fqk, rv, rqk (default: fv)')
+    parser.add_argument('--gen_tokens', type=int, default=50, help='Max tokens to generate per sample (default: 50)')
 
     args = parser.parse_args()
 
@@ -1773,6 +1780,7 @@ Examples:
             max_samples=args.max_samples,
             n_clusters=args.n_clusters,
             pool_type=args.pool_type,
+            gen_tokens=args.gen_tokens,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
     else:
@@ -1787,6 +1795,7 @@ Examples:
             max_samples=args.max_samples,
             n_clusters=args.n_clusters,
             pool_type=args.pool_type,
+            gen_tokens=args.gen_tokens,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
 
