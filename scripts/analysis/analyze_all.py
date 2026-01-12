@@ -424,7 +424,9 @@ class ModelAnalyzer:
                 # Print prompt with streaming indicator
                 print(f"  [{category}] {prompt}", end="", flush=True)
 
-                prev_text = ""  # Track previously printed text for proper spacing
+                # Track full decoded text for proper spacing (BERT tokenizer needs full context)
+                prev_full_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+
                 with torch.no_grad():
                     for _ in range(max_new_tokens):
                         output = self.model(generated, attention_mask=None)
@@ -440,12 +442,12 @@ class ModelAnalyzer:
                         next_token = torch.multinomial(probs, num_samples=1)
                         generated = torch.cat([generated, next_token], dim=1)
 
-                        # Decode full sequence and print only the new part (preserves spacing)
-                        curr_text = self.tokenizer.decode(generated[0][prompt_len:], skip_special_tokens=True)
-                        new_part = curr_text[len(prev_text):]
+                        # Decode FULL sequence to preserve spacing (tokenizer needs full context)
+                        curr_full_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+                        new_part = curr_full_text[len(prev_full_text):]
                         if new_part:
                             print(new_part, end="", flush=True)
-                        prev_text = curr_text
+                        prev_full_text = curr_full_text
 
                         # Stop if EOS token generated
                         if next_token.item() == eos_token_id:
