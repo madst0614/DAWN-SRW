@@ -872,17 +872,26 @@ class ModelAnalyzer:
         if trajectory and 'error' not in trajectory:
             print(f"\n  ┌─ Token Trajectory Analysis ────────────────────────────────────────────")
             for pool, data in trajectory.items():
-                if isinstance(data, dict) and 'mean_change' in data:
-                    print(f"  │ {pool}:")
-                    print(f"  │   Mean change: {data['mean_change']:.4f}")
-                    print(f"  │   Consistency: {data.get('consistency', 0):.4f}")
+                if isinstance(data, dict) and 'early_avg' in data:
+                    display = data.get('display', pool)
+                    print(f"  │ {display}: early={data['early_avg']:.1f}%, late={data['late_avg']:.1f}%")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if probing and 'error' not in probing:
             print(f"\n  ┌─ Probing Analysis ──────────────────────────────────────────────────────")
-            for task, data in probing.items():
-                if isinstance(data, dict) and 'accuracy' in data:
-                    print(f"  │ {task}: accuracy={data['accuracy']*100:.1f}%")
+            # Print overall stats
+            overall = probing.get('overall', {})
+            if overall:
+                print(f"  │ Overall: mean={overall.get('mean_accuracy', 0)*100:.1f}%, "
+                      f"max={overall.get('max_accuracy', 0)*100:.1f}%, "
+                      f"classifiers={overall.get('n_classifiers', 0)}")
+            # Print per-routing summary
+            summary = probing.get('summary', {})
+            if summary:
+                print(f"  │")
+                for rkey, data in summary.items():
+                    if isinstance(data, dict) and 'mean_accuracy' in data:
+                        print(f"  │ {rkey}: mean={data['mean_accuracy']*100:.1f}%, max={data['max_accuracy']*100:.1f}%")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['behavioral'] = results
