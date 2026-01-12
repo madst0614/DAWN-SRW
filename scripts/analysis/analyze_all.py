@@ -298,19 +298,50 @@ class ModelAnalyzer:
         # Generation samples
         print("  Generating samples...")
         samples = self._generate_samples()
+        results['generation'] = samples
 
-        print(f"  ┌─ Generation Samples ────────────────")
-        for prompt, generated in samples:
-            print(f"  │ Prompt: {prompt}")
-            print(f"  │ → {generated}")
+        # Group by category
+        categories = {}
+        for s in samples:
+            cat = s['category']
+            if cat not in categories:
+                categories[cat] = []
+            categories[cat].append(s)
+
+        print(f"\n  ┌─ Generation Samples ─────────────────────────────────────────────────────")
+        for category, cat_samples in categories.items():
             print(f"  │")
-        print(f"  └───────────────────────────────────────\n")
+            print(f"  │ [{category.upper()}]")
+            for s in cat_samples:
+                # Truncate long outputs for display
+                gen_display = s['generated']
+                if len(gen_display) > 100:
+                    gen_display = gen_display[:100] + "..."
+                print(f"  │   Prompt: \"{s['prompt']}\"")
+                print(f"  │   → {gen_display}")
+                print(f"  │   ({s['new_tokens']} tokens, {s['time_ms']:.0f}ms, {s['tokens_per_sec']:.1f} tok/s)")
+        print(f"  │")
+
+        # Summary stats
+        total_tokens = sum(s['new_tokens'] for s in samples)
+        total_time = sum(s['time_ms'] for s in samples)
+        avg_speed = total_tokens / (total_time / 1000) if total_time > 0 else 0
+        print(f"  │ Summary: {len(samples)} prompts, {total_tokens} tokens generated")
+        print(f"  │          Avg speed: {avg_speed:.1f} tokens/sec")
+        print(f"  └─────────────────────────────────────────────────────────────────────────────\n")
+
+        with open(output_dir / 'generation_samples.json', 'w') as f:
+            json.dump(samples, f, indent=2, default=str)
 
         with open(output_dir / 'generation_samples.txt', 'w') as f:
-            for prompt, generated in samples:
-                f.write(f"Prompt: {prompt}\n")
-                f.write(f"Generated: {generated}\n")
-                f.write("-" * 50 + "\n")
+            for category, cat_samples in categories.items():
+                f.write(f"\n[{category.upper()}]\n")
+                f.write("=" * 60 + "\n")
+                for s in cat_samples:
+                    f.write(f"Prompt: {s['prompt']}\n")
+                    f.write(f"Generated: {s['generated']}\n")
+                    f.write(f"Stats: {s['new_tokens']} tokens, {s['time_ms']:.0f}ms, {s['tokens_per_sec']:.1f} tok/s\n")
+                    f.write("-" * 60 + "\n")
 
         self.results['performance'] = results
         return results
@@ -355,48 +386,83 @@ class ModelAnalyzer:
             'seq_len': seq_len,
         }
 
-    def _generate_samples(self, max_new_tokens: int = 30, temperature: float = 0.8, top_k: int = 50) -> List[Tuple[str, str]]:
+    def _generate_samples(self, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 50) -> List[Dict]:
         """Generate text samples with top-k sampling."""
+        import time
         import torch.nn.functional as F
 
-        prompts = [
-            "The capital of France is",
-            "In the beginning",
-            "Machine learning is",
-        ]
+        # Comprehensive prompt categories
+        prompt_categories = {
+            'factual': [
+                "The capital of France is",
+                "The largest ocean on Earth is",
+                "Einstein developed the theory of",
+            ],
+            'common_sense': [
+                "If you drop a glass, it will",
+                "Fire is hot, ice is",
+                "At night, the sky is",
+            ],
+            'narrative': [
+                "Once upon a time, there was a",
+                "She walked into the room and",
+            ],
+            'technical': [
+                "def fibonacci(n):",
+                "The mitochondria is the",
+            ],
+            'conversational': [
+                "I think the best way to",
+                "In my opinion,",
+            ],
+        }
 
         results = []
         self.model.eval()
         eos_token_id = self.tokenizer.sep_token_id
 
-        for prompt in prompts:
-            # Encode without special tokens for cleaner generation
-            input_ids = self.tokenizer.encode(
-                prompt, add_special_tokens=False, return_tensors='pt'
-            ).to(self.device)
-            generated = input_ids.clone()
+        for category, prompts in prompt_categories.items():
+            for prompt in prompts:
+                start_time = time.perf_counter()
 
-            with torch.no_grad():
-                for _ in range(max_new_tokens):
-                    output = self.model(generated, attention_mask=None)
-                    logits = output[0] if isinstance(output, tuple) else output
-                    next_token_logits = logits[:, -1, :] / temperature
+                # Encode without special tokens for cleaner generation
+                input_ids = self.tokenizer.encode(
+                    prompt, add_special_tokens=False, return_tensors='pt'
+                ).to(self.device)
+                generated = input_ids.clone()
+                prompt_len = input_ids.shape[1]
 
-                    # Top-k filtering
-                    if top_k > 0:
-                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                        next_token_logits[indices_to_remove] = float('-inf')
+                with torch.no_grad():
+                    for _ in range(max_new_tokens):
+                        output = self.model(generated, attention_mask=None)
+                        logits = output[0] if isinstance(output, tuple) else output
+                        next_token_logits = logits[:, -1, :] / temperature
 
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                    generated = torch.cat([generated, next_token], dim=1)
+                        # Top-k filtering
+                        if top_k > 0:
+                            indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                            next_token_logits[indices_to_remove] = float('-inf')
 
-                    # Stop if EOS token generated
-                    if next_token.item() == eos_token_id:
-                        break
+                        probs = F.softmax(next_token_logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                        generated = torch.cat([generated, next_token], dim=1)
 
-            generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-            results.append((prompt, generated_text))
+                        # Stop if EOS token generated
+                        if next_token.item() == eos_token_id:
+                            break
+
+                elapsed = time.perf_counter() - start_time
+                generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+                new_tokens = generated.shape[1] - prompt_len
+
+                results.append({
+                    'category': category,
+                    'prompt': prompt,
+                    'generated': generated_text,
+                    'new_tokens': new_tokens,
+                    'time_ms': elapsed * 1000,
+                    'tokens_per_sec': new_tokens / elapsed if elapsed > 0 else 0,
+                })
 
         return results
 
@@ -415,20 +481,53 @@ class ModelAnalyzer:
         analyzer = NeuronHealthAnalyzer(self.model, device=self.device)
         results = analyzer.run_all(str(output_dir))
 
-        # Print summary
+        # Print detailed summary
         ema = results.get('ema_distribution', {})
+        diversity = results.get('diversity', {})
+        qk_overlap = results.get('qk_ema_overlap', {})
+
         if ema:
-            print(f"\n  ┌─ Neuron Health Summary ─────────────")
+            print(f"\n  ┌─ Neuron Health Summary ───────────────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Active':>8} {'Dead':>8} {'Total':>8} {'Ratio':>8} {'Gini':>8} {'EMA Mean':>10} {'EMA Std':>10}")
+            print(f"  │ {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*10} {'─'*10}")
+
             total_active = 0
             total_neurons = 0
             for name, data in ema.items():
                 if isinstance(data, dict) and 'total' in data:
                     total_active += data.get('active', 0)
                     total_neurons += data.get('total', 0)
-                    print(f"  │ {data.get('display', name):12s}: {data['active']:4d}/{data['total']:4d} active ({data['active_ratio']*100:.1f}%)")
+                    stats = data.get('stats', {})
+                    print(f"  │ {data.get('display', name):<12} {data['active']:>8d} {data['dead']:>8d} "
+                          f"{data['total']:>8d} {data['active_ratio']*100:>7.1f}% {data.get('gini', 0):>8.3f} "
+                          f"{stats.get('mean', 0):>10.4f} {stats.get('std', 0):>10.4f}")
+
             if total_neurons > 0:
-                print(f"  │ {'TOTAL':12s}: {total_active:4d}/{total_neurons:4d} active ({total_active/total_neurons*100:.1f}%)")
-            print(f"  └───────────────────────────────────────\n")
+                print(f"  │ {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*10} {'─'*10}")
+                print(f"  │ {'TOTAL':<12} {total_active:>8d} {total_neurons - total_active:>8d} "
+                      f"{total_neurons:>8d} {total_active/total_neurons*100:>7.1f}%")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Diversity metrics
+        if diversity:
+            print(f"\n  ┌─ Diversity Metrics ────────────────────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Entropy':>10} {'Max Entropy':>12} {'Eff. Neurons':>14} {'Utilization':>12}")
+            print(f"  │ {'─'*12} {'─'*10} {'─'*12} {'─'*14} {'─'*12}")
+            for name, data in diversity.items():
+                if isinstance(data, dict) and 'entropy' in data:
+                    print(f"  │ {data.get('display', name):<12} {data['entropy']:>10.3f} {data.get('max_entropy', 0):>12.3f} "
+                          f"{data.get('effective_neurons', 0):>14.1f} {data.get('utilization', 0)*100:>11.1f}%")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Q/K overlap for v18.x
+        if qk_overlap and 'error' not in qk_overlap:
+            print(f"\n  ┌─ Q/K EMA Overlap (v18.x) ──────────────────────────────────────────────")
+            for pool_name, overlap_data in qk_overlap.items():
+                if isinstance(overlap_data, dict):
+                    print(f"  │ {pool_name}:")
+                    print(f"  │   Both Active: {overlap_data.get('both_active', 0):>6d}  |  Q-only: {overlap_data.get('q_only_active', 0):>6d}  |  K-only: {overlap_data.get('k_only_active', 0):>6d}")
+                    print(f"  │   Jaccard: {overlap_data.get('jaccard', 0):.3f}  |  Q Active: {overlap_data.get('q_active_ratio', 0)*100:.1f}%  |  K Active: {overlap_data.get('k_active_ratio', 0)*100:.1f}%")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['health'] = results
         return results
@@ -449,14 +548,56 @@ class ModelAnalyzer:
         analyzer = RoutingAnalyzer(self.model, device=self.device)
         results = analyzer.run_all(dataloader, str(output_dir), n_batches)
 
-        # Print summary
+        # Print detailed summary
         entropy = results.get('entropy', {})
+        selection_freq = results.get('selection_frequency', {})
+        selection_div = results.get('selection_diversity', {})
+        qk_overlap = results.get('qk_overlap', {})
+        qk_entropy = results.get('qk_entropy', {})
+
         if entropy:
-            print(f"\n  ┌─ Routing Entropy Summary ────────────")
+            print(f"\n  ┌─ Routing Entropy ─────────────────────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10} {'Median':>10}")
+            print(f"  │ {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*10} {'─'*10}")
             for pool, data in entropy.items():
                 if isinstance(data, dict) and 'mean' in data:
-                    print(f"  │ {pool:12s}: mean={data['mean']:.3f}, std={data.get('std', 0):.3f}")
-            print(f"  └───────────────────────────────────────\n")
+                    print(f"  │ {pool:<12} {data['mean']:>10.3f} {data.get('std', 0):>10.3f} "
+                          f"{data.get('min', 0):>10.3f} {data.get('max', 0):>10.3f} {data.get('median', 0):>10.3f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if selection_freq:
+            print(f"\n  ┌─ Selection Frequency ─────────────────────────────────────────────────")
+            for pool, data in selection_freq.items():
+                if isinstance(data, dict) and 'total_selections' in data:
+                    print(f"  │ {pool}:")
+                    print(f"  │   Total selections: {data['total_selections']:,}")
+                    print(f"  │   Unique neurons: {data.get('unique_neurons', 0):,} / {data.get('total_neurons', 0):,}")
+                    print(f"  │   Coverage: {data.get('coverage', 0)*100:.1f}%")
+                    if data.get('top_neurons'):
+                        top_5 = data['top_neurons'][:5]
+                        print(f"  │   Top 5: {', '.join(f'N{n[0]}({n[1]})' for n in top_5)}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if selection_div:
+            print(f"\n  ┌─ Selection Diversity ─────────────────────────────────────────────────")
+            for pool, data in selection_div.items():
+                if isinstance(data, dict):
+                    print(f"  │ {pool}: gini={data.get('gini', 0):.3f}, effective={data.get('effective_neurons', 0):.0f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if qk_overlap:
+            print(f"\n  ┌─ Q/K Selection Overlap ────────────────────────────────────────────────")
+            for pool, data in qk_overlap.items():
+                if isinstance(data, dict) and 'overlap_ratio' in data:
+                    print(f"  │ {pool}: overlap={data['overlap_ratio']*100:.1f}%, jaccard={data.get('jaccard', 0):.3f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if qk_entropy:
+            print(f"\n  ┌─ Q/K Entropy Comparison ───────────────────────────────────────────────")
+            for pool, data in qk_entropy.items():
+                if isinstance(data, dict) and 'q_entropy' in data:
+                    print(f"  │ {pool}: Q={data['q_entropy']:.3f}, K={data['k_entropy']:.3f}, diff={data.get('diff', 0):.3f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['routing'] = results
         return results
@@ -476,14 +617,39 @@ class ModelAnalyzer:
         analyzer = EmbeddingAnalyzer(self.model, device=self.device)
         results = analyzer.run_all(str(output_dir), n_clusters=n_clusters)
 
-        # Print summary
+        # Print detailed summary
         sim = results.get('similarity', {})
+        cross_sim = results.get('cross_type_similarity', {})
+        clustering = results.get('clustering', {})
+
         if sim:
-            print(f"\n  ┌─ Embedding Similarity Summary ───────")
+            print(f"\n  ┌─ Embedding Similarity ─────────────────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
+            print(f"  │ {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*10}")
             for pool, data in sim.items():
                 if isinstance(data, dict) and 'mean' in data:
-                    print(f"  │ {pool:12s}: mean={data['mean']:.3f}")
-            print(f"  └───────────────────────────────────────\n")
+                    print(f"  │ {pool:<12} {data['mean']:>10.4f} {data.get('std', 0):>10.4f} "
+                          f"{data.get('min', 0):>10.4f} {data.get('max', 0):>10.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if cross_sim:
+            print(f"\n  ┌─ Cross-Type Similarity ────────────────────────────────────────────────")
+            for pair, data in cross_sim.items():
+                if isinstance(data, dict) and 'mean' in data:
+                    print(f"  │ {pair}: mean={data['mean']:.4f}, std={data.get('std', 0):.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if clustering:
+            print(f"\n  ┌─ Clustering Results ───────────────────────────────────────────────────")
+            for pool, data in clustering.items():
+                if isinstance(data, dict) and 'silhouette' in data:
+                    print(f"  │ {pool}:")
+                    print(f"  │   Silhouette: {data['silhouette']:.3f}")
+                    print(f"  │   Inertia: {data.get('inertia', 0):.1f}")
+                    if data.get('cluster_sizes'):
+                        sizes = data['cluster_sizes']
+                        print(f"  │   Cluster sizes: {sizes}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['embedding'] = results
         return results
@@ -504,7 +670,39 @@ class ModelAnalyzer:
         analyzer = SemanticAnalyzer(self.model, tokenizer=self.tokenizer, device=self.device)
         results = analyzer.run_all(dataloader, str(output_dir), max_batches=n_batches)
 
-        print("  Done.")
+        # Print detailed summary
+        path_sim = results.get('path_similarity', {})
+        context_routing = results.get('context_routing', {})
+        pos_routing = results.get('pos_routing', {})
+
+        if path_sim:
+            print(f"\n  ┌─ Semantic Path Similarity ─────────────────────────────────────────────")
+            for pair_name, data in path_sim.items():
+                if isinstance(data, dict) and 'similarity' in data:
+                    print(f"  │ {pair_name}:")
+                    print(f"  │   Similarity: {data['similarity']:.4f}")
+                    if data.get('common_neurons'):
+                        print(f"  │   Common neurons: {len(data['common_neurons'])}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if context_routing:
+            print(f"\n  ┌─ Context-Dependent Routing ────────────────────────────────────────────")
+            for word, data in context_routing.items():
+                if isinstance(data, dict) and 'contexts' in data:
+                    n_contexts = len(data['contexts'])
+                    overlap = data.get('overlap_ratio', 0)
+                    print(f"  │ '{word}': {n_contexts} contexts, overlap={overlap*100:.1f}%")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if pos_routing:
+            print(f"\n  ┌─ POS Routing Patterns ─────────────────────────────────────────────────")
+            for pos, data in list(pos_routing.items())[:10]:  # Top 10
+                if isinstance(data, dict) and 'mean_activation' in data:
+                    print(f"  │ {pos}: mean_act={data['mean_activation']:.4f}, count={data.get('count', 0)}")
+            if len(pos_routing) > 10:
+                print(f"  │ ... and {len(pos_routing) - 10} more POS tags")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
         self.results['semantic'] = results
         return results
 
@@ -563,16 +761,27 @@ class ModelAnalyzer:
 
         results = analyzer.analyze_factual_neurons(prompts, targets, n_runs=n_runs, pool_type=pool_type)
 
-        # Print summary
+        # Print detailed summary
         per_target = results.get('per_target', {})
         if per_target:
-            print(f"\n  ┌─ Factual Analysis Results ────────────")
+            print(f"\n  ┌─ Factual Analysis Results ─────────────────────────────────────────────")
+            print(f"  │ {'Target':<12} {'Match%':>8} {'Common80':>10} {'Common100':>11} {'Avg Act':>10}")
+            print(f"  │ {'─'*12} {'─'*8} {'─'*10} {'─'*11} {'─'*10}")
             for target, data in per_target.items():
                 if isinstance(data, dict):
                     match_rate = data.get('match_rate', 0) * 100
-                    n_common = len(data.get('common_neurons_80', []))
-                    print(f"  │ {target:10s}: match={match_rate:.0f}%, common_neurons={n_common}")
-            print(f"  └───────────────────────────────────────\n")
+                    n_common_80 = len(data.get('common_neurons_80', []))
+                    n_common_100 = len(data.get('common_neurons_100', []))
+                    avg_act = data.get('avg_activation', 0)
+                    print(f"  │ {target:<12} {match_rate:>7.0f}% {n_common_80:>10d} {n_common_100:>11d} {avg_act:>10.4f}")
+
+            # Show top common neurons
+            all_common = results.get('all_common_neurons', [])
+            if all_common:
+                print(f"  │")
+                print(f"  │ Cross-target common neurons: {len(all_common)}")
+                print(f"  │ Top neurons: {', '.join(f'N{n}' for n in all_common[:10])}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         with open(output_dir / 'factual_neurons.json', 'w') as f:
             json.dump(results, f, indent=2, default=str)
@@ -606,7 +815,26 @@ class ModelAnalyzer:
         )
         results = analyzer.run_all(dataloader, str(output_dir), n_batches)
 
-        print("  Done.")
+        # Print detailed summary
+        trajectory = results.get('trajectory', {})
+        probing = results.get('probing', {})
+
+        if trajectory and 'error' not in trajectory:
+            print(f"\n  ┌─ Token Trajectory Analysis ────────────────────────────────────────────")
+            for pool, data in trajectory.items():
+                if isinstance(data, dict) and 'mean_change' in data:
+                    print(f"  │ {pool}:")
+                    print(f"  │   Mean change: {data['mean_change']:.4f}")
+                    print(f"  │   Consistency: {data.get('consistency', 0):.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if probing and 'error' not in probing:
+            print(f"\n  ┌─ Probing Analysis ──────────────────────────────────────────────────────")
+            for task, data in probing.items():
+                if isinstance(data, dict) and 'accuracy' in data:
+                    print(f"  │ {task}: accuracy={data['accuracy']*100:.1f}%")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
         self.results['behavioral'] = results
         return results
 
@@ -626,7 +854,18 @@ class ModelAnalyzer:
         analyzer = CoselectionAnalyzer(self.model, device=self.device)
         results = analyzer.run_all(dataloader, str(output_dir), 'all', n_batches)
 
-        print("  Done.")
+        # Print detailed summary
+        print(f"\n  ┌─ Co-Selection Analysis ───────────────────────────────────────────────────")
+        for pair_name, data in results.items():
+            if isinstance(data, dict) and 'coselection_rate' in data:
+                print(f"  │ {pair_name}:")
+                print(f"  │   Co-selection rate: {data['coselection_rate']*100:.2f}%")
+                print(f"  │   Correlation: {data.get('correlation', 0):.4f}")
+                if data.get('top_pairs'):
+                    top_3 = data['top_pairs'][:3]
+                    print(f"  │   Top pairs: {', '.join(f'({p[0]},{p[1]})' for p in top_3)}")
+        print(f"  └─────────────────────────────────────────────────────────────────────────────")
+
         self.results['coselection'] = results
         return results
 
@@ -645,7 +884,35 @@ class ModelAnalyzer:
         analyzer = WeightAnalyzer(model=self.model, device=self.device)
         results = analyzer.run_all(str(output_dir))
 
-        print("  Done.")
+        # Print detailed summary
+        svd = results.get('svd', {})
+        norms = results.get('norms', {})
+        similarity = results.get('similarity', {})
+
+        if norms:
+            print(f"\n  ┌─ Weight Norms ─────────────────────────────────────────────────────────")
+            for name, data in norms.items():
+                if isinstance(data, dict) and 'frobenius' in data:
+                    print(f"  │ {name}:")
+                    print(f"  │   Frobenius: {data['frobenius']:.4f}, Spectral: {data.get('spectral', 0):.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if svd:
+            print(f"\n  ┌─ SVD Analysis ─────────────────────────────────────────────────────────")
+            for name, data in svd.items():
+                if isinstance(data, dict) and 'rank' in data:
+                    print(f"  │ {name}: rank={data['rank']}, condition={data.get('condition_number', 0):.2f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if similarity:
+            print(f"\n  ┌─ Weight Similarity ────────────────────────────────────────────────────")
+            for pair, data in similarity.items():
+                if isinstance(data, (int, float)):
+                    print(f"  │ {pair}: {data:.4f}")
+                elif isinstance(data, dict) and 'cosine' in data:
+                    print(f"  │ {pair}: cosine={data['cosine']:.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
         self.results['weight'] = results
         return results
 
