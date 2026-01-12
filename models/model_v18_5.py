@@ -953,6 +953,11 @@ class GlobalRouters(nn.Module):
             if pool_type == 'qk':
                 key = f'rqk_{qk_type.lower()}_pref'
                 routing_info[key] = logits
+                # Store weights for Q/K analysis
+                routing_info[f'rqk_weights_{qk_type}'] = weights
+            else:
+                routing_info['rv_pref'] = logits
+                routing_info['rv_weights'] = weights
 
         return weights, aux_loss, routing_info
 
@@ -1256,6 +1261,14 @@ class AttentionCircuit(nn.Module):
                         overlap = ((mask_q * mask_k).sum(dim=-1) /
                                   torch.maximum(mask_q.sum(dim=-1), mask_k.sum(dim=-1)).clamp(min=1)).mean().item()
                         restore_info['overlap_rqk'] = overlap
+
+                # Store restore weights for analysis (from routing_info)
+                if info_q and 'rqk_weights_Q' in info_q:
+                    restore_info['rqk_weights_Q'] = info_q['rqk_weights_Q']
+                if info_k and 'rqk_weights_K' in info_k:
+                    restore_info['rqk_weights_K'] = info_k['rqk_weights_K']
+                if info_v and 'rv_weights' in info_v:
+                    restore_info['rv_weights'] = info_v['rv_weights']
 
         # Q norm for dead routing detection
         q_norm = Q_total.norm(dim=-1, keepdim=True)
