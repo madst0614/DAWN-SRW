@@ -1773,7 +1773,7 @@ Examples:
     parser.add_argument('--batch_size', type=int, default=16, help='Dataloader batch size (default: 16)')
     parser.add_argument('--max_samples', type=int, default=5000, help='Max samples for dataloader (default: 5000)')
     parser.add_argument('--n_clusters', type=int, default=5, help='Number of clusters for embedding analysis (default: 5)')
-    parser.add_argument('--pool_type', type=str, default='fv', help='Neuron pool type: fv, fqk, rv, rqk (default: fv)')
+    parser.add_argument('--pool_type', type=str, default='fv', help='Neuron pool type: fv, fqk, fqk_q, fqk_k, rv, rqk, rqk_q, rqk_k, fknow, rknow (default: fv)')
     parser.add_argument('--target_layer', type=int, default=None, help='Target layer for POS/routing analysis (default: all layers)')
     parser.add_argument('--gen_tokens', type=int, default=50, help='Max tokens to generate per sample (default: 50)')
 

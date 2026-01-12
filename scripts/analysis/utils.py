@@ -135,6 +135,24 @@ QK_POOLS = {
     'rqk': ('restore_qk', 'rqk_q', 'rqk_k'),
 }
 
+# Pool type aliases for CLI convenience
+# Maps shortcut names to canonical standardized keys
+POOL_TYPE_ALIASES = {
+    'fqk': 'fqk_q',    # Feature QK (default to Q)
+    'rqk': 'rqk_q',    # Restore QK (default to Q)
+    'feature_qk': 'fqk_q',
+    'feature_v': 'fv',
+    'restore_qk': 'rqk_q',
+    'restore_v': 'rv',
+    'feature_know': 'fknow',
+    'restore_know': 'rknow',
+}
+
+
+def resolve_pool_type(pool_type: str) -> str:
+    """Resolve pool type alias to canonical key."""
+    return POOL_TYPE_ALIASES.get(pool_type, pool_type)
+
 # Neuron attribute names for weight analysis
 NEURON_ATTRS = {
     'feature_qk': 'feature_qk_neurons',

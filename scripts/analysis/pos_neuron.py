@@ -17,6 +17,7 @@ from .base import BaseAnalyzer
 from .utils import (
     HAS_TQDM, tqdm,
     RoutingDataExtractor,  # Schema layer for model-agnostic access
+    resolve_pool_type,     # Resolve pool type aliases
 )
 
 
@@ -320,12 +321,15 @@ class POSNeuronAnalyzer(BaseAnalyzer):
 
         Args:
             dataset: List of {'tokens': [...], 'upos': [...]}
-            pool_type: Pool to analyze
+            pool_type: Pool to analyze (fv, fqk, fqk_q, fqk_k, rv, rqk, rqk_q, rqk_k, fknow, rknow)
             max_sentences: Maximum sentences to process
 
         Returns:
             Analysis results dictionary
         """
+        # Resolve pool type alias (e.g., 'fqk' -> 'fqk_q')
+        pool_type = resolve_pool_type(pool_type)
+
         self.reset_stats()
         n_sentences = min(len(dataset), max_sentences) if max_sentences else len(dataset)
 
