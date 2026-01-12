@@ -14,10 +14,7 @@ from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
 from .base import BaseAnalyzer
-from .utils import (
-    get_routing_from_outputs,
-    HAS_TQDM, tqdm
-)
+from .utils import HAS_TQDM, tqdm
 
 
 # Universal POS tags (UPOS)
@@ -248,39 +245,25 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         """
         input_ids = torch.tensor([token_ids], device=self.device)
 
-        self.enable_pref_tensors()
-        try:
-            with torch.no_grad():
-                outputs = self.model(input_ids, return_routing_info=True)
+        with torch.no_grad():
+            outputs = self.model(input_ids, return_routing_info=True)
 
-            routing_infos = get_routing_from_outputs(outputs)
-            if routing_infos is None:
-                return {}
+        # Get routing_infos directly from outputs tuple
+        if isinstance(outputs, tuple) and len(outputs) >= 2:
+            routing_infos = outputs[1]
+        else:
+            return {}
 
-            # Debug: print available keys on first call
-            if not hasattr(self, '_debug_printed'):
-                self._debug_printed = True
-                if routing_infos and len(routing_infos) > 0:
-                    layer_info = routing_infos[0]
-                    attn = layer_info.get('attention', layer_info)
-                    print(f"  [DEBUG] Routing info keys: {list(attn.keys())[:10]}")
-        finally:
-            self.disable_pref_tensors()
+        if not routing_infos:
+            return {}
 
-        # Map pool_type to keys
-        mask_key_map = {
-            'fv': 'fv_mask', 'rv': 'rv_mask',
-            'fqk_q': 'fqk_mask_Q', 'fqk_k': 'fqk_mask_K',
-            'rqk_q': 'rqk_mask_Q', 'rqk_k': 'rqk_mask_K',
-            'fknow': 'feature_know_mask', 'rknow': 'restore_know_mask',
-        }
+        # Map pool_type to weight key
         weight_key_map = {
             'fv': 'fv_weights', 'rv': 'rv_weights',
             'fqk_q': 'fqk_weights_Q', 'fqk_k': 'fqk_weights_K',
             'rqk_q': 'rqk_weights_Q', 'rqk_k': 'rqk_weights_K',
             'fknow': 'feature_know_w', 'rknow': 'restore_know_w',
         }
-        mask_key = mask_key_map.get(pool_type, 'fv_mask')
         weight_key = weight_key_map.get(pool_type, 'fv_weights')
 
         position_neurons = defaultdict(set)
@@ -290,27 +273,17 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             if self.target_layer is not None and layer_idx != self.target_layer:
                 continue
 
+            # Get weights from attention or knowledge
             attn = layer_info.get('attention', layer_info)
             know = layer_info.get('knowledge', {})
 
-            # Prefer binary mask
-            mask = attn.get(mask_key) or know.get(mask_key)
-            use_mask = mask is not None
+            weights = attn.get(weight_key) or know.get(weight_key)
 
-            if not use_mask:
-                mask = attn.get(weight_key) or know.get(weight_key)
-
-            if mask is not None and mask.dim() >= 2:
-                for pos in range(min(seq_len, mask.shape[1] if mask.dim() == 3 else seq_len)):
-                    if mask.dim() == 3:
-                        m = mask[0, pos]
-                    else:
-                        m = mask[0]
-
-                    if use_mask:
-                        active_neurons = m.nonzero(as_tuple=True)[0].cpu().tolist()
-                    else:
-                        active_neurons = (m > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+            if weights is not None:
+                # weights: [B, T, N]
+                for pos in range(seq_len):
+                    w = weights[0, pos]  # [N]
+                    active_neurons = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                     position_neurons[pos].update(active_neurons)
 
         return {pos: list(neurons) for pos, neurons in position_neurons.items()}

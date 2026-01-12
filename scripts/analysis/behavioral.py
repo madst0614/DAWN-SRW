@@ -20,7 +20,7 @@ from .base import BaseAnalyzer
 from .utils import (
     ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
     calc_entropy_ratio, simple_pos_tag,
-    get_batch_input_ids, get_routing_from_outputs,
+    get_batch_input_ids,
     HAS_MATPLOTLIB, HAS_SKLEARN, HAS_TQDM, tqdm, plt
 )
 
@@ -106,42 +106,44 @@ class BehavioralAnalyzer(BaseAnalyzer):
         layer_position_routing = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
         self.model.eval()
-        self.enable_pref_tensors()
-        try:
-            with torch.no_grad():
-                for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Trajectory')):
-                    if i >= n_batches:
-                        break
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Trajectory')):
+                if i >= n_batches:
+                    break
 
-                    input_ids = get_batch_input_ids(batch, self.device)
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    routing_infos = get_routing_from_outputs(outputs)
+                input_ids = get_batch_input_ids(batch, self.device)
+                outputs = self.model(input_ids, return_routing_info=True)
 
-                    if routing_infos is None:
+                # Get routing_infos directly from outputs tuple
+                if isinstance(outputs, tuple) and len(outputs) >= 2:
+                    routing_infos = outputs[1]
+                else:
+                    continue
+
+                if not routing_infos:
+                    continue
+
+                # Process ALL layers
+                for lidx, layer_info in enumerate(routing_infos):
+                    if layer_idx is not None and lidx != layer_idx:
                         continue
 
-                    # Process ALL layers
-                    for lidx, layer_info in enumerate(routing_infos):
-                        if layer_idx is not None and lidx != layer_idx:
+                    attn = layer_info.get('attention', layer_info)
+
+                    # Use weight keys instead of pref keys
+                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                        weights = attn.get(weight_key)
+                        if weights is None:
                             continue
 
-                        attn = layer_info.get('attention', {})
-
-                        for key, (_, pref_key, _, _) in ROUTING_KEYS.items():
-                            pref = attn.get(pref_key)
-                            if pref is None:
-                                continue
-
-                            if pref.dim() == 3:  # [B, S, N] token-level
-                                for pos in range(min(pref.shape[1], 128)):
-                                    ent = calc_entropy_ratio(pref[:, pos, :])
-                                    layer_position_routing[lidx][key][pos].append(ent)
-                            elif pref.dim() == 2:  # [B, N] batch-level - same for all positions
-                                ent = calc_entropy_ratio(pref)
-                                for pos in range(128):
-                                    layer_position_routing[lidx][key][pos].append(ent)
-        finally:
-            self.disable_pref_tensors()
+                        if weights.dim() == 3:  # [B, S, N] token-level
+                            for pos in range(min(weights.shape[1], 128)):
+                                ent = calc_entropy_ratio(weights[:, pos, :])
+                                layer_position_routing[lidx][key][pos].append(ent)
+                        elif weights.dim() == 2:  # [B, N] batch-level - same for all positions
+                            ent = calc_entropy_ratio(weights)
+                            for pos in range(128):
+                                layer_position_routing[lidx][key][pos].append(ent)
 
         # Build per-layer results
         results = {'per_layer': {}}
@@ -214,87 +216,87 @@ class BehavioralAnalyzer(BaseAnalyzer):
         y_labels = defaultdict(list)
 
         self.model.eval()
-        self.enable_pref_tensors()
-        try:
-            with torch.no_grad():
-                for batch_idx, batch in enumerate(tqdm(dataloader, desc='Probing', total=max_batches)):
-                    if batch_idx >= max_batches:
-                        break
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc='Probing', total=max_batches)):
+                if batch_idx >= max_batches:
+                    break
 
-                    input_ids = get_batch_input_ids(batch, self.device)
-                    B, S = input_ids.shape
+                input_ids = get_batch_input_ids(batch, self.device)
+                B, S = input_ids.shape
 
-                    # Get attention mask if available
-                    if isinstance(batch, dict):
-                        attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
+                # Get attention mask if available
+                if isinstance(batch, dict):
+                    attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
+                else:
+                    attention_mask = torch.ones_like(input_ids)
+
+                try:
+                    outputs = self.model(input_ids, return_routing_info=True)
+                    # Get routing_infos directly from outputs tuple
+                    if isinstance(outputs, tuple) and len(outputs) >= 2:
+                        routing_infos = outputs[1]
                     else:
-                        attention_mask = torch.ones_like(input_ids)
+                        continue
+                    if not routing_infos:
+                        continue
+                except Exception:
+                    continue
 
-                    try:
-                        outputs = self.model(input_ids, return_routing_info=True)
-                        routing_infos = get_routing_from_outputs(outputs)
-                        if routing_infos is None:
-                            continue
-                    except Exception:
+                # Flatten mask for vectorized selection
+                flat_mask = attention_mask.view(-1).bool()  # [B*S]
+                valid_count = flat_mask.sum().item()
+
+                if valid_count == 0:
+                    continue
+
+                # Get valid token ids and compute POS labels once per batch
+                flat_input_ids = input_ids.view(-1)  # [B*S]
+                valid_token_ids = flat_input_ids[flat_mask].cpu().tolist()
+                valid_tokens = self.tokenizer.convert_ids_to_tokens(valid_token_ids)
+                batch_pos_labels = [simple_pos_tag(t) for t in valid_tokens]
+
+                # Process ALL layers
+                for lidx, layer_info in enumerate(routing_infos):
+                    if layer_idx is not None and lidx != layer_idx:
                         continue
 
-                    # Flatten mask for vectorized selection
-                    flat_mask = attention_mask.view(-1).bool()  # [B*S]
-                    valid_count = flat_mask.sum().item()
+                    layer_key = f'L{lidx}'
+                    attn = layer_info.get('attention', layer_info)
+                    knowledge = layer_info.get('knowledge', {})
 
-                    if valid_count == 0:
-                        continue
+                    # Collect attention routing weights - vectorized
+                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                        if weight_key in attn:
+                            w = attn[weight_key]
+                            if w.dim() == 3:  # [B, S, N] token-level
+                                flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
+                            elif w.dim() == 2:  # [B, N] batch-level
+                                # Expand and flatten
+                                expanded = w.unsqueeze(1).expand(-1, S, -1)  # [B, S, N]
+                                flat_w = expanded.reshape(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
+                            else:
+                                continue
+                            X_tensors[layer_key][key].append(valid_w.cpu())
 
-                    # Get valid token ids and compute POS labels once per batch
-                    flat_input_ids = input_ids.view(-1)  # [B*S]
-                    valid_token_ids = flat_input_ids[flat_mask].cpu().tolist()
-                    valid_tokens = self.tokenizer.convert_ids_to_tokens(valid_token_ids)
-                    batch_pos_labels = [simple_pos_tag(t) for t in valid_tokens]
+                    # Collect knowledge routing weights - vectorized
+                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
+                        if weight_key in knowledge:
+                            w = knowledge[weight_key]
+                            if w.dim() == 3:  # [B, S, N] token-level
+                                flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
+                            elif w.dim() == 2:  # [B, N] batch-level
+                                expanded = w.unsqueeze(1).expand(-1, S, -1)  # [B, S, N]
+                                flat_w = expanded.reshape(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
+                            else:
+                                continue
+                            X_tensors[layer_key][key].append(valid_w.cpu())
 
-                    # Process ALL layers
-                    for lidx, layer_info in enumerate(routing_infos):
-                        if layer_idx is not None and lidx != layer_idx:
-                            continue
-
-                        layer_key = f'L{lidx}'
-                        attn = layer_info.get('attention', {})
-                        knowledge = layer_info.get('knowledge', {})
-
-                        # Collect attention routing weights - vectorized
-                        for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                            if weight_key in attn:
-                                w = attn[weight_key]
-                                if w.dim() == 3:  # [B, S, N] token-level
-                                    flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
-                                    valid_w = flat_w[flat_mask]  # [valid_count, N]
-                                elif w.dim() == 2:  # [B, N] batch-level
-                                    # Expand and flatten
-                                    expanded = w.unsqueeze(1).expand(-1, S, -1)  # [B, S, N]
-                                    flat_w = expanded.reshape(-1, w.shape[-1])  # [B*S, N]
-                                    valid_w = flat_w[flat_mask]  # [valid_count, N]
-                                else:
-                                    continue
-                                X_tensors[layer_key][key].append(valid_w.cpu())
-
-                        # Collect knowledge routing weights - vectorized
-                        for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
-                            if weight_key in knowledge:
-                                w = knowledge[weight_key]
-                                if w.dim() == 3:  # [B, S, N] token-level
-                                    flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
-                                    valid_w = flat_w[flat_mask]  # [valid_count, N]
-                                elif w.dim() == 2:  # [B, N] batch-level
-                                    expanded = w.unsqueeze(1).expand(-1, S, -1)  # [B, S, N]
-                                    flat_w = expanded.reshape(-1, w.shape[-1])  # [B*S, N]
-                                    valid_w = flat_w[flat_mask]  # [valid_count, N]
-                                else:
-                                    continue
-                                X_tensors[layer_key][key].append(valid_w.cpu())
-
-                        # Add POS labels for this layer
-                        y_labels[layer_key].extend(batch_pos_labels)
-        finally:
-            self.disable_pref_tensors()
+                    # Add POS labels for this layer
+                    y_labels[layer_key].extend(batch_pos_labels)
 
         # Convert tensors to numpy arrays
         X_data = defaultdict(lambda: defaultdict(list))
@@ -528,123 +530,107 @@ class BehavioralAnalyzer(BaseAnalyzer):
         weight_key = weight_key_map.get(pool_type, 'fv_weights')
 
         self.model.eval()
-        self.enable_pref_tensors()
 
-        try:
-            for prompt, target in zip(prompts, targets):
-                neuron_counts = Counter()
-                matching_runs = 0
+        for prompt, target in zip(prompts, targets):
+            neuron_counts = Counter()
+            matching_runs = 0
 
-                target_id = self.tokenizer.encode(target, add_special_tokens=False)
-                if target_id:
-                    target_id = target_id[0]
-                else:
-                    continue
+            target_id = self.tokenizer.encode(target, add_special_tokens=False)
+            if target_id:
+                target_id = target_id[0]
+            else:
+                continue
 
-                for run_idx in range(n_runs):
-                    # Encode prompt
-                    input_ids = self.tokenizer.encode(
-                        prompt, add_special_tokens=False, return_tensors='pt'
-                    ).to(self.device)
+            for run_idx in range(n_runs):
+                # Encode prompt
+                input_ids = self.tokenizer.encode(
+                    prompt, add_special_tokens=False, return_tensors='pt'
+                ).to(self.device)
 
-                    with torch.no_grad():
-                        outputs = self.model(input_ids, return_routing_info=True)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
 
-                        if isinstance(outputs, tuple) and len(outputs) >= 2:
-                            logits, routing_infos = outputs[0], outputs[1]
-                        else:
-                            logits = outputs
-                            routing_infos = None
+                    if isinstance(outputs, tuple) and len(outputs) >= 2:
+                        logits, routing_infos = outputs[0], outputs[1]
+                    else:
+                        logits = outputs
+                        routing_infos = None
 
-                        # Get predicted token and top-k info
-                        last_logits = logits[:, -1, :]
-                        if temperature != 1.0:
-                            last_logits = last_logits / temperature
+                    # Get predicted token and top-k info
+                    last_logits = logits[:, -1, :]
+                    if temperature != 1.0:
+                        last_logits = last_logits / temperature
 
-                        next_token = last_logits.argmax(dim=-1).item()
+                    next_token = last_logits.argmax(dim=-1).item()
 
-                        # Check top-k accuracy
-                        top_k_tokens = last_logits.topk(20, dim=-1).indices[0].tolist()
-                        target_rank = top_k_tokens.index(target_id) + 1 if target_id in top_k_tokens else -1
+                    # Check top-k accuracy
+                    top_k_tokens = last_logits.topk(20, dim=-1).indices[0].tolist()
+                    target_rank = top_k_tokens.index(target_id) + 1 if target_id in top_k_tokens else -1
 
-                        # Store prediction info on first run
-                        if run_idx == 0:
-                            predicted_text = self.tokenizer.decode([next_token])
-                            target_text = self.tokenizer.decode([target_id])
+                    # Store prediction info on first run
+                    if run_idx == 0:
+                        predicted_text = self.tokenizer.decode([next_token])
+                        target_text = self.tokenizer.decode([target_id])
 
-                        # Check if matches target
-                        if next_token == target_id:
-                            matching_runs += 1
+                    # Check if matches target
+                    if next_token == target_id:
+                        matching_runs += 1
 
-                            # Extract active neurons from routing info
-                            if routing_infos:
-                                for layer_info in routing_infos:
-                                    attn = layer_info.get('attention', layer_info)
+                        # Extract active neurons from routing info
+                        if routing_infos:
+                            for layer_info in routing_infos:
+                                attn = layer_info.get('attention', layer_info)
 
-                                    # Try mask first, then weights
-                                    mask = attn.get(mask_key)
-                                    if mask is not None:
-                                        # Last token position
-                                        if mask.dim() == 3:
-                                            m = mask[0, -1]
-                                        else:
-                                            m = mask[0]
-                                        active = m.nonzero(as_tuple=True)[0].cpu().tolist()
-                                        for n in active:
-                                            neuron_counts[n] += 1
+                                # Try weights directly
+                                weights = attn.get(weight_key)
+                                if weights is not None:
+                                    if weights.dim() == 3:
+                                        w = weights[0, -1]
                                     else:
-                                        weights = attn.get(weight_key)
-                                        if weights is not None:
-                                            if weights.dim() == 3:
-                                                w = weights[0, -1]
-                                            else:
-                                                w = weights[0]
-                                            active = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                                            for n in active:
-                                                neuron_counts[n] += 1
+                                        w = weights[0]
+                                    active = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                                    for n in active:
+                                        neuron_counts[n] += 1
 
-                # Store results for this target
-                base_result = {
-                    'prompt': prompt,
-                    'target_token': target_text if 'target_text' in dir() else target,
-                    'predicted_token': predicted_text if 'predicted_text' in dir() else 'N/A',
-                    'target_rank': target_rank if 'target_rank' in dir() else -1,
-                    'matching_runs': matching_runs,
-                    'total_runs': n_runs,
-                    'match_rate': matching_runs / n_runs,
+            # Store results for this target
+            base_result = {
+                'prompt': prompt,
+                'target_token': target_text if 'target_text' in dir() else target,
+                'predicted_token': predicted_text if 'predicted_text' in dir() else 'N/A',
+                'target_rank': target_rank if 'target_rank' in dir() else -1,
+                'matching_runs': matching_runs,
+                'total_runs': n_runs,
+                'match_rate': matching_runs / n_runs,
+            }
+
+            if matching_runs > 0:
+                # Calculate frequency (fraction of matching runs)
+                neuron_freq = {
+                    n: count / matching_runs
+                    for n, count in neuron_counts.items()
                 }
+                # Filter to neurons appearing in >80% and 100% of runs
+                common_neurons_80 = [
+                    n for n, freq in neuron_freq.items()
+                    if freq >= 0.8
+                ]
+                common_neurons_100 = [
+                    n for n, freq in neuron_freq.items()
+                    if freq >= 1.0
+                ]
 
-                if matching_runs > 0:
-                    # Calculate frequency (fraction of matching runs)
-                    neuron_freq = {
-                        n: count / matching_runs
-                        for n, count in neuron_counts.items()
-                    }
-                    # Filter to neurons appearing in >80% and 100% of runs
-                    common_neurons_80 = [
-                        n for n, freq in neuron_freq.items()
-                        if freq >= 0.8
-                    ]
-                    common_neurons_100 = [
-                        n for n, freq in neuron_freq.items()
-                        if freq >= 1.0
-                    ]
+                base_result.update({
+                    'neuron_frequencies': sorted(
+                        [(n, f) for n, f in neuron_freq.items()],
+                        key=lambda x: -x[1]
+                    )[:50],
+                    'common_neurons_80': common_neurons_80,
+                    'common_neurons_100': common_neurons_100,
+                })
+            else:
+                base_result['note'] = f'Model predicted "{predicted_text}" (rank={target_rank})' if 'predicted_text' in dir() else 'No matching runs'
 
-                    base_result.update({
-                        'neuron_frequencies': sorted(
-                            [(n, f) for n, f in neuron_freq.items()],
-                            key=lambda x: -x[1]
-                        )[:50],
-                        'common_neurons_80': common_neurons_80,
-                        'common_neurons_100': common_neurons_100,
-                    })
-                else:
-                    base_result['note'] = f'Model predicted "{predicted_text}" (rank={target_rank})' if 'predicted_text' in dir() else 'No matching runs'
-
-                results['per_target'][target] = base_result
-
-        finally:
-            self.disable_pref_tensors()
+            results['per_target'][target] = base_result
 
         return results
 
