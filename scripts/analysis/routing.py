@@ -144,7 +144,7 @@ class RoutingAnalyzer(BaseAnalyzer):
             top10 = counts.most_common(10)
             unique = len(counts)
 
-            neuron_types = self._get_neuron_types()
+            neuron_types = self.get_neuron_types()
             pool_info = neuron_types.get(pool, {})
             n_attr = pool_info[2] if pool_info else None
             n_total = getattr(self.router, n_attr, 0) if n_attr else 0
@@ -250,7 +250,7 @@ class RoutingAnalyzer(BaseAnalyzer):
             else:
                 continue
 
-            neuron_types = self._get_neuron_types()
+            neuron_types = self.get_neuron_types()
             pool_info = neuron_types.get(pool, {})
             n_attr = pool_info[2] if pool_info else None
             n_total = getattr(self.router, n_attr, 0) if n_attr else 0
