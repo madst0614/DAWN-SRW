@@ -23,6 +23,7 @@ from .utils import (
     NEURON_TYPES, NEURON_TYPES_V18, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS, QK_POOLS,
     calc_entropy_ratio, gini_coefficient,
     get_batch_input_ids,
+    RoutingDataExtractor,  # New extraction layer
     HAS_MATPLOTLIB, HAS_TQDM, tqdm, plt
 )
 
@@ -30,7 +31,7 @@ from .utils import (
 class RoutingAnalyzer(BaseAnalyzer):
     """Routing pattern analyzer for DAWN v17.1+."""
 
-    def __init__(self, model, router=None, device='cuda'):
+    def __init__(self, model, router=None, device='cuda', extractor=None):
         """
         Initialize analyzer.
 
@@ -38,15 +39,10 @@ class RoutingAnalyzer(BaseAnalyzer):
             model: DAWN model
             router: NeuronRouter instance (auto-detected if None)
             device: Device for computation
+            extractor: RoutingDataExtractor instance (created if None)
         """
         super().__init__(model, router=router, device=device)
-
-    # Use inherited methods from BaseAnalyzer:
-    # - is_v18 (property)
-    # - get_neuron_types()
-    # - enable_pref_tensors()
-    # - disable_pref_tensors()
-    # - run_analysis_loop()
+        self.extractor = extractor or RoutingDataExtractor(model, device=device)
 
     def analyze_entropy(self, dataloader, n_batches: int = 50) -> Dict:
         """
@@ -62,27 +58,23 @@ class RoutingAnalyzer(BaseAnalyzer):
         entropy_data = {name: [] for name in ROUTING_KEYS.keys()}
 
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Entropy')):
                 if i >= n_batches:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
-                outputs = self.model(input_ids, return_routing_info=True)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
 
-                # Get routing_infos directly from outputs tuple
-                if not isinstance(outputs, tuple) or len(outputs) < 2:
-                    continue
-                routing_infos = outputs[1]
-                if not routing_infos:
+                routing = self.extractor.extract(outputs)
+                if not routing:
                     continue
 
-                for layer_info in routing_infos:
-                    attn = layer_info.get('attention', layer_info)
-
-                    # Use weight keys instead of pref keys
-                    for key, (display, _, weight_key, _) in ROUTING_KEYS.items():
-                        weights = attn.get(weight_key)
+                for layer in routing:
+                    # Use standardized weight access (key matches ROUTING_KEYS)
+                    for key in ROUTING_KEYS.keys():
+                        weights = layer.get_weight(key)
                         if weights is not None:
                             ent = calc_entropy_ratio(weights)
                             entropy_data[key].append(ent)
@@ -115,27 +107,23 @@ class RoutingAnalyzer(BaseAnalyzer):
         selection_counts = {name: Counter() for name in ROUTING_KEYS.keys()}
 
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Selection')):
                 if i >= n_batches:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
-                outputs = self.model(input_ids, return_routing_info=True)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
 
-                # Get routing_infos directly from outputs tuple
-                if not isinstance(outputs, tuple) or len(outputs) < 2:
-                    continue
-                routing_infos = outputs[1]
-                if not routing_infos:
+                routing = self.extractor.extract(outputs)
+                if not routing:
                     continue
 
-                for layer_info in routing_infos:
-                    attn = layer_info.get('attention', layer_info)
-
-                    # Use weight keys - count neurons with non-zero weights
-                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                        weights = attn.get(weight_key)
+                for layer in routing:
+                    # Use standardized weight access
+                    for key in ROUTING_KEYS.keys():
+                        weights = layer.get_weight(key)
                         if weights is None:
                             continue
 
