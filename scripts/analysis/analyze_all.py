@@ -556,24 +556,24 @@ class ModelAnalyzer:
 
         if entropy:
             print(f"\n  ┌─ Routing Entropy ─────────────────────────────────────────────────────")
-            print(f"  │ {'Pool':<12} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10} {'Median':>10}")
-            print(f"  │ {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*10} {'─'*10}")
+            print(f"  │ {'Pool':<12} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
+            print(f"  │ {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*10}")
             for pool, data in entropy.items():
-                if isinstance(data, dict) and 'mean' in data:
-                    print(f"  │ {pool:<12} {data['mean']:>10.3f} {data.get('std', 0):>10.3f} "
-                          f"{data.get('min', 0):>10.3f} {data.get('max', 0):>10.3f} {data.get('median', 0):>10.3f}")
+                if isinstance(data, dict) and 'mean_entropy' in data:
+                    print(f"  │ {data.get('display', pool):<12} {data['mean_entropy']:>10.3f} {data.get('std_entropy', 0):>10.3f} "
+                          f"{data.get('min_entropy', 0):>10.3f} {data.get('max_entropy', 0):>10.3f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if selection_freq:
             print(f"\n  ┌─ Selection Frequency ─────────────────────────────────────────────────")
             for pool, data in selection_freq.items():
                 if isinstance(data, dict) and 'total_selections' in data:
-                    print(f"  │ {pool}:")
+                    print(f"  │ {data.get('display', pool)}:")
                     print(f"  │   Total selections: {data['total_selections']:,}")
-                    print(f"  │   Unique neurons: {data.get('unique_neurons', 0):,} / {data.get('total_neurons', 0):,}")
+                    print(f"  │   Unique neurons: {data.get('unique_selected', 0):,}")
                     print(f"  │   Coverage: {data.get('coverage', 0)*100:.1f}%")
-                    if data.get('top_neurons'):
-                        top_5 = data['top_neurons'][:5]
+                    if data.get('top10'):
+                        top_5 = data['top10'][:5]
                         print(f"  │   Top 5: {', '.join(f'N{n[0]}({n[1]})' for n in top_5)}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
@@ -603,8 +603,8 @@ class ModelAnalyzer:
         if qk_entropy:
             print(f"\n  ┌─ Q/K Entropy Comparison ───────────────────────────────────────────────")
             for pool, data in qk_entropy.items():
-                if isinstance(data, dict) and 'q_entropy' in data:
-                    print(f"  │ {pool}: Q={data['q_entropy']:.3f}, K={data['k_entropy']:.3f}, diff={data.get('diff', 0):.3f}")
+                if isinstance(data, dict) and 'q_entropy_mean' in data:
+                    print(f"  │ {pool}: Q={data['q_entropy_mean']:.1f}%, K={data['k_entropy_mean']:.1f}%, diff={data.get('entropy_diff', 0):.1f}%")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['routing'] = results
@@ -652,12 +652,11 @@ class ModelAnalyzer:
         if clustering:
             print(f"\n  ┌─ Clustering Results ───────────────────────────────────────────────────")
             for pool, data in clustering.items():
-                if isinstance(data, dict) and 'silhouette' in data:
-                    print(f"  │ {pool}:")
-                    print(f"  │   Silhouette: {data['silhouette']:.3f}")
-                    print(f"  │   Inertia: {data.get('inertia', 0):.1f}")
-                    if data.get('cluster_sizes'):
-                        sizes = data['cluster_sizes']
+                if isinstance(data, dict) and 'n_clusters' in data:
+                    print(f"  │ {data.get('display', pool)}:")
+                    print(f"  │   Clusters: {data['n_clusters']}")
+                    if data.get('clusters'):
+                        sizes = [c.get('size', 0) for c in data['clusters']]
                         print(f"  │   Cluster sizes: {sizes}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
@@ -687,30 +686,46 @@ class ModelAnalyzer:
 
         if path_sim:
             print(f"\n  ┌─ Semantic Path Similarity ─────────────────────────────────────────────")
-            for pair_name, data in path_sim.items():
-                if isinstance(data, dict) and 'similarity' in data:
-                    print(f"  │ {pair_name}:")
-                    print(f"  │   Similarity: {data['similarity']:.4f}")
-                    if data.get('common_neurons'):
-                        print(f"  │   Common neurons: {len(data['common_neurons'])}")
+            # Similar/different pairs summary
+            sim_pairs = path_sim.get('similar_pairs', {})
+            diff_pairs = path_sim.get('different_pairs', {})
+            if sim_pairs or diff_pairs:
+                print(f"  │ Similar pairs: cosine={sim_pairs.get('cosine_mean', 0):.4f}, n={sim_pairs.get('count', 0)}")
+                print(f"  │ Different pairs: cosine={diff_pairs.get('cosine_mean', 0):.4f}, n={diff_pairs.get('count', 0)}")
+                gap = sim_pairs.get('cosine_mean', 0) - diff_pairs.get('cosine_mean', 0)
+                print(f"  │ Similarity gap: {gap:.4f}")
+            # Interpretation
+            interp = path_sim.get('interpretation', {})
+            if interp:
+                print(f"  │ Verdict: {interp.get('verdict', 'N/A')}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if context_routing:
             print(f"\n  ┌─ Context-Dependent Routing ────────────────────────────────────────────")
             for word, data in context_routing.items():
-                if isinstance(data, dict) and 'contexts' in data:
-                    n_contexts = len(data['contexts'])
-                    overlap = data.get('overlap_ratio', 0)
-                    print(f"  │ '{word}': {n_contexts} contexts, overlap={overlap*100:.1f}%")
+                if word == 'summary':
+                    continue
+                if isinstance(data, dict) and 'n_contexts' in data:
+                    n_contexts = data['n_contexts']
+                    avg_var = data.get('avg_variance', 0)
+                    print(f"  │ '{word}': {n_contexts} contexts, variance={avg_var:.4f}")
+            # Summary
+            summary = context_routing.get('summary', {})
+            if summary:
+                print(f"  │ Overall context variance: {summary.get('overall_context_variance', 0):.4f}")
+                print(f"  │ More context-sensitive: {summary.get('more_context_sensitive', 'N/A')}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if pos_routing:
             print(f"\n  ┌─ POS Routing Patterns ─────────────────────────────────────────────────")
-            for pos, data in list(pos_routing.items())[:10]:  # Top 10
+            routing_by_pos = pos_routing.get('routing_by_pos', {})
+            # Sort by count and show top 10
+            sorted_pos = sorted(routing_by_pos.items(), key=lambda x: x[1].get('count', 0), reverse=True)[:10]
+            for pos, data in sorted_pos:
                 if isinstance(data, dict) and 'mean_activation' in data:
                     print(f"  │ {pos}: mean_act={data['mean_activation']:.4f}, count={data.get('count', 0)}")
-            if len(pos_routing) > 10:
-                print(f"  │ ... and {len(pos_routing) - 10} more POS tags")
+            if len(routing_by_pos) > 10:
+                print(f"  │ ... and {len(routing_by_pos) - 10} more POS tags")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['semantic'] = results
