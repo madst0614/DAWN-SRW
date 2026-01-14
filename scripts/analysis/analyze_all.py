@@ -608,6 +608,15 @@ class ModelAnalyzer:
             for pool, data in qk_overlap.items():
                 if isinstance(data, dict) and 'overlap_ratio' in data:
                     print(f"  │ {pool}: overlap={data['overlap_ratio']*100:.1f}%, jaccard={data.get('jaccard', 0):.3f}")
+                    # Debug info
+                    debug = data.get('debug', {})
+                    if debug:
+                        print(f"  │   Retrieved: {debug.get('retrieved_count', 0)} layers")
+                        samples = debug.get('samples', [])
+                        if samples:
+                            s = samples[0]
+                            print(f"  │   Sample: Q_active={s.get('q_active', 0)}, K_active={s.get('k_active', 0)}, "
+                                  f"Q_max={s.get('q_max', 0):.4f}, K_max={s.get('k_max', 0):.4f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if qk_entropy:

@@ -312,9 +312,10 @@ class RoutingAnalyzer(BaseAnalyzer):
             Dictionary with Q/K overlap statistics
         """
         overlap_data = {'fqk': [], 'rqk': []}
+        debug_info = {'fqk_retrieved': 0, 'rqk_retrieved': 0, 'fqk_samples': [], 'rqk_samples': []}
         threshold = 0.01  # For soft gating
 
-        def compute_jaccard_from_weights(q_weights, k_weights):
+        def compute_jaccard_from_weights(q_weights, k_weights, debug_key=None):
             """Compute Jaccard similarity from weight tensors (active neurons)."""
             # Flatten if 3D: [B, S, N] -> [B*S, N]
             if q_weights.dim() == 3:
@@ -327,6 +328,17 @@ class RoutingAnalyzer(BaseAnalyzer):
             # Active neurons (weight > threshold for soft gating)
             q_active = (q_flat > threshold).float()
             k_active = (k_flat > threshold).float()
+
+            # Debug: store sample info (first batch only)
+            if debug_key and len(debug_info[f'{debug_key}_samples']) < 5:
+                q_count = q_active[0].sum().item() if q_active.shape[0] > 0 else 0
+                k_count = k_active[0].sum().item() if k_active.shape[0] > 0 else 0
+                debug_info[f'{debug_key}_samples'].append({
+                    'q_active': int(q_count),
+                    'k_active': int(k_count),
+                    'q_max': float(q_flat[0].max().item()) if q_flat.shape[0] > 0 else 0,
+                    'k_max': float(k_flat[0].max().item()) if k_flat.shape[0] > 0 else 0,
+                })
 
             # Compute intersection and union
             intersection = (q_active * k_active).sum(dim=-1)  # [B*S]
@@ -356,13 +368,15 @@ class RoutingAnalyzer(BaseAnalyzer):
                     fqk_q = layer.get_weight('fqk_q')
                     fqk_k = layer.get_weight('fqk_k')
                     if fqk_q is not None and fqk_k is not None:
-                        overlap_data['fqk'].extend(compute_jaccard_from_weights(fqk_q, fqk_k))
+                        debug_info['fqk_retrieved'] += 1
+                        overlap_data['fqk'].extend(compute_jaccard_from_weights(fqk_q, fqk_k, 'fqk'))
 
                     # R-QK Q/K overlap using standardized keys
                     rqk_q = layer.get_weight('rqk_q')
                     rqk_k = layer.get_weight('rqk_k')
                     if rqk_q is not None and rqk_k is not None:
-                        overlap_data['rqk'].extend(compute_jaccard_from_weights(rqk_q, rqk_k))
+                        debug_info['rqk_retrieved'] += 1
+                        overlap_data['rqk'].extend(compute_jaccard_from_weights(rqk_q, rqk_k, 'rqk'))
 
         results = {}
         for key in ['fqk', 'rqk']:
@@ -375,7 +389,11 @@ class RoutingAnalyzer(BaseAnalyzer):
                     'interpretation': (
                         'Q and K select similar neurons' if mean_overlap > 0.3
                         else 'Q and K select different neurons'
-                    )
+                    ),
+                    'debug': {
+                        'retrieved_count': debug_info[f'{key}_retrieved'],
+                        'samples': debug_info[f'{key}_samples'],
+                    }
                 }
 
         return results
