@@ -15,8 +15,9 @@ from collections import defaultdict
 
 from .base import BaseAnalyzer
 from .utils import (
-    get_routing_from_outputs,
-    HAS_TQDM, tqdm
+    HAS_TQDM, tqdm,
+    RoutingDataExtractor,  # Schema layer for model-agnostic access
+    resolve_pool_type,     # Resolve pool type aliases
 )
 
 
@@ -44,6 +45,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         tokenizer=None,
         device: str = 'cuda',
         target_layer: int = None,
+        extractor=None,
     ):
         """
         Initialize analyzer.
@@ -54,8 +56,10 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             tokenizer: Tokenizer instance
             device: Device for computation
             target_layer: Specific layer to analyze (None = all)
+            extractor: RoutingDataExtractor instance (created if None)
         """
         super().__init__(model, router=router, tokenizer=tokenizer, device=device)
+        self.extractor = extractor or RoutingDataExtractor(model, device=device)
         self.target_layer = target_layer
         self.model.eval()
 
@@ -241,69 +245,45 @@ class POSNeuronAnalyzer(BaseAnalyzer):
 
         Args:
             token_ids: List of token IDs
-            pool_type: Pool to analyze ('fv', 'rv', 'fqk_q', etc.)
+            pool_type: Pool to analyze ('fv', 'rv', 'fqk_q', etc.) - uses standardized keys
 
         Returns:
             {position: [neuron_indices]}
         """
         input_ids = torch.tensor([token_ids], device=self.device)
 
-        self.enable_pref_tensors()
-        try:
+        with self.extractor.analysis_context():
             with torch.no_grad():
                 outputs = self.model(input_ids, return_routing_info=True)
 
-            routing_infos = get_routing_from_outputs(outputs)
-            if routing_infos is None:
+            routing = self.extractor.extract(outputs)
+            if not routing:
                 return {}
-        finally:
-            self.disable_pref_tensors()
-
-        # Map pool_type to keys
-        mask_key_map = {
-            'fv': 'fv_mask', 'rv': 'rv_mask',
-            'fqk_q': 'fqk_mask_Q', 'fqk_k': 'fqk_mask_K',
-            'rqk_q': 'rqk_mask_Q', 'rqk_k': 'rqk_mask_K',
-            'fknow': 'feature_know_mask', 'rknow': 'restore_know_mask',
-        }
-        weight_key_map = {
-            'fv': 'fv_weights', 'rv': 'rv_weights',
-            'fqk_q': 'fqk_weights_Q', 'fqk_k': 'fqk_weights_K',
-            'rqk_q': 'rqk_weights_Q', 'rqk_k': 'rqk_weights_K',
-            'fknow': 'feature_know_w', 'rknow': 'restore_know_w',
-        }
-        mask_key = mask_key_map.get(pool_type, 'fv_mask')
-        weight_key = weight_key_map.get(pool_type, 'fv_weights')
 
         position_neurons = defaultdict(set)
         seq_len = input_ids.shape[1]
 
-        for layer_idx, layer_info in enumerate(routing_infos):
-            if self.target_layer is not None and layer_idx != self.target_layer:
+        # pool_type is already a standardized key, extractor handles mapping
+        for layer in routing:
+            if self.target_layer is not None and layer.layer_idx != self.target_layer:
                 continue
 
-            attn = layer_info.get('attention', layer_info)
-            know = layer_info.get('knowledge', {})
+            # Get weights using standardized key
+            weights = layer.get_weight(pool_type)
 
-            # Prefer binary mask
-            mask = attn.get(mask_key) or know.get(mask_key)
-            use_mask = mask is not None
-
-            if not use_mask:
-                mask = attn.get(weight_key) or know.get(weight_key)
-
-            if mask is not None and mask.dim() >= 2:
-                for pos in range(min(seq_len, mask.shape[1] if mask.dim() == 3 else seq_len)):
-                    if mask.dim() == 3:
-                        m = mask[0, pos]
-                    else:
-                        m = mask[0]
-
-                    if use_mask:
-                        active_neurons = m.nonzero(as_tuple=True)[0].cpu().tolist()
-                    else:
-                        active_neurons = (m > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                    position_neurons[pos].update(active_neurons)
+            if weights is not None:
+                # weights: [B, T, N] or [B, N]
+                if weights.dim() == 3:
+                    for pos in range(min(seq_len, weights.shape[1])):
+                        w = weights[0, pos]  # [N]
+                        active_neurons = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                        position_neurons[pos].update(active_neurons)
+                elif weights.dim() == 2:
+                    # Batch-level routing - same for all positions
+                    w = weights[0]  # [N]
+                    active_neurons = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    for pos in range(seq_len):
+                        position_neurons[pos].update(active_neurons)
 
         return {pos: list(neurons) for pos, neurons in position_neurons.items()}
 
@@ -341,12 +321,15 @@ class POSNeuronAnalyzer(BaseAnalyzer):
 
         Args:
             dataset: List of {'tokens': [...], 'upos': [...]}
-            pool_type: Pool to analyze
+            pool_type: Pool to analyze (fv, fqk, fqk_q, fqk_k, rv, rqk, rqk_q, rqk_k, fknow, rknow)
             max_sentences: Maximum sentences to process
 
         Returns:
             Analysis results dictionary
         """
+        # Resolve pool type alias (e.g., 'fqk' -> 'fqk_q')
+        pool_type = resolve_pool_type(pool_type)
+
         self.reset_stats()
         n_sentences = min(len(dataset), max_sentences) if max_sentences else len(dataset)
 

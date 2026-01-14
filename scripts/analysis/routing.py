@@ -21,8 +21,10 @@ from collections import Counter, defaultdict
 from .base import BaseAnalyzer
 from .utils import (
     NEURON_TYPES, NEURON_TYPES_V18, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS, QK_POOLS,
+    POOL_N_ATTR,  # Direct pool_type to n_attr mapping
     calc_entropy_ratio, gini_coefficient,
-    get_batch_input_ids, get_routing_from_outputs,
+    get_batch_input_ids,
+    RoutingDataExtractor,  # New extraction layer
     HAS_MATPLOTLIB, HAS_TQDM, tqdm, plt
 )
 
@@ -30,7 +32,7 @@ from .utils import (
 class RoutingAnalyzer(BaseAnalyzer):
     """Routing pattern analyzer for DAWN v17.1+."""
 
-    def __init__(self, model, router=None, device='cuda'):
+    def __init__(self, model, router=None, device='cuda', extractor=None):
         """
         Initialize analyzer.
 
@@ -38,15 +40,10 @@ class RoutingAnalyzer(BaseAnalyzer):
             model: DAWN model
             router: NeuronRouter instance (auto-detected if None)
             device: Device for computation
+            extractor: RoutingDataExtractor instance (created if None)
         """
         super().__init__(model, router=router, device=device)
-
-    # Use inherited methods from BaseAnalyzer:
-    # - is_v18 (property)
-    # - get_neuron_types()
-    # - enable_pref_tensors()
-    # - disable_pref_tensors()
-    # - run_analysis_loop()
+        self.extractor = extractor or RoutingDataExtractor(model, device=device)
 
     def analyze_entropy(self, dataloader, n_batches: int = 50) -> Dict:
         """
@@ -62,25 +59,25 @@ class RoutingAnalyzer(BaseAnalyzer):
         entropy_data = {name: [] for name in ROUTING_KEYS.keys()}
 
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Entropy')):
                 if i >= n_batches:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
-                outputs = self.model(input_ids, return_routing_info=True)
-                routing_infos = get_routing_from_outputs(outputs)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
 
-                if routing_infos is None:
+                routing = self.extractor.extract(outputs)
+                if not routing:
                     continue
 
-                for layer_info in routing_infos:
-                    attn = layer_info.get('attention', {})
-
-                    for key, (display, pref_key, _, _) in ROUTING_KEYS.items():
-                        pref = attn.get(pref_key)
-                        if pref is not None:
-                            ent = calc_entropy_ratio(pref)
+                for layer in routing:
+                    # Use standardized weight access (key matches ROUTING_KEYS)
+                    for key in ROUTING_KEYS.keys():
+                        weights = layer.get_weight(key)
+                        if weights is not None:
+                            ent = calc_entropy_ratio(weights)
                             entropy_data[key].append(ent)
 
         results = {}
@@ -111,31 +108,31 @@ class RoutingAnalyzer(BaseAnalyzer):
         selection_counts = {name: Counter() for name in ROUTING_KEYS.keys()}
 
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Selection')):
                 if i >= n_batches:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
-                outputs = self.model(input_ids, return_routing_info=True)
-                routing_infos = get_routing_from_outputs(outputs)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
 
-                if routing_infos is None:
+                routing = self.extractor.extract(outputs)
+                if not routing:
                     continue
 
-                for layer_info in routing_infos:
-                    attn = layer_info.get('attention', {})
-
-                    for key, (_, pref_key, _, _) in ROUTING_KEYS.items():
-                        pref = attn.get(pref_key)
-                        if pref is None:
+                for layer in routing:
+                    # Use standardized weight access
+                    for key in ROUTING_KEYS.keys():
+                        weights = layer.get_weight(key)
+                        if weights is None:
                             continue
 
-                        k = min(8, pref.shape[-1])
-                        _, topk_idx = torch.topk(pref, k, dim=-1)
-                        flat_idx = topk_idx.view(-1).cpu().numpy()
+                        # Get indices of active neurons (weight > 0)
+                        active_mask = weights > 0
+                        active_indices = active_mask.nonzero(as_tuple=False)[:, -1].cpu().numpy()
 
-                        for idx in flat_idx:
+                        for idx in active_indices:
                             selection_counts[key][int(idx)] += 1
 
         results = {}
@@ -148,9 +145,8 @@ class RoutingAnalyzer(BaseAnalyzer):
             top10 = counts.most_common(10)
             unique = len(counts)
 
-            neuron_types = self._get_neuron_types()
-            pool_info = neuron_types.get(pool, {})
-            n_attr = pool_info[2] if pool_info else None
+            # Use direct POOL_N_ATTR mapping for consistent n_total lookup
+            n_attr = POOL_N_ATTR.get(pool)
             n_total = getattr(self.router, n_attr, 0) if n_attr else 0
 
             results[key] = {
@@ -184,7 +180,7 @@ class RoutingAnalyzer(BaseAnalyzer):
         per_batch_counts = defaultdict(list)
 
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, desc='Selection Diversity', total=n_batches)):
                 if i >= n_batches:
                     break
@@ -192,23 +188,23 @@ class RoutingAnalyzer(BaseAnalyzer):
                 input_ids = get_batch_input_ids(batch, self.device)
 
                 try:
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    routing_infos = get_routing_from_outputs(outputs)
-                    if routing_infos is None:
+                    with torch.no_grad():
+                        outputs = self.model(input_ids, return_routing_info=True)
+                    routing = self.extractor.extract(outputs)
+                    if not routing:
                         continue
                 except Exception:
                     continue
 
-                # Process ALL layers
-                for layer_idx, layer_info in enumerate(routing_infos):
-                    attn = layer_info.get('attention', {})
-                    knowledge = layer_info.get('knowledge', {})
+                # Process ALL layers using extractor
+                for layer in routing:
+                    layer_idx = layer.layer_idx
 
-                    # Attention routing
-                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                    # Attention routing - use standardized keys
+                    for key in ROUTING_KEYS.keys():
                         layer_key = f'L{layer_idx}/{key}'
-                        if weight_key in attn:
-                            weights = attn[weight_key]
+                        weights = layer.get_weight(key)
+                        if weights is not None:
                             if weights.dim() == 3:
                                 selected = (weights > 0).any(dim=0).any(dim=0).cpu()
                                 union_selected[layer_key].update(selected.nonzero().flatten().tolist())
@@ -218,11 +214,11 @@ class RoutingAnalyzer(BaseAnalyzer):
                                 union_selected[layer_key].update(selected.nonzero().flatten().tolist())
                                 per_batch_counts[layer_key].append(selected.sum().item())
 
-                    # Knowledge routing
-                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
+                    # Knowledge routing - use standardized keys
+                    for key in KNOWLEDGE_ROUTING_KEYS.keys():
                         layer_key = f'L{layer_idx}/{key}'
-                        if weight_key in knowledge:
-                            weights = knowledge[weight_key]
+                        weights = layer.get_weight(key)
+                        if weights is not None:
                             if weights.dim() == 3:
                                 selected = (weights > 0).any(dim=0).any(dim=0).cpu()
                                 union_selected[layer_key].update(selected.nonzero().flatten().tolist())
@@ -254,9 +250,8 @@ class RoutingAnalyzer(BaseAnalyzer):
             else:
                 continue
 
-            neuron_types = self._get_neuron_types()
-            pool_info = neuron_types.get(pool, {})
-            n_attr = pool_info[2] if pool_info else None
+            # Use direct POOL_N_ATTR mapping for consistent n_total lookup
+            n_attr = POOL_N_ATTR.get(pool)
             n_total = getattr(self.router, n_attr, 0) if n_attr else 0
 
             union_count = len(union_selected[layer_key])
@@ -313,36 +308,23 @@ class RoutingAnalyzer(BaseAnalyzer):
         """
         overlap_data = {'fqk': [], 'rqk': []}
 
-        def compute_jaccard_batch(q_prefs, k_prefs, topk=8):
-            """Compute Jaccard similarity for batch using GPU tensors."""
-            N = q_prefs.shape[-1]
-            k = min(topk, N)
-
+        def compute_jaccard_from_weights(q_weights, k_weights):
+            """Compute Jaccard similarity from weight tensors (active neurons)."""
             # Flatten if 3D: [B, S, N] -> [B*S, N]
-            if q_prefs.dim() == 3:
-                B, S, _ = q_prefs.shape
-                q_flat = q_prefs.view(-1, N)
-                k_flat = k_prefs.view(-1, N)
+            if q_weights.dim() == 3:
+                q_flat = q_weights.view(-1, q_weights.shape[-1])
+                k_flat = k_weights.view(-1, k_weights.shape[-1])
             else:
-                q_flat = q_prefs
-                k_flat = k_prefs
+                q_flat = q_weights
+                k_flat = k_weights
 
-            # Get top-k indices
-            q_topk_idx = torch.topk(q_flat, k, dim=-1)[1]  # [B*S, k]
-            k_topk_idx = torch.topk(k_flat, k, dim=-1)[1]  # [B*S, k]
-
-            # Create one-hot masks
-            batch_size = q_flat.shape[0]
-            q_mask = torch.zeros(batch_size, N, device=q_prefs.device)
-            k_mask = torch.zeros(batch_size, N, device=k_prefs.device)
-
-            # Scatter to create binary masks
-            q_mask.scatter_(1, q_topk_idx, 1.0)
-            k_mask.scatter_(1, k_topk_idx, 1.0)
+            # Active neurons (weight > 0)
+            q_active = (q_flat > 0).float()
+            k_active = (k_flat > 0).float()
 
             # Compute intersection and union
-            intersection = (q_mask * k_mask).sum(dim=-1)  # [B*S]
-            union = ((q_mask + k_mask) > 0).float().sum(dim=-1)  # [B*S]
+            intersection = (q_active * k_active).sum(dim=-1)  # [B*S]
+            union = ((q_active + k_active) > 0).float().sum(dim=-1)  # [B*S]
 
             # Jaccard = intersection / union
             jaccard = intersection / (union + 1e-8)
@@ -350,44 +332,39 @@ class RoutingAnalyzer(BaseAnalyzer):
             return jaccard.cpu().tolist()
 
         self.model.eval()
-        self.enable_pref_tensors()
+        with self.extractor.analysis_context():
+            for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Q/K Overlap')):
+                if i >= n_batches:
+                    break
 
-        try:
-            with torch.no_grad():
-                for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Q/K Overlap')):
-                    if i >= n_batches:
-                        break
-
-                    input_ids = get_batch_input_ids(batch, self.device)
+                input_ids = get_batch_input_ids(batch, self.device)
+                with torch.no_grad():
                     outputs = self.model(input_ids, return_routing_info=True)
-                    routing_infos = get_routing_from_outputs(outputs)
 
-                    if routing_infos is None:
-                        continue
+                routing = self.extractor.extract(outputs)
+                if not routing:
+                    continue
 
-                    for layer_info in routing_infos:
-                        attn = layer_info.get('attention', {})
+                for layer in routing:
+                    # F-QK Q/K overlap using standardized keys
+                    fqk_q = layer.get_weight('fqk_q')
+                    fqk_k = layer.get_weight('fqk_k')
+                    if fqk_q is not None and fqk_k is not None:
+                        overlap_data['fqk'].extend(compute_jaccard_from_weights(fqk_q, fqk_k))
 
-                        # F-QK Q/K overlap - vectorized
-                        fqk_q = attn.get('fqk_q_pref')
-                        fqk_k = attn.get('fqk_k_pref')
-                        if fqk_q is not None and fqk_k is not None:
-                            overlap_data['fqk'].extend(compute_jaccard_batch(fqk_q, fqk_k))
-
-                        # R-QK Q/K overlap - vectorized
-                        rqk_q = attn.get('rqk_q_pref')
-                        rqk_k = attn.get('rqk_k_pref')
-                        if rqk_q is not None and rqk_k is not None:
-                            overlap_data['rqk'].extend(compute_jaccard_batch(rqk_q, rqk_k))
-        finally:
-            self.disable_pref_tensors()
+                    # R-QK Q/K overlap using standardized keys
+                    rqk_q = layer.get_weight('rqk_q')
+                    rqk_k = layer.get_weight('rqk_k')
+                    if rqk_q is not None and rqk_k is not None:
+                        overlap_data['rqk'].extend(compute_jaccard_from_weights(rqk_q, rqk_k))
 
         results = {}
         for key in ['fqk', 'rqk']:
             if overlap_data[key]:
                 mean_overlap = np.mean(overlap_data[key])
                 results[key] = {
-                    'mean_overlap': float(mean_overlap),
+                    'overlap_ratio': float(mean_overlap),
+                    'jaccard': float(mean_overlap),
                     'std_overlap': float(np.std(overlap_data[key])),
                     'interpretation': (
                         'Q and K select similar neurons' if mean_overlap > 0.3
@@ -409,80 +386,86 @@ class RoutingAnalyzer(BaseAnalyzer):
         Returns:
             Dictionary with Q/K usage statistics
         """
+        # Map pool names to standardized Q/K keys
+        POOL_STD_KEYS = {
+            'feature_qk': ('fqk_q', 'fqk_k'),
+            'restore_qk': ('rqk_q', 'rqk_k'),
+        }
+
         results = {}
         self.model.eval()
-        self.enable_pref_tensors()
 
-        try:
-            for pool_name, pool_info in QK_POOLS.items():
-                n_neurons = getattr(self.router, pool_info['n_attr'], 0)
-                if n_neurons == 0:
-                    continue
+        for pool_name, pool_info in QK_POOLS.items():
+            n_neurons = getattr(self.router, pool_info['n_attr'], 0)
+            if n_neurons == 0:
+                continue
 
-                # Per-layer counts: {lidx: (q_counts, k_counts, overlaps)}
-                layer_data = {}
+            # Get standardized keys for this pool
+            std_q_key, std_k_key = POOL_STD_KEYS.get(pool_name, (None, None))
+            if std_q_key is None:
+                continue
 
-                with torch.no_grad():
-                    for i, batch in enumerate(tqdm(dataloader, desc=f'{pool_info["display"]} Q/K', total=n_batches)):
-                        if i >= n_batches:
-                            break
+            # Per-layer counts: {lidx: (q_counts, k_counts, overlaps)}
+            layer_data = {}
 
-                        input_ids = get_batch_input_ids(batch, self.device)
+            with self.extractor.analysis_context():
+                for i, batch in enumerate(tqdm(dataloader, desc=f'{pool_info["display"]} Q/K', total=n_batches)):
+                    if i >= n_batches:
+                        break
 
-                        try:
+                    input_ids = get_batch_input_ids(batch, self.device)
+
+                    try:
+                        with torch.no_grad():
                             outputs = self.model(input_ids, return_routing_info=True)
-                            routing_infos = get_routing_from_outputs(outputs)
-                            if routing_infos is None:
-                                continue
-                        except Exception:
+                        routing = self.extractor.extract(outputs)
+                        if not routing:
+                            continue
+                    except Exception:
+                        continue
+
+                    # Process ALL layers using extractor
+                    for layer in routing:
+                        lidx = layer.layer_idx
+                        if layer_idx is not None and lidx != layer_idx:
                             continue
 
-                        # Process ALL layers
-                        for lidx, layer_info in enumerate(routing_infos):
-                            if layer_idx is not None and lidx != layer_idx:
-                                continue
+                        # Get Q/K weights using standardized keys
+                        w_q = layer.get_weight(std_q_key)
+                        w_k = layer.get_weight(std_k_key)
 
-                            attn = layer_info.get('attention', {})
+                        if w_q is None or w_k is None:
+                            continue
 
-                            # Get Q/K weights
-                            w_q = attn.get(pool_info['q_weight'])
-                            w_k = attn.get(pool_info['k_weight'])
+                        # Initialize layer data if needed
+                        if lidx not in layer_data:
+                            layer_data[lidx] = (
+                                torch.zeros(n_neurons, device=self.device),
+                                torch.zeros(n_neurons, device=self.device),
+                                []
+                            )
 
-                            if w_q is None or w_k is None:
-                                w_q = attn.get(pool_info['q_pref'])
-                                w_k = attn.get(pool_info['k_pref'])
-                                if w_q is None or w_k is None:
-                                    continue
+                        q_counts, k_counts, batch_overlaps = layer_data[lidx]
 
-                            # Initialize layer data if needed
-                            if lidx not in layer_data:
-                                layer_data[lidx] = (
-                                    torch.zeros(n_neurons, device=self.device),
-                                    torch.zeros(n_neurons, device=self.device),
-                                    []
-                                )
+                        # Count selections
+                        if w_q.dim() == 3:  # [B, S, N]
+                            selected_q = (w_q > 0).float().sum(dim=[0, 1])
+                            selected_k = (w_k > 0).float().sum(dim=[0, 1])
+                        else:  # [B, N]
+                            selected_q = (w_q > 0).float().sum(dim=0)
+                            selected_k = (w_k > 0).float().sum(dim=0)
 
-                            q_counts, k_counts, batch_overlaps = layer_data[lidx]
+                        q_counts += selected_q
+                        k_counts += selected_k
 
-                            # Count selections
-                            if w_q.dim() == 3:  # [B, S, N]
-                                selected_q = (w_q > 0).float().sum(dim=[0, 1])
-                                selected_k = (w_k > 0).float().sum(dim=[0, 1])
-                            else:  # [B, N]
-                                selected_q = (w_q > 0).float().sum(dim=0)
-                                selected_k = (w_k > 0).float().sum(dim=0)
+                        # Calculate batch overlap
+                        if w_q.dim() >= 2:
+                            overlap = ((w_q > 0) & (w_k > 0)).float()
+                            active_q = (w_q > 0).float().sum(-1)
+                            overlap_ratio = (overlap.sum(-1) / (active_q + 1e-8)).mean().item()
+                            batch_overlaps.append(overlap_ratio)
 
-                            q_counts += selected_q
-                            k_counts += selected_k
-
-                            # Calculate batch overlap
-                            if w_q.dim() >= 2:
-                                overlap = ((w_q > 0) & (w_k > 0)).float()
-                                active_q = (w_q > 0).float().sum(-1)
-                                overlap_ratio = (overlap.sum(-1) / (active_q + 1e-8)).mean().item()
-                                batch_overlaps.append(overlap_ratio)
-
-                            layer_data[lidx] = (q_counts, k_counts, batch_overlaps)
+                        layer_data[lidx] = (q_counts, k_counts, batch_overlaps)
 
                 # Aggregate across all layers
                 total_q = torch.zeros(n_neurons, device=self.device)
@@ -543,8 +526,6 @@ class RoutingAnalyzer(BaseAnalyzer):
                 }
 
             results['n_batches'] = n_batches
-        finally:
-            self.disable_pref_tensors()
 
         return results
 
@@ -559,54 +540,56 @@ class RoutingAnalyzer(BaseAnalyzer):
         Returns:
             Dictionary with entropy statistics per layer
         """
+        # Map pool names to standardized Q/K keys
+        POOL_STD_KEYS = {
+            'feature_qk': ('fqk_q', 'fqk_k'),
+            'restore_qk': ('rqk_q', 'rqk_k'),
+        }
+
         # {pool_name: {layer_idx: {'q': [], 'k': []}}}
         layer_entropy = {pool: {} for pool in QK_POOLS.keys()}
 
         self.model.eval()
-        self.enable_pref_tensors()
+        with self.extractor.analysis_context():
+            for i, batch in enumerate(tqdm(dataloader, desc='Q/K Entropy', total=n_batches)):
+                if i >= n_batches:
+                    break
 
-        try:
-            with torch.no_grad():
-                for i, batch in enumerate(tqdm(dataloader, desc='Q/K Entropy', total=n_batches)):
-                    if i >= n_batches:
-                        break
+                input_ids = get_batch_input_ids(batch, self.device)
 
-                    input_ids = get_batch_input_ids(batch, self.device)
-
-                    try:
+                try:
+                    with torch.no_grad():
                         outputs = self.model(input_ids, return_routing_info=True)
-                        routing_infos = get_routing_from_outputs(outputs)
-                        if routing_infos is None:
-                            continue
-                    except Exception:
+                    routing = self.extractor.extract(outputs)
+                    if not routing:
                         continue
+                except Exception:
+                    continue
 
-                    # Process ALL layers
-                    for layer_idx, layer_info in enumerate(routing_infos):
-                        attn = layer_info.get('attention', {})
+                # Process ALL layers using extractor
+                for layer in routing:
+                    layer_idx = layer.layer_idx
 
-                        for pool_name, pool_info in QK_POOLS.items():
-                            if layer_idx not in layer_entropy[pool_name]:
-                                layer_entropy[pool_name][layer_idx] = {'q': [], 'k': []}
+                    for pool_name, pool_info in QK_POOLS.items():
+                        if layer_idx not in layer_entropy[pool_name]:
+                            layer_entropy[pool_name][layer_idx] = {'q': [], 'k': []}
 
-                            pref_q = attn.get(pool_info['q_pref'])
-                            pref_k = attn.get(pool_info['k_pref'])
+                        # Get standardized keys for this pool
+                        std_q_key, std_k_key = POOL_STD_KEYS.get(pool_name, (None, None))
+                        if std_q_key is None:
+                            continue
 
-                            if pref_q is not None:
-                                p = pref_q.mean(dim=0) if pref_q.dim() > 1 else pref_q
-                                p = p.clamp(min=1e-8)
-                                ent = -torch.sum(p * torch.log(p)).item()
-                                max_ent = np.log(pref_q.shape[-1])
-                                layer_entropy[pool_name][layer_idx]['q'].append(ent / max_ent * 100)
+                        # Use standardized keys
+                        w_q = layer.get_weight(std_q_key)
+                        w_k = layer.get_weight(std_k_key)
 
-                            if pref_k is not None:
-                                p = pref_k.mean(dim=0) if pref_k.dim() > 1 else pref_k
-                                p = p.clamp(min=1e-8)
-                                ent = -torch.sum(p * torch.log(p)).item()
-                                max_ent = np.log(pref_k.shape[-1])
-                                layer_entropy[pool_name][layer_idx]['k'].append(ent / max_ent * 100)
-        finally:
-            self.disable_pref_tensors()
+                        if w_q is not None:
+                            ent = calc_entropy_ratio(w_q)
+                            layer_entropy[pool_name][layer_idx]['q'].append(ent)
+
+                        if w_k is not None:
+                            ent = calc_entropy_ratio(w_k)
+                            layer_entropy[pool_name][layer_idx]['k'].append(ent)
 
         # Build results
         results = {}
@@ -666,49 +649,47 @@ class RoutingAnalyzer(BaseAnalyzer):
         # {layer_idx: {'attention': [], 'knowledge': []}}
         layer_contributions = defaultdict(lambda: {'attention': [], 'knowledge': []})
 
+        # Standardized keys for attention and knowledge
+        ATTENTION_KEYS = ['fv', 'rv', 'fqk_q', 'fqk_k', 'rqk_q', 'rqk_k']
+        KNOWLEDGE_KEYS = ['fknow', 'rknow']
+
         self.model.eval()
-        self.enable_pref_tensors()
+        with self.extractor.analysis_context():
+            for i, batch in enumerate(tqdm(dataloader, desc='Layer Contribution', total=n_batches)):
+                if i >= n_batches:
+                    break
 
-        try:
-            with torch.no_grad():
-                for i, batch in enumerate(tqdm(dataloader, desc='Layer Contribution', total=n_batches)):
-                    if i >= n_batches:
-                        break
+                input_ids = get_batch_input_ids(batch, self.device)
 
-                    input_ids = get_batch_input_ids(batch, self.device)
-
-                    try:
+                try:
+                    with torch.no_grad():
                         outputs = self.model(input_ids, return_routing_info=True)
-                        routing_infos = get_routing_from_outputs(outputs)
-                        if routing_infos is None:
-                            continue
-                    except Exception:
+                    routing = self.extractor.extract(outputs)
+                    if not routing:
                         continue
+                except Exception:
+                    continue
 
-                    # Process all layers
-                    for layer_idx, layer_info in enumerate(routing_infos):
-                        attn = layer_info.get('attention', {})
-                        know = layer_info.get('knowledge', {})
+                # Process all layers using extractor
+                for layer in routing:
+                    layer_idx = layer.layer_idx
 
-                        # Attention contribution: sum of all attention routing weights
-                        attn_contrib = 0.0
-                        for key in ['fv_weights', 'rv_weights', 'fqk_weights_Q', 'fqk_weights_K',
-                                   'rqk_weights_Q', 'rqk_weights_K']:
-                            w = attn.get(key)
-                            if w is not None:
-                                attn_contrib += w.sum().item()
+                    # Attention contribution: sum of all attention routing weights
+                    attn_contrib = 0.0
+                    for key in ATTENTION_KEYS:
+                        w = layer.get_weight(key)
+                        if w is not None:
+                            attn_contrib += w.sum().item()
 
-                        # Knowledge contribution: sum of knowledge weights
-                        know_contrib = 0.0
-                        for key in ['feature_know_w', 'restore_know_w']:
-                            w = know.get(key)
-                            if w is not None:
-                                know_contrib += w.sum().item()
+                    # Knowledge contribution: sum of knowledge weights
+                    know_contrib = 0.0
+                    for key in KNOWLEDGE_KEYS:
+                        w = layer.get_weight(key)
+                        if w is not None:
+                            know_contrib += w.sum().item()
 
-                        layer_contributions[layer_idx]['attention'].append(attn_contrib)
-                        layer_contributions[layer_idx]['knowledge'].append(know_contrib)
-        finally:
-            self.disable_pref_tensors()
+                    layer_contributions[layer_idx]['attention'].append(attn_contrib)
+                    layer_contributions[layer_idx]['knowledge'].append(know_contrib)
 
         # Aggregate results
         results = {'per_layer': {}}

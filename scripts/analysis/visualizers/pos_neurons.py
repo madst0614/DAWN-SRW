@@ -65,14 +65,21 @@ def plot_pos_heatmap(
     if not HAS_MATPLOTLIB or not HAS_SEABORN:
         return None
 
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    pos_neuron_freq = results.get('pos_neuron_freq', {})
+    if not pos_neuron_freq:
+        print("  Warning: No POS neuron frequency data, skipping heatmap")
+        return None
 
-    pos_neuron_freq = results['pos_neuron_freq']
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
     # Get all neurons and sort by total activation
     all_neurons = set()
     for freq in pos_neuron_freq.values():
         all_neurons.update(int(n) for n in freq.keys())
+
+    if not all_neurons:
+        print("  Warning: No neuron data found, skipping heatmap")
+        return None
 
     # Filter to top neurons
     neuron_total = defaultdict(float)
@@ -82,13 +89,27 @@ def plot_pos_heatmap(
 
     top_neurons = sorted(neuron_total.keys(), key=lambda n: -neuron_total[n])[:100]
 
+    if not top_neurons:
+        print("  Warning: No top neurons found, skipping heatmap")
+        return None
+
     # Build matrix
     pos_list = [p for p in UPOS_TAGS if p in pos_neuron_freq]
+
+    if not pos_list:
+        print("  Warning: No POS tags found, skipping heatmap")
+        return None
+
     matrix = np.zeros((len(pos_list), len(top_neurons)))
 
     for i, pos in enumerate(pos_list):
         for j, neuron in enumerate(top_neurons):
             matrix[i, j] = pos_neuron_freq[pos].get(str(neuron), 0)
+
+    # Check if matrix has any data
+    if matrix.size == 0 or np.all(matrix == 0):
+        print("  Warning: Empty matrix, skipping heatmap")
+        return None
 
     # Plot
     fig, ax = plt.subplots(figsize=figsize)
@@ -155,7 +176,22 @@ def plot_pos_clustering(
     if len(pos_list) < 2:
         return None
 
+    # Filter out zero vectors (would cause NaN in cosine distance)
+    nonzero_mask = np.any(vectors != 0, axis=1)
+    if nonzero_mask.sum() < 2:
+        print("  Warning: Not enough non-zero POS vectors for clustering")
+        return None
+
+    vectors = vectors[nonzero_mask]
+    pos_list = [p for p, m in zip(pos_list, nonzero_mask) if m]
+
     distances = pdist(vectors, metric='cosine')
+
+    # Replace NaN/Inf with max distance (1.0 for cosine)
+    if not np.all(np.isfinite(distances)):
+        print("  Warning: Replacing NaN/Inf in distance matrix")
+        distances = np.nan_to_num(distances, nan=1.0, posinf=1.0, neginf=0.0)
+
     linkage = hierarchy.linkage(distances, method='ward')
 
     # Plot
@@ -222,11 +258,15 @@ def plot_top_neurons_by_pos(
 
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
-    top_neurons = results['top_neurons_per_pos']
+    top_neurons = results.get('top_neurons_per_pos', {})
     pos_list = [p for p in UPOS_TAGS if p in top_neurons]
 
+    if not pos_list:
+        print("  Warning: No POS data to plot")
+        return None
+
     n_cols = 4
-    n_rows = (len(pos_list) + n_cols - 1) // n_cols
+    n_rows = max(1, (len(pos_list) + n_cols - 1) // n_cols)
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
     axes = axes.flatten()

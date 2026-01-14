@@ -290,6 +290,10 @@ class NeuronHealthAnalyzer(BaseAnalyzer):
             else:
                 corr = 0.0
 
+            # Jaccard similarity = intersection / union
+            union = q_only + k_only + shared
+            jaccard = shared / union if union > 0 else 0.0
+
             results[pool_name] = {
                 'n_total': n_total,
                 'q_only': q_only,
@@ -299,6 +303,7 @@ class NeuronHealthAnalyzer(BaseAnalyzer):
                 'q_active': int(q_active.sum()),
                 'k_active': int(k_active.sum()),
                 'correlation': corr,
+                'jaccard': float(jaccard),
                 'q_ema': ema_q.tolist(),
                 'k_ema': ema_k.tolist(),
             }

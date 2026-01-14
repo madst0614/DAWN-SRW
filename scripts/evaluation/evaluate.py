@@ -8,7 +8,7 @@ Compare multiple model checkpoints (Vanilla / DAWN) with:
 - Model architecture info
 
 Usage:
-    python scripts/analyze_checkpoints.py \
+    python -m scripts.evaluation.evaluate \
         --checkpoints path/to/ckpt1 path/to/ckpt2 ... \
         --val_data path/to/val.pt \
         --output results.csv
@@ -19,13 +19,14 @@ Output:
 """
 
 import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import argparse
 import torch
 import torch.nn.functional as F
-from pathlib import Path
 import csv
 import math
 

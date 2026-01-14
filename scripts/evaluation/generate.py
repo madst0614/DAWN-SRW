@@ -6,7 +6,7 @@ Loads model config from checkpoint, no separate config file needed.
 Supports multiple checkpoints and directory paths.
 
 Usage:
-    python scripts/generate_samples.py \
+    python -m scripts.evaluation.generate \
         --checkpoints /path/to/ckpt1 /path/to/ckpt2 \
         --val_data /path/to/val_data.pt \
         --output generation_results.txt
@@ -14,9 +14,10 @@ Usage:
 
 import argparse
 import sys
-import os
 from pathlib import Path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import torch.nn.functional as F
@@ -72,8 +73,6 @@ def load_model(checkpoint_path):
     version = model_config.get('model_version', None)
     if version is None:
         # Check for version-specific keys (most specific first)
-        # v18.5: context-aware restore routing with separate tau projections
-        v18_5_keys = ['router.tau_proj_feature.weight', 'router.tau_proj_restore_Q.weight']
         # v18.2/v18.1: has tau_proj and separate norm layers per projection
         v18_2_keys = ['router.tau_proj.weight', 'router.neuron_router.norm_fqk_Q.weight']
         # v18.0: has multi-path but no learnable tau
@@ -81,14 +80,12 @@ def load_model(checkpoint_path):
         # DAWN generic keys
         dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
 
-        if all(k in state_dict for k in v18_5_keys):
-            version = '18.5'  # v18.5 with context-aware restore routing
-        elif all(k in state_dict for k in v18_2_keys):
+        if all(k in state_dict for k in v18_2_keys):
             version = '18.2'  # v18.2 with learnable tau and separate norms
         elif any(k in state_dict for k in dawn_keys):
             # Check if it's v18.x by looking at the config
             if model_config.get('learnable_tau', False) or model_config.get('max_paths'):
-                version = '18.5'  # Assume latest v18 if has v18 config params
+                version = '18.2'  # Assume latest v18 if has v18 config params
             else:
                 version = '17.1'  # Default DAWN version
         else:
@@ -250,7 +247,7 @@ def compute_perplexity(model, val_tokens, num_seqs=50, seq_len=512, device='cuda
     return avg_loss, ppl
 
 
-def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda', gen_tokens=50):
+def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda'):
     """Test a single checkpoint and return results"""
     results = {}
 
@@ -309,7 +306,7 @@ def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda', gen_
     for category, prompt_list in prompts.items():
         results['generations'][category] = []
         for prompt in prompt_list:
-            output = generate_text(model, tokenizer, prompt, max_new_tokens=gen_tokens, device=device)
+            output = generate_text(model, tokenizer, prompt, max_new_tokens=30, device=device)
             results['generations'][category].append({'prompt': prompt, 'output': output})
 
     # 2. C4 continuation
@@ -342,7 +339,6 @@ def main():
     parser.add_argument('--val_data', type=str, required=True, help='Path to validation data')
     parser.add_argument('--output', type=str, default='generation_results.txt', help='Output file')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
-    parser.add_argument('--gen_tokens', type=int, default=50, help='Max tokens to generate per sample')
     args = parser.parse_args()
 
     # Device check
@@ -373,7 +369,7 @@ def main():
         print('='*60)
 
         try:
-            results = test_single_checkpoint(ckpt_path, tokenizer, val_tokens, args.device, args.gen_tokens)
+            results = test_single_checkpoint(ckpt_path, tokenizer, val_tokens, args.device)
             all_results.append(results)
 
             # Format output

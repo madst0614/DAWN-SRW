@@ -5,9 +5,9 @@ DAWN Parameter Calculator
 Calculate total parameters and recommend neuron counts for target parameter budgets.
 
 Usage:
-    python scripts/calc_params.py --config configs/train_config_v18_2_20M_r16_c4_500M.yaml
-    python scripts/calc_params.py --config configs/train_config_v18_2_20M_r16_c4_500M.yaml --target 40M
-    python scripts/calc_params.py --d_model 256 --n_layers 8 --rank 16 --target 20M
+    python -m scripts.tools.calc_params --config configs/train_config_v18_2_20M_r16_c4_500M.yaml
+    python -m scripts.tools.calc_params --config configs/train_config_v18_2_20M_r16_c4_500M.yaml --target 40M
+    python -m scripts.tools.calc_params --d_model 256 --n_layers 8 --rank 16 --target 20M
 """
 
 import argparse
@@ -377,13 +377,13 @@ def main():
         epilog="""
 Examples:
   # Calculate params from config
-  python scripts/calc_params.py --config configs/train_config_v18_2_20M_r16_c4_500M.yaml
+  python -m scripts.tools.calc_params --config configs/train_config_v18_2_20M_r16_c4_500M.yaml
 
   # Recommend neurons for target params
-  python scripts/calc_params.py --config configs/train_config_v18_2_20M_r16_c4_500M.yaml --target 40
+  python -m scripts.tools.calc_params --config configs/train_config_v18_2_20M_r16_c4_500M.yaml --target 40
 
   # Manual config
-  python scripts/calc_params.py --d_model 256 --n_layers 8 --rank 16 --target 20
+  python -m scripts.tools.calc_params --d_model 256 --n_layers 8 --rank 16 --target 20
         """
     )
     parser.add_argument('--config', type=str, help='Path to config yaml file')

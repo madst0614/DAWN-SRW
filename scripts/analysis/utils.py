@@ -135,6 +135,24 @@ QK_POOLS = {
     'rqk': ('restore_qk', 'rqk_q', 'rqk_k'),
 }
 
+# Pool type aliases for CLI convenience
+# Maps shortcut names to canonical standardized keys
+POOL_TYPE_ALIASES = {
+    'fqk': 'fqk_q',    # Feature QK (default to Q)
+    'rqk': 'rqk_q',    # Restore QK (default to Q)
+    'feature_qk': 'fqk_q',
+    'feature_v': 'fv',
+    'restore_qk': 'rqk_q',
+    'restore_v': 'rv',
+    'feature_know': 'fknow',
+    'restore_know': 'rknow',
+}
+
+
+def resolve_pool_type(pool_type: str) -> str:
+    """Resolve pool type alias to canonical key."""
+    return POOL_TYPE_ALIASES.get(pool_type, pool_type)
+
 # Neuron attribute names for weight analysis
 NEURON_ATTRS = {
     'feature_qk': 'feature_qk_neurons',
@@ -143,6 +161,16 @@ NEURON_ATTRS = {
     'restore_v': 'restore_v_neurons',
     'feature_know': 'feature_know',
     'restore_know': 'restore_know',
+}
+
+# Direct pool_type to n_attr mapping (consistent across all model versions)
+POOL_N_ATTR = {
+    'feature_qk': 'n_feature_qk',
+    'feature_v': 'n_feature_v',
+    'restore_qk': 'n_restore_qk',
+    'restore_v': 'n_restore_v',
+    'feature_know': 'n_feature_know',
+    'restore_know': 'n_restore_know',
 }
 
 # Co-selection pairs for v17.1 analysis
@@ -603,3 +631,261 @@ def get_routing_from_outputs(outputs):
     if not routing_infos:
         return None
     return routing_infos
+
+
+# ============================================================
+# Routing Data Extraction Layer (Model-Agnostic Schema)
+# ============================================================
+
+# Weight key mapping: standard_key -> raw_key in routing_info
+# Aligned with ROUTING_KEYS and KNOWLEDGE_ROUTING_KEYS above
+WEIGHT_KEY_MAP = {
+    # Attention weights (from ROUTING_KEYS)
+    'fqk_q': 'fqk_weights_Q',
+    'fqk_k': 'fqk_weights_K',
+    'fv': 'fv_weights',
+    'rqk_q': 'rqk_weights_Q',
+    'rqk_k': 'rqk_weights_K',
+    'rv': 'rv_weights',
+    # Knowledge weights (from KNOWLEDGE_ROUTING_KEYS)
+    'fknow': 'feature_know_w',
+    'rknow': 'restore_know_w',
+}
+
+# Inverse mapping for quick lookup
+RAW_KEY_TO_STD = {v: k for k, v in WEIGHT_KEY_MAP.items()}
+
+
+class RoutingDataExtractor:
+    """
+    Central routing data extraction layer.
+
+    Abstracts model version differences and provides standardized
+    routing weight access for all analyzers.
+
+    Usage:
+        extractor = RoutingDataExtractor(model)
+
+        with extractor.analysis_context():
+            outputs = model(input_ids, return_routing_info=True)
+            for layer_data in extractor.iter_layers(outputs):
+                weights = layer_data.get_weight('fv')  # Standardized access
+    """
+
+    def __init__(self, model, device='cuda'):
+        self.model = model
+        self.device = device
+        self.router = self._get_router()
+        self.model_version = self._detect_version()
+
+    def _get_router(self):
+        """Get router from model (handles different model structures)."""
+        if hasattr(self.model, 'router'):
+            router = self.model.router
+            if hasattr(router, 'neuron_router'):
+                return router.neuron_router
+            return router
+        return None
+
+    def _detect_version(self) -> str:
+        """Detect model version."""
+        try:
+            return get_model_version(self.model)
+        except:
+            # Fallback detection
+            if hasattr(self.model, 'router') and hasattr(self.model.router, 'max_paths'):
+                return '18.x'
+            return '17.x'
+
+    def enable_weight_storage(self):
+        """Enable weight tensor storage in routing_info."""
+        # v17.x style: model.router
+        if hasattr(self.model, 'router'):
+            router = self.model.router
+            if hasattr(router, 'store_pref_tensors'):
+                router.store_pref_tensors = True
+            if hasattr(router, 'neuron_router') and hasattr(router.neuron_router, 'store_pref_tensors'):
+                router.neuron_router.store_pref_tensors = True
+        # v18.x style: model.global_routers
+        if hasattr(self.model, 'global_routers'):
+            global_routers = self.model.global_routers
+            if hasattr(global_routers, 'store_pref_tensors'):
+                global_routers.store_pref_tensors = True
+
+    def disable_weight_storage(self):
+        """Disable weight tensor storage."""
+        # v17.x style: model.router
+        if hasattr(self.model, 'router'):
+            router = self.model.router
+            if hasattr(router, 'store_pref_tensors'):
+                router.store_pref_tensors = False
+            if hasattr(router, 'neuron_router') and hasattr(router.neuron_router, 'store_pref_tensors'):
+                router.neuron_router.store_pref_tensors = False
+        # v18.x style: model.global_routers
+        if hasattr(self.model, 'global_routers'):
+            global_routers = self.model.global_routers
+            if hasattr(global_routers, 'store_pref_tensors'):
+                global_routers.store_pref_tensors = False
+
+    def analysis_context(self):
+        """Context manager for analysis (enables/disables weight storage)."""
+        return _AnalysisContext(self)
+
+    def extract(self, outputs) -> 'RoutingData':
+        """
+        Extract standardized routing data from model outputs.
+
+        Args:
+            outputs: Model outputs tuple (logits, routing_infos)
+
+        Returns:
+            RoutingData object with standardized access
+        """
+        if not isinstance(outputs, tuple) or len(outputs) < 2:
+            return RoutingData([])
+
+        routing_infos = outputs[1]
+        if not routing_infos:
+            return RoutingData([])
+
+        return RoutingData(routing_infos)
+
+    def forward_and_extract(self, input_ids, **kwargs) -> 'RoutingData':
+        """
+        Run forward pass and extract routing data.
+
+        Args:
+            input_ids: Input token IDs
+            **kwargs: Additional arguments for model forward
+
+        Returns:
+            RoutingData object
+        """
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(input_ids, return_routing_info=True, **kwargs)
+        return self.extract(outputs)
+
+
+class _AnalysisContext:
+    """Context manager for routing analysis."""
+
+    def __init__(self, extractor: RoutingDataExtractor):
+        self.extractor = extractor
+
+    def __enter__(self):
+        self.extractor.enable_weight_storage()
+        return self.extractor
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.extractor.disable_weight_storage()
+        return False
+
+
+class RoutingData:
+    """
+    Standardized routing data container.
+
+    Provides consistent access to routing weights regardless of model version.
+    """
+
+    def __init__(self, routing_infos: list):
+        self.routing_infos = routing_infos
+        self.n_layers = len(routing_infos)
+
+    def __len__(self):
+        return self.n_layers
+
+    def __bool__(self):
+        return self.n_layers > 0
+
+    def __iter__(self):
+        """Iterate over layers, yielding LayerRoutingData."""
+        for layer_idx, layer_info in enumerate(self.routing_infos):
+            yield LayerRoutingData(layer_idx, layer_info)
+
+    def get_layer(self, layer_idx: int) -> 'LayerRoutingData':
+        """Get routing data for a specific layer."""
+        if 0 <= layer_idx < self.n_layers:
+            return LayerRoutingData(layer_idx, self.routing_infos[layer_idx])
+        return LayerRoutingData(layer_idx, {})
+
+
+class LayerRoutingData:
+    """
+    Single layer routing data with standardized access.
+    """
+
+    def __init__(self, layer_idx: int, layer_info: dict):
+        self.layer_idx = layer_idx
+        self.raw = layer_info
+
+        # Extract attention and knowledge sub-dicts
+        # Handle both {'attention': {...}} and flat structure
+        self.attention = layer_info.get('attention', layer_info)
+        self.knowledge = layer_info.get('knowledge', {})
+
+    def get_weight(self, key: str) -> Optional[torch.Tensor]:
+        """
+        Get weight tensor by standardized key.
+
+        Standard keys (from ROUTING_KEYS):
+            'fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv', 'fknow', 'rknow'
+
+        Returns:
+            Weight tensor [B, S, N] or [B, N], or None if not found
+        """
+        # Map standard key to raw key
+        raw_key = WEIGHT_KEY_MAP.get(key, key)
+
+        # Try attention first, then knowledge
+        result = self.attention.get(raw_key)
+        if result is None:
+            result = self.knowledge.get(raw_key)
+
+        return result
+
+    def get_all_attention_weights(self) -> Dict[str, torch.Tensor]:
+        """Get all available attention weights (using ROUTING_KEYS)."""
+        weights = {}
+        for std_key in ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']:
+            raw_key = WEIGHT_KEY_MAP.get(std_key)
+            if raw_key:
+                w = self.attention.get(raw_key)
+                if w is not None:
+                    weights[std_key] = w
+        return weights
+
+    def get_all_knowledge_weights(self) -> Dict[str, torch.Tensor]:
+        """Get all available knowledge weights (using KNOWLEDGE_ROUTING_KEYS)."""
+        weights = {}
+        for std_key in ['fknow', 'rknow']:
+            raw_key = WEIGHT_KEY_MAP.get(std_key)
+            if raw_key:
+                w = self.knowledge.get(raw_key)
+                if w is not None:
+                    weights[std_key] = w
+        return weights
+
+    def get_all_weights(self) -> Dict[str, torch.Tensor]:
+        """Get all available weights."""
+        return {**self.get_all_attention_weights(), **self.get_all_knowledge_weights()}
+
+    def has_weights(self) -> bool:
+        """Check if any weights are available."""
+        return bool(self.get_all_weights())
+
+
+# Convenience function for simple extraction
+def extract_routing_data(model, input_ids, device='cuda') -> RoutingData:
+    """
+    One-shot routing data extraction.
+
+    Usage:
+        routing = extract_routing_data(model, input_ids)
+        for layer in routing:
+            fv = layer.get_weight('fv')
+    """
+    extractor = RoutingDataExtractor(model, device)
+    with extractor.analysis_context():
+        return extractor.forward_and_extract(input_ids)

@@ -1,7 +1,7 @@
 """
 DAWN Analysis Package
 ======================
-Comprehensive analysis toolkit for DAWN v17.1 models.
+Comprehensive analysis toolkit for DAWN models.
 
 This package provides modular analysis tools for:
 - Neuron health and utilization
@@ -9,29 +9,33 @@ This package provides modular analysis tools for:
 - Embedding analysis and visualization
 - Weight matrix analysis
 - Behavioral analysis
-- Semantic analysis (NEW)
+- Semantic analysis
 - Co-selection pattern analysis
+- POS neuron specialization
 - Paper figure generation
 
 Usage:
-    # Quick analysis (no data required)
-    from scripts.analysis import PaperFigureGenerator
-    gen = PaperFigureGenerator('checkpoints/dawn_v17_1_best.pt')
-    gen.run_quick('./quick_analysis')
+    # Complete one-touch analysis
+    python scripts/analysis/analyze_all.py --checkpoint dawn.pt --val_data val.pt --output results/
 
-    # Full analysis with data
-    gen = PaperFigureGenerator(
-        'checkpoints/dawn_v17_1_best.pt',
-        'data/val.parquet'
-    )
-    gen.generate_all('./paper_figures')
+    # Multi-model comparison
+    python scripts/analysis/analyze_all.py --checkpoints dawn.pt vanilla.pt --val_data val.pt --output results/
+
+    # Paper figures only
+    from scripts.analysis import PaperFigureGenerator
+    gen = PaperFigureGenerator('checkpoint.pt', dataloader)
+    gen.generate('all', './paper_figures')
 
     # Individual analyzers
-    from scripts.analysis import load_model, get_router, NeuronHealthAnalyzer
+    from scripts.analysis import load_model, NeuronHealthAnalyzer
     model, tokenizer, config = load_model('checkpoint.pt')
-    router = get_router(model)
-    health = NeuronHealthAnalyzer(router)
+    health = NeuronHealthAnalyzer(model)
     results = health.run_all('./health_output')
+
+    # Programmatic complete analysis
+    from scripts.analysis import ModelAnalyzer
+    analyzer = ModelAnalyzer('checkpoint.pt', 'val.pt', 'output/')
+    analyzer.run_all()
 """
 
 from .utils import (
@@ -81,7 +85,7 @@ from .paper_figures import PaperFigureGenerator
 
 # Visualizers
 from . import visualizers
-from .routing_analysis import (
+from .standalone.routing_analysis import (
     GenerationRoutingAnalyzer,
     analyze_common_neurons,
     analyze_token_neurons,
@@ -90,6 +94,12 @@ from .routing_analysis import (
 )
 # POS Neuron Analyzer (refactored)
 from .pos_neuron import POSNeuronAnalyzer
+
+# V18.x Specific Analyzer
+from .v18 import V18Analyzer
+
+# Complete analysis tool
+from .analyze_all import ModelAnalyzer, MultiModelAnalyzer
 
 # Legacy imports from visualizers for backward compatibility
 from .visualizers.pos_neurons import (
@@ -157,6 +167,13 @@ __all__ = [
     'plot_pos_clustering',
     'plot_top_neurons_by_pos',
     'plot_specificity',
+
+    # V18.x analysis
+    'V18Analyzer',
+
+    # Complete analysis
+    'ModelAnalyzer',
+    'MultiModelAnalyzer',
 ]
 
 __version__ = '1.0.0'

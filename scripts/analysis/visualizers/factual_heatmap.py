@@ -132,6 +132,7 @@ def plot_factual_comparison(
 
     per_target = factual_data.get('per_target', {})
     if not per_target:
+        print("  Warning: No per_target data, skipping factual comparison")
         return None
 
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
@@ -144,7 +145,7 @@ def plot_factual_comparison(
     match_rates = [per_target[t].get('match_rate', 0) * 100 for t in targets]
 
     colors = plt.cm.tab10(np.linspace(0, 1, len(targets)))
-    ax.barh(range(len(targets)), match_rates, color=colors)
+    bars = ax.barh(range(len(targets)), match_rates, color=colors)
     ax.set_yticks(range(len(targets)))
     ax.set_yticklabels(targets)
     ax.set_xlabel('Match Rate (%)')
@@ -152,16 +153,28 @@ def plot_factual_comparison(
     ax.set_xlim(0, 100)
     ax.invert_yaxis()
 
+    # Add value labels
+    for i, (bar, rate) in enumerate(zip(bars, match_rates)):
+        ax.text(rate + 2, i, f'{rate:.0f}%', va='center', fontsize=9)
+
     # 2. Neuron count comparison
     ax = axes[1]
     common_counts = [len(per_target[t].get('common_neurons_80', [])) for t in targets]
 
-    ax.barh(range(len(targets)), common_counts, color=colors)
+    # Ensure non-negative values for proper display
+    max_count = max(common_counts) if common_counts and max(common_counts) > 0 else 1
+
+    bars = ax.barh(range(len(targets)), common_counts, color=colors)
     ax.set_yticks(range(len(targets)))
     ax.set_yticklabels(targets)
     ax.set_xlabel('Number of Common Neurons (>80%)')
     ax.set_title('Factual Knowledge Neurons')
+    ax.set_xlim(0, max(max_count * 1.2, 1))  # Ensure positive xlim
     ax.invert_yaxis()
+
+    # Add value labels
+    for i, (bar, count) in enumerate(zip(bars, common_counts)):
+        ax.text(count + 0.1, i, str(count), va='center', fontsize=9)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
