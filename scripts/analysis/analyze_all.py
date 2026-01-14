@@ -672,13 +672,13 @@ class ModelAnalyzer:
         concentration = results.get('weight_concentration', {})
         if concentration and 'n_batches' in concentration:
             print(f"\n  ┌─ Weight Concentration ─────────────────────────────────────────────────")
-            print(f"  │ {'Pool':<12} {'Top1%':>8} {'Top5%':>8} {'Gini':>8} {'AvgActive':>10}")
-            print(f"  │ {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*10}")
+            print(f"  │ {'Pool':<12} {'Top1%':>10} {'Top5%':>10} {'AvgActive':>12}")
+            print(f"  │ {'─'*12} {'─'*10} {'─'*10} {'─'*12}")
             for key, data in concentration.items():
                 if isinstance(data, dict) and 'top1_weight_ratio' in data:
-                    print(f"  │ {data.get('display', key):<12} {data['top1_weight_ratio']*100:>7.1f}% "
-                          f"{data['top5_weight_ratio']*100:>7.1f}% {data['weight_gini']:>8.3f} "
-                          f"{data['avg_active_neurons']:>10.1f}")
+                    print(f"  │ {data.get('display', key):<12} {data['top1_weight_ratio']*100:>9.1f}% "
+                          f"{data['top5_weight_ratio']*100:>9.1f}% "
+                          f"{data['avg_active_neurons']:>12.1f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         # Path Usage (v18.5)

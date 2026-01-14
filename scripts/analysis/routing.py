@@ -962,7 +962,8 @@ class RoutingAnalyzer(BaseAnalyzer):
             - sparsity_ratio: percentage of inactive neurons
             - active_weight_sum: average weight sum of active neurons
         """
-        sparsity_data = defaultdict(list)
+        # Accumulate statistics per key
+        sparsity_stats = defaultdict(lambda: {'active_sum': 0, 'weight_sum': 0.0, 'count': 0, 'n_total': 0})
 
         self.model.eval()
         with self.extractor.analysis_context():
@@ -991,33 +992,31 @@ class RoutingAnalyzer(BaseAnalyzer):
                         if n_total == 0:
                             continue
 
-                        # Per-token statistics
+                        # Vectorized computation
                         if weights.dim() == 3:  # [B, S, N]
-                            # Flatten to [B*S, N]
                             w_flat = weights.view(-1, weights.shape[-1])
                         else:  # [B, N]
                             w_flat = weights
 
-                        for token_w in w_flat:
-                            active_mask = token_w > 0
-                            active_count = active_mask.sum().item()
-                            weight_sum = token_w[active_mask].sum().item() if active_count > 0 else 0
+                        # Per-token active count and weight sum (vectorized)
+                        active_mask = w_flat > 0
+                        active_counts = active_mask.sum(dim=-1)  # [B*S]
+                        weight_sums = (w_flat * active_mask.float()).sum(dim=-1)  # [B*S]
 
-                            sparsity_data[key].append({
-                                'active': active_count,
-                                'total': n_total,
-                                'weight_sum': weight_sum,
-                            })
+                        sparsity_stats[key]['active_sum'] += active_counts.sum().item()
+                        sparsity_stats[key]['weight_sum'] += weight_sums.sum().item()
+                        sparsity_stats[key]['count'] += w_flat.shape[0]
+                        sparsity_stats[key]['n_total'] = n_total
 
         # Aggregate results
         results = {}
-        for key, data in sparsity_data.items():
-            if not data:
+        for key, stats in sparsity_stats.items():
+            if stats['count'] == 0:
                 continue
 
-            avg_active = np.mean([d['active'] for d in data])
-            n_total = data[0]['total']
-            avg_weight_sum = np.mean([d['weight_sum'] for d in data])
+            avg_active = stats['active_sum'] / stats['count']
+            n_total = stats['n_total']
+            avg_weight_sum = stats['weight_sum'] / stats['count']
 
             results[key] = {
                 'display': ROUTING_KEYS[key][0],
@@ -1048,8 +1047,11 @@ class RoutingAnalyzer(BaseAnalyzer):
             - coselect_rate: ratio of shared to union
             - per_layer: layer-wise patterns
         """
-        coselect_data = defaultdict(list)
-        per_layer_data = defaultdict(lambda: defaultdict(list))
+        # Accumulate statistics
+        coselect_stats = defaultdict(lambda: {
+            'coselect_sum': 0, 'union_sum': 0, 'q_sum': 0, 'k_sum': 0, 'count': 0
+        })
+        per_layer_stats = defaultdict(lambda: defaultdict(lambda: {'coselect_sum': 0, 'count': 0}))
 
         pool_info = {
             'feature_qk': ('fqk_q', 'fqk_k'),
@@ -1080,7 +1082,7 @@ class RoutingAnalyzer(BaseAnalyzer):
                         if w_q is None or w_k is None:
                             continue
 
-                        # Compute per-token co-selection
+                        # Compute per-token co-selection (vectorized)
                         if w_q.dim() == 3:  # [B, S, N]
                             q_flat = w_q.view(-1, w_q.shape[-1])
                             k_flat = w_k.view(-1, w_k.shape[-1])
@@ -1091,39 +1093,40 @@ class RoutingAnalyzer(BaseAnalyzer):
                         q_active = (q_flat > 0)
                         k_active = (k_flat > 0)
 
-                        # Per-token metrics
+                        # Vectorized metrics
                         coselect = (q_active & k_active).sum(dim=-1).float()  # [B*S]
                         union = (q_active | k_active).sum(dim=-1).float()
                         q_count = q_active.sum(dim=-1).float()
                         k_count = k_active.sum(dim=-1).float()
 
-                        for j in range(coselect.shape[0]):
-                            coselect_data[pool_name].append({
-                                'coselect': coselect[j].item(),
-                                'union': union[j].item(),
-                                'q_count': q_count[j].item(),
-                                'k_count': k_count[j].item(),
-                            })
-                            per_layer_data[pool_name][layer_idx].append(coselect[j].item())
+                        n_tokens = coselect.shape[0]
+                        coselect_stats[pool_name]['coselect_sum'] += coselect.sum().item()
+                        coselect_stats[pool_name]['union_sum'] += union.sum().item()
+                        coselect_stats[pool_name]['q_sum'] += q_count.sum().item()
+                        coselect_stats[pool_name]['k_sum'] += k_count.sum().item()
+                        coselect_stats[pool_name]['count'] += n_tokens
+
+                        per_layer_stats[pool_name][layer_idx]['coselect_sum'] += coselect.sum().item()
+                        per_layer_stats[pool_name][layer_idx]['count'] += n_tokens
 
         # Aggregate results
         results = {}
-        for pool_name, data in coselect_data.items():
-            if not data:
+        for pool_name, stats in coselect_stats.items():
+            if stats['count'] == 0:
                 continue
 
-            mean_coselect = np.mean([d['coselect'] for d in data])
-            mean_union = np.mean([d['union'] for d in data])
-            mean_q = np.mean([d['q_count'] for d in data])
-            mean_k = np.mean([d['k_count'] for d in data])
+            mean_coselect = stats['coselect_sum'] / stats['count']
+            mean_union = stats['union_sum'] / stats['count']
+            mean_q = stats['q_sum'] / stats['count']
+            mean_k = stats['k_sum'] / stats['count']
 
             # Per-layer breakdown
             per_layer = {}
-            for layer_idx, layer_data in sorted(per_layer_data[pool_name].items()):
-                per_layer[f'L{layer_idx}'] = {
-                    'mean_coselect': np.mean(layer_data),
-                    'std_coselect': np.std(layer_data),
-                }
+            for layer_idx, layer_stats in sorted(per_layer_stats[pool_name].items()):
+                if layer_stats['count'] > 0:
+                    per_layer[f'L{layer_idx}'] = {
+                        'mean_coselect': layer_stats['coselect_sum'] / layer_stats['count'],
+                    }
 
             results[pool_name] = {
                 'mean_coselect_per_token': mean_coselect,
@@ -1230,7 +1233,10 @@ class RoutingAnalyzer(BaseAnalyzer):
             - top5_weight_ratio: fraction of weight in top-5 neurons
             - weight_gini: gini coefficient among active neurons
         """
-        concentration_data = defaultdict(list)
+        # Accumulate statistics
+        concentration_stats = defaultdict(lambda: {
+            'top1_sum': 0.0, 'top5_sum': 0.0, 'active_sum': 0, 'count': 0
+        })
 
         self.model.eval()
         with self.extractor.analysis_context():
@@ -1252,54 +1258,46 @@ class RoutingAnalyzer(BaseAnalyzer):
                         if weights is None:
                             continue
 
-                        # Flatten to [B*S, N] or [B, N]
+                        # Flatten to [B*S, N]
                         if weights.dim() == 3:
                             w_flat = weights.view(-1, weights.shape[-1])
                         else:
                             w_flat = weights
 
-                        for token_w in w_flat:
-                            # Only consider active (non-zero) weights
-                            active_mask = token_w > 0
-                            active_weights = token_w[active_mask]
+                        # Vectorized: sort each token's weights descending
+                        sorted_w, _ = w_flat.sort(dim=-1, descending=True)
 
-                            if active_weights.numel() == 0:
-                                continue
+                        # Total weight per token
+                        total_w = sorted_w.sum(dim=-1, keepdim=True)  # [B*S, 1]
+                        valid_mask = (total_w.squeeze(-1) > 0)
 
-                            total_w = active_weights.sum().item()
-                            if total_w <= 0:
-                                continue
+                        if not valid_mask.any():
+                            continue
 
-                            # Sort descending
-                            sorted_w, _ = active_weights.sort(descending=True)
-                            sorted_w = sorted_w.cpu().numpy()
+                        # Top1 and Top5 ratios (vectorized)
+                        top1 = sorted_w[:, 0] / (total_w.squeeze(-1) + 1e-8)
+                        top5 = sorted_w[:, :5].sum(dim=-1) / (total_w.squeeze(-1) + 1e-8)
 
-                            # Top-k ratios
-                            top1_ratio = sorted_w[0] / total_w if len(sorted_w) >= 1 else 0
-                            top5_ratio = sorted_w[:5].sum() / total_w if len(sorted_w) >= 5 else sorted_w.sum() / total_w
+                        # Active count per token
+                        active_counts = (w_flat > 0).sum(dim=-1).float()
 
-                            # Gini coefficient
-                            gini = gini_coefficient(sorted_w)
-
-                            concentration_data[key].append({
-                                'top1_ratio': top1_ratio,
-                                'top5_ratio': top5_ratio,
-                                'gini': gini,
-                                'n_active': len(sorted_w),
-                            })
+                        # Only count valid tokens
+                        concentration_stats[key]['top1_sum'] += top1[valid_mask].sum().item()
+                        concentration_stats[key]['top5_sum'] += top5[valid_mask].sum().item()
+                        concentration_stats[key]['active_sum'] += active_counts[valid_mask].sum().item()
+                        concentration_stats[key]['count'] += valid_mask.sum().item()
 
         # Aggregate results
         results = {}
-        for key, data in concentration_data.items():
-            if not data:
+        for key, stats in concentration_stats.items():
+            if stats['count'] == 0:
                 continue
 
             results[key] = {
                 'display': ROUTING_KEYS[key][0],
-                'top1_weight_ratio': np.mean([d['top1_ratio'] for d in data]),
-                'top5_weight_ratio': np.mean([d['top5_ratio'] for d in data]),
-                'weight_gini': np.mean([d['gini'] for d in data]),
-                'avg_active_neurons': np.mean([d['n_active'] for d in data]),
+                'top1_weight_ratio': stats['top1_sum'] / stats['count'],
+                'top5_weight_ratio': stats['top5_sum'] / stats['count'],
+                'avg_active_neurons': stats['active_sum'] / stats['count'],
             }
 
         results['n_batches'] = n_batches
