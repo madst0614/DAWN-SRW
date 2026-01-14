@@ -312,6 +312,7 @@ class RoutingAnalyzer(BaseAnalyzer):
             Dictionary with Q/K overlap statistics
         """
         overlap_data = {'fqk': [], 'rqk': []}
+        threshold = 0.01  # For soft gating
 
         def compute_jaccard_from_weights(q_weights, k_weights):
             """Compute Jaccard similarity from weight tensors (active neurons)."""
@@ -323,9 +324,9 @@ class RoutingAnalyzer(BaseAnalyzer):
                 q_flat = q_weights
                 k_flat = k_weights
 
-            # Active neurons (weight > 0)
-            q_active = (q_flat > 0).float()
-            k_active = (k_flat > 0).float()
+            # Active neurons (weight > threshold for soft gating)
+            q_active = (q_flat > threshold).float()
+            k_active = (k_flat > threshold).float()
 
             # Compute intersection and union
             intersection = (q_active * k_active).sum(dim=-1)  # [B*S]

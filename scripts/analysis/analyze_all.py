@@ -983,13 +983,18 @@ class ModelAnalyzer:
         # Print detailed summary
         print(f"\n  ┌─ Co-Selection Analysis ───────────────────────────────────────────────────")
         for pair_name, data in results.items():
-            if isinstance(data, dict) and 'coselection_rate' in data:
-                print(f"  │ {pair_name}:")
-                print(f"  │   Co-selection rate: {data['coselection_rate']*100:.2f}%")
-                print(f"  │   Correlation: {data.get('correlation', 0):.4f}")
-                if data.get('top_pairs'):
-                    top_3 = data['top_pairs'][:3]
-                    print(f"  │   Top pairs: {', '.join(f'({p[0]},{p[1]})' for p in top_3)}")
+            if isinstance(data, dict) and 'pair_name' in data:
+                print(f"  │ {data['pair_name']}:")
+                # Show concentration metrics
+                conc = data.get('concentration', {})
+                if conc:
+                    print(f"  │   Top10: {conc.get('top10_pct', 0):.1f}%, Top50: {conc.get('top50_pct', 0):.1f}%")
+                    print(f"  │   Entropy: {conc.get('normalized_entropy', 0):.3f} (normalized)")
+                # Show top pairs
+                top_pairs = data.get('top_pairs', [])
+                if top_pairs:
+                    top_3 = [(p['a_idx'], p['b_idx'], p['pct']) for p in top_pairs[:3]]
+                    print(f"  │   Top pairs: {', '.join(f'({a},{b}):{pct:.1f}%' for a,b,pct in top_3)}")
         print(f"  └─────────────────────────────────────────────────────────────────────────────")
 
         self.results['coselection'] = results
@@ -1008,6 +1013,12 @@ class ModelAnalyzer:
 
         print("  Analyzing weight matrices...")
         analyzer = WeightAnalyzer(model=self.model, device=self.device)
+
+        # Check if shared_neurons is available
+        if analyzer.neurons is None:
+            print("  Skipping (no shared_neurons found - may be v18.5+ model)")
+            return {}
+
         results = analyzer.run_all(str(output_dir))
 
         # Print detailed summary
