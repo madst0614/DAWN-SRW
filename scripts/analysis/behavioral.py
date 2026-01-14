@@ -644,10 +644,10 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 ]
 
                 base_result.update({
-                    'neuron_frequencies': sorted(
-                        [(n, f) for n, f in neuron_freq.items()],
-                        key=lambda x: -x[1]
-                    )[:50],
+                    'neuron_frequencies': [
+                        {'neuron': n, 'count': int(neuron_counts[n]), 'percentage': f * 100}
+                        for n, f in sorted(neuron_freq.items(), key=lambda x: -x[1])[:50]
+                    ],
                     'common_neurons_80': common_neurons_80,
                     'common_neurons_100': common_neurons_100,
                 })
