@@ -223,6 +223,124 @@ class NeuronEmbeddingAnalyzer(BaseAnalyzer):
             'centroids': centroids.tolist(),
         }
 
+    def analyze_pool_alignment(self, method: str = 'kmeans') -> Dict:
+        """
+        Analyze how well k=6 clusters align with the 6 neuron pools.
+
+        This tests whether neurons naturally cluster by their pool assignments,
+        which would indicate that pools have distinct embedding patterns.
+
+        Args:
+            method: Clustering method ('kmeans' or 'hierarchical')
+
+        Returns:
+            Dictionary with pool-cluster alignment analysis
+        """
+        if not HAS_SKLEARN:
+            return {'error': 'sklearn not available'}
+
+        if self.neuron_emb is None:
+            return {'error': 'No neuron embeddings found'}
+
+        emb_np = self.neuron_emb.cpu().numpy()
+        n_pools = len(self.pool_boundaries)
+
+        if n_pools == 0:
+            return {'error': 'No pools found'}
+
+        # Create true pool labels for each neuron
+        true_labels = np.zeros(len(emb_np), dtype=int)
+        pool_names = list(self.pool_boundaries.keys())
+        for pool_idx, (pool_name, (start, end)) in enumerate(self.pool_boundaries.items()):
+            true_labels[start:end] = pool_idx
+
+        # Cluster with k = number of pools
+        k = n_pools
+        if method == 'kmeans':
+            clusterer = KMeans(n_clusters=k, random_state=42, n_init=10)
+        else:
+            clusterer = AgglomerativeClustering(n_clusters=k)
+
+        pred_labels = clusterer.fit_predict(emb_np)
+
+        # Build confusion matrix: [n_pools, n_clusters]
+        confusion = np.zeros((n_pools, k), dtype=int)
+        for true_label, pred_label in zip(true_labels, pred_labels):
+            confusion[true_label, pred_label] += 1
+
+        # Compute metrics
+        # 1. Purity: for each cluster, count majority pool / total
+        cluster_purity = []
+        for c in range(k):
+            cluster_mask = pred_labels == c
+            if cluster_mask.sum() == 0:
+                cluster_purity.append(0.0)
+                continue
+            cluster_true = true_labels[cluster_mask]
+            majority_count = np.bincount(cluster_true).max()
+            purity = majority_count / len(cluster_true)
+            cluster_purity.append(float(purity))
+
+        overall_purity = np.mean(cluster_purity)
+
+        # 2. Pool coverage: for each pool, what fraction ends up in one cluster?
+        pool_coverage = []
+        for p in range(n_pools):
+            pool_dist = confusion[p]
+            if pool_dist.sum() == 0:
+                pool_coverage.append(0.0)
+                continue
+            coverage = pool_dist.max() / pool_dist.sum()
+            pool_coverage.append(float(coverage))
+
+        # 3. Silhouette score with true labels vs predicted labels
+        sil_true = silhouette_score(emb_np, true_labels)
+        sil_pred = silhouette_score(emb_np, pred_labels)
+
+        # 4. Best cluster assignment for each pool (Hungarian-like matching)
+        best_cluster_for_pool = {}
+        best_pool_for_cluster = {}
+        for p_idx, pool_name in enumerate(pool_names):
+            best_cluster = int(np.argmax(confusion[p_idx]))
+            best_cluster_for_pool[pool_name] = {
+                'cluster': best_cluster,
+                'count': int(confusion[p_idx, best_cluster]),
+                'coverage': float(confusion[p_idx, best_cluster] / confusion[p_idx].sum())
+            }
+
+        for c in range(k):
+            best_pool_idx = int(np.argmax(confusion[:, c]))
+            best_pool_for_cluster[c] = {
+                'pool': pool_names[best_pool_idx],
+                'count': int(confusion[best_pool_idx, c]),
+                'purity': cluster_purity[c]
+            }
+
+        # 5. Detailed confusion matrix with pool names
+        confusion_dict = {}
+        for p_idx, pool_name in enumerate(pool_names):
+            confusion_dict[pool_name] = {
+                f'cluster_{c}': int(confusion[p_idx, c]) for c in range(k)
+            }
+
+        return {
+            'method': method,
+            'k': k,
+            'n_neurons': len(emb_np),
+            'n_pools': n_pools,
+            'pool_names': pool_names,
+            'confusion_matrix': confusion_dict,
+            'cluster_purity': {c: cluster_purity[c] for c in range(k)},
+            'overall_purity': float(overall_purity),
+            'pool_coverage': {pool_names[p]: pool_coverage[p] for p in range(n_pools)},
+            'mean_pool_coverage': float(np.mean(pool_coverage)),
+            'silhouette_true_labels': float(sil_true),
+            'silhouette_pred_labels': float(sil_pred),
+            'best_cluster_for_pool': best_cluster_for_pool,
+            'best_pool_for_cluster': best_pool_for_cluster,
+            'cluster_labels': pred_labels.tolist(),
+        }
+
     def analyze_pool_distribution(self) -> Dict:
         """
         Analyze embedding distribution across pools.
@@ -757,7 +875,12 @@ class NeuronEmbeddingAnalyzer(BaseAnalyzer):
                 n_batches=n_batches
             )
 
-        # 5. Per-pool clustering
+        # 5. Pool alignment analysis (k=6 fixed)
+        print("Analyzing pool-cluster alignment (k=6)...")
+        pool_alignment = self.analyze_pool_alignment()
+        results['pool_alignment'] = pool_alignment
+
+        # 6. Per-pool clustering (internal structure within each pool)
         print("Analyzing per-pool clustering...")
         results['per_pool_clustering'] = {}
         for pool_name in self.pool_boundaries.keys():
@@ -765,10 +888,14 @@ class NeuronEmbeddingAnalyzer(BaseAnalyzer):
                 k_range=(3, min(15, k_range[1])),
                 pool_name=pool_name
             )
+            # Store detailed results including cluster stats
             results['per_pool_clustering'][pool_name] = {
-                'optimal_k': pool_clustering.get('optimal_k'),
-                'best_silhouette': pool_clustering.get('best_silhouette'),
                 'n_neurons': pool_clustering.get('n_embeddings'),
+                'optimal_k': pool_clustering.get('optimal_k'),
+                'optimal_k_silhouette': pool_clustering.get('optimal_k_silhouette'),
+                'optimal_k_calinski': pool_clustering.get('optimal_k_calinski'),
+                'best_silhouette': pool_clustering.get('best_silhouette'),
+                'cluster_stats': pool_clustering.get('cluster_stats'),
             }
 
         return results

@@ -807,6 +807,33 @@ class ModelAnalyzer:
             print(f"  │ Total embeddings: {clustering.get('n_embeddings', 0)}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
+        # Pool alignment analysis (k=6 fixed)
+        pool_alignment = results.get('pool_alignment', {})
+        if pool_alignment and 'pool_coverage' in pool_alignment:
+            print(f"\n  ┌─ Pool-Cluster Alignment (k=6) ─────────────────────────────────────────")
+            print(f"  │ Overall Purity: {pool_alignment.get('overall_purity', 0)*100:.1f}%")
+            print(f"  │ Mean Pool Coverage: {pool_alignment.get('mean_pool_coverage', 0)*100:.1f}%")
+            print(f"  │ Silhouette (true): {pool_alignment.get('silhouette_true_labels', 0):.4f}")
+            print(f"  │ Silhouette (pred): {pool_alignment.get('silhouette_pred_labels', 0):.4f}")
+            print(f"  │")
+            print(f"  │ Pool → Best Cluster (coverage):")
+            for pool, data in pool_alignment.get('best_cluster_for_pool', {}).items():
+                print(f"  │   {pool:<12} → cluster {data['cluster']} ({data['coverage']*100:.1f}%)")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Per-pool clustering
+        per_pool = results.get('per_pool_clustering', {})
+        if per_pool:
+            print(f"\n  ┌─ Per-Pool Clustering (internal structure) ───────────────────────────")
+            print(f"  │ {'Pool':<12} {'N':>6} {'Opt k':>6} {'Silhouette':>12}")
+            print(f"  │ {'─'*12} {'─'*6} {'─'*6} {'─'*12}")
+            for pool_name, data in per_pool.items():
+                n = data.get('n_neurons', 0)
+                k = data.get('optimal_k', 'N/A')
+                sil = data.get('best_silhouette', 0)
+                print(f"  │ {pool_name:<12} {n:>6} {k:>6} {sil:>12.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
         if pos_analysis and 'pos_stats' in pos_analysis:
             print(f"\n  ┌─ POS Projection Analysis ──────────────────────────────────────────────")
             print(f"  │ POS categories: {pos_analysis.get('n_pos_categories', 0)}")
