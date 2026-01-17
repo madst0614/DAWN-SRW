@@ -259,7 +259,19 @@ class ModelAnalyzer:
         return params_info
 
     def analyze_performance(self, n_batches: int = 200) -> Dict:
-        """Analyze validation performance."""
+        """Analyze validation performance.
+
+        Computes loss, perplexity, and accuracy on validation data.
+
+        Args:
+            n_batches: Number of batches to evaluate (default: 200)
+                - 50: Quick test (~30 sec)
+                - 200: Standard evaluation (~2 min)
+                - 500+: Full validation pass
+
+        Returns:
+            Dict with loss, perplexity, accuracy, speed metrics
+        """
         from scripts.evaluation.evaluate import evaluate_model, load_val_data
 
         output_dir = self.output_dir / 'performance'
@@ -542,7 +554,19 @@ class ModelAnalyzer:
         return results
 
     def analyze_routing(self, n_batches: int = 100) -> Dict:
-        """Analyze routing patterns (DAWN only)."""
+        """Analyze routing patterns (DAWN only).
+
+        Analyzes how the router distributes attention across neuron pools.
+
+        Args:
+            n_batches: Number of batches to analyze (default: 100)
+                - 20: Quick test (~1 min)
+                - 100: Standard analysis (~5 min)
+                - 200+: Comprehensive analysis
+
+        Returns:
+            Dict with entropy, selection frequency, diversity metrics per pool
+        """
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
             return {}
@@ -762,7 +786,24 @@ class ModelAnalyzer:
         return results
 
     def analyze_neuron_embedding(self, n_batches: int = 50, k_range: Tuple[int, int] = (5, 20)) -> Dict:
-        """Analyze neuron embeddings with clustering and token projections (DAWN only)."""
+        """Analyze neuron embeddings with clustering and token projections (DAWN only).
+
+        Clusters neurons based on their embedding vectors and analyzes
+        how different pools align with clusters.
+
+        Args:
+            n_batches: Number of batches for token projection analysis (default: 50)
+                - 10: Quick test
+                - 50: Standard analysis
+                - 100+: More accurate projections
+            k_range: Range of cluster counts to try for K-means (default: (5, 20))
+                - (3, 10): Coarse clustering
+                - (5, 20): Standard range (recommended)
+                - (10, 30): Fine-grained clustering
+
+        Returns:
+            Dict with pool distribution, optimal clustering, silhouette scores
+        """
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
             return {}
@@ -922,8 +963,34 @@ class ModelAnalyzer:
         self.results['semantic'] = results
         return results
 
-    def analyze_pos(self, max_sentences: int = 2000, pool_type: str = 'fv', target_layer: int = None) -> Dict:
-        """Analyze POS neuron specialization (DAWN only)."""
+    def analyze_pos(self, max_sentences: int = 2000, pool_type: str = 'fv', target_layer: int = None,
+                     compute_coactivation: bool = False) -> Dict:
+        """Analyze POS neuron specialization (DAWN only).
+
+        Analyzes how neurons specialize for different Part-of-Speech tags.
+        Uses Universal Dependencies English Web Treebank dataset.
+
+        Args:
+            max_sentences: Number of sentences to analyze (default: 2000)
+                - 500: Quick test (~1 min)
+                - 2000: Standard analysis (~5 min)
+                - 5000+: Comprehensive analysis
+            pool_type: Which neuron pool to analyze
+                - 'fv': Feature V pool (default, recommended)
+                - 'rv': Restore V pool
+                - 'fqk', 'fqk_q', 'fqk_k': Feature QK pools
+                - 'rqk', 'rqk_q', 'rqk_k': Restore QK pools
+                - 'fknow', 'rknow': Knowledge pools
+            target_layer: Specific layer to analyze (default: None = all layers)
+                - 0-11: Specific layer index
+                - None: Average across all layers
+            compute_coactivation: Compute neuron co-activation correlation matrix
+                - False: Skip (faster, less memory)
+                - True: Compute correlation between neurons (memory intensive)
+
+        Returns:
+            Dict with selectivity matrix, top neurons per POS, clustering results
+        """
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
             return {}
@@ -934,12 +1001,16 @@ class ModelAnalyzer:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
-        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, pool={pool_type}, {layer_str})...")
+        coact_str = ", coactivation=ON" if compute_coactivation else ""
+        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, pool={pool_type}, {layer_str}{coact_str})...")
         analyzer = POSNeuronAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device,
             target_layer=target_layer
         )
-        results = analyzer.run_all(str(output_dir), pool_type=pool_type, max_sentences=max_sentences)
+        results = analyzer.run_all(
+            str(output_dir), pool_type=pool_type, max_sentences=max_sentences,
+            compute_coactivation=compute_coactivation
+        )
 
         # Print detailed summary
         pos_counts = results.get('pos_token_counts', {})
@@ -995,7 +1066,24 @@ class ModelAnalyzer:
         return results
 
     def analyze_factual(self, n_runs: int = 10, pool_type: str = 'fv') -> Dict:
-        """Analyze factual knowledge neurons (DAWN only)."""
+        """Analyze factual knowledge neurons (DAWN only).
+
+        Finds neurons that consistently activate for factual knowledge
+        (e.g., "The capital of France is" -> Paris).
+
+        Args:
+            n_runs: Number of repeated runs per prompt for consistency (default: 10)
+                - 5: Quick test
+                - 10: Standard analysis
+                - 20+: High confidence consistency check
+            pool_type: Which neuron pool to analyze
+                - 'fv': Feature V pool (default, recommended)
+                - 'rv': Restore V pool
+                - 'fqk', 'fqk_q', 'fqk_k': Feature QK pools
+
+        Returns:
+            Dict with per-target neuron activations, common neurons, match rates
+        """
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
             return {}
