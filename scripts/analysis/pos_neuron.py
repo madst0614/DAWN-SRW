@@ -601,30 +601,15 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         if path:
             paths['pos_similarity'] = path
 
-        # Legacy visualizations (adapted)
+        # Legacy visualizations - only call plot_pos_specificity (compatible with new format)
         try:
-            from .visualizers.pos_neurons import (
-                plot_pos_heatmap, plot_pos_clustering,
-                plot_top_neurons_by_pos, plot_pos_specificity
-            )
-
-            path = plot_pos_heatmap(results, os.path.join(output_dir, 'pos_neuron_heatmap.png'))
-            if path:
-                paths['heatmap'] = path
-
-            path = plot_pos_clustering(results, os.path.join(output_dir, 'pos_clustering.png'))
-            if path:
-                paths['clustering'] = path
-
-            path = plot_top_neurons_by_pos(results, os.path.join(output_dir, 'top_neurons_by_pos.png'))
-            if path:
-                paths['top_neurons'] = path
+            from .visualizers.pos_neurons import plot_pos_specificity
 
             path = plot_pos_specificity(results, os.path.join(output_dir, 'neuron_specificity.png'))
             if path:
                 paths['specificity'] = path
-        except ImportError:
-            pass
+        except (ImportError, KeyError, Exception):
+            pass  # Legacy visualizers may fail with new data format
 
         return paths
 
