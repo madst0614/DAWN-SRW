@@ -320,14 +320,19 @@ class NeuronEmbeddingAnalyzer(BaseAnalyzer):
         if pool_name:
             start, end = self.pool_boundaries.get(pool_name, (0, 0))
             neuron_offset = start
+            n_pool_neurons = end - start
         else:
             neuron_offset = 0
+            n_pool_neurons = len(cluster_labels)
 
         n_clusters = max(cluster_labels) + 1
-        cluster_labels = np.array(cluster_labels)
+        cluster_labels_np = np.array(cluster_labels)
 
-        # Track activations per cluster
-        # cluster_activations[cluster_id] = {token_id: total_weight}
+        # Pre-compute cluster masks for vectorization
+        cluster_labels_t = torch.tensor(cluster_labels_np, device=self.device)
+        cluster_masks = [(cluster_labels_t == c) for c in range(n_clusters)]
+
+        # Track activations per cluster: cluster_id -> {token_id: weight}
         cluster_activations = [defaultdict(float) for _ in range(n_clusters)]
         cluster_total_weight = [0.0 for _ in range(n_clusters)]
 
@@ -349,7 +354,6 @@ class NeuronEmbeddingAnalyzer(BaseAnalyzer):
                 for layer in routing:
                     # Get weights for the target pool
                     if pool_name:
-                        # Map pool to routing keys
                         pool_to_keys = {
                             'feature_qk': ['fqk_q', 'fqk_k'],
                             'feature_v': ['fv'],
@@ -360,7 +364,6 @@ class NeuronEmbeddingAnalyzer(BaseAnalyzer):
                         }
                         keys = pool_to_keys.get(pool_name, [])
                     else:
-                        # All keys
                         keys = ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']
 
                     for key in keys:
@@ -374,25 +377,44 @@ class NeuronEmbeddingAnalyzer(BaseAnalyzer):
 
                         B, S, N = weights.shape
 
-                        # For each position, find active neurons and their clusters
-                        for b in range(B):
-                            for s in range(S):
-                                token_id = input_ids[b, s].item()
-                                w = weights[b, s]  # [N]
+                        # Slice to pool-specific neurons if needed
+                        if pool_name and neuron_offset > 0:
+                            if N > n_pool_neurons:
+                                weights = weights[:, :, neuron_offset:neuron_offset + n_pool_neurons]
+                        elif N != n_pool_neurons:
+                            continue  # Shape mismatch
 
-                                # Get active neurons
-                                active_mask = w > 0
-                                active_indices = active_mask.nonzero().flatten()
+                        # Vectorized: compute per-cluster weights using masks
+                        input_ids_flat = input_ids.view(-1).cpu().numpy().astype(np.int64)  # [B*S]
 
-                                for idx in active_indices:
-                                    idx = idx.item()
-                                    neuron_idx = idx - neuron_offset
+                        for c in range(n_clusters):
+                            mask = cluster_masks[c]
+                            if mask.shape[0] != weights.shape[-1]:
+                                continue
 
-                                    if 0 <= neuron_idx < len(cluster_labels):
-                                        cluster_id = cluster_labels[neuron_idx]
-                                        weight_val = w[idx].item()
-                                        cluster_activations[cluster_id][token_id] += weight_val
-                                        cluster_total_weight[cluster_id] += weight_val
+                            # Sum weights for neurons in this cluster: [B, S]
+                            cluster_w = (weights * mask.float()).sum(dim=-1)  # [B, S]
+                            cluster_w_flat = cluster_w.view(-1).cpu().numpy()  # [B*S]
+
+                            # Use np.bincount for fast token-wise accumulation
+                            nonzero_mask = cluster_w_flat > 0
+                            if not nonzero_mask.any():
+                                continue
+
+                            token_ids_active = input_ids_flat[nonzero_mask]
+                            weights_active = cluster_w_flat[nonzero_mask]
+
+                            # bincount sums weights per token_id in one shot
+                            max_token = int(token_ids_active.max()) + 1
+                            token_weights = np.bincount(
+                                token_ids_active, weights=weights_active, minlength=max_token
+                            )
+
+                            # Merge into cluster_activations[c]
+                            active_tokens = np.where(token_weights > 0)[0]
+                            for token_id in active_tokens:
+                                cluster_activations[c][int(token_id)] += token_weights[token_id]
+                            cluster_total_weight[c] += float(weights_active.sum())
 
         # Get tokenizer for decoding
         tokenizer = getattr(self, 'tokenizer', None)
