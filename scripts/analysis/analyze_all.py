@@ -964,22 +964,29 @@ class ModelAnalyzer:
 
         if top_neurons:
             print(f"\n  ┌─ Top Neurons per POS ──────────────────────────────────────────────────")
-            print(f"  │ {'POS':<10} {'Top Neurons (id:freq)':<50}")
+            print(f"  │ {'POS':<10} {'Top Neurons (id:sel)':<50}")
             print(f"  │ {'─'*60}")
             for pos in ['NOUN', 'VERB', 'ADJ', 'ADV', 'DET', 'PUNCT']:
                 if pos in top_neurons and top_neurons[pos]:
                     neurons = top_neurons[pos][:5]
-                    neuron_str = ', '.join(f'{n}:{f:.2f}' for n, f in neurons)
+                    # Handle both old format (tuples) and new format (dicts)
+                    if neurons and isinstance(neurons[0], dict):
+                        neuron_str = ', '.join(f"N{n['neuron']}:{n['selectivity']:.2f}" for n in neurons)
+                    else:
+                        neuron_str = ', '.join(f'{n}:{f:.2f}' for n, f in neurons)
                     print(f"  │ {pos:<10} {neuron_str}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if specificity:
             print(f"\n  ┌─ POS-Specific Neurons (High Selectivity) ──────────────────────────────")
             top_specific = list(specificity.items())[:10]
-            print(f"  │ {'Neuron':<10} {'Top POS':<10} {'Score':>10} {'Specificity':>12}")
-            print(f"  │ {'─'*42}")
+            print(f"  │ {'Neuron':<10} {'Top POS':<10} {'Selectivity':>12} {'Mean Weight':>12}")
+            print(f"  │ {'─'*44}")
             for neuron_id, data in top_specific:
-                print(f"  │ N{neuron_id:<9} {data['top_pos']:<10} {data['top_score']:>10.3f} {data['specificity']:>12.1f}x")
+                # Handle both old format and new format
+                selectivity = data.get('selectivity', data.get('specificity', 0))
+                mean_weight = data.get('mean_weight', data.get('top_score', 0))
+                print(f"  │ N{neuron_id:<9} {data['top_pos']:<10} {selectivity:>12.2f}x {mean_weight:>12.4f}")
             print(f"  │")
             print(f"  │ Total specific neurons: {len(specificity)}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
