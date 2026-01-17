@@ -568,6 +568,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         try:
             from sklearn.cluster import KMeans
             from sklearn.preprocessing import StandardScaler
+            from sklearn.metrics import silhouette_score
             HAS_SKLEARN = True
         except ImportError:
             HAS_SKLEARN = False
@@ -588,6 +589,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             return {'error': 'Not enough active neurons for clustering'}
 
         active_profiles = profiles[active_mask]  # [n_active, n_pos]
+        silhouette = None
 
         if HAS_SKLEARN:
             # Normalize profiles for better clustering
@@ -597,6 +599,10 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             # K-means clustering
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             cluster_labels = kmeans.fit_predict(scaled_profiles)
+
+            # Compute silhouette score (clustering quality metric)
+            if len(np.unique(cluster_labels)) > 1:
+                silhouette = float(silhouette_score(scaled_profiles, cluster_labels))
             cluster_centers = scaler.inverse_transform(kmeans.cluster_centers_)  # [k, n_pos]
         else:
             # Simple fallback: assign by dominant POS
@@ -643,6 +649,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         summary = {
             'n_clusters': len(clusters),
             'n_neurons_clustered': len(active_indices),
+            'silhouette_score': silhouette,  # Clustering quality: -1 to 1, higher is better
             'cluster_sizes': {
                 name: data['n_neurons'] for name, data in clusters.items()
             },
@@ -924,8 +931,11 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         if clustering and 'clusters' in clustering:
             print("\n┌─ POS Profile Clustering (neurons grouped by selectivity patterns) ───┐")
             summary = clustering.get('summary', {})
+            sil_score = summary.get('silhouette_score')
+            sil_str = f"{sil_score:.3f}" if sil_score is not None else "N/A"
             print(f"│  Clusters: {summary.get('n_clusters', 0)}, "
                   f"Neurons clustered: {summary.get('n_neurons_clustered', 0)}")
+            print(f"│  Silhouette Score: {sil_str}  (range: -1 to 1, higher = better separation)")
             print(f"│")
 
             for name, data in clustering['clusters'].items():
