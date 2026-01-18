@@ -1293,6 +1293,14 @@ class AttentionCircuit(nn.Module):
                 if info_v and 'rv_weights' in info_v:
                     restore_info['rv_weights'] = info_v['rv_weights']
 
+                # Store restore masks for analysis (scores > tau)
+                if info_q and 'rqk_mask_Q' in info_q:
+                    restore_info['rqk_mask_Q'] = info_q['rqk_mask_Q']
+                if info_k and 'rqk_mask_K' in info_k:
+                    restore_info['rqk_mask_K'] = info_k['rqk_mask_K']
+                if info_v and 'rv_mask' in info_v:
+                    restore_info['rv_mask'] = info_v['rv_mask']
+
         # Q norm for dead routing detection
         q_norm = Q_total.norm(dim=-1, keepdim=True)
 
