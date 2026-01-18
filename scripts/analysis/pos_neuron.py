@@ -3575,7 +3575,8 @@ class NeuronFeatureAnalyzer:
         self.n_tokens = len(token_data)
 
         if n_neurons is None and token_data:
-            n_neurons = len(token_data[0]['mask'])
+            # Use max mask length across all tokens (handles layerwise data with varying sizes)
+            n_neurons = max(len(token['mask']) for token in token_data)
         self.n_neurons = n_neurons
 
         # Matrices (built lazily)
