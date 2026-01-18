@@ -1457,6 +1457,10 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         # Storage for layer divergence analysis
         self.layer_token_data = defaultdict(list)  # {token_str: [{layer_masks: {...}, ...}]}
 
+        # Logging flag (only log mask mode once)
+        self._logged_mask_mode = False
+        self._mask_mode_stats = {'actual': 0, 'fallback': 0}
+
     def _get_pool_sizes(self) -> Dict[str, int]:
         """Get sizes of each pool for concatenation."""
         sizes = {}
@@ -1528,11 +1532,15 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         Falls back to weight > threshold only if masks unavailable.
         """
         masks = []
+        used_actual = 0
+        used_fallback = 0
+
         for pool_key, expected_size in self.pool_order:
             # Try to get actual binary mask first (scores > tau)
             mask = layer.get_mask(pool_key)
 
             if mask is not None:
+                used_actual += 1
                 # Use actual model mask (cleaner signal)
                 if mask.dim() == 3:
                     m = mask[0, :seq_len].cpu().numpy().astype(np.bool_)
@@ -1547,6 +1555,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
 
                 masks.append(m)
             else:
+                used_fallback += 1
                 # Fallback: use weights > threshold
                 weights = layer.get_weight(pool_key)
                 if weights is None:
@@ -1564,6 +1573,20 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                         w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
 
                     masks.append(w > self.activation_threshold)
+
+        # Log mask mode once
+        if not self._logged_mask_mode:
+            self._logged_mask_mode = True
+            if used_actual > 0 and used_fallback == 0:
+                print(f"  [Mask mode] Using actual masks (tau-based) for all {used_actual} pools ✓")
+            elif used_fallback > 0 and used_actual == 0:
+                print(f"  [Mask mode] Fallback to weights > {self.activation_threshold} for all {used_fallback} pools")
+                print(f"              (masks not available in routing_info)")
+            else:
+                print(f"  [Mask mode] Mixed: {used_actual} actual masks, {used_fallback} fallback")
+
+        self._mask_mode_stats['actual'] += used_actual
+        self._mask_mode_stats['fallback'] += used_fallback
 
         return np.concatenate(masks, axis=-1) if masks else np.zeros((seq_len, 0), dtype=np.bool_)
 
@@ -2315,7 +2338,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             '_neuron_sims': neuron_arr,
         }
 
-    def _load_glove_embeddings(self, dim: int = 100) -> Optional[Dict[str, np.ndarray]]:
+    def _load_glove_embeddings(self, dim: int = 300) -> Optional[Dict[str, np.ndarray]]:
         """
         Load GloVe embeddings via gensim (auto-downloads and caches).
 
@@ -2345,8 +2368,29 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         print("TOKEN-BASED NEURON COMBINATION ANALYSIS")
         print("=" * 70)
 
-        print(f"\nTokens analyzed: {results.get('n_tokens', 0):,}")
-        print(f"Total neurons: {results.get('n_neurons', 0):,}")
+        n_tokens = results.get('n_tokens', 0)
+        n_neurons = results.get('n_neurons', 0)
+        print(f"\nTokens analyzed: {n_tokens:,}")
+        print(f"Total neurons: {n_neurons:,}")
+
+        # Mask mode stats
+        if self._mask_mode_stats['actual'] > 0 or self._mask_mode_stats['fallback'] > 0:
+            actual = self._mask_mode_stats['actual']
+            fallback = self._mask_mode_stats['fallback']
+            total = actual + fallback
+            if fallback == 0:
+                print(f"Mask mode: actual tau-based masks ({actual}/{total} pools) ✓")
+            elif actual == 0:
+                print(f"Mask mode: fallback weights > threshold ({fallback}/{total} pools)")
+            else:
+                print(f"Mask mode: mixed ({actual} actual, {fallback} fallback)")
+
+        # Active neurons per token
+        token_stats = results.get('token_stats', {})
+        if token_stats:
+            mean_active = token_stats.get('mean_active_neurons', 0)
+            std_active = token_stats.get('std_active_neurons', 0)
+            print(f"Mean active neurons per token: {mean_active:.1f} ± {std_active:.1f} / {n_neurons}")
 
         # Silhouette score
         sil = results.get('silhouette_score', {})
