@@ -42,6 +42,40 @@ POS_GROUPS = {
 # POS tag to index mapping
 POS_TO_IDX = {pos: i for i, pos in enumerate(UPOS_TAGS)}
 
+# Universal Dependency Relations (deprel) - core relations for analysis
+DEPREL_TAGS = [
+    'nsubj',    # nominal subject
+    'obj',      # object (direct)
+    'iobj',     # indirect object
+    'obl',      # oblique nominal
+    'amod',     # adjectival modifier
+    'advmod',   # adverbial modifier
+    'det',      # determiner
+    'case',     # case marking (preposition)
+    'mark',     # subordinating conjunction
+    'cc',       # coordinating conjunction
+    'conj',     # conjunct
+    'nmod',     # nominal modifier
+    'root',     # root of sentence
+    'aux',      # auxiliary
+    'cop',      # copula
+    'compound', # compound
+    'flat',     # flat (names)
+    'punct',    # punctuation
+]
+
+# Deprel to index mapping
+DEPREL_TO_IDX = {dep: i for i, dep in enumerate(DEPREL_TAGS)}
+
+# Deprel groups for analysis
+DEPREL_GROUPS = {
+    'Core Arguments': ['nsubj', 'obj', 'iobj'],
+    'Modifiers': ['amod', 'advmod', 'nmod', 'obl'],
+    'Function': ['det', 'case', 'mark', 'cc', 'aux', 'cop'],
+    'Structure': ['root', 'conj', 'compound', 'flat'],
+    'Other': ['punct'],
+}
+
 
 class POSNeuronAnalyzer(BaseAnalyzer):
     """Analyze neuron activations by POS tags using continuous weights."""
@@ -176,7 +210,9 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         for sent in sentences:
             tokens = [token['form'] for token in sent]
             upos = [token['upos'] for token in sent]
-            dataset.append({'tokens': tokens, 'upos': upos})
+            # Extract dependency relations (deprel)
+            deprel = [token['deprel'] for token in sent]
+            dataset.append({'tokens': tokens, 'upos': upos, 'deprel': deprel})
 
         print(f"Loaded {len(dataset)} sentences")
         return dataset
@@ -207,9 +243,11 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         for sent in sentences:
             tokens = [word for word, tag in sent]
             upos = [nltk_to_upos.get(tag, 'X') for word, tag in sent]
-            dataset.append({'tokens': tokens, 'upos': upos})
+            # NLTK treebank doesn't have deprel, use empty
+            deprel = ['_'] * len(tokens)
+            dataset.append({'tokens': tokens, 'upos': upos, 'deprel': deprel})
 
-        print(f"Loaded {len(dataset)} sentences from NLTK treebank")
+        print(f"Loaded {len(dataset)} sentences from NLTK treebank (no deprel)")
         return dataset
 
     def get_pos_for_tokens(
@@ -282,6 +320,91 @@ class POSNeuronAnalyzer(BaseAnalyzer):
                 dawn_pos_tags.append(assigned_pos)
 
             return dawn_pos_tags, token_ids
+
+    def get_tags_for_tokens(
+        self,
+        ud_tokens: List[str],
+        ud_pos: List[str],
+        ud_deprel: List[str],
+    ) -> Tuple[List[str], List[str], List[int]]:
+        """
+        Map DAWN tokenizer tokens to POS tags and dependency relations.
+
+        Args:
+            ud_tokens: UD tokens
+            ud_pos: UD POS tags
+            ud_deprel: UD dependency relations
+
+        Returns:
+            (list of POS tags, list of deprel tags, list of token IDs)
+        """
+        text = ""
+        ud_char_spans = []
+
+        for ud_token, pos, dep in zip(ud_tokens, ud_pos, ud_deprel):
+            start = len(text)
+            text += ud_token
+            end = len(text)
+            ud_char_spans.append((start, end, pos, dep))
+            text += " "
+
+        text = text.rstrip()
+
+        try:
+            encoding = self.tokenizer(
+                text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+                return_tensors=None,
+            )
+            token_ids = encoding['input_ids']
+            offset_mapping = encoding['offset_mapping']
+
+            if not token_ids:
+                return [], [], []
+
+            dawn_pos_tags = []
+            dawn_deprel_tags = []
+            for start, end in offset_mapping:
+                assigned_pos = 'X'
+                assigned_dep = '_'
+                for ud_start, ud_end, pos, dep in ud_char_spans:
+                    if start < ud_end and end > ud_start:
+                        assigned_pos = pos
+                        assigned_dep = dep
+                        break
+                dawn_pos_tags.append(assigned_pos)
+                dawn_deprel_tags.append(assigned_dep)
+
+            return dawn_pos_tags, dawn_deprel_tags, token_ids
+
+        except (TypeError, KeyError):
+            token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            if not token_ids:
+                return [], [], []
+
+            dawn_pos_tags = []
+            dawn_deprel_tags = []
+            decoded_so_far = ""
+
+            for tid in token_ids:
+                token_text = self.tokenizer.decode([tid])
+                decoded_so_far += token_text
+
+                char_count = 0
+                assigned_pos = 'X'
+                assigned_dep = '_'
+                for i, (ud_start, ud_end, pos, dep) in enumerate(ud_char_spans):
+                    char_count = ud_end + 1
+                    if len(decoded_so_far.strip()) <= char_count:
+                        assigned_pos = pos
+                        assigned_dep = dep
+                        break
+
+                dawn_pos_tags.append(assigned_pos)
+                dawn_deprel_tags.append(assigned_dep)
+
+            return dawn_pos_tags, dawn_deprel_tags, token_ids
 
     def extract_routing_weights(
         self,
@@ -1491,6 +1614,12 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         temp = POSNeuronAnalyzer(self.model, tokenizer=self.tokenizer, device=self.device)
         return temp.get_pos_for_tokens(ud_tokens, ud_pos)
 
+    def get_tags_for_tokens(self, ud_tokens: List[str], ud_pos: List[str],
+                            ud_deprel: List[str]) -> Tuple[List[str], List[str], List[int]]:
+        """Map tokenizer tokens to POS tags and deprel (reuse from POSNeuronAnalyzer)."""
+        temp = POSNeuronAnalyzer(self.model, tokenizer=self.tokenizer, device=self.device)
+        return temp.get_tags_for_tokens(ud_tokens, ud_pos, ud_deprel)
+
     def _is_whole_word(self, token_str: str, next_token_str: str = None) -> bool:
         """
         Check if token represents a complete whole word (not a subword).
@@ -1637,6 +1766,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         token_ids: List[int],
         pos_tags: List[str],
         store_layer_masks: bool = False,
+        deprel_tags: List[str] = None,
     ) -> List[Dict]:
         """
         Extract binary activation masks for each token.
@@ -1645,9 +1775,10 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             token_ids: List of token IDs
             pos_tags: List of POS tags for each token
             store_layer_masks: Whether to store per-layer masks for divergence analysis
+            deprel_tags: List of dependency relation tags (optional)
 
         Returns:
-            List of {token_id, token_str, pos, mask, is_whole_word, layer_masks?}
+            List of {token_id, token_str, pos, deprel, mask, is_whole_word, layer_masks?}
         """
         input_ids = torch.tensor([token_ids], device=self.device)
         seq_len = len(token_ids)
@@ -1700,6 +1831,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 'token_id': token_ids[i],
                 'token_str': token_str,
                 'pos': pos_tags[i],
+                'deprel': deprel_tags[i] if deprel_tags and i < len(deprel_tags) else '_',
                 'mask': combined_mask[i],
                 'weights': combined_weights[i],  # continuous weights for cosine similarity
                 'is_whole_word': self._is_whole_word(token_str, next_token_str),
@@ -1714,17 +1846,21 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         return results
 
     def analyze_sentence(self, ud_tokens: List[str], ud_pos: List[str],
-                         store_layer_masks: bool = False):
+                         store_layer_masks: bool = False, ud_deprel: List[str] = None):
         """Analyze a single sentence and collect token activations."""
         try:
-            pos_tags, token_ids = self.get_pos_for_tokens(ud_tokens, ud_pos)
+            if ud_deprel is not None:
+                pos_tags, deprel_tags, token_ids = self.get_tags_for_tokens(ud_tokens, ud_pos, ud_deprel)
+            else:
+                pos_tags, token_ids = self.get_pos_for_tokens(ud_tokens, ud_pos)
+                deprel_tags = None
         except Exception:
             return
 
         if not token_ids:
             return
 
-        token_masks = self.extract_token_masks(token_ids, pos_tags, store_layer_masks)
+        token_masks = self.extract_token_masks(token_ids, pos_tags, store_layer_masks, deprel_tags)
         self.token_data.extend(token_masks)
 
         # Store for layer divergence analysis
@@ -1739,7 +1875,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         Analyze full dataset.
 
         Args:
-            dataset: List of {'tokens': [...], 'upos': [...]}
+            dataset: List of {'tokens': [...], 'upos': [...], 'deprel': [...]}
             max_sentences: Maximum sentences to process
             analyze_layer_divergence: Whether to store per-layer masks for divergence
 
@@ -1759,7 +1895,8 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             try:
                 self.analyze_sentence(
                     example['tokens'], example['upos'],
-                    store_layer_masks=analyze_layer_divergence
+                    store_layer_masks=analyze_layer_divergence,
+                    ud_deprel=example.get('deprel'),  # Pass deprel if available
                 )
             except Exception:
                 continue
@@ -1772,6 +1909,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         token_ids: List[int],
         pos_tags: List[str],
         n_layers: int,
+        deprel_tags: List[str] = None,
     ) -> Dict[int, List[Dict]]:
         """
         Extract masks/weights for ALL layers in a single forward pass.
@@ -1780,6 +1918,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             token_ids: List of token IDs
             pos_tags: List of POS tags for each token
             n_layers: Number of layers in model
+            deprel_tags: List of dependency relation tags (optional)
 
         Returns:
             Dict mapping layer_idx -> List of token data dicts
@@ -1828,6 +1967,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                     'token_id': token_ids[i],
                     'token_str': token_str,
                     'pos': pos_tags[i],
+                    'deprel': deprel_tags[i] if deprel_tags and i < len(deprel_tags) else '_',
                     'mask': masks[i],
                     'weights': weights[i],
                     'is_whole_word': self._is_whole_word(token_str, next_token_str),
@@ -1850,7 +1990,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         for each layer, as it only does ONE forward pass per sentence.
 
         Args:
-            dataset: List of {'tokens': [...], 'upos': [...]}
+            dataset: List of {'tokens': [...], 'upos': [...], 'deprel': [...]}
             n_layers: Number of layers in model
             max_sentences: Maximum sentences to process
 
@@ -1867,10 +2007,18 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
 
         for i in tqdm(range(n_sentences), desc="Processing"):
             example = dataset[i]
+            ud_deprel = example.get('deprel')
+
             try:
-                pos_tags, token_ids = self.get_pos_for_tokens(
-                    example['tokens'], example['upos']
-                )
+                if ud_deprel is not None:
+                    pos_tags, deprel_tags, token_ids = self.get_tags_for_tokens(
+                        example['tokens'], example['upos'], ud_deprel
+                    )
+                else:
+                    pos_tags, token_ids = self.get_pos_for_tokens(
+                        example['tokens'], example['upos']
+                    )
+                    deprel_tags = None
             except Exception:
                 continue
 
@@ -1879,7 +2027,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
 
             # Extract all layers in one forward pass
             layer_data = self.extract_token_masks_all_layers(
-                token_ids, pos_tags, n_layers
+                token_ids, pos_tags, n_layers, deprel_tags
             )
 
             # Append to respective layer collections
@@ -1903,7 +2051,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             layer_idx: Layer index (for logging)
 
         Returns:
-            Dict with silhouette, function_silhouette, semantic_correlation
+            Dict with silhouette, function_silhouette, deprel_silhouette, semantic_correlation
         """
         if not token_data:
             return {'error': 'No token data'}
@@ -1915,12 +2063,14 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         masks = np.empty((n_tokens, n_neurons), dtype=np.bool_)
         weights = np.empty((n_tokens, n_neurons), dtype=np.float32)
         pos_labels = np.empty(n_tokens, dtype=np.int32)
+        deprel_labels = np.empty(n_tokens, dtype=np.int32)
         is_whole_word = np.empty(n_tokens, dtype=np.bool_)
 
         for i, t in enumerate(token_data):
             masks[i] = t['mask']
             weights[i] = t['weights']
             pos_labels[i] = POS_TO_IDX.get(t['pos'], -1)
+            deprel_labels[i] = DEPREL_TO_IDX.get(t.get('deprel', '_'), -1)
             is_whole_word[i] = t['is_whole_word']
 
         # Filter valid POS
@@ -1928,6 +2078,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         masks = masks[valid_mask]
         weights = weights[valid_mask]
         pos_labels = pos_labels[valid_mask]
+        deprel_labels = deprel_labels[valid_mask]
         is_whole_word = is_whole_word[valid_mask]
         # Also filter token_data to keep indices aligned
         filtered_token_data = [t for i, t in enumerate(token_data) if valid_mask[i]]
@@ -1939,6 +2090,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         # Compute key metrics
         silhouette = self._compute_silhouette(masks, pos_labels)
         function_silhouette = self._compute_function_word_silhouette(masks, pos_labels)
+        deprel_silhouette = self._compute_deprel_silhouette(masks, deprel_labels)
         semantic_correlation = self._compute_semantic_correlation(
             masks, weights, pos_labels, is_whole_word, token_data=filtered_token_data
         )
@@ -1947,6 +2099,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             'n_tokens': n_tokens,
             'silhouette_score': silhouette,
             'function_word_silhouette': function_silhouette,
+            'deprel_silhouette': deprel_silhouette,
             'semantic_correlation': semantic_correlation,
         }
 
@@ -2001,12 +2154,14 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         masks = np.empty((n_tokens, n_neurons), dtype=np.bool_)
         weights = np.empty((n_tokens, n_neurons), dtype=np.float32)
         pos_labels = np.empty(n_tokens, dtype=np.int32)
+        deprel_labels = np.empty(n_tokens, dtype=np.int32)
         is_whole_word = np.empty(n_tokens, dtype=np.bool_)
 
         for i, t in enumerate(self.token_data):
             masks[i] = t['mask']
             weights[i] = t['weights']
             pos_labels[i] = POS_TO_IDX.get(t['pos'], -1)
+            deprel_labels[i] = DEPREL_TO_IDX.get(t.get('deprel', '_'), -1)
             is_whole_word[i] = t['is_whole_word']
 
         # Filter valid POS
@@ -2014,6 +2169,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         masks = masks[valid_mask]
         weights = weights[valid_mask]
         pos_labels = pos_labels[valid_mask]
+        deprel_labels = deprel_labels[valid_mask]
         is_whole_word = is_whole_word[valid_mask]
         # Also filter token_data to keep indices aligned
         filtered_token_data = [t for i, t in enumerate(self.token_data) if valid_mask[i]]
@@ -2029,6 +2185,9 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
 
         # 3. Function word only silhouette (should be higher)
         function_silhouette = self._compute_function_word_silhouette(masks, pos_labels)
+
+        # 3.5. Deprel silhouette (syntactic role clustering)
+        deprel_silhouette = self._compute_deprel_silhouette(masks, deprel_labels)
 
         # 4. Content vs Function word analysis
         content_analysis = self._analyze_content_vs_function(masks, pos_labels, is_whole_word)
@@ -2056,6 +2215,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             'pos_similarity': pos_similarity,
             'silhouette_score': silhouette,
             'function_word_silhouette': function_silhouette,
+            'deprel_silhouette': deprel_silhouette,
             'content_analysis': content_analysis,
             'token_stats': token_stats,
             'layer_divergence': layer_divergence,
@@ -2064,6 +2224,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             '_masks': masks,
             '_weights': weights,
             '_pos_labels': pos_labels,
+            '_deprel_labels': deprel_labels,
             '_is_whole_word': is_whole_word,
         }
 
@@ -2246,6 +2407,68 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 'n_samples': len(filtered_masks),
                 'n_pos_categories': len(valid_pos),
                 'pos_included': [UPOS_TAGS[i] for i in valid_pos],
+            }
+        except Exception as e:
+            return {'score': None, 'error': str(e)}
+
+    def _compute_deprel_silhouette(self, masks: np.ndarray, deprel_labels: np.ndarray) -> Dict:
+        """Compute silhouette score using dependency relation labels.
+
+        Hypothesis: If deprel silhouette > POS silhouette, neurons encode
+        syntactic roles (nsubj, obj, amod) rather than just part-of-speech.
+        """
+        try:
+            from sklearn.metrics import silhouette_score, silhouette_samples
+        except ImportError:
+            return {'score': None, 'error': 'sklearn not available'}
+
+        # Filter out unknown deprel
+        valid_deprel_mask = deprel_labels >= 0
+        if valid_deprel_mask.sum() < 50:
+            return {'score': None, 'error': 'Not enough valid deprel labels'}
+
+        filtered_masks = masks[valid_deprel_mask]
+        filtered_labels = deprel_labels[valid_deprel_mask]
+
+        # Filter deprel with enough samples (at least 5)
+        unique_dep, counts = np.unique(filtered_labels, return_counts=True)
+        valid_dep = unique_dep[counts >= 5]
+
+        if len(valid_dep) < 2:
+            return {'score': None, 'error': 'Not enough deprel categories'}
+
+        valid_mask = np.isin(filtered_labels, valid_dep)
+        filtered_masks = filtered_masks[valid_mask]
+        filtered_labels = filtered_labels[valid_mask]
+
+        # Sample for speed
+        max_samples = 1500
+        if len(filtered_masks) > max_samples:
+            indices = np.random.choice(len(filtered_masks), max_samples, replace=False)
+            filtered_masks = filtered_masks[indices]
+            filtered_labels = filtered_labels[indices]
+
+        print("  Computing deprel silhouette score...")
+        jaccard_dist = 1.0 - self._compute_jaccard_matrix(filtered_masks)
+
+        try:
+            score = silhouette_score(jaccard_dist, filtered_labels, metric='precomputed')
+            samples = silhouette_samples(jaccard_dist, filtered_labels, metric='precomputed')
+
+            per_deprel = {}
+            for dep_idx in valid_dep:
+                if dep_idx < len(DEPREL_TAGS):
+                    dep_name = DEPREL_TAGS[dep_idx]
+                    dep_mask = filtered_labels == dep_idx
+                    if dep_mask.sum() > 0:
+                        per_deprel[dep_name] = float(samples[dep_mask].mean())
+
+            return {
+                'score': float(score),
+                'per_deprel': per_deprel,
+                'n_samples': len(filtered_masks),
+                'n_deprel_categories': len(valid_dep),
+                'deprel_included': [DEPREL_TAGS[i] for i in valid_dep if i < len(DEPREL_TAGS)],
             }
         except Exception as e:
             return {'score': None, 'error': str(e)}
@@ -3159,6 +3382,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                     'semantic_p_value': None,
                     'silhouette': None,
                     'function_silhouette': None,
+                    'deprel_silhouette': None,
                 }
             else:
                 # Compute results for this layer
@@ -3167,6 +3391,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 sem_corr = layer_results.get('semantic_correlation', {})
                 silhouette = layer_results.get('silhouette_score', {})
                 func_sil = layer_results.get('function_word_silhouette', {})
+                deprel_sil = layer_results.get('deprel_silhouette', {})
 
                 layer_data = {
                     'layer': layer_idx,
@@ -3175,6 +3400,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                     'semantic_p_value': sem_corr.get('p_value', None),
                     'silhouette': silhouette.get('score', None),
                     'function_silhouette': func_sil.get('score', None),
+                    'deprel_silhouette': deprel_sil.get('score', None),
                 }
 
                 # Print summary
@@ -3182,6 +3408,8 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                     print(f"  Semantic correlation: {layer_data['semantic_correlation']:.4f}")
                 if layer_data['silhouette'] is not None:
                     print(f"  POS silhouette: {layer_data['silhouette']:.4f}")
+                if layer_data['deprel_silhouette'] is not None:
+                    print(f"  Deprel silhouette: {layer_data['deprel_silhouette']:.4f}")
                 if layer_data['function_silhouette'] is not None:
                     print(f"  Function silhouette: {layer_data['function_silhouette']:.4f}")
 
@@ -3193,17 +3421,18 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             torch.cuda.empty_cache()
 
         # Summary table
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 85)
         print("SUMMARY: Layer-wise Metrics")
-        print("=" * 70)
-        print(f"{'Layer':>5} | {'Semantic Corr':>13} | {'POS Silhouette':>14} | {'Func Sil':>10}")
-        print("-" * 55)
+        print("=" * 85)
+        print(f"{'Layer':>5} | {'Sem Corr':>10} | {'POS Sil':>10} | {'Deprel Sil':>10} | {'Func Sil':>10}")
+        print("-" * 65)
 
         for r in layer_results_list:
             sem = f"{r['semantic_correlation']:.4f}" if r['semantic_correlation'] is not None else "N/A"
             sil = f"{r['silhouette']:.4f}" if r['silhouette'] is not None else "N/A"
+            dsil = f"{r['deprel_silhouette']:.4f}" if r.get('deprel_silhouette') is not None else "N/A"
             fsil = f"{r['function_silhouette']:.4f}" if r['function_silhouette'] is not None else "N/A"
-            print(f"{r['layer']:>5} | {sem:>13} | {sil:>14} | {fsil:>10}")
+            print(f"{r['layer']:>5} | {sem:>10} | {sil:>10} | {dsil:>10} | {fsil:>10}")
 
         # Save results
         output = {
