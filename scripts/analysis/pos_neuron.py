@@ -1535,6 +1535,17 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         used_actual = 0
         used_fallback = 0
 
+        failed_pools = []
+
+        # Debug: log available keys once
+        if not self._logged_mask_mode:
+            available_keys = list(layer.raw.keys())
+            attn_keys = list(layer.attention.keys()) if layer.attention else []
+            know_keys = list(layer.knowledge.keys()) if layer.knowledge else []
+            print(f"  [Debug] routing_info keys: {available_keys[:10]}...")
+            print(f"  [Debug] attention keys: {[k for k in attn_keys if 'mask' in k.lower()]}")
+            print(f"  [Debug] knowledge keys: {[k for k in know_keys if 'mask' in k.lower()]}")
+
         for pool_key, expected_size in self.pool_order:
             # Try to get actual binary mask first (scores > tau)
             mask = layer.get_mask(pool_key)
@@ -1556,6 +1567,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 masks.append(m)
             else:
                 used_fallback += 1
+                failed_pools.append(pool_key)
                 # Fallback: use weights > threshold
                 weights = layer.get_weight(pool_key)
                 if weights is None:
@@ -1584,6 +1596,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 print(f"              (masks not available in routing_info)")
             else:
                 print(f"  [Mask mode] Mixed: {used_actual} actual masks, {used_fallback} fallback")
+                print(f"              Fallback pools: {failed_pools}")
 
         self._mask_mode_stats['actual'] += used_actual
         self._mask_mode_stats['fallback'] += used_fallback
