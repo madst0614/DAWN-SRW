@@ -636,14 +636,25 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         step_neurons = set()
                         if routing:
                             for layer in routing:
-                                weights = layer.get_weight(pool_type)
-                                if weights is not None:
-                                    if weights.dim() == 3:
-                                        w = weights[0, -1]
+                                # Try mask first (v18.5+), then weights
+                                mask = layer.get_mask(pool_type)
+                                if mask is not None:
+                                    if mask.dim() == 3:
+                                        m = mask[0, -1]  # [B, S, N] → last position
                                     else:
-                                        w = weights[0]
-                                    active = (w > 0.01).nonzero(as_tuple=True)[0].cpu().tolist()
+                                        m = mask[0]      # [B, N]
+                                    active = m.nonzero(as_tuple=True)[0].cpu().tolist()
                                     step_neurons.update(active)
+                                else:
+                                    # Fallback to weights
+                                    weights = layer.get_weight(pool_type)
+                                    if weights is not None:
+                                        if weights.dim() == 3:
+                                            w = weights[0, -1]
+                                        else:
+                                            w = weights[0]
+                                        active = (w > 0.01).nonzero(as_tuple=True)[0].cpu().tolist()
+                                        step_neurons.update(active)
 
                         run_neurons_per_step.append({
                             'step': step,
