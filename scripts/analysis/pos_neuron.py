@@ -2315,9 +2315,9 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             '_neuron_sims': neuron_arr,
         }
 
-    def _load_glove_embeddings(self, dim: int = 50) -> Optional[Dict[str, np.ndarray]]:
+    def _load_glove_embeddings(self, dim: int = 100) -> Optional[Dict[str, np.ndarray]]:
         """
-        Load GloVe embeddings. Tries multiple sources.
+        Load GloVe embeddings via gensim (auto-downloads and caches).
 
         Args:
             dim: Embedding dimension (50, 100, 200, 300)
@@ -2325,50 +2325,19 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         Returns:
             Dict mapping words to embedding vectors, or None
         """
-        # Try gensim first (if installed)
         try:
             import gensim.downloader as api
-            print("    Loading GloVe via gensim...")
+            print(f"    Loading GloVe-{dim}d via gensim (auto-download if needed)...")
             model = api.load(f'glove-wiki-gigaword-{dim}')
 
-            # Convert to dict
-            embeddings = {}
-            for word in model.key_to_index:
-                embeddings[word] = model[word]
-            print(f"    Loaded {len(embeddings)} embeddings")
+            # Convert to dict for fast lookup
+            embeddings = {word: model[word] for word in model.key_to_index}
+            print(f"    Loaded {len(embeddings):,} word embeddings")
             return embeddings
-        except Exception:
-            pass
-
-        # Try loading from file (common paths)
-        glove_paths = [
-            f'/content/glove.6B.{dim}d.txt',
-            f'./glove.6B.{dim}d.txt',
-            f'~/glove.6B.{dim}d.txt',
-            f'/tmp/glove.6B.{dim}d.txt',
-        ]
-
-        for path in glove_paths:
-            path = os.path.expanduser(path)
-            if os.path.exists(path):
-                print(f"    Loading GloVe from {path}...")
-                embeddings = {}
-                try:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            parts = line.strip().split()
-                            if len(parts) > dim:
-                                word = parts[0]
-                                vec = np.array([float(x) for x in parts[1:dim+1]])
-                                embeddings[word] = vec
-                    print(f"    Loaded {len(embeddings)} embeddings")
-                    return embeddings
-                except Exception:
-                    continue
-
-        # Try nltk wordnet (fallback - not as good)
-        print("    GloVe not found. Semantic correlation skipped.")
-        return None
+        except Exception as e:
+            print(f"    GloVe loading failed: {e}")
+            print("    Install gensim: pip install gensim")
+            return None
 
     def print_summary(self, results: Dict):
         """Print analysis summary."""
