@@ -1125,6 +1125,53 @@ class ModelAnalyzer:
         self.results['token_combination'] = results
         return results
 
+    def analyze_layerwise_semantic(self, max_sentences: int = 500) -> Dict:
+        """Analyze layer-wise semantic emergence (DAWN only).
+
+        Runs per-layer analysis to measure:
+        1. Semantic correlation: GloVe similarity vs neuron weight similarity
+        2. POS silhouette: How well neurons cluster by part-of-speech
+
+        Hypothesis:
+        - Early layers: Strong POS clustering (syntax)
+        - Later layers: Strong semantic correlation (semantics)
+        - Crossover point = syntax→semantics transition
+
+        Args:
+            max_sentences: Number of sentences per layer (default: 500)
+                - 200: Quick test (~5 min)
+                - 500: Standard analysis (~15 min)
+                - 1000: Comprehensive analysis (~30 min)
+
+        Returns:
+            Dict with per-layer semantic correlation and silhouette scores
+        """
+        if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
+            return {}
+
+        from scripts.analysis.pos_neuron import TokenCombinationAnalyzer
+
+        output_dir = self.output_dir / 'layerwise_semantic'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get number of layers from model
+        n_layers = getattr(self.model, 'n_layers', 8)
+
+        print(f"  Analyzing layer-wise semantic emergence ({n_layers} layers, {max_sentences} sentences/layer)...")
+
+        results = TokenCombinationAnalyzer.run_layerwise_analysis(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            n_layers=n_layers,
+            output_dir=str(output_dir),
+            max_sentences=max_sentences,
+            device=self.device,
+        )
+
+        self.results['layerwise_semantic'] = results
+        return results
+
     def analyze_factual(self, n_runs: int = 10, pool_type: str = 'fv') -> Dict:
         """Analyze factual knowledge neurons (DAWN only).
 
