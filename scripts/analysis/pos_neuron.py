@@ -4150,6 +4150,17 @@ class NeuronFeatureAnalyzer:
             os.makedirs(output_dir, exist_ok=True)
             results_path = os.path.join(output_dir, 'neuron_feature_analysis.json')
 
+            # Custom encoder for numpy types
+            class NumpyEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, (np.integer, np.int64, np.int32)):
+                        return int(obj)
+                    if isinstance(obj, (np.floating, np.float64, np.float32)):
+                        return float(obj)
+                    if isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    return super().default(obj)
+
             # Convert to JSON-serializable
             results_json = {
                 'n_neurons_profiled': results['n_neurons_profiled'],
@@ -4162,7 +4173,7 @@ class NeuronFeatureAnalyzer:
             }
 
             with open(results_path, 'w') as f:
-                json.dump(results_json, f, indent=2)
+                json.dump(results_json, f, indent=2, cls=NumpyEncoder)
             print(f"\nResults saved to: {results_path}")
 
         return results
