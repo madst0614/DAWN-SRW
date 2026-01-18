@@ -1263,7 +1263,8 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'factual'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"  Analyzing factual neurons ({n_runs} runs per prompt, pool={pool_type})...")
+        max_tokens = 30
+        print(f"  Analyzing factual neurons ({n_runs} runs × {max_tokens} tokens, pool={pool_type})...")
         analyzer = BehavioralAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
         )
@@ -1276,36 +1277,56 @@ class ModelAnalyzer:
         ]
         targets = ["Paris", "Berlin", "Tokyo", "blue"]
 
-        results = analyzer.analyze_factual_neurons(prompts, targets, n_runs=n_runs, pool_type=pool_type)
+        results = analyzer.analyze_factual_neurons(
+            prompts, targets,
+            n_runs=n_runs,
+            pool_type=pool_type,
+            max_new_tokens=max_tokens,
+            top_k=0,  # Greedy for more consistent results
+        )
 
         # Print detailed summary
         per_target = results.get('per_target', {})
         if per_target:
-            print(f"\n  ┌─ Factual Analysis Results ─────────────────────────────────────────────")
-            print(f"  │ {'Target':<10} {'Predicted':<12} {'Rank':>6} {'Match%':>8} {'Common':>8}")
-            print(f"  │ {'─'*10} {'─'*12} {'─'*6} {'─'*8} {'─'*8}")
+            print(f"\n  ┌─ Factual Analysis Results (Contrastive) ──────────────────────────────────")
+            print(f"  │ {'Target':<10} {'Found':>8} {'Match%':>8} {'N80%':>6} {'Specific':>8}")
+            print(f"  │ {'─'*10} {'─'*8} {'─'*8} {'─'*6} {'─'*8}")
             for target, data in per_target.items():
                 if isinstance(data, dict):
+                    matching = data.get('matching_runs', 0)
+                    total = data.get('total_runs', n_runs)
                     match_rate = data.get('match_rate', 0) * 100
-                    predicted = data.get('predicted_token', 'N/A')[:10]
-                    rank = data.get('target_rank', -1)
-                    rank_str = str(rank) if rank > 0 else '>20'
-                    n_common = len(data.get('common_neurons_80', []))
-                    print(f"  │ {target:<10} {predicted:<12} {rank_str:>6} {match_rate:>7.0f}% {n_common:>8d}")
+                    n_common_80 = len(data.get('common_neurons_80', []))
+                    n_specific = len(data.get('target_specific_neurons', []))
+                    print(f"  │ {target:<10} {matching:>3}/{total:<3} {match_rate:>7.0f}% {n_common_80:>6} {n_specific:>8}")
 
-            # Interpretation
+            # Show sample generations and top contrastive neurons
             any_match = any(d.get('match_rate', 0) > 0 for d in per_target.values())
-            if not any_match:
+            if any_match:
                 print(f"  │")
-                print(f"  │ Note: Model not generating target tokens (likely undertrained)")
-                print(f"  │       Check 'Rank' column - lower is better (1=top prediction)")
+                print(f"  │ Sample generations & top target-specific neurons:")
+                for target, data in per_target.items():
+                    samples = data.get('sample_successful_generations', [])
+                    specific = data.get('target_specific_neurons', [])[:5]
+                    contrastive = data.get('contrastive_top50', [])[:3]
+                    if samples:
+                        sample = samples[0]
+                        text = sample.get('text', '')[:50]
+                        pos = sample.get('position', -1)
+                        print(f"  │   {target}: \"{text}...\" (pos={pos})")
+                        if contrastive:
+                            top_neurons = [f"N{c['neuron']}({c['score']:.2f})" for c in contrastive]
+                            print(f"  │          Top neurons: {', '.join(top_neurons)}")
+            else:
+                print(f"  │")
+                print(f"  │ Note: Target tokens not found in any generation")
+                print(f"  │       Model may lack factual knowledge or need different prompts")
+                print(f"  │")
+                print(f"  │ First generation samples:")
+                for target, data in list(per_target.items())[:2]:
+                    first_gen = data.get('first_generation', '')[:50]
+                    print(f"  │   {target}: \"{first_gen}...\"")
 
-            # Show top common neurons if any matches
-            all_common = results.get('all_common_neurons', [])
-            if all_common:
-                print(f"  │")
-                print(f"  │ Cross-target common neurons: {len(all_common)}")
-                print(f"  │ Top neurons: {', '.join(f'N{n}' for n in all_common[:10])}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         with open(output_dir / 'factual_neurons.json', 'w') as f:
