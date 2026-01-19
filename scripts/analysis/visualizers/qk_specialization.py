@@ -22,13 +22,38 @@ except ImportError:
     HAS_MATPLOTLIB = False
     plt = None
 
+# Paper-quality style settings
+if HAS_MATPLOTLIB:
+    plt.rcParams.update({
+        'font.family': 'serif',
+        'font.size': 9,
+        'axes.linewidth': 0.8,
+        'axes.spines.top': False,
+        'axes.spines.right': False,
+        'axes.labelsize': 10,
+        'axes.titlesize': 11,
+        'xtick.labelsize': 8,
+        'ytick.labelsize': 8,
+        'figure.dpi': 150,
+        'savefig.dpi': 300,
+        'savefig.bbox': 'tight',
+    })
+
+# Color palette
+COLOR_Q = '#E74C3C'      # Red for Q
+COLOR_K = '#3498DB'      # Blue for K
+COLOR_SHARED = '#50C878' # Green for shared
+COLOR_INACTIVE = '#95A5A6'  # Gray for inactive
+COLOR_PURPLE = '#9B59B6'    # Purple for histogram
+COLOR_BLACK = '#2C3E50'
+
 
 def plot_qk_specialization(
     qk_usage_data: Dict,
     output_path: str,
     pool_colors: Dict = None,
-    figsize_per_pool: tuple = (18, 6),
-    dpi: int = 150
+    figsize_per_pool: tuple = (15, 4.5),
+    dpi: int = 300
 ) -> Optional[str]:
     """
     Generate Q/K specialization figure (Paper Figure 3).
@@ -51,11 +76,13 @@ def plot_qk_specialization(
     if not HAS_MATPLOTLIB:
         return None
 
-    # Default colors
+    # Default colors per pool
     if pool_colors is None:
         pool_colors = {
-            'feature_qk': 'red',
-            'restore_qk': 'blue',
+            'feature_qk': COLOR_Q,
+            'restore_qk': COLOR_K,
+            'fqk': COLOR_Q,
+            'rqk': COLOR_K,
         }
 
     # Filter out non-pool keys
@@ -72,17 +99,22 @@ def plot_qk_specialization(
     for row, (pool_name, data) in enumerate(pools.items()):
         q_counts = np.array(data['q_counts'])
         k_counts = np.array(data['k_counts'])
-        color = pool_colors.get(pool_name, 'gray')
+        color = pool_colors.get(pool_name, COLOR_Q)
+        display_name = data.get('display', pool_name).replace('_', '-').upper()
 
         # 1. Scatter: Q vs K usage
         ax = axes[row, 0]
-        ax.scatter(q_counts, k_counts, alpha=0.6, s=30, c=color)
+        ax.scatter(q_counts, k_counts, alpha=0.6, s=25, c=color, edgecolors='white', linewidth=0.3)
         max_val = max(q_counts.max(), k_counts.max()) if len(q_counts) > 0 else 1
-        ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, label='Q=K')
+        ax.plot([0, max_val], [0, max_val], '--', color=COLOR_BLACK, alpha=0.5, linewidth=1, label='Q=K')
         ax.set_xlabel('Q Selection Count')
         ax.set_ylabel('K Selection Count')
-        ax.set_title(f'{data["display"]}: Q vs K Usage\n(corr={data["correlation"]:.3f})')
-        ax.legend()
+        corr = data.get('correlation', 0)
+        ax.set_title(f'{display_name}: Q vs K Usage\n(corr={corr:.3f})', fontweight='bold')
+        ax.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax.xaxis.grid(True, linestyle='--', alpha=0.3)
+        ax.yaxis.grid(True, linestyle='--', alpha=0.3)
+        ax.set_axisbelow(True)
 
         # 2. Bar: Specialization categories
         ax = axes[row, 1]
@@ -93,13 +125,16 @@ def plot_qk_specialization(
             data.get('shared', 0),
             data.get('inactive', 0)
         ]
-        colors = ['blue', 'orange', 'green', 'gray']
-        bars = ax.bar(categories, values, color=colors, alpha=0.7)
+        colors = [COLOR_Q, COLOR_K, COLOR_SHARED, COLOR_INACTIVE]
+        bars = ax.bar(categories, values, color=colors, alpha=0.85, edgecolor='white', linewidth=0.5)
         ax.set_ylabel('Neuron Count')
-        ax.set_title(f'{data["display"]}: Neuron Specialization')
+        ax.set_title(f'{display_name}: Neuron Specialization', fontweight='bold')
         for bar, val in zip(bars, values):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), str(val),
-                   ha='center', va='bottom')
+            if val > 0:
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5, str(val),
+                       ha='center', va='bottom', fontsize=8, fontweight='bold')
+        ax.yaxis.grid(True, linestyle='--', alpha=0.3)
+        ax.set_axisbelow(True)
 
         # 3. Histogram: Q/(Q+K) ratio distribution
         ax = axes[row, 2]
@@ -107,18 +142,25 @@ def plot_qk_specialization(
         q_ratio = q_counts / total
         active_mask = (q_counts + k_counts) > 0
         if active_mask.sum() > 0:
-            ax.hist(q_ratio[active_mask], bins=20, alpha=0.7, color='purple', edgecolor='black')
-        ax.axvline(x=0.5, color='red', linestyle='--', label='Q=K')
+            ax.hist(q_ratio[active_mask], bins=20, alpha=0.75, color=COLOR_PURPLE,
+                   edgecolor='white', linewidth=0.5)
+        ax.axvline(x=0.5, color=COLOR_Q, linestyle='--', linewidth=1.5, label='Q=K')
         ax.set_xlabel('Q Ratio (Q / (Q+K))')
         ax.set_ylabel('Neuron Count')
-        ax.set_title(f'{data["display"]}: Q/K Balance Distribution')
-        ax.legend()
+        ax.set_title(f'{display_name}: Q/K Balance Distribution', fontweight='bold')
+        ax.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax.yaxis.grid(True, linestyle='--', alpha=0.3)
+        ax.set_axisbelow(True)
 
     plt.tight_layout()
 
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
-    plt.savefig(output_path, dpi=dpi)
+
+    # Save PNG and PDF
+    plt.savefig(output_path, dpi=dpi, facecolor='white', edgecolor='none')
+    pdf_path = output_path.rsplit('.', 1)[0] + '.pdf'
+    plt.savefig(pdf_path, format='pdf', facecolor='white', edgecolor='none')
     plt.close()
 
     return output_path

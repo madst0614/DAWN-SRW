@@ -1646,9 +1646,32 @@ class ModelAnalyzer:
                 self.val_data_path,  # Pass path, not dataloader
                 device=self.device
             )
-            gen.generate('3,4,5,7', str(figures_dir), n_batches=self.n_runs)
+
+            # Build precomputed results from already-run analyses
+            precomputed = {}
+            if 'routing' in self.results:
+                precomputed['routing'] = self.results['routing']
+            if 'health' in self.results:
+                precomputed['health'] = self.results['health']
+            if 'factual' in self.results:
+                precomputed['factual'] = self.results['factual']
+            if 'neuron_features' in self.results:
+                precomputed['neuron_features'] = self.results['neuron_features']
+
+            # Build config from instance parameters
+            config = {
+                'pool_type': self.pool_type,
+                'gen_tokens': self.gen_tokens,
+                'max_sentences': self.max_sentences,
+                'target_layer': self.target_layer,
+            }
+
+            gen.generate('3,4,5,7', str(figures_dir), n_batches=self.n_runs,
+                        precomputed=precomputed, config=config)
         except Exception as e:
             print(f"    Warning: Could not generate paper figures: {e}")
+            import traceback
+            traceback.print_exc()
 
         # Generate tables
         print("  Generating paper tables...")
