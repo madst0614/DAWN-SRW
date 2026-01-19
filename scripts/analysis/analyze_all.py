@@ -1286,49 +1286,59 @@ class ModelAnalyzer:
             top_k=50,         # Top-k sampling
         )
 
-        # Print detailed summary
+        # Print detailed summary (routing_analysis.py style)
         per_target = results.get('per_target', {})
         if per_target:
-            print(f"\n  ┌─ Factual Analysis Results (Contrastive) ──────────────────────────────────")
-            print(f"  │ {'Target':<10} {'Found':>8} {'Match%':>8} {'N80%':>6} {'Specific':>8}")
-            print(f"  │ {'─'*10} {'─'*8} {'─'*8} {'─'*6} {'─'*8}")
             for target, data in per_target.items():
-                if isinstance(data, dict):
-                    matching = data.get('matching_runs', 0)
-                    total = data.get('total_runs', n_runs)
-                    match_rate = data.get('match_rate', 0) * 100
-                    n_common_80 = len(data.get('common_neurons_80', []))
-                    n_specific = len(data.get('target_specific_neurons', []))
-                    print(f"  │ {target:<10} {matching:>3}/{total:<3} {match_rate:>7.0f}% {n_common_80:>6} {n_specific:>8}")
+                if not isinstance(data, dict):
+                    continue
 
-            # Show sample generations and top contrastive neurons
-            any_match = any(d.get('match_rate', 0) > 0 for d in per_target.values())
-            if any_match:
-                print(f"  │")
-                print(f"  │ Sample generations & top target-specific neurons:")
-                for target, data in per_target.items():
-                    samples = data.get('sample_successful_generations', [])
-                    specific = data.get('target_specific_neurons', [])[:5]
-                    contrastive = data.get('contrastive_top50', [])[:3]
+                matching = data.get('matching_runs', 0)
+                total = data.get('total_runs', n_runs)
+                match_rate = data.get('match_rate', 0) * 100
+
+                print(f"\n  {'='*70}")
+                print(f"  RESULTS: '{target}' appeared in {matching}/{total} runs ({match_rate:.1f}%)")
+                print(f"  {'='*70}")
+
+                if matching > 0:
+                    # Common neurons at different thresholds
+                    n100 = data.get('common_neurons_100', [])
+                    n80 = data.get('common_neurons_80', [])
+                    n50 = data.get('common_neurons_50', [])
+
+                    print(f"\n  100% common neurons ({len(n100)}): {n100[:20]}{'...' if len(n100) > 20 else ''}")
+                    print(f"   80%+ common neurons ({len(n80)}): {n80[:20]}{'...' if len(n80) > 20 else ''}")
+                    print(f"   50%+ common neurons ({len(n50)}): {n50[:20]}{'...' if len(n50) > 20 else ''}")
+
+                    # Top neurons by frequency (bar chart style)
+                    neuron_freqs = data.get('neuron_frequencies', [])[:15]
+                    if neuron_freqs:
+                        print(f"\n  Top 15 neurons by frequency:")
+                        for nf in neuron_freqs:
+                            bar = '█' * int(nf['percentage'] / 5)
+                            print(f"    Neuron {nf['neuron']:4d}: {nf['count']:3d}/{matching} ({nf['percentage']:5.1f}%) {bar}")
+
+                    # Sample generations
+                    samples = data.get('sample_successful_generations', [])[:3]
                     if samples:
-                        sample = samples[0]
-                        text = sample.get('text', '')[:50]
-                        pos = sample.get('position', -1)
-                        print(f"  │   {target}: \"{text}...\" (pos={pos})")
-                        if contrastive:
-                            top_neurons = [f"N{c['neuron']}({c['score']:.2f})" for c in contrastive]
-                            print(f"  │          Top neurons: {', '.join(top_neurons)}")
-            else:
-                print(f"  │")
-                print(f"  │ Note: Target tokens not found in any generation")
-                print(f"  │       Model may lack factual knowledge or need different prompts")
-                print(f"  │")
-                print(f"  │ First generation samples:")
-                for target, data in list(per_target.items())[:2]:
-                    first_gen = data.get('first_generation', '')[:50]
-                    print(f"  │   {target}: \"{first_gen}...\"")
+                        print(f"\n  Sample generations with '{target}':")
+                        for i, sample in enumerate(samples):
+                            text = sample.get('text', '')[:80]
+                            print(f"    Run {i}: {text}...")
 
-            print(f"  └─────────────────────────────────────────────────────────────────────────")
+                    # Top contrastive neurons
+                    contrastive = data.get('contrastive_top50', [])[:5]
+                    if contrastive:
+                        print(f"\n  Top target-specific neurons (contrastive score):")
+                        for c in contrastive:
+                            print(f"    Neuron {c['neuron']:4d}: target={c['target_freq']:5.1f}% baseline={c['baseline_freq']:5.1f}% score={c['score']:.3f}")
+                else:
+                    first_gen = data.get('first_generation', '')[:80]
+                    print(f"\n  Note: Target '{target}' not found in {total} generations")
+                    print(f"  First generation: \"{first_gen}...\"")
+
+            print(f"\n  {'='*70}")
 
         with open(output_dir / 'factual_neurons.json', 'w') as f:
             json.dump(results, f, indent=2, default=str)

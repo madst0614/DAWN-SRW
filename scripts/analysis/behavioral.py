@@ -742,8 +742,9 @@ class BehavioralAnalyzer(BaseAnalyzer):
             if matching_runs > 0:
                 # Neurons consistently active for target (>80% of target occurrences)
                 target_freq = {n: c / matching_runs for n, c in target_neuron_counts.items()}
-                common_neurons_80 = [n for n, f in target_freq.items() if f >= 0.8]
                 common_neurons_100 = [n for n, f in target_freq.items() if f >= 1.0]
+                common_neurons_80 = [n for n, f in target_freq.items() if f >= 0.8]
+                common_neurons_50 = [n for n, f in target_freq.items() if f >= 0.5]
 
                 # Target-SPECIFIC neurons (high contrastive score)
                 # These appear much more often for target than for other tokens
@@ -758,11 +759,19 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     key=lambda x: -x[1]
                 )[:50]
 
+                # Build neuron frequencies list (sorted by count)
+                neuron_frequencies = [
+                    {'neuron': n, 'count': c, 'percentage': c / matching_runs * 100}
+                    for n, c in sorted(target_neuron_counts.items(), key=lambda x: -x[1])
+                ]
+
                 base_result.update({
-                    'common_neurons_80': common_neurons_80,
-                    'common_neurons_100': common_neurons_100,
+                    'common_neurons_100': sorted(common_neurons_100),
+                    'common_neurons_80': sorted(common_neurons_80),
+                    'common_neurons_50': sorted(common_neurons_50),
                     'target_specific_neurons': target_specific,
                     'total_unique_neurons': len(target_neuron_counts),
+                    'neuron_frequencies': neuron_frequencies,
                     'contrastive_top50': [
                         {
                             'neuron': n,
