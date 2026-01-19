@@ -903,6 +903,26 @@ class LayerRoutingData:
                     weights[std_key] = w
         return weights
 
+    def get_output_norms(self) -> Dict[str, float]:
+        """
+        Get output norms for attention and knowledge circuits.
+
+        These are computed by the model as:
+            attn_out_norm = attn_out.norm(dim=-1).mean().detach()
+            know_out_norm = know_out.norm(dim=-1).mean().detach()
+
+        Returns:
+            Dict with 'attn_out_norm' and 'know_out_norm' (or empty if not available)
+        """
+        norms = {}
+        if 'attn_out_norm' in self.raw:
+            val = self.raw['attn_out_norm']
+            norms['attn_out_norm'] = val.item() if hasattr(val, 'item') else float(val)
+        if 'know_out_norm' in self.raw:
+            val = self.raw['know_out_norm']
+            norms['know_out_norm'] = val.item() if hasattr(val, 'item') else float(val)
+        return norms
+
     def get_all_weights(self) -> Dict[str, torch.Tensor]:
         """Get all available weights."""
         return {**self.get_all_attention_weights(), **self.get_all_knowledge_weights()}

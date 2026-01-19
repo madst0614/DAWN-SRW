@@ -688,29 +688,26 @@ class RoutingAnalyzer(BaseAnalyzer):
         """
         Analyze per-layer contribution from attention vs knowledge circuits.
 
-        Paper Figure 6b data generation.
+        Uses OUTPUT NORM based measurement (most accurate):
+            attn_out_norm = attn_out.norm(dim=-1).mean()
+            know_out_norm = know_out.norm(dim=-1).mean()
+            attention_ratio = attn_norm / (attn_norm + know_norm)
 
-        For top-k routing, uses masks (binary selection) instead of weights to get
-        more meaningful per-layer variation.
+        This measures actual output magnitude, not just routing weights.
 
         Args:
             dataloader: DataLoader for input data
             n_batches: Number of batches to process
 
         Returns:
-            Dictionary with layer-wise attention/knowledge ratios
+            Dictionary with layer-wise attention/knowledge ratios based on output norms
         """
-        # Track per-layer, per-pool neuron counts
-        layer_pool_counts = defaultdict(lambda: defaultdict(list))
-
-        # Standardized keys
-        ATTENTION_KEYS = ['fv', 'rv', 'fqk_q', 'fqk_k', 'rqk_q', 'rqk_k']
-        KNOWLEDGE_KEYS = ['fknow', 'rknow']
-        ALL_KEYS = ATTENTION_KEYS + KNOWLEDGE_KEYS
+        # Track per-layer output norms
+        layer_norms = defaultdict(lambda: {'attn': [], 'know': []})
 
         self.model.eval()
         with self.extractor.analysis_context():
-            for i, batch in enumerate(tqdm(dataloader, desc='Layer Contribution', total=n_batches)):
+            for i, batch in enumerate(tqdm(dataloader, desc='Layer Contribution (output norm)', total=n_batches)):
                 if i >= n_batches:
                     break
 
@@ -725,49 +722,34 @@ class RoutingAnalyzer(BaseAnalyzer):
                 except Exception:
                     continue
 
-                # Process all layers using extractor
+                # Process all layers - use output norms
                 for layer in routing:
                     layer_idx = layer.layer_idx
+                    norms = layer.get_output_norms()
 
-                    # Use absolute weight sum (matches fig4 approach)
-                    # This reflects actual contribution magnitude, not just neuron count
-                    for key in ALL_KEYS:
-                        w = layer.get_weight(key)
-                        if w is not None:
-                            # Sum of absolute weights = contribution magnitude
-                            contribution = w.abs().sum().item()
-                            layer_pool_counts[layer_idx][key].append(contribution)
+                    if 'attn_out_norm' in norms and 'know_out_norm' in norms:
+                        layer_norms[layer_idx]['attn'].append(norms['attn_out_norm'])
+                        layer_norms[layer_idx]['know'].append(norms['know_out_norm'])
 
-        # Aggregate results
-        results = {'per_layer': {}, 'per_pool': {}}
+        # Aggregate results using output norms
+        results = {'per_layer': {}, 'method': 'output_norm'}
 
-        for layer_idx in sorted(layer_pool_counts.keys()):
-            pool_data = layer_pool_counts[layer_idx]
+        for layer_idx in sorted(layer_norms.keys()):
+            attn_norms = layer_norms[layer_idx]['attn']
+            know_norms = layer_norms[layer_idx]['know']
 
-            # Sum attention and knowledge separately
-            attn_sum = 0.0
-            know_sum = 0.0
-            pool_means = {}
+            if attn_norms and know_norms:
+                mean_attn = float(np.mean(attn_norms))
+                mean_know = float(np.mean(know_norms))
+                total = mean_attn + mean_know
 
-            for key in ALL_KEYS:
-                if key in pool_data and pool_data[key]:
-                    mean_count = np.mean(pool_data[key])
-                    pool_means[key] = float(mean_count)
-                    if key in ATTENTION_KEYS:
-                        attn_sum += mean_count
-                    else:
-                        know_sum += mean_count
-
-            total = attn_sum + know_sum
-
-            results['per_layer'][f'L{layer_idx}'] = {
-                'layer_idx': layer_idx,
-                'attention_sum': float(attn_sum),
-                'knowledge_sum': float(know_sum),
-                'attention_ratio': float(attn_sum / total) if total > 0 else 0.5,
-                'knowledge_ratio': float(know_sum / total) if total > 0 else 0.5,
-                'pool_breakdown': pool_means,
-            }
+                results['per_layer'][f'L{layer_idx}'] = {
+                    'layer_idx': layer_idx,
+                    'attn_out_norm': mean_attn,
+                    'know_out_norm': mean_know,
+                    'attention_ratio': float(mean_attn / total * 100) if total > 0 else 50.0,
+                    'knowledge_ratio': float(mean_know / total * 100) if total > 0 else 50.0,
+                }
 
         # Summary
         if results['per_layer']:
