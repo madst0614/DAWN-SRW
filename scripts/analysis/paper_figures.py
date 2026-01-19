@@ -54,6 +54,7 @@ class PaperFigureGenerator:
             device: Device for computation
         """
         print("Loading model...")
+        self.checkpoint_path = checkpoint_path  # Store for training log lookup
         self.model, self.tokenizer, self.config = load_model(checkpoint_path, device)
         self.router = get_router(self.model)
         self.neurons = get_neurons(self.model)
@@ -549,7 +550,7 @@ class PaperFigureGenerator:
 
         data = {}
 
-        # Method 1: Explicit training logs list
+        # Method 1: Explicit training logs list from config
         training_logs = config.get('training_logs', [])
         training_labels = config.get('training_labels', [])
 
@@ -561,11 +562,22 @@ class PaperFigureGenerator:
                         label = training_labels[i] if i < len(training_labels) else f'Model-{i+1}'
                         data[label] = (steps, losses)
                         print(f"    Loaded {label}: {meta['n_points']} points")
+                else:
+                    print(f"    Warning: Log file not found: {log_path}")
 
-        # Method 2: Auto-find from checkpoint path
+        # Method 2: Auto-find from self.checkpoint_path (same as model checkpoint)
+        if not data:
+            log_path = find_training_log(self.checkpoint_path)
+            if log_path:
+                steps, losses, meta = parse_training_log(log_path, use_val_loss=True)
+                if steps:
+                    data['DAWN'] = (steps, losses)
+                    print(f"    Loaded DAWN: {meta['n_points']} points from {log_path}")
+
+        # Method 3: Try config's checkpoint_path if different
         if not data:
             checkpoint_path = config.get('checkpoint_path')
-            if checkpoint_path:
+            if checkpoint_path and checkpoint_path != self.checkpoint_path:
                 log_path = find_training_log(checkpoint_path)
                 if log_path:
                     steps, losses, meta = parse_training_log(log_path, use_val_loss=True)
@@ -573,23 +585,17 @@ class PaperFigureGenerator:
                         data['DAWN'] = (steps, losses)
                         print(f"    Loaded DAWN: {meta['n_points']} points from {log_path}")
 
-        # Method 3: Generate demo data if nothing found
+        # No demo data - report that no logs were found
         if not data:
-            print("    No training logs found, using demo data...")
-            np.random.seed(42)
-            steps = np.arange(0, 102000, 2000).tolist()
-
-            # DAWN: faster convergence, lower final loss
-            dawn_loss = (4.5 * np.exp(-np.array(steps) / 30000) + 2.1 +
-                        0.03 * np.random.randn(len(steps)))
-            dawn_loss = np.maximum(dawn_loss, 2.1).tolist()
-            data['DAWN-24M'] = (steps, dawn_loss)
-
-            # Vanilla-22M: slower convergence
-            vanilla_loss = (5.0 * np.exp(-np.array(steps) / 40000) + 3.95 +
-                           0.03 * np.random.randn(len(steps)))
-            vanilla_loss = np.maximum(vanilla_loss, 3.95).tolist()
-            data['Vanilla-22M'] = (steps, vanilla_loss)
+            print("    WARNING: No training logs found!")
+            print(f"    Searched in: {self.checkpoint_path}")
+            print("    Expected file: training_log.txt in checkpoint directory")
+            print("    Skipping figure 6 generation.")
+            return {
+                'error': 'No training logs found',
+                'searched_path': self.checkpoint_path,
+                'expected_file': 'training_log.txt'
+            }
 
         output_path = os.path.join(output_dir, 'fig6_training_dynamics.png')
         path = plot_training_dynamics(data, output_path)
