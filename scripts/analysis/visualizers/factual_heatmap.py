@@ -161,10 +161,10 @@ def plot_factual_heatmap(
         categorized[cat].sort(key=lambda x: -x[1])
 
     # Select neurons: prioritize categories with interesting patterns
-    # Category 1 (Capital-specific) and 2 (Other-specific) are most interesting
+    # Category 0 (Shared) shows common knowledge, then specific categories
     neurons_per_cat = max(3, top_n_neurons // 4)
     sorted_neurons = []
-    category_order = [1, 2, 0, 3]  # Specific first, then Shared, then Mixed
+    category_order = [0, 1, 2, 3]  # Shared first, then Capital-specific, Other-specific, Mixed
 
     for cat in category_order:
         neurons_in_cat = [n for n, _ in categorized[cat][:neurons_per_cat]]
