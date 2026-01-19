@@ -63,8 +63,10 @@ CLI Arguments:
     Analysis Mode:
         --paper-only      Generate paper outputs only (faster)
         --only            Run only specific analyses (comma-separated)
-                          Options: health,routing,embedding,semantic,pos,
-                                   factual,behavioral,coselection,weight,v18
+                          Options: model_info,performance,health,routing,embedding,
+                                   neuron_embedding,semantic,pos,token_combination,
+                                   neuron_features,layerwise_semantic,factual,behavioral,
+                                   coselection,weight,v18,paper,report
 
     Analysis Parameters:
         --n_batches       Batches for routing/semantic/behavioral/coselection (default: 100)
@@ -258,7 +260,19 @@ class ModelAnalyzer:
         return params_info
 
     def analyze_performance(self, n_batches: int = 200) -> Dict:
-        """Analyze validation performance."""
+        """Analyze validation performance.
+
+        Computes loss, perplexity, and accuracy on validation data.
+
+        Args:
+            n_batches: Number of batches to evaluate (default: 200)
+                - 50: Quick test (~30 sec)
+                - 200: Standard evaluation (~2 min)
+                - 500+: Full validation pass
+
+        Returns:
+            Dict with loss, perplexity, accuracy, speed metrics
+        """
         from scripts.evaluation.evaluate import evaluate_model, load_val_data
 
         output_dir = self.output_dir / 'performance'
@@ -541,7 +555,19 @@ class ModelAnalyzer:
         return results
 
     def analyze_routing(self, n_batches: int = 100) -> Dict:
-        """Analyze routing patterns (DAWN only)."""
+        """Analyze routing patterns (DAWN only).
+
+        Analyzes how the router distributes attention across neuron pools.
+
+        Args:
+            n_batches: Number of batches to analyze (default: 100)
+                - 20: Quick test (~1 min)
+                - 100: Standard analysis (~5 min)
+                - 200+: Comprehensive analysis
+
+        Returns:
+            Dict with entropy, selection frequency, diversity metrics per pool
+        """
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
             return {}
@@ -607,6 +633,15 @@ class ModelAnalyzer:
             for pool, data in qk_overlap.items():
                 if isinstance(data, dict) and 'overlap_ratio' in data:
                     print(f"  │ {pool}: overlap={data['overlap_ratio']*100:.1f}%, jaccard={data.get('jaccard', 0):.3f}")
+                    # Debug info
+                    debug = data.get('debug', {})
+                    if debug:
+                        print(f"  │   Retrieved: {debug.get('retrieved_count', 0)} layers")
+                        samples = debug.get('samples', [])
+                        if samples:
+                            s = samples[0]
+                            print(f"  │   Sample: Q_active={s.get('q_active', 0)}, K_active={s.get('k_active', 0)}, "
+                                  f"Q_max={s.get('q_max', 0):.4f}, K_max={s.get('k_max', 0):.4f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if qk_entropy:
@@ -620,6 +655,79 @@ class ModelAnalyzer:
                         print(f"  │ {pool}: N/A (v18.5 context-based routing)")
                     else:
                         print(f"  │ {pool}: Q={q_ent:.1f}%, K={k_ent:.1f}%, diff={data.get('entropy_diff', 0):.1f}%")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Q/K Union Coverage (true dead neurons)
+        qk_union = results.get('qk_union_coverage', {})
+        if qk_union and 'n_batches' in qk_union:
+            print(f"\n  ┌─ Q/K Union Coverage (True Dead) ──────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Total':>8} {'Q-only':>8} {'K-only':>8} {'Shared':>8} {'Dead':>8} {'Union%':>8}")
+            print(f"  │ {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+            for pool, data in qk_union.items():
+                if isinstance(data, dict) and 'n_total' in data:
+                    print(f"  │ {pool:<12} {data['n_total']:>8d} {data['q_only']:>8d} {data['k_only']:>8d} "
+                          f"{data['shared']:>8d} {data['dead']:>8d} {data['union_coverage']*100:>7.1f}%")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Activation Sparsity
+        sparsity = results.get('activation_sparsity', {})
+        if sparsity and 'n_batches' in sparsity:
+            print(f"\n  ┌─ Activation Sparsity ─────────────────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Avg Active':>12} {'Total':>8} {'Sparsity':>10} {'Wgt Sum':>10}")
+            print(f"  │ {'─'*12} {'─'*12} {'─'*8} {'─'*10} {'─'*10}")
+            for key, data in sparsity.items():
+                if isinstance(data, dict) and 'avg_active_per_token' in data:
+                    print(f"  │ {data.get('display', key):<12} {data['avg_active_per_token']:>12.1f} {data['n_total']:>8d} "
+                          f"{data['sparsity_ratio']*100:>9.1f}% {data['avg_weight_sum']:>10.3f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Token Co-selection
+        coselect = results.get('token_coselection', {})
+        if coselect and 'n_batches' in coselect:
+            print(f"\n  ┌─ Per-Token Q/K Co-selection ──────────────────────────────────────────")
+            for pool, data in coselect.items():
+                if isinstance(data, dict) and 'mean_coselect_per_token' in data:
+                    print(f"  │ {pool}:")
+                    print(f"  │   Coselect: {data['mean_coselect_per_token']:.1f}/token  |  "
+                          f"Rate: {data['coselect_rate']*100:.1f}%  |  "
+                          f"Q: {data['mean_q_active']:.1f}  K: {data['mean_k_active']:.1f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Weight Concentration
+        concentration = results.get('weight_concentration', {})
+        if concentration and 'n_batches' in concentration:
+            print(f"\n  ┌─ Weight Concentration ─────────────────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Top1%':>10} {'Top5%':>10} {'AvgActive':>12}")
+            print(f"  │ {'─'*12} {'─'*10} {'─'*10} {'─'*12}")
+            for key, data in concentration.items():
+                if isinstance(data, dict) and 'top1_weight_ratio' in data:
+                    print(f"  │ {data.get('display', key):<12} {data['top1_weight_ratio']*100:>9.1f}% "
+                          f"{data['top5_weight_ratio']*100:>9.1f}% "
+                          f"{data['avg_active_neurons']:>12.1f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Path Usage (v18.5)
+        path_usage = results.get('path_usage', {})
+        if path_usage and 'per_path' in path_usage and path_usage['per_path']:
+            print(f"\n  ┌─ Path Usage (v18.5) ──────────────────────────────────────────────────")
+            print(f"  │ Max paths: {path_usage.get('max_paths', 'N/A')}")
+            for key, data in path_usage.get('per_path', {}).items():
+                if isinstance(data, dict) and 'activation_rate' in data:
+                    print(f"  │ {key}: activation={data['activation_rate']*100:.1f}%")
+            for pool, data in path_usage.get('per_pool', {}).items():
+                if isinstance(data, dict) and 'avg_active_paths' in data:
+                    print(f"  │ {pool}: avg_active_paths={data['avg_active_paths']:.2f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Coverage Progression
+        progression = results.get('coverage_progression', {})
+        if progression and 'n_batches' in progression:
+            print(f"\n  ┌─ Coverage Progression ─────────────────────────────────────────────────")
+            for pool, data in progression.items():
+                if isinstance(data, dict) and 'trend' in data:
+                    print(f"  │ {pool}: early={data['early_coverage']*100:.1f}% → "
+                          f"mid={data['mid_coverage']*100:.1f}% → late={data['late_coverage']*100:.1f}% "
+                          f"({data['trend']}, {data['growth_ratio']:.2f}x)")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['routing'] = results
@@ -676,6 +784,116 @@ class ModelAnalyzer:
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['embedding'] = results
+        return results
+
+    def analyze_neuron_embedding(self, n_batches: int = 50, k_range: Tuple[int, int] = (5, 20)) -> Dict:
+        """Analyze neuron embeddings with clustering and token projections (DAWN only).
+
+        Clusters neurons based on their embedding vectors and analyzes
+        how different pools align with clusters.
+
+        Args:
+            n_batches: Number of batches for token projection analysis (default: 50)
+                - 10: Quick test
+                - 50: Standard analysis
+                - 100+: More accurate projections
+            k_range: Range of cluster counts to try for K-means (default: (5, 20))
+                - (3, 10): Coarse clustering
+                - (5, 20): Standard range (recommended)
+                - (10, 30): Fine-grained clustering
+
+        Returns:
+            Dict with pool distribution, optimal clustering, silhouette scores
+        """
+        if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
+            return {}
+
+        from scripts.analysis.neuron_embedding import NeuronEmbeddingAnalyzer
+
+        output_dir = self.output_dir / 'neuron_embedding'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"  Analyzing neuron embeddings (k_range={k_range}, {n_batches} batches)...")
+        dataloader = self._get_dataloader()
+        analyzer = NeuronEmbeddingAnalyzer(self.model, device=self.device)
+        analyzer.tokenizer = self.tokenizer
+
+        results = analyzer.run_full_analysis(
+            dataloader,
+            output_dir=str(output_dir),
+            n_batches=n_batches,
+            k_range=k_range,
+            tokenizer=self.tokenizer
+        )
+
+        # Print summary
+        pool_dist = results.get('pool_distribution', {})
+        clustering = results.get('clustering', {})
+        pos_analysis = results.get('pos_projection_analysis', {})
+        neuron_pos = results.get('neuron_pos_similarity', {})
+
+        if pool_dist.get('pools'):
+            print(f"\n  ┌─ Pool Distribution ────────────────────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'N':>8} {'Norm μ':>10} {'CosSim μ':>10}")
+            print(f"  │ {'─'*12} {'─'*8} {'─'*10} {'─'*10}")
+            for pool, data in pool_dist['pools'].items():
+                print(f"  │ {data.get('display', pool):<12} {data['n_neurons']:>8} "
+                      f"{data['norm_mean']:>10.4f} {data['mean_cosine_sim']:>10.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if clustering:
+            print(f"\n  ┌─ Clustering ────────────────────────────────────────────────────────────")
+            print(f"  │ Optimal k: {clustering.get('optimal_k', 'N/A')}")
+            print(f"  │ Best silhouette: {clustering.get('best_silhouette', 0):.4f}")
+            print(f"  │ Total embeddings: {clustering.get('n_embeddings', 0)}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Pool alignment analysis (k=6 fixed)
+        pool_alignment = results.get('pool_alignment', {})
+        if pool_alignment and 'pool_coverage' in pool_alignment:
+            print(f"\n  ┌─ Pool-Cluster Alignment (k=6) ─────────────────────────────────────────")
+            print(f"  │ Overall Purity: {pool_alignment.get('overall_purity', 0)*100:.1f}%")
+            print(f"  │ Mean Pool Coverage: {pool_alignment.get('mean_pool_coverage', 0)*100:.1f}%")
+            print(f"  │ Silhouette (true): {pool_alignment.get('silhouette_true_labels', 0):.4f}")
+            print(f"  │ Silhouette (pred): {pool_alignment.get('silhouette_pred_labels', 0):.4f}")
+            print(f"  │")
+            print(f"  │ Pool → Best Cluster (coverage):")
+            for pool, data in pool_alignment.get('best_cluster_for_pool', {}).items():
+                print(f"  │   {pool:<12} → cluster {data['cluster']} ({data['coverage']*100:.1f}%)")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Per-pool clustering
+        per_pool = results.get('per_pool_clustering', {})
+        if per_pool:
+            print(f"\n  ┌─ Per-Pool Clustering (internal structure) ───────────────────────────")
+            print(f"  │ {'Pool':<12} {'N':>6} {'Opt k':>6} {'Silhouette':>12}")
+            print(f"  │ {'─'*12} {'─'*6} {'─'*6} {'─'*12}")
+            for pool_name, data in per_pool.items():
+                n = data.get('n_neurons', 0)
+                k = data.get('optimal_k', 'N/A')
+                sil = data.get('best_silhouette', 0)
+                print(f"  │ {pool_name:<12} {n:>6} {k:>6} {sil:>12.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if pos_analysis and 'pos_stats' in pos_analysis:
+            print(f"\n  ┌─ POS Projection Analysis ──────────────────────────────────────────────")
+            print(f"  │ POS categories: {pos_analysis.get('n_pos_categories', 0)}")
+            print(f"  │ Silhouette score: {pos_analysis.get('silhouette_score', 'N/A')}")
+            top_pos = sorted(pos_analysis['pos_stats'].items(),
+                           key=lambda x: x[1].get('n_tokens', 0), reverse=True)[:5]
+            for pos, data in top_pos:
+                print(f"  │   {pos}: n={data['n_tokens']}, dist={data['mean_dist_to_centroid']:.3f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if neuron_pos and 'pos_pool_affinity' in neuron_pos:
+            print(f"\n  ┌─ Neuron-POS Affinity ──────────────────────────────────────────────────")
+            for pos, affinity in list(neuron_pos['pos_pool_affinity'].items())[:5]:
+                pools = ', '.join(f"{p}:{d['count']}" for p, d in affinity.items())
+                print(f"  │ {pos}: {pools}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        self.results['neuron_embedding'] = results
         return results
 
     def analyze_semantic(self, n_batches: int = 50) -> Dict:
@@ -746,8 +964,34 @@ class ModelAnalyzer:
         self.results['semantic'] = results
         return results
 
-    def analyze_pos(self, max_sentences: int = 2000, pool_type: str = 'fv', target_layer: int = None) -> Dict:
-        """Analyze POS neuron specialization (DAWN only)."""
+    def analyze_pos(self, max_sentences: int = 2000, pool_type: str = 'fv', target_layer: int = None,
+                     compute_coactivation: bool = False) -> Dict:
+        """Analyze POS neuron specialization (DAWN only).
+
+        Analyzes how neurons specialize for different Part-of-Speech tags.
+        Uses Universal Dependencies English Web Treebank dataset.
+
+        Args:
+            max_sentences: Number of sentences to analyze (default: 2000)
+                - 500: Quick test (~1 min)
+                - 2000: Standard analysis (~5 min)
+                - 5000+: Comprehensive analysis
+            pool_type: Which neuron pool to analyze
+                - 'fv': Feature V pool (default, recommended)
+                - 'rv': Restore V pool
+                - 'fqk', 'fqk_q', 'fqk_k': Feature QK pools
+                - 'rqk', 'rqk_q', 'rqk_k': Restore QK pools
+                - 'fknow', 'rknow': Knowledge pools
+            target_layer: Specific layer to analyze (default: None = all layers)
+                - 0-11: Specific layer index
+                - None: Average across all layers
+            compute_coactivation: Compute neuron co-activation correlation matrix
+                - False: Skip (faster, less memory)
+                - True: Compute correlation between neurons (memory intensive)
+
+        Returns:
+            Dict with selectivity matrix, top neurons per POS, clustering results
+        """
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
             return {}
@@ -758,12 +1002,16 @@ class ModelAnalyzer:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
-        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, pool={pool_type}, {layer_str})...")
+        coact_str = ", coactivation=ON" if compute_coactivation else ""
+        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, pool={pool_type}, {layer_str}{coact_str})...")
         analyzer = POSNeuronAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device,
             target_layer=target_layer
         )
-        results = analyzer.run_all(str(output_dir), pool_type=pool_type, max_sentences=max_sentences)
+        results = analyzer.run_all(
+            str(output_dir), pool_type=pool_type, max_sentences=max_sentences,
+            compute_coactivation=compute_coactivation
+        )
 
         # Print detailed summary
         pos_counts = results.get('pos_token_counts', {})
@@ -788,22 +1036,29 @@ class ModelAnalyzer:
 
         if top_neurons:
             print(f"\n  ┌─ Top Neurons per POS ──────────────────────────────────────────────────")
-            print(f"  │ {'POS':<10} {'Top Neurons (id:freq)':<50}")
+            print(f"  │ {'POS':<10} {'Top Neurons (id:sel)':<50}")
             print(f"  │ {'─'*60}")
             for pos in ['NOUN', 'VERB', 'ADJ', 'ADV', 'DET', 'PUNCT']:
                 if pos in top_neurons and top_neurons[pos]:
                     neurons = top_neurons[pos][:5]
-                    neuron_str = ', '.join(f'{n}:{f:.2f}' for n, f in neurons)
+                    # Handle both old format (tuples) and new format (dicts)
+                    if neurons and isinstance(neurons[0], dict):
+                        neuron_str = ', '.join(f"N{n['neuron']}:{n['selectivity']:.2f}" for n in neurons)
+                    else:
+                        neuron_str = ', '.join(f'{n}:{f:.2f}' for n, f in neurons)
                     print(f"  │ {pos:<10} {neuron_str}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if specificity:
             print(f"\n  ┌─ POS-Specific Neurons (High Selectivity) ──────────────────────────────")
             top_specific = list(specificity.items())[:10]
-            print(f"  │ {'Neuron':<10} {'Top POS':<10} {'Score':>10} {'Specificity':>12}")
-            print(f"  │ {'─'*42}")
+            print(f"  │ {'Neuron':<10} {'Top POS':<10} {'Selectivity':>12} {'Mean Weight':>12}")
+            print(f"  │ {'─'*44}")
             for neuron_id, data in top_specific:
-                print(f"  │ N{neuron_id:<9} {data['top_pos']:<10} {data['top_score']:>10.3f} {data['specificity']:>12.1f}x")
+                # Handle both old format and new format
+                selectivity = data.get('selectivity', data.get('specificity', 0))
+                mean_weight = data.get('mean_weight', data.get('top_score', 0))
+                print(f"  │ N{neuron_id:<9} {data['top_pos']:<10} {selectivity:>12.2f}x {mean_weight:>12.4f}")
             print(f"  │")
             print(f"  │ Total specific neurons: {len(specificity)}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
@@ -811,8 +1066,194 @@ class ModelAnalyzer:
         self.results['pos'] = results
         return results
 
+    def analyze_token_combination(self, max_sentences: int = 2000, target_layer: int = None,
+                                   activation_threshold: float = 1e-6) -> Dict:
+        """Analyze token-based neuron combinations (DAWN only).
+
+        Token-centric analysis: which neuron combinations each token activates.
+        Uses Jaccard similarity and silhouette score to measure POS clustering quality.
+
+        Args:
+            max_sentences: Number of sentences to analyze (default: 2000)
+                - 500: Quick test (~2 min)
+                - 2000: Standard analysis (~8 min)
+                - 5000+: Comprehensive analysis
+            target_layer: Specific layer to analyze (default: None = all layers majority vote)
+                - 0-11: Specific layer index
+                - None: Majority vote across all layers
+            activation_threshold: Threshold for binary activation (default: 1e-6)
+                - 1e-6: Include all non-zero weights
+                - 0.01: Only strong activations
+                - 0.1: Only very strong activations
+
+        Returns:
+            Dict with silhouette score, Jaccard similarities, content/function analysis
+        """
+        if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
+            return {}
+
+        from scripts.analysis.pos_neuron import TokenCombinationAnalyzer
+
+        output_dir = self.output_dir / 'token_combination'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
+        print(f"  Analyzing token neuron combinations ({max_sentences} sentences, {layer_str})...")
+
+        analyzer = TokenCombinationAnalyzer(
+            self.model, tokenizer=self.tokenizer, device=self.device,
+            target_layer=target_layer, activation_threshold=activation_threshold
+        )
+        results = analyzer.run_all(str(output_dir), max_sentences=max_sentences)
+
+        # Print key metrics
+        sil = results.get('silhouette_score', {})
+        pos_sim = results.get('pos_similarity', {})
+
+        if sil.get('score') is not None:
+            print(f"\n  ┌─ Token Combination Results ────────────────────────────────────────────")
+            print(f"  │ Silhouette Score: {sil['score']:.4f}  (target: > 0.3)")
+            print(f"  │ Samples: {sil.get('n_samples', 0)}, POS categories: {sil.get('n_pos_categories', 0)}")
+            if pos_sim:
+                print(f"  │")
+                print(f"  │ Jaccard Similarity:")
+                print(f"  │   Within-POS mean:  {pos_sim.get('mean_within', 0):.4f}")
+                print(f"  │   Between-POS mean: {pos_sim.get('mean_between', 0):.4f}")
+                print(f"  │   Separation:       {pos_sim.get('separation', 0):.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        self.results['token_combination'] = results
+        return results
+
+    def analyze_neuron_features(self, max_sentences: int = 2000, target_layer: int = None) -> Dict:
+        """Analyze neuron-centric features (DAWN only).
+
+        Inverts the token->neuron perspective to analyze what features each neuron responds to.
+
+        Analyzes per neuron:
+        - POS distribution of activating tokens
+        - Sentence position distribution
+        - Token frequency (high/med/low)
+        - Subword position (word-initial vs continuation)
+        - Next token POS patterns
+
+        Args:
+            max_sentences: Number of sentences to analyze (default: 2000)
+            target_layer: Specific layer to analyze (default: None = all layers)
+
+        Returns:
+            Dict with neuron profiles, specialized neurons, clusters
+        """
+        if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
+            return {}
+
+        from scripts.analysis.pos_neuron import TokenCombinationAnalyzer, NeuronFeatureAnalyzer
+
+        output_dir = self.output_dir / 'neuron_features'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
+        print(f"  Analyzing neuron features ({max_sentences} sentences, {layer_str})...")
+
+        # First collect token data
+        tca = TokenCombinationAnalyzer(
+            self.model, tokenizer=self.tokenizer, device=self.device,
+            target_layer=target_layer
+        )
+        dataset = tca.load_ud_dataset('train', max_sentences)
+        tca.analyze_dataset(dataset, max_sentences=max_sentences, analyze_layer_divergence=False)
+
+        # Then run neuron feature analysis
+        nfa = NeuronFeatureAnalyzer.from_token_combination_analyzer(tca)
+        results = nfa.run_full_analysis(output_dir=str(output_dir))
+
+        # Print key metrics
+        specialized = results.get('specialized_neurons', {})
+        clusters = results.get('clusters', {})
+
+        print(f"\n  ┌─ Neuron Feature Analysis Results ─────────────────────────────────────")
+        print(f"  │ Neurons profiled: {results.get('n_neurons_profiled', 0)}")
+        print(f"  │")
+        print(f"  │ Specialized neurons (80%+ concentration):")
+        for feature, neurons in specialized.items():
+            if neurons:
+                print(f"  │   {feature:12s}: {len(neurons)} neurons")
+        print(f"  │")
+        if clusters.get('silhouette_score'):
+            print(f"  │ Cluster silhouette: {clusters['silhouette_score']:.4f}")
+        print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        self.results['neuron_features'] = results
+        return results
+
+    def analyze_layerwise_semantic(self, max_sentences: int = 500) -> Dict:
+        """Analyze layer-wise semantic emergence (DAWN only).
+
+        Runs per-layer analysis to measure:
+        1. Semantic correlation: GloVe similarity vs neuron weight similarity
+        2. POS silhouette: How well neurons cluster by part-of-speech
+
+        Hypothesis:
+        - Early layers: Strong POS clustering (syntax)
+        - Later layers: Strong semantic correlation (semantics)
+        - Crossover point = syntax→semantics transition
+
+        Args:
+            max_sentences: Number of sentences per layer (default: 500)
+                - 200: Quick test (~5 min)
+                - 500: Standard analysis (~15 min)
+                - 1000: Comprehensive analysis (~30 min)
+
+        Returns:
+            Dict with per-layer semantic correlation and silhouette scores
+        """
+        if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
+            return {}
+
+        from scripts.analysis.pos_neuron import TokenCombinationAnalyzer
+
+        output_dir = self.output_dir / 'layerwise_semantic'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get number of layers from model
+        n_layers = getattr(self.model, 'n_layers', 8)
+
+        print(f"  Analyzing layer-wise semantic emergence ({n_layers} layers, {max_sentences} sentences/layer)...")
+
+        results = TokenCombinationAnalyzer.run_layerwise_analysis(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            n_layers=n_layers,
+            output_dir=str(output_dir),
+            max_sentences=max_sentences,
+            device=self.device,
+        )
+
+        self.results['layerwise_semantic'] = results
+        return results
+
     def analyze_factual(self, n_runs: int = 10, pool_type: str = 'fv') -> Dict:
-        """Analyze factual knowledge neurons (DAWN only)."""
+        """Analyze factual knowledge neurons (DAWN only).
+
+        Finds neurons that consistently activate for factual knowledge
+        (e.g., "The capital of France is" -> Paris).
+
+        Args:
+            n_runs: Number of repeated runs per prompt for consistency (default: 10)
+                - 5: Quick test
+                - 10: Standard analysis
+                - 20+: High confidence consistency check
+            pool_type: Which neuron pool to analyze
+                - 'fv': Feature V pool (default, recommended)
+                - 'rv': Restore V pool
+                - 'fqk', 'fqk_q', 'fqk_k': Feature QK pools
+
+        Returns:
+            Dict with per-target neuron activations, common neurons, match rates
+        """
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
             return {}
@@ -822,7 +1263,8 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'factual'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"  Analyzing factual neurons ({n_runs} runs per prompt, pool={pool_type})...")
+        max_tokens = 30
+        print(f"  Analyzing factual neurons ({n_runs} runs × {max_tokens} tokens, pool={pool_type})...")
         analyzer = BehavioralAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
         )
@@ -835,36 +1277,57 @@ class ModelAnalyzer:
         ]
         targets = ["Paris", "Berlin", "Tokyo", "blue"]
 
-        results = analyzer.analyze_factual_neurons(prompts, targets, n_runs=n_runs, pool_type=pool_type)
+        results = analyzer.analyze_factual_neurons(
+            prompts, targets,
+            n_runs=n_runs,
+            pool_type=pool_type,
+            max_new_tokens=max_tokens,
+            temperature=0.8,  # Sampling for variation
+            top_k=50,         # Top-k sampling
+        )
 
         # Print detailed summary
         per_target = results.get('per_target', {})
         if per_target:
-            print(f"\n  ┌─ Factual Analysis Results ─────────────────────────────────────────────")
-            print(f"  │ {'Target':<10} {'Predicted':<12} {'Rank':>6} {'Match%':>8} {'Common':>8}")
-            print(f"  │ {'─'*10} {'─'*12} {'─'*6} {'─'*8} {'─'*8}")
+            print(f"\n  ┌─ Factual Analysis Results (Contrastive) ──────────────────────────────────")
+            print(f"  │ {'Target':<10} {'Found':>8} {'Match%':>8} {'N80%':>6} {'Specific':>8}")
+            print(f"  │ {'─'*10} {'─'*8} {'─'*8} {'─'*6} {'─'*8}")
             for target, data in per_target.items():
                 if isinstance(data, dict):
+                    matching = data.get('matching_runs', 0)
+                    total = data.get('total_runs', n_runs)
                     match_rate = data.get('match_rate', 0) * 100
-                    predicted = data.get('predicted_token', 'N/A')[:10]
-                    rank = data.get('target_rank', -1)
-                    rank_str = str(rank) if rank > 0 else '>20'
-                    n_common = len(data.get('common_neurons_80', []))
-                    print(f"  │ {target:<10} {predicted:<12} {rank_str:>6} {match_rate:>7.0f}% {n_common:>8d}")
+                    n_common_80 = len(data.get('common_neurons_80', []))
+                    n_specific = len(data.get('target_specific_neurons', []))
+                    print(f"  │ {target:<10} {matching:>3}/{total:<3} {match_rate:>7.0f}% {n_common_80:>6} {n_specific:>8}")
 
-            # Interpretation
+            # Show sample generations and top contrastive neurons
             any_match = any(d.get('match_rate', 0) > 0 for d in per_target.values())
-            if not any_match:
+            if any_match:
                 print(f"  │")
-                print(f"  │ Note: Model not generating target tokens (likely undertrained)")
-                print(f"  │       Check 'Rank' column - lower is better (1=top prediction)")
+                print(f"  │ Sample generations & top target-specific neurons:")
+                for target, data in per_target.items():
+                    samples = data.get('sample_successful_generations', [])
+                    specific = data.get('target_specific_neurons', [])[:5]
+                    contrastive = data.get('contrastive_top50', [])[:3]
+                    if samples:
+                        sample = samples[0]
+                        text = sample.get('text', '')[:50]
+                        pos = sample.get('position', -1)
+                        print(f"  │   {target}: \"{text}...\" (pos={pos})")
+                        if contrastive:
+                            top_neurons = [f"N{c['neuron']}({c['score']:.2f})" for c in contrastive]
+                            print(f"  │          Top neurons: {', '.join(top_neurons)}")
+            else:
+                print(f"  │")
+                print(f"  │ Note: Target tokens not found in any generation")
+                print(f"  │       Model may lack factual knowledge or need different prompts")
+                print(f"  │")
+                print(f"  │ First generation samples:")
+                for target, data in list(per_target.items())[:2]:
+                    first_gen = data.get('first_generation', '')[:50]
+                    print(f"  │   {target}: \"{first_gen}...\"")
 
-            # Show top common neurons if any matches
-            all_common = results.get('all_common_neurons', [])
-            if all_common:
-                print(f"  │")
-                print(f"  │ Cross-target common neurons: {len(all_common)}")
-                print(f"  │ Top neurons: {', '.join(f'N{n}' for n in all_common[:10])}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         with open(output_dir / 'factual_neurons.json', 'w') as f:
@@ -983,13 +1446,18 @@ class ModelAnalyzer:
         # Print detailed summary
         print(f"\n  ┌─ Co-Selection Analysis ───────────────────────────────────────────────────")
         for pair_name, data in results.items():
-            if isinstance(data, dict) and 'coselection_rate' in data:
-                print(f"  │ {pair_name}:")
-                print(f"  │   Co-selection rate: {data['coselection_rate']*100:.2f}%")
-                print(f"  │   Correlation: {data.get('correlation', 0):.4f}")
-                if data.get('top_pairs'):
-                    top_3 = data['top_pairs'][:3]
-                    print(f"  │   Top pairs: {', '.join(f'({p[0]},{p[1]})' for p in top_3)}")
+            if isinstance(data, dict) and 'pair_name' in data:
+                print(f"  │ {data['pair_name']}:")
+                # Show concentration metrics
+                conc = data.get('concentration', {})
+                if conc:
+                    print(f"  │   Top10: {conc.get('top10_pct', 0):.1f}%, Top50: {conc.get('top50_pct', 0):.1f}%")
+                    print(f"  │   Entropy: {conc.get('normalized_entropy', 0):.3f} (normalized)")
+                # Show top pairs
+                top_pairs = data.get('top_pairs', [])
+                if top_pairs:
+                    top_3 = [(p['a_idx'], p['b_idx'], p['pct']) for p in top_pairs[:3]]
+                    print(f"  │   Top pairs: {', '.join(f'({a},{b}):{pct:.1f}%' for a,b,pct in top_3)}")
         print(f"  └─────────────────────────────────────────────────────────────────────────────")
 
         self.results['coselection'] = results
@@ -1008,6 +1476,12 @@ class ModelAnalyzer:
 
         print("  Analyzing weight matrices...")
         analyzer = WeightAnalyzer(model=self.model, device=self.device)
+
+        # Check if shared_neurons is available
+        if analyzer.neurons is None:
+            print("  Skipping (no shared_neurons found - may be v18.5+ model)")
+            return {}
+
         results = analyzer.run_all(str(output_dir))
 
         # Print detailed summary
@@ -1389,8 +1863,12 @@ class ModelAnalyzer:
             ('health', self.analyze_health, {}),
             ('routing', self.analyze_routing, {'n_batches': self.n_batches}),
             ('embedding', self.analyze_embedding, {'n_clusters': self.n_clusters}),
+            ('neuron_embedding', self.analyze_neuron_embedding, {'n_batches': self.n_batches // 2}),
             ('semantic', self.analyze_semantic, {'n_batches': self.n_batches // 2}),
             ('pos', self.analyze_pos, {'max_sentences': self.max_sentences, 'pool_type': self.pool_type, 'target_layer': self.target_layer}),
+            ('token_combination', self.analyze_token_combination, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
+            ('neuron_features', self.analyze_neuron_features, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
+            ('layerwise_semantic', self.analyze_layerwise_semantic, {'max_sentences': self.max_sentences // 4}),
             ('factual', self.analyze_factual, {'n_runs': self.n_runs, 'pool_type': self.pool_type}),
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
@@ -1841,7 +2319,7 @@ Examples:
 
     # Analysis mode
     parser.add_argument('--paper-only', action='store_true', help='Generate paper outputs only (faster)')
-    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: health,routing,embedding,semantic,pos,factual,behavioral,coselection,weight,v18)')
+    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: model_info,performance,health,routing,embedding,semantic,pos,token_combination,neuron_features,layerwise_semantic,factual,behavioral,coselection,weight,v18,paper,report)')
 
     # Analysis parameters
     parser.add_argument('--n_batches', type=int, default=100, help='Number of batches for routing/semantic/behavioral/coselection (default: 100)')

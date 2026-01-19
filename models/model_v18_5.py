@@ -837,6 +837,10 @@ class GlobalRouters(nn.Module):
             routing_info['fqk_weights_Q'] = fqk_weights_Q
             routing_info['fqk_weights_K'] = fqk_weights_K
             routing_info['fv_weights'] = fv_weights
+            # Binary masks (scores > tau) - for clean neuron selection
+            routing_info['fqk_mask_Q'] = fqk_mask_Q
+            routing_info['fqk_mask_K'] = fqk_mask_K
+            routing_info['fv_mask'] = fv_mask
 
         # Update usage
         if self.training:
@@ -955,9 +959,13 @@ class GlobalRouters(nn.Module):
                 routing_info[key] = logits
                 # Store weights for Q/K analysis
                 routing_info[f'rqk_weights_{qk_type}'] = weights
+                # Binary mask (scores > tau)
+                routing_info[f'rqk_mask_{qk_type}'] = mask
             else:
                 routing_info['rv_pref'] = logits
                 routing_info['rv_weights'] = weights
+                # Binary mask (scores > tau)
+                routing_info['rv_mask'] = mask
 
         return weights, aux_loss, routing_info
 
@@ -1021,6 +1029,8 @@ class GlobalRouters(nn.Module):
         # Store weights for analysis
         if self.store_pref_tensors:
             know_info['feature_know_w'] = f_weights  # [B, S, N_feature_know]
+            # Binary mask (scores > tau)
+            know_info['feature_know_mask'] = f_mask
 
         # Debug info
         if self.debug_mode:
@@ -1113,6 +1123,8 @@ class GlobalRouters(nn.Module):
         # Store weights for analysis
         if self.store_pref_tensors:
             routing_info['restore_know_w'] = weights  # [B, S, N_restore_know]
+            # Binary mask (scores > tau)
+            routing_info['restore_know_mask'] = mask
 
         # Debug info
         if self.debug_mode:
@@ -1280,6 +1292,14 @@ class AttentionCircuit(nn.Module):
                     restore_info['rqk_weights_K'] = info_k['rqk_weights_K']
                 if info_v and 'rv_weights' in info_v:
                     restore_info['rv_weights'] = info_v['rv_weights']
+
+                # Store restore masks for analysis (scores > tau)
+                if info_q and 'rqk_mask_Q' in info_q:
+                    restore_info['rqk_mask_Q'] = info_q['rqk_mask_Q']
+                if info_k and 'rqk_mask_K' in info_k:
+                    restore_info['rqk_mask_K'] = info_k['rqk_mask_K']
+                if info_v and 'rv_mask' in info_v:
+                    restore_info['rv_mask'] = info_v['rv_mask']
 
         # Q norm for dead routing detection
         q_norm = Q_total.norm(dim=-1, keepdim=True)
