@@ -630,15 +630,30 @@ def main():
     if results_dir and results_dir.exists():
         print(f"Loading results from {results_dir}")
 
-        # Q/K data
+        # Q/K data - check multiple possible locations
         qk_path = results_dir / 'routing' / 'qk_usage.json'
+        routing_results_path = results_dir / 'routing' / 'routing_results.json'
+
         if qk_path.exists():
             qk_data = load_json(qk_path) or {}
+        elif routing_results_path.exists():
+            routing_results = load_json(routing_results_path) or {}
+            qk_data = routing_results.get('qk_usage', {})
+
+        # Also try to load from main results file
+        main_results_path = results_dir / 'analysis_results.json'
+        if main_results_path.exists() and not qk_data:
+            main_results = load_json(main_results_path) or {}
+            routing_section = main_results.get('routing', {})
+            qk_data = routing_section.get('qk_usage', {})
 
         # POS data
         pos_path = results_dir / 'pos' / 'pos_analysis.json'
         if pos_path.exists():
             pos_data = load_json(pos_path) or {}
+        elif main_results_path.exists():
+            main_results = load_json(main_results_path) or {}
+            pos_data = main_results.get('pos', {})
 
         # Factual data
         factual_path = results_dir / 'factual' / 'factual_neurons.json'
@@ -646,12 +661,14 @@ def main():
             factual_data = load_json(factual_path) or {}
 
         # Health data
-        health_path = results_dir / 'health' / 'dead_neurons.json'
+        health_path = results_dir / 'health' / 'health_results.json'
+        if not health_path.exists():
+            health_path = results_dir / 'health' / 'dead_neurons.json'
         if health_path.exists():
             health_data = load_json(health_path) or {}
 
-        # Routing data
-        routing_path = results_dir / 'routing' / 'routing_stats.json'
+        # Routing data (for layer contribution)
+        routing_path = results_dir / 'routing' / 'routing_results.json'
         if routing_path.exists():
             routing_data = load_json(routing_path) or {}
 

@@ -1646,7 +1646,7 @@ class ModelAnalyzer:
                 self.val_data_path,  # Pass path, not dataloader
                 device=self.device
             )
-            gen.generate('3,4,6,7', str(figures_dir), n_batches=50)
+            gen.generate('3,4,5,7', str(figures_dir), n_batches=self.n_runs)
         except Exception as e:
             print(f"    Warning: Could not generate paper figures: {e}")
 
