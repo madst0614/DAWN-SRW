@@ -690,6 +690,9 @@ class RoutingAnalyzer(BaseAnalyzer):
 
         Paper Figure 6b data generation.
 
+        For top-k routing, uses masks (binary selection) instead of weights to get
+        more meaningful per-layer variation.
+
         Args:
             dataloader: DataLoader for input data
             n_batches: Number of batches to process
@@ -697,12 +700,13 @@ class RoutingAnalyzer(BaseAnalyzer):
         Returns:
             Dictionary with layer-wise attention/knowledge ratios
         """
-        # {layer_idx: {'attention': [], 'knowledge': []}}
-        layer_contributions = defaultdict(lambda: {'attention': [], 'knowledge': []})
+        # Track per-layer, per-pool neuron counts
+        layer_pool_counts = defaultdict(lambda: defaultdict(list))
 
-        # Standardized keys for attention and knowledge
+        # Standardized keys
         ATTENTION_KEYS = ['fv', 'rv', 'fqk_q', 'fqk_k', 'rqk_q', 'rqk_k']
         KNOWLEDGE_KEYS = ['fknow', 'rknow']
+        ALL_KEYS = ATTENTION_KEYS + KNOWLEDGE_KEYS
 
         self.model.eval()
         with self.extractor.analysis_context():
@@ -725,37 +729,50 @@ class RoutingAnalyzer(BaseAnalyzer):
                 for layer in routing:
                     layer_idx = layer.layer_idx
 
-                    # Attention contribution: sum of all attention routing weights
-                    attn_contrib = 0.0
-                    for key in ATTENTION_KEYS:
-                        w = layer.get_weight(key)
-                        if w is not None:
-                            attn_contrib += w.sum().item()
-
-                    # Knowledge contribution: sum of knowledge weights
-                    know_contrib = 0.0
-                    for key in KNOWLEDGE_KEYS:
-                        w = layer.get_weight(key)
-                        if w is not None:
-                            know_contrib += w.sum().item()
-
-                    layer_contributions[layer_idx]['attention'].append(attn_contrib)
-                    layer_contributions[layer_idx]['knowledge'].append(know_contrib)
+                    # Try masks first (better for top-k), fallback to weights
+                    for key in ALL_KEYS:
+                        m = layer.get_mask(key)
+                        if m is not None:
+                            # Count selected neurons (sum of binary mask)
+                            count = m.sum().item()
+                            layer_pool_counts[layer_idx][key].append(count)
+                        else:
+                            # Fallback to weights
+                            w = layer.get_weight(key)
+                            if w is not None:
+                                # For weights, sum the values
+                                count = w.sum().item()
+                                layer_pool_counts[layer_idx][key].append(count)
 
         # Aggregate results
-        results = {'per_layer': {}}
-        for layer_idx in sorted(layer_contributions.keys()):
-            contribs = layer_contributions[layer_idx]
-            attn_mean = np.mean(contribs['attention']) if contribs['attention'] else 0
-            know_mean = np.mean(contribs['knowledge']) if contribs['knowledge'] else 0
-            total = attn_mean + know_mean
+        results = {'per_layer': {}, 'per_pool': {}}
+
+        for layer_idx in sorted(layer_pool_counts.keys()):
+            pool_data = layer_pool_counts[layer_idx]
+
+            # Sum attention and knowledge separately
+            attn_sum = 0.0
+            know_sum = 0.0
+            pool_means = {}
+
+            for key in ALL_KEYS:
+                if key in pool_data and pool_data[key]:
+                    mean_count = np.mean(pool_data[key])
+                    pool_means[key] = float(mean_count)
+                    if key in ATTENTION_KEYS:
+                        attn_sum += mean_count
+                    else:
+                        know_sum += mean_count
+
+            total = attn_sum + know_sum
 
             results['per_layer'][f'L{layer_idx}'] = {
                 'layer_idx': layer_idx,
-                'attention_sum': float(attn_mean),
-                'knowledge_sum': float(know_mean),
-                'attention_ratio': float(attn_mean / total) if total > 0 else 0.5,
-                'knowledge_ratio': float(know_mean / total) if total > 0 else 0.5,
+                'attention_sum': float(attn_sum),
+                'knowledge_sum': float(know_sum),
+                'attention_ratio': float(attn_sum / total) if total > 0 else 0.5,
+                'knowledge_ratio': float(know_sum / total) if total > 0 else 0.5,
+                'pool_breakdown': pool_means,
             }
 
         # Summary
@@ -765,6 +782,8 @@ class RoutingAnalyzer(BaseAnalyzer):
             results['summary'] = {
                 'attention_ratio_mean': float(np.mean(attn_ratios)),
                 'knowledge_ratio_mean': float(np.mean(know_ratios)),
+                'attention_ratio_std': float(np.std(attn_ratios)),
+                'knowledge_ratio_std': float(np.std(know_ratios)),
                 'n_layers': len(results['per_layer']),
             }
 

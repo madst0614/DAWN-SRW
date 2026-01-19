@@ -37,12 +37,12 @@ def plot_factual_heatmap(
     """
     Semantic-level factual knowledge neuron heatmap.
 
-    Neurons are sorted by semantic category:
-    - Category-shared neurons (e.g., all capitals share)
-    - Category-specific neurons (e.g., only capitals, not colors)
-    - Target-specific neurons
+    Uses common_neurons_80 (neurons that fire in 80%+ of successful runs)
+    to identify reliable neurons for each target.
 
-    This visualization shows that related outputs share neuron subsets.
+    Neurons are categorized by selectivity:
+    - Shared: Fire for multiple targets
+    - Target-specific: Fire mainly for one target
 
     Args:
         factual_data: Results from BehavioralAnalyzer.analyze_factual_neurons()
@@ -62,12 +62,16 @@ def plot_factual_heatmap(
 
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
-    # Collect all neurons and their frequencies
+    # Collect neuron frequencies for each target
     all_neurons = defaultdict(lambda: defaultdict(float))
+    common_neurons_per_target = {}
 
     for target, data in per_target.items():
         if 'error' in data:
             continue
+        # Get common neurons (80%+ threshold)
+        common_neurons_per_target[target] = set(data.get('common_neurons_80', []))
+        # Get all frequencies
         for nf in data.get('neuron_frequencies', []):
             if isinstance(nf, dict):
                 neuron = nf['neuron']
@@ -82,11 +86,8 @@ def plot_factual_heatmap(
     targets = list(all_neurons.keys())
 
     # Auto-detect semantic categories based on target names
-    # Category 1: Capitals (cities)
     capital_keywords = ['Paris', 'Berlin', 'Tokyo', 'London', 'Rome', 'Madrid', 'Beijing', 'Seoul']
     capital_targets = [t for t in targets if any(k.lower() in t.lower() for k in capital_keywords)]
-
-    # Category 2: Others (colors, etc.)
     other_targets = [t for t in targets if t not in capital_targets]
 
     # If no clear category separation, use all targets as one group
@@ -94,38 +95,95 @@ def plot_factual_heatmap(
         capital_targets = targets
         other_targets = []
 
-    # Collect all neuron IDs
+    # Collect all neuron IDs with meaningful activity (freq > 0.1)
     all_neuron_ids = set()
     for t in targets:
-        all_neuron_ids.update(all_neurons[t].keys())
+        for n, freq in all_neurons[t].items():
+            if freq > 0.1:  # Filter out very low frequency neurons
+                all_neuron_ids.add(n)
+
+    if not all_neuron_ids:
+        # Fallback: use common neurons
+        for neurons in common_neurons_per_target.values():
+            all_neuron_ids.update(neurons)
 
     if not all_neuron_ids:
         return None
 
     def get_neuron_category(neuron):
-        """Classify neuron by activation pattern across categories."""
+        """Classify neuron by selectivity pattern across targets."""
         capital_freqs = [all_neurons[t].get(neuron, 0) for t in capital_targets]
         other_freqs = [all_neurons[t].get(neuron, 0) for t in other_targets] if other_targets else []
 
         capital_avg = np.mean(capital_freqs) if capital_freqs else 0
         other_avg = np.mean(other_freqs) if other_freqs else 0
-        capital_min = min(capital_freqs) if capital_freqs else 0
 
-        # Category 0: Shared across all capitals (highest priority)
-        if capital_min >= 0.8:
-            return (0, -capital_avg, neuron)
-        # Category 1: Capital-specific (high in capitals, low in others)
-        elif capital_avg >= 0.5 and (not other_freqs or other_avg < 0.3):
-            return (1, -capital_avg, neuron)
-        # Category 2: Other-specific (high in others, low in capitals)
-        elif other_freqs and other_avg >= 0.5 and capital_avg < 0.3:
-            return (2, -other_avg, neuron)
-        # Category 3: Mixed/weak
-        else:
-            return (3, -(capital_avg + other_avg), neuron)
+        # Use percentile-based thresholds relative to the data
+        # A neuron with avg freq > 0.3 for a group is considered "active" for that group
+        capital_active = capital_avg > 0.3
+        other_active = other_avg > 0.3 if other_freqs else False
 
-    # Sort neurons by semantic category
-    sorted_neurons = sorted(all_neuron_ids, key=get_neuron_category)[:top_n_neurons]
+        # Category 0: Shared - active in both capital and other categories
+        if capital_active and other_active:
+            return 0
+
+        # Category 1: Capital-specific - active only in capitals
+        if capital_active and not other_active:
+            return 1
+
+        # Category 2: Other-specific - active only in others
+        if other_active and not capital_active:
+            return 2
+
+        # Category 3: Low/Mixed activity
+        return 3
+
+    def get_selectivity_score(neuron):
+        """Compute selectivity: how much a neuron prefers one target over others."""
+        freqs = [all_neurons[t].get(neuron, 0) for t in targets]
+        if not freqs or max(freqs) == 0:
+            return 0
+        # Higher variance = more selective
+        return float(np.std(freqs))
+
+    # Categorize and score all neurons
+    categorized = {0: [], 1: [], 2: [], 3: []}
+    for neuron in all_neuron_ids:
+        cat = get_neuron_category(neuron)
+        selectivity = get_selectivity_score(neuron)
+        mean_freq = np.mean([all_neurons[t].get(neuron, 0) for t in targets])
+        # Score: combination of mean activity and selectivity
+        score = mean_freq + selectivity * 2  # Weight selectivity higher
+        categorized[cat].append((neuron, score))
+
+    # Sort within each category by score (descending)
+    for cat in categorized:
+        categorized[cat].sort(key=lambda x: -x[1])
+
+    # Select neurons: prioritize categories with interesting patterns
+    # Category 1 (Capital-specific) and 2 (Other-specific) are most interesting
+    neurons_per_cat = max(3, top_n_neurons // 4)
+    sorted_neurons = []
+    category_order = [1, 2, 0, 3]  # Specific first, then Shared, then Mixed
+
+    for cat in category_order:
+        neurons_in_cat = [n for n, _ in categorized[cat][:neurons_per_cat]]
+        sorted_neurons.extend(neurons_in_cat)
+
+    # Trim to top_n_neurons
+    sorted_neurons = sorted_neurons[:top_n_neurons]
+
+    if not sorted_neurons:
+        # Fallback: just take top neurons by total activity
+        all_neurons_scored = []
+        for n in all_neuron_ids:
+            total = sum(all_neurons[t].get(n, 0) for t in targets)
+            all_neurons_scored.append((n, total))
+        all_neurons_scored.sort(key=lambda x: -x[1])
+        sorted_neurons = [n for n, _ in all_neurons_scored[:top_n_neurons]]
+
+    if not sorted_neurons:
+        return None
 
     # Order targets: capitals first, then others
     ordered_targets = capital_targets + other_targets
@@ -137,7 +195,7 @@ def plot_factual_heatmap(
             matrix[i, j] = all_neurons[target].get(neuron, 0)
 
     # Find category boundaries for vertical lines
-    categories = [get_neuron_category(n)[0] for n in sorted_neurons]
+    categories = [get_neuron_category(n) for n in sorted_neurons]
     boundaries = []
     for i in range(1, len(categories)):
         if categories[i] != categories[i-1]:
@@ -167,20 +225,20 @@ def plot_factual_heatmap(
         ax.axhline(y=len(capital_targets), color='blue', linewidth=2, linestyle='--')
 
     # Category labels at top
-    category_names = ['Shared', 'Capital-specific', 'Other-specific', 'Mixed']
+    category_names = {0: 'Shared', 1: 'Capital-specific', 2: 'Other-specific', 3: 'Mixed'}
     prev_boundary = 0
     for i, b in enumerate(boundaries + [len(sorted_neurons)]):
-        if i < len(category_names) and b > prev_boundary:
+        if b > prev_boundary:
             mid = (prev_boundary + b) / 2
             cat_idx = categories[prev_boundary] if prev_boundary < len(categories) else 3
-            if cat_idx < len(category_names):
-                ax.text(mid, -0.5, category_names[cat_idx], ha='center', va='bottom',
-                       fontsize=9, fontweight='bold', color='darkblue')
+            label = category_names.get(cat_idx, 'Mixed')
+            ax.text(mid, -0.5, label, ha='center', va='bottom',
+                   fontsize=9, fontweight='bold', color='darkblue')
         prev_boundary = b
 
     ax.set_xlabel('Neuron Index (grouped by semantic category)')
     ax.set_ylabel('Target Token')
-    ax.set_title('Semantic-Level Neuron Activation: Related outputs share neuron subsets')
+    ax.set_title('Factual Knowledge Neurons: Related outputs share neuron subsets')
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')

@@ -11,7 +11,8 @@ from .neuron_health import plot_dead_neurons, plot_usage_histogram, plot_qk_ema_
 from .embedding import plot_similarity_heatmap, plot_clustering, plot_embedding_space
 from .pos_neurons import (
     plot_pos_heatmap, plot_pos_clustering,
-    plot_top_neurons_by_pos, plot_pos_specificity
+    plot_top_neurons_by_pos, plot_pos_specificity,
+    plot_pos_specialization_from_features
 )
 from .layer_contribution import plot_layer_contribution, plot_layer_contribution_detail
 from .factual_heatmap import plot_factual_heatmap, plot_factual_comparison
@@ -25,6 +26,7 @@ __all__ = [
     'plot_pos_clustering',
     'plot_top_neurons_by_pos',
     'plot_pos_specificity',
+    'plot_pos_specialization_from_features',
     # Neuron Health (Figure 6a)
     'plot_dead_neurons',
     'plot_usage_histogram',

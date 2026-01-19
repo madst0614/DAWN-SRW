@@ -408,30 +408,38 @@ class PaperFigureGenerator:
         """
         Figure 4: POS Neuron Specialization.
 
-        Shows neuron specialization by part-of-speech.
+        Shows neuron specialization by part-of-speech using NeuronFeatureAnalyzer.
         """
-        from .pos_neuron import POSNeuronAnalyzer
-        from .visualizers import plot_pos_specificity
+        from .pos_neuron import TokenCombinationAnalyzer, NeuronFeatureAnalyzer
+        from .visualizers import plot_pos_specialization_from_features
 
-        print("  Initializing POS analyzer...", flush=True)
-        pos_analyzer = POSNeuronAnalyzer(
-            self.model, router=self.router, tokenizer=self.tokenizer,
-            device=self.device, target_layer=None
+        max_sentences = 2000
+
+        print("  Initializing TokenCombinationAnalyzer...", flush=True)
+        tca = TokenCombinationAnalyzer(
+            self.model, tokenizer=self.tokenizer, device=self.device,
+            target_layer=None
         )
 
         print("  Loading UD dataset...", flush=True)
         try:
-            dataset = pos_analyzer.load_ud_dataset('train', max_sentences=2000)
+            dataset = tca.load_ud_dataset('train', max_sentences=max_sentences)
         except Exception as e:
             return {'error': f'Failed to load UD dataset: {e}'}
 
-        print("  Analyzing...", flush=True)
-        results = pos_analyzer.analyze_dataset(dataset, pool_type='fv', max_sentences=2000)
+        print("  Collecting token activations...", flush=True)
+        tca.analyze_dataset(dataset, max_sentences=max_sentences, analyze_layer_divergence=False)
 
-        path = plot_pos_specificity(results, os.path.join(output_dir, 'fig4_pos_neurons.png'))
+        print("  Building neuron feature profiles...", flush=True)
+        nfa = NeuronFeatureAnalyzer.from_token_combination_analyzer(tca)
+        results = nfa.run_full_analysis(output_dir=output_dir)
+
+        path = plot_pos_specialization_from_features(
+            results, os.path.join(output_dir, 'fig4_pos_neurons.png')
+        )
         print(f"  Saved: {path}", flush=True)
 
-        return {'pos_analysis': results, 'visualization': path}
+        return {'neuron_features': results, 'visualization': path}
 
     def generate_figure5(self, output_dir: str, n_batches: int = 10) -> Dict:
         """

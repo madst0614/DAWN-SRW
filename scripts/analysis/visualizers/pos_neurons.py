@@ -368,3 +368,97 @@ def plot_pos_specificity(
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close()
     return output_path
+
+
+def plot_pos_specialization_from_features(
+    neuron_features: Dict,
+    output_path: str,
+    figsize: Tuple[int, int] = (12, 6),
+    dpi: int = 150
+) -> Optional[str]:
+    """
+    Plot POS neuron specialization from NeuronFeatureAnalyzer results.
+
+    Paper Figure 4: POS Neuron Specialization
+    - Left: Top specialized neurons by POS concentration %
+    - Right: Number of specialized neurons per POS category
+
+    Args:
+        neuron_features: Results from NeuronFeatureAnalyzer.run_full_analysis()
+        output_path: Path to save the figure
+        figsize: Figure size
+        dpi: Output resolution
+
+    Returns:
+        Path to saved figure or None
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    # Extract specialized neurons for POS
+    specialized = neuron_features.get('specialized_neurons', {})
+    pos_neurons = specialized.get('pos', [])
+
+    if not pos_neurons:
+        print("  Warning: No POS-specialized neurons found")
+        return None
+
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # Sort by concentration percentage (descending)
+    pos_neurons_sorted = sorted(pos_neurons, key=lambda x: -x.get('pct', 0))[:20]
+
+    # Left: Top specialized neurons
+    neurons = [n['neuron'] for n in pos_neurons_sorted]
+    pcts = [n['pct'] for n in pos_neurons_sorted]
+    pos_tags = [n['specialized_for'] for n in pos_neurons_sorted]
+
+    # Color by POS
+    unique_pos = list(set(pos_tags))
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_pos)))
+    pos_color_map = {pos: colors[i] for i, pos in enumerate(unique_pos)}
+
+    axes[0].barh(
+        range(len(neurons)),
+        pcts,
+        color=[pos_color_map[p] for p in pos_tags]
+    )
+    axes[0].set_yticks(range(len(neurons)))
+    axes[0].set_yticklabels([f'N{n} ({p})' for n, p in zip(neurons, pos_tags)])
+    axes[0].set_xlabel('POS Concentration (%)')
+    axes[0].set_title('Top POS-Specialized Neurons (≥80%)')
+    axes[0].invert_yaxis()
+    axes[0].axvline(x=80, color='red', linestyle='--', alpha=0.5, label='80% threshold')
+
+    # Right: Count per POS category
+    pos_counts = defaultdict(int)
+    for n in pos_neurons:
+        pos_counts[n['specialized_for']] += 1
+
+    pos_sorted = sorted(pos_counts.items(), key=lambda x: -x[1])
+    axes[1].barh(
+        range(len(pos_sorted)),
+        [c for _, c in pos_sorted],
+        color='coral'
+    )
+    axes[1].set_yticks(range(len(pos_sorted)))
+    axes[1].set_yticklabels([p for p, _ in pos_sorted])
+    axes[1].set_xlabel('Number of Specialized Neurons')
+    axes[1].set_title('POS-Specialized Neurons by Category')
+    axes[1].invert_yaxis()
+
+    # Add summary text
+    total_specialized = len(pos_neurons)
+    n_profiled = neuron_features.get('n_neurons_profiled', 0)
+    if n_profiled > 0:
+        pct_specialized = total_specialized / n_profiled * 100
+        fig.text(0.5, 0.02, f'Total: {total_specialized} specialized / {n_profiled} profiled ({pct_specialized:.1f}%)',
+                 ha='center', fontsize=10)
+
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.1)
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close()
+    return output_path
