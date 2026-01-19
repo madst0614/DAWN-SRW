@@ -1282,7 +1282,7 @@ class ModelAnalyzer:
             n_runs=n_runs,
             pool_type=pool_type,
             max_new_tokens=max_tokens,
-            temperature=0.8,  # Sampling for variation
+            temperature=1.0,  # Sampling for diverse exploration
             top_k=50,         # Top-k sampling
         )
 
