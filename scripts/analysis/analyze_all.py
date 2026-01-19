@@ -1263,7 +1263,7 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'factual'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        max_tokens = 30
+        max_tokens = self.gen_tokens
         print(f"  Analyzing factual neurons ({n_runs} runs × {max_tokens} tokens, pool={pool_type})...")
         analyzer = BehavioralAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
