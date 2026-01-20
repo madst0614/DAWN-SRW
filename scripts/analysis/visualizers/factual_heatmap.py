@@ -224,11 +224,11 @@ def plot_factual_heatmap(
     if capital_targets and other_targets:
         ax.axhline(y=len(capital_targets), color='blue', linewidth=2, linestyle='--')
 
-    # Title - centered above table with more gap from labels
+    # Title - close to heatmap
     fig.suptitle('Factual Knowledge Neurons: Related outputs share neuron subsets',
-                fontsize=11, fontweight='bold', y=1.10)
+                fontsize=11, fontweight='bold', y=0.98)
 
-    # Category labels - closer to heatmap
+    # Category labels - very close to heatmap
     category_names = {0: 'Shared', 1: 'Capital-specific', 2: 'Other-specific', 3: 'Mixed'}
     prev_boundary = 0
     for i, b in enumerate(boundaries + [len(sorted_neurons)]):
@@ -236,14 +236,14 @@ def plot_factual_heatmap(
             mid = (prev_boundary + b) / 2
             cat_idx = categories[prev_boundary] if prev_boundary < len(categories) else 3
             label = category_names.get(cat_idx, 'Mixed')
-            ax.text(mid, -0.08, label, ha='center', va='bottom',
+            ax.text(mid, -0.02, label, ha='center', va='bottom',
                    fontsize=9, fontweight='bold', color='darkblue')
         prev_boundary = b
 
     ax.set_xlabel('Neuron Index (grouped by semantic category)')
     ax.set_ylabel('Target Token')
 
-    plt.tight_layout(rect=[0, 0, 1, 0.90])  # More space for title
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close()
 
