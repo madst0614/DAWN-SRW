@@ -554,6 +554,11 @@ class ModelAnalyzer:
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['health'] = results
+
+        # Save results.json for later --only paper usage
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+
         return results
 
     def analyze_routing(self, n_batches: int = 100) -> Dict:
@@ -733,6 +738,12 @@ class ModelAnalyzer:
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['routing'] = results
+
+        # Save results.json for later --only paper usage
+        output_dir = self.output_dir / 'routing'
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+
         return results
 
     def analyze_embedding(self, n_clusters: int = 5) -> Dict:
@@ -1188,6 +1199,11 @@ class ModelAnalyzer:
         print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['neuron_features'] = results
+
+        # Save results.json for later --only paper usage
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+
         return results
 
     def analyze_layerwise_semantic(self, max_sentences: int = 500) -> Dict:
@@ -1343,6 +1359,10 @@ class ModelAnalyzer:
             print(f"\n  {'='*70}")
 
         with open(output_dir / 'factual_neurons.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+
+        # Also save as results.json for --only paper consistency
+        with open(output_dir / 'results.json', 'w') as f:
             json.dump(results, f, indent=2, default=str)
 
         # Generate visualizations
@@ -2018,6 +2038,11 @@ class ModelAnalyzer:
         if only:
             analyses = [(n, f, a) for n, f, a in analyses if n in only]
 
+        # If --only paper, load existing results from files first
+        if only and 'paper' in only and not analyses:
+            print("\n[Loading existing analysis results...]")
+            self._load_existing_results()
+
         total_analyses = len(analyses)
         for i, (name, func, kwargs) in enumerate(analyses, 1):
             print(f"\n[{i}/{total_analyses}] {name.upper()}")
@@ -2031,7 +2056,7 @@ class ModelAnalyzer:
 
         # Paper outputs (only if not filtering or 'paper' in filter)
         if not only or 'paper' in only:
-            print(f"\n[{total_analyses+1}/{total_analyses+2}] PAPER")
+            print(f"\n[PAPER] Generating paper outputs...")
             self.generate_paper_outputs()
 
         # Report (only if not filtering or 'report' in filter)
@@ -2043,6 +2068,61 @@ class ModelAnalyzer:
         self._print_final_summary()
 
         return self.results
+
+    def _load_existing_results(self):
+        """Load previously saved analysis results from files."""
+        print(f"  Loading from: {self.output_dir}")
+
+        # Model info
+        params_file = self.output_dir / 'model_info' / 'parameters.json'
+        if params_file.exists():
+            with open(params_file) as f:
+                self.results['model_info'] = json.load(f)
+                print(f"    ✓ model_info")
+
+        # Performance
+        val_file = self.output_dir / 'performance' / 'validation.json'
+        speed_file = self.output_dir / 'performance' / 'speed_benchmark.json'
+        if val_file.exists() or speed_file.exists():
+            self.results['performance'] = {}
+            if val_file.exists():
+                with open(val_file) as f:
+                    self.results['performance']['validation'] = json.load(f)
+            if speed_file.exists():
+                with open(speed_file) as f:
+                    self.results['performance']['speed'] = json.load(f)
+            print(f"    ✓ performance")
+
+        # Health
+        health_file = self.output_dir / 'health' / 'results.json'
+        if health_file.exists():
+            with open(health_file) as f:
+                self.results['health'] = json.load(f)
+                print(f"    ✓ health")
+
+        # Routing
+        routing_file = self.output_dir / 'routing' / 'results.json'
+        if routing_file.exists():
+            with open(routing_file) as f:
+                self.results['routing'] = json.load(f)
+                print(f"    ✓ routing")
+
+        # Factual
+        factual_file = self.output_dir / 'factual' / 'results.json'
+        if factual_file.exists():
+            with open(factual_file) as f:
+                self.results['factual'] = json.load(f)
+                print(f"    ✓ factual")
+
+        # Neuron features
+        nf_file = self.output_dir / 'neuron_features' / 'results.json'
+        if nf_file.exists():
+            with open(nf_file) as f:
+                self.results['neuron_features'] = json.load(f)
+                print(f"    ✓ neuron_features")
+
+        if not self.results:
+            print(f"    (No existing results found)")
 
     def _print_final_summary(self):
         """Print final analysis summary."""
