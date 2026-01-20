@@ -212,7 +212,7 @@ def plot_factual_heatmap(
         vmin=0, vmax=1,
         annot=True, fmt='.2f',
         ax=ax,
-        cbar_kws={'label': 'Activation Frequency'},
+        cbar_kws={'label': 'Activation Frequency', 'shrink': 0.8, 'pad': 0.02},
         linewidths=0.5
     )
 
@@ -224,26 +224,28 @@ def plot_factual_heatmap(
     if capital_targets and other_targets:
         ax.axhline(y=len(capital_targets), color='blue', linewidth=2, linestyle='--')
 
-    # Title - close to heatmap
-    fig.suptitle('Factual Knowledge Neurons: Related outputs share neuron subsets',
-                fontsize=11, fontweight='bold', y=0.98)
-
-    # Category labels - very close to heatmap
+    # Category labels - above heatmap using transAxes
     category_names = {0: 'Shared', 1: 'Capital-specific', 2: 'Other-specific', 3: 'Mixed'}
     prev_boundary = 0
-    for i, b in enumerate(boundaries + [len(sorted_neurons)]):
+    n_neurons = len(sorted_neurons)
+    for i, b in enumerate(boundaries + [n_neurons]):
         if b > prev_boundary:
-            mid = (prev_boundary + b) / 2
+            mid = (prev_boundary + b) / 2 / n_neurons  # normalize to 0-1
             cat_idx = categories[prev_boundary] if prev_boundary < len(categories) else 3
             label = category_names.get(cat_idx, 'Mixed')
-            ax.text(mid, -0.02, label, ha='center', va='bottom',
-                   fontsize=9, fontweight='bold', color='darkblue')
+            ax.text(mid, 1.02, label, ha='center', va='bottom',
+                   fontsize=9, fontweight='bold', color='darkblue',
+                   transform=ax.transAxes)
         prev_boundary = b
+
+    # Title - above category labels
+    ax.set_title('Factual Knowledge Neurons: Related outputs share neuron subsets',
+                fontsize=11, fontweight='bold', pad=20, y=1.08)
 
     ax.set_xlabel('Neuron Index (grouped by semantic category)')
     ax.set_ylabel('Target Token')
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.tight_layout()
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close()
 
