@@ -594,9 +594,17 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         if isinstance(outputs, tuple) and len(outputs) >= 2:
                             logits = outputs[0]
                             routing = self.extractor.extract(outputs)
+                            # Debug: first run, first step
+                            if total_runs == 1 and step == 0:
+                                print(f"        [Debug] outputs tuple len={len(outputs)}, routing layers={len(routing) if routing else 0}", flush=True)
+                                if routing and len(routing) > 0:
+                                    layer0 = routing[0]
+                                    print(f"        [Debug] Layer0 pools: {list(layer0._masks.keys()) if hasattr(layer0, '_masks') else 'no _masks'}", flush=True)
                         else:
                             logits = outputs
                             routing = None
+                            if total_runs == 1 and step == 0:
+                                print(f"        [Debug] outputs is not tuple, type={type(outputs)}", flush=True)
 
                         # Sample next token
                         next_logits = logits[:, -1, :]
@@ -618,7 +626,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         # Extract active neurons
                         step_neurons = set()
                         if routing:
-                            for layer in routing:
+                            for layer_idx, layer in enumerate(routing):
                                 m = layer.get_mask(pool_type)
                                 if m is not None:
                                     if m.dim() == 3:
@@ -627,11 +635,22 @@ class BehavioralAnalyzer(BaseAnalyzer):
                                         m = m[0]
                                     active = m.nonzero(as_tuple=True)[0].cpu().tolist()
                                     step_neurons.update(active)
+                                    # Debug: first run, first few steps
+                                    if total_runs == 1 and step < 3 and layer_idx == 0:
+                                        print(f"        [Debug L{layer_idx}] mask shape: {m.shape}, active: {len(active)}", flush=True)
+                                elif total_runs == 1 and step == 0 and layer_idx == 0:
+                                    print(f"        [Debug L{layer_idx}] get_mask('{pool_type}') returned None", flush=True)
+                        elif total_runs == 1 and step == 0:
+                            print(f"        [Debug] routing is None!", flush=True)
 
                         # Check if target found
                         if target_lower in token_text.strip().lower():
                             found_target = True
                             successful_runs += 1
+
+                            # Debug: show neuron count when target found
+                            if successful_runs <= 3:
+                                print(f"        [Target '{token_text.strip()}'] Found {len(step_neurons)} active neurons", flush=True)
 
                             # Record neurons at target generation
                             for n in step_neurons:
@@ -663,6 +682,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
 
             match_rate = successful_runs / total_runs if total_runs > 0 else 0
             print(f"      Match rate: {match_rate*100:.1f}% ({successful_runs}/{total_runs})")
+            print(f"      Unique neurons: target={len(target_neuron_counts)}, baseline={len(baseline_neuron_counts)}")
 
             # Compute results
             base_result = {
