@@ -598,8 +598,17 @@ class BehavioralAnalyzer(BaseAnalyzer):
                             if total_runs == 1 and step == 0:
                                 print(f"        [Debug] outputs tuple len={len(outputs)}, routing layers={len(routing) if routing else 0}", flush=True)
                                 if routing and len(routing) > 0:
-                                    layer0 = routing[0]
-                                    print(f"        [Debug] Layer0 pools: {list(layer0._masks.keys()) if hasattr(layer0, '_masks') else 'no _masks'}", flush=True)
+                                    layer0 = routing.get_layer(0)
+                                    # Check what's actually in the raw layer_info
+                                    raw_keys = list(layer0.raw.keys())[:10] if layer0.raw else []
+                                    att_keys = list(layer0.attention.keys())[:10] if layer0.attention else []
+                                    print(f"        [Debug] Layer0 raw keys: {raw_keys}", flush=True)
+                                    print(f"        [Debug] Layer0 attention keys: {att_keys}", flush=True)
+                                    # Check specific masks and weights
+                                    fv_mask = layer0.get_mask('fv')
+                                    fv_weight = layer0.get_weight('fv')
+                                    print(f"        [Debug] fv_mask: {fv_mask.shape if fv_mask is not None else None}", flush=True)
+                                    print(f"        [Debug] fv_weight: {fv_weight.shape if fv_weight is not None else None}", flush=True)
                         else:
                             logits = outputs
                             routing = None
@@ -638,8 +647,20 @@ class BehavioralAnalyzer(BaseAnalyzer):
                                     # Debug: first run, first few steps
                                     if total_runs == 1 and step < 3 and layer_idx == 0:
                                         print(f"        [Debug L{layer_idx}] mask shape: {m.shape}, active: {len(active)}", flush=True)
-                                elif total_runs == 1 and step == 0 and layer_idx == 0:
-                                    print(f"        [Debug L{layer_idx}] get_mask('{pool_type}') returned None", flush=True)
+                                else:
+                                    # Fallback: use weights with threshold
+                                    w = layer.get_weight(pool_type)
+                                    if w is not None:
+                                        if w.dim() == 3:
+                                            w = w[0, -1]
+                                        else:
+                                            w = w[0]
+                                        active = (w > 0.01).nonzero(as_tuple=True)[0].cpu().tolist()
+                                        step_neurons.update(active)
+                                        if total_runs == 1 and step < 3 and layer_idx == 0:
+                                            print(f"        [Debug L{layer_idx}] weight fallback, shape: {w.shape}, active: {len(active)}", flush=True)
+                                    elif total_runs == 1 and step == 0 and layer_idx == 0:
+                                        print(f"        [Debug L{layer_idx}] both mask and weight are None for '{pool_type}'", flush=True)
                         elif total_runs == 1 and step == 0:
                             print(f"        [Debug] routing is None!", flush=True)
 
