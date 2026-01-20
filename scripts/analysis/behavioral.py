@@ -519,16 +519,18 @@ class BehavioralAnalyzer(BaseAnalyzer):
         self,
         prompts: list,
         targets: list,
-        n_runs: int = 10,
         pool_type: str = 'fv',
-        max_new_tokens: int = 30,
+        max_new_tokens: int = 100,
         temperature: float = 1.0,
         top_k: int = 50,
     ) -> Dict:
         """
         Analyze neuron activations for factual knowledge prompts.
 
-        Generates tokens autoregressively and uses contrastive analysis:
+        Long generation approach: generates many tokens in a single run
+        and records neurons each time the target token appears.
+
+        Contrastive analysis:
         - Records neurons at EVERY step
         - When target appears, compares neurons at target step vs. other steps
         - Finds neurons that are significantly more active for target token
@@ -538,9 +540,8 @@ class BehavioralAnalyzer(BaseAnalyzer):
         Args:
             prompts: List of prompts (e.g., ["The capital of France is"])
             targets: List of expected target tokens (e.g., ["Paris"])
-            n_runs: Number of generation runs per prompt
             pool_type: Pool to analyze ('fv', 'rv', etc.)
-            max_new_tokens: Maximum tokens to generate per run
+            max_new_tokens: Maximum tokens to generate (longer = more target occurrences)
             temperature: Sampling temperature
             top_k: Top-k sampling (0 = greedy)
 
@@ -553,7 +554,6 @@ class BehavioralAnalyzer(BaseAnalyzer):
         results = {
             'prompts': prompts,
             'targets': targets,
-            'n_runs': n_runs,
             'pool_type': pool_type,
             'max_new_tokens': max_new_tokens,
             'per_target': {},
@@ -574,156 +574,132 @@ class BehavioralAnalyzer(BaseAnalyzer):
         for prompt_idx, (prompt, target) in enumerate(prompt_iter):
             target_neuron_counts = Counter()  # Neurons when target generated
             baseline_neuron_counts = Counter()  # Neurons at other steps
-            matching_runs = 0
+            target_occurrences = 0  # Count of target token appearances
             total_baseline_steps = 0
             target_lower = target.strip().lower()
 
-            first_predicted_text = None
-            sample_generations = []
+            generated_text = None
+            target_positions = []  # All positions where target appeared
 
             # Show prompt being processed
             print(f"\n    [{prompt_idx+1}/{len(prompts)}] \"{prompt}\" → target: \"{target}\"", flush=True)
+            print(f"      Generating {max_new_tokens} tokens...", flush=True)
 
-            for run_idx in range(n_runs):
-                # Progress at start of each run (first few runs for debugging)
-                if run_idx < 3:
-                    print(f"      Starting run {run_idx+1}...", flush=True)
+            # Encode prompt
+            input_ids = self.tokenizer.encode(
+                prompt, add_special_tokens=False, return_tensors='pt'
+            ).to(self.device)
 
-                # Encode prompt
-                input_ids = self.tokenizer.encode(
-                    prompt, add_special_tokens=False, return_tensors='pt'
-                ).to(self.device)
+            generated = input_ids.clone()
+            neurons_per_step = []  # Track neurons at each step
 
-                generated = input_ids.clone()
-                found_target = False
-                target_position = -1
-                run_neurons_per_step = []  # Track neurons at each step
+            with torch.no_grad():
+                for step in range(max_new_tokens):
+                    # Forward pass with routing info
+                    outputs = self.model(generated, return_routing_info=True)
 
-                with torch.no_grad():
-                    for step in range(max_new_tokens):
-                        # Forward pass with routing info
-                        outputs = self.model(generated, return_routing_info=True)
+                    # Debug on first step
+                    if step == 0:
+                        print(f"      [Debug] output type: {type(outputs)}, len: {len(outputs) if isinstance(outputs, tuple) else 'N/A'}", flush=True)
 
-                        # Debug on first step of first run
-                        if run_idx == 0 and step == 0:
-                            print(f"      [Debug] output type: {type(outputs)}, len: {len(outputs) if isinstance(outputs, tuple) else 'N/A'}", flush=True)
+                    if isinstance(outputs, tuple) and len(outputs) >= 2:
+                        logits = outputs[0]
+                        routing = self.extractor.extract(outputs)
+                        if step == 0:
+                            print(f"      [Debug] routing layers: {len(routing) if routing else 0}", flush=True)
+                    else:
+                        logits = outputs
+                        routing = None
 
-                        if isinstance(outputs, tuple) and len(outputs) >= 2:
-                            logits = outputs[0]
-                            routing = self.extractor.extract(outputs)
-                            if run_idx == 0 and step == 0:
-                                print(f"      [Debug] routing layers: {len(routing) if routing else 0}", flush=True)
-                        else:
-                            logits = outputs
-                            routing = None
+                    # Get next token logits
+                    next_logits = logits[:, -1, :]
+                    if temperature != 1.0:
+                        next_logits = next_logits / temperature
 
-                        # Get next token logits
-                        next_logits = logits[:, -1, :]
-                        if temperature != 1.0:
-                            next_logits = next_logits / temperature
+                    # Sampling
+                    if top_k > 0:
+                        topk_vals, topk_indices = next_logits.topk(top_k, dim=-1)
+                        mask = next_logits < topk_vals[..., -1, None]
+                        next_logits[mask] = float('-inf')
+                        probs = F.softmax(next_logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                    else:
+                        next_token = next_logits.argmax(dim=-1, keepdim=True)
 
-                        # Sampling
-                        if top_k > 0:
-                            topk_vals, topk_indices = next_logits.topk(top_k, dim=-1)
-                            mask = next_logits < topk_vals[..., -1, None]
-                            next_logits[mask] = float('-inf')
-                            probs = F.softmax(next_logits, dim=-1)
-                            next_token = torch.multinomial(probs, num_samples=1)
-                        else:
-                            next_token = next_logits.argmax(dim=-1, keepdim=True)
+                    next_token_id = next_token.item()
+                    token_text = self.tokenizer.decode([next_token_id])
 
-                        next_token_id = next_token.item()
-                        token_text = self.tokenizer.decode([next_token_id])
-
-                        # Extract active neurons at this step
-                        step_neurons = set()
-                        if routing:
-                            for layer in routing:
-                                # Try mask first (v18.5+), then weights
-                                mask = layer.get_mask(pool_type)
-                                if mask is not None:
-                                    if mask.dim() == 3:
-                                        m = mask[0, -1]  # [B, S, N] → last position
-                                    else:
-                                        m = mask[0]      # [B, N]
-                                    active = m.nonzero(as_tuple=True)[0].cpu().tolist()
-                                    step_neurons.update(active)
+                    # Extract active neurons at this step
+                    step_neurons = set()
+                    if routing:
+                        for layer in routing:
+                            # Try mask first (v18.5+), then weights
+                            mask = layer.get_mask(pool_type)
+                            if mask is not None:
+                                if mask.dim() == 3:
+                                    m = mask[0, -1]  # [B, S, N] → last position
                                 else:
-                                    # Fallback to weights
-                                    weights = layer.get_weight(pool_type)
-                                    if weights is not None:
-                                        if weights.dim() == 3:
-                                            w = weights[0, -1]
-                                        else:
-                                            w = weights[0]
-                                        active = (w > 0.01).nonzero(as_tuple=True)[0].cpu().tolist()
-                                        step_neurons.update(active)
+                                    m = mask[0]      # [B, N]
+                                active = m.nonzero(as_tuple=True)[0].cpu().tolist()
+                                step_neurons.update(active)
+                            else:
+                                # Fallback to weights
+                                weights = layer.get_weight(pool_type)
+                                if weights is not None:
+                                    if weights.dim() == 3:
+                                        w = weights[0, -1]
+                                    else:
+                                        w = weights[0]
+                                    active = (w > 0.01).nonzero(as_tuple=True)[0].cpu().tolist()
+                                    step_neurons.update(active)
 
-                        run_neurons_per_step.append({
-                            'step': step,
-                            'token': token_text,
-                            'neurons': step_neurons,
-                            'is_target': False,
-                        })
+                    # Check if this token is target
+                    is_target = target_lower in token_text.strip().lower()
 
-                        # Check if target found
-                        if not found_target and target_lower in token_text.strip().lower():
-                            found_target = True
-                            target_position = step
-                            matching_runs += 1
-                            run_neurons_per_step[-1]['is_target'] = True
+                    neurons_per_step.append({
+                        'step': step,
+                        'token': token_text,
+                        'neurons': step_neurons,
+                        'is_target': is_target,
+                    })
 
-                        generated = torch.cat([generated, next_token], dim=1)
-
-                        # Stop on EOS
-                        if next_token_id == self.tokenizer.eos_token_id:
-                            break
-
-                        # Early stop: if target found, generate a few more tokens for context then stop
-                        if found_target and step >= target_position + 3:
-                            break
-
-                # Aggregate neurons: target vs baseline
-                for step_info in run_neurons_per_step:
-                    if step_info['is_target']:
-                        for n in step_info['neurons']:
+                    # Count target occurrences
+                    if is_target:
+                        target_occurrences += 1
+                        target_positions.append(step)
+                        for n in step_neurons:
                             target_neuron_counts[n] += 1
                     else:
-                        for n in step_info['neurons']:
+                        for n in step_neurons:
                             baseline_neuron_counts[n] += 1
                         total_baseline_steps += 1
 
-                # Store generation for display
-                gen_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-                if run_idx == 0:
-                    first_predicted_text = gen_text
-                    # Show first generation
-                    print(f"      First gen: \"{gen_text[:60]}...\"", flush=True)
-                if found_target and len(sample_generations) < 3:
-                    sample_generations.append({
-                        'text': gen_text,
-                        'position': target_position,
-                    })
+                    generated = torch.cat([generated, next_token], dim=1)
 
-                # Progress update every 10 runs
-                if (run_idx + 1) % 10 == 0 or run_idx == n_runs - 1:
-                    match_pct = matching_runs / (run_idx + 1) * 100
-                    status = f"✓{matching_runs}" if matching_runs > 0 else "✗"
-                    print(f"      Run {run_idx+1:3d}/{n_runs}: {status} ({match_pct:.0f}% match)", flush=True)
+                    # Stop on EOS
+                    if next_token_id == self.tokenizer.eos_token_id:
+                        break
+
+                    # Progress update every 25 steps
+                    if (step + 1) % 25 == 0:
+                        print(f"      Step {step+1}/{max_new_tokens}: {target_occurrences} target occurrences", flush=True)
+
+            # Store generation
+            generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+            print(f"      Generated: \"{generated_text[:80]}...\"", flush=True)
 
             # Final summary for this prompt
-            match_pct = matching_runs / n_runs * 100
             n_unique = len(target_neuron_counts)
             print(f"      ─────────────────────────────────────────────────────", flush=True)
-            print(f"      Done: {matching_runs}/{n_runs} found ({match_pct:.0f}%), {n_unique} unique neurons", flush=True)
+            print(f"      Done: {target_occurrences} target occurrences, {n_unique} unique neurons", flush=True)
 
             # Compute contrastive scores
             # Score = (freq in target) - (freq in baseline)
             # High score = neuron is more active for target than average
             contrastive_scores = {}
-            if matching_runs > 0 and total_baseline_steps > 0:
+            if target_occurrences > 0 and total_baseline_steps > 0:
                 for neuron in set(target_neuron_counts.keys()) | set(baseline_neuron_counts.keys()):
-                    target_freq = target_neuron_counts[neuron] / matching_runs
+                    target_freq = target_neuron_counts[neuron] / target_occurrences
                     baseline_freq = baseline_neuron_counts[neuron] / total_baseline_steps
                     contrastive_scores[neuron] = target_freq - baseline_freq
 
@@ -731,17 +707,17 @@ class BehavioralAnalyzer(BaseAnalyzer):
             base_result = {
                 'prompt': prompt,
                 'target_token': target,
-                'matching_runs': matching_runs,
-                'total_runs': n_runs,
-                'match_rate': matching_runs / n_runs,
+                'target_occurrences': target_occurrences,
+                'target_positions': target_positions,
+                'total_steps': len(neurons_per_step),
+                'match_rate': target_occurrences / len(neurons_per_step) if neurons_per_step else 0,
                 'total_baseline_steps': total_baseline_steps,
-                'first_generation': first_predicted_text,
-                'sample_successful_generations': sample_generations,
+                'generated_text': generated_text,
             }
 
-            if matching_runs > 0:
+            if target_occurrences > 0:
                 # Neurons consistently active for target (>80% of target occurrences)
-                target_freq = {n: c / matching_runs for n, c in target_neuron_counts.items()}
+                target_freq = {n: c / target_occurrences for n, c in target_neuron_counts.items()}
                 common_neurons_100 = [n for n, f in target_freq.items() if f >= 1.0]
                 common_neurons_80 = [n for n, f in target_freq.items() if f >= 0.8]
                 common_neurons_50 = [n for n, f in target_freq.items() if f >= 0.5]
@@ -761,7 +737,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
 
                 # Build neuron frequencies list (sorted by count)
                 neuron_frequencies = [
-                    {'neuron': n, 'count': c, 'percentage': c / matching_runs * 100}
+                    {'neuron': n, 'count': c, 'percentage': c / target_occurrences * 100}
                     for n, c in sorted(target_neuron_counts.items(), key=lambda x: -x[1])
                 ]
 
@@ -783,7 +759,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     ],
                 })
             else:
-                base_result['note'] = f'Target "{target}" not found in {n_runs} generations (max {max_new_tokens} tokens each)'
+                base_result['note'] = f'Target "{target}" not found in {max_new_tokens} tokens generation'
 
             results['per_target'][target] = base_result
 

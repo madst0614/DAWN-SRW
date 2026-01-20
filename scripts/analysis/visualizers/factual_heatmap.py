@@ -241,9 +241,9 @@ def plot_factual_heatmap(
                    transform=ax.transAxes)
         prev_boundary = b
 
-    # Title - above category labels (closer)
+    # Title - above category labels
     ax.set_title('Factual Knowledge Neurons: Related outputs share neuron subsets',
-                fontsize=11, fontweight='bold', pad=10, y=1.04)
+                fontsize=11, fontweight='bold', pad=20, y=1.06)
 
     ax.set_xlabel('Neuron Index (grouped by semantic category)')
     ax.set_ylabel('Target Token')
