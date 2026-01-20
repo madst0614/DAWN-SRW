@@ -1300,9 +1300,9 @@ class ModelAnalyzer:
         results = analyzer.analyze_factual_neurons(
             prompts, targets,
             pool_type=pool_type,
-            max_new_tokens=max_tokens,
-            temperature=1.0,  # Sampling for diverse exploration
-            top_k=50,         # Top-k sampling
+            min_target_count=max_tokens,  # Use as min target count
+            temperature=1.0,
+            top_k=50,
         )
 
         # Print detailed summary
@@ -1312,15 +1312,15 @@ class ModelAnalyzer:
                 if not isinstance(data, dict):
                     continue
 
-                occurrences = data.get('target_occurrences', 0)
-                total_steps = data.get('total_steps', max_tokens)
+                successful = data.get('successful_runs', 0)
+                total_runs = data.get('total_runs', 0)
                 match_rate = data.get('match_rate', 0) * 100
 
                 print(f"\n  {'='*70}")
-                print(f"  RESULTS: '{target}' appeared {occurrences} times in {total_steps} tokens ({match_rate:.1f}%)")
+                print(f"  RESULTS: '{target}' found {successful}/{total_runs} runs ({match_rate:.1f}%)")
                 print(f"  {'='*70}")
 
-                if matching > 0:
+                if successful > 0:
                     # Common neurons at different thresholds
                     n100 = data.get('common_neurons_100', [])
                     n80 = data.get('common_neurons_80', [])

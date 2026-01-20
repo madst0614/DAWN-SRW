@@ -509,13 +509,13 @@ class PaperFigureGenerator:
             temperature = config.get('temperature', 1.0)
             top_k = config.get('top_k', 50)
 
-            # Long generation approach: generate more tokens to capture target occurrences
-            long_gen_tokens = max(100, gen_tokens * n_batches // 2)
-            print(f"  Analyzing factual neurons (pool={pool_type}, gen_tokens={long_gen_tokens})...", flush=True)
+            # Independent runs until target appears min_target_count times
+            min_targets = max(50, n_batches * 5)
+            print(f"  Analyzing factual neurons (pool={pool_type}, min_targets={min_targets})...", flush=True)
             factual_data = self.behavioral.analyze_factual_neurons(
                 prompts, targets,
                 pool_type=pool_type,
-                max_new_tokens=long_gen_tokens,
+                min_target_count=min_targets,
                 temperature=temperature,
                 top_k=top_k
             )
