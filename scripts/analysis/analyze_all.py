@@ -72,7 +72,7 @@ CLI Arguments:
         --n_batches       Batches for routing/semantic/behavioral/coselection (default: 100)
         --val_batches     Batches for validation performance (default: 200)
         --max_sentences   Max sentences for POS analysis (default: 2000)
-        --factual_tokens  Max tokens for factual analysis (default: 100)
+        --min_targets     Min target occurrences for factual analysis (default: 100)
         --batch_size      Dataloader batch size (default: 16)
         --max_samples     Max samples for dataloader (default: 5000)
         --n_clusters      Clusters for embedding analysis (default: 5)
@@ -124,7 +124,7 @@ class ModelAnalyzer:
         n_batches: int = 100,
         val_batches: int = 200,
         max_sentences: int = 2000,
-        factual_tokens: int = 100,
+        min_targets: int = 100,
         batch_size: int = 16,
         max_samples: int = 5000,
         n_clusters: int = 5,
@@ -143,7 +143,7 @@ class ModelAnalyzer:
         self.n_batches = n_batches
         self.val_batches = val_batches
         self.max_sentences = max_sentences
-        self.factual_tokens = factual_tokens
+        self.min_targets = min_targets
         self.batch_size = batch_size
         self.max_samples = max_samples
         self.n_clusters = n_clusters
@@ -1253,27 +1253,27 @@ class ModelAnalyzer:
         self.results['layerwise_semantic'] = results
         return results
 
-    def analyze_factual(self, max_tokens: int = 100, pool_type: str = 'fv') -> Dict:
+    def analyze_factual(self, min_target_count: int = 100, pool_type: str = 'fv') -> Dict:
         """Analyze factual knowledge neurons (DAWN only).
 
         Finds neurons that consistently activate for factual knowledge
         (e.g., "The capital of France is" -> Paris).
 
-        Uses long generation approach: generates many tokens in a single run
-        and records neurons each time the target token appears.
+        Independent runs approach: each run generates until target appears,
+        records neurons, then starts fresh. Repeats until min_target_count.
 
         Args:
-            max_tokens: Maximum tokens to generate per prompt (default: 100)
+            min_target_count: Minimum target occurrences to collect (default: 100)
                 - 50: Quick test
                 - 100: Standard analysis
-                - 200+: More target occurrences
+                - 200+: High confidence
             pool_type: Which neuron pool to analyze
                 - 'fv': Feature V pool (default, recommended)
                 - 'rv': Restore V pool
                 - 'fqk', 'fqk_q', 'fqk_k': Feature QK pools
 
         Returns:
-            Dict with per-target neuron activations, common neurons, occurrence rates
+            Dict with per-target neuron activations, common neurons, match rates
         """
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
@@ -1284,7 +1284,7 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'factual'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"  Analyzing factual neurons ({max_tokens} tokens, pool={pool_type})...")
+        print(f"  Analyzing factual neurons (min_targets={min_target_count}, pool={pool_type})...")
         analyzer = BehavioralAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
         )
@@ -1300,7 +1300,7 @@ class ModelAnalyzer:
         results = analyzer.analyze_factual_neurons(
             prompts, targets,
             pool_type=pool_type,
-            min_target_count=max_tokens,  # Use as min target count
+            min_target_count=min_target_count,
             temperature=1.0,
             top_k=50,
         )
@@ -1696,7 +1696,7 @@ class ModelAnalyzer:
             config['checkpoint_paths'] = checkpoint_paths
 
             # Generate figures 3,4,5,6,7 (6 = training dynamics)
-            gen.generate('3,4,5,6,7', str(figures_dir), n_batches=self.factual_tokens // 10,
+            gen.generate('3,4,5,6,7', str(figures_dir), n_batches=self.min_targets // 10,
                         precomputed=precomputed, config=config)
         except Exception as e:
             print(f"    Warning: Could not generate paper figures: {e}")
@@ -2208,7 +2208,7 @@ class ModelAnalyzer:
             ('token_combination', self.analyze_token_combination, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('neuron_features', self.analyze_neuron_features, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('layerwise_semantic', self.analyze_layerwise_semantic, {'max_sentences': self.max_sentences // 4}),
-            ('factual', self.analyze_factual, {'max_tokens': self.gen_tokens * 3, 'pool_type': self.pool_type}),
+            ('factual', self.analyze_factual, {'min_target_count': self.min_targets, 'pool_type': self.pool_type}),
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
             ('weight', self.analyze_weight, {}),
@@ -2222,7 +2222,7 @@ class ModelAnalyzer:
                 ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
                 ('health', self.analyze_health, {}),
                 ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
-                ('factual', self.analyze_factual, {'max_tokens': 100, 'pool_type': self.pool_type}),
+                ('factual', self.analyze_factual, {'min_target_count': 100, 'pool_type': self.pool_type}),
             ]
 
         if only:
@@ -2239,7 +2239,7 @@ class ModelAnalyzer:
                 ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
                 ('health', self.analyze_health, {}),
                 ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
-                ('factual', self.analyze_factual, {'max_tokens': 100, 'pool_type': self.pool_type}),
+                ('factual', self.analyze_factual, {'min_target_count': 100, 'pool_type': self.pool_type}),
             ]
 
             # Find missing analyses
@@ -2388,7 +2388,7 @@ class MultiModelAnalyzer:
         n_batches: int = 100,
         val_batches: int = 200,
         max_sentences: int = 2000,
-        factual_tokens: int = 100,
+        min_targets: int = 100,
         batch_size: int = 16,
         max_samples: int = 5000,
         n_clusters: int = 5,
@@ -2405,7 +2405,7 @@ class MultiModelAnalyzer:
         self.n_batches = n_batches
         self.val_batches = val_batches
         self.max_sentences = max_sentences
-        self.factual_tokens = factual_tokens
+        self.min_targets = min_targets
         self.batch_size = batch_size
         self.max_samples = max_samples
         self.n_clusters = n_clusters
@@ -2440,7 +2440,7 @@ class MultiModelAnalyzer:
                 n_batches=self.n_batches,
                 val_batches=self.val_batches,
                 max_sentences=self.max_sentences,
-                factual_tokens=self.factual_tokens,
+                min_targets=self.min_targets,
                 batch_size=self.batch_size,
                 max_samples=self.max_samples,
                 n_clusters=self.n_clusters,
@@ -2746,7 +2746,7 @@ Examples:
     parser.add_argument('--n_batches', type=int, default=100, help='Number of batches for routing/semantic/behavioral/coselection (default: 100)')
     parser.add_argument('--val_batches', type=int, default=200, help='Number of batches for validation performance (default: 200)')
     parser.add_argument('--max_sentences', type=int, default=2000, help='Max sentences for POS analysis (default: 2000)')
-    parser.add_argument('--factual_tokens', type=int, default=100, help='Max tokens for factual analysis (default: 100)')
+    parser.add_argument('--min_targets', type=int, default=100, help='Max tokens for factual analysis (default: 100)')
     parser.add_argument('--batch_size', type=int, default=16, help='Dataloader batch size (default: 16)')
     parser.add_argument('--max_samples', type=int, default=5000, help='Max samples for dataloader (default: 5000)')
     parser.add_argument('--n_clusters', type=int, default=5, help='Number of clusters for embedding analysis (default: 5)')
@@ -2765,7 +2765,7 @@ Examples:
     print(f"n_batches: {args.n_batches}")
     print(f"val_batches: {args.val_batches}")
     print(f"max_sentences: {args.max_sentences}")
-    print(f"factual_tokens: {args.factual_tokens}")
+    print(f"min_targets: {args.min_targets}")
     print(f"max_samples: {args.max_samples}")
     print(f"n_clusters: {args.n_clusters}")
     print(f"pool_type: {args.pool_type}")
@@ -2794,7 +2794,7 @@ Examples:
             n_batches=args.n_batches,
             val_batches=args.val_batches,
             max_sentences=args.max_sentences,
-            factual_tokens=args.factual_tokens,
+            min_targets=args.min_targets,
             batch_size=args.batch_size,
             max_samples=args.max_samples,
             n_clusters=args.n_clusters,
@@ -2811,7 +2811,7 @@ Examples:
             n_batches=args.n_batches,
             val_batches=args.val_batches,
             max_sentences=args.max_sentences,
-            factual_tokens=args.factual_tokens,
+            min_targets=args.min_targets,
             batch_size=args.batch_size,
             max_samples=args.max_samples,
             n_clusters=args.n_clusters,
