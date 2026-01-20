@@ -2038,10 +2038,31 @@ class ModelAnalyzer:
         if only:
             analyses = [(n, f, a) for n, f, a in analyses if n in only]
 
-        # If --only paper, load existing results from files first
+        # If --only paper, check existing results and run missing analyses
         if only and 'paper' in only and not analyses:
-            print("\n[Loading existing analysis results...]")
+            print("\n[Checking existing analysis results...]")
             self._load_existing_results()
+
+            # Define required analyses for paper generation
+            required_for_paper = [
+                ('model_info', self.analyze_model_info, {}),
+                ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
+                ('health', self.analyze_health, {}),
+                ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
+                ('factual', self.analyze_factual, {'n_runs': max(5, self.n_runs // 2), 'pool_type': self.pool_type}),
+            ]
+
+            # Find missing analyses
+            missing = []
+            for name, func, kwargs in required_for_paper:
+                if name not in self.results or not self.results[name]:
+                    missing.append((name, func, kwargs))
+
+            if missing:
+                print(f"\n[Running {len(missing)} missing analyses for paper...]")
+                analyses = missing
+            else:
+                print(f"  All required results found.")
 
         total_analyses = len(analyses)
         for i, (name, func, kwargs) in enumerate(analyses, 1):
