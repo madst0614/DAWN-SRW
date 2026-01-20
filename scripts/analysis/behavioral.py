@@ -751,7 +751,9 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     'neuron_frequencies': neuron_frequencies,
                     'contrastive_scores': contrastive_scores,  # Full dict for filtering
                     'contrastive_top50': sorted(
-                        [{'neuron': n, 'score': s, 'target_freq': target_freq.get(n, 0) * 100}
+                        [{'neuron': n, 'score': s,
+                          'target_freq': target_freq.get(n, 0) * 100,
+                          'baseline_freq': (baseline_neuron_counts[n] / total_baseline_steps * 100) if total_baseline_steps > 0 else 0}
                          for n, s in contrastive_scores.items()],
                         key=lambda x: -x['score']
                     )[:50],
