@@ -1335,7 +1335,7 @@ class ModelAnalyzer:
                         print(f"\n  Top 15 neurons by frequency:")
                         for nf in neuron_freqs:
                             bar = '█' * int(nf['percentage'] / 5)
-                            print(f"    Neuron {nf['neuron']:4d}: {nf['count']:3d}/{matching} ({nf['percentage']:5.1f}%) {bar}")
+                            print(f"    Neuron {nf['neuron']:4d}: {nf['count']:3d}/{successful} ({nf['percentage']:5.1f}%) {bar}")
 
                     # Sample generations
                     samples = data.get('sample_successful_generations', [])[:3]
