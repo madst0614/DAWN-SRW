@@ -62,8 +62,9 @@ def plot_factual_heatmap(
 
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
-    # Collect neuron frequencies for each target
+    # Collect neuron frequencies and contrastive scores for each target
     all_neurons = defaultdict(lambda: defaultdict(float))
+    all_contrastive = defaultdict(lambda: defaultdict(float))  # contrastive scores
     common_neurons_per_target = {}
 
     for target, data in per_target.items():
@@ -71,6 +72,10 @@ def plot_factual_heatmap(
             continue
         # Get common neurons (80%+ threshold)
         common_neurons_per_target[target] = set(data.get('common_neurons_80', []))
+        # Get contrastive scores (target_freq - baseline_freq)
+        contrastive_scores = data.get('contrastive_scores', {})
+        for neuron, score in contrastive_scores.items():
+            all_contrastive[target][neuron] = score
         # Get all frequencies
         for nf in data.get('neuron_frequencies', []):
             if isinstance(nf, dict):
@@ -95,15 +100,27 @@ def plot_factual_heatmap(
         capital_targets = targets
         other_targets = []
 
-    # Collect all neuron IDs with meaningful activity (freq > 0.1)
+    # Collect neuron IDs with:
+    # 1. Meaningful activity (freq > 0.1)
+    # 2. Target-specific activation (contrastive_score > 0.3)
     all_neuron_ids = set()
     for t in targets:
         for n, freq in all_neurons[t].items():
-            if freq > 0.1:  # Filter out very low frequency neurons
+            contrastive = all_contrastive[t].get(n, 0)
+            # Only include neurons that fire MORE for target than baseline
+            if freq > 0.1 and contrastive > 0.3:
                 all_neuron_ids.add(n)
 
     if not all_neuron_ids:
-        # Fallback: use common neurons
+        # Fallback: relax contrastive threshold
+        for t in targets:
+            for n, freq in all_neurons[t].items():
+                contrastive = all_contrastive[t].get(n, 0)
+                if freq > 0.1 and contrastive > 0.1:
+                    all_neuron_ids.add(n)
+
+    if not all_neuron_ids:
+        # Final fallback: use common neurons
         for neurons in common_neurons_per_target.values():
             all_neuron_ids.update(neurons)
 
@@ -146,14 +163,20 @@ def plot_factual_heatmap(
         # Higher variance = more selective
         return float(np.std(freqs))
 
+    def get_max_contrastive(neuron):
+        """Get max contrastive score across all targets."""
+        scores = [all_contrastive[t].get(neuron, 0) for t in targets]
+        return max(scores) if scores else 0
+
     # Categorize and score all neurons
     categorized = {0: [], 1: [], 2: [], 3: []}
     for neuron in all_neuron_ids:
         cat = get_neuron_category(neuron)
         selectivity = get_selectivity_score(neuron)
         mean_freq = np.mean([all_neurons[t].get(neuron, 0) for t in targets])
-        # Score: combination of mean activity and selectivity
-        score = mean_freq + selectivity * 2  # Weight selectivity higher
+        contrastive = get_max_contrastive(neuron)
+        # Score: combine frequency, selectivity, and contrastive (target-specific)
+        score = mean_freq + selectivity * 2 + contrastive * 3  # Weight contrastive highest
         categorized[cat].append((neuron, score))
 
     # Sort within each category by score (descending)

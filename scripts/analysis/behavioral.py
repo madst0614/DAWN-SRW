@@ -700,6 +700,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     'common_neurons_50': sorted(common_neurons_50),
                     'total_unique_neurons': len(target_neuron_counts),
                     'neuron_frequencies': neuron_frequencies,
+                    'contrastive_scores': contrastive_scores,  # Full dict for filtering
                     'contrastive_top50': sorted(
                         [{'neuron': n, 'score': s, 'target_freq': target_freq.get(n, 0) * 100}
                          for n, s in contrastive_scores.items()],
