@@ -131,11 +131,13 @@ class ModelAnalyzer:
         pool_type: str = 'fv',
         gen_tokens: int = 50,
         target_layer: int = None,
+        compare_checkpoint: str = None,
     ):
         self.checkpoint_path = checkpoint_path
         self.val_data_path = val_data_path
         self.output_dir = Path(output_dir)
         self.device = device
+        self.compare_checkpoint = compare_checkpoint
 
         # Analysis parameters
         self.n_batches = n_batches
@@ -1666,7 +1668,14 @@ class ModelAnalyzer:
                 'target_layer': self.target_layer,
             }
 
-            gen.generate('3,4,5,7', str(figures_dir), n_batches=self.n_runs,
+            # Add checkpoint paths for figure 6 (training dynamics comparison)
+            checkpoint_paths = [self.checkpoint_path]
+            if self.compare_checkpoint:
+                checkpoint_paths.append(self.compare_checkpoint)
+            config['checkpoint_paths'] = checkpoint_paths
+
+            # Generate figures 3,4,5,6,7 (6 = training dynamics)
+            gen.generate('3,4,5,6,7', str(figures_dir), n_batches=self.n_runs,
                         precomputed=precomputed, config=config)
         except Exception as e:
             print(f"    Warning: Could not generate paper figures: {e}")
@@ -2346,6 +2355,7 @@ Examples:
     # Input/output
     parser.add_argument('--checkpoint', type=str, help='Single checkpoint path')
     parser.add_argument('--checkpoints', type=str, nargs='+', help='Multiple checkpoint paths')
+    parser.add_argument('--compare_checkpoint', type=str, help='Comparison checkpoint for training dynamics (e.g., vanilla baseline)')
     parser.add_argument('--val_data', type=str, required=True, help='Validation data path')
     parser.add_argument('--output', type=str, default='analysis_results', help='Output directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
@@ -2413,6 +2423,7 @@ Examples:
             pool_type=args.pool_type,
             gen_tokens=args.gen_tokens,
             target_layer=args.target_layer,
+            compare_checkpoint=args.compare_checkpoint,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
     else:

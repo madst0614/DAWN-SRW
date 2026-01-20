@@ -534,7 +534,8 @@ class PaperFigureGenerator:
         Config options:
             training_logs: List of paths to training log files
             training_labels: Labels for each model (e.g., ["DAWN-24M", "Vanilla-22M"])
-            checkpoint_path: Path to checkpoint (will auto-find training_log.txt)
+            checkpoint_paths: List of checkpoint paths (will auto-find training_log.txt for each)
+            checkpoint_path: Single checkpoint path (fallback)
         """
         from .visualizers import (
             plot_training_dynamics, plot_training_from_logs,
@@ -565,7 +566,34 @@ class PaperFigureGenerator:
                 else:
                     print(f"    Warning: Log file not found: {log_path}")
 
-        # Method 2: Auto-find from self.checkpoint_path (same as model checkpoint)
+        # Method 2: Multiple checkpoint paths from config
+        if not data:
+            checkpoint_paths = config.get('checkpoint_paths', [])
+            checkpoint_labels = config.get('checkpoint_labels', [])
+
+            for i, ckpt_path in enumerate(checkpoint_paths):
+                log_path = find_training_log(ckpt_path)
+                if log_path:
+                    steps, losses, meta = parse_training_log(log_path, use_val_loss=True)
+                    if steps:
+                        # Auto-generate label from path
+                        if i < len(checkpoint_labels):
+                            label = checkpoint_labels[i]
+                        else:
+                            from pathlib import Path
+                            p = Path(ckpt_path)
+                            # Extract model name from path (e.g., "v17.1" or "baseline")
+                            name = p.name if p.is_file() else p.name
+                            if 'v17' in name.lower() or 'v18' in name.lower() or 'dawn' in name.lower():
+                                label = 'DAWN'
+                            elif 'baseline' in name.lower() or 'vanilla' in name.lower():
+                                label = 'Vanilla'
+                            else:
+                                label = name[:20]  # Truncate long names
+                        data[label] = (steps, losses)
+                        print(f"    Loaded {label}: {meta['n_points']} points from {log_path}")
+
+        # Method 3: Auto-find from self.checkpoint_path (same as model checkpoint)
         if not data:
             log_path = find_training_log(self.checkpoint_path)
             if log_path:
@@ -573,17 +601,6 @@ class PaperFigureGenerator:
                 if steps:
                     data['DAWN'] = (steps, losses)
                     print(f"    Loaded DAWN: {meta['n_points']} points from {log_path}")
-
-        # Method 3: Try config's checkpoint_path if different
-        if not data:
-            checkpoint_path = config.get('checkpoint_path')
-            if checkpoint_path and checkpoint_path != self.checkpoint_path:
-                log_path = find_training_log(checkpoint_path)
-                if log_path:
-                    steps, losses, meta = parse_training_log(log_path, use_val_loss=True)
-                    if steps:
-                        data['DAWN'] = (steps, losses)
-                        print(f"    Loaded DAWN: {meta['n_points']} points from {log_path}")
 
         # No demo data - report that no logs were found
         if not data:
