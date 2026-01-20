@@ -1690,37 +1690,107 @@ class ModelAnalyzer:
         self._generate_paper_summary(paper_dir)
 
     def _generate_tables(self, tables_dir: Path):
-        """Generate LaTeX and CSV tables."""
+        """Generate LaTeX and CSV tables with optional vanilla comparison."""
+        # Try to get model_info from results, fallback to saved JSON
         model_info = self.results.get('model_info', {})
+        if not model_info:
+            params_file = self.output_dir / 'model_info' / 'parameters.json'
+            if params_file.exists():
+                with open(params_file) as f:
+                    model_info = json.load(f)
+
         perf = self.results.get('performance', {})
+        if not perf:
+            # Load from individual files
+            val_file = self.output_dir / 'performance' / 'validation.json'
+            speed_file = self.output_dir / 'performance' / 'speed_benchmark.json'
+            if val_file.exists():
+                with open(val_file) as f:
+                    perf['validation'] = json.load(f)
+            if speed_file.exists():
+                with open(speed_file) as f:
+                    perf['speed'] = json.load(f)
+
         val = perf.get('validation', {})
         speed = perf.get('speed', {})
 
+        # Load comparison model data if available
+        vanilla_info = {}
+        vanilla_val = {}
+        vanilla_speed = {}
+        if self.compare_checkpoint:
+            comp_path = Path(self.compare_checkpoint)
+            # Try to find analysis results for comparison checkpoint
+            comp_dirs = [
+                comp_path.parent / 'analysis',
+                comp_path / 'analysis',
+                self.output_dir.parent / comp_path.stem / 'analysis' if comp_path.is_file() else None,
+                self.output_dir.parent / comp_path.name if comp_path.is_dir() else None,
+            ]
+            for comp_dir in comp_dirs:
+                if comp_dir and comp_dir.exists():
+                    comp_params = comp_dir / 'model_info' / 'parameters.json'
+                    comp_val_file = comp_dir / 'performance' / 'validation.json'
+                    comp_speed_file = comp_dir / 'performance' / 'speed_benchmark.json'
+                    if comp_params.exists():
+                        with open(comp_params) as f:
+                            vanilla_info = json.load(f)
+                    if comp_val_file.exists():
+                        with open(comp_val_file) as f:
+                            vanilla_val = json.load(f)
+                    if comp_speed_file.exists():
+                        with open(comp_speed_file) as f:
+                            vanilla_speed = json.load(f)
+                    if vanilla_info or vanilla_val:
+                        break
+
+        has_comparison = bool(vanilla_info or vanilla_val)
+
         # Model stats CSV
         with open(tables_dir / 'model_stats.csv', 'w') as f:
-            f.write("metric,value\n")
-            f.write(f"parameters,{model_info.get('total', 0)}\n")
-            f.write(f"parameters_M,{model_info.get('total_M', 0):.2f}\n")
-            f.write(f"flops,{model_info.get('flops', 0)}\n")
-            f.write(f"flops_G,{model_info.get('flops_G', 0):.2f}\n")
-            f.write(f"ppl,{val.get('perplexity', 0):.2f}\n")
-            f.write(f"accuracy,{val.get('accuracy', 0):.2f}\n")
-            f.write(f"tokens_per_sec,{speed.get('tokens_per_sec', 0):.0f}\n")
+            if has_comparison:
+                f.write("metric,dawn,vanilla\n")
+                f.write(f"parameters_M,{model_info.get('total_M', 0):.2f},{vanilla_info.get('total_M', 0):.2f}\n")
+                f.write(f"flops_G,{model_info.get('flops_G', 0):.2f},{vanilla_info.get('flops_G', 0):.2f}\n")
+                f.write(f"ppl,{val.get('perplexity', 0):.2f},{vanilla_val.get('perplexity', 0):.2f}\n")
+                f.write(f"accuracy,{val.get('accuracy', 0):.2f},{vanilla_val.get('accuracy', 0):.2f}\n")
+                f.write(f"tokens_per_sec,{speed.get('tokens_per_sec', 0):.0f},{vanilla_speed.get('tokens_per_sec', 0):.0f}\n")
+            else:
+                f.write("metric,value\n")
+                f.write(f"parameters,{model_info.get('total', 0)}\n")
+                f.write(f"parameters_M,{model_info.get('total_M', 0):.2f}\n")
+                f.write(f"flops,{model_info.get('flops', 0)}\n")
+                f.write(f"flops_G,{model_info.get('flops_G', 0):.2f}\n")
+                f.write(f"ppl,{val.get('perplexity', 0):.2f}\n")
+                f.write(f"accuracy,{val.get('accuracy', 0):.2f}\n")
+                f.write(f"tokens_per_sec,{speed.get('tokens_per_sec', 0):.0f}\n")
 
-        # Model stats LaTeX
+        # Model stats LaTeX - comparison table if vanilla available
         with open(tables_dir / 'model_stats.tex', 'w') as f:
             f.write("\\begin{table}[h]\n")
             f.write("\\centering\n")
-            f.write("\\caption{Model Statistics}\n")
-            f.write("\\begin{tabular}{lr}\n")
-            f.write("\\toprule\n")
-            f.write("Metric & Value \\\\\n")
-            f.write("\\midrule\n")
-            f.write(f"Parameters & {model_info.get('total_M', 0):.2f}M \\\\\n")
-            f.write(f"FLOPs & {model_info.get('flops_G', 0):.2f}G \\\\\n")
-            f.write(f"Perplexity & {val.get('perplexity', 0):.2f} \\\\\n")
-            f.write(f"Accuracy & {val.get('accuracy', 0):.1f}\\% \\\\\n")
-            f.write(f"Speed & {speed.get('tokens_per_sec', 0)/1000:.1f}K tok/s \\\\\n")
+            if has_comparison:
+                f.write("\\caption{Model Comparison: DAWN vs Vanilla}\n")
+                f.write("\\begin{tabular}{lrr}\n")
+                f.write("\\toprule\n")
+                f.write("Metric & DAWN & Vanilla \\\\\n")
+                f.write("\\midrule\n")
+                f.write(f"Parameters & {model_info.get('total_M', 0):.2f}M & {vanilla_info.get('total_M', 0):.2f}M \\\\\n")
+                f.write(f"FLOPs & {model_info.get('flops_G', 0):.2f}G & {vanilla_info.get('flops_G', 0):.2f}G \\\\\n")
+                f.write(f"Perplexity & {val.get('perplexity', 0):.2f} & {vanilla_val.get('perplexity', 0):.2f} \\\\\n")
+                f.write(f"Accuracy & {val.get('accuracy', 0):.1f}\\% & {vanilla_val.get('accuracy', 0):.1f}\\% \\\\\n")
+                f.write(f"Speed & {speed.get('tokens_per_sec', 0)/1000:.1f}K & {vanilla_speed.get('tokens_per_sec', 0)/1000:.1f}K tok/s \\\\\n")
+            else:
+                f.write("\\caption{Model Statistics}\n")
+                f.write("\\begin{tabular}{lr}\n")
+                f.write("\\toprule\n")
+                f.write("Metric & Value \\\\\n")
+                f.write("\\midrule\n")
+                f.write(f"Parameters & {model_info.get('total_M', 0):.2f}M \\\\\n")
+                f.write(f"FLOPs & {model_info.get('flops_G', 0):.2f}G \\\\\n")
+                f.write(f"Perplexity & {val.get('perplexity', 0):.2f} \\\\\n")
+                f.write(f"Accuracy & {val.get('accuracy', 0):.1f}\\% \\\\\n")
+                f.write(f"Speed & {speed.get('tokens_per_sec', 0)/1000:.1f}K tok/s \\\\\n")
             f.write("\\bottomrule\n")
             f.write("\\end{tabular}\n")
             f.write("\\end{table}\n")
@@ -1755,8 +1825,25 @@ class ModelAnalyzer:
 
     def _generate_paper_summary(self, paper_dir: Path):
         """Generate paper summary markdown."""
+        # Try to load from saved files if results are empty
         model_info = self.results.get('model_info', {})
+        if not model_info:
+            params_file = self.output_dir / 'model_info' / 'parameters.json'
+            if params_file.exists():
+                with open(params_file) as f:
+                    model_info = json.load(f)
+
         perf = self.results.get('performance', {})
+        if not perf:
+            val_file = self.output_dir / 'performance' / 'validation.json'
+            speed_file = self.output_dir / 'performance' / 'speed_benchmark.json'
+            if val_file.exists():
+                with open(val_file) as f:
+                    perf['validation'] = json.load(f)
+            if speed_file.exists():
+                with open(speed_file) as f:
+                    perf['speed'] = json.load(f)
+
         val = perf.get('validation', {})
         health = self.results.get('health', {})
 
