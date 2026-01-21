@@ -2366,6 +2366,9 @@ class ModelAnalyzer:
         if self.compare_checkpoint:
             vanilla_info, vanilla_val, vanilla_speed = {}, {}, {}
             comp_path = Path(self.compare_checkpoint)
+            found_results = False
+
+            # Try to load from pre-existing analysis results
             comp_dirs = [
                 comp_path.parent / 'analysis',
                 comp_path / 'analysis',
@@ -2386,7 +2389,16 @@ class ModelAnalyzer:
                         with open(comp_speed_file) as f:
                             vanilla_speed = json.load(f)
                     if vanilla_info or vanilla_val:
+                        found_results = True
                         break
+
+            # Fallback: run quick analysis on vanilla model
+            if not found_results:
+                print("    Running quick analysis on comparison model...")
+                try:
+                    vanilla_info, vanilla_val, vanilla_speed = self._analyze_comparison_model()
+                except Exception as e:
+                    print(f"    Warning: Could not analyze comparison model: {e}")
 
             vanilla_stats = {
                 'parameters_M': round(vanilla_info.get('total_M', 0), 2),
