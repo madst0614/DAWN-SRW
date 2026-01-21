@@ -2054,7 +2054,10 @@ class ModelAnalyzer:
         try:
             # Handle directory paths (find actual checkpoint file)
             path = Path(checkpoint_path)
+            checkpoint_dir = None
+
             if path.is_dir():
+                checkpoint_dir = path
                 pt_files = list(path.glob('*.pt'))
                 found = False
                 for f in pt_files:
@@ -2067,11 +2070,23 @@ class ModelAnalyzer:
                     checkpoint_path = str(sorted(pt_files, key=lambda x: x.stat().st_mtime)[-1])
                 elif not found:
                     raise FileNotFoundError(f"No .pt files found in {path}")
+            else:
+                checkpoint_dir = path.parent
+
+            # Try to load config.json first (saved separately by train.py)
+            config_json_path = checkpoint_dir / 'config.json'
+            json_config = {}
+            if config_json_path.exists():
+                with open(config_json_path, 'r') as f:
+                    json_config = json.load(f)
+                    print(f"      Loaded config.json from {checkpoint_dir.name}")
 
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-            # Model config
-            model_config = checkpoint.get('model_config', checkpoint.get('config', {}))
+            # Model config: prefer config.json > checkpoint['config'] > checkpoint['model_config']
+            model_config = json_config.get('model', {})
+            if not model_config:
+                model_config = checkpoint.get('config', checkpoint.get('model_config', {}))
             config_data['model'] = {
                 'd_model': model_config.get('d_model', model_config.get('hidden_size', 0)),
                 'n_layers': model_config.get('n_layers', model_config.get('num_hidden_layers', 0)),
@@ -2103,8 +2118,10 @@ class ModelAnalyzer:
                 config_data['model']['total_params'] = total_params
                 config_data['model']['total_params_M'] = round(total_params / 1e6, 2)
 
-            # Training config
-            training_config = checkpoint.get('training_config', checkpoint.get('train_config', {}))
+            # Training config: prefer config.json > checkpoint
+            training_config = json_config.get('training', {})
+            if not training_config:
+                training_config = checkpoint.get('training_config', checkpoint.get('train_config', {}))
             if not training_config:
                 # Try to extract from top-level keys
                 training_config = {
