@@ -100,11 +100,35 @@ inactive = (~active).sum()
 | Weight 소스 | ✅ | `fqk_weights_Q` 사용 (top-k 후, softmax 전 logits 아님) |
 | 집계 범위 | ✅ | 모든 레이어/배치 합산 |
 | Correlation 계산 | ✅ | `np.corrcoef()` 정확 |
+| Specialization | ✅ | ratio 기반으로 수정 완료 (commit e4e1246) |
 
-#### 수정 필요 ⚠️
-| 항목 | 현재 | 권장 |
-|------|------|------|
-| Specialization threshold | `mean * 0.1` (arbitrary) | `q_ratio > 0.7` (interpretable) |
+#### 구현 완료 ✅ (2025-01-21)
+```python
+# routing.py line 554-603 - 수정된 코드
+total_usage = q_np + k_np
+q_ratio = np.zeros_like(q_np, dtype=float)
+valid_mask = total_usage > 0
+q_ratio[valid_mask] = q_np[valid_mask] / total_usage[valid_mask]
+
+# Inactive: 하위 10% by total usage
+usage_threshold = np.percentile(total_usage, 10)
+inactive_mask = total_usage <= usage_threshold
+
+# Ratio 기반 분류
+active_mask = ~inactive_mask
+q_specialized = int(((q_ratio > 0.7) & active_mask).sum())
+k_specialized = int(((q_ratio < 0.3) & active_mask).sum())
+shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7) & active_mask).sum())
+inactive = int(inactive_mask.sum())
+
+# Histogram용 데이터
+q_ratio_active = q_ratio[active_mask].tolist()
+```
+
+**출력 데이터:**
+- `q_ratio`: 뉴런별 Q 비율 (scatter plot용)
+- `q_ratio_active`: 활성 뉴런만 (histogram용)
+- `specialization_thresholds`: 사용된 임계값 기록
 
 #### 데이터 소스
 - `self.results['routing']['qk_usage']` (analyze_qk_usage 결과)
@@ -524,13 +548,63 @@ scripts/analysis/analyze_all.py
 
 ---
 
+## Paper Results JSON Output
+
+Paper mode 실행 시 `paper/paper_results.json`에 모든 수치 데이터가 저장됩니다.
+
+### 출력 구조
+```json
+{
+  "table1_model_stats": {
+    "parameters_M": 24.5,
+    "flops_G": 1.23,
+    "perplexity": 45.67,
+    "accuracy": 32.1,
+    "tokens_per_sec": 15000
+  },
+  "table2_neuron_util": {
+    "F-Q": {"total": 2048, "active": 1856, "dead": 192, "active_ratio": 0.906, "gini": 0.234}
+  },
+  "fig3_qk_specialization": {
+    "feature_qk": {
+      "correlation": -0.45,
+      "q_specialized": 450,
+      "k_specialized": 380,
+      "shared": 1018,
+      "inactive": 200,
+      "q_counts": [...],
+      "k_counts": [...],
+      "q_ratio": [...],
+      "q_ratio_active": [...]
+    }
+  },
+  "fig4_pos_specialization": {
+    "pos_neuron_counts": {"NOUN": 45, "VERB": 38, ...},
+    "top_specialized": [{"neuron_id": 123, "pos": "NOUN", "concentration": 92.5}, ...]
+  },
+  "fig5_factual": {
+    "common_neurons_100": [12, 45, 78],
+    "common_neurons_80": [12, 45, 78, 123],
+    "contrastive_top50": [...],
+    "per_target": {...}
+  },
+  "fig7_layer_contribution": {
+    "per_layer": {"L0": {"attention_ratio": 65.2, "knowledge_ratio": 34.8}, ...},
+    "summary": {"attention_ratio_mean": 62.3, "knowledge_ratio_mean": 37.7}
+  }
+}
+```
+
+---
+
 ## Review Checklist (Updated 2025-01-21)
 
 | Item | Logic | Status | Notes |
 |------|-------|--------|-------|
 | Fig 3 Q/K correlation | `np.corrcoef(q_counts, k_counts)` | ✅ Verified | Uses top-k weights correctly |
-| Fig 3 Specialization | `mean * 0.1` threshold | ⚠️ Needs fix | Change to ratio-based (70/30) |
+| Fig 3 Specialization | ratio-based (70/30) | ✅ Fixed | `q_ratio > 0.7` (commit e4e1246) |
 | Fig 4 POS concentration | `count[pos] / total * 100` | ✅ Verified | 80% threshold OK |
+| Fig 4 Layer aggregation | `any()` (union) | ✅ Fixed | Changed from majority vote |
 | Fig 4 Mask source | `get_mask()` → `weight > 0.01` | ✅ Verified | Fallback works with top-k |
 | Fig 5 Factual neurons | shared pool, set dedup | ✅ Verified | Correct DAWN semantics |
 | Fig 5 Contrastive | `target_freq - baseline_freq` | ✅ Verified | |
@@ -538,16 +612,31 @@ scripts/analysis/analyze_all.py
 | Fig 7 Layer contribution | `attn_norm / (attn + know)` | ✅ Verified | Model stores norms |
 | Table 1 Model stats | model_info + performance | ✅ OK | |
 | Table 2 Neuron util | health.ema_distribution | ✅ OK | |
+| paper_results.json | `_generate_paper_results_json()` | ✅ Added | commit e4e1246 |
 
-### Action Items
-1. **Fig 3**: Specialization threshold를 ratio 기반으로 수정 (코드 변경 필요)
-2. **Fig 6**: DAWN vs Vanilla 비교 조건 동일 확인
+### Completed ✅
+1. **Fig 3**: Specialization threshold를 ratio 기반으로 수정 완료 (commit e4e1246)
+   - `q_ratio = q_count / (q_count + k_count)`
+   - Q-specialized: `q_ratio > 0.7`
+   - K-specialized: `q_ratio < 0.3`
+   - Inactive: 하위 10% usage
+
+2. **paper_results.json**: 모든 수치 데이터 JSON 출력 추가 (commit e4e1246)
+
+3. **Fig 4**: 레이어 합산 방식을 union으로 수정 완료
+   - 변경 전: `combined_mask = all_masks.mean(axis=0) > 0.5` (majority vote)
+   - 변경 후: `combined_mask = all_masks.any(axis=0)` (union)
+   - 이유: DAWN shared pool에서 뉴런이 어느 레이어에서든 선택되면 해당 토큰 처리에 관여
+
+### Action Items (남은 작업)
+1. **Fig 6**: DAWN vs Vanilla 비교 조건 동일 확인
 
 ### Key Verification Points
 - [x] Top-k sparsity: `weight > 0` correctly identifies selected neurons
 - [x] WEIGHT_KEY_MAP: `fqk_q` → `fqk_weights_Q` (top-k applied)
 - [x] Shared pool: neuron index = identity across layers
 - [x] Output norms: model saves `attn_out_norm`, `know_out_norm`
+- [x] Fig 4 레이어 합산: union 방식으로 수정 완료
 
 ---
 
