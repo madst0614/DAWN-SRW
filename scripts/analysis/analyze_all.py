@@ -2331,18 +2331,59 @@ class ModelAnalyzer:
 
         paper_results = {}
 
-        # Table 1: Model Statistics
+        # Table 1: Model Statistics (DAWN + Vanilla comparison)
         model_info = self.results.get('model_info', {})
         perf = self.results.get('performance', {})
         val = perf.get('validation', {})
         speed = perf.get('speed', {})
 
-        paper_results['table1_model_stats'] = {
+        # DAWN stats
+        dawn_stats = {
             'parameters_M': round(model_info.get('total_M', 0), 2),
             'flops_G': round(model_info.get('flops_G', 0), 2),
             'perplexity': round(val.get('perplexity', 0), 2),
             'accuracy': round(val.get('accuracy', 0), 2),
             'tokens_per_sec': round(speed.get('tokens_per_sec', 0), 0),
+        }
+
+        # Load Vanilla stats if compare_checkpoint exists
+        vanilla_stats = {}
+        if self.compare_checkpoint:
+            vanilla_info, vanilla_val, vanilla_speed = {}, {}, {}
+            comp_path = Path(self.compare_checkpoint)
+            comp_dirs = [
+                comp_path.parent / 'analysis',
+                comp_path / 'analysis',
+                comp_path.parent,
+            ]
+            for comp_dir in comp_dirs:
+                if comp_dir.exists():
+                    comp_params = comp_dir / 'model_info' / 'parameters.json'
+                    comp_val_file = comp_dir / 'performance' / 'validation.json'
+                    comp_speed_file = comp_dir / 'performance' / 'speed_benchmark.json'
+                    if comp_params.exists():
+                        with open(comp_params) as f:
+                            vanilla_info = json.load(f)
+                    if comp_val_file.exists():
+                        with open(comp_val_file) as f:
+                            vanilla_val = json.load(f)
+                    if comp_speed_file.exists():
+                        with open(comp_speed_file) as f:
+                            vanilla_speed = json.load(f)
+                    if vanilla_info or vanilla_val:
+                        break
+
+            vanilla_stats = {
+                'parameters_M': round(vanilla_info.get('total_M', 0), 2),
+                'flops_G': round(vanilla_info.get('flops_G', 0), 2),
+                'perplexity': round(vanilla_val.get('perplexity', 0), 2),
+                'accuracy': round(vanilla_val.get('accuracy', 0), 2),
+                'tokens_per_sec': round(vanilla_speed.get('tokens_per_sec', 0), 0),
+            }
+
+        paper_results['table1_model_stats'] = {
+            'dawn': dawn_stats,
+            'vanilla': vanilla_stats if vanilla_stats else None,
         }
 
         # Table 2: Neuron Utilization
@@ -2386,20 +2427,21 @@ class ModelAnalyzer:
             summary = neuron_features.get('summary', {})
             n_specialized = summary.get('n_specialized', {})
 
-            # Count neurons per POS
+            # Get POS-specialized neurons (specialized['pos'] is a list)
+            pos_neurons = specialized.get('pos', [])
+
+            # Count neurons per actual POS tag
             pos_neuron_counts = {}
             top_specialized_list = []
-            for pos, neurons in specialized.items():
-                pos_neuron_counts[pos] = len(neurons) if isinstance(neurons, list) else 0
-                # Collect top neurons with their concentration
-                if isinstance(neurons, list):
-                    for neuron_info in neurons[:5]:  # Top 5 per POS
-                        if isinstance(neuron_info, dict):
-                            top_specialized_list.append({
-                                'neuron_id': neuron_info.get('neuron_idx', 0),
-                                'pos': pos,
-                                'concentration': round(neuron_info.get('concentration', 0), 2),
-                            })
+            for neuron_info in pos_neurons:
+                if isinstance(neuron_info, dict):
+                    pos_tag = neuron_info.get('specialized_for', 'unknown')
+                    pos_neuron_counts[pos_tag] = pos_neuron_counts.get(pos_tag, 0) + 1
+                    top_specialized_list.append({
+                        'neuron_id': neuron_info.get('neuron', 0),
+                        'pos': pos_tag,
+                        'concentration': round(neuron_info.get('pct', 0), 2),
+                    })
 
             # Sort by concentration
             top_specialized_list.sort(key=lambda x: x['concentration'], reverse=True)
@@ -2408,24 +2450,41 @@ class ModelAnalyzer:
                 'pos_neuron_counts': pos_neuron_counts,
                 'top_specialized': top_specialized_list[:20],
                 'total_neurons': summary.get('n_neurons', neuron_features.get('n_neurons_profiled', 0)),
-                'n_specialized_total': sum(n_specialized.values()) if isinstance(n_specialized, dict) else 0,
+                'n_specialized_total': n_specialized.get('pos', 0) if isinstance(n_specialized, dict) else len(pos_neurons),
             }
 
         # Fig 5: Factual Heatmap
         factual = self.results.get('factual', {})
         if factual:
-            paper_results['fig5_factual'] = {
-                'common_neurons_100': factual.get('common_neurons_100', []),
-                'common_neurons_80': factual.get('common_neurons_80', []),
-                'contrastive_top50': factual.get('contrastive_top50', []),
-                'per_target': {
-                    k: {
-                        'success_rate': round(v.get('success_rate', 0), 3),
-                        'n_runs': v.get('n_runs', 0),
-                        'active_neurons': v.get('active_neurons', [])[:50],
+            # Extract per-target data with correct keys from analyze_factual_neurons
+            per_target_data = {}
+            for target, data in factual.get('per_target', {}).items():
+                if isinstance(data, dict):
+                    per_target_data[target] = {
+                        'match_rate': round(data.get('match_rate', 0), 3),
+                        'successful_runs': data.get('successful_runs', 0),
+                        'total_runs': data.get('total_runs', 0),
+                        'common_neurons_100': data.get('common_neurons_100', []),
+                        'common_neurons_80': data.get('common_neurons_80', []),
+                        'common_neurons_50': data.get('common_neurons_50', []),
+                        'contrastive_top50': data.get('contrastive_top50', [])[:20],
+                        'total_unique_neurons': data.get('total_unique_neurons', 0),
                     }
-                    for k, v in factual.get('per_target', {}).items()
-                }
+
+            # Aggregate common neurons across all targets
+            all_common_100 = set()
+            all_common_80 = set()
+            for data in per_target_data.values():
+                all_common_100.update(data.get('common_neurons_100', []))
+                all_common_80.update(data.get('common_neurons_80', []))
+
+            paper_results['fig5_factual'] = {
+                'prompts': factual.get('prompts', []),
+                'targets': factual.get('targets', []),
+                'pool_type': factual.get('pool_type', 'fv'),
+                'all_common_neurons_100': sorted(all_common_100),
+                'all_common_neurons_80': sorted(all_common_80),
+                'per_target': per_target_data,
             }
 
         # Fig 6: Training Dynamics - Extract config from checkpoints
