@@ -1409,6 +1409,8 @@ class RoutingAnalyzer(BaseAnalyzer):
             'weight_concentration': self.analyze_weight_concentration(dataloader, n_batches),
             'path_usage': self.analyze_path_usage(dataloader, n_batches),
             'coverage_progression': self.analyze_coverage_progression(dataloader, n_batches),
+            # Layer contribution for Fig 7
+            'layer_contribution': self.analyze_layer_contribution(dataloader, n_batches),
         }
 
         # Visualizations
