@@ -511,7 +511,6 @@ class ModelAnalyzer:
         # Print detailed summary
         ema = results.get('ema_distribution', {})
         diversity = results.get('diversity', {})
-        qk_overlap = results.get('qk_ema_overlap', {})
 
         if ema:
             print(f"\n  ┌─ Neuron Health Summary ───────────────────────────────────────────────")
@@ -544,16 +543,6 @@ class ModelAnalyzer:
                 if isinstance(data, dict) and 'entropy' in data:
                     print(f"  │ {data.get('display', name):<12} {data['entropy']:>10.3f} {data.get('normalized_entropy', 0):>12.3f} "
                           f"{data.get('effective_count', 0):>14.1f} {data.get('coverage', 0)*100:>11.1f}%")
-            print(f"  └─────────────────────────────────────────────────────────────────────────")
-
-        # Q/K overlap for v18.x
-        if qk_overlap and 'error' not in qk_overlap:
-            print(f"\n  ┌─ Q/K EMA Overlap (v18.x) ──────────────────────────────────────────────")
-            for pool_name, overlap_data in qk_overlap.items():
-                if isinstance(overlap_data, dict) and 'q_only' in overlap_data:
-                    print(f"  │ {pool_name}:")
-                    print(f"  │   Shared: {overlap_data.get('shared', 0):>6d}  |  Q-only: {overlap_data.get('q_only', 0):>6d}  |  K-only: {overlap_data.get('k_only', 0):>6d}  |  Dead: {overlap_data.get('dead', 0):>6d}")
-                    print(f"  │   Corr: {overlap_data.get('correlation', 0):.3f}  |  Jaccard: {overlap_data.get('jaccard', 0):.3f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['health'] = results

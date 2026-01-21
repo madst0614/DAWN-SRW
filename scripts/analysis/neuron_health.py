@@ -7,7 +7,6 @@ Includes:
 - EMA distribution analysis
 - Dead/Active neuron ratio
 - Diversity metrics (Gini, entropy)
-- Q/K EMA overlap analysis (v18.x)
 """
 
 import os
@@ -244,94 +243,6 @@ class NeuronHealthAnalyzer(BaseAnalyzer):
             return {'visualization': path}
         return {'error': 'matplotlib not available'}
 
-    def analyze_qk_ema_overlap(self, threshold: float = 0.01) -> Dict:
-        """
-        Analyze Q/K neuron specialization from EMA (v18.x only).
-
-        Classifies neurons into:
-        - q_only: Used only by Q routing
-        - k_only: Used only by K routing
-        - shared: Used by both Q and K
-        - dead: Not used by either
-
-        Args:
-            threshold: EMA threshold for active classification
-
-        Returns:
-            Dictionary with Q/K overlap statistics
-        """
-        results = {}
-
-        # Check for v18.x separate Q/K EMA
-        qk_pairs = [
-            ('fqk', 'usage_ema_feature_q', 'usage_ema_feature_k', 'n_feature_qk'),
-            ('rqk', 'usage_ema_restore_q', 'usage_ema_restore_k', 'n_restore_qk'),
-        ]
-
-        for pool_name, q_attr, k_attr, n_attr in qk_pairs:
-            if not hasattr(self.router, q_attr) or not hasattr(self.router, k_attr):
-                continue
-
-            ema_q = getattr(self.router, q_attr).cpu().numpy()
-            ema_k = getattr(self.router, k_attr).cpu().numpy()
-            n_total = getattr(self.router, n_attr)
-
-            q_active = ema_q > threshold
-            k_active = ema_k > threshold
-
-            q_only = int((q_active & ~k_active).sum())
-            k_only = int((~q_active & k_active).sum())
-            shared = int((q_active & k_active).sum())
-            dead = int((~q_active & ~k_active).sum())
-
-            # Correlation between Q and K usage
-            if ema_q.sum() > 0 and ema_k.sum() > 0:
-                corr = float(np.corrcoef(ema_q, ema_k)[0, 1])
-            else:
-                corr = 0.0
-
-            # Jaccard similarity = intersection / union
-            union = q_only + k_only + shared
-            jaccard = shared / union if union > 0 else 0.0
-
-            results[pool_name] = {
-                'n_total': n_total,
-                'q_only': q_only,
-                'k_only': k_only,
-                'shared': shared,
-                'dead': dead,
-                'q_active': int(q_active.sum()),
-                'k_active': int(k_active.sum()),
-                'correlation': corr,
-                'jaccard': float(jaccard),
-                'q_ema': ema_q.tolist(),
-                'k_ema': ema_k.tolist(),
-            }
-
-        if not results:
-            return {'error': 'Not a v18.x model with separate Q/K EMA'}
-
-        return results
-
-    def visualize_qk_overlap(self, output_dir: str) -> Optional[str]:
-        """
-        Visualize Q/K EMA overlap.
-
-        Args:
-            output_dir: Directory for output
-
-        Returns:
-            Path to saved figure or None
-        """
-        from .visualizers import plot_qk_ema_overlap
-
-        qk_results = self.analyze_qk_ema_overlap()
-        if 'error' in qk_results:
-            return None
-
-        os.makedirs(output_dir, exist_ok=True)
-        return plot_qk_ema_overlap(qk_results, os.path.join(output_dir, 'qk_ema_overlap.png'))
-
     def run_all(self, output_dir: str = './neuron_health') -> Dict:
         """
         Run all neuron health analyses.
@@ -349,13 +260,6 @@ class NeuronHealthAnalyzer(BaseAnalyzer):
             'diversity': self.analyze_diversity(),
             'dead_neurons': self.analyze_dead_neurons(output_dir),
         }
-
-        # v18.x Q/K overlap analysis
-        qk_overlap = self.analyze_qk_ema_overlap()
-        if 'error' not in qk_overlap:
-            results['qk_ema_overlap'] = qk_overlap
-            # Visualize Q/K overlap
-            self.visualize_qk_overlap(output_dir)
 
         # Visualizations
         results['visualization'] = self.visualize_usage(output_dir)

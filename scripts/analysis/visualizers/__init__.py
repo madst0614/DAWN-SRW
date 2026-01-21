@@ -7,7 +7,7 @@ Each module corresponds to a specific paper figure or analysis type.
 """
 
 from .qk_specialization import plot_qk_specialization, plot_qk_usage
-from .neuron_health import plot_dead_neurons, plot_usage_histogram, plot_qk_ema_overlap
+from .neuron_health import plot_dead_neurons, plot_usage_histogram
 from .embedding import plot_similarity_heatmap, plot_clustering, plot_embedding_space
 from .pos_neurons import (
     plot_pos_heatmap, plot_pos_clustering,
@@ -34,7 +34,6 @@ __all__ = [
     # Neuron Health (Figure 6a)
     'plot_dead_neurons',
     'plot_usage_histogram',
-    'plot_qk_ema_overlap',
     # Routing Stats (Figure 7)
     'plot_routing_stats',
     'plot_layer_contribution',
