@@ -357,9 +357,39 @@ def plot_factual_comparison(
     x = np.arange(len(targets))
     width = 0.25
 
-    counts_100 = [len(per_target[t].get('common_neurons_100', [])) for t in targets]
-    counts_80 = [len(per_target[t].get('common_neurons_80', [])) for t in targets]
-    counts_50 = [len(per_target[t].get('common_neurons_50', [])) for t in targets]
+    # Helper to get neuron counts from both old and new structure
+    def get_neuron_counts(target_data, threshold):
+        # Old structure: common_neurons_XX at top level
+        key = f'common_neurons_{threshold}'
+        if key in target_data:
+            return len(target_data[key])
+        # New multi-pool structure: per_pool with common_XX
+        if 'per_pool' in target_data:
+            all_neurons = set()
+            pool_key = f'common_{threshold}'
+            for pool, pool_data in target_data.get('per_pool', {}).items():
+                if isinstance(pool_data, dict):
+                    all_neurons.update(pool_data.get(pool_key, []))
+            return len(all_neurons)
+        return 0
+
+    def get_common_neurons(target_data, threshold=80):
+        """Get set of common neurons from either data structure."""
+        key = f'common_neurons_{threshold}'
+        if key in target_data:
+            return set(target_data[key])
+        if 'per_pool' in target_data:
+            all_neurons = set()
+            pool_key = f'common_{threshold}'
+            for pool, pool_data in target_data.get('per_pool', {}).items():
+                if isinstance(pool_data, dict):
+                    all_neurons.update(pool_data.get(pool_key, []))
+            return all_neurons
+        return set()
+
+    counts_100 = [get_neuron_counts(per_target[t], 100) for t in targets]
+    counts_80 = [get_neuron_counts(per_target[t], 80) for t in targets]
+    counts_50 = [get_neuron_counts(per_target[t], 50) for t in targets]
 
     ax.barh(x - width, counts_100, width, label='100%', color='darkred')
     ax.barh(x, counts_80, width, label='80%+', color='coral')
@@ -378,9 +408,9 @@ def plot_factual_comparison(
     # Calculate overlap between targets
     overlap_matrix = np.zeros((len(targets), len(targets)))
     for i, t1 in enumerate(targets):
-        neurons_1 = set(per_target[t1].get('common_neurons_80', []))
+        neurons_1 = get_common_neurons(per_target[t1], 80)
         for j, t2 in enumerate(targets):
-            neurons_2 = set(per_target[t2].get('common_neurons_80', []))
+            neurons_2 = get_common_neurons(per_target[t2], 80)
             if neurons_1 and neurons_2:
                 overlap = len(neurons_1 & neurons_2) / len(neurons_1 | neurons_2)
                 overlap_matrix[i, j] = overlap
