@@ -210,6 +210,67 @@ class ModelAnalyzer:
             )
         return self._dataloader
 
+    def _load_comparison_model(self):
+        """Load comparison model (cached). Returns (model, name) or (None, None)."""
+        if not self.compare_checkpoint:
+            return None, None
+
+        # Use cached model if available
+        if hasattr(self, '_comparison_model') and self._comparison_model is not None:
+            return self._comparison_model, self._comparison_model_name
+
+        try:
+            from scripts.analysis.utils import load_model
+            baseline_model, _, _ = load_model(self.compare_checkpoint, self.device)
+            baseline_model.eval()
+
+            baseline_path = Path(self.compare_checkpoint)
+            baseline_name = baseline_path.name if baseline_path.is_dir() else baseline_path.parent.name
+
+            # Cache for reuse
+            self._comparison_model = baseline_model
+            self._comparison_model_name = baseline_name
+
+            return baseline_model, baseline_name
+        except Exception as e:
+            print(f"    Error loading comparison model: {e}")
+            return None, None
+
+    def _cleanup_comparison_model(self):
+        """Cleanup comparison model from memory."""
+        if hasattr(self, '_comparison_model') and self._comparison_model is not None:
+            del self._comparison_model
+            self._comparison_model = None
+            torch.cuda.empty_cache()
+
+    def _generate_text_simple(self, model, prompt: str, max_new_tokens: int = 50,
+                              temperature: float = 0.8, top_k: int = 50) -> str:
+        """Generate text from a prompt (simple, no streaming). Returns full generated text."""
+        import torch.nn.functional as F
+
+        input_ids = self.tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt').to(self.device)
+        generated = input_ids.clone()
+        eos_token_id = self.tokenizer.sep_token_id
+
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                output = model(generated, attention_mask=None)
+                logits = output[0] if isinstance(output, tuple) else output
+                next_token_logits = logits[:, -1, :] / temperature
+
+                if top_k > 0:
+                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                    next_token_logits[indices_to_remove] = float('-inf')
+
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                generated = torch.cat([generated, next_token], dim=1)
+
+                if next_token.item() == eos_token_id:
+                    break
+
+        return self.tokenizer.decode(generated[0], skip_special_tokens=True)
+
     def analyze_model_info(self) -> Dict:
         """Analyze model parameters, architecture."""
         output_dir = self.output_dir / 'model_info'
@@ -334,38 +395,67 @@ class ModelAnalyzer:
             json.dump(speed_results, f, indent=2)
 
         # Generation samples (streaming output)
-        print(f"\n  ┌─ Generation Samples (max {self.gen_tokens} tokens) ────────────────────────")
-        samples = self._generate_samples(max_new_tokens=self.gen_tokens)
-        results['generation'] = samples
+        print(f"\n  ┌─ Generation Samples: DAWN (max {self.gen_tokens} tokens) ─────────────────")
+        dawn_samples = self._generate_samples(max_new_tokens=self.gen_tokens, model=self.model, model_name="DAWN")
+        results['generation'] = {'dawn': dawn_samples}
 
-        # Group by category for file output
-        categories = {}
-        for s in samples:
-            cat = s['category']
-            if cat not in categories:
-                categories[cat] = []
-            categories[cat].append(s)
+        # Vanilla model generation if available
+        vanilla_samples = []
+        if self.compare_checkpoint:
+            print(f"\n  ┌─ Generation Samples: Vanilla (max {self.gen_tokens} tokens) ──────────────")
+            try:
+                vanilla_model = self._load_comparison_model()
+                if vanilla_model is not None:
+                    vanilla_samples = self._generate_samples(
+                        max_new_tokens=self.gen_tokens,
+                        model=vanilla_model,
+                        model_name="Vanilla"
+                    )
+                    results['generation']['vanilla'] = vanilla_samples
+                    del vanilla_model
+                    if self.device == 'cuda':
+                        torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"  [Warning] Could not generate with vanilla model: {e}")
 
-        # Summary stats
-        total_tokens = sum(s['new_tokens'] for s in samples)
-        total_time = sum(s['time_ms'] for s in samples)
+        # Summary stats for DAWN
+        total_tokens = sum(s['new_tokens'] for s in dawn_samples)
+        total_time = sum(s['time_ms'] for s in dawn_samples)
         avg_speed = total_tokens / (total_time / 1000) if total_time > 0 else 0
         print(f"  ├─────────────────────────────────────────────────────────────────────────────")
-        print(f"  │ Summary: {len(samples)} prompts, {total_tokens} tokens, avg {avg_speed:.1f} tok/s")
+        print(f"  │ DAWN Summary: {len(dawn_samples)} prompts, {total_tokens} tokens, avg {avg_speed:.1f} tok/s")
+        if vanilla_samples:
+            v_total_tokens = sum(s['new_tokens'] for s in vanilla_samples)
+            v_total_time = sum(s['time_ms'] for s in vanilla_samples)
+            v_avg_speed = v_total_tokens / (v_total_time / 1000) if v_total_time > 0 else 0
+            print(f"  │ Vanilla Summary: {len(vanilla_samples)} prompts, {v_total_tokens} tokens, avg {v_avg_speed:.1f} tok/s")
         print(f"  └─────────────────────────────────────────────────────────────────────────────\n")
 
+        # Save generation samples
         with open(output_dir / 'generation_samples.json', 'w') as f:
-            json.dump(samples, f, indent=2, default=str)
+            json.dump(results['generation'], f, indent=2, default=str)
 
         with open(output_dir / 'generation_samples.txt', 'w') as f:
-            for category, cat_samples in categories.items():
-                f.write(f"\n[{category.upper()}]\n")
-                f.write("=" * 60 + "\n")
-                for s in cat_samples:
-                    f.write(f"Prompt: {s['prompt']}\n")
-                    f.write(f"Generated: {s['generated']}\n")
-                    f.write(f"Stats: {s['new_tokens']} tokens, {s['time_ms']:.0f}ms, {s['tokens_per_sec']:.1f} tok/s\n")
+            for model_name, samples in results['generation'].items():
+                f.write(f"\n{'='*60}\n")
+                f.write(f"MODEL: {model_name.upper()}\n")
+                f.write(f"{'='*60}\n")
+
+                categories = {}
+                for s in samples:
+                    cat = s['category']
+                    if cat not in categories:
+                        categories[cat] = []
+                    categories[cat].append(s)
+
+                for category, cat_samples in categories.items():
+                    f.write(f"\n[{category.upper()}]\n")
                     f.write("-" * 60 + "\n")
+                    for s in cat_samples:
+                        f.write(f"Prompt: {s['prompt']}\n")
+                        f.write(f"Generated: {s['generated']}\n")
+                        f.write(f"Stats: {s['new_tokens']} tokens, {s['time_ms']:.0f}ms, {s['tokens_per_sec']:.1f} tok/s\n")
+                        f.write("-" * 40 + "\n")
 
         self.results['performance'] = results
         return results
@@ -410,10 +500,14 @@ class ModelAnalyzer:
             'seq_len': seq_len,
         }
 
-    def _generate_samples(self, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 50) -> List[Dict]:
+    def _generate_samples(self, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 50,
+                          model=None, model_name: str = "model") -> List[Dict]:
         """Generate text samples with top-k sampling and streaming output."""
         import time
         import torch.nn.functional as F
+
+        if model is None:
+            model = self.model
 
         # Comprehensive prompt categories
         prompt_categories = {
@@ -442,7 +536,7 @@ class ModelAnalyzer:
         }
 
         results = []
-        self.model.eval()
+        model.eval()
         eos_token_id = self.tokenizer.sep_token_id
 
         for category, prompts in prompt_categories.items():
@@ -457,14 +551,14 @@ class ModelAnalyzer:
                 prompt_len = input_ids.shape[1]
 
                 # Print prompt with streaming indicator
-                print(f"  [{category}] {prompt}", end="", flush=True)
+                print(f"  [{model_name}|{category}] {prompt}", end="", flush=True)
 
                 # Track full decoded text for proper spacing (BERT tokenizer needs full context)
                 prev_full_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
 
                 with torch.no_grad():
                     for _ in range(max_new_tokens):
-                        output = self.model(generated, attention_mask=None)
+                        output = model(generated, attention_mask=None)
                         logits = output[0] if isinstance(output, tuple) else output
                         next_token_logits = logits[:, -1, :] / temperature
 
@@ -1716,6 +1810,9 @@ class ModelAnalyzer:
         # Summary
         self._generate_paper_summary(paper_dir)
 
+        # Cleanup comparison model if loaded
+        self._cleanup_comparison_model()
+
     def _generate_tables(self, tables_dir: Path):
         """Generate LaTeX and CSV tables with optional vanilla comparison."""
         # Try to get model_info from results, fallback to saved JSON
@@ -1863,9 +1960,7 @@ class ModelAnalyzer:
 
     def _generate_comparison_samples(self, paper_dir: Path):
         """Generate text samples comparing DAWN vs Baseline for paper."""
-        import torch.nn.functional as F
-
-        # Paper-quality prompts
+        # Paper-quality prompts (unified with _generate_samples)
         PROMPTS = {
             'Factual Knowledge': [
                 "The capital of France is",
@@ -1892,43 +1987,11 @@ class ModelAnalyzer:
             ],
         }
 
-        def generate_text(model, prompt, max_new_tokens=50, temperature=0.8, top_k=50):
-            """Generate text with top-k sampling."""
-            input_ids = self.tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt').to(self.device)
-            generated = input_ids.clone()
-            eos_token_id = self.tokenizer.sep_token_id
-
-            with torch.no_grad():
-                for _ in range(max_new_tokens):
-                    output = model(generated, attention_mask=None)
-                    logits = output[0] if isinstance(output, tuple) else output
-                    next_token_logits = logits[:, -1, :] / temperature
-
-                    if top_k > 0:
-                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                        next_token_logits[indices_to_remove] = float('-inf')
-
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                    generated = torch.cat([generated, next_token], dim=1)
-
-                    if next_token.item() == eos_token_id:
-                        break
-
-            return self.tokenizer.decode(generated[0], skip_special_tokens=True)
-
-        # Load baseline model
+        # Load baseline model using shared method
         print("    Loading baseline model...")
-        try:
-            from scripts.analysis.utils import load_model
-            baseline_model, _, baseline_config = load_model(self.compare_checkpoint, self.device)
-            baseline_model.eval()
-
-            # Get baseline name
-            baseline_path = Path(self.compare_checkpoint)
-            baseline_name = baseline_path.name if baseline_path.is_dir() else baseline_path.parent.name
-        except Exception as e:
-            print(f"    Error loading baseline: {e}")
+        baseline_model, baseline_name = self._load_comparison_model()
+        if baseline_model is None:
+            print("    Skipping comparison samples (no baseline model)")
             return
 
         # Generate samples
@@ -1954,9 +2017,9 @@ class ModelAnalyzer:
                 lines.append(prompt_line)
                 print(prompt_line)
 
-                # Generate from both models
-                dawn_output = generate_text(self.model, prompt, max_new_tokens=self.gen_tokens)
-                baseline_output = generate_text(baseline_model, prompt, max_new_tokens=self.gen_tokens)
+                # Generate from both models using shared method
+                dawn_output = self._generate_text_simple(self.model, prompt, max_new_tokens=self.gen_tokens)
+                baseline_output = self._generate_text_simple(baseline_model, prompt, max_new_tokens=self.gen_tokens)
 
                 # Extract generated part (remove prompt)
                 dawn_gen = dawn_output[len(prompt):].strip() if dawn_output.startswith(prompt) else dawn_output
@@ -1977,18 +2040,16 @@ class ModelAnalyzer:
 
         print(f"\n    Saved to: {output_path}")
 
-        # Cleanup
-        del baseline_model
-        torch.cuda.empty_cache()
-
     def _analyze_comparison_model(self):
         """Run quick analysis on comparison model for table generation."""
-        from scripts.analysis.utils import load_model
         from scripts.evaluation.evaluate import evaluate_model, load_val_data, estimate_flops
 
-        print(f"    Loading: {self.compare_checkpoint}")
-        comp_model, _, comp_config = load_model(self.compare_checkpoint, self.device)
-        comp_model.eval()
+        # Use shared model loader (keeps model cached for later use)
+        comp_model, comp_name = self._load_comparison_model()
+        if comp_model is None:
+            return {}, {}, {}
+
+        print(f"    Analyzing: {comp_name}")
 
         # Model info
         total_params = sum(p.numel() for p in comp_model.parameters())
@@ -2028,10 +2089,7 @@ class ModelAnalyzer:
         vanilla_speed = {'tokens_per_sec': tokens_per_sec}
         print(f"    Speed: {tokens_per_sec/1000:.1f}K tok/s")
 
-        # Cleanup
-        del comp_model
-        torch.cuda.empty_cache()
-
+        # Don't cleanup here - model may be reused for generation comparison
         return vanilla_info, vanilla_val, vanilla_speed
 
     def _extract_checkpoint_config(self, checkpoint_path: str) -> Dict:
@@ -3187,16 +3245,40 @@ class ModelAnalyzer:
         ]
 
     def run_all(self, paper_only: bool = False, only: List[str] = None):
-        """Run all analyses."""
+        """Run all analyses.
+
+        Args:
+            paper_only: If True, only load existing results and generate paper outputs.
+                       Does NOT re-run any analyses.
+            only: List of specific analyses to run (e.g., ['routing', 'health'])
+        """
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Paper-only mode: load existing results and generate paper outputs only
+        if paper_only:
+            print("\n[PAPER-ONLY MODE] Loading pre-computed results...")
+            self.load_model()  # Still need model for generation comparison
+            self._load_existing_results()
+
+            if not self.results:
+                print("  ERROR: No existing results found. Run full analysis first.")
+                return self.results
+
+            print(f"  Loaded {len(self.results)} analysis results")
+
+            # Generate paper outputs from loaded data
+            print(f"\n[PAPER] Generating paper outputs from pre-computed data...")
+            self.generate_paper_outputs()
+
+            # Final summary
+            self._print_final_summary()
+            return self.results
+
+        # Normal mode: load model and run analyses
         self.load_model()
 
-        # Get analysis list based on mode
-        if paper_only:
-            analyses = self._get_paper_analyses()
-        else:
-            analyses = self._get_full_analyses()
+        # Get analysis list
+        analyses = self._get_full_analyses()
 
         # Expand figure/table names (e.g., fig3 -> routing)
         if only:
@@ -3207,24 +3289,25 @@ class ModelAnalyzer:
 
         # Filter by --only option
         if only:
-            analyses = [(n, f, a) for n, f, a in analyses if n in only]
+            # Handle 'paper' as special case - just run paper-required analyses
+            if 'paper' in only:
+                # Load existing and only run missing
+                print("\n[Checking existing analysis results...]")
+                self._load_existing_results()
 
-        # If --only paper, check existing results and run missing analyses
-        if only and 'paper' in only and not analyses:
-            print("\n[Checking existing analysis results...]")
-            self._load_existing_results()
+                missing = []
+                for name, func, kwargs in self._get_paper_analyses():
+                    if name not in self.results or not self.results[name]:
+                        missing.append((name, func, kwargs))
 
-            # Find missing analyses from paper requirements
-            missing = []
-            for name, func, kwargs in self._get_paper_analyses():
-                if name not in self.results or not self.results[name]:
-                    missing.append((name, func, kwargs))
-
-            if missing:
-                print(f"\n[Running {len(missing)} missing analyses for paper...]")
-                analyses = missing
+                if missing:
+                    print(f"  Running {len(missing)} missing analyses for paper...")
+                    analyses = missing
+                else:
+                    print(f"  All required results found.")
+                    analyses = []
             else:
-                print(f"  All required results found.")
+                analyses = [(n, f, a) for n, f, a in analyses if n in only]
 
         total_analyses = len(analyses)
         for i, (name, func, kwargs) in enumerate(analyses, 1):
@@ -3256,14 +3339,34 @@ class ModelAnalyzer:
         """Load previously saved analysis results from files."""
         print(f"  Loading from: {self.output_dir}")
 
-        # Model info
-        params_file = self.output_dir / 'model_info' / 'parameters.json'
-        if params_file.exists():
-            with open(params_file) as f:
-                self.results['model_info'] = json.load(f)
-                print(f"    ✓ model_info")
+        # Define all result files to load
+        result_files = {
+            'model_info': 'model_info/parameters.json',
+            'health': 'health/results.json',
+            'routing': 'routing/results.json',
+            'factual': 'factual/results.json',
+            'neuron_features': 'neuron_features/results.json',
+            'semantic': 'semantic/results.json',
+            'behavioral': 'behavioral/results.json',
+            'coselection': 'coselection/results.json',
+            'embedding': 'embedding/results.json',
+            'neuron_embedding': 'neuron_embedding/results.json',
+            'pos': 'pos/results.json',
+            'token_combination': 'token_combination/results.json',
+            'layerwise_semantic': 'layerwise_semantic/results.json',
+            'v18': 'v18/results.json',
+            'weight': 'weight/results.json',
+        }
 
-        # Performance
+        # Load each result file if exists
+        for name, rel_path in result_files.items():
+            file_path = self.output_dir / rel_path
+            if file_path.exists():
+                with open(file_path) as f:
+                    self.results[name] = json.load(f)
+                    print(f"    ✓ {name}")
+
+        # Performance (special handling - multiple files)
         val_file = self.output_dir / 'performance' / 'validation.json'
         speed_file = self.output_dir / 'performance' / 'speed_benchmark.json'
         if val_file.exists() or speed_file.exists():
@@ -3276,36 +3379,17 @@ class ModelAnalyzer:
                     self.results['performance']['speed'] = json.load(f)
             print(f"    ✓ performance")
 
-        # Health
-        health_file = self.output_dir / 'health' / 'results.json'
-        if health_file.exists():
-            with open(health_file) as f:
-                self.results['health'] = json.load(f)
-                print(f"    ✓ health")
-
-        # Routing
-        routing_file = self.output_dir / 'routing' / 'results.json'
-        if routing_file.exists():
-            with open(routing_file) as f:
-                self.results['routing'] = json.load(f)
-                print(f"    ✓ routing")
-
-        # Factual
-        factual_file = self.output_dir / 'factual' / 'results.json'
-        if factual_file.exists():
-            with open(factual_file) as f:
-                self.results['factual'] = json.load(f)
-                print(f"    ✓ factual")
-
-        # Neuron features
-        nf_file = self.output_dir / 'neuron_features' / 'results.json'
-        if nf_file.exists():
-            with open(nf_file) as f:
-                self.results['neuron_features'] = json.load(f)
-                print(f"    ✓ neuron_features")
+        # Generation samples
+        gen_file = self.output_dir / 'performance' / 'generation_samples.json'
+        if gen_file.exists():
+            with open(gen_file) as f:
+                self.results['generation'] = json.load(f)
+                print(f"    ✓ generation")
 
         if not self.results:
             print(f"    (No existing results found)")
+        else:
+            print(f"  Total: {len(self.results)} result sets loaded")
 
     def _print_final_summary(self):
         """Print final analysis summary."""
