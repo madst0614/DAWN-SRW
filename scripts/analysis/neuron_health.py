@@ -15,7 +15,7 @@ from collections import defaultdict
 
 from .base import BaseAnalyzer
 from .utils import (
-    ROUTING_KEYS, POOL_N_ATTR,
+    ALL_ROUTING_KEYS, POOL_N_ATTR,
     gini_coefficient, get_batch_input_ids,
     RoutingDataExtractor,
     HAS_TQDM, tqdm
@@ -68,12 +68,12 @@ class NeuronHealthAnalyzer(BaseAnalyzer):
                     continue
 
                 for layer in routing:
-                    for key in ROUTING_KEYS.keys():
+                    for key in ALL_ROUTING_KEYS.keys():
                         weights = layer.get_weight(key)
                         if weights is None:
                             continue
 
-                        pool = ROUTING_KEYS[key][3]
+                        pool = ALL_ROUTING_KEYS[key][3]
                         n_attr = POOL_N_ATTR.get(pool)
                         n_neurons = getattr(self.router, n_attr, 0) if n_attr else weights.shape[-1]
 
@@ -155,12 +155,12 @@ class NeuronHealthAnalyzer(BaseAnalyzer):
                     continue
 
                 for layer in routing:
-                    for key in ROUTING_KEYS.keys():
+                    for key in ALL_ROUTING_KEYS.keys():
                         weights = layer.get_weight(key)
                         if weights is None:
                             continue
 
-                        pool = ROUTING_KEYS[key][3]
+                        pool = ALL_ROUTING_KEYS[key][3]
                         n_attr = POOL_N_ATTR.get(pool)
                         n_neurons = getattr(self.router, n_attr, 0) if n_attr else weights.shape[-1]
 
@@ -254,12 +254,12 @@ class NeuronHealthAnalyzer(BaseAnalyzer):
                     continue
 
                 for layer in routing:
-                    for key in ROUTING_KEYS.keys():
+                    for key in ALL_ROUTING_KEYS.keys():
                         weights = layer.get_weight(key)
                         if weights is None:
                             continue
 
-                        pool = ROUTING_KEYS[key][3]
+                        pool = ALL_ROUTING_KEYS[key][3]
                         n_attr = POOL_N_ATTR.get(pool)
                         n_neurons = getattr(self.router, n_attr, 0) if n_attr else weights.shape[-1]
 

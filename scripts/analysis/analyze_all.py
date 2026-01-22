@@ -2619,15 +2619,15 @@ class ModelAnalyzer:
 
         # DAWN-specific neuron config
         dawn_specific = dawn_config.get('dawn_specific', {})
-        if dawn_specific:
-            paper_data['models']['dawn']['neuron_pools'] = {
-                'fqk': dawn_specific.get('n_feature_qk', 0),
-                'rqk': dawn_specific.get('n_restore_qk', 0),
-                'fv': dawn_specific.get('n_feature_v', 0),
-                'rv': dawn_specific.get('n_restore_v', 0),
-                'fknow': dawn_specific.get('n_knowledge', 0),
-                'rknow': dawn_specific.get('n_knowledge', 0),  # Same as fknow typically
-            }
+        # neuron_pools: check both dawn_specific and top-level config
+        paper_data['models']['dawn']['neuron_pools'] = {
+            'fqk': dawn_specific.get('n_feature_qk', 0) or dawn_config.get('n_feature_qk', 0),
+            'rqk': dawn_specific.get('n_restore_qk', 0) or dawn_config.get('n_restore_qk', 0),
+            'fv': dawn_specific.get('n_feature_v', 0) or dawn_config.get('n_feature_v', 0),
+            'rv': dawn_specific.get('n_restore_v', 0) or dawn_config.get('n_restore_v', 0),
+            'fknow': dawn_specific.get('n_feature_know', 0) or dawn_config.get('n_feature_know', 0),
+            'rknow': dawn_specific.get('n_restore_know', 0) or dawn_config.get('n_restore_know', 0),
+        }
 
         # Vanilla model info
         vanilla_info, vanilla_val, vanilla_speed = {}, {}, {}
