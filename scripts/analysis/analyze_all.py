@@ -93,7 +93,6 @@ CLI Arguments:
         --batch_size      Dataloader batch size (default: 16)
         --max_samples     Max samples for dataloader (default: 5000)
         --n_clusters      Clusters for embedding analysis (default: 5)
-        --pool_type       Neuron pool type: fv, fqk, rv, rqk (default: fv)
         --target_layer    Target layer for POS analysis (default: all layers)
         --gen_tokens      Max tokens to generate per sample (default: 50)
 """
@@ -146,7 +145,6 @@ class ModelAnalyzer:
         batch_size: int = 16,
         max_samples: int = 5000,
         n_clusters: int = 5,
-        pool_type: str = 'fv',
         gen_tokens: int = 50,
         target_layer: int = None,
         compare_checkpoint: str = None,
@@ -166,7 +164,6 @@ class ModelAnalyzer:
         self.batch_size = batch_size
         self.max_samples = max_samples
         self.n_clusters = n_clusters
-        self.pool_type = pool_type
         self.gen_tokens = gen_tokens
         self.target_layer = target_layer
 
@@ -998,30 +995,18 @@ class ModelAnalyzer:
         self.results['semantic'] = results
         return results
 
-    def analyze_pos(self, max_sentences: int = 2000, pool_type: str = 'fv', target_layer: int = None,
+    def analyze_pos(self, max_sentences: int = 2000, target_layer: int = None,
                      compute_coactivation: bool = False) -> Dict:
         """Analyze POS neuron specialization (DAWN only).
 
-        Analyzes how neurons specialize for different Part-of-Speech tags.
-        Uses Universal Dependencies English Web Treebank dataset.
+        Note: This is legacy single-pool analysis kept for backward compatibility.
+        For unified all-pool analysis with physical neuron naming (fqk_0, fv_0, etc.),
+        use analyze_neuron_features() which is the primary analysis for paper figures.
 
         Args:
             max_sentences: Number of sentences to analyze (default: 2000)
-                - 500: Quick test (~1 min)
-                - 2000: Standard analysis (~5 min)
-                - 5000+: Comprehensive analysis
-            pool_type: Which neuron pool to analyze
-                - 'fv': Feature V pool (default, recommended)
-                - 'rv': Restore V pool
-                - 'fqk', 'fqk_q', 'fqk_k': Feature QK pools
-                - 'rqk', 'rqk_q', 'rqk_k': Restore QK pools
-                - 'fknow', 'rknow': Knowledge pools
             target_layer: Specific layer to analyze (default: None = all layers)
-                - 0-11: Specific layer index
-                - None: Average across all layers
             compute_coactivation: Compute neuron co-activation correlation matrix
-                - False: Skip (faster, less memory)
-                - True: Compute correlation between neurons (memory intensive)
 
         Returns:
             Dict with selectivity matrix, top neurons per POS, clustering results
@@ -1037,13 +1022,17 @@ class ModelAnalyzer:
 
         layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
         coact_str = ", coactivation=ON" if compute_coactivation else ""
-        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, pool={pool_type}, {layer_str}{coact_str})...")
+
+        # Legacy: analyze fv pool only (use analyze_neuron_features for all-pool analysis)
+        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, {layer_str}{coact_str})...")
+        print(f"  Note: For all-pool unified analysis, see neuron_features results")
+
         analyzer = POSNeuronAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device,
             target_layer=target_layer
         )
         results = analyzer.run_all(
-            str(output_dir), pool_type=pool_type, max_sentences=max_sentences,
+            str(output_dir), pool_type='fv', max_sentences=max_sentences,
             compute_coactivation=compute_coactivation
         )
 
@@ -1274,24 +1263,20 @@ class ModelAnalyzer:
         self.results['layerwise_semantic'] = results
         return results
 
-    def analyze_factual(self, min_target_count: int = 100, max_runs: int = 500, pool_type: str = 'all') -> Dict:
+    def analyze_factual(self, min_target_count: int = 100, max_runs: int = 500) -> Dict:
         """Analyze factual knowledge neurons (DAWN only).
 
         Finds neurons that consistently activate for factual knowledge
         (e.g., "The capital of France is" -> Paris).
 
-        Independent runs approach: each run generates until target appears,
-        records neurons, then starts fresh. Repeats until min_target_count.
+        Analyzes all V/Knowledge pools: fv, rv, fknow, rknow with unified naming.
 
         Args:
             min_target_count: Minimum target occurrences to collect (default: 100)
             max_runs: Maximum runs as safety limit (default: 500)
-            pool_type: Which neuron pool(s) to analyze
-                - 'all': Analyze all V/Knowledge pools (fv, rv, fknow, rknow)
-                - 'fv', 'rv', 'fknow', 'rknow': Specific pool only
 
         Returns:
-            Dict with per-pool, per-target neuron activations
+            Dict with per-pool, per-target neuron activations (unified naming: fv_0, fknow_12, etc.)
         """
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
@@ -1302,11 +1287,8 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'factual'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Determine which pools to analyze
-        if pool_type == 'all':
-            pools_to_analyze = ['fv', 'rv', 'fknow', 'rknow']
-        else:
-            pools_to_analyze = [pool_type]
+        # Analyze all V/Knowledge pools
+        pools_to_analyze = ['fv', 'rv', 'fknow', 'rknow']
 
         print(f"  Analyzing factual neurons (min_targets={min_target_count}, max_runs={max_runs}, pools={pools_to_analyze})...")
         analyzer = BehavioralAnalyzer(
@@ -1747,7 +1729,6 @@ class ModelAnalyzer:
 
             # Build config from instance parameters
             config = {
-                'pool_type': self.pool_type,
                 'gen_tokens': self.gen_tokens,
                 'max_sentences': self.max_sentences,
                 'target_layer': self.target_layer,
@@ -3194,7 +3175,6 @@ class ModelAnalyzer:
             ('factual', self.analyze_factual, {
                 'min_target_count': self.min_targets,
                 'max_runs': self.max_runs,
-                'pool_type': self.pool_type
             }),
         ]
 
@@ -3208,14 +3188,13 @@ class ModelAnalyzer:
             ('embedding', self.analyze_embedding, {'n_clusters': self.n_clusters}),
             ('neuron_embedding', self.analyze_neuron_embedding, {'n_batches': self.n_batches // 2}),
             ('semantic', self.analyze_semantic, {'n_batches': self.n_batches // 2}),
-            ('pos', self.analyze_pos, {'max_sentences': self.max_sentences, 'pool_type': self.pool_type, 'target_layer': self.target_layer}),
+            ('pos', self.analyze_pos, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('token_combination', self.analyze_token_combination, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('neuron_features', self.analyze_neuron_features, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('layerwise_semantic', self.analyze_layerwise_semantic, {'max_sentences': self.max_sentences // 4}),
             ('factual', self.analyze_factual, {
                 'min_target_count': self.min_targets,
                 'max_runs': self.max_runs,
-                'pool_type': self.pool_type
             }),
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
@@ -3402,7 +3381,6 @@ class MultiModelAnalyzer:
         batch_size: int = 16,
         max_samples: int = 5000,
         n_clusters: int = 5,
-        pool_type: str = 'fv',
         gen_tokens: int = 50,
         target_layer: int = None,
     ):
@@ -3420,7 +3398,6 @@ class MultiModelAnalyzer:
         self.batch_size = batch_size
         self.max_samples = max_samples
         self.n_clusters = n_clusters
-        self.pool_type = pool_type
         self.gen_tokens = gen_tokens
         self.target_layer = target_layer
 
@@ -3456,7 +3433,6 @@ class MultiModelAnalyzer:
                 batch_size=self.batch_size,
                 max_samples=self.max_samples,
                 n_clusters=self.n_clusters,
-                pool_type=self.pool_type,
                 gen_tokens=self.gen_tokens,
                 target_layer=self.target_layer,
             )
@@ -3767,7 +3743,6 @@ Examples:
     parser.add_argument('--batch_size', type=int, default=16, help='Dataloader batch size (default: 16)')
     parser.add_argument('--max_samples', type=int, default=5000, help='Max samples for dataloader (default: 5000)')
     parser.add_argument('--n_clusters', type=int, default=5, help='Number of clusters for embedding analysis (default: 5)')
-    parser.add_argument('--pool_type', type=str, default='fv', help='Neuron pool type: fv, fqk, fqk_q, fqk_k, rv, rqk, rqk_q, rqk_k, fknow, rknow (default: fv)')
     parser.add_argument('--target_layer', type=int, default=None, help='Target layer for POS/routing analysis (default: all layers)')
     parser.add_argument('--gen_tokens', type=int, default=50, help='Max tokens to generate per sample (default: 50)')
 
@@ -3786,7 +3761,6 @@ Examples:
     print(f"max_runs: {args.max_runs}")
     print(f"max_samples: {args.max_samples}")
     print(f"n_clusters: {args.n_clusters}")
-    print(f"pool_type: {args.pool_type}")
     print("=" * 60 + "\n")
 
     # Device check
@@ -3817,7 +3791,6 @@ Examples:
             batch_size=args.batch_size,
             max_samples=args.max_samples,
             n_clusters=args.n_clusters,
-            pool_type=args.pool_type,
             gen_tokens=args.gen_tokens,
             target_layer=args.target_layer,
             compare_checkpoint=args.compare_checkpoint,
@@ -3835,7 +3808,6 @@ Examples:
             batch_size=args.batch_size,
             max_samples=args.max_samples,
             n_clusters=args.n_clusters,
-            pool_type=args.pool_type,
             gen_tokens=args.gen_tokens,
             target_layer=args.target_layer,
         )
