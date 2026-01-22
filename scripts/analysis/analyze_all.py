@@ -1776,13 +1776,13 @@ class ModelAnalyzer:
             print("  Generating comparison samples...")
             self._generate_comparison_samples(paper_dir)
 
-        # Generate paper_results.json with all numeric data
-        print("  Generating paper_results.json...")
+        # Generate unified paper_data.json (includes training comparison)
+        print("  Generating paper_data.json...")
         self._generate_paper_results_json(paper_dir)
 
-        # Generate training config comparison
+        # Generate training comparison markdown (for human readability)
         if self.compare_checkpoint:
-            print("  Generating training_comparison...")
+            print("  Generating training_comparison.md...")
             self._generate_training_comparison(paper_dir)
 
         # Summary
@@ -2161,23 +2161,81 @@ class ModelAnalyzer:
                        not k.startswith('_') and hasattr(v, 'numel')
                 }
 
-            # Try to infer vocab_size from embedding layer
-            vocab_size = model_config.get('vocab_size', 0)
+            # === Robust vocab_size extraction ===
+            vocab_size = (
+                model_config.get('vocab_size') or
+                model_config.get('n_vocab') or
+                model_config.get('num_embeddings') or 0
+            )
             if vocab_size == 0 and state_dict:
                 # Try to find embedding layer and extract vocab_size from its shape
+                embed_keys = ['embed', 'wte', 'token_emb', 'word_emb']
                 for key in state_dict.keys():
-                    if 'embed' in key.lower() and 'weight' in key:
+                    if any(ek in key.lower() for ek in embed_keys) and 'weight' in key:
                         tensor = state_dict[key]
                         if hasattr(tensor, 'shape') and len(tensor.shape) == 2:
                             vocab_size = tensor.shape[0]
                             break
 
+            # === Robust d_model extraction ===
+            d_model = (
+                model_config.get('d_model') or
+                model_config.get('hidden_size') or
+                model_config.get('n_embd') or
+                model_config.get('dim') or 0
+            )
+            if d_model == 0 and state_dict:
+                # Infer from embedding layer shape
+                for key in state_dict.keys():
+                    if 'embed' in key.lower() and 'weight' in key:
+                        tensor = state_dict[key]
+                        if hasattr(tensor, 'shape') and len(tensor.shape) == 2:
+                            d_model = tensor.shape[1]
+                            break
+
+            # === Robust d_ff extraction ===
+            d_ff = (
+                model_config.get('d_ff') or
+                model_config.get('intermediate_size') or
+                model_config.get('ffn_dim') or
+                model_config.get('mlp_dim') or
+                model_config.get('feedforward_dim') or 0
+            )
+            if d_ff == 0 and state_dict:
+                # Try to infer from MLP/FFN layer shapes
+                mlp_keys = ['mlp', 'ffn', 'fc1', 'w1', 'up_proj', 'gate_proj']
+                for key in state_dict.keys():
+                    if any(mk in key.lower() for mk in mlp_keys) and 'weight' in key:
+                        tensor = state_dict[key]
+                        if hasattr(tensor, 'shape') and len(tensor.shape) == 2:
+                            # d_ff is usually the larger dimension
+                            d_ff = max(tensor.shape)
+                            break
+
+            # === Robust n_layers extraction ===
+            n_layers = (
+                model_config.get('n_layers') or
+                model_config.get('num_hidden_layers') or
+                model_config.get('num_layers') or
+                model_config.get('n_layer') or 0
+            )
+            if n_layers == 0 and state_dict:
+                # Count unique layer indices from state dict keys
+                layer_indices = set()
+                import re
+                for key in state_dict.keys():
+                    match = re.search(r'layers?[._](\d+)', key.lower())
+                    if match:
+                        layer_indices.add(int(match.group(1)))
+                if layer_indices:
+                    n_layers = max(layer_indices) + 1
+
             config_data['model'] = {
-                'd_model': model_config.get('d_model', model_config.get('hidden_size', 0)),
-                'n_layers': model_config.get('n_layers', model_config.get('num_hidden_layers', 0)),
+                'd_model': d_model,
+                'n_layers': n_layers,
                 'n_heads': model_config.get('n_heads', model_config.get('num_attention_heads', 0)),
                 'vocab_size': vocab_size,
-                'd_ff': model_config.get('d_ff', model_config.get('intermediate_size', 0)),
+                'd_ff': d_ff,
                 'max_seq_len': model_config.get('max_seq_len', model_config.get('max_position_embeddings', 0)),
             }
 
@@ -2193,19 +2251,51 @@ class ModelAnalyzer:
                 config_data['model']['total_params'] = total_params
                 config_data['model']['total_params_M'] = round(total_params / 1e6, 2)
 
-            # Training config: prefer config.json > checkpoint
+            # === Robust training config extraction ===
+            # Priority: config.json > checkpoint keys
             training_config = json_config.get('training', {})
             if not training_config:
                 training_config = checkpoint.get('training_config', checkpoint.get('train_config', {}))
             if not training_config:
-                # Try to extract from top-level keys
-                training_config = {
-                    'batch_size': checkpoint.get('batch_size'),
-                    'learning_rate': checkpoint.get('learning_rate', checkpoint.get('lr')),
-                    'total_steps': checkpoint.get('total_steps', checkpoint.get('max_steps')),
-                    'warmup_steps': checkpoint.get('warmup_steps'),
-                    'dataset': checkpoint.get('dataset', checkpoint.get('data_path')),
-                }
+                # Fallback: try to extract from top-level checkpoint keys
+                training_config = {}
+
+            # === Robust total_steps extraction ===
+            total_steps = (
+                training_config.get('total_steps') or
+                training_config.get('max_steps') or
+                training_config.get('num_training_steps') or
+                training_config.get('num_steps') or
+                training_config.get('max_train_steps') or
+                checkpoint.get('total_steps') or
+                checkpoint.get('max_steps') or
+                checkpoint.get('num_training_steps') or 0
+            )
+
+            # === Robust batch_size extraction ===
+            batch_size = (
+                training_config.get('batch_size') or
+                training_config.get('train_batch_size') or
+                training_config.get('per_device_train_batch_size') or
+                checkpoint.get('batch_size') or 0
+            )
+
+            # === Robust learning_rate extraction ===
+            learning_rate = (
+                training_config.get('learning_rate') or
+                training_config.get('lr') or
+                training_config.get('peak_lr') or
+                checkpoint.get('learning_rate') or
+                checkpoint.get('lr') or 0
+            )
+
+            # === Robust warmup extraction ===
+            warmup_ratio = training_config.get('warmup_ratio', 0)
+            warmup_steps = (
+                training_config.get('warmup_steps') or
+                training_config.get('num_warmup_steps') or
+                checkpoint.get('warmup_steps') or 0
+            )
 
             # Extract dataset info from data section (YAML config) or training section
             data_config = json_config.get('data', {})
@@ -2224,18 +2314,13 @@ class ModelAnalyzer:
             else:
                 dataset_name = training_config.get('dataset', training_config.get('data_path', 'unknown'))
 
-            # Extract training tokens / steps
+            # Extract training tokens
             max_train_tokens = data_config.get('max_train_tokens', 0)
-            total_steps = training_config.get('total_steps', training_config.get('max_steps', 0))
-
-            # Warmup: prefer warmup_ratio (convert to ratio), fallback to warmup_steps
-            warmup_ratio = training_config.get('warmup_ratio', 0)
-            warmup_steps = training_config.get('warmup_steps', 0)
 
             config_data['training'] = {
                 'dataset': dataset_name,
-                'batch_size': training_config.get('batch_size', training_config.get('train_batch_size', 0)),
-                'learning_rate': training_config.get('learning_rate', training_config.get('lr', 0)),
+                'batch_size': batch_size,
+                'learning_rate': learning_rate,
                 'total_steps': total_steps,
                 'max_train_tokens': max_train_tokens,
                 'warmup_steps': warmup_steps,
@@ -2384,14 +2469,11 @@ class ModelAnalyzer:
         return result
 
     def _generate_training_comparison(self, paper_dir: Path):
-        """Generate training_comparison.json and training_comparison.md."""
-        config_data = self._extract_training_configs()
+        """Generate training_comparison.md for human readability.
 
-        # Save JSON
-        json_path = paper_dir / 'training_comparison.json'
-        with open(json_path, 'w') as f:
-            json.dump(config_data, f, indent=2, default=str)
-        print(f"    Saved: {json_path}")
+        Note: JSON data is now part of paper_data.json (training section).
+        """
+        config_data = self._extract_training_configs()
 
         # Generate Markdown table
         md_lines = [
@@ -2492,30 +2574,76 @@ class ModelAnalyzer:
         print(f"    Saved: {md_path}")
 
     def _generate_paper_results_json(self, paper_dir: Path):
-        """Generate paper_results.json with all numeric data for paper figures."""
+        """Generate unified paper_data.json with all numeric data for paper.
+
+        Output structure:
+        {
+            "metadata": { generated, model_name, checkpoint paths... },
+            "models": { "dawn": {...}, "vanilla": {...} },
+            "training": { dawn/vanilla training configs },
+            "figures": { "fig3": {...}, "fig4": {...}, ... },
+            "tables": { "table1": {...}, "table2": {...} },
+            "appendix": { diversity, probing, ... }
+        }
+        """
         from scripts.analysis.utils import convert_to_serializable
 
-        paper_results = {}
+        # Initialize unified structure
+        paper_data = {
+            'metadata': {
+                'generated': datetime.now().isoformat(),
+                'model_name': self.name,
+                'model_type': self.model_type,
+                'version': self.version,
+                'checkpoint_path': str(self.checkpoint_path) if self.checkpoint_path else None,
+                'compare_checkpoint_path': str(self.compare_checkpoint) if self.compare_checkpoint else None,
+            },
+            'models': {},
+            'training': {},
+            'figures': {},
+            'tables': {},
+            'appendix': {},
+        }
 
-        # Table 1: Model Statistics (DAWN + Vanilla comparison)
+        # === MODELS SECTION ===
         model_info = self.results.get('model_info', {})
         perf = self.results.get('performance', {})
         val = perf.get('validation', {})
         speed = perf.get('speed', {})
 
-        # DAWN stats
-        dawn_stats = {
+        # Extract training configs (for both models and training section)
+        training_configs = self._extract_training_configs()
+
+        # DAWN model info
+        dawn_config = training_configs.get('dawn', {})
+        paper_data['models']['dawn'] = {
             'parameters_M': round(model_info.get('total_M', 0), 2),
             'flops_G': round(model_info.get('flops_G', 0), 2),
+            'd_model': model_info.get('d_model', dawn_config.get('model', {}).get('d_model')),
+            'n_layers': model_info.get('n_layers', dawn_config.get('model', {}).get('n_layers')),
+            'n_heads': model_info.get('n_heads', dawn_config.get('model', {}).get('n_heads')),
+            'vocab_size': dawn_config.get('model', {}).get('vocab_size'),
+            'd_ff': dawn_config.get('model', {}).get('d_ff'),
             'perplexity': round(val.get('perplexity', 0), 2),
             'accuracy': round(val.get('accuracy', 0), 2),
             'tokens_per_sec': round(speed.get('tokens_per_sec', 0), 0),
         }
 
-        # Load Vanilla stats if compare_checkpoint exists
-        vanilla_stats = {}
+        # DAWN-specific neuron config
+        dawn_specific = dawn_config.get('dawn_specific', {})
+        if dawn_specific:
+            paper_data['models']['dawn']['neuron_pools'] = {
+                'fqk': dawn_specific.get('n_feature_qk', 0),
+                'rqk': dawn_specific.get('n_restore_qk', 0),
+                'fv': dawn_specific.get('n_feature_v', 0),
+                'rv': dawn_specific.get('n_restore_v', 0),
+                'fknow': dawn_specific.get('n_knowledge', 0),
+                'rknow': dawn_specific.get('n_knowledge', 0),  # Same as fknow typically
+            }
+
+        # Vanilla model info
+        vanilla_info, vanilla_val, vanilla_speed = {}, {}, {}
         if self.compare_checkpoint:
-            vanilla_info, vanilla_val, vanilla_speed = {}, {}, {}
             comp_path = Path(self.compare_checkpoint)
             found_results = False
 
@@ -2551,97 +2679,143 @@ class ModelAnalyzer:
                 except Exception as e:
                     print(f"    Warning: Could not analyze comparison model: {e}")
 
-            vanilla_stats = {
+            vanilla_config = training_configs.get('vanilla', {})
+            paper_data['models']['vanilla'] = {
                 'parameters_M': round(vanilla_info.get('total_M', 0), 2),
                 'flops_G': round(vanilla_info.get('flops_G', 0), 2),
+                'd_model': vanilla_info.get('d_model', vanilla_config.get('model', {}).get('d_model')),
+                'n_layers': vanilla_info.get('n_layers', vanilla_config.get('model', {}).get('n_layers')),
+                'n_heads': vanilla_info.get('n_heads', vanilla_config.get('model', {}).get('n_heads')),
+                'vocab_size': vanilla_config.get('model', {}).get('vocab_size'),
+                'd_ff': vanilla_config.get('model', {}).get('d_ff'),
                 'perplexity': round(vanilla_val.get('perplexity', 0), 2),
                 'accuracy': round(vanilla_val.get('accuracy', 0), 2),
                 'tokens_per_sec': round(vanilla_speed.get('tokens_per_sec', 0), 0),
             }
 
-        paper_results['table1_model_stats'] = {
-            'dawn': dawn_stats,
-            'vanilla': vanilla_stats if vanilla_stats else None,
+        # === TRAINING SECTION ===
+        dawn_training = dawn_config.get('training', {})
+        paper_data['training']['dawn'] = {
+            'dataset': dawn_training.get('dataset'),
+            'batch_size': dawn_training.get('batch_size'),
+            'learning_rate': dawn_training.get('learning_rate'),
+            'total_steps': dawn_training.get('total_steps'),
+            'warmup_steps': dawn_training.get('warmup_steps'),
+            'warmup_ratio': dawn_training.get('warmup_ratio'),
+            'current_step': dawn_training.get('current_step'),
+        }
+        dawn_opt = dawn_config.get('optimizer', {})
+        paper_data['training']['dawn']['optimizer'] = {
+            'type': dawn_opt.get('optimizer', 'AdamW'),
+            'weight_decay': dawn_opt.get('weight_decay'),
+            'grad_clip': dawn_opt.get('grad_clip'),
+            'betas': dawn_opt.get('betas'),
         }
 
-        # Table 2: Neuron Utilization (forward-pass based, not EMA)
-        # Prefer forward-pass utilization from neuron_features over EMA-based health
+        if self.compare_checkpoint:
+            vanilla_config = training_configs.get('vanilla', {})
+            vanilla_training = vanilla_config.get('training', {})
+            paper_data['training']['vanilla'] = {
+                'dataset': vanilla_training.get('dataset'),
+                'batch_size': vanilla_training.get('batch_size'),
+                'learning_rate': vanilla_training.get('learning_rate'),
+                'total_steps': vanilla_training.get('total_steps'),
+                'warmup_steps': vanilla_training.get('warmup_steps'),
+                'warmup_ratio': vanilla_training.get('warmup_ratio'),
+                'current_step': vanilla_training.get('current_step'),
+            }
+            vanilla_opt = vanilla_config.get('optimizer', {})
+            paper_data['training']['vanilla']['optimizer'] = {
+                'type': vanilla_opt.get('optimizer', 'AdamW'),
+                'weight_decay': vanilla_opt.get('weight_decay'),
+                'grad_clip': vanilla_opt.get('grad_clip'),
+                'betas': vanilla_opt.get('betas'),
+            }
+
+        # Validation dataset info
+        paper_data['training']['validation'] = {
+            'dataset': self._extract_dataset_name(self.val_data_path),
+            'n_batches': self.results.get('performance', {}).get('validation', {}).get('n_batches', self.val_batches),
+        }
+
+        # === TABLES SECTION ===
+        # Table 1: Model Statistics
+        paper_data['tables']['table1_model_stats'] = {
+            'dawn': {
+                'parameters_M': paper_data['models']['dawn']['parameters_M'],
+                'flops_G': paper_data['models']['dawn']['flops_G'],
+                'perplexity': paper_data['models']['dawn']['perplexity'],
+                'accuracy': paper_data['models']['dawn']['accuracy'],
+                'tokens_per_sec': paper_data['models']['dawn']['tokens_per_sec'],
+            },
+            'vanilla': {
+                'parameters_M': paper_data['models'].get('vanilla', {}).get('parameters_M'),
+                'flops_G': paper_data['models'].get('vanilla', {}).get('flops_G'),
+                'perplexity': paper_data['models'].get('vanilla', {}).get('perplexity'),
+                'accuracy': paper_data['models'].get('vanilla', {}).get('accuracy'),
+                'tokens_per_sec': paper_data['models'].get('vanilla', {}).get('tokens_per_sec'),
+            } if 'vanilla' in paper_data['models'] else None,
+        }
+
+        # Table 2: Neuron Utilization (forward-pass based)
         neuron_features = self.results.get('neuron_features', {})
         utilization = neuron_features.get('utilization', {})
 
+        table2_data = {'method': 'forward_pass', 'pools': {}}
         if utilization:
-            # Use forward-pass based utilization
-            paper_results['table2_neuron_util'] = {
-                'method': 'forward_pass',
-            }
             for pool_name, data in utilization.items():
                 if pool_name.startswith('_'):
                     continue
                 if isinstance(data, dict) and 'total' in data:
-                    paper_results['table2_neuron_util'][data.get('display', pool_name.upper())] = {
+                    table2_data['pools'][pool_name] = {
                         'total': data['total'],
                         'active': data['active'],
                         'dead': data['dead'],
                         'active_ratio': round(data['active_ratio'], 3),
                         'gini': round(data.get('gini', 0), 3),
                     }
-            # Add overall stats
             overall = utilization.get('_overall', {})
             if overall:
-                paper_results['table2_neuron_util']['_overall'] = {
+                table2_data['overall'] = {
                     'total_neurons': overall.get('total_neurons', 0),
                     'total_active': overall.get('total_active', 0),
                     'total_dead': overall.get('total_dead', 0),
                     'active_ratio': round(overall.get('active_ratio', 0), 3),
                     'tokens_analyzed': overall.get('total_tokens_analyzed', 0),
                 }
-        else:
-            # Fallback to EMA-based health (deprecated)
-            health = self.results.get('health', {})
-            ema = health.get('ema_distribution', {})
-            paper_results['table2_neuron_util'] = {
-                'method': 'ema_deprecated',
-            }
-            for name, data in ema.items():
-                if isinstance(data, dict) and 'total' in data:
-                    paper_results['table2_neuron_util'][data.get('display', name)] = {
-                        'total': data['total'],
-                        'active': data['active'],
-                        'dead': data['dead'],
-                        'active_ratio': round(data['active_ratio'], 3),
-                        'gini': round(data.get('gini', 0), 3),
-                    }
 
-        # Fig 3: Q/K Specialization (summary only, no raw arrays)
+        paper_data['tables']['table2_neuron_util'] = table2_data
+
+        # === FIGURES SECTION ===
+
+        # Fig 3: Q/K Specialization
         routing = self.results.get('routing', {})
         qk_usage = routing.get('qk_usage', {})
-        paper_results['fig3_qk_specialization'] = {}
+        fig3_data = {}
         for pool_name, data in qk_usage.items():
             if isinstance(data, dict) and 'q_specialized' in data:
-                paper_results['fig3_qk_specialization'][pool_name] = {
+                fig3_data[pool_name] = {
                     'correlation': round(data.get('correlation', 0), 3),
                     'q_specialized': data.get('q_specialized', 0),
                     'k_specialized': data.get('k_specialized', 0),
                     'shared': data.get('shared', 0),
                     'inactive': data.get('inactive', 0),
                     'n_neurons': data.get('n_neurons', 0),
-                    # Sensitivity analysis for paper robustness check
                     'sensitivity_analysis': data.get('sensitivity_analysis', {}),
                 }
+        paper_data['figures']['fig3_qk_specialization'] = fig3_data
 
-        # Fig 4: POS Specialization (summary only for paper)
-        neuron_features = self.results.get('neuron_features', {})
+        # Fig 4: POS Specialization (selectivity heatmap)
         if neuron_features:
+            selectivity = neuron_features.get('selectivity', {})
             specialized = neuron_features.get('specialized_neurons', {})
             summary = neuron_features.get('summary', {})
             n_specialized = summary.get('n_specialized', {})
-
-            # Get POS-specialized neurons (specialized['pos'] is a list)
             pos_neurons = specialized.get('pos', [])
             total_neurons = summary.get('n_neurons', neuron_features.get('n_neurons_profiled', 0))
             n_specialized_total = n_specialized.get('pos', 0) if isinstance(n_specialized, dict) else len(pos_neurons)
 
-            # Count neurons per actual POS tag
+            # Count neurons per POS tag (for appendix)
             per_pos = {}
             top_list = []
             for neuron_info in pos_neurons:
@@ -2649,45 +2823,39 @@ class ModelAnalyzer:
                     pos_tag = neuron_info.get('specialized_for', 'unknown')
                     per_pos[pos_tag] = per_pos.get(pos_tag, 0) + 1
                     top_list.append({
-                        'neuron_id': neuron_info.get('neuron', 0),
+                        'neuron': neuron_info.get('neuron_name', f"neuron_{neuron_info.get('neuron', 0)}"),
                         'pos': pos_tag,
                         'concentration': round(neuron_info.get('pct', 0), 1),
                     })
-
-            # Sort by concentration and keep top 10
             top_list.sort(key=lambda x: x['concentration'], reverse=True)
 
-            # Selectivity data for Fig 4 heatmap (main figure)
-            selectivity = neuron_features.get('selectivity', {})
-
-            paper_results['fig4_pos_specialization'] = {
+            paper_data['figures']['fig4_pos_specialization'] = {
                 'total_neurons_analyzed': total_neurons,
-                # Selectivity-based analysis (main figure - heatmap)
+                # Main: selectivity-based heatmap
                 'selectivity': {
                     'top_selective_per_pos': selectivity.get('top_selective_per_pos', {}),
                     'mean_selectivity_by_pos': selectivity.get('mean_selectivity_by_pos', {}),
                     'selectivity_range': selectivity.get('selectivity_range', {}),
                     'n_active_neurons': selectivity.get('n_active_neurons', 0),
                 },
-                # Threshold-based specialization (appendix)
-                'specialized_neurons_80pct': n_specialized_total,
-                'specialized_ratio_80pct': round(n_specialized_total / total_neurons, 3) if total_neurons > 0 else 0,
-                'per_pos_80pct': per_pos,
-                'top_10_80pct': top_list[:10],
-                # Multi-threshold analysis for paper sensitivity check
+                # Supplementary: threshold analysis
+                'threshold_80pct': {
+                    'n_specialized': n_specialized_total,
+                    'ratio': round(n_specialized_total / total_neurons, 3) if total_neurons > 0 else 0,
+                    'per_pos': per_pos,
+                    'top_10': top_list[:10],
+                },
                 'specialization_summary': neuron_features.get('specialization_summary', {}),
             }
 
-        # Fig 5: Factual Heatmap (multi-pool analysis)
+        # Fig 5: Factual Analysis (multi-pool)
         factual = self.results.get('factual', {})
         if factual:
-            # New multi-pool format
             pools_analyzed = factual.get('pools_analyzed', ['fv'])
             per_pool = factual.get('per_pool', {})
             per_target = factual.get('per_target', {})
-            summary = factual.get('summary', {})
+            factual_summary = factual.get('summary', {})
 
-            # Build per-target summary for paper
             per_target_summary = {}
             for target, pool_data in per_target.items():
                 if isinstance(pool_data, dict):
@@ -2701,7 +2869,7 @@ class ModelAnalyzer:
                             }
                     per_target_summary[target] = target_summary
 
-            paper_results['fig5_factual'] = {
+            paper_data['figures']['fig5_factual'] = {
                 'pools_analyzed': pools_analyzed,
                 'per_pool': {
                     pool: {
@@ -2713,48 +2881,21 @@ class ModelAnalyzer:
                 },
                 'per_target': per_target_summary,
                 'summary': {
-                    'most_factual_pool': summary.get('most_factual_pool', 'unknown'),
-                    'total_factual_neurons': summary.get('total_factual_neurons', 0),
+                    'most_factual_pool': factual_summary.get('most_factual_pool', 'unknown'),
+                    'total_factual_neurons': factual_summary.get('total_factual_neurons', 0),
                 },
             }
 
-        # Fig 6: Training Dynamics - Use same sources as Table 1 for consistency
-        # DAWN: use model_info (from loaded model), Vanilla: use vanilla_info (from comparison)
-        fig6_config = self._extract_training_configs()
-        dawn_training = fig6_config.get('dawn', {}).get('training', {})
-        vanilla_training = fig6_config.get('vanilla', {}).get('training', {})
-
-        paper_results['fig6_training_dynamics'] = {
-            'dawn': {
-                # Use model_info for params (same as Table 1)
-                'params_M': round(model_info.get('total_M', 0), 2),
-                'd_model': model_info.get('d_model', fig6_config.get('dawn', {}).get('model', {}).get('d_model')),
-                'n_layers': model_info.get('n_layers', fig6_config.get('dawn', {}).get('model', {}).get('n_layers')),
-                # Training config from checkpoint
-                'batch_size': dawn_training.get('batch_size'),
-                'learning_rate': dawn_training.get('learning_rate'),
-                'total_steps': dawn_training.get('total_steps'),
-                'warmup_steps': dawn_training.get('warmup_steps'),
-            },
-            'vanilla': {
-                # Use vanilla_info for params (same as Table 1)
-                'params_M': round(vanilla_info.get('total_M', 0), 2) if vanilla_info else fig6_config.get('vanilla', {}).get('model', {}).get('total_params_M'),
-                'd_model': vanilla_info.get('d_model') if vanilla_info else fig6_config.get('vanilla', {}).get('model', {}).get('d_model'),
-                'n_layers': vanilla_info.get('n_layers') if vanilla_info else fig6_config.get('vanilla', {}).get('model', {}).get('n_layers'),
-                # Training config from checkpoint
-                'batch_size': vanilla_training.get('batch_size'),
-                'learning_rate': vanilla_training.get('learning_rate'),
-                'total_steps': vanilla_training.get('total_steps'),
-                'warmup_steps': vanilla_training.get('warmup_steps'),
-            } if fig6_config.get('vanilla') or vanilla_info else None,
+        # Fig 6: Training Dynamics (data comes from training section)
+        paper_data['figures']['fig6_training_dynamics'] = {
+            'dawn': paper_data['training'].get('dawn', {}),
+            'vanilla': paper_data['training'].get('vanilla'),
         }
 
-        # Fig 7: Layer Contribution (with computed summary)
+        # Fig 7: Layer Contribution
         layer_contrib = routing.get('layer_contribution', {})
         if layer_contrib:
             per_layer = layer_contrib.get('per_layer', {})
-
-            # Build per_layer dict with rounded values
             per_layer_data = {}
             attention_ratios = []
             knowledge_ratios = []
@@ -2769,12 +2910,11 @@ class ModelAnalyzer:
                 attention_ratios.append(att_ratio)
                 knowledge_ratios.append(know_ratio)
 
-            # Compute summary statistics
             import numpy as np
             att_arr = np.array(attention_ratios) if attention_ratios else np.array([50])
             know_arr = np.array(knowledge_ratios) if knowledge_ratios else np.array([50])
 
-            paper_results['fig7_layer_contribution'] = {
+            paper_data['figures']['fig7_layer_contribution'] = {
                 'per_layer': per_layer_data,
                 'summary': {
                     'attention_mean': round(float(att_arr.mean()), 1),
@@ -2784,62 +2924,73 @@ class ModelAnalyzer:
                 },
             }
 
-        # === Appendix Data (Important) ===
+        # === APPENDIX SECTION ===
+        health = self.results.get('health', {})
 
-        # Diversity Metrics - Dead neuron 문제 없음 증명
+        # Diversity Metrics
         diversity = health.get('diversity', {})
         if diversity:
-            paper_results['appendix_diversity'] = {}
+            diversity_data = {}
             for name, data in diversity.items():
                 if isinstance(data, dict) and 'normalized_entropy' in data:
-                    paper_results['appendix_diversity'][data.get('display', name)] = {
+                    diversity_data[name] = {
                         'normalized_entropy': round(data.get('normalized_entropy', 0), 3),
                         'effective_count': round(data.get('effective_count', 0), 1),
                         'coverage': round(data.get('coverage', 0), 3),
                     }
             overall = diversity.get('overall', {})
             if overall:
-                paper_results['appendix_diversity']['overall'] = {
+                diversity_data['_overall'] = {
                     'diversity_score': round(overall.get('diversity_score', 0), 3),
                     'health': overall.get('health', 'unknown'),
                 }
+            paper_data['appendix']['diversity'] = diversity_data
 
-        # Probing Accuracy - Interpretability 강화
+        # Probing Accuracy
         behavioral = self.results.get('behavioral', {})
         probing = behavioral.get('probing', {})
         if probing:
-            paper_results['appendix_probing'] = {}
+            probing_data = {}
             for pool, data in probing.items():
                 if isinstance(data, dict) and 'accuracy' in data:
-                    paper_results['appendix_probing'][pool] = {
+                    probing_data[pool] = {
                         'accuracy': round(data.get('accuracy', 0), 3),
                         'f1_macro': round(data.get('f1_macro', 0), 3),
                     }
+            paper_data['appendix']['probing'] = probing_data
 
-        # Documentation section: Training config and experiment setup
-        fig6_config = self._extract_training_configs()
-        paper_results['documentation'] = {
-            'training_config': {
-                'dawn': fig6_config.get('dawn', {}),
-                'vanilla': fig6_config.get('vanilla', {}),
-            },
-            'validation_set': {
-                'dataset': self._extract_dataset_name(self.val_data_path),
-                'path': str(self.val_data_path) if self.val_data_path else None,
-                'n_batches': self.results.get('performance', {}).get('validation', {}).get('n_batches', self.val_batches),
-            },
-            'experiment_details': {
-                'analysis_date': str(Path(self.output_dir).name) if self.output_dir else 'unknown',
-                'checkpoint_path': str(self.checkpoint_path) if self.checkpoint_path else None,
-                'compare_checkpoint_path': str(self.compare_checkpoint) if self.compare_checkpoint else None,
+        # === SAVE UNIFIED JSON ===
+        # Save as paper_data.json (new unified format)
+        data_path = paper_dir / 'paper_data.json'
+        with open(data_path, 'w') as f:
+            json.dump(convert_to_serializable(paper_data), f, indent=2)
+        print(f"    Saved: {data_path}")
+
+        # Also save backward-compatible paper_results.json (deprecated, will be removed)
+        # This maps the new structure to old keys for compatibility
+        paper_results = {
+            'table1_model_stats': paper_data['tables']['table1_model_stats'],
+            'table2_neuron_util': paper_data['tables']['table2_neuron_util'],
+            'fig3_qk_specialization': paper_data['figures'].get('fig3_qk_specialization', {}),
+            'fig4_pos_specialization': paper_data['figures'].get('fig4_pos_specialization', {}),
+            'fig5_factual': paper_data['figures'].get('fig5_factual', {}),
+            'fig6_training_dynamics': paper_data['figures'].get('fig6_training_dynamics', {}),
+            'fig7_layer_contribution': paper_data['figures'].get('fig7_layer_contribution', {}),
+            'appendix_diversity': paper_data['appendix'].get('diversity', {}),
+            'appendix_probing': paper_data['appendix'].get('probing', {}),
+            'documentation': {
+                'training_config': {
+                    'dawn': training_configs.get('dawn', {}),
+                    'vanilla': training_configs.get('vanilla', {}),
+                },
+                'validation_set': paper_data['training'].get('validation', {}),
+                'experiment_details': paper_data['metadata'],
             },
         }
-
-        # Save JSON
         results_path = paper_dir / 'paper_results.json'
         with open(results_path, 'w') as f:
             json.dump(convert_to_serializable(paper_results), f, indent=2)
-        print(f"    Saved: {results_path}")
+        print(f"    Saved: {results_path} (deprecated, use paper_data.json)")
 
     def _generate_paper_summary(self, paper_dir: Path):
         """Generate paper summary markdown."""
