@@ -89,19 +89,27 @@ def plot_factual_heatmap(
                     neuron, freq = nf
                 all_neurons[target][neuron] = freq
         elif 'per_pool' in data:
-            # New multi-pool structure
+            # New multi-pool structure - only use fknow pool
             all_common = set()
-            for pool, pool_data in data.get('per_pool', {}).items():
-                if isinstance(pool_data, dict):
-                    # Add common neurons from all pools
-                    common_80 = pool_data.get('common_80', [])
-                    all_common.update(common_80)
-                    # Get top_neurons for frequencies
-                    for nf in pool_data.get('top_neurons', []):
-                        if isinstance(nf, dict):
-                            neuron = nf.get('neuron', '')
-                            freq = nf.get('freq', 0) / 100.0
-                            all_neurons[target][neuron] = max(all_neurons[target][neuron], freq)
+            fknow_data = data.get('per_pool', {}).get('fknow', {})
+            if isinstance(fknow_data, dict):
+                common_80 = fknow_data.get('common_80', [])
+                # Remove pool prefix (fknow_71 → 71)
+                for n in common_80:
+                    if '_' in str(n):
+                        idx = str(n).split('_')[-1]
+                        all_common.add(idx)
+                    else:
+                        all_common.add(str(n))
+                # Get top_neurons for frequencies
+                for nf in fknow_data.get('top_neurons', []):
+                    if isinstance(nf, dict):
+                        neuron = nf.get('neuron', '')
+                        # Remove pool prefix
+                        if '_' in str(neuron):
+                            neuron = str(neuron).split('_')[-1]
+                        freq = nf.get('freq', 0) / 100.0
+                        all_neurons[target][neuron] = max(all_neurons[target][neuron], freq)
             common_neurons_per_target[target] = all_common
             # For new structure, use presence in common_80 as a proxy for high frequency
             for neuron in all_common:
@@ -207,9 +215,10 @@ def plot_factual_heatmap(
 
     # Select neurons: prioritize categories with interesting patterns
     # Category 0 (Shared) shows common knowledge, then specific categories
-    neurons_per_cat = max(3, top_n_neurons // 4)
+    # Exclude Mixed category (3)
+    neurons_per_cat = max(3, top_n_neurons // 3)
     sorted_neurons = []
-    category_order = [0, 1, 2, 3]  # Shared first, then Capital-specific, Other-specific, Mixed
+    category_order = [0, 1, 2]  # Shared, Capital-specific, Other-specific (no Mixed)
 
     for cat in category_order:
         neurons_in_cat = [n for n, _ in categorized[cat][:neurons_per_cat]]
@@ -252,19 +261,23 @@ def plot_factual_heatmap(
     # Capitalize target labels for display
     display_targets = [t.capitalize() for t in ordered_targets]
 
+    # Custom annotation: hide 0.00 values
+    annot_matrix = np.where(matrix > 0, matrix, np.nan)
+    annot_labels = [[f'{v:.2f}' if not np.isnan(v) else '' for v in row] for row in annot_matrix]
+
     sns.heatmap(
         matrix,
-        xticklabels=[str(n) for n in sorted_neurons],  # Use neuron name with pool prefix
+        xticklabels=[str(n) for n in sorted_neurons],  # Neuron index only
         yticklabels=display_targets,
         cmap='YlOrRd',
         vmin=0, vmax=1,
-        annot=True, fmt='.2f',
+        annot=annot_labels, fmt='',
         ax=ax,
         cbar_kws={'label': 'Activation Frequency', 'shrink': 0.8, 'pad': 0.02},
         linewidths=0.5
     )
 
-    # Add category boundary lines (vertical)
+    # Add category boundary lines (vertical) - no labels
     for b in boundaries:
         ax.axvline(x=b, color='black', linewidth=2)
 
@@ -272,48 +285,12 @@ def plot_factual_heatmap(
     if capital_targets and other_targets:
         ax.axhline(y=len(capital_targets), color='blue', linewidth=2, linestyle='--')
 
-    # Category labels - above heatmap using transAxes
-    category_names = {0: 'Shared', 1: 'Capital-specific', 2: 'Other-specific', 3: 'Mixed'}
-    prev_boundary = 0
-    n_neurons = len(sorted_neurons)
-    for i, b in enumerate(boundaries + [n_neurons]):
-        if b > prev_boundary:
-            mid = (prev_boundary + b) / 2 / n_neurons  # normalize to 0-1
-            cat_idx = categories[prev_boundary] if prev_boundary < len(categories) else 3
-            label = category_names.get(cat_idx, 'Mixed')
-            ax.text(mid, 1.02, label, ha='center', va='bottom',
-                   fontsize=9, fontweight='bold', color='darkblue',
-                   transform=ax.transAxes)
-        prev_boundary = b
+    # Title
+    ax.set_title('Factual Knowledge Neurons (F-Know Pool)',
+                fontsize=11, fontweight='bold', pad=10)
 
-    # Title - above category labels
-    ax.set_title('Factual Knowledge Neurons: Related outputs share neuron subsets',
-                fontsize=11, fontweight='bold', pad=20, y=1.06)
-
-    ax.set_xlabel('Neuron Index (grouped by semantic category)')
+    ax.set_xlabel('Neuron Index')
     ax.set_ylabel('Target Token')
-
-    # Pool color legend (small, top-right)
-    POOL_COLORS = {
-        'fknow': '#E53935', 'rknow': '#FF9800',
-        'fv': '#1E88E5', 'rv': '#43A047',
-    }
-    POOL_DISPLAY = {'fknow': 'F-Know', 'rknow': 'R-Know', 'fv': 'F-V', 'rv': 'R-V'}
-
-    # Detect which pools are present
-    seen_pools = set()
-    for n in sorted_neurons:
-        if '_' in str(n):
-            seen_pools.add(str(n).split('_')[0])
-
-    if seen_pools:
-        from matplotlib.patches import Patch
-        legend_elements = [
-            Patch(facecolor=POOL_COLORS[p], label=POOL_DISPLAY[p], edgecolor='gray', linewidth=0.5)
-            for p in ['fknow', 'rknow', 'fv', 'rv'] if p in seen_pools
-        ]
-        ax.legend(handles=legend_elements, loc='upper right', fontsize=7,
-                 title='Pool', title_fontsize=8, framealpha=0.9)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
