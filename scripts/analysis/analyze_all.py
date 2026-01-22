@@ -2286,6 +2286,38 @@ class ModelAnalyzer:
 
         return config_data
 
+    def _extract_dataset_name(self, path) -> str:
+        """Extract dataset name from validation data path.
+
+        Examples:
+            /data/val/c4/c4_val_50M.pt -> 'C4'
+            /data/wikitext-103/validation.pt -> 'WikiText-103'
+        """
+        if not path:
+            return 'unknown'
+
+        path_str = str(path).lower()
+
+        # Common dataset patterns
+        if 'c4' in path_str:
+            return 'C4'
+        elif 'wikitext' in path_str:
+            if '103' in path_str:
+                return 'WikiText-103'
+            elif '2' in path_str:
+                return 'WikiText-2'
+            return 'WikiText'
+        elif 'pile' in path_str:
+            return 'The Pile'
+        elif 'openwebtext' in path_str:
+            return 'OpenWebText'
+        elif 'bookcorpus' in path_str:
+            return 'BookCorpus'
+
+        # Fallback: extract from filename
+        filename = Path(path).stem
+        return filename if filename else 'unknown'
+
     def _extract_training_configs(self) -> Dict:
         """Extract and compare training configs from DAWN and Vanilla checkpoints."""
         result = {
@@ -2792,9 +2824,9 @@ class ModelAnalyzer:
                 'vanilla': fig6_config.get('vanilla', {}),
             },
             'validation_set': {
-                'dataset': 'WikiText-103',
-                'split': 'validation',
-                'n_batches': self.results.get('performance', {}).get('validation', {}).get('n_batches', 100),
+                'dataset': self._extract_dataset_name(self.val_data_path),
+                'path': str(self.val_data_path) if self.val_data_path else None,
+                'n_batches': self.results.get('performance', {}).get('validation', {}).get('n_batches', self.val_batches),
             },
             'experiment_details': {
                 'analysis_date': str(Path(self.output_dir).name) if self.output_dir else 'unknown',
