@@ -462,3 +462,168 @@ def plot_pos_specialization_from_features(
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close()
     return output_path
+
+
+def plot_pos_selectivity_heatmap(
+    selectivity_matrix: np.ndarray,
+    active_indices: list,
+    output_path: str,
+    top_n: int = 50,
+    figsize: Tuple[int, int] = (14, 12),
+    dpi: int = 150
+) -> Optional[str]:
+    """
+    Plot POS selectivity heatmap for Fig 4.
+
+    Selectivity score: P(neuron active | POS) / P(neuron active)
+    - > 1 (red): neuron prefers this POS
+    - = 1 (white): neuron is indifferent
+    - < 1 (blue): neuron avoids this POS
+
+    Args:
+        selectivity_matrix: [n_neurons, n_pos] selectivity scores
+        active_indices: List of active neuron indices
+        output_path: Path to save the figure
+        top_n: Number of top neurons to show
+        figsize: Figure size
+        dpi: Output resolution
+
+    Returns:
+        Path to saved figure or None
+    """
+    if not HAS_MATPLOTLIB or not HAS_SEABORN:
+        print("  Warning: matplotlib/seaborn not available, skipping selectivity heatmap")
+        return None
+
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+
+    # Get top neurons by selectivity range (most variable = most interesting)
+    if len(active_indices) == 0:
+        print("  Warning: No active neurons for selectivity heatmap")
+        return None
+
+    # Select subset of neurons
+    active_selectivity = selectivity_matrix[active_indices]
+    selectivity_range = active_selectivity.max(axis=1) - active_selectivity.min(axis=1)
+    top_idx = np.argsort(-selectivity_range)[:top_n]
+    selected_indices = [active_indices[i] for i in top_idx]
+    selected_selectivity = selectivity_matrix[selected_indices]
+
+    # Log2 scale for visualization (centered at 0 = selectivity 1)
+    log_selectivity = np.log2(np.clip(selected_selectivity, 0.01, 100))
+
+    # Create figure with two subplots
+    fig, axes = plt.subplots(1, 2, figsize=figsize, width_ratios=[4, 1])
+
+    # Main heatmap
+    im = axes[0].imshow(
+        log_selectivity,
+        aspect='auto',
+        cmap='RdBu_r',
+        vmin=-2, vmax=2,
+        interpolation='nearest'
+    )
+
+    # Labels
+    axes[0].set_xticks(range(len(UPOS_TAGS)))
+    axes[0].set_xticklabels(UPOS_TAGS, rotation=45, ha='right', fontsize=9)
+    axes[0].set_yticks(range(0, len(selected_indices), max(1, len(selected_indices) // 20)))
+    axes[0].set_yticklabels([f'N{selected_indices[i]}' for i in range(0, len(selected_indices), max(1, len(selected_indices) // 20))], fontsize=8)
+    axes[0].set_xlabel('POS Category', fontsize=11)
+    axes[0].set_ylabel('Neuron (sorted by selectivity range)', fontsize=11)
+    axes[0].set_title(f'Neuron POS Selectivity (Top {len(selected_indices)} neurons)', fontsize=12)
+
+    # Colorbar
+    cbar = fig.colorbar(im, ax=axes[0], shrink=0.8)
+    cbar.set_label('log₂(selectivity)\n>0: prefer, <0: avoid', fontsize=10)
+    cbar.set_ticks([-2, -1, 0, 1, 2])
+    cbar.set_ticklabels(['0.25x', '0.5x', '1x', '2x', '4x'])
+
+    # Mean selectivity per POS (bar chart)
+    mean_sel = selectivity_matrix[active_indices].mean(axis=0)
+    colors = ['coral' if s > 1.1 else 'steelblue' if s < 0.9 else 'gray' for s in mean_sel]
+    axes[1].barh(range(len(UPOS_TAGS)), mean_sel, color=colors)
+    axes[1].axvline(x=1.0, color='black', linestyle='--', alpha=0.5)
+    axes[1].set_yticks(range(len(UPOS_TAGS)))
+    axes[1].set_yticklabels(UPOS_TAGS, fontsize=9)
+    axes[1].set_xlabel('Mean Selectivity', fontsize=10)
+    axes[1].set_title('Population Mean', fontsize=11)
+    axes[1].set_xlim(0, max(2.0, mean_sel.max() * 1.1))
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close()
+
+    print(f"  Saved: {output_path}")
+    return output_path
+
+
+def plot_pos_selectivity_clustered(
+    selectivity_matrix: np.ndarray,
+    active_indices: list,
+    output_path: str,
+    top_n: int = 100,
+    figsize: Tuple[int, int] = (16, 14),
+    dpi: int = 150
+) -> Optional[str]:
+    """
+    Plot clustered POS selectivity heatmap with dendrogram.
+
+    Uses hierarchical clustering to group neurons with similar POS preferences.
+
+    Args:
+        selectivity_matrix: [n_neurons, n_pos] selectivity scores
+        active_indices: List of active neuron indices
+        output_path: Path to save the figure
+        top_n: Number of top neurons to cluster
+        figsize: Figure size
+        dpi: Output resolution
+
+    Returns:
+        Path to saved figure or None
+    """
+    if not HAS_MATPLOTLIB or not HAS_SEABORN or not HAS_SCIPY:
+        print("  Warning: matplotlib/seaborn/scipy not available, skipping clustered heatmap")
+        return None
+
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+
+    if len(active_indices) == 0:
+        print("  Warning: No active neurons for clustered heatmap")
+        return None
+
+    # Select top neurons by selectivity range
+    active_selectivity = selectivity_matrix[active_indices]
+    selectivity_range = active_selectivity.max(axis=1) - active_selectivity.min(axis=1)
+    top_idx = np.argsort(-selectivity_range)[:top_n]
+    selected_indices = [active_indices[i] for i in top_idx]
+    selected_selectivity = selectivity_matrix[selected_indices]
+
+    # Log2 scale
+    log_selectivity = np.log2(np.clip(selected_selectivity, 0.01, 100))
+
+    # Create clustermap
+    g = sns.clustermap(
+        log_selectivity,
+        cmap='RdBu_r',
+        center=0,
+        vmin=-2, vmax=2,
+        figsize=figsize,
+        xticklabels=UPOS_TAGS,
+        yticklabels=[f'N{i}' for i in selected_indices],
+        dendrogram_ratio=(0.1, 0.15),
+        cbar_pos=(0.02, 0.8, 0.03, 0.15),
+    )
+
+    g.ax_heatmap.set_xlabel('POS Category', fontsize=11)
+    g.ax_heatmap.set_ylabel('Neuron', fontsize=11)
+    g.fig.suptitle(f'Clustered Neuron POS Selectivity (Top {len(selected_indices)} neurons)', fontsize=13, y=1.02)
+
+    # Rotate x labels
+    plt.setp(g.ax_heatmap.get_xticklabels(), rotation=45, ha='right')
+
+    g.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close()
+
+    print(f"  Saved: {output_path}")
+    return output_path

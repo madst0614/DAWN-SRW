@@ -3935,6 +3935,82 @@ class NeuronFeatureAnalyzer:
 
         return specialized
 
+    def compute_selectivity_matrix(self, min_activations: int = 10) -> Dict:
+        """
+        Compute selectivity scores for all neurons across POS categories.
+
+        Selectivity score = P(neuron active | POS) / P(neuron active)
+        - > 1: neuron prefers this POS (more active than baseline)
+        - = 1: neuron is indifferent to this POS
+        - < 1: neuron avoids this POS (less active than baseline)
+
+        Args:
+            min_activations: Minimum activations to include neuron
+
+        Returns:
+            Dict with selectivity matrix and summary statistics
+        """
+        self._compute_neuron_features()
+
+        n_neurons = self.n_neurons
+        n_pos = len(UPOS_TAGS)
+        total_tokens = len(self.token_data)
+
+        # POS totals: how many tokens of each POS
+        pos_totals = self._pos_matrix.sum(axis=0)  # [n_pos]
+
+        # Compute selectivity matrix [n_neurons, n_pos]
+        selectivity = np.ones((n_neurons, n_pos), dtype=np.float32)
+
+        # Active neurons (with enough activations)
+        active_mask = self._neuron_totals >= min_activations
+        active_indices = np.where(active_mask)[0]
+
+        for n in active_indices:
+            p_neuron = self._neuron_totals[n] / total_tokens  # P(neuron active)
+            for p in range(n_pos):
+                if pos_totals[p] > 0 and p_neuron > 0:
+                    # P(neuron active | POS)
+                    p_neuron_given_pos = self._neuron_pos_counts[n, p] / pos_totals[p]
+                    selectivity[n, p] = p_neuron_given_pos / p_neuron
+
+        # Summary statistics
+        # Top selective neurons per POS
+        top_selective = {}
+        for p, pos_tag in enumerate(UPOS_TAGS):
+            # Get neurons with selectivity > 1.5 for this POS
+            sel_scores = selectivity[active_mask, p]
+            sel_indices = active_indices[np.argsort(-sel_scores)][:10]  # Top 10
+            top_selective[pos_tag] = [
+                {'neuron': int(idx), 'selectivity': round(float(selectivity[idx, p]), 2)}
+                for idx in sel_indices
+                if selectivity[idx, p] > 1.0  # Only include if actually selective
+            ]
+
+        # Mean selectivity per POS (across active neurons)
+        mean_selectivity = {
+            pos: round(float(selectivity[active_mask, p].mean()), 3)
+            for p, pos in enumerate(UPOS_TAGS)
+        }
+
+        # Selectivity range per neuron (max - min across POS)
+        selectivity_range = selectivity[active_mask].max(axis=1) - selectivity[active_mask].min(axis=1)
+
+        return {
+            'selectivity_matrix': selectivity,  # [n_neurons, n_pos]
+            'active_neuron_indices': active_indices.tolist(),
+            'pos_tags': UPOS_TAGS,
+            'top_selective_per_pos': top_selective,
+            'mean_selectivity_by_pos': mean_selectivity,
+            'selectivity_range': {
+                'mean': round(float(selectivity_range.mean()), 3),
+                'std': round(float(selectivity_range.std()), 3),
+                'max': round(float(selectivity_range.max()), 3),
+            },
+            'n_active_neurons': int(active_mask.sum()),
+            'total_tokens': total_tokens,
+        }
+
     def build_feature_vectors(self) -> Tuple[np.ndarray, List[int]]:
         """
         Build feature vectors for neuron clustering using precomputed matrices.
@@ -4184,16 +4260,41 @@ class NeuronFeatureAnalyzer:
             'by_pool': pool_specialization,
         }
 
+        # Compute selectivity matrix for Fig 4 heatmap
+        print("\n  Computing selectivity matrix...")
+        selectivity_data = self.compute_selectivity_matrix(min_activations=10)
+
         # Cluster neurons
         clusters = self.cluster_neurons(n_clusters=10)
 
         # Print summary
         self.print_summary(specialized, clusters)
 
+        # Print selectivity summary
+        print(f"\n  ┌─ POS Selectivity Summary ─────────────────────────────────────────────")
+        print(f"  │ Active neurons: {selectivity_data['n_active_neurons']}")
+        print(f"  │ Selectivity range (max-min): mean={selectivity_data['selectivity_range']['mean']:.2f}, "
+              f"max={selectivity_data['selectivity_range']['max']:.2f}")
+        print(f"  │ Top selective POS:")
+        for pos in ['NOUN', 'VERB', 'ADJ', 'PUNCT']:
+            top = selectivity_data['top_selective_per_pos'].get(pos, [])[:3]
+            if top:
+                top_str = ', '.join([f"N{t['neuron']}({t['selectivity']:.1f}x)" for t in top])
+                print(f"  │   {pos}: {top_str}")
+        print(f"  └─────────────────────────────────────────────────────────────────────────")
+
         results = {
             'n_neurons_profiled': len(profiles),
             'specialized_neurons': specialized,
             'specialization_summary': specialization_summary,
+            'selectivity': {
+                'top_selective_per_pos': selectivity_data['top_selective_per_pos'],
+                'mean_selectivity_by_pos': selectivity_data['mean_selectivity_by_pos'],
+                'selectivity_range': selectivity_data['selectivity_range'],
+                'n_active_neurons': selectivity_data['n_active_neurons'],
+                'pos_tags': selectivity_data['pos_tags'],
+                # Don't include full matrix in results (too large), save separately
+            },
             'clusters': clusters,
             'summary': {
                 'total_tokens': len(self.token_data),
@@ -4201,6 +4302,10 @@ class NeuronFeatureAnalyzer:
                 'n_specialized': {k: len(v) for k, v in specialized.items()},
             }
         }
+
+        # Store full selectivity matrix for visualization (not in JSON)
+        self._selectivity_matrix = selectivity_data['selectivity_matrix']
+        self._selectivity_active_indices = selectivity_data['active_neuron_indices']
 
         # Save if output_dir provided
         if output_dir:
@@ -4224,12 +4329,19 @@ class NeuronFeatureAnalyzer:
                 'n_neurons_profiled': results['n_neurons_profiled'],
                 'specialized_neurons': results['specialized_neurons'],
                 'specialization_summary': results['specialization_summary'],
+                'selectivity': results.get('selectivity', {}),
                 'clusters': {
                     k: v for k, v in results['clusters'].items()
                     if k != 'cluster_profiles'  # Skip large arrays
                 },
                 'summary': results['summary'],
             }
+
+            # Save selectivity matrix separately (for heatmap visualization)
+            if hasattr(self, '_selectivity_matrix'):
+                selectivity_path = os.path.join(output_dir, 'selectivity_matrix.npy')
+                np.save(selectivity_path, self._selectivity_matrix)
+                print(f"  Selectivity matrix saved to: {selectivity_path}")
 
             with open(results_path, 'w') as f:
                 json.dump(results_json, f, indent=2, cls=NumpyEncoder)

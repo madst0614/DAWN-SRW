@@ -154,68 +154,81 @@ q_ratio_active = q_ratio[active_mask].tolist()
 
 ### Fig 4: POS Neuron Specialization
 
-**목적**: 특정 POS(품사)에 특화된 뉴런이 존재함을 보여줌
+**목적**: 뉴런별 POS 선호 패턴을 보여줌 (selectivity heatmap)
 
 #### 관련 파일
 ```
 scripts/analysis/
 ├── pos_neuron.py
-│   ├── TokenCombinationAnalyzer
-│   │   ├── _extract_layer_mask() [line 1660-1737]  # 뉴런 활성화 판정
-│   │   └── analyze_dataset()
 │   └── NeuronFeatureAnalyzer
 │       ├── _build_matrices() [line 3604-3685]      # activation matrix 구성
 │       ├── _compute_neuron_features() [line 3687-3732]
-│       ├── build_neuron_profiles() [line 3760-3828]
-│       ├── detect_specialized_neurons() [line 3830-3920]
+│       ├── compute_selectivity_matrix() [NEW]      # selectivity score 계산
+│       ├── detect_specialized_neurons() [line 3830-3920]  # 80%+ threshold (appendix용)
 │       └── run_full_analysis()
 │
 ├── paper_figures.py
 │   └── generate_figure4() [line 428-472]
 │
 └── visualizers/pos_neurons.py
-    └── plot_pos_specialization_from_features() [line 373+]
+    ├── plot_pos_selectivity_heatmap() [NEW]        # Main figure
+    ├── plot_pos_selectivity_clustered() [NEW]      # Clustered version
+    └── plot_pos_specialization_from_features()     # Appendix용 (80% threshold)
 ```
 
-#### 계산 로직
+#### Main Figure: Selectivity Heatmap
+
+**Selectivity Score 정의:**
 ```python
-# 1. 뉴런 활성화 판정 (_extract_layer_mask, line 1684-1720)
-mask = layer.get_mask(pool_key)      # 우선: 모델의 binary mask (tau 기반)
-if mask is None:
-    mask = weights > 0.01            # fallback: weight threshold
+# compute_selectivity_matrix()
 
-# 2. Activation matrix 구성 (_build_matrices, line 3619-3632)
-# activation_matrix[token_idx, neuron_idx] = 1 if active
-for tok_idx, token in enumerate(token_data):
-    active_neurons = np.where(token['mask'])[0]
-    activation_matrix[tok_idx, active_neurons] = 1
+Selectivity(neuron, POS) = P(neuron active | POS) / P(neuron active)
 
-# 3. POS별 활성화 집계 (_compute_neuron_features, line 3703-3706)
-# neuron_pos_counts[neuron, pos] = 해당 POS 토큰에서 활성화된 횟수
-neuron_pos_counts = activation_matrix.T @ pos_matrix  # [n_neurons, n_pos]
-neuron_pos_pct = neuron_pos_counts / neuron_totals * 100
-
-# 4. Specialization 판정 (detect_specialized_neurons, line 3867-3873)
-top_pos_pct = max(neuron_pos_pct[neuron, :])
-if top_pos_pct >= 80:  # threshold = 0.8
-    specialized['pos'].append(neuron)
+# 해석:
+# > 1: 뉴런이 해당 POS를 선호 (baseline보다 더 자주 활성화)
+# = 1: 뉴런이 해당 POS에 무관
+# < 1: 뉴런이 해당 POS를 회피 (baseline보다 덜 활성화)
 ```
 
-#### Measurement Method (논문용)
+**계산 로직:**
+```python
+# pos_neuron.py - compute_selectivity_matrix()
 
-**Concentration Metric:**
+total_tokens = len(token_data)
+pos_totals = pos_matrix.sum(axis=0)  # 각 POS의 총 토큰 수
+
+for neuron_idx in active_neurons:
+    p_neuron = neuron_totals[neuron_idx] / total_tokens  # P(neuron active)
+
+    for pos_idx in range(n_pos):
+        # P(neuron active | POS)
+        p_neuron_given_pos = neuron_pos_counts[neuron_idx, pos_idx] / pos_totals[pos_idx]
+
+        selectivity[neuron_idx, pos_idx] = p_neuron_given_pos / p_neuron
 ```
-For each neuron i:
-  concentration_i(POS) = activations_on_POS / total_activations_of_neuron_i
 
-Specialized if: max(concentration_i) >= 80%
-Interpretation: "80%+ of this neuron's activations occur on a single POS"
+**Heatmap 시각화:**
+```python
+# visualizers/pos_neurons.py - plot_pos_selectivity_heatmap()
+
+# Log2 scale for visualization (centered at 0 = selectivity 1)
+log_selectivity = np.log2(selectivity)
+
+# Color: Red = prefer (>1), Blue = avoid (<1), White = neutral (=1)
+# Range: -2 to +2 (0.25x to 4x)
 ```
 
-**Why 80% threshold:**
-- Represents overwhelming majority (4:1 ratio over all other POS combined)
-- Consistent with prior interpretability work (Geva et al., Bau et al.)
-- Can report sensitivity analysis (70%-90%) in Appendix
+#### Appendix: 80% Threshold Specialization
+
+**Concentration Metric (기존 방식):**
+```
+concentration(neuron, POS) = activations_on_POS / total_activations_of_neuron
+
+Specialized if: max(concentration) >= 80%
+```
+
+**참고**: 80% threshold에서 5/1103 뉴런만 specialized (0.5%) →
+Selectivity heatmap이 더 informative함
 
 #### 검증 완료 ✅
 | 항목 | 상태 | 비고 |
@@ -235,9 +248,36 @@ Interpretation: "80%+ of this neuron's activations occur on a single POS"
 - `NeuronFeatureAnalyzer.run_full_analysis()` 결과
 
 #### 출력 데이터 구조
+
+**Main: Selectivity (paper_results.json)**
 ```python
-# specialization_summary (run_full_analysis() 결과)
-{
+'fig4_pos_specialization': {
+    'selectivity': {
+        'top_selective_per_pos': {
+            'NOUN': [{'neuron': 45, 'selectivity': 3.2}, ...],
+            'VERB': [...],
+            ...
+        },
+        'mean_selectivity_by_pos': {'NOUN': 1.2, 'VERB': 0.9, ...},
+        'selectivity_range': {'mean': 0.8, 'std': 0.3, 'max': 2.5},
+        'n_active_neurons': 1000,
+    },
+    # Appendix용 (80% threshold)
+    'specialized_neurons_80pct': 5,
+    'specialized_ratio_80pct': 0.005,
+    ...
+}
+```
+
+**Full Selectivity Matrix (별도 파일)**
+```python
+# neuron_features/selectivity_matrix.npy
+selectivity_matrix: np.ndarray  # [n_neurons, n_pos]
+```
+
+**Appendix: Specialization Summary**
+```python
+'specialization_summary': {
     'total_neurons': N,
     'specialized_count': {
         '60%': {'pos': X1, 'position': Y1, ...},

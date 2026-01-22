@@ -2544,12 +2544,23 @@ class ModelAnalyzer:
             # Sort by concentration and keep top 10
             top_list.sort(key=lambda x: x['concentration'], reverse=True)
 
+            # Selectivity data for Fig 4 heatmap (main figure)
+            selectivity = neuron_features.get('selectivity', {})
+
             paper_results['fig4_pos_specialization'] = {
                 'total_neurons_analyzed': total_neurons,
-                'specialized_neurons': n_specialized_total,
-                'specialized_ratio': round(n_specialized_total / total_neurons, 3) if total_neurons > 0 else 0,
-                'per_pos': per_pos,
-                'top_10': top_list[:10],
+                # Selectivity-based analysis (main figure - heatmap)
+                'selectivity': {
+                    'top_selective_per_pos': selectivity.get('top_selective_per_pos', {}),
+                    'mean_selectivity_by_pos': selectivity.get('mean_selectivity_by_pos', {}),
+                    'selectivity_range': selectivity.get('selectivity_range', {}),
+                    'n_active_neurons': selectivity.get('n_active_neurons', 0),
+                },
+                # Threshold-based specialization (appendix)
+                'specialized_neurons_80pct': n_specialized_total,
+                'specialized_ratio_80pct': round(n_specialized_total / total_neurons, 3) if total_neurons > 0 else 0,
+                'per_pos_80pct': per_pos,
+                'top_10_80pct': top_list[:10],
                 # Multi-threshold analysis for paper sensitivity check
                 'specialization_summary': neuron_features.get('specialization_summary', {}),
             }
