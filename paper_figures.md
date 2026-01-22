@@ -129,6 +129,18 @@ q_ratio_active = q_ratio[active_mask].tolist()
 - `q_ratio`: 뉴런별 Q 비율 (scatter plot용)
 - `q_ratio_active`: 활성 뉴런만 (histogram용)
 - `specialization_thresholds`: 사용된 임계값 기록
+- `sensitivity_analysis`: 여러 threshold별 결과 (논문 robustness 검증용)
+
+```python
+# sensitivity_analysis 구조
+{
+    '0.6': {'q_specialized': N, 'k_specialized': M, 'shared': S, 'total_active': T},
+    '0.65': {...},
+    '0.7': {...},
+    '0.75': {...},
+    '0.8': {...},
+}
+```
 
 #### 데이터 소스
 - `self.results['routing']['qk_usage']` (analyze_qk_usage 결과)
@@ -221,6 +233,34 @@ Interpretation: "80%+ of this neuron's activations occur on a single POS"
 - Universal Dependencies English Web Treebank (UD EWT)
 - POS tags: 17개 UPOS categories
 - `NeuronFeatureAnalyzer.run_full_analysis()` 결과
+
+#### 출력 데이터 구조
+```python
+# specialization_summary (run_full_analysis() 결과)
+{
+    'total_neurons': N,
+    'specialized_count': {
+        '60%': {'pos': X1, 'position': Y1, ...},
+        '70%': {'pos': X2, 'position': Y2, ...},
+        '80%': {'pos': X3, 'position': Y3, ...},
+    },
+    'specialized_ratio': {
+        '60%': {'pos': X1/N, ...},
+        '70%': {'pos': X2/N, ...},
+        '80%': {'pos': X3/N, ...},
+    },
+    'by_pool': {
+        'fqk_q': {'total': N1, 'specialized_60': S1, 'specialized_70': S2, 'specialized_80': S3},
+        'fqk_k': {...},
+        'fv': {...},
+        'rqk_q': {...},
+        'rqk_k': {...},
+        'rv': {...},
+        'fknow': {...},
+        'rknow': {...},
+    }
+}
+```
 
 #### 출력
 - (a) Top 20 POS-specialized neurons (concentration ≥80%)

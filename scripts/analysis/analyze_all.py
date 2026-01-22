@@ -2457,6 +2457,8 @@ class ModelAnalyzer:
                     'shared': data.get('shared', 0),
                     'inactive': data.get('inactive', 0),
                     'n_neurons': data.get('n_neurons', 0),
+                    # Sensitivity analysis for paper robustness check
+                    'sensitivity_analysis': data.get('sensitivity_analysis', {}),
                 }
 
         # Fig 4: POS Specialization (summary only for paper)
@@ -2493,6 +2495,8 @@ class ModelAnalyzer:
                 'specialized_ratio': round(n_specialized_total / total_neurons, 3) if total_neurons > 0 else 0,
                 'per_pos': per_pos,
                 'top_10': top_list[:10],
+                # Multi-threshold analysis for paper sensitivity check
+                'specialization_summary': neuron_features.get('specialization_summary', {}),
             }
 
         # Fig 5: Factual Heatmap (summary only, no neuron lists)
@@ -2612,6 +2616,25 @@ class ModelAnalyzer:
                         'accuracy': round(data.get('accuracy', 0), 3),
                         'f1_macro': round(data.get('f1_macro', 0), 3),
                     }
+
+        # Documentation section: Training config and experiment setup
+        fig6_config = self._extract_training_configs()
+        paper_results['documentation'] = {
+            'training_config': {
+                'dawn': fig6_config.get('dawn', {}),
+                'vanilla': fig6_config.get('vanilla', {}),
+            },
+            'validation_set': {
+                'dataset': 'WikiText-103',
+                'split': 'validation',
+                'n_batches': self.results.get('performance', {}).get('validation', {}).get('n_batches', 100),
+            },
+            'experiment_details': {
+                'analysis_date': str(Path(self.output_dir).name) if self.output_dir else 'unknown',
+                'checkpoint_path': str(self.checkpoint_path) if self.checkpoint_path else None,
+                'compare_checkpoint_path': str(self.compare_checkpoint) if self.compare_checkpoint else None,
+            },
+        }
 
         # Save JSON
         results_path = paper_dir / 'paper_results.json'

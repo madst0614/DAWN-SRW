@@ -4108,6 +4108,20 @@ class NeuronFeatureAnalyzer:
             tokenizer=tca.tokenizer,
         )
 
+    def _get_pool_ranges(self) -> Dict[str, Tuple[int, int]]:
+        """
+        Get neuron index ranges for each pool.
+
+        Returns:
+            Dict mapping pool_name -> (start_idx, end_idx)
+        """
+        ranges = {}
+        offset = 0
+        for pool_name, size in self.pool_order:
+            ranges[pool_name] = (offset, offset + size)
+            offset += size
+        return ranges
+
     def run_full_analysis(self, output_dir: str = None) -> Dict:
         """
         Run complete neuron feature analysis.
@@ -4125,8 +4139,50 @@ class NeuronFeatureAnalyzer:
         # Build profiles
         profiles = self.build_neuron_profiles()
 
-        # Detect specialized neurons
+        # Detect specialized neurons at default threshold (80%)
         specialized = self.detect_specialized_neurons(threshold=0.8)
+
+        # Multi-threshold specialization analysis for paper
+        thresholds = [0.6, 0.7, 0.8]
+        multi_threshold_results = {}
+        for t in thresholds:
+            spec_t = self.detect_specialized_neurons(threshold=t)
+            multi_threshold_results[f'{int(t*100)}%'] = {
+                k: len(v) for k, v in spec_t.items()
+            }
+
+        # Pool-specific specialization analysis
+        pool_ranges = self._get_pool_ranges()
+        pool_specialization = {}
+
+        for pool_name, (start_idx, end_idx) in pool_ranges.items():
+            pool_size = end_idx - start_idx
+            pool_spec = {'total': pool_size}
+
+            # Count specialized neurons in this pool at each threshold
+            for t in thresholds:
+                spec_t = self.detect_specialized_neurons(threshold=t)
+                # Count POS-specialized neurons in this pool
+                count = sum(
+                    1 for n in spec_t.get('pos', [])
+                    if start_idx <= n['neuron'] < end_idx
+                )
+                pool_spec[f'specialized_{int(t*100)}'] = count
+
+            pool_specialization[pool_name] = pool_spec
+
+        # Build specialization summary for paper
+        total_neurons = self.n_neurons
+        specialization_summary = {
+            'total_neurons': total_neurons,
+            'specialized_count': multi_threshold_results,
+            'specialized_ratio': {
+                k: {feat: round(cnt / total_neurons, 4) if total_neurons > 0 else 0
+                    for feat, cnt in counts.items()}
+                for k, counts in multi_threshold_results.items()
+            },
+            'by_pool': pool_specialization,
+        }
 
         # Cluster neurons
         clusters = self.cluster_neurons(n_clusters=10)
@@ -4137,6 +4193,7 @@ class NeuronFeatureAnalyzer:
         results = {
             'n_neurons_profiled': len(profiles),
             'specialized_neurons': specialized,
+            'specialization_summary': specialization_summary,
             'clusters': clusters,
             'summary': {
                 'total_tokens': len(self.token_data),
@@ -4166,6 +4223,7 @@ class NeuronFeatureAnalyzer:
             results_json = {
                 'n_neurons_profiled': results['n_neurons_profiled'],
                 'specialized_neurons': results['specialized_neurons'],
+                'specialization_summary': results['specialization_summary'],
                 'clusters': {
                     k: v for k, v in results['clusters'].items()
                     if k != 'cluster_profiles'  # Skip large arrays

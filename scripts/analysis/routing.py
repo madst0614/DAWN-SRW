@@ -572,6 +572,20 @@ class RoutingAnalyzer(BaseAnalyzer):
                 shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7) & active_mask).sum())
                 inactive = int(inactive_mask.sum())
 
+                # Sensitivity analysis: multiple thresholds for paper
+                sensitivity_thresholds = [0.6, 0.65, 0.7, 0.75, 0.8]
+                sensitivity_analysis = {}
+                for t in sensitivity_thresholds:
+                    q_spec = int(((q_ratio > t) & active_mask).sum())
+                    k_spec = int(((q_ratio < (1 - t)) & active_mask).sum())
+                    shared_t = int(((q_ratio >= (1 - t)) & (q_ratio <= t) & active_mask).sum())
+                    sensitivity_analysis[str(t)] = {
+                        'q_specialized': q_spec,
+                        'k_specialized': k_spec,
+                        'shared': shared_t,
+                        'total_active': int(active_mask.sum()),
+                    }
+
                 # Q-ratio data for histogram (bimodal distribution)
                 q_ratio_active = q_ratio[active_mask].tolist()
 
@@ -599,7 +613,9 @@ class RoutingAnalyzer(BaseAnalyzer):
                         'q_specialized': 0.7,
                         'k_specialized': 0.3,
                         'inactive_percentile': 10
-                    }
+                    },
+                    # Sensitivity analysis for different thresholds
+                    'sensitivity_analysis': sensitivity_analysis,
                 }
 
             results['n_batches'] = n_batches
