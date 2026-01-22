@@ -1477,6 +1477,7 @@ class RoutingAnalyzer(BaseAnalyzer):
 
         try:
             with self.extractor.analysis_context():
+                processed_batches = 0
                 for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Routing Analysis (single-pass)')):
                     if i >= n_batches:
                         break
@@ -1485,12 +1486,16 @@ class RoutingAnalyzer(BaseAnalyzer):
 
                     try:
                         with torch.no_grad():
-                            outputs = self.model(input_ids, return_routing_info=True, return_path_weights=True)
+                            outputs = self.model(input_ids, return_routing_info=True)
                         routing = self.extractor.extract(outputs)
                         if not routing:
                             continue
-                    except Exception:
+                    except Exception as e:
+                        if processed_batches == 0:
+                            print(f"  [Warning] First batch failed: {e}")
                         continue
+
+                    processed_batches += 1
 
                     # Process all layers from this batch
                     for layer in routing:
