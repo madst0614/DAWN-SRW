@@ -4021,7 +4021,7 @@ class NeuronFeatureAnalyzer:
             min_activations: Minimum activations to include neuron
 
         Returns:
-            Dict with selectivity matrix and summary statistics
+            Dict with selectivity matrix, per-pool analysis, unified naming
         """
         self._compute_neuron_features()
 
@@ -4047,32 +4047,82 @@ class NeuronFeatureAnalyzer:
                     p_neuron_given_pos = self._neuron_pos_counts[n, p] / pos_totals[p]
                     selectivity[n, p] = p_neuron_given_pos / p_neuron
 
-        # Summary statistics
-        # Top selective neurons per POS
+        # Get pool ranges for per-pool analysis
+        pool_ranges = self._get_pool_ranges()
+
+        # Top selective neurons per POS (with unified naming)
         top_selective = {}
         for p, pos_tag in enumerate(UPOS_TAGS):
-            # Get neurons with selectivity > 1.5 for this POS
             sel_scores = selectivity[active_mask, p]
             sel_indices = active_indices[np.argsort(-sel_scores)][:10]  # Top 10
             top_selective[pos_tag] = [
-                {'neuron': int(idx), 'selectivity': round(float(selectivity[idx, p]), 2)}
+                {
+                    'neuron': self._get_neuron_name(int(idx)),
+                    'neuron_idx': int(idx),
+                    'pool': self._get_pool_for_neuron(int(idx)),
+                    'selectivity': round(float(selectivity[idx, p]), 2)
+                }
                 for idx in sel_indices
-                if selectivity[idx, p] > 1.0  # Only include if actually selective
+                if selectivity[idx, p] > 1.0
             ]
 
-        # Mean selectivity per POS (across active neurons)
+        # Per-pool analysis
+        per_pool = {}
+        for pool_name, (start_idx, end_idx) in pool_ranges.items():
+            pool_size = end_idx - start_idx
+            pool_active = active_mask[start_idx:end_idx]
+            pool_selectivity = selectivity[start_idx:end_idx]
+            n_active = int(pool_active.sum())
+
+            # Top selective neurons in this pool
+            pool_top = []
+            if n_active > 0:
+                for p, pos_tag in enumerate(UPOS_TAGS):
+                    pool_sel = pool_selectivity[pool_active, p]
+                    pool_indices = np.where(pool_active)[0]
+                    if len(pool_indices) > 0:
+                        top_idx = pool_indices[np.argmax(pool_sel)]
+                        global_idx = start_idx + top_idx
+                        if pool_selectivity[top_idx, p] > 1.5:  # Only strong selectivity
+                            pool_top.append({
+                                'neuron': self._get_neuron_name(global_idx),
+                                'pos': pos_tag,
+                                'selectivity': round(float(pool_selectivity[top_idx, p]), 2)
+                            })
+
+            per_pool[pool_name] = {
+                'n_neurons': pool_size,
+                'n_active': n_active,
+                'top_selective': sorted(pool_top, key=lambda x: -x['selectivity'])[:10],
+            }
+
+        # Mean selectivity per POS
         mean_selectivity = {
             pos: round(float(selectivity[active_mask, p].mean()), 3)
             for p, pos in enumerate(UPOS_TAGS)
         }
 
-        # Selectivity range per neuron (max - min across POS)
+        # Selectivity range per neuron
         selectivity_range = selectivity[active_mask].max(axis=1) - selectivity[active_mask].min(axis=1)
+
+        # By-POS summary with top neurons
+        by_pos = {}
+        for p, pos_tag in enumerate(UPOS_TAGS):
+            by_pos[pos_tag] = {
+                'top_neurons': [n['neuron'] for n in top_selective[pos_tag][:5]],
+                'mean_selectivity': mean_selectivity[pos_tag],
+            }
 
         return {
             'selectivity_matrix': selectivity,  # [n_neurons, n_pos]
             'active_neuron_indices': active_indices.tolist(),
             'pos_tags': UPOS_TAGS,
+            'pools_analyzed': list(pool_ranges.keys()),
+            'total_neurons': n_neurons,
+            # Per-pool analysis
+            'per_pool': per_pool,
+            # By POS analysis
+            'by_pos': by_pos,
             'top_selective_per_pos': top_selective,
             'mean_selectivity_by_pos': mean_selectivity,
             'selectivity_range': {
@@ -4272,6 +4322,106 @@ class NeuronFeatureAnalyzer:
             offset += size
         return ranges
 
+    def _get_neuron_name(self, global_idx: int) -> str:
+        """
+        Convert global neuron index to unified naming format: {pool}_{local_idx}
+
+        Examples:
+            0 -> 'fqk_0'
+            64 -> 'fv_0'
+            328 -> 'rqk_0'
+
+        Args:
+            global_idx: Global neuron index (0 to total_neurons-1)
+
+        Returns:
+            String like 'fv_45', 'fknow_12', etc.
+        """
+        pool_ranges = self._get_pool_ranges()
+        for pool_name, (start_idx, end_idx) in pool_ranges.items():
+            if start_idx <= global_idx < end_idx:
+                local_idx = global_idx - start_idx
+                return f'{pool_name}_{local_idx}'
+        return f'unknown_{global_idx}'
+
+    def _get_pool_for_neuron(self, global_idx: int) -> str:
+        """Get pool name for a global neuron index."""
+        pool_ranges = self._get_pool_ranges()
+        for pool_name, (start_idx, end_idx) in pool_ranges.items():
+            if start_idx <= global_idx < end_idx:
+                return pool_name
+        return 'unknown'
+
+    def _compute_utilization_stats(self, active_threshold: int = 1) -> Dict:
+        """
+        Compute forward-pass based neuron utilization statistics.
+
+        This replaces EMA-based utilization (Table 2) with actual inference-time usage.
+
+        Args:
+            active_threshold: Minimum activations to consider neuron "active" (default: 1)
+
+        Returns:
+            Dict with per-pool utilization stats
+        """
+        self._compute_neuron_features()
+
+        pool_ranges = self._get_pool_ranges()
+        total_tokens = len(self.token_data)
+        utilization = {}
+
+        for pool_name, (start_idx, end_idx) in pool_ranges.items():
+            pool_size = end_idx - start_idx
+            pool_totals = self._neuron_totals[start_idx:end_idx]
+
+            # Active neurons (activated at least once)
+            active_mask = pool_totals >= active_threshold
+            n_active = int(active_mask.sum())
+            n_dead = pool_size - n_active
+
+            # Usage statistics
+            active_totals = pool_totals[active_mask]
+            mean_usage = float(active_totals.mean()) if n_active > 0 else 0
+            std_usage = float(active_totals.std()) if n_active > 0 else 0
+
+            # Gini coefficient for usage inequality
+            if n_active > 1:
+                sorted_usage = np.sort(active_totals)
+                n = len(sorted_usage)
+                cumsum = np.cumsum(sorted_usage)
+                gini = (2 * np.sum((np.arange(1, n + 1) * sorted_usage)) - (n + 1) * cumsum[-1]) / (n * cumsum[-1])
+            else:
+                gini = 0.0
+
+            utilization[pool_name] = {
+                'display': pool_name.upper(),
+                'total': pool_size,
+                'active': n_active,
+                'dead': n_dead,
+                'active_ratio': round(n_active / pool_size, 4) if pool_size > 0 else 0,
+                'gini': round(float(gini), 4),
+                'stats': {
+                    'mean': round(mean_usage, 2),
+                    'std': round(std_usage, 2),
+                    'min': int(pool_totals.min()) if pool_size > 0 else 0,
+                    'max': int(pool_totals.max()) if pool_size > 0 else 0,
+                },
+                'method': 'forward_pass',  # Mark as forward-pass based
+            }
+
+        # Overall stats
+        total_active = sum(u['active'] for u in utilization.values())
+        total_neurons = sum(u['total'] for u in utilization.values())
+        utilization['_overall'] = {
+            'total_neurons': total_neurons,
+            'total_active': total_active,
+            'total_dead': total_neurons - total_active,
+            'active_ratio': round(total_active / total_neurons, 4) if total_neurons > 0 else 0,
+            'total_tokens_analyzed': total_tokens,
+        }
+
+        return utilization
+
     def run_full_analysis(self, output_dir: str = None) -> Dict:
         """
         Run complete neuron feature analysis.
@@ -4338,6 +4488,10 @@ class NeuronFeatureAnalyzer:
         print("\n  Computing selectivity matrix...")
         selectivity_data = self.compute_selectivity_matrix(min_activations=10)
 
+        # Compute forward-pass based utilization (replaces EMA-based Table 2)
+        print("\n  Computing forward-pass utilization...")
+        utilization = self._compute_utilization_stats()
+
         # Cluster neurons
         clusters = self.cluster_neurons(n_clusters=10)
 
@@ -4353,8 +4507,26 @@ class NeuronFeatureAnalyzer:
         for pos in ['NOUN', 'VERB', 'ADJ', 'PUNCT']:
             top = selectivity_data['top_selective_per_pos'].get(pos, [])[:3]
             if top:
-                top_str = ', '.join([f"N{t['neuron']}({t['selectivity']:.1f}x)" for t in top])
+                top_str = ', '.join([f"{t['neuron']}({t['selectivity']:.1f}x)" for t in top])
                 print(f"  │   {pos}: {top_str}")
+        print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Print utilization summary (forward-pass based, replaces EMA Table 2)
+        print(f"\n  ┌─ Neuron Utilization (Forward-Pass) ─────────────────────────────────────")
+        print(f"  │ {'Pool':<10} {'Active':>8} {'Total':>8} {'Ratio':>10} {'Gini':>8}")
+        print(f"  │ {'─'*10} {'─'*8} {'─'*8} {'─'*10} {'─'*8}")
+        for pool_name, data in utilization.items():
+            if pool_name.startswith('_'):
+                continue
+            print(f"  │ {pool_name:<10} {data['active']:>8d} {data['total']:>8d} "
+                  f"{data['active_ratio']*100:>9.1f}% {data['gini']:>8.3f}")
+        overall = utilization.get('_overall', {})
+        if overall:
+            print(f"  │ {'─'*10} {'─'*8} {'─'*8} {'─'*10}")
+            print(f"  │ {'TOTAL':<10} {overall['total_active']:>8d} {overall['total_neurons']:>8d} "
+                  f"{overall['active_ratio']*100:>9.1f}%")
+            print(f"  │")
+            print(f"  │ Tokens analyzed: {overall['total_tokens_analyzed']:,}")
         print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         results = {
@@ -4367,13 +4539,18 @@ class NeuronFeatureAnalyzer:
                 'selectivity_range': selectivity_data['selectivity_range'],
                 'n_active_neurons': selectivity_data['n_active_neurons'],
                 'pos_tags': selectivity_data['pos_tags'],
-                # Don't include full matrix in results (too large), save separately
+                'per_pool': selectivity_data.get('per_pool', {}),
+                'by_pos': selectivity_data.get('by_pos', {}),
+                'pools_analyzed': selectivity_data.get('pools_analyzed', []),
             },
+            # Forward-pass based utilization (replaces EMA Table 2)
+            'utilization': utilization,
             'clusters': clusters,
             'summary': {
                 'total_tokens': len(self.token_data),
                 'n_neurons': self.n_neurons,
                 'n_specialized': {k: len(v) for k, v in specialized.items()},
+                'pools_analyzed': list(pool_ranges.keys()),
             }
         }
 
