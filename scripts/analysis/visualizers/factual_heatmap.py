@@ -239,58 +239,123 @@ def plot_factual_heatmap(
         for j, neuron in enumerate(sorted_neurons):
             matrix[i, j] = all_neurons[target].get(neuron, 0)
 
-    # Find category boundaries for vertical lines
-    categories = [get_neuron_category(n) for n in sorted_neurons]
-    boundaries = []
-    for i in range(1, len(categories)):
-        if categories[i] != categories[i-1]:
-            boundaries.append(i)
+    # Pool color mapping for neuron labels
+    POOL_COLORS = {
+        'fknow': '#E53935',   # Red
+        'rknow': '#FF9800',   # Orange
+        'fv': '#1E88E5',      # Blue
+        'rv': '#43A047',      # Green
+        'fqk': '#8E24AA',     # Purple
+        'rqk': '#00ACC1',     # Cyan
+    }
+    POOL_DISPLAY = {
+        'fknow': 'F-Know',
+        'rknow': 'R-Know',
+        'fv': 'F-V',
+        'rv': 'R-V',
+        'fqk': 'F-QK',
+        'rqk': 'R-QK',
+    }
+
+    def get_pool_from_neuron(neuron_name):
+        """Extract pool prefix from neuron name (e.g., 'fknow_12' -> 'fknow')."""
+        if '_' in str(neuron_name):
+            return str(neuron_name).split('_')[0]
+        return 'unknown'
+
+    # Sort neurons by pool for better grouping
+    def pool_sort_key(neuron):
+        pool = get_pool_from_neuron(neuron)
+        pool_order = {'fknow': 0, 'rknow': 1, 'fv': 2, 'rv': 3, 'fqk': 4, 'rqk': 5}
+        try:
+            idx = int(str(neuron).split('_')[-1]) if '_' in str(neuron) else 0
+        except:
+            idx = 0
+        return (pool_order.get(pool, 99), idx)
+
+    sorted_neurons = sorted(sorted_neurons, key=pool_sort_key)
+
+    # Rebuild matrix with sorted neurons
+    matrix = np.zeros((len(ordered_targets), len(sorted_neurons)))
+    for i, target in enumerate(ordered_targets):
+        for j, neuron in enumerate(sorted_neurons):
+            matrix[i, j] = all_neurons[target].get(neuron, 0)
+
+    # Find pool boundaries for vertical lines
+    neuron_pools = [get_pool_from_neuron(n) for n in sorted_neurons]
+    pool_boundaries = []
+    for i in range(1, len(neuron_pools)):
+        if neuron_pools[i] != neuron_pools[i-1]:
+            pool_boundaries.append(i)
 
     # Plot
-    fig, ax = plt.subplots(figsize=(max(12, len(sorted_neurons) * 0.6), max(4, len(ordered_targets) * 0.8)))
+    fig, ax = plt.subplots(figsize=(max(14, len(sorted_neurons) * 0.5), max(5, len(ordered_targets) * 0.9)))
 
     # Capitalize target labels for display
     display_targets = [t.capitalize() for t in ordered_targets]
 
+    # Use neuron names directly (with pool prefix)
+    neuron_labels = [str(n) for n in sorted_neurons]
+
     sns.heatmap(
         matrix,
-        xticklabels=[f'N{n}' for n in sorted_neurons],
+        xticklabels=neuron_labels,
         yticklabels=display_targets,
         cmap='YlOrRd',
         vmin=0, vmax=1,
-        annot=True, fmt='.2f',
+        annot=False,  # Too crowded with many neurons
         ax=ax,
         cbar_kws={'label': 'Activation Frequency', 'shrink': 0.8, 'pad': 0.02},
-        linewidths=0.5
+        linewidths=0.3
     )
 
-    # Add category boundary lines (vertical)
-    for b in boundaries:
+    # Color x-axis labels by pool
+    for idx, label in enumerate(ax.get_xticklabels()):
+        pool = get_pool_from_neuron(sorted_neurons[idx])
+        label.set_color(POOL_COLORS.get(pool, 'black'))
+        label.set_fontsize(8)
+        label.set_rotation(90)
+
+    # Add pool boundary lines (vertical)
+    for b in pool_boundaries:
         ax.axvline(x=b, color='black', linewidth=2)
 
     # Add horizontal line between capitals and others
     if capital_targets and other_targets:
         ax.axhline(y=len(capital_targets), color='blue', linewidth=2, linestyle='--')
 
-    # Category labels - above heatmap using transAxes
-    category_names = {0: 'Shared', 1: 'Capital-specific', 2: 'Other-specific', 3: 'Mixed'}
+    # Pool labels - above heatmap
     prev_boundary = 0
     n_neurons = len(sorted_neurons)
-    for i, b in enumerate(boundaries + [n_neurons]):
+    for i, b in enumerate(pool_boundaries + [n_neurons]):
         if b > prev_boundary:
-            mid = (prev_boundary + b) / 2 / n_neurons  # normalize to 0-1
-            cat_idx = categories[prev_boundary] if prev_boundary < len(categories) else 3
-            label = category_names.get(cat_idx, 'Mixed')
+            mid = (prev_boundary + b) / 2 / n_neurons
+            pool = neuron_pools[prev_boundary] if prev_boundary < len(neuron_pools) else 'unknown'
+            label = POOL_DISPLAY.get(pool, pool.upper())
+            color = POOL_COLORS.get(pool, 'black')
             ax.text(mid, 1.02, label, ha='center', va='bottom',
-                   fontsize=9, fontweight='bold', color='darkblue',
+                   fontsize=10, fontweight='bold', color=color,
                    transform=ax.transAxes)
         prev_boundary = b
 
-    # Title - above category labels
-    ax.set_title('Factual Knowledge Neurons: Related outputs share neuron subsets',
-                fontsize=11, fontweight='bold', pad=20, y=1.06)
+    # Legend for pool colors
+    from matplotlib.patches import Patch
+    legend_elements = []
+    seen_pools = set(neuron_pools)
+    for pool in ['fknow', 'rknow', 'fv', 'rv']:
+        if pool in seen_pools:
+            legend_elements.append(
+                Patch(facecolor=POOL_COLORS[pool], label=POOL_DISPLAY[pool])
+            )
+    if legend_elements:
+        ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.15, 1),
+                 title='Pool', fontsize=9)
 
-    ax.set_xlabel('Neuron Index (grouped by semantic category)')
+    # Title
+    ax.set_title('Factual Knowledge Neurons by Pool\n(Related outputs share neuron subsets)',
+                fontsize=11, fontweight='bold', pad=25)
+
+    ax.set_xlabel('Neuron (grouped by pool)')
     ax.set_ylabel('Target Token')
 
     plt.tight_layout()
