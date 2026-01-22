@@ -1287,10 +1287,10 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'factual'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Analyze all V/Knowledge pools
+        # Analyze all V/Knowledge pools in single pass (efficient)
         pools_to_analyze = ['fv', 'rv', 'fknow', 'rknow']
 
-        print(f"  Analyzing factual neurons (min_targets={min_target_count}, max_runs={max_runs}, pools={pools_to_analyze})...")
+        print(f"  Analyzing factual neurons (min_targets={min_target_count}, max_runs={max_runs})...")
         analyzer = BehavioralAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
         )
@@ -1303,75 +1303,23 @@ class ModelAnalyzer:
         ]
         targets = ["Paris", "London", "Tokyo", "blue"]
 
-        # Analyze each pool
-        all_pool_results = {}
-        for pool in pools_to_analyze:
-            print(f"\n  === Analyzing pool: {pool} ===")
-            pool_results = analyzer.analyze_factual_neurons(
-                prompts, targets,
-                pool_type=pool,
-                min_target_count=min_target_count,
-                max_runs=max_runs,
-                temperature=1.0,
-                top_k=50,
-            )
-            all_pool_results[pool] = pool_results
-
-        # Aggregate results with unified naming
-        results = {
-            'pools_analyzed': pools_to_analyze,
-            'prompts': prompts,
-            'targets': targets,
-            'min_target_count': min_target_count,
-            'per_pool': {},
-            'per_target': {},
-        }
-
-        # Process per-pool results
-        for pool, pool_results in all_pool_results.items():
-            per_target = pool_results.get('per_target', {})
-
-            # Convert neuron IDs to unified naming
-            pool_summary = {
-                'n_common_100': 0,
-                'n_common_80': 0,
-                'top_neurons': [],
-            }
-
-            for target, data in per_target.items():
-                if not isinstance(data, dict):
-                    continue
-
-                # Convert neuron IDs to {pool}_{idx} format
-                common_100 = [f'{pool}_{n}' for n in data.get('common_neurons_100', [])]
-                common_80 = [f'{pool}_{n}' for n in data.get('common_neurons_80', [])]
-
-                pool_summary['n_common_100'] += len(common_100)
-                pool_summary['n_common_80'] += len(common_80)
-
-                # Add to per_target
-                if target not in results['per_target']:
-                    results['per_target'][target] = {}
-                results['per_target'][target][pool] = {
-                    'common_100': common_100,
-                    'common_80': common_80,
-                    'successful_runs': data.get('successful_runs', 0),
-                    'total_runs': data.get('total_runs', 0),
-                    'match_rate': data.get('match_rate', 0),
-                }
-
-                # Add top neurons with unified naming
-                for nf in data.get('neuron_frequencies', [])[:5]:
-                    pool_summary['top_neurons'].append(f"{pool}_{nf['neuron']}")
-
-            results['per_pool'][pool] = pool_summary
+        # Single call analyzes ALL pools simultaneously (efficient!)
+        results = analyzer.analyze_factual_neurons(
+            prompts, targets,
+            pools=pools_to_analyze,
+            min_target_count=min_target_count,
+            max_runs=max_runs,
+            temperature=1.0,
+            top_k=50,
+        )
 
         # Summary: which pool has most factual knowledge
-        most_factual = max(results['per_pool'].items(),
-                          key=lambda x: x[1]['n_common_80']) if results['per_pool'] else ('unknown', {})
+        per_pool = results.get('per_pool', {})
+        most_factual = max(per_pool.items(),
+                          key=lambda x: x[1].get('n_common_80', 0)) if per_pool else ('unknown', {})
         results['summary'] = {
             'most_factual_pool': most_factual[0],
-            'total_factual_neurons': sum(p['n_common_80'] for p in results['per_pool'].values()),
+            'total_factual_neurons': sum(p.get('n_common_80', 0) for p in per_pool.values()),
         }
 
         # Print detailed summary
@@ -1382,8 +1330,9 @@ class ModelAnalyzer:
         # Per-pool summary
         print(f"\n  Per-Pool Results:")
         for pool, pool_data in results.get('per_pool', {}).items():
-            print(f"    {pool:8s}: {pool_data['n_common_80']:3d} neurons (80%+), "
-                  f"top: {pool_data['top_neurons'][:3]}")
+            n_common = pool_data.get('n_common_80', 0)
+            top_neurons = pool_data.get('top_neurons', [])[:3]
+            print(f"    {pool:8s}: {n_common:3d} neurons (80%+), top: {top_neurons}")
 
         # Summary
         summary = results.get('summary', {})
@@ -1395,13 +1344,13 @@ class ModelAnalyzer:
         per_target = results.get('per_target', {})
         if per_target:
             print(f"\n  Per-Target Breakdown:")
-            for target, pool_data in per_target.items():
+            for target, target_data in per_target.items():
                 print(f"\n    '{target}':")
-                for pool, data in pool_data.items():
+                target_per_pool = target_data.get('per_pool', {})
+                for pool, data in target_per_pool.items():
                     if isinstance(data, dict):
                         n_common = len(data.get('common_80', []))
-                        match_rate = data.get('match_rate', 0) * 100
-                        print(f"      {pool:8s}: {n_common:3d} neurons, match={match_rate:.1f}%")
+                        print(f"      {pool:8s}: {n_common:3d} neurons (80%+)")
 
         print(f"\n  {'='*70}")
 

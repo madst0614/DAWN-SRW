@@ -519,7 +519,8 @@ class BehavioralAnalyzer(BaseAnalyzer):
         self,
         prompts: list,
         targets: list,
-        pool_type: str = 'fv',
+        pools: list = None,
+        pool_type: str = None,  # Deprecated, use pools instead
         min_target_count: int = 100,
         max_tokens_per_run: int = 200,
         max_runs: int = 500,
@@ -529,14 +530,14 @@ class BehavioralAnalyzer(BaseAnalyzer):
         """
         Analyze neuron activations for factual knowledge prompts.
 
-        Independent runs approach: each run starts fresh from prompt,
-        generates until target appears, records neurons, then starts new run.
-        Repeats until target appears min_target_count times.
+        Efficiently analyzes ALL specified pools in a single generation pass.
+        Each forward pass extracts activations from all pools simultaneously.
 
         Args:
             prompts: List of prompts (e.g., ["The capital of France is"])
             targets: List of expected target tokens (e.g., ["Paris"])
-            pool_type: Pool to analyze ('fv', 'rv', etc.)
+            pools: List of pools to analyze (default: ['fv', 'rv', 'fknow', 'rknow'])
+            pool_type: DEPRECATED - single pool for backward compatibility
             min_target_count: Minimum target occurrences to collect (default: 100)
             max_tokens_per_run: Max tokens per run before giving up (default: 200)
             max_runs: Max runs to prevent infinite loop (default: 500)
@@ -544,34 +545,36 @@ class BehavioralAnalyzer(BaseAnalyzer):
             top_k: Top-k sampling (0 = greedy)
 
         Returns:
-            Dictionary with per-target neuron frequencies
+            Dictionary with per-pool, per-target neuron frequencies using unified naming
         """
         from collections import Counter
         import torch.nn.functional as F
-        import sys
+
+        # Handle backward compatibility: pool_type -> pools
+        if pools is None:
+            if pool_type is not None:
+                pools = [pool_type]  # Single pool for backward compatibility
+            else:
+                pools = ['fv', 'rv', 'fknow', 'rknow']  # Default: all V/Knowledge pools
 
         results = {
             'prompts': prompts,
             'targets': targets,
-            'pool_type': pool_type,
+            'pools_analyzed': pools,
             'min_target_count': min_target_count,
+            'per_pool': {pool: {} for pool in pools},
             'per_target': {},
         }
 
         self.model.eval()
         self.extractor.enable_weight_storage()
 
-        # Debug: verify store_pref_tensors is enabled
-        if hasattr(self.model, 'router'):
-            store_flag = getattr(self.model.router, 'store_pref_tensors', 'NOT_FOUND')
-            print(f"    [Debug] model.router.store_pref_tensors = {store_flag}")
-        else:
-            print(f"    [Debug] model has no 'router' attribute!")
-            print(f"    [Debug] model attributes: {[a for a in dir(self.model) if not a.startswith('_')][:20]}")
+        print(f"    Analyzing {len(pools)} pools simultaneously: {pools}")
 
         for prompt_idx, (prompt, target) in enumerate(zip(prompts, targets)):
-            target_neuron_counts = Counter()
-            baseline_neuron_counts = Counter()
+            # Per-pool counters
+            target_neuron_counts = {pool: Counter() for pool in pools}
+            baseline_neuron_counts = {pool: Counter() for pool in pools}
             successful_runs = 0
             total_runs = 0
             total_baseline_steps = 0
@@ -580,7 +583,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
 
             print(f"\n    [{prompt_idx+1}/{len(prompts)}] \"{prompt}\" → target: \"{target}\"")
 
-            # Encode prompt once (will clone for each run)
+            # Encode prompt once
             base_input_ids = self.tokenizer.encode(
                 prompt, add_special_tokens=False, return_tensors='pt'
             ).to(self.device)
@@ -588,13 +591,9 @@ class BehavioralAnalyzer(BaseAnalyzer):
             with torch.no_grad():
                 while successful_runs < min_target_count and total_runs < max_runs:
                     total_runs += 1
-
-                    # Progress on single line
                     print(f"\r      {successful_runs}/{min_target_count} targets (run {total_runs})", end='', flush=True)
 
-                    # Fresh start each run
                     generated = base_input_ids.clone()
-                    found_target = False
 
                     for step in range(max_tokens_per_run):
                         outputs = self.model(generated, return_routing_info=True)
@@ -602,26 +601,9 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         if isinstance(outputs, tuple) and len(outputs) >= 2:
                             logits = outputs[0]
                             routing = self.extractor.extract(outputs)
-                            # Debug: first run, first step
-                            if total_runs == 1 and step == 0:
-                                print(f"        [Debug] outputs tuple len={len(outputs)}, routing layers={len(routing) if routing else 0}", flush=True)
-                                if routing and len(routing) > 0:
-                                    layer0 = routing.get_layer(0)
-                                    # Check what's actually in the raw layer_info
-                                    raw_keys = list(layer0.raw.keys())[:10] if layer0.raw else []
-                                    att_keys = list(layer0.attention.keys())[:10] if layer0.attention else []
-                                    print(f"        [Debug] Layer0 raw keys: {raw_keys}", flush=True)
-                                    print(f"        [Debug] Layer0 attention keys: {att_keys}", flush=True)
-                                    # Check specific masks and weights
-                                    fv_mask = layer0.get_mask('fv')
-                                    fv_weight = layer0.get_weight('fv')
-                                    print(f"        [Debug] fv_mask: {fv_mask.shape if fv_mask is not None else None}", flush=True)
-                                    print(f"        [Debug] fv_weight: {fv_weight.shape if fv_weight is not None else None}", flush=True)
                         else:
                             logits = outputs
                             routing = None
-                            if total_runs == 1 and step == 0:
-                                print(f"        [Debug] outputs is not tuple, type={type(outputs)}", flush=True)
 
                         # Sample next token
                         next_logits = logits[:, -1, :]
@@ -640,51 +622,64 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         next_token_id = next_token.item()
                         token_text = self.tokenizer.decode([next_token_id])
 
-                        # Extract active neurons (shared pool - same neuron across layers)
-                        step_neurons = set()
+                        # Extract active neurons from ALL pools in single pass
+                        step_neurons_per_pool = {pool: set() for pool in pools}
                         if routing:
                             for layer_idx, layer in enumerate(routing):
-                                m = layer.get_mask(pool_type)
-                                if m is not None:
-                                    if m.dim() == 3:
-                                        m = m[0, -1]
-                                    else:
-                                        m = m[0]
-                                    active = m.nonzero(as_tuple=True)[0].cpu().tolist()
-                                    step_neurons.update(active)
-                                    if total_runs == 1 and step < 3 and layer_idx == 0:
-                                        print(f"        [Debug L{layer_idx}] mask shape: {m.shape}, active: {len(active)}", flush=True)
-                                else:
-                                    # Fallback: use weights with threshold
-                                    w = layer.get_weight(pool_type)
-                                    if w is not None:
-                                        if w.dim() == 3:
-                                            w = w[0, -1]
+                                for pool in pools:
+                                    # Handle Q/K shared pools
+                                    if pool in ('fqk', 'rqk'):
+                                        m_q = layer.get_mask(f'{pool}_q')
+                                        m_k = layer.get_mask(f'{pool}_k')
+                                        if m_q is not None and m_k is not None:
+                                            if m_q.dim() == 3:
+                                                m_q, m_k = m_q[0, -1], m_k[0, -1]
+                                            else:
+                                                m_q, m_k = m_q[0], m_k[0]
+                                            m = m_q | m_k  # OR combine
+                                            active = m.nonzero(as_tuple=True)[0].cpu().tolist()
+                                            step_neurons_per_pool[pool].update(active)
                                         else:
-                                            w = w[0]
-                                        active = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                                        step_neurons.update(active)
-                                        if total_runs == 1 and step < 3 and layer_idx == 0:
-                                            print(f"        [Debug L{layer_idx}] weight fallback, shape: {w.shape}, active: {len(active)}", flush=True)
-                                    elif total_runs == 1 and step == 0 and layer_idx == 0:
-                                        print(f"        [Debug L{layer_idx}] both mask and weight are None for '{pool_type}'", flush=True)
-                        elif total_runs == 1 and step == 0:
-                            print(f"        [Debug] routing is None!", flush=True)
+                                            # Fallback to weights
+                                            w_q = layer.get_weight(f'{pool}_q')
+                                            w_k = layer.get_weight(f'{pool}_k')
+                                            if w_q is not None and w_k is not None:
+                                                if w_q.dim() == 3:
+                                                    w_q, w_k = w_q[0, -1], w_k[0, -1]
+                                                else:
+                                                    w_q, w_k = w_q[0], w_k[0]
+                                                w = torch.max(w_q, w_k)
+                                                active = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                                                step_neurons_per_pool[pool].update(active)
+                                    else:
+                                        # Regular pools (fv, rv, fknow, rknow)
+                                        m = layer.get_mask(pool)
+                                        if m is not None:
+                                            if m.dim() == 3:
+                                                m = m[0, -1]
+                                            else:
+                                                m = m[0]
+                                            active = m.nonzero(as_tuple=True)[0].cpu().tolist()
+                                            step_neurons_per_pool[pool].update(active)
+                                        else:
+                                            w = layer.get_weight(pool)
+                                            if w is not None:
+                                                if w.dim() == 3:
+                                                    w = w[0, -1]
+                                                else:
+                                                    w = w[0]
+                                                active = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                                                step_neurons_per_pool[pool].update(active)
 
                         # Check if target found
                         if target_lower in token_text.strip().lower():
-                            found_target = True
                             successful_runs += 1
 
-                            # Debug: show neuron count when target found
-                            if successful_runs <= 3:
-                                print(f"        [Target '{token_text.strip()}'] Found {len(step_neurons)} active neurons", flush=True)
+                            # Record neurons for ALL pools with unified naming
+                            for pool in pools:
+                                for n in step_neurons_per_pool[pool]:
+                                    target_neuron_counts[pool][f'{pool}_{n}'] += 1
 
-                            # Record neurons at target generation
-                            for n in step_neurons:
-                                target_neuron_counts[n] += 1
-
-                            # Save sample generation
                             if len(sample_generations) < 3:
                                 gen_text = self.tokenizer.decode(
                                     torch.cat([generated, next_token], dim=1)[0],
@@ -692,76 +687,73 @@ class BehavioralAnalyzer(BaseAnalyzer):
                                 )
                                 sample_generations.append(gen_text)
 
-                            break  # Got target, start new run
+                            break
                         else:
                             # Baseline step
-                            for n in step_neurons:
-                                baseline_neuron_counts[n] += 1
+                            for pool in pools:
+                                for n in step_neurons_per_pool[pool]:
+                                    baseline_neuron_counts[pool][f'{pool}_{n}'] += 1
                             total_baseline_steps += 1
 
                         generated = torch.cat([generated, next_token], dim=1)
 
-                        # Stop on EOS
                         if next_token_id == self.tokenizer.eos_token_id:
                             break
 
-            # Final progress
             print(f"\r      {successful_runs}/{min_target_count} targets (run {total_runs}) - Done!          ")
 
             match_rate = successful_runs / total_runs if total_runs > 0 else 0
             print(f"      Match rate: {match_rate*100:.1f}% ({successful_runs}/{total_runs})")
-            print(f"      Unique neurons: target={len(target_neuron_counts)}, baseline={len(baseline_neuron_counts)}")
 
-            # Compute results
-            base_result = {
+            # Compute per-pool results
+            target_result = {
                 'prompt': prompt,
                 'target_token': target,
                 'successful_runs': successful_runs,
                 'total_runs': total_runs,
                 'match_rate': match_rate,
-                'total_baseline_steps': total_baseline_steps,
                 'sample_generations': sample_generations,
+                'per_pool': {},
             }
 
             if successful_runs > 0:
-                # Shared neuron pool - neuron index is the key
-                target_freq = {n: c / successful_runs for n, c in target_neuron_counts.items()}
-                common_neurons_100 = [n for n, f in target_freq.items() if f >= 1.0]
-                common_neurons_80 = [n for n, f in target_freq.items() if f >= 0.8]
-                common_neurons_50 = [n for n, f in target_freq.items() if f >= 0.5]
+                for pool in pools:
+                    pool_target_counts = target_neuron_counts[pool]
+                    pool_baseline_counts = baseline_neuron_counts[pool]
 
-                # Contrastive scores (target_freq - baseline_freq)
-                contrastive_scores = {}
-                if total_baseline_steps > 0:
-                    for neuron in set(target_neuron_counts.keys()) | set(baseline_neuron_counts.keys()):
-                        t_freq = target_neuron_counts[neuron] / successful_runs
-                        b_freq = baseline_neuron_counts[neuron] / total_baseline_steps
-                        contrastive_scores[neuron] = t_freq - b_freq
+                    target_freq = {n: c / successful_runs for n, c in pool_target_counts.items()}
+                    common_100 = [n for n, f in target_freq.items() if f >= 1.0]
+                    common_80 = [n for n, f in target_freq.items() if f >= 0.8]
 
-                neuron_frequencies = [
-                    {'neuron': n, 'count': c, 'percentage': c / successful_runs * 100}
-                    for n, c in sorted(target_neuron_counts.items(), key=lambda x: -x[1])
-                ]
+                    target_result['per_pool'][pool] = {
+                        'common_100': sorted(common_100),
+                        'common_80': sorted(common_80),
+                        'n_unique': len(pool_target_counts),
+                        'top_neurons': sorted(
+                            [{'neuron': n, 'freq': f * 100} for n, f in target_freq.items()],
+                            key=lambda x: -x['freq']
+                        )[:20],
+                    }
 
-                base_result.update({
-                    'common_neurons_100': sorted(common_neurons_100),
-                    'common_neurons_80': sorted(common_neurons_80),
-                    'common_neurons_50': sorted(common_neurons_50),
-                    'total_unique_neurons': len(target_neuron_counts),
-                    'neuron_frequencies': neuron_frequencies,
-                    'contrastive_scores': contrastive_scores,
-                    'contrastive_top50': sorted(
-                        [{'neuron': n, 'score': s,
-                          'target_freq': target_freq.get(n, 0) * 100,
-                          'baseline_freq': (baseline_neuron_counts[n] / total_baseline_steps * 100) if total_baseline_steps > 0 else 0}
-                         for n, s in contrastive_scores.items()],
-                        key=lambda x: -x['score']
-                    )[:50],
-                })
+                    print(f"        {pool}: {len(common_100)} neurons@100%, {len(common_80)} neurons@80%")
             else:
-                base_result['note'] = f'Target "{target}" not found in {total_runs} runs'
+                target_result['note'] = f'Target "{target}" not found in {total_runs} runs'
 
-            results['per_target'][target] = base_result
+            results['per_target'][target] = target_result
+
+        # Aggregate per-pool summary
+        for pool in pools:
+            all_common_100 = set()
+            all_common_80 = set()
+            for target_data in results['per_target'].values():
+                if 'per_pool' in target_data and pool in target_data['per_pool']:
+                    all_common_100.update(target_data['per_pool'][pool].get('common_100', []))
+                    all_common_80.update(target_data['per_pool'][pool].get('common_80', []))
+            results['per_pool'][pool] = {
+                'n_common_100': len(all_common_100),
+                'n_common_80': len(all_common_80),
+                'top_neurons': sorted(all_common_100)[:20],
+            }
 
         self.extractor.disable_weight_storage()
         return results

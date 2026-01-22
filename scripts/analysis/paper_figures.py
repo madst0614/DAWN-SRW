@@ -506,32 +506,19 @@ class PaperFigureGenerator:
             temperature = config.get('temperature', 1.0)
             top_k = config.get('top_k', 50)
 
-            # Analyze all V/Knowledge pools with unified naming
+            # Analyze all V/Knowledge pools in single pass (efficient!)
             pools_to_analyze = ['fv', 'rv', 'fknow', 'rknow']
             min_targets = max(50, n_batches * 5)
             print(f"  Analyzing factual neurons (pools={pools_to_analyze}, min_targets={min_targets})...", flush=True)
 
-            # Aggregate results from all pools
-            all_pool_results = {}
-            for pool in pools_to_analyze:
-                print(f"    Analyzing pool: {pool}...")
-                pool_results = self.behavioral.analyze_factual_neurons(
-                    prompts, targets,
-                    pool_type=pool,
-                    min_target_count=min_targets,
-                    temperature=temperature,
-                    top_k=top_k
-                )
-                all_pool_results[pool] = pool_results
-
-            # Combine into unified format
-            factual_data = {
-                'pools_analyzed': pools_to_analyze,
-                'prompts': prompts,
-                'targets': targets,
-                'per_pool': all_pool_results,
-                'per_target': {},  # Will be populated by visualizer
-            }
+            # Single call analyzes ALL pools simultaneously
+            factual_data = self.behavioral.analyze_factual_neurons(
+                prompts, targets,
+                pools=pools_to_analyze,
+                min_target_count=min_targets,
+                temperature=temperature,
+                top_k=top_k
+            )
 
         path = plot_factual_heatmap(factual_data, os.path.join(output_dir, 'fig5_semantic_coherence.png'))
         print(f"  Saved: {path}", flush=True)
