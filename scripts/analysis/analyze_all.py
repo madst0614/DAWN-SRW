@@ -3318,6 +3318,9 @@ class ModelAnalyzer:
         # Get analysis list
         analyses = self._get_full_analyses()
 
+        # Save original only list before expansion (for figure/table tracking)
+        original_only = list(only) if only else []
+
         # Expand figure/table names (e.g., fig3 -> routing)
         if only:
             expanded_only = self._expand_figure_names(only)
@@ -3347,9 +3350,9 @@ class ModelAnalyzer:
             else:
                 analyses = [(n, f, a) for n, f, a in analyses if n in only]
 
-        # Track if figure names were specified (need paper outputs)
+        # Track if figure/table names were specified in ORIGINAL only (before expansion)
         requested_figures = [
-            item.lower() for item in (only or [])
+            item.lower() for item in original_only
             if item.lower().startswith('fig') or item.lower().startswith('table')
         ]
         has_figure_request = len(requested_figures) > 0
