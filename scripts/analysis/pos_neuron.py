@@ -3561,6 +3561,7 @@ class NeuronFeatureAnalyzer:
         token_data: List[Dict],
         tokenizer,
         n_neurons: int = None,
+        pool_order: List[Tuple[str, int]] = None,
     ):
         """
         Initialize analyzer.
@@ -3570,10 +3571,12 @@ class NeuronFeatureAnalyzer:
                        Each dict has: token_str, pos, mask, weights, is_whole_word, etc.
             tokenizer: Tokenizer instance
             n_neurons: Total number of neurons (auto-detected if None)
+            pool_order: List of (pool_name, size) tuples for pool-specific analysis
         """
         self.token_data = token_data
         self.tokenizer = tokenizer
         self.n_tokens = len(token_data)
+        self.pool_order = pool_order or []
 
         if n_neurons is None and token_data:
             # Use max mask length across all tokens (handles layerwise data with varying sizes)
@@ -4182,6 +4185,7 @@ class NeuronFeatureAnalyzer:
         return cls(
             token_data=tca.token_data,
             tokenizer=tca.tokenizer,
+            pool_order=getattr(tca, 'pool_order', None),
         )
 
     def _get_pool_ranges(self) -> Dict[str, Tuple[int, int]]:
