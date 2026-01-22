@@ -671,6 +671,13 @@ MASK_KEY_MAP = {
 RAW_KEY_TO_STD = {v: k for k, v in WEIGHT_KEY_MAP.items()}
 
 
+def unwrap_model(model):
+    """Unwrap torch.compile wrapped model to get the original module."""
+    while hasattr(model, '_orig_mod'):
+        model = model._orig_mod
+    return model
+
+
 class RoutingDataExtractor:
     """
     Central routing data extraction layer.
@@ -689,56 +696,70 @@ class RoutingDataExtractor:
 
     def __init__(self, model, device='cuda'):
         self.model = model
+        self._unwrapped = unwrap_model(model)  # Unwrap once for attribute access
         self.device = device
         self.router = self._get_router()
         self.model_version = self._detect_version()
 
     def _get_router(self):
         """Get router from model (handles different model structures)."""
-        if hasattr(self.model, 'router'):
-            router = self.model.router
+        model = self._unwrapped
+        if hasattr(model, 'router'):
+            router = model.router
             if hasattr(router, 'neuron_router'):
                 return router.neuron_router
             return router
         return None
 
+    def _get_global_router(self):
+        """Get GlobalRouters instance (for store_pref_tensors flag)."""
+        model = self._unwrapped
+        if hasattr(model, 'router'):
+            return model.router
+        if hasattr(model, 'global_routers'):
+            return model.global_routers
+        return None
+
     def _detect_version(self) -> str:
         """Detect model version."""
         try:
-            return get_model_version(self.model)
+            return get_model_version(self._unwrapped)
         except:
             # Fallback detection
-            if hasattr(self.model, 'router') and hasattr(self.model.router, 'max_paths'):
+            model = self._unwrapped
+            if hasattr(model, 'router') and hasattr(model.router, 'max_paths'):
                 return '18.x'
             return '17.x'
 
     def enable_weight_storage(self):
         """Enable weight tensor storage in routing_info."""
-        # v17.x style: model.router
-        if hasattr(self.model, 'router'):
-            router = self.model.router
+        model = self._unwrapped
+        # v17.x/v18.x: model.router (GlobalRouters or similar)
+        if hasattr(model, 'router'):
+            router = model.router
             if hasattr(router, 'store_pref_tensors'):
                 router.store_pref_tensors = True
             if hasattr(router, 'neuron_router') and hasattr(router.neuron_router, 'store_pref_tensors'):
                 router.neuron_router.store_pref_tensors = True
-        # v18.x style: model.global_routers
-        if hasattr(self.model, 'global_routers'):
-            global_routers = self.model.global_routers
+        # v18.x alternate: model.global_routers
+        if hasattr(model, 'global_routers'):
+            global_routers = model.global_routers
             if hasattr(global_routers, 'store_pref_tensors'):
                 global_routers.store_pref_tensors = True
 
     def disable_weight_storage(self):
         """Disable weight tensor storage."""
-        # v17.x style: model.router
-        if hasattr(self.model, 'router'):
-            router = self.model.router
+        model = self._unwrapped
+        # v17.x/v18.x: model.router
+        if hasattr(model, 'router'):
+            router = model.router
             if hasattr(router, 'store_pref_tensors'):
                 router.store_pref_tensors = False
             if hasattr(router, 'neuron_router') and hasattr(router.neuron_router, 'store_pref_tensors'):
                 router.neuron_router.store_pref_tensors = False
-        # v18.x style: model.global_routers
-        if hasattr(self.model, 'global_routers'):
-            global_routers = self.model.global_routers
+        # v18.x alternate: model.global_routers
+        if hasattr(model, 'global_routers'):
+            global_routers = model.global_routers
             if hasattr(global_routers, 'store_pref_tensors'):
                 global_routers.store_pref_tensors = False
 

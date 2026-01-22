@@ -1477,6 +1477,14 @@ class RoutingAnalyzer(BaseAnalyzer):
 
         try:
             with self.extractor.analysis_context():
+                # Verify store_pref_tensors is enabled
+                global_router = self.extractor._get_global_router()
+                store_enabled = getattr(global_router, 'store_pref_tensors', False) if global_router else False
+                is_wrapped = hasattr(self.model, '_orig_mod')
+                print(f"  [Debug] Model wrapped: {is_wrapped}, store_pref_tensors: {store_enabled}")
+                if not store_enabled:
+                    print(f"  [Warning] store_pref_tensors not enabled - routing weights may be empty")
+
                 processed_batches = 0
                 empty_routing_count = 0
                 for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Routing Analysis (single-pass)')):
@@ -1495,6 +1503,8 @@ class RoutingAnalyzer(BaseAnalyzer):
                     except Exception as e:
                         if processed_batches == 0:
                             print(f"  [Warning] First batch failed: {e}")
+                            import traceback
+                            traceback.print_exc()
                         continue
 
                     processed_batches += 1
@@ -1505,9 +1515,13 @@ class RoutingAnalyzer(BaseAnalyzer):
                         if first_layer:
                             available_keys = []
                             for key in ROUTING_KEYS.keys():
-                                if first_layer.get_weight(key) is not None:
-                                    available_keys.append(key)
-                            print(f"  [Debug] First batch: {len(routing)} layers, available keys: {available_keys}")
+                                w = first_layer.get_weight(key)
+                                if w is not None:
+                                    available_keys.append(f"{key}:{list(w.shape)}")
+                            print(f"  [Debug] First batch: {len(routing)} layers, weights: {available_keys}")
+                            # Also check raw keys in attention dict
+                            raw_attn_keys = list(first_layer.attention.keys()) if first_layer.attention else []
+                            print(f"  [Debug] Raw attention keys: {raw_attn_keys}")
 
                     # Process all layers from this batch
                     for layer in routing:
