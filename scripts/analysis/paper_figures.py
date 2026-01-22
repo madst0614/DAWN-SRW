@@ -24,16 +24,23 @@ if HAS_MATPLOTLIB:
 
 
 class PaperFigureGenerator:
-    """Generate paper-ready figures from DAWN analysis."""
+    """Generate paper-ready figures from DAWN analysis.
 
-    # Figure number to method mapping
+    ICML 2026 Paper Figure Mapping:
+        Fig 3: Q/K Pathway Separation
+        Fig 4: POS Specialization
+        Fig 5: Semantic Coherence (Factual Heatmap)
+        Fig 6: Training Dynamics (Appendix)
+        Fig 7: Neuron Utilization (Appendix)
+    """
+
+    # Figure number to method mapping (ICML 2026)
     FIGURE_MAP = {
         '3': 'generate_figure3',   # Q/K Specialization
         '4': 'generate_figure4',   # POS Neurons
-        '6': 'generate_figure6',   # Neuron Utilization + Layer Contribution
-        '6a': 'generate_figure6a', # Neuron Utilization only
-        '6b': 'generate_figure6b', # Layer Contribution only
-        '7': 'generate_figure7',   # Factual Knowledge Heatmap
+        '5': 'generate_figure5',   # Semantic Coherence (Factual Heatmap)
+        '6': 'generate_figure6',   # Training Dynamics
+        '7': 'generate_figure7',   # Layer Contribution
     }
 
     def __init__(self, checkpoint_path: str, val_data_path: Optional[str] = None,
@@ -47,6 +54,7 @@ class PaperFigureGenerator:
             device: Device for computation
         """
         print("Loading model...")
+        self.checkpoint_path = checkpoint_path  # Store for training log lookup
         self.model, self.tokenizer, self.config = load_model(checkpoint_path, device)
         self.router = get_router(self.model)
         self.neurons = get_neurons(self.model)
@@ -342,7 +350,8 @@ class PaperFigureGenerator:
 
         return results
 
-    def generate(self, figures: str, output_dir: str, n_batches: int = 50) -> Dict:
+    def generate(self, figures: str, output_dir: str, n_batches: int = 50,
+                 precomputed: Optional[Dict] = None, config: Optional[Dict] = None) -> Dict:
         """
         Generate specified figures.
 
@@ -350,14 +359,25 @@ class PaperFigureGenerator:
             figures: Comma-separated list of figure numbers or 'all'
             output_dir: Directory for outputs
             n_batches: Number of batches for data-dependent analyses
+            precomputed: Pre-computed analysis results to reuse (optional)
+                - 'factual': Results from analyze_factual()
+                - 'routing': Results from analyze_routing()
+                - 'health': Results from analyze_health()
+            config: Additional configuration (optional)
+                - 'pool_type': Pool type for factual analysis (default: 'fv')
+                - 'gen_tokens': Max tokens for factual analysis (default: 30)
+                - 'prompts': Custom prompts for figure 5
+                - 'targets': Custom targets for figure 5
 
         Returns:
             Dictionary of results
         """
         os.makedirs(output_dir, exist_ok=True)
+        precomputed = precomputed or {}
+        config = config or {}
 
         if figures == 'all':
-            figure_list = ['3', '4', '6', '7']
+            figure_list = ['3', '4', '5', '6', '7']
         else:
             figure_list = [f.strip() for f in figures.split(',')]
 
@@ -367,140 +387,396 @@ class PaperFigureGenerator:
                 print(f"\nGenerating Figure {fig}...", flush=True)
                 method = getattr(self, self.FIGURE_MAP[fig])
                 try:
-                    results[f'figure_{fig}'] = method(output_dir, n_batches)
+                    results[f'figure_{fig}'] = method(output_dir, n_batches, precomputed, config)
                 except Exception as e:
                     print(f"  ERROR: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
                     results[f'figure_{fig}'] = {'error': str(e)}
             else:
                 print(f"Unknown figure: {fig}", flush=True)
 
         return results
 
-    def generate_figure3(self, output_dir: str, n_batches: int = 100) -> Dict:
+    def generate_figure3(self, output_dir: str, n_batches: int = 100,
+                         precomputed: Optional[Dict] = None, config: Optional[Dict] = None) -> Dict:
         """
         Figure 3: Q/K Specialization.
 
         Shows Q vs K neuron usage patterns.
         """
         from .visualizers import plot_qk_specialization
+        precomputed = precomputed or {}
+        config = config or {}
 
-        if self.dataloader is None:
-            return {'error': 'Requires dataloader'}
+        # Check for pre-computed routing data
+        if 'routing' in precomputed and 'qk_usage' in precomputed['routing']:
+            print("  Using pre-computed Q/K usage data...", flush=True)
+            qk_data = precomputed['routing']['qk_usage']
+        else:
+            if self.dataloader is None:
+                return {'error': 'Requires dataloader'}
 
-        print("  Analyzing Q/K usage...", flush=True)
-        qk_data = self.routing.analyze_qk_usage(self.dataloader, n_batches)
+            print("  Analyzing Q/K usage...", flush=True)
+            qk_data = self.routing.analyze_qk_usage(self.dataloader, n_batches)
 
         path = plot_qk_specialization(qk_data, os.path.join(output_dir, 'fig3_qk_specialization.png'))
         print(f"  Saved: {path}", flush=True)
 
         return {'qk_usage': qk_data, 'visualization': path}
 
-    def generate_figure4(self, output_dir: str, n_batches: int = 50) -> Dict:
+    def generate_figure4(self, output_dir: str, n_batches: int = 50,
+                         precomputed: Optional[Dict] = None, config: Optional[Dict] = None) -> Dict:
         """
         Figure 4: POS Neuron Specialization.
 
-        Shows neuron specialization by part-of-speech.
+        Shows neuron specialization by part-of-speech using NeuronFeatureAnalyzer.
         """
-        from .pos_neuron import POSNeuronAnalyzer
-        from .visualizers import plot_pos_specificity
+        from .pos_neuron import TokenCombinationAnalyzer, NeuronFeatureAnalyzer
+        from .visualizers import plot_pos_specialization_from_features
+        precomputed = precomputed or {}
+        config = config or {}
 
-        print("  Initializing POS analyzer...", flush=True)
-        pos_analyzer = POSNeuronAnalyzer(
-            self.model, router=self.router, tokenizer=self.tokenizer,
-            device=self.device, target_layer=None
+        # Check for pre-computed neuron features
+        if 'neuron_features' in precomputed:
+            print("  Using pre-computed neuron features...", flush=True)
+            results = precomputed['neuron_features']
+        else:
+            max_sentences = config.get('max_sentences', 2000)
+            target_layer = config.get('target_layer', None)
+
+            print("  Initializing TokenCombinationAnalyzer...", flush=True)
+            tca = TokenCombinationAnalyzer(
+                self.model, tokenizer=self.tokenizer, device=self.device,
+                target_layer=target_layer
+            )
+
+            print("  Loading UD dataset...", flush=True)
+            try:
+                dataset = tca.load_ud_dataset('train', max_sentences=max_sentences)
+            except Exception as e:
+                return {'error': f'Failed to load UD dataset: {e}'}
+
+            print("  Collecting token activations...", flush=True)
+            tca.analyze_dataset(dataset, max_sentences=max_sentences, analyze_layer_divergence=False)
+
+            print("  Building neuron feature profiles...", flush=True)
+            nfa = NeuronFeatureAnalyzer.from_token_combination_analyzer(tca)
+            results = nfa.run_full_analysis(output_dir=output_dir)
+
+        path = plot_pos_specialization_from_features(
+            results, os.path.join(output_dir, 'fig4_pos_neurons.png')
         )
-
-        print("  Loading UD dataset...", flush=True)
-        try:
-            dataset = pos_analyzer.load_ud_dataset('train', max_sentences=2000)
-        except Exception as e:
-            return {'error': f'Failed to load UD dataset: {e}'}
-
-        print("  Analyzing...", flush=True)
-        results = pos_analyzer.analyze_dataset(dataset, pool_type='fv', max_sentences=2000)
-
-        path = plot_pos_specificity(results, os.path.join(output_dir, 'fig4_pos_neurons.png'))
         print(f"  Saved: {path}", flush=True)
 
-        return {'pos_analysis': results, 'visualization': path}
+        return {'neuron_features': results, 'visualization': path}
 
-    def generate_figure6(self, output_dir: str, n_batches: int = 50) -> Dict:
+    def generate_figure5(self, output_dir: str, n_batches: int = 10,
+                         precomputed: Optional[Dict] = None, config: Optional[Dict] = None) -> Dict:
         """
-        Figure 6: Neuron Utilization + Layer Contribution.
+        Figure 5: Semantic Coherence (Factual Knowledge Heatmap).
 
-        6a: Neuron utilization histogram
-        6b: Layer-wise contribution
-        """
-        results = {}
-        results.update(self.generate_figure6a(output_dir, n_batches))
-        results.update(self.generate_figure6b(output_dir, n_batches))
-        return results
+        Shows that related semantic outputs share neuron subsets.
+        Neurons are clustered by: shared -> category-specific -> mixed.
 
-    def generate_figure6a(self, output_dir: str, n_batches: int = 50) -> Dict:
-        """
-        Figure 6a: Neuron Utilization.
-
-        Shows EMA distribution across neuron pools.
-        """
-        from .visualizers import plot_usage_histogram
-
-        print("  Analyzing EMA distribution...", flush=True)
-        health_data = self.health.analyze_ema_distribution()
-
-        # Collect EMA data for visualization
-        neuron_types = self.health.get_neuron_types()
-        ema_data = []
-        for name, (display, ema_attr, _, color) in neuron_types.items():
-            if hasattr(self.router, ema_attr):
-                ema = getattr(self.router, ema_attr)
-                ema_data.append((display, ema.detach().cpu().numpy(), color))
-
-        path = plot_usage_histogram(ema_data, os.path.join(output_dir, 'fig6a_neuron_util.png'))
-        print(f"  Saved: {path}", flush=True)
-
-        return {'ema_distribution': health_data, 'visualization_6a': path}
-
-    def generate_figure6b(self, output_dir: str, n_batches: int = 50) -> Dict:
-        """
-        Figure 6b: Layer-wise Contribution.
-
-        Shows attention vs knowledge circuit contribution per layer.
-        """
-        from .visualizers import plot_layer_contribution
-
-        if self.dataloader is None:
-            return {'error': 'Requires dataloader'}
-
-        print("  Analyzing layer contribution...", flush=True)
-        contrib_data = self.routing.analyze_layer_contribution(self.dataloader, n_batches)
-
-        path = plot_layer_contribution(contrib_data, os.path.join(output_dir, 'fig6b_layer_contrib.png'))
-        print(f"  Saved: {path}", flush=True)
-
-        return {'layer_contribution': contrib_data, 'visualization_6b': path}
-
-    def generate_figure7(self, output_dir: str, n_batches: int = 10) -> Dict:
-        """
-        Figure 7: Factual Knowledge Heatmap.
-
-        Shows which neurons activate for factual prompts.
+        Config options:
+            prompts: List of prompts (default: capital city prompts)
+            targets: List of expected targets (default: ["Paris", "Berlin", "Tokyo", "blue"])
+            pool_type: Pool to analyze (default: 'fv')
+            gen_tokens: Max tokens to generate (default: 30)
+            temperature: Sampling temperature (default: 1.0)
+            top_k: Top-k sampling (default: 50)
         """
         from .visualizers import plot_factual_heatmap
+        precomputed = precomputed or {}
+        config = config or {}
 
-        prompts = [
-            "The capital of France is",
-            "The capital of Germany is",
-            "The capital of Japan is",
-            "The color of the sky is",
-        ]
-        targets = ["Paris", "Berlin", "Tokyo", "Blue"]
+        # Check for pre-computed factual data
+        if 'factual' in precomputed and 'per_target' in precomputed.get('factual', {}):
+            print("  Using pre-computed factual analysis...", flush=True)
+            factual_data = precomputed['factual']
+        else:
+            # Get parameters from config with defaults
+            prompts = config.get('prompts', [
+                "The capital of France is",
+                "The capital of England is",
+                "The capital of Japan is",
+                "The color of the sky is",
+            ])
+            targets = config.get('targets', ["Paris", "London", "Tokyo", "blue"])
+            pool_type = config.get('pool_type', 'fv')
+            gen_tokens = config.get('gen_tokens', 30)
+            temperature = config.get('temperature', 1.0)
+            top_k = config.get('top_k', 50)
 
-        print("  Analyzing factual neurons...", flush=True)
-        factual_data = self.behavioral.analyze_factual_neurons(
-            prompts, targets, n_runs=n_batches, pool_type='fv'
-        )
+            # Independent runs until target appears min_target_count times
+            min_targets = max(50, n_batches * 5)
+            print(f"  Analyzing factual neurons (pool={pool_type}, min_targets={min_targets})...", flush=True)
+            factual_data = self.behavioral.analyze_factual_neurons(
+                prompts, targets,
+                pool_type=pool_type,
+                min_target_count=min_targets,
+                temperature=temperature,
+                top_k=top_k
+            )
 
-        path = plot_factual_heatmap(factual_data, os.path.join(output_dir, 'fig7_factual_heatmap.png'))
+        path = plot_factual_heatmap(factual_data, os.path.join(output_dir, 'fig5_semantic_coherence.png'))
         print(f"  Saved: {path}", flush=True)
 
         return {'factual_analysis': factual_data, 'visualization': path}
+
+    def generate_figure6(self, output_dir: str, n_batches: int = 50,
+                         precomputed: Optional[Dict] = None, config: Optional[Dict] = None) -> Dict:
+        """
+        Figure 6: Training Dynamics (Appendix).
+
+        Shows validation loss curve comparing DAWN vs Vanilla transformer.
+
+        Config options:
+            training_logs: List of paths to training log files
+            training_labels: Labels for each model (e.g., ["DAWN-24M", "Vanilla-22M"])
+            checkpoint_paths: List of checkpoint paths (will auto-find training_log.txt for each)
+            checkpoint_path: Single checkpoint path (fallback)
+        """
+        from .visualizers import (
+            plot_training_dynamics, plot_training_from_logs,
+            find_training_log, parse_training_log
+        )
+
+        if not HAS_MATPLOTLIB:
+            return {'error': 'matplotlib required'}
+        precomputed = precomputed or {}
+        config = config or {}
+
+        print("  Generating training dynamics plot...", flush=True)
+
+        data = {}
+
+        # Method 1: Explicit training logs list from config
+        training_logs = config.get('training_logs', [])
+        training_labels = config.get('training_labels', [])
+
+        if training_logs:
+            for i, log_path in enumerate(training_logs):
+                if os.path.exists(log_path):
+                    steps, losses, meta = parse_training_log(log_path, use_val_loss=True)
+                    if steps:
+                        label = training_labels[i] if i < len(training_labels) else f'Model-{i+1}'
+                        data[label] = (steps, losses)
+                        print(f"    Loaded {label}: {meta['n_points']} points")
+                else:
+                    print(f"    Warning: Log file not found: {log_path}")
+
+        # Method 2: Multiple checkpoint paths from config
+        if not data:
+            checkpoint_paths = config.get('checkpoint_paths', [])
+            checkpoint_labels = config.get('checkpoint_labels', [])
+
+            for i, ckpt_path in enumerate(checkpoint_paths):
+                log_path = find_training_log(ckpt_path)
+                if log_path:
+                    steps, losses, meta = parse_training_log(log_path, use_val_loss=True)
+                    if steps:
+                        # Auto-generate label from path
+                        if i < len(checkpoint_labels):
+                            label = checkpoint_labels[i]
+                        else:
+                            from pathlib import Path
+                            p = Path(ckpt_path)
+                            # Extract model name from path (e.g., "v17.1" or "baseline")
+                            name = p.name if p.is_file() else p.name
+                            if 'v17' in name.lower() or 'v18' in name.lower() or 'dawn' in name.lower():
+                                label = 'DAWN'
+                            elif 'baseline' in name.lower() or 'vanilla' in name.lower():
+                                label = 'Vanilla'
+                            else:
+                                label = name[:20]  # Truncate long names
+                        data[label] = (steps, losses)
+                        print(f"    Loaded {label}: {meta['n_points']} points from {log_path}")
+
+        # Method 3: Auto-find from self.checkpoint_path (same as model checkpoint)
+        if not data:
+            log_path = find_training_log(self.checkpoint_path)
+            if log_path:
+                steps, losses, meta = parse_training_log(log_path, use_val_loss=True)
+                if steps:
+                    data['DAWN'] = (steps, losses)
+                    print(f"    Loaded DAWN: {meta['n_points']} points from {log_path}")
+
+        # No demo data - report that no logs were found
+        if not data:
+            print("    WARNING: No training logs found!")
+            print(f"    Searched in: {self.checkpoint_path}")
+            print("    Expected file: training_log.txt in checkpoint directory")
+            print("    Skipping figure 6 generation.")
+            return {
+                'error': 'No training logs found',
+                'searched_path': self.checkpoint_path,
+                'expected_file': 'training_log.txt'
+            }
+
+        output_path = os.path.join(output_dir, 'fig6_training_dynamics.png')
+        path = plot_training_dynamics(data, output_path)
+
+        if path:
+            print(f"  Saved: {path}", flush=True)
+
+        return {'visualization': path, 'data': {k: len(v[0]) for k, v in data.items()}}
+
+    def generate_figure7(self, output_dir: str, n_batches: int = 50,
+                         precomputed: Optional[Dict] = None, config: Optional[Dict] = None) -> Dict:
+        """
+        Figure 7: Routing Statistics (Appendix).
+
+        Shows:
+        (a) Neuron Utilization - pool-wise active neuron percentages
+        (b) Layer-wise Circuit Contribution - attention vs knowledge per layer
+        """
+        from .visualizers import plot_routing_stats
+        precomputed = precomputed or {}
+        config = config or {}
+
+        routing_results = precomputed.get('routing', {})
+
+        # Get layer contribution data
+        if 'layer_contribution' in routing_results:
+            print("  Using pre-computed layer contribution...", flush=True)
+            contrib_data = routing_results['layer_contribution']
+        else:
+            if self.dataloader is None:
+                return {'error': 'Requires dataloader'}
+            print("  Analyzing layer contribution...", flush=True)
+            contrib_data = self.routing.analyze_layer_contribution(self.dataloader, n_batches)
+
+        # Get utilization data from qk_usage (actual forward pass counts)
+        if 'qk_usage' in routing_results:
+            print("  Using pre-computed QK usage...", flush=True)
+            qk_usage = routing_results['qk_usage']
+        else:
+            if self.dataloader is not None:
+                print("  Analyzing QK usage (forward pass)...", flush=True)
+                qk_usage = self.routing.analyze_qk_usage(self.dataloader, n_batches * 2)
+            else:
+                qk_usage = {}
+
+        # Combine data for visualization
+        combined_data = {
+            'layer_contribution': contrib_data,
+            'qk_usage': qk_usage,
+        }
+
+        path = plot_routing_stats(
+            combined_data,
+            os.path.join(output_dir, 'fig7_routing_stats.png'),
+            router=self.router
+        )
+        print(f"  Saved: {path}", flush=True)
+
+        return {'layer_contribution': contrib_data, 'visualization': path}
+
+
+def main():
+    """CLI interface for paper figure generation."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='Generate DAWN paper figures',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Generate all figures
+  python -m scripts.analysis.paper_figures --checkpoint model.pt --output figures/
+
+  # Generate specific figures with custom parameters
+  python -m scripts.analysis.paper_figures --checkpoint model.pt --output figures/ \\
+      --figures 3,5,7 --n_batches 20 --pool_type fv --gen_tokens 50
+
+  # Figure 5 with custom prompts
+  python -m scripts.analysis.paper_figures --checkpoint model.pt --output figures/ \\
+      --figures 5 --prompts "The capital of France is" "The capital of Italy is" \\
+      --targets Paris Rome
+"""
+    )
+
+    parser.add_argument('--checkpoint', required=True, help='Path to model checkpoint')
+    parser.add_argument('--val_data', help='Path to validation data (optional)')
+    parser.add_argument('--output', default='./paper_figures', help='Output directory')
+    parser.add_argument('--figures', default='all',
+                       help='Figures to generate: "all" or comma-separated (e.g., "3,5,7")')
+    parser.add_argument('--n_batches', type=int, default=50, help='Number of batches for analysis')
+    parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
+
+    # Figure 5 specific parameters
+    parser.add_argument('--prompts', nargs='+', help='Custom prompts for figure 5')
+    parser.add_argument('--targets', nargs='+', help='Custom targets for figure 5')
+    parser.add_argument('--pool_type', default='fv', help='Pool type for factual analysis (fv, rv, fqk, etc.)')
+    parser.add_argument('--gen_tokens', type=int, default=30, help='Max tokens to generate')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature')
+    parser.add_argument('--top_k', type=int, default=50, help='Top-k sampling')
+
+    # Figure 4 specific parameters
+    parser.add_argument('--max_sentences', type=int, default=2000, help='Max sentences for POS analysis')
+    parser.add_argument('--target_layer', type=int, help='Target layer for analysis (default: all)')
+
+    # Figure 6 specific parameters
+    parser.add_argument('--training_log', help='Path to training log JSON file')
+
+    args = parser.parse_args()
+
+    # Build config from arguments
+    config = {
+        'pool_type': args.pool_type,
+        'gen_tokens': args.gen_tokens,
+        'temperature': args.temperature,
+        'top_k': args.top_k,
+        'max_sentences': args.max_sentences,
+        'target_layer': args.target_layer,
+        'training_log': args.training_log,
+    }
+
+    if args.prompts:
+        config['prompts'] = args.prompts
+    if args.targets:
+        config['targets'] = args.targets
+
+    print("=" * 60)
+    print("DAWN Paper Figure Generator")
+    print("=" * 60)
+    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Output: {args.output}")
+    print(f"Figures: {args.figures}")
+    print(f"Batches: {args.n_batches}")
+    print(f"Config: pool_type={args.pool_type}, gen_tokens={args.gen_tokens}")
+    print("=" * 60)
+
+    # Initialize generator
+    gen = PaperFigureGenerator(
+        args.checkpoint,
+        args.val_data,
+        device=args.device
+    )
+
+    # Generate figures
+    results = gen.generate(
+        args.figures,
+        args.output,
+        n_batches=args.n_batches,
+        config=config
+    )
+
+    print("\n" + "=" * 60)
+    print("COMPLETE")
+    print("=" * 60)
+    for fig, result in results.items():
+        if 'error' in result:
+            print(f"  {fig}: ERROR - {result['error']}")
+        elif 'visualization' in result:
+            print(f"  {fig}: {result['visualization']}")
+        elif 'visualization_7a' in result:
+            print(f"  {fig}: {result.get('visualization_7a')}, {result.get('visualization_7b')}")
+
+    return results
+
+
+if __name__ == '__main__':
+    main()

@@ -1808,8 +1808,9 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         if not layer_masks:
             return []
 
-        # Combined mask (majority vote or single layer)
-        # Combined weights (mean across layers)
+        # Combined mask (union across layers) and weights (mean across layers)
+        # DAWN shared pool: same neuron index = same physical neuron across layers
+        # Union semantics: if a neuron is selected in ANY layer, it contributed to this token
         if self.target_layer is not None:
             combined_mask = layer_masks.get(self.target_layer)
             combined_weights = layer_weights.get(self.target_layer)
@@ -1817,7 +1818,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 return []
         else:
             all_masks = np.stack(list(layer_masks.values()), axis=0)
-            combined_mask = all_masks.mean(axis=0) > 0.5
+            combined_mask = all_masks.any(axis=0)  # Union: active if selected in ANY layer
             all_weights = np.stack(list(layer_weights.values()), axis=0)
             combined_weights = all_weights.mean(axis=0)
 

@@ -551,12 +551,29 @@ class RoutingAnalyzer(BaseAnalyzer):
                 else:
                     corr = 0.0
 
-                # Specialization analysis
-                threshold = (q_np.sum() + k_np.sum()) / (2 * len(q_np)) * 0.1
-                q_only = int(((q_np > threshold) & (k_np < threshold)).sum())
-                k_only = int(((k_np > threshold) & (q_np < threshold)).sum())
-                shared = int(((q_np > threshold) & (k_np > threshold)).sum())
-                inactive = int(((q_np < threshold) & (k_np < threshold)).sum())
+                # Ratio-based specialization analysis (for paper Fig 3)
+                # q_ratio = q_count / (q_count + k_count) per neuron
+                total_usage = q_np + k_np
+                q_ratio = np.zeros_like(q_np, dtype=float)
+                valid_mask = total_usage > 0
+                q_ratio[valid_mask] = q_np[valid_mask] / total_usage[valid_mask]
+
+                # Inactive: bottom 10% by total usage (neurons rarely selected)
+                usage_threshold = np.percentile(total_usage, 10) if len(total_usage) > 0 else 0
+                inactive_mask = total_usage <= usage_threshold
+
+                # Among active neurons, classify by ratio
+                # Q-specialized: q_ratio > 0.7 (mostly selected by Q)
+                # K-specialized: q_ratio < 0.3 (mostly selected by K)
+                # Shared: 0.3 <= q_ratio <= 0.7 (selected by both)
+                active_mask = ~inactive_mask
+                q_specialized = int(((q_ratio > 0.7) & active_mask).sum())
+                k_specialized = int(((q_ratio < 0.3) & active_mask).sum())
+                shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7) & active_mask).sum())
+                inactive = int(inactive_mask.sum())
+
+                # Q-ratio data for histogram (bimodal distribution)
+                q_ratio_active = q_ratio[active_mask].tolist()
 
                 results[pool_name] = {
                     'display': pool_info['display'],
@@ -567,13 +584,22 @@ class RoutingAnalyzer(BaseAnalyzer):
                     'correlation': corr,
                     'avg_overlap': float(np.mean(all_overlaps)) if all_overlaps else 0,
                     'std_overlap': float(np.std(all_overlaps)) if all_overlaps else 0,
-                    'q_specialized': q_only,
-                    'k_specialized': k_only,
+                    'q_specialized': q_specialized,
+                    'k_specialized': k_specialized,
                     'shared': shared,
                     'inactive': inactive,
                     'q_total': int(q_np.sum()),
                     'k_total': int(k_np.sum()),
                     'per_layer': per_layer_results,
+                    # Paper Fig 3 specific data
+                    'q_ratio': q_ratio.tolist(),  # Per-neuron Q ratio for scatter/histogram
+                    'q_ratio_active': q_ratio_active,  # Only active neurons for histogram
+                    'usage_threshold': float(usage_threshold),
+                    'specialization_thresholds': {
+                        'q_specialized': 0.7,
+                        'k_specialized': 0.3,
+                        'inactive_percentile': 10
+                    }
                 }
 
             results['n_batches'] = n_batches
@@ -688,25 +714,26 @@ class RoutingAnalyzer(BaseAnalyzer):
         """
         Analyze per-layer contribution from attention vs knowledge circuits.
 
-        Paper Figure 6b data generation.
+        Uses OUTPUT NORM based measurement (most accurate):
+            attn_out_norm = attn_out.norm(dim=-1).mean()
+            know_out_norm = know_out.norm(dim=-1).mean()
+            attention_ratio = attn_norm / (attn_norm + know_norm)
+
+        This measures actual output magnitude, not just routing weights.
 
         Args:
             dataloader: DataLoader for input data
             n_batches: Number of batches to process
 
         Returns:
-            Dictionary with layer-wise attention/knowledge ratios
+            Dictionary with layer-wise attention/knowledge ratios based on output norms
         """
-        # {layer_idx: {'attention': [], 'knowledge': []}}
-        layer_contributions = defaultdict(lambda: {'attention': [], 'knowledge': []})
-
-        # Standardized keys for attention and knowledge
-        ATTENTION_KEYS = ['fv', 'rv', 'fqk_q', 'fqk_k', 'rqk_q', 'rqk_k']
-        KNOWLEDGE_KEYS = ['fknow', 'rknow']
+        # Track per-layer output norms
+        layer_norms = defaultdict(lambda: {'attn': [], 'know': []})
 
         self.model.eval()
         with self.extractor.analysis_context():
-            for i, batch in enumerate(tqdm(dataloader, desc='Layer Contribution', total=n_batches)):
+            for i, batch in enumerate(tqdm(dataloader, desc='Layer Contribution (output norm)', total=n_batches)):
                 if i >= n_batches:
                     break
 
@@ -721,42 +748,34 @@ class RoutingAnalyzer(BaseAnalyzer):
                 except Exception:
                     continue
 
-                # Process all layers using extractor
+                # Process all layers - use output norms
                 for layer in routing:
                     layer_idx = layer.layer_idx
+                    norms = layer.get_output_norms()
 
-                    # Attention contribution: sum of all attention routing weights
-                    attn_contrib = 0.0
-                    for key in ATTENTION_KEYS:
-                        w = layer.get_weight(key)
-                        if w is not None:
-                            attn_contrib += w.sum().item()
+                    if 'attn_out_norm' in norms and 'know_out_norm' in norms:
+                        layer_norms[layer_idx]['attn'].append(norms['attn_out_norm'])
+                        layer_norms[layer_idx]['know'].append(norms['know_out_norm'])
 
-                    # Knowledge contribution: sum of knowledge weights
-                    know_contrib = 0.0
-                    for key in KNOWLEDGE_KEYS:
-                        w = layer.get_weight(key)
-                        if w is not None:
-                            know_contrib += w.sum().item()
+        # Aggregate results using output norms
+        results = {'per_layer': {}, 'method': 'output_norm'}
 
-                    layer_contributions[layer_idx]['attention'].append(attn_contrib)
-                    layer_contributions[layer_idx]['knowledge'].append(know_contrib)
+        for layer_idx in sorted(layer_norms.keys()):
+            attn_norms = layer_norms[layer_idx]['attn']
+            know_norms = layer_norms[layer_idx]['know']
 
-        # Aggregate results
-        results = {'per_layer': {}}
-        for layer_idx in sorted(layer_contributions.keys()):
-            contribs = layer_contributions[layer_idx]
-            attn_mean = np.mean(contribs['attention']) if contribs['attention'] else 0
-            know_mean = np.mean(contribs['knowledge']) if contribs['knowledge'] else 0
-            total = attn_mean + know_mean
+            if attn_norms and know_norms:
+                mean_attn = float(np.mean(attn_norms))
+                mean_know = float(np.mean(know_norms))
+                total = mean_attn + mean_know
 
-            results['per_layer'][f'L{layer_idx}'] = {
-                'layer_idx': layer_idx,
-                'attention_sum': float(attn_mean),
-                'knowledge_sum': float(know_mean),
-                'attention_ratio': float(attn_mean / total) if total > 0 else 0.5,
-                'knowledge_ratio': float(know_mean / total) if total > 0 else 0.5,
-            }
+                results['per_layer'][f'L{layer_idx}'] = {
+                    'layer_idx': layer_idx,
+                    'attn_out_norm': mean_attn,
+                    'know_out_norm': mean_know,
+                    'attention_ratio': float(mean_attn / total * 100) if total > 0 else 50.0,
+                    'knowledge_ratio': float(mean_know / total * 100) if total > 0 else 50.0,
+                }
 
         # Summary
         if results['per_layer']:
@@ -765,6 +784,8 @@ class RoutingAnalyzer(BaseAnalyzer):
             results['summary'] = {
                 'attention_ratio_mean': float(np.mean(attn_ratios)),
                 'knowledge_ratio_mean': float(np.mean(know_ratios)),
+                'attention_ratio_std': float(np.std(attn_ratios)),
+                'knowledge_ratio_std': float(np.std(know_ratios)),
                 'n_layers': len(results['per_layer']),
             }
 
@@ -1388,6 +1409,8 @@ class RoutingAnalyzer(BaseAnalyzer):
             'weight_concentration': self.analyze_weight_concentration(dataloader, n_batches),
             'path_usage': self.analyze_path_usage(dataloader, n_batches),
             'coverage_progression': self.analyze_coverage_progression(dataloader, n_batches),
+            # Layer contribution for Fig 7
+            'layer_contribution': self.analyze_layer_contribution(dataloader, n_batches),
         }
 
         # Visualizations

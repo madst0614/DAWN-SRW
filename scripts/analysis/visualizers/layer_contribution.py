@@ -1,9 +1,10 @@
 """
-Layer Contribution Visualizations
-=================================
-Visualization for layer-wise circuit contribution analysis.
+Layer Contribution Visualizer
+=============================
 
-Paper Figure 6b: Layer-wise Attention vs Knowledge Contribution
+Paper-quality visualization for DAWN layer-wise circuit contribution.
+
+Creates a single-panel figure showing attention vs knowledge contribution per layer.
 """
 
 import os
@@ -11,131 +12,159 @@ import numpy as np
 from typing import Dict, Optional
 
 try:
-    import matplotlib.pyplot as plt
     import matplotlib
     matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
-    plt = None
+
+# Style settings
+if HAS_MATPLOTLIB:
+    plt.rcParams['font.family'] = 'serif'
+    plt.rcParams['font.size'] = 9
+    plt.rcParams['axes.linewidth'] = 0.8
+    plt.rcParams['axes.spines.top'] = False
+    plt.rcParams['axes.spines.right'] = False
+
+# Colors
+COLOR_ATTENTION = '#4A90D9'
+COLOR_KNOWLEDGE = '#50C878'
+COLOR_GRAY = '#7F8C8D'
 
 
+def extract_layer_stats_from_contribution(contribution_data: Dict) -> list:
+    """
+    Extract layer-wise attention contribution percentages.
+
+    Args:
+        contribution_data: Results from analyze_layer_contribution()
+
+    Returns:
+        List of attention contribution percentages (0-100) per layer
+    """
+    layer_stats = contribution_data.get('layer_contributions', [])
+
+    if not layer_stats:
+        per_layer = contribution_data.get('per_layer', {})
+        if per_layer:
+            # Handle dict format (L0, L1, ...) or list format
+            if isinstance(per_layer, dict):
+                # Sort by layer index and extract attention ratios
+                sorted_layers = sorted(per_layer.items(),
+                                       key=lambda x: int(x[0].replace('L', '')) if x[0].startswith('L') else int(x[0]))
+                layer_stats = []
+                for _, layer_data in sorted_layers:
+                    ratio = layer_data.get('attention_ratio', 0.5)
+                    # Convert 0-1 to 0-100 if needed
+                    if ratio <= 1.0:
+                        ratio = ratio * 100
+                    layer_stats.append(ratio)
+            elif isinstance(per_layer, list):
+                layer_stats = []
+                for layer_data in per_layer:
+                    ratio = layer_data.get('attention_ratio', 0.5)
+                    if ratio <= 1.0:
+                        ratio = ratio * 100
+                    layer_stats.append(ratio)
+
+    return layer_stats
+
+
+def plot_routing_stats(
+    routing_data: Dict,
+    output_path: str,
+    router=None,
+    dpi: int = 300
+) -> Optional[str]:
+    """
+    Generate paper-quality layer-wise circuit contribution figure.
+
+    Shows attention vs knowledge contribution per layer as a single panel.
+
+    Args:
+        routing_data: Dict with routing analysis results containing:
+            - 'layer_stats': pre-computed layer stats list
+            - 'layer_contribution': for layer-wise data extraction
+        output_path: Path for output PNG
+        router: NeuronRouter instance (unused, kept for API compatibility)
+        dpi: Output resolution
+
+    Returns:
+        Path to saved figure
+    """
+    if not HAS_MATPLOTLIB:
+        print("matplotlib not available")
+        return None
+
+    # Extract layer stats
+    layer_stats = routing_data.get('layer_stats', [])
+    if not layer_stats:
+        contribution_data = routing_data.get('layer_contribution', {})
+        if contribution_data:
+            layer_stats = extract_layer_stats_from_contribution(contribution_data)
+
+    if not layer_stats:
+        print("No layer contribution data available")
+        return None
+
+    # Create single-panel figure
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=dpi)
+
+    n_layers = len(layer_stats)
+    layers = list(range(1, n_layers + 1))
+
+    # Plot line with markers
+    ax.plot(layers, layer_stats, 'o-', color=COLOR_ATTENTION, linewidth=2,
+            markersize=6, markerfacecolor='white', markeredgewidth=1.5)
+
+    # Fill areas above/below 50%
+    ax.fill_between(layers, layer_stats, 50,
+                    where=[a >= 50 for a in layer_stats],
+                    color=COLOR_ATTENTION, alpha=0.3)
+    ax.fill_between(layers, layer_stats, 50,
+                    where=[a < 50 for a in layer_stats],
+                    color=COLOR_KNOWLEDGE, alpha=0.3)
+
+    # 50% baseline
+    ax.axhline(y=50, color=COLOR_GRAY, linestyle='--', linewidth=1.5)
+
+    # Styling
+    ax.set_xlim(0.5, n_layers + 0.5)
+    ax.set_ylim(35, 75)
+    ax.set_xticks(layers)
+    ax.set_xlabel('Layer', fontsize=10)
+    ax.set_ylabel('Attention Contribution (%)', fontsize=10)
+    ax.set_title('Layer-wise Circuit Contribution', fontsize=11, fontweight='bold', pad=10)
+    ax.yaxis.grid(True, linestyle='--', alpha=0.3)
+    ax.set_axisbelow(True)
+
+    # Legend
+    legend_elements = [
+        mpatches.Patch(color=COLOR_ATTENTION, alpha=0.3, label='Attention > 50%'),
+        mpatches.Patch(color=COLOR_KNOWLEDGE, alpha=0.3, label='Knowledge > 50%'),
+        plt.Line2D([0], [0], color=COLOR_GRAY, linestyle='--', label='50% baseline'),
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=8, framealpha=0.9)
+
+    plt.tight_layout()
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+
+    # Save PNG
+    plt.savefig(output_path, dpi=dpi, facecolor='white', edgecolor='none', bbox_inches='tight')
+    plt.close()
+
+    return output_path
+
+
+# Backward compatible alias
 def plot_layer_contribution(
     contribution_data: Dict,
     output_path: str,
-    dpi: int = 150
+    dpi: int = 300
 ) -> Optional[str]:
-    """
-    Generate layer-wise contribution visualization.
-
-    Paper Figure 6b: Shows attention vs knowledge circuit contribution per layer.
-
-    Args:
-        contribution_data: Results from RoutingAnalyzer.analyze_layer_contribution()
-        output_path: Path to save the figure
-        dpi: Output resolution
-
-    Returns:
-        Path to saved figure or None
-    """
-    if not HAS_MATPLOTLIB:
-        return None
-
-    per_layer = contribution_data.get('per_layer', {})
-    if not per_layer:
-        return None
-
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
-
-    # Extract data
-    layers = sorted(per_layer.keys(), key=lambda x: int(x[1:]))
-    layer_indices = [int(l[1:]) for l in layers]
-    attn_ratios = [per_layer[l]['attention_ratio'] * 100 for l in layers]
-    know_ratios = [per_layer[l]['knowledge_ratio'] * 100 for l in layers]
-
-    # Plot
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # 1. Line plot
-    ax = axes[0]
-    ax.plot(layer_indices, attn_ratios, 'b-o', label='Attention', linewidth=2, markersize=6)
-    ax.plot(layer_indices, know_ratios, 'r-o', label='Knowledge', linewidth=2, markersize=6)
-    ax.set_xlabel('Layer Index')
-    ax.set_ylabel('Contribution (%)')
-    ax.set_title('Layer-wise Circuit Contribution')
-    ax.legend()
-    ax.set_ylim(0, 100)
-    ax.grid(True, alpha=0.3)
-
-    # 2. Stacked bar chart
-    ax = axes[1]
-    width = 0.6
-    ax.bar(layer_indices, attn_ratios, width, label='Attention', color='steelblue')
-    ax.bar(layer_indices, know_ratios, width, bottom=attn_ratios, label='Knowledge', color='coral')
-    ax.set_xlabel('Layer Index')
-    ax.set_ylabel('Contribution (%)')
-    ax.set_title('Stacked Layer Contribution')
-    ax.legend()
-    ax.set_ylim(0, 100)
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
-    plt.close()
-
-    return output_path
-
-
-def plot_layer_contribution_detail(
-    contribution_data: Dict,
-    output_path: str,
-    dpi: int = 150
-) -> Optional[str]:
-    """
-    Generate detailed layer contribution heatmap.
-
-    Args:
-        contribution_data: Results from RoutingAnalyzer.analyze_layer_contribution()
-        output_path: Path to save the figure
-        dpi: Output resolution
-
-    Returns:
-        Path to saved figure or None
-    """
-    if not HAS_MATPLOTLIB:
-        return None
-
-    per_layer = contribution_data.get('per_layer', {})
-    if not per_layer:
-        return None
-
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
-
-    # Extract data
-    layers = sorted(per_layer.keys(), key=lambda x: int(x[1:]))
-    attn_sums = [per_layer[l]['attention_sum'] for l in layers]
-    know_sums = [per_layer[l]['knowledge_sum'] for l in layers]
-
-    # Normalize
-    max_val = max(max(attn_sums), max(know_sums)) if attn_sums else 1
-    attn_norm = [v / max_val for v in attn_sums]
-    know_norm = [v / max_val for v in know_sums]
-
-    # Build matrix
-    matrix = np.array([attn_norm, know_norm])
-
-    fig, ax = plt.subplots(figsize=(max(10, len(layers) * 0.5), 3))
-
-    im = ax.imshow(matrix, aspect='auto', cmap='Blues')
-    ax.set_yticks([0, 1])
-    ax.set_yticklabels(['Attention', 'Knowledge'])
-    ax.set_xticks(range(len(layers)))
-    ax.set_xticklabels([l[1:] for l in layers])
-    ax.set_xlabel('Layer')
-    ax.set_title('Normalized Circuit Activity by Layer')
-    plt.colorbar(im, ax=ax, label='Normalized Activity')
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
-    plt.close()
-
-    return output_path
+    """Backward compatible wrapper for plot_routing_stats."""
+    return plot_routing_stats(contribution_data, output_path, dpi=dpi)

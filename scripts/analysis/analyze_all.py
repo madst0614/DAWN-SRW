@@ -72,7 +72,8 @@ CLI Arguments:
         --n_batches       Batches for routing/semantic/behavioral/coselection (default: 100)
         --val_batches     Batches for validation performance (default: 200)
         --max_sentences   Max sentences for POS analysis (default: 2000)
-        --n_runs          Runs for factual analysis (default: 10)
+        --min_targets     Min target occurrences for factual analysis (default: 100)
+        --max_runs        Max runs for factual analysis safety limit (default: 500)
         --batch_size      Dataloader batch size (default: 16)
         --max_samples     Max samples for dataloader (default: 5000)
         --n_clusters      Clusters for embedding analysis (default: 5)
@@ -124,24 +125,28 @@ class ModelAnalyzer:
         n_batches: int = 100,
         val_batches: int = 200,
         max_sentences: int = 2000,
-        n_runs: int = 10,
+        min_targets: int = 100,
+        max_runs: int = 500,
         batch_size: int = 16,
         max_samples: int = 5000,
         n_clusters: int = 5,
         pool_type: str = 'fv',
         gen_tokens: int = 50,
         target_layer: int = None,
+        compare_checkpoint: str = None,
     ):
         self.checkpoint_path = checkpoint_path
         self.val_data_path = val_data_path
         self.output_dir = Path(output_dir)
         self.device = device
+        self.compare_checkpoint = compare_checkpoint
 
         # Analysis parameters
         self.n_batches = n_batches
         self.val_batches = val_batches
         self.max_sentences = max_sentences
-        self.n_runs = n_runs
+        self.min_targets = min_targets
+        self.max_runs = max_runs
         self.batch_size = batch_size
         self.max_samples = max_samples
         self.n_clusters = n_clusters
@@ -506,7 +511,6 @@ class ModelAnalyzer:
         # Print detailed summary
         ema = results.get('ema_distribution', {})
         diversity = results.get('diversity', {})
-        qk_overlap = results.get('qk_ema_overlap', {})
 
         if ema:
             print(f"\n  ┌─ Neuron Health Summary ───────────────────────────────────────────────")
@@ -541,17 +545,12 @@ class ModelAnalyzer:
                           f"{data.get('effective_count', 0):>14.1f} {data.get('coverage', 0)*100:>11.1f}%")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
-        # Q/K overlap for v18.x
-        if qk_overlap and 'error' not in qk_overlap:
-            print(f"\n  ┌─ Q/K EMA Overlap (v18.x) ──────────────────────────────────────────────")
-            for pool_name, overlap_data in qk_overlap.items():
-                if isinstance(overlap_data, dict) and 'q_only' in overlap_data:
-                    print(f"  │ {pool_name}:")
-                    print(f"  │   Shared: {overlap_data.get('shared', 0):>6d}  |  Q-only: {overlap_data.get('q_only', 0):>6d}  |  K-only: {overlap_data.get('k_only', 0):>6d}  |  Dead: {overlap_data.get('dead', 0):>6d}")
-                    print(f"  │   Corr: {overlap_data.get('correlation', 0):.3f}  |  Jaccard: {overlap_data.get('jaccard', 0):.3f}")
-            print(f"  └─────────────────────────────────────────────────────────────────────────")
-
         self.results['health'] = results
+
+        # Save results.json for later --only paper usage
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+
         return results
 
     def analyze_routing(self, n_batches: int = 100) -> Dict:
@@ -588,6 +587,7 @@ class ModelAnalyzer:
         selection_div = results.get('selection_diversity', {})
         qk_overlap = results.get('qk_overlap', {})
         qk_entropy = results.get('qk_entropy', {})
+        qk_usage = results.get('qk_usage', {})
 
         if entropy:
             print(f"\n  ┌─ Routing Entropy ─────────────────────────────────────────────────────")
@@ -655,6 +655,18 @@ class ModelAnalyzer:
                         print(f"  │ {pool}: N/A (v18.5 context-based routing)")
                     else:
                         print(f"  │ {pool}: Q={q_ent:.1f}%, K={k_ent:.1f}%, diff={data.get('entropy_diff', 0):.1f}%")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Q/K Specialization (forward-based, Fig 3)
+        if qk_usage:
+            print(f"\n  ┌─ Q/K Specialization (Forward-based) ─────────────────────────────────────")
+            print(f"  │ {'Pool':<8} {'Total':>8} {'Q-spec':>8} {'K-spec':>8} {'Shared':>8} {'Inactive':>8} {'Corr':>8}")
+            print(f"  │ {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+            for pool, data in qk_usage.items():
+                if isinstance(data, dict) and 'q_specialized' in data:
+                    print(f"  │ {pool:<8} {data.get('n_neurons', 0):>8d} {data['q_specialized']:>8d} "
+                          f"{data['k_specialized']:>8d} {data['shared']:>8d} {data['inactive']:>8d} "
+                          f"{data.get('correlation', 0):>8.3f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         # Q/K Union Coverage (true dead neurons)
@@ -731,6 +743,12 @@ class ModelAnalyzer:
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['routing'] = results
+
+        # Save results.json for later --only paper usage
+        output_dir = self.output_dir / 'routing'
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+
         return results
 
     def analyze_embedding(self, n_clusters: int = 5) -> Dict:
@@ -1186,6 +1204,11 @@ class ModelAnalyzer:
         print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['neuron_features'] = results
+
+        # Save results.json for later --only paper usage
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+
         return results
 
     def analyze_layerwise_semantic(self, max_sentences: int = 500) -> Dict:
@@ -1235,21 +1258,19 @@ class ModelAnalyzer:
         self.results['layerwise_semantic'] = results
         return results
 
-    def analyze_factual(self, n_runs: int = 10, pool_type: str = 'fv') -> Dict:
+    def analyze_factual(self, min_target_count: int = 100, max_runs: int = 500, pool_type: str = 'fv') -> Dict:
         """Analyze factual knowledge neurons (DAWN only).
 
         Finds neurons that consistently activate for factual knowledge
         (e.g., "The capital of France is" -> Paris).
 
+        Independent runs approach: each run generates until target appears,
+        records neurons, then starts fresh. Repeats until min_target_count.
+
         Args:
-            n_runs: Number of repeated runs per prompt for consistency (default: 10)
-                - 5: Quick test
-                - 10: Standard analysis
-                - 20+: High confidence consistency check
-            pool_type: Which neuron pool to analyze
-                - 'fv': Feature V pool (default, recommended)
-                - 'rv': Restore V pool
-                - 'fqk', 'fqk_q', 'fqk_k': Feature QK pools
+            min_target_count: Minimum target occurrences to collect (default: 100)
+            max_runs: Maximum runs as safety limit (default: 500)
+            pool_type: Which neuron pool to analyze ('fv', 'rv', 'fqk', etc.)
 
         Returns:
             Dict with per-target neuron activations, common neurons, match rates
@@ -1263,74 +1284,87 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'factual'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        max_tokens = 30
-        print(f"  Analyzing factual neurons ({n_runs} runs × {max_tokens} tokens, pool={pool_type})...")
+        print(f"  Analyzing factual neurons (min_targets={min_target_count}, max_runs={max_runs}, pool={pool_type})...")
         analyzer = BehavioralAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
         )
 
         prompts = [
             "The capital of France is",
-            "The capital of Germany is",
+            "The capital of England is",
             "The capital of Japan is",
             "The color of the sky is",
         ]
-        targets = ["Paris", "Berlin", "Tokyo", "blue"]
+        targets = ["Paris", "London", "Tokyo", "blue"]
 
         results = analyzer.analyze_factual_neurons(
             prompts, targets,
-            n_runs=n_runs,
             pool_type=pool_type,
-            max_new_tokens=max_tokens,
-            temperature=0.8,  # Sampling for variation
-            top_k=50,         # Top-k sampling
+            min_target_count=min_target_count,
+            max_runs=max_runs,
+            temperature=1.0,
+            top_k=50,
         )
 
         # Print detailed summary
         per_target = results.get('per_target', {})
         if per_target:
-            print(f"\n  ┌─ Factual Analysis Results (Contrastive) ──────────────────────────────────")
-            print(f"  │ {'Target':<10} {'Found':>8} {'Match%':>8} {'N80%':>6} {'Specific':>8}")
-            print(f"  │ {'─'*10} {'─'*8} {'─'*8} {'─'*6} {'─'*8}")
             for target, data in per_target.items():
-                if isinstance(data, dict):
-                    matching = data.get('matching_runs', 0)
-                    total = data.get('total_runs', n_runs)
-                    match_rate = data.get('match_rate', 0) * 100
-                    n_common_80 = len(data.get('common_neurons_80', []))
-                    n_specific = len(data.get('target_specific_neurons', []))
-                    print(f"  │ {target:<10} {matching:>3}/{total:<3} {match_rate:>7.0f}% {n_common_80:>6} {n_specific:>8}")
+                if not isinstance(data, dict):
+                    continue
 
-            # Show sample generations and top contrastive neurons
-            any_match = any(d.get('match_rate', 0) > 0 for d in per_target.values())
-            if any_match:
-                print(f"  │")
-                print(f"  │ Sample generations & top target-specific neurons:")
-                for target, data in per_target.items():
-                    samples = data.get('sample_successful_generations', [])
-                    specific = data.get('target_specific_neurons', [])[:5]
-                    contrastive = data.get('contrastive_top50', [])[:3]
+                successful = data.get('successful_runs', 0)
+                total_runs = data.get('total_runs', 0)
+                match_rate = data.get('match_rate', 0) * 100
+
+                print(f"\n  {'='*70}")
+                print(f"  RESULTS: '{target}' found {successful}/{total_runs} runs ({match_rate:.1f}%)")
+                print(f"  {'='*70}")
+
+                if successful > 0:
+                    # Common neurons at different thresholds
+                    n100 = data.get('common_neurons_100', [])
+                    n80 = data.get('common_neurons_80', [])
+                    n50 = data.get('common_neurons_50', [])
+
+                    print(f"\n  100% common neurons ({len(n100)}): {n100[:20]}{'...' if len(n100) > 20 else ''}")
+                    print(f"   80%+ common neurons ({len(n80)}): {n80[:20]}{'...' if len(n80) > 20 else ''}")
+                    print(f"   50%+ common neurons ({len(n50)}): {n50[:20]}{'...' if len(n50) > 20 else ''}")
+
+                    # Top neurons by frequency (bar chart style)
+                    neuron_freqs = data.get('neuron_frequencies', [])[:15]
+                    if neuron_freqs:
+                        print(f"\n  Top 15 neurons by frequency:")
+                        for nf in neuron_freqs:
+                            bar = '█' * int(nf['percentage'] / 5)
+                            print(f"    Neuron {nf['neuron']:4d}: {nf['count']:3d}/{successful} ({nf['percentage']:5.1f}%) {bar}")
+
+                    # Sample generations
+                    samples = data.get('sample_generations', [])[:3]
                     if samples:
-                        sample = samples[0]
-                        text = sample.get('text', '')[:50]
-                        pos = sample.get('position', -1)
-                        print(f"  │   {target}: \"{text}...\" (pos={pos})")
-                        if contrastive:
-                            top_neurons = [f"N{c['neuron']}({c['score']:.2f})" for c in contrastive]
-                            print(f"  │          Top neurons: {', '.join(top_neurons)}")
-            else:
-                print(f"  │")
-                print(f"  │ Note: Target tokens not found in any generation")
-                print(f"  │       Model may lack factual knowledge or need different prompts")
-                print(f"  │")
-                print(f"  │ First generation samples:")
-                for target, data in list(per_target.items())[:2]:
-                    first_gen = data.get('first_generation', '')[:50]
-                    print(f"  │   {target}: \"{first_gen}...\"")
+                        print(f"\n  Sample generations with '{target}':")
+                        for i, sample in enumerate(samples):
+                            text = sample[:80] if isinstance(sample, str) else str(sample)[:80]
+                            print(f"    Run {i}: {text}...")
 
-            print(f"  └─────────────────────────────────────────────────────────────────────────")
+                    # Top contrastive neurons
+                    contrastive = data.get('contrastive_top50', [])[:5]
+                    if contrastive:
+                        print(f"\n  Top target-specific neurons (contrastive score):")
+                        for c in contrastive:
+                            print(f"    Neuron {c['neuron']:4d}: target={c['target_freq']:5.1f}% baseline={c['baseline_freq']:5.1f}% score={c['score']:.3f}")
+                else:
+                    first_gen = data.get('first_generation', '')[:80]
+                    print(f"\n  Note: Target '{target}' not found in {total} generations")
+                    print(f"  First generation: \"{first_gen}...\"")
+
+            print(f"\n  {'='*70}")
 
         with open(output_dir / 'factual_neurons.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+
+        # Also save as results.json for --only paper consistency
+        with open(output_dir / 'results.json', 'w') as f:
             json.dump(results, f, indent=2, default=str)
 
         # Generate visualizations
@@ -1636,49 +1670,174 @@ class ModelAnalyzer:
                 self.val_data_path,  # Pass path, not dataloader
                 device=self.device
             )
-            gen.generate('3,4,6,7', str(figures_dir), n_batches=50)
+
+            # Build precomputed results from already-run analyses
+            precomputed = {}
+            if 'routing' in self.results:
+                precomputed['routing'] = self.results['routing']
+            if 'health' in self.results:
+                precomputed['health'] = self.results['health']
+            if 'factual' in self.results:
+                precomputed['factual'] = self.results['factual']
+            if 'neuron_features' in self.results:
+                precomputed['neuron_features'] = self.results['neuron_features']
+
+            # Build config from instance parameters
+            config = {
+                'pool_type': self.pool_type,
+                'gen_tokens': self.gen_tokens,
+                'max_sentences': self.max_sentences,
+                'target_layer': self.target_layer,
+            }
+
+            # Add checkpoint paths for figure 6 (training dynamics comparison)
+            checkpoint_paths = [self.checkpoint_path]
+            if self.compare_checkpoint:
+                checkpoint_paths.append(self.compare_checkpoint)
+            config['checkpoint_paths'] = checkpoint_paths
+
+            # Generate figures 3,4,5,6,7 (6 = training dynamics)
+            gen.generate('3,4,5,6,7', str(figures_dir), n_batches=self.min_targets // 10,
+                        precomputed=precomputed, config=config)
         except Exception as e:
             print(f"    Warning: Could not generate paper figures: {e}")
+            import traceback
+            traceback.print_exc()
 
         # Generate tables
         print("  Generating paper tables...")
         self._generate_tables(tables_dir)
 
+        # Generate comparison samples if baseline available
+        if self.compare_checkpoint:
+            print("  Generating comparison samples...")
+            self._generate_comparison_samples(paper_dir)
+
+        # Generate paper_results.json with all numeric data
+        print("  Generating paper_results.json...")
+        self._generate_paper_results_json(paper_dir)
+
+        # Generate training config comparison
+        if self.compare_checkpoint:
+            print("  Generating training_comparison...")
+            self._generate_training_comparison(paper_dir)
+
         # Summary
         self._generate_paper_summary(paper_dir)
 
     def _generate_tables(self, tables_dir: Path):
-        """Generate LaTeX and CSV tables."""
+        """Generate LaTeX and CSV tables with optional vanilla comparison."""
+        # Try to get model_info from results, fallback to saved JSON
         model_info = self.results.get('model_info', {})
+        if not model_info:
+            params_file = self.output_dir / 'model_info' / 'parameters.json'
+            if params_file.exists():
+                with open(params_file) as f:
+                    model_info = json.load(f)
+
         perf = self.results.get('performance', {})
+        if not perf:
+            # Load from individual files
+            val_file = self.output_dir / 'performance' / 'validation.json'
+            speed_file = self.output_dir / 'performance' / 'speed_benchmark.json'
+            if val_file.exists():
+                with open(val_file) as f:
+                    perf['validation'] = json.load(f)
+            if speed_file.exists():
+                with open(speed_file) as f:
+                    perf['speed'] = json.load(f)
+
         val = perf.get('validation', {})
         speed = perf.get('speed', {})
 
+        # Load comparison model data if available
+        vanilla_info = {}
+        vanilla_val = {}
+        vanilla_speed = {}
+        if self.compare_checkpoint:
+            comp_path = Path(self.compare_checkpoint)
+            # Try to find analysis results for comparison checkpoint
+            comp_dirs = [
+                comp_path.parent / 'analysis',
+                comp_path / 'analysis',
+                self.output_dir.parent / comp_path.stem / 'analysis' if comp_path.is_file() else None,
+                self.output_dir.parent / comp_path.name if comp_path.is_dir() else None,
+            ]
+            found_results = False
+            for comp_dir in comp_dirs:
+                if comp_dir and comp_dir.exists():
+                    comp_params = comp_dir / 'model_info' / 'parameters.json'
+                    comp_val_file = comp_dir / 'performance' / 'validation.json'
+                    comp_speed_file = comp_dir / 'performance' / 'speed_benchmark.json'
+                    if comp_params.exists():
+                        with open(comp_params) as f:
+                            vanilla_info = json.load(f)
+                        found_results = True
+                    if comp_val_file.exists():
+                        with open(comp_val_file) as f:
+                            vanilla_val = json.load(f)
+                    if comp_speed_file.exists():
+                        with open(comp_speed_file) as f:
+                            vanilla_speed = json.load(f)
+                    if vanilla_info or vanilla_val:
+                        found_results = True
+                        break
+
+            # If no pre-existing results, run quick analysis on vanilla model
+            if not found_results:
+                print("    Running quick analysis on comparison model...")
+                try:
+                    vanilla_info, vanilla_val, vanilla_speed = self._analyze_comparison_model()
+                except Exception as e:
+                    print(f"    Warning: Could not analyze comparison model: {e}")
+
+        has_comparison = bool(vanilla_info or vanilla_val)
+
         # Model stats CSV
         with open(tables_dir / 'model_stats.csv', 'w') as f:
-            f.write("metric,value\n")
-            f.write(f"parameters,{model_info.get('total', 0)}\n")
-            f.write(f"parameters_M,{model_info.get('total_M', 0):.2f}\n")
-            f.write(f"flops,{model_info.get('flops', 0)}\n")
-            f.write(f"flops_G,{model_info.get('flops_G', 0):.2f}\n")
-            f.write(f"ppl,{val.get('perplexity', 0):.2f}\n")
-            f.write(f"accuracy,{val.get('accuracy', 0):.2f}\n")
-            f.write(f"tokens_per_sec,{speed.get('tokens_per_sec', 0):.0f}\n")
+            if has_comparison:
+                f.write("metric,dawn,vanilla\n")
+                f.write(f"parameters_M,{model_info.get('total_M', 0):.2f},{vanilla_info.get('total_M', 0):.2f}\n")
+                f.write(f"flops_G,{model_info.get('flops_G', 0):.2f},{vanilla_info.get('flops_G', 0):.2f}\n")
+                f.write(f"ppl,{val.get('perplexity', 0):.2f},{vanilla_val.get('perplexity', 0):.2f}\n")
+                f.write(f"accuracy,{val.get('accuracy', 0):.2f},{vanilla_val.get('accuracy', 0):.2f}\n")
+                f.write(f"tokens_per_sec,{speed.get('tokens_per_sec', 0):.0f},{vanilla_speed.get('tokens_per_sec', 0):.0f}\n")
+            else:
+                f.write("metric,value\n")
+                f.write(f"parameters,{model_info.get('total', 0)}\n")
+                f.write(f"parameters_M,{model_info.get('total_M', 0):.2f}\n")
+                f.write(f"flops,{model_info.get('flops', 0)}\n")
+                f.write(f"flops_G,{model_info.get('flops_G', 0):.2f}\n")
+                f.write(f"ppl,{val.get('perplexity', 0):.2f}\n")
+                f.write(f"accuracy,{val.get('accuracy', 0):.2f}\n")
+                f.write(f"tokens_per_sec,{speed.get('tokens_per_sec', 0):.0f}\n")
 
-        # Model stats LaTeX
+        # Model stats LaTeX - comparison table if vanilla available
         with open(tables_dir / 'model_stats.tex', 'w') as f:
             f.write("\\begin{table}[h]\n")
             f.write("\\centering\n")
-            f.write("\\caption{Model Statistics}\n")
-            f.write("\\begin{tabular}{lr}\n")
-            f.write("\\toprule\n")
-            f.write("Metric & Value \\\\\n")
-            f.write("\\midrule\n")
-            f.write(f"Parameters & {model_info.get('total_M', 0):.2f}M \\\\\n")
-            f.write(f"FLOPs & {model_info.get('flops_G', 0):.2f}G \\\\\n")
-            f.write(f"Perplexity & {val.get('perplexity', 0):.2f} \\\\\n")
-            f.write(f"Accuracy & {val.get('accuracy', 0):.1f}\\% \\\\\n")
-            f.write(f"Speed & {speed.get('tokens_per_sec', 0)/1000:.1f}K tok/s \\\\\n")
+            if has_comparison:
+                f.write("\\caption{Model Comparison: DAWN vs Vanilla}\n")
+                f.write("\\begin{tabular}{lrr}\n")
+                f.write("\\toprule\n")
+                f.write("Metric & DAWN & Vanilla \\\\\n")
+                f.write("\\midrule\n")
+                f.write(f"Parameters & {model_info.get('total_M', 0):.2f}M & {vanilla_info.get('total_M', 0):.2f}M \\\\\n")
+                f.write(f"FLOPs & {model_info.get('flops_G', 0):.2f}G & {vanilla_info.get('flops_G', 0):.2f}G \\\\\n")
+                f.write(f"Perplexity & {val.get('perplexity', 0):.2f} & {vanilla_val.get('perplexity', 0):.2f} \\\\\n")
+                f.write(f"Accuracy & {val.get('accuracy', 0):.1f}\\% & {vanilla_val.get('accuracy', 0):.1f}\\% \\\\\n")
+                f.write(f"Speed & {speed.get('tokens_per_sec', 0)/1000:.1f}K & {vanilla_speed.get('tokens_per_sec', 0)/1000:.1f}K tok/s \\\\\n")
+            else:
+                f.write("\\caption{Model Statistics}\n")
+                f.write("\\begin{tabular}{lr}\n")
+                f.write("\\toprule\n")
+                f.write("Metric & Value \\\\\n")
+                f.write("\\midrule\n")
+                f.write(f"Parameters & {model_info.get('total_M', 0):.2f}M \\\\\n")
+                f.write(f"FLOPs & {model_info.get('flops_G', 0):.2f}G \\\\\n")
+                f.write(f"Perplexity & {val.get('perplexity', 0):.2f} \\\\\n")
+                f.write(f"Accuracy & {val.get('accuracy', 0):.1f}\\% \\\\\n")
+                f.write(f"Speed & {speed.get('tokens_per_sec', 0)/1000:.1f}K tok/s \\\\\n")
             f.write("\\bottomrule\n")
             f.write("\\end{tabular}\n")
             f.write("\\end{table}\n")
@@ -1711,10 +1870,776 @@ class ModelAnalyzer:
                 f.write("\\end{tabular}\n")
                 f.write("\\end{table}\n")
 
-    def _generate_paper_summary(self, paper_dir: Path):
-        """Generate paper summary markdown."""
+    def _generate_comparison_samples(self, paper_dir: Path):
+        """Generate text samples comparing DAWN vs Baseline for paper."""
+        import torch.nn.functional as F
+
+        # Paper-quality prompts
+        PROMPTS = {
+            'Factual Knowledge': [
+                "The capital of France is",
+                "The largest planet in our solar system is",
+                "Water boils at",
+                "Albert Einstein was born in",
+            ],
+            'Common Sense': [
+                "If you drop a glass on the floor, it will",
+                "Fire is hot, but ice is",
+                "Birds fly in the sky, fish swim in",
+                "At night, the sun is",
+            ],
+            'Narrative': [
+                "Once upon a time, in a small village,",
+                "The detective examined the evidence and",
+                "She opened the door and saw",
+                "After years of hard work, he finally",
+            ],
+            'Technical': [
+                "In machine learning, gradient descent is",
+                "The function of the mitochondria is",
+                "A neural network consists of",
+            ],
+        }
+
+        def generate_text(model, prompt, max_new_tokens=50, temperature=0.8, top_k=50):
+            """Generate text with top-k sampling."""
+            input_ids = self.tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt').to(self.device)
+            generated = input_ids.clone()
+            eos_token_id = self.tokenizer.sep_token_id
+
+            with torch.no_grad():
+                for _ in range(max_new_tokens):
+                    output = model(generated, attention_mask=None)
+                    logits = output[0] if isinstance(output, tuple) else output
+                    next_token_logits = logits[:, -1, :] / temperature
+
+                    if top_k > 0:
+                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                        next_token_logits[indices_to_remove] = float('-inf')
+
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    generated = torch.cat([generated, next_token], dim=1)
+
+                    if next_token.item() == eos_token_id:
+                        break
+
+            return self.tokenizer.decode(generated[0], skip_special_tokens=True)
+
+        # Load baseline model
+        print("    Loading baseline model...")
+        try:
+            from scripts.analysis.utils import load_model
+            baseline_model, _, baseline_config = load_model(self.compare_checkpoint, self.device)
+            baseline_model.eval()
+
+            # Get baseline name
+            baseline_path = Path(self.compare_checkpoint)
+            baseline_name = baseline_path.name if baseline_path.is_dir() else baseline_path.parent.name
+        except Exception as e:
+            print(f"    Error loading baseline: {e}")
+            return
+
+        # Generate samples
+        lines = []
+        lines.append("=" * 100)
+        lines.append("GENERATION COMPARISON: DAWN vs Baseline")
+        lines.append("=" * 100)
+        lines.append(f"DAWN Model:     {self.name} (v{self.version})")
+        lines.append(f"Baseline Model: {baseline_name}")
+        lines.append(f"Max tokens: {self.gen_tokens}")
+        lines.append("=" * 100)
+
+        # Print header to console
+        print("\n" + "\n".join(lines[-5:]))
+
+        for category, prompts in PROMPTS.items():
+            cat_header = f"\n{'='*100}\n[{category.upper()}]\n{'='*100}"
+            lines.append(cat_header)
+            print(cat_header)
+
+            for prompt in prompts:
+                prompt_line = f"\n{'─'*100}\nPrompt: \"{prompt}\"\n{'─'*100}"
+                lines.append(prompt_line)
+                print(prompt_line)
+
+                # Generate from both models
+                dawn_output = generate_text(self.model, prompt, max_new_tokens=self.gen_tokens)
+                baseline_output = generate_text(baseline_model, prompt, max_new_tokens=self.gen_tokens)
+
+                # Extract generated part (remove prompt)
+                dawn_gen = dawn_output[len(prompt):].strip() if dawn_output.startswith(prompt) else dawn_output
+                baseline_gen = baseline_output[len(prompt):].strip() if baseline_output.startswith(prompt) else baseline_output
+
+                dawn_line = f"  DAWN:     {dawn_gen}"
+                baseline_line = f"  Baseline: {baseline_gen}"
+
+                lines.append(dawn_line)
+                lines.append(baseline_line)
+                print(dawn_line)
+                print(baseline_line)
+
+        # Save to file
+        output_path = paper_dir / 'generation_comparison.txt'
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+
+        print(f"\n    Saved to: {output_path}")
+
+        # Cleanup
+        del baseline_model
+        torch.cuda.empty_cache()
+
+    def _analyze_comparison_model(self):
+        """Run quick analysis on comparison model for table generation."""
+        from scripts.analysis.utils import load_model
+        from scripts.evaluation.evaluate import evaluate_model, load_val_data, estimate_flops
+
+        print(f"    Loading: {self.compare_checkpoint}")
+        comp_model, _, comp_config = load_model(self.compare_checkpoint, self.device)
+        comp_model.eval()
+
+        # Model info
+        total_params = sum(p.numel() for p in comp_model.parameters())
+        flops = estimate_flops(comp_model, seq_len=512)
+        vanilla_info = {
+            'total': total_params,
+            'total_M': total_params / 1e6,
+            'flops': flops,
+            'flops_G': flops / 1e9,
+        }
+        print(f"    Parameters: {vanilla_info['total_M']:.2f}M, FLOPs: {vanilla_info['flops_G']:.2f}G")
+
+        # Performance (quick eval)
+        print(f"    Running validation...")
+        val_tokens = load_val_data(self.val_data_path, max_tokens=50 * 32 * 512)
+        val_results = evaluate_model(comp_model, val_tokens, batch_size=32, seq_len=512, device=self.device)
+        vanilla_val = val_results
+        print(f"    PPL: {vanilla_val.get('perplexity', 0):.2f}, Acc: {vanilla_val.get('accuracy', 0):.1f}%")
+
+        # Speed benchmark
+        import time
+        comp_model.eval()
+        dummy = torch.randint(0, 1000, (1, 512)).to(self.device)
+        # Warmup
+        for _ in range(5):
+            with torch.no_grad():
+                comp_model(dummy)
+        # Benchmark
+        torch.cuda.synchronize() if self.device == 'cuda' else None
+        start = time.time()
+        for _ in range(20):
+            with torch.no_grad():
+                comp_model(dummy)
+        torch.cuda.synchronize() if self.device == 'cuda' else None
+        elapsed = time.time() - start
+        tokens_per_sec = (20 * 512) / elapsed
+        vanilla_speed = {'tokens_per_sec': tokens_per_sec}
+        print(f"    Speed: {tokens_per_sec/1000:.1f}K tok/s")
+
+        # Cleanup
+        del comp_model
+        torch.cuda.empty_cache()
+
+        return vanilla_info, vanilla_val, vanilla_speed
+
+    def _extract_checkpoint_config(self, checkpoint_path: str) -> Dict:
+        """Extract training config from a checkpoint file or directory."""
+        config_data = {
+            'model': {},
+            'training': {},
+            'optimizer': {},
+        }
+
+        try:
+            # Handle directory paths (find actual checkpoint file)
+            path = Path(checkpoint_path)
+            checkpoint_dir = None
+
+            if path.is_dir():
+                checkpoint_dir = path
+                pt_files = list(path.glob('*.pt'))
+                found = False
+                for f in pt_files:
+                    if 'best' in f.name.lower() or 'final' in f.name.lower():
+                        checkpoint_path = str(f)
+                        found = True
+                        break
+                if not found and pt_files:
+                    # Use most recent .pt file
+                    checkpoint_path = str(sorted(pt_files, key=lambda x: x.stat().st_mtime)[-1])
+                elif not found:
+                    raise FileNotFoundError(f"No .pt files found in {path}")
+            else:
+                checkpoint_dir = path.parent
+
+            # Try to load config.json first (saved separately by train.py)
+            config_json_path = checkpoint_dir / 'config.json'
+            json_config = {}
+            if config_json_path.exists():
+                with open(config_json_path, 'r') as f:
+                    json_config = json.load(f)
+                    print(f"      Loaded config.json from {checkpoint_dir.name}")
+
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+            # Model config: prefer config.json > checkpoint['config'] > checkpoint['model_config']
+            model_config = json_config.get('model', {})
+            if not model_config:
+                model_config = checkpoint.get('config', checkpoint.get('model_config', {}))
+            config_data['model'] = {
+                'd_model': model_config.get('d_model', model_config.get('hidden_size', 0)),
+                'n_layers': model_config.get('n_layers', model_config.get('num_hidden_layers', 0)),
+                'n_heads': model_config.get('n_heads', model_config.get('num_attention_heads', 0)),
+                'vocab_size': model_config.get('vocab_size', 0),
+                'd_ff': model_config.get('d_ff', model_config.get('intermediate_size', 0)),
+                'max_seq_len': model_config.get('max_seq_len', model_config.get('max_position_embeddings', 0)),
+            }
+
+            # Count parameters from state dict (exclude EMA/optimizer buffers)
+            state_dict = checkpoint.get('model_state_dict', {})
+            if not state_dict:
+                # Fallback: try 'state_dict' but filter out optimizer/EMA keys
+                raw_state = checkpoint.get('state_dict', {})
+                state_dict = {
+                    k: v for k, v in raw_state.items()
+                    if not k.startswith('optimizer') and not k.startswith('ema_') and
+                       not k.startswith('_') and hasattr(v, 'numel')
+                }
+            if state_dict:
+                # Only count actual parameters (weight, bias, embeddings)
+                param_keys = [k for k in state_dict.keys()
+                             if any(x in k for x in ['.weight', '.bias', 'embedding', '_emb'])]
+                if param_keys:
+                    total_params = sum(state_dict[k].numel() for k in param_keys if hasattr(state_dict[k], 'numel'))
+                else:
+                    # Fallback: count all tensors
+                    total_params = sum(p.numel() for p in state_dict.values() if hasattr(p, 'numel'))
+                config_data['model']['total_params'] = total_params
+                config_data['model']['total_params_M'] = round(total_params / 1e6, 2)
+
+            # Training config: prefer config.json > checkpoint
+            training_config = json_config.get('training', {})
+            if not training_config:
+                training_config = checkpoint.get('training_config', checkpoint.get('train_config', {}))
+            if not training_config:
+                # Try to extract from top-level keys
+                training_config = {
+                    'batch_size': checkpoint.get('batch_size'),
+                    'learning_rate': checkpoint.get('learning_rate', checkpoint.get('lr')),
+                    'total_steps': checkpoint.get('total_steps', checkpoint.get('max_steps')),
+                    'warmup_steps': checkpoint.get('warmup_steps'),
+                    'dataset': checkpoint.get('dataset', checkpoint.get('data_path')),
+                }
+
+            config_data['training'] = {
+                'dataset': training_config.get('dataset', training_config.get('data_path', 'unknown')),
+                'batch_size': training_config.get('batch_size', training_config.get('train_batch_size', 0)),
+                'learning_rate': training_config.get('learning_rate', training_config.get('lr', 0)),
+                'total_steps': training_config.get('total_steps', training_config.get('max_steps', 0)),
+                'warmup_steps': training_config.get('warmup_steps', 0),
+                'epochs': training_config.get('epochs', training_config.get('num_epochs', 0)),
+            }
+
+            # Current step/epoch from checkpoint
+            config_data['training']['current_step'] = checkpoint.get('step', checkpoint.get('global_step', 0))
+            config_data['training']['current_epoch'] = checkpoint.get('epoch', 0)
+
+            # Optimizer config
+            optimizer_config = checkpoint.get('optimizer_config', {})
+            if not optimizer_config and 'optimizer_state_dict' in checkpoint:
+                # Try to infer from optimizer state
+                opt_state = checkpoint['optimizer_state_dict']
+                if 'param_groups' in opt_state and opt_state['param_groups']:
+                    pg = opt_state['param_groups'][0]
+                    optimizer_config = {
+                        'lr': pg.get('lr'),
+                        'weight_decay': pg.get('weight_decay'),
+                        'betas': pg.get('betas'),
+                    }
+
+            config_data['optimizer'] = {
+                'optimizer': training_config.get('optimizer', 'AdamW'),
+                'weight_decay': optimizer_config.get('weight_decay', training_config.get('weight_decay', 0)),
+                'grad_clip': training_config.get('grad_clip', training_config.get('max_grad_norm', 0)),
+                'scheduler': training_config.get('scheduler', training_config.get('lr_scheduler', 'unknown')),
+                'betas': optimizer_config.get('betas', [0.9, 0.999]),
+            }
+
+            # DAWN-specific config
+            if 'n_feature_qk' in model_config or 'n_neurons' in model_config:
+                config_data['dawn_specific'] = {
+                    'n_feature_qk': model_config.get('n_feature_qk', 0),
+                    'n_restore_qk': model_config.get('n_restore_qk', 0),
+                    'n_feature_v': model_config.get('n_feature_v', 0),
+                    'n_restore_v': model_config.get('n_restore_v', 0),
+                    'n_knowledge': model_config.get('n_knowledge', 0),
+                    'top_k': model_config.get('top_k', 0),
+                }
+
+            del checkpoint  # Free memory
+
+        except Exception as e:
+            config_data['error'] = str(e)
+
+        return config_data
+
+    def _extract_training_configs(self) -> Dict:
+        """Extract and compare training configs from DAWN and Vanilla checkpoints."""
+        result = {
+            'dawn': {},
+            'vanilla': {},
+            'comparison': {},
+        }
+
+        # Extract DAWN config
+        if self.checkpoint_path:
+            print(f"    Extracting config from DAWN: {self.checkpoint_path}")
+            result['dawn'] = self._extract_checkpoint_config(str(self.checkpoint_path))
+
+        # Extract Vanilla config
+        if self.compare_checkpoint:
+            print(f"    Extracting config from Vanilla: {self.compare_checkpoint}")
+            result['vanilla'] = self._extract_checkpoint_config(str(self.compare_checkpoint))
+
+        # Build comparison table
+        if result['dawn'] and result['vanilla']:
+            dawn_m = result['dawn'].get('model', {})
+            dawn_t = result['dawn'].get('training', {})
+            dawn_o = result['dawn'].get('optimizer', {})
+            van_m = result['vanilla'].get('model', {})
+            van_t = result['vanilla'].get('training', {})
+            van_o = result['vanilla'].get('optimizer', {})
+
+            result['comparison'] = {
+                # Model
+                'd_model': {'dawn': dawn_m.get('d_model'), 'vanilla': van_m.get('d_model')},
+                'n_layers': {'dawn': dawn_m.get('n_layers'), 'vanilla': van_m.get('n_layers')},
+                'n_heads': {'dawn': dawn_m.get('n_heads'), 'vanilla': van_m.get('n_heads')},
+                'params_M': {'dawn': dawn_m.get('total_params_M'), 'vanilla': van_m.get('total_params_M')},
+                # Training
+                'dataset': {'dawn': dawn_t.get('dataset'), 'vanilla': van_t.get('dataset')},
+                'batch_size': {'dawn': dawn_t.get('batch_size'), 'vanilla': van_t.get('batch_size')},
+                'learning_rate': {'dawn': dawn_t.get('learning_rate'), 'vanilla': van_t.get('learning_rate')},
+                'total_steps': {'dawn': dawn_t.get('total_steps'), 'vanilla': van_t.get('total_steps')},
+                'warmup_steps': {'dawn': dawn_t.get('warmup_steps'), 'vanilla': van_t.get('warmup_steps')},
+                # Optimizer
+                'optimizer': {'dawn': dawn_o.get('optimizer'), 'vanilla': van_o.get('optimizer')},
+                'weight_decay': {'dawn': dawn_o.get('weight_decay'), 'vanilla': van_o.get('weight_decay')},
+                'grad_clip': {'dawn': dawn_o.get('grad_clip'), 'vanilla': van_o.get('grad_clip')},
+            }
+
+            # Check if configs match
+            matches = []
+            mismatches = []
+            for key, vals in result['comparison'].items():
+                if vals['dawn'] == vals['vanilla']:
+                    matches.append(key)
+                elif vals['dawn'] is not None and vals['vanilla'] is not None:
+                    mismatches.append(key)
+
+            result['validation'] = {
+                'matching_configs': matches,
+                'mismatching_configs': mismatches,
+                'is_comparable': len(mismatches) == 0 or all(
+                    k in ['params_M', 'd_model', 'n_layers']  # These can differ
+                    for k in mismatches
+                ),
+            }
+
+        return result
+
+    def _generate_training_comparison(self, paper_dir: Path):
+        """Generate training_comparison.json and training_comparison.md."""
+        config_data = self._extract_training_configs()
+
+        # Save JSON
+        json_path = paper_dir / 'training_comparison.json'
+        with open(json_path, 'w') as f:
+            json.dump(config_data, f, indent=2, default=str)
+        print(f"    Saved: {json_path}")
+
+        # Generate Markdown table
+        md_lines = [
+            "# Training Configuration Comparison",
+            "",
+            "## Model Architecture",
+            "",
+            "| Config | DAWN | Vanilla |",
+            "|--------|------|---------|",
+        ]
+
+        comparison = config_data.get('comparison', {})
+
+        # Model section
+        for key in ['d_model', 'n_layers', 'n_heads', 'params_M']:
+            vals = comparison.get(key, {})
+            dawn_val = vals.get('dawn', '-')
+            van_val = vals.get('vanilla', '-')
+            if key == 'params_M' and dawn_val and van_val:
+                md_lines.append(f"| {key} | {dawn_val}M | {van_val}M |")
+            else:
+                md_lines.append(f"| {key} | {dawn_val} | {van_val} |")
+
+        md_lines.extend([
+            "",
+            "## Training Settings",
+            "",
+            "| Config | DAWN | Vanilla |",
+            "|--------|------|---------|",
+        ])
+
+        # Training section
+        for key in ['dataset', 'batch_size', 'learning_rate', 'total_steps', 'warmup_steps']:
+            vals = comparison.get(key, {})
+            dawn_val = vals.get('dawn', '-')
+            van_val = vals.get('vanilla', '-')
+            # Format learning rate
+            if key == 'learning_rate' and dawn_val and isinstance(dawn_val, float):
+                dawn_val = f"{dawn_val:.0e}"
+            if key == 'learning_rate' and van_val and isinstance(van_val, float):
+                van_val = f"{van_val:.0e}"
+            # Format steps with K
+            if key in ['total_steps', 'warmup_steps'] and dawn_val and isinstance(dawn_val, (int, float)) and dawn_val >= 1000:
+                dawn_val = f"{dawn_val/1000:.0f}K"
+            if key in ['total_steps', 'warmup_steps'] and van_val and isinstance(van_val, (int, float)) and van_val >= 1000:
+                van_val = f"{van_val/1000:.0f}K"
+            md_lines.append(f"| {key} | {dawn_val} | {van_val} |")
+
+        md_lines.extend([
+            "",
+            "## Optimizer Settings",
+            "",
+            "| Config | DAWN | Vanilla |",
+            "|--------|------|---------|",
+        ])
+
+        # Optimizer section
+        for key in ['optimizer', 'weight_decay', 'grad_clip']:
+            vals = comparison.get(key, {})
+            dawn_val = vals.get('dawn', '-')
+            van_val = vals.get('vanilla', '-')
+            md_lines.append(f"| {key} | {dawn_val} | {van_val} |")
+
+        # Validation summary
+        validation = config_data.get('validation', {})
+        if validation:
+            md_lines.extend([
+                "",
+                "## Validation",
+                "",
+                f"- **Comparable**: {'✅ Yes' if validation.get('is_comparable') else '⚠️ No'}",
+                f"- **Matching configs**: {', '.join(validation.get('matching_configs', []))}",
+            ])
+            if validation.get('mismatching_configs'):
+                md_lines.append(f"- **Mismatching configs**: {', '.join(validation['mismatching_configs'])}")
+
+        # DAWN-specific
+        dawn_specific = config_data.get('dawn', {}).get('dawn_specific', {})
+        if dawn_specific:
+            md_lines.extend([
+                "",
+                "## DAWN-Specific Config",
+                "",
+                "| Pool | Size |",
+                "|------|------|",
+            ])
+            for key, val in dawn_specific.items():
+                if val:
+                    md_lines.append(f"| {key} | {val} |")
+
+        md_lines.append("")
+        md_lines.append(f"*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+
+        # Save Markdown
+        md_path = paper_dir / 'training_comparison.md'
+        with open(md_path, 'w') as f:
+            f.write('\n'.join(md_lines))
+        print(f"    Saved: {md_path}")
+
+    def _generate_paper_results_json(self, paper_dir: Path):
+        """Generate paper_results.json with all numeric data for paper figures."""
+        from scripts.analysis.utils import convert_to_serializable
+
+        paper_results = {}
+
+        # Table 1: Model Statistics (DAWN + Vanilla comparison)
         model_info = self.results.get('model_info', {})
         perf = self.results.get('performance', {})
+        val = perf.get('validation', {})
+        speed = perf.get('speed', {})
+
+        # DAWN stats
+        dawn_stats = {
+            'parameters_M': round(model_info.get('total_M', 0), 2),
+            'flops_G': round(model_info.get('flops_G', 0), 2),
+            'perplexity': round(val.get('perplexity', 0), 2),
+            'accuracy': round(val.get('accuracy', 0), 2),
+            'tokens_per_sec': round(speed.get('tokens_per_sec', 0), 0),
+        }
+
+        # Load Vanilla stats if compare_checkpoint exists
+        vanilla_stats = {}
+        if self.compare_checkpoint:
+            vanilla_info, vanilla_val, vanilla_speed = {}, {}, {}
+            comp_path = Path(self.compare_checkpoint)
+            found_results = False
+
+            # Try to load from pre-existing analysis results
+            comp_dirs = [
+                comp_path.parent / 'analysis',
+                comp_path / 'analysis',
+                comp_path.parent,
+            ]
+            for comp_dir in comp_dirs:
+                if comp_dir.exists():
+                    comp_params = comp_dir / 'model_info' / 'parameters.json'
+                    comp_val_file = comp_dir / 'performance' / 'validation.json'
+                    comp_speed_file = comp_dir / 'performance' / 'speed_benchmark.json'
+                    if comp_params.exists():
+                        with open(comp_params) as f:
+                            vanilla_info = json.load(f)
+                    if comp_val_file.exists():
+                        with open(comp_val_file) as f:
+                            vanilla_val = json.load(f)
+                    if comp_speed_file.exists():
+                        with open(comp_speed_file) as f:
+                            vanilla_speed = json.load(f)
+                    if vanilla_info or vanilla_val:
+                        found_results = True
+                        break
+
+            # Fallback: run quick analysis on vanilla model
+            if not found_results:
+                print("    Running quick analysis on comparison model...")
+                try:
+                    vanilla_info, vanilla_val, vanilla_speed = self._analyze_comparison_model()
+                except Exception as e:
+                    print(f"    Warning: Could not analyze comparison model: {e}")
+
+            vanilla_stats = {
+                'parameters_M': round(vanilla_info.get('total_M', 0), 2),
+                'flops_G': round(vanilla_info.get('flops_G', 0), 2),
+                'perplexity': round(vanilla_val.get('perplexity', 0), 2),
+                'accuracy': round(vanilla_val.get('accuracy', 0), 2),
+                'tokens_per_sec': round(vanilla_speed.get('tokens_per_sec', 0), 0),
+            }
+
+        paper_results['table1_model_stats'] = {
+            'dawn': dawn_stats,
+            'vanilla': vanilla_stats if vanilla_stats else None,
+        }
+
+        # Table 2: Neuron Utilization
+        health = self.results.get('health', {})
+        ema = health.get('ema_distribution', {})
+        paper_results['table2_neuron_util'] = {}
+        for name, data in ema.items():
+            if isinstance(data, dict) and 'total' in data:
+                paper_results['table2_neuron_util'][data.get('display', name)] = {
+                    'total': data['total'],
+                    'active': data['active'],
+                    'dead': data['dead'],
+                    'active_ratio': round(data['active_ratio'], 3),
+                    'gini': round(data.get('gini', 0), 3),
+                }
+
+        # Fig 3: Q/K Specialization (summary only, no raw arrays)
+        routing = self.results.get('routing', {})
+        qk_usage = routing.get('qk_usage', {})
+        paper_results['fig3_qk_specialization'] = {}
+        for pool_name, data in qk_usage.items():
+            if isinstance(data, dict) and 'q_specialized' in data:
+                paper_results['fig3_qk_specialization'][pool_name] = {
+                    'correlation': round(data.get('correlation', 0), 3),
+                    'q_specialized': data.get('q_specialized', 0),
+                    'k_specialized': data.get('k_specialized', 0),
+                    'shared': data.get('shared', 0),
+                    'inactive': data.get('inactive', 0),
+                    'n_neurons': data.get('n_neurons', 0),
+                }
+
+        # Fig 4: POS Specialization (summary only for paper)
+        neuron_features = self.results.get('neuron_features', {})
+        if neuron_features:
+            specialized = neuron_features.get('specialized_neurons', {})
+            summary = neuron_features.get('summary', {})
+            n_specialized = summary.get('n_specialized', {})
+
+            # Get POS-specialized neurons (specialized['pos'] is a list)
+            pos_neurons = specialized.get('pos', [])
+            total_neurons = summary.get('n_neurons', neuron_features.get('n_neurons_profiled', 0))
+            n_specialized_total = n_specialized.get('pos', 0) if isinstance(n_specialized, dict) else len(pos_neurons)
+
+            # Count neurons per actual POS tag
+            per_pos = {}
+            top_list = []
+            for neuron_info in pos_neurons:
+                if isinstance(neuron_info, dict):
+                    pos_tag = neuron_info.get('specialized_for', 'unknown')
+                    per_pos[pos_tag] = per_pos.get(pos_tag, 0) + 1
+                    top_list.append({
+                        'neuron_id': neuron_info.get('neuron', 0),
+                        'pos': pos_tag,
+                        'concentration': round(neuron_info.get('pct', 0), 1),
+                    })
+
+            # Sort by concentration and keep top 10
+            top_list.sort(key=lambda x: x['concentration'], reverse=True)
+
+            paper_results['fig4_pos_specialization'] = {
+                'total_neurons_analyzed': total_neurons,
+                'specialized_neurons': n_specialized_total,
+                'specialized_ratio': round(n_specialized_total / total_neurons, 3) if total_neurons > 0 else 0,
+                'per_pos': per_pos,
+                'top_10': top_list[:10],
+            }
+
+        # Fig 5: Factual Heatmap (summary only, no neuron lists)
+        factual = self.results.get('factual', {})
+        if factual:
+            # Extract per-target summary (counts only, no lists)
+            per_target_summary = {}
+            all_common_100 = set()
+            all_common_80 = set()
+
+            for target, data in factual.get('per_target', {}).items():
+                if isinstance(data, dict):
+                    common_100 = data.get('common_neurons_100', [])
+                    common_80 = data.get('common_neurons_80', [])
+                    all_common_100.update(common_100)
+                    all_common_80.update(common_80)
+
+                    per_target_summary[target] = {
+                        'match_rate': round(data.get('match_rate', 0), 3),
+                        'successful_runs': data.get('successful_runs', 0),
+                        'total_runs': data.get('total_runs', 0),
+                        'n_common_100': len(common_100),
+                        'n_common_80': len(common_80),
+                        'n_unique_neurons': data.get('total_unique_neurons', 0),
+                    }
+
+            paper_results['fig5_factual'] = {
+                'pool_type': factual.get('pool_type', 'fv'),
+                'n_all_common_100': len(all_common_100),
+                'n_all_common_80': len(all_common_80),
+                'per_target': per_target_summary,
+            }
+
+        # Fig 6: Training Dynamics - Extract config from checkpoints (summary only)
+        fig6_config = self._extract_training_configs()
+        # Keep only essential summary, remove detailed comparison
+        paper_results['fig6_training_dynamics'] = {
+            'dawn': {
+                'params_M': fig6_config.get('dawn', {}).get('model', {}).get('total_params_M'),
+                'd_model': fig6_config.get('dawn', {}).get('model', {}).get('d_model'),
+                'n_layers': fig6_config.get('dawn', {}).get('model', {}).get('n_layers'),
+                'batch_size': fig6_config.get('dawn', {}).get('training', {}).get('batch_size'),
+                'learning_rate': fig6_config.get('dawn', {}).get('training', {}).get('learning_rate'),
+            },
+            'vanilla': {
+                'params_M': fig6_config.get('vanilla', {}).get('model', {}).get('total_params_M'),
+                'd_model': fig6_config.get('vanilla', {}).get('model', {}).get('d_model'),
+                'n_layers': fig6_config.get('vanilla', {}).get('model', {}).get('n_layers'),
+                'batch_size': fig6_config.get('vanilla', {}).get('training', {}).get('batch_size'),
+                'learning_rate': fig6_config.get('vanilla', {}).get('training', {}).get('learning_rate'),
+            } if fig6_config.get('vanilla') else None,
+        }
+
+        # Fig 7: Layer Contribution (with computed summary)
+        layer_contrib = routing.get('layer_contribution', {})
+        if layer_contrib:
+            per_layer = layer_contrib.get('per_layer', {})
+
+            # Build per_layer dict with rounded values
+            per_layer_data = {}
+            attention_ratios = []
+            knowledge_ratios = []
+
+            for layer, data in per_layer.items():
+                att_ratio = data.get('attention_ratio', 50)
+                know_ratio = data.get('knowledge_ratio', 50)
+                per_layer_data[layer] = {
+                    'attention_ratio': round(att_ratio, 1),
+                    'knowledge_ratio': round(know_ratio, 1),
+                }
+                attention_ratios.append(att_ratio)
+                knowledge_ratios.append(know_ratio)
+
+            # Compute summary statistics
+            import numpy as np
+            att_arr = np.array(attention_ratios) if attention_ratios else np.array([50])
+            know_arr = np.array(knowledge_ratios) if knowledge_ratios else np.array([50])
+
+            paper_results['fig7_layer_contribution'] = {
+                'per_layer': per_layer_data,
+                'summary': {
+                    'attention_mean': round(float(att_arr.mean()), 1),
+                    'attention_std': round(float(att_arr.std()), 1),
+                    'knowledge_mean': round(float(know_arr.mean()), 1),
+                    'knowledge_std': round(float(know_arr.std()), 1),
+                },
+            }
+
+        # === Appendix Data (Important) ===
+
+        # Diversity Metrics - Dead neuron 문제 없음 증명
+        diversity = health.get('diversity', {})
+        if diversity:
+            paper_results['appendix_diversity'] = {}
+            for name, data in diversity.items():
+                if isinstance(data, dict) and 'normalized_entropy' in data:
+                    paper_results['appendix_diversity'][data.get('display', name)] = {
+                        'normalized_entropy': round(data.get('normalized_entropy', 0), 3),
+                        'effective_count': round(data.get('effective_count', 0), 1),
+                        'coverage': round(data.get('coverage', 0), 3),
+                    }
+            overall = diversity.get('overall', {})
+            if overall:
+                paper_results['appendix_diversity']['overall'] = {
+                    'diversity_score': round(overall.get('diversity_score', 0), 3),
+                    'health': overall.get('health', 'unknown'),
+                }
+
+        # Probing Accuracy - Interpretability 강화
+        behavioral = self.results.get('behavioral', {})
+        probing = behavioral.get('probing', {})
+        if probing:
+            paper_results['appendix_probing'] = {}
+            for pool, data in probing.items():
+                if isinstance(data, dict) and 'accuracy' in data:
+                    paper_results['appendix_probing'][pool] = {
+                        'accuracy': round(data.get('accuracy', 0), 3),
+                        'f1_macro': round(data.get('f1_macro', 0), 3),
+                    }
+
+        # Save JSON
+        results_path = paper_dir / 'paper_results.json'
+        with open(results_path, 'w') as f:
+            json.dump(convert_to_serializable(paper_results), f, indent=2)
+        print(f"    Saved: {results_path}")
+
+    def _generate_paper_summary(self, paper_dir: Path):
+        """Generate paper summary markdown."""
+        # Try to load from saved files if results are empty
+        model_info = self.results.get('model_info', {})
+        if not model_info:
+            params_file = self.output_dir / 'model_info' / 'parameters.json'
+            if params_file.exists():
+                with open(params_file) as f:
+                    model_info = json.load(f)
+
+        perf = self.results.get('performance', {})
+        if not perf:
+            val_file = self.output_dir / 'performance' / 'validation.json'
+            speed_file = self.output_dir / 'performance' / 'speed_benchmark.json'
+            if val_file.exists():
+                with open(val_file) as f:
+                    perf['validation'] = json.load(f)
+            if speed_file.exists():
+                with open(speed_file) as f:
+                    perf['speed'] = json.load(f)
+
         val = perf.get('validation', {})
         health = self.results.get('health', {})
 
@@ -1850,14 +2775,23 @@ class ModelAnalyzer:
         with open(self.output_dir / 'report.md', 'w') as f:
             f.write('\n'.join(lines))
 
-    def run_all(self, paper_only: bool = False, only: List[str] = None):
-        """Run all analyses."""
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+    def _get_paper_analyses(self) -> List[tuple]:
+        """Paper generation에 필요한 분석 목록 (Single Source of Truth)"""
+        return [
+            ('model_info', self.analyze_model_info, {}),
+            ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
+            ('health', self.analyze_health, {}),
+            ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
+            ('factual', self.analyze_factual, {
+                'min_target_count': self.min_targets,
+                'max_runs': self.max_runs,
+                'pool_type': self.pool_type
+            }),
+        ]
 
-        self.load_model()
-
-        # Define all analyses using instance parameters
-        analyses = [
+    def _get_full_analyses(self) -> List[tuple]:
+        """전체 분석 목록"""
+        return [
             ('model_info', self.analyze_model_info, {}),
             ('performance', self.analyze_performance, {'n_batches': self.val_batches}),
             ('health', self.analyze_health, {}),
@@ -1869,25 +2803,49 @@ class ModelAnalyzer:
             ('token_combination', self.analyze_token_combination, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('neuron_features', self.analyze_neuron_features, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('layerwise_semantic', self.analyze_layerwise_semantic, {'max_sentences': self.max_sentences // 4}),
-            ('factual', self.analyze_factual, {'n_runs': self.n_runs, 'pool_type': self.pool_type}),
+            ('factual', self.analyze_factual, {
+                'min_target_count': self.min_targets,
+                'max_runs': self.max_runs,
+                'pool_type': self.pool_type
+            }),
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
             ('weight', self.analyze_weight, {}),
             ('v18', self.analyze_v18, {'n_batches': self.n_batches // 2}),
         ]
 
-        if paper_only:
-            # Reduced params for faster paper-only mode
-            analyses = [
-                ('model_info', self.analyze_model_info, {}),
-                ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
-                ('health', self.analyze_health, {}),
-                ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
-                ('factual', self.analyze_factual, {'n_runs': max(5, self.n_runs // 2), 'pool_type': self.pool_type}),
-            ]
+    def run_all(self, paper_only: bool = False, only: List[str] = None):
+        """Run all analyses."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        self.load_model()
+
+        # Get analysis list based on mode
+        if paper_only:
+            analyses = self._get_paper_analyses()
+        else:
+            analyses = self._get_full_analyses()
+
+        # Filter by --only option
         if only:
             analyses = [(n, f, a) for n, f, a in analyses if n in only]
+
+        # If --only paper, check existing results and run missing analyses
+        if only and 'paper' in only and not analyses:
+            print("\n[Checking existing analysis results...]")
+            self._load_existing_results()
+
+            # Find missing analyses from paper requirements
+            missing = []
+            for name, func, kwargs in self._get_paper_analyses():
+                if name not in self.results or not self.results[name]:
+                    missing.append((name, func, kwargs))
+
+            if missing:
+                print(f"\n[Running {len(missing)} missing analyses for paper...]")
+                analyses = missing
+            else:
+                print(f"  All required results found.")
 
         total_analyses = len(analyses)
         for i, (name, func, kwargs) in enumerate(analyses, 1):
@@ -1902,7 +2860,7 @@ class ModelAnalyzer:
 
         # Paper outputs (only if not filtering or 'paper' in filter)
         if not only or 'paper' in only:
-            print(f"\n[{total_analyses+1}/{total_analyses+2}] PAPER")
+            print(f"\n[PAPER] Generating paper outputs...")
             self.generate_paper_outputs()
 
         # Report (only if not filtering or 'report' in filter)
@@ -1914,6 +2872,61 @@ class ModelAnalyzer:
         self._print_final_summary()
 
         return self.results
+
+    def _load_existing_results(self):
+        """Load previously saved analysis results from files."""
+        print(f"  Loading from: {self.output_dir}")
+
+        # Model info
+        params_file = self.output_dir / 'model_info' / 'parameters.json'
+        if params_file.exists():
+            with open(params_file) as f:
+                self.results['model_info'] = json.load(f)
+                print(f"    ✓ model_info")
+
+        # Performance
+        val_file = self.output_dir / 'performance' / 'validation.json'
+        speed_file = self.output_dir / 'performance' / 'speed_benchmark.json'
+        if val_file.exists() or speed_file.exists():
+            self.results['performance'] = {}
+            if val_file.exists():
+                with open(val_file) as f:
+                    self.results['performance']['validation'] = json.load(f)
+            if speed_file.exists():
+                with open(speed_file) as f:
+                    self.results['performance']['speed'] = json.load(f)
+            print(f"    ✓ performance")
+
+        # Health
+        health_file = self.output_dir / 'health' / 'results.json'
+        if health_file.exists():
+            with open(health_file) as f:
+                self.results['health'] = json.load(f)
+                print(f"    ✓ health")
+
+        # Routing
+        routing_file = self.output_dir / 'routing' / 'results.json'
+        if routing_file.exists():
+            with open(routing_file) as f:
+                self.results['routing'] = json.load(f)
+                print(f"    ✓ routing")
+
+        # Factual
+        factual_file = self.output_dir / 'factual' / 'results.json'
+        if factual_file.exists():
+            with open(factual_file) as f:
+                self.results['factual'] = json.load(f)
+                print(f"    ✓ factual")
+
+        # Neuron features
+        nf_file = self.output_dir / 'neuron_features' / 'results.json'
+        if nf_file.exists():
+            with open(nf_file) as f:
+                self.results['neuron_features'] = json.load(f)
+                print(f"    ✓ neuron_features")
+
+        if not self.results:
+            print(f"    (No existing results found)")
 
     def _print_final_summary(self):
         """Print final analysis summary."""
@@ -1968,7 +2981,8 @@ class MultiModelAnalyzer:
         n_batches: int = 100,
         val_batches: int = 200,
         max_sentences: int = 2000,
-        n_runs: int = 10,
+        min_targets: int = 100,
+        max_runs: int = 500,
         batch_size: int = 16,
         max_samples: int = 5000,
         n_clusters: int = 5,
@@ -1985,7 +2999,8 @@ class MultiModelAnalyzer:
         self.n_batches = n_batches
         self.val_batches = val_batches
         self.max_sentences = max_sentences
-        self.n_runs = n_runs
+        self.min_targets = min_targets
+        self.max_runs = max_runs
         self.batch_size = batch_size
         self.max_samples = max_samples
         self.n_clusters = n_clusters
@@ -2020,7 +3035,8 @@ class MultiModelAnalyzer:
                 n_batches=self.n_batches,
                 val_batches=self.val_batches,
                 max_sentences=self.max_sentences,
-                n_runs=self.n_runs,
+                min_targets=self.min_targets,
+                max_runs=self.max_runs,
                 batch_size=self.batch_size,
                 max_samples=self.max_samples,
                 n_clusters=self.n_clusters,
@@ -2313,6 +3329,7 @@ Examples:
     # Input/output
     parser.add_argument('--checkpoint', type=str, help='Single checkpoint path')
     parser.add_argument('--checkpoints', type=str, nargs='+', help='Multiple checkpoint paths')
+    parser.add_argument('--compare_checkpoint', type=str, help='Comparison checkpoint for training dynamics (e.g., vanilla baseline)')
     parser.add_argument('--val_data', type=str, required=True, help='Validation data path')
     parser.add_argument('--output', type=str, default='analysis_results', help='Output directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
@@ -2325,7 +3342,8 @@ Examples:
     parser.add_argument('--n_batches', type=int, default=100, help='Number of batches for routing/semantic/behavioral/coselection (default: 100)')
     parser.add_argument('--val_batches', type=int, default=200, help='Number of batches for validation performance (default: 200)')
     parser.add_argument('--max_sentences', type=int, default=2000, help='Max sentences for POS analysis (default: 2000)')
-    parser.add_argument('--n_runs', type=int, default=10, help='Number of runs for factual analysis (default: 10)')
+    parser.add_argument('--min_targets', type=int, default=100, help='Min target occurrences for factual analysis (default: 100)')
+    parser.add_argument('--max_runs', type=int, default=500, help='Max runs for factual analysis safety limit (default: 500)')
     parser.add_argument('--batch_size', type=int, default=16, help='Dataloader batch size (default: 16)')
     parser.add_argument('--max_samples', type=int, default=5000, help='Max samples for dataloader (default: 5000)')
     parser.add_argument('--n_clusters', type=int, default=5, help='Number of clusters for embedding analysis (default: 5)')
@@ -2344,7 +3362,8 @@ Examples:
     print(f"n_batches: {args.n_batches}")
     print(f"val_batches: {args.val_batches}")
     print(f"max_sentences: {args.max_sentences}")
-    print(f"n_runs: {args.n_runs}")
+    print(f"min_targets: {args.min_targets}")
+    print(f"max_runs: {args.max_runs}")
     print(f"max_samples: {args.max_samples}")
     print(f"n_clusters: {args.n_clusters}")
     print(f"pool_type: {args.pool_type}")
@@ -2373,13 +3392,15 @@ Examples:
             n_batches=args.n_batches,
             val_batches=args.val_batches,
             max_sentences=args.max_sentences,
-            n_runs=args.n_runs,
+            min_targets=args.min_targets,
+            max_runs=args.max_runs,
             batch_size=args.batch_size,
             max_samples=args.max_samples,
             n_clusters=args.n_clusters,
             pool_type=args.pool_type,
             gen_tokens=args.gen_tokens,
             target_layer=args.target_layer,
+            compare_checkpoint=args.compare_checkpoint,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
     else:
@@ -2389,7 +3410,8 @@ Examples:
             n_batches=args.n_batches,
             val_batches=args.val_batches,
             max_sentences=args.max_sentences,
-            n_runs=args.n_runs,
+            min_targets=args.min_targets,
+            max_runs=args.max_runs,
             batch_size=args.batch_size,
             max_samples=args.max_samples,
             n_clusters=args.n_clusters,
