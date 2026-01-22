@@ -1566,12 +1566,12 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         self.total_neurons = sum(self.pool_sizes.values())
 
         # Precompute pool order for fast concatenation
+        # NOTE: Use physical neuron pools, not Q/K separately
+        # Q/K share the same neurons, so fqk (not fqk_q + fqk_k)
         self.pool_order = [
-            ('fqk_q', self.pool_sizes.get('fqk', 0)),
-            ('fqk_k', self.pool_sizes.get('fqk', 0)),
+            ('fqk', self.pool_sizes.get('fqk', 0)),
             ('fv', self.pool_sizes.get('fv', 0)),
-            ('rqk_q', self.pool_sizes.get('rqk', 0)),
-            ('rqk_k', self.pool_sizes.get('rqk', 0)),
+            ('rqk', self.pool_sizes.get('rqk', 0)),
             ('rv', self.pool_sizes.get('rv', 0)),
             ('fknow', self.pool_sizes.get('fknow', 0)),
             ('rknow', self.pool_sizes.get('rknow', 0)),
@@ -1680,44 +1680,91 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             print(f"  [Debug] knowledge keys: {[k for k in know_keys if 'mask' in k.lower()]}")
 
         for pool_key, expected_size in self.pool_order:
-            # Try to get actual binary mask first (scores > tau)
-            mask = layer.get_mask(pool_key)
+            # For Q/K shared pools, combine Q and K masks with OR
+            # A neuron is active if selected for Q OR K
+            if pool_key in ('fqk', 'rqk'):
+                mask_q = layer.get_mask(f'{pool_key}_q')
+                mask_k = layer.get_mask(f'{pool_key}_k')
 
-            if mask is not None:
-                used_actual += 1
-                # Use actual model mask (cleaner signal)
-                if mask.dim() == 3:
-                    m = mask[0, :seq_len].cpu().numpy().astype(np.bool_)
+                if mask_q is not None or mask_k is not None:
+                    used_actual += 1
+                    m = np.zeros((seq_len, expected_size), dtype=np.bool_)
+
+                    for sub_mask in [mask_q, mask_k]:
+                        if sub_mask is not None:
+                            if sub_mask.dim() == 3:
+                                sub_m = sub_mask[0, :seq_len].cpu().numpy().astype(np.bool_)
+                            else:
+                                sub_m = np.broadcast_to(
+                                    sub_mask[0].cpu().numpy().astype(np.bool_),
+                                    (seq_len, sub_mask.shape[-1])
+                                )
+                            if sub_m.shape[0] < seq_len:
+                                sub_m = np.pad(sub_m, ((0, seq_len - sub_m.shape[0]), (0, 0)))
+                            m = m | sub_m  # OR combine
+
+                    masks.append(m)
                 else:
-                    m = np.broadcast_to(
-                        mask[0].cpu().numpy().astype(np.bool_),
-                        (seq_len, mask.shape[-1])
-                    )
+                    # Fallback: use weights > threshold
+                    used_fallback += 1
+                    failed_pools.append(pool_key)
+                    weights_q = layer.get_weight(f'{pool_key}_q')
+                    weights_k = layer.get_weight(f'{pool_key}_k')
 
-                if m.shape[0] < seq_len:
-                    m = np.pad(m, ((0, seq_len - m.shape[0]), (0, 0)))
+                    m = np.zeros((seq_len, expected_size), dtype=np.bool_)
+                    for weights in [weights_q, weights_k]:
+                        if weights is not None:
+                            if weights.dim() == 3:
+                                w = weights[0, :seq_len].cpu().numpy()
+                            else:
+                                w = np.broadcast_to(
+                                    weights[0].cpu().numpy(),
+                                    (seq_len, weights.shape[-1])
+                                )
+                            if w.shape[0] < seq_len:
+                                w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+                            m = m | (w > self.activation_threshold)  # OR combine
 
-                masks.append(m)
+                    masks.append(m)
             else:
-                used_fallback += 1
-                failed_pools.append(pool_key)
-                # Fallback: use weights > threshold
-                weights = layer.get_weight(pool_key)
-                if weights is None:
-                    masks.append(np.zeros((seq_len, expected_size), dtype=np.bool_))
-                else:
-                    if weights.dim() == 3:
-                        w = weights[0, :seq_len].cpu().numpy()
+                # Regular pools: fv, rv, fknow, rknow
+                mask = layer.get_mask(pool_key)
+
+                if mask is not None:
+                    used_actual += 1
+                    # Use actual model mask (cleaner signal)
+                    if mask.dim() == 3:
+                        m = mask[0, :seq_len].cpu().numpy().astype(np.bool_)
                     else:
-                        w = np.broadcast_to(
-                            weights[0].cpu().numpy(),
-                            (seq_len, weights.shape[-1])
+                        m = np.broadcast_to(
+                            mask[0].cpu().numpy().astype(np.bool_),
+                            (seq_len, mask.shape[-1])
                         )
 
-                    if w.shape[0] < seq_len:
-                        w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+                    if m.shape[0] < seq_len:
+                        m = np.pad(m, ((0, seq_len - m.shape[0]), (0, 0)))
 
-                    masks.append(w > self.activation_threshold)
+                    masks.append(m)
+                else:
+                    used_fallback += 1
+                    failed_pools.append(pool_key)
+                    # Fallback: use weights > threshold
+                    weights = layer.get_weight(pool_key)
+                    if weights is None:
+                        masks.append(np.zeros((seq_len, expected_size), dtype=np.bool_))
+                    else:
+                        if weights.dim() == 3:
+                            w = weights[0, :seq_len].cpu().numpy()
+                        else:
+                            w = np.broadcast_to(
+                                weights[0].cpu().numpy(),
+                                (seq_len, weights.shape[-1])
+                            )
+
+                        if w.shape[0] < seq_len:
+                            w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+
+                        masks.append(w > self.activation_threshold)
 
         # Log mask mode once
         if not self._logged_mask_mode:
@@ -1741,27 +1788,50 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         Extract concatenated continuous weights from a single layer.
 
         Returns continuous routing weights for cosine similarity analysis.
+        For Q/K shared pools, takes max(Q, K) weights.
         """
         weights_list = []
 
         for pool_key, expected_size in self.pool_order:
-            weights = layer.get_weight(pool_key)
+            # For Q/K shared pools, take max of Q and K weights
+            if pool_key in ('fqk', 'rqk'):
+                weights_q = layer.get_weight(f'{pool_key}_q')
+                weights_k = layer.get_weight(f'{pool_key}_k')
 
-            if weights is None:
-                weights_list.append(np.zeros((seq_len, expected_size), dtype=np.float32))
-            else:
-                if weights.dim() == 3:
-                    w = weights[0, :seq_len].cpu().numpy().astype(np.float32)
-                else:
-                    w = np.broadcast_to(
-                        weights[0].cpu().numpy().astype(np.float32),
-                        (seq_len, weights.shape[-1])
-                    )
-
-                if w.shape[0] < seq_len:
-                    w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+                w = np.zeros((seq_len, expected_size), dtype=np.float32)
+                for weights in [weights_q, weights_k]:
+                    if weights is not None:
+                        if weights.dim() == 3:
+                            sub_w = weights[0, :seq_len].cpu().numpy().astype(np.float32)
+                        else:
+                            sub_w = np.broadcast_to(
+                                weights[0].cpu().numpy().astype(np.float32),
+                                (seq_len, weights.shape[-1])
+                            )
+                        if sub_w.shape[0] < seq_len:
+                            sub_w = np.pad(sub_w, ((0, seq_len - sub_w.shape[0]), (0, 0)))
+                        w = np.maximum(w, sub_w)  # Take max
 
                 weights_list.append(w)
+            else:
+                # Regular pools
+                weights = layer.get_weight(pool_key)
+
+                if weights is None:
+                    weights_list.append(np.zeros((seq_len, expected_size), dtype=np.float32))
+                else:
+                    if weights.dim() == 3:
+                        w = weights[0, :seq_len].cpu().numpy().astype(np.float32)
+                    else:
+                        w = np.broadcast_to(
+                            weights[0].cpu().numpy().astype(np.float32),
+                            (seq_len, weights.shape[-1])
+                        )
+
+                    if w.shape[0] < seq_len:
+                        w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+
+                    weights_list.append(w)
 
         return np.concatenate(weights_list, axis=-1) if weights_list else np.zeros((seq_len, 0), dtype=np.float32)
 
@@ -1875,14 +1945,15 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                     self.layer_token_data[t['token_str'].lower().strip()].append(t)
 
     def analyze_dataset(self, dataset: List[Dict], max_sentences: int = None,
-                        analyze_layer_divergence: bool = True) -> Dict:
+                        analyze_layer_divergence: bool = True, batch_size: int = 16) -> Dict:
         """
-        Analyze full dataset.
+        Analyze full dataset with batched processing (5-10x faster).
 
         Args:
             dataset: List of {'tokens': [...], 'upos': [...], 'deprel': [...]}
             max_sentences: Maximum sentences to process
             analyze_layer_divergence: Whether to store per-layer masks for divergence
+            batch_size: Number of sentences to process in parallel
 
         Returns:
             Analysis results dictionary
@@ -1894,20 +1965,303 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         print(f"Activation threshold: {self.activation_threshold}")
         print(f"Layer: {self.target_layer if self.target_layer is not None else 'all (majority vote)'}")
         print(f"Layer divergence analysis: {'ON' if analyze_layer_divergence else 'OFF'}")
+        print(f"Batch size: {batch_size} (batched processing for efficiency)")
 
-        for i in tqdm(range(n_sentences), desc="Processing"):
+        # Pre-process all sentences to get token_ids and pos_tags
+        preprocessed = []
+        for i in range(n_sentences):
             example = dataset[i]
             try:
-                self.analyze_sentence(
-                    example['tokens'], example['upos'],
-                    store_layer_masks=analyze_layer_divergence,
-                    ud_deprel=example.get('deprel'),  # Pass deprel if available
-                )
+                ud_deprel = example.get('deprel')
+                if ud_deprel is not None:
+                    pos_tags, deprel_tags, token_ids = self.get_tags_for_tokens(
+                        example['tokens'], example['upos'], ud_deprel
+                    )
+                else:
+                    pos_tags, token_ids = self.get_pos_for_tokens(
+                        example['tokens'], example['upos']
+                    )
+                    deprel_tags = None
+
+                if token_ids:
+                    preprocessed.append({
+                        'token_ids': token_ids,
+                        'pos_tags': pos_tags,
+                        'deprel_tags': deprel_tags,
+                    })
             except Exception:
                 continue
 
+        # Process in batches
+        n_batches = (len(preprocessed) + batch_size - 1) // batch_size
+        for batch_idx in tqdm(range(n_batches), desc="Batched Processing"):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, len(preprocessed))
+            batch = preprocessed[start:end]
+
+            if not batch:
+                continue
+
+            try:
+                token_masks = self._extract_batch_token_masks(
+                    batch, analyze_layer_divergence
+                )
+                self.token_data.extend(token_masks)
+
+                # Store for layer divergence analysis
+                if analyze_layer_divergence:
+                    for t in token_masks:
+                        if 'layer_masks' in t:
+                            self.layer_token_data[t['token_str'].lower().strip()].append(t)
+            except Exception:
+                # Fallback to one-by-one processing for this batch
+                for item in batch:
+                    try:
+                        masks = self.extract_token_masks(
+                            item['token_ids'], item['pos_tags'],
+                            analyze_layer_divergence, item['deprel_tags']
+                        )
+                        self.token_data.extend(masks)
+                        if analyze_layer_divergence:
+                            for t in masks:
+                                if 'layer_masks' in t:
+                                    self.layer_token_data[t['token_str'].lower().strip()].append(t)
+                    except Exception:
+                        continue
+
         print(f"Collected {len(self.token_data)} tokens")
         return self.compute_results(analyze_layer_divergence)
+
+    def _extract_batch_token_masks(
+        self,
+        batch: List[Dict],
+        store_layer_masks: bool = False,
+    ) -> List[Dict]:
+        """
+        Extract token masks for a batch of sentences in one forward pass.
+
+        Args:
+            batch: List of {'token_ids': [...], 'pos_tags': [...], 'deprel_tags': [...]}
+            store_layer_masks: Whether to store per-layer masks
+
+        Returns:
+            List of token data dicts for all tokens in the batch
+        """
+        # Find max length and pad sequences
+        max_len = max(len(item['token_ids']) for item in batch)
+        batch_size = len(batch)
+
+        # Create padded input tensor
+        # Use 0 as padding (assuming 0 is PAD token, will be masked anyway)
+        pad_id = getattr(self.tokenizer, 'pad_token_id', 0) or 0
+        padded_input = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=self.device)
+        seq_lens = []
+
+        for i, item in enumerate(batch):
+            seq_len = len(item['token_ids'])
+            padded_input[i, :seq_len] = torch.tensor(item['token_ids'], dtype=torch.long)
+            seq_lens.append(seq_len)
+
+        # Forward pass for entire batch
+        with self.extractor.analysis_context():
+            with torch.no_grad():
+                outputs = self.model(padded_input, return_routing_info=True)
+
+            routing = self.extractor.extract(outputs)
+            if not routing:
+                return []
+
+        # Collect masks and weights per layer for each batch item
+        all_layer_masks = {i: {} for i in range(batch_size)}
+        all_layer_weights = {i: {} for i in range(batch_size)}
+
+        for layer in routing:
+            layer_idx = layer.layer_idx
+            if self.target_layer is not None and layer_idx != self.target_layer:
+                continue
+
+            # Extract masks/weights for this layer (full batch)
+            batch_masks = self._extract_batch_layer_mask(layer, batch_size, max_len)
+            batch_weights = self._extract_batch_layer_weights(layer, batch_size, max_len)
+
+            for b_idx in range(batch_size):
+                all_layer_masks[b_idx][layer_idx] = batch_masks[b_idx, :seq_lens[b_idx]]
+                all_layer_weights[b_idx][layer_idx] = batch_weights[b_idx, :seq_lens[b_idx]]
+
+        # Build results for each token
+        results = []
+        for b_idx, item in enumerate(batch):
+            seq_len = seq_lens[b_idx]
+            layer_masks = all_layer_masks[b_idx]
+            layer_weights = all_layer_weights[b_idx]
+
+            if not layer_masks:
+                continue
+
+            # Combined mask and weights
+            if self.target_layer is not None:
+                combined_mask = layer_masks.get(self.target_layer)
+                combined_weights = layer_weights.get(self.target_layer)
+                if combined_mask is None:
+                    continue
+            else:
+                all_masks_arr = np.stack(list(layer_masks.values()), axis=0)
+                combined_mask = all_masks_arr.any(axis=0)
+                all_weights_arr = np.stack(list(layer_weights.values()), axis=0)
+                combined_weights = all_weights_arr.mean(axis=0)
+
+            # Build token strings
+            token_strs = [self.tokenizer.decode([tid]) for tid in item['token_ids']]
+
+            n_pos = min(seq_len, len(item['pos_tags']))
+            for i in range(n_pos):
+                token_str = token_strs[i]
+                next_token_str = token_strs[i + 1] if i + 1 < len(token_strs) else None
+
+                entry = {
+                    'token_id': item['token_ids'][i],
+                    'token_str': token_str,
+                    'pos': item['pos_tags'][i],
+                    'deprel': item['deprel_tags'][i] if item['deprel_tags'] and i < len(item['deprel_tags']) else '_',
+                    'mask': combined_mask[i],
+                    'weights': combined_weights[i],
+                    'is_whole_word': self._is_whole_word(token_str, next_token_str),
+                    'n_active': int(combined_mask[i].sum()),
+                }
+
+                if store_layer_masks:
+                    entry['layer_masks'] = {k: v[i] for k, v in layer_masks.items()}
+
+                results.append(entry)
+
+        return results
+
+    def _extract_batch_layer_mask(self, layer, batch_size: int, max_len: int) -> np.ndarray:
+        """
+        Extract concatenated masks from a layer for entire batch.
+
+        Returns: [batch_size, max_len, n_neurons] boolean array
+        """
+        masks = []
+
+        for pool_key, expected_size in self.pool_order:
+            if pool_key in ('fqk', 'rqk'):
+                mask_q = layer.get_mask(f'{pool_key}_q')
+                mask_k = layer.get_mask(f'{pool_key}_k')
+
+                if mask_q is not None or mask_k is not None:
+                    m = np.zeros((batch_size, max_len, expected_size), dtype=np.bool_)
+                    for sub_mask in [mask_q, mask_k]:
+                        if sub_mask is not None:
+                            if sub_mask.dim() == 3:
+                                sub_m = sub_mask[:, :max_len].cpu().numpy().astype(np.bool_)
+                            else:
+                                sub_m = np.broadcast_to(
+                                    sub_mask.cpu().numpy().astype(np.bool_)[:, None, :],
+                                    (batch_size, max_len, sub_mask.shape[-1])
+                                )
+                            pad_len = max_len - sub_m.shape[1]
+                            if pad_len > 0:
+                                sub_m = np.pad(sub_m, ((0, 0), (0, pad_len), (0, 0)))
+                            m = m | sub_m[:, :max_len]
+                    masks.append(m)
+                else:
+                    # Fallback to weights
+                    weights_q = layer.get_weight(f'{pool_key}_q')
+                    weights_k = layer.get_weight(f'{pool_key}_k')
+                    m = np.zeros((batch_size, max_len, expected_size), dtype=np.bool_)
+                    for weights in [weights_q, weights_k]:
+                        if weights is not None:
+                            if weights.dim() == 3:
+                                w = weights[:, :max_len].cpu().numpy()
+                            else:
+                                w = np.broadcast_to(
+                                    weights.cpu().numpy()[:, None, :],
+                                    (batch_size, max_len, weights.shape[-1])
+                                )
+                            pad_len = max_len - w.shape[1]
+                            if pad_len > 0:
+                                w = np.pad(w, ((0, 0), (0, pad_len), (0, 0)))
+                            m = m | (w[:, :max_len] > self.activation_threshold)
+                    masks.append(m)
+            else:
+                mask = layer.get_mask(pool_key)
+                if mask is not None:
+                    if mask.dim() == 3:
+                        m = mask[:, :max_len].cpu().numpy().astype(np.bool_)
+                    else:
+                        m = np.broadcast_to(
+                            mask.cpu().numpy().astype(np.bool_)[:, None, :],
+                            (batch_size, max_len, mask.shape[-1])
+                        )
+                    pad_len = max_len - m.shape[1]
+                    if pad_len > 0:
+                        m = np.pad(m, ((0, 0), (0, pad_len), (0, 0)))
+                    masks.append(m[:, :max_len])
+                else:
+                    weights = layer.get_weight(pool_key)
+                    if weights is None:
+                        masks.append(np.zeros((batch_size, max_len, expected_size), dtype=np.bool_))
+                    else:
+                        if weights.dim() == 3:
+                            w = weights[:, :max_len].cpu().numpy()
+                        else:
+                            w = np.broadcast_to(
+                                weights.cpu().numpy()[:, None, :],
+                                (batch_size, max_len, weights.shape[-1])
+                            )
+                        pad_len = max_len - w.shape[1]
+                        if pad_len > 0:
+                            w = np.pad(w, ((0, 0), (0, pad_len), (0, 0)))
+                        masks.append(w[:, :max_len] > self.activation_threshold)
+
+        return np.concatenate(masks, axis=-1) if masks else np.zeros((batch_size, max_len, 0), dtype=np.bool_)
+
+    def _extract_batch_layer_weights(self, layer, batch_size: int, max_len: int) -> np.ndarray:
+        """
+        Extract concatenated weights from a layer for entire batch.
+
+        Returns: [batch_size, max_len, n_neurons] float array
+        """
+        weights_list = []
+
+        for pool_key, expected_size in self.pool_order:
+            if pool_key in ('fqk', 'rqk'):
+                weights_q = layer.get_weight(f'{pool_key}_q')
+                weights_k = layer.get_weight(f'{pool_key}_k')
+                w = np.zeros((batch_size, max_len, expected_size), dtype=np.float32)
+                for weights in [weights_q, weights_k]:
+                    if weights is not None:
+                        if weights.dim() == 3:
+                            sub_w = weights[:, :max_len].cpu().numpy().astype(np.float32)
+                        else:
+                            sub_w = np.broadcast_to(
+                                weights.cpu().numpy().astype(np.float32)[:, None, :],
+                                (batch_size, max_len, weights.shape[-1])
+                            )
+                        pad_len = max_len - sub_w.shape[1]
+                        if pad_len > 0:
+                            sub_w = np.pad(sub_w, ((0, 0), (0, pad_len), (0, 0)))
+                        w = np.maximum(w, sub_w[:, :max_len])
+                weights_list.append(w)
+            else:
+                weights = layer.get_weight(pool_key)
+                if weights is None:
+                    weights_list.append(np.zeros((batch_size, max_len, expected_size), dtype=np.float32))
+                else:
+                    if weights.dim() == 3:
+                        w = weights[:, :max_len].cpu().numpy().astype(np.float32)
+                    else:
+                        w = np.broadcast_to(
+                            weights.cpu().numpy().astype(np.float32)[:, None, :],
+                            (batch_size, max_len, weights.shape[-1])
+                        )
+                    pad_len = max_len - w.shape[1]
+                    if pad_len > 0:
+                        w = np.pad(w, ((0, 0), (0, pad_len), (0, 0)))
+                    weights_list.append(w[:, :max_len])
+
+        return np.concatenate(weights_list, axis=-1) if weights_list else np.zeros((batch_size, max_len, 0), dtype=np.float32)
 
     def extract_token_masks_all_layers(
         self,
@@ -3561,6 +3915,7 @@ class NeuronFeatureAnalyzer:
         token_data: List[Dict],
         tokenizer,
         n_neurons: int = None,
+        pool_order: List[Tuple[str, int]] = None,
     ):
         """
         Initialize analyzer.
@@ -3570,10 +3925,12 @@ class NeuronFeatureAnalyzer:
                        Each dict has: token_str, pos, mask, weights, is_whole_word, etc.
             tokenizer: Tokenizer instance
             n_neurons: Total number of neurons (auto-detected if None)
+            pool_order: List of (pool_name, size) tuples for pool-specific analysis
         """
         self.token_data = token_data
         self.tokenizer = tokenizer
         self.n_tokens = len(token_data)
+        self.pool_order = pool_order or []
 
         if n_neurons is None and token_data:
             # Use max mask length across all tokens (handles layerwise data with varying sizes)
@@ -3935,6 +4292,132 @@ class NeuronFeatureAnalyzer:
 
         return specialized
 
+    def compute_selectivity_matrix(self, min_activations: int = 10) -> Dict:
+        """
+        Compute selectivity scores for all neurons across POS categories.
+
+        Selectivity score = P(neuron active | POS) / P(neuron active)
+        - > 1: neuron prefers this POS (more active than baseline)
+        - = 1: neuron is indifferent to this POS
+        - < 1: neuron avoids this POS (less active than baseline)
+
+        Args:
+            min_activations: Minimum activations to include neuron
+
+        Returns:
+            Dict with selectivity matrix, per-pool analysis, unified naming
+        """
+        self._compute_neuron_features()
+
+        n_neurons = self.n_neurons
+        n_pos = len(UPOS_TAGS)
+        total_tokens = len(self.token_data)
+
+        # POS totals: how many tokens of each POS
+        pos_totals = self._pos_matrix.sum(axis=0)  # [n_pos]
+
+        # Compute selectivity matrix [n_neurons, n_pos]
+        selectivity = np.ones((n_neurons, n_pos), dtype=np.float32)
+
+        # Active neurons (with enough activations)
+        active_mask = self._neuron_totals >= min_activations
+        active_indices = np.where(active_mask)[0]
+
+        for n in active_indices:
+            p_neuron = self._neuron_totals[n] / total_tokens  # P(neuron active)
+            for p in range(n_pos):
+                if pos_totals[p] > 0 and p_neuron > 0:
+                    # P(neuron active | POS)
+                    p_neuron_given_pos = self._neuron_pos_counts[n, p] / pos_totals[p]
+                    selectivity[n, p] = p_neuron_given_pos / p_neuron
+
+        # Get pool ranges for per-pool analysis
+        pool_ranges = self._get_pool_ranges()
+
+        # Top selective neurons per POS (with unified naming)
+        top_selective = {}
+        for p, pos_tag in enumerate(UPOS_TAGS):
+            sel_scores = selectivity[active_mask, p]
+            sel_indices = active_indices[np.argsort(-sel_scores)][:10]  # Top 10
+            top_selective[pos_tag] = [
+                {
+                    'neuron': self._get_neuron_name(int(idx)),
+                    'neuron_idx': int(idx),
+                    'pool': self._get_pool_for_neuron(int(idx)),
+                    'selectivity': round(float(selectivity[idx, p]), 2)
+                }
+                for idx in sel_indices
+                if selectivity[idx, p] > 1.0
+            ]
+
+        # Per-pool analysis
+        per_pool = {}
+        for pool_name, (start_idx, end_idx) in pool_ranges.items():
+            pool_size = end_idx - start_idx
+            pool_active = active_mask[start_idx:end_idx]
+            pool_selectivity = selectivity[start_idx:end_idx]
+            n_active = int(pool_active.sum())
+
+            # Top selective neurons in this pool
+            pool_top = []
+            if n_active > 0:
+                for p, pos_tag in enumerate(UPOS_TAGS):
+                    pool_sel = pool_selectivity[pool_active, p]
+                    pool_indices = np.where(pool_active)[0]
+                    if len(pool_indices) > 0:
+                        top_idx = pool_indices[np.argmax(pool_sel)]
+                        global_idx = start_idx + top_idx
+                        if pool_selectivity[top_idx, p] > 1.5:  # Only strong selectivity
+                            pool_top.append({
+                                'neuron': self._get_neuron_name(global_idx),
+                                'pos': pos_tag,
+                                'selectivity': round(float(pool_selectivity[top_idx, p]), 2)
+                            })
+
+            per_pool[pool_name] = {
+                'n_neurons': pool_size,
+                'n_active': n_active,
+                'top_selective': sorted(pool_top, key=lambda x: -x['selectivity'])[:10],
+            }
+
+        # Mean selectivity per POS
+        mean_selectivity = {
+            pos: round(float(selectivity[active_mask, p].mean()), 3)
+            for p, pos in enumerate(UPOS_TAGS)
+        }
+
+        # Selectivity range per neuron
+        selectivity_range = selectivity[active_mask].max(axis=1) - selectivity[active_mask].min(axis=1)
+
+        # By-POS summary with top neurons
+        by_pos = {}
+        for p, pos_tag in enumerate(UPOS_TAGS):
+            by_pos[pos_tag] = {
+                'top_neurons': [n['neuron'] for n in top_selective[pos_tag][:5]],
+                'mean_selectivity': mean_selectivity[pos_tag],
+            }
+
+        return {
+            'selectivity_matrix': selectivity,  # [n_neurons, n_pos]
+            'active_neuron_indices': active_indices.tolist(),
+            'pos_tags': UPOS_TAGS,
+            'pools_analyzed': list(pool_ranges.keys()),
+            'total_neurons': n_neurons,
+            # Per-pool analysis
+            'per_pool': per_pool,
+            # By POS analysis
+            'by_pos': by_pos,
+            'top_selective_per_pos': top_selective,
+            'mean_selectivity_by_pos': mean_selectivity,
+            'selectivity_range': {
+                'mean': round(float(selectivity_range.mean()), 3),
+                'std': round(float(selectivity_range.std()), 3),
+                'max': round(float(selectivity_range.max()), 3),
+            },
+            'n_active_neurons': int(active_mask.sum()),
+            'total_tokens': total_tokens,
+        }
+
     def build_feature_vectors(self) -> Tuple[np.ndarray, List[int]]:
         """
         Build feature vectors for neuron clustering using precomputed matrices.
@@ -4106,7 +4589,122 @@ class NeuronFeatureAnalyzer:
         return cls(
             token_data=tca.token_data,
             tokenizer=tca.tokenizer,
+            pool_order=getattr(tca, 'pool_order', None),
         )
+
+    def _get_pool_ranges(self) -> Dict[str, Tuple[int, int]]:
+        """
+        Get neuron index ranges for each pool.
+
+        Returns:
+            Dict mapping pool_name -> (start_idx, end_idx)
+        """
+        ranges = {}
+        offset = 0
+        for pool_name, size in self.pool_order:
+            ranges[pool_name] = (offset, offset + size)
+            offset += size
+        return ranges
+
+    def _get_neuron_name(self, global_idx: int) -> str:
+        """
+        Convert global neuron index to unified naming format: {pool}_{local_idx}
+
+        Examples:
+            0 -> 'fqk_0'
+            64 -> 'fv_0'
+            328 -> 'rqk_0'
+
+        Args:
+            global_idx: Global neuron index (0 to total_neurons-1)
+
+        Returns:
+            String like 'fv_45', 'fknow_12', etc.
+        """
+        pool_ranges = self._get_pool_ranges()
+        for pool_name, (start_idx, end_idx) in pool_ranges.items():
+            if start_idx <= global_idx < end_idx:
+                local_idx = global_idx - start_idx
+                return f'{pool_name}_{local_idx}'
+        return f'unknown_{global_idx}'
+
+    def _get_pool_for_neuron(self, global_idx: int) -> str:
+        """Get pool name for a global neuron index."""
+        pool_ranges = self._get_pool_ranges()
+        for pool_name, (start_idx, end_idx) in pool_ranges.items():
+            if start_idx <= global_idx < end_idx:
+                return pool_name
+        return 'unknown'
+
+    def _compute_utilization_stats(self, active_threshold: int = 1) -> Dict:
+        """
+        Compute forward-pass based neuron utilization statistics.
+
+        This replaces EMA-based utilization (Table 2) with actual inference-time usage.
+
+        Args:
+            active_threshold: Minimum activations to consider neuron "active" (default: 1)
+
+        Returns:
+            Dict with per-pool utilization stats
+        """
+        self._compute_neuron_features()
+
+        pool_ranges = self._get_pool_ranges()
+        total_tokens = len(self.token_data)
+        utilization = {}
+
+        for pool_name, (start_idx, end_idx) in pool_ranges.items():
+            pool_size = end_idx - start_idx
+            pool_totals = self._neuron_totals[start_idx:end_idx]
+
+            # Active neurons (activated at least once)
+            active_mask = pool_totals >= active_threshold
+            n_active = int(active_mask.sum())
+            n_dead = pool_size - n_active
+
+            # Usage statistics
+            active_totals = pool_totals[active_mask]
+            mean_usage = float(active_totals.mean()) if n_active > 0 else 0
+            std_usage = float(active_totals.std()) if n_active > 0 else 0
+
+            # Gini coefficient for usage inequality
+            if n_active > 1:
+                sorted_usage = np.sort(active_totals)
+                n = len(sorted_usage)
+                cumsum = np.cumsum(sorted_usage)
+                gini = (2 * np.sum((np.arange(1, n + 1) * sorted_usage)) - (n + 1) * cumsum[-1]) / (n * cumsum[-1])
+            else:
+                gini = 0.0
+
+            utilization[pool_name] = {
+                'display': pool_name.upper(),
+                'total': pool_size,
+                'active': n_active,
+                'dead': n_dead,
+                'active_ratio': round(n_active / pool_size, 4) if pool_size > 0 else 0,
+                'gini': round(float(gini), 4),
+                'stats': {
+                    'mean': round(mean_usage, 2),
+                    'std': round(std_usage, 2),
+                    'min': int(pool_totals.min()) if pool_size > 0 else 0,
+                    'max': int(pool_totals.max()) if pool_size > 0 else 0,
+                },
+                'method': 'forward_pass',  # Mark as forward-pass based
+            }
+
+        # Overall stats
+        total_active = sum(u['active'] for u in utilization.values())
+        total_neurons = sum(u['total'] for u in utilization.values())
+        utilization['_overall'] = {
+            'total_neurons': total_neurons,
+            'total_active': total_active,
+            'total_dead': total_neurons - total_active,
+            'active_ratio': round(total_active / total_neurons, 4) if total_neurons > 0 else 0,
+            'total_tokens_analyzed': total_tokens,
+        }
+
+        return utilization
 
     def run_full_analysis(self, output_dir: str = None) -> Dict:
         """
@@ -4125,8 +4723,58 @@ class NeuronFeatureAnalyzer:
         # Build profiles
         profiles = self.build_neuron_profiles()
 
-        # Detect specialized neurons
+        # Detect specialized neurons at default threshold (80%)
         specialized = self.detect_specialized_neurons(threshold=0.8)
+
+        # Multi-threshold specialization analysis for paper
+        thresholds = [0.6, 0.7, 0.8]
+        multi_threshold_results = {}
+        for t in thresholds:
+            spec_t = self.detect_specialized_neurons(threshold=t)
+            multi_threshold_results[f'{int(t*100)}%'] = {
+                k: len(v) for k, v in spec_t.items()
+            }
+
+        # Pool-specific specialization analysis
+        pool_ranges = self._get_pool_ranges()
+        pool_specialization = {}
+
+        for pool_name, (start_idx, end_idx) in pool_ranges.items():
+            pool_size = end_idx - start_idx
+            pool_spec = {'total': pool_size}
+
+            # Count specialized neurons in this pool at each threshold
+            for t in thresholds:
+                spec_t = self.detect_specialized_neurons(threshold=t)
+                # Count POS-specialized neurons in this pool
+                count = sum(
+                    1 for n in spec_t.get('pos', [])
+                    if start_idx <= n['neuron'] < end_idx
+                )
+                pool_spec[f'specialized_{int(t*100)}'] = count
+
+            pool_specialization[pool_name] = pool_spec
+
+        # Build specialization summary for paper
+        total_neurons = self.n_neurons
+        specialization_summary = {
+            'total_neurons': total_neurons,
+            'specialized_count': multi_threshold_results,
+            'specialized_ratio': {
+                k: {feat: round(cnt / total_neurons, 4) if total_neurons > 0 else 0
+                    for feat, cnt in counts.items()}
+                for k, counts in multi_threshold_results.items()
+            },
+            'by_pool': pool_specialization,
+        }
+
+        # Compute selectivity matrix for Fig 4 heatmap
+        print("\n  Computing selectivity matrix...")
+        selectivity_data = self.compute_selectivity_matrix(min_activations=10)
+
+        # Compute forward-pass based utilization (replaces EMA-based Table 2)
+        print("\n  Computing forward-pass utilization...")
+        utilization = self._compute_utilization_stats()
 
         # Cluster neurons
         clusters = self.cluster_neurons(n_clusters=10)
@@ -4134,16 +4782,65 @@ class NeuronFeatureAnalyzer:
         # Print summary
         self.print_summary(specialized, clusters)
 
+        # Print selectivity summary
+        print(f"\n  ┌─ POS Selectivity Summary ─────────────────────────────────────────────")
+        print(f"  │ Active neurons: {selectivity_data['n_active_neurons']}")
+        print(f"  │ Selectivity range (max-min): mean={selectivity_data['selectivity_range']['mean']:.2f}, "
+              f"max={selectivity_data['selectivity_range']['max']:.2f}")
+        print(f"  │ Top selective POS:")
+        for pos in ['NOUN', 'VERB', 'ADJ', 'PUNCT']:
+            top = selectivity_data['top_selective_per_pos'].get(pos, [])[:3]
+            if top:
+                top_str = ', '.join([f"{t['neuron']}({t['selectivity']:.1f}x)" for t in top])
+                print(f"  │   {pos}: {top_str}")
+        print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Print utilization summary (forward-pass based, replaces EMA Table 2)
+        print(f"\n  ┌─ Neuron Utilization (Forward-Pass) ─────────────────────────────────────")
+        print(f"  │ {'Pool':<10} {'Active':>8} {'Total':>8} {'Ratio':>10} {'Gini':>8}")
+        print(f"  │ {'─'*10} {'─'*8} {'─'*8} {'─'*10} {'─'*8}")
+        for pool_name, data in utilization.items():
+            if pool_name.startswith('_'):
+                continue
+            print(f"  │ {pool_name:<10} {data['active']:>8d} {data['total']:>8d} "
+                  f"{data['active_ratio']*100:>9.1f}% {data['gini']:>8.3f}")
+        overall = utilization.get('_overall', {})
+        if overall:
+            print(f"  │ {'─'*10} {'─'*8} {'─'*8} {'─'*10}")
+            print(f"  │ {'TOTAL':<10} {overall['total_active']:>8d} {overall['total_neurons']:>8d} "
+                  f"{overall['active_ratio']*100:>9.1f}%")
+            print(f"  │")
+            print(f"  │ Tokens analyzed: {overall['total_tokens_analyzed']:,}")
+        print(f"  └─────────────────────────────────────────────────────────────────────────")
+
         results = {
             'n_neurons_profiled': len(profiles),
             'specialized_neurons': specialized,
+            'specialization_summary': specialization_summary,
+            'selectivity': {
+                'top_selective_per_pos': selectivity_data['top_selective_per_pos'],
+                'mean_selectivity_by_pos': selectivity_data['mean_selectivity_by_pos'],
+                'selectivity_range': selectivity_data['selectivity_range'],
+                'n_active_neurons': selectivity_data['n_active_neurons'],
+                'pos_tags': selectivity_data['pos_tags'],
+                'per_pool': selectivity_data.get('per_pool', {}),
+                'by_pos': selectivity_data.get('by_pos', {}),
+                'pools_analyzed': selectivity_data.get('pools_analyzed', []),
+            },
+            # Forward-pass based utilization (replaces EMA Table 2)
+            'utilization': utilization,
             'clusters': clusters,
             'summary': {
                 'total_tokens': len(self.token_data),
                 'n_neurons': self.n_neurons,
                 'n_specialized': {k: len(v) for k, v in specialized.items()},
+                'pools_analyzed': list(pool_ranges.keys()),
             }
         }
+
+        # Store full selectivity matrix for visualization (not in JSON)
+        self._selectivity_matrix = selectivity_data['selectivity_matrix']
+        self._selectivity_active_indices = selectivity_data['active_neuron_indices']
 
         # Save if output_dir provided
         if output_dir:
@@ -4166,12 +4863,20 @@ class NeuronFeatureAnalyzer:
             results_json = {
                 'n_neurons_profiled': results['n_neurons_profiled'],
                 'specialized_neurons': results['specialized_neurons'],
+                'specialization_summary': results['specialization_summary'],
+                'selectivity': results.get('selectivity', {}),
                 'clusters': {
                     k: v for k, v in results['clusters'].items()
                     if k != 'cluster_profiles'  # Skip large arrays
                 },
                 'summary': results['summary'],
             }
+
+            # Save selectivity matrix separately (for heatmap visualization)
+            if hasattr(self, '_selectivity_matrix'):
+                selectivity_path = os.path.join(output_dir, 'selectivity_matrix.npy')
+                np.save(selectivity_path, self._selectivity_matrix)
+                print(f"  Selectivity matrix saved to: {selectivity_path}")
 
             with open(results_path, 'w') as f:
                 json.dump(results_json, f, indent=2, cls=NumpyEncoder)
