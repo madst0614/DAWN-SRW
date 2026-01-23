@@ -4224,7 +4224,8 @@ class NeuronFeatureAnalyzer:
             pos_info = profile['pos']
             if pos_info.get('top_pos_pct', 0) >= threshold_pct:
                 specialized['pos'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': pos_info['top_pos'],
                     'pct': pos_info['top_pos_pct'],
                     'n_activations': profile['n_activations'],
@@ -4234,7 +4235,8 @@ class NeuronFeatureAnalyzer:
             pos_dist = profile['position']
             if pos_dist.get('dominant_pct', 0) >= threshold_pct:
                 specialized['position'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': pos_dist['dominant_position'],
                     'pct': pos_dist['dominant_pct'],
                     'n_activations': profile['n_activations'],
@@ -4246,14 +4248,16 @@ class NeuronFeatureAnalyzer:
             cont_pct = subword.get('continuation_pct', 50)
             if word_init_pct >= threshold_pct:
                 specialized['subword'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': 'word_initial',
                     'pct': word_init_pct,
                     'n_activations': profile['n_activations'],
                 })
             elif cont_pct >= threshold_pct:
                 specialized['subword'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': 'continuation',
                     'pct': cont_pct,
                     'n_activations': profile['n_activations'],
@@ -4263,14 +4267,16 @@ class NeuronFeatureAnalyzer:
             freq = profile['frequency']
             if freq.get('high_freq_pct', 0) >= threshold_pct:
                 specialized['frequency'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': 'high_frequency',
                     'pct': freq['high_freq_pct'],
                     'n_activations': profile['n_activations'],
                 })
             elif freq.get('low_freq_pct', 0) >= threshold_pct:
                 specialized['frequency'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': 'low_frequency',
                     'pct': freq['low_freq_pct'],
                     'n_activations': profile['n_activations'],
@@ -4280,7 +4286,8 @@ class NeuronFeatureAnalyzer:
             next_pos = profile['next_pos']
             if next_pos.get('top_next_pos_pct', 0) >= threshold_pct:
                 specialized['next_pos'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': next_pos['top_next_pos'],
                     'pct': next_pos['top_next_pos_pct'],
                     'n_activations': profile['n_activations'],
