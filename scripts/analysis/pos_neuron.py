@@ -1965,7 +1965,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
 
         print(f"\nCollecting token activations from {n_sentences} sentences...")
         print(f"Activation threshold: {self.activation_threshold}")
-        print(f"Layer: {self.target_layer if self.target_layer is not None else 'all (majority vote)'}")
+        print(f"Layer: {self.target_layer if self.target_layer is not None else 'all (union)'}")
         print(f"Layer divergence analysis: {'ON' if analyze_layer_divergence else 'OFF'}")
         print(f"Batch size: {batch_size} (batched processing for efficiency)")
 
@@ -4840,6 +4840,8 @@ class NeuronFeatureAnalyzer:
                 'mean_selectivity_by_pos': selectivity_data['mean_selectivity_by_pos'],
                 'selectivity_range': selectivity_data['selectivity_range'],
                 'n_active_neurons': selectivity_data['n_active_neurons'],
+                'active_neuron_indices': selectivity_data['active_neuron_indices'],
+                'pool_order': self.pool_order,  # For neuron name conversion in visualization
                 'pos_tags': selectivity_data['pos_tags'],
                 'per_pool': selectivity_data.get('per_pool', {}),
                 'by_pos': selectivity_data.get('by_pos', {}),

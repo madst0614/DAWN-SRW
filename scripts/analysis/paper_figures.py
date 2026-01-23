@@ -116,9 +116,9 @@ class PaperFigureGenerator:
         Figure 4: POS Neuron Selectivity.
 
         Uses selectivity data (not 80% threshold specialization).
-        Requires: precomputed['neuron_features']['selectivity']
+        Requires: selectivity_matrix.npy file and precomputed['neuron_features']['selectivity']
         """
-        from .visualizers import plot_pos_selectivity_from_json, plot_pos_selectivity_heatmap
+        from .visualizers import plot_pos_selectivity_heatmap
         import numpy as np
 
         if 'neuron_features' not in precomputed:
@@ -132,11 +132,9 @@ class PaperFigureGenerator:
 
         print("  Using pre-computed selectivity data...", flush=True)
 
-        # Try to load selectivity matrix if available (for full heatmap)
+        # Find selectivity_matrix.npy (required)
         matrix_path = config.get('selectivity_matrix_path')
-        path = None
 
-        # Auto-find selectivity_matrix.npy if not explicitly provided
         if not matrix_path or not os.path.exists(matrix_path):
             analysis_output_dir = config.get('analysis_output_dir', '')
             possible_paths = [
@@ -149,23 +147,33 @@ class PaperFigureGenerator:
                     matrix_path = p
                     break
 
-        if matrix_path and os.path.exists(matrix_path):
-            print(f"  Loading selectivity matrix from {matrix_path}...", flush=True)
-            selectivity_matrix = np.load(matrix_path)
-            # Get active indices from selectivity data
-            active_indices = selectivity.get('active_neuron_indices', list(range(selectivity_matrix.shape[0])))
-            path = plot_pos_selectivity_heatmap(
-                selectivity_matrix,
-                active_indices,
-                os.path.join(output_dir, 'fig4_pos_selectivity.png')
-            )
-        else:
-            # Use JSON data for visualization
-            print("  No selectivity_matrix.npy found, using JSON data...", flush=True)
-            path = plot_pos_selectivity_from_json(
-                selectivity,
-                os.path.join(output_dir, 'fig4_pos_selectivity.png')
-            )
+        if not matrix_path or not os.path.exists(matrix_path):
+            return {'error': 'selectivity_matrix.npy not found. Run analyze_all.py --only neuron_features first.'}
+
+        print(f"  Loading selectivity matrix from {matrix_path}...", flush=True)
+        selectivity_matrix = np.load(matrix_path)
+
+        # Get active indices and pool_order from selectivity data
+        active_indices = selectivity.get('active_neuron_indices', list(range(selectivity_matrix.shape[0])))
+        pool_order = selectivity.get('pool_order', config.get('pool_order'))
+
+        # Fallback: default pool_order for 40M DAWN model if not provided
+        if not pool_order:
+            pool_order = [
+                ('fqk', 64),
+                ('fv', 264),
+                ('rqk', 64),
+                ('rv', 264),
+                ('fknow', 160),
+                ('rknow', 160),
+            ]
+
+        path = plot_pos_selectivity_heatmap(
+            selectivity_matrix,
+            active_indices,
+            os.path.join(output_dir, 'fig4_pos_selectivity.png'),
+            pool_order=pool_order
+        )
 
         if path:
             print(f"  Saved: {path}", flush=True)
