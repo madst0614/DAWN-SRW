@@ -646,12 +646,12 @@ class ModelAnalyzer:
         # Q/K Specialization (forward-based, Fig 3)
         if qk_usage:
             print(f"\n  ┌─ Q/K Specialization (Forward-based) ─────────────────────────────────────")
-            print(f"  │ {'Pool':<8} {'Total':>8} {'Q-spec':>8} {'K-spec':>8} {'Shared':>8} {'Inactive':>8} {'Corr':>8}")
-            print(f"  │ {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+            print(f"  │ {'Pool':<8} {'Total':>8} {'Q-spec':>8} {'K-spec':>8} {'Shared':>8} {'Corr':>8}")
+            print(f"  │ {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
             for pool, data in qk_usage.items():
                 if isinstance(data, dict) and 'q_specialized' in data:
                     print(f"  │ {pool:<8} {data.get('n_neurons', 0):>8d} {data['q_specialized']:>8d} "
-                          f"{data['k_specialized']:>8d} {data['shared']:>8d} {data['inactive']:>8d} "
+                          f"{data['k_specialized']:>8d} {data['shared']:>8d} "
                           f"{data.get('correlation', 0):>8.3f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 

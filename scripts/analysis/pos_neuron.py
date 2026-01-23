@@ -4228,6 +4228,7 @@ class NeuronFeatureAnalyzer:
                 specialized['pos'].append({
                     'neuron': self._get_neuron_name(neuron_idx),
                     'neuron_idx': neuron_idx,
+                    'pool': self._get_pool_for_neuron(neuron_idx),
                     'specialized_for': pos_info['top_pos'],
                     'pct': pos_info['top_pos_pct'],
                     'n_activations': profile['n_activations'],
@@ -4239,6 +4240,7 @@ class NeuronFeatureAnalyzer:
                 specialized['position'].append({
                     'neuron': self._get_neuron_name(neuron_idx),
                     'neuron_idx': neuron_idx,
+                    'pool': self._get_pool_for_neuron(neuron_idx),
                     'specialized_for': pos_dist['dominant_position'],
                     'pct': pos_dist['dominant_pct'],
                     'n_activations': profile['n_activations'],
@@ -4252,6 +4254,7 @@ class NeuronFeatureAnalyzer:
                 specialized['subword'].append({
                     'neuron': self._get_neuron_name(neuron_idx),
                     'neuron_idx': neuron_idx,
+                    'pool': self._get_pool_for_neuron(neuron_idx),
                     'specialized_for': 'word_initial',
                     'pct': word_init_pct,
                     'n_activations': profile['n_activations'],
@@ -4260,6 +4263,7 @@ class NeuronFeatureAnalyzer:
                 specialized['subword'].append({
                     'neuron': self._get_neuron_name(neuron_idx),
                     'neuron_idx': neuron_idx,
+                    'pool': self._get_pool_for_neuron(neuron_idx),
                     'specialized_for': 'continuation',
                     'pct': cont_pct,
                     'n_activations': profile['n_activations'],
@@ -4271,6 +4275,7 @@ class NeuronFeatureAnalyzer:
                 specialized['frequency'].append({
                     'neuron': self._get_neuron_name(neuron_idx),
                     'neuron_idx': neuron_idx,
+                    'pool': self._get_pool_for_neuron(neuron_idx),
                     'specialized_for': 'high_frequency',
                     'pct': freq['high_freq_pct'],
                     'n_activations': profile['n_activations'],
@@ -4279,6 +4284,7 @@ class NeuronFeatureAnalyzer:
                 specialized['frequency'].append({
                     'neuron': self._get_neuron_name(neuron_idx),
                     'neuron_idx': neuron_idx,
+                    'pool': self._get_pool_for_neuron(neuron_idx),
                     'specialized_for': 'low_frequency',
                     'pct': freq['low_freq_pct'],
                     'n_activations': profile['n_activations'],
@@ -4290,6 +4296,7 @@ class NeuronFeatureAnalyzer:
                 specialized['next_pos'].append({
                     'neuron': self._get_neuron_name(neuron_idx),
                     'neuron_idx': neuron_idx,
+                    'pool': self._get_pool_for_neuron(neuron_idx),
                     'specialized_for': next_pos['top_next_pos'],
                     'pct': next_pos['top_next_pos_pct'],
                     'n_activations': profile['n_activations'],
@@ -4757,10 +4764,10 @@ class NeuronFeatureAnalyzer:
             # Count specialized neurons in this pool at each threshold
             for t in thresholds:
                 spec_t = self.detect_specialized_neurons(threshold=t)
-                # Count POS-specialized neurons in this pool
+                # Count POS-specialized neurons in this pool by pool name
                 count = sum(
                     1 for n in spec_t.get('pos', [])
-                    if start_idx <= n['neuron'] < end_idx
+                    if n.get('pool') == pool_name
                 )
                 pool_spec[f'specialized_{int(t*100)}'] = count
 
