@@ -1802,6 +1802,25 @@ class ModelAnalyzer:
 
         has_comparison = bool(vanilla_info or vanilla_val)
 
+        # Console output - Table format
+        print("\n  [Model Statistics]")
+        if has_comparison:
+            print(f"  {'Metric':<15} {'DAWN':>12} {'Vanilla':>12}")
+            print(f"  {'-'*15} {'-'*12} {'-'*12}")
+            print(f"  {'Parameters':<15} {model_info.get('total_M', 0):>10.2f}M {vanilla_info.get('total_M', 0):>10.2f}M")
+            print(f"  {'FLOPs':<15} {model_info.get('flops_G', 0):>10.2f}G {vanilla_info.get('flops_G', 0):>10.2f}G")
+            print(f"  {'Perplexity':<15} {val.get('perplexity', 0):>12.2f} {vanilla_val.get('perplexity', 0):>12.2f}")
+            print(f"  {'Accuracy':<15} {val.get('accuracy', 0):>11.1f}% {vanilla_val.get('accuracy', 0):>11.1f}%")
+            print(f"  {'Speed':<15} {speed.get('tokens_per_sec', 0)/1000:>10.1f}K {vanilla_speed.get('tokens_per_sec', 0)/1000:>10.1f}K tok/s")
+        else:
+            print(f"  {'Metric':<15} {'Value':>15}")
+            print(f"  {'-'*15} {'-'*15}")
+            print(f"  {'Parameters':<15} {model_info.get('total_M', 0):>13.2f}M")
+            print(f"  {'FLOPs':<15} {model_info.get('flops_G', 0):>13.2f}G")
+            print(f"  {'Perplexity':<15} {val.get('perplexity', 0):>15.2f}")
+            print(f"  {'Accuracy':<15} {val.get('accuracy', 0):>14.1f}%")
+            print(f"  {'Speed':<15} {speed.get('tokens_per_sec', 0)/1000:>13.1f}K tok/s")
+
         # Model stats CSV
         with open(tables_dir / 'model_stats.csv', 'w') as f:
             if has_comparison:
