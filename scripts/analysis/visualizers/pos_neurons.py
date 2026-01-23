@@ -10,8 +10,10 @@ Paper Figure 4: POS Neuron Specialization
 
 import os
 import numpy as np
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 from collections import defaultdict
+
+from ..utils import POOL_DISPLAY_NAMES, get_neuron_display_name
 
 try:
     import matplotlib.pyplot as plt
@@ -464,9 +466,11 @@ def plot_pos_specialization_from_features(
     return output_path
 
 
-def _neuron_idx_to_pool_label(neuron_idx: int, pool_order: list) -> str:
+def _neuron_idx_to_pool_label(neuron_idx: int, pool_order: List[Tuple[str, int]]) -> str:
     """
-    Convert neuron index to pool-prefixed label.
+    Convert global neuron index to pool-prefixed label.
+
+    Uses POOL_DISPLAY_NAMES from utils.py for consistent naming.
 
     Args:
         neuron_idx: Global neuron index
@@ -475,22 +479,11 @@ def _neuron_idx_to_pool_label(neuron_idx: int, pool_order: list) -> str:
     Returns:
         Label like 'F_V_110', 'R_Know_69'
     """
-    # Pool key to display name mapping
-    POOL_DISPLAY_NAMES = {
-        'fv': 'F_V',
-        'fqk': 'F_QK',
-        'rv': 'R_V',
-        'rqk': 'R_QK',
-        'rknow': 'R_Know',
-        'rknowledge': 'R_Know',
-    }
-
     offset = 0
     for pool_key, pool_size in pool_order:
         if neuron_idx < offset + pool_size:
             local_idx = neuron_idx - offset
-            display_name = POOL_DISPLAY_NAMES.get(pool_key.lower(), pool_key.upper())
-            return f'{display_name}_{local_idx}'
+            return get_neuron_display_name(pool_key, local_idx)
         offset += pool_size
 
     # Fallback: just return the index
