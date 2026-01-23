@@ -23,6 +23,8 @@ from .utils import (
     HAS_TQDM, tqdm,
     RoutingDataExtractor,  # Schema layer for model-agnostic access
     resolve_pool_type,     # Resolve pool type aliases
+    POOL_DISPLAY_NAMES,    # Pool shorthand to display name mapping
+    get_neuron_display_name,  # Unified neuron naming
 )
 
 
@@ -4615,25 +4617,27 @@ class NeuronFeatureAnalyzer:
 
     def _get_neuron_name(self, global_idx: int) -> str:
         """
-        Convert global neuron index to unified naming format: {pool}_{local_idx}
+        Convert global neuron index to unified naming format: {Pool}_{local_idx}
+
+        Uses centralized POOL_DISPLAY_NAMES from utils for consistency.
 
         Examples:
-            0 -> 'fqk_0'
-            64 -> 'fv_0'
-            328 -> 'rqk_0'
+            0 -> 'F_QK_0'
+            64 -> 'F_V_0'
+            328 -> 'R_QK_0'
 
         Args:
             global_idx: Global neuron index (0 to total_neurons-1)
 
         Returns:
-            String like 'fv_45', 'fknow_12', etc.
+            String like 'F_V_45', 'F_Know_12', etc.
         """
         pool_ranges = self._get_pool_ranges()
         for pool_name, (start_idx, end_idx) in pool_ranges.items():
             if start_idx <= global_idx < end_idx:
                 local_idx = global_idx - start_idx
-                return f'{pool_name}_{local_idx}'
-        return f'unknown_{global_idx}'
+                return get_neuron_display_name(pool_name, local_idx)
+        return f'Unknown_{global_idx}'
 
     def _get_pool_for_neuron(self, global_idx: int) -> str:
         """Get pool name for a global neuron index."""

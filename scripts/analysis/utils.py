@@ -173,6 +173,65 @@ POOL_N_ATTR = {
     'restore_know': 'n_restore_know',
 }
 
+# ============================================================
+# Neuron Naming Convention
+# ============================================================
+# Unified neuron naming: {Pool}_{Index} format
+# Examples: F_QK_0, F_V_45, R_Know_12
+
+# Pool shorthand to display name mapping
+POOL_DISPLAY_NAMES = {
+    'fqk': 'F_QK',
+    'fv': 'F_V',
+    'rqk': 'R_QK',
+    'rv': 'R_V',
+    'fknow': 'F_Know',
+    'rknow': 'R_Know',
+}
+
+# Reverse mapping: display name to shorthand
+POOL_SHORTHAND = {v: k for k, v in POOL_DISPLAY_NAMES.items()}
+
+
+def get_neuron_display_name(pool_shorthand: str, local_idx: int) -> str:
+    """
+    Generate unified neuron display name.
+
+    Args:
+        pool_shorthand: Pool shorthand (e.g., 'fqk', 'fv', 'rknow')
+        local_idx: Local index within the pool
+
+    Returns:
+        Display name like 'F_QK_0', 'F_V_45', 'R_Know_12'
+    """
+    display = POOL_DISPLAY_NAMES.get(pool_shorthand, pool_shorthand.upper())
+    return f'{display}_{local_idx}'
+
+
+def parse_neuron_name(neuron_name: str) -> Tuple[str, int]:
+    """
+    Parse neuron display name back to pool shorthand and index.
+
+    Args:
+        neuron_name: Display name like 'F_QK_0', 'F_V_45'
+
+    Returns:
+        Tuple of (pool_shorthand, local_idx)
+    """
+    parts = neuron_name.rsplit('_', 1)
+    if len(parts) != 2:
+        return 'unknown', -1
+
+    display_prefix, idx_str = parts
+    try:
+        local_idx = int(idx_str)
+    except ValueError:
+        return 'unknown', -1
+
+    pool_shorthand = POOL_SHORTHAND.get(display_prefix, display_prefix.lower())
+    return pool_shorthand, local_idx
+
+
 # Co-selection pairs for v17.1 analysis
 COSELECTION_PAIRS = {
     'fqk_rqk': {
