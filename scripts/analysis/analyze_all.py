@@ -3137,9 +3137,9 @@ class ModelAnalyzer:
         """Paper generation에 필요한 분석 목록 (Single Source of Truth)"""
         return [
             ('model_info', self.analyze_model_info, {}),
-            ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
+            ('performance', self.analyze_performance, {'n_batches': self.val_batches}),
             ('health', self.analyze_health, {}),
-            ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
+            ('routing', self.analyze_routing, {'n_batches': self.n_batches}),
             ('neuron_features', self.analyze_neuron_features, {
                 'max_sentences': self.max_sentences,
                 'target_layer': self.target_layer
