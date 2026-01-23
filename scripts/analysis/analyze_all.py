@@ -3282,6 +3282,10 @@ class ModelAnalyzer:
                 traceback.print_exc()
                 self.results[name] = {'error': str(e)}
 
+            # Print summary table after performance analysis
+            if name == 'performance':
+                self._print_summary_table()
+
         # Paper outputs: generate if not filtering, 'paper' in filter, or figure/table specified
         if not only or 'paper' in only or has_figure_request:
             print(f"\n[PAPER] Generating paper outputs...")
@@ -3352,6 +3356,63 @@ class ModelAnalyzer:
             print(f"    (No existing results found)")
         else:
             print(f"  Total: {len(self.results)} result sets loaded")
+
+    def _print_summary_table(self):
+        """Print summary table after performance analysis."""
+        model_info = self.results.get('model_info', {})
+        perf = self.results.get('performance', {})
+        val = perf.get('validation', {})
+        speed = perf.get('speed', {})
+
+        # Try to get vanilla info if comparison checkpoint exists
+        vanilla_info = {}
+        vanilla_val = {}
+        vanilla_speed = {}
+
+        if self.compare_checkpoint:
+            # Try to load from cached comparison model results
+            comp_path = Path(self.compare_checkpoint)
+            comp_dirs = [
+                comp_path.parent / 'analysis',
+                self.output_dir.parent / comp_path.stem / 'analysis' if comp_path.is_file() else None,
+            ]
+            for comp_dir in comp_dirs:
+                if comp_dir and comp_dir.exists():
+                    comp_params = comp_dir / 'model_info' / 'parameters.json'
+                    comp_val = comp_dir / 'performance' / 'validation.json'
+                    comp_speed = comp_dir / 'performance' / 'speed_benchmark.json'
+                    if comp_params.exists():
+                        with open(comp_params) as f:
+                            vanilla_info = json.load(f)
+                    if comp_val.exists():
+                        with open(comp_val) as f:
+                            vanilla_val = json.load(f)
+                    if comp_speed.exists():
+                        with open(comp_speed) as f:
+                            vanilla_speed = json.load(f)
+                    if vanilla_info:
+                        break
+
+        has_comparison = bool(vanilla_info or vanilla_val)
+
+        print("\n  ┌─ Model Statistics ─────────────────────────────────────")
+        if has_comparison:
+            print(f"  │ {'Metric':<12} {'DAWN':>12} {'Vanilla':>12}")
+            print(f"  │ {'-'*12} {'-'*12} {'-'*12}")
+            print(f"  │ {'Parameters':<12} {model_info.get('total_M', 0):>10.2f}M {vanilla_info.get('total_M', 0):>10.2f}M")
+            print(f"  │ {'FLOPs':<12} {model_info.get('flops_G', 0):>10.2f}G {vanilla_info.get('flops_G', 0):>10.2f}G")
+            print(f"  │ {'Perplexity':<12} {val.get('perplexity', 0):>12.2f} {vanilla_val.get('perplexity', 0):>12.2f}")
+            print(f"  │ {'Accuracy':<12} {val.get('accuracy', 0):>11.1f}% {vanilla_val.get('accuracy', 0):>11.1f}%")
+            print(f"  │ {'Speed':<12} {speed.get('tokens_per_sec', 0)/1000:>10.1f}K {vanilla_speed.get('tokens_per_sec', 0)/1000:>10.1f}K tok/s")
+        else:
+            print(f"  │ {'Metric':<15} {'Value':>15}")
+            print(f"  │ {'-'*15} {'-'*15}")
+            print(f"  │ {'Parameters':<15} {model_info.get('total_M', 0):>13.2f}M")
+            print(f"  │ {'FLOPs':<15} {model_info.get('flops_G', 0):>13.2f}G")
+            print(f"  │ {'Perplexity':<15} {val.get('perplexity', 0):>15.2f}")
+            print(f"  │ {'Accuracy':<15} {val.get('accuracy', 0):>14.1f}%")
+            print(f"  │ {'Speed':<15} {speed.get('tokens_per_sec', 0)/1000:>13.1f}K tok/s")
+        print(f"  └─────────────────────────────────────────────────────────\n")
 
     def _print_final_summary(self):
         """Print final analysis summary."""
