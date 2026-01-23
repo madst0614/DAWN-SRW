@@ -464,12 +464,46 @@ def plot_pos_specialization_from_features(
     return output_path
 
 
+def _neuron_idx_to_pool_label(neuron_idx: int, pool_order: list) -> str:
+    """
+    Convert neuron index to pool-prefixed label.
+
+    Args:
+        neuron_idx: Global neuron index
+        pool_order: List of (pool_key, pool_size) tuples, e.g. [('fv', 128), ('fqk', 64), ...]
+
+    Returns:
+        Label like 'F_V_110', 'R_Know_69'
+    """
+    # Pool key to display name mapping
+    POOL_DISPLAY_NAMES = {
+        'fv': 'F_V',
+        'fqk': 'F_QK',
+        'rv': 'R_V',
+        'rqk': 'R_QK',
+        'rknow': 'R_Know',
+        'rknowledge': 'R_Know',
+    }
+
+    offset = 0
+    for pool_key, pool_size in pool_order:
+        if neuron_idx < offset + pool_size:
+            local_idx = neuron_idx - offset
+            display_name = POOL_DISPLAY_NAMES.get(pool_key.lower(), pool_key.upper())
+            return f'{display_name}_{local_idx}'
+        offset += pool_size
+
+    # Fallback: just return the index
+    return str(neuron_idx)
+
+
 def plot_pos_selectivity_heatmap(
     selectivity_matrix: np.ndarray,
     active_indices: list,
     output_path: str,
+    pool_order: list = None,
     top_n: int = 50,
-    figsize: Tuple[int, int] = (10, 12),
+    figsize: Tuple[int, int] = (8, 12),
     dpi: int = 150
 ) -> Optional[str]:
     """
@@ -484,6 +518,7 @@ def plot_pos_selectivity_heatmap(
         selectivity_matrix: [n_neurons, n_pos] selectivity scores
         active_indices: List of active neuron indices
         output_path: Path to save the figure
+        pool_order: List of (pool_key, pool_size) for neuron labeling, e.g. [('fv', 128), ('fqk', 64)]
         top_n: Number of top neurons to show
         figsize: Figure size
         dpi: Output resolution
@@ -524,11 +559,18 @@ def plot_pos_selectivity_heatmap(
         interpolation='nearest'
     )
 
+    # Convert neuron indices to pool labels
+    def get_label(idx):
+        if pool_order:
+            return _neuron_idx_to_pool_label(idx, pool_order)
+        return str(idx)
+
     # Labels
     ax.set_xticks(range(len(UPOS_TAGS)))
     ax.set_xticklabels(UPOS_TAGS, rotation=45, ha='right', fontsize=9)
-    ax.set_yticks(range(0, len(selected_indices), max(1, len(selected_indices) // 20)))
-    ax.set_yticklabels([str(selected_indices[i]) for i in range(0, len(selected_indices), max(1, len(selected_indices) // 20))], fontsize=8)
+    tick_step = max(1, len(selected_indices) // 20)
+    ax.set_yticks(range(0, len(selected_indices), tick_step))
+    ax.set_yticklabels([get_label(selected_indices[i]) for i in range(0, len(selected_indices), tick_step)], fontsize=7)
     ax.set_xlabel('POS Category', fontsize=11)
     ax.set_ylabel('Neuron (sorted by selectivity range)', fontsize=11)
     ax.set_title(f'Neuron POS Selectivity (Top {len(selected_indices)} neurons)', fontsize=12)
