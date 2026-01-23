@@ -113,24 +113,51 @@ class PaperFigureGenerator:
 
     def generate_figure4(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
-        Figure 4: POS Neuron Specialization.
+        Figure 4: POS Neuron Selectivity.
 
-        Requires: precomputed['neuron_features']
+        Uses selectivity data (not 80% threshold specialization).
+        Requires: precomputed['neuron_features']['selectivity']
         """
-        from .visualizers import plot_pos_specialization_from_features
+        from .visualizers import plot_pos_selectivity_from_json, plot_pos_selectivity_heatmap
+        import numpy as np
 
         if 'neuron_features' not in precomputed:
             return {'error': 'Missing precomputed data: neuron_features. Run analyze_all.py --only neuron_features first.'}
 
         results = precomputed['neuron_features']
-        print("  Using pre-computed neuron features...", flush=True)
+        selectivity = results.get('selectivity', {})
 
-        path = plot_pos_specialization_from_features(
-            results, os.path.join(output_dir, 'fig4_pos_neurons.png')
-        )
-        print(f"  Saved: {path}", flush=True)
+        if not selectivity:
+            return {'error': 'Missing selectivity data in neuron_features. Re-run analyze_all.py --only neuron_features.'}
 
-        return {'neuron_features': results, 'visualization': path}
+        print("  Using pre-computed selectivity data...", flush=True)
+
+        # Try to load selectivity matrix if available (for full heatmap)
+        matrix_path = config.get('selectivity_matrix_path')
+        path = None
+
+        if matrix_path and os.path.exists(matrix_path):
+            print(f"  Loading selectivity matrix from {matrix_path}...", flush=True)
+            selectivity_matrix = np.load(matrix_path)
+            active_indices = list(range(selectivity_matrix.shape[0]))  # All rows are active
+            path = plot_pos_selectivity_heatmap(
+                selectivity_matrix,
+                active_indices,
+                os.path.join(output_dir, 'fig4_pos_selectivity.png')
+            )
+        else:
+            # Use JSON data for visualization
+            path = plot_pos_selectivity_from_json(
+                selectivity,
+                os.path.join(output_dir, 'fig4_pos_selectivity.png')
+            )
+
+        if path:
+            print(f"  Saved: {path}", flush=True)
+        else:
+            print("  Warning: Figure generation returned None", flush=True)
+
+        return {'selectivity': selectivity, 'visualization': path}
 
     def generate_figure5(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
