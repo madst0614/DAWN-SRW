@@ -52,79 +52,73 @@ def estimate_flops(model, seq_len=512):
     Estimate theoretical FLOPs for forward pass (per sequence).
 
     Reports theoretical FLOPs based on active neurons (top-k sparse).
-    Note: Current DAWN implementation uses dense operations internally,
-    so actual compute may differ from theoretical sparse FLOPs.
+    Includes both sparse matmul and einsum operations.
 
     FLOPs formula: matmul (m,k) @ (k,n) = 2 * m * k * n
     """
-    d_model = getattr(model, 'd_model', 512)
+    d_model = getattr(model, 'd_model', 384)
     n_layers = getattr(model, 'n_layers', 12)
-    vocab_size = getattr(model, 'vocab_size', 30000)
+    rank = getattr(model, 'rank', 64)
+    knowledge_rank = getattr(model, 'knowledge_rank', 128)
 
-    # Check if DAWN or Vanilla
     if hasattr(model, 'shared_neurons'):
-        # DAWN model - theoretical sparse FLOPs
-        rank = getattr(model, 'rank', 64)
-        knowledge_rank = getattr(model, 'knowledge_rank', 128)
-
-        # Feature pathway top-k values
-        top_k_fqk = getattr(model, 'top_k_feature_qk', 20)
+        # DAWN - Top-k values
+        top_k_fqk = getattr(model, 'top_k_feature_qk', 16)
         top_k_fv = getattr(model, 'top_k_feature_v', 6)
-
-        # Restore pathway top-k values
-        top_k_rqk = getattr(model, 'top_k_restore_qk', top_k_fqk)
-        top_k_rv = getattr(model, 'top_k_restore_v', top_k_fv)
-
-        # Knowledge circuit top-k values
+        top_k_rqk = getattr(model, 'top_k_restore_qk', 16)
+        top_k_rv = getattr(model, 'top_k_restore_v', 6)
         top_k_fknow = getattr(model, 'top_k_feature_know', 4)
-        top_k_rknow = getattr(model, 'top_k_restore_know', top_k_fknow)
+        top_k_rknow = getattr(model, 'top_k_restore_know', 4)
 
         # === Attention Circuit ===
-        # Feature pathway: (seq, d) @ (d, rank) for each selected neuron
-        # Q, K: top_k_fqk neurons each, V: top_k_fv neurons
-        attn_feat = 2 * (top_k_fqk * 2 + top_k_fv) * d_model * rank * seq_len
+        # Feature sparse matmul: Q, K (각 top_k_fqk), V (top_k_fv)
+        attn_feat_matmul = 2 * (top_k_fqk * 2 + top_k_fv) * d_model * rank * seq_len
 
-        # Restore pathway: (seq, rank) @ (rank, d) for each selected neuron
-        # Q, K: top_k_rqk neurons each, V: top_k_rv neurons
-        attn_rest = 2 * (top_k_rqk * 2 + top_k_rv) * rank * d_model * seq_len
+        # Feature einsum (x3 for Q, K, V)
+        attn_feat_einsum = 2 * 3 * d_model * rank * seq_len
 
-        # Attention scores: Q @ K^T + scores @ V
-        # = 2 * seq * seq * d + 2 * seq * seq * d = 4 * seq^2 * d
+        # Restore sparse matmul: Q, K (각 top_k_rqk), V (top_k_rv)
+        attn_rest_matmul = 2 * (top_k_rqk * 2 + top_k_rv) * rank * d_model * seq_len
+
+        # Restore einsum (x3 for Q, K, V)
+        attn_rest_einsum = 2 * 3 * rank * d_model * seq_len
+
+        # Attention scores: QK^T + scores@V
         attn_scores = 2 * 2 * seq_len * seq_len * d_model
 
         # expand_O: Linear(d_model, d_model)
         expand_o = 2 * d_model * d_model * seq_len
 
         # === Knowledge Circuit ===
-        # Feature: (seq, d) @ (d, knowledge_rank) for top_k_fknow neurons
-        # Restore: (seq, knowledge_rank) @ (knowledge_rank, d) for top_k_rknow neurons
-        knowledge = 2 * (top_k_fknow + top_k_rknow) * d_model * knowledge_rank * seq_len
+        # Feature sparse matmul + einsum
+        know_feat = 2 * top_k_fknow * d_model * knowledge_rank * seq_len
+        know_feat_ein = 2 * d_model * knowledge_rank * seq_len
 
-        per_layer = attn_feat + attn_rest + attn_scores + expand_o + knowledge
+        # Restore sparse matmul + einsum
+        know_rest = 2 * top_k_rknow * knowledge_rank * d_model * seq_len
+        know_rest_ein = 2 * knowledge_rank * d_model * seq_len
+
+        per_layer = (attn_feat_matmul + attn_feat_einsum +
+                     attn_rest_matmul + attn_rest_einsum +
+                     attn_scores + expand_o +
+                     know_feat + know_feat_ein +
+                     know_rest + know_rest_ein)
     else:
-        # Vanilla transformer - theoretical dense FLOPs
+        # Vanilla transformer
         d_ff = getattr(model, 'd_ff', 4 * d_model)
 
-        # QKV + O projections: 4 matmuls of (seq, d) @ (d, d)
-        # = 4 * 2 * seq * d * d = 8 * seq * d^2
+        # QKV + O projections: 4 * d_model^2
         qkvo = 2 * 4 * d_model * d_model * seq_len
 
-        # Attention scores: Q @ K^T + scores @ V
-        # = 2 * seq * seq * d + 2 * seq * seq * d = 4 * seq^2 * d
+        # Attention scores: QK^T + scores@V
         attn_scores = 2 * 2 * seq_len * seq_len * d_model
 
-        # FFN: up-proj + down-proj
-        # = 2 * seq * d * d_ff + 2 * seq * d_ff * d = 4 * seq * d * d_ff
+        # FFN: up + down
         ffn = 2 * 2 * d_model * d_ff * seq_len
 
         per_layer = qkvo + attn_scores + ffn
 
-    total_flops = n_layers * per_layer
-
-    # LM head: (seq, d) @ (d, vocab)
-    total_flops += 2 * seq_len * d_model * vocab_size
-
-    return total_flops
+    return n_layers * per_layer
 
 
 def format_flops(flops):
