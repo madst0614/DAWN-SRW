@@ -23,6 +23,8 @@ from .utils import (
     HAS_TQDM, tqdm,
     RoutingDataExtractor,  # Schema layer for model-agnostic access
     resolve_pool_type,     # Resolve pool type aliases
+    POOL_DISPLAY_NAMES,    # Pool shorthand to display name mapping
+    get_neuron_display_name,  # Unified neuron naming
 )
 
 
@@ -4224,7 +4226,8 @@ class NeuronFeatureAnalyzer:
             pos_info = profile['pos']
             if pos_info.get('top_pos_pct', 0) >= threshold_pct:
                 specialized['pos'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': pos_info['top_pos'],
                     'pct': pos_info['top_pos_pct'],
                     'n_activations': profile['n_activations'],
@@ -4234,7 +4237,8 @@ class NeuronFeatureAnalyzer:
             pos_dist = profile['position']
             if pos_dist.get('dominant_pct', 0) >= threshold_pct:
                 specialized['position'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': pos_dist['dominant_position'],
                     'pct': pos_dist['dominant_pct'],
                     'n_activations': profile['n_activations'],
@@ -4246,14 +4250,16 @@ class NeuronFeatureAnalyzer:
             cont_pct = subword.get('continuation_pct', 50)
             if word_init_pct >= threshold_pct:
                 specialized['subword'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': 'word_initial',
                     'pct': word_init_pct,
                     'n_activations': profile['n_activations'],
                 })
             elif cont_pct >= threshold_pct:
                 specialized['subword'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': 'continuation',
                     'pct': cont_pct,
                     'n_activations': profile['n_activations'],
@@ -4263,14 +4269,16 @@ class NeuronFeatureAnalyzer:
             freq = profile['frequency']
             if freq.get('high_freq_pct', 0) >= threshold_pct:
                 specialized['frequency'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': 'high_frequency',
                     'pct': freq['high_freq_pct'],
                     'n_activations': profile['n_activations'],
                 })
             elif freq.get('low_freq_pct', 0) >= threshold_pct:
                 specialized['frequency'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': 'low_frequency',
                     'pct': freq['low_freq_pct'],
                     'n_activations': profile['n_activations'],
@@ -4280,7 +4288,8 @@ class NeuronFeatureAnalyzer:
             next_pos = profile['next_pos']
             if next_pos.get('top_next_pos_pct', 0) >= threshold_pct:
                 specialized['next_pos'].append({
-                    'neuron': neuron_idx,
+                    'neuron': self._get_neuron_name(neuron_idx),
+                    'neuron_idx': neuron_idx,
                     'specialized_for': next_pos['top_next_pos'],
                     'pct': next_pos['top_next_pos_pct'],
                     'n_activations': profile['n_activations'],
@@ -4608,25 +4617,27 @@ class NeuronFeatureAnalyzer:
 
     def _get_neuron_name(self, global_idx: int) -> str:
         """
-        Convert global neuron index to unified naming format: {pool}_{local_idx}
+        Convert global neuron index to unified naming format: {Pool}_{local_idx}
+
+        Uses centralized POOL_DISPLAY_NAMES from utils for consistency.
 
         Examples:
-            0 -> 'fqk_0'
-            64 -> 'fv_0'
-            328 -> 'rqk_0'
+            0 -> 'F_QK_0'
+            64 -> 'F_V_0'
+            328 -> 'R_QK_0'
 
         Args:
             global_idx: Global neuron index (0 to total_neurons-1)
 
         Returns:
-            String like 'fv_45', 'fknow_12', etc.
+            String like 'F_V_45', 'F_Know_12', etc.
         """
         pool_ranges = self._get_pool_ranges()
         for pool_name, (start_idx, end_idx) in pool_ranges.items():
             if start_idx <= global_idx < end_idx:
                 local_idx = global_idx - start_idx
-                return f'{pool_name}_{local_idx}'
-        return f'unknown_{global_idx}'
+                return get_neuron_display_name(pool_name, local_idx)
+        return f'Unknown_{global_idx}'
 
     def _get_pool_for_neuron(self, global_idx: int) -> str:
         """Get pool name for a global neuron index."""

@@ -558,36 +558,27 @@ class RoutingAnalyzer(BaseAnalyzer):
                 valid_mask = total_usage > 0
                 q_ratio[valid_mask] = q_np[valid_mask] / total_usage[valid_mask]
 
-                # Inactive: bottom 10% by total usage (neurons rarely selected)
-                usage_threshold = np.percentile(total_usage, 10) if len(total_usage) > 0 else 0
-                inactive_mask = total_usage <= usage_threshold
-
-                # Among active neurons, classify by ratio
+                # Classify by ratio (all neurons with valid usage)
                 # Q-specialized: q_ratio > 0.7 (mostly selected by Q)
                 # K-specialized: q_ratio < 0.3 (mostly selected by K)
                 # Shared: 0.3 <= q_ratio <= 0.7 (selected by both)
-                active_mask = ~inactive_mask
-                q_specialized = int(((q_ratio > 0.7) & active_mask).sum())
-                k_specialized = int(((q_ratio < 0.3) & active_mask).sum())
-                shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7) & active_mask).sum())
-                inactive = int(inactive_mask.sum())
+                q_specialized = int((q_ratio > 0.7).sum())
+                k_specialized = int((q_ratio < 0.3).sum())
+                shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7)).sum())
 
                 # Sensitivity analysis: multiple thresholds for paper
                 sensitivity_thresholds = [0.6, 0.65, 0.7, 0.75, 0.8]
                 sensitivity_analysis = {}
                 for t in sensitivity_thresholds:
-                    q_spec = int(((q_ratio > t) & active_mask).sum())
-                    k_spec = int(((q_ratio < (1 - t)) & active_mask).sum())
-                    shared_t = int(((q_ratio >= (1 - t)) & (q_ratio <= t) & active_mask).sum())
+                    q_spec = int((q_ratio > t).sum())
+                    k_spec = int((q_ratio < (1 - t)).sum())
+                    shared_t = int(((q_ratio >= (1 - t)) & (q_ratio <= t)).sum())
                     sensitivity_analysis[str(t)] = {
                         'q_specialized': q_spec,
                         'k_specialized': k_spec,
                         'shared': shared_t,
-                        'total_active': int(active_mask.sum()),
+                        'total': n_neurons,
                     }
-
-                # Q-ratio data for histogram (bimodal distribution)
-                q_ratio_active = q_ratio[active_mask].tolist()
 
                 results[pool_name] = {
                     'display': pool_info['display'],
@@ -601,18 +592,14 @@ class RoutingAnalyzer(BaseAnalyzer):
                     'q_specialized': q_specialized,
                     'k_specialized': k_specialized,
                     'shared': shared,
-                    'inactive': inactive,
                     'q_total': int(q_np.sum()),
                     'k_total': int(k_np.sum()),
                     'per_layer': per_layer_results,
                     # Paper Fig 3 specific data
                     'q_ratio': q_ratio.tolist(),  # Per-neuron Q ratio for scatter/histogram
-                    'q_ratio_active': q_ratio_active,  # Only active neurons for histogram
-                    'usage_threshold': float(usage_threshold),
                     'specialization_thresholds': {
                         'q_specialized': 0.7,
                         'k_specialized': 0.3,
-                        'inactive_percentile': 10
                     },
                     # Sensitivity analysis for different thresholds
                     'sensitivity_analysis': sensitivity_analysis,
