@@ -49,53 +49,76 @@ def count_parameters(model):
 
 def estimate_flops(model, seq_len=512):
     """
-    Estimate FLOPs for forward pass (per sequence).
-    Rough estimation based on model architecture.
+    Estimate theoretical FLOPs for forward pass (per sequence).
+
+    Reports theoretical FLOPs based on active neurons (top-k sparse).
+    Includes both sparse matmul and einsum operations.
+
+    FLOPs formula: matmul (m,k) @ (k,n) = 2 * m * k * n
     """
-    d_model = getattr(model, 'd_model', 512)
+    d_model = getattr(model, 'd_model', 384)
     n_layers = getattr(model, 'n_layers', 12)
-    vocab_size = getattr(model, 'vocab_size', 30000)
+    rank = getattr(model, 'rank', 64)
+    knowledge_rank = getattr(model, 'knowledge_rank', 128)
 
-    # Check if DAWN or Vanilla
     if hasattr(model, 'shared_neurons'):
-        # DAWN model
-        rank = getattr(model, 'rank', 64)
-        top_k_qk = getattr(model, 'top_k_feature_qk', 20)
-        top_k_v = getattr(model, 'top_k_feature_v', 6)
-        knowledge_rank = getattr(model, 'knowledge_rank', 128)
-        top_k_know = getattr(model, 'top_k_feature_know', 4)
+        # DAWN - Top-k values
+        top_k_fqk = getattr(model, 'top_k_feature_qk', 16)
+        top_k_fv = getattr(model, 'top_k_feature_v', 6)
+        top_k_rqk = getattr(model, 'top_k_restore_qk', 16)
+        top_k_rv = getattr(model, 'top_k_restore_v', 6)
+        top_k_fknow = getattr(model, 'top_k_feature_know', 4)
+        top_k_rknow = getattr(model, 'top_k_restore_know', 4)
 
-        # Per layer FLOPs:
-        # Feature neurons: top_k * d_model * rank * seq_len (for Q, K, V)
-        # Restore neurons: top_k * rank * d_model * seq_len
-        # Attention: seq_len^2 * d_model
-        # Knowledge: top_k_know * d_model * knowledge_rank * seq_len * 2
+        # === Attention Circuit ===
+        # Feature sparse matmul: Q, K (각 top_k_fqk), V (top_k_fv)
+        attn_feat_matmul = 2 * (top_k_fqk * 2 + top_k_fv) * d_model * rank * seq_len
 
-        attn_proj = 2 * (top_k_qk * 2 + top_k_v) * d_model * rank * seq_len
-        attn_scores = 2 * seq_len * seq_len * d_model
-        knowledge = 2 * 2 * top_k_know * d_model * knowledge_rank * seq_len
+        # Feature einsum (x3 for Q, K, V)
+        attn_feat_einsum = 2 * 3 * d_model * rank * seq_len
 
-        per_layer = attn_proj + attn_scores + knowledge
+        # Restore sparse matmul: Q, K (각 top_k_rqk), V (top_k_rv)
+        attn_rest_matmul = 2 * (top_k_rqk * 2 + top_k_rv) * rank * d_model * seq_len
+
+        # Restore einsum (x3 for Q, K, V)
+        attn_rest_einsum = 2 * 3 * rank * d_model * seq_len
+
+        # Attention scores: QK^T + scores@V
+        attn_scores = 2 * 2 * seq_len * seq_len * d_model
+
+        # expand_O: Linear(d_model, d_model)
+        expand_o = 2 * d_model * d_model * seq_len
+
+        # === Knowledge Circuit ===
+        # Feature sparse matmul + einsum
+        know_feat = 2 * top_k_fknow * d_model * knowledge_rank * seq_len
+        know_feat_ein = 2 * d_model * knowledge_rank * seq_len
+
+        # Restore sparse matmul + einsum
+        know_rest = 2 * top_k_rknow * knowledge_rank * d_model * seq_len
+        know_rest_ein = 2 * knowledge_rank * d_model * seq_len
+
+        per_layer = (attn_feat_matmul + attn_feat_einsum +
+                     attn_rest_matmul + attn_rest_einsum +
+                     attn_scores + expand_o +
+                     know_feat + know_feat_ein +
+                     know_rest + know_rest_ein)
     else:
         # Vanilla transformer
         d_ff = getattr(model, 'd_ff', 4 * d_model)
 
-        # QKV + O projections: 4 * d_model^2 * seq_len
-        # Attention scores: 2 * seq_len^2 * d_model
-        # FFN: 2 * d_model * d_ff * seq_len
+        # QKV + O projections: 4 * d_model^2
+        qkvo = 2 * 4 * d_model * d_model * seq_len
 
-        per_layer = (
-            4 * d_model * d_model * seq_len +
-            2 * seq_len * seq_len * d_model +
-            2 * d_model * d_ff * seq_len
-        )
+        # Attention scores: QK^T + scores@V
+        attn_scores = 2 * 2 * seq_len * seq_len * d_model
 
-    total_flops = n_layers * per_layer
+        # FFN: up + down
+        ffn = 2 * 2 * d_model * d_ff * seq_len
 
-    # LM head
-    total_flops += seq_len * d_model * vocab_size
+        per_layer = qkvo + attn_scores + ffn
 
-    return total_flops
+    return n_layers * per_layer
 
 
 def format_flops(flops):
