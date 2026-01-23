@@ -3,7 +3,7 @@ Factual Knowledge Heatmap Visualizations
 ========================================
 Visualization for factual knowledge neuron analysis.
 
-Paper Figure 7: Factual Knowledge Neuron Heatmap
+Fig 5: Semantic Clustering of Knowledge Neurons
 """
 
 import os

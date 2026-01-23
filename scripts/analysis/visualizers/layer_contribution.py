@@ -2,8 +2,9 @@
 Layer Contribution Visualizer
 =============================
 
-Paper-quality visualization for DAWN layer-wise circuit contribution.
+Fig 7: Attention-Knowledge Balance Across Layers
 
+Paper-quality visualization for DAWN layer-wise circuit contribution.
 Creates a single-panel figure showing attention vs knowledge contribution per layer.
 """
 

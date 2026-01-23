@@ -2,8 +2,9 @@
 Training Dynamics Visualizer
 ============================
 
+Fig 6: Convergence Comparison
+
 Paper-quality visualization for training loss curves.
-Based on figures/fig5_loss_curve.py.
 """
 
 import os

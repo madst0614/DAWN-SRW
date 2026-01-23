@@ -3,7 +3,7 @@ Q/K Specialization Visualizations
 =================================
 Visualization functions for Q/K neuron usage and specialization patterns.
 
-Paper Figure 3: Q/K Specialization
+Fig 3: Emergent Q/K Functional Separation
 - Left: Q vs K scatter plot with correlation
 - Middle: Q-only/K-only/Shared/Inactive bar chart
 - Right: Q/(Q+K) ratio histogram
@@ -56,7 +56,7 @@ def plot_qk_specialization(
     dpi: int = 300
 ) -> Optional[str]:
     """
-    Generate Q/K specialization figure (Paper Figure 3).
+    Generate Q/K specialization figure (Fig 3: Emergent Q/K Functional Separation).
 
     Creates 3-panel figure for each QK pool:
     - Left: Q vs K usage scatter plot
