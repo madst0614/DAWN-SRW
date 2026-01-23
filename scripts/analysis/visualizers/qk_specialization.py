@@ -120,14 +120,13 @@ def plot_qk_specialization(
 
         # 2. Bar: Specialization categories
         ax = axes[row, 1]
-        categories = ['Q-only', 'K-only', 'Shared', 'Inactive']
+        categories = ['Q-only', 'K-only', 'Shared']
         values = [
             data.get('q_specialized', 0),
             data.get('k_specialized', 0),
             data.get('shared', 0),
-            data.get('inactive', 0)
         ]
-        colors = [COLOR_Q, COLOR_K, COLOR_SHARED, COLOR_INACTIVE]
+        colors = [COLOR_Q, COLOR_K, COLOR_SHARED]
         bars = ax.bar(categories, values, color=colors, alpha=0.85, edgecolor='white', linewidth=0.5)
         ax.set_ylabel('Neuron Count')
         ax.set_title(f'{display_name}: Neuron Specialization', fontweight='bold')
@@ -140,17 +139,15 @@ def plot_qk_specialization(
 
         # 3. Histogram: Q/(Q+K) ratio distribution with specialization thresholds
         ax = axes[row, 2]
-        # Use precomputed q_ratio if available (more accurate with inactive handling)
-        if 'q_ratio_active' in data and len(data['q_ratio_active']) > 0:
-            q_ratio_active = np.array(data['q_ratio_active'])
+        # Use precomputed q_ratio if available
+        if 'q_ratio' in data and len(data['q_ratio']) > 0:
+            q_ratio_plot = np.array(data['q_ratio'])
         else:
             total = q_counts + k_counts + 1e-8
-            q_ratio = q_counts / total
-            active_mask = (q_counts + k_counts) > 0
-            q_ratio_active = q_ratio[active_mask] if active_mask.sum() > 0 else np.array([])
+            q_ratio_plot = q_counts / total
 
-        if len(q_ratio_active) > 0:
-            ax.hist(q_ratio_active, bins=20, alpha=0.75, color=COLOR_PURPLE,
+        if len(q_ratio_plot) > 0:
+            ax.hist(q_ratio_plot, bins=20, alpha=0.75, color=COLOR_PURPLE,
                    edgecolor='white', linewidth=0.5)
         # Threshold lines for specialization
         thresholds = data.get('specialization_thresholds', {'q_specialized': 0.7, 'k_specialized': 0.3})
