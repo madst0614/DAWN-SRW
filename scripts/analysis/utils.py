@@ -72,27 +72,26 @@ except ImportError:
 # DAWN Neuron Types Configuration
 # ============================================================
 
+# Pool configuration: (display_name, n_attr, color)
 NEURON_TYPES = {
-    # (display_name, ema_attr, n_attr, color)
-    'feature_qk':   ('F-QK',   'usage_ema_feature_qk',   'n_feature_qk',   'red'),
-    'feature_v':    ('F-V',    'usage_ema_feature_v',    'n_feature_v',    'orange'),
-    'restore_qk':   ('R-QK',   'usage_ema_restore_qk',   'n_restore_qk',   'blue'),
-    'restore_v':    ('R-V',    'usage_ema_restore_v',    'n_restore_v',    'green'),
-    'feature_know': ('F-Know', 'usage_ema_feature_know', 'n_feature_know', 'purple'),
-    'restore_know': ('R-Know', 'usage_ema_restore_know', 'n_restore_know', 'cyan'),
+    'feature_qk':   ('F-QK',   'n_feature_qk',   'red'),
+    'feature_v':    ('F-V',    'n_feature_v',    'orange'),
+    'restore_qk':   ('R-QK',   'n_restore_qk',   'blue'),
+    'restore_v':    ('R-V',    'n_restore_v',    'green'),
+    'feature_know': ('F-Know', 'n_feature_know', 'purple'),
+    'restore_know': ('R-Know', 'n_restore_know', 'cyan'),
 }
 
-# v18.x: Separate Q/K EMA tracking
+# v18.x: Separate Q/K tracking (8 types for analysis grouping)
 NEURON_TYPES_V18 = {
-    # (display_name, ema_attr, n_attr, color)
-    'feature_q':    ('F-Q',    'usage_ema_feature_q',    'n_feature_qk',   'red'),
-    'feature_k':    ('F-K',    'usage_ema_feature_k',    'n_feature_qk',   'darkred'),
-    'feature_v':    ('F-V',    'usage_ema_feature_v',    'n_feature_v',    'orange'),
-    'restore_q':    ('R-Q',    'usage_ema_restore_q',    'n_restore_qk',   'blue'),
-    'restore_k':    ('R-K',    'usage_ema_restore_k',    'n_restore_qk',   'darkblue'),
-    'restore_v':    ('R-V',    'usage_ema_restore_v',    'n_restore_v',    'green'),
-    'feature_know': ('F-Know', 'usage_ema_feature_know', 'n_feature_know', 'purple'),
-    'restore_know': ('R-Know', 'usage_ema_restore_know', 'n_restore_know', 'cyan'),
+    'feature_q':    ('F-Q',    'n_feature_qk',   'red'),
+    'feature_k':    ('F-K',    'n_feature_qk',   'darkred'),
+    'feature_v':    ('F-V',    'n_feature_v',    'orange'),
+    'restore_q':    ('R-Q',    'n_restore_qk',   'blue'),
+    'restore_k':    ('R-K',    'n_restore_qk',   'darkblue'),
+    'restore_v':    ('R-V',    'n_restore_v',    'green'),
+    'feature_know': ('F-Know', 'n_feature_know', 'purple'),
+    'restore_know': ('R-Know', 'n_restore_know', 'cyan'),
 }
 
 # v18.x: Embedding pool boundaries (6 unique pools, not 8 types)
@@ -129,8 +128,9 @@ ALL_ROUTING_KEYS = {**ROUTING_KEYS}
 for k, v in KNOWLEDGE_ROUTING_KEYS.items():
     ALL_ROUTING_KEYS[k] = (v[0], None, v[1], v[2])  # (display, None, weight_key, pool_type)
 
-# Q/K pool keys (for overlap analysis)
-QK_POOLS = {
+# Q/K pool shorthand mapping (for overlap analysis)
+# Maps shorthand keys to (pool_type, q_key, k_key)
+QK_POOL_SHORTHAND = {
     'fqk': ('feature_qk', 'fqk_q', 'fqk_k'),
     'rqk': ('restore_qk', 'rqk_q', 'rqk_k'),
 }
@@ -234,7 +234,9 @@ COSELECTION_PAIRS = {
     },
 }
 
-# Q/K routing pools for v17.1
+# Q/K routing pools configuration
+# Keys: 'feature_qk', 'restore_qk'
+# Each pool has: display name, pref/weight keys, n_attr, color
 QK_POOLS = {
     'feature_qk': {
         'display': 'F-QK',
@@ -671,6 +673,13 @@ MASK_KEY_MAP = {
 RAW_KEY_TO_STD = {v: k for k, v in WEIGHT_KEY_MAP.items()}
 
 
+def unwrap_model(model):
+    """Unwrap torch.compile wrapped model to get the original module."""
+    while hasattr(model, '_orig_mod'):
+        model = model._orig_mod
+    return model
+
+
 class RoutingDataExtractor:
     """
     Central routing data extraction layer.
@@ -689,56 +698,70 @@ class RoutingDataExtractor:
 
     def __init__(self, model, device='cuda'):
         self.model = model
+        self._unwrapped = unwrap_model(model)  # Unwrap once for attribute access
         self.device = device
         self.router = self._get_router()
         self.model_version = self._detect_version()
 
     def _get_router(self):
         """Get router from model (handles different model structures)."""
-        if hasattr(self.model, 'router'):
-            router = self.model.router
+        model = self._unwrapped
+        if hasattr(model, 'router'):
+            router = model.router
             if hasattr(router, 'neuron_router'):
                 return router.neuron_router
             return router
         return None
 
+    def _get_global_router(self):
+        """Get GlobalRouters instance (for store_pref_tensors flag)."""
+        model = self._unwrapped
+        if hasattr(model, 'router'):
+            return model.router
+        if hasattr(model, 'global_routers'):
+            return model.global_routers
+        return None
+
     def _detect_version(self) -> str:
         """Detect model version."""
         try:
-            return get_model_version(self.model)
+            return get_model_version(self._unwrapped)
         except:
             # Fallback detection
-            if hasattr(self.model, 'router') and hasattr(self.model.router, 'max_paths'):
+            model = self._unwrapped
+            if hasattr(model, 'router') and hasattr(model.router, 'max_paths'):
                 return '18.x'
             return '17.x'
 
     def enable_weight_storage(self):
         """Enable weight tensor storage in routing_info."""
-        # v17.x style: model.router
-        if hasattr(self.model, 'router'):
-            router = self.model.router
+        model = self._unwrapped
+        # v17.x/v18.x: model.router (GlobalRouters or similar)
+        if hasattr(model, 'router'):
+            router = model.router
             if hasattr(router, 'store_pref_tensors'):
                 router.store_pref_tensors = True
             if hasattr(router, 'neuron_router') and hasattr(router.neuron_router, 'store_pref_tensors'):
                 router.neuron_router.store_pref_tensors = True
-        # v18.x style: model.global_routers
-        if hasattr(self.model, 'global_routers'):
-            global_routers = self.model.global_routers
+        # v18.x alternate: model.global_routers
+        if hasattr(model, 'global_routers'):
+            global_routers = model.global_routers
             if hasattr(global_routers, 'store_pref_tensors'):
                 global_routers.store_pref_tensors = True
 
     def disable_weight_storage(self):
         """Disable weight tensor storage."""
-        # v17.x style: model.router
-        if hasattr(self.model, 'router'):
-            router = self.model.router
+        model = self._unwrapped
+        # v17.x/v18.x: model.router
+        if hasattr(model, 'router'):
+            router = model.router
             if hasattr(router, 'store_pref_tensors'):
                 router.store_pref_tensors = False
             if hasattr(router, 'neuron_router') and hasattr(router.neuron_router, 'store_pref_tensors'):
                 router.neuron_router.store_pref_tensors = False
-        # v18.x style: model.global_routers
-        if hasattr(self.model, 'global_routers'):
-            global_routers = self.model.global_routers
+        # v18.x alternate: model.global_routers
+        if hasattr(model, 'global_routers'):
+            global_routers = model.global_routers
             if hasattr(global_routers, 'store_pref_tensors'):
                 global_routers.store_pref_tensors = False
 

@@ -70,20 +70,50 @@ def plot_factual_heatmap(
     for target, data in per_target.items():
         if 'error' in data:
             continue
-        # Get common neurons (80%+ threshold)
-        common_neurons_per_target[target] = set(data.get('common_neurons_80', []))
-        # Get contrastive scores (target_freq - baseline_freq)
-        contrastive_scores = data.get('contrastive_scores', {})
-        for neuron, score in contrastive_scores.items():
-            all_contrastive[target][neuron] = score
-        # Get all frequencies
-        for nf in data.get('neuron_frequencies', []):
-            if isinstance(nf, dict):
-                neuron = nf['neuron']
-                freq = nf['percentage'] / 100.0
-            else:
-                neuron, freq = nf
-            all_neurons[target][neuron] = freq
+
+        # Handle both old structure (common_neurons_80 at top level)
+        # and new multi-pool structure (per_pool: {pool: {common_80: [...]}})
+        if 'common_neurons_80' in data:
+            # Old structure
+            common_neurons_per_target[target] = set(data.get('common_neurons_80', []))
+            # Get contrastive scores
+            contrastive_scores = data.get('contrastive_scores', {})
+            for neuron, score in contrastive_scores.items():
+                all_contrastive[target][neuron] = score
+            # Get all frequencies
+            for nf in data.get('neuron_frequencies', []):
+                if isinstance(nf, dict):
+                    neuron = nf['neuron']
+                    freq = nf['percentage'] / 100.0
+                else:
+                    neuron, freq = nf
+                all_neurons[target][neuron] = freq
+        elif 'per_pool' in data:
+            # New multi-pool structure - only use fknow pool
+            all_common = set()
+            fknow_data = data.get('per_pool', {}).get('fknow', {})
+            if isinstance(fknow_data, dict):
+                common_80 = fknow_data.get('common_80', [])
+                # Remove pool prefix (fknow_71 → 71)
+                for n in common_80:
+                    if '_' in str(n):
+                        idx = str(n).split('_')[-1]
+                        all_common.add(idx)
+                    else:
+                        all_common.add(str(n))
+                # Get top_neurons for frequencies
+                for nf in fknow_data.get('top_neurons', []):
+                    if isinstance(nf, dict):
+                        neuron = nf.get('neuron', '')
+                        # Remove pool prefix
+                        if '_' in str(neuron):
+                            neuron = str(neuron).split('_')[-1]
+                        freq = nf.get('freq', 0) / 100.0
+                        all_neurons[target][neuron] = max(all_neurons[target][neuron], freq)
+            common_neurons_per_target[target] = all_common
+            # For new structure, use presence in common_80 as a proxy for high frequency
+            for neuron in all_common:
+                all_neurons[target][neuron] = max(all_neurons[target].get(neuron, 0), 0.8)
 
     if not all_neurons:
         return None
@@ -185,9 +215,10 @@ def plot_factual_heatmap(
 
     # Select neurons: prioritize categories with interesting patterns
     # Category 0 (Shared) shows common knowledge, then specific categories
-    neurons_per_cat = max(3, top_n_neurons // 4)
+    # Exclude Mixed category (3)
+    neurons_per_cat = max(3, top_n_neurons // 3)
     sorted_neurons = []
-    category_order = [0, 1, 2, 3]  # Shared first, then Capital-specific, Other-specific, Mixed
+    category_order = [0, 1, 2]  # Shared, Capital-specific, Other-specific (no Mixed)
 
     for cat in category_order:
         neurons_in_cat = [n for n, _ in categorized[cat][:neurons_per_cat]]
@@ -230,19 +261,23 @@ def plot_factual_heatmap(
     # Capitalize target labels for display
     display_targets = [t.capitalize() for t in ordered_targets]
 
+    # Custom annotation: hide 0.00 values
+    annot_matrix = np.where(matrix > 0, matrix, np.nan)
+    annot_labels = [[f'{v:.2f}' if not np.isnan(v) else '' for v in row] for row in annot_matrix]
+
     sns.heatmap(
         matrix,
-        xticklabels=[f'N{n}' for n in sorted_neurons],
+        xticklabels=[str(n) for n in sorted_neurons],  # Neuron index only
         yticklabels=display_targets,
         cmap='YlOrRd',
         vmin=0, vmax=1,
-        annot=True, fmt='.2f',
+        annot=annot_labels, fmt='',
         ax=ax,
         cbar_kws={'label': 'Activation Frequency', 'shrink': 0.8, 'pad': 0.02},
         linewidths=0.5
     )
 
-    # Add category boundary lines (vertical)
+    # Add category boundary lines (vertical) - no labels
     for b in boundaries:
         ax.axvline(x=b, color='black', linewidth=2)
 
@@ -250,25 +285,11 @@ def plot_factual_heatmap(
     if capital_targets and other_targets:
         ax.axhline(y=len(capital_targets), color='blue', linewidth=2, linestyle='--')
 
-    # Category labels - above heatmap using transAxes
-    category_names = {0: 'Shared', 1: 'Capital-specific', 2: 'Other-specific', 3: 'Mixed'}
-    prev_boundary = 0
-    n_neurons = len(sorted_neurons)
-    for i, b in enumerate(boundaries + [n_neurons]):
-        if b > prev_boundary:
-            mid = (prev_boundary + b) / 2 / n_neurons  # normalize to 0-1
-            cat_idx = categories[prev_boundary] if prev_boundary < len(categories) else 3
-            label = category_names.get(cat_idx, 'Mixed')
-            ax.text(mid, 1.02, label, ha='center', va='bottom',
-                   fontsize=9, fontweight='bold', color='darkblue',
-                   transform=ax.transAxes)
-        prev_boundary = b
+    # Title
+    ax.set_title('Factual Knowledge Neurons (F-Know Pool)',
+                fontsize=11, fontweight='bold', pad=10)
 
-    # Title - above category labels
-    ax.set_title('Factual Knowledge Neurons: Related outputs share neuron subsets',
-                fontsize=11, fontweight='bold', pad=20, y=1.06)
-
-    ax.set_xlabel('Neuron Index (grouped by semantic category)')
+    ax.set_xlabel('Neuron Index')
     ax.set_ylabel('Target Token')
 
     plt.tight_layout()
@@ -335,9 +356,39 @@ def plot_factual_comparison(
     x = np.arange(len(targets))
     width = 0.25
 
-    counts_100 = [len(per_target[t].get('common_neurons_100', [])) for t in targets]
-    counts_80 = [len(per_target[t].get('common_neurons_80', [])) for t in targets]
-    counts_50 = [len(per_target[t].get('common_neurons_50', [])) for t in targets]
+    # Helper to get neuron counts from both old and new structure
+    def get_neuron_counts(target_data, threshold):
+        # Old structure: common_neurons_XX at top level
+        key = f'common_neurons_{threshold}'
+        if key in target_data:
+            return len(target_data[key])
+        # New multi-pool structure: per_pool with common_XX
+        if 'per_pool' in target_data:
+            all_neurons = set()
+            pool_key = f'common_{threshold}'
+            for pool, pool_data in target_data.get('per_pool', {}).items():
+                if isinstance(pool_data, dict):
+                    all_neurons.update(pool_data.get(pool_key, []))
+            return len(all_neurons)
+        return 0
+
+    def get_common_neurons(target_data, threshold=80):
+        """Get set of common neurons from either data structure."""
+        key = f'common_neurons_{threshold}'
+        if key in target_data:
+            return set(target_data[key])
+        if 'per_pool' in target_data:
+            all_neurons = set()
+            pool_key = f'common_{threshold}'
+            for pool, pool_data in target_data.get('per_pool', {}).items():
+                if isinstance(pool_data, dict):
+                    all_neurons.update(pool_data.get(pool_key, []))
+            return all_neurons
+        return set()
+
+    counts_100 = [get_neuron_counts(per_target[t], 100) for t in targets]
+    counts_80 = [get_neuron_counts(per_target[t], 80) for t in targets]
+    counts_50 = [get_neuron_counts(per_target[t], 50) for t in targets]
 
     ax.barh(x - width, counts_100, width, label='100%', color='darkred')
     ax.barh(x, counts_80, width, label='80%+', color='coral')
@@ -356,9 +407,9 @@ def plot_factual_comparison(
     # Calculate overlap between targets
     overlap_matrix = np.zeros((len(targets), len(targets)))
     for i, t1 in enumerate(targets):
-        neurons_1 = set(per_target[t1].get('common_neurons_80', []))
+        neurons_1 = get_common_neurons(per_target[t1], 80)
         for j, t2 in enumerate(targets):
-            neurons_2 = set(per_target[t2].get('common_neurons_80', []))
+            neurons_2 = get_common_neurons(per_target[t2], 80)
             if neurons_1 and neurons_2:
                 overlap = len(neurons_1 & neurons_2) / len(neurons_1 | neurons_2)
                 overlap_matrix[i, j] = overlap
