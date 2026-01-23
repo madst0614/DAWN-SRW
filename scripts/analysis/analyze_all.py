@@ -69,7 +69,10 @@ Usage:
     # Multi-seed comparison (Table 1 with mean ± std)
     python scripts/analysis/analyze_all.py \
         --checkpoint dawn_main.pt \
-        --compare_checkpoint dawn_seed1.pt dawn_seed2.pt vanilla_seed1.pt vanilla_seed2.pt \
+        --compare_checkpoint dawn_seed1.pt \
+        --compare_checkpoint dawn_seed2.pt \
+        --compare_checkpoint vanilla_seed1.pt \
+        --compare_checkpoint vanilla_seed2.pt \
         --val_data val.pt \
         --output results/
         # Outputs Table 1: PPL and Accuracy with mean ± std per model type
@@ -78,8 +81,9 @@ CLI Arguments:
     Input/Output:
         --checkpoint      Single checkpoint path (for neuron analysis)
         --checkpoints     Multiple checkpoint paths (for comparison)
-        --compare_checkpoint  One or more comparison checkpoints for Table 1 (auto-detects DAWN/Vanilla)
-                              Example: --compare_checkpoint dawn1.pt dawn2.pt vanilla1.pt vanilla2.pt
+        --compare_checkpoint  Comparison checkpoint for Table 1 (can be specified multiple times)
+                              Auto-detects DAWN/Vanilla via shared_neurons attribute.
+                              Example: --compare_checkpoint dawn1.pt --compare_checkpoint vanilla1.pt
                               Produces Table 1 with mean ± std per model type
         --val_data        Validation data path (required)
         --output          Output directory (default: analysis_results)
@@ -4002,9 +4006,10 @@ Examples:
     # Input/output
     parser.add_argument('--checkpoint', type=str, help='Single checkpoint path')
     parser.add_argument('--checkpoints', type=str, nargs='+', help='Multiple checkpoint paths')
-    parser.add_argument('--compare_checkpoint', type=str, nargs='+',
-                        help='Comparison checkpoints for Table 1 (multiple DAWN/Vanilla seeds). '
-                             'Model type auto-detected via shared_neurons attribute.')
+    parser.add_argument('--compare_checkpoint', type=str, action='append', default=[],
+                        help='Comparison checkpoint for Table 1 (can be specified multiple times). '
+                             'Model type auto-detected via shared_neurons attribute. '
+                             'Example: --compare_checkpoint dawn1.pt --compare_checkpoint vanilla1.pt')
     parser.add_argument('--val_data', type=str, required=True, help='Validation data path')
     parser.add_argument('--output', type=str, default='analysis_results', help='Output directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
