@@ -186,6 +186,7 @@ class PaperFigureGenerator:
         """
         Fig 5: Semantic Clustering of Knowledge Neurons.
 
+        Uses F-Know (Factual Knowledge) pool neurons only.
         Requires: precomputed['factual']['per_target']
         """
         from .visualizers import plot_factual_heatmap

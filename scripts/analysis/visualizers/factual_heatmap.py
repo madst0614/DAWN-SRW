@@ -4,6 +4,7 @@ Factual Knowledge Heatmap Visualizations
 Visualization for factual knowledge neuron analysis.
 
 Fig 5: Semantic Clustering of Knowledge Neurons
+(Uses F-Know pool neurons only)
 """
 
 import os
