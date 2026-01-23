@@ -2380,7 +2380,8 @@ class ModelAnalyzer:
                     'n_restore_qk': model_config.get('n_restore_qk', 0),
                     'n_feature_v': model_config.get('n_feature_v', 0),
                     'n_restore_v': model_config.get('n_restore_v', 0),
-                    'n_knowledge': model_config.get('n_knowledge', 0),
+                    'n_feature_know': model_config.get('n_feature_know', 0),
+                    'n_restore_know': model_config.get('n_restore_know', 0),
                     'top_k': model_config.get('top_k', 0),
                 }
 
@@ -2923,10 +2924,13 @@ class ModelAnalyzer:
                 },
             }
 
-        # Fig 6: Training Dynamics (data comes from training section)
+        # Fig 6: Training Dynamics
+        # Note: Actual loss curves require parsing training_log.txt separately
+        # This section contains model/training config for reference
         paper_data['figures']['fig6_training_dynamics'] = {
-            'dawn': paper_data['training'].get('dawn', {}),
-            'vanilla': paper_data['training'].get('vanilla'),
+            'note': 'Loss curves parsed from training_log.txt by paper_figures.py',
+            'dawn_params_M': paper_data['models']['dawn']['parameters_M'],
+            'vanilla_params_M': paper_data['models'].get('vanilla', {}).get('parameters_M'),
         }
 
         # Fig 7: Layer Contribution
@@ -2996,12 +3000,12 @@ class ModelAnalyzer:
                     }
             paper_data['appendix']['probing'] = probing_data
 
-        # Generation Samples
-        gen = self.results.get('performance', {}).get('generation', {})
-        if gen and gen.get('samples'):
+        # Generation Samples (DAWN vs Vanilla comparison)
+        gen = self.results.get('generation', {})
+        if gen:
             paper_data['appendix']['generation'] = {
-                'samples': gen.get('samples', [])[:10],  # Top 10 samples
-                'prompts_used': gen.get('prompts_used', []),
+                'dawn': gen.get('dawn', [])[:10],  # Top 10 DAWN samples
+                'vanilla': gen.get('vanilla', [])[:10] if gen.get('vanilla') else None,
             }
 
         # Semantic Analysis
