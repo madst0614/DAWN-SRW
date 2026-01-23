@@ -1965,7 +1965,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
 
         print(f"\nCollecting token activations from {n_sentences} sentences...")
         print(f"Activation threshold: {self.activation_threshold}")
-        print(f"Layer: {self.target_layer if self.target_layer is not None else 'all (majority vote)'}")
+        print(f"Layer: {self.target_layer if self.target_layer is not None else 'all (union)'}")
         print(f"Layer divergence analysis: {'ON' if analyze_layer_divergence else 'OFF'}")
         print(f"Batch size: {batch_size} (batched processing for efficiency)")
 

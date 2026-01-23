@@ -469,7 +469,7 @@ def plot_pos_selectivity_heatmap(
     active_indices: list,
     output_path: str,
     top_n: int = 50,
-    figsize: Tuple[int, int] = (14, 12),
+    figsize: Tuple[int, int] = (10, 12),
     dpi: int = 150
 ) -> Optional[str]:
     """
@@ -512,11 +512,11 @@ def plot_pos_selectivity_heatmap(
     # Log2 scale for visualization (centered at 0 = selectivity 1)
     log_selectivity = np.log2(np.clip(selected_selectivity, 0.01, 100))
 
-    # Create figure with two subplots
-    fig, axes = plt.subplots(1, 2, figsize=figsize, width_ratios=[4, 1])
+    # Create figure with single heatmap
+    fig, ax = plt.subplots(figsize=figsize)
 
     # Main heatmap
-    im = axes[0].imshow(
+    im = ax.imshow(
         log_selectivity,
         aspect='auto',
         cmap='RdBu_r',
@@ -525,30 +525,19 @@ def plot_pos_selectivity_heatmap(
     )
 
     # Labels
-    axes[0].set_xticks(range(len(UPOS_TAGS)))
-    axes[0].set_xticklabels(UPOS_TAGS, rotation=45, ha='right', fontsize=9)
-    axes[0].set_yticks(range(0, len(selected_indices), max(1, len(selected_indices) // 20)))
-    axes[0].set_yticklabels([str(selected_indices[i]) for i in range(0, len(selected_indices), max(1, len(selected_indices) // 20))], fontsize=8)
-    axes[0].set_xlabel('POS Category', fontsize=11)
-    axes[0].set_ylabel('Neuron (sorted by selectivity range)', fontsize=11)
-    axes[0].set_title(f'Neuron POS Selectivity (Top {len(selected_indices)} neurons)', fontsize=12)
+    ax.set_xticks(range(len(UPOS_TAGS)))
+    ax.set_xticklabels(UPOS_TAGS, rotation=45, ha='right', fontsize=9)
+    ax.set_yticks(range(0, len(selected_indices), max(1, len(selected_indices) // 20)))
+    ax.set_yticklabels([str(selected_indices[i]) for i in range(0, len(selected_indices), max(1, len(selected_indices) // 20))], fontsize=8)
+    ax.set_xlabel('POS Category', fontsize=11)
+    ax.set_ylabel('Neuron (sorted by selectivity range)', fontsize=11)
+    ax.set_title(f'Neuron POS Selectivity (Top {len(selected_indices)} neurons)', fontsize=12)
 
     # Colorbar
-    cbar = fig.colorbar(im, ax=axes[0], shrink=0.8)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8)
     cbar.set_label('log₂(selectivity)\n>0: prefer, <0: avoid', fontsize=10)
     cbar.set_ticks([-2, -1, 0, 1, 2])
     cbar.set_ticklabels(['0.25x', '0.5x', '1x', '2x', '4x'])
-
-    # Mean selectivity per POS (bar chart)
-    mean_sel = selectivity_matrix[active_indices].mean(axis=0)
-    colors = ['coral' if s > 1.1 else 'steelblue' if s < 0.9 else 'gray' for s in mean_sel]
-    axes[1].barh(range(len(UPOS_TAGS)), mean_sel, color=colors)
-    axes[1].axvline(x=1.0, color='black', linestyle='--', alpha=0.5)
-    axes[1].set_yticks(range(len(UPOS_TAGS)))
-    axes[1].set_yticklabels(UPOS_TAGS, fontsize=9)
-    axes[1].set_xlabel('Mean Selectivity', fontsize=10)
-    axes[1].set_title('Population Mean', fontsize=11)
-    axes[1].set_xlim(0, max(2.0, mean_sel.max() * 1.1))
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
@@ -632,15 +621,14 @@ def plot_pos_selectivity_clustered(
 def plot_pos_selectivity_from_json(
     selectivity_data: Dict,
     output_path: str,
-    figsize: Tuple[int, int] = (14, 10),
+    figsize: Tuple[int, int] = (10, 10),
     dpi: int = 150
 ) -> Optional[str]:
     """
     Plot POS selectivity from precomputed JSON data.
 
     Paper Figure 4: POS Neuron Selectivity
-    - Left: Heatmap of top selective neurons per POS
-    - Right: Mean selectivity bar chart
+    - Heatmap of top selective neurons per POS
 
     Args:
         selectivity_data: Dict with 'top_selective_per_pos', 'mean_selectivity_by_pos'
@@ -656,7 +644,6 @@ def plot_pos_selectivity_from_json(
         return None
 
     top_selective = selectivity_data.get('top_selective_per_pos', {})
-    mean_selectivity = selectivity_data.get('mean_selectivity_by_pos', {})
 
     if not top_selective:
         print("  Warning: No selectivity data found")
@@ -670,12 +657,11 @@ def plot_pos_selectivity_from_json(
         print("  Warning: No POS tags with selectivity data")
         return None
 
-    fig, axes = plt.subplots(1, 2, figsize=figsize, width_ratios=[3, 1])
+    fig, ax = plt.subplots(figsize=figsize)
 
-    # Left: Top selective neurons per POS (grouped bar / heatmap style)
+    # Top selective neurons per POS (heatmap style)
     n_show = 5  # Top N neurons per POS
     neurons_data = []
-    labels = []
 
     for pos in pos_tags:
         neurons = top_selective[pos][:n_show]
@@ -703,38 +689,26 @@ def plot_pos_selectivity_from_json(
             neuron_labels[i][j] = n.get('neuron', str(n.get('neuron_idx', '?')))
 
     # Plot heatmap
-    im = axes[0].imshow(matrix, aspect='auto', cmap='YlOrRd', vmin=1, vmax=min(10, matrix.max()))
+    im = ax.imshow(matrix, aspect='auto', cmap='YlOrRd', vmin=1, vmax=min(10, matrix.max()))
 
     # Add neuron labels
     for i in range(n_pos):
         for j in range(n_show):
             if matrix[i, j] > 0:
                 text_color = 'white' if matrix[i, j] > 5 else 'black'
-                axes[0].text(j, i, f'{neuron_labels[i][j]}\n{matrix[i, j]:.1f}x',
-                           ha='center', va='center', fontsize=7, color=text_color)
+                ax.text(j, i, f'{neuron_labels[i][j]}\n{matrix[i, j]:.1f}x',
+                        ha='center', va='center', fontsize=7, color=text_color)
 
-    axes[0].set_xticks(range(n_show))
-    axes[0].set_xticklabels([f'Top {i+1}' for i in range(n_show)])
-    axes[0].set_yticks(range(n_pos))
-    axes[0].set_yticklabels(pos_tags)
-    axes[0].set_xlabel('Rank', fontsize=11)
-    axes[0].set_ylabel('POS Category', fontsize=11)
-    axes[0].set_title('Most Selective Neurons per POS', fontsize=12)
+    ax.set_xticks(range(n_show))
+    ax.set_xticklabels([f'Top {i+1}' for i in range(n_show)])
+    ax.set_yticks(range(n_pos))
+    ax.set_yticklabels(pos_tags)
+    ax.set_xlabel('Rank', fontsize=11)
+    ax.set_ylabel('POS Category', fontsize=11)
+    ax.set_title('Most Selective Neurons per POS', fontsize=12)
 
-    cbar = fig.colorbar(im, ax=axes[0], shrink=0.8)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8)
     cbar.set_label('Selectivity (×baseline)', fontsize=10)
-
-    # Right: Mean selectivity bar chart
-    mean_values = [mean_selectivity.get(pos, 1.0) for pos in pos_tags]
-    colors = ['coral' if v > 1.2 else 'steelblue' if v < 0.8 else 'gray' for v in mean_values]
-
-    axes[1].barh(range(n_pos), mean_values, color=colors)
-    axes[1].axvline(x=1.0, color='black', linestyle='--', alpha=0.5, label='baseline')
-    axes[1].set_yticks(range(n_pos))
-    axes[1].set_yticklabels(pos_tags)
-    axes[1].set_xlabel('Mean Selectivity', fontsize=10)
-    axes[1].set_title('Population Mean', fontsize=11)
-    axes[1].set_xlim(0, max(2.0, max(mean_values) * 1.1) if mean_values else 2.0)
 
     # Add summary
     n_active = selectivity_data.get('n_active_neurons', 0)
