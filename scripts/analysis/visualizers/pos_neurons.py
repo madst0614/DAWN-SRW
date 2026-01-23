@@ -495,86 +495,105 @@ def plot_pos_selectivity_heatmap(
     active_indices: list,
     output_path: str,
     pool_order: list = None,
-    top_n: int = 50,
-    figsize: Tuple[int, int] = (8, 12),
+    top_n_per_pos: int = 5,
+    figsize: Tuple[int, int] = (10, 10),
     dpi: int = 150
 ) -> Optional[str]:
     """
     Plot POS selectivity heatmap for Fig 4.
 
-    Selectivity score: P(neuron active | POS) / P(neuron active)
-    - > 1 (red): neuron prefers this POS
-    - = 1 (white): neuron is indifferent
-    - < 1 (blue): neuron avoids this POS
+    Shows top N most selective neurons for each POS category.
+    Each cell displays neuron name and selectivity value.
 
     Args:
         selectivity_matrix: [n_neurons, n_pos] selectivity scores
         active_indices: List of active neuron indices
         output_path: Path to save the figure
-        pool_order: List of (pool_key, pool_size) for neuron labeling, e.g. [('fv', 128), ('fqk', 64)]
-        top_n: Number of top neurons to show
+        pool_order: List of (pool_key, pool_size) for neuron labeling
+        top_n_per_pos: Number of top neurons to show per POS
         figsize: Figure size
         dpi: Output resolution
 
     Returns:
         Path to saved figure or None
     """
-    if not HAS_MATPLOTLIB or not HAS_SEABORN:
-        print("  Warning: matplotlib/seaborn not available, skipping selectivity heatmap")
+    if not HAS_MATPLOTLIB:
+        print("  Warning: matplotlib not available, skipping selectivity heatmap")
         return None
 
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
-    # Get top neurons by selectivity range (most variable = most interesting)
     if len(active_indices) == 0:
         print("  Warning: No active neurons for selectivity heatmap")
         return None
 
-    # Select subset of neurons
-    active_selectivity = selectivity_matrix[active_indices]
-    selectivity_range = active_selectivity.max(axis=1) - active_selectivity.min(axis=1)
-    top_idx = np.argsort(-selectivity_range)[:top_n]
-    selected_indices = [active_indices[i] for i in top_idx]
-    selected_selectivity = selectivity_matrix[selected_indices]
-
-    # Log2 scale for visualization (centered at 0 = selectivity 1)
-    log_selectivity = np.log2(np.clip(selected_selectivity, 0.01, 100))
-
-    # Create figure with single heatmap
-    fig, ax = plt.subplots(figsize=figsize)
-
-    # Main heatmap
-    im = ax.imshow(
-        log_selectivity,
-        aspect='auto',
-        cmap='RdBu_r',
-        vmin=-2, vmax=2,
-        interpolation='nearest'
-    )
-
-    # Convert neuron indices to pool labels
+    # Helper to convert neuron index to label
     def get_label(idx):
         if pool_order:
             return _neuron_idx_to_pool_label(idx, pool_order)
         return str(idx)
 
+    # Get selectivity for active neurons only
+    active_selectivity = selectivity_matrix[active_indices]  # [n_active, n_pos]
+
+    # Find top N neurons for each POS
+    pos_tags = [p for p in UPOS_TAGS if any(active_selectivity[:, UPOS_TAGS.index(p)] > 0)]
+    if not pos_tags:
+        pos_tags = UPOS_TAGS
+
+    n_pos = len(pos_tags)
+    n_show = top_n_per_pos
+
+    # Build matrix and labels
+    matrix = np.zeros((n_pos, n_show))
+    neuron_labels = [['' for _ in range(n_show)] for _ in range(n_pos)]
+
+    for i, pos in enumerate(pos_tags):
+        pos_idx = UPOS_TAGS.index(pos)
+        pos_selectivity = active_selectivity[:, pos_idx]
+
+        # Get top N neurons for this POS
+        top_idx = np.argsort(-pos_selectivity)[:n_show]
+
+        for j, idx in enumerate(top_idx):
+            sel_value = pos_selectivity[idx]
+            neuron_idx = active_indices[idx]
+            matrix[i, j] = sel_value
+            neuron_labels[i][j] = get_label(neuron_idx)
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Plot heatmap
+    vmax = min(10, matrix.max()) if matrix.max() > 0 else 10
+    im = ax.imshow(matrix, aspect='auto', cmap='YlOrRd', vmin=1, vmax=vmax)
+
+    # Add neuron labels in each cell
+    for i in range(n_pos):
+        for j in range(n_show):
+            if matrix[i, j] > 0:
+                text_color = 'white' if matrix[i, j] > 5 else 'black'
+                ax.text(j, i, f'{neuron_labels[i][j]}\n{matrix[i, j]:.1f}x',
+                        ha='center', va='center', fontsize=7, color=text_color)
+
     # Labels
-    ax.set_xticks(range(len(UPOS_TAGS)))
-    ax.set_xticklabels(UPOS_TAGS, rotation=45, ha='right', fontsize=9)
-    tick_step = max(1, len(selected_indices) // 20)
-    ax.set_yticks(range(0, len(selected_indices), tick_step))
-    ax.set_yticklabels([get_label(selected_indices[i]) for i in range(0, len(selected_indices), tick_step)], fontsize=7)
-    ax.set_xlabel('POS Category', fontsize=11)
-    ax.set_ylabel('Neuron (sorted by selectivity range)', fontsize=11)
-    ax.set_title(f'Neuron POS Selectivity (Top {len(selected_indices)} neurons)', fontsize=12)
+    ax.set_xticks(range(n_show))
+    ax.set_xticklabels([f'Top {i+1}' for i in range(n_show)])
+    ax.set_yticks(range(n_pos))
+    ax.set_yticklabels(pos_tags)
+    ax.set_xlabel('Rank', fontsize=11)
+    ax.set_ylabel('POS Category', fontsize=11)
+    ax.set_title('Most Selective Neurons per POS', fontsize=12)
 
     # Colorbar
     cbar = fig.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label('log₂(selectivity)\n>0: prefer, <0: avoid', fontsize=10)
-    cbar.set_ticks([-2, -1, 0, 1, 2])
-    cbar.set_ticklabels(['0.25x', '0.5x', '1x', '2x', '4x'])
+    cbar.set_label('Selectivity (×baseline)', fontsize=10)
+
+    # Summary
+    fig.text(0.5, 0.02, f'Active neurons analyzed: {len(active_indices)}', ha='center', fontsize=10)
 
     plt.tight_layout()
+    plt.subplots_adjust(bottom=0.08)
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close()
 
