@@ -110,6 +110,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 
+from scripts.analysis.performance import (
+    TextGenerator,
+    SpeedBenchmark,
+    ModelComparator,
+    save_generation_results,
+    print_generation_summary,
+)
+
 try:
     from tqdm import tqdm
     HAS_TQDM = True
@@ -243,33 +251,24 @@ class ModelAnalyzer:
             self._comparison_model = None
             torch.cuda.empty_cache()
 
+    def _get_text_generator(self) -> TextGenerator:
+        """Get or create TextGenerator instance."""
+        if not hasattr(self, '_text_generator') or self._text_generator is None:
+            self._text_generator = TextGenerator(self.tokenizer, self.device)
+        return self._text_generator
+
+    def _get_speed_benchmark(self) -> SpeedBenchmark:
+        """Get or create SpeedBenchmark instance."""
+        if not hasattr(self, '_speed_benchmark') or self._speed_benchmark is None:
+            self._speed_benchmark = SpeedBenchmark(self.device)
+        return self._speed_benchmark
+
     def _generate_text_simple(self, model, prompt: str, max_new_tokens: int = 50,
                               temperature: float = 0.8, top_k: int = 50) -> str:
         """Generate text from a prompt (simple, no streaming). Returns full generated text."""
-        import torch.nn.functional as F
-
-        input_ids = self.tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt').to(self.device)
-        generated = input_ids.clone()
-        eos_token_id = self.tokenizer.sep_token_id
-
-        with torch.no_grad():
-            for _ in range(max_new_tokens):
-                output = model(generated, attention_mask=None)
-                logits = output[0] if isinstance(output, tuple) else output
-                next_token_logits = logits[:, -1, :] / temperature
-
-                if top_k > 0:
-                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                    next_token_logits[indices_to_remove] = float('-inf')
-
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-                generated = torch.cat([generated, next_token], dim=1)
-
-                if next_token.item() == eos_token_id:
-                    break
-
-        return self.tokenizer.decode(generated[0], skip_special_tokens=True)
+        return self._get_text_generator().generate_simple(
+            model, prompt, max_new_tokens, temperature, top_k
+        )
 
     def analyze_model_info(self) -> Dict:
         """Analyze model parameters, architecture."""
@@ -460,143 +459,19 @@ class ModelAnalyzer:
 
     def _benchmark_speed(self, warmup: int = 10, iterations: int = 50) -> Dict:
         """Benchmark inference speed."""
-        import time
-
-        self.model.eval()
-        seq_len = 512
-        batch_size = 1
-
-        # Create dummy input
-        dummy_input = torch.randint(0, 1000, (batch_size, seq_len), device=self.device)
-
-        # Warmup
-        with torch.no_grad():
-            for _ in range(warmup):
-                _ = self.model(dummy_input)
-
-        # Benchmark
-        if self.device == 'cuda':
-            torch.cuda.synchronize()
-
-        start = time.perf_counter()
-        with torch.no_grad():
-            for _ in range(iterations):
-                _ = self.model(dummy_input)
-
-        if self.device == 'cuda':
-            torch.cuda.synchronize()
-
-        elapsed = time.perf_counter() - start
-        avg_time = elapsed / iterations
-        tokens_per_sec = (batch_size * seq_len) / avg_time
-
-        return {
-            'avg_time_ms': avg_time * 1000,
-            'tokens_per_sec': tokens_per_sec,
-            'iterations': iterations,
-            'batch_size': batch_size,
-            'seq_len': seq_len,
-        }
+        return self._get_speed_benchmark().benchmark(
+            self.model, warmup=warmup, iterations=iterations
+        )
 
     def _generate_samples(self, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 50,
                           model=None, model_name: str = "model") -> List[Dict]:
         """Generate text samples with top-k sampling and streaming output."""
-        import time
-        import torch.nn.functional as F
-
         if model is None:
             model = self.model
-
-        # Comprehensive prompt categories
-        prompt_categories = {
-            'factual': [
-                "The capital of France is",
-                "The largest ocean on Earth is",
-                "Einstein developed the theory of",
-            ],
-            'common_sense': [
-                "If you drop a glass, it will",
-                "Fire is hot, ice is",
-                "At night, the sky is",
-            ],
-            'narrative': [
-                "Once upon a time, there was a",
-                "She walked into the room and",
-            ],
-            'technical': [
-                "def fibonacci(n):",
-                "The mitochondria is the",
-            ],
-            'conversational': [
-                "I think the best way to",
-                "In my opinion,",
-            ],
-        }
-
-        results = []
-        model.eval()
-        eos_token_id = self.tokenizer.sep_token_id
-
-        for category, prompts in prompt_categories.items():
-            for prompt in prompts:
-                start_time = time.perf_counter()
-
-                # Encode without special tokens for cleaner generation
-                input_ids = self.tokenizer.encode(
-                    prompt, add_special_tokens=False, return_tensors='pt'
-                ).to(self.device)
-                generated = input_ids.clone()
-                prompt_len = input_ids.shape[1]
-
-                # Print prompt with streaming indicator
-                print(f"  [{model_name}|{category}] {prompt}", end="", flush=True)
-
-                # Track full decoded text for proper spacing (BERT tokenizer needs full context)
-                prev_full_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-
-                with torch.no_grad():
-                    for _ in range(max_new_tokens):
-                        output = model(generated, attention_mask=None)
-                        logits = output[0] if isinstance(output, tuple) else output
-                        next_token_logits = logits[:, -1, :] / temperature
-
-                        # Top-k filtering
-                        if top_k > 0:
-                            indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                            next_token_logits[indices_to_remove] = float('-inf')
-
-                        probs = F.softmax(next_token_logits, dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1)
-                        generated = torch.cat([generated, next_token], dim=1)
-
-                        # Decode FULL sequence to preserve spacing (tokenizer needs full context)
-                        curr_full_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-                        new_part = curr_full_text[len(prev_full_text):]
-                        if new_part:
-                            print(new_part, end="", flush=True)
-                        prev_full_text = curr_full_text
-
-                        # Stop if EOS token generated
-                        if next_token.item() == eos_token_id:
-                            break
-
-                elapsed = time.perf_counter() - start_time
-                generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-                new_tokens = generated.shape[1] - prompt_len
-
-                # End line with stats
-                print(f"  ({new_tokens} tok, {elapsed*1000:.0f}ms)", flush=True)
-
-                results.append({
-                    'category': category,
-                    'prompt': prompt,
-                    'generated': generated_text,
-                    'new_tokens': new_tokens,
-                    'time_ms': elapsed * 1000,
-                    'tokens_per_sec': new_tokens / elapsed if elapsed > 0 else 0,
-                })
-
-        return results
+        return self._get_text_generator().generate_samples(
+            model, model_name=model_name,
+            max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k
+        )
 
     def analyze_health(self) -> Dict:
         """Analyze neuron health (DAWN only)."""
