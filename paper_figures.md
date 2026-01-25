@@ -475,6 +475,19 @@ def get_neuron_category(neuron):
 - 0.3: 30% 미만 = 해당 카테고리에 무관한 뉴런으로 판정
 - Sequential filtering으로 명확한 separation 보장
 
+**왜 100%가 아닌 70-80% threshold인가?**
+
+100% consistency가 나오지 않는 이유:
+1. **문맥 의존성**: "Paris"가 수도, 사람 이름, 신화 인물 등 다양한 의미 가능
+2. **라우팅 변동성**: top-k 선택 시 비슷한 weight의 뉴런 간 경쟁
+3. **Generation sampling**: temperature로 인한 자연스러운 변동
+
+따라서 70-80% threshold는:
+- 100%: 너무 strict → 거의 모든 뉴런 제외
+- 70-80%: "대부분의 run에서 일관되게 활성화" = 신뢰할 수 있는 패턴
+
+> "Neurons activating in ≥70% of runs are considered consistently associated with the target, accounting for natural variation in routing decisions."
+
 #### 출력
 - Heatmap: Target × Neuron (activation frequency %)
 - Common neurons shared across semantic category (e.g., capitals)
