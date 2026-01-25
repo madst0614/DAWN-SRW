@@ -431,6 +431,50 @@ High positive score → neuron is target-specific (활성이 target에 집중)
 - `self.results['factual']`
 - Example prompts: "The capital of France is" → "Paris"
 
+#### Heatmap Category Classification
+
+**파일**: `visualizers/factual_heatmap.py` - `get_neuron_category()` [line 161-187]
+
+**분류 로직 (Sequential Filtering)**:
+
+뉴런을 순차적으로 필터링하여 카테고리 분류:
+
+```python
+def get_neuron_category(neuron):
+    capital_freqs = [all_neurons[t].get(neuron, 0) for t in capital_targets]
+    other_freqs = [all_neurons[t].get(neuron, 0) for t in other_targets]
+    all_freqs = capital_freqs + other_freqs
+
+    # Step 1: Shared - 모든 타겟에서 0.7+
+    if all_freqs and all(f >= 0.7 for f in all_freqs):
+        return 0  # Shared
+
+    # Step 2: Capital-specific - 모든 capital 0.7+ AND 모든 other < 0.3
+    if (all(f >= 0.7 for f in capital_freqs) and
+        all(f < 0.3 for f in other_freqs)):
+        return 1  # Capital-specific
+
+    # Step 3: Other-specific - 해당 other 0.7+ AND 모든 capital < 0.3
+    if (any(f >= 0.7 for f in other_freqs) and
+        all(f < 0.3 for f in capital_freqs)):
+        return 2  # Other-specific
+
+    return 3  # Mixed (excluded from figure)
+```
+
+**카테고리 정의**:
+| Category | Condition | 의미 |
+|----------|-----------|------|
+| Shared (0) | ALL targets >= 0.7 | 모든 factual query에서 공통 활성화 |
+| Capital-specific (1) | ALL capitals >= 0.7 AND ALL others < 0.3 | 수도 관련 query에서만 활성화 |
+| Other-specific (2) | ANY other >= 0.7 AND ALL capitals < 0.3 | 특정 비수도 query에서만 활성화 |
+| Mixed (3) | 위 조건 모두 불충족 | Figure에서 제외 |
+
+**Threshold 근거**:
+- 0.7: 70% 이상 run에서 활성화 = 신뢰할 수 있는 consistent activation
+- 0.3: 30% 미만 = 해당 카테고리에 무관한 뉴런으로 판정
+- Sequential filtering으로 명확한 separation 보장
+
 #### 출력
 - Heatmap: Target × Neuron (activation frequency %)
 - Common neurons shared across semantic category (e.g., capitals)
