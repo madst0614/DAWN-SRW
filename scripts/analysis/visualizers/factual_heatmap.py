@@ -159,32 +159,28 @@ def plot_factual_heatmap(
         return None
 
     def get_neuron_category(neuron):
-        """Classify neuron by selectivity pattern across targets."""
+        """Classify neuron by selectivity pattern - sequential filtering."""
         capital_freqs = [all_neurons[t].get(neuron, 0) for t in capital_targets]
         other_freqs = [all_neurons[t].get(neuron, 0) for t in other_targets] if other_targets else []
+        all_freqs = capital_freqs + other_freqs
 
-        capital_avg = np.mean(capital_freqs) if capital_freqs else 0
-        other_avg = np.mean(other_freqs) if other_freqs else 0
+        # Step 1: Shared - 모든 타겟에서 0.7+
+        if all_freqs and all(f >= 0.7 for f in all_freqs):
+            return 0  # Shared
 
-        # Use percentile-based thresholds relative to the data
-        # A neuron with avg freq > 0.3 for a group is considered "active" for that group
-        capital_active = capital_avg > 0.3
-        other_active = other_avg > 0.3 if other_freqs else False
+        # Step 2: Capital-specific - 모든 capital 0.7+ AND 모든 other < 0.3
+        if capital_freqs and other_freqs:
+            if (all(f >= 0.7 for f in capital_freqs) and
+                all(f < 0.3 for f in other_freqs)):
+                return 1  # Capital-specific
 
-        # Category 0: Shared - active in both capital and other categories
-        if capital_active and other_active:
-            return 0
+        # Step 3: Other-specific - 해당 other 0.7+ AND 모든 capital < 0.3
+        if other_freqs and capital_freqs:
+            if (any(f >= 0.7 for f in other_freqs) and
+                all(f < 0.3 for f in capital_freqs)):
+                return 2  # Other-specific
 
-        # Category 1: Capital-specific - active only in capitals
-        if capital_active and not other_active:
-            return 1
-
-        # Category 2: Other-specific - active only in others
-        if other_active and not capital_active:
-            return 2
-
-        # Category 3: Low/Mixed activity
-        return 3
+        return 3  # Mixed (exclude from plot)
 
     def get_selectivity_score(neuron):
         """Compute selectivity: how much a neuron prefers one target over others."""
