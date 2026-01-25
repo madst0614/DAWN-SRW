@@ -3,7 +3,7 @@ POS Neuron Visualizations
 =========================
 Visualization functions for POS-based neuron analysis.
 
-Paper Figure 4: POS Neuron Specialization
+Fig 4: POS Selectivity Across Neuron Pools
 - Specificity bar chart
 - POS-specific neuron counts
 """
@@ -305,7 +305,7 @@ def plot_pos_specificity(
     """
     Plot neuron specificity - neurons specialized for specific POS.
 
-    Paper Figure 4: POS Neuron Specialization
+    Fig 4: POS Selectivity Across Neuron Pools
     - Left: Top neurons by specificity score (horizontal bar)
     - Right: Specialized neurons per POS category (horizontal bar)
 
@@ -381,7 +381,7 @@ def plot_pos_specialization_from_features(
     """
     Plot POS neuron specialization from NeuronFeatureAnalyzer results.
 
-    Paper Figure 4: POS Neuron Specialization
+    Fig 4: POS Selectivity Across Neuron Pools
     - Left: Top specialized neurons by POS concentration %
     - Right: Number of specialized neurons per POS category
 
@@ -583,7 +583,7 @@ def plot_pos_selectivity_heatmap(
     ax.set_yticklabels(pos_tags)
     ax.set_xlabel('Rank', fontsize=11)
     ax.set_ylabel('POS Category', fontsize=11)
-    ax.set_title('Most Selective Neurons per POS', fontsize=12)
+    ax.set_title('Fig 4: POS Selectivity Across Neuron Pools', fontsize=12)
 
     # Colorbar
     cbar = fig.colorbar(im, ax=ax, shrink=0.8)
@@ -681,7 +681,7 @@ def plot_pos_selectivity_from_json(
     """
     Plot POS selectivity from precomputed JSON data.
 
-    Paper Figure 4: POS Neuron Selectivity
+    Fig 4: POS Selectivity Across Neuron Pools
     - Heatmap of top selective neurons per POS
 
     Args:
@@ -759,7 +759,7 @@ def plot_pos_selectivity_from_json(
     ax.set_yticklabels(pos_tags)
     ax.set_xlabel('Rank', fontsize=11)
     ax.set_ylabel('POS Category', fontsize=11)
-    ax.set_title('Most Selective Neurons per POS', fontsize=12)
+    ax.set_title('Fig 4: POS Selectivity Across Neuron Pools', fontsize=12)
 
     cbar = fig.colorbar(im, ax=ax, shrink=0.8)
     cbar.set_label('Selectivity (×baseline)', fontsize=10)

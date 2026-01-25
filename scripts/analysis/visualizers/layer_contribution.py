@@ -2,8 +2,9 @@
 Layer Contribution Visualizer
 =============================
 
-Paper-quality visualization for DAWN layer-wise circuit contribution.
+Fig 7: Attention-Knowledge Balance Across Layers
 
+Paper-quality visualization for DAWN layer-wise circuit contribution.
 Creates a single-panel figure showing attention vs knowledge contribution per layer.
 """
 
@@ -136,7 +137,7 @@ def plot_routing_stats(
     ax.set_xticks(layers)
     ax.set_xlabel('Layer', fontsize=10)
     ax.set_ylabel('Attention Contribution (%)', fontsize=10)
-    ax.set_title('Layer-wise Circuit Contribution', fontsize=11, fontweight='bold', pad=10)
+    ax.set_title('Fig 7: Attention-Knowledge Balance Across Layers', fontsize=11, fontweight='bold', pad=10)
     ax.yaxis.grid(True, linestyle='--', alpha=0.3)
     ax.set_axisbelow(True)
 
