@@ -173,6 +173,7 @@ class ModelAnalyzer:
         factual_tokens: int = 30,
         target_layer: int = None,
         compare_checkpoint: List[str] = None,
+        vanilla_checkpoint: str = None,
     ):
         self.checkpoint_path = checkpoint_path
         self.val_data_path = val_data_path
@@ -202,6 +203,7 @@ class ModelAnalyzer:
         self.gen_tokens = gen_tokens
         self.factual_tokens = factual_tokens
         self.target_layer = target_layer
+        self.vanilla_checkpoint = vanilla_checkpoint
 
         self.model = None
         self.tokenizer = None
@@ -1841,10 +1843,14 @@ class ModelAnalyzer:
                 }
 
                 # Add checkpoint paths for figure 6 (training dynamics comparison)
+                # Uses main checkpoint (DAWN) and vanilla_checkpoint
                 checkpoint_paths = [self.checkpoint_path]
-                if self.compare_checkpoint:
-                    checkpoint_paths.append(self.compare_checkpoint)
+                checkpoint_labels = ['DAWN']
+                if self.vanilla_checkpoint:
+                    checkpoint_paths.append(self.vanilla_checkpoint)
+                    checkpoint_labels.append('Vanilla')
                 config['checkpoint_paths'] = checkpoint_paths
+                config['checkpoint_labels'] = checkpoint_labels
 
                 # Generate requested figures (or all if none specified)
                 gen.generate(figures_to_generate, str(figures_dir), n_batches=self.min_targets // 10,
@@ -4023,6 +4029,9 @@ Examples:
                         help='Comparison checkpoint for Table 1 (can be specified multiple times). '
                              'Model type auto-detected via shared_neurons attribute. '
                              'Example: --compare_checkpoint dawn1.pt --compare_checkpoint vanilla1.pt')
+    parser.add_argument('--vanilla_checkpoint', type=str, default=None,
+                        help='Vanilla checkpoint for Fig 6 training curve comparison. '
+                             'Training log will be auto-detected from checkpoint path.')
     parser.add_argument('--val_data', type=str, required=True, help='Validation data path')
     parser.add_argument('--output', type=str, default='analysis_results', help='Output directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
@@ -4097,6 +4106,7 @@ Examples:
             factual_tokens=args.factual_tokens,
             target_layer=args.target_layer,
             compare_checkpoint=args.compare_checkpoint,
+            vanilla_checkpoint=args.vanilla_checkpoint,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
     else:
