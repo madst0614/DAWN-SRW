@@ -352,8 +352,8 @@ class ModelAnalyzer:
                 params_M = total_params / 1e6
 
                 # Estimate FLOPs
-                flops_result = estimate_flops(model)
-                flops_G = flops_result.get('total_gflops', 0)
+                flops = estimate_flops(model)
+                flops_G = flops / 1e9
 
                 # Run evaluation
                 val_results = evaluate_model(
