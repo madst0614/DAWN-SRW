@@ -302,9 +302,7 @@ def plot_factual_heatmap(
                    transform=ax.transAxes)
         prev_boundary = b
 
-    # Title - above category labels
-    ax.set_title('Fig 5: Semantic Coherence of Knowledge Neurons',
-                fontsize=11, fontweight='bold', pad=20, y=1.06)
+    # No title - figure number added in paper
 
     ax.set_xlabel('Neuron Index')
     ax.set_ylabel('Target Token')
