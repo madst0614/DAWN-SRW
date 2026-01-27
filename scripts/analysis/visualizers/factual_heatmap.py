@@ -3,7 +3,7 @@ Factual Knowledge Heatmap Visualizations
 ========================================
 Visualization for factual knowledge neuron analysis.
 
-Fig 5: Semantic Clustering of Knowledge Neurons
+Fig 5: Semantic Coherence of Knowledge Neurons
 (Uses F-Know pool neurons only)
 """
 
@@ -27,6 +27,9 @@ try:
 except ImportError:
     HAS_SEABORN = False
     sns = None
+
+from .style import PAPER_STYLE
+S = PAPER_STYLE
 
 
 def plot_factual_heatmap(
@@ -102,19 +105,23 @@ def plot_factual_heatmap(
                         all_common.add(idx)
                     else:
                         all_common.add(str(n))
-                # Get top_neurons for frequencies
-                for nf in fknow_data.get('top_neurons', []):
-                    if isinstance(nf, dict):
-                        neuron = nf.get('neuron', '')
-                        # Remove pool prefix
-                        if '_' in str(neuron):
-                            neuron = str(neuron).split('_')[-1]
-                        freq = nf.get('freq', 0) / 100.0
-                        all_neurons[target][neuron] = max(all_neurons[target][neuron], freq)
+
+                # Use all_frequencies for complete freq data
+                all_freqs = fknow_data.get('all_frequencies', {})
+                for neuron, freq in all_freqs.items():
+                    # Remove pool prefix if present
+                    if '_' in str(neuron):
+                        neuron = str(neuron).split('_')[-1]
+                    all_neurons[target][neuron] = freq
+
+                # Load contrastive scores (target_freq - baseline_freq)
+                contrastive = fknow_data.get('contrastive_scores', {})
+                for neuron, score in contrastive.items():
+                    if '_' in str(neuron):
+                        neuron = str(neuron).split('_')[-1]
+                    all_contrastive[target][neuron] = score
+
             common_neurons_per_target[target] = all_common
-            # For new structure, use presence in common_80 as a proxy for high frequency
-            for neuron in all_common:
-                all_neurons[target][neuron] = max(all_neurons[target].get(neuron, 0), 0.8)
 
     if not all_neurons:
         return None
@@ -159,32 +166,28 @@ def plot_factual_heatmap(
         return None
 
     def get_neuron_category(neuron):
-        """Classify neuron by selectivity pattern across targets."""
+        """Classify neuron by selectivity pattern - sequential filtering."""
         capital_freqs = [all_neurons[t].get(neuron, 0) for t in capital_targets]
         other_freqs = [all_neurons[t].get(neuron, 0) for t in other_targets] if other_targets else []
+        all_freqs = capital_freqs + other_freqs
 
-        capital_avg = np.mean(capital_freqs) if capital_freqs else 0
-        other_avg = np.mean(other_freqs) if other_freqs else 0
+        # Step 1: Shared - 모든 타겟에서 0.7+
+        if all_freqs and all(f >= 0.7 for f in all_freqs):
+            return 0  # Shared
 
-        # Use percentile-based thresholds relative to the data
-        # A neuron with avg freq > 0.3 for a group is considered "active" for that group
-        capital_active = capital_avg > 0.3
-        other_active = other_avg > 0.3 if other_freqs else False
+        # Step 2: Capital-specific - 모든 capital 0.7+ AND 모든 other < 0.3
+        if capital_freqs and other_freqs:
+            if (all(f >= 0.7 for f in capital_freqs) and
+                all(f < 0.3 for f in other_freqs)):
+                return 1  # Capital-specific
 
-        # Category 0: Shared - active in both capital and other categories
-        if capital_active and other_active:
-            return 0
+        # Step 3: Other-specific - 해당 other 0.7+ AND 모든 capital < 0.3
+        if other_freqs and capital_freqs:
+            if (any(f >= 0.7 for f in other_freqs) and
+                all(f < 0.3 for f in capital_freqs)):
+                return 2  # Other-specific
 
-        # Category 1: Capital-specific - active only in capitals
-        if capital_active and not other_active:
-            return 1
-
-        # Category 2: Other-specific - active only in others
-        if other_active and not capital_active:
-            return 2
-
-        # Category 3: Low/Mixed activity
-        return 3
+        return 3  # Mixed (exclude from plot)
 
     def get_selectivity_score(neuron):
         """Compute selectivity: how much a neuron prefers one target over others."""
@@ -217,16 +220,18 @@ def plot_factual_heatmap(
     # Select neurons: prioritize categories with interesting patterns
     # Category 0 (Shared) shows common knowledge, then specific categories
     # Exclude Mixed category (3)
-    neurons_per_cat = max(3, top_n_neurons // 3)
+    # 각 카테고리별 최대 5개, mean_freq 기준으로 정렬
+    max_per_category = 5
     sorted_neurons = []
     category_order = [0, 1, 2]  # Shared, Capital-specific, Other-specific (no Mixed)
 
     for cat in category_order:
-        neurons_in_cat = [n for n, _ in categorized[cat][:neurons_per_cat]]
-        sorted_neurons.extend(neurons_in_cat)
-
-    # Trim to top_n_neurons
-    sorted_neurons = sorted_neurons[:top_n_neurons]
+        # Sort by mean_freq instead of composite score
+        neurons_in_cat = sorted(
+            categorized[cat],
+            key=lambda x: -np.mean([all_neurons[t].get(x[0], 0) for t in targets])
+        )[:max_per_category]
+        sorted_neurons.extend([n for n, _ in neurons_in_cat])
 
     if not sorted_neurons:
         # Fallback: just take top neurons by total activity
@@ -273,6 +278,7 @@ def plot_factual_heatmap(
         cmap='YlOrRd',
         vmin=0, vmax=1,
         annot=annot_labels, fmt='',
+        annot_kws={'fontsize': S['font_size_annotation']},
         ax=ax,
         cbar_kws={'label': 'Activation Frequency', 'shrink': 0.8, 'pad': 0.02},
         linewidths=0.5
@@ -296,13 +302,11 @@ def plot_factual_heatmap(
             cat_idx = categories[prev_boundary] if prev_boundary < len(categories) else 3
             label = category_names.get(cat_idx, 'Mixed')
             ax.text(mid, 1.02, label, ha='center', va='bottom',
-                   fontsize=9, fontweight='bold', color='darkblue',
+                   fontsize=S['font_size_category'], fontweight='bold', color='darkblue',
                    transform=ax.transAxes)
         prev_boundary = b
 
-    # Title - above category labels
-    ax.set_title('Fig 5: Semantic Clustering of Knowledge Neurons',
-                fontsize=11, fontweight='bold', pad=20, y=1.06)
+    # No title - figure number added in paper
 
     ax.set_xlabel('Neuron Index')
     ax.set_ylabel('Target Token')
@@ -363,7 +367,7 @@ def plot_factual_comparison(
     ax.invert_yaxis()
 
     for i, (bar, rate) in enumerate(zip(bars, match_rates)):
-        ax.text(rate + 2, i, f'{rate:.0f}%', va='center', fontsize=9)
+        ax.text(rate + 2, i, f'{rate:.0f}%', va='center', fontsize=S['font_size_annotation'])
 
     # 2. Neuron count comparison (100%, 80%, 50%)
     ax = axes[1]

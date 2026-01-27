@@ -249,17 +249,17 @@ class ModelAnalyzer:
         return self._dataloader
 
     def _load_comparison_model(self):
-        """Load comparison model (cached). Returns (model, name) or (None, None)."""
+        """Load comparison model (cached). Returns (model, name, config) or (None, None, None)."""
         if not self.compare_checkpoint:
-            return None, None
+            return None, None, None
 
         # Use cached model if available
         if hasattr(self, '_comparison_model') and self._comparison_model is not None:
-            return self._comparison_model, self._comparison_model_name
+            return self._comparison_model, self._comparison_model_name, getattr(self, '_comparison_config', {})
 
         try:
             from scripts.analysis.utils import load_model
-            baseline_model, _, _ = load_model(self.compare_checkpoint, self.device)
+            baseline_model, _, config = load_model(self.compare_checkpoint, self.device)
             baseline_model.eval()
 
             baseline_path = Path(self.compare_checkpoint)
@@ -268,11 +268,12 @@ class ModelAnalyzer:
             # Cache for reuse
             self._comparison_model = baseline_model
             self._comparison_model_name = baseline_name
+            self._comparison_config = config
 
-            return baseline_model, baseline_name
+            return baseline_model, baseline_name, config
         except Exception as e:
             print(f"    Error loading comparison model: {e}")
-            return None, None
+            return None, None, None
 
     def _cleanup_comparison_model(self):
         """Cleanup comparison model from memory."""
@@ -332,11 +333,38 @@ class ModelAnalyzer:
         dawn_results = []
         vanilla_results = []
 
+        # Reuse main DAWN performance results if already computed
+        perf = self.results.get('performance', {})
+        cached_dawn_val = perf.get('validation', {})
+
         for source, checkpoint_path in all_checkpoints:
             cp_path = Path(checkpoint_path)
             cp_name = cp_path.name if cp_path.is_dir() else cp_path.stem
 
             try:
+                # Reuse main checkpoint results (already evaluated in analyze_performance)
+                if source == 'main' and cached_dawn_val.get('perplexity'):
+                    print(f"    [DAWN] {cp_name}... (cached)", end=' ')
+                    total_params = sum(p.numel() for p in self.model.parameters())
+                    flops = estimate_flops(self.model, config=self.config, seq_len=512)
+                    result = {
+                        'name': cp_name,
+                        'path': str(checkpoint_path),
+                        'source': source,
+                        'params_M': total_params / 1e6,
+                        'flops_G': flops / 1e9,
+                        'perplexity': cached_dawn_val['perplexity'],
+                        'accuracy': cached_dawn_val.get('accuracy', 0),
+                        'loss': cached_dawn_val.get('loss', 0),
+                    }
+                    is_dawn = True
+                    print(f"PPL={result['perplexity']:.2f}, Acc={result['accuracy']:.2f}%")
+                    if is_dawn:
+                        dawn_results.append(result)
+                    else:
+                        vanilla_results.append(result)
+                    continue
+
                 # Load model
                 model, tokenizer, config = load_model(checkpoint_path, self.device)
                 model.eval()
@@ -352,7 +380,7 @@ class ModelAnalyzer:
                 params_M = total_params / 1e6
 
                 # Estimate FLOPs
-                flops = estimate_flops(model)
+                flops = estimate_flops(model, config=config)
                 flops_G = flops / 1e9
 
                 # Run evaluation
@@ -453,7 +481,7 @@ class ModelAnalyzer:
 
         # Estimate FLOPs
         from scripts.evaluation.evaluate import estimate_flops
-        flops = estimate_flops(self.model, seq_len=512)
+        flops = estimate_flops(self.model, config=self.config, seq_len=512)
 
         params_info = {
             'total': total_params,
@@ -574,7 +602,7 @@ class ModelAnalyzer:
         if self.compare_checkpoint:
             print(f"\n  ┌─ Generation Samples: Vanilla (max {self.gen_tokens} tokens) ──────────────")
             try:
-                vanilla_model, vanilla_name = self._load_comparison_model()
+                vanilla_model, vanilla_name, _ = self._load_comparison_model()
                 if vanilla_model is not None:
                     vanilla_samples = self._generate_samples(
                         max_new_tokens=self.gen_tokens,
@@ -2153,33 +2181,50 @@ class ModelAnalyzer:
         print(f"\n    Saved to: {output_path}")
 
     def _analyze_comparison_model(self):
-        """Run quick analysis on comparison model for table generation."""
+        """Run analysis on comparison model for table generation.
+
+        Uses cached multi-seed results if available to avoid redundant PPL computation.
+        Speed benchmark always runs (not cached in multi-seed).
+        """
         from scripts.evaluation.evaluate import evaluate_model, load_val_data, estimate_flops
 
-        # Use shared model loader (keeps model cached for later use)
-        comp_model, comp_name = self._load_comparison_model()
+        # Load model (always needed for speed benchmark)
+        comp_model, comp_name, comp_config = self._load_comparison_model()
         if comp_model is None:
             return {}, {}, {}
 
         print(f"    Analyzing: {comp_name}")
 
-        # Model info
+        # Model info (include config data for single source of truth)
         total_params = sum(p.numel() for p in comp_model.parameters())
-        flops = estimate_flops(comp_model, seq_len=512)
+        flops = estimate_flops(comp_model, config=comp_config, seq_len=512)
         vanilla_info = {
             'total': total_params,
             'total_M': total_params / 1e6,
             'flops': flops,
             'flops_G': flops / 1e9,
+            'd_model': comp_config.get('d_model') if comp_config else getattr(comp_model, 'd_model', 0),
+            'n_layers': comp_config.get('n_layers') if comp_config else getattr(comp_model, 'n_layers', 0),
+            'n_heads': comp_config.get('n_heads') if comp_config else getattr(comp_model, 'n_heads', 0),
+            'vocab_size': comp_config.get('vocab_size') if comp_config else getattr(comp_model, 'vocab_size', 0),
+            'd_ff': comp_config.get('d_ff') if comp_config else getattr(comp_model, 'd_ff', 0),
         }
         print(f"    Parameters: {vanilla_info['total_M']:.2f}M, FLOPs: {vanilla_info['flops_G']:.2f}G")
 
-        # Performance (quick eval)
-        print(f"    Running validation...")
-        val_tokens = load_val_data(self.val_data_path, max_tokens=50 * 32 * 512)
-        val_results = evaluate_model(comp_model, val_tokens, batch_size=32, seq_len=512, device=self.device)
-        vanilla_val = val_results
-        print(f"    PPL: {vanilla_val.get('perplexity', 0):.2f}, Acc: {vanilla_val.get('accuracy', 0):.1f}%")
+        # PPL: use multi-seed cache if available, otherwise compute
+        if self._multi_seed_results and 'vanilla' in self._multi_seed_results:
+            cached = self._multi_seed_results['vanilla']
+            vanilla_val = {
+                'perplexity': cached['ppl_mean'],
+                'accuracy': cached['acc_mean'],
+            }
+            print(f"    PPL: {cached['ppl_mean']:.2f} (cached from multi-seed)")
+        else:
+            print(f"    Running validation ({self.val_batches} batches)...")
+            val_tokens = load_val_data(self.val_data_path, max_tokens=self.val_batches * 32 * 512)
+            val_results = evaluate_model(comp_model, val_tokens, batch_size=32, seq_len=512, device=self.device)
+            vanilla_val = val_results
+            print(f"    PPL: {vanilla_val.get('perplexity', 0):.2f}, Acc: {vanilla_val.get('accuracy', 0):.1f}%")
 
         # Speed benchmark
         import time
@@ -2244,10 +2289,18 @@ class ModelAnalyzer:
 
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-            # Model config: prefer config.json > checkpoint['config'] > checkpoint['model_config']
+            # Model config: merge config.json with checkpoint config
+            # config.json may not have all keys (e.g. d_ff omitted from YAML)
+            # but checkpoint['config'] (from model.config) always has them
+            ckpt_config = checkpoint.get('config', checkpoint.get('model_config', {}))
             model_config = json_config.get('model', {})
             if not model_config:
-                model_config = checkpoint.get('config', checkpoint.get('model_config', {}))
+                model_config = ckpt_config
+            elif ckpt_config:
+                # Fill missing keys from checkpoint config
+                for k, v in ckpt_config.items():
+                    if k not in model_config:
+                        model_config[k] = v
             # Count parameters from state dict (exclude EMA/optimizer buffers)
             state_dict = checkpoint.get('model_state_dict', {})
             if not state_dict:
@@ -2786,14 +2839,15 @@ class ModelAnalyzer:
                 print("    Skipping comparison model eval (figure-only mode)")
 
             vanilla_config = training_configs.get('vanilla', {})
+            vc_model = vanilla_config.get('model', {})
             paper_data['models']['vanilla'] = {
                 'parameters_M': round(vanilla_info.get('total_M', 0), 2),
                 'flops_G': round(vanilla_info.get('flops_G', 0), 2),
-                'd_model': vanilla_info.get('d_model', vanilla_config.get('model', {}).get('d_model')),
-                'n_layers': vanilla_info.get('n_layers', vanilla_config.get('model', {}).get('n_layers')),
-                'n_heads': vanilla_info.get('n_heads', vanilla_config.get('model', {}).get('n_heads')),
-                'vocab_size': vanilla_config.get('model', {}).get('vocab_size'),
-                'd_ff': vanilla_config.get('model', {}).get('d_ff'),
+                'd_model': vanilla_info.get('d_model') or vc_model.get('d_model'),
+                'n_layers': vanilla_info.get('n_layers') or vc_model.get('n_layers'),
+                'n_heads': vanilla_info.get('n_heads') or vc_model.get('n_heads'),
+                'vocab_size': vanilla_info.get('vocab_size') or vc_model.get('vocab_size'),
+                'd_ff': vanilla_info.get('d_ff') or vc_model.get('d_ff'),
                 'perplexity': round(vanilla_val.get('perplexity', 0), 2),
                 'accuracy': round(vanilla_val.get('accuracy', 0), 2),
                 'tokens_per_sec': round(vanilla_speed.get('tokens_per_sec', 0), 0),
@@ -3242,9 +3296,10 @@ class ModelAnalyzer:
             "## Files",
             "",
             "### Figures",
-            "- `figures/fig3_emergent_qk_functional_separation.png`",
+            "- `figures/fig3_fqk_specialization.png` (main paper)",
+            "- `figures/fig3_rqk_specialization.png` (appendix)",
             "- `figures/fig4_pos_selectivity_across_neuron_pools.png`",
-            "- `figures/fig5_semantic_clustering_of_knowledge_neurons.png` (F-Know pool only)",
+            "- `figures/fig5_semantic_coherence_of_knowledge_neurons.png` (F-Know pool only)",
             "- `figures/fig6_convergence_comparison.png`",
             "- `figures/fig7_attention_knowledge_balance.png`",
             "",

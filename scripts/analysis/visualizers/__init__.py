@@ -6,7 +6,8 @@ Visualization functions for DAWN analysis results.
 Each module corresponds to a specific paper figure or analysis type.
 """
 
-from .qk_specialization import plot_qk_specialization, plot_qk_usage
+from .style import PAPER_STYLE, apply_paper_style
+from .qk_specialization import plot_qk_specialization, plot_qk_pool, plot_qk_usage
 from .neuron_health import (
     plot_dead_neurons, plot_usage_histogram,
     plot_activation_histogram, plot_diversity_summary
@@ -29,6 +30,7 @@ from .training_dynamics import (
 __all__ = [
     # Q/K Specialization (Figure 3)
     'plot_qk_specialization',
+    'plot_qk_pool',
     'plot_qk_usage',
     # POS Neurons (Figure 4)
     'plot_pos_heatmap',

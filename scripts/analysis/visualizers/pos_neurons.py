@@ -38,6 +38,8 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
+from .style import PAPER_STYLE
+S = PAPER_STYLE
 
 # Universal POS tags (UPOS)
 UPOS_TAGS = [
@@ -289,7 +291,6 @@ def plot_top_neurons_by_pos(
     for i in range(len(pos_list), len(axes)):
         axes[i].axis('off')
 
-    plt.suptitle('Top 10 Neurons per POS Tag', fontsize=14)
     plt.tight_layout()
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close()
@@ -457,7 +458,7 @@ def plot_pos_specialization_from_features(
     if n_profiled > 0:
         pct_specialized = total_specialized / n_profiled * 100
         fig.text(0.5, 0.02, f'Total: {total_specialized} specialized / {n_profiled} profiled ({pct_specialized:.1f}%)',
-                 ha='center', fontsize=10)
+                 ha='center', fontsize=S['font_size_label'])
 
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.1)
@@ -572,28 +573,23 @@ def plot_pos_selectivity_heatmap(
     for i in range(n_pos):
         for j in range(n_show):
             if matrix[i, j] > 0:
-                text_color = 'white' if matrix[i, j] > 5 else 'black'
                 ax.text(j, i, f'{neuron_labels[i][j]}\n{matrix[i, j]:.1f}x',
-                        ha='center', va='center', fontsize=7, color=text_color)
+                        ha='center', va='center', fontsize=S['font_size_annotation'], color='black',
+                        linespacing=1.3)
 
     # Labels
     ax.set_xticks(range(n_show))
     ax.set_xticklabels([f'Top {i+1}' for i in range(n_show)])
     ax.set_yticks(range(n_pos))
     ax.set_yticklabels(pos_tags)
-    ax.set_xlabel('Rank', fontsize=11)
-    ax.set_ylabel('POS Category', fontsize=11)
-    ax.set_title('Fig 4: POS Selectivity Across Neuron Pools', fontsize=12)
+    ax.set_xlabel('Rank (Top-k most selective neurons)', fontsize=S['font_size_label'])
+    ax.set_ylabel('POS Category', fontsize=S['font_size_label'])
 
     # Colorbar
     cbar = fig.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label('Selectivity (×baseline)', fontsize=10)
-
-    # Summary
-    fig.text(0.5, 0.02, f'Active neurons analyzed: {len(active_indices)}', ha='center', fontsize=10)
+    cbar.set_label('Selectivity (×baseline)', fontsize=S['font_size_label'])
 
     plt.tight_layout()
-    plt.subplots_adjust(bottom=0.08)
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close()
 
@@ -658,9 +654,9 @@ def plot_pos_selectivity_clustered(
         cbar_pos=(0.02, 0.8, 0.03, 0.15),
     )
 
-    g.ax_heatmap.set_xlabel('POS Category', fontsize=11)
-    g.ax_heatmap.set_ylabel('Neuron', fontsize=11)
-    g.fig.suptitle(f'Clustered Neuron POS Selectivity (Top {len(selected_indices)} neurons)', fontsize=13, y=1.02)
+    g.ax_heatmap.set_xlabel('POS Category', fontsize=S['font_size_label'])
+    g.ax_heatmap.set_ylabel('Neuron', fontsize=S['font_size_label'])
+    # No suptitle - figure number added in paper caption
 
     # Rotate x labels
     plt.setp(g.ax_heatmap.get_xticklabels(), rotation=45, ha='right')
@@ -749,25 +745,19 @@ def plot_pos_selectivity_from_json(
     for i in range(n_pos):
         for j in range(n_show):
             if matrix[i, j] > 0:
-                text_color = 'white' if matrix[i, j] > 5 else 'black'
                 ax.text(j, i, f'{neuron_labels[i][j]}\n{matrix[i, j]:.1f}x',
-                        ha='center', va='center', fontsize=7, color=text_color)
+                        ha='center', va='center', fontsize=S['font_size_annotation'], color='black',
+                        linespacing=1.3)
 
     ax.set_xticks(range(n_show))
     ax.set_xticklabels([f'Top {i+1}' for i in range(n_show)])
     ax.set_yticks(range(n_pos))
     ax.set_yticklabels(pos_tags)
-    ax.set_xlabel('Rank', fontsize=11)
-    ax.set_ylabel('POS Category', fontsize=11)
-    ax.set_title('Fig 4: POS Selectivity Across Neuron Pools', fontsize=12)
+    ax.set_xlabel('Rank (Top-k most selective neurons)', fontsize=S['font_size_label'])
+    ax.set_ylabel('POS Category', fontsize=S['font_size_label'])
 
     cbar = fig.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label('Selectivity (×baseline)', fontsize=10)
-
-    # Add summary
-    n_active = selectivity_data.get('n_active_neurons', 0)
-    if n_active:
-        fig.text(0.5, 0.02, f'Active neurons analyzed: {n_active}', ha='center', fontsize=10)
+    cbar.set_label('Selectivity (×baseline)', fontsize=S['font_size_label'])
 
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.08)

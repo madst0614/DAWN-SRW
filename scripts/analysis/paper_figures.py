@@ -94,10 +94,11 @@ class PaperFigureGenerator:
     def generate_figure3(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
         Fig 3: Emergent Q/K Functional Separation.
+        Per-pool files: fig3_fqk (main paper), fig3_rqk (appendix).
 
         Requires: precomputed['routing']['qk_usage']
         """
-        from .visualizers import plot_qk_specialization
+        from .visualizers import plot_qk_pool
 
         routing = precomputed.get('routing', {})
         if 'qk_usage' not in routing:
@@ -106,10 +107,18 @@ class PaperFigureGenerator:
         qk_data = routing['qk_usage']
         print("  Using pre-computed Q/K usage data...", flush=True)
 
-        path = plot_qk_specialization(qk_data, os.path.join(output_dir, 'fig3_emergent_qk_functional_separation.png'))
-        print(f"  Saved: {path}", flush=True)
+        # Generate per-pool figures
+        pools = {k: v for k, v in qk_data.items() if isinstance(v, dict) and 'q_counts' in v}
+        paths = {}
+        for pool_name, pool_data in pools.items():
+            short = pool_name.replace('feature_', 'f').replace('restore_', 'r')
+            out_path = os.path.join(output_dir, f'fig3_{short}_specialization.png')
+            path = plot_qk_pool(pool_data, pool_name, out_path)
+            if path:
+                print(f"  Saved: {path}", flush=True)
+                paths[pool_name] = path
 
-        return {'qk_usage': qk_data, 'visualization': path}
+        return {'qk_usage': qk_data, 'visualizations': paths}
 
     def generate_figure4(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
@@ -197,7 +206,7 @@ class PaperFigureGenerator:
 
         print("  Using pre-computed factual analysis...", flush=True)
 
-        path = plot_factual_heatmap(factual, os.path.join(output_dir, 'fig5_semantic_clustering_of_knowledge_neurons.png'))
+        path = plot_factual_heatmap(factual, os.path.join(output_dir, 'fig5_semantic_coherence_of_knowledge_neurons.png'))
         print(f"  Saved: {path}", flush=True)
 
         return {'factual_analysis': factual, 'visualization': path}
