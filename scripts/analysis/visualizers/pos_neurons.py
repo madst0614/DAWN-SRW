@@ -289,7 +289,6 @@ def plot_top_neurons_by_pos(
     for i in range(len(pos_list), len(axes)):
         axes[i].axis('off')
 
-    plt.suptitle('Top 10 Neurons per POS Tag', fontsize=14)
     plt.tight_layout()
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close()
@@ -661,7 +660,7 @@ def plot_pos_selectivity_clustered(
 
     g.ax_heatmap.set_xlabel('POS Category', fontsize=11)
     g.ax_heatmap.set_ylabel('Neuron', fontsize=11)
-    g.fig.suptitle(f'Clustered Neuron POS Selectivity (Top {len(selected_indices)} neurons)', fontsize=13, y=1.02)
+    # No suptitle - figure number added in paper caption
 
     # Rotate x labels
     plt.setp(g.ax_heatmap.get_xticklabels(), rotation=45, ha='right')
