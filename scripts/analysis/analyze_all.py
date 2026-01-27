@@ -1839,9 +1839,9 @@ class ModelAnalyzer:
                         fig_nums.append(item[3:])  # 'fig5' -> '5'
                     except:
                         pass
-            figures_to_generate = ','.join(fig_nums) if fig_nums else '3,4,5,6,7'
+            figures_to_generate = ','.join(fig_nums) if fig_nums else '3,4,5,7,8'
         else:
-            figures_to_generate = '3,4,5,6,7'
+            figures_to_generate = '3,4,5,7,8'
 
         # Generate figures using PaperFigureGenerator (skip if only tables requested)
         if figures_to_generate:
