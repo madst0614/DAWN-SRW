@@ -458,7 +458,7 @@ def plot_pos_specialization_from_features(
     if n_profiled > 0:
         pct_specialized = total_specialized / n_profiled * 100
         fig.text(0.5, 0.02, f'Total: {total_specialized} specialized / {n_profiled} profiled ({pct_specialized:.1f}%)',
-                 ha='center', fontsize=S['font_size_tick'])
+                 ha='center', fontsize=S['font_size_label'])
 
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.1)
@@ -587,7 +587,7 @@ def plot_pos_selectivity_heatmap(
 
     # Colorbar
     cbar = fig.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label('Selectivity (×baseline)', fontsize=S['font_size_tick'])
+    cbar.set_label('Selectivity (×baseline)', fontsize=S['font_size_label'])
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
@@ -757,7 +757,7 @@ def plot_pos_selectivity_from_json(
     ax.set_ylabel('POS Category', fontsize=S['font_size_label'])
 
     cbar = fig.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label('Selectivity (×baseline)', fontsize=S['font_size_tick'])
+    cbar.set_label('Selectivity (×baseline)', fontsize=S['font_size_label'])
 
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.08)

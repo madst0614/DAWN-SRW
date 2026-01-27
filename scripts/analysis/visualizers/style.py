@@ -24,8 +24,6 @@ PAPER_STYLE = {
     'font_size_annotation': 12,
     # Category / group labels (e.g. "Shared", "Capital-specific" above heatmap)
     'font_size_category': 12,
-    # Colorbar label
-    'font_size_cbar': 10,
 
     # Line widths
     'axes_linewidth': 0.8,
