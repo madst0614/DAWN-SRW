@@ -94,10 +94,11 @@ class PaperFigureGenerator:
     def generate_figure3(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
         Fig 3: Emergent Q/K Functional Separation.
+        Split into fig3a (scatter) and fig3b (bar).
 
         Requires: precomputed['routing']['qk_usage']
         """
-        from .visualizers import plot_qk_specialization
+        from .visualizers import plot_qk_scatter, plot_qk_bar
 
         routing = precomputed.get('routing', {})
         if 'qk_usage' not in routing:
@@ -106,10 +107,13 @@ class PaperFigureGenerator:
         qk_data = routing['qk_usage']
         print("  Using pre-computed Q/K usage data...", flush=True)
 
-        path = plot_qk_specialization(qk_data, os.path.join(output_dir, 'fig3_emergent_qk_functional_separation.png'))
-        print(f"  Saved: {path}", flush=True)
+        path_a = plot_qk_scatter(qk_data, os.path.join(output_dir, 'fig3a_qk_scatter.png'))
+        print(f"  Saved: {path_a}", flush=True)
 
-        return {'qk_usage': qk_data, 'visualization': path}
+        path_b = plot_qk_bar(qk_data, os.path.join(output_dir, 'fig3b_qk_bar.png'))
+        print(f"  Saved: {path_b}", flush=True)
+
+        return {'qk_usage': qk_data, 'visualization_scatter': path_a, 'visualization_bar': path_b}
 
     def generate_figure4(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """

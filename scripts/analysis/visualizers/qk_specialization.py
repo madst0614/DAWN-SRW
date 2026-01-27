@@ -3,9 +3,8 @@ Q/K Specialization Visualizations
 =================================
 Visualization functions for Q/K neuron usage and specialization patterns.
 
-Fig 3: Emergent Q/K Functional Separation
-- Left: Q vs K scatter plot with correlation
-- Right: Q-only/K-only/Shared bar chart
+Fig 3a: Q vs K Usage scatter (2×1 vertical, one per QK pool)
+Fig 3b: Neuron Specialization bar chart (2×1 vertical, one per QK pool)
 """
 
 import os
@@ -150,21 +149,136 @@ def plot_qk_specialization(
     return output_path
 
 
+def plot_qk_scatter(
+    qk_usage_data: Dict,
+    output_path: str,
+    pool_colors: Dict = None,
+    figsize: tuple = (6, 8),
+    dpi: int = 300
+) -> Optional[str]:
+    """
+    Fig 3a: Q vs K Usage scatter plots (2×1 vertical layout).
+
+    Args:
+        qk_usage_data: Results from RoutingAnalyzer.analyze_qk_usage()
+        output_path: Path to save the figure
+        pool_colors: Optional dict mapping pool names to colors
+        figsize: Figure size
+        dpi: Output resolution
+
+    Returns:
+        Path to saved figure or None
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    if pool_colors is None:
+        pool_colors = {
+            'feature_qk': COLOR_Q, 'restore_qk': COLOR_K,
+            'fqk': COLOR_Q, 'rqk': COLOR_K,
+        }
+
+    pools = {k: v for k, v in qk_usage_data.items() if isinstance(v, dict) and 'q_counts' in v}
+    n_pools = len(pools)
+    if n_pools == 0:
+        return None
+
+    fig, axes = plt.subplots(n_pools, 1, figsize=figsize)
+    if n_pools == 1:
+        axes = [axes]
+
+    for i, (pool_name, data) in enumerate(pools.items()):
+        ax = axes[i]
+        q_counts = np.array(data['q_counts'])
+        k_counts = np.array(data['k_counts'])
+        color = pool_colors.get(pool_name, COLOR_Q)
+        display_name = data.get('display', pool_name).replace('_', '-').upper()
+        corr = data.get('correlation', 0)
+
+        ax.scatter(q_counts, k_counts, alpha=0.6, s=25, c=color, edgecolors='white', linewidth=0.3)
+        max_val = max(q_counts.max(), k_counts.max()) if len(q_counts) > 0 else 1
+        ax.plot([0, max_val], [0, max_val], '--', color=COLOR_BLACK, alpha=0.5, linewidth=1, label='Q=K')
+        ax.set_xlabel('Q Selection Count')
+        ax.set_ylabel('K Selection Count')
+        ax.set_title(f'{display_name}: Q vs K Usage (corr={corr:.3f})', fontsize=S['font_size_subtitle'], fontweight='bold')
+        ax.legend(loc='upper right', fontsize=S['font_size_legend'], framealpha=0.9)
+        ax.xaxis.grid(True, linestyle='--', alpha=0.3)
+        ax.yaxis.grid(True, linestyle='--', alpha=0.3)
+        ax.set_axisbelow(True)
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(_format_millions))
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(_format_millions))
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    plt.savefig(output_path, dpi=dpi, facecolor='white', edgecolor='none')
+    plt.close()
+    return output_path
+
+
+def plot_qk_bar(
+    qk_usage_data: Dict,
+    output_path: str,
+    pool_colors: Dict = None,
+    figsize: tuple = (6, 8),
+    dpi: int = 300
+) -> Optional[str]:
+    """
+    Fig 3b: Neuron Specialization bar charts (2×1 vertical layout).
+
+    Args:
+        qk_usage_data: Results from RoutingAnalyzer.analyze_qk_usage()
+        output_path: Path to save the figure
+        pool_colors: Optional dict mapping pool names to colors
+        figsize: Figure size
+        dpi: Output resolution
+
+    Returns:
+        Path to saved figure or None
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    pools = {k: v for k, v in qk_usage_data.items() if isinstance(v, dict) and 'q_counts' in v}
+    n_pools = len(pools)
+    if n_pools == 0:
+        return None
+
+    fig, axes = plt.subplots(n_pools, 1, figsize=figsize)
+    if n_pools == 1:
+        axes = [axes]
+
+    for i, (pool_name, data) in enumerate(pools.items()):
+        ax = axes[i]
+        display_name = data.get('display', pool_name).replace('_', '-').upper()
+        categories = ['Q-only', 'K-only', 'Shared']
+        values = [
+            data.get('q_specialized', 0),
+            data.get('k_specialized', 0),
+            data.get('shared', 0),
+        ]
+        colors = [COLOR_Q, COLOR_K, COLOR_SHARED]
+        bars = ax.bar(categories, values, color=colors, alpha=0.85, edgecolor='white', linewidth=0.5)
+        ax.set_ylabel('Neuron Count')
+        ax.set_title(f'{display_name}: Neuron Specialization', fontsize=S['font_size_subtitle'], fontweight='bold')
+        for bar, val in zip(bars, values):
+            if val > 0:
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5, str(val),
+                       ha='center', va='bottom', fontsize=S['font_size_tick'], fontweight='bold')
+        ax.yaxis.grid(True, linestyle='--', alpha=0.3)
+        ax.set_axisbelow(True)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    plt.savefig(output_path, dpi=dpi, facecolor='white', edgecolor='none')
+    plt.close()
+    return output_path
+
+
 def plot_qk_usage(
     qk_usage_data: Dict,
     output_dir: str,
     filename: str = 'qk_usage_analysis.png'
 ) -> Optional[str]:
-    """
-    Convenience wrapper for plot_qk_specialization.
-
-    Args:
-        qk_usage_data: Results from RoutingAnalyzer.analyze_qk_usage()
-        output_dir: Output directory
-        filename: Output filename
-
-    Returns:
-        Path to saved figure or None
-    """
+    """Legacy wrapper for plot_qk_specialization."""
     output_path = os.path.join(output_dir, filename)
     return plot_qk_specialization(qk_usage_data, output_path)
