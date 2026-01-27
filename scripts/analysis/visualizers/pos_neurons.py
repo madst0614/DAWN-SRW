@@ -571,9 +571,8 @@ def plot_pos_selectivity_heatmap(
     for i in range(n_pos):
         for j in range(n_show):
             if matrix[i, j] > 0:
-                text_color = 'white' if matrix[i, j] > 5 else 'black'
                 ax.text(j, i, f'{neuron_labels[i][j]}\n{matrix[i, j]:.1f}x',
-                        ha='center', va='center', fontsize=8, color=text_color,
+                        ha='center', va='center', fontsize=9, color='black',
                         linespacing=1.3)
 
     # Labels
@@ -744,9 +743,8 @@ def plot_pos_selectivity_from_json(
     for i in range(n_pos):
         for j in range(n_show):
             if matrix[i, j] > 0:
-                text_color = 'white' if matrix[i, j] > 5 else 'black'
                 ax.text(j, i, f'{neuron_labels[i][j]}\n{matrix[i, j]:.1f}x',
-                        ha='center', va='center', fontsize=8, color=text_color,
+                        ha='center', va='center', fontsize=9, color='black',
                         linespacing=1.3)
 
     ax.set_xticks(range(n_show))
