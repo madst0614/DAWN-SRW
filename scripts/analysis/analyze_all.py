@@ -2195,7 +2195,7 @@ class ModelAnalyzer:
 
         print(f"    Analyzing: {comp_name}")
 
-        # Model info
+        # Model info (include config data for single source of truth)
         total_params = sum(p.numel() for p in comp_model.parameters())
         flops = estimate_flops(comp_model, config=comp_config, seq_len=512)
         vanilla_info = {
@@ -2203,6 +2203,11 @@ class ModelAnalyzer:
             'total_M': total_params / 1e6,
             'flops': flops,
             'flops_G': flops / 1e9,
+            'd_model': comp_config.get('d_model') if comp_config else getattr(comp_model, 'd_model', 0),
+            'n_layers': comp_config.get('n_layers') if comp_config else getattr(comp_model, 'n_layers', 0),
+            'n_heads': comp_config.get('n_heads') if comp_config else getattr(comp_model, 'n_heads', 0),
+            'vocab_size': comp_config.get('vocab_size') if comp_config else getattr(comp_model, 'vocab_size', 0),
+            'd_ff': comp_config.get('d_ff') if comp_config else getattr(comp_model, 'd_ff', 0),
         }
         print(f"    Parameters: {vanilla_info['total_M']:.2f}M, FLOPs: {vanilla_info['flops_G']:.2f}G")
 
@@ -2284,10 +2289,18 @@ class ModelAnalyzer:
 
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-            # Model config: prefer config.json > checkpoint['config'] > checkpoint['model_config']
+            # Model config: merge config.json with checkpoint config
+            # config.json may not have all keys (e.g. d_ff omitted from YAML)
+            # but checkpoint['config'] (from model.config) always has them
+            ckpt_config = checkpoint.get('config', checkpoint.get('model_config', {}))
             model_config = json_config.get('model', {})
             if not model_config:
-                model_config = checkpoint.get('config', checkpoint.get('model_config', {}))
+                model_config = ckpt_config
+            elif ckpt_config:
+                # Fill missing keys from checkpoint config
+                for k, v in ckpt_config.items():
+                    if k not in model_config:
+                        model_config[k] = v
             # Count parameters from state dict (exclude EMA/optimizer buffers)
             state_dict = checkpoint.get('model_state_dict', {})
             if not state_dict:
@@ -2826,14 +2839,15 @@ class ModelAnalyzer:
                 print("    Skipping comparison model eval (figure-only mode)")
 
             vanilla_config = training_configs.get('vanilla', {})
+            vc_model = vanilla_config.get('model', {})
             paper_data['models']['vanilla'] = {
                 'parameters_M': round(vanilla_info.get('total_M', 0), 2),
                 'flops_G': round(vanilla_info.get('flops_G', 0), 2),
-                'd_model': vanilla_info.get('d_model', vanilla_config.get('model', {}).get('d_model')),
-                'n_layers': vanilla_info.get('n_layers', vanilla_config.get('model', {}).get('n_layers')),
-                'n_heads': vanilla_info.get('n_heads', vanilla_config.get('model', {}).get('n_heads')),
-                'vocab_size': vanilla_config.get('model', {}).get('vocab_size'),
-                'd_ff': vanilla_config.get('model', {}).get('d_ff'),
+                'd_model': vanilla_info.get('d_model') or vc_model.get('d_model'),
+                'n_layers': vanilla_info.get('n_layers') or vc_model.get('n_layers'),
+                'n_heads': vanilla_info.get('n_heads') or vc_model.get('n_heads'),
+                'vocab_size': vanilla_info.get('vocab_size') or vc_model.get('vocab_size'),
+                'd_ff': vanilla_info.get('d_ff') or vc_model.get('d_ff'),
                 'perplexity': round(vanilla_val.get('perplexity', 0), 2),
                 'accuracy': round(vanilla_val.get('accuracy', 0), 2),
                 'tokens_per_sec': round(vanilla_speed.get('tokens_per_sec', 0), 0),
