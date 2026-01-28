@@ -747,7 +747,7 @@ ffn = 2 * 2 * d_model * d_ff * seq_len          # 4 * d * d_ff * seq
 
 ```python
 # paper_results.json 생성 시 (analyze_all.py line 2578-2583)
-paper_results['fig4_convergence_comparison'] = {
+paper_results['fig6_convergence_comparison'] = {
     'dawn': {
         'params_M': round(model_info.get('total_M', 0), 2),  # Table 1과 동일 소스
         ...
@@ -856,15 +856,15 @@ Paper mode 실행 시 `paper/paper_results.json`에 모든 수치 데이터가 �
       "q_ratio_active": [...]
     }
   },
-  "fig4_convergence_comparison": {
-    "...": "training dynamics data"
-  },
-  "fig5_attention_knowledge_balance": {
+  "fig4_attention_knowledge_balance": {
     "per_layer": {"L0": {"attention_ratio": 65.2, "knowledge_ratio": 34.8}, ...},
     "summary": {"attention_ratio_mean": 62.3, "knowledge_ratio_mean": 37.7}
   },
-  "fig6_rqk_specialization": {
+  "fig5_rqk_specialization": {
     "restore_qk": { "...": "same structure as fig3" }
+  },
+  "fig6_convergence_comparison": {
+    "...": "training dynamics data"
   },
   "fig7_pos_selectivity_heatmap": {
     "pos_neuron_counts": {"NOUN": 45, "VERB": 38, ...},

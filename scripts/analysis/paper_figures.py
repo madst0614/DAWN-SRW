@@ -25,17 +25,17 @@ class PaperFigureGenerator:
 
     ICML 2026 Paper Figure Mapping:
         Fig 3: F-QK Specialization (main paper)
-        Fig 4: Convergence Comparison (main paper)
-        Fig 5: Attention-Knowledge Balance Across Layers (main paper)
-        Fig 6: R-QK Specialization (appendix)
+        Fig 4: Attention-Knowledge Balance Across Layers (main paper)
+        Fig 5: R-QK Specialization (appendix)
+        Fig 6: Convergence Comparison (appendix)
         Fig 7: POS Selectivity Heatmap (appendix)
         Fig 8: Knowledge Neurons (appendix)
     """
 
     FIGURE_MAP = {
-        '3': 'generate_figure3',   # F-QK Specialization (+ Fig 6 R-QK in appendix)
-        '4': 'generate_figure4',   # Convergence Comparison
-        '5': 'generate_figure5',   # Attention-Knowledge Balance
+        '3': 'generate_figure3',   # F-QK Specialization (also generates Fig 5 R-QK appendix)
+        '4': 'generate_figure4',   # Attention-Knowledge Balance
+        '6': 'generate_figure6',   # Convergence Comparison (appendix)
         '7': 'generate_figure7',   # POS Selectivity Heatmap (appendix)
         '8': 'generate_figure8',   # Knowledge Neurons (appendix)
     }
@@ -95,7 +95,7 @@ class PaperFigureGenerator:
     def generate_figure3(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
         Fig 3: F-QK Specialization (main paper).
-        Also generates Fig 6: R-QK Specialization (appendix).
+        Also generates Fig 5: R-QK Specialization (appendix).
 
         Requires: precomputed['routing']['qk_usage']
         """
@@ -108,8 +108,8 @@ class PaperFigureGenerator:
         qk_data = routing['qk_usage']
         print("  Using pre-computed Q/K usage data...", flush=True)
 
-        # Figure number mapping: fqk → fig3 (main), rqk → fig6 (appendix)
-        pool_fig_map = {'fqk': 'fig3_fqk_specialization', 'rqk': 'fig6_rqk_specialization'}
+        # Figure number mapping: fqk → fig3 (main), rqk → fig5 (appendix)
+        pool_fig_map = {'fqk': 'fig3_fqk_specialization', 'rqk': 'fig5_rqk_specialization'}
 
         pools = {k: v for k, v in qk_data.items() if isinstance(v, dict) and 'q_counts' in v}
         paths = {}
@@ -215,9 +215,9 @@ class PaperFigureGenerator:
 
         return {'factual_analysis': factual, 'visualization': path}
 
-    def generate_figure4(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
+    def generate_figure6(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
-        Fig 4: Convergence Comparison.
+        Fig 6 (Appendix): Convergence Comparison.
 
         Uses training logs from checkpoint paths in config.
         """
@@ -283,14 +283,14 @@ class PaperFigureGenerator:
         if not data:
             return {'error': 'No training logs found. Check checkpoint paths.'}
 
-        path = plot_training_dynamics(data, os.path.join(output_dir, 'fig4_convergence_comparison.png'))
+        path = plot_training_dynamics(data, os.path.join(output_dir, 'fig6_convergence_comparison.png'))
         print(f"  Saved: {path}", flush=True)
 
         return {'visualization': path, 'data': {k: len(v[0]) for k, v in data.items()}}
 
-    def generate_figure5(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
+    def generate_figure4(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
-        Fig 5: Attention-Knowledge Balance Across Layers.
+        Fig 4: Attention-Knowledge Balance Across Layers (main paper).
 
         Requires: precomputed['routing']['layer_contribution'] and precomputed['routing']['qk_usage']
         """
@@ -324,7 +324,7 @@ class PaperFigureGenerator:
 
         path = plot_routing_stats(
             combined_data,
-            os.path.join(output_dir, 'fig5_attention_knowledge_balance.png'),
+            os.path.join(output_dir, 'fig4_attention_knowledge_balance.png'),
             router=router
         )
         print(f"  Saved: {path}", flush=True)

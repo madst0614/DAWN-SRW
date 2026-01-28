@@ -142,9 +142,9 @@ Consolidated `paper_results.json` and `training_comparison.json` into unified fo
   },
   "figures": {
     "fig3_fqk_specialization": {...},
-    "fig4_convergence_comparison": {...},
-    "fig5_attention_knowledge_balance": {...},
-    "fig6_rqk_specialization": {...},
+    "fig4_attention_knowledge_balance": {...},
+    "fig5_rqk_specialization": {...},
+    "fig6_convergence_comparison": {...},
     "fig7_pos_selectivity_heatmap": {...},
     "fig8_knowledge_neurons": {...}
   },

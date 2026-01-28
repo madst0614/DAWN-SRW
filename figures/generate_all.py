@@ -8,10 +8,10 @@ Usage:
     # Generate fig1-4 only:
     python figures/generate_all.py
 
-    # Include fig5 with demo data:
+    # Include fig6 with demo data:
     python figures/generate_all.py --demo
 
-    # Include fig5 with checkpoint directories (auto-find training_log.txt):
+    # Include fig6 with checkpoint directories (auto-find training_log.txt):
     python figures/generate_all.py \\
         --dawn path/to/dawn/checkpoints/run_xxx \\
         --vanilla_22m path/to/vanilla_22m/checkpoints/run_xxx \\
@@ -24,8 +24,8 @@ Output:
     figures/fig1_architecture.pdf
     figures/fig2_feature_restore_pathway.pdf
     figures/fig3_param_efficiency.pdf
-    figures/fig4_convergence_comparison.pdf (if --demo or checkpoint paths provided)
-    figures/fig5_attention_knowledge_balance.pdf
+    figures/fig4_attention_knowledge_balance.pdf
+    figures/fig6_convergence_comparison.pdf (if --demo or checkpoint paths provided)
     figures/fig8_knowledge_neurons.pdf
 """
 
@@ -80,7 +80,7 @@ Examples:
     # Basic figures only (fig1-4):
     python figures/generate_all.py
 
-    # All figures with demo loss curves:
+    # All figures with demo convergence curves:
     python figures/generate_all.py --demo
 
     # All figures with checkpoint directories (40M scale):
@@ -93,7 +93,7 @@ Examples:
         """
     )
 
-    # Fig4 options - checkpoint directories (auto-find training_log.txt)
+    # Fig6 options - checkpoint directories (auto-find training_log.txt)
     parser.add_argument('--dawn', type=str,
                        help='DAWN run directory (will auto-find training_log.txt)')
     parser.add_argument('--vanilla_40m', type=str,
@@ -103,7 +103,7 @@ Examples:
     parser.add_argument('--vanilla_108m', type=str,
                        help='Vanilla-108M run directory')
     parser.add_argument('--demo', action='store_true',
-                       help='Use demo data for fig4 convergence comparison')
+                       help='Use demo data for fig6 convergence comparison')
 
     # General options
     parser.add_argument('--skip', nargs='+', default=[],
@@ -111,7 +111,7 @@ Examples:
     parser.add_argument('--zip', action='store_true',
                        help='Create zip file of all figures after generation')
     parser.add_argument('--show_annotations', action='store_true',
-                       help='Show final loss values on fig4')
+                       help='Show final loss values on fig6')
 
     args = parser.parse_args()
 
@@ -132,8 +132,8 @@ Examples:
     if 'fig3' not in args.skip:
         results['fig3'] = run_script('fig3_param_efficiency.py')
 
-    # Figure 4: Convergence Comparison (optional)
-    if 'fig4' not in args.skip:
+    # Figure 6: Convergence Comparison (appendix, optional)
+    if 'fig6' not in args.skip:
         fig4_args = []
 
         if args.demo:
@@ -163,13 +163,13 @@ Examples:
             fig4_args.append('--show_annotations')
 
         if fig4_args:
-            results['fig4'] = run_script('fig4_convergence_comparison.py', fig4_args)
+            results['fig6'] = run_script('fig6_convergence_comparison.py', fig4_args)
         else:
-            print("\n[fig4] Skipped: No --demo or checkpoint paths provided")
+            print("\n[fig6] Skipped: No --demo or checkpoint paths provided")
 
-    # Figure 5: Attention-Knowledge Balance
-    if 'fig5' not in args.skip:
-        results['fig5'] = run_script('fig5_attention_knowledge_balance.py')
+    # Figure 4: Attention-Knowledge Balance
+    if 'fig4' not in args.skip:
+        results['fig4'] = run_script('fig4_attention_knowledge_balance.py')
 
     # Figure 8: Knowledge Neurons (Appendix)
     if 'fig8' not in args.skip:

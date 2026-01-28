@@ -1839,9 +1839,9 @@ class ModelAnalyzer:
                         fig_nums.append(item[3:])  # 'fig5' -> '5'
                     except:
                         pass
-            figures_to_generate = ','.join(fig_nums) if fig_nums else '3,4,5,7,8'
+            figures_to_generate = ','.join(fig_nums) if fig_nums else '3,4,6,7,8'
         else:
-            figures_to_generate = '3,4,5,7,8'
+            figures_to_generate = '3,4,6,7,8'
 
         # Generate figures using PaperFigureGenerator (skip if only tables requested)
         if figures_to_generate:
@@ -1874,7 +1874,7 @@ class ModelAnalyzer:
                     'analysis_output_dir': str(self.output_dir),  # For finding .npy files
                 }
 
-                # Add checkpoint paths for figure 6 (training dynamics comparison)
+                # Add checkpoint paths for figure 6 (convergence comparison, appendix)
                 # Uses main checkpoint (DAWN) and vanilla_checkpoint
                 checkpoint_paths = [self.checkpoint_path]
                 checkpoint_labels = ['DAWN']
@@ -3096,16 +3096,16 @@ class ModelAnalyzer:
                 },
             }
 
-        # Fig 4: Convergence Comparison
+        # Fig 6: Convergence Comparison (appendix)
         # Note: Actual loss curves require parsing training_log.txt separately
         # This section contains model/training config for reference
-        paper_data['figures']['fig4_convergence_comparison'] = {
+        paper_data['figures']['fig6_convergence_comparison'] = {
             'note': 'Loss curves parsed from training_log.txt by paper_figures.py',
             'dawn_params_M': paper_data['models']['dawn']['parameters_M'],
             'vanilla_params_M': paper_data['models'].get('vanilla', {}).get('parameters_M'),
         }
 
-        # Fig 5: Attention-Knowledge Balance
+        # Fig 4: Attention-Knowledge Balance
         layer_contrib = routing.get('layer_contribution', {})
         if layer_contrib:
             per_layer = layer_contrib.get('per_layer', {})
@@ -3127,7 +3127,7 @@ class ModelAnalyzer:
             att_arr = np.array(attention_ratios) if attention_ratios else np.array([50])
             know_arr = np.array(knowledge_ratios) if knowledge_ratios else np.array([50])
 
-            paper_data['figures']['fig5_attention_knowledge_balance'] = {
+            paper_data['figures']['fig4_attention_knowledge_balance'] = {
                 'per_layer': per_layer_data,
                 'summary': {
                     'attention_mean': round(float(att_arr.mean()), 1),
@@ -3216,8 +3216,8 @@ class ModelAnalyzer:
             'table1_model_stats': paper_data['tables']['table1_model_stats'],
             'table2_neuron_util': paper_data['tables']['table2_neuron_util'],
             'fig3_fqk_specialization': paper_data['figures'].get('fig3_fqk_specialization', {}),
-            'fig4_convergence_comparison': paper_data['figures'].get('fig4_convergence_comparison', {}),
-            'fig5_attention_knowledge_balance': paper_data['figures'].get('fig5_attention_knowledge_balance', {}),
+            'fig4_attention_knowledge_balance': paper_data['figures'].get('fig4_attention_knowledge_balance', {}),
+            'fig6_convergence_comparison': paper_data['figures'].get('fig6_convergence_comparison', {}),
             'fig7_pos_selectivity_heatmap': paper_data['figures'].get('fig7_pos_selectivity_heatmap', {}),
             'fig8_knowledge_neurons': paper_data['figures'].get('fig8_knowledge_neurons', {}),
             'appendix_diversity': paper_data['appendix'].get('diversity', {}),
@@ -3297,9 +3297,9 @@ class ModelAnalyzer:
             "",
             "### Figures",
             "- `figures/fig3_fqk_specialization.png` (main paper)",
-            "- `figures/fig4_convergence_comparison.png` (main paper)",
-            "- `figures/fig5_attention_knowledge_balance.png` (main paper)",
-            "- `figures/fig6_rqk_specialization.png` (appendix)",
+            "- `figures/fig4_attention_knowledge_balance.png` (main paper)",
+            "- `figures/fig5_rqk_specialization.png` (appendix)",
+            "- `figures/fig6_convergence_comparison.png` (appendix)",
             "- `figures/fig7_pos_selectivity_heatmap.png` (appendix)",
             "- `figures/fig8_knowledge_neurons.png` (appendix)",
             "",

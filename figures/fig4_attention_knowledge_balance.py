@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Figure 5: Attention-Knowledge Balance (from checkpoint)
+Figure 4: Attention-Knowledge Balance (from checkpoint)
 
 Extracts real routing statistics from DAWN v17.1 checkpoint:
 - Neuron Utilization: EMA usage from each pool
 - Layer-wise Circuit Contribution: attention vs knowledge per layer
 
 Usage:
-    python figures/fig5_attention_knowledge_balance.py --checkpoint /path/to/run_dir
-    python figures/fig5_attention_knowledge_balance.py --demo  # Use demo data
+    python figures/fig4_attention_knowledge_balance.py --checkpoint /path/to/run_dir
+    python figures/fig4_attention_knowledge_balance.py --demo  # Use demo data
 """
 
 import sys
@@ -345,8 +345,8 @@ def create_figure(stats: dict, output_dir: Path):
     plt.tight_layout()
 
     # Save
-    output_png = output_dir / 'fig5_attention_knowledge_balance.png'
-    output_pdf = output_dir / 'fig5_attention_knowledge_balance.pdf'
+    output_png = output_dir / 'fig4_attention_knowledge_balance.png'
+    output_pdf = output_dir / 'fig4_attention_knowledge_balance.pdf'
     plt.savefig(output_png, format='png', dpi=300, bbox_inches='tight', facecolor='white')
     plt.savefig(output_pdf, format='pdf', dpi=300, bbox_inches='tight')
     print(f"\nSaved: {output_png}")
