@@ -928,8 +928,19 @@ def is_v18_model(model):
     return version.startswith('18')
 
 
+def is_tpu_model(model):
+    """Check if model is TPU-optimized version (skip routing_info during training)"""
+    base_model = get_underlying_model(model)
+    version = getattr(base_model, '__version__', '')
+    return 'TPU' in version.upper()
+
+
 def needs_routing_info(model):
-    """Check if model needs routing_info for usage logging"""
+    """Check if model needs routing_info for usage logging.
+    TPU models skip routing_info collection during training for performance.
+    """
+    if is_tpu_model(model):
+        return False
     return is_v16_model(model) or is_v17_model(model) or is_v18_model(model)
 
 
