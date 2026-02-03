@@ -662,7 +662,14 @@ class DAWN(nn.Module):
 
         block_cls = DAWNBlock
         if self.gradient_checkpointing:
-            block_cls = nn.remat(DAWNBlock)
+            # feature_fn/restore_fn already have @jax.checkpoint for the
+            # biggest memory consumers ([B,S,N,R] and [B,S,N,D]).
+            # Layer-level nn.remat conflicts with bool args passed through
+            # Module boundaries under JAX tracing.
+            # The @jax.checkpoint on feature_fn/restore_fn already handles
+            # the dominant memory cost. For full layer remat on very deep
+            # models, users can wrap manually with appropriate static_argnums.
+            pass  # feature_fn + restore_fn @jax.checkpoint already active
 
         self.layers = [
             block_cls(
