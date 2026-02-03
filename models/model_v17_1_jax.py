@@ -6,8 +6,6 @@ Native JAX implementation:
   - flax.linen modules
   - Weight tying via nn.Embed.attend()
   - EMA usage tracking via mutable 'ema' state collection
-  - nn.remat(DAWNBlock) for layer-level remat (no static_argnums needed)
-  - @jax.checkpoint on logits+loss to avoid [B,S,V] materialization
 
 Structure (same as PyTorch):
   SharedNeurons, UnifiedNeuronRouter, GlobalRouters,
@@ -36,28 +34,6 @@ def restore_fn(h, neurons, weights):
     """Restore: h [B,S,R] -> out [B,S,D]. Intermediate [B,S,N,D] not saved."""
     all_out = jnp.einsum('bsr,nrd->bsnd', h, neurons)
     return jnp.einsum('bsnd,bsn->bsd', all_out, weights)
-
-
-@jax.checkpoint
-def _compute_lm_loss(x, embedding, shift_labels, valid_mask):
-    """Compute LM loss + accuracy without storing full [B,S,V] logits for backward.
-
-    @jax.checkpoint ensures the [B, S-1, V] logits tensor is recomputed
-    during backward rather than kept in memory (~7.5G for B=128, S=512, V=30522).
-    Only the scalar outputs (loss, correct, n_valid) are saved.
-    """
-    logits = x @ embedding.T  # [B, S-1, V]
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    safe_labels = jnp.where(valid_mask, shift_labels, 0)
-    token_losses = -jnp.take_along_axis(
-        log_probs, safe_labels[..., jnp.newaxis], axis=-1).squeeze(-1)
-    token_losses = token_losses * valid_mask
-    loss = token_losses.sum() / (valid_mask.sum() + 1e-8)
-    # Accuracy (non-differentiable, but computed here to avoid logits materialization)
-    preds = jnp.argmax(logits, axis=-1)
-    correct = jnp.sum((preds == shift_labels) & valid_mask)
-    n_valid = valid_mask.sum()
-    return loss, correct, n_valid
 
 
 # ================================================================
@@ -195,8 +171,7 @@ class UnifiedNeuronRouter(nn.Module):
         return logits_fqk_Q, logits_fqk_K, logits_fv, logits_rqk_Q, logits_rqk_K, logits_rv
 
     def update_usage(self, weights, neuron_type, attention_mask=None):
-        """Update EMA usage stats. No deterministic guard needed —
-        eval path passes mutable=['ema'] but discards the updates."""
+        """Update EMA usage stats. Always runs — eval safety via mutable=['ema']."""
         if weights.ndim == 3:
             active = (weights > 0).astype(jnp.float32)
             if attention_mask is not None:
@@ -297,7 +272,7 @@ class GlobalRouters(nn.Module):
         )
 
     def get_attention_weights(self, x, attention_mask=None,
-                              deterministic=False, return_routing_info=False):
+                              deterministic=False):
         (fqk_logits_Q, fqk_logits_K, fv_logits,
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(
             x, deterministic=deterministic)
@@ -309,8 +284,7 @@ class GlobalRouters(nn.Module):
         rqk_pref_K = jax.nn.softmax(rqk_logits_K, axis=-1)
         rv_pref = jax.nn.softmax(rv_logits, axis=-1)
 
-        # Load-balancing aux loss — always computed (no deterministic guard)
-        # eval path ignores aux_loss anyway; removing the branch makes nn.remat safe
+        # Load-balancing aux loss — always computed (no deterministic branch)
         if attention_mask is not None:
             mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
             count = mask.sum() + 1e-8
@@ -349,7 +323,7 @@ class GlobalRouters(nn.Module):
         rqk_weights_K, _ = topk_sparsify(rqk_pref_K, self.top_k_restore_qk)
         rv_weights, _ = topk_sparsify(rv_pref, self.top_k_restore_v)
 
-        # EMA usage update — always run; eval discards mutable state
+        # EMA usage update — always runs (no deterministic branch)
         self.neuron_router.update_usage(fqk_weights_Q, 'feature_q', attention_mask)
         self.neuron_router.update_usage(fqk_weights_K, 'feature_k', attention_mask)
         self.neuron_router.update_usage(fv_weights, 'feature_v', attention_mask)
@@ -357,36 +331,18 @@ class GlobalRouters(nn.Module):
         self.neuron_router.update_usage(rqk_weights_K, 'restore_k', attention_mask)
         self.neuron_router.update_usage(rv_weights, 'restore_v', attention_mask)
 
-        routing_info = None
-        if return_routing_info:
-            routing_info = {
-                'fqk_weights_Q': jax.lax.stop_gradient(fqk_weights_Q),
-                'fqk_weights_K': jax.lax.stop_gradient(fqk_weights_K),
-                'fv_weights': jax.lax.stop_gradient(fv_weights),
-                'rqk_weights_Q': jax.lax.stop_gradient(rqk_weights_Q),
-                'rqk_weights_K': jax.lax.stop_gradient(rqk_weights_K),
-                'rv_weights': jax.lax.stop_gradient(rv_weights),
-                'fqk_q_pref': jax.lax.stop_gradient(fqk_pref_Q),
-                'fqk_k_pref': jax.lax.stop_gradient(fqk_pref_K),
-                'fv_pref': jax.lax.stop_gradient(fv_pref),
-                'rqk_q_pref': jax.lax.stop_gradient(rqk_pref_Q),
-                'rqk_k_pref': jax.lax.stop_gradient(rqk_pref_K),
-                'rv_pref': jax.lax.stop_gradient(rv_pref),
-                'token_routing': True,
-            }
-
         return (fqk_weights_Q, fqk_weights_K, fv_weights,
                 rqk_weights_Q, rqk_weights_K, rv_weights,
-                routing_info, aux_loss)
+                aux_loss)
 
     def get_knowledge_weights(self, x, attention_mask=None,
-                              deterministic=False, return_routing_info=False):
+                              deterministic=False):
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(
             x, deterministic=deterministic)
         pref_f = jax.nn.softmax(logits_f, axis=-1)
         pref_r = jax.nn.softmax(logits_r, axis=-1)
 
-        # Always compute aux loss (no deterministic guard)
+        # Load-balance aux loss — always computed
         if attention_mask is not None:
             mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
             count = mask.sum() + 1e-8
@@ -405,20 +361,11 @@ class GlobalRouters(nn.Module):
         feature_know_w, _ = topk_sparsify(pref_f, self.top_k_feature_know)
         restore_know_w, _ = topk_sparsify(pref_r, self.top_k_restore_know)
 
-        # Always update EMA
+        # EMA usage update — always runs
         self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
         self.neuron_router.update_usage(restore_know_w, 'restore_know', attention_mask)
 
-        routing_info = None
-        if return_routing_info:
-            routing_info = {
-                'feature_know_w': jax.lax.stop_gradient(feature_know_w),
-                'restore_know_w': jax.lax.stop_gradient(restore_know_w),
-                'feature_know_pref': jax.lax.stop_gradient(pref_f),
-                'restore_know_pref': jax.lax.stop_gradient(pref_r),
-            }
-
-        return feature_know_w, restore_know_w, routing_info, aux_loss
+        return feature_know_w, restore_know_w, aux_loss
 
 
 # ================================================================
@@ -479,7 +426,7 @@ class AttentionCircuit(nn.Module):
 
         attn_weights = jax.nn.softmax(scores, axis=-1)
 
-        # Attention dropout (nn.Dropout is trace-safe under nn.remat)
+        # Attention dropout — nn.Dropout is trace-safe (no Python bool branch)
         attn_weights = self.attn_dropout(attn_weights, deterministic=deterministic)
 
         attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_weights, V)
@@ -556,15 +503,11 @@ class DAWNBlock(nn.Module):
 
     def __call__(self, x, shared_neurons, router, attention_mask=None,
                  deterministic=False):
-        # return_routing_info removed from DAWNBlock to eliminate Python bool
-        # branches, making this module fully trace-safe under nn.remat.
-        # Routing info collection can be done at DAWN level if needed.
-
         # Attention
         normed_x = self.norm1(x)
         (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
-         _, aux_loss) = router.get_attention_weights(
-            normed_x, attention_mask, deterministic, False)  # literal False
+         aux_loss) = router.get_attention_weights(
+            normed_x, attention_mask, deterministic)
         attn_out = self.attn(
             normed_x, shared_neurons,
             fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
@@ -573,9 +516,9 @@ class DAWNBlock(nn.Module):
 
         # Knowledge
         normed_x = self.norm2(x)
-        feature_know_w, restore_know_w, _, know_aux_loss = \
+        feature_know_w, restore_know_w, know_aux_loss = \
             router.get_knowledge_weights(
-                normed_x, attention_mask, deterministic, False)  # literal False
+                normed_x, attention_mask, deterministic)
         know_out = self.knowledge(
             normed_x, shared_neurons,
             feature_know_w, restore_know_w,
@@ -595,23 +538,15 @@ class DAWN(nn.Module):
 
     JAX/Flax port of v17.1-TPU-MemOpt.
     - jax.checkpoint for feature/restore intermediate tensor recompute
-    - nn.remat(DAWNBlock) for layer-level recompute (no static_argnums needed:
-      all Python bool branches removed from DAWNBlock)
-    - @jax.checkpoint on logits+loss to avoid [B,S,V] materialization
     - Weight tying via nn.Embed.attend()
     - Functional API: returns dict with loss, logits, aux_loss
 
     Usage:
         model = DAWN(vocab_size=30522, d_model=384, ...)
         variables = model.init(rng, input_ids)
-        # Training (mutable=['ema'] required):
-        output, updated = model.apply(variables, input_ids, labels=labels,
+        output = model.apply(variables, input_ids, labels=labels,
                              deterministic=False,
                              rngs={'dropout': dropout_rng},
-                             mutable=['ema'])
-        # Eval (mutable=['ema'] to avoid error, discard updates):
-        output, _ = model.apply(variables, input_ids,
-                             deterministic=True,
                              mutable=['ema'])
     """
     __version__ = "17.1-JAX"
@@ -675,9 +610,6 @@ class DAWN(nn.Module):
 
         block_cls = DAWNBlock
         if self.gradient_checkpointing:
-            # No static_argnums needed: all Python bool branches removed from
-            # DAWNBlock. deterministic is only passed to nn.Dropout (trace-safe),
-            # return_routing_info removed entirely.
             block_cls = nn.remat(DAWNBlock)
 
         self.layers = [
@@ -723,20 +655,34 @@ class DAWN(nn.Module):
         }
 
         if labels is not None:
-            # Training path: compute loss+accuracy inside @jax.checkpoint
-            # to avoid materializing full [B, S, V] logits (~7.5G)
+            # logits+loss under @jax.checkpoint — avoids materializing [B,S,V]
+            # during backward (recomputed instead). Saves ~7G for vocab=30522.
             embedding_matrix = self.token_emb.embedding  # [V, D]
-            shift_x = x[:, :-1, :]  # [B, S-1, D]
+            shift_x = x[:, :-1, :]                       # [B, S-1, D]
             shift_labels = labels[:, 1:].astype(jnp.int32)
             valid_mask = (shift_labels != -100)
 
-            loss, correct, n_valid = _compute_lm_loss(
+            @jax.checkpoint
+            def compute_loss_and_acc(x_chunk, emb, labs, vmask):
+                logits = x_chunk @ emb.T                  # [B, S-1, V]
+                log_probs = jax.nn.log_softmax(logits, axis=-1)
+                safe = jnp.where(vmask, labs, 0)
+                tl = -jnp.take_along_axis(
+                    log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
+                loss = (tl * vmask).sum() / (vmask.sum() + 1e-8)
+                # Accuracy inside checkpoint to avoid returning full logits
+                preds = jnp.argmax(logits, axis=-1)
+                correct = jnp.sum((preds == labs) & vmask)
+                valid_count = jnp.sum(vmask)
+                return loss, correct, valid_count
+
+            loss, correct, valid_count = compute_loss_and_acc(
                 shift_x, embedding_matrix, shift_labels, valid_mask)
             result['loss'] = loss
             result['correct'] = correct
-            result['n_valid'] = n_valid
+            result['valid_count'] = valid_count
         else:
-            # Inference path: return full logits
+            # Inference: need full logits
             logits = self.token_emb.attend(x)
             result['logits'] = logits
 
@@ -848,8 +794,6 @@ class DAWN(nn.Module):
             f"",
             f"  [Memory Optimization]",
             f"  jax.checkpoint: ON (Feature + Restore intermediate recompute)",
-            f"  logits remat: ON (lm_head logits recomputed during backward)",
-            f"  layer remat: {'ON' if self.gradient_checkpointing else 'OFF'}",
             f"",
             f"  [Router]",
             f"  d_space={self.d_space}, router_dropout={self.router_dropout}",

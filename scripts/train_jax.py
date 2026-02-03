@@ -305,7 +305,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'orth_loss': orth_loss,
             'div_loss': div_loss,
             'correct': result['correct'],
-            'valid_count': result['n_valid'],
+            'valid_count': result['valid_count'],
         }
 
         return new_params, new_ema_state, new_opt_state, metrics
@@ -333,7 +333,7 @@ def create_eval_step(model):
         ce_loss = result['loss']
         # Accuracy computed inside model via _compute_lm_loss (no full logits)
         correct = result['correct']
-        valid_count = result['n_valid']
+        valid_count = result['valid_count']
 
         return ce_loss, correct, valid_count
 
