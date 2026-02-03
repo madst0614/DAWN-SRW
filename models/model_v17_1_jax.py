@@ -651,7 +651,7 @@ class DAWN(nn.Module):
         ScanBlock = nn.scan(
             block_cls,
             variable_axes={'params': 0},
-            split_rngs={'dropout': True},
+            split_rngs={'dropout': True, 'params': True},
             length=self.n_layers,
             in_axes=(nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),
             out_axes=0,
