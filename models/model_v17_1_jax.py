@@ -170,9 +170,8 @@ class UnifiedNeuronRouter(nn.Module):
 
         return logits_fqk_Q, logits_fqk_K, logits_fv, logits_rqk_Q, logits_rqk_K, logits_rv
 
-    def update_usage(self, weights, neuron_type, attention_mask=None, deterministic=False):
-        if deterministic:
-            return
+    def update_usage(self, weights, neuron_type, attention_mask=None):
+        """Update EMA usage stats. Always runs — eval safety via mutable=['ema']."""
         if weights.ndim == 3:
             active = (weights > 0).astype(jnp.float32)
             if attention_mask is not None:
@@ -273,7 +272,7 @@ class GlobalRouters(nn.Module):
         )
 
     def get_attention_weights(self, x, attention_mask=None,
-                              deterministic=False, return_routing_info=False):
+                              deterministic=False):
         (fqk_logits_Q, fqk_logits_K, fv_logits,
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(
             x, deterministic=deterministic)
@@ -285,37 +284,36 @@ class GlobalRouters(nn.Module):
         rqk_pref_K = jax.nn.softmax(rqk_logits_K, axis=-1)
         rv_pref = jax.nn.softmax(rv_logits, axis=-1)
 
-        # Load-balancing aux loss
+        # Load-balancing aux loss — always computed (no deterministic branch)
+        if attention_mask is not None:
+            mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
+            count = mask.sum() + 1e-8
+            usage_fqk_Q = (fqk_pref_Q * mask).sum(axis=(0, 1)) / count
+            usage_fqk_K = (fqk_pref_K * mask).sum(axis=(0, 1)) / count
+            usage_fv = (fv_pref * mask).sum(axis=(0, 1)) / count
+            usage_rqk_Q = (rqk_pref_Q * mask).sum(axis=(0, 1)) / count
+            usage_rqk_K = (rqk_pref_K * mask).sum(axis=(0, 1)) / count
+            usage_rv = (rv_pref * mask).sum(axis=(0, 1)) / count
+        else:
+            usage_fqk_Q = fqk_pref_Q.mean(axis=(0, 1))
+            usage_fqk_K = fqk_pref_K.mean(axis=(0, 1))
+            usage_fv = fv_pref.mean(axis=(0, 1))
+            usage_rqk_Q = rqk_pref_Q.mean(axis=(0, 1))
+            usage_rqk_K = rqk_pref_K.mean(axis=(0, 1))
+            usage_rv = rv_pref.mean(axis=(0, 1))
+
+        target_fqk = 1.0 / self.n_feature_qk
+        target_fv = 1.0 / self.n_feature_v
+        target_rqk = 1.0 / self.n_restore_qk
+        target_rv = 1.0 / self.n_restore_v
+
         aux_loss = jnp.float32(0.0)
-        if not deterministic:
-            if attention_mask is not None:
-                mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
-                count = mask.sum() + 1e-8
-                usage_fqk_Q = (fqk_pref_Q * mask).sum(axis=(0, 1)) / count
-                usage_fqk_K = (fqk_pref_K * mask).sum(axis=(0, 1)) / count
-                usage_fv = (fv_pref * mask).sum(axis=(0, 1)) / count
-                usage_rqk_Q = (rqk_pref_Q * mask).sum(axis=(0, 1)) / count
-                usage_rqk_K = (rqk_pref_K * mask).sum(axis=(0, 1)) / count
-                usage_rv = (rv_pref * mask).sum(axis=(0, 1)) / count
-            else:
-                usage_fqk_Q = fqk_pref_Q.mean(axis=(0, 1))
-                usage_fqk_K = fqk_pref_K.mean(axis=(0, 1))
-                usage_fv = fv_pref.mean(axis=(0, 1))
-                usage_rqk_Q = rqk_pref_Q.mean(axis=(0, 1))
-                usage_rqk_K = rqk_pref_K.mean(axis=(0, 1))
-                usage_rv = rv_pref.mean(axis=(0, 1))
-
-            target_fqk = 1.0 / self.n_feature_qk
-            target_fv = 1.0 / self.n_feature_v
-            target_rqk = 1.0 / self.n_restore_qk
-            target_rv = 1.0 / self.n_restore_v
-
-            aux_loss = aux_loss + ((usage_fqk_Q - target_fqk) ** 2).sum() * self.n_feature_qk
-            aux_loss = aux_loss + ((usage_fqk_K - target_fqk) ** 2).sum() * self.n_feature_qk
-            aux_loss = aux_loss + ((usage_fv - target_fv) ** 2).sum() * self.n_feature_v
-            aux_loss = aux_loss + ((usage_rqk_Q - target_rqk) ** 2).sum() * self.n_restore_qk
-            aux_loss = aux_loss + ((usage_rqk_K - target_rqk) ** 2).sum() * self.n_restore_qk
-            aux_loss = aux_loss + ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
+        aux_loss = aux_loss + ((usage_fqk_Q - target_fqk) ** 2).sum() * self.n_feature_qk
+        aux_loss = aux_loss + ((usage_fqk_K - target_fqk) ** 2).sum() * self.n_feature_qk
+        aux_loss = aux_loss + ((usage_fv - target_fv) ** 2).sum() * self.n_feature_v
+        aux_loss = aux_loss + ((usage_rqk_Q - target_rqk) ** 2).sum() * self.n_restore_qk
+        aux_loss = aux_loss + ((usage_rqk_K - target_rqk) ** 2).sum() * self.n_restore_qk
+        aux_loss = aux_loss + ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
 
         # Top-k sparsification
         fqk_weights_Q, _ = topk_sparsify(fqk_pref_Q, self.top_k_feature_qk)
@@ -325,85 +323,49 @@ class GlobalRouters(nn.Module):
         rqk_weights_K, _ = topk_sparsify(rqk_pref_K, self.top_k_restore_qk)
         rv_weights, _ = topk_sparsify(rv_pref, self.top_k_restore_v)
 
-        # EMA usage update (training only)
-        if not deterministic:
-            self.neuron_router.update_usage(fqk_weights_Q, 'feature_q',
-                                            attention_mask, deterministic)
-            self.neuron_router.update_usage(fqk_weights_K, 'feature_k',
-                                            attention_mask, deterministic)
-            self.neuron_router.update_usage(fv_weights, 'feature_v',
-                                            attention_mask, deterministic)
-            self.neuron_router.update_usage(rqk_weights_Q, 'restore_q',
-                                            attention_mask, deterministic)
-            self.neuron_router.update_usage(rqk_weights_K, 'restore_k',
-                                            attention_mask, deterministic)
-            self.neuron_router.update_usage(rv_weights, 'restore_v',
-                                            attention_mask, deterministic)
-
-        routing_info = None
-        if return_routing_info:
-            routing_info = {
-                'fqk_weights_Q': jax.lax.stop_gradient(fqk_weights_Q),
-                'fqk_weights_K': jax.lax.stop_gradient(fqk_weights_K),
-                'fv_weights': jax.lax.stop_gradient(fv_weights),
-                'rqk_weights_Q': jax.lax.stop_gradient(rqk_weights_Q),
-                'rqk_weights_K': jax.lax.stop_gradient(rqk_weights_K),
-                'rv_weights': jax.lax.stop_gradient(rv_weights),
-                'fqk_q_pref': jax.lax.stop_gradient(fqk_pref_Q),
-                'fqk_k_pref': jax.lax.stop_gradient(fqk_pref_K),
-                'fv_pref': jax.lax.stop_gradient(fv_pref),
-                'rqk_q_pref': jax.lax.stop_gradient(rqk_pref_Q),
-                'rqk_k_pref': jax.lax.stop_gradient(rqk_pref_K),
-                'rv_pref': jax.lax.stop_gradient(rv_pref),
-                'token_routing': True,
-            }
+        # EMA usage update — always runs (no deterministic branch)
+        self.neuron_router.update_usage(fqk_weights_Q, 'feature_q', attention_mask)
+        self.neuron_router.update_usage(fqk_weights_K, 'feature_k', attention_mask)
+        self.neuron_router.update_usage(fv_weights, 'feature_v', attention_mask)
+        self.neuron_router.update_usage(rqk_weights_Q, 'restore_q', attention_mask)
+        self.neuron_router.update_usage(rqk_weights_K, 'restore_k', attention_mask)
+        self.neuron_router.update_usage(rv_weights, 'restore_v', attention_mask)
 
         return (fqk_weights_Q, fqk_weights_K, fv_weights,
                 rqk_weights_Q, rqk_weights_K, rv_weights,
-                routing_info, aux_loss)
+                aux_loss)
 
     def get_knowledge_weights(self, x, attention_mask=None,
-                              deterministic=False, return_routing_info=False):
+                              deterministic=False):
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(
             x, deterministic=deterministic)
         pref_f = jax.nn.softmax(logits_f, axis=-1)
         pref_r = jax.nn.softmax(logits_r, axis=-1)
 
-        aux_loss = jnp.float32(0.0)
-        if not deterministic:
-            if attention_mask is not None:
-                mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
-                count = mask.sum() + 1e-8
-                usage_f = (pref_f * mask).sum(axis=(0, 1)) / count
-                usage_r = (pref_r * mask).sum(axis=(0, 1)) / count
-            else:
-                usage_f = pref_f.mean(axis=(0, 1))
-                usage_r = pref_r.mean(axis=(0, 1))
+        # Load-balance aux loss — always computed
+        if attention_mask is not None:
+            mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
+            count = mask.sum() + 1e-8
+            usage_f = (pref_f * mask).sum(axis=(0, 1)) / count
+            usage_r = (pref_r * mask).sum(axis=(0, 1)) / count
+        else:
+            usage_f = pref_f.mean(axis=(0, 1))
+            usage_r = pref_r.mean(axis=(0, 1))
 
-            target_f = 1.0 / self.n_feature_know
-            target_r = 1.0 / self.n_restore_know
-            aux_loss = aux_loss + ((usage_f - target_f) ** 2).sum() * self.n_feature_know
-            aux_loss = aux_loss + ((usage_r - target_r) ** 2).sum() * self.n_restore_know
+        target_f = 1.0 / self.n_feature_know
+        target_r = 1.0 / self.n_restore_know
+        aux_loss = jnp.float32(0.0)
+        aux_loss = aux_loss + ((usage_f - target_f) ** 2).sum() * self.n_feature_know
+        aux_loss = aux_loss + ((usage_r - target_r) ** 2).sum() * self.n_restore_know
 
         feature_know_w, _ = topk_sparsify(pref_f, self.top_k_feature_know)
         restore_know_w, _ = topk_sparsify(pref_r, self.top_k_restore_know)
 
-        if not deterministic:
-            self.neuron_router.update_usage(feature_know_w, 'feature_know',
-                                            attention_mask, deterministic)
-            self.neuron_router.update_usage(restore_know_w, 'restore_know',
-                                            attention_mask, deterministic)
+        # EMA usage update — always runs
+        self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
+        self.neuron_router.update_usage(restore_know_w, 'restore_know', attention_mask)
 
-        routing_info = None
-        if return_routing_info:
-            routing_info = {
-                'feature_know_w': jax.lax.stop_gradient(feature_know_w),
-                'restore_know_w': jax.lax.stop_gradient(restore_know_w),
-                'feature_know_pref': jax.lax.stop_gradient(pref_f),
-                'restore_know_pref': jax.lax.stop_gradient(pref_r),
-            }
-
-        return feature_know_w, restore_know_w, routing_info, aux_loss
+        return feature_know_w, restore_know_w, aux_loss
 
 
 # ================================================================
@@ -426,6 +388,7 @@ class AttentionCircuit(nn.Module):
     def setup(self):
         self.d_head = self.d_model // self.n_heads
         self.expand_O = nn.Dense(self.d_model, use_bias=False)
+        self.attn_dropout = nn.Dropout(rate=self.dropout_rate)
         self.out_dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, x, shared_neurons, fqk_weights_Q, fqk_weights_K,
@@ -463,12 +426,8 @@ class AttentionCircuit(nn.Module):
 
         attn_weights = jax.nn.softmax(scores, axis=-1)
 
-        # Attention dropout
-        if not deterministic and self.dropout_rate > 0.0:
-            dropout_rng = self.make_rng('dropout')
-            keep = jax.random.bernoulli(dropout_rng, 1.0 - self.dropout_rate,
-                                        attn_weights.shape)
-            attn_weights = jnp.where(keep, attn_weights / (1.0 - self.dropout_rate), 0.0)
+        # Attention dropout — nn.Dropout is trace-safe (no Python bool branch)
+        attn_weights = self.attn_dropout(attn_weights, deterministic=deterministic)
 
         attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_weights, V)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, D)
@@ -543,12 +502,12 @@ class DAWNBlock(nn.Module):
         self.norm2 = nn.LayerNorm()
 
     def __call__(self, x, shared_neurons, router, attention_mask=None,
-                 deterministic=False, return_routing_info=False):
+                 deterministic=False):
         # Attention
         normed_x = self.norm1(x)
         (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
-         attn_routing_info, aux_loss) = router.get_attention_weights(
-            normed_x, attention_mask, deterministic, return_routing_info)
+         aux_loss) = router.get_attention_weights(
+            normed_x, attention_mask, deterministic)
         attn_out = self.attn(
             normed_x, shared_neurons,
             fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
@@ -557,27 +516,16 @@ class DAWNBlock(nn.Module):
 
         # Knowledge
         normed_x = self.norm2(x)
-        feature_know_w, restore_know_w, know_routing_info, know_aux_loss = \
+        feature_know_w, restore_know_w, know_aux_loss = \
             router.get_knowledge_weights(
-                normed_x, attention_mask, deterministic, return_routing_info)
+                normed_x, attention_mask, deterministic)
         know_out = self.knowledge(
             normed_x, shared_neurons,
             feature_know_w, restore_know_w,
             attention_mask, deterministic)
         x = x + know_out
 
-        routing_info = None
-        if return_routing_info:
-            routing_info = {
-                'attention': attn_routing_info,
-                'knowledge': know_routing_info,
-                'attn_out_norm': jax.lax.stop_gradient(
-                    jnp.linalg.norm(attn_out, axis=-1).mean()),
-                'know_out_norm': jax.lax.stop_gradient(
-                    jnp.linalg.norm(know_out, axis=-1).mean()),
-            }
-
-        return x, routing_info, aux_loss + know_aux_loss
+        return x, aux_loss + know_aux_loss
 
 
 # ================================================================
@@ -682,7 +630,7 @@ class DAWN(nn.Module):
         # lm_head uses weight tying via token_emb.attend()
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
-                 deterministic=False, return_routing_info=False):
+                 deterministic=False):
         B, S = input_ids.shape
         if S > self.max_seq_len:
             raise ValueError(
@@ -692,42 +640,51 @@ class DAWN(nn.Module):
         x = self.token_emb(input_ids) + self.pos_emb(positions)
         x = self.emb_dropout(x, deterministic=deterministic)
 
-        routing_infos = [] if return_routing_info else None
         total_aux_loss = jnp.float32(0.0)
 
         for layer in self.layers:
-            x, routing_info, aux_loss = layer(
+            x, aux_loss = layer(
                 x, self.shared_neurons, self.router,
-                attention_mask, deterministic, return_routing_info)
-            if routing_infos is not None:
-                routing_infos.append(routing_info)
+                attention_mask, deterministic)
             total_aux_loss = total_aux_loss + aux_loss
 
         x = self.norm(x)
 
-        # Weight-tied lm_head: logits = x @ embedding.T
-        logits = self.token_emb.attend(x)
-
         result = {
-            'logits': logits,
             'aux_loss': total_aux_loss,
         }
 
         if labels is not None:
-            shift_logits = logits[:, :-1, :]
+            # logits+loss under @jax.checkpoint — avoids materializing [B,S,V]
+            # during backward (recomputed instead). Saves ~7G for vocab=30522.
+            embedding_matrix = self.token_emb.embedding  # [V, D]
+            shift_x = x[:, :-1, :]                       # [B, S-1, D]
             shift_labels = labels[:, 1:].astype(jnp.int32)
-            # Cross-entropy with ignore_index=-100
             valid_mask = (shift_labels != -100)
-            safe_labels = jnp.where(valid_mask, shift_labels, 0)
-            log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
-            token_losses = -jnp.take_along_axis(
-                log_probs, safe_labels[..., jnp.newaxis], axis=-1).squeeze(-1)
-            token_losses = token_losses * valid_mask
-            loss = token_losses.sum() / (valid_mask.sum() + 1e-8)
-            result['loss'] = loss
 
-        if return_routing_info:
-            result['routing_infos'] = routing_infos
+            @jax.checkpoint
+            def compute_loss_and_acc(x_chunk, emb, labs, vmask):
+                logits = x_chunk @ emb.T                  # [B, S-1, V]
+                log_probs = jax.nn.log_softmax(logits, axis=-1)
+                safe = jnp.where(vmask, labs, 0)
+                tl = -jnp.take_along_axis(
+                    log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
+                loss = (tl * vmask).sum() / (vmask.sum() + 1e-8)
+                # Accuracy inside checkpoint to avoid returning full logits
+                preds = jnp.argmax(logits, axis=-1)
+                correct = jnp.sum((preds == labs) & vmask)
+                valid_count = jnp.sum(vmask)
+                return loss, correct, valid_count
+
+            loss, correct, valid_count = compute_loss_and_acc(
+                shift_x, embedding_matrix, shift_labels, valid_mask)
+            result['loss'] = loss
+            result['correct'] = correct
+            result['valid_count'] = valid_count
+        else:
+            # Inference: need full logits
+            logits = self.token_emb.attend(x)
+            result['logits'] = logits
 
         return result
 
