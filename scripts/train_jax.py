@@ -763,6 +763,20 @@ def main():
                 )
                 log_message(msg, training_log_file)
 
+                # TPU memory stats
+                try:
+                    mem = jax.devices()[0].memory_stats()
+                    if mem:
+                        used = mem.get('bytes_in_use', 0) / 1e9
+                        peak = mem.get('peak_bytes_in_use', 0) / 1e9
+                        limit = mem.get('bytes_limit', 0) / 1e9
+                        log_message(
+                            f"      HBM: {used:.2f}G / {limit:.2f}G "
+                            f"(peak={peak:.2f}G, free={limit - used:.2f}G)",
+                            training_log_file)
+                except Exception:
+                    pass
+
                 # Reset window
                 win_loss = 0.0
                 win_ce = 0.0
