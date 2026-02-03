@@ -49,7 +49,7 @@ model:
 
   max_seq_len: 512
   dropout: 0.1
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   d_space: 256
   router_dropout: 0.1
 
