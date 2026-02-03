@@ -5,7 +5,6 @@ Native JAX implementation:
   - jax.checkpoint for feature/restore recompute (memory optimization)
   - flax.linen modules
   - Weight tying via nn.Embed.attend()
-  - EMA usage tracking via mutable 'ema' state collection
 
 Structure (same as PyTorch):
   SharedNeurons, UnifiedNeuronRouter, GlobalRouters,
@@ -121,7 +120,6 @@ class UnifiedNeuronRouter(nn.Module):
     n_restore_know: int
     d_space: int = 64
     dropout_rate: float = 0.1
-    ema_alpha: float = 0.01
 
     def setup(self):
         total = (self.n_feature_qk + self.n_feature_v +
@@ -141,24 +139,6 @@ class UnifiedNeuronRouter(nn.Module):
 
         self.neuron_emb = self.param('neuron_emb', scaled_normal(0.02),
                                      (total, self.d_space))
-
-        # EMA usage tracking (mutable state, not gradient-tracked)
-        self.ema_feature_q = self.variable('ema', 'usage_feature_q',
-                                           jnp.zeros, (self.n_feature_qk,))
-        self.ema_feature_k = self.variable('ema', 'usage_feature_k',
-                                           jnp.zeros, (self.n_feature_qk,))
-        self.ema_feature_v = self.variable('ema', 'usage_feature_v',
-                                           jnp.zeros, (self.n_feature_v,))
-        self.ema_restore_q = self.variable('ema', 'usage_restore_q',
-                                           jnp.zeros, (self.n_restore_qk,))
-        self.ema_restore_k = self.variable('ema', 'usage_restore_k',
-                                           jnp.zeros, (self.n_restore_qk,))
-        self.ema_restore_v = self.variable('ema', 'usage_restore_v',
-                                           jnp.zeros, (self.n_restore_v,))
-        self.ema_feature_know = self.variable('ema', 'usage_feature_know',
-                                              jnp.zeros, (self.n_feature_know,))
-        self.ema_restore_know = self.variable('ema', 'usage_restore_know',
-                                              jnp.zeros, (self.n_restore_know,))
 
     def _normalize_emb(self):
         return self.neuron_emb / (jnp.linalg.norm(self.neuron_emb, axis=-1, keepdims=True) + 1e-8)
@@ -197,24 +177,6 @@ class UnifiedNeuronRouter(nn.Module):
         logits_rv = jnp.einsum('bsd,nd->bsn', h_rv, rv_emb)
 
         return logits_fqk_Q, logits_fqk_K, logits_fv, logits_rqk_Q, logits_rqk_K, logits_rv
-
-    def update_usage(self, weights, neuron_type, attention_mask=None):
-        """Update EMA usage stats. Always runs — eval safety via mutable=['ema']."""
-        if weights.ndim == 3:
-            active = (weights > 0).astype(jnp.float32)
-            if attention_mask is not None:
-                mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
-                active = active * mask
-                count = mask.sum() + 1e-8
-                usage = active.sum(axis=(0, 1)) / count
-            else:
-                usage = active.mean(axis=(0, 1))
-        else:
-            usage = (weights > 0).astype(jnp.float32).mean(axis=0)
-
-        decay = 1.0 - self.ema_alpha
-        ema_var = getattr(self, f'ema_{neuron_type}')
-        ema_var.value = ema_var.value * decay + usage * self.ema_alpha
 
 
 # ================================================================
@@ -351,14 +313,6 @@ class GlobalRouters(nn.Module):
         rqk_weights_K, _ = topk_sparsify(rqk_pref_K, self.top_k_restore_qk)
         rv_weights, _ = topk_sparsify(rv_pref, self.top_k_restore_v)
 
-        # EMA usage update — always runs (no deterministic branch)
-        self.neuron_router.update_usage(fqk_weights_Q, 'feature_q', attention_mask)
-        self.neuron_router.update_usage(fqk_weights_K, 'feature_k', attention_mask)
-        self.neuron_router.update_usage(fv_weights, 'feature_v', attention_mask)
-        self.neuron_router.update_usage(rqk_weights_Q, 'restore_q', attention_mask)
-        self.neuron_router.update_usage(rqk_weights_K, 'restore_k', attention_mask)
-        self.neuron_router.update_usage(rv_weights, 'restore_v', attention_mask)
-
         return (fqk_weights_Q, fqk_weights_K, fv_weights,
                 rqk_weights_Q, rqk_weights_K, rv_weights,
                 aux_loss)
@@ -388,10 +342,6 @@ class GlobalRouters(nn.Module):
 
         feature_know_w, _ = topk_sparsify(pref_f, self.top_k_feature_know)
         restore_know_w, _ = topk_sparsify(pref_r, self.top_k_restore_know)
-
-        # EMA usage update — always runs
-        self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
-        self.neuron_router.update_usage(restore_know_w, 'restore_know', attention_mask)
 
         return feature_know_w, restore_know_w, aux_loss
 
@@ -576,8 +526,7 @@ class DAWN(nn.Module):
         variables = model.init(rng, input_ids)
         output = model.apply(variables, input_ids, labels=labels,
                              deterministic=False,
-                             rngs={'dropout': dropout_rng},
-                             mutable=['ema'])
+                             rngs={'dropout': dropout_rng})
     """
     __version__ = "17.1-JAX"
 
