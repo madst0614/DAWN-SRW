@@ -489,6 +489,9 @@ def main():
     print(f"Config: {config_path}")
     print(f"Seed: {seed}")
 
+    # Enable JIT compile logging — helps distinguish OOM vs compilation errors
+    jax.config.update("jax_log_compiles", True)
+
     # ----------------------------------------------------------
     # Load data
     # ----------------------------------------------------------
@@ -533,6 +536,50 @@ def main():
 
     rank = cfg['model'].get('rank', 64)
     knowledge_rank = cfg['model'].get('knowledge_rank', 128)
+
+    # ----------------------------------------------------------
+    # OOM check: dummy forward pass with actual batch shape
+    # ----------------------------------------------------------
+    print(f"\n--- OOM check: dummy forward with batch_size={batch_size}, seq_len={max_seq_len} ---")
+    try:
+        dummy_batch = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
+        dummy_labels = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
+        dummy_mask = jnp.ones((batch_size, max_seq_len), dtype=jnp.int32)
+        rng, dummy_dropout_rng = jax.random.split(rng)
+
+        # Training forward (deterministic=False uses dropout → more memory)
+        dummy_result, dummy_updated = model.apply(
+            {'params': params, 'ema': ema_state},
+            dummy_batch,
+            labels=dummy_labels,
+            attention_mask=dummy_mask,
+            deterministic=False,
+            rngs={'dropout': dummy_dropout_rng},
+            mutable=['ema'],
+        )
+        jax.block_until_ready(dummy_result['loss'])
+        print(f"  Forward OK — loss={float(dummy_result['loss']):.4f}")
+
+        # Eval forward (deterministic=True)
+        dummy_eval_result, _ = model.apply(
+            {'params': params, 'ema': ema_state},
+            dummy_batch,
+            labels=dummy_labels,
+            attention_mask=dummy_mask,
+            deterministic=True,
+            rngs={'dropout': dummy_dropout_rng},
+            mutable=['ema'],
+        )
+        jax.block_until_ready(dummy_eval_result['loss'])
+        print(f"  Eval forward OK — loss={float(dummy_eval_result['loss']):.4f}")
+
+        del dummy_batch, dummy_labels, dummy_mask, dummy_result, dummy_updated, dummy_eval_result
+        print("--- OOM check passed ---\n")
+    except Exception as e:
+        print(f"  *** OOM check FAILED: {e}")
+        print(f"  This likely means the model is too large for the device memory.")
+        print(f"  Try reducing batch_size or enabling gradient_checkpointing.")
+        raise
 
     # ----------------------------------------------------------
     # Optimizer (warmup + cosine decay + optional gradient accumulation)
