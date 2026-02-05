@@ -1,0 +1,9 @@
+jax[tpu]>=0.4.1
+jaxlib>=0.4.1
+flax>=0.7.0
+optax>=0.1.5
+numpy>=1.24.0
+gcsfs>=2023.6.0
+pyyaml>=6.0
+transformers>=4.30.0
+datasets>=2.12.0
