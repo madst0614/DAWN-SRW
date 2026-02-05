@@ -322,9 +322,67 @@ QK_POOLS = {
 # Model Loading Utilities
 # ============================================================
 
+def _load_flax_model(checkpoint_path: str, device: str = 'cuda'):
+    """Load a .flax checkpoint by converting to PyTorch on the fly."""
+    from models import create_model_by_version, normalize_version
+    from transformers import BertTokenizerFast
+
+    try:
+        from scripts.convert_flax_to_pt import load_flax_checkpoint, convert_dawn_params, convert_baseline_params
+    except ImportError:
+        # Try relative import
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "convert_flax_to_pt",
+            str(PROJECT_ROOT / "scripts" / "convert_flax_to_pt.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        load_flax_checkpoint = mod.load_flax_checkpoint
+        convert_dawn_params = mod.convert_dawn_params
+        convert_baseline_params = mod.convert_baseline_params
+
+    print(f"  Converting .flax → PyTorch (in-memory)...")
+    ckpt = load_flax_checkpoint(checkpoint_path)
+    config = ckpt.get('config', {})
+
+    version = config.get('model_version', '')
+    if version in ('baseline', 'baseline-JAX'):
+        state_dict = convert_baseline_params(ckpt['params'])
+        config['model_version'] = 'baseline'
+    else:
+        state_dict = convert_dawn_params(ckpt['params'])
+        config['model_version'] = '17.1'
+
+    version = normalize_version(config['model_version'])
+    print(f"  Model version: {version}")
+
+    model = create_model_by_version(version, config)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    # Filter expected missing keys (GlobalSSM — JAX doesn't have it)
+    real_missing = [k for k in missing if not any(
+        s in k for s in ['global_ssm', 'ssm_norm', 'importance_proj',
+                          'context_proj', 'context_scale',
+                          'A_log', 'W_delta', 'W_B', 'W_C']
+    )]
+    if real_missing:
+        print(f"  WARNING - Missing keys: {real_missing[:10]}")
+    if unexpected:
+        print(f"  WARNING - Unexpected keys: {unexpected[:10]}")
+
+    model.to(device)
+    model.eval()
+
+    tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
+    return model, tokenizer, config
+
+
 def load_model(checkpoint_path: str, device: str = 'cuda'):
     """
     Load DAWN v17.1 model from checkpoint.
+
+    Supports both .pt (PyTorch) and .flax (JAX/Flax) checkpoints.
+    Flax checkpoints are automatically converted to PyTorch format.
 
     Args:
         checkpoint_path: Path to checkpoint file or directory
@@ -337,8 +395,13 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
     from transformers import BertTokenizerFast
 
     path = Path(checkpoint_path)
+    is_flax = False
+
     if path.is_dir():
+        # Look for best checkpoint: prefer .pt, fall back to .flax
         pt_files = list(path.glob('*.pt'))
+        flax_files = list(path.glob('*.flax'))
+
         for f in pt_files:
             if 'best' in f.name.lower() or 'final' in f.name.lower():
                 checkpoint_path = str(f)
@@ -346,8 +409,23 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
         else:
             if pt_files:
                 checkpoint_path = str(sorted(pt_files, key=os.path.getmtime)[-1])
+            elif flax_files:
+                # No .pt files, use .flax
+                for f in flax_files:
+                    if 'best' in f.name.lower():
+                        checkpoint_path = str(f)
+                        break
+                else:
+                    checkpoint_path = str(sorted(flax_files, key=os.path.getmtime)[-1])
+                is_flax = True
+    elif str(checkpoint_path).endswith('.flax'):
+        is_flax = True
 
     print(f"Loading: {checkpoint_path}")
+
+    if is_flax:
+        return _load_flax_model(checkpoint_path, device)
+
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint.get('model_config', checkpoint.get('config', {}))
     state_dict = checkpoint.get('model_state_dict', checkpoint)
