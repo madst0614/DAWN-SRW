@@ -17,6 +17,7 @@ Usage:
 import sys
 import os
 import signal
+import json
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -32,6 +33,7 @@ import argparse
 import yaml
 from datetime import datetime
 from functools import partial
+from tqdm import tqdm
 
 from models.model_v17_1_jax import DAWN
 from models.baseline_transformer_jax import VanillaTransformer
@@ -448,7 +450,11 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200):
     total_correct = 0
     total_valid = 0
 
-    for batch_idx, (input_ids, attention_mask) in enumerate(val_loader):
+    eval_total = min(max_batches, len(val_loader))
+    eval_pbar = tqdm(val_loader, desc="Evaluating", leave=False,
+                     total=eval_total, dynamic_ncols=True, position=0)
+
+    for batch_idx, (input_ids, attention_mask) in enumerate(eval_pbar):
         if batch_idx >= max_batches:
             break
 
@@ -464,6 +470,7 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200):
         total_correct += int(correct[0])
         total_valid += n_valid
 
+    eval_pbar.close()
     avg_loss = total_loss / total_valid if total_valid > 0 else 0.0
     avg_acc = total_correct / total_valid if total_valid > 0 else 0.0
     return avg_loss, avg_acc
@@ -474,7 +481,7 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200):
 # ============================================================
 
 def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config,
-                    step_in_epoch=0, steps_per_epoch=0):
+                    step_in_epoch=0, steps_per_epoch=0, training_config=None):
     """Save checkpoint using flax serialization. Supports local and GCS paths."""
     import flax.serialization as serialization
     ckpt = {
@@ -486,6 +493,7 @@ def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_c
         'steps_per_epoch': steps_per_epoch,
         'best_val_loss': best_val_loss,
         'config': model_config,
+        'training_config': training_config or {},
     }
     bytes_data = serialization.to_bytes(ckpt)
 
@@ -508,6 +516,7 @@ def load_checkpoint(path, target_params, target_opt_state):
         'steps_per_epoch': 0,
         'best_val_loss': float('inf'),
         'config': {},
+        'training_config': {},
     }
     ckpt = serialization.from_bytes(target, bytes_data)
     print(f"  Checkpoint loaded: {path}")
@@ -536,6 +545,32 @@ def format_time(seconds):
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h}:{m:02d}:{s:02d}"
+
+
+def log_jsonl(jsonl_file, record):
+    """Append a JSON-lines record to a .jsonl log file."""
+    if not jsonl_file:
+        return
+    try:
+        line = json.dumps(record, default=str)
+        with _open_file(jsonl_file, 'a') as f:
+            f.write(line + '\n')
+    except Exception:
+        pass
+
+
+def check_nan_inf(metrics_dict, global_step, epoch):
+    """Check for NaN/INF in loss metrics. Returns True if NaN/INF detected."""
+    total = metrics_dict.get('total_loss', 0.0)
+    if np.isnan(total) or np.isinf(total):
+        print(f"\n[WARNING] NaN/INF detected at step {global_step}!")
+        print(f"  total_loss: {total}")
+        print(f"  ce_loss:    {metrics_dict.get('ce_loss', 'N/A')}")
+        print(f"  aux_loss:   {metrics_dict.get('aux_loss', 'N/A')}")
+        print(f"  orth_loss:  {metrics_dict.get('orth_loss', 'N/A')}")
+        print(f"  div_loss:   {metrics_dict.get('div_loss', 'N/A')}")
+        return True
+    return False
 
 
 # ============================================================
@@ -573,7 +608,7 @@ def main():
     seed = cfg.get('seed', 42)
     set_seed(seed)
 
-    # Training params
+    # Training params (from YAML first, may be overridden by checkpoint config below)
     tcfg = cfg['training']
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
@@ -590,6 +625,70 @@ def main():
     log_dir = cfg.get('log_dir', 'logs_jax')
     _makedirs(log_dir)
     _makedirs(checkpoint_dir)
+
+    # ----------------------------------------------------------
+    # Detect resume path early (for config override)
+    # ----------------------------------------------------------
+    resume_path = None
+    if cli_args.resume:
+        rp = cli_args.resume
+        if _file_exists(rp):
+            resume_path = rp
+        else:
+            candidates = _list_files(rp, "*.flax")
+            if candidates:
+                resume_path = candidates[-1]
+    elif not cli_args.from_scratch:
+        candidates = _list_files(checkpoint_dir, "*.flax")
+        if candidates:
+            resume_path = candidates[-1]
+
+    # ----------------------------------------------------------
+    # Resume config override: load training config from checkpoint
+    # ----------------------------------------------------------
+    if resume_path and _file_exists(resume_path):
+        # Try config.json in checkpoint dir first (lightweight)
+        ckpt_parent = str(resume_path).rsplit('/', 1)[0] if '/' in str(resume_path) else str(Path(resume_path).parent)
+        config_json_path = ckpt_parent + '/config.json' if _is_gcs(ckpt_parent) else str(Path(ckpt_parent) / 'config.json')
+
+        saved_training_config = None
+        if _file_exists(config_json_path):
+            try:
+                with _open_file(config_json_path, 'r') as f:
+                    content = f.read()
+                saved_cfg = json.loads(content)
+                saved_training_config = saved_cfg.get('training')
+                print(f"  Loaded training config from {config_json_path}")
+            except Exception as e:
+                print(f"  Warning: Failed to read config.json: {e}")
+                saved_cfg = None
+
+        if saved_training_config:
+            # Apply checkpoint training config (CLI args take precedence)
+            if cli_args.batch_size is None:
+                batch_size = saved_training_config.get('batch_size', batch_size)
+            if cli_args.epochs is None:
+                num_epochs = saved_training_config.get('num_epochs', num_epochs)
+            if cli_args.lr is None:
+                lr = saved_training_config.get('lr', lr)
+            weight_decay = saved_training_config.get('weight_decay', weight_decay)
+            warmup_ratio = saved_training_config.get('warmup_ratio', warmup_ratio)
+            orth_weight = saved_training_config.get('orthogonality_weight', orth_weight)
+            div_weight = saved_training_config.get('diversity_weight', div_weight)
+            lb_weight = saved_training_config.get('load_balance_weight', lb_weight)
+            print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
+
+    # Build training_config dict for saving in checkpoints
+    training_config = {
+        'batch_size': batch_size,
+        'num_epochs': num_epochs,
+        'lr': lr,
+        'weight_decay': weight_decay,
+        'warmup_ratio': warmup_ratio,
+        'orthogonality_weight': orth_weight,
+        'diversity_weight': div_weight,
+        'load_balance_weight': lb_weight,
+    }
 
     # ----------------------------------------------------------
     # Detect devices
@@ -749,28 +848,12 @@ def main():
     print(f"  LB weight: {lb_weight}")
 
     # ----------------------------------------------------------
-    # Resume from checkpoint
+    # Resume from checkpoint (resume_path detected earlier for config override)
     # ----------------------------------------------------------
     start_epoch = 0
     global_step = 0
     start_step_in_epoch = 0
     best_val_loss = float('inf')
-
-    resume_path = None
-    if cli_args.resume:
-        rp = cli_args.resume
-        if _file_exists(rp):
-            resume_path = rp
-        else:
-            # Try as directory — pick latest (including emergency checkpoints)
-            candidates = _list_files(rp, "*.flax")
-            if candidates:
-                resume_path = candidates[-1]
-    elif not cli_args.from_scratch:
-        # Auto-search for latest checkpoint (including emergency)
-        candidates = _list_files(checkpoint_dir, "*.flax")
-        if candidates:
-            resume_path = candidates[-1]
 
     if resume_path and _file_exists(resume_path):
         print(f"\nResuming from: {resume_path}")
@@ -797,6 +880,19 @@ def main():
             print("\nNo checkpoint found. Starting from scratch.")
         else:
             print("\nStarting from scratch (--from-scratch).")
+
+    # Save config.json for this run (model + training config)
+    try:
+        if _is_gcs(checkpoint_dir):
+            cj_path = checkpoint_dir.rstrip('/') + '/config.json'
+        else:
+            cj_path = str(Path(checkpoint_dir) / 'config.json')
+        full_cfg = {'model': cfg['model'], 'training': training_config}
+        with _open_file(cj_path, 'w') as f:
+            f.write(json.dumps(full_cfg, indent=2, default=str))
+        print(f"  Saved config.json: {cj_path}")
+    except Exception as e:
+        print(f"  Warning: Failed to save config.json: {e}")
 
     # ----------------------------------------------------------
     # Replicate params/opt_state across devices
@@ -839,6 +935,12 @@ def main():
     log_message(f"Total steps: {total_steps}", training_log_file)
     log_message("", training_log_file)
 
+    # JSONL structured log file (machine-readable metrics)
+    if _is_gcs(log_dir):
+        jsonl_log_file = log_dir_str + f'metrics_{timestamp}.jsonl'
+    else:
+        jsonl_log_file = str(Path(log_dir) / f'metrics_{timestamp}.jsonl')
+
     # ----------------------------------------------------------
     # Set data loader resume position
     # ----------------------------------------------------------
@@ -872,6 +974,7 @@ def main():
                 cfg['model'],
                 step_in_epoch=epoch_step_counter,
                 steps_per_epoch=steps_per_epoch,
+                training_config=training_config,
             )
             print(f"!!! Emergency checkpoint saved: {epath} !!!", flush=True)
         except Exception as e:
@@ -912,14 +1015,19 @@ def main():
         win_count = 0
         win_start_time = time.time()
 
-        for local_step, (input_ids, attention_mask) in enumerate(train_loader):
+        pbar_initial = start_step_in_epoch if epoch == start_epoch else 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]",
+                    initial=pbar_initial, total=steps_per_epoch,
+                    dynamic_ncols=True, position=0)
+
+        for local_step, (input_ids, attention_mask) in enumerate(pbar):
 
             if preemption_requested[0]:
                 print("Preemption requested — exiting training loop.", flush=True)
                 break
 
             if not first_step_done:
-                print(f"=== First train_step: compiling pmap JIT (this may take minutes) ===", flush=True)
+                pbar.set_description(f"Epoch {epoch} [Compiling JIT]")
 
             # Ensure sharded for pmap
             input_ids = shard_batch(input_ids, n_devices)
@@ -937,7 +1045,8 @@ def main():
             if not first_step_done:
                 # Force sync to catch OOM here, not later
                 jax.block_until_ready(metrics['total_loss'])
-                print(f"=== First train_step done -- loss={float(metrics['total_loss'][0]):.4f} ===", flush=True)
+                pbar.set_description(f"Epoch {epoch} [Train]")
+                print(f"\n=== First train_step done -- loss={float(metrics['total_loss'][0]):.4f} ===", flush=True)
                 first_step_done = True
 
             # Extract metrics (take first device, already aggregated via pmean/psum)
@@ -948,6 +1057,14 @@ def main():
             m_div = float(metrics['div_loss'][0])
             m_correct = int(metrics['correct'][0])
             m_valid = int(metrics['valid_count'][0])
+
+            # NaN/INF detection
+            if check_nan_inf({
+                'total_loss': m_total, 'ce_loss': m_ce, 'aux_loss': m_aux,
+                'orth_loss': m_orth, 'div_loss': m_div,
+            }, global_step + 1, epoch):
+                pbar.close()
+                raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {global_step + 1}")
 
             epoch_loss += m_ce * m_valid
             epoch_correct += m_correct
@@ -994,6 +1111,31 @@ def main():
                 )
                 log_message(msg, training_log_file)
 
+                # Update tqdm postfix
+                pbar.set_postfix(
+                    loss=f"{avg_loss:.4f}",
+                    ce=f"{avg_ce:.4f}",
+                    acc=f"{avg_acc:.4f}",
+                    lr=f"{current_lr:.2e}",
+                )
+
+                # JSONL structured log
+                log_jsonl(jsonl_log_file, {
+                    'type': 'train',
+                    'step': global_step,
+                    'epoch': epoch,
+                    'total_loss': avg_loss,
+                    'ce_loss': avg_ce,
+                    'aux_loss': avg_aux,
+                    'orth_loss': avg_orth,
+                    'div_loss': avg_div,
+                    'accuracy': avg_acc,
+                    'lr': current_lr,
+                    'steps_per_sec': steps_per_sec,
+                    'elapsed': total_elapsed,
+                    'timestamp': datetime.now().isoformat(),
+                })
+
                 # TPU memory stats
                 try:
                     mem = jax.devices()[0].memory_stats()
@@ -1028,6 +1170,14 @@ def main():
                     f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}",
                     training_log_file,
                 )
+                log_jsonl(jsonl_log_file, {
+                    'type': 'val',
+                    'step': global_step,
+                    'epoch': epoch,
+                    'val_loss': val_loss,
+                    'val_acc': val_acc,
+                    'timestamp': datetime.now().isoformat(),
+                })
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -1040,6 +1190,7 @@ def main():
                         cfg['model'],
                         step_in_epoch=epoch_step_counter,
                         steps_per_epoch=steps_per_epoch,
+                        training_config=training_config,
                     )
                     del params_single, opt_state_single
                     log_message(f"  New best model saved! val_loss={best_val_loss:.4f}", training_log_file)
@@ -1055,9 +1206,12 @@ def main():
                     cfg['model'],
                     step_in_epoch=epoch_step_counter,
                     steps_per_epoch=steps_per_epoch,
+                    training_config=training_config,
                 )
                 del params_single, opt_state_single
                 cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
+
+        pbar.close()
 
         if preemption_requested[0]:
             break
@@ -1080,6 +1234,17 @@ def main():
         val_loader.reset()
         val_loss, val_acc = evaluate(eval_step_fn, params, val_loader, n_devices)
         log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}", training_log_file)
+        log_jsonl(jsonl_log_file, {
+            'type': 'val_epoch',
+            'step': global_step,
+            'epoch': epoch,
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'train_loss': epoch_avg_loss,
+            'train_acc': epoch_avg_acc,
+            'epoch_time': epoch_elapsed,
+            'timestamp': datetime.now().isoformat(),
+        })
 
         is_best = val_loss < best_val_loss
         if is_best:
@@ -1096,6 +1261,7 @@ def main():
             cfg['model'],
             step_in_epoch=0,  # start of next epoch
             steps_per_epoch=steps_per_epoch,
+            training_config=training_config,
         )
         if is_best:
             save_checkpoint(
@@ -1105,6 +1271,7 @@ def main():
                 cfg['model'],
                 step_in_epoch=0,
                 steps_per_epoch=steps_per_epoch,
+                training_config=training_config,
             )
             log_message(f"  New best model! val_loss={best_val_loss:.4f}", training_log_file)
 

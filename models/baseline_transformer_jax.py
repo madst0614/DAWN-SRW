@@ -189,3 +189,11 @@ class VanillaTransformer(nn.Module):
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'max_seq_len': self.max_seq_len,
         }
+
+    def get_model_info(self):
+        return [
+            f"  Model: VanillaTransformer (baseline-JAX)",
+            f"  d_model={self.d_model}, d_ff={self.d_ff}, n_layers={self.n_layers}, n_heads={self.n_heads}",
+            f"  max_seq_len={self.max_seq_len}, dropout={self.dropout_rate}",
+            f"  gradient_checkpointing={self.gradient_checkpointing}",
+        ]
