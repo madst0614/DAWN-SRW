@@ -760,48 +760,6 @@ def main():
     knowledge_rank = cfg['model'].get('knowledge_rank', 128)
 
     # ----------------------------------------------------------
-    # OOM check: dummy forward pass with per-device batch shape
-    # ----------------------------------------------------------
-    print(f"\n=== OOM check: dummy forward with per_device_batch={per_device_batch}, seq_len={max_seq_len} ===", flush=True)
-    try:
-        dummy_batch = jnp.zeros((per_device_batch, max_seq_len), dtype=jnp.int32)
-        dummy_labels = jnp.zeros((per_device_batch, max_seq_len), dtype=jnp.int32)
-        dummy_mask = jnp.ones((per_device_batch, max_seq_len), dtype=jnp.int32)
-        rng, dummy_dropout_rng = jax.random.split(rng)
-
-        # Training forward (deterministic=False uses dropout -> more memory)
-        dummy_result = model.apply(
-            {'params': params},
-            dummy_batch,
-            labels=dummy_labels,
-            attention_mask=dummy_mask,
-            deterministic=False,
-            rngs={'dropout': dummy_dropout_rng},
-        )
-        jax.block_until_ready(dummy_result['loss'])
-        print(f"  Forward OK -- loss={float(dummy_result['loss']):.4f}", flush=True)
-
-        # Eval forward (deterministic=True)
-        dummy_eval_result = model.apply(
-            {'params': params},
-            dummy_batch,
-            labels=dummy_labels,
-            attention_mask=dummy_mask,
-            deterministic=True,
-            rngs={'dropout': dummy_dropout_rng},
-        )
-        jax.block_until_ready(dummy_eval_result['loss'])
-        print(f"  Eval forward OK -- loss={float(dummy_eval_result['loss']):.4f}", flush=True)
-
-        del dummy_batch, dummy_labels, dummy_mask, dummy_result, dummy_eval_result
-        print("=== OOM check passed ===\n", flush=True)
-    except Exception as e:
-        print(f"  *** OOM check FAILED: {e}")
-        print(f"  This likely means the model is too large for the device memory.")
-        print(f"  Try reducing batch_size or enabling gradient_checkpointing.")
-        raise
-
-    # ----------------------------------------------------------
     # Optimizer (warmup + cosine decay + optional gradient accumulation)
     # ----------------------------------------------------------
     grad_accum_steps = tcfg.get('gradient_accumulation_steps', 1)
@@ -913,9 +871,29 @@ def main():
     eval_step_fn = create_eval_step(model, n_devices=n_devices)
 
     # ----------------------------------------------------------
-    # Pre-compile train_step
+    # OOM check + JIT pre-compile: real train_step (forward + backward)
     # ----------------------------------------------------------
-    print("\n=== Compiling train_step (pmap, first call will trace) ===", flush=True)
+    print(f"\n=== OOM check: real train_step (forward+backward) "
+          f"per_device_batch={per_device_batch}, seq_len={max_seq_len} ===", flush=True)
+    try:
+        dummy_ids = jnp.zeros((n_devices, per_device_batch, max_seq_len), dtype=jnp.int32)
+        dummy_mask = jnp.ones((n_devices, per_device_batch, max_seq_len), dtype=jnp.int32)
+        rng, dummy_step_rng = jax.random.split(rng)
+        dummy_dropout_keys = jax.random.split(dummy_step_rng, n_devices)
+
+        _dummy_params, _dummy_opt, dummy_metrics = train_step_fn(
+            params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys,
+        )
+        jax.block_until_ready(dummy_metrics['total_loss'])
+        print(f"  train_step OK -- loss={float(dummy_metrics['total_loss'][0]):.4f}", flush=True)
+
+        del _dummy_params, _dummy_opt, dummy_metrics, dummy_ids, dummy_mask, dummy_dropout_keys
+        print("=== OOM check passed (JIT compiled) ===\n", flush=True)
+    except Exception as e:
+        print(f"\n  *** OOM check FAILED: {e}")
+        print(f"  The model + gradients do not fit in device memory.")
+        print(f"  Try: reduce batch_size, enable gradient_checkpointing, or use a smaller model.")
+        raise
 
     # ----------------------------------------------------------
     # Training log file
@@ -994,7 +972,6 @@ def main():
     total_micro_steps = num_epochs * steps_per_epoch
     val_interval = cfg['training'].get('val_interval', 5000)
     ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
-    first_step_done = False
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
     for epoch in range(start_epoch, num_epochs):
@@ -1026,9 +1003,6 @@ def main():
                 print("Preemption requested — exiting training loop.", flush=True)
                 break
 
-            if not first_step_done:
-                pbar.set_description(f"Epoch {epoch} [Compiling JIT]")
-
             # Ensure sharded for pmap
             input_ids = shard_batch(input_ids, n_devices)
             attention_mask = shard_batch(attention_mask, n_devices)
@@ -1041,13 +1015,6 @@ def main():
                 params, opt_state,
                 input_ids, attention_mask, dropout_keys,
             )
-
-            if not first_step_done:
-                # Force sync to catch OOM here, not later
-                jax.block_until_ready(metrics['total_loss'])
-                pbar.set_description(f"Epoch {epoch} [Train]")
-                print(f"\n=== First train_step done -- loss={float(metrics['total_loss'][0]):.4f} ===", flush=True)
-                first_step_done = True
 
             # Extract metrics (take first device, already aggregated via pmean/psum)
             m_total = float(metrics['total_loss'][0])
