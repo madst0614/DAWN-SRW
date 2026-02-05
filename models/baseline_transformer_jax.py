@@ -113,9 +113,10 @@ class VanillaTransformer(nn.Module):
                                   embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(self.max_seq_len, self.d_model,
                                 embedding_init=scaled_normal(0.02))
+        LayerCls = nn.remat(TransformerLayer) if self.gradient_checkpointing else TransformerLayer
         self.layers = [
-            TransformerLayer(self.d_model, self.n_heads, self.d_ff,
-                             self.dropout_rate, name=f'layer_{i}')
+            LayerCls(self.d_model, self.n_heads, self.d_ff,
+                     self.dropout_rate, name=f'layer_{i}')
             for i in range(self.n_layers)
         ]
         self.norm = nn.LayerNorm()
@@ -134,10 +135,7 @@ class VanillaTransformer(nn.Module):
             x = jnp.where(mask, x / keep, 0.0)
 
         for layer in self.layers:
-            if self.gradient_checkpointing and not self.is_initializing():
-                x = jax.checkpoint(layer)(x, deterministic)
-            else:
-                x = layer(x, deterministic)
+            x = layer(x, deterministic)
 
         x = self.norm(x)
 
