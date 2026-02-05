@@ -56,9 +56,14 @@ def feature_fn(x, neurons, weights):
 
 @jax.checkpoint
 def restore_fn(h, neurons, weights):
-    """Restore: h [B,S,R] -> out [B,S,D]. Intermediate [B,S,N,D] not saved."""
-    all_out = jnp.einsum('bsr,nrd->bsnd', h, neurons)
-    return jnp.einsum('bsnd,bsn->bsd', all_out, weights)
+    """Restore: h [B,S,R] -> out [B,S,D].
+
+    Contraction order: (h ⊗ weights) @ neurons
+    Intermediate is [B,S,N,R] instead of [B,S,N,D], saving ~12x memory
+    when R << D (e.g. rank=64 vs d_model=768).
+    """
+    pre = jnp.einsum('bsr,bsn->bsnr', h, weights)  # [B,S,N,R]
+    return jnp.einsum('bsnr,nrd->bsd', pre, neurons)
 
 
 # ================================================================
