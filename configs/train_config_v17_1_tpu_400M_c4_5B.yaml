@@ -20,19 +20,19 @@ model:
 
   n_feature_qk: 192
   n_feature_v: 768
-  top_k_feature_qk: 12
-  top_k_feature_v: 12
+  top_k_feature_qk: 24
+  top_k_feature_v: 24
 
   n_restore_qk: 192
   n_restore_v: 768
-  top_k_restore_qk: 12
-  top_k_restore_v: 12
+  top_k_restore_qk: 24
+  top_k_restore_v: 24
 
   n_feature_know: 480
   n_restore_know: 480
   knowledge_rank: 64
-  top_k_feature_know: 12
-  top_k_restore_know: 12
+  top_k_feature_know: 24
+  top_k_restore_know: 24
 
   max_seq_len: 512
   dropout: 0.1
