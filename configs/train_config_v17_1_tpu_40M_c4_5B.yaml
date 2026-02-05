@@ -8,7 +8,7 @@ data:
   # Pretokenized .bin files (produced by scripts/pretokenize_c4.py)
   # Train: 20 shards, 20B tokens total (loader uses max_train_tokens subset)
   bin_train: gs://dawn-tpu-data-c4/c4_train    # sharded — reads c4_train_meta.json
-  bin_val: gs://dawn-tpu-data-c4/c4_val.bin     # TODO: pretokenize val set if not done
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
   max_train_tokens: 5000000000   # 5B tokens (out of 20B available)
   max_val_tokens: 10000000       # 10M tokens
   local_cache_dir: /tmp/data     # GCS → local SSD for memmap (40GB won't fit in RAM)
