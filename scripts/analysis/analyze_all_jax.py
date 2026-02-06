@@ -52,6 +52,13 @@ Usage:
         --output results/ \
         --only table1,table2  # table1 -> model_info,performance, table2 -> health
 
+    # Training mode (essential analyses for monitoring training progress)
+    python scripts/analysis/analyze_all.py \
+        --checkpoint dawn.pt \
+        --val_data val.pt \
+        --output results/ \
+        --only train  # model_info,performance,health,routing,embedding
+
     # Custom batch settings (faster)
     python scripts/analysis/analyze_all.py \
         --checkpoint dawn.pt \
@@ -94,6 +101,7 @@ CLI Arguments:
         --only            Run only specific analyses (comma-separated)
                           Figures: fig3,fig4,fig5,fig6,fig7 (auto-expand to required analyses)
                           Tables: table1,table2
+                          Shortcuts: train (model_info,performance,health,routing,embedding)
                           Analyses: model_info,performance,health,routing,embedding,
                                     neuron_embedding,semantic,pos,token_combination,
                                     neuron_features,layerwise_semantic,factual,behavioral,
@@ -3509,6 +3517,9 @@ class ModelAnalyzer:
         # Shortcuts
         'all_figs': ['routing', 'neuron_features', 'factual'],
         'all_tables': ['model_info', 'performance', 'health'],
+        # Training mode: essential analyses for monitoring training progress
+        # Includes: model info, performance (loss/PPL), neuron health, routing patterns, embeddings
+        'train': ['model_info', 'performance', 'health', 'routing', 'embedding'],
     }
 
     def _expand_figure_names(self, only: List[str]) -> List[str]:
@@ -4201,6 +4212,7 @@ Examples:
     parser.add_argument('--paper-only', action='store_true', help='Generate paper outputs only (faster)')
     parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated). '
                         'Figures: fig3,fig4,fig5,fig6,fig7 | Tables: table1,table2 | '
+                        'Shortcuts: train (model_info,performance,health,routing,embedding) | '
                         'Analyses: model_info,performance,health,routing,embedding,semantic,pos,'
                         'token_combination,neuron_features,layerwise_semantic,factual,behavioral,'
                         'coselection,weight,v18,paper,report')
