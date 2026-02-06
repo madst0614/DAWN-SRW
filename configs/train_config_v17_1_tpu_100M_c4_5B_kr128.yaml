@@ -1,6 +1,8 @@
 # DAWN v17.1-TPU Training Config - 100M Scale, 5B tokens, knowledge_rank=128
 # For TPU multi-device training with pretokenized .bin data
-# Same as 100M config but with knowledge_rank 64→128
+# Ablation: fewer neurons × wider rank (param-matched to base 100M)
+# Base: 224 neurons × rank64 = 22.02M params
+# This: 112 neurons × rank128 = 22.02M params (same)
 
 seed: 1
 
@@ -28,8 +30,8 @@ model:
   top_k_restore_qk: 16
   top_k_restore_v: 16
 
-  n_feature_know: 224
-  n_restore_know: 224
+  n_feature_know: 112
+  n_restore_know: 112
   knowledge_rank: 128
   top_k_feature_know: 16
   top_k_restore_know: 16
