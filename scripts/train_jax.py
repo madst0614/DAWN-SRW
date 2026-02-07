@@ -7,11 +7,14 @@ JAX/Flax native training for DAWN v17.1 model.
 - GCS checkpoint support for TPU spot instances
 - optax optimizer with warmup + cosine decay
 - jax.jit / jax.pmap compiled train/eval steps
+- Auto-resume: automatically finds latest checkpoint in config's checkpoint_dir
 
 Usage:
+    # Just provide config - auto-resumes if checkpoint exists, otherwise starts fresh
     python scripts/train_jax.py --config configs/train_config_tpu.yaml
+
+    # Force start from scratch (ignores existing checkpoints)
     python scripts/train_jax.py --config configs/train_config_tpu.yaml --from-scratch
-    python scripts/train_jax.py --config configs/train_config_tpu.yaml --resume gs://bucket/checkpoints/step1000.flax
 """
 
 import sys
@@ -645,8 +648,6 @@ def main():
     parser = argparse.ArgumentParser(description='Train DAWN v17.1 (JAX/Flax, Multi-Device)')
     parser.add_argument('--config', type=str, required=True,
                         help='Path to config YAML file')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint file or directory to resume from (local or gs://)')
     parser.add_argument('--from-scratch', action='store_true',
                         help='Start training from scratch (ignore existing checkpoints)')
     parser.add_argument('--epochs', type=int, default=None,
@@ -726,36 +727,16 @@ def main():
                 if d.is_dir() and d.name.startswith('run_')
             ])
 
-    if cli_args.resume:
-        rp = cli_args.resume
-        if _file_exists(rp):
-            # Direct .flax file — run folder is its parent
-            resume_path = rp
-            if _is_gcs(rp):
-                checkpoint_dir = rp.rsplit('/', 1)[0]
-            else:
-                checkpoint_dir = str(Path(rp).parent)
-            print(f"  Resuming from checkpoint: {resume_path}")
-            print(f"  Continuing in run folder: {checkpoint_dir}")
-        else:
-            # Could be a folder path
-            candidates = _list_files(rp, "*.flax")
-            if candidates:
-                resume_path = candidates[-1]
-                checkpoint_dir = rp.rstrip('/')
-                print(f"  Resuming from: {resume_path}")
-                print(f"  Continuing in run folder: {checkpoint_dir}")
-
-    elif not cli_args.from_scratch:
-        # Auto-resume: find latest run folder with checkpoints
+    # Auto-resume: find latest run folder with checkpoints (unless --from-scratch)
+    if not cli_args.from_scratch:
         run_folders = _list_run_folders(base_checkpoint_dir)
         for folder in reversed(run_folders):
             candidates = _list_files(folder, "*.flax")
             if candidates:
                 resume_path = candidates[-1]
                 checkpoint_dir = folder
-                print(f"  Auto-resume: {resume_path}")
-                print(f"  Continuing in run folder: {checkpoint_dir}")
+                print(f"  Auto-resume: found checkpoint in {checkpoint_dir}")
+                print(f"  Resuming from: {resume_path}")
                 break
 
     # Create new run folder if not resuming
