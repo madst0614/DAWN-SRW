@@ -88,7 +88,7 @@ else
     echo "Repo cloned (branch: \$BRANCH)"
 fi
 
-# Run the setup+training script
+# Run the setup+training script (nohup inside will detach training)
 cd ~/dawn
 bash scripts/setup_and_run_tpu_pod.sh
 EOFCMD
@@ -102,4 +102,8 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
     --command="$REMOTE_CMD" \
     2>&1 | tee "launch_${TPU_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
-echo "Launch complete."
+echo ""
+echo "Launch complete. Training is running in tmux session 'train' on all workers."
+echo "  Log:     gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=0 --command='tail -f ~/train.log'"
+echo "  Attach:  gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=0 --command='tmux attach -t train'"
+echo "  Kill:    gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all --command='tmux kill-session -t train'"

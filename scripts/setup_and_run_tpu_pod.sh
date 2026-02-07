@@ -64,12 +64,22 @@ assert jax.default_backend() == 'tpu', 'Not running on TPU!'
 print('TPU setup verified OK')
 "
 
-# 4. Launch training
-echo "[4/4] Starting training..."
+# 4. Launch training in tmux (survives SSH disconnect)
+echo "[4/4] Starting training in tmux session 'train'..."
 echo "  Config: $CONFIG"
 echo "  Host: $(hostname)"
 echo "  Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "  Log: ~/train.log"
 
-python scripts/train_jax.py --config "$CONFIG"
+cd "$WORK_DIR"
 
-echo "Training complete on host $(hostname)"
+# Kill existing train session if any
+tmux kill-session -t train 2>/dev/null || true
+
+# Start new tmux session running training, tee to ~/train.log
+tmux new-session -d -s train \
+    "python scripts/train_jax.py --config '$CONFIG' 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+
+echo "  tmux session 'train' started."
+echo "  Attach:  tmux attach -t train"
+echo "  Monitor: tail -f ~/train.log"
