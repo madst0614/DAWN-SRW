@@ -997,6 +997,17 @@ def main():
         jax.block_until_ready(dummy_metrics['total_loss'])
         print(f"  train_step OK -- loss={float(dummy_metrics['total_loss'][0]):.4f}", flush=True)
 
+        # Show memory usage after JIT compilation
+        try:
+            mem = jax.devices()[0].memory_stats()
+            if mem:
+                used = mem.get('bytes_in_use', 0) / 1e9
+                peak = mem.get('peak_bytes_in_use', 0) / 1e9
+                limit = mem.get('bytes_limit', 0) / 1e9
+                print(f"  HBM: {used:.2f}G / {limit:.2f}G (peak={peak:.2f}G, free={limit - used:.2f}G)", flush=True)
+        except Exception:
+            pass
+
         del _dummy_params, _dummy_opt, dummy_metrics, dummy_ids, dummy_mask, dummy_dropout_keys
         print("=== OOM check passed (JIT compiled) ===\n", flush=True)
     except Exception as e:
