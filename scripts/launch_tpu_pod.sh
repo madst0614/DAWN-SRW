@@ -65,13 +65,41 @@ gcloud compute tpus tpu-vm describe "$TPU_NAME" \
     --project="$PROJECT" \
     --format="value(state)"
 
-# Send command to all workers, passing BRANCH and CONFIG as env vars
-echo "Sending setup+training command to all workers..."
+REPO_URL="https://github.com/madst0614/DAWN.git"
+
+# Build inline bootstrap: clone/update repo first, then run setup script
+read -r -d '' REMOTE_CMD <<EOFCMD || true
+set -e
+REPO_URL='${REPO_URL}'
+BRANCH='${BRANCH}'
+CONFIG='${CONFIG}'
+export BRANCH CONFIG
+
+# Bootstrap: ensure ~/dawn exists with the right branch
+if [ -d ~/dawn/.git ]; then
+    cd ~/dawn
+    git fetch origin "\$BRANCH" --depth 1
+    git checkout "\$BRANCH" --
+    git reset --hard "origin/\$BRANCH"
+    echo "Repo updated to \$BRANCH"
+else
+    rm -rf ~/dawn
+    git clone -b "\$BRANCH" --single-branch --depth 1 "\$REPO_URL" ~/dawn
+    echo "Repo cloned (branch: \$BRANCH)"
+fi
+
+# Run the setup+training script
+cd ~/dawn
+bash scripts/setup_and_run_tpu_pod.sh
+EOFCMD
+
+# Send command to all workers
+echo "Sending bootstrap+training command to all workers..."
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
     --zone="$ZONE" \
     --project="$PROJECT" \
     --worker=all \
-    --command="BRANCH='${BRANCH}' CONFIG='${CONFIG}' bash ~/dawn/scripts/setup_and_run_tpu_pod.sh" \
+    --command="$REMOTE_CMD" \
     2>&1 | tee "launch_${TPU_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
 echo "Launch complete."

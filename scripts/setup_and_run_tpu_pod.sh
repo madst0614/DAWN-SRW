@@ -30,14 +30,27 @@ pip install --upgrade pip -q
 pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
 pip install flax optax numpy pyyaml gcsfs -q
 
-# 2. Deploy code via git clone
-echo "[2/4] Cloning repo (branch: $BRANCH)..."
-cd "$HOME"
-if [ -d dawn ]; then
+# 2. Deploy code via git (clone or update)
+echo "[2/4] Syncing repo (branch: $BRANCH)..."
+if [ -d "$WORK_DIR/.git" ]; then
+    cd "$WORK_DIR"
+    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if [ "$CURRENT_BRANCH" = "$BRANCH" ]; then
+        echo "  Already on branch $BRANCH, pulling latest..."
+        git pull origin "$BRANCH" --ff-only || true
+    else
+        echo "  Switching to branch $BRANCH..."
+        git fetch origin "$BRANCH" --depth 1
+        git checkout "$BRANCH" --
+        git reset --hard "origin/$BRANCH"
+    fi
+else
+    echo "  Fresh clone (branch: $BRANCH)..."
+    cd "$HOME"
     rm -rf dawn
+    git clone -b "$BRANCH" --single-branch --depth 1 "$REPO_URL" dawn
+    cd dawn
 fi
-git clone -b "$BRANCH" --single-branch --depth 1 "$REPO_URL" dawn
-cd dawn
 
 # 3. Verify JAX sees TPU devices
 echo "[3/4] Verifying JAX TPU setup..."
