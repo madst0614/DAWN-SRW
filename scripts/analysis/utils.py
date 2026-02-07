@@ -322,9 +322,93 @@ QK_POOLS = {
 # Model Loading Utilities
 # ============================================================
 
+def _load_flax_model(checkpoint_path: str, device: str = 'cuda'):
+    """Load a .flax checkpoint by converting to PyTorch on the fly."""
+    from models import create_model_by_version, normalize_version
+    from transformers import BertTokenizerFast
+
+    try:
+        from scripts.convert_flax_to_pt import load_flax_checkpoint, convert_dawn_params, convert_baseline_params
+    except ImportError:
+        # Try relative import
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "convert_flax_to_pt",
+            str(PROJECT_ROOT / "scripts" / "convert_flax_to_pt.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        load_flax_checkpoint = mod.load_flax_checkpoint
+        convert_dawn_params = mod.convert_dawn_params
+        convert_baseline_params = mod.convert_baseline_params
+
+    print(f"  Converting .flax → PyTorch (in-memory)...")
+    ckpt = load_flax_checkpoint(checkpoint_path)
+    config = ckpt.get('config', {})
+
+    version = config.get('model_version', '')
+    if version in ('baseline', 'baseline-JAX'):
+        state_dict = convert_baseline_params(ckpt['params'])
+        config['model_version'] = 'baseline'
+    else:
+        state_dict = convert_dawn_params(ckpt['params'])
+        config['model_version'] = '17.1'
+
+    version = normalize_version(config['model_version'])
+    print(f"  Model version: {version}")
+
+    model = create_model_by_version(version, config)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    # Filter expected missing keys (GlobalSSM — JAX doesn't have it)
+    real_missing = [k for k in missing if not any(
+        s in k for s in ['global_ssm', 'ssm_norm', 'importance_proj',
+                          'context_proj', 'context_scale',
+                          'A_log', 'W_delta', 'W_B', 'W_C']
+    )]
+    if real_missing:
+        print(f"  WARNING - Missing keys: {real_missing[:10]}")
+    if unexpected:
+        print(f"  WARNING - Unexpected keys: {unexpected[:10]}")
+
+    model.to(device)
+    model.eval()
+
+    tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
+    return model, tokenizer, config
+
+
+def _is_gcs_path(path):
+    return str(path).startswith('gs://')
+
+
+def _list_gcs_files(gcs_dir, pattern='*'):
+    """List files in a GCS directory matching pattern."""
+    try:
+        import gcsfs
+        fs = gcsfs.GCSFileSystem()
+        # Remove gs:// prefix for gcsfs
+        bucket_path = gcs_dir.replace('gs://', '').rstrip('/')
+        entries = fs.ls(bucket_path)
+        # Filter by pattern and add gs:// prefix back
+        import fnmatch
+        files = []
+        for e in entries:
+            name = e.split('/')[-1]
+            if fnmatch.fnmatch(name, pattern):
+                files.append('gs://' + e)
+        return files
+    except Exception as e:
+        print(f"  Warning: GCS listing failed: {e}")
+        return []
+
+
 def load_model(checkpoint_path: str, device: str = 'cuda'):
     """
     Load DAWN v17.1 model from checkpoint.
+
+    Supports both .pt (PyTorch) and .flax (JAX/Flax) checkpoints.
+    Flax checkpoints are automatically converted to PyTorch format.
+    Supports local paths and GCS (gs://) paths.
 
     Args:
         checkpoint_path: Path to checkpoint file or directory
@@ -336,19 +420,76 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
     from models import create_model_by_version
     from transformers import BertTokenizerFast
 
-    path = Path(checkpoint_path)
-    if path.is_dir():
-        pt_files = list(path.glob('*.pt'))
-        for f in pt_files:
-            if 'best' in f.name.lower() or 'final' in f.name.lower():
-                checkpoint_path = str(f)
-                break
+    checkpoint_path = str(checkpoint_path)
+    is_flax = False
+
+    # Check if it's a directory (local or GCS)
+    is_dir = False
+    if _is_gcs_path(checkpoint_path):
+        # GCS path — check if it looks like a directory (no file extension)
+        if not checkpoint_path.endswith('.pt') and not checkpoint_path.endswith('.flax'):
+            is_dir = True
+    else:
+        path = Path(checkpoint_path)
+        is_dir = path.is_dir()
+
+    if is_dir:
+        # Look for best checkpoint: prefer .pt, fall back to .flax
+        if _is_gcs_path(checkpoint_path):
+            pt_files = _list_gcs_files(checkpoint_path, '*.pt')
+            flax_files = _list_gcs_files(checkpoint_path, '*.flax')
         else:
+            path = Path(checkpoint_path)
+            pt_files = [str(f) for f in path.glob('*.pt')]
+            flax_files = [str(f) for f in path.glob('*.flax')]
+
+        # Find best checkpoint
+        found = False
+        for f in pt_files:
+            fname = f.split('/')[-1].lower()
+            if 'best' in fname or 'final' in fname:
+                checkpoint_path = f
+                found = True
+                break
+
+        if not found:
             if pt_files:
-                checkpoint_path = str(sorted(pt_files, key=os.path.getmtime)[-1])
+                checkpoint_path = sorted(pt_files)[-1]  # Latest by name
+            elif flax_files:
+                # No .pt files, use .flax
+                for f in flax_files:
+                    fname = f.split('/')[-1].lower()
+                    if 'best' in fname:
+                        checkpoint_path = f
+                        found = True
+                        is_flax = True
+                        break
+                if not found and flax_files:
+                    checkpoint_path = sorted(flax_files)[-1]
+                    is_flax = True
+
+    elif checkpoint_path.endswith('.flax'):
+        is_flax = True
 
     print(f"Loading: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    if is_flax:
+        return _load_flax_model(checkpoint_path, device)
+
+    # Load .pt checkpoint (local or GCS)
+    if _is_gcs_path(checkpoint_path):
+        import io
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
+            with fs.open(checkpoint_path, 'rb') as f:
+                data = f.read()
+        except ImportError:
+            import tensorflow as tf
+            data = tf.io.gfile.GFile(checkpoint_path, 'rb').read()
+        checkpoint = torch.load(io.BytesIO(data), map_location=device, weights_only=False)
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint.get('model_config', checkpoint.get('config', {}))
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     cleaned = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}

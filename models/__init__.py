@@ -47,65 +47,43 @@ v17.2: Feature QK Unified + Restore Q/K Separate
 baseline: Vanilla Transformer for fair comparison
 """
 
-# v18.5 - Context-Aware Restore Routing
-from .model_v18_5 import DAWN as DAWN_v18_5
+# Lazy imports — PyTorch models loaded only when accessed (allows torch-free JAX usage)
+def __getattr__(name):
+    _torch_models = {
+        'DAWN_v18_5': ('.model_v18_5', 'DAWN'),
+        'DAWN_v18_4': ('.model_v18_4', 'DAWN'),
+        'DAWN_v18_3': ('.model_v18_3', 'DAWN'),
+        'DAWN_v18_2': ('.model_v18_2', 'DAWN'),
+        'DAWN_v18_1': ('.model_v18_1', 'DAWN'),
+        'DAWN_v18': ('.model_v18', 'DAWN'),
+        'DAWN_v17_1': ('.model_v17_1', 'DAWN'),
+        'DAWN_v17_1_TPU': ('.model_v17_1_tpu', 'DAWN'),
+        'DAWN_v17_1_TPU_MemOpt': ('.model_v17_1_tpu_memopt', 'DAWN'),
+        'DAWN_v17_2': ('.model_v17_2', 'DAWN'),
+        'DAWN': ('.model_v17_1', 'DAWN'),
+        'VanillaTransformer': ('.baseline_transformer', 'VanillaTransformer'),
+    }
+    _registry_names = {
+        'VERSION_REGISTRY', 'normalize_version', 'get_version_info',
+        'get_required_params', 'get_optional_params', 'build_model_kwargs',
+        'build_args_config', 'load_model_params_to_args', 'print_version_info',
+        'list_versions', 'get_all_versions_info', 'get_routing_log_info',
+        'get_router', 'enable_analysis_mode', 'disable_analysis_mode',
+        'analysis_context', 'forward_for_analysis', 'get_model_version',
+        'is_v18_plus',
+    }
 
-# v18.4 - Relative Confidence Scaling
-from .model_v18_4 import DAWN as DAWN_v18_4
+    if name in _torch_models:
+        import importlib
+        module_path, attr = _torch_models[name]
+        mod = importlib.import_module(module_path, __name__)
+        return getattr(mod, attr)
 
-# v18.3 - Confidence-Scaled Soft Gating
-from .model_v18_3 import DAWN as DAWN_v18_3
+    if name in _registry_names:
+        from . import version_registry
+        return getattr(version_registry, name)
 
-# v18.2 - ReLU-Masked Learnable Tau
-from .model_v18_2 import DAWN as DAWN_v18_2
-
-# v18.1 - Soft Mask + Token-level Learnable Tau
-from .model_v18_1 import DAWN as DAWN_v18_1
-
-# v18.0 - Fixed Threshold Multi-Path Routing
-from .model_v18 import DAWN as DAWN_v18
-
-# v17.1 - Q/K Separate Pool + Knowledge Feature-Restore (default)
-from .model_v17_1 import DAWN as DAWN_v17_1
-
-# v17.1-TPU - SSM removed, TPU-optimized computation order
-from .model_v17_1_tpu import DAWN as DAWN_v17_1_TPU
-
-# v17.1-TPU-MemOpt - Memory-optimized TPU version (restore recompute)
-from .model_v17_1_tpu_memopt import DAWN as DAWN_v17_1_TPU_MemOpt
-
-# v17.2 - Feature QK Unified + Restore Q/K Separate
-from .model_v17_2 import DAWN as DAWN_v17_2
-
-# Default DAWN is v17.1
-DAWN = DAWN_v17_1
-
-# Baseline for comparison
-from .baseline_transformer import VanillaTransformer
-
-# Version registry
-from .version_registry import (
-    VERSION_REGISTRY,
-    normalize_version,
-    get_version_info,
-    get_required_params,
-    get_optional_params,
-    build_model_kwargs,
-    build_args_config,
-    load_model_params_to_args,
-    print_version_info,
-    list_versions,
-    get_all_versions_info,
-    get_routing_log_info,
-    # Analysis utilities
-    get_router,
-    enable_analysis_mode,
-    disable_analysis_mode,
-    analysis_context,
-    forward_for_analysis,
-    get_model_version,
-    is_v18_plus,
-)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     # Models
