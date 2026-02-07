@@ -991,11 +991,26 @@ def main():
         rng, dummy_step_rng = jax.random.split(rng)
         dummy_dropout_keys = jax.random.split(dummy_step_rng, n_devices)
 
+        # First call: JIT compilation (slow)
+        jit_start = time.time()
         _dummy_params, _dummy_opt, dummy_metrics = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys,
         )
         jax.block_until_ready(dummy_metrics['total_loss'])
+        jit_time = time.time() - jit_start
+        print(f"  JIT compile: {jit_time:.1f}s", flush=True)
+
+        # Second call: measure actual step time (post-JIT)
+        rng, dummy_step_rng2 = jax.random.split(rng)
+        dummy_dropout_keys2 = jax.random.split(dummy_step_rng2, n_devices)
+        step_start = time.time()
+        _dummy_params2, _dummy_opt2, dummy_metrics2 = train_step_fn(
+            params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys2,
+        )
+        jax.block_until_ready(dummy_metrics2['total_loss'])
+        step_time = time.time() - step_start
         print(f"  train_step OK -- loss={float(dummy_metrics['total_loss'][0]):.4f}", flush=True)
+        print(f"  Step time: {step_time*1000:.1f}ms/batch", flush=True)
 
         # Show memory usage after JIT compilation
         try:
@@ -1008,7 +1023,15 @@ def main():
         except Exception:
             pass
 
+        # Estimate total training time
+        total_steps = len(train_loader) * num_epochs
+        remaining_steps = total_steps - global_step
+        est_seconds = remaining_steps * step_time
+        est_hours = est_seconds / 3600
+        print(f"  Estimated time: {est_hours:.1f}h ({remaining_steps:,} steps @ {step_time*1000:.1f}ms)", flush=True)
+
         del _dummy_params, _dummy_opt, dummy_metrics, dummy_ids, dummy_mask, dummy_dropout_keys
+        del _dummy_params2, _dummy_opt2, dummy_metrics2, dummy_dropout_keys2
         print("=== OOM check passed (JIT compiled) ===\n", flush=True)
     except Exception as e:
         print(f"\n  *** OOM check FAILED: {e}")
