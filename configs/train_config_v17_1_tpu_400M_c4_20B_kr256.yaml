@@ -59,4 +59,4 @@ training:
 
 use_amp: true
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_400M_c4_20B_kr128
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_400M_c4_20B_kr256
