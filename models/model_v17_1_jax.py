@@ -1060,3 +1060,207 @@ class DAWN(nn.Module):
             f"  gradient_checkpointing={self.gradient_checkpointing}",
             f"  jax.lax.scan layer loop (O(1) XLA compile, true param sharing)",
         ]
+
+
+# ================================================================
+# KV-Cached Inference  (for fast autoregressive generation)
+# ================================================================
+
+def _attention_forward_cached(x, sn_params, fqk_w_Q, fqk_w_K, fv_w,
+                               rqk_w_Q, rqk_w_K, rv_w, expand_O_kernel,
+                               n_feature_qk, n_restore_qk, n_heads, d_model,
+                               kv_cache_k, kv_cache_v, cache_index):
+    """Attention with KV cache.  Works for both prefill (S>1) and decode (S=1).
+
+    Args:
+        x:           [B, S, D]  (S = prompt_len for prefill, 1 for decode)
+        kv_cache_k:  [B, H, max_len, d_head]
+        kv_cache_v:  [B, H, max_len, d_head]
+        cache_index: scalar int – write position in cache
+
+    Returns:
+        (output [B,S,D], updated_kv_cache_k, updated_kv_cache_v)
+    """
+    B, S, D = x.shape
+    d_head = d_model // n_heads
+
+    f_neurons = sn_params['f_neurons']
+    r_neurons = sn_params['r_neurons']
+    f_qk = f_neurons[:n_feature_qk]
+    f_v  = f_neurons[n_feature_qk:]
+    r_qk = r_neurons[:n_restore_qk]
+    r_v  = r_neurons[n_restore_qk:]
+
+    Q     = restore_fn(feature_fn(x, f_qk, fqk_w_Q), r_qk, rqk_w_Q)
+    K_new = restore_fn(feature_fn(x, f_qk, fqk_w_K), r_qk, rqk_w_K)
+    V_new = restore_fn(feature_fn(x, f_v,  fv_w),     r_v,  rv_w)
+
+    Q     = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    K_new = K_new.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    V_new = V_new.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+
+    # Write new K/V into cache at [cache_index : cache_index+S]
+    kv_cache_k = jax.lax.dynamic_update_slice(
+        kv_cache_k, K_new, (0, 0, cache_index, 0))
+    kv_cache_v = jax.lax.dynamic_update_slice(
+        kv_cache_v, V_new, (0, 0, cache_index, 0))
+
+    # Scaled dot-product attention against full cache
+    scale = jnp.sqrt(jnp.float32(d_head))
+    scores = jnp.einsum('bhsd,bhtd->bhst', Q, kv_cache_k) / scale
+
+    # Causal mask: query at absolute position (cache_index + i) can attend
+    # to cache positions <= (cache_index + i).
+    max_len = kv_cache_k.shape[2]
+    q_positions = cache_index + jnp.arange(S)          # [S]
+    cache_positions = jnp.arange(max_len)               # [max_len]
+    causal = cache_positions[None, :] <= q_positions[:, None]  # [S, max_len]
+    scores = jnp.where(causal[None, None, :, :], scores,
+                        jnp.finfo(scores.dtype).min)
+
+    attn_weights = jax.nn.softmax(scores, axis=-1)
+    attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_weights, kv_cache_v)
+    attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, D)
+
+    output = attn_out @ expand_O_kernel
+    return output, kv_cache_k, kv_cache_v
+
+
+def dawn_init_kv_cache(config, batch_size=1):
+    """Create zero-initialised KV caches for all layers.
+
+    Returns:
+        (all_k, all_v)  each  [n_layers, B, H, max_seq_len, d_head]
+    """
+    n_layers  = config['n_layers']
+    n_heads   = config.get('n_heads', 8)
+    d_model   = config.get('d_model', 320)
+    max_len   = config.get('max_seq_len', 512)
+    d_head    = d_model // n_heads
+    shape = (n_layers, batch_size, n_heads, max_len, d_head)
+    return jnp.zeros(shape), jnp.zeros(shape)
+
+
+def dawn_cached_forward(params, config, input_ids,
+                         kv_caches_k, kv_caches_v, cache_index):
+    """Full forward pass with KV cache (prefill or decode).
+
+    Pure function – no Flax module state.  Suitable for ``jax.jit``.
+
+    Args:
+        params:       raw param dict  (``variables['params']`` or loaded
+                      checkpoint ``params['params']``)
+        config:       model config dict
+        input_ids:    [B, S]  token IDs
+        kv_caches_k:  [n_layers, B, H, max_len, d_head]
+        kv_caches_v:  [n_layers, B, H, max_len, d_head]
+        cache_index:  scalar int – position in cache to start writing
+
+    Returns:
+        (logits [B, S, V],  updated_kv_caches_k,  updated_kv_caches_v)
+    """
+    # --- unpack config ---
+    n_layers       = config['n_layers']
+    d_model        = config.get('d_model', 320)
+    n_heads        = config.get('n_heads', 8)
+    n_feature_qk   = config.get('n_feature_qk', 56)
+    n_feature_v    = config.get('n_feature_v', 24)
+    n_restore_qk   = config.get('n_restore_qk', 56)
+    n_restore_v    = config.get('n_restore_v', 24)
+    n_feature_know = config.get('n_feature_know', 24)
+    n_restore_know = config.get('n_restore_know', 24)
+    d_space        = config.get('d_space', 64)
+    top_k_fqk = config.get('top_k_feature_qk', 16)
+    top_k_fv  = config.get('top_k_feature_v', 6)
+    top_k_rqk = config.get('top_k_restore_qk', 16)
+    top_k_rv  = config.get('top_k_restore_v', 6)
+    top_k_fk  = config.get('top_k_feature_know', 4)
+    top_k_rk  = config.get('top_k_restore_know', 4)
+
+    # --- unpack params ---
+    # Accept both wrapped (with 'params' key) and raw param dicts
+    p = params.get('params', params) if isinstance(params, dict) else params
+    try:
+        # FrozenDict
+        p = p.get('params', p)
+    except Exception:
+        pass
+
+    token_emb   = p['token_emb']['embedding']        # [V, D]
+    pos_emb     = p['pos_emb']['embedding']           # [max_len, D]
+    sn_params   = p['shared_neurons']
+    router_params = p['router']
+    norm_params = p['norm']
+
+    # --- embedding ---
+    B, S = input_ids.shape
+    x = token_emb[input_ids]                           # [B, S, D]
+    positions = jnp.arange(S) + cache_index
+    x = x + pos_emb[positions][None, :]
+
+    # --- stack per-layer block params ---
+    block_params_list = [p[f'block_{i}'] for i in range(n_layers)]
+    stacked_bp = jax.tree.map(lambda *a: jnp.stack(a), *block_params_list)
+
+    rng = jax.random.PRNGKey(0)
+    layer_rngs = jax.random.split(rng, n_layers)
+    deterministic = True
+
+    def scan_body(carry, xs):
+        x = carry
+        bp   = xs['params']
+        kv_k = xs['kv_k']                              # [B,H,max,dh]
+        kv_v = xs['kv_v']
+        rng_l = xs['rng']
+        rng_l, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng_l, 5)
+
+        # ---- attention sub-block ----
+        normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+
+        (fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w,
+         _aux) = _router_attn_forward(
+            normed, router_params,
+            n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
+            d_space, top_k_fqk, top_k_fv, top_k_rqk, top_k_rv,
+            0.0, None, deterministic, rng_ar)
+
+        attn_out, kv_k, kv_v = _attention_forward_cached(
+            normed, sn_params,
+            fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w,
+            bp['attn']['expand_O']['kernel'],
+            n_feature_qk, n_restore_qk, n_heads, d_model,
+            kv_k, kv_v, cache_index)
+
+        x = x + attn_out
+
+        # ---- knowledge sub-block ----
+        normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+
+        fknow_w, rknow_w, _kaux = _router_know_forward(
+            normed, router_params,
+            n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
+            n_feature_know, n_restore_know, top_k_fk, top_k_rk,
+            0.0, None, deterministic, rng_kr)
+
+        know_out = _knowledge_forward(
+            normed, sn_params, fknow_w, rknow_w,
+            0.0, deterministic, rng_k)
+
+        x = x + know_out
+        return x, {'kv_k': kv_k, 'kv_v': kv_v}
+
+    xs = {
+        'params': stacked_bp,
+        'kv_k':   kv_caches_k,
+        'kv_v':   kv_caches_v,
+        'rng':    layer_rngs,
+    }
+    x, outputs = jax.lax.scan(scan_body, x, xs)
+
+    # final layer norm
+    x = _layer_norm(x, norm_params['scale'], norm_params['bias'])
+
+    # weight-tied logits
+    logits = x @ token_emb.T                            # [B, S, V]
+
+    return logits, outputs['kv_k'], outputs['kv_v']
