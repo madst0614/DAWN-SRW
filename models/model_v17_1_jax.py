@@ -1178,13 +1178,10 @@ def dawn_cached_forward(params, config, input_ids,
     top_k_rk  = config.get('top_k_restore_know', 4)
 
     # --- unpack params ---
-    # Accept both wrapped (with 'params' key) and raw param dicts
-    p = params.get('params', params) if isinstance(params, dict) else params
-    try:
-        # FrozenDict
-        p = p.get('params', p)
-    except Exception:
-        pass
+    # load_model_jax returns freeze({'params': {...}})  →  unwrap the outer key
+    p = params
+    if hasattr(p, 'get') and 'params' in p:
+        p = p['params']
 
     token_emb   = p['token_emb']['embedding']        # [V, D]
     pos_emb     = p['pos_emb']['embedding']           # [max_len, D]

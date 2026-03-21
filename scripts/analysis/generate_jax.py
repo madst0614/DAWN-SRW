@@ -140,7 +140,7 @@ def generate(params, config, input_ids, decode_step_fn,
         token_2d = jnp.array([[next_token]])  # [1, 1]
 
         logits, kv_k, kv_v = decode_step_fn(
-            params, config, token_2d, kv_k, kv_v, cache_pos)
+            params, token_2d, kv_k, kv_v, cache_pos)
 
         next_logits = np.array(logits[0, 0, :])
         next_token, rng_key = _sample_token(
@@ -233,15 +233,15 @@ def main():
     compile_start = time.time()
 
     @jax.jit
-    def decode_step(params, config_unused, token_ids, kv_k, kv_v, cache_pos):
-        """Thin jit wrapper.  config captured from outer scope."""
+    def decode_step(params, token_ids, kv_k, kv_v, cache_pos):
+        """Thin jit wrapper.  config captured from outer scope (not a jit arg)."""
         return dawn_cached_forward(
             params, config, token_ids, kv_k, kv_v, cache_pos)
 
     # Trigger compilation with dummy inputs
     dummy_kv_k, dummy_kv_v = dawn_init_kv_cache(config, batch_size=1)
     dummy_tok = jnp.array([[0]])
-    _out = decode_step(params, config, dummy_tok, dummy_kv_k, dummy_kv_v, 0)
+    _out = decode_step(params, dummy_tok, dummy_kv_k, dummy_kv_v, 0)
     _out[0].block_until_ready()  # wait for compile
     compile_time = time.time() - compile_start
     print(f"done ({compile_time:.1f}s)")
