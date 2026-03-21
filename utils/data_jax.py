@@ -291,21 +291,36 @@ class BinDataLoader:
 
     Yields (input_ids, attention_mask) as jnp.arrays.
     Supports resume from a given step and reset() for epoch boundaries.
+
+    Multi-host support:
+      When n_hosts > 1, each host reads a different slice of the global batch.
+      The global_batch_size is split across hosts, and each host further shards
+      its portion across n_devices (local devices) for pmap.
     """
 
     def __init__(self, dataset, batch_size: int,
-                 n_devices: int = 1, start_step: int = 0):
+                 n_devices: int = 1, start_step: int = 0,
+                 n_hosts: int = 1, host_id: int = 0):
         self.dataset = dataset
-        self.batch_size = batch_size
-        self.n_devices = n_devices
+        self.global_batch_size = batch_size
+        self.n_devices = n_devices  # local devices per host
+        self.n_hosts = n_hosts
+        self.host_id = host_id
         self._start_step = start_step
         self.seq_len = dataset.seq_len
 
-        assert batch_size % n_devices == 0, (
-            f"batch_size ({batch_size}) must be divisible by n_devices ({n_devices})"
+        # Per-host batch size
+        assert batch_size % n_hosts == 0, (
+            f"global batch_size ({batch_size}) must be divisible by n_hosts ({n_hosts})"
         )
-        self.per_device_batch = batch_size // n_devices
-        self._num_batches = len(dataset) // batch_size
+        self.per_host_batch = batch_size // n_hosts
+
+        assert self.per_host_batch % n_devices == 0, (
+            f"per_host_batch ({self.per_host_batch}) must be divisible by "
+            f"n_devices ({n_devices})"
+        )
+        self.per_device_batch = self.per_host_batch // n_devices
+        self._num_batches = len(dataset) // batch_size  # global batches
 
     def reset(self, start_step: int = 0):
         """Reset iterator position without re-reading data files."""
@@ -317,17 +332,20 @@ class BinDataLoader:
     def __iter__(self):
         """Yields (input_ids, attention_mask) tuples.
 
+        Each host reads its own slice of the global batch.
         Shapes:
-          - n_devices == 1: (batch_size, seq_len)
-          - n_devices > 1:  (n_devices, per_device_batch, seq_len)
+          - n_devices == 1 and n_hosts == 1: (per_host_batch, seq_len)
+          - n_devices > 1: (n_devices, per_device_batch, seq_len)
         """
         for batch_idx in range(self._num_batches):
             if batch_idx < self._start_step:
                 continue
 
-            start = batch_idx * self.batch_size
-            batch = self.dataset.get_batch(start, self.batch_size)
-            if batch is None or len(batch) < self.batch_size:
+            # Each host reads a different slice of the global batch
+            global_start = batch_idx * self.global_batch_size
+            host_start = global_start + self.host_id * self.per_host_batch
+            batch = self.dataset.get_batch(host_start, self.per_host_batch)
+            if batch is None or len(batch) < self.per_host_batch:
                 return
 
             input_ids = jnp.array(batch)
@@ -349,7 +367,7 @@ class BinDataLoader:
 # ============================================================
 
 def load_data(data_config, max_length=512, batch_size=128,
-              n_devices=1, start_step=0):
+              n_devices=1, start_step=0, n_hosts=1, host_id=0):
     """Load pretokenized .bin data for JAX training.
 
     Supports three modes via data_config:
@@ -373,14 +391,17 @@ def load_data(data_config, max_length=512, batch_size=128,
     Args:
         data_config: Dict with bin_train, bin_val, and optional fields.
         max_length: Sequence length (default 512).
-        batch_size: Global batch size.
-        n_devices: Number of devices for multi-device reshaping.
+        batch_size: Global batch size (across all hosts).
+        n_devices: Number of local devices per host for reshaping.
         start_step: Resume from this step (skip batches).
+        n_hosts: Number of hosts (jax.process_count()).
+        host_id: This host's index (jax.process_index()).
 
     Returns:
         (train_loader, val_loader, vocab_size)
     """
     seq_len = max_length
+    is_host0 = (host_id == 0)
 
     train_path = data_config.get("bin_train")
     val_path = data_config.get("bin_val")
@@ -397,21 +418,24 @@ def load_data(data_config, max_length=512, batch_size=128,
     max_train_seqs = max_train_tokens // seq_len if max_train_tokens else None
     max_val_seqs = max_val_tokens // seq_len if max_val_tokens else None
 
-    print(f"\nLoading pretokenized data (seq_len={seq_len})...")
+    if is_host0:
+        print(f"\nLoading pretokenized data (seq_len={seq_len})...")
 
-    # ---- Build datasets ----
+    # ---- Build datasets (all hosts load the full dataset for offset-based slicing) ----
     train_dataset = _build_dataset(
         train_path, seq_len, max_train_seqs, local_cache_dir)
     val_dataset = _build_dataset(
         val_path, seq_len, max_val_seqs, local_cache_dir)
 
-    # ---- Create loaders ----
+    # ---- Create loaders (multi-host: each host reads its own slice) ----
     train_loader = BinDataLoader(
         train_dataset, batch_size=batch_size,
-        n_devices=n_devices, start_step=start_step)
+        n_devices=n_devices, start_step=start_step,
+        n_hosts=n_hosts, host_id=host_id)
     val_loader = BinDataLoader(
         val_dataset, batch_size=batch_size,
-        n_devices=n_devices, start_step=0)
+        n_devices=n_devices, start_step=0,
+        n_hosts=n_hosts, host_id=host_id)
 
     # Vocab size
     vocab_size = 30522
@@ -425,14 +449,19 @@ def load_data(data_config, max_length=512, batch_size=128,
         except Exception:
             pass
 
-    print(f"  Vocab size: {vocab_size}")
-    print(f"  Train batches: {len(train_loader)}")
-    print(f"  Val batches: {len(val_loader)}")
-    print(f"  Devices: {n_devices}")
-    if n_devices > 1:
-        print(f"  Per-device batch: {batch_size // n_devices}")
-    if local_cache_dir:
-        print(f"  Local cache: {local_cache_dir}")
+    if is_host0:
+        per_host_batch = batch_size // n_hosts
+        print(f"  Vocab size: {vocab_size}")
+        print(f"  Train batches: {len(train_loader)}")
+        print(f"  Val batches: {len(val_loader)}")
+        print(f"  Hosts: {n_hosts}, Host ID: {host_id}")
+        print(f"  Local devices: {n_devices}")
+        print(f"  Global batch size: {batch_size}")
+        print(f"  Per-host batch: {per_host_batch}")
+        if n_devices > 1:
+            print(f"  Per-device batch: {per_host_batch // n_devices}")
+        if local_cache_dir:
+            print(f"  Local cache: {local_cache_dir}")
 
     return train_loader, val_loader, vocab_size
 

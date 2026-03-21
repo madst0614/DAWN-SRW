@@ -35,17 +35,144 @@ except ImportError:
     jnp = None
     nn = None
 
-# Import shared config from utils.py
-from scripts.analysis.utils import (
-    NEURON_TYPES, NEURON_TYPES_V18, EMBEDDING_POOLS_V18,
-    ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS, ALL_ROUTING_KEYS,
-    QK_POOL_SHORTHAND, POOL_TYPE_ALIASES, POOL_N_ATTR,
-    POOL_DISPLAY_NAMES, POOL_SHORTHAND,
-    WEIGHT_KEY_MAP, MASK_KEY_MAP,
-    get_neuron_display_name, parse_neuron_name, resolve_pool_type,
-    gini_coefficient as _torch_gini,  # We'll reimplement for numpy
-    convert_to_serializable, save_results,
-)
+# Import shared config from utils.py — with torch-free fallback
+# utils.py requires torch at import time. On TPU-only environments
+# (no PyTorch), we define the constants locally.
+try:
+    from scripts.analysis.utils import (
+        NEURON_TYPES, NEURON_TYPES_V18, EMBEDDING_POOLS_V18,
+        ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS, ALL_ROUTING_KEYS,
+        QK_POOL_SHORTHAND, POOL_TYPE_ALIASES, POOL_N_ATTR,
+        POOL_DISPLAY_NAMES, POOL_SHORTHAND,
+        WEIGHT_KEY_MAP, MASK_KEY_MAP,
+        get_neuron_display_name, parse_neuron_name, resolve_pool_type,
+        gini_coefficient as _torch_gini,
+        convert_to_serializable, save_results,
+    )
+    _HAS_TORCH_UTILS = True
+except (ImportError, ModuleNotFoundError):
+    _HAS_TORCH_UTILS = False
+
+    # ---- Torch-free definitions of all constants ----
+    NEURON_TYPES = {
+        'feature_qk':   ('F-QK',   'n_feature_qk',   'red'),
+        'feature_v':    ('F-V',    'n_feature_v',    'orange'),
+        'restore_qk':   ('R-QK',   'n_restore_qk',   'blue'),
+        'restore_v':    ('R-V',    'n_restore_v',    'green'),
+        'feature_know': ('F-Know', 'n_feature_know', 'purple'),
+        'restore_know': ('R-Know', 'n_restore_know', 'cyan'),
+    }
+    NEURON_TYPES_V18 = {
+        'feature_q':    ('F-Q',    'n_feature_qk',   'red'),
+        'feature_k':    ('F-K',    'n_feature_qk',   'darkred'),
+        'feature_v':    ('F-V',    'n_feature_v',    'orange'),
+        'restore_q':    ('R-Q',    'n_restore_qk',   'blue'),
+        'restore_k':    ('R-K',    'n_restore_qk',   'darkblue'),
+        'restore_v':    ('R-V',    'n_restore_v',    'green'),
+        'feature_know': ('F-Know', 'n_feature_know', 'purple'),
+        'restore_know': ('R-Know', 'n_restore_know', 'cyan'),
+    }
+    EMBEDDING_POOLS_V18 = {
+        'feature_qk':   ('FQK',    'n_feature_qk',   'red'),
+        'feature_v':    ('FV',     'n_feature_v',    'orange'),
+        'restore_qk':   ('RQK',    'n_restore_qk',   'blue'),
+        'restore_v':    ('RV',     'n_restore_v',    'green'),
+        'feature_know': ('F-Know', 'n_feature_know', 'purple'),
+        'restore_know': ('R-Know', 'n_restore_know', 'cyan'),
+    }
+    ROUTING_KEYS = {
+        'fqk_q': ('F-QK_Q', 'fqk_q_pref', 'fqk_weights_Q', 'feature_qk'),
+        'fqk_k': ('F-QK_K', 'fqk_k_pref', 'fqk_weights_K', 'feature_qk'),
+        'fv':    ('F-V',    'fv_pref',    'fv_weights',    'feature_v'),
+        'rqk_q': ('R-QK_Q', 'rqk_q_pref', 'rqk_weights_Q', 'restore_qk'),
+        'rqk_k': ('R-QK_K', 'rqk_k_pref', 'rqk_weights_K', 'restore_qk'),
+        'rv':    ('R-V',    'rv_pref',    'rv_weights',    'restore_v'),
+    }
+    KNOWLEDGE_ROUTING_KEYS = {
+        'fknow': ('F-Know', 'feature_know_w', 'feature_know'),
+        'rknow': ('R-Know', 'restore_know_w', 'restore_know'),
+    }
+    ALL_ROUTING_KEYS = {**ROUTING_KEYS}
+    for _k, _v in KNOWLEDGE_ROUTING_KEYS.items():
+        ALL_ROUTING_KEYS[_k] = (_v[0], None, _v[1], _v[2])
+    QK_POOL_SHORTHAND = {
+        'fqk': ('feature_qk', 'fqk_q', 'fqk_k'),
+        'rqk': ('restore_qk', 'rqk_q', 'rqk_k'),
+    }
+    POOL_TYPE_ALIASES = {
+        'fqk': 'fqk_q', 'rqk': 'rqk_q',
+        'feature_qk': 'fqk_q', 'feature_v': 'fv',
+        'restore_qk': 'rqk_q', 'restore_v': 'rv',
+        'feature_know': 'fknow', 'restore_know': 'rknow',
+    }
+    POOL_N_ATTR = {
+        'feature_qk': 'n_feature_qk', 'feature_v': 'n_feature_v',
+        'restore_qk': 'n_restore_qk', 'restore_v': 'n_restore_v',
+        'feature_know': 'n_feature_know', 'restore_know': 'n_restore_know',
+    }
+    POOL_DISPLAY_NAMES = {
+        'fqk': 'F_QK', 'fv': 'F_V', 'rqk': 'R_QK',
+        'rv': 'R_V', 'fknow': 'F_Know', 'rknow': 'R_Know',
+    }
+    POOL_SHORTHAND = {v: k for k, v in POOL_DISPLAY_NAMES.items()}
+    WEIGHT_KEY_MAP = {
+        'fqk_q': 'fqk_weights_Q', 'fqk_k': 'fqk_weights_K',
+        'fv': 'fv_weights', 'rqk_q': 'rqk_weights_Q',
+        'rqk_k': 'rqk_weights_K', 'rv': 'rv_weights',
+        'fknow': 'feature_know_w', 'rknow': 'restore_know_w',
+    }
+    MASK_KEY_MAP = {
+        'fqk_q': 'fqk_mask_Q', 'fqk_k': 'fqk_mask_K',
+        'fv': 'fv_mask', 'rqk_q': 'rqk_mask_Q',
+        'rqk_k': 'rqk_mask_K', 'rv': 'rv_mask',
+        'fknow': 'feature_know_mask', 'rknow': 'restore_know_mask',
+    }
+    QK_POOLS = {
+        'feature_qk': {
+            'display': 'F-QK', 'q_pref': 'fqk_q_pref', 'k_pref': 'fqk_k_pref',
+            'q_weight': 'fqk_weights_Q', 'k_weight': 'fqk_weights_K',
+            'n_attr': 'n_feature_qk', 'color': 'red',
+        },
+        'restore_qk': {
+            'display': 'R-QK', 'q_pref': 'rqk_q_pref', 'k_pref': 'rqk_k_pref',
+            'q_weight': 'rqk_weights_Q', 'k_weight': 'rqk_weights_K',
+            'n_attr': 'n_restore_qk', 'color': 'blue',
+        },
+    }
+
+    def resolve_pool_type(pool_type: str) -> str:
+        return POOL_TYPE_ALIASES.get(pool_type, pool_type)
+
+    def get_neuron_display_name(pool_shorthand: str, local_idx: int) -> str:
+        display = POOL_DISPLAY_NAMES.get(pool_shorthand, pool_shorthand.upper())
+        return f'{display}_{local_idx}'
+
+    def parse_neuron_name(neuron_name: str):
+        parts = neuron_name.rsplit('_', 1)
+        if len(parts) != 2:
+            return 'unknown', -1
+        display_prefix, idx_str = parts
+        try:
+            local_idx = int(idx_str)
+        except ValueError:
+            return 'unknown', -1
+        pool_shorthand = POOL_SHORTHAND.get(display_prefix, display_prefix.lower())
+        return pool_shorthand, local_idx
+
+    def convert_to_serializable(obj):
+        if isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_serializable(v) for v in obj]
+        elif isinstance(obj, (np.ndarray, np.generic)):
+            return obj.tolist()
+        elif isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
+        return obj
+
+    def save_results(results, output_path: str):
+        with open(output_path, 'w') as f:
+            json.dump(convert_to_serializable(results), f, indent=2)
 
 
 # ============================================================
