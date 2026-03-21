@@ -15,17 +15,27 @@ Usage:
     python scripts/analysis/visualizers/interpretability.py \
         --checkpoint gs://bucket/checkpoint.flax \
         --output ./interp_results \
-        --viz all
+        --viz all --val_data gs://bucket/val.bin
 
-    # Individual visualizations
+    # Multi-token, multi-pool exploration (broad sweep)
     python scripts/analysis/visualizers/interpretability.py \
         --checkpoint gs://bucket/checkpoint.flax \
-        --viz context_routing
+        --viz context_routing \
+        --target_token the,is,in \
+        --pool_key fv,fqk_q,rv
 
+    # Custom contexts from JSON file (for paper figure curation)
+    python scripts/analysis/visualizers/interpretability.py \
+        --checkpoint gs://bucket/checkpoint.flax \
+        --viz context_routing \
+        --contexts_file my_contexts.json
+
+    # Embedding space with UMAP
     python scripts/analysis/visualizers/interpretability.py \
         --checkpoint gs://bucket/checkpoint.flax \
         --viz embedding_space
 
+    # Layer-wise routing entropy
     python scripts/analysis/visualizers/interpretability.py \
         --checkpoint gs://bucket/checkpoint.flax \
         --viz layer_entropy \
@@ -110,6 +120,114 @@ POOL_LABELS = {
 
 
 # ============================================================
+# Context Presets (broad coverage for initial exploration)
+# ============================================================
+
+# Diverse contexts designed to probe different routing behaviors.
+# Start broad, then curate based on results for paper figures.
+CONTEXT_PRESETS = {
+    'the': [
+        # Domain-specific contexts
+        ("Science",       "The theory of relativity changed the understanding of physics"),
+        ("Literature",    "The author wrote the most famous novel in exile"),
+        ("Law",           "The court ruled that the contract was invalid"),
+        ("Cooking",       "The chef prepared the signature dish with fresh herbs"),
+        ("Music",         "The orchestra performed the symphony in the grand hall"),
+        ("Sports",        "The team won the championship after a tough season"),
+        ("Tech",          "The engineer designed the new processor architecture"),
+        ("Medicine",      "The doctor examined the patient with great care"),
+        # Syntactic role variation
+        ("Subject-det",   "The cat sat on the mat"),
+        ("Object-det",    "She opened the door slowly"),
+        ("Possessive",    "He lost the key to the apartment"),
+        # Semantic distance
+        ("Abstract",      "The concept of freedom has evolved over the centuries"),
+        ("Concrete",      "The hammer hit the nail on the head"),
+        ("Temporal",      "The year two thousand marked the beginning of a new era"),
+        ("Negation",      "The plan was not the best option available"),
+        ("Question-like", "What was the reason for the sudden change"),
+    ],
+    'is': [
+        ("Copula",        "The sky is blue today"),
+        ("Existential",   "There is a problem with the system"),
+        ("Identity",      "Paris is the capital of France"),
+        ("Property",      "Water is essential for life"),
+        ("Modal",         "The question is whether we should proceed"),
+        ("Passive-aux",   "The cake is baked in the oven"),
+        ("Progressive",   "The child is running in the park"),
+        ("Negated",       "This is not what I expected"),
+        ("Emphasis",      "What is important is the result"),
+        ("Technical",     "The function is defined as follows"),
+    ],
+    'in': [
+        ("Location",      "The book is in the library"),
+        ("Temporal",      "In the morning the streets are quiet"),
+        ("Abstract",      "She excels in mathematics"),
+        ("Membership",    "He is in the committee"),
+        ("Process",       "The project is in development"),
+        ("Material",      "Written in pencil on the paper"),
+        ("Idiomatic",     "She was in trouble after the incident"),
+        ("Contrast",      "In theory it works but in practice it fails"),
+    ],
+}
+
+# Default: broad coverage for any target token
+DEFAULT_CONTEXTS_TEMPLATE = [
+    ("Science",       "The theory of relativity changed {token} understanding of physics"),
+    ("Literature",    "The author wrote {token} most famous novel in exile"),
+    ("Law",           "The court ruled that {token} contract was invalid"),
+    ("Cooking",       "The chef prepared {token} signature dish with fresh herbs"),
+    ("Music",         "The orchestra performed {token} symphony in the grand hall"),
+    ("Sports",        "The team won {token} championship after a tough season"),
+    ("Tech",          "The engineer designed {token} new processor architecture"),
+    ("Medicine",      "The doctor examined {token} patient with great care"),
+    ("Abstract",      "The concept of {token} freedom has evolved over the centuries"),
+    ("Concrete",      "The hammer hit {token} nail on the head"),
+    ("Narrative",     "Once upon a time {token} kingdom was in danger"),
+    ("Formal",        "According to {token} report the results are significant"),
+    ("Casual",        "I think {token} idea is pretty good actually"),
+    ("Question",      "What makes {token} approach different from the rest"),
+    ("Negation",      "This is not {token} best option available"),
+    ("Code-like",     "The function returns {token} value of the expression"),
+]
+
+
+def _get_default_contexts(target_token: str) -> List[Tuple[str, str]]:
+    """Get context pairs for a target token.
+
+    Uses curated presets if available, otherwise fills a generic template.
+    """
+    if target_token in CONTEXT_PRESETS:
+        return CONTEXT_PRESETS[target_token]
+
+    return [(label, sent.format(token=target_token))
+            for label, sent in DEFAULT_CONTEXTS_TEMPLATE]
+
+
+def load_contexts_from_file(path: str) -> List[Tuple[str, str]]:
+    """Load context pairs from a JSON file.
+
+    Expected format:
+        [
+            {"label": "Science", "sentence": "The theory of ..."},
+            ...
+        ]
+    or:
+        [["Science", "The theory of ..."], ...]
+    """
+    with open(path, 'r') as f:
+        data = json.load(f)
+
+    pairs = []
+    for item in data:
+        if isinstance(item, dict):
+            pairs.append((item['label'], item['sentence']))
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            pairs.append((item[0], item[1]))
+    return pairs
+
+
+# ============================================================
 # 1. Context-Dependent Routing Heatmap
 # ============================================================
 
@@ -151,16 +269,7 @@ def visualize_context_routing(
         tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
     if context_pairs is None:
-        context_pairs = [
-            ("Science",    f"The theory of relativity changed {target_token} understanding of physics"),
-            ("Literature", f"The author wrote {target_token} most famous novel in exile"),
-            ("Law",        f"The court ruled that {target_token} contract was invalid"),
-            ("Cooking",    f"The chef prepared {target_token} signature dish with fresh herbs"),
-            ("Music",      f"The orchestra performed {target_token} symphony in the grand hall"),
-            ("Sports",     f"The team won {target_token} championship after a tough season"),
-            ("Tech",       f"The engineer designed {target_token} new processor architecture"),
-            ("Medicine",   f"The doctor examined {target_token} patient with great care"),
-        ]
+        context_pairs = _get_default_contexts(target_token)
 
     extractor = JAXRoutingDataExtractor(
         _create_model_instance(config), params, config
@@ -708,11 +817,13 @@ def main():
 
     # Context routing options
     parser.add_argument('--target_token', default='the',
-                        help='Target token for context routing analysis')
+                        help='Target token for context routing (comma-sep for multi: the,is,in)')
     parser.add_argument('--pool_key', default='fv',
-                        help='Routing pool key (fv, fqk_q, rv, etc.)')
+                        help='Routing pool key (fv, fqk_q, rv, etc. Comma-sep for multi)')
     parser.add_argument('--top_n_neurons', type=int, default=30,
                         help='Number of top neurons to display')
+    parser.add_argument('--contexts_file', default=None,
+                        help='JSON file with custom context pairs (overrides presets)')
 
     # Embedding space options
     parser.add_argument('--embed_method', default='umap', choices=['umap', 'pca'],
@@ -740,12 +851,26 @@ def main():
 
     if run_all or args.viz == 'context_routing':
         print("\n[1/3] Context-Dependent Routing Heatmap")
-        visualize_context_routing(
-            model_cls, params, config, args.output,
-            target_token=args.target_token,
-            pool_key=args.pool_key,
-            top_n_neurons=args.top_n_neurons,
-        )
+        # Load custom contexts if provided
+        custom_contexts = None
+        if args.contexts_file:
+            custom_contexts = load_contexts_from_file(args.contexts_file)
+            print(f"  Loaded {len(custom_contexts)} contexts from {args.contexts_file}")
+
+        # Support comma-separated tokens and pools for exploration
+        tokens = [t.strip() for t in args.target_token.split(',')]
+        pools = [p.strip() for p in args.pool_key.split(',')]
+
+        for token in tokens:
+            for pool in pools:
+                print(f"  Token='{token}', Pool={pool}")
+                visualize_context_routing(
+                    model_cls, params, config, args.output,
+                    target_token=token,
+                    context_pairs=custom_contexts,
+                    pool_key=pool,
+                    top_n_neurons=args.top_n_neurons,
+                )
 
     if run_all or args.viz == 'embedding_space':
         print("\n[2/3] Neuron Embedding Space")
