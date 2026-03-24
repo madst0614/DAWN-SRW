@@ -1,0 +1,77 @@
+# DAWN Spatial-R1 Training Config - 40M Scale, 5B tokens
+# Rank-1 neuron architecture: each neuron is a single [D] vector
+# Transform: out = V^T diag(gate) V x  (sum of rank-1 outer products)
+# Gate: learnable tau threshold (v18.5 style)
+
+seed: 1
+
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+    - train/c4/c4_raw_001.pt
+    - train/c4/c4_raw_002.pt
+    - train/c4/c4_raw_003.pt
+    - train/c4/c4_raw_004.pt
+    - train/c4/c4_raw_005.pt
+    - train/c4/c4_raw_006.pt
+    - train/c4/c4_raw_007.pt
+    - train/c4/c4_raw_008.pt
+    - train/c4/c4_raw_009.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 5000000000
+  max_val_tokens: 2000000
+
+model:
+  model_version: "spatial-r1"
+  d_model: 384
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+
+  # Rank-1 neuron pools
+  n_qk: 256        # Q/K shared neurons [N, D]
+  n_v: 256          # V neurons [N, D]
+  n_know: 512       # Knowledge neurons [N, D]
+  max_k: 32         # Safety cap on active neurons per token
+
+  # Router
+  d_space: 64       # Neuron embedding dimension
+  router_dropout: 0.1
+
+training:
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.00065
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  diversity_weight: 0.1
+  load_balance_weight: 0.001
+  # orthogonality_weight not used (rank-1 has no matrix orthogonality)
+  orthogonality_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_spatial_r1_40M_c4_5B
+log_dir: /content/drive/MyDrive/dawn/logs_spatial_r1_40M_c4_5B
+
+# Architecture Notes:
+#
+#   Rank-1 vs v17.1:
+#   - v17.1 neuron: [N, D, R] matrix → feature [B,S,R], restore [B,S,D]
+#   - spatial-r1 neuron: [N, D] vector → sense scalar, emit [D]
+#   - No separate feature/restore: one vector senses AND emits
+#   - Q/K share qk_neurons pool, V uses v_neurons pool
+#
+#   Parameter count (approximately):
+#   - qk_neurons: 256 × 384 = 98K
+#   - v_neurons:  256 × 384 = 98K
+#   - know_neurons: 512 × 384 = 197K
+#   - neuron_emb: 1024 × 64 = 65K
+#   - Router projections: ~150K
+#   - Per-block (LayerNorm + O_proj): ~300K × 12 = 3.6M
+#   - Embeddings: 30522 × 384 + 512 × 384 = 11.9M
+#   - Total: ~16M (smaller than v17.1 40M — increase n_qk/n_v/n_know for scale)
