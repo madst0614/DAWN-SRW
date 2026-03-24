@@ -30,6 +30,14 @@ model:
   d_space: 256
   router_dropout: 0.1
 
+  # Hierarchical routing (2-stage)
+  n_clusters_qk: 64       # 8192/64 = 128 neurons per cluster
+  n_clusters_v: 64         # 8192/64 = 128
+  n_clusters_know: 128     # 24576/128 = 192
+  k_cluster_qk: 8          # 64 clusters → select 8 → search 1024/8192
+  k_cluster_v: 8
+  k_cluster_know: 8         # 128 clusters → select 8 → search 1536/24576
+
 training:
   batch_size: 128
   gradient_accumulation_steps: 1
@@ -47,12 +55,18 @@ use_amp: true
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1_40M_c4_5B
 log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1_40M_c4_5B
 
-# Parameter budget (40.3M):
-#   qk_neurons:   8192 × 384 =  3.15M
-#   v_neurons:    8192 × 384 =  3.15M
-#   know_neurons: 24576 × 384 =  9.44M
-#   neuron_emb:   40960 × 256 = 10.49M
-#   Router proj + tau:           0.40M
-#   Blocks (LN×2 + O_proj) ×12: 1.79M
-#   Embeddings (tok + pos):     11.92M
-#   Total:                      40.3M
+# Parameter budget (~40.5M):
+#   qk_neurons:    8192 × 384  =  3.15M
+#   v_neurons:     8192 × 384  =  3.15M
+#   know_neurons:  24576 × 384 =  9.44M
+#   neuron_emb:    40960 × 256 = 10.49M
+#   cluster_emb:   (64+64+128) × 256 = 0.07M  (hierarchical routing)
+#   Router proj + tau:            0.40M
+#   Blocks (LN×2 + O_proj) ×12:  1.79M
+#   Embeddings (tok + pos):      11.92M
+#   Total:                       ~40.4M
+#
+# Routing complexity:
+#   QK: 64 cluster scores + 8×128=1024 neuron scores (vs 8192 flat)  → 7.5x speedup
+#   V:  64 cluster scores + 8×128=1024 neuron scores (vs 8192 flat)  → 7.5x speedup
+#   Know: 128 cluster scores + 8×192=1536 neuron scores (vs 24576 flat) → 15x speedup

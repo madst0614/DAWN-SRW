@@ -102,6 +102,13 @@ def build_model_from_config(cfg):
             dropout_rate=mcfg.get('dropout', 0.1),
             router_dropout=mcfg.get('router_dropout', 0.1),
             gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            # Hierarchical routing
+            n_clusters_qk=mcfg.get('n_clusters_qk', 64),
+            n_clusters_v=mcfg.get('n_clusters_v', 64),
+            n_clusters_know=mcfg.get('n_clusters_know', 128),
+            k_cluster_qk=mcfg.get('k_cluster_qk', 8),
+            k_cluster_v=mcfg.get('k_cluster_v', 8),
+            k_cluster_know=mcfg.get('k_cluster_know', 8),
         )
     else:
         model = DAWN(

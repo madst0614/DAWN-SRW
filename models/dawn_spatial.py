@@ -1,5 +1,5 @@
 """
-DAWN-Spatial: Rank-1 Neuron Architecture (JAX/Flax)
+DAWN-Spatial: Rank-1 Neuron Architecture with Hierarchical Routing (JAX/Flax)
 
 Key concept:
   - Every neuron is a single vector v_i [D] (rank-1).
@@ -9,12 +9,17 @@ Key concept:
   - Equivalent to: out = V^T diag(gate) V x  (sum of rank-1 outer products)
   - Complex transforms emerge from multi-layer residual, not single neuron.
 
+Hierarchical Routing (2-stage):
+  Stage 1 (Coarse): Select top-k clusters via cluster embeddings
+  Stage 2 (Fine):   Route within selected clusters via neuron embeddings
+  Complexity: O(n_clusters + k_cluster × cluster_size) << O(N)
+
 Architecture:
-  NeuronPool   — shared [N, D] vectors (rank-1, not [N, D, R])
-  Router       — learned embeddings + threshold tau gating (v18.5 style)
+  NeuronPool   — shared [N, D] vectors + cluster embeddings [n_clusters, d_space]
+  Router       — hierarchical: cluster selection → neuron routing → threshold tau
   sense_emit   — checkpointed rank-1 transform: V^T diag(gate) V x
-  AttentionCircuit — Q/K/V via sense_emit + causal self-attention
-  KnowledgeCircuit — FFN-equivalent via sense_emit
+  AttentionCircuit — Q/K/V via hierarchical sense_emit + causal self-attention
+  KnowledgeCircuit — FFN-equivalent via hierarchical sense_emit
   DAWNBlock    — norm → attn → residual → norm → knowledge → residual
   DAWN         — embedding + jax.lax.scan layer loop + weight-tied lm_head
 
@@ -146,18 +151,27 @@ def sense_emit(x, neurons, gates):
 # ================================================================
 
 class NeuronPool(nn.Module):
-    """Shared rank-1 neuron pool.
+    """Shared rank-1 neuron pool with hierarchical cluster structure.
 
-    Unlike v17.1's SharedNeurons with [N, D, R] matrices,
-    each neuron is a single [D] vector. Three pools:
-      - qk_neurons [N_qk, D]: shared for Q and K (like v17.1)
+    Each neuron is a single [D] vector. Three pools:
+      - qk_neurons [N_qk, D]: shared for Q and K
       - v_neurons  [N_v, D]:  for V
       - know_neurons [N_know, D]: for knowledge (FFN-equivalent)
+
+    Hierarchical routing adds cluster embeddings for coarse selection:
+      - cluster_emb_qk  [n_clusters_qk, d_space]
+      - cluster_emb_v   [n_clusters_v, d_space]
+      - cluster_emb_know [n_clusters_know, d_space]
+    Cluster assignments are fixed: neuron i -> cluster i // cluster_size.
     """
     n_qk: int
     n_v: int
     n_know: int
     d_model: int
+    d_space: int = 256
+    n_clusters_qk: int = 64
+    n_clusters_v: int = 64
+    n_clusters_know: int = 128
 
     def setup(self):
         self.qk_neurons = self.param(
@@ -167,22 +181,131 @@ class NeuronPool(nn.Module):
         self.know_neurons = self.param(
             'know_neurons', unit_norm_init(), (self.n_know, self.d_model))
 
+        # Cluster embeddings for hierarchical routing
+        self.cluster_emb_qk = self.param(
+            'cluster_emb_qk', scaled_normal(0.02),
+            (self.n_clusters_qk, self.d_space))
+        self.cluster_emb_v = self.param(
+            'cluster_emb_v', scaled_normal(0.02),
+            (self.n_clusters_v, self.d_space))
+        self.cluster_emb_know = self.param(
+            'cluster_emb_know', scaled_normal(0.02),
+            (self.n_clusters_know, self.d_space))
+
 
 # ================================================================
-# 7. Router — learned embeddings + threshold tau gating
+# 6b. Hierarchical routing helpers
+# ================================================================
+
+def _hierarchical_gate(h, neuron_emb, cluster_emb, tau,
+                       n_neurons, n_clusters, k_cluster, max_k):
+    """2-stage hierarchical routing: cluster selection → neuron routing.
+
+    Args:
+        h:           [B, S, d_space] projected input
+        neuron_emb:  [N, d_space] neuron embeddings (already normalized)
+        cluster_emb: [n_clusters, d_space] cluster embeddings (learnable)
+        tau:         [B, S, 1] input-dependent threshold
+        n_neurons:   total neuron count N
+        n_clusters:  number of clusters
+        k_cluster:   how many clusters to select
+        max_k:       safety cap on total active neurons
+
+    Returns:
+        gates: [B, S, N] sparse gate values (most entries zero)
+        cluster_aux: scalar cluster-level load balance loss
+        neuron_aux:  scalar neuron-level load balance loss
+    """
+    B, S, _ = h.shape
+    cluster_size = n_neurons // n_clusters
+
+    # --- Stage 1: Coarse cluster selection ---
+    cluster_emb_norm = cluster_emb / (
+        jnp.linalg.norm(cluster_emb, axis=-1, keepdims=True) + 1e-8)
+    cluster_scores = jnp.einsum('bsd,cd->bsc', h, cluster_emb_norm)  # [B,S,n_clusters]
+
+    # Top-k clusters
+    topk_vals, topk_ids = jax.lax.top_k(cluster_scores, k_cluster)  # [B,S,k_cluster]
+
+    # Cluster load balance: encourage uniform cluster usage
+    # Soft assignment via softmax for differentiable balance
+    cluster_probs = jax.nn.softmax(cluster_scores, axis=-1)  # [B,S,n_clusters]
+    cluster_freq = cluster_probs.mean(axis=(0, 1))  # [n_clusters]
+    target_cluster = 1.0 / n_clusters
+    cluster_aux = ((cluster_freq - target_cluster) ** 2).sum() * n_clusters
+
+    # --- Stage 2: Fine neuron selection within selected clusters ---
+    # Build mask of active neurons from selected clusters
+    # topk_ids: [B, S, k_cluster] — each entry is a cluster index
+    # For each selected cluster c, neurons c*cluster_size .. (c+1)*cluster_size-1 are candidates
+
+    # Expand cluster ids to neuron ids: [B, S, k_cluster * cluster_size]
+    # offsets within cluster: [cluster_size]
+    offsets = jnp.arange(cluster_size)  # [cluster_size]
+    # base indices: [B, S, k_cluster, 1] * cluster_size + [cluster_size]
+    base = topk_ids * cluster_size  # [B, S, k_cluster]
+    # [B, S, k_cluster, cluster_size]
+    active_ids = base[:, :, :, jnp.newaxis] + offsets[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
+    active_ids = active_ids.reshape(B, S, k_cluster * cluster_size)  # [B, S, n_active]
+
+    # Gather neuron embeddings for active neurons
+    active_emb = neuron_emb[active_ids.reshape(-1)]  # [B*S*n_active, d_space]
+    active_emb = active_emb.reshape(B, S, k_cluster * cluster_size, -1)  # [B,S,n_active,d_space]
+
+    # Compute scores only for active neurons
+    # h: [B,S,d_space], active_emb: [B,S,n_active,d_space]
+    active_scores = jnp.einsum('bsd,bsnd->bsn', h, active_emb)  # [B,S,n_active]
+
+    # Apply threshold gate on active scores
+    active_gates = threshold_gate(active_scores, tau, max_k)  # [B,S,n_active]
+
+    # Scatter back to full [B, S, N] gate tensor
+    gates = jnp.zeros((B, S, n_neurons), dtype=active_gates.dtype)
+    # Use scatter-add: for each (b, s), place active_gates into gates at active_ids positions
+    b_idx = jnp.arange(B)[:, jnp.newaxis, jnp.newaxis]  # [B,1,1]
+    s_idx = jnp.arange(S)[jnp.newaxis, :, jnp.newaxis]  # [1,S,1]
+    gates = gates.at[b_idx, s_idx, active_ids].set(active_gates)
+
+    # Neuron load balance (within active neurons)
+    target_neuron = 1.0 / n_neurons
+    neuron_freq = gates.mean(axis=(0, 1))  # [N]
+    neuron_aux = ((neuron_freq - target_neuron) ** 2).sum() * n_neurons
+
+    return gates, cluster_aux, neuron_aux
+
+
+def _hierarchical_gate_pure(h, neuron_emb, cluster_emb, tau,
+                            n_neurons, n_clusters, k_cluster, max_k):
+    """Pure-function version of hierarchical gate (for scan body).
+
+    Same as _hierarchical_gate but takes raw arrays, not module params.
+    """
+    return _hierarchical_gate(h, neuron_emb, cluster_emb, tau,
+                              n_neurons, n_clusters, k_cluster, max_k)
+
+
+# ================================================================
+# 7. Router — learned embeddings + hierarchical threshold tau gating
 # ================================================================
 
 class Router(nn.Module):
-    """Routes tokens to neurons via learned embeddings + threshold gate.
+    """Hierarchical router: cluster selection → neuron routing → threshold tau.
 
-    Combines v17.1's neuron embedding routing with v18.5's learnable tau.
-    Single unified embedding table for all neuron types.
+    2-stage routing for each pool (QK, V, Know):
+      Stage 1: score against cluster embeddings, top-k_cluster selection
+      Stage 2: score against neuron embeddings within selected clusters
     """
     d_model: int
     d_space: int
     n_qk: int
     n_v: int
     n_know: int
+    n_clusters_qk: int = 64
+    n_clusters_v: int = 64
+    n_clusters_know: int = 128
+    k_cluster_qk: int = 8
+    k_cluster_v: int = 8
+    k_cluster_know: int = 8
     max_k: int = 32
     router_dropout: float = 0.1
 
@@ -200,8 +323,8 @@ class Router(nn.Module):
         self.tau_attn = nn.Dense(3, name='tau_attn')   # tau_Q, tau_K, tau_V
         self.tau_know = nn.Dense(1, name='tau_know')
 
-    def get_attention_gates(self, x, deterministic, rng):
-        """Compute Q, K, V gates and load-balance aux_loss.
+    def get_attention_gates(self, x, neuron_pool, deterministic, rng):
+        """Compute Q, K, V gates via hierarchical routing.
 
         Returns: (gate_Q [B,S,N_qk], gate_K [B,S,N_qk],
                   gate_V [B,S,N_v], aux_loss)
@@ -217,31 +340,28 @@ class Router(nn.Module):
         h_all = safe_dropout(h_all, self.router_dropout, deterministic, rng1)
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
-        scores_Q = jnp.einsum('bsd,nd->bsn', h_Q, qk_emb)
-        scores_K = jnp.einsum('bsd,nd->bsn', h_K, qk_emb)
-        scores_V = jnp.einsum('bsd,nd->bsn', h_V, v_emb)
-
         tau_all = self.tau_attn(x)  # [B, S, 3]
         tau_Q = tau_all[:, :, 0:1]
         tau_K = tau_all[:, :, 1:2]
         tau_V = tau_all[:, :, 2:3]
 
-        gate_Q = threshold_gate(scores_Q, tau_Q, self.max_k)
-        gate_K = threshold_gate(scores_K, tau_K, self.max_k)
-        gate_V = threshold_gate(scores_V, tau_V, self.max_k)
+        # Hierarchical routing for Q, K (shared QK pool)
+        gate_Q, caux_q, naux_q = _hierarchical_gate(
+            h_Q, qk_emb, neuron_pool.cluster_emb_qk, tau_Q,
+            self.n_qk, self.n_clusters_qk, self.k_cluster_qk, self.max_k)
+        gate_K, caux_k, naux_k = _hierarchical_gate(
+            h_K, qk_emb, neuron_pool.cluster_emb_qk, tau_K,
+            self.n_qk, self.n_clusters_qk, self.k_cluster_qk, self.max_k)
+        # Hierarchical routing for V
+        gate_V, caux_v, naux_v = _hierarchical_gate(
+            h_V, v_emb, neuron_pool.cluster_emb_v, tau_V,
+            self.n_v, self.n_clusters_v, self.k_cluster_v, self.max_k)
 
-        # Load-balance auxiliary loss
-        target_qk = 1.0 / self.n_qk
-        target_v = 1.0 / self.n_v
-        aux = jnp.float32(0.0)
-        aux += ((gate_Q.mean(axis=(0, 1)) - target_qk) ** 2).sum() * self.n_qk
-        aux += ((gate_K.mean(axis=(0, 1)) - target_qk) ** 2).sum() * self.n_qk
-        aux += ((gate_V.mean(axis=(0, 1)) - target_v) ** 2).sum() * self.n_v
-
+        aux = (caux_q + caux_k + caux_v) + (naux_q + naux_k + naux_v)
         return gate_Q, gate_K, gate_V, aux
 
-    def get_knowledge_gates(self, x, deterministic, rng):
-        """Compute knowledge gates and load-balance aux_loss.
+    def get_knowledge_gates(self, x, neuron_pool, deterministic, rng):
+        """Compute knowledge gates via hierarchical routing.
 
         Returns: (gate_know [B,S,N_know], aux_loss)
         """
@@ -253,13 +373,13 @@ class Router(nn.Module):
         h_know = self.proj_know(x)
         h_know = safe_dropout(h_know, self.router_dropout, deterministic, rng1)
 
-        scores = jnp.einsum('bsd,nd->bsn', h_know, know_emb)
         tau = self.tau_know(x)
-        gate = threshold_gate(scores, tau, self.max_k)
 
-        target = 1.0 / self.n_know
-        aux = ((gate.mean(axis=(0, 1)) - target) ** 2).sum() * self.n_know
+        gate, caux, naux = _hierarchical_gate(
+            h_know, know_emb, neuron_pool.cluster_emb_know, tau,
+            self.n_know, self.n_clusters_know, self.k_cluster_know, self.max_k)
 
+        aux = caux + naux
         return gate, aux
 
 
@@ -267,9 +387,12 @@ class Router(nn.Module):
 # 8. Pure functions for jax.lax.scan forward path
 # ================================================================
 
-def _router_attn_gates(x, router_params, n_qk, n_v, d_space, max_k,
+def _router_attn_gates(x, router_params, pool_params,
+                       n_qk, n_v, d_space, max_k,
+                       n_clusters_qk, n_clusters_v,
+                       k_cluster_qk, k_cluster_v,
                        router_dropout, deterministic, rng):
-    """Pure function: attention gates + aux_loss (for scan body)."""
+    """Pure function: hierarchical attention gates + aux_loss (for scan body)."""
     neuron_emb = router_params['neuron_emb']
     emb_norm = neuron_emb / (jnp.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8)
 
@@ -281,33 +404,34 @@ def _router_attn_gates(x, router_params, n_qk, n_v, d_space, max_k,
     h_all = safe_dropout(h_all, router_dropout, deterministic, rng1)
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
-    scores_Q = jnp.einsum('bsd,nd->bsn', h_Q, qk_emb)
-    scores_K = jnp.einsum('bsd,nd->bsn', h_K, qk_emb)
-    scores_V = jnp.einsum('bsd,nd->bsn', h_V, v_emb)
-
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
     tau_Q = tau_all[:, :, 0:1]
     tau_K = tau_all[:, :, 1:2]
     tau_V = tau_all[:, :, 2:3]
 
-    gate_Q = threshold_gate(scores_Q, tau_Q, max_k)
-    gate_K = threshold_gate(scores_K, tau_K, max_k)
-    gate_V = threshold_gate(scores_V, tau_V, max_k)
+    # Hierarchical routing
+    cluster_emb_qk = pool_params['cluster_emb_qk']
+    cluster_emb_v = pool_params['cluster_emb_v']
 
-    # Load-balance auxiliary loss
-    target_qk = 1.0 / n_qk
-    target_v = 1.0 / n_v
-    aux = jnp.float32(0.0)
-    aux += ((gate_Q.mean(axis=(0, 1)) - target_qk) ** 2).sum() * n_qk
-    aux += ((gate_K.mean(axis=(0, 1)) - target_qk) ** 2).sum() * n_qk
-    aux += ((gate_V.mean(axis=(0, 1)) - target_v) ** 2).sum() * n_v
+    gate_Q, caux_q, naux_q = _hierarchical_gate(
+        h_Q, qk_emb, cluster_emb_qk, tau_Q,
+        n_qk, n_clusters_qk, k_cluster_qk, max_k)
+    gate_K, caux_k, naux_k = _hierarchical_gate(
+        h_K, qk_emb, cluster_emb_qk, tau_K,
+        n_qk, n_clusters_qk, k_cluster_qk, max_k)
+    gate_V, caux_v, naux_v = _hierarchical_gate(
+        h_V, v_emb, cluster_emb_v, tau_V,
+        n_v, n_clusters_v, k_cluster_v, max_k)
 
+    aux = (caux_q + caux_k + caux_v) + (naux_q + naux_k + naux_v)
     return gate_Q, gate_K, gate_V, aux
 
 
-def _router_know_gates(x, router_params, n_qk, n_v, n_know, max_k,
+def _router_know_gates(x, router_params, pool_params,
+                       n_qk, n_v, n_know, max_k,
+                       n_clusters_know, k_cluster_know,
                        router_dropout, deterministic, rng):
-    """Pure function: knowledge gates + aux_loss (for scan body)."""
+    """Pure function: hierarchical knowledge gates + aux_loss (for scan body)."""
     neuron_emb = router_params['neuron_emb']
     emb_norm = neuron_emb / (jnp.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8)
     know_emb = emb_norm[n_qk + n_v:]
@@ -316,13 +440,14 @@ def _router_know_gates(x, router_params, n_qk, n_v, n_know, max_k,
     h_know = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     h_know = safe_dropout(h_know, router_dropout, deterministic, rng1)
 
-    scores = jnp.einsum('bsd,nd->bsn', h_know, know_emb)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-    gate = threshold_gate(scores, tau, max_k)
 
-    target = 1.0 / n_know
-    aux = ((gate.mean(axis=(0, 1)) - target) ** 2).sum() * n_know
+    cluster_emb_know = pool_params['cluster_emb_know']
+    gate, caux, naux = _hierarchical_gate(
+        h_know, know_emb, cluster_emb_know, tau,
+        n_know, n_clusters_know, k_cluster_know, max_k)
 
+    aux = caux + naux
     return gate, aux
 
 
@@ -388,7 +513,7 @@ class AttentionCircuit(nn.Module):
         rng, rng_router, rng_drop, rng_out = jax.random.split(rng, 4)
 
         gate_Q, gate_K, gate_V, aux = router.get_attention_gates(
-            x, deterministic, rng_router)
+            x, neuron_pool, deterministic, rng_router)
 
         Q = sense_emit(x, neuron_pool.qk_neurons, gate_Q)
         K = sense_emit(x, neuron_pool.qk_neurons, gate_K)
@@ -423,7 +548,7 @@ class KnowledgeCircuit(nn.Module):
         rng = self.make_rng('dropout')
         rng, rng_router = jax.random.split(rng)
 
-        gate, aux = router.get_knowledge_gates(x, deterministic, rng_router)
+        gate, aux = router.get_knowledge_gates(x, neuron_pool, deterministic, rng_router)
         out = sense_emit(x, neuron_pool.know_neurons, gate)
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
@@ -492,6 +617,13 @@ class DAWN(nn.Module):
     dropout_rate: float = 0.1
     router_dropout: float = 0.1
     gradient_checkpointing: bool = False
+    # Hierarchical routing
+    n_clusters_qk: int = 64
+    n_clusters_v: int = 64
+    n_clusters_know: int = 128
+    k_cluster_qk: int = 8
+    k_cluster_v: int = 8
+    k_cluster_know: int = 8
 
     def setup(self):
         if self.d_model % self.n_heads != 0:
@@ -508,11 +640,20 @@ class DAWN(nn.Module):
 
         self.neuron_pool = NeuronPool(
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
-            d_model=self.d_model)
+            d_model=self.d_model, d_space=self.d_space,
+            n_clusters_qk=self.n_clusters_qk,
+            n_clusters_v=self.n_clusters_v,
+            n_clusters_know=self.n_clusters_know)
 
         self.router = Router(
             d_model=self.d_model, d_space=self.d_space,
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
+            n_clusters_qk=self.n_clusters_qk,
+            n_clusters_v=self.n_clusters_v,
+            n_clusters_know=self.n_clusters_know,
+            k_cluster_qk=self.k_cluster_qk,
+            k_cluster_v=self.k_cluster_v,
+            k_cluster_know=self.k_cluster_know,
             max_k=self.max_k, router_dropout=self.router_dropout)
 
         # Blocks: used for init; forward uses scan with pure functions
@@ -576,8 +717,10 @@ class DAWN(nn.Module):
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
 
                 gate_Q, gate_K, gate_V, attn_aux = _router_attn_gates(
-                    normed, router_params,
+                    normed, router_params, pool_params,
                     self.n_qk, self.n_v, self.d_space, self.max_k,
+                    self.n_clusters_qk, self.n_clusters_v,
+                    self.k_cluster_qk, self.k_cluster_v,
                     self.router_dropout, deterministic, rng_ar)
 
                 attn_out = _attn_forward(
@@ -593,8 +736,9 @@ class DAWN(nn.Module):
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
 
                 gate_know, know_aux = _router_know_gates(
-                    normed, router_params,
+                    normed, router_params, pool_params,
                     self.n_qk, self.n_v, self.n_know, self.max_k,
+                    self.n_clusters_know, self.k_cluster_know,
                     self.router_dropout, deterministic, rng_kr)
 
                 know_out = _know_forward(
@@ -681,11 +825,20 @@ class DAWN(nn.Module):
             'max_seq_len': self.max_seq_len,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_know': self.n_know,
             'max_k': self.max_k, 'd_space': self.d_space,
+            'n_clusters_qk': self.n_clusters_qk,
+            'n_clusters_v': self.n_clusters_v,
+            'n_clusters_know': self.n_clusters_know,
+            'k_cluster_qk': self.k_cluster_qk,
+            'k_cluster_v': self.k_cluster_v,
+            'k_cluster_know': self.k_cluster_know,
         }
 
     def get_model_info(self):
+        cs_qk = self.n_qk // self.n_clusters_qk
+        cs_v = self.n_v // self.n_clusters_v
+        cs_know = self.n_know // self.n_clusters_know
         return [
-            f"DAWN v{self.__version__}: Rank-1 Neuron Architecture (JAX)",
+            f"DAWN v{self.__version__}: Rank-1 Neuron + Hierarchical Routing (JAX)",
             f"  d_model={self.d_model}, n_layers={self.n_layers}, "
             f"n_heads={self.n_heads}",
             f"  max_seq_len={self.max_seq_len}, dropout={self.dropout_rate}",
@@ -698,9 +851,14 @@ class DAWN(nn.Module):
             f"  Know neurons: {self.n_know} x {self.d_model}  "
             f"(max_k={self.max_k})",
             f"",
-            f"  [Router — threshold tau gating]",
+            f"  [Hierarchical Routing — 2-stage]",
+            f"  QK:   {self.n_clusters_qk} clusters x {cs_qk} neurons, "
+            f"top-{self.k_cluster_qk} → search {self.k_cluster_qk * cs_qk}/{self.n_qk}",
+            f"  V:    {self.n_clusters_v} clusters x {cs_v} neurons, "
+            f"top-{self.k_cluster_v} → search {self.k_cluster_v * cs_v}/{self.n_v}",
+            f"  Know: {self.n_clusters_know} clusters x {cs_know} neurons, "
+            f"top-{self.k_cluster_know} → search {self.k_cluster_know * cs_know}/{self.n_know}",
             f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
-            f"  learnable tau (v18.5 style)",
             f"",
             f"  [Memory Optimization]",
             f"  jax.checkpoint: sense_emit (rank-1 intermediate recompute)",
