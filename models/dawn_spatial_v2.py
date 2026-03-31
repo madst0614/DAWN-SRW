@@ -315,11 +315,12 @@ class Router(nn.Module):
 
         n_cand = self.max_k_know * self.candidates_multiplier
 
-        # Chunked distance-based candidate selection (OOM-safe for large N)
-        cand_idx, cand_dist = _chunked_distance_topk(
-            know_pos, npos_know, n_cand, chunk_size=32)
+        # Direct distance + top_k (init path uses small batch, no OOM)
+        dist = jnp.sum(
+            (know_pos[:, :, None, :] - npos_know[None, None, :, :]) ** 2,
+            axis=-1)  # [B, S, N_know]
+        _, cand_idx = jax.lax.top_k(-dist, n_cand)
         cand_idx = jax.lax.stop_gradient(cand_idx)
-        cand_dist = jax.lax.stop_gradient(cand_dist)  # pos_loss recomputes below
 
         # Precise scoring
         cand_neurons = know_neurons[cand_idx]  # [B, S, n_cand, D]
