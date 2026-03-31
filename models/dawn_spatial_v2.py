@@ -3,11 +3,12 @@ DAWN-Spatial v2: Rank-1 Neuron Architecture with 2D Positional Routing (JAX/Flax
 
 Changelog:
   spatial-r1-v2.0.6 (2026-03-31):
-    - Fix scan output stacking OOM: use carry accumulation with
-      dynamic_update_slice instead of scan output stacking.
-      Scan returns None output, all results accumulated in carry buffer.
-    - Remove jax.checkpoint from _know_pipeline_chunked (outer scan_body
-      level checkpoint sufficient)
+    - Both Know AND Attention pipelines fully chunked with carry accumulation
+    - _attn_pipeline_chunked: Q/K/V sense_emit chunked, self-attention full seq
+    - _know_pipeline_chunked: carry accumulation via dynamic_update_slice
+    - Removed dead code: _router_attn_gates, _router_know_gates, _attn_forward,
+      _know_forward, _router_and_attn, sense_emit_sparse, _chunked_distance_topk
+    - scan_body computes pos/tau outside pipelines, passes as args
 
   spatial-r1-v2.0.5 (2026-03-31):
     - Know pipeline fully chunked over sequence axis to fix gather OOM
@@ -157,27 +158,7 @@ def threshold_gate(scores, tau, max_k=None):
     return (exp_gate / gate_sum) * gate_strength
 
 
-# ================================================================
-# 5. Rank-1 Sense-Emit: sparse (candidate-only) version
-# ================================================================
-
-def sense_emit_sparse(x, neurons, gates, cand_idx):
-    """Sparse rank-1 sense + emit (candidates only).
-
-    Checkpoint is handled at the higher level (_router_and_attn).
-    _know_pipeline_chunked uses carry accumulation so no checkpoint needed.
-
-    x:        [B, S, D]
-    neurons:  [N, D]        -- full rank-1 neuron pool
-    gates:    [B, S, n_cand] -- sparse gate values for candidates
-    cand_idx: [B, S, n_cand] -- candidate neuron indices
-
-    Returns: [B, S, D]
-    """
-    cand_neurons = neurons[cand_idx]                           # [B, S, n_cand, D]
-    activations = jnp.einsum('bsd,bsnd->bsn', x, cand_neurons)  # sense
-    gated = activations * gates                                   # fire
-    return jnp.einsum('bsn,bsnd->bsd', gated, cand_neurons)      # emit
+# (sense_emit_sparse removed in v2.0.6 — inlined into chunked pipelines)
 
 
 # ================================================================
@@ -361,289 +342,178 @@ class Router(nn.Module):
 
 
 # ================================================================
-# 8. Pure functions for jax.lax.scan forward path
+# 8. Chunked pipeline functions for jax.lax.scan forward path
+#    All pipelines use carry accumulation (dynamic_update_slice)
+#    to avoid scan output stacking OOM.
 # ================================================================
 
-def _chunked_distance_topk(query_pos, neuron_pos, k, chunk_size=32):
-    """Sequence-chunked distance top-k to avoid OOM on large N.
+def _attn_pipeline_chunked(
+    # --- dynamic (tensors) ---
+    x, qk_pos, v_pos, tau_Q, tau_K, tau_V,
+    qk_neurons, v_neurons, npos_qk, npos_v,
+    expand_O_kernel, rng,
+    # --- static (int/float/bool) ---
+    max_k_qk, max_k_v, candidates_multiplier,
+    n_heads, d_model,
+    router_dropout, dropout_rate, deterministic,
+    chunk_size,
+):
+    """Attention pipeline: Q/K/V sense_emit chunked, self-attention full sequence.
 
-    Splits the sequence axis into chunks, computes distance + top-k per chunk,
-    then reassembles. Peak memory: B * chunk_size * N * 4 bytes.
-
-    Args:
-        query_pos:  [B, S, pos_dim]
-        neuron_pos: [N, pos_dim]
-        k:          number of candidates
-        chunk_size: sequence chunk size (32 recommended)
-
-    Returns:
-        cand_idx:  [B, S, k] candidate neuron indices
-        cand_dist: [B, S, k] squared distances to candidates
+    Gather tensors only exist within each chunk. Q/K/V buffers are [B,S,D] (small).
+    No jax.checkpoint here -- outer scan_body handles that if needed.
     """
-    B, S, P = query_pos.shape
-    # Pad S to multiple of chunk_size for scan compatibility
-    pad_S = ((S + chunk_size - 1) // chunk_size) * chunk_size
-    if pad_S > S:
-        query_pos = jnp.pad(query_pos, ((0, 0), (0, pad_S - S), (0, 0)))
-
-    # [B, n_chunks, chunk_size, pos_dim]
-    query_chunks = query_pos.reshape(B, -1, chunk_size, P)
-
-    def process_chunk(carry, q_chunk):
-        # q_chunk: [B, chunk_size, pos_dim]
-        dist = jnp.sum(
-            (q_chunk[:, :, None, :] - neuron_pos[None, None, :, :]) ** 2,
-            axis=-1)  # [B, chunk_size, N]
-        vals, idx = jax.lax.top_k(-dist, k)
-        return carry, (idx, -vals)  # return positive distances
-
-    _, (all_idx, all_dist) = jax.lax.scan(
-        process_chunk, None,
-        jnp.moveaxis(query_chunks, 1, 0))  # scan over n_chunks dim
-
-    # [n_chunks, B, chunk_size, k] -> [B, n_chunks*chunk_size, k]
-    all_idx = jnp.moveaxis(all_idx, 0, 1).reshape(B, -1, k)
-    all_dist = jnp.moveaxis(all_dist, 0, 1).reshape(B, -1, k)
-
-    # Remove padding
-    return all_idx[:, :S, :], all_dist[:, :S, :]
-
-
-def _router_attn_gates(x, router_params, pool_params,
-                       npos_qk, npos_v, rng,
-                       max_k_qk, max_k_v,
-                       candidates_multiplier,
-                       router_dropout, deterministic):
-    """Pure function: 2D positional attention gates + pos_loss.
-
-    Args order: dynamic tensors first, then static hyperparameters.
-    npos_qk/npos_v are pre-sliced neuron positions.
-    """
-    qk_neurons = pool_params['qk_neurons']      # [N_qk, D]
-    v_neurons = pool_params['v_neurons']         # [N_v, D]
-
-    # Query positions
-    qk_pos = x @ router_params['proj_pos_qk']['kernel'] + router_params['proj_pos_qk']['bias']
-    v_pos = x @ router_params['proj_pos_v']['kernel'] + router_params['proj_pos_v']['bias']
-
+    B, S, D = x.shape
     n_cand_qk = max_k_qk * candidates_multiplier
     n_cand_v = max_k_v * candidates_multiplier
+    pos_dim = qk_pos.shape[-1]
 
-    # Candidate selection (distance-based, stop_gradient)
-    dist_qk = jnp.sum(
-        (qk_pos[:, :, None, :] - npos_qk[None, None, :, :]) ** 2,
-        axis=-1)  # [B, S, N_qk]
-    _, cand_idx_qk = jax.lax.top_k(-dist_qk, n_cand_qk)
-    cand_idx_qk = jax.lax.stop_gradient(cand_idx_qk)
+    # Pad sequence to chunk_size multiple
+    pad_S = ((S + chunk_size - 1) // chunk_size) * chunk_size
+    if pad_S > S:
+        pad_seq = ((0, 0), (0, pad_S - S), (0, 0))
+        x = jnp.pad(x, pad_seq)
+        qk_pos = jnp.pad(qk_pos, pad_seq[:2] + ((0, 0),))
+        v_pos = jnp.pad(v_pos, pad_seq[:2] + ((0, 0),))
+        tau_Q = jnp.pad(tau_Q, pad_seq[:2] + ((0, 0),))
+        tau_K = jnp.pad(tau_K, pad_seq[:2] + ((0, 0),))
+        tau_V = jnp.pad(tau_V, pad_seq[:2] + ((0, 0),))
 
-    dist_v = jnp.sum(
-        (v_pos[:, :, None, :] - npos_v[None, None, :, :]) ** 2,
-        axis=-1)  # [B, S, N_v]
-    _, cand_idx_v = jax.lax.top_k(-dist_v, n_cand_v)
-    cand_idx_v = jax.lax.stop_gradient(cand_idx_v)
+    n_chunks = pad_S // chunk_size
+    Q_buf = jnp.zeros((B, pad_S, D))
+    K_buf = jnp.zeros((B, pad_S, D))
+    V_buf = jnp.zeros((B, pad_S, D))
+    total_pos_loss = jnp.float32(0.0)
+    chunk_rngs = jax.random.split(rng, n_chunks)
 
-    # Precise scoring within candidates
-    cand_qk = qk_neurons[cand_idx_qk]   # [B, S, n_cand_qk, D]
-    cand_v = v_neurons[cand_idx_v]       # [B, S, n_cand_v, D]
+    def process_chunk(carry, chunk_idx):
+        Q_buf, K_buf, V_buf, total_pos_loss = carry
+        start = chunk_idx * chunk_size
 
-    rng, rng1 = jax.random.split(rng)
-    x_drop = safe_dropout(x, router_dropout, deterministic, rng1)
+        x_c = jax.lax.dynamic_slice(x, (0, start, 0), (B, chunk_size, D))
+        qk_pos_c = jax.lax.dynamic_slice(
+            qk_pos, (0, start, 0), (B, chunk_size, pos_dim))
+        v_pos_c = jax.lax.dynamic_slice(
+            v_pos, (0, start, 0), (B, chunk_size, pos_dim))
+        tau_Q_c = jax.lax.dynamic_slice(
+            tau_Q, (0, start, 0), (B, chunk_size, 1))
+        tau_K_c = jax.lax.dynamic_slice(
+            tau_K, (0, start, 0), (B, chunk_size, 1))
+        tau_V_c = jax.lax.dynamic_slice(
+            tau_V, (0, start, 0), (B, chunk_size, 1))
+        rng_c = chunk_rngs[chunk_idx]
 
-    scores_Q = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk)
-    scores_K = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk)
-    scores_V = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_v)
+        # --- QK candidates ---
+        dist_qk = jnp.sum(
+            (qk_pos_c[:, :, None, :] - npos_qk[None, None, :, :]) ** 2,
+            axis=-1)
+        _, cand_idx_qk = jax.lax.top_k(-dist_qk, n_cand_qk)
+        cand_idx_qk = jax.lax.stop_gradient(cand_idx_qk)
+        cand_qk = qk_neurons[cand_idx_qk]  # [B, cs, n_cand_qk, D]
 
-    # Tau
-    tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
-    tau_Q = tau_all[:, :, 0:1]
-    tau_K = tau_all[:, :, 1:2]
-    tau_V = tau_all[:, :, 2:3]
+        # --- V candidates ---
+        dist_v = jnp.sum(
+            (v_pos_c[:, :, None, :] - npos_v[None, None, :, :]) ** 2,
+            axis=-1)
+        _, cand_idx_v = jax.lax.top_k(-dist_v, n_cand_v)
+        cand_idx_v = jax.lax.stop_gradient(cand_idx_v)
+        cand_v = v_neurons[cand_idx_v]  # [B, cs, n_cand_v, D]
 
-    gate_Q = threshold_gate(scores_Q, tau_Q, max_k_qk)
-    gate_K = threshold_gate(scores_K, tau_K, max_k_qk)
-    gate_V = threshold_gate(scores_V, tau_V, max_k_v)
+        # --- Score ---
+        rng_c, rng_drop = jax.random.split(rng_c)
+        x_drop = safe_dropout(x_c, router_dropout, deterministic, rng_drop)
+        scores_Q = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk)
+        scores_K = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk)
+        scores_V = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_v)
 
-    # pos_loss: reuse distances from candidate selection
-    cand_dist_qk = jnp.take_along_axis(dist_qk, cand_idx_qk, axis=-1)
-    pos_loss_qk = (jax.lax.stop_gradient(gate_Q) * cand_dist_qk).mean()
+        # --- Gate ---
+        gate_Q = threshold_gate(scores_Q, tau_Q_c, max_k_qk)
+        gate_K = threshold_gate(scores_K, tau_K_c, max_k_qk)
+        gate_V = threshold_gate(scores_V, tau_V_c, max_k_v)
 
-    cand_dist_v = jnp.take_along_axis(dist_v, cand_idx_v, axis=-1)
-    pos_loss_v = (jax.lax.stop_gradient(gate_V) * cand_dist_v).mean()
+        # --- Sense-emit Q/K/V (inline) ---
+        act_Q = jnp.einsum('bsd,bsnd->bsn', x_c, cand_qk)
+        Q_chunk = jnp.einsum('bsn,bsnd->bsd', act_Q * gate_Q, cand_qk)
 
-    aux = pos_loss_qk + pos_loss_v
-    return gate_Q, gate_K, gate_V, cand_idx_qk, cand_idx_v, aux
+        act_K = jnp.einsum('bsd,bsnd->bsn', x_c, cand_qk)
+        K_chunk = jnp.einsum('bsn,bsnd->bsd', act_K * gate_K, cand_qk)
 
+        act_V = jnp.einsum('bsd,bsnd->bsn', x_c, cand_v)
+        V_chunk = jnp.einsum('bsn,bsnd->bsd', act_V * gate_V, cand_v)
 
-def _router_know_gates(x, router_params, pool_params,
-                       npos_know, rng,
-                       max_k_know,
-                       candidates_multiplier,
-                       router_dropout, deterministic):
-    """Pure function: 2D positional knowledge gates + pos_loss.
+        # --- pos_loss ---
+        pos_dist_qk = jnp.sum(
+            (qk_pos_c[:, :, None, :] - npos_qk[cand_idx_qk]) ** 2,
+            axis=-1)
+        pos_loss_qk = (jax.lax.stop_gradient(gate_Q) * pos_dist_qk).mean()
 
-    Args order: dynamic tensors first, then static hyperparameters.
-    npos_know is pre-sliced neuron positions.
-    """
-    know_neurons = pool_params['know_neurons']     # [N_know, D]
+        pos_dist_v = jnp.sum(
+            (v_pos_c[:, :, None, :] - npos_v[cand_idx_v]) ** 2,
+            axis=-1)
+        pos_loss_v = (jax.lax.stop_gradient(gate_V) * pos_dist_v).mean()
 
-    know_pos = x @ router_params['proj_pos_know']['kernel'] + router_params['proj_pos_know']['bias']
+        # --- Accumulate into carry ---
+        Q_buf = jax.lax.dynamic_update_slice(Q_buf, Q_chunk, (0, start, 0))
+        K_buf = jax.lax.dynamic_update_slice(K_buf, K_chunk, (0, start, 0))
+        V_buf = jax.lax.dynamic_update_slice(V_buf, V_chunk, (0, start, 0))
+        total_pos_loss = total_pos_loss + pos_loss_qk + pos_loss_v
 
-    n_cand = max_k_know * candidates_multiplier
+        return (Q_buf, K_buf, V_buf, total_pos_loss), None
 
-    # Chunked distance (OOM-safe for large N_know)
-    cand_idx, cand_dist_sg = _chunked_distance_topk(
-        know_pos, npos_know, n_cand, chunk_size=32)
-    cand_idx = jax.lax.stop_gradient(cand_idx)
+    (Q_buf, K_buf, V_buf, total_pos_loss), _ = jax.lax.scan(
+        process_chunk,
+        (Q_buf, K_buf, V_buf, total_pos_loss),
+        jnp.arange(n_chunks))
 
-    cand_neurons = know_neurons[cand_idx]  # [B, S, n_cand, D]
+    # Remove padding
+    Q = Q_buf[:, :S, :]
+    K = K_buf[:, :S, :]
+    V = V_buf[:, :S, :]
+    pos_loss = total_pos_loss / n_chunks
 
-    rng, rng1 = jax.random.split(rng)
-    x_drop = safe_dropout(x, router_dropout, deterministic, rng1)
-    scores = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_neurons)
-
-    tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-    gate = threshold_gate(scores, tau, max_k_know)
-
-    # pos_loss: recompute on candidates for gradient flow to neuron_pos & proj_pos
-    cand_npos = npos_know[cand_idx]  # [B, S, n_cand, 2]
-    cand_dist_grad = jnp.sum(
-        (know_pos[:, :, None, :] - cand_npos) ** 2,
-        axis=-1)  # [B, S, n_cand] — small tensor
-    pos_loss = (jax.lax.stop_gradient(gate) * cand_dist_grad).mean()
-
-    return gate, cand_idx, pos_loss
-
-
-def _attn_forward(x, pool_params, gate_Q, gate_K, gate_V,
-                  cand_idx_qk, cand_idx_v,
-                  expand_O_kernel, n_heads, d_model,
-                  dropout_rate, deterministic, rng):
-    """Pure function: rank-1 sparse attention circuit (for scan body)."""
-    B, S, D = x.shape
+    # === Self-attention (full sequence, Q/K/V are [B,S,D] = small) ===
     d_head = d_model // n_heads
-
-    qk = pool_params['qk_neurons']
-    v = pool_params['v_neurons']
-
-    Q = sense_emit_sparse(x, qk, gate_Q, cand_idx_qk)   # [B, S, D]
-    K = sense_emit_sparse(x, qk, gate_K, cand_idx_qk)   # [B, S, D]
-    V = sense_emit_sparse(x, v, gate_V, cand_idx_v)      # [B, S, D]
-
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
     K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
     V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
 
     scale = jnp.sqrt(jnp.float32(d_head))
-    scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+    attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
     causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-    scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
-    attn_w = jax.nn.softmax(scores, axis=-1)
+    attn_scores = jnp.where(causal, attn_scores,
+                            jnp.finfo(attn_scores.dtype).min)
+    attn_w = jax.nn.softmax(attn_scores, axis=-1)
 
-    rng, rng1, rng2 = jax.random.split(rng, 3)
-    attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng1)
+    rng_attn, rng_out = jax.random.split(rng)
+    attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_attn)
 
     out = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
-    out = safe_dropout(out, dropout_rate, deterministic, rng2)
-    return out
+    out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-
-def _know_forward(x, pool_params, gate_know, cand_idx_know,
-                  dropout_rate, deterministic, rng):
-    """Pure function: rank-1 sparse knowledge circuit (for scan body)."""
-    know = pool_params['know_neurons']
-    out = sense_emit_sparse(x, know, gate_know, cand_idx_know)
-    out = safe_dropout(out, dropout_rate, deterministic, rng)
-    return out
-
-
-# ================================================================
-# 8b. Checkpointed routing + forward (eliminates backward OOM)
-# ================================================================
-
-def _router_and_attn_raw(
-    # --- dynamic (tensors) ---
-    x,                     # 0
-    router_params,         # 1
-    pool_params,           # 2
-    npos_qk,               # 3
-    npos_v,                # 4
-    expand_O_kernel,       # 5
-    rng,                   # 6
-    # --- static (int/float/bool) ---
-    max_k_qk,             # 7
-    max_k_v,              # 8
-    candidates_multiplier, # 9
-    n_heads,              # 10
-    d_model,              # 11
-    router_dropout,       # 12
-    dropout_rate,         # 13
-    deterministic,        # 14
-):
-    """Routing (distance->candidate->scoring->gating) + attention forward.
-
-    Wrapped by jax.checkpoint with static_argnums for args 7-14.
-    All intermediate tensors are recomputed during backward.
-    """
-    rng, rng_ar, rng_a = jax.random.split(rng, 3)
-
-    gate_Q, gate_K, gate_V, cand_idx_qk, cand_idx_v, aux = \
-        _router_attn_gates(
-            x, router_params, pool_params,
-            npos_qk, npos_v, rng_ar,
-            max_k_qk, max_k_v,
-            candidates_multiplier,
-            router_dropout, deterministic)
-
-    attn_out = _attn_forward(
-        x, pool_params, gate_Q, gate_K, gate_V,
-        cand_idx_qk, cand_idx_v,
-        expand_O_kernel,
-        n_heads, d_model,
-        dropout_rate, deterministic, rng_a)
-
-    return attn_out, aux
-
-
-_router_and_attn = jax.checkpoint(
-    _router_and_attn_raw,
-    static_argnums=(7, 8, 9, 10, 11, 12, 13, 14)
-)
+    return out, pos_loss
 
 
 def _know_pipeline_chunked(
     # --- dynamic (tensors) ---
-    x,                     # 0  [B, S, D]
-    router_params,         # 1
-    pool_params,           # 2
-    npos_know,             # 3  [N_know, 2]
-    rng,                   # 4
+    x, know_pos, tau,
+    know_neurons, npos_know, rng,
     # --- static (int/float/bool) ---
-    max_k_know,            # 5
-    candidates_multiplier, # 6
-    router_dropout,        # 7
-    dropout_rate,          # 8
-    deterministic,         # 9
-    chunk_size,            # 10
+    max_k_know, candidates_multiplier,
+    router_dropout, dropout_rate, deterministic,
+    chunk_size,
 ):
     """Know pipeline fully chunked over sequence axis.
 
-    Uses carry accumulation (dynamic_update_slice) instead of scan output
-    stacking, so intermediate tensors (cand_neurons gather) are freed after
-    each chunk. No jax.checkpoint here -- outer scan_body handles that.
+    Uses carry accumulation (dynamic_update_slice). Scan returns None output.
+    No jax.checkpoint here -- outer scan_body handles that if needed.
 
     Peak memory per chunk: [B, chunk_size, n_cand, D].
     """
     B, S, D = x.shape
-    know_neurons = pool_params['know_neurons']   # [N_know, D]
     n_cand = max_k_know * candidates_multiplier
-
-    # Compute query_pos and tau over full sequence (small tensors)
-    know_pos = (x @ router_params['proj_pos_know']['kernel']
-                + router_params['proj_pos_know']['bias'])  # [B, S, 2]
-    tau = (x @ router_params['tau_know']['kernel']
-           + router_params['tau_know']['bias'])             # [B, S, 1]
+    pos_dim = know_pos.shape[-1]
 
     # Pad sequence to chunk_size multiple
     pad_S = ((S + chunk_size - 1) // chunk_size) * chunk_size
@@ -653,21 +523,14 @@ def _know_pipeline_chunked(
         tau = jnp.pad(tau, ((0, 0), (0, pad_S - S), (0, 0)))
 
     n_chunks = pad_S // chunk_size
-    pos_dim = know_pos.shape[-1]
-
-    # Output buffer and pos_loss accumulator as carry
     out_buf = jnp.zeros((B, pad_S, D))
     total_pos_loss = jnp.float32(0.0)
-
-    # Per-chunk rngs
     chunk_rngs = jax.random.split(rng, n_chunks)
 
     def process_chunk(carry, chunk_idx):
-        """Full Know pipeline for one sequence chunk, writing to carry buffer."""
         out_buf, total_pos_loss = carry
         start = chunk_idx * chunk_size
 
-        # Extract current chunk via dynamic_slice (static shapes)
         x_c = jax.lax.dynamic_slice(x, (0, start, 0), (B, chunk_size, D))
         pos_c = jax.lax.dynamic_slice(
             know_pos, (0, start, 0), (B, chunk_size, pos_dim))
@@ -677,50 +540,45 @@ def _know_pipeline_chunked(
         # 1. Distance -> candidate selection
         dist = jnp.sum(
             (pos_c[:, :, None, :] - npos_know[None, None, :, :]) ** 2,
-            axis=-1)  # [B, chunk_size, N_know]
+            axis=-1)
         _, cand_idx = jax.lax.top_k(-dist, n_cand)
         cand_idx = jax.lax.stop_gradient(cand_idx)
 
-        # 2. Gather candidate neurons
-        cand_neurons = know_neurons[cand_idx]  # [B, chunk_size, n_cand, D]
-
-        # 3. Score
+        # 2. Gather + Score
+        cand_neurons = know_neurons[cand_idx]
         rng_c, rng_drop = jax.random.split(rng_c)
         x_drop = safe_dropout(x_c, router_dropout, deterministic, rng_drop)
         scores = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_neurons)
 
-        # 4. Gate
+        # 3. Gate
         gate = threshold_gate(scores, tau_c, max_k_know)
 
-        # 5. Sense-emit (inline)
+        # 4. Sense-emit (inline)
         activations = jnp.einsum('bsd,bsnd->bsn', x_c, cand_neurons)
         gated = activations * gate
         chunk_out = jnp.einsum('bsn,bsnd->bsd', gated, cand_neurons)
-
         rng_c, rng_out = jax.random.split(rng_c)
         chunk_out = safe_dropout(
             chunk_out, dropout_rate, deterministic, rng_out)
 
-        # 6. pos_loss (recompute distance on candidates for gradient flow)
-        cand_npos = npos_know[cand_idx]  # [B, chunk_size, n_cand, 2]
+        # 5. pos_loss
+        cand_npos = npos_know[cand_idx]
         pos_dist = jnp.sum(
-            (pos_c[:, :, None, :] - cand_npos) ** 2,
-            axis=-1)  # [B, chunk_size, n_cand]
+            (pos_c[:, :, None, :] - cand_npos) ** 2, axis=-1)
         chunk_pos_loss = (jax.lax.stop_gradient(gate) * pos_dist).mean()
 
-        # Accumulate into carry (no scan output stacking)
+        # Accumulate into carry
         out_buf = jax.lax.dynamic_update_slice(
             out_buf, chunk_out, (0, start, 0))
         total_pos_loss = total_pos_loss + chunk_pos_loss
 
-        return (out_buf, total_pos_loss), None  # no output!
+        return (out_buf, total_pos_loss), None
 
     (out_buf, total_pos_loss), _ = jax.lax.scan(
         process_chunk,
         (out_buf, total_pos_loss),
         jnp.arange(n_chunks))
 
-    # Remove padding, average pos_loss
     return out_buf[:, :S, :], total_pos_loss / n_chunks
 
 
@@ -942,40 +800,51 @@ class DAWN(nn.Module):
                 rng = xs['rng']
                 rng, rng_attn, rng_know = jax.random.split(rng, 3)
 
-                # --- Attention sub-block (fully checkpointed) ---
+                # --- Attention sub-block (chunked Q/K/V + full self-attn) ---
                 normed = _layer_norm(
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
 
-                attn_out, attn_aux = _router_and_attn(
-                    # dynamic tensors
-                    normed, router_params, pool_params,
+                # Compute small tensors (pos, tau) outside chunked pipeline
+                qk_pos = (normed @ router_params['proj_pos_qk']['kernel']
+                          + router_params['proj_pos_qk']['bias'])
+                v_pos = (normed @ router_params['proj_pos_v']['kernel']
+                         + router_params['proj_pos_v']['bias'])
+                tau_all = (normed @ router_params['tau_attn']['kernel']
+                           + router_params['tau_attn']['bias'])
+                tau_Q = tau_all[:, :, 0:1]
+                tau_K = tau_all[:, :, 1:2]
+                tau_V = tau_all[:, :, 2:3]
+
+                attn_out, attn_aux = _attn_pipeline_chunked(
+                    normed, qk_pos, v_pos, tau_Q, tau_K, tau_V,
+                    pool_params['qk_neurons'], pool_params['v_neurons'],
                     npos_qk, npos_v,
-                    bp['attn']['expand_O']['kernel'],
-                    rng_attn,
-                    # static hyperparameters
+                    bp['attn']['expand_O']['kernel'], rng_attn,
+                    # static
                     self.max_k_qk, self.max_k_v,
                     self.candidates_multiplier,
                     self.n_heads, self.d_model,
                     self.router_dropout, self.dropout_rate,
-                    deterministic)
+                    deterministic, self.know_chunk_size)
 
                 x = x + attn_out
 
-                # --- Knowledge sub-block (fully checkpointed) ---
+                # --- Knowledge sub-block (fully chunked) ---
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
 
+                know_pos = (normed @ router_params['proj_pos_know']['kernel']
+                            + router_params['proj_pos_know']['bias'])
+                tau_know = (normed @ router_params['tau_know']['kernel']
+                            + router_params['tau_know']['bias'])
+
                 know_out, know_aux = _know_pipeline_chunked(
-                    # dynamic tensors
-                    normed, router_params, pool_params,
-                    npos_know,
-                    rng_know,
-                    # static hyperparameters
-                    self.max_k_know,
-                    self.candidates_multiplier,
+                    normed, know_pos, tau_know,
+                    pool_params['know_neurons'], npos_know, rng_know,
+                    # static
+                    self.max_k_know, self.candidates_multiplier,
                     self.router_dropout, self.dropout_rate,
-                    deterministic,
-                    self.know_chunk_size)
+                    deterministic, self.know_chunk_size)
 
                 x = x + know_out
                 return x, attn_aux + know_aux
