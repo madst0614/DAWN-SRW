@@ -2,6 +2,11 @@
 DAWN-Spatial v2: Rank-1 Neuron Architecture with 2D Positional Routing (JAX/Flax)
 
 Changelog:
+  spatial-r1-v2.0.4 (2026-03-31):
+    - Fix TracerBoolConversionError: use jax.checkpoint with static_argnums
+      for int/float/bool hyperparameters (max_k, n_heads, dropout, etc.)
+    - Reorder function signatures: dynamic tensor args first, static last
+
   spatial-r1-v2.0.3 (2026-03-31):
     - Fix jax.checkpoint dynamic slice error: pre-slice neuron_pos in
       scan_body (outside checkpoint), pass npos_qk/npos_v/npos_know as
@@ -392,14 +397,14 @@ def _chunked_distance_topk(query_pos, neuron_pos, k, chunk_size=32):
 
 
 def _router_attn_gates(x, router_params, pool_params,
-                       npos_qk, npos_v,
+                       npos_qk, npos_v, rng,
                        max_k_qk, max_k_v,
                        candidates_multiplier,
-                       router_dropout, deterministic, rng):
-    """Pure function: 2D positional attention gates + pos_loss (for scan body).
+                       router_dropout, deterministic):
+    """Pure function: 2D positional attention gates + pos_loss.
 
-    npos_qk/npos_v are pre-sliced neuron positions (avoids dynamic slice
-    inside jax.checkpoint).
+    Args order: dynamic tensors first, then static hyperparameters.
+    npos_qk/npos_v are pre-sliced neuron positions.
     """
     qk_neurons = pool_params['qk_neurons']      # [N_qk, D]
     v_neurons = pool_params['v_neurons']         # [N_v, D]
@@ -457,14 +462,14 @@ def _router_attn_gates(x, router_params, pool_params,
 
 
 def _router_know_gates(x, router_params, pool_params,
-                       npos_know,
+                       npos_know, rng,
                        max_k_know,
                        candidates_multiplier,
-                       router_dropout, deterministic, rng):
-    """Pure function: 2D positional knowledge gates + pos_loss (for scan body).
+                       router_dropout, deterministic):
+    """Pure function: 2D positional knowledge gates + pos_loss.
 
-    npos_know is pre-sliced neuron positions (avoids dynamic slice
-    inside jax.checkpoint).
+    Args order: dynamic tensors first, then static hyperparameters.
+    npos_know is pre-sliced neuron positions.
     """
     know_neurons = pool_params['know_neurons']     # [N_know, D]
 
@@ -544,18 +549,28 @@ def _know_forward(x, pool_params, gate_know, cand_idx_know,
 # 8b. Checkpointed routing + forward (eliminates backward OOM)
 # ================================================================
 
-@jax.checkpoint
-def _router_and_attn(x, router_params, pool_params,
-                     npos_qk, npos_v,
-                     expand_O_kernel,
-                     max_k_qk, max_k_v,
-                     candidates_multiplier,
-                     n_heads, d_model,
-                     router_dropout, dropout_rate,
-                     deterministic, rng):
-    """Checkpointed: routing (distance->candidate->scoring->gating) + attention.
+def _router_and_attn_raw(
+    # --- dynamic (tensors) ---
+    x,                     # 0
+    router_params,         # 1
+    pool_params,           # 2
+    npos_qk,               # 3
+    npos_v,                # 4
+    expand_O_kernel,       # 5
+    rng,                   # 6
+    # --- static (int/float/bool) ---
+    max_k_qk,             # 7
+    max_k_v,              # 8
+    candidates_multiplier, # 9
+    n_heads,              # 10
+    d_model,              # 11
+    router_dropout,       # 12
+    dropout_rate,         # 13
+    deterministic,        # 14
+):
+    """Routing (distance->candidate->scoring->gating) + attention forward.
 
-    npos_qk/npos_v are pre-sliced outside checkpoint to avoid dynamic slice.
+    Wrapped by jax.checkpoint with static_argnums for args 7-14.
     All intermediate tensors are recomputed during backward.
     """
     rng, rng_ar, rng_a = jax.random.split(rng, 3)
@@ -563,10 +578,10 @@ def _router_and_attn(x, router_params, pool_params,
     gate_Q, gate_K, gate_V, cand_idx_qk, cand_idx_v, aux = \
         _router_attn_gates(
             x, router_params, pool_params,
-            npos_qk, npos_v,
+            npos_qk, npos_v, rng_ar,
             max_k_qk, max_k_v,
             candidates_multiplier,
-            router_dropout, deterministic, rng_ar)
+            router_dropout, deterministic)
 
     attn_out = _attn_forward(
         x, pool_params, gate_Q, gate_K, gate_V,
@@ -578,16 +593,29 @@ def _router_and_attn(x, router_params, pool_params,
     return attn_out, aux
 
 
-@jax.checkpoint
-def _router_and_know(x, router_params, pool_params,
-                     npos_know,
-                     max_k_know,
-                     candidates_multiplier,
-                     router_dropout, dropout_rate,
-                     deterministic, rng):
-    """Checkpointed: routing + knowledge forward.
+_router_and_attn = jax.checkpoint(
+    _router_and_attn_raw,
+    static_argnums=(7, 8, 9, 10, 11, 12, 13, 14)
+)
 
-    npos_know is pre-sliced outside checkpoint to avoid dynamic slice.
+
+def _router_and_know_raw(
+    # --- dynamic (tensors) ---
+    x,                     # 0
+    router_params,         # 1
+    pool_params,           # 2
+    npos_know,             # 3
+    rng,                   # 4
+    # --- static (int/float/bool) ---
+    max_k_know,            # 5
+    candidates_multiplier, # 6
+    router_dropout,        # 7
+    dropout_rate,          # 8
+    deterministic,         # 9
+):
+    """Routing + knowledge forward.
+
+    Wrapped by jax.checkpoint with static_argnums for args 5-9.
     All intermediate tensors are recomputed during backward.
     """
     rng, rng_kr, rng_k = jax.random.split(rng, 3)
@@ -595,16 +623,22 @@ def _router_and_know(x, router_params, pool_params,
     gate_know, cand_idx_know, aux = \
         _router_know_gates(
             x, router_params, pool_params,
-            npos_know,
+            npos_know, rng_kr,
             max_k_know,
             candidates_multiplier,
-            router_dropout, deterministic, rng_kr)
+            router_dropout, deterministic)
 
     know_out = _know_forward(
         x, pool_params, gate_know, cand_idx_know,
         dropout_rate, deterministic, rng_k)
 
     return know_out, aux
+
+
+_router_and_know = jax.checkpoint(
+    _router_and_know_raw,
+    static_argnums=(5, 6, 7, 8, 9)
+)
 
 
 # ================================================================
@@ -710,7 +744,7 @@ class DAWN(nn.Module):
     Uses jax.lax.scan for O(1) XLA compile, jax.checkpoint for memory.
     Weight tying: lm_head reuses token_emb via nn.Embed.attend().
     """
-    __version__ = "spatial-r1-v2.0.3"
+    __version__ = "spatial-r1-v2.0.4"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -829,14 +863,17 @@ class DAWN(nn.Module):
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
 
                 attn_out, attn_aux = _router_and_attn(
+                    # dynamic tensors
                     normed, router_params, pool_params,
                     npos_qk, npos_v,
                     bp['attn']['expand_O']['kernel'],
+                    rng_attn,
+                    # static hyperparameters
                     self.max_k_qk, self.max_k_v,
                     self.candidates_multiplier,
                     self.n_heads, self.d_model,
                     self.router_dropout, self.dropout_rate,
-                    deterministic, rng_attn)
+                    deterministic)
 
                 x = x + attn_out
 
@@ -845,12 +882,15 @@ class DAWN(nn.Module):
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
 
                 know_out, know_aux = _router_and_know(
+                    # dynamic tensors
                     normed, router_params, pool_params,
                     npos_know,
+                    rng_know,
+                    # static hyperparameters
                     self.max_k_know,
                     self.candidates_multiplier,
                     self.router_dropout, self.dropout_rate,
-                    deterministic, rng_know)
+                    deterministic)
 
                 x = x + know_out
                 return x, attn_aux + know_aux
