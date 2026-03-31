@@ -459,7 +459,8 @@ def _attn_pipeline_mapped_chunked(
     """Attention: cell lookup (full seq) + chunked Q/K/V sense_emit + full self-attn.
 
     Cell lookup produces small index tensors [B,S,n_cand].
-    Gather+score+gate+emit are chunked to limit peak memory.
+    Gather+score+gate+emit via Python for loop + jax.checkpoint per chunk
+    (scan would stack intermediate tensors across chunks -> OOM).
     Self-attention runs on full sequence (Q/K/V are [B,S,D] = small).
     """
     B, S, D = x.shape
@@ -492,56 +493,27 @@ def _attn_pipeline_mapped_chunked(
         mask_v = jnp.pad(mask_v, pad2[:2] + ((0, 0),))
 
     n_chunks = pad_S // chunk_size
-    Q_buf = jnp.zeros((B, pad_S, D))
-    K_buf = jnp.zeros((B, pad_S, D))
-    V_buf = jnp.zeros((B, pad_S, D))
-    total_pos_loss = jnp.float32(0.0)
     chunk_rngs = jax.random.split(rng, n_chunks + 1)
     rng_final = chunk_rngs[-1]
     chunk_rngs = chunk_rngs[:-1]
 
-    def process_chunk(carry, chunk_idx):
-        Q_buf, K_buf, V_buf, total_pos_loss = carry
-        start = chunk_idx * chunk_size
-
-        x_c = jax.lax.dynamic_slice(x, (0, start, 0), (B, chunk_size, D))
-        qk_pos_c = jax.lax.dynamic_slice(
-            qk_pos, (0, start, 0), (B, chunk_size, pos_dim))
-        v_pos_c = jax.lax.dynamic_slice(
-            v_pos, (0, start, 0), (B, chunk_size, pos_dim))
-        tau_Q_c = jax.lax.dynamic_slice(
-            tau_Q, (0, start, 0), (B, chunk_size, 1))
-        tau_K_c = jax.lax.dynamic_slice(
-            tau_K, (0, start, 0), (B, chunk_size, 1))
-        tau_V_c = jax.lax.dynamic_slice(
-            tau_V, (0, start, 0), (B, chunk_size, 1))
-        ci_qk = jax.lax.dynamic_slice(
-            cand_idx_qk, (0, start, 0), (B, chunk_size, n_cand_qk))
-        m_qk = jax.lax.dynamic_slice(
-            mask_qk, (0, start, 0), (B, chunk_size, n_cand_qk))
-        ci_v = jax.lax.dynamic_slice(
-            cand_idx_v, (0, start, 0), (B, chunk_size, n_cand_v))
-        m_v = jax.lax.dynamic_slice(
-            mask_v, (0, start, 0), (B, chunk_size, n_cand_v))
-        rng_c = chunk_rngs[chunk_idx]
-
-        # Gather
+    def _attn_chunk(x_c, qk_pos_c, v_pos_c, tau_Q_c, tau_K_c, tau_V_c,
+                    ci_qk, m_qk, ci_v, m_v, rng_c,
+                    max_k_qk, max_k_v, router_dropout, deterministic):
+        """Process one attention chunk. Checkpointed per call."""
         cand_qk = qk_neurons[ci_qk]
         cand_v = v_neurons[ci_v]
 
-        # Score
         rng_c, rng_drop = jax.random.split(rng_c)
         x_drop = safe_dropout(x_c, router_dropout, deterministic, rng_drop)
         scores_Q = jnp.where(m_qk, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk), -1e9)
         scores_K = jnp.where(m_qk, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk), -1e9)
         scores_V = jnp.where(m_v, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_v), -1e9)
 
-        # Gate
         gate_Q = threshold_gate(scores_Q, tau_Q_c, max_k_qk)
         gate_K = threshold_gate(scores_K, tau_K_c, max_k_qk)
         gate_V = threshold_gate(scores_V, tau_V_c, max_k_v)
 
-        # Sense-emit Q/K/V (inline)
         act_Q = jnp.einsum('bsd,bsnd->bsn', x_c, cand_qk)
         Q_c = jnp.einsum('bsn,bsnd->bsd', act_Q * gate_Q * m_qk, cand_qk)
         act_K = jnp.einsum('bsd,bsnd->bsn', x_c, cand_qk)
@@ -549,7 +521,6 @@ def _attn_pipeline_mapped_chunked(
         act_V = jnp.einsum('bsd,bsnd->bsn', x_c, cand_v)
         V_c = jnp.einsum('bsn,bsnd->bsd', act_V * gate_V * m_v, cand_v)
 
-        # pos_loss
         pd_qk = jnp.sum(
             (qk_pos_c[:, :, None, :] - npos_qk[ci_qk]) ** 2, axis=-1)
         pl_qk = (jax.lax.stop_gradient(gate_Q) * pd_qk * m_qk
@@ -559,20 +530,40 @@ def _attn_pipeline_mapped_chunked(
         pl_v = (jax.lax.stop_gradient(gate_V) * pd_v * m_v
                 ).sum() / (m_v.sum() + 1e-8)
 
-        Q_buf = jax.lax.dynamic_update_slice(Q_buf, Q_c, (0, start, 0))
-        K_buf = jax.lax.dynamic_update_slice(K_buf, K_c, (0, start, 0))
-        V_buf = jax.lax.dynamic_update_slice(V_buf, V_c, (0, start, 0))
-        total_pos_loss = total_pos_loss + pl_qk + pl_v
-        return (Q_buf, K_buf, V_buf, total_pos_loss), None
+        return Q_c, K_c, V_c, pl_qk + pl_v
 
-    (Q_buf, K_buf, V_buf, total_pos_loss), _ = jax.lax.scan(
-        process_chunk,
-        (Q_buf, K_buf, V_buf, total_pos_loss),
-        jnp.arange(n_chunks))
+    _attn_chunk_ckpt = jax.checkpoint(
+        _attn_chunk, static_argnums=(11, 12, 13, 14))
 
-    Q = Q_buf[:, :S, :]
-    K = K_buf[:, :S, :]
-    V = V_buf[:, :S, :]
+    # Python for loop -- no scan stacking of intermediate tensors
+    Q_parts, K_parts, V_parts = [], [], []
+    total_pos_loss = jnp.float32(0.0)
+
+    for i in range(n_chunks):
+        start = i * chunk_size
+        x_c = jax.lax.dynamic_slice(x, (0, start, 0), (B, chunk_size, D))
+        qk_pos_c = jax.lax.dynamic_slice(qk_pos, (0, start, 0), (B, chunk_size, pos_dim))
+        v_pos_c = jax.lax.dynamic_slice(v_pos, (0, start, 0), (B, chunk_size, pos_dim))
+        tau_Q_c = jax.lax.dynamic_slice(tau_Q, (0, start, 0), (B, chunk_size, 1))
+        tau_K_c = jax.lax.dynamic_slice(tau_K, (0, start, 0), (B, chunk_size, 1))
+        tau_V_c = jax.lax.dynamic_slice(tau_V, (0, start, 0), (B, chunk_size, 1))
+        ci_qk_c = jax.lax.dynamic_slice(cand_idx_qk, (0, start, 0), (B, chunk_size, n_cand_qk))
+        m_qk_c = jax.lax.dynamic_slice(mask_qk, (0, start, 0), (B, chunk_size, n_cand_qk))
+        ci_v_c = jax.lax.dynamic_slice(cand_idx_v, (0, start, 0), (B, chunk_size, n_cand_v))
+        m_v_c = jax.lax.dynamic_slice(mask_v, (0, start, 0), (B, chunk_size, n_cand_v))
+
+        Q_c, K_c, V_c, chunk_pl = _attn_chunk_ckpt(
+            x_c, qk_pos_c, v_pos_c, tau_Q_c, tau_K_c, tau_V_c,
+            ci_qk_c, m_qk_c, ci_v_c, m_v_c, chunk_rngs[i],
+            max_k_qk, max_k_v, router_dropout, deterministic)
+        Q_parts.append(Q_c)
+        K_parts.append(K_c)
+        V_parts.append(V_c)
+        total_pos_loss = total_pos_loss + chunk_pl
+
+    Q = jnp.concatenate(Q_parts, axis=1)[:, :S, :]
+    K = jnp.concatenate(K_parts, axis=1)[:, :S, :]
+    V = jnp.concatenate(V_parts, axis=1)[:, :S, :]
     pos_loss = total_pos_loss / n_chunks
 
     # --- Self-attention (full sequence) ---
@@ -612,7 +603,8 @@ def _know_pipeline_mapped_chunked(
     """Know pipeline: cell lookup (full seq) + chunked gather/score/gate/emit.
 
     Cell lookup over full sequence (small int tensors).
-    Gather+score+gate+emit chunked via carry accumulation.
+    Gather+score+gate+emit via Python for loop + jax.checkpoint per chunk
+    (scan would stack intermediate tensors -> OOM).
     """
     B, S, D = x.shape
     pos_dim = know_pos.shape[-1]
@@ -634,14 +626,44 @@ def _know_pipeline_mapped_chunked(
         valid_mask = jnp.pad(valid_mask, ((0, 0), (0, pad_S - S), (0, 0)))
 
     n_chunks = pad_S // chunk_size
-    out_buf = jnp.zeros((B, pad_S, D))
-    total_pos_loss = jnp.float32(0.0)
     chunk_rngs = jax.random.split(rng, n_chunks)
 
-    def process_chunk(carry, chunk_idx):
-        out_buf, total_pos_loss = carry
-        start = chunk_idx * chunk_size
+    def _know_chunk(x_c, pos_c, tau_c, ci, vm, rng_c,
+                    max_k_know, router_dropout, dropout_rate, deterministic):
+        """Process one know chunk. Checkpointed per call."""
+        cand_neurons = know_neurons[ci]
 
+        rng_c, rng_drop = jax.random.split(rng_c)
+        x_drop = safe_dropout(x_c, router_dropout, deterministic, rng_drop)
+        scores = jnp.where(
+            vm, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_neurons), -1e9)
+
+        gate = threshold_gate(scores, tau_c, max_k_know)
+
+        activations = jnp.einsum('bsd,bsnd->bsn', x_c, cand_neurons)
+        gated = activations * gate * vm
+        chunk_out = jnp.einsum('bsn,bsnd->bsd', gated, cand_neurons)
+        rng_c, rng_out = jax.random.split(rng_c)
+        chunk_out = safe_dropout(
+            chunk_out, dropout_rate, deterministic, rng_out)
+
+        cand_npos = npos_know[ci]
+        pos_dist = jnp.sum(
+            (pos_c[:, :, None, :] - cand_npos) ** 2, axis=-1)
+        chunk_pl = (jax.lax.stop_gradient(gate) * pos_dist * vm
+                    ).sum() / (vm.sum() + 1e-8)
+
+        return chunk_out, chunk_pl
+
+    _know_chunk_ckpt = jax.checkpoint(
+        _know_chunk, static_argnums=(6, 7, 8, 9))
+
+    # Python for loop -- no scan stacking
+    out_parts = []
+    total_pos_loss = jnp.float32(0.0)
+
+    for i in range(n_chunks):
+        start = i * chunk_size
         x_c = jax.lax.dynamic_slice(x, (0, start, 0), (B, chunk_size, D))
         pos_c = jax.lax.dynamic_slice(
             know_pos, (0, start, 0), (B, chunk_size, pos_dim))
@@ -650,45 +672,15 @@ def _know_pipeline_mapped_chunked(
             cand_idx, (0, start, 0), (B, chunk_size, n_cand))
         vm = jax.lax.dynamic_slice(
             valid_mask, (0, start, 0), (B, chunk_size, n_cand))
-        rng_c = chunk_rngs[chunk_idx]
 
-        # Gather
-        cand_neurons = know_neurons[ci]
-
-        # Score
-        rng_c, rng_drop = jax.random.split(rng_c)
-        x_drop = safe_dropout(x_c, router_dropout, deterministic, rng_drop)
-        scores = jnp.where(vm, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_neurons), -1e9)
-
-        # Gate
-        gate = threshold_gate(scores, tau_c, max_k_know)
-
-        # Sense-emit (inline)
-        activations = jnp.einsum('bsd,bsnd->bsn', x_c, cand_neurons)
-        gated = activations * gate * vm
-        chunk_out = jnp.einsum('bsn,bsnd->bsd', gated, cand_neurons)
-        rng_c, rng_out = jax.random.split(rng_c)
-        chunk_out = safe_dropout(
-            chunk_out, dropout_rate, deterministic, rng_out)
-
-        # pos_loss
-        cand_npos = npos_know[ci]
-        pos_dist = jnp.sum(
-            (pos_c[:, :, None, :] - cand_npos) ** 2, axis=-1)
-        chunk_pl = (jax.lax.stop_gradient(gate) * pos_dist * vm
-                    ).sum() / (vm.sum() + 1e-8)
-
-        out_buf = jax.lax.dynamic_update_slice(
-            out_buf, chunk_out, (0, start, 0))
+        chunk_out, chunk_pl = _know_chunk_ckpt(
+            x_c, pos_c, tau_c, ci, vm, chunk_rngs[i],
+            max_k_know, router_dropout, dropout_rate, deterministic)
+        out_parts.append(chunk_out)
         total_pos_loss = total_pos_loss + chunk_pl
-        return (out_buf, total_pos_loss), None
 
-    (out_buf, total_pos_loss), _ = jax.lax.scan(
-        process_chunk,
-        (out_buf, total_pos_loss),
-        jnp.arange(n_chunks))
-
-    return out_buf[:, :S, :], total_pos_loss / n_chunks
+    out = jnp.concatenate(out_parts, axis=1)[:, :S, :]
+    return out, total_pos_loss / n_chunks
 
 
 # ================================================================
