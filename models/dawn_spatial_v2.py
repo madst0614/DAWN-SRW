@@ -2,6 +2,11 @@
 DAWN-Spatial v2: Rank-1 Neuron Architecture with 2D Positional Routing (JAX/Flax)
 
 Changelog:
+  spatial-r1-v2.0.3 (2026-03-31):
+    - Fix jax.checkpoint dynamic slice error: pre-slice neuron_pos in
+      scan_body (outside checkpoint), pass npos_qk/npos_v/npos_know as
+      args to checkpointed functions
+
   spatial-r1-v2.0.2 (2026-03-31):
     - Wrap routing+sense_emit in single jax.checkpoint (_router_and_attn,
       _router_and_know) to eliminate backward OOM from intermediate tensors
@@ -387,14 +392,15 @@ def _chunked_distance_topk(query_pos, neuron_pos, k, chunk_size=32):
 
 
 def _router_attn_gates(x, router_params, pool_params,
-                       n_qk, n_v, pos_dim, max_k_qk, max_k_v,
+                       npos_qk, npos_v,
+                       max_k_qk, max_k_v,
                        candidates_multiplier,
                        router_dropout, deterministic, rng):
-    """Pure function: 2D positional attention gates + pos_loss (for scan body)."""
-    neuron_pos = router_params['neuron_pos']
-    npos_qk = neuron_pos[:n_qk]                # [N_qk, 2]
-    npos_v = neuron_pos[n_qk:n_qk + n_v]       # [N_v, 2]
+    """Pure function: 2D positional attention gates + pos_loss (for scan body).
 
+    npos_qk/npos_v are pre-sliced neuron positions (avoids dynamic slice
+    inside jax.checkpoint).
+    """
     qk_neurons = pool_params['qk_neurons']      # [N_qk, D]
     v_neurons = pool_params['v_neurons']         # [N_v, D]
 
@@ -451,12 +457,15 @@ def _router_attn_gates(x, router_params, pool_params,
 
 
 def _router_know_gates(x, router_params, pool_params,
-                       n_qk, n_v, n_know, max_k_know,
+                       npos_know,
+                       max_k_know,
                        candidates_multiplier,
                        router_dropout, deterministic, rng):
-    """Pure function: 2D positional knowledge gates + pos_loss (for scan body)."""
-    neuron_pos = router_params['neuron_pos']
-    npos_know = neuron_pos[n_qk + n_v:]           # [N_know, 2]
+    """Pure function: 2D positional knowledge gates + pos_loss (for scan body).
+
+    npos_know is pre-sliced neuron positions (avoids dynamic slice
+    inside jax.checkpoint).
+    """
     know_neurons = pool_params['know_neurons']     # [N_know, D]
 
     know_pos = x @ router_params['proj_pos_know']['kernel'] + router_params['proj_pos_know']['bias']
@@ -537,8 +546,8 @@ def _know_forward(x, pool_params, gate_know, cand_idx_know,
 
 @jax.checkpoint
 def _router_and_attn(x, router_params, pool_params,
+                     npos_qk, npos_v,
                      expand_O_kernel,
-                     n_qk, n_v, pos_dim,
                      max_k_qk, max_k_v,
                      candidates_multiplier,
                      n_heads, d_model,
@@ -546,15 +555,15 @@ def _router_and_attn(x, router_params, pool_params,
                      deterministic, rng):
     """Checkpointed: routing (distance->candidate->scoring->gating) + attention.
 
-    All intermediate tensors (distance, gather, gates, QKV) are recomputed
-    during backward. Only x (input) and (attn_out, aux) are saved.
+    npos_qk/npos_v are pre-sliced outside checkpoint to avoid dynamic slice.
+    All intermediate tensors are recomputed during backward.
     """
     rng, rng_ar, rng_a = jax.random.split(rng, 3)
 
     gate_Q, gate_K, gate_V, cand_idx_qk, cand_idx_v, aux = \
         _router_attn_gates(
             x, router_params, pool_params,
-            n_qk, n_v, pos_dim,
+            npos_qk, npos_v,
             max_k_qk, max_k_v,
             candidates_multiplier,
             router_dropout, deterministic, rng_ar)
@@ -571,22 +580,22 @@ def _router_and_attn(x, router_params, pool_params,
 
 @jax.checkpoint
 def _router_and_know(x, router_params, pool_params,
-                     n_qk, n_v, n_know,
+                     npos_know,
                      max_k_know,
                      candidates_multiplier,
                      router_dropout, dropout_rate,
                      deterministic, rng):
     """Checkpointed: routing + knowledge forward.
 
+    npos_know is pre-sliced outside checkpoint to avoid dynamic slice.
     All intermediate tensors are recomputed during backward.
-    Only x (input) and (know_out, aux) are saved.
     """
     rng, rng_kr, rng_k = jax.random.split(rng, 3)
 
     gate_know, cand_idx_know, aux = \
         _router_know_gates(
             x, router_params, pool_params,
-            n_qk, n_v, n_know,
+            npos_know,
             max_k_know,
             candidates_multiplier,
             router_dropout, deterministic, rng_kr)
@@ -701,7 +710,7 @@ class DAWN(nn.Module):
     Uses jax.lax.scan for O(1) XLA compile, jax.checkpoint for memory.
     Weight tying: lm_head reuses token_emb via nn.Embed.attend().
     """
-    __version__ = "spatial-r1-v2.0.2"
+    __version__ = "spatial-r1-v2.0.3"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -803,6 +812,12 @@ class DAWN(nn.Module):
             base_rng = self.make_rng('dropout')
             layer_rngs = jax.random.split(base_rng, self.n_layers)
 
+            # Pre-slice neuron_pos outside checkpoint (static indices)
+            neuron_pos = router_params['neuron_pos']
+            npos_qk = neuron_pos[:self.n_qk]
+            npos_v = neuron_pos[self.n_qk:self.n_qk + self.n_v]
+            npos_know = neuron_pos[self.n_qk + self.n_v:]
+
             def scan_body(carry, xs):
                 x = carry
                 bp = xs['params']
@@ -815,8 +830,8 @@ class DAWN(nn.Module):
 
                 attn_out, attn_aux = _router_and_attn(
                     normed, router_params, pool_params,
+                    npos_qk, npos_v,
                     bp['attn']['expand_O']['kernel'],
-                    self.n_qk, self.n_v, self.pos_dim,
                     self.max_k_qk, self.max_k_v,
                     self.candidates_multiplier,
                     self.n_heads, self.d_model,
@@ -831,7 +846,7 @@ class DAWN(nn.Module):
 
                 know_out, know_aux = _router_and_know(
                     normed, router_params, pool_params,
-                    self.n_qk, self.n_v, self.n_know,
+                    npos_know,
                     self.max_k_know,
                     self.candidates_multiplier,
                     self.router_dropout, self.dropout_rate,
