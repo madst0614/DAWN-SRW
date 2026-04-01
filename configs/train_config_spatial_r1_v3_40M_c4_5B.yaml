@@ -1,6 +1,5 @@
-# DAWN Spatial-R1 v3.6 -- Threshold Gate + Feature-Restore Emit
-# Sense: emb[N,64]. Emit: feature_fn[N,384,64] + restore_fn[N,64,384].
-# Neuron counts reduced for F-R param budget.
+# DAWN Spatial-R1 v3.6 -- Threshold Gate + F-R Basis Dynamic Synthesis
+# 21K sense neurons + M basis F-R emit. Neuron pattern -> basis weights.
 
 seed: 1
 
@@ -21,12 +20,15 @@ model:
   gradient_checkpointing: true
 
   d_bottleneck: 64
-  n_qk: 128
-  n_v: 128
-  n_know: 256
-  max_k_qk: 32
-  max_k_v: 32
-  max_k_know: 64
+  n_qk: 1570
+  n_v: 2620
+  n_know: 21000
+  n_basis_qk: 32
+  n_basis_v: 32
+  n_basis_know: 256
+  max_k_qk: 157
+  max_k_v: 262
+  max_k_know: 1536
   router_dropout: 0.1
 
 training:
@@ -45,11 +47,13 @@ use_amp: true
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.6_40M_c4_5B
 log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.6_40M_c4_5B
 
-# Parameter budget (~39M):
-#   QK:   emb[128,64]=8K + f[128,384,64]=3.15M + r[128,64,384]=3.15M = 6.3M
-#   V:    same as QK = 6.3M
-#   Know: emb[256,64]=16K + f[256,384,64]=6.29M + r[256,64,384]=6.29M = 12.6M
-#   Router proj+tau: ~0.1M
-#   Blocks (LN x2 + O_proj) x12: 1.79M
-#   Embeddings (tok + pos): 11.92M
-#   Total: ~39.0M
+# Parameter budget (~31M):
+#   Sense emb: (1570+2620+21000) x 64 = 1.61M
+#   F-R basis:
+#     QK:  32 x 384 x 64 x 2 = 1.57M
+#     V:   32 x 384 x 64 x 2 = 1.57M
+#     Know: 256 x 384 x 64 x 2 = 12.58M
+#   Router proj+tau: ~0.2M
+#   Blocks (LN x2 + O) x12: 1.79M
+#   Embeddings: 11.92M
+#   Total: ~31.2M
