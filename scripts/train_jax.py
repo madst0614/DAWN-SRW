@@ -1261,7 +1261,7 @@ def main():
 
                 # --- Full component breakdown (every op separately) ---
                 from models.dawn_spatial_v3 import (
-                    threshold_gate as tg_fn, emit_direct)
+                    threshold_gate as tg_fn, sense_read_write)
 
                 def _t(fn, n=N_RUNS):
                     r = fn(); jax.block_until_ready(r)
@@ -1272,7 +1272,8 @@ def main():
 
                 # === Knowledge breakdown ===
                 ke = pool_p['know_emb']
-                kw = pool_p['know_w']
+                k_read = pool_p['know_read']
+                k_write = pool_p['know_write']
                 kn = ke / (jnp.linalg.norm(ke, axis=-1, keepdims=True) + 1e-8)
                 pk, pb_ = router_p['proj_know']['kernel'], router_p['proj_know']['bias']
                 tkk, tkb = router_p['tau_know']['kernel'], router_p['tau_know']['bias']
@@ -1287,15 +1288,16 @@ def main():
                 items.append(("K h@emb.T",       _t(lambda: h_k @ kn.T)))
                 items.append(("K tau",            _t(lambda: normed @ tkk + tkb)))
                 items.append(("K gate",           _t(lambda: tg_fn(sc_k, tau_k))))
-                know_w = pool_p['know_w']
-                items.append(("K emit(g@w)",      _t(lambda: emit_direct(gk, know_w))))
+                items.append(("K srw",             _t(lambda: sense_read_write(normed, gk, k_read, k_write))))
                 items.append(("K load_bal",       _t(lambda: gk.mean(axis=(0,1)))))
 
                 # === Attention breakdown ===
                 qke = pool_p['qk_emb']
                 ve = pool_p['v_emb']
-                qkw = pool_p['qk_w']
-                vw = pool_p['v_w']
+                qk_rd = pool_p['qk_read']
+                qk_wr = pool_p['qk_write']
+                v_rd = pool_p['v_read']
+                v_wr = pool_p['v_write']
                 qkn = qke / (jnp.linalg.norm(qke, axis=-1, keepdims=True) + 1e-8)
                 vn = ve / (jnp.linalg.norm(ve, axis=-1, keepdims=True) + 1e-8)
                 pak, pab = router_p['proj_attn']['kernel'], router_p['proj_attn']['bias']
@@ -1310,9 +1312,9 @@ def main():
                 gQ = tg_fn(hQ @ qkn.T, tau_a[:,:,0:1])
                 gK = tg_fn(hK @ qkn.T, tau_a[:,:,1:2])
                 gV = tg_fn(hV @ vn.T, tau_a[:,:,2:3])
-                Qp = emit_direct(gQ, qkw)
-                Kp = emit_direct(gK, qkw)
-                Vp = emit_direct(gV, vw)
+                Qp = sense_read_write(normed, gQ, qk_rd, qk_wr)
+                Kp = sense_read_write(normed, gK, qk_rd, qk_wr)
+                Vp = sense_read_write(normed, gV, v_rd, v_wr)
 
                 items.append(("A proj(x)",       _t(lambda: normed @ pak + pab)))
                 items.append(("A h@emb.T(QKV)",  _t(lambda: (hQ@qkn.T, hK@qkn.T, hV@vn.T))))
@@ -1322,9 +1324,9 @@ def main():
                     tg_fn(hK@qkn.T, tau_a[:,:,1:2]),
                     tg_fn(hV@vn.T, tau_a[:,:,2:3])))))
                 items.append(("A emit Q+K+V",    _t(lambda: (
-                    emit_direct(gQ, qkw),
-                    emit_direct(gK, qkw),
-                    emit_direct(gV, vw)))))
+                    sense_read_write(normed, gQ, qk_rd, qk_wr),
+                    sense_read_write(normed, gK, qk_rd, qk_wr),
+                    sense_read_write(normed, gV, v_rd, v_wr)))))
 
                 Qr = Qp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
                 Kr = Kp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
