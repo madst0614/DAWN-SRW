@@ -1288,7 +1288,21 @@ def main():
                 items.append(("K h@emb.T",       _t(lambda: h_k @ kn.T)))
                 items.append(("K tau",            _t(lambda: normed @ tkk + tkb)))
                 items.append(("K gate_fast",      _t(lambda: tg_fn(sc_k, tau_k, max_k_know_p))))
-                items.append(("K emit_sparse",    _t(lambda: emit_sparse(gk, pool_p['know_w'], ik))))
+                # K emit split: scatter vs matmul
+                know_w = pool_p['know_w']
+                N_know = know_w.shape[0]
+                def _k_scatter():
+                    B_, S_, k_ = gk.shape
+                    gf = jnp.zeros((B_, S_, N_know), dtype=gk.dtype)
+                    return gf.at[
+                        jnp.arange(B_)[:, None, None],
+                        jnp.arange(S_)[None, :, None],
+                        ik
+                    ].set(gk)
+                gate_full_k = _k_scatter()
+                items.append(("K scatter",        _t(_k_scatter)))
+                items.append(("K matmul(g@w)",    _t(lambda: gate_full_k @ know_w)))
+                items.append(("K emit_sparse",    _t(lambda: emit_sparse(gk, know_w, ik))))
                 items.append(("K load_bal",       _t(lambda: jax.nn.softmax(sc_k, axis=-1).mean(axis=(0,1)))))
 
                 # === Attention breakdown ===
