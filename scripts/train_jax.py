@@ -1188,6 +1188,27 @@ def main():
             except Exception:
                 pass
 
+            # === Profiler trace (1 step) for TensorBoard ===
+            profile_dir = cfg.get('log_dir', '/tmp/dawn_profile')
+            if isinstance(profile_dir, str) and profile_dir.startswith('gs://'):
+                profile_dir = '/tmp/dawn_profile'
+            try:
+                print(f"\n  === Profiling 1 step -> {profile_dir}/profile ===", flush=True)
+                rng, prof_rng = jax.random.split(rng)
+                prof_keys = jax.random.split(prof_rng, n_local_devices)
+                _p, _o, _m = train_step_fn(
+                    params, opt_state, dummy_ids, dummy_mask, prof_keys)
+                jax.block_until_ready(_m['total_loss'])
+                with jax.profiler.trace(f"{profile_dir}/profile"):
+                    rng, prof_rng2 = jax.random.split(rng)
+                    prof_keys2 = jax.random.split(prof_rng2, n_local_devices)
+                    _p2, _o2, _m2 = train_step_fn(
+                        params, opt_state, dummy_ids, dummy_mask, prof_keys2)
+                    jax.block_until_ready(_m2['total_loss'])
+                print(f"  Profile saved. View: tensorboard --logdir={profile_dir}", flush=True)
+            except Exception as e:
+                print(f"  Profiling skipped: {e}", flush=True)
+
             # Estimate total training time
             total_steps = len(train_loader) * num_epochs
             remaining_steps = total_steps - global_step
