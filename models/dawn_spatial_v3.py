@@ -79,22 +79,27 @@ def threshold_gate_fast(scores, tau, max_k):
 
 
 # ================================================================
-# 3. Sparse emit — split into two checkpoints to halve peak memory
+# 3. Sparse emit — scatter to dense gate, then matmul (no gather)
 # ================================================================
 
 @jax.checkpoint
-def _gather_and_weight(gate, w, topk_idx):
-    """Gather w[topk] and apply gate weights -> [B,S,D].
-    Checkpointed: [B,S,k,D] gather freed after forward, recomputed in backward.
-    Only one 9.4GB tensor at a time (not two simultaneous).
-    """
-    sel_w = w[topk_idx]                              # [B, S, k, D]
-    return jnp.einsum('bsk,bskd->bsd', gate, sel_w)  # [B, S, D]
-
-
 def emit_sparse(gate, w, topk_idx):
-    """Sparse emit via checkpointed gather+weight."""
-    return _gather_and_weight(gate, w, topk_idx)
+    """Scatter gate[B,S,k] to gate_full[B,S,N], then gate_full @ w.
+
+    No [B,S,k,D] gather. Peak: gate_full[B,S,N] = 1.3GB (not 9.4GB).
+    gate:     [B, S, k]
+    w:        [N, D]
+    topk_idx: [B, S, k]
+    """
+    B, S, k = gate.shape
+    N = w.shape[0]
+    gate_full = jnp.zeros((B, S, N), dtype=gate.dtype)
+    gate_full = gate_full.at[
+        jnp.arange(B)[:, None, None],
+        jnp.arange(S)[None, :, None],
+        topk_idx
+    ].set(gate)
+    return gate_full @ w  # [B, S, D]
 
 
 # ================================================================
