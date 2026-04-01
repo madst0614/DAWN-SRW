@@ -1261,7 +1261,7 @@ def main():
 
                 # --- Full component breakdown (every op separately) ---
                 from models.dawn_spatial_v3 import (
-                    threshold_gate as tg_fn, emit_dense)
+                    threshold_gate_fast as tg_fn, emit_sparse)
 
                 def _t(fn, n=N_RUNS):
                     r = fn(); jax.block_until_ready(r)
@@ -1281,23 +1281,22 @@ def main():
                 h_k = normed @ pk + pb_
                 sc_k = h_k @ kn.T
                 tau_k = normed @ tkk + tkb
-                gk = tg_fn(sc_k, tau_k)
+                max_k_know_p = cfg['model'].get('max_k_know', 1536)
+                gk, ik = tg_fn(sc_k, tau_k, max_k_know_p)
 
                 items = []
                 items.append(("K proj(x)",       _t(lambda: normed @ pk + pb_)))
                 items.append(("K h@emb.T",       _t(lambda: h_k @ kn.T)))
                 items.append(("K tau",            _t(lambda: normed @ tkk + tkb)))
-                items.append(("K gate",           _t(lambda: tg_fn(sc_k, tau_k))))
-                items.append(("K emit_dense",     _t(lambda: emit_dense(gk, kwe, kwd))))
-                items.append(("K load_bal",       _t(lambda: gk.mean(axis=(0,1)))))
+                items.append(("K gate_fast",      _t(lambda: tg_fn(sc_k, tau_k, max_k_know_p))))
+                items.append(("K emit_sparse",    _t(lambda: emit_sparse(gk, pool_p['know_w'], ik))))
+                items.append(("K load_bal",       _t(lambda: jax.nn.softmax(sc_k, axis=-1).mean(axis=(0,1)))))
 
                 # === Attention breakdown ===
                 qke = pool_p['qk_emb']
                 ve = pool_p['v_emb']
-                qkwe = pool_p['qk_w_enc']
-                qkwd = pool_p['qk_w_dec']
-                vwe = pool_p['v_w_enc']
-                vwd = pool_p['v_w_dec']
+                qkw = pool_p['qk_w']
+                vw = pool_p['v_w']
                 qkn = qke / (jnp.linalg.norm(qke, axis=-1, keepdims=True) + 1e-8)
                 vn = ve / (jnp.linalg.norm(ve, axis=-1, keepdims=True) + 1e-8)
                 pak, pab = router_p['proj_attn']['kernel'], router_p['proj_attn']['bias']
@@ -1309,24 +1308,24 @@ def main():
                 ha = normed @ pak + pab
                 hQ, hK, hV = jnp.split(ha, 3, axis=-1)
                 tau_a = normed @ tak + tab
-                gQ = tg_fn(hQ @ qkn.T, tau_a[:,:,0:1])
-                gK = tg_fn(hK @ qkn.T, tau_a[:,:,1:2])
-                gV = tg_fn(hV @ vn.T, tau_a[:,:,2:3])
-                Qp = emit_dense(gQ, qkwe, qkwd)
-                Kp = emit_dense(gK, qkwe, qkwd)
-                Vp = emit_dense(gV, vwe, vwd)
+                gQ, iQ = tg_fn(hQ @ qkn.T, tau_a[:,:,0:1], max_k_qk)
+                gK, iK = tg_fn(hK @ qkn.T, tau_a[:,:,1:2], max_k_qk)
+                gV, iV = tg_fn(hV @ vn.T, tau_a[:,:,2:3], max_k_v)
+                Qp = emit_sparse(gQ, qkw, iQ)
+                Kp = emit_sparse(gK, qkw, iK)
+                Vp = emit_sparse(gV, vw, iV)
 
                 items.append(("A proj(x)",       _t(lambda: normed @ pak + pab)))
                 items.append(("A h@emb.T(QKV)",  _t(lambda: (hQ@qkn.T, hK@qkn.T, hV@vn.T))))
                 items.append(("A tau",            _t(lambda: normed @ tak + tab)))
                 items.append(("A gate Q+K+V",    _t(lambda: (
-                    tg_fn(hQ@qkn.T, tau_a[:,:,0:1]),
-                    tg_fn(hK@qkn.T, tau_a[:,:,1:2]),
-                    tg_fn(hV@vn.T, tau_a[:,:,2:3])))))
+                    tg_fn(hQ@qkn.T, tau_a[:,:,0:1], max_k_qk),
+                    tg_fn(hK@qkn.T, tau_a[:,:,1:2], max_k_qk),
+                    tg_fn(hV@vn.T, tau_a[:,:,2:3], max_k_v)))))
                 items.append(("A emit Q+K+V",    _t(lambda: (
-                    emit_dense(gQ, qkwe, qkwd),
-                    emit_dense(gK, qkwe, qkwd),
-                    emit_dense(gV, vwe, vwd)))))
+                    emit_sparse(gQ, qkw, iQ),
+                    emit_sparse(gK, qkw, iK),
+                    emit_sparse(gV, vw, iV)))))
 
                 Qr = Qp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
                 Kr = Kp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
@@ -1342,7 +1341,7 @@ def main():
                     jnp.where(csl, attn_sc, jnp.finfo(attn_sc.dtype).min), axis=-1))))
                 items.append(("A wV+O_proj",     _t(lambda: jnp.einsum(
                     'bhst,bhtd->bhsd', attn_w, Vr).transpose(0,2,1,3).reshape(Bp,Sp,d_model) @ Ok)))
-                items.append(("A load_bal",       _t(lambda: gQ.mean(axis=(0,1)))))
+                items.append(("A load_bal",       _t(lambda: jax.nn.softmax(hQ@qkn.T, axis=-1).mean(axis=(0,1)))))
 
                 # === Print all ===
                 total_items = sum(v for _, v in items)
