@@ -84,7 +84,10 @@ def threshold_gate(scores, tau_offset):
     tau = s_mean + tau_offset * s_std
 
     raw = scores - tau
-    gate = jnp.where(raw > 0, raw, 1e-8 * jnp.exp(raw))
+    gate = jnp.where(raw > 0, raw, 1e-8 * jnp.exp(jnp.clip(raw, -10.0, 0.0)))
+
+    # Clamp gate to prevent exp explosion
+    gate = jnp.clip(gate, 0.0, 10.0)
 
     exp_gate = jnp.exp(gate) - 1.0
     exp_sum = exp_gate.sum(axis=-1, keepdims=True) + 1e-8
