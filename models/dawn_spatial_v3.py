@@ -4,7 +4,7 @@ DAWN-Spatial v3.3: Low-dim Routing + Sparse Gather Sense-Emit (JAX/Flax)
 Changelog:
   spatial-r1-v3.3.0 (2026-04-01):
     - Low-dim routing (d_space=64): score 21,000 neurons cheaply
-    - Sparse gather sense_emit: only top_k neurons gathered + matmul
+    - Full matmul sense_emit with d_space routing (no gather/top_k)
     - Combines v3.2 emb/w split with v1-style d_space routing
     - Peak gather: [32,512,1536,384] = 9.4GB (fits 32GB HBM)
 
@@ -14,9 +14,9 @@ Changelog:
 Architecture:
   NeuronPool        -- emb[N,D] + w[N,D] per pool
   Router            -- neuron_emb[N,d_space] + proj + tau
-  sense_emit_sparse -- @jax.checkpoint: gather top_k -> einsum
-  _attn_forward     -- d_space route -> top_k -> sparse QKV -> self-attn
-  _know_forward     -- d_space route -> top_k -> sparse know
+  sense_emit_full   -- @jax.checkpoint: full matmul sense/emit
+  _attn_forward     -- d_space route -> gate -> full sense_emit QKV -> self-attn
+  _know_forward     -- d_space route -> gate -> full sense_emit know
   DAWN              -- embedding + jax.lax.scan + weight-tied lm_head
 """
 
@@ -84,27 +84,18 @@ def threshold_gate(scores, tau, max_k=None):
 # ================================================================
 
 @jax.checkpoint
-def _sense_only(x, emb, idx):
-    """Gather emb + sense. Checkpointed: [B,S,k,D] freed after forward."""
-    sel_emb = emb[idx]                               # [B, S, k, D]
-    return jnp.einsum('bsd,bskd->bsk', x, sel_emb)  # [B, S, k]
+def sense_emit_full(x, emb, w, gate):
+    """Full matmul sense/emit. Checkpointed: [B,S,N] recomputed in backward.
 
-
-@jax.checkpoint
-def _emit_only(gated, w, idx):
-    """Gather w + emit. Checkpointed: [B,S,k,D] freed after forward."""
-    sel_w = w[idx]                                    # [B, S, k, D]
-    return jnp.einsum('bsk,bskd->bsd', gated, sel_w) # [B, S, D]
-
-
-def sense_emit_sparse(x, emb, w, gate, top_k_idx):
-    """Split sense/emit into two checkpoints so only one [B,S,k,D] at a time.
-
-    Peak memory: single gather [B,S,k,D] instead of two simultaneous.
+    x:    [B, S, D]
+    emb:  [N, D]  -- sense vectors
+    w:    [N, D]  -- emit vectors
+    gate: [B, S, N] -- sparse gate (mostly 0)
+    Returns: [B, S, D]
     """
-    activations = _sense_only(x, emb, top_k_idx)  # [B, S, k]
-    gated = activations * gate                      # [B, S, k]
-    return _emit_only(gated, w, top_k_idx)         # [B, S, D]
+    activations = x @ emb.T     # [B, S, N]  sense
+    gated = activations * gate  # [B, S, N]  fire (sparse)
+    return gated @ w            # [B, S, D]  emit
 
 
 # ================================================================
@@ -151,7 +142,7 @@ class Router(nn.Module):
         self.tau_know = nn.Dense(1, name='tau_know')
 
     def get_attention_gates(self, x, neuron_pool, deterministic, rng):
-        """Low-dim routing -> gate -> top_k for Q, K, V."""
+        """Low-dim routing -> gate for Q, K, V (no top_k, full gate)."""
         emb = self.neuron_emb
         emb_norm = emb / (jnp.linalg.norm(emb, axis=-1, keepdims=True) + 1e-8)
         qk_emb_low = emb_norm[:self.n_qk]
@@ -171,10 +162,6 @@ class Router(nn.Module):
         g_K = threshold_gate(scores_K, tau_all[:, :, 1:2], self.max_k_qk)
         g_V = threshold_gate(scores_V, tau_all[:, :, 2:3], self.max_k_v)
 
-        tk_g_Q, tk_i_Q = jax.lax.top_k(g_Q, self.max_k_qk)
-        tk_g_K, tk_i_K = jax.lax.top_k(g_K, self.max_k_qk)
-        tk_g_V, tk_i_V = jax.lax.top_k(g_V, self.max_k_v)
-
         # Load balance
         t_qk = 1.0 / self.n_qk
         t_v = 1.0 / self.n_v
@@ -183,7 +170,7 @@ class Router(nn.Module):
             ((g_K.mean(axis=(0, 1)) - t_qk) ** 2).sum() * self.n_qk +
             ((g_V.mean(axis=(0, 1)) - t_v) ** 2).sum() * self.n_v
         )
-        return tk_g_Q, tk_i_Q, tk_g_K, tk_i_K, tk_g_V, tk_i_V, aux
+        return g_Q, g_K, g_V, aux
 
     def get_knowledge_gates(self, x, neuron_pool, deterministic, rng):
         emb = self.neuron_emb
@@ -197,11 +184,10 @@ class Router(nn.Module):
 
         tau = self.tau_know(x)
         gate = threshold_gate(scores, tau, self.max_k_know)
-        tk_gate, tk_idx = jax.lax.top_k(gate, self.max_k_know)
 
         t = 1.0 / self.n_know
         aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * self.n_know
-        return tk_gate, tk_idx, aux
+        return gate, aux
 
 
 # ================================================================
@@ -237,13 +223,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     g_K = threshold_gate(scores_K, tau_all[:, :, 1:2], max_k_qk)
     g_V = threshold_gate(scores_V, tau_all[:, :, 2:3], max_k_v)
 
-    tk_g_Q, tk_i_Q = jax.lax.top_k(g_Q, max_k_qk)
-    tk_g_K, tk_i_K = jax.lax.top_k(g_K, max_k_qk)
-    tk_g_V, tk_i_V = jax.lax.top_k(g_V, max_k_v)
-
-    Q = sense_emit_sparse(x, qk_emb, qk_w, tk_g_Q, tk_i_Q)
-    K = sense_emit_sparse(x, qk_emb, qk_w, tk_g_K, tk_i_K)
-    V = sense_emit_sparse(x, v_emb, v_w, tk_g_V, tk_i_V)
+    Q = sense_emit_full(x, qk_emb, qk_w, g_Q)
+    K = sense_emit_full(x, qk_emb, qk_w, g_K)
+    V = sense_emit_full(x, v_emb, v_w, g_V)
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -292,9 +274,7 @@ def _know_forward(x, pool_params, router_params, rng,
 
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     gate = threshold_gate(scores, tau, max_k_know)
-    tk_gate, tk_idx = jax.lax.top_k(gate, max_k_know)
-
-    out = sense_emit_sparse(x, know_emb, know_w, tk_gate, tk_idx)
+    out = sense_emit_full(x, know_emb, know_w, gate)
 
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
@@ -321,15 +301,12 @@ class AttentionCircuit(nn.Module):
         rng = self.make_rng('dropout')
         rng, rng_r, rng_d, rng_o = jax.random.split(rng, 4)
 
-        tk_g_Q, tk_i_Q, tk_g_K, tk_i_K, tk_g_V, tk_i_V, aux = \
-            router.get_attention_gates(x, neuron_pool, deterministic, rng_r)
+        g_Q, g_K, g_V, aux = router.get_attention_gates(
+            x, neuron_pool, deterministic, rng_r)
 
-        Q = sense_emit_sparse(x, neuron_pool.qk_emb, neuron_pool.qk_w,
-                              tk_g_Q, tk_i_Q)
-        K = sense_emit_sparse(x, neuron_pool.qk_emb, neuron_pool.qk_w,
-                              tk_g_K, tk_i_K)
-        V = sense_emit_sparse(x, neuron_pool.v_emb, neuron_pool.v_w,
-                              tk_g_V, tk_i_V)
+        Q = sense_emit_full(x, neuron_pool.qk_emb, neuron_pool.qk_w, g_Q)
+        K = sense_emit_full(x, neuron_pool.qk_emb, neuron_pool.qk_w, g_K)
+        V = sense_emit_full(x, neuron_pool.v_emb, neuron_pool.v_w, g_V)
 
         B, S, D = x.shape
         d_head = D // self.n_heads
@@ -358,10 +335,9 @@ class KnowledgeCircuit(nn.Module):
     def __call__(self, x, neuron_pool, router, attention_mask, deterministic):
         rng = self.make_rng('dropout')
         rng, rng_r = jax.random.split(rng)
-        tk_gate, tk_idx, aux = router.get_knowledge_gates(
+        gate, aux = router.get_knowledge_gates(
             x, neuron_pool, deterministic, rng_r)
-        out = sense_emit_sparse(x, neuron_pool.know_emb, neuron_pool.know_w,
-                                tk_gate, tk_idx)
+        out = sense_emit_full(x, neuron_pool.know_emb, neuron_pool.know_w, gate)
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
 
