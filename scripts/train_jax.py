@@ -479,6 +479,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
+        # Grad norm
+        grad_norm = jnp.sqrt(
+            sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
+
         # Aggregate metrics across devices
         metrics = {
             'total_loss': jax.lax.pmean(total_loss, axis_name='dp'),
@@ -488,6 +492,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'div_loss': jax.lax.pmean(div_loss, axis_name='dp'),
             'correct': jax.lax.psum(result['correct'], axis_name='dp'),
             'valid_count': jax.lax.psum(result['valid_count'], axis_name='dp'),
+            'grad_norm': jax.lax.pmean(grad_norm, axis_name='dp'),
         }
 
         return new_params, new_opt_state, metrics
@@ -1553,17 +1558,8 @@ def main():
                     remaining_steps = steps_per_epoch - epoch_steps
                     eta = s_per_it * remaining_steps
 
-                    # Tau bias logging (v3.8.1+)
-                    tau_str = ""
-                    try:
-                        p_0 = jax.tree.map(lambda x: x[0], params)
-                        tk_b = p_0['router']['tau_know']['bias']
-                        ta_b = p_0['router']['tau_attn']['bias']
-                        tau_str = (
-                            f" | tau_k={float(tk_b[0]):.2f}"
-                            f" tau_a={float(ta_b[0]):.2f}/{float(ta_b[1]):.2f}/{float(ta_b[2]):.2f}")
-                    except Exception:
-                        pass
+                    # Grad norm
+                    m_grad = float(metrics['grad_norm'][0])
 
                     msg = (
                         f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
@@ -1571,9 +1567,36 @@ def main():
                         f"orth={avg_orth:.2e} div={avg_div:.2e} | "
                         f"acc={avg_acc:.4f} lr={current_lr:.2e} "
                         f"{format_time(epoch_elapsed)}<{format_time(eta)}, {s_per_it:.2f}s/it"
-                        f"{tau_str}"
                     )
                     log_message(msg)
+
+                    # Detailed stats line (tau + grad_norm + param_norm)
+                    try:
+                        p_0 = jax.tree.map(lambda x: x[0], params)
+                        pool = p_0.get('neuron_pool', {})
+                        rtr = p_0.get('router', {})
+
+                        # Tau bias
+                        tk_b = rtr.get('tau_know', {}).get('bias', None)
+                        ta_b = rtr.get('tau_attn', {}).get('bias', None)
+                        tau_s = ""
+                        if tk_b is not None and ta_b is not None:
+                            tau_s = (f"tau: know={float(tk_b[0]):.2f} "
+                                     f"attn=[{float(ta_b[0]):.2f},{float(ta_b[1]):.2f},{float(ta_b[2]):.2f}]")
+
+                        # Param norms
+                        pn_parts = []
+                        for name in ['know_emb', 'know_read', 'know_write',
+                                     'know_w', 'know_w_enc']:
+                            if name in pool:
+                                v = jnp.linalg.norm(pool[name], axis=-1).mean()
+                                pn_parts.append(f"{name}={float(v):.3f}")
+                        pn_s = " ".join(pn_parts)
+
+                        log_message(
+                            f"      {tau_s} | grad_norm={m_grad:.3f} | {pn_s}")
+                    except Exception:
+                        log_message(f"      grad_norm={m_grad:.3f}")
 
                     # JSONL structured log
                     log_jsonl({
