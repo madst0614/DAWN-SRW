@@ -1258,6 +1258,61 @@ def main():
                 print(f"  Layer total: {total_ms:.1f} ms", flush=True)
                 print(f"  Est. {n_layers}-layer: {total_ms*n_layers:.0f} ms "
                       f"(actual step includes grad+opt)", flush=True)
+
+                # --- Knowledge sub-breakdown ---
+                from models.dawn_spatial_v3 import (
+                    threshold_gate as tg_fn, emit_bottleneck, safe_dropout)
+                know_emb = pool_p['know_emb']
+                know_w_enc = pool_p['know_w_enc']
+                know_w_dec = pool_p['know_w_dec']
+                know_norm = know_emb / (
+                    jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
+                proj_k = router_p['proj_know']['kernel']
+                proj_b = router_p['proj_know']['bias']
+                tau_k = router_p['tau_know']['kernel']
+                tau_b = router_p['tau_know']['bias']
+
+                # Warm up sub-ops
+                h_prof = normed @ proj_k + proj_b
+                scores_prof = h_prof @ know_norm.T
+                tau_prof = normed @ tau_k + tau_b
+                gate_prof = tg_fn(scores_prof, tau_prof, max_k_know)
+                emit_prof = emit_bottleneck(gate_prof, know_w_enc, know_w_dec)
+                jax.block_until_ready(emit_prof)
+
+                # Measure routing score
+                t0 = time.time()
+                for _ in range(N_RUNS):
+                    h_prof = normed @ proj_k + proj_b
+                    scores_prof = h_prof @ know_norm.T
+                    tau_prof = normed @ tau_k + tau_b
+                    jax.block_until_ready(scores_prof)
+                    jax.block_until_ready(tau_prof)
+                route_ms = (time.time() - t0) / N_RUNS * 1000
+
+                # Measure threshold_gate
+                t0 = time.time()
+                for _ in range(N_RUNS):
+                    gate_prof = tg_fn(scores_prof, tau_prof, max_k_know)
+                    jax.block_until_ready(gate_prof)
+                gate_ms = (time.time() - t0) / N_RUNS * 1000
+
+                # Measure emit_bottleneck
+                t0 = time.time()
+                for _ in range(N_RUNS):
+                    emit_prof = emit_bottleneck(gate_prof, know_w_enc, know_w_dec)
+                    jax.block_until_ready(emit_prof)
+                emit_ms = (time.time() - t0) / N_RUNS * 1000
+
+                print(f"\n  --- Knowledge sub-breakdown ---", flush=True)
+                print(f"  Route score:    {route_ms:.1f} ms "
+                      f"({route_ms/know_ms*100:.0f}%)", flush=True)
+                print(f"  threshold_gate: {gate_ms:.1f} ms "
+                      f"({gate_ms/know_ms*100:.0f}%)", flush=True)
+                print(f"  emit_bottleneck:{emit_ms:.1f} ms "
+                      f"({emit_ms/know_ms*100:.0f}%)", flush=True)
+                print(f"  Sum: {route_ms+gate_ms+emit_ms:.1f} ms "
+                      f"(know total: {know_ms:.1f} ms)", flush=True)
             except Exception as e:
                 print(f"  Breakdown skipped: {e}", flush=True)
 
