@@ -1,24 +1,24 @@
 """
-DAWN-Spatial v3.7: Sense + Direct Emit (JAX/Flax)
+DAWN-Spatial v3.8: Sense-Read-Write (JAX/Flax)
 
 Changelog:
-  spatial-r1-v3.7.0 (2026-04-01):
-    - Bottleneck removed. Each neuron has w[384] direct emit direction.
-    - out = sum(gate_i * w_i[384]). Sense + emit, nothing else.
-    - threshold_gate (element-wise, no top_k) + emit_direct (gate @ w)
-    - top_k/scatter removed: gate already [B,S,N], matmul 1.6ms
+  spatial-r1-v3.8.0 (2026-04-01):
+    - Sense-Read-Write: each neuron has emb[64] + w_read[384] + w_write[384]
+    - out = sum(gate_i * (x . read_i) * write_i)
+    - x participates directly in output computation (rank-1 F-R)
+    - All ops: matmul + element-wise. TPU optimal.
 
-  spatial-r1-v3.5.0 (2026-04-01):
-    - Threshold-only gating + bottleneck emit. 4s/step.
+  spatial-r1-v3.7.0 (2026-04-01):
+    - Sense + direct emit (gate @ w). 4s/step.
 
 Architecture:
-  NeuronPool          -- emb[N,d_bn] (sense) + w[N,D] (emit direction)
-  Router              -- proj + tau. Uses pool emb for routing.
-  threshold_gate -- element-wise threshold, no top_k (v3.5.0)
-  emit_direct    -- @jax.checkpoint: gate @ w (pure matmul)
-  _attn_forward  -- threshold gate -> direct emit Q/K/V -> self-attn
-  _know_forward  -- threshold gate -> direct emit
-  DAWN                -- embedding + jax.lax.scan + weight-tied lm_head
+  NeuronPool        -- emb[N,d_bn] + w_read[N,D] + w_write[N,D]
+  Router            -- proj + tau. Uses pool emb for routing.
+  threshold_gate    -- element-wise threshold, no top_k
+  sense_read_write  -- @jax.checkpoint: (gate * (x@read.T)) @ write
+  _attn_forward     -- threshold gate -> sense_read_write QKV -> self-attn
+  _know_forward     -- threshold gate -> sense_read_write
+  DAWN              -- embedding + jax.lax.scan + weight-tied lm_head
 """
 
 import jax
@@ -61,11 +61,10 @@ def unit_norm_init(scale=1.0):
 
 
 # ================================================================
-# 2. Threshold gate (element-wise, no top_k — v3.5.0 style)
+# 2. Threshold gate (element-wise, no top_k)
 # ================================================================
 
 def threshold_gate(scores, tau):
-    """Element-wise threshold gating. No sort, no top_k."""
     raw = scores - tau
     gate = jnp.where(raw > 0, raw, 0.0)
     gate_sum = gate.sum(axis=-1, keepdims=True) + 1e-8
@@ -73,17 +72,26 @@ def threshold_gate(scores, tau):
 
 
 # ================================================================
-# 3. Direct emit: gate[B,S,N] @ w[N,D] (no scatter, no gather)
+# 3. Sense-Read-Write
 # ================================================================
 
 @jax.checkpoint
-def emit_direct(gate, w):
-    """gate[B,S,N] @ w[N,D] -> [B,S,D]. Pure matmul. 1.6ms."""
-    return gate @ w
+def sense_read_write(x, gate, w_read, w_write):
+    """x[B,S,D], gate[B,S,N], w_read[N,D], w_write[N,D] -> out[B,S,D].
+
+    1. Read from x:  x @ w_read.T -> [B,S,N] (scalar per neuron)
+    2. Gate * read:   element-wise  -> [B,S,N] (gated read values)
+    3. Write:         gated @ w_write -> [B,S,D] (push in write direction)
+
+    Checkpointed: intermediate [B,S,N] recomputed in backward.
+    """
+    x_read = x @ w_read.T           # [B, S, N]
+    gated_read = gate * x_read       # [B, S, N]
+    return gated_read @ w_write      # [B, S, D]
 
 
 # ================================================================
-# 4. NeuronPool -- emb[d_bn] (sense) + w[D] (emit direction)
+# 4. NeuronPool -- emb + w_read + w_write
 # ================================================================
 
 class NeuronPool(nn.Module):
@@ -91,21 +99,26 @@ class NeuronPool(nn.Module):
     n_v: int
     n_know: int
     d_model: int
-    d_bottleneck: int  # routing emb dimension
+    d_bottleneck: int
 
     def setup(self):
         db = self.d_bottleneck
         dm = self.d_model
 
-        # Sense (low-dim routing)
+        # Sense (routing, low-dim)
         self.qk_emb = self.param('qk_emb', unit_norm_init(), (self.n_qk, db))
         self.v_emb = self.param('v_emb', unit_norm_init(), (self.n_v, db))
         self.know_emb = self.param('know_emb', unit_norm_init(), (self.n_know, db))
 
-        # Emit (full-dim direction)
-        self.qk_w = self.param('qk_w', scaled_normal(0.02), (self.n_qk, dm))
-        self.v_w = self.param('v_w', scaled_normal(0.02), (self.n_v, dm))
-        self.know_w = self.param('know_w', scaled_normal(0.02), (self.n_know, dm))
+        # Read (what to extract from x)
+        self.qk_read = self.param('qk_read', scaled_normal(0.02), (self.n_qk, dm))
+        self.v_read = self.param('v_read', scaled_normal(0.02), (self.n_v, dm))
+        self.know_read = self.param('know_read', scaled_normal(0.02), (self.n_know, dm))
+
+        # Write (direction to push)
+        self.qk_write = self.param('qk_write', scaled_normal(0.02), (self.n_qk, dm))
+        self.v_write = self.param('v_write', scaled_normal(0.02), (self.n_v, dm))
+        self.know_write = self.param('know_write', scaled_normal(0.02), (self.n_know, dm))
 
 
 # ================================================================
@@ -162,10 +175,9 @@ class Router(nn.Module):
         rng, rng_drop = jax.random.split(rng)
         h = self.proj_know(x)
         h = safe_dropout(h, self.router_dropout, deterministic, rng_drop)
-        scores = h @ know_norm.T
 
         tau = self.tau_know(x)
-        gate = threshold_gate(scores, tau)
+        gate = threshold_gate(h @ know_norm.T, tau)
 
         t = 1.0 / self.n_know
         aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * self.n_know
@@ -182,9 +194,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   router_dropout, dropout_rate, deterministic):
     B, S, D = x.shape
     qk_emb = pool_params['qk_emb']
-    qk_w = pool_params['qk_w']
+    qk_read = pool_params['qk_read']
+    qk_write = pool_params['qk_write']
     v_emb = pool_params['v_emb']
-    v_w = pool_params['v_w']
+    v_read = pool_params['v_read']
+    v_write = pool_params['v_write']
 
     qk_norm = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-8)
     v_norm = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-8)
@@ -200,9 +214,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     g_K = threshold_gate(h_K @ qk_norm.T, tau_all[:, :, 1:2])
     g_V = threshold_gate(h_V @ v_norm.T, tau_all[:, :, 2:3])
 
-    Q = emit_direct(g_Q, qk_w)
-    K = emit_direct(g_K, qk_w)
-    V = emit_direct(g_V, v_w)
+    Q = sense_read_write(x, g_Q, qk_read, qk_write)
+    K = sense_read_write(x, g_K, qk_read, qk_write)
+    V = sense_read_write(x, g_V, v_read, v_write)
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -238,19 +252,19 @@ def _know_forward(x, pool_params, router_params, rng,
                   max_k_know,
                   router_dropout, dropout_rate, deterministic):
     know_emb = pool_params['know_emb']
-    know_w = pool_params['know_w']
+    know_read = pool_params['know_read']
+    know_write = pool_params['know_write']
 
     know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
 
     rng, rng_drop = jax.random.split(rng)
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
-    scores = h @ know_norm.T
 
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-    gate = threshold_gate(scores, tau)
+    gate = threshold_gate(h @ know_norm.T, tau)
 
-    out = emit_direct(gate, know_w)
+    out = sense_read_write(x, gate, know_read, know_write)
 
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
@@ -280,9 +294,9 @@ class AttentionCircuit(nn.Module):
         g_Q, g_K, g_V, aux = router.get_attention_gates(
             x, neuron_pool, deterministic, rng_r)
 
-        Q = emit_direct(g_Q, neuron_pool.qk_w)
-        K = emit_direct(g_K, neuron_pool.qk_w)
-        V = emit_direct(g_V, neuron_pool.v_w)
+        Q = sense_read_write(x, g_Q, neuron_pool.qk_read, neuron_pool.qk_write)
+        K = sense_read_write(x, g_K, neuron_pool.qk_read, neuron_pool.qk_write)
+        V = sense_read_write(x, g_V, neuron_pool.v_read, neuron_pool.v_write)
 
         B, S, D = x.shape
         d_head = D // self.n_heads
@@ -313,7 +327,7 @@ class KnowledgeCircuit(nn.Module):
         rng, rng_r = jax.random.split(rng)
         gate, aux = router.get_knowledge_gates(
             x, neuron_pool, deterministic, rng_r)
-        out = emit_direct(gate, neuron_pool.know_w)
+        out = sense_read_write(x, gate, neuron_pool.know_read, neuron_pool.know_write)
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
 
@@ -349,8 +363,8 @@ class DAWNBlock(nn.Module):
 # ================================================================
 
 class DAWN(nn.Module):
-    """DAWN-Spatial v3.7: Sense + Direct Emit. No bottleneck."""
-    __version__ = "spatial-r1-v3.7.0"
+    """DAWN-Spatial v3.8: Sense-Read-Write."""
+    __version__ = "spatial-r1-v3.8.0"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -361,12 +375,12 @@ class DAWN(nn.Module):
     gradient_checkpointing: bool = False
 
     d_bottleneck: int = 64
-    n_qk: int = 2500
-    n_v: int = 4000
-    n_know: int = 52500
-    max_k_qk: int = 250
-    max_k_v: int = 400
-    max_k_know: int = 3780
+    n_qk: int = 1700
+    n_v: int = 2800
+    n_know: int = 27200
+    max_k_qk: int = 170
+    max_k_v: int = 280
+    max_k_know: int = 1960
     router_dropout: float = 0.1
 
     def setup(self):
@@ -497,9 +511,9 @@ class DAWN(nn.Module):
             mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
             return jnp.abs(sim * mask).sum() / mask.sum()
         pool = self.neuron_pool
-        return (_div(pool.qk_emb) + _div(pool.qk_w) +
-                _div(pool.v_emb) + _div(pool.v_w) +
-                _div(pool.know_emb) + _div(pool.know_w)) / 6
+        return (_div(pool.qk_emb) + _div(pool.qk_read) + _div(pool.qk_write) +
+                _div(pool.v_emb) + _div(pool.v_read) + _div(pool.v_write) +
+                _div(pool.know_emb) + _div(pool.know_read) + _div(pool.know_write)) / 9
 
     def get_auxiliary_losses(self):
         return {'neuron_diversity': self.diversity_loss()}
@@ -518,10 +532,10 @@ class DAWN(nn.Module):
 
     def get_model_info(self):
         return [
-            f"DAWN v{self.__version__}: Sense + Direct Emit",
+            f"DAWN v{self.__version__}: Sense-Read-Write",
             f"  d_model={self.d_model}, d_bottleneck={self.d_bottleneck}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  QK: {self.n_qk}, V: {self.n_v}, Know: {self.n_know}",
-            f"  max_k: qk={self.max_k_qk}, v={self.max_k_v}, "
-            f"know={self.max_k_know}",
+            f"  Per neuron: emb[{self.d_bottleneck}] + read[{self.d_model}] "
+            f"+ write[{self.d_model}]",
         ]

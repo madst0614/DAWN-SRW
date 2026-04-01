@@ -1,5 +1,5 @@
-# DAWN Spatial-R1 v3.7 -- Sense + Direct Emit, 40M Scale, 5B tokens
-# emb[N,64] sense + w[N,384] emit. threshold_gate + emit_direct(gate@w).
+# DAWN Spatial-R1 v3.8 -- Sense-Read-Write, 40M Scale, 5B tokens
+# emb[64] sense + w_read[384] + w_write[384]. x participates in output.
 
 seed: 1
 
@@ -11,7 +11,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.7.0"
+  model_version: "spatial-r1-v3.8.0"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -20,12 +20,12 @@ model:
   gradient_checkpointing: true
 
   d_bottleneck: 64
-  n_qk: 2500
-  n_v: 4000
-  n_know: 52500
-  max_k_qk: 250
-  max_k_v: 400
-  max_k_know: 3780
+  n_qk: 1700
+  n_v: 2800
+  n_know: 27200
+  max_k_qk: 170
+  max_k_v: 280
+  max_k_know: 1960
   router_dropout: 0.1
 
 training:
@@ -41,14 +41,14 @@ training:
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.7_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.7_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.8_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.8_40M_c4_5B
 
-# Parameter budget (~40.0M):
-#   QK:   2500 x (64+384)  = 1.12M
-#   V:    4000 x (64+384)  = 1.79M
-#   Know: 52500 x (64+384) = 23.52M
-#   Router proj+tau:          ~0.1M
+# Parameter budget (~40M):
+#   QK:   1700 x (64+384+384) = 1.41M
+#   V:    2800 x (64+384+384) = 2.33M
+#   Know: 27200 x (64+384+384) = 22.63M
+#   Router proj+tau: ~0.1M
 #   Blocks (LN x2 + O) x12: 1.79M
-#   Embeddings (tok+pos):   11.72M
-#   Total:                  ~40.0M
+#   Embeddings: 11.72M
+#   Total: ~40.0M
