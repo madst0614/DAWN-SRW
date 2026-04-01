@@ -294,15 +294,9 @@ def _know_forward(x, pool_params, router_params, rng,
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     gate = threshold_gate(scores_know, tau)
 
-    # Gate stats (jax.debug.print — runs every step, no perf impact on TPU)
-    N_know = know_emb.shape[0]
+    # Gate stats (returned for logging, no debug.print)
     active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
-    s_mean = scores_know.mean()
-    s_std = jnp.std(scores_know) + 1e-8
-    tau_actual = s_mean + tau.mean() * s_std
-    jax.debug.print(
-        "[gate] active={a:.0f}/{n} tau={t:.3f} gate_max={m:.4f}",
-        a=active_count, n=N_know, t=tau_actual, m=gate.max())
+    gate_max_val = gate.max(axis=-1).mean()
 
     out = sense_read_write(x, gate, know_read, know_write)
 
@@ -313,7 +307,7 @@ def _know_forward(x, pool_params, router_params, rng,
     lb_aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * know_emb.shape[0]
     tau_reg = jnp.maximum(tau, 0.0).mean() * 0.01
     aux = lb_aux + tau_reg
-    return out, aux
+    return out, aux, active_count, gate_max_val
 
 
 # ================================================================
@@ -461,6 +455,8 @@ class DAWN(nn.Module):
 
         if self.is_initializing():
             total_aux = jnp.float32(0.0)
+            know_actives = jnp.float32(0.0)
+            know_gmaxes = jnp.float32(0.0)
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
                                attention_mask, deterministic)
@@ -497,22 +493,27 @@ class DAWN(nn.Module):
 
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
-                know_out, know_aux = _know_forward(
+                know_out, know_aux, know_active, know_gmax = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.max_k_know,
                     self.router_dropout, self.dropout_rate, deterministic)
                 x = x + know_out
-                return x, attn_aux + know_aux
+                return x, (attn_aux + know_aux, know_active, know_gmax)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
 
             xs = {'params': stacked, 'rng': layer_rngs}
-            x, aux_losses = jax.lax.scan(scan_body, x, xs)
+            x, (aux_losses, know_actives, know_gmaxes) = jax.lax.scan(
+                scan_body, x, xs)
             total_aux = aux_losses.sum()
 
         x = self.norm(x)
-        result = {'aux_loss': total_aux}
+        result = {
+            'aux_loss': total_aux,
+            'know_active': know_actives.mean(),
+            'know_gate_max': know_gmaxes.mean(),
+        }
 
         if labels is not None:
             embedding_matrix = self.token_emb.embedding

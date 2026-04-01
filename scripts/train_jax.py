@@ -493,6 +493,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'correct': jax.lax.psum(result['correct'], axis_name='dp'),
             'valid_count': jax.lax.psum(result['valid_count'], axis_name='dp'),
             'grad_norm': jax.lax.pmean(grad_norm, axis_name='dp'),
+            'know_active': jax.lax.pmean(
+                result.get('know_active', jnp.float32(0.0)), axis_name='dp'),
+            'know_gate_max': jax.lax.pmean(
+                result.get('know_gate_max', jnp.float32(0.0)), axis_name='dp'),
         }
 
         return new_params, new_opt_state, metrics
@@ -1593,8 +1597,18 @@ def main():
                                 pn_parts.append(f"{name}={float(v):.3f}")
                         pn_s = " ".join(pn_parts)
 
+                        # Gate stats
+                        k_act = float(metrics['know_active'][0])
+                        k_gmax = float(metrics['know_gate_max'][0])
+                        n_know_cfg = cfg['model'].get('n_know', 27200)
+                        gate_s = (f"gate: active={k_act:.0f}/{n_know_cfg}"
+                                  f"({k_act/n_know_cfg*100:.0f}%) "
+                                  f"max={k_gmax:.4f}")
+
                         log_message(
-                            f"      {tau_s} | grad_norm={m_grad:.3f} | {pn_s}")
+                            f"      {tau_s} | grad_norm={m_grad:.3f}")
+                        log_message(
+                            f"      {gate_s} | {pn_s}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
