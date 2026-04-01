@@ -1,5 +1,6 @@
-# DAWN Spatial-R1 v3.4 -- Bottleneck Emit, 40M Scale, 5B tokens
-# emb[64] sense + w_enc[64]+w_dec[64,384] bottleneck emit. All matmuls in 64-dim.
+# DAWN Spatial-R1 v3.6 -- Threshold Gate + Feature-Restore Emit
+# Sense: emb[N,64]. Emit: feature_fn[N,384,64] + restore_fn[N,64,384].
+# Neuron counts reduced for F-R param budget.
 
 seed: 1
 
@@ -11,7 +12,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.5.0"
+  model_version: "spatial-r1-v3.6.0"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -20,12 +21,12 @@ model:
   gradient_checkpointing: true
 
   d_bottleneck: 64
-  n_qk: 1570
-  n_v: 2620
-  n_know: 21000
-  max_k_qk: 157
-  max_k_v: 262
-  max_k_know: 1536
+  n_qk: 128
+  n_v: 128
+  n_know: 256
+  max_k_qk: 32
+  max_k_v: 32
+  max_k_know: 64
   router_dropout: 0.1
 
 training:
@@ -41,14 +42,14 @@ training:
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.4_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.4_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.6_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.6_40M_c4_5B
 
-# Parameter budget (~17M):
-#   QK:   1570 x 64 x 2 (emb+w_enc) + 64x384 (w_dec) = 0.23M
-#   V:    2620 x 64 x 2 + 64x384                      = 0.36M
-#   Know: 21000 x 64 x 2 + 64x384                     = 2.71M
-#   Router proj + tau:                                    ~0.10M
-#   Blocks (LN x2 + O_proj) x12:                       1.79M
-#   Embeddings (tok + pos):                            11.92M
-#   Total:                                             ~17.1M
+# Parameter budget (~39M):
+#   QK:   emb[128,64]=8K + f[128,384,64]=3.15M + r[128,64,384]=3.15M = 6.3M
+#   V:    same as QK = 6.3M
+#   Know: emb[256,64]=16K + f[256,384,64]=6.29M + r[256,64,384]=6.29M = 12.6M
+#   Router proj+tau: ~0.1M
+#   Blocks (LN x2 + O_proj) x12: 1.79M
+#   Embeddings (tok + pos): 11.92M
+#   Total: ~39.0M
