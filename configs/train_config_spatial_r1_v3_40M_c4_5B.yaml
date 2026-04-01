@@ -1,5 +1,5 @@
-# DAWN Spatial-R1 v3.6 -- Threshold Gate + F-R Basis Dynamic Synthesis
-# 21K sense neurons + M basis F-R emit. Neuron pattern -> basis weights.
+# DAWN Spatial-R1 v3.7 -- Sense + Direct Emit, no bottleneck
+# emb[N,64] sense + w[N,384] emit direction. top_k sparse gather.
 
 seed: 1
 
@@ -11,7 +11,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.6.0"
+  model_version: "spatial-r1-v3.7.0"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -23,9 +23,6 @@ model:
   n_qk: 1570
   n_v: 2620
   n_know: 21000
-  n_basis_qk: 32
-  n_basis_v: 32
-  n_basis_know: 256
   max_k_qk: 157
   max_k_v: 262
   max_k_know: 1536
@@ -44,16 +41,13 @@ training:
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.6_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.6_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.7_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.7_40M_c4_5B
 
-# Parameter budget (~31M):
-#   Sense emb: (1570+2620+21000) x 64 = 1.61M
-#   F-R basis:
-#     QK:  32 x 384 x 64 x 2 = 1.57M
-#     V:   32 x 384 x 64 x 2 = 1.57M
-#     Know: 256 x 384 x 64 x 2 = 12.58M
+# Parameter budget (~25.2M):
+#   sense emb: (1570+2620+21000) x 64 = 1.61M
+#   emit w:    (1570+2620+21000) x 384 = 9.67M
 #   Router proj+tau: ~0.2M
 #   Blocks (LN x2 + O) x12: 1.79M
 #   Embeddings: 11.92M
-#   Total: ~31.2M
+#   Total: ~25.2M
