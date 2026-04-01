@@ -84,21 +84,27 @@ def threshold_gate(scores, tau, max_k=None):
 # ================================================================
 
 @jax.checkpoint
-def sense_emit_sparse(x, emb, w, gate, top_k_idx):
-    """Gather only active neurons, then sense/emit.
+def _sense_only(x, emb, idx):
+    """Gather emb + sense. Checkpointed: [B,S,k,D] freed after forward."""
+    sel_emb = emb[idx]                               # [B, S, k, D]
+    return jnp.einsum('bsd,bskd->bsk', x, sel_emb)  # [B, S, k]
 
-    x:         [B, S, D]
-    emb:       [N, D]     -- full emb pool (shared)
-    w:         [N, D]     -- full w pool (shared)
-    gate:      [B, S, k]  -- top_k gate values
-    top_k_idx: [B, S, k]  -- top_k neuron indices
-    Returns:   [B, S, D]
+
+@jax.checkpoint
+def _emit_only(gated, w, idx):
+    """Gather w + emit. Checkpointed: [B,S,k,D] freed after forward."""
+    sel_w = w[idx]                                    # [B, S, k, D]
+    return jnp.einsum('bsk,bskd->bsd', gated, sel_w) # [B, S, D]
+
+
+def sense_emit_sparse(x, emb, w, gate, top_k_idx):
+    """Split sense/emit into two checkpoints so only one [B,S,k,D] at a time.
+
+    Peak memory: single gather [B,S,k,D] instead of two simultaneous.
     """
-    sel_emb = emb[top_k_idx]                               # [B, S, k, D]
-    sel_w = w[top_k_idx]                                    # [B, S, k, D]
-    activations = jnp.einsum('bsd,bskd->bsk', x, sel_emb)  # sense
-    gated = activations * gate                               # fire
-    return jnp.einsum('bsk,bskd->bsd', gated, sel_w)       # emit
+    activations = _sense_only(x, emb, top_k_idx)  # [B, S, k]
+    gated = activations * gate                      # [B, S, k]
+    return _emit_only(gated, w, top_k_idx)         # [B, S, D]
 
 
 # ================================================================
