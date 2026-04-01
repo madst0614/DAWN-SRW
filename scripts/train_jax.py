@@ -1188,26 +1188,78 @@ def main():
             except Exception:
                 pass
 
-            # === Profiler trace (1 step) for TensorBoard ===
-            profile_dir = cfg.get('log_dir', '/tmp/dawn_profile')
-            if isinstance(profile_dir, str) and profile_dir.startswith('gs://'):
-                profile_dir = '/tmp/dawn_profile'
+            # === Inline step-time breakdown (printed to stdout) ===
             try:
-                print(f"\n  === Profiling 1 step -> {profile_dir}/profile ===", flush=True)
-                rng, prof_rng = jax.random.split(rng)
-                prof_keys = jax.random.split(prof_rng, n_local_devices)
-                _p, _o, _m = train_step_fn(
-                    params, opt_state, dummy_ids, dummy_mask, prof_keys)
-                jax.block_until_ready(_m['total_loss'])
-                with jax.profiler.trace(f"{profile_dir}/profile"):
-                    rng, prof_rng2 = jax.random.split(rng)
-                    prof_keys2 = jax.random.split(prof_rng2, n_local_devices)
-                    _p2, _o2, _m2 = train_step_fn(
-                        params, opt_state, dummy_ids, dummy_mask, prof_keys2)
-                    jax.block_until_ready(_m2['total_loss'])
-                print(f"  Profile saved. View: tensorboard --logdir={profile_dir}", flush=True)
+                print(f"\n  === Step-time breakdown (single device, 1 layer) ===",
+                      flush=True)
+                # Use single-device params for profiling
+                p_single = jax.tree.map(lambda x: x[0], params)
+                pool_p = p_single['neuron_pool']
+                router_p = p_single['router']
+                block_p = p_single['block_0']
+                dummy_x = jnp.zeros((per_device_batch, max_seq_len,
+                                     cfg['model']['d_model']))
+                prof_rng = jax.random.PRNGKey(42)
+                d_model = cfg['model']['d_model']
+                n_heads = cfg['model']['n_heads']
+                max_k_qk = cfg['model'].get('max_k_qk', 157)
+                max_k_v = cfg['model'].get('max_k_v', 262)
+                max_k_know = cfg['model'].get('max_k_know', 1536)
+                n_qk = cfg['model'].get('n_qk', 1570)
+                n_v = cfg['model'].get('n_v', 2620)
+                rd = cfg['model'].get('router_dropout', 0.1)
+                dd = cfg['model'].get('dropout', 0.1)
+
+                from models.dawn_spatial_v3 import (
+                    _layer_norm, _attn_forward, _know_forward)
+
+                normed = _layer_norm(dummy_x,
+                                     block_p['norm1']['scale'],
+                                     block_p['norm1']['bias'])
+                # Warm up
+                _a, _ = _attn_forward(
+                    normed, pool_p, router_p,
+                    block_p['attn']['expand_O']['kernel'], prof_rng,
+                    n_qk, n_v, max_k_qk, max_k_v,
+                    n_heads, d_model, rd, dd, True)
+                jax.block_until_ready(_a)
+                _k, _ = _know_forward(
+                    normed, pool_p, router_p, prof_rng,
+                    max_k_know, rd, dd, True)
+                jax.block_until_ready(_k)
+
+                # Measure attention
+                N_RUNS = 5
+                t0 = time.time()
+                for _ in range(N_RUNS):
+                    _a, _ = _attn_forward(
+                        normed, pool_p, router_p,
+                        block_p['attn']['expand_O']['kernel'], prof_rng,
+                        n_qk, n_v, max_k_qk, max_k_v,
+                        n_heads, d_model, rd, dd, True)
+                    jax.block_until_ready(_a)
+                attn_ms = (time.time() - t0) / N_RUNS * 1000
+
+                # Measure knowledge
+                t0 = time.time()
+                for _ in range(N_RUNS):
+                    _k, _ = _know_forward(
+                        normed, pool_p, router_p, prof_rng,
+                        max_k_know, rd, dd, True)
+                    jax.block_until_ready(_k)
+                know_ms = (time.time() - t0) / N_RUNS * 1000
+
+                total_ms = attn_ms + know_ms
+                n_layers = cfg['model']['n_layers']
+                print(f"  Attention:  {attn_ms:.1f} ms/layer "
+                      f"({attn_ms/total_ms*100:.0f}%)", flush=True)
+                print(f"  Knowledge:  {know_ms:.1f} ms/layer "
+                      f"({know_ms/total_ms*100:.0f}%)", flush=True)
+                print(f"  Layer total: {total_ms:.1f} ms", flush=True)
+                print(f"  Est. {n_layers}-layer: {total_ms*n_layers:.0f} ms "
+                      f"(actual step includes grad+opt)", flush=True)
             except Exception as e:
-                print(f"  Profiling skipped: {e}", flush=True)
+                print(f"  Breakdown skipped: {e}", flush=True)
 
             # Estimate total training time
             total_steps = len(train_loader) * num_epochs
