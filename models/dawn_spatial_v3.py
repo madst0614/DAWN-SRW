@@ -1,24 +1,21 @@
 """
-DAWN-Spatial v3.4: Low-dim Sense + Full-dim Emit (JAX/Flax)
+DAWN-Spatial v3.4: Low-dim Sense + Bottleneck Emit (JAX/Flax)
 
 Changelog:
   spatial-r1-v3.4.0 (2026-04-01):
-    - emb shrunk to d_sense=64 (sense + routing in low dim)
-    - w stays d_model=384 (full-dim emit)
-    - Router neuron_emb removed: pool emb used directly for routing
-    - sense_emit = gate @ w (emit only, gate already encodes sense)
-    - ~42% FLOPs reduction vs v3.3.0
-
-  spatial-r1-v3.3.0 (2026-04-01):
-    - d_space routing + full matmul sense_emit
+    - All heavy matmuls in d_bottleneck=64 dimension
+    - emb[N,64] for sense/routing, w_enc[N,64]+w_dec[64,384] for emit
+    - emit_bottleneck: gate @ w_enc @ w_dec (checkpointed)
+    - ~6x FLOPs reduction vs 384-dim: 2.65M vs 16.2M per token per layer
+    - Router uses pool emb directly, no separate neuron_emb
 
 Architecture:
-  NeuronPool   -- emb[N, d_sense] + w[N, d_model] per pool
-  Router       -- proj (d_model -> d_sense) + tau. No neuron_emb.
-  emit_ckpt    -- @jax.checkpoint: gate @ w
-  _attn_forward -- d_sense route/sense -> gate -> emit -> self-attn
-  _know_forward -- d_sense route/sense -> gate -> emit
-  DAWN         -- embedding + jax.lax.scan + weight-tied lm_head
+  NeuronPool       -- emb[N,d_bn] + w_enc[N,d_bn] + w_dec[d_bn,D] per pool
+  Router           -- proj (D->d_bn) + tau. Uses pool emb for routing.
+  emit_bottleneck  -- @jax.checkpoint: gate @ w_enc @ w_dec
+  _attn_forward    -- d_bn route -> gate -> bottleneck emit -> self-attn
+  _know_forward    -- d_bn route -> gate -> bottleneck emit
+  DAWN             -- embedding + jax.lax.scan + weight-tied lm_head
 """
 
 import jax
@@ -81,48 +78,57 @@ def threshold_gate(scores, tau, max_k=None):
 
 
 # ================================================================
-# 3. Emit (checkpointed gate @ w)
+# 3. Bottleneck emit (checkpointed)
 # ================================================================
 
 @jax.checkpoint
-def _emit_ckpt(gate, w):
-    """Checkpointed emit: gate @ w. Intermediate [B,S,N] recomputed in backward.
+def emit_bottleneck(gate, w_enc, w_dec):
+    """gate @ w_enc -> [B,S,d_bn] -> @ w_dec -> [B,S,D].
 
-    gate: [B, S, N]  -- sparse (threshold_gate output, encodes sense+gating)
-    w:    [N, D]     -- emit vectors (full dim)
-    Returns: [B, S, D]
+    Checkpointed: [B,S,N] intermediate recomputed in backward.
+    gate:  [B, S, N]
+    w_enc: [N, d_bn]
+    w_dec: [d_bn, D]
     """
-    return gate @ w
+    h = gate @ w_enc   # [B, S, d_bn]
+    return h @ w_dec   # [B, S, D]
 
 
 # ================================================================
-# 4. NeuronPool -- emb[d_sense] + w[d_model]
+# 4. NeuronPool -- emb[d_bn] + w_enc[d_bn] + w_dec[d_bn, D]
 # ================================================================
 
 class NeuronPool(nn.Module):
-    """emb[d_sense] for sense/routing, w[d_model] for emit."""
     n_qk: int
     n_v: int
     n_know: int
     d_model: int
-    d_sense: int
+    d_bottleneck: int
 
     def setup(self):
-        self.qk_emb = self.param('qk_emb', unit_norm_init(), (self.n_qk, self.d_sense))
-        self.qk_w = self.param('qk_w', unit_norm_init(), (self.n_qk, self.d_model))
-        self.v_emb = self.param('v_emb', unit_norm_init(), (self.n_v, self.d_sense))
-        self.v_w = self.param('v_w', unit_norm_init(), (self.n_v, self.d_model))
-        self.know_emb = self.param('know_emb', unit_norm_init(), (self.n_know, self.d_sense))
-        self.know_w = self.param('know_w', unit_norm_init(), (self.n_know, self.d_model))
+        db = self.d_bottleneck
+        dm = self.d_model
+        # emb: sense/routing (low-dim)
+        self.qk_emb = self.param('qk_emb', unit_norm_init(), (self.n_qk, db))
+        self.v_emb = self.param('v_emb', unit_norm_init(), (self.n_v, db))
+        self.know_emb = self.param('know_emb', unit_norm_init(), (self.n_know, db))
+        # w_enc: per-neuron emit encoding (low-dim)
+        self.qk_w_enc = self.param('qk_w_enc', unit_norm_init(), (self.n_qk, db))
+        self.v_w_enc = self.param('v_w_enc', unit_norm_init(), (self.n_v, db))
+        self.know_w_enc = self.param('know_w_enc', unit_norm_init(), (self.n_know, db))
+        # w_dec: shared decoder per circuit (low-dim -> full-dim)
+        self.qk_w_dec = self.param('qk_w_dec', scaled_normal(0.02), (db, dm))
+        self.v_w_dec = self.param('v_w_dec', scaled_normal(0.02), (db, dm))
+        self.know_w_dec = self.param('know_w_dec', scaled_normal(0.02), (db, dm))
 
 
 # ================================================================
-# 5. Router -- proj + tau (no neuron_emb, uses pool emb directly)
+# 5. Router -- proj + tau (uses pool emb directly)
 # ================================================================
 
 class Router(nn.Module):
     d_model: int
-    d_sense: int
+    d_bottleneck: int
     n_qk: int
     n_v: int
     n_know: int
@@ -132,30 +138,27 @@ class Router(nn.Module):
     router_dropout: float = 0.1
 
     def setup(self):
-        self.proj_attn = nn.Dense(self.d_sense * 3, name='proj_attn')
-        self.proj_know = nn.Dense(self.d_sense, name='proj_know')
+        db = self.d_bottleneck
+        self.proj_attn = nn.Dense(db * 3, name='proj_attn')
+        self.proj_know = nn.Dense(db, name='proj_know')
         self.tau_attn = nn.Dense(3, name='tau_attn')
         self.tau_know = nn.Dense(1, name='tau_know')
 
     def get_attention_gates(self, x, neuron_pool, deterministic, rng):
-        qk_emb = neuron_pool.qk_emb
-        v_emb = neuron_pool.v_emb
-        qk_norm = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-8)
-        v_norm = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-8)
+        qk_norm = neuron_pool.qk_emb / (
+            jnp.linalg.norm(neuron_pool.qk_emb, axis=-1, keepdims=True) + 1e-8)
+        v_norm = neuron_pool.v_emb / (
+            jnp.linalg.norm(neuron_pool.v_emb, axis=-1, keepdims=True) + 1e-8)
 
         rng, rng_drop = jax.random.split(rng)
         h_all = self.proj_attn(x)
         h_all = safe_dropout(h_all, self.router_dropout, deterministic, rng_drop)
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
-        scores_Q = h_Q @ qk_norm.T
-        scores_K = h_K @ qk_norm.T
-        scores_V = h_V @ v_norm.T
-
         tau_all = self.tau_attn(x)
-        g_Q = threshold_gate(scores_Q, tau_all[:, :, 0:1], self.max_k_qk)
-        g_K = threshold_gate(scores_K, tau_all[:, :, 1:2], self.max_k_qk)
-        g_V = threshold_gate(scores_V, tau_all[:, :, 2:3], self.max_k_v)
+        g_Q = threshold_gate(h_Q @ qk_norm.T, tau_all[:, :, 0:1], self.max_k_qk)
+        g_K = threshold_gate(h_K @ qk_norm.T, tau_all[:, :, 1:2], self.max_k_qk)
+        g_V = threshold_gate(h_V @ v_norm.T, tau_all[:, :, 2:3], self.max_k_v)
 
         t_qk = 1.0 / self.n_qk
         t_v = 1.0 / self.n_v
@@ -167,16 +170,15 @@ class Router(nn.Module):
         return g_Q, g_K, g_V, aux
 
     def get_knowledge_gates(self, x, neuron_pool, deterministic, rng):
-        know_emb = neuron_pool.know_emb
-        know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
+        know_norm = neuron_pool.know_emb / (
+            jnp.linalg.norm(neuron_pool.know_emb, axis=-1, keepdims=True) + 1e-8)
 
         rng, rng_drop = jax.random.split(rng)
         h = self.proj_know(x)
         h = safe_dropout(h, self.router_dropout, deterministic, rng_drop)
-        scores = h @ know_norm.T
 
         tau = self.tau_know(x)
-        gate = threshold_gate(scores, tau, self.max_k_know)
+        gate = threshold_gate(h @ know_norm.T, tau, self.max_k_know)
 
         t = 1.0 / self.n_know
         aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * self.n_know
@@ -193,9 +195,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   router_dropout, dropout_rate, deterministic):
     B, S, D = x.shape
     qk_emb = pool_params['qk_emb']
-    qk_w = pool_params['qk_w']
+    qk_w_enc = pool_params['qk_w_enc']
+    qk_w_dec = pool_params['qk_w_dec']
     v_emb = pool_params['v_emb']
-    v_w = pool_params['v_w']
+    v_w_enc = pool_params['v_w_enc']
+    v_w_dec = pool_params['v_w_dec']
 
     qk_norm = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-8)
     v_norm = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-8)
@@ -205,18 +209,14 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     h_all = safe_dropout(h_all, router_dropout, deterministic, rng_drop)
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
-    scores_Q = h_Q @ qk_norm.T
-    scores_K = h_K @ qk_norm.T
-    scores_V = h_V @ v_norm.T
-
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
-    g_Q = threshold_gate(scores_Q, tau_all[:, :, 0:1], max_k_qk)
-    g_K = threshold_gate(scores_K, tau_all[:, :, 1:2], max_k_qk)
-    g_V = threshold_gate(scores_V, tau_all[:, :, 2:3], max_k_v)
+    g_Q = threshold_gate(h_Q @ qk_norm.T, tau_all[:, :, 0:1], max_k_qk)
+    g_K = threshold_gate(h_K @ qk_norm.T, tau_all[:, :, 1:2], max_k_qk)
+    g_V = threshold_gate(h_V @ v_norm.T, tau_all[:, :, 2:3], max_k_v)
 
-    Q = _emit_ckpt(g_Q, qk_w)
-    K = _emit_ckpt(g_K, qk_w)
-    V = _emit_ckpt(g_V, v_w)
+    Q = emit_bottleneck(g_Q, qk_w_enc, qk_w_dec)
+    K = emit_bottleneck(g_K, qk_w_enc, qk_w_dec)
+    V = emit_bottleneck(g_V, v_w_enc, v_w_dec)
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -252,7 +252,8 @@ def _know_forward(x, pool_params, router_params, rng,
                   max_k_know,
                   router_dropout, dropout_rate, deterministic):
     know_emb = pool_params['know_emb']
-    know_w = pool_params['know_w']
+    know_w_enc = pool_params['know_w_enc']
+    know_w_dec = pool_params['know_w_dec']
 
     know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
 
@@ -264,7 +265,7 @@ def _know_forward(x, pool_params, router_params, rng,
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     gate = threshold_gate(scores, tau, max_k_know)
 
-    out = _emit_ckpt(gate, know_w)
+    out = emit_bottleneck(gate, know_w_enc, know_w_dec)
 
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
@@ -294,9 +295,9 @@ class AttentionCircuit(nn.Module):
         g_Q, g_K, g_V, aux = router.get_attention_gates(
             x, neuron_pool, deterministic, rng_r)
 
-        Q = _emit_ckpt(g_Q, neuron_pool.qk_w)
-        K = _emit_ckpt(g_K, neuron_pool.qk_w)
-        V = _emit_ckpt(g_V, neuron_pool.v_w)
+        Q = emit_bottleneck(g_Q, neuron_pool.qk_w_enc, neuron_pool.qk_w_dec)
+        K = emit_bottleneck(g_K, neuron_pool.qk_w_enc, neuron_pool.qk_w_dec)
+        V = emit_bottleneck(g_V, neuron_pool.v_w_enc, neuron_pool.v_w_dec)
 
         B, S, D = x.shape
         d_head = D // self.n_heads
@@ -327,7 +328,7 @@ class KnowledgeCircuit(nn.Module):
         rng, rng_r = jax.random.split(rng)
         gate, aux = router.get_knowledge_gates(
             x, neuron_pool, deterministic, rng_r)
-        out = _emit_ckpt(gate, neuron_pool.know_w)
+        out = emit_bottleneck(gate, neuron_pool.know_w_enc, neuron_pool.know_w_dec)
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
 
@@ -363,7 +364,7 @@ class DAWNBlock(nn.Module):
 # ================================================================
 
 class DAWN(nn.Module):
-    """DAWN-Spatial v3.4: Low-dim Sense (d_sense) + Full-dim Emit."""
+    """DAWN-Spatial v3.4: Low-dim Sense + Bottleneck Emit."""
     __version__ = "spatial-r1-v3.4.0"
 
     vocab_size: int = 30000
@@ -374,7 +375,7 @@ class DAWN(nn.Module):
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
 
-    d_sense: int = 64
+    d_bottleneck: int = 64
     n_qk: int = 1570
     n_v: int = 2620
     n_know: int = 21000
@@ -394,9 +395,9 @@ class DAWN(nn.Module):
             self.max_seq_len, self.d_model, embedding_init=scaled_normal(0.02))
         self.neuron_pool = NeuronPool(
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
-            d_model=self.d_model, d_sense=self.d_sense)
+            d_model=self.d_model, d_bottleneck=self.d_bottleneck)
         self.router = Router(
-            d_model=self.d_model, d_sense=self.d_sense,
+            d_model=self.d_model, d_bottleneck=self.d_bottleneck,
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
             max_k_qk=self.max_k_qk, max_k_v=self.max_k_v,
             max_k_know=self.max_k_know, router_dropout=self.router_dropout)
@@ -511,9 +512,9 @@ class DAWN(nn.Module):
             mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
             return jnp.abs(sim * mask).sum() / mask.sum()
         pool = self.neuron_pool
-        return (_div(pool.qk_emb) + _div(pool.qk_w) +
-                _div(pool.v_emb) + _div(pool.v_w) +
-                _div(pool.know_emb) + _div(pool.know_w)) / 6
+        return (_div(pool.qk_emb) + _div(pool.qk_w_enc) +
+                _div(pool.v_emb) + _div(pool.v_w_enc) +
+                _div(pool.know_emb) + _div(pool.know_w_enc)) / 6
 
     def get_auxiliary_losses(self):
         return {'neuron_diversity': self.diversity_loss()}
@@ -523,7 +524,8 @@ class DAWN(nn.Module):
             'model_version': self.__version__,
             'vocab_size': self.vocab_size, 'd_model': self.d_model,
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
-            'max_seq_len': self.max_seq_len, 'd_sense': self.d_sense,
+            'max_seq_len': self.max_seq_len,
+            'd_bottleneck': self.d_bottleneck,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_know': self.n_know,
             'max_k_qk': self.max_k_qk, 'max_k_v': self.max_k_v,
             'max_k_know': self.max_k_know,
@@ -531,8 +533,8 @@ class DAWN(nn.Module):
 
     def get_model_info(self):
         return [
-            f"DAWN v{self.__version__}: Low-dim Sense + Full-dim Emit",
-            f"  d_model={self.d_model}, d_sense={self.d_sense}, "
+            f"DAWN v{self.__version__}: Low-dim Sense + Bottleneck Emit",
+            f"  d_model={self.d_model}, d_bottleneck={self.d_bottleneck}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  QK: {self.n_qk}, V: {self.n_v}, Know: {self.n_know}",
             f"  max_k: qk={self.max_k_qk}, v={self.max_k_v}, "

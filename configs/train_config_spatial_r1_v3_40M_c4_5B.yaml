@@ -1,6 +1,5 @@
-# DAWN Spatial-R1 v3.4 -- Low-dim Sense + Full-dim Emit, 40M Scale, 5B tokens
-# emb[d_sense=64] for routing/sense, w[d_model=384] for emit.
-# sense = gate @ w (emit only). No gather.
+# DAWN Spatial-R1 v3.4 -- Bottleneck Emit, 40M Scale, 5B tokens
+# emb[64] sense + w_enc[64]+w_dec[64,384] bottleneck emit. All matmuls in 64-dim.
 
 seed: 1
 
@@ -20,7 +19,7 @@ model:
   dropout: 0.1
   gradient_checkpointing: true
 
-  d_sense: 64
+  d_bottleneck: 64
   n_qk: 1570
   n_v: 2620
   n_know: 21000
@@ -45,11 +44,11 @@ use_amp: true
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.4_40M_c4_5B
 log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.4_40M_c4_5B
 
-# Parameter budget:
-#   QK:   1570 x (64+384)   = 0.70M
-#   V:    2620 x (64+384)   = 1.17M
-#   Know: 21000 x (64+384)  = 9.41M
-#   Router proj + tau:         ~0.10M
-#   Blocks (LN x2 + O) x12: 1.79M
-#   Embeddings:             11.92M
-#   Total:                  ~25.1M
+# Parameter budget (~17M):
+#   QK:   1570 x 64 x 2 (emb+w_enc) + 64x384 (w_dec) = 0.23M
+#   V:    2620 x 64 x 2 + 64x384                      = 0.36M
+#   Know: 21000 x 64 x 2 + 64x384                     = 2.71M
+#   Router proj + tau:                                    ~0.10M
+#   Blocks (LN x2 + O_proj) x12:                       1.79M
+#   Embeddings (tok + pos):                            11.92M
+#   Total:                                             ~17.1M
