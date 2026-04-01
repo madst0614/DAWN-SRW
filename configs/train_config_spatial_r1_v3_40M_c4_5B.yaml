@@ -1,5 +1,5 @@
-# DAWN Spatial-R1 v3.1 -- Cell-Dense Routing, 40M Scale, 5B tokens
-# Index-only cell map. No neuron copies. No distance computation.
+# DAWN Spatial-R1 v3.2 -- Full Matmul (v17.1 pattern), 40M Scale, 5B tokens
+# Dense matmul scoring + sparse gate. No gather/cell/distance.
 
 seed: 1
 
@@ -11,18 +11,13 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.1.0"
+  model_version: "spatial-r1-v3.2.0"
   d_model: 384
   n_layers: 12
   n_heads: 6
   max_seq_len: 512
   dropout: 0.1
   gradient_checkpointing: true
-
-  pos_dim: 2
-  n_cells_per_side: 32
-  map_rebuild_interval: 100
-  chunk_size: 64
 
   n_qk: 3140
   n_v: 5240
@@ -41,10 +36,9 @@ training:
   warmup_ratio: 0.06
   diversity_weight: 0.1
   load_balance_weight: 0.00002
-  pos_loss_weight: 0.01
   checkpoint_interval: 500
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.2_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.2_40M_c4_5B

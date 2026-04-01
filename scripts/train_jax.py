@@ -41,7 +41,6 @@ from models.model_v17_1_jax import DAWN
 from models.dawn_spatial import DAWN as DAWN_Spatial
 from models.dawn_spatial_v2 import DAWN as DAWN_SpatialV2
 from models.dawn_spatial_v3 import DAWN as DAWN_SpatialV3
-from models.dawn_spatial_v3 import build_all_blocks
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -120,11 +119,6 @@ def build_model_from_config(cfg):
             n_layers=mcfg.get('n_layers', 12),
             n_heads=mcfg.get('n_heads', 6),
             max_seq_len=mcfg.get('max_seq_len', 512),
-            pos_dim=mcfg.get('pos_dim', 2),
-            n_cells_per_side=mcfg.get('n_cells_per_side', 32),
-            map_rebuild_interval=mcfg.get('map_rebuild_interval', 100),
-            pos_loss_weight=mcfg.get('pos_loss_weight', 0.01),
-            chunk_size=mcfg.get('chunk_size', 16),
             n_qk=mcfg.get('n_qk', 3140),
             n_v=mcfg.get('n_v', 5240),
             n_know=mcfg.get('n_know', 42000),
@@ -413,26 +407,19 @@ def compute_spatial_diversity_loss(params):
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       n_devices=1, is_baseline=False, is_spatial=False,
-                      pos_loss_weight=0.0, is_spatial_v3=False):
+                      pos_loss_weight=0.0):
     """Create a compiled training step function.
 
     Uses jax.pmap for multi-device data parallelism.
     When n_devices=1, pmap degenerates to single-device execution.
-    For v3: block_data passed as extra argument to train_step.
     """
 
-    # in_axes: all args split on axis 0 except block_data (broadcast)
-    @partial(jax.pmap, axis_name='dp',
-             in_axes=(0, 0, 0, 0, 0, None))
-    def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
-                   block_data=None):
+    @partial(jax.pmap, axis_name='dp')
+    def train_step(params, opt_state, input_ids, attention_mask, dropout_key):
         # Labels for CLM: input_ids shifted, padding masked
         labels = jnp.where(attention_mask == 1, input_ids, -100)
 
         def loss_fn(params):
-            extra_kwargs = {}
-            if is_spatial_v3 and block_data is not None:
-                extra_kwargs['block_data'] = block_data
             result = model.apply(
                 {'params': params},
                 input_ids,
@@ -440,7 +427,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 attention_mask=attention_mask,
                 deterministic=False,
                 rngs={'dropout': dropout_key},
-                **extra_kwargs,
             )
             ce_loss = result['loss']
             aux_loss = result['aux_loss']
@@ -1132,29 +1118,13 @@ def main():
     is_spatial = (model_version == 'spatial-r1'
                   or model_version.startswith('spatial-r1-v2')
                   or model_version.startswith('spatial-r1-v3'))
-    is_spatial_v2_or_v3 = (model_version.startswith('spatial-r1-v2')
-                           or model_version.startswith('spatial-r1-v3'))
-    is_spatial_v3 = model_version.startswith('spatial-r1-v3')
-    pos_loss_weight = cfg['training'].get('pos_loss_weight', 0.01) if is_spatial_v2_or_v3 else 0.0
+    pos_loss_weight = cfg['training'].get('pos_loss_weight', 0.0)
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         n_devices=n_local_devices, is_baseline=is_baseline,
-        is_spatial=is_spatial, pos_loss_weight=pos_loss_weight,
-        is_spatial_v3=is_spatial_v3)
+        is_spatial=is_spatial, pos_loss_weight=pos_loss_weight)
     eval_step_fn = create_eval_step(model, n_devices=n_local_devices)
-
-    # Build initial block_data for v3 (broadcast via in_axes=None, no replication)
-    v3_block_data = None
-    if is_spatial_v3:
-        params_single = jax.tree.map(lambda x: x[0], params)
-        n_cells_side = cfg['model'].get('n_cells_per_side', 32)
-        v3_block_data = build_all_blocks(
-            params_single,
-            cfg['model']['n_qk'], cfg['model']['n_v'], n_cells_side,
-            cfg['model'].get('max_k_qk', 157),
-            cfg['model'].get('max_k_v', 262),
-            cfg['model'].get('max_k_know', 1536))
 
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile: real train_step (forward + backward)
@@ -1173,7 +1143,6 @@ def main():
         jit_start = time.time()
         _dummy_params, _dummy_opt, dummy_metrics = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys,
-            v3_block_data,
         )
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
@@ -1186,7 +1155,6 @@ def main():
         step_start = time.time()
         _dummy_params2, _dummy_opt2, dummy_metrics2 = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys2,
-            v3_block_data,
         )
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
@@ -1336,20 +1304,7 @@ def main():
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
                 input_ids, attention_mask, dropout_keys,
-                v3_block_data,
             )
-
-            # Periodic block_data rebuild for v3
-            if (is_spatial_v3 and global_step > 0
-                    and global_step % cfg['model'].get('map_rebuild_interval', 100) == 0):
-                params_single = jax.tree.map(lambda x: x[0], params)
-                v3_block_data = build_all_blocks(
-                    params_single,
-                    cfg['model']['n_qk'], cfg['model']['n_v'],
-                    cfg['model'].get('n_cells_per_side', 32),
-                    cfg['model'].get('max_k_qk', 157),
-                    cfg['model'].get('max_k_v', 262),
-                    cfg['model'].get('max_k_know', 1536))
 
             # Extract metrics (take first device, already aggregated via pmean/psum)
             m_total = float(metrics['total_loss'][0])
