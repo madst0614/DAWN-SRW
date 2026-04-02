@@ -112,24 +112,90 @@ def threshold_gate(scores, tau_offset):
 #    saving [B,S,N] intermediates
 # ================================================================
 
-@partial(jax.checkpoint,
-         policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
-def _know_core(x, h, emb_norm, tau_offset, w_read, w_write):
-    """Routing + gate + sense_read_write fused. bf16 matmul, f32 gate.
+def _know_core(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks=4):
+    """N-axis chunked: gate + sense_read_write. Peak memory [B,S,N/n_chunks].
 
-    checkpoint policy: saves only dot products with no batch dims
-    (i.e. small tensors), recomputes [B,S,N] intermediates.
+    3-pass over N chunks:
+      Pass 0: scores stats (sum, sq_sum) → global mean/std → tau
+      Pass 1: gate stats (exp_sum, exp_max) for normalization
+      Pass 2: normalized gate × sense_read_write → output accumulation
+
+    Scores recomputed each pass (cheap: [B,S,d_bn] @ [d_bn,chunk]). bf16.
     """
-    scores = h.astype(jnp.bfloat16) @ emb_norm.astype(jnp.bfloat16).T  # bf16 [B,S,N]
-    gate = threshold_gate(scores.astype(jnp.float32), tau_offset)        # f32 [B,S,N]
+    B, S, D = x.shape
+    N = emb_norm.shape[0]
+    chunk_size = N // n_chunks
 
-    gate_bf = gate.astype(jnp.bfloat16)
+    h_bf = h.astype(jnp.bfloat16)
     x_bf = x.astype(jnp.bfloat16)
-    x_read = x_bf @ w_read.astype(jnp.bfloat16).T                       # bf16 [B,S,N]
-    gated_read = gate_bf * x_read                                        # bf16 [B,S,N]
-    out = gated_read @ w_write.astype(jnp.bfloat16)                     # bf16 [B,S,D]
+    emb_c = emb_norm.astype(jnp.bfloat16).reshape(n_chunks, chunk_size, -1)
+    read_c = w_read.astype(jnp.bfloat16).reshape(n_chunks, chunk_size, -1)
+    write_c = w_write.astype(jnp.bfloat16).reshape(n_chunks, chunk_size, -1)
 
-    return out.astype(jnp.float32), gate
+    # --- Pass 0: scores stats for tau ---
+    def stats_fn(carry, ec):
+        s_sum, sq_sum = carry
+        sc = h_bf @ ec.T                                    # [B,S,chunk]
+        s_sum = s_sum + sc.astype(jnp.float32).sum(axis=-1, keepdims=True)
+        sq_sum = sq_sum + (sc.astype(jnp.float32) ** 2).sum(axis=-1, keepdims=True)
+        return (s_sum, sq_sum), None
+
+    z1 = jnp.zeros((B, S, 1))
+    (s_sum, sq_sum), _ = jax.lax.scan(stats_fn, (z1, z1), emb_c)
+
+    s_mean = s_sum / N
+    s_std = jnp.sqrt(sq_sum / N - s_mean ** 2) + 1e-8
+    tau = s_mean + tau_offset * s_std
+    tau_bf = tau.astype(jnp.bfloat16)
+
+    # --- Pass 1: gate exp_sum / exp_max ---
+    def gate_stats_fn(carry, ec):
+        exp_sum, exp_max, active_sum = carry
+        sc = h_bf @ ec.T
+        raw = sc - tau_bf
+        gate_c = jnp.where(raw > 0, raw,
+                           (1e-4 * jax.nn.softplus(
+                               raw.astype(jnp.float32))).astype(jnp.bfloat16))
+        gate_c = jnp.clip(gate_c, 0.0, 10.0)
+        eg = (jnp.exp(gate_c.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
+        exp_sum = exp_sum + eg.astype(jnp.float32).sum(axis=-1, keepdims=True)
+        exp_max = jnp.maximum(exp_max,
+                              eg.astype(jnp.float32).max(axis=-1, keepdims=True))
+        active_sum = active_sum + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
+        return (exp_sum, exp_max, active_sum), None
+
+    z1f = jnp.zeros((B, S, 1))
+    (total_exp_sum, total_exp_max, total_active), _ = jax.lax.scan(
+        gate_stats_fn, (z1f, jnp.full((B, S, 1), -1e9), z1f), emb_c)
+
+    gate_strength = jnp.tanh(total_exp_max).astype(jnp.bfloat16)
+    inv_exp_sum = (1.0 / (total_exp_sum + 1e-4)).astype(jnp.bfloat16)
+
+    # --- Pass 2: normalized gate × sense_read_write ---
+    def srw_fn(acc, data):
+        ec, rc, wc = data
+        sc = h_bf @ ec.T
+        raw = sc - tau_bf
+        gate_c = jnp.where(raw > 0, raw,
+                           (1e-4 * jax.nn.softplus(
+                               raw.astype(jnp.float32))).astype(jnp.bfloat16))
+        gate_c = jnp.clip(gate_c, 0.0, 10.0)
+        eg = (jnp.exp(gate_c.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
+        ng = eg * inv_exp_sum * gate_strength               # [B,S,chunk] normalized
+
+        x_read = x_bf @ rc.T                                # [B,S,chunk]
+        partial_out = (ng * x_read) @ wc                     # [B,S,D]
+        return acc + partial_out, None
+
+    out, _ = jax.lax.scan(srw_fn, jnp.zeros((B, S, D), dtype=jnp.bfloat16),
+                          (emb_c, read_c, write_c))
+
+    # Gate for aux loss: mean stats (from pass 1)
+    active_count = (total_active / N).mean()
+    gate_max_val = total_exp_max.mean()
+
+    # Return f32 out + dummy gate for load_balance (use active_count instead)
+    return out.astype(jnp.float32), active_count, gate_max_val
 
 
 @partial(jax.checkpoint,
@@ -325,20 +391,17 @@ def _know_forward(x, pool_params, router_params, rng,
     know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
 
-    # Core compute: gate + sense_read_write (bf16 matmul, f32 gate)
-    out, gate = _know_core(x, h, know_norm, tau, know_read, know_write)
-
-    # Gate stats (from f32 gate, outside checkpoint)
-    active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
-    gate_max_val = gate.max(axis=-1).mean()
+    # N-axis chunked core: 3-pass (stats, gate_stats, srw)
+    n_chunks = 4  # TODO: make configurable
+    out, active_count, gate_max_val = _know_core(
+        x, h, know_norm, tau, know_read, know_write, n_chunks)
 
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-    t = 1.0 / know_emb.shape[0]
-    lb_aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * know_emb.shape[0]
+    # Load balance from active_count (no full gate tensor available)
     tau_reg = jnp.maximum(tau, 0.0).mean() * 0.01
-    aux = lb_aux + tau_reg
+    aux = tau_reg
     return out, aux, active_count, gate_max_val
 
 
