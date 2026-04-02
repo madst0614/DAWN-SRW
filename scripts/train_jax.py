@@ -34,8 +34,10 @@ import time
 import random
 import argparse
 import yaml
+import numpy as np
 from datetime import datetime
 from functools import partial
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 
 from models.model_v17_1_jax import DAWN
 from models.dawn_spatial import DAWN as DAWN_Spatial
@@ -539,7 +541,147 @@ def create_eval_step(model, n_devices=1):
 
 
 # ============================================================
-# Multi-device helpers
+# Mesh-based sharding (model parallel + data parallel)
+# ============================================================
+
+def create_mesh(mesh_data, mesh_model):
+    """Create 2D Mesh for data + model parallelism."""
+    devices = jax.devices()
+    n_devices = len(devices)
+    assert n_devices == mesh_data * mesh_model, (
+        f"mesh_data({mesh_data}) * mesh_model({mesh_model}) = "
+        f"{mesh_data * mesh_model} != {n_devices} devices")
+    device_array = np.array(devices).reshape(mesh_data, mesh_model)
+    return Mesh(device_array, ('data', 'model'))
+
+
+def get_param_shardings(params, mesh):
+    """Create sharding specs for params: neuron_pool N-axis on 'model', rest replicated."""
+    replicated = NamedSharding(mesh, P())  # no sharding
+    n_sharded = NamedSharding(mesh, P('model', None))  # N axis on model
+    n_sharded_3d = NamedSharding(mesh, P('model', None, None))
+
+    def _get_sharding(path, value):
+        path_str = '/'.join(str(p) for p in path)
+        # NeuronPool params: shard N axis (first dim) on 'model'
+        if 'neuron_pool' in path_str:
+            if value.ndim == 2:
+                return n_sharded       # [N, d_bn] or [N, D]
+            elif value.ndim == 3:
+                return n_sharded_3d    # [N, D, R] for v17.1
+            else:
+                return replicated
+        return replicated
+
+    flat_params = jax.tree.leaves_with_path(params)
+    shardings = {}
+    for path, leaf in flat_params:
+        key_path = tuple(
+            p.key if hasattr(p, 'key') else str(p) for p in path)
+        shardings[key_path] = _get_sharding(path, leaf)
+
+    # Build matching pytree of shardings
+    return jax.tree.map_with_path(
+        lambda path, x: _get_sharding(path, x), params)
+
+
+def shard_params_to_mesh(params, param_shardings):
+    """Place params on mesh according to shardings."""
+    return jax.tree.map(
+        lambda p, s: jax.device_put(p, s),
+        params, param_shardings)
+
+
+def create_mesh_train_step(model, optimizer, div_weight, lb_weight,
+                           mesh, param_shardings,
+                           is_baseline=False, is_spatial=False,
+                           pos_loss_weight=0.0):
+    """Create jit-compiled train step with mesh sharding (replaces pmap version)."""
+    data_sharding = NamedSharding(mesh, P('data', None))  # [B, S]
+
+    @jax.jit
+    def train_step(params, opt_state, input_ids, attention_mask, dropout_key):
+        labels = jnp.where(attention_mask == 1, input_ids, -100)
+
+        def loss_fn(params):
+            result = model.apply(
+                {'params': params},
+                input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+                deterministic=False,
+                rngs={'dropout': dropout_key},
+            )
+            ce_loss = result['loss']
+            aux_loss = result['aux_loss']
+
+            if is_baseline:
+                orth_loss = jnp.float32(0.0)
+                div_loss = jnp.float32(0.0)
+                total_loss = ce_loss
+            elif is_spatial:
+                orth_loss = jnp.float32(0.0)
+                div_loss = compute_spatial_diversity_loss(params)
+                total_loss = (ce_loss
+                              + lb_weight * aux_loss
+                              + pos_loss_weight * aux_loss
+                              + div_weight * div_loss)
+            else:
+                orth_loss = jnp.float32(0.0)
+                div_loss = jnp.float32(0.0)
+                total_loss = ce_loss
+
+            return total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result)
+
+        (total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result)), grads = \
+            jax.value_and_grad(loss_fn, has_aux=True)(params)
+
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+
+        grad_norm = jnp.sqrt(
+            sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
+
+        metrics = {
+            'total_loss': total_loss,
+            'ce_loss': ce_loss,
+            'aux_loss': aux_loss,
+            'orth_loss': orth_loss,
+            'div_loss': div_loss,
+            'correct': result['correct'],
+            'valid_count': result['valid_count'],
+            'grad_norm': grad_norm,
+            'know_active': result.get('know_active', jnp.float32(0.0)),
+            'know_gate_max': result.get('know_gate_max', jnp.float32(0.0)),
+        }
+
+        return new_params, new_opt_state, metrics
+
+    return train_step
+
+
+def create_mesh_eval_step(model, mesh):
+    """Create jit-compiled eval step with mesh sharding."""
+
+    @jax.jit
+    def eval_step(params, input_ids, attention_mask):
+        labels = jnp.where(attention_mask == 1, input_ids, -100)
+        eval_rng = jax.random.PRNGKey(0)
+        result = model.apply(
+            {'params': params},
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            deterministic=True,
+            rngs={'dropout': eval_rng},
+        )
+        return result['loss'], result['correct'], result['valid_count']
+
+    return eval_step
+
+
+# ============================================================
+# Multi-device helpers (pmap legacy)
 # ============================================================
 
 def replicate(pytree, devices=None):
@@ -552,6 +694,17 @@ def replicate(pytree, devices=None):
 def unreplicate(pytree):
     """Extract first replica from a replicated pytree."""
     return jax.tree.map(lambda x: x[0], pytree)
+
+
+def to_single_device(pytree, use_mesh_mode=False):
+    """Get single-device copy of params for checkpoint/logging.
+    In mesh mode: params are already single-copy (sharded), just gather.
+    In pmap mode: take first replica.
+    """
+    if use_mesh_mode:
+        return jax.tree.map(lambda x: jax.device_get(x), pytree)
+    else:
+        return jax.tree.map(lambda x: x[0], pytree)
 
 
 def shard_batch(batch, n_devices):
@@ -570,7 +723,8 @@ def shard_batch(batch, n_devices):
 # Evaluation loop
 # ============================================================
 
-def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200, verbose=True):
+def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
+             verbose=True, use_mesh_mode=False, data_sharding_spec=None):
     """Run evaluation and return avg loss and accuracy.
 
     All hosts must call this (pmap requires it), but only verbose=True host prints.
@@ -586,16 +740,24 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200, verbo
         if batch_idx >= max_batches:
             break
 
-        # Ensure sharded for pmap
-        input_ids = shard_batch(input_ids, n_devices)
-        attention_mask = shard_batch(attention_mask, n_devices)
+        if use_mesh_mode and data_sharding_spec is not None:
+            input_ids = jax.device_put(input_ids, data_sharding_spec)
+            attention_mask = jax.device_put(attention_mask, data_sharding_spec)
+        else:
+            input_ids = shard_batch(input_ids, n_devices)
+            attention_mask = shard_batch(attention_mask, n_devices)
 
         ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
 
-        # Extract from first device (already aggregated via pmean/psum)
-        n_valid = int(valid_count[0])
-        total_loss += float(ce_loss[0]) * n_valid
-        total_correct += int(correct[0])
+        # Extract metrics
+        if use_mesh_mode:
+            n_valid = int(valid_count)
+            total_loss += float(ce_loss) * n_valid
+            total_correct += int(correct)
+        else:
+            n_valid = int(valid_count[0])
+            total_loss += float(ce_loss[0]) * n_valid
+            total_correct += int(correct[0])
         total_valid += n_valid
 
     eval_elapsed = time.time() - eval_start
@@ -1133,13 +1295,7 @@ def main():
             print(f"  Warning: Failed to save config.json: {e}")
 
     # ----------------------------------------------------------
-    # Replicate params/opt_state across local devices
-    # ----------------------------------------------------------
-    params = replicate(params, local_devices)
-    opt_state = replicate(opt_state, local_devices)
-
-    # ----------------------------------------------------------
-    # Create pmap-compiled step functions
+    # Determine parallelism mode: mesh (model+data) or pmap (data only)
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
@@ -1149,31 +1305,79 @@ def main():
                   or model_version.startswith('spatial-r1-v2')
                   or model_version.startswith('spatial-r1-v3'))
     pos_loss_weight = cfg['training'].get('pos_loss_weight', 0.0)
-    train_step_fn = create_train_step(
-        model, optimizer, orth_weight, div_weight, lb_weight,
-        rank, knowledge_rank, n_feature_qk, n_restore_qk,
-        n_devices=n_local_devices, is_baseline=is_baseline,
-        is_spatial=is_spatial, pos_loss_weight=pos_loss_weight)
-    eval_step_fn = create_eval_step(model, n_devices=n_local_devices)
+
+    mesh_model = cfg['training'].get('mesh_model', 1)
+    mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
+    use_mesh = mesh_model > 1
+
+    if use_mesh:
+        # Mesh-based: model parallel + data parallel
+        total_devices = jax.device_count()
+        if mesh_data == 0:
+            mesh_data = total_devices // mesh_model
+        mesh = create_mesh(mesh_data, mesh_model)
+        per_device_batch = batch_size // total_devices
+
+        if is_host0:
+            print(f"\n=== Mesh sharding: ({mesh_data}, {mesh_model}) = "
+                  f"{total_devices} devices ===")
+            print(f"  Per-device batch: {per_device_batch}")
+
+        # Shard params: neuron_pool on model axis, rest replicated
+        param_shardings = get_param_shardings(params, mesh)
+        params = shard_params_to_mesh(params, param_shardings)
+        opt_state = jax.device_put(opt_state,
+            jax.tree.map(lambda _: NamedSharding(mesh, P()), opt_state))
+
+        train_step_fn = create_mesh_train_step(
+            model, optimizer, div_weight, lb_weight,
+            mesh, param_shardings,
+            is_baseline=is_baseline, is_spatial=is_spatial,
+            pos_loss_weight=pos_loss_weight)
+        eval_step_fn = create_mesh_eval_step(model, mesh)
+
+        data_sharding = NamedSharding(mesh, P('data', None))
+    else:
+        # Legacy pmap: data parallel only
+        params = replicate(params, local_devices)
+        opt_state = replicate(opt_state, local_devices)
+
+        train_step_fn = create_train_step(
+            model, optimizer, orth_weight, div_weight, lb_weight,
+            rank, knowledge_rank, n_feature_qk, n_restore_qk,
+            n_devices=n_local_devices, is_baseline=is_baseline,
+            is_spatial=is_spatial, pos_loss_weight=pos_loss_weight)
+        eval_step_fn = create_eval_step(model, n_devices=n_local_devices)
+        data_sharding = None
 
     # ----------------------------------------------------------
-    # OOM check + JIT pre-compile: real train_step (forward + backward)
-    # All hosts must participate (pmap requires it)
+    # OOM check + JIT pre-compile
     # ----------------------------------------------------------
     if is_host0:
         print(f"\n=== OOM check: real train_step (forward+backward) "
               f"per_device_batch={per_device_batch}, seq_len={max_seq_len} ===", flush=True)
     try:
-        dummy_ids = jnp.zeros((n_local_devices, per_device_batch, max_seq_len), dtype=jnp.int32)
-        dummy_mask = jnp.ones((n_local_devices, per_device_batch, max_seq_len), dtype=jnp.int32)
-        rng, dummy_step_rng = jax.random.split(rng)
-        dummy_dropout_keys = jax.random.split(dummy_step_rng, n_local_devices)
+        if use_mesh:
+            dummy_ids = jax.device_put(
+                jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32), data_sharding)
+            dummy_mask = jax.device_put(
+                jnp.ones((batch_size, max_seq_len), dtype=jnp.int32), data_sharding)
+            rng, dummy_step_rng = jax.random.split(rng)
+            dummy_dropout_key = dummy_step_rng
+        else:
+            dummy_ids = jnp.zeros((n_local_devices, per_device_batch, max_seq_len), dtype=jnp.int32)
+            dummy_mask = jnp.ones((n_local_devices, per_device_batch, max_seq_len), dtype=jnp.int32)
+            rng, dummy_step_rng = jax.random.split(rng)
+            dummy_dropout_keys = jax.random.split(dummy_step_rng, n_local_devices)
 
         # First call: JIT compilation (slow)
         jit_start = time.time()
-        _dummy_params, _dummy_opt, dummy_metrics = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys,
-        )
+        if use_mesh:
+            _dp, _do, dummy_metrics = train_step_fn(
+                params, opt_state, dummy_ids, dummy_mask, dummy_dropout_key)
+        else:
+            _dp, _do, dummy_metrics = train_step_fn(
+                params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys)
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         if is_host0:
@@ -1181,15 +1385,19 @@ def main():
 
         # Second call: measure actual step time (post-JIT)
         rng, dummy_step_rng2 = jax.random.split(rng)
-        dummy_dropout_keys2 = jax.random.split(dummy_step_rng2, n_local_devices)
         step_start = time.time()
-        _dummy_params2, _dummy_opt2, dummy_metrics2 = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys2,
-        )
+        if use_mesh:
+            _dp2, _do2, dummy_metrics2 = train_step_fn(
+                params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2)
+        else:
+            dummy_dropout_keys2 = jax.random.split(dummy_step_rng2, n_local_devices)
+            _dp2, _do2, dummy_metrics2 = train_step_fn(
+                params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys2)
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
-            print(f"  train_step OK -- loss={float(dummy_metrics['total_loss'][0]):.4f}", flush=True)
+            m_loss = float(dummy_metrics['total_loss']) if use_mesh else float(dummy_metrics['total_loss'][0])
+            print(f"  train_step OK -- loss={m_loss:.4f}", flush=True)
             print(f"  Step time: {step_time*1000:.1f}ms/batch", flush=True)
 
             # Show memory usage after JIT compilation
@@ -1406,7 +1614,7 @@ def main():
         # Set up loggers (local append + periodic GCS sync)
         _setup_loggers(training_log_file, jsonl_log_file)
 
-        n_params = count_parameters(unreplicate(params))
+        n_params = count_parameters(to_single_device(params, use_mesh))
         log_message(f"DAWN v17.1-JAX Training Log (Multi-Host) - {timestamp}")
         log_message(f"Config: {config_path}")
         log_message(f"Parameters: {n_params:,}")
@@ -1439,8 +1647,8 @@ def main():
         if is_host0:
             print(f"\n!!! SIGTERM received — saving emergency checkpoint (step={global_step}) !!!", flush=True)
             try:
-                params_single = unreplicate(params)
-                opt_state_single = unreplicate(opt_state)
+                params_single = to_single_device(params, use_mesh)
+                opt_state_single = to_single_device(opt_state, use_mesh)
                 epath = _ckpt_path(f"emergency_step{global_step}.flax")
                 save_checkpoint(
                     epath, params_single, opt_state_single,
@@ -1497,27 +1705,33 @@ def main():
                     print("Preemption requested — exiting training loop.", flush=True)
                 break
 
-            # Ensure sharded for pmap (local devices only)
-            input_ids = shard_batch(input_ids, n_local_devices)
-            attention_mask = shard_batch(attention_mask, n_local_devices)
-
-            # Different dropout key per local device per step
+            # Shard data
             rng, step_rng = jax.random.split(rng)
-            dropout_keys = jax.random.split(step_rng, n_local_devices)
+            if use_mesh:
+                input_ids = jax.device_put(input_ids, data_sharding)
+                attention_mask = jax.device_put(attention_mask, data_sharding)
+                dropout_key = step_rng
+                params, opt_state, metrics = train_step_fn(
+                    params, opt_state,
+                    input_ids, attention_mask, dropout_key)
+            else:
+                input_ids = shard_batch(input_ids, n_local_devices)
+                attention_mask = shard_batch(attention_mask, n_local_devices)
+                dropout_keys = jax.random.split(step_rng, n_local_devices)
+                params, opt_state, metrics = train_step_fn(
+                    params, opt_state,
+                    input_ids, attention_mask, dropout_keys)
 
-            params, opt_state, metrics = train_step_fn(
-                params, opt_state,
-                input_ids, attention_mask, dropout_keys,
-            )
-
-            # Extract metrics (take first device, already aggregated via pmean/psum)
-            m_total = float(metrics['total_loss'][0])
-            m_ce = float(metrics['ce_loss'][0])
-            m_aux = float(metrics['aux_loss'][0])
-            m_orth = float(metrics['orth_loss'][0])
-            m_div = float(metrics['div_loss'][0])
-            m_correct = int(metrics['correct'][0])
-            m_valid = int(metrics['valid_count'][0])
+            # Extract metrics
+            def _m(v):
+                return float(v) if use_mesh else float(v[0])
+            m_total = _m(metrics['total_loss'])
+            m_ce = _m(metrics['ce_loss'])
+            m_aux = _m(metrics['aux_loss'])
+            m_orth = _m(metrics['orth_loss'])
+            m_div = _m(metrics['div_loss'])
+            m_correct = int(_m(metrics['correct']))
+            m_valid = int(_m(metrics['valid_count']))
 
             # NaN/INF detection
             if check_nan_inf({
@@ -1569,7 +1783,7 @@ def main():
                     eta = s_per_it * remaining_steps
 
                     # Grad norm
-                    m_grad = float(metrics['grad_norm'][0])
+                    m_grad = _m(metrics['grad_norm'])
 
                     msg = (
                         f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
@@ -1604,8 +1818,8 @@ def main():
                         pn_s = " ".join(pn_parts)
 
                         # Gate stats
-                        k_act = float(metrics['know_active'][0])
-                        k_gmax = float(metrics['know_gate_max'][0])
+                        k_act = _m(metrics['know_active'])
+                        k_gmax = _m(metrics['know_gate_max'])
                         n_know_cfg = cfg['model'].get('n_know', 27200)
                         gate_s = (f"gate: active={k_act:.0f}/{n_know_cfg}"
                                   f"({k_act/n_know_cfg*100:.0f}%) "
@@ -1667,8 +1881,10 @@ def main():
                 if is_host0:
                     log_message(f"\n  Mid-epoch validation at step {global_step}...")
                 val_loader.reset()
-                val_loss, val_acc = evaluate(eval_step_fn, params, val_loader,
-                                             n_local_devices, verbose=is_host0)
+                val_loss, val_acc = evaluate(
+                    eval_step_fn, params, val_loader, n_local_devices,
+                    verbose=is_host0, use_mesh_mode=use_mesh,
+                    data_sharding_spec=data_sharding if use_mesh else None)
                 if is_host0:
                     log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
                     log_jsonl({
@@ -1682,8 +1898,8 @@ def main():
 
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        params_single = unreplicate(params)
-                        opt_state_single = unreplicate(opt_state)
+                        params_single = to_single_device(params, use_mesh)
+                        opt_state_single = to_single_device(opt_state, use_mesh)
                         save_checkpoint(
                             _ckpt_path("best_model.flax"),
                             params_single, opt_state_single,
@@ -1698,8 +1914,8 @@ def main():
 
             # ---- Mid-epoch checkpoint (host 0 only) ----
             if global_step % ckpt_interval == 0 and global_step > 0 and is_host0:
-                params_single = unreplicate(params)
-                opt_state_single = unreplicate(opt_state)
+                params_single = to_single_device(params, use_mesh)
+                opt_state_single = to_single_device(opt_state, use_mesh)
                 save_checkpoint(
                     _ckpt_path(f"checkpoint_step{global_step}.flax"),
                     params_single, opt_state_single,
@@ -1732,8 +1948,10 @@ def main():
         if is_host0:
             log_message("  Running end-of-epoch validation...")
         val_loader.reset()
-        val_loss, val_acc = evaluate(eval_step_fn, params, val_loader,
-                                     n_local_devices, verbose=is_host0)
+        val_loss, val_acc = evaluate(
+            eval_step_fn, params, val_loader, n_local_devices,
+            verbose=is_host0, use_mesh_mode=use_mesh,
+            data_sharding_spec=data_sharding if use_mesh else None)
 
         is_best = val_loss < best_val_loss
         if is_best:
@@ -1754,8 +1972,8 @@ def main():
             })
 
             # Save epoch checkpoint (host 0 only)
-            params_single = unreplicate(params)
-            opt_state_single = unreplicate(opt_state)
+            params_single = to_single_device(params, use_mesh)
+            opt_state_single = to_single_device(opt_state, use_mesh)
 
             save_checkpoint(
                 _ckpt_path(f"checkpoint_epoch{epoch}.flax"),
