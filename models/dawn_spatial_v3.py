@@ -26,9 +26,10 @@ Architecture:
   NeuronPool        -- emb[N,d_bn] + w_read[N,D] + w_write[N,D]
   Router            -- proj + tau. Uses pool emb for routing.
   threshold_gate    -- element-wise threshold, no top_k
-  sense_read_write  -- @jax.checkpoint: (gate * (x@read.T)) @ write
-  _attn_forward     -- threshold gate -> sense_read_write QKV -> self-attn
-  _know_forward     -- threshold gate -> sense_read_write
+  _gate_and_read  -- @jax.checkpoint: score+gate+read → gated_read[B,S,N]
+  _write          -- @jax.checkpoint: gated_read @ write → [B,S,D]
+  _attn_forward   -- two-stage checkpoint QKV -> self-attn
+  _know_forward   -- two-stage checkpoint
   DAWN              -- embedding + jax.lax.scan + weight-tied lm_head
 """
 
@@ -102,22 +103,30 @@ def threshold_gate(scores, tau_offset):
 
 
 # ================================================================
-# 3. Sense-Read-Write
+# 3. Two-stage checkpointed sense-read-write
+#    Stage 1: gate + read → gated_read [B,S,N] (max 2 [B,S,N] alive)
+#    Stage 2: gated_read @ write → [B,S,D] (1 [B,S,N] alive)
 # ================================================================
 
 @jax.checkpoint
-def sense_read_write(x, gate, w_read, w_write):
-    """x[B,S,D], gate[B,S,N], w_read[N,D], w_write[N,D] -> out[B,S,D].
-
-    1. Read from x:  x @ w_read.T -> [B,S,N] (scalar per neuron)
-    2. Gate * read:   element-wise  -> [B,S,N] (gated read values)
-    3. Write:         gated @ w_write -> [B,S,D] (push in write direction)
-
-    Checkpointed: intermediate [B,S,N] recomputed in backward.
+def _gate_and_read(x, h, emb_norm, tau_offset, w_read):
+    """Score → gate → read → gated_read. One checkpoint boundary.
+    Returns gated_read [B,S,N] only (intermediates freed).
     """
-    x_read = x @ w_read.T           # [B, S, N]
-    gated_read = gate * x_read       # [B, S, N]
-    return gated_read @ w_write      # [B, S, D]
+    scores = h @ emb_norm.T                                          # [B,S,N]
+    gate = threshold_gate(scores, tau_offset)                         # [B,S,N]
+    x_read = x @ w_read.T                                            # [B,S,N]
+    gated_read = gate * x_read                                        # [B,S,N]
+    active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
+    gate_max_val = gate.max(axis=-1).mean()
+    # gate needed for aux loss — return it too (small relative to [B,S,N])
+    return gated_read, gate, active_count, gate_max_val
+
+
+@jax.checkpoint
+def _write(gated_read, w_write):
+    """gated_read @ write → [B,S,D]. Separate checkpoint."""
+    return gated_read @ w_write                                       # [B,S,D]
 
 
 # ================================================================
@@ -244,13 +253,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-    g_Q = threshold_gate(h_Q @ qk_norm.T, tau_all[:, :, 0:1])
-    g_K = threshold_gate(h_K @ qk_norm.T, tau_all[:, :, 1:2])
-    g_V = threshold_gate(h_V @ v_norm.T, tau_all[:, :, 2:3])
-
-    Q = sense_read_write(x, g_Q, qk_read, qk_write)
-    K = sense_read_write(x, g_K, qk_read, qk_write)
-    V = sense_read_write(x, g_V, v_read, v_write)
+    # Two-stage checkpoint for each of Q, K, V
+    gr_Q, g_Q, _, _ = _gate_and_read(x, h_Q, qk_norm, tau_all[:, :, 0:1], qk_read)
+    Q = _write(gr_Q, qk_write)
+    gr_K, g_K, _, _ = _gate_and_read(x, h_K, qk_norm, tau_all[:, :, 1:2], qk_read)
+    K = _write(gr_K, qk_write)
+    gr_V, g_V, _, _ = _gate_and_read(x, h_V, v_norm, tau_all[:, :, 2:3], v_read)
+    V = _write(gr_V, v_write)
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -292,21 +301,17 @@ def _know_forward(x, pool_params, router_params, rng,
     know_read = pool_params['know_read']
     know_write = pool_params['know_write']
 
-    know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
-
     rng, rng_drop = jax.random.split(rng)
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
 
-    scores_know = h @ know_norm.T
+    know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-    gate = threshold_gate(scores_know, tau)
 
-    # Gate stats (returned for logging, no debug.print)
-    active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
-    gate_max_val = gate.max(axis=-1).mean()
-
-    out = sense_read_write(x, gate, know_read, know_write)
+    # Two-stage checkpoint: gate+read then write
+    gated_read, gate, active_count, gate_max_val = _gate_and_read(
+        x, h, know_norm, tau, know_read)
+    out = _write(gated_read, know_write)
 
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
@@ -338,9 +343,12 @@ class AttentionCircuit(nn.Module):
         g_Q, g_K, g_V, aux = router.get_attention_gates(
             x, neuron_pool, deterministic, rng_r)
 
-        Q = sense_read_write(x, g_Q, neuron_pool.qk_read, neuron_pool.qk_write)
-        K = sense_read_write(x, g_K, neuron_pool.qk_read, neuron_pool.qk_write)
-        V = sense_read_write(x, g_V, neuron_pool.v_read, neuron_pool.v_write)
+        def _se(x, g, rd, wr):
+            return (g * (x @ rd.T)) @ wr
+
+        Q = _se(x, g_Q, neuron_pool.qk_read, neuron_pool.qk_write)
+        K = _se(x, g_K, neuron_pool.qk_read, neuron_pool.qk_write)
+        V = _se(x, g_V, neuron_pool.v_read, neuron_pool.v_write)
 
         B, S, D = x.shape
         d_head = D // self.n_heads
@@ -371,7 +379,7 @@ class KnowledgeCircuit(nn.Module):
         rng, rng_r = jax.random.split(rng)
         gate, aux = router.get_knowledge_gates(
             x, neuron_pool, deterministic, rng_r)
-        out = sense_read_write(x, gate, neuron_pool.know_read, neuron_pool.know_write)
+        out = (gate * (x @ neuron_pool.know_read.T)) @ neuron_pool.know_write
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
 
