@@ -26,9 +26,9 @@ Architecture:
   NeuronPool        -- emb[N,d_bn] + w_read[N,D] + w_write[N,D]
   Router            -- proj + tau. Uses pool emb for routing.
   threshold_gate    -- element-wise threshold, no top_k
-  _know_core/_attn_core -- checkpoint(dots_saveable): bf16 gate+read+write fused
-  _attn_forward   -- _attn_core per Q/K/V -> self-attn
-  _know_forward   -- _know_core
+  _srw_chunked    -- N-axis chunked gate+srw (dynamic_slice, bf16, 2-pass)
+  _attn_forward   -- _srw_chunked per Q/K/V -> self-attn
+  _know_forward   -- _srw_chunked
   DAWN              -- embedding + jax.lax.scan + weight-tied lm_head
 """
 
@@ -107,115 +107,119 @@ def threshold_gate(scores, tau_offset):
 
 
 # ================================================================
-# 3. Core compute: gate + sense_read_write in one checkpoint
-#    bf16 matmul, f32 threshold_gate, checkpoint policy avoids
-#    saving [B,S,N] intermediates
+# 3. Chunked sense-read-write (shared by know and attn)
+#    Uses dynamic_slice (not reshape) to preserve mesh sharding.
+#    2-pass: (1) stats→tau+gate_norm, (2) gate×srw→output
 # ================================================================
 
-def _know_core(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks=1):
-    """Gate + sense_read_write. bf16.
+def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
+    """Gate + sense_read_write with N-axis dynamic_slice chunking. bf16.
 
-    n_chunks=1: fused (for mesh_model>1 where N is already sharded)
-    n_chunks>1: N-axis chunked scan (for data-only parallel, mesh_model=1)
+    Works with mesh N-sharding (each chip sees local N) AND data-only parallel.
+    dynamic_slice preserves XLA sharding annotations (unlike reshape).
+
+    2-pass over N in chunks:
+      Pass 1: scores stats (sum, sq_sum) + gate stats (exp_sum, exp_max, active)
+      Pass 2: normalized gate × sense_read_write → output accumulation
     """
     B, S, D = x.shape
     N = emb_norm.shape[0]
-
-    if n_chunks <= 1:
-        # --- Fused path (mesh_model>1: N already sharded across chips) ---
-        scores = h.astype(jnp.bfloat16) @ emb_norm.astype(jnp.bfloat16).T
-        gate = threshold_gate(scores, tau_offset)
-        gate_bf = gate.astype(jnp.bfloat16)
-        x_bf = x.astype(jnp.bfloat16)
-        x_read = x_bf @ w_read.astype(jnp.bfloat16).T
-        out = (gate_bf * x_read) @ w_write.astype(jnp.bfloat16)
-        active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
-        gate_max_val = gate.max(axis=-1).mean()
-        return out.astype(jnp.float32), active_count, gate_max_val
-
-    # --- Chunked path (data-only parallel: N not sharded, chunk locally) ---
     cs = N // n_chunks
 
     h_bf = h.astype(jnp.bfloat16)
     x_bf = x.astype(jnp.bfloat16)
-    emb_c = emb_norm.astype(jnp.bfloat16).reshape(n_chunks, cs, -1)
-    read_c = w_read.astype(jnp.bfloat16).reshape(n_chunks, cs, -1)
-    write_c = w_write.astype(jnp.bfloat16).reshape(n_chunks, cs, -1)
+    emb_bf = emb_norm.astype(jnp.bfloat16)
+    read_bf = w_read.astype(jnp.bfloat16)
+    write_bf = w_write.astype(jnp.bfloat16)
 
     z1 = jnp.zeros((B, S, 1))
 
-    # Pass 0: scores stats → tau
-    def p0(carry, ec):
-        ss, sq = carry
+    # --- Pass 1: stats + gate normalization constants ---
+    def pass1(carry, i):
+        s_sum, sq_sum, exp_sum, exp_max, active = carry
+        s = i * cs
+        ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+
+        sc = h_bf @ ec.T                                              # [B,S,cs] bf16
+        sf = sc.astype(jnp.float32)
+        s_sum = s_sum + sf.sum(axis=-1, keepdims=True)
+        sq_sum = sq_sum + (sf ** 2).sum(axis=-1, keepdims=True)
+
+        # tau from running stats (approximate per-chunk, refined after loop)
+        s_mean_est = s_sum / ((i + 1) * cs)
+        s_std_est = jnp.sqrt(
+            sq_sum / ((i + 1) * cs) - s_mean_est ** 2) + 1e-8
+
+        # We need tau for gate, but tau depends on global stats.
+        # Workaround: accumulate raw gate stats and normalize in pass 2.
+        # For now, just accumulate exp_gate stats with a fixed tau estimate.
+
+        return (s_sum, sq_sum, exp_sum, exp_max, active), None
+
+    # Actually, do it cleanly: pass 1 = just scores stats, then compute tau.
+    # Then pass 1b = gate stats with final tau. Then pass 2 = srw.
+    # But 3 passes is slow. Better: merge gate stats + srw into pass 2.
+
+    # Pass 1: scores stats only (cheap, just h@emb.T for sum/sq_sum)
+    def stats_pass(carry, i):
+        s_sum, sq_sum = carry
+        s = i * cs
+        ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
         sc = h_bf @ ec.T
         sf = sc.astype(jnp.float32)
-        return (ss + sf.sum(axis=-1, keepdims=True),
-                sq + (sf ** 2).sum(axis=-1, keepdims=True)), None
+        return (s_sum + sf.sum(axis=-1, keepdims=True),
+                sq_sum + (sf ** 2).sum(axis=-1, keepdims=True)), None
 
-    (s_sum, sq_sum), _ = jax.lax.scan(p0, (z1, z1), emb_c)
+    (s_sum, sq_sum), _ = jax.lax.scan(
+        stats_pass, (z1, z1), jnp.arange(n_chunks))
+
     s_mean = s_sum / N
     s_std = jnp.sqrt(sq_sum / N - s_mean ** 2) + 1e-8
     tau = s_mean + tau_offset * s_std
     tau_bf = tau.astype(jnp.bfloat16)
 
-    # Pass 1: gate stats
-    def p1(carry, ec):
-        es, em, ac = carry
-        sc = h_bf @ ec.T
+    # --- Pass 2: gate stats + srw (merged) ---
+    def gate_srw_pass(carry, i):
+        out, exp_sum, exp_max, active = carry
+        s = i * cs
+        ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+        rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
+        wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
+
+        sc = h_bf @ ec.T                                              # [B,S,cs]
         raw = sc - tau_bf
         gc = jnp.where(raw > 0, raw,
-                        (1e-4 * jax.nn.softplus(raw.astype(jnp.float32))
-                         ).astype(jnp.bfloat16))
+                        (1e-4 * jax.nn.softplus(
+                            raw.astype(jnp.float32))).astype(jnp.bfloat16))
         gc = jnp.clip(gc, 0.0, 10.0)
         eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
+
+        # Accumulate gate normalization stats
         ef = eg.astype(jnp.float32)
-        return (es + ef.sum(axis=-1, keepdims=True),
-                jnp.maximum(em, ef.max(axis=-1, keepdims=True)),
-                ac + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)), None
+        exp_sum = exp_sum + ef.sum(axis=-1, keepdims=True)
+        exp_max = jnp.maximum(exp_max, ef.max(axis=-1, keepdims=True))
+        active = active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
 
-    (t_es, t_em, t_ac), _ = jax.lax.scan(
-        p1, (z1, jnp.full((B, S, 1), -1e9), z1), emb_c)
-    gs = jnp.tanh(t_em).astype(jnp.bfloat16)
-    inv_es = (1.0 / (t_es + 1e-4)).astype(jnp.bfloat16)
+        # srw with unnormalized gate (normalize output after loop)
+        xr = x_bf @ rc.T                                              # [B,S,cs]
+        partial = (eg * xr) @ wc                                       # [B,S,D]
+        return (out + partial, exp_sum, exp_max, active), None
 
-    # Pass 2: normalized gate × srw
-    def p2(acc, data):
-        ec, rc, wc = data
-        sc = h_bf @ ec.T
-        raw = sc - tau_bf
-        gc = jnp.where(raw > 0, raw,
-                        (1e-4 * jax.nn.softplus(raw.astype(jnp.float32))
-                         ).astype(jnp.bfloat16))
-        gc = jnp.clip(gc, 0.0, 10.0)
-        eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
-        ng = eg * inv_es * gs
-        xr = x_bf @ rc.T
-        return acc + (ng * xr) @ wc, None
+    (raw_out, total_exp_sum, total_exp_max, total_active), _ = jax.lax.scan(
+        gate_srw_pass,
+        (jnp.zeros((B, S, D), dtype=jnp.bfloat16),
+         z1, jnp.full((B, S, 1), -1e9), z1),
+        jnp.arange(n_chunks))
 
-    out, _ = jax.lax.scan(
-        p2, jnp.zeros((B, S, D), dtype=jnp.bfloat16),
-        (emb_c, read_c, write_c))
+    # Normalize output (gate was unnormalized in pass 2)
+    inv_es = (1.0 / (total_exp_sum + 1e-4)).astype(jnp.bfloat16)
+    gate_strength = jnp.tanh(total_exp_max).astype(jnp.bfloat16)
+    out = raw_out * inv_es * gate_strength
 
-    active_count = (t_ac / N).mean()
-    gate_max_val = t_em.mean()
+    active_count = (total_active / N).mean()
+    gate_max_val = total_exp_max.mean()
+
     return out.astype(jnp.float32), active_count, gate_max_val
-
-
-@partial(jax.checkpoint,
-         policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
-def _attn_core(x, h, emb_norm, tau_offset, w_read, w_write):
-    """Same as _know_core but for one Q/K/V head."""
-    scores = h.astype(jnp.bfloat16) @ emb_norm.astype(jnp.bfloat16).T
-    gate = threshold_gate(scores.astype(jnp.float32), tau_offset)
-
-    gate_bf = gate.astype(jnp.bfloat16)
-    x_bf = x.astype(jnp.bfloat16)
-    x_read = x_bf @ w_read.astype(jnp.bfloat16).T
-    gated_read = gate_bf * x_read
-    out = gated_read @ w_write.astype(jnp.bfloat16)
-
-    return out.astype(jnp.float32), gate
-    return gated_read @ w_write                                       # [B,S,D]
 
 
 # ================================================================
@@ -323,7 +327,8 @@ class Router(nn.Module):
 def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
                   max_k_qk, max_k_v, n_heads, d_model,
-                  router_dropout, dropout_rate, deterministic):
+                  router_dropout, dropout_rate, deterministic,
+                  n_chunks_qk=1, n_chunks_v=1):
     B, S, D = x.shape
     qk_emb = pool_params['qk_emb']
     qk_read = pool_params['qk_read']
@@ -342,10 +347,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-    # Core compute for Q, K, V (bf16 matmul, f32 gate)
-    Q, g_Q = _attn_core(x, h_Q, qk_norm, tau_all[:, :, 0:1], qk_read, qk_write)
-    K, g_K = _attn_core(x, h_K, qk_norm, tau_all[:, :, 1:2], qk_read, qk_write)
-    V, g_V = _attn_core(x, h_V, v_norm, tau_all[:, :, 2:3], v_read, v_write)
+    # Chunked sense-read-write for Q, K, V
+    Q, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                            qk_read, qk_write, n_chunks_qk)
+    K, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                            qk_read, qk_write, n_chunks_qk)
+    V, _, _ = _srw_chunked(x, h_V, v_norm, tau_all[:, :, 2:3],
+                            v_read, v_write, n_chunks_v)
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -396,7 +404,7 @@ def _know_forward(x, pool_params, router_params, rng,
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
 
     # N-axis chunked core: 3-pass (stats, gate_stats, srw)
-    out, active_count, gate_max_val = _know_core(
+    out, active_count, gate_max_val = _srw_chunked(
         x, h, know_norm, tau, know_read, know_write, n_chunks_know)
 
     rng, rng_out = jax.random.split(rng)
@@ -519,7 +527,9 @@ class DAWN(nn.Module):
     max_k_v: int = 260
     max_k_know: int = 1810
     router_dropout: float = 0.1
-    n_chunks_know: int = 1    # 1=fused (mesh_model>1), >1=chunked (data-only)
+    n_chunks_know: int = 1    # N-axis chunking for know pool
+    n_chunks_qk: int = 1     # N-axis chunking for qk pool
+    n_chunks_v: int = 1      # N-axis chunking for v pool
 
     def setup(self):
         if self.d_model % self.n_heads != 0:
@@ -590,7 +600,8 @@ class DAWN(nn.Module):
                     self.n_qk, self.n_v,
                     self.max_k_qk, self.max_k_v,
                     self.n_heads, self.d_model,
-                    self.router_dropout, self.dropout_rate, deterministic)
+                    self.router_dropout, self.dropout_rate, deterministic,
+                    self.n_chunks_qk, self.n_chunks_v)
                 x = x + attn_out
 
                 normed = _layer_norm(
