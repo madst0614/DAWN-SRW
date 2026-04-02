@@ -1303,8 +1303,12 @@ def main():
             params, opt_state, dummy_ids, dummy_mask, dummy_step_rng)
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
+        jit_loss = float(dummy_metrics['total_loss'])
         if is_host0:
             print(f"  JIT compile: {jit_time:.1f}s", flush=True)
+
+        # Free first step outputs before second call
+        del _dp, _do, dummy_metrics
 
         # Second call: measure actual step time (post-JIT)
         rng, dummy_step_rng2 = jax.random.split(rng)
@@ -1314,7 +1318,7 @@ def main():
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
-            print(f"  train_step OK -- loss={float(dummy_metrics['total_loss']):.4f}", flush=True)
+            print(f"  train_step OK -- loss={jit_loss:.4f}", flush=True)
             print(f"  Step time: {step_time*1000:.1f}ms/batch", flush=True)
 
             # Show memory usage after JIT compilation
@@ -1667,7 +1671,7 @@ def main():
             est_hours = est_seconds / 3600
             print(f"  Estimated time: {est_hours:.1f}h ({remaining_steps:,} steps @ {step_time*1000:.1f}ms)", flush=True)
 
-        del _dp, _do, dummy_metrics, dummy_ids, dummy_mask
+        del dummy_ids, dummy_mask
         del _dp2, _do2, dummy_metrics2
         if is_host0:
             print("=== OOM check passed (JIT compiled) ===\n", flush=True)
