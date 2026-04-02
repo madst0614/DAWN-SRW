@@ -575,25 +575,35 @@ def shard_params_to_mesh(params, param_shardings):
 
 
 def shard_to_mesh(data, sharding, global_shape):
-    """Multi-host: place each host's local data on its local devices.
+    """Multi-host: create global array from host-local data.
 
-    data: [per_host_batch, seq_len] flat, or [n_local, per_device, seq_len] pre-split.
+    Uses make_array_from_callback which correctly maps mesh indices
+    to data slices, regardless of how devices map to hosts.
+
+    data: [per_host_batch, ...] — this host's data portion
+    sharding: NamedSharding
+    global_shape: (global_batch, ...)
     """
-    local_devs = sharding.mesh.local_devices
-    n_local = len(local_devs)
+    n_hosts = jax.process_count()
+    host_id = jax.process_index()
+    per_host = data.shape[0]
 
-    # If already pre-split (n_local, per_device, seq_len), use directly
-    if data.ndim == 3 and data.shape[0] == n_local:
-        local_arrays = [jax.device_put(data[i], d) for i, d in enumerate(local_devs)]
-    else:
-        # Flat (per_host_batch, seq_len) → split across local devices
-        per_device = data.shape[0] // n_local
-        local_arrays = [
-            jax.device_put(data[i * per_device:(i + 1) * per_device], d)
-            for i, d in enumerate(local_devs)
-        ]
-    return jax.make_array_from_single_device_arrays(
-        global_shape, sharding, local_arrays)
+    def data_callback(index):
+        # index is a tuple of slices for each dimension
+        # The batch slice tells us which global rows this device needs
+        batch_slice = index[0]
+        start = batch_slice.start or 0
+        stop = batch_slice.stop or global_shape[0]
+        # Map global indices to this host's local data
+        local_start = start - host_id * per_host
+        local_stop = stop - host_id * per_host
+        # If this slice belongs to our host, return it; else zeros (shouldn't happen)
+        if 0 <= local_start < per_host:
+            return np.array(data[local_start:local_stop])
+        else:
+            return np.zeros((stop - start,) + data.shape[1:], dtype=data.dtype)
+
+    return jax.make_array_from_callback(global_shape, sharding, data_callback)
 
 
 # ============================================================
