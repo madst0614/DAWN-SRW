@@ -947,6 +947,12 @@ def main():
     n_local_devices = jax.local_device_count()
     local_devices = jax.local_devices()
 
+    # ALL hosts print device info (for multi-host debugging)
+    print(f"[Host {host_id}/{n_hosts}] "
+          f"local_devices={n_local_devices} total_devices={jax.device_count()} "
+          f"backend={jax.default_backend()} "
+          f"devices={[str(d) for d in local_devices]}", flush=True)
+
     per_host_batch = batch_size // n_hosts
     per_device_batch = per_host_batch // n_local_devices
 
