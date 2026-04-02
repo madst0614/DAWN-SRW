@@ -1024,7 +1024,7 @@ def main():
 
     if is_host0:
         print(f"\n{'='*60}")
-        print(f"DAWN v17.1-JAX Training (Multi-Host Multi-Device)")
+        print(f"DAWN Training (Multi-Host Multi-Device) — {model_version}")
         print(f"{'='*60}")
         print(f"JAX version: {jax.__version__}")
         print(f"Hosts: {n_hosts}, Host ID: {host_id}")
@@ -1516,7 +1516,7 @@ def main():
         _setup_loggers(training_log_file, jsonl_log_file)
 
         n_params = count_parameters(jax.device_get(params))
-        log_message(f"DAWN v17.1-JAX Training Log (Multi-Host) - {timestamp}")
+        log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
         log_message(f"Config: {config_path}")
         log_message(f"Parameters: {n_params:,}")
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
