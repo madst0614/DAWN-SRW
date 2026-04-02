@@ -113,14 +113,14 @@ def threshold_gate(scores, tau_offset):
 # ================================================================
 
 def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
-    """Gate + sense_read_write with N-axis dynamic_slice chunking. bf16.
+    """Gate + sense_read_write with N-axis chunking. bf16.
 
-    Works with mesh N-sharding (each chip sees local N) AND data-only parallel.
-    dynamic_slice preserves XLA sharding annotations (unlike reshape).
+    Uses fori_loop (not scan) to prevent XLA unrolling.
+    XLA compiles fori_loop as while-loop → 1 chunk in memory at a time.
 
-    2-pass over N in chunks:
-      Pass 1: scores stats (sum, sq_sum) + gate stats (exp_sum, exp_max, active)
-      Pass 2: normalized gate × sense_read_write → output accumulation
+    2-pass:
+      Pass 1 (fori_loop): scores stats → tau
+      Pass 2 (fori_loop): gate + srw + exp_sum/max accumulation
     """
     B, S, D = x.shape
     N = emb_norm.shape[0]
@@ -134,59 +134,32 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
 
     z1 = jnp.zeros((B, S, 1))
 
-    # --- Pass 1: stats + gate normalization constants ---
-    def pass1(carry, i):
-        s_sum, sq_sum, exp_sum, exp_max, active = carry
-        s = i * cs
-        ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-
-        sc = h_bf @ ec.T                                              # [B,S,cs] bf16
-        sf = sc.astype(jnp.float32)
-        s_sum = s_sum + sf.sum(axis=-1, keepdims=True)
-        sq_sum = sq_sum + (sf ** 2).sum(axis=-1, keepdims=True)
-
-        # tau from running stats (approximate per-chunk, refined after loop)
-        s_mean_est = s_sum / ((i + 1) * cs)
-        s_std_est = jnp.sqrt(
-            sq_sum / ((i + 1) * cs) - s_mean_est ** 2) + 1e-8
-
-        # We need tau for gate, but tau depends on global stats.
-        # Workaround: accumulate raw gate stats and normalize in pass 2.
-        # For now, just accumulate exp_gate stats with a fixed tau estimate.
-
-        return (s_sum, sq_sum, exp_sum, exp_max, active), None
-
-    # Actually, do it cleanly: pass 1 = just scores stats, then compute tau.
-    # Then pass 1b = gate stats with final tau. Then pass 2 = srw.
-    # But 3 passes is slow. Better: merge gate stats + srw into pass 2.
-
-    # Pass 1: scores stats only (cheap, just h@emb.T for sum/sq_sum)
-    def stats_pass(carry, i):
+    # --- Pass 1: scores stats → tau (fori_loop) ---
+    def stats_body(i, carry):
         s_sum, sq_sum = carry
         s = i * cs
         ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
         sc = h_bf @ ec.T
         sf = sc.astype(jnp.float32)
         return (s_sum + sf.sum(axis=-1, keepdims=True),
-                sq_sum + (sf ** 2).sum(axis=-1, keepdims=True)), None
+                sq_sum + (sf ** 2).sum(axis=-1, keepdims=True))
 
-    (s_sum, sq_sum), _ = jax.lax.scan(
-        stats_pass, (z1, z1), jnp.arange(n_chunks))
+    s_sum, sq_sum = jax.lax.fori_loop(0, n_chunks, stats_body, (z1, z1))
 
     s_mean = s_sum / N
     s_std = jnp.sqrt(sq_sum / N - s_mean ** 2) + 1e-8
     tau = s_mean + tau_offset * s_std
     tau_bf = tau.astype(jnp.bfloat16)
 
-    # --- Pass 2: gate stats + srw (merged) ---
-    def gate_srw_pass(carry, i):
+    # --- Pass 2: gate + srw + stats (fori_loop) ---
+    def gate_srw_body(i, carry):
         out, exp_sum, exp_max, active = carry
         s = i * cs
         ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
         rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
         wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
 
-        sc = h_bf @ ec.T                                              # [B,S,cs]
+        sc = h_bf @ ec.T
         raw = sc - tau_bf
         gc = jnp.where(raw > 0, raw,
                         (1e-4 * jax.nn.softplus(
@@ -194,22 +167,19 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
         gc = jnp.clip(gc, 0.0, 10.0)
         eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
 
-        # Accumulate gate normalization stats
         ef = eg.astype(jnp.float32)
         exp_sum = exp_sum + ef.sum(axis=-1, keepdims=True)
         exp_max = jnp.maximum(exp_max, ef.max(axis=-1, keepdims=True))
         active = active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
 
-        # srw with unnormalized gate (normalize output after loop)
-        xr = x_bf @ rc.T                                              # [B,S,cs]
-        partial = (eg * xr) @ wc                                       # [B,S,D]
-        return (out + partial, exp_sum, exp_max, active), None
+        xr = x_bf @ rc.T
+        partial = (eg * xr) @ wc
+        return (out + partial, exp_sum, exp_max, active)
 
-    (raw_out, total_exp_sum, total_exp_max, total_active), _ = jax.lax.scan(
-        gate_srw_pass,
+    raw_out, total_exp_sum, total_exp_max, total_active = jax.lax.fori_loop(
+        0, n_chunks, gate_srw_body,
         (jnp.zeros((B, S, D), dtype=jnp.bfloat16),
-         z1, jnp.full((B, S, 1), -1e9), z1),
-        jnp.arange(n_chunks))
+         z1, jnp.full((B, S, 1), -1e9), z1))
 
     # Normalize output (gate was unnormalized in pass 2)
     inv_es = (1.0 / (total_exp_sum + 1e-4)).astype(jnp.bfloat16)
