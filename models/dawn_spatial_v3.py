@@ -154,10 +154,10 @@ def make_sharded_srw(mesh, max_chunk_size=4096):
             s_sum, sq_sum = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-            sc = h_bf @ ec.T
-            sf = sc.astype(jnp.float32)
-            return (s_sum + sf.sum(axis=-1, keepdims=True),
-                    sq_sum + (sf ** 2).sum(axis=-1, keepdims=True)), None
+            sc = h_bf @ ec.T  # bf16 [B,S,cs]
+            # Reduce in bf16, accumulate in f32 — no [B,S,cs] f32 copy
+            return (s_sum + sc.sum(axis=-1, keepdims=True).astype(jnp.float32),
+                    sq_sum + (sc ** 2).sum(axis=-1, keepdims=True).astype(jnp.float32)), None
 
         (local_sum, local_sq), _ = jax.lax.scan(
             stats_step, (z1, z1), jnp.arange(nc))
@@ -202,7 +202,8 @@ def make_sharded_srw(mesh, max_chunk_size=4096):
         global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-4
         gate_strength = jax.lax.stop_gradient(jnp.tanh(total_em))
         out = raw_out / global_exp_sum * gate_strength
-        out = jax.lax.psum(out, 'model')
+        # bf16 before psum: 640MB → 320MB per all-reduce
+        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         active = jax.lax.psum(total_ac, 'model')
         return out.astype(jnp.float32), active / N_total, total_em
@@ -233,10 +234,9 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
         ss, sq = carry
         s = i * cs
         ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-        sc = h_bf @ ec.T
-        sf = sc.astype(jnp.float32)
-        return (ss + sf.sum(axis=-1, keepdims=True),
-                sq + (sf**2).sum(axis=-1, keepdims=True)), None
+        sc = h_bf @ ec.T  # bf16
+        return (ss + sc.sum(axis=-1, keepdims=True).astype(jnp.float32),
+                sq + (sc**2).sum(axis=-1, keepdims=True).astype(jnp.float32)), None
 
     (s_sum, sq_sum), _ = jax.lax.scan(stats_step, (z1, z1), jnp.arange(n_chunks))
     s_mean = s_sum / N
