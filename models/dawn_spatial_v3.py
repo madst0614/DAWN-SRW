@@ -115,12 +115,10 @@ def threshold_gate(scores, tau_offset):
 def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
     """Gate + sense_read_write with N-axis chunking. bf16.
 
-    Uses fori_loop (not scan) to prevent XLA unrolling.
-    XLA compiles fori_loop as while-loop → 1 chunk in memory at a time.
-
-    2-pass:
-      Pass 1 (fori_loop): scores stats → tau
-      Pass 2 (fori_loop): gate + srw + exp_sum/max accumulation
+    fori_loop + jax.checkpoint per chunk:
+      fori_loop → XLA while-loop (no unrolling)
+      checkpoint → backward recomputes each chunk (no intermediate storage)
+      Memory: 1 chunk at a time.
     """
     B, S, D = x.shape
     N = emb_norm.shape[0]
@@ -134,15 +132,19 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
 
     z1 = jnp.zeros((B, S, 1))
 
-    # --- Pass 1: scores stats → tau (fori_loop) ---
+    # --- Pass 1: scores stats → tau ---
     def stats_body(i, carry):
+        @jax.checkpoint
+        def _stats(i_val):
+            s = i_val * cs
+            ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+            sc = h_bf @ ec.T
+            sf = sc.astype(jnp.float32)
+            return (sf.sum(axis=-1, keepdims=True),
+                    (sf ** 2).sum(axis=-1, keepdims=True))
+        chunk_sum, chunk_sq = _stats(i)
         s_sum, sq_sum = carry
-        s = i * cs
-        ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-        sc = h_bf @ ec.T
-        sf = sc.astype(jnp.float32)
-        return (s_sum + sf.sum(axis=-1, keepdims=True),
-                sq_sum + (sf ** 2).sum(axis=-1, keepdims=True))
+        return (s_sum + chunk_sum, sq_sum + chunk_sq)
 
     s_sum, sq_sum = jax.lax.fori_loop(0, n_chunks, stats_body, (z1, z1))
 
@@ -151,30 +153,38 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
     tau = s_mean + tau_offset * s_std
     tau_bf = tau.astype(jnp.bfloat16)
 
-    # --- Pass 2: gate + srw + stats (fori_loop) ---
+    # --- Pass 2: gate + srw + stats ---
     def gate_srw_body(i, carry):
+        @jax.checkpoint
+        def _gate_srw(i_val):
+            s = i_val * cs
+            ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+            rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
+            wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
+
+            sc = h_bf @ ec.T
+            raw = sc - tau_bf
+            gc = jnp.where(raw > 0, raw,
+                            (1e-4 * jax.nn.softplus(
+                                raw.astype(jnp.float32))).astype(jnp.bfloat16))
+            gc = jnp.clip(gc, 0.0, 10.0)
+            eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
+
+            ef = eg.astype(jnp.float32)
+            c_exp_sum = ef.sum(axis=-1, keepdims=True)
+            c_exp_max = ef.max(axis=-1, keepdims=True)
+            c_active = (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
+
+            xr = x_bf @ rc.T
+            c_out = (eg * xr) @ wc
+            return c_out, c_exp_sum, c_exp_max, c_active
+
+        chunk_out, chunk_es, chunk_em, chunk_ac = _gate_srw(i)
         out, exp_sum, exp_max, active = carry
-        s = i * cs
-        ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-        rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
-        wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-
-        sc = h_bf @ ec.T
-        raw = sc - tau_bf
-        gc = jnp.where(raw > 0, raw,
-                        (1e-4 * jax.nn.softplus(
-                            raw.astype(jnp.float32))).astype(jnp.bfloat16))
-        gc = jnp.clip(gc, 0.0, 10.0)
-        eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
-
-        ef = eg.astype(jnp.float32)
-        exp_sum = exp_sum + ef.sum(axis=-1, keepdims=True)
-        exp_max = jnp.maximum(exp_max, ef.max(axis=-1, keepdims=True))
-        active = active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
-
-        xr = x_bf @ rc.T
-        partial = (eg * xr) @ wc
-        return (out + partial, exp_sum, exp_max, active)
+        return (out + chunk_out,
+                exp_sum + chunk_es,
+                jnp.maximum(exp_max, chunk_em),
+                active + chunk_ac)
 
     raw_out, total_exp_sum, total_exp_max, total_active = jax.lax.fori_loop(
         0, n_chunks, gate_srw_body,
