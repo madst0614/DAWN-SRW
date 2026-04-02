@@ -1362,13 +1362,39 @@ def main():
 
                 N_RUNS = 5
 
+                def _hbm_gb():
+                    """Current HBM usage in GB (device 0)."""
+                    try:
+                        mem = jax.local_devices()[0].memory_stats()
+                        if mem:
+                            return mem.get('bytes_in_use', 0) / 1e9
+                    except Exception:
+                        pass
+                    return 0.0
+
+                def _peak_hbm_gb():
+                    """Peak HBM usage in GB (device 0)."""
+                    try:
+                        mem = jax.local_devices()[0].memory_stats()
+                        if mem:
+                            return mem.get('peak_bytes_in_use', 0) / 1e9
+                    except Exception:
+                        pass
+                    return 0.0
+
                 def _t(fn, n=N_RUNS):
-                    """Time a function: 1 warmup + n timed runs."""
+                    """Time a function + measure HBM delta.
+                    Returns (ms, delta_gb, peak_gb)."""
                     r = fn(); jax.block_until_ready(jax.tree.leaves(r))
+                    del r
+                    hbm_before = _hbm_gb()
                     t0 = time.time()
                     for _ in range(n):
                         r = fn(); jax.block_until_ready(jax.tree.leaves(r))
-                    return (time.time() - t0) / n * 1000
+                    elapsed = (time.time() - t0) / n * 1000
+                    hbm_after = _hbm_gb()
+                    peak = _peak_hbm_gb()
+                    return (elapsed, hbm_after - hbm_before, peak)
 
                 # --- Jit-compiled component functions for profiling ---
 
@@ -1507,96 +1533,119 @@ def main():
                         pool_p['know_read'], pool_p['know_write'])
                 jax.block_until_ready(_kout)
 
-                # --- Timed measurements ---
-                items = []
-                items.append(("LayerNorm", _t(
-                    lambda: prof_layernorm(
-                        dummy_x, block_p['norm1']['scale'],
-                        block_p['norm1']['bias']))))
+                # --- Timed + memory measurements ---
+                # Each _t() returns (ms, delta_hbm_gb, peak_hbm_gb)
+                hbm_baseline = _hbm_gb()
+                items = []  # [(name, ms, delta_gb, peak_gb)]
 
-                items.append(("A router(proj+tau)", _t(
-                    lambda: prof_attn_router(normed, router_p))))
+                ms, dg, pk = _t(lambda: prof_layernorm(
+                    dummy_x, block_p['norm1']['scale'],
+                    block_p['norm1']['bias']))
+                items.append(("LayerNorm", ms, dg, pk))
+
+                ms, dg, pk = _t(lambda: prof_attn_router(normed, router_p))
+                items.append(("A router(proj+tau)", ms, dg, pk))
 
                 if _is_sharded:
-                    items.append(("A QK fused shard", _t(
-                        lambda: prof_qk_fused(
-                            normed, h_Q, h_K, qk_norm, tau_all,
-                            pool_p['qk_read'], pool_p['qk_write']))))
-                    items.append(("A V shard", _t(
-                        lambda: prof_v_sharded(
-                            normed, h_V, v_norm, tau_all[:, :, 2:3],
-                            pool_p['v_read'], pool_p['v_write']))))
+                    ms, dg, pk = _t(lambda: prof_qk_fused(
+                        normed, h_Q, h_K, qk_norm, tau_all,
+                        pool_p['qk_read'], pool_p['qk_write']))
+                    items.append(("A QK fused shard", ms, dg, pk))
+                    ms, dg, pk = _t(lambda: prof_v_sharded(
+                        normed, h_V, v_norm, tau_all[:, :, 2:3],
+                        pool_p['v_read'], pool_p['v_write']))
+                    items.append(("A V shard", ms, dg, pk))
                 else:
-                    items.append(("A QK chunked(x2)", _t(
-                        lambda: prof_qk_chunked(
-                            normed, h_Q, h_K, qk_norm, tau_all,
-                            pool_p['qk_read'], pool_p['qk_write']))))
-                    items.append(("A V chunked", _t(
-                        lambda: prof_v_chunked(
-                            normed, h_V, v_norm, tau_all[:, :, 2:3],
-                            pool_p['v_read'], pool_p['v_write']))))
+                    ms, dg, pk = _t(lambda: prof_qk_chunked(
+                        normed, h_Q, h_K, qk_norm, tau_all,
+                        pool_p['qk_read'], pool_p['qk_write']))
+                    items.append(("A QK chunked(x2)", ms, dg, pk))
+                    ms, dg, pk = _t(lambda: prof_v_chunked(
+                        normed, h_V, v_norm, tau_all[:, :, 2:3],
+                        pool_p['v_read'], pool_p['v_write']))
+                    items.append(("A V chunked", ms, dg, pk))
 
                 Ok = block_p['attn']['expand_O']['kernel']
-                items.append(("A self-attn(QKV)", _t(
-                    lambda: prof_self_attn(Q, K, V, Ok))))
+                ms, dg, pk = _t(lambda: prof_self_attn(Q, K, V, Ok))
+                items.append(("A self-attn(QKV)", ms, dg, pk))
 
-                items.append(("LayerNorm (know)", _t(
-                    lambda: prof_layernorm(
-                        dummy_x, block_p['norm2']['scale'],
-                        block_p['norm2']['bias']))))
+                ms, dg, pk = _t(lambda: prof_layernorm(
+                    dummy_x, block_p['norm2']['scale'],
+                    block_p['norm2']['bias']))
+                items.append(("LayerNorm (know)", ms, dg, pk))
 
-                items.append(("K router(proj+tau)", _t(
-                    lambda: prof_know_router(normed, router_p))))
+                ms, dg, pk = _t(lambda: prof_know_router(normed, router_p))
+                items.append(("K router(proj+tau)", ms, dg, pk))
 
                 if _is_sharded:
-                    items.append(("K know shard", _t(
-                        lambda: prof_know_sharded(
-                            normed, h_know, know_norm, tau_know,
-                            pool_p['know_read'], pool_p['know_write']))))
+                    ms, dg, pk = _t(lambda: prof_know_sharded(
+                        normed, h_know, know_norm, tau_know,
+                        pool_p['know_read'], pool_p['know_write']))
+                    items.append(("K know shard", ms, dg, pk))
                 else:
-                    items.append(("K know chunked", _t(
-                        lambda: prof_know_chunked(
-                            normed, h_know, know_norm, tau_know,
-                            pool_p['know_read'], pool_p['know_write']))))
+                    ms, dg, pk = _t(lambda: prof_know_chunked(
+                        normed, h_know, know_norm, tau_know,
+                        pool_p['know_read'], pool_p['know_write']))
+                    items.append(("K know chunked", ms, dg, pk))
 
-                # --- Print breakdown ---
-                total_ms = sum(v for _, v in items)
+                # --- Print breakdown (time + memory) ---
+                total_ms = sum(ms for _, ms, _, _ in items)
+                max_peak = max(pk for _, _, _, pk in items)
                 n_layers = cfg['model']['n_layers']
-                print(f"\n  === Op breakdown (1 layer fwd, {total_ms:.0f} ms) ===",
+
+                try:
+                    mem = jax.local_devices()[0].memory_stats()
+                    hbm_limit = mem.get('bytes_limit', 0) / 1e9 if mem else 0
+                except Exception:
+                    hbm_limit = 0
+
+                print(f"\n  === Op breakdown (1 layer fwd, {total_ms:.0f} ms, "
+                      f"peak={max_peak:.2f}G) ===", flush=True)
+                print(f"    {'Op':22s} {'Time':>8s} {'%':>5s}  "
+                      f"{'HBM Δ':>7s}  {'Peak':>7s}  {''}",
                       flush=True)
-                for name, ms in items:
-                    pct = ms / total_ms * 100 if total_ms > 0 else 0
+                print(f"    {'-'*22} {'-'*8} {'-'*5}  {'-'*7}  {'-'*7}  {'-'*20}",
+                      flush=True)
+                for name, ms_val, dg_val, pk_val in items:
+                    pct = ms_val / total_ms * 100 if total_ms > 0 else 0
                     bar = '#' * int(pct / 2)
-                    print(f"    {name:22s} {ms:7.1f} ms  {pct:4.0f}%  {bar}",
+                    dg_str = f"{dg_val:+.3f}G" if abs(dg_val) > 0.001 else "     -"
+                    print(f"    {name:22s} {ms_val:7.1f}ms {pct:4.0f}%  "
+                          f"{dg_str:>7s}  {pk_val:5.2f}G  {bar}",
                           flush=True)
 
                 # Group summaries
-                attn_ms = sum(v for n, v in items if n.startswith('A '))
-                know_ms = sum(v for n, v in items if n.startswith('K '))
-                norm_ms = sum(v for n, v in items if n.startswith('LayerNorm'))
-                print(f"    {'---':22s} {'---':>7s}", flush=True)
-                print(f"    {'Attention total':22s} {attn_ms:7.1f} ms  "
+                attn_ms = sum(ms for n, ms, _, _ in items if n.startswith('A '))
+                know_ms = sum(ms for n, ms, _, _ in items if n.startswith('K '))
+                norm_ms = sum(ms for n, ms, _, _ in items if n.startswith('LayerNorm'))
+                print(f"    {'-'*22} {'-'*8}", flush=True)
+                print(f"    {'Attention total':22s} {attn_ms:7.1f}ms "
                       f"{attn_ms/total_ms*100:.0f}%", flush=True)
-                print(f"    {'Knowledge total':22s} {know_ms:7.1f} ms  "
+                print(f"    {'Knowledge total':22s} {know_ms:7.1f}ms "
                       f"{know_ms/total_ms*100:.0f}%", flush=True)
-                print(f"    {'LayerNorm total':22s} {norm_ms:7.1f} ms  "
+                print(f"    {'LayerNorm total':22s} {norm_ms:7.1f}ms "
                       f"{norm_ms/total_ms*100:.0f}%", flush=True)
-                print(f"    {'Layer total':22s} {total_ms:7.1f} ms", flush=True)
+                print(f"    {'Layer total':22s} {total_ms:7.1f}ms", flush=True)
                 print(f"    Est. {n_layers}-layer fwd: "
                       f"{total_ms * n_layers:.0f} ms "
                       f"(actual step incl. grad+opt)", flush=True)
 
-                # HBM after breakdown
-                try:
-                    mem = jax.local_devices()[0].memory_stats()
-                    if mem:
-                        used = mem.get('bytes_in_use', 0) / 1e9
-                        peak = mem.get('peak_bytes_in_use', 0) / 1e9
-                        limit = mem.get('bytes_limit', 0) / 1e9
-                        print(f"    HBM after profile: {used:.2f}G / {limit:.2f}G "
-                              f"(peak={peak:.2f}G)", flush=True)
-                except Exception:
-                    pass
+                # Overall HBM summary
+                hbm_now = _hbm_gb()
+                print(f"\n  === HBM Summary (per device) ===", flush=True)
+                print(f"    Baseline (params+opt):  {hbm_baseline:.2f}G",
+                      flush=True)
+                print(f"    After profile:          {hbm_now:.2f}G",
+                      flush=True)
+                print(f"    Peak during profile:    {max_peak:.2f}G",
+                      flush=True)
+                if hbm_limit > 0:
+                    print(f"    Device limit:           {hbm_limit:.2f}G",
+                          flush=True)
+                    print(f"    Headroom:               "
+                          f"{hbm_limit - max_peak:.2f}G "
+                          f"({(hbm_limit - max_peak)/hbm_limit*100:.0f}%)",
+                          flush=True)
 
                 del normed, h_Q, h_K, h_V, tau_all, Q, K, V
                 del h_know, tau_know, _kout, dummy_x
