@@ -1328,267 +1328,271 @@ def main():
             except Exception:
                 pass
 
-            # === Step-time breakdown (sharded, 1 layer) ===
-            try:
-                _is_sharded = _sharded_fns is not None
+        # === Step-time breakdown (sharded, 1 layer) ===
+        # NOTE: runs on ALL hosts — shard_map/psum require collective participation.
+        # Only print statements are guarded by is_host0.
+        try:
+            _is_sharded = _sharded_fns is not None
+            if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-                from models.dawn_spatial_v3 import (
-                    _layer_norm, _attn_forward, _know_forward, _srw_chunked)
+            from models.dawn_spatial_v3 import (
+                _layer_norm, _attn_forward, _know_forward, _srw_chunked)
 
-                # Use actual sharded params (no device_get)
-                pool_p = params['neuron_pool']
-                router_p = params['router']
-                block_p = params['block_0']
-                d_model = cfg['model']['d_model']
-                n_heads = cfg['model']['n_heads']
-                n_qk_cfg = cfg['model'].get('n_qk', 1580)
-                n_v_cfg = cfg['model'].get('n_v', 2620)
-                max_k_qk = cfg['model'].get('max_k_qk', 157)
-                max_k_v = cfg['model'].get('max_k_v', 262)
-                max_k_know = cfg['model'].get('max_k_know', 1536)
-                rd = cfg['model'].get('router_dropout', 0.1)
-                dd = cfg['model'].get('dropout', 0.1)
-                prof_rng = jax.random.PRNGKey(42)
+            # Use actual sharded params (no device_get)
+            pool_p = params['neuron_pool']
+            router_p = params['router']
+            block_p = params['block_0']
+            d_model = cfg['model']['d_model']
+            n_heads = cfg['model']['n_heads']
+            n_qk_cfg = cfg['model'].get('n_qk', 1580)
+            n_v_cfg = cfg['model'].get('n_v', 2620)
+            max_k_qk = cfg['model'].get('max_k_qk', 157)
+            max_k_v = cfg['model'].get('max_k_v', 262)
+            max_k_know = cfg['model'].get('max_k_know', 1536)
+            rd = cfg['model'].get('router_dropout', 0.1)
+            dd = cfg['model'].get('dropout', 0.1)
+            prof_rng = jax.random.PRNGKey(42)
 
-                # Create properly sharded dummy_x [B, S, D]
-                dummy_x_local = jnp.zeros(
-                    (per_host_batch, max_seq_len, d_model), dtype=jnp.float32)
-                x_sharding = NamedSharding(mesh, P('data', None, None))
-                global_x_shape = (batch_size, max_seq_len, d_model)
-                dummy_x = shard_to_mesh(dummy_x_local, x_sharding, global_x_shape)
+            # Create properly sharded dummy_x [B, S, D]
+            dummy_x_local = jnp.zeros(
+                (per_host_batch, max_seq_len, d_model), dtype=jnp.float32)
+            x_sharding = NamedSharding(mesh, P('data', None, None))
+            global_x_shape = (batch_size, max_seq_len, d_model)
+            dummy_x = shard_to_mesh(dummy_x_local, x_sharding, global_x_shape)
 
-                N_RUNS = 5
+            N_RUNS = 5
 
-                def _hbm_gb():
-                    """Current HBM usage in GB (device 0)."""
-                    try:
-                        mem = jax.local_devices()[0].memory_stats()
-                        if mem:
-                            return mem.get('bytes_in_use', 0) / 1e9
-                    except Exception:
-                        pass
-                    return 0.0
+            def _hbm_gb():
+                """Current HBM usage in GB (device 0)."""
+                try:
+                    mem = jax.local_devices()[0].memory_stats()
+                    if mem:
+                        return mem.get('bytes_in_use', 0) / 1e9
+                except Exception:
+                    pass
+                return 0.0
 
-                def _peak_hbm_gb():
-                    """Peak HBM usage in GB (device 0)."""
-                    try:
-                        mem = jax.local_devices()[0].memory_stats()
-                        if mem:
-                            return mem.get('peak_bytes_in_use', 0) / 1e9
-                    except Exception:
-                        pass
-                    return 0.0
+            def _peak_hbm_gb():
+                """Peak HBM usage in GB (device 0)."""
+                try:
+                    mem = jax.local_devices()[0].memory_stats()
+                    if mem:
+                        return mem.get('peak_bytes_in_use', 0) / 1e9
+                except Exception:
+                    pass
+                return 0.0
 
-                def _t(fn, n=N_RUNS):
-                    """Time a function + measure HBM delta.
-                    Returns (ms, delta_gb, peak_gb)."""
+            def _t(fn, n=N_RUNS):
+                """Time a function + measure HBM delta.
+                Returns (ms, delta_gb, peak_gb)."""
+                r = fn(); jax.block_until_ready(jax.tree.leaves(r))
+                del r
+                hbm_before = _hbm_gb()
+                t0 = time.time()
+                for _ in range(n):
                     r = fn(); jax.block_until_ready(jax.tree.leaves(r))
-                    del r
-                    hbm_before = _hbm_gb()
-                    t0 = time.time()
-                    for _ in range(n):
-                        r = fn(); jax.block_until_ready(jax.tree.leaves(r))
-                    elapsed = (time.time() - t0) / n * 1000
-                    hbm_after = _hbm_gb()
-                    peak = _peak_hbm_gb()
-                    return (elapsed, hbm_after - hbm_before, peak)
+                elapsed = (time.time() - t0) / n * 1000
+                hbm_after = _hbm_gb()
+                peak = _peak_hbm_gb()
+                return (elapsed, hbm_after - hbm_before, peak)
 
-                # --- Jit-compiled component functions for profiling ---
+            # --- Jit-compiled component functions for profiling ---
 
-                # 1) LayerNorm
-                @jax.jit
-                def prof_layernorm(x, scale, bias):
-                    return _layer_norm(x, scale, bias)
+            # 1) LayerNorm
+            @jax.jit
+            def prof_layernorm(x, scale, bias):
+                return _layer_norm(x, scale, bias)
 
-                # 2) Attn router: proj + split + tau
-                @jax.jit
-                def prof_attn_router(x, router_p):
-                    h_all = (x @ router_p['proj_attn']['kernel']
-                             + router_p['proj_attn']['bias'])
-                    h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-                    tau_all = (x @ router_p['tau_attn']['kernel']
-                               + router_p['tau_attn']['bias'])
-                    return h_Q, h_K, h_V, tau_all
+            # 2) Attn router: proj + split + tau
+            @jax.jit
+            def prof_attn_router(x, router_p):
+                h_all = (x @ router_p['proj_attn']['kernel']
+                         + router_p['proj_attn']['bias'])
+                h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+                tau_all = (x @ router_p['tau_attn']['kernel']
+                           + router_p['tau_attn']['bias'])
+                return h_Q, h_K, h_V, tau_all
 
-                # 3) QK fused shard_map (paired)
-                @jax.jit
-                def prof_qk_fused(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
-                    fused_paired = _sharded_fns[1]
-                    h_QK = jnp.stack([h_Q, h_K], axis=2)
-                    tau_QK = jnp.stack(
-                        [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-                    QK_out, act, gm = fused_paired(
-                        x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
-                    return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act, gm
+            # 3) QK fused shard_map (paired)
+            @jax.jit
+            def prof_qk_fused(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
+                fused_paired = _sharded_fns[1]
+                h_QK = jnp.stack([h_Q, h_K], axis=2)
+                tau_QK = jnp.stack(
+                    [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
+                QK_out, act, gm = fused_paired(
+                    x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
+                return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act, gm
 
-                # 3b) QK non-sharded fallback
-                @jax.jit
-                def prof_qk_chunked(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
-                    Q, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
-                                           qk_read, qk_write, n_chunks_qk)
-                    K, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
-                                           qk_read, qk_write, n_chunks_qk)
-                    return Q, K
+            # 3b) QK non-sharded fallback
+            @jax.jit
+            def prof_qk_chunked(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
+                Q, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                                       qk_read, qk_write, n_chunks_qk)
+                K, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                                       qk_read, qk_write, n_chunks_qk)
+                return Q, K
 
-                # 4) V shard_map (single)
-                @jax.jit
-                def prof_v_sharded(x, h_V, v_norm, tau_v, v_read, v_write):
-                    fused_single = _sharded_fns[0]
-                    return fused_single(
-                        x, h_V, v_norm, tau_v, v_read, v_write)
+            # 4) V shard_map (single)
+            @jax.jit
+            def prof_v_sharded(x, h_V, v_norm, tau_v, v_read, v_write):
+                fused_single = _sharded_fns[0]
+                return fused_single(
+                    x, h_V, v_norm, tau_v, v_read, v_write)
 
-                # 4b) V non-sharded fallback
-                @jax.jit
-                def prof_v_chunked(x, h_V, v_norm, tau_v, v_read, v_write):
-                    return _srw_chunked(x, h_V, v_norm, tau_v,
-                                        v_read, v_write, n_chunks_v)
+            # 4b) V non-sharded fallback
+            @jax.jit
+            def prof_v_chunked(x, h_V, v_norm, tau_v, v_read, v_write):
+                return _srw_chunked(x, h_V, v_norm, tau_v,
+                                    v_read, v_write, n_chunks_v)
 
-                # 5) Self-attention (QK scores + softmax + wV + O_proj)
-                @jax.jit
-                def prof_self_attn(Q, K, V, Ok):
-                    B, S, D = Q.shape
-                    dh = D // n_heads
-                    Qr = Q.reshape(B, S, n_heads, dh).transpose(0, 2, 1, 3)
-                    Kr = K.reshape(B, S, n_heads, dh).transpose(0, 2, 1, 3)
-                    Vr = V.reshape(B, S, n_heads, dh).transpose(0, 2, 1, 3)
-                    sc = jnp.sqrt(jnp.float32(dh))
-                    scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / sc
-                    causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-                    scores = jnp.where(causal, scores,
-                                       jnp.finfo(scores.dtype).min)
-                    attn_w = jax.nn.softmax(scores, axis=-1)
-                    out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
-                    out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
-                    return out @ Ok
+            # 5) Self-attention (QK scores + softmax + wV + O_proj)
+            @jax.jit
+            def prof_self_attn(Q, K, V, Ok):
+                B, S, D = Q.shape
+                dh = D // n_heads
+                Qr = Q.reshape(B, S, n_heads, dh).transpose(0, 2, 1, 3)
+                Kr = K.reshape(B, S, n_heads, dh).transpose(0, 2, 1, 3)
+                Vr = V.reshape(B, S, n_heads, dh).transpose(0, 2, 1, 3)
+                sc = jnp.sqrt(jnp.float32(dh))
+                scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / sc
+                causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+                scores = jnp.where(causal, scores,
+                                   jnp.finfo(scores.dtype).min)
+                attn_w = jax.nn.softmax(scores, axis=-1)
+                out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+                out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
+                return out @ Ok
 
-                # 6) Know router
-                @jax.jit
-                def prof_know_router(x, router_p):
-                    h = (x @ router_p['proj_know']['kernel']
-                         + router_p['proj_know']['bias'])
-                    tau = (x @ router_p['tau_know']['kernel']
-                           + router_p['tau_know']['bias'])
-                    return h, tau
+            # 6) Know router
+            @jax.jit
+            def prof_know_router(x, router_p):
+                h = (x @ router_p['proj_know']['kernel']
+                     + router_p['proj_know']['bias'])
+                tau = (x @ router_p['tau_know']['kernel']
+                       + router_p['tau_know']['bias'])
+                return h, tau
 
-                # 7) Know shard_map (single)
-                @jax.jit
-                def prof_know_sharded(x, h, know_norm, tau, know_read, know_write):
-                    fused_single = _sharded_fns[0]
-                    return fused_single(
-                        x, h, know_norm, tau, know_read, know_write)
+            # 7) Know shard_map (single)
+            @jax.jit
+            def prof_know_sharded(x, h, know_norm, tau, know_read, know_write):
+                fused_single = _sharded_fns[0]
+                return fused_single(
+                    x, h, know_norm, tau, know_read, know_write)
 
-                # 7b) Know non-sharded fallback
-                @jax.jit
-                def prof_know_chunked(x, h, know_norm, tau, know_read, know_write):
-                    return _srw_chunked(x, h, know_norm, tau,
-                                        know_read, know_write, n_chunks_know)
+            # 7b) Know non-sharded fallback
+            @jax.jit
+            def prof_know_chunked(x, h, know_norm, tau, know_read, know_write):
+                return _srw_chunked(x, h, know_norm, tau,
+                                    know_read, know_write, n_chunks_know)
 
-                # --- Prepare intermediate values ---
-                qk_emb = pool_p['qk_emb']
-                v_emb = pool_p['v_emb']
-                know_emb = pool_p['know_emb']
-                qk_norm = qk_emb / (jnp.linalg.norm(
-                    qk_emb, axis=-1, keepdims=True) + 1e-8)
-                v_norm = v_emb / (jnp.linalg.norm(
-                    v_emb, axis=-1, keepdims=True) + 1e-8)
-                know_norm = know_emb / (jnp.linalg.norm(
-                    know_emb, axis=-1, keepdims=True) + 1e-8)
+            # --- Prepare intermediate values ---
+            qk_emb = pool_p['qk_emb']
+            v_emb = pool_p['v_emb']
+            know_emb = pool_p['know_emb']
+            qk_norm = qk_emb / (jnp.linalg.norm(
+                qk_emb, axis=-1, keepdims=True) + 1e-8)
+            v_norm = v_emb / (jnp.linalg.norm(
+                v_emb, axis=-1, keepdims=True) + 1e-8)
+            know_norm = know_emb / (jnp.linalg.norm(
+                know_emb, axis=-1, keepdims=True) + 1e-8)
 
-                normed = prof_layernorm(
-                    dummy_x, block_p['norm1']['scale'],
-                    block_p['norm1']['bias'])
-                jax.block_until_ready(normed)
+            normed = prof_layernorm(
+                dummy_x, block_p['norm1']['scale'],
+                block_p['norm1']['bias'])
+            jax.block_until_ready(normed)
 
-                h_Q, h_K, h_V, tau_all = prof_attn_router(normed, router_p)
-                jax.block_until_ready(tau_all)
+            h_Q, h_K, h_V, tau_all = prof_attn_router(normed, router_p)
+            jax.block_until_ready(tau_all)
 
-                if _is_sharded:
-                    Q, K, _, _ = prof_qk_fused(
-                        normed, h_Q, h_K, qk_norm, tau_all,
-                        pool_p['qk_read'], pool_p['qk_write'])
-                    V, _, _ = prof_v_sharded(
-                        normed, h_V, v_norm, tau_all[:, :, 2:3],
-                        pool_p['v_read'], pool_p['v_write'])
-                else:
-                    Q, K = prof_qk_chunked(
-                        normed, h_Q, h_K, qk_norm, tau_all,
-                        pool_p['qk_read'], pool_p['qk_write'])
-                    V, _, _ = prof_v_chunked(
-                        normed, h_V, v_norm, tau_all[:, :, 2:3],
-                        pool_p['v_read'], pool_p['v_write'])
-                jax.block_until_ready((Q, K, V))
+            if _is_sharded:
+                Q, K, _, _ = prof_qk_fused(
+                    normed, h_Q, h_K, qk_norm, tau_all,
+                    pool_p['qk_read'], pool_p['qk_write'])
+                V, _, _ = prof_v_sharded(
+                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    pool_p['v_read'], pool_p['v_write'])
+            else:
+                Q, K = prof_qk_chunked(
+                    normed, h_Q, h_K, qk_norm, tau_all,
+                    pool_p['qk_read'], pool_p['qk_write'])
+                V, _, _ = prof_v_chunked(
+                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    pool_p['v_read'], pool_p['v_write'])
+            jax.block_until_ready((Q, K, V))
 
-                h_know, tau_know = prof_know_router(normed, router_p)
-                jax.block_until_ready(tau_know)
-                if _is_sharded:
-                    _kout, _, _ = prof_know_sharded(
-                        normed, h_know, know_norm, tau_know,
-                        pool_p['know_read'], pool_p['know_write'])
-                else:
-                    _kout, _, _ = prof_know_chunked(
-                        normed, h_know, know_norm, tau_know,
-                        pool_p['know_read'], pool_p['know_write'])
-                jax.block_until_ready(_kout)
+            h_know, tau_know = prof_know_router(normed, router_p)
+            jax.block_until_ready(tau_know)
+            if _is_sharded:
+                _kout, _, _ = prof_know_sharded(
+                    normed, h_know, know_norm, tau_know,
+                    pool_p['know_read'], pool_p['know_write'])
+            else:
+                _kout, _, _ = prof_know_chunked(
+                    normed, h_know, know_norm, tau_know,
+                    pool_p['know_read'], pool_p['know_write'])
+            jax.block_until_ready(_kout)
 
-                # --- Timed + memory measurements ---
-                # Each _t() returns (ms, delta_hbm_gb, peak_hbm_gb)
-                hbm_baseline = _hbm_gb()
-                items = []  # [(name, ms, delta_gb, peak_gb)]
+            # --- Timed + memory measurements ---
+            # Each _t() returns (ms, delta_hbm_gb, peak_hbm_gb)
+            hbm_baseline = _hbm_gb()
+            items = []  # [(name, ms, delta_gb, peak_gb)]
 
-                ms, dg, pk = _t(lambda: prof_layernorm(
-                    dummy_x, block_p['norm1']['scale'],
-                    block_p['norm1']['bias']))
-                items.append(("LayerNorm", ms, dg, pk))
+            ms, dg, pk = _t(lambda: prof_layernorm(
+                dummy_x, block_p['norm1']['scale'],
+                block_p['norm1']['bias']))
+            items.append(("LayerNorm", ms, dg, pk))
 
-                ms, dg, pk = _t(lambda: prof_attn_router(normed, router_p))
-                items.append(("A router(proj+tau)", ms, dg, pk))
+            ms, dg, pk = _t(lambda: prof_attn_router(normed, router_p))
+            items.append(("A router(proj+tau)", ms, dg, pk))
 
-                if _is_sharded:
-                    ms, dg, pk = _t(lambda: prof_qk_fused(
-                        normed, h_Q, h_K, qk_norm, tau_all,
-                        pool_p['qk_read'], pool_p['qk_write']))
-                    items.append(("A QK fused shard", ms, dg, pk))
-                    ms, dg, pk = _t(lambda: prof_v_sharded(
-                        normed, h_V, v_norm, tau_all[:, :, 2:3],
-                        pool_p['v_read'], pool_p['v_write']))
-                    items.append(("A V shard", ms, dg, pk))
-                else:
-                    ms, dg, pk = _t(lambda: prof_qk_chunked(
-                        normed, h_Q, h_K, qk_norm, tau_all,
-                        pool_p['qk_read'], pool_p['qk_write']))
-                    items.append(("A QK chunked(x2)", ms, dg, pk))
-                    ms, dg, pk = _t(lambda: prof_v_chunked(
-                        normed, h_V, v_norm, tau_all[:, :, 2:3],
-                        pool_p['v_read'], pool_p['v_write']))
-                    items.append(("A V chunked", ms, dg, pk))
+            if _is_sharded:
+                ms, dg, pk = _t(lambda: prof_qk_fused(
+                    normed, h_Q, h_K, qk_norm, tau_all,
+                    pool_p['qk_read'], pool_p['qk_write']))
+                items.append(("A QK fused shard", ms, dg, pk))
+                ms, dg, pk = _t(lambda: prof_v_sharded(
+                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    pool_p['v_read'], pool_p['v_write']))
+                items.append(("A V shard", ms, dg, pk))
+            else:
+                ms, dg, pk = _t(lambda: prof_qk_chunked(
+                    normed, h_Q, h_K, qk_norm, tau_all,
+                    pool_p['qk_read'], pool_p['qk_write']))
+                items.append(("A QK chunked(x2)", ms, dg, pk))
+                ms, dg, pk = _t(lambda: prof_v_chunked(
+                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    pool_p['v_read'], pool_p['v_write']))
+                items.append(("A V chunked", ms, dg, pk))
 
-                Ok = block_p['attn']['expand_O']['kernel']
-                ms, dg, pk = _t(lambda: prof_self_attn(Q, K, V, Ok))
-                items.append(("A self-attn(QKV)", ms, dg, pk))
+            Ok = block_p['attn']['expand_O']['kernel']
+            ms, dg, pk = _t(lambda: prof_self_attn(Q, K, V, Ok))
+            items.append(("A self-attn(QKV)", ms, dg, pk))
 
-                ms, dg, pk = _t(lambda: prof_layernorm(
-                    dummy_x, block_p['norm2']['scale'],
-                    block_p['norm2']['bias']))
-                items.append(("LayerNorm (know)", ms, dg, pk))
+            ms, dg, pk = _t(lambda: prof_layernorm(
+                dummy_x, block_p['norm2']['scale'],
+                block_p['norm2']['bias']))
+            items.append(("LayerNorm (know)", ms, dg, pk))
 
-                ms, dg, pk = _t(lambda: prof_know_router(normed, router_p))
-                items.append(("K router(proj+tau)", ms, dg, pk))
+            ms, dg, pk = _t(lambda: prof_know_router(normed, router_p))
+            items.append(("K router(proj+tau)", ms, dg, pk))
 
-                if _is_sharded:
-                    ms, dg, pk = _t(lambda: prof_know_sharded(
-                        normed, h_know, know_norm, tau_know,
-                        pool_p['know_read'], pool_p['know_write']))
-                    items.append(("K know shard", ms, dg, pk))
-                else:
-                    ms, dg, pk = _t(lambda: prof_know_chunked(
-                        normed, h_know, know_norm, tau_know,
-                        pool_p['know_read'], pool_p['know_write']))
-                    items.append(("K know chunked", ms, dg, pk))
+            if _is_sharded:
+                ms, dg, pk = _t(lambda: prof_know_sharded(
+                    normed, h_know, know_norm, tau_know,
+                    pool_p['know_read'], pool_p['know_write']))
+                items.append(("K know shard", ms, dg, pk))
+            else:
+                ms, dg, pk = _t(lambda: prof_know_chunked(
+                    normed, h_know, know_norm, tau_know,
+                    pool_p['know_read'], pool_p['know_write']))
+                items.append(("K know chunked", ms, dg, pk))
 
-                # --- Print breakdown (time + memory) ---
+            # --- Print breakdown (time + memory) --- host0 only
+            if is_host0:
                 total_ms = sum(ms for _, ms, _, _ in items)
                 max_peak = max(pk for _, _, _, pk in items)
                 n_layers = cfg['model']['n_layers']
@@ -1647,13 +1651,15 @@ def main():
                           f"({(hbm_limit - max_peak)/hbm_limit*100:.0f}%)",
                           flush=True)
 
-                del normed, h_Q, h_K, h_V, tau_all, Q, K, V
-                del h_know, tau_know, _kout, dummy_x
-            except Exception as e:
+            del normed, h_Q, h_K, h_V, tau_all, Q, K, V
+            del h_know, tau_know, _kout, dummy_x
+        except Exception as e:
+            if is_host0:
                 import traceback
                 print(f"  Breakdown failed: {e}", flush=True)
                 traceback.print_exc()
 
+        if is_host0:
             # Estimate total training time
             total_steps = len(train_loader) * num_epochs
             remaining_steps = total_steps - global_step
