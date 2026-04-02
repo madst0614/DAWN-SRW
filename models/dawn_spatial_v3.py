@@ -77,27 +77,31 @@ def unit_norm_init(scale=1.0):
 # ================================================================
 
 def threshold_gate(scores, tau_offset):
-    """v18.5 style: relative tau based on scores distribution.
-
-    scores:     [B, S, N]
-    tau_offset: [B, S, 1] — learnable offset (relative to mean/std)
-
-    tau = mean(scores) + tau_offset * std(scores)
-    Dead neurons get tiny gradient via 1e-8 * exp(raw).
+    """v18.5 style relative tau. All [B,S,N] tensors in bf16.
+    Only mean/std/tau (scalar/[B,S,1]) computed in f32.
     """
-    s_mean = scores.mean(axis=-1, keepdims=True)
-    s_std = jnp.std(scores, axis=-1, keepdims=True) + 1e-8
+    # mean/std in f32 (reduce results are [B,S,1], tiny)
+    scores_f32 = scores.astype(jnp.float32)
+    s_mean = scores_f32.mean(axis=-1, keepdims=True)
+    s_std = jnp.sqrt(jnp.mean(jnp.square(scores_f32 - s_mean), axis=-1, keepdims=True)) + 1e-8
     tau = s_mean + tau_offset * s_std
 
-    raw = scores - tau
-    gate = jnp.where(raw > 0, raw, 1e-8 * jnp.exp(jnp.clip(raw, -10.0, 0.0)))
+    # gate in bf16 ([B,S,N] tensors)
+    raw = scores - tau.astype(scores.dtype)
+    gate = jnp.where(raw > 0, raw,
+                     (1e-4 * jax.nn.softplus(raw.astype(jnp.float32))).astype(scores.dtype))
 
-    # Clamp gate to prevent exp explosion
     gate = jnp.clip(gate, 0.0, 10.0)
+    exp_gate = (jnp.exp(gate.astype(jnp.float32)) - 1.0).astype(scores.dtype)
 
-    exp_gate = jnp.exp(gate) - 1.0
-    exp_sum = exp_gate.sum(axis=-1, keepdims=True) + 1e-8
-    gate_strength = jnp.tanh(exp_gate.max(axis=-1, keepdims=True))
+    # sum/max reduce → [B,S,1], then normalize in same dtype
+    exp_sum = exp_gate.sum(axis=-1, keepdims=True) + 1e-4
+    ratio = exp_gate / exp_sum
+    gate_strength = jnp.tanh(
+        exp_gate.max(axis=-1, keepdims=True).astype(jnp.float32)
+    ).astype(scores.dtype)
+
+    return ratio * gate_strength
 
     return (exp_gate / exp_sum) * gate_strength
 
