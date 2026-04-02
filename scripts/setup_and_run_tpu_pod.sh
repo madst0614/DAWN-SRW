@@ -46,8 +46,7 @@ if [ -d "$WORK_DIR/.git" ]; then
     else
         echo "  Switching to branch $BRANCH..."
         git fetch origin "$BRANCH" --depth 1
-        git checkout "$BRANCH" --
-        git reset --hard "origin/$BRANCH"
+        git checkout -B "$BRANCH" "origin/$BRANCH"
     fi
 else
     echo "  Fresh clone (branch: $BRANCH)..."
