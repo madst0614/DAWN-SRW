@@ -148,17 +148,19 @@ def make_sharded_srw(mesh, max_chunk_size=4096):
         write_bf = write_local.astype(jnp.bfloat16)
         z1 = jnp.zeros((B, S, 1))
 
-        # --- Pass 1: scores stats -> tau ---
-        def stats_body(i, carry):
+        # --- Pass 1: scores stats -> tau (scan + checkpoint) ---
+        @jax.checkpoint
+        def stats_step(carry, i):
             s_sum, sq_sum = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             sc = h_bf @ ec.T
             sf = sc.astype(jnp.float32)
             return (s_sum + sf.sum(axis=-1, keepdims=True),
-                    sq_sum + (sf ** 2).sum(axis=-1, keepdims=True))
+                    sq_sum + (sf ** 2).sum(axis=-1, keepdims=True)), None
 
-        local_sum, local_sq = jax.lax.fori_loop(0, nc, stats_body, (z1, z1))
+        (local_sum, local_sq), _ = jax.lax.scan(
+            stats_step, (z1, z1), jnp.arange(nc))
         global_sum = jax.lax.psum(local_sum, 'model')
         global_sq = jax.lax.psum(local_sq, 'model')
         model_size = jax.lax.psum(jnp.int32(1), 'model')
@@ -169,38 +171,33 @@ def make_sharded_srw(mesh, max_chunk_size=4096):
         tau = s_mean + tau_offset * s_std
         tau_bf = tau.astype(jnp.bfloat16)
 
-        # --- Pass 2: gate + srw fused (chunked) ---
-        def gate_srw_body(i, carry):
+        # --- Pass 2: gate + srw fused (scan + checkpoint) ---
+        @jax.checkpoint
+        def gate_srw_step(carry, i):
             out, exp_sum, exp_max, active = carry
+            s = i * cs
+            ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+            rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
+            wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
+            sc = h_bf @ ec.T
+            raw = sc - tau_bf
+            gc = jnp.where(raw > 0, raw,
+                            (1e-4 * jax.nn.softplus(
+                                raw.astype(jnp.float32))).astype(jnp.bfloat16))
+            gc = jnp.clip(gc, 0.0, 10.0)
+            eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
+            ef = eg.astype(jnp.float32)
+            xr = x_bf @ rc.T
+            c_out = ((eg * xr) @ wc).astype(jnp.float32)
+            return (out + c_out, exp_sum + ef.sum(axis=-1, keepdims=True),
+                    jnp.maximum(exp_max, ef.max(axis=-1, keepdims=True)),
+                    active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)), None
 
-            @jax.checkpoint
-            def _chunk(i_val):
-                s = i_val * cs
-                ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-                rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
-                wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-                sc = h_bf @ ec.T
-                raw = sc - tau_bf
-                gc = jnp.where(raw > 0, raw,
-                                (1e-4 * jax.nn.softplus(
-                                    raw.astype(jnp.float32))).astype(jnp.bfloat16))
-                gc = jnp.clip(gc, 0.0, 10.0)
-                eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
-                ef = eg.astype(jnp.float32)
-                xr = x_bf @ rc.T
-                c_out = ((eg * xr) @ wc).astype(jnp.float32)
-                return (c_out, ef.sum(axis=-1, keepdims=True),
-                        ef.max(axis=-1, keepdims=True),
-                        (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32))
-
-            co, ces, cem, cac = _chunk(i)
-            return (out + co, exp_sum + ces,
-                    jnp.maximum(exp_max, cem), active + cac)
-
-        raw_out, total_es, total_em, total_ac = jax.lax.fori_loop(
-            0, nc, gate_srw_body,
+        (raw_out, total_es, total_em, total_ac), _ = jax.lax.scan(
+            gate_srw_step,
             (jnp.zeros((B, S, D), dtype=jnp.float32),
-             z1, jnp.full((B, S, 1), -1e9), z1))
+             z1, jnp.full((B, S, 1), -1e9), z1),
+            jnp.arange(nc))
 
         global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-4
         gate_strength = jax.lax.stop_gradient(jnp.tanh(total_em))
@@ -231,48 +228,46 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
 
     z1 = jnp.zeros((B, S, 1))
 
-    def stats_body(i, carry):
-        @jax.checkpoint
-        def _s(iv):
-            s = iv * cs
-            ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-            sc = h_bf @ ec.T
-            sf = sc.astype(jnp.float32)
-            return sf.sum(axis=-1, keepdims=True), (sf**2).sum(axis=-1, keepdims=True)
-        cs_, sq_ = _s(i)
+    @jax.checkpoint
+    def stats_step(carry, i):
         ss, sq = carry
-        return (ss + cs_, sq + sq_)
+        s = i * cs
+        ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+        sc = h_bf @ ec.T
+        sf = sc.astype(jnp.float32)
+        return (ss + sf.sum(axis=-1, keepdims=True),
+                sq + (sf**2).sum(axis=-1, keepdims=True)), None
 
-    s_sum, sq_sum = jax.lax.fori_loop(0, n_chunks, stats_body, (z1, z1))
+    (s_sum, sq_sum), _ = jax.lax.scan(stats_step, (z1, z1), jnp.arange(n_chunks))
     s_mean = s_sum / N
     s_std = jnp.sqrt(sq_sum / N - s_mean**2) + 1e-8
     tau = s_mean + tau_offset * s_std
     tau_bf = tau.astype(jnp.bfloat16)
 
-    def gsrw_body(i, carry):
-        @jax.checkpoint
-        def _g(iv):
-            s = iv * cs
-            ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-            rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
-            wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-            sc = h_bf @ ec.T
-            raw = sc - tau_bf
-            gc = jnp.where(raw > 0, raw,
-                            (1e-4*jax.nn.softplus(raw.astype(jnp.float32))).astype(jnp.bfloat16))
-            gc = jnp.clip(gc, 0.0, 10.0)
-            eg = (jnp.exp(gc.astype(jnp.float32))-1.0).astype(jnp.bfloat16)
-            ef = eg.astype(jnp.float32)
-            xr = x_bf @ rc.T
-            return (eg*xr)@wc, ef.sum(axis=-1,keepdims=True), ef.max(axis=-1,keepdims=True), \
-                   (raw>0).sum(axis=-1,keepdims=True).astype(jnp.float32)
-        co, ces, cem, cac = _g(i)
+    @jax.checkpoint
+    def gsrw_step(carry, i):
         out, es, em, ac = carry
-        return (out+co, es+ces, jnp.maximum(em, cem), ac+cac)
+        s = i * cs
+        ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+        rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
+        wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
+        sc = h_bf @ ec.T
+        raw = sc - tau_bf
+        gc = jnp.where(raw > 0, raw,
+                        (1e-4*jax.nn.softplus(raw.astype(jnp.float32))).astype(jnp.bfloat16))
+        gc = jnp.clip(gc, 0.0, 10.0)
+        eg = (jnp.exp(gc.astype(jnp.float32))-1.0).astype(jnp.bfloat16)
+        ef = eg.astype(jnp.float32)
+        xr = x_bf @ rc.T
+        co = ((eg*xr)@wc).astype(jnp.float32)
+        return (out+co, es+ef.sum(axis=-1,keepdims=True),
+                jnp.maximum(em, ef.max(axis=-1,keepdims=True)),
+                ac+(raw>0).sum(axis=-1,keepdims=True).astype(jnp.float32)), None
 
-    raw_out, tes, tem, tac = jax.lax.fori_loop(
-        0, n_chunks, gsrw_body,
-        (jnp.zeros((B,S,D), dtype=jnp.bfloat16), z1, jnp.full((B,S,1),-1e9), z1))
+    (raw_out, tes, tem, tac), _ = jax.lax.scan(
+        gsrw_step,
+        (jnp.zeros((B,S,D), dtype=jnp.float32), z1, jnp.full((B,S,1),-1e9), z1),
+        jnp.arange(n_chunks))
 
     inv_es = (1.0/(tes+1e-4)).astype(jnp.bfloat16)
     gs = jnp.tanh(tem).astype(jnp.bfloat16)
