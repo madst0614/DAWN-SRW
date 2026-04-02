@@ -112,7 +112,7 @@ def threshold_gate(scores, tau_offset):
 #    fori_loop inside for N_local chunking.
 # ================================================================
 
-def make_sharded_srw(mesh, max_chunk_size=8192):
+def make_sharded_srw(mesh, max_chunk_size=4096):
     """Create shard_map'd gate + sense_read_write functions.
 
     max_chunk_size: max N elements per chunk (auto-determines n_chunks).
@@ -278,7 +278,7 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
     inv_es = (1.0/(tes+1e-4)).astype(jnp.bfloat16)
     gs = jnp.tanh(tem).astype(jnp.bfloat16)
     out = raw_out * inv_es * gs
-    return out.astype(jnp.float32), (tac/N).mean(), tem.mean()
+    return out.astype(jnp.float32), tac / N, tem
 
 
 # ================================================================
