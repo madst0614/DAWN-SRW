@@ -149,8 +149,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         write_bf = write_local.astype(jnp.bfloat16)
         z1 = jnp.zeros((B, S, 1))
 
-        # --- Pass 1: scores stats -> tau (scan + checkpoint) ---
-        @jax.checkpoint
+        # --- Pass 1: scores stats -> tau (no checkpoint: carry is [B,S,1]*2) ---
         def stats_step(carry, i):
             s_sum, sq_sum = carry
             s = i * cs
@@ -248,8 +247,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         write_bf = write_local.astype(jnp.bfloat16)
         z1_r = jnp.zeros((B, S, 2, 1))  # per-route accumulators
 
-        # --- Pass 1: scores stats per route (scan + checkpoint) ---
-        @jax.checkpoint
+        # --- Pass 1: scores stats per route (no checkpoint: carry is [B,S,2,1]*2) ---
         def stats_step(carry, i):
             s_sum, sq_sum = carry  # [B,S,2,1]
             s = i * cs
@@ -335,7 +333,6 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
 
     z1 = jnp.zeros((B, S, 1))
 
-    @jax.checkpoint
     def stats_step(carry, i):
         ss, sq = carry
         s = i * cs
