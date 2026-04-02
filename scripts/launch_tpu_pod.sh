@@ -87,7 +87,7 @@ export BRANCH CONFIG GH_TOKEN
 if [ -d ~/dawn-spatial/.git ]; then
     cd ~/dawn-spatial
     git fetch origin "\$BRANCH" --depth 1
-    git checkout -B "\$BRANCH" "origin/\$BRANCH"
+    git checkout -B "\$BRANCH" FETCH_HEAD
     echo "Repo updated to \$BRANCH"
 else
     rm -rf ~/dawn-spatial
