@@ -571,14 +571,23 @@ def shard_params_to_mesh(params, param_shardings):
 
 
 def shard_to_mesh(data, sharding, global_shape):
-    """Multi-host: place each host's local data on its local devices."""
+    """Multi-host: place each host's local data on its local devices.
+
+    data: [per_host_batch, seq_len] flat, or [n_local, per_device, seq_len] pre-split.
+    """
     local_devs = sharding.mesh.local_devices
     n_local = len(local_devs)
-    per_device = data.shape[0] // n_local
-    local_arrays = []
-    for i, d in enumerate(local_devs):
-        shard = jnp.array(data[i * per_device:(i + 1) * per_device])
-        local_arrays.append(jax.device_put(shard, d))
+
+    # If already pre-split (n_local, per_device, seq_len), use directly
+    if data.ndim == 3 and data.shape[0] == n_local:
+        local_arrays = [jax.device_put(data[i], d) for i, d in enumerate(local_devs)]
+    else:
+        # Flat (per_host_batch, seq_len) → split across local devices
+        per_device = data.shape[0] // n_local
+        local_arrays = [
+            jax.device_put(data[i * per_device:(i + 1) * per_device], d)
+            for i, d in enumerate(local_devs)
+        ]
     return jax.make_array_from_single_device_arrays(
         global_shape, sharding, local_arrays)
 
@@ -1029,7 +1038,7 @@ def main():
         cfg['data'],
         max_length=max_seq_len,
         batch_size=batch_size,
-        n_devices=n_local_devices,
+        n_devices=1,  # flat (per_host_batch, seq_len) — shard_to_mesh handles splitting
         n_hosts=n_hosts,
         host_id=host_id,
     )
