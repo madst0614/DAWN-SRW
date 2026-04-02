@@ -112,7 +112,7 @@ def threshold_gate(scores, tau_offset):
 #    fori_loop inside for N_local chunking.
 # ================================================================
 
-def make_sharded_srw(mesh, max_chunk_size=4096):
+def make_sharded_srw(mesh, max_chunk_size=2048):
     """Create fused shard_map'd gate+srw. Gate never materialized full.
 
     2-pass chunked inside shard_map:
@@ -420,18 +420,20 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
 
     scale = jnp.sqrt(jnp.float32(d_head))
-    attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
-    causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-    attn_scores = jnp.where(causal, attn_scores,
-                            jnp.finfo(attn_scores.dtype).min)
-    attn_w = jax.nn.softmax(attn_scores, axis=-1)
 
-    rng, rng_attn, rng_out = jax.random.split(rng, 3)
-    attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_attn)
+    @jax.checkpoint
+    def _attn_scores(Q, K, V):
+        attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        attn_scores = jnp.where(causal, attn_scores,
+                                jnp.finfo(attn_scores.dtype).min)
+        attn_w = jax.nn.softmax(attn_scores, axis=-1)
+        return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
 
-    out = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+    out = _attn_scores(Q, K, V)
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
+    rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
     # Load balance: use tau_reg only (no full gate available from chunked)
