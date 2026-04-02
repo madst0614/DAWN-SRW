@@ -1266,11 +1266,13 @@ def main():
     # Create shard_map functions if mesh_model > 1
     _sharded_fns = None
     if mesh_model > 1:
-        from models.dawn_spatial_v3 import make_sharded_srw
+        from models.dawn_spatial_v3 import make_sharded_srw, make_sharded_srw_paired
         max_chunk = cfg['training'].get('max_chunk_size', 8192)
-        _sharded_fns = make_sharded_srw(mesh, max_chunk_size=max_chunk)
+        _sharded_single = make_sharded_srw(mesh, max_chunk_size=max_chunk)
+        _sharded_paired = make_sharded_srw_paired(mesh, max_chunk_size=max_chunk)
+        _sharded_fns = (_sharded_single, _sharded_paired)
         if is_host0:
-            print(f"  shard_map enabled (mesh_model={mesh_model})")
+            print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused)")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
