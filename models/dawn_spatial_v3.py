@@ -105,8 +105,6 @@ def threshold_gate(scores, tau_offset):
 
     return ratio * gate_strength
 
-    return (exp_gate / exp_sum) * gate_strength
-
 
 # ================================================================
 # 3. shard_map based gate + sense_read_write
@@ -114,11 +112,11 @@ def threshold_gate(scores, tau_offset):
 #    fori_loop inside for N_local chunking.
 # ================================================================
 
-def make_sharded_srw(mesh, n_chunks=4):
-    """Create shard_map'd gate + sense_read_write functions for a given mesh.
+def make_sharded_srw(mesh, max_chunk_size=8192):
+    """Create shard_map'd gate + sense_read_write functions.
 
-    Returns (compute_gate_sharded, srw_sharded) functions.
-    Call once at model setup, use in forward.
+    max_chunk_size: max N elements per chunk (auto-determines n_chunks).
+    Returns (compute_gate, srw).
     """
 
     @partial(shard_map, mesh=mesh,
@@ -183,7 +181,11 @@ def make_sharded_srw(mesh, n_chunks=4):
     def srw(x, gate_local, read_local, write_local):
         """Per-device sense_read_write with fori_loop chunking + psum."""
         N_local = read_local.shape[0]
-        cs = N_local // n_chunks
+        # Auto n_chunks: ensure chunk_size <= max_chunk_size
+        nc = max(1, N_local // max_chunk_size)
+        while N_local % nc != 0 and nc < N_local:
+            nc += 1
+        cs = N_local // nc
 
         x_bf = x.astype(jnp.bfloat16)
         gate_bf = gate_local.astype(jnp.bfloat16)
@@ -198,16 +200,17 @@ def make_sharded_srw(mesh, n_chunks=4):
                 rd = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
                 wr = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
                 xr = x_bf @ rd.T
-                return (g * xr) @ wr
+                return ((g * xr) @ wr).astype(jnp.float32)
             return acc + _chunk(i)
 
+        # f32 accumulator for gradient precision across chunks
         out_local = jax.lax.fori_loop(
-            0, n_chunks, body,
-            jnp.zeros(x.shape, dtype=jnp.bfloat16))
+            0, nc, body,
+            jnp.zeros(x.shape, dtype=jnp.float32))
 
         # all-reduce: partial sums → global sum
-        out = jax.lax.psum(out_local, 'model')
-        return out.astype(jnp.float32)
+        # all-reduce partial sums across model axis
+        return jax.lax.psum(out_local, 'model')
 
     return compute_gate, srw
 

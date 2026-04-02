@@ -1243,7 +1243,8 @@ def main():
     _sharded_fns = None
     if mesh_model > 1:
         from models.dawn_spatial_v3 import make_sharded_srw
-        _sharded_fns = make_sharded_srw(mesh, n_chunks_know)
+        max_chunk = cfg['training'].get('max_chunk_size', 8192)
+        _sharded_fns = make_sharded_srw(mesh, max_chunk_size=max_chunk)
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model})")
 

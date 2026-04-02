@@ -19,7 +19,7 @@ model:
   d_bottleneck: 256
 
   n_know: 100000
-  n_qk: 6300
+  n_qk: 6400
   n_v: 10400
 
   max_seq_len: 512
