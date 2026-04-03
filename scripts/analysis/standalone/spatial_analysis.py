@@ -344,7 +344,456 @@ def _save_json(data, output_dir, subdir, filename):
 
 
 # ============================================================
-# Main (D1 + D2 for now, more analyses added below)
+# D3: Neuron Health
+# ============================================================
+
+def analyze_neuron_health(params, cfg, output_dir):
+    print("\n" + "="*60)
+    print("D3: Neuron Health")
+    print("="*60)
+
+    from models.dawn_spatial_v3 import vectorized_neuron_health
+
+    raw = jax.device_get(jax.jit(vectorized_neuron_health)(params))
+
+    results = {}
+    for pool_name in ['QK', 'V', 'Know']:
+        s = raw[pool_name]
+        N = int(s['N'])
+        print(f"\n  {pool_name} Pool (N={N}):")
+        for w in ('emb', 'read', 'write'):
+            print(f"    {w:5s} norm: mean={float(s[f'{w}_mean']):.4f}, "
+                  f"std={float(s[f'{w}_std']):.4f}, dead={int(s[f'{w}_dead'])}")
+
+        results[pool_name] = {
+            'N': N,
+            'emb_norm_mean': float(s['emb_mean']),
+            'emb_norm_std': float(s['emb_std']),
+            'read_norm_mean': float(s['read_mean']),
+            'write_norm_mean': float(s['write_mean']),
+            'dead_emb': int(s['emb_dead']),
+            'dead_read': int(s['read_dead']),
+            'dead_write': int(s['write_dead']),
+        }
+
+    tau_attn = raw['tau_attn_bias']
+    tau_know = raw['tau_know_bias']
+    print(f"\n  Tau bias:")
+    print(f"    attn: [{', '.join(f'{float(v):.3f}' for v in tau_attn)}]")
+    print(f"    know: [{float(tau_know[0]):.3f}]")
+    results['tau_attn_bias'] = [float(v) for v in tau_attn]
+    results['tau_know_bias'] = [float(v) for v in tau_know]
+
+    _save_json(results, output_dir, 'health', 'results.json')
+    return results
+
+
+# ============================================================
+# D4: Generation (KV-cache)
+# ============================================================
+
+def analyze_generation(params, cfg, output_dir, prompt="The meaning of life is",
+                       max_new_tokens=100, temperature=0.8, top_k=50):
+    print("\n" + "="*60)
+    print("D4: Generation")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    from models.dawn_spatial_v3 import prefill, decode_step
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+
+    input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    gen_len = min(max_new_tokens, max_seq - len(input_ids))
+
+    print(f"  Prompt: \"{prompt}\" ({len(input_ids)} tokens)")
+    print(f"  Generating up to {gen_len} tokens (temp={temperature}, top_k={top_k})")
+
+    # JIT compile prefill + decode
+    jit_prefill = jax.jit(lambda p, ids: prefill(p, model_cfg, ids))
+    jit_decode = jax.jit(lambda p, tok, cK, cV, cL: decode_step(p, model_cfg, tok, cK, cV, cL))
+
+    prompt_dev = jnp.array([input_ids], dtype=jnp.int32)  # [1, S_prompt]
+
+    # Warmup
+    print(f"  JIT compiling prefill...")
+    t0 = time.time()
+    logits, cache_K, cache_V, cache_len = jit_prefill(params, prompt_dev)
+    jax.block_until_ready(logits)
+    print(f"  Prefill compiled: {time.time()-t0:.1f}s")
+
+    # Sample first token from prefill logits
+    rng = jax.random.PRNGKey(42)
+    generated = []
+
+    def sample(logits_1d, rng):
+        logits_1d = logits_1d / temperature
+        if top_k > 0:
+            top_vals, _ = jax.lax.top_k(logits_1d, top_k)
+            logits_1d = jnp.where(logits_1d >= top_vals[-1], logits_1d, -1e10)
+        return jax.random.categorical(rng, logits_1d)
+
+    last_logits = logits[0, -1, :]
+    stop_ids = {tokenizer.sep_token_id, tokenizer.pad_token_id}
+
+    print(f"  JIT compiling decode...")
+    t0_decode = time.time()
+    # Warmup decode
+    rng, srng = jax.random.split(rng)
+    first_tok = int(sample(last_logits, srng))
+    tok_dev = jnp.array([first_tok], dtype=jnp.int32)
+    logits_d, cache_K, cache_V, cache_len = jit_decode(params, tok_dev, cache_K, cache_V, cache_len)
+    jax.block_until_ready(logits_d)
+    decode_compile_time = time.time() - t0_decode
+    print(f"  Decode compiled: {decode_compile_time:.1f}s")
+
+    generated.append(first_tok)
+    if first_tok not in stop_ids:
+        # Continue generating
+        t0_gen = time.time()
+        for i in range(gen_len - 1):
+            if cache_len >= max_seq:
+                break
+            rng, srng = jax.random.split(rng)
+            next_tok = int(sample(logits_d[0], srng))
+            generated.append(next_tok)
+            if next_tok in stop_ids:
+                break
+            tok_dev = jnp.array([next_tok], dtype=jnp.int32)
+            logits_d, cache_K, cache_V, cache_len = jit_decode(
+                params, tok_dev, cache_K, cache_V, cache_len)
+        gen_time = time.time() - t0_gen
+    else:
+        gen_time = 0.0
+
+    n_gen = len(generated)
+    all_ids = input_ids + generated
+    output_text = tokenizer.decode(all_ids, skip_special_tokens=True)
+    gen_text = tokenizer.decode(generated, skip_special_tokens=True)
+    tok_s = n_gen / gen_time if gen_time > 0 else 0
+
+    print(f"  ---")
+    print(f"  {output_text}")
+    print(f"  ---")
+    print(f"  Generated {n_gen} tokens in {gen_time:.2f}s ({tok_s:.1f} tok/s)")
+
+    result = {
+        'prompt': prompt,
+        'output': output_text,
+        'generated': gen_text,
+        'n_tokens': n_gen,
+        'gen_time_sec': gen_time,
+        'tok_per_sec': tok_s,
+    }
+    _save_json(result, output_dir, 'generation', 'result.json')
+    return result
+
+
+# ============================================================
+# D5: Weight Analysis
+# ============================================================
+
+def analyze_weights(params, cfg, output_dir):
+    print("\n" + "="*60)
+    print("D5: Weight Analysis")
+    print("="*60)
+
+    from models.dawn_spatial_v3 import vectorized_weight_analysis
+
+    raw = jax.device_get(jax.jit(vectorized_weight_analysis)(params))
+    results = {}
+
+    for pool_name in ['QK', 'V', 'Know']:
+        s = raw[pool_name]
+        N, d = int(s['N']), int(s['d'])
+        mean_sim = float(s['mean_cosine_sim'])
+        max_sim = float(s['max_cosine_sim'])
+        eff_rank = float(s['effective_rank'])
+        top5 = [float(v) for v in s['top5_sv']]
+
+        print(f"\n  {pool_name} (N={N}, d={d}):")
+        print(f"    Cosine sim: mean={mean_sim:.4f}, max={max_sim:.4f}")
+        print(f"    Effective rank: {eff_rank:.1f}")
+        print(f"    Top-5 SVs: {', '.join(f'{v:.2f}' for v in top5)}")
+
+        results[pool_name] = {
+            'N': N, 'd': d,
+            'mean_cosine_sim': mean_sim,
+            'max_cosine_sim': max_sim,
+            'effective_rank': eff_rank,
+            'top5_singular_values': top5,
+        }
+
+    _save_json(results, output_dir, 'weights', 'results.json')
+    return results
+
+
+# ============================================================
+# D6: Routing Analysis (gate distributions on val data)
+# ============================================================
+
+def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_size=8):
+    print("\n" + "="*60)
+    print("D6: Routing Analysis")
+    print("="*60)
+
+    from models.dawn_spatial_v3 import (
+        _layer_norm, _srw_inference_with_gates)
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+
+    pool_params = params['neuron_pool']
+    router_params = params['router']
+
+    qk_norm = pool_params['qk_emb'] / (
+        jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_norm = pool_params['v_emb'] / (
+        jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_norm = pool_params['know_emb'] / (
+        jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    # Prepare data
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    total_seqs = min(n_batches * batch_size, n_seqs)
+    tokens = jnp.array(tokens[:total_seqs], dtype=jnp.int32)
+
+    block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
+
+    # Analyze routing at middle layer
+    mid_layer = n_layers // 2
+    bp = block_params_list[mid_layer]
+
+    @jax.jit
+    def get_routing_stats(input_ids):
+        """Forward to mid layer, get gate distributions for Q,K,V,Know."""
+        B, S = input_ids.shape
+        emb_matrix = params['token_emb']['embedding']
+        pos_matrix = params['pos_emb']['embedding']
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids] + pos_matrix[positions]
+
+        # Forward to mid layer
+        for i in range(mid_layer):
+            lp = block_params_list[i]
+            normed = _layer_norm(x, lp['norm1']['scale'], lp['norm1']['bias'])
+            h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+            from models.dawn_spatial_v3 import _srw_inference
+            Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
+                               pool_params['qk_read'], pool_params['qk_write'])
+            K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2],
+                               pool_params['qk_read'], pool_params['qk_write'])
+            V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
+                               pool_params['v_read'], pool_params['v_write'])
+
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vr = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+            attn_w = jax.nn.softmax(scores, axis=-1)
+            attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = attn_out @ lp['attn']['expand_O']['kernel']
+            x = x + attn_out
+
+            normed = _layer_norm(x, lp['norm2']['scale'], lp['norm2']['bias'])
+            h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+            tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+            know_out = _srw_inference(normed, h_k, know_norm, tau_k,
+                                     pool_params['know_read'], pool_params['know_write'])
+            x = x + know_out
+
+        # At mid layer, get gate distributions
+        normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+        h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+        _, gate_Q = _srw_inference_with_gates(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
+                                               pool_params['qk_read'], pool_params['qk_write'])
+        _, gate_K = _srw_inference_with_gates(normed, h_K, qk_norm, tau_all[:, :, 1:2],
+                                               pool_params['qk_read'], pool_params['qk_write'])
+        _, gate_V = _srw_inference_with_gates(normed, h_V, v_norm, tau_all[:, :, 2:3],
+                                               pool_params['v_read'], pool_params['v_write'])
+
+        normed2 = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+        h_k = normed2 @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+        tau_k = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+        _, gate_Know = _srw_inference_with_gates(normed2, h_k, know_norm, tau_k,
+                                                  pool_params['know_read'], pool_params['know_write'])
+
+        # Compute stats per pool
+        def gate_stats(g):
+            active = (g > 1e-6).astype(jnp.float32)
+            active_per_token = active.sum(axis=-1).mean()  # avg active neurons per token
+            active_ratio = active.mean(axis=(0, 1))  # [N] per-neuron activation rate
+            neuron_entropy = -(active_ratio * jnp.log(active_ratio + 1e-10)
+                              + (1 - active_ratio) * jnp.log(1 - active_ratio + 1e-10)).mean()
+            coverage = (active_ratio > 0.01).sum()  # neurons used >1% of time
+            gini = _gini(g.mean(axis=(0, 1)))  # Gini of per-neuron avg gate
+            return {
+                'active_per_token': active_per_token,
+                'coverage': coverage,
+                'entropy': neuron_entropy,
+                'gini': gini,
+                'mean_gate': g.mean(),
+                'max_gate': g.max(),
+            }
+
+        return {
+            'Q': gate_stats(gate_Q), 'K': gate_stats(gate_K),
+            'V': gate_stats(gate_V), 'Know': gate_stats(gate_Know),
+        }
+
+    def _gini(x):
+        """Gini coefficient of 1D array."""
+        x_sorted = jnp.sort(x)
+        n = x.shape[0]
+        indices = jnp.arange(1, n + 1, dtype=jnp.float32)
+        return (2.0 * (indices * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n)
+
+    # Run on first batch (routing analysis is expensive)
+    print(f"  Analyzing routing at layer {mid_layer} (batches={min(n_batches, total_seqs // batch_size)})...")
+    batch = tokens[:batch_size]
+    t0 = time.time()
+    stats = get_routing_stats(batch)
+    stats = jax.device_get(stats)
+    elapsed = time.time() - t0
+
+    results = {}
+    for pool_name in ['Q', 'K', 'V', 'Know']:
+        s = stats[pool_name]
+        results[pool_name] = {k: float(v) for k, v in s.items()}
+        print(f"\n  {pool_name}:")
+        print(f"    Active/token: {float(s['active_per_token']):.1f}")
+        print(f"    Coverage:     {int(s['coverage'])}")
+        print(f"    Gini:         {float(s['gini']):.4f}")
+        print(f"    Mean gate:    {float(s['mean_gate']):.6f}")
+
+    results['layer'] = mid_layer
+    results['time_seconds'] = elapsed
+    _save_json(results, output_dir, 'routing', 'results.json')
+    return results
+
+
+# ============================================================
+# D7: Multi-prompt Generation Samples (matches DAWN format)
+# ============================================================
+
+GENERATION_PROMPTS = [
+    {"prompt": "The meaning of life is", "category": "philosophy"},
+    {"prompt": "In a shocking finding, scientists discovered", "category": "science"},
+    {"prompt": "The president of the United States", "category": "factual"},
+    {"prompt": "Once upon a time in a land far away", "category": "creative"},
+    {"prompt": "The best way to learn programming is", "category": "technical"},
+    {"prompt": "Breaking news:", "category": "news"},
+    {"prompt": "Dear diary, today I", "category": "personal"},
+    {"prompt": "The recipe for happiness includes", "category": "abstract"},
+]
+
+
+def analyze_generation_samples(params, cfg, output_dir,
+                                max_new_tokens=50, temperature=0.8, top_k=50):
+    print("\n" + "="*60)
+    print("D7: Generation Samples")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    from models.dawn_spatial_v3 import prefill, decode_step
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+
+    jit_prefill = jax.jit(lambda p, ids: prefill(p, model_cfg, ids))
+    jit_decode = jax.jit(lambda p, tok, cK, cV, cL: decode_step(p, model_cfg, tok, cK, cV, cL))
+
+    stop_ids = {tokenizer.sep_token_id, tokenizer.pad_token_id}
+    results = []
+    rng = jax.random.PRNGKey(42)
+
+    for i, item in enumerate(GENERATION_PROMPTS):
+        prompt = item['prompt']
+        category = item['category']
+        input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_dev = jnp.array([input_ids], dtype=jnp.int32)
+
+        t0 = time.time()
+        logits, cK, cV, cL = jit_prefill(params, prompt_dev)
+        jax.block_until_ready(logits)
+        prefill_time = time.time() - t0
+
+        generated = []
+        last_logits = logits[0, -1, :]
+
+        t0 = time.time()
+        gen_len = min(max_new_tokens, max_seq - len(input_ids))
+        for j in range(gen_len):
+            rng, srng = jax.random.split(rng)
+            l = last_logits / temperature
+            if top_k > 0:
+                tv, _ = jax.lax.top_k(l, top_k)
+                l = jnp.where(l >= tv[-1], l, -1e10)
+            tok = int(jax.random.categorical(srng, l))
+            generated.append(tok)
+            if tok in stop_ids or cL >= max_seq:
+                break
+            tok_dev = jnp.array([tok], dtype=jnp.int32)
+            last_logits, cK, cV, cL = jit_decode(params, tok_dev, cK, cV, cL)
+            last_logits = last_logits[0]
+        decode_time = time.time() - t0
+
+        all_ids = input_ids + generated
+        output = tokenizer.decode(all_ids, skip_special_tokens=True)
+        gen_text = tokenizer.decode(generated, skip_special_tokens=True)
+        n_gen = len(generated)
+        tok_s = n_gen / decode_time if decode_time > 0 else 0
+
+        print(f"\n  [{category}] \"{prompt}\"")
+        print(f"    → {gen_text[:80]}{'...' if len(gen_text) > 80 else ''}")
+        print(f"    {n_gen} tokens, {tok_s:.1f} tok/s")
+
+        results.append({
+            'prompt': prompt,
+            'category': category,
+            'generated': gen_text,
+            'full_output': output,
+            'new_tokens': n_gen,
+            'prefill_ms': prefill_time * 1000,
+            'decode_ms': decode_time * 1000,
+            'tokens_per_sec': tok_s,
+        })
+
+    # Save both JSON and readable text
+    _save_json(results, output_dir, 'generation', 'samples.json')
+
+    # Human-readable text output
+    txt_path = os.path.join(output_dir, 'generation', 'samples.txt')
+    with open(txt_path, 'w') as f:
+        for r in results:
+            f.write(f"[{r['category']}] {r['prompt']}\n")
+            f.write(f"  → {r['generated']}\n")
+            f.write(f"  ({r['new_tokens']} tokens, {r['tokens_per_sec']:.1f} tok/s)\n\n")
+    print(f"\n  Saved: {txt_path}")
+
+    return results
+
+
+# ============================================================
+# Main
 # ============================================================
 
 def main():
@@ -376,16 +825,41 @@ def main():
     if only is None or 'info' in only:
         analyze_model_info(params, cfg, args.output)
 
+    # Load val tokens once (shared by D2 and D6)
+    val_tokens = None
+    val_path = args.val_data or cfg.get('data', {}).get('bin_val')
+    if val_path and (only is None or any(k in (only or set()) for k in ['val', 'routing'])):
+        val_tokens = load_val_tokens(val_path)
+
     if only is None or 'val' in only:
-        val_path = args.val_data or cfg.get('data', {}).get('bin_val')
-        if val_path:
-            val_tokens = load_val_tokens(val_path)
+        if val_tokens is not None:
             analyze_validation(params, cfg, val_tokens, args.output,
                              args.batch_size, args.max_batches)
         else:
             print("\n  Skipping validation (no --val_data)")
 
-    # D3-D7 will be added in subsequent commits
+    if only is None or 'health' in only:
+        analyze_neuron_health(params, cfg, args.output)
+
+    if only is None or 'generate' in only:
+        analyze_generation(params, cfg, args.output,
+                          prompt=args.prompt,
+                          max_new_tokens=args.max_new_tokens,
+                          temperature=args.temperature)
+
+    if only is None or 'weights' in only:
+        analyze_weights(params, cfg, args.output)
+
+    if only is None or 'routing' in only:
+        if val_tokens is not None:
+            analyze_routing(params, cfg, val_tokens, args.output)
+        else:
+            print("\n  Skipping routing (no --val_data)")
+
+    if only is None or 'samples' in only:
+        analyze_generation_samples(params, cfg, args.output,
+                                   max_new_tokens=args.max_new_tokens,
+                                   temperature=args.temperature)
 
     print(f"\nDone. Results in {args.output}/")
 
