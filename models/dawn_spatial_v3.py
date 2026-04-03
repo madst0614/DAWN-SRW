@@ -1319,3 +1319,182 @@ def vectorized_weight_analysis(params, max_sample=2048):
             'top5_sv': sv[:5],
         }
     return results
+
+
+def analysis_forward(params, model_cfg, input_ids):
+    """Forward returning per-layer gate distributions + output norms.
+
+    For D.1 (Q/K specialization), D.4 (layer balance), D.3/D.5 (knowledge neurons).
+
+    Returns:
+        logits: [B, S, vocab]
+        layer_info: dict with stacked arrays:
+            gate_Q: [n_layers, B, S, n_qk]
+            gate_K: [n_layers, B, S, n_qk]
+            gate_V: [n_layers, B, S, n_v]
+            gate_Know: [n_layers, B, S, n_know]
+            attn_out_norm: [n_layers]
+            know_out_norm: [n_layers]
+    """
+    B, S = input_ids.shape
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+
+    pool_params = params['neuron_pool']
+    router_params = params['router']
+
+    positions = jnp.arange(S)[jnp.newaxis, :]
+    x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
+
+    qk_norm = pool_params['qk_emb'] / (
+        jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_norm = pool_params['v_emb'] / (
+        jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_norm_w = pool_params['know_emb'] / (
+        jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
+    stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    def analysis_layer(carry, xs):
+        x = carry
+        bp = xs['params']
+
+        normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+        h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+        Q, gate_Q = _srw_inference_with_gates(
+            normed, h_Q, qk_norm, tau_all[:, :, 0:1],
+            pool_params['qk_read'], pool_params['qk_write'])
+        K, gate_K = _srw_inference_with_gates(
+            normed, h_K, qk_norm, tau_all[:, :, 1:2],
+            pool_params['qk_read'], pool_params['qk_write'])
+        V, gate_V = _srw_inference_with_gates(
+            normed, h_V, v_norm, tau_all[:, :, 2:3],
+            pool_params['v_read'], pool_params['v_write'])
+
+        d_head = d_model // n_heads
+        Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        Vr = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        scale = jnp.sqrt(jnp.float32(d_head))
+        scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+        attn_w = jax.nn.softmax(scores, axis=-1)
+        attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
+        attn_out = attn_out @ bp['attn']['expand_O']['kernel']
+        attn_out_norm = jnp.linalg.norm(attn_out, axis=-1).mean()
+        x = x + attn_out
+
+        normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+        h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+        tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+        know_out, gate_Know = _srw_inference_with_gates(
+            normed, h_k, know_norm_w, tau_k,
+            pool_params['know_read'], pool_params['know_write'])
+        know_out_norm = jnp.linalg.norm(know_out, axis=-1).mean()
+        x = x + know_out
+
+        return x, {
+            'gate_Q': gate_Q, 'gate_K': gate_K,
+            'gate_V': gate_V, 'gate_Know': gate_Know,
+            'attn_out_norm': attn_out_norm,
+            'know_out_norm': know_out_norm,
+        }
+
+    xs = {'params': stacked}
+    x, layer_info = jax.lax.scan(analysis_layer, x, xs)
+
+    norm_p = params['norm']
+    x = _layer_norm(x, norm_p['scale'], norm_p['bias'])
+    logits = x @ params['token_emb']['embedding'].T
+    return logits, layer_info
+
+
+def build_suppressed_forward(params, model_cfg, suppress_masks):
+    """Build forward with specific neurons suppressed (gate zeroed).
+
+    suppress_masks: dict with 'qk':[n_qk] bool, 'v':[n_v], 'know':[n_know].
+    True = suppress.
+    Returns: forward_fn(input_ids) -> logits [B, S, vocab]
+    """
+    qk_mult = jnp.where(suppress_masks.get('qk', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
+        if 'qk' in suppress_masks else None
+    v_mult = jnp.where(suppress_masks.get('v', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
+        if 'v' in suppress_masks else None
+    know_mult = jnp.where(suppress_masks.get('know', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
+        if 'know' in suppress_masks else None
+
+    def _srw_sup(x, h, emb_n, tau_off, w_read, w_write, mult):
+        """SRW with optional gate suppression."""
+        scores = h @ emb_n.T
+        sf = scores.astype(jnp.float32)
+        s_mean = sf.mean(axis=-1, keepdims=True)
+        s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
+        tau = s_mean + tau_off * s_std
+        raw = scores - tau.astype(scores.dtype)
+        gc = jnp.where(raw > 0, raw,
+                       (1e-8 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(scores.dtype))
+        gc = jnp.clip(gc, 0.0, 10.0)
+        eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
+        if mult is not None:
+            eg = eg * mult[None, None, :]
+        exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-4
+        gs = jnp.tanh(eg.max(axis=-1, keepdims=True).astype(jnp.float32))
+        xr = x @ w_read.T
+        out = (eg * xr) @ w_write
+        return (out.astype(jnp.float32) / exp_sum * gs).astype(jnp.float32)
+
+    def forward_fn(input_ids):
+        B, S = input_ids.shape
+        d_model = model_cfg['d_model']
+        n_layers = model_cfg['n_layers']
+        n_heads = model_cfg['n_heads']
+        d_head = d_model // n_heads
+        pp = params['neuron_pool']
+        rp = params['router']
+
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
+        qk_n = pp['qk_emb'] / (jnp.linalg.norm(pp['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+        v_n = pp['v_emb'] / (jnp.linalg.norm(pp['v_emb'], axis=-1, keepdims=True) + 1e-8)
+        kn_n = pp['know_emb'] / (jnp.linalg.norm(pp['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+        for i in range(n_layers):
+            bp = params[f'block_{i}']
+            normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed @ rp['proj_attn']['kernel'] + rp['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed @ rp['tau_attn']['kernel'] + rp['tau_attn']['bias']
+
+            Q = _srw_sup(normed, h_Q, qk_n, tau_all[:,:,0:1], pp['qk_read'], pp['qk_write'], qk_mult)
+            K = _srw_sup(normed, h_K, qk_n, tau_all[:,:,1:2], pp['qk_read'], pp['qk_write'], qk_mult)
+            V = _srw_sup(normed, h_V, v_n, tau_all[:,:,2:3], pp['v_read'], pp['v_write'], v_mult)
+
+            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            sc = jnp.sqrt(jnp.float32(d_head))
+            attn_s = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / sc
+            causal = jnp.tril(jnp.ones((S,S), dtype=jnp.bool_))
+            attn_s = jnp.where(causal, attn_s, jnp.finfo(attn_s.dtype).min)
+            attn_w = jax.nn.softmax(attn_s, axis=-1)
+            attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+            attn_out = attn_out.transpose(0,2,1,3).reshape(B,S,d_model) @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+
+            normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            h_k = normed @ rp['proj_know']['kernel'] + rp['proj_know']['bias']
+            tau_k = normed @ rp['tau_know']['kernel'] + rp['tau_know']['bias']
+            x = x + _srw_sup(normed, h_k, kn_n, tau_k, pp['know_read'], pp['know_write'], know_mult)
+
+        norm_p = params['norm']
+        x = _layer_norm(x, norm_p['scale'], norm_p['bias'])
+        return x @ params['token_emb']['embedding'].T
+
+    return forward_fn
