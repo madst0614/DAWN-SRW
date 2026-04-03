@@ -156,22 +156,21 @@ def load_checkpoint_params(ckpt_path, model, cfg):
         {'params': rng, 'dropout': rng}, dummy, deterministic=True)
     target_params = variables['params']
 
-    # Load checkpoint
-    import optax
-    dummy_opt = optax.adamw(1e-4)
-    dummy_opt_state = dummy_opt.init(target_params)
-
-    target = {
-        'params': target_params,
-        'opt_state': dummy_opt_state,
-        'epoch': 0, 'step': 0, 'step_in_epoch': 0,
-        'steps_per_epoch': 0, 'best_val_loss': float('inf'),
-        'config': {}, 'training_config': {},
-    }
-
+    # Load checkpoint — params only (skip opt_state to avoid shape mismatch)
     with _open_file(ckpt_path, 'rb') as f:
         bytes_data = f.read()
-    ckpt = serialization.from_bytes(target, bytes_data)
+
+    import msgpack
+    raw = msgpack.unpackb(bytes_data, raw=False)
+
+    # Extract params from raw state dict and restore into target structure
+    raw_params = raw.get('params', raw.get(b'params', {}))
+    ckpt = serialization.from_state_dict({'params': target_params}, {'params': raw_params})
+    ckpt = {
+        'params': ckpt['params'],
+        'step': raw.get('step', raw.get(b'step', 0)),
+        'epoch': raw.get('epoch', raw.get(b'epoch', 0)),
+    }
 
     step = ckpt.get('step', 0)
     epoch = ckpt.get('epoch', 0)
