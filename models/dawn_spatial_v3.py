@@ -911,3 +911,411 @@ class DAWN(nn.Module):
             f"  Per neuron: emb[{self.d_bottleneck}] + read[{self.d_model}] "
             f"+ write[{self.d_model}]",
         ]
+
+
+# ================================================================
+# 9. INFERENCE API — KV-cache prefill + decode
+#    Pure functions only. Training code above is untouched.
+# ================================================================
+
+def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
+    """Non-chunked SRW for inference (S=1 typically).
+    No checkpoint, no LB loss, no bf16 casting.
+    """
+    scores = h @ emb_norm.T
+    scores_f32 = scores.astype(jnp.float32)
+    s_mean = scores_f32.mean(axis=-1, keepdims=True)
+    s_std = jnp.sqrt(jnp.mean(jnp.square(scores_f32 - s_mean),
+                               axis=-1, keepdims=True)) + 1e-8
+    tau = s_mean + tau_offset * s_std
+
+    raw = scores - tau.astype(scores.dtype)
+    gc = jnp.where(raw > 0, raw,
+                   (1e-8 * jnp.exp(jnp.clip(
+                       raw.astype(jnp.float32), -10.0, 0.0)
+                   )).astype(scores.dtype))
+    gc = jnp.clip(gc, 0.0, 10.0)
+    eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
+
+    exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-4
+    gate_strength = jnp.tanh(
+        eg.max(axis=-1, keepdims=True).astype(jnp.float32))
+
+    xr = x @ w_read.T
+    raw_out = (eg * xr) @ w_write
+    out = raw_out.astype(jnp.float32) / exp_sum * gate_strength
+    return out.astype(jnp.float32)
+
+
+def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
+    """Like _srw_inference but also returns normalized gate [B,S,N] for analysis."""
+    scores = h @ emb_norm.T
+    scores_f32 = scores.astype(jnp.float32)
+    s_mean = scores_f32.mean(axis=-1, keepdims=True)
+    s_std = jnp.sqrt(jnp.mean(jnp.square(scores_f32 - s_mean),
+                               axis=-1, keepdims=True)) + 1e-8
+    tau = s_mean + tau_offset * s_std
+
+    raw = scores - tau.astype(scores.dtype)
+    gc = jnp.where(raw > 0, raw,
+                   (1e-8 * jnp.exp(jnp.clip(
+                       raw.astype(jnp.float32), -10.0, 0.0)
+                   )).astype(scores.dtype))
+    gc = jnp.clip(gc, 0.0, 10.0)
+    eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
+
+    exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-4
+    gate_strength = jnp.tanh(
+        eg.max(axis=-1, keepdims=True).astype(jnp.float32))
+    gate_norm = (eg.astype(jnp.float32) / exp_sum * gate_strength)
+
+    xr = x @ w_read.T
+    raw_out = (eg * xr) @ w_write
+    out = raw_out.astype(jnp.float32) / exp_sum * gate_strength
+    return out.astype(jnp.float32), gate_norm
+
+
+def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
+                         n_heads, d_model,
+                         cache_K, cache_V, cache_len):
+    """Cached attention decode step. x: [B, 1, D]."""
+    B = x.shape[0]
+    d_head = d_model // n_heads
+
+    qk_emb = pool_params['qk_emb']
+    qk_norm = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-8)
+    v_emb = pool_params['v_emb']
+    v_norm = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-8)
+
+    h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+    h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+    tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+    Q = _srw_inference(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                       pool_params['qk_read'], pool_params['qk_write'])
+    K_new = _srw_inference(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                           pool_params['qk_read'], pool_params['qk_write'])
+    V_new = _srw_inference(x, h_V, v_norm, tau_all[:, :, 2:3],
+                           pool_params['v_read'], pool_params['v_write'])
+
+    Q = Q.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
+    K_new_h = K_new.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
+    V_new_h = V_new.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
+
+    cache_K = cache_K.at[:, :, cache_len, :].set(K_new_h[:, :, 0, :])
+    cache_V = cache_V.at[:, :, cache_len, :].set(V_new_h[:, :, 0, :])
+
+    scale = jnp.sqrt(jnp.float32(d_head))
+    attn_scores = jnp.einsum('bhqd,bhkd->bhqk', Q, cache_K) / scale
+    pos_mask = jnp.arange(cache_K.shape[2]) < (cache_len + 1)
+    attn_scores = jnp.where(pos_mask[None, None, None, :], attn_scores,
+                            jnp.finfo(attn_scores.dtype).min)
+    attn_w = jax.nn.softmax(attn_scores, axis=-1)
+    out = jnp.einsum('bhqk,bhkd->bhqd', attn_w, cache_V)
+
+    out = out.transpose(0, 2, 1, 3).reshape(B, 1, d_model)
+    out = out @ expand_O_kernel
+    return out, cache_K, cache_V
+
+
+def _know_forward_inference(x, pool_params, router_params):
+    """Inference-only know forward. No chunking, no LB, no dropout."""
+    know_emb = pool_params['know_emb']
+    know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
+    h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+    tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+    return _srw_inference(x, h, know_norm, tau,
+                          pool_params['know_read'], pool_params['know_write'])
+
+
+def prefill(params, model_cfg, input_ids):
+    """Run full forward on prompt, populate KV cache.
+
+    Returns: logits [B,S,vocab], cache_K, cache_V [n_layers,B,H,max_seq,d_head], cache_len
+    """
+    B, S = input_ids.shape
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    max_seq = model_cfg['max_seq_len']
+    d_head = d_model // n_heads
+
+    pool_params = params['neuron_pool']
+    router_params = params['router']
+
+    positions = jnp.arange(S)[jnp.newaxis, :]
+    x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
+
+    qk_norm = pool_params['qk_emb'] / (
+        jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_norm = pool_params['v_emb'] / (
+        jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
+    stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    cache_K = jnp.zeros((n_layers, B, n_heads, max_seq, d_head))
+    cache_V = jnp.zeros((n_layers, B, n_heads, max_seq, d_head))
+
+    def prefill_layer(carry, xs):
+        x, cK, cV = carry
+        bp = xs['params']
+        layer_idx = xs['layer_idx']
+
+        normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+        h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+        Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
+                           pool_params['qk_read'], pool_params['qk_write'])
+        K_val = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2],
+                               pool_params['qk_read'], pool_params['qk_write'])
+        V_val = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
+                               pool_params['v_read'], pool_params['v_write'])
+
+        Q_h = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        K_h = K_val.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        V_h = V_val.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+
+        cK = cK.at[layer_idx, :, :, :S, :].set(K_h)
+        cV = cV.at[layer_idx, :, :, :S, :].set(V_h)
+
+        scale = jnp.sqrt(jnp.float32(d_head))
+        scores = jnp.einsum('bhsd,bhtd->bhst', Q_h, K_h) / scale
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+        attn_w = jax.nn.softmax(scores, axis=-1)
+        attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, V_h)
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
+        attn_out = attn_out @ bp['attn']['expand_O']['kernel']
+        x = x + attn_out
+
+        normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+        know_out = _know_forward_inference(normed, pool_params, router_params)
+        x = x + know_out
+        return (x, cK, cV), None
+
+    xs = {'params': stacked, 'layer_idx': jnp.arange(n_layers)}
+    (x, cache_K, cache_V), _ = jax.lax.scan(prefill_layer, (x, cache_K, cache_V), xs)
+
+    norm_p = params['norm']
+    x = _layer_norm(x, norm_p['scale'], norm_p['bias'])
+    logits = x @ params['token_emb']['embedding'].T
+    return logits, cache_K, cache_V, S
+
+
+def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
+    """Single token decode with KV cache. Returns logits [B,vocab], updated cache."""
+    token_id = token_id.reshape(-1, 1)
+    B = token_id.shape[0]
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+
+    pool_params = params['neuron_pool']
+    router_params = params['router']
+
+    x = (params['token_emb']['embedding'][token_id]
+         + params['pos_emb']['embedding'][[cache_len]])
+
+    block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
+    stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    def decode_layer(carry, xs):
+        x, cK, cV, pos = carry
+        bp = xs['params']
+        layer_idx = xs['layer_idx']
+
+        normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+        attn_out, new_cK, new_cV = _attn_forward_cached(
+            normed, pool_params, router_params,
+            bp['attn']['expand_O']['kernel'],
+            n_heads, d_model, cK[layer_idx], cV[layer_idx], pos)
+        cK = cK.at[layer_idx].set(new_cK)
+        cV = cV.at[layer_idx].set(new_cV)
+        x = x + attn_out
+
+        normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+        know_out = _know_forward_inference(normed, pool_params, router_params)
+        x = x + know_out
+        return (x, cK, cV, pos), None
+
+    xs = {'params': stacked, 'layer_idx': jnp.arange(n_layers)}
+    (x, cache_K, cache_V, _), _ = jax.lax.scan(
+        decode_layer, (x, cache_K, cache_V, cache_len), xs)
+
+    norm_p = params['norm']
+    x = _layer_norm(x, norm_p['scale'], norm_p['bias'])
+    logits = (x @ params['token_emb']['embedding'].T)[:, 0, :]
+    return logits, cache_K, cache_V, cache_len + 1
+
+
+# ================================================================
+# 10. Vectorized analysis helpers (inference-only)
+# ================================================================
+
+def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
+    """Validation without Python loops. all_tokens: [N_seqs, max_seq] on device.
+
+    Uses jax.lax.scan over batches, _srw_inference per layer (no chunking).
+    Returns: (avg_loss, ppl, accuracy, total_valid) — all jnp scalars.
+    """
+    n_seqs = all_tokens.shape[0]
+    n_batches = n_seqs // batch_size
+    tokens = all_tokens[:n_batches * batch_size].reshape(n_batches, batch_size, -1)
+
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    max_seq = model_cfg['max_seq_len']
+
+    pool_params = params['neuron_pool']
+    router_params = params['router']
+    norm_params = params['norm']
+    emb_matrix = params['token_emb']['embedding']
+    pos_matrix = params['pos_emb']['embedding']
+
+    qk_norm = pool_params['qk_emb'] / (
+        jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_norm = pool_params['v_emb'] / (
+        jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_norm = pool_params['know_emb'] / (
+        jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
+    stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    def forward_batch(input_ids):
+        B, S = input_ids.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids] + pos_matrix[positions]
+
+        def layer_fn(x, bp):
+            normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+            Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
+                               pool_params['qk_read'], pool_params['qk_write'])
+            K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2],
+                               pool_params['qk_read'], pool_params['qk_write'])
+            V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
+                               pool_params['v_read'], pool_params['v_write'])
+
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vr = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+
+            scale = jnp.sqrt(jnp.float32(d_head))
+            scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+            attn_w = jax.nn.softmax(scores, axis=-1)
+            attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = attn_out @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+
+            normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+            tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+            know_out = _srw_inference(normed, h_k, know_norm, tau_k,
+                                     pool_params['know_read'], pool_params['know_write'])
+            x = x + know_out
+            return x, None
+
+        x, _ = jax.lax.scan(layer_fn, x, stacked)
+        x = _layer_norm(x, norm_params['scale'], norm_params['bias'])
+
+        shift_x = x[:, :-1, :]
+        shift_labels = input_ids[:, 1:].astype(jnp.int32)
+        valid_mask = shift_labels > 0
+
+        logits = shift_x @ emb_matrix.T
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        safe_labels = jnp.where(valid_mask, shift_labels, 0)
+        token_loss = -jnp.take_along_axis(
+            log_probs, safe_labels[..., jnp.newaxis], axis=-1).squeeze(-1)
+        total_loss = (token_loss * valid_mask).sum()
+        preds = jnp.argmax(logits, axis=-1)
+        correct = ((preds == shift_labels) & valid_mask).sum()
+        valid_count = valid_mask.sum()
+        return total_loss, correct, valid_count
+
+    def scan_batches(carry, batch):
+        tl, tc, tv = carry
+        loss, correct, valid = forward_batch(batch)
+        return (tl + loss, tc + correct, tv + valid), None
+
+    init = (jnp.float32(0.0), jnp.int32(0), jnp.int32(0))
+    (total_loss, total_correct, total_valid), _ = jax.lax.scan(
+        scan_batches, init, tokens)
+
+    avg_loss = total_loss / (total_valid + 1e-8)
+    ppl = jnp.exp(avg_loss)
+    acc = total_correct.astype(jnp.float32) / (total_valid + 1e-8) * 100.0
+    return avg_loss, ppl, acc, total_valid
+
+
+def vectorized_neuron_health(params):
+    """All neuron health stats. Returns dict of jnp values (single device_get later)."""
+    pool = params['neuron_pool']
+    results = {}
+    for pool_name, emb_key in [('QK', 'qk_emb'), ('V', 'v_emb'), ('Know', 'know_emb')]:
+        emb = pool[emb_key]
+        read = pool[emb_key.replace('emb', 'read')]
+        write = pool[emb_key.replace('emb', 'write')]
+        emb_n = jnp.linalg.norm(emb, axis=-1)
+        read_n = jnp.linalg.norm(read, axis=-1)
+        write_n = jnp.linalg.norm(write, axis=-1)
+        results[pool_name] = {
+            'N': emb.shape[0],
+            'emb_mean': emb_n.mean(), 'emb_std': emb_n.std(),
+            'emb_dead': (emb_n < 1e-6).sum(),
+            'read_mean': read_n.mean(), 'read_std': read_n.std(),
+            'read_dead': (read_n < 1e-6).sum(),
+            'write_mean': write_n.mean(), 'write_std': write_n.std(),
+            'write_dead': (write_n < 1e-6).sum(),
+        }
+    results['tau_attn_bias'] = params['router']['tau_attn']['bias']
+    results['tau_know_bias'] = params['router']['tau_know']['bias']
+    return results
+
+
+def vectorized_weight_analysis(params, max_sample=2048):
+    """Weight analysis: effective rank + cosine sim. All on device."""
+    pool = params['neuron_pool']
+    results = {}
+    for pool_name, emb_key in [('QK', 'qk_emb'), ('V', 'v_emb'), ('Know', 'know_emb')]:
+        emb = pool[emb_key]
+        N, d = emb.shape
+        if N > max_sample:
+            idx = jnp.linspace(0, N - 1, max_sample, dtype=jnp.int32)
+            emb_s = emb[idx]
+        else:
+            emb_s = emb
+        norms = jnp.linalg.norm(emb_s, axis=-1, keepdims=True) + 1e-8
+        emb_normed = emb_s / norms
+        n_s = emb_normed.shape[0]
+
+        gram = emb_normed @ emb_normed.T
+        gram = gram - jnp.eye(n_s) * gram
+        mean_sim = jnp.abs(gram).sum() / (n_s * (n_s - 1))
+        max_sim = jnp.abs(gram).max()
+
+        sv = jnp.linalg.svd(emb_s, compute_uv=False)
+        sv_norm = sv / (sv.sum() + 1e-8)
+        entropy = -(sv_norm * jnp.log(sv_norm + 1e-10)).sum()
+        eff_rank = jnp.exp(entropy)
+
+        results[pool_name] = {
+            'N': N, 'd': d,
+            'mean_cosine_sim': mean_sim,
+            'max_cosine_sim': max_sim,
+            'effective_rank': eff_rank,
+            'top5_sv': sv[:5],
+        }
+    return results
