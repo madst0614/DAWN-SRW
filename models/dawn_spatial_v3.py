@@ -91,7 +91,7 @@ def threshold_gate(scores, tau_offset):
     # gate in bf16 ([B,S,N] tensors)
     raw = scores - tau.astype(scores.dtype)
     gate = jnp.where(raw > 0, raw,
-                     (1e-4 * jax.nn.softplus(raw.astype(jnp.float32))).astype(scores.dtype))
+                     (1e-8 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(scores.dtype))
 
     gate = jnp.clip(gate, 0.0, 10.0)
     exp_gate = (jnp.exp(gate.astype(jnp.float32)) - 1.0).astype(scores.dtype)
@@ -183,7 +183,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             sc = h_bf @ ec.T
             raw = sc - tau_bf
             gc = jnp.where(raw > 0, raw,
-                            1e-4 * jax.nn.softplus(raw))
+                            (1e-8 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
             gc = jnp.clip(gc, 0.0, 10.0)
             eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
             ef = eg.astype(jnp.float32)
@@ -302,7 +302,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             sc = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             raw = sc - tau_bf
             gc = jnp.where(raw > 0, raw,
-                            1e-4 * jax.nn.softplus(raw))
+                            (1e-8 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
             gc = jnp.clip(gc, 0.0, 10.0)
             eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
             ef = eg.astype(jnp.float32)
@@ -391,7 +391,7 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
         sc = h_bf @ ec.T
         raw = sc - tau_bf
         gc = jnp.where(raw > 0, raw,
-                        1e-4 * jax.nn.softplus(raw))
+                        (1e-8 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
         gc = jnp.clip(gc, 0.0, 10.0)
         eg = (jnp.exp(gc.astype(jnp.float32))-1.0).astype(jnp.bfloat16)
         ef = eg.astype(jnp.float32)
