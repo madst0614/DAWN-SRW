@@ -364,56 +364,77 @@ def analyze_neuron_health(model, params, cfg):
 # ============================================================
 
 def generate(model, params, cfg, prompt, max_new_tokens=100, temperature=0.8, top_k=50):
-    """Autoregressive generation with DAWN-Spatial."""
+    """Autoregressive generation with DAWN-Spatial.
+
+    Uses fixed-length padded input to avoid JIT recompilation per token.
+    """
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
     input_ids = tokenizer.encode(prompt, add_special_tokens=False)
     max_seq = cfg['model'].get('max_seq_len', 512)
+    gen_len = min(max_new_tokens, max_seq - len(input_ids))
 
+    # Fixed-length forward: pad to max_seq, use position index to read correct logits
     @jax.jit
-    def forward_logits(params, ids):
+    def forward_logits(params, ids_padded, seq_pos):
+        """ids_padded: [max_seq] fixed-length, seq_pos: index of last real token."""
         result = model.apply(
-            {'params': params}, ids[None, :],
+            {'params': params}, ids_padded[None, :],
             deterministic=True,
             rngs={'dropout': jax.random.PRNGKey(0)})
-        return result['logits'][0, -1, :]  # last token logits
+        return result['logits'][0, seq_pos, :]  # logits at last real token
 
-    print(f"\n  Prompt: \"{prompt}\"")
-    print(f"  Generating {max_new_tokens} tokens (temp={temperature}, top_k={top_k})...")
+    @jax.jit
+    def sample_token(logits, rng, temperature, top_k):
+        logits = logits / temperature
+        top_vals, _ = jax.lax.top_k(logits, top_k)
+        threshold = top_vals[-1]
+        logits = jnp.where(logits >= threshold, logits, -1e10)
+        return jax.random.categorical(rng, logits)
+
+    print(f"\n  Prompt: \"{prompt}\" ({len(input_ids)} tokens)")
+    print(f"  Generating up to {gen_len} tokens (temp={temperature}, top_k={top_k})...")
     print(f"  ---")
 
     rng = jax.random.PRNGKey(42)
     generated = list(input_ids)
 
-    for i in range(max_new_tokens):
-        # Truncate to max_seq
-        context = jnp.array(generated[-max_seq:], dtype=jnp.int32)
-        logits = forward_logits(params, context)
+    # Warmup JIT with first call
+    ids_padded = np.zeros(max_seq, dtype=np.int32)
+    ids_padded[:len(generated)] = generated
+    _ = forward_logits(params, jnp.array(ids_padded), len(generated) - 1)
 
-        # Temperature + top-k sampling
-        logits = logits / temperature
-        if top_k > 0:
-            top_k_vals = jax.lax.top_k(logits, top_k)
-            threshold = top_k_vals[0][-1]
-            logits = jnp.where(logits >= threshold, logits, -1e10)
+    t0 = time.time()
+    for i in range(gen_len):
+        pos = len(generated) - 1
+        if pos >= max_seq - 1:
+            break
+
+        ids_padded = np.zeros(max_seq, dtype=np.int32)
+        ids_padded[:len(generated)] = generated[-max_seq:]
+        logits = forward_logits(params, jnp.array(ids_padded), jnp.int32(pos))
 
         rng, sample_rng = jax.random.split(rng)
-        next_token = int(jax.random.categorical(sample_rng, logits))
+        next_token = int(sample_token(logits, sample_rng, temperature, top_k))
         generated.append(next_token)
 
         # Stop on [SEP] or [PAD]
         if next_token in (tokenizer.sep_token_id, tokenizer.pad_token_id):
             break
 
+    elapsed = time.time() - t0
+    n_gen = len(generated) - len(input_ids)
+
     output_text = tokenizer.decode(generated, skip_special_tokens=True)
     gen_text = tokenizer.decode(generated[len(input_ids):], skip_special_tokens=True)
 
     print(f"  {output_text}")
     print(f"  ---")
-    print(f"  Generated {len(generated) - len(input_ids)} tokens")
+    print(f"  Generated {n_gen} tokens in {elapsed:.1f}s ({n_gen/elapsed:.1f} tok/s)")
 
-    return {'prompt': prompt, 'output': output_text, 'generated': gen_text}
+    return {'prompt': prompt, 'output': output_text, 'generated': gen_text,
+            'n_tokens': n_gen, 'tok_per_sec': n_gen / elapsed if elapsed > 0 else 0}
 
 
 # ============================================================
@@ -449,11 +470,9 @@ def analyze_weights(params, cfg):
         mean_sim = float(np.abs(sim).mean())
         max_sim = float(np.abs(sim).max())
 
-        # Effective rank (via singular values)
-        if N <= 4096:
-            sv = np.linalg.svd(emb, compute_uv=False)
-        else:
-            sv = np.linalg.svd(emb[:4096], compute_uv=False)
+        # Effective rank (via singular values on sampled rows)
+        emb_sample = emb[:min(N, 2048)]
+        sv = np.linalg.svd(emb_sample, compute_uv=False)
         sv_norm = sv / (sv.sum() + 1e-8)
         entropy = -float((sv_norm * np.log(sv_norm + 1e-10)).sum())
         eff_rank = float(np.exp(entropy))
