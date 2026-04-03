@@ -793,6 +793,491 @@ def analyze_generation_samples(params, cfg, output_dir,
 
 
 # ============================================================
+# R.1: Q/K Specialization (rebuttal D.1 methodology)
+# ============================================================
+
+def analyze_qk_specialization(params, cfg, val_tokens, output_dir,
+                               n_batches=50, batch_size=8):
+    """Q/K specialization: same method as v17.1 rebuttal D.1.
+
+    For each QK neuron, count how often it's selected by Q vs K gate.
+    q_ratio = q_count / (q_count + k_count). Threshold 0.7/0.3.
+    """
+    print("\n" + "="*60)
+    print("R.1: Q/K Specialization")
+    print("="*60)
+
+    from models.dawn_spatial_v3 import analysis_forward
+    import numpy as np
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    n_qk = model_cfg['n_qk']
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    total_batches = min(n_batches, n_seqs // batch_size)
+
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    # Accumulate per-neuron Q/K counts across batches
+    q_counts = np.zeros(n_qk, dtype=np.float64)
+    k_counts = np.zeros(n_qk, dtype=np.float64)
+    overlaps = []
+
+    print(f"  Processing {total_batches} batches (bs={batch_size})...")
+    for i in range(total_batches):
+        batch = jnp.array(tokens[i*batch_size:(i+1)*batch_size], dtype=jnp.int32)
+        _, layer_info = jit_analysis(params, batch)
+
+        # Average across layers, get binary activation
+        # gate_Q: [n_layers, B, S, n_qk]
+        gQ = np.array(jax.device_get(layer_info['gate_Q']))  # [L, B, S, N]
+        gK = np.array(jax.device_get(layer_info['gate_K']))
+
+        # Binary: active if gate > 1e-6
+        q_active = (gQ > 1e-6).sum(axis=(0, 1, 2))  # [N] summed over layers,batch,seq
+        k_active = (gK > 1e-6).sum(axis=(0, 1, 2))
+        q_counts += q_active
+        k_counts += k_active
+
+        # Batch overlap (across all layers)
+        q_bin = gQ > 1e-6
+        k_bin = gK > 1e-6
+        both = (q_bin & k_bin).sum()
+        either = (q_bin | k_bin).sum()
+        overlaps.append(float(both) / (float(either) + 1e-8))
+
+        if (i+1) % 10 == 0:
+            print(f"    [{i+1}/{total_batches}]")
+
+    # Classification
+    total_usage = q_counts + k_counts
+    valid_mask = total_usage > 0
+    q_ratio = np.zeros(n_qk)
+    q_ratio[valid_mask] = q_counts[valid_mask] / total_usage[valid_mask]
+
+    q_specialized = int((q_ratio[valid_mask] > 0.7).sum())
+    k_specialized = int((q_ratio[valid_mask] < 0.3).sum())
+    shared = int(((q_ratio[valid_mask] >= 0.3) & (q_ratio[valid_mask] <= 0.7)).sum())
+    inactive = int((~valid_mask).sum())
+    active = int(valid_mask.sum())
+
+    # Pearson correlation
+    if valid_mask.sum() > 1:
+        corr_all = float(np.corrcoef(q_counts, k_counts)[0, 1])
+        corr_active = float(np.corrcoef(
+            q_counts[valid_mask], k_counts[valid_mask])[0, 1])
+    else:
+        corr_all = corr_active = 0.0
+
+    avg_overlap = float(np.mean(overlaps))
+
+    # Sensitivity analysis
+    sensitivity = {}
+    for thresh in [0.6, 0.65, 0.7, 0.75, 0.8]:
+        q_s = int((q_ratio[valid_mask] > thresh).sum())
+        k_s = int((q_ratio[valid_mask] < (1 - thresh)).sum())
+        sh = int(((q_ratio[valid_mask] >= (1 - thresh)) &
+                  (q_ratio[valid_mask] <= thresh)).sum())
+        sensitivity[str(thresh)] = {
+            'q_specialized': q_s, 'k_specialized': k_s, 'shared': sh}
+
+    spec_pct = (q_specialized + k_specialized) / active * 100 if active > 0 else 0
+
+    print(f"\n  QK Pool ({n_qk} neurons):")
+    print(f"    Correlation (all): r={corr_all:.4f}")
+    print(f"    Correlation (active): r={corr_active:.4f}")
+    print(f"    Q-only: {q_specialized}  K-only: {k_specialized}  "
+          f"Shared: {shared}  Inactive: {inactive}")
+    print(f"    Specialization: {spec_pct:.1f}% (of {active} active)")
+    print(f"    Avg Q/K overlap: {avg_overlap:.4f}")
+    print(f"    Threshold sensitivity:")
+    for t, s in sorted(sensitivity.items()):
+        t_spec = s['q_specialized'] + s['k_specialized']
+        t_active = t_spec + s['shared']
+        t_pct = t_spec / t_active * 100 if t_active > 0 else 0
+        print(f"      θ={t}: Q={s['q_specialized']} K={s['k_specialized']} "
+              f"Shared={s['shared']} → {t_pct:.1f}%")
+
+    results = {
+        'n_neurons': n_qk, 'n_active': active,
+        'q_specialized': q_specialized, 'k_specialized': k_specialized,
+        'shared': shared, 'inactive': inactive,
+        'specialization_pct': spec_pct,
+        'correlation': corr_all, 'correlation_active': corr_active,
+        'avg_overlap': avg_overlap,
+        'sensitivity_analysis': sensitivity,
+    }
+    _save_json(results, output_dir, 'r1_qk_specialization', 'results.json')
+    return results
+
+
+# ============================================================
+# R.4: Layer-wise Attn/Know Balance (rebuttal D.4 methodology)
+# ============================================================
+
+def analyze_layer_balance(params, cfg, val_tokens, output_dir,
+                          n_batches=50, batch_size=8):
+    """Layer balance: output norm ratio (same as v17.1 D.4)."""
+    print("\n" + "="*60)
+    print("R.4: Layer-wise Balance")
+    print("="*60)
+
+    from models.dawn_spatial_v3 import analysis_forward
+    import numpy as np
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    n_layers = model_cfg['n_layers']
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    total_batches = min(n_batches, n_seqs // batch_size)
+
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    attn_norms = np.zeros(n_layers)
+    know_norms = np.zeros(n_layers)
+
+    print(f"  Processing {total_batches} batches...")
+    for i in range(total_batches):
+        batch = jnp.array(tokens[i*batch_size:(i+1)*batch_size], dtype=jnp.int32)
+        _, layer_info = jit_analysis(params, batch)
+        an = np.array(jax.device_get(layer_info['attn_out_norm']))  # [n_layers]
+        kn = np.array(jax.device_get(layer_info['know_out_norm']))
+        attn_norms += an
+        know_norms += kn
+
+    attn_norms /= total_batches
+    know_norms /= total_batches
+
+    per_layer = []
+    print(f"\n  Layer-wise Contribution (%):")
+    for layer in range(n_layers):
+        total = attn_norms[layer] + know_norms[layer] + 1e-8
+        a_ratio = attn_norms[layer] / total * 100
+        k_ratio = know_norms[layer] / total * 100
+        bar_len = int(a_ratio / 2)
+        bar = '#' * bar_len + '.' * (50 - bar_len)
+        print(f"    L{layer:2d}: {a_ratio:5.1f}% attn  {k_ratio:5.1f}% know  |{bar}|")
+        per_layer.append({
+            'layer': layer,
+            'attention_norm': float(attn_norms[layer]),
+            'knowledge_norm': float(know_norms[layer]),
+            'attention_ratio': float(a_ratio),
+            'knowledge_ratio': float(k_ratio),
+        })
+
+    third = n_layers // 3
+    early_attn = np.mean([p['attention_ratio'] for p in per_layer[:third]])
+    mid_attn = np.mean([p['attention_ratio'] for p in per_layer[third:2*third]])
+    late_attn = np.mean([p['attention_ratio'] for p in per_layer[2*third:]])
+
+    print(f"\n  Early (L0-{third-1}):  {early_attn:.1f}% attention")
+    print(f"  Mid:              {mid_attn:.1f}% attention")
+    print(f"  Late:             {late_attn:.1f}% attention")
+
+    results = {
+        'n_layers': n_layers,
+        'per_layer': per_layer,
+        'summary': {
+            'early_layers_attn': float(early_attn),
+            'mid_layers_attn': float(mid_attn),
+            'late_layers_attn': float(late_attn),
+        }
+    }
+    _save_json(results, output_dir, 'r4_layer_balance', 'results.json')
+    return results
+
+
+# ============================================================
+# R.3: Knowledge Neurons — Contrastive Score (rebuttal D.3)
+# ============================================================
+
+PHYSICS_QUERIES = [
+    {"prompt": "light travels at the speed of", "target": "light"},
+    {"prompt": "the earth orbits the", "target": "sun"},
+    {"prompt": "the earth revolves around the", "target": "sun"},
+]
+
+CONTROL_QUERIES = [
+    {"prompt": "the largest organ in the human body is the", "target": "skin"},
+    {"prompt": "water freezes at", "target": "zero"},
+    {"prompt": "the capital of france is", "target": "paris"},
+]
+
+
+def analyze_knowledge_neurons(params, cfg, output_dir,
+                               min_target_count=20, max_runs=500):
+    """Knowledge neurons via contrastive score (same as v17.1 D.3).
+
+    contrastive_score[neuron] = target_freq - baseline_freq
+    """
+    print("\n" + "="*60)
+    print("R.3: Knowledge Neurons (Contrastive)")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    from models.dawn_spatial_v3 import prefill, decode_step, analysis_forward
+    import numpy as np
+    from collections import Counter
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    model_cfg = get_model_cfg(cfg)
+
+    jit_prefill = jax.jit(lambda p, ids: prefill(p, model_cfg, ids))
+    jit_decode = jax.jit(lambda p, tok, cK, cV, cL: decode_step(p, model_cfg, tok, cK, cV, cL))
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    all_queries = PHYSICS_QUERIES + CONTROL_QUERIES
+    results = {'physics': [], 'control': []}
+
+    for qi, q in enumerate(all_queries):
+        is_physics = qi < len(PHYSICS_QUERIES)
+        tag = 'physics' if is_physics else 'control'
+        prompt = q['prompt']
+        target = q['target'].lower()
+        target_id = tokenizer.encode(target, add_special_tokens=False)
+        if not target_id:
+            print(f"  Skipping '{target}' — not in vocab")
+            continue
+        target_id = target_id[0]
+
+        print(f"\n  [{tag}] \"{prompt}\" → '{target}' (id={target_id})")
+
+        # Collect activations
+        know_target_counts = Counter()  # neuron_id → count when target generated
+        know_baseline_counts = Counter()
+        successful_runs = 0
+        total_baseline_steps = 0
+
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+
+        for run in range(max_runs):
+            if successful_runs >= min_target_count:
+                break
+
+            # Generate one token at a time, check if it's target
+            prompt_dev = jnp.array([prompt_ids], dtype=jnp.int32)
+            logits_pf, cK, cV, cL = jit_prefill(params, prompt_dev)
+
+            # Get gate info for the prompt
+            _, layer_info = jit_analysis(params, prompt_dev)
+            # Know gate at last position, averaged over layers
+            # gate_Know: [n_layers, 1, S, n_know]
+            know_gates = jax.device_get(layer_info['gate_Know'])  # [L, 1, S, N]
+
+            # Greedy decode up to 10 tokens
+            last_logits = logits_pf[0, -1, :]
+            rng = jax.random.PRNGKey(run)
+
+            for step in range(10):
+                rng, srng = jax.random.split(rng)
+                # Temperature sampling for diversity
+                l = last_logits / 0.9
+                next_tok = int(jax.random.categorical(srng, l))
+
+                # Get active neurons at this step (from last position of prompt/context)
+                # Use know gates from the last position
+                last_pos_gates = know_gates[:, 0, -1, :]  # [L, N]
+                active_neurons = set(np.where(last_pos_gates.mean(axis=0) > 1e-6)[0])
+
+                if next_tok == target_id:
+                    successful_runs += 1
+                    for n in active_neurons:
+                        know_target_counts[n] += 1
+                    break
+                else:
+                    total_baseline_steps += 1
+                    for n in active_neurons:
+                        know_baseline_counts[n] += 1
+
+                    # Continue generation
+                    if cL >= model_cfg['max_seq_len'] - 1:
+                        break
+                    tok_dev = jnp.array([next_tok], dtype=jnp.int32)
+                    last_logits, cK, cV, cL = jit_decode(params, tok_dev, cK, cV, cL)
+                    last_logits = last_logits[0]
+
+            if (run + 1) % 50 == 0:
+                print(f"    run {run+1}: {successful_runs}/{min_target_count} hits")
+
+        # Compute contrastive scores
+        all_neurons = set(know_target_counts.keys()) | set(know_baseline_counts.keys())
+        contrastive = {}
+        for n in all_neurons:
+            t_freq = know_target_counts[n] / max(successful_runs, 1)
+            b_freq = know_baseline_counts[n] / max(total_baseline_steps, 1)
+            contrastive[int(n)] = {
+                'target_freq': t_freq,
+                'baseline_freq': b_freq,
+                'contrastive': t_freq - b_freq,
+            }
+
+        # Top contrastive neurons
+        top_neurons = sorted(contrastive.items(),
+                            key=lambda x: x[1]['contrastive'], reverse=True)[:10]
+        if top_neurons:
+            top_str = ", ".join(f"n{n}({s['contrastive']:+.3f})" for n, s in top_neurons[:5])
+            print(f"    Hits: {successful_runs}/{run+1} runs")
+            print(f"    Top know neurons: {top_str}")
+
+        entry = {
+            'prompt': prompt, 'target': target,
+            'successful_runs': successful_runs,
+            'total_runs': run + 1,
+            'match_rate': successful_runs / max(run + 1, 1),
+            'top_neurons': [{
+                'neuron': n, **s
+            } for n, s in top_neurons],
+            'n_unique_active': len(all_neurons),
+        }
+        results[tag].append(entry)
+
+    _save_json(results, output_dir, 'r3_knowledge_neurons', 'results.json')
+    return results
+
+
+# ============================================================
+# R.5: Suppression Sweep (rebuttal D.5 methodology)
+# ============================================================
+
+def analyze_suppression(params, cfg, output_dir, knowledge_results=None,
+                        sweep_pcts=(0.05, 0.10, 0.15, 0.20)):
+    """Neuron suppression sweep (same as v17.1 D.5).
+
+    Suppress top N% neurons by contrastive score, measure probability drop.
+    """
+    print("\n" + "="*60)
+    print("R.5: Suppression Sweep")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    from models.dawn_spatial_v3 import build_suppressed_forward
+    import numpy as np
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    model_cfg = get_model_cfg(cfg)
+    n_know = model_cfg['n_know']
+
+    # Get contrastive scores from D.3
+    if knowledge_results is None:
+        d3_path = os.path.join(output_dir, 'r3_knowledge_neurons', 'results.json')
+        if os.path.exists(d3_path):
+            with open(d3_path) as f:
+                knowledge_results = json.load(f)
+        else:
+            print("  Need R.3 results first. Run with --only r3 first.")
+            return None
+
+    # Collect all contrastive scores from physics queries
+    all_scores = {}
+    for entry in knowledge_results.get('physics', []):
+        for n_info in entry.get('top_neurons', []):
+            nid = n_info['neuron']
+            cs = n_info['contrastive']
+            all_scores[nid] = all_scores.get(nid, 0) + cs
+
+    if not all_scores:
+        print("  No contrastive scores found.")
+        return None
+
+    # Baseline probabilities
+    @jax.jit
+    def get_logits(params, ids):
+        from models.dawn_spatial_v3 import prefill
+        logits, _, _, _ = prefill(params, model_cfg, ids)
+        return logits
+
+    def get_target_prob(forward_fn, prompt, target):
+        """Get probability of target token given prompt."""
+        input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        target_id = tokenizer.encode(target.lower(), add_special_tokens=False)
+        if not target_id:
+            return 0.0
+        target_id = target_id[0]
+        ids = jnp.array([input_ids], dtype=jnp.int32)
+        logits = forward_fn(ids)
+        probs = jax.nn.softmax(logits[0, -1, :])
+        return float(probs[target_id])
+
+    # Baseline forward (no suppression)
+    baseline_forward = jax.jit(build_suppressed_forward(
+        params, model_cfg, {}))
+
+    print("  Baseline probabilities:")
+    baseline_probs = {}
+    for q in PHYSICS_QUERIES + CONTROL_QUERIES:
+        p = get_target_prob(baseline_forward, q['prompt'], q['target'])
+        baseline_probs[q['prompt']] = p
+        tag = 'physics' if q in PHYSICS_QUERIES else 'control'
+        print(f"    [{tag}] \"{q['prompt']}\" → '{q['target']}': {p:.2%}")
+
+    # Sweep
+    sweep_results = []
+    sorted_neurons = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+
+    for pct in sweep_pcts:
+        n_suppress = max(1, int(n_know * pct))
+        suppress_ids = [n for n, _ in sorted_neurons[:n_suppress]]
+
+        know_mask = np.zeros(n_know, dtype=bool)
+        for nid in suppress_ids:
+            if nid < n_know:
+                know_mask[nid] = True
+
+        print(f"\n  pct={pct:.2f}: suppressing {know_mask.sum()} know neurons")
+
+        sup_forward = jax.jit(build_suppressed_forward(
+            params, model_cfg, {'know': jnp.array(know_mask)}))
+
+        target_drops = []
+        control_drops = []
+
+        for q in PHYSICS_QUERIES:
+            post_p = get_target_prob(sup_forward, q['prompt'], q['target'])
+            pre_p = baseline_probs[q['prompt']]
+            drop = pre_p - post_p
+            target_drops.append(drop)
+            print(f"    [physics] \"{q['prompt']}\" pre={pre_p:.2%} post={post_p:.2%} drop={drop:+.2%}")
+
+        for q in CONTROL_QUERIES:
+            post_p = get_target_prob(sup_forward, q['prompt'], q['target'])
+            pre_p = baseline_probs[q['prompt']]
+            drop = pre_p - post_p
+            control_drops.append(drop)
+            print(f"    [control] \"{q['prompt']}\" pre={pre_p:.2%} post={post_p:.2%} drop={drop:+.2%}")
+
+        avg_td = float(np.mean(target_drops))
+        avg_cd = float(np.mean(control_drops))
+        sel_idx = avg_td - avg_cd
+        verdict = 'SELECTIVE' if sel_idx > 0.1 else 'WEAK' if sel_idx > 0 else 'NON-SELECTIVE'
+
+        print(f"    >> target drop: {avg_td:+.2%} | control drop: {avg_cd:+.2%} | "
+              f"selectivity: {sel_idx:+.2%} → {verdict}")
+
+        sweep_results.append({
+            'pct': pct, 'n_suppressed': int(know_mask.sum()),
+            'avg_target_drop': avg_td, 'avg_control_drop': avg_cd,
+            'selectivity_index': sel_idx, 'verdict': verdict,
+            'target_drops': [float(d) for d in target_drops],
+            'control_drops': [float(d) for d in control_drops],
+        })
+
+    # Summary table
+    print(f"\n  {'pct':>5s} | {'neurons':>7s} | {'target':>8s} | {'control':>8s} | {'select':>8s} | verdict")
+    print(f"  {'-'*60}")
+    for r in sweep_results:
+        print(f"  {r['pct']:5.2f} | {r['n_suppressed']:7d} | {r['avg_target_drop']:>+7.2%} | "
+              f"{r['avg_control_drop']:>+7.2%} | {r['selectivity_index']:>+7.2%} | {r['verdict']}")
+
+    _save_json({'sweep': sweep_results, 'baseline_probs': baseline_probs},
+               output_dir, 'r5_suppression', 'results.json')
+    return {'sweep': sweep_results}
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -860,6 +1345,33 @@ def main():
         analyze_generation_samples(params, cfg, args.output,
                                    max_new_tokens=args.max_new_tokens,
                                    temperature=args.temperature)
+
+    # --- Rebuttal analyses (D.1-D.5 methodology) ---
+    # Load val tokens for rebuttal analyses if not already loaded
+    if val_tokens is None and val_path:
+        needs_val = any(k in (only or set()) for k in ['r1', 'r4']) if only else True
+        if needs_val:
+            val_tokens = load_val_tokens(val_path)
+
+    if only is None or 'r1' in only:
+        if val_tokens is not None:
+            analyze_qk_specialization(params, cfg, val_tokens, args.output)
+        else:
+            print("\n  Skipping R.1 (no --val_data)")
+
+    if only is None or 'r4' in only:
+        if val_tokens is not None:
+            analyze_layer_balance(params, cfg, val_tokens, args.output)
+        else:
+            print("\n  Skipping R.4 (no --val_data)")
+
+    r3_results = None
+    if only is None or 'r3' in only:
+        r3_results = analyze_knowledge_neurons(params, cfg, args.output)
+
+    if only is None or 'r5' in only:
+        analyze_suppression(params, cfg, args.output,
+                           knowledge_results=r3_results)
 
     print(f"\nDone. Results in {args.output}/")
 
