@@ -639,7 +639,10 @@ def _know_forward(x, pool_params, router_params, rng,
     # Load balance loss from gate distribution + tau regularization
     tau_reg = jnp.maximum(tau, 0.0).mean() * 0.01
     aux = lb_loss + tau_reg
-    return out, aux, active_count, gate_max_val, gs_mean, es_mean
+    emb_norm_val = jnp.linalg.norm(know_emb, axis=-1).mean()
+    read_norm_val = jnp.linalg.norm(know_read, axis=-1).mean()
+    write_norm_val = jnp.linalg.norm(know_write, axis=-1).mean()
+    return out, aux, active_count, gate_max_val, gs_mean, es_mean, emb_norm_val, read_norm_val, write_norm_val
 
 
 # ================================================================
@@ -793,6 +796,8 @@ class DAWN(nn.Module):
 
         if self.is_initializing():
             total_aux = jnp.float32(0.0)
+            attn_auxes = jnp.float32(0.0)
+            know_auxes = jnp.float32(0.0)
             know_actives = jnp.float32(0.0)
             know_gmaxes = jnp.float32(0.0)
             know_gs_all = jnp.float32(0.0)
@@ -837,29 +842,35 @@ class DAWN(nn.Module):
 
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
-                know_out, know_aux, know_active, know_gmax, know_gs, know_es = _know_forward(
+                know_out, know_aux, know_active, know_gmax, know_gs, know_es, k_emb_n, k_read_n, k_write_n = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.max_k_know,
                     self.router_dropout, self.dropout_rate, deterministic,
                     self.n_chunks_know, sharded_fns=_sharded)
                 x = x + know_out
-                return x, (attn_aux + know_aux, know_active, know_gmax, know_gs, know_es)
+                return x, (attn_aux, know_aux, know_active, know_gmax, know_gs, know_es, k_emb_n, k_read_n, k_write_n)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
 
             xs = {'params': stacked, 'rng': layer_rngs}
-            x, (aux_losses, know_actives, know_gmaxes, know_gs_all, know_es_all) = jax.lax.scan(
+            x, (attn_auxes, know_auxes, know_actives, know_gmaxes,
+                know_gs_all, know_es_all, k_emb_n_all, k_read_n_all, k_write_n_all) = jax.lax.scan(
                 scan_body, x, xs)
-            total_aux = aux_losses.sum()
+            total_aux = (attn_auxes + know_auxes).sum()
 
         x = self.norm(x)
         result = {
             'aux_loss': total_aux,
+            'attn_aux': attn_auxes.mean(),
+            'know_aux': know_auxes.mean(),
             'know_active': know_actives.mean(),
             'know_gate_max': know_gmaxes.mean(),
             'know_gs': know_gs_all.mean(),
             'know_es': know_es_all.mean(),
+            'know_emb_norm': k_emb_n_all.mean(),
+            'know_read_norm': k_read_n_all.mean(),
+            'know_write_norm': k_write_n_all.mean(),
         }
 
         if labels is not None:

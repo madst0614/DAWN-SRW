@@ -502,6 +502,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_gate_max': result.get('know_gate_max', jnp.float32(0.0)),
             'know_gs': result.get('know_gs', jnp.float32(0.0)),
             'know_es': result.get('know_es', jnp.float32(0.0)),
+            'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
+            'know_aux': result.get('know_aux', jnp.float32(0.0)),
+            'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
+            'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
+            'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
             'tau_know_bias': tau_know_b[0],
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
@@ -1893,10 +1898,20 @@ def main():
                                   f"max={k_gmax:.4f} "
                                   f"| gs={k_gs:.4f} es={k_es:.1f}")
 
+                        m_attn_aux = _m(metrics.get('attn_aux', 0.0))
+                        m_know_aux = _m(metrics.get('know_aux', 0.0))
+                        k_emb_n = _m(metrics.get('know_emb_norm', 0.0))
+                        k_read_n = _m(metrics.get('know_read_norm', 0.0))
+                        k_write_n = _m(metrics.get('know_write_norm', 0.0))
+
                         log_message(
                             f"      {tau_s} | grad_norm={m_grad:.3f}")
                         log_message(
                             f"      {gate_s}")
+                        log_message(
+                            f"      aux: attn={m_attn_aux:.2f} know={m_know_aux:.2f}"
+                            f" | know_emb={k_emb_n:.3f} know_read={k_read_n:.3f}"
+                            f" know_write={k_write_n:.3f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
