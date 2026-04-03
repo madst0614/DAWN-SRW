@@ -249,37 +249,51 @@ def analyze_validation(model, params, cfg, val_data_path, max_batches=200, batch
     tokens = tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     print(f"  Tokens: {n_tokens:,}, Sequences: {n_seqs:,}")
 
+    # eval_step returns weighted loss (loss*valid) to avoid per-batch sync
     @jax.jit
     def eval_step(params, input_ids):
         attention_mask = jnp.ones_like(input_ids)
-        labels = input_ids
         result = model.apply(
-            {'params': params}, input_ids, labels=labels,
+            {'params': params}, input_ids, labels=input_ids,
             attention_mask=attention_mask, deterministic=True,
             rngs={'dropout': jax.random.PRNGKey(0)})
-        return result['loss'], result['correct'], result['valid_count']
+        # Return weighted values — accumulate on device, sync once at end
+        return (result['loss'] * result['valid_count'],
+                result['correct'], result['valid_count'])
 
-    total_loss = 0.0
-    total_correct = 0
-    total_valid = 0
     n_batches = min(max_batches, n_seqs // batch_size)
+    # Pre-load all batches to device at once
+    total_seqs = n_batches * batch_size
+    all_tokens = jnp.array(tokens[:total_seqs], dtype=jnp.int32)
 
-    print(f"  Running {n_batches} batches (bs={batch_size})...")
+    print(f"  Running {n_batches} batches (bs={batch_size}, "
+          f"{total_seqs*max_seq:,} tokens on device)...")
+
+    # Accumulate on device — no per-batch host sync
+    acc_loss = jnp.float32(0.0)
+    acc_correct = jnp.float32(0.0)
+    acc_valid = jnp.float32(0.0)
+
     t0 = time.time()
-
     for i in range(n_batches):
-        batch = jnp.array(tokens[i*batch_size:(i+1)*batch_size], dtype=jnp.int32)
-        loss, correct, valid = eval_step(params, batch)
-        loss, correct, valid = float(loss), int(correct), int(valid)
-        total_loss += loss * valid
-        total_correct += correct
-        total_valid += valid
+        batch = jax.lax.dynamic_slice(
+            all_tokens, (i * batch_size, 0), (batch_size, max_seq))
+        wloss, correct, valid = eval_step(params, batch)
+        acc_loss = acc_loss + wloss
+        acc_correct = acc_correct + correct
+        acc_valid = acc_valid + valid
 
         if (i+1) % 50 == 0:
-            avg = total_loss / total_valid
+            # Periodic sync for progress (only every 50 batches)
+            avg = float(acc_loss) / float(acc_valid)
             print(f"    [{i+1}/{n_batches}] loss={avg:.4f} ppl={math.exp(avg):.2f}")
 
+    # Single host sync at the end
+    total_loss = float(acc_loss)
+    total_correct = int(acc_correct)
+    total_valid = int(acc_valid)
     elapsed = time.time() - t0
+
     avg_loss = total_loss / total_valid
     ppl = math.exp(avg_loss)
     acc = total_correct / total_valid * 100
@@ -306,55 +320,52 @@ def analyze_neuron_health(model, params, cfg):
     pool = params['neuron_pool']
     results = {}
 
-    for pool_name, emb_key, n_key in [
-        ('QK', 'qk_emb', 'n_qk'), ('V', 'v_emb', 'n_v'),
-        ('Know', 'know_emb', 'n_know')
-    ]:
+    # Compute all stats on device, collect into one dict, then single sync
+    @jax.jit
+    def compute_pool_stats(emb, read, write):
+        emb_n = jnp.linalg.norm(emb, axis=-1)
+        read_n = jnp.linalg.norm(read, axis=-1)
+        write_n = jnp.linalg.norm(write, axis=-1)
+        return {
+            'emb_mean': emb_n.mean(), 'emb_std': emb_n.std(),
+            'emb_dead': (emb_n < 1e-6).sum(),
+            'read_mean': read_n.mean(), 'read_std': read_n.std(),
+            'read_dead': (read_n < 1e-6).sum(),
+            'write_mean': write_n.mean(), 'write_std': write_n.std(),
+            'write_dead': (write_n < 1e-6).sum(),
+        }
+
+    for pool_name, emb_key in [('QK', 'qk_emb'), ('V', 'v_emb'), ('Know', 'know_emb')]:
         emb = pool[emb_key]
-        read_key = emb_key.replace('emb', 'read')
-        write_key = emb_key.replace('emb', 'write')
-        read = pool[read_key]
-        write = pool[write_key]
+        read = pool[emb_key.replace('emb', 'read')]
+        write = pool[emb_key.replace('emb', 'write')]
         N = emb.shape[0]
 
-        # Embedding norms
-        emb_norms = jnp.linalg.norm(emb, axis=-1)
-        read_norms = jnp.linalg.norm(read, axis=-1)
-        write_norms = jnp.linalg.norm(write, axis=-1)
-
-        # Dead neurons (near-zero norm)
-        dead_emb = int((emb_norms < 1e-6).sum())
-        dead_read = int((read_norms < 1e-6).sum())
-        dead_write = int((write_norms < 1e-6).sum())
+        # Single device call + single host sync via jax.device_get
+        s = jax.device_get(compute_pool_stats(emb, read, write))
 
         print(f"\n  {pool_name} Pool (N={N}):")
-        print(f"    emb   norm: mean={float(emb_norms.mean()):.4f}, "
-              f"std={float(emb_norms.std()):.4f}, "
-              f"dead={dead_emb}")
-        print(f"    read  norm: mean={float(read_norms.mean()):.4f}, "
-              f"std={float(read_norms.std()):.4f}, "
-              f"dead={dead_read}")
-        print(f"    write norm: mean={float(write_norms.mean()):.4f}, "
-              f"std={float(write_norms.std()):.4f}, "
-              f"dead={dead_write}")
+        for w in ('emb', 'read', 'write'):
+            print(f"    {w:5s} norm: mean={s[f'{w}_mean']:.4f}, "
+                  f"std={s[f'{w}_std']:.4f}, dead={int(s[f'{w}_dead'])}")
 
         results[pool_name] = {
             'N': N,
-            'emb_norm_mean': float(emb_norms.mean()),
-            'read_norm_mean': float(read_norms.mean()),
-            'write_norm_mean': float(write_norms.mean()),
-            'dead_emb': dead_emb,
-            'dead_read': dead_read,
-            'dead_write': dead_write,
+            'emb_norm_mean': float(s['emb_mean']),
+            'read_norm_mean': float(s['read_mean']),
+            'write_norm_mean': float(s['write_mean']),
+            'dead_emb': int(s['emb_dead']),
+            'dead_read': int(s['read_dead']),
+            'dead_write': int(s['write_dead']),
         }
 
-    # Router tau bias
+    # Router tau bias — single sync
     router = params['router']
-    tau_attn = router['tau_attn']['bias']
-    tau_know = router['tau_know']['bias']
+    tau_attn = jax.device_get(router['tau_attn']['bias'])
+    tau_know = jax.device_get(router['tau_know']['bias'])
     print(f"\n  Tau bias:")
-    print(f"    attn: [{', '.join(f'{float(v):.3f}' for v in tau_attn)}]")
-    print(f"    know: [{float(tau_know[0]):.3f}]")
+    print(f"    attn: [{', '.join(f'{v:.3f}' for v in tau_attn)}]")
+    print(f"    know: [{tau_know[0]:.3f}]")
 
     return results
 
@@ -375,66 +386,66 @@ def generate(model, params, cfg, prompt, max_new_tokens=100, temperature=0.8, to
     max_seq = cfg['model'].get('max_seq_len', 512)
     gen_len = min(max_new_tokens, max_seq - len(input_ids))
 
-    # Fixed-length forward: pad to max_seq, use position index to read correct logits
+    # Single jitted step: forward + sample, no host round-trip per token
     @jax.jit
-    def forward_logits(params, ids_padded, seq_pos):
-        """ids_padded: [max_seq] fixed-length, seq_pos: index of last real token."""
-        result = model.apply(
+    def generate_step(params, ids_padded, seq_pos, rng):
+        logits = model.apply(
             {'params': params}, ids_padded[None, :],
             deterministic=True,
-            rngs={'dropout': jax.random.PRNGKey(0)})
-        return result['logits'][0, seq_pos, :]  # logits at last real token
-
-    @jax.jit
-    def sample_token(logits, rng, temperature, top_k):
+            rngs={'dropout': jax.random.PRNGKey(0)})['logits'][0, seq_pos, :]
         logits = logits / temperature
         top_vals, _ = jax.lax.top_k(logits, top_k)
-        threshold = top_vals[-1]
-        logits = jnp.where(logits >= threshold, logits, -1e10)
-        return jax.random.categorical(rng, logits)
+        logits = jnp.where(logits >= top_vals[-1], logits, -1e10)
+        rng, sample_rng = jax.random.split(rng)
+        next_token = jax.random.categorical(sample_rng, logits)
+        # Update ids in-place on device
+        new_ids = jax.lax.dynamic_update_index_in_dim(
+            ids_padded, next_token.astype(jnp.int32), seq_pos + 1, axis=0)
+        return new_ids, next_token, rng
 
     print(f"\n  Prompt: \"{prompt}\" ({len(input_ids)} tokens)")
     print(f"  Generating up to {gen_len} tokens (temp={temperature}, top_k={top_k})...")
     print(f"  ---")
 
-    rng = jax.random.PRNGKey(42)
-    generated = list(input_ids)
-
-    # Warmup JIT with first call
+    # Build initial padded ids on device (single transfer)
     ids_padded = np.zeros(max_seq, dtype=np.int32)
-    ids_padded[:len(generated)] = generated
-    _ = forward_logits(params, jnp.array(ids_padded), len(generated) - 1)
+    ids_padded[:len(input_ids)] = input_ids
+    ids_dev = jnp.array(ids_padded)
+    rng = jax.random.PRNGKey(42)
+
+    # Warmup JIT
+    _ = generate_step(params, ids_dev, jnp.int32(len(input_ids) - 1), rng)
 
     t0 = time.time()
+    pos = len(input_ids) - 1
+    stop_ids = {tokenizer.sep_token_id, tokenizer.pad_token_id}
+    n_gen = 0
+
     for i in range(gen_len):
-        pos = len(generated) - 1
         if pos >= max_seq - 1:
             break
-
-        ids_padded = np.zeros(max_seq, dtype=np.int32)
-        ids_padded[:len(generated)] = generated[-max_seq:]
-        logits = forward_logits(params, jnp.array(ids_padded), jnp.int32(pos))
-
-        rng, sample_rng = jax.random.split(rng)
-        next_token = int(sample_token(logits, sample_rng, temperature, top_k))
-        generated.append(next_token)
-
-        # Stop on [SEP] or [PAD]
-        if next_token in (tokenizer.sep_token_id, tokenizer.pad_token_id):
+        ids_dev, next_token, rng = generate_step(params, ids_dev, jnp.int32(pos), rng)
+        pos += 1
+        n_gen += 1
+        # Only sync to check stop token (cheap: single int)
+        tok_id = int(next_token)
+        if tok_id in stop_ids:
             break
 
     elapsed = time.time() - t0
-    n_gen = len(generated) - len(input_ids)
 
-    output_text = tokenizer.decode(generated, skip_special_tokens=True)
-    gen_text = tokenizer.decode(generated[len(input_ids):], skip_special_tokens=True)
+    # Single sync: get all generated ids from device
+    all_ids = jax.device_get(ids_dev)[:pos + 1].tolist()
+    output_text = tokenizer.decode(all_ids, skip_special_tokens=True)
+    gen_text = tokenizer.decode(all_ids[len(input_ids):], skip_special_tokens=True)
 
     print(f"  {output_text}")
     print(f"  ---")
-    print(f"  Generated {n_gen} tokens in {elapsed:.1f}s ({n_gen/elapsed:.1f} tok/s)")
+    tok_s = n_gen / elapsed if elapsed > 0 else 0
+    print(f"  Generated {n_gen} tokens in {elapsed:.1f}s ({tok_s:.1f} tok/s)")
 
     return {'prompt': prompt, 'output': output_text, 'generated': gen_text,
-            'n_tokens': n_gen, 'tok_per_sec': n_gen / elapsed if elapsed > 0 else 0}
+            'n_tokens': n_gen, 'tok_per_sec': tok_s}
 
 
 # ============================================================
@@ -453,33 +464,27 @@ def analyze_weights(params, cfg):
         emb = np.array(pool[emb_key])
         N, d = emb.shape
 
-        # Normalize for cosine similarity
+        # Cosine similarity stats without materializing N×N matrix
         norms = np.linalg.norm(emb, axis=-1, keepdims=True) + 1e-8
         emb_normed = emb / norms
+        # mean |cos_sim| ≈ sample mean of |a·b| for random pairs
+        n_sample = min(N, 1024)
+        idx = np.random.default_rng(42).choice(N, n_sample, replace=False)
+        sample = emb_normed[idx]
+        gram = sample @ sample.T  # [1024, 1024] — manageable
+        np.fill_diagonal(gram, 0)
+        mean_sim = float(np.abs(gram).mean() * n_sample / (n_sample - 1))
+        max_sim = float(np.abs(gram).max())
 
-        # Sample if too large
-        if N > 4096:
-            idx = np.linspace(0, N-1, 4096, dtype=int)
-            sample = emb_normed[idx]
-        else:
-            sample = emb_normed
-
-        # Cosine similarity matrix
-        sim = sample @ sample.T
-        np.fill_diagonal(sim, 0)
-        mean_sim = float(np.abs(sim).mean())
-        max_sim = float(np.abs(sim).max())
-
-        # Effective rank (via singular values on sampled rows)
-        emb_sample = emb[:min(N, 2048)]
-        sv = np.linalg.svd(emb_sample, compute_uv=False)
+        # Effective rank (via SVD on small sample)
+        sv = np.linalg.svd(sample, compute_uv=False)
         sv_norm = sv / (sv.sum() + 1e-8)
         entropy = -float((sv_norm * np.log(sv_norm + 1e-10)).sum())
         eff_rank = float(np.exp(entropy))
 
         print(f"\n  {pool_name} (N={N}, d={d}):")
-        print(f"    Cosine sim: mean={mean_sim:.4f}, max={max_sim:.4f}")
-        print(f"    Effective rank: {eff_rank:.1f} / {min(N, d)}")
+        print(f"    Cosine sim: mean={mean_sim:.4f}, max={max_sim:.4f} (sampled {n_sample})")
+        print(f"    Effective rank: {eff_rank:.1f} / {min(n_sample, d)}")
         print(f"    Top-5 SVs: {', '.join(f'{v:.2f}' for v in sv[:5])}")
 
         results[pool_name] = {
