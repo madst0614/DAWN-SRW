@@ -9,7 +9,7 @@ Changelog:
 
   spatial-r1-v3.8.1 (2026-04-01):
     - threshold_gate: v18.5 relative tau (mean + offset*std)
-    - Dead neuron gradient flow (1e-8 * exp(raw))
+    - Dead neuron gradient flow (1e-6 * exp(raw))
     - Exp scaling + gate_strength (tanh)
     - tau init: bias=-0.5, kernel=zeros (initially ~70% activation)
 
@@ -91,7 +91,7 @@ def threshold_gate(scores, tau_offset):
     # gate in bf16 ([B,S,N] tensors)
     raw = scores - tau.astype(scores.dtype)
     gate = jnp.where(raw > 0, raw,
-                     (1e-8 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(scores.dtype))
+                     (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(scores.dtype))
 
     gate = jnp.clip(gate, 0.0, 10.0)
     exp_gate = (jnp.exp(gate.astype(jnp.float32)) - 1.0).astype(scores.dtype)
@@ -134,7 +134,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
              out_specs=(P('data', None, None),   # out [B,S,D]
                         P('data', None, None),   # active [B,S,1]
                         P('data', None, None),   # gate_max [B,S,1]
-                        P()),                    # lb_loss scalar
+                        P(),                     # lb_loss scalar
+                        P(),                     # gs_mean scalar
+                        P()),                    # es_mean scalar
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, tau_offset, read_local, write_local):
         N_local = emb_local.shape[0]
@@ -183,7 +185,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             sc = h_bf @ ec.T
             raw = sc - tau_bf
             gc = jnp.where(raw > 0, raw,
-                            (1e-8 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
+                            (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
             gc = jnp.clip(gc, 0.0, 10.0)
             eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
             ef = eg.astype(jnp.float32)
@@ -206,8 +208,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
              z_scalar, z_scalar),
             jnp.arange(nc))
 
-        global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-4
-        gate_strength = jax.lax.stop_gradient(jnp.tanh(total_em))
+        global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-8
+        gate_strength = jnp.tanh(total_em)
         out = raw_out / global_exp_sum * gate_strength
         # bf16 before psum: 640MB → 320MB per all-reduce
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
@@ -224,7 +226,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         norm_lb_sq = global_lb_sq / (exp_sum_scalar ** 2)
         lb_loss = norm_lb_sq * N_total - 2.0 * norm_lb_sum + 1.0
 
-        return out.astype(jnp.float32), active / N_total, total_em, lb_loss
+        gs_mean = jnp.tanh(total_em).mean()
+        es_mean = global_exp_sum.mean()
+        return out.astype(jnp.float32), active / N_total, total_em, lb_loss, gs_mean, es_mean
 
     return fused_gate_srw
 
@@ -251,7 +255,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
              out_specs=(P('data', None, None, None), # out [B,S,2,D]
                         P('data', None, None),       # active [B,S,1]
                         P('data', None, None),       # gate_max [B,S,1]
-                        P()),                        # lb_loss scalar
+                        P(),                         # lb_loss scalar
+                        P(),                         # gs_mean scalar
+                        P()),                        # es_mean scalar
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, tau_offset, read_local, write_local):
         N_local = emb_local.shape[0]
@@ -300,7 +306,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             sc = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             raw = sc - tau_bf
             gc = jnp.where(raw > 0, raw,
-                            (1e-8 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
+                            (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
             gc = jnp.clip(gc, 0.0, 10.0)
             eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
             ef = eg.astype(jnp.float32)
@@ -325,8 +331,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             jnp.arange(nc))
 
         # Normalize per route independently
-        global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-4
-        gate_strength = jax.lax.stop_gradient(jnp.tanh(total_em))
+        global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-8
+        gate_strength = jnp.tanh(total_em)
         out = raw_out / global_exp_sum * gate_strength
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
@@ -344,7 +350,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         norm_lb_sq = global_lb_sq / (exp_sum_scalar ** 2)
         lb_loss = norm_lb_sq * N_total - 2.0 * norm_lb_sum + 1.0
 
-        return out.astype(jnp.float32), active_mean / N_total, gate_max_mean, lb_loss
+        gs_mean = jnp.tanh(total_em).mean()
+        es_mean = global_exp_sum.mean()
+        return out.astype(jnp.float32), active_mean / N_total, gate_max_mean, lb_loss, gs_mean, es_mean
 
     return fused_gate_srw_paired
 
@@ -391,7 +399,7 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
         sc = h_bf @ ec.T
         raw = sc - tau_bf
         gc = jnp.where(raw > 0, raw,
-                        (1e-8 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
+                        (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
         gc = jnp.clip(gc, 0.0, 10.0)
         eg = (jnp.exp(gc.astype(jnp.float32))-1.0).astype(jnp.bfloat16)
         ef = eg.astype(jnp.float32)
@@ -412,7 +420,7 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
          z_scalar, z_scalar),
         jnp.arange(n_chunks))
 
-    inv_es = (1.0/(tes+1e-4)).astype(jnp.bfloat16)
+    inv_es = (1.0/(tes+1e-8)).astype(jnp.bfloat16)
     gs = jnp.tanh(tem).astype(jnp.bfloat16)
     out = raw_out * inv_es * gs
 
@@ -422,7 +430,9 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
     norm_lb_sq = lb_sq / (exp_sum_scalar ** 2)
     lb_loss = norm_lb_sq * N - 2.0 * norm_lb_sum + 1.0
 
-    return out.astype(jnp.float32), tac / N, tem, lb_loss
+    gs_mean = jnp.tanh(tem).mean()
+    es_mean = tes.mean()
+    return out.astype(jnp.float32), tac / N, tem, lb_loss, gs_mean, es_mean
 
 
 # ================================================================
@@ -555,18 +565,20 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         fused_single, fused_paired = sharded_fns
         h_QK = jnp.stack([h_Q, h_K], axis=2)  # [B,S,2,d_bn]
         tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)  # [B,S,2,1]
-        QK_out, _, _, qk_lb = fused_paired(x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
+        QK_out, _, _, qk_lb, qk_gs, qk_es = fused_paired(x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
         Q = QK_out[:, :, 0, :]  # [B,S,D]
         K = QK_out[:, :, 1, :]  # [B,S,D]
-        V, _, _, v_lb = fused_single(x, h_V, v_norm, tau_all[:, :, 2:3], v_read, v_write)
+        V, _, _, v_lb, v_gs, v_es = fused_single(x, h_V, v_norm, tau_all[:, :, 2:3], v_read, v_write)
     else:
-        Q, _, _, q_lb = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+        Q, _, _, q_lb, q_gs, q_es = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
                                 qk_read, qk_write, n_chunks_qk)
-        K, _, _, k_lb = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+        K, _, _, k_lb, k_gs2, k_es2 = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
                                 qk_read, qk_write, n_chunks_qk)
-        V, _, _, v_lb = _srw_chunked(x, h_V, v_norm, tau_all[:, :, 2:3],
+        V, _, _, v_lb, v_gs, v_es = _srw_chunked(x, h_V, v_norm, tau_all[:, :, 2:3],
                                 v_read, v_write, n_chunks_v)
         qk_lb = q_lb + k_lb
+        qk_gs = (q_gs + k_gs2) / 2
+        qk_es = (q_es + k_es2) / 2
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -593,7 +605,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     # Load balance loss from gate distributions + tau regularization
     tau_reg = jnp.maximum(tau_all, 0.0).mean() * 0.01
     aux = qk_lb + v_lb + tau_reg
-    return out, aux
+    attn_gs = (qk_gs + v_gs) / 2
+    attn_es = (qk_es + v_es) / 2
+    return out, aux, attn_gs, attn_es
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -613,10 +627,10 @@ def _know_forward(x, pool_params, router_params, rng,
 
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
-        out, active_count, gate_max_val, lb_loss = fused_single(
+        out, active_count, gate_max_val, lb_loss, gs_mean, es_mean = fused_single(
             x, h, know_norm, tau, know_read, know_write)
     else:
-        out, active_count, gate_max_val, lb_loss = _srw_chunked(
+        out, active_count, gate_max_val, lb_loss, gs_mean, es_mean = _srw_chunked(
             x, h, know_norm, tau, know_read, know_write, n_chunks_know)
 
     rng, rng_out = jax.random.split(rng)
@@ -625,7 +639,7 @@ def _know_forward(x, pool_params, router_params, rng,
     # Load balance loss from gate distribution + tau regularization
     tau_reg = jnp.maximum(tau, 0.0).mean() * 0.01
     aux = lb_loss + tau_reg
-    return out, aux, active_count, gate_max_val
+    return out, aux, active_count, gate_max_val, gs_mean, es_mean
 
 
 # ================================================================
@@ -808,7 +822,7 @@ class DAWN(nn.Module):
 
                 normed = _layer_norm(
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
-                attn_out, attn_aux = _attn_forward(
+                attn_out, attn_aux, attn_gs, attn_es = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
                     self.n_qk, self.n_v,
@@ -821,13 +835,13 @@ class DAWN(nn.Module):
 
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
-                know_out, know_aux, know_active, know_gmax = _know_forward(
+                know_out, know_aux, know_active, know_gmax, know_gs, know_es = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.max_k_know,
                     self.router_dropout, self.dropout_rate, deterministic,
                     self.n_chunks_know, sharded_fns=_sharded)
                 x = x + know_out
-                return x, (attn_aux + know_aux, know_active, know_gmax)
+                return x, (attn_aux + know_aux, know_active, know_gmax, know_gs, know_es)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -931,7 +945,7 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
 
     raw = scores - tau.astype(scores.dtype)
     gc = jnp.where(raw > 0, raw,
-                   (1e-8 * jnp.exp(jnp.clip(
+                   (1e-6 * jnp.exp(jnp.clip(
                        raw.astype(jnp.float32), -10.0, 0.0)
                    )).astype(scores.dtype))
     gc = jnp.clip(gc, 0.0, 10.0)
@@ -958,7 +972,7 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
 
     raw = scores - tau.astype(scores.dtype)
     gc = jnp.where(raw > 0, raw,
-                   (1e-8 * jnp.exp(jnp.clip(
+                   (1e-6 * jnp.exp(jnp.clip(
                        raw.astype(jnp.float32), -10.0, 0.0)
                    )).astype(scores.dtype))
     gc = jnp.clip(gc, 0.0, 10.0)
@@ -1439,7 +1453,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         tau = s_mean + tau_off * s_std
         raw = scores - tau.astype(scores.dtype)
         gc = jnp.where(raw > 0, raw,
-                       (1e-8 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(scores.dtype))
+                       (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(scores.dtype))
         gc = jnp.clip(gc, 0.0, 10.0)
         eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
         if mult is not None:
