@@ -213,11 +213,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             jnp.arange(nc))
 
         global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-8
-        global_exp_max = jax.lax.pmax(total_em, 'model')  # cross-chip max
-        gate_strength = jnp.tanh(global_exp_max)
+        # gate_strength: tanh(max) ≈ 1.0 for large values; use local max
+        # (pmax not differentiable; cross-chip max has negligible effect since tanh saturates)
+        gate_strength = jnp.tanh(total_em)
         out = raw_out / global_exp_sum * gate_strength
-        # bf16 before psum: 640MB → 320MB per all-reduce
-        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         active = jax.lax.psum(total_ac, 'model')
 
@@ -231,10 +230,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         norm_lb_sq = global_lb_sq / (exp_sum_scalar ** 2)
         lb_loss = norm_lb_sq * N_total - 2.0 * norm_lb_sum + 1.0
 
-        gs_mean = jnp.tanh(global_exp_max).mean()
+        gs_mean = jnp.tanh(total_em).mean()
         es_mean = global_exp_sum.mean()
-        norm_gate_max = (global_exp_max / global_exp_sum * gate_strength).mean()
-        return out.astype(jnp.float32), active / N_total, global_exp_max, lb_loss, gs_mean, es_mean, norm_gate_max
+        norm_gate_max = (total_em / global_exp_sum * gate_strength).mean()
+        return out.astype(jnp.float32), active / N_total, total_em, lb_loss, gs_mean, es_mean, norm_gate_max
 
     return fused_gate_srw
 
@@ -342,8 +341,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
 
         # Normalize per route independently
         global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-8
-        global_exp_max = jax.lax.pmax(total_em, 'model')  # cross-chip max
-        gate_strength = jnp.tanh(global_exp_max)
+        gate_strength = jnp.tanh(total_em)
         out = raw_out / global_exp_sum * gate_strength
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
@@ -361,9 +359,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         norm_lb_sq = global_lb_sq / (exp_sum_scalar ** 2)
         lb_loss = norm_lb_sq * N_total - 2.0 * norm_lb_sum + 1.0
 
-        gs_mean = jnp.tanh(global_exp_max).mean()
+        gs_mean = jnp.tanh(total_em).mean()
         es_mean = global_exp_sum.mean()
-        norm_gate_max = (global_exp_max / global_exp_sum * gate_strength).mean()
+        norm_gate_max = (total_em / global_exp_sum * gate_strength).mean()
         return out.astype(jnp.float32), active_mean / N_total, gate_max_mean, lb_loss, gs_mean, es_mean, norm_gate_max
 
     return fused_gate_srw_paired
