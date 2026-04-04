@@ -121,13 +121,10 @@ def build_model_from_config(cfg):
             n_layers=mcfg.get('n_layers', 12),
             n_heads=mcfg.get('n_heads', 6),
             max_seq_len=mcfg.get('max_seq_len', 512),
-            d_bottleneck=mcfg.get('d_bottleneck', 128),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
             n_qk=mcfg.get('n_qk', 1580),
             n_v=mcfg.get('n_v', 2600),
             n_know=mcfg.get('n_know', 25200),
-            max_k_qk=mcfg.get('max_k_qk', 158),
-            max_k_v=mcfg.get('max_k_v', 260),
-            max_k_know=mcfg.get('max_k_know', 1810),
             dropout_rate=mcfg.get('dropout', 0.1),
             router_dropout=mcfg.get('router_dropout', 0.1),
             gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
@@ -1364,9 +1361,6 @@ def main():
             n_heads = cfg['model']['n_heads']
             n_qk_cfg = cfg['model'].get('n_qk', 1580)
             n_v_cfg = cfg['model'].get('n_v', 2620)
-            max_k_qk = cfg['model'].get('max_k_qk', 157)
-            max_k_v = cfg['model'].get('max_k_v', 262)
-            max_k_know = cfg['model'].get('max_k_know', 1536)
             rd = cfg['model'].get('router_dropout', 0.1)
             dd = cfg['model'].get('dropout', 0.1)
             prof_rng = jax.random.PRNGKey(42)

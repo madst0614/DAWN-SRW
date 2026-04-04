@@ -1,5 +1,5 @@
 # DAWN Spatial-R1 v3.8.2 Training Config - v4-32 Pod
-# Sense-Read-Write, d_bottleneck=256
+# Sense-Read-Write, d_route=256
 # Global batch: 1024 = 16 chips x 64 per_device_batch
 
 seed: 1
@@ -16,7 +16,7 @@ model:
   d_model: 1280
   n_layers: 18
   n_heads: 16
-  d_bottleneck: 256
+  d_route: 256
 
   n_know: 100000
   n_qk: 6400

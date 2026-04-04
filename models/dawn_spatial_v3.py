@@ -3,7 +3,7 @@ DAWN-Spatial v3.8: Sense-Read-Write (JAX/Flax)
 
 Changelog:
   spatial-r1-v3.8.2 (2026-04-01):
-    - d_bottleneck 64->128 (routing resolution improvement)
+    - d_route 64->128 (routing resolution improvement)
     - threshold_gate clamp (NaN prevention)
     - Neuron counts adjusted for param budget
 
@@ -463,10 +463,10 @@ class NeuronPool(nn.Module):
     n_v: int
     n_know: int
     d_model: int
-    d_bottleneck: int
+    d_route: int
 
     def setup(self):
-        db = self.d_bottleneck
+        db = self.d_route
         dm = self.d_model
 
         # Sense (routing, low-dim)
@@ -491,17 +491,14 @@ class NeuronPool(nn.Module):
 
 class Router(nn.Module):
     d_model: int
-    d_bottleneck: int
+    d_route: int
     n_qk: int
     n_v: int
     n_know: int
-    max_k_qk: int
-    max_k_v: int
-    max_k_know: int
     router_dropout: float = 0.1
 
     def setup(self):
-        db = self.d_bottleneck
+        db = self.d_route
         self.proj_attn = nn.Dense(db * 3, name='proj_attn')
         self.proj_know = nn.Dense(db, name='proj_know')
         self.tau_attn = nn.Dense(3, name='tau_attn',
@@ -560,7 +557,7 @@ class Router(nn.Module):
 
 def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
-                  max_k_qk, max_k_v, n_heads, d_model,
+                  n_heads, d_model,
                   router_dropout, dropout_rate, deterministic,
                   n_chunks_qk=1, n_chunks_v=1,
                   sharded_fns=None):
@@ -640,7 +637,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
 
 def _know_forward(x, pool_params, router_params, rng,
-                  max_k_know,
                   router_dropout, dropout_rate, deterministic,
                   n_chunks_know=1, sharded_fns=None):
     know_emb = pool_params['know_emb']
@@ -777,13 +773,10 @@ class DAWN(nn.Module):
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
 
-    d_bottleneck: int = 128
+    d_route: int = 128
     n_qk: int = 1580
     n_v: int = 2600
     n_know: int = 25200
-    max_k_qk: int = 158
-    max_k_v: int = 260
-    max_k_know: int = 1810
     router_dropout: float = 0.1
     n_chunks_know: int = 1    # N-axis chunking for know pool
     n_chunks_qk: int = 1     # N-axis chunking for qk pool
@@ -800,12 +793,11 @@ class DAWN(nn.Module):
             self.max_seq_len, self.d_model, embedding_init=scaled_normal(0.02))
         self.neuron_pool = NeuronPool(
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
-            d_model=self.d_model, d_bottleneck=self.d_bottleneck)
+            d_model=self.d_model, d_route=self.d_route)
         self.router = Router(
-            d_model=self.d_model, d_bottleneck=self.d_bottleneck,
+            d_model=self.d_model, d_route=self.d_route,
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
-            max_k_qk=self.max_k_qk, max_k_v=self.max_k_v,
-            max_k_know=self.max_k_know, router_dropout=self.router_dropout)
+            router_dropout=self.router_dropout)
         self.layers = [
             DAWNBlock(d_model=self.d_model, n_heads=self.n_heads,
                       dropout_rate=self.dropout_rate, name=f'block_{i}')
@@ -872,7 +864,6 @@ class DAWN(nn.Module):
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
                     self.n_qk, self.n_v,
-                    self.max_k_qk, self.max_k_v,
                     self.n_heads, self.d_model,
                     self.router_dropout, self.dropout_rate, deterministic,
                     self.n_chunks_qk, self.n_chunks_v,
@@ -883,7 +874,6 @@ class DAWN(nn.Module):
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
                 know_out, know_aux, k_active, k_raw_gmax, k_norm_gmax, k_gs, k_es, k_emb_n, k_read_n, k_write_n = _know_forward(
                     normed, pool_params, router_params, rng_know,
-                    self.max_k_know,
                     self.router_dropout, self.dropout_rate, deterministic,
                     self.n_chunks_know, sharded_fns=_sharded)
                 x = x + know_out
@@ -978,19 +968,17 @@ class DAWN(nn.Module):
             'vocab_size': self.vocab_size, 'd_model': self.d_model,
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'max_seq_len': self.max_seq_len,
-            'd_bottleneck': self.d_bottleneck,
+            'd_route': self.d_route,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_know': self.n_know,
-            'max_k_qk': self.max_k_qk, 'max_k_v': self.max_k_v,
-            'max_k_know': self.max_k_know,
         }
 
     def get_model_info(self):
         return [
             f"DAWN v{self.__version__}: Sense-Read-Write",
-            f"  d_model={self.d_model}, d_bottleneck={self.d_bottleneck}, "
+            f"  d_model={self.d_model}, d_route={self.d_route}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  QK: {self.n_qk}, V: {self.n_v}, Know: {self.n_know}",
-            f"  Per neuron: emb[{self.d_bottleneck}] + read[{self.d_model}] "
+            f"  Per neuron: emb[{self.d_route}] + read[{self.d_model}] "
             f"+ write[{self.d_model}]",
         ]
 
