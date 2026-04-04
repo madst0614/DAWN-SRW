@@ -500,10 +500,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_norm': grad_norm,
             'know_active': result.get('know_active', jnp.float32(0.0)),
             'know_gate_max': result.get('know_gate_max', jnp.float32(0.0)),
+            'know_norm_gate_max': result.get('know_norm_gate_max', jnp.float32(0.0)),
             'know_gs': result.get('know_gs', jnp.float32(0.0)),
             'know_es': result.get('know_es', jnp.float32(0.0)),
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'know_aux': result.get('know_aux', jnp.float32(0.0)),
+            'attn_active': result.get('attn_active', jnp.float32(0.0)),
+            'attn_gate_max': result.get('attn_gate_max', jnp.float32(0.0)),
+            'attn_norm_gate_max': result.get('attn_norm_gate_max', jnp.float32(0.0)),
+            'attn_gs': result.get('attn_gs', jnp.float32(0.0)),
+            'attn_es': result.get('attn_es', jnp.float32(0.0)),
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
@@ -1889,14 +1895,11 @@ def main():
 
                         k_act = _m(metrics['know_active'])
                         k_gmax = _m(metrics['know_gate_max'])
+                        k_ngmax = _m(metrics.get('know_norm_gate_max', 0.0))
                         k_gs = _m(metrics.get('know_gs', 0.0))
                         k_es = _m(metrics.get('know_es', 0.0))
                         n_know_cfg = cfg['model'].get('n_know', 27200)
                         k_act_count = k_act * n_know_cfg
-                        gate_s = (f"gate: active={k_act_count:.0f}/{n_know_cfg}"
-                                  f"({k_act*100:.1f}%) "
-                                  f"max={k_gmax:.4f} "
-                                  f"| gs={k_gs:.4f} es={k_es:.1f}")
 
                         m_attn_aux = _m(metrics.get('attn_aux', 0.0))
                         m_know_aux = _m(metrics.get('know_aux', 0.0))
@@ -1904,14 +1907,26 @@ def main():
                         k_read_n = _m(metrics.get('know_read_norm', 0.0))
                         k_write_n = _m(metrics.get('know_write_norm', 0.0))
 
+                        a_act = _m(metrics.get('attn_active', 0.0))
+                        a_gmax = _m(metrics.get('attn_gate_max', 0.0))
+                        a_gs = _m(metrics.get('attn_gs', 0.0))
+                        a_es = _m(metrics.get('attn_es', 0.0))
+
                         log_message(
                             f"      {tau_s} | grad_norm={m_grad:.3f}")
                         log_message(
-                            f"      {gate_s}")
+                            f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
+                            f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
+                            f" write={k_write_n:.3f}")
                         log_message(
-                            f"      aux: attn={m_attn_aux:.2f} know={m_know_aux:.2f}"
-                            f" | know_emb={k_emb_n:.3f} know_read={k_read_n:.3f}"
-                            f" know_write={k_write_n:.3f}")
+                            f"      know: active={k_act_count:.0f}/{n_know_cfg}"
+                            f"({k_act*100:.1f}%) max={k_gmax:.4f}"
+                            f" norm_max={k_ngmax:.4f}"
+                            f" | gs={k_gs:.4f} es={k_es:.1f}")
+                        log_message(
+                            f"      attn: active={a_act:.1%}"
+                            f" max={a_gmax:.4f}"
+                            f" | gs={a_gs:.4f} es={a_es:.1f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
