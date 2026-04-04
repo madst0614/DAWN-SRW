@@ -822,6 +822,15 @@ class DAWN(nn.Module):
             know_gmaxes = jnp.float32(0.0)
             know_gs_all = jnp.float32(0.0)
             know_es_all = jnp.float32(0.0)
+            know_ngmax_all = jnp.float32(0.0)
+            attn_actives = jnp.float32(0.0)
+            attn_gmaxes = jnp.float32(0.0)
+            attn_ngmax_all = jnp.float32(0.0)
+            attn_gs_all = jnp.float32(0.0)
+            attn_es_all = jnp.float32(0.0)
+            k_emb_n_all = jnp.float32(0.0)
+            k_read_n_all = jnp.float32(0.0)
+            k_write_n_all = jnp.float32(0.0)
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
                                attention_mask, deterministic)
