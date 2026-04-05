@@ -486,6 +486,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         tau_attn_b = params.get('router', {}).get('tau_attn', {}).get(
             'bias', jnp.zeros(3))
 
+        # Output scale (per-pool learnable)
+        pool_p = params.get('neuron_pool', {})
+        qk_os = pool_p.get('qk_output_scale', jnp.ones(1))[0]
+        v_os = pool_p.get('v_output_scale', jnp.ones(1))[0]
+        know_os = pool_p.get('know_output_scale', jnp.ones(1))[0]
+
         metrics = {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
@@ -514,6 +520,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
+            'attn_score_mean': result.get('attn_score_mean', jnp.float32(0.0)),
+            'know_score_mean': result.get('know_score_mean', jnp.float32(0.0)),
+            'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
+            'qk_output_scale': qk_os,
+            'v_output_scale': v_os,
+            'know_output_scale': know_os,
         }
 
         return new_params, new_opt_state, metrics
@@ -1912,16 +1924,28 @@ def main():
                             f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
                             f" write={k_write_n:.3f}")
+                        k_smean = _m(metrics.get('know_score_mean', 0.0))
+                        a_smean = _m(metrics.get('attn_score_mean', 0.0))
+                        k_out_n = _m(metrics.get('know_out_norm', 0.0))
+                        qk_os_v = _m(metrics.get('qk_output_scale', 1.0))
+                        v_os_v = _m(metrics.get('v_output_scale', 1.0))
+                        k_os_v = _m(metrics.get('know_output_scale', 1.0))
+
                         log_message(
                             f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
                             f"({k_act*100:.1f}%) raw_max={k_raw_gmax:.4f}"
                             f" conc={k_gconc:.1f}"
-                            f" | s_std={k_sstd:.3f} gsum={k_gsum:.1f}")
+                            f" | s_mean={k_smean:.3f} s_std={k_sstd:.3f}"
+                            f" gsum={k_gsum:.1f} out_norm={k_out_n:.3f}")
                         log_message(
                             f"      attn: active={a_act:.1%}"
                             f" raw_max={a_raw_gmax:.4f}"
                             f" conc={a_gconc:.1f}"
-                            f" | s_std={a_sstd:.3f} gsum={a_gsum:.1f}")
+                            f" | s_mean={a_smean:.3f} s_std={a_sstd:.3f}"
+                            f" gsum={a_gsum:.1f}")
+                        log_message(
+                            f"      scale: qk={qk_os_v:.4f} v={v_os_v:.4f}"
+                            f" know={k_os_v:.4f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
