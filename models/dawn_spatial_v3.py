@@ -2,6 +2,14 @@
 DAWN-Spatial v3.8: Sense-Read-Write (JAX/Flax)
 
 Changelog:
+  spatial-r1-v3.9.0 (2026-04-05):
+    - Gate: exp(gate)-1 → ReLU (linear gate). No dead neuron gradient.
+    - Gate: σ-normalization removed (raw = scores - tau, no /std)
+    - LB loss: 39M-style uniform target MSE per neuron
+    - Attn dropout restored inside checkpoint (rng passed as arg)
+    - New logging: score_std, gate_concentration
+    - Inference APIs updated to match linear gate
+
   spatial-r1-v3.8.2 (2026-04-01):
     - d_route 64->128 (routing resolution improvement)
     - threshold_gate clamp (NaN prevention)
@@ -734,7 +742,7 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """DAWN-Spatial v3.8: Sense-Read-Write."""
-    __version__ = "spatial-r1-v3.8.2"
+    __version__ = "spatial-r1-v3.9.0"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -962,6 +970,7 @@ class DAWN(nn.Module):
 def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     """Non-chunked SRW for inference (S=1 typically).
     No checkpoint, no LB loss, no bf16 casting.
+    Linear gate (ReLU), no σ-normalization.
     """
     scores = h @ emb_norm.T
     scores_f32 = scores.astype(jnp.float32)
@@ -971,20 +980,16 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     tau = s_mean + tau_offset * s_std
 
     raw = scores - tau.astype(scores.dtype)
-    gc = jnp.where(raw > 0, raw,
-                   (1e-6 * jnp.exp(jnp.clip(
-                       raw.astype(jnp.float32), -10.0, 0.0)
-                   )).astype(scores.dtype))
-    gc = jnp.clip(gc, 0.0, 10.0)
-    eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
+    gate = jnp.maximum(raw, 0.0)
+    gate = jnp.clip(gate, 0.0, 10.0)
 
-    exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+    gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
     gate_strength = jnp.tanh(
-        eg.max(axis=-1, keepdims=True).astype(jnp.float32))
+        gate.max(axis=-1, keepdims=True).astype(jnp.float32))
 
     xr = x @ w_read.T
-    raw_out = (eg * xr) @ w_write
-    out = raw_out.astype(jnp.float32) / exp_sum * gate_strength
+    raw_out = (gate * xr) @ w_write
+    out = raw_out.astype(jnp.float32) / gate_sum * gate_strength
     return out.astype(jnp.float32)
 
 
@@ -998,21 +1003,17 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     tau = s_mean + tau_offset * s_std
 
     raw = scores - tau.astype(scores.dtype)
-    gc = jnp.where(raw > 0, raw,
-                   (1e-6 * jnp.exp(jnp.clip(
-                       raw.astype(jnp.float32), -10.0, 0.0)
-                   )).astype(scores.dtype))
-    gc = jnp.clip(gc, 0.0, 10.0)
-    eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
+    gate = jnp.maximum(raw, 0.0)
+    gate = jnp.clip(gate, 0.0, 10.0)
 
-    exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+    gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
     gate_strength = jnp.tanh(
-        eg.max(axis=-1, keepdims=True).astype(jnp.float32))
-    gate_norm = (eg.astype(jnp.float32) / exp_sum * gate_strength)
+        gate.max(axis=-1, keepdims=True).astype(jnp.float32))
+    gate_norm = (gate.astype(jnp.float32) / gate_sum * gate_strength)
 
     xr = x @ w_read.T
-    raw_out = (eg * xr) @ w_write
-    out = raw_out.astype(jnp.float32) / exp_sum * gate_strength
+    raw_out = (gate * xr) @ w_write
+    out = raw_out.astype(jnp.float32) / gate_sum * gate_strength
     return out.astype(jnp.float32), gate_norm
 
 
@@ -1472,24 +1473,22 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if 'know' in suppress_masks else None
 
     def _srw_sup(x, h, emb_n, tau_off, w_read, w_write, mult):
-        """SRW with optional gate suppression."""
+        """SRW with optional gate suppression. Linear gate (ReLU)."""
         scores = h @ emb_n.T
         sf = scores.astype(jnp.float32)
         s_mean = sf.mean(axis=-1, keepdims=True)
         s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
         tau = s_mean + tau_off * s_std
         raw = scores - tau.astype(scores.dtype)
-        gc = jnp.where(raw > 0, raw,
-                       (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(scores.dtype))
-        gc = jnp.clip(gc, 0.0, 10.0)
-        eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
+        gate = jnp.maximum(raw, 0.0)
+        gate = jnp.clip(gate, 0.0, 10.0)
         if mult is not None:
-            eg = eg * mult[None, None, :]
-        exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
-        gs = jnp.tanh(eg.max(axis=-1, keepdims=True).astype(jnp.float32))
+            gate = gate * mult[None, None, :]
+        gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+        gs = jnp.tanh(gate.max(axis=-1, keepdims=True).astype(jnp.float32))
         xr = x @ w_read.T
-        out = (eg * xr) @ w_write
-        return (out.astype(jnp.float32) / exp_sum * gs).astype(jnp.float32)
+        out = (gate * xr) @ w_write
+        return (out.astype(jnp.float32) / gate_sum * gs).astype(jnp.float32)
 
     def forward_fn(input_ids):
         B, S = input_ids.shape
