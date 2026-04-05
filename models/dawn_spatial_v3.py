@@ -231,7 +231,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             jnp.arange(nc))
 
         global_gate_sum = jax.lax.psum(total_gate_sum, 'model') + 1e-8
-        global_gate_max = jax.lax.pmax(total_gate_max, 'model')
+        global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         gate_strength = jnp.tanh(global_gate_max)
         out = raw_out / global_gate_sum * gate_strength
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
@@ -356,7 +356,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
 
         # Normalize per route independently
         global_gate_sum = jax.lax.psum(total_gate_sum, 'model') + 1e-8
-        global_gate_max = jax.lax.pmax(total_gate_max, 'model')
+        global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         gate_strength = jnp.tanh(global_gate_max)
         out = raw_out / global_gate_sum * gate_strength
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
