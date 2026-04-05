@@ -7,7 +7,7 @@ Changelog:
     - All neurons receive LB gradient (no ReLU barrier)
     - Naturally adaptive: weak when scores uniform, strong when biased
     - gate LB (ng_sum/ng_sq) removed from pass 2
-    - read/write init: scaled_normal(0.02) → orthogonal (better initial diversity)
+    - read/write: forward normalize (unit direction), init unit_norm_init
     - score_lb: CV² with adaptive epsilon (spread-invariant, stable at mean≈0)
     - gate_strength: pmax across model shards (global max)
     - Per-pool learnable output_scale (init=1.0) for Q/K, V, Know
@@ -212,6 +212,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
+            rc = rc / (jnp.linalg.norm(rc, axis=-1, keepdims=True) + 1e-8)
+            wc = wc / (jnp.linalg.norm(wc, axis=-1, keepdims=True) + 1e-8)
             scores = h_bf @ ec.T
             raw = scores.astype(jnp.float32) - tau  # f32 (tau already f32)
             gate = jnp.maximum(raw, 0.0)
@@ -336,6 +338,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
+            rc = rc / (jnp.linalg.norm(rc, axis=-1, keepdims=True) + 1e-8)
+            wc = wc / (jnp.linalg.norm(wc, axis=-1, keepdims=True) + 1e-8)
             scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             raw = scores.astype(jnp.float32) - tau
             gate = jnp.maximum(raw, 0.0)
@@ -426,6 +430,8 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
         rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
         wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
+        rc = rc / (jnp.linalg.norm(rc, axis=-1, keepdims=True) + 1e-8)
+        wc = wc / (jnp.linalg.norm(wc, axis=-1, keepdims=True) + 1e-8)
         scores = h_bf @ ec.T
         raw = scores.astype(jnp.float32) - tau
         gate = jnp.maximum(raw, 0.0)
@@ -474,15 +480,15 @@ class NeuronPool(nn.Module):
         self.v_emb = self.param('v_emb', unit_norm_init(), (self.n_v, db))
         self.know_emb = self.param('know_emb', unit_norm_init(), (self.n_know, db))
 
-        # Read (what to extract from x)
-        self.qk_read = self.param('qk_read', nn.initializers.orthogonal(), (self.n_qk, dm))
-        self.v_read = self.param('v_read', nn.initializers.orthogonal(), (self.n_v, dm))
-        self.know_read = self.param('know_read', nn.initializers.orthogonal(), (self.n_know, dm))
+        # Read (what to extract from x) — unit norm, direction only
+        self.qk_read = self.param('qk_read', unit_norm_init(), (self.n_qk, dm))
+        self.v_read = self.param('v_read', unit_norm_init(), (self.n_v, dm))
+        self.know_read = self.param('know_read', unit_norm_init(), (self.n_know, dm))
 
-        # Write (direction to push)
-        self.qk_write = self.param('qk_write', nn.initializers.orthogonal(), (self.n_qk, dm))
-        self.v_write = self.param('v_write', nn.initializers.orthogonal(), (self.n_v, dm))
-        self.know_write = self.param('know_write', nn.initializers.orthogonal(), (self.n_know, dm))
+        # Write (direction to push) — unit norm, direction only
+        self.qk_write = self.param('qk_write', unit_norm_init(), (self.n_qk, dm))
+        self.v_write = self.param('v_write', unit_norm_init(), (self.n_v, dm))
+        self.know_write = self.param('know_write', unit_norm_init(), (self.n_know, dm))
 
         # Per-pool output scale (learnable, init=1.0)
         self.qk_output_scale = self.param('qk_output_scale', lambda k, s: jnp.ones(s), (1,))
@@ -1020,8 +1026,10 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     gate_strength = jnp.tanh(
         gate.max(axis=-1, keepdims=True).astype(jnp.float32))
 
-    xr = x @ w_read.T
-    raw_out = (gate * xr) @ w_write
+    r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
+    w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
+    xr = x @ r_n.T
+    raw_out = (gate * xr) @ w_n
     out = raw_out.astype(jnp.float32) / gate_sum * gate_strength
     return out.astype(jnp.float32)
 
@@ -1044,8 +1052,10 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
         gate.max(axis=-1, keepdims=True).astype(jnp.float32))
     gate_norm = (gate.astype(jnp.float32) / gate_sum * gate_strength)
 
-    xr = x @ w_read.T
-    raw_out = (gate * xr) @ w_write
+    r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
+    w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
+    xr = x @ r_n.T
+    raw_out = (gate * xr) @ w_n
     out = raw_out.astype(jnp.float32) / gate_sum * gate_strength
     return out.astype(jnp.float32), gate_norm
 
@@ -1533,8 +1543,10 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             gate = gate * mult[None, None, :]
         gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
         gs = jnp.tanh(gate.max(axis=-1, keepdims=True).astype(jnp.float32))
-        xr = x @ w_read.T
-        out = (gate * xr) @ w_write
+        r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
+        w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
+        xr = x @ r_n.T
+        out = (gate * xr) @ w_n
         return (out.astype(jnp.float32) / gate_sum * gs).astype(jnp.float32)
 
     def forward_fn(input_ids):
