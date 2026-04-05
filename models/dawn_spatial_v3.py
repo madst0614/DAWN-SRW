@@ -7,6 +7,7 @@ Changelog:
     - All neurons receive LB gradient (no ReLU barrier)
     - Naturally adaptive: weak when scores uniform, strong when biased
     - gate LB (ng_sum/ng_sq) removed from pass 2
+    - read/write init: scaled_normal(0.02) → orthogonal (better initial diversity)
 
   spatial-r1-v3.9.0 (2026-04-05):
     - Gate: exp(gate)-1 → ReLU (linear gate). No dead neuron gradient.
@@ -462,14 +463,14 @@ class NeuronPool(nn.Module):
         self.know_emb = self.param('know_emb', unit_norm_init(), (self.n_know, db))
 
         # Read (what to extract from x)
-        self.qk_read = self.param('qk_read', scaled_normal(0.02), (self.n_qk, dm))
-        self.v_read = self.param('v_read', scaled_normal(0.02), (self.n_v, dm))
-        self.know_read = self.param('know_read', scaled_normal(0.02), (self.n_know, dm))
+        self.qk_read = self.param('qk_read', nn.initializers.orthogonal(), (self.n_qk, dm))
+        self.v_read = self.param('v_read', nn.initializers.orthogonal(), (self.n_v, dm))
+        self.know_read = self.param('know_read', nn.initializers.orthogonal(), (self.n_know, dm))
 
         # Write (direction to push)
-        self.qk_write = self.param('qk_write', scaled_normal(0.02), (self.n_qk, dm))
-        self.v_write = self.param('v_write', scaled_normal(0.02), (self.n_v, dm))
-        self.know_write = self.param('know_write', scaled_normal(0.02), (self.n_know, dm))
+        self.qk_write = self.param('qk_write', nn.initializers.orthogonal(), (self.n_qk, dm))
+        self.v_write = self.param('v_write', nn.initializers.orthogonal(), (self.n_v, dm))
+        self.know_write = self.param('know_write', nn.initializers.orthogonal(), (self.n_know, dm))
 
 
 # ================================================================
