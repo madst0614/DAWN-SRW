@@ -197,7 +197,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         ns_sq = jax.lax.psum(ns_sq, 'data') / _data_axis_size
         global_ns_sum = jax.lax.psum(ns_sum, 'model')
         global_ns_sq = jax.lax.psum(ns_sq, 'model')
-        score_lb = global_ns_sq / N_total - (global_ns_sum / N_total) ** 2
+        mean_score = global_ns_sum / N_total
+        var_score = global_ns_sq / N_total - mean_score ** 2
+        score_lb = var_score / (mean_score ** 2 + 1e-6)
 
         # --- Pass 2: gate + srw fused (scan + checkpoint) ---
         @jax.checkpoint
@@ -318,7 +320,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         ns_sq = jax.lax.psum(ns_sq, 'data') / _data_axis_size
         global_ns_sum = jax.lax.psum(ns_sum, 'model')
         global_ns_sq = jax.lax.psum(ns_sq, 'model')
-        score_lb = global_ns_sq / N_total - (global_ns_sum / N_total) ** 2
+        mean_score = global_ns_sum / N_total
+        var_score = global_ns_sq / N_total - mean_score ** 2
+        score_lb = var_score / (mean_score ** 2 + 1e-6)
 
         # --- Pass 2: gate + srw fused ---
         @jax.checkpoint
@@ -405,8 +409,10 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
     s_std = jnp.sqrt(sq_sum / N - s_mean**2) + 1e-8
     tau = s_mean + tau_offset * s_std
 
-    # Score LB: variance of per-neuron score mean (N-invariant)
-    score_lb = ns_sq / N - (ns_sum / N) ** 2
+    # Score LB: CV² of per-neuron score mean (spread-invariant)
+    mean_score = ns_sum / N
+    var_score = ns_sq / N - mean_score ** 2
+    score_lb = var_score / (mean_score ** 2 + 1e-6)
 
     @jax.checkpoint
     def gate_srw_step(carry, i):
