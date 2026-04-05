@@ -495,10 +495,11 @@ class NeuronPool(nn.Module):
         self.v_write = self.param('v_write', unit_norm_init(), (self.n_v, dm))
         self.know_write = self.param('know_write', unit_norm_init(), (self.n_know, dm))
 
-        # Per-pool output scale (learnable, init=1.0)
-        self.qk_output_scale = self.param('qk_output_scale', lambda k, s: jnp.ones(s), (1,))
-        self.v_output_scale = self.param('v_output_scale', lambda k, s: jnp.ones(s), (1,))
-        self.know_output_scale = self.param('know_output_scale', lambda k, s: jnp.ones(s), (1,))
+        # Per-pool output scale (learnable, init=√d_model for O(1) output)
+        _d_scale = jnp.sqrt(jnp.float32(dm))
+        self.qk_output_scale = self.param('qk_output_scale', lambda k, s: jnp.full(s, _d_scale), (1,))
+        self.v_output_scale = self.param('v_output_scale', lambda k, s: jnp.full(s, _d_scale), (1,))
+        self.know_output_scale = self.param('know_output_scale', lambda k, s: jnp.full(s, _d_scale), (1,))
 
 
 # ================================================================
