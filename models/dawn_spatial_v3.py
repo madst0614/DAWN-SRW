@@ -422,11 +422,13 @@ class NeuronPool(nn.Module):
         self.v_write = self.param('v_write', unit_norm_init(), (self.n_v, dm))
         self.know_write = self.param('know_write', unit_norm_init(), (self.n_know, dm))
 
-        # Per-pool output scale (learnable, init=√d_model for O(1) output)
-        _d_scale_val = float(dm ** 0.5)
-        self.qk_output_scale = self.param('qk_output_scale', lambda k, s: jnp.full(s, _d_scale_val), (1,))
-        self.v_output_scale = self.param('v_output_scale', lambda k, s: jnp.full(s, _d_scale_val), (1,))
-        self.know_output_scale = self.param('know_output_scale', lambda k, s: jnp.full(s, _d_scale_val), (1,))
+        # Per-pool output scale (learnable, init=√(N_pool * d_model) for O(1) output)
+        _qk_scale = float((self.n_qk * dm) ** 0.5)
+        _v_scale = float((self.n_v * dm) ** 0.5)
+        _know_scale = float((self.n_know * dm) ** 0.5)
+        self.qk_output_scale = self.param('qk_output_scale', lambda k, s: jnp.full(s, _qk_scale), (1,))
+        self.v_output_scale = self.param('v_output_scale', lambda k, s: jnp.full(s, _v_scale), (1,))
+        self.know_output_scale = self.param('know_output_scale', lambda k, s: jnp.full(s, _know_scale), (1,))
 
 
 # ================================================================
