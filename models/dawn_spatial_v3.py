@@ -3,9 +3,9 @@ DAWN-Spatial v3.8: Sense-Read-Write (JAX/Flax)
 
 Changelog:
   spatial-r1-v3.9.5 (2026-04-07):
-    - soft gate_sum normalization: out = raw_out / (gate_sum + √d_model) * √d_model
+    - direction-strength normalization: (raw/gate_sum) * gate_max/(gate_max+1) * √d_model
     - threshold_gate returns raw gate (no normalization)
-    - Smooth transition: dense→weighted avg, sparse→passthrough
+    - gate_max stop_gradient in sharded paths (gradient via direction only)
 
   spatial-r1-v3.9.4 (2026-04-07):
     - learnable output_scale → fixed √d_model (wd-induced shrinkage fix)
@@ -234,12 +234,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
              z1, jnp.full((B, S, 1), -1e9), z1),
             jnp.arange(nc))
 
-        # soft gate_sum normalize: out = raw_out / (gate_sum + C) * C
+        # direction × strength × output_scale
         global_gate_sum = jax.lax.psum(total_gate_sum, 'model')
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         raw_out_global = jax.lax.psum(raw_out.astype(jnp.bfloat16), 'model').astype(jnp.float32)
-        C = jnp.sqrt(jnp.float32(D))
-        out = raw_out_global / (global_gate_sum + C) * C
+        output_scale = jnp.sqrt(jnp.float32(D))
+        direction = raw_out_global / (global_gate_sum + 1e-8)
+        strength = global_gate_max / (global_gate_max + 1.0)
+        out = direction * strength * output_scale
 
         global_active = jax.lax.psum(total_active, 'model')
         active_frac = jnp.maximum(global_active, 1.0) / N_total
@@ -362,12 +364,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
              z1_r, jnp.full((B, S, 2, 1), -1e9), z1_r),
             jnp.arange(nc))
 
-        # soft gate_sum normalize per route
+        # direction × strength × output_scale per route
         global_gate_sum = jax.lax.psum(total_gate_sum, 'model')
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         raw_out_global = jax.lax.psum(raw_out.astype(jnp.bfloat16), 'model').astype(jnp.float32)
-        C = jnp.sqrt(jnp.float32(D))
-        out = raw_out_global / (global_gate_sum + C) * C
+        output_scale = jnp.sqrt(jnp.float32(D))
+        direction = raw_out_global / (global_gate_sum + 1e-8)
+        strength = global_gate_max / (global_gate_max + 1.0)
+        out = direction * strength * output_scale
 
         global_active = jax.lax.psum(total_active, 'model')
         active_frac = jnp.maximum(global_active, 1.0) / N_total
@@ -454,9 +458,11 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         (jnp.zeros((B, S, D), dtype=jnp.float32), z1, jnp.full((B, S, 1), -1e9), z1),
         jnp.arange(n_chunks))
 
-    # soft gate_sum normalize: out = raw_out / (gate_sum + C) * C
-    C = jnp.sqrt(jnp.float32(D))
-    out = raw_out / (total_gate_sum + C) * C
+    # direction × strength × output_scale
+    output_scale = jnp.sqrt(jnp.float32(D))
+    direction = raw_out / (total_gate_sum + 1e-8)
+    strength = total_gate_max / (total_gate_max + 1.0)
+    out = direction * strength * output_scale
 
     score_std_out = s_std.mean()
     gate_sum_out = total_gate_sum.mean()
@@ -1083,7 +1089,7 @@ class DAWN(nn.Module):
 def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     """Non-chunked SRW for inference (S=1 typically).
     No checkpoint, no LB loss, no bf16 casting.
-    Soft gate_sum normalize: out = raw_out / (gate_sum + C) * C.
+    direction × strength × output_scale normalization.
     """
     D = x.shape[-1]
     scores = h @ emb_norm.T
@@ -1098,12 +1104,15 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = jnp.clip(gate, 0.0, 10.0)
 
     gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32)
+    gate_max = gate.max(axis=-1, keepdims=True).astype(jnp.float32)
     r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
     xr = x @ r_n.T
     raw_out = ((gate * xr) @ w_n).astype(jnp.float32)
-    C = jnp.sqrt(jnp.float32(D))
-    return raw_out / (gate_sum + C) * C
+    output_scale = jnp.sqrt(jnp.float32(D))
+    direction = raw_out / (gate_sum + 1e-8)
+    strength = gate_max / (gate_max + 1.0)
+    return direction * strength * output_scale
 
 
 def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
@@ -1121,12 +1130,15 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = jnp.clip(gate, 0.0, 10.0)
 
     gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32)
+    gate_max = gate.max(axis=-1, keepdims=True).astype(jnp.float32)
     r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
     xr = x @ r_n.T
     raw_out = ((gate * xr) @ w_n).astype(jnp.float32)
-    C = jnp.sqrt(jnp.float32(D))
-    return raw_out / (gate_sum + C) * C, gate.astype(jnp.float32)
+    output_scale = jnp.sqrt(jnp.float32(D))
+    direction = raw_out / (gate_sum + 1e-8)
+    strength = gate_max / (gate_max + 1.0)
+    return direction * strength * output_scale, gate.astype(jnp.float32)
 
 
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
@@ -1582,7 +1594,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if 'know' in suppress_masks else None
 
     def _srw_sup(x, h, emb_n, tau_off, w_read, w_write, mult):
-        """SRW with optional gate suppression. Soft gate_sum normalize."""
+        """SRW with optional gate suppression. direction × strength × output_scale."""
         D = x.shape[-1]
         scores = h @ emb_n.T
         sf = scores.astype(jnp.float32)
@@ -1595,12 +1607,15 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if mult is not None:
             gate = gate * mult[None, None, :]
         gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32)
+        gate_max = gate.max(axis=-1, keepdims=True).astype(jnp.float32)
         r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
         w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
         xr = x @ r_n.T
         raw_out = ((gate * xr) @ w_n).astype(jnp.float32)
-        C = jnp.sqrt(jnp.float32(D))
-        return raw_out / (gate_sum + C) * C
+        output_scale = jnp.sqrt(jnp.float32(D))
+        direction = raw_out / (gate_sum + 1e-8)
+        strength = gate_max / (gate_max + 1.0)
+        return direction * strength * output_scale
 
     def forward_fn(input_ids):
         B, S = input_ids.shape
