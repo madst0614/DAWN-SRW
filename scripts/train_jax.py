@@ -1466,6 +1466,9 @@ def main():
                 h_all = (x @ router_p['proj_attn']['kernel']
                          + router_p['proj_attn']['bias'])
                 h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+                h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
+                h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
+                h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
                 tau_all = (x @ router_p['tau_attn']['kernel']
                            + router_p['tau_attn']['bias'])
                 return h_Q, h_K, h_V, tau_all
@@ -1526,6 +1529,7 @@ def main():
             def prof_know_router(x, router_p):
                 h = (x @ router_p['proj_know']['kernel']
                      + router_p['proj_know']['bias'])
+                h = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
                 tau = (x @ router_p['tau_know']['kernel']
                        + router_p['tau_know']['bias'])
                 return h, tau
