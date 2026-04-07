@@ -547,6 +547,9 @@ class Router(nn.Module):
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
         tau_all = self.tau_attn(x)
+        # Touch strength Dense to initialize params
+        _ = self.strength_attn_qk(x)
+        _ = self.strength_attn_v(x)
         g_Q = threshold_gate(h_Q @ qk_emb_unit.T, tau_all[:, :, 0:1])
         g_K = threshold_gate(h_K @ qk_emb_unit.T, tau_all[:, :, 1:2])
         g_V = threshold_gate(h_V @ v_emb_unit.T, tau_all[:, :, 2:3])
@@ -568,6 +571,8 @@ class Router(nn.Module):
         h = safe_dropout(h, self.router_dropout, deterministic, rng_drop)
 
         tau = self.tau_know(x)
+        # Touch strength Dense to initialize params
+        _ = self.strength_know(x)
         gate = threshold_gate(h @ know_emb_unit.T, tau)
 
         t = 1.0 / self.n_know
