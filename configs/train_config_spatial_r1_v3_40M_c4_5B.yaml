@@ -1,17 +1,17 @@
-# DAWN Spatial-R1 v3.8.2 -- Sense-Read-Write, d_route=128, 40M Scale
-# emb[N,128] sense + w_read[N,384] + w_write[N,384]. Relative tau gate.
+# DAWN Spatial-R1 v3.9.2 -- Sense-Read-Write, d_route=128, 40M Scale
+# Unit-norm h/emb/read/write, absolute tau, score-based CV² LB.
 
 seed: 1
 
 data:
-  bin_train: gs://dawn-tpu-data-c4/c4_train
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
   bin_val: gs://dawn-tpu-data-c4/c4_val.bin
   max_train_tokens: 5000000000
   max_val_tokens: 10000000
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.8.2"
+  model_version: "spatial-r1-v3.9.4"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -33,13 +33,16 @@ training:
   weight_decay: 0.1
   warmup_ratio: 0.06
   diversity_weight: 0.1
-  load_balance_weight: 0.00002
+  load_balance_weight: 0.1
+  n_chunks_know: 1
+  n_chunks_qk: 1
+  n_chunks_v: 1
   checkpoint_interval: 500
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.8_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.8_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.9.4_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.9.4_40M_c4_5B
 
 # Parameter budget (~40M):
 #   QK:   1580 x (128+384+384) = 1.42M

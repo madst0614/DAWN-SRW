@@ -477,6 +477,24 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
+        # Re-project neuron pool vectors to unit norm after optimizer step
+        def normalize_pool_params(params):
+            pool = params['neuron_pool']
+            norm_keys = [
+                'qk_read', 'v_read', 'know_read',
+                'qk_write', 'v_write', 'know_write',
+                'qk_emb', 'v_emb', 'know_emb',
+            ]
+            new_pool = dict(pool)
+            for key in norm_keys:
+                w = new_pool[key]
+                new_pool[key] = w / (jnp.linalg.norm(w, axis=-1, keepdims=True) + 1e-8)
+            return {**params, 'neuron_pool': new_pool}
+
+        # v3.9.4: re-projection disabled — forward unit-norm handles normalization,
+        # param norm freedom provides implicit gradient scaling regularization
+        # new_params = normalize_pool_params(new_params)
+
         grad_norm = jnp.sqrt(
             sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
 
@@ -499,14 +517,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_aux': result.get('know_aux', jnp.float32(0.0)),
             'know_active': result.get('know_active', jnp.float32(0.0)),
             'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
-            'know_score_std': result.get('know_score_std', jnp.float32(0.0)),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
-            'attn_active': result.get('attn_active', jnp.float32(0.0)),
+            'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
+            'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
-            'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
+            'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
+            'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
+            'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
@@ -514,6 +534,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
+            'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
+            'attn_qk_raw_norm': result.get('attn_qk_raw_norm', jnp.float32(0.0)),
+            'attn_v_raw_norm': result.get('attn_v_raw_norm', jnp.float32(0.0)),
+            'know_raw_out_norm': result.get('know_raw_out_norm', jnp.float32(0.0)),
+            'debug_residual_norm': result.get('debug_residual_norm', jnp.float32(0.0)),
+            'debug_emb_norm': result.get('debug_emb_norm', jnp.float32(0.0)),
+            'debug_o_proj_norm': result.get('debug_o_proj_norm', jnp.float32(0.0)),
+            'debug_q_norm': result.get('debug_q_norm', jnp.float32(0.0)),
+            'debug_k_norm': result.get('debug_k_norm', jnp.float32(0.0)),
+            'debug_v_norm': result.get('debug_v_norm', jnp.float32(0.0)),
+            'debug_logit_max': result.get('debug_logit_max', jnp.float32(0.0)),
+            'debug_o_input_norm': result.get('debug_o_input_norm', jnp.float32(0.0)),
+            'per_layer_attn_out_norm': result.get('per_layer_attn_out_norm', jnp.zeros(1)),
+            'per_layer_know_out_norm': result.get('per_layer_know_out_norm', jnp.zeros(1)),
         }
 
         return new_params, new_opt_state, metrics
@@ -867,6 +901,8 @@ def main():
                         help='Override batch_size from config (global)')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override learning rate from config')
+    parser.add_argument('--debug', action='store_true',
+                        help='Debug mode: log every step with detailed metrics')
     cli_args = parser.parse_args()
 
     # ----------------------------------------------------------
@@ -885,6 +921,7 @@ def main():
     set_seed(seed)
 
     # Training params (from YAML first, may be overridden by checkpoint config below)
+    debug_mode = cli_args.debug
     tcfg = cfg['training']
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
@@ -1133,9 +1170,27 @@ def main():
         end_value=lr * 0.1,
     )
 
+    # Weight decay mask: disable for unit-norm re-projected params
+    def create_wd_mask(params):
+        def _mask(path, _):
+            path_str = '/'.join(str(p) for p in path)
+            # No WD for unit-norm re-projected params
+            if 'neuron_pool' in path_str:
+                for key in ['_emb', '_read', '_write']:
+                    if key in path_str:
+                        return False
+            return True
+        return jax.tree.map_with_path(_mask, params)
+
+    wd_mask = create_wd_mask(params)
+
     base_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, weight_decay=weight_decay, b2=0.95),
+        optax.adamw(learning_rate=schedule, weight_decay=0.0, b2=0.95),
+        optax.masked(
+            optax.add_decayed_weights(weight_decay),
+            wd_mask,
+        ),
     )
 
     if grad_accum_steps > 1:
@@ -1421,6 +1476,9 @@ def main():
                 h_all = (x @ router_p['proj_attn']['kernel']
                          + router_p['proj_attn']['bias'])
                 h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+                h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
+                h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
+                h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
                 tau_all = (x @ router_p['tau_attn']['kernel']
                            + router_p['tau_attn']['bias'])
                 return h_Q, h_K, h_V, tau_all
@@ -1432,16 +1490,16 @@ def main():
                 h_QK = jnp.stack([h_Q, h_K], axis=2)
                 tau_QK = jnp.stack(
                     [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-                QK_out, act, gm, _lb, _gs, _es, _ngm = fused_paired(
+                QK_out, act, gm, _lb, _ss, _gs, _gc, _sm = fused_paired(
                     x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
                 return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act, gm
 
             # 3b) QK non-sharded fallback
             @jax.jit
             def prof_qk_chunked(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
-                Q, _, _, _, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                Q, _, _, _, _, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
                                        qk_read, qk_write, n_chunks_qk)
-                K, _, _, _, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                K, _, _, _, _, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
                                        qk_read, qk_write, n_chunks_qk)
                 return Q, K
 
@@ -1481,6 +1539,7 @@ def main():
             def prof_know_router(x, router_p):
                 h = (x @ router_p['proj_know']['kernel']
                      + router_p['proj_know']['bias'])
+                h = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
                 tau = (x @ router_p['tau_know']['kernel']
                        + router_p['tau_know']['bias'])
                 return h, tau
@@ -1521,14 +1580,14 @@ def main():
                 Q, K, _, _ = prof_qk_fused(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _, _, _, _, _ = prof_v_sharded(
+                V, _, _, _, _, _, _, _ = prof_v_sharded(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             else:
                 Q, K = prof_qk_chunked(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _, _, _, _, _ = prof_v_chunked(
+                V, _, _, _, _, _, _, _ = prof_v_chunked(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             jax.block_until_ready((Q, K, V))
@@ -1536,11 +1595,11 @@ def main():
             h_know, tau_know = prof_know_router(normed, router_p)
             jax.block_until_ready(tau_know)
             if _is_sharded:
-                _kout, _, _, _, _, _, _ = prof_know_sharded(
+                _kout, _, _, _, _, _, _, _ = prof_know_sharded(
                     normed, h_know, know_norm, tau_know,
                     pool_p['know_read'], pool_p['know_write'])
             else:
-                _kout, _, _, _, _, _, _ = prof_know_chunked(
+                _kout, _, _, _, _, _, _, _ = prof_know_chunked(
                     normed, h_know, know_norm, tau_know,
                     pool_p['know_read'], pool_p['know_write'])
             jax.block_until_ready(_kout)
@@ -1842,7 +1901,8 @@ def main():
             epoch_step_counter += 1
 
             # ---- Periodic logging (host 0 only) ----
-            if global_step % LOG_INTERVAL == 0:
+            _early_debug = global_step in (1, 5, 10, 20, 50)
+            if global_step % LOG_INTERVAL == 0 or _early_debug or debug_mode:
                 if is_host0:
                     elapsed = time.time() - win_start_time
                     steps_per_sec = win_count / elapsed if elapsed > 0 else 0
@@ -1896,32 +1956,72 @@ def main():
                         n_know_cfg = cfg['model'].get('n_know', 27200)
                         k_act = _m(metrics['know_active'])
                         k_raw_gmax = _m(metrics['know_raw_gate_max'])
-                        k_sstd = _m(metrics.get('know_score_std', 0.0))
                         k_gsum = _m(metrics.get('know_gate_sum', 0.0))
                         k_gconc = _m(metrics.get('know_gate_conc', 0.0))
 
-                        a_act = _m(metrics.get('attn_active', 0.0))
+                        a_qk_act = _m(metrics.get('attn_qk_active', 0.0))
+                        a_v_act = _m(metrics.get('attn_v_active', 0.0))
                         a_raw_gmax = _m(metrics.get('attn_raw_gate_max', 0.0))
-                        a_sstd = _m(metrics.get('attn_score_std', 0.0))
                         a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
                         a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
+                        a_out_n = _m(metrics.get('attn_out_norm', 0.0))
+
+                        a_tau_m = _m(metrics.get('attn_tau_mean', 0.0))
+                        k_tau_m = _m(metrics.get('know_tau_mean', 0.0))
+                        k_out_n = _m(metrics.get('know_out_norm', 0.0))
 
                         log_message(
-                            f"      {tau_s} | grad_norm={m_grad:.3f}")
+                            f"      {tau_s} | tau_mean: attn={a_tau_m:.3f}"
+                            f" know={k_tau_m:.3f} | grad_norm={m_grad:.3f}")
                         log_message(
                             f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
                             f" write={k_write_n:.3f}")
+                        k_raw_n = _m(metrics.get('know_raw_out_norm', 0.0))
+                        a_qk_raw_n = _m(metrics.get('attn_qk_raw_norm', 0.0))
+                        a_v_raw_n = _m(metrics.get('attn_v_raw_norm', 0.0))
+
                         log_message(
                             f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
                             f"({k_act*100:.1f}%) raw_max={k_raw_gmax:.4f}"
                             f" conc={k_gconc:.1f}"
-                            f" | s_std={k_sstd:.3f} gsum={k_gsum:.1f}")
+                            f" gsum={k_gsum:.1f}"
+                            f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
                         log_message(
-                            f"      attn: active={a_act:.1%}"
+                            f"      attn: qk_active={a_qk_act:.1%}"
+                            f" v_active={a_v_act:.1%}"
                             f" raw_max={a_raw_gmax:.4f}"
                             f" conc={a_gconc:.1f}"
-                            f" | s_std={a_sstd:.3f} gsum={a_gsum:.1f}")
+                            f" gsum={a_gsum:.1f}"
+                            f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
+                            f" out_norm={a_out_n:.3f}")
+                        if _early_debug or debug_mode:
+                            d_res = _m(metrics.get('debug_residual_norm', 0.0))
+                            d_emb = _m(metrics.get('debug_emb_norm', 0.0))
+                            d_oproj = _m(metrics.get('debug_o_proj_norm', 0.0))
+                            d_q = _m(metrics.get('debug_q_norm', 0.0))
+                            d_k = _m(metrics.get('debug_k_norm', 0.0))
+                            d_v = _m(metrics.get('debug_v_norm', 0.0))
+                            d_lm = _m(metrics.get('debug_logit_max', 0.0))
+                            d_oi = _m(metrics.get('debug_o_input_norm', 0.0))
+                            log_message(
+                                f"      [DEBUG] residual={d_res:.3f}"
+                                f" emb={d_emb:.3f} o_proj={d_oproj:.3f}"
+                                f" read={k_read_n:.3f}")
+                            log_message(
+                                f"      [DEBUG] attn_detail:"
+                                f" q={d_q:.3f} k={d_k:.3f} v={d_v:.3f}"
+                                f" logit_max={d_lm:.3f}"
+                                f" o_in={d_oi:.3f} o_out={a_out_n:.3f}")
+                            try:
+                                pl_attn = jax.device_get(metrics['per_layer_attn_out_norm'])
+                                pl_know = jax.device_get(metrics['per_layer_know_out_norm'])
+                                attn_s = ', '.join(f'l{i}={v:.2f}' for i, v in enumerate(pl_attn))
+                                know_s = ', '.join(f'l{i}={v:.2f}' for i, v in enumerate(pl_know))
+                                log_message(f"      [DEBUG] per_layer_attn: [{attn_s}]")
+                                log_message(f"      [DEBUG] per_layer_know: [{know_s}]")
+                            except Exception:
+                                pass
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
