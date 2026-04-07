@@ -1173,27 +1173,9 @@ def main():
         end_value=lr * 0.1,
     )
 
-    # Weight decay mask: disable for unit-norm re-projected params
-    def create_wd_mask(params):
-        def _mask(path, _):
-            path_str = '/'.join(str(p) for p in path)
-            # No WD for unit-norm re-projected params
-            if 'neuron_pool' in path_str:
-                for key in ['_emb', '_read', '_write']:
-                    if key in path_str:
-                        return False
-            return True
-        return jax.tree.map_with_path(_mask, params)
-
-    wd_mask = create_wd_mask(params)
-
     base_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, weight_decay=0.0, b2=0.95),
-        optax.masked(
-            optax.add_decayed_weights(weight_decay),
-            wd_mask,
-        ),
+        optax.adamw(learning_rate=schedule, weight_decay=weight_decay, b2=0.95),
     )
 
     if grad_accum_steps > 1:
