@@ -523,10 +523,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
-            'attn_active': result.get('attn_active', jnp.float32(0.0)),
+            'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
+            'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
+            'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
+            'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
+            'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
@@ -1937,18 +1941,23 @@ def main():
                         k_gsum = _m(metrics.get('know_gate_sum', 0.0))
                         k_gconc = _m(metrics.get('know_gate_conc', 0.0))
 
-                        a_act = _m(metrics.get('attn_active', 0.0))
+                        a_qk_act = _m(metrics.get('attn_qk_active', 0.0))
+                        a_v_act = _m(metrics.get('attn_v_active', 0.0))
                         a_raw_gmax = _m(metrics.get('attn_raw_gate_max', 0.0))
                         a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
                         a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
+                        a_out_n = _m(metrics.get('attn_out_norm', 0.0))
 
+                        a_tau_m = _m(metrics.get('attn_tau_mean', 0.0))
+                        k_tau_m = _m(metrics.get('know_tau_mean', 0.0))
                         k_out_n = _m(metrics.get('know_out_norm', 0.0))
                         qk_os_v = _m(metrics.get('qk_output_scale', 1.0))
                         v_os_v = _m(metrics.get('v_output_scale', 1.0))
                         k_os_v = _m(metrics.get('know_output_scale', 1.0))
 
                         log_message(
-                            f"      {tau_s} | grad_norm={m_grad:.3f}")
+                            f"      {tau_s} | tau_mean: attn={a_tau_m:.3f}"
+                            f" know={k_tau_m:.3f} | grad_norm={m_grad:.3f}")
                         log_message(
                             f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
@@ -1959,10 +1968,11 @@ def main():
                             f" conc={k_gconc:.1f}"
                             f" gsum={k_gsum:.1f} out_norm={k_out_n:.3f}")
                         log_message(
-                            f"      attn: active={a_act:.1%}"
+                            f"      attn: qk_active={a_qk_act:.1%}"
+                            f" v_active={a_v_act:.1%}"
                             f" raw_max={a_raw_gmax:.4f}"
                             f" conc={a_gconc:.1f}"
-                            f" gsum={a_gsum:.1f}")
+                            f" gsum={a_gsum:.1f} out_norm={a_out_n:.3f}")
                         log_message(
                             f"      scale: qk={qk_os_v:.4f} v={v_os_v:.4f}"
                             f" know={k_os_v:.4f}")
