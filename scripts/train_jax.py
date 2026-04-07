@@ -491,7 +491,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 new_pool[key] = w / (jnp.linalg.norm(w, axis=-1, keepdims=True) + 1e-8)
             return {**params, 'neuron_pool': new_pool}
 
-        new_params = normalize_pool_params(new_params)
+        # v3.9.4: re-projection disabled — forward unit-norm handles normalization,
+        # param norm freedom provides implicit gradient scaling regularization
+        # new_params = normalize_pool_params(new_params)
 
         grad_norm = jnp.sqrt(
             sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
