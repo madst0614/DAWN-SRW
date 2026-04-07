@@ -222,10 +222,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             (jnp.zeros((B, S, D), dtype=jnp.float32), z1),
             jnp.arange(nc))
 
-        # active_N normalize: out = raw_out / (active_N + 1) * √d_model
+        # active_N normalize
         global_active = jax.lax.psum(total_active, 'model')
-        C = jnp.sqrt(jnp.float32(D))
-        out = raw_out / (jnp.sqrt(global_active) + 1.0) * C
+        out = raw_out / (jnp.sqrt(global_active) + 1.0)
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         active_frac = global_active / N_total
@@ -344,8 +343,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
 
         # active_N normalize per route
         global_active = jax.lax.psum(total_active, 'model')
-        C = jnp.sqrt(jnp.float32(D))
-        out = raw_out / (jnp.sqrt(global_active) + 1.0) * C
+        out = raw_out / (jnp.sqrt(global_active) + 1.0)
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         active_frac = global_active / N_total
@@ -428,9 +426,8 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         (jnp.zeros((B, S, D), dtype=jnp.float32), z1),
         jnp.arange(n_chunks))
 
-    # active_N normalize: out = raw_out / (active_N + 1) * √d_model
-    C = jnp.sqrt(jnp.float32(D))
-    out = raw_out / (jnp.sqrt(total_active) + 1.0) * C
+    # active_N normalize
+    out = raw_out / (jnp.sqrt(total_active) + 1.0)
 
     score_std_out = s_std.mean()
     active_N_out = total_active.mean()
@@ -558,9 +555,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
-
-    qk_scale = jnp.sqrt(jnp.float32(D))
-    v_scale = jnp.sqrt(jnp.float32(D))
 
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
@@ -697,8 +691,7 @@ class AttentionCircuit(nn.Module):
         def _se(x, g, rd, wr):
             raw = (g * (x @ rd.T)) @ wr
             active_N = (g > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
-            C = jnp.sqrt(jnp.float32(x.shape[-1]))
-            return raw / (jnp.sqrt(active_N) + 1.0) * C
+            return raw / (jnp.sqrt(active_N) + 1.0)
 
         Q = _se(x, g_Q, neuron_pool.qk_read, neuron_pool.qk_write)
         K = _se(x, g_K, neuron_pool.qk_read, neuron_pool.qk_write)
@@ -735,8 +728,7 @@ class KnowledgeCircuit(nn.Module):
             x, neuron_pool, deterministic, rng_r)
         raw = (gate * (x @ neuron_pool.know_read.T)) @ neuron_pool.know_write
         active_N = (gate > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
-        C = jnp.sqrt(jnp.float32(x.shape[-1]))
-        out = raw / (jnp.sqrt(active_N) + 1.0) * C
+        out = raw / (jnp.sqrt(active_N) + 1.0)
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
 
@@ -1069,8 +1061,7 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
     xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
-    C = jnp.sqrt(jnp.float32(D))
-    return (raw_out / (jnp.sqrt(active_N) + 1.0) * C).astype(jnp.float32)
+    return (raw_out / (jnp.sqrt(active_N) + 1.0)).astype(jnp.float32)
 
 
 def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
@@ -1091,8 +1082,7 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
     xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
-    C = jnp.sqrt(jnp.float32(D))
-    return (raw_out / (jnp.sqrt(active_N) + 1.0) * C).astype(jnp.float32), gate_norm
+    return (raw_out / (jnp.sqrt(active_N) + 1.0)).astype(jnp.float32), gate_norm
 
 
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
@@ -1568,8 +1558,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
         xr = x @ r_n.T
         raw_out = (gate * xr) @ w_n
-        C = jnp.sqrt(jnp.float32(D))
-        return (raw_out / (jnp.sqrt(active_N) + 1.0) * C).astype(jnp.float32)
+        return (raw_out / (jnp.sqrt(active_N) + 1.0)).astype(jnp.float32)
 
     def forward_fn(input_ids):
         B, S = input_ids.shape
