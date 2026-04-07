@@ -144,7 +144,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
              out_specs=(P('data', None, None),   # out [B,S,D]
                         P('data', None, None),   # active [B,S,1]
                         P('data', None, None),   # gate_max [B,S,1]
-                        P(),                     # gate_lb scalar
+                        P(),                     # score_lb scalar
                         P(),                     # gate_sum scalar
                         P()),                    # gate_conc scalar
              check_rep=False)
@@ -166,7 +166,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
 
         @jax.checkpoint
         def gate_srw_step(carry, i):
-            out, total_gate_sum, total_gate_max, total_active, ng_sum, ng_sq = carry
+            out, total_gate_sum, total_gate_max, total_active, ns_sum, ns_sq = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
@@ -180,18 +180,18 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             gate_bf = gate.astype(jnp.bfloat16)
             xr = x_bf @ rc.T
             c_out = ((gate_bf * xr) @ wc).astype(jnp.float32)
-            # Gate LB: per-neuron gate mean stats
-            per_neuron_gate = gate.mean(axis=(0, 1))  # [cs]
-            ng_sum = ng_sum + per_neuron_gate.sum()
-            ng_sq = ng_sq + (per_neuron_gate ** 2).sum()
+            # Score LB: per-neuron score mean stats
+            per_neuron_score = scores.astype(jnp.float32).mean(axis=(0, 1))  # [cs]
+            ns_sum = ns_sum + per_neuron_score.sum()
+            ns_sq = ns_sq + (per_neuron_score ** 2).sum()
             return (out + c_out,
                     total_gate_sum + gate.sum(axis=-1, keepdims=True),
                     jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                     total_active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32),
-                    ng_sum, ng_sq), None
+                    ns_sum, ns_sq), None
 
         z_scalar = jnp.float32(0.0)
-        (raw_out, total_gate_sum, total_gate_max, total_active, ng_sum, ng_sq), _ = jax.lax.scan(
+        (raw_out, total_gate_sum, total_gate_max, total_active, ns_sum, ns_sq), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, D), dtype=jnp.float32),
              z1, jnp.full((B, S, 1), -1e9), z1,
@@ -206,19 +206,19 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
 
         active_frac = jax.lax.psum(total_active, 'model') / N_total
 
-        # Gate LB: CV² of per-neuron gate mean
-        ng_sum = jax.lax.psum(ng_sum, 'data') / _data_axis_size
-        ng_sq = jax.lax.psum(ng_sq, 'data') / _data_axis_size
-        global_ng_sum = jax.lax.psum(ng_sum, 'model')
-        global_ng_sq = jax.lax.psum(ng_sq, 'model')
-        mean_gate = global_ng_sum / N_total
-        var_gate = global_ng_sq / N_total - mean_gate ** 2
-        gate_lb = var_gate / (mean_gate ** 2 + var_gate + 1e-2)
+        # Score LB: CV² of per-neuron score mean
+        ns_sum = jax.lax.psum(ns_sum, 'data') / _data_axis_size
+        ns_sq = jax.lax.psum(ns_sq, 'data') / _data_axis_size
+        global_ns_sum = jax.lax.psum(ns_sum, 'model')
+        global_ns_sq = jax.lax.psum(ns_sq, 'model')
+        mean_score = global_ns_sum / N_total
+        var_score = global_ns_sq / N_total - mean_score ** 2
+        score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
         es_out = global_gate_sum.mean()
         mean_active_gate = global_gate_sum / (jax.lax.psum(total_active, 'model') + 1e-8)
         gate_conc = (global_gate_max / (mean_active_gate + 1e-8)).mean()
-        return out.astype(jnp.float32), active_frac, global_gate_max, gate_lb, es_out, gate_conc
+        return out.astype(jnp.float32), active_frac, global_gate_max, score_lb, es_out, gate_conc
 
     return fused_gate_srw
 
@@ -244,7 +244,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
              out_specs=(P('data', None, None, None), # out [B,S,2,D]
                         P('data', None, None),       # active [B,S,1]
                         P('data', None, None),       # gate_max [B,S,1]
-                        P(),                         # gate_lb scalar
+                        P(),                         # score_lb scalar
                         P(),                         # gate_sum scalar
                         P()),                        # gate_conc scalar
              check_rep=False)
@@ -266,7 +266,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
 
         @jax.checkpoint
         def gate_srw_step(carry, i):
-            out, total_gate_sum, total_gate_max, total_active, ng_sum, ng_sq = carry
+            out, total_gate_sum, total_gate_max, total_active, ns_sum, ns_sq = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
@@ -280,18 +280,18 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             gate_bf = gate.astype(jnp.bfloat16)
             xr = x_bf @ rc.T
             c_out = jnp.einsum('bsrn,nd->bsrd', gate_bf * xr[:, :, None, :], wc).astype(jnp.float32)
-            # Gate LB: per-neuron gate mean stats
-            per_neuron_gate = gate.mean(axis=(0, 1, 2))  # [cs]
-            ng_sum = ng_sum + per_neuron_gate.sum()
-            ng_sq = ng_sq + (per_neuron_gate ** 2).sum()
+            # Score LB: per-neuron score mean stats
+            per_neuron_score = scores.astype(jnp.float32).mean(axis=(0, 1, 2))  # [cs]
+            ns_sum = ns_sum + per_neuron_score.sum()
+            ns_sq = ns_sq + (per_neuron_score ** 2).sum()
             return (out + c_out,
                     total_gate_sum + gate.sum(axis=-1, keepdims=True),
                     jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                     total_active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32),
-                    ng_sum, ng_sq), None
+                    ns_sum, ns_sq), None
 
         z_scalar = jnp.float32(0.0)
-        (raw_out, total_gate_sum, total_gate_max, total_active, ng_sum, ng_sq), _ = jax.lax.scan(
+        (raw_out, total_gate_sum, total_gate_max, total_active, ns_sum, ns_sq), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
              z1_r, jnp.full((B, S, 2, 1), -1e9), z1_r,
@@ -309,19 +309,19 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         active_frac_mean = active_frac.mean(axis=2)
         raw_gate_max_mean = global_gate_max.mean(axis=2)
 
-        # Gate LB: CV² of per-neuron gate mean
-        ng_sum = jax.lax.psum(ng_sum, 'data') / _data_axis_size
-        ng_sq = jax.lax.psum(ng_sq, 'data') / _data_axis_size
-        global_ng_sum = jax.lax.psum(ng_sum, 'model')
-        global_ng_sq = jax.lax.psum(ng_sq, 'model')
-        mean_gate = global_ng_sum / N_total
-        var_gate = global_ng_sq / N_total - mean_gate ** 2
-        gate_lb = var_gate / (mean_gate ** 2 + var_gate + 1e-2)
+        # Score LB: CV² of per-neuron score mean
+        ns_sum = jax.lax.psum(ns_sum, 'data') / _data_axis_size
+        ns_sq = jax.lax.psum(ns_sq, 'data') / _data_axis_size
+        global_ns_sum = jax.lax.psum(ns_sum, 'model')
+        global_ns_sq = jax.lax.psum(ns_sq, 'model')
+        mean_score = global_ns_sum / N_total
+        var_score = global_ns_sq / N_total - mean_score ** 2
+        score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
         es_out = global_gate_sum.mean()
         mean_active_gate = global_gate_sum / (jax.lax.psum(total_active, 'model') + 1e-8)
         gate_conc = (global_gate_max / (mean_active_gate + 1e-8)).mean()
-        return out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, gate_lb, es_out, gate_conc
+        return out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb, es_out, gate_conc
 
     return fused_gate_srw_paired
 
@@ -346,7 +346,7 @@ def _srw_chunked(x, h, emb_unit, tau, w_read, w_write, n_chunks):
 
     @jax.checkpoint
     def gate_srw_step(carry, i):
-        out, total_gate_sum, total_gate_max, total_active, ng_sum, ng_sq = carry
+        out, total_gate_sum, total_gate_max, total_active, ns_sum, ns_sq = carry
         s = i * cs
         ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
         rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
@@ -360,18 +360,18 @@ def _srw_chunked(x, h, emb_unit, tau, w_read, w_write, n_chunks):
         gate_bf = gate.astype(jnp.bfloat16)
         xr = x_bf @ rc.T
         c_out = ((gate_bf * xr) @ wc).astype(jnp.float32)
-        # Gate LB: per-neuron gate mean stats
-        per_neuron_gate = gate.mean(axis=(0, 1))  # [cs]
-        ng_sum = ng_sum + per_neuron_gate.sum()
-        ng_sq = ng_sq + (per_neuron_gate ** 2).sum()
+        # Score LB: per-neuron score mean stats
+        per_neuron_score = scores.astype(jnp.float32).mean(axis=(0, 1))  # [cs]
+        ns_sum = ns_sum + per_neuron_score.sum()
+        ns_sq = ns_sq + (per_neuron_score ** 2).sum()
         return (out + c_out,
                 total_gate_sum + gate.sum(axis=-1, keepdims=True),
                 jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                 total_active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32),
-                ng_sum, ng_sq), None
+                ns_sum, ns_sq), None
 
     z_scalar = jnp.float32(0.0)
-    (raw_out, total_gate_sum, total_gate_max, total_active, ng_sum, ng_sq), _ = jax.lax.scan(
+    (raw_out, total_gate_sum, total_gate_max, total_active, ns_sum, ns_sq), _ = jax.lax.scan(
         gate_srw_step,
         (jnp.zeros((B, S, D), dtype=jnp.float32), z1, jnp.full((B, S, 1), -1e9), z1,
          z_scalar, z_scalar),
@@ -381,15 +381,15 @@ def _srw_chunked(x, h, emb_unit, tau, w_read, w_write, n_chunks):
     gate_strength = jnp.tanh(total_gate_max).astype(jnp.bfloat16)
     out = raw_out * inv_gs * gate_strength
 
-    # Gate LB: CV² of per-neuron gate mean
-    mean_gate = ng_sum / N
-    var_gate = ng_sq / N - mean_gate ** 2
-    gate_lb = var_gate / (mean_gate ** 2 + var_gate + 1e-2)
+    # Score LB: CV² of per-neuron score mean
+    mean_score = ns_sum / N
+    var_score = ns_sq / N - mean_score ** 2
+    score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
     es_out = total_gate_sum.mean()
     mean_active_gate = total_gate_sum / (total_active + 1e-8)
     gate_conc = (total_gate_max / (mean_active_gate + 1e-8)).mean()
-    return out.astype(jnp.float32), total_active / N, total_gate_max, gate_lb, es_out, gate_conc
+    return out.astype(jnp.float32), total_active / N, total_gate_max, score_lb, es_out, gate_conc
 
 
 # ================================================================
