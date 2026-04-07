@@ -533,6 +533,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
             'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
+            'attn_qk_raw_norm': result.get('attn_qk_raw_norm', jnp.float32(0.0)),
+            'attn_v_raw_norm': result.get('attn_v_raw_norm', jnp.float32(0.0)),
+            'know_raw_out_norm': result.get('know_raw_out_norm', jnp.float32(0.0)),
         }
 
         return new_params, new_opt_state, metrics
@@ -1961,20 +1964,27 @@ def main():
                             f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
                             f" write={k_write_n:.3f}")
+                        k_raw_n = _m(metrics.get('know_raw_out_norm', 0.0))
+                        a_qk_raw_n = _m(metrics.get('attn_qk_raw_norm', 0.0))
+                        a_v_raw_n = _m(metrics.get('attn_v_raw_norm', 0.0))
+
                         log_message(
                             f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
                             f"({k_act*100:.1f}%) raw_max={k_raw_gmax:.4f}"
                             f" conc={k_gconc:.1f}"
-                            f" gsum={k_gsum:.1f} out_norm={k_out_n:.3f}")
+                            f" gsum={k_gsum:.1f}"
+                            f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
                         log_message(
                             f"      attn: qk_active={a_qk_act:.1%}"
                             f" v_active={a_v_act:.1%}"
                             f" raw_max={a_raw_gmax:.4f}"
                             f" conc={a_gconc:.1f}"
-                            f" gsum={a_gsum:.1f} out_norm={a_out_n:.3f}")
+                            f" gsum={a_gsum:.1f}"
+                            f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
+                            f" out_norm={a_out_n:.3f}")
                         log_message(
-                            f"      scale: qk={qk_os_v:.4f} v={v_os_v:.4f}"
-                            f" know={k_os_v:.4f}")
+                            f"      scale: qk={qk_os_v:.1f} v={v_os_v:.1f}"
+                            f" know={k_os_v:.1f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 

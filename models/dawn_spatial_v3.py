@@ -527,10 +527,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
         QK_out, qk_active, qk_raw_gmax, qk_lb, qk_es, qk_gconc = fused_paired(
             x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write)
+        qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
         Q = QK_out[:, :, 0, :] * qk_scale
         K = QK_out[:, :, 1, :] * qk_scale
         V, v_active, v_raw_gmax, v_lb, v_es, v_gconc = fused_single(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write)
+        v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
         V = V * v_scale
     else:
         Q, q_active, q_raw_gmax, q_lb, q_es, q_gconc = _srw_chunked(
@@ -539,6 +541,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             x, h_K, qk_emb_unit, tau_all[:, :, 1:2], qk_read, qk_write, n_chunks_qk)
         V, v_active, v_raw_gmax, v_lb, v_es, v_gconc = _srw_chunked(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write, n_chunks_v)
+        qk_raw_norm = (jnp.linalg.norm(Q, axis=-1).mean() + jnp.linalg.norm(K, axis=-1).mean()) / 2
+        v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
         Q = Q * qk_scale
         K = K * qk_scale
         V = V * v_scale
@@ -580,7 +584,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_gate_sum = (qk_es + v_es) / 2
     attn_gate_conc = (qk_gconc + v_gconc) / 2
     attn_tau_mean = tau_all.mean()
-    return out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax, attn_gate_sum, attn_gate_conc, attn_out_norm, attn_tau_mean
+    return out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax, attn_gate_sum, attn_gate_conc, attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -610,6 +614,7 @@ def _know_forward(x, pool_params, router_params, rng,
         out, active_frac, raw_gate_max, lb_loss, gate_sum, gate_conc = _srw_chunked(
             x, h, know_emb_unit, tau, know_read, know_write, n_chunks_know)
 
+    know_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     out = out * know_scale
     know_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     rng, rng_out = jax.random.split(rng)
@@ -621,7 +626,7 @@ def _know_forward(x, pool_params, router_params, rng,
     read_norm_val = jnp.linalg.norm(know_read, axis=-1).mean()
     write_norm_val = jnp.linalg.norm(know_write, axis=-1).mean()
     know_tau_mean = tau.mean()
-    return out, aux, active_frac, raw_gate_max, gate_sum, gate_conc, emb_norm_val, read_norm_val, write_norm_val, know_out_norm, know_tau_mean
+    return out, aux, active_frac, raw_gate_max, gate_sum, gate_conc, emb_norm_val, read_norm_val, write_norm_val, know_out_norm, know_tau_mean, know_raw_out_norm
 
 
 # ================================================================
@@ -790,6 +795,9 @@ class DAWN(nn.Module):
             attn_out_norm_all = _z
             attn_tau_mean_all = _z
             know_tau_mean_all = _z
+            attn_qk_raw_norm_all = _z
+            attn_v_raw_norm_all = _z
+            know_raw_out_norm_all = _z
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
                                attention_mask, deterministic)
@@ -817,7 +825,7 @@ class DAWN(nn.Module):
 
                 normed = _layer_norm(
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
-                attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax, a_gsum, a_gconc, a_out_norm, a_tau_mean = _attn_forward(
+                attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax, a_gsum, a_gconc, a_out_norm, a_tau_mean, a_qk_raw_norm, a_v_raw_norm = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
                     self.n_qk, self.n_v,
@@ -829,7 +837,7 @@ class DAWN(nn.Module):
 
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
-                know_out, know_aux, k_active, k_raw_gmax, k_gsum, k_gconc, k_emb_n, k_read_n, k_write_n, k_out_norm, k_tau_mean = _know_forward(
+                know_out, know_aux, k_active, k_raw_gmax, k_gsum, k_gconc, k_emb_n, k_read_n, k_write_n, k_out_norm, k_tau_mean, k_raw_out_norm = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
                     self.n_chunks_know, sharded_fns=_sharded)
@@ -839,7 +847,8 @@ class DAWN(nn.Module):
                            a_qk_active, a_v_active, a_raw_gmax, a_gsum, a_gconc,
                            k_emb_n, k_read_n, k_write_n,
                            k_out_norm, a_out_norm,
-                           a_tau_mean, k_tau_mean)
+                           a_tau_mean, k_tau_mean,
+                           a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -850,7 +859,8 @@ class DAWN(nn.Module):
                 attn_qk_active_all, attn_v_active_all, attn_raw_gmax_all, attn_gsum_all, attn_gconc_all,
                 k_emb_n_all, k_read_n_all, k_write_n_all,
                 know_out_norm_all, attn_out_norm_all,
-                attn_tau_mean_all, know_tau_mean_all) = jax.lax.scan(
+                attn_tau_mean_all, know_tau_mean_all,
+                attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -879,6 +889,9 @@ class DAWN(nn.Module):
             'attn_out_norm': attn_out_norm_all.mean(),
             'attn_tau_mean': attn_tau_mean_all.mean(),
             'know_tau_mean': know_tau_mean_all.mean(),
+            'attn_qk_raw_norm': attn_qk_raw_norm_all.mean(),
+            'attn_v_raw_norm': attn_v_raw_norm_all.mean(),
+            'know_raw_out_norm': know_raw_out_norm_all.mean(),
         }
 
         if labels is not None:
