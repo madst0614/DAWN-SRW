@@ -8,7 +8,7 @@ Changelog:
       strength = sigmoid(x @ w + b)                (per-token [0,1])
       out = direction * strength * output_scale    (output_scale: per-pool learnable)
     - threshold_gate returns raw gate (no normalization)
-    - Per-pool learnable output_scale (init=100.0), exempt from weight decay
+    - Per-pool learnable output_scale (know/V: √d_model, QK: d_model^¼), WD exempt
 
   spatial-r1-v3.9.4 (2026-04-07):
     - learnable output_scale → fixed √d_model (wd-induced shrinkage fix)
@@ -495,11 +495,17 @@ class NeuronPool(nn.Module):
         self.v_write = self.param('v_write', unit_norm_init(), (self.n_v, dm))
         self.know_write = self.param('know_write', unit_norm_init(), (self.n_know, dm))
 
-        # Per-pool output scale (learnable, init=100.0, exempt from weight decay)
-        _os_init = lambda k, s, d=jnp.float32: jnp.full(s, 100.0)
-        self.qk_output_scale = self.param('qk_output_scale', _os_init, (1,))
-        self.v_output_scale = self.param('v_output_scale', _os_init, (1,))
-        self.know_output_scale = self.param('know_output_scale', _os_init, (1,))
+        # Per-pool output scale (learnable, exempt from weight decay)
+        # know/V: √d_model (residual stream scale matching)
+        # QK: d_model^(1/4) (Q·K dot product has squaring effect)
+        _residual_scale = float(dm ** 0.5)
+        _qk_scale = float(dm ** 0.25)
+        self.qk_output_scale = self.param('qk_output_scale',
+            lambda k, s, d=jnp.float32: jnp.full(s, _qk_scale), (1,))
+        self.v_output_scale = self.param('v_output_scale',
+            lambda k, s, d=jnp.float32: jnp.full(s, _residual_scale), (1,))
+        self.know_output_scale = self.param('know_output_scale',
+            lambda k, s, d=jnp.float32: jnp.full(s, _residual_scale), (1,))
 
 
 # ================================================================
