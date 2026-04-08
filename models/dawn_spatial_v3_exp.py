@@ -600,9 +600,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     # V strength: sigmoid(h_V @ W + b) * C, C = 2√d_model
     C_v = 2.0 * jnp.sqrt(jnp.float32(D))
-    v_strength = jax.nn.sigmoid(
-        h_V @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias']
-    ) * C_v  # [B, S, 1]
+    v_logit = h_V @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias']
+    v_strength = jax.nn.sigmoid(v_logit) * C_v  # [B, S, 1]
 
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
@@ -682,7 +681,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             attn_score_std, attn_gate_sum, attn_gate_conc, attn_score_mean,
             attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
             q_norm, k_norm, v_norm_dbg, attn_logit_max, o_input_norm,
-            v_strength.mean())
+            v_strength.mean(), v_strength.std(),
+            v_strength.min(), v_strength.max(),
+            v_logit.mean(), v_logit.std())
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -701,9 +702,8 @@ def _know_forward(x, pool_params, router_params, rng,
 
     # Learned strength: sigmoid(h @ W + b) * C, C = 2√d_model
     C_know = 2.0 * jnp.sqrt(jnp.float32(x.shape[-1]))
-    know_strength = jax.nn.sigmoid(
-        h @ router_params['strength_know']['kernel'] + router_params['strength_know']['bias']
-    ) * C_know  # [B, S, 1]
+    know_logit = h @ router_params['strength_know']['kernel'] + router_params['strength_know']['bias']
+    know_strength = jax.nn.sigmoid(know_logit) * C_know  # [B, S, 1]
 
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
@@ -727,7 +727,10 @@ def _know_forward(x, pool_params, router_params, rng,
     know_tau_mean = tau.mean()
     return (out, aux, active_frac, raw_gate_max, score_std, gate_sum, gate_conc,
             emb_norm_val, read_norm_val, write_norm_val, score_mean, know_out_norm,
-            know_tau_mean, know_raw_out_norm, know_strength.mean())
+            know_tau_mean, know_raw_out_norm,
+            know_strength.mean(), know_strength.std(),
+            know_strength.min(), know_strength.max(),
+            know_logit.mean(), know_logit.std())
 
 
 # ================================================================
@@ -910,6 +913,18 @@ class DAWN(nn.Module):
             attn_o_input_norm_all = _z
             attn_v_strength_all = _z
             know_strength_all = _z
+            attn_v_str_mean_all = _z
+            attn_v_str_std_all = _z
+            attn_v_str_min_all = _z
+            attn_v_str_max_all = _z
+            attn_v_logit_mean_all = _z
+            attn_v_logit_std_all = _z
+            know_str_mean_all = _z
+            know_str_std_all = _z
+            know_str_min_all = _z
+            know_str_max_all = _z
+            know_logit_mean_all = _z
+            know_logit_std_all = _z
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
                                attention_mask, deterministic)
@@ -941,7 +956,8 @@ class DAWN(nn.Module):
                  a_sstd, a_gsum, a_gconc, a_smean,
                  a_out_norm, a_tau_mean, a_qk_raw_norm, a_v_raw_norm,
                  a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
-                 a_v_strength
+                 a_v_strength,
+                 a_v_str_mean, a_v_str_std, a_v_str_min, a_v_str_max, a_v_logit_mean, a_v_logit_std
                 ) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
@@ -956,7 +972,8 @@ class DAWN(nn.Module):
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
                 (know_out, know_aux, k_active, k_raw_gmax, k_sstd, k_gsum, k_gconc,
                  k_emb_n, k_read_n, k_write_n, k_smean, k_out_norm,
-                 k_tau_mean, k_raw_out_norm, k_strength
+                 k_tau_mean, k_raw_out_norm, k_strength,
+                 k_str_mean, k_str_std, k_str_min, k_str_max, k_logit_mean, k_logit_std
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
@@ -970,7 +987,9 @@ class DAWN(nn.Module):
                            a_out_norm, a_tau_mean, k_tau_mean,
                            a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
                            a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
-                           a_v_strength, k_strength)
+                           a_v_strength, k_strength,
+                           a_v_str_mean, a_v_str_std, a_v_str_min, a_v_str_max, a_v_logit_mean, a_v_logit_std,
+                           k_str_mean, k_str_std, k_str_min, k_str_max, k_logit_mean, k_logit_std)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -985,7 +1004,9 @@ class DAWN(nn.Module):
                 attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all,
                 attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
                 attn_logit_max_all, attn_o_input_norm_all,
-                attn_v_strength_all, know_strength_all) = jax.lax.scan(
+                attn_v_strength_all, know_strength_all,
+                attn_v_str_mean_all, attn_v_str_std_all, attn_v_str_min_all, attn_v_str_max_all, attn_v_logit_mean_all, attn_v_logit_std_all,
+                know_str_mean_all, know_str_std_all, know_str_min_all, know_str_max_all, know_logit_mean_all, know_logit_std_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -1042,8 +1063,19 @@ class DAWN(nn.Module):
             'per_layer_attn_out_norm': attn_out_norm_all,
             'per_layer_know_out_norm': know_out_norm_all,
 
-            'know_strength': know_strength_all.mean(),
-            'attn_v_strength': attn_v_strength_all.mean(),
+            'know_strength_mean': know_str_mean_all.mean(),
+            'know_strength_std': know_str_std_all.mean(),
+            'know_strength_min': know_str_min_all.mean(),
+            'know_strength_max': know_str_max_all.mean(),
+            'know_logit_mean': know_logit_mean_all.mean(),
+            'know_logit_std': know_logit_std_all.mean(),
+
+            'attn_v_strength_mean': attn_v_str_mean_all.mean(),
+            'attn_v_strength_std': attn_v_str_std_all.mean(),
+            'attn_v_strength_min': attn_v_str_min_all.mean(),
+            'attn_v_strength_max': attn_v_str_max_all.mean(),
+            'attn_v_logit_mean': attn_v_logit_mean_all.mean(),
+            'attn_v_logit_std': attn_v_logit_std_all.mean(),
         }
 
         if labels is not None:

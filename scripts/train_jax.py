@@ -559,7 +559,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
-            'know_strength': result.get('know_strength', jnp.float32(0.0)),
+            'know_strength_mean': result.get('know_strength_mean', jnp.float32(0.0)),
+            'know_strength_std': result.get('know_strength_std', jnp.float32(0.0)),
+            'know_strength_min': result.get('know_strength_min', jnp.float32(0.0)),
+            'know_strength_max': result.get('know_strength_max', jnp.float32(0.0)),
+            'know_logit_mean': result.get('know_logit_mean', jnp.float32(0.0)),
+            'know_logit_std': result.get('know_logit_std', jnp.float32(0.0)),
             'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_active_N': result.get('attn_active_N', jnp.float32(0.0)),
@@ -567,7 +572,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
-            'attn_v_strength': result.get('attn_v_strength', jnp.float32(0.0)),
+            'attn_v_strength_mean': result.get('attn_v_strength_mean', jnp.float32(0.0)),
+            'attn_v_strength_std': result.get('attn_v_strength_std', jnp.float32(0.0)),
+            'attn_v_strength_min': result.get('attn_v_strength_min', jnp.float32(0.0)),
+            'attn_v_strength_max': result.get('attn_v_strength_max', jnp.float32(0.0)),
+            'attn_v_logit_mean': result.get('attn_v_logit_mean', jnp.float32(0.0)),
+            'attn_v_logit_std': result.get('attn_v_logit_std', jnp.float32(0.0)),
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
             'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
@@ -2052,11 +2062,28 @@ def main():
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
                         # Strength (v3.9.3)
-                        k_str = _m(metrics.get('know_strength', 0.0))
-                        a_v_str = _m(metrics.get('attn_v_strength', 0.0))
-                        if k_str > 0 or a_v_str > 0:
+                        k_str_m = _m(metrics.get('know_strength_mean', 0.0))
+                        if k_str_m > 0:
+                            k_str_s = _m(metrics.get('know_strength_std', 0.0))
+                            k_str_mn = _m(metrics.get('know_strength_min', 0.0))
+                            k_str_mx = _m(metrics.get('know_strength_max', 0.0))
+                            k_lg_m = _m(metrics.get('know_logit_mean', 0.0))
+                            k_lg_s = _m(metrics.get('know_logit_std', 0.0))
                             log_message(
-                                f"      strength: know={k_str:.3f} v={a_v_str:.3f}")
+                                f"      know_str: mean={k_str_m:.2f} std={k_str_s:.2f}"
+                                f" min={k_str_mn:.2f} max={k_str_mx:.2f}"
+                                f" | logit: mean={k_lg_m:.3f} std={k_lg_s:.3f}")
+                        a_v_str_m = _m(metrics.get('attn_v_strength_mean', 0.0))
+                        if a_v_str_m > 0:
+                            a_v_str_s = _m(metrics.get('attn_v_strength_std', 0.0))
+                            a_v_str_mn = _m(metrics.get('attn_v_strength_min', 0.0))
+                            a_v_str_mx = _m(metrics.get('attn_v_strength_max', 0.0))
+                            a_v_lg_m = _m(metrics.get('attn_v_logit_mean', 0.0))
+                            a_v_lg_s = _m(metrics.get('attn_v_logit_std', 0.0))
+                            log_message(
+                                f"      v_str: mean={a_v_str_m:.2f} std={a_v_str_s:.2f}"
+                                f" min={a_v_str_mn:.2f} max={a_v_str_mx:.2f}"
+                                f" | logit: mean={a_v_lg_m:.3f} std={a_v_lg_s:.3f}")
                         if _early_debug or debug_mode:
                             d_res = _m(metrics.get('debug_residual_norm', 0.0))
                             d_emb = _m(metrics.get('debug_emb_norm', 0.0))
