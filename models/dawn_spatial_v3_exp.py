@@ -601,6 +601,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     # V strength: sigmoid(h_V @ W + b) * C, C = 2√d_model
     C_v = 2.0 * jnp.sqrt(jnp.float32(D))
     v_logit = x @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias']
+    v_logit = jnp.clip(v_logit, -3.0, 3.0)
     v_strength = jax.nn.sigmoid(v_logit) * C_v  # [B, S, 1]
 
     if sharded_fns is not None:
@@ -703,6 +704,7 @@ def _know_forward(x, pool_params, router_params, rng,
     # Learned strength: sigmoid(h @ W + b) * C, C = 2√d_model
     C_know = 2.0 * jnp.sqrt(jnp.float32(x.shape[-1]))
     know_logit = x @ router_params['strength_know']['kernel'] + router_params['strength_know']['bias']
+    know_logit = jnp.clip(know_logit, -3.0, 3.0)
     know_strength = jax.nn.sigmoid(know_logit) * C_know  # [B, S, 1]
 
     if sharded_fns is not None:
@@ -1214,8 +1216,8 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
     # V strength: sigmoid(h_V @ W + b) * C, C = 2√d_model
     C_v = 2.0 * jnp.sqrt(jnp.float32(d_model))
-    v_str = jax.nn.sigmoid(
-        x @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias']) * C_v
+    v_str = jax.nn.sigmoid(jnp.clip(
+        x @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias'], -3.0, 3.0)) * C_v
 
     Q = _srw_inference(x, h_Q, qk_norm, tau_all[:, :, 0:1],
                        pool_params['qk_read'], pool_params['qk_write'])
@@ -1254,8 +1256,8 @@ def _know_forward_inference(x, pool_params, router_params):
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     C_k = 2.0 * jnp.sqrt(jnp.float32(x.shape[-1]))
-    k_str = jax.nn.sigmoid(
-        h @ router_params['strength_know']['kernel'] + router_params['strength_know']['bias']) * C_k
+    k_str = jax.nn.sigmoid(jnp.clip(
+        h @ router_params['strength_know']['kernel'] + router_params['strength_know']['bias'], -3.0, 3.0)) * C_k
     out = _srw_inference(x, h, know_norm, tau,
                          pool_params['know_read'], pool_params['know_write'])
     return out * k_str
@@ -1302,8 +1304,8 @@ def prefill(params, model_cfg, input_ids):
 
         qk_scale = jnp.sqrt(jnp.float32(d_model))
         C_v = 2.0 * jnp.sqrt(jnp.float32(d_model))
-        v_str = jax.nn.sigmoid(
-            normed @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias']) * C_v
+        v_str = jax.nn.sigmoid(jnp.clip(
+            normed @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias'], -3.0, 3.0)) * C_v
 
         Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
                            pool_params['qk_read'], pool_params['qk_write'])
@@ -1440,8 +1442,8 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
 
             qk_scale = jnp.sqrt(jnp.float32(d_model))
             C_v = 2.0 * jnp.sqrt(jnp.float32(d_model))
-            v_str = jax.nn.sigmoid(
-                normed @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias']) * C_v
+            v_str = jax.nn.sigmoid(jnp.clip(
+                normed @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias'], -3.0, 3.0)) * C_v
 
             Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
                                pool_params['qk_read'], pool_params['qk_write'])
@@ -1614,8 +1616,8 @@ def analysis_forward(params, model_cfg, input_ids):
 
         qk_scale = jnp.sqrt(jnp.float32(d_model))
         C_v = 2.0 * jnp.sqrt(jnp.float32(d_model))
-        v_str = jax.nn.sigmoid(
-            normed @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias']) * C_v
+        v_str = jax.nn.sigmoid(jnp.clip(
+            normed @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias'], -3.0, 3.0)) * C_v
 
         Q, gate_Q = _srw_inference_with_gates(
             normed, h_Q, qk_norm, tau_all[:, :, 0:1],
@@ -1649,8 +1651,8 @@ def analysis_forward(params, model_cfg, input_ids):
         h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
         tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
         C_k = 2.0 * jnp.sqrt(jnp.float32(x.shape[-1]))
-        k_str = jax.nn.sigmoid(
-            h_k @ router_params['strength_know']['kernel'] + router_params['strength_know']['bias']) * C_k
+        k_str = jax.nn.sigmoid(jnp.clip(
+            h_k @ router_params['strength_know']['kernel'] + router_params['strength_know']['bias'], -3.0, 3.0)) * C_k
         know_out, gate_Know = _srw_inference_with_gates(
             normed, h_k, know_norm_w, tau_k,
             pool_params['know_read'], pool_params['know_write'])
@@ -1731,8 +1733,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
 
             qk_scale = jnp.sqrt(jnp.float32(d_model))
             C_v = 2.0 * jnp.sqrt(jnp.float32(d_model))
-            v_str = jax.nn.sigmoid(
-                normed @ rp['strength_attn_v']['kernel'] + rp['strength_attn_v']['bias']) * C_v
+            v_str = jax.nn.sigmoid(jnp.clip(
+                normed @ rp['strength_attn_v']['kernel'] + rp['strength_attn_v']['bias'], -3.0, 3.0)) * C_v
 
             Q = _srw_sup(normed, h_Q, qk_n, tau_all[:,:,0:1], pp['qk_read'], pp['qk_write'], qk_mult)
             K = _srw_sup(normed, h_K, qk_n, tau_all[:,:,1:2], pp['qk_read'], pp['qk_write'], qk_mult)
@@ -1757,8 +1759,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             h_k = normed @ rp['proj_know']['kernel'] + rp['proj_know']['bias']
             tau_k = normed @ rp['tau_know']['kernel'] + rp['tau_know']['bias']
             C_k = 2.0 * jnp.sqrt(jnp.float32(d_model))
-            k_str = jax.nn.sigmoid(
-                h_k @ rp['strength_know']['kernel'] + rp['strength_know']['bias']) * C_k
+            k_str = jax.nn.sigmoid(jnp.clip(
+                h_k @ rp['strength_know']['kernel'] + rp['strength_know']['bias'], -3.0, 3.0)) * C_k
             x = x + _srw_sup(normed, h_k, kn_n, tau_k, pp['know_read'], pp['know_write'], know_mult) * k_str
 
         norm_p = params['norm']
