@@ -44,6 +44,7 @@ from models.dawn_spatial import DAWN as DAWN_Spatial
 from models.dawn_spatial_v2 import DAWN as DAWN_SpatialV2
 from models.dawn_spatial_v3 import DAWN as DAWN_SpatialV3
 from models.dawn_spatial_v3_baseline import DAWN as DAWN_SpatialV3Baseline
+from models.dawn_spatial_v3_exp import DAWN as DAWN_SpatialV3Exp
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -114,6 +115,24 @@ def build_model_from_config(cfg):
             k_cluster_qk=mcfg.get('k_cluster_qk', 8),
             k_cluster_v=mcfg.get('k_cluster_v', 8),
             k_cluster_know=mcfg.get('k_cluster_know', 8),
+        )
+    elif version == 'spatial-r1-v3.9.3':
+        model = DAWN_SpatialV3Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
         )
     elif version == 'spatial-r1-v3.9.1':
         model = DAWN_SpatialV3Baseline(
@@ -540,6 +559,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
+            'know_strength': result.get('know_strength', jnp.float32(0.0)),
             'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_active_N': result.get('attn_active_N', jnp.float32(0.0)),
@@ -547,6 +567,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
+            'attn_v_strength': result.get('attn_v_strength', jnp.float32(0.0)),
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
             'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
@@ -1348,7 +1369,7 @@ def main():
     # Create shard_map functions if mesh_model > 1
     _sharded_fns = None
     if mesh_model > 1:
-        _v3_mod = 'models.dawn_spatial_v3_baseline' if model_version == 'spatial-r1-v3.9.1' else 'models.dawn_spatial_v3'
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp'}.get(model_version, 'models.dawn_spatial_v3')
         _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw', 'make_sharded_srw_paired'])
         make_sharded_srw, make_sharded_srw_paired = _v3.make_sharded_srw, _v3.make_sharded_srw_paired
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
@@ -1426,7 +1447,7 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = 'models.dawn_spatial_v3_baseline' if model_version == 'spatial-r1-v3.9.1' else 'models.dawn_spatial_v3'
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp'}.get(model_version, 'models.dawn_spatial_v3')
             _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
@@ -2030,6 +2051,12 @@ def main():
                             f" s_std={a_sstd:.3f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
+                        # Strength (v3.9.3)
+                        k_str = _m(metrics.get('know_strength', 0.0))
+                        a_v_str = _m(metrics.get('attn_v_strength', 0.0))
+                        if k_str > 0 or a_v_str > 0:
+                            log_message(
+                                f"      strength: know={k_str:.3f} v={a_v_str:.3f}")
                         if _early_debug or debug_mode:
                             d_res = _m(metrics.get('debug_residual_norm', 0.0))
                             d_emb = _m(metrics.get('debug_emb_norm', 0.0))
