@@ -600,7 +600,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     # V strength: sigmoid(h_V @ W + b) * C, C = 2√d_model
     C_v = 2.0 * jnp.sqrt(jnp.float32(D))
-    v_logit = h_V @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias']
+    v_logit = x @ router_params['strength_attn_v']['kernel'] + router_params['strength_attn_v']['bias']
     v_strength = jax.nn.sigmoid(v_logit) * C_v  # [B, S, 1]
 
     if sharded_fns is not None:
@@ -702,7 +702,7 @@ def _know_forward(x, pool_params, router_params, rng,
 
     # Learned strength: sigmoid(h @ W + b) * C, C = 2√d_model
     C_know = 2.0 * jnp.sqrt(jnp.float32(x.shape[-1]))
-    know_logit = h @ router_params['strength_know']['kernel'] + router_params['strength_know']['bias']
+    know_logit = x @ router_params['strength_know']['kernel'] + router_params['strength_know']['bias']
     know_strength = jax.nn.sigmoid(know_logit) * C_know  # [B, S, 1]
 
     if sharded_fns is not None:
