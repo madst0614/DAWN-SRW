@@ -1,5 +1,5 @@
-# DAWN Spatial-R1 v3.9.1 -- Sense-Read-Write, d_route=128, 40M Scale
-# gate_sum normalize + tanh(gate_max) + learnable output_scale.
+# DAWN Spatial-R1 v3.9.1 baseline -- gate_sum + tanh(gate_max) + √d_model
+# Frozen baseline for comparison. Do not modify.
 
 seed: 1
 
@@ -43,12 +43,3 @@ training:
 use_amp: true
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.9.1_40M_c4_5B
 log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.9.1_40M_c4_5B
-
-# Parameter budget (~40M):
-#   QK:   1580 x (128+384+384) = 1.42M
-#   V:    2600 x (128+384+384) = 2.33M
-#   Know: 25200 x (128+384+384) = 22.58M
-#   Router proj+tau: ~0.25M
-#   Blocks (LN x2 + O) x12: 1.79M
-#   Embeddings: 11.72M
-#   Total: ~40.1M

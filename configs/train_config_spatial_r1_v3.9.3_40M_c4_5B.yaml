@@ -1,5 +1,6 @@
-# DAWN Spatial-R1 v3.9.1 -- Sense-Read-Write, d_route=128, 40M Scale
-# gate_sum normalize + tanh(gate_max) + learnable output_scale.
+# DAWN Spatial-R1 v3.9.3 -- Strength Separation
+# gate_sum normalize (ratio) + learned sigmoid strength (know, V)
+# QK uses fixed √d_model. strength = sigmoid(h @ W + b) * 2√d_model.
 
 seed: 1
 
@@ -11,7 +12,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.9.1"
+  model_version: "spatial-r1-v3.9.3"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -41,14 +42,5 @@ training:
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.9.1_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.9.1_40M_c4_5B
-
-# Parameter budget (~40M):
-#   QK:   1580 x (128+384+384) = 1.42M
-#   V:    2600 x (128+384+384) = 2.33M
-#   Know: 25200 x (128+384+384) = 22.58M
-#   Router proj+tau: ~0.25M
-#   Blocks (LN x2 + O) x12: 1.79M
-#   Embeddings: 11.72M
-#   Total: ~40.1M
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.9.3_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.9.3_40M_c4_5B

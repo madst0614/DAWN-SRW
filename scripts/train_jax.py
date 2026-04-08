@@ -43,6 +43,8 @@ from models.model_v17_1_jax import DAWN
 from models.dawn_spatial import DAWN as DAWN_Spatial
 from models.dawn_spatial_v2 import DAWN as DAWN_SpatialV2
 from models.dawn_spatial_v3 import DAWN as DAWN_SpatialV3
+from models.dawn_spatial_v3_baseline import DAWN as DAWN_SpatialV3Baseline
+from models.dawn_spatial_v3_exp import DAWN as DAWN_SpatialV3Exp
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -113,6 +115,42 @@ def build_model_from_config(cfg):
             k_cluster_qk=mcfg.get('k_cluster_qk', 8),
             k_cluster_v=mcfg.get('k_cluster_v', 8),
             k_cluster_know=mcfg.get('k_cluster_know', 8),
+        )
+    elif version == 'spatial-r1-v3.9.3':
+        model = DAWN_SpatialV3Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.1':
+        model = DAWN_SpatialV3Baseline(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
         )
     elif version.startswith('spatial-r1-v3'):
         model = DAWN_SpatialV3(
@@ -516,14 +554,30 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'know_aux': result.get('know_aux', jnp.float32(0.0)),
             'know_active': result.get('know_active', jnp.float32(0.0)),
+            'know_active_N': result.get('know_active_N', jnp.float32(0.0)),
+            'know_score_std': result.get('know_score_std', jnp.float32(0.0)),
             'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
+            'know_strength_mean': result.get('know_strength_mean', jnp.float32(0.0)),
+            'know_strength_std': result.get('know_strength_std', jnp.float32(0.0)),
+            'know_strength_min': result.get('know_strength_min', jnp.float32(0.0)),
+            'know_strength_max': result.get('know_strength_max', jnp.float32(0.0)),
+            'know_logit_mean': result.get('know_logit_mean', jnp.float32(0.0)),
+            'know_logit_std': result.get('know_logit_std', jnp.float32(0.0)),
             'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
+            'attn_active_N': result.get('attn_active_N', jnp.float32(0.0)),
+            'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
+            'attn_v_strength_mean': result.get('attn_v_strength_mean', jnp.float32(0.0)),
+            'attn_v_strength_std': result.get('attn_v_strength_std', jnp.float32(0.0)),
+            'attn_v_strength_min': result.get('attn_v_strength_min', jnp.float32(0.0)),
+            'attn_v_strength_max': result.get('attn_v_strength_max', jnp.float32(0.0)),
+            'attn_v_logit_mean': result.get('attn_v_logit_mean', jnp.float32(0.0)),
+            'attn_v_logit_std': result.get('attn_v_logit_std', jnp.float32(0.0)),
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
             'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
@@ -903,6 +957,8 @@ def main():
                         help='Override learning rate from config')
     parser.add_argument('--debug', action='store_true',
                         help='Debug mode: log every step with detailed metrics')
+    parser.add_argument('--resume-from', type=str, default=None,
+                        help='Resume from specific run folder path (e.g. gs://...../run_v...)')
     cli_args = parser.parse_args()
 
     # ----------------------------------------------------------
@@ -976,18 +1032,30 @@ def main():
             ])
 
     # Auto-resume: find latest run folder with checkpoints (unless --from-scratch)
-    # All hosts detect the same checkpoint for consistency
+    # --resume-from takes priority: resume from a specific run folder
     if not cli_args.from_scratch:
-        run_folders = _list_run_folders(base_checkpoint_dir)
-        for folder in reversed(run_folders):
+        if cli_args.resume_from:
+            folder = cli_args.resume_from.rstrip('/')
             candidates = _list_files(folder, "*.flax")
             if candidates:
                 resume_path = candidates[-1]
                 checkpoint_dir = folder
                 if jax.process_index() == 0:
-                    print(f"  Auto-resume: found checkpoint in {checkpoint_dir}")
+                    print(f"  Resume from specified folder: {checkpoint_dir}")
                     print(f"  Resuming from: {resume_path}")
-                break
+            else:
+                raise FileNotFoundError(f"No .flax checkpoint found in {folder}")
+        else:
+            run_folders = _list_run_folders(base_checkpoint_dir)
+            for folder in reversed(run_folders):
+                candidates = _list_files(folder, "*.flax")
+                if candidates:
+                    resume_path = candidates[-1]
+                    checkpoint_dir = folder
+                    if jax.process_index() == 0:
+                        print(f"  Auto-resume: found checkpoint in {checkpoint_dir}")
+                        print(f"  Resuming from: {resume_path}")
+                    break
 
     # Create new run folder if not resuming
     if checkpoint_dir is None:
@@ -1170,27 +1238,9 @@ def main():
         end_value=lr * 0.1,
     )
 
-    # Weight decay mask: disable for unit-norm re-projected params
-    def create_wd_mask(params):
-        def _mask(path, _):
-            path_str = '/'.join(str(p) for p in path)
-            # No WD for unit-norm re-projected params
-            if 'neuron_pool' in path_str:
-                for key in ['_emb', '_read', '_write']:
-                    if key in path_str:
-                        return False
-            return True
-        return jax.tree.map_with_path(_mask, params)
-
-    wd_mask = create_wd_mask(params)
-
     base_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, weight_decay=0.0, b2=0.95),
-        optax.masked(
-            optax.add_decayed_weights(weight_decay),
-            wd_mask,
-        ),
+        optax.adamw(learning_rate=schedule, weight_decay=weight_decay, b2=0.95),
     )
 
     if grad_accum_steps > 1:
@@ -1329,7 +1379,9 @@ def main():
     # Create shard_map functions if mesh_model > 1
     _sharded_fns = None
     if mesh_model > 1:
-        from models.dawn_spatial_v3 import make_sharded_srw, make_sharded_srw_paired
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw', 'make_sharded_srw_paired'])
+        make_sharded_srw, make_sharded_srw_paired = _v3.make_sharded_srw, _v3.make_sharded_srw_paired
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
         _sharded_single = make_sharded_srw(mesh, max_chunk_size=max_chunk)
         _sharded_paired = make_sharded_srw_paired(mesh, max_chunk_size=max_chunk)
@@ -1405,8 +1457,9 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            from models.dawn_spatial_v3 import (
-                _layer_norm, _attn_forward, _know_forward, _srw_chunked)
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
+            _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
             # Use actual sharded params (no device_get)
             pool_p = params['neuron_pool']
@@ -1490,16 +1543,17 @@ def main():
                 h_QK = jnp.stack([h_Q, h_K], axis=2)
                 tau_QK = jnp.stack(
                     [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-                QK_out, act, gm, _lb, _ss, _gs, _gc, _sm = fused_paired(
+                results = fused_paired(
                     x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
-                return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act, gm
+                QK_out, act = results[0], results[1]
+                return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act
 
             # 3b) QK non-sharded fallback
             @jax.jit
             def prof_qk_chunked(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
-                Q, _, _, _, _, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                Q, *_ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
                                        qk_read, qk_write, n_chunks_qk)
-                K, _, _, _, _, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                K, *_ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
                                        qk_read, qk_write, n_chunks_qk)
                 return Q, K
 
@@ -1577,17 +1631,17 @@ def main():
             jax.block_until_ready(tau_all)
 
             if _is_sharded:
-                Q, K, _, _ = prof_qk_fused(
+                Q, K, *_ = prof_qk_fused(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _, _, _, _, _, _ = prof_v_sharded(
+                V, *_ = prof_v_sharded(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             else:
                 Q, K = prof_qk_chunked(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _, _, _, _, _, _ = prof_v_chunked(
+                V, *_ = prof_v_chunked(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             jax.block_until_ready((Q, K, V))
@@ -1955,12 +2009,16 @@ def main():
 
                         n_know_cfg = cfg['model'].get('n_know', 27200)
                         k_act = _m(metrics['know_active'])
-                        k_raw_gmax = _m(metrics['know_raw_gate_max'])
+                        k_aN = _m(metrics.get('know_active_N', 0.0))
+                        k_sstd = _m(metrics.get('know_score_std', 0.0))
+                        k_raw_gmax = _m(metrics.get('know_raw_gate_max', 0.0))
                         k_gsum = _m(metrics.get('know_gate_sum', 0.0))
                         k_gconc = _m(metrics.get('know_gate_conc', 0.0))
 
                         a_qk_act = _m(metrics.get('attn_qk_active', 0.0))
                         a_v_act = _m(metrics.get('attn_v_active', 0.0))
+                        a_aN = _m(metrics.get('attn_active_N', 0.0))
+                        a_sstd = _m(metrics.get('attn_score_std', 0.0))
                         a_raw_gmax = _m(metrics.get('attn_raw_gate_max', 0.0))
                         a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
                         a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
@@ -1981,20 +2039,52 @@ def main():
                         a_qk_raw_n = _m(metrics.get('attn_qk_raw_norm', 0.0))
                         a_v_raw_n = _m(metrics.get('attn_v_raw_norm', 0.0))
 
+                        # know line: show active_N or gate_sum/conc depending on version
+                        k_extra = ""
+                        if k_gsum > 0:  # v3.9.1
+                            k_extra = f" raw_max={k_raw_gmax:.4f} conc={k_gconc:.1f} gsum={k_gsum:.1f}"
+                        if k_aN > 0:    # v3.9.2
+                            k_extra += f" active_N={k_aN:.0f}"
                         log_message(
                             f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
-                            f"({k_act*100:.1f}%) raw_max={k_raw_gmax:.4f}"
-                            f" conc={k_gconc:.1f}"
-                            f" gsum={k_gsum:.1f}"
+                            f"({k_act*100:.1f}%){k_extra}"
+                            f" s_std={k_sstd:.3f}"
                             f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
+                        # attn line
+                        a_extra = ""
+                        if a_gsum > 0:  # v3.9.1
+                            a_extra = f" raw_max={a_raw_gmax:.4f} conc={a_gconc:.1f} gsum={a_gsum:.1f}"
+                        if a_aN > 0:    # v3.9.2
+                            a_extra += f" active_N={a_aN:.0f}"
                         log_message(
                             f"      attn: qk_active={a_qk_act:.1%}"
-                            f" v_active={a_v_act:.1%}"
-                            f" raw_max={a_raw_gmax:.4f}"
-                            f" conc={a_gconc:.1f}"
-                            f" gsum={a_gsum:.1f}"
+                            f" v_active={a_v_act:.1%}{a_extra}"
+                            f" s_std={a_sstd:.3f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
+                        # Strength (v3.9.3)
+                        k_str_m = _m(metrics.get('know_strength_mean', 0.0))
+                        if k_str_m > 0:
+                            k_str_s = _m(metrics.get('know_strength_std', 0.0))
+                            k_str_mn = _m(metrics.get('know_strength_min', 0.0))
+                            k_str_mx = _m(metrics.get('know_strength_max', 0.0))
+                            k_lg_m = _m(metrics.get('know_logit_mean', 0.0))
+                            k_lg_s = _m(metrics.get('know_logit_std', 0.0))
+                            log_message(
+                                f"      know_str: mean={k_str_m:.2f} std={k_str_s:.2f}"
+                                f" min={k_str_mn:.2f} max={k_str_mx:.2f}"
+                                f" | logit: mean={k_lg_m:.3f} std={k_lg_s:.3f}")
+                        a_v_str_m = _m(metrics.get('attn_v_strength_mean', 0.0))
+                        if a_v_str_m > 0:
+                            a_v_str_s = _m(metrics.get('attn_v_strength_std', 0.0))
+                            a_v_str_mn = _m(metrics.get('attn_v_strength_min', 0.0))
+                            a_v_str_mx = _m(metrics.get('attn_v_strength_max', 0.0))
+                            a_v_lg_m = _m(metrics.get('attn_v_logit_mean', 0.0))
+                            a_v_lg_s = _m(metrics.get('attn_v_logit_std', 0.0))
+                            log_message(
+                                f"      v_str: mean={a_v_str_m:.2f} std={a_v_str_s:.2f}"
+                                f" min={a_v_str_mn:.2f} max={a_v_str_mx:.2f}"
+                                f" | logit: mean={a_v_lg_m:.3f} std={a_v_lg_s:.3f}")
                         if _early_debug or debug_mode:
                             d_res = _m(metrics.get('debug_residual_norm', 0.0))
                             d_emb = _m(metrics.get('debug_emb_norm', 0.0))
