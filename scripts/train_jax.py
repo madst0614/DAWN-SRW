@@ -1843,7 +1843,7 @@ def main():
         # Set up loggers (local append + periodic GCS sync)
         _setup_loggers(training_log_file, jsonl_log_file)
 
-        n_params = count_parameters(jax.device_get(params))
+        n_params = count_parameters(params)
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
         log_message(f"Config: {config_path}")
         log_message(f"Parameters: {n_params:,}")
