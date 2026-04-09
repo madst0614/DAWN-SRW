@@ -686,8 +686,10 @@ def get_param_shardings(params, mesh, is_baseline=False):
                 return n_sharded_3d    # [N, D, R] for v17.1
             else:
                 return replicated
-        # Baseline FSDP: shard 2D+ params on data axis
+        # Baseline FSDP: shard 2D kernels on data axis (skip embeddings)
         if is_baseline and value.ndim >= 2:
+            if 'token_emb' in path_str or 'pos_emb' in path_str:
+                return replicated
             return data_sharded
         return replicated
 
