@@ -667,11 +667,14 @@ def create_mesh(mesh_data, mesh_model):
     return Mesh(device_array, ('data', 'model'))
 
 
-def get_param_shardings(params, mesh):
-    """Create sharding specs for params: neuron_pool N-axis on 'model', rest replicated."""
+def get_param_shardings(params, mesh, is_baseline=False):
+    """Create sharding specs for params: neuron_pool N-axis on 'model', rest replicated.
+    For baseline models (is_baseline=True), 2D+ params are sharded on 'data' axis (FSDP-style).
+    """
     replicated = NamedSharding(mesh, P())  # no sharding
     n_sharded = NamedSharding(mesh, P('model', None))  # N axis on model
     n_sharded_3d = NamedSharding(mesh, P('model', None, None))
+    data_sharded = NamedSharding(mesh, P('data', None))  # FSDP: first axis on data
 
     def _get_sharding(path, value):
         path_str = '/'.join(str(p) for p in path)
@@ -683,6 +686,9 @@ def get_param_shardings(params, mesh):
                 return n_sharded_3d    # [N, D, R] for v17.1
             else:
                 return replicated
+        # Baseline FSDP: shard 2D+ params on data axis
+        if is_baseline and value.ndim >= 2:
+            return data_sharded
         return replicated
 
     flat_params = jax.tree.leaves_with_path(params)
@@ -1391,7 +1397,7 @@ def main():
         print(f"  Est chunk mem (know): {chunk_mem:.2f}GB bf16")
 
     # Shard params: neuron_pool N-axis on 'model', rest replicated
-    param_shardings = get_param_shardings(params, mesh)
+    param_shardings = get_param_shardings(params, mesh, is_baseline=is_baseline)
     params = shard_params_to_mesh(params, param_shardings)
     opt_state = optimizer.init(params)  # reinit with sharded params
 
