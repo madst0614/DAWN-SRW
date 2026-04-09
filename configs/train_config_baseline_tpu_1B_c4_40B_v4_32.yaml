@@ -23,8 +23,8 @@ model:
   gradient_checkpointing: true
 
 training:
-  batch_size: 512
-  gradient_accumulation_steps: 4
+  batch_size: 128
+  gradient_accumulation_steps: 16
   num_epochs: 1
   lr: 0.0003
   weight_decay: 0.1
