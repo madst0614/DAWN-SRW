@@ -134,6 +134,7 @@ def threshold_gate(scores, tau_offset):
 
     raw = scores - tau.astype(scores.dtype)
     gate_soft = jnp.maximum(raw, 0.0)
+    gate_soft = jnp.clip(gate_soft, 0.0, 10.0)
     gate_hard = (raw > 0).astype(scores.dtype)
     gate = gate_hard + gate_soft - jax.lax.stop_gradient(gate_soft)  # STE
     soft_gate_sum = gate_soft.sum(axis=-1, keepdims=True).astype(jnp.float32)
@@ -240,6 +241,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             scores = h_bf @ ec.T
             raw = scores.astype(jnp.float32) - tau  # f32 (tau already f32)
             gate_soft = jnp.maximum(raw, 0.0)
+            gate_soft = jnp.clip(gate_soft, 0.0, 10.0)
             gate_hard = (raw > 0).astype(jnp.float32)
             gate = gate_hard + gate_soft - jax.lax.stop_gradient(gate_soft)  # STE
             gate_bf = gate.astype(jnp.bfloat16)
@@ -369,6 +371,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             raw = scores.astype(jnp.float32) - tau
             gate_soft = jnp.maximum(raw, 0.0)
+            gate_soft = jnp.clip(gate_soft, 0.0, 10.0)
             gate_hard = (raw > 0).astype(jnp.float32)
             gate = gate_hard + gate_soft - jax.lax.stop_gradient(gate_soft)  # STE
             gate_bf = gate.astype(jnp.bfloat16)
@@ -464,6 +467,7 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         scores = h_bf @ ec.T
         raw = scores.astype(jnp.float32) - tau
         gate_soft = jnp.maximum(raw, 0.0)
+        gate_soft = jnp.clip(gate_soft, 0.0, 10.0)
         gate_hard = (raw > 0).astype(jnp.float32)
         gate = gate_hard + gate_soft - jax.lax.stop_gradient(gate_soft)  # STE
         gate_bf = gate.astype(jnp.bfloat16)
@@ -1130,6 +1134,7 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
 
     raw = scores - tau.astype(scores.dtype)
     gate_soft = jnp.maximum(raw, 0.0)
+    gate_soft = jnp.clip(gate_soft, 0.0, 10.0)
     gate = (raw > 0).astype(scores.dtype)  # pure binary at inference
 
     soft_gate_sum = gate_soft.sum(axis=-1, keepdims=True).astype(jnp.float32)
@@ -1154,6 +1159,7 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
 
     raw = scores - tau.astype(scores.dtype)
     gate_soft = jnp.maximum(raw, 0.0)
+    gate_soft = jnp.clip(gate_soft, 0.0, 10.0)
     gate = (raw > 0).astype(scores.dtype)  # pure binary at inference
 
     soft_gate_sum = gate_soft.sum(axis=-1, keepdims=True).astype(jnp.float32)
@@ -1651,6 +1657,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         tau = s_mean + tau_off * s_std
         raw = scores - tau.astype(scores.dtype)
         gate_soft = jnp.maximum(raw, 0.0)
+        gate_soft = jnp.clip(gate_soft, 0.0, 10.0)
         gate = (raw > 0).astype(scores.dtype)  # pure binary at inference
         if mult is not None:
             gate = gate * mult[None, None, :]
