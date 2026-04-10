@@ -138,7 +138,7 @@ def threshold_gate(scores, tau_offset):
     gate_hard = (raw > 0).astype(scores.dtype)
     gate = gate_hard + gate_soft - jax.lax.stop_gradient(gate_soft)  # STE
     soft_gate_sum = gate_soft.sum(axis=-1, keepdims=True).astype(jnp.float32)
-    norm_factor = jnp.maximum(soft_gate_sum, 1.0)
+    norm_factor = jnp.maximum(jax.lax.stop_gradient(soft_gate_sum), 1.0)
     return gate / norm_factor.astype(scores.dtype)
 
 
@@ -262,7 +262,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
 
         global_soft_gate_sum = jax.lax.psum(total_soft_gate_sum, 'model')
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
-        norm_factor = jnp.maximum(global_soft_gate_sum, 1.0)
+        norm_factor = jnp.maximum(jax.lax.stop_gradient(global_soft_gate_sum), 1.0)
         out = raw_out / norm_factor
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
@@ -393,7 +393,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         # Normalize per route independently
         global_soft_gate_sum = jax.lax.psum(total_soft_gate_sum, 'model')
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
-        norm_factor = jnp.maximum(global_soft_gate_sum, 1.0)
+        norm_factor = jnp.maximum(jax.lax.stop_gradient(global_soft_gate_sum), 1.0)
         out = raw_out / norm_factor
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
@@ -485,7 +485,7 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         (jnp.zeros((B, S, D), dtype=jnp.float32), z1, jnp.full((B, S, 1), -1e9), z1),
         jnp.arange(n_chunks))
 
-    norm_factor = jnp.maximum(total_soft_gate_sum, 1.0)
+    norm_factor = jnp.maximum(jax.lax.stop_gradient(total_soft_gate_sum), 1.0)
     out = (raw_out / norm_factor).astype(jnp.bfloat16)
 
     score_std_out = s_std.mean()
@@ -1138,7 +1138,7 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = (raw > 0).astype(scores.dtype)  # pure binary at inference
 
     soft_gate_sum = gate_soft.sum(axis=-1, keepdims=True).astype(jnp.float32)
-    norm_factor = jnp.maximum(soft_gate_sum, 1.0)
+    norm_factor = jnp.maximum(jax.lax.stop_gradient(soft_gate_sum), 1.0)
 
     r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
@@ -1163,7 +1163,7 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = (raw > 0).astype(scores.dtype)  # pure binary at inference
 
     soft_gate_sum = gate_soft.sum(axis=-1, keepdims=True).astype(jnp.float32)
-    norm_factor = jnp.maximum(soft_gate_sum, 1.0)
+    norm_factor = jnp.maximum(jax.lax.stop_gradient(soft_gate_sum), 1.0)
     active_n = gate.sum(axis=-1, keepdims=True).astype(jnp.float32)
     gate_norm = gate.astype(jnp.float32) / jnp.maximum(active_n, 1.0)
 
@@ -1663,7 +1663,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             gate = gate * mult[None, None, :]
             gate_soft = gate_soft * mult[None, None, :]
         soft_gate_sum = gate_soft.sum(axis=-1, keepdims=True).astype(jnp.float32)
-        norm_factor = jnp.maximum(soft_gate_sum, 1.0)
+        norm_factor = jnp.maximum(jax.lax.stop_gradient(soft_gate_sum), 1.0)
         r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
         w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
         xr = x @ r_n.T
