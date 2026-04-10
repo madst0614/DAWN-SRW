@@ -611,8 +611,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-    qk_scale = jnp.sqrt(jnp.float32(D))
-    v_scale = jnp.sqrt(jnp.float32(D))
+    qk_scale = 1.0
+    v_scale = 1.0
 
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
@@ -708,7 +708,7 @@ def _know_forward(x, pool_params, router_params, rng,
     know_emb_unit = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
 
-    know_scale = jnp.sqrt(jnp.float32(x.shape[-1]))
+    know_scale = 1.0
 
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
@@ -1194,7 +1194,7 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
                            pool_params['qk_read'], pool_params['qk_write'])
     V_new = _srw_inference(x, h_V, v_norm, tau_all[:, :, 2:3],
                            pool_params['v_read'], pool_params['v_write'])
-    _os = jnp.sqrt(jnp.float32(d_model))
+    _os = 1.0
     Q = Q * _os
     K_new = K_new * _os
     V_new = V_new * _os
@@ -1227,7 +1227,7 @@ def _know_forward_inference(x, pool_params, router_params):
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     out = _srw_inference(x, h, know_norm, tau,
                          pool_params['know_read'], pool_params['know_write'])
-    return out * jnp.sqrt(jnp.float32(x.shape[-1]))
+    return out
 
 
 def prefill(params, model_cfg, input_ids):
@@ -1275,7 +1275,7 @@ def prefill(params, model_cfg, input_ids):
                                pool_params['qk_read'], pool_params['qk_write'])
         V_val = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
                                pool_params['v_read'], pool_params['v_write'])
-        _os = jnp.sqrt(jnp.float32(d_model))
+        _os = 1.0
         Q = Q * _os
         K_val = K_val * _os
         V_val = V_val * _os
@@ -1409,7 +1409,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
                                pool_params['qk_read'], pool_params['qk_write'])
             V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
                                pool_params['v_read'], pool_params['v_write'])
-            _os = jnp.sqrt(jnp.float32(d_model))
+            _os = 1.0
             Q = Q * _os
             K = K * _os
             V = V * _os
@@ -1434,7 +1434,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
             know_out = _srw_inference(normed, h_k, know_norm, tau_k,
                                      pool_params['know_read'], pool_params['know_write'])
-            x = x + know_out * jnp.sqrt(jnp.float32(x.shape[-1]))
+            x = x + know_out
             return x, None
 
         x, _ = jax.lax.scan(layer_fn, x, stacked)
@@ -1585,7 +1585,7 @@ def analysis_forward(params, model_cfg, input_ids):
         V, gate_V = _srw_inference_with_gates(
             normed, h_V, v_norm, tau_all[:, :, 2:3],
             pool_params['v_read'], pool_params['v_write'])
-        _os = jnp.sqrt(jnp.float32(d_model))
+        _os = 1.0
         Q = Q * _os
         K = K * _os
         V = V * _os
@@ -1611,7 +1611,6 @@ def analysis_forward(params, model_cfg, input_ids):
         know_out, gate_Know = _srw_inference_with_gates(
             normed, h_k, know_norm_w, tau_k,
             pool_params['know_read'], pool_params['know_write'])
-        know_out = know_out * jnp.sqrt(jnp.float32(x.shape[-1]))
         know_out_norm = jnp.linalg.norm(know_out, axis=-1).mean()
         x = x + know_out
 
@@ -1689,7 +1688,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             Q = _srw_sup(normed, h_Q, qk_n, tau_all[:,:,0:1], pp['qk_read'], pp['qk_write'], qk_mult)
             K = _srw_sup(normed, h_K, qk_n, tau_all[:,:,1:2], pp['qk_read'], pp['qk_write'], qk_mult)
             V = _srw_sup(normed, h_V, v_n, tau_all[:,:,2:3], pp['v_read'], pp['v_write'], v_mult)
-            _os = jnp.sqrt(jnp.float32(d_model))
+            _os = 1.0
             Q = Q * _os
             K = K * _os
             V = V * _os
@@ -1709,7 +1708,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ rp['proj_know']['kernel'] + rp['proj_know']['bias']
             tau_k = normed @ rp['tau_know']['kernel'] + rp['tau_know']['bias']
-            x = x + _srw_sup(normed, h_k, kn_n, tau_k, pp['know_read'], pp['know_write'], know_mult) * jnp.sqrt(jnp.float32(d_model))
+            x = x + _srw_sup(normed, h_k, kn_n, tau_k, pp['know_read'], pp['know_write'], know_mult)
 
         norm_p = params['norm']
         x = _layer_norm(x, norm_p['scale'], norm_p['bias'])
