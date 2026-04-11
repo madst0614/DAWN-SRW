@@ -2,13 +2,16 @@
 DAWN-Spatial v3.9.7: Sense-Read-Write (JAX/Flax)
 
 Changelog:
-  spatial-r1-v3.9.7 (2026-04-11):
+  spatial-r1-v3.9.7 (2026-04-12):
     - Binary gate + xr²-weighted soft denominator
     - numerator: pure binary gate (STE via sigmoid(raw/s_std))
-    - denominator: √(Σ sigmoid(raw/s_std) × sg(xr²)) — xr-weighted smooth count
+    - denominator: √(Σ sigmoid(raw/s_std) × xr²) — xr-weighted smooth count
+    - Remove stop_gradient from xr² in denominator
+    - Allows denominator to provide self-regulation gradient to read
+    - Prevents runaway xr growth (positive feedback loop)
     - sigmoid scale = 1/s_std (adaptive, no hyperparameter)
     - STE changed from ReLU-based to sigmoid-based
-    - den floor = 1e-3, output_scale = √d_model
+    - den floor = 1e-3
 
   spatial-r1-v3.9.6 (2026-04-11):
     - STE binary gate + soft denominator
@@ -256,7 +259,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             xr = x_bf @ rc.T
             c_out = ((gate_bf * xr) @ wc).astype(jnp.float32)
             xr_f32 = xr.astype(jnp.float32)
-            cost = jax.lax.stop_gradient(xr_f32 ** 2)
+            cost = xr_f32 ** 2
             chunk_weighted = (sig * cost).sum(axis=-1, keepdims=True)
             chunk_active = gate_hard.sum(axis=-1, keepdims=True)
             return (out + c_out,
@@ -388,7 +391,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             xr = x_bf @ rc.T  # [B,S,N]
             c_out = jnp.einsum('bsrn,nd->bsrd', gate_bf * xr[:, :, None, :], wc).astype(jnp.float32)
             xr_f32 = xr.astype(jnp.float32)
-            cost = jax.lax.stop_gradient(xr_f32 ** 2)  # [B,S,N]
+            cost = xr_f32 ** 2  # [B,S,N]
             chunk_weighted = (sig * cost[:, :, None, :]).sum(axis=-1, keepdims=True)  # [B,S,2,1]
             chunk_active = gate_hard.sum(axis=-1, keepdims=True)
             return (out + c_out,
@@ -486,7 +489,7 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         xr = x_bf @ rc.T
         c_out = ((gate_bf * xr) @ wc).astype(jnp.float32)
         xr_f32 = xr.astype(jnp.float32)
-        cost = jax.lax.stop_gradient(xr_f32 ** 2)
+        cost = xr_f32 ** 2
         chunk_weighted = (sig * cost).sum(axis=-1, keepdims=True)
         chunk_active = gate_hard.sum(axis=-1, keepdims=True)
         return (out + c_out,
