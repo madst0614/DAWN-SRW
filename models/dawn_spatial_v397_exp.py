@@ -259,7 +259,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             xr = x_bf @ rc.T
             c_out = ((gate_bf * xr) @ wc).astype(jnp.float32)
             xr_f32 = xr.astype(jnp.float32)
-            cost = xr_f32 ** 2
+            cost = jax.lax.stop_gradient(xr_f32 ** 2)
             chunk_weighted = (sig * cost).sum(axis=-1, keepdims=True)
             chunk_active = gate_hard.sum(axis=-1, keepdims=True)
             return (out + c_out,
@@ -391,7 +391,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             xr = x_bf @ rc.T  # [B,S,N]
             c_out = jnp.einsum('bsrn,nd->bsrd', gate_bf * xr[:, :, None, :], wc).astype(jnp.float32)
             xr_f32 = xr.astype(jnp.float32)
-            cost = xr_f32 ** 2  # [B,S,N]
+            cost = jax.lax.stop_gradient(xr_f32 ** 2)  # [B,S,N]
             chunk_weighted = (sig * cost[:, :, None, :]).sum(axis=-1, keepdims=True)  # [B,S,2,1]
             chunk_active = gate_hard.sum(axis=-1, keepdims=True)
             return (out + c_out,
@@ -489,7 +489,7 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         xr = x_bf @ rc.T
         c_out = ((gate_bf * xr) @ wc).astype(jnp.float32)
         xr_f32 = xr.astype(jnp.float32)
-        cost = xr_f32 ** 2
+        cost = jax.lax.stop_gradient(xr_f32 ** 2)
         chunk_weighted = (sig * cost).sum(axis=-1, keepdims=True)
         chunk_active = gate_hard.sum(axis=-1, keepdims=True)
         return (out + c_out,
@@ -1688,7 +1688,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         xr = x @ r_n.T
         out = (gate * xr) @ w_n
         xr_f32 = xr.astype(jnp.float32)
-        cost = xr_f32 ** 2
+        cost = jax.lax.stop_gradient(xr_f32 ** 2)
         weighted = (sig * cost).sum(axis=-1, keepdims=True)
         den = jnp.sqrt(weighted + 1e-6)
         den = jnp.maximum(den, 1e-3)
