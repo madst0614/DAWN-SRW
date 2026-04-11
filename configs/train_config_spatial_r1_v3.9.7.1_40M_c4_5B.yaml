@@ -1,6 +1,6 @@
-# DAWN Spatial-R1 v3.9.7.1 -- Linear denominator + √d_model output scale
+# DAWN Spatial-R1 v3.9.7.1 -- Linear denominator + learnable output_scale
 # den = Σ sigmoid(raw/s_std) × sg(xr²) (no √, linear)
-# out = raw_out / den * √d_model
+# out = raw_out / den * learnable_scale (init=1.0, WD excluded)
 
 seed: 1
 
