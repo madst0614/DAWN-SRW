@@ -163,6 +163,14 @@ def load_checkpoint_params(ckpt_path, model, cfg):
     return params, {'step': step, 'epoch': epoch}
 
 
+def get_output_scales(pool_params):
+    """Get per-pool output scale. Returns (qk_scale, v_scale, know_scale) — 1.0 if absent."""
+    qk_s = pool_params.get('qk_scale', 1.0)
+    v_s = pool_params.get('v_scale', 1.0)
+    know_s = pool_params.get('know_scale', 1.0)
+    return qk_s, v_s, know_s
+
+
 def get_model_cfg(cfg):
     """Extract model config dict for inference functions."""
     mcfg = cfg['model']
@@ -607,6 +615,9 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = emb_matrix[input_ids] + pos_matrix[positions]
 
+        # Output scales (1.0 for models without learnable scale)
+        qk_s, v_s, know_s = get_output_scales(pool_params)
+
         # Forward to mid layer
         for i in range(mid_layer):
             lp = block_params_list[i]
@@ -616,11 +627,11 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
             tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
             Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
-                               pool_params['qk_read'], pool_params['qk_write'])
+                               pool_params['qk_read'], pool_params['qk_write']) * qk_s
             K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2],
-                               pool_params['qk_read'], pool_params['qk_write'])
+                               pool_params['qk_read'], pool_params['qk_write']) * qk_s
             V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
-                               pool_params['v_read'], pool_params['v_write'])
+                               pool_params['v_read'], pool_params['v_write']) * v_s
 
             d_head = d_model // n_heads
             Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -640,7 +651,7 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
             h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
             tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
             know_out = _srw_inference(normed, h_k, know_norm, tau_k,
-                                     pool_params['know_read'], pool_params['know_write'])
+                                     pool_params['know_read'], pool_params['know_write']) * know_s
             x = x + know_out
 
         # At mid layer, get gate distributions
@@ -1599,30 +1610,38 @@ def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20,
     val_reshaped = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     actual_batches = min(n_batches, n_seqs // batch_size)
 
+    # Per-layer stats: 9 metrics per layer, stacked as [n_layers, 9]
+    N_STATS = 9
+    STAT_NAMES = ['gate_mean', 'gate_std', 'gate_max', 'gate_min',
+                  'eff_n_mean', 'frac_above_0p5', 'frac_above_0p1',
+                  'frac_above_0p01', 'frac_neg']
+
+    qk_s, v_s, know_s = get_output_scales(pool_params)
+
     @jax.jit
     def get_all_layer_gates(input_ids):
-        """Forward through all layers, collect know gate at each layer."""
+        """Forward through all layers, collect know gate stats at each layer."""
         B, S = input_ids.shape
         emb_matrix = params['token_emb']['embedding']
         pos_matrix = params['pos_emb']['embedding']
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = emb_matrix[input_ids] + pos_matrix[positions]
 
-        layer_gates = []
+        all_stats = jnp.zeros((n_layers, N_STATS))
+
         for i in range(n_layers):
             lp = block_params_list[i]
-            # Attention forward
             normed = _layer_norm(x, lp['norm1']['scale'], lp['norm1']['bias'])
             h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
             tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
             Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
-                               pool_params['qk_read'], pool_params['qk_write'])
+                               pool_params['qk_read'], pool_params['qk_write']) * qk_s
             K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2],
-                               pool_params['qk_read'], pool_params['qk_write'])
+                               pool_params['qk_read'], pool_params['qk_write']) * qk_s
             V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
-                               pool_params['v_read'], pool_params['v_write'])
+                               pool_params['v_read'], pool_params['v_write']) * v_s
 
             d_head = d_model // n_heads
             Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1638,49 +1657,45 @@ def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20,
             attn_out = attn_out @ lp['attn']['expand_O']['kernel']
             x = x + attn_out
 
-            # Knowledge forward — get gate
             normed = _layer_norm(x, lp['norm2']['scale'], lp['norm2']['bias'])
             h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
             tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
             know_out, gate_know = _srw_inference_with_gates(normed, h_k, know_norm, tau_k,
                                                             pool_params['know_read'], pool_params['know_write'])
-            x = x + know_out
+            x = x + know_out * know_s
 
-            # Gate stats for this layer
             abs_gate = jnp.abs(gate_know)
             gate_sum = abs_gate.sum(axis=-1)
             gate_sq_sum = (abs_gate ** 2).sum(axis=-1)
             eff_n = gate_sum ** 2 / (gate_sq_sum + 1e-8)
-            layer_gates.append({
-                'gate_mean': gate_know.mean(),
-                'gate_std': gate_know.std(),
-                'gate_max': gate_know.max(),
-                'gate_min': gate_know.min(),
-                'eff_n_mean': eff_n.mean(),
-                'frac_above_0p5': (abs_gate > 0.5).astype(jnp.float32).mean(),
-                'frac_above_0p1': (abs_gate > 0.1).astype(jnp.float32).mean(),
-                'frac_above_0p01': (abs_gate > 0.01).astype(jnp.float32).mean(),
-                'frac_neg': (gate_know < -0.5).astype(jnp.float32).mean(),
-            })
+            layer_stat = jnp.array([
+                gate_know.mean(), gate_know.std(), gate_know.max(), gate_know.min(),
+                eff_n.mean(),
+                (abs_gate > 0.5).astype(jnp.float32).mean(),
+                (abs_gate > 0.1).astype(jnp.float32).mean(),
+                (abs_gate > 0.01).astype(jnp.float32).mean(),
+                (gate_know < -0.5).astype(jnp.float32).mean(),
+            ])
+            all_stats = all_stats.at[i].set(layer_stat)
 
-        return layer_gates
+        return all_stats  # [n_layers, 9]
 
     print(f"  Running {actual_batches} batches (batch_size={batch_size})...")
     all_results = []
     for b in range(actual_batches):
         batch = jnp.array(val_reshaped[b * batch_size:(b + 1) * batch_size])
-        layer_gates = get_all_layer_gates(batch)
-        all_results.append(jax.device_get(layer_gates))
+        stats = get_all_layer_gates(batch)
+        all_results.append(jax.device_get(stats))
         if (b + 1) % 5 == 0:
             print(f"    batch {b+1}/{actual_batches}")
 
-    # Aggregate across batches
+    # Aggregate: mean across batches → [n_layers, 9]
+    avg_stats = np.mean(all_results, axis=0)
     results = {}
     for layer_idx in range(n_layers):
         layer_data = {}
-        for key in all_results[0][layer_idx]:
-            vals = [r[layer_idx][key] for r in all_results]
-            layer_data[key] = float(np.mean(vals))
+        for s, name in enumerate(STAT_NAMES):
+            layer_data[name] = float(avg_stats[layer_idx, s])
         results[f'layer_{layer_idx}'] = layer_data
 
     # Print summary
@@ -1732,6 +1747,7 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
     n_seqs = n_tokens // max_seq
     val_reshaped = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     actual_batches = min(n_batches, n_seqs // batch_size)
+    qk_s, v_s, know_s = get_output_scales(pool_params)
 
     @jax.jit
     def get_neuron_activation(input_ids):
@@ -1748,9 +1764,9 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
             h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
             tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
-            Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1], pool_params['qk_read'], pool_params['qk_write'])
-            K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2], pool_params['qk_read'], pool_params['qk_write'])
-            V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3], pool_params['v_read'], pool_params['v_write'])
+            Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1], pool_params['qk_read'], pool_params['qk_write']) * qk_s
+            K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2], pool_params['qk_read'], pool_params['qk_write']) * qk_s
+            V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3], pool_params['v_read'], pool_params['v_write']) * v_s
             d_head = d_model // n_heads
             Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
             Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1767,7 +1783,7 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
             normed = _layer_norm(x, lp['norm2']['scale'], lp['norm2']['bias'])
             h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
             tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-            know_out = _srw_inference(normed, h_k, know_norm, tau_k, pool_params['know_read'], pool_params['know_write'])
+            know_out = _srw_inference(normed, h_k, know_norm, tau_k, pool_params['know_read'], pool_params['know_write']) * know_s
             x = x + know_out
 
         # At mid layer, get know gate
