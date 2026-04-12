@@ -733,7 +733,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
             'know_active_n_mean': result.get('know_active_n_mean', jnp.float32(0.0)),
-            'know_strong': result.get('know_strong', jnp.float32(0.0)),
+            'know_strong': result.get('know_strong', result.get('know_pos', jnp.float32(0.0))),
             'know_strength_mean': result.get('know_strength_mean', jnp.float32(0.0)),
             'know_strength_std': result.get('know_strength_std', jnp.float32(0.0)),
             'know_strength_min': result.get('know_strength_min', jnp.float32(0.0)),
@@ -748,7 +748,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
             'attn_active_n_mean': result.get('attn_active_n_mean', jnp.float32(0.0)),
-            'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
+            'attn_strong': result.get('attn_strong', result.get('attn_pos', jnp.float32(0.0))),
             'attn_v_strength_mean': result.get('attn_v_strength_mean', jnp.float32(0.0)),
             'attn_v_strength_std': result.get('attn_v_strength_std', jnp.float32(0.0)),
             'attn_v_strength_min': result.get('attn_v_strength_min', jnp.float32(0.0)),
@@ -2257,34 +2257,34 @@ def main():
                         # know line: show active_N or gate_sum/conc depending on version
                         k_extra = ""
                         if k_gsum > 0:  # v3.9.1+
-                            k_extra = f" raw_max={k_raw_gmax:.4f} conc={k_gconc:.1f} gsum={k_gsum:.1f}"
+                            k_extra = f" gate_max={k_raw_gmax:.4f} conc={k_gconc:.1f} gsum={k_gsum:.1f}"
                         if k_anm > 0:  # v3.9.5
-                            k_extra = f" raw_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
+                            k_extra = f" gate_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
                         if k_aN > 0:    # v3.9.2
                             k_extra += f" active_N={k_aN:.0f}"
-                        k_exc = k_strong
-                        k_inh = max(k_act - k_strong, 0.0)
-                        k_exc_n = k_exc * n_know_cfg
-                        k_inh_n = k_inh * n_know_cfg
+                        k_pos = k_strong
+                        k_neg = max(k_act - k_strong, 0.0)
+                        k_pos_n = k_pos * n_know_cfg
+                        k_neg_n = k_neg * n_know_cfg
                         k_total_n = k_act * n_know_cfg
                         log_message(
-                            f"      know: exc={k_exc_n:.0f}({k_exc*100:.1f}%)"
-                            f" inh={k_inh_n:.0f}({k_inh*100:.1f}%)"
+                            f"      know: pos={k_pos_n:.0f}({k_pos*100:.1f}%)"
+                            f" neg={k_neg_n:.0f}({k_neg*100:.1f}%)"
                             f" active={k_total_n:.0f}({k_act*100:.1f}%){k_extra}"
                             f" s_std={k_sstd:.3f}"
                             f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
                         # attn line
                         a_extra = ""
                         if a_gsum > 0:  # v3.9.1+
-                            a_extra = f" raw_max={a_raw_gmax:.4f} conc={a_gconc:.1f} gsum={a_gsum:.1f}"
+                            a_extra = f" gate_max={a_raw_gmax:.4f} conc={a_gconc:.1f} gsum={a_gsum:.1f}"
                         if a_anm > 0:  # v3.9.5
-                            a_extra = f" raw_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
+                            a_extra = f" gate_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
                         if a_aN > 0:    # v3.9.2
                             a_extra += f" active_N={a_aN:.0f}"
-                        a_exc = a_strong
-                        a_inh = max(a_qk_act - a_strong, 0.0)
+                        a_pos = a_strong
+                        a_neg = max(a_qk_act - a_strong, 0.0)
                         log_message(
-                            f"      attn: qk_exc={a_exc*100:.1f}% qk_inh={a_inh*100:.1f}%"
+                            f"      attn: qk_pos={a_pos*100:.1f}% qk_neg={a_neg*100:.1f}%"
                             f" v_active={a_v_act:.1%}{a_extra}"
                             f" s_std={a_sstd:.3f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
