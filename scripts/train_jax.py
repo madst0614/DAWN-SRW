@@ -2290,11 +2290,15 @@ def main():
                                 f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
                         else:
                             k_strong_s = f" strong={k_strong * n_know_cfg:.0f}({k_strong*100:.1f}%)" if k_strong > 0 else ""
+                            k_phi_s = ""
+                            k_phi = _m(metrics.get('know_phi_binary', 0.0))
+                            if k_phi > 0:
+                                k_phi_s = f" phi_bin={k_phi*100:.1f}%"
                             log_message(
                                 f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
                                 f"({k_act*100:.1f}%){k_strong_s}{k_extra}"
                                 f" s_std={k_sstd:.3f}"
-                                f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
+                                f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}{k_phi_s}")
 
                         # attn line
                         a_extra = ""
@@ -2319,12 +2323,17 @@ def main():
                                 f" out_norm={a_out_n:.3f}")
                         else:
                             a_strong_s = f" strong={a_strong*100:.1f}%" if a_strong > 0 else ""
+                            a_phi_s = ""
+                            a_qk_phi = _m(metrics.get('attn_qk_phi_binary', 0.0))
+                            a_v_phi = _m(metrics.get('attn_v_phi_binary', 0.0))
+                            if a_qk_phi > 0:
+                                a_phi_s = f" qk_phi={a_qk_phi*100:.1f}% v_phi={a_v_phi*100:.1f}%"
                             log_message(
                                 f"      attn: qk_active={a_qk_act:.1%}"
                                 f" v_active={a_v_act:.1%}{a_strong_s}{a_extra}"
                                 f" s_std={a_sstd:.3f}"
                                 f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
-                                f" out_norm={a_out_n:.3f}")
+                                f" out_norm={a_out_n:.3f}{a_phi_s}")
                         # Strength (v3.9.3)
                         k_str_m = _m(metrics.get('know_strength_mean', 0.0))
                         if k_str_m > 0:
