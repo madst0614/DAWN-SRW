@@ -34,6 +34,7 @@ training:
   lr: 0.00065
   weight_decay: 0.1
   warmup_ratio: 0.06
+  orthogonality_weight: 0.0
   diversity_weight: 0.1
   load_balance_weight: 0.1
   n_chunks_know: 1
