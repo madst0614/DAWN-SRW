@@ -312,6 +312,10 @@ def analyze_validation(params, cfg, val_tokens, output_dir, batch_size=32, max_b
     eval_fn = jax.jit(lambda p, t: vectorized_eval(p, model_cfg, t, batch_size))
 
     print(f"  JIT compiling...")
+    # Debug: check embedding shape
+    emb_shape = jax.tree.map(lambda x: x.shape, params['token_emb'])
+    pos_shape = jax.tree.map(lambda x: x.shape, params['pos_emb'])
+    print(f"  DEBUG emb_shape={emb_shape}, pos_shape={pos_shape}")
     t0 = time.time()
     avg_loss, ppl, acc, total_valid = eval_fn(params, tokens_dev)
     jax.block_until_ready(avg_loss)
