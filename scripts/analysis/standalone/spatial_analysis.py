@@ -1215,26 +1215,32 @@ def analyze_pos_selectivity(params, cfg, output_dir,
             ids_dev = jnp.array(padded, dtype=jnp.int32)
             _, layer_info = jit_analysis(params, ids_dev)
 
-            # Get gates (average across layers)
+            # Vectorized accumulation (no Python per-token loop)
+            valid_mask = pos_padded >= 0  # [B, S]
+            n_valid = int(valid_mask.sum())
+            total_tokens += n_valid
+
+            # Count POS tokens (once, not per pool)
+            for pi in range(n_pos):
+                pos_token_counts[pi] += int((pos_padded == pi).sum())
+
             for pool_name, pinfo in pools.items():
                 # gate: [n_layers, B, S, N]
                 gate = np.array(jax.device_get(layer_info[pinfo['gate_key']]))
-                # Average over layers
                 gate_avg = gate.mean(axis=0)  # [B, S, N]
                 active = (gate_avg > 0.01).astype(np.float32)  # [B, S, N]
 
-                # Accumulate
-                for bi in range(len(batch_tokens)):
-                    for ti in range(min(len(batch_tokens[bi]), max_len)):
-                        pi = pos_padded[bi, ti]
-                        if pi < 0:
-                            continue
-                        # Per-neuron total activation
-                        pool_counts[pool_name] += active[bi, ti]
-                        # Per-(neuron, pos) activation
-                        pool_pos_counts[pool_name][:, pi] += active[bi, ti]
-                        pos_token_counts[pi] += 1
-                        total_tokens += 1
+                # Zero out padding positions
+                active_masked = active * valid_mask[:, :, np.newaxis]  # [B, S, N]
+
+                # Per-neuron total activation
+                pool_counts[pool_name] += active_masked.sum(axis=(0, 1))  # [N]
+
+                # Per-(neuron, pos) activation
+                for pi in range(n_pos):
+                    pmask = (pos_padded == pi)  # [B, S]
+                    if pmask.any():
+                        pool_pos_counts[pool_name][:, pi] += (active * pmask[:, :, np.newaxis]).sum(axis=(0, 1))
 
             n_batches_done += 1
             batch_tokens = []
