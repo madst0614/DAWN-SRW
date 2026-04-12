@@ -2292,8 +2292,9 @@ def main():
                             k_strong_s = f" strong={k_strong * n_know_cfg:.0f}({k_strong*100:.1f}%)" if k_strong > 0 else ""
                             k_phi_s = ""
                             k_phi = _m(metrics.get('know_phi_binary', 0.0))
+                            k_z_act = _m(metrics.get('know_z_mean_active', 0.0))
                             if k_phi > 0:
-                                k_phi_s = f" phi_bin={k_phi*100:.1f}%"
+                                k_phi_s = f" phi_bin={k_phi*100:.1f}% z_act={k_z_act:.2f}"
                             log_message(
                                 f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
                                 f"({k_act*100:.1f}%){k_strong_s}{k_extra}"
@@ -2326,8 +2327,10 @@ def main():
                             a_phi_s = ""
                             a_qk_phi = _m(metrics.get('attn_qk_phi_binary', 0.0))
                             a_v_phi = _m(metrics.get('attn_v_phi_binary', 0.0))
+                            a_qk_z = _m(metrics.get('attn_qk_z_mean_active', 0.0))
+                            a_v_z = _m(metrics.get('attn_v_z_mean_active', 0.0))
                             if a_qk_phi > 0:
-                                a_phi_s = f" qk_phi={a_qk_phi*100:.1f}% v_phi={a_v_phi*100:.1f}%"
+                                a_phi_s = f" qk_phi={a_qk_phi*100:.1f}% v_phi={a_v_phi*100:.1f}% qk_z={a_qk_z:.2f} v_z={a_v_z:.2f}"
                             log_message(
                                 f"      attn: qk_active={a_qk_act:.1%}"
                                 f" v_active={a_v_act:.1%}{a_strong_s}{a_extra}"

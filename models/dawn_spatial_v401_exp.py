@@ -275,7 +275,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         # --- Pass 2: gate + srw fused (scan + checkpoint) ---
         @jax.checkpoint
         def gate_srw_step(carry, i):
-            out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary = carry
+            out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary, total_z_sum = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
@@ -294,17 +294,19 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             chunk_active = (gate > 0.0).astype(jnp.float32).sum(axis=-1, keepdims=True)
             chunk_strong = (gate > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
             chunk_phi_binary = ((phi > 0.95) | (phi < 0.05)).astype(jnp.float32).sum(axis=-1, keepdims=True)
+            chunk_z_sum = jnp.where(z > 0, z, 0.0).sum(axis=-1, keepdims=True)
             return (out + c_out,
                     total_weighted_cost + chunk_weighted,
                     jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                     total_active + chunk_active,
                     total_strong + chunk_strong,
-                    total_phi_binary + chunk_phi_binary), None
+                    total_phi_binary + chunk_phi_binary,
+                    total_z_sum + chunk_z_sum), None
 
-        (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary), _ = jax.lax.scan(
+        (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary, total_z_sum), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, D), dtype=jnp.float32),
-             z1, jnp.full((B, S, 1), -1e9), z1, z1, z1),
+             z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1),
             jnp.arange(nc))
 
         global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')
@@ -316,12 +318,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         active_frac = jax.lax.psum(total_active, 'model') / N_total
         strong_frac = jax.lax.psum(total_strong, 'model') / N_total
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
+        z_mean_active = jax.lax.psum(total_z_sum, 'model') / (jax.lax.psum(total_active, 'model') + 1e-8)
 
         score_std_out = s_std.mean()
         es_out = global_weighted_cost.mean()
         active_n_mean = jax.lax.psum(total_active, 'model').mean()
         score_mean_out = s_mean.mean()
-        return out.astype(jnp.float32), active_frac, global_gate_max, score_lb, score_std_out, es_out, active_n_mean, score_mean_out, strong_frac, phi_binary_frac
+        return out.astype(jnp.float32), active_frac, global_gate_max, score_lb, score_std_out, es_out, active_n_mean, score_mean_out, strong_frac, phi_binary_frac, z_mean_active
 
     return fused_gate_srw
 
@@ -411,7 +414,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         # --- Pass 2: gate + srw fused ---
         @jax.checkpoint
         def gate_srw_step(carry, i):
-            out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary = carry
+            out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary, total_z_sum = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
@@ -430,17 +433,19 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             chunk_active = (gate > 0.0).astype(jnp.float32).sum(axis=-1, keepdims=True)
             chunk_strong = (gate > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
             chunk_phi_binary = ((phi > 0.95) | (phi < 0.05)).astype(jnp.float32).sum(axis=-1, keepdims=True)
+            chunk_z_sum = jnp.where(z > 0, z, 0.0).sum(axis=-1, keepdims=True)
             return (out + c_out,
                     total_weighted_cost + chunk_weighted,
                     jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                     total_active + chunk_active,
                     total_strong + chunk_strong,
-                    total_phi_binary + chunk_phi_binary), None
+                    total_phi_binary + chunk_phi_binary,
+                    total_z_sum + chunk_z_sum), None
 
-        (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary), _ = jax.lax.scan(
+        (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary, total_z_sum), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
-             z1_r, jnp.full((B, S, 2, 1), -1e9), z1_r, z1_r, z1_r),
+             z1_r, jnp.full((B, S, 2, 1), -1e9), z1_r, z1_r, z1_r, z1_r),
             jnp.arange(nc))
 
         # Normalize per route independently
@@ -456,13 +461,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         strong_frac_mean = strong_frac.mean(axis=2)
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
         phi_binary_frac_mean = phi_binary_frac.mean(axis=2)
+        z_mean_active = jax.lax.psum(total_z_sum, 'model') / (jax.lax.psum(total_active, 'model') + 1e-8)
+        z_mean_active_mean = z_mean_active.mean(axis=2)
         raw_gate_max_mean = global_gate_max.mean(axis=2)
 
         score_std_out = s_std.mean()
         es_out = global_weighted_cost.mean()
         active_n_mean = jax.lax.psum(total_active, 'model').mean()
         score_mean_out = s_mean.mean()
-        return out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb, score_std_out, es_out, active_n_mean, score_mean_out, strong_frac_mean, phi_binary_frac_mean
+        return out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb, score_std_out, es_out, active_n_mean, score_mean_out, strong_frac_mean, phi_binary_frac_mean, z_mean_active_mean
 
     return fused_gate_srw_paired
 
@@ -514,7 +521,7 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
 
     @jax.checkpoint
     def gate_srw_step(carry, i):
-        out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary = carry
+        out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary, total_z_sum = carry
         s = i * cs
         ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
         rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
@@ -533,16 +540,18 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         chunk_active = (gate > 0.0).astype(jnp.float32).sum(axis=-1, keepdims=True)
         chunk_strong = (gate > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
         chunk_phi_binary = ((phi > 0.95) | (phi < 0.05)).astype(jnp.float32).sum(axis=-1, keepdims=True)
+        chunk_z_sum = jnp.where(z > 0, z, 0.0).sum(axis=-1, keepdims=True)
         return (out + c_out,
                 total_weighted_cost + chunk_weighted,
                 jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                 total_active + chunk_active,
                 total_strong + chunk_strong,
-                total_phi_binary + chunk_phi_binary), None
+                total_phi_binary + chunk_phi_binary,
+                total_z_sum + chunk_z_sum), None
 
-    (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary), _ = jax.lax.scan(
+    (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong, total_phi_binary, total_z_sum), _ = jax.lax.scan(
         gate_srw_step,
-        (jnp.zeros((B, S, D), dtype=jnp.float32), z1, jnp.full((B, S, 1), -1e9), z1, z1, z1),
+        (jnp.zeros((B, S, D), dtype=jnp.float32), z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1),
         jnp.arange(n_chunks))
 
     D = x.shape[-1]
@@ -553,7 +562,8 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
     es_out = total_weighted_cost.mean()
     active_n_mean = total_active.mean()
     score_mean_out = s_mean.mean()
-    return out.astype(jnp.float32), total_active / N, total_gate_max, score_lb, score_std_out, es_out, active_n_mean, score_mean_out, total_strong / N, total_phi_binary / N
+    z_mean_active = total_z_sum / (total_active + 1e-8)
+    return out.astype(jnp.float32), total_active / N, total_gate_max, score_lb, score_std_out, es_out, active_n_mean, score_mean_out, total_strong / N, total_phi_binary / N, z_mean_active
 
 
 # ================================================================
@@ -692,21 +702,21 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         fused_single, fused_paired = sharded_fns
         h_QK = jnp.stack([h_Q, h_K], axis=2)
         tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-        QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm, qk_smean, qk_strong, qk_phi_bin = fused_paired(
+        QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm, qk_smean, qk_strong, qk_phi_bin, qk_z_act = fused_paired(
             x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write)
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
         Q = QK_out[:, :, 0, :] * qk_scale
         K = QK_out[:, :, 1, :] * qk_scale
-        V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm, v_smean, v_strong, v_phi_bin = fused_single(
+        V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm, v_smean, v_strong, v_phi_bin, v_z_act = fused_single(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write)
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
         V = V * v_scale
     else:
-        Q, q_active, q_raw_gmax, q_lb, q_sstd, q_es, q_anm, q_smean, q_strong, q_phi_bin = _srw_chunked(
+        Q, q_active, q_raw_gmax, q_lb, q_sstd, q_es, q_anm, q_smean, q_strong, q_phi_bin, q_z_act = _srw_chunked(
             x, h_Q, qk_emb_unit, tau_all[:, :, 0:1], qk_read, qk_write, n_chunks_qk)
-        K, k_active, k_raw_gmax, k_lb, k_sstd, k_es, k_anm, k_smean, k_strong, k_phi_bin = _srw_chunked(
+        K, k_active, k_raw_gmax, k_lb, k_sstd, k_es, k_anm, k_smean, k_strong, k_phi_bin, k_z_act = _srw_chunked(
             x, h_K, qk_emb_unit, tau_all[:, :, 1:2], qk_read, qk_write, n_chunks_qk)
-        V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm, v_smean, v_strong, v_phi_bin = _srw_chunked(
+        V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm, v_smean, v_strong, v_phi_bin, v_z_act = _srw_chunked(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write, n_chunks_v)
         qk_raw_norm = (jnp.linalg.norm(Q, axis=-1).mean() + jnp.linalg.norm(K, axis=-1).mean()) / 2
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
@@ -722,6 +732,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         qk_smean = (q_smean + k_smean) / 2
         qk_strong = (q_strong + k_strong) / 2
         qk_phi_bin = (q_phi_bin + k_phi_bin) / 2
+        qk_z_act = (q_z_act + k_z_act) / 2
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -767,11 +778,14 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_strong = (qk_strong.mean() + v_strong.mean()) / 2
     attn_qk_phi_binary = qk_phi_bin.mean()
     attn_v_phi_binary = v_phi_bin.mean()
+    attn_qk_z_mean_active = qk_z_act.mean()
+    attn_v_z_mean_active = v_z_act.mean()
     return (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax,
             attn_score_std, attn_gate_sum, attn_active_n_mean, attn_score_mean,
             attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
             q_norm, k_norm, v_norm_dbg, attn_logit_max, o_input_norm,
-            attn_strong, attn_qk_phi_binary, attn_v_phi_binary)
+            attn_strong, attn_qk_phi_binary, attn_v_phi_binary,
+            attn_qk_z_mean_active, attn_v_z_mean_active)
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -792,10 +806,10 @@ def _know_forward(x, pool_params, router_params, rng,
 
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
-        out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean, score_mean, strong_frac, phi_binary_frac = fused_single(
+        out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean, score_mean, strong_frac, phi_binary_frac, z_mean_act = fused_single(
             x, h, know_emb_unit, tau, know_read, know_write)
     else:
-        out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean, score_mean, strong_frac, phi_binary_frac = _srw_chunked(
+        out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean, score_mean, strong_frac, phi_binary_frac, z_mean_act = _srw_chunked(
             x, h, know_emb_unit, tau, know_read, know_write, n_chunks_know)
 
     know_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
@@ -812,9 +826,10 @@ def _know_forward(x, pool_params, router_params, rng,
     know_tau_mean = tau.mean()
     know_strong = strong_frac.mean()
     know_phi_binary = phi_binary_frac.mean()
+    know_z_mean_active = z_mean_act.mean()
     return (out, aux, active_frac, raw_gate_max, score_std, gate_sum, active_n_mean,
             emb_norm_val, read_norm_val, write_norm_val, score_mean, know_out_norm,
-            know_tau_mean, know_raw_out_norm, know_strong, know_phi_binary)
+            know_tau_mean, know_raw_out_norm, know_strong, know_phi_binary, know_z_mean_active)
 
 
 # ================================================================
@@ -983,6 +998,9 @@ class DAWN(nn.Module):
             know_phi_bin_all = _z
             attn_qk_phi_bin_all = _z
             attn_v_phi_bin_all = _z
+            know_z_act_all = _z
+            attn_qk_z_act_all = _z
+            attn_v_z_act_all = _z
             k_emb_n_all = _z
             k_read_n_all = _z
             k_write_n_all = _z
@@ -1031,7 +1049,8 @@ class DAWN(nn.Module):
                  a_sstd, a_gsum, a_active_n_mean, a_smean,
                  a_out_norm, a_tau_mean, a_qk_raw_norm, a_v_raw_norm,
                  a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
-                 a_strong, a_qk_phi_bin, a_v_phi_bin
+                 a_strong, a_qk_phi_bin, a_v_phi_bin,
+                 a_qk_z_act, a_v_z_act
                 ) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
@@ -1046,7 +1065,7 @@ class DAWN(nn.Module):
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
                 (know_out, know_aux, k_active, k_raw_gmax, k_sstd, k_gsum, k_active_n_mean,
                  k_emb_n, k_read_n, k_write_n, k_smean, k_out_norm,
-                 k_tau_mean, k_raw_out_norm, k_strong, k_phi_bin
+                 k_tau_mean, k_raw_out_norm, k_strong, k_phi_bin, k_z_act
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
@@ -1061,7 +1080,8 @@ class DAWN(nn.Module):
                            a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
                            a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
                            k_strong, a_strong,
-                           k_phi_bin, a_qk_phi_bin, a_v_phi_bin)
+                           k_phi_bin, a_qk_phi_bin, a_v_phi_bin,
+                           k_z_act, a_qk_z_act, a_v_z_act)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -1077,7 +1097,8 @@ class DAWN(nn.Module):
                 attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
                 attn_logit_max_all, attn_o_input_norm_all,
                 know_strong_all, attn_strong_all,
-                know_phi_bin_all, attn_qk_phi_bin_all, attn_v_phi_bin_all) = jax.lax.scan(
+                know_phi_bin_all, attn_qk_phi_bin_all, attn_v_phi_bin_all,
+                know_z_act_all, attn_qk_z_act_all, attn_v_z_act_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -1102,6 +1123,7 @@ class DAWN(nn.Module):
             'know_active_n_mean': know_active_n_mean_all.mean(),
             'know_strong': know_strong_all.mean(),
             'know_phi_binary': know_phi_bin_all.mean(),
+            'know_z_mean_active': know_z_act_all.mean(),
 
             'attn_qk_active': attn_qk_active_all.mean(),
             'attn_v_active': attn_v_active_all.mean(),
@@ -1112,6 +1134,8 @@ class DAWN(nn.Module):
             'attn_strong': attn_strong_all.mean(),
             'attn_qk_phi_binary': attn_qk_phi_bin_all.mean(),
             'attn_v_phi_binary': attn_v_phi_bin_all.mean(),
+            'attn_qk_z_mean_active': attn_qk_z_act_all.mean(),
+            'attn_v_z_mean_active': attn_v_z_act_all.mean(),
 
             'know_emb_norm': k_emb_n_all.mean(),
             'know_read_norm': k_read_n_all.mean(),
