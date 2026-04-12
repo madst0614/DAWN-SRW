@@ -690,7 +690,7 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
 
         # Compute stats per pool
         def gate_stats(g):
-            active = (g > 1e-6).astype(jnp.float32)
+            active = (g > 0.01).astype(jnp.float32)
             active_per_token = active.sum(axis=-1).mean()  # avg active neurons per token
             active_ratio = active.mean(axis=(0, 1))  # [N] per-neuron activation rate
             neuron_entropy = -(active_ratio * jnp.log(active_ratio + 1e-10)
@@ -1156,7 +1156,13 @@ def analyze_pos_selectivity(params, cfg, output_dir,
 
     max_seq = model_cfg['max_seq_len']
 
-    print(f"  Processing sentences...")
+    n_total = len(dataset)
+    n_batches_est = (n_total + batch_size - 1) // batch_size
+    print(f"  Processing {n_total} sentences (~{n_batches_est} batches, bs={batch_size})...")
+    import sys
+    t_start = time.time()
+    n_batches_done = 0
+
     # Process in batches: tokenize sentences, map POS, forward, accumulate
     batch_tokens = []
     batch_pos_labels = []
@@ -1215,8 +1221,7 @@ def analyze_pos_selectivity(params, cfg, output_dir,
                 gate = np.array(jax.device_get(layer_info[pinfo['gate_key']]))
                 # Average over layers
                 gate_avg = gate.mean(axis=0)  # [B, S, N]
-                active = (gate_avg > 1e-6).astype(np.float32)  # [B, S, N]
-                weights = gate_avg  # Use actual gate values for mean_weight
+                active = (gate_avg > 0.01).astype(np.float32)  # [B, S, N]
 
                 # Accumulate
                 for bi in range(len(batch_tokens)):
@@ -1231,11 +1236,18 @@ def analyze_pos_selectivity(params, cfg, output_dir,
                         pos_token_counts[pi] += 1
                         total_tokens += 1
 
+            n_batches_done += 1
             batch_tokens = []
             batch_pos_labels = []
 
-        if (si + 1) % 500 == 0:
-            print(f"    [{si+1}/{len(dataset)}] sentences")
+        if (si + 1) % 100 == 0:
+            elapsed = time.time() - t_start
+            rate = (si + 1) / elapsed if elapsed > 0 else 0
+            eta = (n_total - si - 1) / rate if rate > 0 else 0
+            print(f"    [{si+1:>5}/{n_total}] sentences | "
+                  f"{n_batches_done} batches | {total_tokens:,} tokens | "
+                  f"{rate:.0f} sent/s | ETA {eta:.0f}s",
+                  flush=True)
 
     # Compute selectivity
     results = {}
@@ -1628,11 +1640,12 @@ def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20,
     val_reshaped = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     actual_batches = min(n_batches, n_seqs // batch_size)
 
-    # Per-layer stats: 9 metrics per layer, stacked as [n_layers, 9]
-    N_STATS = 9
+    # Per-layer stats: 11 metrics per layer, stacked as [n_layers, 11]
+    N_STATS = 11
     STAT_NAMES = ['gate_mean', 'gate_std', 'gate_max', 'gate_min',
-                  'eff_n_mean', 'frac_above_0p5', 'frac_above_0p1',
-                  'frac_above_0p01', 'frac_neg']
+                  'eff_n_mean',
+                  'frac_above_0p001', 'frac_above_0p01', 'frac_above_0p05',
+                  'frac_above_0p1', 'frac_above_0p3', 'frac_above_0p5']
 
     qk_s, v_s, know_s = get_output_scales(pool_params)
     _emb_matrix = jnp.asarray(params['token_emb']['embedding'])
@@ -1691,10 +1704,12 @@ def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20,
             layer_stat = jnp.array([
                 gate_know.mean(), gate_know.std(), gate_know.max(), gate_know.min(),
                 eff_n.mean(),
-                (abs_gate > 0.5).astype(jnp.float32).mean(),
-                (abs_gate > 0.1).astype(jnp.float32).mean(),
+                (abs_gate > 0.001).astype(jnp.float32).mean(),
                 (abs_gate > 0.01).astype(jnp.float32).mean(),
-                (gate_know < -0.5).astype(jnp.float32).mean(),
+                (abs_gate > 0.05).astype(jnp.float32).mean(),
+                (abs_gate > 0.1).astype(jnp.float32).mean(),
+                (abs_gate > 0.3).astype(jnp.float32).mean(),
+                (abs_gate > 0.5).astype(jnp.float32).mean(),
             ])
             all_stats = all_stats.at[i].set(layer_stat)
 
@@ -1720,12 +1735,14 @@ def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20,
 
     # Print summary
     print(f"\n  Know Pool (N={n_know}):")
-    print(f"  {'Layer':<7} | {'gate_mean':>10} | {'gate_std':>10} | {'eff_N':>8} | {'>0.5%':>7} | {'>0.1%':>7} | {'neg%':>6}")
-    print(f"  {'-------':<7}-+-{'-'*10}-+-{'-'*10}-+-{'-'*8}-+-{'-'*7}-+-{'-'*7}-+-{'-'*6}")
+    print(f"  {'Layer':<5} | {'gate_mean':>11} | {'gate_std':>11} | {'eff_N':>7} | {'>0.001':>7} | {'>0.01':>7} | {'>0.05':>7} | {'>0.1':>7} | {'>0.3':>7} | {'>0.5':>7}")
+    print(f"  {'-'*5}-+-{'-'*11}-+-{'-'*11}-+-{'-'*7}-+-{'-'*7}-+-{'-'*7}-+-{'-'*7}-+-{'-'*7}-+-{'-'*7}-+-{'-'*7}")
     for i in range(n_layers):
         d = results[f'layer_{i}']
-        print(f"  {i:<7} | {d['gate_mean']:>10.4f} | {d['gate_std']:>10.4f} | {d['eff_n_mean']:>8.1f}"
-              f" | {d['frac_above_0p5']*100:>6.1f}% | {d['frac_above_0p1']*100:>6.1f}% | {d['frac_neg']*100:>5.1f}%")
+        print(f"  {i:<5} | {d['gate_mean']:>11.6f} | {d['gate_std']:>11.6f} | {d['eff_n_mean']:>7.1f}"
+              f" | {d['frac_above_0p001']*100:>6.2f}% | {d['frac_above_0p01']*100:>6.2f}%"
+              f" | {d['frac_above_0p05']*100:>6.2f}% | {d['frac_above_0p1']*100:>6.2f}%"
+              f" | {d['frac_above_0p3']*100:>6.2f}% | {d['frac_above_0p5']*100:>6.2f}%")
 
     _save_json(results, output_dir, 'gate_distribution', 'results.json')
     return results
@@ -1816,8 +1833,8 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
         tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
         _, gate_know = _srw_inference_with_gates(normed, h_k, know_norm, tau_k,
                                                   pool_params['know_read'], pool_params['know_write'])
-        # Per-neuron: fraction of tokens where |gate| > 0.1
-        active_mask = (jnp.abs(gate_know) > 0.1).astype(jnp.float32)  # [B,S,N]
+        # Per-neuron: fraction of tokens where |gate| > 0.01
+        active_mask = (jnp.abs(gate_know) > 0.01).astype(jnp.float32)  # [B,S,N]
         neuron_freq = active_mask.mean(axis=(0, 1))  # [N]
         return neuron_freq
 
@@ -1832,18 +1849,18 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
 
     avg_freq = np.mean(all_freqs, axis=0)  # [N]
 
-    universal = int((avg_freq > 0.9).sum())
-    frequent = int(((avg_freq > 0.5) & (avg_freq <= 0.9)).sum())
-    moderate = int(((avg_freq > 0.1) & (avg_freq <= 0.5)).sum())
-    specialist = int(((avg_freq > 0.01) & (avg_freq <= 0.1)).sum())
-    rare = int((avg_freq <= 0.01).sum())
+    universal = int((avg_freq > 0.5).sum())
+    frequent = int(((avg_freq > 0.1) & (avg_freq <= 0.5)).sum())
+    moderate = int(((avg_freq > 0.01) & (avg_freq <= 0.1)).sum())
+    specialist = int(((avg_freq > 0.001) & (avg_freq <= 0.01)).sum())
+    rare = int((avg_freq <= 0.001).sum())
 
-    print(f"\n  Know Pool (N={n_know}, layer {mid_layer}):")
-    print(f"    Universal (>90%):   {universal:>6} neurons")
-    print(f"    Frequent (50-90%):  {frequent:>6} neurons")
-    print(f"    Moderate (10-50%):  {moderate:>6} neurons")
-    print(f"    Specialist (1-10%): {specialist:>6} neurons")
-    print(f"    Rare (<1%):         {rare:>6} neurons")
+    print(f"\n  Know Pool (N={n_know}, layer {mid_layer}, active threshold=0.01):")
+    print(f"    Universal (>50%):     {universal:>6} neurons")
+    print(f"    Frequent (10-50%):    {frequent:>6} neurons")
+    print(f"    Moderate (1-10%):     {moderate:>6} neurons")
+    print(f"    Specialist (0.1-1%):  {specialist:>6} neurons")
+    print(f"    Rare (<0.1%):         {rare:>6} neurons")
 
     # Top 10 most active
     top_idx = np.argsort(avg_freq)[::-1][:10]
@@ -1854,11 +1871,14 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
     results = {
         'n_know': n_know,
         'layer': mid_layer,
-        'universal': universal,
-        'frequent': frequent,
-        'moderate': moderate,
-        'specialist': specialist,
-        'rare': rare,
+        'active_threshold': 0.01,
+        'categories': {
+            'universal_gt50pct': universal,
+            'frequent_10_50pct': frequent,
+            'moderate_1_10pct': moderate,
+            'specialist_0p1_1pct': specialist,
+            'rare_lt0p1pct': rare,
+        },
         'top_10': [{'neuron_id': int(idx), 'freq_pct': float(avg_freq[idx] * 100)} for idx in top_idx],
         'freq_mean': float(avg_freq.mean()),
         'freq_std': float(avg_freq.std()),
