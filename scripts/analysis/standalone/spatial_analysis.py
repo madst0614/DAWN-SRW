@@ -619,14 +619,16 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
     mid_layer = n_layers // 2
     bp = block_params_list[mid_layer]
 
+    # Convert embeddings to JAX arrays so JIT-traced indexing works
+    _emb_matrix = jnp.asarray(params['token_emb']['embedding'])
+    _pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
+
     @jax.jit
     def get_routing_stats(input_ids):
         """Forward to mid layer, get gate distributions for Q,K,V,Know."""
         B, S = input_ids.shape
-        emb_matrix = params['token_emb']['embedding']
-        pos_matrix = params['pos_emb']['embedding']
         positions = jnp.arange(S)[jnp.newaxis, :]
-        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+        x = _emb_matrix[input_ids.astype(jnp.int32)] + _pos_matrix[positions]
 
         # Output scales (1.0 for models without learnable scale)
         qk_s, v_s, know_s = get_output_scales(pool_params)
