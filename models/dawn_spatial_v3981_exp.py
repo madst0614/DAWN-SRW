@@ -1428,10 +1428,13 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
 
+    print(f"  [DEBUG vectorized_eval] emb type={type(emb_matrix)}, shape={emb_matrix.shape}, dtype={emb_matrix.dtype}")
+    print(f"  [DEBUG vectorized_eval] pos type={type(pos_matrix)}, shape={pos_matrix.shape}, dtype={pos_matrix.dtype}")
+
     def forward_batch(input_ids):
         B, S = input_ids.shape
         positions = jnp.arange(S)
-        x = jax.vmap(lambda ids: emb_matrix[ids])(input_ids.astype(jnp.int32)) + pos_matrix[positions][jnp.newaxis, :, :]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions][jnp.newaxis, :, :]
 
         def layer_fn(x, bp):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
