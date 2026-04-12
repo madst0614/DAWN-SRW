@@ -729,7 +729,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_active': result.get('know_active', jnp.float32(0.0)),
             'know_active_N': result.get('know_active_N', jnp.float32(0.0)),
             'know_score_std': result.get('know_score_std', jnp.float32(0.0)),
-            'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
+            'know_raw_gate_max': result.get('know_gate_max', result.get('know_raw_gate_max', jnp.float32(0.0))),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
             'know_active_n_mean': result.get('know_active_n_mean', jnp.float32(0.0)),
@@ -744,7 +744,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_active_N': result.get('attn_active_N', jnp.float32(0.0)),
             'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
-            'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
+            'attn_raw_gate_max': result.get('attn_gate_max', result.get('attn_raw_gate_max', jnp.float32(0.0))),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
             'attn_active_n_mean': result.get('attn_active_n_mean', jnp.float32(0.0)),
@@ -2222,7 +2222,7 @@ def main():
                         k_act = _m(metrics['know_active'])
                         k_aN = _m(metrics.get('know_active_N', 0.0))
                         k_sstd = _m(metrics.get('know_score_std', 0.0))
-                        k_raw_gmax = _m(metrics.get('know_raw_gate_max', 0.0))
+                        k_raw_gmax = _m(metrics.get('know_raw_gate_max', metrics.get('know_gate_max', 0.0)))
                         k_gsum = _m(metrics.get('know_gate_sum', 0.0))
                         k_gconc = _m(metrics.get('know_gate_conc', 0.0))
                         k_anm = _m(metrics.get('know_active_n_mean', 0.0))
@@ -2232,7 +2232,7 @@ def main():
                         a_v_act = _m(metrics.get('attn_v_active', 0.0))
                         a_aN = _m(metrics.get('attn_active_N', 0.0))
                         a_sstd = _m(metrics.get('attn_score_std', 0.0))
-                        a_raw_gmax = _m(metrics.get('attn_raw_gate_max', 0.0))
+                        a_raw_gmax = _m(metrics.get('attn_raw_gate_max', metrics.get('attn_gate_max', 0.0)))
                         a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
                         a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
                         a_anm = _m(metrics.get('attn_active_n_mean', 0.0))
