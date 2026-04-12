@@ -1291,7 +1291,7 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     router_params = params['router']
 
     x = (params['token_emb']['embedding'][token_id]
-         + params['pos_emb']['embedding'][[cache_len]])
+         + params['pos_emb']['embedding'][cache_len][jnp.newaxis, :])
 
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
