@@ -1428,8 +1428,27 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
 
-    print(f"  [DEBUG vectorized_eval] emb type={type(emb_matrix)}, shape={emb_matrix.shape}, dtype={emb_matrix.dtype}")
-    print(f"  [DEBUG vectorized_eval] pos type={type(pos_matrix)}, shape={pos_matrix.shape}, dtype={pos_matrix.dtype}")
+    print(f"  [DEBUG] emb type={type(emb_matrix)}, shape={emb_matrix.shape}, dtype={emb_matrix.dtype}")
+    print(f"  [DEBUG] pos type={type(pos_matrix)}, shape={pos_matrix.shape}, dtype={pos_matrix.dtype}")
+    print(f"  [DEBUG] tokens type={type(all_tokens)}, shape={all_tokens.shape}, dtype={all_tokens.dtype}")
+    print(f"  [DEBUG] tokens_reshaped shape={tokens.shape}, dtype={tokens.dtype}")
+    print(f"  [DEBUG] pool_params keys={list(pool_params.keys())}")
+    print(f"  [DEBUG] params type={type(params)}")
+    for k in params:
+        v = params[k]
+        if hasattr(v, 'shape'):
+            print(f"  [DEBUG] params['{k}'] shape={v.shape} type={type(v)}")
+        elif isinstance(v, dict):
+            for k2 in v:
+                v2 = v[k2]
+                if hasattr(v2, 'shape'):
+                    print(f"  [DEBUG] params['{k}']['{k2}'] shape={v2.shape} type={type(v2)}")
+
+    # Test indexing outside JIT
+    test_ids = jnp.array([[0, 1, 2]], dtype=jnp.int32)
+    test_result = emb_matrix[test_ids]
+    print(f"  [DEBUG] test emb_matrix[[[0,1,2]]] shape={test_result.shape}")  # should be (1, 3, 384)
+    import sys; sys.stdout.flush()
 
     def forward_batch(input_ids):
         B, S = input_ids.shape
