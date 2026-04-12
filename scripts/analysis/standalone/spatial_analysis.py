@@ -675,17 +675,17 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
         tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-        _, gate_Q = _srw_inference_with_gates(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
+        _, _, gate_Q = _srw_inference_with_gates(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
                                                pool_params['qk_read'], pool_params['qk_write'])
-        _, gate_K = _srw_inference_with_gates(normed, h_K, qk_norm, tau_all[:, :, 1:2],
+        _, _, gate_K = _srw_inference_with_gates(normed, h_K, qk_norm, tau_all[:, :, 1:2],
                                                pool_params['qk_read'], pool_params['qk_write'])
-        _, gate_V = _srw_inference_with_gates(normed, h_V, v_norm, tau_all[:, :, 2:3],
+        _, _, gate_V = _srw_inference_with_gates(normed, h_V, v_norm, tau_all[:, :, 2:3],
                                                pool_params['v_read'], pool_params['v_write'])
 
         normed2 = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
         h_k = normed2 @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
         tau_k = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-        _, gate_Know = _srw_inference_with_gates(normed2, h_k, know_norm, tau_k,
+        _, _, gate_Know = _srw_inference_with_gates(normed2, h_k, know_norm, tau_k,
                                                   pool_params['know_read'], pool_params['know_write'])
 
         # Compute stats per pool
@@ -887,20 +887,20 @@ def analyze_qk_specialization(params, cfg, val_tokens, output_dir,
         batch = jnp.array(tokens[i*batch_size:(i+1)*batch_size], dtype=jnp.int32)
         _, layer_info = jit_analysis(params, batch)
 
-        # Average across layers, get binary activation
-        # gate_Q: [n_layers, B, S, n_qk]
-        gQ = np.array(jax.device_get(layer_info['gate_Q']))  # [L, B, S, N]
-        gK = np.array(jax.device_get(layer_info['gate_K']))
+        # Use raw sigmoid gates (before normalization) for meaningful thresholding
+        # gate_Q_raw: [n_layers, B, S, n_qk]
+        gQ = np.array(jax.device_get(layer_info['gate_Q_raw']))  # [L, B, S, N]
+        gK = np.array(jax.device_get(layer_info['gate_K_raw']))
 
-        # Binary: active if gate > 1e-6
-        q_active = (gQ > 1e-6).sum(axis=(0, 1, 2))  # [N] summed over layers,batch,seq
-        k_active = (gK > 1e-6).sum(axis=(0, 1, 2))
+        # Binary: active if raw sigmoid gate > 0.5
+        q_active = (gQ > 0.5).sum(axis=(0, 1, 2))  # [N] summed over layers,batch,seq
+        k_active = (gK > 0.5).sum(axis=(0, 1, 2))
         q_counts += q_active
         k_counts += k_active
 
         # Batch overlap (across all layers)
-        q_bin = gQ > 1e-6
-        k_bin = gK > 1e-6
+        q_bin = gQ > 0.5
+        k_bin = gK > 0.5
         both = (q_bin & k_bin).sum()
         either = (q_bin | k_bin).sum()
         overlaps.append(float(both) / (float(either) + 1e-8))
@@ -1702,11 +1702,11 @@ def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20,
             normed = _layer_norm(x, lp['norm2']['scale'], lp['norm2']['bias'])
             h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
             tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-            know_out, gate_know = _srw_inference_with_gates(normed, h_k, know_norm, tau_k,
+            know_out, gate_know_raw, _ = _srw_inference_with_gates(normed, h_k, know_norm, tau_k,
                                                             pool_params['know_read'], pool_params['know_write'])
             x = x + know_out * know_s
 
-            abs_gate = jnp.abs(gate_know)
+            abs_gate = jnp.abs(gate_know_raw)
             gate_sum = abs_gate.sum(axis=-1)
             gate_sq_sum = (abs_gate ** 2).sum(axis=-1)
             eff_n = gate_sum ** 2 / (gate_sq_sum + 1e-8)
@@ -1865,10 +1865,10 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
         normed = _layer_norm(x, lp['norm2']['scale'], lp['norm2']['bias'])
         h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
         tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-        _, gate_know = _srw_inference_with_gates(normed, h_k, know_norm, tau_k,
+        _, gate_know_raw, _ = _srw_inference_with_gates(normed, h_k, know_norm, tau_k,
                                                   pool_params['know_read'], pool_params['know_write'])
         # Return raw gate stats per neuron: mean |gate| and max |gate| across tokens
-        abs_g = jnp.abs(gate_know)
+        abs_g = jnp.abs(gate_know_raw)
         neuron_mean_gate = abs_g.mean(axis=(0, 1))  # [N]
         neuron_max_gate = abs_g.max(axis=(0, 1))    # [N]
         return neuron_mean_gate, neuron_max_gate

@@ -1124,7 +1124,12 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
 
 
 def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
-    """Like _srw_inference but also returns normalized gate [B,S,N] for analysis."""
+    """Like _srw_inference but also returns raw and normalized gate for analysis.
+
+    Returns: (out, gate_raw, gate_norm)
+        gate_raw: [B,S,N] raw gate before normalization
+        gate_norm: [B,S,N] normalized gate
+    """
     D = x.shape[-1]
     scores = h @ emb_norm.T
     scores_f32 = scores.astype(jnp.float32)
@@ -1141,7 +1146,7 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
     xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
-    return (raw_out / (jnp.sqrt(active_N) + 1.0)).astype(jnp.float32), gate_norm
+    return (raw_out / (jnp.sqrt(active_N) + 1.0)).astype(jnp.float32), gate, gate_norm
 
 
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
@@ -1545,13 +1550,13 @@ def analysis_forward(params, model_cfg, input_ids):
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
         tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-        Q, gate_Q = _srw_inference_with_gates(
+        Q, gate_Q_raw, gate_Q = _srw_inference_with_gates(
             normed, h_Q, qk_norm, tau_all[:, :, 0:1],
             pool_params['qk_read'], pool_params['qk_write'])
-        K, gate_K = _srw_inference_with_gates(
+        K, gate_K_raw, gate_K = _srw_inference_with_gates(
             normed, h_K, qk_norm, tau_all[:, :, 1:2],
             pool_params['qk_read'], pool_params['qk_write'])
-        V, gate_V = _srw_inference_with_gates(
+        V, gate_V_raw, gate_V = _srw_inference_with_gates(
             normed, h_V, v_norm, tau_all[:, :, 2:3],
             pool_params['v_read'], pool_params['v_write'])
 
@@ -1573,7 +1578,7 @@ def analysis_forward(params, model_cfg, input_ids):
         normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
         h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
         tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-        know_out, gate_Know = _srw_inference_with_gates(
+        know_out, gate_Know_raw, gate_Know = _srw_inference_with_gates(
             normed, h_k, know_norm_w, tau_k,
             pool_params['know_read'], pool_params['know_write'])
         know_out_norm = jnp.linalg.norm(know_out, axis=-1).mean()
@@ -1582,6 +1587,8 @@ def analysis_forward(params, model_cfg, input_ids):
         return x, {
             'gate_Q': gate_Q, 'gate_K': gate_K,
             'gate_V': gate_V, 'gate_Know': gate_Know,
+            'gate_Q_raw': gate_Q_raw, 'gate_K_raw': gate_K_raw,
+            'gate_V_raw': gate_V_raw, 'gate_Know_raw': gate_Know_raw,
             'attn_out_norm': attn_out_norm,
             'know_out_norm': know_out_norm,
         }
