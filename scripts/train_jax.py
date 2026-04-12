@@ -28,6 +28,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.multihost_utils import process_allgather
 import optax
 import numpy as np
 import time
@@ -45,6 +46,15 @@ from models.dawn_spatial_v2 import DAWN as DAWN_SpatialV2
 from models.dawn_spatial_v3 import DAWN as DAWN_SpatialV3
 from models.dawn_spatial_v3_baseline import DAWN as DAWN_SpatialV3Baseline
 from models.dawn_spatial_v3_exp import DAWN as DAWN_SpatialV3Exp
+from models.dawn_spatial_v394_exp import DAWN as DAWN_SpatialV394Exp
+from models.dawn_spatial_v395_exp import DAWN as DAWN_SpatialV395Exp
+from models.dawn_spatial_v396_exp import DAWN as DAWN_SpatialV396Exp
+from models.dawn_spatial_v397_exp import DAWN as DAWN_SpatialV397Exp
+from models.dawn_spatial_v3971_exp import DAWN as DAWN_SpatialV3971Exp
+from models.dawn_spatial_v398_exp import DAWN as DAWN_SpatialV398Exp
+from models.dawn_spatial_v3981_exp import DAWN as DAWN_SpatialV3981Exp
+from models.dawn_spatial_v399_exp import DAWN as DAWN_SpatialV399Exp
+from models.dawn_spatial_v400_exp import DAWN as DAWN_SpatialV400Exp
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -115,6 +125,169 @@ def build_model_from_config(cfg):
             k_cluster_qk=mcfg.get('k_cluster_qk', 8),
             k_cluster_v=mcfg.get('k_cluster_v', 8),
             k_cluster_know=mcfg.get('k_cluster_know', 8),
+        )
+    elif version == 'spatial-r1-v4.0.0':
+        model = DAWN_SpatialV400Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.9':
+        model = DAWN_SpatialV399Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.8.1':
+        model = DAWN_SpatialV3981Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.8':
+        model = DAWN_SpatialV398Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.7.1':
+        model = DAWN_SpatialV3971Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.7':
+        model = DAWN_SpatialV397Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.6':
+        model = DAWN_SpatialV396Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.5':
+        model = DAWN_SpatialV395Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+            gate_norm_mode=mcfg.get('gate_norm_mode', 'sqrt_active'),
+        )
+    elif version == 'spatial-r1-v3.9.4':
+        model = DAWN_SpatialV394Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
         )
     elif version == 'spatial-r1-v3.9.3':
         model = DAWN_SpatialV3Exp(
@@ -556,9 +729,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_active': result.get('know_active', jnp.float32(0.0)),
             'know_active_N': result.get('know_active_N', jnp.float32(0.0)),
             'know_score_std': result.get('know_score_std', jnp.float32(0.0)),
-            'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
+            'know_raw_gate_max': result.get('know_gate_max', result.get('know_raw_gate_max', jnp.float32(0.0))),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
+            'know_active_n_mean': result.get('know_active_n_mean', jnp.float32(0.0)),
+            'know_strong': result.get('know_strong', result.get('know_pos', jnp.float32(0.0))),
             'know_strength_mean': result.get('know_strength_mean', jnp.float32(0.0)),
             'know_strength_std': result.get('know_strength_std', jnp.float32(0.0)),
             'know_strength_min': result.get('know_strength_min', jnp.float32(0.0)),
@@ -569,9 +744,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_active_N': result.get('attn_active_N', jnp.float32(0.0)),
             'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
-            'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
+            'attn_raw_gate_max': result.get('attn_gate_max', result.get('attn_raw_gate_max', jnp.float32(0.0))),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
+            'attn_active_n_mean': result.get('attn_active_n_mean', jnp.float32(0.0)),
+            'attn_strong': result.get('attn_strong', result.get('attn_pos', jnp.float32(0.0))),
+            'attn_qk_pos': result.get('attn_qk_pos', jnp.float32(0.0)),
+            'attn_v_pos': result.get('attn_v_pos', jnp.float32(0.0)),
             'attn_v_strength_mean': result.get('attn_v_strength_mean', jnp.float32(0.0)),
             'attn_v_strength_std': result.get('attn_v_strength_std', jnp.float32(0.0)),
             'attn_v_strength_min': result.get('attn_v_strength_min', jnp.float32(0.0)),
@@ -648,11 +827,14 @@ def create_mesh(mesh_data, mesh_model):
     return Mesh(device_array, ('data', 'model'))
 
 
-def get_param_shardings(params, mesh):
-    """Create sharding specs for params: neuron_pool N-axis on 'model', rest replicated."""
+def get_param_shardings(params, mesh, is_baseline=False):
+    """Create sharding specs for params: neuron_pool N-axis on 'model', rest replicated.
+    For baseline models (is_baseline=True), 2D+ params are sharded on 'data' axis (FSDP-style).
+    """
     replicated = NamedSharding(mesh, P())  # no sharding
     n_sharded = NamedSharding(mesh, P('model', None))  # N axis on model
     n_sharded_3d = NamedSharding(mesh, P('model', None, None))
+    data_sharded = NamedSharding(mesh, P('data', None))  # FSDP: first axis on data
 
     def _get_sharding(path, value):
         path_str = '/'.join(str(p) for p in path)
@@ -664,6 +846,11 @@ def get_param_shardings(params, mesh):
                 return n_sharded_3d    # [N, D, R] for v17.1
             else:
                 return replicated
+        # Baseline FSDP: shard 2D kernels on data axis (skip embeddings)
+        if is_baseline and value.ndim >= 2:
+            if 'token_emb' in path_str or 'pos_emb' in path_str:
+                return replicated
+            return data_sharded
         return replicated
 
     flat_params = jax.tree.leaves_with_path(params)
@@ -1238,9 +1425,30 @@ def main():
         end_value=lr * 0.1,
     )
 
+    # WD mask: exclude bias, layernorm, and output_scale params
+    # Only apply mask if model has learnable scale params (v3.9.7.1+)
+    _has_scale = 'qk_scale' in params.get('neuron_pool', {}) or \
+                 'know_scale' in params.get('neuron_pool', {})
+    _wd_mask_fn = None
+    if _has_scale:
+        def _wd_mask(params):
+            def _should_decay(path, _):
+                path_str = '/'.join(str(p) for p in path)
+                if 'bias' in path_str:
+                    return False
+                if 'scale' in path_str and 'norm' in path_str.lower():
+                    return False  # LayerNorm scale
+                if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
+                   or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
+                    return False  # learnable output_scale
+                return True
+            return jax.tree.map_with_path(_should_decay, params)
+        _wd_mask_fn = _wd_mask
+
     base_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, weight_decay=weight_decay, b2=0.95),
+        optax.adamw(learning_rate=schedule, weight_decay=weight_decay, b2=0.95,
+                    mask=_wd_mask_fn),
     )
 
     if grad_accum_steps > 1:
@@ -1327,7 +1535,8 @@ def main():
     is_baseline = model_version == 'baseline'
     is_spatial = (model_version == 'spatial-r1'
                   or model_version.startswith('spatial-r1-v2')
-                  or model_version.startswith('spatial-r1-v3'))
+                  or model_version.startswith('spatial-r1-v3')
+                  or model_version.startswith('spatial-r1-v4'))
 
     mesh_model = cfg['training'].get('mesh_model', 1)
     mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
@@ -1372,19 +1581,23 @@ def main():
         print(f"  Est chunk mem (know): {chunk_mem:.2f}GB bf16")
 
     # Shard params: neuron_pool N-axis on 'model', rest replicated
-    param_shardings = get_param_shardings(params, mesh)
+    param_shardings = get_param_shardings(params, mesh, is_baseline=is_baseline)
     params = shard_params_to_mesh(params, param_shardings)
     opt_state = optimizer.init(params)  # reinit with sharded params
 
     # Create shard_map functions if mesh_model > 1
     _sharded_fns = None
     if mesh_model > 1:
-        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp'}.get(model_version, 'models.dawn_spatial_v3')
         _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw', 'make_sharded_srw_paired'])
         make_sharded_srw, make_sharded_srw_paired = _v3.make_sharded_srw, _v3.make_sharded_srw_paired
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
-        _sharded_single = make_sharded_srw(mesh, max_chunk_size=max_chunk)
-        _sharded_paired = make_sharded_srw_paired(mesh, max_chunk_size=max_chunk)
+        _gnm = cfg['model'].get('gate_norm_mode', 'sqrt_active')
+        _srw_kwargs = {'mesh': mesh, 'max_chunk_size': max_chunk}
+        if model_version.startswith('spatial-r1-v3.9.5'):
+            _srw_kwargs['gate_norm_mode'] = _gnm
+        _sharded_single = make_sharded_srw(**_srw_kwargs)
+        _sharded_paired = make_sharded_srw_paired(**_srw_kwargs)
         _sharded_fns = (_sharded_single, _sharded_paired)
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused)")
@@ -1457,7 +1670,7 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp'}.get(model_version, 'models.dawn_spatial_v3')
             _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
@@ -1816,7 +2029,7 @@ def main():
         # Set up loggers (local append + periodic GCS sync)
         _setup_loggers(training_log_file, jsonl_log_file)
 
-        n_params = count_parameters(jax.device_get(params))
+        n_params = count_parameters(params)
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
         log_message(f"Config: {config_path}")
         log_message(f"Parameters: {n_params:,}")
@@ -1848,8 +2061,8 @@ def main():
         preemption_requested[0] = True
         print(f"\n!!! SIGTERM received (host {host_id}) — saving emergency checkpoint (step={global_step}) !!!", flush=True)
         try:
-            params_single = jax.device_get(params)
-            opt_state_single = jax.device_get(opt_state)
+            params_single = _gather_for_save(params)
+            opt_state_single = _gather_for_save(opt_state)
             if is_host0:
                 epath = _ckpt_path(f"emergency_step{global_step}.flax")
                 save_checkpoint(
@@ -1863,6 +2076,12 @@ def main():
                 print(f"!!! Emergency checkpoint saved: {epath} !!!", flush=True)
         except Exception as e:
             print(f"!!! Emergency save FAILED: {e} !!!", flush=True)
+
+    def _gather_for_save(x):
+        """Gather sharded params for checkpoint save. Only needed for baseline FSDP."""
+        if is_baseline:
+            return jax.device_get(process_allgather(x))
+        return jax.device_get(x)
 
     signal.signal(signal.SIGTERM, handle_preemption)
     if is_host0:
@@ -2011,17 +2230,21 @@ def main():
                         k_act = _m(metrics['know_active'])
                         k_aN = _m(metrics.get('know_active_N', 0.0))
                         k_sstd = _m(metrics.get('know_score_std', 0.0))
-                        k_raw_gmax = _m(metrics.get('know_raw_gate_max', 0.0))
+                        k_raw_gmax = _m(metrics.get('know_raw_gate_max', metrics.get('know_gate_max', 0.0)))
                         k_gsum = _m(metrics.get('know_gate_sum', 0.0))
                         k_gconc = _m(metrics.get('know_gate_conc', 0.0))
+                        k_anm = _m(metrics.get('know_active_n_mean', 0.0))
+                        k_strong = _m(metrics.get('know_strong', 0.0))
 
                         a_qk_act = _m(metrics.get('attn_qk_active', 0.0))
                         a_v_act = _m(metrics.get('attn_v_active', 0.0))
                         a_aN = _m(metrics.get('attn_active_N', 0.0))
                         a_sstd = _m(metrics.get('attn_score_std', 0.0))
-                        a_raw_gmax = _m(metrics.get('attn_raw_gate_max', 0.0))
+                        a_raw_gmax = _m(metrics.get('attn_raw_gate_max', metrics.get('attn_gate_max', 0.0)))
                         a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
                         a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
+                        a_anm = _m(metrics.get('attn_active_n_mean', 0.0))
+                        a_strong = _m(metrics.get('attn_strong', 0.0))
                         a_out_n = _m(metrics.get('attn_out_norm', 0.0))
 
                         a_tau_m = _m(metrics.get('attn_tau_mean', 0.0))
@@ -2041,24 +2264,38 @@ def main():
 
                         # know line: show active_N or gate_sum/conc depending on version
                         k_extra = ""
-                        if k_gsum > 0:  # v3.9.1
-                            k_extra = f" raw_max={k_raw_gmax:.4f} conc={k_gconc:.1f} gsum={k_gsum:.1f}"
+                        if k_gsum > 0:  # v3.9.1+
+                            k_extra = f" gate_max={k_raw_gmax:.4f} conc={k_gconc:.1f} gsum={k_gsum:.1f}"
+                        if k_anm > 0:  # v3.9.5
+                            k_extra = f" gate_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
                         if k_aN > 0:    # v3.9.2
                             k_extra += f" active_N={k_aN:.0f}"
+                        k_pos = k_strong
+                        k_neg = max(k_act - k_strong, 0.0)
+                        k_pos_n = k_pos * n_know_cfg
+                        k_neg_n = k_neg * n_know_cfg
+                        k_total_n = k_act * n_know_cfg
                         log_message(
-                            f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
-                            f"({k_act*100:.1f}%){k_extra}"
+                            f"      know: pos={k_pos_n:.0f}({k_pos*100:.1f}%)"
+                            f" neg={k_neg_n:.0f}({k_neg*100:.1f}%)"
+                            f" active={k_total_n:.0f}({k_act*100:.1f}%){k_extra}"
                             f" s_std={k_sstd:.3f}"
                             f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
                         # attn line
                         a_extra = ""
-                        if a_gsum > 0:  # v3.9.1
-                            a_extra = f" raw_max={a_raw_gmax:.4f} conc={a_gconc:.1f} gsum={a_gsum:.1f}"
+                        if a_gsum > 0:  # v3.9.1+
+                            a_extra = f" gate_max={a_raw_gmax:.4f} conc={a_gconc:.1f} gsum={a_gsum:.1f}"
+                        if a_anm > 0:  # v3.9.5
+                            a_extra = f" gate_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
                         if a_aN > 0:    # v3.9.2
                             a_extra += f" active_N={a_aN:.0f}"
+                        a_qk_pos = _m(metrics.get('attn_qk_pos', metrics.get('attn_pos', metrics.get('attn_strong', 0.0))))
+                        a_v_pos = _m(metrics.get('attn_v_pos', 0.0))
+                        a_qk_neg = max(a_qk_act - a_qk_pos, 0.0)
+                        a_v_neg = max(a_v_act - a_v_pos, 0.0)
                         log_message(
-                            f"      attn: qk_active={a_qk_act:.1%}"
-                            f" v_active={a_v_act:.1%}{a_extra}"
+                            f"      attn: qk_pos={a_qk_pos*100:.1f}% qk_neg={a_qk_neg*100:.1f}%"
+                            f" v_pos={a_v_pos*100:.1f}% v_neg={a_v_neg*100:.1f}%{a_extra}"
                             f" s_std={a_sstd:.3f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
@@ -2181,8 +2418,8 @@ def main():
                 # Best model save (device_get on ALL hosts)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    params_single = jax.device_get(params)
-                    opt_state_single = jax.device_get(opt_state)
+                    params_single = _gather_for_save(params)
+                    opt_state_single = _gather_for_save(opt_state)
                     if is_host0:
                         save_checkpoint(
                             _ckpt_path("best_model.flax"),
@@ -2199,8 +2436,8 @@ def main():
             # ---- Mid-epoch checkpoint ----
             if global_step % ckpt_interval == 0 and global_step > 0:
                 # device_get on ALL hosts (may be collective for sharded params)
-                params_single = jax.device_get(params)
-                opt_state_single = jax.device_get(opt_state)
+                params_single = _gather_for_save(params)
+                opt_state_single = _gather_for_save(opt_state)
                 if is_host0:
                     save_checkpoint(
                         _ckpt_path(f"checkpoint_step{global_step}.flax"),
@@ -2257,8 +2494,8 @@ def main():
             })
 
         # Save epoch checkpoint (device_get on ALL hosts)
-        params_single = jax.device_get(params)
-        opt_state_single = jax.device_get(opt_state)
+        params_single = _gather_for_save(params)
+        opt_state_single = _gather_for_save(opt_state)
 
         if is_host0:
             save_checkpoint(

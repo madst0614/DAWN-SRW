@@ -1341,7 +1341,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     """
     n_seqs = all_tokens.shape[0]
     n_batches = n_seqs // batch_size
-    tokens = all_tokens[:n_batches * batch_size].reshape(n_batches, batch_size, -1)
+    tokens = all_tokens[:n_batches * batch_size].reshape(n_batches, batch_size, -1).astype(jnp.int32)
 
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
@@ -1351,8 +1351,8 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     pool_params = params['neuron_pool']
     router_params = params['router']
     norm_params = params['norm']
-    emb_matrix = params['token_emb']['embedding']
-    pos_matrix = params['pos_emb']['embedding']
+    emb_matrix = jnp.asarray(params['token_emb']['embedding'])
+    pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
 
     qk_norm = pool_params['qk_emb'] / (
         jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
@@ -1367,7 +1367,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     def forward_batch(input_ids):
         B, S = input_ids.shape
         positions = jnp.arange(S)[jnp.newaxis, :]
-        x = emb_matrix[input_ids] + pos_matrix[positions]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
 
         def layer_fn(x, bp):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
