@@ -55,6 +55,7 @@ from models.dawn_spatial_v398_exp import DAWN as DAWN_SpatialV398Exp
 from models.dawn_spatial_v3981_exp import DAWN as DAWN_SpatialV3981Exp
 from models.dawn_spatial_v399_exp import DAWN as DAWN_SpatialV399Exp
 from models.dawn_spatial_v400_exp import DAWN as DAWN_SpatialV400Exp
+from models.dawn_spatial_v401_exp import DAWN as DAWN_SpatialV401Exp
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -144,8 +145,9 @@ def build_model_from_config(cfg):
             n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
             n_chunks_v=cfg['training'].get('n_chunks_v', 1),
         )
-    elif version == 'spatial-r1-v3.9.9':
-        model = DAWN_SpatialV399Exp(
+    elif version in ('spatial-r1-v3.9.9', 'spatial-r1-v4.0.1'):
+        _cls = DAWN_SpatialV401Exp if version == 'spatial-r1-v4.0.1' else DAWN_SpatialV399Exp
+        model = _cls(
             vocab_size=mcfg.get('vocab_size', 30522),
             d_model=mcfg.get('d_model', 384),
             n_layers=mcfg.get('n_layers', 12),
@@ -1588,7 +1590,7 @@ def main():
     # Create shard_map functions if mesh_model > 1
     _sharded_fns = None
     if mesh_model > 1:
-        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp'}.get(model_version, 'models.dawn_spatial_v3')
         _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw', 'make_sharded_srw_paired'])
         make_sharded_srw, make_sharded_srw_paired = _v3.make_sharded_srw, _v3.make_sharded_srw_paired
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
@@ -1670,7 +1672,7 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp'}.get(model_version, 'models.dawn_spatial_v3')
             _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
@@ -2271,9 +2273,9 @@ def main():
                         if k_aN > 0:    # v3.9.2
                             k_extra += f" active_N={k_aN:.0f}"
 
-                        # v4.0.0+: symmetric gate → show pos/neg split
-                        # v3.9.x: ReLU gate → show active/total + optional strong
-                        _has_pos = bool(metrics.get('know_pos', 0.0)) or model_version.startswith('spatial-r1-v4')
+                        # v4.0.0 (symmetric gate): know_pos metric exists → show pos/neg split
+                        # All others (ReLU/GELU gate): show active/total + optional strong
+                        _has_pos = bool(metrics.get('know_pos', 0.0))
                         if _has_pos:
                             k_pos = _m(metrics.get('know_pos', k_strong))
                             k_neg = max(k_act - k_pos, 0.0)
@@ -2303,7 +2305,7 @@ def main():
                         if a_aN > 0:    # v3.9.2
                             a_extra += f" active_N={a_aN:.0f}"
 
-                        _has_attn_pos = bool(metrics.get('attn_qk_pos', metrics.get('attn_pos', 0.0))) or model_version.startswith('spatial-r1-v4')
+                        _has_attn_pos = bool(metrics.get('attn_qk_pos', metrics.get('attn_pos', 0.0)))
                         if _has_attn_pos:
                             a_qk_pos = _m(metrics.get('attn_qk_pos', metrics.get('attn_pos', metrics.get('attn_strong', 0.0))))
                             a_v_pos = _m(metrics.get('attn_v_pos', 0.0))
