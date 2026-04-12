@@ -1589,10 +1589,12 @@ def main():
     _is_resuming = (resume_path is not None and _file_exists(resume_path))
     if _is_resuming:
         _opt_template = optimizer.init(params)
-        def _place_on_devices(restored, template):
-            restored = jnp.asarray(restored)
-            return jax.device_put(restored, template.sharding)
-        opt_state = jax.tree.map(_place_on_devices, opt_state, _opt_template)
+        def _restore_leaf(restored_val, template_val):
+            # Ensure restored value matches template's dtype and shape,
+            # then place on same devices as template
+            restored_val = jnp.asarray(restored_val, dtype=template_val.dtype).reshape(template_val.shape)
+            return jax.device_put(restored_val, template_val.sharding)
+        opt_state = jax.tree.map(_restore_leaf, opt_state, _opt_template)
         del _opt_template
         if is_host0:
             print(f"  Optimizer state restored from checkpoint and sharded to mesh")
