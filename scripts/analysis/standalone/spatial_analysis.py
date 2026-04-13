@@ -1934,6 +1934,740 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
 
 
 # ============================================================
+# P1: Read/Write Projection Analysis
+# ============================================================
+
+def analyze_rw_projection(params, cfg, output_dir):
+    """P1: Interpret each neuron's read/write vectors via token embedding similarity."""
+    print("\n" + "="*60)
+    print("P1: Read/Write Projection Analysis")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    model_cfg = get_model_cfg(cfg)
+    pool = params['neuron_pool']
+    emb = np.array(params['token_emb']['embedding'])
+    # Unit-norm
+    emb_norm = emb / (np.linalg.norm(emb, axis=-1, keepdims=True) + 1e-8)
+
+    pools = {
+        'QK': {'read': np.array(pool['qk_read']), 'write': np.array(pool['qk_write'])},
+        'V': {'read': np.array(pool['v_read']), 'write': np.array(pool['v_write'])},
+        'Know': {'read': np.array(pool['know_read']), 'write': np.array(pool['know_write'])},
+    }
+
+    results = {}
+    for pool_name, vecs in pools.items():
+        N = vecs['read'].shape[0]
+        read_n = vecs['read'] / (np.linalg.norm(vecs['read'], axis=-1, keepdims=True) + 1e-8)
+        write_n = vecs['write'] / (np.linalg.norm(vecs['write'], axis=-1, keepdims=True) + 1e-8)
+
+        # Read-write alignment per neuron
+        rw_align = (read_n * write_n).sum(axis=-1)  # [N]
+
+        # Top tokens per neuron (chunked to avoid OOM on Know pool)
+        chunk_size = min(N, 2000)
+        n_chunks = (N + chunk_size - 1) // chunk_size
+        all_neurons = []
+
+        print(f"\n  {pool_name} Pool (N={N}):")
+        for ci in range(n_chunks):
+            s, e = ci * chunk_size, min((ci + 1) * chunk_size, N)
+            r_chunk = read_n[s:e]   # [chunk, D]
+            w_chunk = write_n[s:e]
+            r_sim = r_chunk @ emb_norm.T  # [chunk, vocab]
+            w_sim = w_chunk @ emb_norm.T
+            r_top = np.argsort(-r_sim, axis=-1)[:, :10]
+            w_top = np.argsort(-w_sim, axis=-1)[:, :10]
+            for i in range(e - s):
+                ni = s + i
+                all_neurons.append({
+                    'neuron': ni,
+                    'read_top10': [{'token': tokenizer.decode([int(r_top[i, j])]), 'sim': float(r_sim[i, r_top[i, j]])} for j in range(10)],
+                    'write_top10': [{'token': tokenizer.decode([int(w_top[i, j])]), 'sim': float(w_sim[i, w_top[i, j]])} for j in range(10)],
+                    'rw_alignment': float(rw_align[ni]),
+                })
+            if (ci + 1) % 5 == 0 or ci == n_chunks - 1:
+                print(f"    chunk {ci+1}/{n_chunks}")
+
+        # Summary stats
+        align_sorted = np.argsort(rw_align)
+        top_aligned = align_sorted[-10:][::-1]
+        top_ortho = align_sorted[np.argsort(np.abs(rw_align[align_sorted]))][:10]
+        top_anti = align_sorted[:10]
+
+        print(f"    RW alignment: mean={rw_align.mean():.4f} std={rw_align.std():.4f}")
+        print(f"    Top aligned (read≈write):")
+        for idx in top_aligned:
+            r_tok = all_neurons[idx]['read_top10'][0]['token']
+            w_tok = all_neurons[idx]['write_top10'][0]['token']
+            print(f"      neuron {idx}: align={rw_align[idx]:.3f} read='{r_tok}' write='{w_tok}'")
+        print(f"    Top anti-aligned (read≈-write):")
+        for idx in top_anti:
+            r_tok = all_neurons[idx]['read_top10'][0]['token']
+            w_tok = all_neurons[idx]['write_top10'][0]['token']
+            print(f"      neuron {idx}: align={rw_align[idx]:.3f} read='{r_tok}' write='{w_tok}'")
+
+        hist_bins = np.linspace(-1, 1, 21)
+        hist_counts, _ = np.histogram(rw_align, bins=hist_bins)
+
+        results[pool_name] = {
+            'n_neurons': N,
+            'rw_alignment_mean': float(rw_align.mean()),
+            'rw_alignment_std': float(rw_align.std()),
+            'rw_alignment_histogram': {'bins': hist_bins.tolist(), 'counts': hist_counts.tolist()},
+            'top_aligned': [{'neuron': int(i), 'alignment': float(rw_align[i])} for i in top_aligned],
+            'top_anti_aligned': [{'neuron': int(i), 'alignment': float(rw_align[i])} for i in top_anti],
+            'neurons': all_neurons,
+        }
+
+    _save_json(results, output_dir, 'p1_rw_projection', 'results.json')
+    return results
+
+
+# ============================================================
+# P2: Activation Context Analysis
+# ============================================================
+
+def analyze_activation_context(params, cfg, val_tokens, output_dir,
+                                n_batches=10, batch_size=4):
+    """P2: Collect text contexts where each neuron activates most strongly."""
+    print("\n" + "="*60)
+    print("P2: Activation Context Analysis")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    n_know = model_cfg['n_know']
+    n_layers = model_cfg['n_layers']
+    mid_layer = n_layers // 2
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    # Per-neuron: collect (gate_value, batch_idx, seq_pos) tuples
+    # Only track top-100 neurons globally by max gate seen
+    TOP_NEURONS = 100
+    TOP_CONTEXTS = 30
+    CONTEXT_WINDOW = 5
+
+    # neuron_id -> list of (gate_val, token_ids_context)
+    neuron_contexts = {}
+    neuron_max_gate = np.zeros(n_know)
+
+    print(f"  Running {actual_batches} batches (bs={batch_size}, mid_layer={mid_layer})...")
+    for b in range(actual_batches):
+        batch_ids = tokens[b * batch_size:(b + 1) * batch_size]
+        batch_dev = jnp.array(batch_ids, dtype=jnp.int32)
+        _, layer_info = jit_analysis(params, batch_dev)
+
+        # gate_Know_raw: [n_layers, B, S, n_know] — take mid layer only
+        gate_mid = np.array(jax.device_get(layer_info['gate_Know_raw'][mid_layer]))  # [B, S, n_know]
+
+        # Per token position: find top-100 neurons
+        B, S, N = gate_mid.shape
+        for bi in range(B):
+            for si in range(S):
+                g = gate_mid[bi, si]  # [N]
+                top_idx = np.argpartition(-g, TOP_NEURONS)[:TOP_NEURONS]
+                for ni in top_idx:
+                    gv = float(g[ni])
+                    if gv <= 0:
+                        continue
+                    neuron_max_gate[ni] = max(neuron_max_gate[ni], gv)
+                    # Context window
+                    ctx_start = max(0, si - CONTEXT_WINDOW)
+                    ctx_end = min(S, si + CONTEXT_WINDOW + 1)
+                    ctx_ids = batch_ids[bi, ctx_start:ctx_end].tolist()
+                    if ni not in neuron_contexts:
+                        neuron_contexts[ni] = []
+                    neuron_contexts[ni].append((gv, si, ctx_ids))
+
+        if (b + 1) % 2 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # Select top-100 neurons by max gate, keep top-30 contexts each
+    top_neuron_ids = np.argsort(-neuron_max_gate)[:TOP_NEURONS]
+    results = {'mid_layer': mid_layer, 'n_know': n_know, 'neurons': []}
+
+    print(f"\n  Top {TOP_NEURONS} neurons by max gate activation:")
+    for rank, ni in enumerate(top_neuron_ids):
+        ni = int(ni)
+        if ni not in neuron_contexts:
+            continue
+        ctxs = sorted(neuron_contexts[ni], key=lambda x: -x[0])[:TOP_CONTEXTS]
+        decoded_ctxs = []
+        for gv, pos, ctx_ids in ctxs:
+            ctx_text = tokenizer.decode(ctx_ids)
+            decoded_ctxs.append({'gate': gv, 'position': pos, 'context': ctx_text})
+
+        if rank < 10:
+            top_ctx = decoded_ctxs[0] if decoded_ctxs else {}
+            print(f"    neuron {ni}: max_gate={neuron_max_gate[ni]:.4f} top_ctx='{top_ctx.get('context', '')[:60]}'")
+
+        results['neurons'].append({
+            'neuron_id': ni,
+            'max_gate': float(neuron_max_gate[ni]),
+            'contexts': decoded_ctxs,
+        })
+
+    _save_json(results, output_dir, 'p2_activation_context', 'results.json')
+    return results
+
+
+# ============================================================
+# P3: Layer Role Matrix
+# ============================================================
+
+def analyze_layer_role_matrix(params, cfg, val_tokens, output_dir,
+                               n_batches=10, batch_size=4):
+    """P3: Per-neuron activation rate across layers — which layers use which neurons."""
+    print("\n" + "="*60)
+    print("P3: Layer Role Matrix")
+    print("="*60)
+
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    n_layers = model_cfg['n_layers']
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+    THRESH = 0.01
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    # Accumulators: [n_layers, N] activation rate (batch-wise mean)
+    q_acc = np.zeros((n_layers, n_qk), dtype=np.float64)
+    k_acc = np.zeros((n_layers, n_qk), dtype=np.float64)
+    v_acc = np.zeros((n_layers, n_v), dtype=np.float64)
+    know_acc = np.zeros((n_layers, n_know), dtype=np.float64)
+
+    print(f"  Running {actual_batches} batches (bs={batch_size})...")
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        _, layer_info = jit_analysis(params, batch)
+
+        # gate_Q_raw: [n_layers, B, S, n_qk]
+        for pool_key, acc, N in [
+            ('gate_Q_raw', q_acc, n_qk), ('gate_K_raw', k_acc, n_qk),
+            ('gate_V_raw', v_acc, n_v), ('gate_Know_raw', know_acc, n_know)
+        ]:
+            gate = jax.device_get(layer_info[pool_key])  # [L, B, S, N]
+            for li in range(n_layers):
+                act_rate = (np.array(gate[li]) > THRESH).astype(np.float32).mean(axis=(0, 1))
+                acc[li] += act_rate
+        del layer_info
+
+        if (b + 1) % 2 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # Average across batches
+    q_acc /= actual_batches
+    k_acc /= actual_batches
+    v_acc /= actual_batches
+    know_acc /= actual_batches
+
+    # Stats: neurons active in how many layers
+    def layer_spread_stats(mat, pool_name):
+        active_layers = (mat > 0.01).sum(axis=0)  # [N] — how many layers each neuron is active in
+        print(f"\n  {pool_name} Pool (N={mat.shape[1]}):")
+        for n_lay in [1, 2, 3, 5, 8, 12]:
+            if n_lay > n_layers:
+                continue
+            count = int((active_layers >= n_lay).sum())
+            print(f"    Active in >={n_lay} layers: {count} neurons ({count/mat.shape[1]*100:.1f}%)")
+        return active_layers
+
+    q_spread = layer_spread_stats(q_acc, "Q")
+    k_spread = layer_spread_stats(k_acc, "K")
+    v_spread = layer_spread_stats(v_acc, "V")
+    know_spread = layer_spread_stats(know_acc, "Know")
+
+    # Per-layer Q/K correlation
+    print(f"\n  Per-layer Q/K correlation:")
+    layer_corrs = []
+    for li in range(n_layers):
+        if q_acc[li].std() > 0 and k_acc[li].std() > 0:
+            corr = float(np.corrcoef(q_acc[li], k_acc[li])[0, 1])
+        else:
+            corr = 0.0
+        layer_corrs.append(corr)
+        print(f"    Layer {li}: r={corr:.4f}")
+
+    results = {
+        'threshold': THRESH,
+        'n_batches': actual_batches,
+        'layer_role_Q': q_acc.tolist(),
+        'layer_role_K': k_acc.tolist(),
+        'layer_role_V': v_acc.tolist(),
+        'layer_role_Know': know_acc.tolist(),
+        'q_layer_spread': q_spread.tolist(),
+        'k_layer_spread': k_spread.tolist(),
+        'v_layer_spread': v_spread.tolist(),
+        'know_layer_spread': know_spread.tolist(),
+        'per_layer_qk_correlation': layer_corrs,
+    }
+    _save_json(results, output_dir, 'p3_layer_role', 'results.json')
+    return results
+
+
+# ============================================================
+# P4: Cross-Domain Suppression
+# ============================================================
+
+DOMAIN_PROMPTS = {
+    'physics': [
+        "light travels at the speed of",
+        "the earth orbits the",
+        "gravity pulls objects toward the",
+    ],
+    'biology': [
+        "cells divide through a process called",
+        "DNA stores genetic",
+        "photosynthesis converts sunlight into",
+    ],
+    'geography': [
+        "the longest river in the world is the",
+        "mount everest is located in",
+        "the sahara desert covers",
+    ],
+    'language': [
+        "the past tense of go is",
+        "a noun is a word that",
+        "the plural of child is",
+    ],
+    'math': [
+        "the square root of 144 is",
+        "pi is approximately equal to",
+        "the sum of angles in a triangle is",
+    ],
+}
+
+
+def analyze_cross_domain_suppression(params, cfg, output_dir):
+    """P4: Suppress domain-specific neurons and measure cross-domain impact."""
+    print("\n" + "="*60)
+    print("P4: Cross-Domain Suppression")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
+    build_suppressed_forward = _mod.build_suppressed_forward
+    prefill_fn = _mod.prefill
+    decode_step_fn = _mod.decode_step
+
+    model_cfg = get_model_cfg(cfg)
+    n_know = model_cfg['n_know']
+    n_layers = model_cfg['n_layers']
+    mid_layer = n_layers // 2
+    max_seq = model_cfg['max_seq_len']
+
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    # Step 1: Collect per-domain neuron activation profiles
+    print(f"  Collecting domain activation profiles...")
+    domain_profiles = {}  # domain -> [n_know] mean gate
+
+    for domain, prompts in DOMAIN_PROMPTS.items():
+        acc = np.zeros(n_know, dtype=np.float64)
+        n_tokens = 0
+        for prompt in prompts:
+            ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+            ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+            ids_pad[0, :ids.shape[1]] = ids
+            ids_dev = jnp.array(ids_pad, dtype=jnp.int32)
+            _, layer_info = jit_analysis(params, ids_dev)
+            gate = np.array(jax.device_get(layer_info['gate_Know_raw'][mid_layer]))  # [1, S, N]
+            # Only count actual tokens (not padding)
+            gate_valid = gate[0, :ids.shape[1], :]  # [seq_len, N]
+            acc += gate_valid.mean(axis=0)
+            n_tokens += 1
+        domain_profiles[domain] = acc / n_tokens
+        print(f"    {domain}: mean_gate={domain_profiles[domain].mean():.6f}")
+
+    # Step 2: Find domain-specific neurons (contrastive)
+    all_domains = list(DOMAIN_PROMPTS.keys())
+    domain_neurons = {}  # domain -> neuron indices sorted by specificity
+
+    for domain in all_domains:
+        others_mean = np.mean([domain_profiles[d] for d in all_domains if d != domain], axis=0)
+        specificity = domain_profiles[domain] - others_mean
+        domain_neurons[domain] = np.argsort(-specificity)
+
+    # Step 3: Suppress and measure
+    suppress_pcts = [0.01, 0.02, 0.05]  # 1%, 2%, 5%
+
+    @jax.jit
+    def get_loss(params, input_ids):
+        logits, _, _, _ = prefill_fn(params, model_cfg, input_ids)
+        shift_logits = logits[:, :-1, :]
+        shift_labels = input_ids[:, 1:]
+        log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+        safe_labels = jnp.where(shift_labels > 0, shift_labels, 0)
+        token_loss = -jnp.take_along_axis(log_probs, safe_labels[..., jnp.newaxis], axis=-1).squeeze(-1)
+        valid = shift_labels > 0
+        return (token_loss * valid).sum() / (valid.sum() + 1e-8)
+
+    # Baseline losses per domain
+    print(f"\n  Computing baseline losses...")
+    baseline_losses = {}
+    for domain, prompts in DOMAIN_PROMPTS.items():
+        losses = []
+        for prompt in prompts:
+            ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+            ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+            ids_pad[0, :ids.shape[1]] = ids
+            loss = float(get_loss(params, jnp.array(ids_pad, dtype=jnp.int32)))
+            losses.append(loss)
+        baseline_losses[domain] = np.mean(losses)
+    print(f"    Baselines: {', '.join(f'{d}={v:.4f}' for d, v in baseline_losses.items())}")
+
+    # Suppression experiments
+    print(f"\n  Running suppression experiments...")
+    results_matrix = []
+
+    for suppress_domain in all_domains:
+        for pct in suppress_pcts:
+            n_suppress = int(n_know * pct)
+            suppress_idx = domain_neurons[suppress_domain][:n_suppress]
+            mask = np.zeros(n_know, dtype=bool)
+            mask[suppress_idx] = True
+            suppress_masks = {'know': mask}
+            fwd_fn = build_suppressed_forward(params, model_cfg, suppress_masks)
+            jit_fwd = jax.jit(fwd_fn)
+
+            row = {'suppress_domain': suppress_domain, 'pct': pct, 'n_suppressed': n_suppress}
+            for target_domain, prompts in DOMAIN_PROMPTS.items():
+                losses = []
+                for prompt in prompts:
+                    ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+                    ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+                    ids_pad[0, :ids.shape[1]] = ids
+                    logits = np.array(jax.device_get(jit_fwd(jnp.array(ids_pad, dtype=jnp.int32))))
+                    shift_logits = logits[:, :-1, :]
+                    shift_labels = ids_pad[:, 1:]
+                    log_probs = shift_logits - np.log(np.exp(shift_logits).sum(axis=-1, keepdims=True) + 1e-8)
+                    safe = np.where(shift_labels > 0, shift_labels, 0)
+                    tl = -np.take_along_axis(log_probs, safe[..., np.newaxis], axis=-1).squeeze(-1)
+                    valid = shift_labels > 0
+                    loss = float((tl * valid).sum() / (valid.sum() + 1e-8))
+                    losses.append(loss)
+                row[f'loss_{target_domain}'] = float(np.mean(losses))
+                row[f'delta_{target_domain}'] = float(np.mean(losses) - baseline_losses[target_domain])
+
+            # Selectivity index
+            target_delta = row[f'delta_{suppress_domain}']
+            other_deltas = [row[f'delta_{d}'] for d in all_domains if d != suppress_domain]
+            row['selectivity'] = target_delta - np.mean(other_deltas)
+            results_matrix.append(row)
+
+            print(f"    Suppress {suppress_domain} {pct*100:.0f}%: "
+                  f"self_delta={target_delta:+.4f} selectivity={row['selectivity']:+.4f}")
+
+    results = {
+        'baseline_losses': {k: float(v) for k, v in baseline_losses.items()},
+        'suppression_results': results_matrix,
+        'domains': all_domains,
+    }
+    _save_json(results, output_dir, 'p4_cross_domain', 'results.json')
+    return results
+
+
+# ============================================================
+# P5: Gate Mechanism Analysis
+# ============================================================
+
+def analyze_gate_mechanism(params, cfg, val_tokens, output_dir,
+                            n_batches=5, batch_size=2):
+    """P5: Empirical analysis of z × Φ(z) gate — z/phi distributions, den stats."""
+    print("\n" + "="*60)
+    print("P5: Gate Mechanism Analysis")
+    print("="*60)
+
+    _mod = get_model_module()
+    _layer_norm = _mod._layer_norm
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    n_know = model_cfg['n_know']
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+
+    pool_params = params['neuron_pool']
+    router_params = params['router']
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+
+    emb_matrix = jnp.asarray(params['token_emb']['embedding'])
+    pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
+
+    # Precompute unit-norm embs
+    know_emb_n = pool_params['know_emb'] / (jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
+
+    # Histogram bins
+    z_bins = np.arange(0, 5.25, 0.25)
+    phi_bins = np.arange(0.5, 1.025, 0.025)
+
+    # Accumulators per layer
+    layer_stats = {li: {
+        'z_hist': np.zeros(len(z_bins) - 1),
+        'phi_hist': np.zeros(len(phi_bins) - 1),
+        'n_active': 0, 'n_confident': 0, 'n_borderline': 0, 'n_total_tokens': 0,
+        's_std_sum': 0.0, 'den_floor_count': 0, 'den_total': 0,
+        'tau_offset_sum': 0.0,
+    } for li in range(n_layers)}
+
+    print(f"  Running {actual_batches} batches (bs={batch_size}), layer-by-layer forward...")
+
+    for b in range(actual_batches):
+        batch = tokens[b * batch_size:(b + 1) * batch_size]
+        batch_dev = jnp.array(batch, dtype=jnp.int32)
+        B, S = batch_dev.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[batch_dev] + pos_matrix[positions]
+
+        for li in range(n_layers):
+            bp = block_params_list[li]
+            normed = _layer_norm(x, jnp.asarray(bp['norm1']['scale']), jnp.asarray(bp['norm1']['bias']))
+
+            # Attention forward (simplified — just need x update)
+            h_all = normed @ jnp.asarray(router_params['proj_attn']['kernel']) + jnp.asarray(router_params['proj_attn']['bias'])
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed @ jnp.asarray(router_params['tau_attn']['kernel']) + jnp.asarray(router_params['tau_attn']['bias'])
+
+            qk_n = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+            v_n = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+            from models.dawn_spatial_v401_exp import _srw_inference
+            Q = _srw_inference(normed, h_Q, qk_n, tau_all[:,:,0:1], pool_params['qk_read'], pool_params['qk_write'])
+            K = _srw_inference(normed, h_K, qk_n, tau_all[:,:,1:2], pool_params['qk_read'], pool_params['qk_write'])
+            V = _srw_inference(normed, h_V, v_n, tau_all[:,:,2:3], pool_params['v_read'], pool_params['v_write'])
+            _qk_s = pool_params.get('qk_scale', 1.0)
+            _v_s = pool_params.get('v_scale', 1.0)
+            Q, K, V = Q * _qk_s, K * _qk_s, V * _v_s
+
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vr = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            scores_a = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            scores_a = jnp.where(causal, scores_a, jnp.finfo(scores_a.dtype).min)
+            attn_w = jax.nn.softmax(scores_a, axis=-1)
+            attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = attn_out @ jnp.asarray(bp['attn']['expand_O']['kernel'])
+            x = x + attn_out
+
+            # Know forward — compute z, phi, gate directly
+            normed2 = _layer_norm(x, jnp.asarray(bp['norm2']['scale']), jnp.asarray(bp['norm2']['bias']))
+            h_k = normed2 @ jnp.asarray(router_params['proj_know']['kernel']) + jnp.asarray(router_params['proj_know']['bias'])
+            tau_k = normed2 @ jnp.asarray(router_params['tau_know']['kernel']) + jnp.asarray(router_params['tau_know']['bias'])
+
+            scores_k = h_k @ know_emb_n.T
+            sf = scores_k.astype(jnp.float32)
+            s_mean = sf.mean(axis=-1, keepdims=True)
+            s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
+            tau = s_mean + tau_k * s_std
+            raw = scores_k - tau.astype(scores_k.dtype)
+            z = raw.astype(jnp.float32) / s_std
+            phi = 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476))
+            gate = jnp.where(z > 0, z * phi, 0.0)
+            den = jnp.maximum(gate.sum(axis=-1, keepdims=True), 1.0)
+
+            # Collect stats (CPU)
+            z_np = np.array(jax.device_get(z))
+            phi_np = np.array(jax.device_get(phi))
+            den_np = np.array(jax.device_get(den))
+            s_std_np = np.array(jax.device_get(s_std))
+            tau_k_np = np.array(jax.device_get(tau_k))
+
+            active_mask = z_np > 0
+            z_active = z_np[active_mask]
+
+            ls = layer_stats[li]
+            ls['z_hist'] += np.histogram(z_active, bins=z_bins)[0]
+            ls['phi_hist'] += np.histogram(phi_np[active_mask], bins=phi_bins)[0]
+            ls['n_active'] += int(active_mask.sum())
+            ls['n_confident'] += int((phi_np[active_mask] > 0.95).sum()) if len(z_active) > 0 else 0
+            ls['n_borderline'] += int(((phi_np[active_mask] > 0.5) & (phi_np[active_mask] < 0.8)).sum()) if len(z_active) > 0 else 0
+            ls['n_total_tokens'] += B * S
+            ls['s_std_sum'] += float(s_std_np.mean())
+            ls['den_floor_count'] += int((den_np.squeeze(-1) <= 1.0 + 1e-6).sum())
+            ls['den_total'] += B * S
+            ls['tau_offset_sum'] += float(tau_k_np.mean())
+
+            # Update x with know output
+            know_out = _srw_inference(normed2, h_k, know_emb_n, tau_k, pool_params['know_read'], pool_params['know_write'])
+            _k_s = pool_params.get('know_scale', 1.0)
+            x = x + know_out * _k_s
+
+        if (b + 1) % 2 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # Compile results
+    results = {'n_batches': actual_batches, 'batch_size': batch_size, 'layers': {}}
+    print(f"\n  Per-layer gate mechanism stats (Know pool):")
+    print(f"  {'Layer':>5} | {'s_std':>7} | {'confident':>10} | {'borderline':>10} | {'den_floor':>10} | {'tau':>7}")
+    for li in range(n_layers):
+        ls = layer_stats[li]
+        n_act = max(ls['n_active'], 1)
+        conf_ratio = ls['n_confident'] / n_act
+        border_ratio = ls['n_borderline'] / n_act
+        floor_ratio = ls['den_floor_count'] / max(ls['den_total'], 1)
+        avg_std = ls['s_std_sum'] / actual_batches
+        avg_tau = ls['tau_offset_sum'] / actual_batches
+
+        print(f"  {li:>5} | {avg_std:>7.4f} | {conf_ratio*100:>9.1f}% | {border_ratio*100:>9.1f}% | {floor_ratio*100:>9.1f}% | {avg_tau:>7.3f}")
+
+        results['layers'][f'layer_{li}'] = {
+            'z_histogram': {'bins': z_bins.tolist(), 'counts': ls['z_hist'].tolist()},
+            'phi_histogram': {'bins': phi_bins.tolist(), 'counts': ls['phi_hist'].tolist()},
+            'confident_ratio': float(conf_ratio),
+            'borderline_ratio': float(border_ratio),
+            'den_floor_ratio': float(floor_ratio),
+            'avg_s_std': float(avg_std),
+            'avg_tau_offset': float(avg_tau),
+            'n_active_total': int(ls['n_active']),
+        }
+
+    _save_json(results, output_dir, 'p5_gate_mechanism', 'results.json')
+    return results
+
+
+# ============================================================
+# P6: Compositional Expressiveness
+# ============================================================
+
+def analyze_compositional_expressiveness(params, cfg, val_tokens, output_dir,
+                                          n_samples=100, batch_size=4):
+    """P6: Effective rank of active write vectors — rank-1 compositionality."""
+    print("\n" + "="*60)
+    print("P6: Compositional Expressiveness")
+    print("="*60)
+
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    n_know = model_cfg['n_know']
+    n_layers = model_cfg['n_layers']
+    mid_layer = n_layers // 2
+
+    pool = params['neuron_pool']
+    know_write = np.array(pool['know_write'])
+    know_write_n = know_write / (np.linalg.norm(know_write, axis=-1, keepdims=True) + 1e-8)
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    # Collect active neuron sets for random token positions
+    print(f"  Collecting active neuron sets for {n_samples} token positions...")
+    all_results = []
+    samples_collected = 0
+    batch_idx = 0
+
+    while samples_collected < n_samples and batch_idx * batch_size < n_seqs:
+        batch = jnp.array(tokens[batch_idx * batch_size:(batch_idx + 1) * batch_size], dtype=jnp.int32)
+        _, layer_info = jit_analysis(params, batch)
+        gate = np.array(jax.device_get(layer_info['gate_Know_raw'][mid_layer]))  # [B, S, n_know]
+        B, S, N = gate.shape
+
+        # Random sample positions from this batch
+        n_from_batch = min(n_samples - samples_collected, B * S // 4)
+        positions = np.random.choice(B * S, size=n_from_batch, replace=False)
+
+        for pos in positions:
+            bi, si = divmod(int(pos), S)
+            g = gate[bi, si]
+            active_idx = np.where(g > 0)[0]
+            active_N = len(active_idx)
+            if active_N < 2:
+                continue
+
+            # SVD of active write vectors
+            W = know_write_n[active_idx]  # [active_N, d_model]
+            sv = np.linalg.svd(W, compute_uv=False)
+            sv_norm = sv / (sv.sum() + 1e-8)
+            entropy = -(sv_norm * np.log(sv_norm + 1e-10)).sum()
+            eff_rank = float(np.exp(entropy))
+
+            all_results.append({
+                'active_N': active_N,
+                'effective_rank': eff_rank,
+                'efficiency': eff_rank / active_N if active_N > 0 else 0,
+                'top5_sv': sv[:5].tolist(),
+            })
+            samples_collected += 1
+
+        batch_idx += 1
+        if batch_idx % 5 == 0:
+            print(f"    {samples_collected}/{n_samples} samples collected")
+
+    if not all_results:
+        print("  No samples collected!")
+        return {}
+
+    active_Ns = np.array([r['active_N'] for r in all_results])
+    eff_ranks = np.array([r['effective_rank'] for r in all_results])
+    efficiencies = np.array([r['efficiency'] for r in all_results])
+
+    print(f"\n  Collected {len(all_results)} token positions (layer {mid_layer}):")
+    print(f"    Active N:       mean={active_Ns.mean():.0f}  std={active_Ns.std():.0f}  "
+          f"p25={np.percentile(active_Ns, 25):.0f}  p50={np.percentile(active_Ns, 50):.0f}  p75={np.percentile(active_Ns, 75):.0f}")
+    print(f"    Effective rank: mean={eff_ranks.mean():.1f}  std={eff_ranks.std():.1f}  "
+          f"p25={np.percentile(eff_ranks, 25):.1f}  p50={np.percentile(eff_ranks, 50):.1f}  p75={np.percentile(eff_ranks, 75):.1f}")
+    print(f"    Efficiency:     mean={efficiencies.mean():.3f}  (eff_rank / active_N)")
+    print(f"    Max possible:   {model_cfg['d_model']} (d_model)")
+
+    results = {
+        'mid_layer': mid_layer,
+        'n_samples': len(all_results),
+        'n_know': n_know,
+        'd_model': model_cfg['d_model'],
+        'active_N': {'mean': float(active_Ns.mean()), 'std': float(active_Ns.std()),
+                     'percentiles': {str(p): float(np.percentile(active_Ns, p)) for p in [5, 25, 50, 75, 95]}},
+        'effective_rank': {'mean': float(eff_ranks.mean()), 'std': float(eff_ranks.std()),
+                          'percentiles': {str(p): float(np.percentile(eff_ranks, p)) for p in [5, 25, 50, 75, 95]}},
+        'efficiency': {'mean': float(efficiencies.mean()), 'std': float(efficiencies.std())},
+        'samples': all_results[:20],  # Save first 20 for inspection
+    }
+    _save_json(results, output_dir, 'p6_compositional', 'results.json')
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -1946,7 +2680,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -1975,7 +2709,9 @@ def main():
     # Load val tokens once (shared by D2 and D6)
     val_tokens = None
     val_path = args.val_data or cfg.get('data', {}).get('bin_val')
-    if val_path and (only is None or any(k in (only or set()) for k in ['val', 'routing', 'gate_dist', 'utilization'])):
+    _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
+                     'act_context', 'layer_role', 'gate_mech', 'comp_expr']
+    if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         val_tokens = load_val_tokens(val_path)
 
     if only is None or 'val' in only:
@@ -2050,6 +2786,37 @@ def main():
     if only is None or 'r5' in only:
         analyze_suppression(params, cfg, args.output,
                            knowledge_results=r3_results)
+
+    # --- Paper analyses (P1-P6) ---
+    if only is None or 'rw_proj' in only:
+        analyze_rw_projection(params, cfg, args.output)
+
+    if only is None or 'act_context' in only:
+        if val_tokens is not None:
+            analyze_activation_context(params, cfg, val_tokens, args.output)
+        else:
+            print("\n  Skipping act_context (no --val_data)")
+
+    if only is None or 'layer_role' in only:
+        if val_tokens is not None:
+            analyze_layer_role_matrix(params, cfg, val_tokens, args.output)
+        else:
+            print("\n  Skipping layer_role (no --val_data)")
+
+    if only is None or 'cross_suppress' in only:
+        analyze_cross_domain_suppression(params, cfg, args.output)
+
+    if only is None or 'gate_mech' in only:
+        if val_tokens is not None:
+            analyze_gate_mechanism(params, cfg, val_tokens, args.output)
+        else:
+            print("\n  Skipping gate_mech (no --val_data)")
+
+    if only is None or 'comp_expr' in only:
+        if val_tokens is not None:
+            analyze_compositional_expressiveness(params, cfg, val_tokens, args.output)
+        else:
+            print("\n  Skipping comp_expr (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
