@@ -1120,7 +1120,9 @@ def analyze_pos_selectivity(params, cfg, output_dir,
 
     from transformers import AutoTokenizer
     _mod = get_model_module()
-    analysis_forward = _mod.analysis_forward
+    _layer_norm = _mod._layer_norm
+    _srw_inference = _mod._srw_inference
+    _srw_inference_with_gates = _mod._srw_inference_with_gates
     import numpy as np
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
@@ -1128,33 +1130,104 @@ def analyze_pos_selectivity(params, cfg, output_dir,
     n_know = model_cfg['n_know']
     n_qk = model_cfg['n_qk']
     n_v = model_cfg['n_v']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+    max_seq = model_cfg['max_seq_len']
+
+    # Lightweight forward: returns layer-averaged raw gate per pool [B, S, N]
+    # No full [n_layers, B, S, N] tensor — 12x less memory than analysis_forward
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_params = params_jax['neuron_pool']
+    router_params = params_jax['router']
+    emb_matrix = jnp.asarray(params_jax['token_emb']['embedding'])
+    pos_matrix = jnp.asarray(params_jax['pos_emb']['embedding'])
+
+    qk_emb_n = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_emb_n = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_emb_n = pool_params['know_emb'] / (jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    qk_s = pool_params.get('qk_scale', 1.0)
+    v_s = pool_params.get('v_scale', 1.0)
+    know_s = pool_params.get('know_scale', 1.0)
+
+    @jax.jit
+    def lightweight_forward(input_ids):
+        """Forward returning layer-averaged raw gate per pool. Memory: [B,S,N] not [L,B,S,N]."""
+        B, S = input_ids.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+
+        # Accumulators for layer-mean raw gate
+        gate_q_sum = jnp.zeros((B, S, n_qk))
+        gate_v_sum = jnp.zeros((B, S, n_v))
+        gate_know_sum = jnp.zeros((B, S, n_know))
+
+        def layer_fn(carry, bp):
+            x, gq, gv, gk = carry
+            normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+            Q, gQ_raw, _ = _srw_inference_with_gates(normed, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_params['qk_read'], pool_params['qk_write'])
+            K, _, _ = _srw_inference_with_gates(normed, h_K, qk_emb_n, tau_all[:,:,1:2], pool_params['qk_read'], pool_params['qk_write'])
+            V, gV_raw, _ = _srw_inference_with_gates(normed, h_V, v_emb_n, tau_all[:,:,2:3], pool_params['v_read'], pool_params['v_write'])
+            Q, K, V = Q * qk_s, K * qk_s, V * v_s
+
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vr = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+            attn_w = jax.nn.softmax(scores, axis=-1)
+            attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = attn_out @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+
+            normed2 = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            h_k = normed2 @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+            tau_k = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+            know_out, gK_raw, _ = _srw_inference_with_gates(normed2, h_k, know_emb_n, tau_k, pool_params['know_read'], pool_params['know_write'])
+            x = x + know_out * know_s
+
+            return (x, gq + gQ_raw, gv + gV_raw, gk + gK_raw), None
+
+        (_, gate_q_sum, gate_v_sum, gate_know_sum), _ = jax.lax.scan(
+            layer_fn, (x, gate_q_sum, gate_v_sum, gate_know_sum), stacked)
+
+        inv_L = 1.0 / n_layers
+        return gate_q_sum * inv_L, gate_v_sum * inv_L, gate_know_sum * inv_L
 
     # Load UD-EWT
     dataset = _load_ud_ewt(max_sentences)
     print(f"  Loaded {len(dataset)} sentences")
 
-    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids, mode='full'))
-
     # Accumulators: per-neuron activation count, per-(neuron,pos) count
     n_pos = len(UPOS_TAGS)
     pos_to_idx = {p: i for i, p in enumerate(UPOS_TAGS)}
 
-    # For each pool — use raw gate (before normalization) for accurate activation
-    pools = {
-        'QK': {'size': n_qk, 'gate_key': 'gate_Q_raw'},
-        'V': {'size': n_v, 'gate_key': 'gate_V_raw'},
-        'Know': {'size': n_know, 'gate_key': 'gate_Know_raw'},
-    }
+    # Pool info (gates come from lightweight_forward, indexed by position in tuple)
+    pools = [
+        ('QK', n_qk, 0),   # (name, size, index in lightweight_forward output)
+        ('V', n_v, 1),
+        ('Know', n_know, 2),
+    ]
     pool_counts = {}
     pool_pos_counts = {}
     pos_token_counts = np.zeros(n_pos, dtype=np.float64)
     total_tokens = 0
 
-    for pool_name, pinfo in pools.items():
-        pool_counts[pool_name] = np.zeros(pinfo['size'], dtype=np.float64)
-        pool_pos_counts[pool_name] = np.zeros((pinfo['size'], n_pos), dtype=np.float64)
-
-    max_seq = model_cfg['max_seq_len']
+    for pool_name, pool_size, _ in pools:
+        pool_counts[pool_name] = np.zeros(pool_size, dtype=np.float64)
+        pool_pos_counts[pool_name] = np.zeros((pool_size, n_pos), dtype=np.float64)
 
     n_total = len(dataset)
     n_batches_est = (n_total + batch_size - 1) // batch_size
@@ -1212,38 +1285,34 @@ def analyze_pos_selectivity(params, cfg, output_dir,
                 padded[bi, :l] = tids[:l]
                 pos_padded[bi, :l] = plabs[:l]
 
-            # Forward
+            # Lightweight forward: returns layer-averaged raw gate per pool
             ids_dev = jnp.array(padded, dtype=jnp.int32)
-            _, layer_info = jit_analysis(params, ids_dev)
+            gate_q_avg, gate_v_avg, gate_know_avg = lightweight_forward(ids_dev)
+            gates_by_idx = {
+                0: np.array(jax.device_get(gate_q_avg)),    # [B, S, n_qk]
+                1: np.array(jax.device_get(gate_v_avg)),    # [B, S, n_v]
+                2: np.array(jax.device_get(gate_know_avg)), # [B, S, n_know]
+            }
 
-            # Fully vectorized accumulation (no Python loops over tokens or POS)
+            # Fully vectorized accumulation
             valid_mask = pos_padded >= 0  # [B, S]
             total_tokens += int(valid_mask.sum())
 
-            # Count POS tokens via bincount
             valid_pos = pos_padded[valid_mask]  # [n_valid]
             pos_token_counts += np.bincount(valid_pos, minlength=n_pos).astype(np.float64)
 
-            for pool_name, pinfo in pools.items():
-                gate = np.array(jax.device_get(layer_info[pinfo['gate_key']]))
-                gate_avg = gate.mean(axis=0)  # [B, S, N]
-                active = (gate_avg > 0.0).astype(np.float32)  # [B, S, N]
-                N = pinfo['size']
+            # POS one-hot (shared across pools)
+            safe_pos = np.where(valid_mask, pos_padded, 0).ravel()  # [B*S]
+            pos_onehot = np.zeros((safe_pos.shape[0], n_pos), dtype=np.float32)
+            pos_onehot[np.arange(safe_pos.shape[0]), safe_pos] = valid_mask.ravel().astype(np.float32)
 
-                # Zero out padding
-                active_masked = active * valid_mask[:, :, np.newaxis]  # [B, S, N]
-
-                # Per-neuron total activation: sum over (B, S)
-                pool_counts[pool_name] += active_masked.sum(axis=(0, 1))  # [N]
-
-                # Per-(neuron, pos): scatter-add via one-hot matmul
-                # pos_onehot: [B*S, n_pos], active_flat: [B*S, N]
-                safe_pos = np.where(valid_mask, pos_padded, 0).ravel()  # [B*S]
-                pos_onehot = np.zeros((safe_pos.shape[0], n_pos), dtype=np.float32)
-                pos_onehot[np.arange(safe_pos.shape[0]), safe_pos] = valid_mask.ravel().astype(np.float32)
-                active_flat = active.reshape(-1, N)  # [B*S, N]
-                # pool_pos_counts[:, pi] += sum of active[t] for tokens where pos=pi
-                pool_pos_counts[pool_name] += (active_flat.T @ pos_onehot)  # [N, n_pos]
+            for pool_name, pool_size, gate_idx in pools:
+                gate_avg = gates_by_idx[gate_idx]  # [B, S, N]
+                active = (gate_avg > 0.0).astype(np.float32)
+                active_masked = active * valid_mask[:, :, np.newaxis]
+                pool_counts[pool_name] += active_masked.sum(axis=(0, 1))
+                active_flat = active.reshape(-1, pool_size)
+                pool_pos_counts[pool_name] += (active_flat.T @ pos_onehot)
 
             n_batches_done += 1
             batch_tokens = []
@@ -1260,8 +1329,7 @@ def analyze_pos_selectivity(params, cfg, output_dir,
 
     # Compute selectivity
     results = {}
-    for pool_name, pinfo in pools.items():
-        N = pinfo['size']
+    for pool_name, N, _ in pools:
         # P(neuron active)
         p_neuron = pool_counts[pool_name] / (total_tokens + 1e-8)  # [N]
 
