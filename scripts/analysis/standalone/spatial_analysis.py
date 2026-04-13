@@ -2988,6 +2988,285 @@ def analyze_neuron_clustering(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# P8: Cross-Reference Analysis
+# ============================================================
+
+def analyze_cross_reference(params, cfg, val_tokens, output_dir,
+                             n_batches=10, batch_size=4):
+    """P8: Cross-reference P1-P7 results for deeper patterns."""
+    print("\n" + "="*60)
+    print("P8: Cross-Reference Analysis")
+    print("="*60)
+
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
+    _srw_inference_with_gates = _mod._srw_inference_with_gates
+    _layer_norm = _mod._layer_norm
+    _srw_inference = _mod._srw_inference
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    n_know = model_cfg['n_know']
+    n_qk = model_cfg['n_qk']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+    mid_layer = n_layers // 2
+
+    pool = params['neuron_pool']
+    read_vecs = np.array(pool['know_read'])
+    write_vecs = np.array(pool['know_write'])
+    read_n = read_vecs / (np.linalg.norm(read_vecs, axis=-1, keepdims=True) + 1e-8)
+    write_n = write_vecs / (np.linalg.norm(write_vecs, axis=-1, keepdims=True) + 1e-8)
+    alignment = (read_n * write_n).sum(axis=-1)  # [n_know]
+
+    # Groups
+    correction_mask = alignment < -0.5
+    neutral_mask = (alignment >= -0.5) & (alignment <= 0.1)
+    transform_mask = alignment > 0.1
+    n_corr = int(correction_mask.sum())
+    n_neut = int(neutral_mask.sum())
+    n_trans = int(transform_mask.sum())
+    print(f"  Groups: correction(<-0.5)={n_corr}, neutral={n_neut}, transform(>0.1)={n_trans}")
+
+    # Prepare val data
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+
+    # --- Compute layer activation matrix + gate stats in one pass ---
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    layer_act = np.zeros((n_layers, n_know), dtype=np.float64)  # for Part A
+    gate_sum = np.zeros(n_know, dtype=np.float64)  # for Part B
+    gate_max = np.zeros(n_know, dtype=np.float64)
+    gate_phi_conf = np.zeros(n_know, dtype=np.float64)  # confident count
+    gate_phi_bord = np.zeros(n_know, dtype=np.float64)  # borderline count
+    gate_count = np.zeros(n_know, dtype=np.float64)  # active count
+
+    # QK layer data for Part D
+    q_layer_act = np.zeros((n_layers, n_qk), dtype=np.float64)
+    k_layer_act = np.zeros((n_layers, n_qk), dtype=np.float64)
+
+    THRESH = 0.0
+    print(f"\n  Running {actual_batches} batches for layer/gate stats...")
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        _, layer_info = jit_analysis(params, batch)
+
+        # Know raw gate [L, B, S, N]
+        gk = np.array(jax.device_get(layer_info['gate_Know_raw']))
+        for li in range(n_layers):
+            layer_act[li] += (gk[li] > THRESH).astype(np.float32).mean(axis=(0, 1))
+
+        # Mid-layer gate stats for Part B
+        g_mid = gk[mid_layer]  # [B, S, N]
+        active = g_mid > THRESH
+        gate_sum += g_mid.sum(axis=(0, 1))
+        gate_max = np.maximum(gate_max, g_mid.max(axis=(0, 1)))
+        gate_count += active.astype(np.float32).sum(axis=(0, 1))
+
+        # QK gates for Part D
+        gq = np.array(jax.device_get(layer_info['gate_Q_raw']))
+        gkk = np.array(jax.device_get(layer_info['gate_K_raw']))
+        for li in range(n_layers):
+            q_layer_act[li] += (gq[li] > THRESH).astype(np.float32).mean(axis=(0, 1))
+            k_layer_act[li] += (gkk[li] > THRESH).astype(np.float32).mean(axis=(0, 1))
+
+        del layer_info
+        if (b + 1) % 3 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    layer_act /= actual_batches
+    q_layer_act /= actual_batches
+    k_layer_act /= actual_batches
+    n_tokens = actual_batches * batch_size * max_seq
+    mean_gate = gate_sum / (n_tokens + 1e-8)
+
+    results = {}
+
+    # === Part A: Alignment × Layer Activation ===
+    print(f"\n  Part A: Alignment × Layer Activation")
+    print(f"  {'Layer':>5} | {'correction':>10} | {'neutral':>9} | {'transform':>9}")
+    print(f"  {'-'*5}-+-{'-'*10}-+-{'-'*9}-+-{'-'*9}")
+    part_a = {}
+    for li in range(n_layers):
+        corr_rate = float(layer_act[li, correction_mask].mean()) if n_corr > 0 else 0
+        neut_rate = float(layer_act[li, neutral_mask].mean()) if n_neut > 0 else 0
+        trans_rate = float(layer_act[li, transform_mask].mean()) if n_trans > 0 else 0
+        print(f"  {li:>5} | {corr_rate*100:>9.1f}% | {neut_rate*100:>8.1f}% | {trans_rate*100:>8.1f}%")
+        part_a[f'layer_{li}'] = {'correction': corr_rate, 'neutral': neut_rate, 'transform': trans_rate}
+
+    corr_l0 = part_a['layer_0']['correction']
+    corr_l11 = part_a[f'layer_{n_layers-1}']['correction']
+    trans_l0 = part_a['layer_0']['transform']
+    trans_l11 = part_a[f'layer_{n_layers-1}']['transform']
+    print(f"\n  Correction: L0/L{n_layers-1} ratio = {corr_l0/(corr_l11+1e-8):.1f}")
+    print(f"  Transform:  L0/L{n_layers-1} ratio = {trans_l0/(trans_l11+1e-8):.1f}")
+    results['part_a'] = part_a
+
+    # === Part B: Alignment × Gate Strength ===
+    print(f"\n  Part B: Alignment × Gate Strength (layer {mid_layer})")
+    corr_corr = float(np.corrcoef(alignment, mean_gate)[0, 1]) if n_know > 1 else 0
+    print(f"  Correlation(alignment, mean_gate): r={corr_corr:.4f}")
+
+    def group_gate_stats(mask, name):
+        if mask.sum() == 0:
+            return {'mean_gate': 0, 'max_gate': 0}
+        mg = float(mean_gate[mask].mean())
+        mx = float(gate_max[mask].mean())
+        return {'mean_gate': mg, 'max_gate': mx}
+
+    groups = [('correction', correction_mask), ('neutral', neutral_mask), ('transform', transform_mask)]
+    print(f"  {'Group':>12} | {'mean_gate':>10} | {'max_gate':>10}")
+    print(f"  {'-'*12}-+-{'-'*10}-+-{'-'*10}")
+    part_b = {'correlation': corr_corr}
+    for gname, gmask in groups:
+        gs = group_gate_stats(gmask, gname)
+        print(f"  {gname:>12} | {gs['mean_gate']:>10.6f} | {gs['max_gate']:>10.4f}")
+        part_b[gname] = gs
+    results['part_b'] = part_b
+
+    # === Part C: Domain-specific Neurons' Alignment ===
+    print(f"\n  Part C: Domain-specific Neurons' Alignment")
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    jit_analysis_light = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids, mode='light'))
+
+    domain_profiles = {}
+    for domain, prompts in DOMAIN_PROMPTS.items():
+        acc = np.zeros(n_know, dtype=np.float64)
+        for prompt in prompts:
+            ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+            ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+            ids_pad[0, :ids.shape[1]] = ids
+            _, li = jit_analysis_light(params, jnp.array(ids_pad, dtype=jnp.int32))
+            gate = np.array(jax.device_get(li['gate_Know']))  # normalized, but fine for ranking
+            acc += gate.mean(axis=(0, 1, 2))  # [N]
+        domain_profiles[domain] = acc / len(prompts)
+
+    all_domains = list(DOMAIN_PROMPTS.keys())
+    overall_align_mean = float(alignment.mean())
+    overall_corr_pct = float(correction_mask.mean() * 100)
+    overall_neut_pct = float(neutral_mask.mean() * 100)
+    overall_trans_pct = float(transform_mask.mean() * 100)
+
+    print(f"  {'Domain':>12} | {'align_mean':>10} | {'correct%':>9} | {'neutral%':>9} | {'transform%':>10}")
+    print(f"  {'-'*12}-+-{'-'*10}-+-{'-'*9}-+-{'-'*9}-+-{'-'*10}")
+    part_c = {}
+    for domain in all_domains:
+        others_mean = np.mean([domain_profiles[d] for d in all_domains if d != domain], axis=0)
+        specificity = domain_profiles[domain] - others_mean
+        top5_idx = np.argsort(-specificity)[:int(n_know * 0.05)]
+        a_mean = float(alignment[top5_idx].mean())
+        c_pct = float(correction_mask[top5_idx].mean() * 100)
+        n_pct = float(neutral_mask[top5_idx].mean() * 100)
+        t_pct = float(transform_mask[top5_idx].mean() * 100)
+        print(f"  {domain:>12} | {a_mean:>10.3f} | {c_pct:>8.1f}% | {n_pct:>8.1f}% | {t_pct:>9.1f}%")
+        part_c[domain] = {'align_mean': a_mean, 'correction_pct': c_pct,
+                          'neutral_pct': n_pct, 'transform_pct': t_pct}
+    print(f"  {'overall':>12} | {overall_align_mean:>10.3f} | {overall_corr_pct:>8.1f}% | "
+          f"{overall_neut_pct:>8.1f}% | {overall_trans_pct:>9.1f}%")
+    part_c['overall'] = {'align_mean': overall_align_mean, 'correction_pct': overall_corr_pct,
+                         'neutral_pct': overall_neut_pct, 'transform_pct': overall_trans_pct}
+    results['part_c'] = part_c
+
+    # === Part D: Q/K Asymmetry Deep Dive ===
+    print(f"\n  Part D: Q/K Asymmetry")
+    q_total = q_layer_act.sum(axis=0)  # [n_qk]
+    k_total = k_layer_act.sum(axis=0)
+    q_ratio = q_total / (q_total + k_total + 1e-8)  # [n_qk], 0=K-only, 1=Q-only
+    q_only_mask = q_ratio > 0.7
+    k_only_mask = q_ratio < 0.3
+
+    print(f"  {'Layer':>5} | {'Q-only act%':>12} | {'K-only act%':>12} | {'mean Q_ratio':>12}")
+    print(f"  {'-'*5}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}")
+    part_d = {}
+    for li in range(n_layers):
+        q_act = float(q_layer_act[li, q_only_mask].mean()) if q_only_mask.sum() > 0 else 0
+        k_act = float(k_layer_act[li, k_only_mask].mean()) if k_only_mask.sum() > 0 else 0
+        qr_layer = float(q_layer_act[li].sum() / (q_layer_act[li].sum() + k_layer_act[li].sum() + 1e-8))
+        print(f"  {li:>5} | {q_act*100:>11.1f}% | {k_act*100:>11.1f}% | {qr_layer:>12.3f}")
+        part_d[f'layer_{li}'] = {'q_only_active': q_act, 'k_only_active': k_act, 'mean_q_ratio': qr_layer}
+
+    q_spread = float((q_layer_act[:, q_only_mask] > 0.01).sum(axis=0).mean()) if q_only_mask.sum() > 0 else 0
+    k_spread = float((k_layer_act[:, k_only_mask] > 0.01).sum(axis=0).mean()) if k_only_mask.sum() > 0 else 0
+    print(f"\n  Q-only neurons ({int(q_only_mask.sum())}): active in avg {q_spread:.1f} layers")
+    print(f"  K-only neurons ({int(k_only_mask.sum())}): active in avg {k_spread:.1f} layers")
+    part_d['q_only_count'] = int(q_only_mask.sum())
+    part_d['k_only_count'] = int(k_only_mask.sum())
+    part_d['q_only_layer_spread'] = q_spread
+    part_d['k_only_layer_spread'] = k_spread
+    results['part_d'] = part_d
+
+    # === Part E: Effective Rank × Alignment ===
+    print(f"\n  Part E: Effective Rank by Alignment Group (layer {mid_layer})")
+    know_write_n = write_n  # already unit-normed
+
+    jit_analysis_full = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+    N_SAMPLES = 50
+    group_ranks = {'correction': [], 'neutral': [], 'transform': [], 'all': []}
+
+    samples_done = 0
+    bi = 0
+    while samples_done < N_SAMPLES and bi * batch_size < n_seqs:
+        batch = jnp.array(tokens[bi * batch_size:(bi + 1) * batch_size], dtype=jnp.int32)
+        _, li = jit_analysis_full(params, batch)
+        gate = np.array(jax.device_get(li['gate_Know_raw'][mid_layer]))  # [B, S, N]
+        B, S, N = gate.shape
+
+        positions = np.random.choice(B * S, size=min(10, N_SAMPLES - samples_done), replace=False)
+        for pos in positions:
+            b_i, s_i = divmod(int(pos), S)
+            g = gate[b_i, s_i]
+            active_idx = np.where(g > 0)[0]
+            if len(active_idx) < 2:
+                continue
+
+            def _eff_rank(idx):
+                if len(idx) < 2:
+                    return 0, len(idx)
+                W = know_write_n[idx]
+                sv = np.linalg.svd(W, compute_uv=False)
+                sv_n = sv / (sv.sum() + 1e-8)
+                ent = -(sv_n * np.log(sv_n + 1e-10)).sum()
+                return float(np.exp(ent)), len(idx)
+
+            # All active
+            er_all, n_all = _eff_rank(active_idx)
+            group_ranks['all'].append((n_all, er_all))
+
+            # By group
+            for gname, gmask in [('correction', correction_mask), ('neutral', neutral_mask), ('transform', transform_mask)]:
+                grp_idx = active_idx[gmask[active_idx]]
+                if len(grp_idx) >= 2:
+                    er, n_g = _eff_rank(grp_idx)
+                    group_ranks[gname].append((n_g, er))
+            samples_done += 1
+        bi += 1
+
+    print(f"  {'Group':>12} | {'active_N':>8} | {'eff_rank':>8} | {'efficiency':>10}")
+    print(f"  {'-'*12}-+-{'-'*8}-+-{'-'*8}-+-{'-'*10}")
+    part_e = {}
+    for gname in ['correction', 'neutral', 'transform', 'all']:
+        data = group_ranks[gname]
+        if data:
+            ns = np.array([d[0] for d in data])
+            ers = np.array([d[1] for d in data])
+            eff = ers / (ns + 1e-8)
+            print(f"  {gname:>12} | {ns.mean():>8.0f} | {ers.mean():>8.1f} | {eff.mean():>10.3f}")
+            part_e[gname] = {'active_N': float(ns.mean()), 'eff_rank': float(ers.mean()),
+                            'efficiency': float(eff.mean())}
+        else:
+            print(f"  {gname:>12} | — | — | —")
+    results['part_e'] = part_e
+
+    _save_json(results, output_dir, 'p8_cross_reference', 'results.json')
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -3000,7 +3279,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -3037,7 +3316,7 @@ def main():
     val_path = args.val_data or cfg.get('data', {}).get('bin_val')
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
                      'act_context', 'layer_role', 'gate_mech', 'comp_expr',
-                     'neuron_cluster']
+                     'neuron_cluster', 'cross_ref']
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         val_tokens = load_val_tokens(val_path)
 
@@ -3167,6 +3446,13 @@ def main():
         else:
             # Part A works without val, Part B skipped
             analyze_neuron_clustering(params, cfg, None, args.output)
+
+    if only is None or 'cross_ref' in only:
+        if val_tokens is not None:
+            analyze_cross_reference(params, cfg, val_tokens, args.output,
+                                   n_batches=_nb or 10, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping cross_ref (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
