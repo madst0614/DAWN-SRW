@@ -4127,6 +4127,55 @@ def analyze_interventions(params, cfg, val_tokens, output_dir,
         exp4_results[name] = {'n_suppress': int(mask.sum()), 'loss': loss, 'delta': delta}
     results['exp4'] = exp4_results
 
+    # === Exp 4b: Qualitative Generation ===
+    print(f"\n  === Exp 4b: Qualitative Generation ===")
+
+    GEN_PROMPTS = [
+        "The cat sat on the",
+        "The meaning of life is",
+        "Scientists discovered that",
+        "In the beginning there was",
+        "The best way to learn is",
+    ]
+    GEN_LEN = 30
+
+    # Build forward functions for each condition
+    gen_conditions = [('baseline', None)]
+    for name, idx in exp4_conditions:
+        mask = np.zeros(n_know, dtype=bool)
+        mask[idx] = True
+        gen_conditions.append((name.replace('suppress ', 'no '), mask))
+
+    gen_results = {}
+    for prompt in GEN_PROMPTS:
+        print(f"\n  Prompt: \"{prompt}\"")
+        input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        gen_results[prompt] = {}
+
+        for cond_name, suppress_mask in gen_conditions:
+            if suppress_mask is None:
+                fwd = build_suppressed_forward(params, model_cfg, {'know': np.zeros(n_know, dtype=bool)})
+            else:
+                fwd = build_suppressed_forward(params, model_cfg, {'know': suppress_mask})
+
+            generated = list(input_ids)
+            for _ in range(GEN_LEN):
+                padded = generated + [0] * (max_seq - len(generated))
+                padded = padded[:max_seq]
+                logits = fwd(jnp.array([padded], dtype=jnp.int32))
+                next_logit = logits[0, len(generated) - 1]
+                next_tok = int(jnp.argmax(next_logit))
+                generated.append(next_tok)
+                if len(generated) >= max_seq:
+                    break
+
+            out_text = tokenizer.decode(generated[len(input_ids):])
+            label = f"[{cond_name}]"
+            print(f"    {label:<22} → {out_text[:80]}")
+            gen_results[prompt][cond_name] = out_text
+
+    results['exp4_generation'] = gen_results
+
     _save_json(results, output_dir, 'p11_interventions', 'results.json')
     return results
 
