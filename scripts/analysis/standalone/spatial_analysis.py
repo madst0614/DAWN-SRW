@@ -3631,6 +3631,251 @@ def analyze_deep_analysis(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# P10: Operation Space Analysis
+# ============================================================
+
+def analyze_operation_space(params, cfg, val_tokens, output_dir,
+                             n_batches=10, batch_size=4):
+    """P10: proj(x) diversity, activation uniqueness, emb geometry, superposition."""
+    print("\n" + "="*60)
+    print("P10: Operation Space Analysis")
+    print("="*60)
+
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_fn = _mod._srw_inference
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    n_know = model_cfg['n_know']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+    d_route = model_cfg.get('d_route', 128)
+    mid_layer = n_layers // 2
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_params = params_jax['neuron_pool']
+    router_params = params_jax['router']
+    emb_matrix = jnp.asarray(params_jax['token_emb']['embedding'])
+    pos_matrix = jnp.asarray(params_jax['pos_emb']['embedding'])
+    know_emb_n = pool_params['know_emb'] / (jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_n = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_n = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+
+    # Alignment for Part E
+    read_v = np.array(pool_params['know_read'])
+    write_v = np.array(pool_params['know_write'])
+    rn = read_v / (np.linalg.norm(read_v, axis=-1, keepdims=True) + 1e-8)
+    wn = write_v / (np.linalg.norm(write_v, axis=-1, keepdims=True) + 1e-8)
+    alignment = (rn * wn).sum(axis=-1)
+    corr_m = alignment < -0.5
+    neut_m = (alignment >= -0.5) & (alignment <= 0.1)
+    trans_m = alignment > 0.1
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+
+    # Accumulators
+    all_h = []  # Part A: proj(x) vectors [128-dim]
+    all_active = []  # Part B: bool [N] per token
+    all_scores_active = []  # Part C: active scores
+    all_scores_inactive = []
+    tau_percentiles = []  # Part C: tau position
+    h_means_per_layer = []  # Part D: per-layer h mean [n_layers, 128]
+    neur_gate_sum = np.zeros(n_know)  # Part E
+    neur_gate_sq_sum = np.zeros(n_know)
+    neur_active_count = np.zeros(n_know)
+
+    print(f"  Running {actual_batches} batches (bs={batch_size})...")
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        B, S = batch.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[batch] + pos_matrix[positions]
+
+        layer_h_means = []
+        for li in range(n_layers):
+            bp = block_params_list[li]
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+            Q = _srw_inference_fn(normed1, h_Q, qk_n, tau_all[:,:,0:1], pool_params['qk_read'], pool_params['qk_write']) * pool_params.get('qk_scale', 1.0)
+            K = _srw_inference_fn(normed1, h_K, qk_n, tau_all[:,:,1:2], pool_params['qk_read'], pool_params['qk_write']) * pool_params.get('qk_scale', 1.0)
+            V = _srw_inference_fn(normed1, h_V, v_n, tau_all[:,:,2:3], pool_params['v_read'], pool_params['v_write']) * pool_params.get('v_scale', 1.0)
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+
+            normed2 = _layer_norm_fn(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            h_k = normed2 @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+            tau_k = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+
+            # Part D: h mean per layer
+            h_k_np = np.array(jax.device_get(h_k))
+            layer_h_means.append(h_k_np.mean(axis=(0, 1)))  # [d_route]
+
+            if li == mid_layer:
+                # Collect Part A/B/C/E data at mid layer
+                h_flat = h_k_np.reshape(-1, h_k_np.shape[-1])  # [B*S, d_route]
+                all_h.append(h_flat[:500])  # Cap per batch
+
+                scores_k = np.array(jax.device_get(h_k @ know_emb_n.T))  # [B,S,N]
+                sf = scores_k.astype(np.float32)
+                s_mean_np = sf.mean(axis=-1, keepdims=True)
+                s_std_np = np.sqrt(np.mean(np.square(sf - s_mean_np), axis=-1, keepdims=True)) + 1e-8
+                tau_np = s_mean_np + np.array(jax.device_get(tau_k)) * s_std_np
+                z_np = (sf - tau_np) / s_std_np
+                gate_np = np.where(z_np > 0, z_np * 0.5 * (1.0 + np.vectorize(math.erf)(z_np * 0.7071067811865476)), 0.0)
+
+                active = gate_np > 0  # [B, S, N]
+                active_flat = active.reshape(-1, n_know)[:500]
+                all_active.append(active_flat)
+
+                # Part C: score distributions
+                for bi in range(min(B, 2)):
+                    for si in range(0, S, 64):  # Sample every 64th position
+                        am = active[bi, si]
+                        sc_tok = sf[bi, si]
+                        if am.sum() > 0:
+                            all_scores_active.extend(sc_tok[am].tolist()[:100])
+                            all_scores_inactive.extend(sc_tok[~am].tolist()[:100])
+                        # Tau percentile
+                        tau_val = tau_np[bi, si, 0]
+                        pct = (sc_tok < tau_val).mean() * 100
+                        tau_percentiles.append(pct)
+
+                # Part E: per-neuron gate stats
+                mask = active.astype(np.float32)
+                neur_gate_sum += (gate_np * mask).sum(axis=(0, 1))
+                neur_gate_sq_sum += ((gate_np ** 2) * mask).sum(axis=(0, 1))
+                neur_active_count += mask.sum(axis=(0, 1))
+
+            know_out = _srw_inference_fn(normed2, h_k, know_emb_n, tau_k,
+                                         pool_params['know_read'], pool_params['know_write']) * pool_params.get('know_scale', 1.0)
+            x = x + know_out
+
+        h_means_per_layer.append(np.array(layer_h_means))  # [n_layers, d_route]
+
+        if (b + 1) % 3 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    results = {}
+
+    # === Part A: proj(x) Diversity ===
+    print(f"\n  === Part A: proj(x) Diversity (layer {mid_layer}, Know pool) ===")
+    h_all_np = np.concatenate(all_h, axis=0)  # [N_samples, d_route]
+    h_norms = np.linalg.norm(h_all_np, axis=-1, keepdims=True) + 1e-8
+    h_normed = h_all_np / h_norms
+    n_samp = min(len(h_normed), 2000)
+    sv = np.linalg.svd(h_normed[:n_samp], compute_uv=False)
+    sv_n = sv / (sv.sum() + 1e-8)
+    eff_rank = float(np.exp(-(sv_n * np.log(sv_n + 1e-10)).sum()))
+    # Pairwise cosine
+    n_pairs = min(1000, n_samp * (n_samp - 1) // 2)
+    idx = np.random.choice(len(h_normed), size=(n_pairs, 2), replace=True)
+    cos_pairs = (h_normed[idx[:, 0]] * h_normed[idx[:, 1]]).sum(axis=-1)
+    # PCA variance
+    h_c = h_normed[:n_samp] - h_normed[:n_samp].mean(axis=0)
+    cov = (h_c.T @ h_c) / n_samp
+    eigvals = np.linalg.eigvalsh(cov)[::-1]
+    var_total = eigvals.sum() + 1e-8
+    pc1 = float(eigvals[0] / var_total * 100)
+    pc5 = float(eigvals[:5].sum() / var_total * 100)
+    pc10 = float(eigvals[:10].sum() / var_total * 100)
+
+    print(f"  Effective rank of proj(x): {eff_rank:.1f} / {d_route}")
+    print(f"  Pairwise cosine: mean={cos_pairs.mean():.4f}, std={cos_pairs.std():.4f}, "
+          f"p5={np.percentile(cos_pairs, 5):.4f}, p95={np.percentile(cos_pairs, 95):.4f}")
+    print(f"  PCA variance: PC1={pc1:.1f}%, PC1-5={pc5:.1f}%, PC1-10={pc10:.1f}%")
+    results['part_a'] = {'eff_rank': eff_rank, 'd_route': d_route,
+                         'cos_mean': float(cos_pairs.mean()), 'cos_std': float(cos_pairs.std()),
+                         'pca_pc1': pc1, 'pca_pc5': pc5, 'pca_pc10': pc10}
+
+    # === Part B: Activation Set Uniqueness ===
+    print(f"\n  === Part B: Activation Set Uniqueness (layer {mid_layer}) ===")
+    act_all = np.concatenate(all_active, axis=0).astype(np.float32)  # [N_samples, N]
+    mean_active = float(act_all.sum(axis=-1).mean())
+    n_act_samp = min(len(act_all), 2000)
+    idx_b = np.random.choice(n_act_samp, size=(500, 2), replace=True)
+    a1 = act_all[idx_b[:, 0]]
+    a2 = act_all[idx_b[:, 1]]
+    intersection = (a1 * a2).sum(axis=-1)
+    union = ((a1 + a2) > 0).astype(np.float32).sum(axis=-1)
+    jaccard = intersection / (union + 1e-8)
+    print(f"  Mean active neurons: {mean_active:.0f}")
+    print(f"  Jaccard similarity: mean={jaccard.mean():.4f}, std={jaccard.std():.4f}")
+    results['part_b'] = {'mean_active': mean_active,
+                         'jaccard_mean': float(jaccard.mean()), 'jaccard_std': float(jaccard.std())}
+
+    # === Part C: emb Space Geometry ===
+    print(f"\n  === Part C: emb Space Geometry (layer {mid_layer}) ===")
+    act_sc = np.array(all_scores_active[:5000]) if all_scores_active else np.array([0.0])
+    inact_sc = np.array(all_scores_inactive[:5000]) if all_scores_inactive else np.array([0.0])
+    separation = (act_sc.mean() - inact_sc.mean()) / (inact_sc.std() + 1e-8)
+    tau_pct_mean = float(np.mean(tau_percentiles)) if tau_percentiles else 0
+    print(f"  Active neuron scores:   mean={act_sc.mean():.4f}, std={act_sc.std():.4f}")
+    print(f"  Inactive neuron scores: mean={inact_sc.mean():.4f}, std={inact_sc.std():.4f}")
+    print(f"  Score separation: {separation:.2f} sigma")
+    print(f"  Tau cuts at: top {100-tau_pct_mean:.1f}% of score distribution")
+    results['part_c'] = {'active_score_mean': float(act_sc.mean()), 'inactive_score_mean': float(inact_sc.mean()),
+                         'separation_sigma': float(separation), 'tau_top_pct': float(100 - tau_pct_mean)}
+
+    # === Part D: Operation Space Trajectory ===
+    print(f"\n  === Part D: Operation Space Trajectory ===")
+    h_layer_means = np.mean(h_means_per_layer, axis=0)  # [n_layers, d_route]
+    h_lm_n = h_layer_means / (np.linalg.norm(h_layer_means, axis=-1, keepdims=True) + 1e-8)
+    print(f"  {'Layer':>5} | {'cos(h,h0)':>9} | {'cos(h,h-1)':>10} | {'‖h‖':>7}")
+    print(f"  {'-'*5}-+-{'-'*9}-+-{'-'*10}-+-{'-'*7}")
+    p10d = {}
+    for li in range(n_layers):
+        cos_h0 = float((h_lm_n[li] * h_lm_n[0]).sum())
+        cos_prev = float((h_lm_n[li] * h_lm_n[li - 1]).sum()) if li > 0 else 0
+        h_norm = float(np.linalg.norm(h_layer_means[li]))
+        prev_s = f"{cos_prev:>10.4f}" if li > 0 else f"{'—':>10}"
+        print(f"  {li:>5} | {cos_h0:>9.4f} | {prev_s} | {h_norm:>7.3f}")
+        p10d[f'layer_{li}'] = {'cos_h0': cos_h0, 'cos_prev': cos_prev, 'h_norm': h_norm}
+    total_drift = float(np.arccos(np.clip((h_lm_n[0] * h_lm_n[-1]).sum(), -1, 1)) * 180 / np.pi)
+    print(f"  Observation direction drifts {total_drift:.1f}° from layer 0 to {n_layers-1}")
+    results['part_d'] = p10d
+    results['part_d']['total_drift_degrees'] = total_drift
+
+    # === Part E: Superposition Quantification ===
+    print(f"\n  === Part E: Superposition Quantification (layer {mid_layer}) ===")
+    safe_count = neur_active_count + 1e-8
+    neur_mean = neur_gate_sum / safe_count
+    neur_var = neur_gate_sq_sum / safe_count - neur_mean ** 2
+    neur_var = np.maximum(neur_var, 0)
+
+    print(f"  {'Group':>12} | {'mean_var':>10} | {'mean_gate':>10} | {'n_neurons':>9}")
+    print(f"  {'-'*12}-+-{'-'*10}-+-{'-'*10}-+-{'-'*9}")
+    for gname, gmask in [('correction', corr_m), ('neutral', neut_m), ('transform', trans_m), ('all', np.ones(n_know, dtype=bool))]:
+        mv = float(neur_var[gmask].mean()) if gmask.sum() > 0 else 0
+        mg = float(neur_mean[gmask].mean()) if gmask.sum() > 0 else 0
+        print(f"  {gname:>12} | {mv:>10.6f} | {mg:>10.6f} | {int(gmask.sum()):>9}")
+    results['part_e'] = {
+        'correction': {'mean_var': float(neur_var[corr_m].mean()), 'mean_gate': float(neur_mean[corr_m].mean())},
+        'neutral': {'mean_var': float(neur_var[neut_m].mean()), 'mean_gate': float(neur_mean[neut_m].mean())},
+        'transform': {'mean_var': float(neur_var[trans_m].mean()), 'mean_gate': float(neur_mean[trans_m].mean())},
+    }
+
+    _save_json(results, output_dir, 'p10_operation_space', 'results.json')
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -3643,7 +3888,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -3680,9 +3925,15 @@ def main():
     val_path = args.val_data or cfg.get('data', {}).get('bin_val')
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
                      'act_context', 'layer_role', 'gate_mech', 'comp_expr',
-                     'neuron_cluster', 'cross_ref', 'deep']
+                     'neuron_cluster', 'cross_ref', 'deep', 'op_space']
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
+        print(f"  Loading val tokens from {val_path}...")
         val_tokens = load_val_tokens(val_path)
+    else:
+        if not val_path:
+            print(f"  No val_data path configured")
+        elif only:
+            print(f"  Val tokens not needed for: {only}")
 
     if only is None or 'val' in only:
         if val_tokens is not None:
@@ -3824,6 +4075,13 @@ def main():
                                  n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping deep (no --val_data)")
+
+    if only is None or 'op_space' in only:
+        if val_tokens is not None:
+            analyze_operation_space(params, cfg, val_tokens, args.output,
+                                   n_batches=_nb or 10, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping op_space (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
