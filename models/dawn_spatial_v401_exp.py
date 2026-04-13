@@ -1670,10 +1670,11 @@ def vectorized_weight_analysis(params, max_sample=2048):
     return results
 
 
-def analysis_forward(params, model_cfg, input_ids):
+def analysis_forward(params, model_cfg, input_ids, mode='full'):
     """Forward returning per-layer gate distributions + output norms.
 
-    For D.1 (Q/K specialization), D.4 (layer balance), D.3/D.5 (knowledge neurons).
+    mode='full': returns gate_raw + gate_norm (R.1, P2, P3 etc.)
+    mode='light': returns gate_norm only (R.2, D6 — half the memory)
 
     Returns:
         logits: [B, S, vocab]
@@ -1682,6 +1683,7 @@ def analysis_forward(params, model_cfg, input_ids):
             gate_K: [n_layers, B, S, n_qk]
             gate_V: [n_layers, B, S, n_v]
             gate_Know: [n_layers, B, S, n_know]
+            (mode='full' only) gate_Q_raw, gate_K_raw, gate_V_raw, gate_Know_raw
             attn_out_norm: [n_layers]
             know_out_norm: [n_layers]
     """
@@ -1706,6 +1708,8 @@ def analysis_forward(params, model_cfg, input_ids):
 
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    _return_raw = (mode == 'full')
 
     def analysis_layer(carry, xs):
         x = carry
@@ -1756,14 +1760,18 @@ def analysis_forward(params, model_cfg, input_ids):
         know_out_norm = jnp.linalg.norm(know_out, axis=-1).mean()
         x = x + know_out
 
-        return x, {
+        info = {
             'gate_Q': gate_Q, 'gate_K': gate_K,
             'gate_V': gate_V, 'gate_Know': gate_Know,
-            'gate_Q_raw': gate_Q_raw, 'gate_K_raw': gate_K_raw,
-            'gate_V_raw': gate_V_raw, 'gate_Know_raw': gate_Know_raw,
             'attn_out_norm': attn_out_norm,
             'know_out_norm': know_out_norm,
         }
+        if _return_raw:
+            info['gate_Q_raw'] = gate_Q_raw
+            info['gate_K_raw'] = gate_K_raw
+            info['gate_V_raw'] = gate_V_raw
+            info['gate_Know_raw'] = gate_Know_raw
+        return x, info
 
     xs = {'params': stacked}
     x, layer_info = jax.lax.scan(analysis_layer, x, xs)

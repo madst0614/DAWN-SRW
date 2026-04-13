@@ -994,7 +994,7 @@ def analyze_layer_balance(params, cfg, val_tokens, output_dir,
     tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     total_batches = min(n_batches, n_seqs // batch_size)
 
-    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids, mode='light'))
 
     attn_norms = np.zeros(n_layers)
     know_norms = np.zeros(n_layers)
@@ -1133,7 +1133,7 @@ def analyze_pos_selectivity(params, cfg, output_dir,
     dataset = _load_ud_ewt(max_sentences)
     print(f"  Loaded {len(dataset)} sentences")
 
-    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids, mode='light'))
 
     # Accumulators: per-neuron activation count, per-(neuron,pos) count
     n_pos = len(UPOS_TAGS)
@@ -1355,7 +1355,7 @@ def analyze_knowledge_neurons(params, cfg, output_dir,
 
     jit_prefill = jax.jit(lambda p, ids: prefill(p, model_cfg, ids))
     jit_decode = jax.jit(lambda p, tok, cK, cV, cL: decode_step(p, model_cfg, tok, cK, cV, cL))
-    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids, mode='light'))
 
     all_queries = PHYSICS_QUERIES + CONTROL_QUERIES
     results = {'physics': [], 'control': []}
