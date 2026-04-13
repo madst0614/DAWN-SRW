@@ -2753,6 +2753,12 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--model_file", default="models.dawn_spatial_v3",
                         help="Model module path (e.g. models.dawn_spatial_v3981_exp)")
+    parser.add_argument("--n_batches", type=int, default=None,
+                        help="Override n_batches for D6/D8/D10/R.1/R.4/P2/P3/P5/P6")
+    parser.add_argument("--r2_sentences", type=int, default=5000,
+                        help="Max sentences for R.2 POS selectivity")
+    parser.add_argument("--p6_samples", type=int, default=100,
+                        help="Token samples for P6 compositional expressiveness")
     args = parser.parse_args()
 
     # Initialize dynamic model module
@@ -2800,9 +2806,15 @@ def main():
     if only is None or 'weights' in only:
         analyze_weights(params, cfg, args.output)
 
+    # Analysis-specific overrides from CLI
+    _nb = args.n_batches  # None = use function default
+    _bs = args.batch_size
+    _abs = min(_bs, 8)  # analysis batch size (capped for memory)
+
     if only is None or 'routing' in only:
         if val_tokens is not None:
-            analyze_routing(params, cfg, val_tokens, args.output)
+            analyze_routing(params, cfg, val_tokens, args.output,
+                           n_batches=_nb or 50, batch_size=_abs)
         else:
             print("\n  Skipping routing (no --val_data)")
 
@@ -2814,13 +2826,15 @@ def main():
     # --- D8/D10: Gate distribution and neuron utilization ---
     if only is None or 'gate_dist' in only:
         if val_tokens is not None:
-            analyze_gate_distribution(params, cfg, val_tokens, args.output)
+            analyze_gate_distribution(params, cfg, val_tokens, args.output,
+                                     n_batches=_nb or 20, batch_size=_abs)
         else:
             print("\n  Skipping gate_dist (no --val_data)")
 
     if only is None or 'utilization' in only:
         if val_tokens is not None:
-            analyze_neuron_utilization(params, cfg, val_tokens, args.output)
+            analyze_neuron_utilization(params, cfg, val_tokens, args.output,
+                                      n_batches=_nb or 20, batch_size=_abs)
         else:
             print("\n  Skipping utilization (no --val_data)")
 
@@ -2833,16 +2847,19 @@ def main():
 
     if only is None or 'r1' in only:
         if val_tokens is not None:
-            analyze_qk_specialization(params, cfg, val_tokens, args.output)
+            analyze_qk_specialization(params, cfg, val_tokens, args.output,
+                                     n_batches=_nb or 50, batch_size=_abs)
         else:
             print("\n  Skipping R.1 (no --val_data)")
 
     if only is None or 'r2' in only:
-        analyze_pos_selectivity(params, cfg, args.output)
+        analyze_pos_selectivity(params, cfg, args.output,
+                               max_sentences=args.r2_sentences, batch_size=min(_abs, 4))
 
     if only is None or 'r4' in only:
         if val_tokens is not None:
-            analyze_layer_balance(params, cfg, val_tokens, args.output)
+            analyze_layer_balance(params, cfg, val_tokens, args.output,
+                                n_batches=_nb or 20, batch_size=_abs)
         else:
             print("\n  Skipping R.4 (no --val_data)")
 
@@ -2860,13 +2877,15 @@ def main():
 
     if only is None or 'act_context' in only:
         if val_tokens is not None:
-            analyze_activation_context(params, cfg, val_tokens, args.output)
+            analyze_activation_context(params, cfg, val_tokens, args.output,
+                                      n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping act_context (no --val_data)")
 
     if only is None or 'layer_role' in only:
         if val_tokens is not None:
-            analyze_layer_role_matrix(params, cfg, val_tokens, args.output)
+            analyze_layer_role_matrix(params, cfg, val_tokens, args.output,
+                                     n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping layer_role (no --val_data)")
 
@@ -2875,13 +2894,15 @@ def main():
 
     if only is None or 'gate_mech' in only:
         if val_tokens is not None:
-            analyze_gate_mechanism(params, cfg, val_tokens, args.output)
+            analyze_gate_mechanism(params, cfg, val_tokens, args.output,
+                                  n_batches=_nb or 5, batch_size=min(_abs, 2))
         else:
             print("\n  Skipping gate_mech (no --val_data)")
 
     if only is None or 'comp_expr' in only:
         if val_tokens is not None:
-            analyze_compositional_expressiveness(params, cfg, val_tokens, args.output)
+            analyze_compositional_expressiveness(params, cfg, val_tokens, args.output,
+                                                n_samples=args.p6_samples, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping comp_expr (no --val_data)")
 
