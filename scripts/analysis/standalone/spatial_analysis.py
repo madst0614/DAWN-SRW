@@ -1265,18 +1265,13 @@ def analyze_pos_selectivity(params, cfg, output_dir,
         # P(neuron active)
         p_neuron = pool_counts[pool_name] / (total_tokens + 1e-8)  # [N]
 
-        selectivity = np.zeros((N, n_pos))
-        for pi in range(n_pos):
-            if pos_token_counts[pi] > 0:
-                # P(neuron active | POS)
-                p_given_pos = pool_pos_counts[pool_name][:, pi] / pos_token_counts[pi]
-                selectivity[:, pi] = p_given_pos / (p_neuron + 1e-8)
-
-        # Mean weight per (neuron, pos) for specialist threshold
-        mean_weight = np.zeros((N, n_pos))
-        for pi in range(n_pos):
-            if pos_token_counts[pi] > 0:
-                mean_weight[:, pi] = pool_pos_counts[pool_name][:, pi] / pos_token_counts[pi]
+        safe_counts = np.where(pos_token_counts > 0, pos_token_counts, 1.0)  # [n_pos]
+        mean_weight = pool_pos_counts[pool_name] / safe_counts[np.newaxis, :]  # [N, n_pos]
+        selectivity = mean_weight / (p_neuron[:, np.newaxis] + 1e-8)  # [N, n_pos]
+        # Zero out columns with no POS tokens
+        no_pos = pos_token_counts == 0
+        selectivity[:, no_pos] = 0.0
+        mean_weight[:, no_pos] = 0.0
 
         # Per-POS top neurons
         top_per_pos = {}
@@ -2075,24 +2070,28 @@ def analyze_activation_context(params, cfg, val_tokens, output_dir,
         # gate_Know_raw: [n_layers, B, S, n_know] — take mid layer only
         gate_mid = np.array(jax.device_get(layer_info['gate_Know_raw'][mid_layer]))  # [B, S, n_know]
 
-        # Per token position: find top-100 neurons
+        # Vectorized: update per-neuron max gate across all positions
         B, S, N = gate_mid.shape
+        gate_flat = gate_mid.reshape(-1, N)  # [B*S, N]
+        neuron_max_gate = np.maximum(neuron_max_gate, gate_flat.max(axis=0))
+
+        # Find top-k neurons per position and collect contexts (vectorized top-k)
         for bi in range(B):
             for si in range(S):
-                g = gate_mid[bi, si]  # [N]
+                g = gate_mid[bi, si]
                 top_idx = np.argpartition(-g, TOP_NEURONS)[:TOP_NEURONS]
-                for ni in top_idx:
-                    gv = float(g[ni])
-                    if gv <= 0:
-                        continue
-                    neuron_max_gate[ni] = max(neuron_max_gate[ni], gv)
-                    # Context window
-                    ctx_start = max(0, si - CONTEXT_WINDOW)
-                    ctx_end = min(S, si + CONTEXT_WINDOW + 1)
-                    ctx_ids = batch_ids[bi, ctx_start:ctx_end].tolist()
+                top_vals = g[top_idx]
+                active = top_vals > 0
+                if not active.any():
+                    continue
+                ctx_start = max(0, si - CONTEXT_WINDOW)
+                ctx_end = min(S, si + CONTEXT_WINDOW + 1)
+                ctx_ids = batch_ids[bi, ctx_start:ctx_end].tolist()
+                for ni, gv in zip(top_idx[active], top_vals[active]):
+                    ni = int(ni)
                     if ni not in neuron_contexts:
                         neuron_contexts[ni] = []
-                    neuron_contexts[ni].append((gv, si, ctx_ids))
+                    neuron_contexts[ni].append((float(gv), si, ctx_ids))
 
         if (b + 1) % 2 == 0:
             print(f"    batch {b+1}/{actual_batches}")
@@ -2165,15 +2164,14 @@ def analyze_layer_role_matrix(params, cfg, val_tokens, output_dir,
         batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
         _, layer_info = jit_analysis(params, batch)
 
-        # gate_Q_raw: [n_layers, B, S, n_qk]
+        # gate_Q_raw: [n_layers, B, S, n_qk] — vectorized over layers
         for pool_key, acc, N in [
             ('gate_Q_raw', q_acc, n_qk), ('gate_K_raw', k_acc, n_qk),
             ('gate_V_raw', v_acc, n_v), ('gate_Know_raw', know_acc, n_know)
         ]:
-            gate = jax.device_get(layer_info[pool_key])  # [L, B, S, N]
-            for li in range(n_layers):
-                act_rate = (np.array(gate[li]) > THRESH).astype(np.float32).mean(axis=(0, 1))
-                acc[li] += act_rate
+            gate = np.array(jax.device_get(layer_info[pool_key]))  # [L, B, S, N]
+            act_rates = (gate > THRESH).astype(np.float32).mean(axis=(1, 2))  # [L, N]
+            acc += act_rates
         del layer_info
 
         if (b + 1) % 2 == 0:
