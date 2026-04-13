@@ -2465,7 +2465,7 @@ def analyze_gate_mechanism(params, cfg, val_tokens, output_dir,
 
             qk_n = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
             v_n = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
-            from models.dawn_spatial_v401_exp import _srw_inference
+            _srw_inference = _mod._srw_inference
             Q = _srw_inference(normed, h_Q, qk_n, tau_all[:,:,0:1], pool_params['qk_read'], pool_params['qk_write'])
             K = _srw_inference(normed, h_K, qk_n, tau_all[:,:,1:2], pool_params['qk_read'], pool_params['qk_write'])
             V = _srw_inference(normed, h_V, v_n, tau_all[:,:,2:3], pool_params['v_read'], pool_params['v_write'])
