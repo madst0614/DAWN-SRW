@@ -1707,7 +1707,7 @@ def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20,
             gate_sq_sum = (abs_gate ** 2).sum(axis=-1)
             eff_n = gate_sum ** 2 / (gate_sq_sum + 1e-8)
             layer_stat = jnp.array([
-                gate_know.mean(), gate_know.std(), gate_know.max(), gate_know.min(),
+                gate_know_raw.mean(), gate_know_raw.std(), gate_know_raw.max(), gate_know_raw.min(),
                 eff_n.mean(),
                 (abs_gate > 1e-6).astype(jnp.float32).mean(),
                 (abs_gate > 1e-5).astype(jnp.float32).mean(),
