@@ -675,22 +675,22 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
         tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-        _, _, gate_Q = _srw_inference_with_gates(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
+        _, gate_Q, _ = _srw_inference_with_gates(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
                                                pool_params['qk_read'], pool_params['qk_write'])
-        _, _, gate_K = _srw_inference_with_gates(normed, h_K, qk_norm, tau_all[:, :, 1:2],
+        _, gate_K, _ = _srw_inference_with_gates(normed, h_K, qk_norm, tau_all[:, :, 1:2],
                                                pool_params['qk_read'], pool_params['qk_write'])
-        _, _, gate_V = _srw_inference_with_gates(normed, h_V, v_norm, tau_all[:, :, 2:3],
+        _, gate_V, _ = _srw_inference_with_gates(normed, h_V, v_norm, tau_all[:, :, 2:3],
                                                pool_params['v_read'], pool_params['v_write'])
 
         normed2 = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
         h_k = normed2 @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
         tau_k = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-        _, _, gate_Know = _srw_inference_with_gates(normed2, h_k, know_norm, tau_k,
+        _, gate_Know, _ = _srw_inference_with_gates(normed2, h_k, know_norm, tau_k,
                                                   pool_params['know_read'], pool_params['know_write'])
 
-        # Compute stats per pool
+        # Compute stats per pool (raw gate: active = gate > 0)
         def gate_stats(g):
-            active = (g > 0.01).astype(jnp.float32)
+            active = (g > 0.0).astype(jnp.float32)
             active_per_token = active.sum(axis=-1).mean()  # avg active neurons per token
             active_ratio = active.mean(axis=(0, 1))  # [N] per-neuron activation rate
             neuron_entropy = -(active_ratio * jnp.log(active_ratio + 1e-10)
@@ -2405,6 +2405,7 @@ def analyze_gate_mechanism(params, cfg, val_tokens, output_dir,
 
     _mod = get_model_module()
     _layer_norm = _mod._layer_norm
+    _srw_inference = _mod._srw_inference
 
     model_cfg = get_model_cfg(cfg)
     max_seq = model_cfg['max_seq_len']
@@ -2463,7 +2464,6 @@ def analyze_gate_mechanism(params, cfg, val_tokens, output_dir,
 
             qk_n = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
             v_n = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
-            _srw_inference = _mod._srw_inference
             Q = _srw_inference(normed, h_Q, qk_n, tau_all[:,:,0:1], pool_params['qk_read'], pool_params['qk_write'])
             K = _srw_inference(normed, h_K, qk_n, tau_all[:,:,1:2], pool_params['qk_read'], pool_params['qk_write'])
             V = _srw_inference(normed, h_V, v_n, tau_all[:,:,2:3], pool_params['v_read'], pool_params['v_write'])
