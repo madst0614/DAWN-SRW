@@ -2735,6 +2735,259 @@ def analyze_compositional_expressiveness(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# P7: Neuron Clustering Analysis
+# ============================================================
+
+def simple_kmeans(X, k, n_iter=20, seed=42):
+    """Simple k-means. X: [N, D] numpy array. Returns labels [N], centers [k, D]."""
+    rng = np.random.RandomState(seed)
+    N, D = X.shape
+    idx = rng.choice(N, k, replace=False)
+    centers = X[idx].copy()
+    for _ in range(n_iter):
+        labels = np.zeros(N, dtype=np.int32)
+        chunk = 5000
+        for s in range(0, N, chunk):
+            e = min(s + chunk, N)
+            dists = np.linalg.norm(X[s:e, None, :] - centers[None, :, :], axis=-1)
+            labels[s:e] = dists.argmin(axis=-1)
+        for j in range(k):
+            mask = labels == j
+            if mask.sum() > 0:
+                centers[j] = X[mask].mean(axis=0)
+    return labels, centers
+
+
+def _purity_score(labels_a, labels_b):
+    """Purity: for each cluster in A, fraction belonging to dominant B cluster."""
+    ka = labels_a.max() + 1
+    total = 0
+    for i in range(ka):
+        mask = labels_a == i
+        if mask.sum() == 0:
+            continue
+        b_labels = labels_b[mask]
+        counts = np.bincount(b_labels, minlength=labels_b.max() + 1)
+        total += counts.max()
+    return total / len(labels_a)
+
+
+def analyze_neuron_clustering(params, cfg, val_tokens, output_dir,
+                               k_clusters=100, n_batches=10, batch_size=4):
+    """P7: Clustering in emb/read/write space + co-activation analysis."""
+    print("\n" + "="*60)
+    print("P7: Neuron Clustering Analysis")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    model_cfg = get_model_cfg(cfg)
+    n_know = model_cfg['n_know']
+    n_layers = model_cfg['n_layers']
+    mid_layer = n_layers // 2
+
+    pool = params['neuron_pool']
+    emb_vecs = np.array(pool['know_emb'])
+    read_vecs = np.array(pool['know_read'])
+    write_vecs = np.array(pool['know_write'])
+    token_emb = np.array(params['token_emb']['embedding'])
+    token_emb_n = token_emb / (np.linalg.norm(token_emb, axis=-1, keepdims=True) + 1e-8)
+
+    # Unit-norm
+    emb_n = emb_vecs / (np.linalg.norm(emb_vecs, axis=-1, keepdims=True) + 1e-8)
+    read_n = read_vecs / (np.linalg.norm(read_vecs, axis=-1, keepdims=True) + 1e-8)
+    write_n = write_vecs / (np.linalg.norm(write_vecs, axis=-1, keepdims=True) + 1e-8)
+
+    # --- Part A: Embedding-space clustering ---
+    print(f"\n  Part A: Embedding-space clustering (Know pool, N={n_know}, k={k_clusters})")
+
+    # PCA to 50 dims
+    def pca_reduce(X, d=50):
+        X_c = X - X.mean(axis=0)
+        cov = (X_c.T @ X_c) / X.shape[0]
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        top = eigvecs[:, -d:][:, ::-1]
+        return X_c @ top
+
+    emb_pca = pca_reduce(emb_n)
+    read_pca = pca_reduce(read_n)
+    write_pca = pca_reduce(write_n)
+
+    print(f"    PCA done (50 dims). Running k-means...")
+    emb_labels, emb_centers = simple_kmeans(emb_pca, k_clusters)
+    read_labels, read_centers = simple_kmeans(read_pca, k_clusters)
+    write_labels, write_centers = simple_kmeans(write_pca, k_clusters)
+
+    def cluster_stats(labels, name):
+        sizes = np.bincount(labels, minlength=k_clusters)
+        print(f"    {name} clusters (k={k_clusters}): mean_size={sizes.mean():.0f}, "
+              f"min={sizes.min()}, max={sizes.max()}")
+        return sizes
+
+    emb_sizes = cluster_stats(emb_labels, "emb")
+    read_sizes = cluster_stats(read_labels, "read")
+    write_sizes = cluster_stats(write_labels, "write")
+
+    # Purity scores
+    er_pur = _purity_score(emb_labels, read_labels)
+    ew_pur = _purity_score(emb_labels, write_labels)
+    rw_pur = _purity_score(read_labels, write_labels)
+    print(f"\n    emb-read purity:  {er_pur:.3f}")
+    print(f"    emb-write purity: {ew_pur:.3f}")
+    print(f"    read-write purity: {rw_pur:.3f}")
+
+    # Top 5 largest emb clusters — interpret via token embedding
+    top5_clusters = np.argsort(-emb_sizes)[:5]
+    cluster_interpretations = {}
+    print(f"\n    Top 5 largest emb clusters:")
+    for ci in top5_clusters:
+        mask = emb_labels == ci
+        mean_read = read_n[mask].mean(axis=0)
+        mean_write = write_n[mask].mean(axis=0)
+        mean_read = mean_read / (np.linalg.norm(mean_read) + 1e-8)
+        mean_write = mean_write / (np.linalg.norm(mean_write) + 1e-8)
+        r_sim = mean_read @ token_emb_n.T
+        w_sim = mean_write @ token_emb_n.T
+        r_top = np.argsort(-r_sim)[:5]
+        w_top = np.argsort(-w_sim)[:5]
+        r_toks = ', '.join(tokenizer.decode([int(t)]) for t in r_top)
+        w_toks = ', '.join(tokenizer.decode([int(t)]) for t in w_top)
+        print(f"      Cluster {ci} (size={int(emb_sizes[ci])}): read→ \"{r_toks}\" | write→ \"{w_toks}\"")
+        cluster_interpretations[int(ci)] = {
+            'size': int(emb_sizes[ci]),
+            'read_top5': [tokenizer.decode([int(t)]) for t in r_top],
+            'write_top5': [tokenizer.decode([int(t)]) for t in w_top],
+        }
+
+    # --- Part B: Co-activation clustering ---
+    cooccur_matrix = None
+    cooccur_results = {}
+    if val_tokens is not None:
+        print(f"\n  Part B: Co-activation (cluster-level, layer {mid_layer})")
+
+        _mod = get_model_module()
+        analysis_forward = _mod.analysis_forward
+        max_seq = model_cfg['max_seq_len']
+
+        n_seqs = len(val_tokens) // max_seq
+        tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+        actual_batches = min(n_batches, n_seqs // batch_size)
+
+        jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+        # Cluster co-occurrence [k, k]
+        cooccur = np.zeros((k_clusters, k_clusters), dtype=np.float64)
+        cluster_active_count = np.zeros(k_clusters, dtype=np.float64)
+        STRONG_THRESH = 0.5
+
+        print(f"    Running {actual_batches} batches (bs={batch_size})...")
+        for b in range(actual_batches):
+            batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+            _, layer_info = jit_analysis(params, batch)
+            gate = np.array(jax.device_get(layer_info['gate_Know_raw'][mid_layer]))  # [B, S, N]
+            B, S, N = gate.shape
+
+            # Per token: which clusters are strongly active?
+            strong = gate > STRONG_THRESH  # [B, S, N]
+            for bi in range(B):
+                for si in range(S):
+                    active_neurons = np.where(strong[bi, si])[0]
+                    if len(active_neurons) < 2:
+                        continue
+                    active_clusters = np.unique(emb_labels[active_neurons])
+                    cluster_active_count[active_clusters] += 1
+                    for ii in range(len(active_clusters)):
+                        for jj in range(ii + 1, len(active_clusters)):
+                            ci, cj = active_clusters[ii], active_clusters[jj]
+                            cooccur[ci, cj] += 1
+                            cooccur[cj, ci] += 1
+            if (b + 1) % 3 == 0:
+                print(f"      batch {b+1}/{actual_batches}")
+
+        # PMI-like normalization
+        pmi = np.zeros_like(cooccur)
+        for i in range(k_clusters):
+            for j in range(i + 1, k_clusters):
+                denom = np.sqrt(cluster_active_count[i] * cluster_active_count[j])
+                if denom > 0:
+                    pmi[i, j] = cooccur[i, j] / denom
+                    pmi[j, i] = pmi[i, j]
+
+        # Top 10 pairs
+        triu_idx = np.triu_indices(k_clusters, k=1)
+        pmi_flat = pmi[triu_idx]
+        top10_idx = np.argsort(-pmi_flat)[:10]
+        print(f"\n    Top 10 cluster pairs by PMI:")
+        top_pairs = []
+        for rank, idx in enumerate(top10_idx):
+            ci, cj = triu_idx[0][idx], triu_idx[1][idx]
+            p = pmi_flat[idx]
+            c = cooccur[ci, cj]
+            print(f"      Cluster {ci} × Cluster {cj}: PMI={p:.4f} (co-occur {int(c)} times)")
+            top_pairs.append({'cluster_i': int(ci), 'cluster_j': int(cj),
+                             'pmi': float(p), 'co_occur': int(c)})
+        cooccur_results = {'top_pairs': top_pairs}
+        cooccur_matrix = pmi.tolist()
+    else:
+        print(f"\n  Part B: Skipped (no val_data)")
+
+    # --- Part C: R.3 neuron cluster membership ---
+    print(f"\n  Part C: R.3 neuron cluster membership")
+    r3_path = os.path.join(output_dir, 'r3_knowledge_neurons', 'results.json')
+    r3_neurons = []
+    r3_cluster_info = []
+    if os.path.exists(r3_path):
+        with open(r3_path) as f:
+            r3_data = json.load(f)
+        # Extract physics neuron IDs from R.3 results
+        for entry in r3_data.get('physics', []):
+            for n in entry.get('top_neurons', []):
+                nid = n.get('neuron_id', n.get('neuron', -1))
+                if nid >= 0 and nid < n_know:
+                    r3_neurons.append(nid)
+        r3_neurons = list(set(r3_neurons))[:20]  # deduplicate, cap at 20
+
+        if r3_neurons:
+            emb_clusters_used = set()
+            read_clusters_used = set()
+            write_clusters_used = set()
+            for ni in r3_neurons:
+                ec = int(emb_labels[ni])
+                rc = int(read_labels[ni])
+                wc = int(write_labels[ni])
+                emb_clusters_used.add(ec)
+                read_clusters_used.add(rc)
+                write_clusters_used.add(wc)
+                print(f"    n{ni} → emb_cluster={ec}, read_cluster={rc}, write_cluster={wc}")
+                r3_cluster_info.append({'neuron': ni, 'emb_cluster': ec,
+                                        'read_cluster': rc, 'write_cluster': wc})
+            print(f"    Physics neurons span {len(emb_clusters_used)} emb clusters, "
+                  f"{len(read_clusters_used)} read clusters, {len(write_clusters_used)} write clusters")
+        else:
+            print(f"    No physics neurons found in R.3 results")
+    else:
+        print(f"    R.3 results not found at {r3_path}, skipping Part C")
+
+    results = {
+        'k_clusters': k_clusters,
+        'n_know': n_know,
+        'emb_cluster_sizes': emb_sizes.tolist(),
+        'read_cluster_sizes': read_sizes.tolist(),
+        'write_cluster_sizes': write_sizes.tolist(),
+        'purity': {'emb_read': float(er_pur), 'emb_write': float(ew_pur), 'read_write': float(rw_pur)},
+        'top_clusters': cluster_interpretations,
+        'coactivation': cooccur_results,
+        'r3_cluster_info': r3_cluster_info,
+    }
+    if cooccur_matrix is not None:
+        results['cooccur_pmi_matrix'] = cooccur_matrix
+
+    _save_json(results, output_dir, 'p7_neuron_clustering', 'results.json')
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -2747,7 +3000,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -2905,6 +3158,14 @@ def main():
                                                 n_samples=args.p6_samples, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping comp_expr (no --val_data)")
+
+    if only is None or 'neuron_cluster' in only:
+        if val_tokens is not None:
+            analyze_neuron_clustering(params, cfg, val_tokens, args.output,
+                                     n_batches=_nb or 10, batch_size=min(_abs, 4))
+        else:
+            # Part A works without val, Part B skipped
+            analyze_neuron_clustering(params, cfg, None, args.output)
 
     print(f"\nDone. Results in {args.output}/")
 
