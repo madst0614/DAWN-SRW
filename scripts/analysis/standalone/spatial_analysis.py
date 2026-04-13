@@ -3267,6 +3267,370 @@ def analyze_cross_reference(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# Deep Analysis: _run_layerwise_analysis + P8/P9 combined
+# ============================================================
+
+def _run_layerwise_analysis(params, model_cfg, input_ids, alignment=None):
+    """Single forward pass collecting all per-layer statistics for P8/P9.
+
+    No JIT — layer loop collects intermediates. Each layer's heavy tensors
+    are reduced to scalars/small arrays before the next layer.
+    Returns: list of dicts (one per layer).
+    """
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_fn = _mod._srw_inference
+
+    B, S = input_ids.shape
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    n_know = model_cfg['n_know']
+
+    pool_params = params['neuron_pool']
+    router_params = params['router']
+
+    emb_matrix = jnp.asarray(params['token_emb']['embedding'])
+    pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
+    know_emb_n = pool_params['know_emb'] / (jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_n = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_n = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_s = pool_params.get('qk_scale', 1.0)
+    v_s_val = pool_params.get('v_scale', 1.0)
+    know_s = pool_params.get('know_scale', 1.0)
+
+    block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
+
+    positions = jnp.arange(S)[jnp.newaxis, :]
+    x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+    x0_mean = x.mean(axis=(0, 1))  # [D]
+
+    # Alignment masks (if provided)
+    corr_mask = alignment < -0.5 if alignment is not None else None
+    neut_mask = (alignment >= -0.5) & (alignment <= 0.1) if alignment is not None else None
+    trans_mask = alignment > 0.1 if alignment is not None else None
+
+    n_bins = min(16, S // 2)
+    bin_size = S // n_bins
+
+    layer_results = []
+    for li in range(n_layers):
+        bp = block_params_list[li]
+        x_pre = x
+
+        # Attention
+        normed1 = _layer_norm_fn(x, jnp.asarray(bp['norm1']['scale']), jnp.asarray(bp['norm1']['bias']))
+        h_all = normed1 @ jnp.asarray(router_params['proj_attn']['kernel']) + jnp.asarray(router_params['proj_attn']['bias'])
+        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        tau_all = normed1 @ jnp.asarray(router_params['tau_attn']['kernel']) + jnp.asarray(router_params['tau_attn']['bias'])
+
+        Q = _srw_inference_fn(normed1, h_Q, qk_n, tau_all[:,:,0:1], pool_params['qk_read'], pool_params['qk_write']) * qk_s
+        K = _srw_inference_fn(normed1, h_K, qk_n, tau_all[:,:,1:2], pool_params['qk_read'], pool_params['qk_write']) * qk_s
+        V = _srw_inference_fn(normed1, h_V, v_n, tau_all[:,:,2:3], pool_params['v_read'], pool_params['v_write']) * v_s_val
+
+        d_head = d_model // n_heads
+        Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+        Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+        Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+        scale = jnp.sqrt(jnp.float32(d_head))
+        sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+        aw = jax.nn.softmax(sc, axis=-1)
+        ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+        attn_out = ao @ jnp.asarray(bp['attn']['expand_O']['kernel'])
+
+        x_after_attn = x + attn_out
+
+        # Know: direct z/phi/gate computation
+        normed2 = _layer_norm_fn(x_after_attn, jnp.asarray(bp['norm2']['scale']), jnp.asarray(bp['norm2']['bias']))
+        h_k = normed2 @ jnp.asarray(router_params['proj_know']['kernel']) + jnp.asarray(router_params['proj_know']['bias'])
+        tau_k = normed2 @ jnp.asarray(router_params['tau_know']['kernel']) + jnp.asarray(router_params['tau_know']['bias'])
+
+        scores_k = h_k @ know_emb_n.T
+        sf = scores_k.astype(jnp.float32)
+        s_mean = sf.mean(axis=-1, keepdims=True)
+        s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
+        tau = s_mean + tau_k * s_std
+        raw = scores_k - tau.astype(scores_k.dtype)
+        z = raw.astype(jnp.float32) / s_std
+        phi = 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476))
+        gate = jnp.where(z > 0, z * phi, 0.0)
+
+        know_out = _srw_inference_fn(normed2, h_k, know_emb_n, tau_k,
+                                     pool_params['know_read'], pool_params['know_write']) * know_s
+        x = x_after_attn + know_out
+
+        # === Collect stats (all JAX, device_get later) ===
+        # P9A: attn-know interaction
+        a_n = jnp.linalg.norm(attn_out, axis=-1, keepdims=True) + 1e-8
+        k_n = jnp.linalg.norm(know_out, axis=-1, keepdims=True) + 1e-8
+        a_dir = attn_out / a_n
+        cos_ak = (attn_out * know_out).sum(axis=-1) / (a_n.squeeze(-1) * k_n.squeeze(-1))
+        proj_s = (know_out * a_dir).sum(axis=-1, keepdims=True)
+        k_par = proj_s * a_dir
+        par_frac = jnp.linalg.norm(k_par, axis=-1) / k_n.squeeze(-1)
+
+        # P9B: residual trajectory
+        x_mean = x.mean(axis=(0, 1))
+        cos_x0 = jnp.dot(x_mean, x0_mean) / (jnp.linalg.norm(x_mean) * jnp.linalg.norm(x0_mean) + 1e-8)
+
+        # P9C: LN vs Know
+        ln_delta = normed2 - x_after_attn
+        ln_k_cos = (ln_delta * know_out).sum(axis=-1) / (jnp.linalg.norm(ln_delta, axis=-1) * jnp.linalg.norm(know_out, axis=-1) + 1e-8)
+
+        # P9D: position bins
+        g_active = (gate > 0).astype(jnp.float32).sum(axis=-1)  # [B, S]
+        g_sum = gate.sum(axis=-1)
+        usable = n_bins * bin_size
+        pos_active = g_active[:, :usable].reshape(B, n_bins, bin_size).mean(axis=(0, 2))
+        pos_gsum = g_sum[:, :usable].reshape(B, n_bins, bin_size).mean(axis=(0, 2))
+        pos_cos = cos_ak[:, :usable].reshape(B, n_bins, bin_size).mean(axis=(0, 2))
+
+        # P8A/B: per-neuron stats
+        neur_active = (gate > 0).astype(jnp.float32).mean(axis=(0, 1))  # [N]
+        neur_gate = gate.mean(axis=(0, 1))
+        neur_max = gate.max(axis=(0, 1))
+
+        r = {
+            'cos_ak': cos_ak.mean(), 'mag_ratio': (k_n / a_n).mean(),
+            'par_frac': par_frac.mean(), 'proj_sign': proj_s.mean(),
+            'a_norm': a_n.mean(), 'k_norm': k_n.mean(),
+            'x_norm': jnp.linalg.norm(x, axis=-1).mean(),
+            'dx': jnp.linalg.norm(x - x_pre, axis=-1).mean(),
+            'cos_x0': cos_x0,
+            'ln_k_cos': ln_k_cos.mean(),
+            'ln_dn': jnp.linalg.norm(ln_delta, axis=-1).mean(),
+            'k_dn': jnp.linalg.norm(know_out, axis=-1).mean(),
+            'pos_active': pos_active, 'pos_gsum': pos_gsum, 'pos_cos': pos_cos,
+            'neur_active': neur_active, 'neur_gate': neur_gate, 'neur_max': neur_max,
+        }
+        layer_results.append(r)
+
+    return layer_results
+
+
+def analyze_deep_analysis(params, cfg, val_tokens, output_dir,
+                           n_batches=10, batch_size=4):
+    """P8 (cross-ref) + P9 (fundamental) in one forward pass."""
+    print("\n" + "="*60)
+    print("Deep Analysis (P8 Cross-Reference + P9 Fundamental)")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    n_know = model_cfg['n_know']
+    n_qk = model_cfg['n_qk']
+    n_layers = model_cfg['n_layers']
+    d_model = model_cfg['d_model']
+    mid_layer = n_layers // 2
+
+    # Alignment
+    pool = params['neuron_pool']
+    read_v = np.array(pool['know_read'])
+    write_v = np.array(pool['know_write'])
+    r_n = read_v / (np.linalg.norm(read_v, axis=-1, keepdims=True) + 1e-8)
+    w_n = write_v / (np.linalg.norm(write_v, axis=-1, keepdims=True) + 1e-8)
+    alignment = (r_n * w_n).sum(axis=-1)  # [n_know]
+    corr_m = alignment < -0.5
+    neut_m = (alignment >= -0.5) & (alignment <= 0.1)
+    trans_m = alignment > 0.1
+    print(f"  Alignment groups: correction={corr_m.sum()}, neutral={neut_m.sum()}, transform={trans_m.sum()}")
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+
+    # Accumulators
+    acc = {f'l{li}': {} for li in range(n_layers)}
+    scalar_keys = ['cos_ak', 'mag_ratio', 'par_frac', 'proj_sign', 'a_norm', 'k_norm',
+                   'x_norm', 'dx', 'cos_x0', 'ln_k_cos', 'ln_dn', 'k_dn']
+    for li in range(n_layers):
+        for k in scalar_keys:
+            acc[f'l{li}'][k] = 0.0
+        acc[f'l{li}']['pos_active'] = np.zeros(min(16, max_seq // 2))
+        acc[f'l{li}']['pos_gsum'] = np.zeros(min(16, max_seq // 2))
+        acc[f'l{li}']['pos_cos'] = np.zeros(min(16, max_seq // 2))
+        acc[f'l{li}']['neur_active'] = np.zeros(n_know)
+        acc[f'l{li}']['neur_gate'] = np.zeros(n_know)
+        acc[f'l{li}']['neur_max'] = np.zeros(n_know)
+
+    print(f"  Running {actual_batches} batches (bs={batch_size})...")
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        results = _run_layerwise_analysis(params_jax, model_cfg, batch, alignment)
+        for li, r in enumerate(results):
+            d = jax.device_get(r)
+            for k in scalar_keys:
+                acc[f'l{li}'][k] += float(d[k])
+            acc[f'l{li}']['pos_active'] += np.array(d['pos_active'])
+            acc[f'l{li}']['pos_gsum'] += np.array(d['pos_gsum'])
+            acc[f'l{li}']['pos_cos'] += np.array(d['pos_cos'])
+            acc[f'l{li}']['neur_active'] += np.array(d['neur_active'])
+            acc[f'l{li}']['neur_gate'] += np.array(d['neur_gate'])
+            acc[f'l{li}']['neur_max'] = np.maximum(acc[f'l{li}']['neur_max'], np.array(d['neur_max']))
+        if (b + 1) % 3 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # Average
+    for li in range(n_layers):
+        for k in scalar_keys:
+            acc[f'l{li}'][k] /= actual_batches
+        acc[f'l{li}']['pos_active'] /= actual_batches
+        acc[f'l{li}']['pos_gsum'] /= actual_batches
+        acc[f'l{li}']['pos_cos'] /= actual_batches
+        acc[f'l{li}']['neur_active'] /= actual_batches
+        acc[f'l{li}']['neur_gate'] /= actual_batches
+
+    # ===================== P9: FUNDAMENTAL ANALYSIS =====================
+
+    p9 = {}
+
+    # P9A: Attention-Know Interaction
+    print(f"\n  === P9A: Attention-Know Interaction ===")
+    print(f"  {'Layer':>5} | {'cos(a,k)':>9} | {'‖k‖/‖a‖':>9} | {'parallel%':>9} | {'perp%':>7} | {'proj_sign':>9}")
+    print(f"  {'-'*5}-+-{'-'*9}-+-{'-'*9}-+-{'-'*9}-+-{'-'*7}-+-{'-'*9}")
+    p9a = {}
+    for li in range(n_layers):
+        d = acc[f'l{li}']
+        perp = max(0, 1.0 - d['par_frac'])
+        print(f"  {li:>5} | {d['cos_ak']:>9.4f} | {d['mag_ratio']:>9.3f} | {d['par_frac']*100:>8.1f}% | {perp*100:>6.1f}% | {d['proj_sign']:>9.4f}")
+        p9a[f'layer_{li}'] = {k: d[k] for k in ['cos_ak', 'mag_ratio', 'par_frac', 'proj_sign']}
+    p9['part_a'] = p9a
+
+    # P9B: Residual Stream Trajectory
+    print(f"\n  === P9B: Residual Stream Trajectory ===")
+    print(f"  {'Layer':>5} | {'‖x‖':>7} | {'Δx/‖x‖':>8} | {'cos(x,x0)':>10} | {'attn_‖‖':>8} | {'know_‖‖':>8}")
+    print(f"  {'-'*5}-+-{'-'*7}-+-{'-'*8}-+-{'-'*10}-+-{'-'*8}-+-{'-'*8}")
+    p9b = {}
+    for li in range(n_layers):
+        d = acc[f'l{li}']
+        dx_ratio = d['dx'] / (d['x_norm'] + 1e-8)
+        print(f"  {li:>5} | {d['x_norm']:>7.3f} | {dx_ratio:>8.4f} | {d['cos_x0']:>10.4f} | {d['a_norm']:>8.4f} | {d['k_norm']:>8.4f}")
+        p9b[f'layer_{li}'] = {'x_norm': d['x_norm'], 'dx_ratio': dx_ratio, 'cos_x0': d['cos_x0'],
+                              'attn_norm': d['a_norm'], 'know_norm': d['k_norm']}
+    p9['part_b'] = p9b
+
+    # P9C: LayerNorm vs Know
+    print(f"\n  === P9C: LayerNorm vs Know ===")
+    print(f"  {'Layer':>5} | {'LN_‖Δ‖':>8} | {'Know_‖Δ‖':>9} | {'LN-Know cos':>11}")
+    print(f"  {'-'*5}-+-{'-'*8}-+-{'-'*9}-+-{'-'*11}")
+    p9c = {}
+    for li in range(n_layers):
+        d = acc[f'l{li}']
+        print(f"  {li:>5} | {d['ln_dn']:>8.4f} | {d['k_dn']:>9.4f} | {d['ln_k_cos']:>11.4f}")
+        p9c[f'layer_{li}'] = {'ln_delta_norm': d['ln_dn'], 'know_delta_norm': d['k_dn'], 'ln_know_cos': d['ln_k_cos']}
+    p9['part_c'] = p9c
+
+    # P9D: Position-wise Pattern (mid layer)
+    print(f"\n  === P9D: Position-wise Pattern (layer {mid_layer}) ===")
+    d_mid = acc[f'l{mid_layer}']
+    n_bins = len(d_mid['pos_active'])
+    bin_sz = max_seq // n_bins
+    print(f"  {'Position':>10} | {'active_N':>8} | {'gate_sum':>9} | {'attn-know cos':>13}")
+    print(f"  {'-'*10}-+-{'-'*8}-+-{'-'*9}-+-{'-'*13}")
+    p9d = {}
+    for bi in range(n_bins):
+        s, e = bi * bin_sz, (bi + 1) * bin_sz
+        pa = d_mid['pos_active'][bi]
+        pg = d_mid['pos_gsum'][bi]
+        pc = d_mid['pos_cos'][bi]
+        print(f"  {s:>4}-{e-1:<4} | {pa:>8.0f} | {pg:>9.1f} | {pc:>13.4f}")
+        p9d[f'{s}_{e-1}'] = {'active_N': float(pa), 'gate_sum': float(pg), 'cos_ak': float(pc)}
+    p9['part_d'] = p9d
+
+    _save_json(p9, output_dir, 'p9_fundamental', 'results.json')
+
+    # ===================== P8: CROSS-REFERENCE =====================
+
+    p8 = {}
+
+    # P8A: Alignment × Layer
+    print(f"\n  === P8A: Alignment × Layer Activation ===")
+    print(f"  {'Layer':>5} | {'correction':>10} | {'neutral':>9} | {'transform':>9}")
+    print(f"  {'-'*5}-+-{'-'*10}-+-{'-'*9}-+-{'-'*9}")
+    p8a = {}
+    for li in range(n_layers):
+        na = acc[f'l{li}']['neur_active']
+        cr = float(na[corr_m].mean()) if corr_m.sum() > 0 else 0
+        nr = float(na[neut_m].mean()) if neut_m.sum() > 0 else 0
+        tr = float(na[trans_m].mean()) if trans_m.sum() > 0 else 0
+        print(f"  {li:>5} | {cr*100:>9.1f}% | {nr*100:>8.1f}% | {tr*100:>8.1f}%")
+        p8a[f'layer_{li}'] = {'correction': cr, 'neutral': nr, 'transform': tr}
+    p8['part_a'] = p8a
+
+    # P8B: Alignment × Gate Strength
+    print(f"\n  === P8B: Alignment × Gate Strength (layer {mid_layer}) ===")
+    mg = acc[f'l{mid_layer}']['neur_gate']
+    mx = acc[f'l{mid_layer}']['neur_max']
+    corr_mg = float(mg[corr_m].mean()) if corr_m.sum() > 0 else 0
+    neut_mg = float(mg[neut_m].mean()) if neut_m.sum() > 0 else 0
+    trans_mg = float(mg[trans_m].mean()) if trans_m.sum() > 0 else 0
+    corr_mx = float(mx[corr_m].mean()) if corr_m.sum() > 0 else 0
+    neut_mx = float(mx[neut_m].mean()) if neut_m.sum() > 0 else 0
+    trans_mx = float(mx[trans_m].mean()) if trans_m.sum() > 0 else 0
+    r_corr = float(np.corrcoef(alignment, mg)[0, 1]) if n_know > 1 else 0
+    print(f"  Correlation(alignment, mean_gate): r={r_corr:.4f}")
+    print(f"  {'Group':>12} | {'mean_gate':>10} | {'max_gate':>10}")
+    print(f"  {'-'*12}-+-{'-'*10}-+-{'-'*10}")
+    print(f"  {'correction':>12} | {corr_mg:>10.6f} | {corr_mx:>10.4f}")
+    print(f"  {'neutral':>12} | {neut_mg:>10.6f} | {neut_mx:>10.4f}")
+    print(f"  {'transform':>12} | {trans_mg:>10.6f} | {trans_mx:>10.4f}")
+    p8['part_b'] = {'correlation': r_corr,
+                    'correction': {'mean_gate': corr_mg, 'max_gate': corr_mx},
+                    'neutral': {'mean_gate': neut_mg, 'max_gate': neut_mx},
+                    'transform': {'mean_gate': trans_mg, 'max_gate': trans_mx}}
+
+    # P8C: Domain neurons' alignment
+    print(f"\n  === P8C: Domain Neurons' Alignment ===")
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
+    jit_light = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids, mode='light'))
+    domain_profiles = {}
+    for domain, prompts in DOMAIN_PROMPTS.items():
+        da = np.zeros(n_know, dtype=np.float64)
+        for prompt in prompts:
+            ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+            ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+            ids_pad[0, :ids.shape[1]] = ids
+            _, li = jit_light(params_jax, jnp.array(ids_pad, dtype=jnp.int32))
+            da += np.array(jax.device_get(li['gate_Know'])).mean(axis=(0, 1, 2))
+        domain_profiles[domain] = da / len(prompts)
+
+    all_domains = list(DOMAIN_PROMPTS.keys())
+    overall_am = float(alignment.mean())
+    overall_cp = float(corr_m.mean() * 100)
+    overall_np = float(neut_m.mean() * 100)
+    overall_tp = float(trans_m.mean() * 100)
+
+    print(f"  {'Domain':>12} | {'align_mean':>10} | {'correct%':>9} | {'neutral%':>9} | {'transform%':>10}")
+    print(f"  {'-'*12}-+-{'-'*10}-+-{'-'*9}-+-{'-'*9}-+-{'-'*10}")
+    p8c = {}
+    for domain in all_domains:
+        om = np.mean([domain_profiles[d] for d in all_domains if d != domain], axis=0)
+        spec = domain_profiles[domain] - om
+        top5 = np.argsort(-spec)[:int(n_know * 0.05)]
+        am = float(alignment[top5].mean())
+        cp = float(corr_m[top5].mean() * 100)
+        np_ = float(neut_m[top5].mean() * 100)
+        tp = float(trans_m[top5].mean() * 100)
+        print(f"  {domain:>12} | {am:>10.3f} | {cp:>8.1f}% | {np_:>8.1f}% | {tp:>9.1f}%")
+        p8c[domain] = {'align_mean': am, 'correction_pct': cp, 'neutral_pct': np_, 'transform_pct': tp}
+    print(f"  {'overall':>12} | {overall_am:>10.3f} | {overall_cp:>8.1f}% | {overall_np:>8.1f}% | {overall_tp:>9.1f}%")
+    p8c['overall'] = {'align_mean': overall_am, 'correction_pct': overall_cp,
+                      'neutral_pct': overall_np, 'transform_pct': overall_tp}
+    p8['part_c'] = p8c
+
+    _save_json(p8, output_dir, 'p8_cross_reference_v2', 'results.json')
+    print(f"\n  Deep analysis complete.")
+    return p8, p9
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -3279,7 +3643,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -3316,7 +3680,7 @@ def main():
     val_path = args.val_data or cfg.get('data', {}).get('bin_val')
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
                      'act_context', 'layer_role', 'gate_mech', 'comp_expr',
-                     'neuron_cluster', 'cross_ref']
+                     'neuron_cluster', 'cross_ref', 'deep']
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         val_tokens = load_val_tokens(val_path)
 
@@ -3453,6 +3817,13 @@ def main():
                                    n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping cross_ref (no --val_data)")
+
+    if only is None or 'deep' in only:
+        if val_tokens is not None:
+            analyze_deep_analysis(params, cfg, val_tokens, args.output,
+                                 n_batches=_nb or 10, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping deep (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
