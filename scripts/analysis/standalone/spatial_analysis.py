@@ -1108,7 +1108,7 @@ def _load_nltk_fallback(max_sentences=5000):
 
 
 def analyze_pos_selectivity(params, cfg, output_dir,
-                             max_sentences=5000, batch_size=8):
+                             max_sentences=5000, batch_size=4):
     """POS selectivity: same as v17.1 D.2.
 
     selectivity[neuron, pos] = P(neuron active | POS) / P(neuron active)
@@ -1133,17 +1133,17 @@ def analyze_pos_selectivity(params, cfg, output_dir,
     dataset = _load_ud_ewt(max_sentences)
     print(f"  Loaded {len(dataset)} sentences")
 
-    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids, mode='light'))
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids, mode='full'))
 
     # Accumulators: per-neuron activation count, per-(neuron,pos) count
     n_pos = len(UPOS_TAGS)
     pos_to_idx = {p: i for i, p in enumerate(UPOS_TAGS)}
 
-    # For each pool
+    # For each pool — use raw gate (before normalization) for accurate activation
     pools = {
-        'QK': {'size': n_qk, 'gate_key': 'gate_Q'},  # Use Q gate for QK pool
-        'V': {'size': n_v, 'gate_key': 'gate_V'},
-        'Know': {'size': n_know, 'gate_key': 'gate_Know'},
+        'QK': {'size': n_qk, 'gate_key': 'gate_Q_raw'},
+        'V': {'size': n_v, 'gate_key': 'gate_V_raw'},
+        'Know': {'size': n_know, 'gate_key': 'gate_Know_raw'},
     }
     pool_counts = {}
     pool_pos_counts = {}
@@ -1227,7 +1227,7 @@ def analyze_pos_selectivity(params, cfg, output_dir,
             for pool_name, pinfo in pools.items():
                 gate = np.array(jax.device_get(layer_info[pinfo['gate_key']]))
                 gate_avg = gate.mean(axis=0)  # [B, S, N]
-                active = (gate_avg > 0.01).astype(np.float32)  # [B, S, N]
+                active = (gate_avg > 0.0).astype(np.float32)  # [B, S, N]
                 N = pinfo['size']
 
                 # Zero out padding
