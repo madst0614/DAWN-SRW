@@ -1,6 +1,8 @@
 # DAWN Read-Write v4.0.2 -- direct read routing, Q/K split
-# No emb, no proj. score = x @ read_unit.T
-# Separate Q/K pools. Separate tau per role.
+# No emb, no proj. score = normed_x @ read_unit.T
+# Separate Q/K pools (n_q=790, n_k=790). Separate tau per role.
+# GELU gate (z × Φ(z)), den floor=1.0
+# learnable per-pool scale (init=√d_model, WD excluded)
 
 seed: 1
 
@@ -32,6 +34,7 @@ training:
   lr: 0.00065
   weight_decay: 0.1
   warmup_ratio: 0.06
+  orthogonality_weight: 0.01
   diversity_weight: 0.1
   load_balance_weight: 0.1
   n_chunks_q: 1
