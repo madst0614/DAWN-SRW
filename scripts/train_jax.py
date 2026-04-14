@@ -2539,10 +2539,18 @@ def main():
                             'n_know': cfg['model'].get('n_know', 25200),
                         }
                         _params_cpu = _gather_for_save(params)
+                        # Collect real val data for dead neuron diagnosis
+                        val_loader.reset()
+                        _diag_batches = []
+                        for _di, (_dids, _dmask) in enumerate(val_loader):
+                            _diag_batches.append(np.array(_dids))
+                            if len(_diag_batches) * _dids.shape[0] >= 128:
+                                break
+                        _diag_tokens = jnp.array(np.concatenate(_diag_batches, axis=0)[:128])
                         _dead = jax.device_get(_diag_dead(
-                            _params_cpu, _diag_cfg,
-                            jnp.ones((128, cfg['model']['max_seq_len']), dtype=jnp.int32),
+                            _params_cpu, _diag_cfg, _diag_tokens,
                             n_batches=4, batch_size=32))
+                        del _diag_tokens
                         for _pn in ('Q', 'K', 'V', 'Know'):
                             _ps = _dead[_pn]
                             log_message(
