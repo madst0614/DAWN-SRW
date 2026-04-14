@@ -634,15 +634,25 @@ def compute_spatial_diversity_loss(params):
     def _get_pool_arrays(pool):
         """Return list of neuron arrays from pool params."""
         arrays = []
+        # v4.0.2 (rw): separate q/k pools, read/write only
+        for prefix in ('q', 'k', 'v', 'know'):
+            if f'{prefix}_read' in pool:
+                arrays.append(pool[f'{prefix}_read'])
+                arrays.append(pool[f'{prefix}_write'])
+        if arrays:
+            return arrays
+        # v3/v4.0.1: shared qk pool
         for prefix in ('qk', 'v', 'know'):
             if f'{prefix}_neurons' in pool:
                 arrays.append(pool[f'{prefix}_neurons'])
             else:
-                # v3.2: emb + w
                 if f'{prefix}_emb' in pool:
                     arrays.append(pool[f'{prefix}_emb'])
                 if f'{prefix}_w' in pool:
                     arrays.append(pool[f'{prefix}_w'])
+                if f'{prefix}_read' in pool:
+                    arrays.append(pool[f'{prefix}_read'])
+                    arrays.append(pool[f'{prefix}_write'])
         return arrays
 
     pool_arrays = _get_pool_arrays(pool)
