@@ -468,8 +468,18 @@ def _file_exists(path):
 
 
 def _list_files(directory, pattern="*.flax"):
-    """List files in a directory (local or GCS)."""
+    """List files in a directory (local or GCS), sorted by step number."""
+    import re
     dir_str = str(directory)
+
+    def _sort_key(path):
+        """Extract step number for numeric sort. best_model sorts last."""
+        name = path.rsplit('/', 1)[-1] if '/' in path else path
+        if 'best_model' in name:
+            return float('inf')
+        m = re.search(r'(\d+)', name)
+        return int(m.group(1)) if m else 0
+
     if _is_gcs(dir_str):
         try:
             import gcsfs
@@ -477,7 +487,7 @@ def _list_files(directory, pattern="*.flax"):
             if not dir_str.endswith("/"):
                 dir_str += "/"
             files = fs.glob(dir_str + pattern)
-            return sorted(["gs://" + f for f in files])
+            return sorted(["gs://" + f for f in files], key=_sort_key)
         except ImportError:
             pass
         try:
@@ -485,10 +495,10 @@ def _list_files(directory, pattern="*.flax"):
             if not dir_str.endswith("/"):
                 dir_str += "/"
             files = tf.io.gfile.glob(dir_str + pattern)
-            return sorted(files)
+            return sorted(files, key=_sort_key)
         except ImportError:
             return []
-    return sorted(str(f) for f in Path(dir_str).glob(pattern))
+    return sorted((str(f) for f in Path(dir_str).glob(pattern)), key=_sort_key)
 
 
 def _makedirs(path):
