@@ -4982,6 +4982,146 @@ def analyze_phase_dynamics(output_dir, dawn_log=None, baseline_log=None):
 
 
 # ============================================================
+# §8.4 Drift-Prediction Alignment
+# ============================================================
+
+def analyze_drift_alignment(params, cfg, val_tokens, output_dir,
+                             n_batches=20, batch_size=8):
+    """§8.4: per-layer early-exit logits → target rank & cos(x_L, emb[target])."""
+    print("\n" + "="*60)
+    print("§8.4: Drift-Prediction Alignment")
+    print("="*60)
+
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_fn = _mod._srw_inference
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+    router_p = params_jax['router']
+    emb_matrix = params_jax['token_emb']['embedding']
+    pos_matrix = params_jax['pos_emb']['embedding']
+    norm_p = params_jax['norm']  # final layer norm
+
+    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_s = pool_p.get('qk_scale', 1.0)
+    v_s_val = pool_p.get('v_scale', 1.0)
+    know_s = pool_p.get('know_scale', 1.0)
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+    print(f"  batches={actual_batches}, batch_size={batch_size}")
+
+    # 누적기: per layer
+    layer_acc = [{
+        'cos_emb_target': 0.0, 'early_exit_top1_acc': 0.0,
+        'early_exit_top5_acc': 0.0, 'mean_target_rank': 0.0,
+    } for _ in range(n_layers)]
+
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        B, S = batch.shape
+        targets = batch[:, 1:]  # [B, S-1]
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[batch] + pos_matrix[positions]
+
+        for li in range(n_layers):
+            bp = block_params_list[li]
+
+            # Attention
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+
+            Q = _srw_inference_fn(normed1, h_Q, qk_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            K = _srw_inference_fn(normed1, h_K, qk_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            V = _srw_inference_fn(normed1, h_V, v_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
+
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            scale_v = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale_v
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x_after_attn = x + attn_out
+
+            # Know
+            normed2 = _layer_norm_fn(x_after_attn, bp['norm2']['scale'], bp['norm2']['bias'])
+            know_out = _srw_inference_fn(normed2,
+                normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias'],
+                know_emb_n,
+                normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias'],
+                pool_p['know_read'], pool_p['know_write']) * know_s
+            x = x_after_attn + know_out
+
+            # Early-exit: LN → logits
+            x_normed = _layer_norm_fn(x, norm_p['scale'], norm_p['bias'])
+            logits = x_normed @ emb_matrix.T  # [B, S, vocab]
+            # 예측 위치: position 0..S-2 → target 1..S-1
+            pred_logits = logits[:, :-1, :]  # [B, S-1, vocab]
+
+            # top-1, top-5 accuracy
+            top5 = jax.lax.top_k(pred_logits, 5)[1]  # [B, S-1, 5]
+            top1_hit = (top5[:, :, 0] == targets).astype(jnp.float32).mean()
+            top5_hit = (top5 == targets[:, :, jnp.newaxis]).any(axis=-1).astype(jnp.float32).mean()
+
+            # target rank
+            target_logit = jnp.take_along_axis(pred_logits, targets[:, :, jnp.newaxis], axis=-1).squeeze(-1)
+            rank = (pred_logits > target_logit[:, :, jnp.newaxis]).sum(axis=-1).astype(jnp.float32).mean()
+
+            # cos(x_L_normed, emb[target])
+            target_emb = emb_matrix[targets]  # [B, S-1, d]
+            x_pred = x_normed[:, :-1, :]  # [B, S-1, d]
+            cos_et = (x_pred * target_emb).sum(-1) / (
+                jnp.linalg.norm(x_pred, axis=-1) * jnp.linalg.norm(target_emb, axis=-1) + 1e-8)
+
+            vals = jax.device_get({
+                'top1': top1_hit, 'top5': top5_hit,
+                'rank': rank, 'cos_et': cos_et.mean(),
+            })
+            layer_acc[li]['early_exit_top1_acc'] += float(vals['top1'])
+            layer_acc[li]['early_exit_top5_acc'] += float(vals['top5'])
+            layer_acc[li]['mean_target_rank'] += float(vals['rank'])
+            layer_acc[li]['cos_emb_target'] += float(vals['cos_et'])
+
+        if (b + 1) % 5 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # 평균
+    for li in range(n_layers):
+        for k in layer_acc[li]:
+            layer_acc[li][k] /= actual_batches
+
+    results = {
+        'per_layer': {f'layer_{li}': layer_acc[li] for li in range(n_layers)},
+        'n_batches': actual_batches,
+    }
+    _save_json(results, output_dir, 'drift_alignment', 'layer_alignment.json')
+    print(f"  Done: drift_alignment")
+    for li in [0, n_layers//4, n_layers//2, 3*n_layers//4, n_layers-1]:
+        d = layer_acc[li]
+        print(f"    L{li}: top1={d['early_exit_top1_acc']:.4f}, rank={d['mean_target_rank']:.1f}, cos={d['cos_emb_target']:.4f}")
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -4994,7 +5134,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -5051,7 +5191,7 @@ def main():
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
                      'act_context', 'layer_role', 'gate_mech', 'comp_expr',
                      'neuron_cluster', 'cross_ref', 'deep', 'op_space', 'intervene', 'compose',
-                     'resid_dyn']
+                     'resid_dyn', 'drift']
     print(f"  DEBUG: val_path={val_path}, only={only}, check={any(k in (only or set()) for k in _val_analyses)}")
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         print(f"  Loading val tokens from {val_path}...")
@@ -5238,6 +5378,13 @@ def main():
         analyze_phase_dynamics(args.output,
                                dawn_log=args.dawn_log,
                                baseline_log=args.baseline_log)
+
+    if _should_run('drift'):
+        if val_tokens is not None:
+            analyze_drift_alignment(params, cfg, val_tokens, args.output,
+                                     n_batches=_nb or 20, batch_size=min(_abs, 8))
+        else:
+            print("\n  Skipping drift (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
