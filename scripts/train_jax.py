@@ -674,6 +674,7 @@ def compute_spatial_diversity_loss(params):
 # ============================================================
 
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
+                      tau_reg_weight,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None):
@@ -698,6 +699,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             )
             ce_loss = result['loss']
             aux_loss = result['aux_loss']
+            tau_reg = result.get('tau_reg', jnp.float32(0.0))
 
             if is_baseline:
                 orth_loss = jnp.float32(0.0)
@@ -708,6 +710,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 div_loss = compute_spatial_diversity_loss(params)
                 total_loss = (ce_loss
                               + lb_weight * aux_loss
+                              + tau_reg_weight * tau_reg
                               + div_weight * div_loss)
             else:
                 orth_loss = compute_orthogonality_loss(
@@ -715,12 +718,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 div_loss = compute_knowledge_diversity_loss(params)
                 total_loss = (ce_loss
                               + lb_weight * aux_loss
+                              + tau_reg_weight * tau_reg
                               + orth_weight * orth_loss
                               + div_weight * div_loss)
 
-            return total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result)
+            return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss, result)
 
-        (total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result)), grads = \
+        (total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
         # XLA SPMD handles gradient all-reduce automatically
@@ -760,6 +764,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'total_loss': total_loss,
             'ce_loss': ce_loss,
             'aux_loss': aux_loss,
+            'tau_reg': tau_reg,
             'orth_loss': orth_loss,
             'div_loss': div_loss,
             'correct': result['correct'],
@@ -1167,6 +1172,7 @@ def check_nan_inf(metrics_dict, global_step, epoch):
             print(f"  total_loss: {total}")
             print(f"  ce_loss:    {metrics_dict.get('ce_loss', 'N/A')}")
             print(f"  aux_loss:   {metrics_dict.get('aux_loss', 'N/A')}")
+            print(f"  tau_reg:    {metrics_dict.get('tau_reg', 'N/A')}")
             print(f"  orth_loss:  {metrics_dict.get('orth_loss', 'N/A')}")
             print(f"  div_loss:   {metrics_dict.get('div_loss', 'N/A')}")
         return True
@@ -1221,6 +1227,7 @@ def main():
     orth_weight = tcfg.get('orthogonality_weight', 0.01)
     div_weight = tcfg.get('diversity_weight', 0.1)
     lb_weight = tcfg.get('load_balance_weight', 2e-5)
+    tau_reg_weight = tcfg.get('tau_reg_weight', 0.0)
 
     max_seq_len = cfg['model'].get('max_seq_len', 512)
 
@@ -1343,6 +1350,7 @@ def main():
             orth_weight = saved_training_config.get('orthogonality_weight', orth_weight)
             div_weight = saved_training_config.get('diversity_weight', div_weight)
             lb_weight = saved_training_config.get('load_balance_weight', lb_weight)
+            tau_reg_weight = saved_training_config.get('tau_reg_weight', tau_reg_weight)
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
@@ -1356,6 +1364,7 @@ def main():
         'orthogonality_weight': orth_weight,
         'diversity_weight': div_weight,
         'load_balance_weight': lb_weight,
+        'tau_reg_weight': tau_reg_weight,
     }
 
     # ----------------------------------------------------------
@@ -1523,6 +1532,7 @@ def main():
         print(f"  Orth weight: {orth_weight}")
         print(f"  Div weight: {div_weight}")
         print(f"  LB weight: {lb_weight}")
+        print(f"  Tau reg weight: {tau_reg_weight}")
 
     # ----------------------------------------------------------
     # Resume from checkpoint (resume_path detected earlier for config override)
@@ -1669,6 +1679,7 @@ def main():
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
+        tau_reg_weight,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns)
@@ -2177,6 +2188,7 @@ def main():
         win_loss = 0.0
         win_ce = 0.0
         win_aux = 0.0
+        win_tau_reg = 0.0
         win_orth = 0.0
         win_div = 0.0
         win_correct = 0
@@ -2209,6 +2221,7 @@ def main():
             m_total = _m(metrics['total_loss'])
             m_ce = _m(metrics['ce_loss'])
             m_aux = _m(metrics['aux_loss'])
+            m_tau_reg = _m(metrics.get('tau_reg', 0.0))
             m_orth = _m(metrics['orth_loss'])
             m_div = _m(metrics['div_loss'])
             m_correct = int(_m(metrics['correct']))
@@ -2217,6 +2230,7 @@ def main():
             # NaN/INF detection
             if check_nan_inf({
                 'total_loss': m_total, 'ce_loss': m_ce, 'aux_loss': m_aux,
+                'tau_reg': m_tau_reg,
                 'orth_loss': m_orth, 'div_loss': m_div,
             }, global_step + 1, epoch):
                 raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {global_step + 1}")
@@ -2229,6 +2243,7 @@ def main():
             win_loss += m_total
             win_ce += m_ce
             win_aux += m_aux
+            win_tau_reg += m_tau_reg
             win_orth += m_orth
             win_div += m_div
             win_correct += m_correct
@@ -2247,6 +2262,7 @@ def main():
                     avg_loss = win_loss / win_count
                     avg_ce = win_ce / win_count
                     avg_aux = win_aux / win_count
+                    avg_tau_reg = win_tau_reg / win_count
                     avg_orth = win_orth / win_count
                     avg_div = win_div / win_count
                     avg_acc = win_correct / win_valid if win_valid > 0 else 0.0
@@ -2270,6 +2286,7 @@ def main():
                     msg = (
                         f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
                         f"loss={avg_loss:.4f} ce={avg_ce:.4f} aux={avg_aux:.4f} "
+                        f"tau_reg={avg_tau_reg:.4f} "
                         f"orth={avg_orth:.2e} div={avg_div:.2e} | "
                         f"acc={avg_acc:.4f} lr={current_lr:.2e} "
                         f"{format_time(epoch_elapsed)}<{format_time(eta)}, {s_per_it:.2f}s/it"
@@ -2461,6 +2478,7 @@ def main():
                         'total_loss': avg_loss,
                         'ce_loss': avg_ce,
                         'aux_loss': avg_aux,
+                        'tau_reg': avg_tau_reg,
                         'orth_loss': avg_orth,
                         'div_loss': avg_div,
                         'accuracy': avg_acc,
@@ -2490,6 +2508,7 @@ def main():
                 win_loss = 0.0
                 win_ce = 0.0
                 win_aux = 0.0
+                win_tau_reg = 0.0
                 win_orth = 0.0
                 win_div = 0.0
                 win_correct = 0
