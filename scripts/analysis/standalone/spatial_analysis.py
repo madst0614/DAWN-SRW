@@ -4529,6 +4529,24 @@ def analyze_rw_alignment(params, cfg, output_dir):
               f"median={stats['median']:.4f}, range=[{stats['min']:.4f}, {stats['max']:.4f}]")
 
     _save_json(results, output_dir, 'rw_alignment', 'rw_alignment_summary.json')
+
+    # distribution type summary
+    type_parts = []
+    for pn in ['qk', 'v', 'know']:
+        s = results[pn]
+        nm = s.get('n_modes')
+        if nm is not None and nm > 0:
+            peaks_str = ','.join(f"{p['cos_value']:.2f}" for p in s['peaks'])
+            if nm == 1:
+                type_parts.append(f"{pn}=unimodal({peaks_str})")
+            elif nm == 2:
+                type_parts.append(f"{pn}=bimodal({peaks_str})")
+            else:
+                type_parts.append(f"{pn}={nm}-modal({peaks_str})")
+        else:
+            type_parts.append(f"{pn}=unknown")
+    print(f"  Distribution type: {' '.join(type_parts)}")
+
     print("  Done: rw_alignment")
     return results
 
@@ -5312,6 +5330,13 @@ def analyze_write_coverage(params, cfg, output_dir):
               f"covering mean_max_cos={pool_result['covering']['mean_max_cos']:.4f}")
 
     _save_json(results, output_dir, 'write_cov', 'write_coverage.json')
+
+    d_model_val = model_cfg['d_model']
+    rank_parts = [f"{pn}_rank={results[pn]['svd_eff_rank']:.1f}/{d_model_val}" for pn in pools]
+    cover_parts = [f"{pn}={results[pn]['covering']['mean_max_cos']:.2f}" for pn in pools]
+    print(f"  Summary: {' '.join(rank_parts)}")
+    print(f"           covering_radius: {' '.join(cover_parts)}")
+
     print("  Done: write_cov")
     return results
 
@@ -5391,6 +5416,14 @@ def analyze_selection_gini(params, cfg, val_tokens, output_dir,
         print(f"  {pn}: Gini mean={np.mean(ginis):.4f}, range=[{min(ginis):.4f}, {max(ginis):.4f}]")
 
     _save_json(results, output_dir, 'sel_gini', 'per_layer_pool.json')
+
+    print(f"\n  Know pool per-layer:")
+    print(f"  Layer |  Gini | coverage | active_N")
+    print(f"  ------+-------+----------+---------")
+    for li in range(n_layers):
+        d = results['know'][f'layer_{li}']
+        print(f"   L{li:2d}  | {d['gini']:.3f} | {d['coverage']:8.4f} | {d['mean_active_count']:8.0f}")
+
     print("  Done: sel_gini")
     return results
 
@@ -5456,6 +5489,13 @@ def analyze_selection_transition(params, cfg, val_tokens, output_dir,
             } for li in range(n_layers - 1)
         }
         print(f"  {pn}: Jaccard mean={jaccard_avg.mean():.4f}, turnover mean={turnover_avg.mean():.4f}")
+
+        # per-layer-pair compact display
+        labels = [f"L{li}→{li+1}" for li in range(n_layers - 1)]
+        vals = [f"{jaccard_avg[li]:.3f}" for li in range(n_layers - 1)]
+        print(f"  Know pool Jaccard (L→L+1):")
+        print(f"  {' '.join(f'{l:>7s}' for l in labels)}")
+        print(f"  {' '.join(f'{v:>7s}' for v in vals)}")
 
     _save_json(results, output_dir, 'sel_trans', 'layer_pair_jaccard.json')
     print("  Done: sel_trans")
@@ -5675,6 +5715,15 @@ def analyze_additivity(params, cfg, val_tokens, output_dir,
               f"cos_norm={layer_result['cos_norm_mean']:.4f}, n={layer_result['n_samples']}")
 
     _save_json(results, output_dir, 'addit', 'additivity_results.json')
+
+    all_raw = [results['per_layer'][k]['cos_raw_mean'] for k in results['per_layer'] if results['per_layer'][k]['n_samples'] > 0]
+    all_raw_s = [results['per_layer'][k]['cos_raw_std'] for k in results['per_layer'] if results['per_layer'][k]['n_samples'] > 0]
+    all_norm = [results['per_layer'][k]['cos_norm_mean'] for k in results['per_layer'] if results['per_layer'][k]['n_samples'] > 0]
+    all_norm_s = [results['per_layer'][k]['cos_norm_std'] for k in results['per_layer'] if results['per_layer'][k]['n_samples'] > 0]
+    if all_raw:
+        print(f"  Raw additivity: cos={np.mean(all_raw):.4f}±{np.mean(all_raw_s):.4f} (theoretically 1.0)")
+        print(f"  Normalized:     cos={np.mean(all_norm):.4f}±{np.mean(all_norm_s):.4f} (den shift causes deviation)")
+
     print("  Done: addit")
     return results
 
@@ -5860,6 +5909,17 @@ def analyze_domain_suppression_ext(params, cfg, output_dir,
             }
 
     _save_json(results, output_dir, 'dom_supp', 'domain_suppression.json')
+
+    # selectivity index summary (avg across domains)
+    si_parts = []
+    for pct in suppress_levels:
+        sis = [results['selectivity'][d][f'suppress_{pct}']['selectivity_index']
+               for d in all_domains if f'suppress_{pct}' in results['selectivity'].get(d, {})]
+        if sis:
+            si_parts.append(f"{pct:.0%}: SI={np.mean(sis):.2f}")
+    if si_parts:
+        print(f"  Selectivity index (targeted vs random): {' '.join(si_parts)}")
+
     print("  Done: dom_supp")
     return results
 
@@ -5964,7 +6024,16 @@ def analyze_rw_function_correlation(params, cfg, val_tokens, output_dir,
         'n_batches': actual_batches,
     }
     _save_json(results, output_dir, 'rw_func', 'bin_vs_metric.json')
-    print(f"  Correlation: cos_rw vs gate={corr_gate:.4f}, vs active_frac={corr_active:.4f}")
+
+    valid_bins = [b for b in bin_results if b is not None]
+    if valid_bins:
+        print(f"\n  cos(r,w) bin | neurons | gate_mean | active% | peak_layer")
+        print(f"  -------------+---------+-----------+---------+-----------")
+        for b in valid_bins:
+            lo, hi = b['bin_range']
+            print(f"  [{lo:+5.2f},{hi:+5.2f}) | {b['n_neurons']:>7d} | {b['overall_gate_mean']:9.4f} | {b['overall_active_frac']:6.1%} | {b['peak_phase']:>5s} (L{b['peak_layer']})")
+
+    print(f"\n  Correlation: cos_rw vs gate={corr_gate:.4f}, vs active_frac={corr_active:.4f}")
     print("  Done: rw_func")
     return results
 
