@@ -5613,23 +5613,40 @@ def analyze_additivity(params, cfg, val_tokens, output_dir,
     print("§7.4.3: Additivity Test")
     print("="*60)
 
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_fn = _mod._srw_inference
+
     model_cfg = get_model_cfg(cfg)
     n_layers = model_cfg['n_layers']
     n_know = model_cfg['n_know']
+    d_model = model_cfg['d_model']
+    n_heads = model_cfg['n_heads']
     max_seq = model_cfg['max_seq_len']
 
     params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+    router_p = params_jax['router']
+
+    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_s = pool_p.get('qk_scale', 1.0)
+    v_s_val = pool_p.get('v_scale', 1.0)
+    know_s = pool_p.get('know_scale', 1.0)
+    r_n = pool_p['know_read'] / (jnp.linalg.norm(pool_p['know_read'], axis=-1, keepdims=True) + 1e-8)
+    w_n = pool_p['know_write'] / (jnp.linalg.norm(pool_p['know_write'], axis=-1, keepdims=True) + 1e-8)
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
 
     n_seqs = len(val_tokens) // max_seq
     tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
-    batch_size = min(2, n_seqs)
 
-    # 샘플링할 layers
     sample_layers = [0, n_layers // 2, n_layers - 1]
     sample_layers = [li for li in sample_layers if li < n_layers]
 
-    batch = jnp.array(tokens[:batch_size], dtype=jnp.int32)
-    # 분석할 token positions (seq 중간 부근)
+    # single sequence forward로 per-token contrib 추출
+    input_ids = jnp.array(tokens[:1], dtype=jnp.int32)  # [1, S]
     n_tok = min(n_tokens, max_seq - 2)
     tok_positions = list(range(max_seq // 4, max_seq // 4 + n_tok))
 
@@ -5638,70 +5655,107 @@ def analyze_additivity(params, cfg, val_tokens, output_dir,
     for li in sample_layers:
         print(f"  Layer {li}...")
 
-        # return_vector=True로 전체 contribution 벡터 획득 (소수 토큰만)
-        contrib_result = _compute_per_neuron_contribution(
-            params_jax, model_cfg, batch,
-            pool='know', layer_idx=li, return_vector=True)
+        # forward to target layer (single seq, full S)
+        B, S = input_ids.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = params_jax['token_emb']['embedding'][input_ids] + params_jax['pos_emb']['embedding'][positions]
 
-        gate = np.array(jax.device_get(contrib_result['gate']))       # [B, S, N]
-        den = np.array(jax.device_get(contrib_result['den']))         # [B, S]
-        contrib_vec = np.array(jax.device_get(contrib_result['contrib_vec']))  # [B, S, N, d]
+        for l in range(li + 1):
+            bp = block_params_list[l]
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+            Q = _srw_inference_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            K = _srw_inference_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            V = _srw_inference_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            scale_v = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale_v
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+            normed2 = _layer_norm_fn(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            if l < li:
+                know_out = _srw_inference_fn(normed2,
+                    normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias'],
+                    know_emb_n,
+                    normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias'],
+                    pool_p['know_read'], pool_p['know_write']) * know_s
+                x = x + know_out
+
+        # at target layer: get gate + per-token contribution for sampled tokens
+        h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
+        tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
+        scores_k = h_k @ know_emb_n.T
+        sf = scores_k.astype(jnp.float32)
+        s_mean = sf.mean(axis=-1, keepdims=True)
+        s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
+        tau = s_mean + tau_k * s_std
+        raw = scores_k - tau.astype(scores_k.dtype)
+        gate_all = jnp.maximum(raw, 0.0)
+        gate_all = jnp.clip(gate_all, 0.0, 10.0)  # [1, S, N]
+        active_N = (gate_all > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
+        den_all = jnp.sqrt(active_N.squeeze(-1)) + 1.0  # [1, S]
+        xr_all = normed2 @ r_n.T  # [1, S, N]
+
+        gate_np = np.array(jax.device_get(gate_all[0]))  # [S, N]
+        den_np = np.array(jax.device_get(den_all[0]))     # [S]
+        xr_np = np.array(jax.device_get(xr_all[0]))       # [S, N]
+        w_n_np = np.array(jax.device_get(w_n))             # [N, d]
 
         cos_raw_list = []
         cos_norm_list = []
         residual_frac_list = []
 
         for ti in tok_positions:
-            for bi in range(batch_size):
-                g = gate[bi, ti, :]  # [N]
-                active_idx = np.where(g > 0)[0]
-                if len(active_idx) < 2:
-                    continue
+            g = gate_np[ti]        # [N]
+            active_idx = np.where(g > 0)[0]
+            if len(active_idx) < 2:
+                continue
 
-                # top-20 active neurons by gate magnitude
-                top_k = min(20, len(active_idx))
-                top_idx = active_idx[np.argsort(-g[active_idx])[:top_k]]
+            top_k = min(20, len(active_idx))
+            top_idx = active_idx[np.argsort(-g[active_idx])[:top_k]]
 
-                cv = contrib_vec[bi, ti, :, :]  # [N, d]
-                d_val = max(den[bi, ti], 1.0)
+            d_val = max(den_np[ti], 1.0)
 
-                # full output from active neurons
-                full_raw = cv[active_idx].sum(axis=0)  # [d]
-                full_norm = full_raw / d_val
+            # per-neuron contrib vectors for active neurons only
+            g_active = g[active_idx]                   # [A]
+            xr_active = xr_np[ti, active_idx]          # [A]
+            w_active = w_n_np[active_idx]               # [A, d]
+            cv_active = (g_active * xr_active)[:, np.newaxis] * w_active  # [A, d]
 
-                # sum of individual contributions
-                sum_contrib = cv[top_idx].sum(axis=0)
+            full_raw = cv_active.sum(axis=0)  # [d]
 
-                # additivity check: sum ≈ full?
-                if np.linalg.norm(full_raw) > 1e-8:
-                    residual_frac = float(np.linalg.norm(full_raw - cv[active_idx].sum(axis=0)) /
-                                          np.linalg.norm(full_raw))
-                else:
-                    residual_frac = 0.0
-                residual_frac_list.append(residual_frac)
+            residual_frac_list.append(0.0)  # sum == full by construction
 
-                # leave-one-out per top neuron
-                for ni in top_idx:
-                    contrib_i = cv[ni]  # [d]
-                    g_i = g[ni]
+            # top neurons contrib
+            for rank_i, ni in enumerate(top_idx):
+                local_i = np.searchsorted(active_idx, ni)
+                contrib_i = cv_active[local_i]  # [d]
 
-                    # raw (pre-norm) cos
-                    removed_raw = full_raw - contrib_i
-                    diff = full_raw - removed_raw  # = contrib_i
-                    if np.linalg.norm(contrib_i) > 1e-8 and np.linalg.norm(diff) > 1e-8:
-                        cos_r = float(np.dot(diff, contrib_i) /
-                                      (np.linalg.norm(diff) * np.linalg.norm(contrib_i) + 1e-8))
-                        cos_raw_list.append(cos_r)
+                # raw cos (always 1.0 by construction for leave-one-out diff)
+                cos_raw_list.append(1.0)
 
-                    # normalized cos
-                    den_without = max(d_val - g_i, 1.0) if d_val > 0 else 1.0
-                    norm_without = removed_raw / den_without
-                    norm_diff = full_norm - norm_without
-                    contrib_i_norm = contrib_i / d_val
-                    if np.linalg.norm(norm_diff) > 1e-8 and np.linalg.norm(contrib_i_norm) > 1e-8:
-                        cos_n = float(np.dot(norm_diff, contrib_i_norm) /
-                                      (np.linalg.norm(norm_diff) * np.linalg.norm(contrib_i_norm) + 1e-8))
-                        cos_norm_list.append(cos_n)
+                # normalized cos
+                g_i = g[ni]
+                den_without = max(d_val - g_i, 1.0)
+                removed_raw = full_raw - contrib_i
+                norm_full = full_raw / d_val
+                norm_without = removed_raw / den_without
+                norm_diff = norm_full - norm_without
+                contrib_i_norm = contrib_i / d_val
+                nd = np.linalg.norm(norm_diff)
+                cn = np.linalg.norm(contrib_i_norm)
+                if nd > 1e-8 and cn > 1e-8:
+                    cos_n = float(np.dot(norm_diff, contrib_i_norm) / (nd * cn))
+                    cos_norm_list.append(cos_n)
 
         layer_result = {
             'cos_raw_mean': float(np.mean(cos_raw_list)) if cos_raw_list else 0.0,
