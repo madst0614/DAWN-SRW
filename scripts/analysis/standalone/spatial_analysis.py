@@ -5335,39 +5335,21 @@ def analyze_selection_gini(params, cfg, val_tokens, output_dir,
     print("§7.1.2: Selection Gini / Concentration")
     print("="*60)
 
-    _mod = get_model_module()
-    _layer_norm_fn = _mod._layer_norm
-    _srw_inference_fn = _mod._srw_inference
-
     model_cfg = get_model_cfg(cfg)
     n_layers = model_cfg['n_layers']
-    n_heads = model_cfg['n_heads']
-    d_model = model_cfg['d_model']
     n_qk = model_cfg['n_qk']
     n_v = model_cfg['n_v']
     n_know = model_cfg['n_know']
     max_seq = model_cfg['max_seq_len']
 
     params_jax = jax.tree.map(jnp.asarray, params)
-    pool_p = params_jax['neuron_pool']
-    router_p = params_jax['router']
-
-    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
-    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
-    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
-
-    qk_s = pool_p.get('qk_scale', 1.0)
-    v_s_val = pool_p.get('v_scale', 1.0)
-    know_s = pool_p.get('know_scale', 1.0)
-
-    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    forward_fn = _build_forward_extended(params_jax, model_cfg)
 
     n_seqs = len(val_tokens) // max_seq
     tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     actual_batches = min(n_batches, n_seqs // batch_size)
     print(f"  batches={actual_batches}, batch_size={batch_size}")
 
-    # 누적기: per-neuron activation count, per layer per pool
     pool_info = {'qk': n_qk, 'v': n_v, 'know': n_know}
     freq_acc = {}
     active_count_acc = {}
@@ -5375,83 +5357,22 @@ def analyze_selection_gini(params, cfg, val_tokens, output_dir,
         freq_acc[pn] = [np.zeros(n_pool, dtype=np.float64) for _ in range(n_layers)]
         active_count_acc[pn] = [0.0 for _ in range(n_layers)]
 
-    total_tokens = 0
-
     for b in range(actual_batches):
         batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
-        B, S = batch.shape
-        positions = jnp.arange(S)[jnp.newaxis, :]
-        x = params_jax['token_emb']['embedding'][batch] + params_jax['pos_emb']['embedding'][positions]
-        total_tokens += B * S
+        result = jax.device_get(forward_fn(batch))
 
         for li in range(n_layers):
-            bp = block_params_list[li]
-
-            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
-            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
-            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
-
-            # QK pool (Q path): gate > 0 frequency
-            def _get_active_mask(normed, h, emb_n, tau_off):
-                scores = h @ emb_n.T
-                sf = scores.astype(jnp.float32)
-                s_mean = sf.mean(axis=-1, keepdims=True)
-                s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
-                tau = s_mean + tau_off * s_std
-                raw = scores - tau.astype(scores.dtype)
-                gate = jnp.maximum(raw, 0.0)
-                return (gate > 0).astype(jnp.float32)  # [B, S, N]
-
-            # QK: use Q path as representative
-            qk_active = _get_active_mask(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1])
-            qk_freq = np.array(jax.device_get(qk_active.mean(axis=(0, 1))))  # [n_qk]
-            freq_acc['qk'][li] += qk_freq
-            active_count_acc['qk'][li] += float(jax.device_get(qk_active.sum(axis=-1).mean()))
-
-            # V pool
-            v_active = _get_active_mask(normed1, h_V, v_emb_n, tau_all[:,:,2:3])
-            v_freq = np.array(jax.device_get(v_active.mean(axis=(0, 1))))
-            freq_acc['v'][li] += v_freq
-            active_count_acc['v'][li] += float(jax.device_get(v_active.sum(axis=-1).mean()))
-
-            # Attn forward
-            Q = _srw_inference_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            K = _srw_inference_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            V = _srw_inference_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
-            d_head = d_model // n_heads
-            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            scale_v = jnp.sqrt(jnp.float32(d_head))
-            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale_v
-            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
-            aw = jax.nn.softmax(sc, axis=-1)
-            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
-            attn_out = ao @ bp['attn']['expand_O']['kernel']
-            x_after_attn = x + attn_out
-
-            # Know pool
-            normed2 = _layer_norm_fn(x_after_attn, bp['norm2']['scale'], bp['norm2']['bias'])
-            h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
-            tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
-
-            know_active = _get_active_mask(normed2, h_k, know_emb_n, tau_k)
-            know_freq = np.array(jax.device_get(know_active.mean(axis=(0, 1))))
-            freq_acc['know'][li] += know_freq
-            active_count_acc['know'][li] += float(jax.device_get(know_active.sum(axis=-1).mean()))
-
-            know_out = _srw_inference_fn(normed2, h_k, know_emb_n, tau_k,
-                                         pool_p['know_read'], pool_p['know_write']) * know_s
-            x = x_after_attn + know_out
+            freq_acc['qk'][li] += result['qk_q_active'][li]
+            freq_acc['v'][li] += result['v_active'][li]
+            freq_acc['know'][li] += result['know_active'][li]
+            active_count_acc['qk'][li] += float(result['qk_q_active_count'][li])
+            active_count_acc['v'][li] += float(result['v_active_count'][li])
+            active_count_acc['know'][li] += float(result['know_active_count'][li])
 
         if (b + 1) % 5 == 0:
             print(f"    batch {b+1}/{actual_batches}")
 
-    # Gini 계산
     def _gini(freq):
-        """Gini coefficient from frequency array."""
         f = np.sort(freq)
         n = len(f)
         if f.sum() < 1e-12:
