@@ -5986,6 +5986,191 @@ def analyze_additivity(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# Appendix B.1+B.2 Domain Suppression Extended
+# ============================================================
+
+def analyze_domain_suppression_ext(params, cfg, output_dir,
+                                    suppress_levels=None):
+    """Appendix B.1+B.2: 도메인별 targeted/random suppression + selectivity index."""
+    print("\n" + "="*60)
+    print("Appendix B: Domain Suppression Extended")
+    print("="*60)
+
+    if suppress_levels is None:
+        suppress_levels = [0.01, 0.03, 0.05, 0.10]
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
+    build_suppressed_forward = _mod.build_suppressed_forward
+    prefill_fn = _mod.prefill
+
+    model_cfg = get_model_cfg(cfg)
+    n_know = model_cfg['n_know']
+    n_layers = model_cfg['n_layers']
+    mid_layer = n_layers // 2
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    # Step 1: domain activation profiles (재사용 패턴)
+    print("  Collecting domain activation profiles...")
+    domain_profiles = {}
+    for domain, prompts in DOMAIN_PROMPTS.items():
+        acc = np.zeros(n_know, dtype=np.float64)
+        n_tokens = 0
+        for prompt in prompts:
+            ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+            ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+            ids_pad[0, :ids.shape[1]] = ids
+            ids_dev = jnp.array(ids_pad, dtype=jnp.int32)
+            _, layer_info = jit_analysis(params_jax, ids_dev)
+            gate = np.array(jax.device_get(layer_info['gate_Know_raw'][mid_layer]))
+            gate_valid = gate[0, :ids.shape[1], :]
+            acc += gate_valid.mean(axis=0)
+            n_tokens += 1
+        domain_profiles[domain] = acc / n_tokens
+
+    # Step 2: domain-specific neurons (contrastive)
+    all_domains = list(DOMAIN_PROMPTS.keys())
+    domain_neurons = {}
+    for domain in all_domains:
+        others_mean = np.mean([domain_profiles[d] for d in all_domains if d != domain], axis=0)
+        specificity = domain_profiles[domain] - others_mean
+        domain_neurons[domain] = np.argsort(-specificity)
+
+    # Step 3: baseline loss per domain
+    @jax.jit
+    def get_loss(params_j, input_ids):
+        logits, _, _, _ = prefill_fn(params_j, model_cfg, input_ids)
+        shift_logits = logits[:, :-1, :]
+        shift_targets = input_ids[:, 1:]
+        log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+        target_lp = jnp.take_along_axis(log_probs, shift_targets[:, :, jnp.newaxis], axis=-1).squeeze(-1)
+        return -target_lp.mean()
+
+    def _eval_domain_loss(forward_fn, domain):
+        """특정 forward로 domain prompts에 대한 평균 loss."""
+        losses = []
+        for prompt in DOMAIN_PROMPTS[domain]:
+            ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+            ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+            ids_pad[0, :ids.shape[1]] = ids
+            ids_dev = jnp.array(ids_pad, dtype=jnp.int32)
+            loss = float(jax.device_get(forward_fn(ids_dev)))
+            losses.append(loss)
+        return float(np.mean(losses))
+
+    # baseline
+    baseline_fn = jax.jit(lambda ids: get_loss(params_jax, ids))
+    baseline_losses = {}
+    for domain in all_domains:
+        baseline_losses[domain] = _eval_domain_loss(baseline_fn, domain)
+    print(f"  Baseline losses: {baseline_losses}")
+
+    # Step 4: targeted suppression per domain
+    results = {'targeted': {}, 'random_baseline': {}, 'selectivity': {}}
+
+    for target_domain in all_domains:
+        print(f"\n  Target domain: {target_domain}")
+        results['targeted'][target_domain] = {}
+
+        for pct in suppress_levels:
+            n_suppress = max(1, int(pct * n_know))
+            suppress_idx = domain_neurons[target_domain][:n_suppress]
+            mask = np.zeros(n_know, dtype=bool)
+            mask[suppress_idx] = True
+
+            sup_forward = jax.jit(build_suppressed_forward(params_jax, model_cfg,
+                                                            {'know': jnp.array(mask)}))
+            sup_fn = lambda ids, sf=sup_forward: get_loss(
+                # rebuild: use suppressed forward's logits
+                params_jax, ids)  # placeholder — 아래에서 직접 forward
+
+            # suppressed forward 평가 (loss 직접 계산)
+            domain_loss_drop = {}
+            for eval_domain in all_domains:
+                sup_losses = []
+                for prompt in DOMAIN_PROMPTS[eval_domain]:
+                    ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+                    ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+                    ids_pad[0, :ids.shape[1]] = ids
+                    ids_dev = jnp.array(ids_pad, dtype=jnp.int32)
+                    logits = sup_forward(ids_dev)
+                    # compute loss from logits
+                    shift_logits = logits[:, :-1, :]
+                    shift_targets = ids_dev[:, 1:]
+                    log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+                    target_lp = jnp.take_along_axis(log_probs, shift_targets[:, :, jnp.newaxis], axis=-1).squeeze(-1)
+                    loss = float(jax.device_get(-target_lp.mean()))
+                    sup_losses.append(loss)
+                sup_loss = float(np.mean(sup_losses))
+                domain_loss_drop[eval_domain] = sup_loss - baseline_losses[eval_domain]
+
+            results['targeted'][target_domain][f'suppress_{pct}'] = {
+                'n_suppress': n_suppress,
+                'loss_drop': domain_loss_drop,
+                'target_drop': domain_loss_drop[target_domain],
+            }
+            print(f"    {pct*100:.0f}% ({n_suppress}): target_drop={domain_loss_drop[target_domain]:.4f}")
+
+    # Step 5: random baseline
+    rng = np.random.RandomState(42)
+    n_random_trials = 3
+    for pct in suppress_levels:
+        n_suppress = max(1, int(pct * n_know))
+        random_drops = {d: [] for d in all_domains}
+
+        for trial in range(n_random_trials):
+            rand_idx = rng.choice(n_know, n_suppress, replace=False)
+            mask = np.zeros(n_know, dtype=bool)
+            mask[rand_idx] = True
+            rand_forward = jax.jit(build_suppressed_forward(params_jax, model_cfg,
+                                                             {'know': jnp.array(mask)}))
+            for eval_domain in all_domains:
+                rand_losses = []
+                for prompt in DOMAIN_PROMPTS[eval_domain]:
+                    ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+                    ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+                    ids_pad[0, :ids.shape[1]] = ids
+                    ids_dev = jnp.array(ids_pad, dtype=jnp.int32)
+                    logits = rand_forward(ids_dev)
+                    shift_logits = logits[:, :-1, :]
+                    shift_targets = ids_dev[:, 1:]
+                    log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+                    target_lp = jnp.take_along_axis(log_probs, shift_targets[:, :, jnp.newaxis], axis=-1).squeeze(-1)
+                    loss = float(jax.device_get(-target_lp.mean()))
+                    rand_losses.append(loss)
+                random_drops[eval_domain].append(float(np.mean(rand_losses)) - baseline_losses[eval_domain])
+
+        results['random_baseline'][f'suppress_{pct}'] = {
+            d: float(np.mean(random_drops[d])) for d in all_domains
+        }
+        print(f"  Random {pct*100:.0f}%: {results['random_baseline'][f'suppress_{pct}']}")
+
+    # Step 6: selectivity index
+    for target_domain in all_domains:
+        results['selectivity'][target_domain] = {}
+        for pct in suppress_levels:
+            td = results['targeted'][target_domain][f'suppress_{pct}']['target_drop']
+            control_drops = [results['targeted'][target_domain][f'suppress_{pct}']['loss_drop'][d]
+                            for d in all_domains if d != target_domain]
+            cd = float(np.mean(control_drops))
+            selectivity = (td - cd) / (abs(td) + 1e-8)
+            results['selectivity'][target_domain][f'suppress_{pct}'] = {
+                'target_drop': td, 'control_drop': cd,
+                'selectivity_index': selectivity,
+            }
+
+    _save_json(results, output_dir, 'dom_supp', 'domain_suppression.json')
+    print("  Done: dom_supp")
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -5998,7 +6183,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,sel_gini,sel_trans,combo,addit")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,sel_gini,sel_trans,combo,addit,dom_supp")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -6014,6 +6199,8 @@ def main():
                         help="Token samples for P6 compositional expressiveness")
     parser.add_argument("--addit_n_tokens", type=int, default=10,
                         help="Number of tokens to sample for additivity test")
+    parser.add_argument("--dom_supp_suppress_levels", default="0.01,0.03,0.05,0.10",
+                        help="Comma-separated suppress fractions for domain suppression")
     parser.add_argument("--dawn_log", default=None,
                         help="Path to DAWN training log (JSON-lines or CSV)")
     parser.add_argument("--baseline_log", default=None,
@@ -6289,6 +6476,11 @@ def main():
                                 n_tokens=args.addit_n_tokens, n_batches=_nb or 1)
         else:
             print("\n  Skipping addit (no --val_data)")
+
+    if _should_run('dom_supp'):
+        sup_levels = [float(x) for x in args.dom_supp_suppress_levels.split(',')]
+        analyze_domain_suppression_ext(params, cfg, args.output,
+                                        suppress_levels=sup_levels)
 
     print(f"\nDone. Results in {args.output}/")
 
