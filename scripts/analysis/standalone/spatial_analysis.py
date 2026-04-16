@@ -4844,6 +4844,144 @@ def analyze_residual_dynamics(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# §6.3 Phase Dynamics (학습 로그 post-processing)
+# ============================================================
+
+def analyze_phase_dynamics(output_dir, dawn_log=None, baseline_log=None):
+    """§6.3: 학습 로그에서 loss/tau/active_frac 시계열 비교 및 phase 경계 검출."""
+    print("\n" + "="*60)
+    print("§6.3: Phase Dynamics")
+    print("="*60)
+
+    if dawn_log is None:
+        print("  --dawn_log not provided. Skipping phase dynamics.")
+        return None
+
+    def _load_log(path):
+        """JSON-lines 또는 CSV 학습 로그 로드. 각 행: {step, loss, tau_*, active_frac_*}."""
+        records = []
+        with open(path, 'r') as f:
+            first_line = f.readline().strip()
+            f.seek(0)
+            if first_line.startswith('{'):
+                # JSON-lines
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+            else:
+                # CSV
+                import csv
+                reader = csv.DictReader(f)
+                for row in reader:
+                    rec = {}
+                    for k, v in row.items():
+                        try:
+                            rec[k] = float(v)
+                        except (ValueError, TypeError):
+                            rec[k] = v
+                    records.append(rec)
+        return records
+
+    def _extract_series(records, key):
+        """로그 레코드 리스트에서 step/key 시계열 추출."""
+        steps, vals = [], []
+        for r in records:
+            s = r.get('step', r.get('global_step', None))
+            v = r.get(key, None)
+            if s is not None and v is not None:
+                steps.append(float(s))
+                vals.append(float(v))
+        return np.array(steps), np.array(vals)
+
+    def _moving_avg(arr, window=100):
+        if len(arr) < window:
+            return arr
+        kernel = np.ones(window) / window
+        return np.convolve(arr, kernel, mode='valid')
+
+    print(f"  Loading DAWN log: {dawn_log}")
+    dawn_records = _load_log(dawn_log)
+    print(f"    {len(dawn_records)} records loaded")
+
+    dawn_steps, dawn_loss = _extract_series(dawn_records, 'loss')
+    results = {'dawn': {'n_records': len(dawn_records)}}
+
+    # tau/active_frac per pool
+    for pool in ['qk', 'v', 'know']:
+        for metric in ['tau', 'active_frac']:
+            key = f'{metric}_{pool}'
+            steps, vals = _extract_series(dawn_records, key)
+            if len(vals) > 0:
+                results['dawn'][key] = {
+                    'mean': float(vals.mean()),
+                    'final': float(vals[-1]),
+                    'n_points': len(vals),
+                }
+
+    # loss moving average
+    if len(dawn_loss) > 0:
+        dawn_loss_ma = _moving_avg(dawn_loss)
+        results['dawn']['loss_ma_final'] = float(dawn_loss_ma[-1]) if len(dawn_loss_ma) > 0 else None
+
+    # baseline 비교
+    if baseline_log is not None:
+        print(f"  Loading baseline log: {baseline_log}")
+        base_records = _load_log(baseline_log)
+        print(f"    {len(base_records)} records loaded")
+        base_steps, base_loss = _extract_series(base_records, 'loss')
+        results['baseline'] = {'n_records': len(base_records)}
+
+        # gap 계산 (step 정렬)
+        if len(dawn_loss) > 0 and len(base_loss) > 0:
+            min_len = min(len(dawn_loss), len(base_loss))
+            gap = dawn_loss[:min_len] - base_loss[:min_len]
+            gap_ma = _moving_avg(gap)
+
+            # phase 경계: gap 도함수 부호 변화
+            if len(gap_ma) > 2:
+                d_gap = np.diff(gap_ma)
+                sign_changes = np.where(np.diff(np.sign(d_gap)))[0]
+                # 대응하는 step (window offset 보정)
+                window = 100
+                phase_boundaries = []
+                for idx in sign_changes:
+                    step_idx = idx + window // 2
+                    if step_idx < len(dawn_steps):
+                        phase_boundaries.append({
+                            'step': float(dawn_steps[step_idx]),
+                            'gap_value': float(gap_ma[idx]),
+                        })
+                results['phases'] = phase_boundaries
+                print(f"    Detected {len(phase_boundaries)} phase boundaries")
+            else:
+                results['phases'] = []
+
+            results['gap'] = {
+                'mean': float(gap.mean()),
+                'final': float(gap[-1]),
+                'min': float(gap.min()),
+                'max': float(gap.max()),
+            }
+
+    # timeseries 저장 (step, loss, tau, active_frac)
+    timeseries = {}
+    for key in ['loss', 'tau_qk', 'tau_v', 'tau_know', 'active_frac_qk', 'active_frac_v', 'active_frac_know']:
+        steps, vals = _extract_series(dawn_records, key)
+        if len(vals) > 0:
+            # 서브샘플 (최대 2000 포인트)
+            if len(vals) > 2000:
+                idx = np.linspace(0, len(vals)-1, 2000, dtype=int)
+                steps, vals = steps[idx], vals[idx]
+            timeseries[key] = {'steps': steps.tolist(), 'values': vals.tolist()}
+
+    _save_json(timeseries, output_dir, 'phase_dynamics', 'timeseries.json')
+    _save_json(results, output_dir, 'phase_dynamics', 'phases.json')
+    print("  Done: phase_dynamics")
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -4856,7 +4994,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -4870,6 +5008,10 @@ def main():
                         help="Max sentences for R.2 POS selectivity")
     parser.add_argument("--p6_samples", type=int, default=100,
                         help="Token samples for P6 compositional expressiveness")
+    parser.add_argument("--dawn_log", default=None,
+                        help="Path to DAWN training log (JSON-lines or CSV)")
+    parser.add_argument("--baseline_log", default=None,
+                        help="Path to baseline training log (JSON-lines or CSV)")
     args = parser.parse_args()
 
     # Initialize dynamic model module
@@ -5091,6 +5233,11 @@ def main():
                                       n_batches=_nb or 20, batch_size=min(_abs, 8))
         else:
             print("\n  Skipping resid_dyn (no --val_data)")
+
+    if _should_run('phase'):
+        analyze_phase_dynamics(args.output,
+                               dawn_log=args.dawn_log,
+                               baseline_log=args.baseline_log)
 
     print(f"\nDone. Results in {args.output}/")
 
