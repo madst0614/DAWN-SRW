@@ -1,6 +1,6 @@
 # DAWN-SRW: Atomic Unit Composition for Language Modeling
 
-[![Paper](https://img.shields.io/badge/Paper-Zenodo-blue)](https://doi.org/10.5281/zenodo.XXXXXXX)
+[![Paper](https://img.shields.io/badge/Paper-Zenodo-blue)](https://doi.org/10.5281/zenodo.19615584)
 [![Predecessor](https://img.shields.io/badge/DAWN-Predecessor-green)](https://doi.org/10.5281/zenodo.19599530)
 
 DAWN-SRW extends the [DAWN framework](https://github.com/madst0614/DAWN) to rank-1 atomic units. Every projection in a Transformer (Query, Key, Value, feedforward) is dynamically composed from a shared pool of Select-Read-Write units — the minimal possible computational atom.
@@ -70,7 +70,7 @@ pip install -r requirements.txt
   title={DAWN-SRW: Atomic Unit Composition for Language Modeling},
   author={Choi, Seungho},
   year={2026},
-  doi={10.5281/zenodo.XXXXXXX},
+  doi={10.5281/zenodo.19615584},
   url={https://github.com/madst0614/dawn-srw}
 }
 ```
