@@ -4910,23 +4910,78 @@ def analyze_drift_alignment(params, cfg, val_tokens, output_dir,
     router_p = params_jax['router']
     emb_matrix = params_jax['token_emb']['embedding']
     pos_matrix = params_jax['pos_emb']['embedding']
-    norm_p = params_jax['norm']  # final layer norm
+    norm_p = params_jax['norm']
 
+    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
     know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
-    qk_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
-    v_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
     qk_s = pool_p.get('qk_scale', 1.0)
     v_s_val = pool_p.get('v_scale', 1.0)
     know_s = pool_p.get('know_scale', 1.0)
 
     block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    stacked_bp = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    @jax.jit
+    def _drift_forward(input_ids):
+        """per-layer early-exit stats via scan. Returns {top1, top5, rank, cos_et} [n_layers]."""
+        B, S = input_ids.shape
+        targets = input_ids[:, 1:]
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+
+        def layer_fn(carry, bp):
+            x = carry
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+            Q = _srw_inference_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            K = _srw_inference_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            V = _srw_inference_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+            normed2 = _layer_norm_fn(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            know_out = _srw_inference_fn(normed2,
+                normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias'],
+                know_emb_n,
+                normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias'],
+                pool_p['know_read'], pool_p['know_write']) * know_s
+            x = x + know_out
+            # early-exit
+            x_normed = _layer_norm_fn(x, norm_p['scale'], norm_p['bias'])
+            logits = x_normed @ emb_matrix.T
+            pred_logits = logits[:, :-1, :]
+            top5 = jax.lax.top_k(pred_logits, 5)[1]
+            top1_hit = (top5[:, :, 0] == targets).astype(jnp.float32).mean()
+            top5_hit = (top5 == targets[:, :, jnp.newaxis]).any(axis=-1).astype(jnp.float32).mean()
+            target_logit = jnp.take_along_axis(pred_logits, targets[:, :, jnp.newaxis], axis=-1).squeeze(-1)
+            rank = (pred_logits > target_logit[:, :, jnp.newaxis]).sum(axis=-1).astype(jnp.float32).mean()
+            target_emb = emb_matrix[targets]
+            x_pred = x_normed[:, :-1, :]
+            cos_et = ((x_pred * target_emb).sum(-1) / (
+                jnp.linalg.norm(x_pred, axis=-1) * jnp.linalg.norm(target_emb, axis=-1) + 1e-8)).mean()
+            stats = {'top1': top1_hit, 'top5': top5_hit, 'rank': rank, 'cos_et': cos_et}
+            return x, stats
+
+        _, all_stats = jax.lax.scan(layer_fn, x, stacked_bp)
+        return all_stats
 
     n_seqs = len(val_tokens) // max_seq
     tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     actual_batches = min(n_batches, n_seqs // batch_size)
     print(f"  batches={actual_batches}, batch_size={batch_size}")
 
-    # 누적기: per layer
     layer_acc = [{
         'cos_emb_target': 0.0, 'early_exit_top1_acc': 0.0,
         'early_exit_top5_acc': 0.0, 'mean_target_rank': 0.0,
@@ -4934,76 +4989,12 @@ def analyze_drift_alignment(params, cfg, val_tokens, output_dir,
 
     for b in range(actual_batches):
         batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
-        B, S = batch.shape
-        targets = batch[:, 1:]  # [B, S-1]
-        positions = jnp.arange(S)[jnp.newaxis, :]
-        x = emb_matrix[batch] + pos_matrix[positions]
-
+        result = jax.device_get(_drift_forward(batch))
         for li in range(n_layers):
-            bp = block_params_list[li]
-
-            # Attention
-            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
-            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
-            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
-
-            Q = _srw_inference_fn(normed1, h_Q, qk_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            K = _srw_inference_fn(normed1, h_K, qk_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            V = _srw_inference_fn(normed1, h_V, v_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
-
-            d_head = d_model // n_heads
-            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            scale_v = jnp.sqrt(jnp.float32(d_head))
-            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale_v
-            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
-            aw = jax.nn.softmax(sc, axis=-1)
-            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
-            attn_out = ao @ bp['attn']['expand_O']['kernel']
-            x_after_attn = x + attn_out
-
-            # Know
-            normed2 = _layer_norm_fn(x_after_attn, bp['norm2']['scale'], bp['norm2']['bias'])
-            know_out = _srw_inference_fn(normed2,
-                normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias'],
-                know_emb_n,
-                normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias'],
-                pool_p['know_read'], pool_p['know_write']) * know_s
-            x = x_after_attn + know_out
-
-            # Early-exit: LN → logits
-            x_normed = _layer_norm_fn(x, norm_p['scale'], norm_p['bias'])
-            logits = x_normed @ emb_matrix.T  # [B, S, vocab]
-            # 예측 위치: position 0..S-2 → target 1..S-1
-            pred_logits = logits[:, :-1, :]  # [B, S-1, vocab]
-
-            # top-1, top-5 accuracy
-            top5 = jax.lax.top_k(pred_logits, 5)[1]  # [B, S-1, 5]
-            top1_hit = (top5[:, :, 0] == targets).astype(jnp.float32).mean()
-            top5_hit = (top5 == targets[:, :, jnp.newaxis]).any(axis=-1).astype(jnp.float32).mean()
-
-            # target rank
-            target_logit = jnp.take_along_axis(pred_logits, targets[:, :, jnp.newaxis], axis=-1).squeeze(-1)
-            rank = (pred_logits > target_logit[:, :, jnp.newaxis]).sum(axis=-1).astype(jnp.float32).mean()
-
-            # cos(x_L_normed, emb[target])
-            target_emb = emb_matrix[targets]  # [B, S-1, d]
-            x_pred = x_normed[:, :-1, :]  # [B, S-1, d]
-            cos_et = (x_pred * target_emb).sum(-1) / (
-                jnp.linalg.norm(x_pred, axis=-1) * jnp.linalg.norm(target_emb, axis=-1) + 1e-8)
-
-            vals = jax.device_get({
-                'top1': top1_hit, 'top5': top5_hit,
-                'rank': rank, 'cos_et': cos_et.mean(),
-            })
-            layer_acc[li]['early_exit_top1_acc'] += float(vals['top1'])
-            layer_acc[li]['early_exit_top5_acc'] += float(vals['top5'])
-            layer_acc[li]['mean_target_rank'] += float(vals['rank'])
-            layer_acc[li]['cos_emb_target'] += float(vals['cos_et'])
-
+            layer_acc[li]['early_exit_top1_acc'] += float(result['top1'][li])
+            layer_acc[li]['early_exit_top5_acc'] += float(result['top5'][li])
+            layer_acc[li]['mean_target_rank'] += float(result['rank'][li])
+            layer_acc[li]['cos_emb_target'] += float(result['cos_et'][li])
         if (b + 1) % 5 == 0:
             print(f"    batch {b+1}/{actual_batches}")
 
@@ -5415,104 +5406,39 @@ def analyze_selection_transition(params, cfg, val_tokens, output_dir,
     print("="*60)
 
     _mod = get_model_module()
-    _layer_norm_fn = _mod._layer_norm
-    _srw_inference_fn = _mod._srw_inference
+    analysis_forward = _mod.analysis_forward
 
     model_cfg = get_model_cfg(cfg)
     n_layers = model_cfg['n_layers']
-    n_heads = model_cfg['n_heads']
-    d_model = model_cfg['d_model']
     max_seq = model_cfg['max_seq_len']
 
     params_jax = jax.tree.map(jnp.asarray, params)
-    pool_p = params_jax['neuron_pool']
-    router_p = params_jax['router']
-
-    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
-    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
-    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
-
-    qk_s = pool_p.get('qk_scale', 1.0)
-    v_s_val = pool_p.get('v_scale', 1.0)
-    know_s = pool_p.get('know_scale', 1.0)
-
-    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    jit_fwd = jax.jit(lambda ids: analysis_forward(params_jax, model_cfg, ids, mode='full'))
 
     n_seqs = len(val_tokens) // max_seq
     tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     actual_batches = min(n_batches, n_seqs // batch_size)
     print(f"  batches={actual_batches}, batch_size={batch_size}")
 
-    def _get_active_mask(normed, h, emb_n, tau_off):
-        scores = h @ emb_n.T
-        sf = scores.astype(jnp.float32)
-        s_mean = sf.mean(axis=-1, keepdims=True)
-        s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
-        tau = s_mean + tau_off * s_std
-        raw = scores - tau.astype(scores.dtype)
-        gate = jnp.maximum(raw, 0.0)
-        return (gate > 0).astype(jnp.float32)  # [B, S, N]
-
-    # 누적기: per layer-pair per pool
-    pool_names = ['know']  # know pool이 layer 공유라 의미 있음
+    pool_names = ['know']
     jaccard_acc = {pn: np.zeros(n_layers - 1, dtype=np.float64) for pn in pool_names}
     turnover_acc = {pn: np.zeros(n_layers - 1, dtype=np.float64) for pn in pool_names}
 
     for b in range(actual_batches):
         batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
-        B, S = batch.shape
-        positions = jnp.arange(S)[jnp.newaxis, :]
-        x = params_jax['token_emb']['embedding'][batch] + params_jax['pos_emb']['embedding'][positions]
+        _, layer_info = jit_fwd(batch)
+        # gate_Know_raw: [n_layers, B, S, n_know]
+        gate_know_raw = layer_info['gate_Know_raw']
 
-        prev_know_active = None
-
-        for li in range(n_layers):
-            bp = block_params_list[li]
-
-            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
-            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
-            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
-
-            # Attn forward
-            Q = _srw_inference_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            K = _srw_inference_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            V = _srw_inference_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
-            d_head = d_model // n_heads
-            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            scale_v = jnp.sqrt(jnp.float32(d_head))
-            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale_v
-            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
-            aw = jax.nn.softmax(sc, axis=-1)
-            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
-            attn_out = ao @ bp['attn']['expand_O']['kernel']
-            x_after_attn = x + attn_out
-
-            # Know pool active mask
-            normed2 = _layer_norm_fn(x_after_attn, bp['norm2']['scale'], bp['norm2']['bias'])
-            h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
-            tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
-
-            know_active = _get_active_mask(normed2, h_k, know_emb_n, tau_k)  # [B, S, N]
-
-            if prev_know_active is not None:
-                # Jaccard: intersection / union per token, then mean
-                inter = (prev_know_active * know_active).sum(axis=-1)  # [B, S]
-                union = jnp.maximum(prev_know_active + know_active - prev_know_active * know_active, 1e-8).sum(axis=-1)
-                jacc = inter / union  # [B, S]
-                jacc_mean = float(jax.device_get(jacc.mean()))
-                jaccard_acc['know'][li - 1] += jacc_mean
-                turnover_acc['know'][li - 1] += (1.0 - jacc_mean)
-
-            prev_know_active = know_active
-
-            # Know forward
-            know_out = _srw_inference_fn(normed2, h_k, know_emb_n, tau_k,
-                                         pool_p['know_read'], pool_p['know_write']) * know_s
-            x = x_after_attn + know_out
+        for li in range(n_layers - 1):
+            know_L = (gate_know_raw[li] > 0).astype(jnp.float32)
+            know_L1 = (gate_know_raw[li + 1] > 0).astype(jnp.float32)
+            inter = (know_L * know_L1).sum(axis=-1)
+            union = jnp.maximum(know_L + know_L1 - know_L * know_L1, 1e-8).sum(axis=-1)
+            jacc = inter / union
+            jacc_mean = float(jax.device_get(jacc.mean()))
+            jaccard_acc['know'][li] += jacc_mean
+            turnover_acc['know'][li] += (1.0 - jacc_mean)
 
         if (b + 1) % 5 == 0:
             print(f"    batch {b+1}/{actual_batches}")
@@ -5549,41 +5475,25 @@ def analyze_combinatorial_coverage(params, cfg, val_tokens, output_dir,
     from collections import Counter
 
     _mod = get_model_module()
-    _layer_norm_fn = _mod._layer_norm
-    _srw_inference_fn = _mod._srw_inference
+    analysis_forward = _mod.analysis_forward
 
     model_cfg = get_model_cfg(cfg)
     n_layers = model_cfg['n_layers']
-    n_heads = model_cfg['n_heads']
-    d_model = model_cfg['d_model']
     n_know = model_cfg['n_know']
     max_seq = model_cfg['max_seq_len']
 
     params_jax = jax.tree.map(jnp.asarray, params)
-    pool_p = params_jax['neuron_pool']
-    router_p = params_jax['router']
-
-    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
-    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
-    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
-
-    qk_s = pool_p.get('qk_scale', 1.0)
-    v_s_val = pool_p.get('v_scale', 1.0)
-    know_s = pool_p.get('know_scale', 1.0)
-
-    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    jit_fwd = jax.jit(lambda ids: analysis_forward(params_jax, model_cfg, ids, mode='full'))
 
     n_seqs = len(val_tokens) // max_seq
     tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     actual_batches = min(n_batches, n_seqs // batch_size)
     print(f"  batches={actual_batches}, batch_size={batch_size}")
 
-    # hash prime vector (device 상에서 hash 계산용)
     rng = np.random.RandomState(42)
     LARGE_PRIME = 2**61 - 1
     prime_vec = jnp.array(rng.randint(1, LARGE_PRIME, size=n_know, dtype=np.int64))
 
-    # mid layer 분석
     mid_layer = n_layers // 2
     combo_counters = {li: Counter() for li in [mid_layer]}
     size_acc = {li: [] for li in [mid_layer]}
@@ -5592,63 +5502,22 @@ def analyze_combinatorial_coverage(params, cfg, val_tokens, output_dir,
     for b in range(actual_batches):
         batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
         B, S = batch.shape
-        positions = jnp.arange(S)[jnp.newaxis, :]
-        x = params_jax['token_emb']['embedding'][batch] + params_jax['pos_emb']['embedding'][positions]
+        _, layer_info = jit_fwd(batch)
 
-        for li in range(mid_layer + 1):
-            bp = block_params_list[li]
+        # gate_Know_raw at mid layer: [B, S, n_know]
+        gate_mid = layer_info['gate_Know_raw'][mid_layer]
+        active_mask = (gate_mid > 0).astype(jnp.int64)
 
-            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
-            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
-            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+        hashes = (active_mask * prime_vec[jnp.newaxis, jnp.newaxis, :]).sum(axis=-1) % LARGE_PRIME
+        active_sizes = active_mask.sum(axis=-1)
 
-            Q = _srw_inference_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            K = _srw_inference_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            V = _srw_inference_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
-            d_head = d_model // n_heads
-            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            scale_v = jnp.sqrt(jnp.float32(d_head))
-            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale_v
-            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
-            aw = jax.nn.softmax(sc, axis=-1)
-            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
-            attn_out = ao @ bp['attn']['expand_O']['kernel']
-            x_after_attn = x + attn_out
+        hashes_np = np.array(jax.device_get(hashes)).flatten()
+        sizes_np = np.array(jax.device_get(active_sizes)).flatten()
 
-            normed2 = _layer_norm_fn(x_after_attn, bp['norm2']['scale'], bp['norm2']['bias'])
-            h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
-            tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
-
-            if li == mid_layer:
-                # hash 기반 combination 추출
-                scores_k = h_k @ know_emb_n.T
-                sf = scores_k.astype(jnp.float32)
-                s_mean = sf.mean(axis=-1, keepdims=True)
-                s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
-                tau = s_mean + tau_k * s_std
-                raw = scores_k - tau.astype(scores_k.dtype)
-                gate = jnp.maximum(raw, 0.0)
-                active_mask = (gate > 0).astype(jnp.int64)  # [B, S, N]
-
-                # device에서 hash: [B, S]
-                hashes = (active_mask * prime_vec[jnp.newaxis, jnp.newaxis, :]).sum(axis=-1) % LARGE_PRIME
-                active_sizes = active_mask.sum(axis=-1)  # [B, S]
-
-                hashes_np = np.array(jax.device_get(hashes)).flatten()
-                sizes_np = np.array(jax.device_get(active_sizes)).flatten()
-
-                for h in hashes_np:
-                    combo_counters[mid_layer][int(h)] += 1
-                size_acc[mid_layer].extend(sizes_np.tolist())
-                total_tokens += B * S
-
-            know_out = _srw_inference_fn(normed2, h_k, know_emb_n, tau_k,
-                                         pool_p['know_read'], pool_p['know_write']) * know_s
-            x = x_after_attn + know_out
+        for h_val in hashes_np:
+            combo_counters[mid_layer][int(h_val)] += 1
+        size_acc[mid_layer].extend(sizes_np.tolist())
+        total_tokens += B * S
 
         if (b + 1) % 10 == 0:
             print(f"    batch {b+1}/{actual_batches}")
@@ -6005,118 +5874,46 @@ def analyze_rw_function_correlation(params, cfg, val_tokens, output_dir,
     print("§7.2.2: R-W Angle vs Function")
     print("="*60)
 
-    _mod = get_model_module()
-    _layer_norm_fn = _mod._layer_norm
-    _srw_inference_fn = _mod._srw_inference
-
     model_cfg = get_model_cfg(cfg)
     n_layers = model_cfg['n_layers']
-    n_heads = model_cfg['n_heads']
-    d_model = model_cfg['d_model']
     n_know = model_cfg['n_know']
     max_seq = model_cfg['max_seq_len']
 
-    # Task 1.1 결과 확인
     cos_rw_path = os.path.join(output_dir, 'rw_alignment', 'know_cos_rw.npy')
     if not os.path.exists(cos_rw_path):
         print(f"  rw_alignment results not found ({cos_rw_path}). Run --only rw_align first.")
         return None
 
-    cos_rw = np.load(cos_rw_path)  # [n_know]
+    cos_rw = np.load(cos_rw_path)
     print(f"  Loaded cos(r,w) for {len(cos_rw)} know neurons")
 
     params_jax = jax.tree.map(jnp.asarray, params)
-    pool_p = params_jax['neuron_pool']
-    router_p = params_jax['router']
+    forward_fn = _build_forward_extended(params_jax, model_cfg)
 
-    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
-    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
-    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
-
-    qk_s = pool_p.get('qk_scale', 1.0)
-    v_s_val = pool_p.get('v_scale', 1.0)
-    know_s = pool_p.get('know_scale', 1.0)
-
-    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
-
-    # cos(r,w) 기준으로 10개 bin
     n_bins = 10
     bin_edges = np.linspace(cos_rw.min() - 0.001, cos_rw.max() + 0.001, n_bins + 1)
     bin_assignments = np.digitize(cos_rw, bin_edges) - 1
     bin_assignments = np.clip(bin_assignments, 0, n_bins - 1)
 
-    # per-neuron gate magnitude & activation frequency 수집
     n_seqs = len(val_tokens) // max_seq
     tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     actual_batches = min(n_batches, n_seqs // batch_size)
     print(f"  batches={actual_batches}, batch_size={batch_size}")
 
-    # 누적: per-neuron per-layer gate mean & activation frequency
     gate_acc = np.zeros((n_layers, n_know), dtype=np.float64)
     active_acc = np.zeros((n_layers, n_know), dtype=np.float64)
 
     for b in range(actual_batches):
         batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
-        B, S = batch.shape
-        positions = jnp.arange(S)[jnp.newaxis, :]
-        x = params_jax['token_emb']['embedding'][batch] + params_jax['pos_emb']['embedding'][positions]
-
-        for li in range(n_layers):
-            bp = block_params_list[li]
-
-            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
-            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
-            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
-
-            Q = _srw_inference_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            K = _srw_inference_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            V = _srw_inference_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
-
-            d_head = d_model // n_heads
-            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            scale_v = jnp.sqrt(jnp.float32(d_head))
-            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale_v
-            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
-            aw = jax.nn.softmax(sc, axis=-1)
-            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
-            attn_out = ao @ bp['attn']['expand_O']['kernel']
-            x_after_attn = x + attn_out
-
-            normed2 = _layer_norm_fn(x_after_attn, bp['norm2']['scale'], bp['norm2']['bias'])
-            h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
-            tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
-
-            # gate 계산
-            scores_k = h_k @ know_emb_n.T
-            sf = scores_k.astype(jnp.float32)
-            s_mean = sf.mean(axis=-1, keepdims=True)
-            s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
-            tau = s_mean + tau_k * s_std
-            raw = scores_k - tau.astype(scores_k.dtype)
-            gate = jnp.maximum(raw, 0.0)
-            gate = jnp.clip(gate, 0.0, 10.0)
-
-            gate_mean = np.array(jax.device_get(gate.mean(axis=(0, 1))))  # [N]
-            active_frac = np.array(jax.device_get((gate > 0).astype(jnp.float32).mean(axis=(0, 1))))
-
-            gate_acc[li] += gate_mean
-            active_acc[li] += active_frac
-
-            know_out = _srw_inference_fn(normed2, h_k, know_emb_n, tau_k,
-                                         pool_p['know_read'], pool_p['know_write']) * know_s
-            x = x_after_attn + know_out
-
+        result = jax.device_get(forward_fn(batch))
+        gate_acc += result['know_gate_mean']      # [n_layers, n_know]
+        active_acc += result['know_active']        # [n_layers, n_know]
         if (b + 1) % 5 == 0:
             print(f"    batch {b+1}/{actual_batches}")
 
-    gate_avg = gate_acc / actual_batches  # [n_layers, n_know]
+    gate_avg = gate_acc / actual_batches
     active_avg = active_acc / actual_batches
 
-    # bin별 집계
     bin_results = []
     for bi in range(n_bins):
         idx = np.where(bin_assignments == bi)[0]
