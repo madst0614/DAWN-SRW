@@ -2285,8 +2285,8 @@ def main():
 
                     msg = (
                         f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
-                        f"loss={avg_loss:.4f} ce={avg_ce:.4f} aux={avg_aux:.4f} "
-                        f"tau_reg={avg_tau_reg:.4f} "
+                        f"loss={avg_loss:.4f} ce={avg_ce:.4f} | "
+                        f"reg(raw): aux={avg_aux:.4f} tau_reg={avg_tau_reg:.4f} "
                         f"orth={avg_orth:.2e} div={avg_div:.2e} | "
                         f"acc={avg_acc:.4f} lr={current_lr:.2e} "
                         f"{format_time(epoch_elapsed)}<{format_time(eta)}, {s_per_it:.2f}s/it"
@@ -2309,6 +2309,8 @@ def main():
                         k_write_n = _m(metrics.get('know_write_norm', 0.0))
 
                         n_know_cfg = cfg['model'].get('n_know', 27200)
+                        n_qk_cfg = cfg['model'].get('n_qk', 0)
+                        n_v_cfg = cfg['model'].get('n_v', 0)
                         k_act = _m(metrics['know_active'])
                         k_aN = _m(metrics.get('know_active_N', 0.0))
                         k_sstd = _m(metrics.get('know_score_std', 0.0))
@@ -2397,8 +2399,10 @@ def main():
                             a_qk_neg = max(a_qk_act - a_qk_pos, 0.0)
                             a_v_neg = max(a_v_act - a_v_pos, 0.0)
                             log_message(
-                                f"      attn: qk_pos={a_qk_pos*100:.1f}% qk_neg={a_qk_neg*100:.1f}%"
-                                f" v_pos={a_v_pos*100:.1f}% v_neg={a_v_neg*100:.1f}%{a_extra}"
+                                f"      attn: qk_pos={a_qk_pos*n_qk_cfg:.0f}({a_qk_pos*100:.1f}%)"
+                                f" qk_neg={a_qk_neg*n_qk_cfg:.0f}({a_qk_neg*100:.1f}%)"
+                                f" v_pos={a_v_pos*n_v_cfg:.0f}({a_v_pos*100:.1f}%)"
+                                f" v_neg={a_v_neg*n_v_cfg:.0f}({a_v_neg*100:.1f}%){a_extra}"
                                 f" s_std={a_sstd:.3f}"
                                 f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                                 f" out_norm={a_out_n:.3f}")
@@ -2412,8 +2416,10 @@ def main():
                             if a_qk_phi > 0:
                                 a_phi_s = f" qk_phi={a_qk_phi*100:.1f}% v_phi={a_v_phi*100:.1f}% qk_z={a_qk_z:.2f} v_z={a_v_z:.2f}"
                             log_message(
-                                f"      attn: qk_active={a_qk_act:.1%}"
-                                f" v_active={a_v_act:.1%}{a_strong_s}{a_extra}"
+                                f"      attn: qk_active={a_qk_act*n_qk_cfg:.0f}/{n_qk_cfg}"
+                                f"({a_qk_act*100:.1f}%)"
+                                f" v_active={a_v_act*n_v_cfg:.0f}/{n_v_cfg}"
+                                f"({a_v_act*100:.1f}%){a_strong_s}{a_extra}"
                                 f" s_std={a_sstd:.3f}"
                                 f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                                 f" out_norm={a_out_n:.3f}{a_phi_s}")
@@ -2470,7 +2476,9 @@ def main():
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
-                    # JSONL structured log
+                    # JSONL structured log.
+                    # *_loss / tau_reg: raw values (pre-weight).
+                    # *_weighted: contribution to total_loss (= raw * weight).
                     log_jsonl({
                         'type': 'train',
                         'step': global_step,
@@ -2481,6 +2489,10 @@ def main():
                         'tau_reg': avg_tau_reg,
                         'orth_loss': avg_orth,
                         'div_loss': avg_div,
+                        'aux_weighted': lb_weight * avg_aux,
+                        'tau_reg_weighted': tau_reg_weight * avg_tau_reg,
+                        'orth_weighted': orth_weight * avg_orth,
+                        'div_weighted': div_weight * avg_div,
                         'accuracy': avg_acc,
                         'lr': current_lr,
                         'steps_per_sec': steps_per_sec,
