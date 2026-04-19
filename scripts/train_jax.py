@@ -2312,6 +2312,25 @@ def main():
                     )
                     log_message(msg)
 
+                    # Defensive defaults for downstream JSONL so values exist
+                    # even if the detailed-stats block below raises.
+                    a_tau_s = np.zeros(3, dtype=np.float32)
+                    k_tau_s = 0.0
+                    a_kern = 0.0
+                    k_kern = 0.0
+                    k_tau_abs = 0.0
+                    a_tau_abs = 0.0
+                    k_z075 = 0.0
+                    a_z075 = 0.0
+                    k_z030 = 0.0
+                    a_z030 = 0.0
+                    k_skew = 0.0
+                    a_skew = 0.0
+                    k_apt = 0.0
+                    a_apt = 0.0
+                    k_ent = 0.0
+                    a_ent = 0.0
+
                     # Detailed stats (all from metrics, no params access)
                     try:
                         tk_b = _m(metrics['tau_know_bias'])
@@ -2583,6 +2602,25 @@ def main():
                         'drift_qk_emb': drift_qk,
                         'drift_v_emb': drift_v,
                         'drift_know_emb': drift_know,
+                        # Tau dynamics (Phase 1/2/3a/4 metrics; instantaneous, not window-averaged)
+                        'attn_tau_std_q': float(a_tau_s[0]),
+                        'attn_tau_std_k': float(a_tau_s[1]),
+                        'attn_tau_std_v': float(a_tau_s[2]),
+                        'know_tau_std': k_tau_s,
+                        'attn_tau_kernel_norm': a_kern,
+                        'know_tau_kernel_norm': k_kern,
+                        'attn_tau_abs_mean': a_tau_abs,
+                        'know_tau_abs_mean': k_tau_abs,
+                        'attn_z_lt_075': a_z075,
+                        'know_z_lt_075': k_z075,
+                        'attn_z_lt_030': a_z030,
+                        'know_z_lt_030': k_z030,
+                        'attn_score_skew': a_skew,
+                        'know_score_skew': k_skew,
+                        'attn_active_per_token_std': a_apt,
+                        'know_active_per_token_std': k_apt,
+                        'attn_gate_entropy': a_ent,
+                        'know_gate_entropy': k_ent,
                         'accuracy': avg_acc,
                         'lr': current_lr,
                         'steps_per_sec': steps_per_sec,

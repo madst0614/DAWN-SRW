@@ -1165,7 +1165,7 @@ class DAWN(nn.Module):
             attn_v_norm_dbg_all = _z
             attn_logit_max_all = _z
             attn_o_input_norm_all = _z
-            attn_tau_std_all = _z
+            attn_tau_std_all = jnp.zeros((1, 3), dtype=jnp.float32)
             know_tau_std_all = _z
             attn_tau_kernel_norm_all = _z
             know_tau_kernel_norm_all = _z
