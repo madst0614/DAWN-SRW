@@ -816,6 +816,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_z_lt_075': result.get('know_z_lt_075', jnp.float32(0.0)),
             'attn_z_lt_030': result.get('attn_z_lt_030', jnp.float32(0.0)),
             'know_z_lt_030': result.get('know_z_lt_030', jnp.float32(0.0)),
+            'attn_score_skew': result.get('attn_score_skew', jnp.float32(0.0)),
+            'know_score_skew': result.get('know_score_skew', jnp.float32(0.0)),
+            'attn_active_per_token_std': result.get('attn_active_per_token_std', jnp.float32(0.0)),
+            'know_active_per_token_std': result.get('know_active_per_token_std', jnp.float32(0.0)),
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
@@ -2378,6 +2382,15 @@ def main():
                             f" z<075={k_z075*100:.1f}% z<030={k_z030*100:.1f}%]"
                             f" a[abs={a_tau_abs:+.3f}"
                             f" z<075={a_z075*100:.1f}% z<030={a_z030*100:.1f}%]")
+
+                        # Score-dist skewness + active-count std across tokens
+                        k_skew = _m(metrics.get('know_score_skew', 0.0))
+                        a_skew = _m(metrics.get('attn_score_skew', 0.0))
+                        k_apt = _m(metrics.get('know_active_per_token_std', 0.0))
+                        a_apt = _m(metrics.get('attn_active_per_token_std', 0.0))
+                        log_message(
+                            f"      dist: k[skew={k_skew:+.2f} apt_std={k_apt:.1f}]"
+                            f" a[skew={a_skew:+.2f} apt_std={a_apt:.1f}]")
                         log_message(
                             f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
