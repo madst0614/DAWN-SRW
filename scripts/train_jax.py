@@ -57,6 +57,7 @@ from models.dawn_spatial_v399_exp import DAWN as DAWN_SpatialV399Exp
 from models.dawn_spatial_v400_exp import DAWN as DAWN_SpatialV400Exp
 from models.dawn_spatial_v401_exp import DAWN as DAWN_SpatialV401Exp
 from models.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
+from models.dawn_spatial_v403_exp import DAWN as DAWN_SpatialV403Exp
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -146,8 +147,11 @@ def build_model_from_config(cfg):
             n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
             n_chunks_v=cfg['training'].get('n_chunks_v', 1),
         )
-    elif version in ('spatial-r1-v3.9.9', 'spatial-r1-v4.0.1'):
-        _cls = DAWN_SpatialV401Exp if version == 'spatial-r1-v4.0.1' else DAWN_SpatialV399Exp
+    elif version in ('spatial-r1-v3.9.9', 'spatial-r1-v4.0.1', 'spatial-r1-v4.0.3'):
+        _cls = {
+            'spatial-r1-v4.0.1': DAWN_SpatialV401Exp,
+            'spatial-r1-v4.0.3': DAWN_SpatialV403Exp,
+        }.get(version, DAWN_SpatialV399Exp)
         model = _cls(
             vocab_size=mcfg.get('vocab_size', 30522),
             d_model=mcfg.get('d_model', 384),
@@ -822,6 +826,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_active_per_token_std': result.get('know_active_per_token_std', jnp.float32(0.0)),
             'attn_gate_entropy': result.get('attn_gate_entropy', jnp.float32(0.0)),
             'know_gate_entropy': result.get('know_gate_entropy', jnp.float32(0.0)),
+            'attn_z_sum': result.get('attn_z_sum', jnp.float32(0.0)),
+            'know_z_sum': result.get('know_z_sum', jnp.float32(0.0)),
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
@@ -1676,7 +1682,7 @@ def main():
     # Create shard_map functions if mesh_model > 1
     _sharded_fns = None
     if mesh_model > 1:
-        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp'}.get(model_version, 'models.dawn_spatial_v3')
         _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
@@ -1762,7 +1768,7 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp'}.get(model_version, 'models.dawn_spatial_v3')
             _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
@@ -2330,6 +2336,8 @@ def main():
                     a_apt = 0.0
                     k_ent = 0.0
                     a_ent = 0.0
+                    k_zsum = 0.0
+                    a_zsum = 0.0
 
                     # Detailed stats (all from metrics, no params access)
                     try:
@@ -2354,6 +2362,7 @@ def main():
                         k_sstd = _m(metrics.get('know_score_std', 0.0))
                         k_raw_gmax = _m(metrics.get('know_raw_gate_max', metrics.get('know_gate_max', 0.0)))
                         k_gsum = _m(metrics.get('know_gate_sum', 0.0))
+                        k_zsum = _m(metrics.get('know_z_sum', 0.0))
                         k_gconc = _m(metrics.get('know_gate_conc', 0.0))
                         k_anm = _m(metrics.get('know_active_n_mean', 0.0))
                         k_strong = _m(metrics.get('know_strong', 0.0))
@@ -2364,6 +2373,7 @@ def main():
                         a_sstd = _m(metrics.get('attn_score_std', 0.0))
                         a_raw_gmax = _m(metrics.get('attn_raw_gate_max', metrics.get('attn_gate_max', 0.0)))
                         a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
+                        a_zsum = _m(metrics.get('attn_z_sum', 0.0))
                         a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
                         a_anm = _m(metrics.get('attn_active_n_mean', 0.0))
                         a_strong = _m(metrics.get('attn_strong', 0.0))
@@ -2458,6 +2468,8 @@ def main():
                             k_extra = f" gate_max={k_raw_gmax:.4f} conc={k_gconc:.1f} gsum={k_gsum:.1f}"
                         if k_anm > 0:  # v3.9.5
                             k_extra = f" gate_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
+                        if k_zsum > 0:  # v4.0.3 (Σz^+ denominator)
+                            k_extra += f" z_sum={k_zsum:.1f}"
                         if k_aN > 0:    # v3.9.2
                             k_extra += f" active_N={k_aN:.0f}"
 
@@ -2497,6 +2509,8 @@ def main():
                             a_extra = f" gate_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
                         if a_aN > 0:    # v3.9.2
                             a_extra += f" active_N={a_aN:.0f}"
+                        if a_zsum > 0:  # v4.0.3 (Σz^+ denominator)
+                            a_extra += f" z_sum={a_zsum:.1f}"
 
                         _has_attn_pos = bool(metrics.get('attn_qk_pos', metrics.get('attn_pos', 0.0)))
                         if _has_attn_pos:
@@ -2621,6 +2635,8 @@ def main():
                         'know_active_per_token_std': k_apt,
                         'attn_gate_entropy': a_ent,
                         'know_gate_entropy': k_ent,
+                        'attn_z_sum': a_zsum,
+                        'know_z_sum': k_zsum,
                         'accuracy': avg_acc,
                         'lr': current_lr,
                         'steps_per_sec': steps_per_sec,
