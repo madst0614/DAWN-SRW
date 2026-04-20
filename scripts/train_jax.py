@@ -830,11 +830,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_z_sum': result.get('know_z_sum', jnp.float32(0.0)),
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_emb_norm_max': result.get('know_emb_norm_max', jnp.float32(0.0)),
+            'know_emb_norm_min': result.get('know_emb_norm_min', jnp.float32(0.0)),
             'know_emb_norm_std': result.get('know_emb_norm_std', jnp.float32(0.0)),
             'qk_emb_norm_mean': result.get('qk_emb_norm_mean', jnp.float32(0.0)),
             'qk_emb_norm_max': result.get('qk_emb_norm_max', jnp.float32(0.0)),
+            'qk_emb_norm_min': result.get('qk_emb_norm_min', jnp.float32(0.0)),
+            'qk_emb_norm_std': result.get('qk_emb_norm_std', jnp.float32(0.0)),
             'v_emb_norm_mean': result.get('v_emb_norm_mean', jnp.float32(0.0)),
             'v_emb_norm_max': result.get('v_emb_norm_max', jnp.float32(0.0)),
+            'v_emb_norm_min': result.get('v_emb_norm_min', jnp.float32(0.0)),
+            'v_emb_norm_std': result.get('v_emb_norm_std', jnp.float32(0.0)),
+            'attn_score_kurt': result.get('attn_score_kurt', jnp.float32(0.0)),
+            'know_score_kurt': result.get('know_score_kurt', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
             'tau_know_bias': tau_know_b[0],
@@ -2345,11 +2352,18 @@ def main():
                     k_zsum = 0.0
                     a_zsum = 0.0
                     k_emb_nmax = 0.0
+                    k_emb_nmin = 0.0
                     k_emb_nstd = 0.0
                     qk_emb_nmean = 0.0
                     qk_emb_nmax = 0.0
+                    qk_emb_nmin = 0.0
+                    qk_emb_nstd = 0.0
                     v_emb_nmean = 0.0
                     v_emb_nmax = 0.0
+                    v_emb_nmin = 0.0
+                    v_emb_nstd = 0.0
+                    k_kurt = 0.0
+                    a_kurt = 0.0
 
                     # Detailed stats (all from metrics, no params access)
                     try:
@@ -2436,21 +2450,35 @@ def main():
                         a_apt = _m(metrics.get('attn_active_per_token_std', 0.0))
                         k_ent = _m(metrics.get('know_gate_entropy', 0.0))
                         a_ent = _m(metrics.get('attn_gate_entropy', 0.0))
+                        k_kurt = _m(metrics.get('know_score_kurt', 0.0))
+                        a_kurt = _m(metrics.get('attn_score_kurt', 0.0))
                         log_message(
-                            f"      dist: k[skew={k_skew:+.2f} apt_std={k_apt:.1f} ent={k_ent:.2f}]"
-                            f" a[skew={a_skew:+.2f} apt_std={a_apt:.1f} ent={a_ent:.2f}]")
+                            f"      dist: k[skew={k_skew:+.2f} kurt={k_kurt:.2f}"
+                            f" apt_std={k_apt:.1f} ent={k_ent:.2f}]"
+                            f" a[skew={a_skew:+.2f} kurt={a_kurt:.2f}"
+                            f" apt_std={a_apt:.1f} ent={a_ent:.2f}]")
 
-                        # Emb norm per-pool stats (mean / max, + std for know)
+                        # Emb norm per-pool stats (mean / max / min / std)
                         k_emb_nmax = _m(metrics.get('know_emb_norm_max', 0.0))
+                        k_emb_nmin = _m(metrics.get('know_emb_norm_min', 0.0))
                         k_emb_nstd = _m(metrics.get('know_emb_norm_std', 0.0))
                         qk_emb_nmean = _m(metrics.get('qk_emb_norm_mean', 0.0))
                         qk_emb_nmax = _m(metrics.get('qk_emb_norm_max', 0.0))
+                        qk_emb_nmin = _m(metrics.get('qk_emb_norm_min', 0.0))
+                        qk_emb_nstd = _m(metrics.get('qk_emb_norm_std', 0.0))
                         v_emb_nmean = _m(metrics.get('v_emb_norm_mean', 0.0))
                         v_emb_nmax = _m(metrics.get('v_emb_norm_max', 0.0))
+                        v_emb_nmin = _m(metrics.get('v_emb_norm_min', 0.0))
+                        v_emb_nstd = _m(metrics.get('v_emb_norm_std', 0.0))
                         log_message(
-                            f"      emb_n: know[mean={k_emb_n:.3f} max={k_emb_nmax:.3f} std={k_emb_nstd:.3f}]"
-                            f" qk[mean={qk_emb_nmean:.3f} max={qk_emb_nmax:.3f}]"
-                            f" v[mean={v_emb_nmean:.3f} max={v_emb_nmax:.3f}]")
+                            f"      emb_n know: mean={k_emb_n:.3f} max={k_emb_nmax:.3f}"
+                            f" min={k_emb_nmin:.3f} std={k_emb_nstd:.3f}")
+                        log_message(
+                            f"      emb_n qk:   mean={qk_emb_nmean:.3f} max={qk_emb_nmax:.3f}"
+                            f" min={qk_emb_nmin:.3f} std={qk_emb_nstd:.3f}")
+                        log_message(
+                            f"      emb_n v:    mean={v_emb_nmean:.3f} max={v_emb_nmax:.3f}"
+                            f" min={v_emb_nmin:.3f} std={v_emb_nstd:.3f}")
 
                         # Emb drift (relative L2 change since last LOG_INTERVAL snapshot).
                         drift_qk = drift_v = drift_know = 0.0
@@ -2662,11 +2690,18 @@ def main():
                         'attn_z_sum': a_zsum,
                         'know_z_sum': k_zsum,
                         'know_emb_norm_max': k_emb_nmax,
+                        'know_emb_norm_min': k_emb_nmin,
                         'know_emb_norm_std': k_emb_nstd,
                         'qk_emb_norm_mean': qk_emb_nmean,
                         'qk_emb_norm_max': qk_emb_nmax,
+                        'qk_emb_norm_min': qk_emb_nmin,
+                        'qk_emb_norm_std': qk_emb_nstd,
                         'v_emb_norm_mean': v_emb_nmean,
                         'v_emb_norm_max': v_emb_nmax,
+                        'v_emb_norm_min': v_emb_nmin,
+                        'v_emb_norm_std': v_emb_nstd,
+                        'attn_score_kurt': a_kurt,
+                        'know_score_kurt': k_kurt,
                         'accuracy': avg_acc,
                         'lr': current_lr,
                         'steps_per_sec': steps_per_sec,

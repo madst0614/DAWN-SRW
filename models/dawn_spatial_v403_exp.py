@@ -222,7 +222,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
                         P(),                     # score_skew scalar
                         P(),                     # active_per_token_std scalar
                         P(),                     # gate_entropy scalar
-                        P()),                    # z_sum_out scalar (v4.0.3)
+                        P(),                     # z_sum_out scalar (v4.0.3)
+                        P()),                    # score_kurt scalar
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, tau_offset, read_local, write_local):
         N_local = emb_local.shape[0]
@@ -242,7 +243,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
         @jax.checkpoint
         def stats_step(carry, i):
-            s_sum, sq_sum, cube_sum, ns_sum, ns_sq = carry
+            s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             scores = h_bf @ ec.T
@@ -250,20 +251,22 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
             sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
             cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
+            quad_sum = quad_sum + (scores_f ** 4).sum(axis=-1, keepdims=True)
             # Score LB: per-neuron score mean stats
             per_neuron_score = scores_f.mean(axis=(0, 1))  # [cs]
             ns_sum = ns_sum + per_neuron_score.sum()
             ns_sq = ns_sq + (per_neuron_score ** 2).sum()
-            return (s_sum, sq_sum, cube_sum, ns_sum, ns_sq), None
+            return (s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq), None
 
         z_bs1 = jnp.zeros((B, S, 1))
         z_scalar = jnp.float32(0.0)
-        (local_sum, local_sq, local_cube, ns_sum, ns_sq), _ = jax.lax.scan(
-            stats_step, (z_bs1, z_bs1, z_bs1, z_scalar, z_scalar), jnp.arange(nc))
+        (local_sum, local_sq, local_cube, local_quad, ns_sum, ns_sq), _ = jax.lax.scan(
+            stats_step, (z_bs1, z_bs1, z_bs1, z_bs1, z_scalar, z_scalar), jnp.arange(nc))
 
         global_sum = jax.lax.psum(local_sum, 'model')
         global_sq = jax.lax.psum(local_sq, 'model')
         global_cube = jax.lax.psum(local_cube, 'model')
+        global_quad = jax.lax.psum(local_quad, 'model')
         N_total = N_local * _model_axis_size
 
         s_mean = global_sum / N_total
@@ -274,6 +277,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         cube_mean = global_cube / N_total
         central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
         score_skew = jax.lax.stop_gradient((central_third / (s_std ** 3 + 1e-8)).mean())
+        # Kurtosis via E[(X-μ)^4] = E[X^4] - 4μE[X^3] + 6μ²σ² + 3μ⁴
+        quad_mean = global_quad / N_total
+        central_fourth = (quad_mean - 4.0 * s_mean * cube_mean
+                          + 6.0 * (s_mean ** 2) * (s_std ** 2) + 3.0 * s_mean ** 4)
+        score_kurt = jax.lax.stop_gradient((central_fourth / (s_std ** 4 + 1e-8)).mean())
 
         # Score LB: variance of per-neuron score mean * N
         ns_sum = jax.lax.psum(ns_sum, 'data') / _data_axis_size
@@ -363,7 +371,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         return (out.astype(jnp.float32), active_frac, global_gate_max, score_lb,
                 score_std_out, es_out, active_n_mean, strong_frac, phi_binary_frac, z_mean_active,
                 tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
-                score_skew, active_per_token_std, gate_entropy, z_sum_out)
+                score_skew, active_per_token_std, gate_entropy, z_sum_out,
+                score_kurt)
 
     return fused_gate_srw
 
@@ -403,7 +412,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
                         P(),                         # score_skew scalar
                         P(),                         # active_per_token_std scalar
                         P(),                         # gate_entropy scalar
-                        P()),                        # z_sum_out scalar (v4.0.3)
+                        P(),                         # z_sum_out scalar (v4.0.3)
+                        P()),                        # score_kurt scalar
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, tau_offset, read_local, write_local):
         N_local = emb_local.shape[0]
@@ -424,7 +434,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
         @jax.checkpoint
         def stats_step(carry, i):
-            s_sum, sq_sum, cube_sum, ns_sum, ns_sq = carry
+            s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
@@ -432,20 +442,22 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
             sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
             cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
+            quad_sum = quad_sum + (scores_f ** 4).sum(axis=-1, keepdims=True)
             # Score LB: per-neuron score mean stats (averaged over batch, seq, route)
             per_neuron_score = scores_f.mean(axis=(0, 1, 2))  # [cs]
             ns_sum = ns_sum + per_neuron_score.sum()
             ns_sq = ns_sq + (per_neuron_score ** 2).sum()
-            return (s_sum, sq_sum, cube_sum, ns_sum, ns_sq), None
+            return (s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq), None
 
         z_bsr1 = jnp.zeros((B, S, 2, 1))
         z_scalar = jnp.float32(0.0)
-        (local_sum, local_sq, local_cube, ns_sum, ns_sq), _ = jax.lax.scan(
-            stats_step, (z_bsr1, z_bsr1, z_bsr1, z_scalar, z_scalar), jnp.arange(nc))
+        (local_sum, local_sq, local_cube, local_quad, ns_sum, ns_sq), _ = jax.lax.scan(
+            stats_step, (z_bsr1, z_bsr1, z_bsr1, z_bsr1, z_scalar, z_scalar), jnp.arange(nc))
 
         global_sum = jax.lax.psum(local_sum, 'model')  # [B,S,2,1]
         global_sq = jax.lax.psum(local_sq, 'model')
         global_cube = jax.lax.psum(local_cube, 'model')
+        global_quad = jax.lax.psum(local_quad, 'model')
         N_total = N_local * _model_axis_size
 
         s_mean = global_sum / N_total      # [B,S,2,1]
@@ -456,6 +468,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         cube_mean = global_cube / N_total
         central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
         score_skew = jax.lax.stop_gradient((central_third / (s_std ** 3 + 1e-8)).mean())
+        # Kurtosis via E[(X-μ)^4] = E[X^4] - 4μE[X^3] + 6μ²σ² + 3μ⁴
+        quad_mean = global_quad / N_total
+        central_fourth = (quad_mean - 4.0 * s_mean * cube_mean
+                          + 6.0 * (s_mean ** 2) * (s_std ** 2) + 3.0 * s_mean ** 4)
+        score_kurt = jax.lax.stop_gradient((central_fourth / (s_std ** 4 + 1e-8)).mean())
 
         # Score LB: variance of per-neuron score mean * N
         ns_sum = jax.lax.psum(ns_sum, 'data') / _data_axis_size
@@ -551,7 +568,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         return (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb,
                 score_std_out, es_out, active_n_mean, strong_frac_mean, phi_binary_frac_mean,
                 z_mean_active_mean, tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
-                score_skew, active_per_token_std, gate_entropy, z_sum_out)
+                score_skew, active_per_token_std, gate_entropy, z_sum_out,
+                score_kurt)
 
     return fused_gate_srw_paired
 
@@ -576,7 +594,7 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
     # --- Exact stats over ALL chunks (scan + checkpoint) ---
     @jax.checkpoint
     def stats_step(carry, i):
-        s_sum, sq_sum, cube_sum, ns_sum, ns_sq = carry
+        s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
         s = i * cs
         ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
         scores = h_bf @ ec.T
@@ -584,16 +602,17 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
         sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
         cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
+        quad_sum = quad_sum + (scores_f ** 4).sum(axis=-1, keepdims=True)
         # Score LB: per-neuron score mean stats
         per_neuron_score = scores_f.mean(axis=(0, 1))  # [cs]
         ns_sum = ns_sum + per_neuron_score.sum()
         ns_sq = ns_sq + (per_neuron_score ** 2).sum()
-        return (s_sum, sq_sum, cube_sum, ns_sum, ns_sq), None
+        return (s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq), None
 
     z_bs1 = jnp.zeros((B, S, 1))
     z_scalar = jnp.float32(0.0)
-    (s_sum, sq_sum, cube_sum, ns_sum, ns_sq), _ = jax.lax.scan(
-        stats_step, (z_bs1, z_bs1, z_bs1, z_scalar, z_scalar), jnp.arange(n_chunks))
+    (s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq), _ = jax.lax.scan(
+        stats_step, (z_bs1, z_bs1, z_bs1, z_bs1, z_scalar, z_scalar), jnp.arange(n_chunks))
     s_mean = s_sum / N
     s_std = jnp.sqrt(sq_sum / N - s_mean**2) + 1e-8
     tau = s_mean + tau_offset * s_std
@@ -602,6 +621,11 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
     cube_mean = cube_sum / N
     central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
     score_skew = jax.lax.stop_gradient((central_third / (s_std ** 3 + 1e-8)).mean())
+    # Kurtosis via E[(X-μ)^4] = E[X^4] - 4μE[X^3] + 6μ²σ² + 3μ⁴
+    quad_mean = quad_sum / N
+    central_fourth = (quad_mean - 4.0 * s_mean * cube_mean
+                      + 6.0 * (s_mean ** 2) * (s_std ** 2) + 3.0 * s_mean ** 4)
+    score_kurt = jax.lax.stop_gradient((central_fourth / (s_std ** 4 + 1e-8)).mean())
 
     # Score LB: CV² of per-neuron score mean (spread-invariant)
     mean_score = ns_sum / N
@@ -678,7 +702,8 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
             score_std_out, es_out, active_n_mean, total_strong / N,
             total_phi_binary / N, z_mean_active,
             tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
-            score_skew, active_per_token_std, gate_entropy, z_sum_out)
+            score_skew, active_per_token_std, gate_entropy, z_sum_out,
+            score_kurt)
 
 
 # ================================================================
@@ -771,9 +796,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     _qk_emb_norms = jax.lax.stop_gradient(jnp.linalg.norm(qk_emb, axis=-1))
     qk_emb_norm_mean = _qk_emb_norms.mean()
     qk_emb_norm_max = _qk_emb_norms.max()
+    qk_emb_norm_min = _qk_emb_norms.min()
+    qk_emb_norm_std = _qk_emb_norms.std()
     _v_emb_norms = jax.lax.stop_gradient(jnp.linalg.norm(v_emb, axis=-1))
     v_emb_norm_mean = _v_emb_norms.mean()
     v_emb_norm_max = _v_emb_norms.max()
+    v_emb_norm_min = _v_emb_norms.min()
+    v_emb_norm_std = _v_emb_norms.std()
 
     rng, rng_drop = jax.random.split(rng)
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
@@ -798,7 +827,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         (QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
          qk_strong, qk_phi_bin, qk_z_act,
          qk_tau_abs, qk_z075, qk_z030,
-         qk_skew, qk_apt_std, qk_entropy, qk_z_sum) = fused_paired(
+         qk_skew, qk_apt_std, qk_entropy, qk_z_sum, qk_kurt) = fused_paired(
             x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write)
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
         Q = QK_out[:, :, 0, :] * qk_scale
@@ -806,7 +835,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         (V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
          v_strong, v_phi_bin, v_z_act,
          v_tau_abs, v_z075, v_z030,
-         v_skew, v_apt_std, v_entropy, v_z_sum) = fused_single(
+         v_skew, v_apt_std, v_entropy, v_z_sum, v_kurt) = fused_single(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write)
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
         V = V * v_scale
@@ -814,17 +843,17 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         (Q, q_active, q_raw_gmax, q_lb, q_sstd, q_es, q_anm,
          q_strong, q_phi_bin, q_z_act,
          q_tau_abs, q_z075, q_z030,
-         q_skew, q_apt_std, q_entropy, q_z_sum) = _srw_chunked(
+         q_skew, q_apt_std, q_entropy, q_z_sum, q_kurt) = _srw_chunked(
             x, h_Q, qk_emb_unit, tau_all[:, :, 0:1], qk_read, qk_write, n_chunks_qk)
         (K, k_active, k_raw_gmax, k_lb, k_sstd, k_es, k_anm,
          k_strong, k_phi_bin, k_z_act,
          k_tau_abs, k_z075, k_z030,
-         k_skew, k_apt_std, k_entropy, k_z_sum) = _srw_chunked(
+         k_skew, k_apt_std, k_entropy, k_z_sum, k_kurt) = _srw_chunked(
             x, h_K, qk_emb_unit, tau_all[:, :, 1:2], qk_read, qk_write, n_chunks_qk)
         (V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
          v_strong, v_phi_bin, v_z_act,
          v_tau_abs, v_z075, v_z030,
-         v_skew, v_apt_std, v_entropy, v_z_sum) = _srw_chunked(
+         v_skew, v_apt_std, v_entropy, v_z_sum, v_kurt) = _srw_chunked(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write, n_chunks_v)
         qk_raw_norm = (jnp.linalg.norm(Q, axis=-1).mean() + jnp.linalg.norm(K, axis=-1).mean()) / 2
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
@@ -847,6 +876,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         qk_apt_std = (q_apt_std + k_apt_std) / 2
         qk_entropy = (q_entropy + k_entropy) / 2
         qk_z_sum = (q_z_sum + k_z_sum) / 2
+        qk_kurt = (q_kurt + k_kurt) / 2
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -900,6 +930,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_active_per_token_std = (qk_apt_std + v_apt_std) / 2
     attn_gate_entropy = (qk_entropy + v_entropy) / 2
     attn_z_sum = (qk_z_sum + v_z_sum) / 2
+    attn_score_kurt = (qk_kurt + v_kurt) / 2
     return (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax,
             attn_score_std, attn_gate_sum, attn_active_n_mean,
             attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
@@ -911,7 +942,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             attn_score_skew, attn_active_per_token_std, attn_gate_entropy,
             attn_z_sum,
             qk_emb_norm_mean, qk_emb_norm_max,
-            v_emb_norm_mean, v_emb_norm_max)
+            v_emb_norm_mean, v_emb_norm_max,
+            qk_emb_norm_min, qk_emb_norm_std,
+            v_emb_norm_min, v_emb_norm_std,
+            attn_score_kurt)
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -942,14 +976,14 @@ def _know_forward(x, pool_params, router_params, rng,
          strong_frac, phi_binary_frac, z_mean_act,
          know_tau_abs_mean, know_z_lt_075_frac, know_z_lt_030_frac,
          know_score_skew, know_active_per_token_std, know_gate_entropy,
-         know_z_sum) = fused_single(
+         know_z_sum, know_score_kurt) = fused_single(
             x, h, know_emb_unit, tau, know_read, know_write)
     else:
         (out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean,
          strong_frac, phi_binary_frac, z_mean_act,
          know_tau_abs_mean, know_z_lt_075_frac, know_z_lt_030_frac,
          know_score_skew, know_active_per_token_std, know_gate_entropy,
-         know_z_sum) = _srw_chunked(
+         know_z_sum, know_score_kurt) = _srw_chunked(
             x, h, know_emb_unit, tau, know_read, know_write, n_chunks_know)
 
     know_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
@@ -964,6 +998,7 @@ def _know_forward(x, pool_params, router_params, rng,
     _know_emb_norms = jax.lax.stop_gradient(jnp.linalg.norm(know_emb, axis=-1))
     emb_norm_val = _know_emb_norms.mean()
     know_emb_norm_max = _know_emb_norms.max()
+    know_emb_norm_min = _know_emb_norms.min()
     know_emb_norm_std = _know_emb_norms.std()
     read_norm_val = jnp.linalg.norm(know_read, axis=-1).mean()
     write_norm_val = jnp.linalg.norm(know_write, axis=-1).mean()
@@ -978,7 +1013,8 @@ def _know_forward(x, pool_params, router_params, rng,
             know_tau_abs_mean, know_z_lt_075_frac, know_z_lt_030_frac,
             know_score_skew, know_active_per_token_std, know_gate_entropy,
             know_z_sum,
-            know_emb_norm_max, know_emb_norm_std)
+            know_emb_norm_max, know_emb_norm_std,
+            know_emb_norm_min, know_score_kurt)
 
 
 # ================================================================
@@ -1132,6 +1168,13 @@ class DAWN(nn.Module):
             attn_v_emb_n_max_all = _z
             know_emb_n_max_all = _z
             know_emb_n_std_all = _z
+            attn_qk_emb_n_min_all = _z
+            attn_qk_emb_n_std_all = _z
+            attn_v_emb_n_min_all = _z
+            attn_v_emb_n_std_all = _z
+            know_emb_n_min_all = _z
+            attn_score_kurt_all = _z
+            know_score_kurt_all = _z
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
@@ -1177,7 +1220,10 @@ class DAWN(nn.Module):
                  a_tau_abs, a_z075, a_z030,
                  a_skew, a_apt_std, a_entropy, a_z_sum,
                  a_qk_emb_n_mean, a_qk_emb_n_max,
-                 a_v_emb_n_mean, a_v_emb_n_max
+                 a_v_emb_n_mean, a_v_emb_n_max,
+                 a_qk_emb_n_min, a_qk_emb_n_std,
+                 a_v_emb_n_min, a_v_emb_n_std,
+                 a_score_kurt
                 ) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
@@ -1196,7 +1242,8 @@ class DAWN(nn.Module):
                  k_tau_std, k_tau_kernel_norm,
                  k_tau_abs, k_z075, k_z030,
                  k_skew, k_apt_std, k_entropy, k_z_sum,
-                 k_emb_n_max, k_emb_n_std
+                 k_emb_n_max, k_emb_n_std,
+                 k_emb_n_min, k_score_kurt
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
@@ -1224,7 +1271,11 @@ class DAWN(nn.Module):
                            a_z_sum, k_z_sum,
                            a_qk_emb_n_mean, a_qk_emb_n_max,
                            a_v_emb_n_mean, a_v_emb_n_max,
-                           k_emb_n_max, k_emb_n_std)
+                           k_emb_n_max, k_emb_n_std,
+                           a_qk_emb_n_min, a_qk_emb_n_std,
+                           a_v_emb_n_min, a_v_emb_n_std,
+                           k_emb_n_min,
+                           a_score_kurt, k_score_kurt)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -1253,7 +1304,11 @@ class DAWN(nn.Module):
                 attn_z_sum_all, know_z_sum_all,
                 attn_qk_emb_n_mean_all, attn_qk_emb_n_max_all,
                 attn_v_emb_n_mean_all, attn_v_emb_n_max_all,
-                know_emb_n_max_all, know_emb_n_std_all) = jax.lax.scan(
+                know_emb_n_max_all, know_emb_n_std_all,
+                attn_qk_emb_n_min_all, attn_qk_emb_n_std_all,
+                attn_v_emb_n_min_all, attn_v_emb_n_std_all,
+                know_emb_n_min_all,
+                attn_score_kurt_all, know_score_kurt_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -1320,10 +1375,17 @@ class DAWN(nn.Module):
             'know_z_sum': know_z_sum_all.mean(),
             'qk_emb_norm_mean': attn_qk_emb_n_mean_all.mean(),
             'qk_emb_norm_max': attn_qk_emb_n_max_all.max(),
+            'qk_emb_norm_min': attn_qk_emb_n_min_all.min(),
+            'qk_emb_norm_std': attn_qk_emb_n_std_all.mean(),
             'v_emb_norm_mean': attn_v_emb_n_mean_all.mean(),
             'v_emb_norm_max': attn_v_emb_n_max_all.max(),
+            'v_emb_norm_min': attn_v_emb_n_min_all.min(),
+            'v_emb_norm_std': attn_v_emb_n_std_all.mean(),
             'know_emb_norm_max': know_emb_n_max_all.max(),
+            'know_emb_norm_min': know_emb_n_min_all.min(),
             'know_emb_norm_std': know_emb_n_std_all.mean(),
+            'attn_score_kurt': attn_score_kurt_all.mean(),
+            'know_score_kurt': know_score_kurt_all.mean(),
             'attn_qk_raw_norm': attn_qk_raw_norm_all.mean(),
             'attn_v_raw_norm': attn_v_raw_norm_all.mean(),
             'know_raw_out_norm': know_raw_out_norm_all.mean(),
