@@ -356,15 +356,25 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             # v4.0.4: reverse dropout — weak neurons get stochastic z-boost.
             # reverse_p_max_eff is a runtime scalar; eval passes 0 and the
             # constant-fold makes mask all-False (dead-code eliminated).
-            active_z = jnp.where(z > 0, z, 0.0)
-            neuron_sum = active_z.sum(axis=(0, 1))                   # [cs]
+            # Sampling-based weakness: 512 random tokens (Monte-Carlo of the
+            # full B*S reduction). The (B*S / SAMPLE) scale cancels in
+            # neuron_sum / mean_sum but is kept for readability.
+            B_z, S_z, cs_z = z.shape
+            SAMPLE_SIZE = 512
+            sample_key = jax.random.fold_in(_rng_shard, i * 2)
+            z_flat = z.reshape(B_z * S_z, cs_z)
+            sample_idx = jax.random.randint(sample_key, (SAMPLE_SIZE,), 0, B_z * S_z)
+            z_sample = z_flat[sample_idx]                                # [SAMPLE, cs]
+            active_sample = jnp.where(z_sample > 0, z_sample, 0.0)
+            scale = jnp.float32(B_z * S_z) / jnp.float32(SAMPLE_SIZE)
+            neuron_sum = active_sample.sum(axis=0) * scale               # [cs]
             mean_sum = neuron_sum.mean() + 1e-8
-            weakness = jax.nn.relu(1.0 - neuron_sum / mean_sum)      # [cs]
-            z_peak = z.max(axis=-1, keepdims=True)                    # [B,S,1]
-            rev_key_i = jax.random.fold_in(_rng_shard, i)
+            weakness = jax.nn.relu(1.0 - neuron_sum / mean_sum)          # [cs]
+            z_peak = z.max(axis=-1, keepdims=True)                       # [B,S,1]
+            rev_key_i = jax.random.fold_in(_rng_shard, i * 2 + 1)
             rand_vals = jax.random.uniform(rev_key_i, z.shape, dtype=jnp.float32)
-            reverse_prob = weakness[None, None, :] * reverse_p_max_eff  # [1,1,cs]
-            reverse_mask = rand_vals < reverse_prob                   # [B,S,cs]
+            reverse_prob = weakness[None, None, :] * reverse_p_max_eff   # [1,1,cs]
+            reverse_mask = rand_vals < reverse_prob                      # [B,S,cs]
             z = jnp.where(reverse_mask, z_peak, z)
             chunk_rev_count = reverse_mask.astype(jnp.float32).sum()
 
@@ -580,12 +590,20 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
 
             # v4.0.4: reverse dropout (Q/K combined weakness over axis=(0,1,2)).
             # reverse_p_max_eff=0 at eval → mask all-False (constant-folded).
-            active_z = jnp.where(z > 0, z, 0.0)                       # [B,S,2,cs]
-            neuron_sum = active_z.sum(axis=(0, 1, 2))                 # [cs]
+            # Sampling-based weakness: 512 random (token, route) slots.
+            B_z, S_z, two_z, cs_z = z.shape
+            SAMPLE_SIZE = 512
+            sample_key = jax.random.fold_in(_rng_shard, i * 2)
+            z_flat = z.reshape(B_z * S_z * two_z, cs_z)
+            sample_idx = jax.random.randint(sample_key, (SAMPLE_SIZE,), 0, B_z * S_z * two_z)
+            z_sample = z_flat[sample_idx]                                # [SAMPLE, cs]
+            active_sample = jnp.where(z_sample > 0, z_sample, 0.0)
+            scale = jnp.float32(B_z * S_z * two_z) / jnp.float32(SAMPLE_SIZE)
+            neuron_sum = active_sample.sum(axis=0) * scale               # [cs]
             mean_sum = neuron_sum.mean() + 1e-8
-            weakness = jax.nn.relu(1.0 - neuron_sum / mean_sum)       # [cs]
-            z_peak = z.max(axis=-1, keepdims=True)                     # [B,S,2,1]
-            rev_key_i = jax.random.fold_in(_rng_shard, i)
+            weakness = jax.nn.relu(1.0 - neuron_sum / mean_sum)          # [cs]
+            z_peak = z.max(axis=-1, keepdims=True)                       # [B,S,2,1]
+            rev_key_i = jax.random.fold_in(_rng_shard, i * 2 + 1)
             rand_vals = jax.random.uniform(rev_key_i, z.shape, dtype=jnp.float32)
             reverse_prob = weakness[None, None, None, :] * reverse_p_max_eff
             reverse_mask = rand_vals < reverse_prob
