@@ -767,6 +767,14 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     qk_emb_unit = qk_emb
     v_emb_unit = v_emb
 
+    # Emb-norm monitoring (observational — stop_gradient to avoid VJP hazards).
+    _qk_emb_norms = jax.lax.stop_gradient(jnp.linalg.norm(qk_emb, axis=-1))
+    qk_emb_norm_mean = _qk_emb_norms.mean()
+    qk_emb_norm_max = _qk_emb_norms.max()
+    _v_emb_norms = jax.lax.stop_gradient(jnp.linalg.norm(v_emb, axis=-1))
+    v_emb_norm_mean = _v_emb_norms.mean()
+    v_emb_norm_max = _v_emb_norms.max()
+
     rng, rng_drop = jax.random.split(rng)
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
     h_all = safe_dropout(h_all, router_dropout, deterministic, rng_drop)
@@ -901,7 +909,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             attn_tau_std, attn_tau_kernel_norm,
             attn_tau_abs_mean, attn_z_lt_075_frac, attn_z_lt_030_frac,
             attn_score_skew, attn_active_per_token_std, attn_gate_entropy,
-            attn_z_sum)
+            attn_z_sum,
+            qk_emb_norm_mean, qk_emb_norm_max,
+            v_emb_norm_mean, v_emb_norm_max)
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -950,7 +960,11 @@ def _know_forward(x, pool_params, router_params, rng,
 
     tau_reg = jnp.maximum(tau, 0.0).mean() * 0.01
     aux = lb_loss + tau_reg
-    emb_norm_val = jnp.linalg.norm(know_emb, axis=-1).mean()
+    # Emb-norm monitoring (observational — stop_gradient).
+    _know_emb_norms = jax.lax.stop_gradient(jnp.linalg.norm(know_emb, axis=-1))
+    emb_norm_val = _know_emb_norms.mean()
+    know_emb_norm_max = _know_emb_norms.max()
+    know_emb_norm_std = _know_emb_norms.std()
     read_norm_val = jnp.linalg.norm(know_read, axis=-1).mean()
     write_norm_val = jnp.linalg.norm(know_write, axis=-1).mean()
     know_tau_mean = tau.mean()
@@ -963,7 +977,8 @@ def _know_forward(x, pool_params, router_params, rng,
             know_tau_std, know_tau_kernel_norm,
             know_tau_abs_mean, know_z_lt_075_frac, know_z_lt_030_frac,
             know_score_skew, know_active_per_token_std, know_gate_entropy,
-            know_z_sum)
+            know_z_sum,
+            know_emb_norm_max, know_emb_norm_std)
 
 
 # ================================================================
@@ -1111,6 +1126,12 @@ class DAWN(nn.Module):
             know_entropy_all = _z
             attn_z_sum_all = _z
             know_z_sum_all = _z
+            attn_qk_emb_n_mean_all = _z
+            attn_qk_emb_n_max_all = _z
+            attn_v_emb_n_mean_all = _z
+            attn_v_emb_n_max_all = _z
+            know_emb_n_max_all = _z
+            know_emb_n_std_all = _z
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
@@ -1154,7 +1175,9 @@ class DAWN(nn.Module):
                  a_qk_z_act, a_v_z_act,
                  a_tau_std, a_tau_kernel_norm,
                  a_tau_abs, a_z075, a_z030,
-                 a_skew, a_apt_std, a_entropy, a_z_sum
+                 a_skew, a_apt_std, a_entropy, a_z_sum,
+                 a_qk_emb_n_mean, a_qk_emb_n_max,
+                 a_v_emb_n_mean, a_v_emb_n_max
                 ) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
@@ -1172,7 +1195,8 @@ class DAWN(nn.Module):
                  k_tau_mean, k_raw_out_norm, k_strong, k_phi_bin, k_z_act,
                  k_tau_std, k_tau_kernel_norm,
                  k_tau_abs, k_z075, k_z030,
-                 k_skew, k_apt_std, k_entropy, k_z_sum
+                 k_skew, k_apt_std, k_entropy, k_z_sum,
+                 k_emb_n_max, k_emb_n_std
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
@@ -1197,7 +1221,10 @@ class DAWN(nn.Module):
                            a_skew, k_skew,
                            a_apt_std, k_apt_std,
                            a_entropy, k_entropy,
-                           a_z_sum, k_z_sum)
+                           a_z_sum, k_z_sum,
+                           a_qk_emb_n_mean, a_qk_emb_n_max,
+                           a_v_emb_n_mean, a_v_emb_n_max,
+                           k_emb_n_max, k_emb_n_std)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -1223,7 +1250,10 @@ class DAWN(nn.Module):
                 attn_skew_all, know_skew_all,
                 attn_apt_std_all, know_apt_std_all,
                 attn_entropy_all, know_entropy_all,
-                attn_z_sum_all, know_z_sum_all) = jax.lax.scan(
+                attn_z_sum_all, know_z_sum_all,
+                attn_qk_emb_n_mean_all, attn_qk_emb_n_max_all,
+                attn_v_emb_n_mean_all, attn_v_emb_n_max_all,
+                know_emb_n_max_all, know_emb_n_std_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -1288,6 +1318,12 @@ class DAWN(nn.Module):
             'know_gate_entropy': know_entropy_all.mean(),
             'attn_z_sum': attn_z_sum_all.mean(),
             'know_z_sum': know_z_sum_all.mean(),
+            'qk_emb_norm_mean': attn_qk_emb_n_mean_all.mean(),
+            'qk_emb_norm_max': attn_qk_emb_n_max_all.max(),
+            'v_emb_norm_mean': attn_v_emb_n_mean_all.mean(),
+            'v_emb_norm_max': attn_v_emb_n_max_all.max(),
+            'know_emb_norm_max': know_emb_n_max_all.max(),
+            'know_emb_norm_std': know_emb_n_std_all.mean(),
             'attn_qk_raw_norm': attn_qk_raw_norm_all.mean(),
             'attn_v_raw_norm': attn_v_raw_norm_all.mean(),
             'know_raw_out_norm': know_raw_out_norm_all.mean(),
