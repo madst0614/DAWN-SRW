@@ -59,6 +59,7 @@ from models.dawn_spatial_v401_exp import DAWN as DAWN_SpatialV401Exp
 from models.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
 from models.dawn_spatial_v403_exp import DAWN as DAWN_SpatialV403Exp
 from models.dawn_spatial_v404_exp import DAWN as DAWN_SpatialV404Exp
+from models.dawn_spatial_v405_exp import DAWN as DAWN_SpatialV405Exp
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -149,15 +150,19 @@ def build_model_from_config(cfg):
             n_chunks_v=cfg['training'].get('n_chunks_v', 1),
         )
     elif version in ('spatial-r1-v3.9.9', 'spatial-r1-v4.0.1', 'spatial-r1-v4.0.3',
-                      'spatial-r1-v4.0.4'):
+                      'spatial-r1-v4.0.4', 'spatial-r1-v4.0.5'):
         _cls = {
             'spatial-r1-v4.0.1': DAWN_SpatialV401Exp,
             'spatial-r1-v4.0.3': DAWN_SpatialV403Exp,
             'spatial-r1-v4.0.4': DAWN_SpatialV404Exp,
+            'spatial-r1-v4.0.5': DAWN_SpatialV405Exp,
         }.get(version, DAWN_SpatialV399Exp)
         _extra = {}
         if version == 'spatial-r1-v4.0.4':
             _extra['reverse_p_max'] = cfg['training'].get('reverse_p_max', 0.0)
+        elif version == 'spatial-r1-v4.0.5':
+            _extra['gate_drop_rate'] = cfg['training'].get('gate_drop_rate', 0.0)
+            _extra['gate_boost_rate'] = cfg['training'].get('gate_boost_rate', 0.0)
         model = _cls(
             vocab_size=mcfg.get('vocab_size', 30522),
             d_model=mcfg.get('d_model', 384),
@@ -849,8 +854,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'v_emb_norm_std': result.get('v_emb_norm_std', jnp.float32(0.0)),
             'attn_score_kurt': result.get('attn_score_kurt', jnp.float32(0.0)),
             'know_score_kurt': result.get('know_score_kurt', jnp.float32(0.0)),
-            'attn_rev_rate': result.get('attn_rev_rate', jnp.float32(0.0)),
-            'know_rev_rate': result.get('know_rev_rate', jnp.float32(0.0)),
+            'attn_drop_rate': result.get('attn_drop_rate', jnp.float32(0.0)),
+            'attn_boost_rate': result.get('attn_boost_rate', jnp.float32(0.0)),
+            'know_drop_rate': result.get('know_drop_rate', jnp.float32(0.0)),
+            'know_boost_rate': result.get('know_boost_rate', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
             'tau_know_bias': tau_know_b[0],
@@ -1704,9 +1711,9 @@ def main():
     # Create shard_map functions if mesh_model > 1 (or always for v4.0.4
     # which removed its non-sharded fallback and depends on the sharded path).
     _sharded_fns = None
-    _force_sharded = model_version == 'spatial-r1-v4.0.4'
+    _force_sharded = model_version in ('spatial-r1-v4.0.4', 'spatial-r1-v4.0.5')
     if mesh_model > 1 or _force_sharded:
-        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp'}.get(model_version, 'models.dawn_spatial_v3')
         _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
@@ -1794,7 +1801,7 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp'}.get(model_version, 'models.dawn_spatial_v3')
             _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
@@ -2377,8 +2384,10 @@ def main():
                     v_emb_nstd = 0.0
                     k_kurt = 0.0
                     a_kurt = 0.0
-                    k_rev = 0.0
-                    a_rev = 0.0
+                    k_drop = 0.0
+                    a_drop = 0.0
+                    k_boost = 0.0
+                    a_boost = 0.0
 
                     # Detailed stats (all from metrics, no params access)
                     try:
@@ -2467,13 +2476,17 @@ def main():
                         a_ent = _m(metrics.get('attn_gate_entropy', 0.0))
                         k_kurt = _m(metrics.get('know_score_kurt', 0.0))
                         a_kurt = _m(metrics.get('attn_score_kurt', 0.0))
-                        k_rev = _m(metrics.get('know_rev_rate', 0.0))
-                        a_rev = _m(metrics.get('attn_rev_rate', 0.0))
+                        k_drop = _m(metrics.get('know_drop_rate', 0.0))
+                        a_drop = _m(metrics.get('attn_drop_rate', 0.0))
+                        k_boost = _m(metrics.get('know_boost_rate', 0.0))
+                        a_boost = _m(metrics.get('attn_boost_rate', 0.0))
                         log_message(
                             f"      dist: k[skew={k_skew:+.2f} kurt={k_kurt:.2f}"
-                            f" apt_std={k_apt:.1f} ent={k_ent:.2f} rev={k_rev*100:.3f}%]"
+                            f" apt_std={k_apt:.1f} ent={k_ent:.2f}"
+                            f" d={k_drop*100:.3f}% b={k_boost*100:.3f}%]"
                             f" a[skew={a_skew:+.2f} kurt={a_kurt:.2f}"
-                            f" apt_std={a_apt:.1f} ent={a_ent:.2f} rev={a_rev*100:.3f}%]")
+                            f" apt_std={a_apt:.1f} ent={a_ent:.2f}"
+                            f" d={a_drop*100:.3f}% b={a_boost*100:.3f}%]")
 
                         # Emb norm per-pool stats (mean / max / min / std)
                         k_emb_nmax = _m(metrics.get('know_emb_norm_max', 0.0))
@@ -2719,8 +2732,10 @@ def main():
                         'v_emb_norm_std': v_emb_nstd,
                         'attn_score_kurt': a_kurt,
                         'know_score_kurt': k_kurt,
-                        'attn_rev_rate': a_rev,
-                        'know_rev_rate': k_rev,
+                        'attn_drop_rate': a_drop,
+                        'attn_boost_rate': a_boost,
+                        'know_drop_rate': k_drop,
+                        'know_boost_rate': k_boost,
                         'accuracy': avg_acc,
                         'lr': current_lr,
                         'steps_per_sec': steps_per_sec,
