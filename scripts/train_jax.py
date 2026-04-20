@@ -1701,9 +1701,11 @@ def main():
     else:
         opt_state = optimizer.init(params)
 
-    # Create shard_map functions if mesh_model > 1
+    # Create shard_map functions if mesh_model > 1 (or always for v4.0.4
+    # which removed its non-sharded fallback and depends on the sharded path).
     _sharded_fns = None
-    if mesh_model > 1:
+    _force_sharded = model_version == 'spatial-r1-v4.0.4'
+    if mesh_model > 1 or _force_sharded:
         _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp'}.get(model_version, 'models.dawn_spatial_v3')
         _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
