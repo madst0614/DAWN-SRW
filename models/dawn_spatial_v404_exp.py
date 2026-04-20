@@ -1,5 +1,21 @@
 """
-DAWN-Spatial v4.0.4: Sense-Read-Write (JAX/Flax)
+DAWN-SRW v4.0.4: Select-Read-Write (JAX/Flax)
+
+Two levels of abstraction:
+
+Model level:
+  Select -- the model's routing action: chooses which neurons are active
+            for each input token via signature matching in d_route space.
+
+Neuron level:
+  Each neuron is a (read, write) pair in R^{d_model}:
+    Read  -- input direction (which component of x is extracted)
+    Write -- output direction (where the contribution is written)
+
+The neuron body is (read, write). Select is the model-level routing
+operation that picks them. The embedding (e) is the signature used for
+selection, living in d_route (compressed routing space, not the full
+model space).
 
 Changelog:
   spatial-r1-v4.0.4 (2026-04-20):
@@ -141,8 +157,12 @@ Changelog:
     - Sense + direct emit (gate @ w). 4s/step.
 
 Architecture:
-  NeuronPool        -- emb[N,d_bn] + w_read[N,D] + w_write[N,D]
-  Router            -- proj + tau. Uses pool emb for routing.
+  NeuronPool        -- per-neuron storage (neuron level):
+                         emb[N, d_route]    -- select signature
+                         w_read[N, d_model] -- read direction
+                         w_write[N, d_model]-- write direction
+  Router            -- select operation (model level): proj + tau.
+                       Uses pool emb (signatures) to select neurons.
   make_sharded_srw / make_sharded_srw_paired -- shard_map'd gate+srw
   _attn_forward     -- fused_paired (Q/K) + fused_single (V) -> self-attn
   _know_forward     -- fused_single
@@ -192,14 +212,10 @@ def unit_norm_init(scale=1.0):
 
 
 # ================================================================
-# 2. shard_map based gate + sense_read_write
-# ================================================================
-
-
-# ================================================================
-# 3. shard_map based gate + sense_read_write
+# 2. shard_map based gate + select + read/write
 #    Per-device code with explicit psum communication.
-#    fori_loop inside for N_local chunking.
+#    Select (gate computation): score = h @ emb.T, then threshold.
+#    Read/Write (atomic op): each selected neuron applies (read, write).
 # ================================================================
 
 def make_sharded_srw(mesh, max_chunk_size=2048):
@@ -671,20 +687,21 @@ class NeuronPool(nn.Module):
     d_route: int
 
     def setup(self):
-        db = self.d_route
-        dm = self.d_model
+        db = self.d_route   # routing dim (for select signatures)
+        dm = self.d_model   # model dim (for read/write operations)
 
-        # Sense (routing, low-dim)
+        # Select signatures (routing, d_route).
+        # Used by the model's Select operation to choose this neuron.
         self.qk_emb = self.param('qk_emb', unit_norm_init(), (self.n_qk, db))
         self.v_emb = self.param('v_emb', unit_norm_init(), (self.n_v, db))
         self.know_emb = self.param('know_emb', unit_norm_init(), (self.n_know, db))
 
-        # Read (what to extract from x) — unit norm, direction only
+        # Read directions (d_model) — each neuron reads one direction from x
         self.qk_read = self.param('qk_read', unit_norm_init(), (self.n_qk, dm))
         self.v_read = self.param('v_read', unit_norm_init(), (self.n_v, dm))
         self.know_read = self.param('know_read', unit_norm_init(), (self.n_know, dm))
 
-        # Write (direction to push) — unit norm, direction only
+        # Write directions (d_model) — each neuron writes one direction
         self.qk_write = self.param('qk_write', unit_norm_init(), (self.n_qk, dm))
         self.v_write = self.param('v_write', unit_norm_init(), (self.n_v, dm))
         self.know_write = self.param('know_write', unit_norm_init(), (self.n_know, dm))
@@ -703,6 +720,12 @@ class NeuronPool(nn.Module):
 # ================================================================
 
 class Router(nn.Module):
+    """Select operation: model-level routing.
+
+    Given input x, produce gate values for all neurons in each pool.
+    Uses per-pool signature matching: score = proj(x) @ emb^T.
+    Input-dependent threshold (tau) adapts per token.
+    """
     d_model: int
     d_route: int
     n_qk: int
@@ -966,7 +989,11 @@ class DAWNBlock(nn.Module):
 # ================================================================
 
 class DAWN(nn.Module):
-    """DAWN-Spatial v3.8: Sense-Read-Write."""
+    """DAWN-SRW v4.0.4: Select-Read-Write.
+
+    Every Transformer projection (Q, K, V, FFN) decomposed into
+    select-then-compose of rank-1 read/write neurons from shared pools.
+    """
     __version__ = "spatial-r1-v4.0.4"
 
     vocab_size: int = 30000
@@ -1363,7 +1390,7 @@ class DAWN(nn.Module):
 
     def get_model_info(self):
         return [
-            f"DAWN v{self.__version__}: Sense-Read-Write",
+            f"DAWN-SRW v{self.__version__}: Select-Read-Write",
             f"  d_model={self.d_model}, d_route={self.d_route}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  QK: {self.n_qk}, V: {self.n_v}, Know: {self.n_know}",
