@@ -50,8 +50,8 @@ training:
   diversity_weight: 0.1
   load_balance_weight: 0.0
   # v4.0.5 bidirectional gate dropout
-  gate_drop_rate: 0.005
-  gate_boost_rate: 0.005
+  gate_drop_rate: 0.01     # z > 0 neurons (standard dropout effect)
+  gate_boost_rate: 0.005   # z < 0 neurons (peak strength → keep low)
   n_chunks_know: 1
   n_chunks_qk: 1
   n_chunks_v: 1
