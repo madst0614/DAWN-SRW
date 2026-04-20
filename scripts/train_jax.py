@@ -905,6 +905,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'alpha_qk': result.get('alpha_qk', jnp.float32(0.0)),
             'alpha_v': result.get('alpha_v', jnp.float32(0.0)),
             'alpha_know': result.get('alpha_know', jnp.float32(0.0)),
+            'attn_s_std_min': result.get('attn_s_std_min', jnp.float32(0.0)),
+            'know_s_std_min': result.get('know_s_std_min', jnp.float32(0.0)),
         }
 
         return new_params, new_opt_state, metrics
@@ -2514,11 +2516,25 @@ def main():
                         log_message(
                             f"      dist: k[skew={k_skew:+.2f} kurt={k_kurt:.2f}"
                             f" apt_std={k_apt:.1f} ent={k_ent:.2f}"
-                            f" dead={int(k_dead)} α={alpha_know:.3f} tshift={k_tshift:+.3f}]"
+                            f" dead={int(k_dead)} α={alpha_know:.4f} tshift={k_tshift:+.3f}]"
                             f" a[skew={a_skew:+.2f} kurt={a_kurt:.2f}"
                             f" apt_std={a_apt:.1f} ent={a_ent:.2f}"
-                            f" dead={int(a_dead)} α_qk={alpha_qk:.3f} α_v={alpha_v:.3f}"
+                            f" dead={int(a_dead)} α_qk={alpha_qk:.4f} α_v={alpha_v:.4f}"
                             f" tshift_qk={a_qk_tshift:+.3f} tshift_v={a_v_tshift:+.3f}]")
+                        # Worst-token s_std → 1/(s_std+1e-6) max = diff_max.
+                        # tau_shift at that token ≈ -α * diff_max.
+                        k_sstd_min = _m(metrics.get('know_s_std_min', 0.0))
+                        a_sstd_min = _m(metrics.get('attn_s_std_min', 0.0))
+                        k_diff_max = 1.0 / (k_sstd_min + 1e-6)
+                        a_diff_max = 1.0 / (a_sstd_min + 1e-6)
+                        log_message(
+                            f"      diag: k[sstd_min={k_sstd_min:.4f}"
+                            f" diff_max={k_diff_max:.1f}"
+                            f" worst_tshift={-alpha_know * k_diff_max:+.2f}]"
+                            f" a[sstd_min={a_sstd_min:.4f}"
+                            f" diff_max={a_diff_max:.1f}"
+                            f" worst_tshift_qk={-alpha_qk * a_diff_max:+.2f}"
+                            f" worst_tshift_v={-alpha_v * a_diff_max:+.2f}]")
 
                         # Emb norm per-pool stats (mean / max / min / std)
                         k_emb_nmax = _m(metrics.get('know_emb_norm_max', 0.0))

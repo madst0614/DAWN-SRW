@@ -259,7 +259,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=1e-4):
                         P(),                     # score_kurt scalar
                         P(),                     # dead_penalty scalar (v4.0.6)
                         P(),                     # dead_count scalar (v4.0.6)
-                        P()),                    # tau_shift_mean scalar (v4.0.6)
+                        P(),                     # tau_shift_mean scalar (v4.0.6)
+                        P()),                    # s_std_min scalar (v4.0.6 diag)
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, tau_offset, read_local, write_local, alpha):
         N_local = emb_local.shape[0]
@@ -445,11 +446,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=1e-4):
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
         dead_count_out = jax.lax.stop_gradient(
             jax.lax.psum(total_dead_count, 'model'))
+        # v4.0.6 diagnostic: worst-token s_std → tells us when 1/(s_std+1e-6)
+        # explodes and pushes tau_shift hard-negative.  s_std is already
+        # computed from the global (psum) stats so no extra collective.
+        s_std_min_out = jax.lax.stop_gradient(s_std.min())
         return (out.astype(jnp.float32), active_frac, global_gate_max, score_lb,
                 score_std_out, es_out, active_n_mean, strong_frac, phi_binary_frac, z_mean_active,
                 tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
                 score_skew, active_per_token_std, gate_entropy, z_sum_out,
-                score_kurt, dead_penalty_out, dead_count_out, tau_shift_mean)
+                score_kurt, dead_penalty_out, dead_count_out, tau_shift_mean,
+                s_std_min_out)
 
     return fused_gate_srw
 
@@ -498,7 +504,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=1e-4):
                         P(),                         # score_kurt scalar
                         P(),                         # dead_penalty scalar (v4.0.6)
                         P(),                         # dead_count scalar (v4.0.6)
-                        P()),                        # tau_shift_mean scalar (v4.0.6)
+                        P(),                         # tau_shift_mean scalar (v4.0.6)
+                        P()),                        # s_std_min scalar (v4.0.6 diag)
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, tau_offset, read_local, write_local, alpha):
         N_local = emb_local.shape[0]
@@ -687,11 +694,16 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=1e-4):
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
         dead_count_out = jax.lax.stop_gradient(
             jax.lax.psum(total_dead_count, 'model'))
+        # v4.0.6 diagnostic: worst-token s_std → tells us when 1/(s_std+1e-6)
+        # explodes and pushes tau_shift hard-negative.  s_std is already
+        # computed from the global (psum) stats so no extra collective.
+        s_std_min_out = jax.lax.stop_gradient(s_std.min())
         return (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb,
                 score_std_out, es_out, active_n_mean, strong_frac_mean, phi_binary_frac_mean,
                 z_mean_active_mean, tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
                 score_skew, active_per_token_std, gate_entropy, z_sum_out,
-                score_kurt, dead_penalty_out, dead_count_out, tau_shift_mean)
+                score_kurt, dead_penalty_out, dead_count_out, tau_shift_mean,
+                s_std_min_out)
 
     return fused_gate_srw_paired
 
@@ -832,7 +844,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      qk_strong, qk_phi_bin, qk_z_act,
      qk_tau_abs, qk_z075, qk_z030,
      qk_skew, qk_apt_std, qk_entropy, qk_z_sum, qk_kurt,
-     qk_dead_pen, qk_dead_cnt, qk_tau_shift) = fused_paired(
+     qk_dead_pen, qk_dead_cnt, qk_tau_shift, qk_sstd_min) = fused_paired(
         x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write, alpha_qk)
     qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
     Q = QK_out[:, :, 0, :] * qk_scale
@@ -841,7 +853,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      v_strong, v_phi_bin, v_z_act,
      v_tau_abs, v_z075, v_z030,
      v_skew, v_apt_std, v_entropy, v_z_sum, v_kurt,
-     v_dead_pen, v_dead_cnt, v_tau_shift) = fused_single(
+     v_dead_pen, v_dead_cnt, v_tau_shift, v_sstd_min) = fused_single(
         x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write, alpha_v)
     v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
     V = V * v_scale
@@ -904,6 +916,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_dead_count = jax.lax.stop_gradient(qk_dead_cnt + v_dead_cnt)
     attn_qk_tau_shift_mean = qk_tau_shift
     attn_v_tau_shift_mean = v_tau_shift
+    # Worst-token s_std across qk / v (instability proxy).
+    attn_s_std_min = jnp.minimum(qk_sstd_min, v_sstd_min)
     return (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax,
             attn_score_std, attn_gate_sum, attn_active_n_mean,
             attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
@@ -921,7 +935,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             attn_score_kurt,
             attn_dead_penalty, attn_dead_count,
             attn_qk_tau_shift_mean, attn_v_tau_shift_mean,
-            alpha_qk, alpha_v)
+            alpha_qk, alpha_v,
+            attn_s_std_min)
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -955,7 +970,8 @@ def _know_forward(x, pool_params, router_params, rng,
      know_tau_abs_mean, know_z_lt_075_frac, know_z_lt_030_frac,
      know_score_skew, know_active_per_token_std, know_gate_entropy,
      know_z_sum, know_score_kurt,
-     know_dead_penalty, know_dead_count, know_tau_shift_mean) = fused_single(
+     know_dead_penalty, know_dead_count, know_tau_shift_mean,
+     know_s_std_min) = fused_single(
         x, h, know_emb_unit, tau, know_read, know_write, alpha_know)
 
     know_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
@@ -987,7 +1003,8 @@ def _know_forward(x, pool_params, router_params, rng,
             know_z_sum,
             know_emb_norm_max, know_emb_norm_std,
             know_emb_norm_min, know_score_kurt,
-            know_dead_penalty, know_dead_count, know_tau_shift_mean, alpha_know)
+            know_dead_penalty, know_dead_count, know_tau_shift_mean, alpha_know,
+            know_s_std_min)
 
 
 # ================================================================
@@ -1161,6 +1178,8 @@ class DAWN(nn.Module):
             alpha_qk_all = _z
             alpha_v_all = _z
             alpha_know_all = _z
+            attn_s_std_min_all = _z
+            know_s_std_min_all = _z
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
@@ -1212,7 +1231,8 @@ class DAWN(nn.Module):
                  a_score_kurt,
                  a_dead_penalty, a_dead_count,
                  a_qk_tau_shift, a_v_tau_shift,
-                 a_alpha_qk, a_alpha_v
+                 a_alpha_qk, a_alpha_v,
+                 a_s_std_min
                 ) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
@@ -1232,7 +1252,8 @@ class DAWN(nn.Module):
                  k_skew, k_apt_std, k_entropy, k_z_sum,
                  k_emb_n_max, k_emb_n_std,
                  k_emb_n_min, k_score_kurt,
-                 k_dead_penalty, k_dead_count, k_tau_shift, k_alpha
+                 k_dead_penalty, k_dead_count, k_tau_shift, k_alpha,
+                 k_s_std_min
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
@@ -1268,7 +1289,8 @@ class DAWN(nn.Module):
                            a_dead_penalty, k_dead_penalty,
                            a_dead_count, k_dead_count,
                            a_qk_tau_shift, a_v_tau_shift, k_tau_shift,
-                           a_alpha_qk, a_alpha_v, k_alpha)
+                           a_alpha_qk, a_alpha_v, k_alpha,
+                           a_s_std_min, k_s_std_min)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -1305,7 +1327,8 @@ class DAWN(nn.Module):
                 attn_dead_penalty_all, know_dead_penalty_all,
                 attn_dead_count_all, know_dead_count_all,
                 attn_qk_tau_shift_all, attn_v_tau_shift_all, know_tau_shift_all,
-                alpha_qk_all, alpha_v_all, alpha_know_all) = jax.lax.scan(
+                alpha_qk_all, alpha_v_all, alpha_know_all,
+                attn_s_std_min_all, know_s_std_min_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -1401,6 +1424,9 @@ class DAWN(nn.Module):
             'alpha_qk': alpha_qk_all.mean(),
             'alpha_v': alpha_v_all.mean(),
             'alpha_know': alpha_know_all.mean(),
+            # v4.0.6 diag: per-pool min s_std across layers (worst-case blow-up).
+            'attn_s_std_min': attn_s_std_min_all.min(),
+            'know_s_std_min': know_s_std_min_all.min(),
 
             'debug_residual_norm': _residual_norm,
             'debug_emb_norm': _emb_norm,
