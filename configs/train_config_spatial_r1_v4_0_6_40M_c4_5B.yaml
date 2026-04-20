@@ -1,0 +1,59 @@
+# DAWN Spatial-R1 v4.0.6 -- sharp gate + dynamic tau + dead-only penalty
+# On top of v4.0.3 (Σz^+ denominator, no emb forward norm):
+#   gate confidence: Φ(z) -> sigmoid(scores - tau), sharper transition
+#     past threshold.
+#   dynamic tau: per-token shift based on per-token score std.
+#     tau_effective = tau_base - alpha * (1 / (s_std + 1e-6))
+#     Per-pool learnable alpha via softplus (init from tau_alpha_init).
+#   dead-only penalty:
+#     sum_j max(-mean_score_j, 0) * 1[max_gate_j < 1e-4]
+#   Drops v4.0.4/v4.0.5 reverse/bidirectional gate dropouts.
+#
+# Projection-level dropouts kept at 0.0 (same rationale as v4.0.5).
+# safe_dropout short-circuits when rate == 0.0.
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "spatial-r1-v4.0.6"
+  d_model: 384
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+  dropout: 0.0              # emb / attn-softmax / attn-out / know-out
+  gradient_checkpointing: true
+
+  d_route: 128
+  n_qk: 1580
+  n_v: 2600
+  n_know: 25200
+  router_dropout: 0.0       # proj_attn / proj_know
+
+training:
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.00065
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+  # v4.0.6
+  tau_alpha_init: 0.1       # per-pool softplus alpha init (dynamic-tau slope)
+  dead_penalty_weight: 0.05 # weight on dead-only penalty in total_loss
+  n_chunks_know: 1
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  checkpoint_interval: 500
+  val_interval: 500
+
+use_amp: true
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.0.6_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.0.6_40M_c4_5B

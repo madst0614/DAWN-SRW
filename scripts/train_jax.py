@@ -60,6 +60,7 @@ from models.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
 from models.dawn_spatial_v403_exp import DAWN as DAWN_SpatialV403Exp
 from models.dawn_spatial_v404_exp import DAWN as DAWN_SpatialV404Exp
 from models.dawn_spatial_v405_exp import DAWN as DAWN_SpatialV405Exp
+from models.dawn_spatial_v406_exp import DAWN as DAWN_SpatialV406Exp
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -150,12 +151,14 @@ def build_model_from_config(cfg):
             n_chunks_v=cfg['training'].get('n_chunks_v', 1),
         )
     elif version in ('spatial-r1-v3.9.9', 'spatial-r1-v4.0.1', 'spatial-r1-v4.0.3',
-                      'spatial-r1-v4.0.4', 'spatial-r1-v4.0.5'):
+                      'spatial-r1-v4.0.4', 'spatial-r1-v4.0.5',
+                      'spatial-r1-v4.0.6'):
         _cls = {
             'spatial-r1-v4.0.1': DAWN_SpatialV401Exp,
             'spatial-r1-v4.0.3': DAWN_SpatialV403Exp,
             'spatial-r1-v4.0.4': DAWN_SpatialV404Exp,
             'spatial-r1-v4.0.5': DAWN_SpatialV405Exp,
+            'spatial-r1-v4.0.6': DAWN_SpatialV406Exp,
         }.get(version, DAWN_SpatialV399Exp)
         _extra = {}
         if version == 'spatial-r1-v4.0.4':
@@ -163,6 +166,8 @@ def build_model_from_config(cfg):
         elif version == 'spatial-r1-v4.0.5':
             _extra['gate_drop_rate'] = cfg['training'].get('gate_drop_rate', 0.0)
             _extra['gate_boost_rate'] = cfg['training'].get('gate_boost_rate', 0.0)
+        elif version == 'spatial-r1-v4.0.6':
+            _extra['tau_alpha_init'] = cfg['training'].get('tau_alpha_init', 0.1)
         model = _cls(
             vocab_size=mcfg.get('vocab_size', 30522),
             d_model=mcfg.get('d_model', 384),
@@ -690,7 +695,7 @@ def compute_spatial_diversity_loss(params):
 # ============================================================
 
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
-                      tau_reg_weight,
+                      tau_reg_weight, dead_penalty_weight,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None):
@@ -716,6 +721,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             ce_loss = result['loss']
             aux_loss = result['aux_loss']
             tau_reg = result.get('tau_reg', jnp.float32(0.0))
+            # v4.0.6: dead-only penalty (scalar). 0 if model doesn't produce it.
+            dead_penalty = result.get('dead_penalty', jnp.float32(0.0))
 
             if is_baseline:
                 orth_loss = jnp.float32(0.0)
@@ -727,7 +734,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 total_loss = (ce_loss
                               + lb_weight * aux_loss
                               + tau_reg_weight * tau_reg
-                              + div_weight * div_loss)
+                              + div_weight * div_loss
+                              + dead_penalty_weight * dead_penalty)
             else:
                 orth_loss = compute_orthogonality_loss(
                     params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
@@ -736,11 +744,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + lb_weight * aux_loss
                               + tau_reg_weight * tau_reg
                               + orth_weight * orth_loss
-                              + div_weight * div_loss)
+                              + div_weight * div_loss
+                              + dead_penalty_weight * dead_penalty)
 
-            return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss, result)
+            return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss, dead_penalty, result)
 
-        (total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss, result)), grads = \
+        (total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss, dead_penalty, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
         # XLA SPMD handles gradient all-reduce automatically
@@ -884,6 +893,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_v_z_mean_active': result.get('attn_v_z_mean_active', jnp.float32(0.0)),
             'per_layer_attn_out_norm': result.get('per_layer_attn_out_norm', jnp.zeros(1)),
             'per_layer_know_out_norm': result.get('per_layer_know_out_norm', jnp.zeros(1)),
+            # v4.0.6: dead-only penalty + alpha / tau_shift observations.
+            'dead_penalty': dead_penalty,
+            'attn_dead_penalty': result.get('attn_dead_penalty', jnp.float32(0.0)),
+            'know_dead_penalty': result.get('know_dead_penalty', jnp.float32(0.0)),
+            'attn_dead_count': result.get('attn_dead_count', jnp.float32(0.0)),
+            'know_dead_count': result.get('know_dead_count', jnp.float32(0.0)),
+            'attn_qk_tau_shift_mean': result.get('attn_qk_tau_shift_mean', jnp.float32(0.0)),
+            'attn_v_tau_shift_mean': result.get('attn_v_tau_shift_mean', jnp.float32(0.0)),
+            'know_tau_shift_mean': result.get('know_tau_shift_mean', jnp.float32(0.0)),
+            'alpha_qk': result.get('alpha_qk', jnp.float32(0.0)),
+            'alpha_v': result.get('alpha_v', jnp.float32(0.0)),
+            'alpha_know': result.get('alpha_know', jnp.float32(0.0)),
         }
 
         return new_params, new_opt_state, metrics
@@ -1279,6 +1300,7 @@ def main():
     div_weight = tcfg.get('diversity_weight', 0.1)
     lb_weight = tcfg.get('load_balance_weight', 2e-5)
     tau_reg_weight = tcfg.get('tau_reg_weight', 0.0)
+    dead_penalty_weight = tcfg.get('dead_penalty_weight', 0.0)  # v4.0.6
 
     max_seq_len = cfg['model'].get('max_seq_len', 512)
 
@@ -1402,6 +1424,7 @@ def main():
             div_weight = saved_training_config.get('diversity_weight', div_weight)
             lb_weight = saved_training_config.get('load_balance_weight', lb_weight)
             tau_reg_weight = saved_training_config.get('tau_reg_weight', tau_reg_weight)
+            dead_penalty_weight = saved_training_config.get('dead_penalty_weight', dead_penalty_weight)
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
@@ -1416,6 +1439,7 @@ def main():
         'diversity_weight': div_weight,
         'load_balance_weight': lb_weight,
         'tau_reg_weight': tau_reg_weight,
+        'dead_penalty_weight': dead_penalty_weight,
     }
 
     # ----------------------------------------------------------
@@ -1584,6 +1608,7 @@ def main():
         print(f"  Div weight: {div_weight}")
         print(f"  LB weight: {lb_weight}")
         print(f"  Tau reg weight: {tau_reg_weight}")
+        print(f"  Dead penalty weight: {dead_penalty_weight}")
 
     # ----------------------------------------------------------
     # Resume from checkpoint (resume_path detected earlier for config override)
@@ -1711,9 +1736,10 @@ def main():
     # Create shard_map functions if mesh_model > 1 (or always for v4.0.4
     # which removed its non-sharded fallback and depends on the sharded path).
     _sharded_fns = None
-    _force_sharded = model_version in ('spatial-r1-v4.0.4', 'spatial-r1-v4.0.5')
+    _force_sharded = model_version in ('spatial-r1-v4.0.4', 'spatial-r1-v4.0.5',
+                                        'spatial-r1-v4.0.6')
     if mesh_model > 1 or _force_sharded:
-        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp'}.get(model_version, 'models.dawn_spatial_v3')
         _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
@@ -1734,7 +1760,7 @@ def main():
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
-        tau_reg_weight,
+        tau_reg_weight, dead_penalty_weight,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns)
@@ -1801,7 +1827,7 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp'}.get(model_version, 'models.dawn_spatial_v3')
             _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
@@ -2736,6 +2762,19 @@ def main():
                         'attn_boost_rate': a_boost,
                         'know_drop_rate': k_drop,
                         'know_boost_rate': k_boost,
+                        # v4.0.6 dynamic tau / dead-penalty (instantaneous).
+                        'dead_penalty': float(metrics.get('dead_penalty', 0.0)),
+                        'attn_dead_penalty': float(metrics.get('attn_dead_penalty', 0.0)),
+                        'know_dead_penalty': float(metrics.get('know_dead_penalty', 0.0)),
+                        'dead_penalty_weighted': dead_penalty_weight * float(metrics.get('dead_penalty', 0.0)),
+                        'attn_dead_count': float(metrics.get('attn_dead_count', 0.0)),
+                        'know_dead_count': float(metrics.get('know_dead_count', 0.0)),
+                        'attn_qk_tau_shift_mean': float(metrics.get('attn_qk_tau_shift_mean', 0.0)),
+                        'attn_v_tau_shift_mean': float(metrics.get('attn_v_tau_shift_mean', 0.0)),
+                        'know_tau_shift_mean': float(metrics.get('know_tau_shift_mean', 0.0)),
+                        'alpha_qk': float(metrics.get('alpha_qk', 0.0)),
+                        'alpha_v': float(metrics.get('alpha_v', 0.0)),
+                        'alpha_know': float(metrics.get('alpha_know', 0.0)),
                         'accuracy': avg_acc,
                         'lr': current_lr,
                         'steps_per_sec': steps_per_sec,
