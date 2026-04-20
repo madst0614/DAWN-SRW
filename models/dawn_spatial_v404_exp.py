@@ -202,7 +202,7 @@ def unit_norm_init(scale=1.0):
 #    fori_loop inside for N_local chunking.
 # ================================================================
 
-def make_sharded_srw(mesh, max_chunk_size=2048):
+def make_sharded_srw(mesh, max_chunk_size=2048, reverse_p_max=0.0):
     """Create fused shard_map'd gate+srw. Gate never materialized full.
 
     2-pass chunked inside shard_map:
@@ -210,9 +210,17 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
       Pass 2: gate+srw fused per chunk (gate computed and consumed per chunk)
 
     Returns fused_gate_srw function (single call does gate+srw+psum).
+
+    v4.0.4: reverse_p_max controls weak-neuron stochastic boost.
+    If >0, each chunk applies reverse dropout inside gate_srw_step and
+    returns the per-batch boost rate. rng_rev is an additional runtime
+    arg (replicated PRNGKey); the model axis index is folded in so
+    each model shard draws an independent stream.
     """
     _model_axis_size = mesh.shape['model']
     _data_axis_size = mesh.shape['data']
+    _rev_active = reverse_p_max > 0.0
+    _rev_p_max_f = jnp.float32(reverse_p_max if _rev_active else 0.0)
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),    # x [B,S,D]
@@ -220,7 +228,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
                        P('model', None),          # emb_norm [N_local, d_bn]
                        P('data', None, None),    # tau_offset [B,S,1]
                        P('model', None),          # read [N_local, D]
-                       P('model', None)),         # write [N_local, D]
+                       P('model', None),          # write [N_local, D]
+                       P()),                       # rng_rev (replicated)
              out_specs=(P('data', None, None),   # out [B,S,D]
                         P('data', None, None),   # active [B,S,1]
                         P('data', None, None),   # gate_max [B,S,1]
@@ -241,7 +250,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
                         P(),                     # score_kurt scalar
                         P()),                    # rev_rate scalar (v4.0.4)
              check_rep=False)
-    def fused_gate_srw(x, h, emb_local, tau_offset, read_local, write_local):
+    def fused_gate_srw(x, h, emb_local, tau_offset, read_local, write_local, rng_rev):
         N_local = emb_local.shape[0]
         nc = max(1, N_local // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -308,12 +317,18 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         var_score = global_ns_sq / N_total - mean_score ** 2
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
+        # v4.0.4: fold the model-shard axis into rng so each shard draws
+        # an independent stream (they see the same replicated rng_rev).
+        _rng_shard = (jax.random.fold_in(rng_rev, jax.lax.axis_index('model'))
+                      if _rev_active else rng_rev)
+
         # --- Pass 2: gate + srw fused (scan + checkpoint) ---
         @jax.checkpoint
         def gate_srw_step(carry, i):
             (out, total_weighted_cost, total_gate_max, total_active,
              total_strong, total_phi_binary, total_z_sum,
-             total_z_lt_075, total_z_lt_030, total_g_log_g) = carry
+             total_z_lt_075, total_z_lt_030, total_g_log_g,
+             total_rev_count) = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
@@ -323,6 +338,23 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             scores = h_bf @ ec.T
             raw = scores.astype(jnp.float32) - tau  # f32 (tau already f32)
             z = raw / s_std
+
+            # v4.0.4: reverse dropout — weak neurons get stochastic z-boost.
+            if _rev_active:
+                active_z = jnp.where(z > 0, z, 0.0)
+                neuron_sum = active_z.sum(axis=(0, 1))                   # [cs]
+                mean_sum = neuron_sum.mean() + 1e-8
+                weakness = jax.nn.relu(1.0 - neuron_sum / mean_sum)      # [cs]
+                z_peak = z.max(axis=-1, keepdims=True)                    # [B,S,1]
+                rev_key_i = jax.random.fold_in(_rng_shard, i)
+                rand_vals = jax.random.uniform(rev_key_i, z.shape, dtype=jnp.float32)
+                reverse_prob = weakness[None, None, :] * _rev_p_max_f    # [1,1,cs]
+                reverse_mask = rand_vals < reverse_prob                   # [B,S,cs]
+                z = jnp.where(reverse_mask, z_peak, z)
+                chunk_rev_count = reverse_mask.astype(jnp.float32).sum()
+            else:
+                chunk_rev_count = jnp.float32(0.0)
+
             phi = 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476))
             gate = jnp.where(z > 0, z * phi, 0.0)
             gate_bf = gate.astype(jnp.bfloat16)
@@ -346,14 +378,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
                     total_z_sum + chunk_z_sum,
                     total_z_lt_075 + chunk_z_lt_075,
                     total_z_lt_030 + chunk_z_lt_030,
-                    total_g_log_g + chunk_g_log_g), None
+                    total_g_log_g + chunk_g_log_g,
+                    total_rev_count + chunk_rev_count), None
 
         (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong,
          total_phi_binary, total_z_sum, total_z_lt_075, total_z_lt_030,
-         total_g_log_g), _ = jax.lax.scan(
+         total_g_log_g, total_rev_count), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, D), dtype=jnp.float32),
-             z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1, z1, z1, z1),
+             z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1, z1, z1, z1,
+             jnp.float32(0.0)),
             jnp.arange(nc))
 
         global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')  # gsum (logging)
@@ -384,8 +418,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         gate_sum_eps = global_weighted_cost + 1e-8
         entropy_per_token = -global_g_log_g / gate_sum_eps + jnp.log(gate_sum_eps)
         gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
-        # v4.0.4: rev_rate placeholder (sharded path does not apply reverse dropout).
-        rev_rate = jnp.float32(0.0)
+        # v4.0.4: reverse-dropout rate across boosted (B, S, N_total) cells
+        global_rev_count = jax.lax.psum(total_rev_count, 'model')
+        rev_rate = jax.lax.stop_gradient(
+            global_rev_count / (jnp.float32(B * S * N_total) + 1e-8))
         return (out.astype(jnp.float32), active_frac, global_gate_max, score_lb,
                 score_std_out, es_out, active_n_mean, strong_frac, phi_binary_frac, z_mean_active,
                 tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
@@ -395,7 +431,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
     return fused_gate_srw
 
 
-def make_sharded_srw_paired(mesh, max_chunk_size=2048):
+def make_sharded_srw_paired(mesh, max_chunk_size=2048, reverse_p_max=0.0):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_bn] (h_Q, h_K stacked on axis=2).
@@ -403,9 +439,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
     x @ read.T computed once (shared by both routes).
     Scores stats computed independently per route.
     Returns out [B,S,2,D], active [B,S,1], gate_max [B,S,1].
+
+    v4.0.4: when reverse_p_max > 0, reverse dropout is applied per-route
+    (weakness combined across Q and K active sums). rng_rev is a runtime
+    replicated arg.
     """
     _model_axis_size = mesh.shape['model']
     _data_axis_size = mesh.shape['data']
+    _rev_active = reverse_p_max > 0.0
+    _rev_p_max_f = jnp.float32(reverse_p_max if _rev_active else 0.0)
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),        # x [B,S,D]
@@ -413,7 +455,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
                        P('model', None),              # emb_norm [N_local, d_bn]
                        P('data', None, None, None),  # tau_offset [B,S,2,1]
                        P('model', None),              # read [N_local, D]
-                       P('model', None)),             # write [N_local, D]
+                       P('model', None),              # write [N_local, D]
+                       P()),                           # rng_rev (replicated)
              out_specs=(P('data', None, None, None), # out [B,S,2,D]
                         P('data', None, None),       # active [B,S,1]
                         P('data', None, None),       # gate_max [B,S,1]
@@ -434,7 +477,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
                         P(),                         # score_kurt scalar
                         P()),                        # rev_rate scalar (v4.0.4)
              check_rep=False)
-    def fused_gate_srw_paired(x, h, emb_local, tau_offset, read_local, write_local):
+    def fused_gate_srw_paired(x, h, emb_local, tau_offset, read_local, write_local, rng_rev):
         N_local = emb_local.shape[0]
         nc = max(1, N_local // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -502,12 +545,17 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         var_score = global_ns_sq / N_total - mean_score ** 2
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
+        # v4.0.4: fold model-shard index into rng for per-shard independence.
+        _rng_shard = (jax.random.fold_in(rng_rev, jax.lax.axis_index('model'))
+                      if _rev_active else rng_rev)
+
         # --- Pass 2: gate + srw fused ---
         @jax.checkpoint
         def gate_srw_step(carry, i):
             (out, total_weighted_cost, total_gate_max, total_active,
              total_strong, total_phi_binary, total_z_sum,
-             total_z_lt_075, total_z_lt_030, total_g_log_g) = carry
+             total_z_lt_075, total_z_lt_030, total_g_log_g,
+             total_rev_count) = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
@@ -517,6 +565,23 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             raw = scores.astype(jnp.float32) - tau
             z = raw / s_std  # s_std [B,S,2,1] broadcasts to [B,S,2,N]
+
+            # v4.0.4: reverse dropout (Q/K combined weakness over axis=(0,1,2)).
+            if _rev_active:
+                active_z = jnp.where(z > 0, z, 0.0)                       # [B,S,2,cs]
+                neuron_sum = active_z.sum(axis=(0, 1, 2))                 # [cs]
+                mean_sum = neuron_sum.mean() + 1e-8
+                weakness = jax.nn.relu(1.0 - neuron_sum / mean_sum)       # [cs]
+                z_peak = z.max(axis=-1, keepdims=True)                     # [B,S,2,1]
+                rev_key_i = jax.random.fold_in(_rng_shard, i)
+                rand_vals = jax.random.uniform(rev_key_i, z.shape, dtype=jnp.float32)
+                reverse_prob = weakness[None, None, None, :] * _rev_p_max_f
+                reverse_mask = rand_vals < reverse_prob
+                z = jnp.where(reverse_mask, z_peak, z)
+                chunk_rev_count = reverse_mask.astype(jnp.float32).sum()
+            else:
+                chunk_rev_count = jnp.float32(0.0)
+
             phi = 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476))
             gate = jnp.where(z > 0, z * phi, 0.0)
             gate_bf = gate.astype(jnp.bfloat16)
@@ -540,15 +605,17 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
                     total_z_sum + chunk_z_sum,
                     total_z_lt_075 + chunk_z_lt_075,
                     total_z_lt_030 + chunk_z_lt_030,
-                    total_g_log_g + chunk_g_log_g), None
+                    total_g_log_g + chunk_g_log_g,
+                    total_rev_count + chunk_rev_count), None
 
         (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong,
          total_phi_binary, total_z_sum, total_z_lt_075, total_z_lt_030,
-         total_g_log_g), _ = jax.lax.scan(
+         total_g_log_g, total_rev_count), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
              z1_r, jnp.full((B, S, 2, 1), -1e9),
-             z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r),
+             z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r,
+             jnp.float32(0.0)),
             jnp.arange(nc))
 
         # Normalize per route independently
@@ -584,8 +651,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         gate_sum_eps = global_weighted_cost + 1e-8
         entropy_per_token = -global_g_log_g / gate_sum_eps + jnp.log(gate_sum_eps)
         gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
-        # v4.0.4: rev_rate placeholder (sharded path does not apply reverse dropout).
-        rev_rate = jnp.float32(0.0)
+        # v4.0.4: reverse-dropout rate across boosted (B, S, 2, N_total) cells
+        global_rev_count = jax.lax.psum(total_rev_count, 'model')
+        rev_rate = jax.lax.stop_gradient(
+            global_rev_count / (jnp.float32(B * S * 2 * N_total) + 1e-8))
         return (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb,
                 score_std_out, es_out, active_n_mean, strong_frac_mean, phi_binary_frac_mean,
                 z_mean_active_mean, tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
@@ -880,7 +949,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          qk_strong, qk_phi_bin, qk_z_act,
          qk_tau_abs, qk_z075, qk_z030,
          qk_skew, qk_apt_std, qk_entropy, qk_z_sum, qk_kurt, qk_rev) = fused_paired(
-            x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write)
+            x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write, rng_rev_q)
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
         Q = QK_out[:, :, 0, :] * qk_scale
         K = QK_out[:, :, 1, :] * qk_scale
@@ -888,7 +957,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          v_strong, v_phi_bin, v_z_act,
          v_tau_abs, v_z075, v_z030,
          v_skew, v_apt_std, v_entropy, v_z_sum, v_kurt, v_rev) = fused_single(
-            x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write)
+            x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write, rng_rev_v)
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
         V = V * v_scale
     else:
@@ -1036,7 +1105,7 @@ def _know_forward(x, pool_params, router_params, rng,
          know_tau_abs_mean, know_z_lt_075_frac, know_z_lt_030_frac,
          know_score_skew, know_active_per_token_std, know_gate_entropy,
          know_z_sum, know_score_kurt, know_rev_rate) = fused_single(
-            x, h, know_emb_unit, tau, know_read, know_write)
+            x, h, know_emb_unit, tau, know_read, know_write, rng_rev_k)
     else:
         (out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean,
          strong_frac, phi_binary_frac, z_mean_act,
