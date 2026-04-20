@@ -34,7 +34,7 @@ training:
   weight_decay: 0.1
   warmup_ratio: 0.06
   diversity_weight: 0.1
-  load_balance_weight: 0.1
+  load_balance_weight: 0.0
   reverse_p_max: 0.01      # v4.0.4: per-(token, weak-neuron) boost prob cap
   n_chunks_know: 1
   n_chunks_qk: 1
