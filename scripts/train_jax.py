@@ -2502,17 +2502,23 @@ def main():
                         a_ent = _m(metrics.get('attn_gate_entropy', 0.0))
                         k_kurt = _m(metrics.get('know_score_kurt', 0.0))
                         a_kurt = _m(metrics.get('attn_score_kurt', 0.0))
-                        k_drop = _m(metrics.get('know_drop_rate', 0.0))
-                        a_drop = _m(metrics.get('attn_drop_rate', 0.0))
-                        k_boost = _m(metrics.get('know_boost_rate', 0.0))
-                        a_boost = _m(metrics.get('attn_boost_rate', 0.0))
+                        # v4.0.6: dead count + softplus alpha + dynamic tau shift.
+                        k_dead = _m(metrics.get('know_dead_count', 0.0))
+                        a_dead = _m(metrics.get('attn_dead_count', 0.0))
+                        alpha_qk = _m(metrics.get('alpha_qk', 0.0))
+                        alpha_v = _m(metrics.get('alpha_v', 0.0))
+                        alpha_know = _m(metrics.get('alpha_know', 0.0))
+                        k_tshift = _m(metrics.get('know_tau_shift_mean', 0.0))
+                        a_qk_tshift = _m(metrics.get('attn_qk_tau_shift_mean', 0.0))
+                        a_v_tshift = _m(metrics.get('attn_v_tau_shift_mean', 0.0))
                         log_message(
                             f"      dist: k[skew={k_skew:+.2f} kurt={k_kurt:.2f}"
                             f" apt_std={k_apt:.1f} ent={k_ent:.2f}"
-                            f" d={k_drop*100:.3f}% b={k_boost*100:.3f}%]"
+                            f" dead={int(k_dead)} α={alpha_know:.3f} tshift={k_tshift:+.3f}]"
                             f" a[skew={a_skew:+.2f} kurt={a_kurt:.2f}"
                             f" apt_std={a_apt:.1f} ent={a_ent:.2f}"
-                            f" d={a_drop*100:.3f}% b={a_boost*100:.3f}%]")
+                            f" dead={int(a_dead)} α_qk={alpha_qk:.3f} α_v={alpha_v:.3f}"
+                            f" tshift_qk={a_qk_tshift:+.3f} tshift_v={a_v_tshift:+.3f}]")
 
                         # Emb norm per-pool stats (mean / max / min / std)
                         k_emb_nmax = _m(metrics.get('know_emb_norm_max', 0.0))

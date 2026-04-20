@@ -432,8 +432,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=1e-4):
         active_per_token_std = jax.lax.stop_gradient(global_active).std()
         # Gate entropy: per-token H = -(1/S) Σ g log g + log S over global pool
         global_g_log_g = jax.lax.psum(total_g_log_g, 'model')
-        gate_sum_eps = global_weighted_cost + 1e-8
-        entropy_per_token = -global_g_log_g / gate_sum_eps + jnp.log(gate_sum_eps)
+        # v4.0.6: floor gate_sum at 1e-6 (log(1e-8) blew up in early steps
+        # when Σgate≈0); zero-out the ratio when gate_sum is at the floor so
+        # 0/0 stays at 0 before the log term dominates.
+        gate_sum_eps = jnp.maximum(global_weighted_cost, 1e-6)
+        safe_glogg = jnp.where(global_weighted_cost > 1e-6, global_g_log_g, 0.0)
+        entropy_per_token = -safe_glogg / gate_sum_eps + jnp.log(gate_sum_eps)
+        entropy_per_token = jnp.where(
+            jnp.isfinite(entropy_per_token), entropy_per_token, 0.0)
         gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
         # v4.0.6: dead-only penalty aggregated across model shards.
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
@@ -668,8 +674,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=1e-4):
         tau_abs_mean = jax.lax.stop_gradient(tau).mean()
         active_per_token_std = jax.lax.stop_gradient(global_active).std()
         global_g_log_g = jax.lax.psum(total_g_log_g, 'model')
-        gate_sum_eps = global_weighted_cost + 1e-8
-        entropy_per_token = -global_g_log_g / gate_sum_eps + jnp.log(gate_sum_eps)
+        # v4.0.6: floor gate_sum at 1e-6 (log(1e-8) blew up in early steps
+        # when Σgate≈0); zero-out the ratio when gate_sum is at the floor so
+        # 0/0 stays at 0 before the log term dominates.
+        gate_sum_eps = jnp.maximum(global_weighted_cost, 1e-6)
+        safe_glogg = jnp.where(global_weighted_cost > 1e-6, global_g_log_g, 0.0)
+        entropy_per_token = -safe_glogg / gate_sum_eps + jnp.log(gate_sum_eps)
+        entropy_per_token = jnp.where(
+            jnp.isfinite(entropy_per_token), entropy_per_token, 0.0)
         gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
         # v4.0.6: dead-only penalty aggregated across model shards.
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
