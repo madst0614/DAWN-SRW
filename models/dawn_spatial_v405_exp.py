@@ -20,16 +20,20 @@ model space).
 Changelog:
   spatial-r1-v4.0.5 (2026-04-20):
     - Replace v4.0.4 reverse dropout (weakness-based, asymmetric) with
-      bidirectional gate dropout applied to z before the Φ/gate step:
-        Drop  (z > 0): with uniform prob drop_rate, set z := -1.0
+      bidirectional gate dropout (peak strength). Applied to z before
+      the Φ/gate step:
+        Drop  (z > 0): with Bernoulli(drop_rate_eff)  → z := -1.0
                        → neuron was selected but is masked out.
-        Boost (z < 0): with prob gap · boost_rate (gap = relu(-z)),
-                       set z := min(gap, z_peak) where
-                       z_peak = max(max(z, -1), 0).
-                       → neuron was below threshold but is pulled up
-                         by at most the current token's peak.
-      Symmetric Bernoulli perturbation, tau-independent. Off in eval
-      (deterministic=True short-circuits to no-op).
+        Boost (z < 0): with Bernoulli(boost_rate_eff) → z := z_peak
+                       where z_peak = max(max(z, axis=-1), 0).
+                       → neuron was below threshold but is lifted to
+                         the current token's positive peak strength.
+      Symmetric uniform-prob Bernoulli, tau-independent. Rich-get-
+      richer attack from both sides: silence random winners, promote
+      random losers to peak level → strong learning signal, fast
+      emb reshaping. Off in eval (deterministic=True short-circuits
+      both rates to 0).
+    - rng: one fold_in(rng, i) per chunk, then split(2) for drop/boost.
     - Config: training.gate_drop_rate, training.gate_boost_rate
       (both default 0.0 so v4.0.5 with flags unset matches v4.0.3).
     - Metrics: drop_rate_actual, boost_rate_actual per pool.
@@ -374,21 +378,19 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             raw = scores.astype(jnp.float32) - tau  # f32 (tau already f32)
             z = raw / s_std
 
-            # v4.0.5: bidirectional gate dropout (runtime scalars gate it).
-            # drop: z > 0 → Bernoulli(drop_rate_eff) → z := -1.0
-            # boost: z < 0 → Bernoulli(gap * boost_rate_eff) → z := min(gap, z_peak)
+            # v4.0.5: bidirectional gate dropout (peak strength).
+            # drop:  z > 0 → Bernoulli(drop_rate_eff)  → z := -1.0
+            # boost: z < 0 → Bernoulli(boost_rate_eff) → z := z_peak
             # eval passes 0 for both; constant-fold removes the masks.
-            drop_key = jax.random.fold_in(_rng_shard, i * 2)
-            boost_key = jax.random.fold_in(_rng_shard, i * 2 + 1)
+            drop_key, boost_key = jax.random.split(
+                jax.random.fold_in(_rng_shard, i), 2)
             rand_drop = jax.random.uniform(drop_key, z.shape, dtype=jnp.float32)
             drop_mask = (z > 0) & (rand_drop < drop_rate_eff)
-            gap = jax.nn.relu(-z)
-            z_peak = jnp.maximum(z.max(axis=-1, keepdims=True), 0.0)
-            boost_value = jnp.minimum(gap, z_peak)
+            z_peak = jnp.maximum(z.max(axis=-1, keepdims=True), 0.0)  # [B,S,1]
             rand_boost = jax.random.uniform(boost_key, z.shape, dtype=jnp.float32)
-            boost_mask = (z < 0) & (rand_boost < gap * boost_rate_eff)
+            boost_mask = (z < 0) & (rand_boost < boost_rate_eff)
             z = jnp.where(drop_mask, -1.0, z)
-            z = jnp.where(boost_mask, boost_value, z)
+            z = jnp.where(boost_mask, z_peak, z)
             chunk_drop_count = drop_mask.astype(jnp.float32).sum()
             chunk_boost_count = boost_mask.astype(jnp.float32).sum()
 
@@ -607,18 +609,17 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             raw = scores.astype(jnp.float32) - tau
             z = raw / s_std  # s_std [B,S,2,1] broadcasts to [B,S,2,N]
 
-            # v4.0.5: bidirectional gate dropout (per-cell, z shape [B,S,2,cs]).
-            drop_key = jax.random.fold_in(_rng_shard, i * 2)
-            boost_key = jax.random.fold_in(_rng_shard, i * 2 + 1)
+            # v4.0.5: bidirectional gate dropout with peak strength
+            # (per-cell, z shape [B,S,2,cs]).
+            drop_key, boost_key = jax.random.split(
+                jax.random.fold_in(_rng_shard, i), 2)
             rand_drop = jax.random.uniform(drop_key, z.shape, dtype=jnp.float32)
             drop_mask = (z > 0) & (rand_drop < drop_rate_eff)
-            gap = jax.nn.relu(-z)
             z_peak = jnp.maximum(z.max(axis=-1, keepdims=True), 0.0)  # [B,S,2,1]
-            boost_value = jnp.minimum(gap, z_peak)
             rand_boost = jax.random.uniform(boost_key, z.shape, dtype=jnp.float32)
-            boost_mask = (z < 0) & (rand_boost < gap * boost_rate_eff)
+            boost_mask = (z < 0) & (rand_boost < boost_rate_eff)
             z = jnp.where(drop_mask, -1.0, z)
-            z = jnp.where(boost_mask, boost_value, z)
+            z = jnp.where(boost_mask, z_peak, z)
             chunk_drop_count = drop_mask.astype(jnp.float32).sum()
             chunk_boost_count = boost_mask.astype(jnp.float32).sum()
 
