@@ -1714,10 +1714,8 @@ def main():
         _srw_kwargs = {'mesh': mesh, 'max_chunk_size': max_chunk}
         if model_version.startswith('spatial-r1-v3.9.5'):
             _srw_kwargs['gate_norm_mode'] = _gnm
-        # v4.0.4: propagate reverse_p_max into sharded builders so the real
-        # training path (sharded) actually applies reverse dropout.
-        if model_version == 'spatial-r1-v4.0.4':
-            _srw_kwargs['reverse_p_max'] = cfg['training'].get('reverse_p_max', 0.0)
+        # v4.0.4: reverse_p_max is a runtime scalar passed through shard_map
+        # at each call (see _attn_forward / _know_forward); not a builder kwarg.
         _sharded_single = make_sharded_srw(**_srw_kwargs)
         if hasattr(_v3, 'make_sharded_srw_paired'):
             _sharded_paired = _v3.make_sharded_srw_paired(**_srw_kwargs)
