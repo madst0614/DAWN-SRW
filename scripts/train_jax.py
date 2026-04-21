@@ -701,13 +701,22 @@ def compute_spatial_diversity_loss(params):
 
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
+                      exploration_weight, exploration_ema_decay,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None):
-    """Create a jit-compiled training step. Mesh SPMD handles parallelism."""
+    """Create a jit-compiled training step. Mesh SPMD handles parallelism.
+
+    v4.1 explore: `ema_ce` is threaded through as a scalar state. The
+    RPE-style exploration loss pushes tau_offset down for surprising
+    tokens (per_token_ce > EMA). `explore_active` is a float gate
+    (0 during burn-in, 1 after) — passed in rather than comparing
+    global_step inside jit to avoid recompilation.
+    """
 
     @jax.jit
-    def train_step(params, opt_state, input_ids, attention_mask, dropout_key):
+    def train_step(params, opt_state, ema_ce, explore_active,
+                   input_ids, attention_mask, dropout_key):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
 
         def loss_fn(params):
@@ -726,8 +735,44 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             ce_loss = result['loss']
             aux_loss = result['aux_loss']
             tau_reg = result.get('tau_reg', jnp.float32(0.0))
-            # v4.0.6: dead-only penalty (scalar). 0 if model doesn't produce it.
             dead_penalty = result.get('dead_penalty', jnp.float32(0.0))
+
+            # v4.1 RPE-style exploration loss.
+            # surprise = relu(per_token_ce - sg(ema_ce)), masked to valid tokens.
+            # loss pushes tau_offset DOWN (gradient descent on
+            # λ · surprise · Σ tau_offset) so surprising tokens recruit more
+            # neurons via lower tau.
+            per_token_ce = result.get('per_token_ce', None)
+            attn_tau_off = result.get('attn_tau_offset', None)
+            know_tau_off = result.get('know_tau_offset', None)
+            valid_mask = result.get('valid_mask', None)
+            if (per_token_ce is not None and attn_tau_off is not None
+                    and know_tau_off is not None and valid_mask is not None):
+                vmask_f = valid_mask.astype(jnp.float32)
+                surprise = jax.nn.relu(
+                    per_token_ce - jax.lax.stop_gradient(ema_ce))   # [B, S-1]
+                # Per-layer, per-route sums. attn_tau_off [L, B, S, 3],
+                # know_tau_off [L, B, S, 1]. Take first S-1 tokens to align
+                # with per_token_ce / valid_mask; sum over layers and route.
+                a_sum = attn_tau_off[:, :, :-1, :].sum(axis=(0, -1))  # [B, S-1]
+                k_sum = know_tau_off[:, :, :-1, :].sum(axis=(0, -1))  # [B, S-1]
+                explore_attn_raw = (surprise * a_sum * vmask_f).sum() / (
+                    vmask_f.sum() + 1e-8)
+                explore_know_raw = (surprise * k_sum * vmask_f).sum() / (
+                    vmask_f.sum() + 1e-8)
+                explore_loss_raw = explore_attn_raw + explore_know_raw
+                # Log-only stats.
+                surprise_mean = (surprise * vmask_f).sum() / (vmask_f.sum() + 1e-8)
+                surprise_frac = ((surprise > 0).astype(jnp.float32) * vmask_f
+                                  ).sum() / (vmask_f.sum() + 1e-8)
+            else:
+                explore_loss_raw = jnp.float32(0.0)
+                explore_attn_raw = jnp.float32(0.0)
+                explore_know_raw = jnp.float32(0.0)
+                surprise_mean = jnp.float32(0.0)
+                surprise_frac = jnp.float32(0.0)
+            explore_loss_weighted = (exploration_weight * explore_active
+                                      * explore_loss_raw)
 
             if is_baseline:
                 orth_loss = jnp.float32(0.0)
@@ -740,7 +785,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + lb_weight * aux_loss
                               + tau_reg_weight * tau_reg
                               + div_weight * div_loss
-                              + dead_penalty_weight * dead_penalty)
+                              + dead_penalty_weight * dead_penalty
+                              + explore_loss_weighted)
             else:
                 orth_loss = compute_orthogonality_loss(
                     params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
@@ -750,12 +796,25 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + tau_reg_weight * tau_reg
                               + orth_weight * orth_loss
                               + div_weight * div_loss
-                              + dead_penalty_weight * dead_penalty)
+                              + dead_penalty_weight * dead_penalty
+                              + explore_loss_weighted)
 
-            return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss, dead_penalty, result)
+            return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
+                                dead_penalty, explore_loss_raw,
+                                explore_attn_raw, explore_know_raw,
+                                surprise_mean, surprise_frac, result)
 
-        (total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss, dead_penalty, result)), grads = \
+        (total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
+                      dead_penalty, explore_loss_raw,
+                      explore_attn_raw, explore_know_raw,
+                      surprise_mean, surprise_frac, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
+
+        # v4.1 EMA update. ce_loss is already globally reduced by XLA SPMD
+        # (valid-weighted mean over batch/seq with sharded batch axis), so no
+        # extra pmean/psum needed at this scope.
+        new_ema_ce = (exploration_ema_decay * ema_ce
+                      + (1.0 - exploration_ema_decay) * ce_loss)
 
         # XLA SPMD handles gradient all-reduce automatically
         # (loss computed on sharded data → gradients consistent across shards)
@@ -912,9 +971,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'alpha_know': result.get('alpha_know', jnp.float32(0.0)),
             'attn_s_std_min': result.get('attn_s_std_min', jnp.float32(0.0)),
             'know_s_std_min': result.get('know_s_std_min', jnp.float32(0.0)),
+            # v4.1 RPE exploration loss.
+            'ema_ce': new_ema_ce,
+            'surprise_mean': surprise_mean,
+            'surprise_frac': surprise_frac,
+            'explore_loss_raw': explore_loss_raw,
+            'explore_attn_raw': explore_attn_raw,
+            'explore_know_raw': explore_know_raw,
+            'explore_loss_weighted': (exploration_weight * explore_active
+                                       * explore_loss_raw),
+            'explore_active': explore_active,
         }
 
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, new_ema_ce, metrics
 
     return train_step
 
@@ -1099,7 +1168,8 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
 # ============================================================
 
 def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config,
-                    step_in_epoch=0, steps_per_epoch=0, training_config=None):
+                    step_in_epoch=0, steps_per_epoch=0, training_config=None,
+                    ema_ce=None):
     """Save checkpoint using flax serialization. Supports local and GCS paths."""
     import flax.serialization as serialization
     ckpt = {
@@ -1112,6 +1182,8 @@ def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_c
         'best_val_loss': best_val_loss,
         'config': model_config,
         'training_config': training_config or {},
+        # v4.1 RPE: EMA of CE. Float scalar (np array on cpu side).
+        'ema_ce': float(ema_ce) if ema_ce is not None else 0.0,
     }
     bytes_data = serialization.to_bytes(ckpt)
 
@@ -1135,6 +1207,7 @@ def load_checkpoint(path, target_params, target_opt_state):
         'best_val_loss': float('inf'),
         'config': {},
         'training_config': {},
+        'ema_ce': 0.0,
     }
     ckpt = serialization.from_bytes(target, bytes_data)
     if jax.process_index() == 0:
@@ -1308,6 +1381,11 @@ def main():
     lb_weight = tcfg.get('load_balance_weight', 2e-5)
     tau_reg_weight = tcfg.get('tau_reg_weight', 0.0)
     dead_penalty_weight = tcfg.get('dead_penalty_weight', 0.0)  # v4.0.6
+    # v4.1 RPE exploration loss (0 weight => off; no-op for earlier versions).
+    exploration_weight = tcfg.get('exploration_weight', 0.0)
+    exploration_ema_decay = tcfg.get('exploration_ema_decay', 0.99)
+    exploration_warmup_steps = tcfg.get('exploration_warmup_steps', 100)
+    ema_ce_initial = 0.0
 
     max_seq_len = cfg['model'].get('max_seq_len', 512)
 
@@ -1432,6 +1510,12 @@ def main():
             lb_weight = saved_training_config.get('load_balance_weight', lb_weight)
             tau_reg_weight = saved_training_config.get('tau_reg_weight', tau_reg_weight)
             dead_penalty_weight = saved_training_config.get('dead_penalty_weight', dead_penalty_weight)
+            exploration_weight = saved_training_config.get(
+                'exploration_weight', exploration_weight)
+            exploration_ema_decay = saved_training_config.get(
+                'exploration_ema_decay', exploration_ema_decay)
+            exploration_warmup_steps = saved_training_config.get(
+                'exploration_warmup_steps', exploration_warmup_steps)
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
@@ -1447,6 +1531,9 @@ def main():
         'load_balance_weight': lb_weight,
         'tau_reg_weight': tau_reg_weight,
         'dead_penalty_weight': dead_penalty_weight,
+        'exploration_weight': exploration_weight,
+        'exploration_ema_decay': exploration_ema_decay,
+        'exploration_warmup_steps': exploration_warmup_steps,
     }
 
     # ----------------------------------------------------------
@@ -1616,6 +1703,8 @@ def main():
         print(f"  LB weight: {lb_weight}")
         print(f"  Tau reg weight: {tau_reg_weight}")
         print(f"  Dead penalty weight: {dead_penalty_weight}")
+        print(f"  Exploration weight: {exploration_weight} "
+              f"(ema_decay={exploration_ema_decay}, warmup={exploration_warmup_steps})")
 
     # ----------------------------------------------------------
     # Resume from checkpoint (resume_path detected earlier for config override)
@@ -1634,6 +1723,8 @@ def main():
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('step', 0)
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        # v4.1 RPE EMA state (0 if absent — pre-v4.1 checkpoints).
+        ema_ce_initial = float(ckpt.get('ema_ce', 0.0))
         # Precise resume: use step_in_epoch if available
         saved_step_in_epoch = ckpt.get('step_in_epoch', 0)
         saved_steps_per_epoch = ckpt.get('steps_per_epoch', 0)
@@ -1785,10 +1876,14 @@ def main():
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
         tau_reg_weight, dead_penalty_weight,
+        exploration_weight, exploration_ema_decay,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
+
+    # v4.1 RPE exploration state (persisted across steps).
+    ema_ce_state = jnp.float32(ema_ce_initial)
 
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile
@@ -1808,8 +1903,9 @@ def main():
 
         # First call: JIT compilation (slow)
         jit_start = time.time()
-        _dp, _do, dummy_metrics = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng)
+        _dp, _do, _dema, dummy_metrics = train_step_fn(
+            params, opt_state, ema_ce_state, jnp.float32(0.0),
+            dummy_ids, dummy_mask, dummy_step_rng)
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         jit_loss = float(dummy_metrics['total_loss'])
@@ -1817,13 +1913,14 @@ def main():
             print(f"  JIT compile: {jit_time:.1f}s", flush=True)
 
         # Free first step outputs before second call
-        del _dp, _do, dummy_metrics
+        del _dp, _do, _dema, dummy_metrics
 
         # Second call: measure actual step time (post-JIT)
         rng, dummy_step_rng2 = jax.random.split(rng)
         step_start = time.time()
-        _dp2, _do2, dummy_metrics2 = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2)
+        _dp2, _do2, _dema2, dummy_metrics2 = train_step_fn(
+            params, opt_state, ema_ce_state, jnp.float32(0.0),
+            dummy_ids, dummy_mask, dummy_step_rng2)
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
@@ -2189,7 +2286,7 @@ def main():
             print(f"  Estimated time: {est_hours:.1f}h ({remaining_steps:,} steps @ {step_time*1000:.1f}ms)", flush=True)
 
         del dummy_ids, dummy_mask
-        del _dp2, _do2, dummy_metrics2
+        del _dp2, _do2, _dema2, dummy_metrics2
         if is_host0:
             print("=== OOM check passed (JIT compiled) ===\n", flush=True)
     except Exception as e:
@@ -2253,6 +2350,7 @@ def main():
                     step_in_epoch=epoch_step_counter,
                     steps_per_epoch=steps_per_epoch,
                     training_config=training_config,
+                    ema_ce=ema_ce_state,
                 )
                 print(f"!!! Emergency checkpoint saved: {epath} !!!", flush=True)
         except Exception as e:
@@ -2319,8 +2417,12 @@ def main():
             attention_mask = shard_to_mesh(
                 attention_mask, data_sharding, (batch_size, max_seq_len))
 
-            params, opt_state, metrics = train_step_fn(
-                params, opt_state,
+            # v4.1 RPE: burn-in gate (ema_ce still updates, but explore_loss=0
+            # until enough steps to stabilise the EMA estimate).
+            explore_active = jnp.float32(
+                1.0 if global_step >= exploration_warmup_steps else 0.0)
+            params, opt_state, ema_ce_state, metrics = train_step_fn(
+                params, opt_state, ema_ce_state, explore_active,
                 input_ids, attention_mask, step_rng)
 
             # Extract metrics (scalars from jit, no [0] indexing)
@@ -2535,6 +2637,24 @@ def main():
                             f" apt_std={k_apt:.1f} ent={k_ent:.2f} dead={int(k_dead)}]"
                             f" a[skew={a_skew:+.2f} kurt={a_kurt:.2f}"
                             f" apt_std={a_apt:.1f} ent={a_ent:.2f} dead={int(a_dead)}]")
+
+                        # v4.1 RPE exploration — EMA of CE, surprise stats,
+                        # explore-loss contribution. Burn-in while explore_active=0.
+                        m_ema_ce = _m(metrics.get('ema_ce', 0.0))
+                        m_surprise_mean = _m(metrics.get('surprise_mean', 0.0))
+                        m_surprise_frac = _m(metrics.get('surprise_frac', 0.0))
+                        m_explore_raw = _m(metrics.get('explore_loss_raw', 0.0))
+                        m_explore_w = _m(metrics.get('explore_loss_weighted', 0.0))
+                        m_explore_a = _m(metrics.get('explore_attn_raw', 0.0))
+                        m_explore_k = _m(metrics.get('explore_know_raw', 0.0))
+                        m_explore_active = _m(metrics.get('explore_active', 0.0))
+                        log_message(
+                            f"      rpe: ema_ce={m_ema_ce:.3f}"
+                            f" surp_mean={m_surprise_mean:.4f}"
+                            f" surp_frac={m_surprise_frac*100:.1f}%"
+                            f" expl[a={m_explore_a:+.4f} k={m_explore_k:+.4f}]"
+                            f" expl_w={m_explore_w:+.5f}"
+                            f" active={m_explore_active:.0f}")
 
                         # Emb norm per-pool stats (mean / max / min / std)
                         k_emb_nmax = _m(metrics.get('know_emb_norm_max', 0.0))
@@ -2791,6 +2911,15 @@ def main():
                         'dead_penalty_weighted': dead_penalty_weight * float(metrics.get('dead_penalty', 0.0)),
                         'attn_dead_count': float(metrics.get('attn_dead_count', 0.0)),
                         'know_dead_count': float(metrics.get('know_dead_count', 0.0)),
+                        # v4.1 RPE exploration loss.
+                        'ema_ce': float(metrics.get('ema_ce', 0.0)),
+                        'surprise_mean': float(metrics.get('surprise_mean', 0.0)),
+                        'surprise_frac': float(metrics.get('surprise_frac', 0.0)),
+                        'explore_loss_raw': float(metrics.get('explore_loss_raw', 0.0)),
+                        'explore_attn_raw': float(metrics.get('explore_attn_raw', 0.0)),
+                        'explore_know_raw': float(metrics.get('explore_know_raw', 0.0)),
+                        'explore_loss_weighted': float(metrics.get('explore_loss_weighted', 0.0)),
+                        'explore_active': float(metrics.get('explore_active', 0.0)),
                         'accuracy': avg_acc,
                         'lr': current_lr,
                         'steps_per_sec': steps_per_sec,
@@ -2859,6 +2988,7 @@ def main():
                             step_in_epoch=epoch_step_counter,
                             steps_per_epoch=steps_per_epoch,
                             training_config=training_config,
+                            ema_ce=ema_ce_state,
                         )
                         log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
                     del params_single, opt_state_single
@@ -2913,6 +3043,7 @@ def main():
                         step_in_epoch=epoch_step_counter,
                         steps_per_epoch=steps_per_epoch,
                         training_config=training_config,
+                        ema_ce=ema_ce_state,
                     )
                 del params_single, opt_state_single
                 cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
@@ -2972,6 +3103,7 @@ def main():
                 step_in_epoch=0,  # start of next epoch
                 steps_per_epoch=steps_per_epoch,
                 training_config=training_config,
+                ema_ce=ema_ce_state,
             )
             if is_best:
                 save_checkpoint(
@@ -2982,6 +3114,7 @@ def main():
                     step_in_epoch=0,
                     steps_per_epoch=steps_per_epoch,
                     training_config=training_config,
+                    ema_ce=ema_ce_state,
                 )
                 log_message(f"  New best model! val_loss={best_val_loss:.4f}")
 

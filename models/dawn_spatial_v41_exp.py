@@ -1039,6 +1039,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     # v4.1 aggregates: dead-only penalty.
     attn_dead_penalty = qk_dead_pen + v_dead_pen
     attn_dead_count = jax.lax.stop_gradient(qk_dead_cnt + v_dead_cnt)
+    # v4.1 explore: expose raw tau_offset (pre-stats) for RPE-driven
+    # exploration loss in train_step. Shape [B, S, 3] (Q/K/V tau offsets).
+    attn_tau_offset = tau_all
     return (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax,
             attn_score_std, attn_gate_sum, attn_active_n_mean,
             attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
@@ -1054,7 +1057,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             qk_emb_norm_min, qk_emb_norm_std,
             v_emb_norm_min, v_emb_norm_std,
             attn_score_kurt,
-            attn_dead_penalty, attn_dead_count)
+            attn_dead_penalty, attn_dead_count,
+            attn_tau_offset)
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -1117,7 +1121,8 @@ def _know_forward(x, pool_params, router_params, rng,
             know_z_sum,
             know_emb_norm_max, know_emb_norm_std,
             know_emb_norm_min, know_score_kurt,
-            know_dead_penalty, know_dead_count)
+            know_dead_penalty, know_dead_count,
+            tau)
 
 
 # ================================================================
@@ -1283,6 +1288,9 @@ class DAWN(nn.Module):
             know_dead_penalty_all = _z
             attn_dead_count_all = _z
             know_dead_count_all = _z
+            # v4.1 explore: per-layer tau_offset for RPE-driven exploration loss.
+            attn_tau_offset_all = _z
+            know_tau_offset_all = _z
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
@@ -1332,7 +1340,8 @@ class DAWN(nn.Module):
                  a_qk_emb_n_min, a_qk_emb_n_std,
                  a_v_emb_n_min, a_v_emb_n_std,
                  a_score_kurt,
-                 a_dead_penalty, a_dead_count
+                 a_dead_penalty, a_dead_count,
+                 a_tau_offset
                 ) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
@@ -1352,7 +1361,8 @@ class DAWN(nn.Module):
                  k_skew, k_apt_std, k_entropy, k_z_sum,
                  k_emb_n_max, k_emb_n_std,
                  k_emb_n_min, k_score_kurt,
-                 k_dead_penalty, k_dead_count
+                 k_dead_penalty, k_dead_count,
+                 k_tau_offset
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
@@ -1387,6 +1397,7 @@ class DAWN(nn.Module):
                            a_score_kurt, k_score_kurt,
                            a_dead_penalty, k_dead_penalty,
                            a_dead_count, k_dead_count,
+                           a_tau_offset, k_tau_offset,
                            )
 
             if self.gradient_checkpointing:
@@ -1422,7 +1433,8 @@ class DAWN(nn.Module):
                 know_emb_n_min_all,
                 attn_score_kurt_all, know_score_kurt_all,
                 attn_dead_penalty_all, know_dead_penalty_all,
-                attn_dead_count_all, know_dead_count_all) = jax.lax.scan(
+                attn_dead_count_all, know_dead_count_all,
+                attn_tau_offset_all, know_tau_offset_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -1523,6 +1535,10 @@ class DAWN(nn.Module):
 
             'per_layer_attn_out_norm': attn_out_norm_all,
             'per_layer_know_out_norm': know_out_norm_all,
+            # v4.1 explore: per-layer tau_offset stacks for RPE exploration loss.
+            # Shapes: attn [L, B, S, 3], know [L, B, S, 1].
+            'attn_tau_offset': attn_tau_offset_all,
+            'know_tau_offset': know_tau_offset_all,
         }
 
         if labels is not None:
@@ -1538,16 +1554,20 @@ class DAWN(nn.Module):
                 safe = jnp.where(vmask, labs, 0)
                 tl = -jnp.take_along_axis(
                     log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
-                loss = (tl * vmask).sum() / (vmask.sum() + 1e-8)
+                per_token_ce = tl * vmask            # [B, S-1], 0 on invalid
+                loss = per_token_ce.sum() / (vmask.sum() + 1e-8)
                 preds = jnp.argmax(logits, axis=-1)
                 correct = jnp.sum((preds == labs) & vmask)
-                return loss, correct, jnp.sum(vmask)
+                return loss, per_token_ce, correct, jnp.sum(vmask)
 
-            loss, correct, valid_count = compute_loss_and_acc(
+            loss, per_token_ce, correct, valid_count = compute_loss_and_acc(
                 shift_x, embedding_matrix, shift_labels, valid_mask)
             result['loss'] = loss
             result['correct'] = correct
             result['valid_count'] = valid_count
+            # v4.1 explore: expose per-token CE + valid mask for RPE loss.
+            result['per_token_ce'] = per_token_ce
+            result['valid_mask'] = valid_mask
         else:
             result['logits'] = self.token_emb.attend(x)
 

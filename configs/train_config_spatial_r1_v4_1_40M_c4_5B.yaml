@@ -56,6 +56,12 @@ training:
   # Dead-only penalty (threshold bumped from 1e-4 → 0.01 for v4.1 scale).
   dead_penalty_weight: 0.05
   dead_penalty_threshold: 0.01
+  # v4.1 RPE-style exploration loss. Pushes tau_offset DOWN on tokens
+  # where per_token_ce > EMA(ce), so surprising tokens recruit more
+  # neurons. 0 weight to disable.
+  exploration_weight: 0.001        # λ
+  exploration_ema_decay: 0.99
+  exploration_warmup_steps: 100    # burn-in: ema updates, explore_loss=0
   n_chunks_know: 1
   n_chunks_qk: 1
   n_chunks_v: 1
