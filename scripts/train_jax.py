@@ -39,6 +39,7 @@ import numpy as np
 from datetime import datetime
 from functools import partial
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.experimental.shard_map import shard_map
 
 from models.model_v17_1_jax import DAWN
 from models.dawn_spatial import DAWN as DAWN_Spatial
