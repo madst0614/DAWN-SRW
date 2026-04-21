@@ -600,9 +600,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
         dead_count_out = jax.lax.stop_gradient(
             jax.lax.psum(total_dead_count, 'model'))
-        # v4.1 intensity diagnostics.
-        int_max_out = jax.lax.stop_gradient(
-            jax.lax.pmax(total_int_max, 'model'))
+        # v4.1 intensity diagnostics.  pmax has no VJP — wrap the input in
+        # stop_gradient so reverse-mode never reaches it (the output is
+        # observational-only anyway).
+        int_max_out = jax.lax.pmax(
+            jax.lax.stop_gradient(total_int_max), 'model')
         int_cap_frac_out = jax.lax.stop_gradient(
             jax.lax.psum(total_int_cap_count, 'model')
             / jnp.float32(B * S * N_total))
@@ -874,8 +876,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         dead_count_out = jax.lax.stop_gradient(
             jax.lax.psum(total_dead_count, 'model'))
         # v4.1 intensity diagnostics. Counts are over (B, S, 2, N) cells.
-        int_max_out = jax.lax.stop_gradient(
-            jax.lax.pmax(total_int_max, 'model'))
+        # pmax has no VJP — stop_gradient the input.
+        int_max_out = jax.lax.pmax(
+            jax.lax.stop_gradient(total_int_max), 'model')
         int_cap_frac_out = jax.lax.stop_gradient(
             jax.lax.psum(total_int_cap_count, 'model')
             / jnp.float32(B * S * 2 * N_total))
