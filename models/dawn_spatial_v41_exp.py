@@ -388,7 +388,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         P(),                     # z_sum_out (now Σintensity)
                         P(),                     # score_kurt scalar
                         P(),                     # dead_penalty scalar
-                        P()),                    # dead_count scalar
+                        P(),                     # dead_count scalar
+                        P(),                     # int_max scalar  (v4.1 diag)
+                        P()),                    # int_cap_frac    (v4.1 diag)
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, tau_offset, read_local, write_local):
         N_local = emb_local.shape[0]
@@ -463,12 +465,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
         # --- Pass 2: gate + srw fused (scan + checkpoint) ---
+        # v4.1 diagnostic: ceiling on intensity relative to cap (1e-3 below).
+        _int_cap_thresh = _eps + _max_int - jnp.float32(1e-3)
+
         @jax.checkpoint
         def gate_srw_step(carry, i):
             (out, total_weighted_cost, total_gate_max, total_active,
              total_strong, total_phi_binary, total_z_sum,
              total_z_lt_075, total_z_lt_030, total_g_log_g,
-             total_dead_penalty, total_dead_count) = carry
+             total_dead_penalty, total_dead_count,
+             total_int_max, total_int_cap_count) = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
@@ -484,6 +490,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             active_margin = jnp.maximum(margin - _act_cut, 0.0)
             intensity = _eps + jnp.minimum(active_margin, _max_int)
             gate = activation * intensity
+            # v4.1 diag: track intensity saturation.
+            chunk_int_max = intensity.max()
+            chunk_int_cap_count = (intensity >= _int_cap_thresh
+                                    ).astype(jnp.float32).sum()
             gate_bf = gate.astype(jnp.bfloat16)
             xr = x_bf @ rc.T
             c_out = ((gate_bf * xr) @ wc).astype(jnp.float32)
@@ -532,14 +542,18 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     total_z_lt_030 + chunk_z_lt_030,
                     total_g_log_g + chunk_g_log_g,
                     total_dead_penalty + chunk_dead_penalty,
-                    total_dead_count + chunk_dead_count), None
+                    total_dead_count + chunk_dead_count,
+                    jnp.maximum(total_int_max, chunk_int_max),
+                    total_int_cap_count + chunk_int_cap_count), None
 
         (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong,
          total_phi_binary, total_z_sum, total_z_lt_075, total_z_lt_030,
-         total_g_log_g, total_dead_penalty, total_dead_count), _ = jax.lax.scan(
+         total_g_log_g, total_dead_penalty, total_dead_count,
+         total_int_max, total_int_cap_count), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, D), dtype=jnp.float32),
              z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1, z1, z1, z1,
+             jnp.float32(0.0), jnp.float32(0.0),
              jnp.float32(0.0), jnp.float32(0.0)),
             jnp.arange(nc))
 
@@ -559,10 +573,15 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
         # z_mean_active: mean gate over active neurons.
         z_mean_active = jax.lax.psum(total_weighted_cost, 'model') / (global_active + 1e-8)
+        # v4.1 safety floor — active can collapse to 0 per token at init,
+        # and dividing by `global_active + 1e-8` then blows the fraction to
+        # ~1e8. Clamp denominator to at least 1.0 so the worst case is just
+        # "0 among >= 1 claimed-active".
+        _active_denom = jnp.maximum(global_active, 1.0)
         z_lt_075_frac = jax.lax.stop_gradient(
-            (jax.lax.psum(total_z_lt_075, 'model') / (global_active + 1e-8)).mean())
+            (jax.lax.psum(total_z_lt_075, 'model') / _active_denom).mean())
         z_lt_030_frac = jax.lax.stop_gradient(
-            (jax.lax.psum(total_z_lt_030, 'model') / (global_active + 1e-8)).mean())
+            (jax.lax.psum(total_z_lt_030, 'model') / _active_denom).mean())
 
         score_std_out = s_std.mean()
         es_out = global_weighted_cost.mean()           # Σgate — observational
@@ -581,11 +600,18 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
         dead_count_out = jax.lax.stop_gradient(
             jax.lax.psum(total_dead_count, 'model'))
+        # v4.1 intensity diagnostics.
+        int_max_out = jax.lax.stop_gradient(
+            jax.lax.pmax(total_int_max, 'model'))
+        int_cap_frac_out = jax.lax.stop_gradient(
+            jax.lax.psum(total_int_cap_count, 'model')
+            / jnp.float32(B * S * N_total))
         return (out.astype(jnp.float32), active_frac, global_gate_max, score_lb,
                 score_std_out, es_out, active_n_mean, strong_frac, phi_binary_frac, z_mean_active,
                 tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
                 score_skew, active_per_token_std, gate_entropy, z_sum_out,
-                score_kurt, dead_penalty_out, dead_count_out)
+                score_kurt, dead_penalty_out, dead_count_out,
+                int_max_out, int_cap_frac_out)
 
     return fused_gate_srw
 
@@ -641,7 +667,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         P(),                         # z_sum_out (Σintensity)
                         P(),                         # score_kurt scalar
                         P(),                         # dead_penalty scalar
-                        P()),                        # dead_count scalar
+                        P(),                         # dead_count scalar
+                        P(),                         # int_max scalar  (v4.1 diag)
+                        P()),                        # int_cap_frac    (v4.1 diag)
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, tau_offset, read_local, write_local):
         N_local = emb_local.shape[0]
@@ -717,12 +745,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
         # --- Pass 2: gate + srw fused ---
+        _int_cap_thresh_paired = _eps + _max_int - jnp.float32(1e-3)
+
         @jax.checkpoint
         def gate_srw_step(carry, i):
             (out, total_weighted_cost, total_gate_max, total_active,
              total_strong, total_phi_binary, total_z_sum,
              total_z_lt_075, total_z_lt_030, total_g_log_g,
-             total_dead_penalty, total_dead_count) = carry
+             total_dead_penalty, total_dead_count,
+             total_int_max, total_int_cap_count) = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
@@ -738,6 +769,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             active_margin = jnp.maximum(margin - _act_cut, 0.0)
             intensity = _eps + jnp.minimum(active_margin, _max_int)
             gate = activation * intensity
+            # v4.1 diag: intensity saturation.
+            chunk_int_max = intensity.max()
+            chunk_int_cap_count = (intensity >= _int_cap_thresh_paired
+                                    ).astype(jnp.float32).sum()
             gate_bf = gate.astype(jnp.bfloat16)
             xr = x_bf @ rc.T  # [B,S,N]
             c_out = jnp.einsum('bsrn,nd->bsrd', gate_bf * xr[:, :, None, :], wc).astype(jnp.float32)
@@ -781,15 +816,19 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     total_z_lt_030 + chunk_z_lt_030,
                     total_g_log_g + chunk_g_log_g,
                     total_dead_penalty + chunk_dead_penalty,
-                    total_dead_count + chunk_dead_count), None
+                    total_dead_count + chunk_dead_count,
+                    jnp.maximum(total_int_max, chunk_int_max),
+                    total_int_cap_count + chunk_int_cap_count), None
 
         (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong,
          total_phi_binary, total_z_sum, total_z_lt_075, total_z_lt_030,
-         total_g_log_g, total_dead_penalty, total_dead_count), _ = jax.lax.scan(
+         total_g_log_g, total_dead_penalty, total_dead_count,
+         total_int_max, total_int_cap_count), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
              z1_r, jnp.full((B, S, 2, 1), -1e9),
              z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r,
+             jnp.float32(0.0), jnp.float32(0.0),
              jnp.float32(0.0), jnp.float32(0.0)),
             jnp.arange(nc))
 
@@ -811,10 +850,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         z_mean_active = global_weighted_cost / (global_active + 1e-8)
         z_mean_active_mean = z_mean_active.mean(axis=2)
         raw_gate_max_mean = global_gate_max.mean(axis=2)
+        # v4.1 safety floor (see make_sharded_srw body for rationale).
+        _active_denom = jnp.maximum(global_active, 1.0)
         z_lt_075_frac = jax.lax.stop_gradient(
-            (jax.lax.psum(total_z_lt_075, 'model') / (global_active + 1e-8)).mean())
+            (jax.lax.psum(total_z_lt_075, 'model') / _active_denom).mean())
         z_lt_030_frac = jax.lax.stop_gradient(
-            (jax.lax.psum(total_z_lt_030, 'model') / (global_active + 1e-8)).mean())
+            (jax.lax.psum(total_z_lt_030, 'model') / _active_denom).mean())
 
         score_std_out = s_std.mean()
         es_out = global_weighted_cost.mean()
@@ -832,11 +873,18 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
         dead_count_out = jax.lax.stop_gradient(
             jax.lax.psum(total_dead_count, 'model'))
+        # v4.1 intensity diagnostics. Counts are over (B, S, 2, N) cells.
+        int_max_out = jax.lax.stop_gradient(
+            jax.lax.pmax(total_int_max, 'model'))
+        int_cap_frac_out = jax.lax.stop_gradient(
+            jax.lax.psum(total_int_cap_count, 'model')
+            / jnp.float32(B * S * 2 * N_total))
         return (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb,
                 score_std_out, es_out, active_n_mean, strong_frac_mean, phi_binary_frac_mean,
                 z_mean_active_mean, tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
                 score_skew, active_per_token_std, gate_entropy, z_sum_out,
-                score_kurt, dead_penalty_out, dead_count_out)
+                score_kurt, dead_penalty_out, dead_count_out,
+                int_max_out, int_cap_frac_out)
 
     return fused_gate_srw_paired
 
@@ -969,7 +1017,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      qk_strong, qk_phi_bin, qk_z_act,
      qk_tau_abs, qk_z075, qk_z030,
      qk_skew, qk_apt_std, qk_entropy, qk_z_sum, qk_kurt,
-     qk_dead_pen, qk_dead_cnt) = fused_paired(
+     qk_dead_pen, qk_dead_cnt, qk_int_max, qk_int_cap) = fused_paired(
         x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write)
     qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
     Q = QK_out[:, :, 0, :] * qk_scale
@@ -978,7 +1026,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      v_strong, v_phi_bin, v_z_act,
      v_tau_abs, v_z075, v_z030,
      v_skew, v_apt_std, v_entropy, v_z_sum, v_kurt,
-     v_dead_pen, v_dead_cnt) = fused_single(
+     v_dead_pen, v_dead_cnt, v_int_max, v_int_cap) = fused_single(
         x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write)
     v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
     V = V * v_scale
@@ -1039,6 +1087,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     # v4.1 aggregates: dead-only penalty.
     attn_dead_penalty = qk_dead_pen + v_dead_pen
     attn_dead_count = jax.lax.stop_gradient(qk_dead_cnt + v_dead_cnt)
+    # v4.1 intensity diagnostics: max across qk/v; cap fraction averaged.
+    attn_int_max = jnp.maximum(qk_int_max, v_int_max)
+    attn_int_cap_frac = (qk_int_cap + v_int_cap) / 2.0
     # v4.1 explore: expose raw tau_offset (pre-stats) for RPE-driven
     # exploration loss in train_step. Shape [B, S, 3] (Q/K/V tau offsets).
     attn_tau_offset = tau_all
@@ -1058,7 +1109,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             v_emb_norm_min, v_emb_norm_std,
             attn_score_kurt,
             attn_dead_penalty, attn_dead_count,
-            attn_tau_offset)
+            attn_tau_offset,
+            attn_int_max, attn_int_cap_frac)
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -1089,7 +1141,8 @@ def _know_forward(x, pool_params, router_params, rng,
      know_tau_abs_mean, know_z_lt_075_frac, know_z_lt_030_frac,
      know_score_skew, know_active_per_token_std, know_gate_entropy,
      know_z_sum, know_score_kurt,
-     know_dead_penalty, know_dead_count) = fused_single(
+     know_dead_penalty, know_dead_count,
+     know_int_max, know_int_cap_frac) = fused_single(
         x, h, know_emb_unit, tau, know_read, know_write)
 
     know_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
@@ -1122,7 +1175,8 @@ def _know_forward(x, pool_params, router_params, rng,
             know_emb_norm_max, know_emb_norm_std,
             know_emb_norm_min, know_score_kurt,
             know_dead_penalty, know_dead_count,
-            tau)
+            tau,
+            know_int_max, know_int_cap_frac)
 
 
 # ================================================================
@@ -1291,6 +1345,11 @@ class DAWN(nn.Module):
             # v4.1 explore: per-layer tau_offset for RPE-driven exploration loss.
             attn_tau_offset_all = _z
             know_tau_offset_all = _z
+            # v4.1 intensity diagnostics.
+            attn_int_max_all = _z
+            know_int_max_all = _z
+            attn_int_cap_frac_all = _z
+            know_int_cap_frac_all = _z
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
@@ -1341,7 +1400,8 @@ class DAWN(nn.Module):
                  a_v_emb_n_min, a_v_emb_n_std,
                  a_score_kurt,
                  a_dead_penalty, a_dead_count,
-                 a_tau_offset
+                 a_tau_offset,
+                 a_int_max, a_int_cap_frac
                 ) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
@@ -1362,7 +1422,8 @@ class DAWN(nn.Module):
                  k_emb_n_max, k_emb_n_std,
                  k_emb_n_min, k_score_kurt,
                  k_dead_penalty, k_dead_count,
-                 k_tau_offset
+                 k_tau_offset,
+                 k_int_max, k_int_cap_frac
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
@@ -1398,6 +1459,8 @@ class DAWN(nn.Module):
                            a_dead_penalty, k_dead_penalty,
                            a_dead_count, k_dead_count,
                            a_tau_offset, k_tau_offset,
+                           a_int_max, k_int_max,
+                           a_int_cap_frac, k_int_cap_frac,
                            )
 
             if self.gradient_checkpointing:
@@ -1434,7 +1497,9 @@ class DAWN(nn.Module):
                 attn_score_kurt_all, know_score_kurt_all,
                 attn_dead_penalty_all, know_dead_penalty_all,
                 attn_dead_count_all, know_dead_count_all,
-                attn_tau_offset_all, know_tau_offset_all) = jax.lax.scan(
+                attn_tau_offset_all, know_tau_offset_all,
+                attn_int_max_all, know_int_max_all,
+                attn_int_cap_frac_all, know_int_cap_frac_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -1539,6 +1604,11 @@ class DAWN(nn.Module):
             # Shapes: attn [L, B, S, 3], know [L, B, S, 1].
             'attn_tau_offset': attn_tau_offset_all,
             'know_tau_offset': know_tau_offset_all,
+            # v4.1 intensity diagnostics (per-layer max / cap frac).
+            'attn_int_max': attn_int_max_all.max(),
+            'know_int_max': know_int_max_all.max(),
+            'attn_int_cap_frac': attn_int_cap_frac_all.mean(),
+            'know_int_cap_frac': know_int_cap_frac_all.mean(),
         }
 
         if labels is not None:

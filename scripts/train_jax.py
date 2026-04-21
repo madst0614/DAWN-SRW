@@ -789,6 +789,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 k_sum = know_tau_off[:, :, :-1, :].sum(axis=(0, -1))
                 a_tau_mean = attn_tau_off[:, :, :-1, :].mean(axis=(0, -1))
                 k_tau_mean = know_tau_off[:, :, :-1, :].mean(axis=(0, -1))
+                # v4.1 tau_offset distribution diagnostics (sg to keep them
+                # out of the backward pass — they're purely observational).
+                _a_tau_flat = jax.lax.stop_gradient(attn_tau_off)
+                _k_tau_flat = jax.lax.stop_gradient(know_tau_off)
+                attn_tau_off_min = _a_tau_flat.min()
+                attn_tau_off_max = _a_tau_flat.max()
+                attn_tau_off_p99 = jnp.quantile(_a_tau_flat, 0.99)
+                attn_tau_off_p01 = jnp.quantile(_a_tau_flat, 0.01)
+                attn_tau_off_neg_frac = (_a_tau_flat < 0).astype(jnp.float32).mean()
+                know_tau_off_min = _k_tau_flat.min()
+                know_tau_off_max = _k_tau_flat.max()
+                know_tau_off_p99 = jnp.quantile(_k_tau_flat, 0.99)
+                know_tau_off_p01 = jnp.quantile(_k_tau_flat, 0.01)
+                know_tau_off_neg_frac = (_k_tau_flat < 0).astype(jnp.float32).mean()
                 # Downward cap: when signal > 0 (about to push tau DOWN) and
                 # the per-pool mean tau_offset is already ≤ 0, zero the
                 # contribution for that token. Up-push (signal < 0) always
@@ -817,6 +831,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     (a_block.astype(jnp.float32) * vmask_f).sum() / vsum_eps)
                 block_frac_k = jax.lax.stop_gradient(
                     (k_block.astype(jnp.float32) * vmask_f).sum() / vsum_eps)
+                # Signal magnitude extremes (diag).
+                _sig_sg = jax.lax.stop_gradient(signal * vmask_f)
+                sig_pos_max = _sig_sg.max()
+                sig_neg_max = (-_sig_sg).max()
             else:
                 global_mean_ce = jnp.float32(0.0)
                 explore_loss_raw = jnp.float32(0.0)
@@ -827,6 +845,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 neg_mean = jnp.float32(0.0)
                 block_frac_a = jnp.float32(0.0)
                 block_frac_k = jnp.float32(0.0)
+                sig_pos_max = jnp.float32(0.0)
+                sig_neg_max = jnp.float32(0.0)
+                attn_tau_off_min = jnp.float32(0.0)
+                attn_tau_off_max = jnp.float32(0.0)
+                attn_tau_off_p99 = jnp.float32(0.0)
+                attn_tau_off_p01 = jnp.float32(0.0)
+                attn_tau_off_neg_frac = jnp.float32(0.0)
+                know_tau_off_min = jnp.float32(0.0)
+                know_tau_off_max = jnp.float32(0.0)
+                know_tau_off_p99 = jnp.float32(0.0)
+                know_tau_off_p01 = jnp.float32(0.0)
+                know_tau_off_neg_frac = jnp.float32(0.0)
             explore_loss_weighted = exploration_weight * explore_loss_raw
 
             if is_baseline:
@@ -854,17 +884,26 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + dead_penalty_weight * dead_penalty
                               + explore_loss_weighted)
 
+            explore_stats = dict(
+                global_mean_ce=global_mean_ce,
+                explore_loss_raw=explore_loss_raw,
+                explore_attn_raw=explore_attn_raw,
+                explore_know_raw=explore_know_raw,
+                pos_frac=pos_frac, pos_mean=pos_mean, neg_mean=neg_mean,
+                block_frac_a=block_frac_a, block_frac_k=block_frac_k,
+                sig_pos_max=sig_pos_max, sig_neg_max=sig_neg_max,
+                attn_tau_off_min=attn_tau_off_min, attn_tau_off_max=attn_tau_off_max,
+                attn_tau_off_p99=attn_tau_off_p99, attn_tau_off_p01=attn_tau_off_p01,
+                attn_tau_off_neg_frac=attn_tau_off_neg_frac,
+                know_tau_off_min=know_tau_off_min, know_tau_off_max=know_tau_off_max,
+                know_tau_off_p99=know_tau_off_p99, know_tau_off_p01=know_tau_off_p01,
+                know_tau_off_neg_frac=know_tau_off_neg_frac,
+            )
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
-                                dead_penalty, global_mean_ce, explore_loss_raw,
-                                explore_attn_raw, explore_know_raw,
-                                pos_frac, pos_mean, neg_mean,
-                                block_frac_a, block_frac_k, result)
+                                dead_penalty, explore_stats, result)
 
         (total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
-                      dead_penalty, global_mean_ce, explore_loss_raw,
-                      explore_attn_raw, explore_know_raw,
-                      pos_frac, pos_mean, neg_mean,
-                      block_frac_a, block_frac_k, result)), grads = \
+                      dead_penalty, explore_stats, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
         # XLA SPMD handles gradient all-reduce automatically
@@ -1022,17 +1061,34 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'alpha_know': result.get('alpha_know', jnp.float32(0.0)),
             'attn_s_std_min': result.get('attn_s_std_min', jnp.float32(0.0)),
             'know_s_std_min': result.get('know_s_std_min', jnp.float32(0.0)),
-            # v4.1 RPE exploration loss.
-            'global_mean_ce': global_mean_ce,
-            'pos_frac': pos_frac,
-            'pos_mean': pos_mean,
-            'neg_mean': neg_mean,
-            'explore_loss_raw': explore_loss_raw,
-            'explore_attn_raw': explore_attn_raw,
-            'explore_know_raw': explore_know_raw,
-            'explore_loss_weighted': exploration_weight * explore_loss_raw,
-            'explore_block_frac_a': block_frac_a,
-            'explore_block_frac_k': block_frac_k,
+            # v4.1 RPE exploration + diagnostics.
+            'global_mean_ce': explore_stats['global_mean_ce'],
+            'pos_frac': explore_stats['pos_frac'],
+            'pos_mean': explore_stats['pos_mean'],
+            'neg_mean': explore_stats['neg_mean'],
+            'explore_loss_raw': explore_stats['explore_loss_raw'],
+            'explore_attn_raw': explore_stats['explore_attn_raw'],
+            'explore_know_raw': explore_stats['explore_know_raw'],
+            'explore_loss_weighted': exploration_weight * explore_stats['explore_loss_raw'],
+            'explore_block_frac_a': explore_stats['block_frac_a'],
+            'explore_block_frac_k': explore_stats['block_frac_k'],
+            'sig_pos_max': explore_stats['sig_pos_max'],
+            'sig_neg_max': explore_stats['sig_neg_max'],
+            'attn_tau_off_min': explore_stats['attn_tau_off_min'],
+            'attn_tau_off_max': explore_stats['attn_tau_off_max'],
+            'attn_tau_off_p99': explore_stats['attn_tau_off_p99'],
+            'attn_tau_off_p01': explore_stats['attn_tau_off_p01'],
+            'attn_tau_off_neg_frac': explore_stats['attn_tau_off_neg_frac'],
+            'know_tau_off_min': explore_stats['know_tau_off_min'],
+            'know_tau_off_max': explore_stats['know_tau_off_max'],
+            'know_tau_off_p99': explore_stats['know_tau_off_p99'],
+            'know_tau_off_p01': explore_stats['know_tau_off_p01'],
+            'know_tau_off_neg_frac': explore_stats['know_tau_off_neg_frac'],
+            # v4.1 intensity diagnostics.
+            'attn_int_max': result.get('attn_int_max', jnp.float32(0.0)),
+            'know_int_max': result.get('know_int_max', jnp.float32(0.0)),
+            'attn_int_cap_frac': result.get('attn_int_cap_frac', jnp.float32(0.0)),
+            'know_int_cap_frac': result.get('know_int_cap_frac', jnp.float32(0.0)),
         }
 
         return new_params, new_opt_state, metrics
@@ -2671,6 +2727,27 @@ def main():
                             f" a[skew={a_skew:+.2f} kurt={a_kurt:.2f}"
                             f" apt_std={a_apt:.1f} ent={a_ent:.2f} dead={int(a_dead)}]")
 
+                        # v4.1 tau_offset distribution — prime diagnostic
+                        # for exploration-driven runaway.
+                        a_tau_off_min = _m(metrics.get('attn_tau_off_min', 0.0))
+                        a_tau_off_max = _m(metrics.get('attn_tau_off_max', 0.0))
+                        a_tau_off_p99 = _m(metrics.get('attn_tau_off_p99', 0.0))
+                        a_tau_off_neg = _m(metrics.get('attn_tau_off_neg_frac', 0.0))
+                        k_tau_off_min = _m(metrics.get('know_tau_off_min', 0.0))
+                        k_tau_off_max = _m(metrics.get('know_tau_off_max', 0.0))
+                        k_tau_off_p99 = _m(metrics.get('know_tau_off_p99', 0.0))
+                        k_tau_off_neg = _m(metrics.get('know_tau_off_neg_frac', 0.0))
+                        log_message(
+                            f"      tau_off k: min={k_tau_off_min:+.2f}"
+                            f" max={k_tau_off_max:+.2f}"
+                            f" p99={k_tau_off_p99:+.2f}"
+                            f" neg={k_tau_off_neg*100:.1f}%")
+                        log_message(
+                            f"      tau_off a: min={a_tau_off_min:+.2f}"
+                            f" max={a_tau_off_max:+.2f}"
+                            f" p99={a_tau_off_p99:+.2f}"
+                            f" neg={a_tau_off_neg*100:.1f}%")
+
                         # v4.1 RPE exploration (batch-global-mean baseline,
                         # asymmetric signal; no EMA / warmup).
                         m_global_ce = _m(metrics.get('global_mean_ce', 0.0))
@@ -2682,10 +2759,13 @@ def main():
                         m_explore_w = _m(metrics.get('explore_loss_weighted', 0.0))
                         m_block_a = _m(metrics.get('explore_block_frac_a', 0.0))
                         m_block_k = _m(metrics.get('explore_block_frac_k', 0.0))
+                        m_sig_pmax = _m(metrics.get('sig_pos_max', 0.0))
+                        m_sig_nmax = _m(metrics.get('sig_neg_max', 0.0))
                         log_message(
                             f"      rpe: mean_ce={m_global_ce:.3f}"
                             f" pos_frac={m_pos_frac*100:.1f}%"
                             f" pos_avg={m_pos_mean:.3f} neg_avg={m_neg_mean:.3f}"
+                            f" sig[max+={m_sig_pmax:.2f} max-={m_sig_nmax:.2f}]"
                             f" expl[a={m_explore_a:+.3f} k={m_explore_k:+.3f}]"
                             f" w={m_explore_w:+.4f}"
                             f" block[a={m_block_a*100:.1f}% k={m_block_k*100:.1f}%]")
@@ -2703,14 +2783,9 @@ def main():
                         v_emb_nmin = _m(metrics.get('v_emb_norm_min', 0.0))
                         v_emb_nstd = _m(metrics.get('v_emb_norm_std', 0.0))
                         log_message(
-                            f"      emb_n know: mean={k_emb_n:.3f} max={k_emb_nmax:.3f}"
-                            f" min={k_emb_nmin:.3f} std={k_emb_nstd:.3f}")
-                        log_message(
-                            f"      emb_n qk:   mean={qk_emb_nmean:.3f} max={qk_emb_nmax:.3f}"
-                            f" min={qk_emb_nmin:.3f} std={qk_emb_nstd:.3f}")
-                        log_message(
-                            f"      emb_n v:    mean={v_emb_nmean:.3f} max={v_emb_nmax:.3f}"
-                            f" min={v_emb_nmin:.3f} std={v_emb_nstd:.3f}")
+                            f"      emb_n: k[{k_emb_n:.3f}±{k_emb_nstd:.3f} min={k_emb_nmin:.3f}]"
+                            f" qk[{qk_emb_nmean:.3f}±{qk_emb_nstd:.3f} min={qk_emb_nmin:.3f}]"
+                            f" v[{v_emb_nmean:.3f}±{v_emb_nstd:.3f} min={v_emb_nmin:.3f}]")
 
                         # Emb drift (relative L2 change since last LOG_INTERVAL snapshot).
                         drift_qk = drift_v = drift_know = 0.0
@@ -2738,10 +2813,7 @@ def main():
                             _prev_emb_snap = (cur_qk, cur_v, cur_know)
                         except Exception as _drift_err:
                             log_message(f"      drift: failed ({_drift_err})")
-                        log_message(
-                            f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
-                            f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
-                            f" write={k_write_n:.3f}")
+                        # v4.1: aux line removed (lb_weight=0 → no loss contribution).
                         k_raw_n = _m(metrics.get('know_raw_out_norm', 0.0))
                         a_qk_raw_n = _m(metrics.get('attn_qk_raw_norm', 0.0))
                         a_v_raw_n = _m(metrics.get('attn_v_raw_norm', 0.0))
@@ -2773,17 +2845,21 @@ def main():
                                 f" s_std={k_sstd:.3f}"
                                 f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
                         else:
-                            k_strong_s = f" strong={k_strong * n_know_cfg:.0f}({k_strong*100:.1f}%)" if k_strong > 0 else ""
-                            k_phi_s = ""
+                            # v4.1 compressed know line.
                             k_phi = _m(metrics.get('know_phi_binary', 0.0))
                             k_z_act = _m(metrics.get('know_z_mean_active', 0.0))
-                            if k_phi > 0:
-                                k_phi_s = f" phi_bin={k_phi*100:.1f}% z_act={k_z_act:.2f}"
+                            k_z075 = _m(metrics.get('know_z_lt_075', 0.0))
+                            k_z030 = _m(metrics.get('know_z_lt_030', 0.0))
+                            k_int_max = _m(metrics.get('know_int_max', 0.0))
+                            k_int_cap = _m(metrics.get('know_int_cap_frac', 0.0))
                             log_message(
-                                f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
-                                f"({k_act*100:.1f}%){k_strong_s}{k_extra}"
-                                f" s_std={k_sstd:.3f}"
-                                f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}{k_phi_s}")
+                                f"      know: act={k_act*100:.1f}% strong={k_strong*100:.1f}%"
+                                f" gate_max={k_raw_gmax:.2f}"
+                                f" int_avg={k_z_act:.2f} int_max={k_int_max:.2f}"
+                                f" cap={k_int_cap*100:.1f}%"
+                                f" s_std={k_sstd:.2f} raw={k_raw_n:.3f} out={k_out_n:.2f}"
+                                f" phi_bin={k_phi*100:.1f}% bnd={k_z075*100:.1f}%"
+                                f" mid={k_z030*100:.1f}%")
 
                         # attn line
                         a_extra = ""
@@ -2811,22 +2887,26 @@ def main():
                                 f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                                 f" out_norm={a_out_n:.3f}")
                         else:
-                            a_strong_s = f" strong={a_strong*100:.1f}%" if a_strong > 0 else ""
-                            a_phi_s = ""
+                            # v4.1 compressed attn line.
                             a_qk_phi = _m(metrics.get('attn_qk_phi_binary', 0.0))
                             a_v_phi = _m(metrics.get('attn_v_phi_binary', 0.0))
                             a_qk_z = _m(metrics.get('attn_qk_z_mean_active', 0.0))
                             a_v_z = _m(metrics.get('attn_v_z_mean_active', 0.0))
-                            if a_qk_phi > 0:
-                                a_phi_s = f" qk_phi={a_qk_phi*100:.1f}% v_phi={a_v_phi*100:.1f}% qk_z={a_qk_z:.2f} v_z={a_v_z:.2f}"
+                            a_z075 = _m(metrics.get('attn_z_lt_075', 0.0))
+                            a_z030 = _m(metrics.get('attn_z_lt_030', 0.0))
+                            a_int_max = _m(metrics.get('attn_int_max', 0.0))
+                            a_int_cap = _m(metrics.get('attn_int_cap_frac', 0.0))
                             log_message(
-                                f"      attn: qk_active={a_qk_act*n_qk_cfg:.0f}/{n_qk_cfg}"
-                                f"({a_qk_act*100:.1f}%)"
-                                f" v_active={a_v_act*n_v_cfg:.0f}/{n_v_cfg}"
-                                f"({a_v_act*100:.1f}%){a_strong_s}{a_extra}"
-                                f" s_std={a_sstd:.3f}"
-                                f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
-                                f" out_norm={a_out_n:.3f}{a_phi_s}")
+                                f"      attn: qk_act={a_qk_act*100:.1f}% v_act={a_v_act*100:.1f}%"
+                                f" strong={a_strong*100:.1f}%"
+                                f" gate_max={a_raw_gmax:.2f}"
+                                f" int_avg[qk={a_qk_z:.2f} v={a_v_z:.2f}]"
+                                f" int_max={a_int_max:.2f} cap={a_int_cap*100:.1f}%"
+                                f" s_std={a_sstd:.2f}"
+                                f" qk_raw={a_qk_raw_n:.3f} v_raw={a_v_raw_n:.3f}"
+                                f" out={a_out_n:.2f}"
+                                f" phi_bin[qk={a_qk_phi*100:.1f}% v={a_v_phi*100:.1f}%]"
+                                f" bnd={a_z075*100:.1f}% mid={a_z030*100:.1f}%")
                         # Strength (v3.9.3)
                         k_str_m = _m(metrics.get('know_strength_mean', 0.0))
                         if k_str_m > 0:
@@ -2850,7 +2930,14 @@ def main():
                                 f"      v_str: mean={a_v_str_m:.2f} std={a_v_str_s:.2f}"
                                 f" min={a_v_str_mn:.2f} max={a_v_str_mx:.2f}"
                                 f" | logit: mean={a_v_lg_m:.3f} std={a_v_lg_s:.3f}")
-                        if _early_debug or debug_mode:
+                        # Full DEBUG (per-layer stacks, attn q/k/v norms,
+                        # residual/emb/o_proj) is verbose — emit every 500
+                        # steps or when explicitly in debug mode / early-debug
+                        # window. Logit_max + out norm are cheap signals that
+                        # fit on the attn line, so skip the one-line summary.
+                        _full_debug = (debug_mode or _early_debug
+                                        or (global_step % 500 == 0))
+                        if _full_debug:
                             d_res = _m(metrics.get('debug_residual_norm', 0.0))
                             d_emb = _m(metrics.get('debug_emb_norm', 0.0))
                             d_oproj = _m(metrics.get('debug_o_proj_norm', 0.0))
