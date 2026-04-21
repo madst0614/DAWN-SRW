@@ -61,6 +61,7 @@ from models.dawn_spatial_v403_exp import DAWN as DAWN_SpatialV403Exp
 from models.dawn_spatial_v404_exp import DAWN as DAWN_SpatialV404Exp
 from models.dawn_spatial_v405_exp import DAWN as DAWN_SpatialV405Exp
 from models.dawn_spatial_v406_exp import DAWN as DAWN_SpatialV406Exp
+from models.dawn_spatial_v41_exp import DAWN as DAWN_SpatialV41Exp
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -152,13 +153,14 @@ def build_model_from_config(cfg):
         )
     elif version in ('spatial-r1-v3.9.9', 'spatial-r1-v4.0.1', 'spatial-r1-v4.0.3',
                       'spatial-r1-v4.0.4', 'spatial-r1-v4.0.5',
-                      'spatial-r1-v4.0.6'):
+                      'spatial-r1-v4.0.6', 'spatial-r1-v4.1'):
         _cls = {
             'spatial-r1-v4.0.1': DAWN_SpatialV401Exp,
             'spatial-r1-v4.0.3': DAWN_SpatialV403Exp,
             'spatial-r1-v4.0.4': DAWN_SpatialV404Exp,
             'spatial-r1-v4.0.5': DAWN_SpatialV405Exp,
             'spatial-r1-v4.0.6': DAWN_SpatialV406Exp,
+            'spatial-r1-v4.1': DAWN_SpatialV41Exp,
         }.get(version, DAWN_SpatialV399Exp)
         _extra = {}
         if version == 'spatial-r1-v4.0.4':
@@ -168,6 +170,9 @@ def build_model_from_config(cfg):
             _extra['gate_boost_rate'] = cfg['training'].get('gate_boost_rate', 0.0)
         elif version == 'spatial-r1-v4.0.6':
             _extra['tau_alpha_init'] = cfg['training'].get('tau_alpha_init', 0.1)
+        elif version == 'spatial-r1-v4.1':
+            _extra['tau_alpha_init'] = cfg['training'].get('tau_alpha_init', 0.1)
+            _extra['max_alpha'] = cfg['training'].get('max_alpha', 1.0)
         model = _cls(
             vocab_size=mcfg.get('vocab_size', 30522),
             d_model=mcfg.get('d_model', 384),
@@ -1739,9 +1744,9 @@ def main():
     # which removed its non-sharded fallback and depends on the sharded path).
     _sharded_fns = None
     _force_sharded = model_version in ('spatial-r1-v4.0.4', 'spatial-r1-v4.0.5',
-                                        'spatial-r1-v4.0.6')
+                                        'spatial-r1-v4.0.6', 'spatial-r1-v4.1')
     if mesh_model > 1 or _force_sharded:
-        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp', 'spatial-r1-v4.1': 'models.dawn_spatial_v41_exp'}.get(model_version, 'models.dawn_spatial_v3')
         _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
@@ -1751,6 +1756,20 @@ def main():
             _srw_kwargs['gate_norm_mode'] = _gnm
         # v4.0.4: reverse_p_max is a runtime scalar passed through shard_map
         # at each call (see _attn_forward / _know_forward); not a builder kwarg.
+        # v4.0.6: dead_threshold is a builder kwarg (closure constant).
+        if model_version in ('spatial-r1-v4.0.6', 'spatial-r1-v4.1'):
+            _srw_kwargs['dead_threshold'] = cfg['training'].get(
+                'dead_penalty_threshold',
+                0.01 if model_version == 'spatial-r1-v4.1' else 1e-4)
+        # v4.1: sharpness / activation_threshold / epsilon / max_intensity
+        # are all closure constants for the new factored gate.
+        if model_version == 'spatial-r1-v4.1':
+            _srw_kwargs['sharpness'] = cfg['training'].get('sharpness', 50.0)
+            _srw_kwargs['activation_threshold'] = cfg['training'].get(
+                'activation_threshold', 0.5)
+            _srw_kwargs['epsilon'] = cfg['training'].get('epsilon', 1e-4)
+            _srw_kwargs['max_intensity'] = cfg['training'].get(
+                'max_intensity', 10.0)
         _sharded_single = make_sharded_srw(**_srw_kwargs)
         if hasattr(_v3, 'make_sharded_srw_paired'):
             _sharded_paired = _v3.make_sharded_srw_paired(**_srw_kwargs)
@@ -1829,7 +1848,7 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp', 'spatial-r1-v4.1': 'models.dawn_spatial_v41_exp'}.get(model_version, 'models.dawn_spatial_v3')
             _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
