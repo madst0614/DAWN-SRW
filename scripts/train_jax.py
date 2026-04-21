@@ -1663,7 +1663,7 @@ def main():
 
     if is_host0:
         print(f"\n{'='*60}")
-        print(f"DAWN Training (Multi-Host Multi-Device) — {cfg['model'].get('model_version', 'unknown')}")
+        print(f"DAWN Training (Multi-Host Multi-Device) -- {cfg['model'].get('model_version', 'unknown')}")
         print(f"{'='*60}")
         print(f"JAX version: {jax.__version__}")
         print(f"Hosts: {n_hosts}, Host ID: {host_id}")
@@ -2313,7 +2313,7 @@ def main():
                 print(f"\n  === Op breakdown (1 layer fwd, {total_ms:.0f} ms, "
                       f"peak={max_peak:.2f}G) ===", flush=True)
                 print(f"    {'Op':22s} {'Time':>8s} {'%':>5s}  "
-                      f"{'HBM Δ':>7s}  {'Peak':>7s}  {''}",
+                      f"{'HBM d':>7s}  {'Peak':>7s}  {''}",
                       flush=True)
                 print(f"    {'-'*22} {'-'*8} {'-'*5}  {'-'*7}  {'-'*7}  {'-'*20}",
                       flush=True)
@@ -2431,7 +2431,7 @@ def main():
         if preemption_requested[0]:
             return  # avoid double-save
         preemption_requested[0] = True
-        print(f"\n!!! SIGTERM received (host {host_id}) — saving emergency checkpoint (step={global_step}) !!!", flush=True)
+        print(f"\n!!! SIGTERM received (host {host_id}) -- saving emergency checkpoint (step={global_step}) !!!", flush=True)
         try:
             params_single = _gather_for_save(params)
             opt_state_single = _gather_for_save(opt_state)
@@ -2499,7 +2499,7 @@ def main():
 
             if preemption_requested[0]:
                 if is_host0:
-                    print("Preemption requested — exiting training loop.", flush=True)
+                    print("Preemption requested -- exiting training loop.", flush=True)
                 break
 
             # Shard data and run train step
@@ -2783,9 +2783,9 @@ def main():
                         v_emb_nmin = _m(metrics.get('v_emb_norm_min', 0.0))
                         v_emb_nstd = _m(metrics.get('v_emb_norm_std', 0.0))
                         log_message(
-                            f"      emb_n: k[{k_emb_n:.3f}±{k_emb_nstd:.3f} min={k_emb_nmin:.3f}]"
-                            f" qk[{qk_emb_nmean:.3f}±{qk_emb_nstd:.3f} min={qk_emb_nmin:.3f}]"
-                            f" v[{v_emb_nmean:.3f}±{v_emb_nstd:.3f} min={v_emb_nmin:.3f}]")
+                            f"      emb_n: k[{k_emb_n:.3f}/{k_emb_nstd:.3f} min={k_emb_nmin:.3f}]"
+                            f" qk[{qk_emb_nmean:.3f}/{qk_emb_nstd:.3f} min={qk_emb_nmin:.3f}]"
+                            f" v[{v_emb_nmean:.3f}/{v_emb_nstd:.3f} min={v_emb_nmin:.3f}]")
 
                         # Emb drift (relative L2 change since last LOG_INTERVAL snapshot).
                         drift_qk = drift_v = drift_know = 0.0
