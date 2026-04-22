@@ -294,8 +294,12 @@ def safe_dropout(x, rate, deterministic, rng):
         return x
     keep_rate = 1.0 - rate
     mask = jax.random.bernoulli(rng, keep_rate, x.shape)
-    mask = jnp.where(deterministic, jnp.ones_like(mask), mask)
-    return jnp.where(mask, x / keep_rate, 0.0)
+    dropped = jnp.where(mask, x / keep_rate, 0.0)
+    # Eval path: return x unscaled. Previous version returned x/keep_rate
+    # here (mask forced to ones but the where-branch still divided), which
+    # inflated all eval activations by 1/keep_rate and put a structural
+    # offset into val_loss.
+    return jnp.where(deterministic, x, dropped)
 
 
 def _layer_norm(x, scale, bias, eps=1e-6):
@@ -1068,7 +1072,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     # Load balance loss from gate distributions + tau regularization
     tau_reg = jnp.maximum(tau_all, 0.0).mean() * 0.01
+    # TODO(v4.2?): /3 근거 불분명 (v3.9.1 흔적). 현재 pool 2개(qk, v) 합을 3으로 나눔.
+    # 의도가 Q/K/V 3-route 평균이면 paired 내부에서 Q/K lb 분리 필요.
+    # 의도가 평균이면 /2가 맞음. lb_weight 튠 전에 결정 필요.
     aux = (qk_lb + v_lb) / 3.0 + tau_reg
+    # TODO: QK pool과 V pool을 산술평균으로 섞음. pool 크기/역할이 달라 해석 불가.
+    # 로깅용이면 분리해서 노출하는 게 맞음. aux 계산엔 영향 없음(로깅만).
     attn_raw_gmax = jnp.maximum(qk_raw_gmax.mean(), v_raw_gmax.mean())
     attn_score_std = (qk_sstd + v_sstd) / 2
     attn_gate_sum = (qk_es + v_es) / 2
@@ -1504,6 +1513,8 @@ class DAWN(nn.Module):
                 attn_int_max_all, know_int_max_all,
                 attn_int_cap_frac_all, know_int_cap_frac_all) = jax.lax.scan(
                 scan_body, x, xs)
+            # TODO(v4.2?): attn_aux는 내부 /3, know_aux는 생짜 — layer 평균 시 load balance 가중치가
+            # pool별 비대칭(QK/V는 /3L, Know는 /L, know가 3배 강함). 의도 확인 필요.
             total_aux = (attn_auxes + know_auxes).mean()
 
         # Debug norms
