@@ -1129,9 +1129,14 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
 # Checkpoint save / load (with GCS support)
 # ============================================================
 
-def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config,
-                    step_in_epoch=0, steps_per_epoch=0, training_config=None):
-    """Save checkpoint using flax serialization. Supports local and GCS paths."""
+def _serialize_checkpoint(params, opt_state, epoch, step, best_val_loss, model_config,
+                          step_in_epoch=0, steps_per_epoch=0, training_config=None):
+    """Serialize a checkpoint dict to bytes (no write).
+
+    Split out so callers that write the same bytes to multiple paths
+    (e.g. checkpoint_epochN.flax + best_model.flax in the same event)
+    can reuse a single serialization pass.
+    """
     import flax.serialization as serialization
     ckpt = {
         'params': params,
@@ -1144,11 +1149,23 @@ def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_c
         'config': model_config,
         'training_config': training_config or {},
     }
-    bytes_data = serialization.to_bytes(ckpt)
+    return serialization.to_bytes(ckpt)
 
+
+def _write_checkpoint_bytes(path, bytes_data):
+    """Write pre-serialized checkpoint bytes to path."""
     with _open_file(path, 'wb') as f:
         f.write(bytes_data)
     print(f"  Checkpoint saved: {path} ({len(bytes_data) / 1e6:.1f} MB)")
+
+
+def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config,
+                    step_in_epoch=0, steps_per_epoch=0, training_config=None):
+    """Save checkpoint using flax serialization. Supports local and GCS paths."""
+    bytes_data = _serialize_checkpoint(
+        params, opt_state, epoch, step, best_val_loss, model_config,
+        step_in_epoch, steps_per_epoch, training_config)
+    _write_checkpoint_bytes(path, bytes_data)
 
 
 def load_checkpoint(path, target_params, target_opt_state):
@@ -3090,7 +3107,11 @@ def main():
                 win_start_time = time.time()
 
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
-            if global_step % val_interval == 0 and global_step > 0:
+            _do_val = (global_step % val_interval == 0 and global_step > 0)
+            _do_ckpt = (global_step % ckpt_interval == 0 and global_step > 0)
+            _new_best = False
+
+            if _do_val:
                 if is_host0:
                     log_message(f"\n  Mid-epoch validation at step {global_step}...")
                 val_loader.reset()
@@ -3107,24 +3128,9 @@ def main():
                         'val_acc': val_acc,
                         'timestamp': datetime.now().isoformat(),
                     })
-
-                # Best model save (device_get on ALL hosts)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    params_single = _gather_for_save(params)
-                    opt_state_single = _gather_for_save(opt_state)
-                    if is_host0:
-                        save_checkpoint(
-                            _ckpt_path("best_model.flax"),
-                            params_single, opt_state_single,
-                            epoch, global_step, best_val_loss,
-                            cfg['model'],
-                            step_in_epoch=epoch_step_counter,
-                            steps_per_epoch=steps_per_epoch,
-                            training_config=training_config,
-                        )
-                        log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
-                    del params_single, opt_state_single
+                    _new_best = True
 
                 # Dead-neuron diagnosis removed during the registry refactor
                 # (was rw-v4.0.2-specific: separate Q/K pools, GELU-z gate).
@@ -3132,24 +3138,33 @@ def main():
                 # gate — see models/legacy/dawn_spatial_v402_exp.py for
                 # reference.
 
-            # ---- Mid-epoch checkpoint ----
-            if global_step % ckpt_interval == 0 and global_step > 0:
-                # device_get on ALL hosts (may be collective for sharded params)
+            # ---- Unified save path ----
+            # best_model + mid-epoch checkpoint share a single gather +
+            # serialize when both fire on the same step (val_interval ==
+            # ckpt_interval is the common case). Previously that meant two
+            # independent _gather_for_save collectives and two full
+            # re-serializations of the same params — expensive at 1B.
+            if _new_best or _do_ckpt:
                 params_single = _gather_for_save(params)
                 opt_state_single = _gather_for_save(opt_state)
                 if is_host0:
-                    save_checkpoint(
-                        _ckpt_path(f"checkpoint_step{global_step}.flax"),
+                    bytes_data = _serialize_checkpoint(
                         params_single, opt_state_single,
                         epoch, global_step, best_val_loss,
                         cfg['model'],
                         step_in_epoch=epoch_step_counter,
                         steps_per_epoch=steps_per_epoch,
-                        training_config=training_config,
-                    )
-                    # GCS list+delete only from host 0 — racing cleanups across
-                    # hosts can drop the checkpoint that was just written.
-                    cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
+                        training_config=training_config)
+                    if _new_best:
+                        _write_checkpoint_bytes(
+                            _ckpt_path("best_model.flax"), bytes_data)
+                        log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
+                    if _do_ckpt:
+                        _write_checkpoint_bytes(
+                            _ckpt_path(f"checkpoint_step{global_step}.flax"), bytes_data)
+                        # GCS list+delete only from host 0 — racing cleanups across
+                        # hosts can drop the checkpoint that was just written.
+                        cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
                 del params_single, opt_state_single
 
         if preemption_requested[0]:
@@ -3225,30 +3240,24 @@ def main():
                 'timestamp': datetime.now().isoformat(),
             })
 
-        # Save epoch checkpoint (device_get on ALL hosts)
+        # Save epoch checkpoint (device_get on ALL hosts). best_model reuses
+        # the same serialized bytes — no double serialize at 1B scale.
         params_single = _gather_for_save(params)
         opt_state_single = _gather_for_save(opt_state)
 
         if is_host0:
-            save_checkpoint(
-                _ckpt_path(f"checkpoint_epoch{epoch}.flax"),
+            bytes_data = _serialize_checkpoint(
                 params_single, opt_state_single,
                 epoch + 1, global_step, best_val_loss,
                 cfg['model'],
-                step_in_epoch=0,  # start of next epoch
+                step_in_epoch=0,
                 steps_per_epoch=steps_per_epoch,
-                training_config=training_config,
-            )
+                training_config=training_config)
+            _write_checkpoint_bytes(
+                _ckpt_path(f"checkpoint_epoch{epoch}.flax"), bytes_data)
             if is_best:
-                save_checkpoint(
-                    _ckpt_path("best_model.flax"),
-                    params_single, opt_state_single,
-                    epoch + 1, global_step, best_val_loss,
-                    cfg['model'],
-                    step_in_epoch=0,
-                    steps_per_epoch=steps_per_epoch,
-                    training_config=training_config,
-                )
+                _write_checkpoint_bytes(
+                    _ckpt_path("best_model.flax"), bytes_data)
                 log_message(f"  New best model! val_loss={best_val_loss:.4f}")
 
             log_message(f"  Best val loss so far: {best_val_loss:.4f}")
