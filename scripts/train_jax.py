@@ -467,6 +467,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
+                      exploration_warmup_steps=5000,
+                      exploration_lower_bound=-0.5,
+                      exploration_upper_bound=2.0,
+                      exploration_bound_eps=1.0e-3,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
@@ -505,10 +509,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _global_mean_reducer = _mean_reducer_fn
 
     _asym = jnp.float32(exploration_asymmetry)
+    _explore_lower = jnp.float32(exploration_lower_bound)
+    _explore_upper = jnp.float32(exploration_upper_bound)
+    _explore_eps = jnp.float32(exploration_bound_eps)
+    _warmup_steps = jnp.int32(exploration_warmup_steps)
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
-                   prev_emb_snap):
+                   prev_emb_snap, step):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
 
         def loss_fn(params):
@@ -548,13 +556,29 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     per_token_ce - global_mean_ce)                   # [B, S-1]
                 # Asymmetric: full push on hard tokens, `asym`·push on easy ones.
                 signal = jnp.where(deviation > 0, deviation, _asym * deviation)
-                # Sum / mean over layers and route dim to match [B, S-1].
-                a_sum = attn_tau_off[:, :, :-1, :].sum(axis=(0, -1))
-                k_sum = know_tau_off[:, :, :-1, :].sum(axis=(0, -1))
-                a_tau_mean = attn_tau_off[:, :, :-1, :].mean(axis=(0, -1))
-                k_tau_mean = know_tau_off[:, :, :-1, :].mean(axis=(0, -1))
-                # v4.1 tau_offset distribution diagnostics (sg to keep them
-                # out of the backward pass — they're purely observational).
+
+                # v4.1+ per-token/layer/route bounded explore. tau_offset is
+                # NOT clipped (CE keeps full gradient); only the explore-loss
+                # contribution is turned off per-element when further push in
+                # that direction would breach [lower, upper].
+                # attn_tau_off shape [L, B, S, 3]; know_tau_off [L, B, S, 1].
+                a_tau_t = attn_tau_off[:, :, :-1, :]     # [L, B, S-1, 3]
+                k_tau_t = know_tau_off[:, :, :-1, :]     # [L, B, S-1, 1]
+                sig_b = signal[None, :, :, None]          # [1, B, S-1, 1]
+                vmask_b = vmask_f[None, :, :, None]       # [1, B, S-1, 1]
+
+                # Per-element bound-hit masks. Hard off, not soft decay.
+                a_down_off = (sig_b > 0) & (a_tau_t <= _explore_lower + _explore_eps)
+                a_up_off   = (sig_b < 0) & (a_tau_t >= _explore_upper - _explore_eps)
+                a_off_mask = a_down_off | a_up_off
+                k_down_off = (sig_b > 0) & (k_tau_t <= _explore_lower + _explore_eps)
+                k_up_off   = (sig_b < 0) & (k_tau_t >= _explore_upper - _explore_eps)
+                k_off_mask = k_down_off | k_up_off
+
+                a_active = jnp.where(a_off_mask, 0.0, 1.0)
+                k_active = jnp.where(k_off_mask, 0.0, 1.0)
+
+                # tau_offset distribution diagnostics (stop_gradient, obs-only).
                 _a_tau_flat = jax.lax.stop_gradient(attn_tau_off)
                 _k_tau_flat = jax.lax.stop_gradient(know_tau_off)
                 attn_tau_off_min = _a_tau_flat.min()
@@ -567,22 +591,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 know_tau_off_p99 = jnp.quantile(_k_tau_flat, 0.99)
                 know_tau_off_p01 = jnp.quantile(_k_tau_flat, 0.01)
                 know_tau_off_neg_frac = (_k_tau_flat < 0).astype(jnp.float32).mean()
-                # Downward cap: when signal > 0 (about to push tau DOWN) and
-                # the per-pool mean tau_offset is already ≤ 0, zero the
-                # contribution for that token. Up-push (signal < 0) always
-                # allowed — CE self-correction can still recover pools that
-                # over-pruned. Comparison op is non-differentiable so no
-                # gradient flows through the mask itself.
-                pos_signal = (signal > 0)
-                a_block = pos_signal & (a_tau_mean <= 0.0)
-                k_block = pos_signal & (k_tau_mean <= 0.0)
-                a_mask = jnp.where(a_block, 0.0, 1.0)
-                k_mask = jnp.where(k_block, 0.0, 1.0)
+
+                # Per-element contribution → reduce. Gradient flows through
+                # the tau_offset tensor only (signal is stop_gradient'd).
                 vsum_eps = vmask_f.sum() + 1e-8
-                explore_attn_raw = (signal * a_mask * a_sum * vmask_f).sum() / vsum_eps
-                explore_know_raw = (signal * k_mask * k_sum * vmask_f).sum() / vsum_eps
+                a_contrib = sig_b * a_tau_t * a_active * vmask_b
+                k_contrib = sig_b * k_tau_t * k_active * vmask_b
+                explore_attn_raw = a_contrib.sum() / vsum_eps
+                explore_know_raw = k_contrib.sum() / vsum_eps
                 explore_loss_raw = explore_attn_raw + explore_know_raw
-                # Log-only stats (all stop_gradient via pure reductions).
+
+                # Observational stats (same interface as before).
                 pos_mask = (deviation > 0).astype(jnp.float32) * vmask_f
                 neg_mask = (deviation < 0).astype(jnp.float32) * vmask_f
                 pos_frac = pos_mask.sum() / vsum_eps
@@ -590,12 +609,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     pos_mask.sum() + 1e-8)
                 neg_mean = (jnp.maximum(-deviation, 0.0) * vmask_f).sum() / (
                     neg_mask.sum() + 1e-8)
-                # Down-push block fractions (of valid tokens).
+
+                # Off fractions replace pool-mean block fractions. Denominator
+                # is total (layer × batch × valid-time × route) slots.
+                _a_tot = vmask_b.sum() * a_tau_t.shape[0] * a_tau_t.shape[-1]
+                _k_tot = vmask_b.sum() * k_tau_t.shape[0] * k_tau_t.shape[-1]
                 block_frac_a = jax.lax.stop_gradient(
-                    (a_block.astype(jnp.float32) * vmask_f).sum() / vsum_eps)
+                    (a_off_mask.astype(jnp.float32) * vmask_b).sum() / (_a_tot + 1e-8))
                 block_frac_k = jax.lax.stop_gradient(
-                    (k_block.astype(jnp.float32) * vmask_f).sum() / vsum_eps)
-                # Signal magnitude extremes (diag).
+                    (k_off_mask.astype(jnp.float32) * vmask_b).sum() / (_k_tot + 1e-8))
+
                 _sig_sg = jax.lax.stop_gradient(signal * vmask_f)
                 sig_pos_max = _sig_sg.max()
                 sig_neg_max = (-_sig_sg).max()
@@ -621,7 +644,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 know_tau_off_p99 = jnp.float32(0.0)
                 know_tau_off_p01 = jnp.float32(0.0)
                 know_tau_off_neg_frac = jnp.float32(0.0)
-            explore_loss_weighted = exploration_weight * explore_loss_raw
+            # Warmup gate: zero out explore loss until warmup_steps has passed.
+            # W_sense needs time to settle before exploration signals become
+            # meaningful; early CE-dominated learning keeps tau gradient clean.
+            explore_active = (step >= _warmup_steps).astype(jnp.float32)
+            explore_loss_weighted = exploration_weight * explore_loss_raw * explore_active
 
             if is_baseline:
                 orth_loss = jnp.float32(0.0)
@@ -662,6 +689,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 know_tau_off_min=know_tau_off_min, know_tau_off_max=know_tau_off_max,
                 know_tau_off_p99=know_tau_off_p99, know_tau_off_p01=know_tau_off_p01,
                 know_tau_off_neg_frac=know_tau_off_neg_frac,
+                explore_active=explore_active,
+                step_in_train=step,
             )
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
                                 dead_penalty, explore_stats, result)
@@ -849,7 +878,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'explore_loss_raw': explore_stats['explore_loss_raw'],
             'explore_attn_raw': explore_stats['explore_attn_raw'],
             'explore_know_raw': explore_stats['explore_know_raw'],
-            'explore_loss_weighted': exploration_weight * explore_stats['explore_loss_raw'],
+            'explore_loss_weighted': exploration_weight * explore_stats['explore_loss_raw'] * explore_stats['explore_active'],
+            'explore_active': explore_stats['explore_active'],
             'explore_block_frac_a': explore_stats['block_frac_a'],
             'explore_block_frac_k': explore_stats['block_frac_k'],
             'sig_pos_max': explore_stats['sig_pos_max'],
@@ -1272,6 +1302,11 @@ def main():
     # v4.1 RPE exploration loss (0 weight => off; no-op for earlier versions).
     exploration_weight = tcfg.get('exploration_weight', 0.0)
     exploration_asymmetry = tcfg.get('exploration_asymmetry', 0.15)
+    # v4.1+ bounded-explore: warmup + per-element bound-off cap.
+    exploration_warmup_steps = tcfg.get('exploration_warmup_steps', 5000)
+    exploration_lower_bound = tcfg.get('exploration_lower_bound', -0.5)
+    exploration_upper_bound = tcfg.get('exploration_upper_bound', 2.0)
+    exploration_bound_eps = tcfg.get('exploration_bound_eps', 1.0e-3)
 
     max_seq_len = cfg['model'].get('max_seq_len', 512)
 
@@ -1400,6 +1435,14 @@ def main():
                 'exploration_weight', exploration_weight)
             exploration_asymmetry = saved_training_config.get(
                 'exploration_asymmetry', exploration_asymmetry)
+            exploration_warmup_steps = saved_training_config.get(
+                'exploration_warmup_steps', exploration_warmup_steps)
+            exploration_lower_bound = saved_training_config.get(
+                'exploration_lower_bound', exploration_lower_bound)
+            exploration_upper_bound = saved_training_config.get(
+                'exploration_upper_bound', exploration_upper_bound)
+            exploration_bound_eps = saved_training_config.get(
+                'exploration_bound_eps', exploration_bound_eps)
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
@@ -1417,6 +1460,10 @@ def main():
         'dead_penalty_weight': dead_penalty_weight,
         'exploration_weight': exploration_weight,
         'exploration_asymmetry': exploration_asymmetry,
+        'exploration_warmup_steps': exploration_warmup_steps,
+        'exploration_lower_bound': exploration_lower_bound,
+        'exploration_upper_bound': exploration_upper_bound,
+        'exploration_bound_eps': exploration_bound_eps,
     }
 
     # ----------------------------------------------------------
@@ -1744,6 +1791,10 @@ def main():
         tau_reg_weight, dead_penalty_weight,
         exploration_weight, exploration_asymmetry,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
+        exploration_warmup_steps=exploration_warmup_steps,
+        exploration_lower_bound=exploration_lower_bound,
+        exploration_upper_bound=exploration_upper_bound,
+        exploration_bound_eps=exploration_bound_eps,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
@@ -1776,7 +1827,7 @@ def main():
         jit_start = time.time()
         _dp, _do, dummy_metrics = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_step_rng,
-            _dummy_emb_snap)
+            _dummy_emb_snap, jnp.asarray(0, jnp.int32))
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         jit_loss = float(dummy_metrics['total_loss'])
@@ -1791,7 +1842,7 @@ def main():
         step_start = time.time()
         _dp2, _do2, dummy_metrics2 = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
-            _dummy_emb_snap)
+            _dummy_emb_snap, jnp.asarray(0, jnp.int32))
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
@@ -2314,7 +2365,8 @@ def main():
 
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
-                input_ids, attention_mask, step_rng, _prev_emb_snap)
+                input_ids, attention_mask, step_rng, _prev_emb_snap,
+                jnp.asarray(global_step, jnp.int32))
 
             # Extract metrics (scalars from jit, no [0] indexing)
             def _m(v):
