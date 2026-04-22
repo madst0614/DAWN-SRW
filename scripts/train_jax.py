@@ -2387,20 +2387,22 @@ def main():
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
-        epoch_loss = 0.0
-        epoch_correct = 0
-        epoch_valid = 0
+        # Epoch accumulators on device — one device_get per epoch at the
+        # end, rather than per-step float()/int() sync.
+        _epoch_loss_jax = jnp.float32(0.0)
+        _epoch_correct_jax = jnp.int32(0)
+        _epoch_valid_jax = jnp.int32(0)
         epoch_steps = 0
 
-        # Window accumulators for periodic logging
-        win_loss = 0.0
-        win_ce = 0.0
-        win_aux = 0.0
-        win_tau_reg = 0.0
-        win_orth = 0.0
-        win_div = 0.0
-        win_correct = 0
-        win_valid = 0
+        # Window accumulators on device — one device_get per log boundary.
+        _win_loss_jax = jnp.float32(0.0)
+        _win_ce_jax = jnp.float32(0.0)
+        _win_aux_jax = jnp.float32(0.0)
+        _win_tau_reg_jax = jnp.float32(0.0)
+        _win_orth_jax = jnp.float32(0.0)
+        _win_div_jax = jnp.float32(0.0)
+        _win_correct_jax = jnp.int32(0)
+        _win_valid_jax = jnp.int32(0)
         win_count = 0
         win_start_time = time.time()
 
@@ -2441,40 +2443,37 @@ def main():
                 input_ids, attention_mask, step_rng, _prev_emb_snap,
                 jnp.asarray(global_step, jnp.int32))
 
-            # Extract metrics (scalars from jit, no [0] indexing)
+            # Scalar helper kept for log-block use (m_grad etc.).
             def _m(v):
                 return float(v)
-            m_total = _m(metrics['total_loss'])
-            m_ce = _m(metrics['ce_loss'])
-            m_aux = _m(metrics['aux_loss'])
-            m_tau_reg = _m(metrics.get('tau_reg', 0.0))
-            m_orth = _m(metrics['orth_loss'])
-            m_div = _m(metrics['div_loss'])
-            m_correct = int(_m(metrics['correct']))
-            m_valid = int(_m(metrics['valid_count']))
 
-            # NaN/INF detection
-            if check_nan_inf({
-                'total_loss': m_total, 'ce_loss': m_ce, 'aux_loss': m_aux,
-                'tau_reg': m_tau_reg,
-                'orth_loss': m_orth, 'div_loss': m_div,
-            }, global_step + 1, epoch):
-                raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {global_step + 1}")
+            # Device-side accumulation — no per-step TPU→CPU sync on the
+            # regression/metric scalars. Window + epoch values are
+            # materialized only at log boundary and end of epoch.
+            _win_loss_jax = _win_loss_jax + metrics['total_loss']
+            _win_ce_jax = _win_ce_jax + metrics['ce_loss']
+            _win_aux_jax = _win_aux_jax + metrics['aux_loss']
+            _win_tau_reg_jax = _win_tau_reg_jax + metrics.get('tau_reg', jnp.float32(0.0))
+            _win_orth_jax = _win_orth_jax + metrics['orth_loss']
+            _win_div_jax = _win_div_jax + metrics['div_loss']
+            _win_correct_jax = _win_correct_jax + metrics['correct']
+            _win_valid_jax = _win_valid_jax + metrics['valid_count']
 
-            epoch_loss += m_ce * m_valid
-            epoch_correct += m_correct
-            epoch_valid += m_valid
+            _valid_f = metrics['valid_count'].astype(jnp.float32)
+            _epoch_loss_jax = _epoch_loss_jax + metrics['ce_loss'] * _valid_f
+            _epoch_correct_jax = _epoch_correct_jax + metrics['correct']
+            _epoch_valid_jax = _epoch_valid_jax + metrics['valid_count']
+
+            win_count += 1
             epoch_steps += 1
 
-            win_loss += m_total
-            win_ce += m_ce
-            win_aux += m_aux
-            win_tau_reg += m_tau_reg
-            win_orth += m_orth
-            win_div += m_div
-            win_correct += m_correct
-            win_valid += m_valid
-            win_count += 1
+            # Per-step NaN check on total_loss only. A single scalar sync
+            # catches loss explosions immediately; the full 6-key check runs
+            # at log boundary on already-materialized window averages.
+            _m_total_for_nan = float(metrics['total_loss'])
+            if not np.isfinite(_m_total_for_nan):
+                raise ValueError(
+                    f"NaN/INF total_loss at epoch {epoch}, step {global_step + 1}")
 
             global_step += 1
             epoch_step_counter += 1
@@ -2491,16 +2490,36 @@ def main():
                     'v_emb': params['neuron_pool']['v_emb'],
                     'know_emb': params['neuron_pool']['know_emb'],
                 }
+                # One TPU→CPU sync for the whole window.
+                _win_vals = jax.device_get({
+                    'loss': _win_loss_jax, 'ce': _win_ce_jax,
+                    'aux': _win_aux_jax, 'tau_reg': _win_tau_reg_jax,
+                    'orth': _win_orth_jax, 'div': _win_div_jax,
+                    'correct': _win_correct_jax, 'valid': _win_valid_jax,
+                })
+                _win_count_safe = max(win_count, 1)
+                avg_loss = float(_win_vals['loss']) / _win_count_safe
+                avg_ce = float(_win_vals['ce']) / _win_count_safe
+                avg_aux = float(_win_vals['aux']) / _win_count_safe
+                avg_tau_reg = float(_win_vals['tau_reg']) / _win_count_safe
+                avg_orth = float(_win_vals['orth']) / _win_count_safe
+                avg_div = float(_win_vals['div']) / _win_count_safe
+                _win_correct_py = int(_win_vals['correct'])
+                _win_valid_py = int(_win_vals['valid'])
+                avg_acc = _win_correct_py / _win_valid_py if _win_valid_py > 0 else 0.0
+
+                # Full NaN/INF check on the materialized window averages.
+                if check_nan_inf({
+                    'total_loss': avg_loss, 'ce_loss': avg_ce,
+                    'aux_loss': avg_aux, 'tau_reg': avg_tau_reg,
+                    'orth_loss': avg_orth, 'div_loss': avg_div,
+                }, global_step, epoch):
+                    raise ValueError(
+                        f"NaN/INF window averages at epoch {epoch}, step {global_step}")
+
                 if is_host0:
                     elapsed = time.time() - win_start_time
                     steps_per_sec = win_count / elapsed if elapsed > 0 else 0
-                    avg_loss = win_loss / win_count
-                    avg_ce = win_ce / win_count
-                    avg_aux = win_aux / win_count
-                    avg_tau_reg = win_tau_reg / win_count
-                    avg_orth = win_orth / win_count
-                    avg_div = win_div / win_count
-                    avg_acc = win_correct / win_valid if win_valid > 0 else 0.0
 
                     # Current LR from schedule (indexed by optimizer step, not micro-step)
                     opt_step = global_step // grad_accum_steps
@@ -3000,15 +3019,15 @@ def main():
                     # Sync logs to GCS
                     sync_logs()
 
-                # Reset window (all hosts)
-                win_loss = 0.0
-                win_ce = 0.0
-                win_aux = 0.0
-                win_tau_reg = 0.0
-                win_orth = 0.0
-                win_div = 0.0
-                win_correct = 0
-                win_valid = 0
+                # Reset window accumulators (all hosts)
+                _win_loss_jax = jnp.float32(0.0)
+                _win_ce_jax = jnp.float32(0.0)
+                _win_aux_jax = jnp.float32(0.0)
+                _win_tau_reg_jax = jnp.float32(0.0)
+                _win_orth_jax = jnp.float32(0.0)
+                _win_div_jax = jnp.float32(0.0)
+                _win_correct_jax = jnp.int32(0)
+                _win_valid_jax = jnp.int32(0)
                 win_count = 0
                 win_start_time = time.time()
 
@@ -3100,6 +3119,15 @@ def main():
 
         # ---- End of epoch ----
         epoch_elapsed = time.time() - epoch_start
+        # Single TPU→CPU sync for the whole epoch totals.
+        _ep = jax.device_get({
+            'loss': _epoch_loss_jax,
+            'correct': _epoch_correct_jax,
+            'valid': _epoch_valid_jax,
+        })
+        epoch_loss = float(_ep['loss'])
+        epoch_correct = int(_ep['correct'])
+        epoch_valid = int(_ep['valid'])
         epoch_avg_loss = epoch_loss / epoch_valid if epoch_valid > 0 else 0.0
         epoch_avg_acc = epoch_correct / epoch_valid if epoch_valid > 0 else 0.0
 
