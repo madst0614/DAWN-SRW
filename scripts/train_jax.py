@@ -2458,27 +2458,18 @@ def main():
         return _join(checkpoint_dir, name)
 
     def handle_preemption(signum, frame):
-        """Emergency checkpoint on SIGTERM (spot preemption). Host 0 only saves."""
+        """Flag-only SIGTERM handler (spot preemption).
+
+        Saving from a signal handler is unsafe on multi-host: calling a
+        collective here (_gather_for_save / process_allgather) requires
+        every host to enter at the same point, but SIGTERM fires
+        asynchronously per host. We just flag here; the main loop
+        cooperatively saves after the inner-loop break.
+        """
         if preemption_requested[0]:
-            return  # avoid double-save
+            return
         preemption_requested[0] = True
-        print(f"\n!!! SIGTERM received (host {host_id}) -- saving emergency checkpoint (step={global_step}) !!!", flush=True)
-        try:
-            params_single = _gather_for_save(params)
-            opt_state_single = _gather_for_save(opt_state)
-            if is_host0:
-                epath = _ckpt_path(f"emergency_step{global_step}.flax")
-                save_checkpoint(
-                    epath, params_single, opt_state_single,
-                    start_epoch, global_step, best_val_loss,
-                    cfg['model'],
-                    step_in_epoch=epoch_step_counter,
-                    steps_per_epoch=steps_per_epoch,
-                    training_config=training_config,
-                )
-                print(f"!!! Emergency checkpoint saved: {epath} !!!", flush=True)
-        except Exception as e:
-            print(f"!!! Emergency save FAILED: {e} !!!", flush=True)
+        print(f"\n!!! SIGTERM received (host {host_id}) at step={global_step} -- flagging preemption !!!", flush=True)
 
     def _gather_for_save(x):
         """Gather sharded params for checkpoint save. Only needed for baseline FSDP."""
@@ -2533,6 +2524,23 @@ def main():
         win_start_time = time.time()
 
         for local_step, (input_ids, attention_mask) in enumerate(train_loader):
+
+            # Cross-host SIGTERM sync every 10 steps. Handles the case where
+            # spot preemption fires on only some hosts first — without this,
+            # a flagged host would break while unflagged hosts continue into
+            # the next train_step collective and hang. Cost: one bool
+            # all-gather per 10 steps (bytes).
+            if local_step % 10 == 0:
+                _preempt_any = bool(np.any(process_allgather(
+                    np.array([preemption_requested[0]], dtype=np.bool_))))
+                if _preempt_any and not preemption_requested[0]:
+                    preemption_requested[0] = True
+                    if is_host0:
+                        print(
+                            f"Preemption detected on another host"
+                            f" (step={global_step}) -- cooperative break.",
+                            flush=True,
+                        )
 
             if preemption_requested[0]:
                 if is_host0:
@@ -3159,41 +3167,46 @@ def main():
                         log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
                     del params_single, opt_state_single
 
-                # Dead neuron diagnosis (rw-v4.0.2)
-                if model_version.startswith('rw-v') and is_host0:
-                    try:
-                        from models.dawn_spatial_v402_exp import diagnose_dead_neurons as _diag_dead
-                        _diag_cfg = {
-                            'd_model': cfg['model']['d_model'],
-                            'n_layers': cfg['model']['n_layers'],
-                            'n_heads': cfg['model']['n_heads'],
-                            'max_seq_len': cfg['model']['max_seq_len'],
-                            'n_q': cfg['model'].get('n_q', 790),
-                            'n_k': cfg['model'].get('n_k', 790),
-                            'n_v': cfg['model'].get('n_v', 2600),
-                            'n_know': cfg['model'].get('n_know', 25200),
-                        }
-                        _params_cpu = _gather_for_save(params)
-                        # Collect real val data for dead neuron diagnosis
-                        val_loader.reset()
-                        _diag_batches = []
-                        for _di, (_dids, _dmask) in enumerate(val_loader):
-                            _diag_batches.append(np.array(_dids))
-                            if len(_diag_batches) * _dids.shape[0] >= 128:
-                                break
-                        _diag_tokens = jnp.array(np.concatenate(_diag_batches, axis=0)[:128])
-                        _dead = jax.device_get(_diag_dead(
-                            _params_cpu, _diag_cfg, _diag_tokens,
-                            n_batches=4, batch_size=32))
-                        del _diag_tokens
-                        for _pn in ('Q', 'K', 'V', 'Know'):
-                            _ps = _dead[_pn]
-                            log_message(
-                                f"      [DEAD] {_pn}: dead={int(_ps['n_dead'])}({float(_ps['dead_frac'])*100:.1f}%)"
-                                f" rare(<1%)={int(_ps['n_rare'])}({float(_ps['rare_frac'])*100:.1f}%)")
-                        del _params_cpu, _dead
-                    except Exception as e:
-                        log_message(f"      [DEAD] diagnosis failed: {e}")
+                # Dead neuron diagnosis (rw-v4.0.2). _gather_for_save is a
+                # collective — must run on ALL hosts outside the is_host0
+                # guard, same fix class as the drift move. Only the actual
+                # diagnosis / logging stays host-0.
+                if model_version.startswith('rw-v'):
+                    _params_cpu = _gather_for_save(params)
+                    if is_host0:
+                        try:
+                            from models.dawn_spatial_v402_exp import diagnose_dead_neurons as _diag_dead
+                            _diag_cfg = {
+                                'd_model': cfg['model']['d_model'],
+                                'n_layers': cfg['model']['n_layers'],
+                                'n_heads': cfg['model']['n_heads'],
+                                'max_seq_len': cfg['model']['max_seq_len'],
+                                'n_q': cfg['model'].get('n_q', 790),
+                                'n_k': cfg['model'].get('n_k', 790),
+                                'n_v': cfg['model'].get('n_v', 2600),
+                                'n_know': cfg['model'].get('n_know', 25200),
+                            }
+                            # Collect real val data for dead neuron diagnosis
+                            val_loader.reset()
+                            _diag_batches = []
+                            for _di, (_dids, _dmask) in enumerate(val_loader):
+                                _diag_batches.append(np.array(_dids))
+                                if len(_diag_batches) * _dids.shape[0] >= 128:
+                                    break
+                            _diag_tokens = jnp.array(np.concatenate(_diag_batches, axis=0)[:128])
+                            _dead = jax.device_get(_diag_dead(
+                                _params_cpu, _diag_cfg, _diag_tokens,
+                                n_batches=4, batch_size=32))
+                            del _diag_tokens
+                            for _pn in ('Q', 'K', 'V', 'Know'):
+                                _ps = _dead[_pn]
+                                log_message(
+                                    f"      [DEAD] {_pn}: dead={int(_ps['n_dead'])}({float(_ps['dead_frac'])*100:.1f}%)"
+                                    f" rare(<1%)={int(_ps['n_rare'])}({float(_ps['rare_frac'])*100:.1f}%)")
+                            del _dead
+                        except Exception as e:
+                            log_message(f"      [DEAD] diagnosis failed: {e}")
+                    del _params_cpu
 
             # ---- Mid-epoch checkpoint ----
             if global_step % ckpt_interval == 0 and global_step > 0:
@@ -3214,6 +3227,28 @@ def main():
                 cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
 
         if preemption_requested[0]:
+            # Cooperative emergency save. All hosts participate in
+            # _gather_for_save (collective); only host 0 writes the file.
+            # Previously this ran from the SIGTERM signal handler, which
+            # was unsafe because hosts enter the handler asynchronously.
+            try:
+                _emerg_params = _gather_for_save(params)
+                _emerg_opt = _gather_for_save(opt_state)
+                if is_host0:
+                    epath = _ckpt_path(f"emergency_step{global_step}.flax")
+                    save_checkpoint(
+                        epath, _emerg_params, _emerg_opt,
+                        epoch, global_step, best_val_loss,
+                        cfg['model'],
+                        step_in_epoch=epoch_step_counter,
+                        steps_per_epoch=steps_per_epoch,
+                        training_config=training_config,
+                    )
+                    print(f"!!! Emergency checkpoint saved: {epath} !!!", flush=True)
+                del _emerg_params, _emerg_opt
+            except Exception as e:
+                if is_host0:
+                    print(f"!!! Emergency save FAILED: {e} !!!", flush=True)
             break
 
         # ---- End of epoch ----
