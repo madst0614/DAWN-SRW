@@ -216,6 +216,25 @@ def build_model_from_config(cfg):
 # GCS / file I/O helpers
 # ============================================================
 
+_GCS_FS_CACHE = None
+
+
+def _get_gcs_fs():
+    """Cached gcsfs.GCSFileSystem singleton.
+
+    Avoids per-call auth + init overhead. Returns None if gcsfs is not
+    installed; callers are expected to fall back to tensorflow or raise.
+    """
+    global _GCS_FS_CACHE
+    if _GCS_FS_CACHE is None:
+        try:
+            import gcsfs
+            _GCS_FS_CACHE = gcsfs.GCSFileSystem()
+        except ImportError:
+            return None
+    return _GCS_FS_CACHE
+
+
 def _is_gcs(path):
     return str(path).startswith("gs://")
 
@@ -224,12 +243,9 @@ def _open_file(path, mode="rb"):
     """Open a file for read/write, supporting GCS paths."""
     path_str = str(path)
     if _is_gcs(path_str):
-        try:
-            import gcsfs
-            fs = gcsfs.GCSFileSystem()
+        fs = _get_gcs_fs()
+        if fs is not None:
             return fs.open(path_str, mode)
-        except ImportError:
-            pass
         try:
             import tensorflow as tf
             return tf.io.gfile.GFile(path_str, mode)
@@ -249,17 +265,16 @@ def _file_exists(path):
     """Check if a file exists (local or GCS)."""
     path_str = str(path)
     if _is_gcs(path_str):
-        try:
-            import gcsfs
-            fs = gcsfs.GCSFileSystem()
+        fs = _get_gcs_fs()
+        if fs is not None:
             return fs.exists(path_str)
-        except ImportError:
-            pass
         try:
             import tensorflow as tf
             return tf.io.gfile.exists(path_str)
         except ImportError:
-            return False
+            raise ImportError(
+                f"Cannot check GCS path {path_str}: "
+                f"neither gcsfs nor tensorflow available.")
     return Path(path_str).exists()
 
 
@@ -277,15 +292,12 @@ def _list_files(directory, pattern="*.flax"):
         return int(m.group(1)) if m else 0
 
     if _is_gcs(dir_str):
-        try:
-            import gcsfs
-            fs = gcsfs.GCSFileSystem()
+        fs = _get_gcs_fs()
+        if fs is not None:
             if not dir_str.endswith("/"):
                 dir_str += "/"
             files = fs.glob(dir_str + pattern)
             return sorted(["gs://" + f for f in files], key=_sort_key)
-        except ImportError:
-            pass
         try:
             import tensorflow as tf
             if not dir_str.endswith("/"):
@@ -293,7 +305,9 @@ def _list_files(directory, pattern="*.flax"):
             files = tf.io.gfile.glob(dir_str + pattern)
             return sorted(files, key=_sort_key)
         except ImportError:
-            return []
+            raise ImportError(
+                f"Cannot list GCS path {dir_str}: "
+                f"neither gcsfs nor tensorflow available.")
     return sorted((str(f) for f in Path(dir_str).glob(pattern)), key=_sort_key)
 
 
@@ -304,26 +318,30 @@ def _makedirs(path):
 
 
 def _delete_file(path):
-    """Delete a single file (local or GCS)."""
+    """Delete a single file (local or GCS). Warns on failure; never silent."""
     path_str = str(path)
     if _is_gcs(path_str):
-        try:
-            import gcsfs
-            fs = gcsfs.GCSFileSystem()
-            fs.rm(path_str)
+        fs = _get_gcs_fs()
+        if fs is not None:
+            try:
+                fs.rm(path_str)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                if jax.process_index() == 0:
+                    print(f"Warning: _delete_file({path_str}) failed: {e}", flush=True)
             return
-        except ImportError:
-            pass
         try:
             import tensorflow as tf
             tf.io.gfile.remove(path_str)
             return
         except ImportError:
-            pass
-    else:
-        p = Path(path_str)
-        if p.exists():
-            p.unlink()
+            raise ImportError(
+                f"Cannot delete GCS path {path_str}: "
+                f"neither gcsfs nor tensorflow available.")
+    p = Path(path_str)
+    if p.exists():
+        p.unlink()
 
 
 def cleanup_old_checkpoints(checkpoint_dir, keep_last=3):
@@ -1343,22 +1361,25 @@ def main():
         return str(Path(base) / name)
 
     def _list_run_folders(base):
-        """List run_* subdirectories under base (local or GCS)."""
+        """List run_* subdirectories under base (local or GCS).
+
+        Silent empty-list on GCS errors previously masked credential or
+        permission failures as "no prior run found" — a brand-new run
+        would start writing into a fresh folder next to the user's
+        actual run. Fail loud instead.
+        """
         if _is_gcs(base):
-            try:
-                import gcsfs
-                fs = gcsfs.GCSFileSystem()
-                prefix = base.rstrip('/') + '/run_'
-                # strip gs:// for gcsfs
-                bucket_path = base.replace('gs://', '').rstrip('/')
-                entries = fs.ls(bucket_path)
-                runs = sorted([
-                    'gs://' + e for e in entries
-                    if '/run_' in e
-                ])
-                return runs
-            except Exception:
-                return []
+            fs = _get_gcs_fs()
+            if fs is None:
+                raise ImportError(
+                    f"Cannot list GCS path {base}: gcsfs not available.")
+            bucket_path = base.replace('gs://', '').rstrip('/')
+            entries = fs.ls(bucket_path)
+            runs = sorted([
+                'gs://' + e for e in entries
+                if '/run_' in e
+            ])
+            return runs
         else:
             p = Path(base)
             if not p.exists():
