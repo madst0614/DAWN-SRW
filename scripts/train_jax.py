@@ -37,33 +37,20 @@ import argparse
 import yaml
 import numpy as np
 from datetime import datetime
+from dataclasses import dataclass
 from functools import partial
+from typing import Any, Callable, Optional
+
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental.shard_map import shard_map
 
-from models.model_v17_1_jax import DAWN
-from models.dawn_spatial import DAWN as DAWN_Spatial
-from models.dawn_spatial_v2 import DAWN as DAWN_SpatialV2
-from models.dawn_spatial_v3 import DAWN as DAWN_SpatialV3
-from models.dawn_spatial_v3_baseline import DAWN as DAWN_SpatialV3Baseline
-from models.dawn_spatial_v3_exp import DAWN as DAWN_SpatialV3Exp
-from models.dawn_spatial_v394_exp import DAWN as DAWN_SpatialV394Exp
-from models.dawn_spatial_v395_exp import DAWN as DAWN_SpatialV395Exp
-from models.dawn_spatial_v396_exp import DAWN as DAWN_SpatialV396Exp
-from models.dawn_spatial_v397_exp import DAWN as DAWN_SpatialV397Exp
-from models.dawn_spatial_v3971_exp import DAWN as DAWN_SpatialV3971Exp
-from models.dawn_spatial_v398_exp import DAWN as DAWN_SpatialV398Exp
-from models.dawn_spatial_v3981_exp import DAWN as DAWN_SpatialV3981Exp
-from models.dawn_spatial_v399_exp import DAWN as DAWN_SpatialV399Exp
-from models.dawn_spatial_v400_exp import DAWN as DAWN_SpatialV400Exp
-from models.dawn_spatial_v401_exp import DAWN as DAWN_SpatialV401Exp
-from models.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
-from models.dawn_spatial_v403_exp import DAWN as DAWN_SpatialV403Exp
-from models.dawn_spatial_v404_exp import DAWN as DAWN_SpatialV404Exp
-from models.dawn_spatial_v405_exp import DAWN as DAWN_SpatialV405Exp
-from models.dawn_spatial_v406_exp import DAWN as DAWN_SpatialV406Exp
-from models.dawn_spatial_v41_exp import DAWN as DAWN_SpatialV41Exp
+# Model registry imports. Legacy versions (v2 .. v4.0.6, v3.9.x except
+# v3.9.4, rw-v4.0.2) live in models/legacy/ — restore from there and
+# add a ModelSpec entry if you need to resume an old checkpoint or
+# reproduce a paper result. See models/legacy/README.md.
 from models.baseline_transformer_jax import VanillaTransformer
+from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
+from models.dawn_spatial_v41_exp import DAWN as DAWN_V41
 
 # ============================================================
 # Constants
@@ -95,352 +82,128 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
-def build_model_from_config(cfg):
-    """Build model from config dict. Supports DAWN and baseline."""
-    mcfg = cfg['model']
-    version = mcfg.get('model_version', '17.1')
+# ============================================================
+# Model Registry
+# ============================================================
 
-    if version == 'baseline':
-        model = VanillaTransformer(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            d_ff=mcfg.get('d_ff', 1536),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-        )
-    elif version == 'spatial-r1':
-        model = DAWN_Spatial(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_space=mcfg.get('d_space', 64),
-            n_qk=mcfg.get('n_qk', 256),
-            n_v=mcfg.get('n_v', 256),
-            n_know=mcfg.get('n_know', 512),
-            max_k=mcfg.get('max_k', 32),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            # Hierarchical routing
-            n_clusters_qk=mcfg.get('n_clusters_qk', 64),
-            n_clusters_v=mcfg.get('n_clusters_v', 64),
-            n_clusters_know=mcfg.get('n_clusters_know', 128),
-            k_cluster_qk=mcfg.get('k_cluster_qk', 8),
-            k_cluster_v=mcfg.get('k_cluster_v', 8),
-            k_cluster_know=mcfg.get('k_cluster_know', 8),
-        )
-    elif version == 'spatial-r1-v4.0.0':
-        model = DAWN_SpatialV400Exp(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-        )
-    elif version in ('spatial-r1-v3.9.9', 'spatial-r1-v4.0.1', 'spatial-r1-v4.0.3',
-                      'spatial-r1-v4.0.4', 'spatial-r1-v4.0.5',
-                      'spatial-r1-v4.0.6', 'spatial-r1-v4.1'):
-        _cls = {
-            'spatial-r1-v4.0.1': DAWN_SpatialV401Exp,
-            'spatial-r1-v4.0.3': DAWN_SpatialV403Exp,
-            'spatial-r1-v4.0.4': DAWN_SpatialV404Exp,
-            'spatial-r1-v4.0.5': DAWN_SpatialV405Exp,
-            'spatial-r1-v4.0.6': DAWN_SpatialV406Exp,
-            'spatial-r1-v4.1': DAWN_SpatialV41Exp,
-        }.get(version, DAWN_SpatialV399Exp)
-        _extra = {}
-        if version == 'spatial-r1-v4.0.4':
-            _extra['reverse_p_max'] = cfg['training'].get('reverse_p_max', 0.0)
-        elif version == 'spatial-r1-v4.0.5':
-            _extra['gate_drop_rate'] = cfg['training'].get('gate_drop_rate', 0.0)
-            _extra['gate_boost_rate'] = cfg['training'].get('gate_boost_rate', 0.0)
-        elif version == 'spatial-r1-v4.0.6':
-            _extra['tau_alpha_init'] = cfg['training'].get('tau_alpha_init', 0.1)
-        elif version == 'spatial-r1-v4.1':
-            # v4.1 removed dynamic tau / alpha entirely; no model-level kwargs.
-            pass
-        model = _cls(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-            **_extra,
-        )
-    elif version == 'rw-v4.0.2':
-        model = DAWN_RW_V402(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            n_q=mcfg.get('n_q', 790),
-            n_k=mcfg.get('n_k', 790),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_q=cfg['training'].get('n_chunks_q', 1),
-            n_chunks_k=cfg['training'].get('n_chunks_k', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-        )
-    elif version == 'spatial-r1-v3.9.8.1':
-        model = DAWN_SpatialV3981Exp(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-        )
-    elif version == 'spatial-r1-v3.9.8':
-        model = DAWN_SpatialV398Exp(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-        )
-    elif version == 'spatial-r1-v3.9.7.1':
-        model = DAWN_SpatialV3971Exp(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-        )
-    elif version == 'spatial-r1-v3.9.7':
-        model = DAWN_SpatialV397Exp(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-        )
-    elif version == 'spatial-r1-v3.9.6':
-        model = DAWN_SpatialV396Exp(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-        )
-    elif version == 'spatial-r1-v3.9.5':
-        model = DAWN_SpatialV395Exp(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-            gate_norm_mode=mcfg.get('gate_norm_mode', 'sqrt_active'),
-        )
-    elif version == 'spatial-r1-v3.9.4':
-        model = DAWN_SpatialV394Exp(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-        )
-    elif version == 'spatial-r1-v3.9.3':
-        model = DAWN_SpatialV3Exp(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-        )
-    elif version == 'spatial-r1-v3.9.1':
-        model = DAWN_SpatialV3Baseline(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-        )
-    elif version.startswith('spatial-r1-v3'):
-        model = DAWN_SpatialV3(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
-            n_qk=mcfg.get('n_qk', 1580),
-            n_v=mcfg.get('n_v', 2600),
-            n_know=mcfg.get('n_know', 25200),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
-            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
-            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
-        )
-    elif version.startswith('spatial-r1-v2'):
-        model = DAWN_SpatialV2(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            pos_dim=mcfg.get('pos_dim', 2),
-            grid_size=mcfg.get('grid_size', 64),
-            candidates_multiplier=mcfg.get('candidates_multiplier', 2),
-            grid_rebuild_interval=mcfg.get('grid_rebuild_interval', 100),
-            pos_loss_weight=mcfg.get('pos_loss_weight', 0.01),
-            know_chunk_size=mcfg.get('know_chunk_size', 16),
-            n_qk=mcfg.get('n_qk', 3140),
-            n_v=mcfg.get('n_v', 5240),
-            n_know=mcfg.get('n_know', 42000),
-            max_k_qk=mcfg.get('max_k_qk', 157),
-            max_k_v=mcfg.get('max_k_v', 262),
-            max_k_know=mcfg.get('max_k_know', 1536),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-        )
-    else:
-        model = DAWN(
-            vocab_size=mcfg.get('vocab_size', 30522),
-            d_model=mcfg.get('d_model', 384),
-            n_layers=mcfg.get('n_layers', 12),
-            n_heads=mcfg.get('n_heads', 6),
-            rank=mcfg.get('rank', 64),
-            max_seq_len=mcfg.get('max_seq_len', 512),
-            d_space=mcfg.get('d_space', 64),
-            n_feature_qk=mcfg.get('n_feature_qk', 56),
-            n_feature_v=mcfg.get('n_feature_v', 24),
-            top_k_feature_qk=mcfg.get('top_k_feature_qk', 16),
-            top_k_feature_v=mcfg.get('top_k_feature_v', 6),
-            n_restore_qk=mcfg.get('n_restore_qk', 56),
-            n_restore_v=mcfg.get('n_restore_v', 24),
-            top_k_restore_qk=mcfg.get('top_k_restore_qk', 16),
-            top_k_restore_v=mcfg.get('top_k_restore_v', 6),
-            n_feature_know=mcfg.get('n_feature_know', 24),
-            n_restore_know=mcfg.get('n_restore_know', 24),
-            top_k_feature_know=mcfg.get('top_k_feature_know', 4),
-            top_k_restore_know=mcfg.get('top_k_restore_know', 4),
-            knowledge_rank=mcfg.get('knowledge_rank', 128),
-            dropout_rate=mcfg.get('dropout', 0.1),
-            router_dropout=mcfg.get('router_dropout', 0.1),
-            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-        )
-    return model
+@dataclass
+class ModelSpec:
+    """Registered model entry.
+
+    - build_kwargs: cfg -> kwargs dict for the model constructor.
+    - sharded_kwargs: cfg -> extra kwargs for make_sharded_srw /
+      make_sharded_srw_paired (v4.1 closure constants live here).
+    - force_sharded: require shard_map path even when mesh_model==1
+      (v4.1 removed non-sharded fallback).
+    """
+    name: str
+    module_path: str
+    cls: Any
+    build_kwargs: Callable[[dict], dict]
+    supports_sharded: bool = False
+    force_sharded: bool = False
+    sharded_kwargs: Optional[Callable[[dict], dict]] = None
+
+
+def _baseline_kwargs(cfg):
+    m = cfg['model']
+    return dict(
+        vocab_size=m.get('vocab_size', 30522),
+        d_model=m.get('d_model', 384),
+        d_ff=m.get('d_ff', 1536),
+        n_layers=m.get('n_layers', 12),
+        n_heads=m.get('n_heads', 6),
+        max_seq_len=m.get('max_seq_len', 512),
+        dropout_rate=m.get('dropout', 0.1),
+        gradient_checkpointing=m.get('gradient_checkpointing', False),
+    )
+
+
+def _dawn_shared_kwargs(cfg):
+    """Init kwargs shared by v3.9.4 and v4.1 (identical signature)."""
+    m = cfg['model']
+    t = cfg['training']
+    return dict(
+        vocab_size=m.get('vocab_size', 30522),
+        d_model=m.get('d_model', 384),
+        n_layers=m.get('n_layers', 12),
+        n_heads=m.get('n_heads', 6),
+        max_seq_len=m.get('max_seq_len', 512),
+        d_route=m.get('d_route', m.get('d_bottleneck', 128)),
+        n_qk=m.get('n_qk', 1580),
+        n_v=m.get('n_v', 2600),
+        n_know=m.get('n_know', 25200),
+        dropout_rate=m.get('dropout', 0.1),
+        router_dropout=m.get('router_dropout', 0.1),
+        gradient_checkpointing=m.get('gradient_checkpointing', False),
+        n_chunks_know=t.get('n_chunks_know', 1),
+        n_chunks_qk=t.get('n_chunks_qk', 1),
+        n_chunks_v=t.get('n_chunks_v', 1),
+    )
+
+
+def _v41_sharded_kwargs(cfg):
+    """v4.1 two-stage gate constants passed as closure to make_sharded_srw.
+
+    Defaults mirror the pre-refactor values (scripts/train_jax.py line
+    1970-1986 before commit bfcc2b9). Any change here shifts training
+    dynamics — keep in sync with model code.
+    """
+    t = cfg['training']
+    return dict(
+        dead_threshold=t.get('dead_penalty_threshold', 0.01),
+        sharpness=t.get('sharpness', 500.0),
+        activation_threshold=t.get('activation_threshold', 0.5),
+        activation_cutoff=t.get('activation_cutoff', 0.01),
+        epsilon=t.get('epsilon', 1e-4),
+        max_intensity=t.get('max_intensity', 10.0),
+    )
+
+
+MODEL_REGISTRY = {
+    'baseline': ModelSpec(
+        name='baseline',
+        module_path='models.baseline_transformer_jax',
+        cls=VanillaTransformer,
+        build_kwargs=_baseline_kwargs,
+    ),
+    'spatial-r1-v3.9.4': ModelSpec(
+        name='spatial-r1-v3.9.4',
+        module_path='models.dawn_spatial_v394_exp',
+        cls=DAWN_V394,
+        build_kwargs=_dawn_shared_kwargs,
+        supports_sharded=True,
+    ),
+    'spatial-r1-v4.1': ModelSpec(
+        name='spatial-r1-v4.1',
+        module_path='models.dawn_spatial_v41_exp',
+        cls=DAWN_V41,
+        build_kwargs=_dawn_shared_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v41_sharded_kwargs,
+    ),
+}
+
+
+def build_model_from_config(cfg):
+    """Build model from config via MODEL_REGISTRY.
+
+    Unknown versions raise ValueError with restoration instructions —
+    legacy versions live in models/legacy/ and can be re-registered in
+    MODEL_REGISTRY when resuming old checkpoints or reproducing paper
+    results. See models/legacy/README.md.
+    """
+    version = cfg['model'].get('model_version', 'spatial-r1-v4.1')
+    if version not in MODEL_REGISTRY:
+        raise ValueError(
+            f"Unknown model_version: {version!r}. "
+            f"Known: {sorted(MODEL_REGISTRY.keys())}. "
+            f"Legacy versions live in models/legacy/ — to resume an old "
+            f"checkpoint, move the model file back to models/ and add a "
+            f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
+    spec = MODEL_REGISTRY[version]
+    return spec.cls(**spec.build_kwargs(cfg))
 
 
 # ============================================================
@@ -1951,45 +1714,28 @@ def main():
     else:
         opt_state = optimizer.init(params)
 
-    # Create shard_map functions if mesh_model > 1 (or always for v4.0.4
-    # which removed its non-sharded fallback and depends on the sharded path).
+    # Create shard_map functions if mesh_model > 1 or the model demands
+    # the sharded path (v4.1 removed its non-sharded fallback).
     _sharded_fns = None
-    _force_sharded = model_version in ('spatial-r1-v4.0.4', 'spatial-r1-v4.0.5',
-                                        'spatial-r1-v4.0.6', 'spatial-r1-v4.1')
-    if mesh_model > 1 or _force_sharded:
-        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp', 'spatial-r1-v4.1': 'models.dawn_spatial_v41_exp'}.get(model_version, 'models.dawn_spatial_v3')
-        _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw'])
+    _spec = MODEL_REGISTRY.get(model_version)
+    _force_sharded = bool(_spec and _spec.force_sharded)
+    if _spec is not None and (mesh_model > 1 or _force_sharded):
+        if not _spec.supports_sharded:
+            raise RuntimeError(
+                f"model_version={model_version!r} is registered without "
+                f"supports_sharded=True but mesh_model>1 or force_sharded=True.")
+        _v3 = __import__(_spec.module_path, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
-        _gnm = cfg['model'].get('gate_norm_mode', 'sqrt_active')
         _srw_kwargs = {'mesh': mesh, 'max_chunk_size': max_chunk}
-        if model_version.startswith('spatial-r1-v3.9.5'):
-            _srw_kwargs['gate_norm_mode'] = _gnm
-        # v4.0.4: reverse_p_max is a runtime scalar passed through shard_map
-        # at each call (see _attn_forward / _know_forward); not a builder kwarg.
-        # v4.0.6: dead_threshold is a builder kwarg (closure constant).
-        if model_version in ('spatial-r1-v4.0.6', 'spatial-r1-v4.1'):
-            _srw_kwargs['dead_threshold'] = cfg['training'].get(
-                'dead_penalty_threshold',
-                0.01 if model_version == 'spatial-r1-v4.1' else 1e-4)
-        # v4.1: sharpness / activation_threshold / activation_cutoff /
-        # epsilon / max_intensity — all closure constants for the
-        # two-stage gate.
-        if model_version == 'spatial-r1-v4.1':
-            _srw_kwargs['sharpness'] = cfg['training'].get('sharpness', 500.0)
-            _srw_kwargs['activation_threshold'] = cfg['training'].get(
-                'activation_threshold', 0.5)
-            _srw_kwargs['activation_cutoff'] = cfg['training'].get(
-                'activation_cutoff', 0.01)
-            _srw_kwargs['epsilon'] = cfg['training'].get('epsilon', 1e-4)
-            _srw_kwargs['max_intensity'] = cfg['training'].get(
-                'max_intensity', 10.0)
+        if _spec.sharded_kwargs is not None:
+            _srw_kwargs.update(_spec.sharded_kwargs(cfg))
         _sharded_single = make_sharded_srw(**_srw_kwargs)
         if hasattr(_v3, 'make_sharded_srw_paired'):
             _sharded_paired = _v3.make_sharded_srw_paired(**_srw_kwargs)
             _sharded_fns = (_sharded_single, _sharded_paired)
         else:
-            _sharded_fns = _sharded_single  # v4.0.2: no paired (Q/K split)
+            _sharded_fns = _sharded_single
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused)")
 
@@ -2073,8 +1819,9 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp', 'spatial-r1-v4.1': 'models.dawn_spatial_v41_exp'}.get(model_version, 'models.dawn_spatial_v3')
-            _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
+            _v3 = __import__(
+                MODEL_REGISTRY[model_version].module_path,
+                fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
             # Use actual sharded params (no device_get)
@@ -3177,46 +2924,11 @@ def main():
                         log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
                     del params_single, opt_state_single
 
-                # Dead neuron diagnosis (rw-v4.0.2). _gather_for_save is a
-                # collective — must run on ALL hosts outside the is_host0
-                # guard, same fix class as the drift move. Only the actual
-                # diagnosis / logging stays host-0.
-                if model_version.startswith('rw-v'):
-                    _params_cpu = _gather_for_save(params)
-                    if is_host0:
-                        try:
-                            from models.dawn_spatial_v402_exp import diagnose_dead_neurons as _diag_dead
-                            _diag_cfg = {
-                                'd_model': cfg['model']['d_model'],
-                                'n_layers': cfg['model']['n_layers'],
-                                'n_heads': cfg['model']['n_heads'],
-                                'max_seq_len': cfg['model']['max_seq_len'],
-                                'n_q': cfg['model'].get('n_q', 790),
-                                'n_k': cfg['model'].get('n_k', 790),
-                                'n_v': cfg['model'].get('n_v', 2600),
-                                'n_know': cfg['model'].get('n_know', 25200),
-                            }
-                            # Collect real val data for dead neuron diagnosis
-                            val_loader.reset()
-                            _diag_batches = []
-                            for _di, (_dids, _dmask) in enumerate(val_loader):
-                                _diag_batches.append(np.array(_dids))
-                                if len(_diag_batches) * _dids.shape[0] >= 128:
-                                    break
-                            _diag_tokens = jnp.array(np.concatenate(_diag_batches, axis=0)[:128])
-                            _dead = jax.device_get(_diag_dead(
-                                _params_cpu, _diag_cfg, _diag_tokens,
-                                n_batches=4, batch_size=32))
-                            del _diag_tokens
-                            for _pn in ('Q', 'K', 'V', 'Know'):
-                                _ps = _dead[_pn]
-                                log_message(
-                                    f"      [DEAD] {_pn}: dead={int(_ps['n_dead'])}({float(_ps['dead_frac'])*100:.1f}%)"
-                                    f" rare(<1%)={int(_ps['n_rare'])}({float(_ps['rare_frac'])*100:.1f}%)")
-                            del _dead
-                        except Exception as e:
-                            log_message(f"      [DEAD] diagnosis failed: {e}")
-                    del _params_cpu
+                # Dead-neuron diagnosis removed during the registry refactor
+                # (was rw-v4.0.2-specific: separate Q/K pools, GELU-z gate).
+                # If needed for v4.1+, rewrite against the activation×intensity
+                # gate — see models/legacy/dawn_spatial_v402_exp.py for
+                # reference.
 
             # ---- Mid-epoch checkpoint ----
             if global_step % ckpt_interval == 0 and global_step > 0:
