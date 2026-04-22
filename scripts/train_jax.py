@@ -3100,8 +3100,10 @@ def main():
                         steps_per_epoch=steps_per_epoch,
                         training_config=training_config,
                     )
+                    # GCS list+delete only from host 0 — racing cleanups across
+                    # hosts can drop the checkpoint that was just written.
+                    cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
                 del params_single, opt_state_single
-                cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
 
         if preemption_requested[0]:
             # Cooperative emergency save. All hosts participate in
@@ -3202,10 +3204,12 @@ def main():
                 )
                 log_message(f"  New best model! val_loss={best_val_loss:.4f}")
 
-            del params_single, opt_state_single
-
             log_message(f"  Best val loss so far: {best_val_loss:.4f}")
             sync_logs()
+
+        # Release gathered copies on every host — all hosts hold them after
+        # _gather_for_save; host-0-only del leaves multi-GB pinned elsewhere.
+        del params_single, opt_state_single
 
         # Reset data loader for next epoch (no re-read, just reset position)
         if epoch < num_epochs - 1:
