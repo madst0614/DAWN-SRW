@@ -655,9 +655,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-    # Load balance loss from gate distributions + tau regularization
-    tau_reg = jnp.maximum(tau_all, 0.0).mean() * 0.01
-    aux = (qk_lb + v_lb) / 3.0 + tau_reg
+    # Load balance loss from gate distributions; tau_reg returned separately.
+    tau_reg = jnp.maximum(tau_all, 0.0).mean()
+    aux = (qk_lb + v_lb) / 3.0
     attn_raw_gmax = jnp.maximum(qk_raw_gmax.mean(), v_raw_gmax.mean())
     attn_score_std = (qk_sstd + v_sstd) / 2
     attn_gate_sum = (qk_es + v_es) / 2
@@ -667,7 +667,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     return (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax,
             attn_score_std, attn_gate_sum, attn_gate_conc, attn_score_mean,
             attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
-            q_norm, k_norm, v_norm_dbg, attn_logit_max, o_input_norm)
+            q_norm, k_norm, v_norm_dbg, attn_logit_max, o_input_norm,
+            tau_reg)
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -700,15 +701,15 @@ def _know_forward(x, pool_params, router_params, rng,
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-    tau_reg = jnp.maximum(tau, 0.0).mean() * 0.01
-    aux = lb_loss + tau_reg
+    tau_reg = jnp.maximum(tau, 0.0).mean()
+    aux = lb_loss
     emb_norm_val = jnp.linalg.norm(know_emb, axis=-1).mean()
     read_norm_val = jnp.linalg.norm(know_read, axis=-1).mean()
     write_norm_val = jnp.linalg.norm(know_write, axis=-1).mean()
     know_tau_mean = tau.mean()
     return (out, aux, active_frac, raw_gate_max, score_std, gate_sum, gate_conc,
             emb_norm_val, read_norm_val, write_norm_val, score_mean, know_out_norm,
-            know_tau_mean, know_raw_out_norm)
+            know_tau_mean, know_raw_out_norm, tau_reg)
 
 
 # ================================================================
@@ -859,8 +860,11 @@ class DAWN(nn.Module):
         if self.is_initializing():
             _z = jnp.float32(0.0)
             total_aux = _z
+            total_tau_reg = _z
             attn_auxes = _z
             know_auxes = _z
+            attn_tau_regs = _z
+            know_tau_regs = _z
             know_active_all = _z
             know_raw_gmax_all = _z
             know_sstd_all = _z
@@ -919,7 +923,8 @@ class DAWN(nn.Module):
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_gconc, a_smean,
                  a_out_norm, a_tau_mean, a_qk_raw_norm, a_v_raw_norm,
-                 a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm
+                 a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
+                 a_tau_reg
                 ) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
@@ -934,7 +939,7 @@ class DAWN(nn.Module):
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
                 (know_out, know_aux, k_active, k_raw_gmax, k_sstd, k_gsum, k_gconc,
                  k_emb_n, k_read_n, k_write_n, k_smean, k_out_norm,
-                 k_tau_mean, k_raw_out_norm
+                 k_tau_mean, k_raw_out_norm, k_tau_reg
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
@@ -947,7 +952,8 @@ class DAWN(nn.Module):
                            a_smean, k_smean, k_out_norm,
                            a_out_norm, a_tau_mean, k_tau_mean,
                            a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
-                           a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm)
+                           a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
+                           a_tau_reg, k_tau_reg)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -961,9 +967,11 @@ class DAWN(nn.Module):
                 attn_out_norm_all, attn_tau_mean_all, know_tau_mean_all,
                 attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all,
                 attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
-                attn_logit_max_all, attn_o_input_norm_all) = jax.lax.scan(
+                attn_logit_max_all, attn_o_input_norm_all,
+                attn_tau_regs, know_tau_regs) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
+            total_tau_reg = (attn_tau_regs + know_tau_regs).mean()
 
         # Debug norms
         _residual_norm = jnp.linalg.norm(x, axis=-1).mean()
@@ -976,8 +984,11 @@ class DAWN(nn.Module):
         x = self.norm(x)
         result = {
             'aux_loss': total_aux,
+            'tau_reg': total_tau_reg,
             'attn_aux': attn_auxes.mean(),
             'know_aux': know_auxes.mean(),
+            'attn_tau_reg': attn_tau_regs.mean(),
+            'know_tau_reg': know_tau_regs.mean(),
 
             'know_active': know_active_all.mean(),
             'know_raw_gate_max': know_raw_gmax_all.mean(),

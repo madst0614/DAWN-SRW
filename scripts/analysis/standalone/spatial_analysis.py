@@ -5356,6 +5356,193 @@ def analyze_write_coverage(params, cfg, output_dir):
 
 
 # ============================================================
+# §7.2.3b Read Direction Coverage
+# ============================================================
+
+def analyze_read_coverage(params, cfg, output_dir):
+    """§7.2.3b: SVD effective rank, pairwise cos sim, covering radius per pool
+    for read vectors; plus read vs write rank comparison and read-write
+    subspace overlap via principal angles (k=50,100,200)."""
+    print("\n" + "="*60)
+    print("§7.2.3b: Read Direction Coverage")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+    d_model = model_cfg['d_model']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+
+    pools = {
+        'qk':   ('qk_read',   'qk_write',   n_qk),
+        'v':    ('v_read',    'v_write',    n_v),
+        'know': ('know_read', 'know_write', n_know),
+    }
+
+    subspace_ks = [50, 100, 200]
+    results = {}
+    rank_compare = {}
+
+    for pool_name, (r_key, w_key, n_pool) in pools.items():
+        print(f"\n  Pool: {pool_name} (N={n_pool}, d={d_model})")
+        R = np.array(jax.device_get(pool_p[r_key]))   # [N, d]
+        W = np.array(jax.device_get(pool_p[w_key]))   # [N, d]
+        R_n = R / (np.linalg.norm(R, axis=-1, keepdims=True) + 1e-8)
+        W_n = W / (np.linalg.norm(W, axis=-1, keepdims=True) + 1e-8)
+
+        # SVD (subsample if too large) — shared subsample index for R and W
+        print(f"    Computing SVD...")
+        rng = np.random.RandomState(42)
+        if n_pool > 5000:
+            idx = rng.choice(n_pool, 5000, replace=False)
+            R_sub = R_n[idx]
+            W_sub = W_n[idx]
+        else:
+            R_sub = R_n
+            W_sub = W_n
+
+        U_r, S_r, _ = np.linalg.svd(R_sub, full_matrices=False)
+        U_w, S_w, _ = np.linalg.svd(W_sub, full_matrices=False)
+
+        S2_r = S_r ** 2
+        S2r_norm = S2_r / (S2_r.sum() + 1e-12)
+        eff_rank_r = float(np.exp(-np.sum(S2r_norm * np.log(S2r_norm + 1e-12))))
+
+        S2_w = S_w ** 2
+        S2w_norm = S2_w / (S2_w.sum() + 1e-12)
+        eff_rank_w = float(np.exp(-np.sum(S2w_norm * np.log(S2w_norm + 1e-12))))
+
+        print(f"    read  SVD effective rank: {eff_rank_r:.1f} / {min(n_pool, d_model)}")
+        print(f"    write SVD effective rank: {eff_rank_w:.1f} / {min(n_pool, d_model)}")
+
+        # Pairwise cosine similarity (read)
+        print(f"    Computing pairwise cos sim (read)...")
+        chunk = 1000
+        cos_vals = []
+        for i in range(0, len(R_sub), chunk):
+            sim_chunk = R_sub[i:i+chunk] @ R_sub.T
+            for ci in range(sim_chunk.shape[0]):
+                global_i = i + ci
+                row = sim_chunk[ci]
+                row[global_i] = np.nan
+                cos_vals.append(row[~np.isnan(row)])
+
+        cos_flat = np.concatenate(cos_vals)
+        cos_hist, cos_edges = np.histogram(cos_flat, bins=100, range=(-1.0, 1.0))
+
+        # Covering radius (read)
+        print(f"    Computing covering radius (read)...")
+        n_probes = 10000
+        probes = rng.randn(n_probes, d_model).astype(np.float32)
+        probes /= (np.linalg.norm(probes, axis=-1, keepdims=True) + 1e-8)
+
+        max_cos_per_probe = np.zeros(n_probes, dtype=np.float32)
+        for i in range(0, n_probes, chunk):
+            sim = probes[i:i+chunk] @ R_sub.T
+            max_cos_per_probe[i:i+chunk] = sim.max(axis=-1)
+
+        cover_hist, cover_edges = np.histogram(max_cos_per_probe, bins=50, range=(0.0, 1.0))
+
+        # Read-Write subspace overlap (principal angles) at k in {50,100,200}
+        print(f"    Computing read-write subspace overlap...")
+        max_k = min(U_r.shape[1], U_w.shape[1])
+        subspace = {}
+        for k in subspace_ks:
+            kk = min(k, max_k)
+            Ur_k = U_r[:, :kk]
+            Uw_k = U_w[:, :kk]
+            # principal angles: singular values of Ur_k^T @ Uw_k  ∈ [0,1]
+            M = Ur_k.T @ Uw_k
+            sv = np.linalg.svd(M, compute_uv=False)
+            sv = np.clip(sv, 0.0, 1.0)
+            angles_rad = np.arccos(sv)
+            subspace[f'k={kk}'] = {
+                'k': int(kk),
+                'singular_values': sv.tolist(),
+                'sv_mean': float(sv.mean()),
+                'sv_min': float(sv.min()),
+                'sv_max': float(sv.max()),
+                'principal_angles_deg_mean': float(np.degrees(angles_rad.mean())),
+                'principal_angles_deg_min': float(np.degrees(angles_rad.min())),
+                'principal_angles_deg_max': float(np.degrees(angles_rad.max())),
+                'overlap_frobenius': float(np.sqrt((sv ** 2).sum())),
+                'overlap_frac': float((sv ** 2).sum() / kk),
+            }
+            print(f"      k={kk:3d}: sv_mean={sv.mean():.4f}, "
+                  f"overlap_frac={(sv ** 2).sum() / kk:.4f}, "
+                  f"principal_angle_mean={np.degrees(angles_rad.mean()):.1f}deg")
+
+        pool_result = {
+            'n_pool': n_pool,
+            'svd_eff_rank': eff_rank_r,
+            'svd_top10': S_r[:10].tolist(),
+            'write_svd_eff_rank': eff_rank_w,
+            'write_svd_top10': S_w[:10].tolist(),
+            'pairwise_cos': {
+                'mean': float(cos_flat.mean()),
+                'std': float(cos_flat.std()),
+                'p5': float(np.percentile(cos_flat, 5)),
+                'p95': float(np.percentile(cos_flat, 95)),
+                'histogram': cos_hist.tolist(),
+                'edges': cos_edges.tolist(),
+            },
+            'covering': {
+                'mean_max_cos': float(max_cos_per_probe.mean()),
+                'min_max_cos': float(max_cos_per_probe.min()),
+                'p5_max_cos': float(np.percentile(max_cos_per_probe, 5)),
+                'histogram': cover_hist.tolist(),
+                'edges': cover_edges.tolist(),
+            },
+            'rw_subspace_overlap': subspace,
+        }
+        results[pool_name] = pool_result
+        rank_compare[pool_name] = {
+            'read_eff_rank': eff_rank_r,
+            'write_eff_rank': eff_rank_w,
+            'ratio_r_over_w': eff_rank_r / (eff_rank_w + 1e-12),
+            'diff_r_minus_w': eff_rank_r - eff_rank_w,
+            'd_model': d_model,
+            'max_rank': min(n_pool, d_model),
+        }
+        print(f"    pairwise cos mean={pool_result['pairwise_cos']['mean']:.4f}, "
+              f"covering mean_max_cos={pool_result['covering']['mean_max_cos']:.4f}")
+
+    results['_rank_compare'] = rank_compare
+
+    _save_json(results, output_dir, 'read_cov', 'read_coverage.json')
+
+    d_model_val = model_cfg['d_model']
+    rank_parts = [f"{pn}_rank={results[pn]['svd_eff_rank']:.1f}/{d_model_val}" for pn in pools]
+    cover_parts = [f"{pn}={results[pn]['covering']['mean_max_cos']:.2f}" for pn in pools]
+    print(f"\n  Summary: {' '.join(rank_parts)}")
+    print(f"           covering_radius: {' '.join(cover_parts)}")
+
+    print("\n  Read vs Write effective rank:")
+    print(f"    {'pool':<6} {'read':>10} {'write':>10} {'R/W':>8} {'R-W':>10}  max_rank")
+    for pn in pools:
+        rc = rank_compare[pn]
+        print(f"    {pn:<6} {rc['read_eff_rank']:>10.1f} {rc['write_eff_rank']:>10.1f} "
+              f"{rc['ratio_r_over_w']:>8.3f} {rc['diff_r_minus_w']:>+10.1f}  {rc['max_rank']}")
+
+    print("\n  Read-Write subspace overlap (mean σ of U_r^T U_w):")
+    header = "    " + f"{'pool':<6}" + "".join([f" k={k:<5}" for k in subspace_ks])
+    print(header)
+    for pn in pools:
+        row = f"    {pn:<6}"
+        for k in subspace_ks:
+            key = f"k={min(k, min(results[pn]['n_pool'], d_model_val))}"
+            sv_mean = results[pn]['rw_subspace_overlap'][key]['sv_mean']
+            row += f" {sv_mean:>6.3f} "
+        print(row)
+
+    print("\n  Done: read_cov")
+    return results
+
+
+# ============================================================
 # §7.1.2 Selection Gini / Concentration per Pool
 # ============================================================
 
@@ -6105,6 +6292,314 @@ def analyze_rw_function_correlation(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# §Val4: Z distribution (quantile) + gate entropy verification
+# ============================================================
+
+def analyze_z_distribution(params, cfg, val_tokens, output_dir,
+                            n_batches=4, batch_size=4, n_token_sample=256):
+    """Phase 4: sampled z-quantile at 50/90/99 for active neurons (z > 0).
+    Also cross-checks gate_entropy. Runs only on mid-layer. Val-data only."""
+    print("\n" + "="*60)
+    print("§Val4: Z Distribution (quantile + entropy)")
+    print("="*60)
+
+    _mod = get_model_module()
+    _layer_norm = _mod._layer_norm
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+
+    pool_params = jax.tree.map(jnp.asarray, params['neuron_pool'])
+    router_params = jax.tree.map(jnp.asarray, params['router'])
+    block_params_list = [jax.tree.map(jnp.asarray, params[f'block_{i}'])
+                         for i in range(n_layers)]
+
+    qk_n = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_n = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_n = pool_params['know_emb'] / (jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    _emb = jnp.asarray(params['token_emb']['embedding'])
+    _pos = jnp.asarray(params['pos_emb']['embedding'])
+
+    mid = n_layers // 2
+
+    def _z_stats(h_proj, tau_offset, emb_unit, sample_T):
+        """Compute z values + quantile + gate_entropy for one pool.
+        h_proj: [B, S, d_route]; tau_offset: [B, S, d_tau]; emb_unit: [N, d_route].
+        Returns (z_q50, z_q90, z_q99, gate_entropy)."""
+        scores = (h_proj @ emb_unit.T).astype(jnp.float32)
+        s_mean = scores.mean(axis=-1, keepdims=True)
+        s_std = jnp.sqrt(jnp.mean(jnp.square(scores - s_mean), axis=-1, keepdims=True)) + 1e-8
+        tau = s_mean + tau_offset * s_std
+        z = (scores - tau) / s_std                              # [B, S, N]
+        phi = 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476))
+        gate = jnp.where(z > 0, z * phi, 0.0)
+        # Sample first sample_T tokens for quantile; flatten active z
+        z_sample = z[:, :sample_T, :].reshape(-1)               # [B*sample_T*N]
+        z_pos = jnp.where(z_sample > 0, z_sample, jnp.nan)
+        q = jnp.nanquantile(z_pos, jnp.array([0.50, 0.90, 0.99]))
+        gsum = gate.sum(axis=-1, keepdims=True) + 1e-8
+        gll = (gate * jnp.log(gate + 1e-8)).sum(axis=-1, keepdims=True)
+        entropy = (-gll / gsum + jnp.log(gsum)).mean()
+        return q[0], q[1], q[2], entropy
+
+    @jax.jit
+    def _pool_stats(input_ids):
+        B, S = input_ids.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = _emb[input_ids.astype(jnp.int32)] + _pos[positions]
+        # Forward to mid layer
+        for i in range(mid):
+            lp = block_params_list[i]
+            normed = _layer_norm(x, lp['norm1']['scale'], lp['norm1']['bias'])
+            h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+            Q = _mod._srw_inference(normed, h_Q, qk_n, tau_all[:, :, 0:1],
+                                    pool_params['qk_read'], pool_params['qk_write'])
+            K = _mod._srw_inference(normed, h_K, qk_n, tau_all[:, :, 1:2],
+                                    pool_params['qk_read'], pool_params['qk_write'])
+            V = _mod._srw_inference(normed, h_V, v_n, tau_all[:, :, 2:3],
+                                    pool_params['v_read'], pool_params['v_write'])
+            n_heads = model_cfg['n_heads']
+            d_head = d_model // n_heads
+            Qh = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kh = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vh = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qh, Kh) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            attn_out = jnp.einsum('bhst,bhtd->bhsd', aw, Vh)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = attn_out @ lp['attn']['expand_O']['kernel']
+            x = x + attn_out
+            normed2 = _layer_norm(x, lp['norm2']['scale'], lp['norm2']['bias'])
+            h_k = normed2 @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+            tau_k = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+            know_out = _mod._srw_inference(normed2, h_k, know_n, tau_k,
+                                           pool_params['know_read'], pool_params['know_write'])
+            x = x + know_out
+
+        # At mid-layer pre-block
+        normed = _layer_norm(x, block_params_list[mid]['norm1']['scale'],
+                             block_params_list[mid]['norm1']['bias'])
+        h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+        q_q = _z_stats(h_Q, tau_all[:, :, 0:1], qk_n, n_token_sample)
+        k_q = _z_stats(h_K, tau_all[:, :, 1:2], qk_n, n_token_sample)
+        v_q = _z_stats(h_V, tau_all[:, :, 2:3], v_n, n_token_sample)
+        normed2 = _layer_norm(x, block_params_list[mid]['norm2']['scale'],
+                              block_params_list[mid]['norm2']['bias'])
+        h_k = normed2 @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+        tau_k = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+        know_q = _z_stats(h_k, tau_k, know_n, n_token_sample)
+        return q_q, k_q, v_q, know_q
+
+    # Prepare val batches
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    total_seqs = min(n_batches * batch_size, n_seqs)
+    tokens = jnp.array(tokens[:total_seqs], dtype=jnp.int32)
+
+    agg = {'Q': [], 'K': [], 'V': [], 'Know': []}
+    for b in range(min(n_batches, total_seqs // batch_size)):
+        batch = tokens[b * batch_size: (b + 1) * batch_size]
+        qr, kr, vr, kwr = _pool_stats(batch)
+        agg['Q'].append([float(x) for x in qr])
+        agg['K'].append([float(x) for x in kr])
+        agg['V'].append([float(x) for x in vr])
+        agg['Know'].append([float(x) for x in kwr])
+        print(f"  batch {b+1}: Q q50={qr[0]:.3f} q90={qr[1]:.3f} q99={qr[2]:.3f} ent={qr[3]:.2f}")
+
+    out = {}
+    for pool_name, rows in agg.items():
+        arr = np.array(rows)  # [n_batches, 4]
+        out[pool_name] = {
+            'z_q50': float(arr[:, 0].mean()),
+            'z_q90': float(arr[:, 1].mean()),
+            'z_q99': float(arr[:, 2].mean()),
+            'gate_entropy': float(arr[:, 3].mean()),
+            'layer': mid,
+            'n_batches': len(rows),
+        }
+        print(f"  {pool_name:4s}: z_q50={out[pool_name]['z_q50']:.3f}"
+              f" z_q90={out[pool_name]['z_q90']:.3f}"
+              f" z_q99={out[pool_name]['z_q99']:.3f}"
+              f" entropy={out[pool_name]['gate_entropy']:.2f}")
+
+    _save_json(out, output_dir, 'z_dist', 'z_distribution.json')
+    print("  Done: z_dist")
+    return out
+
+
+# ============================================================
+# §Val5: tau gradient — task loss vs aux loss decomposition
+# ============================================================
+
+def analyze_tau_gradient_split(params, cfg, val_tokens, output_dir,
+                                model_file="models.dawn_spatial_v401_exp",
+                                n_batches=2, batch_size=4):
+    """Phase 5: jax.grad(task_loss, tau_*) vs jax.grad(aux_loss, tau_*).
+    Reports Frobenius norm of tau_attn / tau_know gradients from each path."""
+    print("\n" + "="*60)
+    print("§Val5: Tau Gradient Split (task vs aux)")
+    print("="*60)
+
+    model = build_model(cfg, model_file)
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    params_j = jax.tree.map(jnp.asarray, params)
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    total_seqs = min(n_batches * batch_size, n_seqs)
+    tokens = jnp.array(tokens[:total_seqs], dtype=jnp.int32)
+
+    def _tau_norm(grad_tree):
+        ta = grad_tree['router']['tau_attn']
+        tk = grad_tree['router']['tau_know']
+        return float(jnp.sqrt(
+            jnp.sum(ta['kernel'] ** 2) + jnp.sum(ta['bias'] ** 2) +
+            jnp.sum(tk['kernel'] ** 2) + jnp.sum(tk['bias'] ** 2)
+        ))
+
+    @jax.jit
+    def _task_grad(p, input_ids, attention_mask, labels, rng):
+        def loss_fn(p_):
+            r = model.apply({'params': p_}, input_ids, labels=labels,
+                             attention_mask=attention_mask, deterministic=True,
+                             rngs={'dropout': rng})
+            return r['loss']
+        return jax.grad(loss_fn)(p)
+
+    @jax.jit
+    def _aux_grad(p, input_ids, attention_mask, labels, rng):
+        def loss_fn(p_):
+            r = model.apply({'params': p_}, input_ids, labels=labels,
+                             attention_mask=attention_mask, deterministic=True,
+                             rngs={'dropout': rng})
+            return r['aux_loss']
+        return jax.grad(loss_fn)(p)
+
+    task_norms, aux_norms = [], []
+    eval_rng = jax.random.PRNGKey(0)
+    for b in range(min(n_batches, total_seqs // batch_size)):
+        batch = tokens[b * batch_size: (b + 1) * batch_size]
+        mask = jnp.ones_like(batch)
+        labels = jnp.where(mask == 1, batch, -100)
+        t_grad = _task_grad(params_j, batch, mask, labels, eval_rng)
+        a_grad = _aux_grad(params_j, batch, mask, labels, eval_rng)
+        tn = _tau_norm(t_grad)
+        an = _tau_norm(a_grad)
+        task_norms.append(tn)
+        aux_norms.append(an)
+        print(f"  batch {b+1}: task_tau_grad={tn:.4e} aux_tau_grad={an:.4e}"
+              f" ratio={tn / (an + 1e-12):.3f}")
+
+    tn_mean = float(np.mean(task_norms))
+    an_mean = float(np.mean(aux_norms))
+    result = {
+        'task_tau_grad_norm': tn_mean,
+        'aux_tau_grad_norm': an_mean,
+        'ratio_task_over_aux': tn_mean / (an_mean + 1e-12),
+        'per_batch': {'task': task_norms, 'aux': aux_norms},
+    }
+    print(f"\n  Summary: task={tn_mean:.4e} aux={an_mean:.4e} ratio={result['ratio_task_over_aux']:.3f}")
+    print("  (ratio >> 1 = task dominates tau; ~1 = balanced; << 1 = aux dominates)")
+    _save_json(result, output_dir, 'tau_grad', 'tau_grad_split.json')
+    print("  Done: tau_grad")
+    return result
+
+
+# ============================================================
+# §P1: Emb pairwise cosine (sampled) + write direction + R/W orthogonality
+# ============================================================
+
+def analyze_pool_geometry(params, cfg, output_dir, n_samples=200):
+    """Offline pool-geometry audit for qk/v/know pools:
+      (3) pairwise cosine similarity of emb vectors (n_samples random pairs)
+      (5) write direction anisotropy: ||write.mean(axis=0)||
+          (1=all aligned, 0=uniform)
+      (6) read-write orthogonality: per-neuron cos(read_j, write_j) mean + std
+    Pure offline analysis — checkpoint-only, no forward pass."""
+    print("\n" + "="*60)
+    print("§P1: Pool geometry (emb pairwise cos / write aniso / r-w angle)")
+    print("="*60)
+
+    pool = params['neuron_pool']
+    results = {}
+    rng = np.random.default_rng(42)
+
+    for pool_name, prefix in [('QK', 'qk'), ('V', 'v'), ('Know', 'know')]:
+        emb = np.asarray(pool[f'{prefix}_emb'])        # [N, d_route]
+        read = np.asarray(pool[f'{prefix}_read'])      # [N, d_model]
+        write = np.asarray(pool[f'{prefix}_write'])    # [N, d_model]
+        N = emb.shape[0]
+
+        # (3) Emb pairwise cosine (sampled pairs; N² would be too large)
+        idx_i = rng.integers(0, N, size=n_samples)
+        idx_j = rng.integers(0, N, size=n_samples)
+        same = idx_i == idx_j
+        idx_j[same] = (idx_j[same] + 1) % N             # ensure i != j
+        e_i = emb[idx_i] / (np.linalg.norm(emb[idx_i], axis=-1, keepdims=True) + 1e-8)
+        e_j = emb[idx_j] / (np.linalg.norm(emb[idx_j], axis=-1, keepdims=True) + 1e-8)
+        emb_cos = (e_i * e_j).sum(axis=-1)
+        emb_cos_mean = float(emb_cos.mean())
+        emb_cos_std = float(emb_cos.std())
+        emb_cos_abs_mean = float(np.abs(emb_cos).mean())
+
+        # (5) Write direction anisotropy
+        w_unit = write / (np.linalg.norm(write, axis=-1, keepdims=True) + 1e-8)
+        write_mean_norm = float(np.linalg.norm(w_unit.mean(axis=0)))
+        r_unit = read / (np.linalg.norm(read, axis=-1, keepdims=True) + 1e-8)
+        read_mean_norm = float(np.linalg.norm(r_unit.mean(axis=0)))
+
+        # (6) Read-write per-neuron orthogonality
+        rw_cos = (r_unit * w_unit).sum(axis=-1)         # [N]
+        rw_cos_mean = float(rw_cos.mean())
+        rw_cos_std = float(rw_cos.std())
+        rw_cos_abs_mean = float(np.abs(rw_cos).mean())
+        rw_aligned = float((rw_cos > 0.5).mean())       # fraction aligned (>0)
+        rw_anti = float((rw_cos < -0.5).mean())         # fraction anti-aligned
+
+        results[pool_name] = {
+            'N': int(N),
+            'emb_pairwise_cos_mean': emb_cos_mean,
+            'emb_pairwise_cos_std': emb_cos_std,
+            'emb_pairwise_cos_abs_mean': emb_cos_abs_mean,
+            'write_mean_dir_norm': write_mean_norm,
+            'read_mean_dir_norm': read_mean_norm,
+            'rw_cos_mean': rw_cos_mean,
+            'rw_cos_std': rw_cos_std,
+            'rw_cos_abs_mean': rw_cos_abs_mean,
+            'rw_aligned_frac': rw_aligned,
+            'rw_antialigned_frac': rw_anti,
+            'n_sample_pairs': int(n_samples),
+        }
+
+        print(f"\n  {pool_name} (N={N}):")
+        print(f"    emb pairwise cos ({n_samples} pairs): mean={emb_cos_mean:+.4f}"
+              f" std={emb_cos_std:.4f} |mean|={emb_cos_abs_mean:.4f}")
+        print(f"    write mean-direction |μ|={write_mean_norm:.4f}"
+              f" (1 → all same dir, 0 → uniform on sphere)")
+        print(f"    read  mean-direction |μ|={read_mean_norm:.4f}")
+        print(f"    r-w cos: mean={rw_cos_mean:+.4f} std={rw_cos_std:.4f}"
+              f" |mean|={rw_cos_abs_mean:.4f}")
+        print(f"    r-w aligned(cos>0.5)={rw_aligned*100:.1f}%"
+              f"  anti(cos<-0.5)={rw_anti*100:.1f}%")
+
+    _save_json(results, output_dir, 'pool_geometry', 'pool_geometry.json')
+    print("\n  Done: pool_geom")
+    return results
+
+
+# ============================================================
 # z/phi/gate histogram JIT forward (gate_ci 전용)
 # ============================================================
 
@@ -6444,7 +6939,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,sel_gini,sel_trans,combo,addit,dom_supp,rw_func")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,read_cov,rw_cov,sel_gini,sel_trans,combo,addit,dom_supp,rw_func,z_dist,tau_grad,pool_geom")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -6479,6 +6974,20 @@ def main():
 
     only = set(args.only.split(',')) if args.only else None
     skip = set(args.skip.split(',')) if args.skip else set()
+
+    # Meta-aliases: expand shorthand into constituent analyses.
+    _only_aliases = {
+        'rw_cov': {'write_cov', 'read_cov'},
+    }
+    if only is not None:
+        for alias, members in _only_aliases.items():
+            if alias in only:
+                only.discard(alias)
+                only.update(members)
+    for alias, members in _only_aliases.items():
+        if alias in skip:
+            skip.discard(alias)
+            skip.update(members)
 
     def _should_run(name):
         """Check if analysis 'name' should run based on --only and --skip."""
@@ -6710,6 +7219,9 @@ def main():
     if _should_run('write_cov'):
         analyze_write_coverage(params, cfg, args.output)
 
+    if _should_run('read_cov'):
+        analyze_read_coverage(params, cfg, args.output)
+
     if _should_run('sel_gini'):
         if val_tokens is not None:
             analyze_selection_gini(params, cfg, val_tokens, args.output,
@@ -6749,6 +7261,24 @@ def main():
                                              n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping rw_func (no --val_data)")
+
+    if _should_run('z_dist'):
+        if val_tokens is not None:
+            analyze_z_distribution(params, cfg, val_tokens, args.output,
+                                    n_batches=_nb or 4, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping z_dist (no --val_data)")
+
+    if _should_run('tau_grad'):
+        if val_tokens is not None:
+            analyze_tau_gradient_split(params, cfg, val_tokens, args.output,
+                                        model_file=args.model_file,
+                                        n_batches=_nb or 2, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping tau_grad (no --val_data)")
+
+    if _should_run('pool_geom'):
+        analyze_pool_geometry(params, cfg, args.output, n_samples=200)
 
     print(f"\nDone. Results in {args.output}/")
 
