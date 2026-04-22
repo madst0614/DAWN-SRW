@@ -744,7 +744,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _asym = jnp.float32(exploration_asymmetry)
 
     @jax.jit
-    def train_step(params, opt_state, input_ids, attention_mask, dropout_key):
+    def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
+                   prev_emb_snap):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
 
         def loss_fn(params):
@@ -933,6 +934,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_norm = jnp.sqrt(
             sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
 
+        # Emb drift is computed inside jit so every host participates in the
+        # norm collective. A host-0-only version halts the launch group on
+        # multi-host meshes.
+        _cur_qk = new_params['neuron_pool']['qk_emb']
+        _cur_v = new_params['neuron_pool']['v_emb']
+        _cur_know = new_params['neuron_pool']['know_emb']
+        _prev_qk = prev_emb_snap['qk_emb']
+        _prev_v = prev_emb_snap['v_emb']
+        _prev_know = prev_emb_snap['know_emb']
+        drift_qk_emb = (jnp.linalg.norm(_cur_qk - _prev_qk)
+                        / (jnp.linalg.norm(_prev_qk) + 1e-8))
+        drift_v_emb = (jnp.linalg.norm(_cur_v - _prev_v)
+                       / (jnp.linalg.norm(_prev_v) + 1e-8))
+        drift_know_emb = (jnp.linalg.norm(_cur_know - _prev_know)
+                          / (jnp.linalg.norm(_prev_know) + 1e-8))
+
         # Tau bias (read inside jit — safe, no cross-device issue)
         tau_know_b = params.get('router', {}).get('tau_know', {}).get(
             'bias', jnp.zeros(1))
@@ -1089,6 +1106,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_int_max': result.get('know_int_max', jnp.float32(0.0)),
             'attn_int_cap_frac': result.get('attn_int_cap_frac', jnp.float32(0.0)),
             'know_int_cap_frac': result.get('know_int_cap_frac', jnp.float32(0.0)),
+            # Emb drift (relative L2) since prev snapshot — see top of fn.
+            'drift_qk_emb': drift_qk_emb,
+            'drift_v_emb': drift_v_emb,
+            'drift_know_emb': drift_know_emb,
         }
 
         return new_params, new_opt_state, metrics
@@ -1997,10 +2018,19 @@ def main():
             data_sharding, global_shape)
         rng, dummy_step_rng = jax.random.split(rng)
 
+        # Initial emb-drift snapshot: pytree of sharded refs matching
+        # params['neuron_pool'][*_emb]. Identity here → drift=0 on first step.
+        _dummy_emb_snap = {
+            'qk_emb': params['neuron_pool']['qk_emb'],
+            'v_emb': params['neuron_pool']['v_emb'],
+            'know_emb': params['neuron_pool']['know_emb'],
+        }
+
         # First call: JIT compilation (slow)
         jit_start = time.time()
         _dp, _do, dummy_metrics = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng)
+            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng,
+            _dummy_emb_snap)
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         jit_loss = float(dummy_metrics['total_loss'])
@@ -2014,7 +2044,8 @@ def main():
         rng, dummy_step_rng2 = jax.random.split(rng)
         step_start = time.time()
         _dp2, _do2, dummy_metrics2 = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2)
+            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
+            _dummy_emb_snap)
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
@@ -2473,8 +2504,14 @@ def main():
     ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
-    # Emb drift snapshot (sense vectors) — updated every LOG_INTERVAL on host 0.
-    _prev_emb_snap = None
+    # Emb drift snapshot (sense vectors). Held on every host, refreshed at
+    # each log event. Fed into train_step so the drift collective runs inside
+    # jit on all hosts; the actual ||·|| reductions live there.
+    _prev_emb_snap = {
+        'qk_emb': params['neuron_pool']['qk_emb'],
+        'v_emb': params['neuron_pool']['v_emb'],
+        'know_emb': params['neuron_pool']['know_emb'],
+    }
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
@@ -2512,7 +2549,7 @@ def main():
 
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
-                input_ids, attention_mask, step_rng)
+                input_ids, attention_mask, step_rng, _prev_emb_snap)
 
             # Extract metrics (scalars from jit, no [0] indexing)
             def _m(v):
@@ -2555,6 +2592,15 @@ def main():
             # ---- Periodic logging (host 0 only) ----
             _early_debug = global_step in (1, 5, 10, 20, 50)
             if global_step % LOG_INTERVAL == 0 or _early_debug or debug_mode:
+                # Refresh emb-drift snapshot on every host (ref reassignment
+                # only — no collective). Must run outside is_host0 so the
+                # next jit'd train_step sees a consistent snap pytree on all
+                # hosts.
+                _prev_emb_snap = {
+                    'qk_emb': params['neuron_pool']['qk_emb'],
+                    'v_emb': params['neuron_pool']['v_emb'],
+                    'know_emb': params['neuron_pool']['know_emb'],
+                }
                 if is_host0:
                     elapsed = time.time() - win_start_time
                     steps_per_sec = win_count / elapsed if elapsed > 0 else 0
@@ -2787,32 +2833,16 @@ def main():
                             f" qk[{qk_emb_nmean:.3f}/{qk_emb_nstd:.3f} min={qk_emb_nmin:.3f}]"
                             f" v[{v_emb_nmean:.3f}/{v_emb_nstd:.3f} min={v_emb_nmin:.3f}]")
 
-                        # Emb drift (relative L2 change since last LOG_INTERVAL snapshot).
-                        drift_qk = drift_v = drift_know = 0.0
-                        try:
-                            pool_now = params['neuron_pool']
-                            cur_qk = pool_now['qk_emb']
-                            cur_v = pool_now['v_emb']
-                            cur_know = pool_now['know_emb']
-                            if _prev_emb_snap is not None:
-                                p_qk, p_v, p_know = _prev_emb_snap
-                                drift_qk = float(
-                                    jnp.linalg.norm(cur_qk - p_qk)
-                                    / (jnp.linalg.norm(p_qk) + 1e-8))
-                                drift_v = float(
-                                    jnp.linalg.norm(cur_v - p_v)
-                                    / (jnp.linalg.norm(p_v) + 1e-8))
-                                drift_know = float(
-                                    jnp.linalg.norm(cur_know - p_know)
-                                    / (jnp.linalg.norm(p_know) + 1e-8))
-                                log_message(
-                                    f"      drift ({LOG_INTERVAL}step):"
-                                    f" qk_emb={drift_qk:.4e}"
-                                    f" v_emb={drift_v:.4e}"
-                                    f" know_emb={drift_know:.4e}")
-                            _prev_emb_snap = (cur_qk, cur_v, cur_know)
-                        except Exception as _drift_err:
-                            log_message(f"      drift: failed ({_drift_err})")
+                        # Emb drift: reduced inside train_step (all hosts),
+                        # so here we just read scalar metrics.
+                        drift_qk = _m(metrics.get('drift_qk_emb', 0.0))
+                        drift_v = _m(metrics.get('drift_v_emb', 0.0))
+                        drift_know = _m(metrics.get('drift_know_emb', 0.0))
+                        log_message(
+                            f"      drift ({LOG_INTERVAL}step):"
+                            f" qk_emb={drift_qk:.4e}"
+                            f" v_emb={drift_v:.4e}"
+                            f" know_emb={drift_know:.4e}")
                         # v4.1: aux line removed (lb_weight=0 → no loss contribution).
                         k_raw_n = _m(metrics.get('know_raw_out_norm', 0.0))
                         a_qk_raw_n = _m(metrics.get('attn_qk_raw_norm', 0.0))
