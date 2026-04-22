@@ -1057,13 +1057,16 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
     """Run evaluation and return avg loss and accuracy.
 
     All hosts must call this (pmap requires it), but only verbose=True host prints.
+    Accumulates on device — one TPU→CPU sync at the end instead of three
+    per batch — so eval stays fast on 1B-scale runs.
     """
-    total_loss = 0.0
-    total_correct = 0
-    total_valid = 0
+    total_loss_jax = jnp.float32(0.0)
+    total_correct_jax = jnp.int32(0)
+    total_valid_jax = jnp.int32(0)
 
     eval_total = min(max_batches, len(val_loader))
     eval_start = time.time()
+    batch_idx = -1
 
     for batch_idx, (input_ids, attention_mask) in enumerate(val_loader):
         if batch_idx >= max_batches:
@@ -1077,13 +1080,21 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
 
         ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
 
-        n_valid = int(valid_count)
-        total_loss += float(ce_loss) * n_valid
-        total_correct += int(correct)
-        total_valid += n_valid
+        total_loss_jax = total_loss_jax + ce_loss * valid_count.astype(jnp.float32)
+        total_correct_jax = total_correct_jax + correct
+        total_valid_jax = total_valid_jax + valid_count
+
+    totals = jax.device_get({
+        'loss': total_loss_jax,
+        'correct': total_correct_jax,
+        'valid': total_valid_jax,
+    })
+    total_loss = float(totals['loss'])
+    total_correct = int(totals['correct'])
+    total_valid = int(totals['valid'])
 
     eval_elapsed = time.time() - eval_start
-    done = min(batch_idx + 1, eval_total)
+    done = min(batch_idx + 1, eval_total) if batch_idx >= 0 else 0
     if verbose:
         print(f"  Eval: {done}/{eval_total} batches, {eval_elapsed:.1f}s", flush=True)
     avg_loss = total_loss / total_valid if total_valid > 0 else 0.0
