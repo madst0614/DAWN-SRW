@@ -41,7 +41,7 @@ model:
   # equivalent to stochastically dimming all neuron scores along
   # that axis -- horizontal search (area-shift) complement to
   # tau's vertical search (water-level).
-  router_dropout: 0.05
+  router_dropout: 0.02
 
 training:
   batch_size: 128
