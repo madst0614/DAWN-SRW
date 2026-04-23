@@ -111,7 +111,8 @@ Architecture:
   DAWN                 -- embedding + jax.lax.scan + weight-tied lm_head
 
 Changelog:
-  spatial-r1-v4.1 (2026-04-21; emb forward-norm reverted 2026-04-23):
+  spatial-r1-v4.1 (2026-04-21; emb forward-norm reverted 2026-04-23;
+                   read/write forward-norm removed 2026-04-23):
     - Two-stage gate: activation × intensity with ACTIVATION_CUTOFF.
     - Dynamic tau + raw_alpha params removed entirely.
     - Den = Σ intensity; dead threshold 1e-4 → 0.01.
@@ -121,6 +122,16 @@ Changelog:
       magnitude can drive competitive sparsity (qk active regime ~5-6%,
       vs ~28% under forward unit-norm). read / write still
       forward-normalise per chunk; init still unit_norm_init.
+    - 2026-04-23 (free-norm): read/write forward unit-norm also removed.
+      All three pool tensors (emb / read / write) are now free-norm —
+      each neuron has three independent magnitude axes:
+        emb_norm   → routing influence
+        read_norm  → input sensitivity
+        write_norm → output strength
+      Regulated by per-group weight decay in the optimizer
+      (pool_weight_decay ≪ base weight_decay; see train_jax.py). CE
+      self-regulates: output-saturating neurons raise loss, so
+      magnitudes don't run away without the forward-norm guard.
 
   spatial-r1-v4.0.6 (2026-04-20):
     - Gate confidence: Φ(z) (normal CDF) → sigmoid(scores - tau).
@@ -486,8 +497,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-            rc = rc / (jnp.linalg.norm(rc, axis=-1, keepdims=True) + 1e-8)
-            wc = wc / (jnp.linalg.norm(wc, axis=-1, keepdims=True) + 1e-8)
+            # v4.1 free-norm (2026-04-23): r/w magnitude is a learnable DoF,
+            # regulated by pool_weight_decay. Forward no longer re-normalises.
+            # rc, wc used as-is from slice.
             scores = h_bf @ ec.T
             scores_f = scores.astype(jnp.float32)
             # v4.1 two-stage gate.
@@ -764,8 +776,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-            rc = rc / (jnp.linalg.norm(rc, axis=-1, keepdims=True) + 1e-8)
-            wc = wc / (jnp.linalg.norm(wc, axis=-1, keepdims=True) + 1e-8)
+            # v4.1 free-norm (2026-04-23): r/w magnitude is a learnable DoF,
+            # regulated by pool_weight_decay. Forward no longer re-normalises.
+            # rc, wc used as-is from slice.
             scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             scores_f = scores.astype(jnp.float32)
             # v4.1 two-stage gate.
@@ -1715,8 +1728,9 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     intensity = EPSILON + jnp.minimum(active_margin, MAX_INTENSITY)
     gate = activation * intensity
 
-    r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
-    w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
+    # v4.1 free-norm: read / write used as-is.
+    r_n = w_read
+    w_n = w_write
     xr = x @ r_n.T
     raw_out = (gate.astype(scores.dtype) * xr) @ w_n
     den = jnp.maximum(intensity.sum(axis=-1, keepdims=True), 1.0)
@@ -1745,8 +1759,9 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = activation * intensity
     gate_norm = gate / jnp.maximum(gate.sum(axis=-1, keepdims=True), 1e-8)
 
-    r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
-    w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
+    # v4.1 free-norm: read / write used as-is.
+    r_n = w_read
+    w_n = w_write
     xr = x @ r_n.T
     raw_out = (gate.astype(scores.dtype) * xr) @ w_n
     den = jnp.maximum(intensity.sum(axis=-1, keepdims=True), 1.0)
@@ -2258,8 +2273,9 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if mult is not None:
             gate = gate * mult[None, None, :]
             z_pos = z_pos * mult[None, None, :]
-        r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
-        w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
+        # v4.1 free-norm: read / write used as-is.
+        r_n = w_read
+        w_n = w_write
         xr = x @ r_n.T
         out = (gate.astype(scores.dtype) * xr) @ w_n
         z_sum = z_pos.sum(axis=-1, keepdims=True)

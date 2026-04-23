@@ -49,6 +49,7 @@ training:
   num_epochs: 1
   lr: 0.00065
   weight_decay: 0.1
+  pool_weight_decay: 0.02    # free-norm pool params (emb/read/write) softer WD
   warmup_ratio: 0.06
   diversity_weight: 0.1
   load_balance_weight: 0.0

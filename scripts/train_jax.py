@@ -1360,6 +1360,10 @@ def main():
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
     weight_decay = tcfg.get('weight_decay', 0.1)
+    # v4.1 free-norm: pool params (qk/v/know × emb/read/write, 9 tensors)
+    # get a lower WD than dense kernels. Bias / LayerNorm / *_scale
+    # excluded from both groups.
+    pool_weight_decay = tcfg.get('pool_weight_decay', 0.02)
     warmup_ratio = tcfg.get('warmup_ratio', 0.06)
     orth_weight = tcfg.get('orthogonality_weight', 0.01)
     div_weight = tcfg.get('diversity_weight', 0.1)
@@ -1548,6 +1552,8 @@ def main():
             if cli_args.lr is None:
                 lr = saved_training_config.get('lr', lr)
             weight_decay = saved_training_config.get('weight_decay', weight_decay)
+            pool_weight_decay = saved_training_config.get(
+                'pool_weight_decay', pool_weight_decay)
             warmup_ratio = saved_training_config.get('warmup_ratio', warmup_ratio)
             orth_weight = saved_training_config.get('orthogonality_weight', orth_weight)
             div_weight = saved_training_config.get('diversity_weight', div_weight)
@@ -1575,6 +1581,7 @@ def main():
         'num_epochs': num_epochs,
         'lr': lr,
         'weight_decay': weight_decay,
+        'pool_weight_decay': pool_weight_decay,
         'warmup_ratio': warmup_ratio,
         'orthogonality_weight': orth_weight,
         'diversity_weight': div_weight,
@@ -1703,31 +1710,85 @@ def main():
         end_value=lr * 0.1,
     )
 
-    # WD mask: exclude bias, layernorm, and output_scale params
-    # Only apply mask if model has learnable scale params (v3.9.7.1+)
-    _has_scale = 'qk_scale' in params.get('neuron_pool', {}) or \
-                 'know_scale' in params.get('neuron_pool', {})
-    _wd_mask_fn = None
-    if _has_scale:
-        def _wd_mask(params):
-            def _should_decay(path, _):
-                path_str = '/'.join(str(p) for p in path)
-                if 'bias' in path_str:
-                    return False
-                if 'scale' in path_str and 'norm' in path_str.lower():
-                    return False  # LayerNorm scale
-                if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
-                   or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
-                    return False  # learnable output_scale
-                return True
-            return jax.tree.map_with_path(_should_decay, params)
-        _wd_mask_fn = _wd_mask
+    # v4.1 per-group WD: pool tensors (qk/v/know × emb/read/write) get
+    # pool_weight_decay; dense kernels get weight_decay. Bias / LayerNorm /
+    # learnable *_scale excluded from both groups.
+    #
+    # optax.adamw is chain(scale_by_adam, add_decayed_weights, scale_by_lr).
+    # To apply two different WDs we decompose it: one scale_by_adam, then
+    # two masked add_decayed_weights (base + pool — masks are disjoint so
+    # each param is touched at most once), then a single scale_by_lr.
+
+    _POOL_PARAM_NAMES = (
+        'qk_emb', 'v_emb', 'know_emb',
+        'qk_read', 'v_read', 'know_read',
+        'qk_write', 'v_write', 'know_write',
+    )
+
+    def _path_str(path):
+        return '/'.join(str(p) for p in path)
+
+    def _is_pool_param(path_str):
+        return any(name in path_str for name in _POOL_PARAM_NAMES)
+
+    def _is_excluded(path_str):
+        if 'bias' in path_str:
+            return True
+        if 'scale' in path_str and 'norm' in path_str.lower():
+            return True  # LayerNorm scale
+        if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
+           or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
+            return True  # learnable output_scale
+        return False
+
+    def _wd_mask_base(params):
+        def _f(path, _):
+            ps = _path_str(path)
+            if _is_excluded(ps):
+                return False
+            return not _is_pool_param(ps)
+        return jax.tree.map_with_path(_f, params)
+
+    def _wd_mask_pool(params):
+        def _f(path, _):
+            ps = _path_str(path)
+            if _is_excluded(ps):
+                return False
+            return _is_pool_param(ps)
+        return jax.tree.map_with_path(_f, params)
 
     base_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, weight_decay=weight_decay, b2=0.95,
-                    mask=_wd_mask_fn),
+        optax.scale_by_adam(b2=0.95),
+        optax.add_decayed_weights(weight_decay, mask=_wd_mask_base),
+        optax.add_decayed_weights(pool_weight_decay, mask=_wd_mask_pool),
+        optax.scale_by_learning_rate(schedule),
     )
+
+    if is_host0:
+        def _count_true(mask):
+            n = [0]
+            def _f(_, v):
+                if v:
+                    n[0] += 1
+                return v
+            jax.tree.map(_f, mask)
+            return n[0]
+        def _collect_pool_paths(mask):
+            out = []
+            def _f(path, v):
+                if v:
+                    out.append(_path_str(path))
+                return v
+            jax.tree.map_with_path(_f, mask)
+            return out
+        _base_mask = _wd_mask_base(params)
+        _pool_mask = _wd_mask_pool(params)
+        print(f"  WD groups: base ({weight_decay}) = {_count_true(_base_mask)} tensors, "
+              f"pool ({pool_weight_decay}) = {_count_true(_pool_mask)} tensors")
+        _pool_paths = _collect_pool_paths(_pool_mask)
+        if _pool_paths:
+            print(f"    pool params: {_pool_paths[:9]}")
 
     if grad_accum_steps > 1:
         optimizer = optax.MultiSteps(base_optimizer, every_k_schedule=grad_accum_steps)
@@ -1750,7 +1811,7 @@ def main():
         print(f"  Total optimizer steps: {total_steps}")
         print(f"  Warmup steps: {warmup_steps}")
         print(f"  LR: {lr}")
-        print(f"  Weight decay: {weight_decay}")
+        print(f"  Weight decay: {weight_decay} (pool: {pool_weight_decay})")
         print(f"  Orth weight: {orth_weight}")
         print(f"  Div weight: {div_weight}")
         print(f"  LB weight: {lb_weight}")
