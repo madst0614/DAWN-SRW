@@ -1758,6 +1758,19 @@ def main():
         print(f"  Dead penalty weight: {dead_penalty_weight}")
         print(f"  Exploration weight: {exploration_weight} "
               f"(asymmetry={exploration_asymmetry})")
+        print(f"    warmup_steps={exploration_warmup_steps} "
+              f"bounds=[{exploration_lower_bound}, {exploration_upper_bound}] "
+              f"eps={exploration_bound_eps}")
+        print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
+              f"router={cfg['model'].get('router_dropout', 0.0)}")
+        # v4.1+ gate closure constants (used when model_version registers
+        # _v41_sharded_kwargs; harmless to print otherwise — they're just
+        # cfg lookups with defaults).
+        print(f"  Gate (v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
+              f"act_thr={tcfg.get('activation_threshold', 0.5)} "
+              f"act_cut={tcfg.get('activation_cutoff', 0.01)} "
+              f"eps={tcfg.get('epsilon', 1.0e-4)} "
+              f"max_int={tcfg.get('max_intensity', 10.0)}")
 
     # ----------------------------------------------------------
     # Resume from checkpoint (resume_path detected earlier for config override)
