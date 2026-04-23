@@ -1768,7 +1768,7 @@ def main():
     if is_host0:
         def _count_true(mask):
             n = [0]
-            def _f(_, v):
+            def _f(v):
                 if v:
                     n[0] += 1
                 return v
