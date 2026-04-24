@@ -62,7 +62,9 @@ from models.dawn_spatial_v41_exp import DAWN as DAWN_V41
 # Constants
 # ============================================================
 
-LOG_INTERVAL = 100
+# Log cadence is config-driven: see log_interval_fast / log_deep_multiplier /
+# log_analysis_multiplier in `training:`. The legacy module-level LOG_INTERVAL
+# constant was removed.
 
 
 # ============================================================
@@ -729,24 +731,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
-        # Re-project neuron pool vectors to unit norm after optimizer step
-        def normalize_pool_params(params):
-            pool = params['neuron_pool']
-            norm_keys = [
-                'qk_read', 'v_read', 'know_read',
-                'qk_write', 'v_write', 'know_write',
-                'qk_emb', 'v_emb', 'know_emb',
-            ]
-            new_pool = dict(pool)
-            for key in norm_keys:
-                w = new_pool[key]
-                new_pool[key] = w / (jnp.linalg.norm(w, axis=-1, keepdims=True) + 1e-8)
-            return {**params, 'neuron_pool': new_pool}
-
-        # v3.9.4: re-projection disabled — forward unit-norm handles normalization,
-        # param norm freedom provides implicit gradient scaling regularization
-        # new_params = normalize_pool_params(new_params)
-
         grad_norm = jnp.sqrt(
             sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
 
@@ -784,38 +768,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_norm': grad_norm,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'know_aux': result.get('know_aux', jnp.float32(0.0)),
+            # Core activity (v4.1).
             'know_active': result.get('know_active', jnp.float32(0.0)),
-            'know_active_N': result.get('know_active_N', jnp.float32(0.0)),
+            'know_strong': result.get('know_strong', jnp.float32(0.0)),
             'know_score_std': result.get('know_score_std', jnp.float32(0.0)),
-            'know_raw_gate_max': result.get('know_gate_max', result.get('know_raw_gate_max', jnp.float32(0.0))),
+            'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
-            'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
             'know_active_n_mean': result.get('know_active_n_mean', jnp.float32(0.0)),
-            'know_strong': result.get('know_strong', result.get('know_pos', jnp.float32(0.0))),
-            'know_strength_mean': result.get('know_strength_mean', jnp.float32(0.0)),
-            'know_strength_std': result.get('know_strength_std', jnp.float32(0.0)),
-            'know_strength_min': result.get('know_strength_min', jnp.float32(0.0)),
-            'know_strength_max': result.get('know_strength_max', jnp.float32(0.0)),
-            'know_logit_mean': result.get('know_logit_mean', jnp.float32(0.0)),
-            'know_logit_std': result.get('know_logit_std', jnp.float32(0.0)),
             'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
-            'attn_active_N': result.get('attn_active_N', jnp.float32(0.0)),
+            'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
             'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
-            'attn_raw_gate_max': result.get('attn_gate_max', result.get('attn_raw_gate_max', jnp.float32(0.0))),
+            'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
-            'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
             'attn_active_n_mean': result.get('attn_active_n_mean', jnp.float32(0.0)),
-            'attn_strong': result.get('attn_strong', result.get('attn_pos', jnp.float32(0.0))),
-            'attn_qk_pos': result.get('attn_qk_pos', jnp.float32(0.0)),
-            'attn_v_pos': result.get('attn_v_pos', jnp.float32(0.0)),
-            'attn_v_strength_mean': result.get('attn_v_strength_mean', jnp.float32(0.0)),
-            'attn_v_strength_std': result.get('attn_v_strength_std', jnp.float32(0.0)),
-            'attn_v_strength_min': result.get('attn_v_strength_min', jnp.float32(0.0)),
-            'attn_v_strength_max': result.get('attn_v_strength_max', jnp.float32(0.0)),
-            'attn_v_logit_mean': result.get('attn_v_logit_mean', jnp.float32(0.0)),
-            'attn_v_logit_std': result.get('attn_v_logit_std', jnp.float32(0.0)),
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
+            # tau structure.
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
             'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
             'attn_tau_std': result.get('attn_tau_std', jnp.zeros(3)),
@@ -824,10 +792,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_tau_kernel_norm': result.get('know_tau_kernel_norm', jnp.float32(0.0)),
             'attn_tau_abs_mean': result.get('attn_tau_abs_mean', jnp.float32(0.0)),
             'know_tau_abs_mean': result.get('know_tau_abs_mean', jnp.float32(0.0)),
+            # z-margin boundary.
             'attn_z_lt_075': result.get('attn_z_lt_075', jnp.float32(0.0)),
             'know_z_lt_075': result.get('know_z_lt_075', jnp.float32(0.0)),
             'attn_z_lt_030': result.get('attn_z_lt_030', jnp.float32(0.0)),
             'know_z_lt_030': result.get('know_z_lt_030', jnp.float32(0.0)),
+            # Distribution shape.
             'attn_score_skew': result.get('attn_score_skew', jnp.float32(0.0)),
             'know_score_skew': result.get('know_score_skew', jnp.float32(0.0)),
             'attn_active_per_token_std': result.get('attn_active_per_token_std', jnp.float32(0.0)),
@@ -836,6 +806,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_gate_entropy': result.get('know_gate_entropy', jnp.float32(0.0)),
             'attn_z_sum': result.get('attn_z_sum', jnp.float32(0.0)),
             'know_z_sum': result.get('know_z_sum', jnp.float32(0.0)),
+            'attn_score_kurt': result.get('attn_score_kurt', jnp.float32(0.0)),
+            'know_score_kurt': result.get('know_score_kurt', jnp.float32(0.0)),
+            # Emb norm stats.
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_emb_norm_max': result.get('know_emb_norm_max', jnp.float32(0.0)),
             'know_emb_norm_min': result.get('know_emb_norm_min', jnp.float32(0.0)),
@@ -848,22 +821,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'v_emb_norm_max': result.get('v_emb_norm_max', jnp.float32(0.0)),
             'v_emb_norm_min': result.get('v_emb_norm_min', jnp.float32(0.0)),
             'v_emb_norm_std': result.get('v_emb_norm_std', jnp.float32(0.0)),
-            'attn_score_kurt': result.get('attn_score_kurt', jnp.float32(0.0)),
-            'know_score_kurt': result.get('know_score_kurt', jnp.float32(0.0)),
-            'attn_drop_rate': result.get('attn_drop_rate', jnp.float32(0.0)),
-            'attn_boost_rate': result.get('attn_boost_rate', jnp.float32(0.0)),
-            'know_drop_rate': result.get('know_drop_rate', jnp.float32(0.0)),
-            'know_boost_rate': result.get('know_boost_rate', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
+            # tau bias (scalar learned params).
             'tau_know_bias': tau_know_b[0],
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
+            # Output / raw norms.
             'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
             'attn_qk_raw_norm': result.get('attn_qk_raw_norm', jnp.float32(0.0)),
             'attn_v_raw_norm': result.get('attn_v_raw_norm', jnp.float32(0.0)),
             'know_raw_out_norm': result.get('know_raw_out_norm', jnp.float32(0.0)),
+            # Debug norms.
             'debug_residual_norm': result.get('debug_residual_norm', jnp.float32(0.0)),
             'debug_emb_norm': result.get('debug_emb_norm', jnp.float32(0.0)),
             'debug_o_proj_norm': result.get('debug_o_proj_norm', jnp.float32(0.0)),
@@ -872,28 +842,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'debug_v_norm': result.get('debug_v_norm', jnp.float32(0.0)),
             'debug_logit_max': result.get('debug_logit_max', jnp.float32(0.0)),
             'debug_o_input_norm': result.get('debug_o_input_norm', jnp.float32(0.0)),
+            # phi_binary / z_mean_active.
             'know_phi_binary': result.get('know_phi_binary', jnp.float32(0.0)),
             'know_z_mean_active': result.get('know_z_mean_active', jnp.float32(0.0)),
             'attn_qk_phi_binary': result.get('attn_qk_phi_binary', jnp.float32(0.0)),
             'attn_v_phi_binary': result.get('attn_v_phi_binary', jnp.float32(0.0)),
             'attn_qk_z_mean_active': result.get('attn_qk_z_mean_active', jnp.float32(0.0)),
             'attn_v_z_mean_active': result.get('attn_v_z_mean_active', jnp.float32(0.0)),
+            # Per-layer diagnostics.
             'per_layer_attn_out_norm': result.get('per_layer_attn_out_norm', jnp.zeros(1)),
             'per_layer_know_out_norm': result.get('per_layer_know_out_norm', jnp.zeros(1)),
-            # v4.0.6: dead-only penalty + alpha / tau_shift observations.
+            # Dead-only penalty.
             'dead_penalty': dead_penalty,
             'attn_dead_penalty': result.get('attn_dead_penalty', jnp.float32(0.0)),
             'know_dead_penalty': result.get('know_dead_penalty', jnp.float32(0.0)),
             'attn_dead_count': result.get('attn_dead_count', jnp.float32(0.0)),
             'know_dead_count': result.get('know_dead_count', jnp.float32(0.0)),
-            'attn_qk_tau_shift_mean': result.get('attn_qk_tau_shift_mean', jnp.float32(0.0)),
-            'attn_v_tau_shift_mean': result.get('attn_v_tau_shift_mean', jnp.float32(0.0)),
-            'know_tau_shift_mean': result.get('know_tau_shift_mean', jnp.float32(0.0)),
-            'alpha_qk': result.get('alpha_qk', jnp.float32(0.0)),
-            'alpha_v': result.get('alpha_v', jnp.float32(0.0)),
-            'alpha_know': result.get('alpha_know', jnp.float32(0.0)),
-            'attn_s_std_min': result.get('attn_s_std_min', jnp.float32(0.0)),
-            'know_s_std_min': result.get('know_s_std_min', jnp.float32(0.0)),
             # v4.1 RPE exploration + diagnostics.
             'global_mean_ce': explore_stats['global_mean_ce'],
             'pos_frac': explore_stats['pos_frac'],
@@ -1200,8 +1164,8 @@ class GCSLogger:
     GCS doesn't support true append — each open('a')/write/close overwrites.
     So we always append to a local file and upload the full file to GCS
     on every sync() call. Callers decide the sync cadence (training
-    loop syncs once per LOG_INTERVAL); the logger itself doesn't
-    throttle. Uploading the whole file every LOG_INTERVAL is cheap in
+    loop syncs once per FAST log boundary); the logger itself doesn't
+    throttle. Uploading the whole file every FAST log is cheap in
     GCS API cost ($5 per 1M write ops) and in host-0 wall time
     (percent-of-a-percent over a multi-hour run), and the
     near-real-time visibility is worth it.
@@ -1280,7 +1244,7 @@ def _setup_loggers(training_log_file, jsonl_log_file, resume=False):
 
 
 def sync_logs():
-    """Flush local logs to GCS. Call every LOG_INTERVAL for live visibility."""
+    """Flush local logs to GCS. Call every FAST log for live visibility."""
     if _train_logger:
         _train_logger.sync()
     if _jsonl_logger:
