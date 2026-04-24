@@ -111,11 +111,27 @@ Architecture:
   DAWN                 -- embedding + jax.lax.scan + weight-tied lm_head
 
 Changelog:
-  spatial-r1-v4.1 (2026-04-21):
+  spatial-r1-v4.1 (2026-04-21; emb forward-norm reverted 2026-04-23;
+                   read/write forward-norm removed 2026-04-23):
     - Two-stage gate: activation × intensity with ACTIVATION_CUTOFF.
-    - Emb forward-normalised (unit) restored.
     - Dynamic tau + raw_alpha params removed entirely.
     - Den = Σ intensity; dead threshold 1e-4 → 0.01.
+    - Emb forward-norm: originally restored here, then reverted in-place
+      on 2026-04-23 back to v4.0.6-style (no forward unit-norm). ||emb||
+      is a learnable DoF again — WD + task loss shape it so per-neuron
+      magnitude can drive competitive sparsity (qk active regime ~5-6%,
+      vs ~28% under forward unit-norm). read / write still
+      forward-normalise per chunk; init still unit_norm_init.
+    - 2026-04-23 (free-norm): read/write forward unit-norm also removed.
+      All three pool tensors (emb / read / write) are now free-norm —
+      each neuron has three independent magnitude axes:
+        emb_norm   → routing influence
+        read_norm  → input sensitivity
+        write_norm → output strength
+      Regulated by per-group weight decay in the optimizer
+      (pool_weight_decay ≪ base weight_decay; see train_jax.py). CE
+      self-regulates: output-saturating neurons raise loss, so
+      magnitudes don't run away without the forward-norm guard.
 
   spatial-r1-v4.0.6 (2026-04-20):
     - Gate confidence: Φ(z) (normal CDF) → sigmoid(scores - tau).
@@ -294,8 +310,12 @@ def safe_dropout(x, rate, deterministic, rng):
         return x
     keep_rate = 1.0 - rate
     mask = jax.random.bernoulli(rng, keep_rate, x.shape)
-    mask = jnp.where(deterministic, jnp.ones_like(mask), mask)
-    return jnp.where(mask, x / keep_rate, 0.0)
+    dropped = jnp.where(mask, x / keep_rate, 0.0)
+    # Eval path: return x unscaled. Previous version returned x/keep_rate
+    # here (mask forced to ones but the where-branch still divided), which
+    # inflated all eval activations by 1/keep_rate and put a structural
+    # offset into val_loss.
+    return jnp.where(deterministic, x, dropped)
 
 
 def _layer_norm(x, scale, bias, eps=1e-6):
@@ -402,12 +422,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         B, S, D = x.shape
         h_bf = h.astype(jnp.bfloat16)
         x_bf = x.astype(jnp.bfloat16)
-        # v4.1: forward-normalise emb to unit. Grad flows back through the
-        # normalise op (tangent-space projection).
-        emb_f32 = emb_local.astype(jnp.float32)
-        emb_unit_f32 = emb_f32 / (
-            jnp.linalg.norm(emb_f32, axis=-1, keepdims=True) + 1e-6)
-        emb_bf = emb_unit_f32.astype(jnp.bfloat16)
+        # emb used as-is (v4.0.6-style). ||emb|| is a learnable DoF —
+        # WD controls size; per-neuron magnitude drives competitive
+        # sparsity. read/write still forward-normalise below.
+        emb_bf = emb_local.astype(jnp.bfloat16)
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
         z1 = jnp.zeros((B, S, 1))
@@ -479,8 +497,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-            rc = rc / (jnp.linalg.norm(rc, axis=-1, keepdims=True) + 1e-8)
-            wc = wc / (jnp.linalg.norm(wc, axis=-1, keepdims=True) + 1e-8)
+            # v4.1 free-norm (2026-04-23): r/w magnitude is a learnable DoF,
+            # regulated by pool_weight_decay. Forward no longer re-normalises.
+            # rc, wc used as-is from slice.
             scores = h_bf @ ec.T
             scores_f = scores.astype(jnp.float32)
             # v4.1 two-stage gate.
@@ -684,11 +703,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         # h: [B,S,2,d_route], tau_offset: [B,S,2,1]
         h_bf = h.astype(jnp.bfloat16)
         x_bf = x.astype(jnp.bfloat16)
-        # v4.1: forward-normalise emb to unit.
-        emb_f32 = emb_local.astype(jnp.float32)
-        emb_unit_f32 = emb_f32 / (
-            jnp.linalg.norm(emb_f32, axis=-1, keepdims=True) + 1e-6)
-        emb_bf = emb_unit_f32.astype(jnp.bfloat16)
+        # emb used as-is; norm is a learnable DoF (v4.0.6-style).
+        emb_bf = emb_local.astype(jnp.bfloat16)
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
         z1_r = jnp.zeros((B, S, 2, 1))
@@ -760,8 +776,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-            rc = rc / (jnp.linalg.norm(rc, axis=-1, keepdims=True) + 1e-8)
-            wc = wc / (jnp.linalg.norm(wc, axis=-1, keepdims=True) + 1e-8)
+            # v4.1 free-norm (2026-04-23): r/w magnitude is a learnable DoF,
+            # regulated by pool_weight_decay. Forward no longer re-normalises.
+            # rc, wc used as-is from slice.
             scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             scores_f = scores.astype(jnp.float32)
             # v4.1 two-stage gate.
@@ -907,8 +924,9 @@ class NeuronPool(nn.Module):
         db = self.d_route
         dm = self.d_model
 
-        # Sense (routing, low-dim). Unit-norm init; v4.1 forward also
-        # re-normalises so neurons stay pure direction.
+        # Sense (routing, low-dim). Unit-norm init — rows start on the
+        # unit sphere; forward does NOT re-normalise (v4.0.6-style, so
+        # ||emb|| stays a learnable DoF).
         self.qk_emb = self.param('qk_emb', unit_norm_init(), (self.n_qk, db))
         self.v_emb = self.param('v_emb', unit_norm_init(), (self.n_v, db))
         self.know_emb = self.param('know_emb', unit_norm_init(), (self.n_know, db))
@@ -980,7 +998,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     v_read = pool_params['v_read']
     v_write = pool_params['v_write']
 
-    # v4.1: forward normalisation happens inside the sharded fn.
+    # emb used as-is; *_unit names kept for downstream readability.
     qk_emb_unit = qk_emb
     v_emb_unit = v_emb
 
@@ -1068,7 +1086,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     # Load balance loss from gate distributions + tau regularization
     tau_reg = jnp.maximum(tau_all, 0.0).mean() * 0.01
+    # TODO(v4.2?): /3 근거 불분명 (v3.9.1 흔적). 현재 pool 2개(qk, v) 합을 3으로 나눔.
+    # 의도가 Q/K/V 3-route 평균이면 paired 내부에서 Q/K lb 분리 필요.
+    # 의도가 평균이면 /2가 맞음. lb_weight 튠 전에 결정 필요.
     aux = (qk_lb + v_lb) / 3.0 + tau_reg
+    # TODO: QK pool과 V pool을 산술평균으로 섞음. pool 크기/역할이 달라 해석 불가.
+    # 로깅용이면 분리해서 노출하는 게 맞음. aux 계산엔 영향 없음(로깅만).
     attn_raw_gmax = jnp.maximum(qk_raw_gmax.mean(), v_raw_gmax.mean())
     attn_score_std = (qk_sstd + v_sstd) / 2
     attn_gate_sum = (qk_es + v_es) / 2
@@ -1128,7 +1151,7 @@ def _know_forward(x, pool_params, router_params, rng,
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
 
-    # v4.1: forward normalisation happens inside the sharded fn.
+    # emb used as-is; *_unit name kept for downstream readability.
     know_emb_unit = know_emb
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     # Pure observational metrics — stop_gradient to avoid NaN VJP hazards at init.
@@ -1504,6 +1527,8 @@ class DAWN(nn.Module):
                 attn_int_max_all, know_int_max_all,
                 attn_int_cap_frac_all, know_int_cap_frac_all) = jax.lax.scan(
                 scan_body, x, xs)
+            # TODO(v4.2?): attn_aux는 내부 /3, know_aux는 생짜 — layer 평균 시 load balance 가중치가
+            # pool별 비대칭(QK/V는 /3L, Know는 /L, know가 3배 강함). 의도 확인 필요.
             total_aux = (attn_auxes + know_auxes).mean()
 
         # Debug norms
@@ -1687,8 +1712,8 @@ def _squeeze_params(params):
 
 def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     """Non-chunked SRW for inference. v4.1: gate = activation × intensity,
-    den = max(Σintensity, 1.0). emb_norm is expected unit-norm (caller
-    normalises)."""
+    den = max(Σintensity, 1.0). emb_norm is passed as-is (no forward
+    unit-norm; v4.0.6-style)."""
     scores = h @ emb_norm.T
     scores_f32 = scores.astype(jnp.float32)
     s_mean = scores_f32.mean(axis=-1, keepdims=True)
@@ -1703,8 +1728,9 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     intensity = EPSILON + jnp.minimum(active_margin, MAX_INTENSITY)
     gate = activation * intensity
 
-    r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
-    w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
+    # v4.1 free-norm: read / write used as-is.
+    r_n = w_read
+    w_n = w_write
     xr = x @ r_n.T
     raw_out = (gate.astype(scores.dtype) * xr) @ w_n
     den = jnp.maximum(intensity.sum(axis=-1, keepdims=True), 1.0)
@@ -1733,8 +1759,9 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = activation * intensity
     gate_norm = gate / jnp.maximum(gate.sum(axis=-1, keepdims=True), 1e-8)
 
-    r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
-    w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
+    # v4.1 free-norm: read / write used as-is.
+    r_n = w_read
+    w_n = w_write
     xr = x @ r_n.T
     raw_out = (gate.astype(scores.dtype) * xr) @ w_n
     den = jnp.maximum(intensity.sum(axis=-1, keepdims=True), 1.0)
@@ -1749,11 +1776,10 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
     B = x.shape[0]
     d_head = d_model // n_heads
 
-    # v4.1: forward-normalise emb (matches training path).
-    qk_emb = pool_params['qk_emb']
-    v_emb = pool_params['v_emb']
-    qk_norm = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-6)
-    v_norm = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-6)
+    # emb used as-is (matches training path — v4.0.6-style, no
+    # forward unit-norm).
+    qk_norm = pool_params['qk_emb']
+    v_norm = pool_params['v_emb']
 
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
@@ -1793,9 +1819,8 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
 def _know_forward_inference(x, pool_params, router_params):
     """Inference-only know forward. No chunking, no LB, no dropout."""
-    # v4.1: forward-normalise emb.
-    know_emb = pool_params['know_emb']
-    know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-6)
+    # emb used as-is (matches training path).
+    know_norm = pool_params['know_emb']
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     out = _srw_inference(x, h, know_norm, tau,
@@ -2248,8 +2273,9 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if mult is not None:
             gate = gate * mult[None, None, :]
             z_pos = z_pos * mult[None, None, :]
-        r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
-        w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
+        # v4.1 free-norm: read / write used as-is.
+        r_n = w_read
+        w_n = w_write
         xr = x @ r_n.T
         out = (gate.astype(scores.dtype) * xr) @ w_n
         z_sum = z_pos.sum(axis=-1, keepdims=True)

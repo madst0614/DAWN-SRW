@@ -29,12 +29,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import jax
 import jax.numpy as jnp
 from jax.experimental.multihost_utils import process_allgather
-try:
-    from jax.experimental.multihost_utils import broadcast_one_to_all as _bcast_one_to_all
-    _HAVE_BROADCAST = True
-except ImportError:
-    _bcast_one_to_all = None
-    _HAVE_BROADCAST = False
 import optax
 import numpy as np
 import time
@@ -43,28 +37,39 @@ import argparse
 import yaml
 import numpy as np
 from datetime import datetime
-from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Optional
-
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental.shard_map import shard_map
 
-# Model registry imports. Legacy versions (v2 .. v4.0.6, v3.9.x except
-# v3.9.4, rw-v4.0.2) live in models/legacy/ — restore from there and
-# add a ModelSpec entry if you need to resume an old checkpoint or
-# reproduce a paper result. See models/legacy/README.md.
+from models.model_v17_1_jax import DAWN
+from models.dawn_spatial import DAWN as DAWN_Spatial
+from models.dawn_spatial_v2 import DAWN as DAWN_SpatialV2
+from models.dawn_spatial_v3 import DAWN as DAWN_SpatialV3
+from models.dawn_spatial_v3_baseline import DAWN as DAWN_SpatialV3Baseline
+from models.dawn_spatial_v3_exp import DAWN as DAWN_SpatialV3Exp
+from models.dawn_spatial_v394_exp import DAWN as DAWN_SpatialV394Exp
+from models.dawn_spatial_v395_exp import DAWN as DAWN_SpatialV395Exp
+from models.dawn_spatial_v396_exp import DAWN as DAWN_SpatialV396Exp
+from models.dawn_spatial_v397_exp import DAWN as DAWN_SpatialV397Exp
+from models.dawn_spatial_v3971_exp import DAWN as DAWN_SpatialV3971Exp
+from models.dawn_spatial_v398_exp import DAWN as DAWN_SpatialV398Exp
+from models.dawn_spatial_v3981_exp import DAWN as DAWN_SpatialV3981Exp
+from models.dawn_spatial_v399_exp import DAWN as DAWN_SpatialV399Exp
+from models.dawn_spatial_v400_exp import DAWN as DAWN_SpatialV400Exp
+from models.dawn_spatial_v401_exp import DAWN as DAWN_SpatialV401Exp
+from models.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
+from models.dawn_spatial_v403_exp import DAWN as DAWN_SpatialV403Exp
+from models.dawn_spatial_v404_exp import DAWN as DAWN_SpatialV404Exp
+from models.dawn_spatial_v405_exp import DAWN as DAWN_SpatialV405Exp
+from models.dawn_spatial_v406_exp import DAWN as DAWN_SpatialV406Exp
+from models.dawn_spatial_v41_exp import DAWN as DAWN_SpatialV41Exp
 from models.baseline_transformer_jax import VanillaTransformer
-from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
-from models.dawn_spatial_v41_exp import DAWN as DAWN_V41
 
 # ============================================================
 # Constants
 # ============================================================
 
-# Log cadence is config-driven: see log_interval / log_analysis_multiplier
-# in `training:`. The legacy module-level LOG_INTERVAL constant was removed.
-
+LOG_INTERVAL = 100
 
 
 # ============================================================
@@ -90,152 +95,357 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
-# ============================================================
-# Model Registry
-# ============================================================
-
-@dataclass
-class ModelSpec:
-    """Registered model entry.
-
-    - build_kwargs: cfg -> kwargs dict for the model constructor.
-    - sharded_kwargs: cfg -> extra kwargs for make_sharded_srw /
-      make_sharded_srw_paired (v4.1 closure constants live here).
-    - force_sharded: require shard_map path even when mesh_model==1
-      (v4.1 removed non-sharded fallback).
-    """
-    name: str
-    module_path: str
-    cls: Any
-    build_kwargs: Callable[[dict], dict]
-    supports_sharded: bool = False
-    force_sharded: bool = False
-    sharded_kwargs: Optional[Callable[[dict], dict]] = None
-
-
-def _baseline_kwargs(cfg):
-    m = cfg['model']
-    return dict(
-        vocab_size=m.get('vocab_size', 30522),
-        d_model=m.get('d_model', 384),
-        d_ff=m.get('d_ff', 1536),
-        n_layers=m.get('n_layers', 12),
-        n_heads=m.get('n_heads', 6),
-        max_seq_len=m.get('max_seq_len', 512),
-        dropout_rate=m.get('dropout', 0.1),
-        gradient_checkpointing=m.get('gradient_checkpointing', False),
-    )
-
-
-def _dawn_shared_kwargs(cfg):
-    """Init kwargs shared by v3.9.4 and v4.1 (identical signature)."""
-    m = cfg['model']
-    t = cfg['training']
-    return dict(
-        vocab_size=m.get('vocab_size', 30522),
-        d_model=m.get('d_model', 384),
-        n_layers=m.get('n_layers', 12),
-        n_heads=m.get('n_heads', 6),
-        max_seq_len=m.get('max_seq_len', 512),
-        d_route=m.get('d_route', m.get('d_bottleneck', 128)),
-        n_qk=m.get('n_qk', 1580),
-        n_v=m.get('n_v', 2600),
-        n_know=m.get('n_know', 25200),
-        dropout_rate=m.get('dropout', 0.1),
-        router_dropout=m.get('router_dropout', 0.1),
-        gradient_checkpointing=m.get('gradient_checkpointing', False),
-        n_chunks_know=t.get('n_chunks_know', 1),
-        n_chunks_qk=t.get('n_chunks_qk', 1),
-        n_chunks_v=t.get('n_chunks_v', 1),
-    )
-
-
-def _v41_sharded_kwargs(cfg):
-    """v4.1 two-stage gate constants passed as closure to make_sharded_srw.
-
-    Defaults mirror the pre-refactor values (scripts/train_jax.py line
-    1970-1986 before commit bfcc2b9). Any change here shifts training
-    dynamics — keep in sync with model code.
-    """
-    t = cfg['training']
-    return dict(
-        dead_threshold=t.get('dead_penalty_threshold', 0.01),
-        sharpness=t.get('sharpness', 500.0),
-        activation_threshold=t.get('activation_threshold', 0.5),
-        activation_cutoff=t.get('activation_cutoff', 0.01),
-        epsilon=t.get('epsilon', 1e-4),
-        max_intensity=t.get('max_intensity', 10.0),
-    )
-
-
-MODEL_REGISTRY = {
-    'baseline': ModelSpec(
-        name='baseline',
-        module_path='models.baseline_transformer_jax',
-        cls=VanillaTransformer,
-        build_kwargs=_baseline_kwargs,
-    ),
-    'spatial-r1-v3.9.4': ModelSpec(
-        name='spatial-r1-v3.9.4',
-        module_path='models.dawn_spatial_v394_exp',
-        cls=DAWN_V394,
-        build_kwargs=_dawn_shared_kwargs,
-        supports_sharded=True,
-    ),
-    'spatial-r1-v4.1': ModelSpec(
-        name='spatial-r1-v4.1',
-        module_path='models.dawn_spatial_v41_exp',
-        cls=DAWN_V41,
-        build_kwargs=_dawn_shared_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v41_sharded_kwargs,
-    ),
-}
-
-
 def build_model_from_config(cfg):
-    """Build model from config via MODEL_REGISTRY.
+    """Build model from config dict. Supports DAWN and baseline."""
+    mcfg = cfg['model']
+    version = mcfg.get('model_version', '17.1')
 
-    Unknown versions raise ValueError with restoration instructions —
-    legacy versions live in models/legacy/ and can be re-registered in
-    MODEL_REGISTRY when resuming old checkpoints or reproducing paper
-    results. See models/legacy/README.md.
-    """
-    version = cfg['model'].get('model_version', 'spatial-r1-v4.1')
-    if version not in MODEL_REGISTRY:
-        raise ValueError(
-            f"Unknown model_version: {version!r}. "
-            f"Known: {sorted(MODEL_REGISTRY.keys())}. "
-            f"Legacy versions live in models/legacy/ — to resume an old "
-            f"checkpoint, move the model file back to models/ and add a "
-            f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
-    spec = MODEL_REGISTRY[version]
-    return spec.cls(**spec.build_kwargs(cfg))
+    if version == 'baseline':
+        model = VanillaTransformer(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            d_ff=mcfg.get('d_ff', 1536),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+        )
+    elif version == 'spatial-r1':
+        model = DAWN_Spatial(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_space=mcfg.get('d_space', 64),
+            n_qk=mcfg.get('n_qk', 256),
+            n_v=mcfg.get('n_v', 256),
+            n_know=mcfg.get('n_know', 512),
+            max_k=mcfg.get('max_k', 32),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            # Hierarchical routing
+            n_clusters_qk=mcfg.get('n_clusters_qk', 64),
+            n_clusters_v=mcfg.get('n_clusters_v', 64),
+            n_clusters_know=mcfg.get('n_clusters_know', 128),
+            k_cluster_qk=mcfg.get('k_cluster_qk', 8),
+            k_cluster_v=mcfg.get('k_cluster_v', 8),
+            k_cluster_know=mcfg.get('k_cluster_know', 8),
+        )
+    elif version == 'spatial-r1-v4.0.0':
+        model = DAWN_SpatialV400Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version in ('spatial-r1-v3.9.9', 'spatial-r1-v4.0.1', 'spatial-r1-v4.0.3',
+                      'spatial-r1-v4.0.4', 'spatial-r1-v4.0.5',
+                      'spatial-r1-v4.0.6', 'spatial-r1-v4.1'):
+        _cls = {
+            'spatial-r1-v4.0.1': DAWN_SpatialV401Exp,
+            'spatial-r1-v4.0.3': DAWN_SpatialV403Exp,
+            'spatial-r1-v4.0.4': DAWN_SpatialV404Exp,
+            'spatial-r1-v4.0.5': DAWN_SpatialV405Exp,
+            'spatial-r1-v4.0.6': DAWN_SpatialV406Exp,
+            'spatial-r1-v4.1': DAWN_SpatialV41Exp,
+        }.get(version, DAWN_SpatialV399Exp)
+        _extra = {}
+        if version == 'spatial-r1-v4.0.4':
+            _extra['reverse_p_max'] = cfg['training'].get('reverse_p_max', 0.0)
+        elif version == 'spatial-r1-v4.0.5':
+            _extra['gate_drop_rate'] = cfg['training'].get('gate_drop_rate', 0.0)
+            _extra['gate_boost_rate'] = cfg['training'].get('gate_boost_rate', 0.0)
+        elif version == 'spatial-r1-v4.0.6':
+            _extra['tau_alpha_init'] = cfg['training'].get('tau_alpha_init', 0.1)
+        elif version == 'spatial-r1-v4.1':
+            # v4.1 removed dynamic tau / alpha entirely; no model-level kwargs.
+            pass
+        model = _cls(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+            **_extra,
+        )
+    elif version == 'rw-v4.0.2':
+        model = DAWN_RW_V402(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            n_q=mcfg.get('n_q', 790),
+            n_k=mcfg.get('n_k', 790),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_q=cfg['training'].get('n_chunks_q', 1),
+            n_chunks_k=cfg['training'].get('n_chunks_k', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+        )
+    elif version == 'spatial-r1-v3.9.8.1':
+        model = DAWN_SpatialV3981Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.8':
+        model = DAWN_SpatialV398Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.7.1':
+        model = DAWN_SpatialV3971Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.7':
+        model = DAWN_SpatialV397Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.6':
+        model = DAWN_SpatialV396Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.5':
+        model = DAWN_SpatialV395Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+            gate_norm_mode=mcfg.get('gate_norm_mode', 'sqrt_active'),
+        )
+    elif version == 'spatial-r1-v3.9.4':
+        model = DAWN_SpatialV394Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.3':
+        model = DAWN_SpatialV3Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'spatial-r1-v3.9.1':
+        model = DAWN_SpatialV3Baseline(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version.startswith('spatial-r1-v3'):
+        model = DAWN_SpatialV3(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version.startswith('spatial-r1-v2'):
+        model = DAWN_SpatialV2(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            pos_dim=mcfg.get('pos_dim', 2),
+            grid_size=mcfg.get('grid_size', 64),
+            candidates_multiplier=mcfg.get('candidates_multiplier', 2),
+            grid_rebuild_interval=mcfg.get('grid_rebuild_interval', 100),
+            pos_loss_weight=mcfg.get('pos_loss_weight', 0.01),
+            know_chunk_size=mcfg.get('know_chunk_size', 16),
+            n_qk=mcfg.get('n_qk', 3140),
+            n_v=mcfg.get('n_v', 5240),
+            n_know=mcfg.get('n_know', 42000),
+            max_k_qk=mcfg.get('max_k_qk', 157),
+            max_k_v=mcfg.get('max_k_v', 262),
+            max_k_know=mcfg.get('max_k_know', 1536),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+        )
+    else:
+        model = DAWN(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            rank=mcfg.get('rank', 64),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_space=mcfg.get('d_space', 64),
+            n_feature_qk=mcfg.get('n_feature_qk', 56),
+            n_feature_v=mcfg.get('n_feature_v', 24),
+            top_k_feature_qk=mcfg.get('top_k_feature_qk', 16),
+            top_k_feature_v=mcfg.get('top_k_feature_v', 6),
+            n_restore_qk=mcfg.get('n_restore_qk', 56),
+            n_restore_v=mcfg.get('n_restore_v', 24),
+            top_k_restore_qk=mcfg.get('top_k_restore_qk', 16),
+            top_k_restore_v=mcfg.get('top_k_restore_v', 6),
+            n_feature_know=mcfg.get('n_feature_know', 24),
+            n_restore_know=mcfg.get('n_restore_know', 24),
+            top_k_feature_know=mcfg.get('top_k_feature_know', 4),
+            top_k_restore_know=mcfg.get('top_k_restore_know', 4),
+            knowledge_rank=mcfg.get('knowledge_rank', 128),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+        )
+    return model
 
 
 # ============================================================
 # GCS / file I/O helpers
 # ============================================================
-
-_GCS_FS_CACHE = None
-
-
-def _get_gcs_fs():
-    """Cached gcsfs.GCSFileSystem singleton.
-
-    Avoids per-call auth + init overhead. Returns None if gcsfs is not
-    installed; callers are expected to fall back to tensorflow or raise.
-    """
-    global _GCS_FS_CACHE
-    if _GCS_FS_CACHE is None:
-        try:
-            import gcsfs
-            _GCS_FS_CACHE = gcsfs.GCSFileSystem()
-        except ImportError:
-            return None
-    return _GCS_FS_CACHE
-
 
 def _is_gcs(path):
     return str(path).startswith("gs://")
@@ -245,9 +455,12 @@ def _open_file(path, mode="rb"):
     """Open a file for read/write, supporting GCS paths."""
     path_str = str(path)
     if _is_gcs(path_str):
-        fs = _get_gcs_fs()
-        if fs is not None:
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
             return fs.open(path_str, mode)
+        except ImportError:
+            pass
         try:
             import tensorflow as tf
             return tf.io.gfile.GFile(path_str, mode)
@@ -267,16 +480,17 @@ def _file_exists(path):
     """Check if a file exists (local or GCS)."""
     path_str = str(path)
     if _is_gcs(path_str):
-        fs = _get_gcs_fs()
-        if fs is not None:
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
             return fs.exists(path_str)
+        except ImportError:
+            pass
         try:
             import tensorflow as tf
             return tf.io.gfile.exists(path_str)
         except ImportError:
-            raise ImportError(
-                f"Cannot check GCS path {path_str}: "
-                f"neither gcsfs nor tensorflow available.")
+            return False
     return Path(path_str).exists()
 
 
@@ -294,12 +508,15 @@ def _list_files(directory, pattern="*.flax"):
         return int(m.group(1)) if m else 0
 
     if _is_gcs(dir_str):
-        fs = _get_gcs_fs()
-        if fs is not None:
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
             if not dir_str.endswith("/"):
                 dir_str += "/"
             files = fs.glob(dir_str + pattern)
             return sorted(["gs://" + f for f in files], key=_sort_key)
+        except ImportError:
+            pass
         try:
             import tensorflow as tf
             if not dir_str.endswith("/"):
@@ -307,9 +524,7 @@ def _list_files(directory, pattern="*.flax"):
             files = tf.io.gfile.glob(dir_str + pattern)
             return sorted(files, key=_sort_key)
         except ImportError:
-            raise ImportError(
-                f"Cannot list GCS path {dir_str}: "
-                f"neither gcsfs nor tensorflow available.")
+            return []
     return sorted((str(f) for f in Path(dir_str).glob(pattern)), key=_sort_key)
 
 
@@ -320,30 +535,26 @@ def _makedirs(path):
 
 
 def _delete_file(path):
-    """Delete a single file (local or GCS). Warns on failure; never silent."""
+    """Delete a single file (local or GCS)."""
     path_str = str(path)
     if _is_gcs(path_str):
-        fs = _get_gcs_fs()
-        if fs is not None:
-            try:
-                fs.rm(path_str)
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                if jax.process_index() == 0:
-                    print(f"Warning: _delete_file({path_str}) failed: {e}", flush=True)
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
+            fs.rm(path_str)
             return
+        except ImportError:
+            pass
         try:
             import tensorflow as tf
             tf.io.gfile.remove(path_str)
             return
         except ImportError:
-            raise ImportError(
-                f"Cannot delete GCS path {path_str}: "
-                f"neither gcsfs nor tensorflow available.")
-    p = Path(path_str)
-    if p.exists():
-        p.unlink()
+            pass
+    else:
+        p = Path(path_str)
+        if p.exists():
+            p.unlink()
 
 
 def cleanup_old_checkpoints(checkpoint_dir, keep_last=3):
@@ -493,10 +704,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
-                      exploration_warmup_steps=5000,
-                      exploration_lower_bound=-0.5,
-                      exploration_upper_bound=2.0,
-                      exploration_bound_eps=1.0e-3,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
@@ -535,14 +742,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _global_mean_reducer = _mean_reducer_fn
 
     _asym = jnp.float32(exploration_asymmetry)
-    _explore_lower = jnp.float32(exploration_lower_bound)
-    _explore_upper = jnp.float32(exploration_upper_bound)
-    _explore_eps = jnp.float32(exploration_bound_eps)
-    _warmup_steps = jnp.int32(exploration_warmup_steps)
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
-                   prev_emb_snap, step):
+                   prev_emb_snap):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
 
         def loss_fn(params):
@@ -582,29 +785,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     per_token_ce - global_mean_ce)                   # [B, S-1]
                 # Asymmetric: full push on hard tokens, `asym`·push on easy ones.
                 signal = jnp.where(deviation > 0, deviation, _asym * deviation)
-
-                # v4.1+ per-token/layer/route bounded explore. tau_offset is
-                # NOT clipped (CE keeps full gradient); only the explore-loss
-                # contribution is turned off per-element when further push in
-                # that direction would breach [lower, upper].
-                # attn_tau_off shape [L, B, S, 3]; know_tau_off [L, B, S, 1].
-                a_tau_t = attn_tau_off[:, :, :-1, :]     # [L, B, S-1, 3]
-                k_tau_t = know_tau_off[:, :, :-1, :]     # [L, B, S-1, 1]
-                sig_b = signal[None, :, :, None]          # [1, B, S-1, 1]
-                vmask_b = vmask_f[None, :, :, None]       # [1, B, S-1, 1]
-
-                # Per-element bound-hit masks. Hard off, not soft decay.
-                a_down_off = (sig_b > 0) & (a_tau_t <= _explore_lower + _explore_eps)
-                a_up_off   = (sig_b < 0) & (a_tau_t >= _explore_upper - _explore_eps)
-                a_off_mask = a_down_off | a_up_off
-                k_down_off = (sig_b > 0) & (k_tau_t <= _explore_lower + _explore_eps)
-                k_up_off   = (sig_b < 0) & (k_tau_t >= _explore_upper - _explore_eps)
-                k_off_mask = k_down_off | k_up_off
-
-                a_active = jnp.where(a_off_mask, 0.0, 1.0)
-                k_active = jnp.where(k_off_mask, 0.0, 1.0)
-
-                # tau_offset distribution diagnostics (stop_gradient, obs-only).
+                # Sum / mean over layers and route dim to match [B, S-1].
+                a_sum = attn_tau_off[:, :, :-1, :].sum(axis=(0, -1))
+                k_sum = know_tau_off[:, :, :-1, :].sum(axis=(0, -1))
+                a_tau_mean = attn_tau_off[:, :, :-1, :].mean(axis=(0, -1))
+                k_tau_mean = know_tau_off[:, :, :-1, :].mean(axis=(0, -1))
+                # v4.1 tau_offset distribution diagnostics (sg to keep them
+                # out of the backward pass — they're purely observational).
                 _a_tau_flat = jax.lax.stop_gradient(attn_tau_off)
                 _k_tau_flat = jax.lax.stop_gradient(know_tau_off)
                 attn_tau_off_min = _a_tau_flat.min()
@@ -617,17 +804,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 know_tau_off_p99 = jnp.quantile(_k_tau_flat, 0.99)
                 know_tau_off_p01 = jnp.quantile(_k_tau_flat, 0.01)
                 know_tau_off_neg_frac = (_k_tau_flat < 0).astype(jnp.float32).mean()
-
-                # Per-element contribution → reduce. Gradient flows through
-                # the tau_offset tensor only (signal is stop_gradient'd).
+                # Downward cap: when signal > 0 (about to push tau DOWN) and
+                # the per-pool mean tau_offset is already ≤ 0, zero the
+                # contribution for that token. Up-push (signal < 0) always
+                # allowed — CE self-correction can still recover pools that
+                # over-pruned. Comparison op is non-differentiable so no
+                # gradient flows through the mask itself.
+                pos_signal = (signal > 0)
+                a_block = pos_signal & (a_tau_mean <= 0.0)
+                k_block = pos_signal & (k_tau_mean <= 0.0)
+                a_mask = jnp.where(a_block, 0.0, 1.0)
+                k_mask = jnp.where(k_block, 0.0, 1.0)
                 vsum_eps = vmask_f.sum() + 1e-8
-                a_contrib = sig_b * a_tau_t * a_active * vmask_b
-                k_contrib = sig_b * k_tau_t * k_active * vmask_b
-                explore_attn_raw = a_contrib.sum() / vsum_eps
-                explore_know_raw = k_contrib.sum() / vsum_eps
+                explore_attn_raw = (signal * a_mask * a_sum * vmask_f).sum() / vsum_eps
+                explore_know_raw = (signal * k_mask * k_sum * vmask_f).sum() / vsum_eps
                 explore_loss_raw = explore_attn_raw + explore_know_raw
-
-                # Observational stats (same interface as before).
+                # Log-only stats (all stop_gradient via pure reductions).
                 pos_mask = (deviation > 0).astype(jnp.float32) * vmask_f
                 neg_mask = (deviation < 0).astype(jnp.float32) * vmask_f
                 pos_frac = pos_mask.sum() / vsum_eps
@@ -635,16 +827,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     pos_mask.sum() + 1e-8)
                 neg_mean = (jnp.maximum(-deviation, 0.0) * vmask_f).sum() / (
                     neg_mask.sum() + 1e-8)
-
-                # Off fractions replace pool-mean block fractions. Denominator
-                # is total (layer × batch × valid-time × route) slots.
-                _a_tot = vmask_b.sum() * a_tau_t.shape[0] * a_tau_t.shape[-1]
-                _k_tot = vmask_b.sum() * k_tau_t.shape[0] * k_tau_t.shape[-1]
+                # Down-push block fractions (of valid tokens).
                 block_frac_a = jax.lax.stop_gradient(
-                    (a_off_mask.astype(jnp.float32) * vmask_b).sum() / (_a_tot + 1e-8))
+                    (a_block.astype(jnp.float32) * vmask_f).sum() / vsum_eps)
                 block_frac_k = jax.lax.stop_gradient(
-                    (k_off_mask.astype(jnp.float32) * vmask_b).sum() / (_k_tot + 1e-8))
-
+                    (k_block.astype(jnp.float32) * vmask_f).sum() / vsum_eps)
+                # Signal magnitude extremes (diag).
                 _sig_sg = jax.lax.stop_gradient(signal * vmask_f)
                 sig_pos_max = _sig_sg.max()
                 sig_neg_max = (-_sig_sg).max()
@@ -670,11 +858,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 know_tau_off_p99 = jnp.float32(0.0)
                 know_tau_off_p01 = jnp.float32(0.0)
                 know_tau_off_neg_frac = jnp.float32(0.0)
-            # Warmup gate: zero out explore loss until warmup_steps has passed.
-            # W_sense needs time to settle before exploration signals become
-            # meaningful; early CE-dominated learning keeps tau gradient clean.
-            explore_active = (step >= _warmup_steps).astype(jnp.float32)
-            explore_loss_weighted = exploration_weight * explore_loss_raw * explore_active
+            explore_loss_weighted = exploration_weight * explore_loss_raw
 
             if is_baseline:
                 orth_loss = jnp.float32(0.0)
@@ -715,8 +899,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 know_tau_off_min=know_tau_off_min, know_tau_off_max=know_tau_off_max,
                 know_tau_off_p99=know_tau_off_p99, know_tau_off_p01=know_tau_off_p01,
                 know_tau_off_neg_frac=know_tau_off_neg_frac,
-                explore_active=explore_active,
-                step_in_train=step,
             )
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
                                 dead_penalty, explore_stats, result)
@@ -730,6 +912,24 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
+
+        # Re-project neuron pool vectors to unit norm after optimizer step
+        def normalize_pool_params(params):
+            pool = params['neuron_pool']
+            norm_keys = [
+                'qk_read', 'v_read', 'know_read',
+                'qk_write', 'v_write', 'know_write',
+                'qk_emb', 'v_emb', 'know_emb',
+            ]
+            new_pool = dict(pool)
+            for key in norm_keys:
+                w = new_pool[key]
+                new_pool[key] = w / (jnp.linalg.norm(w, axis=-1, keepdims=True) + 1e-8)
+            return {**params, 'neuron_pool': new_pool}
+
+        # v3.9.4: re-projection disabled — forward unit-norm handles normalization,
+        # param norm freedom provides implicit gradient scaling regularization
+        # new_params = normalize_pool_params(new_params)
 
         grad_norm = jnp.sqrt(
             sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
@@ -768,22 +968,38 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_norm': grad_norm,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'know_aux': result.get('know_aux', jnp.float32(0.0)),
-            # Core activity (v4.1).
             'know_active': result.get('know_active', jnp.float32(0.0)),
-            'know_strong': result.get('know_strong', jnp.float32(0.0)),
+            'know_active_N': result.get('know_active_N', jnp.float32(0.0)),
             'know_score_std': result.get('know_score_std', jnp.float32(0.0)),
-            'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
+            'know_raw_gate_max': result.get('know_gate_max', result.get('know_raw_gate_max', jnp.float32(0.0))),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
+            'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
             'know_active_n_mean': result.get('know_active_n_mean', jnp.float32(0.0)),
+            'know_strong': result.get('know_strong', result.get('know_pos', jnp.float32(0.0))),
+            'know_strength_mean': result.get('know_strength_mean', jnp.float32(0.0)),
+            'know_strength_std': result.get('know_strength_std', jnp.float32(0.0)),
+            'know_strength_min': result.get('know_strength_min', jnp.float32(0.0)),
+            'know_strength_max': result.get('know_strength_max', jnp.float32(0.0)),
+            'know_logit_mean': result.get('know_logit_mean', jnp.float32(0.0)),
+            'know_logit_std': result.get('know_logit_std', jnp.float32(0.0)),
             'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
-            'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
+            'attn_active_N': result.get('attn_active_N', jnp.float32(0.0)),
             'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
-            'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
+            'attn_raw_gate_max': result.get('attn_gate_max', result.get('attn_raw_gate_max', jnp.float32(0.0))),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
+            'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
             'attn_active_n_mean': result.get('attn_active_n_mean', jnp.float32(0.0)),
+            'attn_strong': result.get('attn_strong', result.get('attn_pos', jnp.float32(0.0))),
+            'attn_qk_pos': result.get('attn_qk_pos', jnp.float32(0.0)),
+            'attn_v_pos': result.get('attn_v_pos', jnp.float32(0.0)),
+            'attn_v_strength_mean': result.get('attn_v_strength_mean', jnp.float32(0.0)),
+            'attn_v_strength_std': result.get('attn_v_strength_std', jnp.float32(0.0)),
+            'attn_v_strength_min': result.get('attn_v_strength_min', jnp.float32(0.0)),
+            'attn_v_strength_max': result.get('attn_v_strength_max', jnp.float32(0.0)),
+            'attn_v_logit_mean': result.get('attn_v_logit_mean', jnp.float32(0.0)),
+            'attn_v_logit_std': result.get('attn_v_logit_std', jnp.float32(0.0)),
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
-            # tau structure.
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
             'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
             'attn_tau_std': result.get('attn_tau_std', jnp.zeros(3)),
@@ -792,12 +1008,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_tau_kernel_norm': result.get('know_tau_kernel_norm', jnp.float32(0.0)),
             'attn_tau_abs_mean': result.get('attn_tau_abs_mean', jnp.float32(0.0)),
             'know_tau_abs_mean': result.get('know_tau_abs_mean', jnp.float32(0.0)),
-            # z-margin boundary.
             'attn_z_lt_075': result.get('attn_z_lt_075', jnp.float32(0.0)),
             'know_z_lt_075': result.get('know_z_lt_075', jnp.float32(0.0)),
             'attn_z_lt_030': result.get('attn_z_lt_030', jnp.float32(0.0)),
             'know_z_lt_030': result.get('know_z_lt_030', jnp.float32(0.0)),
-            # Distribution shape.
             'attn_score_skew': result.get('attn_score_skew', jnp.float32(0.0)),
             'know_score_skew': result.get('know_score_skew', jnp.float32(0.0)),
             'attn_active_per_token_std': result.get('attn_active_per_token_std', jnp.float32(0.0)),
@@ -806,9 +1020,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_gate_entropy': result.get('know_gate_entropy', jnp.float32(0.0)),
             'attn_z_sum': result.get('attn_z_sum', jnp.float32(0.0)),
             'know_z_sum': result.get('know_z_sum', jnp.float32(0.0)),
-            'attn_score_kurt': result.get('attn_score_kurt', jnp.float32(0.0)),
-            'know_score_kurt': result.get('know_score_kurt', jnp.float32(0.0)),
-            # Emb norm stats.
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_emb_norm_max': result.get('know_emb_norm_max', jnp.float32(0.0)),
             'know_emb_norm_min': result.get('know_emb_norm_min', jnp.float32(0.0)),
@@ -821,19 +1032,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'v_emb_norm_max': result.get('v_emb_norm_max', jnp.float32(0.0)),
             'v_emb_norm_min': result.get('v_emb_norm_min', jnp.float32(0.0)),
             'v_emb_norm_std': result.get('v_emb_norm_std', jnp.float32(0.0)),
+            'attn_score_kurt': result.get('attn_score_kurt', jnp.float32(0.0)),
+            'know_score_kurt': result.get('know_score_kurt', jnp.float32(0.0)),
+            'attn_drop_rate': result.get('attn_drop_rate', jnp.float32(0.0)),
+            'attn_boost_rate': result.get('attn_boost_rate', jnp.float32(0.0)),
+            'know_drop_rate': result.get('know_drop_rate', jnp.float32(0.0)),
+            'know_boost_rate': result.get('know_boost_rate', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
-            # tau bias (scalar learned params).
             'tau_know_bias': tau_know_b[0],
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
-            # Output / raw norms.
             'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
             'attn_qk_raw_norm': result.get('attn_qk_raw_norm', jnp.float32(0.0)),
             'attn_v_raw_norm': result.get('attn_v_raw_norm', jnp.float32(0.0)),
             'know_raw_out_norm': result.get('know_raw_out_norm', jnp.float32(0.0)),
-            # Debug norms.
             'debug_residual_norm': result.get('debug_residual_norm', jnp.float32(0.0)),
             'debug_emb_norm': result.get('debug_emb_norm', jnp.float32(0.0)),
             'debug_o_proj_norm': result.get('debug_o_proj_norm', jnp.float32(0.0)),
@@ -842,22 +1056,28 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'debug_v_norm': result.get('debug_v_norm', jnp.float32(0.0)),
             'debug_logit_max': result.get('debug_logit_max', jnp.float32(0.0)),
             'debug_o_input_norm': result.get('debug_o_input_norm', jnp.float32(0.0)),
-            # phi_binary / z_mean_active.
             'know_phi_binary': result.get('know_phi_binary', jnp.float32(0.0)),
             'know_z_mean_active': result.get('know_z_mean_active', jnp.float32(0.0)),
             'attn_qk_phi_binary': result.get('attn_qk_phi_binary', jnp.float32(0.0)),
             'attn_v_phi_binary': result.get('attn_v_phi_binary', jnp.float32(0.0)),
             'attn_qk_z_mean_active': result.get('attn_qk_z_mean_active', jnp.float32(0.0)),
             'attn_v_z_mean_active': result.get('attn_v_z_mean_active', jnp.float32(0.0)),
-            # Per-layer diagnostics.
             'per_layer_attn_out_norm': result.get('per_layer_attn_out_norm', jnp.zeros(1)),
             'per_layer_know_out_norm': result.get('per_layer_know_out_norm', jnp.zeros(1)),
-            # Dead-only penalty.
+            # v4.0.6: dead-only penalty + alpha / tau_shift observations.
             'dead_penalty': dead_penalty,
             'attn_dead_penalty': result.get('attn_dead_penalty', jnp.float32(0.0)),
             'know_dead_penalty': result.get('know_dead_penalty', jnp.float32(0.0)),
             'attn_dead_count': result.get('attn_dead_count', jnp.float32(0.0)),
             'know_dead_count': result.get('know_dead_count', jnp.float32(0.0)),
+            'attn_qk_tau_shift_mean': result.get('attn_qk_tau_shift_mean', jnp.float32(0.0)),
+            'attn_v_tau_shift_mean': result.get('attn_v_tau_shift_mean', jnp.float32(0.0)),
+            'know_tau_shift_mean': result.get('know_tau_shift_mean', jnp.float32(0.0)),
+            'alpha_qk': result.get('alpha_qk', jnp.float32(0.0)),
+            'alpha_v': result.get('alpha_v', jnp.float32(0.0)),
+            'alpha_know': result.get('alpha_know', jnp.float32(0.0)),
+            'attn_s_std_min': result.get('attn_s_std_min', jnp.float32(0.0)),
+            'know_s_std_min': result.get('know_s_std_min', jnp.float32(0.0)),
             # v4.1 RPE exploration + diagnostics.
             'global_mean_ce': explore_stats['global_mean_ce'],
             'pos_frac': explore_stats['pos_frac'],
@@ -866,8 +1086,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'explore_loss_raw': explore_stats['explore_loss_raw'],
             'explore_attn_raw': explore_stats['explore_attn_raw'],
             'explore_know_raw': explore_stats['explore_know_raw'],
-            'explore_loss_weighted': exploration_weight * explore_stats['explore_loss_raw'] * explore_stats['explore_active'],
-            'explore_active': explore_stats['explore_active'],
+            'explore_loss_weighted': exploration_weight * explore_stats['explore_loss_raw'],
             'explore_block_frac_a': explore_stats['block_frac_a'],
             'explore_block_frac_k': explore_stats['block_frac_k'],
             'sig_pos_max': explore_stats['sig_pos_max'],
@@ -997,24 +1216,19 @@ def shard_to_mesh(data, sharding, global_shape):
     per_host = data.shape[0]
 
     def data_callback(index):
-        # index is a tuple of slices for each dimension.
-        # The batch slice tells us which global rows this device needs.
+        # index is a tuple of slices for each dimension
+        # The batch slice tells us which global rows this device needs
         batch_slice = index[0]
         start = batch_slice.start or 0
         stop = batch_slice.stop or global_shape[0]
+        # Map global indices to this host's local data
         local_start = start - host_id * per_host
         local_stop = stop - host_id * per_host
+        # If this slice belongs to our host, return it; else zeros (shouldn't happen)
         if 0 <= local_start < per_host:
             return np.array(data[local_start:local_stop])
-        # Previously returned silent zeros — that corrupts training with
-        # a zero-batch whenever the mesh's host locality doesn't match
-        # the data partition. Fail loud instead so the misconfiguration
-        # is caught at setup rather than showing up as mysterious loss.
-        raise RuntimeError(
-            f"shard_to_mesh: device requests global index [{start}, {stop}) "
-            f"but host {host_id} has local range [0, {per_host}) "
-            f"(local_start={local_start}). Mesh layout likely doesn't match "
-            f"host locality. Check create_mesh() device order.")
+        else:
+            return np.zeros((stop - start,) + data.shape[1:], dtype=data.dtype)
 
     return jax.make_array_from_callback(global_shape, sharding, data_callback)
 
@@ -1044,16 +1258,13 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
     """Run evaluation and return avg loss and accuracy.
 
     All hosts must call this (pmap requires it), but only verbose=True host prints.
-    Accumulates on device — one TPU→CPU sync at the end instead of three
-    per batch — so eval stays fast on 1B-scale runs.
     """
-    total_loss_jax = jnp.float32(0.0)
-    total_correct_jax = jnp.int32(0)
-    total_valid_jax = jnp.int32(0)
+    total_loss = 0.0
+    total_correct = 0
+    total_valid = 0
 
     eval_total = min(max_batches, len(val_loader))
     eval_start = time.time()
-    batch_idx = -1
 
     for batch_idx, (input_ids, attention_mask) in enumerate(val_loader):
         if batch_idx >= max_batches:
@@ -1067,21 +1278,13 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
 
         ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
 
-        total_loss_jax = total_loss_jax + ce_loss * valid_count.astype(jnp.float32)
-        total_correct_jax = total_correct_jax + correct
-        total_valid_jax = total_valid_jax + valid_count
-
-    totals = jax.device_get({
-        'loss': total_loss_jax,
-        'correct': total_correct_jax,
-        'valid': total_valid_jax,
-    })
-    total_loss = float(totals['loss'])
-    total_correct = int(totals['correct'])
-    total_valid = int(totals['valid'])
+        n_valid = int(valid_count)
+        total_loss += float(ce_loss) * n_valid
+        total_correct += int(correct)
+        total_valid += n_valid
 
     eval_elapsed = time.time() - eval_start
-    done = min(batch_idx + 1, eval_total) if batch_idx >= 0 else 0
+    done = min(batch_idx + 1, eval_total)
     if verbose:
         print(f"  Eval: {done}/{eval_total} batches, {eval_elapsed:.1f}s", flush=True)
     avg_loss = total_loss / total_valid if total_valid > 0 else 0.0
@@ -1093,14 +1296,9 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
 # Checkpoint save / load (with GCS support)
 # ============================================================
 
-def _serialize_checkpoint(params, opt_state, epoch, step, best_val_loss, model_config,
-                          step_in_epoch=0, steps_per_epoch=0, training_config=None):
-    """Serialize a checkpoint dict to bytes (no write).
-
-    Split out so callers that write the same bytes to multiple paths
-    (e.g. checkpoint_epochN.flax + best_model.flax in the same event)
-    can reuse a single serialization pass.
-    """
+def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config,
+                    step_in_epoch=0, steps_per_epoch=0, training_config=None):
+    """Save checkpoint using flax serialization. Supports local and GCS paths."""
     import flax.serialization as serialization
     ckpt = {
         'params': params,
@@ -1113,23 +1311,11 @@ def _serialize_checkpoint(params, opt_state, epoch, step, best_val_loss, model_c
         'config': model_config,
         'training_config': training_config or {},
     }
-    return serialization.to_bytes(ckpt)
+    bytes_data = serialization.to_bytes(ckpt)
 
-
-def _write_checkpoint_bytes(path, bytes_data):
-    """Write pre-serialized checkpoint bytes to path."""
     with _open_file(path, 'wb') as f:
         f.write(bytes_data)
     print(f"  Checkpoint saved: {path} ({len(bytes_data) / 1e6:.1f} MB)")
-
-
-def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config,
-                    step_in_epoch=0, steps_per_epoch=0, training_config=None):
-    """Save checkpoint using flax serialization. Supports local and GCS paths."""
-    bytes_data = _serialize_checkpoint(
-        params, opt_state, epoch, step, best_val_loss, model_config,
-        step_in_epoch, steps_per_epoch, training_config)
-    _write_checkpoint_bytes(path, bytes_data)
 
 
 def load_checkpoint(path, target_params, target_opt_state):
@@ -1159,40 +1345,19 @@ def load_checkpoint(path, target_params, target_opt_state):
 # ============================================================
 
 class GCSLogger:
-    """Logger that writes to a local file and syncs to GCS on sync().
+    """Logger that writes to a local file and periodically syncs to GCS.
 
     GCS doesn't support true append — each open('a')/write/close overwrites.
     So we always append to a local file and upload the full file to GCS
-    on every sync() call. Callers decide the sync cadence (training
-    loop syncs once per FAST log boundary); the logger itself doesn't
-    throttle. Uploading the whole file every FAST log is cheap in
-    GCS API cost ($5 per 1M write ops) and in host-0 wall time
-    (percent-of-a-percent over a multi-hour run), and the
-    near-real-time visibility is worth it.
+    on every sync() call.
     """
 
-    def __init__(self, gcs_path, local_path, resume=False):
+    def __init__(self, gcs_path, local_path):
         self.gcs_path = gcs_path
         self.local_path = local_path
         self._dirty = False
-        if local_path:
-            Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-        if resume and gcs_path and local_path:
-            # Seed the local file from existing GCS contents so the
-            # subsequent open('a')/write path appends in-place; without
-            # the seed the first sync() would overwrite GCS with only
-            # this session's tail. If the GCS file doesn't exist yet we
-            # silently continue (fresh-looking logger).
-            try:
-                with _open_file(gcs_path, 'rb') as f:
-                    data = f.read()
-                with open(local_path, 'wb') as f:
-                    f.write(data)
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                if jax.process_index() == 0:
-                    print(f"  [warn] could not seed log from {gcs_path}: {e}", flush=True)
+        # Ensure local parent dir exists
+        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, text):
         with open(self.local_path, 'a') as f:
@@ -1200,7 +1365,7 @@ class GCSLogger:
         self._dirty = True
 
     def sync(self):
-        """Upload local file to GCS if there are unflushed writes."""
+        """Upload local file to GCS if there are new writes."""
         if not self._dirty or not self.gcs_path:
             return
         try:
@@ -1210,8 +1375,7 @@ class GCSLogger:
                 f.write(data)
             self._dirty = False
         except Exception as e:
-            if jax.process_index() == 0:
-                print(f"  [warn] GCS sync failed: {e}", flush=True)
+            print(f"  [warn] GCS sync failed: {e}")
 
 
 # Module-level loggers — set up in main()
@@ -1219,12 +1383,8 @@ _train_logger = None
 _jsonl_logger = None
 
 
-def _setup_loggers(training_log_file, jsonl_log_file, resume=False):
-    """Create GCSLogger instances for training log and JSONL log.
-
-    resume=True downloads existing GCS content to the local scratch file
-    first so new lines append rather than overwrite.
-    """
+def _setup_loggers(training_log_file, jsonl_log_file):
+    """Create GCSLogger instances for training log and JSONL log."""
     global _train_logger, _jsonl_logger
     import tempfile
     tmpdir = Path(tempfile.gettempdir()) / "dawn_logs"
@@ -1232,19 +1392,19 @@ def _setup_loggers(training_log_file, jsonl_log_file, resume=False):
 
     if _is_gcs(training_log_file):
         local_txt = str(tmpdir / Path(training_log_file).name)
-        _train_logger = GCSLogger(training_log_file, local_txt, resume=resume)
+        _train_logger = GCSLogger(training_log_file, local_txt)
     else:
-        _train_logger = GCSLogger(None, training_log_file, resume=resume)
+        _train_logger = GCSLogger(None)
 
     if _is_gcs(jsonl_log_file):
         local_jsonl = str(tmpdir / Path(jsonl_log_file).name)
-        _jsonl_logger = GCSLogger(jsonl_log_file, local_jsonl, resume=resume)
+        _jsonl_logger = GCSLogger(jsonl_log_file, local_jsonl)
     else:
-        _jsonl_logger = GCSLogger(None, jsonl_log_file, resume=resume)
+        _jsonl_logger = GCSLogger(None, jsonl_log_file)
 
 
 def sync_logs():
-    """Flush local logs to GCS. Call every FAST log for live visibility."""
+    """Flush local logs to GCS. Call periodically (e.g. every LOG_INTERVAL)."""
     if _train_logger:
         _train_logger.sync()
     if _jsonl_logger:
@@ -1252,15 +1412,13 @@ def sync_logs():
 
 
 def log_message(msg, log_file=None):
-    """Print and write to training log file. Host 0 only."""
-    if jax.process_index() != 0:
-        return
+    """Print and write to training log file."""
     print(msg, flush=True)
     if _train_logger:
         try:
             _train_logger.write(msg + '\n')
-        except Exception as e:
-            print(f"  [warn] log_message write failed: {e}", flush=True)
+        except Exception:
+            pass
 
 
 def format_time(seconds):
@@ -1272,16 +1430,14 @@ def format_time(seconds):
 
 
 def log_jsonl(record):
-    """Append a JSON-lines record to the JSONL log file. Host 0 only."""
-    if jax.process_index() != 0:
-        return
+    """Append a JSON-lines record to the JSONL log file."""
     if not _jsonl_logger:
         return
     try:
         line = json.dumps(record, default=str)
         _jsonl_logger.write(line + '\n')
-    except Exception as e:
-        print(f"  [warn] log_jsonl write failed: {e}", flush=True)
+    except Exception:
+        pass
 
 
 def check_nan_inf(metrics_dict, global_step, epoch):
@@ -1298,329 +1454,6 @@ def check_nan_inf(metrics_dict, global_step, epoch):
             print(f"  div_loss:   {metrics_dict.get('div_loss', 'N/A')}")
         return True
     return False
-
-
-# ============================================================
-# 2-tier periodic logging (REGULAR / ANALYSIS)
-# ============================================================
-#
-# REGULAR  every log_interval steps                        (default 100)
-# ANALYSIS every log_interval * log_analysis_multiplier    (default 2000)
-#
-# REGULAR carries the full training-dynamics block (loss, activity,
-# tau structure, emb norms, RPE, per-layer). ANALYSIS extends that with
-# distribution-shape / boundary / saturation / debug diagnostics that
-# are expensive to eyeball on every step but cheap to compute — all
-# metrics are already in the train_step result regardless, so the
-# REGULAR/ANALYSIS split is about console + JSONL volume, not TPU cost.
-#
-# _build_analysis_record takes a REGULAR record as `base` and extends it,
-# so the JSONL line on an ANALYSIS step (type='train_analysis') carries
-# every REGULAR field plus the ANALYSIS additions — no duplicate records.
-
-
-def _fmt_act_count(frac, total):
-    """Format 'XX.X%(N)' — active fraction with the implied count."""
-    return f"{frac * 100:.1f}%({int(round(frac * total))})"
-
-
-def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
-    """REGULAR tier: all training-dynamics fields needed for live monitoring.
-
-    Equivalent to the former FAST + DEEP record merged; consumers of the
-    old train_fast / train_deep JSONL types should switch to type='train'.
-    """
-    m = metrics
-    rec = {
-        'step': global_step,
-        'epoch': epoch,
-        # Loss components (window-averaged).
-        'total_loss': win_avgs['loss'],
-        'ce_loss': win_avgs['ce'],
-        'aux_loss': win_avgs['aux'],
-        'tau_reg': win_avgs['tau_reg'],
-        'orth_loss': win_avgs['orth'],
-        'div_loss': win_avgs['div'],
-        'aux_weighted': ctx['lb_weight'] * win_avgs['aux'],
-        'tau_reg_weighted': ctx['tau_reg_weight'] * win_avgs['tau_reg'],
-        'orth_weighted': ctx['orth_weight'] * win_avgs['orth'],
-        'div_weighted': ctx['div_weight'] * win_avgs['div'],
-        # Dead-only penalty.
-        'dead_penalty': float(m.get('dead_penalty', 0.0)),
-        'attn_dead_penalty': float(m.get('attn_dead_penalty', 0.0)),
-        'know_dead_penalty': float(m.get('know_dead_penalty', 0.0)),
-        'dead_penalty_weighted': ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)),
-        # Explore loss (RPE).
-        'explore_loss_raw': float(m.get('explore_loss_raw', 0.0)),
-        'explore_loss_weighted': float(m.get('explore_loss_weighted', 0.0)),
-        # Accuracy / training status.
-        'accuracy': win_avgs['acc'],
-        'grad_norm': float(m['grad_norm']),
-        'lr': ctx['current_lr'],
-        'steps_per_sec': ctx['steps_per_sec'],
-        'elapsed': ctx['total_elapsed'],
-        # Drift (reduced inside train_step).
-        'drift_qk_emb': float(m.get('drift_qk_emb', 0.0)),
-        'drift_v_emb': float(m.get('drift_v_emb', 0.0)),
-        'drift_know_emb': float(m.get('drift_know_emb', 0.0)),
-        # Core activity.
-        'attn_qk_active': float(m.get('attn_qk_active', 0.0)),
-        'attn_v_active': float(m.get('attn_v_active', 0.0)),
-        'know_active': float(m.get('know_active', 0.0)),
-        'attn_strong': float(m.get('attn_strong', 0.0)),
-        'know_strong': float(m.get('know_strong', 0.0)),
-        'attn_raw_gate_max': float(m.get('attn_raw_gate_max', 0.0)),
-        'know_raw_gate_max': float(m.get('know_raw_gate_max', 0.0)),
-        'attn_int_max': float(m.get('attn_int_max', 0.0)),
-        'know_int_max': float(m.get('know_int_max', 0.0)),
-        'attn_dead_count': float(m.get('attn_dead_count', 0.0)),
-        'know_dead_count': float(m.get('know_dead_count', 0.0)),
-        'attn_tau_mean': float(m.get('attn_tau_mean', 0.0)),
-        'know_tau_mean': float(m.get('know_tau_mean', 0.0)),
-        'attn_out_norm': float(m.get('attn_out_norm', 0.0)),
-        'know_out_norm': float(m.get('know_out_norm', 0.0)),
-        # tau structure (bias + offset distribution).
-        'tau_know_bias': float(m.get('tau_know_bias', 0.0)),
-        'tau_attn_bias_0': float(m.get('tau_attn_bias_0', 0.0)),
-        'tau_attn_bias_1': float(m.get('tau_attn_bias_1', 0.0)),
-        'tau_attn_bias_2': float(m.get('tau_attn_bias_2', 0.0)),
-        'attn_tau_abs_mean': float(m.get('attn_tau_abs_mean', 0.0)),
-        'know_tau_abs_mean': float(m.get('know_tau_abs_mean', 0.0)),
-        'attn_tau_off_min': float(m.get('attn_tau_off_min', 0.0)),
-        'attn_tau_off_max': float(m.get('attn_tau_off_max', 0.0)),
-        'attn_tau_off_p99': float(m.get('attn_tau_off_p99', 0.0)),
-        'attn_tau_off_p01': float(m.get('attn_tau_off_p01', 0.0)),
-        'attn_tau_off_neg_frac': float(m.get('attn_tau_off_neg_frac', 0.0)),
-        'know_tau_off_min': float(m.get('know_tau_off_min', 0.0)),
-        'know_tau_off_max': float(m.get('know_tau_off_max', 0.0)),
-        'know_tau_off_p99': float(m.get('know_tau_off_p99', 0.0)),
-        'know_tau_off_p01': float(m.get('know_tau_off_p01', 0.0)),
-        'know_tau_off_neg_frac': float(m.get('know_tau_off_neg_frac', 0.0)),
-        'attn_score_std': float(m.get('attn_score_std', 0.0)),
-        'know_score_std': float(m.get('know_score_std', 0.0)),
-        # Emb norm stats.
-        'know_emb_norm': float(m.get('know_emb_norm', 0.0)),
-        'know_emb_norm_min': float(m.get('know_emb_norm_min', 0.0)),
-        'know_emb_norm_std': float(m.get('know_emb_norm_std', 0.0)),
-        'qk_emb_norm_mean': float(m.get('qk_emb_norm_mean', 0.0)),
-        'qk_emb_norm_min': float(m.get('qk_emb_norm_min', 0.0)),
-        'qk_emb_norm_std': float(m.get('qk_emb_norm_std', 0.0)),
-        'v_emb_norm_mean': float(m.get('v_emb_norm_mean', 0.0)),
-        'v_emb_norm_min': float(m.get('v_emb_norm_min', 0.0)),
-        'v_emb_norm_std': float(m.get('v_emb_norm_std', 0.0)),
-        # RPE exploration diag.
-        'global_mean_ce': float(m.get('global_mean_ce', 0.0)),
-        'pos_frac': float(m.get('pos_frac', 0.0)),
-        'pos_mean': float(m.get('pos_mean', 0.0)),
-        'neg_mean': float(m.get('neg_mean', 0.0)),
-        'explore_attn_raw': float(m.get('explore_attn_raw', 0.0)),
-        'explore_know_raw': float(m.get('explore_know_raw', 0.0)),
-        'explore_block_frac_a': float(m.get('explore_block_frac_a', 0.0)),
-        'explore_block_frac_k': float(m.get('explore_block_frac_k', 0.0)),
-        'sig_pos_max': float(m.get('sig_pos_max', 0.0)),
-        'sig_neg_max': float(m.get('sig_neg_max', 0.0)),
-        'timestamp': datetime.now().isoformat(),
-    }
-    # Per-layer norms (materialise lists).
-    try:
-        pl_a = jax.device_get(m['per_layer_attn_out_norm']).tolist()
-        pl_k = jax.device_get(m['per_layer_know_out_norm']).tolist()
-    except Exception:
-        pl_a, pl_k = [], []
-    rec['per_layer_attn_out_norm'] = pl_a
-    rec['per_layer_know_out_norm'] = pl_k
-    return rec
-
-
-def _print_regular_block(rec, ctx):
-    """Print REGULAR tier — ~8 lines covering the live training dynamics."""
-    log_message(
-        f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
-        f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} | "
-        f"grad={rec['grad_norm']:.2f} | "
-        f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
-    )
-    log_message(
-        f"  act: qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
-        f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
-        f" k={_fmt_act_count(rec['know_active'], ctx['n_know_cfg'])}"
-        f" | strong: a={rec['attn_strong']*100:.1f}%"
-        f" k={rec['know_strong']*100:.1f}%"
-    )
-    log_message(
-        f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
-        f" k={rec['know_raw_gate_max']:.1f}]"
-        f" int_max[a={rec['attn_int_max']:.1f} k={rec['know_int_max']:.1f}]"
-        f" dead[a={int(rec['attn_dead_count'])} k={int(rec['know_dead_count'])}]"
-        f" drift[qk={rec['drift_qk_emb']:.2e}"
-        f" v={rec['drift_v_emb']:.2e}"
-        f" k={rec['drift_know_emb']:.2e}]"
-    )
-    log_message(
-        f"  tau: know_b={rec['tau_know_bias']:+.2f}"
-        f" attn_b=[{rec['tau_attn_bias_0']:+.2f} {rec['tau_attn_bias_1']:+.2f} {rec['tau_attn_bias_2']:+.2f}]"
-        f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
-        f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
-    )
-    log_message(
-        f"  tau_off k[min={rec['know_tau_off_min']:+.2f} p01={rec['know_tau_off_p01']:+.2f}"
-        f" p99={rec['know_tau_off_p99']:+.2f} max={rec['know_tau_off_max']:+.2f}"
-        f" neg={rec['know_tau_off_neg_frac']*100:.1f}%]"
-        f" a[min={rec['attn_tau_off_min']:+.2f} p01={rec['attn_tau_off_p01']:+.2f}"
-        f" p99={rec['attn_tau_off_p99']:+.2f} max={rec['attn_tau_off_max']:+.2f}"
-        f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
-    )
-    log_message(
-        f"  score_std[a={rec['attn_score_std']:.2f} k={rec['know_score_std']:.2f}]"
-        f" | emb_n k[m={rec['know_emb_norm']:.2f} s={rec['know_emb_norm_std']:.2f}"
-        f" min={rec['know_emb_norm_min']:.2f}]"
-        f" qk[m={rec['qk_emb_norm_mean']:.2f} s={rec['qk_emb_norm_std']:.2f}"
-        f" min={rec['qk_emb_norm_min']:.2f}]"
-        f" v[m={rec['v_emb_norm_mean']:.2f} s={rec['v_emb_norm_std']:.2f}"
-        f" min={rec['v_emb_norm_min']:.2f}]"
-    )
-    log_message(
-        f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
-        f" pos={rec['pos_frac']*100:.1f}%"
-        f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-        f" sig[+={rec['sig_pos_max']:.2f} -={rec['sig_neg_max']:.2f}]"
-        f" expl[a={rec['explore_attn_raw']:+.3f} k={rec['explore_know_raw']:+.3f}]"
-        f" w={rec['explore_loss_weighted']:+.4f}"
-        f" block[a={rec['explore_block_frac_a']*100:.1f}%"
-        f" k={rec['explore_block_frac_k']*100:.1f}%]"
-    )
-    _pl_a = rec.get('per_layer_attn_out_norm', []) or []
-    _pl_k = rec.get('per_layer_know_out_norm', []) or []
-    if _pl_a or _pl_k:
-        log_message(
-            f"  per_layer out: attn=[{' '.join(f'{v:.2f}' for v in _pl_a)}]"
-            f" know=[{' '.join(f'{v:.2f}' for v in _pl_k)}]"
-        )
-    log_message(
-        f"  time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
-        f" {ctx['s_per_it']:.2f}s/it"
-    )
-
-
-def _build_analysis_record(base, metrics, ctx):
-    """ANALYSIS tier: distribution shape, boundary, saturation, debug. Extends DEEP."""
-    m = metrics
-    rec = dict(base)
-    # tau per-route std (attn [3]) — materialise once.
-    try:
-        a_tau_s = np.asarray(jax.device_get(m.get('attn_tau_std', jnp.zeros(3))))
-        if a_tau_s.size < 3:
-            a_tau_s = np.zeros(3, dtype=np.float32)
-    except Exception:
-        a_tau_s = np.zeros(3, dtype=np.float32)
-    rec.update({
-        'attn_score_skew': float(m.get('attn_score_skew', 0.0)),
-        'know_score_skew': float(m.get('know_score_skew', 0.0)),
-        'attn_score_kurt': float(m.get('attn_score_kurt', 0.0)),
-        'know_score_kurt': float(m.get('know_score_kurt', 0.0)),
-        'attn_active_per_token_std': float(m.get('attn_active_per_token_std', 0.0)),
-        'know_active_per_token_std': float(m.get('know_active_per_token_std', 0.0)),
-        'attn_gate_entropy': float(m.get('attn_gate_entropy', 0.0)),
-        'know_gate_entropy': float(m.get('know_gate_entropy', 0.0)),
-        'attn_qk_phi_binary': float(m.get('attn_qk_phi_binary', 0.0)),
-        'attn_v_phi_binary': float(m.get('attn_v_phi_binary', 0.0)),
-        'know_phi_binary': float(m.get('know_phi_binary', 0.0)),
-        'attn_z_lt_075': float(m.get('attn_z_lt_075', 0.0)),
-        'know_z_lt_075': float(m.get('know_z_lt_075', 0.0)),
-        'attn_z_lt_030': float(m.get('attn_z_lt_030', 0.0)),
-        'know_z_lt_030': float(m.get('know_z_lt_030', 0.0)),
-        'attn_int_cap_frac': float(m.get('attn_int_cap_frac', 0.0)),
-        'know_int_cap_frac': float(m.get('know_int_cap_frac', 0.0)),
-        'qk_emb_norm_max': float(m.get('qk_emb_norm_max', 0.0)),
-        'v_emb_norm_max': float(m.get('v_emb_norm_max', 0.0)),
-        'know_emb_norm_max': float(m.get('know_emb_norm_max', 0.0)),
-        'attn_tau_std_q': float(a_tau_s[0]),
-        'attn_tau_std_k': float(a_tau_s[1]),
-        'attn_tau_std_v': float(a_tau_s[2]),
-        'know_tau_std': float(m.get('know_tau_std', 0.0)),
-        'attn_tau_kernel_norm': float(m.get('attn_tau_kernel_norm', 0.0)),
-        'know_tau_kernel_norm': float(m.get('know_tau_kernel_norm', 0.0)),
-        'attn_qk_raw_norm': float(m.get('attn_qk_raw_norm', 0.0)),
-        'attn_v_raw_norm': float(m.get('attn_v_raw_norm', 0.0)),
-        'know_raw_out_norm': float(m.get('know_raw_out_norm', 0.0)),
-        'attn_z_sum': float(m.get('attn_z_sum', 0.0)),
-        'know_z_sum': float(m.get('know_z_sum', 0.0)),
-        'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
-        'debug_emb_norm': float(m.get('debug_emb_norm', 0.0)),
-        'debug_o_proj_norm': float(m.get('debug_o_proj_norm', 0.0)),
-        'debug_q_norm': float(m.get('debug_q_norm', 0.0)),
-        'debug_k_norm': float(m.get('debug_k_norm', 0.0)),
-        'debug_v_norm': float(m.get('debug_v_norm', 0.0)),
-        'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
-        'debug_o_input_norm': float(m.get('debug_o_input_norm', 0.0)),
-    })
-    # HBM (host-0 local device 0 snapshot).
-    try:
-        mem = jax.local_devices()[0].memory_stats()
-        if mem:
-            used = mem.get('bytes_in_use', 0) / 1e9
-            peak = mem.get('peak_bytes_in_use', 0) / 1e9
-            limit = mem.get('bytes_limit', 0) / 1e9
-            rec['hbm_used_gb'] = float(used)
-            rec['hbm_peak_gb'] = float(peak)
-            rec['hbm_limit_gb'] = float(limit)
-    except Exception:
-        pass
-    return rec
-
-
-def _print_analysis_block(rec, ctx):
-    log_message(
-        f"  dist k[skew={rec['know_score_skew']:+.2f} kurt={rec['know_score_kurt']:.2f}"
-        f" apt_std={rec['know_active_per_token_std']:.1f} ent={rec['know_gate_entropy']:.2f}]"
-        f" a[skew={rec['attn_score_skew']:+.2f} kurt={rec['attn_score_kurt']:.2f}"
-        f" apt_std={rec['attn_active_per_token_std']:.1f} ent={rec['attn_gate_entropy']:.2f}]"
-    )
-    log_message(
-        f"  boundary k[phi={rec['know_phi_binary']*100:.1f}%"
-        f" z<075={rec['know_z_lt_075']*100:.1f}%"
-        f" z<030={rec['know_z_lt_030']*100:.1f}%]"
-        f" a_qk[phi={rec['attn_qk_phi_binary']*100:.1f}%]"
-        f" a_v[phi={rec['attn_v_phi_binary']*100:.1f}%]"
-        f" a[z<075={rec['attn_z_lt_075']*100:.1f}%"
-        f" z<030={rec['attn_z_lt_030']*100:.1f}%]"
-    )
-    log_message(
-        f"  saturation cap[a={rec['attn_int_cap_frac']*100:.1f}%"
-        f" k={rec['know_int_cap_frac']*100:.1f}%]"
-        f" | emb_max k={rec['know_emb_norm_max']:.2f}"
-        f" qk={rec['qk_emb_norm_max']:.2f}"
-        f" v={rec['v_emb_norm_max']:.2f}"
-    )
-    log_message(
-        f"  tau_struct k_std={rec['know_tau_std']:.2f}"
-        f" a_std=[{rec['attn_tau_std_q']:.2f} {rec['attn_tau_std_k']:.2f} {rec['attn_tau_std_v']:.2f}]"
-        f" k_kern={rec['know_tau_kernel_norm']:.1f}"
-        f" a_kern={rec['attn_tau_kernel_norm']:.1f}"
-    )
-    log_message(
-        f"  raw_n qk={rec['attn_qk_raw_norm']:.2f}"
-        f" v={rec['attn_v_raw_norm']:.2f}"
-        f" k={rec['know_raw_out_norm']:.2f}"
-        f" | out_n a={rec['attn_out_norm']:.2f}"
-        f" k={rec['know_out_norm']:.2f}"
-    )
-    log_message(
-        f"  debug resid={rec['debug_residual_norm']:.2f}"
-        f" emb={rec['debug_emb_norm']:.2f}"
-        f" o_proj={rec['debug_o_proj_norm']:.2f}"
-        f" q={rec['debug_q_norm']:.2f}"
-        f" k={rec['debug_k_norm']:.2f}"
-        f" v={rec['debug_v_norm']:.2f}"
-        f" logit_max={rec['debug_logit_max']:.1f}"
-        f" o_in={rec['debug_o_input_norm']:.2f}"
-    )
-    if 'hbm_used_gb' in rec:
-        log_message(
-            f"  HBM: {rec['hbm_used_gb']:.2f}G / {rec['hbm_limit_gb']:.2f}G"
-            f" (peak={rec['hbm_peak_gb']:.2f}G,"
-            f" free={rec['hbm_limit_gb'] - rec['hbm_used_gb']:.2f}G)"
-        )
 
 
 # ============================================================
@@ -1667,10 +1500,6 @@ def main():
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
     weight_decay = tcfg.get('weight_decay', 0.1)
-    # v4.1 free-norm: pool params (qk/v/know × emb/read/write, 9 tensors)
-    # get a lower WD than dense kernels. Bias / LayerNorm / *_scale
-    # excluded from both groups.
-    pool_weight_decay = tcfg.get('pool_weight_decay', 0.02)
     warmup_ratio = tcfg.get('warmup_ratio', 0.06)
     orth_weight = tcfg.get('orthogonality_weight', 0.01)
     div_weight = tcfg.get('diversity_weight', 0.1)
@@ -1680,14 +1509,6 @@ def main():
     # v4.1 RPE exploration loss (0 weight => off; no-op for earlier versions).
     exploration_weight = tcfg.get('exploration_weight', 0.0)
     exploration_asymmetry = tcfg.get('exploration_asymmetry', 0.15)
-    # v4.1+ bounded-explore: warmup + per-element bound-off cap.
-    exploration_warmup_steps = tcfg.get('exploration_warmup_steps', 5000)
-    exploration_lower_bound = tcfg.get('exploration_lower_bound', -0.5)
-    exploration_upper_bound = tcfg.get('exploration_upper_bound', 2.0)
-    exploration_bound_eps = tcfg.get('exploration_bound_eps', 1.0e-3)
-    # 2-tier logging cadence.
-    log_interval = int(tcfg.get('log_interval', 100))
-    log_analysis_multiplier = int(tcfg.get('log_analysis_multiplier', 20))
 
     max_seq_len = cfg['model'].get('max_seq_len', 512)
 
@@ -1707,29 +1528,22 @@ def main():
         return str(Path(base) / name)
 
     def _list_run_folders(base):
-        """List run_* subdirectories under base (local or GCS).
-
-        FileNotFoundError on GCS is treated as "no prior runs yet" to
-        match the local-path behavior (Path.exists() check below) —
-        first training on a fresh checkpoint_dir shouldn't fail. Every
-        other exception still propagates so credential / permission
-        failures can't masquerade as "nothing to resume".
-        """
+        """List run_* subdirectories under base (local or GCS)."""
         if _is_gcs(base):
-            fs = _get_gcs_fs()
-            if fs is None:
-                raise ImportError(
-                    f"Cannot list GCS path {base}: gcsfs not available.")
-            bucket_path = base.replace('gs://', '').rstrip('/')
             try:
+                import gcsfs
+                fs = gcsfs.GCSFileSystem()
+                prefix = base.rstrip('/') + '/run_'
+                # strip gs:// for gcsfs
+                bucket_path = base.replace('gs://', '').rstrip('/')
                 entries = fs.ls(bucket_path)
-            except FileNotFoundError:
+                runs = sorted([
+                    'gs://' + e for e in entries
+                    if '/run_' in e
+                ])
+                return runs
+            except Exception:
                 return []
-            runs = sorted([
-                'gs://' + e for e in entries
-                if '/run_' in e
-            ])
-            return runs
         else:
             p = Path(base)
             if not p.exists():
@@ -1739,84 +1553,31 @@ def main():
                 if d.is_dir() and d.name.startswith('run_')
             ])
 
-    def _broadcast_str_from_host0(s, max_len=512):
-        """Broadcast a string (or None) from host 0 to all hosts.
-
-        Must be called collectively on every host. Each host passes its
-        local value; only host 0's value is adopted everywhere. Empty
-        string and None both encode as all-zero padding and decode back
-        to None. max_len caps the payload (GCS URLs usually fit well
-        under 512 bytes).
-        """
-        if s is None:
-            s = ''
-        encoded = s.encode('utf-8')
-        if len(encoded) > max_len:
-            raise ValueError(
-                f"Path too long for broadcast: {len(encoded)} > {max_len}")
-        buf = np.zeros(max_len, dtype=np.uint8)
-        if jax.process_index() == 0:
-            buf[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
-
-        if _HAVE_BROADCAST:
-            broadcast_buf = np.asarray(_bcast_one_to_all(buf))
-        else:
-            gathered = np.asarray(process_allgather(buf))
-            # Shape can be (n_hosts, max_len) or flat (n_hosts * max_len,)
-            # depending on JAX version — pick host 0's slice either way.
-            if gathered.ndim == 1:
-                broadcast_buf = gathered[:max_len]
-            else:
-                broadcast_buf = gathered[0]
-        result = bytes(broadcast_buf).rstrip(b'\x00').decode('utf-8')
-        return result if result else None
-
     # Auto-resume: find latest run folder with checkpoints (unless --from-scratch)
-    # --resume-from takes priority: resume from a specific run folder.
-    #
-    # Only host 0 lists GCS; the resulting (resume_path, checkpoint_dir)
-    # is broadcast to all hosts. Independent per-host listing can diverge
-    # under gcsfs caching, concurrent cleanup, or preemption-timing
-    # races — a split resume mis-syncs global_step across the mesh and
-    # later halts collectives inside train_step.
+    # --resume-from takes priority: resume from a specific run folder
     if not cli_args.from_scratch:
-        _host0_resume_path = None
-        _host0_checkpoint_dir = None
-        _host0_explicit_missing = False
-
-        if jax.process_index() == 0:
-            if cli_args.resume_from:
-                folder = cli_args.resume_from.rstrip('/')
+        if cli_args.resume_from:
+            folder = cli_args.resume_from.rstrip('/')
+            candidates = _list_files(folder, "*.flax")
+            if candidates:
+                resume_path = candidates[-1]
+                checkpoint_dir = folder
+                if jax.process_index() == 0:
+                    print(f"  Resume from specified folder: {checkpoint_dir}")
+                    print(f"  Resuming from: {resume_path}")
+            else:
+                raise FileNotFoundError(f"No .flax checkpoint found in {folder}")
+        else:
+            run_folders = _list_run_folders(base_checkpoint_dir)
+            for folder in reversed(run_folders):
                 candidates = _list_files(folder, "*.flax")
                 if candidates:
-                    _host0_resume_path = candidates[-1]
-                    _host0_checkpoint_dir = folder
-                    print(f"  Resume from specified folder: {_host0_checkpoint_dir}")
-                    print(f"  Resuming from: {_host0_resume_path}")
-                else:
-                    _host0_explicit_missing = True
-                    print(f"  No .flax checkpoint found in {folder}")
-            else:
-                run_folders = _list_run_folders(base_checkpoint_dir)
-                for folder in reversed(run_folders):
-                    candidates = _list_files(folder, "*.flax")
-                    if candidates:
-                        _host0_resume_path = candidates[-1]
-                        _host0_checkpoint_dir = folder
-                        print(f"  Auto-resume: found checkpoint in {_host0_checkpoint_dir}")
-                        print(f"  Resuming from: {_host0_resume_path}")
-                        break
-
-        # Collective broadcast — all hosts must call.
-        resume_path = _broadcast_str_from_host0(_host0_resume_path)
-        checkpoint_dir = _broadcast_str_from_host0(_host0_checkpoint_dir)
-        # Broadcast the explicit-missing signal as a single-byte string
-        # so every host raises together.
-        _missing_signal = _broadcast_str_from_host0(
-            'MISSING' if _host0_explicit_missing else '')
-        if _missing_signal == 'MISSING':
-            raise FileNotFoundError(
-                f"No .flax checkpoint found in {cli_args.resume_from}")
+                    resume_path = candidates[-1]
+                    checkpoint_dir = folder
+                    if jax.process_index() == 0:
+                        print(f"  Auto-resume: found checkpoint in {checkpoint_dir}")
+                        print(f"  Resuming from: {resume_path}")
+                    break
 
     # Create new run folder if not resuming
     if checkpoint_dir is None:
@@ -1825,7 +1586,7 @@ def main():
         kst = timezone(timedelta(hours=9))
         ts = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
         rand_suffix = _random.randint(1000, 9999)
-        version = cfg['model'].get('model_version', 'spatial-r1-v4.1')
+        version = cfg['model'].get('model_version', 'v17.1')
         run_name = f"run_v{version}_{ts}_{rand_suffix}"
         checkpoint_dir = _join(base_checkpoint_dir, run_name)
         _makedirs(checkpoint_dir)
@@ -1866,8 +1627,6 @@ def main():
             if cli_args.lr is None:
                 lr = saved_training_config.get('lr', lr)
             weight_decay = saved_training_config.get('weight_decay', weight_decay)
-            pool_weight_decay = saved_training_config.get(
-                'pool_weight_decay', pool_weight_decay)
             warmup_ratio = saved_training_config.get('warmup_ratio', warmup_ratio)
             orth_weight = saved_training_config.get('orthogonality_weight', orth_weight)
             div_weight = saved_training_config.get('diversity_weight', div_weight)
@@ -1878,21 +1637,6 @@ def main():
                 'exploration_weight', exploration_weight)
             exploration_asymmetry = saved_training_config.get(
                 'exploration_asymmetry', exploration_asymmetry)
-            exploration_warmup_steps = saved_training_config.get(
-                'exploration_warmup_steps', exploration_warmup_steps)
-            exploration_lower_bound = saved_training_config.get(
-                'exploration_lower_bound', exploration_lower_bound)
-            exploration_upper_bound = saved_training_config.get(
-                'exploration_upper_bound', exploration_upper_bound)
-            exploration_bound_eps = saved_training_config.get(
-                'exploration_bound_eps', exploration_bound_eps)
-            # Accept legacy log_interval_fast key so ckpts saved before the
-            # 2-tier rename still resume without manual config fiddling.
-            log_interval = int(saved_training_config.get(
-                'log_interval',
-                saved_training_config.get('log_interval_fast', log_interval)))
-            log_analysis_multiplier = int(saved_training_config.get(
-                'log_analysis_multiplier', log_analysis_multiplier))
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
@@ -1902,7 +1646,6 @@ def main():
         'num_epochs': num_epochs,
         'lr': lr,
         'weight_decay': weight_decay,
-        'pool_weight_decay': pool_weight_decay,
         'warmup_ratio': warmup_ratio,
         'orthogonality_weight': orth_weight,
         'diversity_weight': div_weight,
@@ -1911,12 +1654,6 @@ def main():
         'dead_penalty_weight': dead_penalty_weight,
         'exploration_weight': exploration_weight,
         'exploration_asymmetry': exploration_asymmetry,
-        'exploration_warmup_steps': exploration_warmup_steps,
-        'exploration_lower_bound': exploration_lower_bound,
-        'exploration_upper_bound': exploration_upper_bound,
-        'exploration_bound_eps': exploration_bound_eps,
-        'log_interval': log_interval,
-        'log_analysis_multiplier': log_analysis_multiplier,
     }
 
     # ----------------------------------------------------------
@@ -2033,85 +1770,31 @@ def main():
         end_value=lr * 0.1,
     )
 
-    # v4.1 per-group WD: pool tensors (qk/v/know × emb/read/write) get
-    # pool_weight_decay; dense kernels get weight_decay. Bias / LayerNorm /
-    # learnable *_scale excluded from both groups.
-    #
-    # optax.adamw is chain(scale_by_adam, add_decayed_weights, scale_by_lr).
-    # To apply two different WDs we decompose it: one scale_by_adam, then
-    # two masked add_decayed_weights (base + pool — masks are disjoint so
-    # each param is touched at most once), then a single scale_by_lr.
-
-    _POOL_PARAM_NAMES = (
-        'qk_emb', 'v_emb', 'know_emb',
-        'qk_read', 'v_read', 'know_read',
-        'qk_write', 'v_write', 'know_write',
-    )
-
-    def _path_str(path):
-        return '/'.join(str(p) for p in path)
-
-    def _is_pool_param(path_str):
-        return any(name in path_str for name in _POOL_PARAM_NAMES)
-
-    def _is_excluded(path_str):
-        if 'bias' in path_str:
-            return True
-        if 'scale' in path_str and 'norm' in path_str.lower():
-            return True  # LayerNorm scale
-        if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
-           or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
-            return True  # learnable output_scale
-        return False
-
-    def _wd_mask_base(params):
-        def _f(path, _):
-            ps = _path_str(path)
-            if _is_excluded(ps):
-                return False
-            return not _is_pool_param(ps)
-        return jax.tree.map_with_path(_f, params)
-
-    def _wd_mask_pool(params):
-        def _f(path, _):
-            ps = _path_str(path)
-            if _is_excluded(ps):
-                return False
-            return _is_pool_param(ps)
-        return jax.tree.map_with_path(_f, params)
+    # WD mask: exclude bias, layernorm, and output_scale params
+    # Only apply mask if model has learnable scale params (v3.9.7.1+)
+    _has_scale = 'qk_scale' in params.get('neuron_pool', {}) or \
+                 'know_scale' in params.get('neuron_pool', {})
+    _wd_mask_fn = None
+    if _has_scale:
+        def _wd_mask(params):
+            def _should_decay(path, _):
+                path_str = '/'.join(str(p) for p in path)
+                if 'bias' in path_str:
+                    return False
+                if 'scale' in path_str and 'norm' in path_str.lower():
+                    return False  # LayerNorm scale
+                if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
+                   or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
+                    return False  # learnable output_scale
+                return True
+            return jax.tree.map_with_path(_should_decay, params)
+        _wd_mask_fn = _wd_mask
 
     base_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.scale_by_adam(b2=0.95),
-        optax.add_decayed_weights(weight_decay, mask=_wd_mask_base),
-        optax.add_decayed_weights(pool_weight_decay, mask=_wd_mask_pool),
-        optax.scale_by_learning_rate(schedule),
+        optax.adamw(learning_rate=schedule, weight_decay=weight_decay, b2=0.95,
+                    mask=_wd_mask_fn),
     )
-
-    if is_host0:
-        def _count_true(mask):
-            n = [0]
-            def _f(v):
-                if v:
-                    n[0] += 1
-                return v
-            jax.tree.map(_f, mask)
-            return n[0]
-        def _collect_pool_paths(mask):
-            out = []
-            def _f(path, v):
-                if v:
-                    out.append(_path_str(path))
-                return v
-            jax.tree.map_with_path(_f, mask)
-            return out
-        _base_mask = _wd_mask_base(params)
-        _pool_mask = _wd_mask_pool(params)
-        print(f"  WD groups: base ({weight_decay}) = {_count_true(_base_mask)} tensors, "
-              f"pool ({pool_weight_decay}) = {_count_true(_pool_mask)} tensors")
-        _pool_paths = _collect_pool_paths(_pool_mask)
-        if _pool_paths:
-            print(f"    pool params: {_pool_paths[:9]}")
 
     if grad_accum_steps > 1:
         optimizer = optax.MultiSteps(base_optimizer, every_k_schedule=grad_accum_steps)
@@ -2134,7 +1817,7 @@ def main():
         print(f"  Total optimizer steps: {total_steps}")
         print(f"  Warmup steps: {warmup_steps}")
         print(f"  LR: {lr}")
-        print(f"  Weight decay: {weight_decay} (pool: {pool_weight_decay})")
+        print(f"  Weight decay: {weight_decay}")
         print(f"  Orth weight: {orth_weight}")
         print(f"  Div weight: {div_weight}")
         print(f"  LB weight: {lb_weight}")
@@ -2142,19 +1825,6 @@ def main():
         print(f"  Dead penalty weight: {dead_penalty_weight}")
         print(f"  Exploration weight: {exploration_weight} "
               f"(asymmetry={exploration_asymmetry})")
-        print(f"    warmup_steps={exploration_warmup_steps} "
-              f"bounds=[{exploration_lower_bound}, {exploration_upper_bound}] "
-              f"eps={exploration_bound_eps}")
-        print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
-              f"router={cfg['model'].get('router_dropout', 0.0)}")
-        # v4.1+ gate closure constants (used when model_version registers
-        # _v41_sharded_kwargs; harmless to print otherwise — they're just
-        # cfg lookups with defaults).
-        print(f"  Gate (v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
-              f"act_thr={tcfg.get('activation_threshold', 0.5)} "
-              f"act_cut={tcfg.get('activation_cutoff', 0.01)} "
-              f"eps={tcfg.get('epsilon', 1.0e-4)} "
-              f"max_int={tcfg.get('max_intensity', 10.0)}")
 
     # ----------------------------------------------------------
     # Resume from checkpoint (resume_path detected earlier for config override)
@@ -2164,28 +1834,12 @@ def main():
     start_step_in_epoch = 0
     best_val_loss = float('inf')
 
-    def _strip_legacy_process_axis(ckpt_pytree, template_pytree):
-        """Legacy-compat for ckpts saved before _gather_for_save used
-        tiled=True. process_allgather(tiled=False) prepended a
-        (n_processes,) axis to every leaf (all slices equal for both
-        replicated and sharded-then-gathered arrays). Here we detect
-        the extra leading axis and take [0]. No-op on correctly-shaped
-        leaves."""
-        def _fix(ckpt_leaf, template_leaf):
-            arr = np.asarray(ckpt_leaf)
-            if arr.ndim == template_leaf.ndim + 1:
-                return arr[0]
-            return arr
-        return jax.tree.map(_fix, ckpt_pytree, template_pytree)
-
     if resume_path and _file_exists(resume_path):
         if is_host0:
             print(f"\nResuming from: {resume_path}")
         ckpt = load_checkpoint(resume_path, params, opt_state)
-        ckpt_params = _strip_legacy_process_axis(ckpt['params'], params)
-        ckpt_opt_state = _strip_legacy_process_axis(ckpt['opt_state'], opt_state)
-        params = ckpt_params
-        opt_state = ckpt_opt_state
+        params = ckpt['params']
+        opt_state = ckpt['opt_state']
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('step', 0)
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
@@ -2212,20 +1866,6 @@ def main():
             else:
                 print("\nStarting from scratch (--from-scratch).")
 
-    # Fail-fast check: global_step must match across hosts after resume.
-    # broadcast handles the common path but we still verify — if it ever
-    # drifts, hang-debugging mid-training is painful; raise now instead.
-    if n_hosts > 1:
-        _gs_local = np.array([global_step], dtype=np.int64)
-        _gs_all = np.asarray(process_allgather(_gs_local)).flatten()
-        if not np.all(_gs_all == global_step):
-            raise RuntimeError(
-                f"global_step inconsistent across hosts after resume: "
-                f"host {host_id} sees {global_step}, all hosts: {_gs_all.tolist()}. "
-                f"Resume broadcast likely failed or checkpoint files diverged.")
-        if is_host0:
-            print(f"  [verified] global_step={global_step} consistent across {n_hosts} hosts")
-
     # Save config.json for this run (host 0 only)
     if is_host0:
         try:
@@ -2242,7 +1882,7 @@ def main():
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
-    model_version = cfg['model'].get('model_version', 'spatial-r1-v4.1')
+    model_version = cfg['model'].get('model_version', '17.1')
     is_baseline = model_version == 'baseline'
     is_spatial = (model_version == 'spatial-r1'
                   or model_version.startswith('spatial-r1-v2')
@@ -2311,28 +1951,45 @@ def main():
     else:
         opt_state = optimizer.init(params)
 
-    # Create shard_map functions if mesh_model > 1 or the model demands
-    # the sharded path (v4.1 removed its non-sharded fallback).
+    # Create shard_map functions if mesh_model > 1 (or always for v4.0.4
+    # which removed its non-sharded fallback and depends on the sharded path).
     _sharded_fns = None
-    _spec = MODEL_REGISTRY.get(model_version)
-    _force_sharded = bool(_spec and _spec.force_sharded)
-    if _spec is not None and (mesh_model > 1 or _force_sharded):
-        if not _spec.supports_sharded:
-            raise RuntimeError(
-                f"model_version={model_version!r} is registered without "
-                f"supports_sharded=True but mesh_model>1 or force_sharded=True.")
-        _v3 = __import__(_spec.module_path, fromlist=['make_sharded_srw'])
+    _force_sharded = model_version in ('spatial-r1-v4.0.4', 'spatial-r1-v4.0.5',
+                                        'spatial-r1-v4.0.6', 'spatial-r1-v4.1')
+    if mesh_model > 1 or _force_sharded:
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp', 'spatial-r1-v4.1': 'models.dawn_spatial_v41_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
+        _gnm = cfg['model'].get('gate_norm_mode', 'sqrt_active')
         _srw_kwargs = {'mesh': mesh, 'max_chunk_size': max_chunk}
-        if _spec.sharded_kwargs is not None:
-            _srw_kwargs.update(_spec.sharded_kwargs(cfg))
+        if model_version.startswith('spatial-r1-v3.9.5'):
+            _srw_kwargs['gate_norm_mode'] = _gnm
+        # v4.0.4: reverse_p_max is a runtime scalar passed through shard_map
+        # at each call (see _attn_forward / _know_forward); not a builder kwarg.
+        # v4.0.6: dead_threshold is a builder kwarg (closure constant).
+        if model_version in ('spatial-r1-v4.0.6', 'spatial-r1-v4.1'):
+            _srw_kwargs['dead_threshold'] = cfg['training'].get(
+                'dead_penalty_threshold',
+                0.01 if model_version == 'spatial-r1-v4.1' else 1e-4)
+        # v4.1: sharpness / activation_threshold / activation_cutoff /
+        # epsilon / max_intensity — all closure constants for the
+        # two-stage gate.
+        if model_version == 'spatial-r1-v4.1':
+            _srw_kwargs['sharpness'] = cfg['training'].get('sharpness', 500.0)
+            _srw_kwargs['activation_threshold'] = cfg['training'].get(
+                'activation_threshold', 0.5)
+            _srw_kwargs['activation_cutoff'] = cfg['training'].get(
+                'activation_cutoff', 0.01)
+            _srw_kwargs['epsilon'] = cfg['training'].get('epsilon', 1e-4)
+            _srw_kwargs['max_intensity'] = cfg['training'].get(
+                'max_intensity', 10.0)
         _sharded_single = make_sharded_srw(**_srw_kwargs)
         if hasattr(_v3, 'make_sharded_srw_paired'):
             _sharded_paired = _v3.make_sharded_srw_paired(**_srw_kwargs)
             _sharded_fns = (_sharded_single, _sharded_paired)
         else:
-            _sharded_fns = _sharded_single
+            _sharded_fns = _sharded_single  # v4.0.2: no paired (Q/K split)
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused)")
 
@@ -2341,10 +1998,6 @@ def main():
         tau_reg_weight, dead_penalty_weight,
         exploration_weight, exploration_asymmetry,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
-        exploration_warmup_steps=exploration_warmup_steps,
-        exploration_lower_bound=exploration_lower_bound,
-        exploration_upper_bound=exploration_upper_bound,
-        exploration_bound_eps=exploration_bound_eps,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
@@ -2377,7 +2030,7 @@ def main():
         jit_start = time.time()
         _dp, _do, dummy_metrics = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_step_rng,
-            _dummy_emb_snap, jnp.asarray(0, jnp.int32))
+            _dummy_emb_snap)
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         jit_loss = float(dummy_metrics['total_loss'])
@@ -2392,7 +2045,7 @@ def main():
         step_start = time.time()
         _dp2, _do2, dummy_metrics2 = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
-            _dummy_emb_snap, jnp.asarray(0, jnp.int32))
+            _dummy_emb_snap)
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
@@ -2420,9 +2073,8 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3 = __import__(
-                MODEL_REGISTRY[model_version].module_path,
-                fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp', 'spatial-r1-v4.1': 'models.dawn_spatial_v41_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
             # Use actual sharded params (no device_get)
@@ -2774,22 +2426,11 @@ def main():
     # ----------------------------------------------------------
     if is_host0:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        # On resume, reuse the existing log filenames from the run folder
-        # so the session appends to the prior log instead of fragmenting
-        # into training_log_<ts1>.txt + training_log_<ts2>.txt + ...
-        _existing_logs = sorted(_list_files(log_dir, "training_log_*.txt"))
-        _existing_jsonls = sorted(_list_files(log_dir, "metrics_*.jsonl"))
-        _is_log_resume = (resume_path is not None) and bool(_existing_logs)
-        if _is_log_resume:
-            training_log_file = _existing_logs[-1]
-            jsonl_log_file = (_existing_jsonls[-1] if _existing_jsonls
-                              else _join(log_dir, f'metrics_{timestamp}.jsonl'))
-        else:
-            training_log_file = _join(log_dir, f'training_log_{timestamp}.txt')
-            jsonl_log_file = _join(log_dir, f'metrics_{timestamp}.jsonl')
+        training_log_file = _join(log_dir, f'training_log_{timestamp}.txt')
+        jsonl_log_file = _join(log_dir, f'metrics_{timestamp}.jsonl')
 
         # Set up loggers (local append + periodic GCS sync)
-        _setup_loggers(training_log_file, jsonl_log_file, resume=_is_log_resume)
+        _setup_loggers(training_log_file, jsonl_log_file)
 
         n_params = count_parameters(params)
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
@@ -2833,17 +2474,18 @@ def main():
     def _gather_for_save(x):
         """Gather sharded params to host-local full arrays for checkpoint save.
 
-        Uses process_allgather with tiled=True so the output reconstructs
-        the global shape — sharded axes get concatenated across processes
-        and replicated arrays pass through unchanged. Without tiled=True
-        (JAX default) process_allgather PREPENDS a (n_processes,) axis to
-        every leaf, which silently corrupted every checkpoint written
-        before 2026-04-23 on any mesh that triggered this path. Legacy
-        ckpts are de-corrupted in the load path (see _strip_legacy_process_axis).
+        Always calls process_allgather so sharded axes are correctly
+        reconstructed regardless of mesh shape. Under the current
+        mesh_model=2 config the model axis stays within one host and a
+        plain device_get on host 0 happens to reconstruct the full
+        array; under mesh_model>=4 (axis crosses host boundaries) only
+        process_allgather produces the full array on host 0. For
+        already-replicated params this is effectively a no-op — the
+        collective returns the same global view on every host.
 
         Must be called from ALL hosts simultaneously (collective).
         """
-        return jax.device_get(process_allgather(x, tiled=True))
+        return jax.device_get(process_allgather(x))
 
     signal.signal(signal.SIGTERM, handle_preemption)
     if is_host0:
@@ -2863,15 +2505,6 @@ def main():
     ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
-    # 2-tier logging cadence. ANALYSIS interval is a multiple of REGULAR
-    # so every ANALYSIS step is also a REGULAR step — no duplicate JSONL
-    # records, and console output stacks cleanly (REGULAR -> ANALYSIS).
-    LOG_REGULAR = log_interval
-    LOG_ANALYSIS = log_interval * log_analysis_multiplier
-    if is_host0:
-        print(f"  Log cadence: regular={LOG_REGULAR} analysis={LOG_ANALYSIS}",
-              flush=True)
-
     # Emb drift snapshot (sense vectors). Held on every host, refreshed at
     # each log event. Fed into train_step so the drift collective runs inside
     # jit on all hosts; the actual ||·|| reductions live there.
@@ -2883,24 +2516,20 @@ def main():
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
-        # Epoch accumulators on device — one device_get per epoch at the
-        # end, rather than per-step float()/int() sync.
-        _epoch_loss_jax = jnp.float32(0.0)
-        # int64: valid_count sums to ~n_steps * tokens_per_step, which
-        # exceeds int32 range (2.15e9) on any multi-billion-token epoch.
-        _epoch_correct_jax = jnp.int64(0)
-        _epoch_valid_jax = jnp.int64(0)
+        epoch_loss = 0.0
+        epoch_correct = 0
+        epoch_valid = 0
         epoch_steps = 0
 
-        # Window accumulators on device — one device_get per log boundary.
-        _win_loss_jax = jnp.float32(0.0)
-        _win_ce_jax = jnp.float32(0.0)
-        _win_aux_jax = jnp.float32(0.0)
-        _win_tau_reg_jax = jnp.float32(0.0)
-        _win_orth_jax = jnp.float32(0.0)
-        _win_div_jax = jnp.float32(0.0)
-        _win_correct_jax = jnp.int32(0)
-        _win_valid_jax = jnp.int32(0)
+        # Window accumulators for periodic logging
+        win_loss = 0.0
+        win_ce = 0.0
+        win_aux = 0.0
+        win_tau_reg = 0.0
+        win_orth = 0.0
+        win_div = 0.0
+        win_correct = 0
+        win_valid = 0
         win_count = 0
         win_start_time = time.time()
 
@@ -2938,152 +2567,581 @@ def main():
 
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
-                input_ids, attention_mask, step_rng, _prev_emb_snap,
-                jnp.asarray(global_step, jnp.int32))
+                input_ids, attention_mask, step_rng, _prev_emb_snap)
 
-            # Scalar helper kept for log-block use (m_grad etc.).
+            # Extract metrics (scalars from jit, no [0] indexing)
             def _m(v):
                 return float(v)
+            m_total = _m(metrics['total_loss'])
+            m_ce = _m(metrics['ce_loss'])
+            m_aux = _m(metrics['aux_loss'])
+            m_tau_reg = _m(metrics.get('tau_reg', 0.0))
+            m_orth = _m(metrics['orth_loss'])
+            m_div = _m(metrics['div_loss'])
+            m_correct = int(_m(metrics['correct']))
+            m_valid = int(_m(metrics['valid_count']))
 
-            # Device-side accumulation — no per-step TPU→CPU sync on the
-            # regression/metric scalars. Window + epoch values are
-            # materialized only at log boundary and end of epoch.
-            # Token-weighted accumulation: every window/epoch loss is summed
-            # as (loss * valid_count) so the final avg divides by total
-            # valid tokens, matching evaluate()'s token-level mean. Makes
-            # train/val loss directly comparable.
-            _valid_f = metrics['valid_count'].astype(jnp.float32)
-            _win_loss_jax = _win_loss_jax + metrics['total_loss'] * _valid_f
-            _win_ce_jax = _win_ce_jax + metrics['ce_loss'] * _valid_f
-            _win_aux_jax = _win_aux_jax + metrics['aux_loss'] * _valid_f
-            _win_tau_reg_jax = _win_tau_reg_jax + metrics.get('tau_reg', jnp.float32(0.0)) * _valid_f
-            _win_orth_jax = _win_orth_jax + metrics['orth_loss'] * _valid_f
-            _win_div_jax = _win_div_jax + metrics['div_loss'] * _valid_f
-            _win_correct_jax = _win_correct_jax + metrics['correct']
-            _win_valid_jax = _win_valid_jax + metrics['valid_count']
+            # NaN/INF detection
+            if check_nan_inf({
+                'total_loss': m_total, 'ce_loss': m_ce, 'aux_loss': m_aux,
+                'tau_reg': m_tau_reg,
+                'orth_loss': m_orth, 'div_loss': m_div,
+            }, global_step + 1, epoch):
+                raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {global_step + 1}")
 
-            _epoch_loss_jax = _epoch_loss_jax + metrics['ce_loss'] * _valid_f
-            _epoch_correct_jax = _epoch_correct_jax + metrics['correct']
-            _epoch_valid_jax = _epoch_valid_jax + metrics['valid_count']
-
-            win_count += 1
+            epoch_loss += m_ce * m_valid
+            epoch_correct += m_correct
+            epoch_valid += m_valid
             epoch_steps += 1
 
-            # Per-step NaN check on total_loss only. A single scalar sync
-            # catches loss explosions immediately; the full 6-key check runs
-            # at log boundary on already-materialized window averages.
-            _m_total_for_nan = float(metrics['total_loss'])
-            if not np.isfinite(_m_total_for_nan):
-                raise ValueError(
-                    f"NaN/INF total_loss at epoch {epoch}, step {global_step + 1}")
+            win_loss += m_total
+            win_ce += m_ce
+            win_aux += m_aux
+            win_tau_reg += m_tau_reg
+            win_orth += m_orth
+            win_div += m_div
+            win_correct += m_correct
+            win_valid += m_valid
+            win_count += 1
 
             global_step += 1
             epoch_step_counter += 1
 
-            # ---- 2-tier periodic logging (REGULAR / ANALYSIS) ----
-            _is_early_debug = global_step in (1, 5, 10, 20, 50)
-            is_regular = (global_step % LOG_REGULAR == 0) or _is_early_debug or debug_mode
-            is_analysis = is_regular and (
-                (global_step % LOG_ANALYSIS == 0)
-                or (global_step == 1)
-                or debug_mode
-            )
-
-            if is_regular:
+            # ---- Periodic logging (host 0 only) ----
+            _early_debug = global_step in (1, 5, 10, 20, 50)
+            if global_step % LOG_INTERVAL == 0 or _early_debug or debug_mode:
                 # Refresh emb-drift snapshot on every host (ref reassignment
                 # only — no collective). Must run outside is_host0 so the
-                # next jit'd train_step sees a consistent snap pytree.
+                # next jit'd train_step sees a consistent snap pytree on all
+                # hosts.
                 _prev_emb_snap = {
                     'qk_emb': params['neuron_pool']['qk_emb'],
                     'v_emb': params['neuron_pool']['v_emb'],
                     'know_emb': params['neuron_pool']['know_emb'],
                 }
-                # One TPU→CPU sync for the whole window.
-                _win_vals = jax.device_get({
-                    'loss': _win_loss_jax, 'ce': _win_ce_jax,
-                    'aux': _win_aux_jax, 'tau_reg': _win_tau_reg_jax,
-                    'orth': _win_orth_jax, 'div': _win_div_jax,
-                    'correct': _win_correct_jax, 'valid': _win_valid_jax,
-                })
-                _win_correct_py = int(_win_vals['correct'])
-                _win_valid_py = int(_win_vals['valid'])
-                _vdiv = _win_valid_py if _win_valid_py > 0 else 1
-                win_avgs = {
-                    'loss':    float(_win_vals['loss'])    / _vdiv,
-                    'ce':      float(_win_vals['ce'])      / _vdiv,
-                    'aux':     float(_win_vals['aux'])     / _vdiv,
-                    'tau_reg': float(_win_vals['tau_reg']) / _vdiv,
-                    'orth':    float(_win_vals['orth'])    / _vdiv,
-                    'div':     float(_win_vals['div'])     / _vdiv,
-                    'acc':     _win_correct_py             / _vdiv,
-                }
-                # Full NaN/INF check on the materialized window averages.
-                if check_nan_inf({
-                    'total_loss': win_avgs['loss'], 'ce_loss': win_avgs['ce'],
-                    'aux_loss': win_avgs['aux'], 'tau_reg': win_avgs['tau_reg'],
-                    'orth_loss': win_avgs['orth'], 'div_loss': win_avgs['div'],
-                }, global_step, epoch):
-                    raise ValueError(
-                        f"NaN/INF window averages at epoch {epoch}, step {global_step}")
-
                 if is_host0:
-                    _elapsed = time.time() - win_start_time
-                    _steps_per_sec = (win_count / _elapsed) if _elapsed > 0 else 0.0
-                    _opt_step = global_step // grad_accum_steps
-                    _current_lr = float(schedule(_opt_step))
-                    _total_elapsed = time.time() - train_start_time
-                    _epoch_elapsed = time.time() - epoch_start
-                    _progress = (global_step / total_micro_steps * 100
-                                 if total_micro_steps > 0 else 0.0)
-                    _s_per_it = _epoch_elapsed / epoch_steps if epoch_steps > 0 else 0.0
-                    _remaining = max(steps_per_epoch - epoch_steps, 0)
-                    _eta = _s_per_it * _remaining
-                    ctx = {
-                        'lb_weight': lb_weight,
-                        'tau_reg_weight': tau_reg_weight,
-                        'orth_weight': orth_weight,
-                        'div_weight': div_weight,
-                        'dead_penalty_weight': dead_penalty_weight,
-                        'n_qk_cfg': cfg['model'].get('n_qk', 0),
-                        'n_v_cfg': cfg['model'].get('n_v', 0),
-                        'n_know_cfg': cfg['model'].get('n_know', 0),
-                        'current_lr': _current_lr,
-                        'steps_per_sec': _steps_per_sec,
-                        'total_elapsed': _total_elapsed,
-                        'epoch_elapsed': _epoch_elapsed,
-                        'eta': _eta,
-                        's_per_it': _s_per_it,
-                        'total_micro_steps': total_micro_steps,
-                        'progress': _progress,
-                    }
-                    rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
-                    _print_regular_block(rec, ctx)
-                    if is_analysis:
-                        rec = _build_analysis_record(rec, metrics, ctx)
-                        _print_analysis_block(rec, ctx)
-                        log_jsonl({'type': 'train_analysis', **rec})
-                    else:
-                        log_jsonl({'type': 'train', **rec})
+                    elapsed = time.time() - win_start_time
+                    steps_per_sec = win_count / elapsed if elapsed > 0 else 0
+                    avg_loss = win_loss / win_count
+                    avg_ce = win_ce / win_count
+                    avg_aux = win_aux / win_count
+                    avg_tau_reg = win_tau_reg / win_count
+                    avg_orth = win_orth / win_count
+                    avg_div = win_div / win_count
+                    avg_acc = win_correct / win_valid if win_valid > 0 else 0.0
+
+                    # Current LR from schedule (indexed by optimizer step, not micro-step)
+                    opt_step = global_step // grad_accum_steps
+                    current_lr = float(schedule(opt_step))
+
+                    total_elapsed = time.time() - train_start_time
+                    epoch_elapsed = time.time() - epoch_start
+                    progress = global_step / total_micro_steps * 100
+
+                    # Timing: elapsed<remaining, s/it
+                    s_per_it = epoch_elapsed / epoch_steps if epoch_steps > 0 else 0
+                    remaining_steps = steps_per_epoch - epoch_steps
+                    eta = s_per_it * remaining_steps
+
+                    # Grad norm
+                    m_grad = _m(metrics['grad_norm'])
+
+                    msg = (
+                        f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
+                        f"loss={avg_loss:.4f} ce={avg_ce:.4f} | "
+                        f"reg(raw): aux={avg_aux:.4f} tau_reg={avg_tau_reg:.4f} "
+                        f"orth={avg_orth:.2e} div={avg_div:.2e} | "
+                        f"acc={avg_acc:.4f} lr={current_lr:.2e} "
+                        f"{format_time(epoch_elapsed)}<{format_time(eta)}, {s_per_it:.2f}s/it"
+                    )
+                    log_message(msg)
+
+                    # Defensive defaults for downstream JSONL so values exist
+                    # even if the detailed-stats block below raises.
+                    a_tau_s = np.zeros(3, dtype=np.float32)
+                    k_tau_s = 0.0
+                    a_kern = 0.0
+                    k_kern = 0.0
+                    k_tau_abs = 0.0
+                    a_tau_abs = 0.0
+                    k_z075 = 0.0
+                    a_z075 = 0.0
+                    k_z030 = 0.0
+                    a_z030 = 0.0
+                    k_skew = 0.0
+                    a_skew = 0.0
+                    k_apt = 0.0
+                    a_apt = 0.0
+                    k_ent = 0.0
+                    a_ent = 0.0
+                    k_zsum = 0.0
+                    a_zsum = 0.0
+                    k_emb_nmax = 0.0
+                    k_emb_nmin = 0.0
+                    k_emb_nstd = 0.0
+                    qk_emb_nmean = 0.0
+                    qk_emb_nmax = 0.0
+                    qk_emb_nmin = 0.0
+                    qk_emb_nstd = 0.0
+                    v_emb_nmean = 0.0
+                    v_emb_nmax = 0.0
+                    v_emb_nmin = 0.0
+                    v_emb_nstd = 0.0
+                    k_kurt = 0.0
+                    a_kurt = 0.0
+                    k_drop = 0.0
+                    a_drop = 0.0
+                    k_boost = 0.0
+                    a_boost = 0.0
+
+                    # Detailed stats (all from metrics, no params access)
+                    try:
+                        tk_b = _m(metrics['tau_know_bias'])
+                        ta_b = [_m(metrics['tau_attn_bias_0']),
+                                _m(metrics['tau_attn_bias_1']),
+                                _m(metrics['tau_attn_bias_2'])]
+                        tau_s = (f"tau: know={tk_b:.2f} "
+                                 f"attn=[{ta_b[0]:.2f},{ta_b[1]:.2f},{ta_b[2]:.2f}]")
+
+                        m_attn_aux = _m(metrics.get('attn_aux', 0.0))
+                        m_know_aux = _m(metrics.get('know_aux', 0.0))
+                        k_emb_n = _m(metrics.get('know_emb_norm', 0.0))
+                        k_read_n = _m(metrics.get('know_read_norm', 0.0))
+                        k_write_n = _m(metrics.get('know_write_norm', 0.0))
+
+                        n_know_cfg = cfg['model'].get('n_know', 27200)
+                        n_qk_cfg = cfg['model'].get('n_qk', 0)
+                        n_v_cfg = cfg['model'].get('n_v', 0)
+                        k_act = _m(metrics['know_active'])
+                        k_aN = _m(metrics.get('know_active_N', 0.0))
+                        k_sstd = _m(metrics.get('know_score_std', 0.0))
+                        k_raw_gmax = _m(metrics.get('know_raw_gate_max', metrics.get('know_gate_max', 0.0)))
+                        k_gsum = _m(metrics.get('know_gate_sum', 0.0))
+                        k_zsum = _m(metrics.get('know_z_sum', 0.0))
+                        k_gconc = _m(metrics.get('know_gate_conc', 0.0))
+                        k_anm = _m(metrics.get('know_active_n_mean', 0.0))
+                        k_strong = _m(metrics.get('know_strong', 0.0))
+
+                        a_qk_act = _m(metrics.get('attn_qk_active', 0.0))
+                        a_v_act = _m(metrics.get('attn_v_active', 0.0))
+                        a_aN = _m(metrics.get('attn_active_N', 0.0))
+                        a_sstd = _m(metrics.get('attn_score_std', 0.0))
+                        a_raw_gmax = _m(metrics.get('attn_raw_gate_max', metrics.get('attn_gate_max', 0.0)))
+                        a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
+                        a_zsum = _m(metrics.get('attn_z_sum', 0.0))
+                        a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
+                        a_anm = _m(metrics.get('attn_active_n_mean', 0.0))
+                        a_strong = _m(metrics.get('attn_strong', 0.0))
+                        a_out_n = _m(metrics.get('attn_out_norm', 0.0))
+
+                        a_tau_m = _m(metrics.get('attn_tau_mean', 0.0))
+                        k_tau_m = _m(metrics.get('know_tau_mean', 0.0))
+                        k_out_n = _m(metrics.get('know_out_norm', 0.0))
+
+                        # tau_offset per-token std + kernel Frobenius norm
+                        # (distinguishes bias-only offset from active per-token routing)
+                        try:
+                            a_tau_s = np.asarray(jax.device_get(metrics.get(
+                                'attn_tau_std', jnp.zeros(3))))
+                            if a_tau_s.size < 3:
+                                a_tau_s = np.zeros(3, dtype=np.float32)
+                        except Exception:
+                            a_tau_s = np.zeros(3, dtype=np.float32)
+                        k_tau_s = _m(metrics.get('know_tau_std', 0.0))
+                        a_kern = _m(metrics.get('attn_tau_kernel_norm', 0.0))
+                        k_kern = _m(metrics.get('know_tau_kernel_norm', 0.0))
+
+                        log_message(
+                            f"      {tau_s} | tau_mean: attn={a_tau_m:.3f}"
+                            f" know={k_tau_m:.3f} | grad_norm={m_grad:.3f}")
+                        log_message(
+                            f"      tau_struct: k_std={k_tau_s:.3f}"
+                            f" a_std=[{float(a_tau_s[0]):.3f},{float(a_tau_s[1]):.3f},{float(a_tau_s[2]):.3f}]"
+                            f" k_kern={k_kern:.2f} a_kern={a_kern:.2f}")
+
+                        # Absolute gate threshold + z-margin distribution
+                        k_tau_abs = _m(metrics.get('know_tau_abs_mean', 0.0))
+                        a_tau_abs = _m(metrics.get('attn_tau_abs_mean', 0.0))
+                        k_z075 = _m(metrics.get('know_z_lt_075', 0.0))
+                        a_z075 = _m(metrics.get('attn_z_lt_075', 0.0))
+                        k_z030 = _m(metrics.get('know_z_lt_030', 0.0))
+                        a_z030 = _m(metrics.get('attn_z_lt_030', 0.0))
+                        log_message(
+                            f"      gate_margin: k[abs={k_tau_abs:+.3f}"
+                            f" z<075={k_z075*100:.2f}% z<030={k_z030*100:.2f}%]"
+                            f" a[abs={a_tau_abs:+.3f}"
+                            f" z<075={a_z075*100:.2f}% z<030={a_z030*100:.2f}%]")
+
+                        # Score-dist skewness + active-count std across tokens
+                        k_skew = _m(metrics.get('know_score_skew', 0.0))
+                        a_skew = _m(metrics.get('attn_score_skew', 0.0))
+                        k_apt = _m(metrics.get('know_active_per_token_std', 0.0))
+                        a_apt = _m(metrics.get('attn_active_per_token_std', 0.0))
+                        k_ent = _m(metrics.get('know_gate_entropy', 0.0))
+                        a_ent = _m(metrics.get('attn_gate_entropy', 0.0))
+                        k_kurt = _m(metrics.get('know_score_kurt', 0.0))
+                        a_kurt = _m(metrics.get('attn_score_kurt', 0.0))
+                        # Dead count (v4.0.6+). alpha / tau_shift / s_std_min
+                        # removed in v4.1 (dynamic tau gone).
+                        k_dead = _m(metrics.get('know_dead_count', 0.0))
+                        a_dead = _m(metrics.get('attn_dead_count', 0.0))
+                        log_message(
+                            f"      dist: k[skew={k_skew:+.2f} kurt={k_kurt:.2f}"
+                            f" apt_std={k_apt:.1f} ent={k_ent:.2f} dead={int(k_dead)}]"
+                            f" a[skew={a_skew:+.2f} kurt={a_kurt:.2f}"
+                            f" apt_std={a_apt:.1f} ent={a_ent:.2f} dead={int(a_dead)}]")
+
+                        # v4.1 tau_offset distribution — prime diagnostic
+                        # for exploration-driven runaway.
+                        a_tau_off_min = _m(metrics.get('attn_tau_off_min', 0.0))
+                        a_tau_off_max = _m(metrics.get('attn_tau_off_max', 0.0))
+                        a_tau_off_p99 = _m(metrics.get('attn_tau_off_p99', 0.0))
+                        a_tau_off_neg = _m(metrics.get('attn_tau_off_neg_frac', 0.0))
+                        k_tau_off_min = _m(metrics.get('know_tau_off_min', 0.0))
+                        k_tau_off_max = _m(metrics.get('know_tau_off_max', 0.0))
+                        k_tau_off_p99 = _m(metrics.get('know_tau_off_p99', 0.0))
+                        k_tau_off_neg = _m(metrics.get('know_tau_off_neg_frac', 0.0))
+                        log_message(
+                            f"      tau_off k: min={k_tau_off_min:+.2f}"
+                            f" max={k_tau_off_max:+.2f}"
+                            f" p99={k_tau_off_p99:+.2f}"
+                            f" neg={k_tau_off_neg*100:.1f}%")
+                        log_message(
+                            f"      tau_off a: min={a_tau_off_min:+.2f}"
+                            f" max={a_tau_off_max:+.2f}"
+                            f" p99={a_tau_off_p99:+.2f}"
+                            f" neg={a_tau_off_neg*100:.1f}%")
+
+                        # v4.1 RPE exploration (batch-global-mean baseline,
+                        # asymmetric signal; no EMA / warmup).
+                        m_global_ce = _m(metrics.get('global_mean_ce', 0.0))
+                        m_pos_frac = _m(metrics.get('pos_frac', 0.0))
+                        m_pos_mean = _m(metrics.get('pos_mean', 0.0))
+                        m_neg_mean = _m(metrics.get('neg_mean', 0.0))
+                        m_explore_a = _m(metrics.get('explore_attn_raw', 0.0))
+                        m_explore_k = _m(metrics.get('explore_know_raw', 0.0))
+                        m_explore_w = _m(metrics.get('explore_loss_weighted', 0.0))
+                        m_block_a = _m(metrics.get('explore_block_frac_a', 0.0))
+                        m_block_k = _m(metrics.get('explore_block_frac_k', 0.0))
+                        m_sig_pmax = _m(metrics.get('sig_pos_max', 0.0))
+                        m_sig_nmax = _m(metrics.get('sig_neg_max', 0.0))
+                        log_message(
+                            f"      rpe: mean_ce={m_global_ce:.3f}"
+                            f" pos_frac={m_pos_frac*100:.1f}%"
+                            f" pos_avg={m_pos_mean:.3f} neg_avg={m_neg_mean:.3f}"
+                            f" sig[max+={m_sig_pmax:.2f} max-={m_sig_nmax:.2f}]"
+                            f" expl[a={m_explore_a:+.3f} k={m_explore_k:+.3f}]"
+                            f" w={m_explore_w:+.4f}"
+                            f" block[a={m_block_a*100:.1f}% k={m_block_k*100:.1f}%]")
+
+                        # Emb norm per-pool stats (mean / max / min / std)
+                        k_emb_nmax = _m(metrics.get('know_emb_norm_max', 0.0))
+                        k_emb_nmin = _m(metrics.get('know_emb_norm_min', 0.0))
+                        k_emb_nstd = _m(metrics.get('know_emb_norm_std', 0.0))
+                        qk_emb_nmean = _m(metrics.get('qk_emb_norm_mean', 0.0))
+                        qk_emb_nmax = _m(metrics.get('qk_emb_norm_max', 0.0))
+                        qk_emb_nmin = _m(metrics.get('qk_emb_norm_min', 0.0))
+                        qk_emb_nstd = _m(metrics.get('qk_emb_norm_std', 0.0))
+                        v_emb_nmean = _m(metrics.get('v_emb_norm_mean', 0.0))
+                        v_emb_nmax = _m(metrics.get('v_emb_norm_max', 0.0))
+                        v_emb_nmin = _m(metrics.get('v_emb_norm_min', 0.0))
+                        v_emb_nstd = _m(metrics.get('v_emb_norm_std', 0.0))
+                        log_message(
+                            f"      emb_n: k[{k_emb_n:.3f}/{k_emb_nstd:.3f} min={k_emb_nmin:.3f}]"
+                            f" qk[{qk_emb_nmean:.3f}/{qk_emb_nstd:.3f} min={qk_emb_nmin:.3f}]"
+                            f" v[{v_emb_nmean:.3f}/{v_emb_nstd:.3f} min={v_emb_nmin:.3f}]")
+
+                        # Emb drift: reduced inside train_step (all hosts),
+                        # so here we just read scalar metrics.
+                        drift_qk = _m(metrics.get('drift_qk_emb', 0.0))
+                        drift_v = _m(metrics.get('drift_v_emb', 0.0))
+                        drift_know = _m(metrics.get('drift_know_emb', 0.0))
+                        log_message(
+                            f"      drift ({LOG_INTERVAL}step):"
+                            f" qk_emb={drift_qk:.4e}"
+                            f" v_emb={drift_v:.4e}"
+                            f" know_emb={drift_know:.4e}")
+                        # v4.1: aux line removed (lb_weight=0 → no loss contribution).
+                        k_raw_n = _m(metrics.get('know_raw_out_norm', 0.0))
+                        a_qk_raw_n = _m(metrics.get('attn_qk_raw_norm', 0.0))
+                        a_v_raw_n = _m(metrics.get('attn_v_raw_norm', 0.0))
+
+                        # know line: show active_N or gate_sum/conc depending on version
+                        k_extra = ""
+                        if k_gsum > 0:  # v3.9.1+
+                            k_extra = f" gate_max={k_raw_gmax:.4f} conc={k_gconc:.1f} gsum={k_gsum:.1f}"
+                        if k_anm > 0:  # v3.9.5
+                            k_extra = f" gate_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
+                        if k_zsum > 0:  # v4.0.3 (Σz^+ denominator)
+                            k_extra += f" z_sum={k_zsum:.1f}"
+                        if k_aN > 0:    # v3.9.2
+                            k_extra += f" active_N={k_aN:.0f}"
+
+                        # v4.0.0 (symmetric gate): know_pos metric exists → show pos/neg split
+                        # All others (ReLU/GELU gate): show active/total + optional strong
+                        _has_pos = bool(metrics.get('know_pos', 0.0))
+                        if _has_pos:
+                            k_pos = _m(metrics.get('know_pos', k_strong))
+                            k_neg = max(k_act - k_pos, 0.0)
+                            k_pos_n = k_pos * n_know_cfg
+                            k_neg_n = k_neg * n_know_cfg
+                            k_total_n = k_act * n_know_cfg
+                            log_message(
+                                f"      know: pos={k_pos_n:.0f}({k_pos*100:.1f}%)"
+                                f" neg={k_neg_n:.0f}({k_neg*100:.1f}%)"
+                                f" active={k_total_n:.0f}({k_act*100:.1f}%){k_extra}"
+                                f" s_std={k_sstd:.3f}"
+                                f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
+                        else:
+                            # v4.1 compressed know line.
+                            k_phi = _m(metrics.get('know_phi_binary', 0.0))
+                            k_z_act = _m(metrics.get('know_z_mean_active', 0.0))
+                            k_z075 = _m(metrics.get('know_z_lt_075', 0.0))
+                            k_z030 = _m(metrics.get('know_z_lt_030', 0.0))
+                            k_int_max = _m(metrics.get('know_int_max', 0.0))
+                            k_int_cap = _m(metrics.get('know_int_cap_frac', 0.0))
+                            k_act_n = k_act * n_know_cfg
+                            k_strong_n = k_strong * n_know_cfg
+                            k_strong_of_act = k_strong_n / max(k_act_n, 1.0)
+                            log_message(
+                                f"      know: act={k_act_n:.0f}/{n_know_cfg}({k_act*100:.1f}%)"
+                                f" strong={k_strong_n:.0f}/{k_act_n:.0f}({k_strong_of_act*100:.1f}%)"
+                                f" gate_max={k_raw_gmax:.2f}"
+                                f" int_avg={k_z_act:.2f} int_max={k_int_max:.2f}"
+                                f" cap={k_int_cap*100:.1f}%"
+                                f" s_std={k_sstd:.2f} raw={k_raw_n:.3f} out={k_out_n:.2f}"
+                                f" phi_bin={k_phi*100:.1f}% bnd={k_z075*100:.1f}%"
+                                f" mid={k_z030*100:.1f}%")
+
+                        # attn line
+                        a_extra = ""
+                        if a_gsum > 0:  # v3.9.1+
+                            a_extra = f" gate_max={a_raw_gmax:.4f} conc={a_gconc:.1f} gsum={a_gsum:.1f}"
+                        if a_anm > 0:  # v3.9.5
+                            a_extra = f" gate_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
+                        if a_aN > 0:    # v3.9.2
+                            a_extra += f" active_N={a_aN:.0f}"
+                        if a_zsum > 0:  # v4.0.3 (Σz^+ denominator)
+                            a_extra += f" z_sum={a_zsum:.1f}"
+
+                        _has_attn_pos = bool(metrics.get('attn_qk_pos', metrics.get('attn_pos', 0.0)))
+                        if _has_attn_pos:
+                            a_qk_pos = _m(metrics.get('attn_qk_pos', metrics.get('attn_pos', metrics.get('attn_strong', 0.0))))
+                            a_v_pos = _m(metrics.get('attn_v_pos', 0.0))
+                            a_qk_neg = max(a_qk_act - a_qk_pos, 0.0)
+                            a_v_neg = max(a_v_act - a_v_pos, 0.0)
+                            log_message(
+                                f"      attn: qk_pos={a_qk_pos*n_qk_cfg:.0f}({a_qk_pos*100:.1f}%)"
+                                f" qk_neg={a_qk_neg*n_qk_cfg:.0f}({a_qk_neg*100:.1f}%)"
+                                f" v_pos={a_v_pos*n_v_cfg:.0f}({a_v_pos*100:.1f}%)"
+                                f" v_neg={a_v_neg*n_v_cfg:.0f}({a_v_neg*100:.1f}%){a_extra}"
+                                f" s_std={a_sstd:.3f}"
+                                f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
+                                f" out_norm={a_out_n:.3f}")
+                        else:
+                            # v4.1 compressed attn line.
+                            a_qk_phi = _m(metrics.get('attn_qk_phi_binary', 0.0))
+                            a_v_phi = _m(metrics.get('attn_v_phi_binary', 0.0))
+                            a_qk_z = _m(metrics.get('attn_qk_z_mean_active', 0.0))
+                            a_v_z = _m(metrics.get('attn_v_z_mean_active', 0.0))
+                            a_z075 = _m(metrics.get('attn_z_lt_075', 0.0))
+                            a_z030 = _m(metrics.get('attn_z_lt_030', 0.0))
+                            a_int_max = _m(metrics.get('attn_int_max', 0.0))
+                            a_int_cap = _m(metrics.get('attn_int_cap_frac', 0.0))
+                            a_qk_act_n = a_qk_act * n_qk_cfg
+                            a_v_act_n = a_v_act * n_v_cfg
+                            # `attn_strong` is avg of qk/v strong fractions;
+                            # combined active count = sum of both active counts.
+                            # Express "strong among active" against the combined
+                            # population so the %denom matches what act= shows.
+                            a_total_act_n = a_qk_act_n + a_v_act_n
+                            a_strong_n = a_strong * (n_qk_cfg + n_v_cfg)
+                            a_strong_of_act = a_strong_n / max(a_total_act_n, 1.0)
+                            log_message(
+                                f"      attn: qk_act={a_qk_act_n:.0f}/{n_qk_cfg}({a_qk_act*100:.1f}%)"
+                                f" v_act={a_v_act_n:.0f}/{n_v_cfg}({a_v_act*100:.1f}%)"
+                                f" strong={a_strong_n:.0f}/{a_total_act_n:.0f}({a_strong_of_act*100:.1f}%)"
+                                f" gate_max={a_raw_gmax:.2f}"
+                                f" int_avg[qk={a_qk_z:.2f} v={a_v_z:.2f}]"
+                                f" int_max={a_int_max:.2f} cap={a_int_cap*100:.1f}%"
+                                f" s_std={a_sstd:.2f}"
+                                f" qk_raw={a_qk_raw_n:.3f} v_raw={a_v_raw_n:.3f}"
+                                f" out={a_out_n:.2f}"
+                                f" phi_bin[qk={a_qk_phi*100:.1f}% v={a_v_phi*100:.1f}%]"
+                                f" bnd={a_z075*100:.1f}% mid={a_z030*100:.1f}%")
+                        # Strength (v3.9.3)
+                        k_str_m = _m(metrics.get('know_strength_mean', 0.0))
+                        if k_str_m > 0:
+                            k_str_s = _m(metrics.get('know_strength_std', 0.0))
+                            k_str_mn = _m(metrics.get('know_strength_min', 0.0))
+                            k_str_mx = _m(metrics.get('know_strength_max', 0.0))
+                            k_lg_m = _m(metrics.get('know_logit_mean', 0.0))
+                            k_lg_s = _m(metrics.get('know_logit_std', 0.0))
+                            log_message(
+                                f"      know_str: mean={k_str_m:.2f} std={k_str_s:.2f}"
+                                f" min={k_str_mn:.2f} max={k_str_mx:.2f}"
+                                f" | logit: mean={k_lg_m:.3f} std={k_lg_s:.3f}")
+                        a_v_str_m = _m(metrics.get('attn_v_strength_mean', 0.0))
+                        if a_v_str_m > 0:
+                            a_v_str_s = _m(metrics.get('attn_v_strength_std', 0.0))
+                            a_v_str_mn = _m(metrics.get('attn_v_strength_min', 0.0))
+                            a_v_str_mx = _m(metrics.get('attn_v_strength_max', 0.0))
+                            a_v_lg_m = _m(metrics.get('attn_v_logit_mean', 0.0))
+                            a_v_lg_s = _m(metrics.get('attn_v_logit_std', 0.0))
+                            log_message(
+                                f"      v_str: mean={a_v_str_m:.2f} std={a_v_str_s:.2f}"
+                                f" min={a_v_str_mn:.2f} max={a_v_str_mx:.2f}"
+                                f" | logit: mean={a_v_lg_m:.3f} std={a_v_lg_s:.3f}")
+                        # Full DEBUG (per-layer stacks, attn q/k/v norms,
+                        # residual/emb/o_proj) is verbose — emit every 500
+                        # steps or when explicitly in debug mode / early-debug
+                        # window. Logit_max + out norm are cheap signals that
+                        # fit on the attn line, so skip the one-line summary.
+                        _full_debug = (debug_mode or _early_debug
+                                        or (global_step % 500 == 0))
+                        if _full_debug:
+                            d_res = _m(metrics.get('debug_residual_norm', 0.0))
+                            d_emb = _m(metrics.get('debug_emb_norm', 0.0))
+                            d_oproj = _m(metrics.get('debug_o_proj_norm', 0.0))
+                            d_q = _m(metrics.get('debug_q_norm', 0.0))
+                            d_k = _m(metrics.get('debug_k_norm', 0.0))
+                            d_v = _m(metrics.get('debug_v_norm', 0.0))
+                            d_lm = _m(metrics.get('debug_logit_max', 0.0))
+                            d_oi = _m(metrics.get('debug_o_input_norm', 0.0))
+                            log_message(
+                                f"      [DEBUG] residual={d_res:.3f}"
+                                f" emb={d_emb:.3f} o_proj={d_oproj:.3f}"
+                                f" read={k_read_n:.3f}")
+                            log_message(
+                                f"      [DEBUG] attn_detail:"
+                                f" q={d_q:.3f} k={d_k:.3f} v={d_v:.3f}"
+                                f" logit_max={d_lm:.3f}"
+                                f" o_in={d_oi:.3f} o_out={a_out_n:.3f}")
+                            try:
+                                pl_attn = jax.device_get(metrics['per_layer_attn_out_norm'])
+                                pl_know = jax.device_get(metrics['per_layer_know_out_norm'])
+                                attn_s = ', '.join(f'l{i}={v:.2f}' for i, v in enumerate(pl_attn))
+                                know_s = ', '.join(f'l{i}={v:.2f}' for i, v in enumerate(pl_know))
+                                log_message(f"      [DEBUG] per_layer_attn: [{attn_s}]")
+                                log_message(f"      [DEBUG] per_layer_know: [{know_s}]")
+                            except Exception:
+                                pass
+                    except Exception:
+                        log_message(f"      grad_norm={m_grad:.3f}")
+
+                    # JSONL structured log.
+                    # *_loss / tau_reg: raw values (pre-weight).
+                    # *_weighted: contribution to total_loss (= raw * weight).
+                    log_jsonl({
+                        'type': 'train',
+                        'step': global_step,
+                        'epoch': epoch,
+                        'total_loss': avg_loss,
+                        'ce_loss': avg_ce,
+                        'aux_loss': avg_aux,
+                        'tau_reg': avg_tau_reg,
+                        'orth_loss': avg_orth,
+                        'div_loss': avg_div,
+                        'aux_weighted': lb_weight * avg_aux,
+                        'tau_reg_weighted': tau_reg_weight * avg_tau_reg,
+                        'orth_weighted': orth_weight * avg_orth,
+                        'div_weighted': div_weight * avg_div,
+                        'drift_qk_emb': drift_qk,
+                        'drift_v_emb': drift_v,
+                        'drift_know_emb': drift_know,
+                        # Tau dynamics (Phase 1/2/3a/4 metrics; instantaneous, not window-averaged)
+                        'attn_tau_std_q': float(a_tau_s[0]),
+                        'attn_tau_std_k': float(a_tau_s[1]),
+                        'attn_tau_std_v': float(a_tau_s[2]),
+                        'know_tau_std': k_tau_s,
+                        'attn_tau_kernel_norm': a_kern,
+                        'know_tau_kernel_norm': k_kern,
+                        'attn_tau_abs_mean': a_tau_abs,
+                        'know_tau_abs_mean': k_tau_abs,
+                        'attn_z_lt_075': a_z075,
+                        'know_z_lt_075': k_z075,
+                        'attn_z_lt_030': a_z030,
+                        'know_z_lt_030': k_z030,
+                        'attn_score_skew': a_skew,
+                        'know_score_skew': k_skew,
+                        'attn_active_per_token_std': a_apt,
+                        'know_active_per_token_std': k_apt,
+                        'attn_gate_entropy': a_ent,
+                        'know_gate_entropy': k_ent,
+                        'attn_z_sum': a_zsum,
+                        'know_z_sum': k_zsum,
+                        'know_emb_norm_max': k_emb_nmax,
+                        'know_emb_norm_min': k_emb_nmin,
+                        'know_emb_norm_std': k_emb_nstd,
+                        'qk_emb_norm_mean': qk_emb_nmean,
+                        'qk_emb_norm_max': qk_emb_nmax,
+                        'qk_emb_norm_min': qk_emb_nmin,
+                        'qk_emb_norm_std': qk_emb_nstd,
+                        'v_emb_norm_mean': v_emb_nmean,
+                        'v_emb_norm_max': v_emb_nmax,
+                        'v_emb_norm_min': v_emb_nmin,
+                        'v_emb_norm_std': v_emb_nstd,
+                        'attn_score_kurt': a_kurt,
+                        'know_score_kurt': k_kurt,
+                        'attn_drop_rate': a_drop,
+                        'attn_boost_rate': a_boost,
+                        'know_drop_rate': k_drop,
+                        'know_boost_rate': k_boost,
+                        # Dead-only penalty (v4.0.6+).
+                        'dead_penalty': float(metrics.get('dead_penalty', 0.0)),
+                        'attn_dead_penalty': float(metrics.get('attn_dead_penalty', 0.0)),
+                        'know_dead_penalty': float(metrics.get('know_dead_penalty', 0.0)),
+                        'dead_penalty_weighted': dead_penalty_weight * float(metrics.get('dead_penalty', 0.0)),
+                        'attn_dead_count': float(metrics.get('attn_dead_count', 0.0)),
+                        'know_dead_count': float(metrics.get('know_dead_count', 0.0)),
+                        # v4.1 RPE exploration (redesigned, asymmetric).
+                        'global_mean_ce': float(metrics.get('global_mean_ce', 0.0)),
+                        'pos_frac': float(metrics.get('pos_frac', 0.0)),
+                        'pos_mean': float(metrics.get('pos_mean', 0.0)),
+                        'neg_mean': float(metrics.get('neg_mean', 0.0)),
+                        'explore_loss_raw': float(metrics.get('explore_loss_raw', 0.0)),
+                        'explore_attn_raw': float(metrics.get('explore_attn_raw', 0.0)),
+                        'explore_know_raw': float(metrics.get('explore_know_raw', 0.0)),
+                        'explore_loss_weighted': float(metrics.get('explore_loss_weighted', 0.0)),
+                        'explore_block_frac_a': float(metrics.get('explore_block_frac_a', 0.0)),
+                        'explore_block_frac_k': float(metrics.get('explore_block_frac_k', 0.0)),
+                        'accuracy': avg_acc,
+                        'lr': current_lr,
+                        'steps_per_sec': steps_per_sec,
+                        'elapsed': total_elapsed,
+                        'timestamp': datetime.now().isoformat(),
+                    })
+
+                    # TPU memory stats
+                    try:
+                        mem = jax.local_devices()[0].memory_stats()
+                        if mem:
+                            used = mem.get('bytes_in_use', 0) / 1e9
+                            peak = mem.get('peak_bytes_in_use', 0) / 1e9
+                            limit = mem.get('bytes_limit', 0) / 1e9
+                            log_message(
+                                f"      HBM: {used:.2f}G / {limit:.2f}G "
+                                f"(peak={peak:.2f}G, free={limit - used:.2f}G)")
+                    except Exception:
+                        pass
+
+                    # Sync logs to GCS
                     sync_logs()
 
-                # Reset window accumulators (all hosts)
-                _win_loss_jax = jnp.float32(0.0)
-                _win_ce_jax = jnp.float32(0.0)
-                _win_aux_jax = jnp.float32(0.0)
-                _win_tau_reg_jax = jnp.float32(0.0)
-                _win_orth_jax = jnp.float32(0.0)
-                _win_div_jax = jnp.float32(0.0)
-                _win_correct_jax = jnp.int32(0)
-                _win_valid_jax = jnp.int32(0)
+                # Reset window (all hosts)
+                win_loss = 0.0
+                win_ce = 0.0
+                win_aux = 0.0
+                win_tau_reg = 0.0
+                win_orth = 0.0
+                win_div = 0.0
+                win_correct = 0
+                win_valid = 0
                 win_count = 0
                 win_start_time = time.time()
 
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
-            _do_val = (global_step % val_interval == 0 and global_step > 0)
-            _do_ckpt = (global_step % ckpt_interval == 0 and global_step > 0)
-            _new_best = False
-
-            if _do_val:
+            if global_step % val_interval == 0 and global_step > 0:
                 if is_host0:
                     log_message(f"\n  Mid-epoch validation at step {global_step}...")
                 val_loader.reset()
@@ -3100,44 +3158,83 @@ def main():
                         'val_acc': val_acc,
                         'timestamp': datetime.now().isoformat(),
                     })
+
+                # Best model save (device_get on ALL hosts)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    _new_best = True
+                    params_single = _gather_for_save(params)
+                    opt_state_single = _gather_for_save(opt_state)
+                    if is_host0:
+                        save_checkpoint(
+                            _ckpt_path("best_model.flax"),
+                            params_single, opt_state_single,
+                            epoch, global_step, best_val_loss,
+                            cfg['model'],
+                            step_in_epoch=epoch_step_counter,
+                            steps_per_epoch=steps_per_epoch,
+                            training_config=training_config,
+                        )
+                        log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
+                    del params_single, opt_state_single
 
-                # Dead-neuron diagnosis removed during the registry refactor
-                # (was rw-v4.0.2-specific: separate Q/K pools, GELU-z gate).
-                # If needed for v4.1+, rewrite against the activation×intensity
-                # gate — see models/legacy/dawn_spatial_v402_exp.py for
-                # reference.
+                # Dead neuron diagnosis (rw-v4.0.2). _gather_for_save is a
+                # collective — must run on ALL hosts outside the is_host0
+                # guard, same fix class as the drift move. Only the actual
+                # diagnosis / logging stays host-0.
+                if model_version.startswith('rw-v'):
+                    _params_cpu = _gather_for_save(params)
+                    if is_host0:
+                        try:
+                            from models.dawn_spatial_v402_exp import diagnose_dead_neurons as _diag_dead
+                            _diag_cfg = {
+                                'd_model': cfg['model']['d_model'],
+                                'n_layers': cfg['model']['n_layers'],
+                                'n_heads': cfg['model']['n_heads'],
+                                'max_seq_len': cfg['model']['max_seq_len'],
+                                'n_q': cfg['model'].get('n_q', 790),
+                                'n_k': cfg['model'].get('n_k', 790),
+                                'n_v': cfg['model'].get('n_v', 2600),
+                                'n_know': cfg['model'].get('n_know', 25200),
+                            }
+                            # Collect real val data for dead neuron diagnosis
+                            val_loader.reset()
+                            _diag_batches = []
+                            for _di, (_dids, _dmask) in enumerate(val_loader):
+                                _diag_batches.append(np.array(_dids))
+                                if len(_diag_batches) * _dids.shape[0] >= 128:
+                                    break
+                            _diag_tokens = jnp.array(np.concatenate(_diag_batches, axis=0)[:128])
+                            _dead = jax.device_get(_diag_dead(
+                                _params_cpu, _diag_cfg, _diag_tokens,
+                                n_batches=4, batch_size=32))
+                            del _diag_tokens
+                            for _pn in ('Q', 'K', 'V', 'Know'):
+                                _ps = _dead[_pn]
+                                log_message(
+                                    f"      [DEAD] {_pn}: dead={int(_ps['n_dead'])}({float(_ps['dead_frac'])*100:.1f}%)"
+                                    f" rare(<1%)={int(_ps['n_rare'])}({float(_ps['rare_frac'])*100:.1f}%)")
+                            del _dead
+                        except Exception as e:
+                            log_message(f"      [DEAD] diagnosis failed: {e}")
+                    del _params_cpu
 
-            # ---- Unified save path ----
-            # best_model + mid-epoch checkpoint share a single gather +
-            # serialize when both fire on the same step (val_interval ==
-            # ckpt_interval is the common case). Previously that meant two
-            # independent _gather_for_save collectives and two full
-            # re-serializations of the same params — expensive at 1B.
-            if _new_best or _do_ckpt:
+            # ---- Mid-epoch checkpoint ----
+            if global_step % ckpt_interval == 0 and global_step > 0:
+                # device_get on ALL hosts (may be collective for sharded params)
                 params_single = _gather_for_save(params)
                 opt_state_single = _gather_for_save(opt_state)
                 if is_host0:
-                    bytes_data = _serialize_checkpoint(
+                    save_checkpoint(
+                        _ckpt_path(f"checkpoint_step{global_step}.flax"),
                         params_single, opt_state_single,
                         epoch, global_step, best_val_loss,
                         cfg['model'],
                         step_in_epoch=epoch_step_counter,
                         steps_per_epoch=steps_per_epoch,
-                        training_config=training_config)
-                    if _new_best:
-                        _write_checkpoint_bytes(
-                            _ckpt_path("best_model.flax"), bytes_data)
-                        log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
-                    if _do_ckpt:
-                        _write_checkpoint_bytes(
-                            _ckpt_path(f"checkpoint_step{global_step}.flax"), bytes_data)
-                        # GCS list+delete only from host 0 — racing cleanups across
-                        # hosts can drop the checkpoint that was just written.
-                        cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
+                        training_config=training_config,
+                    )
                 del params_single, opt_state_single
+                cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
 
         if preemption_requested[0]:
             # Cooperative emergency save. All hosts participate in
@@ -3166,15 +3263,6 @@ def main():
 
         # ---- End of epoch ----
         epoch_elapsed = time.time() - epoch_start
-        # Single TPU→CPU sync for the whole epoch totals.
-        _ep = jax.device_get({
-            'loss': _epoch_loss_jax,
-            'correct': _epoch_correct_jax,
-            'valid': _epoch_valid_jax,
-        })
-        epoch_loss = float(_ep['loss'])
-        epoch_correct = int(_ep['correct'])
-        epoch_valid = int(_ep['valid'])
         epoch_avg_loss = epoch_loss / epoch_valid if epoch_valid > 0 else 0.0
         epoch_avg_acc = epoch_correct / epoch_valid if epoch_valid > 0 else 0.0
 
@@ -3212,32 +3300,36 @@ def main():
                 'timestamp': datetime.now().isoformat(),
             })
 
-        # Save epoch checkpoint (device_get on ALL hosts). best_model reuses
-        # the same serialized bytes — no double serialize at 1B scale.
+        # Save epoch checkpoint (device_get on ALL hosts)
         params_single = _gather_for_save(params)
         opt_state_single = _gather_for_save(opt_state)
 
         if is_host0:
-            bytes_data = _serialize_checkpoint(
+            save_checkpoint(
+                _ckpt_path(f"checkpoint_epoch{epoch}.flax"),
                 params_single, opt_state_single,
                 epoch + 1, global_step, best_val_loss,
                 cfg['model'],
-                step_in_epoch=0,
+                step_in_epoch=0,  # start of next epoch
                 steps_per_epoch=steps_per_epoch,
-                training_config=training_config)
-            _write_checkpoint_bytes(
-                _ckpt_path(f"checkpoint_epoch{epoch}.flax"), bytes_data)
+                training_config=training_config,
+            )
             if is_best:
-                _write_checkpoint_bytes(
-                    _ckpt_path("best_model.flax"), bytes_data)
+                save_checkpoint(
+                    _ckpt_path("best_model.flax"),
+                    params_single, opt_state_single,
+                    epoch + 1, global_step, best_val_loss,
+                    cfg['model'],
+                    step_in_epoch=0,
+                    steps_per_epoch=steps_per_epoch,
+                    training_config=training_config,
+                )
                 log_message(f"  New best model! val_loss={best_val_loss:.4f}")
+
+            del params_single, opt_state_single
 
             log_message(f"  Best val loss so far: {best_val_loss:.4f}")
             sync_logs()
-
-        # Release gathered copies on every host — all hosts hold them after
-        # _gather_for_save; host-0-only del leaves multi-GB pinned elsewhere.
-        del params_single, opt_state_single
 
         # Reset data loader for next epoch (no re-read, just reset position)
         if epoch < num_epochs - 1:
