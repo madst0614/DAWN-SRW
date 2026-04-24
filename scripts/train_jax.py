@@ -1174,24 +1174,32 @@ def _make_legacy_opt_state_template(params, schedule, weight_decay,
                                     grad_accum_steps=1):
     """Rebuild the pre-1d7a437 optimizer's opt_state shape.
 
-    Old chain was `chain(clip_by_global_norm, adamw)`, which gives a
-    2-tuple opt_state. New chain (per-group WD) is a 5-tuple. To
-    deserialize old checkpoints we need the OLD shape as the load
-    template, then convert to the NEW shape afterward.
+    Old chain was `chain(clip_by_global_norm, adamw(..., mask=fn))`,
+    which gives a 2-tuple opt_state where adamw's add_decayed_weights
+    is wrapped in `MaskedState` (because the old code passed a mask
+    excluding bias / LayerNorm / output_scale). New chain (per-group
+    WD) is a 5-tuple where each `add_decayed_weights` is masked too,
+    just split into base + pool groups.
+
+    To deserialize old checkpoints we need the OLD shape as the load
+    template. The actual mask values don't affect opt_state shape —
+    what matters is that `mask` is non-None so the `MaskedState`
+    wrapper is produced. A trivially-true mask suffices.
 
     If `grad_accum_steps > 1` the optimizer is wrapped in MultiSteps —
     do the same wrap so the deserialize template lines up with what
     was saved.
-
-    The mask passed to adamw doesn't affect opt_state shape
-    (`add_decayed_weights` is stateless), so we omit it.
     """
+    def _trivial_mask(p):
+        return jax.tree.map(lambda _: True, p)
+
     old_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(
             learning_rate=schedule,
             weight_decay=weight_decay,
             b2=0.95,
+            mask=_trivial_mask,
         ),
     )
     if grad_accum_steps > 1:
