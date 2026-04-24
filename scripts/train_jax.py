@@ -2547,8 +2547,10 @@ def main():
         # Epoch accumulators on device — one device_get per epoch at the
         # end, rather than per-step float()/int() sync.
         _epoch_loss_jax = jnp.float32(0.0)
-        _epoch_correct_jax = jnp.int32(0)
-        _epoch_valid_jax = jnp.int32(0)
+        # int64: valid_count sums to ~n_steps * tokens_per_step, which
+        # exceeds int32 range (2.15e9) on any multi-billion-token epoch.
+        _epoch_correct_jax = jnp.int64(0)
+        _epoch_valid_jax = jnp.int64(0)
         epoch_steps = 0
 
         # Window accumulators on device — one device_get per log boundary.
