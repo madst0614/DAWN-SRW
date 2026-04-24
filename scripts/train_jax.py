@@ -1600,8 +1600,9 @@ def _print_regular_block(rec, ctx):
             f" know=[{' '.join(f'{v:.2f}' for v in _pl_k)}]"
         )
     log_message(
-        f"  time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
-        f" {ctx['s_per_it']:.2f}s/it"
+        f"  time: elapsed={format_time(ctx['epoch_elapsed'])}"
+        f" ETA={format_time(ctx['eta'])}"
+        f" ({ctx['s_per_it']:.2f}s/it)"
     )
 
 
@@ -3211,7 +3212,11 @@ def main():
                     _progress = (global_step / total_micro_steps * 100
                                  if total_micro_steps > 0 else 0.0)
                     _s_per_it = _epoch_elapsed / epoch_steps if epoch_steps > 0 else 0.0
-                    _remaining = max(steps_per_epoch - epoch_steps, 0)
+                    # ETA based on absolute epoch position so resume mid-epoch
+                    # doesn't over-estimate (epoch_steps counts only this
+                    # run's steps; epoch_step_counter starts from
+                    # start_step_in_epoch).
+                    _remaining = max(steps_per_epoch - epoch_step_counter, 0)
                     _eta = _s_per_it * _remaining
                     ctx = {
                         'lb_weight': lb_weight,
