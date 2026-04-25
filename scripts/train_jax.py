@@ -57,6 +57,7 @@ from jax.experimental.shard_map import shard_map
 from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
 from models.dawn_spatial_v41_tau_bias_exp import DAWN as DAWN_V41
+from models.dawn_spatial_v411_tau_bias_xr_intensity_exp import DAWN as DAWN_V411
 
 # ============================================================
 # Constants
@@ -186,6 +187,15 @@ MODEL_REGISTRY = {
         name='spatial-r1-v4.1',
         module_path='models.dawn_spatial_v41_tau_bias_exp',
         cls=DAWN_V41,
+        build_kwargs=_dawn_shared_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v41_sharded_kwargs,
+    ),
+    'spatial-r1-v4.1.1': ModelSpec(
+        name='spatial-r1-v4.1.1',
+        module_path='models.dawn_spatial_v411_tau_bias_xr_intensity_exp',
+        cls=DAWN_V411,
         build_kwargs=_dawn_shared_kwargs,
         supports_sharded=True,
         force_sharded=True,
