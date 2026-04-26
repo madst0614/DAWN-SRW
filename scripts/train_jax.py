@@ -1004,6 +1004,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             # v4.1 intensity diagnostics (int_cap_frac moved to analysis_step).
             'attn_int_max': result.get('attn_int_max', jnp.float32(0.0)),
             'know_int_max': result.get('know_int_max', jnp.float32(0.0)),
+            'attn_den_cost_mean': result.get('attn_den_cost_mean', jnp.float32(0.0)),
+            'know_den_cost_mean': result.get('know_den_cost_mean', jnp.float32(0.0)),
+            'attn_act_cost_mean': result.get('attn_act_cost_mean', jnp.float32(0.0)),
+            'know_act_cost_mean': result.get('know_act_cost_mean', jnp.float32(0.0)),
+            'attn_current_cost_mean': result.get('attn_current_cost_mean', jnp.float32(0.0)),
+            'know_current_cost_mean': result.get('know_current_cost_mean', jnp.float32(0.0)),
             # Emb drift (relative L2) since prev snapshot — see top of fn.
             'drift_qk_emb': drift_qk_emb,
             'drift_v_emb': drift_v_emb,
@@ -1673,6 +1679,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'know_raw_gate_max': float(m.get('know_raw_gate_max', 0.0)),
         'attn_int_max': float(m.get('attn_int_max', 0.0)),
         'know_int_max': float(m.get('know_int_max', 0.0)),
+        'attn_den_cost_mean': float(m.get('attn_den_cost_mean', 0.0)),
+        'know_den_cost_mean': float(m.get('know_den_cost_mean', 0.0)),
+        'attn_act_cost_mean': float(m.get('attn_act_cost_mean', 0.0)),
+        'know_act_cost_mean': float(m.get('know_act_cost_mean', 0.0)),
+        'attn_current_cost_mean': float(m.get('attn_current_cost_mean', 0.0)),
+        'know_current_cost_mean': float(m.get('know_current_cost_mean', 0.0)),
         'attn_gate_sum': float(m.get('attn_gate_sum', 0.0)),
         'know_gate_sum': float(m.get('know_gate_sum', 0.0)),
         'attn_active_n_mean': float(m.get('attn_active_n_mean', 0.0)),
@@ -1816,6 +1828,12 @@ def _print_regular_block(rec, ctx):
         f" v={rec['drift_v_emb']:.2e}"
         f" k={rec['drift_know_emb']:.2e}]"
     )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.4':
+        log_message(
+            f"  den_cost mean[a={rec['attn_den_cost_mean']:.1f} k={rec['know_den_cost_mean']:.1f}]"
+            f" act[a={rec['attn_act_cost_mean']:.1f} k={rec['know_act_cost_mean']:.1f}]"
+            f" current[a={rec['attn_current_cost_mean']:.1f} k={rec['know_current_cost_mean']:.1f}]"
+        )
     log_message(
         f"  tau: know_b={rec['tau_know_bias']:+.2f}"
         f" attn_b=[{rec['tau_attn_bias_0']:+.2f} {rec['tau_attn_bias_1']:+.2f} {rec['tau_attn_bias_2']:+.2f}]"
