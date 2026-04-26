@@ -1911,6 +1911,12 @@ def _build_analysis_record(base, metrics, ctx):
         'know_raw_out_norm': float(m.get('know_raw_out_norm', 0.0)),
         'attn_z_sum': float(m.get('attn_z_sum', 0.0)),
         'know_z_sum': float(m.get('know_z_sum', 0.0)),
+        'attn_den_cost': float(m.get('attn_den_cost', 0.0)),
+        'know_den_cost': float(m.get('know_den_cost', 0.0)),
+        'attn_activation_cost': float(m.get('attn_activation_cost', 0.0)),
+        'know_activation_cost': float(m.get('know_activation_cost', 0.0)),
+        'attn_current_cost': float(m.get('attn_current_cost', 0.0)),
+        'know_current_cost': float(m.get('know_current_cost', 0.0)),
         'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
         'debug_emb_norm': float(m.get('debug_emb_norm', 0.0)),
         'debug_o_proj_norm': float(m.get('debug_o_proj_norm', 0.0)),
@@ -1958,6 +1964,15 @@ def _print_analysis_block(rec, ctx):
         f" qk={rec['qk_emb_norm_max']:.2f}"
         f" v={rec['v_emb_norm_max']:.2f}"
     )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.4':
+        log_message(
+            f"  den_cost: a={rec['attn_den_cost']:.1f}"
+            f" k={rec['know_den_cost']:.1f}"
+            f" | activation a={rec['attn_activation_cost']:.1f}"
+            f" k={rec['know_activation_cost']:.1f}"
+            f" | current a={rec['attn_current_cost']:.1f}"
+            f" k={rec['know_current_cost']:.1f}"
+        )
     log_message(
         f"  tau_struct k_std={rec['know_tau_std']:.2f}"
         f" a_std=[{rec['attn_tau_std_q']:.2f} {rec['attn_tau_std_k']:.2f} {rec['attn_tau_std_v']:.2f}]"
@@ -3602,6 +3617,7 @@ def main():
                                         'n_qk', cfg['model'].get('n_q', 0)),
                                     'n_v_cfg': cfg['model'].get('n_v', 0),
                                     'n_know_cfg': cfg['model'].get('n_know', 0),
+                                    'model_version': model_version,
                                 }
                                 a_rec = _build_analysis_record(
                                     {}, analysis_result, _ctx_a)
