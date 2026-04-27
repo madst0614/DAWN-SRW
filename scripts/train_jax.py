@@ -60,6 +60,7 @@ from models.legacy.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
 from models.dawn_spatial_v41_tau_bias_exp import DAWN as DAWN_V41
 from models.dawn_spatial_v412_scan_bias_exp import DAWN as DAWN_V412
 from models.dawn_spatial_v414_competitive_den_exp import DAWN as DAWN_V414
+from models.dawn_spatial_v415_operator_route_sig_exp import DAWN as DAWN_V415
 
 # ============================================================
 # Constants
@@ -151,6 +152,22 @@ def _dawn_shared_kwargs(cfg):
         n_chunks_qk=t.get('n_chunks_qk', 1),
         n_chunks_v=t.get('n_chunks_v', 1),
     )
+
+
+def _dawn_v415_kwargs(cfg):
+    kw = _dawn_shared_kwargs(cfg)
+    m = cfg['model']
+    tag_dim = m.get('tag_dim', 16)
+    rw_sig_dim = m.get('rw_sig_dim', 48)
+    d_route = m.get('d_route', tag_dim + rw_sig_dim)
+    if d_route != tag_dim + rw_sig_dim:
+        raise ValueError(
+            f"d_route must equal tag_dim + rw_sig_dim, got "
+            f"d_route={d_route}, tag_dim={tag_dim}, rw_sig_dim={rw_sig_dim}")
+    kw['d_route'] = d_route
+    kw['tag_dim'] = tag_dim
+    kw['rw_sig_dim'] = rw_sig_dim
+    return kw
 
 
 def _rw_v402_kwargs(cfg):
@@ -257,6 +274,15 @@ MODEL_REGISTRY = {
         force_sharded=True,
         sharded_kwargs=_v412_sharded_kwargs,
     ),
+    'spatial-r1-v4.1.5': ModelSpec(
+        name='spatial-r1-v4.1.5',
+        module_path='models.dawn_spatial_v415_operator_route_sig_exp',
+        cls=DAWN_V415,
+        build_kwargs=_dawn_v415_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v412_sharded_kwargs,
+    ),
 }
 
 
@@ -277,7 +303,14 @@ def build_model_from_config(cfg):
             f"checkpoint, move the model file back to models/ and add a "
             f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
     spec = MODEL_REGISTRY[version]
-    return spec.cls(**spec.build_kwargs(cfg))
+    kwargs = spec.build_kwargs(cfg)
+    if version == 'spatial-r1-v4.1.5':
+        print(
+            "operator route signature: "
+            f"tag_dim={kwargs['tag_dim']}, "
+            f"rw_sig_dim={kwargs['rw_sig_dim']}, "
+            f"d_route={kwargs['d_route']}")
+    return spec.cls(**kwargs)
 
 
 # ============================================================
@@ -1004,12 +1037,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             # v4.1 intensity diagnostics (int_cap_frac moved to analysis_step).
             'attn_int_max': result.get('attn_int_max', jnp.float32(0.0)),
             'know_int_max': result.get('know_int_max', jnp.float32(0.0)),
+            'attn_intensity_sum_mean': result.get('attn_intensity_sum_mean', jnp.float32(0.0)),
+            'know_intensity_sum_mean': result.get('know_intensity_sum_mean', jnp.float32(0.0)),
             'attn_den_cost_mean': result.get('attn_den_cost_mean', jnp.float32(0.0)),
             'know_den_cost_mean': result.get('know_den_cost_mean', jnp.float32(0.0)),
             'attn_act_cost_mean': result.get('attn_act_cost_mean', jnp.float32(0.0)),
             'know_act_cost_mean': result.get('know_act_cost_mean', jnp.float32(0.0)),
             'attn_current_cost_mean': result.get('attn_current_cost_mean', jnp.float32(0.0)),
             'know_current_cost_mean': result.get('know_current_cost_mean', jnp.float32(0.0)),
+            'qk_rw_sig_norm_mean': result.get('qk_rw_sig_norm_mean', jnp.float32(0.0)),
+            'qk_rw_sig_norm_std': result.get('qk_rw_sig_norm_std', jnp.float32(0.0)),
+            'v_rw_sig_norm_mean': result.get('v_rw_sig_norm_mean', jnp.float32(0.0)),
+            'v_rw_sig_norm_std': result.get('v_rw_sig_norm_std', jnp.float32(0.0)),
+            'know_rw_sig_norm_mean': result.get('know_rw_sig_norm_mean', jnp.float32(0.0)),
+            'know_rw_sig_norm_std': result.get('know_rw_sig_norm_std', jnp.float32(0.0)),
             # Emb drift (relative L2) since prev snapshot — see top of fn.
             'drift_qk_emb': drift_qk_emb,
             'drift_v_emb': drift_v_emb,
@@ -1679,12 +1720,20 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'know_raw_gate_max': float(m.get('know_raw_gate_max', 0.0)),
         'attn_int_max': float(m.get('attn_int_max', 0.0)),
         'know_int_max': float(m.get('know_int_max', 0.0)),
+        'attn_intensity_sum_mean': float(m.get('attn_intensity_sum_mean', 0.0)),
+        'know_intensity_sum_mean': float(m.get('know_intensity_sum_mean', 0.0)),
         'attn_den_cost_mean': float(m.get('attn_den_cost_mean', 0.0)),
         'know_den_cost_mean': float(m.get('know_den_cost_mean', 0.0)),
         'attn_act_cost_mean': float(m.get('attn_act_cost_mean', 0.0)),
         'know_act_cost_mean': float(m.get('know_act_cost_mean', 0.0)),
         'attn_current_cost_mean': float(m.get('attn_current_cost_mean', 0.0)),
         'know_current_cost_mean': float(m.get('know_current_cost_mean', 0.0)),
+        'qk_rw_sig_norm_mean': float(m.get('qk_rw_sig_norm_mean', 0.0)),
+        'qk_rw_sig_norm_std': float(m.get('qk_rw_sig_norm_std', 0.0)),
+        'v_rw_sig_norm_mean': float(m.get('v_rw_sig_norm_mean', 0.0)),
+        'v_rw_sig_norm_std': float(m.get('v_rw_sig_norm_std', 0.0)),
+        'know_rw_sig_norm_mean': float(m.get('know_rw_sig_norm_mean', 0.0)),
+        'know_rw_sig_norm_std': float(m.get('know_rw_sig_norm_std', 0.0)),
         'attn_gate_sum': float(m.get('attn_gate_sum', 0.0)),
         'know_gate_sum': float(m.get('know_gate_sum', 0.0)),
         'attn_active_n_mean': float(m.get('attn_active_n_mean', 0.0)),
@@ -1834,13 +1883,21 @@ def _print_regular_block(rec, ctx):
             f" act[a={rec['attn_act_cost_mean']:.1f} k={rec['know_act_cost_mean']:.1f}]"
             f" current[a={rec['attn_current_cost_mean']:.1f} k={rec['know_current_cost_mean']:.1f}]"
         )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5':
+        log_message(
+            f"  intensity_sum mean[a={rec['attn_intensity_sum_mean']:.1f}"
+            f" k={rec['know_intensity_sum_mean']:.1f}]"
+            f" | rw_sig qk[m={rec['qk_rw_sig_norm_mean']:.2f} s={rec['qk_rw_sig_norm_std']:.2f}]"
+            f" v[m={rec['v_rw_sig_norm_mean']:.2f} s={rec['v_rw_sig_norm_std']:.2f}]"
+            f" k[m={rec['know_rw_sig_norm_mean']:.2f} s={rec['know_rw_sig_norm_std']:.2f}]"
+        )
     log_message(
         f"  tau: know_b={rec['tau_know_bias']:+.2f}"
         f" attn_b=[{rec['tau_attn_bias_0']:+.2f} {rec['tau_attn_bias_1']:+.2f} {rec['tau_attn_bias_2']:+.2f}]"
         f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
         f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4', 'spatial-r1-v4.1.5'):
         log_message(
             f"  scan_bias: know={rec['scan_know_bias']:+.3f}"
             f" attn=[{rec['scan_attn_bias_0']:+.3f} {rec['scan_attn_bias_1']:+.3f} {rec['scan_attn_bias_2']:+.3f}]"
@@ -2464,6 +2521,9 @@ def main():
     def _is_pool_param(path_str):
         return any(name in path_str for name in _POOL_PARAM_NAMES)
 
+    def _is_sig_proj_param(path_str):
+        return 'read_sig_proj' in path_str or 'write_sig_proj' in path_str
+
     def _is_excluded(path_str):
         leaf = path_str.rsplit('/', 1)[-1]
         if leaf == 'bias':
@@ -2473,7 +2533,14 @@ def main():
         if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
            or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
             return True  # learnable output_scale
+        if _is_sig_proj_param(path_str):
+            return True  # v4.1.5 fixed read/write signature projections
         return False
+
+    def _freeze_mask_sig_proj(params):
+        def _f(path, _):
+            return _is_sig_proj_param(_path_str(path))
+        return jax.tree.map_with_path(_f, params)
 
     def _wd_mask_base(params):
         def _f(path, _):
@@ -2492,11 +2559,13 @@ def main():
         return jax.tree.map_with_path(_f, params)
 
     base_optimizer = optax.chain(
+        optax.masked(optax.set_to_zero(), mask=_freeze_mask_sig_proj),
         optax.clip_by_global_norm(1.0),
         optax.scale_by_adam(b2=0.95),
         optax.add_decayed_weights(weight_decay, mask=_wd_mask_base),
         optax.add_decayed_weights(pool_weight_decay, mask=_wd_mask_pool),
         optax.scale_by_learning_rate(schedule),
+        optax.masked(optax.set_to_zero(), mask=_freeze_mask_sig_proj),
     )
 
     if is_host0:
@@ -2516,10 +2585,19 @@ def main():
                 return v
             jax.tree.map_with_path(_f, mask)
             return out
+        def _count_sig_proj(params):
+            n = [0]
+            def _f(path, _):
+                if _is_sig_proj_param(_path_str(path)):
+                    n[0] += 1
+                return _
+            jax.tree.map_with_path(_f, params)
+            return n[0]
         _base_mask = _wd_mask_base(params)
         _pool_mask = _wd_mask_pool(params)
         print(f"  WD groups: base ({weight_decay}) = {_count_true(_base_mask)} tensors, "
-              f"pool ({pool_weight_decay}) = {_count_true(_pool_mask)} tensors")
+              f"pool ({pool_weight_decay}) = {_count_true(_pool_mask)} tensors, "
+              f"frozen_sig_proj_count = {_count_sig_proj(params)}")
         _pool_paths = _collect_pool_paths(_pool_mask)
         if _pool_paths:
             print(f"    pool params: {_pool_paths[:9]}")
@@ -2568,7 +2646,7 @@ def main():
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
-        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4'):
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4', 'spatial-r1-v4.1.5'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -2907,7 +2985,7 @@ def main():
         # Only print statements are guarded by is_host0.
         try:
             _is_sharded = _sharded_fns is not None
-            _uses_scan_bias = model_version in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4')
+            _uses_scan_bias = model_version in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4', 'spatial-r1-v4.1.5')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
