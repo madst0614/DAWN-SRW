@@ -54,7 +54,7 @@ training:
   num_epochs: 1
   lr: 0.00065
   weight_decay: 0.1
-  pool_weight_decay: 0.02    # free-norm pool params (emb/read/write) softer WD
+  pool_weight_decay: 0.0    # 영향 받는 애들 없음
   warmup_ratio: 0.06
   diversity_weight: 0.1
   load_balance_weight: 0.0
@@ -81,7 +81,7 @@ training:
   #   otherwise                                  ->  normal signal
   # tau itself is NOT clipped -- only the explore loss is bounded.
   # CE can push tau outside the bounds if it really needs to.
-  exploration_weight: 0.001        # lambda: overall strength
+  exploration_weight: 0.0002        # lambda: overall strength
   exploration_asymmetry: 1.2       # easy-token push scale (symmetric=1.0)
   exploration_warmup_steps: 1000   # loss off until this step
   exploration_lower_bound: -0.5    # down-push bound
@@ -99,4 +99,4 @@ training:
 
 use_amp: true
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5_route128
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5__route128
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5_route128
