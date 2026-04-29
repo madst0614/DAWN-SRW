@@ -292,6 +292,7 @@ def _v415_sharded_kwargs(cfg):
         max_intensity=t.get('max_intensity', 10.0),
         scan_scale=t.get('scan_scale', 0.01),
         scan_std_floor=t.get('scan_std_floor', 0.5),
+        token_blocks=t.get('srw_token_blocks', 1),
     )
 
 
@@ -2743,7 +2744,8 @@ def main():
     n_chunks_qk = cfg['training'].get('n_chunks_qk',
                                        auto_n_chunks(nqk_local, target_chunk_gb))
     n_chunks_v = cfg['training'].get('n_chunks_v',
-                                      auto_n_chunks(nv_local, target_chunk_gb))
+                                     auto_n_chunks(nv_local, target_chunk_gb))
+    srw_token_blocks = cfg['training'].get('srw_token_blocks', 1)
 
     def _chunk_size_from_count(name, n_local, n_chunks):
         n_chunks = int(n_chunks)
@@ -2763,6 +2765,8 @@ def main():
               f"{total_devices} devices, per_device_batch={per_device_batch} ===")
         print(f"  Chunks: know={n_chunks_know} (cs={nk_local // max(n_chunks_know,1)}), "
               f"qk={n_chunks_qk}, v={n_chunks_v}")
+        if srw_token_blocks != 1:
+            print(f"  SRW token blocks: {srw_token_blocks}")
         chunk_mem = per_device_batch * max_seq_len * know_max_chunk * 2 / 1e9
         print(f"  Est chunk mem (know): {chunk_mem:.2f}GB bf16")
 
@@ -2869,6 +2873,7 @@ def main():
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks qk/v/know={n_chunks_qk}/{n_chunks_v}/{n_chunks_know}"
+                  f"; token_blocks={srw_token_blocks}"
                   f"; max_chunk qk/v/know={qk_max_chunk}/{v_max_chunk}/{know_max_chunk}"
                   f"; analysis kernels={'on' if _supports_analysis else 'off'})")
 
