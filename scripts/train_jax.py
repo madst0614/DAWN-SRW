@@ -242,17 +242,38 @@ def _dawn_shared_kwargs(cfg):
 def _dawn_v415_kwargs(cfg):
     kw = _dawn_shared_kwargs(cfg)
     m = cfg['model']
+    version = m.get('model_version', 'spatial-r1-v4.1.5')
     tag_dim = m.get('tag_dim', 16)
     read_sig_dim = m.get('read_sig_dim', 24)
     write_sig_dim = m.get('write_sig_dim', 24)
+    route_mode = str(m.get('route_mode', 'auto')).lower().replace('-', '_')
     expected_route = tag_dim + read_sig_dim + write_sig_dim
     d_route = m.get('d_route', expected_route)
+    tagonly_aliases = ('tag', 'tagonly', 'tag_only', 'embedding', 'embed')
+    if route_mode in tagonly_aliases or (route_mode == 'auto' and tag_dim == d_route):
+        if tag_dim != d_route:
+            raise ValueError(
+                f"tag-only route requires tag_dim == d_route, got "
+                f"d_route={d_route}, tag_dim={tag_dim}")
+        read_sig_dim = 0
+        write_sig_dim = 0
+        route_mode = 'tagonly'
+        expected_route = tag_dim
+    elif route_mode in ('auto', 'signature', 'sig'):
+        route_mode = 'signature'
+    else:
+        raise ValueError(
+            f"Unknown route_mode={route_mode!r}; use 'signature', 'tagonly', or omit for auto")
     if d_route != expected_route:
         raise ValueError(
             f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
             f"d_route={d_route}, tag_dim={tag_dim}, "
             f"read_sig_dim={read_sig_dim}, write_sig_dim={write_sig_dim}")
+    if route_mode == 'tagonly' and version != 'spatial-r1-v4.1.5.2':
+        raise ValueError("tag-only route mode is implemented for spatial-r1-v4.1.5.2")
     kw['d_route'] = d_route
+    if version == 'spatial-r1-v4.1.5.2':
+        kw['route_mode'] = route_mode
     kw['tag_dim'] = tag_dim
     kw['read_sig_dim'] = read_sig_dim
     kw['write_sig_dim'] = write_sig_dim
@@ -348,7 +369,8 @@ def build_model_from_config(cfg):
             f"tag_dim={kwargs['tag_dim']}, "
             f"read_sig_dim={kwargs['read_sig_dim']}, "
             f"write_sig_dim={kwargs['write_sig_dim']}, "
-            f"d_route={kwargs['d_route']}"
+            f"d_route={kwargs['d_route']}, "
+            f"route_mode={kwargs.get('route_mode', 'signature')}"
             f"{' parallelism=tensor' if cls is spec.tensor_cls else ''}")
     return cls(**kwargs)
 

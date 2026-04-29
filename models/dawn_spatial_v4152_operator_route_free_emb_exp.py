@@ -376,6 +376,8 @@ def unit_norm_init(scale=1.0):
 def fixed_sig_proj_init():
     """Fixed column-orthogonal operator-signature projection."""
     def init(key, shape, dtype=jnp.float32):
+        if shape[-1] == 0:
+            return jnp.zeros(shape, dtype)
         x = jax.random.normal(key, shape, dtype)
         q, _ = jnp.linalg.qr(x)
         return q.astype(dtype)
@@ -384,24 +386,40 @@ def fixed_sig_proj_init():
 
 def build_route_signature(tag, read_unit, write_unit, read_sig_proj, write_sig_proj):
     tag_f = tag.astype(jnp.float32)
-    rproj = jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
-    wproj = jax.lax.stop_gradient(write_sig_proj.astype(jnp.float32))
-    read_sig = read_unit.astype(jnp.float32) @ rproj
-    write_sig = write_unit.astype(jnp.float32) @ wproj
-    read_sig = read_sig / (jnp.linalg.norm(read_sig, axis=-1, keepdims=True) + 1e-8)
-    write_sig = write_sig / (jnp.linalg.norm(write_sig, axis=-1, keepdims=True) + 1e-8)
-    return jnp.concatenate([tag_f, read_sig, write_sig], axis=-1)
+    parts = [tag_f] if tag_f.shape[-1] > 0 else []
+    if read_sig_proj.shape[-1] > 0:
+        rproj = jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
+        read_sig = read_unit.astype(jnp.float32) @ rproj
+        read_sig = read_sig / (jnp.linalg.norm(read_sig, axis=-1, keepdims=True) + 1e-8)
+        parts.append(read_sig)
+    if write_sig_proj.shape[-1] > 0:
+        wproj = jax.lax.stop_gradient(write_sig_proj.astype(jnp.float32))
+        write_sig = write_unit.astype(jnp.float32) @ wproj
+        write_sig = write_sig / (jnp.linalg.norm(write_sig, axis=-1, keepdims=True) + 1e-8)
+        parts.append(write_sig)
+    if len(parts) == 1:
+        return parts[0]
+    return jnp.concatenate(parts, axis=-1)
 
 
 def read_write_sig_norm_stats(read, write, read_sig_proj, write_sig_proj):
+    if read_sig_proj.shape[-1] == 0 and write_sig_proj.shape[-1] == 0:
+        z = jnp.array(0.0, dtype=jnp.float32)
+        return z, z, z, z
     r = read.astype(jnp.float32)
     w = write.astype(jnp.float32)
     r = r / (jnp.linalg.norm(r, axis=-1, keepdims=True) + 1e-8)
     w = w / (jnp.linalg.norm(w, axis=-1, keepdims=True) + 1e-8)
-    read_sig = r @ jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
-    write_sig = w @ jax.lax.stop_gradient(write_sig_proj.astype(jnp.float32))
-    read_norms = jax.lax.stop_gradient(jnp.linalg.norm(read_sig, axis=-1))
-    write_norms = jax.lax.stop_gradient(jnp.linalg.norm(write_sig, axis=-1))
+    if read_sig_proj.shape[-1] > 0:
+        read_sig = r @ jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
+        read_norms = jax.lax.stop_gradient(jnp.linalg.norm(read_sig, axis=-1))
+    else:
+        read_norms = jnp.zeros(read.shape[0], dtype=jnp.float32)
+    if write_sig_proj.shape[-1] > 0:
+        write_sig = w @ jax.lax.stop_gradient(write_sig_proj.astype(jnp.float32))
+        write_norms = jax.lax.stop_gradient(jnp.linalg.norm(write_sig, axis=-1))
+    else:
+        write_norms = jnp.zeros(write.shape[0], dtype=jnp.float32)
     return read_norms.mean(), read_norms.std(), write_norms.mean(), write_norms.std()
 
 
@@ -1638,6 +1656,7 @@ class DAWN(nn.Module):
     gradient_checkpointing: bool = False
 
     d_route: int = DEFAULT_TAG_DIM + DEFAULT_READ_SIG_DIM + DEFAULT_WRITE_SIG_DIM
+    route_mode: str = "signature"
     tag_dim: int = DEFAULT_TAG_DIM
     read_sig_dim: int = DEFAULT_READ_SIG_DIM
     write_sig_dim: int = DEFAULT_WRITE_SIG_DIM
@@ -1654,6 +1673,19 @@ class DAWN(nn.Module):
             raise ValueError(
                 f"d_model ({self.d_model}) must be divisible by "
                 f"n_heads ({self.n_heads})")
+        route_mode = self.route_mode.lower().replace("-", "_")
+        if route_mode == "auto":
+            route_mode = "tagonly" if self.tag_dim == self.d_route else "signature"
+        if route_mode in ("tag", "tagonly", "tag_only", "embedding", "embed"):
+            if self.tag_dim != self.d_route or self.read_sig_dim != 0 or self.write_sig_dim != 0:
+                raise ValueError(
+                    "route_mode='tagonly' requires tag_dim == d_route and "
+                    "read_sig_dim == write_sig_dim == 0, got "
+                    f"d_route={self.d_route}, tag_dim={self.tag_dim}, "
+                    f"read_sig_dim={self.read_sig_dim}, write_sig_dim={self.write_sig_dim}")
+        elif route_mode not in ("signature", "sig"):
+            raise ValueError(
+                f"Unknown route_mode={self.route_mode!r}; use 'signature' or 'tagonly'")
         if self.tag_dim + self.read_sig_dim + self.write_sig_dim != self.d_route:
             raise ValueError(
                 f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
@@ -2122,6 +2154,7 @@ class DAWN(nn.Module):
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'max_seq_len': self.max_seq_len,
             'd_route': self.d_route,
+            'route_mode': self.route_mode,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_know': self.n_know,
             'tag_dim': self.tag_dim,
             'read_sig_dim': self.read_sig_dim,
@@ -2132,6 +2165,7 @@ class DAWN(nn.Module):
         return [
             f"DAWN v{self.__version__}: Sense-Read-Write",
             f"  d_model={self.d_model}, d_route={self.d_route}, "
+            f"route_mode={self.route_mode}, "
             f"tag_dim={self.tag_dim}, read_sig_dim={self.read_sig_dim}, "
             f"write_sig_dim={self.write_sig_dim}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
