@@ -57,7 +57,6 @@ from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
 from models.dawn_spatial_v415_operator_route_sig_exp import DAWN as DAWN_V415
 from models.dawn_spatial_v4152_operator_route_free_emb_exp import DAWN as DAWN_V4152
-from models.dawn_spatial_v4152_tensor_parallel import DAWN as DAWN_V4152_TP
 
 # ============================================================
 # Constants
@@ -130,30 +129,20 @@ def print_xla_oom_diagnostics():
             text = path.read_text(errors="ignore")
         except Exception:
             continue
-        is_memory_report = "memory-usage-report" in path.name
-        if not is_memory_report and not any(n in text for n in needles[:3]):
+        if not any(n in text for n in needles[:3]):
             continue
         print(f"\n  --- XLA memory excerpt: {path} ---", flush=True)
         lines = text.splitlines()
         hits = [i for i, line in enumerate(lines)
-                if any(n in line for n in needles[:3])
-                or "bytes used" in line.lower()
-                or "allocation" in line.lower()]
+                if any(n in line for n in needles[:3])]
         start = max(0, hits[0] - 2) if hits else 0
-        end = min(len(lines), start + 120)
+        end = min(len(lines), start + 90)
         printed = 0
         for line in lines[start:end]:
-            interesting = (
-                any(n in line for n in needles)
-                or "Operator:" in line
-                or "bytes used" in line.lower()
-                or "allocation" in line.lower()
-                or is_memory_report
-            )
-            if interesting:
+            if any(n in line for n in needles) or "Operator:" in line:
                 print(f"  {line[:240]}", flush=True)
                 printed += 1
-                if printed >= 60:
+                if printed >= 36:
                     print("  ... excerpt truncated; inspect dump file above for full report.",
                           flush=True)
                     break
@@ -198,8 +187,6 @@ class ModelSpec:
     supports_sharded: bool = False
     force_sharded: bool = False
     sharded_kwargs: Optional[Callable[[dict], dict]] = None
-    tensor_cls: Any = None
-    tensor_module_path: Optional[str] = None
 
 
 def _baseline_kwargs(cfg):
@@ -242,52 +229,17 @@ def _dawn_shared_kwargs(cfg):
 def _dawn_v415_kwargs(cfg):
     kw = _dawn_shared_kwargs(cfg)
     m = cfg['model']
-    version = m.get('model_version', 'spatial-r1-v4.1.5')
     tag_dim = m.get('tag_dim', 16)
     read_sig_dim = m.get('read_sig_dim', 24)
     write_sig_dim = m.get('write_sig_dim', 24)
-    route_mode = str(m.get('route_mode', 'auto')).lower().replace('-', '_')
     expected_route = tag_dim + read_sig_dim + write_sig_dim
     d_route = m.get('d_route', expected_route)
-    tagonly_aliases = ('tag', 'tagonly', 'tag_only', 'embedding', 'embed')
-    if route_mode in tagonly_aliases or (route_mode == 'auto' and tag_dim == d_route):
-        if tag_dim != d_route:
-            raise ValueError(
-                f"tag-only route requires tag_dim == d_route, got "
-                f"d_route={d_route}, tag_dim={tag_dim}")
-        read_sig_dim = 0
-        write_sig_dim = 0
-        route_mode = 'tagonly'
-        expected_route = tag_dim
-    elif route_mode in ('auto', 'signature', 'sig'):
-        route_mode = 'signature'
-    else:
-        raise ValueError(
-            f"Unknown route_mode={route_mode!r}; use 'signature', 'tagonly', or omit for auto")
     if d_route != expected_route:
         raise ValueError(
             f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
             f"d_route={d_route}, tag_dim={tag_dim}, "
             f"read_sig_dim={read_sig_dim}, write_sig_dim={write_sig_dim}")
-    if route_mode == 'tagonly' and version != 'spatial-r1-v4.1.5.2':
-        raise ValueError("tag-only route mode is implemented for spatial-r1-v4.1.5.2")
     kw['d_route'] = d_route
-    if version == 'spatial-r1-v4.1.5.2':
-        kw['route_mode'] = route_mode
-        kw['attention_impl'] = str(m.get('attention_impl', 'eager')).lower()
-        kw['attention_head_blocks'] = m.get(
-            'attention_head_blocks',
-            cfg.get('training', {}).get('attention_head_blocks', 1))
-        kw['attention_weight_dropout'] = m.get('attention_weight_dropout', True)
-        kw['attention_splash_head_shards'] = m.get(
-            'attention_splash_head_shards',
-            cfg.get('training', {}).get('attention_splash_head_shards', 1))
-        kw['attention_splash_q_seq_shards'] = m.get(
-            'attention_splash_q_seq_shards',
-            cfg.get('training', {}).get('attention_splash_q_seq_shards', 1))
-        kw['attention_splash_interpret'] = m.get(
-            'attention_splash_interpret',
-            cfg.get('training', {}).get('attention_splash_interpret', False))
     kw['tag_dim'] = tag_dim
     kw['read_sig_dim'] = read_sig_dim
     kw['write_sig_dim'] = write_sig_dim
@@ -306,7 +258,6 @@ def _v415_sharded_kwargs(cfg):
         max_intensity=t.get('max_intensity', 10.0),
         scan_scale=t.get('scan_scale', 0.01),
         scan_std_floor=t.get('scan_std_floor', 0.5),
-        token_blocks=t.get('srw_token_blocks', 1),
     )
 
 
@@ -341,8 +292,6 @@ MODEL_REGISTRY = {
         supports_sharded=True,
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
-        tensor_cls=DAWN_V4152_TP,
-        tensor_module_path='models.dawn_spatial_v4152_tensor_parallel',
     ),
 }
 
@@ -365,39 +314,14 @@ def build_model_from_config(cfg):
             f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
-    cls = spec.cls
-    parallelism = cfg['model'].get('parallelism', '').lower()
-    if parallelism in ('tensor', 'tp'):
-        if spec.tensor_cls is None:
-            raise ValueError(
-                f"model_version={version!r} has no tensor-parallel backend")
-        cls = spec.tensor_cls
-        t = cfg['training']
-        m = cfg['model']
-        kwargs['attention_checkpoint'] = m.get(
-            'attention_checkpoint', t.get('attention_checkpoint', True))
-        kwargs['loss_checkpoint'] = m.get(
-            'loss_checkpoint', t.get('loss_checkpoint', True))
-        for _k in (
-            'attention_impl',
-            'attention_head_blocks',
-            'attention_weight_dropout',
-            'attention_splash_head_shards',
-            'attention_splash_q_seq_shards',
-            'attention_splash_interpret',
-        ):
-            kwargs.pop(_k, None)
     if version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
         print(
             "operator route signature: "
             f"tag_dim={kwargs['tag_dim']}, "
             f"read_sig_dim={kwargs['read_sig_dim']}, "
             f"write_sig_dim={kwargs['write_sig_dim']}, "
-            f"d_route={kwargs['d_route']}, "
-            f"route_mode={kwargs.get('route_mode', 'signature')}"
-            f"{', attention_impl=' + kwargs.get('attention_impl', 'eager') if version == 'spatial-r1-v4.1.5.2' else ''}"
-            f"{' parallelism=tensor' if cls is spec.tensor_cls else ''}")
-    return cls(**kwargs)
+            f"d_route={kwargs['d_route']}")
+    return spec.cls(**kwargs)
 
 
 # ============================================================
@@ -1236,40 +1160,17 @@ def create_mesh(mesh_data, mesh_model):
     return Mesh(device_array, ('data', 'model'))
 
 
-def get_param_shardings(params, mesh, is_baseline=False, tensor_parallel=False):
+def get_param_shardings(params, mesh, is_baseline=False):
     """Create sharding specs for params: neuron_pool N-axis on 'model', rest replicated.
     For baseline models (is_baseline=True), 2D+ params are sharded on 'data' axis (FSDP-style).
     """
     replicated = NamedSharding(mesh, P())  # no sharding
     n_sharded = NamedSharding(mesh, P('model', None))  # N axis on model
     n_sharded_3d = NamedSharding(mesh, P('model', None, None))
-    d_sharded = NamedSharding(mesh, P(None, 'model'))
-    d_vector_sharded = NamedSharding(mesh, P('model'))
-    din_sharded = NamedSharding(mesh, P('model', None))
     data_sharded = NamedSharding(mesh, P('data', None))  # FSDP: first axis on data
 
     def _get_sharding(path, value):
         path_str = '/'.join(str(p) for p in path)
-        if tensor_parallel:
-            if value.ndim == 1 and (
-                'norm' in path_str or path_str.endswith('/bias')
-            ) and value.shape[0] % mesh.shape['model'] == 0:
-                return d_vector_sharded
-            if 'token_emb' in path_str or 'pos_emb' in path_str:
-                if value.ndim == 2:
-                    return d_sharded
-            if 'neuron_pool' in path_str:
-                if '_read' in path_str or '_write' in path_str:
-                    if '_sig_proj' in path_str:
-                        return din_sharded
-                    return d_sharded
-                return replicated
-            if 'router' in path_str and value.ndim == 2:
-                if value.shape[0] % mesh.shape['model'] == 0:
-                    return din_sharded
-            if 'expand_O' in path_str and value.ndim == 2:
-                if value.shape[0] % mesh.shape['model'] == 0:
-                    return din_sharded
         # NeuronPool params: shard N axis (first dim) on 'model'
         if 'neuron_pool' in path_str:
             if value.ndim == 2:
@@ -1362,7 +1263,7 @@ def shard_batch(batch, n_devices):
 # ============================================================
 
 def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
-             verbose=True, data_sharding_spec=None, mesh=None):
+             verbose=True, data_sharding_spec=None):
     """Run evaluation and return avg loss and accuracy.
 
     All hosts must call this (pmap requires it), but only verbose=True host prints.
@@ -1387,13 +1288,7 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             input_ids = shard_to_mesh(input_ids, data_sharding_spec, gs)
             attention_mask = shard_to_mesh(attention_mask, data_sharding_spec, gs)
 
-        if mesh is not None:
-            with mesh:
-                ce_loss, correct, valid_count = eval_step_fn(
-                    params, input_ids, attention_mask)
-        else:
-            ce_loss, correct, valid_count = eval_step_fn(
-                params, input_ids, attention_mask)
+        ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
 
         total_loss_jax = total_loss_jax + ce_loss * valid_count.astype(jnp.float32)
         total_correct_jax = total_correct_jax + correct
@@ -2720,18 +2615,7 @@ def main():
 
     mesh = create_mesh(mesh_data, mesh_model)
     data_sharding = NamedSharding(mesh, P('data', None))
-    tensor_parallel = cfg['model'].get('parallelism', '').lower() in ('tensor', 'tp')
-    if tensor_parallel:
-        d_model = cfg['model']['d_model']
-        n_heads = cfg['model']['n_heads']
-        if d_model % mesh_model != 0:
-            raise ValueError(
-                f"d_model={d_model} must be divisible by mesh_model={mesh_model} "
-                "for tensor-parallel residual sharding.")
-        if n_heads % mesh_model != 0:
-            raise ValueError(
-                f"n_heads={n_heads} must be divisible by mesh_model={mesh_model} "
-                "for tensor-parallel head sharding.")
+    per_device_batch = batch_size // total_devices
 
     # Auto n_chunks: target ~2GB per chunk (bf16)
     def auto_n_chunks(N, target_gb=2.0):
@@ -2745,30 +2629,22 @@ def main():
     n_know = cfg['model'].get('n_know', 25200)
     n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
     n_v = cfg['model'].get('n_v', 2600)
-    if tensor_parallel:
-        # TP uses the model axis for D/head sharding; each model shard sees
-        # the full neuron pool and chunks only to bound score/gate temps.
-        nk_local = n_know
-        nqk_local = n_qk
-        nv_local = n_v
-    else:
-        for _name, _N in (('n_know', n_know), ('n_qk', n_qk), ('n_v', n_v)):
-            if _N % mesh_model != 0:
-                raise ValueError(
-                    f"{_name}={_N} must be divisible by mesh_model={mesh_model} "
-                    "for model-axis sharding.")
-        # N_local = N / mesh_model (each chip's share)
-        nk_local = n_know // mesh_model
-        nqk_local = n_qk // mesh_model
-        nv_local = n_v // mesh_model
+    for _name, _N in (('n_know', n_know), ('n_qk', n_qk), ('n_v', n_v)):
+        if _N % mesh_model != 0:
+            raise ValueError(
+                f"{_name}={_N} must be divisible by mesh_model={mesh_model} "
+                "for model-axis sharding.")
+    # N_local = N / mesh_model (each chip's share)
+    nk_local = n_know // mesh_model
+    nqk_local = n_qk // mesh_model
+    nv_local = n_v // mesh_model
 
     n_chunks_know = cfg['training'].get('n_chunks_know',
                                          auto_n_chunks(nk_local, target_chunk_gb))
     n_chunks_qk = cfg['training'].get('n_chunks_qk',
                                        auto_n_chunks(nqk_local, target_chunk_gb))
     n_chunks_v = cfg['training'].get('n_chunks_v',
-                                     auto_n_chunks(nv_local, target_chunk_gb))
-    srw_token_blocks = cfg['training'].get('srw_token_blocks', 1)
+                                      auto_n_chunks(nv_local, target_chunk_gb))
 
     def _chunk_size_from_count(name, n_local, n_chunks):
         n_chunks = int(n_chunks)
@@ -2788,17 +2664,11 @@ def main():
               f"{total_devices} devices, per_device_batch={per_device_batch} ===")
         print(f"  Chunks: know={n_chunks_know} (cs={nk_local // max(n_chunks_know,1)}), "
               f"qk={n_chunks_qk}, v={n_chunks_v}")
-        if srw_token_blocks != 1:
-            print(f"  SRW token blocks: {srw_token_blocks}")
-        if model_version == 'spatial-r1-v4.1.5.2':
-            print(f"  Attention impl: {cfg['model'].get('attention_impl', 'eager')}")
         chunk_mem = per_device_batch * max_seq_len * know_max_chunk * 2 / 1e9
         print(f"  Est chunk mem (know): {chunk_mem:.2f}GB bf16")
 
     # Shard params: neuron_pool N-axis on 'model', rest replicated
-    param_shardings = get_param_shardings(
-        params, mesh, is_baseline=is_baseline,
-        tensor_parallel=tensor_parallel)
+    param_shardings = get_param_shardings(params, mesh, is_baseline=is_baseline)
     params = shard_params_to_mesh(params, param_shardings)
 
     _is_resuming = (resume_path is not None and _file_exists(resume_path))
@@ -2832,11 +2702,7 @@ def main():
             raise RuntimeError(
                 f"model_version={model_version!r} is registered without "
                 f"supports_sharded=True but mesh_model>1 or force_sharded=True.")
-        _parallelism = cfg['model'].get('parallelism', '').lower()
-        _module_path = _spec.module_path
-        if _parallelism in ('tensor', 'tp') and _spec.tensor_module_path:
-            _module_path = _spec.tensor_module_path
-        _v3 = __import__(_module_path, fromlist=['make_sharded_srw'])
+        _v3 = __import__(_spec.module_path, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', None)
         if max_chunk is not None:
@@ -2845,13 +2711,6 @@ def main():
         _srw_base_kwargs = {'mesh': mesh}
         if _spec.sharded_kwargs is not None:
             _srw_base_kwargs.update(_spec.sharded_kwargs(cfg))
-        if _parallelism in ('tensor', 'tp'):
-            _srw_base_kwargs.update({
-                'stats_checkpoint': cfg['training'].get(
-                    'srw_stats_checkpoint', True),
-                'gate_checkpoint': cfg['training'].get(
-                    'srw_gate_checkpoint', True),
-            })
         # Slim (train) -kwargs don't set analysis, so defaults to False.
         _sharded_single_v = make_sharded_srw(
             max_chunk_size=v_max_chunk, **_srw_base_kwargs)
@@ -2866,7 +2725,6 @@ def main():
                 'know_single': _sharded_single_know,
                 'paired': _sharded_paired_qk,
                 'qk_paired': _sharded_paired_qk,
-                'mesh': mesh,
             }
         else:
             _sharded_fns = _sharded_single_know
@@ -2893,14 +2751,12 @@ def main():
                     'know_single': _sharded_single_know_a,
                     'paired': _sharded_paired_a,
                     'qk_paired': _sharded_paired_a,
-                    'mesh': mesh,
                 }
             else:
                 _sharded_fns_analysis = _sharded_single_know_a
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks qk/v/know={n_chunks_qk}/{n_chunks_v}/{n_chunks_know}"
-                  f"; token_blocks={srw_token_blocks}"
                   f"; max_chunk qk/v/know={qk_max_chunk}/{v_max_chunk}/{know_max_chunk}"
                   f"; analysis kernels={'on' if _supports_analysis else 'off'})")
 
@@ -2961,10 +2817,9 @@ def main():
 
         # First call: JIT compilation (slow)
         jit_start = time.time()
-        with mesh:
-            _dp, _do, dummy_metrics = train_step_fn(
-                params, opt_state, dummy_ids, dummy_mask, dummy_step_rng,
-                _dummy_emb_snap, jnp.asarray(0, jnp.int32))
+        _dp, _do, dummy_metrics = train_step_fn(
+            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng,
+            _dummy_emb_snap, jnp.asarray(0, jnp.int32))
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         jit_loss = float(dummy_metrics['total_loss'])
@@ -2977,10 +2832,9 @@ def main():
         # Second call: measure actual step time (post-JIT)
         rng, dummy_step_rng2 = jax.random.split(rng)
         step_start = time.time()
-        with mesh:
-            _dp2, _do2, dummy_metrics2 = train_step_fn(
-                params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
-                _dummy_emb_snap, jnp.asarray(0, jnp.int32))
+        _dp2, _do2, dummy_metrics2 = train_step_fn(
+            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
+            _dummy_emb_snap, jnp.asarray(0, jnp.int32))
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
@@ -3010,10 +2864,7 @@ def main():
                       flush=True)
 
             _v3 = __import__(
-                (MODEL_REGISTRY[model_version].tensor_module_path
-                 if cfg['model'].get('parallelism', '').lower() in ('tensor', 'tp')
-                 and MODEL_REGISTRY[model_version].tensor_module_path
-                 else MODEL_REGISTRY[model_version].module_path),
+                MODEL_REGISTRY[model_version].module_path,
                 fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
@@ -3388,10 +3239,7 @@ def main():
             print(f"  The model + gradients do not fit in device memory.")
             print(f"  Try: reduce batch_size, enable gradient_checkpointing, or use a smaller model.")
             print_xla_oom_diagnostics()
-        try:
-            jax.distributed.shutdown()
-        finally:
-            os._exit(1)
+        raise
 
     # ----------------------------------------------------------
     # Training log file (host 0 only)
@@ -3553,11 +3401,10 @@ def main():
             attention_mask = shard_to_mesh(
                 attention_mask, data_sharding, (batch_size, max_seq_len))
 
-            with mesh:
-                params, opt_state, metrics = train_step_fn(
-                    params, opt_state,
-                    input_ids, attention_mask, step_rng, _prev_emb_snap,
-                    jnp.asarray(global_step, jnp.int32))
+            params, opt_state, metrics = train_step_fn(
+                params, opt_state,
+                input_ids, attention_mask, step_rng, _prev_emb_snap,
+                jnp.asarray(global_step, jnp.int32))
 
             # Scalar helper kept for log-block use (m_grad etc.).
             def _m(v):
@@ -3703,8 +3550,7 @@ def main():
                 val_loader.reset()
                 val_loss, val_acc = evaluate(
                     eval_step_fn, params, val_loader, n_local_devices,
-                    verbose=is_host0, data_sharding_spec=data_sharding,
-                    mesh=mesh)
+                    verbose=is_host0, data_sharding_spec=data_sharding)
                 if is_host0:
                     log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
                     log_jsonl({
@@ -3738,9 +3584,8 @@ def main():
                     _a_mask = shard_to_mesh(_a_mask, data_sharding, _a_gs)
                     try:
                         _a_compile_start = time.time()
-                        with mesh:
-                            analysis_result = analysis_step_fn(
-                                params, _a_ids, _a_mask)
+                        analysis_result = analysis_step_fn(
+                            params, _a_ids, _a_mask)
                         # Force the computation so HBM usage of the
                         # analysis kernels registers now, not on the
                         # next Python line.
@@ -3857,8 +3702,7 @@ def main():
         val_loader.reset()
         val_loss, val_acc = evaluate(
             eval_step_fn, params, val_loader, n_local_devices,
-            verbose=is_host0, data_sharding_spec=data_sharding,
-            mesh=mesh)
+            verbose=is_host0, data_sharding_spec=data_sharding)
 
         is_best = val_loss < best_val_loss
         if is_best:

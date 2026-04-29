@@ -1,4 +1,4 @@
-"""
+﻿"""
 DAWN-SRW v4.1.5.2: Two-stage gate with free-norm route tags
 
 ## Design philosophy
@@ -312,15 +312,6 @@ from functools import partial
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
-try:
-    from jax.experimental.pallas.ops.tpu.splash_attention import (
-        BlockSizes as _SplashBlockSizes,
-        make_splash_mha as _make_splash_mha,
-    )
-except Exception:  # Splash is TPU/JAX-version dependent.
-    _SplashBlockSizes = None
-    _make_splash_mha = None
-
 
 # ================================================================
 # V4.1 physical constants (defaults; overridable via config).
@@ -385,8 +376,6 @@ def unit_norm_init(scale=1.0):
 def fixed_sig_proj_init():
     """Fixed column-orthogonal operator-signature projection."""
     def init(key, shape, dtype=jnp.float32):
-        if shape[-1] == 0:
-            return jnp.zeros(shape, dtype)
         x = jax.random.normal(key, shape, dtype)
         q, _ = jnp.linalg.qr(x)
         return q.astype(dtype)
@@ -395,40 +384,24 @@ def fixed_sig_proj_init():
 
 def build_route_signature(tag, read_unit, write_unit, read_sig_proj, write_sig_proj):
     tag_f = tag.astype(jnp.float32)
-    parts = [tag_f] if tag_f.shape[-1] > 0 else []
-    if read_sig_proj.shape[-1] > 0:
-        rproj = jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
-        read_sig = read_unit.astype(jnp.float32) @ rproj
-        read_sig = read_sig / (jnp.linalg.norm(read_sig, axis=-1, keepdims=True) + 1e-8)
-        parts.append(read_sig)
-    if write_sig_proj.shape[-1] > 0:
-        wproj = jax.lax.stop_gradient(write_sig_proj.astype(jnp.float32))
-        write_sig = write_unit.astype(jnp.float32) @ wproj
-        write_sig = write_sig / (jnp.linalg.norm(write_sig, axis=-1, keepdims=True) + 1e-8)
-        parts.append(write_sig)
-    if len(parts) == 1:
-        return parts[0]
-    return jnp.concatenate(parts, axis=-1)
+    rproj = jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
+    wproj = jax.lax.stop_gradient(write_sig_proj.astype(jnp.float32))
+    read_sig = read_unit.astype(jnp.float32) @ rproj
+    write_sig = write_unit.astype(jnp.float32) @ wproj
+    read_sig = read_sig / (jnp.linalg.norm(read_sig, axis=-1, keepdims=True) + 1e-8)
+    write_sig = write_sig / (jnp.linalg.norm(write_sig, axis=-1, keepdims=True) + 1e-8)
+    return jnp.concatenate([tag_f, read_sig, write_sig], axis=-1)
 
 
 def read_write_sig_norm_stats(read, write, read_sig_proj, write_sig_proj):
-    if read_sig_proj.shape[-1] == 0 and write_sig_proj.shape[-1] == 0:
-        z = jnp.array(0.0, dtype=jnp.float32)
-        return z, z, z, z
     r = read.astype(jnp.float32)
     w = write.astype(jnp.float32)
     r = r / (jnp.linalg.norm(r, axis=-1, keepdims=True) + 1e-8)
     w = w / (jnp.linalg.norm(w, axis=-1, keepdims=True) + 1e-8)
-    if read_sig_proj.shape[-1] > 0:
-        read_sig = r @ jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
-        read_norms = jax.lax.stop_gradient(jnp.linalg.norm(read_sig, axis=-1))
-    else:
-        read_norms = jnp.zeros(read.shape[0], dtype=jnp.float32)
-    if write_sig_proj.shape[-1] > 0:
-        write_sig = w @ jax.lax.stop_gradient(write_sig_proj.astype(jnp.float32))
-        write_norms = jax.lax.stop_gradient(jnp.linalg.norm(write_sig, axis=-1))
-    else:
-        write_norms = jnp.zeros(write.shape[0], dtype=jnp.float32)
+    read_sig = r @ jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
+    write_sig = w @ jax.lax.stop_gradient(write_sig_proj.astype(jnp.float32))
+    read_norms = jax.lax.stop_gradient(jnp.linalg.norm(read_sig, axis=-1))
+    write_norms = jax.lax.stop_gradient(jnp.linalg.norm(write_sig, axis=-1))
     return read_norms.mean(), read_norms.std(), write_norms.mean(), write_norms.std()
 
 
@@ -451,7 +424,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                      max_intensity=MAX_INTENSITY,
                      scan_scale=SCAN_SCALE,
                      scan_std_floor=SCAN_STD_FLOOR,
-                     token_blocks=1,
                      analysis=False):
     """Create fused shard_map'd gate+srw. Gate never materialised full.
 
@@ -495,14 +467,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     # SLIM out_specs: train path.
     _slim_out_specs = (
         P('data', None, None),   # out [B,S,D]
-        P('data', None, None) if analysis else P(),   # active
-        P('data', None, None) if analysis else P(),   # gate_max
+        P('data', None, None),   # active [B,S,1]
+        P('data', None, None),   # gate_max [B,S,1]
         P(),                     # lb_loss scalar
         P(),                     # score_std scalar
         P(),                     # gate_sum scalar (誇gate, observational)
         P(),                     # active_n_mean scalar
-        P('data', None, None) if analysis else P(),   # strong
-        P('data', None, None) if analysis else P(),   # z_mean_active
+        P('data', None, None),   # strong [B,S,1]
+        P('data', None, None),   # z_mean_active [B,S,1]
         P(),                     # tau_abs_mean scalar
         P(),                     # dead_penalty scalar
         P(),                     # dead_count scalar
@@ -574,59 +546,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route, _, _ = route_chunk(s)
-                n_tb = int(token_blocks)
-                if n_tb > 1:
-                    T = B * S
-                    if T % n_tb != 0:
-                        raise ValueError(
-                            f"srw_token_blocks={n_tb} must divide B*S={T}")
-                    tb = T // n_tb
-                    h_tok = h_bf.reshape((T, h_bf.shape[-1]))
-
-                    def stats_token_step(tcarry, j):
-                        (s_sum_f, sq_sum_f, cube_sum_f, quad_sum_f,
-                         score_sum_chunk) = tcarry
-                        t0 = j * tb
-                        h_t = jax.lax.dynamic_slice_in_dim(h_tok, t0, tb, axis=0)
-                        scores_t = h_t @ route.T
-                        s32 = scores_t.astype(jnp.float32)
-                        s2 = s32 * s32
-                        local_sum_t = s32.sum(axis=-1, keepdims=True)
-                        local_sq_t = s2.sum(axis=-1, keepdims=True)
-                        local_cube_t = (s2 * s32).sum(axis=-1, keepdims=True)
-                        local_quad_t = (s2 * s2).sum(axis=-1, keepdims=True)
-                        s_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            s_sum_f, local_sum_t, t0, axis=0)
-                        sq_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            sq_sum_f, local_sq_t, t0, axis=0)
-                        cube_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            cube_sum_f, local_cube_t, t0, axis=0)
-                        quad_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            quad_sum_f, local_quad_t, t0, axis=0)
-                        score_sum_chunk = score_sum_chunk + s32.sum(axis=0)
-                        return (s_sum_f, sq_sum_f, cube_sum_f, quad_sum_f,
-                                score_sum_chunk), None
-
-                    z_t1 = jnp.zeros((T, 1), dtype=jnp.float32)
-                    (sum_f, sq_f, cube_f, quad_f, score_sum_chunk), _ = jax.lax.scan(
-                        stats_token_step,
-                        (z_t1, z_t1, z_t1, z_t1,
-                         jnp.zeros((cs,), dtype=jnp.float32)),
-                        jnp.arange(n_tb))
-                    s_sum = s_sum + sum_f.reshape((B, S, 1))
-                    sq_sum = sq_sum + sq_f.reshape((B, S, 1))
-                    cube_sum = cube_sum + cube_f.reshape((B, S, 1))
-                    quad_sum = quad_sum + quad_f.reshape((B, S, 1))
-                    per_neuron_score = score_sum_chunk / (B * S)
-                else:
-                    scores = h_bf @ route.T
-                    s32 = scores.astype(jnp.float32)
-                    s2 = s32 * s32
-                    s_sum = s_sum + jnp.sum(s32, axis=-1, keepdims=True)
-                    sq_sum = sq_sum + jnp.sum(s2, axis=-1, keepdims=True)
-                    cube_sum = cube_sum + jnp.sum(s2 * s32, axis=-1, keepdims=True)
-                    quad_sum = quad_sum + jnp.sum(s2 * s2, axis=-1, keepdims=True)
-                    per_neuron_score = jnp.sum(s32, axis=(0, 1)) / (B * S)
+                scores = h_bf @ route.T
+                scores_f = scores.astype(jnp.float32)
+                s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
+                sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
+                cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
+                quad_sum = quad_sum + (scores_f ** 4).sum(axis=-1, keepdims=True)
+                per_neuron_score = scores_f.mean(axis=(0, 1))  # [cs]
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq), None
@@ -641,45 +567,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route, _, _ = route_chunk(s)
-                n_tb = int(token_blocks)
-                if n_tb > 1:
-                    T = B * S
-                    if T % n_tb != 0:
-                        raise ValueError(
-                            f"srw_token_blocks={n_tb} must divide B*S={T}")
-                    tb = T // n_tb
-                    h_tok = h_bf.reshape((T, h_bf.shape[-1]))
-
-                    def stats_token_step(tcarry, j):
-                        s_sum_f, sq_sum_f, score_sum_chunk = tcarry
-                        t0 = j * tb
-                        h_t = jax.lax.dynamic_slice_in_dim(h_tok, t0, tb, axis=0)
-                        scores_t = h_t @ route.T
-                        s32 = scores_t.astype(jnp.float32)
-                        local_sum_t = s32.sum(axis=-1, keepdims=True)
-                        local_sq_t = (s32 * s32).sum(axis=-1, keepdims=True)
-                        s_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            s_sum_f, local_sum_t, t0, axis=0)
-                        sq_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            sq_sum_f, local_sq_t, t0, axis=0)
-                        score_sum_chunk = score_sum_chunk + s32.sum(axis=0)
-                        return (s_sum_f, sq_sum_f, score_sum_chunk), None
-
-                    z_t1 = jnp.zeros((T, 1), dtype=jnp.float32)
-                    (sum_f, sq_f, score_sum_chunk), _ = jax.lax.scan(
-                        stats_token_step,
-                        (z_t1, z_t1, jnp.zeros((cs,), dtype=jnp.float32)),
-                        jnp.arange(n_tb))
-                    s_sum = s_sum + sum_f.reshape((B, S, 1))
-                    sq_sum = sq_sum + sq_f.reshape((B, S, 1))
-                    per_neuron_score = score_sum_chunk / (B * S)
-                else:
-                    scores = h_bf @ route.T
-                    scores_f = scores.astype(jnp.float32)
-                    s_sum = s_sum + jnp.sum(scores_f, axis=-1, keepdims=True)
-                    sq_sum = sq_sum + jnp.sum(
-                        scores_f * scores_f, axis=-1, keepdims=True)
-                    per_neuron_score = jnp.sum(scores_f, axis=(0, 1)) / (B * S)
+                scores = h_bf @ route.T
+                scores_f = scores.astype(jnp.float32)
+                s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
+                sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
+                per_neuron_score = scores_f.mean(axis=(0, 1))  # [cs]
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, ns_sum, ns_sq), None
@@ -736,8 +628,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = h_bf @ route.T
-                raw = scores - tau.astype(scores.dtype)
-                margin = raw.astype(jnp.float32) - _act_thr
+                scores_f = scores.astype(jnp.float32)
+                raw = scores_f - tau
+                margin = raw - _act_thr
                 activation = jax.nn.sigmoid(_sharp * margin)
                 active_margin = jnp.maximum(margin - _act_cut, 0.0)
                 intensity = _eps + jnp.minimum(active_margin, _max_int)
@@ -762,7 +655,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 g_safe = gate + 1e-8
                 chunk_g_log_g = (gate * jnp.log(g_safe)).sum(axis=-1, keepdims=True)
                 max_gate_chunk = gate.max(axis=(0, 1))
-                mean_score_chunk = scores.astype(jnp.float32).mean(axis=(0, 1))
+                mean_score_chunk = scores_f.mean(axis=(0, 1))
                 max_gate_chunk = jax.lax.pmax(
                     jax.lax.stop_gradient(max_gate_chunk), 'data')
                 mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
@@ -809,91 +702,26 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_max) = carry
                 s = i * cs
                 route, rc, wc = route_chunk(s)
-                n_tb = int(token_blocks)
-                if n_tb > 1:
-                    T = B * S
-                    if T % n_tb != 0:
-                        raise ValueError(
-                            f"srw_token_blocks={n_tb} must divide B*S={T}")
-                    tb = T // n_tb
-                    h_tok = h_bf.reshape((T, h_bf.shape[-1]))
-                    x_tok = x_bf.reshape((T, D))
-                    tau_tok = tau.reshape((T, 1))
-
-                    def token_step(tcarry, j):
-                        (out_f, weighted_f, gate_max_f, active_f, strong_f,
-                         den_f, chunk_gate_max, chunk_score_sum,
-                         chunk_int_max_t) = tcarry
-                        t0 = j * tb
-                        h_t = jax.lax.dynamic_slice_in_dim(h_tok, t0, tb, axis=0)
-                        x_t = jax.lax.dynamic_slice_in_dim(x_tok, t0, tb, axis=0)
-                        tau_t = jax.lax.dynamic_slice_in_dim(tau_tok, t0, tb, axis=0)
-                        scores_t = h_t @ route.T
-                        scores_tf = scores_t.astype(jnp.float32)
-                        margin_t = scores_tf - tau_t - _act_thr
-                        activation_t = jax.nn.sigmoid(_sharp * margin_t)
-                        active_margin_t = jnp.maximum(margin_t - _act_cut, 0.0)
-                        intensity_t = _eps + jnp.minimum(active_margin_t, _max_int)
-                        gate_t = activation_t * intensity_t
-                        xr_t = (x_t @ rc.T).astype(jnp.float32)
-                        c_out_t = ((gate_t * xr_t).astype(jnp.bfloat16) @ wc).astype(jnp.float32)
-                        out_f = jax.lax.dynamic_update_slice_in_dim(out_f, c_out_t, t0, axis=0)
-                        weighted_f = jax.lax.dynamic_update_slice_in_dim(
-                            weighted_f, gate_t.sum(axis=-1, keepdims=True), t0, axis=0)
-                        gate_max_f = jax.lax.dynamic_update_slice_in_dim(
-                            gate_max_f, gate_t.max(axis=-1, keepdims=True), t0, axis=0)
-                        active_f = jax.lax.dynamic_update_slice_in_dim(
-                            active_f, (activation_t > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True), t0, axis=0)
-                        strong_f = jax.lax.dynamic_update_slice_in_dim(
-                            strong_f, (activation_t > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True), t0, axis=0)
-                        den_f = jax.lax.dynamic_update_slice_in_dim(
-                            den_f, gate_t.sum(axis=-1, keepdims=True), t0, axis=0)
-                        chunk_gate_max = jnp.maximum(chunk_gate_max, gate_t.max(axis=0))
-                        chunk_score_sum = chunk_score_sum + scores_tf.sum(axis=0)
-                        chunk_int_max_t = jnp.maximum(chunk_int_max_t, intensity_t.max())
-                        return (out_f, weighted_f, gate_max_f, active_f, strong_f,
-                                den_f, chunk_gate_max, chunk_score_sum,
-                                chunk_int_max_t), None
-
-                    z_t1 = jnp.zeros((T, 1), dtype=jnp.float32)
-                    (c_out_f, chunk_weighted_f, gate_max_f, chunk_active_f,
-                     chunk_strong_f, chunk_intensity_f,
-                     max_gate_chunk, score_sum_chunk, chunk_int_max), _ = jax.lax.scan(
-                        token_step,
-                        (jnp.zeros((T, D), dtype=jnp.float32),
-                         z_t1, jnp.full((T, 1), -1e9), z_t1, z_t1, z_t1,
-                         jnp.full((cs,), -1e9, dtype=jnp.float32),
-                         jnp.zeros((cs,), dtype=jnp.float32),
-                         jnp.float32(0.0)),
-                        jnp.arange(n_tb))
-                    c_out = c_out_f.reshape((B, S, D))
-                    chunk_weighted = chunk_weighted_f.reshape((B, S, 1))
-                    chunk_intensity = chunk_intensity_f.reshape((B, S, 1))
-                    chunk_active = chunk_active_f.reshape((B, S, 1))
-                    chunk_strong = chunk_strong_f.reshape((B, S, 1))
-                    gate_max_local = gate_max_f.reshape((B, S, 1))
-                    mean_score_chunk = score_sum_chunk / (B * S)
-                else:
-                    scores = h_bf @ route.T
-                    scores_f = scores.astype(jnp.float32)
-                    margin = scores_f - tau - _act_thr
-                    activation = jax.nn.sigmoid(_sharp * margin)
-                    active_margin = jnp.maximum(margin - _act_cut, 0.0)
-                    intensity = _eps + jnp.minimum(active_margin, _max_int)
-                    gate = activation * intensity
-                    chunk_int_max = intensity.max()
-                    xr = x_bf @ rc.T
-                    xr_f = xr.astype(jnp.float32)
-                    a = gate * xr_f
-                    c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
-                    chunk_weighted = gate.sum(axis=-1, keepdims=True)
-                    chunk_intensity = gate.sum(axis=-1, keepdims=True)
-                    chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
-                    chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
-                    max_gate_chunk = gate.max(axis=(0, 1))
-                    mean_score_chunk = scores_f.mean(axis=(0, 1))
-                    gate_max_local = gate.max(axis=-1, keepdims=True)
+                scores = h_bf @ route.T
+                scores_f = scores.astype(jnp.float32)
+                raw = scores_f - tau
+                margin = raw - _act_thr
+                activation = jax.nn.sigmoid(_sharp * margin)
+                active_margin = jnp.maximum(margin - _act_cut, 0.0)
+                intensity = _eps + jnp.minimum(active_margin, _max_int)
+                gate = activation * intensity
+                chunk_int_max = intensity.max()
+                xr = x_bf @ rc.T
+                xr_f = xr.astype(jnp.float32)
+                a = gate * xr_f
+                c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
+                chunk_weighted = gate.sum(axis=-1, keepdims=True)
+                chunk_intensity = gate.sum(axis=-1, keepdims=True)
+                chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
+                chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 # 誇intensity feeds den (consumed after scan, not returned).
+                max_gate_chunk = gate.max(axis=(0, 1))
+                mean_score_chunk = scores_f.mean(axis=(0, 1))
                 max_gate_chunk = jax.lax.pmax(
                     jax.lax.stop_gradient(max_gate_chunk), 'data')
                 mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
@@ -904,7 +732,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_dead_count = dead_mask_chunk.sum()
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
-                        jnp.maximum(total_gate_max, gate_max_local),
+                        jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_den_cost + chunk_intensity,
@@ -956,17 +784,12 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         activation_cost_mean = global_activation_cost.mean()
         current_cost_mean = global_current_cost.mean()
 
-        if not analysis:
-            return (out.astype(jnp.float32), active_frac.mean(), global_gate_max.max(),
-                    score_lb, score_std_out, es_out, active_n_mean,
-                    strong_frac.mean(), z_mean_active.mean(), tau_abs_mean,
-                    dead_penalty_out, dead_count_out, int_max_out,
-                    den_cost_mean, activation_cost_mean, current_cost_mean)
-
         slim_out = (out.astype(jnp.float32), active_frac, global_gate_max, score_lb,
                     score_std_out, es_out, active_n_mean, strong_frac, z_mean_active,
                     tau_abs_mean, dead_penalty_out, dead_count_out, int_max_out,
                     den_cost_mean, activation_cost_mean, current_cost_mean)
+        if not analysis:
+            return slim_out
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
@@ -1006,7 +829,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             max_intensity=MAX_INTENSITY,
                             scan_scale=SCAN_SCALE,
                             scan_std_floor=SCAN_STD_FLOOR,
-                            token_blocks=1,
                             analysis=False):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
@@ -1014,9 +836,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     tau_offset and scan_bias are [B,S,2,1].
     x @ read.T computed once (shared by both routes).
     Scores stats computed independently per route.
-    Returns q_out and k_out separately. Train returns scalar
-    active/gate/strong/z diagnostics; analysis keeps per-token [B,S,1]
-    diagnostics.
+    Returns out [B,S,2,D], active [B,S,1], gate_max [B,S,1].
 
     v4.1 gate: activation 횞 intensity (see make_sharded_srw docstring).
     analysis: see make_sharded_srw docstring.
@@ -1033,16 +853,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     _scan_std_floor = jnp.float32(scan_std_floor)
 
     _slim_out_specs = (
-        P('data', None, None),        # q_out [B,S,D]
-        P('data', None, None),        # k_out [B,S,D]
-        P('data', None, None) if analysis else P(),  # active
-        P('data', None, None) if analysis else P(),  # gate_max
+        P('data', None, None, None),  # out [B,S,2,D]
+        P('data', None, None),        # active [B,S,1]
+        P('data', None, None),        # gate_max [B,S,1]
         P(),                          # lb_loss scalar
         P(),                          # score_std scalar
         P(),                          # gate_sum scalar
         P(),                          # active_n_mean scalar
-        P('data', None, None) if analysis else P(),  # strong
-        P('data', None, None) if analysis else P(),  # z_mean_active
+        P('data', None, None),        # strong [B,S,1]
+        P('data', None, None),        # z_mean_active [B,S,1]
         P(),                          # tau_abs_mean scalar
         P(),                          # dead_penalty scalar
         P(),                          # dead_count scalar
@@ -1114,59 +933,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route, _, _ = route_chunk(s)
-                n_tb = int(token_blocks)
-                if n_tb > 1:
-                    T = B * S
-                    if T % n_tb != 0:
-                        raise ValueError(
-                            f"srw_token_blocks={n_tb} must divide B*S={T}")
-                    tb = T // n_tb
-                    h_tok = h_bf.reshape((T, 2, h_bf.shape[-1]))
-
-                    def stats_token_step(tcarry, j):
-                        (s_sum_f, sq_sum_f, cube_sum_f, quad_sum_f,
-                         score_sum_chunk) = tcarry
-                        t0 = j * tb
-                        h_t = jax.lax.dynamic_slice_in_dim(h_tok, t0, tb, axis=0)
-                        scores_t = jnp.einsum('trd,nd->trn', h_t, route)
-                        s32 = scores_t.astype(jnp.float32)
-                        s2 = s32 * s32
-                        local_sum_t = s32.sum(axis=-1, keepdims=True)
-                        local_sq_t = s2.sum(axis=-1, keepdims=True)
-                        local_cube_t = (s2 * s32).sum(axis=-1, keepdims=True)
-                        local_quad_t = (s2 * s2).sum(axis=-1, keepdims=True)
-                        s_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            s_sum_f, local_sum_t, t0, axis=0)
-                        sq_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            sq_sum_f, local_sq_t, t0, axis=0)
-                        cube_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            cube_sum_f, local_cube_t, t0, axis=0)
-                        quad_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            quad_sum_f, local_quad_t, t0, axis=0)
-                        score_sum_chunk = score_sum_chunk + s32.sum(axis=(0, 1))
-                        return (s_sum_f, sq_sum_f, cube_sum_f, quad_sum_f,
-                                score_sum_chunk), None
-
-                    z_t21 = jnp.zeros((T, 2, 1), dtype=jnp.float32)
-                    (sum_f, sq_f, cube_f, quad_f, score_sum_chunk), _ = jax.lax.scan(
-                        stats_token_step,
-                        (z_t21, z_t21, z_t21, z_t21,
-                         jnp.zeros((cs,), dtype=jnp.float32)),
-                        jnp.arange(n_tb))
-                    s_sum = s_sum + sum_f.reshape((B, S, 2, 1))
-                    sq_sum = sq_sum + sq_f.reshape((B, S, 2, 1))
-                    cube_sum = cube_sum + cube_f.reshape((B, S, 2, 1))
-                    quad_sum = quad_sum + quad_f.reshape((B, S, 2, 1))
-                    per_neuron_score = score_sum_chunk / (B * S * 2)
-                else:
-                    scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                    s32 = scores.astype(jnp.float32)
-                    s2 = s32 * s32
-                    s_sum = s_sum + jnp.sum(s32, axis=-1, keepdims=True)
-                    sq_sum = sq_sum + jnp.sum(s2, axis=-1, keepdims=True)
-                    cube_sum = cube_sum + jnp.sum(s2 * s32, axis=-1, keepdims=True)
-                    quad_sum = quad_sum + jnp.sum(s2 * s2, axis=-1, keepdims=True)
-                    per_neuron_score = jnp.sum(s32, axis=(0, 1, 2)) / (B * S * 2)
+                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
+                scores_f = scores.astype(jnp.float32)
+                s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
+                sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
+                cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
+                quad_sum = quad_sum + (scores_f ** 4).sum(axis=-1, keepdims=True)
+                per_neuron_score = scores_f.mean(axis=(0, 1, 2))  # [cs]
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq), None
@@ -1181,46 +954,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route, _, _ = route_chunk(s)
-                n_tb = int(token_blocks)
-                if n_tb > 1:
-                    T = B * S
-                    if T % n_tb != 0:
-                        raise ValueError(
-                            f"srw_token_blocks={n_tb} must divide B*S={T}")
-                    tb = T // n_tb
-                    h_tok = h_bf.reshape((T, 2, h_bf.shape[-1]))
-
-                    def stats_token_step(tcarry, j):
-                        s_sum_f, sq_sum_f, score_sum_chunk = tcarry
-                        t0 = j * tb
-                        h_t = jax.lax.dynamic_slice_in_dim(h_tok, t0, tb, axis=0)
-                        scores_t = jnp.einsum('trd,nd->trn', h_t, route)
-                        s32 = scores_t.astype(jnp.float32)
-                        local_sum_t = s32.sum(axis=-1, keepdims=True)
-                        local_sq_t = (s32 * s32).sum(axis=-1, keepdims=True)
-                        s_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            s_sum_f, local_sum_t, t0, axis=0)
-                        sq_sum_f = jax.lax.dynamic_update_slice_in_dim(
-                            sq_sum_f, local_sq_t, t0, axis=0)
-                        score_sum_chunk = score_sum_chunk + s32.sum(axis=(0, 1))
-                        return (s_sum_f, sq_sum_f, score_sum_chunk), None
-
-                    z_t21 = jnp.zeros((T, 2, 1), dtype=jnp.float32)
-                    (sum_f, sq_f, score_sum_chunk), _ = jax.lax.scan(
-                        stats_token_step,
-                        (z_t21, z_t21, jnp.zeros((cs,), dtype=jnp.float32)),
-                        jnp.arange(n_tb))
-                    s_sum = s_sum + sum_f.reshape((B, S, 2, 1))
-                    sq_sum = sq_sum + sq_f.reshape((B, S, 2, 1))
-                    per_neuron_score = score_sum_chunk / (B * S * 2)
-                else:
-                    scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                    scores_f = scores.astype(jnp.float32)
-                    s_sum = s_sum + jnp.sum(scores_f, axis=-1, keepdims=True)
-                    sq_sum = sq_sum + jnp.sum(
-                        scores_f * scores_f, axis=-1, keepdims=True)
-                    per_neuron_score = (
-                        jnp.sum(scores_f, axis=(0, 1, 2)) / (B * S * 2))
+                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
+                scores_f = scores.astype(jnp.float32)
+                s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
+                sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
+                per_neuron_score = scores_f.mean(axis=(0, 1, 2))  # [cs]
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, ns_sum, ns_sq), None
@@ -1265,7 +1003,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
             @jax.checkpoint
             def gate_srw_step(carry, i):
-                (out_q, out_k, total_weighted_cost, total_gate_max, total_active,
+                (out, total_weighted_cost, total_gate_max, total_active,
                  total_strong, total_phi_binary, total_den_cost,
                  total_activation_cost, total_current_cost,
                  total_z_lt_075, total_z_lt_030, total_g_log_g,
@@ -1274,8 +1012,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                raw = scores - tau.astype(scores.dtype)
-                margin = raw.astype(jnp.float32) - _act_thr
+                scores_f = scores.astype(jnp.float32)
+                raw = scores_f - tau
+                margin = raw - _act_thr
                 activation = jax.nn.sigmoid(_sharp * margin)
                 active_margin = jnp.maximum(margin - _act_cut, 0.0)
                 intensity = _eps + jnp.minimum(active_margin, _max_int)
@@ -1285,10 +1024,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                                         ).astype(jnp.float32).sum()
                 xr = x_bf @ rc.T  # [B,S,N]
                 xr_f = xr.astype(jnp.float32)
-                c_q = ((gate[:, :, 0, :] * xr_f).astype(jnp.bfloat16) @ wc
-                       ).astype(jnp.float32)
-                c_k = ((gate[:, :, 1, :] * xr_f).astype(jnp.bfloat16) @ wc
-                       ).astype(jnp.float32)
+                a = gate * xr_f[:, :, None, :]
+                c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)           # [B,S,2,1]
                 chunk_intensity = gate.sum(axis=-1, keepdims=True)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -1302,7 +1039,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 g_safe = gate + 1e-8
                 chunk_g_log_g = (gate * jnp.log(g_safe)).sum(axis=-1, keepdims=True)
                 max_gate_chunk = gate.max(axis=(0, 1, 2))
-                mean_score_chunk = jnp.sum(scores.astype(jnp.float32), axis=(0, 1, 2)) / (B * S * 2)
+                mean_score_chunk = scores_f.mean(axis=(0, 1, 2))
                 max_gate_chunk = jax.lax.pmax(
                     jax.lax.stop_gradient(max_gate_chunk), 'data')
                 mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
@@ -1311,8 +1048,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 penalty_chunk = jax.nn.relu(-mean_score_chunk) * dead_mask_chunk
                 chunk_dead_penalty = penalty_chunk.sum()
                 chunk_dead_count = dead_mask_chunk.sum()
-                return (out_q + c_q,
-                        out_k + c_k,
+                return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
@@ -1329,14 +1065,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_int_max, chunk_int_max),
                         total_int_cap_count + chunk_int_cap_count), None
 
-            (raw_q, raw_k, total_weighted_cost, total_gate_max, total_active, total_strong,
+            (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong,
              total_phi_binary, total_den_cost, total_activation_cost,
              total_current_cost, total_z_lt_075, total_z_lt_030,
              total_g_log_g, total_dead_penalty, total_dead_count,
-            total_int_max, total_int_cap_count), _ = jax.lax.scan(
+             total_int_max, total_int_cap_count), _ = jax.lax.scan(
                 gate_srw_step,
-                (jnp.zeros((B, S, D), dtype=jnp.float32),
-                 jnp.zeros((B, S, D), dtype=jnp.float32),
+                (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
                  z1_r, jnp.full((B, S, 2, 1), -1e9),
                  z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r,
                  jnp.float32(0.0), jnp.float32(0.0),
@@ -1345,108 +1080,32 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         else:
             @jax.checkpoint
             def gate_srw_step(carry, i):
-                (out_q, out_k, total_weighted_cost, total_gate_max, total_active,
+                (out, total_weighted_cost, total_gate_max, total_active,
                  total_strong, total_den_cost,
                  total_activation_cost, total_current_cost,
                  total_dead_penalty, total_dead_count,
                  total_int_max) = carry
                 s = i * cs
                 route, rc, wc = route_chunk(s)
-                n_tb = int(token_blocks)
-                if n_tb > 1:
-                    T = B * S
-                    if T % n_tb != 0:
-                        raise ValueError(
-                            f"srw_token_blocks={n_tb} must divide B*S={T}")
-                    tb = T // n_tb
-                    h_tok = h_bf.reshape((T, 2, h_bf.shape[-1]))
-                    x_tok = x_bf.reshape((T, D))
-                    tau_tok = tau.reshape((T, 2, 1))
-
-                    def token_step(tcarry, j):
-                        (out_q_f, out_k_f, weighted_f, gate_max_f, active_f, strong_f,
-                         den_f, chunk_gate_max, chunk_score_sum,
-                         chunk_int_max_t) = tcarry
-                        t0 = j * tb
-                        h_t = jax.lax.dynamic_slice_in_dim(h_tok, t0, tb, axis=0)
-                        x_t = jax.lax.dynamic_slice_in_dim(x_tok, t0, tb, axis=0)
-                        tau_t = jax.lax.dynamic_slice_in_dim(tau_tok, t0, tb, axis=0)
-                        scores_t = jnp.einsum('trd,nd->trn', h_t, route)
-                        scores_tf = scores_t.astype(jnp.float32)
-                        margin_t = scores_tf - tau_t - _act_thr
-                        activation_t = jax.nn.sigmoid(_sharp * margin_t)
-                        active_margin_t = jnp.maximum(margin_t - _act_cut, 0.0)
-                        intensity_t = _eps + jnp.minimum(active_margin_t, _max_int)
-                        gate_t = activation_t * intensity_t
-                        xr_t = (x_t @ rc.T).astype(jnp.float32)
-                        c_q_t = ((gate_t[:, 0, :] * xr_t).astype(jnp.bfloat16) @ wc
-                                 ).astype(jnp.float32)
-                        c_k_t = ((gate_t[:, 1, :] * xr_t).astype(jnp.bfloat16) @ wc
-                                 ).astype(jnp.float32)
-                        out_q_f = jax.lax.dynamic_update_slice_in_dim(
-                            out_q_f, c_q_t, t0, axis=0)
-                        out_k_f = jax.lax.dynamic_update_slice_in_dim(
-                            out_k_f, c_k_t, t0, axis=0)
-                        weighted_f = jax.lax.dynamic_update_slice_in_dim(
-                            weighted_f, gate_t.sum(axis=-1, keepdims=True), t0, axis=0)
-                        gate_max_f = jax.lax.dynamic_update_slice_in_dim(
-                            gate_max_f, gate_t.max(axis=-1, keepdims=True), t0, axis=0)
-                        active_f = jax.lax.dynamic_update_slice_in_dim(
-                            active_f, (activation_t > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True), t0, axis=0)
-                        strong_f = jax.lax.dynamic_update_slice_in_dim(
-                            strong_f, (activation_t > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True), t0, axis=0)
-                        den_f = jax.lax.dynamic_update_slice_in_dim(
-                            den_f, gate_t.sum(axis=-1, keepdims=True), t0, axis=0)
-                        chunk_gate_max = jnp.maximum(chunk_gate_max, gate_t.max(axis=(0, 1)))
-                        chunk_score_sum = chunk_score_sum + scores_tf.sum(axis=(0, 1))
-                        chunk_int_max_t = jnp.maximum(chunk_int_max_t, intensity_t.max())
-                        return (out_q_f, out_k_f, weighted_f, gate_max_f,
-                                active_f, strong_f, den_f,
-                                chunk_gate_max, chunk_score_sum,
-                                chunk_int_max_t), None
-
-                    z_t21 = jnp.zeros((T, 2, 1), dtype=jnp.float32)
-                    (c_q_f, c_k_f, chunk_weighted_f, gate_max_f, chunk_active_f,
-                     chunk_strong_f, chunk_intensity_f,
-                     max_gate_chunk, score_sum_chunk, chunk_int_max), _ = jax.lax.scan(
-                        token_step,
-                        (jnp.zeros((T, D), dtype=jnp.float32),
-                         jnp.zeros((T, D), dtype=jnp.float32),
-                         z_t21, jnp.full((T, 2, 1), -1e9), z_t21, z_t21, z_t21,
-                         jnp.full((cs,), -1e9, dtype=jnp.float32),
-                         jnp.zeros((cs,), dtype=jnp.float32),
-                         jnp.float32(0.0)),
-                        jnp.arange(n_tb))
-                    c_q = c_q_f.reshape((B, S, D))
-                    c_k = c_k_f.reshape((B, S, D))
-                    chunk_weighted = chunk_weighted_f.reshape((B, S, 2, 1))
-                    chunk_intensity = chunk_intensity_f.reshape((B, S, 2, 1))
-                    chunk_active = chunk_active_f.reshape((B, S, 2, 1))
-                    chunk_strong = chunk_strong_f.reshape((B, S, 2, 1))
-                    gate_max_local = gate_max_f.reshape((B, S, 2, 1))
-                    mean_score_chunk = score_sum_chunk / (B * S * 2)
-                else:
-                    scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                    scores_f = scores.astype(jnp.float32)
-                    margin = scores_f - tau - _act_thr
-                    activation = jax.nn.sigmoid(_sharp * margin)
-                    active_margin = jnp.maximum(margin - _act_cut, 0.0)
-                    intensity = _eps + jnp.minimum(active_margin, _max_int)
-                    gate = activation * intensity
-                    chunk_int_max = intensity.max()
-                    xr = x_bf @ rc.T
-                    xr_f = xr.astype(jnp.float32)
-                    c_q = ((gate[:, :, 0, :] * xr_f).astype(jnp.bfloat16) @ wc
-                           ).astype(jnp.float32)
-                    c_k = ((gate[:, :, 1, :] * xr_f).astype(jnp.bfloat16) @ wc
-                           ).astype(jnp.float32)
-                    chunk_weighted = gate.sum(axis=-1, keepdims=True)
-                    chunk_intensity = gate.sum(axis=-1, keepdims=True)
-                    chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
-                    chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
-                    max_gate_chunk = gate.max(axis=(0, 1, 2))
-                    mean_score_chunk = scores_f.mean(axis=(0, 1, 2))
-                    gate_max_local = gate.max(axis=-1, keepdims=True)
+                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
+                scores_f = scores.astype(jnp.float32)
+                raw = scores_f - tau
+                margin = raw - _act_thr
+                activation = jax.nn.sigmoid(_sharp * margin)
+                active_margin = jnp.maximum(margin - _act_cut, 0.0)
+                intensity = _eps + jnp.minimum(active_margin, _max_int)
+                gate = activation * intensity
+                chunk_int_max = intensity.max()
+                xr = x_bf @ rc.T
+                xr_f = xr.astype(jnp.float32)
+                a = gate * xr_f[:, :, None, :]
+                c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
+                chunk_weighted = gate.sum(axis=-1, keepdims=True)
+                chunk_intensity = gate.sum(axis=-1, keepdims=True)
+                chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
+                chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
+                max_gate_chunk = gate.max(axis=(0, 1, 2))
+                mean_score_chunk = scores_f.mean(axis=(0, 1, 2))
                 max_gate_chunk = jax.lax.pmax(
                     jax.lax.stop_gradient(max_gate_chunk), 'data')
                 mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
@@ -1455,10 +1114,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 penalty_chunk = jax.nn.relu(-mean_score_chunk) * dead_mask_chunk
                 chunk_dead_penalty = penalty_chunk.sum()
                 chunk_dead_count = dead_mask_chunk.sum()
-                return (out_q + c_q,
-                        out_k + c_k,
+                return (out + c_out,
                         total_weighted_cost + chunk_weighted,
-                        jnp.maximum(total_gate_max, gate_max_local),
+                        jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_den_cost + chunk_intensity,
@@ -1468,13 +1126,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         total_dead_count + chunk_dead_count,
                         jnp.maximum(total_int_max, chunk_int_max)), None
 
-            (raw_q, raw_k, total_weighted_cost, total_gate_max, total_active, total_strong,
+            (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong,
              total_den_cost, total_activation_cost, total_current_cost,
              total_dead_penalty, total_dead_count,
-            total_int_max), _ = jax.lax.scan(
+             total_int_max), _ = jax.lax.scan(
                 gate_srw_step,
-                (jnp.zeros((B, S, D), dtype=jnp.float32),
-                 jnp.zeros((B, S, D), dtype=jnp.float32),
+                (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
                  z1_r, jnp.full((B, S, 2, 1), -1e9),
                  z1_r, z1_r, z1_r, z1_r, z1_r,
                  jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
@@ -1487,10 +1144,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         den = jnp.maximum(global_den_cost, 1.0)
-        q_out = raw_q / den[:, :, 0, :]
-        k_out = raw_k / den[:, :, 1, :]
-        q_out = jax.lax.psum(q_out.astype(jnp.bfloat16), 'model')
-        k_out = jax.lax.psum(k_out.astype(jnp.bfloat16), 'model')
+        out = raw_out / den
+        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         global_active = jax.lax.psum(total_active, 'model')
         active_frac = global_active / N_total
@@ -1515,19 +1170,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         activation_cost_mean = global_activation_cost.mean()
         current_cost_mean = global_current_cost.mean()
 
+        slim_out = (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb,
+                    score_std_out, es_out, active_n_mean, strong_frac_mean,
+                    z_mean_active_mean, tau_abs_mean, dead_penalty_out, dead_count_out,
+                    int_max_out, den_cost_mean, activation_cost_mean, current_cost_mean)
         if not analysis:
-            return (q_out, k_out, active_frac_mean.mean(),
-                    raw_gate_max_mean.max(), score_lb, score_std_out, es_out,
-                    active_n_mean, strong_frac_mean.mean(),
-                    z_mean_active_mean.mean(), tau_abs_mean, dead_penalty_out,
-                    dead_count_out, int_max_out, den_cost_mean,
-                    activation_cost_mean, current_cost_mean)
-
-        slim_out = (q_out, k_out, active_frac_mean, raw_gate_max_mean,
-                    score_lb, score_std_out, es_out, active_n_mean,
-                    strong_frac_mean, z_mean_active_mean, tau_abs_mean,
-                    dead_penalty_out, dead_count_out, int_max_out,
-                    den_cost_mean, activation_cost_mean, current_cost_mean)
+            return slim_out
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
@@ -1664,11 +1312,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
                   n_heads, d_model,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False, attention_head_blocks=1,
-                  attention_impl="eager", attention_weight_dropout=True,
-                  attention_splash_head_shards=1,
-                  attention_splash_q_seq_shards=1,
-                  attention_splash_interpret=False):
+                  sharded_fns, analysis=False):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -1723,27 +1367,24 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     if isinstance(sharded_fns, dict):
         fused_paired = sharded_fns.get('qk_paired', sharded_fns['paired'])
         fused_single_v = sharded_fns.get('v_single', sharded_fns['single'])
-        mesh = sharded_fns.get('mesh')
     else:
         fused_single_v, fused_paired = sharded_fns
-        mesh = None
     h_QK = jnp.stack([h_Q, h_K], axis=2)
     tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
     scan_bias_QK = jnp.stack([scan_bias_all[:, :, 0:1], scan_bias_all[:, :, 1:2]], axis=2)
     qk_ret = fused_paired(x, h_QK, qk_emb_unit, tau_QK, scan_bias_QK,
                            qk_read, qk_write, qk_read_sig_proj, qk_write_sig_proj)
-    (Q_raw, K_raw, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
+    (QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
      qk_strong, qk_z_act, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
-     qk_den_cost_mean, qk_activation_cost_mean, qk_current_cost_mean) = qk_ret[:17]
+     qk_den_cost_mean, qk_activation_cost_mean, qk_current_cost_mean) = qk_ret[:16]
     if analysis:
         (qk_phi_bin, qk_z075, qk_z030, qk_skew, qk_apt_std, qk_entropy,
          qk_den_cost, qk_activation_cost, qk_current_cost,
-         qk_kurt, qk_int_cap) = qk_ret[17:]
-        qk_raw_norm = (jnp.linalg.norm(Q_raw.astype(jnp.float32), axis=-1).mean()
-                       + jnp.linalg.norm(K_raw.astype(jnp.float32), axis=-1).mean()) / 2
-    Q = (Q_raw.astype(jnp.float32) * qk_scale).astype(jnp.bfloat16)
-    K = (K_raw.astype(jnp.float32) * qk_scale).astype(jnp.bfloat16)
+         qk_kurt, qk_int_cap) = qk_ret[16:]
+        qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
+    Q = QK_out[:, :, 0, :] * qk_scale
+    K = QK_out[:, :, 1, :] * qk_scale
     v_ret = fused_single_v(x, h_V, v_emb_unit, tau_all[:, :, 2:3],
                            scan_bias_all[:, :, 2:3], v_read, v_write,
                            v_read_sig_proj, v_write_sig_proj)
@@ -1756,7 +1397,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          v_den_cost, v_activation_cost, v_current_cost,
          v_kurt, v_int_cap) = v_ret[16:]
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
-    V = (V.astype(jnp.float32) * v_scale).astype(jnp.bfloat16)
+    V = V * v_scale
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1768,91 +1409,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     @jax.checkpoint
     def _attn_scores(Q, K, V, rng_drop):
-        impl = str(attention_impl).lower()
-        if impl in ("splash", "flash", "flash_attention", "pallas_splash"):
-            if _make_splash_mha is None or _SplashBlockSizes is None:
-                raise RuntimeError(
-                    "attention_impl='splash' requires "
-                    "jax.experimental.pallas.ops.tpu.splash_attention. "
-                    "Use a TPU JAX build that includes Splash Attention, "
-                    "or set attention_impl='eager'.")
-            if attention_weight_dropout and dropout_rate != 0.0 and not deterministic:
-                raise ValueError(
-                    "Splash Attention does not support this model's attention-weight "
-                    "dropout path. Set model.attention_weight_dropout=false to use "
-                    "Splash while keeping the existing output/residual dropout.")
-            if mesh is None:
-                raise RuntimeError(
-                    "attention_impl='splash' must run inside shard_map with the "
-                    "training mesh. Expected sharded_fns to carry sharded_fns['mesh'].")
-
-            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-            mask = jnp.broadcast_to(causal[None, :, :], (n_heads, S, S))
-            block_sizes = _SplashBlockSizes.get_default()
-            splash_dim = ((d_head + 127) // 128) * 128
-            pad_width = splash_dim - d_head
-
-            splash_kernel = _make_splash_mha(
-                mask=mask,
-                block_sizes=block_sizes,
-                head_shards=int(attention_splash_head_shards),
-                q_seq_shards=int(attention_splash_q_seq_shards),
-                interpret=bool(attention_splash_interpret),
-            )
-
-            @partial(shard_map, mesh=mesh,
-                     in_specs=(P('data', None, None, None),
-                               P('data', None, None, None),
-                               P('data', None, None, None)),
-                     out_specs=P('data', None, None, None),
-                     check_rep=False)
-            def splash_sharded(q_all, k_all, v_all):
-                def splash_one(q, k, v):
-                    if pad_width:
-                        pad_spec = ((0, 0), (0, 0), (0, pad_width))
-                        q = jnp.pad(q, pad_spec)
-                        k = jnp.pad(k, pad_spec)
-                        v = jnp.pad(v, pad_spec)
-                    q_scaled = (q.astype(jnp.float32) / scale).astype(jnp.bfloat16)
-                    out = splash_kernel(q_scaled, k, v)
-                    return out[..., :d_head]
-
-                return jax.vmap(splash_one, in_axes=(0, 0, 0))(q_all, k_all, v_all)
-
-            return splash_sharded(Q, K, V)
-
+        attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
         causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-        n_hb = int(attention_head_blocks)
-        if n_hb <= 1:
-            attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
-            attn_scores = jnp.where(causal, attn_scores,
-                                    jnp.finfo(attn_scores.dtype).min)
-            attn_w = jax.nn.softmax(attn_scores, axis=-1)
-            attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
-            return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
-        if n_heads % n_hb != 0:
-            raise ValueError(
-                f"attention_head_blocks={n_hb} must divide n_heads={n_heads}")
-        hb = n_heads // n_hb
-
-        def head_step(out, j):
-            h0 = j * hb
-            q_h = jax.lax.dynamic_slice_in_dim(Q, h0, hb, axis=1)
-            k_h = jax.lax.dynamic_slice_in_dim(K, h0, hb, axis=1)
-            v_h = jax.lax.dynamic_slice_in_dim(V, h0, hb, axis=1)
-            scores_h = jnp.einsum('bhsd,bhtd->bhst', q_h, k_h) / scale
-            scores_h = jnp.where(causal, scores_h,
-                                 jnp.finfo(scores_h.dtype).min)
-            attn_h = jax.nn.softmax(scores_h, axis=-1)
-            rng_h = jax.random.fold_in(rng_drop, j)
-            attn_h = safe_dropout(attn_h, dropout_rate, deterministic, rng_h)
-            out_h = jnp.einsum('bhst,bhtd->bhsd', attn_h, v_h)
-            out = jax.lax.dynamic_update_slice_in_dim(out, out_h, h0, axis=1)
-            return out, None
-
-        out0 = jnp.zeros_like(V)
-        out, _ = jax.lax.scan(head_step, out0, jnp.arange(n_hb))
-        return out
+        attn_scores = jnp.where(causal, attn_scores,
+                                jnp.finfo(attn_scores.dtype).min)
+        attn_w = jax.nn.softmax(attn_scores, axis=-1)
+        attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
+        return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
 
     if analysis:
         q_norm = jnp.linalg.norm(Q, axis=-1).mean()
@@ -2073,15 +1636,8 @@ class DAWN(nn.Module):
     max_seq_len: int = 512
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
-    attention_impl: str = "eager"
-    attention_head_blocks: int = 1
-    attention_weight_dropout: bool = True
-    attention_splash_head_shards: int = 1
-    attention_splash_q_seq_shards: int = 1
-    attention_splash_interpret: bool = False
 
     d_route: int = DEFAULT_TAG_DIM + DEFAULT_READ_SIG_DIM + DEFAULT_WRITE_SIG_DIM
-    route_mode: str = "signature"
     tag_dim: int = DEFAULT_TAG_DIM
     read_sig_dim: int = DEFAULT_READ_SIG_DIM
     write_sig_dim: int = DEFAULT_WRITE_SIG_DIM
@@ -2098,19 +1654,6 @@ class DAWN(nn.Module):
             raise ValueError(
                 f"d_model ({self.d_model}) must be divisible by "
                 f"n_heads ({self.n_heads})")
-        route_mode = self.route_mode.lower().replace("-", "_")
-        if route_mode == "auto":
-            route_mode = "tagonly" if self.tag_dim == self.d_route else "signature"
-        if route_mode in ("tag", "tagonly", "tag_only", "embedding", "embed"):
-            if self.tag_dim != self.d_route or self.read_sig_dim != 0 or self.write_sig_dim != 0:
-                raise ValueError(
-                    "route_mode='tagonly' requires tag_dim == d_route and "
-                    "read_sig_dim == write_sig_dim == 0, got "
-                    f"d_route={self.d_route}, tag_dim={self.tag_dim}, "
-                    f"read_sig_dim={self.read_sig_dim}, write_sig_dim={self.write_sig_dim}")
-        elif route_mode not in ("signature", "sig"):
-            raise ValueError(
-                f"Unknown route_mode={self.route_mode!r}; use 'signature' or 'tagonly'")
         if self.tag_dim + self.read_sig_dim + self.write_sig_dim != self.d_route:
             raise ValueError(
                 f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
@@ -2256,13 +1799,7 @@ class DAWN(nn.Module):
                     self.n_qk, self.n_v,
                     self.n_heads, self.d_model,
                     self.router_dropout, self.dropout_rate, deterministic,
-                    sharded_fns=_sharded, analysis=analysis,
-                    attention_head_blocks=self.attention_head_blocks,
-                    attention_impl=self.attention_impl,
-                    attention_weight_dropout=self.attention_weight_dropout,
-                    attention_splash_head_shards=self.attention_splash_head_shards,
-                    attention_splash_q_seq_shards=self.attention_splash_q_seq_shards,
-                    attention_splash_interpret=self.attention_splash_interpret)
+                    sharded_fns=_sharded, analysis=analysis)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -2464,6 +2001,8 @@ class DAWN(nn.Module):
             'attn_dead_count': attn_dead_count_all.mean(),
             'know_dead_count': know_dead_count_all.mean(),
 
+            'per_layer_attn_out_norm': attn_out_norm_all,
+            'per_layer_know_out_norm': know_out_norm_all,
             # v4.1 explore: per-layer tau_offset stacks for RPE exploration loss.
             # Shapes: attn [L, B, S, 3], know [L, B, S, 1].
             'attn_tau_offset': attn_tau_offset_all,
@@ -2505,8 +2044,6 @@ class DAWN(nn.Module):
             _o_proj_norm = jnp.linalg.norm(
                 stacked['attn']['expand_O']['kernel'], axis=(-2, -1)).mean()
             result.update({
-                'per_layer_attn_out_norm': attn_out_norm_all,
-                'per_layer_know_out_norm': know_out_norm_all,
                 'know_phi_binary': know_phi_bin_all.mean(),
                 'attn_qk_phi_binary': attn_qk_phi_bin_all.mean(),
                 'attn_v_phi_binary': attn_v_phi_bin_all.mean(),
@@ -2553,66 +2090,17 @@ class DAWN(nn.Module):
             valid_mask = (shift_labels != -100)
 
             @jax.checkpoint
-            def compute_loss_and_acc(x_seq, emb, labs, vmask):
-                bsz, slen, dim = x_seq.shape
-                x_flat = x_seq.reshape((bsz * slen, dim))
-                labs_flat = labs.reshape((bsz * slen,))
-                valid_flat = vmask.reshape((bsz * slen,))
-                safe = jnp.where(valid_flat, labs_flat, 0)
-
-                target_emb = emb[safe]
-                true_logit = jnp.sum(x_flat * target_emb, axis=-1)
-
-                vocab = emb.shape[0]
-                # Memory-safe chunked CE.
-                # Use fori_loop with carry-only state. Do NOT return per-chunk
-                # logits/masks from scan, or XLA may materialize
-                # [n_chunks, tokens, vocab_chunk] in the backward pass.
-                # 2048 keeps per-step logits temp smaller than 4096.
-                vocab_chunk = 2048
-                pad_vocab = (-vocab) % vocab_chunk
-                emb_pad = jnp.pad(emb, ((0, pad_vocab), (0, 0)))
-                n_vocab_chunks = emb_pad.shape[0] // vocab_chunk
-                vocab_offsets = jnp.arange(vocab_chunk, dtype=jnp.int32)
-
-                def max_body(i, carry):
-                    max_logit, pred = carry
-                    start = i * vocab_chunk
-                    e = jax.lax.dynamic_slice(
-                        emb_pad, (start, 0), (vocab_chunk, dim))
-                    logits = x_flat @ e.T
-                    ids = start + vocab_offsets
-                    logits = jnp.where(ids[None, :] < vocab, logits, -jnp.inf)
-                    chunk_max = logits.max(axis=-1)
-                    chunk_arg = logits.argmax(axis=-1).astype(jnp.int32) + start
-                    better = chunk_max > max_logit
-                    return (jnp.where(better, chunk_max, max_logit),
-                            jnp.where(better, chunk_arg, pred))
-
-                init_max = jnp.full((bsz * slen,), -jnp.inf, dtype=jnp.float32)
-                init_pred = jnp.zeros((bsz * slen,), dtype=jnp.int32)
-                max_logit, preds_flat = jax.lax.fori_loop(
-                    0, n_vocab_chunks, max_body, (init_max, init_pred))
-
-                def sumexp_body(i, sum_exp):
-                    start = i * vocab_chunk
-                    e = jax.lax.dynamic_slice(
-                        emb_pad, (start, 0), (vocab_chunk, dim))
-                    logits = x_flat @ e.T
-                    ids = start + vocab_offsets
-                    logits = jnp.where(ids[None, :] < vocab, logits, -jnp.inf)
-                    return sum_exp + jnp.exp(
-                        logits - max_logit[:, None]).sum(axis=-1)
-
-                sum_exp = jax.lax.fori_loop(
-                    0, n_vocab_chunks, sumexp_body,
-                    jnp.zeros((bsz * slen,), dtype=jnp.float32))
-
-                ce_flat = max_logit + jnp.log(sum_exp + 1e-8) - true_logit
-                ce_flat = jnp.where(valid_flat, ce_flat, 0.0)
-                loss = ce_flat.sum() / (valid_flat.sum() + 1e-8)
-                correct = jnp.sum((preds_flat == labs_flat) & valid_flat)
-                return loss, ce_flat.reshape((bsz, slen)), correct, jnp.sum(valid_flat)
+            def compute_loss_and_acc(x_chunk, emb, labs, vmask):
+                logits = x_chunk @ emb.T
+                log_probs = jax.nn.log_softmax(logits, axis=-1)
+                safe = jnp.where(vmask, labs, 0)
+                tl = -jnp.take_along_axis(
+                    log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
+                per_token_ce = tl * vmask            # [B, S-1], 0 on invalid
+                loss = per_token_ce.sum() / (vmask.sum() + 1e-8)
+                preds = jnp.argmax(logits, axis=-1)
+                correct = jnp.sum((preds == labs) & vmask)
+                return loss, per_token_ce, correct, jnp.sum(vmask)
 
             loss, per_token_ce, correct, valid_count = compute_loss_and_acc(
                 shift_x, embedding_matrix, shift_labels, valid_mask)
@@ -2634,7 +2122,6 @@ class DAWN(nn.Module):
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'max_seq_len': self.max_seq_len,
             'd_route': self.d_route,
-            'route_mode': self.route_mode,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_know': self.n_know,
             'tag_dim': self.tag_dim,
             'read_sig_dim': self.read_sig_dim,
@@ -2645,7 +2132,6 @@ class DAWN(nn.Module):
         return [
             f"DAWN v{self.__version__}: Sense-Read-Write",
             f"  d_model={self.d_model}, d_route={self.d_route}, "
-            f"route_mode={self.route_mode}, "
             f"tag_dim={self.tag_dim}, read_sig_dim={self.read_sig_dim}, "
             f"write_sig_dim={self.write_sig_dim}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
@@ -3348,3 +2834,4 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         return x @ params['token_emb']['embedding'].T
 
     return forward_fn
+
