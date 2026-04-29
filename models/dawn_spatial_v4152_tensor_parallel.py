@@ -2144,8 +2144,11 @@ class DAWN(nn.Module):
             result['per_token_ce'] = per_token_ce
             result['valid_mask'] = valid_mask
         else:
-            result['logits'] = jax.lax.with_sharding_constraint(
-                self.token_emb.attend(x), P('data', None, None))
+            logits = self.token_emb.attend(x)
+            if not self.is_initializing():
+                logits = jax.lax.with_sharding_constraint(
+                    logits, P('data', None, None))
+            result['logits'] = logits
 
         return result
 
