@@ -495,14 +495,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     # SLIM out_specs: train path.
     _slim_out_specs = (
         P('data', None, None),   # out [B,S,D]
-        P('data', None, None),   # active [B,S,1]
-        P('data', None, None),   # gate_max [B,S,1]
+        P('data', None, None) if analysis else P(),   # active
+        P('data', None, None) if analysis else P(),   # gate_max
         P(),                     # lb_loss scalar
         P(),                     # score_std scalar
         P(),                     # gate_sum scalar (誇gate, observational)
         P(),                     # active_n_mean scalar
-        P('data', None, None),   # strong [B,S,1]
-        P('data', None, None),   # z_mean_active [B,S,1]
+        P('data', None, None) if analysis else P(),   # strong
+        P('data', None, None) if analysis else P(),   # z_mean_active
         P(),                     # tau_abs_mean scalar
         P(),                     # dead_penalty scalar
         P(),                     # dead_count scalar
@@ -574,13 +574,59 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route, _, _ = route_chunk(s)
-                scores = h_bf @ route.T
-                s32 = scores.astype(jnp.float32)
-                s_sum = s_sum + jnp.sum(s32, axis=-1, keepdims=True)
-                sq_sum = sq_sum + jnp.sum(s32 * s32, axis=-1, keepdims=True)
-                cube_sum = cube_sum + jnp.sum(s32 * s32 * s32, axis=-1, keepdims=True)
-                quad_sum = quad_sum + jnp.sum(s32 * s32 * s32 * s32, axis=-1, keepdims=True)
-                per_neuron_score = jnp.sum(s32, axis=(0, 1)) / (B * S)
+                n_tb = int(token_blocks)
+                if n_tb > 1:
+                    T = B * S
+                    if T % n_tb != 0:
+                        raise ValueError(
+                            f"srw_token_blocks={n_tb} must divide B*S={T}")
+                    tb = T // n_tb
+                    h_tok = h_bf.reshape((T, h_bf.shape[-1]))
+
+                    def stats_token_step(tcarry, j):
+                        (s_sum_f, sq_sum_f, cube_sum_f, quad_sum_f,
+                         score_sum_chunk) = tcarry
+                        t0 = j * tb
+                        h_t = jax.lax.dynamic_slice_in_dim(h_tok, t0, tb, axis=0)
+                        scores_t = h_t @ route.T
+                        s32 = scores_t.astype(jnp.float32)
+                        s2 = s32 * s32
+                        local_sum_t = s32.sum(axis=-1, keepdims=True)
+                        local_sq_t = s2.sum(axis=-1, keepdims=True)
+                        local_cube_t = (s2 * s32).sum(axis=-1, keepdims=True)
+                        local_quad_t = (s2 * s2).sum(axis=-1, keepdims=True)
+                        s_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            s_sum_f, local_sum_t, t0, axis=0)
+                        sq_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            sq_sum_f, local_sq_t, t0, axis=0)
+                        cube_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            cube_sum_f, local_cube_t, t0, axis=0)
+                        quad_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            quad_sum_f, local_quad_t, t0, axis=0)
+                        score_sum_chunk = score_sum_chunk + s32.sum(axis=0)
+                        return (s_sum_f, sq_sum_f, cube_sum_f, quad_sum_f,
+                                score_sum_chunk), None
+
+                    z_t1 = jnp.zeros((T, 1), dtype=jnp.float32)
+                    (sum_f, sq_f, cube_f, quad_f, score_sum_chunk), _ = jax.lax.scan(
+                        stats_token_step,
+                        (z_t1, z_t1, z_t1, z_t1,
+                         jnp.zeros((cs,), dtype=jnp.float32)),
+                        jnp.arange(n_tb))
+                    s_sum = s_sum + sum_f.reshape((B, S, 1))
+                    sq_sum = sq_sum + sq_f.reshape((B, S, 1))
+                    cube_sum = cube_sum + cube_f.reshape((B, S, 1))
+                    quad_sum = quad_sum + quad_f.reshape((B, S, 1))
+                    per_neuron_score = score_sum_chunk / (B * S)
+                else:
+                    scores = h_bf @ route.T
+                    s32 = scores.astype(jnp.float32)
+                    s2 = s32 * s32
+                    s_sum = s_sum + jnp.sum(s32, axis=-1, keepdims=True)
+                    sq_sum = sq_sum + jnp.sum(s2, axis=-1, keepdims=True)
+                    cube_sum = cube_sum + jnp.sum(s2 * s32, axis=-1, keepdims=True)
+                    quad_sum = quad_sum + jnp.sum(s2 * s2, axis=-1, keepdims=True)
+                    per_neuron_score = jnp.sum(s32, axis=(0, 1)) / (B * S)
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq), None
@@ -595,14 +641,45 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route, _, _ = route_chunk(s)
-                scores = h_bf @ route.T
-                s_sum = s_sum + jnp.sum(
-                    scores.astype(jnp.float32), axis=-1, keepdims=True)
-                sq_sum = sq_sum + jnp.sum(
-                    scores.astype(jnp.float32) * scores.astype(jnp.float32),
-                    axis=-1, keepdims=True)
-                per_neuron_score = (
-                    jnp.sum(scores.astype(jnp.float32), axis=(0, 1)) / (B * S))
+                n_tb = int(token_blocks)
+                if n_tb > 1:
+                    T = B * S
+                    if T % n_tb != 0:
+                        raise ValueError(
+                            f"srw_token_blocks={n_tb} must divide B*S={T}")
+                    tb = T // n_tb
+                    h_tok = h_bf.reshape((T, h_bf.shape[-1]))
+
+                    def stats_token_step(tcarry, j):
+                        s_sum_f, sq_sum_f, score_sum_chunk = tcarry
+                        t0 = j * tb
+                        h_t = jax.lax.dynamic_slice_in_dim(h_tok, t0, tb, axis=0)
+                        scores_t = h_t @ route.T
+                        s32 = scores_t.astype(jnp.float32)
+                        local_sum_t = s32.sum(axis=-1, keepdims=True)
+                        local_sq_t = (s32 * s32).sum(axis=-1, keepdims=True)
+                        s_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            s_sum_f, local_sum_t, t0, axis=0)
+                        sq_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            sq_sum_f, local_sq_t, t0, axis=0)
+                        score_sum_chunk = score_sum_chunk + s32.sum(axis=0)
+                        return (s_sum_f, sq_sum_f, score_sum_chunk), None
+
+                    z_t1 = jnp.zeros((T, 1), dtype=jnp.float32)
+                    (sum_f, sq_f, score_sum_chunk), _ = jax.lax.scan(
+                        stats_token_step,
+                        (z_t1, z_t1, jnp.zeros((cs,), dtype=jnp.float32)),
+                        jnp.arange(n_tb))
+                    s_sum = s_sum + sum_f.reshape((B, S, 1))
+                    sq_sum = sq_sum + sq_f.reshape((B, S, 1))
+                    per_neuron_score = score_sum_chunk / (B * S)
+                else:
+                    scores = h_bf @ route.T
+                    scores_f = scores.astype(jnp.float32)
+                    s_sum = s_sum + jnp.sum(scores_f, axis=-1, keepdims=True)
+                    sq_sum = sq_sum + jnp.sum(
+                        scores_f * scores_f, axis=-1, keepdims=True)
+                    per_neuron_score = jnp.sum(scores_f, axis=(0, 1)) / (B * S)
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, ns_sum, ns_sq), None
@@ -684,6 +761,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                                   ).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 g_safe = gate + 1e-8
                 chunk_g_log_g = (gate * jnp.log(g_safe)).sum(axis=-1, keepdims=True)
+                max_gate_chunk = gate.max(axis=(0, 1))
+                mean_score_chunk = scores.astype(jnp.float32).mean(axis=(0, 1))
                 max_gate_chunk = jax.lax.pmax(
                     jax.lax.stop_gradient(max_gate_chunk), 'data')
                 mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
@@ -877,12 +956,17 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         activation_cost_mean = global_activation_cost.mean()
         current_cost_mean = global_current_cost.mean()
 
+        if not analysis:
+            return (out.astype(jnp.float32), active_frac.mean(), global_gate_max.max(),
+                    score_lb, score_std_out, es_out, active_n_mean,
+                    strong_frac.mean(), z_mean_active.mean(), tau_abs_mean,
+                    dead_penalty_out, dead_count_out, int_max_out,
+                    den_cost_mean, activation_cost_mean, current_cost_mean)
+
         slim_out = (out.astype(jnp.float32), active_frac, global_gate_max, score_lb,
                     score_std_out, es_out, active_n_mean, strong_frac, z_mean_active,
                     tau_abs_mean, dead_penalty_out, dead_count_out, int_max_out,
                     den_cost_mean, activation_cost_mean, current_cost_mean)
-        if not analysis:
-            return slim_out
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
@@ -930,7 +1014,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     tau_offset and scan_bias are [B,S,2,1].
     x @ read.T computed once (shared by both routes).
     Scores stats computed independently per route.
-    Returns out [B,S,2,D], active [B,S,1], gate_max [B,S,1].
+    Train returns scalar active/gate/strong/z diagnostics; analysis keeps
+    per-token [B,S,1] diagnostics.
 
     v4.1 gate: activation 횞 intensity (see make_sharded_srw docstring).
     analysis: see make_sharded_srw docstring.
@@ -948,14 +1033,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
     _slim_out_specs = (
         P('data', None, None, None),  # out [B,S,2,D]
-        P('data', None, None),        # active [B,S,1]
-        P('data', None, None),        # gate_max [B,S,1]
+        P('data', None, None) if analysis else P(),  # active
+        P('data', None, None) if analysis else P(),  # gate_max
         P(),                          # lb_loss scalar
         P(),                          # score_std scalar
         P(),                          # gate_sum scalar
         P(),                          # active_n_mean scalar
-        P('data', None, None),        # strong [B,S,1]
-        P('data', None, None),        # z_mean_active [B,S,1]
+        P('data', None, None) if analysis else P(),  # strong
+        P('data', None, None) if analysis else P(),  # z_mean_active
         P(),                          # tau_abs_mean scalar
         P(),                          # dead_penalty scalar
         P(),                          # dead_count scalar
@@ -1027,13 +1112,59 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route, _, _ = route_chunk(s)
-                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                s32 = scores.astype(jnp.float32)
-                s_sum = s_sum + jnp.sum(s32, axis=-1, keepdims=True)
-                sq_sum = sq_sum + jnp.sum(s32 * s32, axis=-1, keepdims=True)
-                cube_sum = cube_sum + jnp.sum(s32 * s32 * s32, axis=-1, keepdims=True)
-                quad_sum = quad_sum + jnp.sum(s32 * s32 * s32 * s32, axis=-1, keepdims=True)
-                per_neuron_score = jnp.sum(s32, axis=(0, 1, 2)) / (B * S * 2)
+                n_tb = int(token_blocks)
+                if n_tb > 1:
+                    T = B * S
+                    if T % n_tb != 0:
+                        raise ValueError(
+                            f"srw_token_blocks={n_tb} must divide B*S={T}")
+                    tb = T // n_tb
+                    h_tok = h_bf.reshape((T, 2, h_bf.shape[-1]))
+
+                    def stats_token_step(tcarry, j):
+                        (s_sum_f, sq_sum_f, cube_sum_f, quad_sum_f,
+                         score_sum_chunk) = tcarry
+                        t0 = j * tb
+                        h_t = jax.lax.dynamic_slice_in_dim(h_tok, t0, tb, axis=0)
+                        scores_t = jnp.einsum('trd,nd->trn', h_t, route)
+                        s32 = scores_t.astype(jnp.float32)
+                        s2 = s32 * s32
+                        local_sum_t = s32.sum(axis=-1, keepdims=True)
+                        local_sq_t = s2.sum(axis=-1, keepdims=True)
+                        local_cube_t = (s2 * s32).sum(axis=-1, keepdims=True)
+                        local_quad_t = (s2 * s2).sum(axis=-1, keepdims=True)
+                        s_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            s_sum_f, local_sum_t, t0, axis=0)
+                        sq_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            sq_sum_f, local_sq_t, t0, axis=0)
+                        cube_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            cube_sum_f, local_cube_t, t0, axis=0)
+                        quad_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            quad_sum_f, local_quad_t, t0, axis=0)
+                        score_sum_chunk = score_sum_chunk + s32.sum(axis=(0, 1))
+                        return (s_sum_f, sq_sum_f, cube_sum_f, quad_sum_f,
+                                score_sum_chunk), None
+
+                    z_t21 = jnp.zeros((T, 2, 1), dtype=jnp.float32)
+                    (sum_f, sq_f, cube_f, quad_f, score_sum_chunk), _ = jax.lax.scan(
+                        stats_token_step,
+                        (z_t21, z_t21, z_t21, z_t21,
+                         jnp.zeros((cs,), dtype=jnp.float32)),
+                        jnp.arange(n_tb))
+                    s_sum = s_sum + sum_f.reshape((B, S, 2, 1))
+                    sq_sum = sq_sum + sq_f.reshape((B, S, 2, 1))
+                    cube_sum = cube_sum + cube_f.reshape((B, S, 2, 1))
+                    quad_sum = quad_sum + quad_f.reshape((B, S, 2, 1))
+                    per_neuron_score = score_sum_chunk / (B * S * 2)
+                else:
+                    scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
+                    s32 = scores.astype(jnp.float32)
+                    s2 = s32 * s32
+                    s_sum = s_sum + jnp.sum(s32, axis=-1, keepdims=True)
+                    sq_sum = sq_sum + jnp.sum(s2, axis=-1, keepdims=True)
+                    cube_sum = cube_sum + jnp.sum(s2 * s32, axis=-1, keepdims=True)
+                    quad_sum = quad_sum + jnp.sum(s2 * s2, axis=-1, keepdims=True)
+                    per_neuron_score = jnp.sum(s32, axis=(0, 1, 2)) / (B * S * 2)
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq), None
@@ -1048,14 +1179,46 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route, _, _ = route_chunk(s)
-                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                s_sum = s_sum + jnp.sum(
-                    scores.astype(jnp.float32), axis=-1, keepdims=True)
-                sq_sum = sq_sum + jnp.sum(
-                    scores.astype(jnp.float32) * scores.astype(jnp.float32),
-                    axis=-1, keepdims=True)
-                per_neuron_score = (
-                    jnp.sum(scores.astype(jnp.float32), axis=(0, 1, 2)) / (B * S * 2))
+                n_tb = int(token_blocks)
+                if n_tb > 1:
+                    T = B * S
+                    if T % n_tb != 0:
+                        raise ValueError(
+                            f"srw_token_blocks={n_tb} must divide B*S={T}")
+                    tb = T // n_tb
+                    h_tok = h_bf.reshape((T, 2, h_bf.shape[-1]))
+
+                    def stats_token_step(tcarry, j):
+                        s_sum_f, sq_sum_f, score_sum_chunk = tcarry
+                        t0 = j * tb
+                        h_t = jax.lax.dynamic_slice_in_dim(h_tok, t0, tb, axis=0)
+                        scores_t = jnp.einsum('trd,nd->trn', h_t, route)
+                        s32 = scores_t.astype(jnp.float32)
+                        local_sum_t = s32.sum(axis=-1, keepdims=True)
+                        local_sq_t = (s32 * s32).sum(axis=-1, keepdims=True)
+                        s_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            s_sum_f, local_sum_t, t0, axis=0)
+                        sq_sum_f = jax.lax.dynamic_update_slice_in_dim(
+                            sq_sum_f, local_sq_t, t0, axis=0)
+                        score_sum_chunk = score_sum_chunk + s32.sum(axis=(0, 1))
+                        return (s_sum_f, sq_sum_f, score_sum_chunk), None
+
+                    z_t21 = jnp.zeros((T, 2, 1), dtype=jnp.float32)
+                    (sum_f, sq_f, score_sum_chunk), _ = jax.lax.scan(
+                        stats_token_step,
+                        (z_t21, z_t21, jnp.zeros((cs,), dtype=jnp.float32)),
+                        jnp.arange(n_tb))
+                    s_sum = s_sum + sum_f.reshape((B, S, 2, 1))
+                    sq_sum = sq_sum + sq_f.reshape((B, S, 2, 1))
+                    per_neuron_score = score_sum_chunk / (B * S * 2)
+                else:
+                    scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
+                    scores_f = scores.astype(jnp.float32)
+                    s_sum = s_sum + jnp.sum(scores_f, axis=-1, keepdims=True)
+                    sq_sum = sq_sum + jnp.sum(
+                        scores_f * scores_f, axis=-1, keepdims=True)
+                    per_neuron_score = (
+                        jnp.sum(scores_f, axis=(0, 1, 2)) / (B * S * 2))
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, ns_sum, ns_sq), None
@@ -1332,12 +1495,18 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         activation_cost_mean = global_activation_cost.mean()
         current_cost_mean = global_current_cost.mean()
 
+        if not analysis:
+            return (out.astype(jnp.float32), active_frac_mean.mean(),
+                    raw_gate_max_mean.max(), score_lb, score_std_out, es_out,
+                    active_n_mean, strong_frac_mean.mean(),
+                    z_mean_active_mean.mean(), tau_abs_mean, dead_penalty_out,
+                    dead_count_out, int_max_out, den_cost_mean,
+                    activation_cost_mean, current_cost_mean)
+
         slim_out = (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb,
                     score_std_out, es_out, active_n_mean, strong_frac_mean,
                     z_mean_active_mean, tau_abs_mean, dead_penalty_out, dead_count_out,
                     int_max_out, den_cost_mean, activation_cost_mean, current_cost_mean)
-        if not analysis:
-            return slim_out
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
@@ -2272,8 +2441,6 @@ class DAWN(nn.Module):
             'attn_dead_count': attn_dead_count_all.mean(),
             'know_dead_count': know_dead_count_all.mean(),
 
-            'per_layer_attn_out_norm': attn_out_norm_all,
-            'per_layer_know_out_norm': know_out_norm_all,
             # v4.1 explore: per-layer tau_offset stacks for RPE exploration loss.
             # Shapes: attn [L, B, S, 3], know [L, B, S, 1].
             'attn_tau_offset': attn_tau_offset_all,
@@ -2315,6 +2482,8 @@ class DAWN(nn.Module):
             _o_proj_norm = jnp.linalg.norm(
                 stacked['attn']['expand_O']['kernel'], axis=(-2, -1)).mean()
             result.update({
+                'per_layer_attn_out_norm': attn_out_norm_all,
+                'per_layer_know_out_norm': know_out_norm_all,
                 'know_phi_binary': know_phi_bin_all.mean(),
                 'attn_qk_phi_binary': attn_qk_phi_bin_all.mean(),
                 'attn_v_phi_binary': attn_v_phi_bin_all.mean(),
@@ -2361,17 +2530,63 @@ class DAWN(nn.Module):
             valid_mask = (shift_labels != -100)
 
             @jax.checkpoint
-            def compute_loss_and_acc(x_chunk, emb, labs, vmask):
-                logits = x_chunk @ emb.T
-                log_probs = jax.nn.log_softmax(logits, axis=-1)
-                safe = jnp.where(vmask, labs, 0)
-                tl = -jnp.take_along_axis(
-                    log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
-                per_token_ce = tl * vmask            # [B, S-1], 0 on invalid
-                loss = per_token_ce.sum() / (vmask.sum() + 1e-8)
-                preds = jnp.argmax(logits, axis=-1)
-                correct = jnp.sum((preds == labs) & vmask)
-                return loss, per_token_ce, correct, jnp.sum(vmask)
+            def compute_loss_and_acc(x_seq, emb, labs, vmask):
+                bsz, slen, dim = x_seq.shape
+                x_flat = x_seq.reshape((bsz * slen, dim))
+                labs_flat = labs.reshape((bsz * slen,))
+                valid_flat = vmask.reshape((bsz * slen,))
+                safe = jnp.where(valid_flat, labs_flat, 0)
+
+                target_emb = emb[safe]
+                true_logit = jnp.sum(x_flat * target_emb, axis=-1)
+
+                vocab = emb.shape[0]
+                vocab_chunk = 4096
+                pad_vocab = (-vocab) % vocab_chunk
+                emb_pad = jnp.pad(emb, ((0, pad_vocab), (0, 0)))
+                n_vocab_chunks = emb_pad.shape[0] // vocab_chunk
+                vocab_offsets = jnp.arange(vocab_chunk, dtype=jnp.int32)
+
+                def max_step(carry, i):
+                    max_logit, pred = carry
+                    start = i * vocab_chunk
+                    e = jax.lax.dynamic_slice(
+                        emb_pad, (start, 0), (vocab_chunk, dim))
+                    logits = x_flat @ e.T
+                    ids = start + vocab_offsets
+                    logits = jnp.where(
+                        ids[None, :] < vocab, logits, -jnp.inf)
+                    chunk_max = logits.max(axis=-1)
+                    chunk_arg = logits.argmax(axis=-1).astype(jnp.int32) + start
+                    better = chunk_max > max_logit
+                    return (jnp.where(better, chunk_max, max_logit),
+                            jnp.where(better, chunk_arg, pred)), None
+
+                init_max = jnp.full((bsz * slen,), -jnp.inf, dtype=jnp.float32)
+                init_pred = jnp.zeros((bsz * slen,), dtype=jnp.int32)
+                (max_logit, preds_flat), _ = jax.lax.scan(
+                    max_step, (init_max, init_pred), jnp.arange(n_vocab_chunks))
+
+                def sumexp_step(sum_exp, i):
+                    start = i * vocab_chunk
+                    e = jax.lax.dynamic_slice(
+                        emb_pad, (start, 0), (vocab_chunk, dim))
+                    logits = x_flat @ e.T
+                    ids = start + vocab_offsets
+                    logits = jnp.where(
+                        ids[None, :] < vocab, logits, -jnp.inf)
+                    return sum_exp + jnp.exp(
+                        logits - max_logit[:, None]).sum(axis=-1), None
+
+                sum_exp, _ = jax.lax.scan(
+                    sumexp_step,
+                    jnp.zeros((bsz * slen,), dtype=jnp.float32),
+                    jnp.arange(n_vocab_chunks))
+                ce_flat = max_logit + jnp.log(sum_exp + 1e-8) - true_logit
+                ce_flat = jnp.where(valid_flat, ce_flat, 0.0)
+                loss = ce_flat.sum() / (valid_flat.sum() + 1e-8)
+                correct = jnp.sum((preds_flat == labs_flat) & valid_flat)
+                return loss, ce_flat.reshape((bsz, slen)), correct, jnp.sum(valid_flat)
 
             loss, per_token_ce, correct, valid_count = compute_loss_and_acc(
                 shift_x, embedding_matrix, shift_labels, valid_mask)
@@ -3107,4 +3322,3 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         return x @ params['token_emb']['embedding'].T
 
     return forward_fn
-

@@ -2720,7 +2720,6 @@ def main():
 
     mesh = create_mesh(mesh_data, mesh_model)
     data_sharding = NamedSharding(mesh, P('data', None))
-    per_device_batch = batch_size // total_devices
     tensor_parallel = cfg['model'].get('parallelism', '').lower() in ('tensor', 'tp')
     if tensor_parallel:
         d_model = cfg['model']['d_model']
@@ -3389,7 +3388,10 @@ def main():
             print(f"  The model + gradients do not fit in device memory.")
             print(f"  Try: reduce batch_size, enable gradient_checkpointing, or use a smaller model.")
             print_xla_oom_diagnostics()
-        raise
+        try:
+            jax.distributed.shutdown()
+        finally:
+            os._exit(1)
 
     # ----------------------------------------------------------
     # Training log file (host 0 only)
