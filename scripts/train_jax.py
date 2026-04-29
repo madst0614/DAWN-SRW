@@ -31,6 +31,10 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.multihost_utils import process_allgather
 try:
+    from jax.experimental.multihost_utils import sync_global_devices as _sync_global_devices
+except ImportError:
+    _sync_global_devices = None
+try:
     from jax.experimental.multihost_utils import broadcast_one_to_all as _bcast_one_to_all
     _HAVE_BROADCAST = True
 except ImportError:
@@ -75,6 +79,13 @@ from models.dawn_spatial_v4152_tensor_parallel import DAWN as DAWN_V4152_TP
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
+
+
+def sync_hosts(stage):
+    """Best-effort multi-host barrier before collectives/device_put."""
+    if _sync_global_devices is None or jax.process_count() <= 1:
+        return
+    _sync_global_devices(f"dawn:{stage}")
 
 
 def print_xla_oom_diagnostics():
@@ -2338,6 +2349,7 @@ def main():
           f"local_devices={n_local_devices} total_devices={jax.device_count()} "
           f"backend={jax.default_backend()} "
           f"devices={[str(d) for d in local_devices]}", flush=True)
+    sync_hosts("after_device_discovery")
 
     per_host_batch = batch_size // n_hosts
     per_device_batch = per_host_batch // n_local_devices
@@ -2402,12 +2414,14 @@ def main():
 
     if is_host0:
         print("=== Starting model.init ===", flush=True)
+    sync_hosts("before_model_init")
     variables = model.init(
         {'params': init_rng, 'dropout': dropout_rng},
         dummy_input,
         deterministic=True,
     )
     params = variables['params']
+    sync_hosts("after_model_init")
     if is_host0:
         print("=== model.init done ===", flush=True)
 
@@ -2761,7 +2775,9 @@ def main():
     param_shardings = get_param_shardings(
         params, mesh, is_baseline=is_baseline,
         tensor_parallel=tensor_parallel)
+    sync_hosts("before_param_shard")
     params = shard_params_to_mesh(params, param_shardings)
+    sync_hosts("after_param_shard")
 
     _is_resuming = (resume_path is not None and _file_exists(resume_path))
     if _is_resuming:
@@ -2890,6 +2906,7 @@ def main():
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile
     # ----------------------------------------------------------
+    sync_hosts("before_oom_check")
     if is_host0:
         print(f"\n=== OOM check: real train_step (forward+backward) "
               f"per_device_batch={per_device_batch}, seq_len={max_seq_len} ===", flush=True)
@@ -2922,6 +2939,7 @@ def main():
         _dummy_emb_snap = _drift_snap(params)
 
         # First call: JIT compilation (slow)
+        sync_hosts("before_oom_jit_first_call")
         jit_start = time.time()
         with mesh:
             _dp, _do, dummy_metrics = train_step_fn(
@@ -2938,6 +2956,7 @@ def main():
 
         # Second call: measure actual step time (post-JIT)
         rng, dummy_step_rng2 = jax.random.split(rng)
+        sync_hosts("before_oom_jit_second_call")
         step_start = time.time()
         with mesh:
             _dp2, _do2, dummy_metrics2 = train_step_fn(
@@ -3344,6 +3363,7 @@ def main():
         del _dp2, _do2, dummy_metrics2
         if is_host0:
             print("=== OOM check passed (JIT compiled) ===\n", flush=True)
+        sync_hosts("after_oom_check")
     except Exception as e:
         if is_host0:
             print(f"\n  *** OOM check FAILED: {e}")
