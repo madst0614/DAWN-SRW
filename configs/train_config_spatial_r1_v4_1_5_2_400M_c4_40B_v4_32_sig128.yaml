@@ -25,6 +25,8 @@ model:
   max_seq_len: 512
   dropout: 0.05
   gradient_checkpointing: true
+  attention_checkpoint: false
+  loss_checkpoint: false
 
   d_route: 256
   tag_dim: 0
@@ -43,6 +45,8 @@ training:
   n_chunks_qk: 1
   n_chunks_v: 1
   n_chunks_know: 2
+  srw_stats_checkpoint: false
+  srw_gate_checkpoint: true
   gradient_accumulation_steps: 1
   num_epochs: 1
   lr: 0.0003

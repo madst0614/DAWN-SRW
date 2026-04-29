@@ -376,6 +376,12 @@ def safe_dropout(x, rate, deterministic, rng):
     return jnp.where(deterministic, x, dropped)
 
 
+def _maybe_checkpoint(fn=None, *, enabled=True):
+    if fn is None:
+        return lambda f: _maybe_checkpoint(f, enabled=enabled)
+    return jax.checkpoint(fn) if enabled else fn
+
+
 def _layer_norm(x, scale, bias, eps=1e-6):
     mean = jnp.mean(x, axis=-1, keepdims=True)
     var = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
@@ -447,7 +453,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                      max_intensity=MAX_INTENSITY,
                      scan_scale=SCAN_SCALE,
                      scan_std_floor=SCAN_STD_FLOOR,
-                     analysis=False):
+                     analysis=False,
+                     stats_checkpoint=True,
+                     gate_checkpoint=True):
     """Create fused shard_map'd gate+srw. Gate never materialised full.
 
     2-pass chunked inside shard_map:
@@ -563,7 +571,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
         # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
         if analysis:
-            @jax.checkpoint
+            @partial(_maybe_checkpoint, enabled=stats_checkpoint)
             def stats_step(carry, i):
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
@@ -584,7 +592,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             (local_sum, local_sq, local_cube, local_quad, ns_sum, ns_sq), _ = jax.lax.scan(
                 stats_step, (z_bs1, z_bs1, z_bs1, z_bs1, z_scalar, z_scalar), jnp.arange(nc))
         else:
-            @jax.checkpoint
+            @partial(_maybe_checkpoint, enabled=stats_checkpoint)
             def stats_step(carry, i):
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
@@ -639,7 +647,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         if analysis:
             _int_cap_thresh = _eps + _max_int - jnp.float32(1e-3)
 
-            @jax.checkpoint
+            @partial(_maybe_checkpoint, enabled=gate_checkpoint)
             def gate_srw_step(carry, i):
                 (out, total_weighted_cost, total_gate_max, total_active,
                  total_strong, total_phi_binary, total_den_cost,
@@ -715,7 +723,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  jnp.float32(0.0), jnp.float32(0.0)),
                 jnp.arange(nc))
         else:
-            @jax.checkpoint
+            @partial(_maybe_checkpoint, enabled=gate_checkpoint)
             def gate_srw_step(carry, i):
                 (out, total_weighted_cost, total_gate_max, total_active,
                  total_strong, total_den_cost,
@@ -849,7 +857,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             max_intensity=MAX_INTENSITY,
                             scan_scale=SCAN_SCALE,
                             scan_std_floor=SCAN_STD_FLOOR,
-                            analysis=False):
+                            analysis=False,
+                            stats_checkpoint=True,
+                            gate_checkpoint=True):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_bn] (h_Q, h_K stacked on axis=2).
@@ -947,7 +957,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
         # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
         if analysis:
-            @jax.checkpoint
+            @partial(_maybe_checkpoint, enabled=stats_checkpoint)
             def stats_step(carry, i):
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
@@ -968,7 +978,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             (local_sum, local_sq, local_cube, local_quad, ns_sum, ns_sq), _ = jax.lax.scan(
                 stats_step, (z_bsr1, z_bsr1, z_bsr1, z_bsr1, z_scalar, z_scalar), jnp.arange(nc))
         else:
-            @jax.checkpoint
+            @partial(_maybe_checkpoint, enabled=stats_checkpoint)
             def stats_step(carry, i):
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
@@ -1020,7 +1030,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         if analysis:
             _int_cap_thresh_paired = _eps + _max_int - jnp.float32(1e-3)
 
-            @jax.checkpoint
+            @partial(_maybe_checkpoint, enabled=gate_checkpoint)
             def gate_srw_step(carry, i):
                 (out, total_weighted_cost, total_gate_max, total_active,
                  total_strong, total_phi_binary, total_den_cost,
@@ -1097,7 +1107,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  jnp.float32(0.0), jnp.float32(0.0)),
                 jnp.arange(nc))
         else:
-            @jax.checkpoint
+            @partial(_maybe_checkpoint, enabled=gate_checkpoint)
             def gate_srw_step(carry, i):
                 (out, total_weighted_cost, total_gate_max, total_active,
                  total_strong, total_den_cost,
@@ -1329,7 +1339,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
                   n_heads, d_model,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False):
+                  sharded_fns, analysis=False,
+                  attention_checkpoint=True):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -1430,7 +1441,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     scale = jnp.sqrt(jnp.float32(d_head))
     rng, rng_attn_drop = jax.random.split(rng)
 
-    @jax.checkpoint
+    @partial(_maybe_checkpoint, enabled=attention_checkpoint)
     def _attn_scores(Q, K, V, rng_drop):
         attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
         causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
@@ -1664,6 +1675,8 @@ class DAWN(nn.Module):
     max_seq_len: int = 512
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
+    attention_checkpoint: bool = True
+    loss_checkpoint: bool = True
 
     d_route: int = DEFAULT_TAG_DIM + DEFAULT_READ_SIG_DIM + DEFAULT_WRITE_SIG_DIM
     tag_dim: int = DEFAULT_TAG_DIM
@@ -1829,7 +1842,8 @@ class DAWN(nn.Module):
                     self.n_qk, self.n_v,
                     self.n_heads, self.d_model,
                     self.router_dropout, self.dropout_rate, deterministic,
-                    sharded_fns=_sharded, analysis=analysis)
+                    sharded_fns=_sharded, analysis=analysis,
+                    attention_checkpoint=self.attention_checkpoint)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -2121,7 +2135,7 @@ class DAWN(nn.Module):
             shift_labels = labels[:, 1:].astype(jnp.int32)
             valid_mask = (shift_labels != -100)
 
-            @jax.checkpoint
+            @partial(_maybe_checkpoint, enabled=self.loss_checkpoint)
             def compute_loss_and_acc(x_chunk, emb, labs, vmask):
                 logits = x_chunk @ emb.T
                 logits = jax.lax.with_sharding_constraint(logits, P('data', None, None))

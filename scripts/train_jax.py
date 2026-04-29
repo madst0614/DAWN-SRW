@@ -326,6 +326,12 @@ def build_model_from_config(cfg):
             raise ValueError(
                 f"model_version={version!r} has no tensor-parallel backend")
         cls = spec.tensor_cls
+        t = cfg['training']
+        m = cfg['model']
+        kwargs['attention_checkpoint'] = m.get(
+            'attention_checkpoint', t.get('attention_checkpoint', True))
+        kwargs['loss_checkpoint'] = m.get(
+            'loss_checkpoint', t.get('loss_checkpoint', True))
     if version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
         print(
             "operator route signature: "
@@ -2778,6 +2784,13 @@ def main():
         _srw_base_kwargs = {'mesh': mesh}
         if _spec.sharded_kwargs is not None:
             _srw_base_kwargs.update(_spec.sharded_kwargs(cfg))
+        if _parallelism in ('tensor', 'tp'):
+            _srw_base_kwargs.update({
+                'stats_checkpoint': cfg['training'].get(
+                    'srw_stats_checkpoint', True),
+                'gate_checkpoint': cfg['training'].get(
+                    'srw_gate_checkpoint', True),
+            })
         # Slim (train) -kwargs don't set analysis, so defaults to False.
         _sharded_single_v = make_sharded_srw(
             max_chunk_size=v_max_chunk, **_srw_base_kwargs)
