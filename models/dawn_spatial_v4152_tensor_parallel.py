@@ -2167,20 +2167,27 @@ class DAWN(nn.Module):
                 """Exact CE/accuracy without materializing [B,T,V] logits."""
                 chunk = int(self.vocab_loss_chunk_size)
                 vocab = int(self.vocab_size)
-                n_chunks = (vocab + chunk - 1) // chunk
-                padded_vocab = n_chunks * chunk
-                pad_rows = padded_vocab - vocab
-                emb_pad = jnp.pad(emb, ((0, pad_rows), (0, 0)))
-                chunk_offsets = jnp.arange(chunk, dtype=jnp.int32)
+                # IMPORTANT: avoid padding + valid_vocab masks here. XLA can lift
+                # that mask across the loop and materialize [n_chunks, B, T, chunk]
+                # constants, which is worse than full logits. Use an exact divisor
+                # of vocab instead. For BERT vocab 30522, the useful large divisor
+                # is 5087 (=30522/6).
+                if vocab % chunk != 0:
+                    if vocab == 30522:
+                        chunk = 5087
+                    else:
+                        raise ValueError(
+                            f"vocab_loss_chunk_size must divide vocab_size to avoid "
+                            f"padded/masked streaming loss temp blow-up, got "
+                            f"chunk={chunk}, vocab={vocab}")
+                n_chunks = vocab // chunk
                 neg_inf = jnp.array(-jnp.inf, jnp.float32)
 
                 def logits_for_chunk(i):
                     start = i * chunk
-                    emb_c = jax.lax.dynamic_slice_in_dim(emb_pad, start, chunk, axis=0)
+                    emb_c = jax.lax.dynamic_slice_in_dim(emb, start, chunk, axis=0)
                     logits = x_chunk @ emb_c.T
-                    logits = jax.lax.with_sharding_constraint(logits, P('data', None, None))
-                    valid_vocab = (start + chunk_offsets) < vocab
-                    return jnp.where(valid_vocab[None, None, :], logits, neg_inf)
+                    return jax.lax.with_sharding_constraint(logits, P('data', None, None))
 
                 def max_body(i, cur_max):
                     return jnp.maximum(cur_max, logits_for_chunk(i).max(axis=-1))
