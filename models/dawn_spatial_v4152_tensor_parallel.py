@@ -485,7 +485,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     Used by analysis_step at val time only.
     """
     _data_axis_size = mesh.shape['data']
-    _neuron_axis_size = mesh.shape.get('neuron', 1)
     _dead_thresh = jnp.float32(dead_threshold)
     _sharp = jnp.float32(sharpness)
     _act_thr = jnp.float32(activation_threshold)
@@ -534,11 +533,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, 'model'), # x [B,S,D/model]
                        P('data', None, None),    # h [B,S,d_bn]
-                       P('neuron', None),         # tag [N/neuron, tag_dim]
+                       P(None, None),             # tag [N, tag_dim]
                        P('data', None, None),    # tau_offset [B,S,1]
                        P('data', None, None),    # scan_bias [B,S,1]
-                       P('neuron', 'model'),      # read [N/neuron, D/model]
-                       P('neuron', 'model'),     # write [N/neuron, D/model]
+                       P(None, 'model'),          # read [N, D/model]
+                       P(None, 'model'),          # write [N, D/model]
                        P('model', None),          # read_sig_proj [D/model,read_sig_dim]
                        P('model', None)),         # write_sig_proj [D/model,write_sig_dim]
              out_specs=_out_specs,
@@ -612,9 +611,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             (local_sum, local_sq, ns_sum, ns_sq), _ = jax.lax.scan(
                 stats_step, (z_bs1, z_bs1, z_scalar, z_scalar), jnp.arange(nc))
 
-        global_sum = jax.lax.psum(local_sum, 'neuron')
-        global_sq = jax.lax.psum(local_sq, 'neuron')
-        N_total = N_local * _neuron_axis_size
+        global_sum = local_sum
+        global_sq = local_sq
+        N_total = N_local
 
         s_mean = global_sum / N_total
         s_std = jnp.sqrt(global_sq / N_total - s_mean ** 2) + 1e-8
@@ -622,8 +621,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         tau = s_mean + tau_offset * s_std - scan / jnp.maximum(s_std, _scan_std_floor)
 
         if analysis:
-            global_cube = jax.lax.psum(local_cube, 'neuron')
-            global_quad = jax.lax.psum(local_quad, 'neuron')
+            global_cube = local_cube
+            global_quad = local_quad
             # Skewness via E[(X-關)^3] = E[X^3] - 3關?짼 - 關쨀
             cube_mean = global_cube / N_total
             central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
@@ -637,8 +636,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         # Score LB: variance of per-neuron score mean * N
         ns_sum = jax.lax.psum(ns_sum, 'data') / _data_axis_size
         ns_sq = jax.lax.psum(ns_sq, 'data') / _data_axis_size
-        global_ns_sum = jax.lax.psum(ns_sum, 'neuron')
-        global_ns_sq = jax.lax.psum(ns_sq, 'neuron')
+        global_ns_sum = ns_sum
+        global_ns_sq = ns_sq
         mean_score = global_ns_sum / N_total
         var_score = global_ns_sq / N_total - mean_score ** 2
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
@@ -783,21 +782,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
                 jnp.arange(nc))
 
-        # Reduce neuron-sharded partials back to full-pool semantics.
-        raw_out = jax.lax.psum(raw_out, 'neuron')
-        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'neuron')  # 誇gate
+        global_weighted_cost = total_weighted_cost  # 誇gate
         # v4.1 den = 誇intensity (boundary neurons get EPSILON den penalty
         # without matching numerator ??structural bimodality pressure).
         # Effective v4.1.5 denominator: max(sum(activation * intensity), 1.0).
-        global_den_cost = jax.lax.psum(total_den_cost, 'neuron')
-        global_activation_cost = jax.lax.psum(total_activation_cost, 'neuron')
-        global_current_cost = jax.lax.psum(total_current_cost, 'neuron')
-        global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'neuron')
-        total_active = jax.lax.psum(total_active, 'neuron')
-        total_strong = jax.lax.psum(total_strong, 'neuron')
-        total_dead_penalty = jax.lax.psum(total_dead_penalty, 'neuron')
-        total_dead_count = jax.lax.psum(total_dead_count, 'neuron')
-        total_int_max = jax.lax.pmax(jax.lax.stop_gradient(total_int_max), 'neuron')
+        global_den_cost = total_den_cost
+        global_activation_cost = total_activation_cost
+        global_current_cost = total_current_cost
+        global_gate_max = jax.lax.stop_gradient(total_gate_max)
         den = jnp.maximum(global_den_cost, 1.0)
         out = raw_out / den
         out = out.astype(jnp.bfloat16)
@@ -829,11 +821,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             return slim_out
 
         # --- Analysis-only extras ---
-        total_phi_binary = jax.lax.psum(total_phi_binary, 'neuron')
-        total_z_lt_075 = jax.lax.psum(total_z_lt_075, 'neuron')
-        total_z_lt_030 = jax.lax.psum(total_z_lt_030, 'neuron')
-        total_g_log_g = jax.lax.psum(total_g_log_g, 'neuron')
-        total_int_cap_count = jax.lax.psum(total_int_cap_count, 'neuron')
         phi_binary_frac = total_phi_binary / N_total
         # Safety floor ??active can collapse to 0 at init; clamp to 1.0.
         _active_denom = jnp.maximum(global_active, 1.0)
@@ -885,7 +872,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     analysis: see make_sharded_srw docstring.
     """
     _data_axis_size = mesh.shape['data']
-    _neuron_axis_size = mesh.shape.get('neuron', 1)
     _dead_thresh = jnp.float32(dead_threshold)
     _sharp = jnp.float32(sharpness)
     _act_thr = jnp.float32(activation_threshold)
@@ -932,11 +918,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, 'model'),     # x [B,S,D/model]
                        P('data', None, None, None),  # h [B,S,2,d_bn]
-                       P('neuron', None),         # tag [N/neuron, tag_dim]
+                       P(None, None),                 # tag [N, tag_dim]
                        P('data', None, None, None),  # tau_offset [B,S,2,1]
                        P('data', None, None, None),  # scan_bias [B,S,2,1]
-                       P('neuron', 'model'),      # read [N/neuron, D/model]
-                       P('neuron', 'model'),     # write [N/neuron, D/model]
+                       P(None, 'model'),              # read [N, D/model]
+                       P(None, 'model'),              # write [N, D/model]
                        P('model', None),              # read_sig_proj [D/model,read_sig_dim]
                        P('model', None)),             # write_sig_proj [D/model,write_sig_dim]
              out_specs=_out_specs,
@@ -1011,9 +997,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             (local_sum, local_sq, ns_sum, ns_sq), _ = jax.lax.scan(
                 stats_step, (z_bsr1, z_bsr1, z_scalar, z_scalar), jnp.arange(nc))
 
-        global_sum = jax.lax.psum(local_sum, 'neuron')
-        global_sq = jax.lax.psum(local_sq, 'neuron')
-        N_total = N_local * _neuron_axis_size
+        global_sum = local_sum
+        global_sq = local_sq
+        N_total = N_local
 
         s_mean = global_sum / N_total      # [B,S,2,1]
         s_std = jnp.sqrt(global_sq / N_total - s_mean ** 2) + 1e-8
@@ -1021,8 +1007,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         tau = s_mean + tau_offset * s_std - scan / jnp.maximum(s_std, _scan_std_floor)
 
         if analysis:
-            global_cube = jax.lax.psum(local_cube, 'neuron')
-            global_quad = jax.lax.psum(local_quad, 'neuron')
+            global_cube = local_cube
+            global_quad = local_quad
             cube_mean = global_cube / N_total
             central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
             score_skew = jax.lax.stop_gradient((central_third / (s_std ** 3 + 1e-8)).mean())
@@ -1034,8 +1020,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         # Score LB: variance of per-neuron score mean * N
         ns_sum = jax.lax.psum(ns_sum, 'data') / _data_axis_size
         ns_sq = jax.lax.psum(ns_sq, 'data') / _data_axis_size
-        global_ns_sum = jax.lax.psum(ns_sum, 'neuron')
-        global_ns_sq = jax.lax.psum(ns_sq, 'neuron')
+        global_ns_sum = ns_sum
+        global_ns_sq = ns_sq
         mean_score = global_ns_sum / N_total
         var_score = global_ns_sq / N_total - mean_score ** 2
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
@@ -1180,18 +1166,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
                 jnp.arange(nc))
 
-        # Normalize per route independently. Reduce neuron-sharded partials.
-        raw_out = jax.lax.psum(raw_out, 'neuron')
-        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'neuron')   # 誇gate (log)
-        global_den_cost = jax.lax.psum(total_den_cost, 'neuron')
-        global_activation_cost = jax.lax.psum(total_activation_cost, 'neuron')
-        global_current_cost = jax.lax.psum(total_current_cost, 'neuron')
-        global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'neuron')
-        total_active = jax.lax.psum(total_active, 'neuron')
-        total_strong = jax.lax.psum(total_strong, 'neuron')
-        total_dead_penalty = jax.lax.psum(total_dead_penalty, 'neuron')
-        total_dead_count = jax.lax.psum(total_dead_count, 'neuron')
-        total_int_max = jax.lax.pmax(jax.lax.stop_gradient(total_int_max), 'neuron')
+        # Normalize per route independently
+        global_weighted_cost = total_weighted_cost   # 誇gate (log)
+        global_den_cost = total_den_cost
+        global_activation_cost = total_activation_cost
+        global_current_cost = total_current_cost
+        global_gate_max = jax.lax.stop_gradient(total_gate_max)
         den = jnp.maximum(global_den_cost, 1.0)
         out = raw_out / den
         out = out.astype(jnp.bfloat16)
@@ -1226,11 +1206,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             return slim_out
 
         # --- Analysis-only extras ---
-        total_phi_binary = jax.lax.psum(total_phi_binary, 'neuron')
-        total_z_lt_075 = jax.lax.psum(total_z_lt_075, 'neuron')
-        total_z_lt_030 = jax.lax.psum(total_z_lt_030, 'neuron')
-        total_g_log_g = jax.lax.psum(total_g_log_g, 'neuron')
-        total_int_cap_count = jax.lax.psum(total_int_cap_count, 'neuron')
         phi_binary_frac = total_phi_binary / N_total
         phi_binary_frac_mean = phi_binary_frac.mean(axis=2)
         _active_denom = jnp.maximum(global_active, 1.0)
@@ -1702,8 +1677,6 @@ class DAWN(nn.Module):
     gradient_checkpointing: bool = False
     attention_checkpoint: bool = True
     loss_checkpoint: bool = True
-    # Streaming vocab loss avoids materializing [B, T, vocab] logits.
-    vocab_loss_chunk_size: int = 4096
 
     d_route: int = DEFAULT_TAG_DIM + DEFAULT_READ_SIG_DIM + DEFAULT_WRITE_SIG_DIM
     tag_dim: int = DEFAULT_TAG_DIM
@@ -2163,76 +2136,27 @@ class DAWN(nn.Module):
             valid_mask = (shift_labels != -100)
 
             @partial(_maybe_checkpoint, enabled=self.loss_checkpoint)
-            def compute_streaming_loss_and_acc(x_chunk, emb, labs, vmask):
-                """Exact CE/accuracy without materializing [B,T,V] logits."""
-                chunk = int(self.vocab_loss_chunk_size)
-                vocab = int(self.vocab_size)
-                # IMPORTANT: avoid padding + valid_vocab masks here. XLA can lift
-                # that mask across the loop and materialize [n_chunks, B, T, chunk]
-                # constants, which is worse than full logits. Use an exact divisor
-                # of vocab instead. For BERT vocab 30522, the useful large divisor
-                # is 5087 (=30522/6).
-                if vocab % chunk != 0:
-                    if vocab == 30522:
-                        chunk = 5087
-                    else:
-                        raise ValueError(
-                            f"vocab_loss_chunk_size must divide vocab_size to avoid "
-                            f"padded/masked streaming loss temp blow-up, got "
-                            f"chunk={chunk}, vocab={vocab}")
-                n_chunks = vocab // chunk
-                neg_inf = jnp.array(-jnp.inf, jnp.float32)
-
-                def logits_for_chunk(i):
-                    start = i * chunk
-                    emb_c = jax.lax.dynamic_slice_in_dim(emb, start, chunk, axis=0)
-                    logits = x_chunk @ emb_c.T
-                    return jax.lax.with_sharding_constraint(logits, P('data', None, None))
-
-                def max_body(i, cur_max):
-                    return jnp.maximum(cur_max, logits_for_chunk(i).max(axis=-1))
-
-                max_logits = jax.lax.fori_loop(
-                    0, n_chunks, max_body,
-                    jnp.full(labs.shape, neg_inf, dtype=jnp.float32))
-
-                def sum_body(i, carry):
-                    sumexp, target_logit, best_logit, best_id = carry
-                    start = i * chunk
-                    logits = logits_for_chunk(i)
-                    sumexp = sumexp + jnp.exp(logits - max_logits[..., None]).sum(axis=-1)
-                    in_chunk = (labs >= start) & (labs < start + chunk) & vmask
-                    local_idx = jnp.clip(labs - start, 0, chunk - 1)
-                    picked = jnp.take_along_axis(logits, local_idx[..., None], axis=-1).squeeze(-1)
-                    target_logit = jnp.where(in_chunk, picked, target_logit)
-                    local_best_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-                    local_best = jnp.take_along_axis(logits, local_best_idx[..., None], axis=-1).squeeze(-1)
-                    better = local_best > best_logit
-                    best_logit = jnp.where(better, local_best, best_logit)
-                    best_id = jnp.where(better, start + local_best_idx, best_id)
-                    return sumexp, target_logit, best_logit, best_id
-
-                init = (jnp.zeros(labs.shape, dtype=jnp.float32),
-                        jnp.full(labs.shape, neg_inf, dtype=jnp.float32),
-                        jnp.full(labs.shape, neg_inf, dtype=jnp.float32),
-                        jnp.zeros(labs.shape, dtype=jnp.int32))
-                sumexp, target_logit, _best_logit, preds = jax.lax.fori_loop(
-                    0, n_chunks, sum_body, init)
-                logsumexp = max_logits + jnp.log(sumexp + 1e-8)
-                per_token_ce = jnp.where(vmask, logsumexp - target_logit, 0.0)
-                valid_count = jnp.sum(vmask)
-                loss = per_token_ce.sum() / (valid_count + 1e-8)
+            def compute_loss_and_acc(x_chunk, emb, labs, vmask):
+                logits = x_chunk @ emb.T
+                logits = jax.lax.with_sharding_constraint(logits, P('data', None, None))
+                log_probs = jax.nn.log_softmax(logits, axis=-1)
+                safe = jnp.where(vmask, labs, 0)
+                tl = -jnp.take_along_axis(
+                    log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
+                per_token_ce = tl * vmask            # [B, S-1], 0 on invalid
+                loss = per_token_ce.sum() / (vmask.sum() + 1e-8)
+                preds = jnp.argmax(logits, axis=-1)
                 correct = jnp.sum((preds == labs) & vmask)
-                return loss, per_token_ce, correct, valid_count
+                return loss, per_token_ce, correct, jnp.sum(vmask)
 
-            loss, per_token_ce, correct, valid_count = compute_streaming_loss_and_acc(
+            loss, per_token_ce, correct, valid_count = compute_loss_and_acc(
                 shift_x, embedding_matrix, shift_labels, valid_mask)
             result['loss'] = loss
             result['correct'] = correct
             result['valid_count'] = valid_count
+            # v4.1 explore: expose per-token CE + valid mask for RPE loss.
             result['per_token_ce'] = per_token_ce
             result['valid_mask'] = valid_mask
-
         else:
             logits = self.token_emb.attend(x)
             if not self.is_initializing():
