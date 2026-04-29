@@ -1014,8 +1014,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     tau_offset and scan_bias are [B,S,2,1].
     x @ read.T computed once (shared by both routes).
     Scores stats computed independently per route.
-    Train returns scalar active/gate/strong/z diagnostics; analysis keeps
-    per-token [B,S,1] diagnostics.
+    Returns q_out and k_out separately. Train returns scalar
+    active/gate/strong/z diagnostics; analysis keeps per-token [B,S,1]
+    diagnostics.
 
     v4.1 gate: activation 횞 intensity (see make_sharded_srw docstring).
     analysis: see make_sharded_srw docstring.
@@ -1032,7 +1033,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     _scan_std_floor = jnp.float32(scan_std_floor)
 
     _slim_out_specs = (
-        P('data', None, None, None),  # out [B,S,2,D]
+        P('data', None, None),        # q_out [B,S,D]
+        P('data', None, None),        # k_out [B,S,D]
         P('data', None, None) if analysis else P(),  # active
         P('data', None, None) if analysis else P(),  # gate_max
         P(),                          # lb_loss scalar
@@ -1263,7 +1265,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
             @jax.checkpoint
             def gate_srw_step(carry, i):
-                (out, total_weighted_cost, total_gate_max, total_active,
+                (out_q, out_k, total_weighted_cost, total_gate_max, total_active,
                  total_strong, total_phi_binary, total_den_cost,
                  total_activation_cost, total_current_cost,
                  total_z_lt_075, total_z_lt_030, total_g_log_g,
@@ -1283,8 +1285,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                                         ).astype(jnp.float32).sum()
                 xr = x_bf @ rc.T  # [B,S,N]
                 xr_f = xr.astype(jnp.float32)
-                a = gate * xr_f[:, :, None, :]
-                c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
+                c_q = ((gate[:, :, 0, :] * xr_f).astype(jnp.bfloat16) @ wc
+                       ).astype(jnp.float32)
+                c_k = ((gate[:, :, 1, :] * xr_f).astype(jnp.bfloat16) @ wc
+                       ).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)           # [B,S,2,1]
                 chunk_intensity = gate.sum(axis=-1, keepdims=True)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -1307,7 +1311,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 penalty_chunk = jax.nn.relu(-mean_score_chunk) * dead_mask_chunk
                 chunk_dead_penalty = penalty_chunk.sum()
                 chunk_dead_count = dead_mask_chunk.sum()
-                return (out + c_out,
+                return (out_q + c_q,
+                        out_k + c_k,
                         total_weighted_cost + chunk_weighted,
                         jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
@@ -1324,13 +1329,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_int_max, chunk_int_max),
                         total_int_cap_count + chunk_int_cap_count), None
 
-            (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong,
+            (raw_q, raw_k, total_weighted_cost, total_gate_max, total_active, total_strong,
              total_phi_binary, total_den_cost, total_activation_cost,
              total_current_cost, total_z_lt_075, total_z_lt_030,
              total_g_log_g, total_dead_penalty, total_dead_count,
-             total_int_max, total_int_cap_count), _ = jax.lax.scan(
+            total_int_max, total_int_cap_count), _ = jax.lax.scan(
                 gate_srw_step,
-                (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
+                (jnp.zeros((B, S, D), dtype=jnp.float32),
+                 jnp.zeros((B, S, D), dtype=jnp.float32),
                  z1_r, jnp.full((B, S, 2, 1), -1e9),
                  z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r,
                  jnp.float32(0.0), jnp.float32(0.0),
@@ -1339,7 +1345,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         else:
             @jax.checkpoint
             def gate_srw_step(carry, i):
-                (out, total_weighted_cost, total_gate_max, total_active,
+                (out_q, out_k, total_weighted_cost, total_gate_max, total_active,
                  total_strong, total_den_cost,
                  total_activation_cost, total_current_cost,
                  total_dead_penalty, total_dead_count,
@@ -1358,7 +1364,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     tau_tok = tau.reshape((T, 2, 1))
 
                     def token_step(tcarry, j):
-                        (out_f, weighted_f, gate_max_f, active_f, strong_f,
+                        (out_q_f, out_k_f, weighted_f, gate_max_f, active_f, strong_f,
                          den_f, chunk_gate_max, chunk_score_sum,
                          chunk_int_max_t) = tcarry
                         t0 = j * tb
@@ -1373,9 +1379,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         intensity_t = _eps + jnp.minimum(active_margin_t, _max_int)
                         gate_t = activation_t * intensity_t
                         xr_t = (x_t @ rc.T).astype(jnp.float32)
-                        a_t = gate_t * xr_t[:, None, :]
-                        c_out_t = jnp.einsum('trn,nd->trd', a_t.astype(jnp.bfloat16), wc).astype(jnp.float32)
-                        out_f = jax.lax.dynamic_update_slice_in_dim(out_f, c_out_t, t0, axis=0)
+                        c_q_t = ((gate_t[:, 0, :] * xr_t).astype(jnp.bfloat16) @ wc
+                                 ).astype(jnp.float32)
+                        c_k_t = ((gate_t[:, 1, :] * xr_t).astype(jnp.bfloat16) @ wc
+                                 ).astype(jnp.float32)
+                        out_q_f = jax.lax.dynamic_update_slice_in_dim(
+                            out_q_f, c_q_t, t0, axis=0)
+                        out_k_f = jax.lax.dynamic_update_slice_in_dim(
+                            out_k_f, c_k_t, t0, axis=0)
                         weighted_f = jax.lax.dynamic_update_slice_in_dim(
                             weighted_f, gate_t.sum(axis=-1, keepdims=True), t0, axis=0)
                         gate_max_f = jax.lax.dynamic_update_slice_in_dim(
@@ -1389,22 +1400,25 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         chunk_gate_max = jnp.maximum(chunk_gate_max, gate_t.max(axis=(0, 1)))
                         chunk_score_sum = chunk_score_sum + scores_tf.sum(axis=(0, 1))
                         chunk_int_max_t = jnp.maximum(chunk_int_max_t, intensity_t.max())
-                        return (out_f, weighted_f, gate_max_f, active_f, strong_f,
-                                den_f, chunk_gate_max, chunk_score_sum,
+                        return (out_q_f, out_k_f, weighted_f, gate_max_f,
+                                active_f, strong_f, den_f,
+                                chunk_gate_max, chunk_score_sum,
                                 chunk_int_max_t), None
 
                     z_t21 = jnp.zeros((T, 2, 1), dtype=jnp.float32)
-                    (c_out_f, chunk_weighted_f, gate_max_f, chunk_active_f,
+                    (c_q_f, c_k_f, chunk_weighted_f, gate_max_f, chunk_active_f,
                      chunk_strong_f, chunk_intensity_f,
                      max_gate_chunk, score_sum_chunk, chunk_int_max), _ = jax.lax.scan(
                         token_step,
-                        (jnp.zeros((T, 2, D), dtype=jnp.float32),
+                        (jnp.zeros((T, D), dtype=jnp.float32),
+                         jnp.zeros((T, D), dtype=jnp.float32),
                          z_t21, jnp.full((T, 2, 1), -1e9), z_t21, z_t21, z_t21,
                          jnp.full((cs,), -1e9, dtype=jnp.float32),
                          jnp.zeros((cs,), dtype=jnp.float32),
                          jnp.float32(0.0)),
                         jnp.arange(n_tb))
-                    c_out = c_out_f.reshape((B, S, 2, D))
+                    c_q = c_q_f.reshape((B, S, D))
+                    c_k = c_k_f.reshape((B, S, D))
                     chunk_weighted = chunk_weighted_f.reshape((B, S, 2, 1))
                     chunk_intensity = chunk_intensity_f.reshape((B, S, 2, 1))
                     chunk_active = chunk_active_f.reshape((B, S, 2, 1))
@@ -1422,8 +1436,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     chunk_int_max = intensity.max()
                     xr = x_bf @ rc.T
                     xr_f = xr.astype(jnp.float32)
-                    a = gate * xr_f[:, :, None, :]
-                    c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
+                    c_q = ((gate[:, :, 0, :] * xr_f).astype(jnp.bfloat16) @ wc
+                           ).astype(jnp.float32)
+                    c_k = ((gate[:, :, 1, :] * xr_f).astype(jnp.bfloat16) @ wc
+                           ).astype(jnp.float32)
                     chunk_weighted = gate.sum(axis=-1, keepdims=True)
                     chunk_intensity = gate.sum(axis=-1, keepdims=True)
                     chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -1439,7 +1455,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 penalty_chunk = jax.nn.relu(-mean_score_chunk) * dead_mask_chunk
                 chunk_dead_penalty = penalty_chunk.sum()
                 chunk_dead_count = dead_mask_chunk.sum()
-                return (out + c_out,
+                return (out_q + c_q,
+                        out_k + c_k,
                         total_weighted_cost + chunk_weighted,
                         jnp.maximum(total_gate_max, gate_max_local),
                         total_active + chunk_active,
@@ -1451,12 +1468,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         total_dead_count + chunk_dead_count,
                         jnp.maximum(total_int_max, chunk_int_max)), None
 
-            (raw_out, total_weighted_cost, total_gate_max, total_active, total_strong,
+            (raw_q, raw_k, total_weighted_cost, total_gate_max, total_active, total_strong,
              total_den_cost, total_activation_cost, total_current_cost,
              total_dead_penalty, total_dead_count,
-             total_int_max), _ = jax.lax.scan(
+            total_int_max), _ = jax.lax.scan(
                 gate_srw_step,
-                (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
+                (jnp.zeros((B, S, D), dtype=jnp.float32),
+                 jnp.zeros((B, S, D), dtype=jnp.float32),
                  z1_r, jnp.full((B, S, 2, 1), -1e9),
                  z1_r, z1_r, z1_r, z1_r, z1_r,
                  jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
@@ -1469,8 +1487,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         den = jnp.maximum(global_den_cost, 1.0)
-        out = raw_out / den
-        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
+        q_out = raw_q / den[:, :, 0, :]
+        k_out = raw_k / den[:, :, 1, :]
+        q_out = jax.lax.psum(q_out.astype(jnp.bfloat16), 'model')
+        k_out = jax.lax.psum(k_out.astype(jnp.bfloat16), 'model')
 
         global_active = jax.lax.psum(total_active, 'model')
         active_frac = global_active / N_total
@@ -1496,17 +1516,18 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         current_cost_mean = global_current_cost.mean()
 
         if not analysis:
-            return (out.astype(jnp.float32), active_frac_mean.mean(),
+            return (q_out, k_out, active_frac_mean.mean(),
                     raw_gate_max_mean.max(), score_lb, score_std_out, es_out,
                     active_n_mean, strong_frac_mean.mean(),
                     z_mean_active_mean.mean(), tau_abs_mean, dead_penalty_out,
                     dead_count_out, int_max_out, den_cost_mean,
                     activation_cost_mean, current_cost_mean)
 
-        slim_out = (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb,
-                    score_std_out, es_out, active_n_mean, strong_frac_mean,
-                    z_mean_active_mean, tau_abs_mean, dead_penalty_out, dead_count_out,
-                    int_max_out, den_cost_mean, activation_cost_mean, current_cost_mean)
+        slim_out = (q_out, k_out, active_frac_mean, raw_gate_max_mean,
+                    score_lb, score_std_out, es_out, active_n_mean,
+                    strong_frac_mean, z_mean_active_mean, tau_abs_mean,
+                    dead_penalty_out, dead_count_out, int_max_out,
+                    den_cost_mean, activation_cost_mean, current_cost_mean)
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
@@ -1711,17 +1732,18 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     scan_bias_QK = jnp.stack([scan_bias_all[:, :, 0:1], scan_bias_all[:, :, 1:2]], axis=2)
     qk_ret = fused_paired(x, h_QK, qk_emb_unit, tau_QK, scan_bias_QK,
                            qk_read, qk_write, qk_read_sig_proj, qk_write_sig_proj)
-    (QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
+    (Q_raw, K_raw, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
      qk_strong, qk_z_act, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
-     qk_den_cost_mean, qk_activation_cost_mean, qk_current_cost_mean) = qk_ret[:16]
+     qk_den_cost_mean, qk_activation_cost_mean, qk_current_cost_mean) = qk_ret[:17]
     if analysis:
         (qk_phi_bin, qk_z075, qk_z030, qk_skew, qk_apt_std, qk_entropy,
          qk_den_cost, qk_activation_cost, qk_current_cost,
-         qk_kurt, qk_int_cap) = qk_ret[16:]
-        qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
-    Q = QK_out[:, :, 0, :] * qk_scale
-    K = QK_out[:, :, 1, :] * qk_scale
+         qk_kurt, qk_int_cap) = qk_ret[17:]
+        qk_raw_norm = (jnp.linalg.norm(Q_raw.astype(jnp.float32), axis=-1).mean()
+                       + jnp.linalg.norm(K_raw.astype(jnp.float32), axis=-1).mean()) / 2
+    Q = (Q_raw.astype(jnp.float32) * qk_scale).astype(jnp.bfloat16)
+    K = (K_raw.astype(jnp.float32) * qk_scale).astype(jnp.bfloat16)
     v_ret = fused_single_v(x, h_V, v_emb_unit, tau_all[:, :, 2:3],
                            scan_bias_all[:, :, 2:3], v_read, v_write,
                            v_read_sig_proj, v_write_sig_proj)
@@ -1734,7 +1756,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          v_den_cost, v_activation_cost, v_current_cost,
          v_kurt, v_int_cap) = v_ret[16:]
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
-    V = V * v_scale
+    V = (V.astype(jnp.float32) * v_scale).astype(jnp.bfloat16)
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1791,7 +1813,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                         q = jnp.pad(q, pad_spec)
                         k = jnp.pad(k, pad_spec)
                         v = jnp.pad(v, pad_spec)
-                    out = splash_kernel(q / scale, k, v)
+                    q_scaled = (q.astype(jnp.float32) / scale).astype(jnp.bfloat16)
+                    out = splash_kernel(q_scaled, k, v)
                     return out[..., :d_head]
 
                 return jax.vmap(splash_one, in_axes=(0, 0, 0))(q_all, k_all, v_all)
