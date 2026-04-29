@@ -1702,6 +1702,8 @@ class DAWN(nn.Module):
     gradient_checkpointing: bool = False
     attention_checkpoint: bool = True
     loss_checkpoint: bool = True
+    # Streaming vocab loss avoids materializing [B, T, vocab] logits.
+    vocab_loss_chunk_size: int = 4096
 
     d_route: int = DEFAULT_TAG_DIM + DEFAULT_READ_SIG_DIM + DEFAULT_WRITE_SIG_DIM
     tag_dim: int = DEFAULT_TAG_DIM
@@ -2161,27 +2163,69 @@ class DAWN(nn.Module):
             valid_mask = (shift_labels != -100)
 
             @partial(_maybe_checkpoint, enabled=self.loss_checkpoint)
-            def compute_loss_and_acc(x_chunk, emb, labs, vmask):
-                logits = x_chunk @ emb.T
-                logits = jax.lax.with_sharding_constraint(logits, P('data', None, None))
-                log_probs = jax.nn.log_softmax(logits, axis=-1)
-                safe = jnp.where(vmask, labs, 0)
-                tl = -jnp.take_along_axis(
-                    log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
-                per_token_ce = tl * vmask            # [B, S-1], 0 on invalid
-                loss = per_token_ce.sum() / (vmask.sum() + 1e-8)
-                preds = jnp.argmax(logits, axis=-1)
-                correct = jnp.sum((preds == labs) & vmask)
-                return loss, per_token_ce, correct, jnp.sum(vmask)
+            def compute_streaming_loss_and_acc(x_chunk, emb, labs, vmask):
+                """Exact CE/accuracy without materializing [B,T,V] logits."""
+                chunk = int(self.vocab_loss_chunk_size)
+                vocab = int(self.vocab_size)
+                n_chunks = (vocab + chunk - 1) // chunk
+                padded_vocab = n_chunks * chunk
+                pad_rows = padded_vocab - vocab
+                emb_pad = jnp.pad(emb, ((0, pad_rows), (0, 0)))
+                chunk_offsets = jnp.arange(chunk, dtype=jnp.int32)
+                neg_inf = jnp.array(-jnp.inf, jnp.float32)
 
-            loss, per_token_ce, correct, valid_count = compute_loss_and_acc(
+                def logits_for_chunk(i):
+                    start = i * chunk
+                    emb_c = jax.lax.dynamic_slice_in_dim(emb_pad, start, chunk, axis=0)
+                    logits = x_chunk @ emb_c.T
+                    logits = jax.lax.with_sharding_constraint(logits, P('data', None, None))
+                    valid_vocab = (start + chunk_offsets) < vocab
+                    return jnp.where(valid_vocab[None, None, :], logits, neg_inf)
+
+                def max_body(i, cur_max):
+                    return jnp.maximum(cur_max, logits_for_chunk(i).max(axis=-1))
+
+                max_logits = jax.lax.fori_loop(
+                    0, n_chunks, max_body,
+                    jnp.full(labs.shape, neg_inf, dtype=jnp.float32))
+
+                def sum_body(i, carry):
+                    sumexp, target_logit, best_logit, best_id = carry
+                    start = i * chunk
+                    logits = logits_for_chunk(i)
+                    sumexp = sumexp + jnp.exp(logits - max_logits[..., None]).sum(axis=-1)
+                    in_chunk = (labs >= start) & (labs < start + chunk) & vmask
+                    local_idx = jnp.clip(labs - start, 0, chunk - 1)
+                    picked = jnp.take_along_axis(logits, local_idx[..., None], axis=-1).squeeze(-1)
+                    target_logit = jnp.where(in_chunk, picked, target_logit)
+                    local_best_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                    local_best = jnp.take_along_axis(logits, local_best_idx[..., None], axis=-1).squeeze(-1)
+                    better = local_best > best_logit
+                    best_logit = jnp.where(better, local_best, best_logit)
+                    best_id = jnp.where(better, start + local_best_idx, best_id)
+                    return sumexp, target_logit, best_logit, best_id
+
+                init = (jnp.zeros(labs.shape, dtype=jnp.float32),
+                        jnp.full(labs.shape, neg_inf, dtype=jnp.float32),
+                        jnp.full(labs.shape, neg_inf, dtype=jnp.float32),
+                        jnp.zeros(labs.shape, dtype=jnp.int32))
+                sumexp, target_logit, _best_logit, preds = jax.lax.fori_loop(
+                    0, n_chunks, sum_body, init)
+                logsumexp = max_logits + jnp.log(sumexp + 1e-8)
+                per_token_ce = jnp.where(vmask, logsumexp - target_logit, 0.0)
+                valid_count = jnp.sum(vmask)
+                loss = per_token_ce.sum() / (valid_count + 1e-8)
+                correct = jnp.sum((preds == labs) & vmask)
+                return loss, per_token_ce, correct, valid_count
+
+            loss, per_token_ce, correct, valid_count = compute_streaming_loss_and_acc(
                 shift_x, embedding_matrix, shift_labels, valid_mask)
             result['loss'] = loss
             result['correct'] = correct
             result['valid_count'] = valid_count
-            # v4.1 explore: expose per-token CE + valid mask for RPE loss.
             result['per_token_ce'] = per_token_ce
             result['valid_mask'] = valid_mask
+
         else:
             logits = self.token_emb.attend(x)
             if not self.is_initializing():
