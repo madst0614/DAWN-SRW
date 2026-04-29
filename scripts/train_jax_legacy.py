@@ -51,11 +51,18 @@ from typing import Any, Callable, Optional
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental.shard_map import shard_map
 
-# Model registry imports. Legacy DAWN experiments live in models/legacy/;
-# restore and re-register them only when reproducing an old run.
+# Model registry imports. Legacy versions (v2 .. v4.0.6, v3.9.x except
+# v3.9.4, rw-v4.0.2) live in models/legacy/ — restore from there and
+# add a ModelSpec entry if you need to resume an old checkpoint or
+# reproduce a paper result. See models/legacy/README.md.
 from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
+from models.legacy.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
+from models.legacy.dawn_spatial_v41_tau_bias_exp import DAWN as DAWN_V41
+from models.legacy.dawn_spatial_v412_scan_bias_exp import DAWN as DAWN_V412
+from models.legacy.dawn_spatial_v414_competitive_den_exp import DAWN as DAWN_V414
 from models.dawn_spatial_v415_operator_route_sig_exp import DAWN as DAWN_V415
+from models.legacy.dawn_spatial_v4151_operator_route_sig_free_rw_exp import DAWN as DAWN_V4151
 from models.dawn_spatial_v4152_operator_route_free_emb_exp import DAWN as DAWN_V4152
 
 # ============================================================
@@ -128,7 +135,7 @@ def _baseline_kwargs(cfg):
 
 
 def _dawn_shared_kwargs(cfg):
-    """Init kwargs shared by active DAWN variants with the base signature."""
+    """Init kwargs shared by v3.9.4 and v4.1 (identical signature)."""
     m = cfg['model']
     t = cfg['training']
     return dict(
@@ -153,25 +160,76 @@ def _dawn_shared_kwargs(cfg):
 def _dawn_v415_kwargs(cfg):
     kw = _dawn_shared_kwargs(cfg)
     m = cfg['model']
+    version = m.get('model_version', '')
     tag_dim = m.get('tag_dim', 16)
     read_sig_dim = m.get('read_sig_dim', 24)
     write_sig_dim = m.get('write_sig_dim', 24)
+    read_norm_sig_dim = m.get('read_norm_sig_dim', 0)
+    write_norm_sig_dim = m.get('write_norm_sig_dim', 0)
     expected_route = tag_dim + read_sig_dim + write_sig_dim
+    if version == 'spatial-r1-v4.1.5.1':
+        expected_route += read_norm_sig_dim + write_norm_sig_dim
     d_route = m.get('d_route', expected_route)
     if d_route != expected_route:
         raise ValueError(
-            f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
+            f"d_route must equal configured route split, got "
             f"d_route={d_route}, tag_dim={tag_dim}, "
-            f"read_sig_dim={read_sig_dim}, write_sig_dim={write_sig_dim}")
+            f"read_sig_dim={read_sig_dim}, write_sig_dim={write_sig_dim}, "
+            f"read_norm_sig_dim={read_norm_sig_dim}, "
+            f"write_norm_sig_dim={write_norm_sig_dim}")
     kw['d_route'] = d_route
     kw['tag_dim'] = tag_dim
     kw['read_sig_dim'] = read_sig_dim
     kw['write_sig_dim'] = write_sig_dim
+    if version == 'spatial-r1-v4.1.5.1':
+        kw['read_norm_sig_dim'] = read_norm_sig_dim
+        kw['write_norm_sig_dim'] = write_norm_sig_dim
     return kw
 
 
-def _v415_sharded_kwargs(cfg):
-    """Gate constants for the active v4.1.5 sharded SRW path."""
+def _rw_v402_kwargs(cfg):
+    """Init kwargs for rw-v4.0.2 direct-read routing."""
+    m = cfg['model']
+    t = cfg['training']
+    return dict(
+        vocab_size=m.get('vocab_size', 30522),
+        d_model=m.get('d_model', 384),
+        n_layers=m.get('n_layers', 12),
+        n_heads=m.get('n_heads', 6),
+        max_seq_len=m.get('max_seq_len', 512),
+        n_q=m.get('n_q', 790),
+        n_k=m.get('n_k', 790),
+        n_v=m.get('n_v', 2600),
+        n_know=m.get('n_know', 25200),
+        dropout_rate=m.get('dropout', 0.1),
+        gradient_checkpointing=m.get('gradient_checkpointing', False),
+        n_chunks_q=t.get('n_chunks_q', 1),
+        n_chunks_k=t.get('n_chunks_k', 1),
+        n_chunks_v=t.get('n_chunks_v', 1),
+        n_chunks_know=t.get('n_chunks_know', 1),
+    )
+
+
+def _v41_sharded_kwargs(cfg):
+    """v4.1 two-stage gate constants passed as closure to make_sharded_srw.
+
+    Defaults mirror the pre-refactor values (scripts/train_jax.py line
+    1970-1986 before commit bfcc2b9). Any change here shifts training
+    dynamics — keep in sync with model code.
+    """
+    t = cfg['training']
+    return dict(
+        dead_threshold=t.get('dead_penalty_threshold', 0.01),
+        sharpness=t.get('sharpness', 500.0),
+        activation_threshold=t.get('activation_threshold', 0.5),
+        activation_cutoff=t.get('activation_cutoff', 0.01),
+        epsilon=t.get('epsilon', 1e-4),
+        max_intensity=t.get('max_intensity', 10.0),
+    )
+
+
+def _v412_sharded_kwargs(cfg):
+    """v4.1.2 adds bounded scan_bias to the v4.1 gate constants."""
     t = cfg['training']
     return dict(
         dead_threshold=t.get('dead_penalty_threshold', 0.01),
@@ -183,6 +241,14 @@ def _v415_sharded_kwargs(cfg):
         scan_scale=t.get('scan_scale', 0.01),
         scan_std_floor=t.get('scan_std_floor', 0.5),
     )
+
+
+def _v4151_sharded_kwargs(cfg):
+    kw = _v412_sharded_kwargs(cfg)
+    m = cfg['model']
+    kw['read_norm_sig_dim'] = m.get('read_norm_sig_dim', 1)
+    kw['write_norm_sig_dim'] = m.get('write_norm_sig_dim', 1)
+    return kw
 
 
 MODEL_REGISTRY = {
@@ -199,6 +265,40 @@ MODEL_REGISTRY = {
         build_kwargs=_dawn_shared_kwargs,
         supports_sharded=True,
     ),
+    'rw-v4.0.2': ModelSpec(
+        name='rw-v4.0.2',
+        module_path='models.legacy.dawn_spatial_v402_exp',
+        cls=DAWN_RW_V402,
+        build_kwargs=_rw_v402_kwargs,
+        supports_sharded=True,
+    ),
+    'spatial-r1-v4.1': ModelSpec(
+        name='spatial-r1-v4.1',
+        module_path='models.legacy.dawn_spatial_v41_tau_bias_exp',
+        cls=DAWN_V41,
+        build_kwargs=_dawn_shared_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v41_sharded_kwargs,
+    ),
+    'spatial-r1-v4.1.2': ModelSpec(
+        name='spatial-r1-v4.1.2',
+        module_path='models.legacy.dawn_spatial_v412_scan_bias_exp',
+        cls=DAWN_V412,
+        build_kwargs=_dawn_shared_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v412_sharded_kwargs,
+    ),
+    'spatial-r1-v4.1.4': ModelSpec(
+        name='spatial-r1-v4.1.4',
+        module_path='models.legacy.dawn_spatial_v414_competitive_den_exp',
+        cls=DAWN_V414,
+        build_kwargs=_dawn_shared_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v412_sharded_kwargs,
+    ),
     'spatial-r1-v4.1.5': ModelSpec(
         name='spatial-r1-v4.1.5',
         module_path='models.dawn_spatial_v415_operator_route_sig_exp',
@@ -206,7 +306,16 @@ MODEL_REGISTRY = {
         build_kwargs=_dawn_v415_kwargs,
         supports_sharded=True,
         force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
+        sharded_kwargs=_v412_sharded_kwargs,
+    ),
+    'spatial-r1-v4.1.5.1': ModelSpec(
+        name='spatial-r1-v4.1.5.1',
+        module_path='models.legacy.dawn_spatial_v4151_operator_route_sig_free_rw_exp',
+        cls=DAWN_V4151,
+        build_kwargs=_dawn_v415_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v4151_sharded_kwargs,
     ),
     'spatial-r1-v4.1.5.2': ModelSpec(
         name='spatial-r1-v4.1.5.2',
@@ -215,7 +324,7 @@ MODEL_REGISTRY = {
         build_kwargs=_dawn_v415_kwargs,
         supports_sharded=True,
         force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
+        sharded_kwargs=_v412_sharded_kwargs,
     ),
 }
 
@@ -223,27 +332,29 @@ MODEL_REGISTRY = {
 def build_model_from_config(cfg):
     """Build model from config via MODEL_REGISTRY.
 
-    Unknown versions raise ValueError with restoration instructions:
+    Unknown versions raise ValueError with restoration instructions —
     legacy versions live in models/legacy/ and can be re-registered in
     MODEL_REGISTRY when resuming old checkpoints or reproducing paper
     results. See models/legacy/README.md.
     """
-    version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5')
+    version = cfg['model'].get('model_version', 'spatial-r1-v4.1')
     if version not in MODEL_REGISTRY:
         raise ValueError(
             f"Unknown model_version: {version!r}. "
             f"Known: {sorted(MODEL_REGISTRY.keys())}. "
-            f"Legacy versions live in models/legacy/; to resume an old "
+            f"Legacy versions live in models/legacy/ — to resume an old "
             f"checkpoint, move the model file back to models/ and add a "
             f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
-    if version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+    if version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.1', 'spatial-r1-v4.1.5.2'):
         print(
             "operator route signature: "
             f"tag_dim={kwargs['tag_dim']}, "
             f"read_sig_dim={kwargs['read_sig_dim']}, "
             f"write_sig_dim={kwargs['write_sig_dim']}, "
+            f"read_norm_sig_dim={kwargs.get('read_norm_sig_dim', 0)}, "
+            f"write_norm_sig_dim={kwargs.get('write_norm_sig_dim', 0)}, "
             f"d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
@@ -527,7 +638,7 @@ def _model_accepts_analysis(model):
     """Return True if model.__call__ accepts an `analysis` kwarg.
 
     v4.1+ accepts it (routes the full-stats forward); older versions
-    don't -passing it there raises, so we must gate it.
+    don't — passing it there raises, so we must gate it.
     """
     import inspect as _inspect
     try:
@@ -551,16 +662,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     v4.1 explore (redesigned): no EMA, no warmup. For every step compute
     a batch-global per-token CE mean, define
         deviation = per_token_ce - sg(global_mean_ce)
-        signal    = where(deviation > 0, deviation, asymmetry 쨌 deviation)
+        signal    = where(deviation > 0, deviation, asymmetry · deviation)
     and add
-        explore_loss = 貫 쨌 valid_weighted_mean(signal 쨌 誇 tau_offset)
+        explore_loss = λ · valid_weighted_mean(signal · Σ tau_offset)
     to total_loss.  Positive deviations (surprising tokens) push
     tau_offset DOWN at full strength; negative deviations (easy tokens)
     push UP at `exploration_asymmetry` of the strength.  The global mean
     baseline makes the net push roughly zero-sum each batch, so tau does
     not accumulate monotonically.
 
-    `mesh` is required when the v4.1 exploration loss is active -the
+    `mesh` is required when the v4.1 exploration loss is active — the
     per-batch global mean is computed via a small shard_map.
     """
     # Shard_map'd valid-weighted global-mean reducer.  Inputs are sharded
@@ -630,7 +741,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # Signed deviation; gradient only flows through tau_offset.
                 deviation = jax.lax.stop_gradient(
                     per_token_ce - global_mean_ce)                   # [B, S-1]
-                # Asymmetric: full push on hard tokens, `asym`쨌push on easy ones.
+                # Asymmetric: full push on hard tokens, `asym`·push on easy ones.
                 signal = jnp.where(deviation > 0, deviation, _asym * deviation)
 
                 # v4.1+ per-token/layer/route bounded explore. tau_offset is
@@ -668,7 +779,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 know_tau_off_p01 = jnp.quantile(_k_tau_flat, 0.01)
                 know_tau_off_neg_frac = (_k_tau_flat < 0).astype(jnp.float32).mean()
 
-                # Per-element contribution -reduce. Gradient flows through
+                # Per-element contribution → reduce. Gradient flows through
                 # the tau_offset tensor only (signal is stop_gradient'd).
                 vsum_eps = vmask_f.sum() + 1e-8
                 a_contrib = sig_b * a_tau_t * a_active * vmask_b
@@ -687,7 +798,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     neg_mask.sum() + 1e-8)
 
                 # Off fractions replace pool-mean block fractions. Denominator
-                # is total (layer 횞 batch 횞 valid-time 횞 route) slots.
+                # is total (layer × batch × valid-time × route) slots.
                 _a_tot = vmask_b.sum() * a_tau_t.shape[0] * a_tau_t.shape[-1]
                 _k_tot = vmask_b.sum() * k_tau_t.shape[0] * k_tau_t.shape[-1]
                 block_frac_a = jax.lax.stop_gradient(
@@ -776,7 +887,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
         # XLA SPMD handles gradient all-reduce automatically
-        # (loss computed on sharded data -gradients consistent across shards)
+        # (loss computed on sharded data → gradients consistent across shards)
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
@@ -826,8 +937,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             _cur_v = _pool['v_emb']
             _cur_know = _pool['know_emb']
         else:
-            # Some archived pool variants expose read tensors instead of emb
-            # tensors; keep the diagnostic slots comparable when resuming them.
+            # rw-v4.0.2 has no emb tensors; read directions are the routing
+            # basis, so use them for the same drift diagnostic slots.
             _cur_qk = _pool['q_read']
             _cur_v = _pool['v_read']
             _cur_know = _pool['know_read']
@@ -841,7 +952,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         drift_know_emb = (jnp.linalg.norm(_cur_know - _prev_know)
                           / (jnp.linalg.norm(_prev_know) + 1e-8))
 
-        # Tau / scan biases (read inside jit -safe, no cross-device issue)
+        # Tau / scan biases (read inside jit — safe, no cross-device issue)
         tau_know_b = params.get('router', {}).get('tau_know', {}).get(
             'bias', jnp.zeros(1))
         tau_attn_b = params.get('router', {}).get('tau_attn', {}).get(
@@ -994,7 +1105,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_read_sig_norm_std': result.get('know_read_sig_norm_std', jnp.float32(0.0)),
             'know_write_sig_norm_mean': result.get('know_write_sig_norm_mean', jnp.float32(0.0)),
             'know_write_sig_norm_std': result.get('know_write_sig_norm_std', jnp.float32(0.0)),
-            # Emb drift (relative L2) since prev snapshot -see top of fn.
+            # Emb drift (relative L2) since prev snapshot — see top of fn.
             'drift_qk_emb': drift_qk_emb,
             'drift_v_emb': drift_v_emb,
             'drift_know_emb': drift_know_emb,
@@ -1008,7 +1119,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 def create_eval_step(model, sharded_fns=None):
     """Create a jit-compiled evaluation step.
 
-    Uses the SLIM forward (analysis=False) -eval only needs loss /
+    Uses the SLIM forward (analysis=False) — eval only needs loss /
     correct / valid_count.
     """
     _pass_analysis_kw = _model_accepts_analysis(model)
@@ -1135,7 +1246,7 @@ def shard_to_mesh(data, sharding, global_shape):
     Uses make_array_from_callback which correctly maps mesh indices
     to data slices, regardless of how devices map to hosts.
 
-    data: [per_host_batch, ...] -this host's data portion
+    data: [per_host_batch, ...] — this host's data portion
     sharding: NamedSharding
     global_shape: (global_batch, ...)
     """
@@ -1153,7 +1264,7 @@ def shard_to_mesh(data, sharding, global_shape):
         local_stop = stop - host_id * per_host
         if 0 <= local_start < per_host:
             return np.array(data[local_start:local_stop])
-        # Previously returned silent zeros -that corrupts training with
+        # Previously returned silent zeros — that corrupts training with
         # a zero-batch whenever the mesh's host locality doesn't match
         # the data partition. Fail loud instead so the misconfiguration
         # is caught at setup rather than showing up as mysterious loss.
@@ -1171,7 +1282,7 @@ def shard_to_mesh(data, sharding, global_shape):
 # ============================================================
 
 def shard_batch(batch, n_devices):
-    """Reshape a batch for pmap: (B, ...) -> (n_devices, B//n_devices, ...).
+    """Reshape a batch for legacy compatibility: (B, ...) -> (n_devices, B//n_devices, ...).
 
     If the batch is already sharded (leading dim == n_devices), return as-is.
     """
@@ -1191,8 +1302,8 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
     """Run evaluation and return avg loss and accuracy.
 
     All hosts must call this (pmap requires it), but only verbose=True host prints.
-    Accumulates on device -one TPU-to-CPU sync at the end instead of three
-    per batch -so eval stays fast on 1B-scale runs.
+    Accumulates on device — one TPU→CPU sync at the end instead of three
+    per batch — so eval stays fast on 1B-scale runs.
     """
     total_loss_jax = jnp.float32(0.0)
     total_correct_jax = jnp.int32(0)
@@ -1301,6 +1412,236 @@ def load_checkpoint(path, target_params, target_opt_state):
     return ckpt
 
 
+def _make_legacy_opt_state_template(params, schedule, weight_decay,
+                                    grad_accum_steps=1):
+    """Rebuild the pre-1d7a437 optimizer's opt_state shape.
+
+    Old chain was `chain(clip_by_global_norm, adamw(..., mask=fn))`
+    where `fn` was only passed when the model had learnable
+    `qk_scale` / `know_scale` (v3.9.7.1+). For older checkpoints
+    (v3.9.4, v3.9.5, etc.) no mask was passed. The wrapper shape
+    differs:
+      with mask: adamw_state[1] = MaskedState(inner_state=EmptyState())
+      no mask:   adamw_state[1] = EmptyState()
+    We replicate the old `_has_scale` check on the live params so the
+    template matches whichever code path saved the checkpoint.
+
+    New chain (per-group WD) always masks both add_decayed_weights
+    calls; the migration fills the pool slot from the freshly-init
+    new template so its MaskedState wrapper is correct regardless.
+
+    If `grad_accum_steps > 1` the optimizer is wrapped in MultiSteps —
+    do the same wrap so the deserialize template lines up with what
+    was saved.
+    """
+    # Replicate the pre-1d7a437 `_has_scale` check on the live params.
+    # v3.9.4 NeuronPool uses fixed sqrt(D) locals (no learnable
+    # qk_scale / know_scale params) → _has_scale=False → mask=None →
+    # adamw_state[1] = bare EmptyState.
+    # v3.9.7.1+ NeuronPool declares qk_scale / v_scale / know_scale as
+    # learnable params → _has_scale=True → mask=fn → adamw_state[1] =
+    # MaskedState(inner_state=EmptyState()).
+    # Use try/except instead of isinstance(params, dict) because Flax
+    # may return a FrozenDict that doesn't subclass dict.
+    try:
+        _pool = params['neuron_pool']
+        _has_scale = 'qk_scale' in _pool or 'know_scale' in _pool
+    except (KeyError, TypeError):
+        _has_scale = False
+    _legacy_mask = None
+    if _has_scale:
+        # Match the exact _wd_mask body from the old train_jax.py at the
+        # time of checkpoint save: exclude bias, LayerNorm scale, and
+        # learnable output_scale; decay everything else.
+        def _legacy_mask_fn(p):
+            def _should_decay(path, _):
+                path_str = '/'.join(str(x) for x in path)
+                if 'bias' in path_str:
+                    return False
+                if 'scale' in path_str and 'norm' in path_str.lower():
+                    return False  # LayerNorm scale
+                if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
+                   or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
+                    return False  # learnable output_scale
+                return True
+            return jax.tree.map_with_path(_should_decay, p)
+        _legacy_mask = _legacy_mask_fn
+
+    old_optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(
+            learning_rate=schedule,
+            weight_decay=weight_decay,
+            b2=0.95,
+            mask=_legacy_mask,
+        ),
+    )
+    if grad_accum_steps > 1:
+        old_optimizer = optax.MultiSteps(
+            old_optimizer, every_k_schedule=grad_accum_steps)
+    return old_optimizer.init(params)
+
+
+def _strip_sig_freeze_slots_from_opt_state(new_opt_state_template):
+    """Build a 5-slot opt_state template from the current 7-slot optimizer.
+
+    v4.1.5 added fixed signature projection guards:
+      current: (freeze_pre, clip, adam, base_wd, pool_wd, lr, freeze_post)
+      old per-group: (clip, adam, base_wd, pool_wd, lr)
+
+    This helper makes a deserialize target for checkpoints saved before
+    those guards were added, while preserving MultiSteps wrapping.
+    """
+    _MS = getattr(optax, 'MultiStepsState', None)
+    if _MS is not None and isinstance(new_opt_state_template, _MS):
+        inner = _strip_sig_freeze_slots_from_opt_state(
+            new_opt_state_template.inner_opt_state)
+        return new_opt_state_template._replace(inner_opt_state=inner)
+    if len(new_opt_state_template) != 7:
+        raise ValueError(
+            f"Current opt_state template should be a 7-tuple, "
+            f"got len={len(new_opt_state_template)}.")
+    return (
+        new_opt_state_template[1],
+        new_opt_state_template[2],
+        new_opt_state_template[3],
+        new_opt_state_template[4],
+        new_opt_state_template[5],
+    )
+
+
+def _convert_5tuple_opt_state(old_opt_state, new_opt_state_template):
+    """Convert pre-freeze-mask 5-tuple opt_state to current 7-tuple format."""
+    _MS = getattr(optax, 'MultiStepsState', None)
+    if _MS is not None and isinstance(old_opt_state, _MS) \
+            and isinstance(new_opt_state_template, _MS):
+        new_inner = _convert_5tuple_opt_state(
+            old_opt_state.inner_opt_state,
+            new_opt_state_template.inner_opt_state)
+        return old_opt_state._replace(inner_opt_state=new_inner)
+    if len(old_opt_state) != 5:
+        raise ValueError(
+            f"Old per-group opt_state should be a 5-tuple, got len={len(old_opt_state)}.")
+    if len(new_opt_state_template) != 7:
+        raise ValueError(
+            f"Current opt_state template should be a 7-tuple, "
+            f"got len={len(new_opt_state_template)}.")
+    return (
+        new_opt_state_template[0],  # new freeze_sig_proj pre-slot
+        old_opt_state[0],           # clip
+        old_opt_state[1],           # adam moments
+        old_opt_state[2],           # base WD stateless slot
+        old_opt_state[3],           # pool WD stateless slot
+        old_opt_state[4],           # LR schedule counter
+        new_opt_state_template[6],  # new freeze_sig_proj post-slot
+    )
+
+
+def _convert_legacy_opt_state(old_opt_state, new_opt_state_template):
+    """Convert pre-1d7a437 2-tuple opt_state to the current optimizer format.
+
+    OLD: (clip_state, adamw_state)
+         where adamw_state = (scale_by_adam_state,
+                              add_decayed_weights_state,   # EmptyState or
+                                                           # MaskedState(EmptyState)
+                                                           # depending on whether
+                                                           # old code passed a mask
+                              scale_by_lr_state)
+    NEW since v4.1.5:
+         (freeze_sig_proj_pre,
+          clip_state,
+          scale_by_adam_state,
+          MaskedState(EmptyState()),   # base-WD slot (always masked)
+          MaskedState(EmptyState()),   # pool-WD slot (always masked, new)
+          scale_by_lr_state,
+          freeze_sig_proj_post)
+
+    Adam moments + the LR-schedule counter survive the migration. Both
+    WD slots are stateless (EmptyState wrapped or not — no numerical
+    content), so they're taken from the freshly-init new template.
+    This keeps the wrapper shape consistent regardless of whether the
+    old checkpoint had a mask (v3.9.7.1+) or not (v3.9.4 and earlier).
+
+    Handles MultiSteps wrapping transparently: if both inputs are
+    MultiStepsState, recurse into `inner_opt_state` and rewrap.
+    """
+    # MultiSteps wrap: peel off the wrapper, recurse, rewrap.
+    _MS = getattr(optax, 'MultiStepsState', None)
+    if _MS is not None and isinstance(old_opt_state, _MS) \
+            and isinstance(new_opt_state_template, _MS):
+        new_inner = _convert_legacy_opt_state(
+            old_opt_state.inner_opt_state,
+            new_opt_state_template.inner_opt_state)
+        return old_opt_state._replace(inner_opt_state=new_inner)
+    if len(old_opt_state) != 2:
+        raise ValueError(
+            f"Legacy opt_state should be a 2-tuple, got len={len(old_opt_state)}.")
+    if len(new_opt_state_template) not in (5, 7):
+        raise ValueError(
+            f"New opt_state template should be a 5- or 7-tuple, "
+            f"got len={len(new_opt_state_template)}.")
+    clip_state = old_opt_state[0]
+    adamw_state = old_opt_state[1]
+    if len(adamw_state) != 3:
+        raise ValueError(
+            f"Legacy adamw inner state should be a 3-tuple "
+            f"(scale_by_adam, add_decayed_weights, scale_by_lr), "
+            f"got len={len(adamw_state)}.")
+    scale_by_adam_state, _old_base_decayed, scale_by_lr_state = adamw_state
+    # Both WD slots: take from the new template so the MaskedState
+    # wrapper matches regardless of the old mask/no-mask path.
+    if len(new_opt_state_template) == 5:
+        base_decayed_state = new_opt_state_template[2]
+        pool_decayed_state = new_opt_state_template[3]
+        return (
+            clip_state,
+            scale_by_adam_state,
+            base_decayed_state,
+            pool_decayed_state,
+            scale_by_lr_state,
+        )
+    base_decayed_state = new_opt_state_template[3]
+    pool_decayed_state = new_opt_state_template[4]
+    return (
+        new_opt_state_template[0],
+        clip_state,
+        scale_by_adam_state,
+        base_decayed_state,
+        pool_decayed_state,
+        scale_by_lr_state,
+        new_opt_state_template[6],
+    )
+
+
+def _optimizer_resume_lineage(model_version):
+    """Return the opt_state lineage expected for a checkpoint version.
+
+    The live optimizer may have more slots than an older checkpoint
+    because optimizer-only transforms were added over time. We branch by
+    checkpoint/model version instead of guessing every mismatch is the
+    pre-1d7a437 2-tuple.
+    """
+    per_group_5 = {
+        'spatial-r1-v4.1',
+        'spatial-r1-v4.1.2',
+        'spatial-r1-v4.1.4',
+    }
+    if model_version in per_group_5:
+        return 'per_group_5'
+    if model_version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.1', 'spatial-r1-v4.1.5.2'):
+        # New checkpoints are 7-slot. Early local v4.1.5 experiments before
+        # fixed-sig freeze guards may still be 5-slot; direct load is tried
+        # before this lineage is used as fallback.
+        return 'current_or_per_group_5'
+    return 'legacy_2'
+
+
+def _infer_checkpoint_version_from_path(path, fallback):
+    """Infer model_version from run_v... folder names, with config fallback."""
+    m = re.search(r'run_v(.+?)_\d{8}_\d{6}_\d+', str(path))
+    return m.group(1) if m else fallback
+
+
 # ============================================================
 # Logging
 # ============================================================
@@ -1308,7 +1649,7 @@ def load_checkpoint(path, target_params, target_opt_state):
 class GCSLogger:
     """Logger that writes to a local file and syncs to GCS on sync().
 
-    GCS doesn't support true append -each open('a')/write/close overwrites.
+    GCS doesn't support true append — each open('a')/write/close overwrites.
     So we always append to a local file and upload the full file to GCS
     on every sync() call. Callers decide the sync cadence (training
     loop syncs once per FAST log boundary); the logger itself doesn't
@@ -1361,7 +1702,7 @@ class GCSLogger:
                 print(f"  [warn] GCS sync failed: {e}", flush=True)
 
 
-# Module-level loggers -set up in main()
+# Module-level loggers — set up in main()
 _train_logger = None
 _jsonl_logger = None
 
@@ -1452,24 +1793,26 @@ def check_nan_inf(metrics_dict, global_step, epoch):
 # ============================================================
 #
 # REGULAR  every log_interval steps                        (default 100)
-# ANALYSIS every log_interval * log_analysis_multiplier steps
+# ANALYSIS every val_interval    (fires alongside mid-epoch val)
 #
-# v4.1: ANALYSIS is not emitted on every REGULAR tick. The distribution /
-# boundary / saturation stats require a separate forward with the full-stats
-# shard_map kernels (analysis_step), so the multiplier controls that cost.
+# v4.1: ANALYSIS is no longer scheduled from the REGULAR path. The
+# distribution / boundary / saturation stats require a separate forward
+# with the full-stats shard_map kernels (analysis_step), so running
+# them every log_interval was a pure HBM waste. They now fire on the
+# val tick, sharing the same cadence as mid-epoch validation.
 #
 # REGULAR carries the training-dynamics block (loss, activity, tau
-# structure, emb norms, RPE, per-layer). ANALYSIS (`type='train_analysis'`)
-# adds distribution-shape / boundary /
+# structure, emb norms, RPE, per-layer). ANALYSIS (emitted from the val
+# path, `type='train_analysis'`) adds distribution-shape / boundary /
 # saturation / debug diagnostics.
 #
-# _build_analysis_record accepts `base={}` on the new path -the
+# _build_analysis_record accepts `base={}` on the new path — the
 # `base`/`metrics` split is preserved for back-compat but the ANALYSIS
 # record is now standalone.
 
 
 def _fmt_act_count(frac, total):
-    """Format 'XX.X%(N)' -active fraction with the implied count."""
+    """Format 'XX.X%(N)' — active fraction with the implied count."""
     return f"{frac * 100:.1f}%({int(round(frac * total))})"
 
 
@@ -1480,7 +1823,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     old train_fast / train_deep JSONL types should switch to type='train'.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.1', 'spatial-r1-v4.1.5.2')
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -1644,7 +1987,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
 
 
 def _print_regular_block(rec, ctx):
-    """Print REGULAR tier -~8 lines covering the live training dynamics."""
+    """Print REGULAR tier — ~8 lines covering the live training dynamics."""
     log_message(
         f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
         f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} | "
@@ -1659,6 +2002,44 @@ def _print_regular_block(rec, ctx):
         f" v={rec['attn_v_strong']*100:.1f}%"
         f" k={rec['know_strong']*100:.1f}%"
     )
+    if ctx.get('model_version') == 'rw-v4.0.2':
+        log_message(
+            f"  gate: max[a={rec['attn_raw_gate_max']:.2f} k={rec['know_raw_gate_max']:.2f}]"
+            f" gsum[a={rec['attn_gate_sum']:.1f} k={rec['know_gate_sum']:.1f}]"
+            f" active_n[a={rec['attn_active_n_mean']:.0f} k={rec['know_active_n_mean']:.0f}]"
+            f" z_act[qk={rec['attn_qk_z_mean_active']:.2f}"
+            f" v={rec['attn_v_z_mean_active']:.2f}"
+            f" k={rec['know_z_mean_active']:.2f}]"
+        )
+        log_message(
+            f"  tau: know_b={rec['tau_know_bias']:+.2f}"
+            f" qkv_b=[{rec['tau_q_bias']:+.2f} {rec['tau_k_bias']:+.2f} {rec['tau_v_bias']:+.2f}]"
+            f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
+            f" score_mean[a={rec['attn_score_mean']:+.3f} k={rec['know_score_mean']:+.3f}]"
+            f" score_std[a={rec['attn_score_std']:.2f} k={rec['know_score_std']:.2f}]"
+        )
+        log_message(
+            f"  norm: raw[qk={rec['attn_qk_raw_norm']:.3f}"
+            f" v={rec['attn_v_raw_norm']:.3f}"
+            f" k={rec['know_raw_out_norm']:.3f}]"
+            f" out[a={rec['attn_out_norm']:.2f} k={rec['know_out_norm']:.2f}]"
+            f" read/write k[{rec['know_read_norm']:.2f}/{rec['know_write_norm']:.2f}]"
+            f" drift[q={rec['drift_qk_emb']:.2e}"
+            f" v={rec['drift_v_emb']:.2e}"
+            f" k={rec['drift_know_emb']:.2e}]"
+        )
+        _pl_a = rec.get('per_layer_attn_out_norm', []) or []
+        _pl_k = rec.get('per_layer_know_out_norm', []) or []
+        if _pl_a or _pl_k:
+            log_message(
+                f"  per_layer out: attn=[{' '.join(f'{v:.2f}' for v in _pl_a)}]"
+                f" know=[{' '.join(f'{v:.2f}' for v in _pl_k)}]"
+            )
+        log_message(
+            f"  time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
+            f" {ctx['s_per_it']:.2f}s/it"
+        )
+        return
     log_message(
         f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
         f" k={rec['know_raw_gate_max']:.1f}]"
@@ -1668,7 +2049,13 @@ def _print_regular_block(rec, ctx):
         f" v={rec['drift_v_emb']:.2e}"
         f" k={rec['drift_know_emb']:.2e}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+    if ctx.get('model_version') == 'spatial-r1-v4.1.4':
+        log_message(
+            f"  den_cost mean[a={rec['attn_den_cost_mean']:.1f} k={rec['know_den_cost_mean']:.1f}]"
+            f" act[a={rec['attn_act_cost_mean']:.1f} k={rec['know_act_cost_mean']:.1f}]"
+            f" current[a={rec['attn_current_cost_mean']:.1f} k={rec['know_current_cost_mean']:.1f}]"
+        )
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.1', 'spatial-r1-v4.1.5.2'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" k={rec['know_gate_den_sum_mean']:.1f}]"
@@ -1687,7 +2074,7 @@ def _print_regular_block(rec, ctx):
         f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
         f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4', 'spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.1', 'spatial-r1-v4.1.5.2'):
         log_message(
             f"  scan_bias: know={rec['scan_know_bias']:+.3f}"
             f" attn=[{rec['scan_attn_bias_0']:+.3f} {rec['scan_attn_bias_1']:+.3f} {rec['scan_attn_bias_2']:+.3f}]"
@@ -1737,15 +2124,15 @@ def _build_analysis_record(base, metrics, ctx):
 
     In v4.1 this is fed by analysis_step (a separate full-stats forward
     run at val ticks), not by train_step. `base` is an empty dict on the
-    new path -kept for back-compat. All ANALYSIS fields come from
+    new path — kept for back-compat. All ANALYSIS fields come from
     `metrics`, which is the dict returned by analysis_step. Needs
     `attn_out_norm` / `know_out_norm` for the raw_n print line, so
     those are pulled from analysis_result too.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.1', 'spatial-r1-v4.1.5.2')
     rec = dict(base)
-    # tau per-route std (attn [3]) -materialise once.
+    # tau per-route std (attn [3]) — materialise once.
     try:
         a_tau_s = np.asarray(jax.device_get(m.get('attn_tau_std', jnp.zeros(3))))
         if a_tau_s.size < 3:
@@ -1848,7 +2235,16 @@ def _print_analysis_block(rec, ctx):
         f" qk={rec['qk_emb_norm_max']:.2f}"
         f" v={rec['v_emb_norm_max']:.2f}"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+    if ctx.get('model_version') == 'spatial-r1-v4.1.4':
+        log_message(
+            f"  den_cost: a={rec['attn_den_cost']:.1f}"
+            f" k={rec['know_den_cost']:.1f}"
+            f" | activation a={rec['attn_activation_cost']:.1f}"
+            f" k={rec['know_activation_cost']:.1f}"
+            f" | current a={rec['attn_current_cost']:.1f}"
+            f" k={rec['know_current_cost']:.1f}"
+        )
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.1', 'spatial-r1-v4.1.5.2'):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" k={rec['know_gate_den_sum']:.1f}"
@@ -1928,7 +2324,7 @@ def main():
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
     weight_decay = tcfg.get('weight_decay', 0.1)
-    # v4.1 free-norm: pool params (qk/v/know 횞 emb/read/write, 9 tensors)
+    # v4.1 free-norm: pool params (qk/v/know × emb/read/write, 9 tensors)
     # get a lower WD than dense kernels. Bias / LayerNorm / *_scale
     # excluded from both groups.
     pool_weight_decay = tcfg.get('pool_weight_decay', 0.02)
@@ -1971,7 +2367,7 @@ def main():
         """List run_* subdirectories under base (local or GCS).
 
         FileNotFoundError on GCS is treated as "no prior runs yet" to
-        match the local-path behavior (Path.exists() check below) -
+        match the local-path behavior (Path.exists() check below) —
         first training on a fresh checkpoint_dir shouldn't fail. Every
         other exception still propagates so credential / permission
         failures can't masquerade as "nothing to resume".
@@ -2024,7 +2420,7 @@ def main():
         else:
             gathered = np.asarray(process_allgather(buf))
             # Shape can be (n_hosts, max_len) or flat (n_hosts * max_len,)
-            # depending on JAX version -pick host 0's slice either way.
+            # depending on JAX version — pick host 0's slice either way.
             if gathered.ndim == 1:
                 broadcast_buf = gathered[:max_len]
             else:
@@ -2038,7 +2434,7 @@ def main():
     # Only host 0 lists GCS; the resulting (resume_path, checkpoint_dir)
     # is broadcast to all hosts. Independent per-host listing can diverge
     # under gcsfs caching, concurrent cleanup, or preemption-timing
-    # races -a split resume mis-syncs global_step across the mesh and
+    # races — a split resume mis-syncs global_step across the mesh and
     # later halts collectives inside train_step.
     if not cli_args.from_scratch:
         _host0_resume_path = None
@@ -2068,7 +2464,7 @@ def main():
                         print(f"  Resuming from: {_host0_resume_path}")
                         break
 
-        # Collective broadcast -all hosts must call.
+        # Collective broadcast — all hosts must call.
         resume_path = _broadcast_str_from_host0(_host0_resume_path)
         checkpoint_dir = _broadcast_str_from_host0(_host0_checkpoint_dir)
         # Broadcast the explicit-missing signal as a single-byte string
@@ -2086,7 +2482,7 @@ def main():
         kst = timezone(timedelta(hours=9))
         ts = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
         rand_suffix = _random.randint(1000, 9999)
-        version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5')
+        version = cfg['model'].get('model_version', 'spatial-r1-v4.1')
         run_name = f"run_v{version}_{ts}_{rand_suffix}"
         checkpoint_dir = _join(base_checkpoint_dir, run_name)
         _makedirs(checkpoint_dir)
@@ -2147,8 +2543,11 @@ def main():
                 'exploration_upper_bound', exploration_upper_bound)
             exploration_bound_eps = saved_training_config.get(
                 'exploration_bound_eps', exploration_bound_eps)
+            # Accept legacy log_interval_fast key so ckpts saved before the
+            # 2-tier rename still resume without manual config fiddling.
             log_interval = int(saved_training_config.get(
-                'log_interval', log_interval))
+                'log_interval',
+                saved_training_config.get('log_interval_fast', log_interval)))
             log_analysis_multiplier = int(saved_training_config.get(
                 'log_analysis_multiplier', log_analysis_multiplier))
             if jax.process_index() == 0:
@@ -2233,7 +2632,7 @@ def main():
         cfg['data'],
         max_length=max_seq_len,
         batch_size=batch_size,
-        n_devices=1,  # flat (per_host_batch, seq_len) -shard_to_mesh handles splitting
+        n_devices=1,  # flat (per_host_batch, seq_len) — shard_to_mesh handles splitting
         n_hosts=n_hosts,
         host_id=host_id,
     )
@@ -2291,16 +2690,16 @@ def main():
         end_value=lr * 0.1,
     )
 
-    # v4.1 per-group WD: pool tensors (qk/v/know 횞 emb/read/write) get
+    # v4.1 per-group WD: pool tensors (qk/v/know × emb/read/write) get
     # pool_weight_decay; dense kernels get weight_decay. Bias / LayerNorm /
     # learnable *_scale excluded from both groups.
     #
     # optax.adamw is chain(scale_by_adam, add_decayed_weights, scale_by_lr).
     # To apply two different WDs we decompose it: one scale_by_adam, then
-    # two masked add_decayed_weights (base + pool -masks are disjoint so
+    # two masked add_decayed_weights (base + pool — masks are disjoint so
     # each param is touched at most once), then a single scale_by_lr.
 
-    _MODEL_VERSION = cfg['model'].get('model_version', 'spatial-r1-v4.1.5')
+    _MODEL_VERSION = cfg['model'].get('model_version', 'spatial-r1-v4.1')
 
     _POOL_PARAM_NAMES = (
         'qk_emb', 'v_emb', 'know_emb',
@@ -2340,7 +2739,7 @@ def main():
         if _is_sig_proj_param(path_str):
             return True  # v4.1.5 fixed read/write signature projections
         if _MODEL_VERSION in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2') and _is_rw_param(path_str):
-            return True  # v4.1.5 variants forward-normalize read/write directions
+            return True  # v4.1.5 unit-RW variants forward-normalize read/write directions
         return False
 
     def _freeze_mask_sig_proj(params):
@@ -2442,7 +2841,9 @@ def main():
               f"eps={exploration_bound_eps}")
         print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
               f"router={cfg['model'].get('router_dropout', 0.0)}")
-        # Active v4.1.5 gate closure constants.
+        # v4.1+ gate closure constants (used when model_version registers
+        # _v41_sharded_kwargs; harmless to print otherwise — they're just
+        # cfg lookups with defaults).
         gate_msg = (
             f"  Gate (v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
             f"act_thr={tcfg.get('activation_threshold', 0.5)} "
@@ -2450,7 +2851,7 @@ def main():
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
-        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4', 'spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.1', 'spatial-r1-v4.1.5.2'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -2465,12 +2866,80 @@ def main():
     start_step_in_epoch = 0
     best_val_loss = float('inf')
 
+    def _strip_legacy_process_axis(ckpt_pytree, template_pytree):
+        """Legacy-compat for ckpts saved before _gather_for_save used
+        tiled=True. process_allgather(tiled=False) prepended a
+        (n_processes,) axis to every leaf (all slices equal for both
+        replicated and sharded-then-gathered arrays). Here we detect
+        the extra leading axis and take [0]. No-op on correctly-shaped
+        leaves."""
+        def _fix(ckpt_leaf, template_leaf):
+            arr = np.asarray(ckpt_leaf)
+            if arr.ndim == template_leaf.ndim + 1:
+                return arr[0]
+            return arr
+        return jax.tree.map(_fix, ckpt_pytree, template_pytree)
+
     if resume_path and _file_exists(resume_path):
         if is_host0:
             print(f"\nResuming from: {resume_path}")
-        ckpt = load_checkpoint(resume_path, params, opt_state)
-        params = ckpt['params']
-        opt_state = ckpt['opt_state']
+        try:
+            ckpt = load_checkpoint(resume_path, params, opt_state)
+        except ValueError as e:
+            _msg = str(e)
+            _is_opt_state_size_mismatch = (
+                'opt_state' in _msg
+                and 'do not match' in _msg
+            )
+            if not _is_opt_state_size_mismatch:
+                raise
+            ckpt_version = _infer_checkpoint_version_from_path(
+                resume_path,
+                cfg['model'].get('model_version', 'spatial-r1-v4.1'))
+            lineage = _optimizer_resume_lineage(ckpt_version)
+            if is_host0:
+                print(f"  opt_state size mismatch detected ({_msg.strip()}).")
+                print(f"  Checkpoint optimizer lineage for {ckpt_version}: {lineage}.")
+            if lineage in ('per_group_5', 'current_or_per_group_5'):
+                if is_host0:
+                    print(f"  Migrating per-group 5-slot optimizer "
+                          f"(clip, adam, base_wd, pool_wd, lr) to current "
+                          f"7-slot optimizer with fixed-sig freeze guards.")
+                five_slot_template = _strip_sig_freeze_slots_from_opt_state(opt_state)
+                try:
+                    ckpt = load_checkpoint(resume_path, params, five_slot_template)
+                except ValueError:
+                    if lineage == 'per_group_5':
+                        raise
+                    # v4.1.5 should normally load directly as 7-slot. If a
+                    # specific v4.1.5 checkpoint is neither 7 nor 5, fall
+                    # through to the legacy path below.
+                    ckpt = None
+                if ckpt is not None:
+                    ckpt['opt_state'] = _convert_5tuple_opt_state(
+                        ckpt['opt_state'], opt_state)
+                    if is_host0:
+                        print(f"  opt_state migration OK "
+                              f"(Adam moments + LR counter preserved; "
+                              f"freeze slots initialized fresh).")
+            if lineage == 'legacy_2' or ckpt is None:
+                if is_host0:
+                    print(f"  Migrating legacy 2-tuple optimizer "
+                          f"(chain(clip, adamw)) to current optimizer.")
+                legacy_opt_state_template = _make_legacy_opt_state_template(
+                    params, schedule, weight_decay,
+                    grad_accum_steps=grad_accum_steps)
+                ckpt = load_checkpoint(
+                    resume_path, params, legacy_opt_state_template)
+                ckpt['opt_state'] = _convert_legacy_opt_state(
+                    ckpt['opt_state'], opt_state)
+                if is_host0:
+                    print(f"  opt_state migration OK "
+                          f"(Adam moments + LR counter preserved).")
+        ckpt_params = _strip_legacy_process_axis(ckpt['params'], params)
+        ckpt_opt_state = _strip_legacy_process_axis(ckpt['opt_state'], opt_state)
+        params = ckpt_params
+        opt_state = ckpt_opt_state
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('step', 0)
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
@@ -2482,7 +2951,7 @@ def main():
         if saved_step_in_epoch > 0 and saved_steps_per_epoch == steps_per_epoch:
             start_step_in_epoch = saved_step_in_epoch
         elif saved_step_in_epoch > 0:
-            # steps_per_epoch changed (batch size or data changed) -fallback
+            # steps_per_epoch changed (batch size or data changed) — fallback
             if is_host0:
                 print(f"  Warning: steps_per_epoch changed ({saved_steps_per_epoch} -> {steps_per_epoch}), "
                       f"cannot use step_in_epoch for resume. Starting epoch from beginning.")
@@ -2498,7 +2967,7 @@ def main():
                 print("\nStarting from scratch (--from-scratch).")
 
     # Fail-fast check: global_step must match across hosts after resume.
-    # broadcast handles the common path but we still verify -if it ever
+    # broadcast handles the common path but we still verify — if it ever
     # drifts, hang-debugging mid-training is painful; raise now instead.
     if n_hosts > 1:
         _gs_local = np.array([global_step], dtype=np.int64)
@@ -2527,9 +2996,13 @@ def main():
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
-    model_version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5')
+    model_version = cfg['model'].get('model_version', 'spatial-r1-v4.1')
     is_baseline = model_version == 'baseline'
-    is_spatial = model_version in ('spatial-r1-v3.9.4', 'spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
+    is_spatial = (model_version == 'spatial-r1'
+                  or model_version.startswith('spatial-r1-v2')
+                  or model_version.startswith('spatial-r1-v3')
+                  or model_version.startswith('spatial-r1-v4')
+                  or model_version.startswith('rw-v'))
 
     mesh_model = cfg['training'].get('mesh_model', 1)
     mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
@@ -2614,7 +3087,7 @@ def main():
         _srw_kwargs = {'mesh': mesh, 'max_chunk_size': max_chunk}
         if _spec.sharded_kwargs is not None:
             _srw_kwargs.update(_spec.sharded_kwargs(cfg))
-        # Slim (train) -kwargs don't set analysis, so defaults to False.
+        # Slim (train) — kwargs don't set analysis, so defaults to False.
         _sharded_single = make_sharded_srw(**_srw_kwargs)
         if hasattr(_v3, 'make_sharded_srw_paired'):
             _sharded_paired = _v3.make_sharded_srw_paired(**_srw_kwargs)
@@ -2622,7 +3095,7 @@ def main():
         else:
             _sharded_fns = _sharded_single
         # Analysis (observation only). Factory kwargs forward analysis=True
-        # only to factories that accept it -v4.1 does, earlier versions
+        # only to factories that accept it — v4.1 does, earlier versions
         # silently absorb it via **kwargs or raise; only probe when the
         # factory advertises the kwarg.
         import inspect as _inspect
@@ -2654,7 +3127,7 @@ def main():
         sharded_fns=_sharded_fns, mesh=mesh)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
     # v4.1: analysis_step is only meaningful when the full analysis
-    # kernels exist. Older model versions skip it -analysis logging
+    # kernels exist. Older model versions skip it — analysis logging
     # degrades to empty then.
     if _sharded_fns_analysis is not None:
         analysis_step_fn = create_analysis_step(
@@ -2679,7 +3152,7 @@ def main():
         rng, dummy_step_rng = jax.random.split(rng)
 
         # Initial emb-drift snapshot: pytree of sharded refs matching
-        # params['neuron_pool'][*_emb]. Identity here -drift=0 on first step.
+        # params['neuron_pool'][*_emb]. Identity here → drift=0 on first step.
         def _drift_snap(p):
             pool = p['neuron_pool']
             if 'qk_emb' in pool:
@@ -2734,11 +3207,11 @@ def main():
                 pass
 
         # === Step-time breakdown (sharded, 1 layer) ===
-        # NOTE: runs on ALL hosts -shard_map/psum require collective participation.
+        # NOTE: runs on ALL hosts — shard_map/psum require collective participation.
         # Only print statements are guarded by is_host0.
         try:
             _is_sharded = _sharded_fns is not None
-            _uses_scan_bias = model_version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
+            _uses_scan_bias = model_version in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4', 'spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.1', 'spatial-r1-v4.1.5.2')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
@@ -3180,8 +3653,12 @@ def main():
         """Gather sharded params to host-local full arrays for checkpoint save.
 
         Uses process_allgather with tiled=True so the output reconstructs
-        the global shape: sharded axes get concatenated across processes
-        and replicated arrays pass through unchanged.
+        the global shape — sharded axes get concatenated across processes
+        and replicated arrays pass through unchanged. Without tiled=True
+        (JAX default) process_allgather PREPENDS a (n_processes,) axis to
+        every leaf, which silently corrupted every checkpoint written
+        before 2026-04-23 on any mesh that triggered this path. Legacy
+        ckpts are de-corrupted in the load path (see _strip_legacy_process_axis).
 
         Must be called from ALL hosts simultaneously (collective).
         """
@@ -3205,24 +3682,24 @@ def main():
     ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
-    # Logging cadence. REGULAR every log_interval steps. ANALYSIS every
-    # log_interval * log_analysis_multiplier steps.
+    # Logging cadence. REGULAR every log_interval steps. ANALYSIS is
+    # now driven from the val path (fires on val_interval) — the old
+    # log_analysis_multiplier config key is kept as a legacy no-op so
+    # existing configs resume cleanly.
     LOG_REGULAR = log_interval
-    LOG_ANALYSIS = max(1, log_interval * log_analysis_multiplier)
     if is_host0:
         print(f"  Log cadence: regular={LOG_REGULAR}"
-              f" analysis={LOG_ANALYSIS}"
-              f" val={val_interval}",
+              f" analysis=on-val(interval={val_interval})",
               flush=True)
 
     # Emb drift snapshot (sense vectors). Held on every host, refreshed at
     # each log event. Fed into train_step so the drift collective runs inside
-    # jit on all hosts; the actual ||쨌|| reductions live there.
+    # jit on all hosts; the actual ||·|| reductions live there.
     _prev_emb_snap = _drift_snap(params)
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
-        # Epoch accumulators on device -one device_get per epoch at the
+        # Epoch accumulators on device — one device_get per epoch at the
         # end, rather than per-step float()/int() sync.
         _epoch_loss_jax = jnp.float32(0.0)
         # int64: valid_count sums to ~n_steps * tokens_per_step, which
@@ -3231,7 +3708,7 @@ def main():
         _epoch_valid_jax = jnp.int64(0)
         epoch_steps = 0
 
-        # Window accumulators on device -one device_get per log boundary.
+        # Window accumulators on device — one device_get per log boundary.
         _win_loss_jax = jnp.float32(0.0)
         _win_ce_jax = jnp.float32(0.0)
         _win_aux_jax = jnp.float32(0.0)
@@ -3246,7 +3723,7 @@ def main():
         for local_step, (input_ids, attention_mask) in enumerate(train_loader):
 
             # Cross-host SIGTERM sync every 10 steps. Handles the case where
-            # spot preemption fires on only some hosts first -without this,
+            # spot preemption fires on only some hosts first — without this,
             # a flagged host would break while unflagged hosts continue into
             # the next train_step collective and hang. Cost: one bool
             # all-gather per 10 steps (bytes).
@@ -3284,7 +3761,7 @@ def main():
             def _m(v):
                 return float(v)
 
-            # Device-side accumulation -no per-step TPU-to-CPU sync on the
+            # Device-side accumulation — no per-step TPU→CPU sync on the
             # regression/metric scalars. Window + epoch values are
             # materialized only at log boundary and end of epoch.
             # Token-weighted accumulation: every window/epoch loss is summed
@@ -3320,7 +3797,7 @@ def main():
             epoch_step_counter += 1
 
             # ---- REGULAR periodic logging ----
-            # ANALYSIS is driven from the val path (below), not from here -
+            # ANALYSIS is driven from the val path (below), not from here —
             # the ANALYSIS stats now require a separate forward with the
             # full-stats kernels and only run on val ticks.
             _is_early_debug = global_step in (1, 5, 10, 20, 50)
@@ -3328,10 +3805,10 @@ def main():
 
             if is_regular:
                 # Refresh emb-drift snapshot on every host (ref reassignment
-                # only -no collective). Must run outside is_host0 so the
+                # only — no collective). Must run outside is_host0 so the
                 # next jit'd train_step sees a consistent snap pytree.
                 _prev_emb_snap = _drift_snap(params)
-                # One TPU-to-CPU sync for the whole window.
+                # One TPU→CPU sync for the whole window.
                 _win_vals = jax.device_get({
                     'loss': _win_loss_jax, 'ce': _win_ce_jax,
                     'aux': _win_aux_jax, 'tau_reg': _win_tau_reg_jax,
@@ -3414,7 +3891,6 @@ def main():
 
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
             _do_val = (global_step % val_interval == 0 and global_step > 0)
-            _do_analysis = (global_step % LOG_ANALYSIS == 0 and global_step > 0)
             _do_ckpt = (global_step % ckpt_interval == 0 and global_step > 0)
             _new_best = False
 
@@ -3439,67 +3915,71 @@ def main():
                     best_val_loss = val_loss
                     _new_best = True
 
-
-            # ---- ANALYSIS: run full-stats forward on one val batch ----
-            # Single analysis forward at the configured analysis cadence. Compiles
-            # once on first call (extra HBM + time logged). Result dict
-            # is released after the JSONL write so HBM snaps back.
-            if _do_analysis and analysis_step_fn is not None:
-                val_loader.reset()
-                _analysis_batch = None
-                for _ab_ids, _ab_mask in val_loader:
-                    _analysis_batch = (_ab_ids, _ab_mask)
-                    break
-                if _analysis_batch is not None:
-                    _a_ids, _a_mask = _analysis_batch
-                    _a_gb = _a_ids.shape[0] * jax.process_count()
-                    _a_gs = (_a_gb, _a_ids.shape[1])
-                    _a_ids = shard_to_mesh(_a_ids, data_sharding, _a_gs)
-                    _a_mask = shard_to_mesh(_a_mask, data_sharding, _a_gs)
-                    try:
-                        _a_compile_start = time.time()
-                        analysis_result = analysis_step_fn(
-                            params, _a_ids, _a_mask)
-                        # Force the computation so HBM usage of the
-                        # analysis kernels registers now, not on the
-                        # next Python line.
-                        jax.block_until_ready(
-                            analysis_result.get('aux_loss',
-                                                jnp.float32(0.0)))
-                        _a_elapsed = time.time() - _a_compile_start
-                        if is_host0:
-                            _ctx_a = {
-                                'n_qk_cfg': cfg['model'].get(
-                                    'n_qk', cfg['model'].get('n_q', 0)),
-                                'n_v_cfg': cfg['model'].get('n_v', 0),
-                                'n_know_cfg': cfg['model'].get('n_know', 0),
-                                'model_version': model_version,
-                            }
-                            a_rec = _build_analysis_record(
-                                {}, analysis_result, _ctx_a)
-                            a_rec['step'] = global_step
-                            a_rec['epoch'] = epoch
-                            a_rec['analysis_step_sec'] = float(_a_elapsed)
-                            _print_analysis_block(a_rec, _ctx_a)
-                            log_jsonl({'type': 'train_analysis', **a_rec})
-                            sync_logs()
-                    finally:
-                        # Explicit release -jit-returned dict holds
-                        # TPU buffers that outlive the val block
-                        # otherwise.
+                # ---- ANALYSIS: run full-stats forward on one val batch ----
+                # Single analysis forward, same frequency as val. Compiles
+                # once on first call (extra HBM + time logged). Result dict
+                # is released after the JSONL write so HBM snaps back.
+                if analysis_step_fn is not None:
+                    val_loader.reset()
+                    _analysis_batch = None
+                    for _ab_ids, _ab_mask in val_loader:
+                        _analysis_batch = (_ab_ids, _ab_mask)
+                        break
+                    if _analysis_batch is not None:
+                        _a_ids, _a_mask = _analysis_batch
+                        _a_gb = _a_ids.shape[0] * jax.process_count()
+                        _a_gs = (_a_gb, _a_ids.shape[1])
+                        _a_ids = shard_to_mesh(_a_ids, data_sharding, _a_gs)
+                        _a_mask = shard_to_mesh(_a_mask, data_sharding, _a_gs)
                         try:
-                            del analysis_result
-                        except NameError:
-                            pass
-                        del _a_ids, _a_mask, _analysis_batch
+                            _a_compile_start = time.time()
+                            analysis_result = analysis_step_fn(
+                                params, _a_ids, _a_mask)
+                            # Force the computation so HBM usage of the
+                            # analysis kernels registers now, not on the
+                            # next Python line.
+                            jax.block_until_ready(
+                                analysis_result.get('aux_loss',
+                                                    jnp.float32(0.0)))
+                            _a_elapsed = time.time() - _a_compile_start
+                            if is_host0:
+                                _ctx_a = {
+                                    'n_qk_cfg': cfg['model'].get(
+                                        'n_qk', cfg['model'].get('n_q', 0)),
+                                    'n_v_cfg': cfg['model'].get('n_v', 0),
+                                    'n_know_cfg': cfg['model'].get('n_know', 0),
+                                    'model_version': model_version,
+                                }
+                                a_rec = _build_analysis_record(
+                                    {}, analysis_result, _ctx_a)
+                                a_rec['step'] = global_step
+                                a_rec['epoch'] = epoch
+                                a_rec['analysis_step_sec'] = float(_a_elapsed)
+                                _print_analysis_block(a_rec, _ctx_a)
+                                log_jsonl({'type': 'train_analysis', **a_rec})
+                                sync_logs()
+                        finally:
+                            # Explicit release — jit-returned dict holds
+                            # TPU buffers that outlive the val block
+                            # otherwise.
+                            try:
+                                del analysis_result
+                            except NameError:
+                                pass
+                            del _a_ids, _a_mask, _analysis_batch
 
+                # Dead-neuron diagnosis removed during the registry refactor
+                # (was rw-v4.0.2-specific: separate Q/K pools, GELU-z gate).
+                # If needed for v4.1+, rewrite against the activation×intensity
+                # gate — see models/legacy/dawn_spatial_v402_exp.py for
+                # reference.
 
             # ---- Unified save path ----
             # best_model + mid-epoch checkpoint share a single gather +
             # serialize when both fire on the same step (val_interval ==
             # ckpt_interval is the common case). Previously that meant two
             # independent _gather_for_save collectives and two full
-            # re-serializations of the same params -expensive at 1B.
+            # re-serializations of the same params — expensive at 1B.
             if _new_best or _do_ckpt:
                 params_single = _gather_for_save(params)
                 opt_state_single = _gather_for_save(opt_state)
@@ -3518,7 +3998,7 @@ def main():
                     if _do_ckpt:
                         _write_checkpoint_bytes(
                             _ckpt_path(f"checkpoint_step{global_step}.flax"), bytes_data)
-                        # GCS list+delete only from host 0 -racing cleanups across
+                        # GCS list+delete only from host 0 — racing cleanups across
                         # hosts can drop the checkpoint that was just written.
                         cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
                 del params_single, opt_state_single
@@ -3550,7 +4030,7 @@ def main():
 
         # ---- End of epoch ----
         epoch_elapsed = time.time() - epoch_start
-        # Single TPU-to-CPU sync for the whole epoch totals.
+        # Single TPU→CPU sync for the whole epoch totals.
         _ep = jax.device_get({
             'loss': _epoch_loss_jax,
             'correct': _epoch_correct_jax,
@@ -3597,7 +4077,7 @@ def main():
             })
 
         # Save epoch checkpoint (device_get on ALL hosts). best_model reuses
-        # the same serialized bytes -no double serialize at 1B scale.
+        # the same serialized bytes — no double serialize at 1B scale.
         params_single = _gather_for_save(params)
         opt_state_single = _gather_for_save(opt_state)
 
@@ -3619,7 +4099,7 @@ def main():
             log_message(f"  Best val loss so far: {best_val_loss:.4f}")
             sync_logs()
 
-        # Release gathered copies on every host -all hosts hold them after
+        # Release gathered copies on every host — all hosts hold them after
         # _gather_for_save; host-0-only del leaves multi-GB pinned elsewhere.
         del params_single, opt_state_single
 
