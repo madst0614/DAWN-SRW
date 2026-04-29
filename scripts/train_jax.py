@@ -130,20 +130,30 @@ def print_xla_oom_diagnostics():
             text = path.read_text(errors="ignore")
         except Exception:
             continue
-        if not any(n in text for n in needles[:3]):
+        is_memory_report = "memory-usage-report" in path.name
+        if not is_memory_report and not any(n in text for n in needles[:3]):
             continue
         print(f"\n  --- XLA memory excerpt: {path} ---", flush=True)
         lines = text.splitlines()
         hits = [i for i, line in enumerate(lines)
-                if any(n in line for n in needles[:3])]
+                if any(n in line for n in needles[:3])
+                or "bytes used" in line.lower()
+                or "allocation" in line.lower()]
         start = max(0, hits[0] - 2) if hits else 0
-        end = min(len(lines), start + 90)
+        end = min(len(lines), start + 120)
         printed = 0
         for line in lines[start:end]:
-            if any(n in line for n in needles) or "Operator:" in line:
+            interesting = (
+                any(n in line for n in needles)
+                or "Operator:" in line
+                or "bytes used" in line.lower()
+                or "allocation" in line.lower()
+                or is_memory_report
+            )
+            if interesting:
                 print(f"  {line[:240]}", flush=True)
                 printed += 1
-                if printed >= 36:
+                if printed >= 60:
                     print("  ... excerpt truncated; inspect dump file above for full report.",
                           flush=True)
                     break
