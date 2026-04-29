@@ -99,7 +99,7 @@ def print_xla_oom_diagnostics():
                 seen.add(path)
                 files.append(path)
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    files = files[:20]
+    files = files[:12]
 
     if not files:
         print(f"  No XLA text dumps found under {dump_dir}", flush=True)
@@ -108,7 +108,7 @@ def print_xla_oom_diagnostics():
     print(f"\n  === XLA OOM diagnostics ===", flush=True)
     print(f"  Dump dir: {dump_dir}", flush=True)
     print("  Newest relevant dump files:", flush=True)
-    for path in files[:8]:
+    for path in files[:5]:
         try:
             size_mb = path.stat().st_size / 1e6
             print(f"    {path} ({size_mb:.1f} MB)", flush=True)
@@ -136,10 +136,16 @@ def print_xla_oom_diagnostics():
         hits = [i for i, line in enumerate(lines)
                 if any(n in line for n in needles[:3])]
         start = max(0, hits[0] - 2) if hits else 0
-        end = min(len(lines), start + 140)
+        end = min(len(lines), start + 90)
+        printed = 0
         for line in lines[start:end]:
             if any(n in line for n in needles) or "Operator:" in line:
                 print(f"  {line[:240]}", flush=True)
+                printed += 1
+                if printed >= 36:
+                    print("  ... excerpt truncated; inspect dump file above for full report.",
+                          flush=True)
+                    break
         return
 
     print("  No memory report excerpt found yet. Inspect latest dumps above.",
