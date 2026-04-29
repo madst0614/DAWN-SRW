@@ -806,8 +806,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     mean_score_chunk = scores_f.mean(axis=(0, 1))
                     gate_max_local = gate.max(axis=-1, keepdims=True)
                 # 誇intensity feeds den (consumed after scan, not returned).
-                max_gate_chunk = gate.max(axis=(0, 1))
-                mean_score_chunk = jnp.sum(scores.astype(jnp.float32), axis=(0, 1)) / (B * S)
                 max_gate_chunk = jax.lax.pmax(
                     jax.lax.stop_gradient(max_gate_chunk), 'data')
                 mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
