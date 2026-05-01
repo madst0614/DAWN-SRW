@@ -1490,6 +1490,14 @@ class DAWN(nn.Module):
             know_activation_cost_mean_all = _z
             attn_current_cost_mean_all = _z
             know_current_cost_mean_all = _z
+            attn_gate_eff_n_all = _z
+            attn_gate_eff_ratio_all = _z
+            attn_top1_gate_frac_all = _z
+            attn_top1_gate_frac_max_all = _z
+            know_gate_eff_n_all = _z
+            know_gate_eff_ratio_all = _z
+            know_top1_gate_frac_all = _z
+            know_top1_gate_frac_max_all = _z
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
