@@ -82,6 +82,7 @@ training:
   # ---- 2-tier log cadence (step units) ----
   log_interval: 100
   log_analysis_multiplier: 20
+  heavy_geometry_multiplier: 10
 
 use_amp: true
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1_sym_40M_c4_5B

@@ -3739,7 +3739,7 @@ def main():
     # log_interval * log_analysis_multiplier steps.
     LOG_REGULAR = log_interval
     LOG_ANALYSIS = max(1, log_interval * log_analysis_multiplier)
-    LOG_GEOMETRY = max(1, LOG_ANALYSIS * heavy_geometry_multiplier)
+    LOG_GEOMETRY = max(1, LOG_REGULAR * heavy_geometry_multiplier)
     if is_host0:
         print(f"  Log cadence: regular={LOG_REGULAR}"
               f" analysis={LOG_ANALYSIS}"
