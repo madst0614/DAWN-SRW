@@ -3,15 +3,46 @@
 This document preserves model history that should not live inside active model
 source files. Active source files describe current behavior only.
 
+## spatial-r1-v4.1.5.5
+
+- Active implementation: `models/dawn_spatial_v4155.py`
+- Training entry point: `scripts/train_jax.py`
+- Functional change from v4.1.5.2: read/write vectors are used raw in SRW;
+  their norms are learnable operator gain axes.
+- Gate and denominator are unchanged from v4.1.5.2:
+  `gate = activation * intensity`, `den = max(sum(gate), 1.0)`.
+- Weight decay: `qk_emb`, `v_emb`, `know_emb`, and raw read/write vectors
+  all receive `pool_weight_decay`; only v4.1.5.2 excludes read/write WD.
+
 ## spatial-r1-v4.1.5.4
 
-- Active implementation: `models/dawn_spatial_v4154.py`
-- Training entry point: `scripts/train_jax.py`
-- Functional change from v4.1.5.2: SRW denominator is now
-  `max(sum(activation), 1.0)`.
-- Numerator is unchanged: `gate = activation * intensity` and output
-  contribution still uses `gate * <x, read> * write`.
-- Read/write unit normalization and route embedding behavior are unchanged.
+- Archived implementation:
+  `models/legacy/dawn_spatial_v4154_activation_den_exp.py`
+- Archived configs:
+  `configs/legacy/train_config_spatial_r1_v4_1_5_4_*.yaml`
+- Functional change from v4.1.5.2: SRW denominator used activation mass only:
+  `den = max(sum(activation), 1.0)`.
+- Numerator was unchanged:
+  `gate = activation * intensity`,
+  `a_i = gate_i * <x, normalize(read_i)>`.
+- Read/write vectors remained forward-normalized inside SRW.
+- Removed from the active training registry; kept only as a historical
+  experiment.
+
+## spatial-r1-v4.1.5.3
+
+- Archived implementation:
+  `models/legacy/dawn_spatial_v4153_factorized_routing_exp.py`
+- Archived config:
+  `configs/legacy/train_config_spatial_r1_v4_1_5_3_40M_c4_5B_tag0_sigr64_sigw64_factorized.yaml`
+- Factorized read/write signature routing experiment.
+- Removed learned route tags in the archived config:
+  `tag_dim=0`, `read_sig_dim=64`, `write_sig_dim=64`, `d_route=128`.
+- Used `routing_type="factorized"` with separate read/write operator
+  signature factors.
+- Kept the v4.1 two-stage gate and gate denominator:
+  `gate = activation * intensity`,
+  `den = max(sum(activation * intensity), 1.0)`.
 
 ## spatial-r1-v4.1.5.2
 

@@ -1,7 +1,7 @@
-﻿"""
-DAWN-SRW v4.1.5.4: Sense-Read-Write routing, activation-only den.
+"""
+DAWN-SRW v4.1.5.5: Sense-Read-Write routing, free read/write operator norms.
 
-This file contains the active v4.1.5.4 implementation.  Routing is performed
+This file contains the active v4.1.5.5 implementation.  Routing is performed
 in the learned route space:
 
     score_i = h @ emb_i
@@ -57,17 +57,16 @@ For each token and pool:
     intensity     = epsilon + min(active_margin, max_intensity)
     gate          = activation * intensity
 
-    r_i = normalize(read_i)
-    w_i = normalize(write_i)
+    r_i = read_i
+    w_i = write_i
     a_i = gate_i * <x, r_i>
-    out = sum_i a_i * w_i / max(sum_i activation_i, 1.0)
+    out = sum_i a_i * w_i / max(sum_i gate_i, 1.0)
 
 Implementation notes
 --------------------
 * Routing is score-based in route space: scores = h @ emb.T.
-* Read/write vectors are forward-normalized inside SRW.
-* The numerator uses gate = activation * intensity.
-* The denominator intentionally excludes intensity: sum(activation).
+* Read/write vectors are used raw in SRW; their norms are learnable operator gain axes.
+* The denominator remains activation-weighted intensity: sum(gate).
 * Dynamic tau alpha parameters are not present; tau is relative threshold
   plus bounded scan-bias.
 * The neuron pool and router are shared across layers.  Per-layer parameters
@@ -91,8 +90,7 @@ from jax.experimental.shard_map import shard_map
 #   active_margin = max(margin - ACTIVATION_CUTOFF, 0)
 #   intensity     = EPSILON + min(active_margin, MAX_INTENSITY)
 #   gate          = activation * intensity
-#   den           = max(sum(activation), 1.0)
-#   gate is still used in the numerator; denominator excludes intensity.
+#   den           = max(sum(gate), 1.0)
 # ================================================================
 
 SHARPNESS = 500.0              # activation sigmoid sharpness (near-binary)
@@ -175,9 +173,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         active_margin = max(margin - activation_cutoff, 0)
         intensity     = epsilon + min(active_margin, max_intensity)
         gate          = activation * intensity
-        den           = max(sum(activation), 1.0)
-        # gate = activation * intensity is still used in the numerator.
-        # The denominator intentionally excludes intensity.
+        den           = max(sum(gate), 1.0)
 
     scan = scan_scale * tanh(scan_bias)
     tau = s_mean + tau_offset * s_std - scan / max(s_std, scan_std_floor).
@@ -218,7 +214,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                     # dead_penalty scalar
         P(),                     # dead_count scalar
         P(),                     # int_max scalar (v4.1 diag)
-        P(),                     # den_cost_mean scalar (activation-den mass)
+        P(),                     # den_cost_mean scalar
         P(),                     # activation_cost_mean scalar
         P(),                     # current_cost_mean scalar
     )
@@ -230,7 +226,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                     # score_skew scalar
         P(),                     # active_per_token_std scalar
         P(),                     # gate_entropy scalar
-        P(),                     # den_cost_out (activation-den mass)
+        P(),                     # den_cost_out
         P(),                     # activation_cost_out
         P(),                     # current_cost_out
         P(),                     # score_kurt scalar
@@ -271,8 +267,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             wc = jax.lax.dynamic_slice_in_dim(write_bf, start, cs, axis=0)
             rc_f = rc.astype(jnp.float32)
             wc_f = wc.astype(jnp.float32)
-            rc_f = rc_f / (jnp.linalg.norm(rc_f, axis=-1, keepdims=True) + 1e-8)
-            wc_f = wc_f / (jnp.linalg.norm(wc_f, axis=-1, keepdims=True) + 1e-8)
+            # v4.1.5.5: use raw read/write vectors.
+            # Their norms are implicit per-neuron operator gain axes.
+            # WD/pool_weight_decay regulates these norms.
             return ec, rc_f.astype(jnp.bfloat16), wc_f.astype(jnp.bfloat16)
 
         # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
@@ -379,9 +376,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 a = gate * xr_f
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
-                # v4.1.5.4: denominator uses activation mass only.
-                # gate remains activation * intensity for numerator strength.
-                chunk_den = activation.sum(axis=-1, keepdims=True)
+                chunk_intensity = gate.sum(axis=-1, keepdims=True)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_phi_binary = ((activation > 0.1) & (activation < 0.9)
@@ -408,7 +403,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_phi_binary + chunk_phi_binary,
-                        total_den_cost + chunk_den,
+                        total_den_cost + chunk_intensity,
                         total_activation_cost,
                         total_current_cost,
                         total_z_lt_075 + chunk_z_lt_075,
@@ -454,13 +449,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 a = gate * xr_f
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
-                # v4.1.5.4: denominator uses activation mass only.
-                # gate remains activation * intensity for numerator strength.
-                chunk_den = activation.sum(axis=-1, keepdims=True)
+                chunk_intensity = gate.sum(axis=-1, keepdims=True)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
-                # sum(gate) remains observational gate mass; denominator uses
-                # sum(activation) after the chunk scan.
+                # sum(gate) feeds the denominator after the chunk scan.
                 max_gate_chunk = gate.max(axis=(0, 1))
                 mean_score_chunk = scores_f.mean(axis=(0, 1))
                 max_gate_chunk = jax.lax.pmax(
@@ -476,7 +468,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
-                        total_den_cost + chunk_den,
+                        total_den_cost + chunk_intensity,
                         total_activation_cost,
                         total_current_cost,
                         total_dead_penalty + chunk_dead_penalty,
@@ -494,8 +486,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 jnp.arange(nc))
 
         global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')  # sum(gate)
-        # Denominator uses participation mass only:
-        # max(sum(activation), 1.0). Numerator still uses gate.
+        # Denominator matches the numerator gate weight:
+        # max(sum(activation * intensity), 1.0).
         global_den_cost = jax.lax.psum(total_den_cost, 'model')
         global_activation_cost = jax.lax.psum(total_activation_cost, 'model')
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
@@ -520,7 +512,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         int_max_out = jax.lax.pmax(
             jax.lax.stop_gradient(total_int_max), 'model')
 
-        den_cost_mean = global_den_cost.mean()  # activation-denominator mass
+        den_cost_mean = global_den_cost.mean()
         activation_cost_mean = global_activation_cost.mean()
         current_cost_mean = global_current_cost.mean()
 
@@ -547,7 +539,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         entropy_per_token = jnp.where(
             jnp.isfinite(entropy_per_token), entropy_per_token, 0.0)
         gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
-        den_cost_out = global_den_cost.mean()  # activation-denominator mass
+        den_cost_out = global_den_cost.mean()
         activation_cost_out = jax.lax.psum(total_activation_cost, 'model').mean()
         current_cost_out = jax.lax.psum(total_current_cost, 'model').mean()
         int_cap_frac_out = jax.lax.stop_gradient(
@@ -606,7 +598,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                          # dead_penalty scalar
         P(),                          # dead_count scalar
         P(),                          # int_max scalar (v4.1 diag)
-        P(),                          # den_cost_mean scalar (activation-den mass)
+        P(),                          # den_cost_mean scalar
         P(),                          # activation_cost_mean scalar
         P(),                          # current_cost_mean scalar
     )
@@ -617,7 +609,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                          # score_skew scalar
         P(),                          # active_per_token_std scalar
         P(),                          # gate_entropy scalar
-        P(),                          # den_cost_out scalar (activation-den mass)
+        P(),                          # den_cost_out scalar
         P(),                          # activation_cost_out scalar
         P(),                          # current_cost_out scalar
         P(),                          # score_kurt scalar
@@ -659,8 +651,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             wc = jax.lax.dynamic_slice_in_dim(write_bf, start, cs, axis=0)
             rc_f = rc.astype(jnp.float32)
             wc_f = wc.astype(jnp.float32)
-            rc_f = rc_f / (jnp.linalg.norm(rc_f, axis=-1, keepdims=True) + 1e-8)
-            wc_f = wc_f / (jnp.linalg.norm(wc_f, axis=-1, keepdims=True) + 1e-8)
+            # v4.1.5.5: use raw read/write vectors.
+            # Their norms are implicit per-neuron operator gain axes.
+            # WD/pool_weight_decay regulates these norms.
             return ec, rc_f.astype(jnp.bfloat16), wc_f.astype(jnp.bfloat16)
 
         # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
@@ -764,9 +757,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 a = gate * xr_f[:, :, None, :]
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)           # [B,S,2,1]
-                # v4.1.5.4: denominator uses activation mass only.
-                # gate remains activation * intensity for numerator strength.
-                chunk_den = activation.sum(axis=-1, keepdims=True)          # [B,S,2,1]
+                chunk_intensity = gate.sum(axis=-1, keepdims=True)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_phi_binary = ((activation > 0.1) & (activation < 0.9)
@@ -793,7 +784,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_phi_binary + chunk_phi_binary,
-                        total_den_cost + chunk_den,
+                        total_den_cost + chunk_intensity,
                         total_activation_cost,
                         total_current_cost,
                         total_z_lt_075 + chunk_z_lt_075,
@@ -840,9 +831,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 a = gate * xr_f[:, :, None, :]
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
-                # v4.1.5.4: denominator uses activation mass only.
-                # gate remains activation * intensity for numerator strength.
-                chunk_den = activation.sum(axis=-1, keepdims=True)
+                chunk_intensity = gate.sum(axis=-1, keepdims=True)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 max_gate_chunk = gate.max(axis=(0, 1, 2))
@@ -860,7 +849,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
-                        total_den_cost + chunk_den,
+                        total_den_cost + chunk_intensity,
                         total_activation_cost,
                         total_current_cost,
                         total_dead_penalty + chunk_dead_penalty,
@@ -880,8 +869,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
         # Normalize per route independently
         global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')   # sum(gate)
-        # Denominator uses participation mass only:
-        # max(sum(activation), 1.0). Numerator still uses gate.
         global_den_cost = jax.lax.psum(total_den_cost, 'model')
         global_activation_cost = jax.lax.psum(total_activation_cost, 'model')
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
@@ -909,7 +896,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         int_max_out = jax.lax.pmax(
             jax.lax.stop_gradient(total_int_max), 'model')
 
-        den_cost_mean = global_den_cost.mean()  # activation-denominator mass
+        den_cost_mean = global_den_cost.mean()
         activation_cost_mean = global_activation_cost.mean()
         current_cost_mean = global_current_cost.mean()
 
@@ -936,7 +923,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         entropy_per_token = jnp.where(
             jnp.isfinite(entropy_per_token), entropy_per_token, 0.0)
         gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
-        den_cost_out = global_den_cost.mean()  # activation-denominator mass
+        den_cost_out = global_den_cost.mean()
         activation_cost_out = jax.lax.psum(total_activation_cost, 'model').mean()
         current_cost_out = jax.lax.psum(total_current_cost, 'model').mean()
         int_cap_frac_out = jax.lax.stop_gradient(
@@ -971,13 +958,13 @@ class NeuronPool(nn.Module):
         self.know_emb = self.param('know_emb', unit_norm_init(), (self.n_know, db))
 
         # Read vectors define what each neuron extracts from x.
-        # They are normalized in the SRW forward path.
+        # v4.1.5.5 uses their raw norms as input sensitivity / operator gain.
         self.qk_read = self.param('qk_read', unit_norm_init(), (self.n_qk, dm))
         self.v_read = self.param('v_read', unit_norm_init(), (self.n_v, dm))
         self.know_read = self.param('know_read', unit_norm_init(), (self.n_know, dm))
 
         # Write vectors define the output direction for each neuron.
-        # They are normalized in the SRW forward path.
+        # v4.1.5.5 uses their raw norms as output strength / operator gain.
         self.qk_write = self.param('qk_write', unit_norm_init(), (self.n_qk, dm))
         self.v_write = self.param('v_write', unit_norm_init(), (self.n_v, dm))
         self.know_write = self.param('know_write', unit_norm_init(), (self.n_know, dm))
@@ -1337,8 +1324,8 @@ class DAWNBlock(nn.Module):
 # ================================================================
 
 class DAWN(nn.Module):
-    """DAWN-Spatial v4.1.5.4: Sense-Read-Write."""
-    __version__ = "spatial-r1-v4.1.5.4"
+    """DAWN-Spatial v3.8: Sense-Read-Write."""
+    __version__ = "spatial-r1-v4.1.5.5"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -1702,8 +1689,7 @@ class DAWN(nn.Module):
             # Shapes: attn [L, B, S, 3], know [L, B, S, 1].
             'attn_tau_offset': attn_tau_offset_all,
             'know_tau_offset': know_tau_offset_all,
-            # Denominator diagnostic: sum(activation). Legacy key names are
-            # preserved for log compatibility.
+            # Denominator diagnostic: sum(activation * intensity).
             'attn_int_max': attn_int_max_all.max(),
             'know_int_max': know_int_max_all.max(),
             'attn_gate_den_sum_mean': attn_den_cost_mean_all.mean(),
@@ -1826,10 +1812,9 @@ def _squeeze_params(params):
 
 def _srw_inference(x, h, emb, tau_offset, scan_bias, w_read, w_write):
     """Non-chunked SRW for inference."""
+    # v4.1.5.5: raw read/write vectors; norms are operator gain.
     r_n = w_read.astype(jnp.float32)
-    r_n = r_n / (jnp.linalg.norm(r_n, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write.astype(jnp.float32)
-    w_n = w_n / (jnp.linalg.norm(w_n, axis=-1, keepdims=True) + 1e-8)
     scores = h @ emb.T
     scores_f32 = scores.astype(jnp.float32)
     s_mean = scores_f32.mean(axis=-1, keepdims=True)
@@ -1848,19 +1833,16 @@ def _srw_inference(x, h, emb, tau_offset, scan_bias, w_read, w_write):
     xr = x.astype(jnp.float32) @ r_n.T
     a = gate * xr
     raw_out = a @ w_n
-    # v4.1.5.4: denominator uses activation mass only.
-    # gate remains activation * intensity for numerator strength.
-    den = jnp.maximum(activation.sum(axis=-1, keepdims=True), 1.0)
+    den = jnp.maximum(gate.sum(axis=-1, keepdims=True), 1.0)
     out = raw_out.astype(jnp.float32) / den
     return out.astype(jnp.float32)
 
 
 def _srw_inference_with_gates(x, h, emb, tau_offset, scan_bias, w_read, w_write):
     """Like _srw_inference but also returns raw and normalized gate for analysis."""
+    # v4.1.5.5: raw read/write vectors; norms are operator gain.
     r_n = w_read.astype(jnp.float32)
-    r_n = r_n / (jnp.linalg.norm(r_n, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write.astype(jnp.float32)
-    w_n = w_n / (jnp.linalg.norm(w_n, axis=-1, keepdims=True) + 1e-8)
     scores = h @ emb.T
     scores_f32 = scores.astype(jnp.float32)
     s_mean = scores_f32.mean(axis=-1, keepdims=True)
@@ -1880,9 +1862,7 @@ def _srw_inference_with_gates(x, h, emb, tau_offset, scan_bias, w_read, w_write)
     xr = x.astype(jnp.float32) @ r_n.T
     a = gate * xr
     raw_out = a @ w_n
-    # v4.1.5.4: denominator uses activation mass only.
-    # gate remains activation * intensity for numerator strength.
-    den = jnp.maximum(activation.sum(axis=-1, keepdims=True), 1.0)
+    den = jnp.maximum(gate.sum(axis=-1, keepdims=True), 1.0)
     out = raw_out.astype(jnp.float32) / den
     return out.astype(jnp.float32), gate, gate_norm
 
@@ -2385,10 +2365,9 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
 
     def _srw_sup(x, h, emb, tau_off, scan_bias, w_read, w_write, mult):
         """SRW with optional gate suppression."""
+        # v4.1.5.5: raw read/write vectors; norms are operator gain.
         r_n = w_read.astype(jnp.float32)
-        r_n = r_n / (jnp.linalg.norm(r_n, axis=-1, keepdims=True) + 1e-8)
         w_n = w_write.astype(jnp.float32)
-        w_n = w_n / (jnp.linalg.norm(w_n, axis=-1, keepdims=True) + 1e-8)
         scores = h @ emb.T
         sf = scores.astype(jnp.float32)
         s_mean = sf.mean(axis=-1, keepdims=True)
@@ -2407,9 +2386,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         xr = x.astype(jnp.float32) @ r_n.T
         a = gate * xr
         out = a @ w_n
-        # v4.1.5.4: denominator uses activation mass only.
-        # gate remains activation * intensity for numerator strength.
-        den = jnp.maximum(activation.sum(axis=-1, keepdims=True), 1.0)
+        den = jnp.maximum(gate.sum(axis=-1, keepdims=True), 1.0)
         return (out.astype(jnp.float32) / den).astype(jnp.float32)
 
     def forward_fn(input_ids):

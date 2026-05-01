@@ -56,7 +56,7 @@ from jax.experimental.shard_map import shard_map
 from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
 from models.dawn_spatial_v4152 import DAWN as DAWN_V4152
-from models.dawn_spatial_v4154 import DAWN as DAWN_V4154
+from models.dawn_spatial_v4155 import DAWN as DAWN_V4155
 
 # ============================================================
 # Constants
@@ -280,10 +280,10 @@ MODEL_REGISTRY = {
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
     ),
-    'spatial-r1-v4.1.5.4': ModelSpec(
-        name='spatial-r1-v4.1.5.4',
-        module_path='models.dawn_spatial_v4154',
-        cls=DAWN_V4154,
+    'spatial-r1-v4.1.5.5': ModelSpec(
+        name='spatial-r1-v4.1.5.5',
+        module_path='models.dawn_spatial_v4155',
+        cls=DAWN_V4155,
         build_kwargs=_dawn_v4152_kwargs,
         supports_sharded=True,
         force_sharded=True,
@@ -310,7 +310,7 @@ def build_model_from_config(cfg):
             f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
-    if version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4'):
+    if version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
         print(f"route dims: d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
@@ -1641,7 +1641,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     old train_fast / train_deep JSONL types should switch to type='train'.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5')
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -1817,7 +1817,7 @@ def _print_regular_block(rec, ctx):
         f" v={rec['drift_v_emb']:.2e}"
         f" k={rec['drift_know_emb']:.2e}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" k={rec['know_gate_den_sum_mean']:.1f}]"
@@ -1828,7 +1828,7 @@ def _print_regular_block(rec, ctx):
         f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
         f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
         log_message(
             f"  scan_bias: know={rec['scan_know_bias']:+.3f}"
             f" attn=[{rec['scan_attn_bias_0']:+.3f} {rec['scan_attn_bias_1']:+.3f} {rec['scan_attn_bias_2']:+.3f}]"
@@ -1884,7 +1884,7 @@ def _build_analysis_record(base, metrics, ctx):
     those are pulled from analysis_result too.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5')
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -1989,7 +1989,7 @@ def _print_analysis_block(rec, ctx):
         f" qk={rec['qk_emb_norm_max']:.2f}"
         f" v={rec['v_emb_norm_max']:.2f}"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" k={rec['know_gate_den_sum']:.1f}"
@@ -2432,7 +2432,7 @@ def main():
         end_value=lr * 0.1,
     )
 
-    # v4.1 per-group WD: pool tensors (qk/v/know 횞 emb/read/write) get
+    # v4.1 per-group WD: pool tensors (qk/v/know emb/read/write) get
     # pool_weight_decay; dense kernels get weight_decay. Bias / LayerNorm /
     # learnable *_scale excluded from both groups.
     #
@@ -2475,8 +2475,8 @@ def main():
         if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
            or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
             return True  # learnable output_scale
-        if _MODEL_VERSION in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4') and _is_rw_param(path_str):
-            return True  # v4.1.5 variants forward-normalize read/write directions
+        if _MODEL_VERSION == 'spatial-r1-v4.1.5.2' and _is_rw_param(path_str):
+            return True  # v4.1.5.2 forward-normalizes read/write directions
         return False
 
     def _wd_mask_base(params):
@@ -2575,7 +2575,7 @@ def main():
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
-        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4'):
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -2657,7 +2657,7 @@ def main():
     is_spatial = model_version in (
         'spatial-r1-v3.9.4',
         'spatial-r1-v4.1.5.2',
-        'spatial-r1-v4.1.5.4',
+        'spatial-r1-v4.1.5.5',
     )
 
     mesh_model = cfg['training'].get('mesh_model', 1)
@@ -2910,7 +2910,7 @@ def main():
         # Only print statements are guarded by is_host0.
         try:
             _is_sharded = _sharded_fns is not None
-            _uses_scan_bias = model_version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4')
+            _uses_scan_bias = model_version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
