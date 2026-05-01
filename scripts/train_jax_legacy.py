@@ -63,7 +63,7 @@ from models.legacy.dawn_spatial_v412_scan_bias_exp import DAWN as DAWN_V412
 from models.legacy.dawn_spatial_v414_competitive_den_exp import DAWN as DAWN_V414
 from models.dawn_spatial_v415_operator_route_sig_exp import DAWN as DAWN_V415
 from models.legacy.dawn_spatial_v4151_operator_route_sig_free_rw_exp import DAWN as DAWN_V4151
-from models.dawn_spatial_v4152_operator_route_free_emb_exp import DAWN as DAWN_V4152
+from models.dawn_spatial_v4152 import DAWN as DAWN_V4152
 
 # ============================================================
 # Constants
@@ -319,7 +319,7 @@ MODEL_REGISTRY = {
     ),
     'spatial-r1-v4.1.5.2': ModelSpec(
         name='spatial-r1-v4.1.5.2',
-        module_path='models.dawn_spatial_v4152_operator_route_free_emb_exp',
+        module_path='models.dawn_spatial_v4152',
         cls=DAWN_V4152,
         build_kwargs=_dawn_v415_kwargs,
         supports_sharded=True,

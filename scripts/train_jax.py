@@ -55,7 +55,8 @@ from jax.experimental.shard_map import shard_map
 # restore and re-register them only when reproducing an old run.
 from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
-from models.dawn_spatial_v4152_droute_exp import DAWN as DAWN_V4152
+from models.dawn_spatial_v4152 import DAWN as DAWN_V4152
+from models.dawn_spatial_v4154 import DAWN as DAWN_V4154
 
 # ============================================================
 # Constants
@@ -226,30 +227,18 @@ def _dawn_shared_kwargs(cfg):
 
 
 def _dawn_v4152_kwargs(cfg):
-    """v4.1.5.2 active path: d_route-only tag routing.
-
-    Older configs may still contain an explicit route split. If present,
-    honor it for checkpoint compatibility; otherwise use d_route as the
-    learned route width.
-    """
+    """v4.1.5.2 active path: d_route-only routing."""
     kw = _dawn_shared_kwargs(cfg)
     m = cfg['model']
-    d_route = m.get('d_route', m.get('d_bottleneck', 128))
-    tag_dim = m.get('tag_dim', d_route)
-    legacy_read_key = 'read_' + 's' + 'ig_dim'
-    legacy_write_key = 'write_' + 's' + 'ig_dim'
-    read_route_dim = m.get(legacy_read_key, 0)
-    write_route_dim = m.get(legacy_write_key, 0)
-    expected_route = tag_dim + read_route_dim + write_route_dim
-    if d_route != expected_route:
-        raise ValueError(
-            f"d_route must equal the route split total, got "
-            f"d_route={d_route}, tag_dim={tag_dim}, "
-            f"read_route_dim={read_route_dim}, write_route_dim={write_route_dim}")
+    d_route = m.get('d_route')
+    if d_route is None:
+        old_total = (
+            m.get('tag' + '_dim', 0)
+            + m.get('read_' + 's' + 'ig_dim', 0)
+            + m.get('write_' + 's' + 'ig_dim', 0)
+        )
+        d_route = old_total or m.get('d_bottleneck', 128)
     kw['d_route'] = d_route
-    kw['tag_dim'] = tag_dim
-    kw[legacy_read_key] = read_route_dim
-    kw[legacy_write_key] = write_route_dim
     return kw
 
 
@@ -284,8 +273,17 @@ MODEL_REGISTRY = {
     ),
     'spatial-r1-v4.1.5.2': ModelSpec(
         name='spatial-r1-v4.1.5.2',
-        module_path='models.dawn_spatial_v4152_droute_exp',
+        module_path='models.dawn_spatial_v4152',
         cls=DAWN_V4152,
+        build_kwargs=_dawn_v4152_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    ),
+    'spatial-r1-v4.1.5.4': ModelSpec(
+        name='spatial-r1-v4.1.5.4',
+        module_path='models.dawn_spatial_v4154',
+        cls=DAWN_V4154,
         build_kwargs=_dawn_v4152_kwargs,
         supports_sharded=True,
         force_sharded=True,
@@ -312,11 +310,8 @@ def build_model_from_config(cfg):
             f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
-    if version == 'spatial-r1-v4.1.5.2':
-        print(
-            "route dims: "
-            f"route_width={kwargs['tag_dim']}, "
-            f"d_route={kwargs['d_route']}")
+    if version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4'):
+        print(f"route dims: d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
 
@@ -1339,6 +1334,110 @@ def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_c
     _write_checkpoint_bytes(path, bytes_data)
 
 
+_V4152_OBSOLETE_ROUTE_KEYS = tuple(
+    f"{pool}_{side}_{'s' + 'ig_proj'}"
+    for pool in ('qk', 'v', 'know')
+    for side in ('read', 'write')
+)
+
+
+def _drop_v4152_obsolete_route_keys(tree):
+    """Drop route leaves that existed only in pre-cleanup v4.1.5.2 checkpoints."""
+    if isinstance(tree, dict):
+        return {
+            k: _drop_v4152_obsolete_route_keys(v)
+            for k, v in tree.items()
+            if k not in _V4152_OBSOLETE_ROUTE_KEYS
+        }
+    if isinstance(tree, list):
+        return [_drop_v4152_obsolete_route_keys(v) for v in tree]
+    if isinstance(tree, tuple):
+        return tuple(_drop_v4152_obsolete_route_keys(v) for v in tree)
+    return tree
+
+
+def _migrate_v4152_route_params(raw, target):
+    """Convert old split-route checkpoints into the current d_route-only state."""
+    params = raw.get('params')
+    target_params = target.get('params')
+    if not isinstance(params, dict) or not isinstance(target_params, dict):
+        return raw
+    pool = params.get('neuron_pool')
+    target_pool = target_params.get('neuron_pool')
+    if not isinstance(pool, dict) or not isinstance(target_pool, dict):
+        return raw
+
+    old_suffix = 's' + 'ig_proj'
+    changed = False
+    target_route_shapes = {}
+
+    def _row_unit(x):
+        x = np.asarray(x, dtype=np.float32)
+        return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
+
+    for name in ('qk', 'v', 'know'):
+        emb_key = f'{name}_emb'
+        read_key = f'{name}_read'
+        write_key = f'{name}_write'
+        read_proj_key = f'{name}_read_{old_suffix}'
+        write_proj_key = f'{name}_write_{old_suffix}'
+        if emb_key not in pool or emb_key not in target_pool:
+            continue
+        old_emb = np.asarray(pool[emb_key])
+        target_shape = np.asarray(target_pool[emb_key]).shape
+        target_route_shapes[emb_key] = target_shape
+        if old_emb.shape == target_shape:
+            continue
+        needed = target_shape[-1]
+        parts = [old_emb.astype(np.float32)]
+        if (read_key in pool and write_key in pool
+                and read_proj_key in pool and write_proj_key in pool):
+            r = _row_unit(pool[read_key])
+            w = _row_unit(pool[write_key])
+            r_proj = np.asarray(pool[read_proj_key], dtype=np.float32)
+            w_proj = np.asarray(pool[write_proj_key], dtype=np.float32)
+            r_part = _row_unit(r @ r_proj)
+            w_part = _row_unit(w @ w_proj)
+            parts.extend([r_part, w_part])
+        route = np.concatenate(parts, axis=-1)
+        if route.shape[-1] < needed:
+            pad = np.zeros(route.shape[:-1] + (needed - route.shape[-1],), dtype=route.dtype)
+            route = np.concatenate([route, pad], axis=-1)
+        pool[emb_key] = route[..., :needed].astype(old_emb.dtype)
+        changed = True
+
+    def _fit_leaf(x, shape):
+        arr = np.asarray(x)
+        if arr.shape == shape:
+            return x
+        out = np.zeros(shape, dtype=arr.dtype)
+        slices = tuple(slice(0, min(a, b)) for a, b in zip(arr.shape, shape))
+        out[slices] = arr[slices]
+        return out
+
+    def _fit_opt_state(tree):
+        if isinstance(tree, dict):
+            out = {}
+            for k, v in tree.items():
+                if k in _V4152_OBSOLETE_ROUTE_KEYS:
+                    continue
+                if k in target_route_shapes and hasattr(v, 'shape'):
+                    out[k] = _fit_leaf(v, target_route_shapes[k])
+                else:
+                    out[k] = _fit_opt_state(v)
+            return out
+        if isinstance(tree, list):
+            return [_fit_opt_state(v) for v in tree]
+        if isinstance(tree, tuple):
+            return tuple(_fit_opt_state(v) for v in tree)
+        return tree
+
+    if changed and 'opt_state' in raw:
+        raw['opt_state'] = _fit_opt_state(raw['opt_state'])
+    raw = _drop_v4152_obsolete_route_keys(raw)
+    return raw
+
+
 def load_checkpoint(path, target_params, target_opt_state):
     """Load checkpoint using flax serialization. Supports local and GCS paths."""
     import flax.serialization as serialization
@@ -1355,7 +1454,9 @@ def load_checkpoint(path, target_params, target_opt_state):
         'config': {},
         'training_config': {},
     }
-    ckpt = serialization.from_bytes(target, bytes_data)
+    raw = serialization.msgpack_restore(bytes_data)
+    migrated = _migrate_v4152_route_params(raw, target)
+    ckpt = serialization.from_state_dict(target, migrated)
     if jax.process_index() == 0:
         print(f"  Checkpoint loaded: {path}")
     return ckpt
@@ -1540,7 +1641,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     old train_fast / train_deep JSONL types should switch to type='train'.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4')
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -1716,7 +1817,7 @@ def _print_regular_block(rec, ctx):
         f" v={rec['drift_v_emb']:.2e}"
         f" k={rec['drift_know_emb']:.2e}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" k={rec['know_gate_den_sum_mean']:.1f}]"
@@ -1727,7 +1828,7 @@ def _print_regular_block(rec, ctx):
         f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
         f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4'):
         log_message(
             f"  scan_bias: know={rec['scan_know_bias']:+.3f}"
             f" attn=[{rec['scan_attn_bias_0']:+.3f} {rec['scan_attn_bias_1']:+.3f} {rec['scan_attn_bias_2']:+.3f}]"
@@ -1783,7 +1884,7 @@ def _build_analysis_record(base, metrics, ctx):
     those are pulled from analysis_result too.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4')
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -1888,7 +1989,7 @@ def _print_analysis_block(rec, ctx):
         f" qk={rec['qk_emb_norm_max']:.2f}"
         f" v={rec['v_emb_norm_max']:.2f}"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4'):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" k={rec['know_gate_den_sum']:.1f}"
@@ -2362,10 +2463,6 @@ def main():
     def _is_pool_param(path_str):
         return any(name in path_str for name in _POOL_PARAM_NAMES)
 
-    def _is_legacy_route_proj_param(path_str):
-        legacy_suffix = 's' + 'ig_proj'
-        return f'read_{legacy_suffix}' in path_str or f'write_{legacy_suffix}' in path_str
-
     def _is_rw_param(path_str):
         return any(name in path_str for name in _RW_PARAM_NAMES)
 
@@ -2378,16 +2475,9 @@ def main():
         if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
            or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
             return True  # learnable output_scale
-        if _is_legacy_route_proj_param(path_str):
-            return True  # compatibility-only zero-width route projections
-        if _MODEL_VERSION in ('spatial-r1-v4.1.5.2') and _is_rw_param(path_str):
+        if _MODEL_VERSION in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4') and _is_rw_param(path_str):
             return True  # v4.1.5 variants forward-normalize read/write directions
         return False
-
-    def _freeze_mask_legacy_route_proj(params):
-        def _f(path, _):
-            return _is_legacy_route_proj_param(_path_str(path))
-        return jax.tree.map_with_path(_f, params)
 
     def _wd_mask_base(params):
         def _f(path, _):
@@ -2405,14 +2495,17 @@ def main():
             return _is_pool_param(ps)
         return jax.tree.map_with_path(_f, params)
 
+    def _no_param_mask(params):
+        return jax.tree.map(lambda _: False, params)
+
     base_optimizer = optax.chain(
-        optax.masked(optax.set_to_zero(), mask=_freeze_mask_legacy_route_proj),
+        optax.masked(optax.set_to_zero(), mask=_no_param_mask),
         optax.clip_by_global_norm(1.0),
         optax.scale_by_adam(b2=0.95),
         optax.add_decayed_weights(weight_decay, mask=_wd_mask_base),
         optax.add_decayed_weights(pool_weight_decay, mask=_wd_mask_pool),
         optax.scale_by_learning_rate(schedule),
-        optax.masked(optax.set_to_zero(), mask=_freeze_mask_legacy_route_proj),
+        optax.masked(optax.set_to_zero(), mask=_no_param_mask),
     )
 
     if is_host0:
@@ -2432,19 +2525,10 @@ def main():
                 return v
             jax.tree.map_with_path(_f, mask)
             return out
-        def _count_legacy_route_proj(params):
-            n = [0]
-            def _f(path, _):
-                if _is_legacy_route_proj_param(_path_str(path)):
-                    n[0] += 1
-                return _
-            jax.tree.map_with_path(_f, params)
-            return n[0]
         _base_mask = _wd_mask_base(params)
         _pool_mask = _wd_mask_pool(params)
         print(f"  WD groups: base ({weight_decay}) = {_count_true(_base_mask)} tensors, "
-              f"pool ({pool_weight_decay}) = {_count_true(_pool_mask)} tensors, "
-              f"compat_route_proj_count = {_count_legacy_route_proj(params)}")
+              f"pool ({pool_weight_decay}) = {_count_true(_pool_mask)} tensors")
         _pool_paths = _collect_pool_paths(_pool_mask)
         if _pool_paths:
             print(f"    pool params: {_pool_paths[:9]}")
@@ -2491,7 +2575,7 @@ def main():
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
-        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.2'):
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -2573,6 +2657,7 @@ def main():
     is_spatial = model_version in (
         'spatial-r1-v3.9.4',
         'spatial-r1-v4.1.5.2',
+        'spatial-r1-v4.1.5.4',
     )
 
     mesh_model = cfg['training'].get('mesh_model', 1)
@@ -2825,7 +2910,7 @@ def main():
         # Only print statements are guarded by is_host0.
         try:
             _is_sharded = _sharded_fns is not None
-            _uses_scan_bias = model_version in ('spatial-r1-v4.1.5.2')
+            _uses_scan_bias = model_version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.4')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",

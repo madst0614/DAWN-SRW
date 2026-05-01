@@ -1,15 +1,15 @@
-# DAWN Spatial-R1 v4.1.5.2 -- d_route-only tag routing
+# DAWN Spatial-R1 v4.1.5.4 -- d_route-only tag routing
 #
 # Sister of train_config_spatial_r1_v4_1_40M_c4_5B.yaml.
-# train_jax.py maps model_version: "spatial-r1-v4.1.5.2" to:
-#   models/dawn_spatial_v4152.py
+# train_jax.py maps model_version: "spatial-r1-v4.1.5.4" to:
+#   models/dawn_spatial_v4154.py
 #
 # This keeps the baseline v4.1 training hyperparameters fixed while using
 # the d_route-only route convention:
 #   scan = scan_scale * tanh(scan_bias)
 #   tau = s_mean + tau_offset * s_std - scan / max(s_std, scan_std_floor)
 #
-# v4.1.5.2 train_jax default:
+# v4.1.5.4 train_jax default:
 #   route_width=d_route
 #
 # Route interpretation:
@@ -29,7 +29,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v4.1.5.2"
+  model_version: "spatial-r1-v4.1.5.4"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -55,7 +55,7 @@ training:
   num_epochs: 1
   lr: 0.00065
   weight_decay: 0.1
-  pool_weight_decay: 0.02    # v4.1.5.2 decays free-norm emb/tag; RW is WD-excluded
+  pool_weight_decay: 0.02    # v4.1.5.4 decays free-norm emb/tag; RW is WD-excluded
   warmup_ratio: 0.06
   diversity_weight: 0.1
   load_balance_weight: 0.0
@@ -99,5 +99,5 @@ training:
   log_analysis_multiplier: 5
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.2_40M_c4_5B_tag128_balanced
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5.2_40M_c4_5B_tag128_balanced
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.4_40M_c4_5B_tag128_balanced
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5.4_40M_c4_5B_tag128_balanced
