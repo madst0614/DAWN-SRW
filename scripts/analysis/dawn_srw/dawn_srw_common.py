@@ -51,6 +51,58 @@ def import_dawn_srw():
     return importlib.import_module("models.dawn_srw")
 
 
+GATE_CONSTANTS = {
+    "sharpness": "SHARPNESS",
+    "activation_threshold": "ACTIVATION_THRESHOLD",
+    "activation_cutoff": "ACTIVATION_CUTOFF",
+    "epsilon": "EPSILON",
+    "max_intensity": "MAX_INTENSITY",
+    "scan_scale": "SCAN_SCALE",
+    "scan_std_floor": "SCAN_STD_FLOOR",
+}
+
+
+def gate_constants_from_config(cfg: Dict[str, Any]) -> Dict[str, float]:
+    """Return DAWN-SRW gate constants from training config.
+
+    The official training path bakes these values into sharded SRW functions.
+    Standalone analysis/probe scripts must use the same values, otherwise
+    traces can silently cap gates at the module default instead of the run's
+    configured max_intensity.
+    """
+    t = cfg.get("training", {})
+    return {
+        "sharpness": float(t.get("sharpness", 500.0)),
+        "activation_threshold": float(t.get("activation_threshold", 0.5)),
+        "activation_cutoff": float(t.get("activation_cutoff", 0.01)),
+        "epsilon": float(t.get("epsilon", 1.0e-4)),
+        "max_intensity": float(t.get("max_intensity", 10.0)),
+        "scan_scale": float(t.get("scan_scale", 0.01)),
+        "scan_std_floor": float(t.get("scan_std_floor", 0.5)),
+    }
+
+
+def apply_gate_constants_from_config(cfg: Dict[str, Any], mod=None, verbose: bool = False):
+    """Patch module-level DAWN-SRW gate constants for standalone analysis.
+
+    Training uses config-baked closures. The analysis helpers use the official
+    module's inference/probe functions, which read module-level constants.
+    This function makes those standalone functions match the checkpoint run.
+    """
+    if mod is None:
+        mod = import_dawn_srw()
+    const = gate_constants_from_config(cfg)
+    for key, attr in GATE_CONSTANTS.items():
+        if hasattr(mod, attr):
+            setattr(mod, attr, const[key])
+    if verbose:
+        print(
+            "Gate constants: "
+            + ", ".join(f"{k}={v}" for k, v in const.items())
+        )
+    return const
+
+
 def is_gcs(path: str | os.PathLike[str]) -> bool:
     return str(path).startswith("gs://")
 
@@ -129,6 +181,7 @@ def select_checkpoint(checkpoint: str | os.PathLike[str]) -> str:
 
 def build_model(cfg: Dict[str, Any]):
     mod = import_dawn_srw()
+    apply_gate_constants_from_config(cfg, mod, verbose=True)
     m = cfg["model"]
     t = cfg.get("training", {})
     return mod.DAWN(
@@ -169,6 +222,7 @@ def model_cfg_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "n_chunks_qk": t.get("n_chunks_qk", 1),
         "n_chunks_v": t.get("n_chunks_v", 1),
         "n_chunks_rst": t.get("n_chunks_rst", t.get("n_chunks_know", 1)),
+        **gate_constants_from_config(cfg),
     }
 
 
@@ -195,6 +249,7 @@ def load_checkpoint_params(checkpoint: str | os.PathLike[str], cfg: Dict[str, An
         params, meta
     """
     mod = import_dawn_srw()
+    apply_gate_constants_from_config(cfg, mod, verbose=False)
     if model is None:
         model = build_model(cfg)
     target_params = init_target_params(model, cfg)
