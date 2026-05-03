@@ -1,8 +1,8 @@
 # DAWN-SRW -- 400M d_route-only tag routing
 #
 # 400M/v4-32 scale variant of the 40M v4.1.5.5 run.
-# Parameter-matched to the 400M TF baseline by keeping depth fixed and
-# increasing d_model, while preserving the 40M pool ratio.
+# Restores the earlier 400M width/pool scale (d_model=1280) while keeping
+# the v4.1.5.5 d_route-only route.
 #   route_width=d_route
 # ============================================================
 
@@ -17,28 +17,28 @@ data:
 
 model:
   model_version: "dawn_srw"
-  d_model: 2304
+  d_model: 1280
   n_layers: 18
-  n_heads: 36
+  n_heads: 16
   max_seq_len: 512
   dropout: 0.0
   gradient_checkpointing: true
 
   d_route: 256
 
-  n_qk: 2430
-  n_v: 8574
-  n_know: 37160
+  n_qk: 6390
+  n_v: 40300
+  n_know: 80160
   router_dropout: 0.02
 
 training:
-  batch_size: 512
+  batch_size: 1024
   mesh_model: 2
   mesh_data: 8
   n_chunks_qk: 1
   n_chunks_v: 1
   n_chunks_know: 4
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   num_epochs: 1
   lr: 0.0003
   weight_decay: 0.1
@@ -62,7 +62,7 @@ training:
 
   # ---- Explore loss (v4.1+ per-token bound) ----
   exploration_weight: 0.001
-  exploration_asymmetry: 1.25
+  exploration_asymmetry: 5.0
   exploration_warmup_steps: 1000
   exploration_lower_bound: -0.5
   exploration_upper_bound: 2.0
@@ -75,5 +75,5 @@ training:
   heavy_geometry_multiplier: 10
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_400M_c4_40B_dmodel
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_400M_c4_40B_dmodel
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_400M_c4_40B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_400M_c4_40B
