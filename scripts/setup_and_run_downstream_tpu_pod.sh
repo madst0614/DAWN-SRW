@@ -18,9 +18,17 @@ echo "============================================"
 cd "$WORK_DIR"
 
 echo "[1/4] Installing dependencies..."
-pip install --upgrade pip -q
-pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-pip install flax optax numpy pyyaml gcsfs datasets transformers sentencepiece -q
+python3 -m pip install --upgrade pip -q
+python3 -m pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
+python3 -m pip install -U flax optax numpy pyyaml gcsfs datasets transformers sentencepiece pyarrow fsspec huggingface_hub -q
+python3 - <<'PYCHK'
+import sys
+import datasets
+import transformers
+print(f"  Python: {sys.executable}", flush=True)
+print(f"  datasets: {datasets.__version__}", flush=True)
+print(f"  transformers: {transformers.__version__}", flush=True)
+PYCHK
 
 echo "[2/4] Verifying downstream files..."
 test -f scripts/downstream_finetune_jax.py || { echo "missing scripts/downstream_finetune_jax.py" >&2; exit 2; }
