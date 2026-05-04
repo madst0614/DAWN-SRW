@@ -16,23 +16,6 @@ def scaled_normal(scale=0.02):
     return init
 
 
-def safe_dropout(x, rate, deterministic, rng):
-    """Dropout that is safe under nn.remat/checkpoint.
-
-    Flax nn.Dropout uses a Python boolean branch on `deterministic`. When a
-    rematerialized layer receives `deterministic` as a JAX tracer, that branch
-    raises TracerBoolConversionError. This implementation keeps the decision in
-    JAX (`jnp.where`) while only branching on the static dropout rate.
-    """
-    if rate == 0.0:
-        return x
-    keep_rate = 1.0 - rate
-    mask = jax.random.bernoulli(rng, keep_rate, x.shape)
-    deterministic = jnp.asarray(deterministic)
-    mask = jnp.where(deterministic, jnp.ones_like(mask), mask)
-    return jnp.where(mask, x / keep_rate, 0.0)
-
-
 class StandardAttention(nn.Module):
     d_model: int
     n_heads: int
@@ -44,6 +27,7 @@ class StandardAttention(nn.Module):
         self.k_proj = nn.Dense(self.d_model)
         self.v_proj = nn.Dense(self.d_model)
         self.o_proj = nn.Dense(self.d_model, use_bias=False)
+        self.attn_dropout = nn.Dropout(self.dropout_rate)
 
     def __call__(self, x, deterministic=False):
         B, S, D = x.shape
@@ -57,8 +41,7 @@ class StandardAttention(nn.Module):
         scores = jnp.where(causal_mask, scores, jnp.finfo(scores.dtype).min)
         attn_weights = jax.nn.softmax(scores, axis=-1)
 
-        attn_weights = safe_dropout(
-            attn_weights, self.dropout_rate, deterministic, self.make_rng('dropout'))
+        attn_weights = self.attn_dropout(attn_weights, deterministic=deterministic)
 
         out = jnp.einsum('bhst,bhtd->bhsd', attn_weights, v)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
@@ -74,7 +57,7 @@ class StandardFFN(nn.Module):
     def __call__(self, x, deterministic=False):
         h = nn.Dense(self.d_ff)(x)
         h = nn.gelu(h)
-        h = safe_dropout(h, self.dropout_rate, deterministic, self.make_rng('dropout'))
+        h = nn.Dropout(self.dropout_rate)(h, deterministic=deterministic)
         h = nn.Dense(self.d_model)(h)
         return h
 
@@ -121,13 +104,19 @@ class VanillaTransformer(nn.Module):
                                   embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(self.max_seq_len, self.d_model,
                                 embedding_init=scaled_normal(0.02))
-        LayerCls = nn.remat(TransformerLayer) if self.gradient_checkpointing else TransformerLayer
+        # Keep the original Flax Dropout path for memory parity with pretraining.
+        # On current Flax/JAX, deterministic must be static under remat; otherwise
+        # nn.Dropout tries to branch on a traced bool and raises TracerBoolConversionError.
+        # static_argnums=(2,) corresponds to TransformerLayer.__call__(self, x, deterministic).
+        LayerCls = (nn.remat(TransformerLayer, static_argnums=(2,))
+                    if self.gradient_checkpointing else TransformerLayer)
         self.layers = [
             LayerCls(self.d_model, self.n_heads, self.d_ff,
                      self.dropout_rate, name=f'layer_{i}')
             for i in range(self.n_layers)
         ]
         self.norm = nn.LayerNorm()
+        self.emb_dropout = nn.Dropout(self.dropout_rate)
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
                  deterministic=False):
@@ -135,7 +124,7 @@ class VanillaTransformer(nn.Module):
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = self.token_emb(input_ids) + self.pos_emb(positions)
 
-        x = safe_dropout(x, self.dropout_rate, deterministic, self.make_rng('dropout'))
+        x = self.emb_dropout(x, deterministic=deterministic)
 
         for layer in self.layers:
             x = layer(x, deterministic)
