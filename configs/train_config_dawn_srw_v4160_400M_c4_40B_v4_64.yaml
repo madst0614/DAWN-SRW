@@ -53,7 +53,10 @@ training:
   pool_weight_decay: 0.02
   tau_lr_mult: 0.1
   tau_grad_clip: 1.0
+  router_proj_lr_mult: 1.0
   router_proj_grad_clip: 2.0
+  route_emb_lr_mult: 1.0
+  route_emb_grad_clip: 2.0
 
   # DirectTau Angular Select / Intensity
   tau_init_attn_qk: 0.001
@@ -78,7 +81,7 @@ training:
   exploration_asymmetry_rst: 2.0
   exploration_warmup_steps: 0
   exploration_lower_bound: 0.0
-  exploration_upper_bound: 0.95
+  exploration_upper_bound: 0.70
   exploration_bound_eps: 0.001
 
   # Chunking — 400M-specific memory/mesh setting
