@@ -1186,6 +1186,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       dead_penalty_v_weight=1.0,
                       dead_penalty_rst_weight=1.0,
                       dead_penalty_weighted_clip=0.0,
+                      selection_margin_reg_weight_qk=0.0,
+                      selection_margin_reg_weight_v=0.0,
+                      selection_margin_reg_weight_rst=0.0,
                       global_grad_clip=0.0,
                       tau_lr_mult=1.0,
                       tau_grad_clip=0.0,
@@ -1284,6 +1287,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _dead_penalty_v_weight = jnp.float32(dead_penalty_v_weight)
     _dead_penalty_rst_weight = jnp.float32(dead_penalty_rst_weight)
     _dead_weighted_clip = jnp.float32(dead_penalty_weighted_clip)
+    _selection_margin_reg_weight_qk = jnp.float32(selection_margin_reg_weight_qk)
+    _selection_margin_reg_weight_v = jnp.float32(selection_margin_reg_weight_v)
+    _selection_margin_reg_weight_rst = jnp.float32(selection_margin_reg_weight_rst)
     _global_grad_clip = jnp.float32(global_grad_clip)
     _tau_lr_mult = jnp.float32(tau_lr_mult)
     _tau_grad_clip = jnp.float32(tau_grad_clip)
@@ -1341,6 +1347,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     + _dead_penalty_rst_weight * dead_rst_raw)
             else:
                 dead_penalty = dead_penalty_unweighted
+            selection_margin_reg_raw_qk = result.get(
+                'selection_margin_reg_qk', jnp.float32(0.0))
+            selection_margin_reg_raw_v = result.get(
+                'selection_margin_reg_v', jnp.float32(0.0))
+            selection_margin_reg_raw_rst = result.get(
+                'selection_margin_reg_rst', jnp.float32(0.0))
+            selection_margin_reg_weighted_qk = (
+                _selection_margin_reg_weight_qk * selection_margin_reg_raw_qk)
+            selection_margin_reg_weighted_v = (
+                _selection_margin_reg_weight_v * selection_margin_reg_raw_v)
+            selection_margin_reg_weighted_rst = (
+                _selection_margin_reg_weight_rst * selection_margin_reg_raw_rst)
+            selection_margin_reg_loss = (
+                selection_margin_reg_weighted_qk
+                + selection_margin_reg_weighted_v
+                + selection_margin_reg_weighted_rst)
             # v4.1 batch-global-mean exploration loss.
             per_token_ce = result.get('per_token_ce', None)
             attn_tau_off = result.get('attn_tau_direct', result.get('attn_tau_offset', None))
@@ -1585,6 +1607,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + div_weight * div_loss
                               + dead_penalty_weighted
                               + explore_loss_weighted)
+            total_loss = total_loss + selection_margin_reg_loss
 
             explore_stats = dict(
                 global_mean_ce=global_mean_ce,
@@ -1623,6 +1646,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 dead_penalty_rst_weight=_dead_penalty_rst_weight,
                 dead_penalty_weighted_unclipped=dead_penalty_weighted_unclipped,
                 dead_penalty_weighted_clipped=dead_penalty_weighted,
+                selection_margin_reg_raw_qk=selection_margin_reg_raw_qk,
+                selection_margin_reg_raw_v=selection_margin_reg_raw_v,
+                selection_margin_reg_raw_rst=selection_margin_reg_raw_rst,
+                selection_margin_reg_weight_qk=_selection_margin_reg_weight_qk,
+                selection_margin_reg_weight_v=_selection_margin_reg_weight_v,
+                selection_margin_reg_weight_rst=_selection_margin_reg_weight_rst,
+                selection_margin_reg_weighted_qk=selection_margin_reg_weighted_qk,
+                selection_margin_reg_weighted_v=selection_margin_reg_weighted_v,
+                selection_margin_reg_weighted_rst=selection_margin_reg_weighted_rst,
+                selection_margin_reg_weighted_total=selection_margin_reg_loss,
                 step_in_train=step,
             )
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
@@ -2298,6 +2331,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         explore_loss_weighted_unclipped_metric = explore_stats['explore_loss_weighted_unclipped']
         dead_penalty_weighted_metric = explore_stats['dead_penalty_weighted_clipped']
         dead_penalty_weighted_unclipped_metric = explore_stats['dead_penalty_weighted_unclipped']
+        selection_margin_reg_weighted_total_metric = explore_stats[
+            'selection_margin_reg_weighted_total']
         metrics = {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
@@ -2320,6 +2355,26 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'dead_penalty_qk_weight': explore_stats['dead_penalty_qk_weight'],
             'dead_penalty_v_weight': explore_stats['dead_penalty_v_weight'],
             'dead_penalty_rst_weight': explore_stats['dead_penalty_rst_weight'],
+            'selection_margin_reg_raw_qk': explore_stats[
+                'selection_margin_reg_raw_qk'],
+            'selection_margin_reg_raw_v': explore_stats[
+                'selection_margin_reg_raw_v'],
+            'selection_margin_reg_raw_rst': explore_stats[
+                'selection_margin_reg_raw_rst'],
+            'selection_margin_reg_weight_qk': explore_stats[
+                'selection_margin_reg_weight_qk'],
+            'selection_margin_reg_weight_v': explore_stats[
+                'selection_margin_reg_weight_v'],
+            'selection_margin_reg_weight_rst': explore_stats[
+                'selection_margin_reg_weight_rst'],
+            'selection_margin_reg_weighted_qk': explore_stats[
+                'selection_margin_reg_weighted_qk'],
+            'selection_margin_reg_weighted_v': explore_stats[
+                'selection_margin_reg_weighted_v'],
+            'selection_margin_reg_weighted_rst': explore_stats[
+                'selection_margin_reg_weighted_rst'],
+            'selection_margin_reg_weighted_total': (
+                selection_margin_reg_weighted_total_metric),
             'attn_qk_dead_penalty': result.get(
                 'attn_qk_dead_penalty', jnp.float32(0.0)),
             'attn_v_dead_penalty': result.get(
@@ -2391,7 +2446,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 + orth_weight * orth_loss
                 + div_weight * div_loss
                 + dead_penalty_weighted_metric
-                + explore_loss_weighted_metric)),
+                + explore_loss_weighted_metric
+                + selection_margin_reg_weighted_total_metric)),
             'correct': result['correct'],
             'valid_count': result['valid_count'],
             'grad_norm': grad_norm,
@@ -3981,6 +4037,26 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'dead_penalty_weighted_total',
             ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)))),
         'dead_count_total': float(m.get('dead_count_total', 0.0)),
+        'selection_margin_reg_raw_qk': float(m.get(
+            'selection_margin_reg_raw_qk', 0.0)),
+        'selection_margin_reg_raw_v': float(m.get(
+            'selection_margin_reg_raw_v', 0.0)),
+        'selection_margin_reg_raw_rst': float(m.get(
+            'selection_margin_reg_raw_rst', 0.0)),
+        'selection_margin_reg_weight_qk': float(m.get(
+            'selection_margin_reg_weight_qk', 0.0)),
+        'selection_margin_reg_weight_v': float(m.get(
+            'selection_margin_reg_weight_v', 0.0)),
+        'selection_margin_reg_weight_rst': float(m.get(
+            'selection_margin_reg_weight_rst', 0.0)),
+        'selection_margin_reg_weighted_qk': float(m.get(
+            'selection_margin_reg_weighted_qk', 0.0)),
+        'selection_margin_reg_weighted_v': float(m.get(
+            'selection_margin_reg_weighted_v', 0.0)),
+        'selection_margin_reg_weighted_rst': float(m.get(
+            'selection_margin_reg_weighted_rst', 0.0)),
+        'selection_margin_reg_weighted_total': float(m.get(
+            'selection_margin_reg_weighted_total', 0.0)),
         'dead_penalty_per_dead': float(m.get('dead_penalty_per_dead', 0.0)),
         'attn_dead_penalty_per_dead': float(m.get(
             'attn_dead_penalty_per_dead', 0.0)),
@@ -5598,6 +5674,16 @@ def _print_debug_block(rec, ctx):
         f"recon_err={_g('reconstructed_loss_error'):.3e}"
     )
     if is_v4160:
+        log_debug_message(
+            f"selection_margin_reg: "
+            f"raw[qk={_g('selection_margin_reg_raw_qk'):.6f} "
+            f"v={_g('selection_margin_reg_raw_v'):.6f} "
+            f"rst={_g('selection_margin_reg_raw_rst'):.6f}] "
+            f"weighted[qk={_g('selection_margin_reg_weighted_qk'):.6f} "
+            f"v={_g('selection_margin_reg_weighted_v'):.6f} "
+            f"rst={_g('selection_margin_reg_weighted_rst'):.6f} "
+            f"total={_g('selection_margin_reg_weighted_total'):.6f}]"
+        )
         _qk_per_dead = _g('attn_qk_dead_penalty') / max(_g('attn_qk_dead_count'), 1.0)
         _v_per_dead = _g('attn_v_dead_penalty') / max(_g('attn_v_dead_count'), 1.0)
         log_debug_message(
@@ -6638,6 +6724,12 @@ def main():
     dead_penalty_v_weight = tcfg.get('dead_penalty_v_weight', 1.0)
     dead_penalty_rst_weight = tcfg.get('dead_penalty_rst_weight', 1.0)
     dead_exposure_target = float(tcfg.get('dead_exposure_target', 0.1))
+    selection_margin_reg_weight_qk = tcfg.get(
+        'selection_margin_reg_weight_qk', 0.0)
+    selection_margin_reg_weight_v = tcfg.get(
+        'selection_margin_reg_weight_v', 0.0)
+    selection_margin_reg_weight_rst = tcfg.get(
+        'selection_margin_reg_weight_rst', 0.0)
     # v4.1 RPE exploration loss (0 weight => off; no-op for earlier versions).
     exploration_weight = tcfg.get('exploration_weight', 0.0)
     exploration_weight_qk = tcfg.get('exploration_weight_qk', exploration_weight)
@@ -6912,6 +7004,15 @@ def main():
                 'dead_penalty_rst_weight', dead_penalty_rst_weight)
             dead_exposure_target = float(saved_training_config.get(
                 'dead_exposure_target', dead_exposure_target))
+            selection_margin_reg_weight_qk = saved_training_config.get(
+                'selection_margin_reg_weight_qk',
+                selection_margin_reg_weight_qk)
+            selection_margin_reg_weight_v = saved_training_config.get(
+                'selection_margin_reg_weight_v',
+                selection_margin_reg_weight_v)
+            selection_margin_reg_weight_rst = saved_training_config.get(
+                'selection_margin_reg_weight_rst',
+                selection_margin_reg_weight_rst)
             exploration_weight = saved_training_config.get(
                 'exploration_weight', exploration_weight)
             exploration_weight_qk = saved_training_config.get(
@@ -7047,6 +7148,9 @@ def main():
         'dead_penalty_v_weight': dead_penalty_v_weight,
         'dead_penalty_rst_weight': dead_penalty_rst_weight,
         'dead_exposure_target': dead_exposure_target,
+        'selection_margin_reg_weight_qk': selection_margin_reg_weight_qk,
+        'selection_margin_reg_weight_v': selection_margin_reg_weight_v,
+        'selection_margin_reg_weight_rst': selection_margin_reg_weight_rst,
         'exploration_weight': exploration_weight,
         'exploration_weight_qk': exploration_weight_qk,
         'exploration_weight_v': exploration_weight_v,
@@ -7457,6 +7561,10 @@ def main():
               f"exposure_target={dead_exposure_target} "
               f"pool_w[qk={dead_penalty_qk_weight}, v={dead_penalty_v_weight}, "
               f"rst={dead_penalty_rst_weight}]")
+        print("  Selection-margin regularization: "
+              f"qk={selection_margin_reg_weight_qk} "
+              f"v={selection_margin_reg_weight_v} "
+              f"rst={selection_margin_reg_weight_rst}")
         if rpe_enabled:
             print(f"  Exploration weight: {exploration_weight}")
             print("    weight split: "
@@ -7800,6 +7908,9 @@ def main():
         dead_penalty_v_weight=dead_penalty_v_weight,
         dead_penalty_rst_weight=dead_penalty_rst_weight,
         dead_penalty_weighted_clip=dead_penalty_weighted_clip,
+        selection_margin_reg_weight_qk=selection_margin_reg_weight_qk,
+        selection_margin_reg_weight_v=selection_margin_reg_weight_v,
+        selection_margin_reg_weight_rst=selection_margin_reg_weight_rst,
         global_grad_clip=global_grad_clip,
         tau_lr_mult=tau_lr_mult,
         tau_grad_clip=tau_grad_clip,

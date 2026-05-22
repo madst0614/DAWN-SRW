@@ -75,6 +75,13 @@ training:
   dead_penalty_weight: 0.001
   dead_exposure_target: 0.1
 
+  # Selection-margin regularization.
+  # Penalizes only scores that cross the current DirectTau boundary.
+  # Does not regularize inactive/pre-boundary candidates.
+  selection_margin_reg_weight_qk: 2.0e-5
+  selection_margin_reg_weight_v: 5.0e-5
+  selection_margin_reg_weight_rst: 2.0e-4
+
   # Exploration / RPE feedback over direct tau in [0, 1]
   exploration_weight: 0.001
   exploration_weight_qk: 0.001
