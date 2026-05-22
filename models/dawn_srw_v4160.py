@@ -186,6 +186,12 @@ ATTN_SPLIT_CORE_NAMES = (
     'v_top1_gate_frac_max',
     'qk_dead_penalty',
     'v_dead_penalty',
+    'q_active_frac',
+    'k_active_frac',
+    'q_strong_frac',
+    'k_strong_frac',
+    'q_active_n_mean',
+    'k_active_n_mean',
 )
 ATTN_SPLIT_CORE_COUNT = len(ATTN_SPLIT_CORE_NAMES)
 (
@@ -213,6 +219,12 @@ ATTN_SPLIT_CORE_COUNT = len(ATTN_SPLIT_CORE_NAMES)
     ATTN_SPLIT_V_TOP1_GATE_FRAC_MAX,
     ATTN_SPLIT_QK_DEAD_PENALTY,
     ATTN_SPLIT_V_DEAD_PENALTY,
+    ATTN_SPLIT_Q_ACTIVE_FRAC,
+    ATTN_SPLIT_K_ACTIVE_FRAC,
+    ATTN_SPLIT_Q_STRONG_FRAC,
+    ATTN_SPLIT_K_STRONG_FRAC,
+    ATTN_SPLIT_Q_ACTIVE_N_MEAN,
+    ATTN_SPLIT_K_ACTIVE_N_MEAN,
 ) = range(ATTN_SPLIT_CORE_COUNT)
 
 
@@ -1068,6 +1080,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         P(),                          # top1_gate_frac_mean scalar
         P(),                          # top1_gate_frac_max scalar
     )
+    _route_split_out_specs = (
+        P(),                          # q_active_frac scalar
+        P(),                          # k_active_frac scalar
+        P(),                          # q_strong_frac scalar
+        P(),                          # k_strong_frac scalar
+        P(),                          # q_active_n_mean scalar
+        P(),                          # k_active_n_mean scalar
+    )
     _select_diag_specs = tuple(P() for _ in range(SELECT_DIAG_COUNT))
     _dead_exposure_diag_specs = tuple(
         P() for _ in range(DEAD_EXPOSURE_DIAG_COUNT))
@@ -1077,8 +1097,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         P(),                          # top1_breakdown_values [2, field]
         P(),                          # top1_breakdown_locs [2, b/t/neuron]
     )
-    _out_specs = (_slim_out_specs + _conc_out_specs + _analysis_extra_specs
-                  if analysis else _slim_out_specs + _conc_out_specs)
+    _out_specs = (_slim_out_specs + _conc_out_specs
+                  + _route_split_out_specs + _analysis_extra_specs
+                  if analysis
+                  else _slim_out_specs + _conc_out_specs
+                  + _route_split_out_specs)
     _out_specs = _out_specs + _select_diag_specs
     _out_specs = _out_specs + _dead_exposure_diag_specs
     if _local_diagnostics:
@@ -1601,6 +1624,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     current_cost_mean, selection_residency_loss)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
+        route_split_out = (
+            active_frac[:, :, 0, :].mean(),
+            active_frac[:, :, 1, :].mean(),
+            strong_frac[:, :, 0, :].mean(),
+            strong_frac[:, :, 1, :].mean(),
+            global_active_m[:, :, 0, :].mean(),
+            global_active_m[:, :, 1, :].mean(),
+        )
         local_diag_out = ()
         if _local_diagnostics:
             tau_abs_max = jnp.max(
@@ -1646,7 +1677,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 metric_vals.astype(jnp.float32), metric_locs,
                 top1_details, top1_locs)
         if not analysis:
-            return (slim_out + conc_out + select_diag_out
+            return (slim_out + conc_out + route_split_out + select_diag_out
                     + dead_exposure_diag_out + local_diag_out)
 
         # --- Analysis-only extras ---
@@ -1674,7 +1705,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             jax.lax.psum(total_int_cap_count, 'model')
             / jnp.float32(B * S * 2 * N_total))
         # local_diag_out is collected inline in pass 2 above; no replay path.
-        return (slim_out + conc_out
+        return (slim_out + conc_out + route_split_out
                 + (margin_band_frac_mean, margin_band_wide_frac,
                    margin_band_mid_frac, rho_skew, active_per_token_std,
                    gate_entropy, den_cost_out, selection_cost_out,
@@ -1843,7 +1874,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      qk_selection_residency) = qk_ret[:17]
     (qk_gate_eff_n, qk_gate_eff_ratio,
      qk_top1_gate_frac, qk_top1_gate_frac_max) = qk_ret[17:21]
-    qk_offset = 21
+    (q_active, k_active, q_strong, k_strong,
+     q_active_n_mean, k_active_n_mean) = qk_ret[21:27]
+    qk_offset = 27
     if analysis:
         (qk_margin_band, qk_margin_band_wide, qk_margin_band_mid, qk_skew, qk_apt_std, qk_entropy,
          qk_den_cost, qk_selection_cost, qk_current_cost,
@@ -2072,6 +2105,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         v_top1_gate_frac_max,
         qk_dead_pen,
         v_dead_pen,
+        q_active,
+        k_active,
+        q_strong,
+        k_strong,
+        q_active_n_mean,
+        k_active_n_mean,
     )).astype(jnp.float32)
     attn_qk_select_diag = jnp.stack(qk_select_diag).astype(jnp.float32)
     attn_v_select_diag = jnp.stack(v_select_diag).astype(jnp.float32)
@@ -2940,12 +2979,16 @@ class DAWN(nn.Module):
                 rst_positive_margin_active_all.mean()),
 
             'attn_qk_active': attn_qk_active_all.mean(),
+            'attn_q_active': _attn_core_mean(ATTN_SPLIT_Q_ACTIVE_FRAC),
+            'attn_k_active': _attn_core_mean(ATTN_SPLIT_K_ACTIVE_FRAC),
             'attn_v_active': attn_v_active_all.mean(),
             'attn_raw_gate_max': attn_raw_gmax_all.mean(),
             'attn_gate_sum': attn_gsum_all.mean(),
             'attn_active_n_mean': attn_active_n_mean_all.mean(),
             'attn_strong': attn_strong_all.mean(),
             'attn_qk_strong': attn_qk_strong_all.mean(),
+            'attn_q_strong': _attn_core_mean(ATTN_SPLIT_Q_STRONG_FRAC),
+            'attn_k_strong': _attn_core_mean(ATTN_SPLIT_K_STRONG_FRAC),
             'attn_v_strong': attn_v_strong_all.mean(),
             'attn_qk_positive_margin_mean_active': (
                 attn_qk_positive_margin_active_all.mean()),
@@ -3131,6 +3174,10 @@ class DAWN(nn.Module):
                 ATTN_SPLIT_V_GATE_SUM),
             'attn_qk_active_n_mean': _attn_core_mean(
                 ATTN_SPLIT_QK_ACTIVE_N_MEAN),
+            'attn_q_active_n_mean': _attn_core_mean(
+                ATTN_SPLIT_Q_ACTIVE_N_MEAN),
+            'attn_k_active_n_mean': _attn_core_mean(
+                ATTN_SPLIT_K_ACTIVE_N_MEAN),
             'attn_v_active_n_mean': _attn_core_mean(
                 ATTN_SPLIT_V_ACTIVE_N_MEAN),
             'attn_qk_tau_abs_mean': _attn_core_mean(
