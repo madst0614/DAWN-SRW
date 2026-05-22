@@ -79,7 +79,7 @@ training:
   exploration_weight: 0.001
   exploration_weight_qk: 0.001
   exploration_weight_v: 0.001
-  exploration_weight_rst: 0.001
+  exploration_weight_rst: 0.002
   exploration_asymmetry: 1.0
   exploration_asymmetry_qk: 1.2
   exploration_asymmetry_v: 1.5
