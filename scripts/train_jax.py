@@ -4688,6 +4688,16 @@ def _print_regular_block(rec, ctx):
             f" v={rec['attn_v_no_active_frac']*100:.2f}%"
             f" rst={rec['rst_no_active_frac']*100:.2f}%]"
         )
+        log_message(
+            f"  selection_margin_reg: "
+            f"raw[qk={rec['selection_margin_reg_raw_qk']:.6f}"
+            f" v={rec['selection_margin_reg_raw_v']:.6f}"
+            f" rst={rec['selection_margin_reg_raw_rst']:.6f}]"
+            f" weighted[qk={rec['selection_margin_reg_weighted_qk']:.6f}"
+            f" v={rec['selection_margin_reg_weighted_v']:.6f}"
+            f" rst={rec['selection_margin_reg_weighted_rst']:.6f}"
+            f" total={rec['selection_margin_reg_weighted_total']:.6f}]"
+        )
     if is_v4160:
         log_message(
             f"  gate_max[qk={rec['attn_qk_raw_gate_max']:.1f}"
