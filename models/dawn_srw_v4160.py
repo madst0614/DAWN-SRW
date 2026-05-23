@@ -294,6 +294,28 @@ def _forward_unit_direction(x):
                 + RW_FORWARD_NORM_EPS)
 
 
+@jax.custom_vjp
+def _block_tau_up_when_no_active(tau, no_active):
+    return tau
+
+
+def _block_tau_up_fwd(tau, no_active):
+    return tau, no_active
+
+
+def _block_tau_up_bwd(no_active, g):
+    no_active = no_active.astype(jnp.bool_)
+    block_up = no_active & (g < 0.0)
+    g_tau = jnp.where(block_up, 0.0, g)
+    return g_tau, None
+
+
+_block_tau_up_when_no_active.defvjp(
+    _block_tau_up_fwd,
+    _block_tau_up_bwd,
+)
+
+
 def scaled_normal(scale=0.02):
     def init(key, shape, dtype=jnp.float32):
         return jax.random.normal(key, shape, dtype) * scale
@@ -395,6 +417,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         P(),                     # current_cost_mean scalar
         P(),                     # selection_residency_loss scalar (disabled selection-residency)
         P(),                     # selection_margin_reg scalar
+        P('data', None, None),   # tau_direct [B,S,1]
+        P('data', None, None),   # no_active_direct [B,S,1]
     )
     # ANALYSIS extras appended after slim.
     _analysis_extra_specs = (
@@ -867,6 +891,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             jax.lax.stop_gradient(total_rho_max), 'model')
         global_selection_margin_max = jax.lax.pmax(
             jax.lax.stop_gradient(total_selection_margin_max), 'model')
+        no_active_direct = jax.lax.stop_gradient(
+            (global_selection_margin_max <= 0.0).astype(jnp.float32))
+        tau_direct = _block_tau_up_when_no_active(
+            tau, no_active_direct.astype(jnp.bool_))
         # Measurement path: detached copies for diagnostics / feedback refs.
         # Action path above keeps global_den_cost/global_weighted_cost live for
         # the SRW denominator and output gradient.
@@ -915,7 +943,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         current_cost_mean = global_current_cost_m.mean()
 
         rho_count = jnp.float32(B * S * N_total)
-        token_count = jnp.float32(B * S)
         raw_tau_sg = jax.lax.stop_gradient(raw_tau)
         tau_sg = jax.lax.stop_gradient(tau)
         select_diag_out = (
@@ -932,9 +959,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             jax.lax.stop_gradient(global_positive_margin_sum / rho_count),
             jax.lax.stop_gradient(global_positive_margin_max),
             jax.lax.stop_gradient(global_selected_m.mean() / N_total),
-            jax.lax.stop_gradient(
-                (global_selection_margin_max <= 0.0).astype(jnp.float32).sum()
-                / token_count),
+            jax.lax.stop_gradient(no_active_direct.mean()),
         )
         dead_exposure_diag_out = (
             global_exposure_sum / jnp.float32(N_total),
@@ -950,7 +975,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                     positive_margin_mean_active,
                     tau_abs_mean, dead_penalty_out, dead_count_out, int_max_out,
                     den_cost_mean, selection_cost_mean, current_cost_mean,
-                    selection_residency_loss, selection_margin_reg)
+                    selection_residency_loss, selection_margin_reg,
+                    tau_direct.astype(jnp.float32),
+                    no_active_direct)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
         local_diag_out = ()
@@ -1080,6 +1107,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         P(),                          # current_cost_mean scalar
         P(),                          # selection_residency_loss scalar (disabled selection-residency)
         P(),                          # selection_margin_reg scalar
+        P('data', None, None, None),  # tau_direct [B,S,2,1]
+        P('data', None, None, None),  # no_active_direct [B,S,2,1]
     )
     _analysis_extra_specs = (
         P('data', None, None),        # margin_band [B,S,1]
@@ -1572,6 +1601,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             jax.lax.stop_gradient(total_rho_max), 'model')
         global_selection_margin_max = jax.lax.pmax(
             jax.lax.stop_gradient(total_selection_margin_max), 'model')
+        no_active_direct = jax.lax.stop_gradient(
+            (global_selection_margin_max <= 0.0).astype(jnp.float32))
+        tau_direct = _block_tau_up_when_no_active(
+            tau, no_active_direct.astype(jnp.bool_))
         # Measurement path: detached copies for diagnostics / feedback refs.
         # Action path above keeps global_den_cost/global_weighted_cost live for
         # the SRW denominator and output gradient.
@@ -1624,7 +1657,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         current_cost_mean = global_current_cost_m.mean()
 
         rho_count = jnp.float32(B * S * 2 * N_total)
-        token_count = jnp.float32(B * S * 2)
         raw_tau_sg = jax.lax.stop_gradient(raw_tau)
         tau_sg = jax.lax.stop_gradient(tau)
         select_diag_out = (
@@ -1641,9 +1673,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             jax.lax.stop_gradient(global_positive_margin_sum / rho_count),
             jax.lax.stop_gradient(global_positive_margin_max),
             jax.lax.stop_gradient(global_selected_m.mean() / N_total),
-            jax.lax.stop_gradient(
-                (global_selection_margin_max <= 0.0).astype(jnp.float32).sum()
-                / token_count),
+            jax.lax.stop_gradient(no_active_direct.mean()),
         )
         dead_exposure_diag_out = (
             global_exposure_sum / jnp.float32(N_total),
@@ -1660,7 +1690,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     dead_penalty_out, dead_count_out,
                     int_max_out, den_cost_mean, selection_cost_mean,
                     current_cost_mean, selection_residency_loss,
-                    selection_margin_reg)
+                    selection_margin_reg,
+                    tau_direct.astype(jnp.float32),
+                    no_active_direct)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
         route_split_out = (
@@ -1910,12 +1942,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      qk_strong, qk_positive_margin_active, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
      qk_den_cost_mean, qk_selection_cost_mean, qk_current_cost_mean,
-      qk_selection_residency, qk_selection_margin_reg) = qk_ret[:18]
+      qk_selection_residency, qk_selection_margin_reg,
+      qk_tau_direct, qk_no_active_direct) = qk_ret[:20]
     (qk_gate_eff_n, qk_gate_eff_ratio,
-     qk_top1_gate_frac, qk_top1_gate_frac_max) = qk_ret[18:22]
+     qk_top1_gate_frac, qk_top1_gate_frac_max) = qk_ret[20:24]
     (q_active, k_active, q_strong, k_strong,
-     q_active_n_mean, k_active_n_mean) = qk_ret[22:28]
-    qk_offset = 28
+     q_active_n_mean, k_active_n_mean) = qk_ret[24:30]
+    qk_offset = 30
     if analysis:
         (qk_margin_band, qk_margin_band_wide, qk_margin_band_mid, qk_skew, qk_apt_std, qk_entropy,
          qk_den_cost, qk_selection_cost, qk_current_cost,
@@ -1938,10 +1971,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      v_strong, v_positive_margin_active, v_tau_abs,
      v_dead_pen, v_dead_cnt, v_int_max,
      v_den_cost_mean, v_selection_cost_mean, v_current_cost_mean,
-      v_selection_residency, v_selection_margin_reg) = v_ret[:18]
+      v_selection_residency, v_selection_margin_reg,
+      v_tau_direct, v_no_active_direct) = v_ret[:20]
     (v_gate_eff_n, v_gate_eff_ratio,
-     v_top1_gate_frac, v_top1_gate_frac_max) = v_ret[18:22]
-    v_offset = 22
+     v_top1_gate_frac, v_top1_gate_frac_max) = v_ret[20:24]
+    v_offset = 24
     if analysis:
         (v_margin_band, v_margin_band_wide, v_margin_band_mid, v_skew, v_apt_std, v_entropy,
          v_den_cost, v_selection_cost, v_current_cost,
@@ -2155,8 +2189,17 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_v_select_diag = jnp.stack(v_select_diag).astype(jnp.float32)
     attn_qk_exposure_diag = jnp.stack(qk_exposure_diag).astype(jnp.float32)
     attn_v_exposure_diag = jnp.stack(v_exposure_diag).astype(jnp.float32)
-    # Exploration loss consumes tau offsets per layer: [B, S, 3].
-    attn_tau_direct = tau_all
+    # Exploration loss consumes per-layer direct tau/no-active stacks.
+    attn_tau_direct = jnp.concatenate(
+        (qk_tau_direct[:, :, 0, :],
+         qk_tau_direct[:, :, 1, :],
+         v_tau_direct),
+        axis=-1)
+    attn_no_active_direct = jax.lax.stop_gradient(jnp.concatenate(
+        (qk_no_active_direct[:, :, 0, :],
+         qk_no_active_direct[:, :, 1, :],
+         v_no_active_direct),
+        axis=-1).astype(jnp.float32))
     slim_ret = (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax,
                 attn_rho_std_slim, attn_gate_sum, attn_active_n_mean,
                 attn_out_norm, attn_tau_mean,
@@ -2169,7 +2212,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_qk_emb_norm_min, attn_qk_emb_norm_std,
                 attn_v_emb_norm_min, attn_v_emb_norm_std,
                 attn_dead_penalty, attn_dead_count,
-                attn_tau_direct,
+                attn_tau_direct, attn_no_active_direct,
                 attn_int_max,
                 attn_den_cost_mean, attn_selection_cost_mean,
                 attn_current_cost_mean,
@@ -2301,10 +2344,11 @@ def _rst_forward(x, pool_params, router_params, rng,
      strong_frac, positive_margin_mean_active, rst_tau_abs_mean,
      rst_dead_penalty, rst_dead_count, rst_int_max,
      rst_den_cost_mean, rst_selection_cost_mean, rst_current_cost_mean,
-      rst_selection_residency, rst_selection_margin_reg) = rst_ret[:18]
+      rst_selection_residency, rst_selection_margin_reg,
+      rst_tau_direct, rst_no_active_direct) = rst_ret[:20]
     (rst_gate_eff_n, rst_gate_eff_ratio,
-     rst_top1_gate_frac, rst_top1_gate_frac_max) = rst_ret[18:22]
-    rst_offset = 22
+     rst_top1_gate_frac, rst_top1_gate_frac_max) = rst_ret[20:24]
+    rst_offset = 24
     if analysis:
         (margin_band_frac, rst_margin_band_wide_frac, rst_margin_band_mid_frac,
          rst_rho_skew, rst_active_per_token_std, rst_gate_entropy,
@@ -2344,7 +2388,7 @@ def _rst_forward(x, pool_params, router_params, rng,
                 rst_tau_abs_mean,
                 rst_emb_norm_min, rst_emb_norm_std,
                 rst_dead_penalty, rst_dead_count,
-                tau,
+                rst_tau_direct, rst_no_active_direct,
                 rst_int_max,
                 rst_den_cost_mean, rst_selection_cost_mean,
                 rst_current_cost_mean,
@@ -2557,6 +2601,8 @@ class DAWN(nn.Module):
             rst_dead_count_all = _z
             attn_tau_direct_all = _z
             rst_tau_direct_all = _z
+            attn_no_active_direct_all = _z
+            rst_no_active_direct_all = _z
             attn_int_max_all = _z
             rst_int_max_all = _z
             attn_den_cost_mean_all = _z
@@ -2682,7 +2728,7 @@ class DAWN(nn.Module):
                  a_qk_emb_n_min, a_qk_emb_n_std,
                  a_v_emb_n_min, a_v_emb_n_std,
                  a_dead_penalty, a_dead_count,
-                 a_tau_direct,
+                 a_tau_direct, a_no_active_direct,
                  a_int_max,
                  a_den_cost_mean, a_selection_cost_mean,
                  a_current_cost_mean,
@@ -2700,10 +2746,10 @@ class DAWN(nn.Module):
                  a_selected_frac, a_no_active_frac,
                  a_angular_exposure_mean, a_angular_exposure_min,
                  a_angular_exposure_max, a_dead_exposure_frac,
-                 a_weak_exposure_frac, a_dead_exposure_target) = attn_ret[:57]
+                 a_weak_exposure_frac, a_dead_exposure_target) = attn_ret[:58]
                 (a_split_core,
                  a_qk_select_diag, a_v_select_diag,
-                 a_qk_exposure_diag, a_v_exposure_diag) = attn_ret[57:62]
+                 a_qk_exposure_diag, a_v_exposure_diag) = attn_ret[58:63]
                 if analysis:
                     (a_qk_raw_norm, a_v_raw_norm,
                      a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
@@ -2720,7 +2766,7 @@ class DAWN(nn.Module):
                       a_softmax_top1_mean, a_softmax_top1_max,
                       a_logit_gap_mean, a_logit_gap_max,
                       a_softmax_entropy_mean, a_softmax_entropy_min,
-                      a_o_input_norm_max, a_o_out_norm_max) = attn_ret[62:99]
+                      a_o_input_norm_max, a_o_out_norm_max) = attn_ret[63:100]
                 if local_diagnostics:
                     (a_attn_local_layer_values,
                      a_attn_local_values, a_attn_local_locs,
@@ -2740,7 +2786,7 @@ class DAWN(nn.Module):
                  k_tau_mean, k_strong, k_positive_margin_active, k_tau_abs,
                  k_emb_n_min, k_emb_n_std,
                  k_dead_penalty, k_dead_count,
-                 k_tau_direct,
+                 k_tau_direct, k_no_active_direct,
                  k_int_max,
                  k_den_cost_mean, k_selection_cost_mean,
                   k_current_cost_mean,
@@ -2756,7 +2802,7 @@ class DAWN(nn.Module):
                   k_selected_frac, k_no_active_frac,
                   k_angular_exposure_mean, k_angular_exposure_min,
                   k_angular_exposure_max, k_dead_exposure_frac,
-                  k_weak_exposure_frac, k_dead_exposure_target) = rst_ret[:50]
+                  k_weak_exposure_frac, k_dead_exposure_target) = rst_ret[:51]
                 if analysis:
                     (k_raw_out_norm,
                       k_tau_std, k_tau_kernel_norm,
@@ -2764,7 +2810,7 @@ class DAWN(nn.Module):
                       k_skew, k_apt_std, k_entropy,
                       k_den_cost, k_selection_cost, k_current_cost,
                       k_emb_n_max, k_rho_kurt, k_margin_band,
-                      k_int_cap_frac) = rst_ret[50:65]
+                      k_int_cap_frac) = rst_ret[51:66]
                 if local_diagnostics:
                     (k_local_values, k_local_locs,
                      k_top1_values, k_top1_locs) = rst_ret[-4:]
@@ -2790,6 +2836,7 @@ class DAWN(nn.Module):
                            a_dead_penalty, k_dead_penalty,
                            a_dead_count, k_dead_count,
                            a_tau_direct, k_tau_direct,
+                           a_no_active_direct, k_no_active_direct,
                            a_int_max, k_int_max,
                            a_den_cost_mean, k_den_cost_mean,
                            a_selection_cost_mean, k_selection_cost_mean,
@@ -2902,6 +2949,7 @@ class DAWN(nn.Module):
             attn_dead_penalty_all, rst_dead_penalty_all,
             attn_dead_count_all, rst_dead_count_all,
             attn_tau_direct_all, rst_tau_direct_all,
+            attn_no_active_direct_all, rst_no_active_direct_all,
             attn_int_max_all, rst_int_max_all,
             attn_den_cost_mean_all, rst_den_cost_mean_all,
             attn_selection_cost_mean_all, rst_selection_cost_mean_all,
@@ -2943,8 +2991,8 @@ class DAWN(nn.Module):
             rst_angular_exposure_max_all,
             rst_dead_exposure_frac_all,
             rst_weak_exposure_frac_all,
-            rst_dead_exposure_target_all) = scan_ys[:105]
-            _scan_offset = 105
+            rst_dead_exposure_target_all) = scan_ys[:107]
+            _scan_offset = 107
             (attn_split_core_all,
              attn_qk_select_diag_all, attn_v_select_diag_all,
              attn_qk_exposure_diag_all, attn_v_exposure_diag_all) = scan_ys[
@@ -3217,6 +3265,10 @@ class DAWN(nn.Module):
             # Shapes: attn [L, B, S, 3], RST [L, B, S, 1].
             'attn_tau_direct': attn_tau_direct_all,
             'rst_tau_direct': rst_tau_direct_all,
+            'attn_no_active_direct': jax.lax.stop_gradient(
+                attn_no_active_direct_all),
+            'rst_no_active_direct': jax.lax.stop_gradient(
+                rst_no_active_direct_all),
             # Denominator diagnostic: sum(positive_margin * intensity).
             'attn_int_max': attn_int_max_all.max(),
             'attn_qk_int_max': _attn_core_max(ATTN_SPLIT_QK_INT_MAX),

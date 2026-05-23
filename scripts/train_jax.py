@@ -1177,6 +1177,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       exploration_z_clip=2.0,
                       exploration_z_tanh=True,
                       exploration_weighted_clip=0.0,
+                      exploration_normalize_by_layers=False,
                       exploration_asymmetry_q=None,
                       exploration_asymmetry_k=None,
                       exploration_asymmetry_v=None,
@@ -1282,6 +1283,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _explore_z_clip = jnp.float32(exploration_z_clip)
     _explore_z_tanh = bool(exploration_z_tanh)
     _explore_weighted_clip = jnp.float32(exploration_weighted_clip)
+    _explore_norm_by_layers = bool(exploration_normalize_by_layers)
+    _explore_norm_by_layers_f = jnp.float32(
+        1.0 if _explore_norm_by_layers else 0.0)
     _rpe_enabled = bool(rpe_enabled)
     _dead_penalty_qk_weight = jnp.float32(dead_penalty_qk_weight)
     _dead_penalty_v_weight = jnp.float32(dead_penalty_v_weight)
@@ -1307,6 +1311,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_local_kw = _model_accepts_local_diagnostics(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
+    _model_version = getattr(
+        model, '__version__', getattr(type(model), '__version__', ''))
+    _rpe_requires_no_active_direct = (
+        str(_model_version) == 'spatial-r1-v4.1.6.0')
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
@@ -1367,11 +1375,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             per_token_ce = result.get('per_token_ce', None)
             attn_tau_off = result.get('attn_tau_direct', result.get('attn_tau_offset', None))
             rst_tau_off = result.get('rst_tau_direct', result.get('rst_tau_offset', None))
+            attn_no_active = result.get('attn_no_active_direct', None)
+            rst_no_active = result.get('rst_no_active_direct', None)
             valid_mask = result.get('valid_mask', None)
+            if (_rpe_enabled and _rpe_requires_no_active_direct
+                    and (attn_no_active is None or rst_no_active is None)):
+                raise ValueError(
+                    "v4.1.6.0 RPE requires attn_no_active_direct and "
+                    "rst_no_active_direct from the model.")
             have_explore = (_rpe_enabled
                             and per_token_ce is not None
                             and attn_tau_off is not None
                             and rst_tau_off is not None
+                            and (not _rpe_requires_no_active_direct
+                                 or (attn_no_active is not None
+                                     and rst_no_active is not None))
                             and valid_mask is not None
                             and _global_mean_std_reducer is not None)
             if have_explore:
@@ -1420,10 +1438,33 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # attn_tau_off shape [L, B, S, 3]; rst_tau_off [L, B, S, 1].
                 a_tau_t = attn_tau_off[:, :, :-1, :]     # [L, B, S-1, 3]
                 k_tau_t = rst_tau_off[:, :, :-1, :]     # [L, B, S-1, 1]
+                if attn_no_active is None:
+                    a_no_active_t = jnp.zeros_like(a_tau_t, dtype=jnp.bool_)
+                else:
+                    a_no_active_t = attn_no_active[:, :, :-1, :]
+                if rst_no_active is None:
+                    k_no_active_t = jnp.zeros_like(k_tau_t, dtype=jnp.bool_)
+                else:
+                    k_no_active_t = rst_no_active[:, :, :-1, :]
+                explore_layer_count = jnp.float32(a_tau_t.shape[0])
                 a_dev_b = jnp.stack(
                     (signal_q, signal_k, signal_v), axis=-1)[None, :, :, :]
                 k_dev_b = signal_rst[None, :, :, None]
                 vmask_b = vmask_f[None, :, :, None]       # [1, B, S-1, 1]
+                a_easy = a_dev_b < 0.0
+                k_easy = k_dev_b < 0.0
+                a_already_off = jax.lax.stop_gradient(
+                    a_no_active_t.astype(jnp.bool_))
+                k_already_off = jax.lax.stop_gradient(
+                    k_no_active_t.astype(jnp.bool_))
+                a_easy_shutoff = a_easy & a_already_off
+                k_easy_shutoff = k_easy & k_already_off
+                a_keep = jax.lax.stop_gradient(
+                    (~a_easy_shutoff).astype(jnp.float32))
+                k_keep = jax.lax.stop_gradient(
+                    (~k_easy_shutoff).astype(jnp.float32))
+                a_dev_b = a_dev_b * a_keep
+                k_dev_b = k_dev_b * k_keep
                 a_tau_ref = jax.lax.stop_gradient(a_tau_t)
                 k_tau_ref = jax.lax.stop_gradient(k_tau_t)
 
@@ -1457,6 +1498,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # Per-element contribution -reduce. Gradient flows through
                 # the tau_offset tensor only (signal is stop_gradient'd).
                 vsum_eps = vmask_f.sum() + 1e-8
+                explore_norm = vsum_eps
+                if _explore_norm_by_layers:
+                    explore_norm = explore_norm * explore_layer_count
                 a_contrib_pre = a_dev_b * a_tau_t * vmask_b
                 k_contrib_pre = k_dev_b * k_tau_t * vmask_b
                 a_contrib = a_contrib_pre * a_active
@@ -1467,21 +1511,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 a_q_contrib = a_contrib[..., 0:1]
                 a_k_contrib = a_contrib[..., 1:2]
                 a_v_contrib = a_contrib[..., 2:3]
-                explore_q_pre_bound = a_q_contrib_pre.sum() / vsum_eps
-                explore_k_pre_bound = a_k_contrib_pre.sum() / vsum_eps
+                explore_q_pre_bound = a_q_contrib_pre.sum() / explore_norm
+                explore_k_pre_bound = a_k_contrib_pre.sum() / explore_norm
                 explore_qk_pre_bound = (
                     explore_q_pre_bound + explore_k_pre_bound)
-                explore_v_pre_bound = a_v_contrib_pre.sum() / vsum_eps
-                explore_attn_pre_bound = a_contrib_pre.sum() / vsum_eps
-                explore_rst_pre_bound = k_contrib_pre.sum() / vsum_eps
+                explore_v_pre_bound = a_v_contrib_pre.sum() / explore_norm
+                explore_attn_pre_bound = a_contrib_pre.sum() / explore_norm
+                explore_rst_pre_bound = k_contrib_pre.sum() / explore_norm
                 explore_loss_pre_bound = (
                     explore_attn_pre_bound + explore_rst_pre_bound)
-                explore_q_raw = a_q_contrib.sum() / vsum_eps
-                explore_k_raw = a_k_contrib.sum() / vsum_eps
+                explore_q_raw = a_q_contrib.sum() / explore_norm
+                explore_k_raw = a_k_contrib.sum() / explore_norm
                 explore_qk_raw = explore_q_raw + explore_k_raw
-                explore_v_raw = a_v_contrib.sum() / vsum_eps
-                explore_attn_raw = a_contrib.sum() / vsum_eps
-                explore_rst_raw = k_contrib.sum() / vsum_eps
+                explore_v_raw = a_v_contrib.sum() / explore_norm
+                explore_attn_raw = a_contrib.sum() / explore_norm
+                explore_rst_raw = k_contrib.sum() / explore_norm
                 explore_loss_raw = explore_attn_raw + explore_rst_raw
 
                 # Observational stats (same interface as before).
@@ -1501,6 +1545,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _key_tot = vmask_b.sum() * a_tau_t.shape[0]
                 _v_tot = vmask_b.sum() * a_tau_t.shape[0]
                 _k_tot = vmask_b.sum() * k_tau_t.shape[0] * k_tau_t.shape[-1]
+                rpe_no_active_easy_shutoff_q = jax.lax.stop_gradient(
+                    (a_easy_shutoff[..., 0:1].astype(jnp.float32)
+                     * vmask_b).sum() / (_q_tot + 1e-8))
+                rpe_no_active_easy_shutoff_k = jax.lax.stop_gradient(
+                    (a_easy_shutoff[..., 1:2].astype(jnp.float32)
+                     * vmask_b).sum() / (_key_tot + 1e-8))
+                rpe_no_active_easy_shutoff_v = jax.lax.stop_gradient(
+                    (a_easy_shutoff[..., 2:3].astype(jnp.float32)
+                     * vmask_b).sum() / (_v_tot + 1e-8))
+                rpe_no_active_easy_shutoff_rst = jax.lax.stop_gradient(
+                    (k_easy_shutoff.astype(jnp.float32) * vmask_b).sum()
+                    / (_k_tot + 1e-8))
                 block_frac_a = jax.lax.stop_gradient(
                     (a_off_mask.astype(jnp.float32) * vmask_b).sum() / (_a_tot + 1e-8))
                 block_frac_qk = jax.lax.stop_gradient(
@@ -1539,6 +1595,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 explore_v_pre_bound = jnp.float32(0.0)
                 explore_attn_pre_bound = jnp.float32(0.0)
                 explore_rst_pre_bound = jnp.float32(0.0)
+                explore_layer_count = jnp.float32(_local_layers)
+                explore_norm = jnp.float32(0.0)
                 pos_frac = jnp.float32(0.0)
                 pos_mean = jnp.float32(0.0)
                 neg_mean = jnp.float32(0.0)
@@ -1548,6 +1606,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 block_frac_qk = jnp.float32(0.0)
                 block_frac_v = jnp.float32(0.0)
                 block_frac_rst = jnp.float32(0.0)
+                rpe_no_active_easy_shutoff_q = jnp.float32(0.0)
+                rpe_no_active_easy_shutoff_k = jnp.float32(0.0)
+                rpe_no_active_easy_shutoff_v = jnp.float32(0.0)
+                rpe_no_active_easy_shutoff_rst = jnp.float32(0.0)
                 dev_pos_max = jnp.float32(0.0)
                 dev_neg_max = jnp.float32(0.0)
                 attn_tau_off_min = jnp.float32(0.0)
@@ -1629,6 +1691,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 block_frac_a=block_frac_a, block_frac_q=block_frac_q,
                 block_frac_key=block_frac_key, block_frac_qk=block_frac_qk,
                 block_frac_v=block_frac_v, block_frac_rst=block_frac_rst,
+                rpe_no_active_easy_shutoff_q=rpe_no_active_easy_shutoff_q,
+                rpe_no_active_easy_shutoff_k=rpe_no_active_easy_shutoff_k,
+                rpe_no_active_easy_shutoff_v=rpe_no_active_easy_shutoff_v,
+                rpe_no_active_easy_shutoff_rst=rpe_no_active_easy_shutoff_rst,
                 dev_pos_max=dev_pos_max, dev_neg_max=dev_neg_max,
                 attn_tau_off_min=attn_tau_off_min, attn_tau_off_max=attn_tau_off_max,
                 attn_tau_off_p99=attn_tau_off_p99, attn_tau_off_p01=attn_tau_off_p01,
@@ -1656,6 +1722,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 selection_margin_reg_weighted_v=selection_margin_reg_weighted_v,
                 selection_margin_reg_weighted_rst=selection_margin_reg_weighted_rst,
                 selection_margin_reg_weighted_total=selection_margin_reg_loss,
+                exploration_layer_norm_enabled=_explore_norm_by_layers_f,
+                exploration_layer_count=explore_layer_count,
+                exploration_norm=explore_norm,
                 step_in_train=step,
             )
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
@@ -2395,6 +2464,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 (_asym_q + _asym_k) / jnp.float32(2.0)),
             'exploration_asymmetry_v': _asym_v,
             'exploration_asymmetry_rst': _asym_rst,
+            'exploration_layer_norm_enabled': explore_stats[
+                'exploration_layer_norm_enabled'],
+            'exploration_layer_count': explore_stats['exploration_layer_count'],
+            'exploration_norm': explore_stats['exploration_norm'],
+            'rpe_no_active_easy_shutoff_q': explore_stats[
+                'rpe_no_active_easy_shutoff_q'],
+            'rpe_no_active_easy_shutoff_k': explore_stats[
+                'rpe_no_active_easy_shutoff_k'],
+            'rpe_no_active_easy_shutoff_v': explore_stats[
+                'rpe_no_active_easy_shutoff_v'],
+            'rpe_no_active_easy_shutoff_rst': explore_stats[
+                'rpe_no_active_easy_shutoff_rst'],
             'exploration_loss_raw_total': explore_stats['explore_loss_raw'],
             'exploration_loss_raw_q': explore_stats['explore_q_raw'],
             'exploration_loss_raw_k': explore_stats['explore_k_raw'],
@@ -2921,6 +3002,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     'exploration_loss_weighted_total',
                     'exploration_loss_weighted_unclipped',
                     'exploration_loss_weighted_clipped',
+                    'exploration_layer_norm_enabled',
+                    'exploration_layer_count',
+                    'exploration_norm',
+                    'rpe_no_active_easy_shutoff_q',
+                    'rpe_no_active_easy_shutoff_k',
+                    'rpe_no_active_easy_shutoff_v',
+                    'rpe_no_active_easy_shutoff_rst',
                     'exploration_raw_pre_bound',
                     'exploration_q_pre_bound',
                     'exploration_k_pre_bound',
@@ -3915,6 +4003,13 @@ RPE_REGULAR_RECORD_KEYS = (
     'exploration_asymmetry_qk',
     'exploration_asymmetry_v',
     'exploration_asymmetry_rst',
+    'exploration_layer_norm_enabled',
+    'exploration_layer_count',
+    'exploration_norm',
+    'rpe_no_active_easy_shutoff_q',
+    'rpe_no_active_easy_shutoff_k',
+    'rpe_no_active_easy_shutoff_v',
+    'rpe_no_active_easy_shutoff_rst',
     'exploration_loss_weighted_q',
     'exploration_loss_weighted_k',
     'exploration_loss_weighted_qk',
@@ -4117,6 +4212,18 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'exploration_asymmetry_v', m.get('exploration_asymmetry', 0.0))),
         'exploration_asymmetry_rst': float(m.get(
             'exploration_asymmetry_rst', m.get('exploration_asymmetry', 0.0))),
+        'exploration_layer_norm_enabled': float(m.get(
+            'exploration_layer_norm_enabled', 0.0)),
+        'exploration_layer_count': float(m.get('exploration_layer_count', 0.0)),
+        'exploration_norm': float(m.get('exploration_norm', 0.0)),
+        'rpe_no_active_easy_shutoff_q': float(m.get(
+            'rpe_no_active_easy_shutoff_q', 0.0)),
+        'rpe_no_active_easy_shutoff_k': float(m.get(
+            'rpe_no_active_easy_shutoff_k', 0.0)),
+        'rpe_no_active_easy_shutoff_v': float(m.get(
+            'rpe_no_active_easy_shutoff_v', 0.0)),
+        'rpe_no_active_easy_shutoff_rst': float(m.get(
+            'rpe_no_active_easy_shutoff_rst', 0.0)),
         'exploration_loss_weighted_q': float(m.get(
             'exploration_loss_weighted_q', 0.0)),
         'exploration_loss_weighted_k': float(m.get(
@@ -4970,6 +5077,13 @@ def _print_regular_block(rec, ctx):
             f" pos={rec['pos_frac']*100:.1f}%"
             f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
             f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
+            f" norm[layer_norm={rec['exploration_layer_norm_enabled']:.0f}"
+            f" layer_count={rec['exploration_layer_count']:.0f}"
+            f" norm={rec['exploration_norm']:.1f}]"
+            f" rpe_guard: shutoff[q={rec['rpe_no_active_easy_shutoff_q']*100:.1f}%"
+            f" k={rec['rpe_no_active_easy_shutoff_k']*100:.1f}%"
+            f" v={rec['rpe_no_active_easy_shutoff_v']*100:.1f}%"
+            f" rst={rec['rpe_no_active_easy_shutoff_rst']*100:.1f}%]"
             f" expl[q={rec['explore_q_raw']:+.3f}"
             f" k={rec['explore_k_raw']:+.3f}"
             f" v={rec['explore_v_raw']:+.3f}"
@@ -5766,6 +5880,13 @@ def _print_debug_block(rec, ctx):
         log_debug_message(
             f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
             f"w_eff={_g('exploration_weight_effective'):.6f} "
+            f"norm[layer_norm={_g('exploration_layer_norm_enabled'):.0f} "
+            f"layer_count={_g('exploration_layer_count'):.0f} "
+            f"norm={_g('exploration_norm'):.1f}] "
+            f"rpe_guard: shutoff[q={_g('rpe_no_active_easy_shutoff_q'):.3f} "
+            f"k={_g('rpe_no_active_easy_shutoff_k'):.3f} "
+            f"v={_g('rpe_no_active_easy_shutoff_v'):.3f} "
+            f"rst={_g('rpe_no_active_easy_shutoff_rst'):.3f}] "
             f"asym[q={_g('exploration_asymmetry_q', _g('exploration_asymmetry')):.3f} "
             f"k={_g('exploration_asymmetry_k', _g('exploration_asymmetry')):.3f} "
             f"v={_g('exploration_asymmetry_v', _g('exploration_asymmetry')):.3f} "
@@ -6778,6 +6899,11 @@ def main():
     exploration_z_tanh = tcfg.get('exploration_z_tanh', True)
     exploration_weighted_clip = tcfg.get(
         'exploration_weighted_clip', tcfg.get('expl_w_clip', 0.0))
+    exploration_normalize_by_layers_default = (
+        cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.0')
+    exploration_normalize_by_layers = bool(tcfg.get(
+        'exploration_normalize_by_layers',
+        exploration_normalize_by_layers_default))
     rpe_enabled = bool(tcfg.get('rpe_enabled', True))
     if not rpe_enabled:
         exploration_weight = 0.0
@@ -7077,6 +7203,9 @@ def main():
                 'exploration_z_tanh', exploration_z_tanh)
             exploration_weighted_clip = saved_training_config.get(
                 'exploration_weighted_clip', exploration_weighted_clip)
+            exploration_normalize_by_layers = bool(saved_training_config.get(
+                'exploration_normalize_by_layers',
+                exploration_normalize_by_layers))
             rpe_enabled = bool(saved_training_config.get(
                 'rpe_enabled', rpe_enabled))
             dead_penalty_weighted_clip = saved_training_config.get(
@@ -7178,6 +7307,7 @@ def main():
         'exploration_z_clip': exploration_z_clip,
         'exploration_z_tanh': exploration_z_tanh,
         'exploration_weighted_clip': exploration_weighted_clip,
+        'exploration_normalize_by_layers': exploration_normalize_by_layers,
         'rpe_enabled': rpe_enabled,
         'dead_penalty_weighted_clip': dead_penalty_weighted_clip,
         'global_grad_clip': global_grad_clip,
@@ -7583,6 +7713,8 @@ def main():
             print("    asymmetry split: "
                   f"qk={exploration_asymmetry_qk} "
                   f"v={exploration_asymmetry_v} rst={exploration_asymmetry_rst}")
+            print("    normalization: "
+                  f"by_layers={exploration_normalize_by_layers}")
             print(f"    warmup_steps={exploration_warmup_steps} "
                   f"bounds=[{exploration_lower_bound}, {exploration_upper_bound}] "
                   f"eps={exploration_bound_eps}")
@@ -7909,6 +8041,7 @@ def main():
         exploration_z_clip=exploration_z_clip,
         exploration_z_tanh=exploration_z_tanh,
         exploration_weighted_clip=exploration_weighted_clip,
+        exploration_normalize_by_layers=exploration_normalize_by_layers,
         exploration_asymmetry_q=exploration_asymmetry_q,
         exploration_asymmetry_k=exploration_asymmetry_k,
         exploration_asymmetry_v=exploration_asymmetry_v,
