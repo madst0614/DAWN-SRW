@@ -80,7 +80,7 @@ training:
   # Does not regularize inactive/pre-boundary candidates.
   selection_margin_reg_weight_qk: 0.1
   selection_margin_reg_weight_v: 0.5
-  selection_margin_reg_weight_rst: 1.0
+  selection_margin_reg_weight_rst: 10.0
 
   # Exploration / RPE feedback over direct tau in [0, 1]
   exploration_weight: 0.006
