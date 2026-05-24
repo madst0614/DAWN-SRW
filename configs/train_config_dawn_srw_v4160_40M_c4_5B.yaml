@@ -56,7 +56,7 @@ training:
   warmup_ratio: 0.06
   weight_decay: 0.1
   pool_weight_decay: 0.02
-  tau_lr_mult: 0.2
+  tau_lr_mult: 1.0
   tau_grad_clip: 1.0
   router_proj_lr_mult: 1.0
   router_proj_grad_clip: 2.0
