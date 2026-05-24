@@ -53,7 +53,7 @@ training:
   # Optimizer
   lr: 0.00065
   warmup_ratio: 0.06
-  weight_decay: 0.1
+  weight_decay: 0.01
   pool_weight_decay: 0.02
   tau_lr_mult: 0.1
   tau_grad_clip: 1.0
@@ -64,7 +64,7 @@ training:
 
   # DirectTau Angular Select / Intensity
   tau_target_count_attn_qk: 615
-  tau_target_count_attn_v: 2000
+  tau_target_count_attn_v: 400
   tau_target_count_rst: 300
   intensity_beta: 0.5
 
@@ -89,7 +89,7 @@ training:
   exploration_asymmetry: 1.0
   exploration_asymmetry_qk: 1.0
   exploration_asymmetry_v: 1.5
-  exploration_asymmetry_rst: 2.5
+  exploration_asymmetry_rst: 2.0
   exploration_warmup_steps: 0
   exploration_lower_bound: 0.0
   exploration_upper_bound: 0.70
