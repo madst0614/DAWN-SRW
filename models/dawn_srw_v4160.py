@@ -98,6 +98,9 @@ Implementation notes
   are LayerNorms and the attention output projection.
 """
 
+import math
+from statistics import NormalDist
+
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -334,6 +337,41 @@ def _safe_logit(p):
     p = jnp.asarray(p, dtype=jnp.float32)
     p = jnp.clip(p, 1e-6, 1.0 - 1e-6)
     return jnp.log(p / (1.0 - p))
+
+
+_STANDARD_NORMAL = NormalDist()
+
+
+def _tau_init_from_target_count(target_count, pool_size, d_select_effective):
+    """Estimate the DirectTau cosine cutoff for a desired active count."""
+    target_count = float(target_count)
+    pool_size = int(pool_size)
+    d_select_effective = int(d_select_effective)
+    if target_count <= 0:
+        raise ValueError(
+            f"target_count must be > 0; got {target_count}")
+    if target_count > pool_size:
+        raise ValueError(
+            f"target_count must be <= pool_size; got "
+            f"target_count={target_count}, pool_size={pool_size}")
+    if d_select_effective <= 0:
+        raise ValueError(
+            f"d_select_effective must be > 0; got {d_select_effective}")
+
+    target_frac = target_count / float(pool_size)
+    if target_frac >= 0.5:
+        return 0.0
+    tau_init = (
+        _STANDARD_NORMAL.inv_cdf(1.0 - target_frac)
+        / math.sqrt(float(d_select_effective)))
+    return max(tau_init, 0.0)
+
+
+def _require_tau_target_count(name, value):
+    if value is None:
+        raise ValueError(
+            f"count-based DirectTau initialization requires {name}.")
+    return value
 
 
 LOCAL_SPIKE_METRIC_COUNT = 11
@@ -1835,7 +1873,7 @@ class NeuronPool(nn.Module):
 
 
 # ================================================================
-# 5. Router -- route queries, tau offsets, bounded scan offset
+# 5. Router -- route queries and direct tau cutoffs
 # ================================================================
 
 class Router(nn.Module):
@@ -1843,21 +1881,42 @@ class Router(nn.Module):
     d_route: int
     n_qk: int
     n_v: int
+    d_select_effective: int
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Legacy alias accepted from older configs.
     router_dropout: float = 0.1
-    tau_init_attn_qk: float = 0.02
-    tau_init_attn_v: float = 0.10
-    tau_init_rst: float = 0.15
+    tau_target_count_attn_qk: Optional[float] = None
+    tau_target_count_attn_v: Optional[float] = None
+    tau_target_count_rst: Optional[float] = None
 
     def setup(self):
         db = self.d_route
+        n_rst_eff = self.n_rst if self.n_rst is not None else (
+            self.n_know if self.n_know is not None else 25200)
+        qk_tau_init = _tau_init_from_target_count(
+            _require_tau_target_count(
+                "tau_target_count_attn_qk",
+                self.tau_target_count_attn_qk),
+            self.n_qk,
+            self.d_select_effective)
+        v_tau_init = _tau_init_from_target_count(
+            _require_tau_target_count(
+                "tau_target_count_attn_v",
+                self.tau_target_count_attn_v),
+            self.n_v,
+            self.d_select_effective)
+        rst_tau_init = _tau_init_from_target_count(
+            _require_tau_target_count(
+                "tau_target_count_rst",
+                self.tau_target_count_rst),
+            n_rst_eff,
+            self.d_select_effective)
         raw_tau_attn_bias_init = jnp.asarray(
-            [_safe_logit(self.tau_init_attn_qk),
-             _safe_logit(self.tau_init_attn_qk),
-             _safe_logit(self.tau_init_attn_v)],
+            [_safe_logit(qk_tau_init),
+             _safe_logit(qk_tau_init),
+             _safe_logit(v_tau_init)],
             dtype=jnp.float32)
-        raw_tau_rst_bias_init = _safe_logit(self.tau_init_rst)
+        raw_tau_rst_bias_init = _safe_logit(rst_tau_init)
         self.proj_attn = nn.Dense(db * 3, name='proj_attn')
         self.proj_rst = nn.Dense(db, name='proj_rst')
         self.raw_tau_attn = nn.Dense(3, name='raw_tau_attn',
@@ -2497,10 +2556,10 @@ class DAWN(nn.Module):
     n_chunks_know: int = 1    # Legacy config alias; prefer n_chunks_rst.
     n_chunks_qk: int = 1     # N-axis chunking for qk pool
     n_chunks_v: int = 1      # N-axis chunking for v pool
-    # Direct cosine cutoff initialization. Values are converted to raw logits.
-    tau_init_attn_qk: float = 0.02
-    tau_init_attn_v: float = 0.10
-    tau_init_rst: float = 0.15
+    # Desired initial active neuron counts per token.
+    tau_target_count_attn_qk: Optional[float] = None
+    tau_target_count_attn_v: Optional[float] = None
+    tau_target_count_rst: Optional[float] = None
     # Checkpoint-compatible ablation: keep scale params in NeuronPool, but
     # ignore them in forward/inference and use depth-scaled constants.
     d_select: Optional[int] = None
@@ -2514,6 +2573,10 @@ class DAWN(nn.Module):
             raise ValueError(
                 f"d_select must satisfy 0 < d_select < d_route; "
                 f"got d_select={self.d_select}, d_route={self.d_route}")
+        if self.d_select is None:
+            raise ValueError(
+                "count-based DirectTau initialization requires d_select so "
+                "the Select subspace dimension is explicit.")
         self.token_emb = nn.Embed(
             self.vocab_size, self.d_model, embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(
@@ -2526,10 +2589,11 @@ class DAWN(nn.Module):
         self.router = Router(
             d_model=self.d_model, d_route=self.d_route,
             n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
+            d_select_effective=self.d_select,
             router_dropout=self.router_dropout,
-            tau_init_attn_qk=self.tau_init_attn_qk,
-            tau_init_attn_v=self.tau_init_attn_v,
-            tau_init_rst=self.tau_init_rst)
+            tau_target_count_attn_qk=self.tau_target_count_attn_qk,
+            tau_target_count_attn_v=self.tau_target_count_attn_v,
+            tau_target_count_rst=self.tau_target_count_rst)
         self.layers = [
             DAWNBlock(d_model=self.d_model, n_heads=self.n_heads,
                       dropout_rate=self.dropout_rate, name=f'block_{i}')
@@ -3492,6 +3556,9 @@ class DAWN(nn.Module):
             'd_route': self.d_route,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
+            'tau_target_count_attn_qk': self.tau_target_count_attn_qk,
+            'tau_target_count_attn_v': self.tau_target_count_attn_v,
+            'tau_target_count_rst': self.tau_target_count_rst,
         }
         if self.d_select is not None:
             cfg['d_select'] = self.d_select
@@ -3511,6 +3578,10 @@ class DAWN(nn.Module):
              f"d_intensity={self.d_route - self.d_select}")
             if self.d_select is not None
             else f"  Route: learned d_route embedding [{self.d_route}]",
+            "  DirectTau init counts: "
+            f"qk={self.tau_target_count_attn_qk}, "
+            f"v={self.tau_target_count_attn_v}, "
+            f"rst={self.tau_target_count_rst}",
             "  Pool scales: fixed depth-scaled "
             f"(qk={float(qk_scale):.6g}, v={float(v_scale):.6g}, "
             f"rst={float(rst_scale):.6g})",

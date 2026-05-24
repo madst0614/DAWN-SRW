@@ -498,12 +498,21 @@ def _dawn_srw_kwargs(cfg):
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
     if version == 'spatial-r1-v4.1.6.0':
-        kw['tau_init_attn_qk'] = m.get(
-            'tau_init_attn_qk', t.get('tau_init_attn_qk', 0.02))
-        kw['tau_init_attn_v'] = m.get(
-            'tau_init_attn_v', t.get('tau_init_attn_v', 0.10))
-        kw['tau_init_rst'] = m.get(
-            'tau_init_rst', t.get('tau_init_rst', 0.15))
+        def _tau_target_count_cfg(name):
+            if name in m:
+                return m[name]
+            if name in t:
+                return t[name]
+            raise ValueError(
+                f"{version} requires {name} for count-based "
+                "DirectTau initialization.")
+
+        kw['tau_target_count_attn_qk'] = _tau_target_count_cfg(
+            'tau_target_count_attn_qk')
+        kw['tau_target_count_attn_v'] = _tau_target_count_cfg(
+            'tau_target_count_attn_v')
+        kw['tau_target_count_rst'] = _tau_target_count_cfg(
+            'tau_target_count_rst')
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
     return kw
@@ -7334,6 +7343,15 @@ def main():
             'tau_offset_init_attn_v', cfg['model'].get('tau_offset_init_attn_v', None)),
         'tau_offset_init_rst': tcfg.get(
             'tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', None)),
+        'tau_target_count_attn_qk': tcfg.get(
+            'tau_target_count_attn_qk',
+            cfg['model'].get('tau_target_count_attn_qk', None)),
+        'tau_target_count_attn_v': tcfg.get(
+            'tau_target_count_attn_v',
+            cfg['model'].get('tau_target_count_attn_v', None)),
+        'tau_target_count_rst': tcfg.get(
+            'tau_target_count_rst',
+            cfg['model'].get('tau_target_count_rst', None)),
         'oom_check': run_oom_check,
         'speed_check': run_speed_check,
         'restore_training_config_on_resume': restore_training_config_on_resume,
@@ -7736,9 +7754,9 @@ def main():
         elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.0':
             gate_msg = (
                 f"  Gate ({cfg['model'].get('model_version')} direct-tau): "
-                f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', 0.02))} "
-                f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', 0.10))} "
-                f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', 0.15))} "
+                f"tau_target_count_attn_qk={tcfg.get('tau_target_count_attn_qk', cfg['model'].get('tau_target_count_attn_qk', None))} "
+                f"tau_target_count_attn_v={tcfg.get('tau_target_count_attn_v', cfg['model'].get('tau_target_count_attn_v', None))} "
+                f"tau_target_count_rst={tcfg.get('tau_target_count_rst', cfg['model'].get('tau_target_count_rst', None))} "
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)}"
             )
         else:
