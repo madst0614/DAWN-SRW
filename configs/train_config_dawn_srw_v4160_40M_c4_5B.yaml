@@ -85,11 +85,11 @@ training:
   exploration_weight: 0.006
   exploration_weight_qk: 0.01
   exploration_weight_v: 0.01
-  exploration_weight_rst: 0.02
+  exploration_weight_rst: 0.01
   exploration_asymmetry: 1.0
   exploration_asymmetry_qk: 1.0
   exploration_asymmetry_v: 1.5
-  exploration_asymmetry_rst: 2.0
+  exploration_asymmetry_rst: 1.5
   exploration_warmup_steps: 0
   exploration_lower_bound: 0.0
   exploration_upper_bound: 0.70
