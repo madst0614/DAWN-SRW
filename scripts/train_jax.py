@@ -8930,10 +8930,11 @@ def main():
         # Epoch accumulators on device -one device_get per epoch at the
         # end, rather than per-step float()/int() sync.
         _epoch_loss_jax = jnp.float32(0.0)
-        # int64: valid_count sums to ~n_steps * tokens_per_step, which
-        # exceeds int32 range (2.15e9) on any multi-billion-token epoch.
-        _epoch_correct_jax = jnp.int64(0)
-        _epoch_valid_jax = jnp.int64(0)
+        # Keep epoch counts in fp32: JAX x64 is typically disabled on TPU, so
+        # jnp.int64 silently truncates to int32 and overflows on multi-billion
+        # token epochs.
+        _epoch_correct_jax = jnp.float32(0.0)
+        _epoch_valid_jax = jnp.float32(0.0)
         epoch_steps = 0
 
         # Window accumulators on device -one device_get per log boundary.
@@ -9020,8 +9021,10 @@ def main():
                 _debug_cap_window_jax, metrics)
 
             _epoch_loss_jax = _epoch_loss_jax + metrics['ce_loss'] * _valid_f
-            _epoch_correct_jax = _epoch_correct_jax + metrics['correct']
-            _epoch_valid_jax = _epoch_valid_jax + metrics['valid_count']
+            _epoch_correct_jax = (
+                _epoch_correct_jax + metrics['correct'].astype(jnp.float32))
+            _epoch_valid_jax = (
+                _epoch_valid_jax + metrics['valid_count'].astype(jnp.float32))
 
             win_count += 1
             epoch_steps += 1
@@ -9544,8 +9547,8 @@ def main():
             'valid': _epoch_valid_jax,
         })
         epoch_loss = float(_ep['loss'])
-        epoch_correct = int(_ep['correct'])
-        epoch_valid = int(_ep['valid'])
+        epoch_correct = float(_ep['correct'])
+        epoch_valid = float(_ep['valid'])
         epoch_avg_loss = epoch_loss / epoch_valid if epoch_valid > 0 else 0.0
         epoch_avg_acc = epoch_correct / epoch_valid if epoch_valid > 0 else 0.0
 
