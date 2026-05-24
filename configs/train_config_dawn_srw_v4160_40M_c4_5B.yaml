@@ -64,7 +64,7 @@ training:
 
   # DirectTau Angular Select / Intensity
   tau_target_count_attn_qk: 615
-  tau_target_count_attn_v: 400
+  tau_target_count_attn_v: 600
   tau_target_count_rst: 300
   intensity_beta: 0.5
 
@@ -88,8 +88,8 @@ training:
   exploration_weight_rst: 0.05
   exploration_asymmetry: 1.0
   exploration_asymmetry_qk: 1.0
-  exploration_asymmetry_v: 1.5
-  exploration_asymmetry_rst: 2.0
+  exploration_asymmetry_v: 1.2
+  exploration_asymmetry_rst: 1.5
   exploration_warmup_steps: 0
   exploration_lower_bound: 0.0
   exploration_upper_bound: 0.70
