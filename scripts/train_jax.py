@@ -7767,7 +7767,9 @@ def main():
             )
         if cfg['model'].get('model_version') in (
                 'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
-            if cfg['model'].get('model_version') != 'spatial-r1-v4.1.5.9':
+            if cfg['model'].get('model_version') not in (
+                    'spatial-r1-v4.1.5.9',
+                    'spatial-r1-v4.1.6.0'):
                 gate_msg += (
                     f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                     f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
