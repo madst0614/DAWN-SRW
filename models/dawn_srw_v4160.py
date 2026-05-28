@@ -3926,9 +3926,19 @@ class DAWN(nn.Module):
                             k_resid_norm_max,
                         )
                     if focus_probe_enabled:
+                        focus_srw_candidates = jnp.concatenate(
+                            [a_focus_srw_rows, k_focus_srw_rows], axis=1)
+                        _fs_scores = focus_srw_candidates[:, :, 6]
+                        _fs_vals, _fs_idx = jax.lax.top_k(
+                            _fs_scores, min(focus_k, int(_fs_scores.shape[1])))
+                        focus_srw_rows = jnp.take_along_axis(
+                            focus_srw_candidates, _fs_idx[:, :, None], axis=1)
+                        focus_srw_rows = focus_srw_rows.at[:, :, 6].set(_fs_vals)
                         slim_ys = slim_ys + (
                             focus_path_rows,
                             focus_route_rows,
+                            focus_srw_rows,
+                            a_focus_attn_rows,
                         )
                     return x, slim_ys
                 analysis_ys = slim_ys + (
