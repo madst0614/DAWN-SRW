@@ -6166,8 +6166,37 @@ def _decode_spike_probe(probe_raw):
 
 
 def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
+    """Classify a spike event from probe evidence.
+
+    Important distinction:
+    - `top_token_ce`, `top_srw`, and `top_attention` are global maxima from
+      the same batch, not necessarily the same token/event path.
+    - Do NOT call an SRW/attention global max the primary cause unless it is
+      located at the top-CE token or the gradient evidence agrees with that
+      pool.  Otherwise mark it as an unrelated global outlier.
+    """
     def _g(key, default=0.0):
         return _finite_float(metrics_rec.get(key, default), default)
+
+    def _same_token(row, token, pos_key='pos'):
+        if not row or not token:
+            return False
+        return (int(row.get('batch', -999999)) == int(token.get('batch', -1))
+                and int(row.get(pos_key, -999999)) == int(token.get('pos', -1)))
+
+    def _pool_grad(row, grad_summary):
+        pool = str(row.get('pool', ''))
+        if pool in ('attn_q', 'attn_k'):
+            vals = grad_summary.get('qk_rw', [0.0, 0.0])
+        elif pool == 'attn_v':
+            vals = grad_summary.get('v_rw', [0.0, 0.0])
+        elif pool == 'rst':
+            vals = grad_summary.get('rst_rw', [0.0, 0.0])
+        else:
+            vals = [0.0, 0.0]
+        if isinstance(vals, (list, tuple)):
+            return max((_finite_float(v, 0.0) for v in vals), default=0.0)
+        return _finite_float(vals, 0.0)
 
     top_token = max(
         probe.get('top_token_ce', []),
@@ -6183,6 +6212,7 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
                           abs(r.get('attn_logit_max', 0.0)),
                           r.get('attn_o_output_norm', 0.0)),
         default={})
+
     ce = _g('ce')
     grad = _g('grad_pre')
     logit_abs = _g('lm_logit_abs_max')
@@ -6208,6 +6238,20 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
     evidence.extend(trigger_bits)
 
     top_ce = top_token.get('token_ce', 0.0)
+    token_pos = int(top_token.get('pos', -1)) if top_token else -1
+    pred_id = int(top_token.get('pred_token_id', -2)) if top_token else -2
+    input_id = int(top_token.get('input_token_id', -1)) if top_token else -1
+    pred_is_input = bool(top_token) and pred_id == input_id
+    token_ce_huge = top_ce > max(thresholds['spike_ce_threshold'], ce * 2.0, 10.0)
+
+    grad_e = metrics_rec.get('grad_group_summary', {})
+    grad_global = max(_g('grad_pre'), 1e-8)
+    token_emb_grad = _finite_float(grad_e.get('token_emb', 0.0))
+    pos_emb_grad = _finite_float(grad_e.get('pos_emb', 0.0))
+    expand_grad = _finite_float(grad_e.get('expand_O', 0.0))
+    early = max(token_emb_grad, pos_emb_grad, expand_grad)
+    early_dominant = (early / grad_global) > 0.25
+
     srw_contrib = top_srw.get('contrib_proxy', 0.0)
     srw_gate_share = max(
         top_srw.get('gate_share', 0.0),
@@ -6217,27 +6261,54 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
     srw_margin = abs(top_srw.get('margin', 1.0))
     srw_large = srw_contrib >= max(
         2.0, thresholds['spike_rst_out_threshold'] * 0.25)
+    srw_same_token = _same_token(top_srw, top_token, pos_key='pos')
+    srw_pool_grad = _pool_grad(top_srw, grad_e)
+    srw_pool_grad_agrees = srw_pool_grad > max(5.0, 0.10 * grad_global)
+
     attn_top1 = top_attn.get('attn_top1_weight', 0.0)
     attn_entropy = top_attn.get('attn_entropy', 99.0)
     attn_out = top_attn.get('attn_o_output_norm', 0.0)
+    attn_same_token = _same_token(top_attn, top_token, pos_key='query_pos')
 
     primary = 'unclassified_spike'
     confidence = 'medium'
-    if logit_abs > thresholds['spike_logit_abs_threshold']:
+
+    # Highest-priority diagnosis: a single token CE outlier, especially pos=0,
+    # with token/pos/early gradients dominating.  This should override unrelated
+    # global SRW/attention maxima from other positions.
+    if token_ce_huge and token_pos == 0 and early_dominant:
+        primary = 'pos0_hard_token_ce_spike'
+        confidence = 'high'
+        evidence.append(
+            f"top token CE={top_ce:.4g} at pos=0 b={top_token.get('batch')} target={top_token.get('target_token_id')} pred={top_token.get('pred_token_id')}")
+        evidence.append(
+            f"early grads dominate: token_emb={token_emb_grad:.4g}, pos_emb={pos_emb_grad:.4g}, expand_O={expand_grad:.4g}, grad={grad_global:.4g}")
+        if pred_is_input:
+            secondary.append('pos0_self_copy_logit_spike')
+            evidence.append(
+                f"pred_id equals input_id={input_id}; current-token self-copy at first position")
+    elif token_ce_huge and early_dominant:
+        primary = 'hard_token_ce_spike'
+        confidence = 'high'
+        evidence.append(
+            f"top token CE={top_ce:.4g} at b={top_token.get('batch')} pos={top_token.get('pos')}")
+        evidence.append(
+            f"early grads dominate: token_emb={token_emb_grad:.4g}, pos_emb={pos_emb_grad:.4g}, expand_O={expand_grad:.4g}, grad={grad_global:.4g}")
+    elif logit_abs > thresholds['spike_logit_abs_threshold']:
         primary = 'logit_output_scale_spike'
         evidence.append(f"lm_logit_abs_max={logit_abs:.4g}")
-    elif (attn_top1 >= 0.98 and attn_entropy <= 0.15
+    elif (attn_same_token and attn_top1 >= 0.98 and attn_entropy <= 0.15
           and attn_out >= thresholds['spike_rst_out_threshold']):
         primary = 'attention_top1_collapse'
         evidence.append(
-            f"attention layer={top_attn.get('layer')} query=(b={top_attn.get('batch')},pos={top_attn.get('query_pos')}) top1={attn_top1:.4f} entropy={attn_entropy:.4f} out={attn_out:.4g}")
+            f"same-token attention layer={top_attn.get('layer')} query=(b={top_attn.get('batch')},pos={top_attn.get('query_pos')}) top1={attn_top1:.4f} entropy={attn_entropy:.4f} out={attn_out:.4g}")
         confidence = 'high'
-    elif srw_large and srw_gate_share >= 0.95:
+    elif srw_large and srw_same_token and srw_gate_share >= 0.95 and srw_pool_grad_agrees:
         primary = 'srw_top1_contribution_spike'
         evidence.append(
-            f"top SRW culprit pool={top_srw.get('pool')} layer={top_srw.get('layer')} token=(b={top_srw.get('batch')},pos={top_srw.get('pos')})")
+            f"same-token SRW culprit pool={top_srw.get('pool')} layer={top_srw.get('layer')} token=(b={top_srw.get('batch')},pos={top_srw.get('pos')})")
         evidence.append(
-            f"gate_share={top_srw.get('gate_share', 0.0):.4f}, top1_share={top_srw.get('top1_share_for_token', 0.0):.4f}")
+            f"gate_share={top_srw.get('gate_share', 0.0):.4f}, top1_share={top_srw.get('top1_share_for_token', 0.0):.4f}, pool_grad={srw_pool_grad:.4g}")
         evidence.append(
             f"read_scalar_xr={top_srw.get('read_scalar_xr', 0.0):.4g}, contrib_proxy={srw_contrib:.4g}")
         confidence = 'high'
@@ -6249,39 +6320,46 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
             secondary.append('tau_margin_boundary_spike')
         if top_srw.get('no_active_for_token', False):
             secondary.append('no_active_noop_boundary_spike')
-            not_primary.append('no_active marked on the culprit token; treat as symptom unless history shows it first')
-    elif srw_large and srw_read >= max(10.0, srw_contrib * 0.5):
+            not_primary.append('no_active marked on same-token culprit; treat as symptom unless history shows it first')
+    elif srw_large and srw_same_token and srw_read >= max(10.0, srw_contrib * 0.5) and srw_pool_grad_agrees:
         primary = 'srw_read_scalar_spike'
         evidence.append(
-            f"read_scalar_xr={top_srw.get('read_scalar_xr', 0.0):.4g}, contrib_proxy={srw_contrib:.4g}")
-    elif srw_large and intensity_bound > 0 and srw_intensity >= intensity_bound * 0.90:
+            f"same-token read_scalar_xr={top_srw.get('read_scalar_xr', 0.0):.4g}, contrib_proxy={srw_contrib:.4g}, pool_grad={srw_pool_grad:.4g}")
+    elif srw_large and srw_same_token and intensity_bound > 0 and srw_intensity >= intensity_bound * 0.90 and srw_pool_grad_agrees:
         primary = 'srw_intensity_spike'
         evidence.append(
-            f"intensity={srw_intensity:.4g} near exp(beta)={intensity_bound:.4g}")
-    elif srw_margin <= 1.0e-3 and srw_gate_share >= 0.5:
+            f"same-token intensity={srw_intensity:.4g} near exp(beta)={intensity_bound:.4g}, pool_grad={srw_pool_grad:.4g}")
+    elif srw_same_token and srw_margin <= 1.0e-3 and srw_gate_share >= 0.5:
         primary = 'tau_margin_boundary_spike'
         evidence.append(
-            f"rho={top_srw.get('rho', 0.0):.6f}, tau={top_srw.get('tau', 0.0):.6f}, margin={top_srw.get('margin', 0.0):.6g}")
-    elif top_ce > max(thresholds['spike_ce_threshold'], ce * 2.0):
-        primary = 'hard_token_ce_spike'
-        evidence.append(
-            f"top token CE={top_ce:.4g} at b={top_token.get('batch')} pos={top_token.get('pos')}")
+            f"same-token rho={top_srw.get('rho', 0.0):.6f}, tau={top_srw.get('tau', 0.0):.6f}, margin={top_srw.get('margin', 0.0):.6g}")
+
     if top_ce > 0.0:
         evidence.append(
             f"token_ce={top_ce:.4g} target={top_token.get('target_token_id')} pred={top_token.get('pred_token_id')}")
 
-    grad_e = metrics_rec.get('grad_group_summary', {})
-    grad_global = max(_g('grad_pre'), 1e-8)
-    early = max(
-        _finite_float(grad_e.get('token_emb', 0.0)),
-        _finite_float(grad_e.get('pos_emb', 0.0)),
-        _finite_float(grad_e.get('expand_O', 0.0)))
-    if early / grad_global > 0.25:
+    # Mark unrelated global maxima so they are not mistaken for the cause.
+    if top_srw and top_token and not srw_same_token:
+        not_primary.append(
+            f"global top_srw is at b={top_srw.get('batch')} pos={top_srw.get('pos')}, not top-CE token b={top_token.get('batch')} pos={top_token.get('pos')}")
+    if top_srw and srw_pool_grad <= max(5.0, 0.05 * grad_global):
+        not_primary.append(
+            f"top_srw pool={top_srw.get('pool')} pool_grad={srw_pool_grad:.4g} is not dominant vs grad={grad_global:.4g}")
+    if top_attn and top_token and not attn_same_token:
+        not_primary.append(
+            f"global top_attention is at b={top_attn.get('batch')} q={top_attn.get('query_pos')}, not top-CE token b={top_token.get('batch')} pos={top_token.get('pos')}")
+
+    if early_dominant:
         secondary.append('output_to_early_path_backprop_spike')
-    if not secondary:
-        secondary.append('none_clear')
-    if not not_primary:
-        not_primary.append('raw_tau_grad was not dominant unless shown in grad_evidence')
+    if max(_finite_float(v, 0.0) for v in grad_e.get('v_rw', [0.0, 0.0])) > max(5.0, 0.10 * grad_global):
+        secondary.append('v_rw_backward_amplification')
+    if max(_finite_float(v, 0.0) for v in grad_e.get('rst_rw', [0.0, 0.0])) > max(5.0, 0.10 * grad_global):
+        secondary.append('rst_rw_backward_amplification')
+
+    # De-duplicate while preserving order.
+    secondary = list(dict.fromkeys(secondary)) or ['none_clear']
+    not_primary = list(dict.fromkeys(not_primary)) or [
+        'raw_tau_grad was not dominant unless shown in grad_evidence']
 
     return {
         'primary': primary,
@@ -6290,7 +6368,6 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
         'secondary': secondary,
         'not_primary': not_primary,
     }
-
 
 def _format_spike_text(event):
     m = event.get('metrics', {})
@@ -6303,34 +6380,75 @@ def _format_spike_text(event):
         f"lm_logit_abs_max={m.get('lm_logit_abs_max', 0.0):.6f} layer_attn_max={m.get('layer_attn_max', 0.0):.6f} layer_rst_max={m.get('layer_rst_max', 0.0):.6f}",
         f"diagnosis: primary={diag.get('primary')} confidence={diag.get('confidence')}",
     ]
-    for item in diag.get('evidence', [])[:8]:
+    for item in diag.get('evidence', [])[:12]:
         lines.append(f"  evidence: {item}")
-    token = (probe.get('top_token_ce') or [{}])[0]
-    if token:
-        lines.append(
-            "top_token_ce: "
-            f"rank={token.get('rank')} b={token.get('batch')} pos={token.get('pos')} "
-            f"in={token.get('input_token_id')} target={token.get('target_token_id')} "
-            f"pred={token.get('pred_token_id')} ce={token.get('token_ce', 0.0):.6f} "
-            f"target_logit={token.get('target_logit', 0.0):.6f} "
-            f"pred_logit={token.get('pred_logit', 0.0):.6f}")
+    if diag.get('secondary'):
+        lines.append("  secondary: " + ", ".join(str(x) for x in diag.get('secondary', [])))
+    if diag.get('not_primary'):
+        for item in diag.get('not_primary', [])[:8]:
+            lines.append(f"  not_primary: {item}")
+
+    tokens = sorted(
+        probe.get('top_token_ce', []),
+        key=lambda r: r.get('token_ce', 0.0),
+        reverse=True)
+    if tokens:
+        lines.append("top_token_ce_topk:")
+        for token in tokens[:5]:
+            self_copy = " self_copy" if token.get('pred_token_id') == token.get('input_token_id') else ""
+            pos0 = " pos0" if int(token.get('pos', -1)) == 0 else ""
+            lines.append(
+                "  "
+                f"rank={token.get('rank')} b={token.get('batch')} pos={token.get('pos')}"
+                f"{pos0}{self_copy} in={token.get('input_token_id')} "
+                f"target={token.get('target_token_id')} pred={token.get('pred_token_id')} "
+                f"ce={token.get('token_ce', 0.0):.6f} "
+                f"target_logit={token.get('target_logit', 0.0):.6f} "
+                f"pred_logit={token.get('pred_logit', 0.0):.6f}")
+
+    top_token = tokens[0] if tokens else {}
+    tb = int(top_token.get('batch', -1)) if top_token else -1
+    tp = int(top_token.get('pos', -1)) if top_token else -1
+
     srw = sorted(
         probe.get('srw_top_contributors', []),
         key=lambda r: r.get('contrib_proxy', 0.0),
         reverse=True)
     if srw:
-        row = srw[0]
-        lines.append(
-            "top_srw: "
-            f"layer={row.get('layer')} pool={row.get('pool')} "
-            f"b={row.get('batch')} pos={row.get('pos')} neuron={row.get('neuron_global_id')} "
-            f"contrib={row.get('contrib_proxy', 0.0):.6f} "
-            f"gate_share={row.get('gate_share', 0.0):.6f} "
-            f"top1={row.get('top1_share_for_token', 0.0):.6f} "
-            f"xr={row.get('read_scalar_xr', 0.0):.6f} "
-            f"int={row.get('intensity', 0.0):.6f} "
-            f"rho={row.get('rho', 0.0):.6f} tau={row.get('tau', 0.0):.6f} "
-            f"margin={row.get('margin', 0.0):.6f}")
+        lines.append("global_srw_topk:")
+        for row in srw[:5]:
+            same = (int(row.get('batch', -2)) == tb
+                    and int(row.get('pos', -2)) == tp)
+            lines.append(
+                "  "
+                f"same_top_ce={same} layer={row.get('layer')} pool={row.get('pool')} "
+                f"b={row.get('batch')} pos={row.get('pos')} neuron={row.get('neuron_global_id')} "
+                f"contrib={row.get('contrib_proxy', 0.0):.6f} "
+                f"gate_share={row.get('gate_share', 0.0):.6f} "
+                f"top1={row.get('top1_share_for_token', 0.0):.6f} "
+                f"xr={row.get('read_scalar_xr', 0.0):.6f} "
+                f"int={row.get('intensity', 0.0):.6f} "
+                f"rho={row.get('rho', 0.0):.6f} tau={row.get('tau', 0.0):.6f} "
+                f"margin={row.get('margin', 0.0):.6f}")
+
+    same_token_srw = [
+        row for row in srw
+        if int(row.get('batch', -2)) == tb and int(row.get('pos', -2)) == tp
+    ]
+    if same_token_srw:
+        lines.append("same_top_token_srw_topk:")
+        for row in same_token_srw[:5]:
+            lines.append(
+                "  "
+                f"layer={row.get('layer')} pool={row.get('pool')} neuron={row.get('neuron_global_id')} "
+                f"contrib={row.get('contrib_proxy', 0.0):.6f} "
+                f"gate_share={row.get('gate_share', 0.0):.6f} "
+                f"top1={row.get('top1_share_for_token', 0.0):.6f} "
+                f"xr={row.get('read_scalar_xr', 0.0):.6f} "
+                f"margin={row.get('margin', 0.0):.6f}")
+    elif top_token:
+        lines.append("same_top_token_srw_topk: none_in_global_topk")
+
     attn = sorted(
         probe.get('attention_top', []),
         key=lambda r: max(r.get('attn_top1_weight', 0.0) * 10.0,
@@ -6338,21 +6456,41 @@ def _format_spike_text(event):
                           r.get('attn_o_output_norm', 0.0)),
         reverse=True)
     if attn:
-        row = attn[0]
-        lines.append(
-            "top_attention: "
-            f"layer={row.get('layer')} b={row.get('batch')} "
-            f"q={row.get('query_pos')} k={row.get('key_pos')} "
-            f"logit_max={row.get('attn_logit_max', 0.0):.6f} "
-            f"gap={row.get('attn_logit_gap_top1_top2', 0.0):.6f} "
-            f"top1={row.get('attn_top1_weight', 0.0):.6f} "
-            f"entropy={row.get('attn_entropy', 0.0):.6f} "
-            f"o_out={row.get('attn_o_output_norm', 0.0):.6f}")
+        lines.append("global_attention_topk:")
+        for row in attn[:5]:
+            same = (int(row.get('batch', -2)) == tb
+                    and int(row.get('query_pos', -2)) == tp)
+            lines.append(
+                "  "
+                f"same_top_ce={same} layer={row.get('layer')} b={row.get('batch')} "
+                f"q={row.get('query_pos')} k={row.get('key_pos')} "
+                f"logit_max={row.get('attn_logit_max', 0.0):.6f} "
+                f"gap={row.get('attn_logit_gap_top1_top2', 0.0):.6f} "
+                f"top1={row.get('attn_top1_weight', 0.0):.6f} "
+                f"entropy={row.get('attn_entropy', 0.0):.6f} "
+                f"o_out={row.get('attn_o_output_norm', 0.0):.6f}")
+
+    same_token_attn = [
+        row for row in attn
+        if int(row.get('batch', -2)) == tb and int(row.get('query_pos', -2)) == tp
+    ]
+    if same_token_attn:
+        lines.append("same_top_token_attention_topk:")
+        for row in same_token_attn[:5]:
+            lines.append(
+                "  "
+                f"layer={row.get('layer')} k={row.get('key_pos')} "
+                f"logit_max={row.get('attn_logit_max', 0.0):.6f} "
+                f"top1={row.get('attn_top1_weight', 0.0):.6f} "
+                f"entropy={row.get('attn_entropy', 0.0):.6f} "
+                f"o_out={row.get('attn_o_output_norm', 0.0):.6f}")
+    elif top_token:
+        lines.append("same_top_token_attention_topk: none_in_global_topk")
+
     lines.append("grad_evidence: " + json.dumps(
         event.get('grad_evidence', {}), default=str))
     lines.append("")
     return "\n".join(lines)
-
 
 def _spike_trigger_reasons(rec, thresholds):
     grad = rec.get('grad_pre', 0.0)
