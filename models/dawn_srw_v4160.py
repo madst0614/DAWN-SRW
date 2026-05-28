@@ -2446,10 +2446,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         q_norms = jnp.linalg.norm(jax.lax.stop_gradient(Q), axis=-1)
         k_norms = jnp.linalg.norm(jax.lax.stop_gradient(K), axis=-1)
         v_norms = jnp.linalg.norm(jax.lax.stop_gradient(V), axis=-1)
+        # k_norms/v_norms have shape [B, H, S_key] and key_idx has
+        # shape [B, H, S_query].  take_along_axis requires indices.ndim
+        # to match the source array rank, so keep key_idx 3D here.
         k_norm_i = jnp.take_along_axis(
-            k_norms, key_idx[..., None], axis=-1).squeeze(-1)
+            k_norms, key_idx.astype(jnp.int32), axis=-1)
         v_norm_i = jnp.take_along_axis(
-            v_norms, key_idx[..., None], axis=-1).squeeze(-1)
+            v_norms, key_idx.astype(jnp.int32), axis=-1)
         o_in_norm = jnp.linalg.norm(
             jax.lax.stop_gradient(out_dbg), axis=-1)
         score = jnp.maximum(

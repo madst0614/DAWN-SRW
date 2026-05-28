@@ -116,4 +116,8 @@ training:
   spike_probe_topk: 8
   spike_history_steps: 20
 
+  training_log_append_on_resume: true
+  debug_log_append_on_resume: false
+  spike_log_append_on_resume: false
+
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4160_400M_c4_40B_v4_64
