@@ -9806,7 +9806,7 @@ def main():
         _existing_jsonls = sorted(_list_files(log_dir, "metrics_*.jsonl"))
         _existing_debug_logs = sorted(_list_files(log_dir, "debug_log_*.txt"))
         _existing_debug_jsonls = sorted(_list_files(log_dir, "debug_metrics_*.jsonl"))
-        _existing_spike_logs = sorted(_list_files(log_dir, "spike_events_*.log"))
+        _existing_spike_logs = sorted(_list_files(log_dir, "spike_events_*.txt"))
         _existing_spike_jsonls = sorted(_list_files(log_dir, "spike_events_*.jsonl"))
         _is_log_resume = (resume_path is not None) and bool(_existing_logs)
         if _is_log_resume:
@@ -9840,7 +9840,7 @@ def main():
                     else _join(log_dir, f'spike_events_{timestamp}.jsonl'))
                 _is_spike_log_resume = True
             else:
-                spike_log_file = _join(log_dir, f'spike_events_{timestamp}.log')
+                spike_log_file = _join(log_dir, f'spike_events_{timestamp}.txt')
                 spike_jsonl_log_file = _join(
                     log_dir, f'spike_events_{timestamp}.jsonl')
                 _is_spike_log_resume = False
