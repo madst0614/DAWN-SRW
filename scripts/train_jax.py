@@ -141,6 +141,13 @@ SPIKE_TOKEN_FIELD_NAMES = (
     'max_logit', 'min_logit', 'logit_abs_max',
     'logit_gap_pred_minus_target')
 
+SPIKE_TOKEN_ALIGN_FIELD_NAMES = (
+    'rank', 'batch', 'pos', 'input_token_id', 'target_token_id',
+    'pred_token_id', 'input_cos', 'target_cos', 'pred_cos',
+    'input_dot', 'target_dot', 'pred_dot', 'hidden_norm',
+    'input_emb_norm', 'target_emb_norm', 'pred_emb_norm',
+    'pred_equals_input', 'target_equals_input', 'pred_equals_target')
+
 DIRECT_TAU_SELECT_METRIC_NAMES = (
     'rho_mean', 'rho_std', 'rho_max',
     'tau_mean', 'tau_min', 'tau_max',
@@ -3548,6 +3555,10 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8):
                 'spike_top_token_ce',
                 jnp.full((_topk, len(SPIKE_TOKEN_FIELD_NAMES)),
                          -jnp.inf, dtype=jnp.float32)),
+            'spike_top_token_alignment': result.get(
+                'spike_top_token_alignment',
+                jnp.full((_topk, len(SPIKE_TOKEN_ALIGN_FIELD_NAMES)),
+                         -jnp.inf, dtype=jnp.float32)),
             'spike_srw_top': result.get(
                 'spike_srw_top',
                 jnp.full((1, len(LOCAL_SPIKE_POOL_NAMES), _topk,
@@ -6115,6 +6126,13 @@ def _decode_spike_probe(probe_raw):
             'rank', 'batch', 'pos', 'input_token_id',
             'target_token_id', 'pred_token_id',
         })
+    token_align_rows = _decode_spike_rows(
+        probe_raw.get('spike_top_token_alignment', []),
+        SPIKE_TOKEN_ALIGN_FIELD_NAMES,
+        int_fields={
+            'rank', 'batch', 'pos', 'input_token_id',
+            'target_token_id', 'pred_token_id',
+        })
     srw_rows = []
     srw_arr = np.asarray(
         probe_raw.get('spike_srw_top', []), dtype=np.float64)
@@ -6147,6 +6165,7 @@ def _decode_spike_probe(probe_raw):
                 attn_rows.append(item)
     return {
         'top_token_ce': token_rows,
+        'top_token_alignment': token_align_rows,
         'srw_top_contributors': srw_rows,
         'attention_top': attn_rows,
         'layer_forward_norms': {
@@ -6212,6 +6231,11 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
                           abs(r.get('attn_logit_max', 0.0)),
                           r.get('attn_o_output_norm', 0.0)),
         default={})
+    top_align = next(
+        (r for r in probe.get('top_token_alignment', [])
+         if int(r.get('batch', -999999)) == int(top_token.get('batch', -1))
+         and int(r.get('pos', -999999)) == int(top_token.get('pos', -1))),
+        {})
 
     ce = _g('ce')
     grad = _g('grad_pre')
@@ -6243,6 +6267,16 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
     input_id = int(top_token.get('input_token_id', -1)) if top_token else -1
     pred_is_input = bool(top_token) and pred_id == input_id
     token_ce_huge = top_ce > max(thresholds['spike_ce_threshold'], ce * 2.0, 10.0)
+    input_cos = _finite_float(top_align.get('input_cos', 0.0)) if top_align else 0.0
+    pred_cos = _finite_float(top_align.get('pred_cos', 0.0)) if top_align else 0.0
+    target_cos = _finite_float(top_align.get('target_cos', 0.0)) if top_align else 0.0
+    input_dot = _finite_float(top_align.get('input_dot', 0.0)) if top_align else 0.0
+    pred_dot = _finite_float(top_align.get('pred_dot', 0.0)) if top_align else 0.0
+    target_dot = _finite_float(top_align.get('target_dot', 0.0)) if top_align else 0.0
+    alignment_self_copy = bool(
+        top_align and pred_is_input and (
+            pred_cos > max(target_cos + 0.10, 0.25)
+            or pred_dot > target_dot + 5.0))
 
     grad_e = metrics_rec.get('grad_group_summary', {})
     grad_global = max(_g('grad_pre'), 1e-8)
@@ -6287,13 +6321,22 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
             secondary.append('pos0_self_copy_logit_spike')
             evidence.append(
                 f"pred_id equals input_id={input_id}; current-token self-copy at first position")
+        if top_align:
+            evidence.append(
+                f"final-hidden alignment: cos[input={input_cos:.4f}, pred={pred_cos:.4f}, target={target_cos:.4f}] dot[input={input_dot:.4g}, pred={pred_dot:.4g}, target={target_dot:.4g}]")
     elif token_ce_huge and early_dominant:
         primary = 'hard_token_ce_spike'
         confidence = 'high'
+        if alignment_self_copy:
+            primary = 'self_copy_hard_token_ce_spike'
+            secondary.append('self_copy_logit_spike')
         evidence.append(
             f"top token CE={top_ce:.4g} at b={top_token.get('batch')} pos={top_token.get('pos')}")
         evidence.append(
             f"early grads dominate: token_emb={token_emb_grad:.4g}, pos_emb={pos_emb_grad:.4g}, expand_O={expand_grad:.4g}, grad={grad_global:.4g}")
+        if top_align:
+            evidence.append(
+                f"final-hidden alignment: cos[input={input_cos:.4f}, pred={pred_cos:.4f}, target={target_cos:.4f}] dot[input={input_dot:.4g}, pred={pred_dot:.4g}, target={target_dot:.4g}]")
     elif logit_abs > thresholds['spike_logit_abs_threshold']:
         primary = 'logit_output_scale_spike'
         evidence.append(f"lm_logit_abs_max={logit_abs:.4g}")
@@ -6409,6 +6452,26 @@ def _format_spike_text(event):
     top_token = tokens[0] if tokens else {}
     tb = int(top_token.get('batch', -1)) if top_token else -1
     tp = int(top_token.get('pos', -1)) if top_token else -1
+
+    align_rows = probe.get('top_token_alignment', [])[:5]
+    if align_rows:
+        lines.append("top_token_alignment:")
+        for r in align_rows:
+            if not np.isfinite(float(r.get('rank', -np.inf))):
+                continue
+            flags = []
+            if float(r.get('pred_equals_input', 0.0)) >= 0.5:
+                flags.append('pred=input')
+            if float(r.get('target_equals_input', 0.0)) >= 0.5:
+                flags.append('target=input')
+            if float(r.get('pred_equals_target', 0.0)) >= 0.5:
+                flags.append('pred=target')
+            flag_s = (' ' + ' '.join(flags)) if flags else ''
+            lines.append(
+                f"  rank={r.get('rank')} b={r.get('batch')} pos={r.get('pos')}{flag_s} "
+                f"cos[in={r.get('input_cos', 0.0):.4f} target={r.get('target_cos', 0.0):.4f} pred={r.get('pred_cos', 0.0):.4f}] "
+                f"dot[in={r.get('input_dot', 0.0):.3f} target={r.get('target_dot', 0.0):.3f} pred={r.get('pred_dot', 0.0):.3f}] "
+                f"norm[h={r.get('hidden_norm', 0.0):.3f} in={r.get('input_emb_norm', 0.0):.3f} target={r.get('target_emb_norm', 0.0):.3f} pred={r.get('pred_emb_norm', 0.0):.3f}]")
 
     srw = sorted(
         probe.get('srw_top_contributors', []),

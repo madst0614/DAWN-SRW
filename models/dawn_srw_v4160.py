@@ -380,6 +380,7 @@ ATTN_LOCAL_METRIC_COUNT = 7
 SPIKE_SRW_FIELD_COUNT = 26
 SPIKE_ATTN_FIELD_COUNT = 14
 SPIKE_TOKEN_FIELD_COUNT = 13
+SPIKE_TOKEN_ALIGN_FIELD_COUNT = 19
 
 
 def _topk_rows(candidates, topk, field_count):
@@ -4122,6 +4123,53 @@ class DAWN(nn.Module):
                     pad = pad.at[:, 1:6].set(0.0)
                     rows = jnp.concatenate([rows, pad], axis=0)
                 result['spike_top_token_ce'] = rows
+
+                # Probe-only final-state alignment for the same top CE tokens.
+                # This detects identity/self-copy leakage through the tied LM head.
+                input_tok = input_ids[tok_b, tok_pos].astype(jnp.int32)
+                target_tok = safe_targets[tok_b, tok_pos].astype(jnp.int32)
+                pred_tok = pred_ids[tok_b, tok_pos].astype(jnp.int32)
+                hidden = shift_x[tok_b, tok_pos].astype(jnp.float32)
+                in_emb = embedding_matrix[input_tok].astype(jnp.float32)
+                tgt_emb = embedding_matrix[target_tok].astype(jnp.float32)
+                pred_emb = embedding_matrix[pred_tok].astype(jnp.float32)
+                h_norm = jnp.linalg.norm(hidden, axis=-1) + 1e-8
+                in_norm = jnp.linalg.norm(in_emb, axis=-1) + 1e-8
+                tgt_norm = jnp.linalg.norm(tgt_emb, axis=-1) + 1e-8
+                pred_norm = jnp.linalg.norm(pred_emb, axis=-1) + 1e-8
+                in_dot = jnp.sum(hidden * in_emb, axis=-1)
+                tgt_dot = jnp.sum(hidden * tgt_emb, axis=-1)
+                pred_dot = jnp.sum(hidden * pred_emb, axis=-1)
+                align_rows = jnp.stack([
+                    jnp.arange(_tok_k, dtype=jnp.float32),
+                    tok_b.astype(jnp.float32),
+                    tok_pos.astype(jnp.float32),
+                    input_tok.astype(jnp.float32),
+                    target_tok.astype(jnp.float32),
+                    pred_tok.astype(jnp.float32),
+                    in_dot / (h_norm * in_norm),
+                    tgt_dot / (h_norm * tgt_norm),
+                    pred_dot / (h_norm * pred_norm),
+                    in_dot,
+                    tgt_dot,
+                    pred_dot,
+                    h_norm,
+                    in_norm,
+                    tgt_norm,
+                    pred_norm,
+                    (pred_tok == input_tok).astype(jnp.float32),
+                    (target_tok == input_tok).astype(jnp.float32),
+                    (pred_tok == target_tok).astype(jnp.float32),
+                ], axis=-1).astype(jnp.float32)
+                if _tok_k < int(spike_probe_topk):
+                    pad = jnp.full(
+                        (int(spike_probe_topk) - _tok_k,
+                         SPIKE_TOKEN_ALIGN_FIELD_COUNT),
+                        -jnp.inf, dtype=jnp.float32)
+                    pad = pad.at[:, 1:6].set(0.0)
+                    pad = pad.at[:, 16:19].set(0.0)
+                    align_rows = jnp.concatenate([align_rows, pad], axis=0)
+                result['spike_top_token_alignment'] = align_rows
         else:
             result['logits'] = self.token_emb.attend(x)
 
