@@ -469,6 +469,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         P(),                     # selection_cost_mean scalar
         P(),                     # current_cost_mean scalar
         P(),                     # selection_residency_loss scalar (disabled selection-residency)
+        P(),                     # selection_margin_reg scalar
     )
     # ANALYSIS extras appended after slim.
     _analysis_extra_specs = (
@@ -585,6 +586,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         # statistics for tau; rho distribution moments are analysis-only.
         N_total = N_local * _model_axis_size
         tau = jax.nn.sigmoid(raw_tau)
+        tau_ref = jax.lax.stop_gradient(tau)
         if analysis:
             @jax.checkpoint
             def stats_step(carry, i):
@@ -622,6 +624,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         # Load-balance over rho distribution is disabled in the fast path for
         # v4.1.6.0 so regular training does not require a rho-statistics pass.
         rho_lb = jnp.float32(0.0)
+
+        def selection_margin_reg_terms(rho):
+            positive_selection_margin = jax.nn.relu(rho - tau_ref)
+            return jnp.square(positive_selection_margin)
 
         def angular_gate_parts(rho, intensity):
             selection_margin = rho - tau
@@ -718,6 +724,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  total_exposure_max, total_weak_exposure_count,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count,
+                 total_selection_margin_reg,
                  total_cb1a_below_best, total_cb1a_above_best,
                  select_diag_carry, diag_vals) = carry
                 s = i * cs
@@ -732,6 +739,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                     (total_cb1a_below_best, total_cb1a_above_best) = (
                         update_cb1a_boundary(
                             total_cb1a_below_best, total_cb1a_above_best, rho))
+                chunk_selection_margin_reg = selection_margin_reg_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
                 gate = base_gate
@@ -798,6 +806,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_selection_residency_count,
+                        total_selection_margin_reg + chunk_selection_margin_reg,
                         total_cb1a_below_best,
                         total_cb1a_above_best,
                         select_diag_carry,
@@ -811,6 +820,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
              total_exposure_max, total_weak_exposure_count,
              total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count,
+             total_selection_margin_reg,
              total_cb1a_below_best, total_cb1a_above_best,
              select_diag_carry, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
@@ -821,6 +831,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.float32(0.0), jnp.float32(0.0),
+                 jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.full((B, S, 1), diag_neg_inf, dtype=jnp.float32),
                  jnp.full((B, S, 1), diag_pos_inf, dtype=jnp.float32),
@@ -838,6 +849,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  total_exposure_max, total_weak_exposure_count,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count,
+                 total_selection_margin_reg,
                  total_cb1a_below_best, total_cb1a_above_best,
                  select_diag_carry, diag_vals) = carry
                 s = i * cs
@@ -852,6 +864,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                     (total_cb1a_below_best, total_cb1a_above_best) = (
                         update_cb1a_boundary(
                             total_cb1a_below_best, total_cb1a_above_best, rho))
+                chunk_selection_margin_reg = selection_margin_reg_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
                 gate = base_gate
@@ -910,6 +923,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_selection_residency_count,
+                        total_selection_margin_reg + chunk_selection_margin_reg,
                         total_cb1a_below_best,
                         total_cb1a_above_best,
                         select_diag_carry,
@@ -922,6 +936,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
              total_exposure_max, total_weak_exposure_count,
              total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count,
+             total_selection_margin_reg,
              total_cb1a_below_best, total_cb1a_above_best,
              select_diag_carry, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
@@ -931,6 +946,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  diag_pos_inf, diag_neg_inf, jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.float32(0.0), jnp.float32(0.0),
+                 jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.full((B, S, 1), diag_neg_inf, dtype=jnp.float32),
                  jnp.full((B, S, 1), diag_pos_inf, dtype=jnp.float32),
@@ -977,6 +993,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         global_selection_cost = jax.lax.psum(total_selection_cost, 'model')
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
         selection_residency_loss = jnp.float32(0.0)
+        selection_margin_reg = (
+            jax.lax.psum(total_selection_margin_reg, 'model')
+            / jnp.float32(B * S * N_total))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         den = jnp.maximum(global_den_cost, 1.0)
         out = raw_out / den
@@ -1080,7 +1099,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                     positive_margin_mean_active,
                     tau_abs_mean, dead_penalty_out, dead_count_out, int_max_out,
                     den_cost_mean, selection_cost_mean, current_cost_mean,
-                    selection_residency_loss)
+                    selection_residency_loss, selection_margin_reg)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
         local_diag_out = ()
@@ -1226,6 +1245,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         P(),                          # selection_cost_mean scalar
         P(),                          # current_cost_mean scalar
         P(),                          # selection_residency_loss scalar (disabled selection-residency)
+        P(),                          # selection_margin_reg scalar
     )
     _analysis_extra_specs = (
         P('data', None, None),        # margin_band [B,S,1]
@@ -1342,6 +1362,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         # statistics for tau; rho distribution moments are analysis-only.
         N_total = N_local * _model_axis_size
         tau = jax.nn.sigmoid(raw_tau)
+        tau_ref = jax.lax.stop_gradient(tau)
         if analysis:
             @jax.checkpoint
             def stats_step(carry, i):
@@ -1379,6 +1400,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         # Load-balance over rho distribution is disabled in the fast path for
         # v4.1.6.0 so regular training does not require a rho-statistics pass.
         rho_lb = jnp.float32(0.0)
+
+        def selection_margin_reg_terms(rho):
+            positive_selection_margin = jax.nn.relu(rho - tau_ref)
+            return jnp.square(positive_selection_margin)
 
         def angular_gate_parts(rho, intensity):
             selection_margin = rho - tau
@@ -1474,6 +1499,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  total_exposure_max, total_weak_exposure_count,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count,
+                 total_selection_margin_reg,
                  total_cb1a_below_best, total_cb1a_above_best,
                  select_diag_carry, diag_vals) = carry
                 s = i * cs
@@ -1488,6 +1514,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     (total_cb1a_below_best, total_cb1a_above_best) = (
                         update_cb1a_boundary(
                             total_cb1a_below_best, total_cb1a_above_best, rho))
+                chunk_selection_margin_reg = selection_margin_reg_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
                 gate = base_gate
@@ -1559,6 +1586,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_selection_residency_count,
+                        total_selection_margin_reg + chunk_selection_margin_reg,
                         total_cb1a_below_best,
                         total_cb1a_above_best,
                         select_diag_carry,
@@ -1572,6 +1600,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
              total_exposure_max, total_weak_exposure_count,
              total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count,
+             total_selection_margin_reg,
              total_cb1a_below_best, total_cb1a_above_best,
              select_diag_carry, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
@@ -1583,6 +1612,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.float32(0.0), jnp.float32(0.0),
+                 jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.full((B, S, 2, 1), diag_neg_inf, dtype=jnp.float32),
                  jnp.full((B, S, 2, 1), diag_pos_inf, dtype=jnp.float32),
@@ -1600,6 +1630,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  total_exposure_max, total_weak_exposure_count,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count,
+                 total_selection_margin_reg,
                  total_cb1a_below_best, total_cb1a_above_best,
                  select_diag_carry, diag_vals) = carry
                 s = i * cs
@@ -1614,6 +1645,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     (total_cb1a_below_best, total_cb1a_above_best) = (
                         update_cb1a_boundary(
                             total_cb1a_below_best, total_cb1a_above_best, rho))
+                chunk_selection_margin_reg = selection_margin_reg_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
                 gate = base_gate
@@ -1676,6 +1708,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_selection_residency_count,
+                        total_selection_margin_reg + chunk_selection_margin_reg,
                         total_cb1a_below_best,
                         total_cb1a_above_best,
                         select_diag_carry,
@@ -1688,6 +1721,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
              total_exposure_max, total_weak_exposure_count,
              total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count,
+             total_selection_margin_reg,
              total_cb1a_below_best, total_cb1a_above_best,
              select_diag_carry, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
@@ -1698,6 +1732,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  diag_pos_inf, diag_neg_inf, jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.float32(0.0), jnp.float32(0.0),
+                 jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.full((B, S, 2, 1), diag_neg_inf, dtype=jnp.float32),
                  jnp.full((B, S, 2, 1), diag_pos_inf, dtype=jnp.float32),
@@ -1743,6 +1778,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         global_selection_cost = jax.lax.psum(total_selection_cost, 'model')
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
         selection_residency_loss = jnp.float32(0.0)
+        selection_margin_reg = (
+            jax.lax.psum(total_selection_margin_reg, 'model')
+            / jnp.float32(B * S * 2 * N_total))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         den = jnp.maximum(global_den_cost, 1.0)
         out = raw_out / den
@@ -1850,7 +1888,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     positive_margin_mean_active_mean, tau_abs_mean,
                     dead_penalty_out, dead_count_out,
                     int_max_out, den_cost_mean, selection_cost_mean,
-                    current_cost_mean, selection_residency_loss)
+                    current_cost_mean, selection_residency_loss,
+                    selection_margin_reg)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
         local_diag_out = ()
@@ -2094,10 +2133,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      qk_strong, qk_positive_margin_active, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
      qk_den_cost_mean, qk_selection_cost_mean, qk_current_cost_mean,
-     qk_selection_residency) = qk_ret[:17]
+     qk_selection_residency, qk_selection_margin_reg) = qk_ret[:18]
     (qk_gate_eff_n, qk_gate_eff_ratio,
-     qk_top1_gate_frac, qk_top1_gate_frac_max) = qk_ret[17:21]
-    qk_offset = 21
+     qk_top1_gate_frac, qk_top1_gate_frac_max) = qk_ret[18:22]
+    qk_offset = 22
     if analysis:
         (qk_margin_band, qk_margin_band_wide, qk_margin_band_mid, qk_skew, qk_apt_std, qk_entropy,
          qk_den_cost, qk_selection_cost, qk_current_cost,
@@ -2125,10 +2164,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      v_strong, v_positive_margin_active, v_tau_abs,
      v_dead_pen, v_dead_cnt, v_int_max,
      v_den_cost_mean, v_selection_cost_mean, v_current_cost_mean,
-     v_selection_residency) = v_ret[:17]
+     v_selection_residency, v_selection_margin_reg) = v_ret[:18]
     (v_gate_eff_n, v_gate_eff_ratio,
-     v_top1_gate_frac, v_top1_gate_frac_max) = v_ret[17:21]
-    v_offset = 21
+     v_top1_gate_frac, v_top1_gate_frac_max) = v_ret[18:22]
+    v_offset = 22
     if analysis:
         (v_margin_band, v_margin_band_wide, v_margin_band_mid, v_skew, v_apt_std, v_entropy,
          v_den_cost, v_selection_cost, v_current_cost,
@@ -2371,6 +2410,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_gate_eff_n, attn_gate_eff_ratio,
                 attn_top1_gate_frac, attn_top1_gate_frac_max,
                 qk_selection_residency, v_selection_residency,
+                qk_selection_margin_reg, v_selection_margin_reg,
                 *attn_select_diag,
                 *attn_exposure_diag,
                 attn_split_core,
@@ -2500,10 +2540,10 @@ def _rst_forward(x, pool_params, router_params, rng,
      strong_frac, positive_margin_mean_active, rst_tau_abs_mean,
      rst_dead_penalty, rst_dead_count, rst_int_max,
      rst_den_cost_mean, rst_selection_cost_mean, rst_current_cost_mean,
-     rst_selection_residency) = rst_ret[:17]
+     rst_selection_residency, rst_selection_margin_reg) = rst_ret[:18]
     (rst_gate_eff_n, rst_gate_eff_ratio,
-     rst_top1_gate_frac, rst_top1_gate_frac_max) = rst_ret[17:21]
-    rst_offset = 21
+     rst_top1_gate_frac, rst_top1_gate_frac_max) = rst_ret[18:22]
+    rst_offset = 22
     if analysis:
         (margin_band_frac, rst_margin_band_wide_frac, rst_margin_band_mid_frac,
          rst_rho_skew, rst_active_per_token_std, rst_gate_entropy,
@@ -2555,6 +2595,7 @@ def _rst_forward(x, pool_params, router_params, rng,
                 rst_gate_eff_n, rst_gate_eff_ratio,
                 rst_top1_gate_frac, rst_top1_gate_frac_max,
                 rst_selection_residency,
+                rst_selection_margin_reg,
                 *rst_select_diag,
                 *rst_exposure_diag,
                 rst_cb1a_challenge_gap,
@@ -2782,6 +2823,9 @@ class DAWN(nn.Module):
             attn_qk_selection_residency_all = _z
             attn_v_selection_residency_all = _z
             rst_selection_residency_all = _z
+            attn_qk_selection_margin_reg_all = _z
+            attn_v_selection_margin_reg_all = _z
+            rst_selection_margin_reg_all = _z
             attn_rho_mean_all = _z
             attn_rho_std_all = _z
             attn_rho_max_all = _z
@@ -2909,6 +2953,8 @@ class DAWN(nn.Module):
                  a_top1_gate_frac, a_top1_gate_frac_max,
                  a_qk_selection_residency,
                  a_v_selection_residency,
+                 a_qk_selection_margin_reg,
+                 a_v_selection_margin_reg,
                  a_rho_mean, a_rho_std, a_rho_max,
                  a_tau_raw_mean, a_tau_floor_mean, a_tau_min_hit_frac,
                  a_tau_direct_mean, a_tau_direct_min, a_tau_direct_max,
@@ -2917,12 +2963,12 @@ class DAWN(nn.Module):
                  a_selected_frac, a_no_active_frac,
                  a_angular_exposure_mean, a_angular_exposure_min,
                  a_angular_exposure_max, a_dead_exposure_frac,
-                 a_weak_exposure_frac, a_dead_exposure_target) = attn_ret[:55]
+                 a_weak_exposure_frac, a_dead_exposure_target) = attn_ret[:57]
                 (a_split_core,
                  a_qk_select_diag, a_v_select_diag,
-                 a_qk_exposure_diag, a_v_exposure_diag) = attn_ret[55:60]
+                 a_qk_exposure_diag, a_v_exposure_diag) = attn_ret[57:62]
                 (a_cb1a_challenge_gap, a_cb1a_prune_gap,
-                 a_cb1a_diag, a_qk_cb1a_diag, a_v_cb1a_diag) = attn_ret[60:65]
+                 a_cb1a_diag, a_qk_cb1a_diag, a_v_cb1a_diag) = attn_ret[62:67]
                 if analysis:
                     (a_qk_raw_norm, a_v_raw_norm,
                      a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
@@ -2939,7 +2985,7 @@ class DAWN(nn.Module):
                      a_softmax_top1_mean, a_softmax_top1_max,
                      a_logit_gap_mean, a_logit_gap_max,
                      a_softmax_entropy_mean, a_softmax_entropy_min,
-                     a_o_input_norm_max, a_o_out_norm_max) = attn_ret[65:102]
+                     a_o_input_norm_max, a_o_out_norm_max) = attn_ret[67:104]
                 if local_diagnostics:
                     (a_attn_local_layer_values,
                      a_attn_local_values, a_attn_local_locs,
@@ -2966,6 +3012,7 @@ class DAWN(nn.Module):
                  k_gate_eff_n, k_gate_eff_ratio,
                  k_top1_gate_frac, k_top1_gate_frac_max,
                  k_selection_residency,
+                 k_selection_margin_reg,
                  k_rho_mean, k_rho_std, k_rho_max,
                  k_tau_raw_mean, k_tau_floor_mean, k_tau_min_hit_frac,
                  k_tau_direct_mean, k_tau_direct_min, k_tau_direct_max,
@@ -2974,9 +3021,9 @@ class DAWN(nn.Module):
                  k_selected_frac, k_no_active_frac,
                  k_angular_exposure_mean, k_angular_exposure_min,
                  k_angular_exposure_max, k_dead_exposure_frac,
-                 k_weak_exposure_frac, k_dead_exposure_target) = rst_ret[:49]
+                 k_weak_exposure_frac, k_dead_exposure_target) = rst_ret[:50]
                 (k_cb1a_challenge_gap, k_cb1a_prune_gap,
-                 k_cb1a_diag) = rst_ret[49:52]
+                 k_cb1a_diag) = rst_ret[50:53]
                 if analysis:
                     (k_raw_out_norm,
                      k_tau_std, k_tau_kernel_norm,
@@ -2984,7 +3031,7 @@ class DAWN(nn.Module):
                      k_skew, k_apt_std, k_entropy,
                      k_den_cost, k_selection_cost, k_current_cost,
                      k_emb_n_max, k_rho_kurt, k_margin_band,
-                     k_int_cap_frac) = rst_ret[52:67]
+                     k_int_cap_frac) = rst_ret[53:68]
                 if local_diagnostics:
                     (k_local_values, k_local_locs,
                      k_top1_values, k_top1_locs) = rst_ret[-4:]
@@ -3021,6 +3068,9 @@ class DAWN(nn.Module):
                            a_qk_selection_residency,
                            a_v_selection_residency,
                            k_selection_residency,
+                           a_qk_selection_margin_reg,
+                           a_v_selection_margin_reg,
+                           k_selection_margin_reg,
                            a_rho_mean, a_rho_std, a_rho_max,
                            a_tau_raw_mean, a_tau_floor_mean,
                            a_tau_min_hit_frac,
@@ -3134,6 +3184,9 @@ class DAWN(nn.Module):
             attn_qk_selection_residency_all,
             attn_v_selection_residency_all,
             rst_selection_residency_all,
+            attn_qk_selection_margin_reg_all,
+            attn_v_selection_margin_reg_all,
+            rst_selection_margin_reg_all,
             attn_rho_mean_all, attn_rho_std_all, attn_rho_max_all,
             attn_tau_raw_mean_all, attn_tau_floor_mean_all,
             attn_tau_min_hit_frac_all,
@@ -3161,8 +3214,8 @@ class DAWN(nn.Module):
             rst_angular_exposure_max_all,
             rst_dead_exposure_frac_all,
             rst_weak_exposure_frac_all,
-            rst_dead_exposure_target_all) = scan_ys[:102]
-            _scan_offset = 102
+            rst_dead_exposure_target_all) = scan_ys[:105]
+            _scan_offset = 105
             (attn_split_core_all,
              attn_qk_select_diag_all, attn_v_select_diag_all,
              attn_qk_exposure_diag_all, attn_v_exposure_diag_all) = scan_ys[
@@ -3279,6 +3332,12 @@ class DAWN(nn.Module):
                 rst_cb1a_diag_all, CB1A_CHALLENGE_GAP_MEAN),
             'cb1a_rst_prune': _cb1a_mean(
                 rst_cb1a_diag_all, CB1A_PRUNE_GAP_MEAN),
+            'selection_margin_reg_qk': (
+                attn_qk_selection_margin_reg_all.mean()),
+            'selection_margin_reg_v': (
+                attn_v_selection_margin_reg_all.mean()),
+            'selection_margin_reg_rst': (
+                rst_selection_margin_reg_all.mean()),
 
             'rst_active': rst_active_all.mean(),
             'rst_raw_gate_max': rst_raw_gmax_all.mean(),

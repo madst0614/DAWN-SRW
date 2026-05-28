@@ -101,11 +101,6 @@ SRW_ACTIVE_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.1',
 )
 
-DIRECT_TAU_SPLIT_MODEL_VERSIONS = (
-    'spatial-r1-v4.1.6.0',
-    'spatial-r1-v4.1.6.1',
-)
-
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
 # These names must match model local_spike_values slots. Top1-only fields
 # live in LOCAL_TOP1_FIELD_NAMES.
@@ -507,25 +502,7 @@ def _dawn_srw_kwargs(cfg):
                 'tau_offset_init_rst', t.get('tau_offset_init_rst'))
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
-    if version == 'spatial-r1-v4.1.6.0':
-        def _tau_target_count_cfg(name):
-            if name in m:
-                return m[name]
-            if name in t:
-                return t[name]
-            raise ValueError(
-                f"{version} requires {name} for count-based "
-                "DirectTau initialization.")
-
-        kw['tau_target_count_attn_qk'] = _tau_target_count_cfg(
-            'tau_target_count_attn_qk')
-        kw['tau_target_count_attn_v'] = _tau_target_count_cfg(
-            'tau_target_count_attn_v')
-        kw['tau_target_count_rst'] = _tau_target_count_cfg(
-            'tau_target_count_rst')
-        if ('d_select' in m or 'd_select' in t):
-            kw['d_select'] = m.get('d_select', t.get('d_select'))
-    if version == 'spatial-r1-v4.1.6.1':
+    if version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1'):
         kw['tau_init_attn_qk'] = m.get(
             'tau_init_attn_qk', t.get('tau_init_attn_qk', 0.02))
         kw['tau_init_attn_v'] = m.get(
@@ -548,14 +525,10 @@ def _v415_sharded_kwargs(cfg):
             scan_std_floor=t.get('scan_std_floor', 0.5),
             tau_min=t.get('tau_min', 0.0),
         )
-    elif version == 'spatial-r1-v4.1.6.0':
+    elif version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1'):
         kw = dict(
             dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
-        )
-    elif version == 'spatial-r1-v4.1.6.1':
-        kw = dict(
-            dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
-            cb1a_enabled=bool(t.get('cb1a_enabled', True)),
+            cb1a_enabled=bool(t.get('cb1a_enabled', False)),
             cb1a_tau_stopgrad=bool(t.get('cb1a_tau_stopgrad', True)),
             cb1a_anchor_stopgrad=bool(t.get('cb1a_anchor_stopgrad', True)),
             cb1a_forward_influence=bool(t.get('cb1a_forward_influence', False)),
@@ -1211,10 +1184,6 @@ def _pool_update_diagnostics(params, grads):
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
-                      exploration_weight_q,
-                      exploration_weight_k,
-                      exploration_weight_v,
-                      exploration_weight_rst,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       weight_decay=0.0, pool_weight_decay=0.0,
                       exploration_warmup_steps=5000,
@@ -1226,22 +1195,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       exploration_z_clip=2.0,
                       exploration_z_tanh=True,
                       exploration_weighted_clip=0.0,
-                      exploration_normalize_by_layers=False,
-                      exploration_asymmetry_q=None,
-                      exploration_asymmetry_k=None,
-                      exploration_asymmetry_v=None,
-                      exploration_asymmetry_rst=None,
                       rpe_enabled=True,
-                      dead_penalty_qk_weight=0.0,
-                      dead_penalty_v_weight=0.0,
-                      dead_penalty_rst_weight=0.0,
+                      dead_penalty_qk_weight=1.0,
+                      dead_penalty_v_weight=1.0,
+                      dead_penalty_rst_weight=1.0,
                       cb1a_enabled=False,
                       cb1a_weight=0.0,
-                      cb1a_challenge_weight=0.0,
-                      cb1a_prune_weight=0.0,
-                      cb1a_qk_weight=0.0,
-                      cb1a_v_weight=0.0,
-                      cb1a_rst_weight=0.0,
+                      cb1a_challenge_weight=1.0,
+                      cb1a_prune_weight=1.0,
+                      cb1a_qk_weight=1.0,
+                      cb1a_v_weight=1.0,
+                      cb1a_rst_weight=1.0,
                       cb1a_qk_challenge_weight=None,
                       cb1a_qk_prune_weight=None,
                       cb1a_v_challenge_weight=None,
@@ -1251,9 +1215,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       cb1a_ce_mode='sigmoid_z',
                       cb1a_eps=1.0e-8,
                       dead_penalty_weighted_clip=0.0,
-                      selection_margin_reg_weight_qk=0.0,
-                      selection_margin_reg_weight_v=0.0,
-                      selection_margin_reg_weight_rst=0.0,
                       global_grad_clip=0.0,
                       tau_lr_mult=1.0,
                       tau_grad_clip=0.0,
@@ -1316,27 +1277,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return mean, std
         _global_mean_std_reducer = _mean_std_reducer_fn
 
-    _explore_weight_q = jnp.float32(
-        exploration_weight if exploration_weight_q is None else exploration_weight_q)
-    _explore_weight_k = jnp.float32(
-        exploration_weight if exploration_weight_k is None else exploration_weight_k)
-    _explore_weight_v = jnp.float32(
-        exploration_weight if exploration_weight_v is None else exploration_weight_v)
-    _explore_weight_rst = jnp.float32(
-        exploration_weight if exploration_weight_rst is None else exploration_weight_rst)
-    _asym_q = jnp.float32(
-        exploration_asymmetry
-        if exploration_asymmetry_q is None else exploration_asymmetry_q)
-    _asym_k = jnp.float32(
-        exploration_asymmetry
-        if exploration_asymmetry_k is None else exploration_asymmetry_k)
-    _asym_v = jnp.float32(
-        exploration_asymmetry
-        if exploration_asymmetry_v is None else exploration_asymmetry_v)
-    _asym_rst = jnp.float32(
-        exploration_asymmetry
-        if exploration_asymmetry_rst is None else exploration_asymmetry_rst)
-    _asym = (_asym_q + _asym_k + _asym_v + _asym_rst) / jnp.float32(4.0)
+    _asym = jnp.float32(exploration_asymmetry)
     _explore_lower = jnp.float32(exploration_lower_bound)
     _explore_upper = jnp.float32(exploration_upper_bound)
     _explore_eps = jnp.float32(exploration_bound_eps)
@@ -1347,9 +1288,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _explore_z_clip = jnp.float32(exploration_z_clip)
     _explore_z_tanh = bool(exploration_z_tanh)
     _explore_weighted_clip = jnp.float32(exploration_weighted_clip)
-    _explore_norm_by_layers = bool(exploration_normalize_by_layers)
-    _explore_norm_by_layers_f = jnp.float32(
-        1.0 if _explore_norm_by_layers else 0.0)
     _rpe_enabled = bool(rpe_enabled)
     _dead_penalty_qk_weight = jnp.float32(dead_penalty_qk_weight)
     _dead_penalty_v_weight = jnp.float32(dead_penalty_v_weight)
@@ -1362,30 +1300,28 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _cb1a_v_weight = jnp.float32(cb1a_v_weight)
     _cb1a_rst_weight = jnp.float32(cb1a_rst_weight)
     _cb1a_qk_challenge_weight = jnp.float32(
-        0.0 if cb1a_qk_challenge_weight is None
-        else cb1a_qk_challenge_weight)
+        cb1a_challenge_weight
+        if cb1a_qk_challenge_weight is None else cb1a_qk_challenge_weight)
     _cb1a_qk_prune_weight = jnp.float32(
-        0.0 if cb1a_qk_prune_weight is None else cb1a_qk_prune_weight)
+        cb1a_prune_weight
+        if cb1a_qk_prune_weight is None else cb1a_qk_prune_weight)
     _cb1a_v_challenge_weight = jnp.float32(
-        0.0 if cb1a_v_challenge_weight is None
-        else cb1a_v_challenge_weight)
+        cb1a_challenge_weight
+        if cb1a_v_challenge_weight is None else cb1a_v_challenge_weight)
     _cb1a_v_prune_weight = jnp.float32(
-        0.0 if cb1a_v_prune_weight is None else cb1a_v_prune_weight)
+        cb1a_prune_weight
+        if cb1a_v_prune_weight is None else cb1a_v_prune_weight)
     _cb1a_rst_challenge_weight = jnp.float32(
-        0.0 if cb1a_rst_challenge_weight is None
-        else cb1a_rst_challenge_weight)
+        cb1a_challenge_weight
+        if cb1a_rst_challenge_weight is None else cb1a_rst_challenge_weight)
     _cb1a_rst_prune_weight = jnp.float32(
-        0.0 if cb1a_rst_prune_weight is None else cb1a_rst_prune_weight)
+        cb1a_prune_weight
+        if cb1a_rst_prune_weight is None else cb1a_rst_prune_weight)
     _cb1a_ce_mode = str(cb1a_ce_mode).lower()
     if _cb1a_ce_mode != 'sigmoid_z':
-        raise ValueError(
-            f"Unsupported cb1a_ce_mode={cb1a_ce_mode!r}; "
-            "expected 'sigmoid_z'.")
+        raise ValueError(f"Unsupported cb1a_ce_mode={cb1a_ce_mode!r}; expected 'sigmoid_z'.")
     _cb1a_eps = jnp.float32(cb1a_eps)
     _dead_weighted_clip = jnp.float32(dead_penalty_weighted_clip)
-    _selection_margin_reg_weight_qk = jnp.float32(selection_margin_reg_weight_qk)
-    _selection_margin_reg_weight_v = jnp.float32(selection_margin_reg_weight_v)
-    _selection_margin_reg_weight_rst = jnp.float32(selection_margin_reg_weight_rst)
     _global_grad_clip = jnp.float32(global_grad_clip)
     _tau_lr_mult = jnp.float32(tau_lr_mult)
     _tau_grad_clip = jnp.float32(tau_grad_clip)
@@ -1403,10 +1339,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_local_kw = _model_accepts_local_diagnostics(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
-    _model_version = getattr(
-        model, '__version__', getattr(type(model), '__version__', ''))
-    _rpe_requires_no_active_direct = (
-        str(_model_version) == 'spatial-r1-v4.1.6.0')
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
@@ -1441,50 +1373,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             if (dead_qk_raw is not None
                     and dead_v_raw is not None
                     and dead_rst_raw is not None):
-                dead_penalty = dead_qk_raw + dead_v_raw + dead_rst_raw
-                dead_penalty_weighted_unclipped = (
+                dead_penalty = (
                     _dead_penalty_qk_weight * dead_qk_raw
                     + _dead_penalty_v_weight * dead_v_raw
                     + _dead_penalty_rst_weight * dead_rst_raw)
             else:
                 dead_penalty = dead_penalty_unweighted
-                dead_penalty_weighted_unclipped = (
-                    jnp.float32(dead_penalty_weight) * dead_penalty)
-            selection_margin_reg_raw_qk = result.get(
-                'selection_margin_reg_qk', jnp.float32(0.0))
-            selection_margin_reg_raw_v = result.get(
-                'selection_margin_reg_v', jnp.float32(0.0))
-            selection_margin_reg_raw_rst = result.get(
-                'selection_margin_reg_rst', jnp.float32(0.0))
-            selection_margin_reg_weighted_qk = (
-                _selection_margin_reg_weight_qk * selection_margin_reg_raw_qk)
-            selection_margin_reg_weighted_v = (
-                _selection_margin_reg_weight_v * selection_margin_reg_raw_v)
-            selection_margin_reg_weighted_rst = (
-                _selection_margin_reg_weight_rst * selection_margin_reg_raw_rst)
-            selection_margin_reg_loss = (
-                selection_margin_reg_weighted_qk
-                + selection_margin_reg_weighted_v
-                + selection_margin_reg_weighted_rst)
             # v4.1 batch-global-mean exploration loss.
             per_token_ce = result.get('per_token_ce', None)
             attn_tau_off = result.get('attn_tau_direct', result.get('attn_tau_offset', None))
             rst_tau_off = result.get('rst_tau_direct', result.get('rst_tau_offset', None))
-            attn_no_active = result.get('attn_no_active_direct', None)
-            rst_no_active = result.get('rst_no_active_direct', None)
             valid_mask = result.get('valid_mask', None)
-            if (_rpe_enabled and _rpe_requires_no_active_direct
-                    and (attn_no_active is None or rst_no_active is None)):
-                raise ValueError(
-                    "v4.1.6.0 RPE requires attn_no_active_direct and "
-                    "rst_no_active_direct from the model.")
             have_explore = (_rpe_enabled
                             and per_token_ce is not None
                             and attn_tau_off is not None
                             and rst_tau_off is not None
-                            and (not _rpe_requires_no_active_direct
-                                 or (attn_no_active is not None
-                                     and rst_no_active is not None))
                             and valid_mask is not None
                             and _global_mean_std_reducer is not None)
             if have_explore:
@@ -1514,17 +1417,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     global_mean_ce = jax.lax.stop_gradient(mean_ce0)
                     raw_deviation = ce_sg - global_mean_ce
                     deviation = jax.lax.stop_gradient(raw_deviation)
-                # Asymmetric: full push on hard tokens, per-route asymmetry
-                # on easy tokens. The CE measurement is shared, but Q/K/V/RST
-                # can apply different negative-side feedback strength.
-                signal_q = jax.lax.stop_gradient(
-                    jnp.where(deviation > 0, deviation, _asym_q * deviation))
-                signal_k = jax.lax.stop_gradient(
-                    jnp.where(deviation > 0, deviation, _asym_k * deviation))
-                signal_v = jax.lax.stop_gradient(
-                    jnp.where(deviation > 0, deviation, _asym_v * deviation))
-                signal_rst = jax.lax.stop_gradient(
-                    jnp.where(deviation > 0, deviation, _asym_rst * deviation))
+                # Asymmetric: full push on hard tokens, `asym`*push on easy ones.
+                signal = jax.lax.stop_gradient(
+                    jnp.where(deviation > 0, deviation, _asym * deviation))
 
                 # v4.1+ per-token/layer/route bounded explore. tau_offset is
                 # NOT clipped (CE keeps full gradient); only the explore-loss
@@ -1533,44 +1428,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # attn_tau_off shape [L, B, S, 3]; rst_tau_off [L, B, S, 1].
                 a_tau_t = attn_tau_off[:, :, :-1, :]     # [L, B, S-1, 3]
                 k_tau_t = rst_tau_off[:, :, :-1, :]     # [L, B, S-1, 1]
-                if attn_no_active is None:
-                    a_no_active_t = jnp.zeros_like(a_tau_t, dtype=jnp.bool_)
-                else:
-                    a_no_active_t = attn_no_active[:, :, :-1, :]
-                if rst_no_active is None:
-                    k_no_active_t = jnp.zeros_like(k_tau_t, dtype=jnp.bool_)
-                else:
-                    k_no_active_t = rst_no_active[:, :, :-1, :]
-                explore_layer_count = jnp.float32(a_tau_t.shape[0])
-                a_dev_b = jnp.stack(
-                    (signal_q, signal_k, signal_v), axis=-1)[None, :, :, :]
-                k_dev_b = signal_rst[None, :, :, None]
+                dev_b = signal[None, :, :, None]          # [1, B, S-1, 1]
                 vmask_b = vmask_f[None, :, :, None]       # [1, B, S-1, 1]
-                a_easy = a_dev_b < 0.0
-                k_easy = k_dev_b < 0.0
-                a_already_off = jax.lax.stop_gradient(
-                    a_no_active_t.astype(jnp.bool_))
-                k_already_off = jax.lax.stop_gradient(
-                    k_no_active_t.astype(jnp.bool_))
-                a_easy_shutoff = a_easy & a_already_off
-                k_easy_shutoff = k_easy & k_already_off
-                a_keep = jax.lax.stop_gradient(
-                    (~a_easy_shutoff).astype(jnp.float32))
-                k_keep = jax.lax.stop_gradient(
-                    (~k_easy_shutoff).astype(jnp.float32))
-                a_dev_b = a_dev_b * a_keep
-                k_dev_b = k_dev_b * k_keep
                 a_tau_ref = jax.lax.stop_gradient(a_tau_t)
                 k_tau_ref = jax.lax.stop_gradient(k_tau_t)
 
                 # Per-element bound-hit masks. Hard off, not soft decay.
                 # The block decision is measurement feedback; the loss below
                 # still differentiates through the original tau_offset tensor.
-                a_down_off = (a_dev_b > 0) & (a_tau_ref <= _explore_lower + _explore_eps)
-                a_up_off   = (a_dev_b < 0) & (a_tau_ref >= _explore_upper - _explore_eps)
+                a_down_off = (dev_b > 0) & (a_tau_ref <= _explore_lower + _explore_eps)
+                a_up_off   = (dev_b < 0) & (a_tau_ref >= _explore_upper - _explore_eps)
                 a_off_mask = jax.lax.stop_gradient(a_down_off | a_up_off)
-                k_down_off = (k_dev_b > 0) & (k_tau_ref <= _explore_lower + _explore_eps)
-                k_up_off   = (k_dev_b < 0) & (k_tau_ref >= _explore_upper - _explore_eps)
+                k_down_off = (dev_b > 0) & (k_tau_ref <= _explore_lower + _explore_eps)
+                k_up_off   = (dev_b < 0) & (k_tau_ref >= _explore_upper - _explore_eps)
                 k_off_mask = jax.lax.stop_gradient(k_down_off | k_up_off)
 
                 a_active = jax.lax.stop_gradient(jnp.where(a_off_mask, 0.0, 1.0))
@@ -1593,34 +1463,24 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # Per-element contribution -reduce. Gradient flows through
                 # the tau_offset tensor only (signal is stop_gradient'd).
                 vsum_eps = vmask_f.sum() + 1e-8
-                explore_norm = vsum_eps
-                if _explore_norm_by_layers:
-                    explore_norm = explore_norm * explore_layer_count
-                a_contrib_pre = a_dev_b * a_tau_t * vmask_b
-                k_contrib_pre = k_dev_b * k_tau_t * vmask_b
+                a_contrib_pre = dev_b * a_tau_t * vmask_b
+                k_contrib_pre = dev_b * k_tau_t * vmask_b
                 a_contrib = a_contrib_pre * a_active
                 k_contrib = k_contrib_pre * k_active
-                a_q_contrib_pre = a_contrib_pre[..., 0:1]
-                a_k_contrib_pre = a_contrib_pre[..., 1:2]
+                a_qk_contrib_pre = a_contrib_pre[..., :2]
                 a_v_contrib_pre = a_contrib_pre[..., 2:3]
-                a_q_contrib = a_contrib[..., 0:1]
-                a_k_contrib = a_contrib[..., 1:2]
+                a_qk_contrib = a_contrib[..., :2]
                 a_v_contrib = a_contrib[..., 2:3]
-                explore_q_pre_bound = a_q_contrib_pre.sum() / explore_norm
-                explore_k_pre_bound = a_k_contrib_pre.sum() / explore_norm
-                explore_qk_pre_bound = (
-                    explore_q_pre_bound + explore_k_pre_bound)
-                explore_v_pre_bound = a_v_contrib_pre.sum() / explore_norm
-                explore_attn_pre_bound = a_contrib_pre.sum() / explore_norm
-                explore_rst_pre_bound = k_contrib_pre.sum() / explore_norm
+                explore_qk_pre_bound = a_qk_contrib_pre.sum() / vsum_eps
+                explore_v_pre_bound = a_v_contrib_pre.sum() / vsum_eps
+                explore_attn_pre_bound = a_contrib_pre.sum() / vsum_eps
+                explore_rst_pre_bound = k_contrib_pre.sum() / vsum_eps
                 explore_loss_pre_bound = (
                     explore_attn_pre_bound + explore_rst_pre_bound)
-                explore_q_raw = a_q_contrib.sum() / explore_norm
-                explore_k_raw = a_k_contrib.sum() / explore_norm
-                explore_qk_raw = explore_q_raw + explore_k_raw
-                explore_v_raw = a_v_contrib.sum() / explore_norm
-                explore_attn_raw = a_contrib.sum() / explore_norm
-                explore_rst_raw = k_contrib.sum() / explore_norm
+                explore_qk_raw = a_qk_contrib.sum() / vsum_eps
+                explore_v_raw = a_v_contrib.sum() / vsum_eps
+                explore_attn_raw = a_contrib.sum() / vsum_eps
+                explore_rst_raw = k_contrib.sum() / vsum_eps
                 explore_loss_raw = explore_attn_raw + explore_rst_raw
 
                 # Observational stats (same interface as before).
@@ -1636,75 +1496,41 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # is total (layer 횞 batch 횞 valid-time 횞 route) slots.
                 _a_tot = vmask_b.sum() * a_tau_t.shape[0] * a_tau_t.shape[-1]
                 _qk_tot = vmask_b.sum() * a_tau_t.shape[0] * 2
-                _q_tot = vmask_b.sum() * a_tau_t.shape[0]
-                _key_tot = vmask_b.sum() * a_tau_t.shape[0]
                 _v_tot = vmask_b.sum() * a_tau_t.shape[0]
                 _k_tot = vmask_b.sum() * k_tau_t.shape[0] * k_tau_t.shape[-1]
-                rpe_no_active_easy_shutoff_q = jax.lax.stop_gradient(
-                    (a_easy_shutoff[..., 0:1].astype(jnp.float32)
-                     * vmask_b).sum() / (_q_tot + 1e-8))
-                rpe_no_active_easy_shutoff_k = jax.lax.stop_gradient(
-                    (a_easy_shutoff[..., 1:2].astype(jnp.float32)
-                     * vmask_b).sum() / (_key_tot + 1e-8))
-                rpe_no_active_easy_shutoff_v = jax.lax.stop_gradient(
-                    (a_easy_shutoff[..., 2:3].astype(jnp.float32)
-                     * vmask_b).sum() / (_v_tot + 1e-8))
-                rpe_no_active_easy_shutoff_rst = jax.lax.stop_gradient(
-                    (k_easy_shutoff.astype(jnp.float32) * vmask_b).sum()
-                    / (_k_tot + 1e-8))
                 block_frac_a = jax.lax.stop_gradient(
                     (a_off_mask.astype(jnp.float32) * vmask_b).sum() / (_a_tot + 1e-8))
                 block_frac_qk = jax.lax.stop_gradient(
                     (a_off_mask[..., :2].astype(jnp.float32) * vmask_b).sum()
                     / (_qk_tot + 1e-8))
-                block_frac_q = jax.lax.stop_gradient(
-                    (a_off_mask[..., 0:1].astype(jnp.float32) * vmask_b).sum()
-                    / (_q_tot + 1e-8))
-                block_frac_key = jax.lax.stop_gradient(
-                    (a_off_mask[..., 1:2].astype(jnp.float32) * vmask_b).sum()
-                    / (_key_tot + 1e-8))
                 block_frac_v = jax.lax.stop_gradient(
                     (a_off_mask[..., 2:3].astype(jnp.float32) * vmask_b).sum()
                     / (_v_tot + 1e-8))
-                block_frac_rst = jax.lax.stop_gradient(
+                block_frac_k = jax.lax.stop_gradient(
                     (k_off_mask.astype(jnp.float32) * vmask_b).sum() / (_k_tot + 1e-8))
 
-                _dev_sg = jax.lax.stop_gradient(
-                    jnp.stack((signal_q, signal_k, signal_v, signal_rst), axis=0)
-                    * vmask_f[None, :, :])
+                _dev_sg = jax.lax.stop_gradient(signal * vmask_f)
                 dev_pos_max = _dev_sg.max()
                 dev_neg_max = (-_dev_sg).max()
             else:
                 global_mean_ce = jnp.float32(0.0)
                 explore_loss_raw = jnp.float32(0.0)
-                explore_q_raw = jnp.float32(0.0)
-                explore_k_raw = jnp.float32(0.0)
                 explore_qk_raw = jnp.float32(0.0)
                 explore_v_raw = jnp.float32(0.0)
                 explore_attn_raw = jnp.float32(0.0)
                 explore_rst_raw = jnp.float32(0.0)
                 explore_loss_pre_bound = jnp.float32(0.0)
-                explore_q_pre_bound = jnp.float32(0.0)
-                explore_k_pre_bound = jnp.float32(0.0)
                 explore_qk_pre_bound = jnp.float32(0.0)
                 explore_v_pre_bound = jnp.float32(0.0)
                 explore_attn_pre_bound = jnp.float32(0.0)
                 explore_rst_pre_bound = jnp.float32(0.0)
-                explore_layer_count = jnp.float32(_local_layers)
-                explore_norm = jnp.float32(0.0)
                 pos_frac = jnp.float32(0.0)
                 pos_mean = jnp.float32(0.0)
                 neg_mean = jnp.float32(0.0)
                 block_frac_a = jnp.float32(0.0)
-                block_frac_q = jnp.float32(0.0)
-                block_frac_key = jnp.float32(0.0)
                 block_frac_qk = jnp.float32(0.0)
                 block_frac_v = jnp.float32(0.0)
-                block_frac_rst = jnp.float32(0.0)
-                rpe_no_active_easy_shutoff_q = jnp.float32(0.0)
-                rpe_no_active_easy_shutoff_k = jnp.float32(0.0)
-                rpe_no_active_easy_shutoff_v = jnp.float32(0.0)
-                rpe_no_active_easy_shutoff_rst = jnp.float32(0.0)
+                block_frac_k = jnp.float32(0.0)
                 dev_pos_max = jnp.float32(0.0)
                 dev_neg_max = jnp.float32(0.0)
                 attn_tau_off_min = jnp.float32(0.0)
@@ -1737,13 +1563,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                         ce_sg, valid_mask)
                 else:
                     cb1a_cnt = vmask_f.sum()
-                    cb1a_ce_mean = (ce_sg * vmask_f).sum() / (
-                        cb1a_cnt + _cb1a_eps)
+                    cb1a_ce_mean = (ce_sg * vmask_f).sum() / (cb1a_cnt + _cb1a_eps)
                     cb1a_var = (
                         jnp.square(ce_sg - cb1a_ce_mean) * vmask_f
                     ).sum() / (cb1a_cnt + _cb1a_eps)
-                    cb1a_ce_std = jnp.sqrt(
-                        jnp.maximum(cb1a_var, 0.0) + _cb1a_eps)
+                    cb1a_ce_std = jnp.sqrt(jnp.maximum(cb1a_var, 0.0) + _cb1a_eps)
                 cb1a_ce_z = jax.lax.stop_gradient(
                     (ce_sg - jax.lax.stop_gradient(cb1a_ce_mean))
                     / (jax.lax.stop_gradient(cb1a_ce_std) + _cb1a_eps))
@@ -1784,10 +1608,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     (k_prune * easy_b * vmask_b).sum()
                     / (vsum * k_layers + _cb1a_eps))
 
+                pool_weight_sum = (
+                    _cb1a_qk_weight + _cb1a_v_weight + _cb1a_rst_weight
+                    + _cb1a_eps)
                 cb1a_challenge_raw = (
-                    qk_challenge_raw + v_challenge_raw + rst_challenge_raw)
+                    _cb1a_qk_weight * qk_challenge_raw
+                    + _cb1a_v_weight * v_challenge_raw
+                    + _cb1a_rst_weight * rst_challenge_raw) / pool_weight_sum
                 cb1a_prune_raw = (
-                    qk_prune_raw + v_prune_raw + rst_prune_raw)
+                    _cb1a_qk_weight * qk_prune_raw
+                    + _cb1a_v_weight * v_prune_raw
+                    + _cb1a_rst_weight * rst_prune_raw) / pool_weight_sum
                 cb1a_qk_raw = (
                     _cb1a_qk_challenge_weight * qk_challenge_raw
                     + _cb1a_qk_prune_weight * qk_prune_raw)
@@ -1798,8 +1629,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     _cb1a_rst_challenge_weight * rst_challenge_raw
                     + _cb1a_rst_prune_weight * rst_prune_raw)
                 cb1a_raw = (
-                    cb1a_qk_raw + cb1a_v_raw + cb1a_rst_raw)
-                cb1a_loss_weighted = cb1a_raw
+                    _cb1a_qk_weight * cb1a_qk_raw
+                    + _cb1a_v_weight * cb1a_v_raw
+                    + _cb1a_rst_weight * cb1a_rst_raw) / pool_weight_sum
+                cb1a_loss_weighted = _cb1a_weight * cb1a_raw
             else:
                 cb1a_ce_mean = jnp.float32(0.0)
                 cb1a_ce_std = jnp.float32(0.0)
@@ -1816,22 +1649,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 cb1a_rst_raw = jnp.float32(0.0)
                 cb1a_raw = jnp.float32(0.0)
                 cb1a_loss_weighted = jnp.float32(0.0)
-
             # Warmup gate: zero out explore loss until warmup_steps has passed.
             # W_sense needs time to settle before exploration signals become
             # meaningful; early CE-dominated learning keeps tau gradient clean.
             explore_active = (step >= _warmup_steps).astype(jnp.float32)
             explore_loss_weighted_unclipped = (
-                (_explore_weight_q * explore_q_raw
-                 + _explore_weight_k * explore_k_raw
-                 + _explore_weight_v * explore_v_raw
-                 + _explore_weight_rst * explore_rst_raw)
-                * explore_active)
+                jnp.float32(exploration_weight)
+                * explore_loss_raw * explore_active)
             explore_loss_weighted = jnp.where(
                 _explore_weighted_clip > 0.0,
                 jnp.clip(explore_loss_weighted_unclipped,
                          -_explore_weighted_clip, _explore_weighted_clip),
                 explore_loss_weighted_unclipped)
+            dead_penalty_weighted_unclipped = (
+                jnp.float32(dead_penalty_weight) * dead_penalty)
             dead_penalty_weighted = jnp.where(
                 _dead_weighted_clip > 0.0,
                 jnp.minimum(dead_penalty_weighted_unclipped, _dead_weighted_clip),
@@ -1863,32 +1694,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + dead_penalty_weighted
                               + explore_loss_weighted
                               + cb1a_loss_weighted)
-            total_loss = total_loss + selection_margin_reg_loss
 
             explore_stats = dict(
                 global_mean_ce=global_mean_ce,
                 explore_loss_raw=explore_loss_raw,
-                explore_q_raw=explore_q_raw,
-                explore_k_raw=explore_k_raw,
                 explore_qk_raw=explore_qk_raw,
                 explore_v_raw=explore_v_raw,
                 explore_attn_raw=explore_attn_raw,
                 explore_rst_raw=explore_rst_raw,
                 explore_loss_pre_bound=explore_loss_pre_bound,
-                explore_q_pre_bound=explore_q_pre_bound,
-                explore_k_pre_bound=explore_k_pre_bound,
                 explore_qk_pre_bound=explore_qk_pre_bound,
                 explore_v_pre_bound=explore_v_pre_bound,
                 explore_attn_pre_bound=explore_attn_pre_bound,
                 explore_rst_pre_bound=explore_rst_pre_bound,
                 pos_frac=pos_frac, pos_mean=pos_mean, neg_mean=neg_mean,
-                block_frac_a=block_frac_a, block_frac_q=block_frac_q,
-                block_frac_key=block_frac_key, block_frac_qk=block_frac_qk,
-                block_frac_v=block_frac_v, block_frac_rst=block_frac_rst,
-                rpe_no_active_easy_shutoff_q=rpe_no_active_easy_shutoff_q,
-                rpe_no_active_easy_shutoff_k=rpe_no_active_easy_shutoff_k,
-                rpe_no_active_easy_shutoff_v=rpe_no_active_easy_shutoff_v,
-                rpe_no_active_easy_shutoff_rst=rpe_no_active_easy_shutoff_rst,
+                block_frac_a=block_frac_a, block_frac_qk=block_frac_qk,
+                block_frac_v=block_frac_v, block_frac_k=block_frac_k,
                 dev_pos_max=dev_pos_max, dev_neg_max=dev_neg_max,
                 attn_tau_off_min=attn_tau_off_min, attn_tau_off_max=attn_tau_off_max,
                 attn_tau_off_p99=attn_tau_off_p99, attn_tau_off_p01=attn_tau_off_p01,
@@ -1927,19 +1748,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 dead_penalty_rst_weight=_dead_penalty_rst_weight,
                 dead_penalty_weighted_unclipped=dead_penalty_weighted_unclipped,
                 dead_penalty_weighted_clipped=dead_penalty_weighted,
-                selection_margin_reg_raw_qk=selection_margin_reg_raw_qk,
-                selection_margin_reg_raw_v=selection_margin_reg_raw_v,
-                selection_margin_reg_raw_rst=selection_margin_reg_raw_rst,
-                selection_margin_reg_weight_qk=_selection_margin_reg_weight_qk,
-                selection_margin_reg_weight_v=_selection_margin_reg_weight_v,
-                selection_margin_reg_weight_rst=_selection_margin_reg_weight_rst,
-                selection_margin_reg_weighted_qk=selection_margin_reg_weighted_qk,
-                selection_margin_reg_weighted_v=selection_margin_reg_weighted_v,
-                selection_margin_reg_weighted_rst=selection_margin_reg_weighted_rst,
-                selection_margin_reg_weighted_total=selection_margin_reg_loss,
-                exploration_layer_norm_enabled=_explore_norm_by_layers_f,
-                exploration_layer_count=explore_layer_count,
-                exploration_norm=explore_norm,
                 step_in_train=step,
             )
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
@@ -2616,8 +2424,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         cb1a_weighted_metric = explore_stats['cb1a_weighted']
         dead_penalty_weighted_metric = explore_stats['dead_penalty_weighted_clipped']
         dead_penalty_weighted_unclipped_metric = explore_stats['dead_penalty_weighted_unclipped']
-        selection_margin_reg_weighted_total_metric = explore_stats[
-            'selection_margin_reg_weighted_total']
         metrics = {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
@@ -2640,26 +2446,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'dead_penalty_qk_weight': explore_stats['dead_penalty_qk_weight'],
             'dead_penalty_v_weight': explore_stats['dead_penalty_v_weight'],
             'dead_penalty_rst_weight': explore_stats['dead_penalty_rst_weight'],
-            'selection_margin_reg_raw_qk': explore_stats[
-                'selection_margin_reg_raw_qk'],
-            'selection_margin_reg_raw_v': explore_stats[
-                'selection_margin_reg_raw_v'],
-            'selection_margin_reg_raw_rst': explore_stats[
-                'selection_margin_reg_raw_rst'],
-            'selection_margin_reg_weight_qk': explore_stats[
-                'selection_margin_reg_weight_qk'],
-            'selection_margin_reg_weight_v': explore_stats[
-                'selection_margin_reg_weight_v'],
-            'selection_margin_reg_weight_rst': explore_stats[
-                'selection_margin_reg_weight_rst'],
-            'selection_margin_reg_weighted_qk': explore_stats[
-                'selection_margin_reg_weighted_qk'],
-            'selection_margin_reg_weighted_v': explore_stats[
-                'selection_margin_reg_weighted_v'],
-            'selection_margin_reg_weighted_rst': explore_stats[
-                'selection_margin_reg_weighted_rst'],
-            'selection_margin_reg_weighted_total': (
-                selection_margin_reg_weighted_total_metric),
             'attn_qk_dead_penalty': result.get(
                 'attn_qk_dead_penalty', jnp.float32(0.0)),
             'attn_v_dead_penalty': result.get(
@@ -2670,55 +2456,24 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'attn_v_dead_count', jnp.float32(0.0)),
             'exploration_warmup_factor': explore_stats['explore_active'],
             'exploration_weight_effective': (
-                (_explore_weight_q + _explore_weight_k
-                 + _explore_weight_v + _explore_weight_rst)
-                / jnp.float32(4.0) * explore_stats['explore_active']),
-            'exploration_asymmetry': _asym,
-            'exploration_asymmetry_q': _asym_q,
-            'exploration_asymmetry_k': _asym_k,
-            'exploration_asymmetry_qk': (
-                (_asym_q + _asym_k) / jnp.float32(2.0)),
-            'exploration_asymmetry_v': _asym_v,
-            'exploration_asymmetry_rst': _asym_rst,
-            'exploration_layer_norm_enabled': explore_stats[
-                'exploration_layer_norm_enabled'],
-            'exploration_layer_count': explore_stats['exploration_layer_count'],
-            'exploration_norm': explore_stats['exploration_norm'],
-            'rpe_no_active_easy_shutoff_q': explore_stats[
-                'rpe_no_active_easy_shutoff_q'],
-            'rpe_no_active_easy_shutoff_k': explore_stats[
-                'rpe_no_active_easy_shutoff_k'],
-            'rpe_no_active_easy_shutoff_v': explore_stats[
-                'rpe_no_active_easy_shutoff_v'],
-            'rpe_no_active_easy_shutoff_rst': explore_stats[
-                'rpe_no_active_easy_shutoff_rst'],
+                jnp.float32(exploration_weight) * explore_stats['explore_active']),
+            'exploration_asymmetry': jnp.float32(exploration_asymmetry),
             'exploration_loss_raw_total': explore_stats['explore_loss_raw'],
-            'exploration_loss_raw_q': explore_stats['explore_q_raw'],
-            'exploration_loss_raw_k': explore_stats['explore_k_raw'],
             'exploration_loss_raw_qk': explore_stats['explore_qk_raw'],
             'exploration_loss_raw_v': explore_stats['explore_v_raw'],
             'exploration_loss_raw_attn': explore_stats['explore_attn_raw'],
             'exploration_loss_raw_rst': explore_stats['explore_rst_raw'],
-            'exploration_loss_weighted_q': (
-                _explore_weight_q * explore_stats['explore_q_raw']
-                * explore_stats['explore_active']),
-            'exploration_loss_weighted_k': (
-                _explore_weight_k * explore_stats['explore_k_raw']
-                * explore_stats['explore_active']),
             'exploration_loss_weighted_qk': (
-                (_explore_weight_q * explore_stats['explore_q_raw']
-                 + _explore_weight_k * explore_stats['explore_k_raw'])
+                exploration_weight * explore_stats['explore_qk_raw']
                 * explore_stats['explore_active']),
             'exploration_loss_weighted_v': (
-                _explore_weight_v * explore_stats['explore_v_raw']
+                exploration_weight * explore_stats['explore_v_raw']
                 * explore_stats['explore_active']),
             'exploration_loss_weighted_attn': (
-                (_explore_weight_q * explore_stats['explore_q_raw']
-                 + _explore_weight_k * explore_stats['explore_k_raw']
-                 + _explore_weight_v * explore_stats['explore_v_raw'])
+                exploration_weight * explore_stats['explore_attn_raw']
                 * explore_stats['explore_active']),
             'exploration_loss_weighted_rst': (
-                _explore_weight_rst * explore_stats['explore_rst_raw']
+                exploration_weight * explore_stats['explore_rst_raw']
                 * explore_stats['explore_active']),
             'exploration_loss_weighted_total': explore_loss_weighted_metric,
             'exploration_loss_weighted_unclipped': explore_loss_weighted_unclipped_metric,
@@ -2750,22 +2505,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'cb1a_qk_weight': _cb1a_qk_weight,
             'cb1a_v_weight': _cb1a_v_weight,
             'cb1a_rst_weight': _cb1a_rst_weight,
-            'cb1a_qk_challenge_weight': explore_stats[
-                'cb1a_qk_challenge_weight'],
+            'cb1a_qk_challenge_weight': explore_stats['cb1a_qk_challenge_weight'],
             'cb1a_qk_prune_weight': explore_stats['cb1a_qk_prune_weight'],
-            'cb1a_v_challenge_weight': explore_stats[
-                'cb1a_v_challenge_weight'],
+            'cb1a_v_challenge_weight': explore_stats['cb1a_v_challenge_weight'],
             'cb1a_v_prune_weight': explore_stats['cb1a_v_prune_weight'],
-            'cb1a_rst_challenge_weight': explore_stats[
-                'cb1a_rst_challenge_weight'],
+            'cb1a_rst_challenge_weight': explore_stats['cb1a_rst_challenge_weight'],
             'cb1a_rst_prune_weight': explore_stats['cb1a_rst_prune_weight'],
             'cb1a_ce_mean': explore_stats['cb1a_ce_mean'],
             'cb1a_ce_std': explore_stats['cb1a_ce_std'],
             'dead_penalty_weighted_unclipped': dead_penalty_weighted_unclipped_metric,
             'dead_penalty_weighted_clipped': dead_penalty_weighted_metric,
             'exploration_raw_pre_bound': explore_stats['explore_loss_pre_bound'],
-            'exploration_q_pre_bound': explore_stats['explore_q_pre_bound'],
-            'exploration_k_pre_bound': explore_stats['explore_k_pre_bound'],
             'exploration_qk_pre_bound': explore_stats['explore_qk_pre_bound'],
             'exploration_v_pre_bound': explore_stats['explore_v_pre_bound'],
             'exploration_raw_post_bound': explore_stats['explore_loss_raw'],
@@ -2782,8 +2532,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 + div_weight * div_loss
                 + dead_penalty_weighted_metric
                 + explore_loss_weighted_metric
-                + cb1a_weighted_metric
-                + selection_margin_reg_weighted_total_metric)),
+                + cb1a_weighted_metric)),
             'correct': result['correct'],
             'valid_count': result['valid_count'],
             'grad_norm': grad_norm,
@@ -2846,33 +2595,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_top1_gate_frac': result.get('rst_top1_gate_frac', jnp.float32(0.0)),
             'rst_top1_gate_frac_max': result.get('rst_top1_gate_frac_max', jnp.float32(0.0)),
             'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
-            'attn_q_active_n_mean': result.get(
-                'attn_q_active_n_mean',
-                result.get('attn_qk_active_n_mean',
-                           result.get('attn_active_n_mean', jnp.float32(0.0)))),
-            'attn_k_active_n_mean': result.get(
-                'attn_k_active_n_mean',
-                result.get('attn_qk_active_n_mean',
-                           result.get('attn_active_n_mean', jnp.float32(0.0)))),
-            'attn_q_active': result.get(
-                'attn_q_active',
-                result.get('attn_qk_active', jnp.float32(0.0))),
-            'attn_k_active': result.get(
-                'attn_k_active',
-                result.get('attn_qk_active', jnp.float32(0.0))),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
             'attn_qk_strong': result.get(
                 'attn_qk_strong',
                 result.get('attn_strong', jnp.float32(0.0))),
-            'attn_q_strong': result.get(
-                'attn_q_strong',
-                result.get('attn_qk_strong',
-                           result.get('attn_strong', jnp.float32(0.0)))),
-            'attn_k_strong': result.get(
-                'attn_k_strong',
-                result.get('attn_qk_strong',
-                           result.get('attn_strong', jnp.float32(0.0)))),
             'attn_v_strong': result.get(
                 'attn_v_strong',
                 result.get('attn_strong', jnp.float32(0.0))),
@@ -3019,27 +2746,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rpe_dev_pos': explore_stats['dev_pos_max'],
             'rpe_dev_neg': explore_stats['dev_neg_max'],
             'explore_loss_raw': explore_stats['explore_loss_raw'],
-            'explore_q_raw': explore_stats['explore_q_raw'],
-            'explore_k_raw': explore_stats['explore_k_raw'],
             'explore_qk_raw': explore_stats['explore_qk_raw'],
             'explore_v_raw': explore_stats['explore_v_raw'],
             'explore_attn_raw': explore_stats['explore_attn_raw'],
             'explore_rst_raw': explore_stats['explore_rst_raw'],
             'explore_loss_weighted': explore_loss_weighted_metric,
             'explore_active': explore_stats['explore_active'],
-            'explore_block_frac_q': explore_stats['block_frac_q'],
-            'explore_block_frac_key': explore_stats['block_frac_key'],
             'explore_block_frac_qk': explore_stats['block_frac_qk'],
             'explore_block_frac_v': explore_stats['block_frac_v'],
             'explore_block_frac_a': explore_stats['block_frac_a'],
-            'explore_block_frac_rst': explore_stats['block_frac_rst'],
-            'explore_block_frac_k': explore_stats['block_frac_rst'],
-            'rpe_block_q': explore_stats['block_frac_q'],
-            'rpe_block_key': explore_stats['block_frac_key'],
+            'explore_block_frac_k': explore_stats['block_frac_k'],
             'rpe_block_qk': explore_stats['block_frac_qk'],
             'rpe_block_v': explore_stats['block_frac_v'],
             'rpe_block_attn': explore_stats['block_frac_a'],
-            'rpe_block_rst': explore_stats['block_frac_rst'],
+            'rpe_block_rst': explore_stats['block_frac_k'],
             'dev_pos_max': explore_stats['dev_pos_max'],
             'dev_neg_max': explore_stats['dev_neg_max'],
             'attn_tau_off_min': explore_stats['attn_tau_off_min'],
@@ -3236,20 +2956,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     'exploration_warmup_factor',
                     'exploration_weight_effective',
                     'exploration_asymmetry',
-                    'exploration_asymmetry_q',
-                    'exploration_asymmetry_k',
-                    'exploration_asymmetry_qk',
-                    'exploration_asymmetry_v',
-                    'exploration_asymmetry_rst',
                     'exploration_loss_raw_total',
-                    'exploration_loss_raw_q',
-                    'exploration_loss_raw_k',
                     'exploration_loss_raw_qk',
                     'exploration_loss_raw_v',
                     'exploration_loss_raw_attn',
                     'exploration_loss_raw_rst',
-                    'exploration_loss_weighted_q',
-                    'exploration_loss_weighted_k',
                     'exploration_loss_weighted_qk',
                     'exploration_loss_weighted_v',
                     'exploration_loss_weighted_attn',
@@ -3257,16 +2968,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     'exploration_loss_weighted_total',
                     'exploration_loss_weighted_unclipped',
                     'exploration_loss_weighted_clipped',
-                    'exploration_layer_norm_enabled',
-                    'exploration_layer_count',
-                    'exploration_norm',
-                    'rpe_no_active_easy_shutoff_q',
-                    'rpe_no_active_easy_shutoff_k',
-                    'rpe_no_active_easy_shutoff_v',
-                    'rpe_no_active_easy_shutoff_rst',
                     'exploration_raw_pre_bound',
-                    'exploration_q_pre_bound',
-                    'exploration_k_pre_bound',
                     'exploration_qk_pre_bound',
                     'exploration_v_pre_bound',
                     'exploration_raw_post_bound',
@@ -3281,27 +2983,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     'rpe_neg_avg',
                     'rpe_dev_pos',
                     'rpe_dev_neg',
-                    'rpe_block_q',
-                    'rpe_block_key',
                     'rpe_block_qk',
                     'rpe_block_v',
                     'rpe_block_attn',
                     'rpe_block_rst',
                     'explore_loss_raw',
-                    'explore_q_raw',
-                    'explore_k_raw',
                     'explore_qk_raw',
                     'explore_v_raw',
                     'explore_attn_raw',
                     'explore_rst_raw',
                     'explore_loss_weighted',
                     'explore_active',
-                    'explore_block_frac_q',
-                    'explore_block_frac_key',
                     'explore_block_frac_qk',
                     'explore_block_frac_v',
                     'explore_block_frac_a',
-                    'explore_block_frac_rst',
                     'explore_block_frac_k',
                     'dev_pos_max',
                     'dev_neg_max'):
@@ -4244,8 +3939,6 @@ RPE_REGULAR_RECORD_KEYS = (
     'explore_loss_raw',
     'explore_loss_weighted',
     'exploration_loss_raw_total',
-    'exploration_loss_raw_q',
-    'exploration_loss_raw_k',
     'exploration_loss_raw_qk',
     'exploration_loss_raw_v',
     'exploration_loss_raw_attn',
@@ -4253,28 +3946,12 @@ RPE_REGULAR_RECORD_KEYS = (
     'exploration_warmup_factor',
     'exploration_weight_effective',
     'exploration_asymmetry',
-    'exploration_asymmetry_q',
-    'exploration_asymmetry_k',
-    'exploration_asymmetry_qk',
-    'exploration_asymmetry_v',
-    'exploration_asymmetry_rst',
-    'exploration_layer_norm_enabled',
-    'exploration_layer_count',
-    'exploration_norm',
-    'rpe_no_active_easy_shutoff_q',
-    'rpe_no_active_easy_shutoff_k',
-    'rpe_no_active_easy_shutoff_v',
-    'rpe_no_active_easy_shutoff_rst',
-    'exploration_loss_weighted_q',
-    'exploration_loss_weighted_k',
     'exploration_loss_weighted_qk',
     'exploration_loss_weighted_v',
     'exploration_loss_weighted_attn',
     'exploration_loss_weighted_rst',
     'exploration_loss_weighted_total',
     'exploration_raw_pre_bound',
-    'exploration_q_pre_bound',
-    'exploration_k_pre_bound',
     'exploration_qk_pre_bound',
     'exploration_v_pre_bound',
     'exploration_raw_post_bound',
@@ -4288,23 +3965,16 @@ RPE_REGULAR_RECORD_KEYS = (
     'rpe_dev_pos',
     'rpe_dev_neg',
     'rpe_block_attn',
-    'rpe_block_q',
-    'rpe_block_key',
     'rpe_block_qk',
     'rpe_block_v',
     'rpe_block_rst',
-    'explore_q_raw',
-    'explore_k_raw',
     'explore_qk_raw',
     'explore_v_raw',
     'explore_attn_raw',
     'explore_rst_raw',
-    'explore_block_frac_q',
-    'explore_block_frac_key',
     'explore_block_frac_qk',
     'explore_block_frac_v',
     'explore_block_frac_a',
-    'explore_block_frac_rst',
     'explore_block_frac_k',
     'dev_pos_max',
     'dev_neg_max',
@@ -4387,26 +4057,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'dead_penalty_weighted_total',
             ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)))),
         'dead_count_total': float(m.get('dead_count_total', 0.0)),
-        'selection_margin_reg_raw_qk': float(m.get(
-            'selection_margin_reg_raw_qk', 0.0)),
-        'selection_margin_reg_raw_v': float(m.get(
-            'selection_margin_reg_raw_v', 0.0)),
-        'selection_margin_reg_raw_rst': float(m.get(
-            'selection_margin_reg_raw_rst', 0.0)),
-        'selection_margin_reg_weight_qk': float(m.get(
-            'selection_margin_reg_weight_qk', 0.0)),
-        'selection_margin_reg_weight_v': float(m.get(
-            'selection_margin_reg_weight_v', 0.0)),
-        'selection_margin_reg_weight_rst': float(m.get(
-            'selection_margin_reg_weight_rst', 0.0)),
-        'selection_margin_reg_weighted_qk': float(m.get(
-            'selection_margin_reg_weighted_qk', 0.0)),
-        'selection_margin_reg_weighted_v': float(m.get(
-            'selection_margin_reg_weighted_v', 0.0)),
-        'selection_margin_reg_weighted_rst': float(m.get(
-            'selection_margin_reg_weighted_rst', 0.0)),
-        'selection_margin_reg_weighted_total': float(m.get(
-            'selection_margin_reg_weighted_total', 0.0)),
         'dead_penalty_per_dead': float(m.get('dead_penalty_per_dead', 0.0)),
         'attn_dead_penalty_per_dead': float(m.get(
             'attn_dead_penalty_per_dead', 0.0)),
@@ -4441,10 +4091,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'explore_loss_weighted': float(m.get('explore_loss_weighted', 0.0)),
         'exploration_loss_raw_total': float(m.get(
             'exploration_loss_raw_total', m.get('explore_loss_raw', 0.0))),
-        'exploration_loss_raw_q': float(m.get(
-            'exploration_loss_raw_q', m.get('explore_q_raw', 0.0))),
-        'exploration_loss_raw_k': float(m.get(
-            'exploration_loss_raw_k', m.get('explore_k_raw', 0.0))),
         'exploration_loss_raw_qk': float(m.get(
             'exploration_loss_raw_qk', m.get('explore_qk_raw', 0.0))),
         'exploration_loss_raw_v': float(m.get(
@@ -4457,32 +4103,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'exploration_weight_effective': float(m.get(
             'exploration_weight_effective', 0.0)),
         'exploration_asymmetry': float(m.get('exploration_asymmetry', 0.0)),
-        'exploration_asymmetry_q': float(m.get(
-            'exploration_asymmetry_q', m.get('exploration_asymmetry', 0.0))),
-        'exploration_asymmetry_k': float(m.get(
-            'exploration_asymmetry_k', m.get('exploration_asymmetry', 0.0))),
-        'exploration_asymmetry_qk': float(m.get(
-            'exploration_asymmetry_qk', m.get('exploration_asymmetry', 0.0))),
-        'exploration_asymmetry_v': float(m.get(
-            'exploration_asymmetry_v', m.get('exploration_asymmetry', 0.0))),
-        'exploration_asymmetry_rst': float(m.get(
-            'exploration_asymmetry_rst', m.get('exploration_asymmetry', 0.0))),
-        'exploration_layer_norm_enabled': float(m.get(
-            'exploration_layer_norm_enabled', 0.0)),
-        'exploration_layer_count': float(m.get('exploration_layer_count', 0.0)),
-        'exploration_norm': float(m.get('exploration_norm', 0.0)),
-        'rpe_no_active_easy_shutoff_q': float(m.get(
-            'rpe_no_active_easy_shutoff_q', 0.0)),
-        'rpe_no_active_easy_shutoff_k': float(m.get(
-            'rpe_no_active_easy_shutoff_k', 0.0)),
-        'rpe_no_active_easy_shutoff_v': float(m.get(
-            'rpe_no_active_easy_shutoff_v', 0.0)),
-        'rpe_no_active_easy_shutoff_rst': float(m.get(
-            'rpe_no_active_easy_shutoff_rst', 0.0)),
-        'exploration_loss_weighted_q': float(m.get(
-            'exploration_loss_weighted_q', 0.0)),
-        'exploration_loss_weighted_k': float(m.get(
-            'exploration_loss_weighted_k', 0.0)),
         'exploration_loss_weighted_qk': float(m.get(
             'exploration_loss_weighted_qk', 0.0)),
         'exploration_loss_weighted_v': float(m.get(
@@ -4494,8 +4114,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'exploration_loss_weighted_total': float(m.get(
             'exploration_loss_weighted_total', m.get('explore_loss_weighted', 0.0))),
         'exploration_raw_pre_bound': float(m.get('exploration_raw_pre_bound', 0.0)),
-        'exploration_q_pre_bound': float(m.get('exploration_q_pre_bound', 0.0)),
-        'exploration_k_pre_bound': float(m.get('exploration_k_pre_bound', 0.0)),
         'exploration_qk_pre_bound': float(m.get('exploration_qk_pre_bound', 0.0)),
         'exploration_v_pre_bound': float(m.get('exploration_v_pre_bound', 0.0)),
         'exploration_raw_post_bound': float(m.get('exploration_raw_post_bound', 0.0)),
@@ -4670,18 +4288,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'drift_rst_emb': float(m.get('drift_rst_emb', 0.0)),
         # Core activity.
         'attn_qk_active': float(m.get('attn_qk_active', 0.0)),
-        'attn_q_active': float(m.get(
-            'attn_q_active', m.get('attn_qk_active', 0.0))),
-        'attn_k_active': float(m.get(
-            'attn_k_active', m.get('attn_qk_active', 0.0))),
         'attn_v_active': float(m.get('attn_v_active', 0.0)),
         'rst_active': float(m.get('rst_active', 0.0)),
         'attn_strong': float(m.get('attn_strong', 0.0)),
         'attn_qk_strong': float(m.get('attn_qk_strong', m.get('attn_strong', 0.0))),
-        'attn_q_strong': float(m.get(
-            'attn_q_strong', m.get('attn_qk_strong', m.get('attn_strong', 0.0)))),
-        'attn_k_strong': float(m.get(
-            'attn_k_strong', m.get('attn_qk_strong', m.get('attn_strong', 0.0)))),
         'attn_v_strong': float(m.get('attn_v_strong', m.get('attn_strong', 0.0))),
         'rst_strong': float(m.get('rst_strong', 0.0)),
         'attn_raw_gate_max': float(m.get('attn_raw_gate_max', 0.0)),
@@ -4745,12 +4355,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_gate_sum': float(m.get('attn_gate_sum', 0.0)),
         'rst_gate_sum': float(m.get('rst_gate_sum', 0.0)),
         'attn_active_n_mean': float(m.get('attn_active_n_mean', 0.0)),
-        'attn_q_active_n_mean': float(m.get(
-            'attn_q_active_n_mean',
-            m.get('attn_qk_active_n_mean', m.get('attn_active_n_mean', 0.0)))),
-        'attn_k_active_n_mean': float(m.get(
-            'attn_k_active_n_mean',
-            m.get('attn_qk_active_n_mean', m.get('attn_active_n_mean', 0.0)))),
         'rst_active_n_mean': float(m.get('rst_active_n_mean', 0.0)),
         'attn_gate_eff_n': float(m.get('attn_gate_eff_n', 0.0)),
         'attn_gate_eff_ratio': float(m.get('attn_gate_eff_ratio', 0.0)),
@@ -4931,30 +4535,19 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rpe_dev_neg': float(m.get('rpe_dev_neg', m.get('dev_neg_max', 0.0))),
         'rpe_block_attn': float(m.get(
             'rpe_block_attn', m.get('explore_block_frac_a', 0.0))),
-        'rpe_block_q': float(m.get(
-            'rpe_block_q', m.get('explore_block_frac_q', 0.0))),
-        'rpe_block_key': float(m.get(
-            'rpe_block_key', m.get('explore_block_frac_key', 0.0))),
         'rpe_block_qk': float(m.get(
             'rpe_block_qk', m.get('explore_block_frac_qk', 0.0))),
         'rpe_block_v': float(m.get(
             'rpe_block_v', m.get('explore_block_frac_v', 0.0))),
         'rpe_block_rst': float(m.get(
-            'rpe_block_rst', m.get(
-                'explore_block_frac_rst', m.get('explore_block_frac_k', 0.0)))),
-        'explore_q_raw': float(m.get('explore_q_raw', 0.0)),
-        'explore_k_raw': float(m.get('explore_k_raw', 0.0)),
+            'rpe_block_rst', m.get('explore_block_frac_k', 0.0))),
         'explore_qk_raw': float(m.get('explore_qk_raw', 0.0)),
         'explore_v_raw': float(m.get('explore_v_raw', 0.0)),
         'explore_attn_raw': float(m.get('explore_attn_raw', 0.0)),
         'explore_rst_raw': float(m.get('explore_rst_raw', 0.0)),
-        'explore_block_frac_q': float(m.get('explore_block_frac_q', 0.0)),
-        'explore_block_frac_key': float(m.get('explore_block_frac_key', 0.0)),
         'explore_block_frac_qk': float(m.get('explore_block_frac_qk', 0.0)),
         'explore_block_frac_v': float(m.get('explore_block_frac_v', 0.0)),
         'explore_block_frac_a': float(m.get('explore_block_frac_a', 0.0)),
-        'explore_block_frac_rst': float(m.get(
-            'explore_block_frac_rst', m.get('explore_block_frac_k', 0.0))),
         'explore_block_frac_k': float(m.get('explore_block_frac_k', 0.0)),
         'dev_pos_max': float(m.get('dev_pos_max', 0.0)),
         'dev_neg_max': float(m.get('dev_neg_max', 0.0)),
@@ -5013,6 +4606,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
                       'attn_local_layer_values'):
         if _diag_key in m:
             rec[_diag_key] = _jsonable_diag_value(jax.device_get(m[_diag_key]))
+    if ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
+        for _key in RPE_REGULAR_RECORD_KEYS:
+            rec.pop(_key, None)
     return rec
 
 
@@ -5084,24 +4680,19 @@ def _print_cb1a_regular_block(rec):
         f" pool[qk={_g('cb1a_qk_raw'):.6f}"
         f" v={_g('cb1a_v_raw'):.6f}"
         f" rst={_g('cb1a_rst_raw'):.6f}]"
-        f" valid={_g('cb1a_valid'):.3f}"
     )
     log_message(
         f"  cb1a_split: qk[ch={qk_challenge:.6f} pr={qk_prune:.6f}]"
         f" v[ch={v_challenge:.6f} pr={v_prune:.6f}]"
         f" rst[ch={rst_challenge:.6f} pr={rst_prune:.6f}]"
-        f" direct_w[qk=({_g('cb1a_qk_challenge_weight', 0.0):.4g},"
-        f"{_g('cb1a_qk_prune_weight', 0.0):.4g})"
-        f" v=({_g('cb1a_v_challenge_weight', 0.0):.4g},"
-        f"{_g('cb1a_v_prune_weight', 0.0):.4g})"
-        f" rst=({_g('cb1a_rst_challenge_weight', 0.0):.4g},"
-        f"{_g('cb1a_rst_prune_weight', 0.0):.4g})]"
     )
 
 
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
-    is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
+    is_v4160 = ctx.get('model_version') in (
+        'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1')
+    is_v4161 = ctx.get('model_version') == 'spatial-r1-v4.1.6.1'
     log_message(
         f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
         f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} | "
@@ -5110,12 +4701,10 @@ def _print_regular_block(rec, ctx):
     )
     if is_v4160:
         log_message(
-            f"  act: q={_fmt_act_count(rec['attn_q_active'], ctx['n_qk_cfg'])}"
-            f" k={_fmt_act_count(rec['attn_k_active'], ctx['n_qk_cfg'])}"
+            f"  act: qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
             f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
             f" rst={_fmt_act_count(rec['rst_active'], ctx['n_rst_cfg'])}"
-            f" | strong: q={rec['attn_q_strong']*100:.1f}%"
-            f" k={rec['attn_k_strong']*100:.1f}%"
+            f" | strong: qk={rec['attn_qk_strong']*100:.1f}%"
             f" v={rec['attn_v_strong']*100:.1f}%"
             f" rst={rec['rst_strong']*100:.1f}%"
         )
@@ -5160,16 +4749,6 @@ def _print_regular_block(rec, ctx):
             f" no_active[qk={rec['attn_qk_no_active_frac']*100:.2f}%"
             f" v={rec['attn_v_no_active_frac']*100:.2f}%"
             f" rst={rec['rst_no_active_frac']*100:.2f}%]"
-        )
-        log_message(
-            f"  selection_margin_reg: "
-            f"raw[qk={rec['selection_margin_reg_raw_qk']:.6f}"
-            f" v={rec['selection_margin_reg_raw_v']:.6f}"
-            f" rst={rec['selection_margin_reg_raw_rst']:.6f}]"
-            f" weighted[qk={rec['selection_margin_reg_weighted_qk']:.6f}"
-            f" v={rec['selection_margin_reg_weighted_v']:.6f}"
-            f" rst={rec['selection_margin_reg_weighted_rst']:.6f}"
-            f" total={rec['selection_margin_reg_weighted_total']:.6f}]"
         )
     if is_v4160:
         log_message(
@@ -5437,47 +5016,38 @@ def _print_regular_block(rec, ctx):
         f" k[m={rec['rst_op_gain_mean']:.2f} s={rec['rst_op_gain_std']:.2f}"
         f" max={rec['rst_op_gain_max']:.2f}]"
     )
-    if is_v4160:
-        log_message(
-            f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
-            f" pos={rec['pos_frac']*100:.1f}%"
-            f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-            f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
-            f" norm[layer_norm={rec['exploration_layer_norm_enabled']:.0f}"
-            f" layer_count={rec['exploration_layer_count']:.0f}"
-            f" norm={rec['exploration_norm']:.1f}]"
-            f" rpe_guard: shutoff[q={rec['rpe_no_active_easy_shutoff_q']*100:.1f}%"
-            f" k={rec['rpe_no_active_easy_shutoff_k']*100:.1f}%"
-            f" v={rec['rpe_no_active_easy_shutoff_v']*100:.1f}%"
-            f" rst={rec['rpe_no_active_easy_shutoff_rst']*100:.1f}%]"
-            f" expl[q={rec['explore_q_raw']:+.3f}"
-            f" k={rec['explore_k_raw']:+.3f}"
-            f" v={rec['explore_v_raw']:+.3f}"
-            f" rst={rec['explore_rst_raw']:+.3f}"
-            f" total={rec['explore_loss_raw']:+.3f}]"
-            f" weighted[q={rec['exploration_loss_weighted_q']:+.4f}"
-            f" k={rec['exploration_loss_weighted_k']:+.4f}"
-            f" v={rec['exploration_loss_weighted_v']:+.4f}"
-            f" rst={rec['exploration_loss_weighted_rst']:+.4f}"
-            f" total={rec['explore_loss_weighted']:+.4f}]"
-            f" block[q={rec['explore_block_frac_q']*100:.1f}%"
-            f" k={rec['explore_block_frac_key']*100:.1f}%"
-            f" v={rec['explore_block_frac_v']*100:.1f}%"
-            f" rst={rec['explore_block_frac_rst']*100:.1f}%]"
-        )
-    else:
-        log_message(
-            f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
-            f" pos={rec['pos_frac']*100:.1f}%"
-            f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-            f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
-            f" expl[a={rec['explore_attn_raw']:+.3f} rst={rec['explore_rst_raw']:+.3f}]"
-            f" w={rec['explore_loss_weighted']:+.4f}"
-            f" block[a={rec['explore_block_frac_a']*100:.1f}%"
-            f" rst={rec['explore_block_frac_rst']*100:.1f}%]"
-        )
     if _should_print_cb1a_line(rec, ctx):
         _print_cb1a_regular_block(rec)
+    if not is_v4161:
+        if is_v4160:
+            log_message(
+                f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
+                f" pos={rec['pos_frac']*100:.1f}%"
+                f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
+                f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
+                f" expl[qk={rec['explore_qk_raw']:+.3f}"
+                f" v={rec['explore_v_raw']:+.3f}"
+                f" rst={rec['explore_rst_raw']:+.3f}"
+                f" total={rec['explore_loss_raw']:+.3f}]"
+                f" weighted[qk={rec['exploration_loss_weighted_qk']:+.4f}"
+                f" v={rec['exploration_loss_weighted_v']:+.4f}"
+                f" rst={rec['exploration_loss_weighted_rst']:+.4f}"
+                f" total={rec['explore_loss_weighted']:+.4f}]"
+                f" block[qk={rec['explore_block_frac_qk']*100:.1f}%"
+                f" v={rec['explore_block_frac_v']*100:.1f}%"
+                f" rst={rec['explore_block_frac_k']*100:.1f}%]"
+            )
+        else:
+            log_message(
+                f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
+                f" pos={rec['pos_frac']*100:.1f}%"
+                f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
+                f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
+                f" expl[a={rec['explore_attn_raw']:+.3f} rst={rec['explore_rst_raw']:+.3f}]"
+                f" w={rec['explore_loss_weighted']:+.4f}"
+                f" block[a={rec['explore_block_frac_a']*100:.1f}%"
+                f" rst={rec['explore_block_frac_k']*100:.1f}%]"
+            )
     _pl_a = rec.get('per_layer_attn_out_norm', []) or []
     _pl_k = rec.get('per_layer_rst_out_norm', []) or []
     if _pl_a or _pl_k:
@@ -5497,7 +5067,8 @@ def _dead_trigger_info(rec, ctx=None):
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
 
-    is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
+    is_v4160 = ctx.get('model_version') in (
+        'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1')
     if is_v4160:
         qk_count = _g('attn_qk_dead_count')
         v_count = _g('attn_v_dead_count')
@@ -5709,11 +5280,7 @@ CRASH_REASON_NAMES = (
 def _active_max_from_rec(rec):
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
-    attn_qk = _g('attn_qk_active')
-    return max(_g('attn_q_active', attn_qk),
-               _g('attn_k_active', attn_qk),
-               _g('attn_v_active'),
-               _g('rst_active'))
+    return max(_g('attn_qk_active'), _g('attn_v_active'), _g('rst_active'))
 
 
 def _top1_max_from_rec(rec):
@@ -6126,7 +5693,9 @@ def _print_drop_compare_block(rec):
 
 def _print_debug_block(rec, ctx):
     """Write debug-only DAWN-SRW collapse diagnostics to debug_log_*.txt."""
-    is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
+    is_v4160 = ctx.get('model_version') in (
+        'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1')
+    is_v4161 = ctx.get('model_version') == 'spatial-r1-v4.1.6.1'
 
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
@@ -6145,12 +5714,12 @@ def _print_debug_block(rec, ctx):
         f"grad={_g('grad_global_preclip', _g('grad_norm')):.3f} "
         f"lr={_g('lr'):.3e}"
     )
-    rpe_loss_terms = (
-        f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
-        f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
-        f"cb1a_raw={_g('cb1a_raw'):+.6f} "
-        f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
-    )
+    rpe_loss_terms = ""
+    if not is_v4161:
+        rpe_loss_terms = (
+            f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
+            f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
+        )
     log_debug_message(
         f"loss_terms: ce={_g('ce_loss'):.6f} "
         f"aux_raw_lb_plus_internal_tau={_g('aux_loss_raw', _g('aux_loss')):.6f} "
@@ -6162,22 +5731,14 @@ def _print_debug_block(rec, ctx):
         f"dead_raw={_g('dead_penalty_raw_total', _g('dead_penalty')):.6f} "
         f"dead_w={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f} "
         f"{rpe_loss_terms}"
+        f"cb1a_raw={_g('cb1a_raw'):+.6f} "
+        f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
         f"wd_pool={_g('pool_weight_decay_loss'):.6f} "
         f"wd_normal={_g('normal_weight_decay_loss'):.6f} "
         f"total_minus_ce={_g('total_loss_minus_ce'):.6f} "
         f"recon_err={_g('reconstructed_loss_error'):.3e}"
     )
     if is_v4160:
-        log_debug_message(
-            f"selection_margin_reg: "
-            f"raw[qk={_g('selection_margin_reg_raw_qk'):.6f} "
-            f"v={_g('selection_margin_reg_raw_v'):.6f} "
-            f"rst={_g('selection_margin_reg_raw_rst'):.6f}] "
-            f"weighted[qk={_g('selection_margin_reg_weighted_qk'):.6f} "
-            f"v={_g('selection_margin_reg_weighted_v'):.6f} "
-            f"rst={_g('selection_margin_reg_weighted_rst'):.6f} "
-            f"total={_g('selection_margin_reg_weighted_total'):.6f}]"
-        )
         _qk_per_dead = _g('attn_qk_dead_penalty') / max(_g('attn_qk_dead_count'), 1.0)
         _v_per_dead = _g('attn_v_dead_penalty') / max(_g('attn_v_dead_count'), 1.0)
         log_debug_message(
@@ -6192,9 +5753,10 @@ def _print_debug_block(rec, ctx):
             f"v={_v_per_dead:.6f} "
             f"rst={_g('rst_dead_penalty_per_dead'):.6f} "
             f"total={_g('dead_penalty_per_dead'):.6f}] "
-            f"direct_w[qk={_g('dead_penalty_qk_weight', 0.0):.4g} "
-            f"v={_g('dead_penalty_v_weight', 0.0):.4g} "
-            f"rst={_g('dead_penalty_rst_weight', 0.0):.4g}] "
+            f"weight={_g('dead_penalty_weight'):.4f} "
+            f"pool_w[qk={_g('dead_penalty_qk_weight', 1.0):.2f} "
+            f"v={_g('dead_penalty_v_weight', 1.0):.2f} "
+            f"rst={_g('dead_penalty_rst_weight', 1.0):.2f}] "
             f"weighted={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f}"
         )
     else:
@@ -6225,15 +5787,18 @@ def _print_debug_block(rec, ctx):
             f"pool_prune[qk={_g('cb1a_qk_prune'):+.6f} "
             f"v={_g('cb1a_v_prune'):+.6f} "
             f"rst={_g('cb1a_rst_prune'):+.6f}] "
-            f"weighted_pool[qk={_g('cb1a_qk_raw'):+.6f} "
+            f"pool_raw[qk={_g('cb1a_qk_raw'):+.6f} "
             f"v={_g('cb1a_v_raw'):+.6f} "
             f"rst={_g('cb1a_rst_raw'):+.6f}] "
-            f"direct_w[qk=({_g('cb1a_qk_challenge_weight', 0.0):.4g},"
-            f"{_g('cb1a_qk_prune_weight', 0.0):.4g}) "
-            f"v=({_g('cb1a_v_challenge_weight', 0.0):.4g},"
-            f"{_g('cb1a_v_prune_weight', 0.0):.4g}) "
-            f"rst=({_g('cb1a_rst_challenge_weight', 0.0):.4g},"
-            f"{_g('cb1a_rst_prune_weight', 0.0):.4g})]"
+            f"pool_w[qk={_g('cb1a_qk_weight', 1.0):.2f} "
+            f"v={_g('cb1a_v_weight', 1.0):.2f} "
+            f"rst={_g('cb1a_rst_weight', 1.0):.2f}] "
+            f"cp_w[qk=({_g('cb1a_qk_challenge_weight', 1.0):.2f},"
+            f"{_g('cb1a_qk_prune_weight', 3.0):.2f}) "
+            f"v=({_g('cb1a_v_challenge_weight', 1.0):.2f},"
+            f"{_g('cb1a_v_prune_weight', 3.0):.2f}) "
+            f"rst=({_g('cb1a_rst_challenge_weight', 1.0):.2f},"
+            f"{_g('cb1a_rst_prune_weight', 3.0):.2f})]"
         )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_debug_message(
@@ -6270,33 +5835,20 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('rst_weak_exposure_frac'):.5f}] "
             f"target={_g('attn_qk_dead_exposure_target'):.5f}"
         )
-    if is_v4160:
+    if not is_v4161 and is_v4160:
         log_debug_message(
             f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
             f"w_eff={_g('exploration_weight_effective'):.6f} "
-            f"norm[layer_norm={_g('exploration_layer_norm_enabled'):.0f} "
-            f"layer_count={_g('exploration_layer_count'):.0f} "
-            f"norm={_g('exploration_norm'):.1f}] "
-            f"rpe_guard: shutoff[q={_g('rpe_no_active_easy_shutoff_q'):.3f} "
-            f"k={_g('rpe_no_active_easy_shutoff_k'):.3f} "
-            f"v={_g('rpe_no_active_easy_shutoff_v'):.3f} "
-            f"rst={_g('rpe_no_active_easy_shutoff_rst'):.3f}] "
-            f"asym[q={_g('exploration_asymmetry_q', _g('exploration_asymmetry')):.3f} "
-            f"k={_g('exploration_asymmetry_k', _g('exploration_asymmetry')):.3f} "
-            f"v={_g('exploration_asymmetry_v', _g('exploration_asymmetry')):.3f} "
-            f"rst={_g('exploration_asymmetry_rst', _g('exploration_asymmetry')):.3f}] "
-            f"raw[q={_g('exploration_loss_raw_q', _g('explore_q_raw')):+.6f} "
-            f"k={_g('exploration_loss_raw_k', _g('explore_k_raw')):+.6f} "
+            f"asym={_g('exploration_asymmetry'):.3f} "
+            f"raw[qk={_g('exploration_loss_raw_qk', _g('explore_qk_raw')):+.6f} "
             f"v={_g('exploration_loss_raw_v', _g('explore_v_raw')):+.6f} "
             f"rst={_g('exploration_loss_raw_rst', _g('explore_rst_raw')):+.6f} "
             f"total={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f}] "
-            f"weighted[q={_g('exploration_loss_weighted_q'):+.6f} "
-            f"k={_g('exploration_loss_weighted_k'):+.6f} "
+            f"weighted[qk={_g('exploration_loss_weighted_qk'):+.6f} "
             f"v={_g('exploration_loss_weighted_v'):+.6f} "
             f"rst={_g('exploration_loss_weighted_rst'):+.6f} "
             f"total={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f}] "
-            f"pre_bound[q={_g('exploration_q_pre_bound'):+.6f} "
-            f"k={_g('exploration_k_pre_bound'):+.6f} "
+            f"pre_bound[qk={_g('exploration_qk_pre_bound'):+.6f} "
             f"v={_g('exploration_v_pre_bound'):+.6f} "
             f"total={_g('exploration_raw_pre_bound'):+.6f}] "
             f"post_bound={_g('exploration_raw_post_bound'):+.6f} "
@@ -6305,12 +5857,11 @@ def _print_debug_block(rec, ctx):
             f"neg_avg={_g('rpe_neg_avg', _g('neg_mean')):.4f} "
             f"dev_pos={_g('rpe_dev_pos', _g('dev_pos_max')):.4f} "
             f"dev_neg={_g('rpe_dev_neg', _g('dev_neg_max')):.4f} "
-            f"block[q={_g('rpe_block_q', _g('explore_block_frac_q')):.3f} "
-            f"k={_g('rpe_block_key', _g('explore_block_frac_key')):.3f} "
+            f"block[qk={_g('rpe_block_qk', _g('explore_block_frac_qk')):.3f} "
             f"v={_g('rpe_block_v', _g('explore_block_frac_v')):.3f} "
-            f"rst={_g('rpe_block_rst', _g('explore_block_frac_rst')):.3f}]]"
+            f"rst={_g('rpe_block_rst', _g('explore_block_frac_k')):.3f}]]"
         )
-    else:
+    elif not is_v4161:
         log_debug_message(
             f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
             f"w_eff={_g('exploration_weight_effective'):.6f} "
@@ -6329,19 +5880,16 @@ def _print_debug_block(rec, ctx):
             f"dev_pos={_g('rpe_dev_pos', _g('dev_pos_max')):.4f} "
             f"dev_neg={_g('rpe_dev_neg', _g('dev_neg_max')):.4f} "
             f"block_attn={_g('rpe_block_attn', _g('explore_block_frac_a')):.3f} "
-            f"block_rst={_g('rpe_block_rst', _g('explore_block_frac_rst')):.3f}]"
+            f"block_rst={_g('rpe_block_rst', _g('explore_block_frac_k')):.3f}]"
         )
     if is_v4160:
         log_debug_message(
-            f"route_diag: active_n[q={_g('attn_q_active') * ctx.get('n_qk_cfg', 0):.1f} "
-            f"k={_g('attn_k_active') * ctx.get('n_qk_cfg', 0):.1f} "
+            f"route_diag: active_n[qk={_g('attn_qk_active') * ctx.get('n_qk_cfg', 0):.1f} "
             f"v={_g('attn_v_active') * ctx.get('n_v_cfg', 0):.1f} "
             f"rst={_g('rst_active') * ctx.get('n_rst_cfg', 0):.1f}] "
-            f"active_frac[q={_g('attn_q_active'):.4f} "
-            f"k={_g('attn_k_active'):.4f} "
+            f"active_frac[qk={_g('attn_qk_active'):.4f} "
             f"v={_g('attn_v_active'):.4f} rst={_g('rst_active'):.4f}] "
-            f"strong[q={_g('attn_q_strong'):.4f} "
-            f"k={_g('attn_k_strong'):.4f} "
+            f"strong[qk={_g('attn_qk_strong'):.4f} "
             f"v={_g('attn_v_strong'):.4f} rst={_g('rst_strong'):.4f}] "
             f"den[qk={_g('attn_qk_gate_den_sum_mean'):.3f} "
             f"v={_g('attn_v_gate_den_sum_mean'):.3f} "
@@ -6402,7 +5950,8 @@ def _print_debug_block(rec, ctx):
             f"selected[attn={_g('attn_selected_frac'):.5f} rst={_g('rst_selected_frac'):.5f}] "
             f"no_active[attn={_g('attn_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
         )
-    elif ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS:
+    elif ctx.get('model_version') in (
+            'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1'):
         log_debug_message(
             f"direct_tau_select_diag: "
             f"tau[qk={_g('attn_qk_tau_mean'):+.5f} "
@@ -6929,7 +6478,8 @@ def _build_analysis_record(base, metrics, ctx):
 def _print_analysis_block(rec, ctx):
     # Analysis logging must never kill a run.  Missing optional fields are
     # printed as 0.0 instead of raising KeyError.
-    is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
+    is_v4160 = ctx.get('model_version') in (
+        'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1')
 
     def _g(key, default=0.0):
         return float(rec.get(key, default))
@@ -7185,6 +6735,9 @@ def main():
         else:
             raise FileNotFoundError(f"Config file not found: {config_path}")
     cfg = load_config(config_path)
+    model_version_cfg = cfg['model'].get('model_version', 'dawn_srw')
+    rpe_enabled = model_version_cfg != 'spatial-r1-v4.1.6.1'
+
     seed = cfg.get('seed', 42)
     set_seed(seed)
 
@@ -7192,7 +6745,6 @@ def main():
     # Keep the CLI surface small: --debug controls cadence, while the diagnostic
     # feature switches themselves live in training: config.
     tcfg = cfg['training']
-    model_version_cfg = cfg['model'].get('model_version', 'dawn_srw')
     # Optional config-driven resume. CLI --resume remains an override for
     # ad-hoc launches, but diagnostic configs can be one-shot.
     configured_resume_from = (
@@ -7246,46 +6798,13 @@ def main():
     lb_weight = tcfg.get('load_balance_weight', 2e-5)
     tau_reg_weight = tcfg.get('tau_reg_weight', 0.0)
     dead_penalty_weight = tcfg.get('dead_penalty_weight', 0.0)  # v4.0.6
-    dead_penalty_qk_weight = tcfg.get(
-        'dead_penalty_qk_weight', dead_penalty_weight)
-    dead_penalty_v_weight = tcfg.get(
-        'dead_penalty_v_weight', dead_penalty_weight)
-    dead_penalty_rst_weight = tcfg.get(
-        'dead_penalty_rst_weight', dead_penalty_weight)
+    dead_penalty_qk_weight = tcfg.get('dead_penalty_qk_weight', 1.0)
+    dead_penalty_v_weight = tcfg.get('dead_penalty_v_weight', 1.0)
+    dead_penalty_rst_weight = tcfg.get('dead_penalty_rst_weight', 1.0)
     dead_exposure_target = float(tcfg.get('dead_exposure_target', 0.1))
-    selection_margin_reg_weight_qk = tcfg.get(
-        'selection_margin_reg_weight_qk', 0.0)
-    selection_margin_reg_weight_v = tcfg.get(
-        'selection_margin_reg_weight_v', 0.0)
-    selection_margin_reg_weight_rst = tcfg.get(
-        'selection_margin_reg_weight_rst', 0.0)
     # v4.1 RPE exploration loss (0 weight => off; no-op for earlier versions).
     exploration_weight = tcfg.get('exploration_weight', 0.0)
-    exploration_weight_qk = tcfg.get('exploration_weight_qk', exploration_weight)
-    if ('exploration_weight_qk' not in tcfg
-            and ('exploration_weight_q' in tcfg or 'exploration_weight_k' in tcfg)):
-        exploration_weight_qk = (
-            float(tcfg.get('exploration_weight_q', exploration_weight))
-            + float(tcfg.get('exploration_weight_k', exploration_weight))) * 0.5
-    exploration_weight_q = exploration_weight_qk
-    exploration_weight_k = exploration_weight_qk
-    exploration_weight_v = tcfg.get('exploration_weight_v', exploration_weight)
-    exploration_weight_rst = tcfg.get('exploration_weight_rst', exploration_weight)
     exploration_asymmetry = tcfg.get('exploration_asymmetry', 0.15)
-    exploration_asymmetry_qk = tcfg.get(
-        'exploration_asymmetry_qk', exploration_asymmetry)
-    if ('exploration_asymmetry_qk' not in tcfg
-            and ('exploration_asymmetry_q' in tcfg
-                 or 'exploration_asymmetry_k' in tcfg)):
-        exploration_asymmetry_qk = (
-            float(tcfg.get('exploration_asymmetry_q', exploration_asymmetry))
-            + float(tcfg.get('exploration_asymmetry_k', exploration_asymmetry))) * 0.5
-    exploration_asymmetry_q = exploration_asymmetry_qk
-    exploration_asymmetry_k = exploration_asymmetry_qk
-    exploration_asymmetry_v = tcfg.get(
-        'exploration_asymmetry_v', exploration_asymmetry)
-    exploration_asymmetry_rst = tcfg.get(
-        'exploration_asymmetry_rst', exploration_asymmetry)
     # v4.1+ bounded-explore: warmup + per-element bound-off cap.
     exploration_warmup_steps = tcfg.get('exploration_warmup_steps', 5000)
     exploration_lower_bound = tcfg.get('exploration_lower_bound', -0.5)
@@ -7297,46 +6816,28 @@ def main():
     exploration_z_tanh = tcfg.get('exploration_z_tanh', True)
     exploration_weighted_clip = tcfg.get(
         'exploration_weighted_clip', tcfg.get('expl_w_clip', 0.0))
-    exploration_normalize_by_layers_default = (
-        model_version_cfg in DIRECT_TAU_SPLIT_MODEL_VERSIONS)
-    exploration_normalize_by_layers = bool(tcfg.get(
-        'exploration_normalize_by_layers',
-        exploration_normalize_by_layers_default))
-    rpe_enabled = bool(tcfg.get(
-        'rpe_enabled', model_version_cfg != 'spatial-r1-v4.1.6.1'))
     if not rpe_enabled:
         exploration_weight = 0.0
-        exploration_weight_q = 0.0
-        exploration_weight_k = 0.0
-        exploration_weight_qk = 0.0
-        exploration_weight_v = 0.0
-        exploration_weight_rst = 0.0
-        exploration_asymmetry_q = 0.0
-        exploration_asymmetry_k = 0.0
-        exploration_asymmetry_qk = 0.0
-        exploration_asymmetry_v = 0.0
-        exploration_asymmetry_rst = 0.0
         exploration_weighted_clip = 0.0
-    cb1a_enabled = tcfg.get(
-        'cb1a_enabled', model_version_cfg == 'spatial-r1-v4.1.6.1')
+    cb1a_enabled = tcfg.get('cb1a_enabled', False)
     cb1a_weight = tcfg.get('cb1a_weight', 0.0)
-    cb1a_challenge_weight = tcfg.get('cb1a_challenge_weight', 0.0)
-    cb1a_prune_weight = tcfg.get('cb1a_prune_weight', 0.0)
-    cb1a_qk_weight = tcfg.get('cb1a_qk_weight', 0.0)
-    cb1a_v_weight = tcfg.get('cb1a_v_weight', 0.0)
-    cb1a_rst_weight = tcfg.get('cb1a_rst_weight', 0.0)
+    cb1a_challenge_weight = tcfg.get('cb1a_challenge_weight', 1.0)
+    cb1a_prune_weight = tcfg.get('cb1a_prune_weight', 1.0)
+    cb1a_qk_weight = tcfg.get('cb1a_qk_weight', 1.0)
+    cb1a_v_weight = tcfg.get('cb1a_v_weight', 1.0)
+    cb1a_rst_weight = tcfg.get('cb1a_rst_weight', 1.0)
     cb1a_qk_challenge_weight = tcfg.get(
-        'cb1a_qk_challenge_weight', 0.0)
+        'cb1a_qk_challenge_weight', cb1a_challenge_weight)
     cb1a_qk_prune_weight = tcfg.get(
-        'cb1a_qk_prune_weight', 0.0)
+        'cb1a_qk_prune_weight', cb1a_prune_weight)
     cb1a_v_challenge_weight = tcfg.get(
-        'cb1a_v_challenge_weight', 0.0)
+        'cb1a_v_challenge_weight', cb1a_challenge_weight)
     cb1a_v_prune_weight = tcfg.get(
-        'cb1a_v_prune_weight', 0.0)
+        'cb1a_v_prune_weight', cb1a_prune_weight)
     cb1a_rst_challenge_weight = tcfg.get(
-        'cb1a_rst_challenge_weight', 0.0)
+        'cb1a_rst_challenge_weight', cb1a_challenge_weight)
     cb1a_rst_prune_weight = tcfg.get(
-        'cb1a_rst_prune_weight', 0.0)
+        'cb1a_rst_prune_weight', cb1a_prune_weight)
     cb1a_tau_stopgrad = tcfg.get('cb1a_tau_stopgrad', True)
     cb1a_anchor_stopgrad = tcfg.get('cb1a_anchor_stopgrad', True)
     cb1a_forward_influence = tcfg.get('cb1a_forward_influence', False)
@@ -7564,51 +7065,10 @@ def main():
                 'dead_penalty_rst_weight', dead_penalty_rst_weight)
             dead_exposure_target = float(saved_training_config.get(
                 'dead_exposure_target', dead_exposure_target))
-            selection_margin_reg_weight_qk = saved_training_config.get(
-                'selection_margin_reg_weight_qk',
-                selection_margin_reg_weight_qk)
-            selection_margin_reg_weight_v = saved_training_config.get(
-                'selection_margin_reg_weight_v',
-                selection_margin_reg_weight_v)
-            selection_margin_reg_weight_rst = saved_training_config.get(
-                'selection_margin_reg_weight_rst',
-                selection_margin_reg_weight_rst)
             exploration_weight = saved_training_config.get(
                 'exploration_weight', exploration_weight)
-            exploration_weight_qk = saved_training_config.get(
-                'exploration_weight_qk', exploration_weight)
-            if ('exploration_weight_qk' not in saved_training_config
-                    and ('exploration_weight_q' in saved_training_config
-                         or 'exploration_weight_k' in saved_training_config)):
-                exploration_weight_qk = (
-                    float(saved_training_config.get(
-                        'exploration_weight_q', exploration_weight))
-                    + float(saved_training_config.get(
-                        'exploration_weight_k', exploration_weight))) * 0.5
-            exploration_weight_q = exploration_weight_qk
-            exploration_weight_k = exploration_weight_qk
-            exploration_weight_v = saved_training_config.get(
-                'exploration_weight_v', exploration_weight)
-            exploration_weight_rst = saved_training_config.get(
-                'exploration_weight_rst', exploration_weight)
             exploration_asymmetry = saved_training_config.get(
                 'exploration_asymmetry', exploration_asymmetry)
-            exploration_asymmetry_qk = saved_training_config.get(
-                'exploration_asymmetry_qk', exploration_asymmetry)
-            if ('exploration_asymmetry_qk' not in saved_training_config
-                    and ('exploration_asymmetry_q' in saved_training_config
-                         or 'exploration_asymmetry_k' in saved_training_config)):
-                exploration_asymmetry_qk = (
-                    float(saved_training_config.get(
-                        'exploration_asymmetry_q', exploration_asymmetry))
-                    + float(saved_training_config.get(
-                        'exploration_asymmetry_k', exploration_asymmetry))) * 0.5
-            exploration_asymmetry_q = exploration_asymmetry_qk
-            exploration_asymmetry_k = exploration_asymmetry_qk
-            exploration_asymmetry_v = saved_training_config.get(
-                'exploration_asymmetry_v', exploration_asymmetry)
-            exploration_asymmetry_rst = saved_training_config.get(
-                'exploration_asymmetry_rst', exploration_asymmetry)
             exploration_warmup_steps = saved_training_config.get(
                 'exploration_warmup_steps', exploration_warmup_steps)
             exploration_lower_bound = saved_training_config.get(
@@ -7627,11 +7087,6 @@ def main():
                 'exploration_z_tanh', exploration_z_tanh)
             exploration_weighted_clip = saved_training_config.get(
                 'exploration_weighted_clip', exploration_weighted_clip)
-            exploration_normalize_by_layers = bool(saved_training_config.get(
-                'exploration_normalize_by_layers',
-                exploration_normalize_by_layers))
-            rpe_enabled = bool(saved_training_config.get(
-                'rpe_enabled', rpe_enabled))
             cb1a_enabled = saved_training_config.get(
                 'cb1a_enabled', cb1a_enabled)
             cb1a_weight = saved_training_config.get(
@@ -7666,7 +7121,8 @@ def main():
                 'cb1a_forward_influence', cb1a_forward_influence)
             cb1a_ce_mode = saved_training_config.get(
                 'cb1a_ce_mode', cb1a_ce_mode)
-            cb1a_eps = saved_training_config.get('cb1a_eps', cb1a_eps)
+            cb1a_eps = saved_training_config.get(
+                'cb1a_eps', cb1a_eps)
             dead_penalty_weighted_clip = saved_training_config.get(
                 'dead_penalty_weighted_clip', dead_penalty_weighted_clip)
             global_grad_clip = saved_training_config.get(
@@ -7717,16 +7173,6 @@ def main():
 
     if not rpe_enabled:
         exploration_weight = 0.0
-        exploration_weight_q = 0.0
-        exploration_weight_k = 0.0
-        exploration_weight_qk = 0.0
-        exploration_weight_v = 0.0
-        exploration_weight_rst = 0.0
-        exploration_asymmetry_q = 0.0
-        exploration_asymmetry_k = 0.0
-        exploration_asymmetry_qk = 0.0
-        exploration_asymmetry_v = 0.0
-        exploration_asymmetry_rst = 0.0
         exploration_weighted_clip = 0.0
 
     # Build training_config dict for saving in checkpoints
@@ -7746,17 +7192,8 @@ def main():
         'dead_penalty_v_weight': dead_penalty_v_weight,
         'dead_penalty_rst_weight': dead_penalty_rst_weight,
         'dead_exposure_target': dead_exposure_target,
-        'selection_margin_reg_weight_qk': selection_margin_reg_weight_qk,
-        'selection_margin_reg_weight_v': selection_margin_reg_weight_v,
-        'selection_margin_reg_weight_rst': selection_margin_reg_weight_rst,
         'exploration_weight': exploration_weight,
-        'exploration_weight_qk': exploration_weight_qk,
-        'exploration_weight_v': exploration_weight_v,
-        'exploration_weight_rst': exploration_weight_rst,
         'exploration_asymmetry': exploration_asymmetry,
-        'exploration_asymmetry_qk': exploration_asymmetry_qk,
-        'exploration_asymmetry_v': exploration_asymmetry_v,
-        'exploration_asymmetry_rst': exploration_asymmetry_rst,
         'exploration_warmup_steps': exploration_warmup_steps,
         'exploration_lower_bound': exploration_lower_bound,
         'exploration_upper_bound': exploration_upper_bound,
@@ -7766,9 +7203,13 @@ def main():
         'exploration_z_clip': exploration_z_clip,
         'exploration_z_tanh': exploration_z_tanh,
         'exploration_weighted_clip': exploration_weighted_clip,
-        'exploration_normalize_by_layers': exploration_normalize_by_layers,
-        'rpe_enabled': rpe_enabled,
         'cb1a_enabled': cb1a_enabled,
+        'cb1a_weight': cb1a_weight,
+        'cb1a_challenge_weight': cb1a_challenge_weight,
+        'cb1a_prune_weight': cb1a_prune_weight,
+        'cb1a_qk_weight': cb1a_qk_weight,
+        'cb1a_v_weight': cb1a_v_weight,
+        'cb1a_rst_weight': cb1a_rst_weight,
         'cb1a_qk_challenge_weight': cb1a_qk_challenge_weight,
         'cb1a_qk_prune_weight': cb1a_qk_prune_weight,
         'cb1a_v_challenge_weight': cb1a_v_challenge_weight,
@@ -7805,24 +7246,6 @@ def main():
             'tau_offset_init_attn_v', cfg['model'].get('tau_offset_init_attn_v', None)),
         'tau_offset_init_rst': tcfg.get(
             'tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', None)),
-        'tau_target_count_attn_qk': tcfg.get(
-            'tau_target_count_attn_qk',
-            cfg['model'].get('tau_target_count_attn_qk', None)),
-        'tau_target_count_attn_v': tcfg.get(
-            'tau_target_count_attn_v',
-            cfg['model'].get('tau_target_count_attn_v', None)),
-        'tau_target_count_rst': tcfg.get(
-            'tau_target_count_rst',
-            cfg['model'].get('tau_target_count_rst', None)),
-        'tau_init_attn_qk': tcfg.get(
-            'tau_init_attn_qk',
-            cfg['model'].get('tau_init_attn_qk', None)),
-        'tau_init_attn_v': tcfg.get(
-            'tau_init_attn_v',
-            cfg['model'].get('tau_init_attn_v', None)),
-        'tau_init_rst': tcfg.get(
-            'tau_init_rst',
-            cfg['model'].get('tau_init_rst', None)),
         'oom_check': run_oom_check,
         'speed_check': run_speed_check,
         'restore_training_config_on_resume': restore_training_config_on_resume,
@@ -7830,26 +7253,10 @@ def main():
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
-    for _key in (
-            'exploration_weight_q',
-            'exploration_weight_k',
-            'exploration_asymmetry_q',
-            'exploration_asymmetry_k'):
-        cfg.setdefault('training', {}).pop(_key, None)
     if not rpe_enabled:
         for _key in (
                 'exploration_weight',
-                'exploration_weight_q',
-                'exploration_weight_k',
-                'exploration_weight_qk',
-                'exploration_weight_v',
-                'exploration_weight_rst',
                 'exploration_asymmetry',
-                'exploration_asymmetry_q',
-                'exploration_asymmetry_k',
-                'exploration_asymmetry_qk',
-                'exploration_asymmetry_v',
-                'exploration_asymmetry_rst',
                 'exploration_warmup_steps',
                 'exploration_lower_bound',
                 'exploration_upper_bound',
@@ -8186,35 +7593,27 @@ def main():
         print(f"  Div weight: {div_weight}")
         print(f"  LB weight: {lb_weight}")
         print(f"  Tau reg weight: {tau_reg_weight}")
-        print(f"  Dead penalty: legacy_global={dead_penalty_weight} "
+        print(f"  Dead penalty: weight={dead_penalty_weight} "
               f"exposure_target={dead_exposure_target} "
-              f"direct_w[qk={dead_penalty_qk_weight}, v={dead_penalty_v_weight}, "
+              f"pool_w[qk={dead_penalty_qk_weight}, v={dead_penalty_v_weight}, "
               f"rst={dead_penalty_rst_weight}]")
-        print("  Selection-margin regularization: "
-              f"qk={selection_margin_reg_weight_qk} "
-              f"v={selection_margin_reg_weight_v} "
-              f"rst={selection_margin_reg_weight_rst}")
         if rpe_enabled:
-            print(f"  Exploration weight: {exploration_weight}")
-            print("    weight split: "
-                  f"qk={exploration_weight_qk} "
-                  f"v={exploration_weight_v} rst={exploration_weight_rst}")
-            print("    asymmetry split: "
-                  f"qk={exploration_asymmetry_qk} "
-                  f"v={exploration_asymmetry_v} rst={exploration_asymmetry_rst}")
-            print("    normalization: "
-                  f"by_layers={exploration_normalize_by_layers}")
+            print(f"  Exploration weight: {exploration_weight} "
+                  f"(asymmetry={exploration_asymmetry})")
             print(f"    warmup_steps={exploration_warmup_steps} "
                   f"bounds=[{exploration_lower_bound}, {exploration_upper_bound}] "
                   f"eps={exploration_bound_eps}")
         print("  CB1A: "
-              f"enabled={cb1a_enabled} "
+              f"enabled={cb1a_enabled} weight={cb1a_weight} "
+              f"challenge={cb1a_challenge_weight} prune={cb1a_prune_weight} "
+              f"pool_w[qk={cb1a_qk_weight}, v={cb1a_v_weight}, rst={cb1a_rst_weight}] "
               f"ce_mode={cb1a_ce_mode} eps={cb1a_eps}")
-        print("    direct weights: "
+        print("    CB1A pool challenge/prune: "
               f"qk=({cb1a_qk_challenge_weight}, {cb1a_qk_prune_weight}) "
               f"v=({cb1a_v_challenge_weight}, {cb1a_v_prune_weight}) "
-              f"rst=({cb1a_rst_challenge_weight}, "
-              f"{cb1a_rst_prune_weight})")
+              f"rst=({cb1a_rst_challenge_weight}, {cb1a_rst_prune_weight}) "
+              f"stopgrad[tau={cb1a_tau_stopgrad}, anchor={cb1a_anchor_stopgrad}] "
+              f"forward_influence={cb1a_forward_influence}")
         print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
               f"router={cfg['model'].get('router_dropout', 0.0)}")
         # Active v4.1.5 gate closure constants.
@@ -8230,17 +7629,10 @@ def main():
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
                 f"scan_scale={tcfg.get('scan_scale', 0.0)}"
             )
-        elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.0':
+        elif cfg['model'].get('model_version') in (
+                'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1'):
             gate_msg = (
                 f"  Gate ({cfg['model'].get('model_version')} direct-tau): "
-                f"tau_target_count_attn_qk={tcfg.get('tau_target_count_attn_qk', cfg['model'].get('tau_target_count_attn_qk', None))} "
-                f"tau_target_count_attn_v={tcfg.get('tau_target_count_attn_v', cfg['model'].get('tau_target_count_attn_v', None))} "
-                f"tau_target_count_rst={tcfg.get('tau_target_count_rst', cfg['model'].get('tau_target_count_rst', None))} "
-                f"intensity_beta={tcfg.get('intensity_beta', 0.5)}"
-            )
-        elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.1':
-            gate_msg = (
-                f"  Gate ({cfg['model'].get('model_version')} direct-tau-init): "
                 f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', 0.02))} "
                 f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', 0.10))} "
                 f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', 0.15))} "
@@ -8254,10 +7646,7 @@ def main():
             )
         if cfg['model'].get('model_version') in (
                 'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
-            if cfg['model'].get('model_version') not in (
-                    'spatial-r1-v4.1.5.9',
-                    'spatial-r1-v4.1.6.0',
-                    'spatial-r1-v4.1.6.1'):
+            if cfg['model'].get('model_version') != 'spatial-r1-v4.1.5.9':
                 gate_msg += (
                     f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                     f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -8536,8 +7925,6 @@ def main():
         model, optimizer, orth_weight, div_weight, lb_weight,
         tau_reg_weight, dead_penalty_weight,
         exploration_weight, exploration_asymmetry,
-        exploration_weight_q, exploration_weight_k,
-        exploration_weight_v, exploration_weight_rst,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         weight_decay=weight_decay, pool_weight_decay=pool_weight_decay,
         exploration_warmup_steps=exploration_warmup_steps,
@@ -8549,11 +7936,6 @@ def main():
         exploration_z_clip=exploration_z_clip,
         exploration_z_tanh=exploration_z_tanh,
         exploration_weighted_clip=exploration_weighted_clip,
-        exploration_normalize_by_layers=exploration_normalize_by_layers,
-        exploration_asymmetry_q=exploration_asymmetry_q,
-        exploration_asymmetry_k=exploration_asymmetry_k,
-        exploration_asymmetry_v=exploration_asymmetry_v,
-        exploration_asymmetry_rst=exploration_asymmetry_rst,
         rpe_enabled=rpe_enabled,
         dead_penalty_qk_weight=dead_penalty_qk_weight,
         dead_penalty_v_weight=dead_penalty_v_weight,
@@ -8574,9 +7956,6 @@ def main():
         cb1a_ce_mode=cb1a_ce_mode,
         cb1a_eps=cb1a_eps,
         dead_penalty_weighted_clip=dead_penalty_weighted_clip,
-        selection_margin_reg_weight_qk=selection_margin_reg_weight_qk,
-        selection_margin_reg_weight_v=selection_margin_reg_weight_v,
-        selection_margin_reg_weight_rst=selection_margin_reg_weight_rst,
         global_grad_clip=global_grad_clip,
         tau_lr_mult=tau_lr_mult,
         tau_grad_clip=tau_grad_clip,
@@ -9435,11 +8814,10 @@ def main():
         # Epoch accumulators on device -one device_get per epoch at the
         # end, rather than per-step float()/int() sync.
         _epoch_loss_jax = jnp.float32(0.0)
-        # Keep epoch counts in fp32: JAX x64 is typically disabled on TPU, so
-        # jnp.int64 silently truncates to int32 and overflows on multi-billion
-        # token epochs.
-        _epoch_correct_jax = jnp.float32(0.0)
-        _epoch_valid_jax = jnp.float32(0.0)
+        # int64: valid_count sums to ~n_steps * tokens_per_step, which
+        # exceeds int32 range (2.15e9) on any multi-billion-token epoch.
+        _epoch_correct_jax = jnp.int64(0)
+        _epoch_valid_jax = jnp.int64(0)
         epoch_steps = 0
 
         # Window accumulators on device -one device_get per log boundary.
@@ -9526,10 +8904,8 @@ def main():
                 _debug_cap_window_jax, metrics)
 
             _epoch_loss_jax = _epoch_loss_jax + metrics['ce_loss'] * _valid_f
-            _epoch_correct_jax = (
-                _epoch_correct_jax + metrics['correct'].astype(jnp.float32))
-            _epoch_valid_jax = (
-                _epoch_valid_jax + metrics['valid_count'].astype(jnp.float32))
+            _epoch_correct_jax = _epoch_correct_jax + metrics['correct']
+            _epoch_valid_jax = _epoch_valid_jax + metrics['valid_count']
 
             win_count += 1
             epoch_steps += 1
@@ -9549,12 +8925,6 @@ def main():
                     'grad_global_postclip': metrics.get(
                         'grad_global_postclip', jnp.float32(0.0)),
                     'attn_qk_active': metrics.get('attn_qk_active', jnp.float32(0.0)),
-                    'attn_q_active': metrics.get(
-                        'attn_q_active',
-                        metrics.get('attn_qk_active', jnp.float32(0.0))),
-                    'attn_k_active': metrics.get(
-                        'attn_k_active',
-                        metrics.get('attn_qk_active', jnp.float32(0.0))),
                     'attn_v_active': metrics.get('attn_v_active', jnp.float32(0.0)),
                     'rst_active': metrics.get('rst_active', jnp.float32(0.0)),
                     'attn_top1_gate_frac_max': metrics.get(
@@ -9729,8 +9099,7 @@ def main():
                         'orth_weight': orth_weight,
                         'div_weight': div_weight,
                         'dead_penalty_weight': dead_penalty_weight,
-                        'dead_exposure_target': dead_exposure_target,
-                        'cb1a_enabled': bool(cb1a_enabled),
+                                        'dead_exposure_target': dead_exposure_target,
                         'n_qk_cfg': cfg['model'].get(
                             'n_qk', cfg['model'].get('n_q', 0)),
                         'n_v_cfg': cfg['model'].get('n_v', 0),
@@ -9745,6 +9114,7 @@ def main():
                         'total_micro_steps': total_micro_steps,
                         'progress': _progress,
                         'model_version': model_version,
+                        'cb1a_enabled': bool(cb1a_enabled),
                         'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
                         'd_select': int(cfg['model'].get('d_select', 0) or 0),
                         'd_intensity': int(
@@ -9812,8 +9182,7 @@ def main():
                     'orth_weight': orth_weight,
                     'div_weight': div_weight,
                     'dead_penalty_weight': dead_penalty_weight,
-                    'dead_exposure_target': dead_exposure_target,
-                    'cb1a_enabled': bool(cb1a_enabled),
+                                'dead_exposure_target': dead_exposure_target,
                     'n_qk_cfg': cfg['model'].get(
                         'n_qk', cfg['model'].get('n_q', 0)),
                     'n_v_cfg': cfg['model'].get('n_v', 0),
@@ -9828,6 +9197,7 @@ def main():
                     'total_micro_steps': total_micro_steps,
                     'progress': _progress,
                     'model_version': model_version,
+                    'cb1a_enabled': bool(cb1a_enabled),
                     'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
                     'd_select': int(cfg['model'].get('d_select', 0) or 0),
                     'd_intensity': int(
@@ -10054,8 +9424,8 @@ def main():
             'valid': _epoch_valid_jax,
         })
         epoch_loss = float(_ep['loss'])
-        epoch_correct = float(_ep['correct'])
-        epoch_valid = float(_ep['valid'])
+        epoch_correct = int(_ep['correct'])
+        epoch_valid = int(_ep['valid'])
         epoch_avg_loss = epoch_loss / epoch_valid if epoch_valid > 0 else 0.0
         epoch_avg_acc = epoch_correct / epoch_valid if epoch_valid > 0 else 0.0
 

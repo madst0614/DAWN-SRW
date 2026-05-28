@@ -51,40 +51,41 @@ training:
   warmup_ratio: 0.08
   weight_decay: 0.1
   pool_weight_decay: 0.02
-  tau_lr_mult: 0.1
+  tau_lr_mult: 0.01
   tau_grad_clip: 1.0
+  router_proj_lr_mult: 1.0
   router_proj_grad_clip: 2.0
+  route_emb_lr_mult: 1.0
+  route_emb_grad_clip: 2.0
 
   # DirectTau Angular Select / Intensity
-  tau_init_attn_qk: 0.001
-  tau_init_attn_v: 0.08
-  tau_init_rst: 0.12
+  tau_target_count_attn_qk: 1152
+  tau_target_count_attn_v: 800
+  tau_target_count_rst: 400
   intensity_beta: 0.5
 
   # Auxiliary losses
   diversity_weight: 0.1
   load_balance_weight: 0.0
-  dead_penalty_weight: 0.005
   dead_exposure_target: 0.1
-  dead_penalty_qk_weight: 1.0
-  dead_penalty_v_weight: 1.0
-  dead_penalty_rst_weight: 0.5
+  dead_penalty_qk_weight: 0.001
+  dead_penalty_v_weight: 0.001
+  dead_penalty_rst_weight: 0.001
+
+  # Selection-margin regularization.
+  # Penalizes only scores that cross the current DirectTau boundary.
+  # Does not regularize inactive/pre-boundary candidates.
+  selection_margin_reg_weight_qk: 0.1
+  selection_margin_reg_weight_v: 0.1
+  selection_margin_reg_weight_rst: 0.1
 
   # CE-conditioned Boundary-1 Audition (CB1A)
-  cb1a_enabled: true
-  cb1a_weight: 1.0
-  cb1a_qk_weight: 0.1
-  cb1a_v_weight: 0.8
-  cb1a_rst_weight: 1.5
-  cb1a_qk_challenge_weight: 1.0
-  cb1a_qk_prune_weight: 1.1
-  cb1a_v_challenge_weight: 1.0
-  cb1a_v_prune_weight: 1.2
-  cb1a_rst_challenge_weight: 1.0
-  cb1a_rst_prune_weight: 2.0
-  cb1a_tau_stopgrad: true
-  cb1a_anchor_stopgrad: true
-  cb1a_forward_influence: false
+  cb1a_qk_challenge_weight: 0.041667
+  cb1a_qk_prune_weight: 0.045833
+  cb1a_v_challenge_weight: 0.333333
+  cb1a_v_prune_weight: 0.4
+  cb1a_rst_challenge_weight: 0.625
+  cb1a_rst_prune_weight: 1.25
   cb1a_ce_mode: sigmoid_z
   cb1a_eps: 1.0e-8
 
