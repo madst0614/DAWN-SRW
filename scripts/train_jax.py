@@ -4132,6 +4132,7 @@ _spike_jsonl_logger = None
 
 def _setup_loggers(training_log_file, jsonl_log_file, resume=False,
                    debug_log_file=None, debug_jsonl_log_file=None,
+                   debug_resume=False,
                    spike_log_file=None, spike_jsonl_log_file=None,
                    spike_resume=False):
     """Create GCSLogger instances for training/debug text + JSONL logs.
@@ -4161,9 +4162,9 @@ def _setup_loggers(training_log_file, jsonl_log_file, resume=False,
         if _is_gcs(debug_log_file):
             local_debug = str(tmpdir / Path(debug_log_file).name)
             _debug_logger = GCSLogger(debug_log_file, local_debug,
-                                      resume=resume)
+                                      resume=debug_resume)
         else:
-            _debug_logger = GCSLogger(None, debug_log_file, resume=resume)
+            _debug_logger = GCSLogger(None, debug_log_file, resume=debug_resume)
     else:
         _debug_logger = None
 
@@ -4172,10 +4173,10 @@ def _setup_loggers(training_log_file, jsonl_log_file, resume=False,
             local_debug_jsonl = str(tmpdir / Path(debug_jsonl_log_file).name)
             _debug_jsonl_logger = GCSLogger(debug_jsonl_log_file,
                                             local_debug_jsonl,
-                                            resume=resume)
+                                            resume=debug_resume)
         else:
             _debug_jsonl_logger = GCSLogger(None, debug_jsonl_log_file,
-                                            resume=resume)
+                                            resume=debug_resume)
     else:
         _debug_jsonl_logger = None
 
@@ -7814,6 +7815,15 @@ def main():
     spike_probe_on_event = bool(tcfg.get('spike_probe_on_event', True))
     spike_probe_topk = int(tcfg.get('spike_probe_topk', 8))
     spike_history_steps = int(tcfg.get('spike_history_steps', 20))
+    # Resume log append policy. Defaults preserve the previous behavior.
+    # Set debug/spike to false in config to start fresh diagnostic files
+    # on resume without touching the main training log.
+    training_log_append_on_resume = bool(
+        tcfg.get('training_log_append_on_resume', True))
+    debug_log_append_on_resume = bool(
+        tcfg.get('debug_log_append_on_resume', True))
+    spike_log_append_on_resume = bool(
+        tcfg.get('spike_log_append_on_resume', True))
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
@@ -9808,7 +9818,10 @@ def main():
         _existing_debug_jsonls = sorted(_list_files(log_dir, "debug_metrics_*.jsonl"))
         _existing_spike_logs = sorted(_list_files(log_dir, "spike_events_*.txt"))
         _existing_spike_jsonls = sorted(_list_files(log_dir, "spike_events_*.jsonl"))
-        _is_log_resume = (resume_path is not None) and bool(_existing_logs)
+        _is_log_resume = (
+            training_log_append_on_resume
+            and (resume_path is not None)
+            and bool(_existing_logs))
         if _is_log_resume:
             training_log_file = _existing_logs[-1]
             jsonl_log_file = (_existing_jsonls[-1] if _existing_jsonls
@@ -9817,7 +9830,9 @@ def main():
             training_log_file = _join(log_dir, f'training_log_{timestamp}.txt')
             jsonl_log_file = _join(log_dir, f'metrics_{timestamp}.jsonl')
         if debug_mode:
-            if (resume_path is not None) and _existing_debug_logs:
+            if (debug_log_append_on_resume
+                    and (resume_path is not None)
+                    and _existing_debug_logs):
                 debug_log_file = _existing_debug_logs[-1]
                 debug_jsonl_log_file = (
                     _existing_debug_jsonls[-1] if _existing_debug_jsonls
@@ -9833,7 +9848,9 @@ def main():
             debug_jsonl_log_file = None
             _is_debug_log_resume = False
         if spike_event_logger:
-            if (resume_path is not None) and _existing_spike_logs:
+            if (spike_log_append_on_resume
+                    and (resume_path is not None)
+                    and _existing_spike_logs):
                 spike_log_file = _existing_spike_logs[-1]
                 spike_jsonl_log_file = (
                     _existing_spike_jsonls[-1] if _existing_spike_jsonls
@@ -9854,6 +9871,7 @@ def main():
             training_log_file, jsonl_log_file, resume=_is_log_resume,
             debug_log_file=debug_log_file,
             debug_jsonl_log_file=debug_jsonl_log_file,
+            debug_resume=_is_debug_log_resume,
             spike_log_file=spike_log_file,
             spike_jsonl_log_file=spike_jsonl_log_file,
             spike_resume=_is_spike_log_resume)
@@ -9864,6 +9882,11 @@ def main():
         log_message(f"Parameters: {n_params:,}")
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
         log_message(f"Total steps: {total_steps}")
+        log_message(
+            "Resume log append policy: "
+            f"training={training_log_append_on_resume} "
+            f"debug={debug_log_append_on_resume} "
+            f"spike={spike_log_append_on_resume}")
         if debug_mode:
             log_message(
                 f"Debug diagnostics: every {debug_interval} step(s) -> {debug_log_file}")
@@ -9885,7 +9908,8 @@ def main():
                     f"Crash history: last {crash_history_steps} local metric records; "
                     f"host batches: {'on' if crash_snapshot_save_host_batches else 'off'}")
             log_debug_message(
-                f"Resume append: {_is_debug_log_resume}")
+                f"Resume append: {_is_debug_log_resume} "
+                f"(config debug_log_append_on_resume={debug_log_append_on_resume})")
             log_debug_message("")
         if spike_event_logger:
             log_message(
@@ -9898,7 +9922,9 @@ def main():
                 f"Probe on event: {'on' if spike_probe_step_fn is not None else 'off'} topk={spike_probe_topk}")
             log_spike_message(
                 f"Thresholds: {json.dumps(spike_thresholds, sort_keys=True)}")
-            log_spike_message(f"Resume append: {_is_spike_log_resume}")
+            log_spike_message(
+                f"Resume append: {_is_spike_log_resume} "
+                f"(config spike_log_append_on_resume={spike_log_append_on_resume})")
             log_spike_message("")
         log_message("")
         sync_logs()
