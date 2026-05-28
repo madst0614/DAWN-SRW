@@ -385,8 +385,10 @@ SPIKE_TOKEN_ALIGN_FIELD_COUNT = 19
 # spike_probe pass, after train_jax has identified the actual top-CE tokens.
 # Path rows trace one focused token through each layer/stage so a spike can be
 # attributed to attention, RST, final norm/readout, or backward-only effects.
-SPIKE_FOCUS_PATH_FIELD_COUNT = 22
+SPIKE_FOCUS_PATH_FIELD_COUNT = 28
 SPIKE_FOCUS_ROUTE_FIELD_COUNT = 24
+SPIKE_FOCUS_SRW_FIELD_COUNT = 25
+SPIKE_FOCUS_ATTN_FIELD_COUNT = 18
 
 
 def _topk_rows(candidates, topk, field_count):
@@ -2294,7 +2296,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   sharded_fns, analysis=False,
                   local_diagnostics=False,
                   spike_probe=False,
-                  spike_probe_topk=8):
+                  spike_probe_topk=8,
+                  focus_probe_enabled=False,
+                  focus_b=None,
+                  focus_pos=None,
+                  focus_rank=None,
+                  d_select=None,
+                  intensity_beta=0.5):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -2423,6 +2431,146 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     scale = jnp.sqrt(jnp.float32(d_head))
     rng, rng_attn_drop = jax.random.split(rng)
     _spike_probe_topk = max(1, int(spike_probe_topk))
+    _focus_probe_enabled = bool(focus_probe_enabled)
+    _focus_take_k = _spike_probe_topk
+    _focus_b = focus_b if focus_b is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
+    _focus_pos = focus_pos if focus_pos is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
+    _focus_rank = focus_rank if focus_rank is not None else jnp.arange(_focus_take_k, dtype=jnp.float32)
+    _d_select = int(d_select or max(1, Q.shape[-1] * n_heads // 2))
+    _intensity_beta = jnp.float32(intensity_beta)
+
+    def _merge_focus_topk(candidates, score_col, field_count):
+        scores = candidates[:, :, score_col]
+        vals, idx = jax.lax.top_k(scores, min(_focus_take_k, int(candidates.shape[1])))
+        rows = jnp.take_along_axis(candidates, idx[:, :, None], axis=1)
+        rows = rows.at[:, :, score_col].set(vals)
+        return rows.astype(jnp.float32)
+
+    def _focus_srw_rows_for_pool(pool_id, x_in, h_in, emb, raw_tau, read, write, pool_scale):
+        hf = h_in[_focus_b, _focus_pos].astype(jnp.float32)
+        xf = x_in[_focus_b, _focus_pos].astype(jnp.float32)
+        emb_f = emb.astype(jnp.float32)
+        read_f = read.astype(jnp.float32)
+        write_f = write.astype(jnp.float32)
+        d_total = int(hf.shape[-1])
+        d_sel = min(max(_d_select, 1), d_total - 1)
+        q_sel = _forward_unit_direction(hf[:, :d_sel])
+        e_sel = _forward_unit_direction(emb_f[:, :d_sel])
+        rho = q_sel @ e_sel.T
+        h_int = hf[:, d_sel:]
+        e_int = emb_f[:, d_sel:]
+        intensity = jnp.exp(_intensity_beta * jnp.tanh(h_int @ e_int.T))
+        tau = jax.nn.sigmoid(raw_tau[_focus_b, _focus_pos, 0].astype(jnp.float32))[:, None]
+        margin = rho - tau
+        pos_margin = jnp.maximum(margin, 0.0)
+        gate = pos_margin * intensity
+        gate_sum = gate.sum(axis=-1)
+        den = jnp.maximum(gate_sum, 1.0)
+        active_n = (margin > 0.0).astype(jnp.float32).sum(axis=-1)
+        read_dir = _forward_unit_direction(read_f)
+        write_dir = _forward_unit_direction(write_f)
+        xr = xf @ read_dir.T
+        weighted = gate * xr
+        raw_out = weighted @ write_dir
+        out_vec = raw_out / den[:, None] * pool_scale
+        raw_out_norm = jnp.linalg.norm(raw_out, axis=-1)
+        out_norm = jnp.linalg.norm(out_vec, axis=-1)
+        read_norm = jnp.linalg.norm(read_f, axis=-1)
+        write_norm = jnp.linalg.norm(write_f, axis=-1)
+        op_gain = read_norm * write_norm
+        score = jnp.abs(weighted) * write_norm[None, :]
+        vals, idx = jax.lax.top_k(score, min(_focus_take_k, int(score.shape[-1])))
+        def take(a):
+            return jnp.take_along_axis(a, idx, axis=1)
+        K = vals.shape[1]
+        return jnp.stack([
+            jnp.broadcast_to(_focus_rank[:, None], vals.shape),
+            jnp.broadcast_to(_focus_b[:, None].astype(jnp.float32), vals.shape),
+            jnp.broadcast_to(_focus_pos[:, None].astype(jnp.float32), vals.shape),
+            jnp.zeros_like(vals),  # layer filled by scan_body
+            jnp.full(vals.shape, jnp.float32(pool_id)),
+            idx.astype(jnp.float32),
+            vals,
+            take(rho),
+            jnp.broadcast_to(tau, vals.shape),
+            take(margin),
+            take(pos_margin),
+            take(intensity),
+            take(gate),
+            jnp.broadcast_to(den[:, None], vals.shape),
+            take(gate) / jnp.maximum(den[:, None], 1e-8),
+            jnp.broadcast_to(active_n[:, None], vals.shape),
+            take(xr),
+            jnp.abs(take(xr)),
+            jnp.take(read_norm, idx),
+            jnp.take(write_norm, idx),
+            jnp.take(op_gain, idx),
+            jnp.broadcast_to(raw_out_norm[:, None], vals.shape),
+            jnp.broadcast_to(out_norm[:, None], vals.shape),
+            jnp.broadcast_to(jnp.linalg.norm(xf, axis=-1)[:, None], vals.shape),
+            jnp.broadcast_to(jnp.linalg.norm(hf, axis=-1)[:, None], vals.shape),
+        ], axis=-1).astype(jnp.float32)
+
+    def _attention_focus_rows(attn_scores, attn_w, out_dbg):
+        scores_sg = jax.lax.stop_gradient(attn_scores.astype(jnp.float32))
+        score_floor = jnp.finfo(scores_sg.dtype).min
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        causal_4d = causal[None, None, :, :]
+        masked_scores = jnp.where(causal_4d, scores_sg, score_floor)
+        attn_w_sg = jax.lax.stop_gradient(attn_w.astype(jnp.float32))
+        q_norms = jnp.linalg.norm(jax.lax.stop_gradient(Q), axis=-1)
+        k_norms = jnp.linalg.norm(jax.lax.stop_gradient(K), axis=-1)
+        v_norms = jnp.linalg.norm(jax.lax.stop_gradient(V), axis=-1)
+        o_in_norm = jnp.linalg.norm(jax.lax.stop_gradient(out_dbg), axis=-1)
+        entropy_terms = jnp.where(
+            attn_w_sg > 0.0,
+            attn_w_sg * jnp.log(jnp.maximum(attn_w_sg, 1e-30)),
+            0.0)
+        entropy = -jnp.sum(entropy_terms, axis=-1)
+        top1_logits = jnp.max(masked_scores, axis=-1)
+        top1_idx = jnp.argmax(masked_scores, axis=-1)
+        attn_idx = jnp.arange(S)
+        second_scores = jnp.where(
+            attn_idx[None, None, None, :] == top1_idx[..., None],
+            score_floor, masked_scores)
+        top2_logits = jnp.max(second_scores, axis=-1)
+        has_top2 = (jnp.arange(S) + 1) > 1
+        top2_logits = jnp.where(has_top2[None, None, :], top2_logits, top1_logits)
+        gap = top1_logits - top2_logits
+
+        cand_logits = masked_scores[_focus_b, :, _focus_pos, :]  # [K,H,S]
+        cand_weights = attn_w_sg[_focus_b, :, _focus_pos, :]
+        cand_score = jnp.maximum(jnp.abs(cand_logits), cand_weights * jnp.float32(10.0))
+        flat_score = cand_score.reshape((_focus_take_k, -1))
+        vals, flat_idx = jax.lax.top_k(flat_score, min(_focus_take_k, int(flat_score.shape[-1])))
+        head_idx = flat_idx // S
+        key_idx = flat_idx - head_idx * S
+        q_idx = _focus_pos[:, None]
+        batch_idx = _focus_b[:, None]
+        gather_b = _focus_b[:, None]
+        gather_q = _focus_pos[:, None]
+        cand_logit = jnp.take_along_axis(cand_logits.reshape((_focus_take_k, -1)), flat_idx, axis=1)
+        cand_weight = jnp.take_along_axis(cand_weights.reshape((_focus_take_k, -1)), flat_idx, axis=1)
+        return jnp.stack([
+            jnp.broadcast_to(_focus_rank[:, None], vals.shape),
+            jnp.broadcast_to(batch_idx.astype(jnp.float32), vals.shape),
+            jnp.broadcast_to(q_idx.astype(jnp.float32), vals.shape),
+            jnp.zeros_like(vals),  # layer filled by scan_body
+            head_idx.astype(jnp.float32),
+            key_idx.astype(jnp.float32),
+            vals,
+            cand_logit,
+            cand_weight,
+            gap[_focus_b[:, None], head_idx, _focus_pos[:, None]],
+            entropy[_focus_b[:, None], head_idx, _focus_pos[:, None]],
+            q_norms[_focus_b[:, None], head_idx, _focus_pos[:, None]],
+            k_norms[_focus_b[:, None], head_idx, key_idx],
+            v_norms[_focus_b[:, None], head_idx, key_idx],
+            o_in_norm[_focus_b[:, None], head_idx, _focus_pos[:, None]],
+            jnp.zeros_like(vals),  # projected o_out_norm filled after expand_O
+            (_focus_pos[:, None].astype(jnp.float32) - key_idx.astype(jnp.float32)),
+            (key_idx == _focus_pos[:, None]).astype(jnp.float32),
+        ], axis=-1).astype(jnp.float32)
 
     def _attention_spike_rows(attn_scores, attn_w, out_dbg):
         scores_sg = jax.lax.stop_gradient(attn_scores.astype(jnp.float32))
@@ -2553,6 +2701,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         out_dbg = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
         if spike_probe:
             attn_rows = _attention_spike_rows(attn_scores, attn_w, out_dbg)
+            if _focus_probe_enabled:
+                attn_focus_rows = _attention_focus_rows(attn_scores, attn_w, out_dbg)
         if analysis:
             return (
                 out_dbg,
@@ -2565,6 +2715,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         if local_diagnostics:
             return out_dbg, attn_logit_max_dbg, softmax_top1_max
         if spike_probe:
+            if _focus_probe_enabled:
+                return out_dbg, attn_rows, attn_focus_rows
             return out_dbg, attn_rows
         return out_dbg
 
@@ -2592,7 +2744,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         out, attn_logit_max_actual, attn_softmax_top1_max = _attn_scores(
             Q, K, V, rng_attn_drop)
     elif spike_probe:
-        out, attn_spike_rows = _attn_scores(Q, K, V, rng_attn_drop)
+        if _focus_probe_enabled:
+            out, attn_spike_rows, attn_focus_rows = _attn_scores(Q, K, V, rng_attn_drop)
+        else:
+            out, attn_spike_rows = _attn_scores(Q, K, V, rng_attn_drop)
     else:
         out = _attn_scores(Q, K, V, rng_attn_drop)
     if analysis or local_diagnostics or spike_probe:
@@ -2613,6 +2768,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         _o_out_by_token = jnp.linalg.norm(out, axis=-1)
         attn_spike_rows = attn_spike_rows.at[:, 13].set(
             _o_out_by_token[_row_b, _row_q])
+        if _focus_probe_enabled:
+            attn_focus_rows = attn_focus_rows.at[:, :, 15].set(
+                _o_out_by_token[_focus_b, _focus_pos][:, None])
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
@@ -2708,6 +2866,19 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          qk_no_active_direct[:, :, 1, :],
          v_no_active_direct),
         axis=-1).astype(jnp.float32))
+    if spike_probe and _focus_probe_enabled:
+        _q_focus_rows = _focus_srw_rows_for_pool(
+            0, x, h_Q, qk_emb_unit, raw_tau_all[:, :, 0:1],
+            qk_read, qk_write, qk_scale)
+        _k_focus_rows = _focus_srw_rows_for_pool(
+            1, x, h_K, qk_emb_unit, raw_tau_all[:, :, 1:2],
+            qk_read, qk_write, qk_scale)
+        _v_focus_rows = _focus_srw_rows_for_pool(
+            2, x, h_V, v_emb_unit, raw_tau_all[:, :, 2:3],
+            v_read, v_write, v_scale)
+        attn_focus_srw_rows = _merge_focus_topk(
+            jnp.concatenate([_q_focus_rows, _k_focus_rows, _v_focus_rows], axis=1),
+            6, SPIKE_FOCUS_SRW_FIELD_COUNT)
     slim_ret = (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax,
                 attn_rho_std_slim, attn_gate_sum, attn_active_n_mean,
                 attn_out_norm, attn_tau_mean,
@@ -2757,11 +2928,20 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_top1_values, attn_top1_locs,
             )
         if spike_probe:
-            ret = ret + (
-                jnp.concatenate([qk_spike_rows, v_spike_rows], axis=0),
-                attn_spike_rows,
-                o_out_norm_max.astype(jnp.float32),
-            )
+            if _focus_probe_enabled:
+                ret = ret + (
+                    jnp.concatenate([qk_spike_rows, v_spike_rows], axis=0),
+                    attn_spike_rows,
+                    attn_focus_srw_rows,
+                    attn_focus_rows,
+                    o_out_norm_max.astype(jnp.float32),
+                )
+            else:
+                ret = ret + (
+                    jnp.concatenate([qk_spike_rows, v_spike_rows], axis=0),
+                    attn_spike_rows,
+                    o_out_norm_max.astype(jnp.float32),
+                )
         return ret
 
     attn_qk_margin_band = qk_margin_band.mean()
@@ -2812,11 +2992,20 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             attn_top1_values, attn_top1_locs,
         )
     if spike_probe:
-        analysis_ret = analysis_ret + (
-            jnp.concatenate([qk_spike_rows, v_spike_rows], axis=0),
-            attn_spike_rows,
-            o_out_norm_max.astype(jnp.float32),
-        )
+        if _focus_probe_enabled:
+            analysis_ret = analysis_ret + (
+                jnp.concatenate([qk_spike_rows, v_spike_rows], axis=0),
+                attn_spike_rows,
+                attn_focus_srw_rows,
+                attn_focus_rows,
+                o_out_norm_max.astype(jnp.float32),
+            )
+        else:
+            analysis_ret = analysis_ret + (
+                jnp.concatenate([qk_spike_rows, v_spike_rows], axis=0),
+                attn_spike_rows,
+                o_out_norm_max.astype(jnp.float32),
+            )
     return analysis_ret
 
 
@@ -2826,7 +3015,13 @@ def _rst_forward(x, pool_params, router_params, rng,
                   local_diagnostics=False,
                   spike_probe=False,
                   spike_probe_topk=8,
-                  d_model=None, n_layers=None):
+                  d_model=None, n_layers=None,
+                  focus_probe_enabled=False,
+                  focus_b=None,
+                  focus_pos=None,
+                  focus_rank=None,
+                  d_select=None,
+                  intensity_beta=0.5):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis` see _attn_forward docstring.
@@ -2855,6 +3050,77 @@ def _rst_forward(x, pool_params, router_params, rng,
         raise ValueError(
             "depth-scaled pool outputs require d_model and n_layers.")
     _, _, rst_scale = _pool_output_scales(d_model, n_layers)
+    _focus_probe_enabled = bool(focus_probe_enabled)
+    _focus_take_k = max(1, int(spike_probe_topk))
+    _focus_b = focus_b if focus_b is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
+    _focus_pos = focus_pos if focus_pos is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
+    _focus_rank = focus_rank if focus_rank is not None else jnp.arange(_focus_take_k, dtype=jnp.float32)
+    _d_select = int(d_select or max(1, h.shape[-1] // 2))
+    _intensity_beta = jnp.float32(intensity_beta)
+
+    def _focus_srw_rows_for_pool(pool_id, x_in, h_in, emb, raw_tau, read, write, pool_scale):
+        hf = h_in[_focus_b, _focus_pos].astype(jnp.float32)
+        xf = x_in[_focus_b, _focus_pos].astype(jnp.float32)
+        emb_f = emb.astype(jnp.float32)
+        read_f = read.astype(jnp.float32)
+        write_f = write.astype(jnp.float32)
+        d_total = int(hf.shape[-1])
+        d_sel = min(max(_d_select, 1), d_total - 1)
+        q_sel = _forward_unit_direction(hf[:, :d_sel])
+        e_sel = _forward_unit_direction(emb_f[:, :d_sel])
+        rho = q_sel @ e_sel.T
+        h_int = hf[:, d_sel:]
+        e_int = emb_f[:, d_sel:]
+        intensity = jnp.exp(_intensity_beta * jnp.tanh(h_int @ e_int.T))
+        tau = jax.nn.sigmoid(raw_tau[_focus_b, _focus_pos, 0].astype(jnp.float32))[:, None]
+        margin = rho - tau
+        pos_margin = jnp.maximum(margin, 0.0)
+        gate = pos_margin * intensity
+        gate_sum = gate.sum(axis=-1)
+        den = jnp.maximum(gate_sum, 1.0)
+        active_n = (margin > 0.0).astype(jnp.float32).sum(axis=-1)
+        read_dir = _forward_unit_direction(read_f)
+        write_dir = _forward_unit_direction(write_f)
+        xr = xf @ read_dir.T
+        weighted = gate * xr
+        raw_out = weighted @ write_dir
+        out_vec = raw_out / den[:, None] * pool_scale
+        raw_out_norm = jnp.linalg.norm(raw_out, axis=-1)
+        out_norm = jnp.linalg.norm(out_vec, axis=-1)
+        read_norm = jnp.linalg.norm(read_f, axis=-1)
+        write_norm = jnp.linalg.norm(write_f, axis=-1)
+        op_gain = read_norm * write_norm
+        score = jnp.abs(weighted) * write_norm[None, :]
+        vals, idx = jax.lax.top_k(score, min(_focus_take_k, int(score.shape[-1])))
+        def take(a):
+            return jnp.take_along_axis(a, idx, axis=1)
+        return jnp.stack([
+            jnp.broadcast_to(_focus_rank[:, None], vals.shape),
+            jnp.broadcast_to(_focus_b[:, None].astype(jnp.float32), vals.shape),
+            jnp.broadcast_to(_focus_pos[:, None].astype(jnp.float32), vals.shape),
+            jnp.zeros_like(vals),  # layer filled by scan_body
+            jnp.full(vals.shape, jnp.float32(pool_id)),
+            idx.astype(jnp.float32),
+            vals,
+            take(rho),
+            jnp.broadcast_to(tau, vals.shape),
+            take(margin),
+            take(pos_margin),
+            take(intensity),
+            take(gate),
+            jnp.broadcast_to(den[:, None], vals.shape),
+            take(gate) / jnp.maximum(den[:, None], 1e-8),
+            jnp.broadcast_to(active_n[:, None], vals.shape),
+            take(xr),
+            jnp.abs(take(xr)),
+            jnp.take(read_norm, idx),
+            jnp.take(write_norm, idx),
+            jnp.take(op_gain, idx),
+            jnp.broadcast_to(raw_out_norm[:, None], vals.shape),
+            jnp.broadcast_to(out_norm[:, None], vals.shape),
+            jnp.broadcast_to(jnp.linalg.norm(xf, axis=-1)[:, None], vals.shape),
+            jnp.broadcast_to(jnp.linalg.norm(hf, axis=-1)[:, None], vals.shape),
+        ], axis=-1).astype(jnp.float32)
 
     if isinstance(sharded_fns, dict):
         fused_single = sharded_fns.get('rst_single', sharded_fns['single'])
@@ -2892,6 +3158,9 @@ def _rst_forward(x, pool_params, router_params, rng,
     out = out * rst_scale
     rst_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     rst_out_norm_max = jnp.linalg.norm(out, axis=-1).max()
+    if spike_probe and _focus_probe_enabled:
+        rst_focus_srw_rows = _focus_srw_rows_for_pool(
+            3, x, h, rst_emb_unit, raw_tau, rst_read, rst_write, rst_scale)
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
@@ -2932,10 +3201,17 @@ def _rst_forward(x, pool_params, router_params, rng,
                 rst_top1_values, rst_top1_locs,
             )
         if spike_probe:
-            ret = ret + (
-                rst_spike_rows,
-                rst_out_norm_max.astype(jnp.float32),
-            )
+            if _focus_probe_enabled:
+                ret = ret + (
+                    rst_spike_rows,
+                    rst_focus_srw_rows,
+                    rst_out_norm_max.astype(jnp.float32),
+                )
+            else:
+                ret = ret + (
+                    rst_spike_rows,
+                    rst_out_norm_max.astype(jnp.float32),
+                )
         return ret
 
     rst_margin_band = margin_band_frac.mean()
@@ -2957,10 +3233,17 @@ def _rst_forward(x, pool_params, router_params, rng,
             rst_top1_values, rst_top1_locs,
         )
     if spike_probe:
-        analysis_ret = analysis_ret + (
-            rst_spike_rows,
-            rst_out_norm_max.astype(jnp.float32),
-        )
+        if _focus_probe_enabled:
+            analysis_ret = analysis_ret + (
+                rst_spike_rows,
+                rst_focus_srw_rows,
+                rst_out_norm_max.astype(jnp.float32),
+            )
+        else:
+            analysis_ret = analysis_ret + (
+                rst_spike_rows,
+                rst_out_norm_max.astype(jnp.float32),
+            )
     return analysis_ret
 
 
@@ -3284,6 +3567,13 @@ class DAWN(nn.Module):
                 in_cos = in_dot / (h_norm * in_norm)
                 tgt_cos = tgt_dot / (h_norm * tgt_norm)
                 pred_cos = pred_dot / (h_norm * pred_norm)
+                delta_norm_safe = d_norm + 1e-8
+                delta_in_dot = jnp.sum(delta * in_emb, axis=-1)
+                delta_tgt_dot = jnp.sum(delta * tgt_emb, axis=-1)
+                delta_pred_dot = jnp.sum(delta * pred_emb, axis=-1)
+                delta_in_cos = delta_in_dot / (delta_norm_safe * in_norm)
+                delta_tgt_cos = delta_tgt_dot / (delta_norm_safe * tgt_norm)
+                delta_pred_cos = delta_pred_dot / (delta_norm_safe * pred_norm)
                 return jnp.stack([
                     _focus_rank,
                     _focus_b.astype(jnp.float32),
@@ -3304,6 +3594,12 @@ class DAWN(nn.Module):
                     pred_dot - tgt_dot,
                     pred_cos - tgt_cos,
                     tgt_dot - in_dot,
+                    delta_tgt_dot,
+                    delta_pred_dot,
+                    delta_pred_dot - delta_tgt_dot,
+                    delta_tgt_cos,
+                    delta_pred_cos,
+                    delta_pred_cos - delta_tgt_cos,
                     (_focus_pred_tok == _focus_input_tok).astype(jnp.float32),
                     (_focus_target_tok == _focus_input_tok).astype(jnp.float32),
                     (_focus_pred_tok == _focus_target_tok).astype(jnp.float32),
@@ -3371,7 +3667,13 @@ class DAWN(nn.Module):
                     sharded_fns=_sharded, analysis=analysis,
                     local_diagnostics=local_diagnostics,
                     spike_probe=spike_probe,
-                    spike_probe_topk=spike_probe_topk)
+                    spike_probe_topk=spike_probe_topk,
+                    focus_probe_enabled=focus_probe_enabled,
+                    focus_b=_focus_b if focus_probe_enabled else None,
+                    focus_pos=_focus_pos if focus_probe_enabled else None,
+                    focus_rank=_focus_rank if focus_probe_enabled else None,
+                    d_select=self.d_select,
+                    intensity_beta=0.5)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -3422,14 +3724,30 @@ class DAWN(nn.Module):
                       a_softmax_entropy_mean, a_softmax_entropy_min,
                       a_o_input_norm_max, a_o_out_norm_max) = attn_ret[63:100]
                 if local_diagnostics:
-                    _a_local_tail = attn_ret[-8:-3] if spike_probe else attn_ret[-5:]
+                    if spike_probe and focus_probe_enabled:
+                        _a_local_tail = attn_ret[-10:-5]
+                    elif spike_probe:
+                        _a_local_tail = attn_ret[-8:-3]
+                    else:
+                        _a_local_tail = attn_ret[-5:]
                     (a_attn_local_layer_values,
                      a_attn_local_values, a_attn_local_locs,
                      a_attn_top1_values, a_attn_top1_locs) = _a_local_tail
                 if spike_probe:
-                    (a_spike_srw_rows,
-                     a_spike_attn_rows,
-                     a_out_norm_max) = attn_ret[-3:]
+                    if focus_probe_enabled:
+                        (a_spike_srw_rows,
+                         a_spike_attn_rows,
+                         a_focus_srw_rows,
+                         a_focus_attn_rows,
+                         a_out_norm_max) = attn_ret[-5:]
+                        a_focus_srw_rows = a_focus_srw_rows.at[:, :, 3].set(
+                            layer_idx.astype(jnp.float32))
+                        a_focus_attn_rows = a_focus_attn_rows.at[:, :, 3].set(
+                            layer_idx.astype(jnp.float32))
+                    else:
+                        (a_spike_srw_rows,
+                         a_spike_attn_rows,
+                         a_out_norm_max) = attn_ret[-3:]
                 x = x + attn_out
                 x_post_attn = x
                 if spike_probe:
@@ -3445,7 +3763,13 @@ class DAWN(nn.Module):
                     local_diagnostics=local_diagnostics,
                     spike_probe=spike_probe,
                     spike_probe_topk=spike_probe_topk,
-                    d_model=self.d_model, n_layers=self.n_layers)
+                    d_model=self.d_model, n_layers=self.n_layers,
+                    focus_probe_enabled=focus_probe_enabled,
+                    focus_b=_focus_b if focus_probe_enabled else None,
+                    focus_pos=_focus_pos if focus_probe_enabled else None,
+                    focus_rank=_focus_rank if focus_probe_enabled else None,
+                    d_select=self.d_select,
+                    intensity_beta=0.5)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_strong, k_positive_margin_active, k_tau_abs,
@@ -3477,12 +3801,24 @@ class DAWN(nn.Module):
                       k_emb_n_max, k_rho_kurt, k_margin_band,
                       k_int_cap_frac) = rst_ret[51:66]
                 if local_diagnostics:
-                    _k_local_tail = rst_ret[-6:-2] if spike_probe else rst_ret[-4:]
+                    if spike_probe and focus_probe_enabled:
+                        _k_local_tail = rst_ret[-7:-3]
+                    elif spike_probe:
+                        _k_local_tail = rst_ret[-6:-2]
+                    else:
+                        _k_local_tail = rst_ret[-4:]
                     (k_local_values, k_local_locs,
                      k_top1_values, k_top1_locs) = _k_local_tail
                 if spike_probe:
-                    (k_spike_srw_rows,
-                     k_out_norm_max) = rst_ret[-2:]
+                    if focus_probe_enabled:
+                        (k_spike_srw_rows,
+                         k_focus_srw_rows,
+                         k_out_norm_max) = rst_ret[-3:]
+                        k_focus_srw_rows = k_focus_srw_rows.at[:, :, 3].set(
+                            layer_idx.astype(jnp.float32))
+                    else:
+                        (k_spike_srw_rows,
+                         k_out_norm_max) = rst_ret[-2:]
                 x = x + rst_out
                 x_post_rst = x
                 if spike_probe:
@@ -3640,9 +3976,19 @@ class DAWN(nn.Module):
                         k_resid_norm_max,
                     )
                 if focus_probe_enabled:
+                    focus_srw_candidates = jnp.concatenate(
+                        [a_focus_srw_rows, k_focus_srw_rows], axis=1)
+                    _fs_scores = focus_srw_candidates[:, :, 6]
+                    _fs_vals, _fs_idx = jax.lax.top_k(
+                        _fs_scores, min(focus_k, int(_fs_scores.shape[1])))
+                    focus_srw_rows = jnp.take_along_axis(
+                        focus_srw_candidates, _fs_idx[:, :, None], axis=1)
+                    focus_srw_rows = focus_srw_rows.at[:, :, 6].set(_fs_vals)
                     analysis_ys = analysis_ys + (
                         focus_path_rows,
                         focus_route_rows,
+                        focus_srw_rows,
+                        a_focus_attn_rows,
                     )
                 return x, analysis_ys
 
@@ -3775,9 +4121,11 @@ class DAWN(nn.Module):
                 _scan_offset += 7
             if focus_probe_enabled:
                 (spike_focus_path_trace_all,
-                 spike_focus_route_trace_all) = scan_ys[
-                    _scan_offset:_scan_offset + 2]
-                _scan_offset += 2
+                 spike_focus_route_trace_all,
+                 spike_focus_srw_top_all,
+                 spike_focus_attention_top_all) = scan_ys[
+                    _scan_offset:_scan_offset + 4]
+                _scan_offset += 4
             # Aux is averaged over layers after attention and RST terms are
             # collected.  Attention keeps historical Q/K/V scaling upstream.
             total_aux = (attn_auxes + rst_auxes).mean()
@@ -4213,6 +4561,8 @@ class DAWN(nn.Module):
                     _focus_final_block[None, :, :, :],
                 ], axis=0),
                 'spike_focus_route_trace': spike_focus_route_trace_all,
+                'spike_focus_srw_top': spike_focus_srw_top_all,
+                'spike_focus_attention_top': spike_focus_attention_top_all,
             })
 
 

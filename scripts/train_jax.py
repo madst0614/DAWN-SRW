@@ -156,6 +156,10 @@ SPIKE_FOCUS_PATH_FIELD_NAMES = (
     'input_dot', 'target_dot', 'pred_dot',
     'pred_minus_target_dot', 'pred_minus_target_cos',
     'target_minus_input_dot',
+    'delta_target_dot', 'delta_pred_dot',
+    'delta_pred_minus_target_dot',
+    'delta_target_cos', 'delta_pred_cos',
+    'delta_pred_minus_target_cos',
     'pred_equals_input', 'target_equals_input', 'pred_equals_target')
 
 SPIKE_FOCUS_ROUTE_FIELD_NAMES = (
@@ -167,6 +171,21 @@ SPIKE_FOCUS_ROUTE_FIELD_NAMES = (
     'q_no_active', 'k_no_active', 'v_no_active', 'rst_no_active',
     'qk_positive_margin', 'v_positive_margin', 'rst_positive_margin',
     'full_block_delta_norm')
+
+SPIKE_FOCUS_SRW_FIELD_NAMES = (
+    'rank', 'batch', 'pos', 'layer', 'pool_id', 'neuron_global_id',
+    'score', 'rho', 'tau', 'margin', 'positive_margin', 'intensity',
+    'gate_raw', 'gate_den', 'gate_share', 'active_n_for_token',
+    'read_scalar_xr', 'abs_read_scalar_xr', 'read_norm', 'write_norm',
+    'op_gain', 'raw_out_norm_for_token', 'out_norm_for_token',
+    'resid_norm_for_token', 'h_norm_for_token')
+
+SPIKE_FOCUS_ATTN_FIELD_NAMES = (
+    'rank', 'batch', 'query_pos', 'layer', 'head', 'key_pos', 'score',
+    'attn_logit', 'attn_weight', 'attn_logit_gap_top1_top2',
+    'attn_entropy', 'q_norm', 'k_norm', 'v_norm',
+    'attn_o_input_norm', 'attn_o_output_norm',
+    'key_relpos', 'key_is_self')
 
 DIRECT_TAU_SELECT_METRIC_NAMES = (
     'rho_mean', 'rho_std', 'rho_max',
@@ -6266,6 +6285,35 @@ def _decode_spike_probe(probe_raw):
             int_fields={'rank', 'batch', 'pos', 'layer'})
         focus_route_rows.extend(decoded)
 
+    focus_srw_rows = []
+    focus_srw_arr = np.asarray(
+        probe_raw.get('spike_focus_srw_top', []), dtype=np.float64)
+    if focus_srw_arr.ndim == 4:
+        flat = focus_srw_arr.reshape((-1, focus_srw_arr.shape[-1]))
+        decoded = _decode_spike_rows(
+            flat, SPIKE_FOCUS_SRW_FIELD_NAMES,
+            int_fields={
+                'rank', 'batch', 'pos', 'layer',
+                'pool_id', 'neuron_global_id',
+            })
+        pool_names = {0: 'attn_q', 1: 'attn_k', 2: 'attn_v', 3: 'rst'}
+        for item in decoded:
+            item['pool'] = pool_names.get(int(item.get('pool_id', -1)), 'unknown')
+            focus_srw_rows.append(item)
+
+    focus_attn_rows = []
+    focus_attn_arr = np.asarray(
+        probe_raw.get('spike_focus_attention_top', []), dtype=np.float64)
+    if focus_attn_arr.ndim == 4:
+        flat = focus_attn_arr.reshape((-1, focus_attn_arr.shape[-1]))
+        decoded = _decode_spike_rows(
+            flat, SPIKE_FOCUS_ATTN_FIELD_NAMES,
+            int_fields={
+                'rank', 'batch', 'query_pos', 'layer',
+                'head', 'key_pos', 'key_is_self',
+            })
+        focus_attn_rows.extend(decoded)
+
     return {
         'top_token_ce': token_rows,
         'top_token_alignment': token_align_rows,
@@ -6273,6 +6321,8 @@ def _decode_spike_probe(probe_raw):
         'attention_top': attn_rows,
         'focus_path_trace': focus_path_rows,
         'focus_route_trace': focus_route_rows,
+        'focus_srw_top': focus_srw_rows,
+        'focus_attention_top': focus_attn_rows,
         'layer_forward_norms': {
             'layer_attn_out_norm_max': _jsonable_diag_value(
                 probe_raw.get('spike_layer_attn_out_norm_max', [])),
@@ -6672,7 +6722,9 @@ def _format_spike_text(event):
                     f"h={r.get('hidden_norm', 0.0):.3f} dprev={r.get('delta_norm_from_prev', 0.0):.3f} "
                     f"cos[in={r.get('input_cos', 0.0):+.4f} tgt={r.get('target_cos', 0.0):+.4f} pred={r.get('pred_cos', 0.0):+.4f}] "
                     f"dot[tgt={r.get('target_dot', 0.0):+.3f} pred={r.get('pred_dot', 0.0):+.3f} "
-                    f"p-t={r.get('pred_minus_target_dot', 0.0):+.3f}]")
+                    f"p-t={r.get('pred_minus_target_dot', 0.0):+.3f}] "
+                    f"delta[p-t={r.get('delta_pred_minus_target_dot', 0.0):+.3f} "
+                    f"tgt={r.get('delta_target_dot', 0.0):+.3f} pred={r.get('delta_pred_dot', 0.0):+.3f}]")
 
     focus_route = [
         r for r in probe.get('focus_route_trace', [])
@@ -6703,6 +6755,44 @@ def _format_spike_text(event):
                     f"active[qk={r.get('qk_active', 0.0):.1f} v={r.get('v_active', 0.0):.1f} rst={r.get('rst_active', 0.0):.1f}] "
                     f"tau[q={r.get('q_tau', 0.0):.4f} k={r.get('k_tau', 0.0):.4f} v={r.get('v_tau', 0.0):.4f} rst={r.get('rst_tau', 0.0):.4f}] "
                     f"no[q={r.get('q_no_active', 0.0):.0f} k={r.get('k_no_active', 0.0):.0f} v={r.get('v_no_active', 0.0):.0f} rst={r.get('rst_no_active', 0.0):.0f}]")
+
+    focus_srw = sorted(
+        [r for r in probe.get('focus_srw_top', [])
+         if int(r.get('rank', -1)) in (0, 1)],
+        key=lambda r: r.get('score', 0.0),
+        reverse=True)
+    if focus_srw:
+        lines.append("same_top_token_srw_focus_topk:")
+        for row in focus_srw[:12]:
+            lines.append(
+                "  "
+                f"rank={row.get('rank')} L{int(row.get('layer', -1)):02d} pool={row.get('pool')} "
+                f"b={row.get('batch')} pos={row.get('pos')} neuron={row.get('neuron_global_id')} "
+                f"score={row.get('score', 0.0):.6f} gate_share={row.get('gate_share', 0.0):.6f} "
+                f"xr={row.get('read_scalar_xr', 0.0):.6f} int={row.get('intensity', 0.0):.6f} "
+                f"rho={row.get('rho', 0.0):.6f} tau={row.get('tau', 0.0):.6f} "
+                f"margin={row.get('margin', 0.0):.6f} out={row.get('out_norm_for_token', 0.0):.3f}")
+
+    focus_attn = sorted(
+        [r for r in probe.get('focus_attention_top', [])
+         if int(r.get('rank', -1)) in (0, 1)],
+        key=lambda r: max(
+            abs(r.get('attn_logit', 0.0)),
+            r.get('attn_weight', 0.0) * 10.0,
+            r.get('attn_o_output_norm', 0.0)),
+        reverse=True)
+    if focus_attn:
+        lines.append("same_top_token_attention_focus_topk:")
+        for row in focus_attn[:12]:
+            lines.append(
+                "  "
+                f"rank={row.get('rank')} L{int(row.get('layer', -1)):02d} h={row.get('head')} "
+                f"b={row.get('batch')} q={row.get('query_pos')} k={row.get('key_pos')} "
+                f"rel={row.get('key_relpos', 0.0):.0f} self={row.get('key_is_self', 0)} "
+                f"logit={row.get('attn_logit', 0.0):.6f} w={row.get('attn_weight', 0.0):.6f} "
+                f"gap={row.get('attn_logit_gap_top1_top2', 0.0):.6f} ent={row.get('attn_entropy', 0.0):.6f} "
+                f"q={row.get('q_norm', 0.0):.3f} k_norm={row.get('k_norm', 0.0):.3f} "
+                f"v={row.get('v_norm', 0.0):.3f} o_out={row.get('attn_o_output_norm', 0.0):.3f}")
 
     srw = sorted(
         probe.get('srw_top_contributors', []),
