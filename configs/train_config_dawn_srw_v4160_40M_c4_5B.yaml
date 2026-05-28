@@ -106,5 +106,18 @@ training:
   log_interval: 100
   log_analysis_multiplier: 5
   heavy_geometry_multiplier: 10
+  stop_on_collapse: false
+  crash_snapshot: false
+  crash_snapshot_enabled: false
+  spike_event_logger: true
+  spike_grad_threshold: 5.0
+  spike_ce_threshold: 5.0
+  spike_ce_grad_ce_threshold: 4.0
+  spike_ce_grad_grad_threshold: 2.0
+  spike_logit_abs_threshold: 40.0
+  spike_rst_out_threshold: 8.0
+  spike_probe_on_event: true
+  spike_probe_topk: 8
+  spike_history_steps: 20
 
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4160_40M_c4_5B

@@ -1,9 +1,9 @@
-# DAWN-SRW v4.1.6.1 DirectTau + CB1A - 400M config
+# DAWN-SRW v4.1.6.1 DirectTau + CB1A — 400M config
 #
 # Policy:
-#   - Keep 400M-specific shape, C4-40B scale, TPU mesh, batch, and chunking.
-#   - Keep the v4.1.6.0 DirectTau forward rule unchanged.
-#   - Add CB1A as an auxiliary-only boundary audition loss.
+#   - Keep v4.1.6.0 DirectTau forward/init unchanged.
+#   - Remove RPE/exploration loss for v4.1.6.1.
+#   - Add CB1A as an auxiliary-only CE-conditioned boundary loss.
 
 seed: 1
 
@@ -68,6 +68,8 @@ training:
   diversity_weight: 0.1
   load_balance_weight: 0.0
   dead_exposure_target: 0.1
+
+  # Keep 4160's effective dead penalty, but expose per-pool weights.
   dead_penalty_qk_weight: 0.001
   dead_penalty_v_weight: 0.001
   dead_penalty_rst_weight: 0.001
@@ -80,16 +82,35 @@ training:
   selection_margin_reg_weight_rst: 0.1
 
   # CE-conditioned Boundary-1 Audition (CB1A)
-  cb1a_qk_challenge_weight: 0.041667
-  cb1a_qk_prune_weight: 0.045833
-  cb1a_v_challenge_weight: 0.333333
-  cb1a_v_prune_weight: 0.4
-  cb1a_rst_challenge_weight: 0.625
-  cb1a_rst_prune_weight: 1.25
+  # v4.1.6.1 replaces RPE/exploration with this aux-only boundary loss.
+  # CB1A execution controls are code defaults, not config knobs:
+  #   enabled=True, tau_stopgrad=True, anchor_stopgrad=True,
+  #   forward_influence=False.
+  # Loss form:
+  #   cb1a_weight * (
+  #       qk_challenge_weight  * qk_challenge
+  #     + qk_prune_weight      * qk_prune
+  #     + v_challenge_weight   * v_challenge
+  #     + v_prune_weight       * v_prune
+  #     + rst_challenge_weight * rst_challenge
+  #     + rst_prune_weight     * rst_prune
+  #   )
+  # challenge: high-CE positions; boundary-near unselected candidates compete.
+  # prune:     low-CE positions; boundary-near selected candidates shrink.
+  cb1a_weight: 0.005
+  cb1a_qk_challenge_weight: 1
+  cb1a_qk_prune_weight: 1
+  cb1a_v_challenge_weight: 2
+  cb1a_v_prune_weight: 3
+  cb1a_rst_challenge_weight: 5
+  cb1a_rst_prune_weight: 10
   cb1a_ce_mode: sigmoid_z
   cb1a_eps: 1.0e-8
 
-  # Chunking - 400M-specific memory/mesh setting
+  # RPE/exploration is intentionally absent for v4.1.6.1.
+  # Do not add exploration_* keys unless you are explicitly reverting to 4160-style RPE.
+
+  # Chunking — 400M-specific memory/mesh setting
   n_chunks_qk: 1
   n_chunks_v: 1
   n_chunks_know: 4
@@ -100,5 +121,18 @@ training:
   log_interval: 100
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
+  stop_on_collapse: false
+  crash_snapshot: false
+  crash_snapshot_enabled: false
+  spike_event_logger: true
+  spike_grad_threshold: 5.0
+  spike_ce_threshold: 5.0
+  spike_ce_grad_ce_threshold: 4.0
+  spike_ce_grad_grad_threshold: 2.0
+  spike_logit_abs_threshold: 40.0
+  spike_rst_out_threshold: 8.0
+  spike_probe_on_event: true
+  spike_probe_topk: 8
+  spike_history_steps: 20
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4161_400M_c4_40B_v4_64_cb1a
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4161_400M_c4_40B_v4_64

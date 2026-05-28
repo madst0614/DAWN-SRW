@@ -377,6 +377,23 @@ def _require_tau_target_count(name, value):
 LOCAL_SPIKE_METRIC_COUNT = 11
 LOCAL_SPIKE_TOP1_COUNT = 17
 ATTN_LOCAL_METRIC_COUNT = 7
+SPIKE_SRW_FIELD_COUNT = 26
+SPIKE_ATTN_FIELD_COUNT = 14
+SPIKE_TOKEN_FIELD_COUNT = 13
+
+
+def _topk_rows(candidates, topk, field_count):
+    """Return top-k candidate rows sorted by score in column 0."""
+    k = int(topk)
+    size = int(candidates.shape[0])
+    take_k = min(k, size)
+    scores, idx = jax.lax.top_k(candidates[:, 0], take_k)
+    rows = jnp.take(candidates, idx, axis=0)
+    rows = rows.at[:, 0].set(scores)
+    if take_k < k:
+        pad = jnp.full((k - take_k, field_count), -jnp.inf, dtype=rows.dtype)
+        rows = jnp.concatenate([rows, pad], axis=0)
+    return rows
 
 
 # ================================================================
@@ -393,6 +410,8 @@ ATTN_LOCAL_METRIC_COUNT = 7
 def make_sharded_srw(mesh, max_chunk_size=2048,
                      analysis=False,
                      local_diagnostics=False,
+                     spike_probe=False,
+                     spike_probe_topk=8,
                      intensity_route_dim=0,
                      intensity_beta=0.5,
                      dead_exposure_target=0.1):
@@ -427,6 +446,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _data_axis_size = mesh.shape['data']
     _dead_exposure_target = jnp.float32(dead_exposure_target)
     _local_diagnostics = bool(local_diagnostics)
+    _spike_probe = bool(spike_probe)
+    _spike_probe_topk = max(1, int(spike_probe_topk))
     _intensity_route_dim = int(intensity_route_dim or 0)
     if _intensity_route_dim <= 0:
         raise ValueError(
@@ -487,12 +508,17 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         P(),                     # top1_breakdown_values [1, field]
         P(),                     # top1_breakdown_locs [1, b/t/neuron]
     )
+    _spike_probe_specs = (
+        P(),                     # spike SRW top rows [1, K, field]
+    )
     _out_specs = (_slim_out_specs + _conc_out_specs + _analysis_extra_specs
                   if analysis else _slim_out_specs + _conc_out_specs)
     _out_specs = _out_specs + _select_diag_specs
     _out_specs = _out_specs + _dead_exposure_diag_specs
     if _local_diagnostics:
         _out_specs = _out_specs + _local_diag_specs
+    if _spike_probe:
+        _out_specs = _out_specs + _spike_probe_specs
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),    # x [B,S,D]
@@ -522,6 +548,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         diag_pos_inf = jnp.float32(1.0e30)
         diag_vals_init = jnp.full(
             (1, LOCAL_SPIKE_METRIC_COUNT), diag_neg_inf)
+        spike_rows_init = jnp.full(
+            (_spike_probe_topk, SPIKE_SRW_FIELD_COUNT),
+            diag_neg_inf, dtype=jnp.float32)
+        spike_rows_init = spike_rows_init.at[:, 1:4].set(0.0)
 
         def route_emb_chunk(start):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
@@ -678,6 +708,109 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 weak_mask.astype(jnp.float32).sum(),
             )
 
+        def spike_chunk_rows(start, rho, raw_tau_chunk, tau_chunk,
+                             selection_margin, positive_margin, intensity,
+                             gate, xr_f, read_norm, write_norm):
+            contrib_proxy = (
+                jnp.abs(jax.lax.stop_gradient(gate * xr_f))
+                * write_norm[None, None, :])
+            flat_score = contrib_proxy.reshape((-1,))
+            top_scores, top_idx = jax.lax.top_k(
+                flat_score,
+                min(_spike_probe_topk, int(flat_score.shape[0])))
+            b_idx = top_idx // (S * cs)
+            rem = top_idx - b_idx * (S * cs)
+            pos_idx = rem // cs
+            n_idx = rem - pos_idx * cs
+            read_norm_i = jnp.take(read_norm, n_idx, axis=0)
+            write_norm_i = jnp.take(write_norm, n_idx, axis=0)
+            raw_tau_i = raw_tau_chunk[b_idx, pos_idx, 0]
+            tau_i = tau_chunk[b_idx, pos_idx, 0]
+            margin_i = selection_margin[b_idx, pos_idx, n_idx]
+            pos_margin_i = positive_margin[b_idx, pos_idx, n_idx]
+            intensity_i = intensity[b_idx, pos_idx, n_idx]
+            gate_i = gate[b_idx, pos_idx, n_idx]
+            xr_i = xr_f[b_idx, pos_idx, n_idx]
+            h_norm_i = jnp.linalg.norm(
+                jax.lax.stop_gradient(h[b_idx, pos_idx].astype(jnp.float32)),
+                axis=-1)
+            resid_norm_i = jnp.linalg.norm(
+                jax.lax.stop_gradient(x[b_idx, pos_idx].astype(jnp.float32)),
+                axis=-1)
+            rows = jnp.stack([
+                top_scores,
+                b_idx.astype(jnp.float32),
+                pos_idx.astype(jnp.float32),
+                (jnp.asarray(start, dtype=jnp.int32) + n_idx).astype(jnp.float32),
+                rho[b_idx, pos_idx, n_idx],
+                raw_tau_i,
+                tau_i,
+                margin_i,
+                pos_margin_i,
+                intensity_i,
+                gate_i,
+                jnp.zeros_like(top_scores),
+                jnp.zeros_like(top_scores),
+                jnp.zeros_like(top_scores),
+                jnp.zeros_like(top_scores),
+                jnp.zeros_like(top_scores),
+                xr_i,
+                jnp.abs(xr_i),
+                read_norm_i,
+                write_norm_i,
+                read_norm_i * write_norm_i,
+                top_scores,
+                jnp.zeros_like(top_scores),
+                jnp.zeros_like(top_scores),
+                resid_norm_i,
+                h_norm_i,
+            ], axis=-1).astype(jnp.float32)
+            if int(top_scores.shape[0]) < _spike_probe_topk:
+                pad = jnp.full(
+                    (_spike_probe_topk - int(top_scores.shape[0]),
+                     SPIKE_SRW_FIELD_COUNT),
+                    diag_neg_inf, dtype=jnp.float32)
+                pad = pad.at[:, 1:4].set(0.0)
+                rows = jnp.concatenate([rows, pad], axis=0)
+            return rows
+
+        def spike_merge_rows(rows_a, rows_b):
+            return _topk_rows(
+                jnp.concatenate([rows_a, rows_b], axis=0),
+                _spike_probe_topk, SPIKE_SRW_FIELD_COUNT)
+
+        def spike_finalize_rows(rows, raw_out, out, global_den_cost_m,
+                                global_gate_max_m, global_active_m,
+                                no_active_direct):
+            local_b = rows[:, 1].astype(jnp.int32)
+            pos = rows[:, 2].astype(jnp.int32)
+            den_i = global_den_cost_m[local_b, pos, 0]
+            top1_i = (
+                global_gate_max_m[local_b, pos, 0]
+                / jnp.maximum(den_i, 1e-8))
+            active_i = global_active_m[local_b, pos, 0]
+            no_active_i = no_active_direct[local_b, pos, 0]
+            raw_out_i = jnp.linalg.norm(
+                jax.lax.stop_gradient(raw_out[local_b, pos]), axis=-1)
+            out_i = jnp.linalg.norm(
+                jax.lax.stop_gradient(out[local_b, pos]), axis=-1)
+            model_offset = jax.lax.axis_index('model') * N_local
+            data_offset = jax.lax.axis_index('data') * B
+            rows = rows.at[:, 1].set(rows[:, 1] + data_offset)
+            rows = rows.at[:, 3].set(rows[:, 3] + model_offset)
+            rows = rows.at[:, 11].set(den_i)
+            rows = rows.at[:, 12].set(rows[:, 10] / jnp.maximum(den_i, 1e-8))
+            rows = rows.at[:, 13].set(top1_i)
+            rows = rows.at[:, 14].set(active_i)
+            rows = rows.at[:, 15].set(no_active_i)
+            rows = rows.at[:, 22].set(raw_out_i)
+            rows = rows.at[:, 23].set(out_i)
+            gathered = jax.lax.all_gather(rows, 'model', axis=0)
+            gathered = jax.lax.all_gather(gathered, 'data', axis=0)
+            return _topk_rows(
+                gathered.reshape((-1, SPIKE_SRW_FIELD_COUNT)),
+                _spike_probe_topk, SPIKE_SRW_FIELD_COUNT)[None, :, :]
+
         # --- Pass 2: gate + srw fused (scan + checkpoint) ---
         # v4.1 diagnostic: ceiling on intensity relative to cap (1e-3 below).
         if analysis:
@@ -692,7 +825,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  total_exposure_max, total_weak_exposure_count,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count, total_selection_margin_reg,
-                 select_diag_carry, diag_vals) = carry
+                 select_diag_carry, diag_vals, spike_rows) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, intensity, rho_exposure = route_relation_and_intensity(
@@ -734,6 +867,21 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                             jax.lax.stop_gradient(route.astype(jnp.float32)),
                             axis=-1)))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
+                if _spike_probe:
+                    read_norm = jnp.linalg.norm(
+                        jax.lax.dynamic_slice_in_dim(
+                            read_bf, s, cs, axis=0).astype(jnp.float32),
+                        axis=-1)
+                    write_norm = jnp.linalg.norm(
+                        jax.lax.dynamic_slice_in_dim(
+                            write_bf, s, cs, axis=0).astype(jnp.float32),
+                        axis=-1)
+                    spike_rows = spike_merge_rows(
+                        spike_rows,
+                        spike_chunk_rows(
+                            s, rho, raw_tau, tau, selection_margin,
+                            positive_margin, intensity, gate, xr_f,
+                            read_norm, write_norm))
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_margin_band = jnp.zeros((B, S, 1), dtype=jnp.float32)
@@ -770,7 +918,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                         total_selection_residency_count + chunk_selection_residency_count,
                         total_selection_margin_reg + chunk_selection_margin_reg,
                         select_diag_carry,
-                        diag_vals), None
+                        diag_vals,
+                        spike_rows), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_margin_band, total_den_cost, total_selection_cost,
@@ -780,7 +929,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
               total_exposure_max, total_weak_exposure_count,
               total_int_max, total_int_cap_count, total_selection_residency_sum,
               total_selection_residency_count, total_selection_margin_reg,
-              select_diag_carry, diag_vals), _ = jax.lax.scan(
+              select_diag_carry, diag_vals, spike_rows), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
                  z1, z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1, z1, z1, z1, z1, z1,
@@ -792,7 +941,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                   jnp.float32(0.0),
                   jnp.float32(0.0),
                   select_diag_carry0,
-                  diag_vals_init),
+                  diag_vals_init,
+                  spike_rows_init),
                 jnp.arange(nc))
         else:
             @jax.checkpoint
@@ -805,7 +955,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  total_exposure_max, total_weak_exposure_count,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count, total_selection_margin_reg,
-                 select_diag_carry, diag_vals) = carry
+                 select_diag_carry, diag_vals, spike_rows) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, intensity, rho_exposure = route_relation_and_intensity(
@@ -847,6 +997,21 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                             jax.lax.stop_gradient(route.astype(jnp.float32)),
                             axis=-1)))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
+                if _spike_probe:
+                    read_norm = jnp.linalg.norm(
+                        jax.lax.dynamic_slice_in_dim(
+                            read_bf, s, cs, axis=0).astype(jnp.float32),
+                        axis=-1)
+                    write_norm = jnp.linalg.norm(
+                        jax.lax.dynamic_slice_in_dim(
+                            write_bf, s, cs, axis=0).astype(jnp.float32),
+                        axis=-1)
+                    spike_rows = spike_merge_rows(
+                        spike_rows,
+                        spike_chunk_rows(
+                            s, rho, raw_tau, tau, selection_margin,
+                            positive_margin, intensity, gate, xr_f,
+                            read_norm, write_norm))
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 # sum(gate) feeds the denominator after the chunk scan.
@@ -875,7 +1040,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                         total_selection_residency_count + chunk_selection_residency_count,
                         total_selection_margin_reg + chunk_selection_margin_reg,
                         select_diag_carry,
-                        diag_vals), None
+                        diag_vals,
+                        spike_rows), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_den_cost, total_selection_cost, total_current_cost,
@@ -884,7 +1050,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
               total_exposure_max, total_weak_exposure_count,
               total_int_max, total_int_cap_count, total_selection_residency_sum,
               total_selection_residency_count, total_selection_margin_reg,
-              select_diag_carry, diag_vals), _ = jax.lax.scan(
+              select_diag_carry, diag_vals, spike_rows), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
                  z1, z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1, z1,
@@ -895,7 +1061,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                   jnp.float32(0.0),
                   jnp.float32(0.0),
                   select_diag_carry0,
-                  diag_vals_init),
+                  diag_vals_init,
+                  spike_rows_init),
                 jnp.arange(nc))
 
         global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')  # sum(gate)
@@ -1056,9 +1223,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             local_diag_out = (
                 metric_vals.astype(jnp.float32), metric_locs,
                 top1_details, top1_locs)
+        spike_probe_out = ()
+        if _spike_probe:
+            spike_probe_out = (
+                spike_finalize_rows(
+                    spike_rows, raw_out, out, global_den_cost_m,
+                    global_gate_max_m, global_active_m,
+                    no_active_direct).astype(jnp.float32),)
         if not analysis:
             return (slim_out + conc_out + select_diag_out
-                    + dead_exposure_diag_out + local_diag_out)
+                    + dead_exposure_diag_out + local_diag_out + spike_probe_out)
 
         # --- Analysis-only extras ---
         margin_band_frac = jax.lax.psum(total_margin_band, 'model') / N_total
@@ -1092,7 +1266,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                    gate_entropy, den_cost_out, selection_cost_out,
                    current_cost_out, rho_kurt, int_cap_frac_out)
                 + select_diag_out + dead_exposure_diag_out
-                + local_diag_out)
+                + local_diag_out + spike_probe_out)
 
     return fused_gate_srw
 
@@ -1100,6 +1274,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
 def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             analysis=False,
                             local_diagnostics=False,
+                            spike_probe=False,
+                            spike_probe_topk=8,
                             intensity_route_dim=0,
                             intensity_beta=0.5,
                             dead_exposure_target=0.1):
@@ -1118,6 +1294,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _data_axis_size = mesh.shape['data']
     _dead_exposure_target = jnp.float32(dead_exposure_target)
     _local_diagnostics = bool(local_diagnostics)
+    _spike_probe = bool(spike_probe)
+    _spike_probe_topk = max(1, int(spike_probe_topk))
     _intensity_route_dim = int(intensity_route_dim or 0)
     if _intensity_route_dim <= 0:
         raise ValueError(
@@ -1184,6 +1362,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         P(),                          # top1_breakdown_values [2, field]
         P(),                          # top1_breakdown_locs [2, b/t/neuron]
     )
+    _spike_probe_specs = (
+        P(),                          # spike SRW top rows [2, K, field]
+    )
     _out_specs = (_slim_out_specs + _conc_out_specs
                   + _route_split_out_specs + _analysis_extra_specs
                   if analysis
@@ -1193,6 +1374,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _out_specs = _out_specs + _dead_exposure_diag_specs
     if _local_diagnostics:
         _out_specs = _out_specs + _local_diag_specs
+    if _spike_probe:
+        _out_specs = _out_specs + _spike_probe_specs
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),        # x [B,S,D]
@@ -1223,6 +1406,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         diag_pos_inf = jnp.float32(1.0e30)
         diag_vals_init = jnp.full(
             (2, LOCAL_SPIKE_METRIC_COUNT), diag_neg_inf)
+        spike_rows_init = jnp.full(
+            (2, _spike_probe_topk, SPIKE_SRW_FIELD_COUNT),
+            diag_neg_inf, dtype=jnp.float32)
+        spike_rows_init = spike_rows_init.at[:, :, 1:4].set(0.0)
 
         def route_emb_chunk(start):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
@@ -1379,6 +1566,127 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 weak_mask.astype(jnp.float32).sum(),
             )
 
+        def spike_chunk_rows_paired(start, rho, raw_tau_chunk, tau_chunk,
+                                    selection_margin, positive_margin,
+                                    intensity, gate, xr_f, read_norm,
+                                    write_norm):
+            xr_r = xr_f[:, :, None, :]
+            contrib_proxy = (
+                jnp.abs(jax.lax.stop_gradient(gate * xr_r))
+                * write_norm[None, None, None, :])
+            out_rows = []
+            local_k = min(_spike_probe_topk, int(B * S * cs))
+            for route_idx in range(2):
+                flat_score = contrib_proxy[:, :, route_idx, :].reshape((-1,))
+                top_scores, top_idx = jax.lax.top_k(flat_score, local_k)
+                b_idx = top_idx // (S * cs)
+                rem = top_idx - b_idx * (S * cs)
+                pos_idx = rem // cs
+                n_idx = rem - pos_idx * cs
+                read_norm_i = jnp.take(read_norm, n_idx, axis=0)
+                write_norm_i = jnp.take(write_norm, n_idx, axis=0)
+                raw_tau_i = raw_tau_chunk[b_idx, pos_idx, route_idx, 0]
+                tau_i = tau_chunk[b_idx, pos_idx, route_idx, 0]
+                margin_i = selection_margin[b_idx, pos_idx, route_idx, n_idx]
+                pos_margin_i = positive_margin[b_idx, pos_idx, route_idx, n_idx]
+                intensity_i = intensity[b_idx, pos_idx, route_idx, n_idx]
+                gate_i = gate[b_idx, pos_idx, route_idx, n_idx]
+                xr_i = xr_f[b_idx, pos_idx, n_idx]
+                h_norm_i = jnp.linalg.norm(
+                    jax.lax.stop_gradient(
+                        h[b_idx, pos_idx, route_idx].astype(jnp.float32)),
+                    axis=-1)
+                resid_norm_i = jnp.linalg.norm(
+                    jax.lax.stop_gradient(
+                        x[b_idx, pos_idx].astype(jnp.float32)),
+                    axis=-1)
+                rows = jnp.stack([
+                    top_scores,
+                    b_idx.astype(jnp.float32),
+                    pos_idx.astype(jnp.float32),
+                    (jnp.asarray(start, dtype=jnp.int32) + n_idx).astype(jnp.float32),
+                    rho[b_idx, pos_idx, route_idx, n_idx],
+                    raw_tau_i,
+                    tau_i,
+                    margin_i,
+                    pos_margin_i,
+                    intensity_i,
+                    gate_i,
+                    jnp.zeros_like(top_scores),
+                    jnp.zeros_like(top_scores),
+                    jnp.zeros_like(top_scores),
+                    jnp.zeros_like(top_scores),
+                    jnp.zeros_like(top_scores),
+                    xr_i,
+                    jnp.abs(xr_i),
+                    read_norm_i,
+                    write_norm_i,
+                    read_norm_i * write_norm_i,
+                    top_scores,
+                    jnp.zeros_like(top_scores),
+                    jnp.zeros_like(top_scores),
+                    resid_norm_i,
+                    h_norm_i,
+                ], axis=-1).astype(jnp.float32)
+                if local_k < _spike_probe_topk:
+                    pad = jnp.full(
+                        (_spike_probe_topk - local_k,
+                         SPIKE_SRW_FIELD_COUNT),
+                        diag_neg_inf, dtype=jnp.float32)
+                    pad = pad.at[:, 1:4].set(0.0)
+                    rows = jnp.concatenate([rows, pad], axis=0)
+                out_rows.append(rows)
+            return jnp.stack(out_rows, axis=0)
+
+        def spike_merge_rows_paired(rows_a, rows_b):
+            merged = []
+            for route_idx in range(2):
+                merged.append(_topk_rows(
+                    jnp.concatenate(
+                        [rows_a[route_idx], rows_b[route_idx]], axis=0),
+                    _spike_probe_topk, SPIKE_SRW_FIELD_COUNT))
+            return jnp.stack(merged, axis=0)
+
+        def spike_finalize_rows_paired(rows, raw_out, out,
+                                       global_den_cost_m,
+                                       global_gate_max_m, global_active_m,
+                                       no_active_direct):
+            finalized = []
+            model_offset = jax.lax.axis_index('model') * N_local
+            data_offset = jax.lax.axis_index('data') * B
+            for route_idx in range(2):
+                r = rows[route_idx]
+                local_b = r[:, 1].astype(jnp.int32)
+                pos = r[:, 2].astype(jnp.int32)
+                den_i = global_den_cost_m[local_b, pos, route_idx, 0]
+                top1_i = (
+                    global_gate_max_m[local_b, pos, route_idx, 0]
+                    / jnp.maximum(den_i, 1e-8))
+                active_i = global_active_m[local_b, pos, route_idx, 0]
+                no_active_i = no_active_direct[local_b, pos, route_idx, 0]
+                raw_out_i = jnp.linalg.norm(
+                    jax.lax.stop_gradient(
+                        raw_out[local_b, pos, route_idx]),
+                    axis=-1)
+                out_i = jnp.linalg.norm(
+                    jax.lax.stop_gradient(out[local_b, pos, route_idx]),
+                    axis=-1)
+                r = r.at[:, 1].set(r[:, 1] + data_offset)
+                r = r.at[:, 3].set(r[:, 3] + model_offset)
+                r = r.at[:, 11].set(den_i)
+                r = r.at[:, 12].set(r[:, 10] / jnp.maximum(den_i, 1e-8))
+                r = r.at[:, 13].set(top1_i)
+                r = r.at[:, 14].set(active_i)
+                r = r.at[:, 15].set(no_active_i)
+                r = r.at[:, 22].set(raw_out_i)
+                r = r.at[:, 23].set(out_i)
+                gathered = jax.lax.all_gather(r, 'model', axis=0)
+                gathered = jax.lax.all_gather(gathered, 'data', axis=0)
+                finalized.append(_topk_rows(
+                    gathered.reshape((-1, SPIKE_SRW_FIELD_COUNT)),
+                    _spike_probe_topk, SPIKE_SRW_FIELD_COUNT))
+            return jnp.stack(finalized, axis=0)
+
         # --- Pass 2: gate + srw fused ---
         if analysis:
             @jax.checkpoint
@@ -1392,7 +1700,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  total_exposure_max, total_weak_exposure_count,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count, total_selection_margin_reg,
-                 select_diag_carry, diag_vals) = carry
+                 select_diag_carry, diag_vals, spike_rows) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, intensity, rho_exposure = route_relation_and_intensity(
@@ -1439,6 +1747,21 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     diag_chunk = diag_chunk.at[:, 10].set(
                         jnp.repeat(_route_norm_max, 2))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
+                if _spike_probe:
+                    read_norm = jnp.linalg.norm(
+                        jax.lax.dynamic_slice_in_dim(
+                            read_bf, s, cs, axis=0).astype(jnp.float32),
+                        axis=-1)
+                    write_norm = jnp.linalg.norm(
+                        jax.lax.dynamic_slice_in_dim(
+                            write_bf, s, cs, axis=0).astype(jnp.float32),
+                        axis=-1)
+                    spike_rows = spike_merge_rows_paired(
+                        spike_rows,
+                        spike_chunk_rows_paired(
+                            s, rho, raw_tau, tau, selection_margin,
+                            positive_margin, intensity, gate, xr_f,
+                            read_norm, write_norm))
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_margin_band = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
@@ -1475,7 +1798,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         total_selection_residency_count + chunk_selection_residency_count,
                         total_selection_margin_reg + chunk_selection_margin_reg,
                         select_diag_carry,
-                        diag_vals), None
+                        diag_vals,
+                        spike_rows), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_margin_band, total_den_cost, total_selection_cost,
@@ -1483,9 +1807,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
              total_g_log_g, total_dead_penalty, total_dead_count,
               total_exposure_sum, total_exposure_min,
               total_exposure_max, total_weak_exposure_count,
-              total_int_max, total_int_cap_count, total_selection_residency_sum,
-              total_selection_residency_count, total_selection_margin_reg,
-              select_diag_carry, diag_vals), _ = jax.lax.scan(
+             total_int_max, total_int_cap_count, total_selection_residency_sum,
+             total_selection_residency_count, total_selection_margin_reg,
+             select_diag_carry, diag_vals, spike_rows), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
                  z1_r, z1_r, jnp.full((B, S, 2, 1), -1e9),
@@ -1496,9 +1820,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                   jnp.float32(0.0),
                   jnp.float32(0.0), jnp.float32(0.0),
                   jnp.float32(0.0),
-                  jnp.float32(0.0),
-                  select_diag_carry0,
-                  diag_vals_init),
+                 jnp.float32(0.0),
+                 select_diag_carry0,
+                 diag_vals_init,
+                 spike_rows_init),
                 jnp.arange(nc))
         else:
             @jax.checkpoint
@@ -1511,7 +1836,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  total_exposure_max, total_weak_exposure_count,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count, total_selection_margin_reg,
-                 select_diag_carry, diag_vals) = carry
+                 select_diag_carry, diag_vals, spike_rows) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, intensity, rho_exposure = route_relation_and_intensity(
@@ -1558,6 +1883,21 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     diag_chunk = diag_chunk.at[:, 10].set(
                         jnp.repeat(_route_norm_max, 2))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
+                if _spike_probe:
+                    read_norm = jnp.linalg.norm(
+                        jax.lax.dynamic_slice_in_dim(
+                            read_bf, s, cs, axis=0).astype(jnp.float32),
+                        axis=-1)
+                    write_norm = jnp.linalg.norm(
+                        jax.lax.dynamic_slice_in_dim(
+                            write_bf, s, cs, axis=0).astype(jnp.float32),
+                        axis=-1)
+                    spike_rows = spike_merge_rows_paired(
+                        spike_rows,
+                        spike_chunk_rows_paired(
+                            s, rho, raw_tau, tau, selection_margin,
+                            positive_margin, intensity, gate, xr_f,
+                            read_norm, write_norm))
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 (chunk_dead_penalty, chunk_dead_count,
@@ -1585,7 +1925,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         total_selection_residency_count + chunk_selection_residency_count,
                         total_selection_margin_reg + chunk_selection_margin_reg,
                         select_diag_carry,
-                        diag_vals), None
+                        diag_vals,
+                        spike_rows), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_den_cost, total_selection_cost, total_current_cost,
@@ -1594,7 +1935,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
               total_exposure_max, total_weak_exposure_count,
               total_int_max, total_int_cap_count, total_selection_residency_sum,
               total_selection_residency_count, total_selection_margin_reg,
-              select_diag_carry, diag_vals), _ = jax.lax.scan(
+              select_diag_carry, diag_vals, spike_rows), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
                  z1_r, z1_r, jnp.full((B, S, 2, 1), -1e9),
@@ -1606,7 +1947,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                   jnp.float32(0.0),
                   jnp.float32(0.0),
                   select_diag_carry0,
-                  diag_vals_init),
+                  diag_vals_init,
+                  spike_rows_init),
                 jnp.arange(nc))
 
         # Normalize per route independently
@@ -1785,9 +2127,16 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             local_diag_out = (
                 metric_vals.astype(jnp.float32), metric_locs,
                 top1_details, top1_locs)
+        spike_probe_out = ()
+        if _spike_probe:
+            spike_probe_out = (
+                spike_finalize_rows_paired(
+                    spike_rows, raw_out, out, global_den_cost_m,
+                    global_gate_max_m, global_active_m,
+                    no_active_direct).astype(jnp.float32),)
         if not analysis:
             return (slim_out + conc_out + route_split_out + select_diag_out
-                    + dead_exposure_diag_out + local_diag_out)
+                    + dead_exposure_diag_out + local_diag_out + spike_probe_out)
 
         # --- Analysis-only extras ---
         margin_band_frac = jax.lax.psum(total_margin_band, 'model') / N_total
@@ -1820,7 +2169,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                    gate_entropy, den_cost_out, selection_cost_out,
                    current_cost_out, rho_kurt, int_cap_frac_out)
                 + select_diag_out + dead_exposure_diag_out
-                + local_diag_out)
+                + local_diag_out + spike_probe_out)
 
     return fused_gate_srw_paired
 
@@ -1936,7 +2285,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_heads, d_model, n_layers,
                   router_dropout, dropout_rate, deterministic,
                   sharded_fns, analysis=False,
-                  local_diagnostics=False):
+                  local_diagnostics=False,
+                  spike_probe=False,
+                  spike_probe_topk=8):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -2019,9 +2370,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     qk_exposure_start = qk_select_start + SELECT_DIAG_COUNT
     qk_exposure_diag = qk_ret[
         qk_exposure_start:qk_exposure_start + DEAD_EXPOSURE_DIAG_COUNT]
+    if spike_probe:
+        qk_spike_rows = qk_ret[-1]
     if local_diagnostics:
+        _qk_local_tail = qk_ret[-5:-1] if spike_probe else qk_ret[-4:]
         (qk_local_values, qk_local_locs,
-         qk_top1_values, qk_top1_locs) = qk_ret[-4:]
+         qk_top1_values, qk_top1_locs) = _qk_local_tail
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
     v_ret = fused_single_v(x, h_V, v_emb_unit, raw_tau_all[:, :, 2:3],
@@ -2046,9 +2400,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     v_exposure_start = v_select_start + SELECT_DIAG_COUNT
     v_exposure_diag = v_ret[
         v_exposure_start:v_exposure_start + DEAD_EXPOSURE_DIAG_COUNT]
+    if spike_probe:
+        v_spike_rows = v_ret[-1]
     if local_diagnostics:
+        _v_local_tail = v_ret[-5:-1] if spike_probe else v_ret[-4:]
         (v_local_values, v_local_locs,
-         v_top1_values, v_top1_locs) = v_ret[-4:]
+         v_top1_values, v_top1_locs) = _v_local_tail
     V = V * v_scale
 
     d_head = d_model // n_heads
@@ -2058,6 +2415,76 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     scale = jnp.sqrt(jnp.float32(d_head))
     rng, rng_attn_drop = jax.random.split(rng)
+    _spike_probe_topk = max(1, int(spike_probe_topk))
+
+    def _attention_spike_rows(attn_scores, attn_w, out_dbg):
+        scores_sg = jax.lax.stop_gradient(attn_scores.astype(jnp.float32))
+        score_floor = jnp.finfo(scores_sg.dtype).min
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        causal_4d = causal[None, None, :, :]
+        masked_scores = jnp.where(causal_4d, scores_sg, score_floor)
+        top1_logits = jnp.max(masked_scores, axis=-1)
+        min_logits = jnp.min(jnp.where(causal_4d, scores_sg, jnp.inf), axis=-1)
+        key_idx = jnp.argmax(masked_scores, axis=-1)
+        attn_idx = jnp.arange(S)
+        second_scores = jnp.where(
+            attn_idx[None, None, None, :] == key_idx[..., None],
+            score_floor,
+            masked_scores)
+        top2_logits = jnp.max(second_scores, axis=-1)
+        has_top2 = (jnp.arange(S) + 1) > 1
+        top2_logits = jnp.where(
+            has_top2[None, None, :], top2_logits, top1_logits)
+        gap = top1_logits - top2_logits
+        attn_w_sg = jax.lax.stop_gradient(attn_w.astype(jnp.float32))
+        top1_w = jnp.max(attn_w_sg, axis=-1)
+        entropy_terms = jnp.where(
+            attn_w_sg > 0.0,
+            attn_w_sg * jnp.log(jnp.maximum(attn_w_sg, 1e-30)),
+            0.0)
+        entropy = -jnp.sum(entropy_terms, axis=-1)
+        q_norms = jnp.linalg.norm(jax.lax.stop_gradient(Q), axis=-1)
+        k_norms = jnp.linalg.norm(jax.lax.stop_gradient(K), axis=-1)
+        v_norms = jnp.linalg.norm(jax.lax.stop_gradient(V), axis=-1)
+        k_norm_i = jnp.take_along_axis(
+            k_norms, key_idx[..., None], axis=-1).squeeze(-1)
+        v_norm_i = jnp.take_along_axis(
+            v_norms, key_idx[..., None], axis=-1).squeeze(-1)
+        o_in_norm = jnp.linalg.norm(
+            jax.lax.stop_gradient(out_dbg), axis=-1)
+        score = jnp.maximum(
+            jnp.abs(top1_logits),
+            jnp.maximum(top1_w * jnp.float32(10.0), o_in_norm))
+        flat_score = score.reshape((-1,))
+        local_k = min(_spike_probe_topk, int(flat_score.shape[0]))
+        top_scores, flat_idx = jax.lax.top_k(flat_score, local_k)
+        b_idx = flat_idx // (n_heads * S)
+        rem = flat_idx - b_idx * (n_heads * S)
+        h_idx = rem // S
+        q_idx = rem - h_idx * S
+        rows = jnp.stack([
+            top_scores,
+            b_idx.astype(jnp.float32),
+            q_idx.astype(jnp.float32),
+            key_idx[b_idx, h_idx, q_idx].astype(jnp.float32),
+            top1_logits[b_idx, h_idx, q_idx],
+            min_logits[b_idx, h_idx, q_idx],
+            gap[b_idx, h_idx, q_idx],
+            top1_w[b_idx, h_idx, q_idx],
+            entropy[b_idx, h_idx, q_idx],
+            q_norms[b_idx, h_idx, q_idx],
+            k_norm_i[b_idx, h_idx, q_idx],
+            v_norm_i[b_idx, h_idx, q_idx],
+            o_in_norm[b_idx, h_idx, q_idx],
+            jnp.zeros_like(top_scores),
+        ], axis=-1).astype(jnp.float32)
+        if local_k < _spike_probe_topk:
+            pad = jnp.full(
+                (_spike_probe_topk - local_k, SPIKE_ATTN_FIELD_COUNT),
+                -jnp.inf, dtype=jnp.float32)
+            pad = pad.at[:, 1:4].set(0.0)
+            rows = jnp.concatenate([rows, pad], axis=0)
+        return rows
 
     @jax.checkpoint
     def _attn_scores(Q, K, V, rng_drop):
@@ -2114,6 +2541,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             softmax_top1_max = jnp.max(attn_w)
         attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
         out_dbg = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+        if spike_probe:
+            attn_rows = _attention_spike_rows(attn_scores, attn_w, out_dbg)
         if analysis:
             return (
                 out_dbg,
@@ -2125,9 +2554,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             )
         if local_diagnostics:
             return out_dbg, attn_logit_max_dbg, softmax_top1_max
+        if spike_probe:
+            return out_dbg, attn_rows
         return out_dbg
 
-    if analysis or local_diagnostics:
+    if analysis or local_diagnostics or spike_probe:
         q_norms_dbg = jnp.linalg.norm(Q, axis=-1)
         k_norms_dbg = jnp.linalg.norm(K, axis=-1)
         v_norms_dbg = jnp.linalg.norm(V, axis=-1)
@@ -2150,9 +2581,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     elif local_diagnostics:
         out, attn_logit_max_actual, attn_softmax_top1_max = _attn_scores(
             Q, K, V, rng_attn_drop)
+    elif spike_probe:
+        out, attn_spike_rows = _attn_scores(Q, K, V, rng_attn_drop)
     else:
         out = _attn_scores(Q, K, V, rng_attn_drop)
-    if analysis or local_diagnostics:
+    if analysis or local_diagnostics or spike_probe:
         o_input_norm = jnp.linalg.norm(out, axis=-1).mean()
         if local_diagnostics and not analysis:
             q_norm_max = q_norms_dbg.max()
@@ -2162,8 +2595,14 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
     attn_out_norm = jnp.linalg.norm(out, axis=-1).mean()
-    if analysis or local_diagnostics:
+    if analysis or local_diagnostics or spike_probe:
         o_out_norm_max = jnp.linalg.norm(out, axis=-1).max()
+    if spike_probe:
+        _row_b = attn_spike_rows[:, 1].astype(jnp.int32)
+        _row_q = attn_spike_rows[:, 2].astype(jnp.int32)
+        _o_out_by_token = jnp.linalg.norm(out, axis=-1)
+        attn_spike_rows = attn_spike_rows.at[:, 13].set(
+            _o_out_by_token[_row_b, _row_q])
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
@@ -2307,6 +2746,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_local_values, attn_local_locs,
                 attn_top1_values, attn_top1_locs,
             )
+        if spike_probe:
+            ret = ret + (
+                jnp.concatenate([qk_spike_rows, v_spike_rows], axis=0),
+                attn_spike_rows,
+                o_out_norm_max.astype(jnp.float32),
+            )
         return ret
 
     attn_qk_margin_band = qk_margin_band.mean()
@@ -2356,6 +2801,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             attn_local_values, attn_local_locs,
             attn_top1_values, attn_top1_locs,
         )
+    if spike_probe:
+        analysis_ret = analysis_ret + (
+            jnp.concatenate([qk_spike_rows, v_spike_rows], axis=0),
+            attn_spike_rows,
+            o_out_norm_max.astype(jnp.float32),
+        )
     return analysis_ret
 
 
@@ -2363,6 +2814,8 @@ def _rst_forward(x, pool_params, router_params, rng,
                   router_dropout, dropout_rate, deterministic,
                   sharded_fns, analysis=False,
                   local_diagnostics=False,
+                  spike_probe=False,
+                  spike_probe_topk=8,
                   d_model=None, n_layers=None):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
@@ -2420,11 +2873,15 @@ def _rst_forward(x, pool_params, router_params, rng,
     rst_exposure_start = rst_select_start + SELECT_DIAG_COUNT
     rst_exposure_diag = rst_ret[
         rst_exposure_start:rst_exposure_start + DEAD_EXPOSURE_DIAG_COUNT]
+    if spike_probe:
+        rst_spike_rows = rst_ret[-1]
     if local_diagnostics:
+        _rst_local_tail = rst_ret[-5:-1] if spike_probe else rst_ret[-4:]
         (rst_local_values, rst_local_locs,
-         rst_top1_values, rst_top1_locs) = rst_ret[-4:]
+         rst_top1_values, rst_top1_locs) = _rst_local_tail
     out = out * rst_scale
     rst_out_norm = jnp.linalg.norm(out, axis=-1).mean()
+    rst_out_norm_max = jnp.linalg.norm(out, axis=-1).max()
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
@@ -2464,6 +2921,11 @@ def _rst_forward(x, pool_params, router_params, rng,
                 rst_local_values, rst_local_locs,
                 rst_top1_values, rst_top1_locs,
             )
+        if spike_probe:
+            ret = ret + (
+                rst_spike_rows,
+                rst_out_norm_max.astype(jnp.float32),
+            )
         return ret
 
     rst_margin_band = margin_band_frac.mean()
@@ -2483,6 +2945,11 @@ def _rst_forward(x, pool_params, router_params, rng,
         analysis_ret = analysis_ret + (
             rst_local_values, rst_local_locs,
             rst_top1_values, rst_top1_locs,
+        )
+    if spike_probe:
+        analysis_ret = analysis_ret + (
+            rst_spike_rows,
+            rst_out_norm_max.astype(jnp.float32),
         )
     return analysis_ret
 
@@ -2602,7 +3069,8 @@ class DAWN(nn.Module):
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
                  deterministic=False, sharded_fns=None, analysis=False,
-                 local_diagnostics=False):
+                 local_diagnostics=False, spike_probe=False,
+                 spike_probe_topk=8):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -2781,7 +3249,9 @@ class DAWN(nn.Module):
                     self.n_heads, self.d_model, self.n_layers,
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
-                    local_diagnostics=local_diagnostics)
+                    local_diagnostics=local_diagnostics,
+                    spike_probe=spike_probe,
+                    spike_probe_topk=spike_probe_topk)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -2832,10 +3302,18 @@ class DAWN(nn.Module):
                       a_softmax_entropy_mean, a_softmax_entropy_min,
                       a_o_input_norm_max, a_o_out_norm_max) = attn_ret[63:100]
                 if local_diagnostics:
+                    _a_local_tail = attn_ret[-8:-3] if spike_probe else attn_ret[-5:]
                     (a_attn_local_layer_values,
                      a_attn_local_values, a_attn_local_locs,
-                     a_attn_top1_values, a_attn_top1_locs) = attn_ret[-5:]
+                     a_attn_top1_values, a_attn_top1_locs) = _a_local_tail
+                if spike_probe:
+                    (a_spike_srw_rows,
+                     a_spike_attn_rows,
+                     a_out_norm_max) = attn_ret[-3:]
                 x = x + attn_out
+                if spike_probe:
+                    a_resid_norm_max = jnp.linalg.norm(
+                        jax.lax.stop_gradient(x), axis=-1).max()
 
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
@@ -2844,6 +3322,8 @@ class DAWN(nn.Module):
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
                     local_diagnostics=local_diagnostics,
+                    spike_probe=spike_probe,
+                    spike_probe_topk=spike_probe_topk,
                     d_model=self.d_model, n_layers=self.n_layers)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
@@ -2876,9 +3356,16 @@ class DAWN(nn.Module):
                       k_emb_n_max, k_rho_kurt, k_margin_band,
                       k_int_cap_frac) = rst_ret[51:66]
                 if local_diagnostics:
+                    _k_local_tail = rst_ret[-6:-2] if spike_probe else rst_ret[-4:]
                     (k_local_values, k_local_locs,
-                     k_top1_values, k_top1_locs) = rst_ret[-4:]
+                     k_top1_values, k_top1_locs) = _k_local_tail
+                if spike_probe:
+                    (k_spike_srw_rows,
+                     k_out_norm_max) = rst_ret[-2:]
                 x = x + rst_out
+                if spike_probe:
+                    k_resid_norm_max = jnp.linalg.norm(
+                        jax.lax.stop_gradient(x), axis=-1).max()
 
                 slim_ys = (attn_aux, rst_aux,
                            k_active, k_raw_gmax, k_sstd, k_gsum, k_active_n_mean,
@@ -2950,6 +3437,16 @@ class DAWN(nn.Module):
                             k_local_values, k_local_locs,
                             k_top1_values, k_top1_locs,
                         )
+                    if spike_probe:
+                        slim_ys = slim_ys + (
+                            a_spike_srw_rows,
+                            a_spike_attn_rows,
+                            k_spike_srw_rows,
+                            a_out_norm_max,
+                            k_out_norm_max,
+                            a_resid_norm_max,
+                            k_resid_norm_max,
+                        )
                     return x, slim_ys
                 analysis_ys = slim_ys + (
                     a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
@@ -2984,6 +3481,16 @@ class DAWN(nn.Module):
                         a_attn_top1_values, a_attn_top1_locs,
                         k_local_values, k_local_locs,
                         k_top1_values, k_top1_locs,
+                    )
+                if spike_probe:
+                    analysis_ys = analysis_ys + (
+                        a_spike_srw_rows,
+                        a_spike_attn_rows,
+                        k_spike_srw_rows,
+                        a_out_norm_max,
+                        k_out_norm_max,
+                        a_resid_norm_max,
+                        k_resid_norm_max,
                     )
                 return x, analysis_ys
 
@@ -3100,6 +3607,16 @@ class DAWN(nn.Module):
                  rst_top1_values_all, rst_top1_locs_all) = scan_ys[
                     _scan_offset:_scan_offset + 9]
                 _scan_offset += 9
+            if spike_probe:
+                (spike_attn_srw_rows_all,
+                 spike_attn_rows_all,
+                 spike_rst_srw_rows_all,
+                 spike_layer_attn_out_norm_max_all,
+                 spike_layer_rst_out_norm_max_all,
+                 spike_layer_resid_norm_max_after_attn_all,
+                 spike_layer_resid_norm_max_after_rst_all) = scan_ys[
+                    _scan_offset:_scan_offset + 7]
+                _scan_offset += 7
             # Aux is averaged over layers after attention and RST terms are
             # collected.  Attention keeps historical Q/K/V scaling upstream.
             total_aux = (attn_auxes + rst_auxes).mean()
@@ -3500,6 +4017,24 @@ class DAWN(nn.Module):
                     rst_top1_locs_all,
                 ], axis=1),
             })
+        if spike_probe and not self.is_initializing():
+            result.update({
+                'spike_srw_top': jnp.concatenate([
+                    spike_attn_srw_rows_all,
+                    spike_rst_srw_rows_all,
+                ], axis=1),
+                'spike_attention_top': spike_attn_rows_all,
+                'spike_layer_attn_out_norm_max': (
+                    spike_layer_attn_out_norm_max_all),
+                'spike_layer_rst_out_norm_max': (
+                    spike_layer_rst_out_norm_max_all),
+                'spike_layer_resid_norm_max_after_attn': (
+                    spike_layer_resid_norm_max_after_attn_all),
+                'spike_layer_resid_norm_max_after_rst': (
+                    spike_layer_resid_norm_max_after_rst_all),
+                'spike_layer_lm_logit_abs_proxy_if_available': jnp.zeros(
+                    (self.n_layers,), dtype=jnp.float32),
+            })
 
 
         if labels is not None:
@@ -3540,6 +4075,50 @@ class DAWN(nn.Module):
             # v4.1 explore: expose per-token CE + valid mask for RPE loss.
             result['per_token_ce'] = per_token_ce
             result['valid_mask'] = valid_mask
+            if spike_probe:
+                logits_f = (shift_x @ embedding_matrix.T).astype(jnp.float32)
+                pred_ids = jnp.argmax(logits_f, axis=-1).astype(jnp.int32)
+                max_logits = jnp.max(logits_f, axis=-1)
+                min_logits = jnp.min(logits_f, axis=-1)
+                pred_logits = jnp.take_along_axis(
+                    logits_f, pred_ids[..., None], axis=-1).squeeze(-1)
+                safe_targets = jnp.where(valid_mask, shift_labels, 0)
+                target_logits = jnp.take_along_axis(
+                    logits_f, safe_targets[..., None], axis=-1).squeeze(-1)
+                score = jnp.where(
+                    valid_mask, per_token_ce, jnp.float32(-jnp.inf))
+                flat_score = score.reshape((-1,))
+                _tok_k = min(max(1, int(spike_probe_topk)),
+                             int(flat_score.shape[0]))
+                top_scores, flat_idx = jax.lax.top_k(flat_score, _tok_k)
+                tok_b = flat_idx // (S - 1)
+                tok_pos = flat_idx - tok_b * (S - 1)
+                rows = jnp.stack([
+                    jnp.arange(_tok_k, dtype=jnp.float32),
+                    tok_b.astype(jnp.float32),
+                    tok_pos.astype(jnp.float32),
+                    input_ids[tok_b, tok_pos].astype(jnp.float32),
+                    safe_targets[tok_b, tok_pos].astype(jnp.float32),
+                    pred_ids[tok_b, tok_pos].astype(jnp.float32),
+                    top_scores,
+                    target_logits[tok_b, tok_pos],
+                    pred_logits[tok_b, tok_pos],
+                    max_logits[tok_b, tok_pos],
+                    min_logits[tok_b, tok_pos],
+                    jnp.maximum(
+                        jnp.abs(max_logits[tok_b, tok_pos]),
+                        jnp.abs(min_logits[tok_b, tok_pos])),
+                    pred_logits[tok_b, tok_pos]
+                    - target_logits[tok_b, tok_pos],
+                ], axis=-1).astype(jnp.float32)
+                if _tok_k < int(spike_probe_topk):
+                    pad = jnp.full(
+                        (int(spike_probe_topk) - _tok_k,
+                         SPIKE_TOKEN_FIELD_COUNT),
+                        -jnp.inf, dtype=jnp.float32)
+                    pad = pad.at[:, 1:6].set(0.0)
+                    rows = jnp.concatenate([rows, pad], axis=0)
+                result['spike_top_token_ce'] = rows
         else:
             result['logits'] = self.token_emb.attend(x)
 

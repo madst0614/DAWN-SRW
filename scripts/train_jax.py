@@ -122,6 +122,24 @@ LOCAL_TOP1_FIELD_NAMES = (
 ATTN_LOCAL_FIELD_NAMES = (
     'q_norm_max', 'k_norm_max', 'v_norm_max', 'attn_logit_max',
     'softmax_top1_max', 'o_in_norm_max', 'o_out_norm_max')
+SPIKE_SRW_FIELD_NAMES = (
+    'score', 'batch', 'pos', 'neuron_global_id', 'rho', 'raw_tau', 'tau',
+    'margin', 'positive_margin', 'intensity', 'gate_raw', 'gate_den',
+    'gate_share', 'top1_share_for_token', 'active_n_for_token',
+    'no_active_for_token', 'read_scalar_xr', 'abs_read_scalar_xr',
+    'read_norm', 'write_norm', 'op_gain', 'contrib_proxy',
+    'raw_out_norm_for_token', 'out_norm_for_token', 'resid_norm_for_token',
+    'h_norm_for_token')
+SPIKE_ATTN_FIELD_NAMES = (
+    'score', 'batch', 'query_pos', 'key_pos', 'attn_logit_max',
+    'attn_logit_min', 'attn_logit_gap_top1_top2', 'attn_top1_weight',
+    'attn_entropy', 'q_norm', 'k_norm', 'v_norm',
+    'attn_o_input_norm', 'attn_o_output_norm')
+SPIKE_TOKEN_FIELD_NAMES = (
+    'rank', 'batch', 'pos', 'input_token_id', 'target_token_id',
+    'pred_token_id', 'token_ce', 'target_logit', 'pred_logit',
+    'max_logit', 'min_logit', 'logit_abs_max',
+    'logit_gap_pred_minus_target')
 
 DIRECT_TAU_SELECT_METRIC_NAMES = (
     'rho_mean', 'rho_std', 'rho_max',
@@ -544,12 +562,15 @@ def _v415_sharded_kwargs(cfg):
             dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
         )
     elif version == 'spatial-r1-v4.1.6.1':
+        # CB1A is fixed-on and auxiliary-only for 4161. These are no longer
+        # public config knobs: enabled=True, tau/anchor stopgrad=True,
+        # forward_influence=False. Keep only eps configurable.
         kw = dict(
             dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
-            cb1a_enabled=bool(t.get('cb1a_enabled', True)),
-            cb1a_tau_stopgrad=bool(t.get('cb1a_tau_stopgrad', True)),
-            cb1a_anchor_stopgrad=bool(t.get('cb1a_anchor_stopgrad', True)),
-            cb1a_forward_influence=bool(t.get('cb1a_forward_influence', False)),
+            cb1a_enabled=True,
+            cb1a_tau_stopgrad=True,
+            cb1a_anchor_stopgrad=True,
+            cb1a_forward_influence=False,
             cb1a_eps=float(t.get('cb1a_eps', 1.0e-8)),
         )
     else:
@@ -1076,6 +1097,15 @@ def _model_accepts_local_diagnostics(model):
     import inspect as _inspect
     try:
         return 'local_diagnostics' in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _model_accepts_spike_probe(model):
+    """Return True if model.__call__ accepts the event-triggered probe path."""
+    import inspect as _inspect
+    try:
+        return 'spike_probe' in _inspect.signature(model.__call__).parameters
     except (TypeError, ValueError):
         return False
 
@@ -3487,6 +3517,66 @@ def create_debug_forward_step(model, sharded_fns=None, drop_compare=False):
     return debug_forward_step
 
 
+def create_spike_probe_step(model, sharded_fns=None, topk=8):
+    """Event-only forward probe. No gradients, no optimizer updates."""
+    _pass_analysis_kw = _model_accepts_analysis(model)
+    _pass_spike_kw = _model_accepts_spike_probe(model)
+    _topk = int(topk)
+
+    @jax.jit
+    def spike_probe_step(params, input_ids, attention_mask, dropout_key):
+        labels = jnp.where(attention_mask == 1, input_ids, -100)
+        extra_kw = {}
+        if sharded_fns is not None:
+            extra_kw['sharded_fns'] = sharded_fns
+        if _pass_analysis_kw:
+            extra_kw['analysis'] = False
+        if _pass_spike_kw:
+            extra_kw['spike_probe'] = True
+            extra_kw['spike_probe_topk'] = _topk
+        result = model.apply(
+            {'params': params},
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            deterministic=False,
+            rngs={'dropout': dropout_key},
+            **extra_kw,
+        )
+        return {
+            'spike_top_token_ce': result.get(
+                'spike_top_token_ce',
+                jnp.full((_topk, len(SPIKE_TOKEN_FIELD_NAMES)),
+                         -jnp.inf, dtype=jnp.float32)),
+            'spike_srw_top': result.get(
+                'spike_srw_top',
+                jnp.full((1, len(LOCAL_SPIKE_POOL_NAMES), _topk,
+                          len(SPIKE_SRW_FIELD_NAMES)),
+                         -jnp.inf, dtype=jnp.float32)),
+            'spike_attention_top': result.get(
+                'spike_attention_top',
+                jnp.full((1, _topk, len(SPIKE_ATTN_FIELD_NAMES)),
+                         -jnp.inf, dtype=jnp.float32)),
+            'spike_layer_attn_out_norm_max': result.get(
+                'spike_layer_attn_out_norm_max',
+                jnp.zeros((1,), dtype=jnp.float32)),
+            'spike_layer_rst_out_norm_max': result.get(
+                'spike_layer_rst_out_norm_max',
+                jnp.zeros((1,), dtype=jnp.float32)),
+            'spike_layer_resid_norm_max_after_attn': result.get(
+                'spike_layer_resid_norm_max_after_attn',
+                jnp.zeros((1,), dtype=jnp.float32)),
+            'spike_layer_resid_norm_max_after_rst': result.get(
+                'spike_layer_resid_norm_max_after_rst',
+                jnp.zeros((1,), dtype=jnp.float32)),
+            'spike_layer_lm_logit_abs_proxy_if_available': result.get(
+                'spike_layer_lm_logit_abs_proxy_if_available',
+                jnp.zeros((1,), dtype=jnp.float32)),
+        }
+
+    return spike_probe_step if _pass_spike_kw else None
+
+
 def create_geometry_step(max_sample=512):
     """Rare, observational geometry diagnostics on a deterministic row sample."""
     max_sample = int(max_sample)
@@ -4036,16 +4126,21 @@ _train_logger = None
 _jsonl_logger = None
 _debug_logger = None
 _debug_jsonl_logger = None
+_spike_logger = None
+_spike_jsonl_logger = None
 
 
 def _setup_loggers(training_log_file, jsonl_log_file, resume=False,
-                   debug_log_file=None, debug_jsonl_log_file=None):
+                   debug_log_file=None, debug_jsonl_log_file=None,
+                   spike_log_file=None, spike_jsonl_log_file=None,
+                   spike_resume=False):
     """Create GCSLogger instances for training/debug text + JSONL logs.
 
     resume=True downloads existing GCS content to the local scratch file
     first so new lines append rather than overwrite.
     """
     global _train_logger, _jsonl_logger, _debug_logger, _debug_jsonl_logger
+    global _spike_logger, _spike_jsonl_logger
     import tempfile
     tmpdir = Path(tempfile.gettempdir()) / "dawn_logs"
     tmpdir.mkdir(parents=True, exist_ok=True)
@@ -4084,6 +4179,29 @@ def _setup_loggers(training_log_file, jsonl_log_file, resume=False,
     else:
         _debug_jsonl_logger = None
 
+    if spike_log_file:
+        if _is_gcs(spike_log_file):
+            local_spike = str(tmpdir / Path(spike_log_file).name)
+            _spike_logger = GCSLogger(
+                spike_log_file, local_spike, resume=spike_resume)
+        else:
+            _spike_logger = GCSLogger(
+                None, spike_log_file, resume=spike_resume)
+    else:
+        _spike_logger = None
+
+    if spike_jsonl_log_file:
+        if _is_gcs(spike_jsonl_log_file):
+            local_spike_jsonl = str(tmpdir / Path(spike_jsonl_log_file).name)
+            _spike_jsonl_logger = GCSLogger(
+                spike_jsonl_log_file, local_spike_jsonl,
+                resume=spike_resume)
+        else:
+            _spike_jsonl_logger = GCSLogger(
+                None, spike_jsonl_log_file, resume=spike_resume)
+    else:
+        _spike_jsonl_logger = None
+
 
 def sync_logs():
     """Flush local logs to GCS. Call every FAST log for live visibility."""
@@ -4095,6 +4213,10 @@ def sync_logs():
         _debug_logger.sync()
     if _debug_jsonl_logger:
         _debug_jsonl_logger.sync()
+    if _spike_logger:
+        _spike_logger.sync()
+    if _spike_jsonl_logger:
+        _spike_jsonl_logger.sync()
 
 
 def log_message(msg, log_file=None):
@@ -4153,6 +4275,31 @@ def log_debug_jsonl(record):
         _debug_jsonl_logger.write(line + '\n')
     except Exception as e:
         print(f"  [warn] log_debug_jsonl write failed: {e}", flush=True)
+
+
+def log_spike_message(msg):
+    """Write to the spike event log only. Host 0 only."""
+    if jax.process_index() != 0:
+        return
+    if not _spike_logger:
+        return
+    try:
+        _spike_logger.write(msg + '\n')
+    except Exception as e:
+        print(f"  [warn] log_spike_message write failed: {e}", flush=True)
+
+
+def log_spike_jsonl(record):
+    """Append one structured spike event. Host 0 only."""
+    if jax.process_index() != 0:
+        return
+    if not _spike_jsonl_logger:
+        return
+    try:
+        line = json.dumps(record, default=str)
+        _spike_jsonl_logger.write(line + '\n')
+    except Exception as e:
+        print(f"  [warn] log_spike_jsonl write failed: {e}", flush=True)
 
 
 def _dead_pool_totals(ctx):
@@ -5821,6 +5968,411 @@ def _jsonable_diag_value(value):
     return value
 
 
+def _finite_float(value, default=0.0):
+    try:
+        out = float(value)
+    except Exception:
+        return default
+    return out if np.isfinite(out) else default
+
+
+def _spike_layer_max(value):
+    arr = np.asarray(_jsonable_diag_value(value), dtype=np.float32)
+    if arr.size == 0:
+        return 0.0
+    return _finite_float(np.nanmax(arr), 0.0)
+
+
+def _spike_history_record(raw, step, epoch, lr):
+    def _g(key, default=0.0):
+        return _finite_float(raw.get(key, default), default)
+
+    layer_attn = _jsonable_diag_value(
+        raw.get('per_layer_attn_out_norm', []))
+    layer_rst = _jsonable_diag_value(
+        raw.get('per_layer_rst_out_norm', []))
+    return {
+        'step': int(step),
+        'epoch': int(epoch),
+        'ce': _g('ce_loss'),
+        'loss': _g('total_loss'),
+        'grad_pre': _g('grad_global_preclip', _g('grad_norm')),
+        'grad_post': _g('grad_global_postclip'),
+        'lr': float(lr),
+        'active_n': {
+            'q': _g('attn_q_active_n_mean',
+                    _g('attn_qk_active_n_mean',
+                       _g('attn_active_n_mean'))),
+            'k': _g('attn_k_active_n_mean',
+                    _g('attn_qk_active_n_mean',
+                       _g('attn_active_n_mean'))),
+            'v': _g('attn_v_active_n_mean'),
+            'rst': _g('rst_active_n_mean'),
+        },
+        'no_active': {
+            'qk': _g('attn_qk_no_active_frac',
+                     _g('attn_no_active_frac')),
+            'v': _g('attn_v_no_active_frac',
+                    _g('attn_no_active_frac')),
+            'rst': _g('rst_no_active_frac'),
+        },
+        'top1_max': {
+            'qk': _g('attn_qk_top1_gate_frac_max',
+                     _g('attn_top1_gate_frac_max')),
+            'v': _g('attn_v_top1_gate_frac_max',
+                    _g('attn_top1_gate_frac_max')),
+            'rst': _g('rst_top1_gate_frac_max'),
+        },
+        'den': {
+            'qk': _g('attn_qk_gate_den_sum_mean',
+                     _g('attn_gate_den_sum_mean')),
+            'v': _g('attn_v_gate_den_sum_mean',
+                    _g('attn_gate_den_sum_mean')),
+            'rst': _g('rst_gate_den_sum_mean'),
+        },
+        'lm_logit_abs_max': _g('debug_logit_max'),
+        'layer_attn_max': _spike_layer_max(layer_attn),
+        'layer_rst_max': _spike_layer_max(layer_rst),
+        'grad_group_summary': {
+            'token_emb': _g('grad_token_emb'),
+            'pos_emb': _g('grad_pos_emb'),
+            'router_proj_attn': _g('grad_router_proj_attn'),
+            'router_proj_rst': _g('grad_router_proj_rst'),
+            'raw_tau_qk': _g('grad_router_raw_tau_qk'),
+            'raw_tau_v': _g('grad_router_raw_tau_v'),
+            'raw_tau_rst': _g('grad_router_raw_tau_rst'),
+            'qk_rw': [_g('grad_pool_attn_qk_read'),
+                      _g('grad_pool_attn_qk_write')],
+            'v_rw': [_g('grad_pool_attn_v_read'),
+                     _g('grad_pool_attn_v_write')],
+            'rst_rw': [_g('grad_pool_rst_read'),
+                       _g('grad_pool_rst_write')],
+            'expand_O': _g('grad_expand_O'),
+            'layernorm': _g('grad_layernorms'),
+        },
+    }
+
+
+def _spike_grad_evidence(raw):
+    def _g(key, default=0.0):
+        return _finite_float(raw.get(key, default), default)
+
+    return {
+        'grad_global_pre': _g('grad_global_preclip', _g('grad_norm')),
+        'grad_global_post': _g('grad_global_postclip'),
+        'token_emb_grad': _g('grad_token_emb'),
+        'pos_emb_grad': _g('grad_pos_emb'),
+        'router_proj_attn_grad': _g('grad_router_proj_attn'),
+        'router_proj_rst_grad': _g('grad_router_proj_rst'),
+        'raw_tau_qk_grad': _g('grad_router_raw_tau_qk'),
+        'raw_tau_v_grad': _g('grad_router_raw_tau_v'),
+        'raw_tau_rst_grad': _g('grad_router_raw_tau_rst'),
+        'qk_rw_read_grad': _g('grad_pool_attn_qk_read'),
+        'qk_rw_write_grad': _g('grad_pool_attn_qk_write'),
+        'v_rw_read_grad': _g('grad_pool_attn_v_read'),
+        'v_rw_write_grad': _g('grad_pool_attn_v_write'),
+        'rst_rw_read_grad': _g('grad_pool_rst_read'),
+        'rst_rw_write_grad': _g('grad_pool_rst_write'),
+        'expand_O_grad_by_layer': _jsonable_diag_value(
+            raw.get('grad_expand_O_per_layer', [])),
+        'layernorm_grad_by_layer': _jsonable_diag_value(
+            raw.get('grad_layernorms_per_layer', [])),
+    }
+
+
+def _decode_spike_rows(rows, field_names, int_fields=()):
+    arr = np.asarray(rows, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    out = []
+    for row in arr:
+        if row.size < len(field_names):
+            continue
+        score = row[0]
+        if not np.isfinite(score) or score <= -1.0e20:
+            continue
+        item = {}
+        for idx, name in enumerate(field_names):
+            val = row[idx]
+            if name in int_fields:
+                item[name] = int(round(float(val)))
+            elif name == 'no_active_for_token':
+                item[name] = bool(float(val) >= 0.5)
+            else:
+                item[name] = _finite_float(val)
+        out.append(item)
+    return out
+
+
+def _decode_spike_probe(probe_raw):
+    if not probe_raw:
+        return {}
+    token_rows = _decode_spike_rows(
+        probe_raw.get('spike_top_token_ce', []),
+        SPIKE_TOKEN_FIELD_NAMES,
+        int_fields={
+            'rank', 'batch', 'pos', 'input_token_id',
+            'target_token_id', 'pred_token_id',
+        })
+    srw_rows = []
+    srw_arr = np.asarray(
+        probe_raw.get('spike_srw_top', []), dtype=np.float64)
+    if srw_arr.ndim == 4:
+        for layer in range(srw_arr.shape[0]):
+            for pool_idx, pool in enumerate(LOCAL_SPIKE_POOL_NAMES):
+                decoded = _decode_spike_rows(
+                    srw_arr[layer, pool_idx],
+                    SPIKE_SRW_FIELD_NAMES,
+                    int_fields={'batch', 'pos', 'neuron_global_id'})
+                for rank, item in enumerate(decoded):
+                    item['rank'] = int(rank)
+                    item['layer'] = int(layer)
+                    item['pool'] = pool
+                    item.pop('score', None)
+                    srw_rows.append(item)
+    attn_rows = []
+    attn_arr = np.asarray(
+        probe_raw.get('spike_attention_top', []), dtype=np.float64)
+    if attn_arr.ndim == 3:
+        for layer in range(attn_arr.shape[0]):
+            decoded = _decode_spike_rows(
+                attn_arr[layer],
+                SPIKE_ATTN_FIELD_NAMES,
+                int_fields={'batch', 'query_pos', 'key_pos'})
+            for rank, item in enumerate(decoded):
+                item['rank'] = int(rank)
+                item['layer'] = int(layer)
+                item.pop('score', None)
+                attn_rows.append(item)
+    return {
+        'top_token_ce': token_rows,
+        'srw_top_contributors': srw_rows,
+        'attention_top': attn_rows,
+        'layer_forward_norms': {
+            'layer_attn_out_norm_max': _jsonable_diag_value(
+                probe_raw.get('spike_layer_attn_out_norm_max', [])),
+            'layer_rst_out_norm_max': _jsonable_diag_value(
+                probe_raw.get('spike_layer_rst_out_norm_max', [])),
+            'layer_resid_norm_max_after_attn': _jsonable_diag_value(
+                probe_raw.get('spike_layer_resid_norm_max_after_attn', [])),
+            'layer_resid_norm_max_after_rst': _jsonable_diag_value(
+                probe_raw.get('spike_layer_resid_norm_max_after_rst', [])),
+            'layer_lm_logit_abs_proxy_if_available': _jsonable_diag_value(
+                probe_raw.get(
+                    'spike_layer_lm_logit_abs_proxy_if_available', [])),
+        },
+    }
+
+
+def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
+    def _g(key, default=0.0):
+        return _finite_float(metrics_rec.get(key, default), default)
+
+    top_token = max(
+        probe.get('top_token_ce', []),
+        key=lambda r: r.get('token_ce', 0.0),
+        default={})
+    top_srw = max(
+        probe.get('srw_top_contributors', []),
+        key=lambda r: r.get('contrib_proxy', 0.0),
+        default={})
+    top_attn = max(
+        probe.get('attention_top', []),
+        key=lambda r: max(r.get('attn_top1_weight', 0.0) * 10.0,
+                          abs(r.get('attn_logit_max', 0.0)),
+                          r.get('attn_o_output_norm', 0.0)),
+        default={})
+    ce = _g('ce')
+    grad = _g('grad_pre')
+    logit_abs = _g('lm_logit_abs_max')
+    layer_rst_max = _g('layer_rst_max')
+    intensity_bound = float(np.exp(float(ctx.get('intensity_beta', 0.0))))
+    evidence = []
+    secondary = []
+    not_primary = []
+
+    trigger_bits = []
+    if grad > thresholds['spike_grad_threshold']:
+        trigger_bits.append(
+            f"grad_global_pre={grad:.4g} > threshold={thresholds['spike_grad_threshold']:.4g}")
+    if ce > thresholds['spike_ce_threshold']:
+        trigger_bits.append(
+            f"ce_loss={ce:.4g} > threshold={thresholds['spike_ce_threshold']:.4g}")
+    if logit_abs > thresholds['spike_logit_abs_threshold']:
+        trigger_bits.append(
+            f"lm_logit_abs_max={logit_abs:.4g} > threshold={thresholds['spike_logit_abs_threshold']:.4g}")
+    if layer_rst_max > thresholds['spike_rst_out_threshold']:
+        trigger_bits.append(
+            f"layer_rst_max={layer_rst_max:.4g} > threshold={thresholds['spike_rst_out_threshold']:.4g}")
+    evidence.extend(trigger_bits)
+
+    top_ce = top_token.get('token_ce', 0.0)
+    srw_contrib = top_srw.get('contrib_proxy', 0.0)
+    srw_gate_share = max(
+        top_srw.get('gate_share', 0.0),
+        top_srw.get('top1_share_for_token', 0.0))
+    srw_read = top_srw.get('abs_read_scalar_xr', 0.0)
+    srw_intensity = top_srw.get('intensity', 0.0)
+    srw_margin = abs(top_srw.get('margin', 1.0))
+    srw_large = srw_contrib >= max(
+        2.0, thresholds['spike_rst_out_threshold'] * 0.25)
+    attn_top1 = top_attn.get('attn_top1_weight', 0.0)
+    attn_entropy = top_attn.get('attn_entropy', 99.0)
+    attn_out = top_attn.get('attn_o_output_norm', 0.0)
+
+    primary = 'unclassified_spike'
+    confidence = 'medium'
+    if logit_abs > thresholds['spike_logit_abs_threshold']:
+        primary = 'logit_output_scale_spike'
+        evidence.append(f"lm_logit_abs_max={logit_abs:.4g}")
+    elif (attn_top1 >= 0.98 and attn_entropy <= 0.15
+          and attn_out >= thresholds['spike_rst_out_threshold']):
+        primary = 'attention_top1_collapse'
+        evidence.append(
+            f"attention layer={top_attn.get('layer')} query=(b={top_attn.get('batch')},pos={top_attn.get('query_pos')}) top1={attn_top1:.4f} entropy={attn_entropy:.4f} out={attn_out:.4g}")
+        confidence = 'high'
+    elif srw_large and srw_gate_share >= 0.95:
+        primary = 'srw_top1_contribution_spike'
+        evidence.append(
+            f"top SRW culprit pool={top_srw.get('pool')} layer={top_srw.get('layer')} token=(b={top_srw.get('batch')},pos={top_srw.get('pos')})")
+        evidence.append(
+            f"gate_share={top_srw.get('gate_share', 0.0):.4f}, top1_share={top_srw.get('top1_share_for_token', 0.0):.4f}")
+        evidence.append(
+            f"read_scalar_xr={top_srw.get('read_scalar_xr', 0.0):.4g}, contrib_proxy={srw_contrib:.4g}")
+        confidence = 'high'
+        if srw_read >= max(10.0, srw_contrib * 0.5):
+            secondary.append('srw_read_scalar_spike')
+        if intensity_bound > 0 and srw_intensity >= intensity_bound * 0.90:
+            secondary.append('srw_intensity_spike')
+        if srw_margin <= 1.0e-3:
+            secondary.append('tau_margin_boundary_spike')
+        if top_srw.get('no_active_for_token', False):
+            secondary.append('no_active_noop_boundary_spike')
+            not_primary.append('no_active marked on the culprit token; treat as symptom unless history shows it first')
+    elif srw_large and srw_read >= max(10.0, srw_contrib * 0.5):
+        primary = 'srw_read_scalar_spike'
+        evidence.append(
+            f"read_scalar_xr={top_srw.get('read_scalar_xr', 0.0):.4g}, contrib_proxy={srw_contrib:.4g}")
+    elif srw_large and intensity_bound > 0 and srw_intensity >= intensity_bound * 0.90:
+        primary = 'srw_intensity_spike'
+        evidence.append(
+            f"intensity={srw_intensity:.4g} near exp(beta)={intensity_bound:.4g}")
+    elif srw_margin <= 1.0e-3 and srw_gate_share >= 0.5:
+        primary = 'tau_margin_boundary_spike'
+        evidence.append(
+            f"rho={top_srw.get('rho', 0.0):.6f}, tau={top_srw.get('tau', 0.0):.6f}, margin={top_srw.get('margin', 0.0):.6g}")
+    elif top_ce > max(thresholds['spike_ce_threshold'], ce * 2.0):
+        primary = 'hard_token_ce_spike'
+        evidence.append(
+            f"top token CE={top_ce:.4g} at b={top_token.get('batch')} pos={top_token.get('pos')}")
+    if top_ce > 0.0:
+        evidence.append(
+            f"token_ce={top_ce:.4g} target={top_token.get('target_token_id')} pred={top_token.get('pred_token_id')}")
+
+    grad_e = metrics_rec.get('grad_group_summary', {})
+    grad_global = max(_g('grad_pre'), 1e-8)
+    early = max(
+        _finite_float(grad_e.get('token_emb', 0.0)),
+        _finite_float(grad_e.get('pos_emb', 0.0)),
+        _finite_float(grad_e.get('expand_O', 0.0)))
+    if early / grad_global > 0.25:
+        secondary.append('output_to_early_path_backprop_spike')
+    if not secondary:
+        secondary.append('none_clear')
+    if not not_primary:
+        not_primary.append('raw_tau_grad was not dominant unless shown in grad_evidence')
+
+    return {
+        'primary': primary,
+        'confidence': confidence,
+        'evidence': evidence,
+        'secondary': secondary,
+        'not_primary': not_primary,
+    }
+
+
+def _format_spike_text(event):
+    m = event.get('metrics', {})
+    diag = event.get('diagnosis', {})
+    probe = event.get('probe', {})
+    lines = [
+        "=" * 88,
+        f"SPIKE EVENT step={event.get('step')} epoch={event.get('epoch')} reasons={','.join(event.get('trigger', {}).get('reasons', []))}",
+        f"loss={m.get('loss', 0.0):.6f} ce={m.get('ce', 0.0):.6f} grad_pre={m.get('grad_pre', 0.0):.6f} grad_post={m.get('grad_post', 0.0):.6f} lr={m.get('lr', 0.0):.3e}",
+        f"lm_logit_abs_max={m.get('lm_logit_abs_max', 0.0):.6f} layer_attn_max={m.get('layer_attn_max', 0.0):.6f} layer_rst_max={m.get('layer_rst_max', 0.0):.6f}",
+        f"diagnosis: primary={diag.get('primary')} confidence={diag.get('confidence')}",
+    ]
+    for item in diag.get('evidence', [])[:8]:
+        lines.append(f"  evidence: {item}")
+    token = (probe.get('top_token_ce') or [{}])[0]
+    if token:
+        lines.append(
+            "top_token_ce: "
+            f"rank={token.get('rank')} b={token.get('batch')} pos={token.get('pos')} "
+            f"in={token.get('input_token_id')} target={token.get('target_token_id')} "
+            f"pred={token.get('pred_token_id')} ce={token.get('token_ce', 0.0):.6f} "
+            f"target_logit={token.get('target_logit', 0.0):.6f} "
+            f"pred_logit={token.get('pred_logit', 0.0):.6f}")
+    srw = sorted(
+        probe.get('srw_top_contributors', []),
+        key=lambda r: r.get('contrib_proxy', 0.0),
+        reverse=True)
+    if srw:
+        row = srw[0]
+        lines.append(
+            "top_srw: "
+            f"layer={row.get('layer')} pool={row.get('pool')} "
+            f"b={row.get('batch')} pos={row.get('pos')} neuron={row.get('neuron_global_id')} "
+            f"contrib={row.get('contrib_proxy', 0.0):.6f} "
+            f"gate_share={row.get('gate_share', 0.0):.6f} "
+            f"top1={row.get('top1_share_for_token', 0.0):.6f} "
+            f"xr={row.get('read_scalar_xr', 0.0):.6f} "
+            f"int={row.get('intensity', 0.0):.6f} "
+            f"rho={row.get('rho', 0.0):.6f} tau={row.get('tau', 0.0):.6f} "
+            f"margin={row.get('margin', 0.0):.6f}")
+    attn = sorted(
+        probe.get('attention_top', []),
+        key=lambda r: max(r.get('attn_top1_weight', 0.0) * 10.0,
+                          abs(r.get('attn_logit_max', 0.0)),
+                          r.get('attn_o_output_norm', 0.0)),
+        reverse=True)
+    if attn:
+        row = attn[0]
+        lines.append(
+            "top_attention: "
+            f"layer={row.get('layer')} b={row.get('batch')} "
+            f"q={row.get('query_pos')} k={row.get('key_pos')} "
+            f"logit_max={row.get('attn_logit_max', 0.0):.6f} "
+            f"gap={row.get('attn_logit_gap_top1_top2', 0.0):.6f} "
+            f"top1={row.get('attn_top1_weight', 0.0):.6f} "
+            f"entropy={row.get('attn_entropy', 0.0):.6f} "
+            f"o_out={row.get('attn_o_output_norm', 0.0):.6f}")
+    lines.append("grad_evidence: " + json.dumps(
+        event.get('grad_evidence', {}), default=str))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _spike_trigger_reasons(rec, thresholds):
+    grad = rec.get('grad_pre', 0.0)
+    ce = rec.get('ce', 0.0)
+    logit_abs = rec.get('lm_logit_abs_max', 0.0)
+    layer_rst = rec.get('layer_rst_max', 0.0)
+    reasons = []
+    if grad > thresholds['spike_grad_threshold']:
+        reasons.append('grad_pre')
+    if ce > thresholds['spike_ce_threshold']:
+        reasons.append('ce_loss')
+    if (ce > thresholds['spike_ce_grad_ce_threshold']
+            and grad > thresholds['spike_ce_grad_grad_threshold']):
+        reasons.append('ce_grad_combo')
+    if logit_abs > thresholds['spike_logit_abs_threshold']:
+        reasons.append('lm_logit_abs_max')
+    if layer_rst > thresholds['spike_rst_out_threshold']:
+        reasons.append('layer_rst_max')
+    return reasons
+
+
 def _attach_debug_forward_record(rec, debug_forward):
     """Merge diagnostics-only forward outputs into a host-side log record."""
     if not debug_forward:
@@ -7226,7 +7778,8 @@ def main():
         or run_speed_check
         or tcfg.get('oom_check', tcfg.get('run_oom_check', False)))
     collapse_warn_ctx = _collapse_warn_context(tcfg)
-    crash_snapshot_enabled = bool(tcfg.get('crash_snapshot_enabled', False))
+    crash_snapshot_enabled = bool(tcfg.get(
+        'crash_snapshot_enabled', tcfg.get('crash_snapshot', False)))
     stop_on_collapse = bool(tcfg.get('stop_on_collapse', False))
     if stop_on_collapse:
         crash_snapshot_enabled = True
@@ -7245,6 +7798,22 @@ def main():
         tcfg.get('collapse_ce_grad_ce_threshold', 6.0))
     collapse_ce_grad_grad_threshold = float(
         tcfg.get('collapse_ce_grad_grad_threshold', 5.0))
+    spike_event_logger = bool(tcfg.get('spike_event_logger', True))
+    spike_thresholds = {
+        'spike_grad_threshold': float(tcfg.get('spike_grad_threshold', 5.0)),
+        'spike_ce_threshold': float(tcfg.get('spike_ce_threshold', 5.0)),
+        'spike_ce_grad_ce_threshold': float(
+            tcfg.get('spike_ce_grad_ce_threshold', 4.0)),
+        'spike_ce_grad_grad_threshold': float(
+            tcfg.get('spike_ce_grad_grad_threshold', 2.0)),
+        'spike_logit_abs_threshold': float(
+            tcfg.get('spike_logit_abs_threshold', 40.0)),
+        'spike_rst_out_threshold': float(
+            tcfg.get('spike_rst_out_threshold', 8.0)),
+    }
+    spike_probe_on_event = bool(tcfg.get('spike_probe_on_event', True))
+    spike_probe_topk = int(tcfg.get('spike_probe_topk', 8))
+    spike_history_steps = int(tcfg.get('spike_history_steps', 20))
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
@@ -7332,32 +7901,32 @@ def main():
         exploration_asymmetry_v = 0.0
         exploration_asymmetry_rst = 0.0
         exploration_weighted_clip = 0.0
-    cb1a_enabled = tcfg.get(
-        'cb1a_enabled', model_version_cfg == 'spatial-r1-v4.1.6.1')
     _cb1a_default_on = model_version_cfg == 'spatial-r1-v4.1.6.1'
+    # 4161 policy: CB1A replaces exploration/RPE and is always enabled.
+    # Do not expose cb1a_enabled, cb1a_tau_stopgrad,
+    # cb1a_anchor_stopgrad, or cb1a_forward_influence as config knobs.
+    cb1a_enabled = _cb1a_default_on
     cb1a_weight = tcfg.get('cb1a_weight', 1.0 if _cb1a_default_on else 0.0)
-    cb1a_challenge_weight = tcfg.get(
-        'cb1a_challenge_weight', 1.0 if _cb1a_default_on else 0.0)
-    cb1a_prune_weight = tcfg.get(
-        'cb1a_prune_weight', 1.0 if _cb1a_default_on else 0.0)
-    cb1a_qk_weight = tcfg.get('cb1a_qk_weight', 1.0 if _cb1a_default_on else 0.0)
-    cb1a_v_weight = tcfg.get('cb1a_v_weight', 1.0 if _cb1a_default_on else 0.0)
-    cb1a_rst_weight = tcfg.get('cb1a_rst_weight', 1.0 if _cb1a_default_on else 0.0)
+    # Public CB1A scaling is per pool and per branch. The old shared
+    # challenge/prune and coarse pool weights are fixed to 1.0 so the six
+    # direct weights below are the effective knobs.
+    cb1a_challenge_weight = 1.0 if _cb1a_default_on else 0.0
+    cb1a_prune_weight = 1.0 if _cb1a_default_on else 0.0
+    cb1a_qk_weight = 1.0 if _cb1a_default_on else 0.0
+    cb1a_v_weight = 1.0 if _cb1a_default_on else 0.0
+    cb1a_rst_weight = 1.0 if _cb1a_default_on else 0.0
     cb1a_qk_challenge_weight = tcfg.get(
-        'cb1a_qk_challenge_weight', None)
+        'cb1a_qk_challenge_weight', 0.05 if _cb1a_default_on else None)
     cb1a_qk_prune_weight = tcfg.get(
-        'cb1a_qk_prune_weight', None)
+        'cb1a_qk_prune_weight', 0.05 if _cb1a_default_on else None)
     cb1a_v_challenge_weight = tcfg.get(
-        'cb1a_v_challenge_weight', None)
+        'cb1a_v_challenge_weight', 0.20 if _cb1a_default_on else None)
     cb1a_v_prune_weight = tcfg.get(
-        'cb1a_v_prune_weight', None)
+        'cb1a_v_prune_weight', 0.30 if _cb1a_default_on else None)
     cb1a_rst_challenge_weight = tcfg.get(
-        'cb1a_rst_challenge_weight', None)
+        'cb1a_rst_challenge_weight', 0.40 if _cb1a_default_on else None)
     cb1a_rst_prune_weight = tcfg.get(
-        'cb1a_rst_prune_weight', None)
-    cb1a_tau_stopgrad = tcfg.get('cb1a_tau_stopgrad', True)
-    cb1a_anchor_stopgrad = tcfg.get('cb1a_anchor_stopgrad', True)
-    cb1a_forward_influence = tcfg.get('cb1a_forward_influence', False)
+        'cb1a_rst_prune_weight', 0.70 if _cb1a_default_on else None)
     cb1a_ce_mode = tcfg.get('cb1a_ce_mode', 'sigmoid_z')
     cb1a_eps = tcfg.get('cb1a_eps', 1.0e-8)
     dead_penalty_weighted_clip = tcfg.get(
@@ -7652,20 +8221,17 @@ def main():
                 'rpe_enabled', rpe_enabled))
             if model_version_cfg == 'spatial-r1-v4.1.6.1':
                 rpe_enabled = False
-            cb1a_enabled = saved_training_config.get(
-                'cb1a_enabled', cb1a_enabled)
+            # For 4161, ignore legacy saved CB1A control knobs. CB1A is
+            # fixed-on, aux-only, stopgrad-protected; restore only the
+            # intended scalar/direct branch weights.
+            cb1a_enabled = model_version_cfg == 'spatial-r1-v4.1.6.1'
             cb1a_weight = saved_training_config.get(
                 'cb1a_weight', cb1a_weight)
-            cb1a_challenge_weight = saved_training_config.get(
-                'cb1a_challenge_weight', cb1a_challenge_weight)
-            cb1a_prune_weight = saved_training_config.get(
-                'cb1a_prune_weight', cb1a_prune_weight)
-            cb1a_qk_weight = saved_training_config.get(
-                'cb1a_qk_weight', cb1a_qk_weight)
-            cb1a_v_weight = saved_training_config.get(
-                'cb1a_v_weight', cb1a_v_weight)
-            cb1a_rst_weight = saved_training_config.get(
-                'cb1a_rst_weight', cb1a_rst_weight)
+            cb1a_challenge_weight = 1.0 if cb1a_enabled else 0.0
+            cb1a_prune_weight = 1.0 if cb1a_enabled else 0.0
+            cb1a_qk_weight = 1.0 if cb1a_enabled else 0.0
+            cb1a_v_weight = 1.0 if cb1a_enabled else 0.0
+            cb1a_rst_weight = 1.0 if cb1a_enabled else 0.0
             cb1a_qk_challenge_weight = saved_training_config.get(
                 'cb1a_qk_challenge_weight', cb1a_qk_challenge_weight)
             cb1a_qk_prune_weight = saved_training_config.get(
@@ -7678,12 +8244,6 @@ def main():
                 'cb1a_rst_challenge_weight', cb1a_rst_challenge_weight)
             cb1a_rst_prune_weight = saved_training_config.get(
                 'cb1a_rst_prune_weight', cb1a_rst_prune_weight)
-            cb1a_tau_stopgrad = saved_training_config.get(
-                'cb1a_tau_stopgrad', cb1a_tau_stopgrad)
-            cb1a_anchor_stopgrad = saved_training_config.get(
-                'cb1a_anchor_stopgrad', cb1a_anchor_stopgrad)
-            cb1a_forward_influence = saved_training_config.get(
-                'cb1a_forward_influence', cb1a_forward_influence)
             cb1a_ce_mode = saved_training_config.get(
                 'cb1a_ce_mode', cb1a_ce_mode)
             cb1a_eps = saved_training_config.get('cb1a_eps', cb1a_eps)
@@ -7795,11 +8355,20 @@ def main():
         'cb1a_v_prune_weight': cb1a_v_prune_weight,
         'cb1a_rst_challenge_weight': cb1a_rst_challenge_weight,
         'cb1a_rst_prune_weight': cb1a_rst_prune_weight,
-        'cb1a_tau_stopgrad': cb1a_tau_stopgrad,
-        'cb1a_anchor_stopgrad': cb1a_anchor_stopgrad,
-        'cb1a_forward_influence': cb1a_forward_influence,
+        'cb1a_tau_stopgrad': True,
+        'cb1a_anchor_stopgrad': True,
+        'cb1a_forward_influence': False,
         'cb1a_ce_mode': cb1a_ce_mode,
         'cb1a_eps': cb1a_eps,
+        'stop_on_collapse': stop_on_collapse,
+        'crash_snapshot': crash_snapshot_enabled,
+        'crash_snapshot_enabled': crash_snapshot_enabled,
+        'crash_snapshot_save_post': crash_save_post_update,
+        'spike_event_logger': spike_event_logger,
+        **spike_thresholds,
+        'spike_probe_on_event': spike_probe_on_event,
+        'spike_probe_topk': spike_probe_topk,
+        'spike_history_steps': spike_history_steps,
         'dead_penalty_weighted_clip': dead_penalty_weighted_clip,
         'global_grad_clip': global_grad_clip,
         'tau_lr_mult': tau_lr_mult,
@@ -8465,6 +9034,7 @@ def main():
     # analysis_step at the configured analysis cadence.
     _sharded_fns = None
     _sharded_fns_analysis = None
+    _sharded_fns_spike_probe = None
     _train_local_diag = False
     _spec = MODEL_REGISTRY.get(model_version)
     _force_sharded = bool(_spec and _spec.force_sharded)
@@ -8494,6 +9064,9 @@ def main():
         )
         _supports_local_diag = (
             'local_diagnostics' in _inspect.signature(make_sharded_srw).parameters
+        )
+        _supports_spike_probe = (
+            'spike_probe' in _inspect.signature(make_sharded_srw).parameters
         )
         _train_local_diag = bool(debug_local_spikes and _supports_local_diag)
         _srw_train_kwargs = dict(_srw_base_kwargs)
@@ -8546,12 +9119,39 @@ def main():
                 }
             else:
                 _sharded_fns_analysis = _sharded_single_rst_a
+        if _supports_spike_probe and spike_event_logger and spike_probe_on_event:
+            _srw_spike_kwargs = dict(_srw_base_kwargs)
+            _srw_spike_kwargs.update({
+                'spike_probe': True,
+                'spike_probe_topk': spike_probe_topk,
+            })
+            _sharded_single_v_sp = make_sharded_srw(
+                max_chunk_size=attn_v_max_chunk,
+                **_factory_kwargs(make_sharded_srw, _srw_spike_kwargs))
+            _sharded_single_rst_sp = make_sharded_srw(
+                max_chunk_size=rst_max_chunk,
+                **_factory_kwargs(make_sharded_srw, _srw_spike_kwargs))
+            if hasattr(_v3, 'make_sharded_srw_paired'):
+                _paired_factory = _v3.make_sharded_srw_paired
+                _sharded_paired_sp = _v3.make_sharded_srw_paired(
+                    max_chunk_size=attn_qk_max_chunk,
+                    **_factory_kwargs(_paired_factory, _srw_spike_kwargs))
+                _sharded_fns_spike_probe = {
+                    'single': _sharded_single_v_sp,
+                    'attn_v_single': _sharded_single_v_sp,
+                    'rst_single': _sharded_single_rst_sp,
+                    'paired': _sharded_paired_sp,
+                    'attn_qk_paired': _sharded_paired_sp,
+                }
+            else:
+                _sharded_fns_spike_probe = _sharded_single_rst_sp
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
                   f"; analysis kernels={'on' if _supports_analysis else 'off'}"
-                  f"; inline local spikes={'on' if _train_local_diag else 'off'})")
+                  f"; inline local spikes={'on' if _train_local_diag else 'off'}"
+                  f"; spike probe={'on' if _sharded_fns_spike_probe is not None else 'off'})")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -8614,7 +9214,7 @@ def main():
         scan_update_abs_cap=scan_update_abs_cap,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh,
-        debug_diagnostics=debug_mode,
+        debug_diagnostics=(debug_mode or spike_event_logger),
         debug_local_spikes=_train_local_diag)
     eval_step_fn = create_eval_step(
         model, sharded_fns=_sharded_fns, return_dead_stats=True)
@@ -8626,6 +9226,12 @@ def main():
             model, sharded_fns=_sharded_fns_analysis)
     else:
         analysis_step_fn = None
+    spike_probe_step_fn = None
+    if spike_event_logger and spike_probe_on_event:
+        spike_probe_step_fn = create_spike_probe_step(
+            model,
+            sharded_fns=(_sharded_fns_spike_probe or _sharded_fns),
+            topk=spike_probe_topk)
     # No current-train-batch debug forward: --debug uses regular scalar
     # train_step metrics. Local spike diagnostics require training.debug_local_spikes=true.
     debug_forward_step_fn = None
@@ -9200,6 +9806,8 @@ def main():
         _existing_jsonls = sorted(_list_files(log_dir, "metrics_*.jsonl"))
         _existing_debug_logs = sorted(_list_files(log_dir, "debug_log_*.txt"))
         _existing_debug_jsonls = sorted(_list_files(log_dir, "debug_metrics_*.jsonl"))
+        _existing_spike_logs = sorted(_list_files(log_dir, "spike_events_*.log"))
+        _existing_spike_jsonls = sorted(_list_files(log_dir, "spike_events_*.jsonl"))
         _is_log_resume = (resume_path is not None) and bool(_existing_logs)
         if _is_log_resume:
             training_log_file = _existing_logs[-1]
@@ -9224,12 +9832,31 @@ def main():
             debug_log_file = None
             debug_jsonl_log_file = None
             _is_debug_log_resume = False
+        if spike_event_logger:
+            if (resume_path is not None) and _existing_spike_logs:
+                spike_log_file = _existing_spike_logs[-1]
+                spike_jsonl_log_file = (
+                    _existing_spike_jsonls[-1] if _existing_spike_jsonls
+                    else _join(log_dir, f'spike_events_{timestamp}.jsonl'))
+                _is_spike_log_resume = True
+            else:
+                spike_log_file = _join(log_dir, f'spike_events_{timestamp}.log')
+                spike_jsonl_log_file = _join(
+                    log_dir, f'spike_events_{timestamp}.jsonl')
+                _is_spike_log_resume = False
+        else:
+            spike_log_file = None
+            spike_jsonl_log_file = None
+            _is_spike_log_resume = False
 
         # Set up loggers (local append + periodic GCS sync)
         _setup_loggers(
             training_log_file, jsonl_log_file, resume=_is_log_resume,
             debug_log_file=debug_log_file,
-            debug_jsonl_log_file=debug_jsonl_log_file)
+            debug_jsonl_log_file=debug_jsonl_log_file,
+            spike_log_file=spike_log_file,
+            spike_jsonl_log_file=spike_jsonl_log_file,
+            spike_resume=_is_spike_log_resume)
 
         n_params = count_parameters(params)
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
@@ -9260,6 +9887,19 @@ def main():
             log_debug_message(
                 f"Resume append: {_is_debug_log_resume}")
             log_debug_message("")
+        if spike_event_logger:
+            log_message(
+                f"Spike event logger: on -> {spike_log_file}, {spike_jsonl_log_file}")
+            log_spike_message(
+                f"DAWN {model_version} Spike Events - {timestamp}")
+            log_spike_message(f"Config: {config_path}")
+            log_spike_message(f"Training log: {training_log_file}")
+            log_spike_message(
+                f"Probe on event: {'on' if spike_probe_step_fn is not None else 'off'} topk={spike_probe_topk}")
+            log_spike_message(
+                f"Thresholds: {json.dumps(spike_thresholds, sort_keys=True)}")
+            log_spike_message(f"Resume append: {_is_spike_log_resume}")
+            log_spike_message("")
         log_message("")
         sync_logs()
 
@@ -9416,6 +10056,7 @@ def main():
     # ----------------------------------------------------------
     # Training loop
     crash_metric_history = []
+    spike_metric_history = []
 
     # ----------------------------------------------------------
     if is_host0:
@@ -9507,9 +10148,12 @@ def main():
             # regular checkpoint retention later deletes nearby checkpoints.
             rng, step_rng = jax.random.split(rng)
             step_rng = jax.random.fold_in(step_rng, host_id)  # per-host dropout
+            _keep_pre_step = (
+                crash_snapshot_enabled
+                or (spike_event_logger and spike_probe_step_fn is not None))
             _crash_batch_ids = np.asarray(input_ids) if crash_snapshot_enabled else None
             _crash_batch_mask = np.asarray(attention_mask) if crash_snapshot_enabled else None
-            _pre_step_params = params if crash_snapshot_enabled else None
+            _pre_step_params = params if _keep_pre_step else None
             _pre_step_opt_state = opt_state if crash_snapshot_enabled else None
             input_ids = shard_to_mesh(
                 input_ids, data_sharding, (batch_size, max_seq_len))
@@ -9624,6 +10268,157 @@ def main():
             if not np.isfinite(_m_total_for_nan):
                 raise ValueError(
                     f"NaN/INF total_loss at epoch {epoch}, step {global_step + 1}")
+
+            if spike_event_logger:
+                _event_step = global_step + 1
+                _event_lr = float(schedule(_event_step // grad_accum_steps))
+                _spike_raw = jax.device_get({
+                    'total_loss': metrics['total_loss'],
+                    'ce_loss': metrics['ce_loss'],
+                    'grad_norm': metrics.get('grad_norm', jnp.float32(0.0)),
+                    'grad_global_preclip': metrics.get(
+                        'grad_global_preclip',
+                        metrics.get('grad_norm', jnp.float32(0.0))),
+                    'grad_global_postclip': metrics.get(
+                        'grad_global_postclip', jnp.float32(0.0)),
+                    'debug_logit_max': metrics.get(
+                        'debug_logit_max', jnp.float32(0.0)),
+                    'per_layer_attn_out_norm': metrics.get(
+                        'per_layer_attn_out_norm', jnp.zeros(1)),
+                    'per_layer_rst_out_norm': metrics.get(
+                        'per_layer_rst_out_norm', jnp.zeros(1)),
+                    'attn_q_active_n_mean': metrics.get(
+                        'attn_q_active_n_mean', jnp.float32(0.0)),
+                    'attn_k_active_n_mean': metrics.get(
+                        'attn_k_active_n_mean', jnp.float32(0.0)),
+                    'attn_qk_active_n_mean': metrics.get(
+                        'attn_qk_active_n_mean', jnp.float32(0.0)),
+                    'attn_v_active_n_mean': metrics.get(
+                        'attn_v_active_n_mean', jnp.float32(0.0)),
+                    'attn_active_n_mean': metrics.get(
+                        'attn_active_n_mean', jnp.float32(0.0)),
+                    'rst_active_n_mean': metrics.get(
+                        'rst_active_n_mean', jnp.float32(0.0)),
+                    'attn_qk_no_active_frac': metrics.get(
+                        'attn_qk_no_active_frac',
+                        metrics.get('attn_no_active_frac', jnp.float32(0.0))),
+                    'attn_v_no_active_frac': metrics.get(
+                        'attn_v_no_active_frac',
+                        metrics.get('attn_no_active_frac', jnp.float32(0.0))),
+                    'rst_no_active_frac': metrics.get(
+                        'rst_no_active_frac', jnp.float32(0.0)),
+                    'attn_qk_top1_gate_frac_max': metrics.get(
+                        'attn_qk_top1_gate_frac_max',
+                        metrics.get('attn_top1_gate_frac_max',
+                                    jnp.float32(0.0))),
+                    'attn_v_top1_gate_frac_max': metrics.get(
+                        'attn_v_top1_gate_frac_max',
+                        metrics.get('attn_top1_gate_frac_max',
+                                    jnp.float32(0.0))),
+                    'rst_top1_gate_frac_max': metrics.get(
+                        'rst_top1_gate_frac_max', jnp.float32(0.0)),
+                    'attn_qk_gate_den_sum_mean': metrics.get(
+                        'attn_qk_gate_den_sum_mean',
+                        metrics.get('attn_gate_den_sum_mean',
+                                    jnp.float32(0.0))),
+                    'attn_v_gate_den_sum_mean': metrics.get(
+                        'attn_v_gate_den_sum_mean',
+                        metrics.get('attn_gate_den_sum_mean',
+                                    jnp.float32(0.0))),
+                    'rst_gate_den_sum_mean': metrics.get(
+                        'rst_gate_den_sum_mean', jnp.float32(0.0)),
+                    'grad_token_emb': metrics.get(
+                        'grad_token_emb', jnp.float32(0.0)),
+                    'grad_pos_emb': metrics.get(
+                        'grad_pos_emb', jnp.float32(0.0)),
+                    'grad_router_proj_attn': metrics.get(
+                        'grad_router_proj_attn', jnp.float32(0.0)),
+                    'grad_router_proj_rst': metrics.get(
+                        'grad_router_proj_rst', jnp.float32(0.0)),
+                    'grad_router_raw_tau_qk': metrics.get(
+                        'grad_router_raw_tau_qk', jnp.float32(0.0)),
+                    'grad_router_raw_tau_v': metrics.get(
+                        'grad_router_raw_tau_v', jnp.float32(0.0)),
+                    'grad_router_raw_tau_rst': metrics.get(
+                        'grad_router_raw_tau_rst', jnp.float32(0.0)),
+                    'grad_pool_attn_qk_read': metrics.get(
+                        'grad_pool_attn_qk_read', jnp.float32(0.0)),
+                    'grad_pool_attn_qk_write': metrics.get(
+                        'grad_pool_attn_qk_write', jnp.float32(0.0)),
+                    'grad_pool_attn_v_read': metrics.get(
+                        'grad_pool_attn_v_read', jnp.float32(0.0)),
+                    'grad_pool_attn_v_write': metrics.get(
+                        'grad_pool_attn_v_write', jnp.float32(0.0)),
+                    'grad_pool_rst_read': metrics.get(
+                        'grad_pool_rst_read', jnp.float32(0.0)),
+                    'grad_pool_rst_write': metrics.get(
+                        'grad_pool_rst_write', jnp.float32(0.0)),
+                    'grad_expand_O': metrics.get(
+                        'grad_expand_O', jnp.float32(0.0)),
+                    'grad_layernorms': metrics.get(
+                        'grad_layernorms', jnp.float32(0.0)),
+                    'grad_expand_O_per_layer': metrics.get(
+                        'grad_expand_O_per_layer', jnp.zeros(1)),
+                    'grad_layernorms_per_layer': metrics.get(
+                        'grad_layernorms_per_layer', jnp.zeros(1)),
+                })
+                _spike_rec = _spike_history_record(
+                    _spike_raw, _event_step, epoch, _event_lr)
+                _spike_reasons = _spike_trigger_reasons(
+                    _spike_rec, spike_thresholds)
+                _spike_vec = np.asarray([
+                    float(host_id),
+                    1.0 if _spike_reasons else 0.0,
+                    _spike_rec['grad_pre'],
+                    _spike_rec['ce'],
+                    _spike_rec['lm_logit_abs_max'],
+                    _spike_rec['layer_rst_max'],
+                ], dtype=np.float64)
+                _spike_all = process_allgather(_spike_vec)
+                _spike_all_arr = np.asarray(
+                    _spike_all, dtype=np.float64).reshape(-1, 6)
+                _spike_any = bool(np.any(_spike_all_arr[:, 1] >= 0.5))
+                if _spike_any:
+                    _probe_decoded = {}
+                    if spike_probe_step_fn is not None and _pre_step_params is not None:
+                        _probe_raw = jax.device_get(spike_probe_step_fn(
+                            _pre_step_params, input_ids, attention_mask,
+                            step_rng))
+                        _probe_decoded = _decode_spike_probe(_probe_raw)
+                        del _probe_raw
+                    if is_host0:
+                        _event = {
+                            'type': 'spike_event',
+                            'step': int(_event_step),
+                            'epoch': int(epoch),
+                            'process_index': int(host_id),
+                            'timestamp': datetime.now().isoformat(),
+                            'trigger': {
+                                'reasons': list(_spike_reasons),
+                                'thresholds': dict(spike_thresholds),
+                                'host_trigger_summary': (
+                                    _spike_all_arr.tolist()),
+                            },
+                            'metrics': _spike_rec,
+                            'grad_evidence': _spike_grad_evidence(_spike_raw),
+                            'history': list(spike_metric_history),
+                            'probe': _probe_decoded,
+                        }
+                        _diag_ctx = {
+                            'intensity_beta': float(
+                                tcfg.get('intensity_beta', 0.0)),
+                        }
+                        _event['diagnosis'] = _diagnose_spike(
+                            _spike_rec, _probe_decoded,
+                            spike_thresholds, _diag_ctx)
+                        log_spike_message(_format_spike_text(_event))
+                        log_spike_jsonl(_event)
+                        sync_logs()
+                if spike_history_steps > 0:
+                    spike_metric_history.append(dict(_spike_rec))
+                    if len(spike_metric_history) > spike_history_steps:
+                        spike_metric_history = (
+                            spike_metric_history[-spike_history_steps:])
 
             global_step += 1
             epoch_step_counter += 1
