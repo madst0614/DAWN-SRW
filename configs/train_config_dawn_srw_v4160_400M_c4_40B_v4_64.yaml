@@ -96,26 +96,44 @@ training:
   n_chunks_v: 1
   n_chunks_know: 4
 
-  # Logging / diagnostics / checkpoints
+  # Logging / checkpoints
   checkpoint_interval: 200
   val_interval: 1000
   log_interval: 100
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
+
+  # Collapse/crash behavior.
+  # Keep training alive while collecting spike evidence. Turn stop_on_collapse
+  # on only if you want an intentional hard stop + crash snapshot.
   stop_on_collapse: false
   crash_snapshot: false
   crash_snapshot_enabled: false
+
+  # Focused spike-probe diagnostics.
+  # Requires the patched models/dawn_srw_v4160.py and scripts/train_jax.py.
+  # When a spike event fires, train_jax now runs an event-only 2-pass probe:
+  #   pass 1: find top-CE tokens
+  #   pass 2: trace those exact tokens through every layer/stage
+  # Normal training forward is unchanged; only event logging is heavier.
   spike_event_logger: true
+  spike_probe_on_event: true
+  spike_probe_topk: 8
+  spike_history_steps: 20
+
+  # Spike triggers. These are intentionally broad enough to catch both:
+  #   - output-scale/logit-only events
+  #   - real hard-token gradient spikes
   spike_grad_threshold: 5.0
   spike_ce_threshold: 5.0
   spike_ce_grad_ce_threshold: 4.0
   spike_ce_grad_grad_threshold: 2.0
   spike_logit_abs_threshold: 40.0
   spike_rst_out_threshold: 8.0
-  spike_probe_on_event: true
-  spike_probe_topk: 8
-  spike_history_steps: 20
 
+  # Resume log policy.
+  # Keep the main training log continuous, but start fresh debug/spike logs
+  # when resuming so the focused probe output is easy to inspect.
   training_log_append_on_resume: true
   debug_log_append_on_resume: false
   spike_log_append_on_resume: false
