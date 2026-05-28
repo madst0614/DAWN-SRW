@@ -507,7 +507,7 @@ def _dawn_srw_kwargs(cfg):
                 'tau_offset_init_rst', t.get('tau_offset_init_rst'))
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
-    if version == 'spatial-r1-v4.1.6.0':
+    if version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1'):
         def _tau_target_count_cfg(name):
             if name in m:
                 return m[name]
@@ -523,15 +523,6 @@ def _dawn_srw_kwargs(cfg):
             'tau_target_count_attn_v')
         kw['tau_target_count_rst'] = _tau_target_count_cfg(
             'tau_target_count_rst')
-        if ('d_select' in m or 'd_select' in t):
-            kw['d_select'] = m.get('d_select', t.get('d_select'))
-    if version == 'spatial-r1-v4.1.6.1':
-        kw['tau_init_attn_qk'] = m.get(
-            'tau_init_attn_qk', t.get('tau_init_attn_qk', 0.02))
-        kw['tau_init_attn_v'] = m.get(
-            'tau_init_attn_v', t.get('tau_init_attn_v', 0.10))
-        kw['tau_init_rst'] = m.get(
-            'tau_init_rst', t.get('tau_init_rst', 0.15))
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
     return kw
@@ -1362,20 +1353,23 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _cb1a_v_weight = jnp.float32(cb1a_v_weight)
     _cb1a_rst_weight = jnp.float32(cb1a_rst_weight)
     _cb1a_qk_challenge_weight = jnp.float32(
-        0.0 if cb1a_qk_challenge_weight is None
+        cb1a_challenge_weight if cb1a_qk_challenge_weight is None
         else cb1a_qk_challenge_weight)
     _cb1a_qk_prune_weight = jnp.float32(
-        0.0 if cb1a_qk_prune_weight is None else cb1a_qk_prune_weight)
+        cb1a_prune_weight if cb1a_qk_prune_weight is None
+        else cb1a_qk_prune_weight)
     _cb1a_v_challenge_weight = jnp.float32(
-        0.0 if cb1a_v_challenge_weight is None
+        cb1a_challenge_weight if cb1a_v_challenge_weight is None
         else cb1a_v_challenge_weight)
     _cb1a_v_prune_weight = jnp.float32(
-        0.0 if cb1a_v_prune_weight is None else cb1a_v_prune_weight)
+        cb1a_prune_weight if cb1a_v_prune_weight is None
+        else cb1a_v_prune_weight)
     _cb1a_rst_challenge_weight = jnp.float32(
-        0.0 if cb1a_rst_challenge_weight is None
+        cb1a_challenge_weight if cb1a_rst_challenge_weight is None
         else cb1a_rst_challenge_weight)
     _cb1a_rst_prune_weight = jnp.float32(
-        0.0 if cb1a_rst_prune_weight is None else cb1a_rst_prune_weight)
+        cb1a_prune_weight if cb1a_rst_prune_weight is None
+        else cb1a_rst_prune_weight)
     _cb1a_ce_mode = str(cb1a_ce_mode).lower()
     if _cb1a_ce_mode != 'sigmoid_z':
         raise ValueError(
@@ -1405,6 +1399,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _local_layers = int(getattr(model, 'n_layers', 1))
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
+    _disable_exploration_loss = (
+        str(_model_version) == 'spatial-r1-v4.1.6.1')
+    # v4.1.6.1 uses CB1A as the CE-conditioned boundary auxiliary.
+    # Do not run or weight the old RPE/exploration loss on this path.
+    if _disable_exploration_loss:
+        _rpe_enabled = False
     _rpe_requires_no_active_direct = (
         str(_model_version) == 'spatial-r1-v4.1.6.0')
 
@@ -1799,7 +1799,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     + _cb1a_rst_prune_weight * rst_prune_raw)
                 cb1a_raw = (
                     cb1a_qk_raw + cb1a_v_raw + cb1a_rst_raw)
-                cb1a_loss_weighted = cb1a_raw
+                cb1a_loss_weighted = _cb1a_weight * (
+                    _cb1a_qk_weight * cb1a_qk_raw
+                    + _cb1a_v_weight * cb1a_v_raw
+                    + _cb1a_rst_weight * cb1a_rst_raw)
             else:
                 cb1a_ce_mean = jnp.float32(0.0)
                 cb1a_ce_std = jnp.float32(0.0)
@@ -5437,7 +5440,9 @@ def _print_regular_block(rec, ctx):
         f" k[m={rec['rst_op_gain_mean']:.2f} s={rec['rst_op_gain_std']:.2f}"
         f" max={rec['rst_op_gain_max']:.2f}]"
     )
-    if is_v4160:
+    if ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
+        pass
+    elif is_v4160:
         log_message(
             f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
             f" pos={rec['pos_frac']*100:.1f}%"
@@ -6145,12 +6150,18 @@ def _print_debug_block(rec, ctx):
         f"grad={_g('grad_global_preclip', _g('grad_norm')):.3f} "
         f"lr={_g('lr'):.3e}"
     )
-    rpe_loss_terms = (
-        f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
-        f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
-        f"cb1a_raw={_g('cb1a_raw'):+.6f} "
-        f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
-    )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
+        rpe_loss_terms = (
+            f"cb1a_raw={_g('cb1a_raw'):+.6f} "
+            f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
+        )
+    else:
+        rpe_loss_terms = (
+            f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
+            f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
+            f"cb1a_raw={_g('cb1a_raw'):+.6f} "
+            f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
+        )
     log_debug_message(
         f"loss_terms: ce={_g('ce_loss'):.6f} "
         f"aux_raw_lb_plus_internal_tau={_g('aux_loss_raw', _g('aux_loss')):.6f} "
@@ -6270,7 +6281,9 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('rst_weak_exposure_frac'):.5f}] "
             f"target={_g('attn_qk_dead_exposure_target'):.5f}"
         )
-    if is_v4160:
+    if ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
+        pass
+    elif is_v4160:
         log_debug_message(
             f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
             f"w_eff={_g('exploration_weight_effective'):.6f} "
@@ -7304,6 +7317,8 @@ def main():
         exploration_normalize_by_layers_default))
     rpe_enabled = bool(tcfg.get(
         'rpe_enabled', model_version_cfg != 'spatial-r1-v4.1.6.1'))
+    if model_version_cfg == 'spatial-r1-v4.1.6.1':
+        rpe_enabled = False
     if not rpe_enabled:
         exploration_weight = 0.0
         exploration_weight_q = 0.0
@@ -7319,24 +7334,27 @@ def main():
         exploration_weighted_clip = 0.0
     cb1a_enabled = tcfg.get(
         'cb1a_enabled', model_version_cfg == 'spatial-r1-v4.1.6.1')
-    cb1a_weight = tcfg.get('cb1a_weight', 0.0)
-    cb1a_challenge_weight = tcfg.get('cb1a_challenge_weight', 0.0)
-    cb1a_prune_weight = tcfg.get('cb1a_prune_weight', 0.0)
-    cb1a_qk_weight = tcfg.get('cb1a_qk_weight', 0.0)
-    cb1a_v_weight = tcfg.get('cb1a_v_weight', 0.0)
-    cb1a_rst_weight = tcfg.get('cb1a_rst_weight', 0.0)
+    _cb1a_default_on = model_version_cfg == 'spatial-r1-v4.1.6.1'
+    cb1a_weight = tcfg.get('cb1a_weight', 1.0 if _cb1a_default_on else 0.0)
+    cb1a_challenge_weight = tcfg.get(
+        'cb1a_challenge_weight', 1.0 if _cb1a_default_on else 0.0)
+    cb1a_prune_weight = tcfg.get(
+        'cb1a_prune_weight', 1.0 if _cb1a_default_on else 0.0)
+    cb1a_qk_weight = tcfg.get('cb1a_qk_weight', 1.0 if _cb1a_default_on else 0.0)
+    cb1a_v_weight = tcfg.get('cb1a_v_weight', 1.0 if _cb1a_default_on else 0.0)
+    cb1a_rst_weight = tcfg.get('cb1a_rst_weight', 1.0 if _cb1a_default_on else 0.0)
     cb1a_qk_challenge_weight = tcfg.get(
-        'cb1a_qk_challenge_weight', 0.0)
+        'cb1a_qk_challenge_weight', None)
     cb1a_qk_prune_weight = tcfg.get(
-        'cb1a_qk_prune_weight', 0.0)
+        'cb1a_qk_prune_weight', None)
     cb1a_v_challenge_weight = tcfg.get(
-        'cb1a_v_challenge_weight', 0.0)
+        'cb1a_v_challenge_weight', None)
     cb1a_v_prune_weight = tcfg.get(
-        'cb1a_v_prune_weight', 0.0)
+        'cb1a_v_prune_weight', None)
     cb1a_rst_challenge_weight = tcfg.get(
-        'cb1a_rst_challenge_weight', 0.0)
+        'cb1a_rst_challenge_weight', None)
     cb1a_rst_prune_weight = tcfg.get(
-        'cb1a_rst_prune_weight', 0.0)
+        'cb1a_rst_prune_weight', None)
     cb1a_tau_stopgrad = tcfg.get('cb1a_tau_stopgrad', True)
     cb1a_anchor_stopgrad = tcfg.get('cb1a_anchor_stopgrad', True)
     cb1a_forward_influence = tcfg.get('cb1a_forward_influence', False)
@@ -7632,6 +7650,8 @@ def main():
                 exploration_normalize_by_layers))
             rpe_enabled = bool(saved_training_config.get(
                 'rpe_enabled', rpe_enabled))
+            if model_version_cfg == 'spatial-r1-v4.1.6.1':
+                rpe_enabled = False
             cb1a_enabled = saved_training_config.get(
                 'cb1a_enabled', cb1a_enabled)
             cb1a_weight = saved_training_config.get(
@@ -8240,11 +8260,12 @@ def main():
             )
         elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.1':
             gate_msg = (
-                f"  Gate ({cfg['model'].get('model_version')} direct-tau-init): "
-                f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', 0.02))} "
-                f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', 0.10))} "
-                f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', 0.15))} "
-                f"intensity_beta={tcfg.get('intensity_beta', 0.5)}"
+                f"  Gate ({cfg['model'].get('model_version')} direct-tau + CB1A): "
+                f"tau_target_count_attn_qk={tcfg.get('tau_target_count_attn_qk', cfg['model'].get('tau_target_count_attn_qk', None))} "
+                f"tau_target_count_attn_v={tcfg.get('tau_target_count_attn_v', cfg['model'].get('tau_target_count_attn_v', None))} "
+                f"tau_target_count_rst={tcfg.get('tau_target_count_rst', cfg['model'].get('tau_target_count_rst', None))} "
+                f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
+                f"exploration=off cb1a={cb1a_enabled}"
             )
         else:
             gate_msg = (
