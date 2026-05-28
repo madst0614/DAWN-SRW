@@ -148,6 +148,26 @@ SPIKE_TOKEN_ALIGN_FIELD_NAMES = (
     'input_emb_norm', 'target_emb_norm', 'pred_emb_norm',
     'pred_equals_input', 'target_equals_input', 'pred_equals_target')
 
+SPIKE_FOCUS_PATH_FIELD_NAMES = (
+    'rank', 'batch', 'pos', 'layer', 'stage_id',
+    'input_token_id', 'target_token_id', 'pred_token_id',
+    'hidden_norm', 'delta_norm_from_prev',
+    'input_cos', 'target_cos', 'pred_cos',
+    'input_dot', 'target_dot', 'pred_dot',
+    'pred_minus_target_dot', 'pred_minus_target_cos',
+    'target_minus_input_dot',
+    'pred_equals_input', 'target_equals_input', 'pred_equals_target')
+
+SPIKE_FOCUS_ROUTE_FIELD_NAMES = (
+    'rank', 'batch', 'pos', 'layer',
+    'attn_out_norm', 'rst_out_norm',
+    'pre_attn_resid_norm', 'post_attn_resid_norm', 'post_rst_resid_norm',
+    'qk_active', 'v_active', 'rst_active',
+    'q_tau', 'k_tau', 'v_tau', 'rst_tau',
+    'q_no_active', 'k_no_active', 'v_no_active', 'rst_no_active',
+    'qk_positive_margin', 'v_positive_margin', 'rst_positive_margin',
+    'full_block_delta_norm')
+
 DIRECT_TAU_SELECT_METRIC_NAMES = (
     'rho_mean', 'rho_std', 'rho_max',
     'tau_mean', 'tau_min', 'tau_max',
@@ -1113,6 +1133,16 @@ def _model_accepts_spike_probe(model):
     import inspect as _inspect
     try:
         return 'spike_probe' in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _model_accepts_spike_focus_probe(model):
+    """Return True if model.__call__ accepts second-pass focused spike tokens."""
+    import inspect as _inspect
+    try:
+        params = _inspect.signature(model.__call__).parameters
+        return 'spike_focus_bpos' in params
     except (TypeError, ValueError):
         return False
 
@@ -3525,9 +3555,18 @@ def create_debug_forward_step(model, sharded_fns=None, drop_compare=False):
 
 
 def create_spike_probe_step(model, sharded_fns=None, topk=8):
-    """Event-only forward probe. No gradients, no optimizer updates."""
+    """Event-only forward probe. No gradients, no optimizer updates.
+
+    Two-pass design for v4.1.6.0+ focused spike debugging:
+      pass 1: regular spike_probe finds the actual top-CE tokens.
+      pass 2: re-runs the same batch/dropout key focused on those b,pos tokens,
+              so the model can emit layer/stage traces for the exact tokens
+              that triggered the event. This avoids storing all hidden states
+              for all tokens during training.
+    """
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_spike_kw = _model_accepts_spike_probe(model)
+    _pass_focus_kw = _model_accepts_spike_focus_probe(model)
     _topk = int(topk)
 
     @jax.jit
@@ -3550,11 +3589,42 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8):
             rngs={'dropout': dropout_key},
             **extra_kw,
         )
+        token_rows = result.get(
+            'spike_top_token_ce',
+            jnp.full((_topk, len(SPIKE_TOKEN_FIELD_NAMES)),
+                     -jnp.inf, dtype=jnp.float32))
+        focus_result = {}
+        if _pass_focus_kw:
+            focus_bpos = token_rows[:, 1:3].astype(jnp.int32)
+            focus_bpos = jnp.where(jnp.isfinite(token_rows[:, 6:7]),
+                                   focus_bpos, 0)
+            focus_input = jnp.where(
+                jnp.isfinite(token_rows[:, 3]),
+                token_rows[:, 3], 0).astype(jnp.int32)
+            focus_target = jnp.where(
+                jnp.isfinite(token_rows[:, 4]),
+                token_rows[:, 4], 0).astype(jnp.int32)
+            focus_pred = jnp.where(
+                jnp.isfinite(token_rows[:, 5]),
+                token_rows[:, 5], 0).astype(jnp.int32)
+            focus_kw = dict(extra_kw)
+            focus_kw.update({
+                'spike_focus_bpos': focus_bpos,
+                'spike_focus_input_ids': focus_input,
+                'spike_focus_target_ids': focus_target,
+                'spike_focus_pred_ids': focus_pred,
+            })
+            focus_result = model.apply(
+                {'params': params},
+                input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+                deterministic=False,
+                rngs={'dropout': dropout_key},
+                **focus_kw,
+            )
         return {
-            'spike_top_token_ce': result.get(
-                'spike_top_token_ce',
-                jnp.full((_topk, len(SPIKE_TOKEN_FIELD_NAMES)),
-                         -jnp.inf, dtype=jnp.float32)),
+            'spike_top_token_ce': token_rows,
             'spike_top_token_alignment': result.get(
                 'spike_top_token_alignment',
                 jnp.full((_topk, len(SPIKE_TOKEN_ALIGN_FIELD_NAMES)),
@@ -3583,6 +3653,14 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8):
             'spike_layer_lm_logit_abs_proxy_if_available': result.get(
                 'spike_layer_lm_logit_abs_proxy_if_available',
                 jnp.zeros((1,), dtype=jnp.float32)),
+            'spike_focus_path_trace': focus_result.get(
+                'spike_focus_path_trace',
+                jnp.full((1, _topk, 1, len(SPIKE_FOCUS_PATH_FIELD_NAMES)),
+                         -jnp.inf, dtype=jnp.float32)),
+            'spike_focus_route_trace': focus_result.get(
+                'spike_focus_route_trace',
+                jnp.full((1, _topk, len(SPIKE_FOCUS_ROUTE_FIELD_NAMES)),
+                         -jnp.inf, dtype=jnp.float32)),
         }
 
     return spike_probe_step if _pass_spike_kw else None
@@ -6163,11 +6241,38 @@ def _decode_spike_probe(probe_raw):
                 item['layer'] = int(layer)
                 item.pop('score', None)
                 attn_rows.append(item)
+
+    focus_path_rows = []
+    focus_path_arr = np.asarray(
+        probe_raw.get('spike_focus_path_trace', []), dtype=np.float64)
+    if focus_path_arr.ndim == 4:
+        # [layer_or_final_block, token_rank, stage_slot, field]
+        flat = focus_path_arr.reshape((-1, focus_path_arr.shape[-1]))
+        decoded = _decode_spike_rows(
+            flat, SPIKE_FOCUS_PATH_FIELD_NAMES,
+            int_fields={
+                'rank', 'batch', 'pos', 'layer', 'stage_id',
+                'input_token_id', 'target_token_id', 'pred_token_id',
+            })
+        focus_path_rows.extend(decoded)
+
+    focus_route_rows = []
+    focus_route_arr = np.asarray(
+        probe_raw.get('spike_focus_route_trace', []), dtype=np.float64)
+    if focus_route_arr.ndim == 3:
+        flat = focus_route_arr.reshape((-1, focus_route_arr.shape[-1]))
+        decoded = _decode_spike_rows(
+            flat, SPIKE_FOCUS_ROUTE_FIELD_NAMES,
+            int_fields={'rank', 'batch', 'pos', 'layer'})
+        focus_route_rows.extend(decoded)
+
     return {
         'top_token_ce': token_rows,
         'top_token_alignment': token_align_rows,
         'srw_top_contributors': srw_rows,
         'attention_top': attn_rows,
+        'focus_path_trace': focus_path_rows,
+        'focus_route_trace': focus_route_rows,
         'layer_forward_norms': {
             'layer_attn_out_norm_max': _jsonable_diag_value(
                 probe_raw.get('spike_layer_attn_out_norm_max', [])),
@@ -6278,6 +6383,58 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
             pred_cos > max(target_cos + 0.10, 0.25)
             or pred_dot > target_dot + 5.0))
 
+    # Focused path trace, when available, is stronger evidence than the
+    # global top-SRW/top-attention rows. It follows the actual top-CE token
+    # through every layer/stage and tells us where pred-vs-target alignment
+    # first worsens.
+    focus_rank0 = sorted(
+        [r for r in probe.get('focus_path_trace', [])
+         if int(r.get('rank', -1)) == 0],
+        key=lambda r: (int(r.get('layer', -1)), int(r.get('stage_id', -1))))
+    focus_route0 = sorted(
+        [r for r in probe.get('focus_route_trace', [])
+         if int(r.get('rank', -1)) == 0],
+        key=lambda r: int(r.get('layer', -1)))
+
+    def _pt_margin(row):
+        return _finite_float(row.get('pred_minus_target_dot', 0.0), 0.0)
+
+    def _by_layer_stage(rows):
+        return {(int(r.get('layer', -1)), int(r.get('stage_id', -1))): r
+                for r in rows}
+
+    path_map = _by_layer_stage(focus_rank0)
+    attn_shift = (0.0, -1)
+    rst_shift = (0.0, -1)
+    final_shift = 0.0
+    for layer in sorted({k[0] for k in path_map if k[0] >= 0}):
+        pre = path_map.get((layer, 0))
+        post_a = path_map.get((layer, 3))
+        post_r = path_map.get((layer, 6))
+        if pre and post_a:
+            val = _pt_margin(post_a) - _pt_margin(pre)
+            if val > attn_shift[0]:
+                attn_shift = (val, layer)
+        if post_a and post_r:
+            val = _pt_margin(post_r) - _pt_margin(post_a)
+            if val > rst_shift[0]:
+                rst_shift = (val, layer)
+    if focus_rank0:
+        final_rows = [r for r in focus_rank0 if int(r.get('stage_id', -1)) == 7]
+        last_post = None
+        if path_map:
+            last_layer = max(k[0] for k in path_map if k[0] >= 0)
+            last_post = path_map.get((last_layer, 6))
+        if final_rows and last_post:
+            final_shift = _pt_margin(final_rows[-1]) - _pt_margin(last_post)
+
+    max_focus_attn_out = max(
+        (_finite_float(r.get('attn_out_norm', 0.0), 0.0)
+         for r in focus_route0), default=0.0)
+    max_focus_rst_out = max(
+        (_finite_float(r.get('rst_out_norm', 0.0), 0.0)
+         for r in focus_route0), default=0.0)
+
     grad_e = metrics_rec.get('grad_group_summary', {})
     grad_global = max(_g('grad_pre'), 1e-8)
     token_emb_grad = _finite_float(grad_e.get('token_emb', 0.0))
@@ -6328,8 +6485,7 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
         primary = 'hard_token_ce_spike'
         confidence = 'high'
         if alignment_self_copy:
-            primary = 'self_copy_hard_token_ce_spike'
-            secondary.append('self_copy_logit_spike')
+            secondary.append('self_copy_candidate_not_primary_without_path_persistence')
         evidence.append(
             f"top token CE={top_ce:.4g} at b={top_token.get('batch')} pos={top_token.get('pos')}")
         evidence.append(
@@ -6337,6 +6493,19 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
         if top_align:
             evidence.append(
                 f"final-hidden alignment: cos[input={input_cos:.4f}, pred={pred_cos:.4f}, target={target_cos:.4f}] dot[input={input_dot:.4g}, pred={pred_dot:.4g}, target={target_dot:.4g}]")
+        if focus_rank0:
+            evidence.append(
+                f"focus path shift: max_attn_pred_minus_target_delta={attn_shift[0]:.4g}@L{attn_shift[1]}, max_rst_pred_minus_target_delta={rst_shift[0]:.4g}@L{rst_shift[1]}, final_norm_delta={final_shift:.4g}")
+            evidence.append(
+                f"focus route out_norm max: attn={max_focus_attn_out:.4g}, rst={max_focus_rst_out:.4g}")
+            if attn_shift[0] > max(rst_shift[0], final_shift, 2.0):
+                secondary.append('attention_forward_alignment_shift')
+            elif rst_shift[0] > max(attn_shift[0], final_shift, 2.0):
+                secondary.append('rst_forward_alignment_shift')
+            elif final_shift > max(attn_shift[0], rst_shift[0], 2.0):
+                secondary.append('final_norm_readout_alignment_shift')
+            else:
+                secondary.append('no_single_forward_stage_dominates_focus_trace')
     elif logit_abs > thresholds['spike_logit_abs_threshold']:
         primary = 'logit_output_scale_spike'
         evidence.append(f"lm_logit_abs_max={logit_abs:.4g}")
@@ -6472,6 +6641,68 @@ def _format_spike_text(event):
                 f"cos[in={r.get('input_cos', 0.0):.4f} target={r.get('target_cos', 0.0):.4f} pred={r.get('pred_cos', 0.0):.4f}] "
                 f"dot[in={r.get('input_dot', 0.0):.3f} target={r.get('target_dot', 0.0):.3f} pred={r.get('pred_dot', 0.0):.3f}] "
                 f"norm[h={r.get('hidden_norm', 0.0):.3f} in={r.get('input_emb_norm', 0.0):.3f} target={r.get('target_emb_norm', 0.0):.3f} pred={r.get('pred_emb_norm', 0.0):.3f}]")
+
+    stage_names = {
+        0: 'pre_attn', 1: 'norm1', 2: 'attn_out', 3: 'post_attn',
+        4: 'norm2', 5: 'rst_out', 6: 'post_rst', 7: 'final_norm',
+    }
+    focus_path = [
+        r for r in probe.get('focus_path_trace', [])
+        if int(r.get('rank', -1)) in (0, 1)
+    ]
+    if focus_path:
+        lines.append("focus_path_trace_top_ce:")
+        for rank in (0, 1):
+            rank_rows = [r for r in focus_path if int(r.get('rank', -1)) == rank]
+            if not rank_rows:
+                continue
+            rank_rows = sorted(
+                rank_rows, key=lambda r: (int(r.get('layer', -1)), int(r.get('stage_id', -1))))
+            head = rank_rows[0]
+            lines.append(
+                f"  rank={rank} b={head.get('batch')} pos={head.get('pos')} "
+                f"input={head.get('input_token_id')} target={head.get('target_token_id')} pred={head.get('pred_token_id')}")
+            # Print all stages for rank 0; for rank 1 print compactly every major residual stage.
+            for r in rank_rows:
+                st = int(r.get('stage_id', -1))
+                if rank == 1 and st not in (0, 3, 6, 7):
+                    continue
+                lines.append(
+                    f"    L{int(r.get('layer', -1)):02d} {stage_names.get(st, str(st)):>10s} "
+                    f"h={r.get('hidden_norm', 0.0):.3f} dprev={r.get('delta_norm_from_prev', 0.0):.3f} "
+                    f"cos[in={r.get('input_cos', 0.0):+.4f} tgt={r.get('target_cos', 0.0):+.4f} pred={r.get('pred_cos', 0.0):+.4f}] "
+                    f"dot[tgt={r.get('target_dot', 0.0):+.3f} pred={r.get('pred_dot', 0.0):+.3f} "
+                    f"p-t={r.get('pred_minus_target_dot', 0.0):+.3f}]")
+
+    focus_route = [
+        r for r in probe.get('focus_route_trace', [])
+        if int(r.get('rank', -1)) in (0, 1)
+    ]
+    if focus_route:
+        lines.append("focus_route_trace_top_ce:")
+        for rank in (0, 1):
+            rank_rows = sorted(
+                [r for r in focus_route if int(r.get('rank', -1)) == rank],
+                key=lambda r: int(r.get('layer', -1)))
+            if not rank_rows:
+                continue
+            lines.append(f"  rank={rank}:")
+            # Print layers with largest block delta or nontrivial no-active flags first.
+            rank_rows_sorted = sorted(
+                rank_rows,
+                key=lambda r: max(
+                    r.get('full_block_delta_norm', 0.0),
+                    r.get('attn_out_norm', 0.0),
+                    r.get('rst_out_norm', 0.0)),
+                reverse=True)
+            for r in rank_rows_sorted[:8]:
+                lines.append(
+                    f"    L{int(r.get('layer', -1)):02d} "
+                    f"out[attn={r.get('attn_out_norm', 0.0):.3f} rst={r.get('rst_out_norm', 0.0):.3f} block={r.get('full_block_delta_norm', 0.0):.3f}] "
+                    f"resid[pre={r.get('pre_attn_resid_norm', 0.0):.3f} postA={r.get('post_attn_resid_norm', 0.0):.3f} postR={r.get('post_rst_resid_norm', 0.0):.3f}] "
+                    f"active[qk={r.get('qk_active', 0.0):.1f} v={r.get('v_active', 0.0):.1f} rst={r.get('rst_active', 0.0):.1f}] "
+                    f"tau[q={r.get('q_tau', 0.0):.4f} k={r.get('k_tau', 0.0):.4f} v={r.get('v_tau', 0.0):.4f} rst={r.get('rst_tau', 0.0):.4f}] "
+                    f"no[q={r.get('q_no_active', 0.0):.0f} k={r.get('k_no_active', 0.0):.0f} v={r.get('v_no_active', 0.0):.0f} rst={r.get('rst_no_active', 0.0):.0f}]")
 
     srw = sorted(
         probe.get('srw_top_contributors', []),
