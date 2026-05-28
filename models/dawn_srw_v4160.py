@@ -3326,6 +3326,7 @@ class DAWN(nn.Module):
                 k_tau = a_tau_direct[_focus_b, _focus_pos, 1].astype(jnp.float32)
                 v_tau = a_tau_direct[_focus_b, _focus_pos, 2].astype(jnp.float32)
                 rst_tau = k_tau_direct[_focus_b, _focus_pos, 0].astype(jnp.float32)
+                rst_active_focus = k_active[_focus_b, _focus_pos, 0].astype(jnp.float32)
                 q_no = a_no_active_direct[_focus_b, _focus_pos, 0].astype(jnp.float32)
                 k_no = a_no_active_direct[_focus_b, _focus_pos, 1].astype(jnp.float32)
                 v_no = a_no_active_direct[_focus_b, _focus_pos, 2].astype(jnp.float32)
@@ -3342,7 +3343,7 @@ class DAWN(nn.Module):
                     jnp.linalg.norm(post_r, axis=-1),
                     jnp.full((focus_k,), a_qk_active.astype(jnp.float32)),
                     jnp.full((focus_k,), a_v_active.astype(jnp.float32)),
-                    jnp.full((focus_k,), k_active.astype(jnp.float32)),
+                    rst_active_focus,
                     q_tau, k_tau, v_tau, rst_tau,
                     q_no, k_no, v_no, rst_no,
                     jnp.full((focus_k,), a_qk_positive_margin_active.astype(jnp.float32)),
