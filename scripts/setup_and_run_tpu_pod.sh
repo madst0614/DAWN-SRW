@@ -56,21 +56,19 @@ else
     cd dawn-spatial
 fi
 
-# 3. Verify JAX sees TPU devices
-echo "[3/4] Verifying JAX TPU setup..."
-python -c "
-import jax
-print(f'Host: {jax.process_index()}/{jax.process_count()}')
-print(f'Local devices: {jax.local_device_count()}')
-print(f'Total devices: {jax.device_count()}')
-print(f'Backend: {jax.default_backend()}')
-assert jax.default_backend() == 'tpu', 'Not running on TPU!'
-print('TPU setup verified OK')
-"
+# 3. Skip standalone JAX preflight.
+#
+# On multi-host TPU pods a short-lived standalone JAX process can initialize
+# PJRT, print device info, and then abort during teardown with:
+#   GetSliceInfo can only be invoked after a slice is built...
+# The real training process below performs the same backend/device checks and
+# keeps the slice alive, so avoid opening a throwaway slice here.
+echo "[3/4] Skipping standalone JAX TPU preflight; train_jax.py will verify devices."
 
 # 4. Launch training in tmux (survives SSH disconnect)
 echo "[4/4] Starting training in tmux session 'train'..."
 echo "  Config: $CONFIG"
+echo "  Train args: ${TRAIN_ARGS:-}"
 echo "  Host: $(hostname)"
 echo "  Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "  Log: ~/train.log"
@@ -80,10 +78,25 @@ cd "$WORK_DIR"
 # Kill existing train session if any
 tmux kill-session -t train 2>/dev/null || true
 
+# Enable XLA dumps by default so OOM-check failures can point at the HLO
+# memory report. Keep console logging quiet; train_jax.py prints a compact
+# excerpt from the dump only when the OOM check fails.
+XLA_DUMP_DIR="${XLA_DUMP_DIR:-/tmp/xla_dump_train}"
+mkdir -p "$XLA_DUMP_DIR"
+export XLA_DUMP_DIR
+export JAX_TRACEBACK_FILTERING="${JAX_TRACEBACK_FILTERING:-auto}"
+export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-0}"
+export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-2}"
+if [ -z "${XLA_FLAGS:-}" ]; then
+    export XLA_FLAGS="--xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
+else
+    export XLA_FLAGS="$XLA_FLAGS --xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
+fi
+
 # Start new tmux session running training, tee to ~/train.log
 TRAIN_ARGS="${TRAIN_ARGS:-}"
 tmux new-session -d -s train \
-    "python3 scripts/train_jax.py --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+    "export XLA_DUMP_DIR='$XLA_DUMP_DIR'; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; export XLA_FLAGS='$XLA_FLAGS'; python3 scripts/train_jax.py --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"

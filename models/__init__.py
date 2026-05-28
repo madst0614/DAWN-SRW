@@ -50,19 +50,20 @@ baseline: Vanilla Transformer for fair comparison
 # Lazy imports — PyTorch models loaded only when accessed (allows torch-free JAX usage)
 def __getattr__(name):
     _torch_models = {
-        'DAWN_v18_5': ('.model_v18_5', 'DAWN'),
-        'DAWN_v18_4': ('.model_v18_4', 'DAWN'),
-        'DAWN_v18_3': ('.model_v18_3', 'DAWN'),
-        'DAWN_v18_2': ('.model_v18_2', 'DAWN'),
-        'DAWN_v18_1': ('.model_v18_1', 'DAWN'),
-        'DAWN_v18': ('.model_v18', 'DAWN'),
-        'DAWN_v17_1': ('.model_v17_1', 'DAWN'),
-        'DAWN_v17_1_TPU': ('.model_v17_1_tpu', 'DAWN'),
-        'DAWN_v17_1_TPU_MemOpt': ('.model_v17_1_tpu_memopt', 'DAWN'),
-        'DAWN_v17_2': ('.model_v17_2', 'DAWN'),
-        'DAWN_Spatial': ('.dawn_spatial', 'DAWN'),
-        'DAWN': ('.model_v17_1', 'DAWN'),
-        'VanillaTransformer': ('.baseline_transformer', 'VanillaTransformer'),
+        'DAWN_v18_5': ('.legacy.model_v18_5', 'DAWN'),
+        'DAWN_v18_4': ('.legacy.model_v18_4', 'DAWN'),
+        'DAWN_v18_3': ('.legacy.model_v18_3', 'DAWN'),
+        'DAWN_v18_2': ('.legacy.model_v18_2', 'DAWN'),
+        'DAWN_v18_1': ('.legacy.model_v18_1', 'DAWN'),
+        'DAWN_v18': ('.legacy.model_v18', 'DAWN'),
+        'DAWN_v17_1': ('.legacy.model_v17_1', 'DAWN'),
+        'DAWN_v17_1_TPU': ('.legacy.model_v17_1_tpu', 'DAWN'),
+        'DAWN_v17_1_TPU_MemOpt': ('.legacy.model_v17_1_tpu_memopt', 'DAWN'),
+        'DAWN_v17_2': ('.legacy.model_v17_2', 'DAWN'),
+        'DAWN_SRW': ('.dawn_srw', 'DAWN'),
+        'DAWN_Spatial': ('.legacy.dawn_spatial', 'DAWN'),
+        'DAWN': ('.legacy.model_v17_1', 'DAWN'),
+        'VanillaTransformer': ('.legacy.baseline_transformer', 'VanillaTransformer'),
     }
     _registry_names = {
         'VERSION_REGISTRY', 'normalize_version', 'get_version_info',
@@ -99,6 +100,7 @@ __all__ = [
     'DAWN_v17_1',
     'DAWN_v17_1_TPU',
     'DAWN_v17_1_TPU_MemOpt',
+    'DAWN_SRW',
     'DAWN_Spatial',
     'VanillaTransformer',
     # Version utilities
@@ -139,6 +141,7 @@ def create_model_by_version(version, config):
         Model instance (DAWN or VanillaTransformer)
     """
     if version == "baseline":
+        from .legacy.baseline_transformer import VanillaTransformer
         return VanillaTransformer(**config)
 
     version = normalize_version(version)
