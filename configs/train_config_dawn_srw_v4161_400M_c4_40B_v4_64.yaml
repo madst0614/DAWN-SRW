@@ -65,9 +65,8 @@ training:
   intensity_beta: 0.5
 
   # Auxiliary losses
-  diversity_weight: 0.1
+  diversity_weight: 0.0
   load_balance_weight: 0.0
-  dead_exposure_target: 0.1
 
   # Keep 4160's effective dead penalty, but expose per-pool weights.
   dead_penalty_qk_weight: 0.001
