@@ -2,8 +2,8 @@
 #
 # Policy:
 #   - Keep v4.1.6.0 DirectTau forward/init unchanged.
-#   - Remove RPE/exploration loss for v4.1.6.1.
-#   - Add CB1A as an auxiliary-only CE-conditioned boundary loss.
+#   - Use CB1A as the main auxiliary-only boundary audition loss.
+#   - Re-enable weak RPE/exploration as background sparsity pressure.
 
 seed: 1
 
@@ -82,22 +82,23 @@ training:
   selection_margin_reg_weight_rst: 0.1
 
   # CE-conditioned Boundary-1 Audition (CB1A)
-  # v4.1.6.1 replaces RPE/exploration with this aux-only boundary loss.
   # CB1A execution controls are code defaults, not config knobs:
   #   enabled=True, tau_stopgrad=True, anchor_stopgrad=True,
   #   forward_influence=False.
-  # Loss form:
-  #   cb1a_weight * (
-  #       qk_challenge_weight  * qk_challenge
-  #     + qk_prune_weight      * qk_prune
-  #     + v_challenge_weight   * v_challenge
-  #     + v_prune_weight       * v_prune
-  #     + rst_challenge_weight * rst_challenge
-  #     + rst_prune_weight     * rst_prune
-  #   )
+  # Weight form follows the same shape as exploration/RPE:
+  #   global weight -> pool weight -> direct branch weights.
+  # Branch weights are kept explicit rather than hidden behind an
+  # asymmetry ratio, so challenge/prune can be tuned independently.
   # challenge: high-CE positions; boundary-near unselected candidates compete.
   # prune:     low-CE positions; boundary-near selected candidates shrink.
   cb1a_weight: 0.005
+
+  # Pool-level CB1A weights, matching exploration_weight_qk/v/rst style.
+  cb1a_qk_weight: 1.0
+  cb1a_v_weight: 1.0
+  cb1a_rst_weight: 1.0
+
+  # Direct branch weights inside each pool.
   cb1a_qk_challenge_weight: 1
   cb1a_qk_prune_weight: 1
   cb1a_v_challenge_weight: 2
@@ -107,8 +108,24 @@ training:
   cb1a_ce_mode: sigmoid_z
   cb1a_eps: 1.0e-8
 
-  # RPE/exploration is intentionally absent for v4.1.6.1.
-  # Do not add exploration_* keys unless you are explicitly reverting to 4160-style RPE.
+  # Exploration / RPE feedback, re-enabled for v4.1.6.1 + CB1A.
+  # RPE is the weaker background sparsity pressure; CB1A remains the
+  # main hard-token boundary audition loss.
+  rpe_enabled: true
+  exploration_weight: 0.0005
+  exploration_weight_qk: 0.0001
+  exploration_weight_v: 0.0005
+  exploration_weight_rst: 0.001
+
+  exploration_asymmetry: 1.0
+  exploration_asymmetry_qk: 1.0
+  exploration_asymmetry_v: 1.2
+  exploration_asymmetry_rst: 1.5
+
+  exploration_warmup_steps: 2000
+  exploration_lower_bound: 0.0
+  exploration_upper_bound: 0.70
+  exploration_bound_eps: 0.001
 
   # Chunking — 400M-specific memory/mesh setting
   n_chunks_qk: 1

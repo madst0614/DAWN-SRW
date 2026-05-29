@@ -1488,12 +1488,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _local_layers = int(getattr(model, 'n_layers', 1))
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
-    _disable_exploration_loss = (
-        str(_model_version) == 'spatial-r1-v4.1.6.1')
-    # v4.1.6.1 uses CB1A as the CE-conditioned boundary auxiliary.
-    # Do not run or weight the old RPE/exploration loss on this path.
-    if _disable_exploration_loss:
-        _rpe_enabled = False
+    # v4.1.6.1 now runs CB1A together with the bounded
+    # RPE/exploration auxiliary.  CB1A remains aux-only/stopgrad-protected,
+    # while RPE provides the weak easy-token sparsity / hard-token relaxation
+    # pressure.  Do not hard-disable _rpe_enabled by version here; respect the
+    # training config/defaults prepared in main().
     _rpe_requires_no_active_direct = (
         str(_model_version) == 'spatial-r1-v4.1.6.0')
 
@@ -5707,9 +5706,7 @@ def _print_regular_block(rec, ctx):
         f" k[m={rec['rst_op_gain_mean']:.2f} s={rec['rst_op_gain_std']:.2f}"
         f" max={rec['rst_op_gain_max']:.2f}]"
     )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
-        pass
-    elif is_v4160:
+    if is_v4160 or ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
         log_message(
             f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
             f" pos={rec['pos_frac']*100:.1f}%"
@@ -7254,18 +7251,12 @@ def _print_debug_block(rec, ctx):
         f"grad={_g('grad_global_preclip', _g('grad_norm')):.3f} "
         f"lr={_g('lr'):.3e}"
     )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
-        rpe_loss_terms = (
-            f"cb1a_raw={_g('cb1a_raw'):+.6f} "
-            f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
-        )
-    else:
-        rpe_loss_terms = (
-            f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
-            f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
-            f"cb1a_raw={_g('cb1a_raw'):+.6f} "
-            f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
-        )
+    rpe_loss_terms = (
+        f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
+        f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
+        f"cb1a_raw={_g('cb1a_raw'):+.6f} "
+        f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
+    )
     log_debug_message(
         f"loss_terms: ce={_g('ce_loss'):.6f} "
         f"aux_raw_lb_plus_internal_tau={_g('aux_loss_raw', _g('aux_loss')):.6f} "
@@ -7385,9 +7376,7 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('rst_weak_exposure_frac'):.5f}] "
             f"target={_g('attn_qk_dead_exposure_target'):.5f}"
         )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
-        pass
-    elif is_v4160:
+    if is_v4160 or ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
         log_debug_message(
             f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
             f"w_eff={_g('exploration_weight_effective'):.6f} "
@@ -8402,8 +8391,15 @@ def main():
         'selection_margin_reg_weight_v', 0.0)
     selection_margin_reg_weight_rst = tcfg.get(
         'selection_margin_reg_weight_rst', 0.0)
-    # v4.1 RPE exploration loss (0 weight => off; no-op for earlier versions).
-    exploration_weight = tcfg.get('exploration_weight', 0.0)
+    # v4.1 RPE/exploration loss.
+    # v4.1.6.1 default: run weak RPE together with CB1A.  Keep it mild by
+    # default; explicit config values still override this.
+    _v4161_exp_default_on = model_version_cfg == 'spatial-r1-v4.1.6.1'
+    _v4161_exp_default_weight = 0.0002
+    _v4161_exp_default_asymmetry = 1.2
+    exploration_weight = tcfg.get(
+        'exploration_weight',
+        _v4161_exp_default_weight if _v4161_exp_default_on else 0.0)
     exploration_weight_qk = tcfg.get('exploration_weight_qk', exploration_weight)
     if ('exploration_weight_qk' not in tcfg
             and ('exploration_weight_q' in tcfg or 'exploration_weight_k' in tcfg)):
@@ -8414,7 +8410,9 @@ def main():
     exploration_weight_k = exploration_weight_qk
     exploration_weight_v = tcfg.get('exploration_weight_v', exploration_weight)
     exploration_weight_rst = tcfg.get('exploration_weight_rst', exploration_weight)
-    exploration_asymmetry = tcfg.get('exploration_asymmetry', 0.15)
+    exploration_asymmetry = tcfg.get(
+        'exploration_asymmetry',
+        _v4161_exp_default_asymmetry if _v4161_exp_default_on else 0.15)
     exploration_asymmetry_qk = tcfg.get(
         'exploration_asymmetry_qk', exploration_asymmetry)
     if ('exploration_asymmetry_qk' not in tcfg
@@ -8445,10 +8443,7 @@ def main():
     exploration_normalize_by_layers = bool(tcfg.get(
         'exploration_normalize_by_layers',
         exploration_normalize_by_layers_default))
-    rpe_enabled = bool(tcfg.get(
-        'rpe_enabled', model_version_cfg != 'spatial-r1-v4.1.6.1'))
-    if model_version_cfg == 'spatial-r1-v4.1.6.1':
-        rpe_enabled = False
+    rpe_enabled = bool(tcfg.get('rpe_enabled', True))
     if not rpe_enabled:
         exploration_weight = 0.0
         exploration_weight_q = 0.0
@@ -8463,7 +8458,7 @@ def main():
         exploration_asymmetry_rst = 0.0
         exploration_weighted_clip = 0.0
     _cb1a_default_on = model_version_cfg == 'spatial-r1-v4.1.6.1'
-    # 4161 policy: CB1A replaces exploration/RPE and is always enabled.
+    # 4161 policy: CB1A is always enabled and runs together with weak RPE by default.
     # Do not expose cb1a_enabled, cb1a_tau_stopgrad,
     # cb1a_anchor_stopgrad, or cb1a_forward_influence as config knobs.
     cb1a_enabled = _cb1a_default_on
@@ -8473,9 +8468,15 @@ def main():
     # direct weights below are the effective knobs.
     cb1a_challenge_weight = 1.0 if _cb1a_default_on else 0.0
     cb1a_prune_weight = 1.0 if _cb1a_default_on else 0.0
-    cb1a_qk_weight = 1.0 if _cb1a_default_on else 0.0
-    cb1a_v_weight = 1.0 if _cb1a_default_on else 0.0
-    cb1a_rst_weight = 1.0 if _cb1a_default_on else 0.0
+    cb1a_qk_weight = tcfg.get(
+        'cb1a_qk_weight',
+        tcfg.get('cb1a_weight_qk', 1.0 if _cb1a_default_on else 0.0))
+    cb1a_v_weight = tcfg.get(
+        'cb1a_v_weight',
+        tcfg.get('cb1a_weight_v', 1.0 if _cb1a_default_on else 0.0))
+    cb1a_rst_weight = tcfg.get(
+        'cb1a_rst_weight',
+        tcfg.get('cb1a_weight_rst', 1.0 if _cb1a_default_on else 0.0))
     cb1a_qk_challenge_weight = tcfg.get(
         'cb1a_qk_challenge_weight', 0.05 if _cb1a_default_on else None)
     cb1a_qk_prune_weight = tcfg.get(
@@ -8781,7 +8782,46 @@ def main():
             rpe_enabled = bool(saved_training_config.get(
                 'rpe_enabled', rpe_enabled))
             if model_version_cfg == 'spatial-r1-v4.1.6.1':
-                rpe_enabled = False
+                # Older 4161 checkpoints may have saved rpe_enabled=False and
+                # exploration_weight=0 because the old code hard-disabled RPE.
+                # For the current run, prefer the current config/defaults so
+                # CB1A + weak RPE is enabled by default on resume too.
+                rpe_enabled = bool(tcfg.get('rpe_enabled', True))
+                exploration_weight = tcfg.get(
+                    'exploration_weight', _v4161_exp_default_weight)
+                exploration_weight_qk = tcfg.get(
+                    'exploration_weight_qk', exploration_weight)
+                if ('exploration_weight_qk' not in tcfg
+                        and ('exploration_weight_q' in tcfg
+                             or 'exploration_weight_k' in tcfg)):
+                    exploration_weight_qk = (
+                        float(tcfg.get('exploration_weight_q', exploration_weight))
+                        + float(tcfg.get('exploration_weight_k', exploration_weight))) * 0.5
+                exploration_weight_q = exploration_weight_qk
+                exploration_weight_k = exploration_weight_qk
+                exploration_weight_v = tcfg.get(
+                    'exploration_weight_v', exploration_weight)
+                exploration_weight_rst = tcfg.get(
+                    'exploration_weight_rst', exploration_weight)
+                exploration_asymmetry = tcfg.get(
+                    'exploration_asymmetry', _v4161_exp_default_asymmetry)
+                exploration_asymmetry_qk = tcfg.get(
+                    'exploration_asymmetry_qk', exploration_asymmetry)
+                if ('exploration_asymmetry_qk' not in tcfg
+                        and ('exploration_asymmetry_q' in tcfg
+                             or 'exploration_asymmetry_k' in tcfg)):
+                    exploration_asymmetry_qk = (
+                        float(tcfg.get('exploration_asymmetry_q', exploration_asymmetry))
+                        + float(tcfg.get('exploration_asymmetry_k', exploration_asymmetry))) * 0.5
+                exploration_asymmetry_q = exploration_asymmetry_qk
+                exploration_asymmetry_k = exploration_asymmetry_qk
+                exploration_asymmetry_v = tcfg.get(
+                    'exploration_asymmetry_v', exploration_asymmetry)
+                exploration_asymmetry_rst = tcfg.get(
+                    'exploration_asymmetry_rst', exploration_asymmetry)
+                exploration_weighted_clip = tcfg.get(
+                    'exploration_weighted_clip',
+                    tcfg.get('expl_w_clip', exploration_weighted_clip))
             # For 4161, ignore legacy saved CB1A control knobs. CB1A is
             # fixed-on, aux-only, stopgrad-protected; restore only the
             # intended scalar/direct branch weights.
@@ -8790,9 +8830,15 @@ def main():
                 'cb1a_weight', cb1a_weight)
             cb1a_challenge_weight = 1.0 if cb1a_enabled else 0.0
             cb1a_prune_weight = 1.0 if cb1a_enabled else 0.0
-            cb1a_qk_weight = 1.0 if cb1a_enabled else 0.0
-            cb1a_v_weight = 1.0 if cb1a_enabled else 0.0
-            cb1a_rst_weight = 1.0 if cb1a_enabled else 0.0
+            cb1a_qk_weight = saved_training_config.get(
+                'cb1a_qk_weight',
+                saved_training_config.get('cb1a_weight_qk', cb1a_qk_weight))
+            cb1a_v_weight = saved_training_config.get(
+                'cb1a_v_weight',
+                saved_training_config.get('cb1a_weight_v', cb1a_v_weight))
+            cb1a_rst_weight = saved_training_config.get(
+                'cb1a_rst_weight',
+                saved_training_config.get('cb1a_weight_rst', cb1a_rst_weight))
             cb1a_qk_challenge_weight = saved_training_config.get(
                 'cb1a_qk_challenge_weight', cb1a_qk_challenge_weight)
             cb1a_qk_prune_weight = saved_training_config.get(
@@ -8808,6 +8854,36 @@ def main():
             cb1a_ce_mode = saved_training_config.get(
                 'cb1a_ce_mode', cb1a_ce_mode)
             cb1a_eps = saved_training_config.get('cb1a_eps', cb1a_eps)
+            if model_version_cfg == 'spatial-r1-v4.1.6.1':
+                # For 4161 runs, prefer current config/defaults over legacy
+                # checkpoint values so CB1A+RPE knobs can be changed on resume.
+                cb1a_enabled = True
+                cb1a_weight = tcfg.get('cb1a_weight', cb1a_weight)
+                cb1a_challenge_weight = 1.0
+                cb1a_prune_weight = 1.0
+                cb1a_qk_weight = tcfg.get(
+                    'cb1a_qk_weight',
+                    tcfg.get('cb1a_weight_qk', cb1a_qk_weight))
+                cb1a_v_weight = tcfg.get(
+                    'cb1a_v_weight',
+                    tcfg.get('cb1a_weight_v', cb1a_v_weight))
+                cb1a_rst_weight = tcfg.get(
+                    'cb1a_rst_weight',
+                    tcfg.get('cb1a_weight_rst', cb1a_rst_weight))
+                cb1a_qk_challenge_weight = tcfg.get(
+                    'cb1a_qk_challenge_weight', cb1a_qk_challenge_weight)
+                cb1a_qk_prune_weight = tcfg.get(
+                    'cb1a_qk_prune_weight', cb1a_qk_prune_weight)
+                cb1a_v_challenge_weight = tcfg.get(
+                    'cb1a_v_challenge_weight', cb1a_v_challenge_weight)
+                cb1a_v_prune_weight = tcfg.get(
+                    'cb1a_v_prune_weight', cb1a_v_prune_weight)
+                cb1a_rst_challenge_weight = tcfg.get(
+                    'cb1a_rst_challenge_weight', cb1a_rst_challenge_weight)
+                cb1a_rst_prune_weight = tcfg.get(
+                    'cb1a_rst_prune_weight', cb1a_rst_prune_weight)
+                cb1a_ce_mode = tcfg.get('cb1a_ce_mode', cb1a_ce_mode)
+                cb1a_eps = tcfg.get('cb1a_eps', cb1a_eps)
             dead_penalty_weighted_clip = saved_training_config.get(
                 'dead_penalty_weighted_clip', dead_penalty_weighted_clip)
             global_grad_clip = saved_training_config.get(
@@ -9360,7 +9436,10 @@ def main():
         print("  CB1A: "
               f"enabled={cb1a_enabled} "
               f"ce_mode={cb1a_ce_mode} eps={cb1a_eps}")
-        print("    direct weights: "
+        print("    pool weights: "
+              f"qk={cb1a_qk_weight} v={cb1a_v_weight} "
+              f"rst={cb1a_rst_weight}")
+        print("    branch weights: "
               f"qk=({cb1a_qk_challenge_weight}, {cb1a_qk_prune_weight}) "
               f"v=({cb1a_v_challenge_weight}, {cb1a_v_prune_weight}) "
               f"rst=({cb1a_rst_challenge_weight}, "
