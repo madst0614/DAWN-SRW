@@ -2713,9 +2713,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         k_norms = jnp.linalg.norm(jax.lax.stop_gradient(K), axis=-1)
         v_norms = jnp.linalg.norm(jax.lax.stop_gradient(V), axis=-1)
         k_norm_i = jnp.take_along_axis(
-            k_norms, key_idx[..., None], axis=-1).squeeze(-1)
+            k_norms, key_idx.astype(jnp.int32), axis=-1)
         v_norm_i = jnp.take_along_axis(
-            v_norms, key_idx[..., None], axis=-1).squeeze(-1)
+            v_norms, key_idx.astype(jnp.int32), axis=-1)
         o_in_norm = jnp.linalg.norm(
             jax.lax.stop_gradient(out_dbg), axis=-1)
         score = jnp.maximum(
