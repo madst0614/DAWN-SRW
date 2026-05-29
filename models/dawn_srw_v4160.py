@@ -387,7 +387,7 @@ SPIKE_TOKEN_ALIGN_FIELD_COUNT = 19
 # attributed to attention, RST, final norm/readout, or backward-only effects.
 SPIKE_FOCUS_PATH_FIELD_COUNT = 28
 SPIKE_FOCUS_ROUTE_FIELD_COUNT = 24
-SPIKE_FOCUS_SRW_FIELD_COUNT = 25
+SPIKE_FOCUS_SRW_FIELD_COUNT = 31
 SPIKE_FOCUS_ATTN_FIELD_COUNT = 18
 
 
@@ -2301,6 +2301,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   focus_b=None,
                   focus_pos=None,
                   focus_rank=None,
+                  focus_target_emb=None,
+                  focus_pred_emb=None,
                   d_select=None,
                   intensity_beta=0.5):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
@@ -2436,6 +2438,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     _focus_b = focus_b if focus_b is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
     _focus_pos = focus_pos if focus_pos is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
     _focus_rank = focus_rank if focus_rank is not None else jnp.arange(_focus_take_k, dtype=jnp.float32)
+    _focus_target_emb = (focus_target_emb.astype(jnp.float32)
+                         if focus_target_emb is not None
+                         else jnp.zeros((_focus_take_k, D), dtype=jnp.float32))
+    _focus_pred_emb = (focus_pred_emb.astype(jnp.float32)
+                       if focus_pred_emb is not None
+                       else jnp.zeros((_focus_take_k, D), dtype=jnp.float32))
     _d_select = int(d_select or max(1, Q.shape[-1] * n_heads // 2))
     _intensity_beta = jnp.float32(intensity_beta)
 
@@ -2478,6 +2486,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         read_norm = jnp.linalg.norm(read_f, axis=-1)
         write_norm = jnp.linalg.norm(write_f, axis=-1)
         op_gain = read_norm * write_norm
+        read_target = _focus_target_emb @ read_dir.T
+        read_pred = _focus_pred_emb @ read_dir.T
+        write_target = _focus_target_emb @ write_dir.T
+        write_pred = _focus_pred_emb @ write_dir.T
+        write_pred_minus_target = write_pred - write_target
+        contrib_pred_minus_target = (weighted / jnp.maximum(den[:, None], 1e-8)
+                                     * pool_scale * write_pred_minus_target)
         score = jnp.abs(weighted) * write_norm[None, :]
         vals, idx = jax.lax.top_k(score, min(_focus_take_k, int(score.shape[-1])))
         def take(a):
@@ -2509,6 +2524,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             jnp.broadcast_to(out_norm[:, None], vals.shape),
             jnp.broadcast_to(jnp.linalg.norm(xf, axis=-1)[:, None], vals.shape),
             jnp.broadcast_to(jnp.linalg.norm(hf, axis=-1)[:, None], vals.shape),
+            take(read_target),
+            take(read_pred),
+            take(write_target),
+            take(write_pred),
+            take(write_pred_minus_target),
+            take(contrib_pred_minus_target),
         ], axis=-1).astype(jnp.float32)
 
     def _attention_focus_rows(attn_scores, attn_w, out_dbg):
@@ -3020,6 +3041,8 @@ def _rst_forward(x, pool_params, router_params, rng,
                   focus_b=None,
                   focus_pos=None,
                   focus_rank=None,
+                  focus_target_emb=None,
+                  focus_pred_emb=None,
                   d_select=None,
                   intensity_beta=0.5):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
@@ -3055,6 +3078,12 @@ def _rst_forward(x, pool_params, router_params, rng,
     _focus_b = focus_b if focus_b is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
     _focus_pos = focus_pos if focus_pos is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
     _focus_rank = focus_rank if focus_rank is not None else jnp.arange(_focus_take_k, dtype=jnp.float32)
+    _focus_target_emb = (focus_target_emb.astype(jnp.float32)
+                         if focus_target_emb is not None
+                         else jnp.zeros((_focus_take_k, D), dtype=jnp.float32))
+    _focus_pred_emb = (focus_pred_emb.astype(jnp.float32)
+                       if focus_pred_emb is not None
+                       else jnp.zeros((_focus_take_k, D), dtype=jnp.float32))
     _d_select = int(d_select or max(1, h.shape[-1] // 2))
     _intensity_beta = jnp.float32(intensity_beta)
 
@@ -3090,6 +3119,13 @@ def _rst_forward(x, pool_params, router_params, rng,
         read_norm = jnp.linalg.norm(read_f, axis=-1)
         write_norm = jnp.linalg.norm(write_f, axis=-1)
         op_gain = read_norm * write_norm
+        read_target = _focus_target_emb @ read_dir.T
+        read_pred = _focus_pred_emb @ read_dir.T
+        write_target = _focus_target_emb @ write_dir.T
+        write_pred = _focus_pred_emb @ write_dir.T
+        write_pred_minus_target = write_pred - write_target
+        contrib_pred_minus_target = (weighted / jnp.maximum(den[:, None], 1e-8)
+                                     * pool_scale * write_pred_minus_target)
         score = jnp.abs(weighted) * write_norm[None, :]
         vals, idx = jax.lax.top_k(score, min(_focus_take_k, int(score.shape[-1])))
         def take(a):
@@ -3120,6 +3156,12 @@ def _rst_forward(x, pool_params, router_params, rng,
             jnp.broadcast_to(out_norm[:, None], vals.shape),
             jnp.broadcast_to(jnp.linalg.norm(xf, axis=-1)[:, None], vals.shape),
             jnp.broadcast_to(jnp.linalg.norm(hf, axis=-1)[:, None], vals.shape),
+            take(read_target),
+            take(read_pred),
+            take(write_target),
+            take(write_pred),
+            take(write_pred_minus_target),
+            take(contrib_pred_minus_target),
         ], axis=-1).astype(jnp.float32)
 
     if isinstance(sharded_fns, dict):
@@ -3387,6 +3429,9 @@ class DAWN(nn.Module):
             _focus_input_tok = spike_focus_input_ids.astype(jnp.int32)
             _focus_target_tok = spike_focus_target_ids.astype(jnp.int32)
             _focus_pred_tok = spike_focus_pred_ids.astype(jnp.int32)
+            _focus_vocab_emb = self.token_emb.embedding.astype(jnp.float32)
+            _focus_target_emb = _focus_vocab_emb[_focus_target_tok]
+            _focus_pred_emb = _focus_vocab_emb[_focus_pred_tok]
         if S > self.max_seq_len:
             raise ValueError(f"Sequence length {S} exceeds max_seq_len")
 
@@ -3672,6 +3717,8 @@ class DAWN(nn.Module):
                     focus_b=_focus_b if focus_probe_enabled else None,
                     focus_pos=_focus_pos if focus_probe_enabled else None,
                     focus_rank=_focus_rank if focus_probe_enabled else None,
+                    focus_target_emb=_focus_target_emb if focus_probe_enabled else None,
+                    focus_pred_emb=_focus_pred_emb if focus_probe_enabled else None,
                     d_select=self.d_select,
                     intensity_beta=0.5)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
@@ -3768,6 +3815,8 @@ class DAWN(nn.Module):
                     focus_b=_focus_b if focus_probe_enabled else None,
                     focus_pos=_focus_pos if focus_probe_enabled else None,
                     focus_rank=_focus_rank if focus_probe_enabled else None,
+                    focus_target_emb=_focus_target_emb if focus_probe_enabled else None,
+                    focus_pred_emb=_focus_pred_emb if focus_probe_enabled else None,
                     d_select=self.d_select,
                     intensity_beta=0.5)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,

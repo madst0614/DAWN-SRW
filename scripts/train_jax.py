@@ -178,7 +178,10 @@ SPIKE_FOCUS_SRW_FIELD_NAMES = (
     'gate_raw', 'gate_den', 'gate_share', 'active_n_for_token',
     'read_scalar_xr', 'abs_read_scalar_xr', 'read_norm', 'write_norm',
     'op_gain', 'raw_out_norm_for_token', 'out_norm_for_token',
-    'resid_norm_for_token', 'h_norm_for_token')
+    'resid_norm_for_token', 'h_norm_for_token',
+    'read_dot_target', 'read_dot_pred',
+    'write_dot_target', 'write_dot_pred',
+    'write_pred_minus_target', 'contrib_pred_minus_target')
 
 SPIKE_FOCUS_ATTN_FIELD_NAMES = (
     'rank', 'batch', 'query_pos', 'layer', 'head', 'key_pos', 'score',
@@ -6469,14 +6472,25 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
             val = _pt_margin(post_r) - _pt_margin(post_a)
             if val > rst_shift[0]:
                 rst_shift = (val, layer)
+    final_target_shift = 0.0
+    final_pred_shift = 0.0
+    final_norm_gain_ratio = 0.0
     if focus_rank0:
         final_rows = [r for r in focus_rank0 if int(r.get('stage_id', -1)) == 7]
-        last_post = None
-        if path_map:
-            last_layer = max(k[0] for k in path_map if k[0] >= 0)
-            last_post = path_map.get((last_layer, 6))
+        last_post_rows = [r for r in focus_rank0 if int(r.get('stage_id', -1)) == 6]
+        last_post = (max(last_post_rows, key=lambda r: int(r.get('layer', -1)))
+                     if last_post_rows else None)
         if final_rows and last_post:
-            final_shift = _pt_margin(final_rows[-1]) - _pt_margin(last_post)
+            final_row = final_rows[-1]
+            final_shift = _finite_float(
+                final_row.get('delta_pred_minus_target_dot',
+                              _pt_margin(final_row) - _pt_margin(last_post)),
+                0.0)
+            final_target_shift = _finite_float(final_row.get('delta_target_dot', 0.0), 0.0)
+            final_pred_shift = _finite_float(final_row.get('delta_pred_dot', 0.0), 0.0)
+            raw_last_pt = _pt_margin(last_post)
+            final_norm_gain_ratio = (_pt_margin(final_row)
+                                     / max(abs(raw_last_pt), 1.0e-6))
 
     max_focus_attn_out = max(
         (_finite_float(r.get('attn_out_norm', 0.0), 0.0)
@@ -6545,7 +6559,7 @@ def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
                 f"final-hidden alignment: cos[input={input_cos:.4f}, pred={pred_cos:.4f}, target={target_cos:.4f}] dot[input={input_dot:.4g}, pred={pred_dot:.4g}, target={target_dot:.4g}]")
         if focus_rank0:
             evidence.append(
-                f"focus path shift: max_attn_pred_minus_target_delta={attn_shift[0]:.4g}@L{attn_shift[1]}, max_rst_pred_minus_target_delta={rst_shift[0]:.4g}@L{rst_shift[1]}, final_norm_delta={final_shift:.4g}")
+                f"focus path shift: max_attn_pred_minus_target_delta={attn_shift[0]:.4g}@L{attn_shift[1]}, max_rst_pred_minus_target_delta={rst_shift[0]:.4g}@L{rst_shift[1]}, final_norm_delta={final_shift:.4g}, final_norm_delta[tgt={final_target_shift:.4g}, pred={final_pred_shift:.4g}], final_norm_gain={final_norm_gain_ratio:.4g}x")
             evidence.append(
                 f"focus route out_norm max: attn={max_focus_attn_out:.4g}, rst={max_focus_rst_out:.4g}")
             if attn_shift[0] > max(rst_shift[0], final_shift, 2.0):
@@ -6692,6 +6706,46 @@ def _format_spike_text(event):
                 f"dot[in={r.get('input_dot', 0.0):.3f} target={r.get('target_dot', 0.0):.3f} pred={r.get('pred_dot', 0.0):.3f}] "
                 f"norm[h={r.get('hidden_norm', 0.0):.3f} in={r.get('input_emb_norm', 0.0):.3f} target={r.get('target_emb_norm', 0.0):.3f} pred={r.get('pred_emb_norm', 0.0):.3f}]")
 
+    focus_srw = sorted(
+        [r for r in probe.get('focus_srw_top', [])
+         if int(r.get('rank', -1)) in (0, 1)],
+        key=lambda r: r.get('score', 0.0),
+        reverse=True)
+    if focus_srw:
+        lines.append("same_top_token_srw_focus_topk:")
+        for row in focus_srw[:12]:
+            lines.append(
+                "  "
+                f"rank={row.get('rank')} L{int(row.get('layer', -1)):02d} pool={row.get('pool')} "
+                f"b={row.get('batch')} pos={row.get('pos')} neuron={row.get('neuron_global_id')} "
+                f"score={row.get('score', 0.0):.6f} gate_share={row.get('gate_share', 0.0):.6f} "
+                f"xr={row.get('read_scalar_xr', 0.0):.6f} int={row.get('intensity', 0.0):.6f} "
+                f"rho={row.get('rho', 0.0):.6f} tau={row.get('tau', 0.0):.6f} "
+                f"margin={row.get('margin', 0.0):.6f} out={row.get('out_norm_for_token', 0.0):.3f} "
+                f"write[tgt={row.get('write_dot_target', 0.0):+.4f} pred={row.get('write_dot_pred', 0.0):+.4f} p-t={row.get('write_pred_minus_target', 0.0):+.4f}] "
+                f"contrib_p-t={row.get('contrib_pred_minus_target', 0.0):+.4f}")
+
+    focus_attn = sorted(
+        [r for r in probe.get('focus_attention_top', [])
+         if int(r.get('rank', -1)) in (0, 1)],
+        key=lambda r: max(
+            abs(r.get('attn_logit', 0.0)),
+            r.get('attn_weight', 0.0) * 10.0,
+            r.get('attn_o_output_norm', 0.0)),
+        reverse=True)
+    if focus_attn:
+        lines.append("same_top_token_attention_focus_topk:")
+        for row in focus_attn[:12]:
+            lines.append(
+                "  "
+                f"rank={row.get('rank')} L{int(row.get('layer', -1)):02d} h={row.get('head')} "
+                f"b={row.get('batch')} q={row.get('query_pos')} k={row.get('key_pos')} "
+                f"rel={row.get('key_relpos', 0.0):.0f} self={row.get('key_is_self', 0)} "
+                f"logit={row.get('attn_logit', 0.0):.6f} w={row.get('attn_weight', 0.0):.6f} "
+                f"gap={row.get('attn_logit_gap_top1_top2', 0.0):.6f} ent={row.get('attn_entropy', 0.0):.6f} "
+                f"q={row.get('q_norm', 0.0):.3f} k_norm={row.get('k_norm', 0.0):.3f} "
+                f"v={row.get('v_norm', 0.0):.3f} o_out={row.get('attn_o_output_norm', 0.0):.3f}")
+
     stage_names = {
         0: 'pre_attn', 1: 'norm1', 2: 'attn_out', 3: 'post_attn',
         4: 'norm2', 5: 'rst_out', 6: 'post_rst', 7: 'final_norm',
@@ -6756,43 +6810,6 @@ def _format_spike_text(event):
                     f"tau[q={r.get('q_tau', 0.0):.4f} k={r.get('k_tau', 0.0):.4f} v={r.get('v_tau', 0.0):.4f} rst={r.get('rst_tau', 0.0):.4f}] "
                     f"no[q={r.get('q_no_active', 0.0):.0f} k={r.get('k_no_active', 0.0):.0f} v={r.get('v_no_active', 0.0):.0f} rst={r.get('rst_no_active', 0.0):.0f}]")
 
-    focus_srw = sorted(
-        [r for r in probe.get('focus_srw_top', [])
-         if int(r.get('rank', -1)) in (0, 1)],
-        key=lambda r: r.get('score', 0.0),
-        reverse=True)
-    if focus_srw:
-        lines.append("same_top_token_srw_focus_topk:")
-        for row in focus_srw[:12]:
-            lines.append(
-                "  "
-                f"rank={row.get('rank')} L{int(row.get('layer', -1)):02d} pool={row.get('pool')} "
-                f"b={row.get('batch')} pos={row.get('pos')} neuron={row.get('neuron_global_id')} "
-                f"score={row.get('score', 0.0):.6f} gate_share={row.get('gate_share', 0.0):.6f} "
-                f"xr={row.get('read_scalar_xr', 0.0):.6f} int={row.get('intensity', 0.0):.6f} "
-                f"rho={row.get('rho', 0.0):.6f} tau={row.get('tau', 0.0):.6f} "
-                f"margin={row.get('margin', 0.0):.6f} out={row.get('out_norm_for_token', 0.0):.3f}")
-
-    focus_attn = sorted(
-        [r for r in probe.get('focus_attention_top', [])
-         if int(r.get('rank', -1)) in (0, 1)],
-        key=lambda r: max(
-            abs(r.get('attn_logit', 0.0)),
-            r.get('attn_weight', 0.0) * 10.0,
-            r.get('attn_o_output_norm', 0.0)),
-        reverse=True)
-    if focus_attn:
-        lines.append("same_top_token_attention_focus_topk:")
-        for row in focus_attn[:12]:
-            lines.append(
-                "  "
-                f"rank={row.get('rank')} L{int(row.get('layer', -1)):02d} h={row.get('head')} "
-                f"b={row.get('batch')} q={row.get('query_pos')} k={row.get('key_pos')} "
-                f"rel={row.get('key_relpos', 0.0):.0f} self={row.get('key_is_self', 0)} "
-                f"logit={row.get('attn_logit', 0.0):.6f} w={row.get('attn_weight', 0.0):.6f} "
-                f"gap={row.get('attn_logit_gap_top1_top2', 0.0):.6f} ent={row.get('attn_entropy', 0.0):.6f} "
-                f"q={row.get('q_norm', 0.0):.3f} k_norm={row.get('k_norm', 0.0):.3f} "
-                f"v={row.get('v_norm', 0.0):.3f} o_out={row.get('attn_o_output_norm', 0.0):.3f}")
 
     srw = sorted(
         probe.get('srw_top_contributors', []),
