@@ -3683,6 +3683,14 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8):
                 'spike_focus_route_trace',
                 jnp.full((1, _topk, len(SPIKE_FOCUS_ROUTE_FIELD_NAMES)),
                          -jnp.inf, dtype=jnp.float32)),
+            'spike_focus_srw_top': focus_result.get(
+                'spike_focus_srw_top',
+                jnp.full((1, _topk, _topk, len(SPIKE_FOCUS_SRW_FIELD_NAMES)),
+                         -jnp.inf, dtype=jnp.float32)),
+            'spike_focus_attention_top': focus_result.get(
+                'spike_focus_attention_top',
+                jnp.full((1, _topk, _topk, len(SPIKE_FOCUS_ATTN_FIELD_NAMES)),
+                         -jnp.inf, dtype=jnp.float32)),
         }
 
     return spike_probe_step if _pass_spike_kw else None
@@ -6724,6 +6732,8 @@ def _format_spike_text(event):
                 f"margin={row.get('margin', 0.0):.6f} out={row.get('out_norm_for_token', 0.0):.3f} "
                 f"write[tgt={row.get('write_dot_target', 0.0):+.4f} pred={row.get('write_dot_pred', 0.0):+.4f} p-t={row.get('write_pred_minus_target', 0.0):+.4f}] "
                 f"contrib_p-t={row.get('contrib_pred_minus_target', 0.0):+.4f}")
+    elif probe.get('focus_path_trace'):
+        lines.append("same_top_token_srw_focus_topk: empty_or_not_returned")
 
     focus_attn = sorted(
         [r for r in probe.get('focus_attention_top', [])
@@ -6745,6 +6755,8 @@ def _format_spike_text(event):
                 f"gap={row.get('attn_logit_gap_top1_top2', 0.0):.6f} ent={row.get('attn_entropy', 0.0):.6f} "
                 f"q={row.get('q_norm', 0.0):.3f} k_norm={row.get('k_norm', 0.0):.3f} "
                 f"v={row.get('v_norm', 0.0):.3f} o_out={row.get('attn_o_output_norm', 0.0):.3f}")
+    elif probe.get('focus_path_trace'):
+        lines.append("same_top_token_attention_focus_topk: empty_or_not_returned")
 
     stage_names = {
         0: 'pre_attn', 1: 'norm1', 2: 'attn_out', 3: 'post_attn',
