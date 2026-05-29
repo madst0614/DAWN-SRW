@@ -2561,7 +2561,16 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
         cand_logits = masked_scores[_focus_b, :, _focus_pos, :]  # [K,H,S]
         cand_weights = attn_w_sg[_focus_b, :, _focus_pos, :]
-        cand_score = jnp.maximum(jnp.abs(cand_logits), cand_weights * jnp.float32(10.0))
+        # Focus attention rows must rank only causally-valid keys.  The
+        # masked future logits are ~finfo.min; using abs(logit) accidentally
+        # made those future keys look largest.  Rank by attention weight after
+        # applying the causal valid-key mask so the printed rows are real keys.
+        valid_keys = causal[_focus_pos, :][:, None, :]  # [K,1,S]
+        cand_score = jnp.where(
+            valid_keys,
+            cand_weights,
+            jnp.full_like(cand_weights, -jnp.inf),
+        )
         flat_score = cand_score.reshape((_focus_take_k, -1))
         vals, flat_idx = jax.lax.top_k(flat_score, min(_focus_take_k, int(flat_score.shape[-1])))
         head_idx = flat_idx // S
