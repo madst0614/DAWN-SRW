@@ -150,6 +150,7 @@ training:
   spike_rst_out_threshold: 8.0
   spike_probe_on_event: true
   spike_probe_topk: 8
+  spike_probe_min_step: 0
   spike_history_steps: 20
 
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4161_400M_c4_40B_v4_64

@@ -8354,6 +8354,9 @@ def main():
     }
     spike_probe_on_event = bool(tcfg.get('spike_probe_on_event', True))
     spike_probe_topk = int(tcfg.get('spike_probe_topk', 8))
+    # Ignore early random-model CE spikes. The probe stays enabled, but
+    # events before this optimizer step are not recorded or probed.
+    spike_probe_min_step = int(tcfg.get('spike_probe_min_step', 1000))
     spike_history_steps = int(tcfg.get('spike_history_steps', 20))
     # Resume log append policy. Defaults preserve the previous behavior.
     # Set debug/spike to false in config to start fresh diagnostic files
@@ -10549,7 +10552,7 @@ def main():
             log_spike_message(f"Config: {config_path}")
             log_spike_message(f"Training log: {training_log_file}")
             log_spike_message(
-                f"Probe on event: {'on' if spike_probe_step_fn is not None else 'off'} topk={spike_probe_topk}")
+                f"Probe on event: {'on' if spike_probe_step_fn is not None else 'off'} topk={spike_probe_topk} min_step={spike_probe_min_step}")
             log_spike_message(
                 f"Thresholds: {json.dumps(spike_thresholds, sort_keys=True)}")
             log_spike_message(
@@ -11022,6 +11025,8 @@ def main():
                     _spike_raw, _event_step, epoch, _event_lr)
                 _spike_reasons = _spike_trigger_reasons(
                     _spike_rec, spike_thresholds)
+                if int(_event_step) < spike_probe_min_step:
+                    _spike_reasons = []
                 _spike_vec = np.asarray([
                     float(host_id),
                     1.0 if _spike_reasons else 0.0,
