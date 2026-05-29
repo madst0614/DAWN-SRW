@@ -799,27 +799,26 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             )
 
         def angular_exposure_dead_parts(rho_exposure):
-            # Angular exposure dead penalty:
-            # An operator is diagnostically dead if its signature never enters the
-            # positive angular half-space of any select query in the batch
-            # (max rho <= 0).
-            # The repair loss softly pulls weak/dead signatures toward
-            # dead_exposure_target, while stopping gradients through q_select so the
-            # query manifold is not distorted by the dead penalty.
-            local_exposure = rho_exposure.max(axis=(0, 1))  # [cs]
-            exposure = jax.lax.all_gather(
-                local_exposure, 'data', axis=0).max(axis=0)
-            dead_gap = jax.nn.relu(_dead_exposure_target - exposure)
-            penalty = jnp.square(dead_gap)
-            exposure_sg = jax.lax.stop_gradient(exposure)
-            dead_mask = exposure_sg <= 0.0
-            weak_mask = exposure_sg < _dead_exposure_target
+            # Dead repair uses the actual DirectTau selection boundary.
+            # An operator is dead only if it never crosses score > tau anywhere
+            # in this batch.  The repair target is the boundary itself:
+            # max(score - tau) -> 0.  Already-used operators receive no loss.
+            tau_ref = jax.lax.stop_gradient(tau)
+            local_margin_exposure = (
+                rho_exposure - tau_ref).max(axis=(0, 1))  # [cs]
+            margin_exposure = jax.lax.all_gather(
+                local_margin_exposure, 'data', axis=0).max(axis=0)
+            margin_exposure_sg = jax.lax.stop_gradient(margin_exposure)
+            dead_mask = margin_exposure_sg <= 0.0
+            dead_gap = jax.nn.relu(-margin_exposure)
+            penalty = dead_mask.astype(jnp.float32) * jnp.square(dead_gap)
+            weak_mask = dead_mask
             return (
                 penalty.sum(),
                 dead_mask.astype(jnp.float32).sum(),
-                exposure_sg.sum(),
-                exposure_sg.min(),
-                exposure_sg.max(),
+                margin_exposure_sg.sum(),
+                margin_exposure_sg.min(),
+                margin_exposure_sg.max(),
                 weak_mask.astype(jnp.float32).sum(),
             )
 
@@ -1343,7 +1342,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             global_exposure_max,
             dead_count_out / jnp.float32(N_total),
             global_weak_exposure_count / jnp.float32(N_total),
-            jax.lax.stop_gradient(_dead_exposure_target),
+            jax.lax.stop_gradient(jnp.float32(0.0)),
         )
 
         slim_out = (out.astype(jnp.float32), active_frac, global_gate_max, rho_lb,
@@ -1748,27 +1747,26 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             )
 
         def angular_exposure_dead_parts(rho_exposure):
-            # Angular exposure dead penalty:
-            # An operator is diagnostically dead if its signature never enters the
-            # positive angular half-space of any select query in the batch
-            # (max rho <= 0).
-            # The repair loss softly pulls weak/dead signatures toward
-            # dead_exposure_target, while stopping gradients through q_select so the
-            # query manifold is not distorted by the dead penalty.
-            local_exposure = rho_exposure.max(axis=(0, 1, 2))  # [cs]
-            exposure = jax.lax.all_gather(
-                local_exposure, 'data', axis=0).max(axis=0)
-            dead_gap = jax.nn.relu(_dead_exposure_target - exposure)
-            penalty = jnp.square(dead_gap)
-            exposure_sg = jax.lax.stop_gradient(exposure)
-            dead_mask = exposure_sg <= 0.0
-            weak_mask = exposure_sg < _dead_exposure_target
+            # Dead repair uses the actual DirectTau selection boundary.
+            # An operator is dead only if it never crosses score > tau anywhere
+            # in this batch.  The repair target is the boundary itself:
+            # max(score - tau) -> 0.  Already-used operators receive no loss.
+            tau_ref = jax.lax.stop_gradient(tau)
+            local_margin_exposure = (
+                rho_exposure - tau_ref).max(axis=(0, 1, 2))  # [cs]
+            margin_exposure = jax.lax.all_gather(
+                local_margin_exposure, 'data', axis=0).max(axis=0)
+            margin_exposure_sg = jax.lax.stop_gradient(margin_exposure)
+            dead_mask = margin_exposure_sg <= 0.0
+            dead_gap = jax.nn.relu(-margin_exposure)
+            penalty = dead_mask.astype(jnp.float32) * jnp.square(dead_gap)
+            weak_mask = dead_mask
             return (
                 penalty.sum(),
                 dead_mask.astype(jnp.float32).sum(),
-                exposure_sg.sum(),
-                exposure_sg.min(),
-                exposure_sg.max(),
+                margin_exposure_sg.sum(),
+                margin_exposure_sg.min(),
+                margin_exposure_sg.max(),
                 weak_mask.astype(jnp.float32).sum(),
             )
 
@@ -2323,7 +2321,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             global_exposure_max,
             dead_count_out / jnp.float32(N_total),
             global_weak_exposure_count / jnp.float32(N_total),
-            jax.lax.stop_gradient(_dead_exposure_target),
+            jax.lax.stop_gradient(jnp.float32(0.0)),
         )
 
         slim_out = (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, rho_lb,
