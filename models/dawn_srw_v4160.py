@@ -3049,6 +3049,7 @@ def _rst_forward(x, pool_params, router_params, rng,
 
     `analysis` see _attn_forward docstring.
     """
+    B, S, D = x.shape
     rst_emb = pool_params['rst_emb']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
