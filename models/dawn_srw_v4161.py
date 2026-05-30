@@ -73,7 +73,8 @@ For each token and pool:
     raw_tau = learned cutoff logit
     tau = sigmoid(raw_tau)
 
-    selection_margin = rho - tau
+    tau_for_gate     = stop_gradient(tau)
+    selection_margin = rho - tau_for_gate
     positive_margin  = relu(selection_margin)
     gate             = positive_margin * intensity
 
@@ -331,7 +332,8 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 #   rho              = cosine(q_select, signature)
 #   raw_tau          = learned direct cutoff logit
 #   tau              = sigmoid(raw_tau)
-#   selection_margin = rho - tau
+#   tau_for_gate     = stop_gradient(tau)
+#   selection_margin = rho - tau_for_gate
 #   positive_margin  = relu(selection_margin)
 #   gate             = positive_margin * intensity
 #   den              = max(sum(gate), 1.0)
@@ -510,7 +512,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         rho              = cosine(q_select, signature)
         raw_tau          = learned direct cutoff logit
         tau              = sigmoid(raw_tau)
-        selection_margin = rho - tau
+        tau_for_gate     = stop_gradient(tau)
+        selection_margin = rho - tau_for_gate
         positive_margin  = relu(selection_margin)
         gate             = positive_margin * intensity
         den              = max(sum(gate), 1.0)
@@ -743,7 +746,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             return jnp.square(positive_selection_margin)
 
         def angular_gate_parts(rho, intensity):
-            selection_margin = rho - tau
+            # Forward uses the learned DirectTau boundary, but CE/RWCompose
+            # gradients through gate must not update tau.  Tau is therefore
+            # trained only through explicit activation-policy auxiliaries such
+            # as RPE/exploration.  Score/query/signature/intensity/RW paths
+            # still receive the normal CE gradient.
+            tau_for_gate = tau_ref
+            selection_margin = rho - tau_for_gate
             positive_margin = jnp.maximum(selection_margin, 0.0)
             # positive_margin is not a fractional "amount of selection".
             # It is the positive angular selection margin: how far inside the
@@ -1691,7 +1700,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             return jnp.square(positive_selection_margin)
 
         def angular_gate_parts(rho, intensity):
-            selection_margin = rho - tau
+            # Forward uses the learned DirectTau boundary, but CE/RWCompose
+            # gradients through gate must not update tau.  Tau is therefore
+            # trained only through explicit activation-policy auxiliaries such
+            # as RPE/exploration.  Score/query/signature/intensity/RW paths
+            # still receive the normal CE gradient.
+            tau_for_gate = tau_ref
+            selection_margin = rho - tau_for_gate
             positive_margin = jnp.maximum(selection_margin, 0.0)
             # positive_margin is not a fractional "amount of selection".
             # It is the positive angular selection margin: how far inside the
@@ -2733,7 +2748,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         e_int = emb_f[:, d_sel:]
         intensity = jnp.exp(_intensity_beta * jnp.tanh(h_int @ e_int.T))
         tau = jax.nn.sigmoid(raw_tau[_focus_b, _focus_pos, 0].astype(jnp.float32))[:, None]
-        margin = rho - tau
+        tau_for_gate = jax.lax.stop_gradient(tau)
+        margin = rho - tau_for_gate
         pos_margin = jnp.maximum(margin, 0.0)
         gate = pos_margin * intensity
         gate_sum = gate.sum(axis=-1)
@@ -3387,7 +3403,8 @@ def _rst_forward(x, pool_params, router_params, rng,
         e_int = emb_f[:, d_sel:]
         intensity = jnp.exp(_intensity_beta * jnp.tanh(h_int @ e_int.T))
         tau = jax.nn.sigmoid(raw_tau[_focus_b, _focus_pos, 0].astype(jnp.float32))[:, None]
-        margin = rho - tau
+        tau_for_gate = jax.lax.stop_gradient(tau)
+        margin = rho - tau_for_gate
         pos_margin = jnp.maximum(margin, 0.0)
         gate = pos_margin * intensity
         gate_sum = gate.sum(axis=-1)
@@ -5164,10 +5181,12 @@ def _angular_gate(h, emb, raw_tau, raw_scan_offset=None, d_select=None,
     rho, intensity = _angular_relation_and_intensity(
         h, emb, d_select, intensity_beta)
     tau = jax.nn.sigmoid(raw_tau)
-    selection_margin = rho - tau
+    tau_for_gate = jax.lax.stop_gradient(tau)
+    selection_margin = rho - tau_for_gate
     positive_margin = jnp.maximum(selection_margin, 0.0)
-    # positive_margin is the differentiable soft selection signal; execution
-    # strength remains separated in the intensity branch.
+    # positive_margin is the differentiable soft selection signal for rho,
+    # but the DirectTau boundary is detached from CE/RWCompose gradients.
+    # Tau still receives gradients from explicit activation-policy auxiliaries.
     gate = positive_margin * intensity
     return gate.astype(jnp.float32)
 

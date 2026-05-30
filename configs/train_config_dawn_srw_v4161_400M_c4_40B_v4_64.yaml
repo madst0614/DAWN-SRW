@@ -60,8 +60,8 @@ training:
 
   # DirectTau Angular Select / Intensity
   tau_target_count_attn_qk: 1152
-  tau_target_count_attn_v: 600
-  tau_target_count_rst: 200
+  tau_target_count_attn_v: 1000
+  tau_target_count_rst: 500
   intensity_beta: 0.5
 
   # Auxiliary losses
