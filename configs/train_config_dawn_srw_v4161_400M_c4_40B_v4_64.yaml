@@ -100,10 +100,10 @@ training:
   # Direct branch weights inside each pool.
   cb1a_qk_challenge_weight: 1
   cb1a_qk_prune_weight: 1
-  cb1a_v_challenge_weight: 2
-  cb1a_v_prune_weight: 3
-  cb1a_rst_challenge_weight: 5
-  cb1a_rst_prune_weight: 10
+  cb1a_v_challenge_weight: 1
+  cb1a_v_prune_weight: 1
+  cb1a_rst_challenge_weight: 1
+  cb1a_rst_prune_weight: 1
   cb1a_ce_mode: sigmoid_z
   cb1a_eps: 1.0e-8
 
@@ -111,17 +111,17 @@ training:
   # RPE is the weaker background sparsity pressure; CB1A remains the
   # main hard-token boundary audition loss.
   rpe_enabled: true
-  exploration_weight: 0.0005
+  exploration_weight: 0.0001
   exploration_weight_qk: 0.0001
-  exploration_weight_v: 0.0005
-  exploration_weight_rst: 0.001
+  exploration_weight_v: 0.0001
+  exploration_weight_rst: 0.0001
 
   exploration_asymmetry: 1.0
   exploration_asymmetry_qk: 1.0
-  exploration_asymmetry_v: 1.2
-  exploration_asymmetry_rst: 1.5
+  exploration_asymmetry_v: 1.0
+  exploration_asymmetry_rst: 1.0
 
-  exploration_warmup_steps: 2000
+  exploration_warmup_steps: 5000
   exploration_lower_bound: 0.0
   exploration_upper_bound: 0.70
   exploration_bound_eps: 0.001
