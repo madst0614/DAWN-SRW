@@ -76,9 +76,9 @@ training:
   # Selection-margin regularization.
   # Penalizes only scores that cross the current DirectTau boundary.
   # Does not regularize inactive/pre-boundary candidates.
-  selection_margin_reg_weight_qk: 0.1
-  selection_margin_reg_weight_v: 0.1
-  selection_margin_reg_weight_rst: 0.1
+  selection_margin_reg_weight_qk: 0.0
+  selection_margin_reg_weight_v: 0.0
+  selection_margin_reg_weight_rst: 0.0
 
   # CE-conditioned Boundary-1 Audition (CB1A)
   # CB1A execution controls are code defaults, not config knobs:
@@ -111,17 +111,17 @@ training:
   # RPE is the weaker background sparsity pressure; CB1A remains the
   # main hard-token boundary audition loss.
   rpe_enabled: true
-  exploration_weight: 0.0001
-  exploration_weight_qk: 0.0001
-  exploration_weight_v: 0.0001
-  exploration_weight_rst: 0.0001
+  exploration_weight: 0.001
+  exploration_weight_qk: 0.001
+  exploration_weight_v: 0.001
+  exploration_weight_rst: 0.001
 
   exploration_asymmetry: 1.0
   exploration_asymmetry_qk: 1.0
   exploration_asymmetry_v: 1.0
   exploration_asymmetry_rst: 1.0
 
-  exploration_warmup_steps: 5000
+  exploration_warmup_steps: 0
   exploration_lower_bound: 0.0
   exploration_upper_bound: 0.70
   exploration_bound_eps: 0.001
