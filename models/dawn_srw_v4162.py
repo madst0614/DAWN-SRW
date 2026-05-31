@@ -3741,7 +3741,7 @@ class DAWN(nn.Module):
                      a_softmax_top1_mean, a_softmax_top1_max,
                      a_logit_gap_mean, a_logit_gap_max,
                      a_softmax_entropy_mean, a_softmax_entropy_min,
-                     a_o_input_norm_max, a_o_out_norm_max) = attn_ret[68:105]
+                     a_o_input_norm_max, a_o_out_norm_max) = attn_ret[63:100]
                 if local_diagnostics:
                     if spike_probe and focus_probe_enabled:
                         _a_local_tail = attn_ret[-10:-5]
@@ -3823,7 +3823,7 @@ class DAWN(nn.Module):
                      k_skew, k_apt_std, k_entropy,
                      k_den_cost, k_selection_cost, k_current_cost,
                      k_emb_n_max, k_rho_kurt, k_margin_band,
-                     k_int_cap_frac) = rst_ret[54:69]
+                     k_int_cap_frac) = rst_ret[51:66]
                 if local_diagnostics:
                     if spike_probe and focus_probe_enabled:
                         _k_local_tail = rst_ret[-7:-3]
