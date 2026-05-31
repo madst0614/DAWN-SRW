@@ -277,7 +277,16 @@ def _compute_soft_gate(score, tau, intensity, temperature, tau_ce_grad_scale,
     return margin, soft_weight, gate, active_mask
 
 
-# Count-based DirectTau initialization is intentionally absent in clean v4162.
+LOCAL_SPIKE_METRIC_COUNT = 11
+LOCAL_SPIKE_TOP1_COUNT = 17
+ATTN_LOCAL_METRIC_COUNT = 7
+SPIKE_SRW_FIELD_COUNT = 26
+SPIKE_ATTN_FIELD_COUNT = 14
+SPIKE_TOKEN_FIELD_COUNT = 13
+SPIKE_FOCUS_PATH_FIELD_COUNT = 28
+SPIKE_FOCUS_ROUTE_FIELD_COUNT = 24
+SPIKE_FOCUS_SRW_FIELD_COUNT = 31
+SPIKE_FOCUS_ATTN_FIELD_COUNT = 18
 
 
 def _topk_rows(candidates, topk, field_count):
@@ -3366,6 +3375,8 @@ class DAWN(nn.Module):
         such as distribution shape, selection diagnostics, entropy, tau stats,
         raw norms, and debug norms.
         """
+        n_rst_eff = self.n_rst if self.n_rst is not None else (
+            self.n_know if self.n_know is not None else 25200)
         B, S = input_ids.shape
         focus_probe_enabled = bool(spike_probe and spike_focus_bpos is not None)
         focus_k = int(spike_probe_topk)
@@ -4195,7 +4206,8 @@ class DAWN(nn.Module):
             'execution_prune_gate_den_min': jnp.minimum(
                 attn_den_cost_mean_all.min(), rst_den_cost_mean_all.min()),
             'execution_prune_no_active_frac': (
-                jnp.mean((attn_active_all <= 0.0).astype(jnp.float32))
+                (jnp.mean((attn_qk_active_all <= 0.0).astype(jnp.float32))
+                 + jnp.mean((attn_v_active_all <= 0.0).astype(jnp.float32))) / 2.0
                 + jnp.mean((rst_active_all <= 0.0).astype(jnp.float32))) / 2.0,
             'execution_prune_unpruned_gate_den_mean': (
                 attn_current_cost_mean_all.mean() + rst_current_cost_mean_all.mean()) / 2.0,
