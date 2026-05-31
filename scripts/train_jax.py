@@ -83,6 +83,7 @@ try:
     from models.dawn_srw_v4161 import DAWN as DAWN_SRW_V4161
 except ImportError:
     DAWN_SRW_V4161 = None
+from models.dawn_srw_v4162 import DAWN as DAWN_SRW_V4162
 
 # ============================================================
 # Constants
@@ -99,11 +100,13 @@ SRW_ACTIVE_MODEL_VERSIONS = (
     'spatial-r1-v4.1.5.9',
     'spatial-r1-v4.1.6.0',
     'spatial-r1-v4.1.6.1',
+    'spatial-r1-v4.1.6.2',
 )
 
 DIRECT_TAU_SPLIT_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.0',
     'spatial-r1-v4.1.6.1',
+    'spatial-r1-v4.1.6.2',
 )
 
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
@@ -574,22 +577,40 @@ def _dawn_srw_kwargs(cfg):
                 'tau_offset_init_rst', t.get('tau_offset_init_rst'))
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
-    if version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1'):
-        def _tau_target_count_cfg(name):
+    if version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1',
+                   'spatial-r1-v4.1.6.2'):
+        def _cfg_get(name, default=None):
             if name in m:
                 return m[name]
             if name in t:
                 return t[name]
-            raise ValueError(
-                f"{version} requires {name} for count-based "
-                "DirectTau initialization.")
+            return default
 
-        kw['tau_target_count_attn_qk'] = _tau_target_count_cfg(
-            'tau_target_count_attn_qk')
-        kw['tau_target_count_attn_v'] = _tau_target_count_cfg(
-            'tau_target_count_attn_v')
-        kw['tau_target_count_rst'] = _tau_target_count_cfg(
-            'tau_target_count_rst')
+        def _legacy_count_init_cfg(name):
+            val = _cfg_get(name, None)
+            if val is None:
+                raise ValueError(
+                    f"{version} requires {name} for count-based "
+                    "DirectTau initialization.")
+            return val
+
+        if version == 'spatial-r1-v4.1.6.2':
+            explicit_qk = _cfg_get('tau_init_attn_qk', None)
+            explicit_v = _cfg_get('tau_init_attn_v', None)
+            explicit_rst = _cfg_get('tau_init_rst', None)
+            if explicit_qk is None or explicit_v is None or explicit_rst is None:
+                raise ValueError(
+                    "v4162 requires explicit cosine-space tau_init_attn_qk/v/rst.")
+            kw['tau_init_attn_qk'] = explicit_qk
+            kw['tau_init_attn_v'] = explicit_v
+            kw['tau_init_rst'] = explicit_rst
+        else:
+            kw['legacy_count_init_attn_qk'] = _legacy_count_init_cfg(
+                'legacy_count_init_attn_qk')
+            kw['legacy_count_init_attn_v'] = _legacy_count_init_cfg(
+                'legacy_count_init_attn_v')
+            kw['legacy_count_init_rst'] = _legacy_count_init_cfg(
+                'legacy_count_init_rst')
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
     return kw
@@ -611,9 +632,7 @@ def _v415_sharded_kwargs(cfg):
             dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
         )
     elif version == 'spatial-r1-v4.1.6.1':
-        # CB1A is fixed-on and auxiliary-only for 4161. These are no longer
-        # public config knobs: enabled=True, tau/anchor stopgrad=True,
-        # forward_influence=False. Keep only eps configurable.
+        # v4161 is intentionally left on its original CB1A path.
         kw = dict(
             dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
             cb1a_enabled=True,
@@ -621,6 +640,14 @@ def _v415_sharded_kwargs(cfg):
             cb1a_anchor_stopgrad=True,
             cb1a_forward_influence=False,
             cb1a_eps=float(t.get('cb1a_eps', 1.0e-8)),
+        )
+    elif version == 'spatial-r1-v4.1.6.2':
+        # v4162 clean path: soft annealed DirectTau only. no CB1A/edge auxiliary kwargs.
+        kw = dict(
+            dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
+            soft_gate_enabled=bool(t.get('soft_gate_enabled', True)),
+            soft_gate_effective_active_eps=float(
+                t.get('soft_gate_effective_active_eps', 1.0e-6)),
         )
     else:
         kw = dict(
@@ -638,7 +665,8 @@ def _v415_sharded_kwargs(cfg):
     if version in (
             'spatial-r1-v4.1.5.9',
             'spatial-r1-v4.1.6.0',
-            'spatial-r1-v4.1.6.1') and d_select_cfg is None:
+            'spatial-r1-v4.1.6.1',
+            'spatial-r1-v4.1.6.2') and d_select_cfg is None:
         raise ValueError(
             f"{version} angular SRW requires model.d_select.")
     if d_select_cfg is not None:
@@ -751,6 +779,17 @@ if DAWN_SRW_V4161 is not None:
         name='spatial-r1-v4.1.6.1',
         module_path='models.dawn_srw_v4161',
         cls=DAWN_SRW_V4161,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    )
+
+if DAWN_SRW_V4162 is not None:
+    MODEL_REGISTRY['spatial-r1-v4.1.6.2'] = ModelSpec(
+        name='spatial-r1-v4.1.6.2',
+        module_path='models.dawn_srw_v4162',
+        cls=DAWN_SRW_V4162,
         build_kwargs=_dawn_srw_kwargs,
         supports_sharded=True,
         force_sharded=True,
@@ -1150,6 +1189,26 @@ def _model_accepts_local_diagnostics(model):
         return False
 
 
+def _model_accepts_soft_gate_schedule(model):
+    """Return True if model.__call__ accepts v4162 soft-gate schedule kwargs."""
+    import inspect as _inspect
+    try:
+        params = _inspect.signature(model.__call__).parameters
+        return ('soft_gate_temperature' in params
+                and 'tau_ce_grad_scale' in params)
+    except (TypeError, ValueError):
+        return False
+
+
+def _model_accepts_execution_prune_eps(model):
+    """Return True if model.__call__ accepts eval-time execution pruning."""
+    import inspect as _inspect
+    try:
+        return 'execution_prune_eps' in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _model_accepts_spike_probe(model):
     """Return True if model.__call__ accepts the event-triggered probe path."""
     import inspect as _inspect
@@ -1171,6 +1230,37 @@ def _model_accepts_spike_focus_probe(model):
 
 def _scalar0(x):
     return jnp.asarray(x, dtype=jnp.float32).reshape(())
+
+
+def scheduled_value_by_frac(step, total_steps, start, final, hold_frac,
+                            end_frac, schedule='cosine'):
+    """Piecewise hold/anneal/hold scalar schedule by training fraction."""
+    step_f = jnp.asarray(step, dtype=jnp.float32)
+    total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
+    frac = jnp.clip(step_f / total_f, 0.0, 1.0)
+    hold = jnp.asarray(hold_frac, dtype=jnp.float32)
+    end = jnp.maximum(jnp.asarray(end_frac, dtype=jnp.float32),
+                      hold + 1.0e-6)
+    progress = jnp.clip((frac - hold) / (end - hold), 0.0, 1.0)
+    schedule_name = str(schedule).lower()
+    if schedule_name == 'constant':
+        mix = jnp.float32(0.0)
+    elif schedule_name == 'linear':
+        mix = progress
+    elif schedule_name == 'cosine':
+        mix = 0.5 - 0.5 * jnp.cos(jnp.pi * progress)
+    else:
+        raise ValueError(
+            f"Unsupported schedule={schedule!r}; expected cosine, linear, or constant.")
+    val = (jnp.asarray(start, dtype=jnp.float32)
+           + (jnp.asarray(final, dtype=jnp.float32)
+              - jnp.asarray(start, dtype=jnp.float32)) * mix)
+    return jnp.where(frac < hold, jnp.asarray(start, dtype=jnp.float32),
+                     jnp.where(frac >= end,
+                               jnp.asarray(final, dtype=jnp.float32), val))
+
+
+_scheduled_scalar = scheduled_value_by_frac
 
 
 def _global_norm_array(x):
@@ -1331,9 +1421,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       cb1a_ce_mode='sigmoid_z',
                       cb1a_eps=1.0e-8,
                       dead_penalty_weighted_clip=0.0,
-                      selection_margin_reg_weight_qk=0.0,
-                      selection_margin_reg_weight_v=0.0,
-                      selection_margin_reg_weight_rst=0.0,
+                      removed_margin_reg_weight_qk=0.0,
+                      removed_margin_reg_weight_v=0.0,
+                      removed_margin_reg_weight_rst=0.0,
                       global_grad_clip=0.0,
                       tau_lr_mult=1.0,
                       tau_grad_clip=0.0,
@@ -1348,6 +1438,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       route_emb_update_ratio_cap=0.0,
                       tau_update_abs_cap=0.0,
                       scan_update_abs_cap=0.0,
+                      total_training_steps=1,
+                      soft_gate_enabled=False,
+                      soft_gate_t_start=1.5,
+                      soft_gate_t_final=0.07,
+                      soft_gate_t_hold_frac=0.10,
+                      soft_gate_t_anneal_end_frac=0.80,
+                      soft_gate_schedule='cosine',
+                      tau_ce_grad_scale_start=1.0,
+                      tau_ce_grad_scale_final=0.0,
+                      tau_ce_grad_scale_hold_frac=0.25,
+                      tau_ce_grad_scale_anneal_end_frac=0.60,
+                      tau_ce_grad_scale_schedule='cosine',
+                      rpe_start_frac=0.0,
+                      rpe_full_frac=0.0,
+                      rpe_schedule='linear',
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None,
                       debug_diagnostics=False,
@@ -1466,9 +1571,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             "expected 'sigmoid_z'.")
     _cb1a_eps = jnp.float32(cb1a_eps)
     _dead_weighted_clip = jnp.float32(dead_penalty_weighted_clip)
-    _selection_margin_reg_weight_qk = jnp.float32(selection_margin_reg_weight_qk)
-    _selection_margin_reg_weight_v = jnp.float32(selection_margin_reg_weight_v)
-    _selection_margin_reg_weight_rst = jnp.float32(selection_margin_reg_weight_rst)
+    _removed_margin_reg_weight_qk = jnp.float32(removed_margin_reg_weight_qk)
+    _removed_margin_reg_weight_v = jnp.float32(removed_margin_reg_weight_v)
+    _removed_margin_reg_weight_rst = jnp.float32(removed_margin_reg_weight_rst)
     _global_grad_clip = jnp.float32(global_grad_clip)
     _tau_lr_mult = jnp.float32(tau_lr_mult)
     _tau_grad_clip = jnp.float32(tau_grad_clip)
@@ -1485,9 +1590,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _scan_update_abs_cap = jnp.float32(scan_update_abs_cap)
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_local_kw = _model_accepts_local_diagnostics(model)
+    _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
+    _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
+    _is_v4162_clean = (str(_model_version) == 'spatial-r1-v4.1.6.2')
+    if _is_v4162_clean:
+        _cb1a_enabled = False
+        _removed_margin_reg_weight_qk = jnp.float32(0.0)
+        _removed_margin_reg_weight_v = jnp.float32(0.0)
+        _removed_margin_reg_weight_rst = jnp.float32(0.0)
+        _explore_norm_by_layers = True
+        _explore_norm_by_layers_f = jnp.float32(1.0)
     # v4.1.6.1 now runs CB1A together with the bounded
     # RPE/exploration auxiliary.  CB1A remains aux-only/stopgrad-protected,
     # while RPE provides the weak easy-token sparsity / hard-token relaxation
@@ -1495,6 +1610,23 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     # training config/defaults prepared in main().
     _rpe_requires_no_active_direct = (
         str(_model_version) == 'spatial-r1-v4.1.6.0')
+
+    _soft_gate_runtime_enabled = bool(
+        soft_gate_enabled and str(_model_version) == 'spatial-r1-v4.1.6.2')
+    _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
+    _soft_gate_t_start = jnp.float32(soft_gate_t_start)
+    _soft_gate_t_final = jnp.float32(soft_gate_t_final)
+    _soft_gate_t_hold_frac = jnp.float32(soft_gate_t_hold_frac)
+    _soft_gate_t_anneal_end_frac = jnp.float32(soft_gate_t_anneal_end_frac)
+    _soft_gate_schedule = str(soft_gate_schedule).lower()
+    _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
+    _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
+    _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
+    _tau_ce_grad_scale_anneal_end_frac = jnp.float32(tau_ce_grad_scale_anneal_end_frac)
+    _tau_ce_grad_scale_schedule = str(tau_ce_grad_scale_schedule).lower()
+    _rpe_start_frac = jnp.float32(rpe_start_frac)
+    _rpe_full_frac = jnp.float32(rpe_full_frac)
+    _rpe_schedule = str(rpe_schedule).lower()
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
@@ -1509,6 +1641,36 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 extra_kw['analysis'] = False
             if debug_local_spikes and _pass_local_kw:
                 extra_kw['local_diagnostics'] = True
+            if _soft_gate_runtime_enabled:
+                soft_gate_T = _scheduled_scalar(
+                    step, _total_training_steps,
+                    _soft_gate_t_start, _soft_gate_t_final,
+                    _soft_gate_t_hold_frac, _soft_gate_t_anneal_end_frac,
+                    _soft_gate_schedule)
+                tau_ce_scale = _scheduled_scalar(
+                    step, _total_training_steps,
+                    _tau_ce_grad_scale_start, _tau_ce_grad_scale_final,
+                    _tau_ce_grad_scale_hold_frac,
+                    _tau_ce_grad_scale_anneal_end_frac,
+                    _tau_ce_grad_scale_schedule)
+                rpe_schedule_scale = _scheduled_scalar(
+                    step, _total_training_steps,
+                    0.0, 1.0, _rpe_start_frac, _rpe_full_frac,
+                    _rpe_schedule)
+            else:
+                soft_gate_T = jnp.float32(0.07)
+                tau_ce_scale = jnp.float32(0.0)
+                rpe_schedule_scale = (step >= _warmup_steps).astype(jnp.float32)
+            if _pass_soft_gate_schedule_kw:
+                extra_kw['soft_gate_temperature'] = soft_gate_T
+                extra_kw['tau_ce_grad_scale'] = tau_ce_scale
+                extra_kw['rpe_effective_weight'] = (
+                    (_explore_weight_q + _explore_weight_k
+                     + _explore_weight_v + _explore_weight_rst)
+                    / jnp.float32(4.0) * rpe_schedule_scale)
+            if _pass_execution_prune_kw:
+                # Training never execution-prunes; pruning is eval-sweep only.
+                extra_kw['execution_prune_eps'] = jnp.float32(0.0)
             result = model.apply(
                 {'params': params},
                 input_ids,
@@ -1538,22 +1700,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 dead_penalty = dead_penalty_unweighted
                 dead_penalty_weighted_unclipped = (
                     jnp.float32(dead_penalty_weight) * dead_penalty)
-            selection_margin_reg_raw_qk = result.get(
-                'selection_margin_reg_qk', jnp.float32(0.0))
-            selection_margin_reg_raw_v = result.get(
-                'selection_margin_reg_v', jnp.float32(0.0))
-            selection_margin_reg_raw_rst = result.get(
-                'selection_margin_reg_rst', jnp.float32(0.0))
-            selection_margin_reg_weighted_qk = (
-                _selection_margin_reg_weight_qk * selection_margin_reg_raw_qk)
-            selection_margin_reg_weighted_v = (
-                _selection_margin_reg_weight_v * selection_margin_reg_raw_v)
-            selection_margin_reg_weighted_rst = (
-                _selection_margin_reg_weight_rst * selection_margin_reg_raw_rst)
-            selection_margin_reg_loss = (
-                selection_margin_reg_weighted_qk
-                + selection_margin_reg_weighted_v
-                + selection_margin_reg_weighted_rst)
+            removed_margin_reg_raw_qk = result.get(
+                'removed_margin_reg_qk', jnp.float32(0.0))
+            removed_margin_reg_raw_v = result.get(
+                'removed_margin_reg_v', jnp.float32(0.0))
+            removed_margin_reg_raw_rst = result.get(
+                'removed_margin_reg_rst', jnp.float32(0.0))
+            removed_margin_reg_weighted_qk = (
+                _removed_margin_reg_weight_qk * removed_margin_reg_raw_qk)
+            removed_margin_reg_weighted_v = (
+                _removed_margin_reg_weight_v * removed_margin_reg_raw_v)
+            removed_margin_reg_weighted_rst = (
+                _removed_margin_reg_weight_rst * removed_margin_reg_raw_rst)
+            removed_margin_reg_loss = (
+                removed_margin_reg_weighted_qk
+                + removed_margin_reg_weighted_v
+                + removed_margin_reg_weighted_rst)
             # v4.1 batch-global-mean exploration loss.
             per_token_ce = result.get('per_token_ce', None)
             attn_tau_off = result.get('attn_tau_direct', result.get('attn_tau_offset', None))
@@ -1911,7 +2073,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             # Warmup gate: zero out explore loss until warmup_steps has passed.
             # W_sense needs time to settle before exploration signals become
             # meaningful; early CE-dominated learning keeps tau gradient clean.
-            explore_active = (step >= _warmup_steps).astype(jnp.float32)
+            explore_active = rpe_schedule_scale
             explore_loss_weighted_unclipped = (
                 (_explore_weight_q * explore_q_raw
                  + _explore_weight_k * explore_k_raw
@@ -1928,7 +2090,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 jnp.minimum(dead_penalty_weighted_unclipped, _dead_weighted_clip),
                 dead_penalty_weighted_unclipped)
 
-            if is_baseline:
+            if _is_v4162_clean:
+                # v4162 loss surface is intentionally clean:
+                # CE + existing DirectTau dead penalty + scheduled RPE only.
+                orth_loss = jnp.float32(0.0)
+                div_loss = compute_spatial_diversity_loss(params) if is_spatial else jnp.float32(0.0)
+                total_loss = (ce_loss
+                              + dead_penalty_weighted
+                              + explore_loss_weighted)
+            elif is_baseline:
                 orth_loss = jnp.float32(0.0)
                 div_loss = jnp.float32(0.0)
                 total_loss = ce_loss
@@ -1941,7 +2111,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + div_weight * div_loss
                               + dead_penalty_weighted
                               + explore_loss_weighted
-                              + cb1a_loss_weighted)
+                              + cb1a_loss_weighted
+                              + removed_margin_reg_loss)
             else:
                 orth_loss = compute_orthogonality_loss(
                     params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
@@ -1953,8 +2124,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + div_weight * div_loss
                               + dead_penalty_weighted
                               + explore_loss_weighted
-                              + cb1a_loss_weighted)
-            total_loss = total_loss + selection_margin_reg_loss
+                              + cb1a_loss_weighted
+                              + removed_margin_reg_loss)
 
             explore_stats = dict(
                 global_mean_ce=global_mean_ce,
@@ -2018,20 +2189,23 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 dead_penalty_rst_weight=_dead_penalty_rst_weight,
                 dead_penalty_weighted_unclipped=dead_penalty_weighted_unclipped,
                 dead_penalty_weighted_clipped=dead_penalty_weighted,
-                selection_margin_reg_raw_qk=selection_margin_reg_raw_qk,
-                selection_margin_reg_raw_v=selection_margin_reg_raw_v,
-                selection_margin_reg_raw_rst=selection_margin_reg_raw_rst,
-                selection_margin_reg_weight_qk=_selection_margin_reg_weight_qk,
-                selection_margin_reg_weight_v=_selection_margin_reg_weight_v,
-                selection_margin_reg_weight_rst=_selection_margin_reg_weight_rst,
-                selection_margin_reg_weighted_qk=selection_margin_reg_weighted_qk,
-                selection_margin_reg_weighted_v=selection_margin_reg_weighted_v,
-                selection_margin_reg_weighted_rst=selection_margin_reg_weighted_rst,
-                selection_margin_reg_weighted_total=selection_margin_reg_loss,
+                removed_margin_reg_raw_qk=removed_margin_reg_raw_qk,
+                removed_margin_reg_raw_v=removed_margin_reg_raw_v,
+                removed_margin_reg_raw_rst=removed_margin_reg_raw_rst,
+                removed_margin_reg_weight_qk=_removed_margin_reg_weight_qk,
+                removed_margin_reg_weight_v=_removed_margin_reg_weight_v,
+                removed_margin_reg_weight_rst=_removed_margin_reg_weight_rst,
+                removed_margin_reg_weighted_qk=removed_margin_reg_weighted_qk,
+                removed_margin_reg_weighted_v=removed_margin_reg_weighted_v,
+                removed_margin_reg_weighted_rst=removed_margin_reg_weighted_rst,
+                removed_margin_reg_weighted_total=removed_margin_reg_loss,
                 exploration_layer_norm_enabled=_explore_norm_by_layers_f,
                 exploration_layer_count=explore_layer_count,
                 exploration_norm=explore_norm,
                 step_in_train=step,
+                soft_gate_T=soft_gate_T,
+                tau_ce_grad_scale=tau_ce_scale,
+                rpe_schedule_scale=rpe_schedule_scale,
             )
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
                                 dead_penalty, explore_stats, result)
@@ -2707,8 +2881,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         cb1a_weighted_metric = explore_stats['cb1a_weighted']
         dead_penalty_weighted_metric = explore_stats['dead_penalty_weighted_clipped']
         dead_penalty_weighted_unclipped_metric = explore_stats['dead_penalty_weighted_unclipped']
-        selection_margin_reg_weighted_total_metric = explore_stats[
-            'selection_margin_reg_weighted_total']
+        removed_margin_reg_weighted_total_metric = explore_stats[
+            'removed_margin_reg_weighted_total']
         metrics = {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
@@ -2731,26 +2905,26 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'dead_penalty_qk_weight': explore_stats['dead_penalty_qk_weight'],
             'dead_penalty_v_weight': explore_stats['dead_penalty_v_weight'],
             'dead_penalty_rst_weight': explore_stats['dead_penalty_rst_weight'],
-            'selection_margin_reg_raw_qk': explore_stats[
-                'selection_margin_reg_raw_qk'],
-            'selection_margin_reg_raw_v': explore_stats[
-                'selection_margin_reg_raw_v'],
-            'selection_margin_reg_raw_rst': explore_stats[
-                'selection_margin_reg_raw_rst'],
-            'selection_margin_reg_weight_qk': explore_stats[
-                'selection_margin_reg_weight_qk'],
-            'selection_margin_reg_weight_v': explore_stats[
-                'selection_margin_reg_weight_v'],
-            'selection_margin_reg_weight_rst': explore_stats[
-                'selection_margin_reg_weight_rst'],
-            'selection_margin_reg_weighted_qk': explore_stats[
-                'selection_margin_reg_weighted_qk'],
-            'selection_margin_reg_weighted_v': explore_stats[
-                'selection_margin_reg_weighted_v'],
-            'selection_margin_reg_weighted_rst': explore_stats[
-                'selection_margin_reg_weighted_rst'],
-            'selection_margin_reg_weighted_total': (
-                selection_margin_reg_weighted_total_metric),
+            'removed_margin_reg_raw_qk': explore_stats[
+                'removed_margin_reg_raw_qk'],
+            'removed_margin_reg_raw_v': explore_stats[
+                'removed_margin_reg_raw_v'],
+            'removed_margin_reg_raw_rst': explore_stats[
+                'removed_margin_reg_raw_rst'],
+            'removed_margin_reg_weight_qk': explore_stats[
+                'removed_margin_reg_weight_qk'],
+            'removed_margin_reg_weight_v': explore_stats[
+                'removed_margin_reg_weight_v'],
+            'removed_margin_reg_weight_rst': explore_stats[
+                'removed_margin_reg_weight_rst'],
+            'removed_margin_reg_weighted_qk': explore_stats[
+                'removed_margin_reg_weighted_qk'],
+            'removed_margin_reg_weighted_v': explore_stats[
+                'removed_margin_reg_weighted_v'],
+            'removed_margin_reg_weighted_rst': explore_stats[
+                'removed_margin_reg_weighted_rst'],
+            'removed_margin_reg_weighted_total': (
+                removed_margin_reg_weighted_total_metric),
             'attn_qk_dead_penalty': result.get(
                 'attn_qk_dead_penalty', jnp.float32(0.0)),
             'attn_v_dead_penalty': result.get(
@@ -2764,6 +2938,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 (_explore_weight_q + _explore_weight_k
                  + _explore_weight_v + _explore_weight_rst)
                 / jnp.float32(4.0) * explore_stats['explore_active']),
+            'soft_gate_T': explore_stats['soft_gate_T'],
+            'tau_ce_grad_scale': explore_stats['tau_ce_grad_scale'],
+            'rpe_effective_weight': (
+                (_explore_weight_q + _explore_weight_k
+                 + _explore_weight_v + _explore_weight_rst)
+                / jnp.float32(4.0) * explore_stats['explore_active']),
+            'rpe_schedule_scale': explore_stats['rpe_schedule_scale'],
             'exploration_asymmetry': _asym,
             'exploration_asymmetry_q': _asym_q,
             'exploration_asymmetry_k': _asym_k,
@@ -2874,7 +3055,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 + dead_penalty_weighted_metric
                 + explore_loss_weighted_metric
                 + cb1a_weighted_metric
-                + selection_margin_reg_weighted_total_metric)),
+                + removed_margin_reg_weighted_total_metric)),
             'correct': result['correct'],
             'valid_count': result['valid_count'],
             'grad_norm': grad_norm,
@@ -3405,7 +3586,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     return train_step
 
 
-def create_eval_step(model, sharded_fns=None, return_dead_stats=False):
+def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
+                     return_prune_stats=False, execution_prune_eps=0.0,
+                     total_training_steps=1,
+                     soft_gate_enabled=False,
+                     soft_gate_t_start=1.5,
+                     soft_gate_t_final=0.07,
+                     soft_gate_t_hold_frac=0.10,
+                     soft_gate_t_anneal_end_frac=0.80,
+                     soft_gate_schedule='cosine',
+                     tau_ce_grad_scale_start=1.0,
+                     tau_ce_grad_scale_final=0.0,
+                     tau_ce_grad_scale_hold_frac=0.25,
+                     tau_ce_grad_scale_anneal_end_frac=0.60,
+                     tau_ce_grad_scale_schedule='cosine'):
     """Create a jit-compiled evaluation step.
 
     Uses the SLIM forward (analysis=False). Eval normally needs only loss /
@@ -3413,9 +3607,28 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False):
     logging.
     """
     _pass_analysis_kw = _model_accepts_analysis(model)
+    _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
+    _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
+    _execution_prune_eps = jnp.float32(execution_prune_eps)
+    _return_prune_stats = bool(return_prune_stats)
+    _soft_gate_runtime_enabled = bool(
+        soft_gate_enabled
+        and getattr(model, '__version__', getattr(type(model), '__version__', ''))
+        == 'spatial-r1-v4.1.6.2')
+    _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
+    _soft_gate_t_start = jnp.float32(soft_gate_t_start)
+    _soft_gate_t_final = jnp.float32(soft_gate_t_final)
+    _soft_gate_t_hold_frac = jnp.float32(soft_gate_t_hold_frac)
+    _soft_gate_t_anneal_end_frac = jnp.float32(soft_gate_t_anneal_end_frac)
+    _soft_gate_schedule = str(soft_gate_schedule).lower()
+    _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
+    _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
+    _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
+    _tau_ce_grad_scale_anneal_end_frac = jnp.float32(tau_ce_grad_scale_anneal_end_frac)
+    _tau_ce_grad_scale_schedule = str(tau_ce_grad_scale_schedule).lower()
 
     @jax.jit
-    def eval_step(params, input_ids, attention_mask):
+    def eval_step(params, input_ids, attention_mask, step):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
         eval_rng = jax.random.PRNGKey(0)
         extra_kw = {}
@@ -3423,6 +3636,20 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False):
             extra_kw['sharded_fns'] = sharded_fns
         if _pass_analysis_kw:
             extra_kw['analysis'] = False
+        if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
+            extra_kw['soft_gate_temperature'] = scheduled_value_by_frac(
+                step, _total_training_steps,
+                _soft_gate_t_start, _soft_gate_t_final,
+                _soft_gate_t_hold_frac, _soft_gate_t_anneal_end_frac,
+                _soft_gate_schedule)
+            extra_kw['tau_ce_grad_scale'] = scheduled_value_by_frac(
+                step, _total_training_steps,
+                _tau_ce_grad_scale_start, _tau_ce_grad_scale_final,
+                _tau_ce_grad_scale_hold_frac,
+                _tau_ce_grad_scale_anneal_end_frac,
+                _tau_ce_grad_scale_schedule)
+        if _pass_execution_prune_kw:
+            extra_kw['execution_prune_eps'] = _execution_prune_eps
         result = model.apply(
             {'params': params},
             input_ids,
@@ -3433,7 +3660,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False):
             **extra_kw,
         )
         if return_dead_stats:
-            return (
+            base_ret = (
                 result['loss'],
                 result['correct'],
                 result['valid_count'],
@@ -3442,12 +3669,34 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False):
                     'rst_dead_count',
                     result.get('know_dead_count', jnp.float32(0.0))),
             )
+            if _return_prune_stats:
+                base_ret = base_ret + (
+                    result.get('execution_estimated_compute_frac', jnp.float32(0.0)),
+                    result.get('execution_gate_mass_retained', jnp.float32(1.0)),
+                    result.get('execution_prune_gate_den_mean', jnp.float32(0.0)),
+                    result.get('execution_prune_gate_den_min', jnp.float32(0.0)),
+                    result.get('execution_prune_no_active_frac', jnp.float32(0.0)),
+                    result.get('execution_prune_unpruned_gate_den_mean', jnp.float32(0.0)),
+                )
+            return base_ret
         return result['loss'], result['correct'], result['valid_count']
 
     return eval_step
 
 
-def create_analysis_step(model, sharded_fns=None):
+def create_analysis_step(model, sharded_fns=None,
+                         total_training_steps=1,
+                         soft_gate_enabled=False,
+                         soft_gate_t_start=1.5,
+                         soft_gate_t_final=0.07,
+                         soft_gate_t_hold_frac=0.10,
+                         soft_gate_t_anneal_end_frac=0.80,
+                         soft_gate_schedule='cosine',
+                         tau_ce_grad_scale_start=1.0,
+                         tau_ce_grad_scale_final=0.0,
+                         tau_ce_grad_scale_hold_frac=0.25,
+                         tau_ce_grad_scale_anneal_end_frac=0.60,
+                         tau_ce_grad_scale_schedule='cosine'):
     """Create a jit-compiled analysis step (FULL forward, observational).
 
     Runs the model with `analysis=True` and the ANALYSIS variant of
@@ -3456,9 +3705,26 @@ def create_analysis_step(model, sharded_fns=None):
     once per val tick (val_interval), so the compile cost amortises.
     """
     _pass_analysis_kw = _model_accepts_analysis(model)
+    _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
+    _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
+    _soft_gate_runtime_enabled = bool(
+        soft_gate_enabled
+        and getattr(model, '__version__', getattr(type(model), '__version__', ''))
+        == 'spatial-r1-v4.1.6.2')
+    _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
+    _soft_gate_t_start = jnp.float32(soft_gate_t_start)
+    _soft_gate_t_final = jnp.float32(soft_gate_t_final)
+    _soft_gate_t_hold_frac = jnp.float32(soft_gate_t_hold_frac)
+    _soft_gate_t_anneal_end_frac = jnp.float32(soft_gate_t_anneal_end_frac)
+    _soft_gate_schedule = str(soft_gate_schedule).lower()
+    _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
+    _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
+    _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
+    _tau_ce_grad_scale_anneal_end_frac = jnp.float32(tau_ce_grad_scale_anneal_end_frac)
+    _tau_ce_grad_scale_schedule = str(tau_ce_grad_scale_schedule).lower()
 
     @jax.jit
-    def analysis_step(params, input_ids, attention_mask):
+    def analysis_step(params, input_ids, attention_mask, step):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
         eval_rng = jax.random.PRNGKey(0)
         extra_kw = {}
@@ -3466,6 +3732,20 @@ def create_analysis_step(model, sharded_fns=None):
             extra_kw['sharded_fns'] = sharded_fns
         if _pass_analysis_kw:
             extra_kw['analysis'] = True
+        if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
+            extra_kw['soft_gate_temperature'] = scheduled_value_by_frac(
+                step, _total_training_steps,
+                _soft_gate_t_start, _soft_gate_t_final,
+                _soft_gate_t_hold_frac, _soft_gate_t_anneal_end_frac,
+                _soft_gate_schedule)
+            extra_kw['tau_ce_grad_scale'] = scheduled_value_by_frac(
+                step, _total_training_steps,
+                _tau_ce_grad_scale_start, _tau_ce_grad_scale_final,
+                _tau_ce_grad_scale_hold_frac,
+                _tau_ce_grad_scale_anneal_end_frac,
+                _tau_ce_grad_scale_schedule)
+        if _pass_execution_prune_kw:
+            extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         result = model.apply(
             {'params': params},
             input_ids,
@@ -3575,7 +3855,19 @@ def create_debug_forward_step(model, sharded_fns=None, drop_compare=False):
     return debug_forward_step
 
 
-def create_spike_probe_step(model, sharded_fns=None, topk=8):
+def create_spike_probe_step(model, sharded_fns=None, topk=8,
+                            total_training_steps=1,
+                            soft_gate_enabled=False,
+                            soft_gate_t_start=1.5,
+                            soft_gate_t_final=0.07,
+                            soft_gate_t_hold_frac=0.10,
+                            soft_gate_t_anneal_end_frac=0.80,
+                            soft_gate_schedule='cosine',
+                            tau_ce_grad_scale_start=1.0,
+                            tau_ce_grad_scale_final=0.0,
+                            tau_ce_grad_scale_hold_frac=0.25,
+                            tau_ce_grad_scale_anneal_end_frac=0.60,
+                            tau_ce_grad_scale_schedule='cosine'):
     """Event-only forward probe. No gradients, no optimizer updates.
 
     Two-pass design for v4.1.6.0+ focused spike debugging:
@@ -3588,10 +3880,27 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8):
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_spike_kw = _model_accepts_spike_probe(model)
     _pass_focus_kw = _model_accepts_spike_focus_probe(model)
+    _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
+    _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
+    _soft_gate_runtime_enabled = bool(
+        soft_gate_enabled
+        and getattr(model, '__version__', getattr(type(model), '__version__', ''))
+        == 'spatial-r1-v4.1.6.2')
+    _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
+    _soft_gate_t_start = jnp.float32(soft_gate_t_start)
+    _soft_gate_t_final = jnp.float32(soft_gate_t_final)
+    _soft_gate_t_hold_frac = jnp.float32(soft_gate_t_hold_frac)
+    _soft_gate_t_anneal_end_frac = jnp.float32(soft_gate_t_anneal_end_frac)
+    _soft_gate_schedule = str(soft_gate_schedule).lower()
+    _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
+    _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
+    _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
+    _tau_ce_grad_scale_anneal_end_frac = jnp.float32(tau_ce_grad_scale_anneal_end_frac)
+    _tau_ce_grad_scale_schedule = str(tau_ce_grad_scale_schedule).lower()
     _topk = int(topk)
 
     @jax.jit
-    def spike_probe_step(params, input_ids, attention_mask, dropout_key):
+    def spike_probe_step(params, input_ids, attention_mask, dropout_key, step):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
         extra_kw = {}
         if sharded_fns is not None:
@@ -3601,6 +3910,20 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8):
         if _pass_spike_kw:
             extra_kw['spike_probe'] = True
             extra_kw['spike_probe_topk'] = _topk
+        if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
+            extra_kw['soft_gate_temperature'] = scheduled_value_by_frac(
+                step, _total_training_steps,
+                _soft_gate_t_start, _soft_gate_t_final,
+                _soft_gate_t_hold_frac, _soft_gate_t_anneal_end_frac,
+                _soft_gate_schedule)
+            extra_kw['tau_ce_grad_scale'] = scheduled_value_by_frac(
+                step, _total_training_steps,
+                _tau_ce_grad_scale_start, _tau_ce_grad_scale_final,
+                _tau_ce_grad_scale_hold_frac,
+                _tau_ce_grad_scale_anneal_end_frac,
+                _tau_ce_grad_scale_schedule)
+        if _pass_execution_prune_kw:
+            extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         result = model.apply(
             {'params': params},
             input_ids,
@@ -3862,7 +4185,7 @@ def shard_batch(batch, n_devices):
 
 def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
              verbose=True, data_sharding_spec=None,
-             return_dead_stats=False):
+             return_dead_stats=False, return_prune_stats=False, current_step=0):
     """Run evaluation and return avg loss and accuracy.
 
     All hosts must call this (pmap requires it), but only verbose=True host prints.
@@ -3876,6 +4199,12 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
     dead_attn_max_jax = jnp.float32(0.0)
     dead_rst_sum_jax = jnp.float32(0.0)
     dead_rst_max_jax = jnp.float32(0.0)
+    prune_compute_sum_jax = jnp.float32(0.0)
+    prune_mass_sum_jax = jnp.float32(0.0)
+    prune_den_sum_jax = jnp.float32(0.0)
+    prune_den_min_jax = jnp.float32(1.0e30)
+    prune_no_active_sum_jax = jnp.float32(0.0)
+    prune_unpruned_den_sum_jax = jnp.float32(0.0)
     dead_batches = 0
 
     eval_total = min(max_batches, len(val_loader))
@@ -3893,9 +4222,32 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             attention_mask = shard_to_mesh(attention_mask, data_sharding_spec, gs)
 
         if return_dead_stats:
-            (ce_loss, correct, valid_count,
-             attn_dead_count, rst_dead_count) = eval_step_fn(
-                params, input_ids, attention_mask)
+            eval_ret = eval_step_fn(
+                params, input_ids, attention_mask, jnp.int32(current_step))
+            if return_prune_stats:
+                (ce_loss, correct, valid_count,
+                 attn_dead_count, rst_dead_count,
+                 prune_compute_frac, prune_gate_mass_retained,
+                 prune_gate_den_mean, prune_gate_den_min,
+                 prune_no_active_frac,
+                 prune_unpruned_gate_den_mean) = eval_ret
+                prune_compute_sum_jax = prune_compute_sum_jax + jnp.asarray(
+                    prune_compute_frac, dtype=jnp.float32)
+                prune_mass_sum_jax = prune_mass_sum_jax + jnp.asarray(
+                    prune_gate_mass_retained, dtype=jnp.float32)
+                prune_den_sum_jax = prune_den_sum_jax + jnp.asarray(
+                    prune_gate_den_mean, dtype=jnp.float32)
+                prune_den_min_jax = jnp.minimum(
+                    prune_den_min_jax,
+                    jnp.asarray(prune_gate_den_min, dtype=jnp.float32))
+                prune_no_active_sum_jax = (
+                    prune_no_active_sum_jax
+                    + jnp.asarray(prune_no_active_frac, dtype=jnp.float32))
+                prune_unpruned_den_sum_jax = prune_unpruned_den_sum_jax + jnp.asarray(
+                    prune_unpruned_gate_den_mean, dtype=jnp.float32)
+            else:
+                (ce_loss, correct, valid_count,
+                 attn_dead_count, rst_dead_count) = eval_ret
             attn_dead_count = jnp.asarray(attn_dead_count, dtype=jnp.float32)
             rst_dead_count = jnp.asarray(rst_dead_count, dtype=jnp.float32)
             # These are per-validation-batch dead statistics. They are not
@@ -3907,7 +4259,7 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             dead_batches += 1
         else:
             ce_loss, correct, valid_count = eval_step_fn(
-                params, input_ids, attention_mask)
+                params, input_ids, attention_mask, jnp.int32(current_step))
 
         total_loss_jax = total_loss_jax + ce_loss * valid_count.astype(jnp.float32)
         total_correct_jax = total_correct_jax + correct
@@ -3925,6 +4277,15 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             'dead_rst_sum': dead_rst_sum_jax,
             'dead_rst_max': dead_rst_max_jax,
         })
+        if return_prune_stats:
+            totals_payload.update({
+                'prune_compute_sum': prune_compute_sum_jax,
+                'prune_mass_sum': prune_mass_sum_jax,
+                'prune_den_sum': prune_den_sum_jax,
+                'prune_den_min': prune_den_min_jax,
+                'prune_no_active_sum': prune_no_active_sum_jax,
+                'prune_unpruned_den_sum': prune_unpruned_den_sum_jax,
+            })
     totals = jax.device_get(totals_payload)
     total_loss = float(totals['loss'])
     total_correct = int(totals['correct'])
@@ -3945,8 +4306,51 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             'val_rst_dead_max': float(totals['dead_rst_max']),
             'val_dead_batches': int(dead_batches),
         }
+        if return_prune_stats:
+            dead_stats.update({
+                'estimated_compute_frac': float(totals['prune_compute_sum']) / denom,
+                'gate_mass_retained': float(totals['prune_mass_sum']) / denom,
+                'prune_gate_den_mean': float(totals['prune_den_sum']) / denom,
+                'prune_gate_den_min': float(totals['prune_den_min']),
+                'prune_no_active_frac': float(totals['prune_no_active_sum']) / denom,
+                'prune_unpruned_gate_den_mean': float(totals['prune_unpruned_den_sum']) / denom,
+            })
         return avg_loss, avg_acc, dead_stats
     return avg_loss, avg_acc
+
+
+def _format_prune_eps(eps):
+    return f"{float(eps):.0e}".replace('-', 'm')
+
+
+def run_eval_prune_sweep(eval_prune_step_fns, params, val_loader, n_devices,
+                         data_sharding_spec, current_step, base_loss, base_acc,
+                         verbose=False):
+    records = {}
+    for eps, step_fn in eval_prune_step_fns.items():
+        val_loader.reset()
+        loss, acc, stats = evaluate(
+            step_fn, params, val_loader, n_devices, verbose=verbose,
+            data_sharding_spec=data_sharding_spec, return_dead_stats=True,
+            return_prune_stats=True, current_step=current_step)
+        tag = _format_prune_eps(eps)
+        records[f'val_loss_prune_eps_{tag}'] = loss
+        records[f'val_acc_prune_eps_{tag}'] = acc
+        records[f'val_loss_delta_prune_eps_{tag}'] = loss - base_loss
+        records[f'val_acc_delta_prune_eps_{tag}'] = acc - base_acc
+        records[f'estimated_compute_frac_prune_eps_{tag}'] = float(
+            stats.get('estimated_compute_frac', 0.0))
+        records[f'gate_mass_retained_prune_eps_{tag}'] = float(
+            stats.get('gate_mass_retained', 1.0))
+        records[f'prune_gate_den_mean_eps_{tag}'] = float(
+            stats.get('prune_gate_den_mean', 0.0))
+        records[f'prune_gate_den_min_eps_{tag}'] = float(
+            stats.get('prune_gate_den_min', 0.0))
+        records[f'prune_no_active_frac_eps_{tag}'] = float(
+            stats.get('prune_no_active_frac', 0.0))
+        records[f'prune_unpruned_gate_den_mean_eps_{tag}'] = float(
+            stats.get('prune_unpruned_gate_den_mean', 0.0))
+    return records
 
 
 # ============================================================
@@ -4656,26 +5060,26 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'dead_penalty_weighted_total',
             ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)))),
         'dead_count_total': float(m.get('dead_count_total', 0.0)),
-        'selection_margin_reg_raw_qk': float(m.get(
-            'selection_margin_reg_raw_qk', 0.0)),
-        'selection_margin_reg_raw_v': float(m.get(
-            'selection_margin_reg_raw_v', 0.0)),
-        'selection_margin_reg_raw_rst': float(m.get(
-            'selection_margin_reg_raw_rst', 0.0)),
-        'selection_margin_reg_weight_qk': float(m.get(
-            'selection_margin_reg_weight_qk', 0.0)),
-        'selection_margin_reg_weight_v': float(m.get(
-            'selection_margin_reg_weight_v', 0.0)),
-        'selection_margin_reg_weight_rst': float(m.get(
-            'selection_margin_reg_weight_rst', 0.0)),
-        'selection_margin_reg_weighted_qk': float(m.get(
-            'selection_margin_reg_weighted_qk', 0.0)),
-        'selection_margin_reg_weighted_v': float(m.get(
-            'selection_margin_reg_weighted_v', 0.0)),
-        'selection_margin_reg_weighted_rst': float(m.get(
-            'selection_margin_reg_weighted_rst', 0.0)),
-        'selection_margin_reg_weighted_total': float(m.get(
-            'selection_margin_reg_weighted_total', 0.0)),
+        'removed_margin_reg_raw_qk': float(m.get(
+            'removed_margin_reg_raw_qk', 0.0)),
+        'removed_margin_reg_raw_v': float(m.get(
+            'removed_margin_reg_raw_v', 0.0)),
+        'removed_margin_reg_raw_rst': float(m.get(
+            'removed_margin_reg_raw_rst', 0.0)),
+        'removed_margin_reg_weight_qk': float(m.get(
+            'removed_margin_reg_weight_qk', 0.0)),
+        'removed_margin_reg_weight_v': float(m.get(
+            'removed_margin_reg_weight_v', 0.0)),
+        'removed_margin_reg_weight_rst': float(m.get(
+            'removed_margin_reg_weight_rst', 0.0)),
+        'removed_margin_reg_weighted_qk': float(m.get(
+            'removed_margin_reg_weighted_qk', 0.0)),
+        'removed_margin_reg_weighted_v': float(m.get(
+            'removed_margin_reg_weighted_v', 0.0)),
+        'removed_margin_reg_weighted_rst': float(m.get(
+            'removed_margin_reg_weighted_rst', 0.0)),
+        'removed_margin_reg_weighted_total': float(m.get(
+            'removed_margin_reg_weighted_total', 0.0)),
         'dead_penalty_per_dead': float(m.get('dead_penalty_per_dead', 0.0)),
         'attn_dead_penalty_per_dead': float(m.get(
             'attn_dead_penalty_per_dead', 0.0)),
@@ -4725,6 +5129,11 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'exploration_warmup_factor': float(m.get('exploration_warmup_factor', 0.0)),
         'exploration_weight_effective': float(m.get(
             'exploration_weight_effective', 0.0)),
+        'soft_gate_T': float(m.get('soft_gate_T', 0.0)),
+        'tau_ce_grad_scale': float(m.get('tau_ce_grad_scale', 0.0)),
+        'rpe_effective_weight': float(m.get(
+            'rpe_effective_weight', m.get('exploration_weight_effective', 0.0))),
+        'rpe_schedule_scale': float(m.get('rpe_schedule_scale', 0.0)),
         'exploration_asymmetry': float(m.get('exploration_asymmetry', 0.0)),
         'exploration_asymmetry_q': float(m.get(
             'exploration_asymmetry_q', m.get('exploration_asymmetry', 0.0))),
@@ -5413,6 +5822,10 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['rst_no_active_frac']*100:.2f}%]"
         )
     elif is_v4160:
+        _is_v4162_soft = ctx.get('model_version') == 'spatial-r1-v4.1.6.2'
+        _weight_label = 'soft_weight' if _is_v4162_soft else 'pos'
+        _selected_label = 'margin>tau' if _is_v4162_soft else 'selected'
+        _no_active_label = 'no_margin>tau' if _is_v4162_soft else 'no_active'
         log_message(
             f"  select: tau[qk={rec['attn_qk_tau_mean']:.4f}"
             f" v={rec['attn_v_tau_mean']:.4f}"
@@ -5420,26 +5833,27 @@ def _print_regular_block(rec, ctx):
             f" margin[qk={rec['attn_qk_selection_margin_mean']:+.4f}"
             f" v={rec['attn_v_selection_margin_mean']:+.4f}"
             f" rst={rec['rst_selection_margin_mean']:+.4f}]"
-            f" pos[qk={rec['attn_qk_positive_margin_mean']:.4f}"
+            f" {_weight_label}[qk={rec['attn_qk_positive_margin_mean']:.4f}"
             f" v={rec['attn_v_positive_margin_mean']:.4f}"
             f" rst={rec['rst_positive_margin_mean']:.4f}]"
-            f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
+            f" {_selected_label}[qk={rec['attn_qk_selected_frac']*100:.1f}%"
             f" v={rec['attn_v_selected_frac']*100:.1f}%"
             f" rst={rec['rst_selected_frac']*100:.1f}%]"
-            f" no_active[qk={rec['attn_qk_no_active_frac']*100:.2f}%"
+            f" {_no_active_label}[qk={rec['attn_qk_no_active_frac']*100:.2f}%"
             f" v={rec['attn_v_no_active_frac']*100:.2f}%"
             f" rst={rec['rst_no_active_frac']*100:.2f}%]"
         )
-        log_message(
-            f"  selection_margin_reg: "
-            f"raw[qk={rec['selection_margin_reg_raw_qk']:.6f}"
-            f" v={rec['selection_margin_reg_raw_v']:.6f}"
-            f" rst={rec['selection_margin_reg_raw_rst']:.6f}]"
-            f" weighted[qk={rec['selection_margin_reg_weighted_qk']:.6f}"
-            f" v={rec['selection_margin_reg_weighted_v']:.6f}"
-            f" rst={rec['selection_margin_reg_weighted_rst']:.6f}"
-            f" total={rec['selection_margin_reg_weighted_total']:.6f}]"
-        )
+        if not _is_v4162_soft:
+            log_message(
+                f"  removed_margin_reg: "
+                f"raw[qk={rec['removed_margin_reg_raw_qk']:.6f}"
+                f" v={rec['removed_margin_reg_raw_v']:.6f}"
+                f" rst={rec['removed_margin_reg_raw_rst']:.6f}]"
+                f" weighted[qk={rec['removed_margin_reg_weighted_qk']:.6f}"
+                f" v={rec['removed_margin_reg_weighted_v']:.6f}"
+                f" rst={rec['removed_margin_reg_weighted_rst']:.6f}"
+                f" total={rec['removed_margin_reg_weighted_total']:.6f}]"
+            )
     if is_v4160:
         log_message(
             f"  gate_max[qk={rec['attn_qk_raw_gate_max']:.1f}"
@@ -7251,6 +7665,13 @@ def _print_debug_block(rec, ctx):
         f"grad={_g('grad_global_preclip', _g('grad_norm')):.3f} "
         f"lr={_g('lr'):.3e}"
     )
+    if _g('soft_gate_T', 0.0) > 0.0:
+        log_debug_message(
+            f"soft_gate_schedule: T={_g('soft_gate_T'):.6f} "
+            f"tau_ce_grad_scale={_g('tau_ce_grad_scale'):.6f} "
+            f"rpe_effective_weight={_g('rpe_effective_weight', _g('exploration_weight_effective')):.6f} "
+            f"rpe_schedule_scale={_g('rpe_schedule_scale'):.3f}"
+        )
     rpe_loss_terms = (
         f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
         f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
@@ -7274,16 +7695,17 @@ def _print_debug_block(rec, ctx):
         f"recon_err={_g('reconstructed_loss_error'):.3e}"
     )
     if is_v4160:
-        log_debug_message(
-            f"selection_margin_reg: "
-            f"raw[qk={_g('selection_margin_reg_raw_qk'):.6f} "
-            f"v={_g('selection_margin_reg_raw_v'):.6f} "
-            f"rst={_g('selection_margin_reg_raw_rst'):.6f}] "
-            f"weighted[qk={_g('selection_margin_reg_weighted_qk'):.6f} "
-            f"v={_g('selection_margin_reg_weighted_v'):.6f} "
-            f"rst={_g('selection_margin_reg_weighted_rst'):.6f} "
-            f"total={_g('selection_margin_reg_weighted_total'):.6f}]"
-        )
+        if ctx.get('model_version') != 'spatial-r1-v4.1.6.2':
+            log_debug_message(
+                f"removed_margin_reg: "
+                f"raw[qk={_g('removed_margin_reg_raw_qk'):.6f} "
+                f"v={_g('removed_margin_reg_raw_v'):.6f} "
+                f"rst={_g('removed_margin_reg_raw_rst'):.6f}] "
+                f"weighted[qk={_g('removed_margin_reg_weighted_qk'):.6f} "
+                f"v={_g('removed_margin_reg_weighted_v'):.6f} "
+                f"rst={_g('removed_margin_reg_weighted_rst'):.6f} "
+                f"total={_g('removed_margin_reg_weighted_total'):.6f}]"
+            )
         _qk_per_dead = _g('attn_qk_dead_penalty') / max(_g('attn_qk_dead_count'), 1.0)
         _v_per_dead = _g('attn_v_dead_penalty') / max(_g('attn_v_dead_count'), 1.0)
         log_debug_message(
@@ -7509,6 +7931,12 @@ def _print_debug_block(rec, ctx):
             f"no_active[attn={_g('attn_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
         )
     elif ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS:
+        _is_v4162_soft = ctx.get('model_version') == 'spatial-r1-v4.1.6.2'
+        _weight_label = 'soft_weight' if _is_v4162_soft else 'positive_margin'
+        _selected_label = (
+            'margin_above_tau' if _is_v4162_soft else 'selected')
+        _no_active_label = (
+            'no_margin_above_tau' if _is_v4162_soft else 'no_active')
         log_debug_message(
             f"direct_tau_select_diag: "
             f"tau[qk={_g('attn_qk_tau_mean'):+.5f} "
@@ -7518,12 +7946,12 @@ def _print_debug_block(rec, ctx):
             f"selection_margin[qk={_g('attn_qk_selection_margin_mean'):+.5f} "
             f"v={_g('attn_v_selection_margin_mean'):+.5f} "
             f"rst={_g('rst_selection_margin_mean'):+.5f}] "
-            f"positive_margin[qk={_g('attn_qk_positive_margin_mean'):.5f}/{_g('attn_qk_positive_margin_max'):.5f} "
+            f"{_weight_label}[qk={_g('attn_qk_positive_margin_mean'):.5f}/{_g('attn_qk_positive_margin_max'):.5f} "
             f"v={_g('attn_v_positive_margin_mean'):.5f}/{_g('attn_v_positive_margin_max'):.5f} "
             f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
-            f"selected[qk={_g('attn_qk_selected_frac'):.5f} "
+            f"{_selected_label}[qk={_g('attn_qk_selected_frac'):.5f} "
             f"v={_g('attn_v_selected_frac'):.5f} rst={_g('rst_selected_frac'):.5f}] "
-            f"no_active[qk={_g('attn_qk_no_active_frac'):.5f} "
+            f"{_no_active_label}[qk={_g('attn_qk_no_active_frac'):.5f} "
             f"v={_g('attn_v_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
         )
     route_std_label = (
@@ -8388,12 +8816,17 @@ def main():
     dead_penalty_rst_weight = tcfg.get(
         'dead_penalty_rst_weight', dead_penalty_weight)
     dead_exposure_target = float(tcfg.get('dead_exposure_target', 0.1))
-    selection_margin_reg_weight_qk = tcfg.get(
-        'selection_margin_reg_weight_qk', 0.0)
-    selection_margin_reg_weight_v = tcfg.get(
-        'selection_margin_reg_weight_v', 0.0)
-    selection_margin_reg_weight_rst = tcfg.get(
-        'selection_margin_reg_weight_rst', 0.0)
+    removed_margin_reg_weight_qk = tcfg.get(
+        'removed_margin_reg_weight_qk', 0.0)
+    removed_margin_reg_weight_v = tcfg.get(
+        'removed_margin_reg_weight_v', 0.0)
+    removed_margin_reg_weight_rst = tcfg.get(
+        'removed_margin_reg_weight_rst', 0.0)
+    if model_version_cfg == 'spatial-r1-v4.1.6.2':
+        # v4162 clean path has no configurable selection-margin auxiliary.
+        removed_margin_reg_weight_qk = 0.0
+        removed_margin_reg_weight_v = 0.0
+        removed_margin_reg_weight_rst = 0.0
     # v4.1 RPE/exploration loss.
     # v4.1.6.1 default: run weak RPE together with CB1A.  Keep it mild by
     # default; explicit config values still override this.
@@ -8446,7 +8879,43 @@ def main():
     exploration_normalize_by_layers = bool(tcfg.get(
         'exploration_normalize_by_layers',
         exploration_normalize_by_layers_default))
+    if model_version_cfg == 'spatial-r1-v4.1.6.2':
+        exploration_normalize_by_layers = True
     rpe_enabled = bool(tcfg.get('rpe_enabled', True))
+    soft_gate_enabled = bool(tcfg.get(
+        'soft_gate_enabled', model_version_cfg == 'spatial-r1-v4.1.6.2'))
+    soft_gate_t_start = float(tcfg.get('soft_gate_t_start', 1.5))
+    soft_gate_t_final = float(tcfg.get('soft_gate_t_final', 0.07))
+    soft_gate_t_hold_frac = float(tcfg.get('soft_gate_t_hold_frac', 0.10))
+    soft_gate_t_anneal_end_frac = float(
+        tcfg.get('soft_gate_t_anneal_end_frac', 0.80))
+    soft_gate_schedule = str(tcfg.get('soft_gate_schedule', 'cosine'))
+    soft_gate_effective_active_eps = float(
+        tcfg.get('soft_gate_effective_active_eps', 1.0e-6))
+    effective_prune_eps_list = list(
+        tcfg.get('effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
+    eval_effective_prune_enabled = bool(tcfg.get(
+        'eval_effective_prune_enabled', model_version_cfg == 'spatial-r1-v4.1.6.2'))
+    eval_effective_prune_eps_list = list(tcfg.get(
+        'eval_effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
+    if model_version_cfg != 'spatial-r1-v4.1.6.2':
+        eval_effective_prune_enabled = False
+        eval_effective_prune_eps_list = []
+    tau_ce_grad_scale_start = float(
+        tcfg.get('tau_ce_grad_scale_start', 1.0))
+    tau_ce_grad_scale_final = float(
+        tcfg.get('tau_ce_grad_scale_final', 0.0))
+    tau_ce_grad_scale_hold_frac = float(
+        tcfg.get('tau_ce_grad_scale_hold_frac', 0.25))
+    tau_ce_grad_scale_anneal_end_frac = float(
+        tcfg.get('tau_ce_grad_scale_anneal_end_frac', 0.60))
+    tau_ce_grad_scale_schedule = str(
+        tcfg.get('tau_ce_grad_scale_schedule', 'cosine'))
+    rpe_start_frac = float(tcfg.get(
+        'rpe_start_frac', 0.20 if model_version_cfg == 'spatial-r1-v4.1.6.2' else 0.0))
+    rpe_full_frac = float(tcfg.get(
+        'rpe_full_frac', 0.45 if model_version_cfg == 'spatial-r1-v4.1.6.2' else 0.0))
+    rpe_schedule = str(tcfg.get('rpe_schedule', 'linear'))
     if not rpe_enabled:
         exploration_weight = 0.0
         exploration_weight_q = 0.0
@@ -8716,15 +9185,16 @@ def main():
                 'dead_penalty_rst_weight', dead_penalty_rst_weight)
             dead_exposure_target = float(saved_training_config.get(
                 'dead_exposure_target', dead_exposure_target))
-            selection_margin_reg_weight_qk = saved_training_config.get(
-                'selection_margin_reg_weight_qk',
-                selection_margin_reg_weight_qk)
-            selection_margin_reg_weight_v = saved_training_config.get(
-                'selection_margin_reg_weight_v',
-                selection_margin_reg_weight_v)
-            selection_margin_reg_weight_rst = saved_training_config.get(
-                'selection_margin_reg_weight_rst',
-                selection_margin_reg_weight_rst)
+            if model_version_cfg != 'spatial-r1-v4.1.6.2':
+                removed_margin_reg_weight_qk = saved_training_config.get(
+                    'removed_margin_reg_weight_qk',
+                    removed_margin_reg_weight_qk)
+                removed_margin_reg_weight_v = saved_training_config.get(
+                    'removed_margin_reg_weight_v',
+                    removed_margin_reg_weight_v)
+                removed_margin_reg_weight_rst = saved_training_config.get(
+                    'removed_margin_reg_weight_rst',
+                    removed_margin_reg_weight_rst)
             exploration_weight = saved_training_config.get(
                 'exploration_weight', exploration_weight)
             exploration_weight_qk = saved_training_config.get(
@@ -8966,9 +9436,9 @@ def main():
         'dead_penalty_v_weight': dead_penalty_v_weight,
         'dead_penalty_rst_weight': dead_penalty_rst_weight,
         'dead_exposure_target': dead_exposure_target,
-        'selection_margin_reg_weight_qk': selection_margin_reg_weight_qk,
-        'selection_margin_reg_weight_v': selection_margin_reg_weight_v,
-        'selection_margin_reg_weight_rst': selection_margin_reg_weight_rst,
+        'removed_margin_reg_weight_qk': removed_margin_reg_weight_qk,
+        'removed_margin_reg_weight_v': removed_margin_reg_weight_v,
+        'removed_margin_reg_weight_rst': removed_margin_reg_weight_rst,
         'exploration_weight': exploration_weight,
         'exploration_weight_qk': exploration_weight_qk,
         'exploration_weight_v': exploration_weight_v,
@@ -8988,6 +9458,24 @@ def main():
         'exploration_weighted_clip': exploration_weighted_clip,
         'exploration_normalize_by_layers': exploration_normalize_by_layers,
         'rpe_enabled': rpe_enabled,
+        'soft_gate_enabled': soft_gate_enabled,
+        'soft_gate_t_start': soft_gate_t_start,
+        'soft_gate_t_final': soft_gate_t_final,
+        'soft_gate_t_hold_frac': soft_gate_t_hold_frac,
+        'soft_gate_t_anneal_end_frac': soft_gate_t_anneal_end_frac,
+        'soft_gate_schedule': soft_gate_schedule,
+        'soft_gate_effective_active_eps': soft_gate_effective_active_eps,
+        'effective_prune_eps_list': effective_prune_eps_list,
+        'eval_effective_prune_enabled': eval_effective_prune_enabled,
+        'eval_effective_prune_eps_list': eval_effective_prune_eps_list,
+        'tau_ce_grad_scale_start': tau_ce_grad_scale_start,
+        'tau_ce_grad_scale_final': tau_ce_grad_scale_final,
+        'tau_ce_grad_scale_hold_frac': tau_ce_grad_scale_hold_frac,
+        'tau_ce_grad_scale_anneal_end_frac': tau_ce_grad_scale_anneal_end_frac,
+        'tau_ce_grad_scale_schedule': tau_ce_grad_scale_schedule,
+        'rpe_start_frac': rpe_start_frac,
+        'rpe_full_frac': rpe_full_frac,
+        'rpe_schedule': rpe_schedule,
         'cb1a_enabled': cb1a_enabled,
         'cb1a_qk_challenge_weight': cb1a_qk_challenge_weight,
         'cb1a_qk_prune_weight': cb1a_qk_prune_weight,
@@ -9034,15 +9522,15 @@ def main():
             'tau_offset_init_attn_v', cfg['model'].get('tau_offset_init_attn_v', None)),
         'tau_offset_init_rst': tcfg.get(
             'tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', None)),
-        'tau_target_count_attn_qk': tcfg.get(
-            'tau_target_count_attn_qk',
-            cfg['model'].get('tau_target_count_attn_qk', None)),
-        'tau_target_count_attn_v': tcfg.get(
-            'tau_target_count_attn_v',
-            cfg['model'].get('tau_target_count_attn_v', None)),
-        'tau_target_count_rst': tcfg.get(
-            'tau_target_count_rst',
-            cfg['model'].get('tau_target_count_rst', None)),
+        'legacy_count_init_attn_qk': tcfg.get(
+            'legacy_count_init_attn_qk',
+            cfg['model'].get('legacy_count_init_attn_qk', None)),
+        'legacy_count_init_attn_v': tcfg.get(
+            'legacy_count_init_attn_v',
+            cfg['model'].get('legacy_count_init_attn_v', None)),
+        'legacy_count_init_rst': tcfg.get(
+            'legacy_count_init_rst',
+            cfg['model'].get('legacy_count_init_rst', None)),
         'tau_init_attn_qk': tcfg.get(
             'tau_init_attn_qk',
             cfg['model'].get('tau_init_attn_qk', None)),
@@ -9059,6 +9547,16 @@ def main():
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
+    if model_version_cfg == 'spatial-r1-v4.1.6.2':
+        for _clean_key in list(training_config.keys()):
+            if (_clean_key.startswith('cb1a_')
+                    or _clean_key.startswith('removed_margin_reg_')
+                    or _clean_key.startswith('removed_diag_')
+                    or _clean_key.startswith('legacy_count_init_')
+                    or _clean_key == 'exploration_normalize_by_layers'):
+                training_config.pop(_clean_key, None)
+                cfg.setdefault('training', {}).pop(_clean_key, None)
+
     for _key in (
             'exploration_weight_q',
             'exploration_weight_k',
@@ -9419,10 +9917,11 @@ def main():
               f"exposure_target={dead_exposure_target} "
               f"direct_w[qk={dead_penalty_qk_weight}, v={dead_penalty_v_weight}, "
               f"rst={dead_penalty_rst_weight}]")
-        print("  Selection-margin regularization: "
-              f"qk={selection_margin_reg_weight_qk} "
-              f"v={selection_margin_reg_weight_v} "
-              f"rst={selection_margin_reg_weight_rst}")
+        if model_version_cfg != 'spatial-r1-v4.1.6.2':
+            print("  Selection-margin regularization: "
+                  f"qk={removed_margin_reg_weight_qk} "
+                  f"v={removed_margin_reg_weight_v} "
+                  f"rst={removed_margin_reg_weight_rst}")
         if rpe_enabled:
             print(f"  Exploration weight: {exploration_weight}")
             print("    weight split: "
@@ -9436,17 +9935,18 @@ def main():
             print(f"    warmup_steps={exploration_warmup_steps} "
                   f"bounds=[{exploration_lower_bound}, {exploration_upper_bound}] "
                   f"eps={exploration_bound_eps}")
-        print("  CB1A: "
-              f"enabled={cb1a_enabled} "
-              f"ce_mode={cb1a_ce_mode} eps={cb1a_eps}")
-        print("    pool weights: "
-              f"qk={cb1a_qk_weight} v={cb1a_v_weight} "
-              f"rst={cb1a_rst_weight}")
-        print("    branch weights: "
-              f"qk=({cb1a_qk_challenge_weight}, {cb1a_qk_prune_weight}) "
-              f"v=({cb1a_v_challenge_weight}, {cb1a_v_prune_weight}) "
-              f"rst=({cb1a_rst_challenge_weight}, "
-              f"{cb1a_rst_prune_weight})")
+        if model_version_cfg != 'spatial-r1-v4.1.6.2':
+            print("  CB1A: "
+                  f"enabled={cb1a_enabled} "
+                  f"ce_mode={cb1a_ce_mode} eps={cb1a_eps}")
+            print("    pool weights: "
+                  f"qk={cb1a_qk_weight} v={cb1a_v_weight} "
+                  f"rst={cb1a_rst_weight}")
+            print("    branch weights: "
+                  f"qk=({cb1a_qk_challenge_weight}, {cb1a_qk_prune_weight}) "
+                  f"v=({cb1a_v_challenge_weight}, {cb1a_v_prune_weight}) "
+                  f"rst=({cb1a_rst_challenge_weight}, "
+                  f"{cb1a_rst_prune_weight})")
         print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
               f"router={cfg['model'].get('router_dropout', 0.0)}")
         # Active v4.1.5 gate closure constants.
@@ -9462,20 +9962,54 @@ def main():
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
                 f"scan_scale={tcfg.get('scan_scale', 0.0)}"
             )
+        elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.2':
+            print("  Module path: models.dawn_srw_v4162")
+            print("  Tau parameterization: cosine-space STE clip [-1, 1]")
+            print("  Soft gate:")
+            print(f"    enabled={soft_gate_enabled} "
+                  f"T_start={soft_gate_t_start} T_final={soft_gate_t_final} "
+                  f"hold_frac={soft_gate_t_hold_frac} "
+                  f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
+                  f"schedule={soft_gate_schedule} "
+                  f"effective_active_eps={soft_gate_effective_active_eps}")
+            print("  Tau CE grad:")
+            print(f"    start={tau_ce_grad_scale_start} "
+                  f"final={tau_ce_grad_scale_final} "
+                  f"hold_frac={tau_ce_grad_scale_hold_frac} "
+                  f"anneal_end_frac={tau_ce_grad_scale_anneal_end_frac} "
+                  f"schedule={tau_ce_grad_scale_schedule}")
+            print("  RPE schedule:")
+            print(f"    start_frac={rpe_start_frac} full_frac={rpe_full_frac} "
+                  f"final exploration_weight={exploration_weight} "
+                  f"qk/v/rst=({exploration_weight_qk}, "
+                  f"{exploration_weight_v}, {exploration_weight_rst})")
+            print("  Effective pruning:")
+            print(f"    train diagnostic eps={effective_prune_eps_list}")
+            print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
+            gate_msg = (
+                f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
+                f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
+                f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
+                f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
+                f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
+                f"soft_gate_enabled={soft_gate_enabled} "
+                f"dropout={cfg['model'].get('dropout', None)} "
+                f"router_dropout={cfg['model'].get('router_dropout', None)}"
+            )
         elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.0':
             gate_msg = (
                 f"  Gate ({cfg['model'].get('model_version')} direct-tau): "
-                f"tau_target_count_attn_qk={tcfg.get('tau_target_count_attn_qk', cfg['model'].get('tau_target_count_attn_qk', None))} "
-                f"tau_target_count_attn_v={tcfg.get('tau_target_count_attn_v', cfg['model'].get('tau_target_count_attn_v', None))} "
-                f"tau_target_count_rst={tcfg.get('tau_target_count_rst', cfg['model'].get('tau_target_count_rst', None))} "
+                f"legacy_count_init_attn_qk={tcfg.get('legacy_count_init_attn_qk', cfg['model'].get('legacy_count_init_attn_qk', None))} "
+                f"legacy_count_init_attn_v={tcfg.get('legacy_count_init_attn_v', cfg['model'].get('legacy_count_init_attn_v', None))} "
+                f"legacy_count_init_rst={tcfg.get('legacy_count_init_rst', cfg['model'].get('legacy_count_init_rst', None))} "
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)}"
             )
         elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.1':
             gate_msg = (
                 f"  Gate ({cfg['model'].get('model_version')} direct-tau + CB1A): "
-                f"tau_target_count_attn_qk={tcfg.get('tau_target_count_attn_qk', cfg['model'].get('tau_target_count_attn_qk', None))} "
-                f"tau_target_count_attn_v={tcfg.get('tau_target_count_attn_v', cfg['model'].get('tau_target_count_attn_v', None))} "
-                f"tau_target_count_rst={tcfg.get('tau_target_count_rst', cfg['model'].get('tau_target_count_rst', None))} "
+                f"legacy_count_init_attn_qk={tcfg.get('legacy_count_init_attn_qk', cfg['model'].get('legacy_count_init_attn_qk', None))} "
+                f"legacy_count_init_attn_v={tcfg.get('legacy_count_init_attn_v', cfg['model'].get('legacy_count_init_attn_v', None))} "
+                f"legacy_count_init_rst={tcfg.get('legacy_count_init_rst', cfg['model'].get('legacy_count_init_rst', None))} "
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
                 f"exploration=off cb1a={cb1a_enabled}"
             )
@@ -9490,7 +10024,8 @@ def main():
             if cfg['model'].get('model_version') not in (
                     'spatial-r1-v4.1.5.9',
                     'spatial-r1-v4.1.6.0',
-                    'spatial-r1-v4.1.6.1'):
+                    'spatial-r1-v4.1.6.1',
+                    'spatial-r1-v4.1.6.2'):
                 gate_msg += (
                     f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                     f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -9838,9 +10373,9 @@ def main():
         cb1a_ce_mode=cb1a_ce_mode,
         cb1a_eps=cb1a_eps,
         dead_penalty_weighted_clip=dead_penalty_weighted_clip,
-        selection_margin_reg_weight_qk=selection_margin_reg_weight_qk,
-        selection_margin_reg_weight_v=selection_margin_reg_weight_v,
-        selection_margin_reg_weight_rst=selection_margin_reg_weight_rst,
+        removed_margin_reg_weight_qk=removed_margin_reg_weight_qk,
+        removed_margin_reg_weight_v=removed_margin_reg_weight_v,
+        removed_margin_reg_weight_rst=removed_margin_reg_weight_rst,
         global_grad_clip=global_grad_clip,
         tau_lr_mult=tau_lr_mult,
         tau_grad_clip=tau_grad_clip,
@@ -9855,18 +10390,76 @@ def main():
         route_emb_update_ratio_cap=route_emb_update_ratio_cap,
         tau_update_abs_cap=tau_update_abs_cap,
         scan_update_abs_cap=scan_update_abs_cap,
+        total_training_steps=total_steps,
+        soft_gate_enabled=soft_gate_enabled,
+        soft_gate_t_start=soft_gate_t_start,
+        soft_gate_t_final=soft_gate_t_final,
+        soft_gate_t_hold_frac=soft_gate_t_hold_frac,
+        soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
+        soft_gate_schedule=soft_gate_schedule,
+        tau_ce_grad_scale_start=tau_ce_grad_scale_start,
+        tau_ce_grad_scale_final=tau_ce_grad_scale_final,
+        tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
+        tau_ce_grad_scale_anneal_end_frac=tau_ce_grad_scale_anneal_end_frac,
+        tau_ce_grad_scale_schedule=tau_ce_grad_scale_schedule,
+        rpe_start_frac=rpe_start_frac,
+        rpe_full_frac=rpe_full_frac,
+        rpe_schedule=rpe_schedule,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh,
         debug_diagnostics=(debug_mode or spike_event_logger),
         debug_local_spikes=_train_local_diag)
     eval_step_fn = create_eval_step(
-        model, sharded_fns=_sharded_fns, return_dead_stats=True)
+        model, sharded_fns=_sharded_fns, return_dead_stats=True,
+        total_training_steps=total_steps,
+        soft_gate_enabled=soft_gate_enabled,
+        soft_gate_t_start=soft_gate_t_start,
+        soft_gate_t_final=soft_gate_t_final,
+        soft_gate_t_hold_frac=soft_gate_t_hold_frac,
+        soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
+        soft_gate_schedule=soft_gate_schedule,
+        tau_ce_grad_scale_start=tau_ce_grad_scale_start,
+        tau_ce_grad_scale_final=tau_ce_grad_scale_final,
+        tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
+        tau_ce_grad_scale_anneal_end_frac=tau_ce_grad_scale_anneal_end_frac,
+        tau_ce_grad_scale_schedule=tau_ce_grad_scale_schedule)
+    eval_prune_step_fns = {}
+    if eval_effective_prune_enabled:
+        for _eps in eval_effective_prune_eps_list:
+            _eps_f = float(_eps)
+            eval_prune_step_fns[_eps_f] = create_eval_step(
+                model, sharded_fns=_sharded_fns, return_dead_stats=True,
+                return_prune_stats=True, execution_prune_eps=_eps_f,
+                total_training_steps=total_steps,
+                soft_gate_enabled=soft_gate_enabled,
+                soft_gate_t_start=soft_gate_t_start,
+                soft_gate_t_final=soft_gate_t_final,
+                soft_gate_t_hold_frac=soft_gate_t_hold_frac,
+                soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
+                soft_gate_schedule=soft_gate_schedule,
+                tau_ce_grad_scale_start=tau_ce_grad_scale_start,
+                tau_ce_grad_scale_final=tau_ce_grad_scale_final,
+                tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
+                tau_ce_grad_scale_anneal_end_frac=tau_ce_grad_scale_anneal_end_frac,
+                tau_ce_grad_scale_schedule=tau_ce_grad_scale_schedule)
     # v4.1: analysis_step is only meaningful when the full analysis
     # kernels exist. Older model versions skip it -analysis logging
     # degrades to empty then.
     if _sharded_fns_analysis is not None:
         analysis_step_fn = create_analysis_step(
-            model, sharded_fns=_sharded_fns_analysis)
+            model, sharded_fns=_sharded_fns_analysis,
+            total_training_steps=total_steps,
+            soft_gate_enabled=soft_gate_enabled,
+            soft_gate_t_start=soft_gate_t_start,
+            soft_gate_t_final=soft_gate_t_final,
+            soft_gate_t_hold_frac=soft_gate_t_hold_frac,
+            soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
+            soft_gate_schedule=soft_gate_schedule,
+            tau_ce_grad_scale_start=tau_ce_grad_scale_start,
+            tau_ce_grad_scale_final=tau_ce_grad_scale_final,
+            tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
+            tau_ce_grad_scale_anneal_end_frac=tau_ce_grad_scale_anneal_end_frac,
+            tau_ce_grad_scale_schedule=tau_ce_grad_scale_schedule)
     else:
         analysis_step_fn = None
     spike_probe_step_fn = None
@@ -9874,7 +10467,19 @@ def main():
         spike_probe_step_fn = create_spike_probe_step(
             model,
             sharded_fns=(_sharded_fns_spike_probe or _sharded_fns),
-            topk=spike_probe_topk)
+            topk=spike_probe_topk,
+            total_training_steps=total_training_steps,
+            soft_gate_enabled=soft_gate_enabled,
+            soft_gate_t_start=soft_gate_t_start,
+            soft_gate_t_final=soft_gate_t_final,
+            soft_gate_t_hold_frac=soft_gate_t_hold_frac,
+            soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
+            soft_gate_schedule=soft_gate_schedule,
+            tau_ce_grad_scale_start=tau_ce_grad_scale_start,
+            tau_ce_grad_scale_final=tau_ce_grad_scale_final,
+            tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
+            tau_ce_grad_scale_anneal_end_frac=tau_ce_grad_scale_anneal_end_frac,
+            tau_ce_grad_scale_schedule=tau_ce_grad_scale_schedule)
     # No current-train-batch debug forward: --debug uses regular scalar
     # train_step metrics. Local spike diagnostics require training.debug_local_spikes=true.
     debug_forward_step_fn = None
@@ -11044,7 +11649,7 @@ def main():
                     if spike_probe_step_fn is not None and _pre_step_params is not None:
                         _probe_raw = jax.device_get(spike_probe_step_fn(
                             _pre_step_params, input_ids, attention_mask,
-                            step_rng))
+                            step_rng, jnp.asarray(_event_step, dtype=jnp.int32)))
                         _probe_decoded = _decode_spike_probe(_probe_raw)
                         del _probe_raw
                     if is_host0:
@@ -11343,9 +11948,15 @@ def main():
                 val_loss, val_acc, val_dead_stats = evaluate(
                     eval_step_fn, params, val_loader, n_local_devices,
                     verbose=is_host0, data_sharding_spec=data_sharding,
-                    return_dead_stats=True)
+                    return_dead_stats=True, current_step=global_step)
                 _latest_val_dead_stats = val_dead_stats
                 _latest_val_dead_step = global_step
+                prune_eval_log = {}
+                if eval_prune_step_fns:
+                    prune_eval_log = run_eval_prune_sweep(
+                        eval_prune_step_fns, params, val_loader,
+                        n_local_devices, data_sharding, global_step,
+                        val_loss, val_acc, verbose=False)
                 if is_host0:
                     _val_dead_ctx = {
                         'n_qk_cfg': cfg['model'].get(
@@ -11357,6 +11968,16 @@ def main():
                     val_dead_log = _attach_validation_dead_fractions(
                         dict(val_dead_stats), _val_dead_ctx)
                     log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
+                    if prune_eval_log:
+                        for _eps in eval_effective_prune_eps_list:
+                            _tag = _format_prune_eps(_eps)
+                            log_message(
+                                f"  Pruned eval eps={float(_eps):.0e}: "
+                                f"loss={prune_eval_log.get('val_loss_prune_eps_' + _tag, 0.0):.4f} "
+                                f"Δloss={prune_eval_log.get('val_loss_delta_prune_eps_' + _tag, 0.0):+.4f} "
+                                f"acc={prune_eval_log.get('val_acc_prune_eps_' + _tag, 0.0):.4f} "
+                                f"compute≈{prune_eval_log.get('estimated_compute_frac_prune_eps_' + _tag, 0.0):.4f} "
+                                f"mass={prune_eval_log.get('gate_mass_retained_prune_eps_' + _tag, 0.0):.4f}")
                     if not (_do_analysis and analysis_step_fn is not None):
                         _print_validation_dead_stats(val_dead_log, _val_dead_ctx)
                     log_jsonl({
@@ -11366,6 +11987,7 @@ def main():
                         'val_loss': val_loss,
                         'val_acc': val_acc,
                         **val_dead_log,
+                        **prune_eval_log,
                         'timestamp': datetime.now().isoformat(),
                     })
                 if val_loss < best_val_loss:
@@ -11392,7 +12014,7 @@ def main():
                     try:
                         _a_compile_start = time.time()
                         analysis_result = analysis_step_fn(
-                            params, _a_ids, _a_mask)
+                            params, _a_ids, _a_mask, jnp.int32(global_step))
                         # Force the computation so HBM usage of the
                         # analysis kernels registers now, not on the
                         # next Python line.
@@ -11551,9 +12173,14 @@ def main():
         val_loss, val_acc, val_dead_stats = evaluate(
             eval_step_fn, params, val_loader, n_local_devices,
             verbose=is_host0, data_sharding_spec=data_sharding,
-            return_dead_stats=True)
+            return_dead_stats=True, current_step=global_step)
         _latest_val_dead_stats = val_dead_stats
         _latest_val_dead_step = global_step
+        prune_eval_log = {}
+        if eval_prune_step_fns:
+            prune_eval_log = run_eval_prune_sweep(
+                eval_prune_step_fns, params, val_loader, n_local_devices,
+                data_sharding, global_step, val_loss, val_acc, verbose=False)
 
         is_best = val_loss < best_val_loss
         if is_best:
@@ -11570,6 +12197,16 @@ def main():
             val_dead_log = _attach_validation_dead_fractions(
                 dict(val_dead_stats), _val_dead_ctx)
             log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
+            if prune_eval_log:
+                for _eps in eval_effective_prune_eps_list:
+                    _tag = _format_prune_eps(_eps)
+                    log_message(
+                        f"  Pruned eval eps={float(_eps):.0e}: "
+                        f"loss={prune_eval_log.get('val_loss_prune_eps_' + _tag, 0.0):.4f} "
+                        f"Δloss={prune_eval_log.get('val_loss_delta_prune_eps_' + _tag, 0.0):+.4f} "
+                        f"acc={prune_eval_log.get('val_acc_prune_eps_' + _tag, 0.0):.4f} "
+                        f"compute≈{prune_eval_log.get('estimated_compute_frac_prune_eps_' + _tag, 0.0):.4f} "
+                        f"mass={prune_eval_log.get('gate_mass_retained_prune_eps_' + _tag, 0.0):.4f}")
             _print_validation_dead_stats(val_dead_log, _val_dead_ctx)
             log_jsonl({
                 'type': 'val_epoch',
@@ -11578,6 +12215,7 @@ def main():
                 'val_loss': val_loss,
                 'val_acc': val_acc,
                 **val_dead_log,
+                **prune_eval_log,
                 'train_loss': epoch_avg_loss,
                 'train_acc': epoch_avg_acc,
                 'epoch_time': epoch_elapsed,
