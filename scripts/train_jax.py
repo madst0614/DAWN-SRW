@@ -9964,7 +9964,8 @@ def main():
             )
         elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.2':
             print("  Module path: models.dawn_srw_v4162")
-            print("  Tau parameterization: cosine-space STE clip [-1, 1]")
+            print("  Tau parameterization: bounded sigmoid min/max")
+            print("  tau = -1 + 2 * sigmoid(raw_tau)")
             print("  Soft gate:")
             print(f"    enabled={soft_gate_enabled} "
                   f"T_start={soft_gate_t_start} T_final={soft_gate_t_final} "

@@ -4,7 +4,7 @@ DAWN-SRW v4.1.6.2 Soft Annealed DirectTau
 Clean v4162 experimental model path.
 
 Implemented concepts:
-- cosine-space tau reference with STE clipping to [-1, 1]
+- cosine-space tau reference with bounded sigmoid min/max mapping
 - soft sigmoid tau/T DirectTau gate
 - scheduled soft-gate temperature input
 - scheduled tau CE-gradient scale input
@@ -172,7 +172,7 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 #
 #   rho              = cosine(q_select, signature)
 #   raw_tau          = learned cosine-space reference
-#   tau              = straight-through clip(raw_tau, -1, 1)
+#   tau              = -1 + 2 * sigmoid(raw_tau)
 #   tau_for_gate     = stop_gradient(tau) + scheduled CE-gradient blend
 #   margin           = rho - tau_for_gate
 #   soft_weight      = sigmoid(margin / temperature)
@@ -248,11 +248,22 @@ def unit_norm_init(scale=1.0):
     return init
 
 
+TAU_MIN = -1.0
+TAU_MAX = 1.0
+
+
 def _tau_from_param(raw_tau):
-    """v4162 cosine-space tau: forward clipped to [-1, 1], straight-through gradient."""
+    """v4162 cosine-space bounded tau using a sigmoid min/max map."""
     raw_tau = jnp.asarray(raw_tau, dtype=jnp.float32)
-    tau_clipped = jnp.clip(raw_tau, -1.0, 1.0)
-    return raw_tau + jax.lax.stop_gradient(tau_clipped - raw_tau)
+    return TAU_MIN + (TAU_MAX - TAU_MIN) * jax.nn.sigmoid(raw_tau)
+
+
+def _raw_tau_init_from_cosine_tau(tau_init, eps=1.0e-4):
+    """Map desired cosine-space tau in [-1, 1] to raw sigmoid parameter."""
+    tau_init = jnp.asarray(tau_init, dtype=jnp.float32)
+    p = (tau_init - TAU_MIN) / (TAU_MAX - TAU_MIN)
+    p = jnp.clip(p, eps, 1.0 - eps)
+    return jnp.log(p) - jnp.log1p(-p)
 
 
 def _compute_soft_gate(score, tau, intensity, temperature, tau_ce_grad_scale,
@@ -2207,8 +2218,14 @@ class Router(nn.Module):
         v_tau_init = float(self.tau_init_attn_v)
         rst_tau_init = float(self.tau_init_rst)
         raw_tau_attn_bias_init = jnp.asarray(
-            [qk_tau_init, qk_tau_init, v_tau_init], dtype=jnp.float32)
-        raw_tau_rst_bias_init = jnp.asarray(rst_tau_init, dtype=jnp.float32)
+            [
+                _raw_tau_init_from_cosine_tau(qk_tau_init),
+                _raw_tau_init_from_cosine_tau(qk_tau_init),
+                _raw_tau_init_from_cosine_tau(v_tau_init),
+            ],
+            dtype=jnp.float32)
+        raw_tau_rst_bias_init = jnp.asarray(
+            _raw_tau_init_from_cosine_tau(rst_tau_init), dtype=jnp.float32)
         self.proj_attn = nn.Dense(db * 3, name='proj_attn')
         self.proj_rst = nn.Dense(db, name='proj_rst')
         self.raw_tau_attn = nn.Dense(3, name='raw_tau_attn',
