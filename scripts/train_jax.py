@@ -10469,7 +10469,7 @@ def main():
             model,
             sharded_fns=(_sharded_fns_spike_probe or _sharded_fns),
             topk=spike_probe_topk,
-            total_training_steps=total_training_steps,
+            total_training_steps=total_steps,
             soft_gate_enabled=soft_gate_enabled,
             soft_gate_t_start=soft_gate_t_start,
             soft_gate_t_final=soft_gate_t_final,
