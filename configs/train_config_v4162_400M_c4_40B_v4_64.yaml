@@ -35,7 +35,7 @@ training:
   lr: 0.0003
   warmup_ratio: 0.08
   weight_decay: 0.1
-  pool_weight_decay: 0.02
+  pool_weight_decay: 0.0
   tau_lr_mult: 0.01
   tau_grad_clip: 1.0
   router_proj_lr_mult: 1.0
@@ -49,11 +49,11 @@ training:
   rpe_full_frac: 0.45
   rpe_schedule: linear
   exploration_weight: 0.001
-  exploration_asymmetry: 3.0
-  exploration_lower_bound: -0.5
-  exploration_upper_bound: 2.0
+  exploration_asymmetry: 1.0
+  exploration_lower_bound: 0.0
+  exploration_upper_bound: 0.95
   exploration_bound_eps: 0.001
-  exploration_dev_mode: raw
+  exploration_dev_mode: bounded_z
   exploration_ce_clip_std: 2.0
   exploration_z_clip: 2.0
   exploration_z_tanh: true
@@ -95,4 +95,4 @@ training:
   spike_probe_topk: 8
   spike_probe_min_step: 5000
   spike_history_steps: 20
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/v4162_400M_c4_40B_v4_64
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4162_400M_c4_40B_v4_64
