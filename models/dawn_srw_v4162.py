@@ -59,13 +59,18 @@ SELECT_DIAG_COUNT = len(SELECT_DIAG_NAMES)
 ) = range(SELECT_DIAG_COUNT)
 
 
+# v4162 exposure diagnostics are soft-gate based, not hard score>tau based.
+# The historical DEAD_EXPOSURE_* constant names are kept as internal slot names
+# so tuple layouts stay stable, but the values below mean:
+#   mean/min/max of max_batch_token(gate_unpruned_i), and dead fractions at
+#   eps=1e-6, 1e-5, 1e-4.
 DEAD_EXPOSURE_DIAG_NAMES = (
-    'angular_exposure_mean',
-    'angular_exposure_min',
-    'angular_exposure_max',
-    'dead_exposure_frac',
-    'weak_exposure_frac',
-    'dead_exposure_target',
+    'soft_exposure_mean',
+    'soft_exposure_min',
+    'soft_exposure_max',
+    'soft_dead_frac_eps_1e_6',
+    'soft_dead_frac_eps_1e_5',
+    'soft_dead_frac_eps_1e_4',
 )
 DEAD_EXPOSURE_DIAG_COUNT = len(DEAD_EXPOSURE_DIAG_NAMES)
 (
@@ -606,28 +611,27 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             jnp.full((B, S, 1), diag_neg_inf, dtype=jnp.float32),
         )
 
-        def angular_exposure_dead_parts(rho_exposure):
-            # Dead repair uses the actual DirectTau selection edge.
-            # An operator is dead only if it never crosses score > tau anywhere
-            # in this batch.  The repair target is the edge itself:
-            # max(score - tau) -> 0.  Already-used operators receive no loss.
-            tau_ref = jax.lax.stop_gradient(tau)
-            local_margin_exposure = (
-                rho_exposure - tau_ref).max(axis=(0, 1))  # [cs]
-            margin_exposure = jax.lax.all_gather(
-                local_margin_exposure, 'data', axis=0).max(axis=0)
-            margin_exposure_sg = jax.lax.stop_gradient(margin_exposure)
-            dead_mask = margin_exposure_sg <= 0.0
-            dead_gap = jax.nn.relu(-margin_exposure)
-            penalty = dead_mask.astype(jnp.float32) * jnp.square(dead_gap)
-            weak_mask = dead_mask
+        def soft_gate_exposure_parts(gate_unpruned):
+            # v4162 soft-gate exposure diagnostic only.  Do not use the hard
+            # score > tau boundary as a dead definition: with high T,
+            # score < tau can still produce meaningful sigmoid gate mass.
+            # A unit is considered soft-dead only if its actual unpruned gate
+            # mass is essentially zero across the batch/tokens.
+            local_soft_exposure = jax.lax.stop_gradient(
+                gate_unpruned).max(axis=(0, 1))  # [cs]
+            soft_exposure = jax.lax.all_gather(
+                local_soft_exposure, 'data', axis=0).max(axis=0)
+            soft_dead_1e6 = soft_exposure <= jnp.float32(1.0e-6)
+            soft_dead_1e5 = soft_exposure <= jnp.float32(1.0e-5)
+            soft_dead_1e4 = soft_exposure <= jnp.float32(1.0e-4)
             return (
-                penalty.sum(),
-                dead_mask.astype(jnp.float32).sum(),
-                margin_exposure_sg.sum(),
-                margin_exposure_sg.min(),
-                margin_exposure_sg.max(),
-                weak_mask.astype(jnp.float32).sum(),
+                jnp.float32(0.0),
+                soft_dead_1e6.astype(jnp.float32).sum(),
+                soft_exposure.sum(),
+                soft_exposure.min(),
+                soft_exposure.max(),
+                soft_dead_1e5.astype(jnp.float32).sum(),
+                soft_dead_1e4.astype(jnp.float32).sum(),
             )
 
         def spike_chunk_rows(start, rho, raw_tau_chunk, tau_chunk,
@@ -819,8 +823,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 chunk_g_log_g = (gate * jnp.log(g_safe)).sum(axis=-1, keepdims=True)
                 (chunk_dead_penalty, chunk_dead_count,
                  chunk_exposure_sum, chunk_exposure_min,
-                 chunk_exposure_max, chunk_weak_exposure_count) = (
-                    angular_exposure_dead_parts(rho_exposure))
+                 chunk_exposure_max, chunk_weak_exposure_count,
+                 chunk_soft_dead_1e4_count) = (
+                    soft_gate_exposure_parts(gate_unpruned))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
@@ -843,7 +848,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                         jnp.maximum(total_int_max, chunk_int_max),
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
-                        total_selection_residency_count + chunk_selection_residency_count,
+                        total_selection_residency_count + chunk_soft_dead_1e4_count,
                         total_edge_margin_stat + chunk_edge_margin_stat,
                         select_diag_carry,
                         diag_vals,
@@ -952,8 +957,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 # sum(gate) feeds the denominator after the chunk scan.
                 (chunk_dead_penalty, chunk_dead_count,
                  chunk_exposure_sum, chunk_exposure_min,
-                 chunk_exposure_max, chunk_weak_exposure_count) = (
-                    angular_exposure_dead_parts(rho_exposure))
+                 chunk_exposure_max, chunk_weak_exposure_count,
+                 chunk_soft_dead_1e4_count) = (
+                    soft_gate_exposure_parts(gate_unpruned))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
@@ -972,7 +978,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                         jnp.maximum(total_int_max, chunk_int_max),
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
-                        total_selection_residency_count + chunk_selection_residency_count,
+                        total_selection_residency_count + chunk_soft_dead_1e4_count,
                         total_edge_margin_stat + chunk_edge_margin_stat,
                         select_diag_carry,
                         diag_vals,
@@ -1110,7 +1116,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             global_exposure_max,
             dead_count_out / jnp.float32(N_total),
             global_weak_exposure_count / jnp.float32(N_total),
-            jax.lax.stop_gradient(jnp.float32(0.0)),
+            jax.lax.stop_gradient(
+                jax.lax.psum(total_selection_residency_count, 'model')
+                / jnp.float32(N_total)),
         )
 
         slim_out = (out.astype(jnp.float32), active_frac, global_gate_max, rho_lb,
@@ -1484,28 +1492,27 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             jnp.full((B, S, 2, 1), diag_neg_inf, dtype=jnp.float32),
         )
 
-        def angular_exposure_dead_parts(rho_exposure):
-            # Dead repair uses the actual DirectTau selection edge.
-            # An operator is dead only if it never crosses score > tau anywhere
-            # in this batch.  The repair target is the edge itself:
-            # max(score - tau) -> 0.  Already-used operators receive no loss.
-            tau_ref = jax.lax.stop_gradient(tau)
-            local_margin_exposure = (
-                rho_exposure - tau_ref).max(axis=(0, 1, 2))  # [cs]
-            margin_exposure = jax.lax.all_gather(
-                local_margin_exposure, 'data', axis=0).max(axis=0)
-            margin_exposure_sg = jax.lax.stop_gradient(margin_exposure)
-            dead_mask = margin_exposure_sg <= 0.0
-            dead_gap = jax.nn.relu(-margin_exposure)
-            penalty = dead_mask.astype(jnp.float32) * jnp.square(dead_gap)
-            weak_mask = dead_mask
+        def soft_gate_exposure_parts(gate_unpruned):
+            # v4162 soft-gate exposure diagnostic only.  Do not use the hard
+            # score > tau boundary as a dead definition: with high T,
+            # score < tau can still produce meaningful sigmoid gate mass.
+            # A unit is considered soft-dead only if its actual unpruned gate
+            # mass is essentially zero across the batch/tokens/routes.
+            local_soft_exposure = jax.lax.stop_gradient(
+                gate_unpruned).max(axis=(0, 1, 2))  # [cs]
+            soft_exposure = jax.lax.all_gather(
+                local_soft_exposure, 'data', axis=0).max(axis=0)
+            soft_dead_1e6 = soft_exposure <= jnp.float32(1.0e-6)
+            soft_dead_1e5 = soft_exposure <= jnp.float32(1.0e-5)
+            soft_dead_1e4 = soft_exposure <= jnp.float32(1.0e-4)
             return (
-                penalty.sum(),
-                dead_mask.astype(jnp.float32).sum(),
-                margin_exposure_sg.sum(),
-                margin_exposure_sg.min(),
-                margin_exposure_sg.max(),
-                weak_mask.astype(jnp.float32).sum(),
+                jnp.float32(0.0),
+                soft_dead_1e6.astype(jnp.float32).sum(),
+                soft_exposure.sum(),
+                soft_exposure.min(),
+                soft_exposure.max(),
+                soft_dead_1e5.astype(jnp.float32).sum(),
+                soft_dead_1e4.astype(jnp.float32).sum(),
             )
 
         def spike_chunk_rows_paired(start, rho, raw_tau_chunk, tau_chunk,
@@ -1719,8 +1726,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 chunk_g_log_g = (gate * jnp.log(g_safe)).sum(axis=-1, keepdims=True)
                 (chunk_dead_penalty, chunk_dead_count,
                  chunk_exposure_sum, chunk_exposure_min,
-                 chunk_exposure_max, chunk_weak_exposure_count) = (
-                    angular_exposure_dead_parts(rho_exposure))
+                 chunk_exposure_max, chunk_weak_exposure_count,
+                 chunk_soft_dead_1e4_count) = (
+                    soft_gate_exposure_parts(gate_unpruned))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
@@ -1743,7 +1751,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         jnp.maximum(total_int_max, chunk_int_max),
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
-                        total_selection_residency_count + chunk_selection_residency_count,
+                        total_selection_residency_count + chunk_soft_dead_1e4_count,
                         total_edge_margin_stat + chunk_edge_margin_stat,
                         select_diag_carry,
                         diag_vals,
@@ -1857,8 +1865,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 (chunk_dead_penalty, chunk_dead_count,
                  chunk_exposure_sum, chunk_exposure_min,
-                 chunk_exposure_max, chunk_weak_exposure_count) = (
-                    angular_exposure_dead_parts(rho_exposure))
+                 chunk_exposure_max, chunk_weak_exposure_count,
+                 chunk_soft_dead_1e4_count) = (
+                    soft_gate_exposure_parts(gate_unpruned))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
@@ -1877,7 +1886,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         jnp.maximum(total_int_max, chunk_int_max),
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
-                        total_selection_residency_count + chunk_selection_residency_count,
+                        total_selection_residency_count + chunk_soft_dead_1e4_count,
                         total_edge_margin_stat + chunk_edge_margin_stat,
                         select_diag_carry,
                         diag_vals,
@@ -2019,7 +2028,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             global_exposure_max,
             dead_count_out / jnp.float32(N_total),
             global_weak_exposure_count / jnp.float32(N_total),
-            jax.lax.stop_gradient(jnp.float32(0.0)),
+            jax.lax.stop_gradient(
+                jax.lax.psum(total_selection_residency_count, 'model')
+                / jnp.float32(N_total)),
         )
 
         slim_out = (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, rho_lb,
@@ -4337,42 +4348,42 @@ class DAWN(nn.Module):
             'rst_selection_margin_mean': rst_selection_margin_mean_all.mean(),
             'rst_positive_margin_mean': rst_positive_margin_mean_all.mean(),
             'rst_positive_margin_max': rst_positive_margin_max_all.max(),
-            'attn_angular_exposure_mean': attn_angular_exposure_mean_all.mean(),
-            'attn_angular_exposure_min': attn_angular_exposure_min_all.min(),
-            'attn_angular_exposure_max': attn_angular_exposure_max_all.max(),
-            'attn_dead_exposure_frac': attn_dead_exposure_frac_all.mean(),
-            'attn_weak_exposure_frac': attn_weak_exposure_frac_all.mean(),
-            'attn_dead_exposure_target': attn_dead_exposure_target_all.mean(),
-            'attn_qk_angular_exposure_mean': _exposure_mean(
+            'attn_soft_exposure_mean': attn_angular_exposure_mean_all.mean(),
+            'attn_soft_exposure_min': attn_angular_exposure_min_all.min(),
+            'attn_soft_exposure_max': attn_angular_exposure_max_all.max(),
+            'attn_soft_dead_frac_eps_1e_6': attn_dead_exposure_frac_all.mean(),
+            'attn_soft_dead_frac_eps_1e_5': attn_weak_exposure_frac_all.mean(),
+            'attn_soft_dead_frac_eps_1e_4': attn_dead_exposure_target_all.mean(),
+            'attn_qk_soft_exposure_mean': _exposure_mean(
                 attn_qk_exposure_diag_all, DEAD_EXPOSURE_MEAN),
-            'attn_qk_angular_exposure_min': _exposure_min(
+            'attn_qk_soft_exposure_min': _exposure_min(
                 attn_qk_exposure_diag_all, DEAD_EXPOSURE_MIN),
-            'attn_qk_angular_exposure_max': _exposure_max(
+            'attn_qk_soft_exposure_max': _exposure_max(
                 attn_qk_exposure_diag_all, DEAD_EXPOSURE_MAX),
-            'attn_qk_dead_exposure_frac': _exposure_mean(
+            'attn_qk_soft_dead_frac_eps_1e_6': _exposure_mean(
                 attn_qk_exposure_diag_all, DEAD_EXPOSURE_DEAD_FRAC),
-            'attn_qk_weak_exposure_frac': _exposure_mean(
+            'attn_qk_soft_dead_frac_eps_1e_5': _exposure_mean(
                 attn_qk_exposure_diag_all, DEAD_EXPOSURE_WEAK_FRAC),
-            'attn_qk_dead_exposure_target': _exposure_mean(
+            'attn_qk_soft_dead_frac_eps_1e_4': _exposure_mean(
                 attn_qk_exposure_diag_all, DEAD_EXPOSURE_TARGET),
-            'attn_v_angular_exposure_mean': _exposure_mean(
+            'attn_v_soft_exposure_mean': _exposure_mean(
                 attn_v_exposure_diag_all, DEAD_EXPOSURE_MEAN),
-            'attn_v_angular_exposure_min': _exposure_min(
+            'attn_v_soft_exposure_min': _exposure_min(
                 attn_v_exposure_diag_all, DEAD_EXPOSURE_MIN),
-            'attn_v_angular_exposure_max': _exposure_max(
+            'attn_v_soft_exposure_max': _exposure_max(
                 attn_v_exposure_diag_all, DEAD_EXPOSURE_MAX),
-            'attn_v_dead_exposure_frac': _exposure_mean(
+            'attn_v_soft_dead_frac_eps_1e_6': _exposure_mean(
                 attn_v_exposure_diag_all, DEAD_EXPOSURE_DEAD_FRAC),
-            'attn_v_weak_exposure_frac': _exposure_mean(
+            'attn_v_soft_dead_frac_eps_1e_5': _exposure_mean(
                 attn_v_exposure_diag_all, DEAD_EXPOSURE_WEAK_FRAC),
-            'attn_v_dead_exposure_target': _exposure_mean(
+            'attn_v_soft_dead_frac_eps_1e_4': _exposure_mean(
                 attn_v_exposure_diag_all, DEAD_EXPOSURE_TARGET),
-            'rst_angular_exposure_mean': rst_angular_exposure_mean_all.mean(),
-            'rst_angular_exposure_min': rst_angular_exposure_min_all.min(),
-            'rst_angular_exposure_max': rst_angular_exposure_max_all.max(),
-            'rst_dead_exposure_frac': rst_dead_exposure_frac_all.mean(),
-            'rst_weak_exposure_frac': rst_weak_exposure_frac_all.mean(),
-            'rst_dead_exposure_target': rst_dead_exposure_target_all.mean(),
+            'rst_soft_exposure_mean': rst_angular_exposure_mean_all.mean(),
+            'rst_soft_exposure_min': rst_angular_exposure_min_all.min(),
+            'rst_soft_exposure_max': rst_angular_exposure_max_all.max(),
+            'rst_soft_dead_frac_eps_1e_6': rst_dead_exposure_frac_all.mean(),
+            'rst_soft_dead_frac_eps_1e_5': rst_weak_exposure_frac_all.mean(),
+            'rst_soft_dead_frac_eps_1e_4': rst_dead_exposure_target_all.mean(),
             'attn_qk_emb_norm_mean': attn_qk_emb_n_mean_all.mean(),
             'attn_qk_emb_norm_min': attn_qk_emb_n_min_all.min(),
             'attn_qk_emb_norm_std': attn_qk_emb_n_std_all.mean(),

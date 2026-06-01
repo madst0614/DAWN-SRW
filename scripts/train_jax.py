@@ -1597,7 +1597,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_v4162_clean = (str(_model_version) == 'spatial-r1-v4.1.6.2')
     if _is_v4162_clean:
+        # v4162 is the soft annealed DirectTau path. Keep the loss surface
+        # auditable: CE + scheduled RPE only. All hard-boundary dead repair,
+        # CB1A/boundary auxiliaries, and removed legacy margin auxiliaries are
+        # disabled here without affecting v4160/v4161.
         _cb1a_enabled = False
+        _dead_penalty_qk_weight = jnp.float32(0.0)
+        _dead_penalty_v_weight = jnp.float32(0.0)
+        _dead_penalty_rst_weight = jnp.float32(0.0)
+        _dead_weighted_clip = jnp.float32(0.0)
         _removed_margin_reg_weight_qk = jnp.float32(0.0)
         _removed_margin_reg_weight_v = jnp.float32(0.0)
         _removed_margin_reg_weight_rst = jnp.float32(0.0)
@@ -2089,15 +2097,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _dead_weighted_clip > 0.0,
                 jnp.minimum(dead_penalty_weighted_unclipped, _dead_weighted_clip),
                 dead_penalty_weighted_unclipped)
+            if _is_v4162_clean:
+                # Hard-boundary dead exposure is diagnostic-only in v4162 and
+                # must not affect training loss. Soft-gate exposure diagnostics
+                # are reported by the model; no dead repair loss is active here.
+                dead_penalty_weighted_unclipped = jnp.float32(0.0)
+                dead_penalty_weighted = jnp.float32(0.0)
 
             if _is_v4162_clean:
                 # v4162 loss surface is intentionally clean:
-                # CE + existing DirectTau dead penalty + scheduled RPE only.
+                # CE + scheduled RPE only.
                 orth_loss = jnp.float32(0.0)
-                div_loss = compute_spatial_diversity_loss(params) if is_spatial else jnp.float32(0.0)
-                total_loss = (ce_loss
-                              + dead_penalty_weighted
-                              + explore_loss_weighted)
+                div_loss = jnp.float32(0.0)
+                total_loss = ce_loss + explore_loss_weighted
             elif is_baseline:
                 orth_loss = jnp.float32(0.0)
                 div_loss = jnp.float32(0.0)
@@ -2883,21 +2895,49 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         dead_penalty_weighted_unclipped_metric = explore_stats['dead_penalty_weighted_unclipped']
         removed_margin_reg_weighted_total_metric = explore_stats[
             'removed_margin_reg_weighted_total']
+
+        if _is_v4162_clean:
+            aux_loss_weighted_metric = jnp.float32(0.0)
+            load_balance_loss_weighted_metric = jnp.float32(0.0)
+            tau_reg_weighted_metric = jnp.float32(0.0)
+            orth_loss_weighted_metric = jnp.float32(0.0)
+            diversity_loss_weighted_metric = jnp.float32(0.0)
+            cb1a_weighted_metric = jnp.float32(0.0)
+            dead_penalty_weighted_metric = jnp.float32(0.0)
+            dead_penalty_weighted_unclipped_metric = jnp.float32(0.0)
+            removed_margin_reg_weighted_total_metric = jnp.float32(0.0)
+        else:
+            aux_loss_weighted_metric = lb_weight * aux_loss
+            load_balance_loss_weighted_metric = lb_weight * aux_loss
+            tau_reg_weighted_metric = tau_reg_weight * tau_reg
+            orth_loss_weighted_metric = orth_weight * orth_loss
+            diversity_loss_weighted_metric = div_weight * div_loss
+
+        reconstructed_total_loss_metric = (
+            ce_loss
+            + aux_loss_weighted_metric
+            + tau_reg_weighted_metric
+            + orth_loss_weighted_metric
+            + diversity_loss_weighted_metric
+            + dead_penalty_weighted_metric
+            + explore_loss_weighted_metric
+            + cb1a_weighted_metric
+            + removed_margin_reg_weighted_total_metric)
         metrics = {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
             'aux_loss': aux_loss,
             'aux_loss_raw': aux_loss,
-            'aux_loss_weighted': lb_weight * aux_loss,
+            'aux_loss_weighted': aux_loss_weighted_metric,
             'load_balance_loss_raw': aux_loss,
-            'load_balance_loss_weighted': lb_weight * aux_loss,
+            'load_balance_loss_weighted': load_balance_loss_weighted_metric,
             'tau_reg': tau_reg,
-            'tau_reg_weighted': tau_reg_weight * tau_reg,
+            'tau_reg_weighted': tau_reg_weighted_metric,
             'orth_loss': orth_loss,
-            'orth_loss_weighted': orth_weight * orth_loss,
+            'orth_loss_weighted': orth_loss_weighted_metric,
             'div_loss': div_loss,
             'diversity_loss_raw': div_loss,
-            'diversity_loss_weighted': div_weight * div_loss,
+            'diversity_loss_weighted': diversity_loss_weighted_metric,
             'dead_penalty_weight': jnp.float32(dead_penalty_weight),
             'dead_penalty_weighted_total': dead_penalty_weighted_metric,
             'dead_penalty_raw_unweighted': explore_stats['dead_penalty_raw_unweighted'],
@@ -3046,16 +3086,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'pool_weight_decay_loss': pool_weight_decay_loss,
             'normal_weight_decay_loss': normal_weight_decay_loss,
             'total_loss_minus_ce': total_loss - ce_loss,
-            'reconstructed_loss_error': jnp.abs(total_loss - (
-                ce_loss
-                + lb_weight * aux_loss
-                + tau_reg_weight * tau_reg
-                + orth_weight * orth_loss
-                + div_weight * div_loss
-                + dead_penalty_weighted_metric
-                + explore_loss_weighted_metric
-                + cb1a_weighted_metric
-                + removed_margin_reg_weighted_total_metric)),
+            'reconstructed_total_loss': reconstructed_total_loss_metric,
+            'reconstructed_loss_error': jnp.abs(
+                total_loss - reconstructed_total_loss_metric),
+            'dead_loss_raw': dead_penalty,
+            'dead_loss_weighted': dead_penalty_weighted_metric,
+            'rpe_loss_raw': explore_stats['explore_loss_raw'],
+            'rpe_loss_weighted': explore_loss_weighted_metric,
+            'weight_decay_pool': pool_weight_decay_loss,
+            'weight_decay_normal': normal_weight_decay_loss,
             'correct': result['correct'],
             'valid_count': result['valid_count'],
             'grad_norm': grad_norm,
@@ -3259,6 +3298,32 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'rst_weak_exposure_frac', jnp.float32(0.0)),
             'rst_dead_exposure_target': result.get(
                 'rst_dead_exposure_target', jnp.float32(0.0)),
+            # v4162 soft-gate exposure diagnostics. Old hard-boundary
+            # exposure keys above are kept for v4160/v4161 compatibility.
+            'attn_soft_exposure_mean': result.get('attn_soft_exposure_mean', jnp.float32(0.0)),
+            'attn_soft_exposure_min': result.get('attn_soft_exposure_min', jnp.float32(0.0)),
+            'attn_soft_exposure_max': result.get('attn_soft_exposure_max', jnp.float32(0.0)),
+            'attn_soft_dead_frac_eps_1e_6': result.get('attn_soft_dead_frac_eps_1e_6', jnp.float32(0.0)),
+            'attn_soft_dead_frac_eps_1e_5': result.get('attn_soft_dead_frac_eps_1e_5', jnp.float32(0.0)),
+            'attn_soft_dead_frac_eps_1e_4': result.get('attn_soft_dead_frac_eps_1e_4', jnp.float32(0.0)),
+            'attn_qk_soft_exposure_mean': result.get('attn_qk_soft_exposure_mean', jnp.float32(0.0)),
+            'attn_qk_soft_exposure_min': result.get('attn_qk_soft_exposure_min', jnp.float32(0.0)),
+            'attn_qk_soft_exposure_max': result.get('attn_qk_soft_exposure_max', jnp.float32(0.0)),
+            'attn_qk_soft_dead_frac_eps_1e_6': result.get('attn_qk_soft_dead_frac_eps_1e_6', jnp.float32(0.0)),
+            'attn_qk_soft_dead_frac_eps_1e_5': result.get('attn_qk_soft_dead_frac_eps_1e_5', jnp.float32(0.0)),
+            'attn_qk_soft_dead_frac_eps_1e_4': result.get('attn_qk_soft_dead_frac_eps_1e_4', jnp.float32(0.0)),
+            'attn_v_soft_exposure_mean': result.get('attn_v_soft_exposure_mean', jnp.float32(0.0)),
+            'attn_v_soft_exposure_min': result.get('attn_v_soft_exposure_min', jnp.float32(0.0)),
+            'attn_v_soft_exposure_max': result.get('attn_v_soft_exposure_max', jnp.float32(0.0)),
+            'attn_v_soft_dead_frac_eps_1e_6': result.get('attn_v_soft_dead_frac_eps_1e_6', jnp.float32(0.0)),
+            'attn_v_soft_dead_frac_eps_1e_5': result.get('attn_v_soft_dead_frac_eps_1e_5', jnp.float32(0.0)),
+            'attn_v_soft_dead_frac_eps_1e_4': result.get('attn_v_soft_dead_frac_eps_1e_4', jnp.float32(0.0)),
+            'rst_soft_exposure_mean': result.get('rst_soft_exposure_mean', jnp.float32(0.0)),
+            'rst_soft_exposure_min': result.get('rst_soft_exposure_min', jnp.float32(0.0)),
+            'rst_soft_exposure_max': result.get('rst_soft_exposure_max', jnp.float32(0.0)),
+            'rst_soft_dead_frac_eps_1e_6': result.get('rst_soft_dead_frac_eps_1e_6', jnp.float32(0.0)),
+            'rst_soft_dead_frac_eps_1e_5': result.get('rst_soft_dead_frac_eps_1e_5', jnp.float32(0.0)),
+            'rst_soft_dead_frac_eps_1e_4': result.get('rst_soft_dead_frac_eps_1e_4', jnp.float32(0.0)),
             'dead_count_total': (
                 result.get('attn_dead_count', jnp.float32(0.0))
                 + result.get('rst_dead_count', jnp.float32(0.0))),
@@ -5032,9 +5097,36 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'div_weighted': ctx['div_weight'] * win_avgs['div'],
         'pool_weight_decay_loss': float(m.get('pool_weight_decay_loss', 0.0)),
         'normal_weight_decay_loss': float(m.get('normal_weight_decay_loss', 0.0)),
+        'reconstructed_total_loss': float(m.get(
+            'reconstructed_total_loss', m.get('total_loss', 0.0))),
+        'reconstructed_loss_error': float(m.get('reconstructed_loss_error', 0.0)),
+        'dead_loss_raw': float(m.get('dead_loss_raw', m.get('dead_penalty', 0.0))),
+        'dead_loss_weighted': float(m.get(
+            'dead_loss_weighted', m.get('dead_penalty_weighted_total', 0.0))),
+        'rpe_loss_raw': float(m.get(
+            'rpe_loss_raw', m.get('exploration_loss_raw_total', 0.0))),
+        'rpe_loss_weighted': float(m.get(
+            'rpe_loss_weighted', m.get('exploration_loss_weighted_total', 0.0))),
+        'weight_decay_pool': float(m.get(
+            'weight_decay_pool', m.get('pool_weight_decay_loss', 0.0))),
+        'weight_decay_normal': float(m.get(
+            'weight_decay_normal', m.get('normal_weight_decay_loss', 0.0))),
         'total_loss_minus_ce': float(m.get(
             'total_loss_minus_ce', win_avgs['loss'] - win_avgs['ce'])),
+        'reconstructed_total_loss': float(m.get(
+            'reconstructed_total_loss', m.get('total_loss', win_avgs['loss']))),
         'reconstructed_loss_error': float(m.get('reconstructed_loss_error', 0.0)),
+        'dead_loss_raw': float(m.get('dead_loss_raw', m.get('dead_penalty', 0.0))),
+        'dead_loss_weighted': float(m.get(
+            'dead_loss_weighted', m.get('dead_penalty_weighted_total', 0.0))),
+        'rpe_loss_raw': float(m.get(
+            'rpe_loss_raw', m.get('exploration_loss_raw_total', 0.0))),
+        'rpe_loss_weighted': float(m.get(
+            'rpe_loss_weighted', m.get('exploration_loss_weighted_total', 0.0))),
+        'weight_decay_pool': float(m.get(
+            'weight_decay_pool', m.get('pool_weight_decay_loss', 0.0))),
+        'weight_decay_normal': float(m.get(
+            'weight_decay_normal', m.get('normal_weight_decay_loss', 0.0))),
         # Dead-only penalty.
         'dead_penalty': float(m.get('dead_penalty', 0.0)),
         'attn_dead_penalty': float(m.get('attn_dead_penalty', 0.0)),
@@ -5109,6 +5201,30 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'rst_weak_exposure_frac', 0.0)),
         'rst_dead_exposure_target': float(m.get(
             'rst_dead_exposure_target', 0.0)),
+        'attn_soft_exposure_mean': float(m.get('attn_soft_exposure_mean', 0.0)),
+        'attn_soft_exposure_min': float(m.get('attn_soft_exposure_min', 0.0)),
+        'attn_soft_exposure_max': float(m.get('attn_soft_exposure_max', 0.0)),
+        'attn_soft_dead_frac_eps_1e_6': float(m.get('attn_soft_dead_frac_eps_1e_6', 0.0)),
+        'attn_soft_dead_frac_eps_1e_5': float(m.get('attn_soft_dead_frac_eps_1e_5', 0.0)),
+        'attn_soft_dead_frac_eps_1e_4': float(m.get('attn_soft_dead_frac_eps_1e_4', 0.0)),
+        'attn_qk_soft_exposure_mean': float(m.get('attn_qk_soft_exposure_mean', 0.0)),
+        'attn_qk_soft_exposure_min': float(m.get('attn_qk_soft_exposure_min', 0.0)),
+        'attn_qk_soft_exposure_max': float(m.get('attn_qk_soft_exposure_max', 0.0)),
+        'attn_qk_soft_dead_frac_eps_1e_6': float(m.get('attn_qk_soft_dead_frac_eps_1e_6', 0.0)),
+        'attn_qk_soft_dead_frac_eps_1e_5': float(m.get('attn_qk_soft_dead_frac_eps_1e_5', 0.0)),
+        'attn_qk_soft_dead_frac_eps_1e_4': float(m.get('attn_qk_soft_dead_frac_eps_1e_4', 0.0)),
+        'attn_v_soft_exposure_mean': float(m.get('attn_v_soft_exposure_mean', 0.0)),
+        'attn_v_soft_exposure_min': float(m.get('attn_v_soft_exposure_min', 0.0)),
+        'attn_v_soft_exposure_max': float(m.get('attn_v_soft_exposure_max', 0.0)),
+        'attn_v_soft_dead_frac_eps_1e_6': float(m.get('attn_v_soft_dead_frac_eps_1e_6', 0.0)),
+        'attn_v_soft_dead_frac_eps_1e_5': float(m.get('attn_v_soft_dead_frac_eps_1e_5', 0.0)),
+        'attn_v_soft_dead_frac_eps_1e_4': float(m.get('attn_v_soft_dead_frac_eps_1e_4', 0.0)),
+        'rst_soft_exposure_mean': float(m.get('rst_soft_exposure_mean', 0.0)),
+        'rst_soft_exposure_min': float(m.get('rst_soft_exposure_min', 0.0)),
+        'rst_soft_exposure_max': float(m.get('rst_soft_exposure_max', 0.0)),
+        'rst_soft_dead_frac_eps_1e_6': float(m.get('rst_soft_dead_frac_eps_1e_6', 0.0)),
+        'rst_soft_dead_frac_eps_1e_5': float(m.get('rst_soft_dead_frac_eps_1e_5', 0.0)),
+        'rst_soft_dead_frac_eps_1e_4': float(m.get('rst_soft_dead_frac_eps_1e_4', 0.0)),
         # Explore loss (RPE).
         'explore_loss_raw': float(m.get('explore_loss_raw', 0.0)),
         'explore_loss_weighted': float(m.get('explore_loss_weighted', 0.0)),
@@ -5464,6 +5580,30 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'rst_weak_exposure_frac', 0.0)),
         'rst_dead_exposure_target': float(m.get(
             'rst_dead_exposure_target', 0.0)),
+        'attn_soft_exposure_mean': float(m.get('attn_soft_exposure_mean', 0.0)),
+        'attn_soft_exposure_min': float(m.get('attn_soft_exposure_min', 0.0)),
+        'attn_soft_exposure_max': float(m.get('attn_soft_exposure_max', 0.0)),
+        'attn_soft_dead_frac_eps_1e_6': float(m.get('attn_soft_dead_frac_eps_1e_6', 0.0)),
+        'attn_soft_dead_frac_eps_1e_5': float(m.get('attn_soft_dead_frac_eps_1e_5', 0.0)),
+        'attn_soft_dead_frac_eps_1e_4': float(m.get('attn_soft_dead_frac_eps_1e_4', 0.0)),
+        'attn_qk_soft_exposure_mean': float(m.get('attn_qk_soft_exposure_mean', 0.0)),
+        'attn_qk_soft_exposure_min': float(m.get('attn_qk_soft_exposure_min', 0.0)),
+        'attn_qk_soft_exposure_max': float(m.get('attn_qk_soft_exposure_max', 0.0)),
+        'attn_qk_soft_dead_frac_eps_1e_6': float(m.get('attn_qk_soft_dead_frac_eps_1e_6', 0.0)),
+        'attn_qk_soft_dead_frac_eps_1e_5': float(m.get('attn_qk_soft_dead_frac_eps_1e_5', 0.0)),
+        'attn_qk_soft_dead_frac_eps_1e_4': float(m.get('attn_qk_soft_dead_frac_eps_1e_4', 0.0)),
+        'attn_v_soft_exposure_mean': float(m.get('attn_v_soft_exposure_mean', 0.0)),
+        'attn_v_soft_exposure_min': float(m.get('attn_v_soft_exposure_min', 0.0)),
+        'attn_v_soft_exposure_max': float(m.get('attn_v_soft_exposure_max', 0.0)),
+        'attn_v_soft_dead_frac_eps_1e_6': float(m.get('attn_v_soft_dead_frac_eps_1e_6', 0.0)),
+        'attn_v_soft_dead_frac_eps_1e_5': float(m.get('attn_v_soft_dead_frac_eps_1e_5', 0.0)),
+        'attn_v_soft_dead_frac_eps_1e_4': float(m.get('attn_v_soft_dead_frac_eps_1e_4', 0.0)),
+        'rst_soft_exposure_mean': float(m.get('rst_soft_exposure_mean', 0.0)),
+        'rst_soft_exposure_min': float(m.get('rst_soft_exposure_min', 0.0)),
+        'rst_soft_exposure_max': float(m.get('rst_soft_exposure_max', 0.0)),
+        'rst_soft_dead_frac_eps_1e_6': float(m.get('rst_soft_dead_frac_eps_1e_6', 0.0)),
+        'rst_soft_dead_frac_eps_1e_5': float(m.get('rst_soft_dead_frac_eps_1e_5', 0.0)),
+        'rst_soft_dead_frac_eps_1e_4': float(m.get('rst_soft_dead_frac_eps_1e_4', 0.0)),
         'attn_tau_mean': float(m.get('attn_tau_mean', 0.0)),
         'rst_tau_mean': float(m.get('rst_tau_mean', 0.0)),
         'attn_score_mean': float(m.get('attn_score_mean', 0.0)),
@@ -5780,9 +5920,14 @@ def _print_cb1a_regular_block(rec):
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
+    aux_note = (
+        " aux_is_not_total_minus_ce"
+        if ctx.get('model_version') == 'spatial-r1-v4.1.6.2'
+        else "")
     log_message(
         f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
-        f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} | "
+        f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} "
+        f"total_minus_ce={rec['total_loss_minus_ce']:.4f}{aux_note} | "
         f"grad={rec['grad_norm']:.2f} | "
         f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
     )
@@ -5878,7 +6023,28 @@ def _print_regular_block(rec, ctx):
             f" attn_v={rec['drift_attn_v_emb']:.2e}"
             f" rst={rec['drift_rst_emb']:.2e}]"
         )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
+    if ctx.get('model_version') == 'spatial-r1-v4.1.6.2':
+        log_message(
+            f"  soft_exposure: mean[qk={rec['attn_qk_soft_exposure_mean']:+.4f}"
+            f" v={rec['attn_v_soft_exposure_mean']:+.4f}"
+            f" rst={rec['rst_soft_exposure_mean']:+.4f}]"
+            f" min[qk={rec['attn_qk_soft_exposure_min']:+.4f}"
+            f" v={rec['attn_v_soft_exposure_min']:+.4f}"
+            f" rst={rec['rst_soft_exposure_min']:+.4f}]"
+            f" max[qk={rec['attn_qk_soft_exposure_max']:+.4f}"
+            f" v={rec['attn_v_soft_exposure_max']:+.4f}"
+            f" rst={rec['rst_soft_exposure_max']:+.4f}]"
+            f" dead@1e-6[qk={rec['attn_qk_soft_dead_frac_eps_1e_6']*100:.2f}%"
+            f" v={rec['attn_v_soft_dead_frac_eps_1e_6']*100:.2f}%"
+            f" rst={rec['rst_soft_dead_frac_eps_1e_6']*100:.2f}%]"
+            f" dead@1e-5[qk={rec['attn_qk_soft_dead_frac_eps_1e_5']*100:.2f}%"
+            f" v={rec['attn_v_soft_dead_frac_eps_1e_5']*100:.2f}%"
+            f" rst={rec['rst_soft_dead_frac_eps_1e_5']*100:.2f}%]"
+            f" dead@1e-4[qk={rec['attn_qk_soft_dead_frac_eps_1e_4']*100:.2f}%"
+            f" v={rec['attn_v_soft_dead_frac_eps_1e_4']*100:.2f}%"
+            f" rst={rec['rst_soft_dead_frac_eps_1e_4']*100:.2f}%]"
+        )
+    elif ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_message(
             f"  angular_exposure: mean[a={rec['attn_angular_exposure_mean']:+.4f}"
             f" rst={rec['rst_angular_exposure_mean']:+.4f}]"
@@ -7692,6 +7858,7 @@ def _print_debug_block(rec, ctx):
         f"wd_pool={_g('pool_weight_decay_loss'):.6f} "
         f"wd_normal={_g('normal_weight_decay_loss'):.6f} "
         f"total_minus_ce={_g('total_loss_minus_ce'):.6f} "
+        f"reconstructed={_g('reconstructed_total_loss'):.6f} "
         f"recon_err={_g('reconstructed_loss_error'):.3e}"
     )
     if is_v4160:
@@ -7763,7 +7930,29 @@ def _print_debug_block(rec, ctx):
             f"rst=({_g('cb1a_rst_challenge_weight', 0.0):.4g},"
             f"{_g('cb1a_rst_prune_weight', 0.0):.4g})]"
         )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
+    if ctx.get('model_version') == 'spatial-r1-v4.1.6.2':
+        log_debug_message(
+            f"soft_exposure_diag: "
+            f"mean[qk={_g('attn_qk_soft_exposure_mean'):+.5f} "
+            f"v={_g('attn_v_soft_exposure_mean'):+.5f} "
+            f"rst={_g('rst_soft_exposure_mean'):+.5f}] "
+            f"min[qk={_g('attn_qk_soft_exposure_min'):+.5f} "
+            f"v={_g('attn_v_soft_exposure_min'):+.5f} "
+            f"rst={_g('rst_soft_exposure_min'):+.5f}] "
+            f"max[qk={_g('attn_qk_soft_exposure_max'):+.5f} "
+            f"v={_g('attn_v_soft_exposure_max'):+.5f} "
+            f"rst={_g('rst_soft_exposure_max'):+.5f}] "
+            f"dead@1e-6[qk={_g('attn_qk_soft_dead_frac_eps_1e_6'):.5f} "
+            f"v={_g('attn_v_soft_dead_frac_eps_1e_6'):.5f} "
+            f"rst={_g('rst_soft_dead_frac_eps_1e_6'):.5f}] "
+            f"dead@1e-5[qk={_g('attn_qk_soft_dead_frac_eps_1e_5'):.5f} "
+            f"v={_g('attn_v_soft_dead_frac_eps_1e_5'):.5f} "
+            f"rst={_g('rst_soft_dead_frac_eps_1e_5'):.5f}] "
+            f"dead@1e-4[qk={_g('attn_qk_soft_dead_frac_eps_1e_4'):.5f} "
+            f"v={_g('attn_v_soft_dead_frac_eps_1e_4'):.5f} "
+            f"rst={_g('rst_soft_dead_frac_eps_1e_4'):.5f}]"
+        )
+    elif ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_debug_message(
             f"angular_exposure_diag: "
             f"mean[attn={_g('attn_angular_exposure_mean'):+.5f} "
@@ -8823,7 +9012,14 @@ def main():
     removed_margin_reg_weight_rst = tcfg.get(
         'removed_margin_reg_weight_rst', 0.0)
     if model_version_cfg == 'spatial-r1-v4.1.6.2':
-        # v4162 clean path has no configurable selection-margin auxiliary.
+        # v4162 clean path has no hard-boundary dead repair or configurable
+        # selection-margin auxiliary.  Keep config defaults harmless even if
+        # an old YAML/checkpoint config contains legacy nonzero values.
+        dead_penalty_weight = 0.0
+        dead_penalty_qk_weight = 0.0
+        dead_penalty_v_weight = 0.0
+        dead_penalty_rst_weight = 0.0
+        dead_exposure_target = 0.0
         removed_margin_reg_weight_qk = 0.0
         removed_margin_reg_weight_v = 0.0
         removed_margin_reg_weight_rst = 0.0
@@ -9185,7 +9381,16 @@ def main():
                 'dead_penalty_rst_weight', dead_penalty_rst_weight)
             dead_exposure_target = float(saved_training_config.get(
                 'dead_exposure_target', dead_exposure_target))
-            if model_version_cfg != 'spatial-r1-v4.1.6.2':
+            if model_version_cfg == 'spatial-r1-v4.1.6.2':
+                dead_penalty_weight = 0.0
+                dead_penalty_qk_weight = 0.0
+                dead_penalty_v_weight = 0.0
+                dead_penalty_rst_weight = 0.0
+                dead_exposure_target = 0.0
+                removed_margin_reg_weight_qk = 0.0
+                removed_margin_reg_weight_v = 0.0
+                removed_margin_reg_weight_rst = 0.0
+            else:
                 removed_margin_reg_weight_qk = saved_training_config.get(
                     'removed_margin_reg_weight_qk',
                     removed_margin_reg_weight_qk)
