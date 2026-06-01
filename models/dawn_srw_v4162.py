@@ -4105,7 +4105,6 @@ class DAWN(nn.Module):
              attn_qk_exposure_diag_all, attn_v_exposure_diag_all) = scan_ys[
                 _scan_offset:_scan_offset + 5]
             _scan_offset += 5
-            _scan_offset += 8
             if analysis:
                 (attn_qk_raw_norm_all, attn_v_raw_norm_all, rst_raw_out_norm_all,
                  attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
