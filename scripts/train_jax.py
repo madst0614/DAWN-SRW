@@ -206,6 +206,31 @@ DIRECT_TAU_EXPOSURE_METRIC_NAMES = (
     'angular_exposure_max', 'dead_exposure_frac',
     'weak_exposure_frac', 'dead_exposure_target',
 )
+DIRECT_TAU_SPARSITY_METRIC_NAMES = (
+    'active_tau_frac', 'active_tau_count',
+    'active_eps_1e_6_frac', 'active_eps_1e_6_count',
+    'active_eps_1e_5_frac', 'active_eps_1e_5_count',
+    'active_eps_1e_4_frac', 'active_eps_1e_4_count',
+    'active_eps_1e_3_frac', 'active_eps_1e_3_count',
+    'active_eps_1e_2_frac', 'active_eps_1e_2_count',
+    'active_eps_1e_1_frac', 'active_eps_1e_1_count',
+    'mass_eps_1e_6', 'mass_eps_1e_5', 'mass_eps_1e_4',
+    'mass_eps_1e_3', 'mass_eps_1e_2', 'mass_eps_1e_1',
+    'projected_Tfinal_active_eps_1e_6_frac',
+    'projected_Tfinal_active_eps_1e_6_count',
+    'projected_Tfinal_active_eps_1e_4_frac',
+    'projected_Tfinal_active_eps_1e_4_count',
+    'projected_Tfinal_active_eps_1e_3_frac',
+    'projected_Tfinal_active_eps_1e_3_count',
+    'projected_Tfinal_mass_eps_1e_6',
+    'projected_Tfinal_mass_eps_1e_4',
+    'projected_Tfinal_mass_eps_1e_3',
+    'margin_band_gt_0',
+    'margin_band_m0_01_0',
+    'margin_band_m0_03_m0_01',
+    'margin_band_m0_10_m0_03',
+    'margin_band_lt_m0_10',
+)
 DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES = (
     'raw_gate_max', 'gate_sum', 'active_n_mean',
     'tau_abs_mean', 'dead_penalty', 'dead_count',
@@ -1200,6 +1225,16 @@ def _model_accepts_soft_gate_schedule(model):
         return False
 
 
+def _model_accepts_soft_gate_t_final(model):
+    """Return True if model.__call__ accepts projected final-T diagnostics."""
+    import inspect as _inspect
+    try:
+        return 'soft_gate_t_final' in _inspect.signature(
+            model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _model_accepts_execution_prune_eps(model):
     """Return True if model.__call__ accepts eval-time execution pruning."""
     import inspect as _inspect
@@ -1591,6 +1626,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_local_kw = _model_accepts_local_diagnostics(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
+    _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
     _model_version = getattr(
@@ -1676,6 +1712,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     (_explore_weight_q + _explore_weight_k
                      + _explore_weight_v + _explore_weight_rst)
                     / jnp.float32(4.0) * rpe_schedule_scale)
+            if _pass_soft_gate_t_final_kw:
+                extra_kw['soft_gate_t_final'] = _soft_gate_t_final
             if _pass_execution_prune_kw:
                 # Training never execution-prunes; pruning is eval-sweep only.
                 extra_kw['execution_prune_eps'] = jnp.float32(0.0)
@@ -3542,6 +3580,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 metrics[f'{_pool}_{_name}'] = result.get(
                     f'{_pool}_{_name}',
                     result.get(f'attn_{_name}', jnp.float32(0.0)))
+        for _pool in ('attn_qk', 'attn_v', 'attn_q', 'attn_k', 'rst'):
+            for _name in DIRECT_TAU_SPARSITY_METRIC_NAMES:
+                metrics[f'{_pool}_{_name}'] = result.get(
+                    f'{_pool}_{_name}', jnp.float32(0.0))
         if debug_local_spikes:
             metrics.update({
                 'local_spike_values': result.get(
@@ -3673,6 +3715,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     """
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
+    _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _execution_prune_eps = jnp.float32(execution_prune_eps)
     _return_prune_stats = bool(return_prune_stats)
@@ -3713,6 +3756,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                 _tau_ce_grad_scale_hold_frac,
                 _tau_ce_grad_scale_anneal_end_frac,
                 _tau_ce_grad_scale_schedule)
+        if _pass_soft_gate_t_final_kw:
+            extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = _execution_prune_eps
         result = model.apply(
@@ -3771,6 +3816,7 @@ def create_analysis_step(model, sharded_fns=None,
     """
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
+    _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
@@ -3809,6 +3855,8 @@ def create_analysis_step(model, sharded_fns=None,
                 _tau_ce_grad_scale_hold_frac,
                 _tau_ce_grad_scale_anneal_end_frac,
                 _tau_ce_grad_scale_schedule)
+        if _pass_soft_gate_t_final_kw:
+            extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         result = model.apply(
@@ -3946,6 +3994,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _pass_spike_kw = _model_accepts_spike_probe(model)
     _pass_focus_kw = _model_accepts_spike_focus_probe(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
+    _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
@@ -3987,6 +4036,8 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                 _tau_ce_grad_scale_hold_frac,
                 _tau_ce_grad_scale_anneal_end_frac,
                 _tau_ce_grad_scale_schedule)
+        if _pass_soft_gate_t_final_kw:
+            extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         result = model.apply(
@@ -5054,6 +5105,94 @@ def _fmt_act_count(frac, total):
     return f"{frac * 100:.1f}%({int(round(frac * total))})"
 
 
+SPARSITY_LOG_POOLS = (
+    ('attn_qk', 'qk'),
+    ('attn_q', 'q'),
+    ('attn_k', 'k'),
+    ('attn_v', 'v'),
+    ('rst', 'rst'),
+)
+SPARSITY_CURRENT_EPS_LOG = (
+    ('1e-6', '1e_6'),
+    ('1e-5', '1e_5'),
+    ('1e-4', '1e_4'),
+    ('1e-3', '1e_3'),
+    ('1e-2', '1e_2'),
+    ('1e-1', '1e_1'),
+)
+SPARSITY_PROJECTED_EPS_LOG = (
+    ('1e-6', '1e_6'),
+    ('1e-4', '1e_4'),
+    ('1e-3', '1e_3'),
+)
+SPARSITY_MARGIN_BAND_LOG = (
+    ('>0', 'margin_band_gt_0'),
+    ('[-0.01,0]', 'margin_band_m0_01_0'),
+    ('[-0.03,-0.01]', 'margin_band_m0_03_m0_01'),
+    ('[-0.10,-0.03]', 'margin_band_m0_10_m0_03'),
+    ('<-0.10', 'margin_band_lt_m0_10'),
+)
+
+
+def _fmt_sparsity_frac_count(rec, pool, prefix):
+    frac = float(rec.get(f'{pool}_{prefix}_frac', 0.0) or 0.0)
+    count = float(rec.get(f'{pool}_{prefix}_count', 0.0) or 0.0)
+    return f"{frac * 100:.2f}%({count:.2f})"
+
+
+def _fmt_sparsity_mass(rec, pool, key):
+    mass = float(rec.get(f'{pool}_{key}', 0.0) or 0.0)
+    return f"{mass * 100:.2f}%"
+
+
+def _fmt_sparsity_pool_values(rec, formatter):
+    return " ".join(
+        f"{label}={formatter(pool)}"
+        for pool, label in SPARSITY_LOG_POOLS)
+
+
+def _print_v4162_sparsity_block(rec):
+    log_message(
+        "  active_tau: "
+        + _fmt_sparsity_pool_values(
+            rec,
+            lambda pool: _fmt_sparsity_frac_count(
+                rec, pool, 'active_tau')))
+    for eps_label, suffix in SPARSITY_CURRENT_EPS_LOG:
+        log_message(
+            f"  gate@{eps_label}: active "
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool, suffix=suffix: _fmt_sparsity_frac_count(
+                    rec, pool, f'active_eps_{suffix}'))
+            + " | mass "
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool, suffix=suffix: _fmt_sparsity_mass(
+                    rec, pool, f'mass_eps_{suffix}')))
+    for eps_label, suffix in SPARSITY_PROJECTED_EPS_LOG:
+        log_message(
+            f"  projected_Tfinal@{eps_label}: active "
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool, suffix=suffix: _fmt_sparsity_frac_count(
+                    rec, pool, f'projected_Tfinal_active_eps_{suffix}'))
+            + " | mass "
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool, suffix=suffix: _fmt_sparsity_mass(
+                    rec, pool, f'projected_Tfinal_mass_eps_{suffix}')))
+    log_message(
+        "  margin_bands: "
+        + " ".join(
+            f"{band}["
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool, key=key: _fmt_sparsity_mass(rec, pool, key))
+            + "]"
+            for band, key in SPARSITY_MARGIN_BAND_LOG))
+
+
 def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     """REGULAR tier: all training-dynamics fields needed for live monitoring.
 
@@ -5793,6 +5932,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             rec[f'{_pool}_{_name}'] = float(m.get(
                 f'{_pool}_{_name}',
                 rec.get(f'attn_{_name}', 0.0)))
+    for _pool in ('attn_qk', 'attn_v', 'attn_q', 'attn_k', 'rst'):
+        for _name in DIRECT_TAU_SPARSITY_METRIC_NAMES:
+            rec[f'{_pool}_{_name}'] = float(m.get(
+                f'{_pool}_{_name}', 0.0))
     if rec['attn_top1_gate_frac'] == 0.0:
         rec['attn_top1_gate_frac'] = rec['attn_raw_gate_max'] / max(rec['attn_gate_sum'], 1e-8)
     if rec['rst_top1_gate_frac'] == 0.0:
@@ -5920,9 +6063,10 @@ def _print_cb1a_regular_block(rec):
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
+    is_v4162_soft = ctx.get('model_version') == 'spatial-r1-v4.1.6.2'
     aux_note = (
         " aux_is_not_total_minus_ce"
-        if ctx.get('model_version') == 'spatial-r1-v4.1.6.2'
+        if is_v4162_soft
         else "")
     log_message(
         f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
@@ -5932,16 +6076,25 @@ def _print_regular_block(rec, ctx):
         f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
     )
     if is_v4160:
-        log_message(
-            f"  act: q={_fmt_act_count(rec['attn_q_active'], ctx['n_qk_cfg'])}"
-            f" k={_fmt_act_count(rec['attn_k_active'], ctx['n_qk_cfg'])}"
-            f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
-            f" rst={_fmt_act_count(rec['rst_active'], ctx['n_rst_cfg'])}"
-            f" | strong: q={rec['attn_q_strong']*100:.1f}%"
-            f" k={rec['attn_k_strong']*100:.1f}%"
-            f" v={rec['attn_v_strong']*100:.1f}%"
-            f" rst={rec['rst_strong']*100:.1f}%"
-        )
+        if is_v4162_soft:
+            _print_v4162_sparsity_block(rec)
+            log_message(
+                f"  strong: q={rec['attn_q_strong']*100:.1f}%"
+                f" k={rec['attn_k_strong']*100:.1f}%"
+                f" v={rec['attn_v_strong']*100:.1f}%"
+                f" rst={rec['rst_strong']*100:.1f}%"
+            )
+        else:
+            log_message(
+                f"  act: q={_fmt_act_count(rec['attn_q_active'], ctx['n_qk_cfg'])}"
+                f" k={_fmt_act_count(rec['attn_k_active'], ctx['n_qk_cfg'])}"
+                f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
+                f" rst={_fmt_act_count(rec['rst_active'], ctx['n_rst_cfg'])}"
+                f" | strong: q={rec['attn_q_strong']*100:.1f}%"
+                f" k={rec['attn_k_strong']*100:.1f}%"
+                f" v={rec['attn_v_strong']*100:.1f}%"
+                f" rst={rec['rst_strong']*100:.1f}%"
+            )
     else:
         log_message(
             f"  act: attn_qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
@@ -5967,10 +6120,16 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['rst_no_active_frac']*100:.2f}%]"
         )
     elif is_v4160:
-        _is_v4162_soft = ctx.get('model_version') == 'spatial-r1-v4.1.6.2'
-        _weight_label = 'soft_weight' if _is_v4162_soft else 'pos'
-        _selected_label = 'margin>tau' if _is_v4162_soft else 'selected'
-        _no_active_label = 'no_margin>tau' if _is_v4162_soft else 'no_active'
+        _weight_label = 'soft_weight' if is_v4162_soft else 'pos'
+        _select_status = ""
+        if not is_v4162_soft:
+            _select_status = (
+                f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
+                f" v={rec['attn_v_selected_frac']*100:.1f}%"
+                f" rst={rec['rst_selected_frac']*100:.1f}%]"
+                f" no_active[qk={rec['attn_qk_no_active_frac']*100:.2f}%"
+                f" v={rec['attn_v_no_active_frac']*100:.2f}%"
+                f" rst={rec['rst_no_active_frac']*100:.2f}%]")
         log_message(
             f"  select: tau[qk={rec['attn_qk_tau_mean']:.4f}"
             f" v={rec['attn_v_tau_mean']:.4f}"
@@ -5981,14 +6140,9 @@ def _print_regular_block(rec, ctx):
             f" {_weight_label}[qk={rec['attn_qk_positive_margin_mean']:.4f}"
             f" v={rec['attn_v_positive_margin_mean']:.4f}"
             f" rst={rec['rst_positive_margin_mean']:.4f}]"
-            f" {_selected_label}[qk={rec['attn_qk_selected_frac']*100:.1f}%"
-            f" v={rec['attn_v_selected_frac']*100:.1f}%"
-            f" rst={rec['rst_selected_frac']*100:.1f}%]"
-            f" {_no_active_label}[qk={rec['attn_qk_no_active_frac']*100:.2f}%"
-            f" v={rec['attn_v_no_active_frac']*100:.2f}%"
-            f" rst={rec['rst_no_active_frac']*100:.2f}%]"
+            f"{_select_status}"
         )
-        if not _is_v4162_soft:
+        if not is_v4162_soft:
             log_message(
                 f"  removed_margin_reg: "
                 f"raw[qk={rec['removed_margin_reg_raw_qk']:.6f}"
@@ -8122,10 +8276,15 @@ def _print_debug_block(rec, ctx):
     elif ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS:
         _is_v4162_soft = ctx.get('model_version') == 'spatial-r1-v4.1.6.2'
         _weight_label = 'soft_weight' if _is_v4162_soft else 'positive_margin'
-        _selected_label = (
-            'margin_above_tau' if _is_v4162_soft else 'selected')
-        _no_active_label = (
-            'no_margin_above_tau' if _is_v4162_soft else 'no_active')
+        _select_status = ""
+        if not _is_v4162_soft:
+            _select_status = (
+                f" selected[qk={_g('attn_qk_selected_frac'):.5f} "
+                f"v={_g('attn_v_selected_frac'):.5f} "
+                f"rst={_g('rst_selected_frac'):.5f}] "
+                f"no_active[qk={_g('attn_qk_no_active_frac'):.5f} "
+                f"v={_g('attn_v_no_active_frac'):.5f} "
+                f"rst={_g('rst_no_active_frac'):.5f}]")
         log_debug_message(
             f"direct_tau_select_diag: "
             f"tau[qk={_g('attn_qk_tau_mean'):+.5f} "
@@ -8138,10 +8297,7 @@ def _print_debug_block(rec, ctx):
             f"{_weight_label}[qk={_g('attn_qk_positive_margin_mean'):.5f}/{_g('attn_qk_positive_margin_max'):.5f} "
             f"v={_g('attn_v_positive_margin_mean'):.5f}/{_g('attn_v_positive_margin_max'):.5f} "
             f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
-            f"{_selected_label}[qk={_g('attn_qk_selected_frac'):.5f} "
-            f"v={_g('attn_v_selected_frac'):.5f} rst={_g('rst_selected_frac'):.5f}] "
-            f"{_no_active_label}[qk={_g('attn_qk_no_active_frac'):.5f} "
-            f"v={_g('attn_v_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
+            f"{_select_status}"
         )
     route_std_label = (
         "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
@@ -8562,6 +8718,10 @@ def _build_analysis_record(base, metrics, ctx):
             rec[f'{_pool}_{_name}'] = float(m.get(
                 f'{_pool}_{_name}',
                 rec.get(f'attn_{_name}', 0.0)))
+    for _pool in ('attn_qk', 'attn_v', 'attn_q', 'attn_k', 'rst'):
+        for _name in DIRECT_TAU_SPARSITY_METRIC_NAMES:
+            rec[f'{_pool}_{_name}'] = float(m.get(
+                f'{_pool}_{_name}', 0.0))
     try:
         rec['attn_logit_max_layer'] = int(jax.device_get(
             m.get('attn_logit_max_layer', -1)))

@@ -150,6 +150,64 @@ ATTN_SPLIT_CORE_COUNT = len(ATTN_SPLIT_CORE_NAMES)
 ) = range(ATTN_SPLIT_CORE_COUNT)
 
 
+GATE_CURRENT_EPS = (
+    1.0e-6,
+    1.0e-5,
+    1.0e-4,
+    1.0e-3,
+    1.0e-2,
+    1.0e-1,
+)
+GATE_PROJECTED_EPS = (
+    1.0e-6,
+    1.0e-4,
+    1.0e-3,
+)
+MARGIN_BAND_NAMES = (
+    'gt_0',
+    'm0_01_0',
+    'm0_03_m0_01',
+    'm0_10_m0_03',
+    'lt_m0_10',
+)
+GATE_EPS_NAME_SUFFIXES = (
+    '1e_6',
+    '1e_5',
+    '1e_4',
+    '1e_3',
+    '1e_2',
+    '1e_1',
+)
+GATE_PROJECTED_EPS_NAME_SUFFIXES = (
+    '1e_6',
+    '1e_4',
+    '1e_3',
+)
+GATE_SPARSITY_DIAG_NAMES = (
+    ('active_tau_frac', 'active_tau_count')
+    + tuple(
+        name
+        for suffix in GATE_EPS_NAME_SUFFIXES
+        for name in (
+            f'active_eps_{suffix}_frac',
+            f'active_eps_{suffix}_count',
+        ))
+    + tuple(f'mass_eps_{suffix}' for suffix in GATE_EPS_NAME_SUFFIXES)
+    + tuple(
+        name
+        for suffix in GATE_PROJECTED_EPS_NAME_SUFFIXES
+        for name in (
+            f'projected_Tfinal_active_eps_{suffix}_frac',
+            f'projected_Tfinal_active_eps_{suffix}_count',
+        ))
+    + tuple(
+        f'projected_Tfinal_mass_eps_{suffix}'
+        for suffix in GATE_PROJECTED_EPS_NAME_SUFFIXES)
+    + tuple(f'margin_band_{name}' for name in MARGIN_BAND_NAMES)
+)
+GATE_SPARSITY_DIAG_COUNT = len(GATE_SPARSITY_DIAG_NAMES)
+
+
 def _pool_output_scales(d_model, n_layers):
     dm = jnp.asarray(d_model, dtype=jnp.float32)
     nl = jnp.asarray(n_layers, dtype=jnp.float32)
@@ -289,6 +347,8 @@ def _compute_soft_gate(score, tau, intensity, temperature, tau_ce_grad_scale,
         execution_prune_eps > 0.0,
         jnp.where(gate_unpruned >= execution_prune_eps, gate_unpruned, 0.0),
         gate_unpruned)
+    # Preserve the existing forward-side active mask.  The tau-boundary
+    # diagnostic, margin > 0, is reported separately as active_tau.
     active_mask = gate >= jnp.asarray(effective_active_eps, dtype=jnp.float32)
     return margin, soft_weight, gate, active_mask
 
@@ -427,6 +487,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _select_diag_specs = tuple(P() for _ in range(SELECT_DIAG_COUNT))
     _dead_exposure_diag_specs = tuple(
         P() for _ in range(DEAD_EXPOSURE_DIAG_COUNT))
+    _sparsity_diag_specs = (
+        P(),                     # gate sparsity diagnostics [metric]
+    )
     _local_diag_specs = (
         P(),                     # local_spike_values [1, metric]
         P(),                     # local_spike_locs [1, metric, b/t/neuron]
@@ -440,6 +503,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                   if analysis else _slim_out_specs + _conc_out_specs)
     _out_specs = _out_specs + _select_diag_specs
     _out_specs = _out_specs + _dead_exposure_diag_specs
+    _out_specs = _out_specs + _sparsity_diag_specs
     if _local_diagnostics:
         _out_specs = _out_specs + _local_diag_specs
     if _spike_probe:
@@ -454,12 +518,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                        P('model', None),          # write [N_local, D]
                        P(),                       # soft_gate_temperature scalar
                        P(),                       # tau_ce_grad_scale scalar
+                       P(),                       # soft_gate_t_final scalar
                        P()),                      # execution_prune_eps scalar
              out_specs=_out_specs,
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, raw_tau,
                        read_local, write_local,
                        soft_gate_temperature, tau_ce_grad_scale,
+                       soft_gate_t_final,
                        execution_prune_eps):
         N_local = emb_local.shape[0]
         nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
@@ -610,6 +676,101 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             diag_neg_inf,
             jnp.full((B, S, 1), diag_neg_inf, dtype=jnp.float32),
         )
+        current_eps = jnp.asarray(GATE_CURRENT_EPS, dtype=jnp.float32)
+        projected_eps = jnp.asarray(GATE_PROJECTED_EPS, dtype=jnp.float32)
+        sparsity_carry0 = (
+            jnp.float32(0.0),
+            jnp.zeros((len(GATE_CURRENT_EPS),), dtype=jnp.float32),
+            jnp.zeros((len(GATE_CURRENT_EPS),), dtype=jnp.float32),
+            jnp.float32(0.0),
+            jnp.zeros((len(GATE_PROJECTED_EPS),), dtype=jnp.float32),
+            jnp.zeros((len(GATE_PROJECTED_EPS),), dtype=jnp.float32),
+            jnp.float32(0.0),
+            jnp.zeros((len(MARGIN_BAND_NAMES),), dtype=jnp.float32),
+        )
+
+        def gate_sparsity_parts(selection_margin, intensity, gate):
+            margin_sg = jax.lax.stop_gradient(selection_margin)
+            intensity_sg = jax.lax.stop_gradient(intensity)
+            gate_sg = jax.lax.stop_gradient(gate)
+            active_tau = margin_sg > 0.0
+
+            current_active = gate_sg[..., None] > current_eps
+            current_active_count = current_active.astype(jnp.float32).sum(
+                axis=(0, 1, 2))
+            current_mass = (
+                gate_sg[..., None] * current_active.astype(jnp.float32)
+            ).sum(axis=(0, 1, 2))
+            gate_mass = gate_sg.sum()
+
+            tfinal = jnp.maximum(
+                jnp.asarray(soft_gate_t_final, dtype=jnp.float32),
+                jnp.float32(1.0e-4))
+            projected_gate = (
+                jax.nn.sigmoid(jnp.clip(margin_sg / tfinal, -30.0, 30.0))
+                * intensity_sg)
+            projected_active = projected_gate[..., None] > projected_eps
+            projected_active_count = projected_active.astype(jnp.float32).sum(
+                axis=(0, 1, 2))
+            projected_mass = (
+                projected_gate[..., None]
+                * projected_active.astype(jnp.float32)
+            ).sum(axis=(0, 1, 2))
+            projected_gate_mass = projected_gate.sum()
+
+            margin_bands = jnp.stack((
+                active_tau.astype(jnp.float32).sum(),
+                ((margin_sg >= -0.01) & (margin_sg <= 0.0)).astype(jnp.float32).sum(),
+                ((margin_sg >= -0.03) & (margin_sg < -0.01)).astype(jnp.float32).sum(),
+                ((margin_sg >= -0.10) & (margin_sg < -0.03)).astype(jnp.float32).sum(),
+                (margin_sg < -0.10).astype(jnp.float32).sum(),
+            )).astype(jnp.float32)
+            return (
+                active_tau.astype(jnp.float32).sum(),
+                current_active_count,
+                current_mass,
+                gate_mass,
+                projected_active_count,
+                projected_mass,
+                projected_gate_mass,
+                margin_bands,
+            )
+
+        def add_sparsity_carry(a, b):
+            return tuple(x + y for x, y in zip(a, b))
+
+        def finalize_sparsity_diag(carry):
+            (active_tau_count, current_active_count, current_mass, gate_mass,
+             projected_active_count, projected_mass, projected_gate_mass,
+             margin_bands) = carry
+            active_tau_count = jax.lax.psum(active_tau_count, 'model')
+            current_active_count = jax.lax.psum(
+                current_active_count, 'model')
+            current_mass = jax.lax.psum(current_mass, 'model')
+            gate_mass = jax.lax.psum(gate_mass, 'model')
+            projected_active_count = jax.lax.psum(
+                projected_active_count, 'model')
+            projected_mass = jax.lax.psum(projected_mass, 'model')
+            projected_gate_mass = jax.lax.psum(projected_gate_mass, 'model')
+            margin_bands = jax.lax.psum(margin_bands, 'model')
+
+            token_count = jnp.float32(B * S)
+            element_count = token_count * jnp.float32(N_total)
+            current_frac = current_active_count / element_count
+            current_count = current_active_count / token_count
+            projected_frac = projected_active_count / element_count
+            projected_count = projected_active_count / token_count
+            return jax.lax.stop_gradient(jnp.concatenate((
+                jnp.stack((
+                    active_tau_count / element_count,
+                    active_tau_count / token_count,
+                )).astype(jnp.float32),
+                jnp.stack((current_frac, current_count), axis=1).reshape((-1,)),
+                current_mass / jnp.maximum(gate_mass, 1.0e-8),
+                jnp.stack((projected_frac, projected_count), axis=1).reshape((-1,)),
+                projected_mass / jnp.maximum(projected_gate_mass, 1.0e-8),
+                margin_bands / element_count,
+            )).astype(jnp.float32))
 
         def soft_gate_exposure_parts(gate_unpruned):
             # v4162 soft-gate exposure diagnostic only.  Do not use the hard
@@ -752,7 +913,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count,
                  total_edge_margin_stat,
-                 select_diag_carry, diag_vals, spike_rows) = carry
+                 sparsity_carry, select_diag_carry, diag_vals, spike_rows) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, intensity, rho_exposure = route_relation_and_intensity(
@@ -770,6 +931,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 gate_unpruned = positive_margin * intensity
                 chunk_current_cost = gate_unpruned.sum(axis=-1, keepdims=True)
                 gate = base_gate
+                chunk_sparsity = gate_sparsity_parts(
+                    selection_margin, intensity, gate)
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
@@ -850,6 +1013,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_soft_dead_1e4_count,
                         total_edge_margin_stat + chunk_edge_margin_stat,
+                        add_sparsity_carry(sparsity_carry, chunk_sparsity),
                         select_diag_carry,
                         diag_vals,
                         spike_rows), None
@@ -863,6 +1027,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
              total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count,
              total_edge_margin_stat,
+             sparsity_carry,
              select_diag_carry, diag_vals, spike_rows), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
@@ -874,6 +1039,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  jnp.float32(0.0), jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.float32(0.0),
+                 sparsity_carry0,
                  select_diag_carry0,
                  diag_vals_init,
                  spike_rows_init),
@@ -890,7 +1056,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count,
                  total_edge_margin_stat,
-                 select_diag_carry, diag_vals, spike_rows) = carry
+                 sparsity_carry, select_diag_carry, diag_vals, spike_rows) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, intensity, rho_exposure = route_relation_and_intensity(
@@ -908,6 +1074,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 gate_unpruned = positive_margin * intensity
                 chunk_current_cost = gate_unpruned.sum(axis=-1, keepdims=True)
                 gate = base_gate
+                chunk_sparsity = gate_sparsity_parts(
+                    selection_margin, intensity, gate)
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
@@ -980,6 +1148,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_soft_dead_1e4_count,
                         total_edge_margin_stat + chunk_edge_margin_stat,
+                        add_sparsity_carry(sparsity_carry, chunk_sparsity),
                         select_diag_carry,
                         diag_vals,
                         spike_rows), None
@@ -992,6 +1161,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
              total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count,
              total_edge_margin_stat,
+             sparsity_carry,
              select_diag_carry, diag_vals, spike_rows), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
@@ -1002,6 +1172,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  jnp.float32(0.0), jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.float32(0.0),
+                 sparsity_carry0,
                  select_diag_carry0,
                  diag_vals_init,
                  spike_rows_init),
@@ -1120,6 +1291,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 jax.lax.psum(total_selection_residency_count, 'model')
                 / jnp.float32(N_total)),
         )
+        sparsity_diag_out = finalize_sparsity_diag(sparsity_carry)
 
         slim_out = (out.astype(jnp.float32), active_frac, global_gate_max, rho_lb,
                     rho_std_out, es_out, active_n_mean, strong_frac,
@@ -1178,7 +1350,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                     no_active_direct).astype(jnp.float32),)
         if not analysis:
             return (slim_out + conc_out + select_diag_out
-                    + dead_exposure_diag_out + local_diag_out + spike_probe_out)
+                    + dead_exposure_diag_out + (sparsity_diag_out,)
+                    + local_diag_out + spike_probe_out)
 
         # --- Analysis-only extras ---
         margin_band_frac = jax.lax.psum(total_margin_band, 'model') / N_total
@@ -1212,6 +1385,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                    gate_entropy, den_cost_out, selection_cost_out,
                    current_cost_out, rho_kurt, int_cap_frac_out)
                 + select_diag_out + dead_exposure_diag_out
+                + (sparsity_diag_out,)
                 + local_diag_out + spike_probe_out)
 
     return fused_gate_srw
@@ -1306,6 +1480,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _select_diag_specs = tuple(P() for _ in range(SELECT_DIAG_COUNT))
     _dead_exposure_diag_specs = tuple(
         P() for _ in range(DEAD_EXPOSURE_DIAG_COUNT))
+    _sparsity_diag_specs = (
+        P(),                          # gate sparsity diagnostics [2, metric]
+    )
     _local_diag_specs = (
         P(),                          # local_spike_values [2, metric]
         P(),                          # local_spike_locs [2, metric, b/t/neuron]
@@ -1321,6 +1498,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                   else _slim_out_specs + _conc_out_specs + _route_split_out_specs)
     _out_specs = _out_specs + _select_diag_specs
     _out_specs = _out_specs + _dead_exposure_diag_specs
+    _out_specs = _out_specs + _sparsity_diag_specs
     if _local_diagnostics:
         _out_specs = _out_specs + _local_diag_specs
     if _spike_probe:
@@ -1335,12 +1513,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                        P('model', None),              # write [N_local, D]
                        P(),                           # soft_gate_temperature scalar
                        P(),                           # tau_ce_grad_scale scalar
+                       P(),                           # soft_gate_t_final scalar
                        P()),                          # execution_prune_eps scalar
              out_specs=_out_specs,
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, raw_tau,
                               read_local, write_local,
-                              soft_gate_temperature, tau_ce_grad_scale, execution_prune_eps):
+                              soft_gate_temperature, tau_ce_grad_scale,
+                              soft_gate_t_final, execution_prune_eps):
         N_local = emb_local.shape[0]
         nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -1491,6 +1671,101 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             diag_neg_inf,
             jnp.full((B, S, 2, 1), diag_neg_inf, dtype=jnp.float32),
         )
+        current_eps = jnp.asarray(GATE_CURRENT_EPS, dtype=jnp.float32)
+        projected_eps = jnp.asarray(GATE_PROJECTED_EPS, dtype=jnp.float32)
+        sparsity_carry0 = (
+            jnp.zeros((2,), dtype=jnp.float32),
+            jnp.zeros((2, len(GATE_CURRENT_EPS)), dtype=jnp.float32),
+            jnp.zeros((2, len(GATE_CURRENT_EPS)), dtype=jnp.float32),
+            jnp.zeros((2,), dtype=jnp.float32),
+            jnp.zeros((2, len(GATE_PROJECTED_EPS)), dtype=jnp.float32),
+            jnp.zeros((2, len(GATE_PROJECTED_EPS)), dtype=jnp.float32),
+            jnp.zeros((2,), dtype=jnp.float32),
+            jnp.zeros((2, len(MARGIN_BAND_NAMES)), dtype=jnp.float32),
+        )
+
+        def gate_sparsity_parts(selection_margin, intensity, gate):
+            margin_sg = jax.lax.stop_gradient(selection_margin)
+            intensity_sg = jax.lax.stop_gradient(intensity)
+            gate_sg = jax.lax.stop_gradient(gate)
+            active_tau = margin_sg > 0.0
+
+            current_active = gate_sg[..., None] > current_eps
+            current_active_count = current_active.astype(jnp.float32).sum(
+                axis=(0, 1, 3))
+            current_mass = (
+                gate_sg[..., None] * current_active.astype(jnp.float32)
+            ).sum(axis=(0, 1, 3))
+            gate_mass = gate_sg.sum(axis=(0, 1, 3))
+
+            tfinal = jnp.maximum(
+                jnp.asarray(soft_gate_t_final, dtype=jnp.float32),
+                jnp.float32(1.0e-4))
+            projected_gate = (
+                jax.nn.sigmoid(jnp.clip(margin_sg / tfinal, -30.0, 30.0))
+                * intensity_sg)
+            projected_active = projected_gate[..., None] > projected_eps
+            projected_active_count = projected_active.astype(jnp.float32).sum(
+                axis=(0, 1, 3))
+            projected_mass = (
+                projected_gate[..., None]
+                * projected_active.astype(jnp.float32)
+            ).sum(axis=(0, 1, 3))
+            projected_gate_mass = projected_gate.sum(axis=(0, 1, 3))
+
+            margin_bands = jnp.stack((
+                active_tau.astype(jnp.float32).sum(axis=(0, 1, 3)),
+                ((margin_sg >= -0.01) & (margin_sg <= 0.0)).astype(jnp.float32).sum(axis=(0, 1, 3)),
+                ((margin_sg >= -0.03) & (margin_sg < -0.01)).astype(jnp.float32).sum(axis=(0, 1, 3)),
+                ((margin_sg >= -0.10) & (margin_sg < -0.03)).astype(jnp.float32).sum(axis=(0, 1, 3)),
+                (margin_sg < -0.10).astype(jnp.float32).sum(axis=(0, 1, 3)),
+            ), axis=1).astype(jnp.float32)
+            return (
+                active_tau.astype(jnp.float32).sum(axis=(0, 1, 3)),
+                current_active_count,
+                current_mass,
+                gate_mass,
+                projected_active_count,
+                projected_mass,
+                projected_gate_mass,
+                margin_bands,
+            )
+
+        def add_sparsity_carry(a, b):
+            return tuple(x + y for x, y in zip(a, b))
+
+        def finalize_sparsity_diag(carry):
+            (active_tau_count, current_active_count, current_mass, gate_mass,
+             projected_active_count, projected_mass, projected_gate_mass,
+             margin_bands) = carry
+            active_tau_count = jax.lax.psum(active_tau_count, 'model')
+            current_active_count = jax.lax.psum(
+                current_active_count, 'model')
+            current_mass = jax.lax.psum(current_mass, 'model')
+            gate_mass = jax.lax.psum(gate_mass, 'model')
+            projected_active_count = jax.lax.psum(
+                projected_active_count, 'model')
+            projected_mass = jax.lax.psum(projected_mass, 'model')
+            projected_gate_mass = jax.lax.psum(projected_gate_mass, 'model')
+            margin_bands = jax.lax.psum(margin_bands, 'model')
+
+            token_count = jnp.float32(B * S)
+            element_count = token_count * jnp.float32(N_total)
+            current_frac = current_active_count / element_count
+            current_count = current_active_count / token_count
+            projected_frac = projected_active_count / element_count
+            projected_count = projected_active_count / token_count
+            return jax.lax.stop_gradient(jnp.concatenate((
+                jnp.stack((
+                    active_tau_count / element_count,
+                    active_tau_count / token_count,
+                ), axis=1),
+                jnp.stack((current_frac, current_count), axis=2).reshape((2, -1)),
+                current_mass / jnp.maximum(gate_mass[:, None], 1.0e-8),
+                jnp.stack((projected_frac, projected_count), axis=2).reshape((2, -1)),
+                projected_mass / jnp.maximum(projected_gate_mass[:, None], 1.0e-8),
+                margin_bands / element_count,
+            ), axis=1).astype(jnp.float32))
 
         def soft_gate_exposure_parts(gate_unpruned):
             # v4162 soft-gate exposure diagnostic only.  Do not use the hard
@@ -1650,7 +1925,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count,
                  total_edge_margin_stat,
-                 select_diag_carry, diag_vals, spike_rows) = carry
+                 sparsity_carry, select_diag_carry, diag_vals, spike_rows) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, intensity, rho_exposure = route_relation_and_intensity(
@@ -1668,6 +1943,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 gate_unpruned = positive_margin * intensity
                 chunk_current_cost = gate_unpruned.sum(axis=-1, keepdims=True)
                 gate = base_gate
+                chunk_sparsity = gate_sparsity_parts(
+                    selection_margin, intensity, gate)
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T  # [B,S,N]
@@ -1753,6 +2030,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_soft_dead_1e4_count,
                         total_edge_margin_stat + chunk_edge_margin_stat,
+                        add_sparsity_carry(sparsity_carry, chunk_sparsity),
                         select_diag_carry,
                         diag_vals,
                         spike_rows), None
@@ -1766,6 +2044,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
              total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count,
              total_edge_margin_stat,
+             sparsity_carry,
              select_diag_carry, diag_vals, spike_rows), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
@@ -1778,6 +2057,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  jnp.float32(0.0), jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.float32(0.0),
+                 sparsity_carry0,
                  select_diag_carry0,
                  diag_vals_init,
                  spike_rows_init),
@@ -1794,7 +2074,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count,
                  total_edge_margin_stat,
-                 select_diag_carry, diag_vals, spike_rows) = carry
+                 sparsity_carry, select_diag_carry, diag_vals, spike_rows) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, intensity, rho_exposure = route_relation_and_intensity(
@@ -1812,6 +2092,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 gate_unpruned = positive_margin * intensity
                 chunk_current_cost = gate_unpruned.sum(axis=-1, keepdims=True)
                 gate = base_gate
+                chunk_sparsity = gate_sparsity_parts(
+                    selection_margin, intensity, gate)
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
@@ -1888,6 +2170,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_soft_dead_1e4_count,
                         total_edge_margin_stat + chunk_edge_margin_stat,
+                        add_sparsity_carry(sparsity_carry, chunk_sparsity),
                         select_diag_carry,
                         diag_vals,
                         spike_rows), None
@@ -1900,6 +2183,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
              total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count,
              total_edge_margin_stat,
+             sparsity_carry,
              select_diag_carry, diag_vals, spike_rows), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
@@ -1911,6 +2195,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  jnp.float32(0.0), jnp.float32(0.0),
                  jnp.float32(0.0),
                  jnp.float32(0.0),
+                 sparsity_carry0,
                  select_diag_carry0,
                  diag_vals_init,
                  spike_rows_init),
@@ -2052,6 +2337,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             global_active_m[:, :, 0, :].mean(),
             global_active_m[:, :, 1, :].mean(),
         )
+        sparsity_diag_out = finalize_sparsity_diag(sparsity_carry)
         local_diag_out = ()
         if _local_diagnostics:
             tau_abs_max = jnp.max(
@@ -2105,7 +2391,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     no_active_direct).astype(jnp.float32),)
         if not analysis:
             return (slim_out + conc_out + route_split_out + select_diag_out
-                    + dead_exposure_diag_out + local_diag_out + spike_probe_out)
+                    + dead_exposure_diag_out + (sparsity_diag_out,)
+                    + local_diag_out + spike_probe_out)
 
         # --- Analysis-only extras ---
         margin_band_frac = jax.lax.psum(total_margin_band, 'model') / N_total
@@ -2138,6 +2425,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                    gate_entropy, den_cost_out, selection_cost_out,
                    current_cost_out, rho_kurt, int_cap_frac_out)
                 + select_diag_out + dead_exposure_diag_out
+                + (sparsity_diag_out,)
                 + local_diag_out + spike_probe_out)
 
     return fused_gate_srw_paired
@@ -2268,6 +2556,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   d_select=None,
                   intensity_beta=0.5,
                   soft_gate_temperature=0.07,
+                  soft_gate_t_final=0.07,
                   tau_ce_grad_scale=0.0,
                   execution_prune_eps=0.0):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
@@ -2330,7 +2619,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     raw_tau_QK = jnp.stack([raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
     qk_ret = fused_paired(x, h_QK, qk_emb_unit, raw_tau_QK,
                            qk_read, qk_write,
-                           soft_gate_temperature, tau_ce_grad_scale, execution_prune_eps)
+                           soft_gate_temperature, tau_ce_grad_scale,
+                           soft_gate_t_final, execution_prune_eps)
     (QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
      qk_strong, qk_positive_margin_active, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
@@ -2363,7 +2653,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     K = QK_out[:, :, 1, :] * qk_scale
     v_ret = fused_single_v(x, h_V, v_emb_unit, raw_tau_all[:, :, 2:3],
                            v_read, v_write,
-                           soft_gate_temperature, tau_ce_grad_scale, execution_prune_eps)
+                           soft_gate_temperature, tau_ce_grad_scale,
+                           soft_gate_t_final, execution_prune_eps)
     (V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
      v_strong, v_positive_margin_active, v_tau_abs,
      v_dead_pen, v_dead_cnt, v_int_max,
@@ -2384,6 +2675,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     v_exposure_start = v_select_start + SELECT_DIAG_COUNT
     v_exposure_diag = v_ret[
         v_exposure_start:v_exposure_start + DEAD_EXPOSURE_DIAG_COUNT]
+    qk_sparsity_start = qk_exposure_start + DEAD_EXPOSURE_DIAG_COUNT
+    qk_route_sparsity_diag = qk_ret[qk_sparsity_start]
+    q_sparsity_diag = qk_route_sparsity_diag[0]
+    k_sparsity_diag = qk_route_sparsity_diag[1]
+    qk_sparsity_diag = qk_route_sparsity_diag.mean(axis=0)
+    v_sparsity_start = v_exposure_start + DEAD_EXPOSURE_DIAG_COUNT
+    v_sparsity_diag = v_ret[v_sparsity_start]
     if spike_probe:
         v_spike_rows = v_ret[-1]
     if local_diagnostics:
@@ -2899,7 +3197,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_qk_select_diag,
                 attn_v_select_diag,
                 attn_qk_exposure_diag,
-                attn_v_exposure_diag)
+                attn_v_exposure_diag,
+                qk_sparsity_diag,
+                v_sparsity_diag,
+                q_sparsity_diag,
+                k_sparsity_diag)
     if not analysis:
         ret = slim_ret
         if local_diagnostics:
@@ -3019,6 +3321,7 @@ def _rst_forward(x, pool_params, router_params, rng,
                   d_select=None,
                   intensity_beta=0.5,
                   soft_gate_temperature=0.07,
+                  soft_gate_t_final=0.07,
                   tau_ce_grad_scale=0.0,
                   execution_prune_eps=0.0):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
@@ -3147,7 +3450,8 @@ def _rst_forward(x, pool_params, router_params, rng,
         fused_single, _ = sharded_fns
     rst_ret = fused_single(x, h, rst_emb_unit, raw_tau,
                             rst_read, rst_write,
-                            soft_gate_temperature, tau_ce_grad_scale, execution_prune_eps)
+                            soft_gate_temperature, tau_ce_grad_scale,
+                            soft_gate_t_final, execution_prune_eps)
     (out, active_frac, raw_gate_max, lb_loss, rho_std_slim, gate_sum, active_n_mean,
      strong_frac, positive_margin_mean_active, rst_tau_abs_mean,
      rst_dead_penalty, rst_dead_count, rst_int_max,
@@ -3169,6 +3473,8 @@ def _rst_forward(x, pool_params, router_params, rng,
     rst_exposure_start = rst_select_start + SELECT_DIAG_COUNT
     rst_exposure_diag = rst_ret[
         rst_exposure_start:rst_exposure_start + DEAD_EXPOSURE_DIAG_COUNT]
+    rst_sparsity_start = rst_exposure_start + DEAD_EXPOSURE_DIAG_COUNT
+    rst_sparsity_diag = rst_ret[rst_sparsity_start]
     if spike_probe:
         rst_spike_rows = rst_ret[-1]
     if local_diagnostics:
@@ -3212,7 +3518,8 @@ def _rst_forward(x, pool_params, router_params, rng,
                 rst_selection_residency,
                 rst_edge_margin_stat,
                 *rst_select_diag,
-                *rst_exposure_diag)
+                *rst_exposure_diag,
+                rst_sparsity_diag)
     if not analysis:
         ret = slim_ret
         if local_diagnostics:
@@ -3385,6 +3692,7 @@ class DAWN(nn.Module):
                  spike_focus_target_ids=None,
                  spike_focus_pred_ids=None,
                  soft_gate_temperature=0.07,
+                 soft_gate_t_final=0.07,
                  tau_ce_grad_scale=0.0,
                  rpe_effective_weight=0.0,
                  execution_prune_eps=0.0):
@@ -3540,6 +3848,16 @@ class DAWN(nn.Module):
                 (1, DEAD_EXPOSURE_DIAG_COUNT), dtype=jnp.float32)
             attn_v_exposure_diag_all = jnp.zeros(
                 (1, DEAD_EXPOSURE_DIAG_COUNT), dtype=jnp.float32)
+            attn_qk_sparsity_diag_all = jnp.zeros(
+                (1, GATE_SPARSITY_DIAG_COUNT), dtype=jnp.float32)
+            attn_v_sparsity_diag_all = jnp.zeros(
+                (1, GATE_SPARSITY_DIAG_COUNT), dtype=jnp.float32)
+            attn_q_sparsity_diag_all = jnp.zeros(
+                (1, GATE_SPARSITY_DIAG_COUNT), dtype=jnp.float32)
+            attn_k_sparsity_diag_all = jnp.zeros(
+                (1, GATE_SPARSITY_DIAG_COUNT), dtype=jnp.float32)
+            rst_sparsity_diag_all = jnp.zeros(
+                (1, GATE_SPARSITY_DIAG_COUNT), dtype=jnp.float32)
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
@@ -3702,6 +4020,7 @@ class DAWN(nn.Module):
                     d_select=self.d_select,
                     intensity_beta=0.5,
                     soft_gate_temperature=soft_gate_temperature,
+                    soft_gate_t_final=soft_gate_t_final,
                     tau_ce_grad_scale=tau_ce_grad_scale,
                     execution_prune_eps=execution_prune_eps)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
@@ -3735,7 +4054,9 @@ class DAWN(nn.Module):
                  a_weak_exposure_frac, a_dead_exposure_target) = attn_ret[:58]
                 (a_split_core,
                  a_qk_select_diag, a_v_select_diag,
-                 a_qk_exposure_diag, a_v_exposure_diag) = attn_ret[58:63]
+                 a_qk_exposure_diag, a_v_exposure_diag,
+                 a_qk_sparsity_diag, a_v_sparsity_diag,
+                 a_q_sparsity_diag, a_k_sparsity_diag) = attn_ret[58:67]
                 if analysis:
                     (a_qk_raw_norm, a_v_raw_norm,
                      a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
@@ -3752,7 +4073,7 @@ class DAWN(nn.Module):
                      a_softmax_top1_mean, a_softmax_top1_max,
                      a_logit_gap_mean, a_logit_gap_max,
                      a_softmax_entropy_mean, a_softmax_entropy_min,
-                     a_o_input_norm_max, a_o_out_norm_max) = attn_ret[63:100]
+                     a_o_input_norm_max, a_o_out_norm_max) = attn_ret[67:104]
                 if local_diagnostics:
                     if spike_probe and focus_probe_enabled:
                         _a_local_tail = attn_ret[-10:-5]
@@ -3803,6 +4124,7 @@ class DAWN(nn.Module):
                     d_select=self.d_select,
                     intensity_beta=0.5,
                     soft_gate_temperature=soft_gate_temperature,
+                    soft_gate_t_final=soft_gate_t_final,
                     tau_ce_grad_scale=tau_ce_grad_scale,
                     execution_prune_eps=execution_prune_eps)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
@@ -3826,7 +4148,8 @@ class DAWN(nn.Module):
                  k_selected_frac, k_no_active_frac,
                  k_angular_exposure_mean, k_angular_exposure_min,
                  k_angular_exposure_max, k_dead_exposure_frac,
-                 k_weak_exposure_frac, k_dead_exposure_target) = rst_ret[:51]
+                 k_weak_exposure_frac, k_dead_exposure_target,
+                 k_sparsity_diag) = rst_ret[:52]
                 if analysis:
                     (k_raw_out_norm,
                      k_tau_std, k_tau_kernel_norm,
@@ -3834,7 +4157,7 @@ class DAWN(nn.Module):
                      k_skew, k_apt_std, k_entropy,
                      k_den_cost, k_selection_cost, k_current_cost,
                      k_emb_n_max, k_rho_kurt, k_margin_band,
-                     k_int_cap_frac) = rst_ret[51:66]
+                     k_int_cap_frac) = rst_ret[52:67]
                 if local_diagnostics:
                     if spike_probe and focus_probe_enabled:
                         _k_local_tail = rst_ret[-7:-3]
@@ -3940,6 +4263,9 @@ class DAWN(nn.Module):
                            a_split_core,
                            a_qk_select_diag, a_v_select_diag,
                            a_qk_exposure_diag, a_v_exposure_diag,
+                           a_qk_sparsity_diag, a_v_sparsity_diag,
+                           a_q_sparsity_diag, a_k_sparsity_diag,
+                           k_sparsity_diag,
                            )
                 if not analysis:
                     if local_diagnostics:
@@ -4113,9 +4439,12 @@ class DAWN(nn.Module):
             _scan_offset = 107
             (attn_split_core_all,
              attn_qk_select_diag_all, attn_v_select_diag_all,
-             attn_qk_exposure_diag_all, attn_v_exposure_diag_all) = scan_ys[
-                _scan_offset:_scan_offset + 5]
-            _scan_offset += 5
+             attn_qk_exposure_diag_all, attn_v_exposure_diag_all,
+             attn_qk_sparsity_diag_all, attn_v_sparsity_diag_all,
+             attn_q_sparsity_diag_all, attn_k_sparsity_diag_all,
+             rst_sparsity_diag_all) = scan_ys[
+                _scan_offset:_scan_offset + 10]
+            _scan_offset += 10
             if analysis:
                 (attn_qk_raw_norm_all, attn_v_raw_norm_all, rst_raw_out_norm_all,
                  attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
@@ -4205,6 +4534,9 @@ class DAWN(nn.Module):
 
         def _exposure_max(diag_all, idx):
             return diag_all[:, idx].max()
+
+        def _sparsity_mean(diag_all, idx):
+            return diag_all[:, idx].mean()
 
         result = {
             'aux_loss': total_aux,
@@ -4480,6 +4812,16 @@ class DAWN(nn.Module):
             'debug_token_emb_norm': jnp.linalg.norm(self.token_emb.embedding, axis=-1).mean(),
             'debug_token_emb_norm_max': jnp.linalg.norm(self.token_emb.embedding, axis=-1).max(),
         }
+        for _prefix, _diag_all in (
+                ('attn_qk', attn_qk_sparsity_diag_all),
+                ('attn_v', attn_v_sparsity_diag_all),
+                ('attn_q', attn_q_sparsity_diag_all),
+                ('attn_k', attn_k_sparsity_diag_all),
+                ('rst', rst_sparsity_diag_all)):
+            result.update({
+                f'{_prefix}_{_name}': _sparsity_mean(_diag_all, _idx)
+                for _idx, _name in enumerate(GATE_SPARSITY_DIAG_NAMES)
+            })
         if analysis and not self.is_initializing():
             _residual_norm = jnp.linalg.norm(x, axis=-1).mean()
             _emb_norm = jnp.linalg.norm(self.token_emb.embedding, axis=-1).mean()
