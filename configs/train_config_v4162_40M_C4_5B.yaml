@@ -36,40 +36,46 @@ training:
   warmup_ratio: 0.06
   weight_decay: 0.1
   pool_weight_decay: 0.0
-  tau_lr_mult: 0.01
-  tau_grad_clip: 1.0
+  tau_lr_mult: 1.0
+  tau_grad_clip: 2.0
   router_proj_lr_mult: 1.0
   router_proj_grad_clip: 2.0
   route_emb_lr_mult: 1.0
   route_emb_grad_clip: 2.0
+
   dead_penalty_weight: 0.0
   dead_exposure_target: 0.0
-  rpe_enabled: true
+
+  rpe_enabled: false
   rpe_start_frac: 0.2
   rpe_full_frac: 0.45
   rpe_schedule: linear
-  exploration_weight: 0.001
+  exploration_weight: 0.0
   exploration_asymmetry: 1.0
-  exploration_lower_bound: 0.0
+  exploration_lower_bound: 0.5
   exploration_upper_bound: 0.95
   exploration_bound_eps: 0.001
   exploration_dev_mode: bounded_z
   exploration_ce_clip_std: 2.0
   exploration_z_clip: 2.0
   exploration_z_tanh: true
+
   soft_gate_enabled: true
   soft_gate_t_start: 1.5
-  soft_gate_t_final: 0.07
-  soft_gate_t_hold_frac: 0.1
-  soft_gate_t_anneal_end_frac: 0.8
+  soft_gate_t_final: 0.001
+  soft_gate_t_hold_frac: 0.03
+  soft_gate_t_anneal_end_frac: 0.7
   soft_gate_schedule: cosine
   soft_gate_effective_active_eps: 1.0e-06
+
   tau_ce_grad_scale_start: 1.0
-  tau_ce_grad_scale_final: 0.0
-  tau_ce_grad_scale_hold_frac: 0.25
-  tau_ce_grad_scale_anneal_end_frac: 0.6
+  tau_ce_grad_scale_final: 0.01
+  tau_ce_grad_scale_hold_frac: 0.05
+  tau_ce_grad_scale_anneal_end_frac: 0.7
   tau_ce_grad_scale_schedule: cosine
+
   intensity_beta: 0.5
+
   eval_effective_prune_enabled: true
   eval_effective_prune_eps_list:
   - 1.0e-06
