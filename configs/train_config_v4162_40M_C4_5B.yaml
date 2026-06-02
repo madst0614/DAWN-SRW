@@ -51,8 +51,11 @@ training:
   rpe_full_frac: 0.45
   rpe_schedule: linear
   exploration_weight: 0.0
+  exploration_weight_qk: 0.0
+  exploration_weight_v: 0.0
+  exploration_weight_rst: 0.0
   exploration_asymmetry: 1.0
-  exploration_lower_bound: 0.5
+  exploration_lower_bound: 0.0
   exploration_upper_bound: 0.95
   exploration_bound_eps: 0.001
   exploration_dev_mode: bounded_z
@@ -64,14 +67,15 @@ training:
   soft_gate_t_start: 1.5
   soft_gate_t_final: 0.001
   soft_gate_t_hold_frac: 0.03
-  soft_gate_t_anneal_end_frac: 0.7
-  soft_gate_schedule: cosine
+  soft_gate_t_anneal_end_frac: 0.90
+  soft_gate_t_schedule: log_power
+  soft_gate_t_power: 4.0
   soft_gate_effective_active_eps: 1.0e-06
 
   tau_ce_grad_scale_start: 1.0
   tau_ce_grad_scale_final: 0.01
   tau_ce_grad_scale_hold_frac: 0.05
-  tau_ce_grad_scale_anneal_end_frac: 0.7
+  tau_ce_grad_scale_anneal_end_frac: 0.30
   tau_ce_grad_scale_schedule: cosine
 
   intensity_beta: 0.5

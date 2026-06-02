@@ -1268,7 +1268,7 @@ def _scalar0(x):
 
 
 def scheduled_value_by_frac(step, total_steps, start, final, hold_frac,
-                            end_frac, schedule='cosine'):
+                            end_frac, schedule='cosine', power=1.0):
     """Piecewise hold/anneal/hold scalar schedule by training fraction."""
     step_f = jnp.asarray(step, dtype=jnp.float32)
     total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
@@ -1278,21 +1278,34 @@ def scheduled_value_by_frac(step, total_steps, start, final, hold_frac,
                       hold + 1.0e-6)
     progress = jnp.clip((frac - hold) / (end - hold), 0.0, 1.0)
     schedule_name = str(schedule).lower()
+    start_f = jnp.asarray(start, dtype=jnp.float32)
+    final_f = jnp.asarray(final, dtype=jnp.float32)
     if schedule_name == 'constant':
         mix = jnp.float32(0.0)
     elif schedule_name == 'linear':
         mix = progress
     elif schedule_name == 'cosine':
         mix = 0.5 - 0.5 * jnp.cos(jnp.pi * progress)
+    elif schedule_name in ('log', 'log_linear'):
+        mix = progress
+        log_val = (1.0 - mix) * jnp.log(start_f) + mix * jnp.log(final_f)
+        val = jnp.exp(log_val)
+        return jnp.where(frac < hold, start_f,
+                         jnp.where(frac >= end, final_f, val))
+    elif schedule_name == 'log_power':
+        power_f = jnp.asarray(power, dtype=jnp.float32)
+        mix = 1.0 - jnp.power(1.0 - progress, power_f)
+        log_val = (1.0 - mix) * jnp.log(start_f) + mix * jnp.log(final_f)
+        val = jnp.exp(log_val)
+        return jnp.where(frac < hold, start_f,
+                         jnp.where(frac >= end, final_f, val))
     else:
         raise ValueError(
-            f"Unsupported schedule={schedule!r}; expected cosine, linear, or constant.")
-    val = (jnp.asarray(start, dtype=jnp.float32)
-           + (jnp.asarray(final, dtype=jnp.float32)
-              - jnp.asarray(start, dtype=jnp.float32)) * mix)
-    return jnp.where(frac < hold, jnp.asarray(start, dtype=jnp.float32),
-                     jnp.where(frac >= end,
-                               jnp.asarray(final, dtype=jnp.float32), val))
+            f"Unsupported schedule={schedule!r}; expected cosine, linear, "
+            "constant, log, log_linear, or log_power.")
+    val = start_f + (final_f - start_f) * mix
+    return jnp.where(frac < hold, start_f,
+                     jnp.where(frac >= end, final_f, val))
 
 
 _scheduled_scalar = scheduled_value_by_frac
@@ -1480,6 +1493,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       soft_gate_t_hold_frac=0.10,
                       soft_gate_t_anneal_end_frac=0.80,
                       soft_gate_schedule='cosine',
+                      soft_gate_t_power=4.0,
                       tau_ce_grad_scale_start=1.0,
                       tau_ce_grad_scale_final=0.0,
                       tau_ce_grad_scale_hold_frac=0.25,
@@ -1663,6 +1677,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _soft_gate_t_hold_frac = jnp.float32(soft_gate_t_hold_frac)
     _soft_gate_t_anneal_end_frac = jnp.float32(soft_gate_t_anneal_end_frac)
     _soft_gate_schedule = str(soft_gate_schedule).lower()
+    _soft_gate_t_power = jnp.float32(soft_gate_t_power)
     _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
     _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
     _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
@@ -1690,7 +1705,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     step, _total_training_steps,
                     _soft_gate_t_start, _soft_gate_t_final,
                     _soft_gate_t_hold_frac, _soft_gate_t_anneal_end_frac,
-                    _soft_gate_schedule)
+                    _soft_gate_schedule, _soft_gate_t_power)
                 tau_ce_scale = _scheduled_scalar(
                     step, _total_training_steps,
                     _tau_ce_grad_scale_start, _tau_ce_grad_scale_final,
@@ -3702,6 +3717,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_t_hold_frac=0.10,
                      soft_gate_t_anneal_end_frac=0.80,
                      soft_gate_schedule='cosine',
+                     soft_gate_t_power=4.0,
                      tau_ce_grad_scale_start=1.0,
                      tau_ce_grad_scale_final=0.0,
                      tau_ce_grad_scale_hold_frac=0.25,
@@ -3729,6 +3745,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _soft_gate_t_hold_frac = jnp.float32(soft_gate_t_hold_frac)
     _soft_gate_t_anneal_end_frac = jnp.float32(soft_gate_t_anneal_end_frac)
     _soft_gate_schedule = str(soft_gate_schedule).lower()
+    _soft_gate_t_power = jnp.float32(soft_gate_t_power)
     _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
     _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
     _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
@@ -3749,7 +3766,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                 step, _total_training_steps,
                 _soft_gate_t_start, _soft_gate_t_final,
                 _soft_gate_t_hold_frac, _soft_gate_t_anneal_end_frac,
-                _soft_gate_schedule)
+                _soft_gate_schedule, _soft_gate_t_power)
             extra_kw['tau_ce_grad_scale'] = scheduled_value_by_frac(
                 step, _total_training_steps,
                 _tau_ce_grad_scale_start, _tau_ce_grad_scale_final,
@@ -3802,6 +3819,7 @@ def create_analysis_step(model, sharded_fns=None,
                          soft_gate_t_hold_frac=0.10,
                          soft_gate_t_anneal_end_frac=0.80,
                          soft_gate_schedule='cosine',
+                         soft_gate_t_power=4.0,
                          tau_ce_grad_scale_start=1.0,
                          tau_ce_grad_scale_final=0.0,
                          tau_ce_grad_scale_hold_frac=0.25,
@@ -3828,6 +3846,7 @@ def create_analysis_step(model, sharded_fns=None,
     _soft_gate_t_hold_frac = jnp.float32(soft_gate_t_hold_frac)
     _soft_gate_t_anneal_end_frac = jnp.float32(soft_gate_t_anneal_end_frac)
     _soft_gate_schedule = str(soft_gate_schedule).lower()
+    _soft_gate_t_power = jnp.float32(soft_gate_t_power)
     _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
     _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
     _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
@@ -3848,7 +3867,7 @@ def create_analysis_step(model, sharded_fns=None,
                 step, _total_training_steps,
                 _soft_gate_t_start, _soft_gate_t_final,
                 _soft_gate_t_hold_frac, _soft_gate_t_anneal_end_frac,
-                _soft_gate_schedule)
+                _soft_gate_schedule, _soft_gate_t_power)
             extra_kw['tau_ce_grad_scale'] = scheduled_value_by_frac(
                 step, _total_training_steps,
                 _tau_ce_grad_scale_start, _tau_ce_grad_scale_final,
@@ -3976,6 +3995,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                             soft_gate_t_hold_frac=0.10,
                             soft_gate_t_anneal_end_frac=0.80,
                             soft_gate_schedule='cosine',
+                            soft_gate_t_power=4.0,
                             tau_ce_grad_scale_start=1.0,
                             tau_ce_grad_scale_final=0.0,
                             tau_ce_grad_scale_hold_frac=0.25,
@@ -4006,6 +4026,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _soft_gate_t_hold_frac = jnp.float32(soft_gate_t_hold_frac)
     _soft_gate_t_anneal_end_frac = jnp.float32(soft_gate_t_anneal_end_frac)
     _soft_gate_schedule = str(soft_gate_schedule).lower()
+    _soft_gate_t_power = jnp.float32(soft_gate_t_power)
     _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
     _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
     _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
@@ -4029,7 +4050,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                 step, _total_training_steps,
                 _soft_gate_t_start, _soft_gate_t_final,
                 _soft_gate_t_hold_frac, _soft_gate_t_anneal_end_frac,
-                _soft_gate_schedule)
+                _soft_gate_schedule, _soft_gate_t_power)
             extra_kw['tau_ce_grad_scale'] = scheduled_value_by_frac(
                 step, _total_training_steps,
                 _tau_ce_grad_scale_start, _tau_ce_grad_scale_final,
@@ -7987,7 +8008,9 @@ def _print_debug_block(rec, ctx):
     )
     if _g('soft_gate_T', 0.0) > 0.0:
         log_debug_message(
-            f"soft_gate_schedule: T={_g('soft_gate_T'):.6f} "
+            f"soft_gate_schedule: soft_T={_g('soft_gate_T'):.6f} "
+            f"schedule={ctx.get('soft_gate_schedule', 'cosine')} "
+            f"power={float(ctx.get('soft_gate_t_power', 4.0)):.4g} "
             f"tau_ce_grad_scale={_g('tau_ce_grad_scale'):.6f} "
             f"rpe_effective_weight={_g('rpe_effective_weight', _g('exploration_weight_effective')):.6f} "
             f"rpe_schedule_scale={_g('rpe_schedule_scale'):.3f}"
@@ -9245,7 +9268,9 @@ def main():
     soft_gate_t_hold_frac = float(tcfg.get('soft_gate_t_hold_frac', 0.10))
     soft_gate_t_anneal_end_frac = float(
         tcfg.get('soft_gate_t_anneal_end_frac', 0.80))
-    soft_gate_schedule = str(tcfg.get('soft_gate_schedule', 'cosine'))
+    soft_gate_schedule = str(tcfg.get(
+        'soft_gate_t_schedule', tcfg.get('soft_gate_schedule', 'cosine')))
+    soft_gate_t_power = float(tcfg.get('soft_gate_t_power', 4.0))
     soft_gate_effective_active_eps = float(
         tcfg.get('soft_gate_effective_active_eps', 1.0e-6))
     effective_prune_eps_list = list(
@@ -9784,6 +9809,30 @@ def main():
         exploration_asymmetry_rst = 0.0
         exploration_weighted_clip = 0.0
 
+    if soft_gate_enabled:
+        _soft_gate_schedule_name = soft_gate_schedule.lower()
+        if _soft_gate_schedule_name not in (
+                'constant', 'linear', 'cosine',
+                'log', 'log_linear', 'log_power'):
+            raise ValueError(
+                f"Unsupported soft_gate_t_schedule={soft_gate_schedule!r}; "
+                "expected constant, linear, cosine, log, log_linear, "
+                "or log_power.")
+        if soft_gate_t_start <= 0.0:
+            raise ValueError(
+                f"soft_gate_t_start must be > 0, got {soft_gate_t_start}")
+        if soft_gate_t_final <= 0.0:
+            raise ValueError(
+                f"soft_gate_t_final must be > 0, got {soft_gate_t_final}")
+        if soft_gate_t_anneal_end_frac <= soft_gate_t_hold_frac:
+            raise ValueError(
+                "soft_gate_t_anneal_end_frac must be > "
+                f"soft_gate_t_hold_frac, got {soft_gate_t_anneal_end_frac} "
+                f"<= {soft_gate_t_hold_frac}")
+        if soft_gate_t_power <= 0.0:
+            raise ValueError(
+                f"soft_gate_t_power must be > 0, got {soft_gate_t_power}")
+
     # Build training_config dict for saving in checkpoints
     training_config = {
         'batch_size': batch_size,
@@ -9828,7 +9877,8 @@ def main():
         'soft_gate_t_final': soft_gate_t_final,
         'soft_gate_t_hold_frac': soft_gate_t_hold_frac,
         'soft_gate_t_anneal_end_frac': soft_gate_t_anneal_end_frac,
-        'soft_gate_schedule': soft_gate_schedule,
+        'soft_gate_t_schedule': soft_gate_schedule,
+        'soft_gate_t_power': soft_gate_t_power,
         'soft_gate_effective_active_eps': soft_gate_effective_active_eps,
         'effective_prune_eps_list': effective_prune_eps_list,
         'eval_effective_prune_enabled': eval_effective_prune_enabled,
@@ -10337,6 +10387,7 @@ def main():
                   f"hold_frac={soft_gate_t_hold_frac} "
                   f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
                   f"schedule={soft_gate_schedule} "
+                  f"power={soft_gate_t_power} "
                   f"effective_active_eps={soft_gate_effective_active_eps}")
             print("  Tau CE grad:")
             print(f"    start={tau_ce_grad_scale_start} "
@@ -10763,6 +10814,7 @@ def main():
         soft_gate_t_hold_frac=soft_gate_t_hold_frac,
         soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
         soft_gate_schedule=soft_gate_schedule,
+        soft_gate_t_power=soft_gate_t_power,
         tau_ce_grad_scale_start=tau_ce_grad_scale_start,
         tau_ce_grad_scale_final=tau_ce_grad_scale_final,
         tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
@@ -10784,6 +10836,7 @@ def main():
         soft_gate_t_hold_frac=soft_gate_t_hold_frac,
         soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
         soft_gate_schedule=soft_gate_schedule,
+        soft_gate_t_power=soft_gate_t_power,
         tau_ce_grad_scale_start=tau_ce_grad_scale_start,
         tau_ce_grad_scale_final=tau_ce_grad_scale_final,
         tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
@@ -10803,6 +10856,7 @@ def main():
                 soft_gate_t_hold_frac=soft_gate_t_hold_frac,
                 soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
                 soft_gate_schedule=soft_gate_schedule,
+                soft_gate_t_power=soft_gate_t_power,
                 tau_ce_grad_scale_start=tau_ce_grad_scale_start,
                 tau_ce_grad_scale_final=tau_ce_grad_scale_final,
                 tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
@@ -10821,6 +10875,7 @@ def main():
             soft_gate_t_hold_frac=soft_gate_t_hold_frac,
             soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
             soft_gate_schedule=soft_gate_schedule,
+            soft_gate_t_power=soft_gate_t_power,
             tau_ce_grad_scale_start=tau_ce_grad_scale_start,
             tau_ce_grad_scale_final=tau_ce_grad_scale_final,
             tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
@@ -10841,6 +10896,7 @@ def main():
             soft_gate_t_hold_frac=soft_gate_t_hold_frac,
             soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
             soft_gate_schedule=soft_gate_schedule,
+            soft_gate_t_power=soft_gate_t_power,
             tau_ce_grad_scale_start=tau_ce_grad_scale_start,
             tau_ce_grad_scale_final=tau_ce_grad_scale_final,
             tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
@@ -12193,6 +12249,8 @@ def main():
                         'total_micro_steps': total_micro_steps,
                         'progress': _progress,
                         'model_version': model_version,
+                        'soft_gate_schedule': soft_gate_schedule,
+                        'soft_gate_t_power': soft_gate_t_power,
                         'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
                         'd_select': int(cfg['model'].get('d_select', 0) or 0),
                         'd_intensity': int(
@@ -12276,6 +12334,8 @@ def main():
                     'total_micro_steps': total_micro_steps,
                     'progress': _progress,
                     'model_version': model_version,
+                    'soft_gate_schedule': soft_gate_schedule,
+                    'soft_gate_t_power': soft_gate_t_power,
                     'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
                     'd_select': int(cfg['model'].get('d_select', 0) or 0),
                     'd_intensity': int(
