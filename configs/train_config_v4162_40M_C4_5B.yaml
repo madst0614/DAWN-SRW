@@ -67,18 +67,26 @@ training:
   # Soft gate temperature: Gompertz differentiation schedule
   soft_gate_t_start: 1.5
   soft_gate_t_final: 0.001
-  soft_gate_t_hold_frac: 0.03
+  soft_gate_t_hold_frac: 0.0
   soft_gate_t_anneal_end_frac: 0.90
   soft_gate_t_schedule: log_gompertz
-  soft_gate_t_gompertz_center: 0.25
+  soft_gate_t_gompertz_center: 0.20
   soft_gate_t_gompertz_steepness: 8.0
   soft_gate_effective_active_eps: 1.0e-06
+  regular_diagnostics_level: compact
+  regular_current_eps:
+  - 0.1
+  - 0.01
+  - 0.001
+  regular_projected_eps:
+  - 1.0e-06
+  regular_mass_enabled: false
 
   # Tau CE-gradient handoff: log-space influence decay
   tau_ce_grad_scale_start: 1.0
   tau_ce_grad_scale_final: 0.01
-  tau_ce_grad_scale_hold_frac: 0.05
-  tau_ce_grad_scale_anneal_end_frac: 0.30
+  tau_ce_grad_scale_hold_frac: 0.02
+  tau_ce_grad_scale_anneal_end_frac: 0.25
   tau_ce_grad_scale_schedule: log_linear
 
   intensity_beta: 0.5

@@ -230,6 +230,9 @@ DIRECT_TAU_SPARSITY_METRIC_NAMES = (
     'margin_band_m0_03_m0_01',
     'margin_band_m0_10_m0_03',
     'margin_band_lt_m0_10',
+    'margin_band_pos',
+    'margin_band_near_m0_03_0',
+    'margin_band_far_lt_m0_10',
 )
 DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES = (
     'raw_gate_max', 'gate_sum', 'active_n_mean',
@@ -348,6 +351,7 @@ def _format_update_cap_window_line(rec, indent="  ", is_v4160=False):
     hit_parts = []
     pre_parts = []
     scale_parts = []
+    hit_total = 0.0
     for group_name, label, _, _, _, pre_kind in UPDATE_CAP_GROUP_SPECS:
         if is_v4160 and group_name in ('tau_attn', 'tau_rst'):
             continue
@@ -358,10 +362,13 @@ def _format_update_cap_window_line(rec, indent="  ", is_v4160=False):
             continue
         hit_parts.append(
             f"{label}={_g(_cap_window_hit_key(group_name)):.0f}")
+        hit_total += _g(_cap_window_hit_key(group_name))
         pre_parts.append(
             f"{label}={_g(_cap_window_pre_max_key(group_name, pre_kind)):.1e}")
         scale_parts.append(
             (label, _g(_cap_window_scale_min_key(group_name), 1.0)))
+    if hit_total <= 0.0:
+        return None
     min_scale_label, min_scale = min(scale_parts, key=lambda item: item[1])
     return (
         f"{indent}update_cap_window: steps={steps} "
@@ -668,11 +675,22 @@ def _v415_sharded_kwargs(cfg):
         )
     elif version == 'spatial-r1-v4.1.6.2':
         # v4162 clean path: soft annealed DirectTau only. no CB1A/edge auxiliary kwargs.
+        regular_level = str(t.get('regular_diagnostics_level', 'compact')).lower()
+        if regular_level not in ('compact', 'full'):
+            raise ValueError(
+                "training.regular_diagnostics_level must be 'compact' or 'full'.")
         kw = dict(
             dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
             soft_gate_enabled=bool(t.get('soft_gate_enabled', True)),
             soft_gate_effective_active_eps=float(
                 t.get('soft_gate_effective_active_eps', 1.0e-6)),
+            regular_diagnostics_level=regular_level,
+            regular_current_eps=tuple(
+                float(x) for x in t.get(
+                    'regular_current_eps', [1.0e-1, 1.0e-2, 1.0e-3])),
+            regular_projected_eps=tuple(
+                float(x) for x in t.get('regular_projected_eps', [1.0e-6])),
+            regular_mass_enabled=bool(t.get('regular_mass_enabled', False)),
         )
     else:
         kw = dict(
@@ -1526,7 +1544,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None,
                       debug_diagnostics=False,
-                      debug_local_spikes=False):
+                      debug_local_spikes=False,
+                      compact_train_metrics=False,
+                      keep_train_layer_metrics=False):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
 
     v4.1 explore (redesigned): no EMA, no warmup. For every step compute
@@ -1710,6 +1730,26 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _rpe_start_frac = jnp.float32(rpe_start_frac)
     _rpe_full_frac = jnp.float32(rpe_full_frac)
     _rpe_schedule = str(rpe_schedule).lower()
+    _compact_train_metrics = (
+        bool(compact_train_metrics)
+        and not bool(debug_local_spikes))
+    _keep_train_layer_metrics = bool(keep_train_layer_metrics)
+    _heavy_keys = {
+        'per_token_ce',
+        'valid_mask',
+        'attn_tau_direct',
+        'rst_tau_direct',
+        'attn_tau_offset',
+        'rst_tau_offset',
+        'attn_no_active_direct',
+        'rst_no_active_direct',
+    }
+    if not _keep_train_layer_metrics:
+        _heavy_keys.update({
+            'per_layer_attn_out_norm',
+            'per_layer_rst_out_norm',
+        })
+    _train_result_heavy_keys = frozenset(_heavy_keys)
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
@@ -2298,8 +2338,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 tau_ce_grad_scale=tau_ce_scale,
                 rpe_schedule_scale=rpe_schedule_scale,
             )
+            result_payload = result
+            if _compact_train_metrics:
+                result_payload = {
+                    k: v for k, v in result.items()
+                    if k not in _train_result_heavy_keys}
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
-                                dead_penalty, explore_stats, result)
+                                dead_penalty, explore_stats, result_payload)
 
         (total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
                       dead_penalty, explore_stats, result)), grads = \
@@ -2908,13 +2953,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         else:
             pool_weight_decay_loss = jnp.float32(0.0)
             normal_weight_decay_loss = jnp.float32(0.0)
-        pool_diag = _pool_param_diagnostics(params, full=False, model=model)
-        pool_update_diag = _pool_update_diagnostics(params, grads)
+        if debug_diagnostics:
+            pool_diag = _pool_param_diagnostics(params, full=False, model=model)
+            pool_update_diag = _pool_update_diagnostics(params, grads)
+        else:
+            pool_diag = {}
+            pool_update_diag = {}
 
-        # Emb drift is computed inside jit so every host participates in the
-        # norm collective. A host-0-only version halts the launch group on
-        # multi-host meshes.
-        if is_baseline or 'neuron_pool' not in new_params:
+        # Emb drift is debug-only.  It is computed inside jit when enabled so
+        # every host participates in the same reductions on multi-host meshes.
+        if (not debug_diagnostics) or is_baseline or 'neuron_pool' not in new_params:
             drift_attn_qk_emb = jnp.float32(0.0)
             drift_attn_v_emb = jnp.float32(0.0)
             drift_rst_emb = jnp.float32(0.0)
@@ -3344,9 +3392,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_z_mean_active': result.get('rst_z_mean_active', jnp.float32(0.0)),
             'attn_qk_z_mean_active': result.get('attn_qk_z_mean_active', jnp.float32(0.0)),
             'attn_v_z_mean_active': result.get('attn_v_z_mean_active', jnp.float32(0.0)),
-            # Per-layer diagnostics.
-            'per_layer_attn_out_norm': result.get('per_layer_attn_out_norm', jnp.zeros(1)),
-            'per_layer_rst_out_norm': result.get('per_layer_rst_out_norm', jnp.zeros(1)),
             # Dead-only penalty.
             'dead_penalty': dead_penalty,
             'attn_dead_penalty': result.get('attn_dead_penalty', jnp.float32(0.0)),
@@ -3603,6 +3648,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'update_cap_scan_rst_scale': upd_scan_rst_scale,
             'update_cap_scan_rst_hit': upd_scan_rst_hit,
         }
+        if (not _compact_train_metrics) or _keep_train_layer_metrics:
+            metrics.update({
+                'per_layer_attn_out_norm': result.get(
+                    'per_layer_attn_out_norm', jnp.zeros(1)),
+                'per_layer_rst_out_norm': result.get(
+                    'per_layer_rst_out_norm', jnp.zeros(1)),
+            })
         for _pool in ('attn_qk', 'attn_v'):
             for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
                 _fallback = result.get(
@@ -5180,6 +5232,12 @@ SPARSITY_LOG_POOLS = (
     ('attn_v', 'v'),
     ('rst', 'rst'),
 )
+SPARSITY_LOG_POOLS_COMPACT = (
+    ('attn_q', 'q'),
+    ('attn_k', 'k'),
+    ('attn_v', 'v'),
+    ('rst', 'rst'),
+)
 SPARSITY_CURRENT_EPS_LOG = (
     ('1e-6', '1e_6'),
     ('1e-5', '1e_5'),
@@ -5188,10 +5246,18 @@ SPARSITY_CURRENT_EPS_LOG = (
     ('1e-2', '1e_2'),
     ('1e-1', '1e_1'),
 )
+SPARSITY_CURRENT_EPS_LOG_COMPACT = (
+    ('1e-1', '1e_1'),
+    ('1e-2', '1e_2'),
+    ('1e-3', '1e_3'),
+)
 SPARSITY_PROJECTED_EPS_LOG = (
     ('1e-6', '1e_6'),
     ('1e-4', '1e_4'),
     ('1e-3', '1e_3'),
+)
+SPARSITY_PROJECTED_EPS_LOG_COMPACT = (
+    ('1e-6', '1e_6'),
 )
 SPARSITY_MARGIN_BAND_LOG = (
     ('>0', 'margin_band_gt_0'),
@@ -5199,6 +5265,11 @@ SPARSITY_MARGIN_BAND_LOG = (
     ('[-0.03,-0.01]', 'margin_band_m0_03_m0_01'),
     ('[-0.10,-0.03]', 'margin_band_m0_10_m0_03'),
     ('<-0.10', 'margin_band_lt_m0_10'),
+)
+SPARSITY_MARGIN_BAND_LOG_COMPACT = (
+    ('pos', 'margin_band_pos'),
+    ('near', 'margin_band_near_m0_03_0'),
+    ('far', 'margin_band_far_lt_m0_10'),
 )
 
 
@@ -5213,52 +5284,75 @@ def _fmt_sparsity_mass(rec, pool, key):
     return f"{mass * 100:.2f}%"
 
 
-def _fmt_sparsity_pool_values(rec, formatter):
+def _fmt_sparsity_pool_values(rec, formatter, pools=SPARSITY_LOG_POOLS):
     return " ".join(
         f"{label}={formatter(pool)}"
-        for pool, label in SPARSITY_LOG_POOLS)
+        for pool, label in pools)
 
 
-def _print_v4162_sparsity_block(rec):
+def _print_v4162_sparsity_block(rec, level='compact'):
+    compact = str(level or 'compact').lower() == 'compact'
+    current_eps = (
+        SPARSITY_CURRENT_EPS_LOG_COMPACT if compact
+        else SPARSITY_CURRENT_EPS_LOG)
+    projected_eps = (
+        SPARSITY_PROJECTED_EPS_LOG_COMPACT if compact
+        else SPARSITY_PROJECTED_EPS_LOG)
+    margin_bands = (
+        SPARSITY_MARGIN_BAND_LOG_COMPACT if compact
+        else SPARSITY_MARGIN_BAND_LOG)
+    pools = SPARSITY_LOG_POOLS_COMPACT if compact else SPARSITY_LOG_POOLS
     log_message(
         "  active_tau: "
         + _fmt_sparsity_pool_values(
             rec,
             lambda pool: _fmt_sparsity_frac_count(
-                rec, pool, 'active_tau')))
-    for eps_label, suffix in SPARSITY_CURRENT_EPS_LOG:
-        log_message(
-            f"  gate@{eps_label}: active "
+                rec, pool, 'active_tau'),
+            pools=pools))
+    for eps_label, suffix in current_eps:
+        line = (
+            f"  gate@{eps_label}: "
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool, suffix=suffix: _fmt_sparsity_frac_count(
-                    rec, pool, f'active_eps_{suffix}'))
-            + " | mass "
-            + _fmt_sparsity_pool_values(
-                rec,
-                lambda pool, suffix=suffix: _fmt_sparsity_mass(
-                    rec, pool, f'mass_eps_{suffix}')))
-    for eps_label, suffix in SPARSITY_PROJECTED_EPS_LOG:
-        log_message(
-            f"  projected_Tfinal@{eps_label}: active "
+                    rec, pool, f'active_eps_{suffix}'),
+                pools=pools))
+        if not compact:
+            line += (
+                " | mass "
+                + _fmt_sparsity_pool_values(
+                    rec,
+                    lambda pool, suffix=suffix: _fmt_sparsity_mass(
+                        rec, pool, f'mass_eps_{suffix}'),
+                    pools=pools))
+        log_message(line)
+    for eps_label, suffix in projected_eps:
+        line = (
+            f"  projected_Tfinal@{eps_label}: "
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool, suffix=suffix: _fmt_sparsity_frac_count(
-                    rec, pool, f'projected_Tfinal_active_eps_{suffix}'))
-            + " | mass "
-            + _fmt_sparsity_pool_values(
-                rec,
-                lambda pool, suffix=suffix: _fmt_sparsity_mass(
-                    rec, pool, f'projected_Tfinal_mass_eps_{suffix}')))
+                    rec, pool, f'projected_Tfinal_active_eps_{suffix}'),
+                pools=pools))
+        if not compact:
+            line += (
+                " | mass "
+                + _fmt_sparsity_pool_values(
+                    rec,
+                    lambda pool, suffix=suffix: _fmt_sparsity_mass(
+                        rec, pool, f'projected_Tfinal_mass_eps_{suffix}'),
+                    pools=pools))
+        log_message(line)
     log_message(
         "  margin_bands: "
         + " ".join(
             f"{band}["
             + _fmt_sparsity_pool_values(
                 rec,
-                lambda pool, key=key: _fmt_sparsity_mass(rec, pool, key))
+                lambda pool, key=key: _fmt_sparsity_mass(rec, pool, key),
+                pools=pools)
             + "]"
-            for band, key in SPARSITY_MARGIN_BAND_LOG))
+            for band, key in margin_bands))
 
 
 def _soft_gate_schedule_shape(ctx):
@@ -6164,7 +6258,8 @@ def _print_regular_block(rec, ctx):
     )
     if is_v4160:
         if is_v4162_soft:
-            _print_v4162_sparsity_block(rec)
+            _print_v4162_sparsity_block(
+                rec, ctx.get('regular_diagnostics_level', 'compact'))
             log_message(
                 f"  strong: q={rec['attn_q_strong']*100:.1f}%"
                 f" k={rec['attn_k_strong']*100:.1f}%"
@@ -6249,7 +6344,7 @@ def _print_regular_block(rec, ctx):
                 f" rst={rec['removed_margin_reg_weighted_rst']:.6f}"
                 f" total={rec['removed_margin_reg_weighted_total']:.6f}]"
             )
-    if is_v4160:
+    if is_v4160 and not is_v4162_soft:
         log_message(
             f"  gate_max[qk={rec['attn_qk_raw_gate_max']:.1f}"
             f" v={rec['attn_v_raw_gate_max']:.1f}"
@@ -6263,7 +6358,7 @@ def _print_regular_block(rec, ctx):
             f" v={rec['drift_attn_v_emb']:.2e}"
             f" rst={rec['drift_rst_emb']:.2e}]"
         )
-    else:
+    elif not is_v4160:
         log_message(
             f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
             f" rst={rec['rst_raw_gate_max']:.1f}]"
@@ -6274,26 +6369,7 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['drift_rst_emb']:.2e}]"
         )
     if ctx.get('model_version') == 'spatial-r1-v4.1.6.2':
-        log_message(
-            f"  soft_exposure: mean[qk={rec['attn_qk_soft_exposure_mean']:+.4f}"
-            f" v={rec['attn_v_soft_exposure_mean']:+.4f}"
-            f" rst={rec['rst_soft_exposure_mean']:+.4f}]"
-            f" min[qk={rec['attn_qk_soft_exposure_min']:+.4f}"
-            f" v={rec['attn_v_soft_exposure_min']:+.4f}"
-            f" rst={rec['rst_soft_exposure_min']:+.4f}]"
-            f" max[qk={rec['attn_qk_soft_exposure_max']:+.4f}"
-            f" v={rec['attn_v_soft_exposure_max']:+.4f}"
-            f" rst={rec['rst_soft_exposure_max']:+.4f}]"
-            f" dead@1e-6[qk={rec['attn_qk_soft_dead_frac_eps_1e_6']*100:.2f}%"
-            f" v={rec['attn_v_soft_dead_frac_eps_1e_6']*100:.2f}%"
-            f" rst={rec['rst_soft_dead_frac_eps_1e_6']*100:.2f}%]"
-            f" dead@1e-5[qk={rec['attn_qk_soft_dead_frac_eps_1e_5']*100:.2f}%"
-            f" v={rec['attn_v_soft_dead_frac_eps_1e_5']*100:.2f}%"
-            f" rst={rec['rst_soft_dead_frac_eps_1e_5']*100:.2f}%]"
-            f" dead@1e-4[qk={rec['attn_qk_soft_dead_frac_eps_1e_4']*100:.2f}%"
-            f" v={rec['attn_v_soft_dead_frac_eps_1e_4']*100:.2f}%"
-            f" rst={rec['rst_soft_dead_frac_eps_1e_4']*100:.2f}%]"
-        )
+        pass
     elif ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_message(
             f"  angular_exposure: mean[a={rec['attn_angular_exposure_mean']:+.4f}"
@@ -6367,6 +6443,22 @@ def _print_regular_block(rec, ctx):
             )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_message(_format_output_stab_line(rec, indent="  "))
+    _update_cap_hit_total = sum(
+        float(rec.get(_key, 0.0) or 0.0)
+        for _key in (
+            'update_cap_proj_attn_hit',
+            'update_cap_proj_rst_hit',
+            'update_cap_emb_qk_hit',
+            'update_cap_emb_v_hit',
+            'update_cap_emb_rst_hit',
+            'update_cap_tau_attn_hit',
+            'update_cap_tau_rst_hit',
+            'update_cap_raw_tau_qk_hit',
+            'update_cap_raw_tau_v_hit',
+            'update_cap_raw_tau_rst_hit',
+            'update_cap_scan_attn_hit',
+            'update_cap_scan_rst_hit',
+        ))
     _cap_scale_min = min(
         rec.get('update_cap_proj_attn_scale', 1.0),
         rec.get('update_cap_proj_rst_scale', 1.0),
@@ -6381,7 +6473,7 @@ def _print_regular_block(rec, ctx):
         rec.get('update_cap_scan_attn_scale', 1.0),
         rec.get('update_cap_scan_rst_scale', 1.0),
     )
-    if is_v4160:
+    if is_v4160 and _update_cap_hit_total > 0.0:
         raw_tau_part = ""
         raw_tau_hit_part = ""
         if rec.get('update_cap_raw_tau_enabled', 0.0) > 0.0:
@@ -6418,7 +6510,7 @@ def _print_regular_block(rec, ctx):
             f" scan_pre[a={rec.get('update_cap_scan_attn_abs_pre', 0.0):.1e}"
             f" r={rec.get('update_cap_scan_rst_abs_pre', 0.0):.1e}]"
         )
-    else:
+    elif _update_cap_hit_total > 0.0:
         log_message(
             f"  update_cap: hit[pA={rec.get('update_cap_proj_attn_hit', 0.0):.0f}"
             f" pR={rec.get('update_cap_proj_rst_hit', 0.0):.0f}"
@@ -6476,7 +6568,7 @@ def _print_regular_block(rec, ctx):
             f" p99={rec['attn_tau_off_p99']:+.2f} max={rec['attn_tau_off_max']:+.2f}"
             f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
         )
-    elif is_v4160:
+    elif is_v4160 and not is_v4162_soft:
         rst_raw_tau_min = rec.get('rst_raw_tau_min', rec.get('rst_raw_tau_mean', 0.0))
         rst_raw_tau_max = rec.get('rst_raw_tau_max', rec.get('rst_raw_tau_mean', 0.0))
         qk_raw_tau_min = rec.get(
@@ -6495,7 +6587,7 @@ def _print_regular_block(rec, ctx):
     route_std_label = (
         "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
         else "score_std")
-    if is_v4160:
+    if is_v4160 and not is_v4162_soft:
         log_message(
             f"  emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
             f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
@@ -6504,7 +6596,7 @@ def _print_regular_block(rec, ctx):
             f" v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
             f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
         )
-    else:
+    elif not is_v4160:
         log_message(
             f"  {route_std_label}[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
             f" | emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
@@ -6514,72 +6606,74 @@ def _print_regular_block(rec, ctx):
             f" attn_v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
             f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
         )
-    log_message(
-        f"  rw_n: attn_qk r[m={rec['attn_qk_read_norm_mean']:.2f} s={rec['attn_qk_read_norm_std']:.2f}"
-        f" max={rec['attn_qk_read_norm_max']:.2f}]"
-        f" w[m={rec['attn_qk_write_norm_mean']:.2f} s={rec['attn_qk_write_norm_std']:.2f}"
-        f" max={rec['attn_qk_write_norm_max']:.2f}]"
-        f" | attn_v r[m={rec['attn_v_read_norm_mean']:.2f} s={rec['attn_v_read_norm_std']:.2f}"
-        f" max={rec['attn_v_read_norm_max']:.2f}]"
-        f" w[m={rec['attn_v_write_norm_mean']:.2f} s={rec['attn_v_write_norm_std']:.2f}"
-        f" max={rec['attn_v_write_norm_max']:.2f}]"
-        f" | k r[m={rec['rst_read_norm_mean']:.2f} s={rec['rst_read_norm_std']:.2f}"
-        f" max={rec['rst_read_norm_max']:.2f}]"
-        f" w[m={rec['rst_write_norm_mean']:.2f} s={rec['rst_write_norm_std']:.2f}"
-        f" max={rec['rst_write_norm_max']:.2f}]"
-    )
-    log_message(
-        f"  op_gain: attn_qk[m={rec['attn_qk_op_gain_mean']:.2f} s={rec['attn_qk_op_gain_std']:.2f}"
-        f" max={rec['attn_qk_op_gain_max']:.2f}]"
-        f" attn_v[m={rec['attn_v_op_gain_mean']:.2f} s={rec['attn_v_op_gain_std']:.2f}"
-        f" max={rec['attn_v_op_gain_max']:.2f}]"
-        f" k[m={rec['rst_op_gain_mean']:.2f} s={rec['rst_op_gain_std']:.2f}"
-        f" max={rec['rst_op_gain_max']:.2f}]"
-    )
-    if is_v4160 or ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
+    if not is_v4162_soft:
         log_message(
-            f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
-            f" pos={rec['pos_frac']*100:.1f}%"
-            f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-            f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
-            f" norm[layer_norm={rec['exploration_layer_norm_enabled']:.0f}"
-            f" layer_count={rec['exploration_layer_count']:.0f}"
-            f" norm={rec['exploration_norm']:.1f}]"
-            f" rpe_guard: shutoff[q={rec['rpe_no_active_easy_shutoff_q']*100:.1f}%"
-            f" k={rec['rpe_no_active_easy_shutoff_k']*100:.1f}%"
-            f" v={rec['rpe_no_active_easy_shutoff_v']*100:.1f}%"
-            f" rst={rec['rpe_no_active_easy_shutoff_rst']*100:.1f}%]"
-            f" expl[q={rec['explore_q_raw']:+.3f}"
-            f" k={rec['explore_k_raw']:+.3f}"
-            f" v={rec['explore_v_raw']:+.3f}"
-            f" rst={rec['explore_rst_raw']:+.3f}"
-            f" total={rec['explore_loss_raw']:+.3f}]"
-            f" weighted[q={rec['exploration_loss_weighted_q']:+.4f}"
-            f" k={rec['exploration_loss_weighted_k']:+.4f}"
-            f" v={rec['exploration_loss_weighted_v']:+.4f}"
-            f" rst={rec['exploration_loss_weighted_rst']:+.4f}"
-            f" total={rec['explore_loss_weighted']:+.4f}]"
-            f" block[q={rec['explore_block_frac_q']*100:.1f}%"
-            f" k={rec['explore_block_frac_key']*100:.1f}%"
-            f" v={rec['explore_block_frac_v']*100:.1f}%"
-            f" rst={rec['explore_block_frac_rst']*100:.1f}%]"
+            f"  rw_n: attn_qk r[m={rec['attn_qk_read_norm_mean']:.2f} s={rec['attn_qk_read_norm_std']:.2f}"
+            f" max={rec['attn_qk_read_norm_max']:.2f}]"
+            f" w[m={rec['attn_qk_write_norm_mean']:.2f} s={rec['attn_qk_write_norm_std']:.2f}"
+            f" max={rec['attn_qk_write_norm_max']:.2f}]"
+            f" | attn_v r[m={rec['attn_v_read_norm_mean']:.2f} s={rec['attn_v_read_norm_std']:.2f}"
+            f" max={rec['attn_v_read_norm_max']:.2f}]"
+            f" w[m={rec['attn_v_write_norm_mean']:.2f} s={rec['attn_v_write_norm_std']:.2f}"
+            f" max={rec['attn_v_write_norm_max']:.2f}]"
+            f" | k r[m={rec['rst_read_norm_mean']:.2f} s={rec['rst_read_norm_std']:.2f}"
+            f" max={rec['rst_read_norm_max']:.2f}]"
+            f" w[m={rec['rst_write_norm_mean']:.2f} s={rec['rst_write_norm_std']:.2f}"
+            f" max={rec['rst_write_norm_max']:.2f}]"
         )
-    else:
         log_message(
-            f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
-            f" pos={rec['pos_frac']*100:.1f}%"
-            f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-            f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
-            f" expl[a={rec['explore_attn_raw']:+.3f} rst={rec['explore_rst_raw']:+.3f}]"
-            f" w={rec['explore_loss_weighted']:+.4f}"
-            f" block[a={rec['explore_block_frac_a']*100:.1f}%"
-            f" rst={rec['explore_block_frac_rst']*100:.1f}%]"
+            f"  op_gain: attn_qk[m={rec['attn_qk_op_gain_mean']:.2f} s={rec['attn_qk_op_gain_std']:.2f}"
+            f" max={rec['attn_qk_op_gain_max']:.2f}]"
+            f" attn_v[m={rec['attn_v_op_gain_mean']:.2f} s={rec['attn_v_op_gain_std']:.2f}"
+            f" max={rec['attn_v_op_gain_max']:.2f}]"
+            f" k[m={rec['rst_op_gain_mean']:.2f} s={rec['rst_op_gain_std']:.2f}"
+            f" max={rec['rst_op_gain_max']:.2f}]"
         )
+    if ctx.get('rpe_enabled', True):
+        if is_v4160 or ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
+            log_message(
+                f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
+                f" pos={rec['pos_frac']*100:.1f}%"
+                f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
+                f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
+                f" norm[layer_norm={rec['exploration_layer_norm_enabled']:.0f}"
+                f" layer_count={rec['exploration_layer_count']:.0f}"
+                f" norm={rec['exploration_norm']:.1f}]"
+                f" rpe_guard: shutoff[q={rec['rpe_no_active_easy_shutoff_q']*100:.1f}%"
+                f" k={rec['rpe_no_active_easy_shutoff_k']*100:.1f}%"
+                f" v={rec['rpe_no_active_easy_shutoff_v']*100:.1f}%"
+                f" rst={rec['rpe_no_active_easy_shutoff_rst']*100:.1f}%]"
+                f" expl[q={rec['explore_q_raw']:+.3f}"
+                f" k={rec['explore_k_raw']:+.3f}"
+                f" v={rec['explore_v_raw']:+.3f}"
+                f" rst={rec['explore_rst_raw']:+.3f}"
+                f" total={rec['explore_loss_raw']:+.3f}]"
+                f" weighted[q={rec['exploration_loss_weighted_q']:+.4f}"
+                f" k={rec['exploration_loss_weighted_k']:+.4f}"
+                f" v={rec['exploration_loss_weighted_v']:+.4f}"
+                f" rst={rec['exploration_loss_weighted_rst']:+.4f}"
+                f" total={rec['explore_loss_weighted']:+.4f}]"
+                f" block[q={rec['explore_block_frac_q']*100:.1f}%"
+                f" k={rec['explore_block_frac_key']*100:.1f}%"
+                f" v={rec['explore_block_frac_v']*100:.1f}%"
+                f" rst={rec['explore_block_frac_rst']*100:.1f}%]"
+            )
+        else:
+            log_message(
+                f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
+                f" pos={rec['pos_frac']*100:.1f}%"
+                f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
+                f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
+                f" expl[a={rec['explore_attn_raw']:+.3f} rst={rec['explore_rst_raw']:+.3f}]"
+                f" w={rec['explore_loss_weighted']:+.4f}"
+                f" block[a={rec['explore_block_frac_a']*100:.1f}%"
+                f" rst={rec['explore_block_frac_rst']*100:.1f}%]"
+            )
     if _should_print_cb1a_line(rec, ctx):
         _print_cb1a_regular_block(rec)
     _pl_a = rec.get('per_layer_attn_out_norm', []) or []
     _pl_k = rec.get('per_layer_rst_out_norm', []) or []
-    if _pl_a or _pl_k:
+    if (_pl_a or _pl_k) and not is_v4162_soft:
         log_message(
             f"  per_layer out: attn=[{' '.join(f'{v:.2f}' for v in _pl_a)}]"
             f" know=[{' '.join(f'{v:.2f}' for v in _pl_k)}]"
@@ -9355,6 +9449,20 @@ def main():
         tcfg.get('soft_gate_t_gompertz_steepness', 8.0))
     soft_gate_effective_active_eps = float(
         tcfg.get('soft_gate_effective_active_eps', 1.0e-6))
+    regular_diagnostics_level_default = (
+        'compact' if model_version_cfg == 'spatial-r1-v4.1.6.2' else 'full')
+    regular_diagnostics_level = str(tcfg.get(
+        'regular_diagnostics_level',
+        regular_diagnostics_level_default)).lower()
+    if regular_diagnostics_level not in ('compact', 'full'):
+        raise ValueError(
+            "training.regular_diagnostics_level must be 'compact' or 'full'.")
+    regular_current_eps = [
+        float(x) for x in tcfg.get(
+            'regular_current_eps', [1.0e-1, 1.0e-2, 1.0e-3])]
+    regular_projected_eps = [
+        float(x) for x in tcfg.get('regular_projected_eps', [1.0e-6])]
+    regular_mass_enabled = bool(tcfg.get('regular_mass_enabled', False))
     effective_prune_eps_list = list(
         tcfg.get('effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
     eval_effective_prune_enabled = bool(tcfg.get(
@@ -9726,6 +9834,19 @@ def main():
                 exploration_normalize_by_layers))
             rpe_enabled = bool(saved_training_config.get(
                 'rpe_enabled', rpe_enabled))
+            regular_diagnostics_level = str(saved_training_config.get(
+                'regular_diagnostics_level', regular_diagnostics_level)).lower()
+            if regular_diagnostics_level not in ('compact', 'full'):
+                raise ValueError(
+                    "training.regular_diagnostics_level must be 'compact' or 'full'.")
+            regular_current_eps = [
+                float(x) for x in saved_training_config.get(
+                    'regular_current_eps', regular_current_eps)]
+            regular_projected_eps = [
+                float(x) for x in saved_training_config.get(
+                    'regular_projected_eps', regular_projected_eps)]
+            regular_mass_enabled = bool(saved_training_config.get(
+                'regular_mass_enabled', regular_mass_enabled))
             if model_version_cfg == 'spatial-r1-v4.1.6.1':
                 # Older 4161 checkpoints may have saved rpe_enabled=False and
                 # exploration_weight=0 because the old code hard-disabled RPE.
@@ -9974,6 +10095,10 @@ def main():
         'soft_gate_t_gompertz_center': soft_gate_t_gompertz_center,
         'soft_gate_t_gompertz_steepness': soft_gate_t_gompertz_steepness,
         'soft_gate_effective_active_eps': soft_gate_effective_active_eps,
+        'regular_diagnostics_level': regular_diagnostics_level,
+        'regular_current_eps': regular_current_eps,
+        'regular_projected_eps': regular_projected_eps,
+        'regular_mass_enabled': regular_mass_enabled,
         'effective_prune_eps_list': effective_prune_eps_list,
         'eval_effective_prune_enabled': eval_effective_prune_enabled,
         'eval_effective_prune_eps_list': eval_effective_prune_eps_list,
@@ -10500,6 +10625,11 @@ def main():
                   f"qk/v/rst=({exploration_weight_qk}, "
                   f"{exploration_weight_v}, {exploration_weight_rst})")
             print("  Effective pruning:")
+            print(
+                f"    regular diagnostics={regular_diagnostics_level} "
+                f"current_eps={regular_current_eps} "
+                f"projected_eps={regular_projected_eps} "
+                f"mass={regular_mass_enabled}")
             print(f"    train diagnostic eps={effective_prune_eps_list}")
             print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
             gate_msg = (
@@ -10926,8 +11056,15 @@ def main():
         rpe_schedule=rpe_schedule,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh,
-        debug_diagnostics=(debug_mode or spike_event_logger),
-        debug_local_spikes=_train_local_diag)
+        debug_diagnostics=debug_mode,
+        debug_local_spikes=_train_local_diag,
+        compact_train_metrics=(
+            model_version_cfg == 'spatial-r1-v4.1.6.2'
+            and regular_diagnostics_level == 'compact'
+            and not debug_mode
+            and not _train_local_diag),
+        keep_train_layer_metrics=(
+            spike_event_logger or crash_snapshot_enabled))
     eval_step_fn = create_eval_step(
         model, sharded_fns=_sharded_fns, return_dead_stats=True,
         total_training_steps=total_steps,
@@ -12292,6 +12429,8 @@ def main():
                 # only -no collective). Must run outside is_host0 so the
                 # next jit'd train_step sees a consistent snap pytree.
                 _prev_emb_snap = _drift_snap(params)
+                _raw_step_time_window = time.time() - win_start_time
+                _regular_logging_t0 = time.time()
                 # One TPU-to-CPU sync for the whole window.
                 _win_vals = jax.device_get({
                     'loss': _win_loss_jax, 'ce': _win_ce_jax,
@@ -12358,6 +12497,8 @@ def main():
                         'total_micro_steps': total_micro_steps,
                         'progress': _progress,
                         'model_version': model_version,
+                        'regular_diagnostics_level': regular_diagnostics_level,
+                        'rpe_enabled': bool(rpe_enabled),
                         'soft_gate_schedule': soft_gate_schedule,
                         'soft_gate_t_power': soft_gate_t_power,
                         'soft_gate_t_gompertz_center':
@@ -12375,8 +12516,23 @@ def main():
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
                     rec = _attach_update_cap_window_stats(
                         rec, jax.device_get(_regular_cap_window_jax))
+                    rec['raw_step_time_window'] = float(_raw_step_time_window)
+                    rec['logging_time'] = 0.0
                     _print_regular_block(rec, ctx)
                     log_jsonl({'type': 'train', **rec})
+                    sync_logs()
+                    _regular_logging_time = time.time() - _regular_logging_t0
+                    log_message(
+                        f"  host_timing: raw_step_time_window={_raw_step_time_window:.3f}s "
+                        f"logging_time={_regular_logging_time:.3f}s")
+                    log_jsonl({
+                        'type': 'train_timing',
+                        'step': int(global_step),
+                        'epoch': int(epoch),
+                        'raw_step_time_window': float(_raw_step_time_window),
+                        'logging_time': float(_regular_logging_time),
+                        'timestamp': datetime.now().isoformat(),
+                    })
                     sync_logs()
 
                 # Reset window accumulators (all hosts)
@@ -12448,6 +12604,8 @@ def main():
                     'total_micro_steps': total_micro_steps,
                     'progress': _progress,
                     'model_version': model_version,
+                    'regular_diagnostics_level': regular_diagnostics_level,
+                    'rpe_enabled': bool(rpe_enabled),
                     'soft_gate_schedule': soft_gate_schedule,
                     'soft_gate_t_power': soft_gate_t_power,
                     'soft_gate_t_gompertz_center':

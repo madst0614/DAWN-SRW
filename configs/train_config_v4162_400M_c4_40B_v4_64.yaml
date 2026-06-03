@@ -64,6 +64,14 @@ training:
   soft_gate_t_anneal_end_frac: 0.8
   soft_gate_schedule: cosine
   soft_gate_effective_active_eps: 1.0e-06
+  regular_diagnostics_level: compact
+  regular_current_eps:
+  - 0.1
+  - 0.01
+  - 0.001
+  regular_projected_eps:
+  - 1.0e-06
+  regular_mass_enabled: false
   tau_ce_grad_scale_start: 1.0
   tau_ce_grad_scale_final: 0.0
   tau_ce_grad_scale_hold_frac: 0.25

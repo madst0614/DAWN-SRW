@@ -204,8 +204,61 @@ GATE_SPARSITY_DIAG_NAMES = (
         f'projected_Tfinal_mass_eps_{suffix}'
         for suffix in GATE_PROJECTED_EPS_NAME_SUFFIXES)
     + tuple(f'margin_band_{name}' for name in MARGIN_BAND_NAMES)
+    + (
+        'margin_band_pos',
+        'margin_band_near_m0_03_0',
+        'margin_band_far_lt_m0_10',
+    )
 )
 GATE_SPARSITY_DIAG_COUNT = len(GATE_SPARSITY_DIAG_NAMES)
+GATE_SPARSITY_DIAG_INDEX = {
+    name: i for i, name in enumerate(GATE_SPARSITY_DIAG_NAMES)
+}
+GATE_EPS_SUFFIX_TO_VALUE = {
+    '1e_6': 1.0e-6,
+    '1e_5': 1.0e-5,
+    '1e_4': 1.0e-4,
+    '1e_3': 1.0e-3,
+    '1e_2': 1.0e-2,
+    '1e_1': 1.0e-1,
+}
+GATE_EPS_VALUE_TO_SUFFIX = {
+    float(v): k for k, v in GATE_EPS_SUFFIX_TO_VALUE.items()
+}
+
+
+def _gate_eps_suffix(value):
+    value_f = float(value)
+    for known_value, suffix in GATE_EPS_VALUE_TO_SUFFIX.items():
+        if math.isclose(value_f, known_value, rel_tol=0.0, abs_tol=known_value * 1.0e-6):
+            return suffix
+    raise ValueError(
+        f"Unsupported v4162 sparsity eps={value!r}; supported values are "
+        f"{sorted(GATE_EPS_VALUE_TO_SUFFIX)}.")
+
+
+def _gate_eps_values_from_suffixes(suffixes):
+    return tuple(float(GATE_EPS_SUFFIX_TO_VALUE[s]) for s in suffixes)
+
+
+def _regular_diag_level(level):
+    level = str(level or 'compact').lower()
+    if level not in ('compact', 'full'):
+        raise ValueError(
+            f"regular_diagnostics_level={level!r}; expected 'compact' or 'full'.")
+    return level
+
+
+def _regular_eps_suffixes(values, default_suffixes, allowed_suffixes):
+    if values is None:
+        return tuple(default_suffixes)
+    suffixes = tuple(_gate_eps_suffix(v) for v in values)
+    bad = [s for s in suffixes if s not in allowed_suffixes]
+    if bad:
+        raise ValueError(
+            f"Unsupported regular sparsity eps suffixes {bad}; allowed are "
+            f"{tuple(allowed_suffixes)}.")
+    return suffixes
 
 
 def _pool_output_scales(d_model, n_layers):
@@ -399,7 +452,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                      intensity_beta=0.5,
                      dead_exposure_target=0.1,
                      soft_gate_effective_active_eps=1.0e-6,
-                     soft_gate_enabled=False):
+                     soft_gate_enabled=False,
+                     regular_diagnostics_level='compact',
+                     regular_current_eps=(1.0e-1, 1.0e-2, 1.0e-3),
+                     regular_projected_eps=(1.0e-6,),
+                     regular_mass_enabled=False):
     """Create fused shard_map'd angular Select + SRW.
 
     Fast train path: one chunked pass computes rho, tau, gate, and SRW.
@@ -433,6 +490,25 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _spike_probe = bool(spike_probe)
     _spike_probe_topk = max(1, int(spike_probe_topk))
     _soft_gate_enabled = True
+    _regular_level = _regular_diag_level(regular_diagnostics_level)
+    _compact_regular_diag = (not bool(analysis) and _regular_level == 'compact')
+    _regular_current_suffixes = _regular_eps_suffixes(
+        regular_current_eps, ('1e_1', '1e_2', '1e_3'),
+        GATE_EPS_NAME_SUFFIXES)
+    _regular_projected_suffixes = _regular_eps_suffixes(
+        regular_projected_eps, ('1e_6',),
+        GATE_PROJECTED_EPS_NAME_SUFFIXES)
+    _current_suffixes = (
+        _regular_current_suffixes if _compact_regular_diag
+        else GATE_EPS_NAME_SUFFIXES)
+    _projected_suffixes = (
+        _regular_projected_suffixes if _compact_regular_diag
+        else GATE_PROJECTED_EPS_NAME_SUFFIXES)
+    _current_eps_values = _gate_eps_values_from_suffixes(_current_suffixes)
+    _projected_eps_values = _gate_eps_values_from_suffixes(_projected_suffixes)
+    _compute_sparsity_mass = (
+        (not _compact_regular_diag) or bool(regular_mass_enabled))
+    _compact_margin_bands = bool(_compact_regular_diag)
     _intensity_route_dim = int(intensity_route_dim or 0)
     if _intensity_route_dim <= 0:
         raise ValueError(
@@ -676,17 +752,18 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             diag_neg_inf,
             jnp.full((B, S, 1), diag_neg_inf, dtype=jnp.float32),
         )
-        current_eps = jnp.asarray(GATE_CURRENT_EPS, dtype=jnp.float32)
-        projected_eps = jnp.asarray(GATE_PROJECTED_EPS, dtype=jnp.float32)
+        current_eps = jnp.asarray(_current_eps_values, dtype=jnp.float32)
+        projected_eps = jnp.asarray(_projected_eps_values, dtype=jnp.float32)
+        margin_band_count = 3 if _compact_margin_bands else len(MARGIN_BAND_NAMES)
         sparsity_carry0 = (
             jnp.float32(0.0),
-            jnp.zeros((len(GATE_CURRENT_EPS),), dtype=jnp.float32),
-            jnp.zeros((len(GATE_CURRENT_EPS),), dtype=jnp.float32),
+            jnp.zeros((len(_current_eps_values),), dtype=jnp.float32),
+            jnp.zeros((len(_current_eps_values),), dtype=jnp.float32),
             jnp.float32(0.0),
-            jnp.zeros((len(GATE_PROJECTED_EPS),), dtype=jnp.float32),
-            jnp.zeros((len(GATE_PROJECTED_EPS),), dtype=jnp.float32),
+            jnp.zeros((len(_projected_eps_values),), dtype=jnp.float32),
+            jnp.zeros((len(_projected_eps_values),), dtype=jnp.float32),
             jnp.float32(0.0),
-            jnp.zeros((len(MARGIN_BAND_NAMES),), dtype=jnp.float32),
+            jnp.zeros((margin_band_count,), dtype=jnp.float32),
         )
 
         def gate_sparsity_parts(selection_margin, intensity, gate):
@@ -698,10 +775,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             current_active = gate_sg[..., None] > current_eps
             current_active_count = current_active.astype(jnp.float32).sum(
                 axis=(0, 1, 2))
-            current_mass = (
-                gate_sg[..., None] * current_active.astype(jnp.float32)
-            ).sum(axis=(0, 1, 2))
-            gate_mass = gate_sg.sum()
+            if _compute_sparsity_mass:
+                current_mass = (
+                    gate_sg[..., None] * current_active.astype(jnp.float32)
+                ).sum(axis=(0, 1, 2))
+                gate_mass = gate_sg.sum()
+            else:
+                current_mass = jnp.zeros_like(current_active_count)
+                gate_mass = jnp.float32(0.0)
 
             tfinal = jnp.maximum(
                 jnp.asarray(soft_gate_t_final, dtype=jnp.float32),
@@ -712,19 +793,30 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             projected_active = projected_gate[..., None] > projected_eps
             projected_active_count = projected_active.astype(jnp.float32).sum(
                 axis=(0, 1, 2))
-            projected_mass = (
-                projected_gate[..., None]
-                * projected_active.astype(jnp.float32)
-            ).sum(axis=(0, 1, 2))
-            projected_gate_mass = projected_gate.sum()
+            if _compute_sparsity_mass:
+                projected_mass = (
+                    projected_gate[..., None]
+                    * projected_active.astype(jnp.float32)
+                ).sum(axis=(0, 1, 2))
+                projected_gate_mass = projected_gate.sum()
+            else:
+                projected_mass = jnp.zeros_like(projected_active_count)
+                projected_gate_mass = jnp.float32(0.0)
 
-            margin_bands = jnp.stack((
-                active_tau.astype(jnp.float32).sum(),
-                ((margin_sg >= -0.01) & (margin_sg <= 0.0)).astype(jnp.float32).sum(),
-                ((margin_sg >= -0.03) & (margin_sg < -0.01)).astype(jnp.float32).sum(),
-                ((margin_sg >= -0.10) & (margin_sg < -0.03)).astype(jnp.float32).sum(),
-                (margin_sg < -0.10).astype(jnp.float32).sum(),
-            )).astype(jnp.float32)
+            if _compact_margin_bands:
+                margin_bands = jnp.stack((
+                    active_tau.astype(jnp.float32).sum(),
+                    ((margin_sg >= -0.03) & (margin_sg <= 0.0)).astype(jnp.float32).sum(),
+                    (margin_sg < -0.10).astype(jnp.float32).sum(),
+                )).astype(jnp.float32)
+            else:
+                margin_bands = jnp.stack((
+                    active_tau.astype(jnp.float32).sum(),
+                    ((margin_sg >= -0.01) & (margin_sg <= 0.0)).astype(jnp.float32).sum(),
+                    ((margin_sg >= -0.03) & (margin_sg < -0.01)).astype(jnp.float32).sum(),
+                    ((margin_sg >= -0.10) & (margin_sg < -0.03)).astype(jnp.float32).sum(),
+                    (margin_sg < -0.10).astype(jnp.float32).sum(),
+                )).astype(jnp.float32)
             return (
                 active_tau.astype(jnp.float32).sum(),
                 current_active_count,
@@ -760,17 +852,65 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             current_count = current_active_count / token_count
             projected_frac = projected_active_count / element_count
             projected_count = projected_active_count / token_count
-            return jax.lax.stop_gradient(jnp.concatenate((
-                jnp.stack((
-                    active_tau_count / element_count,
-                    active_tau_count / token_count,
-                )).astype(jnp.float32),
-                jnp.stack((current_frac, current_count), axis=1).reshape((-1,)),
-                current_mass / jnp.maximum(gate_mass, 1.0e-8),
-                jnp.stack((projected_frac, projected_count), axis=1).reshape((-1,)),
-                projected_mass / jnp.maximum(projected_gate_mass, 1.0e-8),
-                margin_bands / element_count,
-            )).astype(jnp.float32))
+            out = jnp.zeros((GATE_SPARSITY_DIAG_COUNT,), dtype=jnp.float32)
+            out = out.at[GATE_SPARSITY_DIAG_INDEX['active_tau_frac']].set(
+                active_tau_count / element_count)
+            out = out.at[GATE_SPARSITY_DIAG_INDEX['active_tau_count']].set(
+                active_tau_count / token_count)
+            for _i, _suffix in enumerate(_current_suffixes):
+                out = out.at[
+                    GATE_SPARSITY_DIAG_INDEX[f'active_eps_{_suffix}_frac']
+                ].set(current_frac[_i])
+                out = out.at[
+                    GATE_SPARSITY_DIAG_INDEX[f'active_eps_{_suffix}_count']
+                ].set(current_count[_i])
+                if _compute_sparsity_mass:
+                    out = out.at[
+                        GATE_SPARSITY_DIAG_INDEX[f'mass_eps_{_suffix}']
+                    ].set(current_mass[_i] / jnp.maximum(gate_mass, 1.0e-8))
+            for _i, _suffix in enumerate(_projected_suffixes):
+                out = out.at[
+                    GATE_SPARSITY_DIAG_INDEX[
+                        f'projected_Tfinal_active_eps_{_suffix}_frac']
+                ].set(projected_frac[_i])
+                out = out.at[
+                    GATE_SPARSITY_DIAG_INDEX[
+                        f'projected_Tfinal_active_eps_{_suffix}_count']
+                ].set(projected_count[_i])
+                if _compute_sparsity_mass:
+                    out = out.at[
+                        GATE_SPARSITY_DIAG_INDEX[
+                            f'projected_Tfinal_mass_eps_{_suffix}']
+                    ].set(projected_mass[_i] / jnp.maximum(
+                        projected_gate_mass, 1.0e-8))
+            margin_frac = margin_bands / element_count
+            if _compact_margin_bands:
+                out = out.at[GATE_SPARSITY_DIAG_INDEX['margin_band_gt_0']].set(
+                    margin_frac[0])
+                out = out.at[GATE_SPARSITY_DIAG_INDEX['margin_band_lt_m0_10']].set(
+                    margin_frac[2])
+                out = out.at[GATE_SPARSITY_DIAG_INDEX['margin_band_pos']].set(
+                    margin_frac[0])
+                out = out.at[
+                    GATE_SPARSITY_DIAG_INDEX['margin_band_near_m0_03_0']
+                ].set(margin_frac[1])
+                out = out.at[
+                    GATE_SPARSITY_DIAG_INDEX['margin_band_far_lt_m0_10']
+                ].set(margin_frac[2])
+            else:
+                for _i, _name in enumerate(MARGIN_BAND_NAMES):
+                    out = out.at[
+                        GATE_SPARSITY_DIAG_INDEX[f'margin_band_{_name}']
+                    ].set(margin_frac[_i])
+                out = out.at[GATE_SPARSITY_DIAG_INDEX['margin_band_pos']].set(
+                    margin_frac[0])
+                out = out.at[
+                    GATE_SPARSITY_DIAG_INDEX['margin_band_near_m0_03_0']
+                ].set(margin_frac[1] + margin_frac[2])
+                out = out.at[
+                    GATE_SPARSITY_DIAG_INDEX['margin_band_far_lt_m0_10']
+                ].set(margin_frac[4])
+            return jax.lax.stop_gradient(out.astype(jnp.float32))
 
         def soft_gate_exposure_parts(gate_unpruned):
             # v4162 soft-gate exposure diagnostic only.  Do not use the hard
@@ -778,6 +918,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             # score < tau can still produce meaningful sigmoid gate mass.
             # A unit is considered soft-dead only if its actual unpruned gate
             # mass is essentially zero across the batch/tokens.
+            if _compact_regular_diag:
+                return (
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                )
             local_soft_exposure = jax.lax.stop_gradient(
                 gate_unpruned).max(axis=(0, 1))  # [cs]
             soft_exposure = jax.lax.all_gather(
@@ -1400,7 +1550,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             intensity_beta=0.5,
                             dead_exposure_target=0.1,
                             soft_gate_effective_active_eps=1.0e-6,
-                            soft_gate_enabled=False):
+                            soft_gate_enabled=False,
+                            regular_diagnostics_level='compact',
+                            regular_current_eps=(1.0e-1, 1.0e-2, 1.0e-3),
+                            regular_projected_eps=(1.0e-6,),
+                            regular_mass_enabled=False):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
@@ -1419,6 +1573,25 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _local_diagnostics = bool(local_diagnostics)
     _spike_probe = bool(spike_probe)
     _spike_probe_topk = max(1, int(spike_probe_topk))
+    _regular_level = _regular_diag_level(regular_diagnostics_level)
+    _compact_regular_diag = (not bool(analysis) and _regular_level == 'compact')
+    _regular_current_suffixes = _regular_eps_suffixes(
+        regular_current_eps, ('1e_1', '1e_2', '1e_3'),
+        GATE_EPS_NAME_SUFFIXES)
+    _regular_projected_suffixes = _regular_eps_suffixes(
+        regular_projected_eps, ('1e_6',),
+        GATE_PROJECTED_EPS_NAME_SUFFIXES)
+    _current_suffixes = (
+        _regular_current_suffixes if _compact_regular_diag
+        else GATE_EPS_NAME_SUFFIXES)
+    _projected_suffixes = (
+        _regular_projected_suffixes if _compact_regular_diag
+        else GATE_PROJECTED_EPS_NAME_SUFFIXES)
+    _current_eps_values = _gate_eps_values_from_suffixes(_current_suffixes)
+    _projected_eps_values = _gate_eps_values_from_suffixes(_projected_suffixes)
+    _compute_sparsity_mass = (
+        (not _compact_regular_diag) or bool(regular_mass_enabled))
+    _compact_margin_bands = bool(_compact_regular_diag)
     _soft_gate_enabled = True
     _intensity_route_dim = int(intensity_route_dim or 0)
     if _intensity_route_dim <= 0:
@@ -1671,17 +1844,18 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             diag_neg_inf,
             jnp.full((B, S, 2, 1), diag_neg_inf, dtype=jnp.float32),
         )
-        current_eps = jnp.asarray(GATE_CURRENT_EPS, dtype=jnp.float32)
-        projected_eps = jnp.asarray(GATE_PROJECTED_EPS, dtype=jnp.float32)
+        current_eps = jnp.asarray(_current_eps_values, dtype=jnp.float32)
+        projected_eps = jnp.asarray(_projected_eps_values, dtype=jnp.float32)
+        margin_band_count = 3 if _compact_margin_bands else len(MARGIN_BAND_NAMES)
         sparsity_carry0 = (
             jnp.zeros((2,), dtype=jnp.float32),
-            jnp.zeros((2, len(GATE_CURRENT_EPS)), dtype=jnp.float32),
-            jnp.zeros((2, len(GATE_CURRENT_EPS)), dtype=jnp.float32),
+            jnp.zeros((2, len(_current_eps_values)), dtype=jnp.float32),
+            jnp.zeros((2, len(_current_eps_values)), dtype=jnp.float32),
             jnp.zeros((2,), dtype=jnp.float32),
-            jnp.zeros((2, len(GATE_PROJECTED_EPS)), dtype=jnp.float32),
-            jnp.zeros((2, len(GATE_PROJECTED_EPS)), dtype=jnp.float32),
+            jnp.zeros((2, len(_projected_eps_values)), dtype=jnp.float32),
+            jnp.zeros((2, len(_projected_eps_values)), dtype=jnp.float32),
             jnp.zeros((2,), dtype=jnp.float32),
-            jnp.zeros((2, len(MARGIN_BAND_NAMES)), dtype=jnp.float32),
+            jnp.zeros((2, margin_band_count), dtype=jnp.float32),
         )
 
         def gate_sparsity_parts(selection_margin, intensity, gate):
@@ -1693,10 +1867,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             current_active = gate_sg[..., None] > current_eps
             current_active_count = current_active.astype(jnp.float32).sum(
                 axis=(0, 1, 3))
-            current_mass = (
-                gate_sg[..., None] * current_active.astype(jnp.float32)
-            ).sum(axis=(0, 1, 3))
-            gate_mass = gate_sg.sum(axis=(0, 1, 3))
+            if _compute_sparsity_mass:
+                current_mass = (
+                    gate_sg[..., None] * current_active.astype(jnp.float32)
+                ).sum(axis=(0, 1, 3))
+                gate_mass = gate_sg.sum(axis=(0, 1, 3))
+            else:
+                current_mass = jnp.zeros_like(current_active_count)
+                gate_mass = jnp.zeros((2,), dtype=jnp.float32)
 
             tfinal = jnp.maximum(
                 jnp.asarray(soft_gate_t_final, dtype=jnp.float32),
@@ -1707,19 +1885,30 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             projected_active = projected_gate[..., None] > projected_eps
             projected_active_count = projected_active.astype(jnp.float32).sum(
                 axis=(0, 1, 3))
-            projected_mass = (
-                projected_gate[..., None]
-                * projected_active.astype(jnp.float32)
-            ).sum(axis=(0, 1, 3))
-            projected_gate_mass = projected_gate.sum(axis=(0, 1, 3))
+            if _compute_sparsity_mass:
+                projected_mass = (
+                    projected_gate[..., None]
+                    * projected_active.astype(jnp.float32)
+                ).sum(axis=(0, 1, 3))
+                projected_gate_mass = projected_gate.sum(axis=(0, 1, 3))
+            else:
+                projected_mass = jnp.zeros_like(projected_active_count)
+                projected_gate_mass = jnp.zeros((2,), dtype=jnp.float32)
 
-            margin_bands = jnp.stack((
-                active_tau.astype(jnp.float32).sum(axis=(0, 1, 3)),
-                ((margin_sg >= -0.01) & (margin_sg <= 0.0)).astype(jnp.float32).sum(axis=(0, 1, 3)),
-                ((margin_sg >= -0.03) & (margin_sg < -0.01)).astype(jnp.float32).sum(axis=(0, 1, 3)),
-                ((margin_sg >= -0.10) & (margin_sg < -0.03)).astype(jnp.float32).sum(axis=(0, 1, 3)),
-                (margin_sg < -0.10).astype(jnp.float32).sum(axis=(0, 1, 3)),
-            ), axis=1).astype(jnp.float32)
+            if _compact_margin_bands:
+                margin_bands = jnp.stack((
+                    active_tau.astype(jnp.float32).sum(axis=(0, 1, 3)),
+                    ((margin_sg >= -0.03) & (margin_sg <= 0.0)).astype(jnp.float32).sum(axis=(0, 1, 3)),
+                    (margin_sg < -0.10).astype(jnp.float32).sum(axis=(0, 1, 3)),
+                ), axis=1).astype(jnp.float32)
+            else:
+                margin_bands = jnp.stack((
+                    active_tau.astype(jnp.float32).sum(axis=(0, 1, 3)),
+                    ((margin_sg >= -0.01) & (margin_sg <= 0.0)).astype(jnp.float32).sum(axis=(0, 1, 3)),
+                    ((margin_sg >= -0.03) & (margin_sg < -0.01)).astype(jnp.float32).sum(axis=(0, 1, 3)),
+                    ((margin_sg >= -0.10) & (margin_sg < -0.03)).astype(jnp.float32).sum(axis=(0, 1, 3)),
+                    (margin_sg < -0.10).astype(jnp.float32).sum(axis=(0, 1, 3)),
+                ), axis=1).astype(jnp.float32)
             return (
                 active_tau.astype(jnp.float32).sum(axis=(0, 1, 3)),
                 current_active_count,
@@ -1755,17 +1944,65 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             current_count = current_active_count / token_count
             projected_frac = projected_active_count / element_count
             projected_count = projected_active_count / token_count
-            return jax.lax.stop_gradient(jnp.concatenate((
-                jnp.stack((
-                    active_tau_count / element_count,
-                    active_tau_count / token_count,
-                ), axis=1),
-                jnp.stack((current_frac, current_count), axis=2).reshape((2, -1)),
-                current_mass / jnp.maximum(gate_mass[:, None], 1.0e-8),
-                jnp.stack((projected_frac, projected_count), axis=2).reshape((2, -1)),
-                projected_mass / jnp.maximum(projected_gate_mass[:, None], 1.0e-8),
-                margin_bands / element_count,
-            ), axis=1).astype(jnp.float32))
+            out = jnp.zeros((2, GATE_SPARSITY_DIAG_COUNT), dtype=jnp.float32)
+            out = out.at[:, GATE_SPARSITY_DIAG_INDEX['active_tau_frac']].set(
+                active_tau_count / element_count)
+            out = out.at[:, GATE_SPARSITY_DIAG_INDEX['active_tau_count']].set(
+                active_tau_count / token_count)
+            for _i, _suffix in enumerate(_current_suffixes):
+                out = out.at[
+                    :, GATE_SPARSITY_DIAG_INDEX[f'active_eps_{_suffix}_frac']
+                ].set(current_frac[:, _i])
+                out = out.at[
+                    :, GATE_SPARSITY_DIAG_INDEX[f'active_eps_{_suffix}_count']
+                ].set(current_count[:, _i])
+                if _compute_sparsity_mass:
+                    out = out.at[
+                        :, GATE_SPARSITY_DIAG_INDEX[f'mass_eps_{_suffix}']
+                    ].set(current_mass[:, _i] / jnp.maximum(gate_mass, 1.0e-8))
+            for _i, _suffix in enumerate(_projected_suffixes):
+                out = out.at[
+                    :, GATE_SPARSITY_DIAG_INDEX[
+                        f'projected_Tfinal_active_eps_{_suffix}_frac']
+                ].set(projected_frac[:, _i])
+                out = out.at[
+                    :, GATE_SPARSITY_DIAG_INDEX[
+                        f'projected_Tfinal_active_eps_{_suffix}_count']
+                ].set(projected_count[:, _i])
+                if _compute_sparsity_mass:
+                    out = out.at[
+                        :, GATE_SPARSITY_DIAG_INDEX[
+                            f'projected_Tfinal_mass_eps_{_suffix}']
+                    ].set(projected_mass[:, _i] / jnp.maximum(
+                        projected_gate_mass, 1.0e-8))
+            margin_frac = margin_bands / element_count
+            if _compact_margin_bands:
+                out = out.at[:, GATE_SPARSITY_DIAG_INDEX['margin_band_gt_0']].set(
+                    margin_frac[:, 0])
+                out = out.at[:, GATE_SPARSITY_DIAG_INDEX['margin_band_lt_m0_10']].set(
+                    margin_frac[:, 2])
+                out = out.at[:, GATE_SPARSITY_DIAG_INDEX['margin_band_pos']].set(
+                    margin_frac[:, 0])
+                out = out.at[
+                    :, GATE_SPARSITY_DIAG_INDEX['margin_band_near_m0_03_0']
+                ].set(margin_frac[:, 1])
+                out = out.at[
+                    :, GATE_SPARSITY_DIAG_INDEX['margin_band_far_lt_m0_10']
+                ].set(margin_frac[:, 2])
+            else:
+                for _i, _name in enumerate(MARGIN_BAND_NAMES):
+                    out = out.at[
+                        :, GATE_SPARSITY_DIAG_INDEX[f'margin_band_{_name}']
+                    ].set(margin_frac[:, _i])
+                out = out.at[:, GATE_SPARSITY_DIAG_INDEX['margin_band_pos']].set(
+                    margin_frac[:, 0])
+                out = out.at[
+                    :, GATE_SPARSITY_DIAG_INDEX['margin_band_near_m0_03_0']
+                ].set(margin_frac[:, 1] + margin_frac[:, 2])
+                out = out.at[
+                    :, GATE_SPARSITY_DIAG_INDEX['margin_band_far_lt_m0_10']
+                ].set(margin_frac[:, 4])
+            return jax.lax.stop_gradient(out.astype(jnp.float32))
 
         def soft_gate_exposure_parts(gate_unpruned):
             # v4162 soft-gate exposure diagnostic only.  Do not use the hard
@@ -1773,6 +2010,16 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             # score < tau can still produce meaningful sigmoid gate mass.
             # A unit is considered soft-dead only if its actual unpruned gate
             # mass is essentially zero across the batch/tokens/routes.
+            if _compact_regular_diag:
+                return (
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                    jnp.float32(0.0),
+                )
             local_soft_exposure = jax.lax.stop_gradient(
                 gate_unpruned).max(axis=(0, 1, 2))  # [cs]
             soft_exposure = jax.lax.all_gather(
