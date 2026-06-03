@@ -6245,6 +6245,10 @@ def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
     is_v4162_soft = ctx.get('model_version') == 'spatial-r1-v4.1.6.2'
+    is_v4162_compact = (
+        is_v4162_soft
+        and str(ctx.get('regular_diagnostics_level', 'compact')).lower()
+        == 'compact')
     aux_note = (
         " aux_is_not_total_minus_ce"
         if is_v4162_soft
@@ -6404,6 +6408,12 @@ def _print_regular_block(rec, ctx):
             f" target={rec['attn_qk_dead_exposure_target']:.3f}"
         )
     if is_v4160:
+        _pool_scale_part = ""
+        if not is_v4162_compact:
+            _pool_scale_part = (
+                f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
+                f" v={rec['attn_v_pool_scale']:.3f}"
+                f" rst={rec['rst_pool_scale']:.3f}")
         log_message(
             f"  gate_conc: qk[eff={rec['attn_qk_gate_eff_n']:.1f}"
             f" ratio={rec['attn_qk_gate_eff_ratio']:.3f}"
@@ -6414,8 +6424,7 @@ def _print_regular_block(rec, ctx):
             f" rst[eff={rec['rst_gate_eff_n']:.1f}"
             f" ratio={rec['rst_gate_eff_ratio']:.3f}"
             f" top1={rec['rst_top1_gate_frac']:.3f}]"
-            f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
-            f" v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
+            f"{_pool_scale_part}"
         )
     else:
         log_message(
