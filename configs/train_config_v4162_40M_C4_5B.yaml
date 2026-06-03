@@ -64,19 +64,22 @@ training:
   exploration_z_tanh: true
 
   soft_gate_enabled: true
+  # Soft gate temperature: Gompertz differentiation schedule
   soft_gate_t_start: 1.5
   soft_gate_t_final: 0.001
-  soft_gate_t_hold_frac: 0.01
+  soft_gate_t_hold_frac: 0.03
   soft_gate_t_anneal_end_frac: 0.90
-  soft_gate_t_schedule: log_power
-  soft_gate_t_power: 4.0
+  soft_gate_t_schedule: log_gompertz
+  soft_gate_t_gompertz_center: 0.25
+  soft_gate_t_gompertz_steepness: 8.0
   soft_gate_effective_active_eps: 1.0e-06
 
+  # Tau CE-gradient handoff: log-space influence decay
   tau_ce_grad_scale_start: 1.0
   tau_ce_grad_scale_final: 0.01
   tau_ce_grad_scale_hold_frac: 0.05
   tau_ce_grad_scale_anneal_end_frac: 0.30
-  tau_ce_grad_scale_schedule: cosine
+  tau_ce_grad_scale_schedule: log_linear
 
   intensity_beta: 0.5
 
