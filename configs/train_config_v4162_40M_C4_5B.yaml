@@ -73,34 +73,38 @@ training:
   soft_gate_t_gompertz_center: 0.20
   soft_gate_t_gompertz_steepness: 8.0
 
+  # Pool-specific soft gate temperature schedules
   soft_gate_t_pool_specific: true
 
-  soft_gate_t_qk_start: 1.5
+  # q/k: 지금도 잘 됨. 살짝만 낮추거나 그대로 유지.
+  soft_gate_t_qk_start: 1.3
   soft_gate_t_qk_final: 0.001
   soft_gate_t_qk_hold_frac: 0.0
   soft_gate_t_qk_anneal_end_frac: 0.90
   soft_gate_t_qk_schedule: log_gompertz
-  soft_gate_t_qk_gompertz_center: 0.20
+  soft_gate_t_qk_gompertz_center: 0.18
   soft_gate_t_qk_gompertz_steepness: 8.0
 
-  soft_gate_t_v_start: 1.2
+  # v: 3~8% hard active 목표. 더 local-first.
+  soft_gate_t_v_start: 0.85
   soft_gate_t_v_final: 0.001
   soft_gate_t_v_hold_frac: 0.0
-  soft_gate_t_v_anneal_end_frac: 0.90
+  soft_gate_t_v_anneal_end_frac: 0.85
   soft_gate_t_v_schedule: log_gompertz
-  soft_gate_t_v_gompertz_center: 0.16
+  soft_gate_t_v_gompertz_center: 0.10
   soft_gate_t_v_gompertz_steepness: 8.0
 
-  soft_gate_t_rst_start: 1.25
+  # rst: v보다는 약간 완만하지만 지금보다 더 local-first.
+  soft_gate_t_rst_start: 0.95
   soft_gate_t_rst_final: 0.001
   soft_gate_t_rst_hold_frac: 0.0
-  soft_gate_t_rst_anneal_end_frac: 0.90
+  soft_gate_t_rst_anneal_end_frac: 0.85
   soft_gate_t_rst_schedule: log_gompertz
-  soft_gate_t_rst_gompertz_center: 0.17
+  soft_gate_t_rst_gompertz_center: 0.12
   soft_gate_t_rst_gompertz_steepness: 8.0
 
   soft_gate_effective_active_eps: 1.0e-06
-  
+
   regular_diagnostics_level: compact
   regular_current_eps:
   - 0.1
@@ -117,24 +121,28 @@ training:
   tau_ce_grad_scale_anneal_end_frac: 0.25
   tau_ce_grad_scale_schedule: log_linear
 
+  # Pool-specific tau CE-gradient handoff
   tau_ce_grad_scale_pool_specific: true
 
+  # q/k: sparse address는 지금 잘 되니까 완만하게 유지
   tau_ce_grad_scale_qk_start: 1.0
   tau_ce_grad_scale_qk_final: 0.01
   tau_ce_grad_scale_qk_hold_frac: 0.02
   tau_ce_grad_scale_qk_anneal_end_frac: 0.25
   tau_ce_grad_scale_qk_schedule: log_linear
 
+  # v: 8.5k~10k 사이에서 거의 굳히기
   tau_ce_grad_scale_v_start: 1.0
   tau_ce_grad_scale_v_final: 0.005
-  tau_ce_grad_scale_v_hold_frac: 0.01
-  tau_ce_grad_scale_v_anneal_end_frac: 0.22
+  tau_ce_grad_scale_v_hold_frac: 0.003
+  tau_ce_grad_scale_v_anneal_end_frac: 0.12
   tau_ce_grad_scale_v_schedule: log_linear
 
+  # rst: v와 비슷하되 약간 더 여유
   tau_ce_grad_scale_rst_start: 1.0
   tau_ce_grad_scale_rst_final: 0.005
-  tau_ce_grad_scale_rst_hold_frac: 0.01
-  tau_ce_grad_scale_rst_anneal_end_frac: 0.22
+  tau_ce_grad_scale_rst_hold_frac: 0.005
+  tau_ce_grad_scale_rst_anneal_end_frac: 0.14
   tau_ce_grad_scale_rst_schedule: log_linear
 
   intensity_beta: 0.5
