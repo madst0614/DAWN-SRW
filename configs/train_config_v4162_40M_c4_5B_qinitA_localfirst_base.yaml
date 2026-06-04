@@ -41,7 +41,7 @@ training:
   warmup_ratio: 0.06
   weight_decay: 0.1
   pool_weight_decay: 0.0
-  tau_lr_mult: 1.0
+  tau_lr_mult: 0.005
   tau_grad_clip: 2.0
   router_proj_lr_mult: 1.0
   router_proj_grad_clip: 2.0
@@ -116,34 +116,6 @@ training:
   - 1.0e-06
   regular_mass_enabled: false
 
-  # Tau CE-gradient handoff: log-space influence decay
-  tau_ce_grad_scale_start: 1.0
-  tau_ce_grad_scale_final: 0.01
-  tau_ce_grad_scale_hold_frac: 0.02
-  tau_ce_grad_scale_anneal_end_frac: 0.25
-  tau_ce_grad_scale_schedule: log_linear
-
-  # Pool-specific tau CE-gradient handoff
-  tau_ce_grad_scale_pool_specific: true
-
-  tau_ce_grad_scale_qk_start: 1.0
-  tau_ce_grad_scale_qk_final: 0.005
-  tau_ce_grad_scale_qk_hold_frac: 0.005
-  tau_ce_grad_scale_qk_anneal_end_frac: 0.15
-  tau_ce_grad_scale_qk_schedule: log_linear
-
-  tau_ce_grad_scale_v_start: 1.0
-  tau_ce_grad_scale_v_final: 0.0001
-  tau_ce_grad_scale_v_hold_frac: 0.0
-  tau_ce_grad_scale_v_anneal_end_frac: 0.06
-  tau_ce_grad_scale_v_schedule: log_linear
-
-  tau_ce_grad_scale_rst_start: 1.0
-  tau_ce_grad_scale_rst_final: 0.0001
-  tau_ce_grad_scale_rst_hold_frac: 0.0
-  tau_ce_grad_scale_rst_anneal_end_frac: 0.06
-  tau_ce_grad_scale_rst_schedule: log_linear
-
   intensity_beta: 0.5
 
   eval_effective_prune_enabled: true
@@ -160,4 +132,4 @@ training:
   crash_snapshot: false
   crash_snapshot_enabled: false
   spike_event_logger: false
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/v4162_40M_qinitA_localfirst_base_q15_v06_rst05_Tv035_tauV0001
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/v4162_40M_qinit_localfirst_tauLR005_noTauCEGrad

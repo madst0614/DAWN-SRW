@@ -1432,22 +1432,7 @@ def _model_accepts_soft_gate_schedule(model):
     import inspect as _inspect
     try:
         params = _inspect.signature(model.__call__).parameters
-        return ('soft_gate_temperature' in params
-                and 'tau_ce_grad_scale' in params)
-    except (TypeError, ValueError):
-        return False
-
-
-def _model_accepts_soft_gate_pool_schedule(model):
-    """Return True if model.__call__ accepts pool-specific v4162 schedules."""
-    import inspect as _inspect
-    try:
-        params = _inspect.signature(model.__call__).parameters
-        return all(
-            name in params for name in (
-                'soft_gate_T_qk', 'soft_gate_T_v', 'soft_gate_T_rst',
-                'tau_ce_grad_scale_qk', 'tau_ce_grad_scale_v',
-                'tau_ce_grad_scale_rst'))
+        return 'soft_gate_temperature' in params
     except (TypeError, ValueError):
         return False
 
@@ -1524,32 +1509,6 @@ def _training_soft_gate_pool_schedules(
     return out
 
 
-def _training_tau_ce_pool_schedules(
-        tcfg, tau_ce_grad_scale_start, tau_ce_grad_scale_final,
-        tau_ce_grad_scale_hold_frac, tau_ce_grad_scale_anneal_end_frac,
-        tau_ce_grad_scale_schedule):
-    out = {}
-    for pool in POOL_SCHEDULE_NAMES:
-        prefix = f'tau_ce_grad_scale_{pool}'
-        out[pool] = {
-            'start': float(tcfg.get(
-                f'{prefix}_start', tau_ce_grad_scale_start)),
-            'final': float(tcfg.get(
-                f'{prefix}_final', tau_ce_grad_scale_final)),
-            'hold_frac': float(tcfg.get(
-                f'{prefix}_hold_frac', tau_ce_grad_scale_hold_frac)),
-            'anneal_end_frac': float(tcfg.get(
-                f'{prefix}_anneal_end_frac',
-                tau_ce_grad_scale_anneal_end_frac)),
-            'schedule': str(tcfg.get(
-                f'{prefix}_schedule', tau_ce_grad_scale_schedule)),
-            'power': 1.0,
-            'gompertz_center': 0.25,
-            'gompertz_steepness': 8.0,
-        }
-    return out
-
-
 def _coerce_pool_schedule_configs(pool_schedules, defaults):
     pool_schedules = pool_schedules or {}
     out = {}
@@ -1595,20 +1554,6 @@ def _flatten_soft_gate_pool_schedules(pool_schedules):
             f'{prefix}_power': cfg['power'],
             f'{prefix}_gompertz_center': cfg['gompertz_center'],
             f'{prefix}_gompertz_steepness': cfg['gompertz_steepness'],
-        })
-    return out
-
-
-def _flatten_tau_ce_pool_schedules(pool_schedules):
-    out = {}
-    for pool, cfg in pool_schedules.items():
-        prefix = f'tau_ce_grad_scale_{pool}'
-        out.update({
-            f'{prefix}_start': cfg['start'],
-            f'{prefix}_final': cfg['final'],
-            f'{prefix}_hold_frac': cfg['hold_frac'],
-            f'{prefix}_anneal_end_frac': cfg['anneal_end_frac'],
-            f'{prefix}_schedule': cfg['schedule'],
         })
     return out
 
@@ -1869,13 +1814,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       soft_gate_t_gompertz_steepness=8.0,
                       soft_gate_t_pool_specific=False,
                       soft_gate_pool_schedules=None,
-                      tau_ce_grad_scale_start=1.0,
-                      tau_ce_grad_scale_final=0.0,
-                      tau_ce_grad_scale_hold_frac=0.25,
-                      tau_ce_grad_scale_anneal_end_frac=0.60,
-                      tau_ce_grad_scale_schedule='cosine',
-                      tau_ce_grad_scale_pool_specific=False,
-                      tau_ce_grad_scale_pool_schedules=None,
                       rpe_start_frac=0.0,
                       rpe_full_frac=0.0,
                       rpe_schedule='linear',
@@ -2019,8 +1957,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_local_kw = _model_accepts_local_diagnostics(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
-    _pass_soft_gate_pool_schedule_kw = _model_accepts_soft_gate_pool_schedule(
-        model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
@@ -2075,25 +2011,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
         soft_gate_pool_schedules if soft_gate_t_pool_specific else None,
         _soft_gate_pool_defaults)
-    _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
-    _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
-    _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
-    _tau_ce_grad_scale_anneal_end_frac = jnp.float32(tau_ce_grad_scale_anneal_end_frac)
-    _tau_ce_grad_scale_schedule = str(tau_ce_grad_scale_schedule).lower()
-    _tau_ce_pool_defaults = {
-        'start': tau_ce_grad_scale_start,
-        'final': tau_ce_grad_scale_final,
-        'hold_frac': tau_ce_grad_scale_hold_frac,
-        'anneal_end_frac': tau_ce_grad_scale_anneal_end_frac,
-        'schedule': tau_ce_grad_scale_schedule,
-        'power': 1.0,
-        'gompertz_center': 0.25,
-        'gompertz_steepness': 8.0,
-    }
-    _tau_ce_pool_cfg = _coerce_pool_schedule_configs(
-        (tau_ce_grad_scale_pool_schedules
-         if tau_ce_grad_scale_pool_specific else None),
-        _tau_ce_pool_defaults)
     _rpe_start_frac = jnp.float32(rpe_start_frac)
     _rpe_full_frac = jnp.float32(rpe_full_frac)
     _rpe_schedule = str(rpe_schedule).lower()
@@ -2138,12 +2055,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     step, _total_training_steps, _soft_gate_pool_cfg['v'])
                 soft_gate_T_rst = _scheduled_from_config(
                     step, _total_training_steps, _soft_gate_pool_cfg['rst'])
-                tau_ce_scale_qk = _scheduled_from_config(
-                    step, _total_training_steps, _tau_ce_pool_cfg['qk'])
-                tau_ce_scale_v = _scheduled_from_config(
-                    step, _total_training_steps, _tau_ce_pool_cfg['v'])
-                tau_ce_scale_rst = _scheduled_from_config(
-                    step, _total_training_steps, _tau_ce_pool_cfg['rst'])
                 rpe_schedule_scale = _scheduled_scalar(
                     step, _total_training_steps,
                     0.0, 1.0, _rpe_start_frac, _rpe_full_frac,
@@ -2152,26 +2063,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 soft_gate_T_qk = jnp.float32(0.07)
                 soft_gate_T_v = jnp.float32(0.07)
                 soft_gate_T_rst = jnp.float32(0.07)
-                tau_ce_scale_qk = jnp.float32(0.0)
-                tau_ce_scale_v = jnp.float32(0.0)
-                tau_ce_scale_rst = jnp.float32(0.0)
                 rpe_schedule_scale = (step >= _warmup_steps).astype(jnp.float32)
             soft_gate_T = soft_gate_T_qk
-            tau_ce_scale = tau_ce_scale_qk
             if _pass_soft_gate_schedule_kw:
                 extra_kw['soft_gate_temperature'] = soft_gate_T
-                extra_kw['tau_ce_grad_scale'] = tau_ce_scale
+                extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
+                extra_kw['soft_gate_T_v'] = soft_gate_T_v
+                extra_kw['soft_gate_T_rst'] = soft_gate_T_rst
                 extra_kw['rpe_effective_weight'] = (
                     (_explore_weight_q + _explore_weight_k
                      + _explore_weight_v + _explore_weight_rst)
                     / jnp.float32(4.0) * rpe_schedule_scale)
-                if _pass_soft_gate_pool_schedule_kw:
-                    extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
-                    extra_kw['soft_gate_T_v'] = soft_gate_T_v
-                    extra_kw['soft_gate_T_rst'] = soft_gate_T_rst
-                    extra_kw['tau_ce_grad_scale_qk'] = tau_ce_scale_qk
-                    extra_kw['tau_ce_grad_scale_v'] = tau_ce_scale_v
-                    extra_kw['tau_ce_grad_scale_rst'] = tau_ce_scale_rst
             if _pass_soft_gate_t_final_kw:
                 extra_kw['soft_gate_t_final'] = _soft_gate_t_final
             if _pass_execution_prune_kw:
@@ -2717,10 +2619,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 soft_gate_T_qk=soft_gate_T_qk,
                 soft_gate_T_v=soft_gate_T_v,
                 soft_gate_T_rst=soft_gate_T_rst,
-                tau_ce_grad_scale=tau_ce_scale,
-                tau_ce_grad_scale_qk=tau_ce_scale_qk,
-                tau_ce_grad_scale_v=tau_ce_scale_v,
-                tau_ce_grad_scale_rst=tau_ce_scale_rst,
                 rpe_schedule_scale=rpe_schedule_scale,
             )
             result_payload = result
@@ -3494,10 +3392,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'soft_gate_T_qk': explore_stats['soft_gate_T_qk'],
             'soft_gate_T_v': explore_stats['soft_gate_T_v'],
             'soft_gate_T_rst': explore_stats['soft_gate_T_rst'],
-            'tau_ce_grad_scale': explore_stats['tau_ce_grad_scale'],
-            'tau_ce_grad_scale_qk': explore_stats['tau_ce_grad_scale_qk'],
-            'tau_ce_grad_scale_v': explore_stats['tau_ce_grad_scale_v'],
-            'tau_ce_grad_scale_rst': explore_stats['tau_ce_grad_scale_rst'],
             'rpe_effective_weight': (
                 (_explore_weight_q + _explore_weight_k
                  + _explore_weight_v + _explore_weight_rst)
@@ -4190,14 +4084,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_t_gompertz_center=0.25,
                      soft_gate_t_gompertz_steepness=8.0,
                      soft_gate_t_pool_specific=False,
-                     soft_gate_pool_schedules=None,
-                     tau_ce_grad_scale_start=1.0,
-                     tau_ce_grad_scale_final=0.0,
-                     tau_ce_grad_scale_hold_frac=0.25,
-                     tau_ce_grad_scale_anneal_end_frac=0.60,
-                     tau_ce_grad_scale_schedule='cosine',
-                     tau_ce_grad_scale_pool_specific=False,
-                     tau_ce_grad_scale_pool_schedules=None):
+                     soft_gate_pool_schedules=None):
     """Create a jit-compiled evaluation step.
 
     Uses the SLIM forward (analysis=False). Eval normally needs only loss /
@@ -4206,8 +4093,6 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     """
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
-    _pass_soft_gate_pool_schedule_kw = _model_accepts_soft_gate_pool_schedule(
-        model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _execution_prune_eps = jnp.float32(execution_prune_eps)
@@ -4239,25 +4124,6 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
         soft_gate_pool_schedules if soft_gate_t_pool_specific else None,
         _soft_gate_pool_defaults)
-    _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
-    _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
-    _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
-    _tau_ce_grad_scale_anneal_end_frac = jnp.float32(tau_ce_grad_scale_anneal_end_frac)
-    _tau_ce_grad_scale_schedule = str(tau_ce_grad_scale_schedule).lower()
-    _tau_ce_pool_defaults = {
-        'start': tau_ce_grad_scale_start,
-        'final': tau_ce_grad_scale_final,
-        'hold_frac': tau_ce_grad_scale_hold_frac,
-        'anneal_end_frac': tau_ce_grad_scale_anneal_end_frac,
-        'schedule': tau_ce_grad_scale_schedule,
-        'power': 1.0,
-        'gompertz_center': 0.25,
-        'gompertz_steepness': 8.0,
-    }
-    _tau_ce_pool_cfg = _coerce_pool_schedule_configs(
-        (tau_ce_grad_scale_pool_schedules
-         if tau_ce_grad_scale_pool_specific else None),
-        _tau_ce_pool_defaults)
 
     @jax.jit
     def eval_step(params, input_ids, attention_mask, step):
@@ -4271,21 +4137,12 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
             soft_gate_T_qk = _scheduled_from_config(
                 step, _total_training_steps, _soft_gate_pool_cfg['qk'])
-            tau_ce_scale_qk = _scheduled_from_config(
-                step, _total_training_steps, _tau_ce_pool_cfg['qk'])
             extra_kw['soft_gate_temperature'] = soft_gate_T_qk
-            extra_kw['tau_ce_grad_scale'] = tau_ce_scale_qk
-            if _pass_soft_gate_pool_schedule_kw:
-                extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
-                extra_kw['soft_gate_T_v'] = _scheduled_from_config(
-                    step, _total_training_steps, _soft_gate_pool_cfg['v'])
-                extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
-                    step, _total_training_steps, _soft_gate_pool_cfg['rst'])
-                extra_kw['tau_ce_grad_scale_qk'] = tau_ce_scale_qk
-                extra_kw['tau_ce_grad_scale_v'] = _scheduled_from_config(
-                    step, _total_training_steps, _tau_ce_pool_cfg['v'])
-                extra_kw['tau_ce_grad_scale_rst'] = _scheduled_from_config(
-                    step, _total_training_steps, _tau_ce_pool_cfg['rst'])
+            extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
+            extra_kw['soft_gate_T_v'] = _scheduled_from_config(
+                step, _total_training_steps, _soft_gate_pool_cfg['v'])
+            extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
+                step, _total_training_steps, _soft_gate_pool_cfg['rst'])
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_execution_prune_kw:
@@ -4336,14 +4193,7 @@ def create_analysis_step(model, sharded_fns=None,
                          soft_gate_t_gompertz_center=0.25,
                          soft_gate_t_gompertz_steepness=8.0,
                          soft_gate_t_pool_specific=False,
-                         soft_gate_pool_schedules=None,
-                         tau_ce_grad_scale_start=1.0,
-                         tau_ce_grad_scale_final=0.0,
-                         tau_ce_grad_scale_hold_frac=0.25,
-                         tau_ce_grad_scale_anneal_end_frac=0.60,
-                         tau_ce_grad_scale_schedule='cosine',
-                         tau_ce_grad_scale_pool_specific=False,
-                         tau_ce_grad_scale_pool_schedules=None):
+                         soft_gate_pool_schedules=None):
     """Create a jit-compiled analysis step (FULL forward, observational).
 
     Runs the model with `analysis=True` and the ANALYSIS variant of
@@ -4353,8 +4203,6 @@ def create_analysis_step(model, sharded_fns=None,
     """
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
-    _pass_soft_gate_pool_schedule_kw = _model_accepts_soft_gate_pool_schedule(
-        model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _soft_gate_runtime_enabled = bool(
@@ -4384,25 +4232,6 @@ def create_analysis_step(model, sharded_fns=None,
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
         soft_gate_pool_schedules if soft_gate_t_pool_specific else None,
         _soft_gate_pool_defaults)
-    _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
-    _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
-    _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
-    _tau_ce_grad_scale_anneal_end_frac = jnp.float32(tau_ce_grad_scale_anneal_end_frac)
-    _tau_ce_grad_scale_schedule = str(tau_ce_grad_scale_schedule).lower()
-    _tau_ce_pool_defaults = {
-        'start': tau_ce_grad_scale_start,
-        'final': tau_ce_grad_scale_final,
-        'hold_frac': tau_ce_grad_scale_hold_frac,
-        'anneal_end_frac': tau_ce_grad_scale_anneal_end_frac,
-        'schedule': tau_ce_grad_scale_schedule,
-        'power': 1.0,
-        'gompertz_center': 0.25,
-        'gompertz_steepness': 8.0,
-    }
-    _tau_ce_pool_cfg = _coerce_pool_schedule_configs(
-        (tau_ce_grad_scale_pool_schedules
-         if tau_ce_grad_scale_pool_specific else None),
-        _tau_ce_pool_defaults)
 
     @jax.jit
     def analysis_step(params, input_ids, attention_mask, step):
@@ -4416,21 +4245,12 @@ def create_analysis_step(model, sharded_fns=None,
         if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
             soft_gate_T_qk = _scheduled_from_config(
                 step, _total_training_steps, _soft_gate_pool_cfg['qk'])
-            tau_ce_scale_qk = _scheduled_from_config(
-                step, _total_training_steps, _tau_ce_pool_cfg['qk'])
             extra_kw['soft_gate_temperature'] = soft_gate_T_qk
-            extra_kw['tau_ce_grad_scale'] = tau_ce_scale_qk
-            if _pass_soft_gate_pool_schedule_kw:
-                extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
-                extra_kw['soft_gate_T_v'] = _scheduled_from_config(
-                    step, _total_training_steps, _soft_gate_pool_cfg['v'])
-                extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
-                    step, _total_training_steps, _soft_gate_pool_cfg['rst'])
-                extra_kw['tau_ce_grad_scale_qk'] = tau_ce_scale_qk
-                extra_kw['tau_ce_grad_scale_v'] = _scheduled_from_config(
-                    step, _total_training_steps, _tau_ce_pool_cfg['v'])
-                extra_kw['tau_ce_grad_scale_rst'] = _scheduled_from_config(
-                    step, _total_training_steps, _tau_ce_pool_cfg['rst'])
+            extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
+            extra_kw['soft_gate_T_v'] = _scheduled_from_config(
+                step, _total_training_steps, _soft_gate_pool_cfg['v'])
+            extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
+                step, _total_training_steps, _soft_gate_pool_cfg['rst'])
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_execution_prune_kw:
@@ -4556,14 +4376,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                             soft_gate_t_gompertz_center=0.25,
                             soft_gate_t_gompertz_steepness=8.0,
                             soft_gate_t_pool_specific=False,
-                            soft_gate_pool_schedules=None,
-                            tau_ce_grad_scale_start=1.0,
-                            tau_ce_grad_scale_final=0.0,
-                            tau_ce_grad_scale_hold_frac=0.25,
-                            tau_ce_grad_scale_anneal_end_frac=0.60,
-                            tau_ce_grad_scale_schedule='cosine',
-                            tau_ce_grad_scale_pool_specific=False,
-                            tau_ce_grad_scale_pool_schedules=None):
+                            soft_gate_pool_schedules=None):
     """Event-only forward probe. No gradients, no optimizer updates.
 
     Two-pass design for v4.1.6.0+ focused spike debugging:
@@ -4577,8 +4390,6 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _pass_spike_kw = _model_accepts_spike_probe(model)
     _pass_focus_kw = _model_accepts_spike_focus_probe(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
-    _pass_soft_gate_pool_schedule_kw = _model_accepts_soft_gate_pool_schedule(
-        model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _soft_gate_runtime_enabled = bool(
@@ -4608,25 +4419,6 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
         soft_gate_pool_schedules if soft_gate_t_pool_specific else None,
         _soft_gate_pool_defaults)
-    _tau_ce_grad_scale_start = jnp.float32(tau_ce_grad_scale_start)
-    _tau_ce_grad_scale_final = jnp.float32(tau_ce_grad_scale_final)
-    _tau_ce_grad_scale_hold_frac = jnp.float32(tau_ce_grad_scale_hold_frac)
-    _tau_ce_grad_scale_anneal_end_frac = jnp.float32(tau_ce_grad_scale_anneal_end_frac)
-    _tau_ce_grad_scale_schedule = str(tau_ce_grad_scale_schedule).lower()
-    _tau_ce_pool_defaults = {
-        'start': tau_ce_grad_scale_start,
-        'final': tau_ce_grad_scale_final,
-        'hold_frac': tau_ce_grad_scale_hold_frac,
-        'anneal_end_frac': tau_ce_grad_scale_anneal_end_frac,
-        'schedule': tau_ce_grad_scale_schedule,
-        'power': 1.0,
-        'gompertz_center': 0.25,
-        'gompertz_steepness': 8.0,
-    }
-    _tau_ce_pool_cfg = _coerce_pool_schedule_configs(
-        (tau_ce_grad_scale_pool_schedules
-         if tau_ce_grad_scale_pool_specific else None),
-        _tau_ce_pool_defaults)
     _topk = int(topk)
 
     @jax.jit
@@ -4643,21 +4435,12 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
         if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
             soft_gate_T_qk = _scheduled_from_config(
                 step, _total_training_steps, _soft_gate_pool_cfg['qk'])
-            tau_ce_scale_qk = _scheduled_from_config(
-                step, _total_training_steps, _tau_ce_pool_cfg['qk'])
             extra_kw['soft_gate_temperature'] = soft_gate_T_qk
-            extra_kw['tau_ce_grad_scale'] = tau_ce_scale_qk
-            if _pass_soft_gate_pool_schedule_kw:
-                extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
-                extra_kw['soft_gate_T_v'] = _scheduled_from_config(
-                    step, _total_training_steps, _soft_gate_pool_cfg['v'])
-                extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
-                    step, _total_training_steps, _soft_gate_pool_cfg['rst'])
-                extra_kw['tau_ce_grad_scale_qk'] = tau_ce_scale_qk
-                extra_kw['tau_ce_grad_scale_v'] = _scheduled_from_config(
-                    step, _total_training_steps, _tau_ce_pool_cfg['v'])
-                extra_kw['tau_ce_grad_scale_rst'] = _scheduled_from_config(
-                    step, _total_training_steps, _tau_ce_pool_cfg['rst'])
+            extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
+            extra_kw['soft_gate_T_v'] = _scheduled_from_config(
+                step, _total_training_steps, _soft_gate_pool_cfg['v'])
+            extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
+                step, _total_training_steps, _soft_gate_pool_cfg['rst'])
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_execution_prune_kw:
@@ -6072,15 +5855,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'soft_gate_t_gompertz_center', 0.25)),
         'soft_gate_t_gompertz_steepness': float(ctx.get(
             'soft_gate_t_gompertz_steepness', 8.0)),
-        'tau_ce_grad_scale': float(m.get('tau_ce_grad_scale', 0.0)),
-        'tau_ce_grad_scale_qk': float(m.get(
-            'tau_ce_grad_scale_qk', m.get('tau_ce_grad_scale', 0.0))),
-        'tau_ce_grad_scale_v': float(m.get(
-            'tau_ce_grad_scale_v', m.get('tau_ce_grad_scale', 0.0))),
-        'tau_ce_grad_scale_rst': float(m.get(
-            'tau_ce_grad_scale_rst', m.get('tau_ce_grad_scale', 0.0))),
-        'tau_ce_grad_scale_schedule': ctx.get(
-            'tau_ce_grad_scale_schedule', 'cosine'),
         'rpe_effective_weight': float(m.get(
             'rpe_effective_weight', m.get('exploration_weight_effective', 0.0))),
         'rpe_schedule_scale': float(m.get('rpe_schedule_scale', 0.0)),
@@ -6788,11 +6562,6 @@ def _print_regular_block(rec, ctx):
                 f"  soft_gate_T: qk={rec['soft_gate_T_qk']:.6f}"
                 f" v={rec['soft_gate_T_v']:.6f}"
                 f" rst={rec['soft_gate_T_rst']:.6f}"
-            )
-            log_message(
-                f"  tau_ce_grad_scale: qk={rec['tau_ce_grad_scale_qk']:.6f}"
-                f" v={rec['tau_ce_grad_scale_v']:.6f}"
-                f" rst={rec['tau_ce_grad_scale_rst']:.6f}"
             )
         else:
             log_message(
@@ -8706,10 +8475,6 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('soft_gate_T_rst', _g('soft_gate_T')):.6f}"
         )
         log_debug_message(
-            f"tau_ce_grad_scale: "
-            f"qk={_g('tau_ce_grad_scale_qk', _g('tau_ce_grad_scale')):.6f} "
-            f"v={_g('tau_ce_grad_scale_v', _g('tau_ce_grad_scale')):.6f} "
-            f"rst={_g('tau_ce_grad_scale_rst', _g('tau_ce_grad_scale')):.6f} "
             f"rpe_effective_weight={_g('rpe_effective_weight', _g('exploration_weight_effective')):.6f} "
             f"rpe_schedule_scale={_g('rpe_schedule_scale'):.3f}"
         )
@@ -10009,22 +9774,10 @@ def main():
     if model_version_cfg != 'spatial-r1-v4.1.6.2':
         eval_effective_prune_enabled = False
         eval_effective_prune_eps_list = []
-    tau_ce_grad_scale_start = float(
-        tcfg.get('tau_ce_grad_scale_start', 1.0))
-    tau_ce_grad_scale_final = float(
-        tcfg.get('tau_ce_grad_scale_final', 0.0))
-    tau_ce_grad_scale_hold_frac = float(
-        tcfg.get('tau_ce_grad_scale_hold_frac', 0.25))
-    tau_ce_grad_scale_anneal_end_frac = float(
-        tcfg.get('tau_ce_grad_scale_anneal_end_frac', 0.60))
-    tau_ce_grad_scale_schedule = str(
-        tcfg.get('tau_ce_grad_scale_schedule', 'cosine'))
-    tau_ce_grad_scale_pool_specific = bool(tcfg.get(
-        'tau_ce_grad_scale_pool_specific', False))
-    tau_ce_grad_scale_pool_schedules = _training_tau_ce_pool_schedules(
-        tcfg, tau_ce_grad_scale_start, tau_ce_grad_scale_final,
-        tau_ce_grad_scale_hold_frac, tau_ce_grad_scale_anneal_end_frac,
-        tau_ce_grad_scale_schedule)
+    ignored_tau_ce_grad_scale_keys = (
+        sorted(k for k in tcfg if k.startswith('tau_ce_grad_scale'))
+        if model_version_cfg == 'spatial-r1-v4.1.6.2'
+        else [])
     rpe_start_frac = float(tcfg.get(
         'rpe_start_frac', 0.20 if model_version_cfg == 'spatial-r1-v4.1.6.2' else 0.0))
     rpe_full_frac = float(tcfg.get(
@@ -10623,33 +10376,6 @@ def main():
                             f"{_label}_gompertz_steepness must be > 0, "
                             f"got {_cfg['gompertz_steepness']}")
 
-    _supported_scalar_schedules = (
-        'constant', 'linear', 'cosine',
-        'log', 'log_linear', 'log_power', 'log_gompertz')
-    if str(tau_ce_grad_scale_schedule).lower() not in _supported_scalar_schedules:
-        raise ValueError(
-            "Unsupported tau_ce_grad_scale_schedule="
-            f"{tau_ce_grad_scale_schedule!r}; expected constant, linear, "
-            "cosine, log, log_linear, log_power, or log_gompertz.")
-    if tau_ce_grad_scale_pool_specific:
-        for _pool, _cfg in tau_ce_grad_scale_pool_schedules.items():
-            _schedule_name = str(_cfg['schedule']).lower()
-            _label = f"tau_ce_grad_scale_{_pool}"
-            if _schedule_name not in _supported_scalar_schedules:
-                raise ValueError(
-                    f"Unsupported {_label}_schedule={_cfg['schedule']!r}; "
-                    "expected constant, linear, cosine, log, log_linear, "
-                    "log_power, or log_gompertz.")
-            if _cfg['start'] < 0.0 or _cfg['final'] < 0.0:
-                raise ValueError(
-                    f"{_label}_start/final must be >= 0, got "
-                    f"{_cfg['start']} -> {_cfg['final']}")
-            if _cfg['anneal_end_frac'] <= _cfg['hold_frac']:
-                raise ValueError(
-                    f"{_label}_anneal_end_frac must be > "
-                    f"{_label}_hold_frac, got "
-                    f"{_cfg['anneal_end_frac']} <= {_cfg['hold_frac']}")
-
     # Build training_config dict for saving in checkpoints
     training_config = {
         'batch_size': batch_size,
@@ -10708,15 +10434,6 @@ def main():
         'effective_prune_eps_list': effective_prune_eps_list,
         'eval_effective_prune_enabled': eval_effective_prune_enabled,
         'eval_effective_prune_eps_list': eval_effective_prune_eps_list,
-        'tau_ce_grad_scale_start': tau_ce_grad_scale_start,
-        'tau_ce_grad_scale_final': tau_ce_grad_scale_final,
-        'tau_ce_grad_scale_hold_frac': tau_ce_grad_scale_hold_frac,
-        'tau_ce_grad_scale_anneal_end_frac': tau_ce_grad_scale_anneal_end_frac,
-        'tau_ce_grad_scale_schedule': tau_ce_grad_scale_schedule,
-        'tau_ce_grad_scale_pool_specific':
-            tau_ce_grad_scale_pool_specific,
-        **_flatten_tau_ce_pool_schedules(
-            tau_ce_grad_scale_pool_schedules),
         'rpe_start_frac': rpe_start_frac,
         'rpe_full_frac': rpe_full_frac,
         'rpe_schedule': rpe_schedule,
@@ -11251,23 +10968,11 @@ def main():
                       f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
                       f"schedule={soft_gate_schedule} "
                       f"{_soft_gate_shape_msg}")
-            print("  Tau CE grad:")
-            print(f"    pool_specific={tau_ce_grad_scale_pool_specific}")
-            if tau_ce_grad_scale_pool_specific:
-                for _pool in POOL_SCHEDULE_NAMES:
-                    _cfg = tau_ce_grad_scale_pool_schedules[_pool]
-                    print(
-                        f"    {_pool}: start={_cfg['start']} "
-                        f"final={_cfg['final']} "
-                        f"hold_frac={_cfg['hold_frac']} "
-                        f"anneal_end_frac={_cfg['anneal_end_frac']} "
-                        f"schedule={_cfg['schedule']}")
-            else:
-                print(f"    start={tau_ce_grad_scale_start} "
-                      f"final={tau_ce_grad_scale_final} "
-                      f"hold_frac={tau_ce_grad_scale_hold_frac} "
-                      f"anneal_end_frac={tau_ce_grad_scale_anneal_end_frac} "
-                      f"schedule={tau_ce_grad_scale_schedule}")
+            print(f"  tau control: tau_lr_mult={tau_lr_mult}; "
+                  "tau_ce_grad_scale=removed")
+            if ignored_tau_ce_grad_scale_keys:
+                print("  tau_ce_grad_scale config fields are ignored in "
+                      "v4162; tau movement is controlled by tau_lr_mult.")
             print("  RPE schedule:")
             print(f"    start_frac={rpe_start_frac} full_frac={rpe_full_frac} "
                   f"final exploration_weight={exploration_weight} "
@@ -11727,13 +11432,6 @@ def main():
         soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
         soft_gate_t_pool_specific=soft_gate_t_pool_specific,
         soft_gate_pool_schedules=soft_gate_pool_schedules,
-        tau_ce_grad_scale_start=tau_ce_grad_scale_start,
-        tau_ce_grad_scale_final=tau_ce_grad_scale_final,
-        tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
-        tau_ce_grad_scale_anneal_end_frac=tau_ce_grad_scale_anneal_end_frac,
-        tau_ce_grad_scale_schedule=tau_ce_grad_scale_schedule,
-        tau_ce_grad_scale_pool_specific=tau_ce_grad_scale_pool_specific,
-        tau_ce_grad_scale_pool_schedules=tau_ce_grad_scale_pool_schedules,
         rpe_start_frac=rpe_start_frac,
         rpe_full_frac=rpe_full_frac,
         rpe_schedule=rpe_schedule,
@@ -11761,14 +11459,7 @@ def main():
         soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
         soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
         soft_gate_t_pool_specific=soft_gate_t_pool_specific,
-        soft_gate_pool_schedules=soft_gate_pool_schedules,
-        tau_ce_grad_scale_start=tau_ce_grad_scale_start,
-        tau_ce_grad_scale_final=tau_ce_grad_scale_final,
-        tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
-        tau_ce_grad_scale_anneal_end_frac=tau_ce_grad_scale_anneal_end_frac,
-        tau_ce_grad_scale_schedule=tau_ce_grad_scale_schedule,
-        tau_ce_grad_scale_pool_specific=tau_ce_grad_scale_pool_specific,
-        tau_ce_grad_scale_pool_schedules=tau_ce_grad_scale_pool_schedules)
+        soft_gate_pool_schedules=soft_gate_pool_schedules)
     eval_prune_step_fns = {}
     if eval_effective_prune_enabled:
         for _eps in eval_effective_prune_eps_list:
@@ -11787,14 +11478,7 @@ def main():
                 soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
                 soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
                 soft_gate_t_pool_specific=soft_gate_t_pool_specific,
-                soft_gate_pool_schedules=soft_gate_pool_schedules,
-                tau_ce_grad_scale_start=tau_ce_grad_scale_start,
-                tau_ce_grad_scale_final=tau_ce_grad_scale_final,
-                tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
-                tau_ce_grad_scale_anneal_end_frac=tau_ce_grad_scale_anneal_end_frac,
-                tau_ce_grad_scale_schedule=tau_ce_grad_scale_schedule,
-                tau_ce_grad_scale_pool_specific=tau_ce_grad_scale_pool_specific,
-                tau_ce_grad_scale_pool_schedules=tau_ce_grad_scale_pool_schedules)
+                soft_gate_pool_schedules=soft_gate_pool_schedules)
     # v4.1: analysis_step is only meaningful when the full analysis
     # kernels exist. Older model versions skip it -analysis logging
     # degrades to empty then.
@@ -11812,14 +11496,7 @@ def main():
             soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
             soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
             soft_gate_t_pool_specific=soft_gate_t_pool_specific,
-            soft_gate_pool_schedules=soft_gate_pool_schedules,
-            tau_ce_grad_scale_start=tau_ce_grad_scale_start,
-            tau_ce_grad_scale_final=tau_ce_grad_scale_final,
-            tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
-            tau_ce_grad_scale_anneal_end_frac=tau_ce_grad_scale_anneal_end_frac,
-            tau_ce_grad_scale_schedule=tau_ce_grad_scale_schedule,
-            tau_ce_grad_scale_pool_specific=tau_ce_grad_scale_pool_specific,
-            tau_ce_grad_scale_pool_schedules=tau_ce_grad_scale_pool_schedules)
+            soft_gate_pool_schedules=soft_gate_pool_schedules)
     else:
         analysis_step_fn = None
     spike_probe_step_fn = None
@@ -11839,14 +11516,7 @@ def main():
             soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
             soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
             soft_gate_t_pool_specific=soft_gate_t_pool_specific,
-            soft_gate_pool_schedules=soft_gate_pool_schedules,
-            tau_ce_grad_scale_start=tau_ce_grad_scale_start,
-            tau_ce_grad_scale_final=tau_ce_grad_scale_final,
-            tau_ce_grad_scale_hold_frac=tau_ce_grad_scale_hold_frac,
-            tau_ce_grad_scale_anneal_end_frac=tau_ce_grad_scale_anneal_end_frac,
-            tau_ce_grad_scale_schedule=tau_ce_grad_scale_schedule,
-            tau_ce_grad_scale_pool_specific=tau_ce_grad_scale_pool_specific,
-            tau_ce_grad_scale_pool_schedules=tau_ce_grad_scale_pool_schedules)
+            soft_gate_pool_schedules=soft_gate_pool_schedules)
     # No current-train-batch debug forward: --debug uses regular scalar
     # train_step metrics. Local spike diagnostics require training.debug_local_spikes=true.
     debug_forward_step_fn = None
@@ -13206,7 +12876,6 @@ def main():
                             soft_gate_t_gompertz_center,
                         'soft_gate_t_gompertz_steepness':
                             soft_gate_t_gompertz_steepness,
-                        'tau_ce_grad_scale_schedule': tau_ce_grad_scale_schedule,
                         'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
                         'd_select': int(cfg['model'].get('d_select', 0) or 0),
                         'd_intensity': int(
@@ -13313,7 +12982,6 @@ def main():
                         soft_gate_t_gompertz_center,
                     'soft_gate_t_gompertz_steepness':
                         soft_gate_t_gompertz_steepness,
-                    'tau_ce_grad_scale_schedule': tau_ce_grad_scale_schedule,
                     'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
                     'd_select': int(cfg['model'].get('d_select', 0) or 0),
                     'd_intensity': int(

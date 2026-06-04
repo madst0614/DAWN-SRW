@@ -382,17 +382,14 @@ def _raw_tau_init_from_cosine_tau(tau_init, eps=1.0e-4):
     return jnp.log(p) - jnp.log1p(-p)
 
 
-def _compute_soft_gate(score, tau, intensity, temperature, tau_ce_grad_scale,
+def _compute_soft_gate(score, tau, intensity, temperature,
                        effective_active_eps=1.0e-6,
                        execution_prune_eps=0.0):
     """Clean v4162 soft annealed DirectTau gate."""
     temperature = jnp.maximum(jnp.asarray(temperature, dtype=jnp.float32),
                               jnp.float32(1.0e-4))
-    tau_ce_grad_scale = jnp.asarray(tau_ce_grad_scale, dtype=jnp.float32)
     execution_prune_eps = jnp.asarray(execution_prune_eps, dtype=jnp.float32)
-    tau_sg = jax.lax.stop_gradient(tau)
-    tau_for_gate = tau_sg + tau_ce_grad_scale * (tau - tau_sg)
-    margin = score - tau_for_gate
+    margin = score - tau
     z = jnp.clip(margin / temperature, -30.0, 30.0)
     soft_weight = jax.nn.sigmoid(z)
     gate_unpruned = soft_weight * intensity
@@ -593,15 +590,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                        P('model', None),          # read [N_local, D]
                        P('model', None),          # write [N_local, D]
                        P(),                       # soft_gate_temperature scalar
-                       P(),                       # tau_ce_grad_scale scalar
                        P(),                       # soft_gate_t_final scalar
                        P()),                      # execution_prune_eps scalar
              out_specs=_out_specs,
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, raw_tau,
                        read_local, write_local,
-                       soft_gate_temperature, tau_ce_grad_scale,
-                       soft_gate_t_final,
+                       soft_gate_temperature, soft_gate_t_final,
                        execution_prune_eps):
         N_local = emb_local.shape[0]
         nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
@@ -716,7 +711,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             (selection_margin, positive_margin, base_gate,
              active_mask) = _compute_soft_gate(
                 rho, tau, intensity, soft_gate_temperature,
-                tau_ce_grad_scale,
                 effective_active_eps=_soft_gate_effective_active_eps,
                 execution_prune_eps=execution_prune_eps)
             strong_mask = positive_margin > _angular_strong_margin
@@ -1685,15 +1679,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                        P('model', None),              # read [N_local, D]
                        P('model', None),              # write [N_local, D]
                        P(),                           # soft_gate_temperature scalar
-                       P(),                           # tau_ce_grad_scale scalar
                        P(),                           # soft_gate_t_final scalar
                        P()),                          # execution_prune_eps scalar
              out_specs=_out_specs,
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, raw_tau,
                               read_local, write_local,
-                              soft_gate_temperature, tau_ce_grad_scale,
-                              soft_gate_t_final, execution_prune_eps):
+                              soft_gate_temperature, soft_gate_t_final,
+                              execution_prune_eps):
         N_local = emb_local.shape[0]
         nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -1808,7 +1801,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             (selection_margin, positive_margin, base_gate,
              active_mask) = _compute_soft_gate(
                 rho, tau, intensity, soft_gate_temperature,
-                tau_ce_grad_scale,
                 effective_active_eps=_soft_gate_effective_active_eps,
                 execution_prune_eps=execution_prune_eps)
             strong_mask = positive_margin > _angular_strong_margin
@@ -2807,9 +2799,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   soft_gate_t_final=0.07,
                   soft_gate_T_qk=None,
                   soft_gate_T_v=None,
-                  tau_ce_grad_scale_qk=None,
-                  tau_ce_grad_scale_v=None,
-                  tau_ce_grad_scale=0.0,
                   execution_prune_eps=0.0):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
@@ -2822,12 +2811,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         soft_gate_temperature if soft_gate_T_qk is None else soft_gate_T_qk)
     soft_gate_T_v = (
         soft_gate_temperature if soft_gate_T_v is None else soft_gate_T_v)
-    tau_ce_grad_scale_qk = (
-        tau_ce_grad_scale
-        if tau_ce_grad_scale_qk is None else tau_ce_grad_scale_qk)
-    tau_ce_grad_scale_v = (
-        tau_ce_grad_scale
-        if tau_ce_grad_scale_v is None else tau_ce_grad_scale_v)
     qk_emb = pool_params['attn_qk_emb']
     qk_read = pool_params['attn_qk_read']
     qk_write = pool_params['attn_qk_write']
@@ -2881,8 +2864,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     raw_tau_QK = jnp.stack([raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
     qk_ret = fused_paired(x, h_QK, qk_emb_unit, raw_tau_QK,
                            qk_read, qk_write,
-                           soft_gate_T_qk, tau_ce_grad_scale_qk,
-                           soft_gate_t_final, execution_prune_eps)
+                           soft_gate_T_qk, soft_gate_t_final,
+                           execution_prune_eps)
     (QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
      qk_strong, qk_positive_margin_active, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
@@ -2915,8 +2898,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     K = QK_out[:, :, 1, :] * qk_scale
     v_ret = fused_single_v(x, h_V, v_emb_unit, raw_tau_all[:, :, 2:3],
                            v_read, v_write,
-                           soft_gate_T_v, tau_ce_grad_scale_v,
-                           soft_gate_t_final, execution_prune_eps)
+                           soft_gate_T_v, soft_gate_t_final,
+                           execution_prune_eps)
     (V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
      v_strong, v_positive_margin_active, v_tau_abs,
      v_dead_pen, v_dead_cnt, v_int_max,
@@ -2997,10 +2980,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         intensity = jnp.exp(_intensity_beta * jnp.tanh(h_int @ e_int.T))
         tau = _tau_from_param(raw_tau[_focus_b, _focus_pos, 0].astype(jnp.float32))[:, None]
         pool_soft_gate_T = soft_gate_T_v if pool_id == 2 else soft_gate_T_qk
-        pool_tau_ce_grad_scale = (
-            tau_ce_grad_scale_v if pool_id == 2 else tau_ce_grad_scale_qk)
         margin, pos_margin, gate, active_mask = _compute_soft_gate(
-            rho, tau, intensity, pool_soft_gate_T, pool_tau_ce_grad_scale,
+            rho, tau, intensity, pool_soft_gate_T,
             execution_prune_eps=execution_prune_eps)
         gate_sum = gate.sum(axis=-1)
         den = jnp.maximum(gate_sum, 1.0)
@@ -3588,8 +3569,6 @@ def _rst_forward(x, pool_params, router_params, rng,
                   soft_gate_temperature=0.07,
                   soft_gate_t_final=0.07,
                   soft_gate_T_rst=None,
-                  tau_ce_grad_scale_rst=None,
-                  tau_ce_grad_scale=0.0,
                   execution_prune_eps=0.0):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
@@ -3599,9 +3578,6 @@ def _rst_forward(x, pool_params, router_params, rng,
     soft_gate_T_rst = (
         soft_gate_temperature
         if soft_gate_T_rst is None else soft_gate_T_rst)
-    tau_ce_grad_scale_rst = (
-        tau_ce_grad_scale
-        if tau_ce_grad_scale_rst is None else tau_ce_grad_scale_rst)
     rst_emb = pool_params['rst_emb']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
@@ -3656,7 +3632,7 @@ def _rst_forward(x, pool_params, router_params, rng,
         intensity = jnp.exp(_intensity_beta * jnp.tanh(h_int @ e_int.T))
         tau = _tau_from_param(raw_tau[_focus_b, _focus_pos, 0].astype(jnp.float32))[:, None]
         margin, pos_margin, gate, active_mask = _compute_soft_gate(
-            rho, tau, intensity, soft_gate_T_rst, tau_ce_grad_scale_rst,
+            rho, tau, intensity, soft_gate_T_rst,
             execution_prune_eps=execution_prune_eps)
         gate_sum = gate.sum(axis=-1)
         den = jnp.maximum(gate_sum, 1.0)
@@ -3723,8 +3699,8 @@ def _rst_forward(x, pool_params, router_params, rng,
         fused_single, _ = sharded_fns
     rst_ret = fused_single(x, h, rst_emb_unit, raw_tau,
                             rst_read, rst_write,
-                            soft_gate_T_rst, tau_ce_grad_scale_rst,
-                            soft_gate_t_final, execution_prune_eps)
+                            soft_gate_T_rst, soft_gate_t_final,
+                            execution_prune_eps)
     (out, active_frac, raw_gate_max, lb_loss, rho_std_slim, gate_sum, active_n_mean,
      strong_frac, positive_margin_mean_active, rst_tau_abs_mean,
      rst_dead_penalty, rst_dead_count, rst_int_max,
@@ -3970,10 +3946,6 @@ class DAWN(nn.Module):
                  soft_gate_T_qk=None,
                  soft_gate_T_v=None,
                  soft_gate_T_rst=None,
-                 tau_ce_grad_scale=0.0,
-                 tau_ce_grad_scale_qk=None,
-                 tau_ce_grad_scale_v=None,
-                 tau_ce_grad_scale_rst=None,
                  rpe_effective_weight=0.0,
                  execution_prune_eps=0.0):
         """Run the shared-pool SRW Transformer forward pass.
@@ -3994,15 +3966,6 @@ class DAWN(nn.Module):
         soft_gate_T_rst = (
             soft_gate_temperature
             if soft_gate_T_rst is None else soft_gate_T_rst)
-        tau_ce_grad_scale_qk = (
-            tau_ce_grad_scale
-            if tau_ce_grad_scale_qk is None else tau_ce_grad_scale_qk)
-        tau_ce_grad_scale_v = (
-            tau_ce_grad_scale
-            if tau_ce_grad_scale_v is None else tau_ce_grad_scale_v)
-        tau_ce_grad_scale_rst = (
-            tau_ce_grad_scale
-            if tau_ce_grad_scale_rst is None else tau_ce_grad_scale_rst)
         B, S = input_ids.shape
         focus_probe_enabled = bool(spike_probe and spike_focus_bpos is not None)
         focus_k = int(spike_probe_topk)
@@ -4321,9 +4284,6 @@ class DAWN(nn.Module):
                     soft_gate_t_final=soft_gate_t_final,
                     soft_gate_T_qk=soft_gate_T_qk,
                     soft_gate_T_v=soft_gate_T_v,
-                    tau_ce_grad_scale=tau_ce_grad_scale,
-                    tau_ce_grad_scale_qk=tau_ce_grad_scale_qk,
-                    tau_ce_grad_scale_v=tau_ce_grad_scale_v,
                     execution_prune_eps=execution_prune_eps)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
@@ -4428,8 +4388,6 @@ class DAWN(nn.Module):
                     soft_gate_temperature=soft_gate_temperature,
                     soft_gate_t_final=soft_gate_t_final,
                     soft_gate_T_rst=soft_gate_T_rst,
-                    tau_ce_grad_scale=tau_ce_grad_scale,
-                    tau_ce_grad_scale_rst=tau_ce_grad_scale_rst,
                     execution_prune_eps=execution_prune_eps)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
@@ -4848,14 +4806,6 @@ class DAWN(nn.Module):
             'soft_gate_T_qk': jnp.asarray(soft_gate_T_qk, dtype=jnp.float32),
             'soft_gate_T_v': jnp.asarray(soft_gate_T_v, dtype=jnp.float32),
             'soft_gate_T_rst': jnp.asarray(soft_gate_T_rst, dtype=jnp.float32),
-            'tau_ce_grad_scale': jnp.asarray(
-                tau_ce_grad_scale_qk, dtype=jnp.float32),
-            'tau_ce_grad_scale_qk': jnp.asarray(
-                tau_ce_grad_scale_qk, dtype=jnp.float32),
-            'tau_ce_grad_scale_v': jnp.asarray(
-                tau_ce_grad_scale_v, dtype=jnp.float32),
-            'tau_ce_grad_scale_rst': jnp.asarray(
-                tau_ce_grad_scale_rst, dtype=jnp.float32),
             'rpe_effective_weight': jnp.asarray(rpe_effective_weight, dtype=jnp.float32),
             'execution_prune_eps': jnp.asarray(execution_prune_eps, dtype=jnp.float32),
             'execution_gate_mass_retained': (
@@ -5441,7 +5391,6 @@ def _angular_gate_kwargs_from_model_cfg(model_cfg):
         'intensity_beta': float(model_cfg.get('intensity_beta', 0.5)),
         'soft_gate_temperature': float(
             model_cfg.get('soft_gate_temperature', 0.07)),
-        'tau_ce_grad_scale': float(model_cfg.get('tau_ce_grad_scale', 0.0)),
         'execution_prune_eps': float(model_cfg.get('execution_prune_eps', 0.0)),
         'soft_gate_effective_active_eps': float(
             model_cfg.get('soft_gate_effective_active_eps', 1.0e-6)),
@@ -5534,14 +5483,14 @@ def _angular_relation_and_intensity(h, emb, d_select, intensity_beta):
 
 def _angular_gate(h, emb, raw_tau, raw_scan_offset=None, d_select=None,
                   intensity_beta=0.5, soft_gate_temperature=0.07,
-                  tau_ce_grad_scale=0.0, execution_prune_eps=0.0,
+                  execution_prune_eps=0.0,
                   soft_gate_effective_active_eps=1.0e-6):
     """Canonical v4162 soft gate for non-sharded inference helpers."""
     rho, intensity = _angular_relation_and_intensity(
         h, emb, d_select, intensity_beta)
     tau = _tau_from_param(raw_tau)
     _, _, gate, _ = _compute_soft_gate(
-        rho, tau, intensity, soft_gate_temperature, tau_ce_grad_scale,
+        rho, tau, intensity, soft_gate_temperature,
         effective_active_eps=soft_gate_effective_active_eps,
         execution_prune_eps=execution_prune_eps)
     return gate.astype(jnp.float32)
