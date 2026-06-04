@@ -25,9 +25,9 @@ model:
 
   # One-time local tau initialization from the first training batch
   tau_init_mode: quantile_frac
-  tau_init_target_qk_frac: 0.25
+  tau_init_target_qk_frac: 0.12
   tau_init_target_v_frac: 0.04
-  tau_init_target_rst_frac: 0.04
+  tau_init_target_rst_frac: 0.02
 training:
   batch_size: 128
   mesh_model: 1
@@ -41,7 +41,7 @@ training:
   warmup_ratio: 0.06
   weight_decay: 0.1
   pool_weight_decay: 0.0
-  tau_lr_mult: 0.005
+  tau_lr_mult: 0.001
   tau_grad_clip: 2.0
   router_proj_lr_mult: 1.0
   router_proj_grad_clip: 2.0
