@@ -2737,7 +2737,8 @@ class Router(nn.Module):
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Legacy alias accepted from older configs.
     router_dropout: float = 0.1
-    # Explicit cosine-space tau initialization is required for v4.1.6.2.
+    # Constructor receives cosine-space tau values. The train driver may use
+    # safe placeholders before one-time quantile calibration.
     tau_init_attn_qk: Optional[float] = None
     tau_init_attn_v: Optional[float] = None
     tau_init_rst: Optional[float] = None
@@ -3915,7 +3916,8 @@ class DAWN(nn.Module):
     n_chunks_know: int = 1    # Legacy config alias; prefer n_chunks_rst.
     n_chunks_qk: int = 1     # N-axis chunking for qk pool
     n_chunks_v: int = 1      # N-axis chunking for v pool
-    # Explicit cosine-space tau initialization is required for v4.1.6.2.
+    # Constructor receives cosine-space tau values. The train driver may use
+    # safe placeholders before one-time quantile calibration.
     tau_init_attn_qk: Optional[float] = None
     tau_init_attn_v: Optional[float] = None
     tau_init_rst: Optional[float] = None
@@ -5443,6 +5445,75 @@ def _angular_gate_kwargs_from_model_cfg(model_cfg):
         'execution_prune_eps': float(model_cfg.get('execution_prune_eps', 0.0)),
         'soft_gate_effective_active_eps': float(
             model_cfg.get('soft_gate_effective_active_eps', 1.0e-6)),
+    }
+
+
+def _tau_init_calibration_scores(params, input_ids, d_select,
+                                 max_tokens=128):
+    """Sample fresh-init cosine scores without changing forward semantics.
+
+    The sample uses the first block's freshly initialized normalized route
+    states and the shared v4162 router/pool parameters. Selection rho follows
+    the sharded train path exactly: normalize only the selection dimensions,
+    cast directions to bf16, then compute cosine dot products.
+    """
+    d_select = int(d_select)
+    max_tokens = int(max_tokens)
+    if d_select <= 0:
+        raise ValueError(f"d_select must be > 0, got {d_select}")
+    if max_tokens <= 0:
+        raise ValueError(
+            f"tau init calibration max_tokens must be > 0, got {max_tokens}")
+
+    input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
+    if input_ids.ndim != 2:
+        raise ValueError(
+            "tau init calibration input_ids must be rank 2 [batch, seq], "
+            f"got shape={input_ids.shape}")
+    _, seq_len = input_ids.shape
+    total_tokens = int(input_ids.size)
+    token_count = min(max_tokens, total_tokens)
+    token_idx = (
+        jnp.arange(token_count, dtype=jnp.int32) * total_tokens
+        // token_count)
+    token_ids = input_ids.reshape(-1)[token_idx]
+    positions = token_idx % seq_len
+
+    x = (
+        params['token_emb']['embedding'][token_ids]
+        + params['pos_emb']['embedding'][positions]
+    ).astype(jnp.float32)
+    block0 = params['block_0']
+    attn_x = _layer_norm(
+        x, block0['norm1']['scale'], block0['norm1']['bias'])
+    rst_x = _layer_norm(
+        x, block0['norm2']['scale'], block0['norm2']['bias'])
+    router = params['router']
+    h_all = (
+        attn_x @ router['proj_attn']['kernel']
+        + router['proj_attn']['bias'])
+    h_q, h_k, h_v = jnp.split(h_all, 3, axis=-1)
+    h_rst = (
+        rst_x @ router['proj_rst']['kernel']
+        + router['proj_rst']['bias'])
+
+    def _selection_rho(h, emb):
+        q_sel = h[..., :d_select].astype(jnp.float32)
+        route_sel = emb[:, :d_select].astype(jnp.float32)
+        q_sel_unit = _forward_unit_direction(q_sel).astype(jnp.bfloat16)
+        route_sel_unit = _forward_unit_direction(
+            route_sel).astype(jnp.bfloat16)
+        return (q_sel_unit @ route_sel_unit.T).astype(jnp.float32)
+
+    pool = params['neuron_pool']
+    qk_emb = pool['attn_qk_emb']
+    v_emb = pool['attn_v_emb']
+    rst_emb = pool['rst_emb']
+    return {
+        'q': _selection_rho(h_q, qk_emb),
+        'k': _selection_rho(h_k, qk_emb),
+        'v': _selection_rho(h_v, v_emb),
+        'rst': _selection_rho(h_rst, rst_emb),
     }
 
 

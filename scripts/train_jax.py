@@ -83,7 +83,11 @@ try:
     from models.dawn_srw_v4161 import DAWN as DAWN_SRW_V4161
 except ImportError:
     DAWN_SRW_V4161 = None
-from models.dawn_srw_v4162 import DAWN as DAWN_SRW_V4162
+from models.dawn_srw_v4162 import (
+    DAWN as DAWN_SRW_V4162,
+    _raw_tau_init_from_cosine_tau as _v4162_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4162_tau_init_calibration_scores,
+)
 
 # ============================================================
 # Constants
@@ -581,6 +585,70 @@ def _dawn_v4152_kwargs(cfg):
     return kw
 
 
+def _v4162_tau_init_config(cfg):
+    """Parse and validate v4162's explicit or one-time quantile init mode."""
+    model_cfg = cfg['model']
+    training_cfg = cfg['training']
+
+    def _cfg_get(name, default=None):
+        if name in model_cfg:
+            return model_cfg[name]
+        if name in training_cfg:
+            return training_cfg[name]
+        return default
+
+    mode = str(_cfg_get('tau_init_mode', 'explicit')).strip().lower()
+    if mode not in ('explicit', 'quantile_frac'):
+        raise ValueError(
+            "v4162 tau_init_mode must be 'explicit' or 'quantile_frac', "
+            f"got {mode!r}.")
+
+    parsed = {'mode': mode}
+    if mode == 'explicit':
+        explicit = {
+            'qk': _cfg_get('tau_init_attn_qk', None),
+            'v': _cfg_get('tau_init_attn_v', None),
+            'rst': _cfg_get('tau_init_rst', None),
+        }
+        if any(value is None for value in explicit.values()):
+            raise ValueError(
+                "v4162 requires explicit cosine-space tau_init_attn_qk/v/rst.")
+        parsed['explicit'] = explicit
+        return parsed
+
+    targets = {}
+    for pool in ('qk', 'v', 'rst'):
+        name = f'tau_init_target_{pool}_frac'
+        value = _cfg_get(name, None)
+        if value is None:
+            raise ValueError(
+                f"v4162 tau_init_mode=quantile_frac requires {name}.")
+        value = float(value)
+        if not np.isfinite(value) or not (0.0 < value < 1.0):
+            raise ValueError(f"{name} must be in (0, 1), got {value}.")
+        targets[pool] = value
+
+    tau_min = float(_cfg_get('tau_init_min', -1.0))
+    tau_max = float(_cfg_get('tau_init_max', 1.0))
+    if (not np.isfinite(tau_min) or not np.isfinite(tau_max)
+            or tau_min < -1.0 or tau_max > 1.0 or tau_min > tau_max):
+        raise ValueError(
+            "tau_init_min/max must be finite cosine values satisfying "
+            f"-1 <= min <= max <= 1, got {tau_min}/{tau_max}.")
+    calibration_tokens = int(_cfg_get('tau_init_calibration_tokens', 128))
+    if calibration_tokens <= 0:
+        raise ValueError(
+            "tau_init_calibration_tokens must be > 0, got "
+            f"{calibration_tokens}.")
+    parsed.update({
+        'targets': targets,
+        'tau_min': tau_min,
+        'tau_max': tau_max,
+        'calibration_tokens': calibration_tokens,
+    })
+    return parsed
+
+
 def _dawn_srw_kwargs(cfg):
     """Official DAWN-SRW path; accepts n_rst while preserving n_know configs."""
     kw = _dawn_v4152_kwargs(cfg)
@@ -627,15 +695,17 @@ def _dawn_srw_kwargs(cfg):
             return val
 
         if version == 'spatial-r1-v4.1.6.2':
-            explicit_qk = _cfg_get('tau_init_attn_qk', None)
-            explicit_v = _cfg_get('tau_init_attn_v', None)
-            explicit_rst = _cfg_get('tau_init_rst', None)
-            if explicit_qk is None or explicit_v is None or explicit_rst is None:
-                raise ValueError(
-                    "v4162 requires explicit cosine-space tau_init_attn_qk/v/rst.")
-            kw['tau_init_attn_qk'] = explicit_qk
-            kw['tau_init_attn_v'] = explicit_v
-            kw['tau_init_rst'] = explicit_rst
+            tau_init_cfg = _v4162_tau_init_config(cfg)
+            if tau_init_cfg['mode'] == 'explicit':
+                kw['tau_init_attn_qk'] = tau_init_cfg['explicit']['qk']
+                kw['tau_init_attn_v'] = tau_init_cfg['explicit']['v']
+                kw['tau_init_rst'] = tau_init_cfg['explicit']['rst']
+            else:
+                # Safe constructor placeholders. Fresh quantile_frac starts
+                # overwrite these biases once, before optimizer init/training.
+                kw['tau_init_attn_qk'] = 0.0
+                kw['tau_init_attn_v'] = 0.0
+                kw['tau_init_rst'] = 0.0
         else:
             kw['legacy_count_init_attn_qk'] = _legacy_count_init_cfg(
                 'legacy_count_init_attn_qk')
@@ -861,6 +931,131 @@ def build_model_from_config(cfg):
     if version in ('spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
         print(f"route dims: d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
+
+
+def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
+                                     tau_init_cfg):
+    """Compute host-side quantiles from a small deterministic score sample."""
+    d_select = cfg['model'].get(
+        'd_select', cfg['training'].get('d_select', None))
+    if d_select is None:
+        raise ValueError(
+            "v4162 tau_init_mode=quantile_frac requires model.d_select.")
+
+    # Keep the one-time JIT signature small: calibration needs only route
+    # geometry, not read/write tensors, tau params, or LM output weights.
+    score_params = {
+        'token_emb': params['token_emb'],
+        'pos_emb': params['pos_emb'],
+        'block_0': {
+            'norm1': params['block_0']['norm1'],
+            'norm2': params['block_0']['norm2'],
+        },
+        'router': {
+            'proj_attn': params['router']['proj_attn'],
+            'proj_rst': params['router']['proj_rst'],
+        },
+        'neuron_pool': {
+            'attn_qk_emb': params['neuron_pool']['attn_qk_emb'],
+            'attn_v_emb': params['neuron_pool']['attn_v_emb'],
+            'rst_emb': params['neuron_pool']['rst_emb'],
+        },
+    }
+    score_fn = jax.jit(partial(
+        _v4162_tau_init_calibration_scores,
+        d_select=int(d_select),
+        max_tokens=tau_init_cfg['calibration_tokens'],
+    ))
+    sampled = jax.device_get(score_fn(score_params, input_ids))
+    scores = {
+        name: np.asarray(value, dtype=np.float32).reshape(-1)
+        for name, value in sampled.items()
+    }
+    scores['qk'] = np.concatenate([scores['q'], scores['k']])
+
+    tau = {}
+    estimated_active = {}
+    for pool in ('qk', 'v', 'rst'):
+        target = tau_init_cfg['targets'][pool]
+        quantile_tau = float(np.quantile(scores[pool], 1.0 - target))
+        quantile_tau = float(np.clip(
+            quantile_tau, tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
+        tau[pool] = quantile_tau
+        estimated_active[pool] = float(np.mean(scores[pool] > quantile_tau))
+
+    return {
+        'type': 'tau_init',
+        'tau_init_mode': 'quantile_frac',
+        'tau_init_target_frac': dict(tau_init_cfg['targets']),
+        'tau_init_quantile_tau': tau,
+        'tau_init_est_active': estimated_active,
+        'tau_init_target_qk_frac': tau_init_cfg['targets']['qk'],
+        'tau_init_target_v_frac': tau_init_cfg['targets']['v'],
+        'tau_init_target_rst_frac': tau_init_cfg['targets']['rst'],
+        'tau_init_quantile_tau_qk': tau['qk'],
+        'tau_init_quantile_tau_v': tau['v'],
+        'tau_init_quantile_tau_rst': tau['rst'],
+        'tau_init_est_active_qk': estimated_active['qk'],
+        'tau_init_est_active_v': estimated_active['v'],
+        'tau_init_est_active_rst': estimated_active['rst'],
+        'tau_init_est_active_q': float(np.mean(scores['q'] > tau['qk'])),
+        'tau_init_est_active_k': float(np.mean(scores['k'] > tau['qk'])),
+        'tau_init_calibration': {
+            'batch': 'first_train_batch_host0',
+            'token_sampling': 'evenly_spaced_flat',
+            'tokens': int(sampled['q'].shape[0]),
+            'neurons_qk': int(sampled['q'].shape[1]),
+            'neurons_v': int(sampled['v'].shape[1]),
+            'neurons_rst': int(sampled['rst'].shape[1]),
+        },
+    }
+
+
+def _set_v4162_quantile_tau_biases(params, tau_summary):
+    """Overwrite only v4162 raw tau biases, preserving the pytree structure."""
+    tau = tau_summary['tau_init_quantile_tau']
+    raw_qk = _v4162_raw_tau_init_from_cosine_tau(tau['qk'])
+    raw_v = _v4162_raw_tau_init_from_cosine_tau(tau['v'])
+    raw_rst = _v4162_raw_tau_init_from_cosine_tau(tau['rst'])
+
+    def _replace(path, value):
+        keys = tuple(
+            str(p.key if hasattr(p, 'key') else p)
+            for p in path)
+        if keys[-3:] == ('router', 'raw_tau_attn', 'bias'):
+            return jnp.stack([raw_qk, raw_qk, raw_v]).astype(value.dtype)
+        if keys[-3:] == ('router', 'raw_tau_rst', 'bias'):
+            return jnp.full_like(value, raw_rst)
+        return value
+
+    return jax.tree.map_with_path(_replace, params)
+
+
+def _v4162_tau_init_summary_lines(summary):
+    targets = summary['tau_init_target_frac']
+    tau = summary['tau_init_quantile_tau']
+    active = summary['tau_init_est_active']
+    sample = summary['tau_init_calibration']
+    return [
+        "tau_init_mode=quantile_frac",
+        "tau_init_target_frac["
+        f"qk={targets['qk']:.3f} v={targets['v']:.3f} "
+        f"rst={targets['rst']:.3f}]",
+        "tau_init_quantile_tau["
+        f"qk={tau['qk']:.6f} v={tau['v']:.6f} rst={tau['rst']:.6f}]",
+        "tau_init_est_active["
+        f"qk={active['qk']:.6f} v={active['v']:.6f} "
+        f"rst={active['rst']:.6f}]",
+        "tau_init_est_active_qk_split["
+        f"q={summary['tau_init_est_active_q']:.6f} "
+        f"k={summary['tau_init_est_active_k']:.6f}]",
+        "tau_init_calibration_sample["
+        f"batch={sample['batch']} token_sampling={sample['token_sampling']} "
+        f"tokens={sample['tokens']} "
+        f"neurons_qk={sample['neurons_qk']} "
+        f"neurons_v={sample['neurons_v']} "
+        f"neurons_rst={sample['neurons_rst']}]",
+    ]
 
 
 # ============================================================
@@ -9602,6 +9797,10 @@ def main():
     # feature switches themselves live in training: config.
     tcfg = cfg['training']
     model_version_cfg = cfg['model'].get('model_version', 'dawn_srw')
+    tau_init_cfg = (
+        _v4162_tau_init_config(cfg)
+        if model_version_cfg == 'spatial-r1-v4.1.6.2'
+        else None)
     # Optional config-driven resume. CLI --resume remains an override for
     # ad-hoc launches, but diagnostic configs can be one-shot.
     configured_resume_from = (
@@ -10593,6 +10792,17 @@ def main():
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
     if model_version_cfg == 'spatial-r1-v4.1.6.2':
+        training_config['tau_init_mode'] = tau_init_cfg['mode']
+        if tau_init_cfg['mode'] == 'quantile_frac':
+            training_config.update({
+                'tau_init_target_qk_frac': tau_init_cfg['targets']['qk'],
+                'tau_init_target_v_frac': tau_init_cfg['targets']['v'],
+                'tau_init_target_rst_frac': tau_init_cfg['targets']['rst'],
+                'tau_init_min': tau_init_cfg['tau_min'],
+                'tau_init_max': tau_init_cfg['tau_max'],
+                'tau_init_calibration_tokens':
+                    tau_init_cfg['calibration_tokens'],
+            })
         for _clean_key in list(training_config.keys()):
             if (_clean_key.startswith('cb1a_')
                     or _clean_key.startswith('removed_margin_reg_')
@@ -11073,6 +11283,7 @@ def main():
             print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
             gate_msg = (
                 f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
+                f"tau_init_mode={tau_init_cfg['mode']} "
                 f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
                 f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
                 f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
@@ -11169,6 +11380,35 @@ def main():
                 print("\nNo checkpoint found. Starting from scratch.")
             else:
                 print("\nStarting from scratch (--from-scratch).")
+
+    tau_init_summary = None
+    _has_resume_checkpoint = bool(
+        resume_path is not None and _file_exists(resume_path))
+    if (model_version_cfg == 'spatial-r1-v4.1.6.2'
+            and tau_init_cfg['mode'] == 'quantile_frac'
+            and not _has_resume_checkpoint):
+        if len(train_loader) <= 0:
+            raise ValueError(
+                "tau_init_mode=quantile_frac requires at least one "
+                "training batch for calibration.")
+        _tau_init_summary_json = None
+        if is_host0:
+            calibration_input_ids, _ = next(iter(train_loader))
+            tau_init_summary = _compute_v4162_quantile_tau_init(
+                params, calibration_input_ids, cfg, tau_init_cfg)
+            _tau_init_summary_json = json.dumps(tau_init_summary)
+        _tau_init_summary_json = _broadcast_str_from_host0(
+            _tau_init_summary_json, max_len=4096)
+        if not _tau_init_summary_json:
+            raise RuntimeError(
+                "Failed to broadcast quantile tau initialization summary.")
+        tau_init_summary = json.loads(_tau_init_summary_json)
+        params = _set_v4162_quantile_tau_biases(params, tau_init_summary)
+        if is_host0:
+            print("\n=== Quantile tau initialization ===", flush=True)
+            for _line in _v4162_tau_init_summary_lines(tau_init_summary):
+                print(_line, flush=True)
+
     _print_v4159_tau_bias("effective pre-shard", params)
 
     # Fail-fast check: global_step must match across hosts after resume.
@@ -12247,6 +12487,8 @@ def main():
         log_message(f"Parameters: {n_params:,}")
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
         log_message(f"Total steps: {total_steps}")
+        if tau_init_summary is not None:
+            log_jsonl(tau_init_summary)
         log_message(
             "Resume log append policy: "
             f"training={training_log_append_on_resume} "
