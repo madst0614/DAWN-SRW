@@ -7,7 +7,7 @@ Implemented concepts:
 - cosine-space tau reference with bounded sigmoid min/max mapping
 - soft sigmoid tau/T DirectTau gate
 - scheduled soft-gate temperature input
-- scheduled tau CE-gradient scale input
+- tau movement controlled by optimizer-side tau_lr_mult
 - delayed RPE/exploration weight input
 - train-time effective gate statistics
 - validation-time execution pruning through execution_prune_eps
@@ -289,8 +289,7 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 #   rho              = cosine(q_select, signature)
 #   raw_tau          = learned cosine-space reference
 #   tau              = -1 + 2 * sigmoid(raw_tau)
-#   tau_for_gate     = stop_gradient(tau) + scheduled CE-gradient blend
-#   margin           = rho - tau_for_gate
+#   margin           = rho - tau
 #   soft_weight      = sigmoid(margin / temperature)
 #   gate             = soft_weight * intensity
 #   den              = max(sum(gate), 1.0)
@@ -461,8 +460,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
 
     Soft annealed DirectTau gate:
         rho              = cosine(q_select, signature)
-        tau_for_gate     = stop_gradient(tau) plus scheduled CE-gradient blend
-        margin           = rho - tau_for_gate
+        margin           = rho - tau
         gate             = sigmoid(margin / T) * intensity
         den              = max(sum(gate), 1.0)
 
