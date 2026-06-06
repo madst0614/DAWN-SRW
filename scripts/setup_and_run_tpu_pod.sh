@@ -15,16 +15,16 @@ set -euo pipefail
 
 GH_TOKEN="${GH_TOKEN:-}"
 if [ -n "$GH_TOKEN" ]; then
-    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/madst0614/dawn-spatial.git"
+    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/madst0614/DAWN-SRW.git"
 else
-    REPO_URL="https://github.com/madst0614/dawn-spatial.git"
+    REPO_URL="https://github.com/madst0614/DAWN-SRW.git"
 fi
 BRANCH="${BRANCH:?ERROR: BRANCH env var not set}"
 CONFIG="${CONFIG:?ERROR: CONFIG env var not set}"
-WORK_DIR="$HOME/dawn-spatial"
+WORK_DIR="$HOME/DAWN-SRW"
 
 echo "============================================"
-echo "Host $(hostname) — Setting up TPU Pod training"
+echo "Host $(hostname) -- Setting up TPU Pod training"
 echo "  Branch: $BRANCH"
 echo "  Config: $CONFIG"
 echo "============================================"
@@ -33,7 +33,7 @@ echo "============================================"
 echo "[1/4] Installing dependencies..."
 pip install --upgrade pip -q
 pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-pip install flax optax numpy pyyaml gcsfs -q
+pip install flax optax numpy pyyaml gcsfs conllu transformers matplotlib -q
 
 # 2. Deploy code via git (clone or update)
 echo "[2/4] Syncing repo (branch: $BRANCH)..."
@@ -50,10 +50,9 @@ if [ -d "$WORK_DIR/.git" ]; then
     fi
 else
     echo "  Fresh clone (branch: $BRANCH)..."
-    cd "$HOME"
-    rm -rf dawn-spatial
-    git clone -b "$BRANCH" --single-branch --depth 1 "$REPO_URL" dawn-spatial
-    cd dawn-spatial
+    rm -rf "$WORK_DIR"
+    git clone -b "$BRANCH" --single-branch --depth 1 "$REPO_URL" "$WORK_DIR"
+    cd "$WORK_DIR"
 fi
 
 # 3. Skip standalone JAX preflight.

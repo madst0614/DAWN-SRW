@@ -1,15 +1,18 @@
 #!/bin/bash
 # =============================================================================
-# TPU Pod Launcher — run from local machine or Cloud Shell
+# TPU VM/Pod Launcher -- run from local machine or Cloud Shell
 # =============================================================================
 # Sends setup_and_run_tpu_pod.sh to all workers with the specified branch/config.
+# Supports single-host TPU VMs such as v4-8 and multi-host TPU pods such as
+# v4-64 or v4-128. This script assumes the TPU VM/queued resource already exists.
 #
 # Usage:
+#   bash scripts/launch_tpu_pod.sh --tpu spatial-analysis1 --config configs/v4_8.yaml
 #   bash scripts/launch_tpu_pod.sh --tpu dawn-400m-v4-64 --branch main --config configs/v4_64.yaml
 #   bash scripts/launch_tpu_pod.sh  # uses defaults (v4-64 settings)
 #
 # Prerequisites:
-#   1. TPU VM created:
+#   1. TPU VM or queued resource created separately:
 #      gcloud compute tpus tpu-vm create dawn-400m-v4-64 \
 #        --zone=us-central2-b --accelerator-type=v4-64 \
 #        --version=tpu-vm-v4-base --spot
@@ -47,7 +50,10 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -h|--help)
-            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch] [--debug [N]]"
+            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch] [--resume-from CKPT_OR_RUN] [--debug [N]]"
+            echo ""
+            echo "Supports single-host TPU VMs such as v4-8 and multi-host TPU pods such as v4-64/v4-128."
+            echo "The TPU VM or queued resource must already exist; this script only launches setup/training."
             echo ""
             echo "  --tpu      TPU VM name         (default: $TPU_NAME)"
             echo "  --zone     GCP zone            (default: $ZONE)"
@@ -68,7 +74,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "============================================"
-echo "Launching TPU Pod training"
+echo "Launching TPU VM/Pod training"
 echo "  TPU:     $TPU_NAME"
 echo "  Zone:    $ZONE"
 echo "  Project: $PROJECT"
@@ -87,9 +93,9 @@ gcloud compute tpus tpu-vm describe "$TPU_NAME" \
     --format="value(state)"
 
 if [ -n "$GH_TOKEN" ]; then
-    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/madst0614/dawn-spatial.git"
+    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/madst0614/DAWN-SRW.git"
 else
-    REPO_URL="https://github.com/madst0614/dawn-spatial.git"
+    REPO_URL="https://github.com/madst0614/DAWN-SRW.git"
 fi
 
 # Build inline bootstrap: clone/update repo first, then run setup script
@@ -102,20 +108,20 @@ GH_TOKEN='${GH_TOKEN}'
 TRAIN_ARGS='${TRAIN_ARGS}'
 export BRANCH CONFIG GH_TOKEN TRAIN_ARGS
 
-# Bootstrap: ensure ~/dawn-spatial exists with the right branch
-if [ -d ~/dawn-spatial/.git ]; then
-    cd ~/dawn-spatial
+# Bootstrap: ensure ~/DAWN-SRW exists with the right branch
+if [ -d ~/DAWN-SRW/.git ]; then
+    cd ~/DAWN-SRW
     git fetch origin "\$BRANCH" --depth 1
     git checkout -B "\$BRANCH" FETCH_HEAD
     echo "Repo updated to \$BRANCH"
 else
-    rm -rf ~/dawn-spatial
-    git clone -b "\$BRANCH" --single-branch --depth 1 "\$REPO_URL" ~/dawn-spatial
+    rm -rf ~/DAWN-SRW
+    git clone -b "\$BRANCH" --single-branch --depth 1 "\$REPO_URL" ~/DAWN-SRW
     echo "Repo cloned (branch: \$BRANCH)"
 fi
 
 # Run the setup+training script (nohup inside will detach training)
-cd ~/dawn-spatial
+cd ~/DAWN-SRW
 bash scripts/setup_and_run_tpu_pod.sh
 EOFCMD
 
