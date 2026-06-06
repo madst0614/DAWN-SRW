@@ -16,7 +16,7 @@ model:
   router_dropout: 0.0
   gradient_checkpointing: true
   d_route: 128
-  d_select: 64
+  d_select: 96
   n_qk: 1480
   n_v: 7330
   n_rst: 20560
@@ -25,7 +25,7 @@ model:
 
   # One-time local tau initialization from the first training batch
   tau_init_mode: quantile_frac
-  tau_init_target_qk_frac: 0.12
+  tau_init_target_qk_frac: 0.06
   tau_init_target_v_frac: 0.04
   tau_init_target_rst_frac: 0.02
 training:
@@ -82,29 +82,29 @@ training:
   soft_gate_t_pool_specific: true
   soft_gate_effective_active_eps: 1.0e-06
 
-  soft_gate_t_qk_start: 0.8
+  soft_gate_t_qk_start: 0.30
   soft_gate_t_qk_final: 0.001
   soft_gate_t_qk_hold_frac: 0.0
-  soft_gate_t_qk_anneal_end_frac: 0.80
+  soft_gate_t_qk_anneal_end_frac: 0.35
   soft_gate_t_qk_schedule: log_gompertz
-  soft_gate_t_qk_gompertz_center: 0.12
-  soft_gate_t_qk_gompertz_steepness: 10.0
+  soft_gate_t_qk_gompertz_center: 0.040
+  soft_gate_t_qk_gompertz_steepness: 12.0
 
-  soft_gate_t_v_start: 0.35
+  soft_gate_t_v_start: 0.14
   soft_gate_t_v_final: 0.001
   soft_gate_t_v_hold_frac: 0.0
-  soft_gate_t_v_anneal_end_frac: 0.60
+  soft_gate_t_v_anneal_end_frac: 0.30
   soft_gate_t_v_schedule: log_gompertz
-  soft_gate_t_v_gompertz_center: 0.05
-  soft_gate_t_v_gompertz_steepness: 10.0
+  soft_gate_t_v_gompertz_center: 0.030
+  soft_gate_t_v_gompertz_steepness: 12.0
 
-  soft_gate_t_rst_start: 0.35
+  soft_gate_t_rst_start: 0.14
   soft_gate_t_rst_final: 0.001
   soft_gate_t_rst_hold_frac: 0.0
-  soft_gate_t_rst_anneal_end_frac: 0.60
+  soft_gate_t_rst_anneal_end_frac: 0.30
   soft_gate_t_rst_schedule: log_gompertz
-  soft_gate_t_rst_gompertz_center: 0.05
-  soft_gate_t_rst_gompertz_steepness: 10.0
+  soft_gate_t_rst_gompertz_center: 0.030
+  soft_gate_t_rst_gompertz_steepness: 12.0
 
 
   regular_diagnostics_level: compact
