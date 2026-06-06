@@ -5,9 +5,9 @@ Strict behavior:
   - Before QR is ACTIVE: only read queued-resource state. No SSH probing.
   - QR MISSING: create Spot queued-resource.
   - QR WAITING/PROVISIONING/etc.: wait quietly; log only state changes.
-  - QR ACTIVE: start SSH readiness loop.
+  - QR ACTIVE: start SSH readiness loop every 20 seconds by default.
   - ACTIVE + SSH_READY: call scripts/launch_tpu_pod.sh exactly once for this keeper process.
-  - ACTIVE + SSH_NOT_READY longer than timeout: delete QR/node and recreate.
+  - ACTIVE + SSH_NOT_READY longer than timeout, 300 seconds by default: delete QR/node and recreate.
   - QR FAILED/SUSPENDED/etc.: delete QR/node and recreate.
   - All events are written to log.txt by default.
   - No repeated same-state spam unless --verbose is used.
@@ -77,12 +77,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--project", default="dawn-486218")
     p.add_argument("--runtime-version", default="tpu-ubuntu2204-base")
     p.add_argument("--queued-resource-id", default=None)
-    p.add_argument("--poll-seconds", type=int, default=60)
+    p.add_argument("--poll-seconds", type=int, default=20)
     p.add_argument(
         "--ssh-ready-timeout-seconds",
         type=int,
         default=300,
-        help="After QR ACTIVE, recreate if SSH is not ready within this many seconds.",
+        help="After QR ACTIVE, recreate if SSH is not ready within this many seconds. Default: 300.",
     )
     p.add_argument(
         "--local-repo",
