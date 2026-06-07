@@ -82,7 +82,7 @@ training:
   soft_gate_t_pool_specific: true
   soft_gate_effective_active_eps: 1.0e-06
 
-  soft_gate_t_qk_start: 0.30
+  soft_gate_t_qk_start: 0.075
   soft_gate_t_qk_final: 0.001
   soft_gate_t_qk_hold_frac: 0.0
   soft_gate_t_qk_anneal_end_frac: 0.35
@@ -90,7 +90,7 @@ training:
   soft_gate_t_qk_gompertz_center: 0.040
   soft_gate_t_qk_gompertz_steepness: 12.0
 
-  soft_gate_t_v_start: 0.14
+  soft_gate_t_v_start: 0.075
   soft_gate_t_v_final: 0.001
   soft_gate_t_v_hold_frac: 0.0
   soft_gate_t_v_anneal_end_frac: 0.30
@@ -98,14 +98,13 @@ training:
   soft_gate_t_v_gompertz_center: 0.030
   soft_gate_t_v_gompertz_steepness: 12.0
 
-  soft_gate_t_rst_start: 0.14
+  soft_gate_t_rst_start: 0.075
   soft_gate_t_rst_final: 0.001
   soft_gate_t_rst_hold_frac: 0.0
   soft_gate_t_rst_anneal_end_frac: 0.30
   soft_gate_t_rst_schedule: log_gompertz
   soft_gate_t_rst_gompertz_center: 0.030
   soft_gate_t_rst_gompertz_steepness: 12.0
-
 
   regular_diagnostics_level: compact
   regular_current_eps:
