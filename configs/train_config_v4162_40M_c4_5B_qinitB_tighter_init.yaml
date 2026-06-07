@@ -82,13 +82,13 @@ training:
   soft_gate_t_pool_specific: true
   soft_gate_effective_active_eps: 1.0e-06
 
-  soft_gate_t_qk_start: 0.8
+  soft_gate_t_qk_start: 0.30
   soft_gate_t_qk_final: 0.001
   soft_gate_t_qk_hold_frac: 0.0
-  soft_gate_t_qk_anneal_end_frac: 0.80
+  soft_gate_t_qk_anneal_end_frac: 0.35
   soft_gate_t_qk_schedule: log_gompertz
-  soft_gate_t_qk_gompertz_center: 0.120
-  soft_gate_t_qk_gompertz_steepness: 10.0
+  soft_gate_t_qk_gompertz_center: 0.040
+  soft_gate_t_qk_gompertz_steepness: 12.0
 
   soft_gate_t_v_start: 0.14
   soft_gate_t_v_final: 0.001
