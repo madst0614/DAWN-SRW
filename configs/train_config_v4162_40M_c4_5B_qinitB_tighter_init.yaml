@@ -131,4 +131,4 @@ training:
   crash_snapshot: false
   crash_snapshot_enabled: false
   spike_event_logger: false
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/v4162_40M_qinitB_tighter_init
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/v4162_40M_qinitB_tighter_init_more_freeze
