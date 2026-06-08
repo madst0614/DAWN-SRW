@@ -1480,6 +1480,16 @@ def _scalar0(x):
 
 
 POOL_SCHEDULE_NAMES = ('qk', 'v', 'rst')
+SOFT_GATE_T_SCHEDULE_NAMES = (
+    'constant', 'linear', 'cosine',
+    'log', 'log_linear', 'log_power', 'log_gompertz',
+    'developmental_band')
+DEVELOPMENTAL_BAND_TEMP_KEYS = ('sort', 'band', 'mid', 'late', 'final')
+DEVELOPMENTAL_BAND_FRAC_KEYS = (
+    'sort_end_frac', 'band_reach_frac',
+    'formation_end_frac', 'sharpen_end_frac')
+DEVELOPMENTAL_BAND_REQUIRED_KEYS = (
+    DEVELOPMENTAL_BAND_TEMP_KEYS + DEVELOPMENTAL_BAND_FRAC_KEYS)
 
 
 def _training_soft_gate_pool_schedules(
@@ -1490,7 +1500,7 @@ def _training_soft_gate_pool_schedules(
     out = {}
     for pool in POOL_SCHEDULE_NAMES:
         prefix = f'soft_gate_t_{pool}'
-        out[pool] = {
+        cfg = {
             'start': float(tcfg.get(f'{prefix}_start', soft_gate_t_start)),
             'final': float(tcfg.get(f'{prefix}_final', soft_gate_t_final)),
             'hold_frac': float(tcfg.get(
@@ -1506,6 +1516,34 @@ def _training_soft_gate_pool_schedules(
                 f'{prefix}_gompertz_steepness',
                 soft_gate_t_gompertz_steepness)),
         }
+        cfg['_final_pool_present'] = f'{prefix}_final' in tcfg
+        cfg['_final_present'] = (
+            cfg['_final_pool_present'] or 'soft_gate_t_final' in tcfg)
+
+        dev_defaults = {
+            'sort': soft_gate_t_start,
+            'band': soft_gate_t_start,
+            'mid': soft_gate_t_final,
+            'late': soft_gate_t_final,
+            'sort_end_frac': soft_gate_t_hold_frac,
+            'band_reach_frac': soft_gate_t_hold_frac,
+            'formation_end_frac': soft_gate_t_anneal_end_frac,
+            'sharpen_end_frac': soft_gate_t_anneal_end_frac,
+            'formation_power': 1.5,
+            'sharpen_power': 1.0,
+        }
+        for key, default in dev_defaults.items():
+            pool_key = f'{prefix}_{key}'
+            global_key = f'soft_gate_t_{key}'
+            if pool_key in tcfg:
+                raw = tcfg[pool_key]
+            else:
+                raw = tcfg.get(global_key, default)
+            cfg[key] = float(raw)
+            cfg[f'_{key}_pool_present'] = pool_key in tcfg
+            cfg[f'_{key}_present'] = (
+                cfg[f'_{key}_pool_present'] or global_key in tcfg)
+        out[pool] = cfg
     return out
 
 
@@ -1528,6 +1566,30 @@ def _coerce_pool_schedule_configs(pool_schedules, defaults):
             'gompertz_steepness': jnp.float32(src.get(
                 'gompertz_steepness', defaults.get(
                     'gompertz_steepness', 8.0))),
+            'sort': jnp.float32(src.get(
+                'sort', defaults.get('sort', defaults['start']))),
+            'band': jnp.float32(src.get(
+                'band', defaults.get('band', defaults['start']))),
+            'mid': jnp.float32(src.get(
+                'mid', defaults.get('mid', defaults['final']))),
+            'late': jnp.float32(src.get(
+                'late', defaults.get('late', defaults['final']))),
+            'sort_end_frac': jnp.float32(src.get(
+                'sort_end_frac', defaults.get(
+                    'sort_end_frac', defaults['hold_frac']))),
+            'band_reach_frac': jnp.float32(src.get(
+                'band_reach_frac', defaults.get(
+                    'band_reach_frac', defaults['hold_frac']))),
+            'formation_end_frac': jnp.float32(src.get(
+                'formation_end_frac', defaults.get(
+                    'formation_end_frac', defaults['anneal_end_frac']))),
+            'sharpen_end_frac': jnp.float32(src.get(
+                'sharpen_end_frac', defaults.get(
+                    'sharpen_end_frac', defaults['anneal_end_frac']))),
+            'formation_power': jnp.float32(src.get(
+                'formation_power', defaults.get('formation_power', 1.5))),
+            'sharpen_power': jnp.float32(src.get(
+                'sharpen_power', defaults.get('sharpen_power', 1.0))),
         }
     return out
 
@@ -1538,7 +1600,11 @@ def _scheduled_from_config(step, total_steps, cfg):
         cfg['start'], cfg['final'],
         cfg['hold_frac'], cfg['anneal_end_frac'],
         cfg['schedule'], cfg['power'],
-        cfg['gompertz_center'], cfg['gompertz_steepness'])
+        cfg['gompertz_center'], cfg['gompertz_steepness'],
+        cfg['sort'], cfg['band'], cfg['mid'], cfg['late'],
+        cfg['sort_end_frac'], cfg['band_reach_frac'],
+        cfg['formation_end_frac'], cfg['sharpen_end_frac'],
+        cfg['formation_power'], cfg['sharpen_power'])
 
 
 def _flatten_soft_gate_pool_schedules(pool_schedules):
@@ -1554,6 +1620,16 @@ def _flatten_soft_gate_pool_schedules(pool_schedules):
             f'{prefix}_power': cfg['power'],
             f'{prefix}_gompertz_center': cfg['gompertz_center'],
             f'{prefix}_gompertz_steepness': cfg['gompertz_steepness'],
+            f'{prefix}_sort': cfg['sort'],
+            f'{prefix}_band': cfg['band'],
+            f'{prefix}_mid': cfg['mid'],
+            f'{prefix}_late': cfg['late'],
+            f'{prefix}_sort_end_frac': cfg['sort_end_frac'],
+            f'{prefix}_band_reach_frac': cfg['band_reach_frac'],
+            f'{prefix}_formation_end_frac': cfg['formation_end_frac'],
+            f'{prefix}_sharpen_end_frac': cfg['sharpen_end_frac'],
+            f'{prefix}_formation_power': cfg['formation_power'],
+            f'{prefix}_sharpen_power': cfg['sharpen_power'],
         })
     return out
 
@@ -1561,7 +1637,13 @@ def _flatten_soft_gate_pool_schedules(pool_schedules):
 def scheduled_value_by_frac(step, total_steps, start, final, hold_frac,
                             end_frac, schedule='cosine', power=1.0,
                             gompertz_center=0.25,
-                            gompertz_steepness=8.0):
+                            gompertz_steepness=8.0,
+                            sort=None, band=None, mid=None, late=None,
+                            sort_end_frac=0.0, band_reach_frac=0.0,
+                            formation_end_frac=1.0,
+                            sharpen_end_frac=1.0,
+                            formation_power=1.5,
+                            sharpen_power=1.0):
     """Piecewise hold/anneal/hold scalar schedule by training fraction."""
     step_f = jnp.asarray(step, dtype=jnp.float32)
     total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
@@ -1615,16 +1697,155 @@ def scheduled_value_by_frac(step, total_steps, start, final, hold_frac,
         val = jnp.exp(log_val)
         return jnp.where(frac < hold, start_f,
                          jnp.where(frac >= end, final_f, val))
+    elif schedule_name == 'developmental_band':
+        eps = jnp.float32(1.0e-6)
+
+        def _as_f32(x, fallback):
+            return jnp.asarray(fallback if x is None else x,
+                               dtype=jnp.float32)
+
+        def _smoothstep(u):
+            u = jnp.clip(u, 0.0, 1.0)
+            return u * u * (3.0 - 2.0 * u)
+
+        def _geom_interp(a, b, u):
+            log_a = jnp.log(jnp.maximum(a, jnp.float32(1.0e-12)))
+            log_b = jnp.log(jnp.maximum(b, jnp.float32(1.0e-12)))
+            return jnp.exp((1.0 - u) * log_a + u * log_b)
+
+        sort_f = _as_f32(sort, start_f)
+        band_f = _as_f32(band, start_f)
+        mid_f = _as_f32(mid, final_f)
+        late_f = _as_f32(late, final_f)
+        sort_end = jnp.asarray(sort_end_frac, dtype=jnp.float32)
+        band_reach = jnp.asarray(band_reach_frac, dtype=jnp.float32)
+        formation_end = jnp.asarray(formation_end_frac, dtype=jnp.float32)
+        sharpen_end = jnp.asarray(sharpen_end_frac, dtype=jnp.float32)
+        formation_power_f = jnp.asarray(formation_power, dtype=jnp.float32)
+        sharpen_power_f = jnp.asarray(sharpen_power, dtype=jnp.float32)
+
+        u_contract = jnp.clip(
+            (frac - sort_end) / jnp.maximum(band_reach - sort_end, eps),
+            0.0, 1.0)
+        contract_val = _geom_interp(
+            sort_f, band_f, _smoothstep(u_contract))
+
+        u_form = jnp.clip(
+            ((frac - band_reach)
+             / jnp.maximum(formation_end - band_reach, eps)),
+            0.0, 1.0)
+        form_val = _geom_interp(
+            band_f, mid_f, jnp.power(u_form, formation_power_f))
+
+        u_sharp = jnp.clip(
+            ((frac - formation_end)
+             / jnp.maximum(sharpen_end - formation_end, eps)),
+            0.0, 1.0)
+        sharp_val = _geom_interp(
+            mid_f, late_f,
+            _smoothstep(jnp.power(u_sharp, sharpen_power_f)))
+
+        u_final = jnp.clip(
+            (frac - sharpen_end) / jnp.maximum(1.0 - sharpen_end, eps),
+            0.0, 1.0)
+        final_val = _geom_interp(late_f, final_f, _smoothstep(u_final))
+
+        return jnp.where(
+            frac < sort_end, sort_f,
+            jnp.where(
+                frac < band_reach, contract_val,
+                jnp.where(
+                    frac < formation_end, form_val,
+                    jnp.where(frac < sharpen_end, sharp_val, final_val))))
     else:
         raise ValueError(
             f"Unsupported schedule={schedule!r}; expected cosine, linear, "
-            "constant, log, log_linear, log_power, or log_gompertz.")
+            "constant, log, log_linear, log_power, log_gompertz, or "
+            "developmental_band.")
     val = start_f + (final_f - start_f) * mix
     return jnp.where(frac < hold, start_f,
                      jnp.where(frac >= end, final_f, val))
 
 
 _scheduled_scalar = scheduled_value_by_frac
+
+
+def _soft_gate_schedule_expected_msg():
+    return (
+        "expected constant, linear, cosine, log, log_linear, log_power, "
+        "log_gompertz, or developmental_band.")
+
+
+def _validate_soft_gate_schedule_config(
+        label, cfg, require_pool_specific_devband_fields=False):
+    schedule_name = str(cfg['schedule']).lower()
+    if schedule_name not in SOFT_GATE_T_SCHEDULE_NAMES:
+        raise ValueError(
+            f"Unsupported {label}_schedule={cfg['schedule']!r}; "
+            f"{_soft_gate_schedule_expected_msg()}")
+
+    if schedule_name == 'developmental_band':
+        missing = []
+        for key in DEVELOPMENTAL_BAND_REQUIRED_KEYS:
+            present_key = (
+                f'_{key}_pool_present'
+                if require_pool_specific_devband_fields
+                else f'_{key}_present')
+            if not cfg.get(present_key, False):
+                missing.append(f'{label}_{key}')
+        if missing:
+            raise ValueError(
+                f"{label}_schedule=developmental_band requires: "
+                f"{', '.join(missing)}")
+
+        for key in DEVELOPMENTAL_BAND_TEMP_KEYS:
+            if cfg[key] <= 0.0:
+                raise ValueError(
+                    f"{label}_{key} must be > 0 for developmental_band, "
+                    f"got {cfg[key]}")
+        sort_end = cfg['sort_end_frac']
+        band_reach = cfg['band_reach_frac']
+        formation_end = cfg['formation_end_frac']
+        sharpen_end = cfg['sharpen_end_frac']
+        if not (0.0 <= sort_end < band_reach
+                < formation_end < sharpen_end <= 1.0):
+            raise ValueError(
+                f"{label} developmental_band fractions must satisfy "
+                "0 <= sort_end_frac < band_reach_frac < "
+                "formation_end_frac < sharpen_end_frac <= 1, got "
+                f"{sort_end}, {band_reach}, {formation_end}, {sharpen_end}")
+        if cfg['formation_power'] <= 0.0:
+            raise ValueError(
+                f"{label}_formation_power must be > 0, "
+                f"got {cfg['formation_power']}")
+        if cfg['sharpen_power'] <= 0.0:
+            raise ValueError(
+                f"{label}_sharpen_power must be > 0, "
+                f"got {cfg['sharpen_power']}")
+        return
+
+    if cfg['start'] <= 0.0:
+        raise ValueError(
+            f"{label}_start must be > 0, got {cfg['start']}")
+    if cfg['final'] <= 0.0:
+        raise ValueError(
+            f"{label}_final must be > 0, got {cfg['final']}")
+    if cfg['anneal_end_frac'] <= cfg['hold_frac']:
+        raise ValueError(
+            f"{label}_anneal_end_frac must be > {label}_hold_frac, got "
+            f"{cfg['anneal_end_frac']} <= {cfg['hold_frac']}")
+    if schedule_name == 'log_power' and cfg['power'] <= 0.0:
+        raise ValueError(
+            f"{label}_power must be > 0, got {cfg['power']}")
+    if schedule_name == 'log_gompertz':
+        if not (0.0 < cfg['gompertz_center'] < 1.0):
+            raise ValueError(
+                f"{label}_gompertz_center must be > 0 and < 1, "
+                f"got {cfg['gompertz_center']}")
+        if cfg['gompertz_steepness'] <= 0.0:
+            raise ValueError(
+                f"{label}_gompertz_steepness must be > 0, "
+                f"got {cfg['gompertz_steepness']}")
 
 
 def _global_norm_array(x):
@@ -2009,7 +2230,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         'gompertz_steepness': soft_gate_t_gompertz_steepness,
     }
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
-        soft_gate_pool_schedules if soft_gate_t_pool_specific else None,
+        (soft_gate_pool_schedules
+         if (soft_gate_t_pool_specific
+             or _soft_gate_schedule == 'developmental_band')
+         else None),
         _soft_gate_pool_defaults)
     _rpe_start_frac = jnp.float32(rpe_start_frac)
     _rpe_full_frac = jnp.float32(rpe_full_frac)
@@ -4122,7 +4346,10 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         'gompertz_steepness': soft_gate_t_gompertz_steepness,
     }
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
-        soft_gate_pool_schedules if soft_gate_t_pool_specific else None,
+        (soft_gate_pool_schedules
+         if (soft_gate_t_pool_specific
+             or _soft_gate_schedule == 'developmental_band')
+         else None),
         _soft_gate_pool_defaults)
 
     @jax.jit
@@ -4230,7 +4457,10 @@ def create_analysis_step(model, sharded_fns=None,
         'gompertz_steepness': soft_gate_t_gompertz_steepness,
     }
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
-        soft_gate_pool_schedules if soft_gate_t_pool_specific else None,
+        (soft_gate_pool_schedules
+         if (soft_gate_t_pool_specific
+             or _soft_gate_schedule == 'developmental_band')
+         else None),
         _soft_gate_pool_defaults)
 
     @jax.jit
@@ -4417,7 +4647,10 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
         'gompertz_steepness': soft_gate_t_gompertz_steepness,
     }
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
-        soft_gate_pool_schedules if soft_gate_t_pool_specific else None,
+        (soft_gate_pool_schedules
+         if (soft_gate_t_pool_specific
+             or _soft_gate_schedule == 'developmental_band')
+         else None),
         _soft_gate_pool_defaults)
     _topk = int(topk)
 
@@ -10310,71 +10543,31 @@ def main():
 
     if soft_gate_enabled:
         _soft_gate_schedule_name = soft_gate_schedule.lower()
-        if _soft_gate_schedule_name not in (
-                'constant', 'linear', 'cosine',
-                'log', 'log_linear', 'log_power', 'log_gompertz'):
+        if _soft_gate_schedule_name not in SOFT_GATE_T_SCHEDULE_NAMES:
             raise ValueError(
                 f"Unsupported soft_gate_t_schedule={soft_gate_schedule!r}; "
-                "expected constant, linear, cosine, log, log_linear, "
-                "log_power, or log_gompertz.")
-        if soft_gate_t_start <= 0.0:
-            raise ValueError(
-                f"soft_gate_t_start must be > 0, got {soft_gate_t_start}")
-        if soft_gate_t_final <= 0.0:
-            raise ValueError(
-                f"soft_gate_t_final must be > 0, got {soft_gate_t_final}")
-        if soft_gate_t_anneal_end_frac <= soft_gate_t_hold_frac:
-            raise ValueError(
-                "soft_gate_t_anneal_end_frac must be > "
-                f"soft_gate_t_hold_frac, got {soft_gate_t_anneal_end_frac} "
-                f"<= {soft_gate_t_hold_frac}")
-        if (_soft_gate_schedule_name == 'log_power'
-                and soft_gate_t_power <= 0.0):
-            raise ValueError(
-                f"soft_gate_t_power must be > 0, got {soft_gate_t_power}")
-        if _soft_gate_schedule_name == 'log_gompertz':
-            if not (0.0 < soft_gate_t_gompertz_center < 1.0):
-                raise ValueError(
-                    "soft_gate_t_gompertz_center must be > 0 and < 1, "
-                    f"got {soft_gate_t_gompertz_center}")
-            if soft_gate_t_gompertz_steepness <= 0.0:
-                raise ValueError(
-                    "soft_gate_t_gompertz_steepness must be > 0, "
-                    f"got {soft_gate_t_gompertz_steepness}")
+                f"{_soft_gate_schedule_expected_msg()}")
+        if not (_soft_gate_schedule_name == 'developmental_band'
+                and soft_gate_t_pool_specific):
+            if _soft_gate_schedule_name == 'developmental_band':
+                _validate_soft_gate_schedule_config(
+                    'soft_gate_t', soft_gate_pool_schedules['qk'])
+            else:
+                _validate_soft_gate_schedule_config('soft_gate_t', {
+                    'schedule': soft_gate_schedule,
+                    'start': soft_gate_t_start,
+                    'final': soft_gate_t_final,
+                    'hold_frac': soft_gate_t_hold_frac,
+                    'anneal_end_frac': soft_gate_t_anneal_end_frac,
+                    'power': soft_gate_t_power,
+                    'gompertz_center': soft_gate_t_gompertz_center,
+                    'gompertz_steepness': soft_gate_t_gompertz_steepness,
+                })
         if soft_gate_t_pool_specific:
             for _pool, _cfg in soft_gate_pool_schedules.items():
-                _schedule_name = str(_cfg['schedule']).lower()
-                _label = f"soft_gate_t_{_pool}"
-                if _schedule_name not in (
-                        'constant', 'linear', 'cosine',
-                        'log', 'log_linear', 'log_power', 'log_gompertz'):
-                    raise ValueError(
-                        f"Unsupported {_label}_schedule={_cfg['schedule']!r}; "
-                        "expected constant, linear, cosine, log, log_linear, "
-                        "log_power, or log_gompertz.")
-                if _cfg['start'] <= 0.0:
-                    raise ValueError(
-                        f"{_label}_start must be > 0, got {_cfg['start']}")
-                if _cfg['final'] <= 0.0:
-                    raise ValueError(
-                        f"{_label}_final must be > 0, got {_cfg['final']}")
-                if _cfg['anneal_end_frac'] <= _cfg['hold_frac']:
-                    raise ValueError(
-                        f"{_label}_anneal_end_frac must be > "
-                        f"{_label}_hold_frac, got "
-                        f"{_cfg['anneal_end_frac']} <= {_cfg['hold_frac']}")
-                if _schedule_name == 'log_power' and _cfg['power'] <= 0.0:
-                    raise ValueError(
-                        f"{_label}_power must be > 0, got {_cfg['power']}")
-                if _schedule_name == 'log_gompertz':
-                    if not (0.0 < _cfg['gompertz_center'] < 1.0):
-                        raise ValueError(
-                            f"{_label}_gompertz_center must be > 0 and < 1, "
-                            f"got {_cfg['gompertz_center']}")
-                    if _cfg['gompertz_steepness'] <= 0.0:
-                        raise ValueError(
-                            f"{_label}_gompertz_steepness must be > 0, "
-                            f"got {_cfg['gompertz_steepness']}")
+                _validate_soft_gate_schedule_config(
+                    f"soft_gate_t_{_pool}", _cfg,
+                    require_pool_specific_devband_fields=True)
 
     # Build training_config dict for saving in checkpoints
     training_config = {
@@ -10942,32 +11135,54 @@ def main():
             print(f"    enabled={soft_gate_enabled} "
                   f"pool_specific={soft_gate_t_pool_specific} "
                   f"effective_active_eps={soft_gate_effective_active_eps}")
+            def _devband_summary(_cfg):
+                return (
+                    f"sort={_cfg['sort']} band={_cfg['band']} "
+                    f"mid={_cfg['mid']} late={_cfg['late']} "
+                    f"final={_cfg['final']} "
+                    f"sort_end_frac={_cfg['sort_end_frac']} "
+                    f"band_reach_frac={_cfg['band_reach_frac']} "
+                    f"formation_end_frac={_cfg['formation_end_frac']} "
+                    f"sharpen_end_frac={_cfg['sharpen_end_frac']} "
+                    f"formation_power={_cfg['formation_power']} "
+                    f"sharpen_power={_cfg['sharpen_power']}")
             if soft_gate_t_pool_specific:
                 for _pool in POOL_SCHEDULE_NAMES:
                     _cfg = soft_gate_pool_schedules[_pool]
-                    _shape_msg = (
-                        f"gompertz_center={_cfg['gompertz_center']} "
-                        f"gompertz_steepness={_cfg['gompertz_steepness']} "
-                        if str(_cfg['schedule']).lower() == 'log_gompertz'
-                        else f"power={_cfg['power']} ")
-                    print(
-                        f"    {_pool}: T_start={_cfg['start']} "
-                        f"T_final={_cfg['final']} "
-                        f"hold_frac={_cfg['hold_frac']} "
-                        f"anneal_end_frac={_cfg['anneal_end_frac']} "
-                        f"schedule={_cfg['schedule']} {_shape_msg}")
+                    _schedule_name = str(_cfg['schedule']).lower()
+                    if _schedule_name == 'developmental_band':
+                        print(
+                            f"    {_pool}: schedule={_cfg['schedule']} "
+                            f"{_devband_summary(_cfg)}")
+                    else:
+                        _shape_msg = (
+                            f"gompertz_center={_cfg['gompertz_center']} "
+                            f"gompertz_steepness={_cfg['gompertz_steepness']} "
+                            if _schedule_name == 'log_gompertz'
+                            else f"power={_cfg['power']} ")
+                        print(
+                            f"    {_pool}: T_start={_cfg['start']} "
+                            f"T_final={_cfg['final']} "
+                            f"hold_frac={_cfg['hold_frac']} "
+                            f"anneal_end_frac={_cfg['anneal_end_frac']} "
+                            f"schedule={_cfg['schedule']} {_shape_msg}")
             else:
-                _soft_gate_shape_msg = (
-                    f"gompertz_center={soft_gate_t_gompertz_center} "
-                    f"gompertz_steepness={soft_gate_t_gompertz_steepness} "
-                    if soft_gate_schedule.lower() == 'log_gompertz'
-                    else f"power={soft_gate_t_power} ")
-                print(f"    T_start={soft_gate_t_start} "
-                      f"T_final={soft_gate_t_final} "
-                      f"hold_frac={soft_gate_t_hold_frac} "
-                      f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
-                      f"schedule={soft_gate_schedule} "
-                      f"{_soft_gate_shape_msg}")
+                if soft_gate_schedule.lower() == 'developmental_band':
+                    _cfg = soft_gate_pool_schedules['qk']
+                    print(f"    schedule={soft_gate_schedule} "
+                          f"{_devband_summary(_cfg)}")
+                else:
+                    _soft_gate_shape_msg = (
+                        f"gompertz_center={soft_gate_t_gompertz_center} "
+                        f"gompertz_steepness={soft_gate_t_gompertz_steepness} "
+                        if soft_gate_schedule.lower() == 'log_gompertz'
+                        else f"power={soft_gate_t_power} ")
+                    print(f"    T_start={soft_gate_t_start} "
+                          f"T_final={soft_gate_t_final} "
+                          f"hold_frac={soft_gate_t_hold_frac} "
+                          f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
+                          f"schedule={soft_gate_schedule} "
+                          f"{_soft_gate_shape_msg}")
             print(f"  tau control: tau_lr_mult={tau_lr_mult}; "
                   "tau_ce_grad_scale=removed")
             if ignored_tau_ce_grad_scale_keys:
