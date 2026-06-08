@@ -90,7 +90,7 @@ training:
   soft_gate_t_qk_gompertz_center: 0.040
   soft_gate_t_qk_gompertz_steepness: 12.0
 
-  soft_gate_t_v_start: 0.075
+  soft_gate_t_v_start: 0.035
   soft_gate_t_v_final: 0.001
   soft_gate_t_v_hold_frac: 0.0
   soft_gate_t_v_anneal_end_frac: 0.30
@@ -98,7 +98,7 @@ training:
   soft_gate_t_v_gompertz_center: 0.030
   soft_gate_t_v_gompertz_steepness: 12.0
 
-  soft_gate_t_rst_start: 0.075
+  soft_gate_t_rst_start: 0.020
   soft_gate_t_rst_final: 0.001
   soft_gate_t_rst_hold_frac: 0.0
   soft_gate_t_rst_anneal_end_frac: 0.30
