@@ -74,27 +74,42 @@ training:
   soft_gate_t_gompertz_center: 0.040
   soft_gate_t_gompertz_steepness: 12.0
   soft_gate_t_pool_specific: true
-  soft_gate_t_qk_start: 0.075
+  soft_gate_t_qk_schedule: developmental_band
+  soft_gate_t_qk_sort: 0.035
+  soft_gate_t_qk_band: 0.035
+  soft_gate_t_qk_mid: 0.012
+  soft_gate_t_qk_late: 0.003
   soft_gate_t_qk_final: 0.001
-  soft_gate_t_qk_hold_frac: 0.0
-  soft_gate_t_qk_anneal_end_frac: 0.35
-  soft_gate_t_qk_schedule: log_gompertz
-  soft_gate_t_qk_gompertz_center: 0.040
-  soft_gate_t_qk_gompertz_steepness: 12.0
-  soft_gate_t_v_start: 0.035
+  soft_gate_t_qk_sort_end_frac: 0.0
+  soft_gate_t_qk_band_reach_frac: 0.001
+  soft_gate_t_qk_formation_end_frac: 0.180
+  soft_gate_t_qk_sharpen_end_frac: 0.400
+  soft_gate_t_qk_formation_power: 1.5
+  soft_gate_t_qk_sharpen_power: 1.0
+  soft_gate_t_v_schedule: developmental_band
+  soft_gate_t_v_sort: 0.018
+  soft_gate_t_v_band: 0.018
+  soft_gate_t_v_mid: 0.007
+  soft_gate_t_v_late: 0.002
   soft_gate_t_v_final: 0.001
-  soft_gate_t_v_hold_frac: 0.0
-  soft_gate_t_v_anneal_end_frac: 0.30
-  soft_gate_t_v_schedule: log_gompertz
-  soft_gate_t_v_gompertz_center: 0.030
-  soft_gate_t_v_gompertz_steepness: 12.0
-  soft_gate_t_rst_start: 0.020
+  soft_gate_t_v_sort_end_frac: 0.0
+  soft_gate_t_v_band_reach_frac: 0.001
+  soft_gate_t_v_formation_end_frac: 0.180
+  soft_gate_t_v_sharpen_end_frac: 0.400
+  soft_gate_t_v_formation_power: 1.5
+  soft_gate_t_v_sharpen_power: 1.0
+  soft_gate_t_rst_schedule: developmental_band
+  soft_gate_t_rst_sort: 0.011
+  soft_gate_t_rst_band: 0.011
+  soft_gate_t_rst_mid: 0.0045
+  soft_gate_t_rst_late: 0.0018
   soft_gate_t_rst_final: 0.001
-  soft_gate_t_rst_hold_frac: 0.0
-  soft_gate_t_rst_anneal_end_frac: 0.30
-  soft_gate_t_rst_schedule: log_gompertz
-  soft_gate_t_rst_gompertz_center: 0.030
-  soft_gate_t_rst_gompertz_steepness: 12.0
+  soft_gate_t_rst_sort_end_frac: 0.0
+  soft_gate_t_rst_band_reach_frac: 0.001
+  soft_gate_t_rst_formation_end_frac: 0.180
+  soft_gate_t_rst_sharpen_end_frac: 0.400
+  soft_gate_t_rst_formation_power: 1.5
+  soft_gate_t_rst_sharpen_power: 1.0
   soft_gate_effective_active_eps: 1.0e-06
   regular_diagnostics_level: compact
   regular_current_eps:
@@ -130,4 +145,4 @@ training:
   spike_probe_topk: 8
   spike_probe_min_step: 5000
   spike_history_steps: 20
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4162_400M_c4_40B_q04_v04_rst02_Tpool
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4162_400M_c4_40B_devband_nosort_smallband_q04_v04_rst02
