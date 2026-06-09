@@ -79,41 +79,41 @@ training:
   # Phase D/E: micro-sharpening -> final sparse consolidation
 
   soft_gate_t_qk_schedule: developmental_band
-  soft_gate_t_qk_sort: 0.18
-  soft_gate_t_qk_band: 0.050
-  soft_gate_t_qk_mid: 0.010
+  soft_gate_t_qk_sort: 0.14
+  soft_gate_t_qk_band: 0.045
+  soft_gate_t_qk_mid: 0.0075
   soft_gate_t_qk_late: 0.003
   soft_gate_t_qk_final: 0.001
   soft_gate_t_qk_sort_end_frac: 0.0033
-  soft_gate_t_qk_band_reach_frac: 0.012
-  soft_gate_t_qk_formation_end_frac: 0.105
-  soft_gate_t_qk_sharpen_end_frac: 0.210
+  soft_gate_t_qk_band_reach_frac: 0.020
+  soft_gate_t_qk_formation_end_frac: 0.180
+  soft_gate_t_qk_sharpen_end_frac: 0.400
   soft_gate_t_qk_formation_power: 1.5
   soft_gate_t_qk_sharpen_power: 1.0
 
   soft_gate_t_v_schedule: developmental_band
-  soft_gate_t_v_sort: 0.075
-  soft_gate_t_v_band: 0.025
-  soft_gate_t_v_mid: 0.006
+  soft_gate_t_v_sort: 0.060
+  soft_gate_t_v_band: 0.022
+  soft_gate_t_v_mid: 0.005
   soft_gate_t_v_late: 0.002
   soft_gate_t_v_final: 0.001
   soft_gate_t_v_sort_end_frac: 0.0033
-  soft_gate_t_v_band_reach_frac: 0.012
-  soft_gate_t_v_formation_end_frac: 0.105
-  soft_gate_t_v_sharpen_end_frac: 0.210
+  soft_gate_t_v_band_reach_frac: 0.020
+  soft_gate_t_v_formation_end_frac: 0.180
+  soft_gate_t_v_sharpen_end_frac: 0.400
   soft_gate_t_v_formation_power: 1.5
   soft_gate_t_v_sharpen_power: 1.0
 
   soft_gate_t_rst_schedule: developmental_band
-  soft_gate_t_rst_sort: 0.045
-  soft_gate_t_rst_band: 0.015
-  soft_gate_t_rst_mid: 0.004
+  soft_gate_t_rst_sort: 0.036
+  soft_gate_t_rst_band: 0.013
+  soft_gate_t_rst_mid: 0.0035
   soft_gate_t_rst_late: 0.0018
   soft_gate_t_rst_final: 0.001
   soft_gate_t_rst_sort_end_frac: 0.0033
-  soft_gate_t_rst_band_reach_frac: 0.012
-  soft_gate_t_rst_formation_end_frac: 0.105
-  soft_gate_t_rst_sharpen_end_frac: 0.210
+  soft_gate_t_rst_band_reach_frac: 0.020
+  soft_gate_t_rst_formation_end_frac: 0.180
+  soft_gate_t_rst_sharpen_end_frac: 0.400
   soft_gate_t_rst_formation_power: 1.5
   soft_gate_t_rst_sharpen_power: 1.0
 
@@ -142,4 +142,4 @@ training:
   crash_snapshot: false
   crash_snapshot_enabled: false
   spike_event_logger: false
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4162_40M_c4_5B_devband_q06_v04_rst02
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4162_40M_c4_5B_devband_sparsity_renorm_q06_v04_rst02
