@@ -84,8 +84,8 @@ training:
   soft_gate_t_qk_mid: 0.0075
   soft_gate_t_qk_late: 0.003
   soft_gate_t_qk_final: 0.001
-  soft_gate_t_qk_sort_end_frac: 0.0033
-  soft_gate_t_qk_band_reach_frac: 0.020
+  soft_gate_t_qk_sort_end_frac: 0.0013
+  soft_gate_t_qk_band_reach_frac: 0.0070
   soft_gate_t_qk_formation_end_frac: 0.180
   soft_gate_t_qk_sharpen_end_frac: 0.400
   soft_gate_t_qk_formation_power: 1.5
@@ -97,8 +97,8 @@ training:
   soft_gate_t_v_mid: 0.005
   soft_gate_t_v_late: 0.002
   soft_gate_t_v_final: 0.001
-  soft_gate_t_v_sort_end_frac: 0.0033
-  soft_gate_t_v_band_reach_frac: 0.020
+  soft_gate_t_v_sort_end_frac: 0.0013
+  soft_gate_t_v_band_reach_frac: 0.0070
   soft_gate_t_v_formation_end_frac: 0.180
   soft_gate_t_v_sharpen_end_frac: 0.400
   soft_gate_t_v_formation_power: 1.5
@@ -110,8 +110,8 @@ training:
   soft_gate_t_rst_mid: 0.0035
   soft_gate_t_rst_late: 0.0018
   soft_gate_t_rst_final: 0.001
-  soft_gate_t_rst_sort_end_frac: 0.0033
-  soft_gate_t_rst_band_reach_frac: 0.020
+  soft_gate_t_rst_sort_end_frac: 0.0013
+  soft_gate_t_rst_band_reach_frac: 0.0070
   soft_gate_t_rst_formation_end_frac: 0.180
   soft_gate_t_rst_sharpen_end_frac: 0.400
   soft_gate_t_rst_formation_power: 1.5
@@ -142,4 +142,4 @@ training:
   crash_snapshot: false
   crash_snapshot_enabled: false
   spike_event_logger: false
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4162_40M_c4_5B_devband_sparsity_renorm_q06_v04_rst02
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4162_40M_c4_5B_devband_sort100_band530_q06_v04_rst02
