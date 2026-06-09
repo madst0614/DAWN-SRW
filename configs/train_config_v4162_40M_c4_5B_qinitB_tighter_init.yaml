@@ -73,45 +73,45 @@ training:
   soft_gate_effective_active_eps: 1.0e-06
 
   # Developmental Band Annealing
-  # Phase A: short global sorting
-  # Phase B: rapid contraction to target band
+  # Phase A: no-sorting / direct small target band
+  # Phase B: stable small-band formation
   # Phase C: formation band
   # Phase D/E: micro-sharpening -> final sparse consolidation
 
   soft_gate_t_qk_schedule: developmental_band
-  soft_gate_t_qk_sort: 0.14
-  soft_gate_t_qk_band: 0.045
-  soft_gate_t_qk_mid: 0.0075
+  soft_gate_t_qk_sort: 0.035
+  soft_gate_t_qk_band: 0.035
+  soft_gate_t_qk_mid: 0.012
   soft_gate_t_qk_late: 0.003
   soft_gate_t_qk_final: 0.001
-  soft_gate_t_qk_sort_end_frac: 0.0013
-  soft_gate_t_qk_band_reach_frac: 0.0070
+  soft_gate_t_qk_sort_end_frac: 0.0
+  soft_gate_t_qk_band_reach_frac: 0.001
   soft_gate_t_qk_formation_end_frac: 0.180
   soft_gate_t_qk_sharpen_end_frac: 0.400
   soft_gate_t_qk_formation_power: 1.5
   soft_gate_t_qk_sharpen_power: 1.0
 
   soft_gate_t_v_schedule: developmental_band
-  soft_gate_t_v_sort: 0.060
-  soft_gate_t_v_band: 0.022
-  soft_gate_t_v_mid: 0.005
+  soft_gate_t_v_sort: 0.018
+  soft_gate_t_v_band: 0.018
+  soft_gate_t_v_mid: 0.007
   soft_gate_t_v_late: 0.002
   soft_gate_t_v_final: 0.001
-  soft_gate_t_v_sort_end_frac: 0.0013
-  soft_gate_t_v_band_reach_frac: 0.0070
+  soft_gate_t_v_sort_end_frac: 0.0
+  soft_gate_t_v_band_reach_frac: 0.001
   soft_gate_t_v_formation_end_frac: 0.180
   soft_gate_t_v_sharpen_end_frac: 0.400
   soft_gate_t_v_formation_power: 1.5
   soft_gate_t_v_sharpen_power: 1.0
 
   soft_gate_t_rst_schedule: developmental_band
-  soft_gate_t_rst_sort: 0.036
-  soft_gate_t_rst_band: 0.013
-  soft_gate_t_rst_mid: 0.0035
+  soft_gate_t_rst_sort: 0.011
+  soft_gate_t_rst_band: 0.011
+  soft_gate_t_rst_mid: 0.0045
   soft_gate_t_rst_late: 0.0018
   soft_gate_t_rst_final: 0.001
-  soft_gate_t_rst_sort_end_frac: 0.0013
-  soft_gate_t_rst_band_reach_frac: 0.0070
+  soft_gate_t_rst_sort_end_frac: 0.0
+  soft_gate_t_rst_band_reach_frac: 0.001
   soft_gate_t_rst_formation_end_frac: 0.180
   soft_gate_t_rst_sharpen_end_frac: 0.400
   soft_gate_t_rst_formation_power: 1.5
@@ -142,4 +142,4 @@ training:
   crash_snapshot: false
   crash_snapshot_enabled: false
   spike_event_logger: false
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4162_40M_c4_5B_devband_sort100_band530_q06_v04_rst02
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4162_40M_c4_5B_devband_nosort_smallband_q06_v04_rst02
