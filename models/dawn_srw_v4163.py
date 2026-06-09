@@ -285,14 +285,14 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 
 
 # ================================================================
-# V4.1.6.3 one-sided generalized Gaussian DirectTau in cosine space.
+# V4.1.6.3 annealed generalized Gaussian DirectTau in cosine space.
 #
 #   rho              = cosine(q_select, signature)
 #   raw_tau          = learned cosine-space reference
 #   tau              = -1 + 2 * sigmoid(raw_tau)
-#   margin           = rho - tau
-#   below            = max(-margin, 0)
-#   soft_weight      = exp(-((below / boundary_scale) ** boundary_power))
+#   margin, r        = rho - tau, margin / boundary_scale
+#   d_neg            = lambda_neg * softplus(-r / lambda_neg)
+#   soft_weight      = exp(-(d_neg ** boundary_power) - gamma(p) * exp(-r / A(p)))
 #   gate             = soft_weight * intensity
 #   den              = max(sum(gate), 1.0)
 # ================================================================
@@ -390,8 +390,27 @@ def _boundary_soft_weight_from_margin(margin, boundary_scale, boundary_power):
     boundary_power = jnp.maximum(
         jnp.asarray(boundary_power, dtype=jnp.float32),
         jnp.float32(1.0e-4))
-    below = jnp.maximum(-margin, jnp.float32(0.0))
-    return jnp.exp(-jnp.power(below / boundary_scale, boundary_power))
+    r = margin / boundary_scale
+
+    lambda_neg = jnp.float32(0.10)
+    d_neg = lambda_neg * jax.nn.softplus(-r / lambda_neg)
+
+    alpha = jnp.clip(
+        (jnp.float32(4.0) - boundary_power) / jnp.float32(2.0),
+        jnp.float32(0.0),
+        jnp.float32(1.0))
+
+    gamma_start = jnp.float32(0.15)
+    gamma_final = jnp.float32(0.00)
+    gamma = gamma_final + (gamma_start - gamma_final) * alpha
+
+    A_start = jnp.float32(5.0)
+    A_final = jnp.float32(0.8)
+    A = A_final + (A_start - A_final) * alpha
+
+    active_exp_arg = jnp.minimum(-r / A, jnp.float32(30.0))
+    active_gap = gamma * jnp.exp(active_exp_arg)
+    return jnp.exp(-jnp.power(d_neg, boundary_power) - active_gap)
 
 
 def _boundary_gate_from_margin(margin, intensity, boundary_scale,
