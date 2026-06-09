@@ -88,6 +88,10 @@ from models.dawn_srw_v4162 import (
     _raw_tau_init_from_cosine_tau as _v4162_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4162_tau_init_calibration_scores,
 )
+try:
+    from models.dawn_srw_v4163 import DAWN as DAWN_SRW_V4163
+except ImportError:
+    DAWN_SRW_V4163 = None
 
 # ============================================================
 # Constants
@@ -105,12 +109,19 @@ SRW_ACTIVE_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.0',
     'spatial-r1-v4.1.6.1',
     'spatial-r1-v4.1.6.2',
+    'spatial-r1-v4.1.6.3',
 )
 
 DIRECT_TAU_SPLIT_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.0',
     'spatial-r1-v4.1.6.1',
     'spatial-r1-v4.1.6.2',
+    'spatial-r1-v4.1.6.3',
+)
+
+SOFT_DIRECT_TAU_MODEL_VERSIONS = (
+    'spatial-r1-v4.1.6.2',
+    'spatial-r1-v4.1.6.3',
 )
 
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
@@ -586,7 +597,7 @@ def _dawn_v4152_kwargs(cfg):
 
 
 def _v4162_tau_init_config(cfg):
-    """Parse and validate v4162's explicit or one-time quantile init mode."""
+    """Parse and validate v4162/v4163 explicit or one-time quantile init."""
     model_cfg = cfg['model']
     training_cfg = cfg['training']
 
@@ -600,7 +611,7 @@ def _v4162_tau_init_config(cfg):
     mode = str(_cfg_get('tau_init_mode', 'explicit')).strip().lower()
     if mode not in ('explicit', 'quantile_frac'):
         raise ValueError(
-            "v4162 tau_init_mode must be 'explicit' or 'quantile_frac', "
+            "v4162/v4163 tau_init_mode must be 'explicit' or 'quantile_frac', "
             f"got {mode!r}.")
 
     parsed = {'mode': mode}
@@ -612,7 +623,7 @@ def _v4162_tau_init_config(cfg):
         }
         if any(value is None for value in explicit.values()):
             raise ValueError(
-                "v4162 requires explicit cosine-space tau_init_attn_qk/v/rst.")
+                "v4162/v4163 requires explicit cosine-space tau_init_attn_qk/v/rst.")
         parsed['explicit'] = explicit
         return parsed
 
@@ -622,7 +633,7 @@ def _v4162_tau_init_config(cfg):
         value = _cfg_get(name, None)
         if value is None:
             raise ValueError(
-                f"v4162 tau_init_mode=quantile_frac requires {name}.")
+                f"v4162/v4163 tau_init_mode=quantile_frac requires {name}.")
         value = float(value)
         if not np.isfinite(value) or not (0.0 < value < 1.0):
             raise ValueError(f"{name} must be in (0, 1), got {value}.")
@@ -678,7 +689,7 @@ def _dawn_srw_kwargs(cfg):
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
     if version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1',
-                   'spatial-r1-v4.1.6.2'):
+                   'spatial-r1-v4.1.6.2', 'spatial-r1-v4.1.6.3'):
         def _cfg_get(name, default=None):
             if name in m:
                 return m[name]
@@ -694,7 +705,7 @@ def _dawn_srw_kwargs(cfg):
                     "DirectTau initialization.")
             return val
 
-        if version == 'spatial-r1-v4.1.6.2':
+        if version in SOFT_DIRECT_TAU_MODEL_VERSIONS:
             tau_init_cfg = _v4162_tau_init_config(cfg)
             if tau_init_cfg['mode'] == 'explicit':
                 kw['tau_init_attn_qk'] = tau_init_cfg['explicit']['qk']
@@ -743,8 +754,8 @@ def _v415_sharded_kwargs(cfg):
             cb1a_forward_influence=False,
             cb1a_eps=float(t.get('cb1a_eps', 1.0e-8)),
         )
-    elif version == 'spatial-r1-v4.1.6.2':
-        # v4162 clean path: soft annealed DirectTau only. no CB1A/edge auxiliary kwargs.
+    elif version in SOFT_DIRECT_TAU_MODEL_VERSIONS:
+        # v4162/v4163 clean path: DirectTau only. no CB1A/edge auxiliary kwargs.
         regular_level = str(t.get('regular_diagnostics_level', 'compact')).lower()
         if regular_level not in ('compact', 'full'):
             raise ValueError(
@@ -779,7 +790,8 @@ def _v415_sharded_kwargs(cfg):
             'spatial-r1-v4.1.5.9',
             'spatial-r1-v4.1.6.0',
             'spatial-r1-v4.1.6.1',
-            'spatial-r1-v4.1.6.2') and d_select_cfg is None:
+            'spatial-r1-v4.1.6.2',
+            'spatial-r1-v4.1.6.3') and d_select_cfg is None:
         raise ValueError(
             f"{version} angular SRW requires model.d_select.")
     if d_select_cfg is not None:
@@ -909,6 +921,17 @@ if DAWN_SRW_V4162 is not None:
         sharded_kwargs=_v415_sharded_kwargs,
     )
 
+if DAWN_SRW_V4163 is not None:
+    MODEL_REGISTRY['spatial-r1-v4.1.6.3'] = ModelSpec(
+        name='spatial-r1-v4.1.6.3',
+        module_path='models.dawn_srw_v4163',
+        cls=DAWN_SRW_V4163,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    )
+
 
 def build_model_from_config(cfg):
     """Build model from config via MODEL_REGISTRY.
@@ -940,7 +963,7 @@ def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
         'd_select', cfg['training'].get('d_select', None))
     if d_select is None:
         raise ValueError(
-            "v4162 tau_init_mode=quantile_frac requires model.d_select.")
+            "v4162/v4163 tau_init_mode=quantile_frac requires model.d_select.")
 
     # Keep the one-time JIT signature small: calibration needs only route
     # geometry, not read/write tensors, tau params, or LM output weights.
@@ -1012,7 +1035,7 @@ def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
 
 
 def _set_v4162_quantile_tau_biases(params, tau_summary):
-    """Overwrite only v4162 raw tau biases, preserving the pytree structure."""
+    """Overwrite only v4162/v4163 raw tau biases, preserving the pytree structure."""
     tau = tau_summary['tau_init_quantile_tau']
     raw_qk = _v4162_raw_tau_init_from_cosine_tau(tau['qk'])
     raw_v = _v4162_raw_tau_init_from_cosine_tau(tau['v'])
@@ -1428,7 +1451,7 @@ def _model_accepts_local_diagnostics(model):
 
 
 def _model_accepts_soft_gate_schedule(model):
-    """Return True if model.__call__ accepts v4162 soft-gate schedule kwargs."""
+    """Return True if model.__call__ accepts soft-gate schedule kwargs."""
     import inspect as _inspect
     try:
         params = _inspect.signature(model.__call__).parameters
@@ -1452,6 +1475,16 @@ def _model_accepts_execution_prune_eps(model):
     import inspect as _inspect
     try:
         return 'execution_prune_eps' in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _model_accepts_soft_gate_boundary_power(model):
+    """Return True if model.__call__ accepts v4163 boundary-power kwargs."""
+    import inspect as _inspect
+    try:
+        return 'soft_gate_boundary_power' in _inspect.signature(
+            model.__call__).parameters
     except (TypeError, ValueError):
         return False
 
@@ -1770,6 +1803,30 @@ def scheduled_value_by_frac(step, total_steps, start, final, hold_frac,
 _scheduled_scalar = scheduled_value_by_frac
 
 
+def scheduled_boundary_power_by_frac(
+        step, total_steps, enabled, start, mid, final,
+        mid_frac, final_frac):
+    step_f = jnp.asarray(step, dtype=jnp.float32)
+    total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
+    frac = jnp.clip(step_f / total_f, 0.0, 1.0)
+    start_f = jnp.asarray(start, dtype=jnp.float32)
+    mid_f = jnp.asarray(mid, dtype=jnp.float32)
+    final_f = jnp.asarray(final, dtype=jnp.float32)
+    mid_frac_f = jnp.asarray(mid_frac, dtype=jnp.float32)
+    final_frac_f = jnp.asarray(final_frac, dtype=jnp.float32)
+    eps = jnp.float32(1.0e-6)
+    u_mid = jnp.clip(frac / jnp.maximum(mid_frac_f, eps), 0.0, 1.0)
+    u_final = jnp.clip(
+        (frac - mid_frac_f) / jnp.maximum(final_frac_f - mid_frac_f, eps),
+        0.0, 1.0)
+    mid_val = start_f + (mid_f - start_f) * u_mid
+    final_val = mid_f + (final_f - mid_f) * u_final
+    scheduled = jnp.where(
+        frac < mid_frac_f, mid_val,
+        jnp.where(frac < final_frac_f, final_val, final_f))
+    return jnp.where(jnp.asarray(enabled), scheduled, jnp.float32(2.0))
+
+
 def _soft_gate_schedule_expected_msg():
     return (
         "expected constant, linear, cosine, log, log_linear, log_power, "
@@ -2035,6 +2092,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       soft_gate_t_gompertz_steepness=8.0,
                       soft_gate_t_pool_specific=False,
                       soft_gate_pool_schedules=None,
+                      soft_gate_boundary_power_enabled=False,
+                      soft_gate_boundary_power_start=2.0,
+                      soft_gate_boundary_power_mid=3.0,
+                      soft_gate_boundary_power_final=4.0,
+                      soft_gate_boundary_power_mid_frac=0.180,
+                      soft_gate_boundary_power_final_frac=0.400,
                       rpe_start_frac=0.0,
                       rpe_full_frac=0.0,
                       rpe_schedule='linear',
@@ -2180,12 +2243,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
+    _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
-    _is_v4162_clean = (str(_model_version) == 'spatial-r1-v4.1.6.2')
-    if _is_v4162_clean:
-        # v4162 is the soft annealed DirectTau path. Keep the loss surface
+    _is_soft_direct_tau = str(_model_version) in SOFT_DIRECT_TAU_MODEL_VERSIONS
+    _is_v4163_boundary = str(_model_version) == 'spatial-r1-v4.1.6.3'
+    if _is_soft_direct_tau:
+        # v4162/v4163 are the clean DirectTau paths. Keep the loss surface
         # auditable: CE + scheduled RPE only. All hard-boundary dead repair,
         # CB1A/boundary auxiliaries, and removed legacy margin auxiliaries are
         # disabled here without affecting v4160/v4161.
@@ -2208,7 +2273,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         str(_model_version) == 'spatial-r1-v4.1.6.0')
 
     _soft_gate_runtime_enabled = bool(
-        soft_gate_enabled and str(_model_version) == 'spatial-r1-v4.1.6.2')
+        soft_gate_enabled and _is_soft_direct_tau)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -2235,6 +2300,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
              or _soft_gate_schedule == 'developmental_band')
          else None),
         _soft_gate_pool_defaults)
+    _soft_gate_boundary_power_enabled = bool(
+        soft_gate_boundary_power_enabled)
+    _soft_gate_boundary_power_start = jnp.float32(
+        soft_gate_boundary_power_start)
+    _soft_gate_boundary_power_mid = jnp.float32(
+        soft_gate_boundary_power_mid)
+    _soft_gate_boundary_power_final = jnp.float32(
+        soft_gate_boundary_power_final)
+    _soft_gate_boundary_power_mid_frac = jnp.float32(
+        soft_gate_boundary_power_mid_frac)
+    _soft_gate_boundary_power_final_frac = jnp.float32(
+        soft_gate_boundary_power_final_frac)
     _rpe_start_frac = jnp.float32(rpe_start_frac)
     _rpe_full_frac = jnp.float32(rpe_full_frac)
     _rpe_schedule = str(rpe_schedule).lower()
@@ -2288,6 +2365,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 soft_gate_T_v = jnp.float32(0.07)
                 soft_gate_T_rst = jnp.float32(0.07)
                 rpe_schedule_scale = (step >= _warmup_steps).astype(jnp.float32)
+            boundary_power_p = scheduled_boundary_power_by_frac(
+                step, _total_training_steps,
+                _soft_gate_boundary_power_enabled and _is_v4163_boundary,
+                _soft_gate_boundary_power_start,
+                _soft_gate_boundary_power_mid,
+                _soft_gate_boundary_power_final,
+                _soft_gate_boundary_power_mid_frac,
+                _soft_gate_boundary_power_final_frac)
             soft_gate_T = soft_gate_T_qk
             if _pass_soft_gate_schedule_kw:
                 extra_kw['soft_gate_temperature'] = soft_gate_T
@@ -2298,6 +2383,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     (_explore_weight_q + _explore_weight_k
                      + _explore_weight_v + _explore_weight_rst)
                     / jnp.float32(4.0) * rpe_schedule_scale)
+            if _pass_boundary_power_kw:
+                extra_kw['soft_gate_boundary_power'] = boundary_power_p
+                extra_kw['soft_gate_boundary_power_final'] = (
+                    _soft_gate_boundary_power_final)
             if _pass_soft_gate_t_final_kw:
                 extra_kw['soft_gate_t_final'] = _soft_gate_t_final
             if _pass_execution_prune_kw:
@@ -2721,15 +2810,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _dead_weighted_clip > 0.0,
                 jnp.minimum(dead_penalty_weighted_unclipped, _dead_weighted_clip),
                 dead_penalty_weighted_unclipped)
-            if _is_v4162_clean:
-                # Hard-boundary dead exposure is diagnostic-only in v4162 and
+            if _is_soft_direct_tau:
+                # Hard-boundary dead exposure is diagnostic-only in v4162/v4163 and
                 # must not affect training loss. Soft-gate exposure diagnostics
                 # are reported by the model; no dead repair loss is active here.
                 dead_penalty_weighted_unclipped = jnp.float32(0.0)
                 dead_penalty_weighted = jnp.float32(0.0)
 
-            if _is_v4162_clean:
-                # v4162 loss surface is intentionally clean:
+            if _is_soft_direct_tau:
+                # v4162/v4163 loss surface is intentionally clean:
                 # CE + scheduled RPE only.
                 orth_loss = jnp.float32(0.0)
                 div_loss = jnp.float32(0.0)
@@ -2843,6 +2932,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 soft_gate_T_qk=soft_gate_T_qk,
                 soft_gate_T_v=soft_gate_T_v,
                 soft_gate_T_rst=soft_gate_T_rst,
+                boundary_power_p=boundary_power_p,
                 rpe_schedule_scale=rpe_schedule_scale,
             )
             result_payload = result
@@ -3530,7 +3620,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         removed_margin_reg_weighted_total_metric = explore_stats[
             'removed_margin_reg_weighted_total']
 
-        if _is_v4162_clean:
+        if _is_soft_direct_tau:
             aux_loss_weighted_metric = jnp.float32(0.0)
             load_balance_loss_weighted_metric = jnp.float32(0.0)
             tau_reg_weighted_metric = jnp.float32(0.0)
@@ -3616,6 +3706,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'soft_gate_T_qk': explore_stats['soft_gate_T_qk'],
             'soft_gate_T_v': explore_stats['soft_gate_T_v'],
             'soft_gate_T_rst': explore_stats['soft_gate_T_rst'],
+            'boundary_power_p': explore_stats['boundary_power_p'],
             'rpe_effective_weight': (
                 (_explore_weight_q + _explore_weight_k
                  + _explore_weight_v + _explore_weight_rst)
@@ -3931,7 +4022,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'rst_weak_exposure_frac', jnp.float32(0.0)),
             'rst_dead_exposure_target': result.get(
                 'rst_dead_exposure_target', jnp.float32(0.0)),
-            # v4162 soft-gate exposure diagnostics. Old hard-boundary
+            # v4162/v4163 soft-gate exposure diagnostics. Old hard-boundary
             # exposure keys above are kept for v4160/v4161 compatibility.
             'attn_soft_exposure_mean': result.get('attn_soft_exposure_mean', jnp.float32(0.0)),
             'attn_soft_exposure_min': result.get('attn_soft_exposure_min', jnp.float32(0.0)),
@@ -4308,7 +4399,13 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_t_gompertz_center=0.25,
                      soft_gate_t_gompertz_steepness=8.0,
                      soft_gate_t_pool_specific=False,
-                     soft_gate_pool_schedules=None):
+                     soft_gate_pool_schedules=None,
+                     soft_gate_boundary_power_enabled=False,
+                     soft_gate_boundary_power_start=2.0,
+                     soft_gate_boundary_power_mid=3.0,
+                     soft_gate_boundary_power_final=4.0,
+                     soft_gate_boundary_power_mid_frac=0.180,
+                     soft_gate_boundary_power_final_frac=0.400):
     """Create a jit-compiled evaluation step.
 
     Uses the SLIM forward (analysis=False). Eval normally needs only loss /
@@ -4319,12 +4416,16 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
+    _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _execution_prune_eps = jnp.float32(execution_prune_eps)
     _return_prune_stats = bool(return_prune_stats)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        == 'spatial-r1-v4.1.6.2')
+        in SOFT_DIRECT_TAU_MODEL_VERSIONS)
+    _is_v4163_boundary = (
+        getattr(model, '__version__', getattr(type(model), '__version__', ''))
+        == 'spatial-r1-v4.1.6.3')
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -4351,6 +4452,18 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
              or _soft_gate_schedule == 'developmental_band')
          else None),
         _soft_gate_pool_defaults)
+    _soft_gate_boundary_power_enabled = bool(
+        soft_gate_boundary_power_enabled)
+    _soft_gate_boundary_power_start = jnp.float32(
+        soft_gate_boundary_power_start)
+    _soft_gate_boundary_power_mid = jnp.float32(
+        soft_gate_boundary_power_mid)
+    _soft_gate_boundary_power_final = jnp.float32(
+        soft_gate_boundary_power_final)
+    _soft_gate_boundary_power_mid_frac = jnp.float32(
+        soft_gate_boundary_power_mid_frac)
+    _soft_gate_boundary_power_final_frac = jnp.float32(
+        soft_gate_boundary_power_final_frac)
 
     @jax.jit
     def eval_step(params, input_ids, attention_mask, step):
@@ -4370,6 +4483,18 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                 step, _total_training_steps, _soft_gate_pool_cfg['v'])
             extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
                 step, _total_training_steps, _soft_gate_pool_cfg['rst'])
+        if _pass_boundary_power_kw:
+            boundary_power_p = scheduled_boundary_power_by_frac(
+                step, _total_training_steps,
+                _soft_gate_boundary_power_enabled and _is_v4163_boundary,
+                _soft_gate_boundary_power_start,
+                _soft_gate_boundary_power_mid,
+                _soft_gate_boundary_power_final,
+                _soft_gate_boundary_power_mid_frac,
+                _soft_gate_boundary_power_final_frac)
+            extra_kw['soft_gate_boundary_power'] = boundary_power_p
+            extra_kw['soft_gate_boundary_power_final'] = (
+                _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_execution_prune_kw:
@@ -4420,7 +4545,13 @@ def create_analysis_step(model, sharded_fns=None,
                          soft_gate_t_gompertz_center=0.25,
                          soft_gate_t_gompertz_steepness=8.0,
                          soft_gate_t_pool_specific=False,
-                         soft_gate_pool_schedules=None):
+                         soft_gate_pool_schedules=None,
+                         soft_gate_boundary_power_enabled=False,
+                         soft_gate_boundary_power_start=2.0,
+                         soft_gate_boundary_power_mid=3.0,
+                         soft_gate_boundary_power_final=4.0,
+                         soft_gate_boundary_power_mid_frac=0.180,
+                         soft_gate_boundary_power_final_frac=0.400):
     """Create a jit-compiled analysis step (FULL forward, observational).
 
     Runs the model with `analysis=True` and the ANALYSIS variant of
@@ -4432,10 +4563,14 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
+    _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        == 'spatial-r1-v4.1.6.2')
+        in SOFT_DIRECT_TAU_MODEL_VERSIONS)
+    _is_v4163_boundary = (
+        getattr(model, '__version__', getattr(type(model), '__version__', ''))
+        == 'spatial-r1-v4.1.6.3')
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -4462,6 +4597,18 @@ def create_analysis_step(model, sharded_fns=None,
              or _soft_gate_schedule == 'developmental_band')
          else None),
         _soft_gate_pool_defaults)
+    _soft_gate_boundary_power_enabled = bool(
+        soft_gate_boundary_power_enabled)
+    _soft_gate_boundary_power_start = jnp.float32(
+        soft_gate_boundary_power_start)
+    _soft_gate_boundary_power_mid = jnp.float32(
+        soft_gate_boundary_power_mid)
+    _soft_gate_boundary_power_final = jnp.float32(
+        soft_gate_boundary_power_final)
+    _soft_gate_boundary_power_mid_frac = jnp.float32(
+        soft_gate_boundary_power_mid_frac)
+    _soft_gate_boundary_power_final_frac = jnp.float32(
+        soft_gate_boundary_power_final_frac)
 
     @jax.jit
     def analysis_step(params, input_ids, attention_mask, step):
@@ -4481,6 +4628,18 @@ def create_analysis_step(model, sharded_fns=None,
                 step, _total_training_steps, _soft_gate_pool_cfg['v'])
             extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
                 step, _total_training_steps, _soft_gate_pool_cfg['rst'])
+        if _pass_boundary_power_kw:
+            boundary_power_p = scheduled_boundary_power_by_frac(
+                step, _total_training_steps,
+                _soft_gate_boundary_power_enabled and _is_v4163_boundary,
+                _soft_gate_boundary_power_start,
+                _soft_gate_boundary_power_mid,
+                _soft_gate_boundary_power_final,
+                _soft_gate_boundary_power_mid_frac,
+                _soft_gate_boundary_power_final_frac)
+            extra_kw['soft_gate_boundary_power'] = boundary_power_p
+            extra_kw['soft_gate_boundary_power_final'] = (
+                _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_execution_prune_kw:
@@ -4606,7 +4765,13 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                             soft_gate_t_gompertz_center=0.25,
                             soft_gate_t_gompertz_steepness=8.0,
                             soft_gate_t_pool_specific=False,
-                            soft_gate_pool_schedules=None):
+                            soft_gate_pool_schedules=None,
+                            soft_gate_boundary_power_enabled=False,
+                            soft_gate_boundary_power_start=2.0,
+                            soft_gate_boundary_power_mid=3.0,
+                            soft_gate_boundary_power_final=4.0,
+                            soft_gate_boundary_power_mid_frac=0.180,
+                            soft_gate_boundary_power_final_frac=0.400):
     """Event-only forward probe. No gradients, no optimizer updates.
 
     Two-pass design for v4.1.6.0+ focused spike debugging:
@@ -4622,10 +4787,14 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
+    _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        == 'spatial-r1-v4.1.6.2')
+        in SOFT_DIRECT_TAU_MODEL_VERSIONS)
+    _is_v4163_boundary = (
+        getattr(model, '__version__', getattr(type(model), '__version__', ''))
+        == 'spatial-r1-v4.1.6.3')
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -4652,6 +4821,18 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
              or _soft_gate_schedule == 'developmental_band')
          else None),
         _soft_gate_pool_defaults)
+    _soft_gate_boundary_power_enabled = bool(
+        soft_gate_boundary_power_enabled)
+    _soft_gate_boundary_power_start = jnp.float32(
+        soft_gate_boundary_power_start)
+    _soft_gate_boundary_power_mid = jnp.float32(
+        soft_gate_boundary_power_mid)
+    _soft_gate_boundary_power_final = jnp.float32(
+        soft_gate_boundary_power_final)
+    _soft_gate_boundary_power_mid_frac = jnp.float32(
+        soft_gate_boundary_power_mid_frac)
+    _soft_gate_boundary_power_final_frac = jnp.float32(
+        soft_gate_boundary_power_final_frac)
     _topk = int(topk)
 
     @jax.jit
@@ -4674,6 +4855,18 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                 step, _total_training_steps, _soft_gate_pool_cfg['v'])
             extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
                 step, _total_training_steps, _soft_gate_pool_cfg['rst'])
+        if _pass_boundary_power_kw:
+            boundary_power_p = scheduled_boundary_power_by_frac(
+                step, _total_training_steps,
+                _soft_gate_boundary_power_enabled and _is_v4163_boundary,
+                _soft_gate_boundary_power_start,
+                _soft_gate_boundary_power_mid,
+                _soft_gate_boundary_power_final,
+                _soft_gate_boundary_power_mid_frac,
+                _soft_gate_boundary_power_final_frac)
+            extra_kw['soft_gate_boundary_power'] = boundary_power_p
+            extra_kw['soft_gate_boundary_power_final'] = (
+                _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_execution_prune_kw:
@@ -6083,6 +6276,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'soft_gate_T_v', m.get('soft_gate_T', 0.0))),
         'soft_gate_T_rst': float(m.get(
             'soft_gate_T_rst', m.get('soft_gate_T', 0.0))),
+        'boundary_power_p': float(m.get(
+            'boundary_power_p',
+            m.get('soft_gate_boundary_power', 2.0))),
         'soft_gate_schedule': ctx.get('soft_gate_schedule', 'cosine'),
         'soft_gate_t_gompertz_center': float(ctx.get(
             'soft_gate_t_gompertz_center', 0.25)),
@@ -6765,7 +6961,7 @@ def _print_cb1a_regular_block(rec):
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
-    is_v4162_soft = ctx.get('model_version') == 'spatial-r1-v4.1.6.2'
+    is_v4162_soft = ctx.get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS
     is_v4162_compact = (
         is_v4162_soft
         and str(ctx.get('regular_diagnostics_level', 'compact')).lower()
@@ -6791,10 +6987,19 @@ def _print_regular_block(rec, ctx):
                 f" v={rec['attn_v_strong']*100:.1f}%"
                 f" rst={rec['rst_strong']*100:.1f}%"
             )
+            _soft_gate_label = (
+                'soft_gate_B'
+                if ctx.get('model_version') == 'spatial-r1-v4.1.6.3'
+                else 'soft_gate_T')
+            _power_part = (
+                f" boundary_power_p={rec.get('boundary_power_p', 2.0):.3f}"
+                if ctx.get('model_version') == 'spatial-r1-v4.1.6.3'
+                else "")
             log_message(
-                f"  soft_gate_T: qk={rec['soft_gate_T_qk']:.6f}"
+                f"  {_soft_gate_label}: qk={rec['soft_gate_T_qk']:.6f}"
                 f" v={rec['soft_gate_T_v']:.6f}"
                 f" rst={rec['soft_gate_T_rst']:.6f}"
+                f"{_power_part}"
             )
         else:
             log_message(
@@ -6889,7 +7094,7 @@ def _print_regular_block(rec, ctx):
             f" attn_v={rec['drift_attn_v_emb']:.2e}"
             f" rst={rec['drift_rst_emb']:.2e}]"
         )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.6.2':
+    if ctx.get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS:
         pass
     elif ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_message(
@@ -8702,10 +8907,19 @@ def _print_debug_block(rec, ctx):
         f"lr={_g('lr'):.3e}"
     )
     if _g('soft_gate_T', 0.0) > 0.0:
+        _soft_gate_label = (
+            'soft_gate_B'
+            if ctx.get('model_version') == 'spatial-r1-v4.1.6.3'
+            else 'soft_gate_T')
+        _power_part = (
+            f" boundary_power_p={_g('boundary_power_p', 2.0):.3f}"
+            if ctx.get('model_version') == 'spatial-r1-v4.1.6.3'
+            else "")
         log_debug_message(
-            f"soft_gate_T: qk={_g('soft_gate_T_qk', _g('soft_gate_T')):.6f} "
+            f"{_soft_gate_label}: qk={_g('soft_gate_T_qk', _g('soft_gate_T')):.6f} "
             f"v={_g('soft_gate_T_v', _g('soft_gate_T')):.6f} "
             f"rst={_g('soft_gate_T_rst', _g('soft_gate_T')):.6f}"
+            f"{_power_part}"
         )
         log_debug_message(
             f"rpe_effective_weight={_g('rpe_effective_weight', _g('exploration_weight_effective')):.6f} "
@@ -8735,7 +8949,7 @@ def _print_debug_block(rec, ctx):
         f"recon_err={_g('reconstructed_loss_error'):.3e}"
     )
     if is_v4160:
-        if ctx.get('model_version') != 'spatial-r1-v4.1.6.2':
+        if ctx.get('model_version') not in SOFT_DIRECT_TAU_MODEL_VERSIONS:
             log_debug_message(
                 f"removed_margin_reg: "
                 f"raw[qk={_g('removed_margin_reg_raw_qk'):.6f} "
@@ -8803,7 +9017,7 @@ def _print_debug_block(rec, ctx):
             f"rst=({_g('cb1a_rst_challenge_weight', 0.0):.4g},"
             f"{_g('cb1a_rst_prune_weight', 0.0):.4g})]"
         )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.6.2':
+    if ctx.get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS:
         log_debug_message(
             f"soft_exposure_diag: "
             f"mean[qk={_g('attn_qk_soft_exposure_mean'):+.5f} "
@@ -8993,7 +9207,7 @@ def _print_debug_block(rec, ctx):
             f"no_active[attn={_g('attn_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
         )
     elif ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS:
-        _is_v4162_soft = ctx.get('model_version') == 'spatial-r1-v4.1.6.2'
+        _is_v4162_soft = ctx.get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS
         _weight_label = 'soft_weight' if _is_v4162_soft else 'positive_margin'
         _select_status = ""
         if not _is_v4162_soft:
@@ -9797,7 +10011,7 @@ def main():
     model_version_cfg = cfg['model'].get('model_version', 'dawn_srw')
     tau_init_cfg = (
         _v4162_tau_init_config(cfg)
-        if model_version_cfg == 'spatial-r1-v4.1.6.2'
+        if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
         else None)
     # Optional config-driven resume. CLI --resume remains an override for
     # ad-hoc launches, but diagnostic configs can be one-shot.
@@ -9894,8 +10108,8 @@ def main():
         'removed_margin_reg_weight_v', 0.0)
     removed_margin_reg_weight_rst = tcfg.get(
         'removed_margin_reg_weight_rst', 0.0)
-    if model_version_cfg == 'spatial-r1-v4.1.6.2':
-        # v4162 clean path has no hard-boundary dead repair or configurable
+    if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS:
+        # v4162/v4163 clean paths have no hard-boundary dead repair or configurable
         # selection-margin auxiliary.  Keep config defaults harmless even if
         # an old YAML/checkpoint config contains legacy nonzero values.
         dead_penalty_weight = 0.0
@@ -9958,11 +10172,12 @@ def main():
     exploration_normalize_by_layers = bool(tcfg.get(
         'exploration_normalize_by_layers',
         exploration_normalize_by_layers_default))
-    if model_version_cfg == 'spatial-r1-v4.1.6.2':
+    if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS:
         exploration_normalize_by_layers = True
     rpe_enabled = bool(tcfg.get('rpe_enabled', True))
     soft_gate_enabled = bool(tcfg.get(
-        'soft_gate_enabled', model_version_cfg == 'spatial-r1-v4.1.6.2'))
+        'soft_gate_enabled',
+        model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS))
     soft_gate_t_start = float(tcfg.get('soft_gate_t_start', 1.5))
     soft_gate_t_final = float(tcfg.get('soft_gate_t_final', 0.07))
     soft_gate_t_hold_frac = float(tcfg.get('soft_gate_t_hold_frac', 0.10))
@@ -9982,10 +10197,25 @@ def main():
         soft_gate_t_hold_frac, soft_gate_t_anneal_end_frac,
         soft_gate_schedule, soft_gate_t_power,
         soft_gate_t_gompertz_center, soft_gate_t_gompertz_steepness)
+    soft_gate_boundary_power_enabled = bool(tcfg.get(
+        'soft_gate_boundary_power_enabled',
+        model_version_cfg == 'spatial-r1-v4.1.6.3'))
+    soft_gate_boundary_power_start = float(tcfg.get(
+        'soft_gate_boundary_power_start', 2.0))
+    soft_gate_boundary_power_mid = float(tcfg.get(
+        'soft_gate_boundary_power_mid', 3.0))
+    soft_gate_boundary_power_final = float(tcfg.get(
+        'soft_gate_boundary_power_final', 4.0))
+    soft_gate_boundary_power_mid_frac = float(tcfg.get(
+        'soft_gate_boundary_power_mid_frac', 0.180))
+    soft_gate_boundary_power_final_frac = float(tcfg.get(
+        'soft_gate_boundary_power_final_frac', 0.400))
     soft_gate_effective_active_eps = float(
         tcfg.get('soft_gate_effective_active_eps', 1.0e-6))
     regular_diagnostics_level_default = (
-        'compact' if model_version_cfg == 'spatial-r1-v4.1.6.2' else 'full')
+        'compact'
+        if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
+        else 'full')
     regular_diagnostics_level = str(tcfg.get(
         'regular_diagnostics_level',
         regular_diagnostics_level_default)).lower()
@@ -10001,20 +10231,23 @@ def main():
     effective_prune_eps_list = list(
         tcfg.get('effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
     eval_effective_prune_enabled = bool(tcfg.get(
-        'eval_effective_prune_enabled', model_version_cfg == 'spatial-r1-v4.1.6.2'))
+        'eval_effective_prune_enabled',
+        model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS))
     eval_effective_prune_eps_list = list(tcfg.get(
         'eval_effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
-    if model_version_cfg != 'spatial-r1-v4.1.6.2':
+    if model_version_cfg not in SOFT_DIRECT_TAU_MODEL_VERSIONS:
         eval_effective_prune_enabled = False
         eval_effective_prune_eps_list = []
     ignored_tau_ce_grad_scale_keys = (
         sorted(k for k in tcfg if k.startswith('tau_ce_grad_scale'))
-        if model_version_cfg == 'spatial-r1-v4.1.6.2'
+        if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
         else [])
     rpe_start_frac = float(tcfg.get(
-        'rpe_start_frac', 0.20 if model_version_cfg == 'spatial-r1-v4.1.6.2' else 0.0))
+        'rpe_start_frac',
+        0.20 if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS else 0.0))
     rpe_full_frac = float(tcfg.get(
-        'rpe_full_frac', 0.45 if model_version_cfg == 'spatial-r1-v4.1.6.2' else 0.0))
+        'rpe_full_frac',
+        0.45 if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS else 0.0))
     rpe_schedule = str(tcfg.get('rpe_schedule', 'linear'))
     if not rpe_enabled:
         exploration_weight = 0.0
@@ -10285,7 +10518,7 @@ def main():
                 'dead_penalty_rst_weight', dead_penalty_rst_weight)
             dead_exposure_target = float(saved_training_config.get(
                 'dead_exposure_target', dead_exposure_target))
-            if model_version_cfg == 'spatial-r1-v4.1.6.2':
+            if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS:
                 dead_penalty_weight = 0.0
                 dead_penalty_qk_weight = 0.0
                 dead_penalty_v_weight = 0.0
@@ -10376,6 +10609,30 @@ def main():
                     'regular_projected_eps', regular_projected_eps)]
             regular_mass_enabled = bool(saved_training_config.get(
                 'regular_mass_enabled', regular_mass_enabled))
+            soft_gate_boundary_power_enabled = bool(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_enabled',
+                    soft_gate_boundary_power_enabled))
+            soft_gate_boundary_power_start = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_start',
+                    soft_gate_boundary_power_start))
+            soft_gate_boundary_power_mid = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_mid',
+                    soft_gate_boundary_power_mid))
+            soft_gate_boundary_power_final = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_final',
+                    soft_gate_boundary_power_final))
+            soft_gate_boundary_power_mid_frac = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_mid_frac',
+                    soft_gate_boundary_power_mid_frac))
+            soft_gate_boundary_power_final_frac = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_final_frac',
+                    soft_gate_boundary_power_final_frac))
             if model_version_cfg == 'spatial-r1-v4.1.6.1':
                 # Older 4161 checkpoints may have saved rpe_enabled=False and
                 # exploration_weight=0 because the old code hard-disabled RPE.
@@ -10568,6 +10825,26 @@ def main():
                 _validate_soft_gate_schedule_config(
                     f"soft_gate_t_{_pool}", _cfg,
                     require_pool_specific_devband_fields=True)
+    if soft_gate_boundary_power_enabled:
+        if soft_gate_boundary_power_start <= 0.0:
+            raise ValueError(
+                "soft_gate_boundary_power_start must be > 0, got "
+                f"{soft_gate_boundary_power_start}")
+        if soft_gate_boundary_power_mid <= 0.0:
+            raise ValueError(
+                "soft_gate_boundary_power_mid must be > 0, got "
+                f"{soft_gate_boundary_power_mid}")
+        if soft_gate_boundary_power_final <= 0.0:
+            raise ValueError(
+                "soft_gate_boundary_power_final must be > 0, got "
+                f"{soft_gate_boundary_power_final}")
+        if not (0.0 < soft_gate_boundary_power_mid_frac
+                < soft_gate_boundary_power_final_frac <= 1.0):
+            raise ValueError(
+                "soft_gate_boundary_power fractions must satisfy "
+                "0 < mid_frac < final_frac <= 1, got "
+                f"{soft_gate_boundary_power_mid_frac}, "
+                f"{soft_gate_boundary_power_final_frac}")
 
     # Build training_config dict for saving in checkpoints
     training_config = {
@@ -10619,6 +10896,12 @@ def main():
         'soft_gate_t_gompertz_steepness': soft_gate_t_gompertz_steepness,
         'soft_gate_t_pool_specific': soft_gate_t_pool_specific,
         **_flatten_soft_gate_pool_schedules(soft_gate_pool_schedules),
+        'soft_gate_boundary_power_enabled': soft_gate_boundary_power_enabled,
+        'soft_gate_boundary_power_start': soft_gate_boundary_power_start,
+        'soft_gate_boundary_power_mid': soft_gate_boundary_power_mid,
+        'soft_gate_boundary_power_final': soft_gate_boundary_power_final,
+        'soft_gate_boundary_power_mid_frac': soft_gate_boundary_power_mid_frac,
+        'soft_gate_boundary_power_final_frac': soft_gate_boundary_power_final_frac,
         'soft_gate_effective_active_eps': soft_gate_effective_active_eps,
         'regular_diagnostics_level': regular_diagnostics_level,
         'regular_current_eps': regular_current_eps,
@@ -10701,7 +10984,7 @@ def main():
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
-    if model_version_cfg == 'spatial-r1-v4.1.6.2':
+    if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS:
         training_config['tau_init_mode'] = tau_init_cfg['mode']
         if tau_init_cfg['mode'] == 'quantile_frac':
             training_config.update({
@@ -11082,7 +11365,7 @@ def main():
               f"exposure_target={dead_exposure_target} "
               f"direct_w[qk={dead_penalty_qk_weight}, v={dead_penalty_v_weight}, "
               f"rst={dead_penalty_rst_weight}]")
-        if model_version_cfg != 'spatial-r1-v4.1.6.2':
+        if model_version_cfg not in SOFT_DIRECT_TAU_MODEL_VERSIONS:
             print("  Selection-margin regularization: "
                   f"qk={removed_margin_reg_weight_qk} "
                   f"v={removed_margin_reg_weight_v} "
@@ -11100,7 +11383,7 @@ def main():
             print(f"    warmup_steps={exploration_warmup_steps} "
                   f"bounds=[{exploration_lower_bound}, {exploration_upper_bound}] "
                   f"eps={exploration_bound_eps}")
-        if model_version_cfg != 'spatial-r1-v4.1.6.2':
+        if model_version_cfg not in SOFT_DIRECT_TAU_MODEL_VERSIONS:
             print("  CB1A: "
                   f"enabled={cb1a_enabled} "
                   f"ce_mode={cb1a_ce_mode} eps={cb1a_eps}")
@@ -11127,14 +11410,35 @@ def main():
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
                 f"scan_scale={tcfg.get('scan_scale', 0.0)}"
             )
-        elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.2':
-            print("  Module path: models.dawn_srw_v4162")
+        elif cfg['model'].get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS:
+            _soft_model_version = cfg['model'].get('model_version')
+            _soft_module_path = (
+                'models.dawn_srw_v4163'
+                if _soft_model_version == 'spatial-r1-v4.1.6.3'
+                else 'models.dawn_srw_v4162')
+            print(f"  Module path: {_soft_module_path}")
             print("  Tau parameterization: bounded sigmoid min/max")
             print("  tau = -1 + 2 * sigmoid(raw_tau)")
-            print("  Soft gate:")
+            if _soft_model_version == 'spatial-r1-v4.1.6.3':
+                print("  Boundary gate: one-sided generalized Gaussian")
+                print("  gate = exp(-((max(tau-score,0)/B)^p)) * intensity")
+                print("  Boundary power:")
+                print(
+                    f"    enabled={soft_gate_boundary_power_enabled} "
+                    f"start={soft_gate_boundary_power_start} "
+                    f"mid={soft_gate_boundary_power_mid} "
+                    f"final={soft_gate_boundary_power_final} "
+                    f"mid_frac={soft_gate_boundary_power_mid_frac} "
+                    f"final_frac={soft_gate_boundary_power_final_frac}")
+            else:
+                print("  Soft gate:")
             print(f"    enabled={soft_gate_enabled} "
                   f"pool_specific={soft_gate_t_pool_specific} "
                   f"effective_active_eps={soft_gate_effective_active_eps}")
+            _scale_label = (
+                'B'
+                if _soft_model_version == 'spatial-r1-v4.1.6.3'
+                else 'T')
             def _devband_summary(_cfg):
                 return (
                     f"sort={_cfg['sort']} band={_cfg['band']} "
@@ -11161,8 +11465,8 @@ def main():
                             if _schedule_name == 'log_gompertz'
                             else f"power={_cfg['power']} ")
                         print(
-                            f"    {_pool}: T_start={_cfg['start']} "
-                            f"T_final={_cfg['final']} "
+                            f"    {_pool}: {_scale_label}_start={_cfg['start']} "
+                            f"{_scale_label}_final={_cfg['final']} "
                             f"hold_frac={_cfg['hold_frac']} "
                             f"anneal_end_frac={_cfg['anneal_end_frac']} "
                             f"schedule={_cfg['schedule']} {_shape_msg}")
@@ -11177,8 +11481,8 @@ def main():
                         f"gompertz_steepness={soft_gate_t_gompertz_steepness} "
                         if soft_gate_schedule.lower() == 'log_gompertz'
                         else f"power={soft_gate_t_power} ")
-                    print(f"    T_start={soft_gate_t_start} "
-                          f"T_final={soft_gate_t_final} "
+                    print(f"    {_scale_label}_start={soft_gate_t_start} "
+                          f"{_scale_label}_final={soft_gate_t_final} "
                           f"hold_frac={soft_gate_t_hold_frac} "
                           f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
                           f"schedule={soft_gate_schedule} "
@@ -11187,7 +11491,7 @@ def main():
                   "tau_ce_grad_scale=removed")
             if ignored_tau_ce_grad_scale_keys:
                 print("  tau_ce_grad_scale config fields are ignored in "
-                      "v4162; tau movement is controlled by tau_lr_mult.")
+                      "v4162/v4163; tau movement is controlled by tau_lr_mult.")
             print("  RPE schedule:")
             print(f"    start_frac={rpe_start_frac} full_frac={rpe_full_frac} "
                   f"final exploration_weight={exploration_weight} "
@@ -11241,7 +11545,8 @@ def main():
                     'spatial-r1-v4.1.5.9',
                     'spatial-r1-v4.1.6.0',
                     'spatial-r1-v4.1.6.1',
-                    'spatial-r1-v4.1.6.2'):
+                    'spatial-r1-v4.1.6.2',
+                    'spatial-r1-v4.1.6.3'):
                 gate_msg += (
                     f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                     f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -11304,7 +11609,7 @@ def main():
     tau_init_summary = None
     _has_resume_checkpoint = bool(
         resume_path is not None and _file_exists(resume_path))
-    if (model_version_cfg == 'spatial-r1-v4.1.6.2'
+    if (model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
             and tau_init_cfg['mode'] == 'quantile_frac'
             and not _has_resume_checkpoint):
         if len(train_loader) <= 0:
@@ -11647,6 +11952,12 @@ def main():
         soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
         soft_gate_t_pool_specific=soft_gate_t_pool_specific,
         soft_gate_pool_schedules=soft_gate_pool_schedules,
+        soft_gate_boundary_power_enabled=soft_gate_boundary_power_enabled,
+        soft_gate_boundary_power_start=soft_gate_boundary_power_start,
+        soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
+        soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+        soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
+        soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
         rpe_start_frac=rpe_start_frac,
         rpe_full_frac=rpe_full_frac,
         rpe_schedule=rpe_schedule,
@@ -11655,7 +11966,7 @@ def main():
         debug_diagnostics=debug_mode,
         debug_local_spikes=_train_local_diag,
         compact_train_metrics=(
-            model_version_cfg == 'spatial-r1-v4.1.6.2'
+            model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
             and regular_diagnostics_level == 'compact'
             and not debug_mode
             and not _train_local_diag),
@@ -11674,7 +11985,13 @@ def main():
         soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
         soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
         soft_gate_t_pool_specific=soft_gate_t_pool_specific,
-        soft_gate_pool_schedules=soft_gate_pool_schedules)
+        soft_gate_pool_schedules=soft_gate_pool_schedules,
+        soft_gate_boundary_power_enabled=soft_gate_boundary_power_enabled,
+        soft_gate_boundary_power_start=soft_gate_boundary_power_start,
+        soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
+        soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+        soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
+        soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac)
     eval_prune_step_fns = {}
     if eval_effective_prune_enabled:
         for _eps in eval_effective_prune_eps_list:
@@ -11693,7 +12010,13 @@ def main():
                 soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
                 soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
                 soft_gate_t_pool_specific=soft_gate_t_pool_specific,
-                soft_gate_pool_schedules=soft_gate_pool_schedules)
+                soft_gate_pool_schedules=soft_gate_pool_schedules,
+                soft_gate_boundary_power_enabled=soft_gate_boundary_power_enabled,
+                soft_gate_boundary_power_start=soft_gate_boundary_power_start,
+                soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
+                soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+                soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
+                soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac)
     # v4.1: analysis_step is only meaningful when the full analysis
     # kernels exist. Older model versions skip it -analysis logging
     # degrades to empty then.
@@ -11711,7 +12034,13 @@ def main():
             soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
             soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
             soft_gate_t_pool_specific=soft_gate_t_pool_specific,
-            soft_gate_pool_schedules=soft_gate_pool_schedules)
+            soft_gate_pool_schedules=soft_gate_pool_schedules,
+            soft_gate_boundary_power_enabled=soft_gate_boundary_power_enabled,
+            soft_gate_boundary_power_start=soft_gate_boundary_power_start,
+            soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
+            soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+            soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
+            soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac)
     else:
         analysis_step_fn = None
     spike_probe_step_fn = None
@@ -11731,7 +12060,13 @@ def main():
             soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
             soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
             soft_gate_t_pool_specific=soft_gate_t_pool_specific,
-            soft_gate_pool_schedules=soft_gate_pool_schedules)
+            soft_gate_pool_schedules=soft_gate_pool_schedules,
+            soft_gate_boundary_power_enabled=soft_gate_boundary_power_enabled,
+            soft_gate_boundary_power_start=soft_gate_boundary_power_start,
+            soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
+            soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+            soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
+            soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac)
     # No current-train-batch debug forward: --debug uses regular scalar
     # train_step metrics. Local spike diagnostics require training.debug_local_spikes=true.
     debug_forward_step_fn = None
@@ -13091,6 +13426,18 @@ def main():
                             soft_gate_t_gompertz_center,
                         'soft_gate_t_gompertz_steepness':
                             soft_gate_t_gompertz_steepness,
+                        'soft_gate_boundary_power_enabled':
+                            soft_gate_boundary_power_enabled,
+                        'soft_gate_boundary_power_start':
+                            soft_gate_boundary_power_start,
+                        'soft_gate_boundary_power_mid':
+                            soft_gate_boundary_power_mid,
+                        'soft_gate_boundary_power_final':
+                            soft_gate_boundary_power_final,
+                        'soft_gate_boundary_power_mid_frac':
+                            soft_gate_boundary_power_mid_frac,
+                        'soft_gate_boundary_power_final_frac':
+                            soft_gate_boundary_power_final_frac,
                         'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
                         'd_select': int(cfg['model'].get('d_select', 0) or 0),
                         'd_intensity': int(
@@ -13197,6 +13544,18 @@ def main():
                         soft_gate_t_gompertz_center,
                     'soft_gate_t_gompertz_steepness':
                         soft_gate_t_gompertz_steepness,
+                    'soft_gate_boundary_power_enabled':
+                        soft_gate_boundary_power_enabled,
+                    'soft_gate_boundary_power_start':
+                        soft_gate_boundary_power_start,
+                    'soft_gate_boundary_power_mid':
+                        soft_gate_boundary_power_mid,
+                    'soft_gate_boundary_power_final':
+                        soft_gate_boundary_power_final,
+                    'soft_gate_boundary_power_mid_frac':
+                        soft_gate_boundary_power_mid_frac,
+                    'soft_gate_boundary_power_final_frac':
+                        soft_gate_boundary_power_final_frac,
                     'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
                     'd_select': int(cfg['model'].get('d_select', 0) or 0),
                     'd_intensity': int(
