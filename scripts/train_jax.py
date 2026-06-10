@@ -92,6 +92,16 @@ try:
     from models.dawn_srw_v4163 import DAWN as DAWN_SRW_V4163
 except ImportError:
     DAWN_SRW_V4163 = None
+try:
+    from models.dawn_srw_v4164 import (
+        DAWN as DAWN_SRW_V4164,
+        _raw_tau_init_from_cosine_tau as _v4164_raw_tau_init_from_cosine_tau,
+        _tau_init_calibration_scores as _v4164_tau_init_calibration_scores,
+    )
+except ImportError:
+    DAWN_SRW_V4164 = None
+    _v4164_raw_tau_init_from_cosine_tau = None
+    _v4164_tau_init_calibration_scores = None
 
 # ============================================================
 # Constants
@@ -110,6 +120,7 @@ SRW_ACTIVE_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.1',
     'spatial-r1-v4.1.6.2',
     'spatial-r1-v4.1.6.3',
+    'spatial-r1-v4.1.6.4',
 )
 
 DIRECT_TAU_SPLIT_MODEL_VERSIONS = (
@@ -117,11 +128,18 @@ DIRECT_TAU_SPLIT_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.1',
     'spatial-r1-v4.1.6.2',
     'spatial-r1-v4.1.6.3',
+    'spatial-r1-v4.1.6.4',
 )
 
 SOFT_DIRECT_TAU_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.2',
     'spatial-r1-v4.1.6.3',
+    'spatial-r1-v4.1.6.4',
+)
+
+ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS = (
+    'spatial-r1-v4.1.6.3',
+    'spatial-r1-v4.1.6.4',
 )
 
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
@@ -597,7 +615,7 @@ def _dawn_v4152_kwargs(cfg):
 
 
 def _v4162_tau_init_config(cfg):
-    """Parse and validate v4162/v4163 explicit or one-time quantile init."""
+    """Parse and validate v4162/v4163/v4164 explicit or quantile tau init."""
     model_cfg = cfg['model']
     training_cfg = cfg['training']
 
@@ -611,7 +629,7 @@ def _v4162_tau_init_config(cfg):
     mode = str(_cfg_get('tau_init_mode', 'explicit')).strip().lower()
     if mode not in ('explicit', 'quantile_frac'):
         raise ValueError(
-            "v4162/v4163 tau_init_mode must be 'explicit' or 'quantile_frac', "
+            "v4162/v4163/v4164 tau_init_mode must be 'explicit' or 'quantile_frac', "
             f"got {mode!r}.")
 
     parsed = {'mode': mode}
@@ -623,7 +641,8 @@ def _v4162_tau_init_config(cfg):
         }
         if any(value is None for value in explicit.values()):
             raise ValueError(
-                "v4162/v4163 requires explicit cosine-space tau_init_attn_qk/v/rst.")
+                "v4162/v4163/v4164 requires explicit cosine-space "
+                "tau_init_attn_qk/v/rst.")
         parsed['explicit'] = explicit
         return parsed
 
@@ -633,7 +652,8 @@ def _v4162_tau_init_config(cfg):
         value = _cfg_get(name, None)
         if value is None:
             raise ValueError(
-                f"v4162/v4163 tau_init_mode=quantile_frac requires {name}.")
+                f"v4162/v4163/v4164 tau_init_mode=quantile_frac "
+                f"requires {name}.")
         value = float(value)
         if not np.isfinite(value) or not (0.0 < value < 1.0):
             raise ValueError(f"{name} must be in (0, 1), got {value}.")
@@ -689,7 +709,8 @@ def _dawn_srw_kwargs(cfg):
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
     if version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1',
-                   'spatial-r1-v4.1.6.2', 'spatial-r1-v4.1.6.3'):
+                   'spatial-r1-v4.1.6.2', 'spatial-r1-v4.1.6.3',
+                   'spatial-r1-v4.1.6.4'):
         def _cfg_get(name, default=None):
             if name in m:
                 return m[name]
@@ -724,7 +745,8 @@ def _dawn_srw_kwargs(cfg):
                 'legacy_count_init_attn_v')
             kw['legacy_count_init_rst'] = _legacy_count_init_cfg(
                 'legacy_count_init_rst')
-        if ('d_select' in m or 'd_select' in t):
+        if (version != 'spatial-r1-v4.1.6.4'
+                and ('d_select' in m or 'd_select' in t)):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
     return kw
 
@@ -774,7 +796,7 @@ def _v415_sharded_kwargs(cfg):
             regular_mass_enabled=bool(t.get('regular_mass_enabled', False)),
             regular_sparsity_enabled=bool(t.get(
                 'regular_sparsity_enabled',
-                version != 'spatial-r1-v4.1.6.3')),
+                version not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)),
         )
     else:
         kw = dict(
@@ -784,8 +806,8 @@ def _v415_sharded_kwargs(cfg):
             scan_scale=t.get('scan_scale', 0.01),
             scan_std_floor=t.get('scan_std_floor', 0.5),
         )
-    # v4.1.5.9/v4.1.6.x angular routing uses model.d_select directly:
-    #   d_intensity = d_route - d_select
+    # v4.1.5.9-v4.1.6.3 split d_route into select/intensity dims.
+    # v4.1.6.4 keeps d_route as one unified angular space.
     m = cfg['model']
     d_route = int(m.get('d_route', m.get('d_bottleneck', 128)))
     d_select_cfg = m.get('d_select', t.get('d_select', None))
@@ -797,7 +819,9 @@ def _v415_sharded_kwargs(cfg):
             'spatial-r1-v4.1.6.3') and d_select_cfg is None:
         raise ValueError(
             f"{version} angular SRW requires model.d_select.")
-    if d_select_cfg is not None:
+    if version == 'spatial-r1-v4.1.6.4':
+        intensity_route_dim = 0
+    elif d_select_cfg is not None:
         d_select = int(d_select_cfg)
         if not (0 < d_select < d_route):
             raise ValueError(
@@ -935,6 +959,17 @@ if DAWN_SRW_V4163 is not None:
         sharded_kwargs=_v415_sharded_kwargs,
     )
 
+if DAWN_SRW_V4164 is not None:
+    MODEL_REGISTRY['spatial-r1-v4.1.6.4'] = ModelSpec(
+        name='spatial-r1-v4.1.6.4',
+        module_path='models.dawn_srw_v4164',
+        cls=DAWN_SRW_V4164,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    )
+
 
 def build_model_from_config(cfg):
     """Build model from config via MODEL_REGISTRY.
@@ -962,11 +997,17 @@ def build_model_from_config(cfg):
 def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
                                      tau_init_cfg):
     """Compute host-side quantiles from a small deterministic score sample."""
+    version = cfg['model'].get('model_version', 'dawn_srw')
+    is_v4164 = version == 'spatial-r1-v4.1.6.4'
     d_select = cfg['model'].get(
         'd_select', cfg['training'].get('d_select', None))
-    if d_select is None:
+    if d_select is None and not is_v4164:
         raise ValueError(
             "v4162/v4163 tau_init_mode=quantile_frac requires model.d_select.")
+    if is_v4164 and _v4164_tau_init_calibration_scores is None:
+        raise ValueError(
+            "v4164 tau_init_mode=quantile_frac requires "
+            "models.dawn_srw_v4164 to import cleanly.")
 
     # Keep the one-time JIT signature small: calibration needs only route
     # geometry, not read/write tensors, tau params, or LM output weights.
@@ -987,11 +1028,16 @@ def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
             'rst_emb': params['neuron_pool']['rst_emb'],
         },
     }
-    score_fn = jax.jit(partial(
-        _v4162_tau_init_calibration_scores,
-        d_select=int(d_select),
-        max_tokens=tau_init_cfg['calibration_tokens'],
-    ))
+    score_impl = (
+        _v4164_tau_init_calibration_scores
+        if is_v4164
+        else _v4162_tau_init_calibration_scores)
+    score_kwargs = {
+        'max_tokens': tau_init_cfg['calibration_tokens'],
+    }
+    if not is_v4164:
+        score_kwargs['d_select'] = int(d_select)
+    score_fn = jax.jit(partial(score_impl, **score_kwargs))
     sampled = jax.device_get(score_fn(score_params, input_ids))
     scores = {
         name: np.asarray(value, dtype=np.float32).reshape(-1)
@@ -1038,7 +1084,7 @@ def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
 
 
 def _set_v4162_quantile_tau_biases(params, tau_summary):
-    """Overwrite only v4162/v4163 raw tau biases, preserving the pytree structure."""
+    """Overwrite v4162+ raw tau biases, preserving the pytree structure."""
     tau = tau_summary['tau_init_quantile_tau']
     raw_qk = _v4162_raw_tau_init_from_cosine_tau(tau['qk'])
     raw_v = _v4162_raw_tau_init_from_cosine_tau(tau['v'])
@@ -2251,9 +2297,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_soft_direct_tau = str(_model_version) in SOFT_DIRECT_TAU_MODEL_VERSIONS
-    _is_v4163_boundary = str(_model_version) == 'spatial-r1-v4.1.6.3'
+    _is_boundary_power_model = (
+        str(_model_version) in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
     if _is_soft_direct_tau:
-        # v4162/v4163 are the clean DirectTau paths. Keep the loss surface
+        # v4162+ soft DirectTau paths keep the loss surface
         # auditable: CE + scheduled RPE only. All hard-boundary dead repair,
         # CB1A/boundary auxiliaries, and removed legacy margin auxiliaries are
         # disabled here without affecting v4160/v4161.
@@ -2370,7 +2417,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 rpe_schedule_scale = (step >= _warmup_steps).astype(jnp.float32)
             boundary_power_p = scheduled_boundary_power_by_frac(
                 step, _total_training_steps,
-                _soft_gate_boundary_power_enabled and _is_v4163_boundary,
+                _soft_gate_boundary_power_enabled and _is_boundary_power_model,
                 _soft_gate_boundary_power_start,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
@@ -4426,9 +4473,9 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
         in SOFT_DIRECT_TAU_MODEL_VERSIONS)
-    _is_v4163_boundary = (
+    _is_boundary_power_model = (
         getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        == 'spatial-r1-v4.1.6.3')
+        in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -4489,7 +4536,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         if _pass_boundary_power_kw:
             boundary_power_p = scheduled_boundary_power_by_frac(
                 step, _total_training_steps,
-                _soft_gate_boundary_power_enabled and _is_v4163_boundary,
+                _soft_gate_boundary_power_enabled and _is_boundary_power_model,
                 _soft_gate_boundary_power_start,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
@@ -4571,9 +4618,9 @@ def create_analysis_step(model, sharded_fns=None,
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
         in SOFT_DIRECT_TAU_MODEL_VERSIONS)
-    _is_v4163_boundary = (
+    _is_boundary_power_model = (
         getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        == 'spatial-r1-v4.1.6.3')
+        in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -4634,7 +4681,7 @@ def create_analysis_step(model, sharded_fns=None,
         if _pass_boundary_power_kw:
             boundary_power_p = scheduled_boundary_power_by_frac(
                 step, _total_training_steps,
-                _soft_gate_boundary_power_enabled and _is_v4163_boundary,
+                _soft_gate_boundary_power_enabled and _is_boundary_power_model,
                 _soft_gate_boundary_power_start,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
@@ -4795,9 +4842,9 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
         in SOFT_DIRECT_TAU_MODEL_VERSIONS)
-    _is_v4163_boundary = (
+    _is_boundary_power_model = (
         getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        == 'spatial-r1-v4.1.6.3')
+        in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -4861,7 +4908,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
         if _pass_boundary_power_kw:
             boundary_power_p = scheduled_boundary_power_by_frac(
                 step, _total_training_steps,
-                _soft_gate_boundary_power_enabled and _is_v4163_boundary,
+                _soft_gate_boundary_power_enabled and _is_boundary_power_model,
                 _soft_gate_boundary_power_start,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
@@ -6576,6 +6623,39 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_act_cost_mean': float(m.get('rst_act_cost_mean', 0.0)),
         'attn_current_cost_mean': float(m.get('attn_current_cost_mean', 0.0)),
         'rst_current_cost_mean': float(m.get('rst_current_cost_mean', 0.0)),
+        'admission_den_sum': float(m.get('admission_den_sum', 0.0)),
+        'attn_admission_den_sum': float(m.get('attn_admission_den_sum', 0.0)),
+        'attn_qk_admission_den_sum': float(m.get('attn_qk_admission_den_sum', 0.0)),
+        'attn_v_admission_den_sum': float(m.get('attn_v_admission_den_sum', 0.0)),
+        'rst_admission_den_sum': float(m.get('rst_admission_den_sum', 0.0)),
+        'compose_mass_sum': float(m.get('compose_mass_sum', 0.0)),
+        'attn_compose_mass_sum': float(m.get('attn_compose_mass_sum', 0.0)),
+        'attn_qk_compose_mass_sum': float(m.get('attn_qk_compose_mass_sum', 0.0)),
+        'attn_v_compose_mass_sum': float(m.get('attn_v_compose_mass_sum', 0.0)),
+        'rst_compose_mass_sum': float(m.get('rst_compose_mass_sum', 0.0)),
+        'angular_depth_mean': float(m.get('angular_depth_mean', 0.0)),
+        'attn_angular_depth_mean': float(m.get('attn_angular_depth_mean', 0.0)),
+        'rst_angular_depth_mean': float(m.get('rst_angular_depth_mean', 0.0)),
+        'angular_depth_max': float(m.get('angular_depth_max', 0.0)),
+        'attn_angular_depth_max': float(m.get('attn_angular_depth_max', 0.0)),
+        'attn_qk_angular_depth_max': float(m.get('attn_qk_angular_depth_max', 0.0)),
+        'attn_v_angular_depth_max': float(m.get('attn_v_angular_depth_max', 0.0)),
+        'rst_angular_depth_max': float(m.get('rst_angular_depth_max', 0.0)),
+        'compose_eff_n': float(m.get('compose_eff_n', 0.0)),
+        'attn_compose_eff_n': float(m.get('attn_compose_eff_n', 0.0)),
+        'attn_qk_compose_eff_n': float(m.get('attn_qk_compose_eff_n', 0.0)),
+        'attn_v_compose_eff_n': float(m.get('attn_v_compose_eff_n', 0.0)),
+        'rst_compose_eff_n': float(m.get('rst_compose_eff_n', 0.0)),
+        'compose_top1_frac': float(m.get('compose_top1_frac', 0.0)),
+        'compose_top1_frac_max': float(m.get('compose_top1_frac_max', 0.0)),
+        'attn_compose_top1_frac': float(m.get('attn_compose_top1_frac', 0.0)),
+        'attn_compose_top1_frac_max': float(m.get('attn_compose_top1_frac_max', 0.0)),
+        'attn_qk_compose_top1_frac': float(m.get('attn_qk_compose_top1_frac', 0.0)),
+        'attn_qk_compose_top1_frac_max': float(m.get('attn_qk_compose_top1_frac_max', 0.0)),
+        'attn_v_compose_top1_frac': float(m.get('attn_v_compose_top1_frac', 0.0)),
+        'attn_v_compose_top1_frac_max': float(m.get('attn_v_compose_top1_frac_max', 0.0)),
+        'rst_compose_top1_frac': float(m.get('rst_compose_top1_frac', 0.0)),
+        'rst_compose_top1_frac_max': float(m.get('rst_compose_top1_frac_max', 0.0)),
         'attn_gate_sum': float(m.get('attn_gate_sum', 0.0)),
         'rst_gate_sum': float(m.get('rst_gate_sum', 0.0)),
         'attn_active_n_mean': float(m.get('attn_active_n_mean', 0.0)),
@@ -6993,11 +7073,11 @@ def _print_regular_block(rec, ctx):
             )
             _soft_gate_label = (
                 'soft_gate_B'
-                if ctx.get('model_version') == 'spatial-r1-v4.1.6.3'
+                if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
                 else 'soft_gate_T')
             _power_part = (
                 f" boundary_power_p={rec.get('boundary_power_p', 2.0):.3f}"
-                if ctx.get('model_version') == 'spatial-r1-v4.1.6.3'
+                if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
                 else "")
             log_message(
                 f"  {_soft_gate_label}: qk={rec['soft_gate_T_qk']:.6f}"
@@ -7041,9 +7121,13 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['rst_no_active_frac']*100:.2f}%]"
         )
     elif is_v4160:
-        _weight_label = 'soft_weight' if is_v4162_soft else 'pos'
+        _weight_label = (
+            'admission'
+            if ctx.get('model_version') == 'spatial-r1-v4.1.6.4'
+            else ('soft_weight' if is_v4162_soft else 'pos'))
         _select_status = ""
-        if is_v4162_soft and ctx.get('model_version') == 'spatial-r1-v4.1.6.3':
+        if (is_v4162_soft
+                and ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS):
             _select_status = (
                 f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
                 f" v={rec['attn_v_selected_frac']*100:.1f}%"
@@ -7148,18 +7232,36 @@ def _print_regular_block(rec, ctx):
                 f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
                 f" v={rec['attn_v_pool_scale']:.3f}"
                 f" rst={rec['rst_pool_scale']:.3f}")
-        log_message(
-            f"  gate_conc: qk[eff={rec['attn_qk_gate_eff_n']:.1f}"
-            f" ratio={rec['attn_qk_gate_eff_ratio']:.3f}"
-            f" top1={rec['attn_qk_top1_gate_frac']:.3f}]"
-            f" v[eff={rec['attn_v_gate_eff_n']:.1f}"
-            f" ratio={rec['attn_v_gate_eff_ratio']:.3f}"
-            f" top1={rec['attn_v_top1_gate_frac']:.3f}]"
-            f" rst[eff={rec['rst_gate_eff_n']:.1f}"
-            f" ratio={rec['rst_gate_eff_ratio']:.3f}"
-            f" top1={rec['rst_top1_gate_frac']:.3f}]"
-            f"{_pool_scale_part}"
-        )
+        if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
+            log_message(
+                f"  compose_conc: qk[eff={rec['attn_qk_compose_eff_n']:.1f}"
+                f" top1={rec['attn_qk_compose_top1_frac']:.3f}]"
+                f" v[eff={rec['attn_v_compose_eff_n']:.1f}"
+                f" top1={rec['attn_v_compose_top1_frac']:.3f}]"
+                f" rst[eff={rec['rst_compose_eff_n']:.1f}"
+                f" top1={rec['rst_compose_top1_frac']:.3f}]"
+                f"{_pool_scale_part}"
+            )
+            log_message(
+                f"  angular_depth: mean={rec['angular_depth_mean']:.5f}"
+                f" max={rec['angular_depth_max']:.5f}"
+                f" admission_den[qk={rec['attn_qk_admission_den_sum']:.1f}"
+                f" v={rec['attn_v_admission_den_sum']:.1f}"
+                f" rst={rec['rst_admission_den_sum']:.1f}]"
+            )
+        else:
+            log_message(
+                f"  gate_conc: qk[eff={rec['attn_qk_gate_eff_n']:.1f}"
+                f" ratio={rec['attn_qk_gate_eff_ratio']:.3f}"
+                f" top1={rec['attn_qk_top1_gate_frac']:.3f}]"
+                f" v[eff={rec['attn_v_gate_eff_n']:.1f}"
+                f" ratio={rec['attn_v_gate_eff_ratio']:.3f}"
+                f" top1={rec['attn_v_top1_gate_frac']:.3f}]"
+                f" rst[eff={rec['rst_gate_eff_n']:.1f}"
+                f" ratio={rec['rst_gate_eff_ratio']:.3f}"
+                f" top1={rec['rst_top1_gate_frac']:.3f}]"
+                f"{_pool_scale_part}"
+            )
     else:
         log_message(
             f"  gate_conc: a[eff={rec['attn_gate_eff_n']:.1f}"
@@ -7174,11 +7276,18 @@ def _print_regular_block(rec, ctx):
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
         if is_v4160:
-            log_message(
-                f"  gate_den_sum mean[qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
-                f" v={rec['attn_v_gate_den_sum_mean']:.1f}"
-                f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
-            )
+            if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
+                log_message(
+                    f"  compose_mass mean[qk={rec['attn_qk_compose_mass_sum']:.1f}"
+                    f" v={rec['attn_v_compose_mass_sum']:.1f}"
+                    f" rst={rec['rst_compose_mass_sum']:.1f}]"
+                )
+            else:
+                log_message(
+                    f"  gate_den_sum mean[qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
+                    f" v={rec['attn_v_gate_den_sum_mean']:.1f}"
+                    f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
+                )
         else:
             log_message(
                 f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
@@ -8921,11 +9030,11 @@ def _print_debug_block(rec, ctx):
     if _g('soft_gate_T', 0.0) > 0.0:
         _soft_gate_label = (
             'soft_gate_B'
-            if ctx.get('model_version') == 'spatial-r1-v4.1.6.3'
+            if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
             else 'soft_gate_T')
         _power_part = (
             f" boundary_power_p={_g('boundary_power_p', 2.0):.3f}"
-            if ctx.get('model_version') == 'spatial-r1-v4.1.6.3'
+            if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
             else "")
         log_debug_message(
             f"{_soft_gate_label}: qk={_g('soft_gate_T_qk', _g('soft_gate_T')):.6f} "
@@ -9610,6 +9719,39 @@ def _build_analysis_record(base, metrics, ctx):
         'rst_activation_cost': float(m.get('rst_activation_cost', 0.0)),
         'attn_current_cost': float(m.get('attn_current_cost', 0.0)),
         'rst_current_cost': float(m.get('rst_current_cost', 0.0)),
+        'admission_den_sum': float(m.get('admission_den_sum', 0.0)),
+        'attn_admission_den_sum': float(m.get('attn_admission_den_sum', 0.0)),
+        'attn_qk_admission_den_sum': float(m.get('attn_qk_admission_den_sum', 0.0)),
+        'attn_v_admission_den_sum': float(m.get('attn_v_admission_den_sum', 0.0)),
+        'rst_admission_den_sum': float(m.get('rst_admission_den_sum', 0.0)),
+        'compose_mass_sum': float(m.get('compose_mass_sum', 0.0)),
+        'attn_compose_mass_sum': float(m.get('attn_compose_mass_sum', 0.0)),
+        'attn_qk_compose_mass_sum': float(m.get('attn_qk_compose_mass_sum', 0.0)),
+        'attn_v_compose_mass_sum': float(m.get('attn_v_compose_mass_sum', 0.0)),
+        'rst_compose_mass_sum': float(m.get('rst_compose_mass_sum', 0.0)),
+        'angular_depth_mean': float(m.get('angular_depth_mean', 0.0)),
+        'attn_angular_depth_mean': float(m.get('attn_angular_depth_mean', 0.0)),
+        'rst_angular_depth_mean': float(m.get('rst_angular_depth_mean', 0.0)),
+        'angular_depth_max': float(m.get('angular_depth_max', 0.0)),
+        'attn_angular_depth_max': float(m.get('attn_angular_depth_max', 0.0)),
+        'attn_qk_angular_depth_max': float(m.get('attn_qk_angular_depth_max', 0.0)),
+        'attn_v_angular_depth_max': float(m.get('attn_v_angular_depth_max', 0.0)),
+        'rst_angular_depth_max': float(m.get('rst_angular_depth_max', 0.0)),
+        'compose_eff_n': float(m.get('compose_eff_n', 0.0)),
+        'attn_compose_eff_n': float(m.get('attn_compose_eff_n', 0.0)),
+        'attn_qk_compose_eff_n': float(m.get('attn_qk_compose_eff_n', 0.0)),
+        'attn_v_compose_eff_n': float(m.get('attn_v_compose_eff_n', 0.0)),
+        'rst_compose_eff_n': float(m.get('rst_compose_eff_n', 0.0)),
+        'compose_top1_frac': float(m.get('compose_top1_frac', 0.0)),
+        'compose_top1_frac_max': float(m.get('compose_top1_frac_max', 0.0)),
+        'attn_compose_top1_frac': float(m.get('attn_compose_top1_frac', 0.0)),
+        'attn_compose_top1_frac_max': float(m.get('attn_compose_top1_frac_max', 0.0)),
+        'attn_qk_compose_top1_frac': float(m.get('attn_qk_compose_top1_frac', 0.0)),
+        'attn_qk_compose_top1_frac_max': float(m.get('attn_qk_compose_top1_frac_max', 0.0)),
+        'attn_v_compose_top1_frac': float(m.get('attn_v_compose_top1_frac', 0.0)),
+        'attn_v_compose_top1_frac_max': float(m.get('attn_v_compose_top1_frac_max', 0.0)),
+        'rst_compose_top1_frac': float(m.get('rst_compose_top1_frac', 0.0)),
+        'rst_compose_top1_frac_max': float(m.get('rst_compose_top1_frac_max', 0.0)),
         'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
         'debug_residual_norm_max': float(m.get('debug_residual_norm_max', 0.0)),
         'debug_token_emb_norm': float(m.get('debug_token_emb_norm', m.get('debug_emb_norm', 0.0))),
@@ -9792,7 +9934,7 @@ def _print_analysis_block(rec, ctx):
             f" std={_g('rst_rho_std'):.5f}"
             f" max={_g('rst_rho_max'):.5f}]"
         )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.6.3':
+    if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS:
         _print_v4162_sparsity_block(rec, 'full')
     log_message(
         f"  boundary k[phi={rec['rst_phi_binary']*100:.1f}%"
@@ -10213,7 +10355,7 @@ def main():
         soft_gate_t_gompertz_center, soft_gate_t_gompertz_steepness)
     soft_gate_boundary_power_enabled = bool(tcfg.get(
         'soft_gate_boundary_power_enabled',
-        model_version_cfg == 'spatial-r1-v4.1.6.3'))
+        model_version_cfg in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS))
     soft_gate_boundary_power_start = float(tcfg.get(
         'soft_gate_boundary_power_start', 3.0))
     soft_gate_boundary_power_mid = float(tcfg.get(
@@ -10244,7 +10386,7 @@ def main():
     regular_mass_enabled = bool(tcfg.get('regular_mass_enabled', False))
     regular_sparsity_enabled = bool(tcfg.get(
         'regular_sparsity_enabled',
-        model_version_cfg != 'spatial-r1-v4.1.6.3'))
+        model_version_cfg not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS))
     effective_prune_eps_list = list(
         tcfg.get('effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
     eval_effective_prune_enabled = bool(tcfg.get(
@@ -11432,16 +11574,17 @@ def main():
             )
         elif cfg['model'].get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS:
             _soft_model_version = cfg['model'].get('model_version')
-            _soft_module_path = (
-                'models.dawn_srw_v4163'
-                if _soft_model_version == 'spatial-r1-v4.1.6.3'
-                else 'models.dawn_srw_v4162')
+            _soft_module_path = MODEL_REGISTRY[_soft_model_version].module_path
             print(f"  Module path: {_soft_module_path}")
             print("  Tau parameterization: bounded sigmoid min/max")
             print("  tau = -1 + 2 * sigmoid(raw_tau)")
-            if _soft_model_version == 'spatial-r1-v4.1.6.3':
-                print("  Boundary gate: one-sided generalized Gaussian")
-                print("  gate = exp(-((max(tau-score,0)/B)^p)) * intensity")
+            if _soft_model_version in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS:
+                print("  Boundary admission: one-sided generalized Gaussian")
+                if _soft_model_version == 'spatial-r1-v4.1.6.4':
+                    print("  compose = admission * B * softplus((rho-tau)/B) / (1-tau+eps)")
+                    print("  den = max(sum(admission), 1.0)")
+                else:
+                    print("  gate = exp(-((max(tau-score,0)/B)^p)) * intensity")
                 print("  Boundary power:")
                 print(
                     f"    enabled={soft_gate_boundary_power_enabled} "
@@ -11457,7 +11600,7 @@ def main():
                   f"effective_active_eps={soft_gate_effective_active_eps}")
             _scale_label = (
                 'B'
-                if _soft_model_version == 'spatial-r1-v4.1.6.3'
+                if _soft_model_version in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
                 else 'T')
             def _devband_summary(_cfg):
                 return (
@@ -11511,7 +11654,7 @@ def main():
                   "tau_ce_grad_scale=removed")
             if ignored_tau_ce_grad_scale_keys:
                 print("  tau_ce_grad_scale config fields are ignored in "
-                      "v4162/v4163; tau movement is controlled by tau_lr_mult.")
+                      "v4162+; tau movement is controlled by tau_lr_mult.")
             print("  RPE schedule:")
             print(f"    start_frac={rpe_start_frac} full_frac={rpe_full_frac} "
                   f"final exploration_weight={exploration_weight} "
@@ -11526,13 +11669,17 @@ def main():
                 f"sparsity={regular_sparsity_enabled}")
             print(f"    train diagnostic eps={effective_prune_eps_list}")
             print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
+            _gate_intensity_part = (
+                ""
+                if _soft_model_version == 'spatial-r1-v4.1.6.4'
+                else f"intensity_beta={tcfg.get('intensity_beta', 0.5)} ")
             gate_msg = (
                 f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
                 f"tau_init_mode={tau_init_cfg['mode']} "
                 f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
                 f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
                 f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
-                f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
+                f"{_gate_intensity_part}"
                 f"soft_gate_enabled={soft_gate_enabled} "
                 f"dropout={cfg['model'].get('dropout', None)} "
                 f"router_dropout={cfg['model'].get('router_dropout', None)}"
@@ -11567,7 +11714,8 @@ def main():
                     'spatial-r1-v4.1.6.0',
                     'spatial-r1-v4.1.6.1',
                     'spatial-r1-v4.1.6.2',
-                    'spatial-r1-v4.1.6.3'):
+                    'spatial-r1-v4.1.6.3',
+                    'spatial-r1-v4.1.6.4'):
                 gate_msg += (
                     f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                     f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -13281,8 +13429,14 @@ def main():
                             'probe': _probe_decoded,
                         }
                         _diag_ctx = {
-                            'intensity_beta': float(
-                                tcfg.get('intensity_beta', 0.0)),
+                            'intensity_beta': (
+                                0.0
+                                if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                                else float(tcfg.get('intensity_beta', 0.0))),
+                            'd_route_unified': (
+                                int(cfg['model'].get('d_route', 0))
+                                if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                                else 0),
                         }
                         _event['diagnosis'] = _diagnose_spike(
                             _spike_rec, _probe_decoded,
@@ -13460,11 +13614,24 @@ def main():
                             soft_gate_boundary_power_mid_frac,
                         'soft_gate_boundary_power_final_frac':
                             soft_gate_boundary_power_final_frac,
-                        'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
-                        'd_select': int(cfg['model'].get('d_select', 0) or 0),
-                        'd_intensity': int(
-                            cfg['model'].get('d_route', 0)
-                            - cfg['model'].get('d_select', 0)),
+                        'intensity_beta': (
+                            0.0
+                            if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                            else float(tcfg.get('intensity_beta', 0.0))),
+                        'd_select': (
+                            0
+                            if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                            else int(cfg['model'].get('d_select', 0) or 0)),
+                        'd_intensity': (
+                            0
+                            if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                            else int(
+                                cfg['model'].get('d_route', 0)
+                                - cfg['model'].get('d_select', 0))),
+                        'd_route_unified': (
+                            int(cfg['model'].get('d_route', 0))
+                            if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                            else 0),
                     }
                     ctx.update(collapse_warn_ctx)
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
@@ -13579,11 +13746,24 @@ def main():
                         soft_gate_boundary_power_mid_frac,
                     'soft_gate_boundary_power_final_frac':
                         soft_gate_boundary_power_final_frac,
-                    'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
-                    'd_select': int(cfg['model'].get('d_select', 0) or 0),
-                    'd_intensity': int(
-                        cfg['model'].get('d_route', 0)
-                        - cfg['model'].get('d_select', 0)),
+                    'intensity_beta': (
+                        0.0
+                        if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                        else float(tcfg.get('intensity_beta', 0.0))),
+                    'd_select': (
+                        0
+                        if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                        else int(cfg['model'].get('d_select', 0) or 0)),
+                    'd_intensity': (
+                        0
+                        if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                        else int(
+                            cfg['model'].get('d_route', 0)
+                            - cfg['model'].get('d_select', 0))),
+                    'd_route_unified': (
+                        int(cfg['model'].get('d_route', 0))
+                        if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                        else 0),
                 }
                 debug_ctx.update(collapse_warn_ctx)
                 debug_metrics = jax.device_get(metrics)
