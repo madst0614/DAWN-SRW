@@ -1398,7 +1398,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             jax.lax.psum(total_edge_margin_stat, 'model')
             / jnp.float32(B * S * N_total))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
-        den = jnp.maximum(global_den_cost, 1.0)
+        # v4164: normalize by admission mass, but detach the denominator.
+        # This preserves the forward scale while preventing a denominator-only
+        # pressure that can close admission/rho to reduce den.
+        den_live = jnp.maximum(global_den_cost, 1.0)
+        den = jax.lax.stop_gradient(den_live)
         out = raw_out / den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
@@ -1422,8 +1426,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         tau_direct = _block_tau_up_when_no_active(
             tau, no_active_direct.astype(jnp.bool_))
         # Measurement path: detached copies for diagnostics / feedback refs.
-        # Action path above keeps global_den_cost/global_weighted_cost live for
-        # the SRW denominator and output gradient.
+        # The forward denominator is already detached above; numerator paths
+        # through compose_weight remain live for SRW output gradients.
         global_weighted_cost_m = jax.lax.stop_gradient(global_weighted_cost)
         global_gate_sq_m = jax.lax.stop_gradient(global_gate_sq)
         global_den_cost_m = jax.lax.stop_gradient(global_den_cost)
@@ -2522,7 +2526,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             jax.lax.psum(total_edge_margin_stat, 'model')
             / jnp.float32(B * S * 2 * N_total))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
-        den = jnp.maximum(global_den_cost, 1.0)
+        # v4164: normalize by admission mass, but detach the denominator.
+        # This preserves the forward scale while preventing a denominator-only
+        # pressure that can close admission/rho to reduce den.
+        den_live = jnp.maximum(global_den_cost, 1.0)
+        den = jax.lax.stop_gradient(den_live)
         out = raw_out / den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
@@ -2546,8 +2554,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         tau_direct = _block_tau_up_when_no_active(
             tau, no_active_direct.astype(jnp.bool_))
         # Measurement path: detached copies for diagnostics / feedback refs.
-        # Action path above keeps global_den_cost/global_weighted_cost live for
-        # the SRW denominator and output gradient.
+        # The forward denominator is already detached above; numerator paths
+        # through compose_weight remain live for SRW output gradients.
         global_weighted_cost_m = jax.lax.stop_gradient(global_weighted_cost)
         global_gate_sq_m = jax.lax.stop_gradient(global_gate_sq)
         global_den_cost_m = jax.lax.stop_gradient(global_den_cost)
