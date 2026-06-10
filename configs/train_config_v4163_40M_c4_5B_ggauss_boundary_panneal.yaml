@@ -133,7 +133,7 @@ training:
   regular_mass_enabled: false
   regular_sparsity_enabled: false
 
-  intensity_beta: 0.5
+  intensity_beta: 2.0
 
   eval_effective_prune_enabled: true
   eval_effective_prune_eps_list:
@@ -149,4 +149,4 @@ training:
   crash_snapshot: false
   crash_snapshot_enabled: false
   spike_event_logger: false
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4163_40M_c4_5B_ggauss_boundary_panneal_q10_qkslow_v04_rst02
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4163_40M_c4_5B_ggauss_boundary_panneal_intensity
