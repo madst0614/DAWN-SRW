@@ -72,11 +72,11 @@ training:
   soft_gate_t_pool_specific: true
   soft_gate_effective_active_eps: 1.0e-06
   soft_gate_boundary_power_enabled: true
-  soft_gate_boundary_power_start: 2.0
-  soft_gate_boundary_power_mid: 3.0
+  soft_gate_boundary_power_start: 3.0
+  soft_gate_boundary_power_mid: 3.15
   soft_gate_boundary_power_final: 4.0
-  soft_gate_boundary_power_mid_frac: 0.300
-  soft_gate_boundary_power_final_frac: 0.650
+  soft_gate_boundary_power_mid_frac: 0.800
+  soft_gate_boundary_power_final_frac: 0.950
 
   # Developmental Band Annealing
   # Phase A: no-sorting / direct small target band
@@ -85,42 +85,42 @@ training:
   # Phase D/E: micro-sharpening -> final sparse consolidation
 
   soft_gate_t_qk_schedule: developmental_band
-  soft_gate_t_qk_sort: 0.045
-  soft_gate_t_qk_band: 0.045
-  soft_gate_t_qk_mid: 0.022
-  soft_gate_t_qk_late: 0.008
+  soft_gate_t_qk_sort: 0.035
+  soft_gate_t_qk_band: 0.035
+  soft_gate_t_qk_mid: 0.030
+  soft_gate_t_qk_late: 0.001
   soft_gate_t_qk_final: 0.001
   soft_gate_t_qk_sort_end_frac: 0.0
   soft_gate_t_qk_band_reach_frac: 0.001
-  soft_gate_t_qk_formation_end_frac: 0.300
-  soft_gate_t_qk_sharpen_end_frac: 0.650
-  soft_gate_t_qk_formation_power: 1.5
+  soft_gate_t_qk_formation_end_frac: 0.800
+  soft_gate_t_qk_sharpen_end_frac: 0.950
+  soft_gate_t_qk_formation_power: 2.0
   soft_gate_t_qk_sharpen_power: 1.0
 
   soft_gate_t_v_schedule: developmental_band
   soft_gate_t_v_sort: 0.018
   soft_gate_t_v_band: 0.018
-  soft_gate_t_v_mid: 0.007
-  soft_gate_t_v_late: 0.002
+  soft_gate_t_v_mid: 0.0155
+  soft_gate_t_v_late: 0.001
   soft_gate_t_v_final: 0.001
   soft_gate_t_v_sort_end_frac: 0.0
   soft_gate_t_v_band_reach_frac: 0.001
-  soft_gate_t_v_formation_end_frac: 0.180
-  soft_gate_t_v_sharpen_end_frac: 0.400
-  soft_gate_t_v_formation_power: 1.5
+  soft_gate_t_v_formation_end_frac: 0.800
+  soft_gate_t_v_sharpen_end_frac: 0.950
+  soft_gate_t_v_formation_power: 2.0
   soft_gate_t_v_sharpen_power: 1.0
 
   soft_gate_t_rst_schedule: developmental_band
   soft_gate_t_rst_sort: 0.011
   soft_gate_t_rst_band: 0.011
-  soft_gate_t_rst_mid: 0.0045
-  soft_gate_t_rst_late: 0.0018
+  soft_gate_t_rst_mid: 0.0095
+  soft_gate_t_rst_late: 0.001
   soft_gate_t_rst_final: 0.001
   soft_gate_t_rst_sort_end_frac: 0.0
   soft_gate_t_rst_band_reach_frac: 0.001
-  soft_gate_t_rst_formation_end_frac: 0.180
-  soft_gate_t_rst_sharpen_end_frac: 0.400
-  soft_gate_t_rst_formation_power: 1.5
+  soft_gate_t_rst_formation_end_frac: 0.800
+  soft_gate_t_rst_sharpen_end_frac: 0.950
+  soft_gate_t_rst_formation_power: 2.0
   soft_gate_t_rst_sharpen_power: 1.0
 
   regular_diagnostics_level: compact
@@ -131,6 +131,7 @@ training:
   regular_projected_eps:
   - 1.0e-06
   regular_mass_enabled: false
+  regular_sparsity_enabled: false
 
   intensity_beta: 0.5
 

@@ -396,15 +396,14 @@ def _boundary_soft_weight_from_margin(margin, boundary_scale, boundary_power):
     d_neg = lambda_neg * jax.nn.softplus(-r / lambda_neg)
 
     alpha = jnp.clip(
-        (jnp.float32(4.0) - boundary_power) / jnp.float32(2.0),
+        jnp.float32(4.0) - boundary_power,
         jnp.float32(0.0),
         jnp.float32(1.0))
 
-    gamma_start = jnp.float32(0.15)
-    gamma_final = jnp.float32(0.00)
-    gamma = gamma_final + (gamma_start - gamma_final) * alpha
+    gamma_start = jnp.float32(0.025)
+    gamma = gamma_start * jnp.power(alpha, jnp.float32(3.0))
 
-    A_start = jnp.float32(5.0)
+    A_start = jnp.float32(3.0)
     A_final = jnp.float32(0.8)
     A = A_final + (A_start - A_final) * alpha
 
@@ -490,7 +489,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                      regular_diagnostics_level='compact',
                      regular_current_eps=(1.0e-1, 1.0e-2, 1.0e-3),
                      regular_projected_eps=(1.0e-6,),
-                     regular_mass_enabled=False):
+                     regular_mass_enabled=False,
+                     regular_sparsity_enabled=False):
     """Create fused shard_map'd angular Select + SRW.
 
     Fast train path: one chunked pass computes rho, tau, gate, and SRW.
@@ -525,6 +525,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _soft_gate_enabled = True
     _regular_level = _regular_diag_level(regular_diagnostics_level)
     _compact_regular_diag = (not bool(analysis) and _regular_level == 'compact')
+    _sparsity_diag_enabled = bool(analysis) or bool(regular_sparsity_enabled)
     _regular_current_suffixes = _regular_eps_suffixes(
         regular_current_eps, ('1e_1', '1e_2', '1e_3'),
         GATE_EPS_NAME_SUFFIXES)
@@ -1113,8 +1114,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 gate_unpruned = positive_margin * intensity
                 chunk_current_cost = gate_unpruned.sum(axis=-1, keepdims=True)
                 gate = base_gate
-                chunk_sparsity = gate_sparsity_parts(
-                    selection_margin, intensity, gate)
+                if _sparsity_diag_enabled:
+                    chunk_sparsity = gate_sparsity_parts(
+                        selection_margin, intensity, gate)
+                else:
+                    chunk_sparsity = sparsity_carry0
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
@@ -1256,8 +1260,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 gate_unpruned = positive_margin * intensity
                 chunk_current_cost = gate_unpruned.sum(axis=-1, keepdims=True)
                 gate = base_gate
-                chunk_sparsity = gate_sparsity_parts(
-                    selection_margin, intensity, gate)
+                if _sparsity_diag_enabled:
+                    chunk_sparsity = gate_sparsity_parts(
+                        selection_margin, intensity, gate)
+                else:
+                    chunk_sparsity = sparsity_carry0
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
@@ -1586,7 +1593,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             regular_diagnostics_level='compact',
                             regular_current_eps=(1.0e-1, 1.0e-2, 1.0e-3),
                             regular_projected_eps=(1.0e-6,),
-                            regular_mass_enabled=False):
+                            regular_mass_enabled=False,
+                            regular_sparsity_enabled=False):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
@@ -1608,6 +1616,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _spike_probe_topk = max(1, int(spike_probe_topk))
     _regular_level = _regular_diag_level(regular_diagnostics_level)
     _compact_regular_diag = (not bool(analysis) and _regular_level == 'compact')
+    _sparsity_diag_enabled = bool(analysis) or bool(regular_sparsity_enabled)
     _regular_current_suffixes = _regular_eps_suffixes(
         regular_current_eps, ('1e_1', '1e_2', '1e_3'),
         GATE_EPS_NAME_SUFFIXES)
@@ -2223,8 +2232,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 gate_unpruned = positive_margin * intensity
                 chunk_current_cost = gate_unpruned.sum(axis=-1, keepdims=True)
                 gate = base_gate
-                chunk_sparsity = gate_sparsity_parts(
-                    selection_margin, intensity, gate)
+                if _sparsity_diag_enabled:
+                    chunk_sparsity = gate_sparsity_parts(
+                        selection_margin, intensity, gate)
+                else:
+                    chunk_sparsity = sparsity_carry0
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T  # [B,S,N]
@@ -2372,8 +2384,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 gate_unpruned = positive_margin * intensity
                 chunk_current_cost = gate_unpruned.sum(axis=-1, keepdims=True)
                 gate = base_gate
-                chunk_sparsity = gate_sparsity_parts(
-                    selection_margin, intensity, gate)
+                if _sparsity_diag_enabled:
+                    chunk_sparsity = gate_sparsity_parts(
+                        selection_margin, intensity, gate)
+                else:
+                    chunk_sparsity = sparsity_carry0
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T

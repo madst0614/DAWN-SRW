@@ -772,6 +772,9 @@ def _v415_sharded_kwargs(cfg):
             regular_projected_eps=tuple(
                 float(x) for x in t.get('regular_projected_eps', [1.0e-6])),
             regular_mass_enabled=bool(t.get('regular_mass_enabled', False)),
+            regular_sparsity_enabled=bool(t.get(
+                'regular_sparsity_enabled',
+                version != 'spatial-r1-v4.1.6.3')),
         )
     else:
         kw = dict(
@@ -1819,7 +1822,7 @@ def scheduled_boundary_power_by_frac(
     u_final = jnp.clip(
         (frac - mid_frac_f) / jnp.maximum(final_frac_f - mid_frac_f, eps),
         0.0, 1.0)
-    mid_val = start_f + (mid_f - start_f) * u_mid
+    mid_val = start_f + (mid_f - start_f) * jnp.square(u_mid)
     final_val = mid_f + (final_f - mid_f) * u_final
     scheduled = jnp.where(
         frac < mid_frac_f, mid_val,
@@ -2093,11 +2096,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       soft_gate_t_pool_specific=False,
                       soft_gate_pool_schedules=None,
                       soft_gate_boundary_power_enabled=False,
-                      soft_gate_boundary_power_start=2.0,
-                      soft_gate_boundary_power_mid=3.0,
+                      soft_gate_boundary_power_start=3.0,
+                      soft_gate_boundary_power_mid=3.15,
                       soft_gate_boundary_power_final=4.0,
-                      soft_gate_boundary_power_mid_frac=0.180,
-                      soft_gate_boundary_power_final_frac=0.400,
+                      soft_gate_boundary_power_mid_frac=0.800,
+                      soft_gate_boundary_power_final_frac=0.950,
                       rpe_start_frac=0.0,
                       rpe_full_frac=0.0,
                       rpe_schedule='linear',
@@ -4401,11 +4404,11 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_t_pool_specific=False,
                      soft_gate_pool_schedules=None,
                      soft_gate_boundary_power_enabled=False,
-                     soft_gate_boundary_power_start=2.0,
-                     soft_gate_boundary_power_mid=3.0,
+                     soft_gate_boundary_power_start=3.0,
+                     soft_gate_boundary_power_mid=3.15,
                      soft_gate_boundary_power_final=4.0,
-                     soft_gate_boundary_power_mid_frac=0.180,
-                     soft_gate_boundary_power_final_frac=0.400):
+                     soft_gate_boundary_power_mid_frac=0.800,
+                     soft_gate_boundary_power_final_frac=0.950):
     """Create a jit-compiled evaluation step.
 
     Uses the SLIM forward (analysis=False). Eval normally needs only loss /
@@ -4547,11 +4550,11 @@ def create_analysis_step(model, sharded_fns=None,
                          soft_gate_t_pool_specific=False,
                          soft_gate_pool_schedules=None,
                          soft_gate_boundary_power_enabled=False,
-                         soft_gate_boundary_power_start=2.0,
-                         soft_gate_boundary_power_mid=3.0,
+                         soft_gate_boundary_power_start=3.0,
+                         soft_gate_boundary_power_mid=3.15,
                          soft_gate_boundary_power_final=4.0,
-                         soft_gate_boundary_power_mid_frac=0.180,
-                         soft_gate_boundary_power_final_frac=0.400):
+                         soft_gate_boundary_power_mid_frac=0.800,
+                         soft_gate_boundary_power_final_frac=0.950):
     """Create a jit-compiled analysis step (FULL forward, observational).
 
     Runs the model with `analysis=True` and the ANALYSIS variant of
@@ -4767,11 +4770,11 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                             soft_gate_t_pool_specific=False,
                             soft_gate_pool_schedules=None,
                             soft_gate_boundary_power_enabled=False,
-                            soft_gate_boundary_power_start=2.0,
-                            soft_gate_boundary_power_mid=3.0,
+                            soft_gate_boundary_power_start=3.0,
+                            soft_gate_boundary_power_mid=3.15,
                             soft_gate_boundary_power_final=4.0,
-                            soft_gate_boundary_power_mid_frac=0.180,
-                            soft_gate_boundary_power_final_frac=0.400):
+                            soft_gate_boundary_power_mid_frac=0.800,
+                            soft_gate_boundary_power_final_frac=0.950):
     """Event-only forward probe. No gradients, no optimizer updates.
 
     Two-pass design for v4.1.6.0+ focused spike debugging:
@@ -6979,8 +6982,9 @@ def _print_regular_block(rec, ctx):
     )
     if is_v4160:
         if is_v4162_soft:
-            _print_v4162_sparsity_block(
-                rec, ctx.get('regular_diagnostics_level', 'compact'))
+            if bool(ctx.get('regular_sparsity_enabled', True)):
+                _print_v4162_sparsity_block(
+                    rec, ctx.get('regular_diagnostics_level', 'compact'))
             log_message(
                 f"  strong: q={rec['attn_q_strong']*100:.1f}%"
                 f" k={rec['attn_k_strong']*100:.1f}%"
@@ -7039,7 +7043,15 @@ def _print_regular_block(rec, ctx):
     elif is_v4160:
         _weight_label = 'soft_weight' if is_v4162_soft else 'pos'
         _select_status = ""
-        if not is_v4162_soft:
+        if is_v4162_soft and ctx.get('model_version') == 'spatial-r1-v4.1.6.3':
+            _select_status = (
+                f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
+                f" v={rec['attn_v_selected_frac']*100:.1f}%"
+                f" rst={rec['rst_selected_frac']*100:.1f}%]"
+                f" no_active[qk={rec['attn_qk_no_active_frac']*100:.2f}%"
+                f" v={rec['attn_v_no_active_frac']*100:.2f}%"
+                f" rst={rec['rst_no_active_frac']*100:.2f}%]")
+        elif not is_v4162_soft:
             _select_status = (
                 f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
                 f" v={rec['attn_v_selected_frac']*100:.1f}%"
@@ -9780,6 +9792,8 @@ def _print_analysis_block(rec, ctx):
             f" std={_g('rst_rho_std'):.5f}"
             f" max={_g('rst_rho_max'):.5f}]"
         )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.6.3':
+        _print_v4162_sparsity_block(rec, 'full')
     log_message(
         f"  boundary k[phi={rec['rst_phi_binary']*100:.1f}%"
         f" z<075={rec['rst_z_lt_075']*100:.1f}%"
@@ -10201,15 +10215,15 @@ def main():
         'soft_gate_boundary_power_enabled',
         model_version_cfg == 'spatial-r1-v4.1.6.3'))
     soft_gate_boundary_power_start = float(tcfg.get(
-        'soft_gate_boundary_power_start', 2.0))
+        'soft_gate_boundary_power_start', 3.0))
     soft_gate_boundary_power_mid = float(tcfg.get(
-        'soft_gate_boundary_power_mid', 3.0))
+        'soft_gate_boundary_power_mid', 3.15))
     soft_gate_boundary_power_final = float(tcfg.get(
         'soft_gate_boundary_power_final', 4.0))
     soft_gate_boundary_power_mid_frac = float(tcfg.get(
-        'soft_gate_boundary_power_mid_frac', 0.180))
+        'soft_gate_boundary_power_mid_frac', 0.800))
     soft_gate_boundary_power_final_frac = float(tcfg.get(
-        'soft_gate_boundary_power_final_frac', 0.400))
+        'soft_gate_boundary_power_final_frac', 0.950))
     soft_gate_effective_active_eps = float(
         tcfg.get('soft_gate_effective_active_eps', 1.0e-6))
     regular_diagnostics_level_default = (
@@ -10228,6 +10242,9 @@ def main():
     regular_projected_eps = [
         float(x) for x in tcfg.get('regular_projected_eps', [1.0e-6])]
     regular_mass_enabled = bool(tcfg.get('regular_mass_enabled', False))
+    regular_sparsity_enabled = bool(tcfg.get(
+        'regular_sparsity_enabled',
+        model_version_cfg != 'spatial-r1-v4.1.6.3'))
     effective_prune_eps_list = list(
         tcfg.get('effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
     eval_effective_prune_enabled = bool(tcfg.get(
@@ -10609,6 +10626,8 @@ def main():
                     'regular_projected_eps', regular_projected_eps)]
             regular_mass_enabled = bool(saved_training_config.get(
                 'regular_mass_enabled', regular_mass_enabled))
+            regular_sparsity_enabled = bool(saved_training_config.get(
+                'regular_sparsity_enabled', regular_sparsity_enabled))
             soft_gate_boundary_power_enabled = bool(
                 saved_training_config.get(
                     'soft_gate_boundary_power_enabled',
@@ -10907,6 +10926,7 @@ def main():
         'regular_current_eps': regular_current_eps,
         'regular_projected_eps': regular_projected_eps,
         'regular_mass_enabled': regular_mass_enabled,
+        'regular_sparsity_enabled': regular_sparsity_enabled,
         'effective_prune_eps_list': effective_prune_eps_list,
         'eval_effective_prune_enabled': eval_effective_prune_enabled,
         'eval_effective_prune_eps_list': eval_effective_prune_eps_list,
@@ -11502,7 +11522,8 @@ def main():
                 f"    regular diagnostics={regular_diagnostics_level} "
                 f"current_eps={regular_current_eps} "
                 f"projected_eps={regular_projected_eps} "
-                f"mass={regular_mass_enabled}")
+                f"mass={regular_mass_enabled} "
+                f"sparsity={regular_sparsity_enabled}")
             print(f"    train diagnostic eps={effective_prune_eps_list}")
             print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
             gate_msg = (
@@ -13419,6 +13440,7 @@ def main():
                         'progress': _progress,
                         'model_version': model_version,
                         'regular_diagnostics_level': regular_diagnostics_level,
+                        'regular_sparsity_enabled': regular_sparsity_enabled,
                         'rpe_enabled': bool(rpe_enabled),
                         'soft_gate_schedule': soft_gate_schedule,
                         'soft_gate_t_power': soft_gate_t_power,
@@ -13537,6 +13559,7 @@ def main():
                     'progress': _progress,
                     'model_version': model_version,
                     'regular_diagnostics_level': regular_diagnostics_level,
+                    'regular_sparsity_enabled': regular_sparsity_enabled,
                     'rpe_enabled': bool(rpe_enabled),
                     'soft_gate_schedule': soft_gate_schedule,
                     'soft_gate_t_power': soft_gate_t_power,
