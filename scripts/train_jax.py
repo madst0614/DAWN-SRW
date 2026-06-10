@@ -241,6 +241,18 @@ DIRECT_TAU_EXPOSURE_METRIC_NAMES = (
 )
 DIRECT_TAU_SPARSITY_METRIC_NAMES = (
     'active_tau_frac', 'active_tau_count',
+    'admission_active_eps_1e_6_frac',
+    'admission_active_eps_1e_6_count',
+    'admission_active_eps_1e_5_frac',
+    'admission_active_eps_1e_5_count',
+    'admission_active_eps_1e_4_frac',
+    'admission_active_eps_1e_4_count',
+    'admission_active_eps_1e_3_frac',
+    'admission_active_eps_1e_3_count',
+    'admission_active_eps_1e_2_frac',
+    'admission_active_eps_1e_2_count',
+    'admission_active_eps_1e_1_frac',
+    'admission_active_eps_1e_1_count',
     'active_eps_1e_6_frac', 'active_eps_1e_6_count',
     'active_eps_1e_5_frac', 'active_eps_1e_5_count',
     'active_eps_1e_4_frac', 'active_eps_1e_4_count',
@@ -270,9 +282,47 @@ DIRECT_TAU_SPARSITY_METRIC_NAMES = (
 DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES = (
     'raw_gate_max', 'gate_sum', 'active_n_mean',
     'tau_abs_mean', 'dead_penalty', 'dead_count',
-    'int_max', 'gate_den_sum_mean', 'gate_eff_n',
+    'int_max', 'angular_depth_mean', 'gate_den_sum_mean', 'gate_eff_n',
     'gate_eff_ratio', 'top1_gate_frac', 'top1_gate_frac_max',
     'score_std',
+)
+
+V4164_SCALAR_METRIC_NAMES = (
+    'admission_den_sum',
+    'attn_admission_den_sum',
+    'attn_qk_admission_den_sum',
+    'attn_v_admission_den_sum',
+    'rst_admission_den_sum',
+    'compose_mass_sum',
+    'attn_compose_mass_sum',
+    'attn_qk_compose_mass_sum',
+    'attn_v_compose_mass_sum',
+    'rst_compose_mass_sum',
+    'angular_depth_mean',
+    'attn_angular_depth_mean',
+    'attn_qk_angular_depth_mean',
+    'attn_v_angular_depth_mean',
+    'rst_angular_depth_mean',
+    'angular_depth_max',
+    'attn_angular_depth_max',
+    'attn_qk_angular_depth_max',
+    'attn_v_angular_depth_max',
+    'rst_angular_depth_max',
+    'compose_eff_n',
+    'attn_compose_eff_n',
+    'attn_qk_compose_eff_n',
+    'attn_v_compose_eff_n',
+    'rst_compose_eff_n',
+    'compose_top1_frac',
+    'compose_top1_frac_max',
+    'attn_compose_top1_frac',
+    'attn_compose_top1_frac_max',
+    'attn_qk_compose_top1_frac',
+    'attn_qk_compose_top1_frac_max',
+    'attn_v_compose_top1_frac',
+    'attn_v_compose_top1_frac_max',
+    'rst_compose_top1_frac',
+    'rst_compose_top1_frac_max',
 )
 
 UPDATE_CAP_GROUP_SPECS = (
@@ -782,6 +832,14 @@ def _v415_sharded_kwargs(cfg):
         if regular_level not in ('compact', 'full'):
             raise ValueError(
                 "training.regular_diagnostics_level must be 'compact' or 'full'.")
+        regular_current_eps_default = (
+            [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
+            if version == 'spatial-r1-v4.1.6.4'
+            else [1.0e-1, 1.0e-2, 1.0e-3])
+        regular_sparsity_default = (
+            True
+            if version == 'spatial-r1-v4.1.6.4'
+            else version not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
         kw = dict(
             dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
             soft_gate_enabled=bool(t.get('soft_gate_enabled', True)),
@@ -790,13 +848,13 @@ def _v415_sharded_kwargs(cfg):
             regular_diagnostics_level=regular_level,
             regular_current_eps=tuple(
                 float(x) for x in t.get(
-                    'regular_current_eps', [1.0e-1, 1.0e-2, 1.0e-3])),
+                    'regular_current_eps', regular_current_eps_default)),
             regular_projected_eps=tuple(
                 float(x) for x in t.get('regular_projected_eps', [1.0e-6])),
             regular_mass_enabled=bool(t.get('regular_mass_enabled', False)),
             regular_sparsity_enabled=bool(t.get(
                 'regular_sparsity_enabled',
-                version not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)),
+                regular_sparsity_default)),
         )
     else:
         kw = dict(
@@ -4305,6 +4363,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'per_layer_rst_out_norm': result.get(
                     'per_layer_rst_out_norm', jnp.zeros(1)),
             })
+        for _name in V4164_SCALAR_METRIC_NAMES:
+            metrics[_name] = result.get(_name, jnp.float32(0.0))
         for _pool in ('attn_qk', 'attn_v'):
             for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
                 _fallback = result.get(
@@ -6116,6 +6176,39 @@ def _print_v4162_sparsity_block(rec, level='compact'):
             for band, key in margin_bands))
 
 
+def _print_v4164_sparsity_block(rec):
+    qkv_rst_pools = (
+        ('attn_qk', 'qk'),
+        ('attn_v', 'v'),
+        ('rst', 'rst'),
+    )
+    log_message(
+        "  active_tau: "
+        + _fmt_sparsity_pool_values(
+            rec,
+            lambda pool: _fmt_sparsity_frac_count(rec, pool, 'active_tau'),
+            pools=SPARSITY_LOG_POOLS))
+    for eps_label, suffix in (('1e-2', '1e_2'), ('1e-1', '1e_1')):
+        log_message(
+            f"  admission@{eps_label}: "
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool, suffix=suffix: _fmt_sparsity_frac_count(
+                    rec, pool, f'admission_active_eps_{suffix}'),
+                pools=qkv_rst_pools))
+    for eps_label, suffix in (
+            ('1e-4', '1e_4'),
+            ('1e-3', '1e_3'),
+            ('1e-2', '1e_2')):
+        log_message(
+            f"  compose@{eps_label}: "
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool, suffix=suffix: _fmt_sparsity_frac_count(
+                    rec, pool, f'active_eps_{suffix}'),
+                pools=qkv_rst_pools))
+
+
 def _soft_gate_schedule_shape(ctx):
     schedule = str(ctx.get('soft_gate_schedule', 'cosine')).lower()
     if schedule == 'log_gompertz':
@@ -6635,6 +6728,8 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_compose_mass_sum': float(m.get('rst_compose_mass_sum', 0.0)),
         'angular_depth_mean': float(m.get('angular_depth_mean', 0.0)),
         'attn_angular_depth_mean': float(m.get('attn_angular_depth_mean', 0.0)),
+        'attn_qk_angular_depth_mean': float(m.get('attn_qk_angular_depth_mean', 0.0)),
+        'attn_v_angular_depth_mean': float(m.get('attn_v_angular_depth_mean', 0.0)),
         'rst_angular_depth_mean': float(m.get('rst_angular_depth_mean', 0.0)),
         'angular_depth_max': float(m.get('angular_depth_max', 0.0)),
         'attn_angular_depth_max': float(m.get('attn_angular_depth_max', 0.0)),
@@ -7063,8 +7158,11 @@ def _print_regular_block(rec, ctx):
     if is_v4160:
         if is_v4162_soft:
             if bool(ctx.get('regular_sparsity_enabled', True)):
-                _print_v4162_sparsity_block(
-                    rec, ctx.get('regular_diagnostics_level', 'compact'))
+                if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
+                    _print_v4164_sparsity_block(rec)
+                else:
+                    _print_v4162_sparsity_block(
+                        rec, ctx.get('regular_diagnostics_level', 'compact'))
             log_message(
                 f"  strong: q={rec['attn_q_strong']*100:.1f}%"
                 f" k={rec['attn_k_strong']*100:.1f}%"
@@ -7127,6 +7225,7 @@ def _print_regular_block(rec, ctx):
             else ('soft_weight' if is_v4162_soft else 'pos'))
         _select_status = ""
         if (is_v4162_soft
+                and ctx.get('model_version') != 'spatial-r1-v4.1.6.4'
                 and ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS):
             _select_status = (
                 f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
@@ -7234,6 +7333,25 @@ def _print_regular_block(rec, ctx):
                 f" rst={rec['rst_pool_scale']:.3f}")
         if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
             log_message(
+                f"  angular_depth: "
+                f"qk[m={rec['attn_qk_angular_depth_mean']:.5f}"
+                f" max={rec['attn_qk_angular_depth_max']:.5f}] "
+                f"v[m={rec['attn_v_angular_depth_mean']:.5f}"
+                f" max={rec['attn_v_angular_depth_max']:.5f}] "
+                f"rst[m={rec['rst_angular_depth_mean']:.5f}"
+                f" max={rec['rst_angular_depth_max']:.5f}]"
+            )
+            log_message(
+                f"  admission_den: qk={rec['attn_qk_admission_den_sum']:.1f}"
+                f" v={rec['attn_v_admission_den_sum']:.1f}"
+                f" rst={rec['rst_admission_den_sum']:.1f}"
+            )
+            log_message(
+                f"  compose_mass: qk={rec['attn_qk_compose_mass_sum']:.1f}"
+                f" v={rec['attn_v_compose_mass_sum']:.1f}"
+                f" rst={rec['rst_compose_mass_sum']:.1f}"
+            )
+            log_message(
                 f"  compose_conc: qk[eff={rec['attn_qk_compose_eff_n']:.1f}"
                 f" top1={rec['attn_qk_compose_top1_frac']:.3f}]"
                 f" v[eff={rec['attn_v_compose_eff_n']:.1f}"
@@ -7241,13 +7359,6 @@ def _print_regular_block(rec, ctx):
                 f" rst[eff={rec['rst_compose_eff_n']:.1f}"
                 f" top1={rec['rst_compose_top1_frac']:.3f}]"
                 f"{_pool_scale_part}"
-            )
-            log_message(
-                f"  angular_depth: mean={rec['angular_depth_mean']:.5f}"
-                f" max={rec['angular_depth_max']:.5f}"
-                f" admission_den[qk={rec['attn_qk_admission_den_sum']:.1f}"
-                f" v={rec['attn_v_admission_den_sum']:.1f}"
-                f" rst={rec['rst_admission_den_sum']:.1f}]"
             )
         else:
             log_message(
@@ -7277,11 +7388,7 @@ def _print_regular_block(rec, ctx):
             'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
         if is_v4160:
             if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
-                log_message(
-                    f"  compose_mass mean[qk={rec['attn_qk_compose_mass_sum']:.1f}"
-                    f" v={rec['attn_v_compose_mass_sum']:.1f}"
-                    f" rst={rec['rst_compose_mass_sum']:.1f}]"
-                )
+                pass
             else:
                 log_message(
                     f"  gate_den_sum mean[qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
@@ -9329,7 +9436,10 @@ def _print_debug_block(rec, ctx):
         )
     elif ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS:
         _is_v4162_soft = ctx.get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS
-        _weight_label = 'soft_weight' if _is_v4162_soft else 'positive_margin'
+        _weight_label = (
+            'admission'
+            if ctx.get('model_version') == 'spatial-r1-v4.1.6.4'
+            else ('soft_weight' if _is_v4162_soft else 'positive_margin'))
         _select_status = ""
         if not _is_v4162_soft:
             _select_status = (
@@ -9352,6 +9462,60 @@ def _print_debug_block(rec, ctx):
             f"v={_g('attn_v_positive_margin_mean'):.5f}/{_g('attn_v_positive_margin_max'):.5f} "
             f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
             f"{_select_status}"
+        )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
+        log_debug_message(
+            "v4164_thresholds: active_tau["
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool: _fmt_sparsity_frac_count(
+                    rec, pool, 'active_tau'),
+                pools=SPARSITY_LOG_POOLS)
+            + "] admission@1e-2["
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool: _fmt_sparsity_frac_count(
+                    rec, pool, 'admission_active_eps_1e_2'),
+                pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
+            + "] admission@1e-1["
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool: _fmt_sparsity_frac_count(
+                    rec, pool, 'admission_active_eps_1e_1'),
+                pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
+            + "] compose@1e-4["
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool: _fmt_sparsity_frac_count(
+                    rec, pool, 'active_eps_1e_4'),
+                pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
+            + "] compose@1e-3["
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool: _fmt_sparsity_frac_count(
+                    rec, pool, 'active_eps_1e_3'),
+                pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
+            + "] compose@1e-2["
+            + _fmt_sparsity_pool_values(
+                rec,
+                lambda pool: _fmt_sparsity_frac_count(
+                    rec, pool, 'active_eps_1e_2'),
+                pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
+            + "]"
+        )
+        log_debug_message(
+            f"v4164_depth: qk[m={_g('attn_qk_angular_depth_mean'):.6f} "
+            f"max={_g('attn_qk_angular_depth_max'):.6f}] "
+            f"v[m={_g('attn_v_angular_depth_mean'):.6f} "
+            f"max={_g('attn_v_angular_depth_max'):.6f}] "
+            f"rst[m={_g('rst_angular_depth_mean'):.6f} "
+            f"max={_g('rst_angular_depth_max'):.6f}] "
+            f"admission_den[qk={_g('attn_qk_admission_den_sum'):.3f} "
+            f"v={_g('attn_v_admission_den_sum'):.3f} "
+            f"rst={_g('rst_admission_den_sum'):.3f}] "
+            f"compose_mass[qk={_g('attn_qk_compose_mass_sum'):.3f} "
+            f"v={_g('attn_v_compose_mass_sum'):.3f} "
+            f"rst={_g('rst_compose_mass_sum'):.3f}]"
         )
     route_std_label = (
         "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
@@ -9731,6 +9895,8 @@ def _build_analysis_record(base, metrics, ctx):
         'rst_compose_mass_sum': float(m.get('rst_compose_mass_sum', 0.0)),
         'angular_depth_mean': float(m.get('angular_depth_mean', 0.0)),
         'attn_angular_depth_mean': float(m.get('attn_angular_depth_mean', 0.0)),
+        'attn_qk_angular_depth_mean': float(m.get('attn_qk_angular_depth_mean', 0.0)),
+        'attn_v_angular_depth_mean': float(m.get('attn_v_angular_depth_mean', 0.0)),
         'rst_angular_depth_mean': float(m.get('rst_angular_depth_mean', 0.0)),
         'angular_depth_max': float(m.get('angular_depth_max', 0.0)),
         'attn_angular_depth_max': float(m.get('attn_angular_depth_max', 0.0)),
@@ -9935,7 +10101,10 @@ def _print_analysis_block(rec, ctx):
             f" max={_g('rst_rho_max'):.5f}]"
         )
     if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS:
-        _print_v4162_sparsity_block(rec, 'full')
+        if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
+            _print_v4164_sparsity_block(rec)
+        else:
+            _print_v4162_sparsity_block(rec, 'full')
     log_message(
         f"  boundary k[phi={rec['rst_phi_binary']*100:.1f}%"
         f" z<075={rec['rst_z_lt_075']*100:.1f}%"
@@ -10378,15 +10547,20 @@ def main():
     if regular_diagnostics_level not in ('compact', 'full'):
         raise ValueError(
             "training.regular_diagnostics_level must be 'compact' or 'full'.")
+    regular_current_eps_default = (
+        [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
+        if model_version_cfg == 'spatial-r1-v4.1.6.4'
+        else [1.0e-1, 1.0e-2, 1.0e-3])
     regular_current_eps = [
         float(x) for x in tcfg.get(
-            'regular_current_eps', [1.0e-1, 1.0e-2, 1.0e-3])]
+            'regular_current_eps', regular_current_eps_default)]
     regular_projected_eps = [
         float(x) for x in tcfg.get('regular_projected_eps', [1.0e-6])]
     regular_mass_enabled = bool(tcfg.get('regular_mass_enabled', False))
     regular_sparsity_enabled = bool(tcfg.get(
         'regular_sparsity_enabled',
-        model_version_cfg not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS))
+        (True if model_version_cfg == 'spatial-r1-v4.1.6.4'
+         else model_version_cfg not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)))
     effective_prune_eps_list = list(
         tcfg.get('effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
     eval_effective_prune_enabled = bool(tcfg.get(
@@ -11581,7 +11755,8 @@ def main():
             if _soft_model_version in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS:
                 print("  Boundary admission: one-sided generalized Gaussian")
                 if _soft_model_version == 'spatial-r1-v4.1.6.4':
-                    print("  compose = admission * B * softplus((rho-tau)/B) / (1-tau+eps)")
+                    print("  depth = softplus((rho-tau)/B) / softplus((1-tau)/B)")
+                    print("  compose = admission * depth")
                     print("  den = max(sum(admission), 1.0)")
                 else:
                     print("  gate = exp(-((max(tau-score,0)/B)^p)) * intensity")

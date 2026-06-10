@@ -126,13 +126,14 @@ training:
 
   regular_diagnostics_level: compact
   regular_current_eps:
-  - 0.1
-  - 0.01
+  - 0.0001
   - 0.001
+  - 0.01
+  - 0.1
   regular_projected_eps:
   - 1.0e-06
   regular_mass_enabled: false
-  regular_sparsity_enabled: false
+  regular_sparsity_enabled: true
 
   eval_effective_prune_enabled: true
   eval_effective_prune_eps_list:
@@ -148,4 +149,4 @@ training:
   crash_snapshot: false
   crash_snapshot_enabled: false
   spike_event_logger: false
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4164_40M_c4_5B_ggauss_boundary_panneal
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4164_40M_c4_5B_ggauss_boundary_panneal_ratio_depth_diag

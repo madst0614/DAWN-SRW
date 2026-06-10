@@ -116,6 +116,8 @@ ATTN_SPLIT_CORE_NAMES = (
     'k_strong_frac',
     'q_active_n_mean',
     'k_active_n_mean',
+    'qk_angular_depth_mean',
+    'v_angular_depth_mean',
 )
 ATTN_SPLIT_CORE_COUNT = len(ATTN_SPLIT_CORE_NAMES)
 (
@@ -149,6 +151,8 @@ ATTN_SPLIT_CORE_COUNT = len(ATTN_SPLIT_CORE_NAMES)
     ATTN_SPLIT_K_STRONG_FRAC,
     ATTN_SPLIT_Q_ACTIVE_N_MEAN,
     ATTN_SPLIT_K_ACTIVE_N_MEAN,
+    ATTN_SPLIT_QK_ANGULAR_DEPTH_MEAN,
+    ATTN_SPLIT_V_ANGULAR_DEPTH_MEAN,
 ) = range(ATTN_SPLIT_CORE_COUNT)
 
 
@@ -187,6 +191,13 @@ GATE_PROJECTED_EPS_NAME_SUFFIXES = (
 )
 GATE_SPARSITY_DIAG_NAMES = (
     ('active_tau_frac', 'active_tau_count')
+    + tuple(
+        name
+        for suffix in GATE_EPS_NAME_SUFFIXES
+        for name in (
+            f'admission_active_eps_{suffix}_frac',
+            f'admission_active_eps_{suffix}_count',
+        ))
     + tuple(
         name
         for suffix in GATE_EPS_NAME_SUFFIXES
@@ -294,7 +305,7 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 #   margin, r        = rho - tau, margin / boundary_scale
 #   d_neg            = lambda_neg * softplus(-r / lambda_neg)
 #   admission        = exp(-(d_neg ** boundary_power) - gamma(p) * exp(-r / A(p)))
-#   angular_depth    = B * softplus(margin / B) / (1 - tau + eps)
+#   angular_depth    = softplus(margin / B) / softplus((1 - tau) / B)
 #   compose_weight   = admission * angular_depth
 #   den              = max(sum(admission), 1.0)
 # ================================================================
@@ -419,8 +430,13 @@ def _angular_depth_from_margin(margin, tau, depth_scale, eps=1.0e-6):
         jnp.asarray(depth_scale, dtype=jnp.float32),
         jnp.float32(1.0e-4))
     tau = jnp.asarray(tau, dtype=jnp.float32)
-    denom = jnp.maximum(jnp.float32(1.0) - tau, jnp.float32(eps))
-    return depth_scale * jax.nn.softplus(margin / depth_scale) / denom
+    max_margin = jnp.maximum(
+        jnp.float32(1.0) - tau,
+        jnp.float32(eps))
+
+    numerator = jax.nn.softplus(margin / depth_scale)
+    denominator = jax.nn.softplus(max_margin / depth_scale)
+    return numerator / jnp.maximum(denominator, jnp.float32(eps))
 
 
 def _boundary_gate_from_margin(margin, boundary_scale, boundary_power):
@@ -511,7 +527,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         rho              = cosine(q, signature)
         margin           = rho - tau
         admission        = exp(-((max(tau - rho, 0) / B) ** p))
-        angular_depth    = B * softplus(margin / B) / (1 - tau + eps)
+        angular_depth    = softplus(margin / B) / softplus((1 - tau) / B)
         compose_weight   = admission * angular_depth
         den              = max(sum(admission), 1.0)
 
@@ -790,6 +806,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             jnp.float32(0.0),
             jnp.zeros((len(_current_eps_values),), dtype=jnp.float32),
             jnp.zeros((len(_current_eps_values),), dtype=jnp.float32),
+            jnp.zeros((len(_current_eps_values),), dtype=jnp.float32),
             jnp.float32(0.0),
             jnp.zeros((len(_projected_eps_values),), dtype=jnp.float32),
             jnp.zeros((len(_projected_eps_values),), dtype=jnp.float32),
@@ -803,6 +820,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             compose_sg = jax.lax.stop_gradient(compose_weight)
             active_tau = margin_sg > 0.0
 
+            admission_active = admission_sg[..., None] > current_eps
+            admission_active_count = admission_active.astype(jnp.float32).sum(
+                axis=(0, 1, 2))
             current_active = compose_sg[..., None] > current_eps
             current_active_count = current_active.astype(jnp.float32).sum(
                 axis=(0, 1, 2))
@@ -846,6 +866,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 )).astype(jnp.float32)
             return (
                 active_tau.astype(jnp.float32).sum(),
+                admission_active_count,
                 current_active_count,
                 current_mass,
                 gate_mass,
@@ -859,10 +880,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             return tuple(x + y for x, y in zip(a, b))
 
         def finalize_sparsity_diag(carry):
-            (active_tau_count, current_active_count, current_mass, gate_mass,
+            (active_tau_count, admission_active_count,
+             current_active_count, current_mass, gate_mass,
              projected_active_count, projected_mass, projected_gate_mass,
              margin_bands) = carry
             active_tau_count = jax.lax.psum(active_tau_count, 'model')
+            admission_active_count = jax.lax.psum(
+                admission_active_count, 'model')
             current_active_count = jax.lax.psum(
                 current_active_count, 'model')
             current_mass = jax.lax.psum(current_mass, 'model')
@@ -875,6 +899,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
 
             token_count = jnp.float32(B * S)
             element_count = token_count * jnp.float32(N_total)
+            admission_frac = admission_active_count / element_count
+            admission_count = admission_active_count / token_count
             current_frac = current_active_count / element_count
             current_count = current_active_count / token_count
             projected_frac = projected_active_count / element_count
@@ -885,6 +911,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             out = out.at[GATE_SPARSITY_DIAG_INDEX['active_tau_count']].set(
                 active_tau_count / token_count)
             for _i, _suffix in enumerate(_current_suffixes):
+                out = out.at[
+                    GATE_SPARSITY_DIAG_INDEX[
+                        f'admission_active_eps_{_suffix}_frac']
+                ].set(admission_frac[_i])
+                out = out.at[
+                    GATE_SPARSITY_DIAG_INDEX[
+                        f'admission_active_eps_{_suffix}_count']
+                ].set(admission_count[_i])
                 out = out.at[
                     GATE_SPARSITY_DIAG_INDEX[f'active_eps_{_suffix}_frac']
                 ].set(current_frac[_i])
@@ -1587,7 +1621,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
 
     Boundary DirectTau admission with angular-depth composition:
         admission = exp(-((max(tau - rho, 0) / B) ** p))
-        angular_depth = B * softplus((rho - tau) / B) / (1 - tau + eps)
+        angular_depth = softplus((rho - tau) / B) / softplus((1 - tau) / B)
         compose_weight = admission * angular_depth
         den = max(sum(admission), 1.0)
     analysis/local_diagnostics: see make_sharded_srw docstring.
@@ -1865,6 +1899,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             jnp.zeros((2,), dtype=jnp.float32),
             jnp.zeros((2, len(_current_eps_values)), dtype=jnp.float32),
             jnp.zeros((2, len(_current_eps_values)), dtype=jnp.float32),
+            jnp.zeros((2, len(_current_eps_values)), dtype=jnp.float32),
             jnp.zeros((2,), dtype=jnp.float32),
             jnp.zeros((2, len(_projected_eps_values)), dtype=jnp.float32),
             jnp.zeros((2, len(_projected_eps_values)), dtype=jnp.float32),
@@ -1878,6 +1913,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             compose_sg = jax.lax.stop_gradient(compose_weight)
             active_tau = margin_sg > 0.0
 
+            admission_active = admission_sg[..., None] > current_eps
+            admission_active_count = admission_active.astype(jnp.float32).sum(
+                axis=(0, 1, 3))
             current_active = compose_sg[..., None] > current_eps
             current_active_count = current_active.astype(jnp.float32).sum(
                 axis=(0, 1, 3))
@@ -1921,6 +1959,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 ), axis=1).astype(jnp.float32)
             return (
                 active_tau.astype(jnp.float32).sum(axis=(0, 1, 3)),
+                admission_active_count,
                 current_active_count,
                 current_mass,
                 gate_mass,
@@ -1934,10 +1973,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             return tuple(x + y for x, y in zip(a, b))
 
         def finalize_sparsity_diag(carry):
-            (active_tau_count, current_active_count, current_mass, gate_mass,
+            (active_tau_count, admission_active_count,
+             current_active_count, current_mass, gate_mass,
              projected_active_count, projected_mass, projected_gate_mass,
              margin_bands) = carry
             active_tau_count = jax.lax.psum(active_tau_count, 'model')
+            admission_active_count = jax.lax.psum(
+                admission_active_count, 'model')
             current_active_count = jax.lax.psum(
                 current_active_count, 'model')
             current_mass = jax.lax.psum(current_mass, 'model')
@@ -1950,6 +1992,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
 
             token_count = jnp.float32(B * S)
             element_count = token_count * jnp.float32(N_total)
+            admission_frac = admission_active_count / element_count
+            admission_count = admission_active_count / token_count
             current_frac = current_active_count / element_count
             current_count = current_active_count / token_count
             projected_frac = projected_active_count / element_count
@@ -1960,6 +2004,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             out = out.at[:, GATE_SPARSITY_DIAG_INDEX['active_tau_count']].set(
                 active_tau_count / token_count)
             for _i, _suffix in enumerate(_current_suffixes):
+                out = out.at[
+                    :, GATE_SPARSITY_DIAG_INDEX[
+                        f'admission_active_eps_{_suffix}_frac']
+                ].set(admission_frac[:, _i])
+                out = out.at[
+                    :, GATE_SPARSITY_DIAG_INDEX[
+                        f'admission_active_eps_{_suffix}_count']
+                ].set(admission_count[:, _i])
                 out = out.at[
                     :, GATE_SPARSITY_DIAG_INDEX[f'active_eps_{_suffix}_frac']
                 ].set(current_frac[:, _i])
@@ -3402,6 +3454,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         k_strong,
         q_active_n_mean,
         k_active_n_mean,
+        qk_current_cost_mean,
+        v_current_cost_mean,
     )).astype(jnp.float32)
     attn_qk_select_diag = jnp.stack(qk_select_diag).astype(jnp.float32)
     attn_v_select_diag = jnp.stack(v_select_diag).astype(jnp.float32)
@@ -5095,6 +5149,10 @@ class DAWN(nn.Module):
                 attn_current_cost_mean_all.mean()
                 + rst_current_cost_mean_all.mean()) / jnp.float32(2.0),
             'attn_angular_depth_mean': attn_current_cost_mean_all.mean(),
+            'attn_qk_angular_depth_mean': _attn_core_mean(
+                ATTN_SPLIT_QK_ANGULAR_DEPTH_MEAN),
+            'attn_v_angular_depth_mean': _attn_core_mean(
+                ATTN_SPLIT_V_ANGULAR_DEPTH_MEAN),
             'rst_angular_depth_mean': rst_current_cost_mean_all.mean(),
             'angular_depth_max': jnp.maximum(
                 attn_int_max_all.max(), rst_int_max_all.max()),
