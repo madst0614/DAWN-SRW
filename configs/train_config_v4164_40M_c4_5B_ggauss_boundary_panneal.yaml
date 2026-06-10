@@ -155,4 +155,4 @@ training:
   crash_snapshot: false
   crash_snapshot_enabled: false
   spike_event_logger: false
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4164_40M_c4_5B_ggauss_boundary_panneal_ratio_depth_diag_no_den_grad
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4164_40M_c4_5B_ggauss_boundary_panneal_ratio_depth_diag_add_power
