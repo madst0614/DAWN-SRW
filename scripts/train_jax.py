@@ -856,6 +856,12 @@ def _v415_sharded_kwargs(cfg):
                 'regular_sparsity_enabled',
                 regular_sparsity_default)),
         )
+        if version == 'spatial-r1-v4.1.6.4':
+            kw.update(
+                v4164_den_power=float(t.get('v4164_den_power', 1.0)),
+                v4164_den_grad_scale=float(
+                    t.get('v4164_den_grad_scale', 1.0)),
+            )
     else:
         kw = dict(
             sharpness=t.get('sharpness', 500.0),
@@ -11757,7 +11763,10 @@ def main():
                 if _soft_model_version == 'spatial-r1-v4.1.6.4':
                     print("  depth = softplus((rho-tau)/B) / softplus((1-tau)/B)")
                     print("  compose = admission * depth")
-                    print("  den = max(sum(admission), 1.0)")
+                    print("  den = max(sum(admission), 1.0) ** v4164_den_power")
+                    print(
+                        "  den_grad = v4164_den_grad_scale * live_den_grad "
+                        "+ detached remainder")
                 else:
                     print("  gate = exp(-((max(tau-score,0)/B)^p)) * intensity")
                 print("  Boundary power:")

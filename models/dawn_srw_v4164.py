@@ -517,7 +517,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                      regular_current_eps=(1.0e-1, 1.0e-2, 1.0e-3),
                      regular_projected_eps=(1.0e-6,),
                      regular_mass_enabled=False,
-                     regular_sparsity_enabled=False):
+                     regular_sparsity_enabled=False,
+                     v4164_den_power=1.0,
+                     v4164_den_grad_scale=1.0):
     """Create fused shard_map'd angular Select + SRW.
 
     Fast train path: one chunked pass computes rho, tau, gate, and SRW.
@@ -529,7 +531,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         admission        = exp(-((max(tau - rho, 0) / B) ** p))
         angular_depth    = softplus(margin / B) / softplus((1 - tau) / B)
         compose_weight   = admission * angular_depth
-        den              = max(sum(admission), 1.0)
+        den              = max(sum(admission), 1.0) ** den_power
 
 
     `analysis=False` (default, train path): returns the SLIM tuple plus
@@ -573,6 +575,18 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         (not _compact_regular_diag) or bool(regular_mass_enabled))
     _compact_margin_bands = bool(_compact_regular_diag)
     _angular_strong_margin = jnp.float32(0.05)
+    # v4164 divisive normalization:
+    #   den_forward = max(sum(admission), 1) ** den_power
+    #   backward gradient through den is scaled by den_grad_scale.
+    # den_power=0.5 is RMS/energy-like inhibition; den_grad_scale=0 detaches
+    # the inhibitory denominator gradient, 1 restores the full live den path.
+    _v4164_den_power = jnp.maximum(
+        jnp.asarray(v4164_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+    _v4164_den_grad_scale = jnp.clip(
+        jnp.asarray(v4164_den_grad_scale, dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0))
 
     # SLIM out_specs: train path.
     _slim_out_specs = (
@@ -1398,11 +1412,18 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             jax.lax.psum(total_edge_margin_stat, 'model')
             / jnp.float32(B * S * N_total))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
-        # v4164: normalize by admission mass, but detach the denominator.
-        # This preserves the forward scale while preventing a denominator-only
-        # pressure that can close admission/rho to reduce den.
-        den_live = jnp.maximum(global_den_cost, 1.0)
-        den = jax.lax.stop_gradient(den_live)
+        # v4164: sublinear divisive inhibition over admission mass.
+        # Forward:
+        #   den_forward = max(sum(admission), 1) ** den_power
+        # Backward:
+        #   only den_grad_scale fraction of the denominator gradient is live.
+        # This keeps the inhibitory/gain-control term biologically plausible
+        # while avoiding the early full-denominator collapse observed with
+        # den_grad_scale=1 and den_power=1.
+        den_base = jnp.maximum(global_den_cost, 1.0)
+        den_forward = jnp.power(den_base, _v4164_den_power)
+        den_sg = jax.lax.stop_gradient(den_forward)
+        den = den_sg + _v4164_den_grad_scale * (den_forward - den_sg)
         out = raw_out / den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
@@ -1614,7 +1635,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             regular_current_eps=(1.0e-1, 1.0e-2, 1.0e-3),
                             regular_projected_eps=(1.0e-6,),
                             regular_mass_enabled=False,
-                            regular_sparsity_enabled=False):
+                            regular_sparsity_enabled=False,
+                            v4164_den_power=1.0,
+                            v4164_den_grad_scale=1.0):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
@@ -1659,6 +1682,18 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _compact_margin_bands = bool(_compact_regular_diag)
     _soft_gate_enabled = True
     _angular_strong_margin = jnp.float32(0.05)
+    # v4164 divisive normalization:
+    #   den_forward = max(sum(admission), 1) ** den_power
+    #   backward gradient through den is scaled by den_grad_scale.
+    # den_power=0.5 is RMS/energy-like inhibition; den_grad_scale=0 detaches
+    # the inhibitory denominator gradient, 1 restores the full live den path.
+    _v4164_den_power = jnp.maximum(
+        jnp.asarray(v4164_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+    _v4164_den_grad_scale = jnp.clip(
+        jnp.asarray(v4164_den_grad_scale, dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0))
 
     _slim_out_specs = (
         P('data', None, None, None),  # out [B,S,2,D]
@@ -2526,11 +2561,18 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             jax.lax.psum(total_edge_margin_stat, 'model')
             / jnp.float32(B * S * 2 * N_total))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
-        # v4164: normalize by admission mass, but detach the denominator.
-        # This preserves the forward scale while preventing a denominator-only
-        # pressure that can close admission/rho to reduce den.
-        den_live = jnp.maximum(global_den_cost, 1.0)
-        den = jax.lax.stop_gradient(den_live)
+        # v4164: sublinear divisive inhibition over admission mass.
+        # Forward:
+        #   den_forward = max(sum(admission), 1) ** den_power
+        # Backward:
+        #   only den_grad_scale fraction of the denominator gradient is live.
+        # This keeps the inhibitory/gain-control term biologically plausible
+        # while avoiding the early full-denominator collapse observed with
+        # den_grad_scale=1 and den_power=1.
+        den_base = jnp.maximum(global_den_cost, 1.0)
+        den_forward = jnp.power(den_base, _v4164_den_power)
+        den_sg = jax.lax.stop_gradient(den_forward)
+        den = den_sg + _v4164_den_grad_scale * (den_forward - den_sg)
         out = raw_out / den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 

@@ -72,6 +72,12 @@ training:
   soft_gate_enabled: true
   soft_gate_t_pool_specific: true
   soft_gate_effective_active_eps: 1.0e-06
+  # v4164 divisive normalization / inhibition
+  # den = max(sum(admission), 1) ** v4164_den_power
+  # den_grad_scale controls only the backward denominator branch:
+  #   0.0 = detached den, 1.0 = full live den.
+  v4164_den_power: 0.5
+  v4164_den_grad_scale: 1.0
   soft_gate_boundary_power_enabled: true
   soft_gate_boundary_power_start: 3.0
   soft_gate_boundary_power_mid: 3.15
