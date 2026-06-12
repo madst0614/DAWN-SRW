@@ -68,47 +68,47 @@ training:
   soft_gate_t_pool_specific: true
   soft_gate_effective_active_eps: 1.0e-06
   v4164_den_power: 0.5
-  v4164_den_grad_scale: 0.1
+  v4164_den_grad_scale: 1.0
   soft_gate_boundary_power_enabled: true
   soft_gate_boundary_power_start: 2.0
-  soft_gate_boundary_power_mid: 3.0
+  soft_gate_boundary_power_mid: 3.3
   soft_gate_boundary_power_final: 4.0
-  soft_gate_boundary_power_mid_frac: 0.1
-  soft_gate_boundary_power_final_frac: 0.7
+  soft_gate_boundary_power_mid_frac: 0.09
+  soft_gate_boundary_power_final_frac: 0.22
   soft_gate_t_qk_schedule: developmental_band
   soft_gate_t_qk_sort: 0.06
-  soft_gate_t_qk_band: 0.06
-  soft_gate_t_qk_mid: 0.03
-  soft_gate_t_qk_late: 0.001
+  soft_gate_t_qk_band: 0.05
+  soft_gate_t_qk_mid: 0.02
+  soft_gate_t_qk_late: 0.006
   soft_gate_t_qk_final: 0.001
   soft_gate_t_qk_sort_end_frac: 0.0
   soft_gate_t_qk_band_reach_frac: 0.001
-  soft_gate_t_qk_formation_end_frac: 0.025
-  soft_gate_t_qk_sharpen_end_frac: 0.7
+  soft_gate_t_qk_formation_end_frac: 0.075
+  soft_gate_t_qk_sharpen_end_frac: 0.22
   soft_gate_t_qk_formation_power: 2.0
   soft_gate_t_qk_sharpen_power: 1.0
   soft_gate_t_v_schedule: developmental_band
   soft_gate_t_v_sort: 0.04
-  soft_gate_t_v_band: 0.04
-  soft_gate_t_v_mid: 0.0155
-  soft_gate_t_v_late: 0.001
+  soft_gate_t_v_band: 0.032
+  soft_gate_t_v_mid: 0.011
+  soft_gate_t_v_late: 0.0048
   soft_gate_t_v_final: 0.001
   soft_gate_t_v_sort_end_frac: 0.0
   soft_gate_t_v_band_reach_frac: 0.001
-  soft_gate_t_v_formation_end_frac: 0.025
-  soft_gate_t_v_sharpen_end_frac: 0.7
+  soft_gate_t_v_formation_end_frac: 0.075
+  soft_gate_t_v_sharpen_end_frac: 0.22
   soft_gate_t_v_formation_power: 2.0
   soft_gate_t_v_sharpen_power: 1.0
   soft_gate_t_rst_schedule: developmental_band
   soft_gate_t_rst_sort: 0.032
-  soft_gate_t_rst_band: 0.032
-  soft_gate_t_rst_mid: 0.0095
-  soft_gate_t_rst_late: 0.001
+  soft_gate_t_rst_band: 0.026
+  soft_gate_t_rst_mid: 0.008
+  soft_gate_t_rst_late: 0.0042
   soft_gate_t_rst_final: 0.001
   soft_gate_t_rst_sort_end_frac: 0.0
   soft_gate_t_rst_band_reach_frac: 0.001
-  soft_gate_t_rst_formation_end_frac: 0.025
-  soft_gate_t_rst_sharpen_end_frac: 0.7
+  soft_gate_t_rst_formation_end_frac: 0.075
+  soft_gate_t_rst_sharpen_end_frac: 0.22
   soft_gate_t_rst_formation_power: 2.0
   soft_gate_t_rst_sharpen_power: 1.0
   regular_diagnostics_level: compact
@@ -137,9 +137,10 @@ training:
   crash_snapshot_enabled: false
   spike_event_logger: false
   admission_floor_hold_frac: 0.0015
-  admission_floor_end_frac: 0.02
+  admission_floor_end_frac: 0.018
   drive_baseline_qk: 0.012
   drive_baseline_v: 0.01
   drive_baseline_rst: 0.008
-  boundary_drive_ratio_end_frac: 0.03
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4165_40M_c4_5B_admission_floor_drive_baseline_tausg
+  boundary_drive_ratio_end_frac: 0.075
+  boundary_drive_ratio_start_frac: 0.018
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4165_40M_c4_5B_admission_floor_drive_baseline_optimized_schedule
