@@ -1651,10 +1651,28 @@ def _model_accepts_soft_gate_boundary_power(model):
 
 
 def _model_accepts_drive_mix(model):
-    """Return True if model.__call__ accepts v4165 drive annealing kwargs."""
+    """Backward-compatible alias probe for old v4165 drive kwargs."""
     import inspect as _inspect
     try:
         return 'drive_mix' in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _model_accepts_admission_floor(model):
+    """Return True if model.__call__ accepts admission_floor."""
+    import inspect as _inspect
+    try:
+        return 'admission_floor' in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _model_accepts_boundary_drive_ratio(model):
+    """Return True if model.__call__ accepts boundary_drive_ratio."""
+    import inspect as _inspect
+    try:
+        return 'boundary_drive_ratio' in _inspect.signature(model.__call__).parameters
     except (TypeError, ValueError):
         return False
 
@@ -2190,6 +2208,34 @@ def _pool_update_diagnostics(params, grads):
     return out
 
 
+
+def scheduled_admission_floor_by_frac(step, total_steps,
+                                      hold_frac=0.0, end_frac=0.0):
+    """Short full-admission floor followed by smoothstep decay to zero."""
+    step_f = jnp.asarray(step, dtype=jnp.float32)
+    total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
+    frac = jnp.clip(step_f / total_f, 0.0, 1.0)
+    hold = jnp.asarray(hold_frac, dtype=jnp.float32)
+    end = jnp.asarray(end_frac, dtype=jnp.float32)
+    eps = jnp.float32(1.0e-8)
+    u = jnp.clip((frac - hold) / jnp.maximum(end - hold, eps), 0.0, 1.0)
+    s = u * u * (jnp.float32(3.0) - jnp.float32(2.0) * u)
+    floor = jnp.float32(1.0) - s
+    return jnp.where(end > hold, floor, jnp.float32(0.0))
+
+
+def scheduled_boundary_drive_ratio_by_frac(step, total_steps, end_frac=0.0):
+    """Smoothstep transition from drive_baseline to boundary_drive."""
+    step_f = jnp.asarray(step, dtype=jnp.float32)
+    total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
+    frac = jnp.clip(step_f / total_f, 0.0, 1.0)
+    end = jnp.asarray(end_frac, dtype=jnp.float32)
+    eps = jnp.float32(1.0e-8)
+    u = jnp.clip(frac / jnp.maximum(end, eps), 0.0, 1.0)
+    s = u * u * (jnp.float32(3.0) - jnp.float32(2.0) * u)
+    return jnp.where(end > 0.0, s, jnp.float32(1.0))
+
+
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
@@ -2275,6 +2321,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       drive_mix_start=1.0,
                       drive_mix_final=1.0,
                       drive_mix_end_frac=0.0,
+                      admission_floor_hold_frac=0.0,
+                      admission_floor_end_frac=0.0,
+                      drive_baseline_qk=0.012,
+                      drive_baseline_v=0.010,
+                      drive_baseline_rst=0.008,
+                      boundary_drive_ratio_end_frac=0.0,
                       rpe_start_frac=0.0,
                       rpe_full_frac=0.0,
                       rpe_schedule='linear',
@@ -2422,6 +2474,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_drive_mix_kw = _model_accepts_drive_mix(model)
+    _pass_admission_floor_kw = _model_accepts_admission_floor(model)
+    _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
@@ -2498,6 +2552,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _drive_mix_start = jnp.float32(drive_mix_start)
     _drive_mix_final = jnp.float32(drive_mix_final)
     _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
+    _admission_floor_hold_frac = jnp.float32(admission_floor_hold_frac)
+    _admission_floor_end_frac = jnp.float32(admission_floor_end_frac)
+    _drive_baseline_qk = jnp.float32(drive_baseline_qk)
+    _drive_baseline_v = jnp.float32(drive_baseline_v)
+    _drive_baseline_rst = jnp.float32(drive_baseline_rst)
+    _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
     _rpe_start_frac = jnp.float32(rpe_start_frac)
     _rpe_full_frac = jnp.float32(rpe_full_frac)
     _rpe_schedule = str(rpe_schedule).lower()
@@ -2559,6 +2619,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _soft_gate_boundary_power_final,
                 _soft_gate_boundary_power_mid_frac,
                 _soft_gate_boundary_power_final_frac)
+            admission_floor = scheduled_admission_floor_by_frac(
+                step, _total_training_steps,
+                _admission_floor_hold_frac, _admission_floor_end_frac)
+            boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
+                step, _total_training_steps,
+                _boundary_drive_ratio_end_frac)
             drive_mix = jnp.where(
                 jnp.asarray(_drive_anneal_enabled),
                 _scheduled_scalar(
@@ -2583,7 +2649,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     _soft_gate_boundary_power_final)
             if _pass_soft_gate_t_final_kw:
                 extra_kw['soft_gate_t_final'] = _soft_gate_t_final
-            if _pass_drive_mix_kw:
+            if _pass_admission_floor_kw:
+                extra_kw['admission_floor'] = admission_floor
+                extra_kw['drive_baseline_qk'] = _drive_baseline_qk
+                extra_kw['drive_baseline_v'] = _drive_baseline_v
+                extra_kw['drive_baseline_rst'] = _drive_baseline_rst
+            if _pass_boundary_drive_ratio_kw:
+                extra_kw['boundary_drive_ratio'] = boundary_drive_ratio
+            elif _pass_drive_mix_kw:
                 extra_kw['drive_mix'] = drive_mix
                 extra_kw['drive_ref_qk'] = _drive_ref_qk
                 extra_kw['drive_ref_v'] = _drive_ref_v
@@ -3132,6 +3205,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 soft_gate_T_v=soft_gate_T_v,
                 soft_gate_T_rst=soft_gate_T_rst,
                 boundary_power_p=boundary_power_p,
+                admission_floor=admission_floor,
+                boundary_drive_ratio=boundary_drive_ratio,
                 rpe_schedule_scale=rpe_schedule_scale,
             )
             result_payload = result
@@ -3906,6 +3981,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'soft_gate_T_v': explore_stats['soft_gate_T_v'],
             'soft_gate_T_rst': explore_stats['soft_gate_T_rst'],
             'boundary_power_p': explore_stats['boundary_power_p'],
+            'admission_floor': explore_stats['admission_floor'],
+            'boundary_drive_ratio': explore_stats['boundary_drive_ratio'],
             'rpe_effective_weight': (
                 (_explore_weight_q + _explore_weight_k
                  + _explore_weight_v + _explore_weight_rst)
@@ -4070,7 +4147,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_pool_write': grad_pool_write,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'rst_aux': result.get('rst_aux', jnp.float32(0.0)),
-            'drive_mix': result.get('drive_mix', jnp.float32(1.0)),
+            'admission_floor': result.get(
+                'admission_floor', explore_stats.get('admission_floor', jnp.float32(0.0))),
+            'boundary_drive_ratio': result.get(
+                'boundary_drive_ratio', explore_stats.get('boundary_drive_ratio', jnp.float32(1.0))),
+            'drive_mix': result.get(
+                'drive_mix', result.get('boundary_drive_ratio', jnp.float32(1.0))),
             'drive_mean': result.get('drive_mean', jnp.float32(0.0)),
             'drive_max': result.get('drive_max', jnp.float32(0.0)),
             'attn_drive_mean': result.get('attn_drive_mean', jnp.float32(0.0)),
@@ -4643,7 +4725,13 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      drive_ref_rst=0.04,
                      drive_mix_start=1.0,
                      drive_mix_final=1.0,
-                     drive_mix_end_frac=0.0):
+                     drive_mix_end_frac=0.0,
+                     admission_floor_hold_frac=0.0,
+                     admission_floor_end_frac=0.0,
+                     drive_baseline_qk=0.012,
+                     drive_baseline_v=0.010,
+                     drive_baseline_rst=0.008,
+                     boundary_drive_ratio_end_frac=0.0):
     """Create a jit-compiled evaluation step.
 
     Uses the SLIM forward (analysis=False). Eval normally needs only loss /
@@ -4656,6 +4744,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_drive_mix_kw = _model_accepts_drive_mix(model)
+    _pass_admission_floor_kw = _model_accepts_admission_floor(model)
+    _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
     _execution_prune_eps = jnp.float32(execution_prune_eps)
     _return_prune_stats = bool(return_prune_stats)
     _soft_gate_runtime_enabled = bool(
@@ -4710,6 +4800,12 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _drive_mix_start = jnp.float32(drive_mix_start)
     _drive_mix_final = jnp.float32(drive_mix_final)
     _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
+    _admission_floor_hold_frac = jnp.float32(admission_floor_hold_frac)
+    _admission_floor_end_frac = jnp.float32(admission_floor_end_frac)
+    _drive_baseline_qk = jnp.float32(drive_baseline_qk)
+    _drive_baseline_v = jnp.float32(drive_baseline_v)
+    _drive_baseline_rst = jnp.float32(drive_baseline_rst)
+    _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
 
     @jax.jit
     def eval_step(params, input_ids, attention_mask, step):
@@ -4743,7 +4839,20 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                 _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
-        if _pass_drive_mix_kw:
+        admission_floor = scheduled_admission_floor_by_frac(
+            step, _total_training_steps,
+            _admission_floor_hold_frac, _admission_floor_end_frac)
+        boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
+            step, _total_training_steps,
+            _boundary_drive_ratio_end_frac)
+        if _pass_admission_floor_kw:
+            extra_kw['admission_floor'] = admission_floor
+            extra_kw['drive_baseline_qk'] = _drive_baseline_qk
+            extra_kw['drive_baseline_v'] = _drive_baseline_v
+            extra_kw['drive_baseline_rst'] = _drive_baseline_rst
+        if _pass_boundary_drive_ratio_kw:
+            extra_kw['boundary_drive_ratio'] = boundary_drive_ratio
+        elif _pass_drive_mix_kw:
             extra_kw['drive_mix'] = jnp.where(
                 jnp.asarray(_drive_anneal_enabled),
                 _scheduled_scalar(
@@ -4816,7 +4925,13 @@ def create_analysis_step(model, sharded_fns=None,
                          drive_ref_rst=0.04,
                          drive_mix_start=1.0,
                          drive_mix_final=1.0,
-                         drive_mix_end_frac=0.0):
+                         drive_mix_end_frac=0.0,
+                     admission_floor_hold_frac=0.0,
+                     admission_floor_end_frac=0.0,
+                     drive_baseline_qk=0.012,
+                     drive_baseline_v=0.010,
+                     drive_baseline_rst=0.008,
+                     boundary_drive_ratio_end_frac=0.0):
     """Create a jit-compiled analysis step (FULL forward, observational).
 
     Runs the model with `analysis=True` and the ANALYSIS variant of
@@ -4830,6 +4945,8 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_drive_mix_kw = _model_accepts_drive_mix(model)
+    _pass_admission_floor_kw = _model_accepts_admission_floor(model)
+    _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
@@ -4882,6 +4999,12 @@ def create_analysis_step(model, sharded_fns=None,
     _drive_mix_start = jnp.float32(drive_mix_start)
     _drive_mix_final = jnp.float32(drive_mix_final)
     _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
+    _admission_floor_hold_frac = jnp.float32(admission_floor_hold_frac)
+    _admission_floor_end_frac = jnp.float32(admission_floor_end_frac)
+    _drive_baseline_qk = jnp.float32(drive_baseline_qk)
+    _drive_baseline_v = jnp.float32(drive_baseline_v)
+    _drive_baseline_rst = jnp.float32(drive_baseline_rst)
+    _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
 
     @jax.jit
     def analysis_step(params, input_ids, attention_mask, step):
@@ -4915,7 +5038,20 @@ def create_analysis_step(model, sharded_fns=None,
                 _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
-        if _pass_drive_mix_kw:
+        admission_floor = scheduled_admission_floor_by_frac(
+            step, _total_training_steps,
+            _admission_floor_hold_frac, _admission_floor_end_frac)
+        boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
+            step, _total_training_steps,
+            _boundary_drive_ratio_end_frac)
+        if _pass_admission_floor_kw:
+            extra_kw['admission_floor'] = admission_floor
+            extra_kw['drive_baseline_qk'] = _drive_baseline_qk
+            extra_kw['drive_baseline_v'] = _drive_baseline_v
+            extra_kw['drive_baseline_rst'] = _drive_baseline_rst
+        if _pass_boundary_drive_ratio_kw:
+            extra_kw['boundary_drive_ratio'] = boundary_drive_ratio
+        elif _pass_drive_mix_kw:
             extra_kw['drive_mix'] = jnp.where(
                 jnp.asarray(_drive_anneal_enabled),
                 _scheduled_scalar(
@@ -5063,7 +5199,13 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                             drive_ref_rst=0.04,
                             drive_mix_start=1.0,
                             drive_mix_final=1.0,
-                            drive_mix_end_frac=0.0):
+                            drive_mix_end_frac=0.0,
+                     admission_floor_hold_frac=0.0,
+                     admission_floor_end_frac=0.0,
+                     drive_baseline_qk=0.012,
+                     drive_baseline_v=0.010,
+                     drive_baseline_rst=0.008,
+                     boundary_drive_ratio_end_frac=0.0):
     """Event-only forward probe. No gradients, no optimizer updates.
 
     Two-pass design for v4.1.6.0+ focused spike debugging:
@@ -5081,6 +5223,8 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_drive_mix_kw = _model_accepts_drive_mix(model)
+    _pass_admission_floor_kw = _model_accepts_admission_floor(model)
+    _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
@@ -5133,6 +5277,12 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _drive_mix_start = jnp.float32(drive_mix_start)
     _drive_mix_final = jnp.float32(drive_mix_final)
     _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
+    _admission_floor_hold_frac = jnp.float32(admission_floor_hold_frac)
+    _admission_floor_end_frac = jnp.float32(admission_floor_end_frac)
+    _drive_baseline_qk = jnp.float32(drive_baseline_qk)
+    _drive_baseline_v = jnp.float32(drive_baseline_v)
+    _drive_baseline_rst = jnp.float32(drive_baseline_rst)
+    _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
     _topk = int(topk)
 
     @jax.jit
@@ -5169,7 +5319,20 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                 _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
-        if _pass_drive_mix_kw:
+        admission_floor = scheduled_admission_floor_by_frac(
+            step, _total_training_steps,
+            _admission_floor_hold_frac, _admission_floor_end_frac)
+        boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
+            step, _total_training_steps,
+            _boundary_drive_ratio_end_frac)
+        if _pass_admission_floor_kw:
+            extra_kw['admission_floor'] = admission_floor
+            extra_kw['drive_baseline_qk'] = _drive_baseline_qk
+            extra_kw['drive_baseline_v'] = _drive_baseline_v
+            extra_kw['drive_baseline_rst'] = _drive_baseline_rst
+        if _pass_boundary_drive_ratio_kw:
+            extra_kw['boundary_drive_ratio'] = boundary_drive_ratio
+        elif _pass_drive_mix_kw:
             extra_kw['drive_mix'] = jnp.where(
                 jnp.asarray(_drive_anneal_enabled),
                 _scheduled_scalar(
@@ -6421,11 +6584,12 @@ def _print_v4165_compact_regular_block(rec, ctx):
     )
     log_message(
         "sched: "
+        f"floor={_rec_float(rec, 'admission_floor', 0.0):.3f} "
+        f"boundary_ratio={_rec_float(rec, 'boundary_drive_ratio', 1.0):.3f} "
         f"B[qk={_rec_float(rec, 'soft_gate_T_qk'):.5f} "
         f"v={_rec_float(rec, 'soft_gate_T_v'):.5f} "
         f"rst={_rec_float(rec, 'soft_gate_T_rst'):.5f}] "
-        f"p={_rec_float(rec, 'boundary_power_p', 2.0):.3f} "
-        f"drive_mix={_rec_float(rec, 'drive_mix', 1.0):.3f}"
+        f"p={_rec_float(rec, 'boundary_power_p', 2.0):.3f}"
     )
     log_message(
         "state: "
@@ -6433,12 +6597,12 @@ def _print_v4165_compact_regular_block(rec, ctx):
         f"margin[{_fmt_v4165_triplet(rec, ('attn_qk_selection_margin_mean', 'attn_v_selection_margin_mean', 'rst_selection_margin_mean'), lambda x: f'{x:.3f}')}] "
         f"adm_mean[{_fmt_v4165_triplet(rec, ('attn_qk_admission_mean', 'attn_v_admission_mean', 'rst_admission_mean'), lambda x: f'{x:.3f}')}]"
     )
-    load_qk = _rec_float(rec, 'attn_qk_admission_den_sum')
-    load_v = _rec_float(rec, 'attn_v_admission_den_sum')
-    load_rst = _rec_float(rec, 'rst_admission_den_sum')
-    mass_qk = _rec_float(rec, 'attn_qk_compose_mass_sum')
-    mass_v = _rec_float(rec, 'attn_v_compose_mass_sum')
-    mass_rst = _rec_float(rec, 'rst_compose_mass_sum')
+    load_qk = _rec_float(rec, 'attn_qk_load')
+    load_v = _rec_float(rec, 'attn_v_load')
+    load_rst = _rec_float(rec, 'rst_load')
+    mass_qk = _rec_float(rec, 'attn_qk_mass')
+    mass_v = _rec_float(rec, 'attn_v_mass')
+    mass_rst = _rec_float(rec, 'rst_mass')
     log_message(
         "rw: "
         f"drive_mean[qk={_v4165_drive_mean(rec, 'attn_qk'):.4f} "
@@ -6446,9 +6610,9 @@ def _print_v4165_compact_regular_block(rec, ctx):
         f"rst={_v4165_drive_mean(rec, 'rst'):.4f}] "
         f"load[qk={load_qk:.1f} v={load_v:.1f} rst={load_rst:.1f}] "
         f"mass[qk={mass_qk:.1f} v={mass_v:.1f} rst={mass_rst:.1f}] "
-        f"util[qk={_v4165_util(rec, 'attn_qk_compose_mass_sum', 'attn_qk_admission_den_sum'):.3f} "
-        f"v={_v4165_util(rec, 'attn_v_compose_mass_sum', 'attn_v_admission_den_sum'):.3f} "
-        f"rst={_v4165_util(rec, 'rst_compose_mass_sum', 'rst_admission_den_sum'):.3f}]"
+        f"util[qk={_v4165_util(rec, 'attn_qk_mass', 'attn_qk_load'):.3f} "
+        f"v={_v4165_util(rec, 'attn_v_mass', 'attn_v_load'):.3f} "
+        f"rst={_v4165_util(rec, 'rst_mass', 'rst_load'):.3f}]"
     )
     _print_v4165_warning_line(rec, ctx)
     log_message(
@@ -6566,7 +6730,7 @@ def _print_v4164_sparsity_block(rec):
             ('1e-3', '1e_3'),
             ('1e-2', '1e_2')):
         log_message(
-            f"  compose@{eps_label}: "
+            f"  weight@{eps_label}: "
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool, suffix=suffix: _fmt_sparsity_frac_count(
@@ -7008,7 +7172,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'drift_attn_v_emb': float(m.get('drift_attn_v_emb', 0.0)),
         'drift_rst_emb': float(m.get('drift_rst_emb', 0.0)),
         # Core activity.
-        'drive_mix': float(m.get('drive_mix', 1.0)),
+        'admission_floor': float(m.get('admission_floor', 0.0)),
+        'boundary_drive_ratio': float(m.get(
+            'boundary_drive_ratio', m.get('drive_mix', 1.0))),
+        'drive_mix': float(m.get('drive_mix', m.get('boundary_drive_ratio', 1.0))),
         'drive_mean': float(m.get('drive_mean', 0.0)),
         'drive_max': float(m.get('drive_max', 0.0)),
         'attn_qk_drive_mean': float(m.get('attn_qk_drive_mean', 0.0)),
@@ -7120,6 +7287,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_qk_compose_mass_sum': float(m.get('attn_qk_compose_mass_sum', 0.0)),
         'attn_v_compose_mass_sum': float(m.get('attn_v_compose_mass_sum', 0.0)),
         'rst_compose_mass_sum': float(m.get('rst_compose_mass_sum', 0.0)),
+        'attn_qk_load': float(m.get('attn_qk_admission_den_sum', 0.0)),
+        'attn_v_load': float(m.get('attn_v_admission_den_sum', 0.0)),
+        'rst_load': float(m.get('rst_admission_den_sum', 0.0)),
+        'attn_qk_mass': float(m.get('attn_qk_compose_mass_sum', 0.0)),
+        'attn_v_mass': float(m.get('attn_v_compose_mass_sum', 0.0)),
+        'rst_mass': float(m.get('rst_compose_mass_sum', 0.0)),
         'angular_depth_mean': float(m.get('angular_depth_mean', 0.0)),
         'attn_angular_depth_mean': float(m.get('attn_angular_depth_mean', 0.0)),
         'attn_qk_angular_depth_mean': float(m.get('attn_qk_angular_depth_mean', 0.0)),
@@ -10337,6 +10510,12 @@ def _build_analysis_record(base, metrics, ctx):
         'attn_qk_compose_mass_sum': float(m.get('attn_qk_compose_mass_sum', 0.0)),
         'attn_v_compose_mass_sum': float(m.get('attn_v_compose_mass_sum', 0.0)),
         'rst_compose_mass_sum': float(m.get('rst_compose_mass_sum', 0.0)),
+        'attn_qk_load': float(m.get('attn_qk_admission_den_sum', 0.0)),
+        'attn_v_load': float(m.get('attn_v_admission_den_sum', 0.0)),
+        'rst_load': float(m.get('rst_admission_den_sum', 0.0)),
+        'attn_qk_mass': float(m.get('attn_qk_compose_mass_sum', 0.0)),
+        'attn_v_mass': float(m.get('attn_v_compose_mass_sum', 0.0)),
+        'rst_mass': float(m.get('rst_compose_mass_sum', 0.0)),
         'angular_depth_mean': float(m.get('angular_depth_mean', 0.0)),
         'attn_angular_depth_mean': float(m.get('attn_angular_depth_mean', 0.0)),
         'attn_qk_angular_depth_mean': float(m.get('attn_qk_angular_depth_mean', 0.0)),
@@ -11488,6 +11667,18 @@ def main():
                 'drive_mix_final', drive_mix_final))
             drive_mix_end_frac = float(saved_training_config.get(
                 'drive_mix_end_frac', drive_mix_end_frac))
+            admission_floor_hold_frac = float(saved_training_config.get(
+                'admission_floor_hold_frac', admission_floor_hold_frac))
+            admission_floor_end_frac = float(saved_training_config.get(
+                'admission_floor_end_frac', admission_floor_end_frac))
+            drive_baseline_qk = float(saved_training_config.get(
+                'drive_baseline_qk', drive_baseline_qk))
+            drive_baseline_v = float(saved_training_config.get(
+                'drive_baseline_v', drive_baseline_v))
+            drive_baseline_rst = float(saved_training_config.get(
+                'drive_baseline_rst', drive_baseline_rst))
+            boundary_drive_ratio_end_frac = float(saved_training_config.get(
+                'boundary_drive_ratio_end_frac', boundary_drive_ratio_end_frac))
             if model_version_cfg == 'spatial-r1-v4.1.6.1':
                 # Older 4161 checkpoints may have saved rpe_enabled=False and
                 # exploration_weight=0 because the old code hard-disabled RPE.
@@ -11700,6 +11891,19 @@ def main():
                 "0 < mid_frac < final_frac <= 1, got "
                 f"{soft_gate_boundary_power_mid_frac}, "
                 f"{soft_gate_boundary_power_final_frac}")
+    if not (0.0 <= admission_floor_hold_frac <= admission_floor_end_frac <= 1.0):
+        raise ValueError(
+            "admission_floor_hold_frac/end_frac must satisfy "
+            f"0 <= hold <= end <= 1, got {admission_floor_hold_frac}, "
+            f"{admission_floor_end_frac}")
+    if drive_baseline_qk < 0.0 or drive_baseline_v < 0.0 or drive_baseline_rst < 0.0:
+        raise ValueError(
+            "drive_baseline_qk/v/rst must be >= 0, got "
+            f"{drive_baseline_qk}, {drive_baseline_v}, {drive_baseline_rst}")
+    if not (0.0 <= boundary_drive_ratio_end_frac <= 1.0):
+        raise ValueError(
+            "boundary_drive_ratio_end_frac must satisfy 0 <= end_frac <= 1, got "
+            f"{boundary_drive_ratio_end_frac}")
     if drive_ref_qk <= 0.0 or drive_ref_v <= 0.0 or drive_ref_rst <= 0.0:
         raise ValueError(
             "drive_ref_qk/v/rst must be > 0, got "
@@ -11771,6 +11975,13 @@ def main():
         'soft_gate_boundary_power_final': soft_gate_boundary_power_final,
         'soft_gate_boundary_power_mid_frac': soft_gate_boundary_power_mid_frac,
         'soft_gate_boundary_power_final_frac': soft_gate_boundary_power_final_frac,
+        'admission_floor_hold_frac': admission_floor_hold_frac,
+        'admission_floor_end_frac': admission_floor_end_frac,
+        'drive_baseline_qk': drive_baseline_qk,
+        'drive_baseline_v': drive_baseline_v,
+        'drive_baseline_rst': drive_baseline_rst,
+        'boundary_drive_ratio_end_frac': boundary_drive_ratio_end_frac,
+        # Backward-compatible aliases retained in checkpoints.
         'drive_anneal_enabled': drive_anneal_enabled,
         'drive_ref_qk': drive_ref_qk,
         'drive_ref_v': drive_ref_v,
@@ -12324,13 +12535,15 @@ def main():
                     f"mid_frac={soft_gate_boundary_power_mid_frac} "
                     f"final_frac={soft_gate_boundary_power_final_frac}")
                 if _soft_model_version == V4165_MODEL_VERSION:
-                    print("  FairDrive/TauSG:")
+                    print("  Admission floor / drive baseline:")
                     print("    tau_sg=stop_gradient(tau); load=sum(admission)")
                     print(
-                        f"    drive_anneal={drive_anneal_enabled} "
-                        f"ref[qk/v/rst]=({drive_ref_qk}, {drive_ref_v}, "
-                        f"{drive_ref_rst}) mix={drive_mix_start}->"
-                        f"{drive_mix_final} end_frac={drive_mix_end_frac}")
+                        f"    admission_floor hold={admission_floor_hold_frac} "
+                        f"end={admission_floor_end_frac}")
+                    print(
+                        f"    drive_baseline[qk/v/rst]=({drive_baseline_qk}, "
+                        f"{drive_baseline_v}, {drive_baseline_rst}) "
+                        f"boundary_ratio_end={boundary_drive_ratio_end_frac}")
             else:
                 print("  Soft gate:")
             print(f"    enabled={soft_gate_enabled} "
@@ -12875,6 +13088,12 @@ def main():
         drive_mix_start=drive_mix_start,
         drive_mix_final=drive_mix_final,
         drive_mix_end_frac=drive_mix_end_frac,
+        admission_floor_hold_frac=admission_floor_hold_frac,
+        admission_floor_end_frac=admission_floor_end_frac,
+        drive_baseline_qk=drive_baseline_qk,
+        drive_baseline_v=drive_baseline_v,
+        drive_baseline_rst=drive_baseline_rst,
+        boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac,
         rpe_start_frac=rpe_start_frac,
         rpe_full_frac=rpe_full_frac,
         rpe_schedule=rpe_schedule,
@@ -12915,7 +13134,13 @@ def main():
         drive_ref_rst=drive_ref_rst,
         drive_mix_start=drive_mix_start,
         drive_mix_final=drive_mix_final,
-        drive_mix_end_frac=drive_mix_end_frac)
+        drive_mix_end_frac=drive_mix_end_frac,
+        admission_floor_hold_frac=admission_floor_hold_frac,
+        admission_floor_end_frac=admission_floor_end_frac,
+        drive_baseline_qk=drive_baseline_qk,
+        drive_baseline_v=drive_baseline_v,
+        drive_baseline_rst=drive_baseline_rst,
+        boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
     eval_prune_step_fns = {}
     if eval_effective_prune_enabled:
         for _eps in eval_effective_prune_eps_list:
@@ -12947,7 +13172,13 @@ def main():
                 drive_ref_rst=drive_ref_rst,
                 drive_mix_start=drive_mix_start,
                 drive_mix_final=drive_mix_final,
-                drive_mix_end_frac=drive_mix_end_frac)
+                drive_mix_end_frac=drive_mix_end_frac,
+                admission_floor_hold_frac=admission_floor_hold_frac,
+                admission_floor_end_frac=admission_floor_end_frac,
+                drive_baseline_qk=drive_baseline_qk,
+                drive_baseline_v=drive_baseline_v,
+                drive_baseline_rst=drive_baseline_rst,
+                boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
     # v4.1: analysis_step is only meaningful when the full analysis
     # kernels exist. Older model versions skip it -analysis logging
     # degrades to empty then.
@@ -12978,7 +13209,13 @@ def main():
             drive_ref_rst=drive_ref_rst,
             drive_mix_start=drive_mix_start,
             drive_mix_final=drive_mix_final,
-            drive_mix_end_frac=drive_mix_end_frac)
+            drive_mix_end_frac=drive_mix_end_frac,
+                admission_floor_hold_frac=admission_floor_hold_frac,
+                admission_floor_end_frac=admission_floor_end_frac,
+                drive_baseline_qk=drive_baseline_qk,
+                drive_baseline_v=drive_baseline_v,
+                drive_baseline_rst=drive_baseline_rst,
+                boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
     else:
         analysis_step_fn = None
     spike_probe_step_fn = None
@@ -13011,7 +13248,13 @@ def main():
             drive_ref_rst=drive_ref_rst,
             drive_mix_start=drive_mix_start,
             drive_mix_final=drive_mix_final,
-            drive_mix_end_frac=drive_mix_end_frac)
+            drive_mix_end_frac=drive_mix_end_frac,
+                admission_floor_hold_frac=admission_floor_hold_frac,
+                admission_floor_end_frac=admission_floor_end_frac,
+                drive_baseline_qk=drive_baseline_qk,
+                drive_baseline_v=drive_baseline_v,
+                drive_baseline_rst=drive_baseline_rst,
+                boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
     # No current-train-batch debug forward: --debug uses regular scalar
     # train_step metrics. Local spike diagnostics require training.debug_local_spikes=true.
     debug_forward_step_fn = None

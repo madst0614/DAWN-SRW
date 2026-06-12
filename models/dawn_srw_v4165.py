@@ -1,12 +1,12 @@
 """
-DAWN-SRW v4.1.6.5 FairDrive/TauSG Boundary DirectTau
+DAWN-SRW v4.1.6.5 AdmissionFloor/DriveBaseline TauSG Boundary DirectTau
 
 Clean v4165 experimental model path based on v4164.
 
 Implemented concepts:
 - cosine-space tau reference with bounded sigmoid min/max mapping
 - one-sided generalized Gaussian boundary DirectTau admission
-- boundary-relative FairDrive RW composition
+- boundary admission plus scheduled drive baseline RW composition
 - tau stop-gradient for admission/drive on the CE path
 - scheduled soft-gate boundary-scale input
 - scheduled boundary power input
@@ -298,7 +298,7 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 
 
 # ================================================================
-# V4.1.6.5 FairDrive/TauSG generalized Gaussian DirectTau in cosine space.
+# V4.1.6.5 admission-floor / drive-baseline generalized Gaussian DirectTau in cosine space.
 #
 #   rho              = cosine(q, signature)
 #   raw_tau          = learned cosine-space reference
@@ -440,19 +440,44 @@ def _compute_admission_depth(score, tau, boundary_scale,
                              boundary_power=2.0,
                              effective_active_eps=1.0e-6,
                              execution_prune_eps=0.0,
-                             drive_mix=1.0,
-                             drive_ref=1.0,
-                             scale=None):
-    """v4165 admission plus FairDrive composition.
+                             admission_floor=0.0,
+                             boundary_drive_ratio=1.0,
+                             drive_baseline=0.0,
+                             drive_baseline_load_scale=1.0,
+                             scale=None,
+                             drive_mix=None,
+                             drive_ref=None):
+    """v4165 candidate admission plus scheduled drive composition.
 
-    The returned tuple preserves the v4164 positions for compatibility:
+    Preferred v4165 semantics:
+      boundary_admission = exp(-(d_neg ** boundary_power))
+      admission = admission_floor + (1 - admission_floor) * boundary_admission
+      drive = (1 - boundary_drive_ratio) * drive_baseline_eff
+            + boundary_drive_ratio * boundary_drive
+      weight = admission * drive
+
+    drive_mix/drive_ref remain accepted only as backward-compatible aliases.
+    The returned tuple preserves the older positions for compatibility:
     slot 2 is drive, slot 3 is weight.
     """
     execution_prune_eps = jnp.asarray(execution_prune_eps, dtype=jnp.float32)
     tau_sg = jax.lax.stop_gradient(tau)
     margin = score - tau_sg
-    admission_unpruned = _boundary_soft_weight_from_margin(
+    admission_floor = jnp.clip(
+        jnp.asarray(admission_floor, dtype=jnp.float32),
+        jnp.float32(0.0), jnp.float32(1.0))
+    if drive_mix is not None and boundary_drive_ratio is None:
+        boundary_drive_ratio = drive_mix
+    if drive_ref is not None and drive_baseline is None:
+        drive_baseline = drive_ref
+    boundary_drive_ratio = jnp.clip(
+        jnp.asarray(boundary_drive_ratio, dtype=jnp.float32),
+        jnp.float32(0.0), jnp.float32(1.0))
+    boundary_admission = _boundary_soft_weight_from_margin(
         margin, boundary_scale, boundary_power)
+    admission_unpruned = (
+        admission_floor
+        + (jnp.float32(1.0) - admission_floor) * boundary_admission)
     admission = jnp.where(
         execution_prune_eps > 0.0,
         jnp.where(
@@ -462,10 +487,12 @@ def _compute_admission_depth(score, tau, boundary_scale,
     scale = (
         _drive_scale_from_tau(tau_sg, boundary_scale)
         if scale is None else scale)
-    drive = _drive_from_margin(margin, boundary_scale, scale)
-    drive = ((jnp.float32(1.0) - jnp.asarray(drive_mix, dtype=jnp.float32))
-             * jnp.asarray(drive_ref, dtype=jnp.float32)
-             + jnp.asarray(drive_mix, dtype=jnp.float32) * drive)
+    boundary_drive = _drive_from_margin(margin, boundary_scale, scale)
+    drive_baseline_eff = (
+        jnp.asarray(drive_baseline, dtype=jnp.float32)
+        * jnp.asarray(drive_baseline_load_scale, dtype=jnp.float32))
+    drive = ((jnp.float32(1.0) - boundary_drive_ratio) * drive_baseline_eff
+             + boundary_drive_ratio * boundary_drive)
     weight = admission * drive
     active_mask = (
         admission >= jnp.asarray(effective_active_eps, dtype=jnp.float32))
@@ -533,8 +560,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         rho              = cosine(q, signature)
         margin           = rho - tau
         admission        = exp(-((max(tau - rho, 0) / B) ** p))
-        angular_depth    = softplus(margin / B) / softplus((1 - tau) / B)
-        compose_weight   = admission * angular_depth
+        drive            = scheduled baseline/boundary drive
+        weight           = admission * drive
         den              = max(sum(admission), 1.0) ** den_power
 
 
@@ -672,8 +699,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                        P(),                       # soft_gate_boundary_power scalar
                        P(),                       # soft_gate_boundary_power_final scalar
                        P(),                       # execution_prune_eps scalar
-                       P(),                       # drive_mix scalar
-                       P()),                      # drive_ref scalar
+                       P(),                       # admission_floor scalar
+                       P(),                       # boundary_drive_ratio scalar
+                       P(),                       # drive_baseline scalar
+                       P()),                      # drive_baseline_target_load_frac scalar
              out_specs=_out_specs,
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, raw_tau,
@@ -682,8 +711,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                        soft_gate_boundary_power,
                        soft_gate_boundary_power_final,
                        execution_prune_eps,
-                       drive_mix,
-                       drive_ref):
+                       admission_floor,
+                       boundary_drive_ratio,
+                       drive_baseline,
+                       drive_baseline_target_load_frac):
         N_local = emb_local.shape[0]
         nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -775,6 +806,55 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         # Load-balance over rho distribution is disabled in the fast path for
         # v4.1.6.4 does not require a rho-statistics pass for regular train.
         rho_lb = jnp.float32(0.0)
+        # v4165 admission-floor scheduling: admission decides candidate
+        # membership, while drive decides execution strength.  The weak
+        # drive_baseline load correction is based on final admission.
+        admission_floor = jnp.clip(
+            jnp.asarray(admission_floor, dtype=jnp.float32),
+            jnp.float32(0.0), jnp.float32(1.0))
+        boundary_drive_ratio = jnp.clip(
+            jnp.asarray(boundary_drive_ratio, dtype=jnp.float32),
+            jnp.float32(0.0), jnp.float32(1.0))
+        drive_baseline = jnp.maximum(
+            jnp.asarray(drive_baseline, dtype=jnp.float32),
+            jnp.float32(0.0))
+        target_load = jnp.maximum(
+            jnp.asarray(drive_baseline_target_load_frac, dtype=jnp.float32)
+            * jnp.float32(N_total),
+            jnp.float32(1.0))
+
+        def admission_from_rho(rho):
+            margin = rho - tau_ref
+            boundary_admission = _boundary_soft_weight_from_margin(
+                margin, soft_gate_temperature, soft_gate_boundary_power)
+            admission_unpruned = (
+                admission_floor
+                + (jnp.float32(1.0) - admission_floor)
+                * boundary_admission)
+            return jnp.where(
+                execution_prune_eps > 0.0,
+                jnp.where(
+                    admission_unpruned >= execution_prune_eps,
+                    admission_unpruned, 0.0),
+                admission_unpruned)
+
+        @jax.checkpoint
+        def admission_load_step(carry, i):
+            s = i * cs
+            route = route_emb_chunk(s)
+            rho, _ = route_relation(h_bf, route)
+            return carry + admission_from_rho(rho).sum(
+                axis=-1, keepdims=True), None
+
+        z_load = jnp.zeros((B, S, 1), dtype=jnp.float32)
+        local_admission_load, _ = jax.lax.scan(
+            admission_load_step, z_load, jnp.arange(nc))
+        load = jax.lax.psum(local_admission_load, 'model')
+        load_sg = jax.lax.stop_gradient(load)
+        drive_baseline_load_scale = jnp.power(
+            target_load / jnp.maximum(load_sg, target_load),
+            jnp.float32(0.25))
+
 
         def edge_margin_stat_terms(rho):
             positive_selection_margin = jax.nn.relu(rho - tau_ref)
@@ -789,8 +869,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 boundary_power=soft_gate_boundary_power,
                 effective_active_eps=_soft_gate_effective_active_eps,
                 execution_prune_eps=execution_prune_eps,
-                drive_mix=drive_mix,
-                drive_ref=drive_ref,
+                admission_floor=admission_floor,
+                boundary_drive_ratio=boundary_drive_ratio,
+                drive_baseline=drive_baseline,
+                drive_baseline_load_scale=drive_baseline_load_scale,
                 scale=scale)
             strong_mask = selection_margin > _angular_strong_margin
             return (
@@ -1136,7 +1218,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 gathered.reshape((-1, SPIKE_SRW_FIELD_COUNT)),
                 _spike_probe_topk, SPIKE_SRW_FIELD_COUNT)[None, :, :]
 
-        # --- Pass 2: admission + FairDrive SRW fused (scan + checkpoint) ---
+        # --- Pass 2: admission + drive-baseline SRW fused (scan + checkpoint) ---
         if analysis:
             @jax.checkpoint
             def gate_srw_step(carry, i):
@@ -1659,7 +1741,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     Scores stats computed independently per route.
     Returns out [B,S,2,D], active [B,S,1], gate_max [B,S,1].
 
-    Boundary DirectTau admission with FairDrive composition:
+    Boundary DirectTau admission with drive-baseline composition:
         admission = exp(-((max(tau - rho, 0) / B) ** p))
         angular_depth = softplus((rho - tau) / B) / softplus((1 - tau) / B)
         compose_weight = admission * angular_depth
@@ -1796,8 +1878,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                        P(),                           # soft_gate_boundary_power scalar
                        P(),                           # soft_gate_boundary_power_final scalar
                        P(),                           # execution_prune_eps scalar
-                       P(),                           # drive_mix scalar
-                       P()),                          # drive_ref scalar
+                       P(),                           # admission_floor scalar
+                       P(),                           # boundary_drive_ratio scalar
+                       P(),                           # drive_baseline scalar
+                       P()),                          # drive_baseline_target_load_frac scalar
              out_specs=_out_specs,
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, raw_tau,
@@ -1806,8 +1890,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                               soft_gate_boundary_power,
                               soft_gate_boundary_power_final,
                               execution_prune_eps,
-                              drive_mix,
-                              drive_ref):
+                              admission_floor,
+                              boundary_drive_ratio,
+                              drive_baseline,
+                              drive_baseline_target_load_frac):
         N_local = emb_local.shape[0]
         nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -1902,6 +1988,55 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         # Load-balance over rho distribution is disabled in the fast path for
         # v4.1.6.4 does not require a rho-statistics pass for regular train.
         rho_lb = jnp.float32(0.0)
+        # v4165 admission-floor scheduling: admission decides candidate
+        # membership, while drive decides execution strength.  The weak
+        # drive_baseline load correction is based on final admission.
+        admission_floor = jnp.clip(
+            jnp.asarray(admission_floor, dtype=jnp.float32),
+            jnp.float32(0.0), jnp.float32(1.0))
+        boundary_drive_ratio = jnp.clip(
+            jnp.asarray(boundary_drive_ratio, dtype=jnp.float32),
+            jnp.float32(0.0), jnp.float32(1.0))
+        drive_baseline = jnp.maximum(
+            jnp.asarray(drive_baseline, dtype=jnp.float32),
+            jnp.float32(0.0))
+        target_load = jnp.maximum(
+            jnp.asarray(drive_baseline_target_load_frac, dtype=jnp.float32)
+            * jnp.float32(N_total),
+            jnp.float32(1.0))
+
+        def admission_from_rho(rho):
+            margin = rho - tau_ref
+            boundary_admission = _boundary_soft_weight_from_margin(
+                margin, soft_gate_temperature, soft_gate_boundary_power)
+            admission_unpruned = (
+                admission_floor
+                + (jnp.float32(1.0) - admission_floor)
+                * boundary_admission)
+            return jnp.where(
+                execution_prune_eps > 0.0,
+                jnp.where(
+                    admission_unpruned >= execution_prune_eps,
+                    admission_unpruned, 0.0),
+                admission_unpruned)
+
+        @jax.checkpoint
+        def admission_load_step(carry, i):
+            s = i * cs
+            route = route_emb_chunk(s)
+            rho, _ = route_relation(h_bf, route)
+            return carry + admission_from_rho(rho).sum(
+                axis=-1, keepdims=True), None
+
+        z_load = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
+        local_admission_load, _ = jax.lax.scan(
+            admission_load_step, z_load, jnp.arange(nc))
+        load = jax.lax.psum(local_admission_load, 'model')
+        load_sg = jax.lax.stop_gradient(load)
+        drive_baseline_load_scale = jnp.power(
+            target_load / jnp.maximum(load_sg, target_load),
+            jnp.float32(0.25))
+
 
         def edge_margin_stat_terms(rho):
             positive_selection_margin = jax.nn.relu(rho - tau_ref)
@@ -1916,8 +2051,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 boundary_power=soft_gate_boundary_power,
                 effective_active_eps=_soft_gate_effective_active_eps,
                 execution_prune_eps=execution_prune_eps,
-                drive_mix=drive_mix,
-                drive_ref=drive_ref,
+                admission_floor=admission_floor,
+                boundary_drive_ratio=boundary_drive_ratio,
+                drive_baseline=drive_baseline,
+                drive_baseline_load_scale=drive_baseline_load_scale,
                 scale=scale)
             strong_mask = selection_margin > _angular_strong_margin
             return (
@@ -2940,6 +3077,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   soft_gate_T_v=None,
                   soft_gate_boundary_power=2.0,
                   soft_gate_boundary_power_final=4.0,
+                  admission_floor=0.0,
+                  boundary_drive_ratio=None,
+                  drive_baseline_qk=0.012,
+                  drive_baseline_v=0.010,
                   drive_mix=1.0,
                   drive_ref_qk=0.05,
                   drive_ref_v=0.04,
@@ -2955,6 +3096,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         soft_gate_temperature if soft_gate_T_qk is None else soft_gate_T_qk)
     soft_gate_T_v = (
         soft_gate_temperature if soft_gate_T_v is None else soft_gate_T_v)
+    if boundary_drive_ratio is None:
+        boundary_drive_ratio = drive_mix
+    if drive_baseline_qk is None:
+        drive_baseline_qk = drive_ref_qk
+    if drive_baseline_v is None:
+        drive_baseline_v = drive_ref_v
     qk_emb = pool_params['attn_qk_emb']
     qk_read = pool_params['attn_qk_read']
     qk_write = pool_params['attn_qk_write']
@@ -3012,8 +3159,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                            soft_gate_boundary_power,
                            soft_gate_boundary_power_final,
                            execution_prune_eps,
-                           drive_mix,
-                           drive_ref_qk)
+                           admission_floor,
+                           boundary_drive_ratio,
+                           drive_baseline_qk,
+                           jnp.float32(0.20))
     (QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
      qk_strong, qk_positive_margin_active, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
@@ -3050,8 +3199,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                            soft_gate_boundary_power,
                            soft_gate_boundary_power_final,
                            execution_prune_eps,
-                           drive_mix,
-                           drive_ref_v)
+                           admission_floor,
+                           boundary_drive_ratio,
+                           drive_baseline_v,
+                           jnp.float32(0.08))
     (V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
      v_strong, v_positive_margin_active, v_tau_abs,
      v_dead_pen, v_dead_cnt, v_int_max,
@@ -3129,8 +3280,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             rho, tau, pool_soft_gate_T,
             boundary_power=soft_gate_boundary_power,
             execution_prune_eps=execution_prune_eps,
-            drive_mix=drive_mix,
-            drive_ref=drive_ref_v if pool_id == 2 else drive_ref_qk)
+            admission_floor=admission_floor,
+            boundary_drive_ratio=boundary_drive_ratio,
+            drive_baseline=(drive_baseline_v if pool_id == 2 else drive_baseline_qk),
+            drive_baseline_load_scale=1.0)
         den = jnp.maximum(admission.sum(axis=-1), 1.0)
         active_n = active_mask.astype(jnp.float32).sum(axis=-1)
         read_dir = _forward_unit_direction(read_f)
@@ -3718,6 +3871,9 @@ def _rst_forward(x, pool_params, router_params, rng,
                   soft_gate_T_rst=None,
                   soft_gate_boundary_power=2.0,
                   soft_gate_boundary_power_final=4.0,
+                  admission_floor=0.0,
+                  boundary_drive_ratio=None,
+                  drive_baseline_rst=0.008,
                   drive_mix=1.0,
                   drive_ref_rst=0.04,
                   execution_prune_eps=0.0):
@@ -3729,6 +3885,10 @@ def _rst_forward(x, pool_params, router_params, rng,
     soft_gate_T_rst = (
         soft_gate_temperature
         if soft_gate_T_rst is None else soft_gate_T_rst)
+    if boundary_drive_ratio is None:
+        boundary_drive_ratio = drive_mix
+    if drive_baseline_rst is None:
+        drive_baseline_rst = drive_ref_rst
     rst_emb = pool_params['rst_emb']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
@@ -3779,8 +3939,10 @@ def _rst_forward(x, pool_params, router_params, rng,
             rho, tau, soft_gate_T_rst,
             boundary_power=soft_gate_boundary_power,
             execution_prune_eps=execution_prune_eps,
-            drive_mix=drive_mix,
-            drive_ref=drive_ref_rst)
+            admission_floor=admission_floor,
+            boundary_drive_ratio=boundary_drive_ratio,
+            drive_baseline=drive_baseline_rst,
+            drive_baseline_load_scale=1.0)
         den = jnp.maximum(admission.sum(axis=-1), 1.0)
         active_n = active_mask.astype(jnp.float32).sum(axis=-1)
         read_dir = _forward_unit_direction(read_f)
@@ -3849,8 +4011,10 @@ def _rst_forward(x, pool_params, router_params, rng,
                             soft_gate_boundary_power,
                             soft_gate_boundary_power_final,
                             execution_prune_eps,
-                            drive_mix,
-                            drive_ref_rst)
+                            admission_floor,
+                            boundary_drive_ratio,
+                            drive_baseline_rst,
+                            jnp.float32(0.04))
     (out, active_frac, raw_gate_max, lb_loss, rho_std_slim, gate_sum, active_n_mean,
      strong_frac, positive_margin_mean_active, rst_tau_abs_mean,
      rst_dead_penalty, rst_dead_count, rst_int_max,
@@ -4021,7 +4185,7 @@ class DAWNBlock(nn.Module):
 # ================================================================
 
 class DAWN(nn.Module):
-    """DAWN-SRW v4.1.6.5 with FairDrive/TauSG composition."""
+    """DAWN-SRW v4.1.6.5 with admission-floor / drive-baseline composition."""
     __version__ = "spatial-r1-v4.1.6.5"
 
     vocab_size: int = 30000
@@ -4090,6 +4254,11 @@ class DAWN(nn.Module):
                  soft_gate_T_rst=None,
                  soft_gate_boundary_power=2.0,
                  soft_gate_boundary_power_final=4.0,
+                 admission_floor=0.0,
+                 boundary_drive_ratio=None,
+                 drive_baseline_qk=0.012,
+                 drive_baseline_v=0.010,
+                 drive_baseline_rst=0.008,
                  drive_mix=1.0,
                  drive_ref_qk=0.05,
                  drive_ref_v=0.04,
@@ -4114,6 +4283,14 @@ class DAWN(nn.Module):
         soft_gate_T_rst = (
             soft_gate_temperature
             if soft_gate_T_rst is None else soft_gate_T_rst)
+        if boundary_drive_ratio is None:
+            boundary_drive_ratio = drive_mix
+        if drive_baseline_qk is None:
+            drive_baseline_qk = drive_ref_qk
+        if drive_baseline_v is None:
+            drive_baseline_v = drive_ref_v
+        if drive_baseline_rst is None:
+            drive_baseline_rst = drive_ref_rst
         B, S = input_ids.shape
         focus_probe_enabled = bool(spike_probe and spike_focus_bpos is not None)
         focus_k = int(spike_probe_topk)
@@ -4432,6 +4609,10 @@ class DAWN(nn.Module):
                     soft_gate_T_v=soft_gate_T_v,
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+                    admission_floor=admission_floor,
+                    boundary_drive_ratio=boundary_drive_ratio,
+                    drive_baseline_qk=drive_baseline_qk,
+                    drive_baseline_v=drive_baseline_v,
                     drive_mix=drive_mix,
                     drive_ref_qk=drive_ref_qk,
                     drive_ref_v=drive_ref_v,
@@ -4539,6 +4720,9 @@ class DAWN(nn.Module):
                     soft_gate_T_rst=soft_gate_T_rst,
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+                    admission_floor=admission_floor,
+                    boundary_drive_ratio=boundary_drive_ratio,
+                    drive_baseline_rst=drive_baseline_rst,
                     drive_mix=drive_mix,
                     drive_ref_rst=drive_ref_rst,
                     execution_prune_eps=execution_prune_eps)
@@ -4963,7 +5147,10 @@ class DAWN(nn.Module):
                 soft_gate_boundary_power, dtype=jnp.float32),
             'soft_gate_boundary_power_final': jnp.asarray(
                 soft_gate_boundary_power_final, dtype=jnp.float32),
-            'drive_mix': jnp.asarray(drive_mix, dtype=jnp.float32),
+            'admission_floor': jnp.asarray(admission_floor, dtype=jnp.float32),
+            'boundary_drive_ratio': jnp.asarray(
+                boundary_drive_ratio, dtype=jnp.float32),
+            'drive_mix': jnp.asarray(boundary_drive_ratio, dtype=jnp.float32),
             'rpe_effective_weight': jnp.asarray(rpe_effective_weight, dtype=jnp.float32),
             'execution_prune_eps': jnp.asarray(execution_prune_eps, dtype=jnp.float32),
             'execution_gate_mass_retained': (
