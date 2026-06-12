@@ -11215,9 +11215,16 @@ def main():
         'regular_sparsity_enabled',
         (True if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
          else model_version_cfg not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)))
+    legacy_drive_mix_schedule_present = any(
+        key in tcfg for key in (
+            'drive_mix_start', 'drive_mix_final', 'drive_mix_end_frac'))
+    # v4165 uses boundary_drive_ratio as the preferred schedule.  The old
+    # drive_mix path is kept only as a backward-compatible alias, so a new
+    # v4165 config with no drive_mix_* keys must not enable legacy validation.
     drive_anneal_enabled = bool(tcfg.get(
         'drive_anneal_enabled',
-        model_version_cfg == 'spatial-r1-v4.1.6.5'))
+        legacy_drive_mix_schedule_present
+        and 'boundary_drive_ratio_end_frac' not in tcfg))
     drive_ref_qk = float(tcfg.get('drive_ref_qk', 0.05))
     drive_ref_v = float(tcfg.get('drive_ref_v', 0.04))
     drive_ref_rst = float(tcfg.get('drive_ref_rst', 0.04))
@@ -11916,12 +11923,13 @@ def main():
         raise ValueError(
             "drive_ref_qk/v/rst must be > 0, got "
             f"{drive_ref_qk}, {drive_ref_v}, {drive_ref_rst}")
-    if drive_anneal_enabled:
+    if drive_anneal_enabled or legacy_drive_mix_schedule_present:
         if not (0.0 <= drive_mix_start <= drive_mix_final):
             raise ValueError(
                 "drive_mix_start/final must satisfy "
                 f"0 <= start <= final, got {drive_mix_start}, "
                 f"{drive_mix_final}")
+    if drive_anneal_enabled:
         if not (0.0 < drive_mix_end_frac <= 1.0):
             raise ValueError(
                 "drive_mix_end_frac must satisfy 0 < end_frac <= 1, got "
@@ -12522,7 +12530,7 @@ def main():
                 print("  Boundary admission: one-sided generalized Gaussian")
                 if _soft_model_version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
                     if _soft_model_version == V4165_MODEL_VERSION:
-                        print("  drive = boundary-relative FairDrive strength")
+                        print("  drive = boundary-relative execution strength")
                         print("  weight = admission * drive")
                         print("  load = sum(admission)")
                     else:
