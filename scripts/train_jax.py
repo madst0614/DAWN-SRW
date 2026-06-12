@@ -11224,6 +11224,14 @@ def main():
     drive_mix_start = float(tcfg.get('drive_mix_start', 1.0))
     drive_mix_final = float(tcfg.get('drive_mix_final', 1.0))
     drive_mix_end_frac = float(tcfg.get('drive_mix_end_frac', 0.0))
+    admission_floor_hold_frac = float(tcfg.get('admission_floor_hold_frac', 0.0))
+    admission_floor_end_frac = float(tcfg.get('admission_floor_end_frac', 0.0))
+    drive_baseline_qk = float(tcfg.get('drive_baseline_qk', 0.012))
+    drive_baseline_v = float(tcfg.get('drive_baseline_v', 0.010))
+    drive_baseline_rst = float(tcfg.get('drive_baseline_rst', 0.008))
+    boundary_drive_ratio_end_frac = float(tcfg.get(
+        'boundary_drive_ratio_end_frac',
+        tcfg.get('drive_mix_end_frac', 0.0)))
     effective_prune_eps_list = list(
         tcfg.get('effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
     eval_effective_prune_enabled = bool(tcfg.get(
