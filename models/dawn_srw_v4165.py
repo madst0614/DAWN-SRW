@@ -807,8 +807,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         # v4.1.6.4 does not require a rho-statistics pass for regular train.
         rho_lb = jnp.float32(0.0)
         # v4165 admission-floor scheduling: admission decides candidate
-        # membership, while drive decides execution strength.  The weak
-        # drive_baseline load correction is based on final admission.
+        # membership, while drive decides execution strength.  The main
+        # compose scan below still computes admission load for den.
         admission_floor = jnp.clip(
             jnp.asarray(admission_floor, dtype=jnp.float32),
             jnp.float32(0.0), jnp.float32(1.0))
@@ -818,42 +818,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         drive_baseline = jnp.maximum(
             jnp.asarray(drive_baseline, dtype=jnp.float32),
             jnp.float32(0.0))
-        target_load = jnp.maximum(
-            jnp.asarray(drive_baseline_target_load_frac, dtype=jnp.float32)
-            * jnp.float32(N_total),
-            jnp.float32(1.0))
-
-        def admission_from_rho(rho):
-            margin = rho - tau_ref
-            boundary_admission = _boundary_soft_weight_from_margin(
-                margin, soft_gate_temperature, soft_gate_boundary_power)
-            admission_unpruned = (
-                admission_floor
-                + (jnp.float32(1.0) - admission_floor)
-                * boundary_admission)
-            return jnp.where(
-                execution_prune_eps > 0.0,
-                jnp.where(
-                    admission_unpruned >= execution_prune_eps,
-                    admission_unpruned, 0.0),
-                admission_unpruned)
-
-        @jax.checkpoint
-        def admission_load_step(carry, i):
-            s = i * cs
-            route = route_emb_chunk(s)
-            rho, _ = route_relation(h_bf, route)
-            return carry + admission_from_rho(rho).sum(
-                axis=-1, keepdims=True), None
-
-        z_load = jnp.zeros((B, S, 1), dtype=jnp.float32)
-        local_admission_load, _ = jax.lax.scan(
-            admission_load_step, z_load, jnp.arange(nc))
-        load = jax.lax.psum(local_admission_load, 'model')
-        load_sg = jax.lax.stop_gradient(load)
-        drive_baseline_load_scale = jnp.power(
-            target_load / jnp.maximum(load_sg, target_load),
-            jnp.float32(0.25))
+        drive_baseline_load_scale = jnp.float32(1.0)
 
 
         def edge_margin_stat_terms(rho):
@@ -1989,8 +1954,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         # v4.1.6.4 does not require a rho-statistics pass for regular train.
         rho_lb = jnp.float32(0.0)
         # v4165 admission-floor scheduling: admission decides candidate
-        # membership, while drive decides execution strength.  The weak
-        # drive_baseline load correction is based on final admission.
+        # membership, while drive decides execution strength.  The main
+        # compose scan below still computes admission load for den.
         admission_floor = jnp.clip(
             jnp.asarray(admission_floor, dtype=jnp.float32),
             jnp.float32(0.0), jnp.float32(1.0))
@@ -2000,42 +1965,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         drive_baseline = jnp.maximum(
             jnp.asarray(drive_baseline, dtype=jnp.float32),
             jnp.float32(0.0))
-        target_load = jnp.maximum(
-            jnp.asarray(drive_baseline_target_load_frac, dtype=jnp.float32)
-            * jnp.float32(N_total),
-            jnp.float32(1.0))
-
-        def admission_from_rho(rho):
-            margin = rho - tau_ref
-            boundary_admission = _boundary_soft_weight_from_margin(
-                margin, soft_gate_temperature, soft_gate_boundary_power)
-            admission_unpruned = (
-                admission_floor
-                + (jnp.float32(1.0) - admission_floor)
-                * boundary_admission)
-            return jnp.where(
-                execution_prune_eps > 0.0,
-                jnp.where(
-                    admission_unpruned >= execution_prune_eps,
-                    admission_unpruned, 0.0),
-                admission_unpruned)
-
-        @jax.checkpoint
-        def admission_load_step(carry, i):
-            s = i * cs
-            route = route_emb_chunk(s)
-            rho, _ = route_relation(h_bf, route)
-            return carry + admission_from_rho(rho).sum(
-                axis=-1, keepdims=True), None
-
-        z_load = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
-        local_admission_load, _ = jax.lax.scan(
-            admission_load_step, z_load, jnp.arange(nc))
-        load = jax.lax.psum(local_admission_load, 'model')
-        load_sg = jax.lax.stop_gradient(load)
-        drive_baseline_load_scale = jnp.power(
-            target_load / jnp.maximum(load_sg, target_load),
-            jnp.float32(0.25))
+        drive_baseline_load_scale = jnp.float32(1.0)
 
 
         def edge_margin_stat_terms(rho):
