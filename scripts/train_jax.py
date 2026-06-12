@@ -102,6 +102,16 @@ except ImportError:
     DAWN_SRW_V4164 = None
     _v4164_raw_tau_init_from_cosine_tau = None
     _v4164_tau_init_calibration_scores = None
+try:
+    from models.dawn_srw_v4165 import (
+        DAWN as DAWN_SRW_V4165,
+        _raw_tau_init_from_cosine_tau as _v4165_raw_tau_init_from_cosine_tau,
+        _tau_init_calibration_scores as _v4165_tau_init_calibration_scores,
+    )
+except ImportError:
+    DAWN_SRW_V4165 = None
+    _v4165_raw_tau_init_from_cosine_tau = None
+    _v4165_tau_init_calibration_scores = None
 
 # ============================================================
 # Constants
@@ -109,6 +119,8 @@ except ImportError:
 
 # Log cadence is config-driven: see log_interval / log_analysis_multiplier
 # in `training:`. The legacy module-level LOG_INTERVAL constant was removed.
+
+V4165_MODEL_VERSION = 'spatial-r1-v4.1.6.5'
 
 SRW_ACTIVE_MODEL_VERSIONS = (
     'dawn_srw',
@@ -121,6 +133,7 @@ SRW_ACTIVE_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.2',
     'spatial-r1-v4.1.6.3',
     'spatial-r1-v4.1.6.4',
+    V4165_MODEL_VERSION,
 )
 
 DIRECT_TAU_SPLIT_MODEL_VERSIONS = (
@@ -129,17 +142,25 @@ DIRECT_TAU_SPLIT_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.2',
     'spatial-r1-v4.1.6.3',
     'spatial-r1-v4.1.6.4',
+    V4165_MODEL_VERSION,
 )
 
 SOFT_DIRECT_TAU_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.2',
     'spatial-r1-v4.1.6.3',
     'spatial-r1-v4.1.6.4',
+    V4165_MODEL_VERSION,
 )
 
 ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.3',
     'spatial-r1-v4.1.6.4',
+    V4165_MODEL_VERSION,
+)
+
+UNIFIED_ROUTE_DEN_MODEL_VERSIONS = (
+    'spatial-r1-v4.1.6.4',
+    V4165_MODEL_VERSION,
 )
 
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
@@ -760,7 +781,8 @@ def _dawn_srw_kwargs(cfg):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
     if version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1',
                    'spatial-r1-v4.1.6.2', 'spatial-r1-v4.1.6.3',
-                   'spatial-r1-v4.1.6.4'):
+                   'spatial-r1-v4.1.6.4',
+                   'spatial-r1-v4.1.6.5'):
         def _cfg_get(name, default=None):
             if name in m:
                 return m[name]
@@ -795,7 +817,7 @@ def _dawn_srw_kwargs(cfg):
                 'legacy_count_init_attn_v')
             kw['legacy_count_init_rst'] = _legacy_count_init_cfg(
                 'legacy_count_init_rst')
-        if (version != 'spatial-r1-v4.1.6.4'
+        if (version not in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                 and ('d_select' in m or 'd_select' in t)):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
     return kw
@@ -832,13 +854,18 @@ def _v415_sharded_kwargs(cfg):
         if regular_level not in ('compact', 'full'):
             raise ValueError(
                 "training.regular_diagnostics_level must be 'compact' or 'full'.")
-        regular_current_eps_default = (
-            [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
-            if version == 'spatial-r1-v4.1.6.4'
-            else [1.0e-1, 1.0e-2, 1.0e-3])
+        if version == V4165_MODEL_VERSION and regular_level == 'compact':
+            regular_current_eps_default = [1.0e-2]
+            regular_projected_eps_default = []
+        else:
+            regular_current_eps_default = (
+                [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
+                if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                else [1.0e-1, 1.0e-2, 1.0e-3])
+            regular_projected_eps_default = [1.0e-6]
         regular_sparsity_default = (
             True
-            if version == 'spatial-r1-v4.1.6.4'
+            if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
             else version not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
         kw = dict(
             dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
@@ -850,13 +877,15 @@ def _v415_sharded_kwargs(cfg):
                 float(x) for x in t.get(
                     'regular_current_eps', regular_current_eps_default)),
             regular_projected_eps=tuple(
-                float(x) for x in t.get('regular_projected_eps', [1.0e-6])),
+                float(x) for x in t.get(
+                    'regular_projected_eps',
+                    regular_projected_eps_default)),
             regular_mass_enabled=bool(t.get('regular_mass_enabled', False)),
             regular_sparsity_enabled=bool(t.get(
                 'regular_sparsity_enabled',
                 regular_sparsity_default)),
         )
-        if version == 'spatial-r1-v4.1.6.4':
+        if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
             kw.update(
                 v4164_den_power=float(t.get('v4164_den_power', 1.0)),
                 v4164_den_grad_scale=float(
@@ -883,7 +912,7 @@ def _v415_sharded_kwargs(cfg):
             'spatial-r1-v4.1.6.3') and d_select_cfg is None:
         raise ValueError(
             f"{version} angular SRW requires model.d_select.")
-    if version == 'spatial-r1-v4.1.6.4':
+    if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
         intensity_route_dim = 0
     elif d_select_cfg is not None:
         d_select = int(d_select_cfg)
@@ -1034,6 +1063,17 @@ if DAWN_SRW_V4164 is not None:
         sharded_kwargs=_v415_sharded_kwargs,
     )
 
+if DAWN_SRW_V4165 is not None:
+    MODEL_REGISTRY['spatial-r1-v4.1.6.5'] = ModelSpec(
+        name='spatial-r1-v4.1.6.5',
+        module_path='models.dawn_srw_v4165',
+        cls=DAWN_SRW_V4165,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    )
+
 
 def build_model_from_config(cfg):
     """Build model from config via MODEL_REGISTRY.
@@ -1062,16 +1102,22 @@ def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
                                      tau_init_cfg):
     """Compute host-side quantiles from a small deterministic score sample."""
     version = cfg['model'].get('model_version', 'dawn_srw')
-    is_v4164 = version == 'spatial-r1-v4.1.6.4'
+    is_unified_route_den = version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
     d_select = cfg['model'].get(
         'd_select', cfg['training'].get('d_select', None))
-    if d_select is None and not is_v4164:
+    if d_select is None and not is_unified_route_den:
         raise ValueError(
             "v4162/v4163 tau_init_mode=quantile_frac requires model.d_select.")
-    if is_v4164 and _v4164_tau_init_calibration_scores is None:
+    if (version == 'spatial-r1-v4.1.6.4'
+            and _v4164_tau_init_calibration_scores is None):
         raise ValueError(
             "v4164 tau_init_mode=quantile_frac requires "
             "models.dawn_srw_v4164 to import cleanly.")
+    if (version == 'spatial-r1-v4.1.6.5'
+            and _v4165_tau_init_calibration_scores is None):
+        raise ValueError(
+            "v4165 tau_init_mode=quantile_frac requires "
+            "models.dawn_srw_v4165 to import cleanly.")
 
     # Keep the one-time JIT signature small: calibration needs only route
     # geometry, not read/write tensors, tau params, or LM output weights.
@@ -1093,13 +1139,15 @@ def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
         },
     }
     score_impl = (
-        _v4164_tau_init_calibration_scores
-        if is_v4164
-        else _v4162_tau_init_calibration_scores)
+        _v4165_tau_init_calibration_scores
+        if version == 'spatial-r1-v4.1.6.5'
+        else (_v4164_tau_init_calibration_scores
+              if version == 'spatial-r1-v4.1.6.4'
+              else _v4162_tau_init_calibration_scores))
     score_kwargs = {
         'max_tokens': tau_init_cfg['calibration_tokens'],
     }
-    if not is_v4164:
+    if not is_unified_route_den:
         score_kwargs['d_select'] = int(d_select)
     score_fn = jax.jit(partial(score_impl, **score_kwargs))
     sampled = jax.device_get(score_fn(score_params, input_ids))
@@ -1598,6 +1646,15 @@ def _model_accepts_soft_gate_boundary_power(model):
     try:
         return 'soft_gate_boundary_power' in _inspect.signature(
             model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _model_accepts_drive_mix(model):
+    """Return True if model.__call__ accepts v4165 drive annealing kwargs."""
+    import inspect as _inspect
+    try:
+        return 'drive_mix' in _inspect.signature(model.__call__).parameters
     except (TypeError, ValueError):
         return False
 
@@ -2211,6 +2268,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       soft_gate_boundary_power_final=4.0,
                       soft_gate_boundary_power_mid_frac=0.800,
                       soft_gate_boundary_power_final_frac=0.950,
+                      drive_anneal_enabled=False,
+                      drive_ref_qk=0.05,
+                      drive_ref_v=0.04,
+                      drive_ref_rst=0.04,
+                      drive_mix_start=1.0,
+                      drive_mix_final=1.0,
+                      drive_mix_end_frac=0.0,
                       rpe_start_frac=0.0,
                       rpe_full_frac=0.0,
                       rpe_schedule='linear',
@@ -2357,6 +2421,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
+    _pass_drive_mix_kw = _model_accepts_drive_mix(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
@@ -2426,6 +2491,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
+    _drive_anneal_enabled = bool(drive_anneal_enabled)
+    _drive_ref_qk = jnp.float32(drive_ref_qk)
+    _drive_ref_v = jnp.float32(drive_ref_v)
+    _drive_ref_rst = jnp.float32(drive_ref_rst)
+    _drive_mix_start = jnp.float32(drive_mix_start)
+    _drive_mix_final = jnp.float32(drive_mix_final)
+    _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
     _rpe_start_frac = jnp.float32(rpe_start_frac)
     _rpe_full_frac = jnp.float32(rpe_full_frac)
     _rpe_schedule = str(rpe_schedule).lower()
@@ -2487,6 +2559,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _soft_gate_boundary_power_final,
                 _soft_gate_boundary_power_mid_frac,
                 _soft_gate_boundary_power_final_frac)
+            drive_mix = jnp.where(
+                jnp.asarray(_drive_anneal_enabled),
+                _scheduled_scalar(
+                    step, _total_training_steps,
+                    _drive_mix_start, _drive_mix_final,
+                    0.0, _drive_mix_end_frac,
+                    'cosine'),
+                jnp.float32(1.0))
             soft_gate_T = soft_gate_T_qk
             if _pass_soft_gate_schedule_kw:
                 extra_kw['soft_gate_temperature'] = soft_gate_T
@@ -2503,6 +2583,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     _soft_gate_boundary_power_final)
             if _pass_soft_gate_t_final_kw:
                 extra_kw['soft_gate_t_final'] = _soft_gate_t_final
+            if _pass_drive_mix_kw:
+                extra_kw['drive_mix'] = drive_mix
+                extra_kw['drive_ref_qk'] = _drive_ref_qk
+                extra_kw['drive_ref_v'] = _drive_ref_v
+                extra_kw['drive_ref_rst'] = _drive_ref_rst
             if _pass_execution_prune_kw:
                 # Training never execution-prunes; pruning is eval-sweep only.
                 extra_kw['execution_prune_eps'] = jnp.float32(0.0)
@@ -3985,6 +4070,36 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_pool_write': grad_pool_write,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'rst_aux': result.get('rst_aux', jnp.float32(0.0)),
+            'drive_mix': result.get('drive_mix', jnp.float32(1.0)),
+            'drive_mean': result.get('drive_mean', jnp.float32(0.0)),
+            'drive_max': result.get('drive_max', jnp.float32(0.0)),
+            'attn_drive_mean': result.get('attn_drive_mean', jnp.float32(0.0)),
+            'attn_drive_max': result.get('attn_drive_max', jnp.float32(0.0)),
+            'attn_qk_drive_mean': result.get('attn_qk_drive_mean', jnp.float32(0.0)),
+            'attn_qk_drive_max': result.get('attn_qk_drive_max', jnp.float32(0.0)),
+            'attn_v_drive_mean': result.get('attn_v_drive_mean', jnp.float32(0.0)),
+            'attn_v_drive_max': result.get('attn_v_drive_max', jnp.float32(0.0)),
+            'rst_drive_mean': result.get('rst_drive_mean', jnp.float32(0.0)),
+            'rst_drive_max': result.get('rst_drive_max', jnp.float32(0.0)),
+            'weight_mean': result.get('weight_mean', jnp.float32(0.0)),
+            'weight_max': result.get('weight_max', jnp.float32(0.0)),
+            'attn_qk_weight_mean': result.get('attn_qk_weight_mean', jnp.float32(0.0)),
+            'attn_qk_weight_max': result.get('attn_qk_weight_max', jnp.float32(0.0)),
+            'attn_v_weight_mean': result.get('attn_v_weight_mean', jnp.float32(0.0)),
+            'attn_v_weight_max': result.get('attn_v_weight_max', jnp.float32(0.0)),
+            'rst_weight_mean': result.get('rst_weight_mean', jnp.float32(0.0)),
+            'rst_weight_max': result.get('rst_weight_max', jnp.float32(0.0)),
+            'admission_mean': result.get('admission_mean', jnp.float32(0.0)),
+            'admission_max': result.get('admission_max', jnp.float32(0.0)),
+            'attn_qk_admission_mean': result.get('attn_qk_admission_mean', jnp.float32(0.0)),
+            'attn_qk_admission_max': result.get('attn_qk_admission_max', jnp.float32(0.0)),
+            'attn_v_admission_mean': result.get('attn_v_admission_mean', jnp.float32(0.0)),
+            'attn_v_admission_max': result.get('attn_v_admission_max', jnp.float32(0.0)),
+            'rst_admission_mean': result.get('rst_admission_mean', jnp.float32(0.0)),
+            'rst_admission_max': result.get('rst_admission_max', jnp.float32(0.0)),
+            'load_mean': result.get('load_mean', jnp.float32(0.0)),
+            'normalization_load_mean': result.get('normalization_load_mean', jnp.float32(0.0)),
+            'den_mean': result.get('den_mean', jnp.float32(0.0)),
             # Core activity (v4.1).
             'rst_active': result.get('rst_active', jnp.float32(0.0)),
             'rst_strong': result.get('rst_strong', jnp.float32(0.0)),
@@ -4521,7 +4636,14 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_boundary_power_mid=3.15,
                      soft_gate_boundary_power_final=4.0,
                      soft_gate_boundary_power_mid_frac=0.800,
-                     soft_gate_boundary_power_final_frac=0.950):
+                     soft_gate_boundary_power_final_frac=0.950,
+                     drive_anneal_enabled=False,
+                     drive_ref_qk=0.05,
+                     drive_ref_v=0.04,
+                     drive_ref_rst=0.04,
+                     drive_mix_start=1.0,
+                     drive_mix_final=1.0,
+                     drive_mix_end_frac=0.0):
     """Create a jit-compiled evaluation step.
 
     Uses the SLIM forward (analysis=False). Eval normally needs only loss /
@@ -4533,6 +4655,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
+    _pass_drive_mix_kw = _model_accepts_drive_mix(model)
     _execution_prune_eps = jnp.float32(execution_prune_eps)
     _return_prune_stats = bool(return_prune_stats)
     _soft_gate_runtime_enabled = bool(
@@ -4580,6 +4703,13 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
+    _drive_anneal_enabled = bool(drive_anneal_enabled)
+    _drive_ref_qk = jnp.float32(drive_ref_qk)
+    _drive_ref_v = jnp.float32(drive_ref_v)
+    _drive_ref_rst = jnp.float32(drive_ref_rst)
+    _drive_mix_start = jnp.float32(drive_mix_start)
+    _drive_mix_final = jnp.float32(drive_mix_final)
+    _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
 
     @jax.jit
     def eval_step(params, input_ids, attention_mask, step):
@@ -4613,6 +4743,18 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                 _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
+        if _pass_drive_mix_kw:
+            extra_kw['drive_mix'] = jnp.where(
+                jnp.asarray(_drive_anneal_enabled),
+                _scheduled_scalar(
+                    step, _total_training_steps,
+                    _drive_mix_start, _drive_mix_final,
+                    0.0, _drive_mix_end_frac,
+                    'cosine'),
+                jnp.float32(1.0))
+            extra_kw['drive_ref_qk'] = _drive_ref_qk
+            extra_kw['drive_ref_v'] = _drive_ref_v
+            extra_kw['drive_ref_rst'] = _drive_ref_rst
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = _execution_prune_eps
         result = model.apply(
@@ -4667,7 +4809,14 @@ def create_analysis_step(model, sharded_fns=None,
                          soft_gate_boundary_power_mid=3.15,
                          soft_gate_boundary_power_final=4.0,
                          soft_gate_boundary_power_mid_frac=0.800,
-                         soft_gate_boundary_power_final_frac=0.950):
+                         soft_gate_boundary_power_final_frac=0.950,
+                         drive_anneal_enabled=False,
+                         drive_ref_qk=0.05,
+                         drive_ref_v=0.04,
+                         drive_ref_rst=0.04,
+                         drive_mix_start=1.0,
+                         drive_mix_final=1.0,
+                         drive_mix_end_frac=0.0):
     """Create a jit-compiled analysis step (FULL forward, observational).
 
     Runs the model with `analysis=True` and the ANALYSIS variant of
@@ -4680,6 +4829,7 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
+    _pass_drive_mix_kw = _model_accepts_drive_mix(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
@@ -4725,6 +4875,13 @@ def create_analysis_step(model, sharded_fns=None,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
+    _drive_anneal_enabled = bool(drive_anneal_enabled)
+    _drive_ref_qk = jnp.float32(drive_ref_qk)
+    _drive_ref_v = jnp.float32(drive_ref_v)
+    _drive_ref_rst = jnp.float32(drive_ref_rst)
+    _drive_mix_start = jnp.float32(drive_mix_start)
+    _drive_mix_final = jnp.float32(drive_mix_final)
+    _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
 
     @jax.jit
     def analysis_step(params, input_ids, attention_mask, step):
@@ -4758,6 +4915,18 @@ def create_analysis_step(model, sharded_fns=None,
                 _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
+        if _pass_drive_mix_kw:
+            extra_kw['drive_mix'] = jnp.where(
+                jnp.asarray(_drive_anneal_enabled),
+                _scheduled_scalar(
+                    step, _total_training_steps,
+                    _drive_mix_start, _drive_mix_final,
+                    0.0, _drive_mix_end_frac,
+                    'cosine'),
+                jnp.float32(1.0))
+            extra_kw['drive_ref_qk'] = _drive_ref_qk
+            extra_kw['drive_ref_v'] = _drive_ref_v
+            extra_kw['drive_ref_rst'] = _drive_ref_rst
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         result = model.apply(
@@ -4887,7 +5056,14 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                             soft_gate_boundary_power_mid=3.15,
                             soft_gate_boundary_power_final=4.0,
                             soft_gate_boundary_power_mid_frac=0.800,
-                            soft_gate_boundary_power_final_frac=0.950):
+                            soft_gate_boundary_power_final_frac=0.950,
+                            drive_anneal_enabled=False,
+                            drive_ref_qk=0.05,
+                            drive_ref_v=0.04,
+                            drive_ref_rst=0.04,
+                            drive_mix_start=1.0,
+                            drive_mix_final=1.0,
+                            drive_mix_end_frac=0.0):
     """Event-only forward probe. No gradients, no optimizer updates.
 
     Two-pass design for v4.1.6.0+ focused spike debugging:
@@ -4904,6 +5080,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
+    _pass_drive_mix_kw = _model_accepts_drive_mix(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
@@ -4949,6 +5126,13 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
+    _drive_anneal_enabled = bool(drive_anneal_enabled)
+    _drive_ref_qk = jnp.float32(drive_ref_qk)
+    _drive_ref_v = jnp.float32(drive_ref_v)
+    _drive_ref_rst = jnp.float32(drive_ref_rst)
+    _drive_mix_start = jnp.float32(drive_mix_start)
+    _drive_mix_final = jnp.float32(drive_mix_final)
+    _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
     _topk = int(topk)
 
     @jax.jit
@@ -4985,6 +5169,18 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                 _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
+        if _pass_drive_mix_kw:
+            extra_kw['drive_mix'] = jnp.where(
+                jnp.asarray(_drive_anneal_enabled),
+                _scheduled_scalar(
+                    step, _total_training_steps,
+                    _drive_mix_start, _drive_mix_final,
+                    0.0, _drive_mix_end_frac,
+                    'cosine'),
+                jnp.float32(1.0))
+            extra_kw['drive_ref_qk'] = _drive_ref_qk
+            extra_kw['drive_ref_v'] = _drive_ref_v
+            extra_kw['drive_ref_rst'] = _drive_ref_rst
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         result = model.apply(
@@ -6117,6 +6313,169 @@ def _fmt_sparsity_pool_values(rec, formatter, pools=SPARSITY_LOG_POOLS):
         for pool, label in pools)
 
 
+def _rec_float(rec, key, default=0.0):
+    return float(rec.get(key, default) or 0.0)
+
+
+def _is_v4165_compact_console(ctx):
+    return (
+        ctx.get('model_version') == V4165_MODEL_VERSION
+        and str(ctx.get('regular_console_level', 'compact')).lower()
+        == 'compact')
+
+
+def _fmt_v4165_active_tau(rec, pool):
+    frac = _rec_float(rec, f'{pool}_active_tau_frac')
+    count = _rec_float(rec, f'{pool}_active_tau_count')
+    return f"{frac * 100:.2f}%({count:.1f})"
+
+
+def _fmt_v4165_threshold_pct(rec, pool, prefix):
+    return f"{_rec_float(rec, f'{pool}_{prefix}_frac') * 100:.2f}"
+
+
+def _fmt_v4165_triplet(rec, keys, fmt):
+    return (
+        f"qk={fmt(_rec_float(rec, keys[0]))} "
+        f"v={fmt(_rec_float(rec, keys[1]))} "
+        f"rst={fmt(_rec_float(rec, keys[2]))}")
+
+
+def _v4165_util(rec, mass_key, load_key):
+    load = _rec_float(rec, load_key)
+    mass = _rec_float(rec, mass_key)
+    return mass / max(load, 1.0e-8)
+
+
+def _v4165_drive_mean(rec, pool):
+    return _rec_float(
+        rec, f'{pool}_drive_mean',
+        _rec_float(rec, f'{pool}_angular_depth_mean'))
+
+
+def _v4165_drive_max(rec, pool):
+    return _rec_float(
+        rec, f'{pool}_drive_max',
+        _rec_float(rec, f'{pool}_angular_depth_max'))
+
+
+def _print_v4165_warning_line(rec, ctx):
+    parts = []
+    top1_warn = float(ctx.get('regular_console_top1_warn', 0.05))
+    top1 = (
+        _rec_float(rec, 'attn_qk_compose_top1_frac_max',
+                   _rec_float(rec, 'attn_qk_compose_top1_frac')),
+        _rec_float(rec, 'attn_v_compose_top1_frac_max',
+                   _rec_float(rec, 'attn_v_compose_top1_frac')),
+        _rec_float(rec, 'rst_compose_top1_frac_max',
+                   _rec_float(rec, 'rst_compose_top1_frac')),
+    )
+    if top1_warn > 0.0 and max(top1) > top1_warn:
+        parts.append(
+            f"top1 qk={top1[0]:.3f} v={top1[1]:.3f} rst={top1[2]:.3f}")
+
+    drive_warn = float(ctx.get('regular_console_drive_max_warn', 1.20))
+    drive_max = (
+        _v4165_drive_max(rec, 'attn_qk'),
+        _v4165_drive_max(rec, 'attn_v'),
+        _v4165_drive_max(rec, 'rst'),
+    )
+    if drive_warn > 0.0 and max(drive_max) > drive_warn:
+        parts.append(
+            "drive_max["
+            f"qk={drive_max[0]:.2f} v={drive_max[1]:.2f} "
+            f"rst={drive_max[2]:.2f}]")
+
+    no_active = (
+        _rec_float(rec, 'attn_qk_no_active_frac'),
+        _rec_float(rec, 'attn_v_no_active_frac'),
+        _rec_float(rec, 'rst_no_active_frac'),
+    )
+    if max(no_active) > 0.0:
+        parts.append(
+            "no_active["
+            f"qk={no_active[0] * 100:.2f}% "
+            f"v={no_active[1] * 100:.2f}% "
+            f"rst={no_active[2] * 100:.2f}%]")
+
+    if parts:
+        log_message("warn: " + " ".join(parts))
+
+
+def _print_v4165_compact_regular_block(rec, ctx):
+    log_message(
+        "route: "
+        f"active_tau qk={_fmt_v4165_active_tau(rec, 'attn_qk')} "
+        f"q/k={_rec_float(rec, 'attn_q_active_tau_frac') * 100:.2f}/"
+        f"{_rec_float(rec, 'attn_k_active_tau_frac') * 100:.2f} "
+        f"v={_fmt_v4165_active_tau(rec, 'attn_v')} "
+        f"rst={_fmt_v4165_active_tau(rec, 'rst')} | "
+        "adm@1e-2 "
+        f"qk={_fmt_v4165_threshold_pct(rec, 'attn_qk', 'admission_active_eps_1e_2')} "
+        f"v={_fmt_v4165_threshold_pct(rec, 'attn_v', 'admission_active_eps_1e_2')} "
+        f"rst={_fmt_v4165_threshold_pct(rec, 'rst', 'admission_active_eps_1e_2')} | "
+        "weight@1e-2 "
+        f"qk={_fmt_v4165_threshold_pct(rec, 'attn_qk', 'active_eps_1e_2')} "
+        f"v={_fmt_v4165_threshold_pct(rec, 'attn_v', 'active_eps_1e_2')} "
+        f"rst={_fmt_v4165_threshold_pct(rec, 'rst', 'active_eps_1e_2')}"
+    )
+    log_message(
+        "sched: "
+        f"B[qk={_rec_float(rec, 'soft_gate_T_qk'):.5f} "
+        f"v={_rec_float(rec, 'soft_gate_T_v'):.5f} "
+        f"rst={_rec_float(rec, 'soft_gate_T_rst'):.5f}] "
+        f"p={_rec_float(rec, 'boundary_power_p', 2.0):.3f} "
+        f"drive_mix={_rec_float(rec, 'drive_mix', 1.0):.3f}"
+    )
+    log_message(
+        "state: "
+        f"tau[{_fmt_v4165_triplet(rec, ('attn_qk_tau_mean', 'attn_v_tau_mean', 'rst_tau_mean'), lambda x: f'{x:.3f}')}] "
+        f"margin[{_fmt_v4165_triplet(rec, ('attn_qk_selection_margin_mean', 'attn_v_selection_margin_mean', 'rst_selection_margin_mean'), lambda x: f'{x:.3f}')}] "
+        f"adm_mean[{_fmt_v4165_triplet(rec, ('attn_qk_admission_mean', 'attn_v_admission_mean', 'rst_admission_mean'), lambda x: f'{x:.3f}')}]"
+    )
+    load_qk = _rec_float(rec, 'attn_qk_admission_den_sum')
+    load_v = _rec_float(rec, 'attn_v_admission_den_sum')
+    load_rst = _rec_float(rec, 'rst_admission_den_sum')
+    mass_qk = _rec_float(rec, 'attn_qk_compose_mass_sum')
+    mass_v = _rec_float(rec, 'attn_v_compose_mass_sum')
+    mass_rst = _rec_float(rec, 'rst_compose_mass_sum')
+    log_message(
+        "rw: "
+        f"drive_mean[qk={_v4165_drive_mean(rec, 'attn_qk'):.4f} "
+        f"v={_v4165_drive_mean(rec, 'attn_v'):.4f} "
+        f"rst={_v4165_drive_mean(rec, 'rst'):.4f}] "
+        f"load[qk={load_qk:.1f} v={load_v:.1f} rst={load_rst:.1f}] "
+        f"mass[qk={mass_qk:.1f} v={mass_v:.1f} rst={mass_rst:.1f}] "
+        f"util[qk={_v4165_util(rec, 'attn_qk_compose_mass_sum', 'attn_qk_admission_den_sum'):.3f} "
+        f"v={_v4165_util(rec, 'attn_v_compose_mass_sum', 'attn_v_admission_den_sum'):.3f} "
+        f"rst={_v4165_util(rec, 'rst_compose_mass_sum', 'rst_admission_den_sum'):.3f}]"
+    )
+    _print_v4165_warning_line(rec, ctx)
+    log_message(
+        f"time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
+        f" {ctx['s_per_it']:.2f}s/it"
+    )
+
+
+def _print_regular_host_timing(raw_step_time_window, logging_time, ctx):
+    mode = str(ctx.get('regular_console_host_timing', 'always')).lower()
+    if mode in ('off', 'false', 'none'):
+        return
+    if mode == 'warn_only':
+        threshold = float(ctx.get(
+            'regular_console_logging_overhead_warn', 0.05))
+        ratio = logging_time / max(raw_step_time_window, 1.0e-8)
+        if threshold > 0.0 and ratio > threshold:
+            log_message(
+                f"warn: logging_overhead={ratio * 100:.1f}% "
+                f"raw_step_time_window={raw_step_time_window:.3f}s "
+                f"logging_time={logging_time:.3f}s")
+        return
+    log_message(
+        f"  host_timing: raw_step_time_window={raw_step_time_window:.3f}s "
+        f"logging_time={logging_time:.3f}s")
+
+
 def _print_v4162_sparsity_block(rec, level='compact'):
     compact = str(level or 'compact').lower() == 'compact'
     current_eps = (
@@ -6649,6 +7008,35 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'drift_attn_v_emb': float(m.get('drift_attn_v_emb', 0.0)),
         'drift_rst_emb': float(m.get('drift_rst_emb', 0.0)),
         # Core activity.
+        'drive_mix': float(m.get('drive_mix', 1.0)),
+        'drive_mean': float(m.get('drive_mean', 0.0)),
+        'drive_max': float(m.get('drive_max', 0.0)),
+        'attn_qk_drive_mean': float(m.get('attn_qk_drive_mean', 0.0)),
+        'attn_qk_drive_max': float(m.get('attn_qk_drive_max', 0.0)),
+        'attn_v_drive_mean': float(m.get('attn_v_drive_mean', 0.0)),
+        'attn_v_drive_max': float(m.get('attn_v_drive_max', 0.0)),
+        'rst_drive_mean': float(m.get('rst_drive_mean', 0.0)),
+        'rst_drive_max': float(m.get('rst_drive_max', 0.0)),
+        'weight_mean': float(m.get('weight_mean', 0.0)),
+        'weight_max': float(m.get('weight_max', 0.0)),
+        'attn_qk_weight_mean': float(m.get('attn_qk_weight_mean', 0.0)),
+        'attn_qk_weight_max': float(m.get('attn_qk_weight_max', 0.0)),
+        'attn_v_weight_mean': float(m.get('attn_v_weight_mean', 0.0)),
+        'attn_v_weight_max': float(m.get('attn_v_weight_max', 0.0)),
+        'rst_weight_mean': float(m.get('rst_weight_mean', 0.0)),
+        'rst_weight_max': float(m.get('rst_weight_max', 0.0)),
+        'admission_mean': float(m.get('admission_mean', 0.0)),
+        'admission_max': float(m.get('admission_max', 0.0)),
+        'attn_qk_admission_mean': float(m.get('attn_qk_admission_mean', 0.0)),
+        'attn_qk_admission_max': float(m.get('attn_qk_admission_max', 0.0)),
+        'attn_v_admission_mean': float(m.get('attn_v_admission_mean', 0.0)),
+        'attn_v_admission_max': float(m.get('attn_v_admission_max', 0.0)),
+        'rst_admission_mean': float(m.get('rst_admission_mean', 0.0)),
+        'rst_admission_max': float(m.get('rst_admission_max', 0.0)),
+        'load_mean': float(m.get('load_mean', 0.0)),
+        'normalization_load_mean': float(m.get(
+            'normalization_load_mean', m.get('load_mean', 0.0))),
+        'den_mean': float(m.get('den_mean', 0.0)),
         'attn_qk_active': float(m.get('attn_qk_active', 0.0)),
         'attn_q_active': float(m.get(
             'attn_q_active', m.get('attn_qk_active', 0.0))),
@@ -7150,6 +7538,16 @@ def _print_regular_block(rec, ctx):
         is_v4162_soft
         and str(ctx.get('regular_diagnostics_level', 'compact')).lower()
         == 'compact')
+    if _is_v4165_compact_console(ctx):
+        log_message(
+            f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
+            f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} "
+            f"aux={rec['aux_loss']:.4f} | "
+            f"grad={rec['grad_norm']:.2f} | "
+            f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
+        )
+        _print_v4165_compact_regular_block(rec, ctx)
+        return
     aux_note = (
         " aux_is_not_total_minus_ce"
         if is_v4162_soft
@@ -7164,7 +7562,7 @@ def _print_regular_block(rec, ctx):
     if is_v4160:
         if is_v4162_soft:
             if bool(ctx.get('regular_sparsity_enabled', True)):
-                if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
+                if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
                     _print_v4164_sparsity_block(rec)
                 else:
                     _print_v4162_sparsity_block(
@@ -7227,11 +7625,11 @@ def _print_regular_block(rec, ctx):
     elif is_v4160:
         _weight_label = (
             'admission'
-            if ctx.get('model_version') == 'spatial-r1-v4.1.6.4'
+            if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
             else ('soft_weight' if is_v4162_soft else 'pos'))
         _select_status = ""
         if (is_v4162_soft
-                and ctx.get('model_version') != 'spatial-r1-v4.1.6.4'
+                and ctx.get('model_version') not in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                 and ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS):
             _select_status = (
                 f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
@@ -7337,35 +7735,65 @@ def _print_regular_block(rec, ctx):
                 f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
                 f" v={rec['attn_v_pool_scale']:.3f}"
                 f" rst={rec['rst_pool_scale']:.3f}")
-        if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
-            log_message(
-                f"  angular_depth: "
-                f"qk[m={rec['attn_qk_angular_depth_mean']:.5f}"
-                f" max={rec['attn_qk_angular_depth_max']:.5f}] "
-                f"v[m={rec['attn_v_angular_depth_mean']:.5f}"
-                f" max={rec['attn_v_angular_depth_max']:.5f}] "
-                f"rst[m={rec['rst_angular_depth_mean']:.5f}"
-                f" max={rec['rst_angular_depth_max']:.5f}]"
-            )
-            log_message(
-                f"  admission_den: qk={rec['attn_qk_admission_den_sum']:.1f}"
-                f" v={rec['attn_v_admission_den_sum']:.1f}"
-                f" rst={rec['rst_admission_den_sum']:.1f}"
-            )
-            log_message(
-                f"  compose_mass: qk={rec['attn_qk_compose_mass_sum']:.1f}"
-                f" v={rec['attn_v_compose_mass_sum']:.1f}"
-                f" rst={rec['rst_compose_mass_sum']:.1f}"
-            )
-            log_message(
-                f"  compose_conc: qk[eff={rec['attn_qk_compose_eff_n']:.1f}"
-                f" top1={rec['attn_qk_compose_top1_frac']:.3f}]"
-                f" v[eff={rec['attn_v_compose_eff_n']:.1f}"
-                f" top1={rec['attn_v_compose_top1_frac']:.3f}]"
-                f" rst[eff={rec['rst_compose_eff_n']:.1f}"
-                f" top1={rec['rst_compose_top1_frac']:.3f}]"
-                f"{_pool_scale_part}"
-            )
+        if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+            if ctx.get('model_version') == V4165_MODEL_VERSION:
+                log_message(
+                    f"  drive: "
+                    f"qk[m={_v4165_drive_mean(rec, 'attn_qk'):.5f}"
+                    f" max={_v4165_drive_max(rec, 'attn_qk'):.5f}] "
+                    f"v[m={_v4165_drive_mean(rec, 'attn_v'):.5f}"
+                    f" max={_v4165_drive_max(rec, 'attn_v'):.5f}] "
+                    f"rst[m={_v4165_drive_mean(rec, 'rst'):.5f}"
+                    f" max={_v4165_drive_max(rec, 'rst'):.5f}]"
+                )
+                log_message(
+                    f"  load: qk={rec['attn_qk_admission_den_sum']:.1f}"
+                    f" v={rec['attn_v_admission_den_sum']:.1f}"
+                    f" rst={rec['rst_admission_den_sum']:.1f}"
+                )
+                log_message(
+                    f"  mass: qk={rec['attn_qk_compose_mass_sum']:.1f}"
+                    f" v={rec['attn_v_compose_mass_sum']:.1f}"
+                    f" rst={rec['rst_compose_mass_sum']:.1f}"
+                )
+                log_message(
+                    f"  weight_conc: qk[eff={rec['attn_qk_compose_eff_n']:.1f}"
+                    f" top1={rec['attn_qk_compose_top1_frac']:.3f}]"
+                    f" v[eff={rec['attn_v_compose_eff_n']:.1f}"
+                    f" top1={rec['attn_v_compose_top1_frac']:.3f}]"
+                    f" rst[eff={rec['rst_compose_eff_n']:.1f}"
+                    f" top1={rec['rst_compose_top1_frac']:.3f}]"
+                    f"{_pool_scale_part}"
+                )
+            else:
+                log_message(
+                    f"  angular_depth: "
+                    f"qk[m={rec['attn_qk_angular_depth_mean']:.5f}"
+                    f" max={rec['attn_qk_angular_depth_max']:.5f}] "
+                    f"v[m={rec['attn_v_angular_depth_mean']:.5f}"
+                    f" max={rec['attn_v_angular_depth_max']:.5f}] "
+                    f"rst[m={rec['rst_angular_depth_mean']:.5f}"
+                    f" max={rec['rst_angular_depth_max']:.5f}]"
+                )
+                log_message(
+                    f"  admission_den: qk={rec['attn_qk_admission_den_sum']:.1f}"
+                    f" v={rec['attn_v_admission_den_sum']:.1f}"
+                    f" rst={rec['rst_admission_den_sum']:.1f}"
+                )
+                log_message(
+                    f"  compose_mass: qk={rec['attn_qk_compose_mass_sum']:.1f}"
+                    f" v={rec['attn_v_compose_mass_sum']:.1f}"
+                    f" rst={rec['rst_compose_mass_sum']:.1f}"
+                )
+                log_message(
+                    f"  compose_conc: qk[eff={rec['attn_qk_compose_eff_n']:.1f}"
+                    f" top1={rec['attn_qk_compose_top1_frac']:.3f}]"
+                    f" v[eff={rec['attn_v_compose_eff_n']:.1f}"
+                    f" top1={rec['attn_v_compose_top1_frac']:.3f}]"
+                    f" rst[eff={rec['rst_compose_eff_n']:.1f}"
+                    f" top1={rec['rst_compose_top1_frac']:.3f}]"
+                    f"{_pool_scale_part}"
+                )
         else:
             log_message(
                 f"  gate_conc: qk[eff={rec['attn_qk_gate_eff_n']:.1f}"
@@ -7393,7 +7821,7 @@ def _print_regular_block(rec, ctx):
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
         if is_v4160:
-            if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
+            if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
                 pass
             else:
                 log_message(
@@ -9444,7 +9872,7 @@ def _print_debug_block(rec, ctx):
         _is_v4162_soft = ctx.get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS
         _weight_label = (
             'admission'
-            if ctx.get('model_version') == 'spatial-r1-v4.1.6.4'
+            if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
             else ('soft_weight' if _is_v4162_soft else 'positive_margin'))
         _select_status = ""
         if not _is_v4162_soft:
@@ -9469,9 +9897,18 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
             f"{_select_status}"
         )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
+    if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+        _is_v4165 = ctx.get('model_version') == V4165_MODEL_VERSION
+        _threshold_label = (
+            'v4165_thresholds' if _is_v4165 else 'v4164_thresholds')
+        _drive_load_label = (
+            'v4165_drive_load' if _is_v4165 else 'v4164_depth')
+        _weight_label = 'weight' if _is_v4165 else 'compose'
+        _drive_label = 'drive' if _is_v4165 else 'angular_depth'
+        _load_label = 'load' if _is_v4165 else 'admission_den'
+        _mass_label = 'weight_mass' if _is_v4165 else 'compose_mass'
         log_debug_message(
-            "v4164_thresholds: active_tau["
+            f"{_threshold_label}: active_tau["
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool: _fmt_sparsity_frac_count(
@@ -9489,19 +9926,19 @@ def _print_debug_block(rec, ctx):
                 lambda pool: _fmt_sparsity_frac_count(
                     rec, pool, 'admission_active_eps_1e_1'),
                 pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + "] compose@1e-4["
+            + f"] {_weight_label}@1e-4["
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool: _fmt_sparsity_frac_count(
                     rec, pool, 'active_eps_1e_4'),
                 pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + "] compose@1e-3["
+            + f"] {_weight_label}@1e-3["
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool: _fmt_sparsity_frac_count(
                     rec, pool, 'active_eps_1e_3'),
                 pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + "] compose@1e-2["
+            + f"] {_weight_label}@1e-2["
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool: _fmt_sparsity_frac_count(
@@ -9510,16 +9947,17 @@ def _print_debug_block(rec, ctx):
             + "]"
         )
         log_debug_message(
-            f"v4164_depth: qk[m={_g('attn_qk_angular_depth_mean'):.6f} "
+            f"{_drive_load_label}: "
+            f"qk[{_drive_label}_m={_g('attn_qk_angular_depth_mean'):.6f} "
             f"max={_g('attn_qk_angular_depth_max'):.6f}] "
-            f"v[m={_g('attn_v_angular_depth_mean'):.6f} "
+            f"v[{_drive_label}_m={_g('attn_v_angular_depth_mean'):.6f} "
             f"max={_g('attn_v_angular_depth_max'):.6f}] "
-            f"rst[m={_g('rst_angular_depth_mean'):.6f} "
+            f"rst[{_drive_label}_m={_g('rst_angular_depth_mean'):.6f} "
             f"max={_g('rst_angular_depth_max'):.6f}] "
-            f"admission_den[qk={_g('attn_qk_admission_den_sum'):.3f} "
+            f"{_load_label}[qk={_g('attn_qk_admission_den_sum'):.3f} "
             f"v={_g('attn_v_admission_den_sum'):.3f} "
             f"rst={_g('rst_admission_den_sum'):.3f}] "
-            f"compose_mass[qk={_g('attn_qk_compose_mass_sum'):.3f} "
+            f"{_mass_label}[qk={_g('attn_qk_compose_mass_sum'):.3f} "
             f"v={_g('attn_v_compose_mass_sum'):.3f} "
             f"rst={_g('rst_compose_mass_sum'):.3f}]"
         )
@@ -10107,7 +10545,7 @@ def _print_analysis_block(rec, ctx):
             f" max={_g('rst_rho_max'):.5f}]"
         )
     if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS:
-        if ctx.get('model_version') == 'spatial-r1-v4.1.6.4':
+        if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
             _print_v4164_sparsity_block(rec)
         else:
             _print_v4162_sparsity_block(rec, 'full')
@@ -10553,20 +10991,60 @@ def main():
     if regular_diagnostics_level not in ('compact', 'full'):
         raise ValueError(
             "training.regular_diagnostics_level must be 'compact' or 'full'.")
-    regular_current_eps_default = (
-        [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
-        if model_version_cfg == 'spatial-r1-v4.1.6.4'
-        else [1.0e-1, 1.0e-2, 1.0e-3])
+    regular_console_level_default = (
+        'compact' if model_version_cfg == V4165_MODEL_VERSION else 'full')
+    regular_console_level = str(tcfg.get(
+        'regular_console_level',
+        regular_console_level_default)).lower()
+    if regular_console_level not in ('compact', 'full'):
+        raise ValueError(
+            "training.regular_console_level must be 'compact' or 'full'.")
+    regular_console_host_timing_default = (
+        'warn_only' if model_version_cfg == V4165_MODEL_VERSION else 'always')
+    regular_console_host_timing = str(tcfg.get(
+        'regular_console_host_timing',
+        regular_console_host_timing_default)).lower()
+    if regular_console_host_timing not in (
+            'always', 'warn_only', 'off', 'false', 'none'):
+        raise ValueError(
+            "training.regular_console_host_timing must be 'always', "
+            "'warn_only', or 'off'.")
+    regular_console_top1_warn = float(tcfg.get(
+        'regular_console_top1_warn', 0.05))
+    regular_console_drive_max_warn = float(tcfg.get(
+        'regular_console_drive_max_warn', 1.20))
+    regular_console_logging_overhead_warn = float(tcfg.get(
+        'regular_console_logging_overhead_warn', 0.05))
+    if (model_version_cfg == V4165_MODEL_VERSION
+            and regular_diagnostics_level == 'compact'):
+        regular_current_eps_default = [1.0e-2]
+        regular_projected_eps_default = []
+    else:
+        regular_current_eps_default = (
+            [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
+            if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+            else [1.0e-1, 1.0e-2, 1.0e-3])
+        regular_projected_eps_default = [1.0e-6]
     regular_current_eps = [
         float(x) for x in tcfg.get(
             'regular_current_eps', regular_current_eps_default)]
     regular_projected_eps = [
-        float(x) for x in tcfg.get('regular_projected_eps', [1.0e-6])]
+        float(x) for x in tcfg.get(
+            'regular_projected_eps', regular_projected_eps_default)]
     regular_mass_enabled = bool(tcfg.get('regular_mass_enabled', False))
     regular_sparsity_enabled = bool(tcfg.get(
         'regular_sparsity_enabled',
-        (True if model_version_cfg == 'spatial-r1-v4.1.6.4'
+        (True if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
          else model_version_cfg not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)))
+    drive_anneal_enabled = bool(tcfg.get(
+        'drive_anneal_enabled',
+        model_version_cfg == 'spatial-r1-v4.1.6.5'))
+    drive_ref_qk = float(tcfg.get('drive_ref_qk', 0.05))
+    drive_ref_v = float(tcfg.get('drive_ref_v', 0.04))
+    drive_ref_rst = float(tcfg.get('drive_ref_rst', 0.04))
+    drive_mix_start = float(tcfg.get('drive_mix_start', 1.0))
+    drive_mix_final = float(tcfg.get('drive_mix_final', 1.0))
+    drive_mix_end_frac = float(tcfg.get('drive_mix_end_frac', 0.0))
     effective_prune_eps_list = list(
         tcfg.get('effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
     eval_effective_prune_enabled = bool(tcfg.get(
@@ -10940,6 +11418,28 @@ def main():
             if regular_diagnostics_level not in ('compact', 'full'):
                 raise ValueError(
                     "training.regular_diagnostics_level must be 'compact' or 'full'.")
+            regular_console_level = str(saved_training_config.get(
+                'regular_console_level', regular_console_level)).lower()
+            if regular_console_level not in ('compact', 'full'):
+                raise ValueError(
+                    "training.regular_console_level must be 'compact' or 'full'.")
+            regular_console_host_timing = str(saved_training_config.get(
+                'regular_console_host_timing',
+                regular_console_host_timing)).lower()
+            if regular_console_host_timing not in (
+                    'always', 'warn_only', 'off', 'false', 'none'):
+                raise ValueError(
+                    "training.regular_console_host_timing must be 'always', "
+                    "'warn_only', or 'off'.")
+            regular_console_top1_warn = float(saved_training_config.get(
+                'regular_console_top1_warn', regular_console_top1_warn))
+            regular_console_drive_max_warn = float(saved_training_config.get(
+                'regular_console_drive_max_warn',
+                regular_console_drive_max_warn))
+            regular_console_logging_overhead_warn = float(
+                saved_training_config.get(
+                    'regular_console_logging_overhead_warn',
+                    regular_console_logging_overhead_warn))
             regular_current_eps = [
                 float(x) for x in saved_training_config.get(
                     'regular_current_eps', regular_current_eps)]
@@ -10974,6 +11474,20 @@ def main():
                 saved_training_config.get(
                     'soft_gate_boundary_power_final_frac',
                     soft_gate_boundary_power_final_frac))
+            drive_anneal_enabled = bool(saved_training_config.get(
+                'drive_anneal_enabled', drive_anneal_enabled))
+            drive_ref_qk = float(saved_training_config.get(
+                'drive_ref_qk', drive_ref_qk))
+            drive_ref_v = float(saved_training_config.get(
+                'drive_ref_v', drive_ref_v))
+            drive_ref_rst = float(saved_training_config.get(
+                'drive_ref_rst', drive_ref_rst))
+            drive_mix_start = float(saved_training_config.get(
+                'drive_mix_start', drive_mix_start))
+            drive_mix_final = float(saved_training_config.get(
+                'drive_mix_final', drive_mix_final))
+            drive_mix_end_frac = float(saved_training_config.get(
+                'drive_mix_end_frac', drive_mix_end_frac))
             if model_version_cfg == 'spatial-r1-v4.1.6.1':
                 # Older 4161 checkpoints may have saved rpe_enabled=False and
                 # exploration_weight=0 because the old code hard-disabled RPE.
@@ -11186,6 +11700,20 @@ def main():
                 "0 < mid_frac < final_frac <= 1, got "
                 f"{soft_gate_boundary_power_mid_frac}, "
                 f"{soft_gate_boundary_power_final_frac}")
+    if drive_ref_qk <= 0.0 or drive_ref_v <= 0.0 or drive_ref_rst <= 0.0:
+        raise ValueError(
+            "drive_ref_qk/v/rst must be > 0, got "
+            f"{drive_ref_qk}, {drive_ref_v}, {drive_ref_rst}")
+    if drive_anneal_enabled:
+        if not (0.0 <= drive_mix_start <= drive_mix_final):
+            raise ValueError(
+                "drive_mix_start/final must satisfy "
+                f"0 <= start <= final, got {drive_mix_start}, "
+                f"{drive_mix_final}")
+        if not (0.0 < drive_mix_end_frac <= 1.0):
+            raise ValueError(
+                "drive_mix_end_frac must satisfy 0 < end_frac <= 1, got "
+                f"{drive_mix_end_frac}")
 
     # Build training_config dict for saving in checkpoints
     training_config = {
@@ -11243,8 +11771,21 @@ def main():
         'soft_gate_boundary_power_final': soft_gate_boundary_power_final,
         'soft_gate_boundary_power_mid_frac': soft_gate_boundary_power_mid_frac,
         'soft_gate_boundary_power_final_frac': soft_gate_boundary_power_final_frac,
+        'drive_anneal_enabled': drive_anneal_enabled,
+        'drive_ref_qk': drive_ref_qk,
+        'drive_ref_v': drive_ref_v,
+        'drive_ref_rst': drive_ref_rst,
+        'drive_mix_start': drive_mix_start,
+        'drive_mix_final': drive_mix_final,
+        'drive_mix_end_frac': drive_mix_end_frac,
         'soft_gate_effective_active_eps': soft_gate_effective_active_eps,
         'regular_diagnostics_level': regular_diagnostics_level,
+        'regular_console_level': regular_console_level,
+        'regular_console_host_timing': regular_console_host_timing,
+        'regular_console_top1_warn': regular_console_top1_warn,
+        'regular_console_drive_max_warn': regular_console_drive_max_warn,
+        'regular_console_logging_overhead_warn':
+            regular_console_logging_overhead_warn,
         'regular_current_eps': regular_current_eps,
         'regular_projected_eps': regular_projected_eps,
         'regular_mass_enabled': regular_mass_enabled,
@@ -11760,10 +12301,15 @@ def main():
             print("  tau = -1 + 2 * sigmoid(raw_tau)")
             if _soft_model_version in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS:
                 print("  Boundary admission: one-sided generalized Gaussian")
-                if _soft_model_version == 'spatial-r1-v4.1.6.4':
-                    print("  depth = softplus((rho-tau)/B) / softplus((1-tau)/B)")
-                    print("  compose = admission * depth")
-                    print("  den = max(sum(admission), 1.0) ** v4164_den_power")
+                if _soft_model_version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+                    if _soft_model_version == V4165_MODEL_VERSION:
+                        print("  drive = boundary-relative FairDrive strength")
+                        print("  weight = admission * drive")
+                        print("  load = sum(admission)")
+                    else:
+                        print("  depth = softplus((rho-tau)/B) / softplus((1-tau)/B)")
+                        print("  compose = admission * depth")
+                        print("  den = max(sum(admission), 1.0) ** v4164_den_power")
                     print(
                         "  den_grad = v4164_den_grad_scale * live_den_grad "
                         "+ detached remainder")
@@ -11777,6 +12323,14 @@ def main():
                     f"final={soft_gate_boundary_power_final} "
                     f"mid_frac={soft_gate_boundary_power_mid_frac} "
                     f"final_frac={soft_gate_boundary_power_final_frac}")
+                if _soft_model_version == V4165_MODEL_VERSION:
+                    print("  FairDrive/TauSG:")
+                    print("    tau_sg=stop_gradient(tau); load=sum(admission)")
+                    print(
+                        f"    drive_anneal={drive_anneal_enabled} "
+                        f"ref[qk/v/rst]=({drive_ref_qk}, {drive_ref_v}, "
+                        f"{drive_ref_rst}) mix={drive_mix_start}->"
+                        f"{drive_mix_final} end_frac={drive_mix_end_frac}")
             else:
                 print("  Soft gate:")
             print(f"    enabled={soft_gate_enabled} "
@@ -11847,6 +12401,8 @@ def main():
             print("  Effective pruning:")
             print(
                 f"    regular diagnostics={regular_diagnostics_level} "
+                f"console={regular_console_level} "
+                f"host_timing={regular_console_host_timing} "
                 f"current_eps={regular_current_eps} "
                 f"projected_eps={regular_projected_eps} "
                 f"mass={regular_mass_enabled} "
@@ -11855,7 +12411,7 @@ def main():
             print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
             _gate_intensity_part = (
                 ""
-                if _soft_model_version == 'spatial-r1-v4.1.6.4'
+                if _soft_model_version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                 else f"intensity_beta={tcfg.get('intensity_beta', 0.5)} ")
             gate_msg = (
                 f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
@@ -11899,7 +12455,8 @@ def main():
                     'spatial-r1-v4.1.6.1',
                     'spatial-r1-v4.1.6.2',
                     'spatial-r1-v4.1.6.3',
-                    'spatial-r1-v4.1.6.4'):
+                    'spatial-r1-v4.1.6.4',
+                    'spatial-r1-v4.1.6.5'):
                 gate_msg += (
                     f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                     f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -12311,6 +12868,13 @@ def main():
         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
         soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
         soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
+        drive_anneal_enabled=drive_anneal_enabled,
+        drive_ref_qk=drive_ref_qk,
+        drive_ref_v=drive_ref_v,
+        drive_ref_rst=drive_ref_rst,
+        drive_mix_start=drive_mix_start,
+        drive_mix_final=drive_mix_final,
+        drive_mix_end_frac=drive_mix_end_frac,
         rpe_start_frac=rpe_start_frac,
         rpe_full_frac=rpe_full_frac,
         rpe_schedule=rpe_schedule,
@@ -12344,7 +12908,14 @@ def main():
         soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
         soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
-        soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac)
+        soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
+        drive_anneal_enabled=drive_anneal_enabled,
+        drive_ref_qk=drive_ref_qk,
+        drive_ref_v=drive_ref_v,
+        drive_ref_rst=drive_ref_rst,
+        drive_mix_start=drive_mix_start,
+        drive_mix_final=drive_mix_final,
+        drive_mix_end_frac=drive_mix_end_frac)
     eval_prune_step_fns = {}
     if eval_effective_prune_enabled:
         for _eps in eval_effective_prune_eps_list:
@@ -12369,7 +12940,14 @@ def main():
                 soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
                 soft_gate_boundary_power_final=soft_gate_boundary_power_final,
                 soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
-                soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac)
+                soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
+                drive_anneal_enabled=drive_anneal_enabled,
+                drive_ref_qk=drive_ref_qk,
+                drive_ref_v=drive_ref_v,
+                drive_ref_rst=drive_ref_rst,
+                drive_mix_start=drive_mix_start,
+                drive_mix_final=drive_mix_final,
+                drive_mix_end_frac=drive_mix_end_frac)
     # v4.1: analysis_step is only meaningful when the full analysis
     # kernels exist. Older model versions skip it -analysis logging
     # degrades to empty then.
@@ -12393,7 +12971,14 @@ def main():
             soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
             soft_gate_boundary_power_final=soft_gate_boundary_power_final,
             soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
-            soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac)
+            soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
+            drive_anneal_enabled=drive_anneal_enabled,
+            drive_ref_qk=drive_ref_qk,
+            drive_ref_v=drive_ref_v,
+            drive_ref_rst=drive_ref_rst,
+            drive_mix_start=drive_mix_start,
+            drive_mix_final=drive_mix_final,
+            drive_mix_end_frac=drive_mix_end_frac)
     else:
         analysis_step_fn = None
     spike_probe_step_fn = None
@@ -12419,7 +13004,14 @@ def main():
             soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
             soft_gate_boundary_power_final=soft_gate_boundary_power_final,
             soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
-            soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac)
+            soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
+            drive_anneal_enabled=drive_anneal_enabled,
+            drive_ref_qk=drive_ref_qk,
+            drive_ref_v=drive_ref_v,
+            drive_ref_rst=drive_ref_rst,
+            drive_mix_start=drive_mix_start,
+            drive_mix_final=drive_mix_final,
+            drive_mix_end_frac=drive_mix_end_frac)
     # No current-train-batch debug forward: --debug uses regular scalar
     # train_step metrics. Local spike diagnostics require training.debug_local_spikes=true.
     debug_forward_step_fn = None
@@ -13615,11 +14207,11 @@ def main():
                         _diag_ctx = {
                             'intensity_beta': (
                                 0.0
-                                if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                                if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                                 else float(tcfg.get('intensity_beta', 0.0))),
                             'd_route_unified': (
                                 int(cfg['model'].get('d_route', 0))
-                                if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                                if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                                 else 0),
                         }
                         _event['diagnosis'] = _diagnose_spike(
@@ -13778,6 +14370,15 @@ def main():
                         'progress': _progress,
                         'model_version': model_version,
                         'regular_diagnostics_level': regular_diagnostics_level,
+                        'regular_console_level': regular_console_level,
+                        'regular_console_host_timing':
+                            regular_console_host_timing,
+                        'regular_console_top1_warn':
+                            regular_console_top1_warn,
+                        'regular_console_drive_max_warn':
+                            regular_console_drive_max_warn,
+                        'regular_console_logging_overhead_warn':
+                            regular_console_logging_overhead_warn,
                         'regular_sparsity_enabled': regular_sparsity_enabled,
                         'rpe_enabled': bool(rpe_enabled),
                         'soft_gate_schedule': soft_gate_schedule,
@@ -13800,21 +14401,21 @@ def main():
                             soft_gate_boundary_power_final_frac,
                         'intensity_beta': (
                             0.0
-                            if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                            if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                             else float(tcfg.get('intensity_beta', 0.0))),
                         'd_select': (
                             0
-                            if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                            if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                             else int(cfg['model'].get('d_select', 0) or 0)),
                         'd_intensity': (
                             0
-                            if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                            if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                             else int(
                                 cfg['model'].get('d_route', 0)
                                 - cfg['model'].get('d_select', 0))),
                         'd_route_unified': (
                             int(cfg['model'].get('d_route', 0))
-                            if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                            if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                             else 0),
                     }
                     ctx.update(collapse_warn_ctx)
@@ -13827,9 +14428,9 @@ def main():
                     log_jsonl({'type': 'train', **rec})
                     sync_logs()
                     _regular_logging_time = time.time() - _regular_logging_t0
-                    log_message(
-                        f"  host_timing: raw_step_time_window={_raw_step_time_window:.3f}s "
-                        f"logging_time={_regular_logging_time:.3f}s")
+                    rec['logging_time'] = float(_regular_logging_time)
+                    _print_regular_host_timing(
+                        _raw_step_time_window, _regular_logging_time, ctx)
                     log_jsonl({
                         'type': 'train_timing',
                         'step': int(global_step),
@@ -13910,6 +14511,13 @@ def main():
                     'progress': _progress,
                     'model_version': model_version,
                     'regular_diagnostics_level': regular_diagnostics_level,
+                    'regular_console_level': regular_console_level,
+                    'regular_console_host_timing': regular_console_host_timing,
+                    'regular_console_top1_warn': regular_console_top1_warn,
+                    'regular_console_drive_max_warn':
+                        regular_console_drive_max_warn,
+                    'regular_console_logging_overhead_warn':
+                        regular_console_logging_overhead_warn,
                     'regular_sparsity_enabled': regular_sparsity_enabled,
                     'rpe_enabled': bool(rpe_enabled),
                     'soft_gate_schedule': soft_gate_schedule,
@@ -13932,21 +14540,21 @@ def main():
                         soft_gate_boundary_power_final_frac,
                     'intensity_beta': (
                         0.0
-                        if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                        if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                         else float(tcfg.get('intensity_beta', 0.0))),
                     'd_select': (
                         0
-                        if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                        if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                         else int(cfg['model'].get('d_select', 0) or 0)),
                     'd_intensity': (
                         0
-                        if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                        if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                         else int(
                             cfg['model'].get('d_route', 0)
                             - cfg['model'].get('d_select', 0))),
                     'd_route_unified': (
                         int(cfg['model'].get('d_route', 0))
-                        if model_version_cfg == 'spatial-r1-v4.1.6.4'
+                        if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                         else 0),
                 }
                 debug_ctx.update(collapse_warn_ctx)
