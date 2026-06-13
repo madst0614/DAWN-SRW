@@ -2920,6 +2920,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   soft_gate_T_v=None,
                   soft_gate_boundary_power=2.0,
                   soft_gate_boundary_power_final=4.0,
+                  admission_den_power=1.0,
                   execution_prune_eps=0.0):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
@@ -2932,6 +2933,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         soft_gate_temperature if soft_gate_T_qk is None else soft_gate_T_qk)
     soft_gate_T_v = (
         soft_gate_temperature if soft_gate_T_v is None else soft_gate_T_v)
+    _focus_admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
     qk_emb = pool_params['attn_qk_emb']
     qk_read = pool_params['attn_qk_read']
     qk_write = pool_params['attn_qk_write']
@@ -3102,14 +3106,16 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             rho, tau, pool_soft_gate_T,
             boundary_power=soft_gate_boundary_power,
             execution_prune_eps=execution_prune_eps)
-        admission_den = jnp.maximum(admission.sum(axis=-1), 1.0)
+        admission_den = jnp.power(
+            jnp.maximum(admission.sum(axis=-1), 1.0),
+            _focus_admission_den_power)
         active_n = active_mask.astype(jnp.float32).sum(axis=-1)
         read_dir = _forward_unit_direction(read_f)
         write_dir = _forward_unit_direction(write_f)
         xr = xf @ read_dir.T
         weighted = execution_weight * xr
         raw_out = weighted @ write_dir
-        out_vec = raw_out / admission_admission_den[:, None] * pool_scale
+        out_vec = raw_out / admission_den[:, None] * pool_scale
         raw_out_norm = jnp.linalg.norm(raw_out, axis=-1)
         out_norm = jnp.linalg.norm(out_vec, axis=-1)
         read_norm = jnp.linalg.norm(read_f, axis=-1)
@@ -3120,7 +3126,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         write_target = _focus_target_emb @ write_dir.T
         write_pred = _focus_pred_emb @ write_dir.T
         write_pred_minus_target = write_pred - write_target
-        contrib_pred_minus_target = (weighted / jnp.maximum(admission_admission_den[:, None], 1e-8)
+        contrib_pred_minus_target = (weighted / jnp.maximum(admission_den[:, None], 1e-8)
                                      * pool_scale * write_pred_minus_target)
         score = jnp.abs(weighted) * write_norm[None, :]
         vals, idx = jax.lax.top_k(score, min(_focus_take_k, int(score.shape[-1])))
@@ -3141,8 +3147,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             take(admission),
             take(drive),
             take(execution_weight),
-            jnp.broadcast_to(admission_admission_den[:, None], vals.shape),
-            take(execution_weight) / jnp.maximum(admission_admission_den[:, None], 1e-8),
+            jnp.broadcast_to(admission_den[:, None], vals.shape),
+            take(execution_weight) / jnp.maximum(admission_den[:, None], 1e-8),
             jnp.broadcast_to(active_n[:, None], vals.shape),
             take(xr),
             jnp.abs(take(xr)),
@@ -3689,6 +3695,7 @@ def _rst_forward(x, pool_params, router_params, rng,
                   soft_gate_T_rst=None,
                   soft_gate_boundary_power=2.0,
                   soft_gate_boundary_power_final=4.0,
+                  admission_den_power=1.0,
                   execution_prune_eps=0.0):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
@@ -3698,6 +3705,9 @@ def _rst_forward(x, pool_params, router_params, rng,
     soft_gate_T_rst = (
         soft_gate_temperature
         if soft_gate_T_rst is None else soft_gate_T_rst)
+    _focus_admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
     rst_emb = pool_params['rst_emb']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
@@ -3748,14 +3758,16 @@ def _rst_forward(x, pool_params, router_params, rng,
             rho, tau, soft_gate_T_rst,
             boundary_power=soft_gate_boundary_power,
             execution_prune_eps=execution_prune_eps)
-        admission_den = jnp.maximum(admission.sum(axis=-1), 1.0)
+        admission_den = jnp.power(
+            jnp.maximum(admission.sum(axis=-1), 1.0),
+            _focus_admission_den_power)
         active_n = active_mask.astype(jnp.float32).sum(axis=-1)
         read_dir = _forward_unit_direction(read_f)
         write_dir = _forward_unit_direction(write_f)
         xr = xf @ read_dir.T
         weighted = execution_weight * xr
         raw_out = weighted @ write_dir
-        out_vec = raw_out / admission_admission_den[:, None] * pool_scale
+        out_vec = raw_out / admission_den[:, None] * pool_scale
         raw_out_norm = jnp.linalg.norm(raw_out, axis=-1)
         out_norm = jnp.linalg.norm(out_vec, axis=-1)
         read_norm = jnp.linalg.norm(read_f, axis=-1)
@@ -3766,7 +3778,7 @@ def _rst_forward(x, pool_params, router_params, rng,
         write_target = _focus_target_emb @ write_dir.T
         write_pred = _focus_pred_emb @ write_dir.T
         write_pred_minus_target = write_pred - write_target
-        contrib_pred_minus_target = (weighted / jnp.maximum(admission_admission_den[:, None], 1e-8)
+        contrib_pred_minus_target = (weighted / jnp.maximum(admission_den[:, None], 1e-8)
                                      * pool_scale * write_pred_minus_target)
         score = jnp.abs(weighted) * write_norm[None, :]
         vals, idx = jax.lax.top_k(score, min(_focus_take_k, int(score.shape[-1])))
@@ -3786,8 +3798,8 @@ def _rst_forward(x, pool_params, router_params, rng,
             take(admission),
             take(drive),
             take(execution_weight),
-            jnp.broadcast_to(admission_admission_den[:, None], vals.shape),
-            take(execution_weight) / jnp.maximum(admission_admission_den[:, None], 1e-8),
+            jnp.broadcast_to(admission_den[:, None], vals.shape),
+            take(execution_weight) / jnp.maximum(admission_den[:, None], 1e-8),
             jnp.broadcast_to(active_n[:, None], vals.shape),
             take(xr),
             jnp.abs(take(xr)),
@@ -4055,6 +4067,7 @@ class DAWN(nn.Module):
                  soft_gate_T_rst=None,
                  soft_gate_boundary_power=2.0,
                  soft_gate_boundary_power_final=4.0,
+                 admission_den_power=1.0,
                  rpe_effective_weight=0.0,
                  execution_prune_eps=0.0):
         """Run the shared-pool SRW Transformer forward pass.
@@ -4393,6 +4406,7 @@ class DAWN(nn.Module):
                     soft_gate_T_v=soft_gate_T_v,
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+                    admission_den_power=admission_den_power,
                     execution_prune_eps=execution_prune_eps)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
@@ -4497,6 +4511,7 @@ class DAWN(nn.Module):
                     soft_gate_T_rst=soft_gate_T_rst,
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+                    admission_den_power=admission_den_power,
                     execution_prune_eps=execution_prune_eps)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
@@ -5544,6 +5559,9 @@ def _angular_execution_kwargs_from_model_cfg(model_cfg):
             model_cfg.get('soft_gate_temperature', 0.07)),
         'soft_gate_boundary_power': float(
             model_cfg.get('soft_gate_boundary_power', 4.0)),
+        'admission_den_power': float(model_cfg.get(
+            'admission_den_power',
+            model_cfg.get('v4164_den_power', model_cfg.get('den_power', 1.0)))),
         'execution_prune_eps': float(model_cfg.get('execution_prune_eps', 0.0)),
         'soft_gate_effective_active_eps': float(
             model_cfg.get('soft_gate_effective_active_eps', 1.0e-6)),
@@ -5649,19 +5667,32 @@ def _angular_execution_weight(h, emb, raw_tau, raw_scan_offset=None,
     return execution_weight.astype(jnp.float32)
 
 
+def _split_admission_den_kwargs(angular_execution_kwargs):
+    execution_kwargs = dict(angular_execution_kwargs)
+    admission_den_power = execution_kwargs.pop('admission_den_power', 1.0)
+    admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+    return execution_kwargs, admission_den_power
+
+
 def _srw_inference(x, h, emb, raw_tau, raw_scan_offset, w_read, w_write,
                    **angular_execution_kwargs):
     """Non-chunked SRW for inference."""
     # v4.1.6.4: inference uses read/write directions; params stay raw.
     r_n = _forward_unit_direction(w_read.astype(jnp.float32))
     w_n = _forward_unit_direction(w_write.astype(jnp.float32))
+    execution_kwargs, admission_den_power = _split_admission_den_kwargs(
+        angular_execution_kwargs)
     _, admission, _, execution_weight, _ = _angular_execution(
-        h, emb, raw_tau, raw_scan_offset, **angular_execution_kwargs)
+        h, emb, raw_tau, raw_scan_offset, **execution_kwargs)
 
     xr = x.astype(jnp.float32) @ r_n.T
     a = execution_weight * xr
     raw_out = a @ w_n
-    admission_den = jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0)
+    admission_den = jnp.power(
+        jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0),
+        admission_den_power)
     out = raw_out.astype(jnp.float32) / admission_den
     return out.astype(jnp.float32)
 
@@ -5672,15 +5703,19 @@ def _srw_inference_with_gates(x, h, emb, raw_tau, raw_scan_offset, w_read,
     # v4.1.6.4: analysis inference uses read/write directions; params stay raw.
     r_n = _forward_unit_direction(w_read.astype(jnp.float32))
     w_n = _forward_unit_direction(w_write.astype(jnp.float32))
+    execution_kwargs, admission_den_power = _split_admission_den_kwargs(
+        angular_execution_kwargs)
     _, admission, _, execution_weight, _ = _angular_execution(
-        h, emb, raw_tau, raw_scan_offset, **angular_execution_kwargs)
+        h, emb, raw_tau, raw_scan_offset, **execution_kwargs)
+    admission_den = jnp.power(
+        jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0),
+        admission_den_power)
     execution_weight_norm = execution_weight / jnp.maximum(
-        admission.sum(axis=-1, keepdims=True), 1e-8)
+        admission_den, 1e-8)
 
     xr = x.astype(jnp.float32) @ r_n.T
     a = execution_weight * xr
     raw_out = a @ w_n
-    admission_den = jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0)
     out = raw_out.astype(jnp.float32) / admission_den
     return out.astype(jnp.float32), execution_weight, execution_weight_norm
 
@@ -6244,15 +6279,19 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         # v4.1.6.4: suppressed forward uses read/write directions.
         r_n = _forward_unit_direction(w_read.astype(jnp.float32))
         w_n = _forward_unit_direction(w_write.astype(jnp.float32))
+        execution_kwargs, admission_den_power = _split_admission_den_kwargs(
+            angular_execution_kwargs)
         _, admission, _, execution_weight, _ = _angular_execution(
-            h, emb, tau_off, raw_scan_offset, **angular_execution_kwargs)
+            h, emb, tau_off, raw_scan_offset, **execution_kwargs)
         if mult is not None:
             execution_weight = execution_weight * mult[None, None, :]
             admission = admission * mult[None, None, :]
         xr = x.astype(jnp.float32) @ r_n.T
         a = execution_weight * xr
         out = a @ w_n
-        admission_den = jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0)
+        admission_den = jnp.power(
+            jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0),
+            admission_den_power)
         return (out.astype(jnp.float32) / admission_den).astype(jnp.float32)
 
     def forward_fn(input_ids):

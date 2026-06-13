@@ -2519,6 +2519,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _soft_gate_boundary_power_mid_frac,
                 _soft_gate_boundary_power_final_frac,
                 _soft_gate_boundary_power_start_frac)
+            soft_gate_T = soft_gate_T_qk
+            if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
+                extra_kw['soft_gate_temperature'] = soft_gate_T_qk
+                extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
+                extra_kw['soft_gate_T_v'] = soft_gate_T_v
+                extra_kw['soft_gate_T_rst'] = soft_gate_T_rst
+            if _pass_boundary_power_kw:
+                extra_kw['soft_gate_boundary_power'] = boundary_power_p
+                extra_kw['soft_gate_boundary_power_final'] = (
+                    _soft_gate_boundary_power_final)
+            if _pass_soft_gate_t_final_kw:
+                extra_kw['soft_gate_t_final'] = _soft_gate_t_final
             if _pass_den_power_kw:
                 extra_kw['admission_den_power'] = _admission_den_power
             if _pass_execution_prune_kw:
@@ -7437,7 +7449,7 @@ def _print_regular_block(rec, ctx):
         pass
     elif ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_message(
-            f"  angular_exposure: mean[a={rec['attn_angular_exposure_mean']:+.4f}"
+            f"  soft_exposure: mean[a={rec['attn_angular_exposure_mean']:+.4f}"
             f" rst={rec['rst_angular_exposure_mean']:+.4f}]"
             f" min[a={rec['attn_angular_exposure_min']:+.4f}"
             f" rst={rec['rst_angular_exposure_min']:+.4f}]"
@@ -7451,7 +7463,7 @@ def _print_regular_block(rec, ctx):
         )
     elif is_v4160:
         log_message(
-            f"  angular_exposure: mean[qk={rec['attn_qk_angular_exposure_mean']:+.4f}"
+            f"  soft_exposure: mean[qk={rec['attn_qk_angular_exposure_mean']:+.4f}"
             f" v={rec['attn_v_angular_exposure_mean']:+.4f}"
             f" rst={rec['rst_angular_exposure_mean']:+.4f}]"
             f" min[qk={rec['attn_qk_angular_exposure_min']:+.4f}"
@@ -9414,7 +9426,7 @@ def _print_debug_block(rec, ctx):
         )
     elif ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_debug_message(
-            f"angular_exposure_diag: "
+            f"soft_exposure_diag: "
             f"mean[attn={_g('attn_angular_exposure_mean'):+.5f} "
             f"rst={_g('rst_angular_exposure_mean'):+.5f}] "
             f"min[attn={_g('attn_angular_exposure_min'):+.5f} "
@@ -9429,7 +9441,7 @@ def _print_debug_block(rec, ctx):
         )
     elif is_v4160:
         log_debug_message(
-            f"angular_exposure_diag: "
+            f"soft_exposure_diag: "
             f"mean[qk={_g('attn_qk_angular_exposure_mean'):+.5f} "
             f"v={_g('attn_v_angular_exposure_mean'):+.5f} "
             f"rst={_g('rst_angular_exposure_mean'):+.5f}] "
