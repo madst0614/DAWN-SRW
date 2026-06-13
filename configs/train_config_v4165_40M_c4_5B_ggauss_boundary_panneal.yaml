@@ -154,4 +154,4 @@ training:
   drive_baseline_rst: 0.008
   boundary_drive_ratio_end_frac: 0.0260
   boundary_drive_ratio_start_frac: 0.0040
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4165_40M_c4_5B_admission_floor_drive_baseline_schedule_bug_fixed
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4165_40M_c4_5B_admission_floor_drive_baseline_new_schedule
