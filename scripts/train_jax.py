@@ -102,16 +102,6 @@ except ImportError:
     DAWN_SRW_V4164 = None
     _v4164_raw_tau_init_from_cosine_tau = None
     _v4164_tau_init_calibration_scores = None
-try:
-    from models.dawn_srw_v4165 import (
-        DAWN as DAWN_SRW_V4165,
-        _raw_tau_init_from_cosine_tau as _v4165_raw_tau_init_from_cosine_tau,
-        _tau_init_calibration_scores as _v4165_tau_init_calibration_scores,
-    )
-except ImportError:
-    DAWN_SRW_V4165 = None
-    _v4165_raw_tau_init_from_cosine_tau = None
-    _v4165_tau_init_calibration_scores = None
 
 # ============================================================
 # Constants
@@ -119,8 +109,6 @@ except ImportError:
 
 # Log cadence is config-driven: see log_interval / log_analysis_multiplier
 # in `training:`. The legacy module-level LOG_INTERVAL constant was removed.
-
-V4165_MODEL_VERSION = 'spatial-r1-v4.1.6.5'
 
 SRW_ACTIVE_MODEL_VERSIONS = (
     'dawn_srw',
@@ -133,7 +121,6 @@ SRW_ACTIVE_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.2',
     'spatial-r1-v4.1.6.3',
     'spatial-r1-v4.1.6.4',
-    V4165_MODEL_VERSION,
 )
 
 DIRECT_TAU_SPLIT_MODEL_VERSIONS = (
@@ -142,25 +129,21 @@ DIRECT_TAU_SPLIT_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.2',
     'spatial-r1-v4.1.6.3',
     'spatial-r1-v4.1.6.4',
-    V4165_MODEL_VERSION,
 )
 
 SOFT_DIRECT_TAU_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.2',
     'spatial-r1-v4.1.6.3',
     'spatial-r1-v4.1.6.4',
-    V4165_MODEL_VERSION,
 )
 
 ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.3',
     'spatial-r1-v4.1.6.4',
-    V4165_MODEL_VERSION,
 )
 
 UNIFIED_ROUTE_DEN_MODEL_VERSIONS = (
     'spatial-r1-v4.1.6.4',
-    V4165_MODEL_VERSION,
 )
 
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
@@ -303,7 +286,7 @@ DIRECT_TAU_SPARSITY_METRIC_NAMES = (
 DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES = (
     'raw_gate_max', 'gate_sum', 'active_n_mean',
     'tau_abs_mean', 'dead_penalty', 'dead_count',
-    'int_max', 'angular_depth_mean', 'gate_den_sum_mean', 'gate_eff_n',
+    'int_max', 'drive_mean', 'gate_den_sum_mean', 'gate_eff_n',
     'gate_eff_ratio', 'top1_gate_frac', 'top1_gate_frac_max',
     'score_std',
 )
@@ -314,36 +297,36 @@ V4164_SCALAR_METRIC_NAMES = (
     'attn_qk_admission_den_sum',
     'attn_v_admission_den_sum',
     'rst_admission_den_sum',
-    'compose_mass_sum',
-    'attn_compose_mass_sum',
-    'attn_qk_compose_mass_sum',
-    'attn_v_compose_mass_sum',
-    'rst_compose_mass_sum',
-    'angular_depth_mean',
-    'attn_angular_depth_mean',
-    'attn_qk_angular_depth_mean',
-    'attn_v_angular_depth_mean',
-    'rst_angular_depth_mean',
-    'angular_depth_max',
-    'attn_angular_depth_max',
-    'attn_qk_angular_depth_max',
-    'attn_v_angular_depth_max',
-    'rst_angular_depth_max',
-    'compose_eff_n',
-    'attn_compose_eff_n',
-    'attn_qk_compose_eff_n',
-    'attn_v_compose_eff_n',
-    'rst_compose_eff_n',
-    'compose_top1_frac',
-    'compose_top1_frac_max',
-    'attn_compose_top1_frac',
-    'attn_compose_top1_frac_max',
-    'attn_qk_compose_top1_frac',
-    'attn_qk_compose_top1_frac_max',
-    'attn_v_compose_top1_frac',
-    'attn_v_compose_top1_frac_max',
-    'rst_compose_top1_frac',
-    'rst_compose_top1_frac_max',
+    'execution_mass_sum',
+    'attn_execution_mass_sum',
+    'attn_qk_execution_mass_sum',
+    'attn_v_execution_mass_sum',
+    'rst_execution_mass_sum',
+    'drive_mean',
+    'attn_drive_mean',
+    'attn_qk_drive_mean',
+    'attn_v_drive_mean',
+    'rst_drive_mean',
+    'drive_max',
+    'attn_drive_max',
+    'attn_qk_drive_max',
+    'attn_v_drive_max',
+    'rst_drive_max',
+    'execution_eff_n',
+    'attn_execution_eff_n',
+    'attn_qk_execution_eff_n',
+    'attn_v_execution_eff_n',
+    'rst_execution_eff_n',
+    'execution_top1_frac',
+    'execution_top1_frac_max',
+    'attn_execution_top1_frac',
+    'attn_execution_top1_frac_max',
+    'attn_qk_execution_top1_frac',
+    'attn_qk_execution_top1_frac_max',
+    'attn_v_execution_top1_frac',
+    'attn_v_execution_top1_frac_max',
+    'rst_execution_top1_frac',
+    'rst_execution_top1_frac_max',
 )
 
 UPDATE_CAP_GROUP_SPECS = (
@@ -781,8 +764,7 @@ def _dawn_srw_kwargs(cfg):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
     if version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1',
                    'spatial-r1-v4.1.6.2', 'spatial-r1-v4.1.6.3',
-                   'spatial-r1-v4.1.6.4',
-                   'spatial-r1-v4.1.6.5'):
+                   'spatial-r1-v4.1.6.4'):
         def _cfg_get(name, default=None):
             if name in m:
                 return m[name]
@@ -820,26 +802,6 @@ def _dawn_srw_kwargs(cfg):
         if (version not in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                 and ('d_select' in m or 'd_select' in t)):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
-        if version == V4165_MODEL_VERSION:
-            den_defaults = {
-                'v4164_den_power': 1.0,
-                'v4164_den_grad_scale': 1.0,
-                'v4164_den_power_schedule': 'constant',
-                'v4164_den_power_base': _cfg_get('v4164_den_power', 1.0),
-                'v4164_den_power_peak': _cfg_get('v4164_den_power', 1.0),
-                'v4164_den_power_mid': _cfg_get('v4164_den_power', 1.0),
-                'v4164_den_power_final': _cfg_get('v4164_den_power', 1.0),
-                'v4164_den_power_up_start_frac': 0.0,
-                'v4164_den_power_peak_frac': 0.0,
-                'v4164_den_power_hold_end_frac': 0.0,
-                'v4164_den_power_mid_frac': 0.0,
-                'v4164_den_power_down_end_frac': 0.0,
-            }
-            for name, default in den_defaults.items():
-                if name in ('v4164_den_power_schedule',):
-                    kw[name] = str(_cfg_get(name, default))
-                else:
-                    kw[name] = float(_cfg_get(name, default))
     return kw
 
 
@@ -874,15 +836,11 @@ def _v415_sharded_kwargs(cfg):
         if regular_level not in ('compact', 'full'):
             raise ValueError(
                 "training.regular_diagnostics_level must be 'compact' or 'full'.")
-        if version == V4165_MODEL_VERSION and regular_level == 'compact':
-            regular_current_eps_default = [1.0e-2]
-            regular_projected_eps_default = []
-        else:
-            regular_current_eps_default = (
-                [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
-                if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-                else [1.0e-1, 1.0e-2, 1.0e-3])
-            regular_projected_eps_default = [1.0e-6]
+        regular_current_eps_default = (
+            [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
+            if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+            else [1.0e-1, 1.0e-2, 1.0e-3])
+        regular_projected_eps_default = [1.0e-6]
         regular_sparsity_default = (
             True
             if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
@@ -906,10 +864,15 @@ def _v415_sharded_kwargs(cfg):
                 regular_sparsity_default)),
         )
         if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+            admission_den_power_cfg = t.get(
+                'admission_den_power',
+                t.get('v4164_den_power', 1.0))
+            admission_den_grad_scale_cfg = t.get(
+                'admission_den_grad_scale',
+                t.get('v4164_den_grad_scale', 1.0))
             kw.update(
-                v4164_den_power=float(t.get('v4164_den_power', 1.0)),
-                v4164_den_grad_scale=float(
-                    t.get('v4164_den_grad_scale', 1.0)),
+                admission_den_power=float(admission_den_power_cfg),
+                admission_den_grad_scale=float(admission_den_grad_scale_cfg),
             )
     else:
         kw = dict(
@@ -1083,18 +1046,6 @@ if DAWN_SRW_V4164 is not None:
         sharded_kwargs=_v415_sharded_kwargs,
     )
 
-if DAWN_SRW_V4165 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.6.5'] = ModelSpec(
-        name='spatial-r1-v4.1.6.5',
-        module_path='models.dawn_srw_v4165',
-        cls=DAWN_SRW_V4165,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
-
-
 def build_model_from_config(cfg):
     """Build model from config via MODEL_REGISTRY.
 
@@ -1133,12 +1084,6 @@ def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
         raise ValueError(
             "v4164 tau_init_mode=quantile_frac requires "
             "models.dawn_srw_v4164 to import cleanly.")
-    if (version == 'spatial-r1-v4.1.6.5'
-            and _v4165_tau_init_calibration_scores is None):
-        raise ValueError(
-            "v4165 tau_init_mode=quantile_frac requires "
-            "models.dawn_srw_v4165 to import cleanly.")
-
     # Keep the one-time JIT signature small: calibration needs only route
     # geometry, not read/write tensors, tau params, or LM output weights.
     score_params = {
@@ -1159,11 +1104,9 @@ def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
         },
     }
     score_impl = (
-        _v4165_tau_init_calibration_scores
-        if version == 'spatial-r1-v4.1.6.5'
-        else (_v4164_tau_init_calibration_scores
-              if version == 'spatial-r1-v4.1.6.4'
-              else _v4162_tau_init_calibration_scores))
+        _v4164_tau_init_calibration_scores
+        if version == 'spatial-r1-v4.1.6.4'
+        else _v4162_tau_init_calibration_scores)
     score_kwargs = {
         'max_tokens': tau_init_cfg['calibration_tokens'],
     }
@@ -1670,38 +1613,11 @@ def _model_accepts_soft_gate_boundary_power(model):
         return False
 
 
-def _model_accepts_drive_mix(model):
-    """Backward-compatible alias probe for old v4165 drive kwargs."""
+def _model_accepts_admission_den_power(model):
+    """Return True if model.__call__ accepts runtime admission_den_power."""
     import inspect as _inspect
     try:
-        return 'drive_mix' in _inspect.signature(model.__call__).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-def _model_accepts_admission_floor(model):
-    """Return True if model.__call__ accepts admission_floor."""
-    import inspect as _inspect
-    try:
-        return 'admission_floor' in _inspect.signature(model.__call__).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-def _model_accepts_boundary_drive_ratio(model):
-    """Return True if model.__call__ accepts boundary_drive_ratio."""
-    import inspect as _inspect
-    try:
-        return 'boundary_drive_ratio' in _inspect.signature(model.__call__).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-def _model_accepts_v4164_den_power(model):
-    """Return True if model.__call__ accepts runtime den_power."""
-    import inspect as _inspect
-    try:
-        return 'v4164_den_power' in _inspect.signature(model.__call__).parameters
+        return 'admission_den_power' in _inspect.signature(model.__call__).parameters
     except (TypeError, ValueError):
         return False
 
@@ -2242,99 +2158,6 @@ def _pool_update_diagnostics(params, grads):
 
 
 
-def scheduled_admission_floor_by_frac(step, total_steps,
-                                      hold_frac=0.0, end_frac=0.0):
-    """Short full-admission floor followed by smoothstep decay to zero."""
-    step_f = jnp.asarray(step, dtype=jnp.float32)
-    total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
-    frac = jnp.clip(step_f / total_f, 0.0, 1.0)
-    hold = jnp.asarray(hold_frac, dtype=jnp.float32)
-    end = jnp.asarray(end_frac, dtype=jnp.float32)
-    eps = jnp.float32(1.0e-8)
-    u = jnp.clip((frac - hold) / jnp.maximum(end - hold, eps), 0.0, 1.0)
-    s = u * u * (jnp.float32(3.0) - jnp.float32(2.0) * u)
-    floor = jnp.float32(1.0) - s
-    return jnp.where(end > hold, floor, jnp.float32(0.0))
-
-
-def scheduled_boundary_drive_ratio_by_frac(
-        step, total_steps, start_frac=0.0, end_frac=0.0):
-    """Smoothstep transition from drive_baseline to boundary_drive."""
-    step_f = jnp.asarray(step, dtype=jnp.float32)
-    total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
-    frac = jnp.clip(step_f / total_f, 0.0, 1.0)
-    start = jnp.clip(
-        jnp.asarray(start_frac, dtype=jnp.float32),
-        jnp.float32(0.0), jnp.float32(1.0))
-    end = jnp.clip(
-        jnp.asarray(end_frac, dtype=jnp.float32),
-        jnp.float32(0.0), jnp.float32(1.0))
-    eps = jnp.float32(1.0e-8)
-    u = jnp.clip((frac - start) / jnp.maximum(end - start, eps), 0.0, 1.0)
-    s = u * u * (jnp.float32(3.0) - jnp.float32(2.0) * u)
-    return jnp.where(end > start, s, jnp.float32(1.0))
-
-
-def smoothstep01(x):
-    u = jnp.clip(jnp.asarray(x, dtype=jnp.float32), 0.0, 1.0)
-    return u * u * (jnp.float32(3.0) - jnp.float32(2.0) * u)
-
-
-def scheduled_den_power_by_frac(
-        step, total_steps, schedule, den_power,
-        base, peak, mid, final, up_start_frac, peak_frac,
-        hold_end_frac, mid_frac, down_end_frac):
-    """Backward-compatible constant/bump or v4165 early impulse schedule."""
-    den_power_f = jnp.asarray(den_power, dtype=jnp.float32)
-    schedule_name = str(schedule).lower()
-    if schedule_name in ('constant', 'none'):
-        return den_power_f
-
-    step_f = jnp.asarray(step, dtype=jnp.float32)
-    total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
-    progress = jnp.clip(step_f / total_f, 0.0, 1.0)
-
-    base_f = jnp.asarray(base, dtype=jnp.float32)
-    peak_f = jnp.asarray(peak, dtype=jnp.float32)
-    mid_f = jnp.asarray(mid, dtype=jnp.float32)
-    final_f = jnp.asarray(final, dtype=jnp.float32)
-    up_start = jnp.asarray(up_start_frac, dtype=jnp.float32)
-    peak_at = jnp.asarray(peak_frac, dtype=jnp.float32)
-    hold_end = jnp.asarray(hold_end_frac, dtype=jnp.float32)
-    mid_at = jnp.asarray(mid_frac, dtype=jnp.float32)
-    down_end = jnp.asarray(down_end_frac, dtype=jnp.float32)
-    eps = jnp.float32(1.0e-8)
-
-    up_u = smoothstep01(
-        (progress - up_start) / jnp.maximum(peak_at - up_start, eps))
-    up_val = base_f + (peak_f - base_f) * up_u
-
-    if schedule_name == 'early_impulse_decay':
-        mid_u = smoothstep01(
-            (progress - hold_end) / jnp.maximum(mid_at - hold_end, eps))
-        down_u = smoothstep01(
-            (progress - mid_at) / jnp.maximum(down_end - mid_at, eps))
-        mid_val = peak_f + (mid_f - peak_f) * mid_u
-        down_val = mid_f + (final_f - mid_f) * down_u
-
-        scheduled = jnp.where(progress < up_start, base_f, up_val)
-        scheduled = jnp.where(progress >= peak_at, peak_f, scheduled)
-        scheduled = jnp.where(progress >= hold_end, mid_val, scheduled)
-        scheduled = jnp.where(progress >= mid_at, down_val, scheduled)
-        scheduled = jnp.where(progress >= down_end, final_f, scheduled)
-        return scheduled
-
-    down_u = smoothstep01(
-        (progress - hold_end) / jnp.maximum(down_end - hold_end, eps))
-    down_val = peak_f + (final_f - peak_f) * down_u
-
-    scheduled = jnp.where(progress < up_start, base_f, up_val)
-    scheduled = jnp.where(progress >= peak_at, peak_f, scheduled)
-    scheduled = jnp.where(progress >= hold_end, down_val, scheduled)
-    scheduled = jnp.where(progress >= down_end, final_f, scheduled)
-    return scheduled
-
-
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
@@ -2414,31 +2237,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       soft_gate_boundary_power_start_frac=0.0,
                       soft_gate_boundary_power_mid_frac=0.800,
                       soft_gate_boundary_power_final_frac=0.950,
-                      v4164_den_power=1.0,
-                      v4164_den_power_schedule='constant',
-                      v4164_den_power_base=1.0,
-                      v4164_den_power_peak=1.0,
-                      v4164_den_power_mid=1.0,
-                      v4164_den_power_final=1.0,
-                      v4164_den_power_up_start_frac=0.0,
-                      v4164_den_power_peak_frac=0.0,
-                      v4164_den_power_hold_end_frac=0.0,
-                      v4164_den_power_mid_frac=0.0,
-                      v4164_den_power_down_end_frac=0.0,
-                      drive_anneal_enabled=False,
-                      drive_ref_qk=0.05,
-                      drive_ref_v=0.04,
-                      drive_ref_rst=0.04,
-                      drive_mix_start=1.0,
-                      drive_mix_final=1.0,
-                      drive_mix_end_frac=0.0,
-                      admission_floor_hold_frac=0.0,
-                      admission_floor_end_frac=0.0,
-                      drive_baseline_qk=0.012,
-                      drive_baseline_v=0.010,
-                      drive_baseline_rst=0.008,
-                      boundary_drive_ratio_start_frac=0.0,
-                      boundary_drive_ratio_end_frac=0.0,
+                      admission_den_power=1.0,
                       rpe_start_frac=0.0,
                       rpe_full_frac=0.0,
                       rpe_schedule='linear',
@@ -2585,10 +2384,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
-    _pass_drive_mix_kw = _model_accepts_drive_mix(model)
-    _pass_admission_floor_kw = _model_accepts_admission_floor(model)
-    _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
-    _pass_den_power_kw = _model_accepts_v4164_den_power(model)
+    _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
@@ -2660,34 +2456,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
-    _v4164_den_power = jnp.float32(v4164_den_power)
-    _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
-    _v4164_den_power_base = jnp.float32(v4164_den_power_base)
-    _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
-    _v4164_den_power_mid = jnp.float32(v4164_den_power_mid)
-    _v4164_den_power_final = jnp.float32(v4164_den_power_final)
-    _v4164_den_power_up_start_frac = jnp.float32(
-        v4164_den_power_up_start_frac)
-    _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
-    _v4164_den_power_hold_end_frac = jnp.float32(
-        v4164_den_power_hold_end_frac)
-    _v4164_den_power_mid_frac = jnp.float32(v4164_den_power_mid_frac)
-    _v4164_den_power_down_end_frac = jnp.float32(
-        v4164_den_power_down_end_frac)
-    _drive_anneal_enabled = bool(drive_anneal_enabled)
-    _drive_ref_qk = jnp.float32(drive_ref_qk)
-    _drive_ref_v = jnp.float32(drive_ref_v)
-    _drive_ref_rst = jnp.float32(drive_ref_rst)
-    _drive_mix_start = jnp.float32(drive_mix_start)
-    _drive_mix_final = jnp.float32(drive_mix_final)
-    _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
-    _admission_floor_hold_frac = jnp.float32(admission_floor_hold_frac)
-    _admission_floor_end_frac = jnp.float32(admission_floor_end_frac)
-    _drive_baseline_qk = jnp.float32(drive_baseline_qk)
-    _drive_baseline_v = jnp.float32(drive_baseline_v)
-    _drive_baseline_rst = jnp.float32(drive_baseline_rst)
-    _boundary_drive_ratio_start_frac = float(boundary_drive_ratio_start_frac)
-    _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
+    _admission_den_power = jnp.float32(admission_den_power)
     _rpe_start_frac = jnp.float32(rpe_start_frac)
     _rpe_full_frac = jnp.float32(rpe_full_frac)
     _rpe_schedule = str(rpe_schedule).lower()
@@ -2750,61 +2519,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _soft_gate_boundary_power_mid_frac,
                 _soft_gate_boundary_power_final_frac,
                 _soft_gate_boundary_power_start_frac)
-            admission_floor = scheduled_admission_floor_by_frac(
-                step, _total_training_steps,
-                _admission_floor_hold_frac, _admission_floor_end_frac)
-            boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
-                step, _total_training_steps,
-                _boundary_drive_ratio_start_frac,
-                _boundary_drive_ratio_end_frac)
-            den_power_p = scheduled_den_power_by_frac(
-                step, _total_training_steps,
-                _v4164_den_power_schedule, _v4164_den_power,
-                _v4164_den_power_base, _v4164_den_power_peak,
-                _v4164_den_power_mid, _v4164_den_power_final,
-                _v4164_den_power_up_start_frac,
-                _v4164_den_power_peak_frac,
-                _v4164_den_power_hold_end_frac,
-                _v4164_den_power_mid_frac,
-                _v4164_den_power_down_end_frac)
-            drive_mix = jnp.where(
-                jnp.asarray(_drive_anneal_enabled),
-                _scheduled_scalar(
-                    step, _total_training_steps,
-                    _drive_mix_start, _drive_mix_final,
-                    0.0, _drive_mix_end_frac,
-                    'cosine'),
-                jnp.float32(1.0))
-            soft_gate_T = soft_gate_T_qk
-            if _pass_soft_gate_schedule_kw:
-                extra_kw['soft_gate_temperature'] = soft_gate_T
-                extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
-                extra_kw['soft_gate_T_v'] = soft_gate_T_v
-                extra_kw['soft_gate_T_rst'] = soft_gate_T_rst
-                extra_kw['rpe_effective_weight'] = (
-                    (_explore_weight_q + _explore_weight_k
-                     + _explore_weight_v + _explore_weight_rst)
-                    / jnp.float32(4.0) * rpe_schedule_scale)
-            if _pass_boundary_power_kw:
-                extra_kw['soft_gate_boundary_power'] = boundary_power_p
-                extra_kw['soft_gate_boundary_power_final'] = (
-                    _soft_gate_boundary_power_final)
-            if _pass_soft_gate_t_final_kw:
-                extra_kw['soft_gate_t_final'] = _soft_gate_t_final
-            if _pass_admission_floor_kw:
-                extra_kw['admission_floor'] = admission_floor
-                extra_kw['drive_baseline_qk'] = _drive_baseline_qk
-                extra_kw['drive_baseline_v'] = _drive_baseline_v
-                extra_kw['drive_baseline_rst'] = _drive_baseline_rst
-            if _pass_boundary_drive_ratio_kw:
-                extra_kw['boundary_drive_ratio'] = boundary_drive_ratio
-            elif _pass_drive_mix_kw:
-                extra_kw['drive_mix'] = drive_mix
-                extra_kw['drive_ref_qk'] = _drive_ref_qk
-                extra_kw['drive_ref_v'] = _drive_ref_v
-                extra_kw['drive_ref_rst'] = _drive_ref_rst
             if _pass_den_power_kw:
-                extra_kw['v4164_den_power'] = den_power_p
+                extra_kw['admission_den_power'] = _admission_den_power
             if _pass_execution_prune_kw:
                 # Training never execution-prunes; pruning is eval-sweep only.
                 extra_kw['execution_prune_eps'] = jnp.float32(0.0)
@@ -3349,9 +3065,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 soft_gate_T_v=soft_gate_T_v,
                 soft_gate_T_rst=soft_gate_T_rst,
                 boundary_power_p=boundary_power_p,
-                v4164_den_power=den_power_p,
-                admission_floor=admission_floor,
-                boundary_drive_ratio=boundary_drive_ratio,
+                admission_den_power=_admission_den_power,
                 rpe_schedule_scale=rpe_schedule_scale,
             )
             result_payload = result
@@ -4126,10 +3840,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'soft_gate_T_v': explore_stats['soft_gate_T_v'],
             'soft_gate_T_rst': explore_stats['soft_gate_T_rst'],
             'boundary_power_p': explore_stats['boundary_power_p'],
-            'v4164_den_power': explore_stats['v4164_den_power'],
-            'den_power': explore_stats['v4164_den_power'],
-            'admission_floor': explore_stats['admission_floor'],
-            'boundary_drive_ratio': explore_stats['boundary_drive_ratio'],
+            'admission_den_power': explore_stats['admission_den_power'],
             'rpe_effective_weight': (
                 (_explore_weight_q + _explore_weight_k
                  + _explore_weight_v + _explore_weight_rst)
@@ -4294,12 +4005,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_pool_write': grad_pool_write,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'rst_aux': result.get('rst_aux', jnp.float32(0.0)),
-            'admission_floor': result.get(
-                'admission_floor', explore_stats.get('admission_floor', jnp.float32(0.0))),
-            'boundary_drive_ratio': result.get(
-                'boundary_drive_ratio', explore_stats.get('boundary_drive_ratio', jnp.float32(1.0))),
-            'drive_mix': result.get(
-                'drive_mix', result.get('boundary_drive_ratio', jnp.float32(1.0))),
             'drive_mean': result.get('drive_mean', jnp.float32(0.0)),
             'drive_max': result.get('drive_max', jnp.float32(0.0)),
             'attn_drive_mean': result.get('attn_drive_mean', jnp.float32(0.0)),
@@ -4867,31 +4572,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_boundary_power_start_frac=0.0,
                      soft_gate_boundary_power_mid_frac=0.800,
                      soft_gate_boundary_power_final_frac=0.950,
-                     v4164_den_power=1.0,
-                     v4164_den_power_schedule='constant',
-                     v4164_den_power_base=1.0,
-                     v4164_den_power_peak=1.0,
-                     v4164_den_power_mid=1.0,
-                     v4164_den_power_final=1.0,
-                     v4164_den_power_up_start_frac=0.0,
-                     v4164_den_power_peak_frac=0.0,
-                     v4164_den_power_hold_end_frac=0.0,
-                     v4164_den_power_mid_frac=0.0,
-                     v4164_den_power_down_end_frac=0.0,
-                     drive_anneal_enabled=False,
-                     drive_ref_qk=0.05,
-                     drive_ref_v=0.04,
-                     drive_ref_rst=0.04,
-                     drive_mix_start=1.0,
-                     drive_mix_final=1.0,
-                     drive_mix_end_frac=0.0,
-                     admission_floor_hold_frac=0.0,
-                     admission_floor_end_frac=0.0,
-                     drive_baseline_qk=0.012,
-                     drive_baseline_v=0.010,
-                     drive_baseline_rst=0.008,
-                     boundary_drive_ratio_start_frac=0.0,
-                     boundary_drive_ratio_end_frac=0.0):
+                     admission_den_power=1.0):
     """Create a jit-compiled evaluation step.
 
     Uses the SLIM forward (analysis=False). Eval normally needs only loss /
@@ -4903,10 +4584,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
-    _pass_drive_mix_kw = _model_accepts_drive_mix(model)
-    _pass_admission_floor_kw = _model_accepts_admission_floor(model)
-    _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
-    _pass_den_power_kw = _model_accepts_v4164_den_power(model)
+    _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _execution_prune_eps = jnp.float32(execution_prune_eps)
     _return_prune_stats = bool(return_prune_stats)
     _soft_gate_runtime_enabled = bool(
@@ -4956,34 +4634,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
-    _v4164_den_power = jnp.float32(v4164_den_power)
-    _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
-    _v4164_den_power_base = jnp.float32(v4164_den_power_base)
-    _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
-    _v4164_den_power_mid = jnp.float32(v4164_den_power_mid)
-    _v4164_den_power_final = jnp.float32(v4164_den_power_final)
-    _v4164_den_power_up_start_frac = jnp.float32(
-        v4164_den_power_up_start_frac)
-    _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
-    _v4164_den_power_hold_end_frac = jnp.float32(
-        v4164_den_power_hold_end_frac)
-    _v4164_den_power_mid_frac = jnp.float32(v4164_den_power_mid_frac)
-    _v4164_den_power_down_end_frac = jnp.float32(
-        v4164_den_power_down_end_frac)
-    _drive_anneal_enabled = bool(drive_anneal_enabled)
-    _drive_ref_qk = jnp.float32(drive_ref_qk)
-    _drive_ref_v = jnp.float32(drive_ref_v)
-    _drive_ref_rst = jnp.float32(drive_ref_rst)
-    _drive_mix_start = jnp.float32(drive_mix_start)
-    _drive_mix_final = jnp.float32(drive_mix_final)
-    _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
-    _admission_floor_hold_frac = jnp.float32(admission_floor_hold_frac)
-    _admission_floor_end_frac = jnp.float32(admission_floor_end_frac)
-    _drive_baseline_qk = jnp.float32(drive_baseline_qk)
-    _drive_baseline_v = jnp.float32(drive_baseline_v)
-    _drive_baseline_rst = jnp.float32(drive_baseline_rst)
-    _boundary_drive_ratio_start_frac = float(boundary_drive_ratio_start_frac)
-    _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
+    _admission_den_power = jnp.float32(admission_den_power)
 
     @jax.jit
     def eval_step(params, input_ids, attention_mask, step):
@@ -5018,44 +4669,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                 _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
-        admission_floor = scheduled_admission_floor_by_frac(
-            step, _total_training_steps,
-            _admission_floor_hold_frac, _admission_floor_end_frac)
-        boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
-            step, _total_training_steps,
-            _boundary_drive_ratio_start_frac,
-            _boundary_drive_ratio_end_frac)
-        den_power_p = scheduled_den_power_by_frac(
-            step, _total_training_steps,
-            _v4164_den_power_schedule, _v4164_den_power,
-            _v4164_den_power_base, _v4164_den_power_peak,
-            _v4164_den_power_mid, _v4164_den_power_final,
-            _v4164_den_power_up_start_frac,
-            _v4164_den_power_peak_frac,
-            _v4164_den_power_hold_end_frac,
-            _v4164_den_power_mid_frac,
-            _v4164_den_power_down_end_frac)
-        if _pass_admission_floor_kw:
-            extra_kw['admission_floor'] = admission_floor
-            extra_kw['drive_baseline_qk'] = _drive_baseline_qk
-            extra_kw['drive_baseline_v'] = _drive_baseline_v
-            extra_kw['drive_baseline_rst'] = _drive_baseline_rst
-        if _pass_boundary_drive_ratio_kw:
-            extra_kw['boundary_drive_ratio'] = boundary_drive_ratio
-        elif _pass_drive_mix_kw:
-            extra_kw['drive_mix'] = jnp.where(
-                jnp.asarray(_drive_anneal_enabled),
-                _scheduled_scalar(
-                    step, _total_training_steps,
-                    _drive_mix_start, _drive_mix_final,
-                    0.0, _drive_mix_end_frac,
-                    'cosine'),
-                jnp.float32(1.0))
-            extra_kw['drive_ref_qk'] = _drive_ref_qk
-            extra_kw['drive_ref_v'] = _drive_ref_v
-            extra_kw['drive_ref_rst'] = _drive_ref_rst
         if _pass_den_power_kw:
-            extra_kw['v4164_den_power'] = den_power_p
+            extra_kw['admission_den_power'] = _admission_den_power
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = _execution_prune_eps
         result = model.apply(
@@ -5112,31 +4727,7 @@ def create_analysis_step(model, sharded_fns=None,
                          soft_gate_boundary_power_start_frac=0.0,
                          soft_gate_boundary_power_mid_frac=0.800,
                          soft_gate_boundary_power_final_frac=0.950,
-                         v4164_den_power=1.0,
-                         v4164_den_power_schedule='constant',
-                         v4164_den_power_base=1.0,
-                         v4164_den_power_peak=1.0,
-                         v4164_den_power_mid=1.0,
-                         v4164_den_power_final=1.0,
-                         v4164_den_power_up_start_frac=0.0,
-                         v4164_den_power_peak_frac=0.0,
-                         v4164_den_power_hold_end_frac=0.0,
-                         v4164_den_power_mid_frac=0.0,
-                         v4164_den_power_down_end_frac=0.0,
-                         drive_anneal_enabled=False,
-                         drive_ref_qk=0.05,
-                         drive_ref_v=0.04,
-                         drive_ref_rst=0.04,
-                         drive_mix_start=1.0,
-                         drive_mix_final=1.0,
-                         drive_mix_end_frac=0.0,
-                     admission_floor_hold_frac=0.0,
-                     admission_floor_end_frac=0.0,
-                     drive_baseline_qk=0.012,
-                     drive_baseline_v=0.010,
-                     drive_baseline_rst=0.008,
-                     boundary_drive_ratio_start_frac=0.0,
-                     boundary_drive_ratio_end_frac=0.0):
+                         admission_den_power=1.0):
     """Create a jit-compiled analysis step (FULL forward, observational).
 
     Runs the model with `analysis=True` and the ANALYSIS variant of
@@ -5149,10 +4740,7 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
-    _pass_drive_mix_kw = _model_accepts_drive_mix(model)
-    _pass_admission_floor_kw = _model_accepts_admission_floor(model)
-    _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
-    _pass_den_power_kw = _model_accepts_v4164_den_power(model)
+    _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
@@ -5200,34 +4788,7 @@ def create_analysis_step(model, sharded_fns=None,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
-    _v4164_den_power = jnp.float32(v4164_den_power)
-    _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
-    _v4164_den_power_base = jnp.float32(v4164_den_power_base)
-    _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
-    _v4164_den_power_mid = jnp.float32(v4164_den_power_mid)
-    _v4164_den_power_final = jnp.float32(v4164_den_power_final)
-    _v4164_den_power_up_start_frac = jnp.float32(
-        v4164_den_power_up_start_frac)
-    _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
-    _v4164_den_power_hold_end_frac = jnp.float32(
-        v4164_den_power_hold_end_frac)
-    _v4164_den_power_mid_frac = jnp.float32(v4164_den_power_mid_frac)
-    _v4164_den_power_down_end_frac = jnp.float32(
-        v4164_den_power_down_end_frac)
-    _drive_anneal_enabled = bool(drive_anneal_enabled)
-    _drive_ref_qk = jnp.float32(drive_ref_qk)
-    _drive_ref_v = jnp.float32(drive_ref_v)
-    _drive_ref_rst = jnp.float32(drive_ref_rst)
-    _drive_mix_start = jnp.float32(drive_mix_start)
-    _drive_mix_final = jnp.float32(drive_mix_final)
-    _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
-    _admission_floor_hold_frac = jnp.float32(admission_floor_hold_frac)
-    _admission_floor_end_frac = jnp.float32(admission_floor_end_frac)
-    _drive_baseline_qk = jnp.float32(drive_baseline_qk)
-    _drive_baseline_v = jnp.float32(drive_baseline_v)
-    _drive_baseline_rst = jnp.float32(drive_baseline_rst)
-    _boundary_drive_ratio_start_frac = float(boundary_drive_ratio_start_frac)
-    _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
+    _admission_den_power = jnp.float32(admission_den_power)
 
     @jax.jit
     def analysis_step(params, input_ids, attention_mask, step):
@@ -5262,44 +4823,8 @@ def create_analysis_step(model, sharded_fns=None,
                 _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
-        admission_floor = scheduled_admission_floor_by_frac(
-            step, _total_training_steps,
-            _admission_floor_hold_frac, _admission_floor_end_frac)
-        boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
-            step, _total_training_steps,
-            _boundary_drive_ratio_start_frac,
-            _boundary_drive_ratio_end_frac)
-        den_power_p = scheduled_den_power_by_frac(
-            step, _total_training_steps,
-            _v4164_den_power_schedule, _v4164_den_power,
-            _v4164_den_power_base, _v4164_den_power_peak,
-            _v4164_den_power_mid, _v4164_den_power_final,
-            _v4164_den_power_up_start_frac,
-            _v4164_den_power_peak_frac,
-            _v4164_den_power_hold_end_frac,
-            _v4164_den_power_mid_frac,
-            _v4164_den_power_down_end_frac)
-        if _pass_admission_floor_kw:
-            extra_kw['admission_floor'] = admission_floor
-            extra_kw['drive_baseline_qk'] = _drive_baseline_qk
-            extra_kw['drive_baseline_v'] = _drive_baseline_v
-            extra_kw['drive_baseline_rst'] = _drive_baseline_rst
-        if _pass_boundary_drive_ratio_kw:
-            extra_kw['boundary_drive_ratio'] = boundary_drive_ratio
-        elif _pass_drive_mix_kw:
-            extra_kw['drive_mix'] = jnp.where(
-                jnp.asarray(_drive_anneal_enabled),
-                _scheduled_scalar(
-                    step, _total_training_steps,
-                    _drive_mix_start, _drive_mix_final,
-                    0.0, _drive_mix_end_frac,
-                    'cosine'),
-                jnp.float32(1.0))
-            extra_kw['drive_ref_qk'] = _drive_ref_qk
-            extra_kw['drive_ref_v'] = _drive_ref_v
-            extra_kw['drive_ref_rst'] = _drive_ref_rst
         if _pass_den_power_kw:
-            extra_kw['v4164_den_power'] = den_power_p
+            extra_kw['admission_den_power'] = _admission_den_power
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         result = model.apply(
@@ -5431,31 +4956,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                             soft_gate_boundary_power_start_frac=0.0,
                             soft_gate_boundary_power_mid_frac=0.800,
                             soft_gate_boundary_power_final_frac=0.950,
-                            v4164_den_power=1.0,
-                            v4164_den_power_schedule='constant',
-                            v4164_den_power_base=1.0,
-                            v4164_den_power_peak=1.0,
-                            v4164_den_power_mid=1.0,
-                            v4164_den_power_final=1.0,
-                            v4164_den_power_up_start_frac=0.0,
-                            v4164_den_power_peak_frac=0.0,
-                            v4164_den_power_hold_end_frac=0.0,
-                            v4164_den_power_mid_frac=0.0,
-                            v4164_den_power_down_end_frac=0.0,
-                            drive_anneal_enabled=False,
-                            drive_ref_qk=0.05,
-                            drive_ref_v=0.04,
-                            drive_ref_rst=0.04,
-                            drive_mix_start=1.0,
-                            drive_mix_final=1.0,
-                            drive_mix_end_frac=0.0,
-                     admission_floor_hold_frac=0.0,
-                     admission_floor_end_frac=0.0,
-                     drive_baseline_qk=0.012,
-                     drive_baseline_v=0.010,
-                     drive_baseline_rst=0.008,
-                     boundary_drive_ratio_start_frac=0.0,
-                     boundary_drive_ratio_end_frac=0.0):
+                            admission_den_power=1.0):
     """Event-only forward probe. No gradients, no optimizer updates.
 
     Two-pass design for v4.1.6.0+ focused spike debugging:
@@ -5472,10 +4973,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
-    _pass_drive_mix_kw = _model_accepts_drive_mix(model)
-    _pass_admission_floor_kw = _model_accepts_admission_floor(model)
-    _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
-    _pass_den_power_kw = _model_accepts_v4164_den_power(model)
+    _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
@@ -5523,34 +5021,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
-    _v4164_den_power = jnp.float32(v4164_den_power)
-    _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
-    _v4164_den_power_base = jnp.float32(v4164_den_power_base)
-    _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
-    _v4164_den_power_mid = jnp.float32(v4164_den_power_mid)
-    _v4164_den_power_final = jnp.float32(v4164_den_power_final)
-    _v4164_den_power_up_start_frac = jnp.float32(
-        v4164_den_power_up_start_frac)
-    _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
-    _v4164_den_power_hold_end_frac = jnp.float32(
-        v4164_den_power_hold_end_frac)
-    _v4164_den_power_mid_frac = jnp.float32(v4164_den_power_mid_frac)
-    _v4164_den_power_down_end_frac = jnp.float32(
-        v4164_den_power_down_end_frac)
-    _drive_anneal_enabled = bool(drive_anneal_enabled)
-    _drive_ref_qk = jnp.float32(drive_ref_qk)
-    _drive_ref_v = jnp.float32(drive_ref_v)
-    _drive_ref_rst = jnp.float32(drive_ref_rst)
-    _drive_mix_start = jnp.float32(drive_mix_start)
-    _drive_mix_final = jnp.float32(drive_mix_final)
-    _drive_mix_end_frac = jnp.float32(drive_mix_end_frac)
-    _admission_floor_hold_frac = jnp.float32(admission_floor_hold_frac)
-    _admission_floor_end_frac = jnp.float32(admission_floor_end_frac)
-    _drive_baseline_qk = jnp.float32(drive_baseline_qk)
-    _drive_baseline_v = jnp.float32(drive_baseline_v)
-    _drive_baseline_rst = jnp.float32(drive_baseline_rst)
-    _boundary_drive_ratio_start_frac = float(boundary_drive_ratio_start_frac)
-    _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
+    _admission_den_power = jnp.float32(admission_den_power)
     _topk = int(topk)
 
     @jax.jit
@@ -5588,44 +5059,8 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                 _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
-        admission_floor = scheduled_admission_floor_by_frac(
-            step, _total_training_steps,
-            _admission_floor_hold_frac, _admission_floor_end_frac)
-        boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
-            step, _total_training_steps,
-            _boundary_drive_ratio_start_frac,
-            _boundary_drive_ratio_end_frac)
-        den_power_p = scheduled_den_power_by_frac(
-            step, _total_training_steps,
-            _v4164_den_power_schedule, _v4164_den_power,
-            _v4164_den_power_base, _v4164_den_power_peak,
-            _v4164_den_power_mid, _v4164_den_power_final,
-            _v4164_den_power_up_start_frac,
-            _v4164_den_power_peak_frac,
-            _v4164_den_power_hold_end_frac,
-            _v4164_den_power_mid_frac,
-            _v4164_den_power_down_end_frac)
-        if _pass_admission_floor_kw:
-            extra_kw['admission_floor'] = admission_floor
-            extra_kw['drive_baseline_qk'] = _drive_baseline_qk
-            extra_kw['drive_baseline_v'] = _drive_baseline_v
-            extra_kw['drive_baseline_rst'] = _drive_baseline_rst
-        if _pass_boundary_drive_ratio_kw:
-            extra_kw['boundary_drive_ratio'] = boundary_drive_ratio
-        elif _pass_drive_mix_kw:
-            extra_kw['drive_mix'] = jnp.where(
-                jnp.asarray(_drive_anneal_enabled),
-                _scheduled_scalar(
-                    step, _total_training_steps,
-                    _drive_mix_start, _drive_mix_final,
-                    0.0, _drive_mix_end_frac,
-                    'cosine'),
-                jnp.float32(1.0))
-            extra_kw['drive_ref_qk'] = _drive_ref_qk
-            extra_kw['drive_ref_v'] = _drive_ref_v
-            extra_kw['drive_ref_rst'] = _drive_ref_rst
         if _pass_den_power_kw:
-            extra_kw['v4164_den_power'] = den_power_p
+            extra_kw['admission_den_power'] = _admission_den_power
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         result = model.apply(
@@ -6762,148 +6197,6 @@ def _rec_float(rec, key, default=0.0):
     return float(rec.get(key, default) or 0.0)
 
 
-def _is_v4165_compact_console(ctx):
-    return (
-        ctx.get('model_version') == V4165_MODEL_VERSION
-        and str(ctx.get('regular_console_level', 'compact')).lower()
-        == 'compact')
-
-
-def _fmt_v4165_active_tau(rec, pool):
-    frac = _rec_float(rec, f'{pool}_active_tau_frac')
-    count = _rec_float(rec, f'{pool}_active_tau_count')
-    return f"{frac * 100:.2f}%({count:.1f})"
-
-
-def _fmt_v4165_threshold_pct(rec, pool, prefix):
-    return f"{_rec_float(rec, f'{pool}_{prefix}_frac') * 100:.2f}"
-
-
-def _fmt_v4165_triplet(rec, keys, fmt):
-    return (
-        f"qk={fmt(_rec_float(rec, keys[0]))} "
-        f"v={fmt(_rec_float(rec, keys[1]))} "
-        f"rst={fmt(_rec_float(rec, keys[2]))}")
-
-
-def _v4165_util(rec, mass_key, load_key):
-    load = _rec_float(rec, load_key)
-    mass = _rec_float(rec, mass_key)
-    return mass / max(load, 1.0e-8)
-
-
-def _v4165_drive_mean(rec, pool):
-    return _rec_float(
-        rec, f'{pool}_drive_mean',
-        _rec_float(rec, f'{pool}_angular_depth_mean'))
-
-
-def _v4165_drive_max(rec, pool):
-    return _rec_float(
-        rec, f'{pool}_drive_max',
-        _rec_float(rec, f'{pool}_angular_depth_max'))
-
-
-def _print_v4165_warning_line(rec, ctx):
-    parts = []
-    top1_warn = float(ctx.get('regular_console_top1_warn', 0.05))
-    top1 = (
-        _rec_float(rec, 'attn_qk_compose_top1_frac_max',
-                   _rec_float(rec, 'attn_qk_compose_top1_frac')),
-        _rec_float(rec, 'attn_v_compose_top1_frac_max',
-                   _rec_float(rec, 'attn_v_compose_top1_frac')),
-        _rec_float(rec, 'rst_compose_top1_frac_max',
-                   _rec_float(rec, 'rst_compose_top1_frac')),
-    )
-    if top1_warn > 0.0 and max(top1) > top1_warn:
-        parts.append(
-            f"top1 qk={top1[0]:.3f} v={top1[1]:.3f} rst={top1[2]:.3f}")
-
-    drive_warn = float(ctx.get('regular_console_drive_max_warn', 1.20))
-    drive_max = (
-        _v4165_drive_max(rec, 'attn_qk'),
-        _v4165_drive_max(rec, 'attn_v'),
-        _v4165_drive_max(rec, 'rst'),
-    )
-    if drive_warn > 0.0 and max(drive_max) > drive_warn:
-        parts.append(
-            "drive_max["
-            f"qk={drive_max[0]:.2f} v={drive_max[1]:.2f} "
-            f"rst={drive_max[2]:.2f}]")
-
-    no_active = (
-        _rec_float(rec, 'attn_qk_no_active_frac'),
-        _rec_float(rec, 'attn_v_no_active_frac'),
-        _rec_float(rec, 'rst_no_active_frac'),
-    )
-    if max(no_active) > 0.0:
-        parts.append(
-            "no_active["
-            f"qk={no_active[0] * 100:.2f}% "
-            f"v={no_active[1] * 100:.2f}% "
-            f"rst={no_active[2] * 100:.2f}%]")
-
-    if parts:
-        log_message("warn: " + " ".join(parts))
-
-
-def _print_v4165_compact_regular_block(rec, ctx):
-    log_message(
-        "route: "
-        f"active_tau qk={_fmt_v4165_active_tau(rec, 'attn_qk')} "
-        f"q/k={_rec_float(rec, 'attn_q_active_tau_frac') * 100:.2f}/"
-        f"{_rec_float(rec, 'attn_k_active_tau_frac') * 100:.2f} "
-        f"v={_fmt_v4165_active_tau(rec, 'attn_v')} "
-        f"rst={_fmt_v4165_active_tau(rec, 'rst')} | "
-        "adm@1e-2 "
-        f"qk={_fmt_v4165_threshold_pct(rec, 'attn_qk', 'admission_active_eps_1e_2')} "
-        f"v={_fmt_v4165_threshold_pct(rec, 'attn_v', 'admission_active_eps_1e_2')} "
-        f"rst={_fmt_v4165_threshold_pct(rec, 'rst', 'admission_active_eps_1e_2')} | "
-        "weight@1e-2 "
-        f"qk={_fmt_v4165_threshold_pct(rec, 'attn_qk', 'active_eps_1e_2')} "
-        f"v={_fmt_v4165_threshold_pct(rec, 'attn_v', 'active_eps_1e_2')} "
-        f"rst={_fmt_v4165_threshold_pct(rec, 'rst', 'active_eps_1e_2')}"
-    )
-    log_message(
-        "sched: "
-        f"floor={_rec_float(rec, 'admission_floor', 0.0):.3f} "
-        f"boundary_ratio={_rec_float(rec, 'boundary_drive_ratio', 1.0):.3f} "
-        f"B[qk={_rec_float(rec, 'soft_gate_T_qk'):.5f} "
-        f"v={_rec_float(rec, 'soft_gate_T_v'):.5f} "
-        f"rst={_rec_float(rec, 'soft_gate_T_rst'):.5f}] "
-        f"p={_rec_float(rec, 'boundary_power_p', 2.0):.3f} "
-        f"den_p={_rec_float(rec, 'v4164_den_power', 1.0):.3f}"
-    )
-    log_message(
-        "state: "
-        f"tau[{_fmt_v4165_triplet(rec, ('attn_qk_tau_mean', 'attn_v_tau_mean', 'rst_tau_mean'), lambda x: f'{x:.3f}')}] "
-        f"margin[{_fmt_v4165_triplet(rec, ('attn_qk_selection_margin_mean', 'attn_v_selection_margin_mean', 'rst_selection_margin_mean'), lambda x: f'{x:.3f}')}] "
-        f"adm_mean[{_fmt_v4165_triplet(rec, ('attn_qk_admission_mean', 'attn_v_admission_mean', 'rst_admission_mean'), lambda x: f'{x:.3f}')}]"
-    )
-    load_qk = _rec_float(rec, 'attn_qk_load')
-    load_v = _rec_float(rec, 'attn_v_load')
-    load_rst = _rec_float(rec, 'rst_load')
-    mass_qk = _rec_float(rec, 'attn_qk_mass')
-    mass_v = _rec_float(rec, 'attn_v_mass')
-    mass_rst = _rec_float(rec, 'rst_mass')
-    log_message(
-        "rw: "
-        f"drive_mean[qk={_v4165_drive_mean(rec, 'attn_qk'):.4f} "
-        f"v={_v4165_drive_mean(rec, 'attn_v'):.4f} "
-        f"rst={_v4165_drive_mean(rec, 'rst'):.4f}] "
-        f"load[qk={load_qk:.1f} v={load_v:.1f} rst={load_rst:.1f}] "
-        f"mass[qk={mass_qk:.1f} v={mass_v:.1f} rst={mass_rst:.1f}] "
-        f"util[qk={_v4165_util(rec, 'attn_qk_mass', 'attn_qk_load'):.3f} "
-        f"v={_v4165_util(rec, 'attn_v_mass', 'attn_v_load'):.3f} "
-        f"rst={_v4165_util(rec, 'rst_mass', 'rst_load'):.3f}]"
-    )
-    _print_v4165_warning_line(rec, ctx)
-    log_message(
-        f"time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
-        f" {ctx['s_per_it']:.2f}s/it"
-    )
-
-
 def _print_regular_host_timing(raw_step_time_window, logging_time, ctx):
     mode = str(ctx.get('regular_console_host_timing', 'always')).lower()
     if mode in ('off', 'false', 'none'):
@@ -7234,10 +6527,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'boundary_power_p': float(m.get(
             'boundary_power_p',
             m.get('soft_gate_boundary_power', 2.0))),
-        'v4164_den_power': float(m.get(
-            'v4164_den_power', m.get('den_power', 1.0))),
+        'admission_den_power': float(m.get(
+            'admission_den_power', m.get('den_power', 1.0))),
         'den_power': float(m.get(
-            'den_power', m.get('v4164_den_power', 1.0))),
+            'den_power', m.get('admission_den_power', 1.0))),
         'soft_gate_schedule': ctx.get('soft_gate_schedule', 'cosine'),
         'soft_gate_t_gompertz_center': float(ctx.get(
             'soft_gate_t_gompertz_center', 0.25)),
@@ -7459,10 +6752,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'drift_attn_v_emb': float(m.get('drift_attn_v_emb', 0.0)),
         'drift_rst_emb': float(m.get('drift_rst_emb', 0.0)),
         # Core activity.
-        'admission_floor': float(m.get('admission_floor', 0.0)),
-        'boundary_drive_ratio': float(m.get(
-            'boundary_drive_ratio', m.get('drive_mix', 1.0))),
-        'drive_mix': float(m.get('drive_mix', m.get('boundary_drive_ratio', 1.0))),
         'drive_mean': float(m.get('drive_mean', 0.0)),
         'drive_max': float(m.get('drive_max', 0.0)),
         'attn_qk_drive_mean': float(m.get('attn_qk_drive_mean', 0.0)),
@@ -7569,42 +6858,42 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_qk_admission_den_sum': float(m.get('attn_qk_admission_den_sum', 0.0)),
         'attn_v_admission_den_sum': float(m.get('attn_v_admission_den_sum', 0.0)),
         'rst_admission_den_sum': float(m.get('rst_admission_den_sum', 0.0)),
-        'compose_mass_sum': float(m.get('compose_mass_sum', 0.0)),
-        'attn_compose_mass_sum': float(m.get('attn_compose_mass_sum', 0.0)),
-        'attn_qk_compose_mass_sum': float(m.get('attn_qk_compose_mass_sum', 0.0)),
-        'attn_v_compose_mass_sum': float(m.get('attn_v_compose_mass_sum', 0.0)),
-        'rst_compose_mass_sum': float(m.get('rst_compose_mass_sum', 0.0)),
+        'execution_mass_sum': float(m.get('execution_mass_sum', 0.0)),
+        'attn_execution_mass_sum': float(m.get('attn_execution_mass_sum', 0.0)),
+        'attn_qk_execution_mass_sum': float(m.get('attn_qk_execution_mass_sum', 0.0)),
+        'attn_v_execution_mass_sum': float(m.get('attn_v_execution_mass_sum', 0.0)),
+        'rst_execution_mass_sum': float(m.get('rst_execution_mass_sum', 0.0)),
         'attn_qk_load': float(m.get('attn_qk_admission_den_sum', 0.0)),
         'attn_v_load': float(m.get('attn_v_admission_den_sum', 0.0)),
         'rst_load': float(m.get('rst_admission_den_sum', 0.0)),
-        'attn_qk_mass': float(m.get('attn_qk_compose_mass_sum', 0.0)),
-        'attn_v_mass': float(m.get('attn_v_compose_mass_sum', 0.0)),
-        'rst_mass': float(m.get('rst_compose_mass_sum', 0.0)),
-        'angular_depth_mean': float(m.get('angular_depth_mean', 0.0)),
-        'attn_angular_depth_mean': float(m.get('attn_angular_depth_mean', 0.0)),
-        'attn_qk_angular_depth_mean': float(m.get('attn_qk_angular_depth_mean', 0.0)),
-        'attn_v_angular_depth_mean': float(m.get('attn_v_angular_depth_mean', 0.0)),
-        'rst_angular_depth_mean': float(m.get('rst_angular_depth_mean', 0.0)),
-        'angular_depth_max': float(m.get('angular_depth_max', 0.0)),
-        'attn_angular_depth_max': float(m.get('attn_angular_depth_max', 0.0)),
-        'attn_qk_angular_depth_max': float(m.get('attn_qk_angular_depth_max', 0.0)),
-        'attn_v_angular_depth_max': float(m.get('attn_v_angular_depth_max', 0.0)),
-        'rst_angular_depth_max': float(m.get('rst_angular_depth_max', 0.0)),
-        'compose_eff_n': float(m.get('compose_eff_n', 0.0)),
-        'attn_compose_eff_n': float(m.get('attn_compose_eff_n', 0.0)),
-        'attn_qk_compose_eff_n': float(m.get('attn_qk_compose_eff_n', 0.0)),
-        'attn_v_compose_eff_n': float(m.get('attn_v_compose_eff_n', 0.0)),
-        'rst_compose_eff_n': float(m.get('rst_compose_eff_n', 0.0)),
-        'compose_top1_frac': float(m.get('compose_top1_frac', 0.0)),
-        'compose_top1_frac_max': float(m.get('compose_top1_frac_max', 0.0)),
-        'attn_compose_top1_frac': float(m.get('attn_compose_top1_frac', 0.0)),
-        'attn_compose_top1_frac_max': float(m.get('attn_compose_top1_frac_max', 0.0)),
-        'attn_qk_compose_top1_frac': float(m.get('attn_qk_compose_top1_frac', 0.0)),
-        'attn_qk_compose_top1_frac_max': float(m.get('attn_qk_compose_top1_frac_max', 0.0)),
-        'attn_v_compose_top1_frac': float(m.get('attn_v_compose_top1_frac', 0.0)),
-        'attn_v_compose_top1_frac_max': float(m.get('attn_v_compose_top1_frac_max', 0.0)),
-        'rst_compose_top1_frac': float(m.get('rst_compose_top1_frac', 0.0)),
-        'rst_compose_top1_frac_max': float(m.get('rst_compose_top1_frac_max', 0.0)),
+        'attn_qk_mass': float(m.get('attn_qk_execution_mass_sum', 0.0)),
+        'attn_v_mass': float(m.get('attn_v_execution_mass_sum', 0.0)),
+        'rst_mass': float(m.get('rst_execution_mass_sum', 0.0)),
+        'drive_mean': float(m.get('drive_mean', 0.0)),
+        'attn_drive_mean': float(m.get('attn_drive_mean', 0.0)),
+        'attn_qk_drive_mean': float(m.get('attn_qk_drive_mean', 0.0)),
+        'attn_v_drive_mean': float(m.get('attn_v_drive_mean', 0.0)),
+        'rst_drive_mean': float(m.get('rst_drive_mean', 0.0)),
+        'drive_max': float(m.get('drive_max', 0.0)),
+        'attn_drive_max': float(m.get('attn_drive_max', 0.0)),
+        'attn_qk_drive_max': float(m.get('attn_qk_drive_max', 0.0)),
+        'attn_v_drive_max': float(m.get('attn_v_drive_max', 0.0)),
+        'rst_drive_max': float(m.get('rst_drive_max', 0.0)),
+        'execution_eff_n': float(m.get('execution_eff_n', 0.0)),
+        'attn_execution_eff_n': float(m.get('attn_execution_eff_n', 0.0)),
+        'attn_qk_execution_eff_n': float(m.get('attn_qk_execution_eff_n', 0.0)),
+        'attn_v_execution_eff_n': float(m.get('attn_v_execution_eff_n', 0.0)),
+        'rst_execution_eff_n': float(m.get('rst_execution_eff_n', 0.0)),
+        'execution_top1_frac': float(m.get('execution_top1_frac', 0.0)),
+        'execution_top1_frac_max': float(m.get('execution_top1_frac_max', 0.0)),
+        'attn_execution_top1_frac': float(m.get('attn_execution_top1_frac', 0.0)),
+        'attn_execution_top1_frac_max': float(m.get('attn_execution_top1_frac_max', 0.0)),
+        'attn_qk_execution_top1_frac': float(m.get('attn_qk_execution_top1_frac', 0.0)),
+        'attn_qk_execution_top1_frac_max': float(m.get('attn_qk_execution_top1_frac_max', 0.0)),
+        'attn_v_execution_top1_frac': float(m.get('attn_v_execution_top1_frac', 0.0)),
+        'attn_v_execution_top1_frac_max': float(m.get('attn_v_execution_top1_frac_max', 0.0)),
+        'rst_execution_top1_frac': float(m.get('rst_execution_top1_frac', 0.0)),
+        'rst_execution_top1_frac_max': float(m.get('rst_execution_top1_frac_max', 0.0)),
         'attn_gate_sum': float(m.get('attn_gate_sum', 0.0)),
         'rst_gate_sum': float(m.get('rst_gate_sum', 0.0)),
         'attn_active_n_mean': float(m.get('attn_active_n_mean', 0.0)),
@@ -7921,7 +7210,7 @@ def _format_output_stab_line(rec, indent="  "):
         f"{_g('rst_contrib_den_max'):.2g}/"
         f"{_g('rst_contrib_den_min'):.2g}/"
         f"{_g('rst_contrib_den_floor_frac'):.1e}] "
-        f"compose[a={_g('attn_compose_norm_mean', _g('attn_compose_norm')):.3f}/"
+        f"execution[a={_g('attn_compose_norm_mean', _g('attn_compose_norm')):.3f}/"
         f"{_g('attn_compose_norm_max'):.3f} "
         f"rst={_g('rst_compose_norm_mean', _g('rst_compose_norm')):.3f}/"
         f"{_g('rst_compose_norm_max'):.3f}] "
@@ -7998,16 +7287,6 @@ def _print_regular_block(rec, ctx):
         is_v4162_soft
         and str(ctx.get('regular_diagnostics_level', 'compact')).lower()
         == 'compact')
-    if _is_v4165_compact_console(ctx):
-        log_message(
-            f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
-            f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} "
-            f"aux={rec['aux_loss']:.4f} | "
-            f"grad={rec['grad_norm']:.2f} | "
-            f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
-        )
-        _print_v4165_compact_regular_block(rec, ctx)
-        return
     aux_note = (
         " aux_is_not_total_minus_ce"
         if is_v4162_soft
@@ -8039,7 +7318,7 @@ def _print_regular_block(rec, ctx):
                 else 'soft_gate_T')
             _power_part = (
                 f" boundary_power_p={rec.get('boundary_power_p', 2.0):.3f}"
-                f" den_p={rec.get('v4164_den_power', rec.get('den_power', 1.0)):.3f}"
+                f" admission_den_power={rec.get('admission_den_power', rec.get('den_power', 1.0)):.3f}"
                 if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
                 else "")
             log_message(
@@ -8197,64 +7476,34 @@ def _print_regular_block(rec, ctx):
                 f" v={rec['attn_v_pool_scale']:.3f}"
                 f" rst={rec['rst_pool_scale']:.3f}")
         if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
-            if ctx.get('model_version') == V4165_MODEL_VERSION:
-                log_message(
-                    f"  drive: "
-                    f"qk[m={_v4165_drive_mean(rec, 'attn_qk'):.5f}"
-                    f" max={_v4165_drive_max(rec, 'attn_qk'):.5f}] "
-                    f"v[m={_v4165_drive_mean(rec, 'attn_v'):.5f}"
-                    f" max={_v4165_drive_max(rec, 'attn_v'):.5f}] "
-                    f"rst[m={_v4165_drive_mean(rec, 'rst'):.5f}"
-                    f" max={_v4165_drive_max(rec, 'rst'):.5f}]"
-                )
-                log_message(
-                    f"  load: qk={rec['attn_qk_admission_den_sum']:.1f}"
-                    f" v={rec['attn_v_admission_den_sum']:.1f}"
-                    f" rst={rec['rst_admission_den_sum']:.1f}"
-                )
-                log_message(
-                    f"  mass: qk={rec['attn_qk_compose_mass_sum']:.1f}"
-                    f" v={rec['attn_v_compose_mass_sum']:.1f}"
-                    f" rst={rec['rst_compose_mass_sum']:.1f}"
-                )
-                log_message(
-                    f"  weight_conc: qk[eff={rec['attn_qk_compose_eff_n']:.1f}"
-                    f" top1={rec['attn_qk_compose_top1_frac']:.3f}]"
-                    f" v[eff={rec['attn_v_compose_eff_n']:.1f}"
-                    f" top1={rec['attn_v_compose_top1_frac']:.3f}]"
-                    f" rst[eff={rec['rst_compose_eff_n']:.1f}"
-                    f" top1={rec['rst_compose_top1_frac']:.3f}]"
-                    f"{_pool_scale_part}"
-                )
-            else:
-                log_message(
-                    f"  angular_depth: "
-                    f"qk[m={rec['attn_qk_angular_depth_mean']:.5f}"
-                    f" max={rec['attn_qk_angular_depth_max']:.5f}] "
-                    f"v[m={rec['attn_v_angular_depth_mean']:.5f}"
-                    f" max={rec['attn_v_angular_depth_max']:.5f}] "
-                    f"rst[m={rec['rst_angular_depth_mean']:.5f}"
-                    f" max={rec['rst_angular_depth_max']:.5f}]"
-                )
-                log_message(
-                    f"  admission_den: qk={rec['attn_qk_admission_den_sum']:.1f}"
-                    f" v={rec['attn_v_admission_den_sum']:.1f}"
-                    f" rst={rec['rst_admission_den_sum']:.1f}"
-                )
-                log_message(
-                    f"  compose_mass: qk={rec['attn_qk_compose_mass_sum']:.1f}"
-                    f" v={rec['attn_v_compose_mass_sum']:.1f}"
-                    f" rst={rec['rst_compose_mass_sum']:.1f}"
-                )
-                log_message(
-                    f"  compose_conc: qk[eff={rec['attn_qk_compose_eff_n']:.1f}"
-                    f" top1={rec['attn_qk_compose_top1_frac']:.3f}]"
-                    f" v[eff={rec['attn_v_compose_eff_n']:.1f}"
-                    f" top1={rec['attn_v_compose_top1_frac']:.3f}]"
-                    f" rst[eff={rec['rst_compose_eff_n']:.1f}"
-                    f" top1={rec['rst_compose_top1_frac']:.3f}]"
-                    f"{_pool_scale_part}"
-                )
+            log_message(
+                f"  drive: "
+                f"qk[m={rec['attn_qk_drive_mean']:.5f}"
+                f" max={rec['attn_qk_drive_max']:.5f}] "
+                f"v[m={rec['attn_v_drive_mean']:.5f}"
+                f" max={rec['attn_v_drive_max']:.5f}] "
+                f"rst[m={rec['rst_drive_mean']:.5f}"
+                f" max={rec['rst_drive_max']:.5f}]"
+            )
+            log_message(
+                f"  admission_den: qk={rec['attn_qk_admission_den_sum']:.1f}"
+                f" v={rec['attn_v_admission_den_sum']:.1f}"
+                f" rst={rec['rst_admission_den_sum']:.1f}"
+            )
+            log_message(
+                f"  execution_mass: qk={rec['attn_qk_execution_mass_sum']:.1f}"
+                f" v={rec['attn_v_execution_mass_sum']:.1f}"
+                f" rst={rec['rst_execution_mass_sum']:.1f}"
+            )
+            log_message(
+                f"  execution_conc: qk[eff={rec['attn_qk_execution_eff_n']:.1f}"
+                f" top1={rec['attn_qk_execution_top1_frac']:.3f}]"
+                f" v[eff={rec['attn_v_execution_eff_n']:.1f}"
+                f" top1={rec['attn_v_execution_top1_frac']:.3f}]"
+                f" rst[eff={rec['rst_execution_eff_n']:.1f}"
+                f" top1={rec['rst_execution_top1_frac']:.3f}]"
+                f"{_pool_scale_part}"
+            )
         else:
             log_message(
                 f"  gate_conc: qk[eff={rec['attn_qk_gate_eff_n']:.1f}"
@@ -8286,13 +7535,13 @@ def _print_regular_block(rec, ctx):
                 pass
             else:
                 log_message(
-                    f"  gate_den_sum mean[qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
+                    f"  admission_den mean[qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
                     f" v={rec['attn_v_gate_den_sum_mean']:.1f}"
                     f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
                 )
         else:
             log_message(
-                f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
+                f"  admission_den mean[a={rec['attn_gate_den_sum_mean']:.1f}"
                 f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
             )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
@@ -10036,7 +9285,7 @@ def _print_debug_block(rec, ctx):
             else 'soft_gate_T')
         _power_part = (
             f" boundary_power_p={_g('boundary_power_p', 2.0):.3f}"
-            f" den_p={_g('v4164_den_power', _g('den_power', 1.0)):.3f}"
+            f" admission_den_power={_g('admission_den_power', _g('den_power', 1.0)):.3f}"
             if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
             else "")
         log_debug_message(
@@ -10271,7 +9520,7 @@ def _print_debug_block(rec, ctx):
             f"strong[q={_g('attn_q_strong'):.4f} "
             f"k={_g('attn_k_strong'):.4f} "
             f"v={_g('attn_v_strong'):.4f} rst={_g('rst_strong'):.4f}] "
-            f"den[qk={_g('attn_qk_gate_den_sum_mean'):.3f} "
+            f"admission_den[qk={_g('attn_qk_gate_den_sum_mean'):.3f} "
             f"v={_g('attn_v_gate_den_sum_mean'):.3f} "
             f"rst={_g('rst_gate_den_sum_mean'):.3f}] "
             f"eff[qk={_g('attn_qk_gate_eff_n'):.3f}/{_g('attn_qk_gate_eff_ratio'):.4f} "
@@ -10283,7 +9532,7 @@ def _print_debug_block(rec, ctx):
             f"v_max={_g('attn_v_top1_gate_frac_max'):.4f} "
             f"rst_m={_g('rst_top1_gate_frac'):.4f} "
             f"rst_max={_g('rst_top1_gate_frac_max'):.4f}] "
-            f"gate_max[qk={_g('attn_qk_raw_gate_max'):.3f} "
+            f"admission_max[qk={_g('attn_qk_raw_gate_max'):.3f} "
             f"v={_g('attn_v_raw_gate_max'):.3f} "
             f"rst={_g('rst_raw_gate_max'):.3f}]"
         )
@@ -10296,11 +9545,11 @@ def _print_debug_block(rec, ctx):
             f"v={_g('attn_v_active'):.4f} rst={_g('rst_active'):.4f}] "
             f"strong[qk={_g('attn_qk_strong'):.4f} "
             f"v={_g('attn_v_strong'):.4f} rst={_g('rst_strong'):.4f}] "
-            f"den[attn={_g('attn_gate_den_sum_mean'):.3f} "
+            f"admission_den[attn={_g('attn_gate_den_sum_mean'):.3f} "
             f"rst={_g('rst_gate_den_sum_mean'):.3f}] "
             f"contrib[attn={_g('attn_contrib_den_sum'):.3f} "
             f"rst={_g('rst_contrib_den_sum'):.3f}] "
-            f"compose[attn={_g('attn_compose_norm'):.4f} "
+            f"execution_weight[attn={_g('attn_compose_norm'):.4f} "
             f"rst={_g('rst_compose_norm'):.4f}] "
             f"den_ratio[attn={_g('attn_den_ratio'):.4f} "
             f"rst={_g('rst_den_ratio'):.4f}] "
@@ -10360,17 +9609,8 @@ def _print_debug_block(rec, ctx):
             f"{_select_status}"
         )
     if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
-        _is_v4165 = ctx.get('model_version') == V4165_MODEL_VERSION
-        _threshold_label = (
-            'v4165_thresholds' if _is_v4165 else 'v4164_thresholds')
-        _drive_load_label = (
-            'v4165_drive_load' if _is_v4165 else 'v4164_depth')
-        _weight_label = 'weight' if _is_v4165 else 'compose'
-        _drive_label = 'drive' if _is_v4165 else 'angular_depth'
-        _load_label = 'load' if _is_v4165 else 'admission_den'
-        _mass_label = 'weight_mass' if _is_v4165 else 'compose_mass'
         log_debug_message(
-            f"{_threshold_label}: active_tau["
+            "v4164_thresholds: active_tau["
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool: _fmt_sparsity_frac_count(
@@ -10388,19 +9628,19 @@ def _print_debug_block(rec, ctx):
                 lambda pool: _fmt_sparsity_frac_count(
                     rec, pool, 'admission_active_eps_1e_1'),
                 pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + f"] {_weight_label}@1e-4["
+            + "] execution_weight@1e-4["
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool: _fmt_sparsity_frac_count(
                     rec, pool, 'active_eps_1e_4'),
                 pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + f"] {_weight_label}@1e-3["
+            + "] execution_weight@1e-3["
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool: _fmt_sparsity_frac_count(
                     rec, pool, 'active_eps_1e_3'),
                 pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + f"] {_weight_label}@1e-2["
+            + "] execution_weight@1e-2["
             + _fmt_sparsity_pool_values(
                 rec,
                 lambda pool: _fmt_sparsity_frac_count(
@@ -10409,19 +9649,19 @@ def _print_debug_block(rec, ctx):
             + "]"
         )
         log_debug_message(
-            f"{_drive_load_label}: "
-            f"qk[{_drive_label}_m={_g('attn_qk_angular_depth_mean'):.6f} "
-            f"max={_g('attn_qk_angular_depth_max'):.6f}] "
-            f"v[{_drive_label}_m={_g('attn_v_angular_depth_mean'):.6f} "
-            f"max={_g('attn_v_angular_depth_max'):.6f}] "
-            f"rst[{_drive_label}_m={_g('rst_angular_depth_mean'):.6f} "
-            f"max={_g('rst_angular_depth_max'):.6f}] "
-            f"{_load_label}[qk={_g('attn_qk_admission_den_sum'):.3f} "
+            "v4164_drive_admission_den: "
+            f"qk[drive_m={_g('attn_qk_drive_mean'):.6f} "
+            f"max={_g('attn_qk_drive_max'):.6f}] "
+            f"v[drive_m={_g('attn_v_drive_mean'):.6f} "
+            f"max={_g('attn_v_drive_max'):.6f}] "
+            f"rst[drive_m={_g('rst_drive_mean'):.6f} "
+            f"max={_g('rst_drive_max'):.6f}] "
+            f"admission_den[qk={_g('attn_qk_admission_den_sum'):.3f} "
             f"v={_g('attn_v_admission_den_sum'):.3f} "
             f"rst={_g('rst_admission_den_sum'):.3f}] "
-            f"{_mass_label}[qk={_g('attn_qk_compose_mass_sum'):.3f} "
-            f"v={_g('attn_v_compose_mass_sum'):.3f} "
-            f"rst={_g('rst_compose_mass_sum'):.3f}]"
+            f"execution_mass[qk={_g('attn_qk_execution_mass_sum'):.3f} "
+            f"v={_g('attn_v_execution_mass_sum'):.3f} "
+            f"rst={_g('rst_execution_mass_sum'):.3f}]"
         )
     route_std_label = (
         "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
@@ -10634,7 +9874,7 @@ def _print_debug_analysis_block(rec, ctx):
         f"rst={_g('rst_out_norm'):.6f}] "
         f"contrib_den[attn={_g('attn_contrib_den_sum'):.6f} "
         f"rst={_g('rst_contrib_den_sum'):.6f}] "
-        f"compose[attn={_g('attn_compose_norm'):.6f} "
+        f"execution[attn={_g('attn_compose_norm'):.6f} "
         f"rst={_g('rst_compose_norm'):.6f}] "
         f"resid_mean={_g('debug_residual_norm'):.6f} "
         f"resid_max={_g('debug_residual_norm_max'):.6f} "
@@ -10794,42 +10034,42 @@ def _build_analysis_record(base, metrics, ctx):
         'attn_qk_admission_den_sum': float(m.get('attn_qk_admission_den_sum', 0.0)),
         'attn_v_admission_den_sum': float(m.get('attn_v_admission_den_sum', 0.0)),
         'rst_admission_den_sum': float(m.get('rst_admission_den_sum', 0.0)),
-        'compose_mass_sum': float(m.get('compose_mass_sum', 0.0)),
-        'attn_compose_mass_sum': float(m.get('attn_compose_mass_sum', 0.0)),
-        'attn_qk_compose_mass_sum': float(m.get('attn_qk_compose_mass_sum', 0.0)),
-        'attn_v_compose_mass_sum': float(m.get('attn_v_compose_mass_sum', 0.0)),
-        'rst_compose_mass_sum': float(m.get('rst_compose_mass_sum', 0.0)),
+        'execution_mass_sum': float(m.get('execution_mass_sum', 0.0)),
+        'attn_execution_mass_sum': float(m.get('attn_execution_mass_sum', 0.0)),
+        'attn_qk_execution_mass_sum': float(m.get('attn_qk_execution_mass_sum', 0.0)),
+        'attn_v_execution_mass_sum': float(m.get('attn_v_execution_mass_sum', 0.0)),
+        'rst_execution_mass_sum': float(m.get('rst_execution_mass_sum', 0.0)),
         'attn_qk_load': float(m.get('attn_qk_admission_den_sum', 0.0)),
         'attn_v_load': float(m.get('attn_v_admission_den_sum', 0.0)),
         'rst_load': float(m.get('rst_admission_den_sum', 0.0)),
-        'attn_qk_mass': float(m.get('attn_qk_compose_mass_sum', 0.0)),
-        'attn_v_mass': float(m.get('attn_v_compose_mass_sum', 0.0)),
-        'rst_mass': float(m.get('rst_compose_mass_sum', 0.0)),
-        'angular_depth_mean': float(m.get('angular_depth_mean', 0.0)),
-        'attn_angular_depth_mean': float(m.get('attn_angular_depth_mean', 0.0)),
-        'attn_qk_angular_depth_mean': float(m.get('attn_qk_angular_depth_mean', 0.0)),
-        'attn_v_angular_depth_mean': float(m.get('attn_v_angular_depth_mean', 0.0)),
-        'rst_angular_depth_mean': float(m.get('rst_angular_depth_mean', 0.0)),
-        'angular_depth_max': float(m.get('angular_depth_max', 0.0)),
-        'attn_angular_depth_max': float(m.get('attn_angular_depth_max', 0.0)),
-        'attn_qk_angular_depth_max': float(m.get('attn_qk_angular_depth_max', 0.0)),
-        'attn_v_angular_depth_max': float(m.get('attn_v_angular_depth_max', 0.0)),
-        'rst_angular_depth_max': float(m.get('rst_angular_depth_max', 0.0)),
-        'compose_eff_n': float(m.get('compose_eff_n', 0.0)),
-        'attn_compose_eff_n': float(m.get('attn_compose_eff_n', 0.0)),
-        'attn_qk_compose_eff_n': float(m.get('attn_qk_compose_eff_n', 0.0)),
-        'attn_v_compose_eff_n': float(m.get('attn_v_compose_eff_n', 0.0)),
-        'rst_compose_eff_n': float(m.get('rst_compose_eff_n', 0.0)),
-        'compose_top1_frac': float(m.get('compose_top1_frac', 0.0)),
-        'compose_top1_frac_max': float(m.get('compose_top1_frac_max', 0.0)),
-        'attn_compose_top1_frac': float(m.get('attn_compose_top1_frac', 0.0)),
-        'attn_compose_top1_frac_max': float(m.get('attn_compose_top1_frac_max', 0.0)),
-        'attn_qk_compose_top1_frac': float(m.get('attn_qk_compose_top1_frac', 0.0)),
-        'attn_qk_compose_top1_frac_max': float(m.get('attn_qk_compose_top1_frac_max', 0.0)),
-        'attn_v_compose_top1_frac': float(m.get('attn_v_compose_top1_frac', 0.0)),
-        'attn_v_compose_top1_frac_max': float(m.get('attn_v_compose_top1_frac_max', 0.0)),
-        'rst_compose_top1_frac': float(m.get('rst_compose_top1_frac', 0.0)),
-        'rst_compose_top1_frac_max': float(m.get('rst_compose_top1_frac_max', 0.0)),
+        'attn_qk_mass': float(m.get('attn_qk_execution_mass_sum', 0.0)),
+        'attn_v_mass': float(m.get('attn_v_execution_mass_sum', 0.0)),
+        'rst_mass': float(m.get('rst_execution_mass_sum', 0.0)),
+        'drive_mean': float(m.get('drive_mean', 0.0)),
+        'attn_drive_mean': float(m.get('attn_drive_mean', 0.0)),
+        'attn_qk_drive_mean': float(m.get('attn_qk_drive_mean', 0.0)),
+        'attn_v_drive_mean': float(m.get('attn_v_drive_mean', 0.0)),
+        'rst_drive_mean': float(m.get('rst_drive_mean', 0.0)),
+        'drive_max': float(m.get('drive_max', 0.0)),
+        'attn_drive_max': float(m.get('attn_drive_max', 0.0)),
+        'attn_qk_drive_max': float(m.get('attn_qk_drive_max', 0.0)),
+        'attn_v_drive_max': float(m.get('attn_v_drive_max', 0.0)),
+        'rst_drive_max': float(m.get('rst_drive_max', 0.0)),
+        'execution_eff_n': float(m.get('execution_eff_n', 0.0)),
+        'attn_execution_eff_n': float(m.get('attn_execution_eff_n', 0.0)),
+        'attn_qk_execution_eff_n': float(m.get('attn_qk_execution_eff_n', 0.0)),
+        'attn_v_execution_eff_n': float(m.get('attn_v_execution_eff_n', 0.0)),
+        'rst_execution_eff_n': float(m.get('rst_execution_eff_n', 0.0)),
+        'execution_top1_frac': float(m.get('execution_top1_frac', 0.0)),
+        'execution_top1_frac_max': float(m.get('execution_top1_frac_max', 0.0)),
+        'attn_execution_top1_frac': float(m.get('attn_execution_top1_frac', 0.0)),
+        'attn_execution_top1_frac_max': float(m.get('attn_execution_top1_frac_max', 0.0)),
+        'attn_qk_execution_top1_frac': float(m.get('attn_qk_execution_top1_frac', 0.0)),
+        'attn_qk_execution_top1_frac_max': float(m.get('attn_qk_execution_top1_frac_max', 0.0)),
+        'attn_v_execution_top1_frac': float(m.get('attn_v_execution_top1_frac', 0.0)),
+        'attn_v_execution_top1_frac_max': float(m.get('attn_v_execution_top1_frac_max', 0.0)),
+        'rst_execution_top1_frac': float(m.get('rst_execution_top1_frac', 0.0)),
+        'rst_execution_top1_frac_max': float(m.get('rst_execution_top1_frac_max', 0.0)),
         'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
         'debug_residual_norm_max': float(m.get('debug_residual_norm_max', 0.0)),
         'debug_token_emb_norm': float(m.get('debug_token_emb_norm', m.get('debug_emb_norm', 0.0))),
@@ -11088,13 +10328,13 @@ def _print_analysis_block(rec, ctx):
             'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
         if is_v4160:
             log_message(
-                f"  gate_den_sum: qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
+                f"  admission_den: qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
                 f" v={rec['attn_v_gate_den_sum_mean']:.1f}"
                 f" rst={rec['rst_gate_den_sum']:.1f}"
             )
         else:
             log_message(
-                f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
+                f"  admission_den: a={rec['attn_gate_den_sum']:.1f}"
                 f" rst={rec['rst_gate_den_sum']:.1f}"
             )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
@@ -11451,47 +10691,18 @@ def main():
         'soft_gate_boundary_power_final_frac', 0.950))
     soft_gate_effective_active_eps = float(
         tcfg.get('soft_gate_effective_active_eps', 1.0e-6))
-    v4164_den_power = float(tcfg.get('v4164_den_power', 1.0))
-    v4164_den_grad_scale = float(tcfg.get('v4164_den_grad_scale', 1.0))
-    v4164_den_power_schedule = str(tcfg.get(
-        'v4164_den_power_schedule', 'constant')).lower()
-    v4164_den_power_base = float(tcfg.get(
-        'v4164_den_power_base', v4164_den_power))
-    v4164_den_power_peak = float(tcfg.get(
-        'v4164_den_power_peak', v4164_den_power_base))
-    v4164_den_power_mid = float(tcfg.get(
-        'v4164_den_power_mid', v4164_den_power_peak))
-    v4164_den_power_final = float(tcfg.get(
-        'v4164_den_power_final', v4164_den_power))
-    v4164_den_power_up_start_frac = float(tcfg.get(
-        'v4164_den_power_up_start_frac', 0.0))
-    v4164_den_power_peak_frac = float(tcfg.get(
-        'v4164_den_power_peak_frac', 0.0))
-    v4164_den_power_hold_end_frac = float(tcfg.get(
-        'v4164_den_power_hold_end_frac',
-        v4164_den_power_peak_frac))
-    v4164_den_power_mid_frac = float(tcfg.get(
-        'v4164_den_power_mid_frac',
-        v4164_den_power_hold_end_frac))
-    v4164_den_power_down_end_frac = float(tcfg.get(
-        'v4164_den_power_down_end_frac',
-        v4164_den_power_hold_end_frac))
-    den_power_schedule_keys = (
-        'v4164_den_power',
-        'v4164_den_grad_scale',
-        'v4164_den_power_schedule',
-        'v4164_den_power_base',
-        'v4164_den_power_peak',
-        'v4164_den_power_mid',
-        'v4164_den_power_final',
-        'v4164_den_power_up_start_frac',
-        'v4164_den_power_peak_frac',
-        'v4164_den_power_hold_end_frac',
-        'v4164_den_power_mid_frac',
-        'v4164_den_power_down_end_frac',
+    admission_den_power = float(tcfg.get(
+        'admission_den_power',
+        tcfg.get('v4164_den_power', 1.0)))
+    admission_den_grad_scale = float(tcfg.get(
+        'admission_den_grad_scale',
+        tcfg.get('v4164_den_grad_scale', 1.0)))
+    admission_den_config_keys = (
+        'admission_den_power',
+        'admission_den_grad_scale',
     )
-    current_den_power_config_override = any(
-        key in tcfg for key in den_power_schedule_keys)
+    current_admission_den_config_override = any(
+        key in tcfg for key in admission_den_config_keys)
     regular_diagnostics_level_default = (
         'compact'
         if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
@@ -11502,16 +10713,14 @@ def main():
     if regular_diagnostics_level not in ('compact', 'full'):
         raise ValueError(
             "training.regular_diagnostics_level must be 'compact' or 'full'.")
-    regular_console_level_default = (
-        'compact' if model_version_cfg == V4165_MODEL_VERSION else 'full')
+    regular_console_level_default = 'full'
     regular_console_level = str(tcfg.get(
         'regular_console_level',
         regular_console_level_default)).lower()
     if regular_console_level not in ('compact', 'full'):
         raise ValueError(
             "training.regular_console_level must be 'compact' or 'full'.")
-    regular_console_host_timing_default = (
-        'warn_only' if model_version_cfg == V4165_MODEL_VERSION else 'always')
+    regular_console_host_timing_default = 'always'
     regular_console_host_timing = str(tcfg.get(
         'regular_console_host_timing',
         regular_console_host_timing_default)).lower()
@@ -11526,16 +10735,11 @@ def main():
         'regular_console_drive_max_warn', 1.20))
     regular_console_logging_overhead_warn = float(tcfg.get(
         'regular_console_logging_overhead_warn', 0.05))
-    if (model_version_cfg == V4165_MODEL_VERSION
-            and regular_diagnostics_level == 'compact'):
-        regular_current_eps_default = [1.0e-2]
-        regular_projected_eps_default = []
-    else:
-        regular_current_eps_default = (
-            [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
-            if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-            else [1.0e-1, 1.0e-2, 1.0e-3])
-        regular_projected_eps_default = [1.0e-6]
+    regular_current_eps_default = (
+        [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
+        if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+        else [1.0e-1, 1.0e-2, 1.0e-3])
+    regular_projected_eps_default = [1.0e-6]
     regular_current_eps = [
         float(x) for x in tcfg.get(
             'regular_current_eps', regular_current_eps_default)]
@@ -11547,32 +10751,6 @@ def main():
         'regular_sparsity_enabled',
         (True if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
          else model_version_cfg not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)))
-    legacy_drive_mix_schedule_present = any(
-        key in tcfg for key in (
-            'drive_mix_start', 'drive_mix_final', 'drive_mix_end_frac'))
-    # v4165 uses boundary_drive_ratio as the preferred schedule.  The old
-    # drive_mix path is kept only as a backward-compatible alias, so a new
-    # v4165 config with no drive_mix_* keys must not enable legacy validation.
-    drive_anneal_enabled = bool(tcfg.get(
-        'drive_anneal_enabled',
-        legacy_drive_mix_schedule_present
-        and 'boundary_drive_ratio_end_frac' not in tcfg))
-    drive_ref_qk = float(tcfg.get('drive_ref_qk', 0.05))
-    drive_ref_v = float(tcfg.get('drive_ref_v', 0.04))
-    drive_ref_rst = float(tcfg.get('drive_ref_rst', 0.04))
-    drive_mix_start = float(tcfg.get('drive_mix_start', 1.0))
-    drive_mix_final = float(tcfg.get('drive_mix_final', 1.0))
-    drive_mix_end_frac = float(tcfg.get('drive_mix_end_frac', 0.0))
-    admission_floor_hold_frac = float(tcfg.get('admission_floor_hold_frac', 0.0))
-    admission_floor_end_frac = float(tcfg.get('admission_floor_end_frac', 0.0))
-    drive_baseline_qk = float(tcfg.get('drive_baseline_qk', 0.012))
-    drive_baseline_v = float(tcfg.get('drive_baseline_v', 0.010))
-    drive_baseline_rst = float(tcfg.get('drive_baseline_rst', 0.008))
-    boundary_drive_ratio_start_frac = float(tcfg.get(
-        'boundary_drive_ratio_start_frac', 0.0))
-    boundary_drive_ratio_end_frac = float(tcfg.get(
-        'boundary_drive_ratio_end_frac',
-        tcfg.get('drive_mix_end_frac', 0.0)))
     effective_prune_eps_list = list(
         tcfg.get('effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
     eval_effective_prune_enabled = bool(tcfg.get(
@@ -11839,44 +11017,31 @@ def main():
                 saved_cfg = None
 
         if saved_training_config and restore_training_config_on_resume:
-            saved_den_power_signature = {
+            saved_admission_den_signature = {
                 key: saved_training_config.get(key, '<missing>')
-                for key in den_power_schedule_keys
+                for key in admission_den_config_keys
             }
-            current_den_power_signature = {
-                'v4164_den_power': v4164_den_power,
-                'v4164_den_grad_scale': v4164_den_grad_scale,
-                'v4164_den_power_schedule': v4164_den_power_schedule,
-                'v4164_den_power_base': v4164_den_power_base,
-                'v4164_den_power_peak': v4164_den_power_peak,
-                'v4164_den_power_mid': v4164_den_power_mid,
-                'v4164_den_power_final': v4164_den_power_final,
-                'v4164_den_power_up_start_frac':
-                    v4164_den_power_up_start_frac,
-                'v4164_den_power_peak_frac': v4164_den_power_peak_frac,
-                'v4164_den_power_hold_end_frac':
-                    v4164_den_power_hold_end_frac,
-                'v4164_den_power_mid_frac': v4164_den_power_mid_frac,
-                'v4164_den_power_down_end_frac':
-                    v4164_den_power_down_end_frac,
+            current_admission_den_signature = {
+                'admission_den_power': admission_den_power,
+                'admission_den_grad_scale': admission_den_grad_scale,
             }
-            if current_den_power_config_override:
+            if current_admission_den_config_override:
                 def _norm_sig_value(v):
                     try:
                         return round(float(v), 10)
                     except (TypeError, ValueError):
                         return str(v).lower()
 
-                den_power_mismatch = any(
-                    _norm_sig_value(saved_den_power_signature[key])
-                    != _norm_sig_value(current_den_power_signature[key])
-                    for key in den_power_schedule_keys)
-                if den_power_mismatch and jax.process_index() == 0:
+                admission_den_mismatch = any(
+                    _norm_sig_value(saved_admission_den_signature[key])
+                    != _norm_sig_value(current_admission_den_signature[key])
+                    for key in admission_den_config_keys)
+                if admission_den_mismatch and jax.process_index() == 0:
                     print(
                         "  Warning: checkpoint training config has stale or "
-                        "different v4164_den_power schedule fields. Keeping "
+                        "different admission_den settings. Keeping "
                         "the current config override; use a fresh run for the "
-                        "new den_power schedule or remove the override to "
+                        "new admission_den settings or remove the override to "
                         "reproduce the checkpoint config.")
             # Apply checkpoint training config (CLI args take precedence)
             if cli_args.batch_size is None:
@@ -12045,76 +11210,15 @@ def main():
                 saved_training_config.get(
                     'soft_gate_boundary_power_final_frac',
                     soft_gate_boundary_power_final_frac))
-            if not current_den_power_config_override:
-                v4164_den_power = float(saved_training_config.get(
-                    'v4164_den_power', v4164_den_power))
-                v4164_den_grad_scale = float(saved_training_config.get(
-                    'v4164_den_grad_scale', v4164_den_grad_scale))
-                v4164_den_power_schedule = str(saved_training_config.get(
-                    'v4164_den_power_schedule',
-                    v4164_den_power_schedule)).lower()
-                v4164_den_power_base = float(saved_training_config.get(
-                    'v4164_den_power_base', v4164_den_power_base))
-                v4164_den_power_peak = float(saved_training_config.get(
-                    'v4164_den_power_peak', v4164_den_power_peak))
-                v4164_den_power_mid = float(saved_training_config.get(
-                    'v4164_den_power_mid', v4164_den_power_mid))
-                v4164_den_power_final = float(saved_training_config.get(
-                    'v4164_den_power_final', v4164_den_power_final))
-                v4164_den_power_up_start_frac = float(
+            if not current_admission_den_config_override:
+                admission_den_power = float(saved_training_config.get(
+                    'admission_den_power',
                     saved_training_config.get(
-                        'v4164_den_power_up_start_frac',
-                        v4164_den_power_up_start_frac))
-                v4164_den_power_peak_frac = float(
+                        'v4164_den_power', admission_den_power)))
+                admission_den_grad_scale = float(saved_training_config.get(
+                    'admission_den_grad_scale',
                     saved_training_config.get(
-                        'v4164_den_power_peak_frac',
-                        v4164_den_power_peak_frac))
-                v4164_den_power_hold_end_frac = float(
-                    saved_training_config.get(
-                        'v4164_den_power_hold_end_frac',
-                        v4164_den_power_hold_end_frac))
-                v4164_den_power_mid_frac = float(
-                    saved_training_config.get(
-                        'v4164_den_power_mid_frac',
-                        v4164_den_power_mid_frac))
-                v4164_den_power_down_end_frac = float(
-                    saved_training_config.get(
-                        'v4164_den_power_down_end_frac',
-                        v4164_den_power_down_end_frac))
-            drive_anneal_enabled = bool(saved_training_config.get(
-                'drive_anneal_enabled', drive_anneal_enabled))
-            drive_ref_qk = float(saved_training_config.get(
-                'drive_ref_qk', drive_ref_qk))
-            drive_ref_v = float(saved_training_config.get(
-                'drive_ref_v', drive_ref_v))
-            drive_ref_rst = float(saved_training_config.get(
-                'drive_ref_rst', drive_ref_rst))
-            drive_mix_start = float(saved_training_config.get(
-                'drive_mix_start', drive_mix_start))
-            drive_mix_final = float(saved_training_config.get(
-                'drive_mix_final', drive_mix_final))
-            drive_mix_end_frac = float(saved_training_config.get(
-                'drive_mix_end_frac', drive_mix_end_frac))
-            admission_floor_hold_frac = float(saved_training_config.get(
-                'admission_floor_hold_frac', admission_floor_hold_frac))
-            admission_floor_end_frac = float(saved_training_config.get(
-                'admission_floor_end_frac', admission_floor_end_frac))
-            drive_baseline_qk = float(saved_training_config.get(
-                'drive_baseline_qk', drive_baseline_qk))
-            drive_baseline_v = float(saved_training_config.get(
-                'drive_baseline_v', drive_baseline_v))
-            drive_baseline_rst = float(saved_training_config.get(
-                'drive_baseline_rst', drive_baseline_rst))
-            if ('boundary_drive_ratio_start_frac' in saved_training_config
-                    or 'boundary_drive_ratio_end_frac' in saved_training_config):
-                boundary_drive_ratio_start_frac = float(
-                    saved_training_config.get(
-                        'boundary_drive_ratio_start_frac',
-                        boundary_drive_ratio_start_frac))
-                boundary_drive_ratio_end_frac = float(
-                    saved_training_config.get(
-                        'boundary_drive_ratio_end_frac',
-                        boundary_drive_ratio_end_frac))
+                        'v4164_den_grad_scale', admission_den_grad_scale)))
             if model_version_cfg == 'spatial-r1-v4.1.6.1':
                 # Older 4161 checkpoints may have saved rpe_enabled=False and
                 # exploration_weight=0 because the old code hard-disabled RPE.
@@ -12329,98 +11433,13 @@ def main():
                 f"{soft_gate_boundary_power_start_frac}, "
                 f"{soft_gate_boundary_power_mid_frac}, "
                 f"{soft_gate_boundary_power_final_frac}")
-    if v4164_den_power < 0.0:
+    if admission_den_power < 0.0:
         raise ValueError(
-            f"v4164_den_power must be >= 0, got {v4164_den_power}")
-    if not (0.0 <= v4164_den_grad_scale <= 1.0):
+            f"admission_den_power must be >= 0, got {admission_den_power}")
+    if not (0.0 <= admission_den_grad_scale <= 1.0):
         raise ValueError(
-            "v4164_den_grad_scale must be in [0, 1], got "
-            f"{v4164_den_grad_scale}")
-    if v4164_den_power_schedule not in (
-            'constant', 'none', 'bump', 'early_impulse_decay'):
-        raise ValueError(
-            "v4164_den_power_schedule must be 'early_impulse_decay', 'bump', "
-            "or omitted/constant, "
-            f"got {v4164_den_power_schedule!r}")
-    if v4164_den_power_schedule == 'bump':
-        if min(v4164_den_power_base, v4164_den_power_peak,
-               v4164_den_power_final) < 0.0:
-            raise ValueError(
-                "v4164_den_power_base/peak/final must be >= 0, got "
-                f"{v4164_den_power_base}, {v4164_den_power_peak}, "
-                f"{v4164_den_power_final}")
-        if not (0.0 <= v4164_den_power_up_start_frac
-                < v4164_den_power_peak_frac
-                <= v4164_den_power_hold_end_frac
-                < v4164_den_power_down_end_frac <= 1.0):
-            raise ValueError(
-                "v4164_den_power bump fractions must satisfy "
-                "0 <= up_start < peak <= hold_end < down_end <= 1, got "
-                f"{v4164_den_power_up_start_frac}, "
-                f"{v4164_den_power_peak_frac}, "
-                f"{v4164_den_power_hold_end_frac}, "
-                f"{v4164_den_power_down_end_frac}")
-    if v4164_den_power_schedule == 'early_impulse_decay':
-        if min(v4164_den_power_base, v4164_den_power_peak,
-               v4164_den_power_mid, v4164_den_power_final) < 0.0:
-            raise ValueError(
-                "v4164_den_power_base/peak/mid/final must be >= 0, got "
-                f"{v4164_den_power_base}, {v4164_den_power_peak}, "
-                f"{v4164_den_power_mid}, {v4164_den_power_final}")
-        if not (0.0 <= v4164_den_power_up_start_frac
-                < v4164_den_power_peak_frac
-                <= v4164_den_power_hold_end_frac
-                < v4164_den_power_mid_frac
-                < v4164_den_power_down_end_frac <= 1.0):
-            raise ValueError(
-                "v4164_den_power early_impulse_decay fractions must satisfy "
-                "0 <= up_start < peak <= hold_end < mid < down_end <= 1, "
-                "got "
-                f"{v4164_den_power_up_start_frac}, "
-                f"{v4164_den_power_peak_frac}, "
-                f"{v4164_den_power_hold_end_frac}, "
-                f"{v4164_den_power_mid_frac}, "
-                f"{v4164_den_power_down_end_frac}")
-    if not (0.0 <= admission_floor_hold_frac <= admission_floor_end_frac <= 1.0):
-        raise ValueError(
-            "admission_floor_hold_frac/end_frac must satisfy "
-            f"0 <= hold <= end <= 1, got {admission_floor_hold_frac}, "
-            f"{admission_floor_end_frac}")
-    if drive_baseline_qk < 0.0 or drive_baseline_v < 0.0 or drive_baseline_rst < 0.0:
-        raise ValueError(
-            "drive_baseline_qk/v/rst must be >= 0, got "
-            f"{drive_baseline_qk}, {drive_baseline_v}, {drive_baseline_rst}")
-    if not (0.0 <= boundary_drive_ratio_start_frac <= 1.0):
-        raise ValueError(
-            "boundary_drive_ratio_start_frac must be in [0, 1], got "
-            f"{boundary_drive_ratio_start_frac}")
-    if not (0.0 <= boundary_drive_ratio_end_frac <= 1.0):
-        raise ValueError(
-            "boundary_drive_ratio_end_frac must be in [0, 1], got "
-            f"{boundary_drive_ratio_end_frac}")
-    if (boundary_drive_ratio_end_frac <= boundary_drive_ratio_start_frac
-            and not (boundary_drive_ratio_start_frac == 0.0
-                     and boundary_drive_ratio_end_frac == 0.0)):
-        raise ValueError(
-            "boundary_drive_ratio_end_frac must be greater than "
-            "boundary_drive_ratio_start_frac; got "
-            f"start={boundary_drive_ratio_start_frac}, "
-            f"end={boundary_drive_ratio_end_frac}")
-    if drive_ref_qk <= 0.0 or drive_ref_v <= 0.0 or drive_ref_rst <= 0.0:
-        raise ValueError(
-            "drive_ref_qk/v/rst must be > 0, got "
-            f"{drive_ref_qk}, {drive_ref_v}, {drive_ref_rst}")
-    if drive_anneal_enabled or legacy_drive_mix_schedule_present:
-        if not (0.0 <= drive_mix_start <= drive_mix_final):
-            raise ValueError(
-                "drive_mix_start/final must satisfy "
-                f"0 <= start <= final, got {drive_mix_start}, "
-                f"{drive_mix_final}")
-    if drive_anneal_enabled:
-        if not (0.0 < drive_mix_end_frac <= 1.0):
-            raise ValueError(
-                "drive_mix_end_frac must satisfy 0 < end_frac <= 1, got "
-                f"{drive_mix_end_frac}")
+            "admission_den_grad_scale must be in [0, 1], got "
+            f"{admission_den_grad_scale}")
 
     # Build training_config dict for saving in checkpoints
     training_config = {
@@ -12479,33 +11498,8 @@ def main():
         'soft_gate_boundary_power_start_frac': soft_gate_boundary_power_start_frac,
         'soft_gate_boundary_power_mid_frac': soft_gate_boundary_power_mid_frac,
         'soft_gate_boundary_power_final_frac': soft_gate_boundary_power_final_frac,
-        'v4164_den_power': v4164_den_power,
-        'v4164_den_grad_scale': v4164_den_grad_scale,
-        'v4164_den_power_schedule': v4164_den_power_schedule,
-        'v4164_den_power_base': v4164_den_power_base,
-        'v4164_den_power_peak': v4164_den_power_peak,
-        'v4164_den_power_mid': v4164_den_power_mid,
-        'v4164_den_power_final': v4164_den_power_final,
-        'v4164_den_power_up_start_frac': v4164_den_power_up_start_frac,
-        'v4164_den_power_peak_frac': v4164_den_power_peak_frac,
-        'v4164_den_power_hold_end_frac': v4164_den_power_hold_end_frac,
-        'v4164_den_power_mid_frac': v4164_den_power_mid_frac,
-        'v4164_den_power_down_end_frac': v4164_den_power_down_end_frac,
-        'admission_floor_hold_frac': admission_floor_hold_frac,
-        'admission_floor_end_frac': admission_floor_end_frac,
-        'drive_baseline_qk': drive_baseline_qk,
-        'drive_baseline_v': drive_baseline_v,
-        'drive_baseline_rst': drive_baseline_rst,
-        'boundary_drive_ratio_start_frac': boundary_drive_ratio_start_frac,
-        'boundary_drive_ratio_end_frac': boundary_drive_ratio_end_frac,
-        # Backward-compatible aliases retained in checkpoints.
-        'drive_anneal_enabled': drive_anneal_enabled,
-        'drive_ref_qk': drive_ref_qk,
-        'drive_ref_v': drive_ref_v,
-        'drive_ref_rst': drive_ref_rst,
-        'drive_mix_start': drive_mix_start,
-        'drive_mix_final': drive_mix_final,
-        'drive_mix_end_frac': drive_mix_end_frac,
+        'admission_den_power': admission_den_power,
+        'admission_den_grad_scale': admission_den_grad_scale,
         'soft_gate_effective_active_eps': soft_gate_effective_active_eps,
         'regular_diagnostics_level': regular_diagnostics_level,
         'regular_console_level': regular_console_level,
@@ -13030,16 +12024,11 @@ def main():
             if _soft_model_version in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS:
                 print("  Boundary admission: one-sided generalized Gaussian")
                 if _soft_model_version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
-                    if _soft_model_version == V4165_MODEL_VERSION:
-                        print("  drive = boundary-relative execution strength")
-                        print("  weight = admission * drive")
-                        print("  load = sum(admission)")
-                    else:
-                        print("  depth = softplus((rho-tau)/B) / softplus((1-tau)/B)")
-                        print("  compose = admission * depth")
-                        print("  den = max(sum(admission), 1.0) ** v4164_den_power")
+                    print("  drive = softplus((rho-tau)/B) / softplus((1-tau)/B)")
+                    print("  execution_weight = admission * drive")
+                    print("  admission_den = max(sum(admission), 1.0) ** admission_den_power")
                     print(
-                        "  den_grad = v4164_den_grad_scale * live_den_grad "
+                        "  admission_den_grad = admission_den_grad_scale * live_admission_den_grad "
                         "+ detached remainder")
                 else:
                     print("  gate = exp(-((max(tau-score,0)/B)^p)) * intensity")
@@ -13052,30 +12041,11 @@ def main():
                     f"start_frac={soft_gate_boundary_power_start_frac} "
                     f"mid_frac={soft_gate_boundary_power_mid_frac} "
                     f"final_frac={soft_gate_boundary_power_final_frac}")
-                if _soft_model_version == V4165_MODEL_VERSION:
-                    print("  Denominator power:")
+                if _soft_model_version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+                    print("  Admission denominator:")
                     print(
-                        f"    schedule={v4164_den_power_schedule} "
-                        f"base={v4164_den_power_base} "
-                        f"peak={v4164_den_power_peak} "
-                        f"mid={v4164_den_power_mid} "
-                        f"final={v4164_den_power_final} "
-                        f"up_start={v4164_den_power_up_start_frac} "
-                        f"peak_frac={v4164_den_power_peak_frac} "
-                        f"hold_end={v4164_den_power_hold_end_frac} "
-                        f"mid_frac={v4164_den_power_mid_frac} "
-                        f"down_end={v4164_den_power_down_end_frac} "
-                        f"grad_scale={v4164_den_grad_scale}")
-                    print("  Admission floor / drive baseline:")
-                    print("    tau_sg=stop_gradient(tau); load=sum(admission)")
-                    print(
-                        f"    admission_floor hold={admission_floor_hold_frac} "
-                        f"end={admission_floor_end_frac}")
-                    print(
-                        f"    drive_baseline[qk/v/rst]=({drive_baseline_qk}, "
-                        f"{drive_baseline_v}, {drive_baseline_rst}) "
-                        f"boundary_ratio_start={boundary_drive_ratio_start_frac} "
-                        f"boundary_ratio_end={boundary_drive_ratio_end_frac}")
+                        f"    admission_den_power={admission_den_power} "
+                        f"admission_den_grad_scale={admission_den_grad_scale}")
             else:
                 print("  Soft gate:")
             print(f"    enabled={soft_gate_enabled} "
@@ -13200,8 +12170,7 @@ def main():
                     'spatial-r1-v4.1.6.1',
                     'spatial-r1-v4.1.6.2',
                     'spatial-r1-v4.1.6.3',
-                    'spatial-r1-v4.1.6.4',
-                    'spatial-r1-v4.1.6.5'):
+                    'spatial-r1-v4.1.6.4'):
                 gate_msg += (
                     f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                     f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -13614,31 +12583,7 @@ def main():
         soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
         soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
         soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-        v4164_den_power=v4164_den_power,
-        v4164_den_power_schedule=v4164_den_power_schedule,
-        v4164_den_power_base=v4164_den_power_base,
-        v4164_den_power_peak=v4164_den_power_peak,
-        v4164_den_power_mid=v4164_den_power_mid,
-        v4164_den_power_final=v4164_den_power_final,
-        v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
-        v4164_den_power_peak_frac=v4164_den_power_peak_frac,
-        v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
-        v4164_den_power_mid_frac=v4164_den_power_mid_frac,
-        v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
-        drive_anneal_enabled=drive_anneal_enabled,
-        drive_ref_qk=drive_ref_qk,
-        drive_ref_v=drive_ref_v,
-        drive_ref_rst=drive_ref_rst,
-        drive_mix_start=drive_mix_start,
-        drive_mix_final=drive_mix_final,
-        drive_mix_end_frac=drive_mix_end_frac,
-        admission_floor_hold_frac=admission_floor_hold_frac,
-        admission_floor_end_frac=admission_floor_end_frac,
-        drive_baseline_qk=drive_baseline_qk,
-        drive_baseline_v=drive_baseline_v,
-        drive_baseline_rst=drive_baseline_rst,
-        boundary_drive_ratio_start_frac=boundary_drive_ratio_start_frac,
-        boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac,
+        admission_den_power=admission_den_power,
         rpe_start_frac=rpe_start_frac,
         rpe_full_frac=rpe_full_frac,
         rpe_schedule=rpe_schedule,
@@ -13674,31 +12619,7 @@ def main():
         soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
         soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
         soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-        v4164_den_power=v4164_den_power,
-        v4164_den_power_schedule=v4164_den_power_schedule,
-        v4164_den_power_base=v4164_den_power_base,
-        v4164_den_power_peak=v4164_den_power_peak,
-        v4164_den_power_mid=v4164_den_power_mid,
-        v4164_den_power_final=v4164_den_power_final,
-        v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
-        v4164_den_power_peak_frac=v4164_den_power_peak_frac,
-        v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
-        v4164_den_power_mid_frac=v4164_den_power_mid_frac,
-        v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
-        drive_anneal_enabled=drive_anneal_enabled,
-        drive_ref_qk=drive_ref_qk,
-        drive_ref_v=drive_ref_v,
-        drive_ref_rst=drive_ref_rst,
-        drive_mix_start=drive_mix_start,
-        drive_mix_final=drive_mix_final,
-        drive_mix_end_frac=drive_mix_end_frac,
-        admission_floor_hold_frac=admission_floor_hold_frac,
-        admission_floor_end_frac=admission_floor_end_frac,
-        drive_baseline_qk=drive_baseline_qk,
-        drive_baseline_v=drive_baseline_v,
-        drive_baseline_rst=drive_baseline_rst,
-        boundary_drive_ratio_start_frac=boundary_drive_ratio_start_frac,
-        boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
+        admission_den_power=admission_den_power)
     eval_prune_step_fns = {}
     if eval_effective_prune_enabled:
         for _eps in eval_effective_prune_eps_list:
@@ -13725,31 +12646,7 @@ def main():
                 soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
                 soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
                 soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-                v4164_den_power=v4164_den_power,
-                v4164_den_power_schedule=v4164_den_power_schedule,
-                v4164_den_power_base=v4164_den_power_base,
-                v4164_den_power_peak=v4164_den_power_peak,
-                v4164_den_power_mid=v4164_den_power_mid,
-                v4164_den_power_final=v4164_den_power_final,
-                v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
-                v4164_den_power_peak_frac=v4164_den_power_peak_frac,
-                v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
-                v4164_den_power_mid_frac=v4164_den_power_mid_frac,
-                v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
-                drive_anneal_enabled=drive_anneal_enabled,
-                drive_ref_qk=drive_ref_qk,
-                drive_ref_v=drive_ref_v,
-                drive_ref_rst=drive_ref_rst,
-                drive_mix_start=drive_mix_start,
-                drive_mix_final=drive_mix_final,
-                drive_mix_end_frac=drive_mix_end_frac,
-                admission_floor_hold_frac=admission_floor_hold_frac,
-                admission_floor_end_frac=admission_floor_end_frac,
-                drive_baseline_qk=drive_baseline_qk,
-                drive_baseline_v=drive_baseline_v,
-                drive_baseline_rst=drive_baseline_rst,
-                boundary_drive_ratio_start_frac=boundary_drive_ratio_start_frac,
-                boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
+                admission_den_power=admission_den_power)
     # v4.1: analysis_step is only meaningful when the full analysis
     # kernels exist. Older model versions skip it -analysis logging
     # degrades to empty then.
@@ -13775,31 +12672,7 @@ def main():
             soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
             soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
             soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-            v4164_den_power=v4164_den_power,
-            v4164_den_power_schedule=v4164_den_power_schedule,
-            v4164_den_power_base=v4164_den_power_base,
-            v4164_den_power_peak=v4164_den_power_peak,
-            v4164_den_power_mid=v4164_den_power_mid,
-            v4164_den_power_final=v4164_den_power_final,
-            v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
-            v4164_den_power_peak_frac=v4164_den_power_peak_frac,
-            v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
-            v4164_den_power_mid_frac=v4164_den_power_mid_frac,
-            v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
-            drive_anneal_enabled=drive_anneal_enabled,
-            drive_ref_qk=drive_ref_qk,
-            drive_ref_v=drive_ref_v,
-            drive_ref_rst=drive_ref_rst,
-            drive_mix_start=drive_mix_start,
-            drive_mix_final=drive_mix_final,
-            drive_mix_end_frac=drive_mix_end_frac,
-                admission_floor_hold_frac=admission_floor_hold_frac,
-                admission_floor_end_frac=admission_floor_end_frac,
-                drive_baseline_qk=drive_baseline_qk,
-                drive_baseline_v=drive_baseline_v,
-                drive_baseline_rst=drive_baseline_rst,
-                boundary_drive_ratio_start_frac=boundary_drive_ratio_start_frac,
-                boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
+            admission_den_power=admission_den_power)
     else:
         analysis_step_fn = None
     spike_probe_step_fn = None
@@ -13827,31 +12700,7 @@ def main():
             soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
             soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
             soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-            v4164_den_power=v4164_den_power,
-            v4164_den_power_schedule=v4164_den_power_schedule,
-            v4164_den_power_base=v4164_den_power_base,
-            v4164_den_power_peak=v4164_den_power_peak,
-            v4164_den_power_mid=v4164_den_power_mid,
-            v4164_den_power_final=v4164_den_power_final,
-            v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
-            v4164_den_power_peak_frac=v4164_den_power_peak_frac,
-            v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
-            v4164_den_power_mid_frac=v4164_den_power_mid_frac,
-            v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
-            drive_anneal_enabled=drive_anneal_enabled,
-            drive_ref_qk=drive_ref_qk,
-            drive_ref_v=drive_ref_v,
-            drive_ref_rst=drive_ref_rst,
-            drive_mix_start=drive_mix_start,
-            drive_mix_final=drive_mix_final,
-            drive_mix_end_frac=drive_mix_end_frac,
-                admission_floor_hold_frac=admission_floor_hold_frac,
-                admission_floor_end_frac=admission_floor_end_frac,
-                drive_baseline_qk=drive_baseline_qk,
-                drive_baseline_v=drive_baseline_v,
-                drive_baseline_rst=drive_baseline_rst,
-                boundary_drive_ratio_start_frac=boundary_drive_ratio_start_frac,
-                boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
+            admission_den_power=admission_den_power)
     # No current-train-batch debug forward: --debug uses regular scalar
     # train_step metrics. Local spike diagnostics require training.debug_local_spikes=true.
     debug_forward_step_fn = None

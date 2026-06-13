@@ -1,12 +1,12 @@
 """
-DAWN-SRW v4.1.6.4 Angular-Depth Boundary DirectTau
+DAWN-SRW v4.1.6.4 Drive Boundary DirectTau
 
 Clean v4164 experimental model path.
 
 Implemented concepts:
 - cosine-space tau reference with bounded sigmoid min/max mapping
 - one-sided generalized Gaussian boundary DirectTau admission
-- boundary-relative angular-depth RW composition
+- boundary-relative drive RW composition
 - scheduled soft-gate boundary-scale input
 - scheduled boundary power input
 - tau movement controlled by optimizer-side tau_lr_mult
@@ -116,8 +116,8 @@ ATTN_SPLIT_CORE_NAMES = (
     'k_strong_frac',
     'q_active_n_mean',
     'k_active_n_mean',
-    'qk_angular_depth_mean',
-    'v_angular_depth_mean',
+    'qk_drive_mean',
+    'v_drive_mean',
 )
 ATTN_SPLIT_CORE_COUNT = len(ATTN_SPLIT_CORE_NAMES)
 (
@@ -151,8 +151,8 @@ ATTN_SPLIT_CORE_COUNT = len(ATTN_SPLIT_CORE_NAMES)
     ATTN_SPLIT_K_STRONG_FRAC,
     ATTN_SPLIT_Q_ACTIVE_N_MEAN,
     ATTN_SPLIT_K_ACTIVE_N_MEAN,
-    ATTN_SPLIT_QK_ANGULAR_DEPTH_MEAN,
-    ATTN_SPLIT_V_ANGULAR_DEPTH_MEAN,
+    ATTN_SPLIT_QK_DRIVE_MEAN,
+    ATTN_SPLIT_V_DRIVE_MEAN,
 ) = range(ATTN_SPLIT_CORE_COUNT)
 
 
@@ -305,9 +305,9 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 #   margin, r        = rho - tau, margin / boundary_scale
 #   d_neg            = lambda_neg * softplus(-r / lambda_neg)
 #   admission        = exp(-(d_neg ** boundary_power) - gamma(p) * exp(-r / A(p)))
-#   angular_depth    = softplus(margin / B) / softplus((1 - tau) / B)
-#   compose_weight   = admission * angular_depth
-#   den              = max(sum(admission), 1.0)
+#   drive            = softplus(margin / B) / softplus((1 - tau) / B)
+#   execution_weight = admission * drive
+#   admission_den    = max(sum(admission), 1.0) ** admission_den_power
 # ================================================================
 
 DEFAULT_D_ROUTE = 64
@@ -425,17 +425,17 @@ def _boundary_soft_weight_from_margin(margin, boundary_scale, boundary_power):
     return jnp.exp(-jnp.power(d_neg, boundary_power) - active_gap)
 
 
-def _angular_depth_from_margin(margin, tau, depth_scale, eps=1.0e-6):
-    depth_scale = jnp.maximum(
-        jnp.asarray(depth_scale, dtype=jnp.float32),
+def _drive_from_margin(margin, tau, boundary_scale, eps=1.0e-6):
+    boundary_scale = jnp.maximum(
+        jnp.asarray(boundary_scale, dtype=jnp.float32),
         jnp.float32(1.0e-4))
     tau = jnp.asarray(tau, dtype=jnp.float32)
     max_margin = jnp.maximum(
         jnp.float32(1.0) - tau,
         jnp.float32(eps))
 
-    numerator = jax.nn.softplus(margin / depth_scale)
-    denominator = jax.nn.softplus(max_margin / depth_scale)
+    numerator = jax.nn.softplus(margin / boundary_scale)
+    denominator = jax.nn.softplus(max_margin / boundary_scale)
     return numerator / jnp.maximum(denominator, jnp.float32(eps))
 
 
@@ -445,11 +445,11 @@ def _boundary_gate_from_margin(margin, boundary_scale, boundary_power):
         margin, boundary_scale, boundary_power)
 
 
-def _compute_admission_depth(score, tau, boundary_scale,
+def _compute_admission_drive(score, tau, boundary_scale,
                              boundary_power=2.0,
                              effective_active_eps=1.0e-6,
                              execution_prune_eps=0.0):
-    """v4164 admission plus boundary-relative angular-depth composition."""
+    """v4164 admission plus boundary-relative drive composition."""
     execution_prune_eps = jnp.asarray(execution_prune_eps, dtype=jnp.float32)
     margin = score - tau
     admission_unpruned = _boundary_soft_weight_from_margin(
@@ -460,12 +460,12 @@ def _compute_admission_depth(score, tau, boundary_scale,
             admission_unpruned >= execution_prune_eps,
             admission_unpruned, 0.0),
         admission_unpruned)
-    angular_depth = _angular_depth_from_margin(
+    drive = _drive_from_margin(
         margin, tau, boundary_scale)
-    compose_weight = admission * angular_depth
+    execution_weight = admission * drive
     active_mask = (
         admission >= jnp.asarray(effective_active_eps, dtype=jnp.float32))
-    return margin, admission, angular_depth, compose_weight, active_mask
+    return margin, admission, drive, execution_weight, active_mask
 
 
 LOCAL_SPIKE_METRIC_COUNT = 11
@@ -518,8 +518,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                      regular_projected_eps=(1.0e-6,),
                      regular_mass_enabled=False,
                      regular_sparsity_enabled=False,
-                     v4164_den_power=1.0,
-                     v4164_den_grad_scale=1.0):
+                     admission_den_power=1.0,
+                     admission_den_grad_scale=1.0):
     """Create fused shard_map'd angular Select + SRW.
 
     Fast train path: one chunked pass computes rho, tau, gate, and SRW.
@@ -529,14 +529,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         rho              = cosine(q, signature)
         margin           = rho - tau
         admission        = exp(-((max(tau - rho, 0) / B) ** p))
-        angular_depth    = softplus(margin / B) / softplus((1 - tau) / B)
-        compose_weight   = admission * angular_depth
-        den              = max(sum(admission), 1.0) ** den_power
+        drive            = softplus(margin / B) / softplus((1 - tau) / B)
+        execution_weight = admission * drive
+        admission_den    = max(sum(admission), 1.0) ** admission_den_power
 
 
     `analysis=False` (default, train path): returns the SLIM tuple plus
     four gate-concentration diagnostics, and skips distribution-shape stats
-    (skew/kurt), selection-residency/entropy diagnostics and depth extrema.
+    (skew/kurt), selection-residency/entropy diagnostics and drive extrema.
     XLA DCE's the unused work.
     `local_diagnostics=True` appends a lightweight, scalar-only local-spike
     summary to either path. It is independent of `analysis=True` and is
@@ -576,15 +576,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _compact_margin_bands = bool(_compact_regular_diag)
     _angular_strong_margin = jnp.float32(0.05)
     # v4164 divisive normalization:
-    #   den_forward = max(sum(admission), 1) ** den_power
-    #   backward gradient through den is scaled by den_grad_scale.
-    # den_power=0.5 is RMS/energy-like inhibition; den_grad_scale=0 detaches
-    # the inhibitory denominator gradient, 1 restores the full live den path.
-    _v4164_den_power = jnp.maximum(
-        jnp.asarray(v4164_den_power, dtype=jnp.float32),
+    #   admission_den_forward = max(sum(admission), 1) ** admission_den_power
+    #   backward gradient through admission_den is scaled by admission_den_grad_scale.
+    # admission_den_power=0.5 is RMS/energy-like inhibition;
+    # admission_den_grad_scale=0 detaches the inhibitory denominator gradient,
+    # 1 restores the full live admission_den path.
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
         jnp.float32(0.0))
-    _v4164_den_grad_scale = jnp.clip(
-        jnp.asarray(v4164_den_grad_scale, dtype=jnp.float32),
+    _admission_den_grad_scale = jnp.clip(
+        jnp.asarray(admission_den_grad_scale, dtype=jnp.float32),
         jnp.float32(0.0),
         jnp.float32(1.0))
 
@@ -773,8 +774,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             return jnp.square(positive_selection_margin)
 
         def angular_compose_parts(rho):
-            (selection_margin, admission, angular_depth, compose_weight,
-             active_mask) = _compute_admission_depth(
+            (selection_margin, admission, drive, execution_weight,
+             active_mask) = _compute_admission_drive(
                 rho, tau, soft_gate_temperature,
                 boundary_power=soft_gate_boundary_power,
                 effective_active_eps=_soft_gate_effective_active_eps,
@@ -783,8 +784,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             return (
                 selection_margin,
                 admission,
-                angular_depth,
-                compose_weight,
+                drive,
+                execution_weight,
                 active_mask,
                 strong_mask,
             )
@@ -828,23 +829,23 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             jnp.zeros((margin_band_count,), dtype=jnp.float32),
         )
 
-        def gate_sparsity_parts(selection_margin, admission, compose_weight):
+        def gate_sparsity_parts(selection_margin, admission, execution_weight):
             margin_sg = jax.lax.stop_gradient(selection_margin)
             admission_sg = jax.lax.stop_gradient(admission)
-            compose_sg = jax.lax.stop_gradient(compose_weight)
+            execution_sg = jax.lax.stop_gradient(execution_weight)
             active_tau = margin_sg > 0.0
 
             admission_active = admission_sg[..., None] > current_eps
             admission_active_count = admission_active.astype(jnp.float32).sum(
                 axis=(0, 1, 2))
-            current_active = compose_sg[..., None] > current_eps
+            current_active = execution_sg[..., None] > current_eps
             current_active_count = current_active.astype(jnp.float32).sum(
                 axis=(0, 1, 2))
             if _compute_sparsity_mass:
                 current_mass = (
-                    compose_sg[..., None] * current_active.astype(jnp.float32)
+                    execution_sg[..., None] * current_active.astype(jnp.float32)
                 ).sum(axis=(0, 1, 2))
-                gate_mass = compose_sg.sum()
+                gate_mass = execution_sg.sum()
             else:
                 current_mass = jnp.zeros_like(current_active_count)
                 gate_mass = jnp.float32(0.0)
@@ -1021,10 +1022,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             )
 
         def spike_chunk_rows(start, rho, raw_tau_chunk, tau_chunk,
-                             selection_margin, admission, angular_depth,
-                             compose_weight, xr_f, read_norm, write_norm):
+                             selection_margin, admission, drive,
+                             execution_weight, xr_f, read_norm, write_norm):
             contrib_proxy = (
-                jnp.abs(jax.lax.stop_gradient(compose_weight * xr_f))
+                jnp.abs(jax.lax.stop_gradient(execution_weight * xr_f))
                 * write_norm[None, None, :])
             flat_score = contrib_proxy.reshape((-1,))
             top_scores, top_idx = jax.lax.top_k(
@@ -1040,8 +1041,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             tau_i = tau_chunk[b_idx, pos_idx, 0]
             margin_i = selection_margin[b_idx, pos_idx, n_idx]
             pos_margin_i = admission[b_idx, pos_idx, n_idx]
-            angular_depth_i = angular_depth[b_idx, pos_idx, n_idx]
-            gate_i = compose_weight[b_idx, pos_idx, n_idx]
+            drive_i = drive[b_idx, pos_idx, n_idx]
+            execution_weight_i = execution_weight[b_idx, pos_idx, n_idx]
             xr_i = xr_f[b_idx, pos_idx, n_idx]
             h_norm_i = jnp.linalg.norm(
                 jax.lax.stop_gradient(h[b_idx, pos_idx].astype(jnp.float32)),
@@ -1059,8 +1060,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 tau_i,
                 margin_i,
                 pos_margin_i,
-                angular_depth_i,
-                gate_i,
+                drive_i,
+                execution_weight_i,
                 jnp.zeros_like(top_scores),
                 jnp.zeros_like(top_scores),
                 jnp.zeros_like(top_scores),
@@ -1123,7 +1124,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 gathered.reshape((-1, SPIKE_SRW_FIELD_COUNT)),
                 _spike_probe_topk, SPIKE_SRW_FIELD_COUNT)[None, :, :]
 
-        # --- Pass 2: admission + angular-depth SRW fused (scan + checkpoint) ---
+        # --- Pass 2: admission + drive SRW fused (scan + checkpoint) ---
         if analysis:
             @jax.checkpoint
             def gate_srw_step(carry, i):
@@ -1141,41 +1142,41 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, rho_exposure = route_relation(h_bf, route)
-                (selection_margin, admission, angular_depth, compose_weight,
+                (selection_margin, admission, drive, execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(rho)
                 select_diag_carry = update_select_diag(
                     select_diag_carry, rho, selection_margin, admission)
                 chunk_edge_margin_stat = edge_margin_stat_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
-                chunk_current_cost = angular_depth.mean(
+                chunk_current_cost = drive.mean(
                     axis=-1, keepdims=True)
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission, compose_weight)
+                        selection_margin, admission, execution_weight)
                 else:
                     chunk_sparsity = sparsity_carry0
-                chunk_int_max = angular_depth.max()
+                chunk_int_max = drive.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
-                a = compose_weight * xr_f
+                a = execution_weight * xr_f
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
-                chunk_weighted = compose_weight.sum(axis=-1, keepdims=True)
-                chunk_gate_sq = jnp.square(compose_weight).sum(
+                chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
+                chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
                 chunk_den_cost = admission.sum(axis=-1, keepdims=True)
                 if _local_diagnostics:
                     write_norm = jnp.linalg.norm(
                         wc.astype(jnp.float32), axis=-1)
                     contrib_proxy = (
-                        jnp.abs(jax.lax.stop_gradient(compose_weight * xr_f))
+                        jnp.abs(jax.lax.stop_gradient(execution_weight * xr_f))
                         * write_norm[None, None, :])
                     diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
                     diag_chunk = diag_chunk.at[:, 1].set(
                         jnp.max(jax.lax.stop_gradient(selection_margin)))
                     diag_chunk = diag_chunk.at[:, 4].set(
-                        jnp.max(jax.lax.stop_gradient(angular_depth)))
+                        jnp.max(jax.lax.stop_gradient(drive)))
                     diag_chunk = diag_chunk.at[:, 5].set(
                         jnp.max(jnp.abs(jax.lax.stop_gradient(xr_f))))
                     diag_chunk = diag_chunk.at[:, 6].set(
@@ -1198,15 +1199,15 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                         spike_rows,
                         spike_chunk_rows(
                             s, rho, raw_tau, tau, selection_margin,
-                            admission, angular_depth, compose_weight, xr_f,
+                            admission, drive, execution_weight, xr_f,
                             read_norm, write_norm))
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_margin_band = jnp.zeros((B, S, 1), dtype=jnp.float32)
                 chunk_margin_band_wide = jnp.zeros((B, S, 1), dtype=jnp.float32)
                 chunk_margin_band_mid = jnp.zeros((B, S, 1), dtype=jnp.float32)
-                g_safe = compose_weight + 1e-8
-                chunk_g_log_g = (compose_weight * jnp.log(g_safe)).sum(
+                g_safe = execution_weight + 1e-8
+                chunk_g_log_g = (execution_weight * jnp.log(g_safe)).sum(
                     axis=-1, keepdims=True)
                 (chunk_dead_penalty, chunk_dead_count,
                  chunk_exposure_sum, chunk_exposure_min,
@@ -1216,7 +1217,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
-                        jnp.maximum(total_gate_max, compose_weight.max(axis=-1, keepdims=True)),
+                        jnp.maximum(total_gate_max, execution_weight.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_margin_band + chunk_margin_band,
@@ -1284,41 +1285,41 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, rho_exposure = route_relation(h_bf, route)
-                (selection_margin, admission, angular_depth, compose_weight,
+                (selection_margin, admission, drive, execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(rho)
                 select_diag_carry = update_select_diag(
                     select_diag_carry, rho, selection_margin, admission)
                 chunk_edge_margin_stat = edge_margin_stat_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
-                chunk_current_cost = angular_depth.mean(
+                chunk_current_cost = drive.mean(
                     axis=-1, keepdims=True)
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission, compose_weight)
+                        selection_margin, admission, execution_weight)
                 else:
                     chunk_sparsity = sparsity_carry0
-                chunk_int_max = angular_depth.max()
+                chunk_int_max = drive.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
-                a = compose_weight * xr_f
+                a = execution_weight * xr_f
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
-                chunk_weighted = compose_weight.sum(axis=-1, keepdims=True)
-                chunk_gate_sq = jnp.square(compose_weight).sum(
+                chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
+                chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
                 chunk_den_cost = admission.sum(axis=-1, keepdims=True)
                 if _local_diagnostics:
                     write_norm = jnp.linalg.norm(
                         wc.astype(jnp.float32), axis=-1)
                     contrib_proxy = (
-                        jnp.abs(jax.lax.stop_gradient(compose_weight * xr_f))
+                        jnp.abs(jax.lax.stop_gradient(execution_weight * xr_f))
                         * write_norm[None, None, :])
                     diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
                     diag_chunk = diag_chunk.at[:, 1].set(
                         jnp.max(jax.lax.stop_gradient(selection_margin)))
                     diag_chunk = diag_chunk.at[:, 4].set(
-                        jnp.max(jax.lax.stop_gradient(angular_depth)))
+                        jnp.max(jax.lax.stop_gradient(drive)))
                     diag_chunk = diag_chunk.at[:, 5].set(
                         jnp.max(jnp.abs(jax.lax.stop_gradient(xr_f))))
                     diag_chunk = diag_chunk.at[:, 6].set(
@@ -1341,7 +1342,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                         spike_rows,
                         spike_chunk_rows(
                             s, rho, raw_tau, tau, selection_margin,
-                            admission, angular_depth, compose_weight, xr_f,
+                            admission, drive, execution_weight, xr_f,
                             read_norm, write_norm))
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -1353,7 +1354,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
-                        jnp.maximum(total_gate_max, compose_weight.max(axis=-1, keepdims=True)),
+                        jnp.maximum(total_gate_max, execution_weight.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_den_cost + chunk_den_cost,
@@ -1401,9 +1402,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 jnp.arange(nc))
 
 
-        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')  # sum(compose_weight)
+        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')  # sum(execution_weight)
         global_gate_sq = jax.lax.psum(total_gate_sq, 'model')
-        # Denominator intentionally uses admission only, not compose_weight.
+        # Denominator intentionally uses admission only, not execution_weight.
         global_den_cost = jax.lax.psum(total_den_cost, 'model')
         global_selection_cost = jax.lax.psum(total_selection_cost, 'model')
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
@@ -1414,17 +1415,17 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         # v4164: sublinear divisive inhibition over admission mass.
         # Forward:
-        #   den_forward = max(sum(admission), 1) ** den_power
+        #   admission_den_forward = max(sum(admission), 1) ** admission_den_power
         # Backward:
         #   only den_grad_scale fraction of the denominator gradient is live.
         # This keeps the inhibitory/gain-control term biologically plausible
         # while avoiding the early full-denominator collapse observed with
-        # den_grad_scale=1 and den_power=1.
-        den_base = jnp.maximum(global_den_cost, 1.0)
-        den_forward = jnp.power(den_base, _v4164_den_power)
-        den_sg = jax.lax.stop_gradient(den_forward)
-        den = den_sg + _v4164_den_grad_scale * (den_forward - den_sg)
-        out = raw_out / den
+        # admission_den_grad_scale=1 and admission_den_power=1.
+        admission_den_base = jnp.maximum(global_den_cost, 1.0)
+        admission_den_forward = jnp.power(admission_den_base, _admission_den_power)
+        admission_den_sg = jax.lax.stop_gradient(admission_den_forward)
+        admission_den = admission_den_sg + _admission_den_grad_scale * (admission_den_forward - admission_den_sg)
+        out = raw_out / admission_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         global_active = jax.lax.psum(total_active, 'model')
@@ -1448,7 +1449,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             tau, no_active_direct.astype(jnp.bool_))
         # Measurement path: detached copies for diagnostics / feedback refs.
         # The forward denominator is already detached above; numerator paths
-        # through compose_weight remain live for SRW output gradients.
+        # through execution_weight remain live for SRW output gradients.
         global_weighted_cost_m = jax.lax.stop_gradient(global_weighted_cost)
         global_gate_sq_m = jax.lax.stop_gradient(global_gate_sq)
         global_den_cost_m = jax.lax.stop_gradient(global_den_cost)
@@ -1636,8 +1637,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             regular_projected_eps=(1.0e-6,),
                             regular_mass_enabled=False,
                             regular_sparsity_enabled=False,
-                            v4164_den_power=1.0,
-                            v4164_den_grad_scale=1.0):
+                            admission_den_power=1.0,
+                            admission_den_grad_scale=1.0):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
@@ -1646,11 +1647,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     Scores stats computed independently per route.
     Returns out [B,S,2,D], active [B,S,1], gate_max [B,S,1].
 
-    Boundary DirectTau admission with angular-depth composition:
+    Boundary DirectTau admission with drive composition:
         admission = exp(-((max(tau - rho, 0) / B) ** p))
-        angular_depth = softplus((rho - tau) / B) / softplus((1 - tau) / B)
-        compose_weight = admission * angular_depth
-        den = max(sum(admission), 1.0)
+        drive = softplus((rho - tau) / B) / softplus((1 - tau) / B)
+        execution_weight = admission * drive
+        admission_den = max(sum(admission), 1.0) ** admission_den_power
     analysis/local_diagnostics: see make_sharded_srw docstring.
     """
     _model_axis_size = mesh.shape['model']
@@ -1683,15 +1684,16 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _soft_gate_enabled = True
     _angular_strong_margin = jnp.float32(0.05)
     # v4164 divisive normalization:
-    #   den_forward = max(sum(admission), 1) ** den_power
-    #   backward gradient through den is scaled by den_grad_scale.
-    # den_power=0.5 is RMS/energy-like inhibition; den_grad_scale=0 detaches
-    # the inhibitory denominator gradient, 1 restores the full live den path.
-    _v4164_den_power = jnp.maximum(
-        jnp.asarray(v4164_den_power, dtype=jnp.float32),
+    #   admission_den_forward = max(sum(admission), 1) ** admission_den_power
+    #   backward gradient through admission_den is scaled by admission_den_grad_scale.
+    # admission_den_power=0.5 is RMS/energy-like inhibition;
+    # admission_den_grad_scale=0 detaches the inhibitory denominator gradient,
+    # 1 restores the full live admission_den path.
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
         jnp.float32(0.0))
-    _v4164_den_grad_scale = jnp.clip(
-        jnp.asarray(v4164_den_grad_scale, dtype=jnp.float32),
+    _admission_den_grad_scale = jnp.clip(
+        jnp.asarray(admission_den_grad_scale, dtype=jnp.float32),
         jnp.float32(0.0),
         jnp.float32(1.0))
 
@@ -1891,8 +1893,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             return jnp.square(positive_selection_margin)
 
         def angular_compose_parts(rho):
-            (selection_margin, admission, angular_depth, compose_weight,
-             active_mask) = _compute_admission_depth(
+            (selection_margin, admission, drive, execution_weight,
+             active_mask) = _compute_admission_drive(
                 rho, tau, soft_gate_temperature,
                 boundary_power=soft_gate_boundary_power,
                 effective_active_eps=_soft_gate_effective_active_eps,
@@ -1901,8 +1903,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             return (
                 selection_margin,
                 admission,
-                angular_depth,
-                compose_weight,
+                drive,
+                execution_weight,
                 active_mask,
                 strong_mask,
             )
@@ -1946,23 +1948,23 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             jnp.zeros((2, margin_band_count), dtype=jnp.float32),
         )
 
-        def gate_sparsity_parts(selection_margin, admission, compose_weight):
+        def gate_sparsity_parts(selection_margin, admission, execution_weight):
             margin_sg = jax.lax.stop_gradient(selection_margin)
             admission_sg = jax.lax.stop_gradient(admission)
-            compose_sg = jax.lax.stop_gradient(compose_weight)
+            execution_sg = jax.lax.stop_gradient(execution_weight)
             active_tau = margin_sg > 0.0
 
             admission_active = admission_sg[..., None] > current_eps
             admission_active_count = admission_active.astype(jnp.float32).sum(
                 axis=(0, 1, 3))
-            current_active = compose_sg[..., None] > current_eps
+            current_active = execution_sg[..., None] > current_eps
             current_active_count = current_active.astype(jnp.float32).sum(
                 axis=(0, 1, 3))
             if _compute_sparsity_mass:
                 current_mass = (
-                    compose_sg[..., None] * current_active.astype(jnp.float32)
+                    execution_sg[..., None] * current_active.astype(jnp.float32)
                 ).sum(axis=(0, 1, 3))
-                gate_mass = compose_sg.sum(axis=(0, 1, 3))
+                gate_mass = execution_sg.sum(axis=(0, 1, 3))
             else:
                 current_mass = jnp.zeros_like(current_active_count)
                 gate_mass = jnp.zeros((2,), dtype=jnp.float32)
@@ -2140,11 +2142,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
 
         def spike_chunk_rows_paired(start, rho, raw_tau_chunk, tau_chunk,
                                     selection_margin, admission,
-                                    angular_depth, compose_weight, xr_f,
+                                    drive, execution_weight, xr_f,
                                     read_norm, write_norm):
             xr_r = xr_f[:, :, None, :]
             contrib_proxy = (
-                jnp.abs(jax.lax.stop_gradient(compose_weight * xr_r))
+                jnp.abs(jax.lax.stop_gradient(execution_weight * xr_r))
                 * write_norm[None, None, None, :])
             out_rows = []
             local_k = min(_spike_probe_topk, int(B * S * cs))
@@ -2161,9 +2163,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 tau_i = tau_chunk[b_idx, pos_idx, route_idx, 0]
                 margin_i = selection_margin[b_idx, pos_idx, route_idx, n_idx]
                 pos_margin_i = admission[b_idx, pos_idx, route_idx, n_idx]
-                angular_depth_i = angular_depth[
+                drive_i = drive[
                     b_idx, pos_idx, route_idx, n_idx]
-                gate_i = compose_weight[b_idx, pos_idx, route_idx, n_idx]
+                execution_weight_i = execution_weight[b_idx, pos_idx, route_idx, n_idx]
                 xr_i = xr_f[b_idx, pos_idx, n_idx]
                 h_norm_i = jnp.linalg.norm(
                     jax.lax.stop_gradient(
@@ -2183,8 +2185,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     tau_i,
                     margin_i,
                     pos_margin_i,
-                    angular_depth_i,
-                    gate_i,
+                    drive_i,
+                    execution_weight_i,
                     jnp.zeros_like(top_scores),
                     jnp.zeros_like(top_scores),
                     jnp.zeros_like(top_scores),
@@ -2278,28 +2280,28 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, rho_exposure = route_relation(h_bf, route)
-                (selection_margin, admission, angular_depth, compose_weight,
+                (selection_margin, admission, drive, execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(rho)
                 select_diag_carry = update_select_diag(
                     select_diag_carry, rho, selection_margin, admission)
                 chunk_edge_margin_stat = edge_margin_stat_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
-                chunk_current_cost = angular_depth.mean(
+                chunk_current_cost = drive.mean(
                     axis=-1, keepdims=True)
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission, compose_weight)
+                        selection_margin, admission, execution_weight)
                 else:
                     chunk_sparsity = sparsity_carry0
-                chunk_int_max = angular_depth.max()
+                chunk_int_max = drive.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T  # [B,S,N]
                 xr_f = xr.astype(jnp.float32)
-                a = compose_weight * xr_f[:, :, None, :]
+                a = execution_weight * xr_f[:, :, None, :]
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
-                chunk_weighted = compose_weight.sum(axis=-1, keepdims=True)
-                chunk_gate_sq = jnp.square(compose_weight).sum(
+                chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
+                chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
                 chunk_den_cost = admission.sum(axis=-1, keepdims=True)
                 if _local_diagnostics:
@@ -2307,14 +2309,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         wc.astype(jnp.float32), axis=-1)
                     xr_r = xr_f[:, :, None, :]
                     contrib_proxy = (
-                        jnp.abs(jax.lax.stop_gradient(compose_weight * xr_r))
+                        jnp.abs(jax.lax.stop_gradient(execution_weight * xr_r))
                         * write_norm[None, None, None, :])
                     diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
                     diag_chunk = diag_chunk.at[:, 1].set(
                         jnp.max(jax.lax.stop_gradient(selection_margin),
                                 axis=(0, 1, 3)))
                     diag_chunk = diag_chunk.at[:, 4].set(
-                        jnp.max(jax.lax.stop_gradient(angular_depth),
+                        jnp.max(jax.lax.stop_gradient(drive),
                                 axis=(0, 1, 3)))
                     diag_chunk = diag_chunk.at[:, 5].set(
                         jnp.max(jnp.abs(jax.lax.stop_gradient(
@@ -2340,15 +2342,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         spike_rows,
                         spike_chunk_rows_paired(
                             s, rho, raw_tau, tau, selection_margin,
-                            admission, angular_depth, compose_weight, xr_f,
+                            admission, drive, execution_weight, xr_f,
                             read_norm, write_norm))
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_margin_band = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
                 chunk_margin_band_wide = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
                 chunk_margin_band_mid = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
-                g_safe = compose_weight + 1e-8
-                chunk_g_log_g = (compose_weight * jnp.log(g_safe)).sum(
+                g_safe = execution_weight + 1e-8
+                chunk_g_log_g = (execution_weight * jnp.log(g_safe)).sum(
                     axis=-1, keepdims=True)
                 (chunk_dead_penalty, chunk_dead_count,
                  chunk_exposure_sum, chunk_exposure_min,
@@ -2358,7 +2360,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
-                        jnp.maximum(total_gate_max, compose_weight.max(axis=-1, keepdims=True)),
+                        jnp.maximum(total_gate_max, execution_weight.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_margin_band + chunk_margin_band,
@@ -2427,28 +2429,28 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
                 rho, rho_exposure = route_relation(h_bf, route)
-                (selection_margin, admission, angular_depth, compose_weight,
+                (selection_margin, admission, drive, execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(rho)
                 select_diag_carry = update_select_diag(
                     select_diag_carry, rho, selection_margin, admission)
                 chunk_edge_margin_stat = edge_margin_stat_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
-                chunk_current_cost = angular_depth.mean(
+                chunk_current_cost = drive.mean(
                     axis=-1, keepdims=True)
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission, compose_weight)
+                        selection_margin, admission, execution_weight)
                 else:
                     chunk_sparsity = sparsity_carry0
-                chunk_int_max = angular_depth.max()
+                chunk_int_max = drive.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
-                a = compose_weight * xr_f[:, :, None, :]
+                a = execution_weight * xr_f[:, :, None, :]
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
-                chunk_weighted = compose_weight.sum(axis=-1, keepdims=True)
-                chunk_gate_sq = jnp.square(compose_weight).sum(
+                chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
+                chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
                 chunk_den_cost = admission.sum(axis=-1, keepdims=True)
                 if _local_diagnostics:
@@ -2456,14 +2458,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         wc.astype(jnp.float32), axis=-1)
                     xr_r = xr_f[:, :, None, :]
                     contrib_proxy = (
-                        jnp.abs(jax.lax.stop_gradient(compose_weight * xr_r))
+                        jnp.abs(jax.lax.stop_gradient(execution_weight * xr_r))
                         * write_norm[None, None, None, :])
                     diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
                     diag_chunk = diag_chunk.at[:, 1].set(
                         jnp.max(jax.lax.stop_gradient(selection_margin),
                                 axis=(0, 1, 3)))
                     diag_chunk = diag_chunk.at[:, 4].set(
-                        jnp.max(jax.lax.stop_gradient(angular_depth),
+                        jnp.max(jax.lax.stop_gradient(drive),
                                 axis=(0, 1, 3)))
                     diag_chunk = diag_chunk.at[:, 5].set(
                         jnp.max(jnp.abs(jax.lax.stop_gradient(
@@ -2489,7 +2491,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                         spike_rows,
                         spike_chunk_rows_paired(
                             s, rho, raw_tau, tau, selection_margin,
-                            admission, angular_depth, compose_weight, xr_f,
+                            admission, drive, execution_weight, xr_f,
                             read_norm, write_norm))
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -2501,7 +2503,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
-                        jnp.maximum(total_gate_max, compose_weight.max(axis=-1, keepdims=True)),
+                        jnp.maximum(total_gate_max, execution_weight.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_den_cost + chunk_den_cost,
@@ -2551,7 +2553,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
 
 
         # Normalize per route independently
-        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')   # sum(compose_weight)
+        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')   # sum(execution_weight)
         global_gate_sq = jax.lax.psum(total_gate_sq, 'model')
         global_den_cost = jax.lax.psum(total_den_cost, 'model')
         global_selection_cost = jax.lax.psum(total_selection_cost, 'model')
@@ -2563,17 +2565,17 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         # v4164: sublinear divisive inhibition over admission mass.
         # Forward:
-        #   den_forward = max(sum(admission), 1) ** den_power
+        #   admission_den_forward = max(sum(admission), 1) ** admission_den_power
         # Backward:
         #   only den_grad_scale fraction of the denominator gradient is live.
         # This keeps the inhibitory/gain-control term biologically plausible
         # while avoiding the early full-denominator collapse observed with
-        # den_grad_scale=1 and den_power=1.
-        den_base = jnp.maximum(global_den_cost, 1.0)
-        den_forward = jnp.power(den_base, _v4164_den_power)
-        den_sg = jax.lax.stop_gradient(den_forward)
-        den = den_sg + _v4164_den_grad_scale * (den_forward - den_sg)
-        out = raw_out / den
+        # admission_den_grad_scale=1 and admission_den_power=1.
+        admission_den_base = jnp.maximum(global_den_cost, 1.0)
+        admission_den_forward = jnp.power(admission_den_base, _admission_den_power)
+        admission_den_sg = jax.lax.stop_gradient(admission_den_forward)
+        admission_den = admission_den_sg + _admission_den_grad_scale * (admission_den_forward - admission_den_sg)
+        out = raw_out / admission_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         global_active = jax.lax.psum(total_active, 'model')
@@ -2597,7 +2599,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             tau, no_active_direct.astype(jnp.bool_))
         # Measurement path: detached copies for diagnostics / feedback refs.
         # The forward denominator is already detached above; numerator paths
-        # through compose_weight remain live for SRW output gradients.
+        # through execution_weight remain live for SRW output gradients.
         global_weighted_cost_m = jax.lax.stop_gradient(global_weighted_cost)
         global_gate_sq_m = jax.lax.stop_gradient(global_gate_sq)
         global_den_cost_m = jax.lax.stop_gradient(global_den_cost)
@@ -3095,19 +3097,19 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         rho = q @ e.T
         tau = _tau_from_param(raw_tau[_focus_b, _focus_pos, 0].astype(jnp.float32))[:, None]
         pool_soft_gate_T = soft_gate_T_v if pool_id == 2 else soft_gate_T_qk
-        (margin, admission, angular_depth, compose_weight,
-         active_mask) = _compute_admission_depth(
+        (margin, admission, drive, execution_weight,
+         active_mask) = _compute_admission_drive(
             rho, tau, pool_soft_gate_T,
             boundary_power=soft_gate_boundary_power,
             execution_prune_eps=execution_prune_eps)
-        den = jnp.maximum(admission.sum(axis=-1), 1.0)
+        admission_den = jnp.maximum(admission.sum(axis=-1), 1.0)
         active_n = active_mask.astype(jnp.float32).sum(axis=-1)
         read_dir = _forward_unit_direction(read_f)
         write_dir = _forward_unit_direction(write_f)
         xr = xf @ read_dir.T
-        weighted = compose_weight * xr
+        weighted = execution_weight * xr
         raw_out = weighted @ write_dir
-        out_vec = raw_out / den[:, None] * pool_scale
+        out_vec = raw_out / admission_admission_den[:, None] * pool_scale
         raw_out_norm = jnp.linalg.norm(raw_out, axis=-1)
         out_norm = jnp.linalg.norm(out_vec, axis=-1)
         read_norm = jnp.linalg.norm(read_f, axis=-1)
@@ -3118,7 +3120,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         write_target = _focus_target_emb @ write_dir.T
         write_pred = _focus_pred_emb @ write_dir.T
         write_pred_minus_target = write_pred - write_target
-        contrib_pred_minus_target = (weighted / jnp.maximum(den[:, None], 1e-8)
+        contrib_pred_minus_target = (weighted / jnp.maximum(admission_admission_den[:, None], 1e-8)
                                      * pool_scale * write_pred_minus_target)
         score = jnp.abs(weighted) * write_norm[None, :]
         vals, idx = jax.lax.top_k(score, min(_focus_take_k, int(score.shape[-1])))
@@ -3137,10 +3139,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             jnp.broadcast_to(tau, vals.shape),
             take(margin),
             take(admission),
-            take(angular_depth),
-            take(compose_weight),
-            jnp.broadcast_to(den[:, None], vals.shape),
-            take(compose_weight) / jnp.maximum(den[:, None], 1e-8),
+            take(drive),
+            take(execution_weight),
+            jnp.broadcast_to(admission_admission_den[:, None], vals.shape),
+            take(execution_weight) / jnp.maximum(admission_admission_den[:, None], 1e-8),
             jnp.broadcast_to(active_n[:, None], vals.shape),
             take(xr),
             jnp.abs(take(xr)),
@@ -3741,19 +3743,19 @@ def _rst_forward(x, pool_params, router_params, rng,
         e = _forward_unit_direction(emb_f)
         rho = q @ e.T
         tau = _tau_from_param(raw_tau[_focus_b, _focus_pos, 0].astype(jnp.float32))[:, None]
-        (margin, admission, angular_depth, compose_weight,
-         active_mask) = _compute_admission_depth(
+        (margin, admission, drive, execution_weight,
+         active_mask) = _compute_admission_drive(
             rho, tau, soft_gate_T_rst,
             boundary_power=soft_gate_boundary_power,
             execution_prune_eps=execution_prune_eps)
-        den = jnp.maximum(admission.sum(axis=-1), 1.0)
+        admission_den = jnp.maximum(admission.sum(axis=-1), 1.0)
         active_n = active_mask.astype(jnp.float32).sum(axis=-1)
         read_dir = _forward_unit_direction(read_f)
         write_dir = _forward_unit_direction(write_f)
         xr = xf @ read_dir.T
-        weighted = compose_weight * xr
+        weighted = execution_weight * xr
         raw_out = weighted @ write_dir
-        out_vec = raw_out / den[:, None] * pool_scale
+        out_vec = raw_out / admission_admission_den[:, None] * pool_scale
         raw_out_norm = jnp.linalg.norm(raw_out, axis=-1)
         out_norm = jnp.linalg.norm(out_vec, axis=-1)
         read_norm = jnp.linalg.norm(read_f, axis=-1)
@@ -3764,7 +3766,7 @@ def _rst_forward(x, pool_params, router_params, rng,
         write_target = _focus_target_emb @ write_dir.T
         write_pred = _focus_pred_emb @ write_dir.T
         write_pred_minus_target = write_pred - write_target
-        contrib_pred_minus_target = (weighted / jnp.maximum(den[:, None], 1e-8)
+        contrib_pred_minus_target = (weighted / jnp.maximum(admission_admission_den[:, None], 1e-8)
                                      * pool_scale * write_pred_minus_target)
         score = jnp.abs(weighted) * write_norm[None, :]
         vals, idx = jax.lax.top_k(score, min(_focus_take_k, int(score.shape[-1])))
@@ -3782,10 +3784,10 @@ def _rst_forward(x, pool_params, router_params, rng,
             jnp.broadcast_to(tau, vals.shape),
             take(margin),
             take(admission),
-            take(angular_depth),
-            take(compose_weight),
-            jnp.broadcast_to(den[:, None], vals.shape),
-            take(compose_weight) / jnp.maximum(den[:, None], 1e-8),
+            take(drive),
+            take(execution_weight),
+            jnp.broadcast_to(admission_admission_den[:, None], vals.shape),
+            take(execution_weight) / jnp.maximum(admission_admission_den[:, None], 1e-8),
             jnp.broadcast_to(active_n[:, None], vals.shape),
             take(xr),
             jnp.abs(take(xr)),
@@ -3984,7 +3986,7 @@ class DAWNBlock(nn.Module):
 # ================================================================
 
 class DAWN(nn.Module):
-    """DAWN-SRW v4.1.6.4 with angular-depth boundary composition."""
+    """DAWN-SRW v4.1.6.4 with drive boundary composition."""
     __version__ = "spatial-r1-v4.1.6.4"
 
     vocab_size: int = 30000
@@ -5128,8 +5130,9 @@ class DAWN(nn.Module):
                 attn_no_active_direct_all),
             'rst_no_active_direct': jax.lax.stop_gradient(
                 rst_no_active_direct_all),
-            # v4164 aliases: old gate slots carry compose-weight statistics;
-            # denominator slots carry admission-only sums.
+            # v4164 aliases: old gate tuple slots carry paper
+            # execution_weight statistics; denominator slots carry
+            # admission-only sums.
             'attn_int_max': attn_int_max_all.max(),
             'attn_qk_int_max': _attn_core_max(ATTN_SPLIT_QK_INT_MAX),
             'attn_v_int_max': _attn_core_max(ATTN_SPLIT_V_INT_MAX),
@@ -5188,57 +5191,57 @@ class DAWN(nn.Module):
             'attn_v_admission_den_sum': _attn_core_mean(
                 ATTN_SPLIT_V_GATE_DEN_SUM_MEAN),
             'rst_admission_den_sum': rst_den_cost_mean_all.mean(),
-            'compose_mass_sum': attn_gsum_all.mean() + rst_gsum_all.mean(),
-            'attn_compose_mass_sum': attn_gsum_all.mean(),
-            'attn_qk_compose_mass_sum': _attn_core_mean(
+            'execution_mass_sum': attn_gsum_all.mean() + rst_gsum_all.mean(),
+            'attn_execution_mass_sum': attn_gsum_all.mean(),
+            'attn_qk_execution_mass_sum': _attn_core_mean(
                 ATTN_SPLIT_QK_GATE_SUM),
-            'attn_v_compose_mass_sum': _attn_core_mean(
+            'attn_v_execution_mass_sum': _attn_core_mean(
                 ATTN_SPLIT_V_GATE_SUM),
-            'rst_compose_mass_sum': rst_gsum_all.mean(),
-            'angular_depth_mean': (
+            'rst_execution_mass_sum': rst_gsum_all.mean(),
+            'drive_mean': (
                 attn_current_cost_mean_all.mean()
                 + rst_current_cost_mean_all.mean()) / jnp.float32(2.0),
-            'attn_angular_depth_mean': attn_current_cost_mean_all.mean(),
-            'attn_qk_angular_depth_mean': _attn_core_mean(
-                ATTN_SPLIT_QK_ANGULAR_DEPTH_MEAN),
-            'attn_v_angular_depth_mean': _attn_core_mean(
-                ATTN_SPLIT_V_ANGULAR_DEPTH_MEAN),
-            'rst_angular_depth_mean': rst_current_cost_mean_all.mean(),
-            'angular_depth_max': jnp.maximum(
+            'attn_drive_mean': attn_current_cost_mean_all.mean(),
+            'attn_qk_drive_mean': _attn_core_mean(
+                ATTN_SPLIT_QK_DRIVE_MEAN),
+            'attn_v_drive_mean': _attn_core_mean(
+                ATTN_SPLIT_V_DRIVE_MEAN),
+            'rst_drive_mean': rst_current_cost_mean_all.mean(),
+            'drive_max': jnp.maximum(
                 attn_int_max_all.max(), rst_int_max_all.max()),
-            'attn_angular_depth_max': attn_int_max_all.max(),
-            'attn_qk_angular_depth_max': _attn_core_max(
+            'attn_drive_max': attn_int_max_all.max(),
+            'attn_qk_drive_max': _attn_core_max(
                 ATTN_SPLIT_QK_INT_MAX),
-            'attn_v_angular_depth_max': _attn_core_max(
+            'attn_v_drive_max': _attn_core_max(
                 ATTN_SPLIT_V_INT_MAX),
-            'rst_angular_depth_max': rst_int_max_all.max(),
-            'compose_eff_n': (
+            'rst_drive_max': rst_int_max_all.max(),
+            'execution_eff_n': (
                 attn_gate_eff_n_all.mean() + rst_gate_eff_n_all.mean()
             ) / jnp.float32(2.0),
-            'attn_compose_eff_n': attn_gate_eff_n_all.mean(),
-            'attn_qk_compose_eff_n': _attn_core_mean(
+            'attn_execution_eff_n': attn_gate_eff_n_all.mean(),
+            'attn_qk_execution_eff_n': _attn_core_mean(
                 ATTN_SPLIT_QK_GATE_EFF_N),
-            'attn_v_compose_eff_n': _attn_core_mean(
+            'attn_v_execution_eff_n': _attn_core_mean(
                 ATTN_SPLIT_V_GATE_EFF_N),
-            'rst_compose_eff_n': rst_gate_eff_n_all.mean(),
-            'compose_top1_frac': (
+            'rst_execution_eff_n': rst_gate_eff_n_all.mean(),
+            'execution_top1_frac': (
                 attn_top1_gate_frac_all.mean()
                 + rst_top1_gate_frac_all.mean()) / jnp.float32(2.0),
-            'compose_top1_frac_max': jnp.maximum(
+            'execution_top1_frac_max': jnp.maximum(
                 attn_top1_gate_frac_all.max(),
                 rst_top1_gate_frac_all.max()),
-            'attn_compose_top1_frac': attn_top1_gate_frac_all.mean(),
-            'attn_compose_top1_frac_max': attn_top1_gate_frac_all.max(),
-            'attn_qk_compose_top1_frac': _attn_core_mean(
+            'attn_execution_top1_frac': attn_top1_gate_frac_all.mean(),
+            'attn_execution_top1_frac_max': attn_top1_gate_frac_all.max(),
+            'attn_qk_execution_top1_frac': _attn_core_mean(
                 ATTN_SPLIT_QK_TOP1_GATE_FRAC),
-            'attn_qk_compose_top1_frac_max': _attn_core_max(
+            'attn_qk_execution_top1_frac_max': _attn_core_max(
                 ATTN_SPLIT_QK_TOP1_GATE_FRAC_MAX),
-            'attn_v_compose_top1_frac': _attn_core_mean(
+            'attn_v_execution_top1_frac': _attn_core_mean(
                 ATTN_SPLIT_V_TOP1_GATE_FRAC),
-            'attn_v_compose_top1_frac_max': _attn_core_max(
+            'attn_v_execution_top1_frac_max': _attn_core_max(
                 ATTN_SPLIT_V_TOP1_GATE_FRAC_MAX),
-            'rst_compose_top1_frac': rst_top1_gate_frac_all.mean(),
-            'rst_compose_top1_frac_max': rst_top1_gate_frac_all.max(),
+            'rst_execution_top1_frac': rst_top1_gate_frac_all.mean(),
+            'rst_execution_top1_frac_max': rst_top1_gate_frac_all.max(),
             # Always-on output diagnostics: cheap scalar reductions used by train logs.
             # These are kept outside the analysis-only block so out_diag never falls
             # back to misleading zeros during normal training.
@@ -5531,8 +5534,8 @@ def _squeeze_params(params):
     return jax.tree.map(_sq, params)
 
 
-def _angular_gate_kwargs_from_model_cfg(model_cfg):
-    """Extract v4164 angular-depth boundary settings for inference."""
+def _angular_execution_kwargs_from_model_cfg(model_cfg):
+    """Extract v4164 drive boundary settings for inference."""
     # Pure generation/vectorized helpers do not receive the training schedule,
     # so they use explicit boundary defaults unless the caller supplies current
     # values through model_cfg.
@@ -5617,82 +5620,82 @@ def _angular_relation(h, emb):
     return (q @ route.T).astype(jnp.float32)
 
 
-def _angular_compose(h, emb, raw_tau, raw_scan_offset=None,
+def _angular_execution(h, emb, raw_tau, raw_scan_offset=None,
                      soft_gate_temperature=0.07,
                      soft_gate_boundary_power=4.0,
                      execution_prune_eps=0.0,
                      soft_gate_effective_active_eps=1.0e-6):
     rho = _angular_relation(h, emb)
     tau = _tau_from_param(raw_tau)
-    return _compute_admission_depth(
+    return _compute_admission_drive(
         rho, tau, soft_gate_temperature,
         boundary_power=soft_gate_boundary_power,
         effective_active_eps=soft_gate_effective_active_eps,
         execution_prune_eps=execution_prune_eps)
 
 
-def _angular_gate(h, emb, raw_tau, raw_scan_offset=None,
+def _angular_execution_weight(h, emb, raw_tau, raw_scan_offset=None,
                   soft_gate_temperature=0.07,
                   soft_gate_boundary_power=4.0,
                   execution_prune_eps=0.0,
                   soft_gate_effective_active_eps=1.0e-6):
-    """Canonical v4164 compose weight for non-sharded inference helpers."""
-    _, _, _, compose_weight, _ = _angular_compose(
+    """Canonical v4164 execution_weight for non-sharded inference helpers."""
+    _, _, _, execution_weight, _ = _angular_execution(
         h, emb, raw_tau, raw_scan_offset,
         soft_gate_temperature=soft_gate_temperature,
         soft_gate_boundary_power=soft_gate_boundary_power,
         execution_prune_eps=execution_prune_eps,
         soft_gate_effective_active_eps=soft_gate_effective_active_eps)
-    return compose_weight.astype(jnp.float32)
+    return execution_weight.astype(jnp.float32)
 
 
 def _srw_inference(x, h, emb, raw_tau, raw_scan_offset, w_read, w_write,
-                   **angular_gate_kwargs):
+                   **angular_execution_kwargs):
     """Non-chunked SRW for inference."""
     # v4.1.6.4: inference uses read/write directions; params stay raw.
     r_n = _forward_unit_direction(w_read.astype(jnp.float32))
     w_n = _forward_unit_direction(w_write.astype(jnp.float32))
-    _, admission, _, compose_weight, _ = _angular_compose(
-        h, emb, raw_tau, raw_scan_offset, **angular_gate_kwargs)
+    _, admission, _, execution_weight, _ = _angular_execution(
+        h, emb, raw_tau, raw_scan_offset, **angular_execution_kwargs)
 
     xr = x.astype(jnp.float32) @ r_n.T
-    a = compose_weight * xr
+    a = execution_weight * xr
     raw_out = a @ w_n
-    den = jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0)
-    out = raw_out.astype(jnp.float32) / den
+    admission_den = jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0)
+    out = raw_out.astype(jnp.float32) / admission_den
     return out.astype(jnp.float32)
 
 
 def _srw_inference_with_gates(x, h, emb, raw_tau, raw_scan_offset, w_read,
-                              w_write, **angular_gate_kwargs):
+                              w_write, **angular_execution_kwargs):
     """Like _srw_inference but also returns gate and normalized gate."""
     # v4.1.6.4: analysis inference uses read/write directions; params stay raw.
     r_n = _forward_unit_direction(w_read.astype(jnp.float32))
     w_n = _forward_unit_direction(w_write.astype(jnp.float32))
-    _, admission, _, compose_weight, _ = _angular_compose(
-        h, emb, raw_tau, raw_scan_offset, **angular_gate_kwargs)
-    gate_norm = compose_weight / jnp.maximum(
+    _, admission, _, execution_weight, _ = _angular_execution(
+        h, emb, raw_tau, raw_scan_offset, **angular_execution_kwargs)
+    execution_weight_norm = execution_weight / jnp.maximum(
         admission.sum(axis=-1, keepdims=True), 1e-8)
 
     xr = x.astype(jnp.float32) @ r_n.T
-    a = compose_weight * xr
+    a = execution_weight * xr
     raw_out = a @ w_n
-    den = jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0)
-    out = raw_out.astype(jnp.float32) / den
-    return out.astype(jnp.float32), compose_weight, gate_norm
+    admission_den = jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0)
+    out = raw_out.astype(jnp.float32) / admission_den
+    return out.astype(jnp.float32), execution_weight, execution_weight_norm
 
 
 
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
                          n_heads, d_model, n_layers,
                          cache_K, cache_V, cache_len,
-                         angular_gate_kwargs=None):
+                         angular_execution_kwargs=None):
     """Cached attention decode step. x: [B, 1, D]."""
     B = x.shape[0]
     d_head = d_model // n_heads
 
-    if angular_gate_kwargs is None:
-        angular_gate_kwargs = {}
+    if angular_execution_kwargs is None:
+        angular_execution_kwargs = {}
     # Route embeddings are used as-is, matching the training path.
     qk_norm = pool_params['attn_qk_emb']
     v_norm = pool_params['attn_v_emb']
@@ -5703,13 +5706,13 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
     Q = _srw_inference(x, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                        pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                       **angular_gate_kwargs)
+                       **angular_execution_kwargs)
     K_new = _srw_inference(x, h_K, qk_norm, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                            pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                           **angular_gate_kwargs)
+                           **angular_execution_kwargs)
     V_new = _srw_inference(x, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                            pool_params['attn_v_read'], pool_params['attn_v_write'],
-                           **angular_gate_kwargs)
+                           **angular_execution_kwargs)
     _qk_s, _v_s, _ = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
     Q = Q * _qk_s
@@ -5738,10 +5741,10 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
 def _rst_forward_inference(x, pool_params, router_params,
                            d_model=None, n_layers=None,
-                           angular_gate_kwargs=None):
+                           angular_execution_kwargs=None):
     """Inference-only RST Layer forward. No chunking, no LB, no dropout."""
-    if angular_gate_kwargs is None:
-        angular_gate_kwargs = {}
+    if angular_execution_kwargs is None:
+        angular_execution_kwargs = {}
     # emb used as-is (matches training path).
     rst_norm = pool_params['rst_emb']
     h = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
@@ -5749,7 +5752,7 @@ def _rst_forward_inference(x, pool_params, router_params,
     raw_scan_offset = jnp.zeros_like(tau)
     out = _srw_inference(x, h, rst_norm, tau, raw_scan_offset,
                          pool_params['rst_read'], pool_params['rst_write'],
-                         **angular_gate_kwargs)
+                         **angular_execution_kwargs)
     if d_model is None or n_layers is None:
         raise ValueError(
             "depth-scaled pool outputs require d_model and n_layers.")
@@ -5769,7 +5772,7 @@ def prefill(params, model_cfg, input_ids):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
-    angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
+    angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
     max_seq = model_cfg['max_seq_len']
     d_head = d_model // n_heads
 
@@ -5804,13 +5807,13 @@ def prefill(params, model_cfg, input_ids):
 
         Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                            pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                           **angular_gate_kwargs)
+                           **angular_execution_kwargs)
         K_val = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                               **angular_gate_kwargs)
+                               **angular_execution_kwargs)
         V_val = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                                pool_params['attn_v_read'], pool_params['attn_v_write'],
-                               **angular_gate_kwargs)
+                               **angular_execution_kwargs)
         _qk_s = qk_scale_eff
         _v_s = v_scale_eff
         Q = Q * _qk_s
@@ -5838,7 +5841,7 @@ def prefill(params, model_cfg, input_ids):
         rst_out = _rst_forward_inference(
             normed, pool_params, router_params,
             d_model=d_model, n_layers=n_layers,
-            angular_gate_kwargs=angular_gate_kwargs)
+            angular_execution_kwargs=angular_execution_kwargs)
         x = x + rst_out
         return (x, cK, cV), None
 
@@ -5859,7 +5862,7 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
-    angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
+    angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
 
     pool_params = params['neuron_pool']
     router_params = params['router']
@@ -5881,7 +5884,7 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
             bp['attn']['expand_O']['kernel'],
             n_heads, d_model, n_layers,
             cK[layer_idx], cV[layer_idx], pos,
-            angular_gate_kwargs=angular_gate_kwargs)
+            angular_execution_kwargs=angular_execution_kwargs)
         cK = cK.at[layer_idx].set(new_cK)
         cV = cV.at[layer_idx].set(new_cV)
         x = x + attn_out
@@ -5890,7 +5893,7 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
         rst_out = _rst_forward_inference(
             normed, pool_params, router_params,
             d_model=d_model, n_layers=n_layers,
-            angular_gate_kwargs=angular_gate_kwargs)
+            angular_execution_kwargs=angular_execution_kwargs)
         x = x + rst_out
         return (x, cK, cV, pos), None
 
@@ -5923,7 +5926,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
     max_seq = model_cfg['max_seq_len']
-    angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
+    angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
 
     pool_params = params['neuron_pool']
     router_params = params['router']
@@ -5955,13 +5958,13 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
 
             Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                               **angular_gate_kwargs)
+                               **angular_execution_kwargs)
             K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                               **angular_gate_kwargs)
+                               **angular_execution_kwargs)
             V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                                pool_params['attn_v_read'], pool_params['attn_v_write'],
-                               **angular_gate_kwargs)
+                               **angular_execution_kwargs)
             _qk_s = qk_scale_eff
             _v_s = v_scale_eff
             Q = Q * _qk_s
@@ -5989,7 +5992,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             raw_scan_offset_k = jnp.zeros_like(tau_k)
             rst_out = _srw_inference(normed, h_k, rst_norm, tau_k, raw_scan_offset_k,
                                      pool_params['rst_read'], pool_params['rst_write'],
-                                     **angular_gate_kwargs)
+                                     **angular_execution_kwargs)
             x = x + rst_out * rst_scale_eff
             return x, None
 
@@ -6098,8 +6101,8 @@ def vectorized_weight_analysis(params, max_sample=2048):
 def analysis_forward(params, model_cfg, input_ids, mode='full'):
     """Forward returning per-layer gate distributions + output norms.
 
-    mode='full': returns gate + gate_norm (R.1, P2, P3 etc.)
-    mode='light': returns gate_norm only.
+    mode='full': returns gate + execution_weight_norm (R.1, P2, P3 etc.)
+    mode='light': returns execution_weight_norm only.
 
     Returns:
         logits: [B, S, vocab]
@@ -6117,7 +6120,7 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
-    angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
+    angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
 
     pool_params = params['neuron_pool']
     router_params = params['router']
@@ -6150,15 +6153,15 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         Q, gate_Q_raw, gate_Q = _srw_inference_with_gates(
             normed, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
             pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-            **angular_gate_kwargs)
+            **angular_execution_kwargs)
         K, gate_K_raw, gate_K = _srw_inference_with_gates(
             normed, h_K, qk_norm, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
             pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-            **angular_gate_kwargs)
+            **angular_execution_kwargs)
         V, gate_V_raw, gate_V = _srw_inference_with_gates(
             normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
             pool_params['attn_v_read'], pool_params['attn_v_write'],
-            **angular_gate_kwargs)
+            **angular_execution_kwargs)
         _qk_s = qk_scale_eff
         _v_s = v_scale_eff
         Q = Q * _qk_s
@@ -6187,7 +6190,7 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         rst_out, gate_RST_raw, gate_RST = _srw_inference_with_gates(
             normed, h_k, rst_norm_w, tau_k, raw_scan_offset_k,
             pool_params['rst_read'], pool_params['rst_write'],
-            **angular_gate_kwargs)
+            **angular_execution_kwargs)
         rst_out = rst_out * rst_scale_eff
         rst_out_norm = jnp.linalg.norm(rst_out, axis=-1).mean()
         x = x + rst_out
@@ -6228,7 +6231,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
     """
     params = _squeeze_params(params)
     params = jax.tree.map(jnp.asarray, params)
-    angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
+    angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
     qk_mult = jnp.where(suppress_masks.get('qk', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
         if 'qk' in suppress_masks else None
     v_mult = jnp.where(suppress_masks.get('v', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
@@ -6241,16 +6244,16 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         # v4.1.6.4: suppressed forward uses read/write directions.
         r_n = _forward_unit_direction(w_read.astype(jnp.float32))
         w_n = _forward_unit_direction(w_write.astype(jnp.float32))
-        _, admission, _, compose_weight, _ = _angular_compose(
-            h, emb, tau_off, raw_scan_offset, **angular_gate_kwargs)
+        _, admission, _, execution_weight, _ = _angular_execution(
+            h, emb, tau_off, raw_scan_offset, **angular_execution_kwargs)
         if mult is not None:
-            compose_weight = compose_weight * mult[None, None, :]
+            execution_weight = execution_weight * mult[None, None, :]
             admission = admission * mult[None, None, :]
         xr = x.astype(jnp.float32) @ r_n.T
-        a = compose_weight * xr
+        a = execution_weight * xr
         out = a @ w_n
-        den = jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0)
-        return (out.astype(jnp.float32) / den).astype(jnp.float32)
+        admission_den = jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0)
+        return (out.astype(jnp.float32) / admission_den).astype(jnp.float32)
 
     def forward_fn(input_ids):
         B, S = input_ids.shape

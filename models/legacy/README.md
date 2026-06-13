@@ -59,6 +59,7 @@ File names encode the DAWN version. Brief context:
 | `dawn_spatial_v402_exp.py`             | rw-v4.0.2   | Separate Q/K pools; dead-neuron diagnostics |
 | `dawn_spatial_v40{3,4,5,6}_exp.py`     | v4.0.3 – v4.0.6 | Progression toward v4.1 two-stage gate |
 | `dawn_spatial_v3_*backup*.py`          | snapshots   | Archived checkpoints (39M / 400M) |
+| `dawn_srw_v4165.py`                    | v4.1.6.5    | Experimental FairDrive/admission-floor/den-impulse branch; archived here and not the paper path |
 | `model_v17_1.py` / `_tpu*.py`          | v17.1 non-jax | Pre-JAX originals; v17.1-JAX (`models/model_v17_1_jax.py`) kept at repo root for analysis tooling |
 | `model_v17_2.py`, `model_v18*.py`      | v17.2 / v18.x | Exploration branches superseded by v4.x |
 
