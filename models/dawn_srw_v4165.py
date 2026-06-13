@@ -4169,10 +4169,12 @@ class DAWN(nn.Module):
     v4164_den_power_schedule: str = 'constant'
     v4164_den_power_base: float = 1.0
     v4164_den_power_peak: float = 1.0
+    v4164_den_power_mid: float = 1.0
     v4164_den_power_final: float = 1.0
     v4164_den_power_up_start_frac: float = 0.0
     v4164_den_power_peak_frac: float = 0.0
     v4164_den_power_hold_end_frac: float = 0.0
+    v4164_den_power_mid_frac: float = 0.0
     v4164_den_power_down_end_frac: float = 0.0
 
     def setup(self):

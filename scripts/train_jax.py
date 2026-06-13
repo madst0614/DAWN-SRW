@@ -827,10 +827,12 @@ def _dawn_srw_kwargs(cfg):
                 'v4164_den_power_schedule': 'constant',
                 'v4164_den_power_base': _cfg_get('v4164_den_power', 1.0),
                 'v4164_den_power_peak': _cfg_get('v4164_den_power', 1.0),
+                'v4164_den_power_mid': _cfg_get('v4164_den_power', 1.0),
                 'v4164_den_power_final': _cfg_get('v4164_den_power', 1.0),
                 'v4164_den_power_up_start_frac': 0.0,
                 'v4164_den_power_peak_frac': 0.0,
                 'v4164_den_power_hold_end_frac': 0.0,
+                'v4164_den_power_mid_frac': 0.0,
                 'v4164_den_power_down_end_frac': 0.0,
             }
             for name, default in den_defaults.items():
@@ -2280,11 +2282,12 @@ def smoothstep01(x):
 
 def scheduled_den_power_by_frac(
         step, total_steps, schedule, den_power,
-        base, peak, final, up_start_frac, peak_frac,
-        hold_end_frac, down_end_frac):
-    """Backward-compatible v4164 den_power or v4165 bump schedule."""
+        base, peak, mid, final, up_start_frac, peak_frac,
+        hold_end_frac, mid_frac, down_end_frac):
+    """Backward-compatible constant/bump or v4165 early impulse schedule."""
     den_power_f = jnp.asarray(den_power, dtype=jnp.float32)
-    if str(schedule).lower() != 'bump':
+    schedule_name = str(schedule).lower()
+    if schedule_name in ('constant', 'none'):
         return den_power_f
 
     step_f = jnp.asarray(step, dtype=jnp.float32)
@@ -2293,18 +2296,36 @@ def scheduled_den_power_by_frac(
 
     base_f = jnp.asarray(base, dtype=jnp.float32)
     peak_f = jnp.asarray(peak, dtype=jnp.float32)
+    mid_f = jnp.asarray(mid, dtype=jnp.float32)
     final_f = jnp.asarray(final, dtype=jnp.float32)
     up_start = jnp.asarray(up_start_frac, dtype=jnp.float32)
     peak_at = jnp.asarray(peak_frac, dtype=jnp.float32)
     hold_end = jnp.asarray(hold_end_frac, dtype=jnp.float32)
+    mid_at = jnp.asarray(mid_frac, dtype=jnp.float32)
     down_end = jnp.asarray(down_end_frac, dtype=jnp.float32)
     eps = jnp.float32(1.0e-8)
 
     up_u = smoothstep01(
         (progress - up_start) / jnp.maximum(peak_at - up_start, eps))
+    up_val = base_f + (peak_f - base_f) * up_u
+
+    if schedule_name == 'early_impulse_decay':
+        mid_u = smoothstep01(
+            (progress - hold_end) / jnp.maximum(mid_at - hold_end, eps))
+        down_u = smoothstep01(
+            (progress - mid_at) / jnp.maximum(down_end - mid_at, eps))
+        mid_val = peak_f + (mid_f - peak_f) * mid_u
+        down_val = mid_f + (final_f - mid_f) * down_u
+
+        scheduled = jnp.where(progress < up_start, base_f, up_val)
+        scheduled = jnp.where(progress >= peak_at, peak_f, scheduled)
+        scheduled = jnp.where(progress >= hold_end, mid_val, scheduled)
+        scheduled = jnp.where(progress >= mid_at, down_val, scheduled)
+        scheduled = jnp.where(progress >= down_end, final_f, scheduled)
+        return scheduled
+
     down_u = smoothstep01(
         (progress - hold_end) / jnp.maximum(down_end - hold_end, eps))
-    up_val = base_f + (peak_f - base_f) * up_u
     down_val = peak_f + (final_f - peak_f) * down_u
 
     scheduled = jnp.where(progress < up_start, base_f, up_val)
@@ -2397,10 +2418,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       v4164_den_power_schedule='constant',
                       v4164_den_power_base=1.0,
                       v4164_den_power_peak=1.0,
+                      v4164_den_power_mid=1.0,
                       v4164_den_power_final=1.0,
                       v4164_den_power_up_start_frac=0.0,
                       v4164_den_power_peak_frac=0.0,
                       v4164_den_power_hold_end_frac=0.0,
+                      v4164_den_power_mid_frac=0.0,
                       v4164_den_power_down_end_frac=0.0,
                       drive_anneal_enabled=False,
                       drive_ref_qk=0.05,
@@ -2641,12 +2664,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
     _v4164_den_power_base = jnp.float32(v4164_den_power_base)
     _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
+    _v4164_den_power_mid = jnp.float32(v4164_den_power_mid)
     _v4164_den_power_final = jnp.float32(v4164_den_power_final)
     _v4164_den_power_up_start_frac = jnp.float32(
         v4164_den_power_up_start_frac)
     _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
     _v4164_den_power_hold_end_frac = jnp.float32(
         v4164_den_power_hold_end_frac)
+    _v4164_den_power_mid_frac = jnp.float32(v4164_den_power_mid_frac)
     _v4164_den_power_down_end_frac = jnp.float32(
         v4164_den_power_down_end_frac)
     _drive_anneal_enabled = bool(drive_anneal_enabled)
@@ -2736,9 +2761,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 step, _total_training_steps,
                 _v4164_den_power_schedule, _v4164_den_power,
                 _v4164_den_power_base, _v4164_den_power_peak,
-                _v4164_den_power_final, _v4164_den_power_up_start_frac,
+                _v4164_den_power_mid, _v4164_den_power_final,
+                _v4164_den_power_up_start_frac,
                 _v4164_den_power_peak_frac,
                 _v4164_den_power_hold_end_frac,
+                _v4164_den_power_mid_frac,
                 _v4164_den_power_down_end_frac)
             drive_mix = jnp.where(
                 jnp.asarray(_drive_anneal_enabled),
@@ -4844,10 +4871,12 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      v4164_den_power_schedule='constant',
                      v4164_den_power_base=1.0,
                      v4164_den_power_peak=1.0,
+                     v4164_den_power_mid=1.0,
                      v4164_den_power_final=1.0,
                      v4164_den_power_up_start_frac=0.0,
                      v4164_den_power_peak_frac=0.0,
                      v4164_den_power_hold_end_frac=0.0,
+                     v4164_den_power_mid_frac=0.0,
                      v4164_den_power_down_end_frac=0.0,
                      drive_anneal_enabled=False,
                      drive_ref_qk=0.05,
@@ -4931,12 +4960,14 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
     _v4164_den_power_base = jnp.float32(v4164_den_power_base)
     _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
+    _v4164_den_power_mid = jnp.float32(v4164_den_power_mid)
     _v4164_den_power_final = jnp.float32(v4164_den_power_final)
     _v4164_den_power_up_start_frac = jnp.float32(
         v4164_den_power_up_start_frac)
     _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
     _v4164_den_power_hold_end_frac = jnp.float32(
         v4164_den_power_hold_end_frac)
+    _v4164_den_power_mid_frac = jnp.float32(v4164_den_power_mid_frac)
     _v4164_den_power_down_end_frac = jnp.float32(
         v4164_den_power_down_end_frac)
     _drive_anneal_enabled = bool(drive_anneal_enabled)
@@ -4998,9 +5029,11 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             step, _total_training_steps,
             _v4164_den_power_schedule, _v4164_den_power,
             _v4164_den_power_base, _v4164_den_power_peak,
-            _v4164_den_power_final, _v4164_den_power_up_start_frac,
+            _v4164_den_power_mid, _v4164_den_power_final,
+            _v4164_den_power_up_start_frac,
             _v4164_den_power_peak_frac,
             _v4164_den_power_hold_end_frac,
+            _v4164_den_power_mid_frac,
             _v4164_den_power_down_end_frac)
         if _pass_admission_floor_kw:
             extra_kw['admission_floor'] = admission_floor
@@ -5083,10 +5116,12 @@ def create_analysis_step(model, sharded_fns=None,
                          v4164_den_power_schedule='constant',
                          v4164_den_power_base=1.0,
                          v4164_den_power_peak=1.0,
+                         v4164_den_power_mid=1.0,
                          v4164_den_power_final=1.0,
                          v4164_den_power_up_start_frac=0.0,
                          v4164_den_power_peak_frac=0.0,
                          v4164_den_power_hold_end_frac=0.0,
+                         v4164_den_power_mid_frac=0.0,
                          v4164_den_power_down_end_frac=0.0,
                          drive_anneal_enabled=False,
                          drive_ref_qk=0.05,
@@ -5169,12 +5204,14 @@ def create_analysis_step(model, sharded_fns=None,
     _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
     _v4164_den_power_base = jnp.float32(v4164_den_power_base)
     _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
+    _v4164_den_power_mid = jnp.float32(v4164_den_power_mid)
     _v4164_den_power_final = jnp.float32(v4164_den_power_final)
     _v4164_den_power_up_start_frac = jnp.float32(
         v4164_den_power_up_start_frac)
     _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
     _v4164_den_power_hold_end_frac = jnp.float32(
         v4164_den_power_hold_end_frac)
+    _v4164_den_power_mid_frac = jnp.float32(v4164_den_power_mid_frac)
     _v4164_den_power_down_end_frac = jnp.float32(
         v4164_den_power_down_end_frac)
     _drive_anneal_enabled = bool(drive_anneal_enabled)
@@ -5236,9 +5273,11 @@ def create_analysis_step(model, sharded_fns=None,
             step, _total_training_steps,
             _v4164_den_power_schedule, _v4164_den_power,
             _v4164_den_power_base, _v4164_den_power_peak,
-            _v4164_den_power_final, _v4164_den_power_up_start_frac,
+            _v4164_den_power_mid, _v4164_den_power_final,
+            _v4164_den_power_up_start_frac,
             _v4164_den_power_peak_frac,
             _v4164_den_power_hold_end_frac,
+            _v4164_den_power_mid_frac,
             _v4164_den_power_down_end_frac)
         if _pass_admission_floor_kw:
             extra_kw['admission_floor'] = admission_floor
@@ -5396,10 +5435,12 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                             v4164_den_power_schedule='constant',
                             v4164_den_power_base=1.0,
                             v4164_den_power_peak=1.0,
+                            v4164_den_power_mid=1.0,
                             v4164_den_power_final=1.0,
                             v4164_den_power_up_start_frac=0.0,
                             v4164_den_power_peak_frac=0.0,
                             v4164_den_power_hold_end_frac=0.0,
+                            v4164_den_power_mid_frac=0.0,
                             v4164_den_power_down_end_frac=0.0,
                             drive_anneal_enabled=False,
                             drive_ref_qk=0.05,
@@ -5486,12 +5527,14 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
     _v4164_den_power_base = jnp.float32(v4164_den_power_base)
     _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
+    _v4164_den_power_mid = jnp.float32(v4164_den_power_mid)
     _v4164_den_power_final = jnp.float32(v4164_den_power_final)
     _v4164_den_power_up_start_frac = jnp.float32(
         v4164_den_power_up_start_frac)
     _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
     _v4164_den_power_hold_end_frac = jnp.float32(
         v4164_den_power_hold_end_frac)
+    _v4164_den_power_mid_frac = jnp.float32(v4164_den_power_mid_frac)
     _v4164_den_power_down_end_frac = jnp.float32(
         v4164_den_power_down_end_frac)
     _drive_anneal_enabled = bool(drive_anneal_enabled)
@@ -5556,9 +5599,11 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
             step, _total_training_steps,
             _v4164_den_power_schedule, _v4164_den_power,
             _v4164_den_power_base, _v4164_den_power_peak,
-            _v4164_den_power_final, _v4164_den_power_up_start_frac,
+            _v4164_den_power_mid, _v4164_den_power_final,
+            _v4164_den_power_up_start_frac,
             _v4164_den_power_peak_frac,
             _v4164_den_power_hold_end_frac,
+            _v4164_den_power_mid_frac,
             _v4164_den_power_down_end_frac)
         if _pass_admission_floor_kw:
             extra_kw['admission_floor'] = admission_floor
@@ -11414,6 +11459,8 @@ def main():
         'v4164_den_power_base', v4164_den_power))
     v4164_den_power_peak = float(tcfg.get(
         'v4164_den_power_peak', v4164_den_power_base))
+    v4164_den_power_mid = float(tcfg.get(
+        'v4164_den_power_mid', v4164_den_power_peak))
     v4164_den_power_final = float(tcfg.get(
         'v4164_den_power_final', v4164_den_power))
     v4164_den_power_up_start_frac = float(tcfg.get(
@@ -11423,6 +11470,9 @@ def main():
     v4164_den_power_hold_end_frac = float(tcfg.get(
         'v4164_den_power_hold_end_frac',
         v4164_den_power_peak_frac))
+    v4164_den_power_mid_frac = float(tcfg.get(
+        'v4164_den_power_mid_frac',
+        v4164_den_power_hold_end_frac))
     v4164_den_power_down_end_frac = float(tcfg.get(
         'v4164_den_power_down_end_frac',
         v4164_den_power_hold_end_frac))
@@ -11432,10 +11482,12 @@ def main():
         'v4164_den_power_schedule',
         'v4164_den_power_base',
         'v4164_den_power_peak',
+        'v4164_den_power_mid',
         'v4164_den_power_final',
         'v4164_den_power_up_start_frac',
         'v4164_den_power_peak_frac',
         'v4164_den_power_hold_end_frac',
+        'v4164_den_power_mid_frac',
         'v4164_den_power_down_end_frac',
     )
     current_den_power_config_override = any(
@@ -11797,12 +11849,14 @@ def main():
                 'v4164_den_power_schedule': v4164_den_power_schedule,
                 'v4164_den_power_base': v4164_den_power_base,
                 'v4164_den_power_peak': v4164_den_power_peak,
+                'v4164_den_power_mid': v4164_den_power_mid,
                 'v4164_den_power_final': v4164_den_power_final,
                 'v4164_den_power_up_start_frac':
                     v4164_den_power_up_start_frac,
                 'v4164_den_power_peak_frac': v4164_den_power_peak_frac,
                 'v4164_den_power_hold_end_frac':
                     v4164_den_power_hold_end_frac,
+                'v4164_den_power_mid_frac': v4164_den_power_mid_frac,
                 'v4164_den_power_down_end_frac':
                     v4164_den_power_down_end_frac,
             }
@@ -11822,8 +11876,8 @@ def main():
                         "  Warning: checkpoint training config has stale or "
                         "different v4164_den_power schedule fields. Keeping "
                         "the current config override; use a fresh run for the "
-                        "new bump schedule or remove the override to reproduce "
-                        "the checkpoint config.")
+                        "new den_power schedule or remove the override to "
+                        "reproduce the checkpoint config.")
             # Apply checkpoint training config (CLI args take precedence)
             if cli_args.batch_size is None:
                 batch_size = saved_training_config.get('batch_size', batch_size)
@@ -12003,6 +12057,8 @@ def main():
                     'v4164_den_power_base', v4164_den_power_base))
                 v4164_den_power_peak = float(saved_training_config.get(
                     'v4164_den_power_peak', v4164_den_power_peak))
+                v4164_den_power_mid = float(saved_training_config.get(
+                    'v4164_den_power_mid', v4164_den_power_mid))
                 v4164_den_power_final = float(saved_training_config.get(
                     'v4164_den_power_final', v4164_den_power_final))
                 v4164_den_power_up_start_frac = float(
@@ -12017,6 +12073,10 @@ def main():
                     saved_training_config.get(
                         'v4164_den_power_hold_end_frac',
                         v4164_den_power_hold_end_frac))
+                v4164_den_power_mid_frac = float(
+                    saved_training_config.get(
+                        'v4164_den_power_mid_frac',
+                        v4164_den_power_mid_frac))
                 v4164_den_power_down_end_frac = float(
                     saved_training_config.get(
                         'v4164_den_power_down_end_frac',
@@ -12276,9 +12336,11 @@ def main():
         raise ValueError(
             "v4164_den_grad_scale must be in [0, 1], got "
             f"{v4164_den_grad_scale}")
-    if v4164_den_power_schedule not in ('constant', 'none', 'bump'):
+    if v4164_den_power_schedule not in (
+            'constant', 'none', 'bump', 'early_impulse_decay'):
         raise ValueError(
-            "v4164_den_power_schedule must be 'bump' or omitted/constant, "
+            "v4164_den_power_schedule must be 'early_impulse_decay', 'bump', "
+            "or omitted/constant, "
             f"got {v4164_den_power_schedule!r}")
     if v4164_den_power_schedule == 'bump':
         if min(v4164_den_power_base, v4164_den_power_peak,
@@ -12297,6 +12359,27 @@ def main():
                 f"{v4164_den_power_up_start_frac}, "
                 f"{v4164_den_power_peak_frac}, "
                 f"{v4164_den_power_hold_end_frac}, "
+                f"{v4164_den_power_down_end_frac}")
+    if v4164_den_power_schedule == 'early_impulse_decay':
+        if min(v4164_den_power_base, v4164_den_power_peak,
+               v4164_den_power_mid, v4164_den_power_final) < 0.0:
+            raise ValueError(
+                "v4164_den_power_base/peak/mid/final must be >= 0, got "
+                f"{v4164_den_power_base}, {v4164_den_power_peak}, "
+                f"{v4164_den_power_mid}, {v4164_den_power_final}")
+        if not (0.0 <= v4164_den_power_up_start_frac
+                < v4164_den_power_peak_frac
+                <= v4164_den_power_hold_end_frac
+                < v4164_den_power_mid_frac
+                < v4164_den_power_down_end_frac <= 1.0):
+            raise ValueError(
+                "v4164_den_power early_impulse_decay fractions must satisfy "
+                "0 <= up_start < peak <= hold_end < mid < down_end <= 1, "
+                "got "
+                f"{v4164_den_power_up_start_frac}, "
+                f"{v4164_den_power_peak_frac}, "
+                f"{v4164_den_power_hold_end_frac}, "
+                f"{v4164_den_power_mid_frac}, "
                 f"{v4164_den_power_down_end_frac}")
     if not (0.0 <= admission_floor_hold_frac <= admission_floor_end_frac <= 1.0):
         raise ValueError(
@@ -12401,10 +12484,12 @@ def main():
         'v4164_den_power_schedule': v4164_den_power_schedule,
         'v4164_den_power_base': v4164_den_power_base,
         'v4164_den_power_peak': v4164_den_power_peak,
+        'v4164_den_power_mid': v4164_den_power_mid,
         'v4164_den_power_final': v4164_den_power_final,
         'v4164_den_power_up_start_frac': v4164_den_power_up_start_frac,
         'v4164_den_power_peak_frac': v4164_den_power_peak_frac,
         'v4164_den_power_hold_end_frac': v4164_den_power_hold_end_frac,
+        'v4164_den_power_mid_frac': v4164_den_power_mid_frac,
         'v4164_den_power_down_end_frac': v4164_den_power_down_end_frac,
         'admission_floor_hold_frac': admission_floor_hold_frac,
         'admission_floor_end_frac': admission_floor_end_frac,
@@ -12973,10 +13058,12 @@ def main():
                         f"    schedule={v4164_den_power_schedule} "
                         f"base={v4164_den_power_base} "
                         f"peak={v4164_den_power_peak} "
+                        f"mid={v4164_den_power_mid} "
                         f"final={v4164_den_power_final} "
                         f"up_start={v4164_den_power_up_start_frac} "
                         f"peak_frac={v4164_den_power_peak_frac} "
                         f"hold_end={v4164_den_power_hold_end_frac} "
+                        f"mid_frac={v4164_den_power_mid_frac} "
                         f"down_end={v4164_den_power_down_end_frac} "
                         f"grad_scale={v4164_den_grad_scale}")
                     print("  Admission floor / drive baseline:")
@@ -13531,10 +13618,12 @@ def main():
         v4164_den_power_schedule=v4164_den_power_schedule,
         v4164_den_power_base=v4164_den_power_base,
         v4164_den_power_peak=v4164_den_power_peak,
+        v4164_den_power_mid=v4164_den_power_mid,
         v4164_den_power_final=v4164_den_power_final,
         v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
         v4164_den_power_peak_frac=v4164_den_power_peak_frac,
         v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
+        v4164_den_power_mid_frac=v4164_den_power_mid_frac,
         v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
         drive_anneal_enabled=drive_anneal_enabled,
         drive_ref_qk=drive_ref_qk,
@@ -13589,10 +13678,12 @@ def main():
         v4164_den_power_schedule=v4164_den_power_schedule,
         v4164_den_power_base=v4164_den_power_base,
         v4164_den_power_peak=v4164_den_power_peak,
+        v4164_den_power_mid=v4164_den_power_mid,
         v4164_den_power_final=v4164_den_power_final,
         v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
         v4164_den_power_peak_frac=v4164_den_power_peak_frac,
         v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
+        v4164_den_power_mid_frac=v4164_den_power_mid_frac,
         v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
         drive_anneal_enabled=drive_anneal_enabled,
         drive_ref_qk=drive_ref_qk,
@@ -13638,10 +13729,12 @@ def main():
                 v4164_den_power_schedule=v4164_den_power_schedule,
                 v4164_den_power_base=v4164_den_power_base,
                 v4164_den_power_peak=v4164_den_power_peak,
+                v4164_den_power_mid=v4164_den_power_mid,
                 v4164_den_power_final=v4164_den_power_final,
                 v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
                 v4164_den_power_peak_frac=v4164_den_power_peak_frac,
                 v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
+                v4164_den_power_mid_frac=v4164_den_power_mid_frac,
                 v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
                 drive_anneal_enabled=drive_anneal_enabled,
                 drive_ref_qk=drive_ref_qk,
@@ -13686,10 +13779,12 @@ def main():
             v4164_den_power_schedule=v4164_den_power_schedule,
             v4164_den_power_base=v4164_den_power_base,
             v4164_den_power_peak=v4164_den_power_peak,
+            v4164_den_power_mid=v4164_den_power_mid,
             v4164_den_power_final=v4164_den_power_final,
             v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
             v4164_den_power_peak_frac=v4164_den_power_peak_frac,
             v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
+            v4164_den_power_mid_frac=v4164_den_power_mid_frac,
             v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
             drive_anneal_enabled=drive_anneal_enabled,
             drive_ref_qk=drive_ref_qk,
@@ -13736,10 +13831,12 @@ def main():
             v4164_den_power_schedule=v4164_den_power_schedule,
             v4164_den_power_base=v4164_den_power_base,
             v4164_den_power_peak=v4164_den_power_peak,
+            v4164_den_power_mid=v4164_den_power_mid,
             v4164_den_power_final=v4164_den_power_final,
             v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
             v4164_den_power_peak_frac=v4164_den_power_peak_frac,
             v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
+            v4164_den_power_mid_frac=v4164_den_power_mid_frac,
             v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
             drive_anneal_enabled=drive_anneal_enabled,
             drive_ref_qk=drive_ref_qk,
