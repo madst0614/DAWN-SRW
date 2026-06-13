@@ -611,7 +611,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     #   backward gradient through den is scaled by den_grad_scale.
     # den_power=0.5 is RMS/energy-like inhibition; den_grad_scale=0 detaches
     # the inhibitory denominator gradient, 1 restores the full live den path.
-    _v4164_den_power = jnp.maximum(
+    _v4164_den_power_default = jnp.maximum(
         jnp.asarray(v4164_den_power, dtype=jnp.float32),
         jnp.float32(0.0))
     _v4164_den_grad_scale = jnp.clip(
@@ -702,7 +702,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                        P(),                       # admission_floor scalar
                        P(),                       # boundary_drive_ratio scalar
                        P(),                       # drive_baseline scalar
-                       P()),                      # drive_baseline_target_load_frac scalar
+                       P(),                       # drive_baseline_target_load_frac scalar
+                       P()),                      # v4164_den_power scalar
              out_specs=_out_specs,
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, raw_tau,
@@ -714,7 +715,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                        admission_floor,
                        boundary_drive_ratio,
                        drive_baseline,
-                       drive_baseline_target_load_frac):
+                       drive_baseline_target_load_frac,
+                       v4164_den_power_runtime):
         N_local = emb_local.shape[0]
         nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -817,6 +819,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             jnp.float32(0.0), jnp.float32(1.0))
         drive_baseline = jnp.maximum(
             jnp.asarray(drive_baseline, dtype=jnp.float32),
+            jnp.float32(0.0))
+        den_power = jnp.maximum(
+            jnp.asarray(v4164_den_power_runtime, dtype=jnp.float32),
             jnp.float32(0.0))
         drive_baseline_load_scale = jnp.float32(1.0)
 
@@ -1481,7 +1486,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         # while avoiding the early full-denominator collapse observed with
         # den_grad_scale=1 and den_power=1.
         den_base = jnp.maximum(global_den_cost, 1.0)
-        den_forward = jnp.power(den_base, _v4164_den_power)
+        den_forward = jnp.power(den_base, den_power)
         den_sg = jax.lax.stop_gradient(den_forward)
         den = den_sg + _v4164_den_grad_scale * (den_forward - den_sg)
         out = raw_out / den
@@ -1747,7 +1752,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     #   backward gradient through den is scaled by den_grad_scale.
     # den_power=0.5 is RMS/energy-like inhibition; den_grad_scale=0 detaches
     # the inhibitory denominator gradient, 1 restores the full live den path.
-    _v4164_den_power = jnp.maximum(
+    _v4164_den_power_default = jnp.maximum(
         jnp.asarray(v4164_den_power, dtype=jnp.float32),
         jnp.float32(0.0))
     _v4164_den_grad_scale = jnp.clip(
@@ -1846,7 +1851,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                        P(),                           # admission_floor scalar
                        P(),                           # boundary_drive_ratio scalar
                        P(),                           # drive_baseline scalar
-                       P()),                          # drive_baseline_target_load_frac scalar
+                       P(),                           # drive_baseline_target_load_frac scalar
+                       P()),                          # v4164_den_power scalar
              out_specs=_out_specs,
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, raw_tau,
@@ -1858,7 +1864,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                               admission_floor,
                               boundary_drive_ratio,
                               drive_baseline,
-                              drive_baseline_target_load_frac):
+                              drive_baseline_target_load_frac,
+                              v4164_den_power_runtime):
         N_local = emb_local.shape[0]
         nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -1964,6 +1971,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             jnp.float32(0.0), jnp.float32(1.0))
         drive_baseline = jnp.maximum(
             jnp.asarray(drive_baseline, dtype=jnp.float32),
+            jnp.float32(0.0))
+        den_power = jnp.maximum(
+            jnp.asarray(v4164_den_power_runtime, dtype=jnp.float32),
             jnp.float32(0.0))
         drive_baseline_load_scale = jnp.float32(1.0)
 
@@ -2659,7 +2669,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         # while avoiding the early full-denominator collapse observed with
         # den_grad_scale=1 and den_power=1.
         den_base = jnp.maximum(global_den_cost, 1.0)
-        den_forward = jnp.power(den_base, _v4164_den_power)
+        den_forward = jnp.power(den_base, den_power)
         den_sg = jax.lax.stop_gradient(den_forward)
         den = den_sg + _v4164_den_grad_scale * (den_forward - den_sg)
         out = raw_out / den
@@ -3007,6 +3017,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   soft_gate_T_v=None,
                   soft_gate_boundary_power=2.0,
                   soft_gate_boundary_power_final=4.0,
+                  v4164_den_power=1.0,
                   admission_floor=0.0,
                   boundary_drive_ratio=None,
                   drive_baseline_qk=0.012,
@@ -3032,6 +3043,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         drive_baseline_qk = drive_ref_qk
     if drive_baseline_v is None:
         drive_baseline_v = drive_ref_v
+    v4164_den_power = jnp.maximum(
+        jnp.asarray(v4164_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
     qk_emb = pool_params['attn_qk_emb']
     qk_read = pool_params['attn_qk_read']
     qk_write = pool_params['attn_qk_write']
@@ -3092,7 +3106,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                            admission_floor,
                            boundary_drive_ratio,
                            drive_baseline_qk,
-                           jnp.float32(0.20))
+                           jnp.float32(0.20),
+                           v4164_den_power)
     (QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
      qk_strong, qk_positive_margin_active, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
@@ -3132,7 +3147,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                            admission_floor,
                            boundary_drive_ratio,
                            drive_baseline_v,
-                           jnp.float32(0.08))
+                           jnp.float32(0.08),
+                           v4164_den_power)
     (V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
      v_strong, v_positive_margin_active, v_tau_abs,
      v_dead_pen, v_dead_cnt, v_int_max,
@@ -3214,7 +3230,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             boundary_drive_ratio=boundary_drive_ratio,
             drive_baseline=(drive_baseline_v if pool_id == 2 else drive_baseline_qk),
             drive_baseline_load_scale=1.0)
-        den = jnp.maximum(admission.sum(axis=-1), 1.0)
+        den = jnp.power(jnp.maximum(admission.sum(axis=-1), 1.0),
+                        v4164_den_power)
         active_n = active_mask.astype(jnp.float32).sum(axis=-1)
         read_dir = _forward_unit_direction(read_f)
         write_dir = _forward_unit_direction(write_f)
@@ -3801,6 +3818,7 @@ def _rst_forward(x, pool_params, router_params, rng,
                   soft_gate_T_rst=None,
                   soft_gate_boundary_power=2.0,
                   soft_gate_boundary_power_final=4.0,
+                  v4164_den_power=1.0,
                   admission_floor=0.0,
                   boundary_drive_ratio=None,
                   drive_baseline_rst=0.008,
@@ -3819,6 +3837,9 @@ def _rst_forward(x, pool_params, router_params, rng,
         boundary_drive_ratio = drive_mix
     if drive_baseline_rst is None:
         drive_baseline_rst = drive_ref_rst
+    v4164_den_power = jnp.maximum(
+        jnp.asarray(v4164_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
     rst_emb = pool_params['rst_emb']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
@@ -3873,7 +3894,8 @@ def _rst_forward(x, pool_params, router_params, rng,
             boundary_drive_ratio=boundary_drive_ratio,
             drive_baseline=drive_baseline_rst,
             drive_baseline_load_scale=1.0)
-        den = jnp.maximum(admission.sum(axis=-1), 1.0)
+        den = jnp.power(jnp.maximum(admission.sum(axis=-1), 1.0),
+                        v4164_den_power)
         active_n = active_mask.astype(jnp.float32).sum(axis=-1)
         read_dir = _forward_unit_direction(read_f)
         write_dir = _forward_unit_direction(write_f)
@@ -3944,7 +3966,8 @@ def _rst_forward(x, pool_params, router_params, rng,
                             admission_floor,
                             boundary_drive_ratio,
                             drive_baseline_rst,
-                            jnp.float32(0.04))
+                            jnp.float32(0.04),
+                            v4164_den_power)
     (out, active_frac, raw_gate_max, lb_loss, rho_std_slim, gate_sum, active_n_mean,
      strong_frac, positive_margin_mean_active, rst_tau_abs_mean,
      rst_dead_penalty, rst_dead_count, rst_int_max,
@@ -4141,6 +4164,16 @@ class DAWN(nn.Module):
     tau_init_attn_qk: Optional[float] = None
     tau_init_attn_v: Optional[float] = None
     tau_init_rst: Optional[float] = None
+    v4164_den_power: float = 1.0
+    v4164_den_grad_scale: float = 1.0
+    v4164_den_power_schedule: str = 'constant'
+    v4164_den_power_base: float = 1.0
+    v4164_den_power_peak: float = 1.0
+    v4164_den_power_final: float = 1.0
+    v4164_den_power_up_start_frac: float = 0.0
+    v4164_den_power_peak_frac: float = 0.0
+    v4164_den_power_hold_end_frac: float = 0.0
+    v4164_den_power_down_end_frac: float = 0.0
 
     def setup(self):
         if self.d_model % self.n_heads != 0:
@@ -4184,6 +4217,7 @@ class DAWN(nn.Module):
                  soft_gate_T_rst=None,
                  soft_gate_boundary_power=2.0,
                  soft_gate_boundary_power_final=4.0,
+                 v4164_den_power=None,
                  admission_floor=0.0,
                  boundary_drive_ratio=None,
                  drive_baseline_qk=0.012,
@@ -4221,6 +4255,11 @@ class DAWN(nn.Module):
             drive_baseline_v = drive_ref_v
         if drive_baseline_rst is None:
             drive_baseline_rst = drive_ref_rst
+        if v4164_den_power is None:
+            v4164_den_power = self.v4164_den_power
+        v4164_den_power = jnp.maximum(
+            jnp.asarray(v4164_den_power, dtype=jnp.float32),
+            jnp.float32(0.0))
         B, S = input_ids.shape
         focus_probe_enabled = bool(spike_probe and spike_focus_bpos is not None)
         focus_k = int(spike_probe_topk)
@@ -4539,6 +4578,7 @@ class DAWN(nn.Module):
                     soft_gate_T_v=soft_gate_T_v,
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+                    v4164_den_power=v4164_den_power,
                     admission_floor=admission_floor,
                     boundary_drive_ratio=boundary_drive_ratio,
                     drive_baseline_qk=drive_baseline_qk,
@@ -4650,6 +4690,7 @@ class DAWN(nn.Module):
                     soft_gate_T_rst=soft_gate_T_rst,
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+                    v4164_den_power=v4164_den_power,
                     admission_floor=admission_floor,
                     boundary_drive_ratio=boundary_drive_ratio,
                     drive_baseline_rst=drive_baseline_rst,
@@ -5077,6 +5118,9 @@ class DAWN(nn.Module):
                 soft_gate_boundary_power, dtype=jnp.float32),
             'soft_gate_boundary_power_final': jnp.asarray(
                 soft_gate_boundary_power_final, dtype=jnp.float32),
+            'v4164_den_power': jnp.asarray(
+                v4164_den_power, dtype=jnp.float32),
+            'den_power': jnp.asarray(v4164_den_power, dtype=jnp.float32),
             'admission_floor': jnp.asarray(admission_floor, dtype=jnp.float32),
             'boundary_drive_ratio': jnp.asarray(
                 boundary_drive_ratio, dtype=jnp.float32),
@@ -5111,10 +5155,11 @@ class DAWN(nn.Module):
             'rst_load_mean': rst_den_cost_mean_all.mean(),
             'normalization_load_mean': (
                 attn_den_cost_mean_all.mean() + rst_den_cost_mean_all.mean()) / 2.0,
-            'den_mean': jnp.sqrt(jnp.maximum(
+            'den_mean': jnp.power(jnp.maximum(
                 (attn_den_cost_mean_all.mean() + rst_den_cost_mean_all.mean())
                 / jnp.float32(2.0),
-                jnp.float32(1.0))),
+                jnp.float32(1.0)),
+                v4164_den_power),
             'drive_mean': (
                 attn_current_cost_mean_all.mean()
                 + rst_current_cost_mean_all.mean()) / jnp.float32(2.0),

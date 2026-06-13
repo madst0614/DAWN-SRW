@@ -820,6 +820,24 @@ def _dawn_srw_kwargs(cfg):
         if (version not in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                 and ('d_select' in m or 'd_select' in t)):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
+        if version == V4165_MODEL_VERSION:
+            den_defaults = {
+                'v4164_den_power': 1.0,
+                'v4164_den_grad_scale': 1.0,
+                'v4164_den_power_schedule': 'constant',
+                'v4164_den_power_base': _cfg_get('v4164_den_power', 1.0),
+                'v4164_den_power_peak': _cfg_get('v4164_den_power', 1.0),
+                'v4164_den_power_final': _cfg_get('v4164_den_power', 1.0),
+                'v4164_den_power_up_start_frac': 0.0,
+                'v4164_den_power_peak_frac': 0.0,
+                'v4164_den_power_hold_end_frac': 0.0,
+                'v4164_den_power_down_end_frac': 0.0,
+            }
+            for name, default in den_defaults.items():
+                if name in ('v4164_den_power_schedule',):
+                    kw[name] = str(_cfg_get(name, default))
+                else:
+                    kw[name] = float(_cfg_get(name, default))
     return kw
 
 
@@ -1677,6 +1695,15 @@ def _model_accepts_boundary_drive_ratio(model):
         return False
 
 
+def _model_accepts_v4164_den_power(model):
+    """Return True if model.__call__ accepts runtime den_power."""
+    import inspect as _inspect
+    try:
+        return 'v4164_den_power' in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _model_accepts_spike_probe(model):
     """Return True if model.__call__ accepts the event-triggered probe path."""
     import inspect as _inspect
@@ -1993,25 +2020,29 @@ _scheduled_scalar = scheduled_value_by_frac
 
 def scheduled_boundary_power_by_frac(
         step, total_steps, enabled, start, mid, final,
-        mid_frac, final_frac):
+        mid_frac, final_frac, start_frac=0.0):
     step_f = jnp.asarray(step, dtype=jnp.float32)
     total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
     frac = jnp.clip(step_f / total_f, 0.0, 1.0)
     start_f = jnp.asarray(start, dtype=jnp.float32)
     mid_f = jnp.asarray(mid, dtype=jnp.float32)
     final_f = jnp.asarray(final, dtype=jnp.float32)
+    start_frac_f = jnp.asarray(start_frac, dtype=jnp.float32)
     mid_frac_f = jnp.asarray(mid_frac, dtype=jnp.float32)
     final_frac_f = jnp.asarray(final_frac, dtype=jnp.float32)
     eps = jnp.float32(1.0e-6)
-    u_mid = jnp.clip(frac / jnp.maximum(mid_frac_f, eps), 0.0, 1.0)
+    u_mid = jnp.clip(
+        (frac - start_frac_f) / jnp.maximum(mid_frac_f - start_frac_f, eps),
+        0.0, 1.0)
     u_final = jnp.clip(
         (frac - mid_frac_f) / jnp.maximum(final_frac_f - mid_frac_f, eps),
         0.0, 1.0)
     mid_val = start_f + (mid_f - start_f) * jnp.square(u_mid)
     final_val = mid_f + (final_f - mid_f) * u_final
     scheduled = jnp.where(
-        frac < mid_frac_f, mid_val,
-        jnp.where(frac < final_frac_f, final_val, final_f))
+        frac < start_frac_f, start_f,
+        jnp.where(frac < mid_frac_f, mid_val,
+            jnp.where(frac < final_frac_f, final_val, final_f)))
     return jnp.where(jnp.asarray(enabled), scheduled, jnp.float32(2.0))
 
 
@@ -2224,16 +2255,63 @@ def scheduled_admission_floor_by_frac(step, total_steps,
     return jnp.where(end > hold, floor, jnp.float32(0.0))
 
 
-def scheduled_boundary_drive_ratio_by_frac(step, total_steps, end_frac=0.0):
+def scheduled_boundary_drive_ratio_by_frac(
+        step, total_steps, start_frac=0.0, end_frac=0.0):
     """Smoothstep transition from drive_baseline to boundary_drive."""
     step_f = jnp.asarray(step, dtype=jnp.float32)
     total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
     frac = jnp.clip(step_f / total_f, 0.0, 1.0)
-    end = jnp.asarray(end_frac, dtype=jnp.float32)
+    start = jnp.clip(
+        jnp.asarray(start_frac, dtype=jnp.float32),
+        jnp.float32(0.0), jnp.float32(1.0))
+    end = jnp.clip(
+        jnp.asarray(end_frac, dtype=jnp.float32),
+        jnp.float32(0.0), jnp.float32(1.0))
     eps = jnp.float32(1.0e-8)
-    u = jnp.clip(frac / jnp.maximum(end, eps), 0.0, 1.0)
+    u = jnp.clip((frac - start) / jnp.maximum(end - start, eps), 0.0, 1.0)
     s = u * u * (jnp.float32(3.0) - jnp.float32(2.0) * u)
-    return jnp.where(end > 0.0, s, jnp.float32(1.0))
+    return jnp.where(end > start, s, jnp.float32(1.0))
+
+
+def smoothstep01(x):
+    u = jnp.clip(jnp.asarray(x, dtype=jnp.float32), 0.0, 1.0)
+    return u * u * (jnp.float32(3.0) - jnp.float32(2.0) * u)
+
+
+def scheduled_den_power_by_frac(
+        step, total_steps, schedule, den_power,
+        base, peak, final, up_start_frac, peak_frac,
+        hold_end_frac, down_end_frac):
+    """Backward-compatible v4164 den_power or v4165 bump schedule."""
+    den_power_f = jnp.asarray(den_power, dtype=jnp.float32)
+    if str(schedule).lower() != 'bump':
+        return den_power_f
+
+    step_f = jnp.asarray(step, dtype=jnp.float32)
+    total_f = jnp.maximum(jnp.asarray(total_steps, dtype=jnp.float32), 1.0)
+    progress = jnp.clip(step_f / total_f, 0.0, 1.0)
+
+    base_f = jnp.asarray(base, dtype=jnp.float32)
+    peak_f = jnp.asarray(peak, dtype=jnp.float32)
+    final_f = jnp.asarray(final, dtype=jnp.float32)
+    up_start = jnp.asarray(up_start_frac, dtype=jnp.float32)
+    peak_at = jnp.asarray(peak_frac, dtype=jnp.float32)
+    hold_end = jnp.asarray(hold_end_frac, dtype=jnp.float32)
+    down_end = jnp.asarray(down_end_frac, dtype=jnp.float32)
+    eps = jnp.float32(1.0e-8)
+
+    up_u = smoothstep01(
+        (progress - up_start) / jnp.maximum(peak_at - up_start, eps))
+    down_u = smoothstep01(
+        (progress - hold_end) / jnp.maximum(down_end - hold_end, eps))
+    up_val = base_f + (peak_f - base_f) * up_u
+    down_val = peak_f + (final_f - peak_f) * down_u
+
+    scheduled = jnp.where(progress < up_start, base_f, up_val)
+    scheduled = jnp.where(progress >= peak_at, peak_f, scheduled)
+    scheduled = jnp.where(progress >= hold_end, down_val, scheduled)
+    scheduled = jnp.where(progress >= down_end, final_f, scheduled)
+    return scheduled
 
 
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
@@ -2312,8 +2390,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       soft_gate_boundary_power_start=3.0,
                       soft_gate_boundary_power_mid=3.15,
                       soft_gate_boundary_power_final=4.0,
+                      soft_gate_boundary_power_start_frac=0.0,
                       soft_gate_boundary_power_mid_frac=0.800,
                       soft_gate_boundary_power_final_frac=0.950,
+                      v4164_den_power=1.0,
+                      v4164_den_power_schedule='constant',
+                      v4164_den_power_base=1.0,
+                      v4164_den_power_peak=1.0,
+                      v4164_den_power_final=1.0,
+                      v4164_den_power_up_start_frac=0.0,
+                      v4164_den_power_peak_frac=0.0,
+                      v4164_den_power_hold_end_frac=0.0,
+                      v4164_den_power_down_end_frac=0.0,
                       drive_anneal_enabled=False,
                       drive_ref_qk=0.05,
                       drive_ref_v=0.04,
@@ -2326,6 +2414,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       drive_baseline_qk=0.012,
                       drive_baseline_v=0.010,
                       drive_baseline_rst=0.008,
+                      boundary_drive_ratio_start_frac=0.0,
                       boundary_drive_ratio_end_frac=0.0,
                       rpe_start_frac=0.0,
                       rpe_full_frac=0.0,
@@ -2476,6 +2565,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_drive_mix_kw = _model_accepts_drive_mix(model)
     _pass_admission_floor_kw = _model_accepts_admission_floor(model)
     _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
+    _pass_den_power_kw = _model_accepts_v4164_den_power(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
@@ -2541,10 +2631,24 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         soft_gate_boundary_power_mid)
     _soft_gate_boundary_power_final = jnp.float32(
         soft_gate_boundary_power_final)
+    _soft_gate_boundary_power_start_frac = jnp.float32(
+        soft_gate_boundary_power_start_frac)
     _soft_gate_boundary_power_mid_frac = jnp.float32(
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
+    _v4164_den_power = jnp.float32(v4164_den_power)
+    _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
+    _v4164_den_power_base = jnp.float32(v4164_den_power_base)
+    _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
+    _v4164_den_power_final = jnp.float32(v4164_den_power_final)
+    _v4164_den_power_up_start_frac = jnp.float32(
+        v4164_den_power_up_start_frac)
+    _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
+    _v4164_den_power_hold_end_frac = jnp.float32(
+        v4164_den_power_hold_end_frac)
+    _v4164_den_power_down_end_frac = jnp.float32(
+        v4164_den_power_down_end_frac)
     _drive_anneal_enabled = bool(drive_anneal_enabled)
     _drive_ref_qk = jnp.float32(drive_ref_qk)
     _drive_ref_v = jnp.float32(drive_ref_v)
@@ -2557,6 +2661,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _drive_baseline_qk = jnp.float32(drive_baseline_qk)
     _drive_baseline_v = jnp.float32(drive_baseline_v)
     _drive_baseline_rst = jnp.float32(drive_baseline_rst)
+    _boundary_drive_ratio_start_frac = float(boundary_drive_ratio_start_frac)
     _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
     _rpe_start_frac = jnp.float32(rpe_start_frac)
     _rpe_full_frac = jnp.float32(rpe_full_frac)
@@ -2618,13 +2723,23 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
                 _soft_gate_boundary_power_mid_frac,
-                _soft_gate_boundary_power_final_frac)
+                _soft_gate_boundary_power_final_frac,
+                _soft_gate_boundary_power_start_frac)
             admission_floor = scheduled_admission_floor_by_frac(
                 step, _total_training_steps,
                 _admission_floor_hold_frac, _admission_floor_end_frac)
             boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
                 step, _total_training_steps,
+                _boundary_drive_ratio_start_frac,
                 _boundary_drive_ratio_end_frac)
+            den_power_p = scheduled_den_power_by_frac(
+                step, _total_training_steps,
+                _v4164_den_power_schedule, _v4164_den_power,
+                _v4164_den_power_base, _v4164_den_power_peak,
+                _v4164_den_power_final, _v4164_den_power_up_start_frac,
+                _v4164_den_power_peak_frac,
+                _v4164_den_power_hold_end_frac,
+                _v4164_den_power_down_end_frac)
             drive_mix = jnp.where(
                 jnp.asarray(_drive_anneal_enabled),
                 _scheduled_scalar(
@@ -2661,6 +2776,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 extra_kw['drive_ref_qk'] = _drive_ref_qk
                 extra_kw['drive_ref_v'] = _drive_ref_v
                 extra_kw['drive_ref_rst'] = _drive_ref_rst
+            if _pass_den_power_kw:
+                extra_kw['v4164_den_power'] = den_power_p
             if _pass_execution_prune_kw:
                 # Training never execution-prunes; pruning is eval-sweep only.
                 extra_kw['execution_prune_eps'] = jnp.float32(0.0)
@@ -3205,6 +3322,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 soft_gate_T_v=soft_gate_T_v,
                 soft_gate_T_rst=soft_gate_T_rst,
                 boundary_power_p=boundary_power_p,
+                v4164_den_power=den_power_p,
                 admission_floor=admission_floor,
                 boundary_drive_ratio=boundary_drive_ratio,
                 rpe_schedule_scale=rpe_schedule_scale,
@@ -3981,6 +4099,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'soft_gate_T_v': explore_stats['soft_gate_T_v'],
             'soft_gate_T_rst': explore_stats['soft_gate_T_rst'],
             'boundary_power_p': explore_stats['boundary_power_p'],
+            'v4164_den_power': explore_stats['v4164_den_power'],
+            'den_power': explore_stats['v4164_den_power'],
             'admission_floor': explore_stats['admission_floor'],
             'boundary_drive_ratio': explore_stats['boundary_drive_ratio'],
             'rpe_effective_weight': (
@@ -4717,8 +4837,18 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_boundary_power_start=3.0,
                      soft_gate_boundary_power_mid=3.15,
                      soft_gate_boundary_power_final=4.0,
+                     soft_gate_boundary_power_start_frac=0.0,
                      soft_gate_boundary_power_mid_frac=0.800,
                      soft_gate_boundary_power_final_frac=0.950,
+                     v4164_den_power=1.0,
+                     v4164_den_power_schedule='constant',
+                     v4164_den_power_base=1.0,
+                     v4164_den_power_peak=1.0,
+                     v4164_den_power_final=1.0,
+                     v4164_den_power_up_start_frac=0.0,
+                     v4164_den_power_peak_frac=0.0,
+                     v4164_den_power_hold_end_frac=0.0,
+                     v4164_den_power_down_end_frac=0.0,
                      drive_anneal_enabled=False,
                      drive_ref_qk=0.05,
                      drive_ref_v=0.04,
@@ -4731,6 +4861,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      drive_baseline_qk=0.012,
                      drive_baseline_v=0.010,
                      drive_baseline_rst=0.008,
+                     boundary_drive_ratio_start_frac=0.0,
                      boundary_drive_ratio_end_frac=0.0):
     """Create a jit-compiled evaluation step.
 
@@ -4746,6 +4877,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _pass_drive_mix_kw = _model_accepts_drive_mix(model)
     _pass_admission_floor_kw = _model_accepts_admission_floor(model)
     _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
+    _pass_den_power_kw = _model_accepts_v4164_den_power(model)
     _execution_prune_eps = jnp.float32(execution_prune_eps)
     _return_prune_stats = bool(return_prune_stats)
     _soft_gate_runtime_enabled = bool(
@@ -4789,10 +4921,24 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         soft_gate_boundary_power_mid)
     _soft_gate_boundary_power_final = jnp.float32(
         soft_gate_boundary_power_final)
+    _soft_gate_boundary_power_start_frac = jnp.float32(
+        soft_gate_boundary_power_start_frac)
     _soft_gate_boundary_power_mid_frac = jnp.float32(
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
+    _v4164_den_power = jnp.float32(v4164_den_power)
+    _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
+    _v4164_den_power_base = jnp.float32(v4164_den_power_base)
+    _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
+    _v4164_den_power_final = jnp.float32(v4164_den_power_final)
+    _v4164_den_power_up_start_frac = jnp.float32(
+        v4164_den_power_up_start_frac)
+    _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
+    _v4164_den_power_hold_end_frac = jnp.float32(
+        v4164_den_power_hold_end_frac)
+    _v4164_den_power_down_end_frac = jnp.float32(
+        v4164_den_power_down_end_frac)
     _drive_anneal_enabled = bool(drive_anneal_enabled)
     _drive_ref_qk = jnp.float32(drive_ref_qk)
     _drive_ref_v = jnp.float32(drive_ref_v)
@@ -4805,6 +4951,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _drive_baseline_qk = jnp.float32(drive_baseline_qk)
     _drive_baseline_v = jnp.float32(drive_baseline_v)
     _drive_baseline_rst = jnp.float32(drive_baseline_rst)
+    _boundary_drive_ratio_start_frac = float(boundary_drive_ratio_start_frac)
     _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
 
     @jax.jit
@@ -4833,7 +4980,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
                 _soft_gate_boundary_power_mid_frac,
-                _soft_gate_boundary_power_final_frac)
+                _soft_gate_boundary_power_final_frac,
+                _soft_gate_boundary_power_start_frac)
             extra_kw['soft_gate_boundary_power'] = boundary_power_p
             extra_kw['soft_gate_boundary_power_final'] = (
                 _soft_gate_boundary_power_final)
@@ -4844,7 +4992,16 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             _admission_floor_hold_frac, _admission_floor_end_frac)
         boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
             step, _total_training_steps,
+            _boundary_drive_ratio_start_frac,
             _boundary_drive_ratio_end_frac)
+        den_power_p = scheduled_den_power_by_frac(
+            step, _total_training_steps,
+            _v4164_den_power_schedule, _v4164_den_power,
+            _v4164_den_power_base, _v4164_den_power_peak,
+            _v4164_den_power_final, _v4164_den_power_up_start_frac,
+            _v4164_den_power_peak_frac,
+            _v4164_den_power_hold_end_frac,
+            _v4164_den_power_down_end_frac)
         if _pass_admission_floor_kw:
             extra_kw['admission_floor'] = admission_floor
             extra_kw['drive_baseline_qk'] = _drive_baseline_qk
@@ -4864,6 +5021,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             extra_kw['drive_ref_qk'] = _drive_ref_qk
             extra_kw['drive_ref_v'] = _drive_ref_v
             extra_kw['drive_ref_rst'] = _drive_ref_rst
+        if _pass_den_power_kw:
+            extra_kw['v4164_den_power'] = den_power_p
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = _execution_prune_eps
         result = model.apply(
@@ -4917,8 +5076,18 @@ def create_analysis_step(model, sharded_fns=None,
                          soft_gate_boundary_power_start=3.0,
                          soft_gate_boundary_power_mid=3.15,
                          soft_gate_boundary_power_final=4.0,
+                         soft_gate_boundary_power_start_frac=0.0,
                          soft_gate_boundary_power_mid_frac=0.800,
                          soft_gate_boundary_power_final_frac=0.950,
+                         v4164_den_power=1.0,
+                         v4164_den_power_schedule='constant',
+                         v4164_den_power_base=1.0,
+                         v4164_den_power_peak=1.0,
+                         v4164_den_power_final=1.0,
+                         v4164_den_power_up_start_frac=0.0,
+                         v4164_den_power_peak_frac=0.0,
+                         v4164_den_power_hold_end_frac=0.0,
+                         v4164_den_power_down_end_frac=0.0,
                          drive_anneal_enabled=False,
                          drive_ref_qk=0.05,
                          drive_ref_v=0.04,
@@ -4931,6 +5100,7 @@ def create_analysis_step(model, sharded_fns=None,
                      drive_baseline_qk=0.012,
                      drive_baseline_v=0.010,
                      drive_baseline_rst=0.008,
+                     boundary_drive_ratio_start_frac=0.0,
                      boundary_drive_ratio_end_frac=0.0):
     """Create a jit-compiled analysis step (FULL forward, observational).
 
@@ -4947,6 +5117,7 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_drive_mix_kw = _model_accepts_drive_mix(model)
     _pass_admission_floor_kw = _model_accepts_admission_floor(model)
     _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
+    _pass_den_power_kw = _model_accepts_v4164_den_power(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
@@ -4988,10 +5159,24 @@ def create_analysis_step(model, sharded_fns=None,
         soft_gate_boundary_power_mid)
     _soft_gate_boundary_power_final = jnp.float32(
         soft_gate_boundary_power_final)
+    _soft_gate_boundary_power_start_frac = jnp.float32(
+        soft_gate_boundary_power_start_frac)
     _soft_gate_boundary_power_mid_frac = jnp.float32(
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
+    _v4164_den_power = jnp.float32(v4164_den_power)
+    _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
+    _v4164_den_power_base = jnp.float32(v4164_den_power_base)
+    _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
+    _v4164_den_power_final = jnp.float32(v4164_den_power_final)
+    _v4164_den_power_up_start_frac = jnp.float32(
+        v4164_den_power_up_start_frac)
+    _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
+    _v4164_den_power_hold_end_frac = jnp.float32(
+        v4164_den_power_hold_end_frac)
+    _v4164_den_power_down_end_frac = jnp.float32(
+        v4164_den_power_down_end_frac)
     _drive_anneal_enabled = bool(drive_anneal_enabled)
     _drive_ref_qk = jnp.float32(drive_ref_qk)
     _drive_ref_v = jnp.float32(drive_ref_v)
@@ -5004,6 +5189,7 @@ def create_analysis_step(model, sharded_fns=None,
     _drive_baseline_qk = jnp.float32(drive_baseline_qk)
     _drive_baseline_v = jnp.float32(drive_baseline_v)
     _drive_baseline_rst = jnp.float32(drive_baseline_rst)
+    _boundary_drive_ratio_start_frac = float(boundary_drive_ratio_start_frac)
     _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
 
     @jax.jit
@@ -5032,7 +5218,8 @@ def create_analysis_step(model, sharded_fns=None,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
                 _soft_gate_boundary_power_mid_frac,
-                _soft_gate_boundary_power_final_frac)
+                _soft_gate_boundary_power_final_frac,
+                _soft_gate_boundary_power_start_frac)
             extra_kw['soft_gate_boundary_power'] = boundary_power_p
             extra_kw['soft_gate_boundary_power_final'] = (
                 _soft_gate_boundary_power_final)
@@ -5043,7 +5230,16 @@ def create_analysis_step(model, sharded_fns=None,
             _admission_floor_hold_frac, _admission_floor_end_frac)
         boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
             step, _total_training_steps,
+            _boundary_drive_ratio_start_frac,
             _boundary_drive_ratio_end_frac)
+        den_power_p = scheduled_den_power_by_frac(
+            step, _total_training_steps,
+            _v4164_den_power_schedule, _v4164_den_power,
+            _v4164_den_power_base, _v4164_den_power_peak,
+            _v4164_den_power_final, _v4164_den_power_up_start_frac,
+            _v4164_den_power_peak_frac,
+            _v4164_den_power_hold_end_frac,
+            _v4164_den_power_down_end_frac)
         if _pass_admission_floor_kw:
             extra_kw['admission_floor'] = admission_floor
             extra_kw['drive_baseline_qk'] = _drive_baseline_qk
@@ -5063,6 +5259,8 @@ def create_analysis_step(model, sharded_fns=None,
             extra_kw['drive_ref_qk'] = _drive_ref_qk
             extra_kw['drive_ref_v'] = _drive_ref_v
             extra_kw['drive_ref_rst'] = _drive_ref_rst
+        if _pass_den_power_kw:
+            extra_kw['v4164_den_power'] = den_power_p
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         result = model.apply(
@@ -5191,8 +5389,18 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                             soft_gate_boundary_power_start=3.0,
                             soft_gate_boundary_power_mid=3.15,
                             soft_gate_boundary_power_final=4.0,
+                            soft_gate_boundary_power_start_frac=0.0,
                             soft_gate_boundary_power_mid_frac=0.800,
                             soft_gate_boundary_power_final_frac=0.950,
+                            v4164_den_power=1.0,
+                            v4164_den_power_schedule='constant',
+                            v4164_den_power_base=1.0,
+                            v4164_den_power_peak=1.0,
+                            v4164_den_power_final=1.0,
+                            v4164_den_power_up_start_frac=0.0,
+                            v4164_den_power_peak_frac=0.0,
+                            v4164_den_power_hold_end_frac=0.0,
+                            v4164_den_power_down_end_frac=0.0,
                             drive_anneal_enabled=False,
                             drive_ref_qk=0.05,
                             drive_ref_v=0.04,
@@ -5205,6 +5413,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                      drive_baseline_qk=0.012,
                      drive_baseline_v=0.010,
                      drive_baseline_rst=0.008,
+                     boundary_drive_ratio_start_frac=0.0,
                      boundary_drive_ratio_end_frac=0.0):
     """Event-only forward probe. No gradients, no optimizer updates.
 
@@ -5225,6 +5434,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _pass_drive_mix_kw = _model_accepts_drive_mix(model)
     _pass_admission_floor_kw = _model_accepts_admission_floor(model)
     _pass_boundary_drive_ratio_kw = _model_accepts_boundary_drive_ratio(model)
+    _pass_den_power_kw = _model_accepts_v4164_den_power(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_enabled
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
@@ -5266,10 +5476,24 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
         soft_gate_boundary_power_mid)
     _soft_gate_boundary_power_final = jnp.float32(
         soft_gate_boundary_power_final)
+    _soft_gate_boundary_power_start_frac = jnp.float32(
+        soft_gate_boundary_power_start_frac)
     _soft_gate_boundary_power_mid_frac = jnp.float32(
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
+    _v4164_den_power = jnp.float32(v4164_den_power)
+    _v4164_den_power_schedule = str(v4164_den_power_schedule).lower()
+    _v4164_den_power_base = jnp.float32(v4164_den_power_base)
+    _v4164_den_power_peak = jnp.float32(v4164_den_power_peak)
+    _v4164_den_power_final = jnp.float32(v4164_den_power_final)
+    _v4164_den_power_up_start_frac = jnp.float32(
+        v4164_den_power_up_start_frac)
+    _v4164_den_power_peak_frac = jnp.float32(v4164_den_power_peak_frac)
+    _v4164_den_power_hold_end_frac = jnp.float32(
+        v4164_den_power_hold_end_frac)
+    _v4164_den_power_down_end_frac = jnp.float32(
+        v4164_den_power_down_end_frac)
     _drive_anneal_enabled = bool(drive_anneal_enabled)
     _drive_ref_qk = jnp.float32(drive_ref_qk)
     _drive_ref_v = jnp.float32(drive_ref_v)
@@ -5282,6 +5506,7 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
     _drive_baseline_qk = jnp.float32(drive_baseline_qk)
     _drive_baseline_v = jnp.float32(drive_baseline_v)
     _drive_baseline_rst = jnp.float32(drive_baseline_rst)
+    _boundary_drive_ratio_start_frac = float(boundary_drive_ratio_start_frac)
     _boundary_drive_ratio_end_frac = jnp.float32(boundary_drive_ratio_end_frac)
     _topk = int(topk)
 
@@ -5313,7 +5538,8 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
                 _soft_gate_boundary_power_mid_frac,
-                _soft_gate_boundary_power_final_frac)
+                _soft_gate_boundary_power_final_frac,
+                _soft_gate_boundary_power_start_frac)
             extra_kw['soft_gate_boundary_power'] = boundary_power_p
             extra_kw['soft_gate_boundary_power_final'] = (
                 _soft_gate_boundary_power_final)
@@ -5324,7 +5550,16 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
             _admission_floor_hold_frac, _admission_floor_end_frac)
         boundary_drive_ratio = scheduled_boundary_drive_ratio_by_frac(
             step, _total_training_steps,
+            _boundary_drive_ratio_start_frac,
             _boundary_drive_ratio_end_frac)
+        den_power_p = scheduled_den_power_by_frac(
+            step, _total_training_steps,
+            _v4164_den_power_schedule, _v4164_den_power,
+            _v4164_den_power_base, _v4164_den_power_peak,
+            _v4164_den_power_final, _v4164_den_power_up_start_frac,
+            _v4164_den_power_peak_frac,
+            _v4164_den_power_hold_end_frac,
+            _v4164_den_power_down_end_frac)
         if _pass_admission_floor_kw:
             extra_kw['admission_floor'] = admission_floor
             extra_kw['drive_baseline_qk'] = _drive_baseline_qk
@@ -5344,6 +5579,8 @@ def create_spike_probe_step(model, sharded_fns=None, topk=8,
             extra_kw['drive_ref_qk'] = _drive_ref_qk
             extra_kw['drive_ref_v'] = _drive_ref_v
             extra_kw['drive_ref_rst'] = _drive_ref_rst
+        if _pass_den_power_kw:
+            extra_kw['v4164_den_power'] = den_power_p
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         result = model.apply(
@@ -6589,7 +6826,8 @@ def _print_v4165_compact_regular_block(rec, ctx):
         f"B[qk={_rec_float(rec, 'soft_gate_T_qk'):.5f} "
         f"v={_rec_float(rec, 'soft_gate_T_v'):.5f} "
         f"rst={_rec_float(rec, 'soft_gate_T_rst'):.5f}] "
-        f"p={_rec_float(rec, 'boundary_power_p', 2.0):.3f}"
+        f"p={_rec_float(rec, 'boundary_power_p', 2.0):.3f} "
+        f"den_p={_rec_float(rec, 'v4164_den_power', 1.0):.3f}"
     )
     log_message(
         "state: "
@@ -6951,6 +7189,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'boundary_power_p': float(m.get(
             'boundary_power_p',
             m.get('soft_gate_boundary_power', 2.0))),
+        'v4164_den_power': float(m.get(
+            'v4164_den_power', m.get('den_power', 1.0))),
+        'den_power': float(m.get(
+            'den_power', m.get('v4164_den_power', 1.0))),
         'soft_gate_schedule': ctx.get('soft_gate_schedule', 'cosine'),
         'soft_gate_t_gompertz_center': float(ctx.get(
             'soft_gate_t_gompertz_center', 0.25)),
@@ -7752,6 +7994,7 @@ def _print_regular_block(rec, ctx):
                 else 'soft_gate_T')
             _power_part = (
                 f" boundary_power_p={rec.get('boundary_power_p', 2.0):.3f}"
+                f" den_p={rec.get('v4164_den_power', rec.get('den_power', 1.0)):.3f}"
                 if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
                 else "")
             log_message(
@@ -9748,6 +9991,7 @@ def _print_debug_block(rec, ctx):
             else 'soft_gate_T')
         _power_part = (
             f" boundary_power_p={_g('boundary_power_p', 2.0):.3f}"
+            f" den_p={_g('v4164_den_power', _g('den_power', 1.0)):.3f}"
             if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
             else "")
         log_debug_message(
@@ -11154,12 +11398,48 @@ def main():
         'soft_gate_boundary_power_mid', 3.15))
     soft_gate_boundary_power_final = float(tcfg.get(
         'soft_gate_boundary_power_final', 4.0))
+    soft_gate_boundary_power_start_frac = float(tcfg.get(
+        'soft_gate_boundary_power_start_frac', 0.0))
     soft_gate_boundary_power_mid_frac = float(tcfg.get(
         'soft_gate_boundary_power_mid_frac', 0.800))
     soft_gate_boundary_power_final_frac = float(tcfg.get(
         'soft_gate_boundary_power_final_frac', 0.950))
     soft_gate_effective_active_eps = float(
         tcfg.get('soft_gate_effective_active_eps', 1.0e-6))
+    v4164_den_power = float(tcfg.get('v4164_den_power', 1.0))
+    v4164_den_grad_scale = float(tcfg.get('v4164_den_grad_scale', 1.0))
+    v4164_den_power_schedule = str(tcfg.get(
+        'v4164_den_power_schedule', 'constant')).lower()
+    v4164_den_power_base = float(tcfg.get(
+        'v4164_den_power_base', v4164_den_power))
+    v4164_den_power_peak = float(tcfg.get(
+        'v4164_den_power_peak', v4164_den_power_base))
+    v4164_den_power_final = float(tcfg.get(
+        'v4164_den_power_final', v4164_den_power))
+    v4164_den_power_up_start_frac = float(tcfg.get(
+        'v4164_den_power_up_start_frac', 0.0))
+    v4164_den_power_peak_frac = float(tcfg.get(
+        'v4164_den_power_peak_frac', 0.0))
+    v4164_den_power_hold_end_frac = float(tcfg.get(
+        'v4164_den_power_hold_end_frac',
+        v4164_den_power_peak_frac))
+    v4164_den_power_down_end_frac = float(tcfg.get(
+        'v4164_den_power_down_end_frac',
+        v4164_den_power_hold_end_frac))
+    den_power_schedule_keys = (
+        'v4164_den_power',
+        'v4164_den_grad_scale',
+        'v4164_den_power_schedule',
+        'v4164_den_power_base',
+        'v4164_den_power_peak',
+        'v4164_den_power_final',
+        'v4164_den_power_up_start_frac',
+        'v4164_den_power_peak_frac',
+        'v4164_den_power_hold_end_frac',
+        'v4164_den_power_down_end_frac',
+    )
+    current_den_power_config_override = any(
+        key in tcfg for key in den_power_schedule_keys)
     regular_diagnostics_level_default = (
         'compact'
         if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
@@ -11236,6 +11516,8 @@ def main():
     drive_baseline_qk = float(tcfg.get('drive_baseline_qk', 0.012))
     drive_baseline_v = float(tcfg.get('drive_baseline_v', 0.010))
     drive_baseline_rst = float(tcfg.get('drive_baseline_rst', 0.008))
+    boundary_drive_ratio_start_frac = float(tcfg.get(
+        'boundary_drive_ratio_start_frac', 0.0))
     boundary_drive_ratio_end_frac = float(tcfg.get(
         'boundary_drive_ratio_end_frac',
         tcfg.get('drive_mix_end_frac', 0.0)))
@@ -11505,6 +11787,43 @@ def main():
                 saved_cfg = None
 
         if saved_training_config and restore_training_config_on_resume:
+            saved_den_power_signature = {
+                key: saved_training_config.get(key, '<missing>')
+                for key in den_power_schedule_keys
+            }
+            current_den_power_signature = {
+                'v4164_den_power': v4164_den_power,
+                'v4164_den_grad_scale': v4164_den_grad_scale,
+                'v4164_den_power_schedule': v4164_den_power_schedule,
+                'v4164_den_power_base': v4164_den_power_base,
+                'v4164_den_power_peak': v4164_den_power_peak,
+                'v4164_den_power_final': v4164_den_power_final,
+                'v4164_den_power_up_start_frac':
+                    v4164_den_power_up_start_frac,
+                'v4164_den_power_peak_frac': v4164_den_power_peak_frac,
+                'v4164_den_power_hold_end_frac':
+                    v4164_den_power_hold_end_frac,
+                'v4164_den_power_down_end_frac':
+                    v4164_den_power_down_end_frac,
+            }
+            if current_den_power_config_override:
+                def _norm_sig_value(v):
+                    try:
+                        return round(float(v), 10)
+                    except (TypeError, ValueError):
+                        return str(v).lower()
+
+                den_power_mismatch = any(
+                    _norm_sig_value(saved_den_power_signature[key])
+                    != _norm_sig_value(current_den_power_signature[key])
+                    for key in den_power_schedule_keys)
+                if den_power_mismatch and jax.process_index() == 0:
+                    print(
+                        "  Warning: checkpoint training config has stale or "
+                        "different v4164_den_power schedule fields. Keeping "
+                        "the current config override; use a fresh run for the "
+                        "new bump schedule or remove the override to reproduce "
+                        "the checkpoint config.")
             # Apply checkpoint training config (CLI args take precedence)
             if cli_args.batch_size is None:
                 batch_size = saved_training_config.get('batch_size', batch_size)
@@ -11660,6 +11979,10 @@ def main():
                 saved_training_config.get(
                     'soft_gate_boundary_power_final',
                     soft_gate_boundary_power_final))
+            soft_gate_boundary_power_start_frac = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_start_frac',
+                    soft_gate_boundary_power_start_frac))
             soft_gate_boundary_power_mid_frac = float(
                 saved_training_config.get(
                     'soft_gate_boundary_power_mid_frac',
@@ -11668,6 +11991,36 @@ def main():
                 saved_training_config.get(
                     'soft_gate_boundary_power_final_frac',
                     soft_gate_boundary_power_final_frac))
+            if not current_den_power_config_override:
+                v4164_den_power = float(saved_training_config.get(
+                    'v4164_den_power', v4164_den_power))
+                v4164_den_grad_scale = float(saved_training_config.get(
+                    'v4164_den_grad_scale', v4164_den_grad_scale))
+                v4164_den_power_schedule = str(saved_training_config.get(
+                    'v4164_den_power_schedule',
+                    v4164_den_power_schedule)).lower()
+                v4164_den_power_base = float(saved_training_config.get(
+                    'v4164_den_power_base', v4164_den_power_base))
+                v4164_den_power_peak = float(saved_training_config.get(
+                    'v4164_den_power_peak', v4164_den_power_peak))
+                v4164_den_power_final = float(saved_training_config.get(
+                    'v4164_den_power_final', v4164_den_power_final))
+                v4164_den_power_up_start_frac = float(
+                    saved_training_config.get(
+                        'v4164_den_power_up_start_frac',
+                        v4164_den_power_up_start_frac))
+                v4164_den_power_peak_frac = float(
+                    saved_training_config.get(
+                        'v4164_den_power_peak_frac',
+                        v4164_den_power_peak_frac))
+                v4164_den_power_hold_end_frac = float(
+                    saved_training_config.get(
+                        'v4164_den_power_hold_end_frac',
+                        v4164_den_power_hold_end_frac))
+                v4164_den_power_down_end_frac = float(
+                    saved_training_config.get(
+                        'v4164_den_power_down_end_frac',
+                        v4164_den_power_down_end_frac))
             drive_anneal_enabled = bool(saved_training_config.get(
                 'drive_anneal_enabled', drive_anneal_enabled))
             drive_ref_qk = float(saved_training_config.get(
@@ -11692,8 +12045,16 @@ def main():
                 'drive_baseline_v', drive_baseline_v))
             drive_baseline_rst = float(saved_training_config.get(
                 'drive_baseline_rst', drive_baseline_rst))
-            boundary_drive_ratio_end_frac = float(saved_training_config.get(
-                'boundary_drive_ratio_end_frac', boundary_drive_ratio_end_frac))
+            if ('boundary_drive_ratio_start_frac' in saved_training_config
+                    or 'boundary_drive_ratio_end_frac' in saved_training_config):
+                boundary_drive_ratio_start_frac = float(
+                    saved_training_config.get(
+                        'boundary_drive_ratio_start_frac',
+                        boundary_drive_ratio_start_frac))
+                boundary_drive_ratio_end_frac = float(
+                    saved_training_config.get(
+                        'boundary_drive_ratio_end_frac',
+                        boundary_drive_ratio_end_frac))
             if model_version_cfg == 'spatial-r1-v4.1.6.1':
                 # Older 4161 checkpoints may have saved rpe_enabled=False and
                 # exploration_weight=0 because the old code hard-disabled RPE.
@@ -11899,13 +12260,44 @@ def main():
             raise ValueError(
                 "soft_gate_boundary_power_final must be > 0, got "
                 f"{soft_gate_boundary_power_final}")
-        if not (0.0 < soft_gate_boundary_power_mid_frac
+        if not (0.0 <= soft_gate_boundary_power_start_frac
+                < soft_gate_boundary_power_mid_frac
                 < soft_gate_boundary_power_final_frac <= 1.0):
             raise ValueError(
                 "soft_gate_boundary_power fractions must satisfy "
-                "0 < mid_frac < final_frac <= 1, got "
+                "0 <= start_frac < mid_frac < final_frac <= 1, got "
+                f"{soft_gate_boundary_power_start_frac}, "
                 f"{soft_gate_boundary_power_mid_frac}, "
                 f"{soft_gate_boundary_power_final_frac}")
+    if v4164_den_power < 0.0:
+        raise ValueError(
+            f"v4164_den_power must be >= 0, got {v4164_den_power}")
+    if not (0.0 <= v4164_den_grad_scale <= 1.0):
+        raise ValueError(
+            "v4164_den_grad_scale must be in [0, 1], got "
+            f"{v4164_den_grad_scale}")
+    if v4164_den_power_schedule not in ('constant', 'none', 'bump'):
+        raise ValueError(
+            "v4164_den_power_schedule must be 'bump' or omitted/constant, "
+            f"got {v4164_den_power_schedule!r}")
+    if v4164_den_power_schedule == 'bump':
+        if min(v4164_den_power_base, v4164_den_power_peak,
+               v4164_den_power_final) < 0.0:
+            raise ValueError(
+                "v4164_den_power_base/peak/final must be >= 0, got "
+                f"{v4164_den_power_base}, {v4164_den_power_peak}, "
+                f"{v4164_den_power_final}")
+        if not (0.0 <= v4164_den_power_up_start_frac
+                < v4164_den_power_peak_frac
+                <= v4164_den_power_hold_end_frac
+                < v4164_den_power_down_end_frac <= 1.0):
+            raise ValueError(
+                "v4164_den_power bump fractions must satisfy "
+                "0 <= up_start < peak <= hold_end < down_end <= 1, got "
+                f"{v4164_den_power_up_start_frac}, "
+                f"{v4164_den_power_peak_frac}, "
+                f"{v4164_den_power_hold_end_frac}, "
+                f"{v4164_den_power_down_end_frac}")
     if not (0.0 <= admission_floor_hold_frac <= admission_floor_end_frac <= 1.0):
         raise ValueError(
             "admission_floor_hold_frac/end_frac must satisfy "
@@ -11915,10 +12307,22 @@ def main():
         raise ValueError(
             "drive_baseline_qk/v/rst must be >= 0, got "
             f"{drive_baseline_qk}, {drive_baseline_v}, {drive_baseline_rst}")
+    if not (0.0 <= boundary_drive_ratio_start_frac <= 1.0):
+        raise ValueError(
+            "boundary_drive_ratio_start_frac must be in [0, 1], got "
+            f"{boundary_drive_ratio_start_frac}")
     if not (0.0 <= boundary_drive_ratio_end_frac <= 1.0):
         raise ValueError(
-            "boundary_drive_ratio_end_frac must satisfy 0 <= end_frac <= 1, got "
+            "boundary_drive_ratio_end_frac must be in [0, 1], got "
             f"{boundary_drive_ratio_end_frac}")
+    if (boundary_drive_ratio_end_frac <= boundary_drive_ratio_start_frac
+            and not (boundary_drive_ratio_start_frac == 0.0
+                     and boundary_drive_ratio_end_frac == 0.0)):
+        raise ValueError(
+            "boundary_drive_ratio_end_frac must be greater than "
+            "boundary_drive_ratio_start_frac; got "
+            f"start={boundary_drive_ratio_start_frac}, "
+            f"end={boundary_drive_ratio_end_frac}")
     if drive_ref_qk <= 0.0 or drive_ref_v <= 0.0 or drive_ref_rst <= 0.0:
         raise ValueError(
             "drive_ref_qk/v/rst must be > 0, got "
@@ -11989,13 +12393,25 @@ def main():
         'soft_gate_boundary_power_start': soft_gate_boundary_power_start,
         'soft_gate_boundary_power_mid': soft_gate_boundary_power_mid,
         'soft_gate_boundary_power_final': soft_gate_boundary_power_final,
+        'soft_gate_boundary_power_start_frac': soft_gate_boundary_power_start_frac,
         'soft_gate_boundary_power_mid_frac': soft_gate_boundary_power_mid_frac,
         'soft_gate_boundary_power_final_frac': soft_gate_boundary_power_final_frac,
+        'v4164_den_power': v4164_den_power,
+        'v4164_den_grad_scale': v4164_den_grad_scale,
+        'v4164_den_power_schedule': v4164_den_power_schedule,
+        'v4164_den_power_base': v4164_den_power_base,
+        'v4164_den_power_peak': v4164_den_power_peak,
+        'v4164_den_power_final': v4164_den_power_final,
+        'v4164_den_power_up_start_frac': v4164_den_power_up_start_frac,
+        'v4164_den_power_peak_frac': v4164_den_power_peak_frac,
+        'v4164_den_power_hold_end_frac': v4164_den_power_hold_end_frac,
+        'v4164_den_power_down_end_frac': v4164_den_power_down_end_frac,
         'admission_floor_hold_frac': admission_floor_hold_frac,
         'admission_floor_end_frac': admission_floor_end_frac,
         'drive_baseline_qk': drive_baseline_qk,
         'drive_baseline_v': drive_baseline_v,
         'drive_baseline_rst': drive_baseline_rst,
+        'boundary_drive_ratio_start_frac': boundary_drive_ratio_start_frac,
         'boundary_drive_ratio_end_frac': boundary_drive_ratio_end_frac,
         # Backward-compatible aliases retained in checkpoints.
         'drive_anneal_enabled': drive_anneal_enabled,
@@ -12548,9 +12964,21 @@ def main():
                     f"start={soft_gate_boundary_power_start} "
                     f"mid={soft_gate_boundary_power_mid} "
                     f"final={soft_gate_boundary_power_final} "
+                    f"start_frac={soft_gate_boundary_power_start_frac} "
                     f"mid_frac={soft_gate_boundary_power_mid_frac} "
                     f"final_frac={soft_gate_boundary_power_final_frac}")
                 if _soft_model_version == V4165_MODEL_VERSION:
+                    print("  Denominator power:")
+                    print(
+                        f"    schedule={v4164_den_power_schedule} "
+                        f"base={v4164_den_power_base} "
+                        f"peak={v4164_den_power_peak} "
+                        f"final={v4164_den_power_final} "
+                        f"up_start={v4164_den_power_up_start_frac} "
+                        f"peak_frac={v4164_den_power_peak_frac} "
+                        f"hold_end={v4164_den_power_hold_end_frac} "
+                        f"down_end={v4164_den_power_down_end_frac} "
+                        f"grad_scale={v4164_den_grad_scale}")
                     print("  Admission floor / drive baseline:")
                     print("    tau_sg=stop_gradient(tau); load=sum(admission)")
                     print(
@@ -12559,6 +12987,7 @@ def main():
                     print(
                         f"    drive_baseline[qk/v/rst]=({drive_baseline_qk}, "
                         f"{drive_baseline_v}, {drive_baseline_rst}) "
+                        f"boundary_ratio_start={boundary_drive_ratio_start_frac} "
                         f"boundary_ratio_end={boundary_drive_ratio_end_frac}")
             else:
                 print("  Soft gate:")
@@ -13095,8 +13524,18 @@ def main():
         soft_gate_boundary_power_start=soft_gate_boundary_power_start,
         soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+        soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
         soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
         soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
+        v4164_den_power=v4164_den_power,
+        v4164_den_power_schedule=v4164_den_power_schedule,
+        v4164_den_power_base=v4164_den_power_base,
+        v4164_den_power_peak=v4164_den_power_peak,
+        v4164_den_power_final=v4164_den_power_final,
+        v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
+        v4164_den_power_peak_frac=v4164_den_power_peak_frac,
+        v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
+        v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
         drive_anneal_enabled=drive_anneal_enabled,
         drive_ref_qk=drive_ref_qk,
         drive_ref_v=drive_ref_v,
@@ -13109,6 +13548,7 @@ def main():
         drive_baseline_qk=drive_baseline_qk,
         drive_baseline_v=drive_baseline_v,
         drive_baseline_rst=drive_baseline_rst,
+        boundary_drive_ratio_start_frac=boundary_drive_ratio_start_frac,
         boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac,
         rpe_start_frac=rpe_start_frac,
         rpe_full_frac=rpe_full_frac,
@@ -13142,8 +13582,18 @@ def main():
         soft_gate_boundary_power_start=soft_gate_boundary_power_start,
         soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+        soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
         soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
         soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
+        v4164_den_power=v4164_den_power,
+        v4164_den_power_schedule=v4164_den_power_schedule,
+        v4164_den_power_base=v4164_den_power_base,
+        v4164_den_power_peak=v4164_den_power_peak,
+        v4164_den_power_final=v4164_den_power_final,
+        v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
+        v4164_den_power_peak_frac=v4164_den_power_peak_frac,
+        v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
+        v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
         drive_anneal_enabled=drive_anneal_enabled,
         drive_ref_qk=drive_ref_qk,
         drive_ref_v=drive_ref_v,
@@ -13156,6 +13606,7 @@ def main():
         drive_baseline_qk=drive_baseline_qk,
         drive_baseline_v=drive_baseline_v,
         drive_baseline_rst=drive_baseline_rst,
+        boundary_drive_ratio_start_frac=boundary_drive_ratio_start_frac,
         boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
     eval_prune_step_fns = {}
     if eval_effective_prune_enabled:
@@ -13180,8 +13631,18 @@ def main():
                 soft_gate_boundary_power_start=soft_gate_boundary_power_start,
                 soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
                 soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+                soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
                 soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
                 soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
+                v4164_den_power=v4164_den_power,
+                v4164_den_power_schedule=v4164_den_power_schedule,
+                v4164_den_power_base=v4164_den_power_base,
+                v4164_den_power_peak=v4164_den_power_peak,
+                v4164_den_power_final=v4164_den_power_final,
+                v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
+                v4164_den_power_peak_frac=v4164_den_power_peak_frac,
+                v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
+                v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
                 drive_anneal_enabled=drive_anneal_enabled,
                 drive_ref_qk=drive_ref_qk,
                 drive_ref_v=drive_ref_v,
@@ -13194,6 +13655,7 @@ def main():
                 drive_baseline_qk=drive_baseline_qk,
                 drive_baseline_v=drive_baseline_v,
                 drive_baseline_rst=drive_baseline_rst,
+                boundary_drive_ratio_start_frac=boundary_drive_ratio_start_frac,
                 boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
     # v4.1: analysis_step is only meaningful when the full analysis
     # kernels exist. Older model versions skip it -analysis logging
@@ -13217,8 +13679,18 @@ def main():
             soft_gate_boundary_power_start=soft_gate_boundary_power_start,
             soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
             soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+            soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
             soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
             soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
+            v4164_den_power=v4164_den_power,
+            v4164_den_power_schedule=v4164_den_power_schedule,
+            v4164_den_power_base=v4164_den_power_base,
+            v4164_den_power_peak=v4164_den_power_peak,
+            v4164_den_power_final=v4164_den_power_final,
+            v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
+            v4164_den_power_peak_frac=v4164_den_power_peak_frac,
+            v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
+            v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
             drive_anneal_enabled=drive_anneal_enabled,
             drive_ref_qk=drive_ref_qk,
             drive_ref_v=drive_ref_v,
@@ -13231,6 +13703,7 @@ def main():
                 drive_baseline_qk=drive_baseline_qk,
                 drive_baseline_v=drive_baseline_v,
                 drive_baseline_rst=drive_baseline_rst,
+                boundary_drive_ratio_start_frac=boundary_drive_ratio_start_frac,
                 boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
     else:
         analysis_step_fn = None
@@ -13256,8 +13729,18 @@ def main():
             soft_gate_boundary_power_start=soft_gate_boundary_power_start,
             soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
             soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+            soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
             soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
             soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
+            v4164_den_power=v4164_den_power,
+            v4164_den_power_schedule=v4164_den_power_schedule,
+            v4164_den_power_base=v4164_den_power_base,
+            v4164_den_power_peak=v4164_den_power_peak,
+            v4164_den_power_final=v4164_den_power_final,
+            v4164_den_power_up_start_frac=v4164_den_power_up_start_frac,
+            v4164_den_power_peak_frac=v4164_den_power_peak_frac,
+            v4164_den_power_hold_end_frac=v4164_den_power_hold_end_frac,
+            v4164_den_power_down_end_frac=v4164_den_power_down_end_frac,
             drive_anneal_enabled=drive_anneal_enabled,
             drive_ref_qk=drive_ref_qk,
             drive_ref_v=drive_ref_v,
@@ -13270,6 +13753,7 @@ def main():
                 drive_baseline_qk=drive_baseline_qk,
                 drive_baseline_v=drive_baseline_v,
                 drive_baseline_rst=drive_baseline_rst,
+                boundary_drive_ratio_start_frac=boundary_drive_ratio_start_frac,
                 boundary_drive_ratio_end_frac=boundary_drive_ratio_end_frac)
     # No current-train-batch debug forward: --debug uses regular scalar
     # train_step metrics. Local spike diagnostics require training.debug_local_spikes=true.
