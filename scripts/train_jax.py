@@ -507,7 +507,7 @@ def _dawn_srw_kwargs(cfg):
     m = cfg['model']
     t = cfg['training']
     if 'n_rst' not in m and 'n_know' not in m:
-        raise ValueError("v4164 requires model.n_rst or legacy model.n_know.")
+        raise ValueError("v4164 requires model.n_rst or model.n_know checkpoint alias.")
     kw['n_rst'] = m.get('n_rst', m.get('n_know'))
     kw['n_know'] = m.get('n_know', None)
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
@@ -962,7 +962,7 @@ def compute_spatial_diversity_loss(params):
     Penalizes high cosine similarity between neurons in each pool.
     Replaces orthogonality + knowledge diversity for spatial-r1.
     For large pools (>4096), uses deterministic strided sampling to avoid O(N^2).
-    Supports current DAWN-SRW pool param names and legacy spatial-r1 names.
+    Supports current DAWN-SRW pool param names.
     """
     pool = params['neuron_pool']
 
@@ -982,10 +982,10 @@ def compute_spatial_diversity_loss(params):
         )
 
     def _get_pool_arrays(pool):
-        """Return list of neuron arrays from current or legacy pool params."""
+        """Return list of neuron arrays from current v4164 pool params."""
         arrays = []
 
-        # Current DAWN-SRW / v4.1.5.x names.
+        # Current v4164 DAWN-SRW pool names.
         for prefix in ('attn_qk', 'attn_v', 'rst'):
             for suffix in ('emb', 'read', 'write'):
                 key = f'{prefix}_{suffix}'
@@ -993,24 +993,6 @@ def compute_spatial_diversity_loss(params):
                     arrays.append(pool[key])
         if arrays:
             return arrays
-
-        # v4.0.2 legacy rw names: separate q/k/v/know read-write pools.
-        for prefix in ('q', 'k', 'v', 'know'):
-            read_key = f'{prefix}_read'
-            write_key = f'{prefix}_write'
-            if read_key in pool:
-                arrays.append(pool[read_key])
-            if write_key in pool:
-                arrays.append(pool[write_key])
-        if arrays:
-            return arrays
-
-        # v3 / v4.0.1 legacy names: qk/v/know neurons, emb, w, read/write.
-        for prefix in ('qk', 'v', 'know'):
-            for suffix in ('neurons', 'emb', 'w', 'read', 'write'):
-                key = f'{prefix}_{suffix}'
-                if key in pool:
-                    arrays.append(pool[key])
         return arrays
 
     pool_arrays = _get_pool_arrays(pool)
@@ -1028,8 +1010,7 @@ def compute_spatial_diversity_loss(params):
 def _model_accepts_analysis(model):
     """Return True if model.__call__ accepts an `analysis` kwarg.
 
-    v4.1+ accepts it (routes the full-stats forward); older versions
-    don't -passing it there raises, so we must gate it.
+    v4164 accepts it and routes the full-stats forward. there raises, so we must gate it.
     """
     import inspect as _inspect
     try:
@@ -1068,7 +1049,7 @@ def _model_accepts_execution_prune_eps(model):
 
 
 def _model_accepts_soft_gate_boundary_power(model):
-    """Return True if model.__call__ accepts v4163 boundary-power kwargs."""
+    """Return True if model.__call__ accepts boundary-power kwargs."""
     import inspect as _inspect
     try:
         return 'soft_gate_boundary_power' in _inspect.signature(
@@ -1683,14 +1664,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       inactive_aux_start_frac=0.0,
                       inactive_aux_full_frac=0.0,
                       inactive_aux_schedule='linear',
-                      is_baseline=False,
                       sharded_fns=None, mesh=None,
-                      debug_diagnostics=False,
                       compact_train_metrics=False,
                       keep_train_layer_metrics=False):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
 
-    Disabled auxiliary path retained for metric compatibility.
+    Creates the official v4164 train step and regular metric payload.
     """
     # Shard_map'd valid-weighted global statistics reducer. Inputs are
     # sharded on 'data' (batch-parallel); psum aggregates across shards + hosts.
@@ -1814,8 +1793,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _is_boundary_power_model = (
         str(_model_version) == OFFICIAL_MODEL_VERSION)
     if _is_soft_direct_tau:
-        # v4164 soft DirectTau paths keep the loss surface
-        # and CB1A/boundary auxiliaries are disabled for v4164.
+        # Official v4164 train path keeps the soft DirectTau loss surface.
         _cb1a_enabled = False
         _dead_penalty_qk_weight = jnp.float32(0.0)
         _dead_penalty_v_weight = jnp.float32(0.0)
@@ -1823,8 +1801,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _dead_weighted_clip = jnp.float32(0.0)
         _inactive_aux_norm_by_layers = True
         _inactive_aux_norm_by_layers_f = jnp.float32(1.0)
-    # v4.1.6.1 now runs CB1A together with the bounded
-    # training config/defaults prepared in main().
     _inactive_aux_requires_no_active_direct = False
 
     _soft_gate_runtime_enabled = bool(
@@ -2002,7 +1978,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     # Robust center/scale: first clip extreme CE tokens using
                     # global mean/std, then recompute a clipped mean/std.  This
                     # prevents a few hard/easy tokens from shifting the batch
-                    # baseline and creating a huge one-step tau control signal.
+                    # the main loss and creating a huge one-step tau control signal.
                     clip_lo = mean_ce0 - _inactive_aux_ce_clip_std * std_ce0
                     clip_hi = mean_ce0 + _inactive_aux_ce_clip_std * std_ce0
                     ce_clip = jnp.clip(ce_sg, clip_lo, clip_hi)
@@ -2341,21 +2317,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 jnp.minimum(dead_penalty_weighted_unclipped, _dead_weighted_clip),
                 dead_penalty_weighted_unclipped)
             if _is_soft_direct_tau:
-                # Hard-boundary dead exposure is diagnostic-only in v4162/v4163 and
-                # must not affect training loss. Soft-gate exposure diagnostics
-                # are reported by the model; no dead repair loss is active here.
+                # v4164 reports admission exposure diagnostics but keeps the
+                # active loss surface clean. No dead repair loss is active here.
                 dead_penalty_weighted_unclipped = jnp.float32(0.0)
                 dead_penalty_weighted = jnp.float32(0.0)
-
-            if _is_soft_direct_tau:
-                # v4162/v4163 loss surface is intentionally clean:
                 orth_loss = jnp.float32(0.0)
                 div_loss = jnp.float32(0.0)
                 total_loss = ce_loss + inactive_aux_loss_weighted
-            elif is_baseline:
-                orth_loss = jnp.float32(0.0)
-                div_loss = jnp.float32(0.0)
-                total_loss = ce_loss
             else:
                 orth_loss = jnp.float32(0.0)
                 div_loss = compute_spatial_diversity_loss(params)
@@ -2497,10 +2465,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _is_generic_raw_tau_path(ps):
             return _has_path_part(ps, 'raw_tau')
 
-        def _is_legacy_tau_attn_path(ps):
+        def _is_tau_attn_bias_path(ps):
             return _has_path_part(ps, 'tau_attn')
 
-        def _is_legacy_tau_rst_path(ps):
+        def _is_tau_rst_bias_path(ps):
             return _has_path_part(ps, 'tau_rst')
 
         def _is_raw_tau_path(ps):
@@ -2530,8 +2498,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return sum(leaves)
 
         def _is_tau_path(ps):
-            return (_is_legacy_tau_attn_path(ps)
-                    or _is_legacy_tau_rst_path(ps)
+            return (_is_tau_attn_bias_path(ps)
+                    or _is_tau_rst_bias_path(ps)
                     or _is_raw_tau_path(ps))
 
         def _is_router_proj_path(ps):
@@ -2570,14 +2538,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/know_emb' in ps))
 
         def _is_tau_attn_path(ps):
-            return (_is_legacy_tau_attn_path(ps)
+            return (_is_tau_attn_bias_path(ps)
                     or _is_raw_tau_attn_combined_path(ps)
                     or _is_raw_tau_qk_path(ps)
                     or _is_raw_tau_v_path(ps)
                     or _is_generic_raw_tau_path(ps))
 
         def _is_tau_rst_path(ps):
-            return _is_legacy_tau_rst_path(ps) or _is_raw_tau_rst_path(ps)
+            return _is_tau_rst_bias_path(ps) or _is_raw_tau_rst_path(ps)
 
         def _is_scan_attn_path(ps):
             return (('router/raw_scan_offset_attn' in ps)
@@ -2785,10 +2753,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _route_emb_update_ratio_cap)
             (upd_tau_attn_abs_pre, upd_tau_attn_abs_post,
              upd_tau_attn_scale, upd_tau_attn_hit) = _abs_cap_stats(
-                updates, _is_legacy_tau_attn_path, _tau_update_abs_cap)
+                updates, _is_tau_attn_bias_path, _tau_update_abs_cap)
             (upd_tau_rst_abs_pre, upd_tau_rst_abs_post,
              upd_tau_rst_scale, upd_tau_rst_hit) = _abs_cap_stats(
-                updates, _is_legacy_tau_rst_path, _tau_update_abs_cap)
+                updates, _is_tau_rst_bias_path, _tau_update_abs_cap)
             (upd_raw_tau_qk_abs_pre, upd_raw_tau_qk_abs_post,
              upd_raw_tau_qk_scale, upd_raw_tau_qk_hit) = _raw_tau_abs_cap_stats(
                 updates, 'qk', _tau_update_abs_cap)
@@ -2844,8 +2812,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 scale = jnp.where(_is_route_emb_qk_path(ps), upd_emb_qk_scale, scale)
                 scale = jnp.where(_is_route_emb_v_path(ps), upd_emb_v_scale, scale)
                 scale = jnp.where(_is_route_emb_rst_path(ps), upd_emb_rst_scale, scale)
-                scale = jnp.where(_is_legacy_tau_attn_path(ps), upd_tau_attn_scale, scale)
-                scale = jnp.where(_is_legacy_tau_rst_path(ps), upd_tau_rst_scale, scale)
+                scale = jnp.where(_is_tau_attn_bias_path(ps), upd_tau_attn_scale, scale)
+                scale = jnp.where(_is_tau_rst_bias_path(ps), upd_tau_rst_scale, scale)
                 scale = jnp.where(_is_scan_attn_path(ps), upd_scan_attn_scale, scale)
                 scale = jnp.where(_is_scan_rst_path(ps), upd_scan_rst_scale, scale)
                 return u * scale.astype(u.dtype)
@@ -2945,7 +2913,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_pool_rst_emb = _child_norm(_gpool, 'rst_emb')
         grad_pool_rst_read = _child_norm(_gpool, 'rst_read')
         grad_pool_rst_write = _child_norm(_gpool, 'rst_write')
-        if debug_diagnostics:
+        if False:
             grad_token_emb = _tree_norm(_path_tree(grads, 'token_emb'))
             grad_pos_emb = _tree_norm(_path_tree(grads, 'pos_emb'))
             grad_pool_scales = jnp.sqrt(
@@ -3038,7 +3006,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             grad_pool_attn_qk_write + grad_pool_attn_v_write
             + grad_pool_rst_write)
         _ppool = params.get('neuron_pool', {})
-        if debug_diagnostics:
+        if False:
             pool_weight_decay_loss = jnp.float32(0.5 * pool_weight_decay) * (
                 _tree_sq(_path_tree(_ppool, 'attn_qk_emb'))
                 + _tree_sq(_path_tree(_ppool, 'attn_qk_read'))
@@ -3056,16 +3024,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         else:
             pool_weight_decay_loss = jnp.float32(0.0)
             normal_weight_decay_loss = jnp.float32(0.0)
-        if debug_diagnostics:
+        if False:
             pool_diag = _pool_param_diagnostics(params, full=False, model=model)
             pool_update_diag = _pool_update_diagnostics(params, grads)
         else:
             pool_diag = {}
             pool_update_diag = {}
 
-        # Emb drift is debug-only.  It is computed inside jit when enabled so
+        # Emb drift is diagnostic-only.  It is computed inside jit when enabled so
         # every host participates in the same reductions on multi-host meshes.
-        if (not debug_diagnostics) or is_baseline or 'neuron_pool' not in new_params:
+        if 'neuron_pool' not in new_params:
             drift_attn_qk_emb = jnp.float32(0.0)
             drift_attn_v_emb = jnp.float32(0.0)
             drift_rst_emb = jnp.float32(0.0)
@@ -3381,7 +3349,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'load_mean': result.get('load_mean', jnp.float32(0.0)),
             'normalization_load_mean': result.get('normalization_load_mean', jnp.float32(0.0)),
             'den_mean': result.get('den_mean', jnp.float32(0.0)),
-            # Core activity (v4.1).
+            # Core v4164 activity.
             'rst_active': result.get('rst_active', jnp.float32(0.0)),
             'rst_strong': result.get('rst_strong', jnp.float32(0.0)),
             'rst_score_std': result.get(
@@ -3532,8 +3500,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'rst_weak_exposure_frac', jnp.float32(0.0)),
             'rst_dead_exposure_target': result.get(
                 'rst_dead_exposure_target', jnp.float32(0.0)),
-            # v4162/v4163 soft-gate exposure diagnostics. Old hard-boundary
-            # exposure keys above are kept for v4164/v4164 compatibility.
+            # v4164 admission exposure diagnostics. Older hard-boundary
+            # exposure aliases above are kept only for JSONL continuity.
             'attn_soft_exposure_mean': result.get('attn_soft_exposure_mean', jnp.float32(0.0)),
             'attn_soft_exposure_min': result.get('attn_soft_exposure_min', jnp.float32(0.0)),
             'attn_soft_exposure_max': result.get('attn_soft_exposure_max', jnp.float32(0.0)),
@@ -3622,7 +3590,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_tau_off_p99': inactive_aux_stats['rst_tau_off_p99'],
             'rst_tau_off_p01': inactive_aux_stats['rst_tau_off_p01'],
             'rst_tau_off_neg_frac': inactive_aux_stats['rst_tau_off_neg_frac'],
-            # v4.1 intensity / v4.1.5 gate-denominator diagnostics.
+            # v4164 intensity and gate-denominator diagnostics.
             'attn_int_max': result.get('attn_int_max', jnp.float32(0.0)),
             'rst_int_max': result.get('rst_int_max', jnp.float32(0.0)),
             'attn_int_cap_frac': result.get('attn_int_cap_frac', jnp.float32(0.0)),
@@ -3632,15 +3600,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_gate_den_sum_mean': result.get('attn_gate_den_sum_mean', jnp.float32(0.0)),
             'rst_gate_den_sum_mean': result.get('rst_gate_den_sum_mean', jnp.float32(0.0)),
             # Output/logit diagnostics are always-on cheap scalar reductions from the model.
-            'debug_residual_norm': result.get('debug_residual_norm', jnp.float32(0.0)),
-            'debug_residual_norm_max': result.get('debug_residual_norm_max', jnp.float32(0.0)),
-            'debug_token_emb_norm': result.get('debug_token_emb_norm', jnp.float32(0.0)),
-            'debug_token_emb_norm_max': result.get('debug_token_emb_norm_max', jnp.float32(0.0)),
-            'debug_logit_max': result.get('debug_logit_max', jnp.float32(0.0)),
-            'debug_logit_norm_mean': result.get('debug_logit_norm_mean', jnp.float32(0.0)),
-            'debug_logit_mean': result.get('debug_logit_mean', jnp.float32(0.0)),
-            'debug_logit_std': result.get('debug_logit_std', jnp.float32(0.0)),
-            'debug_attn_logit_max_mean': result.get('debug_attn_logit_max_mean', jnp.float32(0.0)),
+            'residual_norm': result.get('residual_norm', jnp.float32(0.0)),
+            'residual_norm_max': result.get('residual_norm_max', jnp.float32(0.0)),
+            'token_emb_norm': result.get('token_emb_norm', jnp.float32(0.0)),
+            'token_emb_norm_max': result.get('token_emb_norm_max', jnp.float32(0.0)),
+            'logit_max': result.get('logit_max', jnp.float32(0.0)),
+            'logit_norm_mean': result.get('logit_norm_mean', jnp.float32(0.0)),
+            'logit_mean': result.get('logit_mean', jnp.float32(0.0)),
+            'logit_std': result.get('logit_std', jnp.float32(0.0)),
+            'attn_logit_max_mean': result.get('attn_logit_max_mean', jnp.float32(0.0)),
             'attn_contrib_den_sum': result.get('attn_contrib_den_sum', jnp.float32(0.0)),
             'rst_contrib_den_sum': result.get('rst_contrib_den_sum', jnp.float32(0.0)),
             'attn_contrib_den_mean': result.get(
@@ -4047,7 +4015,7 @@ def create_analysis_step(model, sharded_fns=None,
     """Create a jit-compiled analysis step (FULL forward, observational).
 
     Runs the model with `analysis=True` and the ANALYSIS variant of
-    sharded_fns. Returns a dict of distribution / boundary / debug
+    sharded_fns. Returns a dict of distribution / boundary
     stats that the 2-tier logger's ANALYSIS block consumes. Called
     once per val tick (val_interval), so the compile cost amortises.
     """
@@ -4222,14 +4190,15 @@ def create_mesh(mesh_data, mesh_model):
     return Mesh(device_array, ('data', 'model'))
 
 
-def get_param_shardings(params, mesh, is_baseline=False):
-    """Create sharding specs for params: neuron_pool N-axis on 'model', rest replicated.
-    For baseline models (is_baseline=True), 2D+ params are sharded on 'data' axis (FSDP-style).
+def get_param_shardings(params, mesh):
+    """Create sharding specs for v4164 parameters.
+
+    Neuron-pool first dimensions are sharded on the model axis; all other
+    parameters are replicated.
     """
-    replicated = NamedSharding(mesh, P())  # no sharding
-    n_sharded = NamedSharding(mesh, P('model', None))  # N axis on model
+    replicated = NamedSharding(mesh, P())
+    n_sharded = NamedSharding(mesh, P('model', None))
     n_sharded_3d = NamedSharding(mesh, P('model', None, None))
-    data_sharded = NamedSharding(mesh, P('data', None))  # FSDP: first axis on data
 
     def _get_sharding(path, value):
         path_str = '/'.join(str(p) for p in path)
@@ -4238,14 +4207,9 @@ def get_param_shardings(params, mesh, is_baseline=False):
             if value.ndim == 2:
                 return n_sharded       # [N, d_bn] or [N, D]
             elif value.ndim == 3:
-                return n_sharded_3d    # [N, D, R] for v17.1
+                return n_sharded_3d    # [N, D, R] tensor pools
             else:
                 return replicated
-        # Baseline FSDP: shard 2D kernels on data axis (skip embeddings)
-        if is_baseline and value.ndim >= 2:
-            if 'token_emb' in path_str or 'pos_emb' in path_str:
-                return replicated
-            return data_sharded
         return replicated
 
     flat_params = jax.tree.leaves_with_path(params)
@@ -4630,19 +4594,15 @@ class GCSLogger:
 # Module-level loggers -set up in main()
 _train_logger = None
 _jsonl_logger = None
-_debug_logger = None
-_debug_jsonl_logger = None
 
 
-def _setup_loggers(training_log_file, jsonl_log_file, resume=False,
-                   debug_log_file=None, debug_jsonl_log_file=None,
-                   debug_resume=False):
-    """Create GCSLogger instances for training/debug text + JSONL logs.
+def _setup_loggers(training_log_file, jsonl_log_file, resume=False):
+    """Create training text + JSONL loggers.
 
     resume=True downloads existing GCS content to the local scratch file
     first so new lines append rather than overwrite.
     """
-    global _train_logger, _jsonl_logger, _debug_logger, _debug_jsonl_logger
+    global _train_logger, _jsonl_logger
     import tempfile
     tmpdir = Path(tempfile.gettempdir()) / "dawn_logs"
     tmpdir.mkdir(parents=True, exist_ok=True)
@@ -4659,39 +4619,13 @@ def _setup_loggers(training_log_file, jsonl_log_file, resume=False,
     else:
         _jsonl_logger = GCSLogger(None, jsonl_log_file, resume=resume)
 
-    if debug_log_file:
-        if _is_gcs(debug_log_file):
-            local_debug = str(tmpdir / Path(debug_log_file).name)
-            _debug_logger = GCSLogger(debug_log_file, local_debug,
-                                      resume=debug_resume)
-        else:
-            _debug_logger = GCSLogger(None, debug_log_file, resume=debug_resume)
-    else:
-        _debug_logger = None
-
-    if debug_jsonl_log_file:
-        if _is_gcs(debug_jsonl_log_file):
-            local_debug_jsonl = str(tmpdir / Path(debug_jsonl_log_file).name)
-            _debug_jsonl_logger = GCSLogger(debug_jsonl_log_file,
-                                            local_debug_jsonl,
-                                            resume=debug_resume)
-        else:
-            _debug_jsonl_logger = GCSLogger(None, debug_jsonl_log_file,
-                                            resume=debug_resume)
-    else:
-        _debug_jsonl_logger = None
-
 
 def sync_logs():
-    """Flush local logs to GCS. Call every FAST log for live visibility."""
+    """Flush local logs to GCS for live visibility."""
     if _train_logger:
         _train_logger.sync()
     if _jsonl_logger:
         _jsonl_logger.sync()
-    if _debug_logger:
-        _debug_logger.sync()
-    if _debug_jsonl_logger:
-        _debug_jsonl_logger.sync()
 
 
 def log_message(msg, log_file=None):
@@ -4704,18 +4638,6 @@ def log_message(msg, log_file=None):
             _train_logger.write(msg + '\n')
         except Exception as e:
             print(f"  [warn] log_message write failed: {e}", flush=True)
-
-
-def log_debug_message(msg):
-    """Write to the debug log file only. Host 0 only; no stdout pollution."""
-    if jax.process_index() != 0:
-        return
-    if not _debug_logger:
-        return
-    try:
-        _debug_logger.write(msg + '\n')
-    except Exception as e:
-        print(f"  [warn] log_debug_message write failed: {e}", flush=True)
 
 
 def format_time(seconds):
@@ -4737,19 +4659,6 @@ def log_jsonl(record):
         _jsonl_logger.write(line + '\n')
     except Exception as e:
         print(f"  [warn] log_jsonl write failed: {e}", flush=True)
-
-
-def log_debug_jsonl(record):
-    """Append a JSON-lines record to the debug JSONL log. Host 0 only."""
-    if jax.process_index() != 0:
-        return
-    if not _debug_jsonl_logger:
-        return
-    try:
-        line = json.dumps(record, default=str)
-        _debug_jsonl_logger.write(line + '\n')
-    except Exception as e:
-        print(f"  [warn] log_debug_jsonl write failed: {e}", flush=True)
 
 
 def _dead_pool_totals(ctx):
@@ -4826,16 +4735,16 @@ def check_nan_inf(metrics_dict, global_step, epoch):
 # REGULAR  every log_interval steps                        (default 100)
 # ANALYSIS every log_interval * log_analysis_multiplier steps
 #
-# v4.1: ANALYSIS is not emitted on every REGULAR tick. The distribution /
+# v4164: ANALYSIS is not emitted on every REGULAR tick. The distribution /
 # boundary / saturation stats require a separate forward with the full-stats
 # shard_map kernels (analysis_step), so the multiplier controls that cost.
 #
 # REGULAR carries the training-dynamics block (loss, activity, tau
 # adds distribution-shape / boundary /
-# saturation / debug diagnostics.
+# saturation diagnostics.
 #
 # _build_analysis_record accepts `base={}` on the new path -the
-# `base`/`metrics` split is preserved for back-compat but the ANALYSIS
+# `base`/`metrics` split is kept so ANALYSIS
 # record is now standalone.
 
 
@@ -4934,7 +4843,7 @@ def _print_regular_host_timing(raw_step_time_window, logging_time, ctx):
         f"logging_time={logging_time:.3f}s")
 
 
-def _print_v4162_sparsity_block(rec, level='compact'):
+def _print_v4164_soft_sparsity_block(rec, level='compact'):
     compact = str(level or 'compact').lower() == 'compact'
     current_eps = (
         SPARSITY_CURRENT_EPS_LOG_COMPACT if compact
@@ -5059,8 +4968,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         except Exception:
             return []
 
-    is_v415 = ctx.get('model_version') in (
-        OFFICIAL_MODEL_VERSION)
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -5780,15 +5687,15 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_qk_raw_norm': float(m.get('attn_qk_raw_norm', 0.0)),
         'attn_v_raw_norm': float(m.get('attn_v_raw_norm', 0.0)),
         'rst_raw_out_norm': float(m.get('rst_raw_out_norm', 0.0)),
-        'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
-        'debug_residual_norm_max': float(m.get('debug_residual_norm_max', 0.0)),
-        'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
-        'debug_logit_norm_mean': float(m.get('debug_logit_norm_mean', 0.0)),
-        'debug_logit_mean': float(m.get('debug_logit_mean', 0.0)),
-        'debug_logit_std': float(m.get('debug_logit_std', 0.0)),
-        'debug_token_emb_norm': float(m.get('debug_token_emb_norm', m.get('debug_emb_norm', 0.0))),
-        'debug_token_emb_norm_max': float(m.get('debug_token_emb_norm_max', 0.0)),
-        'debug_attn_logit_max_mean': float(m.get('debug_attn_logit_max_mean', 0.0)),
+        'residual_norm': float(m.get('residual_norm', 0.0)),
+        'residual_norm_max': float(m.get('residual_norm_max', 0.0)),
+        'logit_max': float(m.get('logit_max', 0.0)),
+        'logit_norm_mean': float(m.get('logit_norm_mean', 0.0)),
+        'logit_mean': float(m.get('logit_mean', 0.0)),
+        'logit_std': float(m.get('logit_std', 0.0)),
+        'token_emb_norm': float(m.get('token_emb_norm', m.get('token_emb_norm', 0.0))),
+        'token_emb_norm_max': float(m.get('token_emb_norm_max', 0.0)),
+        'attn_logit_max_mean': float(m.get('attn_logit_max_mean', 0.0)),
         'rst_z_mean_active': float(m.get('rst_z_mean_active', 0.0)),
         'attn_qk_z_mean_active': float(m.get('attn_qk_z_mean_active', 0.0)),
         'attn_v_z_mean_active': float(m.get('attn_v_z_mean_active', 0.0)),
@@ -5858,20 +5765,14 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
                 m.get(f'{_pool}_{_part}_grad_ratio', 0.0))
             rec[f'{_pool}_{_part}_update_ratio'] = (
                 _lr * rec[f'{_pool}_{_part}_grad_ratio'])
-    if is_v415:
-        rec.pop('attn_den_cost_mean', None)
-        rec.pop('rst_den_cost_mean', None)
-        rec.update({
-            'attn_gate_den_sum_mean': float(m.get(
-                'attn_gate_den_sum_mean', m.get('attn_intensity_sum_mean', 0.0))),
-            'rst_gate_den_sum_mean': float(m.get(
-                'rst_gate_den_sum_mean', m.get('rst_intensity_sum_mean', 0.0))),
-        })
-    else:
-        rec.update({
-            'attn_intensity_sum_mean': float(m.get('attn_intensity_sum_mean', 0.0)),
-            'rst_intensity_sum_mean': float(m.get('rst_intensity_sum_mean', 0.0)),
-        })
+    rec.pop('attn_den_cost_mean', None)
+    rec.pop('rst_den_cost_mean', None)
+    rec.update({
+        'attn_gate_den_sum_mean': float(m.get(
+            'attn_gate_den_sum_mean', m.get('attn_intensity_sum_mean', 0.0))),
+        'rst_gate_den_sum_mean': float(m.get(
+            'rst_gate_den_sum_mean', m.get('rst_intensity_sum_mean', 0.0))),
+    })
     # Per-layer norms (materialise lists).
     try:
         pl_a = jax.device_get(m['per_layer_attn_out_norm']).tolist()
@@ -5969,11 +5870,11 @@ def _print_cb1a_regular_block(rec):
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4164 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
-    is_v4162_soft = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
-    is_v4162_compact = False
+    is_official_soft_direct_tau = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
+    official_soft_sparsity_compact = False
     aux_note = (
         " aux_is_not_total_minus_ce"
-        if is_v4162_soft
+        if is_official_soft_direct_tau
         else "")
     log_message(
         f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
@@ -5983,7 +5884,7 @@ def _print_regular_block(rec, ctx):
         f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
     )
     if is_v4164:
-        if is_v4162_soft:
+        if is_official_soft_direct_tau:
             log_message(
                 f"  strong: q={rec['attn_q_strong']*100:.1f}%"
                 f" k={rec['attn_k_strong']*100:.1f}%"
@@ -6025,45 +5926,9 @@ def _print_regular_block(rec, ctx):
             f" attn_v={rec['attn_v_strong']*100:.1f}%"
             f" rst={rec['rst_strong']*100:.1f}%"
         )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
-        log_message(
-            f"  select: rho_std[a={rec['attn_rho_std']:.4f}"
-            f" rst={rec['rst_rho_std']:.4f}]"
-            f" tau[a={rec['attn_tau_floor_mean']:.4f}"
-            f" rst={rec['rst_tau_floor_mean']:.4f}]"
-            f" margin[a={rec['attn_selection_margin_mean']:+.4f}"
-            f" rst={rec['rst_selection_margin_mean']:+.4f}]"
-            f" pos[a={rec['attn_positive_margin_mean']:.4f}"
-            f" rst={rec['rst_positive_margin_mean']:.4f}]"
-            f" selected[a={rec['attn_selected_frac']*100:.1f}%"
-            f" rst={rec['rst_selected_frac']*100:.1f}%]"
-            f" no_active[a={rec['attn_no_active_frac']*100:.2f}%"
-            f" rst={rec['rst_no_active_frac']*100:.2f}%]"
-        )
-    elif is_v4164:
-        _weight_label = (
-            'admission'
-            if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
-            else ('soft_weight' if is_v4162_soft else 'pos'))
+    if is_v4164:
+        _weight_label = 'admission'
         _select_status = ""
-        if (is_v4162_soft
-                and ctx.get('model_version') != OFFICIAL_MODEL_VERSION
-                and ctx.get('model_version') == OFFICIAL_MODEL_VERSION):
-            _select_status = (
-                f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
-                f" v={rec['attn_v_selected_frac']*100:.1f}%"
-                f" rst={rec['rst_selected_frac']*100:.1f}%]"
-                f" no_active[qk={rec['attn_qk_no_active_frac']*100:.2f}%"
-                f" v={rec['attn_v_no_active_frac']*100:.2f}%"
-                f" rst={rec['rst_no_active_frac']*100:.2f}%]")
-        elif not is_v4162_soft:
-            _select_status = (
-                f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
-                f" v={rec['attn_v_selected_frac']*100:.1f}%"
-                f" rst={rec['rst_selected_frac']*100:.1f}%]"
-                f" no_active[qk={rec['attn_qk_no_active_frac']*100:.2f}%"
-                f" v={rec['attn_v_no_active_frac']*100:.2f}%"
-                f" rst={rec['rst_no_active_frac']*100:.2f}%]")
         log_message(
             f"  select: tau[qk={rec['attn_qk_tau_mean']:.4f}"
             f" v={rec['attn_v_tau_mean']:.4f}"
@@ -6076,7 +5941,7 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['rst_positive_margin_mean']:.4f}]"
             f"{_select_status}"
         )
-    if is_v4164 and not is_v4162_soft:
+    if is_v4164 and not is_official_soft_direct_tau:
         log_message(
             f"  gate_max[qk={rec['attn_qk_raw_gate_max']:.1f}"
             f" v={rec['attn_v_raw_gate_max']:.1f}"
@@ -6104,7 +5969,7 @@ def _print_regular_block(rec, ctx):
         pass
     if is_v4164:
         _pool_scale_part = ""
-        if not is_v4162_compact:
+        if not official_soft_sparsity_compact:
             _pool_scale_part = (
                 f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
                 f" v={rec['attn_v_pool_scale']:.3f}"
@@ -6178,8 +6043,6 @@ def _print_regular_block(rec, ctx):
                 f"  admission_den mean[a={rec['attn_gate_den_sum_mean']:.1f}"
                 f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
             )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
-        log_message(_format_output_stab_line(rec, indent="  "))
     _update_cap_hit_total = sum(
         float(rec.get(_key, 0.0) or 0.0)
         for _key in (
@@ -6289,14 +6152,6 @@ def _print_regular_block(rec, ctx):
             f" | tau_mean[attn={rec['attn_tau_mean']:+.3f} rst={rec['rst_tau_mean']:+.3f}]"
             f" abs[attn={rec['attn_tau_abs_mean']:.3f} rst={rec['rst_tau_abs_mean']:.3f}]"
         )
-    if ctx.get('model_version') in (
-            'spatial-r1-v4.1.5.2', 'dawn_srw',
-            'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6',
-            'spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
-        log_message(
-            f"  scan_offset: rst={rec['raw_scan_offset_rst_bias']:+.3f}"
-            f" attn=[{rec['raw_scan_offset_attn_bias_0']:+.3f} {rec['raw_scan_offset_attn_bias_1']:+.3f} {rec['raw_scan_offset_attn_bias_2']:+.3f}]"
-        )
         log_message(
             f"  tau_off rst[min={rec['rst_tau_off_min']:+.2f} p01={rec['rst_tau_off_p01']:+.2f}"
             f" p99={rec['rst_tau_off_p99']:+.2f} max={rec['rst_tau_off_max']:+.2f}"
@@ -6305,7 +6160,7 @@ def _print_regular_block(rec, ctx):
             f" p99={rec['attn_tau_off_p99']:+.2f} max={rec['attn_tau_off_max']:+.2f}"
             f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
         )
-    elif is_v4164 and not is_v4162_soft:
+    if is_v4164 and not is_official_soft_direct_tau:
         rst_raw_tau_min = rec.get('rst_raw_tau_min', rec.get('rst_raw_tau_mean', 0.0))
         rst_raw_tau_max = rec.get('rst_raw_tau_max', rec.get('rst_raw_tau_mean', 0.0))
         qk_raw_tau_min = rec.get(
@@ -6321,10 +6176,7 @@ def _print_regular_block(rec, ctx):
             f" v[min={v_raw_tau_min:+.2f} max={v_raw_tau_max:+.2f}]"
             f" rst[min={rst_raw_tau_min:+.2f} max={rst_raw_tau_max:+.2f}]"
         )
-    route_std_label = (
-        "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
-        else "score_std")
-    if is_v4164 and not is_v4162_soft:
+    if is_v4164 and not is_official_soft_direct_tau:
         log_message(
             f"  emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
             f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
@@ -6343,7 +6195,7 @@ def _print_regular_block(rec, ctx):
             f" attn_v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
             f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
         )
-    if not is_v4162_soft:
+    if not is_official_soft_direct_tau:
         log_message(
             f"  rw_n: attn_qk r[m={rec['attn_qk_read_norm_mean']:.2f} s={rec['attn_qk_read_norm_std']:.2f}"
             f" max={rec['attn_qk_read_norm_max']:.2f}]"
@@ -6370,7 +6222,7 @@ def _print_regular_block(rec, ctx):
         _print_cb1a_regular_block(rec)
     _pl_a = rec.get('per_layer_attn_out_norm', []) or []
     _pl_k = rec.get('per_layer_rst_out_norm', []) or []
-    if (_pl_a or _pl_k) and not is_v4162_soft:
+    if (_pl_a or _pl_k) and not is_official_soft_direct_tau:
         log_message(
             f"  per_layer out: attn=[{' '.join(f'{v:.2f}' for v in _pl_a)}]"
             f" know=[{' '.join(f'{v:.2f}' for v in _pl_k)}]"
@@ -6451,614 +6303,17 @@ def _fmt_grad_array(rec, key):
     return "[" + ", ".join(f"{float(v):.6g}" for v in arr) + "]"
 
 
-def _print_grad_layer_block(rec, is_v4164=False):
-    if 'grad_expand_O_per_layer' not in rec:
-        return
-    log_debug_message("[GRAD_LAYER]")
-    log_debug_message(
-        "shared_note=router/pool_rw are shared params; single-entry arrays are pool-level")
-    if is_v4164:
-        raw_tau_items = (
-            ('raw_tau_qk', 'grad_router_raw_tau_qk_per_layer'),
-            ('raw_tau_v', 'grad_router_raw_tau_v_per_layer'),
-            ('raw_tau_rst', 'grad_router_raw_tau_rst_per_layer'),
-        )
-    else:
-        raw_tau_items = (
-            ('router_tau_attn', 'grad_router_tau_attn_per_layer'),
-            ('router_tau_rst', 'grad_router_tau_rst_per_layer'),
-        )
-    for label, key in (
-            *raw_tau_items,
-            ('router_proj_attn', 'grad_router_proj_attn_per_layer'),
-            ('router_proj_rst', 'grad_router_proj_rst_per_layer'),
-            ('qk_rw_read_write', 'grad_pool_attn_qk_rw'),
-            ('v_rw_read_write', 'grad_pool_attn_v_rw'),
-            ('rst_rw_read_write', 'grad_pool_rst_rw'),
-            ('expand_O', 'grad_expand_O_per_layer'),
-            ('layernorm', 'grad_layernorms_per_layer')):
-        if key in rec:
-            log_debug_message(f"{label}={_fmt_grad_array(rec, key)}")
-
-
-def _print_drop_compare_block(rec):
-    if not rec.get('debug_drop_compare_enabled', False):
-        return
-
-    def _line(prefix):
-        return (
-            f"loss={float(rec.get(prefix + '_loss', 0.0)):.6f} "
-            f"ce={float(rec.get(prefix + '_ce', 0.0)):.6f} "
-            f"top1_max={float(rec.get(prefix + '_top1_max', 0.0)):.6f} "
-            f"int_max={float(rec.get(prefix + '_int_max', 0.0)):.6f} "
-            f"tau_abs_max={float(rec.get(prefix + '_tau_abs_max', 0.0)):.6f} "
-            f"out_max={float(rec.get(prefix + '_local_out_norm_max', 0.0)):.6f} "
-            f"active={float(rec.get(prefix + '_active_frac', 0.0)):.6f} "
-            f"den_max={float(rec.get(prefix + '_gate_den_sum_max', 0.0)):.6f} "
-            f"attention_logit_max={float(rec.get(prefix + '_attention_logit_max', 0.0)):.6f}"
-        )
-
-    log_debug_message("[DROP_COMPARE]")
-    log_debug_message("normal: " + _line('debug_normal'))
-    log_debug_message("deterministic: " + _line('debug_deterministic'))
-
-
-def _print_debug_block(rec, ctx):
-    is_v4164 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
-
-    def _g(key, default=0.0):
-        return float(rec.get(key, default) or 0.0)
-
-    def _layer_max(key):
-        vals = rec.get(key, []) or []
-        try:
-            return max(float(v) for v in vals)
-        except ValueError:
-            return 0.0
-
-    step = rec.get('step', 0)
-    log_debug_message(
-        f"[DEBUG_DIAG] step={step} epoch={rec.get('epoch', 0)} "
-        f"loss={_g('total_loss'):.4f} ce={_g('ce_loss'):.4f} "
-        f"grad={_g('grad_global_preclip', _g('grad_norm')):.3f} "
-        f"lr={_g('lr'):.3e}"
-    )
-    if _g('soft_gate_T', 0.0) > 0.0:
-        _soft_gate_label = (
-            'soft_gate_B'
-            if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
-            else 'soft_gate_T')
-        _power_part = (
-            f" boundary_power_p={_g('boundary_power_p', 2.0):.3f}"
-            f" admission_den_power={_g('admission_den_power', _g('den_power', 1.0)):.3f}"
-            if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
-            else "")
-        log_debug_message(
-            f"{_soft_gate_label}: qk={_g('soft_gate_T_qk', _g('soft_gate_T')):.6f} "
-            f"v={_g('soft_gate_T_v', _g('soft_gate_T')):.6f} "
-            f"rst={_g('soft_gate_T_rst', _g('soft_gate_T')):.6f}"
-            f"{_power_part}"
-        )
-    aux_loss_terms = (
-        f"cb1a_raw={_g('cb1a_raw'):+.6f} "
-        f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
-    )
-    log_debug_message(
-        f"loss_terms: ce={_g('ce_loss'):.6f} "
-        f"aux_raw_lb_plus_internal_tau={_g('aux_loss_raw', _g('aux_loss')):.6f} "
-        f"aux_w={_g('aux_loss_weighted', _g('aux_weighted')):.6f} "
-        f"div_raw={_g('diversity_loss_raw', _g('div_loss')):.6f} "
-        f"div_w={_g('diversity_loss_weighted', _g('div_weighted')):.6f} "
-        f"load_balance_raw_current_aux={_g('load_balance_loss_raw', _g('aux_loss')):.6f} "
-        f"load_balance_w={_g('load_balance_loss_weighted', _g('aux_weighted')):.6f} "
-        f"dead_raw={_g('dead_penalty_raw_total', _g('dead_penalty')):.6f} "
-        f"dead_w={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f} "
-        f"{aux_loss_terms}"
-        f"wd_pool={_g('pool_weight_decay_loss'):.6f} "
-        f"wd_normal={_g('normal_weight_decay_loss'):.6f} "
-        f"total_minus_ce={_g('total_loss_minus_ce'):.6f} "
-        f"reconstructed={_g('reconstructed_total_loss'):.6f} "
-        f"recon_err={_g('reconstructed_loss_error'):.3e}"
-    )
-    if is_v4164:
-        _qk_per_dead = _g('attn_qk_dead_penalty') / max(_g('attn_qk_dead_count'), 1.0)
-        _v_per_dead = _g('attn_v_dead_penalty') / max(_g('attn_v_dead_count'), 1.0)
-        log_debug_message(
-            f"dead_diag: qk_count={_g('attn_qk_dead_count'):.1f} "
-            f"v_count={_g('attn_v_dead_count'):.1f} "
-            f"rst_count={_g('rst_dead_count'):.1f} "
-            f"total={_g('dead_count_total'):.1f} "
-            f"raw[qk={_g('attn_qk_dead_penalty'):.6f} "
-            f"v={_g('attn_v_dead_penalty'):.6f} "
-            f"rst={_g('rst_dead_penalty_raw', _g('rst_dead_penalty')):.6f}] "
-            f"per_dead[qk={_qk_per_dead:.6f} "
-            f"v={_v_per_dead:.6f} "
-            f"rst={_g('rst_dead_penalty_per_dead'):.6f} "
-            f"total={_g('dead_penalty_per_dead'):.6f}] "
-            f"direct_w[qk={_g('dead_penalty_qk_weight', 0.0):.4g} "
-            f"v={_g('dead_penalty_v_weight', 0.0):.4g} "
-            f"rst={_g('dead_penalty_rst_weight', 0.0):.4g}] "
-            f"weighted={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f}"
-        )
-    else:
-        log_debug_message(
-            f"dead_diag: a_count={_g('attn_dead_count'):.1f} "
-            f"rst_count={_g('rst_dead_count'):.1f} "
-            f"total={_g('dead_count_total'):.1f} "
-            f"raw[a={_g('attn_dead_penalty_raw', _g('attn_dead_penalty')):.6f} "
-            f"rst={_g('rst_dead_penalty_raw', _g('rst_dead_penalty')):.6f}] "
-            f"per_dead[a={_g('attn_dead_penalty_per_dead'):.6f} "
-            f"rst={_g('rst_dead_penalty_per_dead'):.6f} "
-            f"total={_g('dead_penalty_per_dead'):.6f}] "
-            f"weight={_g('dead_penalty_weight'):.4f} "
-            f"weighted={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f}"
-        )
-    if _g('cb1a_weight') != 0.0 or _g('cb1a_raw') != 0.0:
-        log_debug_message(
-            f"cb1a_diag: raw={_g('cb1a_raw'):+.6f} "
-            f"w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
-            f"challenge={_g('cb1a_challenge_raw'):+.6f} "
-            f"prune={_g('cb1a_prune_raw'):+.6f} "
-            f"valid={_g('cb1a_valid'):.3f} "
-            f"has_above={_g('cb1a_has_above'):.3f} "
-            f"has_below={_g('cb1a_has_below'):.3f} "
-            f"pool_challenge[qk={_g('cb1a_qk_challenge'):+.6f} "
-            f"v={_g('cb1a_v_challenge'):+.6f} "
-            f"rst={_g('cb1a_rst_challenge'):+.6f}] "
-            f"pool_prune[qk={_g('cb1a_qk_prune'):+.6f} "
-            f"v={_g('cb1a_v_prune'):+.6f} "
-            f"rst={_g('cb1a_rst_prune'):+.6f}] "
-            f"weighted_pool[qk={_g('cb1a_qk_raw'):+.6f} "
-            f"v={_g('cb1a_v_raw'):+.6f} "
-            f"rst={_g('cb1a_rst_raw'):+.6f}] "
-            f"direct_w[qk=({_g('cb1a_qk_challenge_weight', 0.0):.4g},"
-            f"{_g('cb1a_qk_prune_weight', 0.0):.4g}) "
-            f"v=({_g('cb1a_v_challenge_weight', 0.0):.4g},"
-            f"{_g('cb1a_v_prune_weight', 0.0):.4g}) "
-            f"rst=({_g('cb1a_rst_challenge_weight', 0.0):.4g},"
-            f"{_g('cb1a_rst_prune_weight', 0.0):.4g})]"
-        )
-    if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
-        log_debug_message(
-            f"soft_exposure_diag: "
-            f"mean[qk={_g('attn_qk_soft_exposure_mean'):+.5f} "
-            f"v={_g('attn_v_soft_exposure_mean'):+.5f} "
-            f"rst={_g('rst_soft_exposure_mean'):+.5f}] "
-            f"min[qk={_g('attn_qk_soft_exposure_min'):+.5f} "
-            f"v={_g('attn_v_soft_exposure_min'):+.5f} "
-            f"rst={_g('rst_soft_exposure_min'):+.5f}] "
-            f"max[qk={_g('attn_qk_soft_exposure_max'):+.5f} "
-            f"v={_g('attn_v_soft_exposure_max'):+.5f} "
-            f"rst={_g('rst_soft_exposure_max'):+.5f}] "
-            f"dead@1e-6[qk={_g('attn_qk_soft_dead_frac_eps_1e_6'):.5f} "
-            f"v={_g('attn_v_soft_dead_frac_eps_1e_6'):.5f} "
-            f"rst={_g('rst_soft_dead_frac_eps_1e_6'):.5f}] "
-            f"dead@1e-5[qk={_g('attn_qk_soft_dead_frac_eps_1e_5'):.5f} "
-            f"v={_g('attn_v_soft_dead_frac_eps_1e_5'):.5f} "
-            f"rst={_g('rst_soft_dead_frac_eps_1e_5'):.5f}] "
-            f"dead@1e-4[qk={_g('attn_qk_soft_dead_frac_eps_1e_4'):.5f} "
-            f"v={_g('attn_v_soft_dead_frac_eps_1e_4'):.5f} "
-            f"rst={_g('rst_soft_dead_frac_eps_1e_4'):.5f}]"
-        )
-    elif ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
-        log_debug_message(
-            f"soft_exposure_diag: "
-            f"mean[attn={_g('attn_angular_exposure_mean'):+.5f} "
-            f"rst={_g('rst_angular_exposure_mean'):+.5f}] "
-            f"min[attn={_g('attn_angular_exposure_min'):+.5f} "
-            f"rst={_g('rst_angular_exposure_min'):+.5f}] "
-            f"max[attn={_g('attn_angular_exposure_max'):+.5f} "
-            f"rst={_g('rst_angular_exposure_max'):+.5f}] "
-            f"dead_frac[attn={_g('attn_dead_exposure_frac'):.5f} "
-            f"rst={_g('rst_dead_exposure_frac'):.5f}] "
-            f"weak_frac[attn={_g('attn_weak_exposure_frac'):.5f} "
-            f"rst={_g('rst_weak_exposure_frac'):.5f}] "
-            f"target={_g('attn_dead_exposure_target'):.5f}"
-        )
-    elif is_v4164:
-        log_debug_message(
-            f"soft_exposure_diag: "
-            f"mean[qk={_g('attn_qk_angular_exposure_mean'):+.5f} "
-            f"v={_g('attn_v_angular_exposure_mean'):+.5f} "
-            f"rst={_g('rst_angular_exposure_mean'):+.5f}] "
-            f"min[qk={_g('attn_qk_angular_exposure_min'):+.5f} "
-            f"v={_g('attn_v_angular_exposure_min'):+.5f} "
-            f"rst={_g('rst_angular_exposure_min'):+.5f}] "
-            f"max[qk={_g('attn_qk_angular_exposure_max'):+.5f} "
-            f"v={_g('attn_v_angular_exposure_max'):+.5f} "
-            f"rst={_g('rst_angular_exposure_max'):+.5f}] "
-            f"dead_frac[qk={_g('attn_qk_dead_exposure_frac'):.5f} "
-            f"v={_g('attn_v_dead_exposure_frac'):.5f} "
-            f"rst={_g('rst_dead_exposure_frac'):.5f}] "
-            f"weak_frac[qk={_g('attn_qk_weak_exposure_frac'):.5f} "
-            f"v={_g('attn_v_weak_exposure_frac'):.5f} "
-            f"rst={_g('rst_weak_exposure_frac'):.5f}] "
-            f"target={_g('attn_qk_dead_exposure_target'):.5f}"
-        )
-    if is_v4164:
-        log_debug_message(
-            f"route_diag: active_n[q={_g('attn_q_active') * ctx.get('n_qk_cfg', 0):.1f} "
-            f"k={_g('attn_k_active') * ctx.get('n_qk_cfg', 0):.1f} "
-            f"v={_g('attn_v_active') * ctx.get('n_v_cfg', 0):.1f} "
-            f"rst={_g('rst_active') * ctx.get('n_rst_cfg', 0):.1f}] "
-            f"active_frac[q={_g('attn_q_active'):.4f} "
-            f"k={_g('attn_k_active'):.4f} "
-            f"v={_g('attn_v_active'):.4f} rst={_g('rst_active'):.4f}] "
-            f"strong[q={_g('attn_q_strong'):.4f} "
-            f"k={_g('attn_k_strong'):.4f} "
-            f"v={_g('attn_v_strong'):.4f} rst={_g('rst_strong'):.4f}] "
-            f"admission_den[qk={_g('attn_qk_gate_den_sum_mean'):.3f} "
-            f"v={_g('attn_v_gate_den_sum_mean'):.3f} "
-            f"rst={_g('rst_gate_den_sum_mean'):.3f}] "
-            f"eff[qk={_g('attn_qk_gate_eff_n'):.3f}/{_g('attn_qk_gate_eff_ratio'):.4f} "
-            f"v={_g('attn_v_gate_eff_n'):.3f}/{_g('attn_v_gate_eff_ratio'):.4f} "
-            f"rst={_g('rst_gate_eff_n'):.3f}/{_g('rst_gate_eff_ratio'):.4f}] "
-            f"top1[qk_m={_g('attn_qk_top1_gate_frac'):.4f} "
-            f"qk_max={_g('attn_qk_top1_gate_frac_max'):.4f} "
-            f"v_m={_g('attn_v_top1_gate_frac'):.4f} "
-            f"v_max={_g('attn_v_top1_gate_frac_max'):.4f} "
-            f"rst_m={_g('rst_top1_gate_frac'):.4f} "
-            f"rst_max={_g('rst_top1_gate_frac_max'):.4f}] "
-            f"admission_max[qk={_g('attn_qk_raw_gate_max'):.3f} "
-            f"v={_g('attn_v_raw_gate_max'):.3f} "
-            f"rst={_g('rst_raw_gate_max'):.3f}]"
-        )
-    else:
-        log_debug_message(
-            f"route_diag: active_n[qk={_g('attn_qk_active') * ctx.get('n_qk_cfg', 0):.1f} "
-            f"v={_g('attn_v_active') * ctx.get('n_v_cfg', 0):.1f} "
-            f"rst={_g('rst_active') * ctx.get('n_rst_cfg', 0):.1f}] "
-            f"active_frac[qk={_g('attn_qk_active'):.4f} "
-            f"v={_g('attn_v_active'):.4f} rst={_g('rst_active'):.4f}] "
-            f"strong[qk={_g('attn_qk_strong'):.4f} "
-            f"v={_g('attn_v_strong'):.4f} rst={_g('rst_strong'):.4f}] "
-            f"admission_den[attn={_g('attn_gate_den_sum_mean'):.3f} "
-            f"rst={_g('rst_gate_den_sum_mean'):.3f}] "
-            f"contrib[attn={_g('attn_contrib_den_sum'):.3f} "
-            f"rst={_g('rst_contrib_den_sum'):.3f}] "
-            f"execution_weight[attn={_g('attn_compose_norm'):.4f} "
-            f"rst={_g('rst_compose_norm'):.4f}] "
-            f"den_ratio[attn={_g('attn_den_ratio'):.4f} "
-            f"rst={_g('rst_den_ratio'):.4f}] "
-            f"eff[attn={_g('attn_gate_eff_n'):.3f}/{_g('attn_gate_eff_ratio'):.4f} "
-            f"rst={_g('rst_gate_eff_n'):.3f}/{_g('rst_gate_eff_ratio'):.4f}] "
-            f"top1[attn_m={_g('attn_top1_gate_frac'):.4f} "
-            f"attn_max={_g('attn_top1_gate_frac_max'):.4f} "
-            f"rst_m={_g('rst_top1_gate_frac'):.4f} "
-            f"rst_max={_g('rst_top1_gate_frac_max'):.4f}] "
-            f"gate_max[attn={_g('attn_raw_gate_max'):.3f} "
-            f"rst={_g('rst_raw_gate_max'):.3f}]"
-        )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
-        log_debug_message(_format_output_stab_line(rec, indent=""))
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
-        log_debug_message(
-            f"angular_select_diag: "
-            f"rho_mean[attn={_g('attn_rho_mean'):+.5f} rst={_g('rst_rho_mean'):+.5f}] "
-            f"rho_std[attn={_g('attn_rho_std'):.5f} rst={_g('rst_rho_std'):.5f}] "
-            f"rho_max[attn={_g('attn_rho_max'):.5f} rst={_g('rst_rho_max'):.5f}] "
-            f"tau_raw[attn={_g('attn_tau_raw_mean'):+.5f} rst={_g('rst_tau_raw_mean'):+.5f}] "
-            f"tau[attn={_g('attn_tau_floor_mean'):+.5f} rst={_g('rst_tau_floor_mean'):+.5f}] "
-            f"tau_min_hit[attn={_g('attn_tau_min_hit_frac'):.5f} rst={_g('rst_tau_min_hit_frac'):.5f}] "
-            f"selection_margin[attn={_g('attn_selection_margin_mean'):+.5f} rst={_g('rst_selection_margin_mean'):+.5f}] "
-            f"positive_margin[attn={_g('attn_positive_margin_mean'):.5f}/{_g('attn_positive_margin_max'):.5f} "
-            f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
-            f"selected[attn={_g('attn_selected_frac'):.5f} rst={_g('rst_selected_frac'):.5f}] "
-            f"no_active[attn={_g('attn_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
-        )
-    elif ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
-        _is_v4162_soft = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
-        _weight_label = (
-            'admission'
-            if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
-            else ('soft_weight' if _is_v4162_soft else 'positive_margin'))
-        _select_status = ""
-        if not _is_v4162_soft:
-            _select_status = (
-                f" selected[qk={_g('attn_qk_selected_frac'):.5f} "
-                f"v={_g('attn_v_selected_frac'):.5f} "
-                f"rst={_g('rst_selected_frac'):.5f}] "
-                f"no_active[qk={_g('attn_qk_no_active_frac'):.5f} "
-                f"v={_g('attn_v_no_active_frac'):.5f} "
-                f"rst={_g('rst_no_active_frac'):.5f}]")
-        log_debug_message(
-            f"direct_tau_select_diag: "
-            f"tau[qk={_g('attn_qk_tau_mean'):+.5f} "
-            f"v={_g('attn_v_tau_mean'):+.5f} rst={_g('rst_tau_mean'):+.5f}] "
-            f"raw_tau[qk={_g('attn_qk_raw_tau_mean'):+.5f} "
-            f"v={_g('attn_v_raw_tau_mean'):+.5f} rst={_g('rst_raw_tau_mean'):+.5f}] "
-            f"selection_margin[qk={_g('attn_qk_selection_margin_mean'):+.5f} "
-            f"v={_g('attn_v_selection_margin_mean'):+.5f} "
-            f"rst={_g('rst_selection_margin_mean'):+.5f}] "
-            f"{_weight_label}[qk={_g('attn_qk_positive_margin_mean'):.5f}/{_g('attn_qk_positive_margin_max'):.5f} "
-            f"v={_g('attn_v_positive_margin_mean'):.5f}/{_g('attn_v_positive_margin_max'):.5f} "
-            f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
-            f"{_select_status}"
-        )
-    if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
-        log_debug_message(
-            "v4164_thresholds: active_tau["
-            + _fmt_sparsity_pool_values(
-                rec,
-                lambda pool: _fmt_sparsity_frac_count(
-                    rec, pool, 'active_tau'),
-                pools=SPARSITY_LOG_POOLS)
-            + "] admission@1e-2["
-            + _fmt_sparsity_pool_values(
-                rec,
-                lambda pool: _fmt_sparsity_frac_count(
-                    rec, pool, 'admission_active_eps_1e_2'),
-                pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + "] admission@1e-1["
-            + _fmt_sparsity_pool_values(
-                rec,
-                lambda pool: _fmt_sparsity_frac_count(
-                    rec, pool, 'admission_active_eps_1e_1'),
-                pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + "] execution_weight@1e-4["
-            + _fmt_sparsity_pool_values(
-                rec,
-                lambda pool: _fmt_sparsity_frac_count(
-                    rec, pool, 'active_eps_1e_4'),
-                pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + "] execution_weight@1e-3["
-            + _fmt_sparsity_pool_values(
-                rec,
-                lambda pool: _fmt_sparsity_frac_count(
-                    rec, pool, 'active_eps_1e_3'),
-                pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + "] execution_weight@1e-2["
-            + _fmt_sparsity_pool_values(
-                rec,
-                lambda pool: _fmt_sparsity_frac_count(
-                    rec, pool, 'active_eps_1e_2'),
-                pools=(('attn_qk', 'qk'), ('attn_v', 'v'), ('rst', 'rst')))
-            + "]"
-        )
-        log_debug_message(
-            "v4164_drive_admission_den: "
-            f"qk[drive_m={_g('attn_qk_drive_mean'):.6f} "
-            f"max={_g('attn_qk_drive_max'):.6f}] "
-            f"v[drive_m={_g('attn_v_drive_mean'):.6f} "
-            f"max={_g('attn_v_drive_max'):.6f}] "
-            f"rst[drive_m={_g('rst_drive_mean'):.6f} "
-            f"max={_g('rst_drive_max'):.6f}] "
-            f"admission_den[qk={_g('attn_qk_admission_den_sum'):.3f} "
-            f"v={_g('attn_v_admission_den_sum'):.3f} "
-            f"rst={_g('rst_admission_den_sum'):.3f}] "
-            f"execution_mass[qk={_g('attn_qk_execution_mass_sum'):.3f} "
-            f"v={_g('attn_v_execution_mass_sum'):.3f} "
-            f"rst={_g('rst_execution_mass_sum'):.3f}]"
-        )
-    route_std_label = (
-        "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
-        else "score_std")
-    if is_v4164:
-        log_debug_message(
-            f"tau_diag: tau_abs[qk={_g('attn_qk_tau_abs_mean'):.4f} "
-            f"v={_g('attn_v_tau_abs_mean'):.4f} "
-            f"rst={_g('rst_tau_abs_mean'):.4f}] "
-            f"raw_tau[qk={_g('attn_qk_raw_tau_mean'):+.4f} "
-            f"v={_g('attn_v_raw_tau_mean'):+.4f} "
-            f"rst={_g('rst_raw_tau_mean'):+.4f}]"
-        )
-    else:
-        log_debug_message(
-            f"tau_diag: {route_std_label}[attn={_g('attn_score_std'):.4f} "
-            f"rst={_g('rst_score_std'):.4f}] "
-            f"tau_abs[attn={_g('attn_tau_abs_mean'):.4f} "
-            f"rst={_g('rst_tau_abs_mean'):.4f}] "
-            f"tau_offset_attn[min={_g('attn_tau_off_min'):+.4f} "
-            f"p01={_g('attn_tau_off_p01'):+.4f} p99={_g('attn_tau_off_p99'):+.4f} "
-            f"max={_g('attn_tau_off_max'):+.4f} "
-            f"neg={_g('attn_tau_off_neg_frac'):.4f}] "
-            f"tau_offset_rst[min={_g('rst_tau_off_min'):+.4f} "
-            f"p01={_g('rst_tau_off_p01'):+.4f} p99={_g('rst_tau_off_p99'):+.4f} "
-            f"max={_g('rst_tau_off_max'):+.4f} "
-            f"neg={_g('rst_tau_off_neg_frac'):.4f}] "
-            f"scan_offset[attn=({_g('raw_scan_offset_attn_bias_0'):+.4f},"
-            f"{_g('raw_scan_offset_attn_bias_1'):+.4f},"
-            f"{_g('raw_scan_offset_attn_bias_2'):+.4f}) "
-            f"rst={_g('raw_scan_offset_rst_bias'):+.4f}]"
-        )
-    _intensity_bound = float(np.exp(float(ctx.get('intensity_beta', 0.0))))
-    _intensity_bound = _intensity_bound if _intensity_bound > 0 else 1.0
-    log_debug_message(
-        f"intensity_diag: int_max[attn={_g('attn_int_max', float('nan')):.3f} "
-        f"rst={_g('rst_int_max', float('nan')):.3f}] "
-        f"bound=exp(beta)={_intensity_bound:.3f} "
-        f"bound_ratio[attn={_g('attn_int_max') / _intensity_bound:.3f} "
-        f"rst={_g('rst_int_max') / _intensity_bound:.3f}] "
-        f"legacy_cap_frac[attn={_g('attn_int_cap_frac'):.6f} "
-        f"rst={_g('rst_int_cap_frac'):.6f}] "
-        f"op_gain_max[qk={_g('attn_qk_op_gain_max'):.3f} "
-        f"v={_g('attn_v_op_gain_max'):.3f} "
-        f"rst={_g('rst_op_gain_max'):.3f}] "
-        f"emb_max[qk={_g('attn_qk_emb_norm_max'):.3f} "
-        f"v={_g('attn_v_emb_norm_max'):.3f} "
-        f"rst={_g('rst_emb_norm_max'):.3f}] "
-        f"rw_max[qk_r={_g('attn_qk_read_norm_max'):.3f} "
-        f"qk_w={_g('attn_qk_write_norm_max'):.3f} "
-        f"v_r={_g('attn_v_read_norm_max'):.3f} "
-        f"v_w={_g('attn_v_write_norm_max'):.3f} "
-        f"rst_r={_g('rst_read_norm_max'):.3f} "
-        f"rst_w={_g('rst_write_norm_max'):.3f}] "
-        f"scale[qk={_g('attn_qk_pool_scale'):.3f} "
-        f"v={_g('attn_v_pool_scale'):.3f} rst={_g('rst_pool_scale'):.3f}]"
-    )
-    log_debug_message(
-        f"out_diag: resid_mean={_g('debug_residual_norm'):.3f} "
-        f"resid_max={_g('debug_residual_norm_max'):.3f} "
-        f"lm_logit_abs_max={_g('debug_logit_max'):.3f} "
-        f"lm_logit_norm_mean={_g('debug_logit_norm_mean'):.3f} "
-        f"lm_logit_std={_g('debug_logit_std'):.3f} "
-        f"tok_emb_norm={_g('debug_token_emb_norm'):.3f} "
-        f"attn_out_mean={_g('attn_out_norm'):.3f} "
-        f"rst_out_mean={_g('rst_out_norm'):.3f} "
-        f"layer_attn_max={_layer_max('per_layer_attn_out_norm'):.3f} "
-        f"layer_rst_max={_layer_max('per_layer_rst_out_norm'):.3f}"
-    )
-    if is_v4164:
-        log_debug_message(
-            f"raw_tau_grad[qk={_g('grad_router_raw_tau_qk'):.6f} "
-            f"v={_g('grad_router_raw_tau_v'):.6f} "
-            f"rst={_g('grad_router_raw_tau_rst'):.6f}]")
-        tau_grad_part = (
-            f"router_raw_tau_qk={_g('grad_router_raw_tau_qk'):.6f} "
-            f"router_raw_tau_v={_g('grad_router_raw_tau_v'):.6f} "
-            f"router_raw_tau_rst={_g('grad_router_raw_tau_rst'):.6f} ")
-    else:
-        tau_grad_part = (
-            f"router_tau_attn={_g('grad_router_tau_attn'):.6f} "
-            f"router_tau_rst={_g('grad_router_tau_rst'):.6f} ")
-    log_debug_message(
-        f"grad_groups: global_pre={_g('grad_global_preclip', _g('grad_norm')):.6f} "
-        f"global_post={_g('grad_global_postclip'):.6f} "
-        f"token_emb={_g('grad_token_emb'):.6f} "
-        f"pos_emb={_g('grad_pos_emb'):.6f} "
-        f"router_proj_attn={_g('grad_router_proj_attn'):.6f} "
-        f"router_proj_rst={_g('grad_router_proj_rst'):.6f} "
-        f"{tau_grad_part}"
-        f"router_scan_attn={_g('grad_router_scan_attn'):.6f} "
-        f"router_scan_rst={_g('grad_router_scan_rst'):.6f} "
-        f"qk_rw={_g('grad_pool_attn_qk_read'):.6f}/{_g('grad_pool_attn_qk_write'):.6f} "
-        f"v_rw={_g('grad_pool_attn_v_read'):.6f}/{_g('grad_pool_attn_v_write'):.6f} "
-        f"rst_rw={_g('grad_pool_rst_read'):.6f}/{_g('grad_pool_rst_write'):.6f} "
-        f"pool_scale={_g('grad_pool_scales'):.6f} "
-        f"expand_O={_g('grad_expand_O'):.6f} "
-        f"ln={_g('grad_layernorms'):.6f} "
-        f"lm_head_or_token_tied={_g('grad_lm_head_or_token_tied'):.6f}"
-    )
-    if is_v4164:
-        raw_tau_part = ""
-        if _g('update_cap_raw_tau_enabled') > 0.0:
-            raw_tau_part = (
-                f"raw_tau[qk pre={_g('update_cap_raw_tau_qk_abs_pre'):.2e} "
-                f"post={_g('update_cap_raw_tau_qk_abs_post'):.2e} "
-                f"hit={_g('update_cap_raw_tau_qk_hit'):.0f}; "
-                f"v pre={_g('update_cap_raw_tau_v_abs_pre'):.2e} "
-                f"post={_g('update_cap_raw_tau_v_abs_post'):.2e} "
-                f"hit={_g('update_cap_raw_tau_v_hit'):.0f}; "
-                f"rst pre={_g('update_cap_raw_tau_rst_abs_pre'):.2e} "
-                f"post={_g('update_cap_raw_tau_rst_abs_post'):.2e} "
-                f"hit={_g('update_cap_raw_tau_rst_hit'):.0f}] ")
-        log_debug_message(
-            f"update_cap: proj[a pre={_g('update_cap_proj_attn_ratio_pre'):.2e} "
-            f"post={_g('update_cap_proj_attn_ratio_post'):.2e} "
-            f"s={_g('update_cap_proj_attn_scale', 1.0):.2e} "
-            f"hit={_g('update_cap_proj_attn_hit'):.0f}; "
-            f"rst pre={_g('update_cap_proj_rst_ratio_pre'):.2e} "
-            f"post={_g('update_cap_proj_rst_ratio_post'):.2e} "
-            f"s={_g('update_cap_proj_rst_scale', 1.0):.2e} "
-            f"hit={_g('update_cap_proj_rst_hit'):.0f}] "
-            f"emb[qk pre={_g('update_cap_emb_qk_ratio_pre'):.2e} "
-            f"post={_g('update_cap_emb_qk_ratio_post'):.2e} "
-            f"hit={_g('update_cap_emb_qk_hit'):.0f}; "
-            f"v pre={_g('update_cap_emb_v_ratio_pre'):.2e} "
-            f"post={_g('update_cap_emb_v_ratio_post'):.2e} "
-            f"hit={_g('update_cap_emb_v_hit'):.0f}; "
-            f"rst pre={_g('update_cap_emb_rst_ratio_pre'):.2e} "
-            f"post={_g('update_cap_emb_rst_ratio_post'):.2e} "
-            f"hit={_g('update_cap_emb_rst_hit'):.0f}] "
-            f"{raw_tau_part}"
-            f"scan[a pre={_g('update_cap_scan_attn_abs_pre'):.2e} "
-            f"post={_g('update_cap_scan_attn_abs_post'):.2e} "
-            f"hit={_g('update_cap_scan_attn_hit'):.0f}; "
-            f"rst pre={_g('update_cap_scan_rst_abs_pre'):.2e} "
-            f"post={_g('update_cap_scan_rst_abs_post'):.2e} "
-            f"hit={_g('update_cap_scan_rst_hit'):.0f}]"
-        )
-    else:
-        log_debug_message(
-            f"update_cap: proj[a pre={_g('update_cap_proj_attn_ratio_pre'):.2e} "
-            f"post={_g('update_cap_proj_attn_ratio_post'):.2e} "
-            f"s={_g('update_cap_proj_attn_scale', 1.0):.2e} "
-            f"hit={_g('update_cap_proj_attn_hit'):.0f}; "
-            f"rst pre={_g('update_cap_proj_rst_ratio_pre'):.2e} "
-            f"post={_g('update_cap_proj_rst_ratio_post'):.2e} "
-            f"s={_g('update_cap_proj_rst_scale', 1.0):.2e} "
-            f"hit={_g('update_cap_proj_rst_hit'):.0f}] "
-            f"emb[qk pre={_g('update_cap_emb_qk_ratio_pre'):.2e} "
-            f"post={_g('update_cap_emb_qk_ratio_post'):.2e} "
-            f"hit={_g('update_cap_emb_qk_hit'):.0f}; "
-            f"v pre={_g('update_cap_emb_v_ratio_pre'):.2e} "
-            f"post={_g('update_cap_emb_v_ratio_post'):.2e} "
-            f"hit={_g('update_cap_emb_v_hit'):.0f}; "
-            f"rst pre={_g('update_cap_emb_rst_ratio_pre'):.2e} "
-            f"post={_g('update_cap_emb_rst_ratio_post'):.2e} "
-            f"hit={_g('update_cap_emb_rst_hit'):.0f}] "
-            f"tau[a pre={_g('update_cap_tau_attn_abs_pre'):.2e} "
-            f"post={_g('update_cap_tau_attn_abs_post'):.2e} "
-            f"hit={_g('update_cap_tau_attn_hit'):.0f}; "
-            f"rst pre={_g('update_cap_tau_rst_abs_pre'):.2e} "
-            f"post={_g('update_cap_tau_rst_abs_post'):.2e} "
-            f"hit={_g('update_cap_tau_rst_hit'):.0f}] "
-            f"scan[a pre={_g('update_cap_scan_attn_abs_pre'):.2e} "
-            f"post={_g('update_cap_scan_attn_abs_post'):.2e} "
-            f"hit={_g('update_cap_scan_attn_hit'):.0f}; "
-            f"rst pre={_g('update_cap_scan_rst_abs_pre'):.2e} "
-            f"post={_g('update_cap_scan_rst_abs_post'):.2e} "
-            f"hit={_g('update_cap_scan_rst_hit'):.0f}]"
-        )
-    _cap_window_line = _format_update_cap_window_line(
-        rec, indent="", is_v4164=is_v4164)
-    if _cap_window_line:
-        log_debug_message(_cap_window_line)
-    _print_grad_layer_block(rec, is_v4164=is_v4164)
-    reasons = []
-    log_debug_message("")
-
-
-def _print_debug_analysis_block(rec, ctx):
-    def _g(key, default=0.0):
-        return float(rec.get(key, default) or 0.0)
-
-    log_debug_message(
-        f"analysis_diag: step={rec.get('step', 0)} "
-        f"boundary_phi[qk={_g('attn_qk_phi_binary'):.6f} "
-        f"v={_g('attn_v_phi_binary'):.6f} rst={_g('rst_phi_binary'):.6f}] "
-        f"z_lt_075[attn={_g('attn_z_lt_075'):.6f} "
-        f"rst={_g('rst_z_lt_075'):.6f}] "
-        f"z_lt_030[attn={_g('attn_z_lt_030'):.6f} "
-        f"rst={_g('rst_z_lt_030'):.6f}] "
-        f"entropy[attn={_g('attn_gate_entropy'):.6f} "
-        f"rst={_g('rst_gate_entropy'):.6f}] "
-        f"int_cap_frac[attn={_g('attn_int_cap_frac'):.6f} "
-        f"rst={_g('rst_int_cap_frac'):.6f}] "
-        f"raw_out_norm[attn_qk={_g('attn_qk_raw_norm'):.6f} "
-        f"attn_v={_g('attn_v_raw_norm'):.6f} "
-        f"rst={_g('rst_raw_out_norm'):.6f}] "
-        f"normalized_out_norm[attn={_g('attn_out_norm'):.6f} "
-        f"rst={_g('rst_out_norm'):.6f}] "
-        f"contrib_den[attn={_g('attn_contrib_den_sum'):.6f} "
-        f"rst={_g('rst_contrib_den_sum'):.6f}] "
-        f"execution[attn={_g('attn_compose_norm'):.6f} "
-        f"rst={_g('rst_compose_norm'):.6f}] "
-        f"resid_mean={_g('debug_residual_norm'):.6f} "
-        f"resid_max={_g('debug_residual_norm_max'):.6f} "
-        f"lm_logit_abs_max={_g('debug_logit_max'):.6f} "
-        f"lm_logit_norm_mean={_g('debug_logit_norm_mean'):.6f} "
-        f"lm_logit_std={_g('debug_logit_std'):.6f}"
-    )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
-        log_debug_message(_format_output_stab_line(rec, indent=""))
-    reasons = []
-    log_debug_message("")
-
-
 def _build_analysis_record(base, metrics, ctx):
-    """ANALYSIS tier: distribution shape, boundary, saturation, debug.
+    """ANALYSIS tier: distribution shape, boundary, and saturation.
 
-    In v4.1 this is fed by analysis_step (a separate full-stats forward
+    In v4164 this is fed by analysis_step (a separate full-stats forward
     run at val ticks), not by train_step. `base` is an empty dict on the
-    new path -kept for back-compat. All ANALYSIS fields come from
+    official path. All ANALYSIS fields come from
     `metrics`, which is the dict returned by analysis_step. Needs
     `attn_out_norm` / `rst_out_norm` for the raw_n print line, so
     those are pulled from analysis_result too.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in (
-        OFFICIAL_MODEL_VERSION)
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -7223,20 +6478,20 @@ def _build_analysis_record(base, metrics, ctx):
         'attn_v_execution_top1_frac_max': float(m.get('attn_v_execution_top1_frac_max', 0.0)),
         'rst_execution_top1_frac': float(m.get('rst_execution_top1_frac', 0.0)),
         'rst_execution_top1_frac_max': float(m.get('rst_execution_top1_frac_max', 0.0)),
-        'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
-        'debug_residual_norm_max': float(m.get('debug_residual_norm_max', 0.0)),
-        'debug_token_emb_norm': float(m.get('debug_token_emb_norm', m.get('debug_emb_norm', 0.0))),
-        'debug_token_emb_norm_max': float(m.get('debug_token_emb_norm_max', 0.0)),
-        'debug_o_proj_norm': float(m.get('debug_o_proj_norm', 0.0)),
-        'debug_q_norm': float(m.get('debug_q_norm', 0.0)),
-        'debug_k_norm': float(m.get('debug_k_norm', 0.0)),
-        'debug_v_norm': float(m.get('debug_v_norm', 0.0)),
-        'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
-        'debug_logit_norm_mean': float(m.get('debug_logit_norm_mean', 0.0)),
-        'debug_logit_mean': float(m.get('debug_logit_mean', 0.0)),
-        'debug_logit_std': float(m.get('debug_logit_std', 0.0)),
-        'debug_attn_logit_max_mean': float(m.get('debug_attn_logit_max_mean', 0.0)),
-        'debug_o_input_norm': float(m.get('debug_o_input_norm', 0.0)),
+        'residual_norm': float(m.get('residual_norm', 0.0)),
+        'residual_norm_max': float(m.get('residual_norm_max', 0.0)),
+        'token_emb_norm': float(m.get('token_emb_norm', m.get('token_emb_norm', 0.0))),
+        'token_emb_norm_max': float(m.get('token_emb_norm_max', 0.0)),
+        'o_proj_norm': float(m.get('o_proj_norm', 0.0)),
+        'q_norm': float(m.get('q_norm', 0.0)),
+        'k_norm': float(m.get('k_norm', 0.0)),
+        'v_norm': float(m.get('v_norm', 0.0)),
+        'logit_max': float(m.get('logit_max', 0.0)),
+        'logit_norm_mean': float(m.get('logit_norm_mean', 0.0)),
+        'logit_mean': float(m.get('logit_mean', 0.0)),
+        'logit_std': float(m.get('logit_std', 0.0)),
+        'attn_logit_max_mean': float(m.get('attn_logit_max_mean', 0.0)),
+        'o_input_norm': float(m.get('o_input_norm', 0.0)),
         'attn_q_norm_mean': float(m.get('attn_q_norm_mean', 0.0)),
         'attn_q_norm_std': float(m.get('attn_q_norm_std', 0.0)),
         'attn_q_norm_max': float(m.get('attn_q_norm_max', 0.0)),
@@ -7286,10 +6541,9 @@ def _build_analysis_record(base, metrics, ctx):
     except Exception:
         rec['attn_logit_max_layer'] = -1
     # Full pool diagnostics emitted by _pool_param_diagnostics() use the
-    # current SRW names: attn_qk_*, attn_v_*, rst_*.  Older analysis code
-    # copied only legacy qk/v/know names, which made _print_analysis_block()
-    # crash with KeyError at validation time.  Copy both name families and
-    # provide a conservative fallback to the non-full scalar names.
+    # current SRW names: attn_qk_*, attn_v_*, rst_*. Copy qk/v/know
+    # alias metrics too, then provide a conservative fallback to the
+    # non-full scalar names.
     def _copy_full_pool_stats(dst_prefix, src_prefix=None):
         src_prefix = src_prefix or dst_prefix
         for _kind in ('emb_norm', 'read_norm', 'write_norm', 'op_gain'):
@@ -7305,7 +6559,7 @@ def _build_analysis_record(base, metrics, ctx):
     for _pool in ('attn_qk', 'attn_v', 'rst'):
         _copy_full_pool_stats(_pool)
 
-    # Keep legacy aliases populated for old JSONL consumers / archived models.
+    # Keep qk/v/know aliases populated for JSONL continuity.
     for _dst, _src in (('qk', 'attn_qk'), ('v', 'attn_v'), ('know', 'rst')):
         _copy_full_pool_stats(_dst, _src)
     rec['attn_gate_eff_n'] = float(m.get('attn_gate_eff_n', 0.0))
@@ -7338,19 +6592,18 @@ def _build_analysis_record(base, metrics, ctx):
                                m.get(f'{_src}_{_part}_grad_ratio', 0.0)))
             rec[f'{_dst}_{_part}_grad_ratio'] = _val
             rec[f'{_dst}_{_part}_update_ratio'] = _lr * _val
-    if is_v415:
-        rec.pop('attn_den_cost', None)
-        rec.pop('rst_den_cost', None)
-        rec.update({
-            'attn_gate_den_sum': float(m.get(
-                'attn_gate_den_sum',
-                m.get('attn_gate_den_sum_mean',
-                      m.get('attn_den_cost', 0.0)))),
-            'rst_gate_den_sum': float(m.get(
-                'rst_gate_den_sum',
-                m.get('rst_gate_den_sum_mean',
-                      m.get('rst_den_cost', 0.0)))),
-        })
+    rec.pop('attn_den_cost', None)
+    rec.pop('rst_den_cost', None)
+    rec.update({
+        'attn_gate_den_sum': float(m.get(
+            'attn_gate_den_sum',
+            m.get('attn_gate_den_sum_mean',
+                  m.get('attn_den_cost', 0.0)))),
+        'rst_gate_den_sum': float(m.get(
+            'rst_gate_den_sum',
+            m.get('rst_gate_den_sum_mean',
+                  m.get('rst_den_cost', 0.0)))),
+    })
     _attach_validation_dead_fractions(rec, ctx)
     # HBM (host-0 local device 0 snapshot).
     try:
@@ -7409,7 +6662,7 @@ def _print_analysis_block(rec, ctx):
         if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
             _print_v4164_sparsity_block(rec)
         else:
-            _print_v4162_sparsity_block(rec, 'full')
+            _print_v4164_soft_sparsity_block(rec, 'full')
     log_message(
         f"  boundary k[phi={rec['rst_phi_binary']*100:.1f}%"
         f" z<075={rec['rst_z_lt_075']*100:.1f}%"
@@ -7490,8 +6743,6 @@ def _print_analysis_block(rec, ctx):
                 f"  admission_den: a={rec['attn_gate_den_sum']:.1f}"
                 f" rst={rec['rst_gate_den_sum']:.1f}"
             )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
-        log_message(_format_output_stab_line(rec, indent="  "))
     log_message(
         f"  tau_struct k_std={rec['rst_tau_std']:.2f}"
         f" a_std=[{rec['attn_tau_std_q']:.2f} {rec['attn_tau_std_k']:.2f} {rec['attn_tau_std_v']:.2f}]"
@@ -7506,51 +6757,15 @@ def _print_analysis_block(rec, ctx):
         f" rst={rec['rst_out_norm']:.2f}"
     )
     log_message(
-        f"  debug resid={rec['debug_residual_norm']:.2f}"
-        f" tok_emb={rec['debug_token_emb_norm']:.2f}"
-        f" o_proj={rec['debug_o_proj_norm']:.2f}"
-        f" q={rec['debug_q_norm']:.2f}"
-        f" rst={rec['debug_k_norm']:.2f}"
-        f" attn_v={rec['debug_v_norm']:.2f}"
-        f" logit_max={rec['debug_logit_max']:.1f}"
-        f" o_in={rec['debug_o_input_norm']:.2f}"
+        f"  output resid={rec['residual_norm']:.2f}"
+        f" tok_emb={rec['token_emb_norm']:.2f}"
+        f" o_proj={rec['o_proj_norm']:.2f}"
+        f" q={rec['q_norm']:.2f}"
+        f" rst={rec['k_norm']:.2f}"
+        f" attn_v={rec['v_norm']:.2f}"
+        f" logit_max={rec['logit_max']:.1f}"
+        f" o_in={rec['o_input_norm']:.2f}"
     )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.6':
-        log_message("[ATTN_QK_DIAG]")
-        log_message(
-            f"  logit[mean={_g('attn_logit_mean'):.2f}"
-            f" std={_g('attn_logit_std'):.2f}"
-            f" max={_g('attn_logit_max'):.2f}"
-            f" layer_max={int(rec.get('attn_logit_max_layer', -1))}]"
-        )
-        log_message(
-            f"  q_norm[mean={_g('attn_q_norm_mean'):.2f}"
-            f" std={_g('attn_q_norm_std'):.2f}"
-            f" max={_g('attn_q_norm_max'):.2f}]"
-        )
-        log_message(
-            f"  k_norm[mean={_g('attn_k_norm_mean'):.2f}"
-            f" std={_g('attn_k_norm_std'):.2f}"
-            f" max={_g('attn_k_norm_max'):.2f}]"
-        )
-        log_message(
-            f"  softmax_top1[mean={_g('attn_softmax_top1_mean'):.3f}"
-            f" max={_g('attn_softmax_top1_max'):.3f}]"
-        )
-        log_message(
-            f"  gap[top1_top2 mean={_g('attn_logit_gap_top1_top2_mean'):.2f}"
-            f" max={_g('attn_logit_gap_top1_top2_max'):.2f}]"
-        )
-        log_message(
-            f"  entropy[mean={_g('attn_softmax_entropy_mean'):.2f}"
-            f" min={_g('attn_softmax_entropy_min'):.2f}]"
-        )
-        log_message(
-            f"  out[o_in={_g('attn_o_input_norm_mean'):.2f}"
-            f"/{_g('attn_o_input_norm_max'):.2f}"
-            f" o_out={_g('attn_o_output_norm_mean'):.2f}"
-            f"/{_g('attn_o_output_norm_max'):.2f}]"
-        )
     log_message(
         f"  grad_ratio qk[emb={rec['qk_emb_grad_ratio']:.2e}"
         f" r={rec['qk_read_grad_ratio']:.2e} w={rec['qk_write_grad_ratio']:.2e}]"
@@ -7589,7 +6804,7 @@ def _print_geometry_block(geom):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Train DAWN v17.1 (JAX/Flax, Multi-Device)')
+    parser = argparse.ArgumentParser(description='Train DAWN-SRW v4164 (JAX/Flax, Multi-Device)')
     parser.add_argument('--config', type=str, required=True,
                         help='Path to config YAML file')
     parser.add_argument('--from-scratch', action='store_true',
@@ -7642,8 +6857,6 @@ def main():
         cli_args.resume
         or tcfg.get('resume_from')
         or cfg.get('resume_from'))
-    debug_interval = 0
-    debug_mode = False
     run_speed_check = bool(
         cli_args.speed_check
         or tcfg.get('speed_check', tcfg.get('run_speed_check', False)))
@@ -7652,12 +6865,8 @@ def main():
         or run_speed_check
         or tcfg.get('oom_check', tcfg.get('run_oom_check', False)))
     # Resume log append policy. Defaults preserve the previous behavior.
-    # Set debug to false in config to start fresh diagnostic files on resume
-    # without touching the main training log.
     training_log_append_on_resume = bool(
         tcfg.get('training_log_append_on_resume', True))
-    debug_log_append_on_resume = bool(
-        tcfg.get('debug_log_append_on_resume', True))
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
@@ -8488,7 +7697,7 @@ def main():
     n_local_devices = jax.local_device_count()
     local_devices = jax.local_devices()
 
-    # ALL hosts print device info (for multi-host debugging)
+    # ALL hosts print device info (for multi-host diagnostics)
     print(f"[Host {host_id}/{n_hosts}] "
           f"local_devices={n_local_devices} total_devices={jax.device_count()} "
           f"backend={jax.default_backend()} "
@@ -8593,7 +7802,7 @@ def main():
         end_value=lr * 0.1,
     )
 
-    # v4.1 per-group WD: pool tensors (attn-qk/attn-v/RST emb/read/write) get
+    # v4164 per-group WD: pool tensors (attn-qk/attn-v/RST emb/read/write) get
     # pool_weight_decay; dense kernels get weight_decay. Bias / LayerNorm /
     # learnable *_scale excluded from both groups.
     #
@@ -8674,7 +7883,7 @@ def main():
     if float(global_grad_clip) > 0.0:
         optimizer_parts.append(optax.clip_by_global_norm(global_grad_clip))
     else:
-        # Keep the old global-clip opt_state slot for checkpoint compatibility,
+        # Keep the global-clip opt_state slot for checkpoint resume stability,
         # but make it an exact no-op unless config explicitly enables clipping.
         optimizer_parts.append(optax.scale(1.0))
     optimizer_parts.extend([
@@ -8710,26 +7919,6 @@ def main():
         _pool_paths = _collect_pool_paths(_pool_mask)
         if _pool_paths:
             print(f"    pool params: {_pool_paths[:9]}")
-        if _MODEL_VERSION == 'spatial-r1-v4.1.5.6':
-            _base_paths = _collect_pool_paths(_base_mask)
-            _emb_names = ('attn_qk_emb', 'attn_v_emb', 'rst_emb')
-            _rw_names = (
-                'attn_qk_read', 'attn_qk_write',
-                'attn_v_read', 'attn_v_write',
-                'rst_read', 'rst_write',
-            )
-            _scale_names = ('attn_qk_scale', 'attn_v_scale', 'rst_scale')
-            def _paths_with(paths, names):
-                return [name for name in names
-                        if any(name in path for path in paths)]
-            _pool_emb = _paths_with(_pool_paths, _emb_names)
-            _rw_wd = _paths_with(_pool_paths + _base_paths, _rw_names)
-            _scale_wd = _paths_with(_pool_paths + _base_paths, _scale_names)
-            print("  WD v4.1.5.6 check: "
-                  f"pool_embeddings={_pool_emb}, "
-                  f"read_write_excluded={not _rw_wd}, "
-                  f"pool_scale_excluded={not _scale_wd}")
-
     if grad_accum_steps > 1:
         optimizer = optax.MultiSteps(base_optimizer, every_k_schedule=grad_accum_steps)
     else:
@@ -8777,12 +7966,12 @@ def main():
         print(f"  Div weight: {div_weight}")
         print(f"  LB weight: {lb_weight}")
         print(f"  Tau reg weight: {tau_reg_weight}")
-        print(f"  Dead penalty: legacy_global={dead_penalty_weight} "
+        print(f"  Dead penalty: global={dead_penalty_weight} "
               f"exposure_target={dead_exposure_target} "
               f"direct_w[qk={dead_penalty_qk_weight}, v={dead_penalty_v_weight}, "
               f"rst={dead_penalty_rst_weight}]")
         if inactive_aux_enabled:
-            print(f"  Exploration weight: {inactive_aux_weight}")
+            print(f"  Inactive auxiliary weight: {inactive_aux_weight}")
             print("    weight split: "
                   f"qk={inactive_aux_weight_qk} "
                   f"v={inactive_aux_weight_v} rst={inactive_aux_weight_rst}")
@@ -8794,146 +7983,102 @@ def main():
             print(f"    warmup_steps={inactive_aux_warmup_steps} "
                   f"bounds=[{inactive_aux_lower_bound}, {inactive_aux_upper_bound}] "
                   f"eps={inactive_aux_bound_eps}")
-        if model_version_cfg != OFFICIAL_MODEL_VERSION:
-            print("  CB1A: "
-                  f"enabled={cb1a_enabled} "
-                  f"ce_mode={cb1a_ce_mode} eps={cb1a_eps}")
-            print("    pool weights: "
-                  f"qk={cb1a_qk_weight} v={cb1a_v_weight} "
-                  f"rst={cb1a_rst_weight}")
-            print("    branch weights: "
-                  f"qk=({cb1a_qk_challenge_weight}, {cb1a_qk_prune_weight}) "
-                  f"v=({cb1a_v_challenge_weight}, {cb1a_v_prune_weight}) "
-                  f"rst=({cb1a_rst_challenge_weight}, "
-                  f"{cb1a_rst_prune_weight})")
         print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
               f"router={cfg['model'].get('router_dropout', 0.0)}")
-        if False:
-            gate_msg = (
-                "  Gate (v4.1.5.9 angular): "
-                f"tau_min={tcfg.get('tau_min', 0.0)} "
-                f"tau_offset_init={tcfg.get('tau_offset_init', cfg['model'].get('tau_offset_init', -0.5))} "
-                f"tau_offset_init_attn={tcfg.get('tau_offset_init_attn', cfg['model'].get('tau_offset_init_attn', 'default'))} "
-                f"tau_offset_init_attn_qk={tcfg.get('tau_offset_init_attn_qk', cfg['model'].get('tau_offset_init_attn_qk', 'default'))} "
-                f"tau_offset_init_attn_v={tcfg.get('tau_offset_init_attn_v', cfg['model'].get('tau_offset_init_attn_v', 'default'))} "
-                f"tau_offset_init_rst={tcfg.get('tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', 'default'))} "
-                f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
-                f"scan_scale={tcfg.get('scan_scale', 0.0)}"
-            )
-        elif cfg['model'].get('model_version') == OFFICIAL_MODEL_VERSION:
-            _soft_model_version = cfg['model'].get('model_version')
-            _soft_module_path = 'models.dawn_srw_v4164'
-            print(f"  Module path: {_soft_module_path}")
-            print("  Tau parameterization: bounded sigmoid min/max")
-            print("  tau = -1 + 2 * sigmoid(raw_tau)")
-            if _soft_model_version == OFFICIAL_MODEL_VERSION:
-                print("  Boundary admission: one-sided generalized Gaussian")
-                if _soft_model_version == OFFICIAL_MODEL_VERSION:
-                    print("  drive = softplus((rho-tau)/B) / softplus((1-tau)/B)")
-                    print("  execution_weight = admission * drive")
-                    print("  admission_den = max(sum(admission), 1.0) ** admission_den_power")
+        print("  Module path: models.dawn_srw_v4164")
+        print("  Tau parameterization: bounded sigmoid min/max")
+        print("  tau = -1 + 2 * sigmoid(raw_tau)")
+        print("  Boundary admission: one-sided generalized Gaussian")
+        print("  drive = softplus((rho-tau)/B) / softplus((1-tau)/B)")
+        print("  execution_weight = admission * drive")
+        print("  admission_den = max(sum(admission), 1.0) ** admission_den_power")
+        print(
+            "  admission_den_grad = admission_den_grad_scale * live_admission_den_grad "
+            "+ detached remainder")
+        print("  Boundary power:")
+        print(
+            f"    start={soft_gate_boundary_power_start} "
+            f"mid={soft_gate_boundary_power_mid} "
+            f"final={soft_gate_boundary_power_final} "
+            f"start_frac={soft_gate_boundary_power_start_frac} "
+            f"mid_frac={soft_gate_boundary_power_mid_frac} "
+            f"final_frac={soft_gate_boundary_power_final_frac}")
+        print("  Admission denominator:")
+        print(
+            f"    admission_den_power={admission_den_power} "
+            f"admission_den_grad_scale={admission_den_grad_scale}")
+        print(f"    pool_specific={pool_specific_gate_t} "
+              f"effective_active_eps={soft_gate_effective_active_eps}")
+        _scale_label = 'B'
+        def _devband_summary(_cfg):
+            return (
+                f"sort={_cfg['sort']} band={_cfg['band']} "
+                f"mid={_cfg['mid']} late={_cfg['late']} "
+                f"final={_cfg['final']} "
+                f"sort_end_frac={_cfg['sort_end_frac']} "
+                f"band_reach_frac={_cfg['band_reach_frac']} "
+                f"formation_end_frac={_cfg['formation_end_frac']} "
+                f"sharpen_end_frac={_cfg['sharpen_end_frac']} "
+                f"formation_power={_cfg['formation_power']} "
+                f"sharpen_power={_cfg['sharpen_power']}")
+        if pool_specific_gate_t:
+            for _pool in POOL_SCHEDULE_NAMES:
+                _cfg = soft_gate_pool_schedules[_pool]
+                _schedule_name = str(_cfg['schedule']).lower()
+                if _schedule_name == 'developmental_band':
                     print(
-                        "  admission_den_grad = admission_den_grad_scale * live_admission_den_grad "
-                        "+ detached remainder")
+                        f"    {_pool}: schedule={_cfg['schedule']} "
+                        f"{_devband_summary(_cfg)}")
                 else:
-                    print("  gate = exp(-((max(tau-score,0)/B)^p)) * intensity")
-                print("  Boundary power:")
-                print(
-                    f"    start={soft_gate_boundary_power_start} "
-                    f"mid={soft_gate_boundary_power_mid} "
-                    f"final={soft_gate_boundary_power_final} "
-                    f"start_frac={soft_gate_boundary_power_start_frac} "
-                    f"mid_frac={soft_gate_boundary_power_mid_frac} "
-                    f"final_frac={soft_gate_boundary_power_final_frac}")
-                if _soft_model_version == OFFICIAL_MODEL_VERSION:
-                    print("  Admission denominator:")
+                    _shape_msg = (
+                        f"gompertz_center={_cfg['gompertz_center']} "
+                        f"gompertz_steepness={_cfg['gompertz_steepness']} "
+                        if _schedule_name == 'log_gompertz'
+                        else f"power={_cfg['power']} ")
                     print(
-                        f"    admission_den_power={admission_den_power} "
-                        f"admission_den_grad_scale={admission_den_grad_scale}")
+                        f"    {_pool}: {_scale_label}_start={_cfg['start']} "
+                        f"{_scale_label}_final={_cfg['final']} "
+                        f"hold_frac={_cfg['hold_frac']} "
+                        f"anneal_end_frac={_cfg['anneal_end_frac']} "
+                        f"schedule={_cfg['schedule']} {_shape_msg}")
+        else:
+            if soft_gate_schedule.lower() == 'developmental_band':
+                _cfg = soft_gate_pool_schedules['qk']
+                print(f"    schedule={soft_gate_schedule} "
+                      f"{_devband_summary(_cfg)}")
             else:
-                print("  Soft gate:")
-            print(f"    pool_specific={pool_specific_gate_t} "
-                  f"effective_active_eps={soft_gate_effective_active_eps}")
-            _scale_label = (
-                'B'
-                if _soft_model_version == OFFICIAL_MODEL_VERSION
-                else 'T')
-            def _devband_summary(_cfg):
-                return (
-                    f"sort={_cfg['sort']} band={_cfg['band']} "
-                    f"mid={_cfg['mid']} late={_cfg['late']} "
-                    f"final={_cfg['final']} "
-                    f"sort_end_frac={_cfg['sort_end_frac']} "
-                    f"band_reach_frac={_cfg['band_reach_frac']} "
-                    f"formation_end_frac={_cfg['formation_end_frac']} "
-                    f"sharpen_end_frac={_cfg['sharpen_end_frac']} "
-                    f"formation_power={_cfg['formation_power']} "
-                    f"sharpen_power={_cfg['sharpen_power']}")
-            if pool_specific_gate_t:
-                for _pool in POOL_SCHEDULE_NAMES:
-                    _cfg = soft_gate_pool_schedules[_pool]
-                    _schedule_name = str(_cfg['schedule']).lower()
-                    if _schedule_name == 'developmental_band':
-                        print(
-                            f"    {_pool}: schedule={_cfg['schedule']} "
-                            f"{_devband_summary(_cfg)}")
-                    else:
-                        _shape_msg = (
-                            f"gompertz_center={_cfg['gompertz_center']} "
-                            f"gompertz_steepness={_cfg['gompertz_steepness']} "
-                            if _schedule_name == 'log_gompertz'
-                            else f"power={_cfg['power']} ")
-                        print(
-                            f"    {_pool}: {_scale_label}_start={_cfg['start']} "
-                            f"{_scale_label}_final={_cfg['final']} "
-                            f"hold_frac={_cfg['hold_frac']} "
-                            f"anneal_end_frac={_cfg['anneal_end_frac']} "
-                            f"schedule={_cfg['schedule']} {_shape_msg}")
-            else:
-                if soft_gate_schedule.lower() == 'developmental_band':
-                    _cfg = soft_gate_pool_schedules['qk']
-                    print(f"    schedule={soft_gate_schedule} "
-                          f"{_devband_summary(_cfg)}")
-                else:
-                    _soft_gate_shape_msg = (
-                        f"gompertz_center={soft_gate_t_gompertz_center} "
-                        f"gompertz_steepness={soft_gate_t_gompertz_steepness} "
-                        if soft_gate_schedule.lower() == 'log_gompertz'
-                        else f"power={soft_gate_t_power} ")
-                    print(f"    {_scale_label}_start={soft_gate_t_start} "
-                          f"{_scale_label}_final={soft_gate_t_final} "
-                          f"hold_frac={soft_gate_t_hold_frac} "
-                          f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
-                          f"schedule={soft_gate_schedule} "
-                          f"{_soft_gate_shape_msg}")
-            print(f"  tau control: tau_lr_mult={tau_lr_mult}")
-            if ignored_tau_ce_grad_scale_keys:
-                print("  tau_ce_grad_scale config fields are ignored in "
-                      "v4164; tau movement is controlled by tau_lr_mult.")
-            print("  Effective pruning:")
-            print(
-                f"    console={regular_console_level} "
-                f"host_timing={regular_console_host_timing}")
-            print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
-            _gate_intensity_part = (
-                ""
-                if _soft_model_version == OFFICIAL_MODEL_VERSION
-                else f"intensity_beta={tcfg.get('intensity_beta', 0.5)} ")
-            gate_msg = (
-                f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
-                f"tau_init_mode={tau_init_cfg['mode']} "
-                f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
-                f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
-                f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
-                f"{_gate_intensity_part}"
-                f"dropout={cfg['model'].get('dropout', None)} "
-                f"router_dropout={cfg['model'].get('router_dropout', None)}"
-            )
+                _soft_gate_shape_msg = (
+                    f"gompertz_center={soft_gate_t_gompertz_center} "
+                    f"gompertz_steepness={soft_gate_t_gompertz_steepness} "
+                    if soft_gate_schedule.lower() == 'log_gompertz'
+                    else f"power={soft_gate_t_power} ")
+                print(f"    {_scale_label}_start={soft_gate_t_start} "
+                      f"{_scale_label}_final={soft_gate_t_final} "
+                      f"hold_frac={soft_gate_t_hold_frac} "
+                      f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
+                      f"schedule={soft_gate_schedule} "
+                      f"{_soft_gate_shape_msg}")
+        print(f"  tau control: tau_lr_mult={tau_lr_mult}")
+        if ignored_tau_ce_grad_scale_keys:
+            print("  tau_ce_grad_scale config fields are ignored in "
+                  "v4164; tau movement is controlled by tau_lr_mult.")
+        print("  Effective pruning:")
+        print(
+            f"    console={regular_console_level} "
+            f"host_timing={regular_console_host_timing}")
+        print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
+        _gate_intensity_part = ""
+        gate_msg = (
+            f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
+            f"tau_init_mode={tau_init_cfg['mode']} "
+            f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
+            f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
+            f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
+            f"{_gate_intensity_part}"
+            f"dropout={cfg['model'].get('dropout', None)} "
+            f"router_dropout={cfg['model'].get('router_dropout', None)}"
+        )
         print(gate_msg)
-        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
-            print(
-                "  v4158 contrib-den diagnostics: "
-            )
 
     # ----------------------------------------------------------
     # Resume from checkpoint (resume_path detected earlier for config override)
@@ -8952,8 +8097,7 @@ def main():
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('step', 0)
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
-        # v4.1 has no EMA state; silently ignore any ema_ce left
-        # in older checkpoints.
+        # v4164 has no EMA state; silently ignore any ema_ce left in checkpoints.
         # Precise resume: use step_in_epoch if available
         saved_step_in_epoch = ckpt.get('step_in_epoch', 0)
         saved_steps_per_epoch = ckpt.get('steps_per_epoch', 0)
@@ -9006,7 +8150,7 @@ def main():
 
     # Fail-fast check: global_step must match across hosts after resume.
     # broadcast handles the common path but we still verify -if it ever
-    # drifts, hang-debugging mid-training is painful; raise now instead.
+    # drifts, hang diagnostics mid-training is painful; raise now instead.
     if n_hosts > 1:
         _gs_local = np.array([global_step], dtype=np.int64)
         _gs_all = np.asarray(process_allgather(_gs_local)).flatten()
@@ -9035,7 +8179,6 @@ def main():
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
     model_version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
-    is_baseline = model_version == 'baseline'
 
     mesh_model = cfg['training'].get('mesh_model', 1)
     mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
@@ -9098,7 +8241,7 @@ def main():
         print(f"  Est chunk mem (rst): {chunk_mem:.2f}GB bf16")
 
     # Shard params: neuron_pool N-axis on 'model', rest replicated
-    param_shardings = get_param_shardings(params, mesh, is_baseline=is_baseline)
+    param_shardings = get_param_shardings(params, mesh)
     params = shard_params_to_mesh(params, param_shardings)
 
     _is_resuming = (resume_path is not None and _file_exists(resume_path))
@@ -9119,14 +8262,14 @@ def main():
     # Create shard_map functions if mesh_model > 1 or the model demands
     # the sharded path.
     #
-    # v4.1: `_sharded_fns` is the slim train path; `_sharded_fns_analysis`
+    # v4164: `_sharded_fns` is the slim train path; `_sharded_fns_analysis`
     # is the full observational path used only by analysis_step.
     _sharded_fns = None
     _sharded_fns_analysis = None
     _force_sharded = True
     if mesh_model > 1 or _force_sharded:
-        _v3 = __import__('models.dawn_srw_v4164', fromlist=['make_sharded_srw'])
-        make_sharded_srw = _v3.make_sharded_srw
+        _v4164_module = __import__('models.dawn_srw_v4164', fromlist=['make_sharded_srw'])
+        make_sharded_srw = _v4164_module.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', None)
         if max_chunk is not None:
             attn_qk_max_chunk = attn_v_max_chunk = rst_max_chunk = int(max_chunk)
@@ -9151,9 +8294,9 @@ def main():
         _sharded_single_rst = make_sharded_srw(
             max_chunk_size=rst_max_chunk,
             **_factory_kwargs(make_sharded_srw, _srw_train_kwargs))
-        if hasattr(_v3, 'make_sharded_srw_paired'):
-            _paired_factory = _v3.make_sharded_srw_paired
-            _sharded_paired_attn_qk = _v3.make_sharded_srw_paired(
+        if hasattr(_v4164_module, 'make_sharded_srw_paired'):
+            _paired_factory = _v4164_module.make_sharded_srw_paired
+            _sharded_paired_attn_qk = _v4164_module.make_sharded_srw_paired(
                 max_chunk_size=attn_qk_max_chunk,
                 **_factory_kwargs(_paired_factory, _srw_train_kwargs))
             _sharded_fns = {
@@ -9166,9 +8309,7 @@ def main():
         else:
             _sharded_fns = _sharded_single_rst
         # Analysis (observation only). Factory kwargs forward analysis=True
-        # only to factories that accept it -v4.1 does, earlier versions
-        # silently absorb it via **kwargs or raise; only probe when the
-        # factory advertises the kwarg.
+        # only when the v4164 factory advertises the kwarg.
         if _supports_analysis:
             _sharded_single_v_a = make_sharded_srw(
                 analysis=True, max_chunk_size=attn_v_max_chunk,
@@ -9176,9 +8317,9 @@ def main():
             _sharded_single_rst_a = make_sharded_srw(
                 analysis=True, max_chunk_size=rst_max_chunk,
                 **_factory_kwargs(make_sharded_srw, _srw_base_kwargs))
-            if hasattr(_v3, 'make_sharded_srw_paired'):
-                _paired_factory = _v3.make_sharded_srw_paired
-                _sharded_paired_a = _v3.make_sharded_srw_paired(
+            if hasattr(_v4164_module, 'make_sharded_srw_paired'):
+                _paired_factory = _v4164_module.make_sharded_srw_paired
+                _sharded_paired_a = _v4164_module.make_sharded_srw_paired(
                     analysis=True, max_chunk_size=attn_qk_max_chunk,
                     **_factory_kwargs(_paired_factory, _srw_base_kwargs))
                 _sharded_fns_analysis = {
@@ -9275,12 +8416,8 @@ def main():
         inactive_aux_start_frac=inactive_aux_start_frac,
         inactive_aux_full_frac=inactive_aux_full_frac,
         inactive_aux_schedule=inactive_aux_schedule,
-        is_baseline=is_baseline,
         sharded_fns=_sharded_fns, mesh=mesh,
-        debug_diagnostics=debug_mode,
-        compact_train_metrics=(
-            model_version_cfg == OFFICIAL_MODEL_VERSION
-            and not debug_mode),
+        compact_train_metrics=(model_version_cfg == OFFICIAL_MODEL_VERSION),
         keep_train_layer_metrics=False)
     eval_step_fn = create_eval_step(
         model, sharded_fns=_sharded_fns, return_dead_stats=True,
@@ -9331,9 +8468,7 @@ def main():
                 soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
                 soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
                 admission_den_power=admission_den_power)
-    # v4.1: analysis_step is only meaningful when the full analysis
-    # kernels exist. Older model versions skip it -analysis logging
-    # degrades to empty then.
+    # v4164 analysis_step is active when the full analysis kernels exist.
     if _sharded_fns_analysis is not None:
         analysis_step_fn = create_analysis_step(
             model, sharded_fns=_sharded_fns_analysis,
@@ -9368,7 +8503,7 @@ def main():
     # Initial emb-drift snapshot: pytree of sharded refs matching
     # params['neuron_pool'][*_emb]. Identity here -drift=0 on first step.
     def _drift_snap(p):
-        if is_baseline or 'neuron_pool' not in p:
+        if 'neuron_pool' not in p:
             z = jnp.float32(0.0)
             return {
                 'attn_qk_emb': z,
@@ -9478,10 +8613,6 @@ def main():
             if not run_speed_check:
                 raise _SkipBreakdown("speed check disabled")
 
-            if is_baseline:
-                raise _SkipBreakdown(
-                    "baseline model has no DAWN neuron_pool/router")
-
             _is_sharded = _sharded_fns is not None
             _uses_scan_offset = model_version == OFFICIAL_MODEL_VERSION
             if is_host0:
@@ -9489,10 +8620,10 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3 = __import__(
+            _v4164_module = __import__(
                 'models.dawn_srw_v4164',
                 fromlist=['_layer_norm', '_attn_forward', '_rst_forward', '_srw_chunked'])
-            _layer_norm, _attn_forward, _rst_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._rst_forward, _v3._srw_chunked
+            _layer_norm, _attn_forward, _rst_forward, _srw_chunked = _v4164_module._layer_norm, _v4164_module._attn_forward, _v4164_module._rst_forward, _v4164_module._srw_chunked
 
             # Use actual sharded params (no device_get)
             pool_p = params['neuron_pool']
@@ -9550,8 +8681,8 @@ def main():
                 return (elapsed, hbm_after - hbm_before, peak)
 
             # --- Jit-compiled component functions for profiling ---
-            def _get_param(container, new_key, legacy_key):
-                return container[new_key] if new_key in container else container[legacy_key]
+            def _get_param(container, new_key, alias_key):
+                return container[new_key] if new_key in container else container[alias_key]
 
             # 1) LayerNorm
             @jax.jit
@@ -9731,7 +8862,7 @@ def main():
 
             # --- Timed + memory measurements ---
             # Each _t() returns (ms, delta_hbm_gb, peak_hbm_gb)
-            hbm_baseline = _hbm_gb()
+            hbm_before_profile = _hbm_gb()
             items = []  # [(name, ms, delta_gb, peak_gb)]
 
             ms, dg, pk = _t(lambda: prof_layernorm(
@@ -9830,7 +8961,7 @@ def main():
                 # Overall HBM summary
                 hbm_now = _hbm_gb()
                 print(f"\n  === HBM Summary (per device) ===", flush=True)
-                print(f"    Baseline (params+opt):  {hbm_baseline:.2f}G",
+                print(f"    Before profile:         {hbm_before_profile:.2f}G",
                       flush=True)
                 print(f"    After profile:          {hbm_now:.2f}G",
                       flush=True)
@@ -9924,8 +9055,6 @@ def main():
         # into training_log_<ts1>.txt + training_log_<ts2>.txt + ...
         _existing_logs = sorted(_list_files(log_dir, "training_log_*.txt"))
         _existing_jsonls = sorted(_list_files(log_dir, "metrics_*.jsonl"))
-        _existing_debug_logs = sorted(_list_files(log_dir, "debug_log_*.txt"))
-        _existing_debug_jsonls = sorted(_list_files(log_dir, "debug_metrics_*.jsonl"))
         _is_log_resume = (
             training_log_append_on_resume
             and (resume_path is not None)
@@ -9937,31 +9066,9 @@ def main():
         else:
             training_log_file = _join(log_dir, f'training_log_{timestamp}.txt')
             jsonl_log_file = _join(log_dir, f'metrics_{timestamp}.jsonl')
-        if debug_mode:
-            if (debug_log_append_on_resume
-                    and (resume_path is not None)
-                    and _existing_debug_logs):
-                debug_log_file = _existing_debug_logs[-1]
-                debug_jsonl_log_file = (
-                    _existing_debug_jsonls[-1] if _existing_debug_jsonls
-                    else _join(log_dir, f'debug_metrics_{timestamp}.jsonl'))
-                _is_debug_log_resume = True
-            else:
-                debug_log_file = _join(log_dir, f'debug_log_{timestamp}.txt')
-                debug_jsonl_log_file = _join(
-                    log_dir, f'debug_metrics_{timestamp}.jsonl')
-                _is_debug_log_resume = False
-        else:
-            debug_log_file = None
-            debug_jsonl_log_file = None
-            _is_debug_log_resume = False
-
         # Set up loggers (local append + periodic GCS sync)
         _setup_loggers(
-            training_log_file, jsonl_log_file, resume=_is_log_resume,
-            debug_log_file=debug_log_file,
-            debug_jsonl_log_file=debug_jsonl_log_file,
-            debug_resume=_is_debug_log_resume)
+            training_log_file, jsonl_log_file, resume=_is_log_resume)
 
         n_params = count_parameters(params)
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
@@ -9973,20 +9080,7 @@ def main():
             log_jsonl(tau_init_summary)
         log_message(
             "Resume log append policy: "
-            f"training={training_log_append_on_resume} "
-            f"debug={debug_log_append_on_resume}")
-        if debug_mode:
-            log_message(
-                f"Debug diagnostics: every {debug_interval} step(s) -> {debug_log_file}")
-            log_debug_message(
-                f"DAWN {model_version} Debug Diagnostics - {timestamp}")
-            log_debug_message(f"Config: {config_path}")
-            log_debug_message(f"Training log: {training_log_file}")
-            log_debug_message(f"Debug interval: {debug_interval}")
-            log_debug_message(
-                f"Resume append: {_is_debug_log_resume} "
-                f"(config debug_log_append_on_resume={debug_log_append_on_resume})")
-            log_debug_message("")
+            f"training={training_log_append_on_resume}")
         log_message("")
         sync_logs()
 
@@ -10088,7 +9182,6 @@ def main():
         _win_correct_jax = jnp.int32(0)
         _win_valid_jax = jnp.int32(0)
         _regular_cap_window_jax = _init_update_cap_window_stats()
-        _debug_cap_window_jax = _init_update_cap_window_stats()
         win_count = 0
         win_start_time = time.time()
 
@@ -10151,8 +9244,6 @@ def main():
             _win_valid_jax = _win_valid_jax + metrics['valid_count']
             _regular_cap_window_jax = _accumulate_update_cap_window_stats(
                 _regular_cap_window_jax, metrics)
-            _debug_cap_window_jax = _accumulate_update_cap_window_stats(
-                _debug_cap_window_jax, metrics)
 
             _epoch_loss_jax = _epoch_loss_jax + metrics['ce_loss'] * _valid_f
             _epoch_correct_jax = (
@@ -10178,11 +9269,8 @@ def main():
             # ANALYSIS is driven from the val path (below), not from here -
             # the ANALYSIS stats now require a separate forward with the
             # full-stats kernels and only run on val ticks.
-            _is_early_debug = global_step in (1, 5, 10, 20, 50)
-            is_regular = (global_step % LOG_REGULAR == 0) or _is_early_debug
-            is_debug_log = (
-                debug_mode and global_step > 0
-                and (global_step % debug_interval == 0))
+            _is_early_log = global_step in (1, 5, 10, 20, 50)
+            is_regular = (global_step % LOG_REGULAR == 0) or _is_early_log
 
             if is_regular:
                 # Refresh emb-drift snapshot on every host (ref reassignment
@@ -10335,120 +9423,9 @@ def main():
                 _regular_cap_window_jax = _init_update_cap_window_stats()
                 win_count = 0
                 win_start_time = time.time()
-
-            # ---- DEBUG diagnostics: separate log, no stdout/train-log noise ----
-            if is_debug_log and is_host0:
-                _debug_vals = jax.device_get({
-                    'loss': metrics['total_loss'],
-                    'ce': metrics['ce_loss'],
-                    'aux': metrics['aux_loss'],
-                    'tau_reg': metrics.get('tau_reg', jnp.float32(0.0)),
-                    'orth': metrics['orth_loss'],
-                    'div': metrics['div_loss'],
-                    'correct': metrics['correct'],
-                    'valid': metrics['valid_count'],
-                })
-                _debug_valid = int(_debug_vals['valid'])
-                _debug_vdiv = _debug_valid if _debug_valid > 0 else 1
-                debug_avgs = {
-                    'loss': float(_debug_vals['loss']),
-                    'ce': float(_debug_vals['ce']),
-                    'aux': float(_debug_vals['aux']),
-                    'tau_reg': float(_debug_vals['tau_reg']),
-                    'orth': float(_debug_vals['orth']),
-                    'div': float(_debug_vals['div']),
-                    'acc': int(_debug_vals['correct']) / _debug_vdiv,
-                }
-                _elapsed = time.time() - win_start_time
-                _steps_per_sec = (win_count / _elapsed) if _elapsed > 0 else 0.0
-                _opt_step = global_step // grad_accum_steps
-                _current_lr = float(schedule(_opt_step))
-                _total_elapsed = time.time() - train_start_time
-                _epoch_elapsed = time.time() - epoch_start
-                _progress = (global_step / total_micro_steps * 100
-                             if total_micro_steps > 0 else 0.0)
-                _s_per_it = _epoch_elapsed / epoch_steps if epoch_steps > 0 else 0.0
-                _remaining = max(steps_per_epoch - epoch_step_counter, 0)
-                _eta = _s_per_it * _remaining
-                debug_ctx = {
-                    'lb_weight': lb_weight,
-                    'tau_reg_weight': tau_reg_weight,
-                    'orth_weight': orth_weight,
-                    'div_weight': div_weight,
-                    'dead_penalty_weight': dead_penalty_weight,
-                    'dead_exposure_target': dead_exposure_target,
-                    'cb1a_enabled': bool(cb1a_enabled),
-                    'n_qk_cfg': cfg['model'].get(
-                        'n_qk', cfg['model'].get('n_q', 0)),
-                    'n_v_cfg': cfg['model'].get('n_v', 0),
-                    'n_rst_cfg': cfg['model'].get(
-                        'n_rst', cfg['model'].get('n_know', 0)),
-                    'current_lr': _current_lr,
-                    'steps_per_sec': _steps_per_sec,
-                    'total_elapsed': _total_elapsed,
-                    'epoch_elapsed': _epoch_elapsed,
-                    'eta': _eta,
-                    's_per_it': _s_per_it,
-                    'total_micro_steps': total_micro_steps,
-                    'progress': _progress,
-                    'model_version': model_version,
-                    'regular_console_level': regular_console_level,
-                    'regular_console_host_timing': regular_console_host_timing,
-                    'regular_console_top1_warn': regular_console_top1_warn,
-                    'regular_console_drive_max_warn':
-                        regular_console_drive_max_warn,
-                    'regular_console_logging_overhead_warn':
-                        regular_console_logging_overhead_warn,
-                    'soft_gate_schedule': soft_gate_schedule,
-                    'soft_gate_t_power': soft_gate_t_power,
-                    'soft_gate_t_gompertz_center':
-                        soft_gate_t_gompertz_center,
-                    'soft_gate_t_gompertz_steepness':
-                        soft_gate_t_gompertz_steepness,
-                    'soft_gate_boundary_power_start':
-                        soft_gate_boundary_power_start,
-                    'soft_gate_boundary_power_mid':
-                        soft_gate_boundary_power_mid,
-                    'soft_gate_boundary_power_final':
-                        soft_gate_boundary_power_final,
-                    'soft_gate_boundary_power_mid_frac':
-                        soft_gate_boundary_power_mid_frac,
-                    'soft_gate_boundary_power_final_frac':
-                        soft_gate_boundary_power_final_frac,
-                    'intensity_beta': (
-                        0.0
-                        if model_version_cfg == OFFICIAL_MODEL_VERSION
-                        else float(tcfg.get('intensity_beta', 0.0))),
-                    'd_select': (
-                        0
-                        if model_version_cfg == OFFICIAL_MODEL_VERSION
-                        else int(cfg['model'].get('d_select', 0) or 0)),
-                    'd_intensity': (
-                        0
-                        if model_version_cfg == OFFICIAL_MODEL_VERSION
-                        else int(
-                            cfg['model'].get('d_route', 0)
-                            - cfg['model'].get('d_select', 0))),
-                    'd_route_unified': (
-                        int(cfg['model'].get('d_route', 0))
-                        if model_version_cfg == OFFICIAL_MODEL_VERSION
-                        else 0),
-                }
-                debug_metrics = jax.device_get(metrics)
-                debug_rec = _build_regular_record(
-                    debug_metrics, debug_avgs, debug_ctx, global_step, epoch)
-                debug_rec = _attach_update_cap_window_stats(
-                    debug_rec, jax.device_get(_debug_cap_window_jax))
-                _print_debug_block(debug_rec, debug_ctx)
-                log_debug_jsonl({'type': 'debug_train', **debug_rec})
-                sync_logs()
-            if is_debug_log:
-                _debug_cap_window_jax = _init_update_cap_window_stats()
-
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
             _do_val = (global_step % val_interval == 0 and global_step > 0)
             _do_analysis = (global_step % LOG_ANALYSIS == 0 and global_step > 0)
-            _do_debug_analysis = False
             _do_geometry = (global_step % LOG_GEOMETRY == 0 and global_step > 0)
             _do_ckpt = (global_step % ckpt_interval == 0 and global_step > 0)
             _new_best = False
@@ -10511,7 +9488,7 @@ def main():
             # Single analysis forward at the configured analysis cadence. Compiles
             # once on first call (extra HBM + time logged). Result dict
             # is released after the JSONL write so HBM snaps back.
-            if (_do_analysis or _do_debug_analysis) and analysis_step_fn is not None:
+            if _do_analysis and analysis_step_fn is not None:
                 val_loader.reset()
                 _analysis_batch = None
                 for _ab_ids, _ab_mask in val_loader:
@@ -10561,12 +9538,6 @@ def main():
                             if _do_analysis:
                                 _print_analysis_block(a_rec, _ctx_a)
                                 log_jsonl({'type': 'train_analysis', **a_rec})
-                            if _do_debug_analysis:
-                                _print_debug_analysis_block(a_rec, _ctx_a)
-                                log_debug_jsonl({
-                                    'type': 'debug_train_analysis',
-                                    **a_rec,
-                                })
                             sync_logs()
                     finally:
                         # Explicit release -jit-returned dict holds

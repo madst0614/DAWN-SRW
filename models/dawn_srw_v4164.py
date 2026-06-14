@@ -254,7 +254,7 @@ def _pool_output_scales(d_model, n_layers):
 def _effective_pool_output_scales(pool_params, d_model, n_layers):
     """PureCore uses fixed depth-scaled pool outputs.
 
-    The learned scale parameters stay in the checkpoint tree for compatibility,
+    The learned scale parameters stay in the checkpoint tree for resume stability,
     but the active forward path ignores them.
     """
     return _pool_output_scales(d_model, n_layers)
@@ -503,7 +503,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         P(),                     # tau_abs_mean scalar
         P(),                     # dead_penalty scalar
         P(),                     # dead_count scalar
-        P(),                     # int_max scalar (v4.1 diag)
+        P(),                     # int_max scalar
         P(),                     # den_cost_mean scalar
         P(),                     # selection_cost_mean scalar
         P(),                     # current_cost_mean scalar
@@ -1339,7 +1339,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         P(),                          # tau_abs_mean scalar
         P(),                          # dead_penalty scalar
         P(),                          # dead_count scalar
-        P(),                          # int_max scalar (v4.1 diag)
+        P(),                          # int_max scalar
         P(),                          # den_cost_mean scalar
         P(),                          # selection_cost_mean scalar
         P(),                          # current_cost_mean scalar
@@ -2151,14 +2151,14 @@ class NeuronPool(nn.Module):
     d_model: int
     d_route: int
     n_rst: Optional[int] = None
-    n_know: Optional[int] = None  # Legacy alias accepted from older configs.
+    n_know: Optional[int] = None  # Checkpoint/config alias for rst pool size.
 
     def setup(self):
         db = self.d_route
         dm = self.d_model
         n_rst_eff = self.n_rst if self.n_rst is not None else self.n_know
         if n_rst_eff is None:
-            raise ValueError("NeuronPool requires n_rst or legacy n_know.")
+            raise ValueError("NeuronPool requires n_rst or n_know checkpoint alias.")
 
         # Learned route embeddings use the full d_route angular space.
         self.attn_qk_emb = self.param('attn_qk_emb', unit_norm_init(), (self.n_qk, db))
@@ -2198,7 +2198,7 @@ class Router(nn.Module):
     n_qk: int
     n_v: int
     n_rst: Optional[int] = None
-    n_know: Optional[int] = None  # Legacy alias accepted from older configs.
+    n_know: Optional[int] = None  # Checkpoint/config alias for rst pool size.
     router_dropout: float = 0.1
     # Constructor receives cosine-space tau values. The train driver may use
     # safe placeholders before one-time quantile calibration.
@@ -2210,7 +2210,7 @@ class Router(nn.Module):
         db = self.d_route
         n_rst_eff = self.n_rst if self.n_rst is not None else self.n_know
         if n_rst_eff is None:
-            raise ValueError("Router requires n_rst or legacy n_know.")
+            raise ValueError("Router requires n_rst or n_know checkpoint alias.")
 
         missing_tau = [
             name for name, value in (
@@ -2262,7 +2262,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   soft_gate_boundary_power_final=4.0,
                   admission_den_power=1.0,
                   execution_prune_eps=0.0):
-    """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
+    """v4164 sharded-only path. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
     returns the SLIM tuple extended with observational ANALYSIS stats
@@ -2668,7 +2668,7 @@ def _rst_forward(x, pool_params, router_params, rng,
                   soft_gate_boundary_power_final=4.0,
                   admission_den_power=1.0,
                   execution_prune_eps=0.0):
-    """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
+    """v4164 sharded-only path. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis` see _attn_forward docstring.
     """
@@ -2907,7 +2907,7 @@ class DAWN(nn.Module):
         analysis=False is the train/eval path and returns only regular
         training metrics.  analysis=True enables extra observational stats
         such as distribution shape, selection diagnostics, entropy, tau stats,
-        raw norms, and debug norms.
+        raw norms, and output-stability norms.
         """
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
@@ -3782,10 +3782,10 @@ class DAWN(nn.Module):
             # Always-on output diagnostics: cheap scalar reductions used by train logs.
             # These are kept outside the analysis-only block so out_diag never falls
             # back to misleading zeros during normal training.
-            'debug_residual_norm': jnp.linalg.norm(x, axis=-1).mean(),
-            'debug_residual_norm_max': jnp.linalg.norm(x, axis=-1).max(),
-            'debug_token_emb_norm': jnp.linalg.norm(self.token_emb.embedding, axis=-1).mean(),
-            'debug_token_emb_norm_max': jnp.linalg.norm(self.token_emb.embedding, axis=-1).max(),
+            'residual_norm': jnp.linalg.norm(x, axis=-1).mean(),
+            'residual_norm_max': jnp.linalg.norm(x, axis=-1).max(),
+            'token_emb_norm': jnp.linalg.norm(self.token_emb.embedding, axis=-1).mean(),
+            'token_emb_norm_max': jnp.linalg.norm(self.token_emb.embedding, axis=-1).max(),
         }
         for _prefix, _diag_all in (
                 ('attn_qk', attn_qk_sparsity_diag_all),
@@ -3831,14 +3831,14 @@ class DAWN(nn.Module):
                 'attn_qk_raw_norm': attn_qk_raw_norm_all.mean(),
                 'attn_v_raw_norm': attn_v_raw_norm_all.mean(),
                 'rst_raw_out_norm': rst_raw_out_norm_all.mean(),
-                'debug_residual_norm': _residual_norm,
-                'debug_token_emb_norm_analysis': _emb_norm,
-                'debug_o_proj_norm': _o_proj_norm,
-                'debug_q_norm': attn_q_norm_all.mean(),
-                'debug_k_norm': attn_k_norm_all.mean(),
-                'debug_v_norm': attn_v_norm_dbg_all.mean(),
-                'debug_attn_logit_max_mean': attn_logit_max_all.mean(),
-                'debug_o_input_norm': attn_o_input_norm_all.mean(),
+                'residual_norm': _residual_norm,
+                'token_emb_norm_analysis': _emb_norm,
+                'o_proj_norm': _o_proj_norm,
+                'q_norm': attn_q_norm_all.mean(),
+                'k_norm': attn_k_norm_all.mean(),
+                'v_norm': attn_v_norm_dbg_all.mean(),
+                'attn_logit_max_mean': attn_logit_max_all.mean(),
+                'o_input_norm': attn_o_input_norm_all.mean(),
                 'attn_q_norm_mean': attn_q_norm_all.mean(),
                 'attn_q_norm_std': attn_q_norm_std_all.mean(),
                 'attn_q_norm_max': attn_q_norm_max_all.max(),
@@ -3912,10 +3912,10 @@ class DAWN(nn.Module):
             result['loss'] = loss
             result['correct'] = correct
             result['valid_count'] = valid_count
-            result['debug_logit_max'] = logit_abs_max
-            result['debug_logit_norm_mean'] = logit_norm_mean
-            result['debug_logit_mean'] = logit_mean
-            result['debug_logit_std'] = logit_std
+            result['logit_max'] = logit_abs_max
+            result['logit_norm_mean'] = logit_norm_mean
+            result['logit_mean'] = logit_mean
+            result['logit_std'] = logit_std
             result['per_token_ce'] = per_token_ce
             result['valid_mask'] = valid_mask
         else:
@@ -4785,63 +4785,3 @@ def _rename_key_if_needed(d, old, new):
         del d[old]
 
 
-def migrate_legacy_v4155_params(params):
-    """
-    Convert older checkpoint parameter names to DAWN-SRW/RST names.
-
-    Legacy:
-        qk_* -> attn_qk_*
-        v_* -> attn_v_*
-        know_* -> rst_*
-        proj_know -> proj_rst
-        tau_know -> tau_rst
-        scan_bias_attn -> raw_scan_offset_attn
-        scan_bias_know -> raw_scan_offset_rst
-
-    The function is safe to call on already-migrated params. It does not mutate
-    the input in-place, preserves unknown keys, and handles plain dicts and
-    Flax FrozenDict parameter trees. If old and new keys both exist, the new
-    key is preferred.
-    """
-    was_frozen = isinstance(params, FrozenDict)
-    tree = unfreeze(params) if was_frozen else jax.tree.map(
-        lambda x: x, params, is_leaf=lambda x: not isinstance(x, dict))
-
-    def _migrate_container(container):
-        if not isinstance(container, dict):
-            return
-        if 'neuron_pool' in container and isinstance(container['neuron_pool'], dict):
-            pool = container['neuron_pool']
-            for old, new in (
-                    ('qk_emb', 'attn_qk_emb'),
-                    ('qk_read', 'attn_qk_read'),
-                    ('qk_write', 'attn_qk_write'),
-                    ('qk_scale', 'attn_qk_scale'),
-                    ('v_emb', 'attn_v_emb'),
-                    ('v_read', 'attn_v_read'),
-                    ('v_write', 'attn_v_write'),
-                    ('v_scale', 'attn_v_scale'),
-                    ('know_emb', 'rst_emb'),
-                    ('know_read', 'rst_read'),
-                    ('know_write', 'rst_write'),
-                    ('know_scale', 'rst_scale'),
-            ):
-                _rename_key_if_needed(pool, old, new)
-        if 'router' in container and isinstance(container['router'], dict):
-            router = container['router']
-            for old, new in (
-                    ('proj_know', 'proj_rst'),
-                    ('tau_know', 'tau_rst'),
-                    ('scan_bias_attn', 'raw_scan_offset_attn'),
-                    ('scan_bias_know', 'raw_scan_offset_rst'),
-            ):
-                _rename_key_if_needed(router, old, new)
-
-    def _walk(node):
-        if isinstance(node, dict):
-            _migrate_container(node)
-            for value in node.values():
-                _walk(value)
-
-    _walk(tree)
-    return freeze(tree) if was_frozen else tree
