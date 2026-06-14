@@ -4501,12 +4501,6 @@ def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_c
     _write_checkpoint_bytes(path, bytes_data)
 
 
-_V4152_OBSOLETE_ROUTE_KEYS = tuple(
-    f"{pool}_{side}_{'s' + 'ig_proj'}"
-    for pool in ('qk', 'v', 'know')
-    for side in ('read', 'write')
-)
-
 
 def load_checkpoint(path, target_params, target_opt_state):
     """Load checkpoint using flax serialization. Supports local and GCS paths."""

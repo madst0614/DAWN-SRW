@@ -288,10 +288,7 @@ def safe_dropout(x, rate, deterministic, rng):
     keep_rate = 1.0 - rate
     mask = jax.random.bernoulli(rng, keep_rate, x.shape)
     dropped = jnp.where(mask, x / keep_rate, 0.0)
-    # Eval path: return x unscaled. Previous version returned x/keep_rate
-    # here (mask forced to ones but the where-branch still divided), which
-    # inflated all eval tensors by 1/keep_rate and put a structural
-    # offset into val_loss.
+    # Eval path returns x unscaled; train path uses inverted dropout.
     return jnp.where(deterministic, x, dropped)
 
 
@@ -2852,10 +2849,10 @@ class DAWN(nn.Module):
     n_qk: int = 1580
     n_v: int = 2600
     n_rst: Optional[int] = None
-    n_know: Optional[int] = None  # Legacy config alias; prefer n_rst in new configs.
+    n_know: Optional[int] = None  # Checkpoint/config alias; n_rst is canonical.
     router_dropout: float = 0.1
     n_chunks_rst: Optional[int] = None
-    n_chunks_know: int = 1    # Legacy config alias; prefer n_chunks_rst.
+    n_chunks_know: int = 1    # Config alias; n_chunks_rst is canonical.
     n_chunks_qk: int = 1     # N-axis chunking for qk pool
     n_chunks_v: int = 1      # N-axis chunking for v pool
     # Constructor receives cosine-space tau values. The train driver may use
@@ -4664,7 +4661,7 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
             info['gate_K_raw'] = gate_K_raw
             info['gate_V_raw'] = gate_V_raw
             info['gate_RST_raw'] = gate_RST_raw
-        # Legacy analysis aliases; remove after downstream analysis is migrated.
+        # Analysis aliases kept for downstream tooling compatibility.
         info['gate_Know'] = info['gate_RST']
         if _return_raw:
             info['gate_Know_raw'] = info['gate_RST_raw']
@@ -4683,7 +4680,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
     """Build forward with specific neurons suppressed (gate zeroed).
 
     suppress_masks: dict with 'qk':[n_qk] bool, 'v':[n_v], 'rst':[n_rst] bool.
-    Legacy key 'know' is still accepted.
+    Compatibility key 'know' is still accepted.
     True = suppress.
     Returns: forward_fn(input_ids) -> logits [B, S, vocab]
     """
