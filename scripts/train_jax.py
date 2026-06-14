@@ -2169,7 +2169,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 inactive_aux_v_pre_bound = jnp.float32(0.0)
                 inactive_aux_attn_pre_bound = jnp.float32(0.0)
                 inactive_aux_rst_pre_bound = jnp.float32(0.0)
-                inactive_aux_layer_count = jnp.float32(_local_layers)
+                inactive_aux_layer_count = jnp.float32(0.0)
                 inactive_aux_norm = jnp.float32(0.0)
                 pos_frac = jnp.float32(0.0)
                 pos_mean = jnp.float32(0.0)
