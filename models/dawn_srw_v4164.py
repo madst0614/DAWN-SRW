@@ -16,7 +16,6 @@ Implemented concepts:
 """
 
 
-import math
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -235,43 +234,9 @@ GATE_EPS_SUFFIX_TO_VALUE = {
     '1e_2': 1.0e-2,
     '1e_1': 1.0e-1,
 }
-GATE_EPS_VALUE_TO_SUFFIX = {
-    float(v): k for k, v in GATE_EPS_SUFFIX_TO_VALUE.items()
-}
-
-
-def _gate_eps_suffix(value):
-    value_f = float(value)
-    for known_value, suffix in GATE_EPS_VALUE_TO_SUFFIX.items():
-        if math.isclose(value_f, known_value, rel_tol=0.0, abs_tol=known_value * 1.0e-6):
-            return suffix
-    raise ValueError(
-        f"Unsupported v4164 sparsity eps={value!r}; supported values are "
-        f"{sorted(GATE_EPS_VALUE_TO_SUFFIX)}.")
-
 
 def _gate_eps_values_from_suffixes(suffixes):
     return tuple(float(GATE_EPS_SUFFIX_TO_VALUE[s]) for s in suffixes)
-
-
-def _regular_diag_level(level):
-    level = str(level or 'compact').lower()
-    if level not in ('compact', 'full'):
-        raise ValueError(
-            f"regular_diagnostics_level={level!r}; expected 'compact' or 'full'.")
-    return level
-
-
-def _regular_eps_suffixes(values, default_suffixes, allowed_suffixes):
-    if values is None:
-        return tuple(default_suffixes)
-    suffixes = tuple(_gate_eps_suffix(v) for v in values)
-    bad = [s for s in suffixes if s not in allowed_suffixes]
-    if bad:
-        raise ValueError(
-            f"Unsupported regular sparsity eps suffixes {bad}; allowed are "
-            f"{tuple(allowed_suffixes)}.")
-    return suffixes
 
 
 def _pool_output_scales(d_model, n_layers):
@@ -512,12 +477,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                      spike_probe_topk=8,
                      dead_exposure_target=0.1,
                      soft_gate_effective_active_eps=1.0e-6,
-                     soft_gate_enabled=False,
-                     regular_diagnostics_level='compact',
-                     regular_current_eps=(1.0e-1, 1.0e-2, 1.0e-3),
-                     regular_projected_eps=(1.0e-6,),
-                     regular_mass_enabled=False,
-                     regular_sparsity_enabled=False,
                      admission_den_power=1.0,
                      admission_den_grad_scale=1.0):
     """Create fused shard_map'd angular Select + SRW.
@@ -553,27 +512,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _local_diagnostics = bool(local_diagnostics)
     _spike_probe = bool(spike_probe)
     _spike_probe_topk = max(1, int(spike_probe_topk))
-    _soft_gate_enabled = True
-    _regular_level = _regular_diag_level(regular_diagnostics_level)
-    _compact_regular_diag = (not bool(analysis) and _regular_level == 'compact')
-    _sparsity_diag_enabled = bool(analysis) or bool(regular_sparsity_enabled)
-    _regular_current_suffixes = _regular_eps_suffixes(
-        regular_current_eps, ('1e_1', '1e_2', '1e_3'),
-        GATE_EPS_NAME_SUFFIXES)
-    _regular_projected_suffixes = _regular_eps_suffixes(
-        regular_projected_eps, ('1e_6',),
-        GATE_PROJECTED_EPS_NAME_SUFFIXES)
-    _current_suffixes = (
-        _regular_current_suffixes if _compact_regular_diag
-        else GATE_EPS_NAME_SUFFIXES)
-    _projected_suffixes = (
-        _regular_projected_suffixes if _compact_regular_diag
-        else GATE_PROJECTED_EPS_NAME_SUFFIXES)
+    _sparsity_diag_enabled = bool(analysis)
+    _current_suffixes = GATE_EPS_NAME_SUFFIXES
+    _projected_suffixes = GATE_PROJECTED_EPS_NAME_SUFFIXES
     _current_eps_values = _gate_eps_values_from_suffixes(_current_suffixes)
     _projected_eps_values = _gate_eps_values_from_suffixes(_projected_suffixes)
-    _compute_sparsity_mass = (
-        (not _compact_regular_diag) or bool(regular_mass_enabled))
-    _compact_margin_bands = bool(_compact_regular_diag)
+    _compute_sparsity_mass = True
+    _compact_margin_bands = False
     _angular_strong_margin = jnp.float32(0.05)
     # v4164 divisive normalization:
     #   admission_den_forward = max(sum(admission), 1) ** admission_den_power
@@ -994,7 +939,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             # score < tau can still produce meaningful boundary gate mass.
             # A unit is considered soft-dead only if its actual admission
             # mass is essentially zero across the batch/tokens.
-            if _compact_regular_diag:
+            if not analysis:
                 return (
                     jnp.float32(0.0),
                     jnp.float32(0.0),
@@ -1524,7 +1469,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 jax.lax.psum(total_selection_residency_count, 'model')
                 / jnp.float32(N_total)),
         )
-        sparsity_diag_out = finalize_sparsity_diag(sparsity_carry)
+        sparsity_diag_out = (
+            finalize_sparsity_diag(sparsity_carry)
+            if _sparsity_diag_enabled
+            else jnp.zeros((GATE_SPARSITY_DIAG_COUNT,), dtype=jnp.float32))
 
         slim_out = (out.astype(jnp.float32), active_frac, global_gate_max, rho_lb,
                     rho_std_out, es_out, active_n_mean, strong_frac,
@@ -1631,12 +1579,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             spike_probe_topk=8,
                             dead_exposure_target=0.1,
                             soft_gate_effective_active_eps=1.0e-6,
-                            soft_gate_enabled=False,
-                            regular_diagnostics_level='compact',
-                            regular_current_eps=(1.0e-1, 1.0e-2, 1.0e-3),
-                            regular_projected_eps=(1.0e-6,),
-                            regular_mass_enabled=False,
-                            regular_sparsity_enabled=False,
                             admission_den_power=1.0,
                             admission_den_grad_scale=1.0):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
@@ -1661,27 +1603,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _local_diagnostics = bool(local_diagnostics)
     _spike_probe = bool(spike_probe)
     _spike_probe_topk = max(1, int(spike_probe_topk))
-    _regular_level = _regular_diag_level(regular_diagnostics_level)
-    _compact_regular_diag = (not bool(analysis) and _regular_level == 'compact')
-    _sparsity_diag_enabled = bool(analysis) or bool(regular_sparsity_enabled)
-    _regular_current_suffixes = _regular_eps_suffixes(
-        regular_current_eps, ('1e_1', '1e_2', '1e_3'),
-        GATE_EPS_NAME_SUFFIXES)
-    _regular_projected_suffixes = _regular_eps_suffixes(
-        regular_projected_eps, ('1e_6',),
-        GATE_PROJECTED_EPS_NAME_SUFFIXES)
-    _current_suffixes = (
-        _regular_current_suffixes if _compact_regular_diag
-        else GATE_EPS_NAME_SUFFIXES)
-    _projected_suffixes = (
-        _regular_projected_suffixes if _compact_regular_diag
-        else GATE_PROJECTED_EPS_NAME_SUFFIXES)
+    _sparsity_diag_enabled = bool(analysis)
+    _current_suffixes = GATE_EPS_NAME_SUFFIXES
+    _projected_suffixes = GATE_PROJECTED_EPS_NAME_SUFFIXES
     _current_eps_values = _gate_eps_values_from_suffixes(_current_suffixes)
     _projected_eps_values = _gate_eps_values_from_suffixes(_projected_suffixes)
-    _compute_sparsity_mass = (
-        (not _compact_regular_diag) or bool(regular_mass_enabled))
-    _compact_margin_bands = bool(_compact_regular_diag)
-    _soft_gate_enabled = True
+    _compute_sparsity_mass = True
+    _compact_margin_bands = False
     _angular_strong_margin = jnp.float32(0.05)
     # v4164 divisive normalization:
     #   admission_den_forward = max(sum(admission), 1) ** admission_den_power
@@ -2113,7 +2041,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             # score < tau can still produce meaningful boundary gate mass.
             # A unit is considered soft-dead only if its actual admission
             # mass is essentially zero across the batch/tokens/routes.
-            if _compact_regular_diag:
+            if not analysis:
                 return (
                     jnp.float32(0.0),
                     jnp.float32(0.0),
@@ -2698,7 +2626,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             global_active_m[:, :, 0, :].mean(),
             global_active_m[:, :, 1, :].mean(),
         )
-        sparsity_diag_out = finalize_sparsity_diag(sparsity_carry)
+        sparsity_diag_out = (
+            finalize_sparsity_diag(sparsity_carry)
+            if _sparsity_diag_enabled
+            else jnp.zeros((2, GATE_SPARSITY_DIAG_COUNT), dtype=jnp.float32))
         local_diag_out = ()
         if _local_diagnostics:
             tau_abs_max = jnp.max(

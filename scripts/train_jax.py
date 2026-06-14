@@ -831,38 +831,6 @@ def _v415_sharded_kwargs(cfg):
             cb1a_eps=float(t.get('cb1a_eps', 1.0e-8)),
         )
     elif version in SOFT_DIRECT_TAU_MODEL_VERSIONS:
-        # v4162/v4163 clean path: DirectTau only. no CB1A/edge auxiliary kwargs.
-        regular_level = str(t.get('regular_diagnostics_level', 'compact')).lower()
-        if regular_level not in ('compact', 'full'):
-            raise ValueError(
-                "training.regular_diagnostics_level must be 'compact' or 'full'.")
-        regular_current_eps_default = (
-            [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
-            if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-            else [1.0e-1, 1.0e-2, 1.0e-3])
-        regular_projected_eps_default = [1.0e-6]
-        regular_sparsity_default = (
-            True
-            if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-            else version not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
-        kw = dict(
-            dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
-            soft_gate_enabled=bool(t.get('soft_gate_enabled', True)),
-            soft_gate_effective_active_eps=float(
-                t.get('soft_gate_effective_active_eps', 1.0e-6)),
-            regular_diagnostics_level=regular_level,
-            regular_current_eps=tuple(
-                float(x) for x in t.get(
-                    'regular_current_eps', regular_current_eps_default)),
-            regular_projected_eps=tuple(
-                float(x) for x in t.get(
-                    'regular_projected_eps',
-                    regular_projected_eps_default)),
-            regular_mass_enabled=bool(t.get('regular_mass_enabled', False)),
-            regular_sparsity_enabled=bool(t.get(
-                'regular_sparsity_enabled',
-                regular_sparsity_default)),
-        )
         if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
             admission_den_power_cfg = t.get(
                 'admission_den_power',
@@ -870,9 +838,36 @@ def _v415_sharded_kwargs(cfg):
             admission_den_grad_scale_cfg = t.get(
                 'admission_den_grad_scale',
                 t.get('v4164_den_grad_scale', 1.0))
-            kw.update(
+            kw = dict(
+                dead_exposure_target=0.0,
+                soft_gate_effective_active_eps=float(
+                    t.get('soft_gate_effective_active_eps', 1.0e-6)),
                 admission_den_power=float(admission_den_power_cfg),
                 admission_den_grad_scale=float(admission_den_grad_scale_cfg),
+            )
+        else:
+            # v4162/v4163 compatibility path: DirectTau only. no CB1A/edge
+            # auxiliary kwargs.
+            regular_level = str(t.get('regular_diagnostics_level', 'compact')).lower()
+            if regular_level not in ('compact', 'full'):
+                raise ValueError(
+                    "training.regular_diagnostics_level must be 'compact' or 'full'.")
+            kw = dict(
+                dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
+                soft_gate_enabled=bool(t.get('soft_gate_enabled', True)),
+                soft_gate_effective_active_eps=float(
+                    t.get('soft_gate_effective_active_eps', 1.0e-6)),
+                regular_diagnostics_level=regular_level,
+                regular_current_eps=tuple(
+                    float(x) for x in t.get(
+                        'regular_current_eps', [1.0e-1, 1.0e-2, 1.0e-3])),
+                regular_projected_eps=tuple(
+                    float(x) for x in t.get(
+                        'regular_projected_eps', [1.0e-6])),
+                regular_mass_enabled=bool(t.get('regular_mass_enabled', False)),
+                regular_sparsity_enabled=bool(t.get(
+                    'regular_sparsity_enabled',
+                    version not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)),
             )
     else:
         kw = dict(
@@ -1565,15 +1560,6 @@ def _model_accepts_analysis(model):
         return False
 
 
-def _model_accepts_local_diagnostics(model):
-    """Return True if model.__call__ accepts local diagnostic controls."""
-    import inspect as _inspect
-    try:
-        return 'local_diagnostics' in _inspect.signature(model.__call__).parameters
-    except (TypeError, ValueError):
-        return False
-
-
 def _model_accepts_soft_gate_schedule(model):
     """Return True if model.__call__ accepts soft-gate schedule kwargs."""
     import inspect as _inspect
@@ -1618,25 +1604,6 @@ def _model_accepts_admission_den_power(model):
     import inspect as _inspect
     try:
         return 'admission_den_power' in _inspect.signature(model.__call__).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-def _model_accepts_spike_probe(model):
-    """Return True if model.__call__ accepts the event-triggered probe path."""
-    import inspect as _inspect
-    try:
-        return 'spike_probe' in _inspect.signature(model.__call__).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-def _model_accepts_spike_focus_probe(model):
-    """Return True if model.__call__ accepts second-pass focused spike tokens."""
-    import inspect as _inspect
-    try:
-        params = _inspect.signature(model.__call__).parameters
-        return 'spike_focus_bpos' in params
     except (TypeError, ValueError):
         return False
 
@@ -2244,7 +2211,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None,
                       debug_diagnostics=False,
-                      debug_local_spikes=False,
                       compact_train_metrics=False,
                       keep_train_layer_metrics=False):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
@@ -2379,13 +2345,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _tau_update_abs_cap = jnp.float32(tau_update_abs_cap)
     _scan_update_abs_cap = jnp.float32(scan_update_abs_cap)
     _pass_analysis_kw = _model_accepts_analysis(model)
-    _pass_local_kw = _model_accepts_local_diagnostics(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
-    _local_layers = int(getattr(model, 'n_layers', 1))
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_soft_direct_tau = str(_model_version) in SOFT_DIRECT_TAU_MODEL_VERSIONS
@@ -2460,9 +2424,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _rpe_start_frac = jnp.float32(rpe_start_frac)
     _rpe_full_frac = jnp.float32(rpe_full_frac)
     _rpe_schedule = str(rpe_schedule).lower()
-    _compact_train_metrics = (
-        bool(compact_train_metrics)
-        and not bool(debug_local_spikes))
+    _compact_train_metrics = bool(compact_train_metrics)
     _keep_train_layer_metrics = bool(keep_train_layer_metrics)
     _heavy_keys = {
         'per_token_ce',
@@ -2492,8 +2454,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 extra_kw['sharded_fns'] = sharded_fns
             if _pass_analysis_kw:
                 extra_kw['analysis'] = False
-            if debug_local_spikes and _pass_local_kw:
-                extra_kw['local_diagnostics'] = True
             if _soft_gate_runtime_enabled:
                 soft_gate_T_qk = _scheduled_from_config(
                     step, _total_training_steps, _soft_gate_pool_cfg['qk'])
@@ -4454,32 +4414,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             for _name in DIRECT_TAU_SPARSITY_METRIC_NAMES:
                 metrics[f'{_pool}_{_name}'] = result.get(
                     f'{_pool}_{_name}', jnp.float32(0.0))
-        if debug_local_spikes:
-            metrics.update({
-                'local_spike_values': result.get(
-                    'local_spike_values',
-                    jnp.zeros((_local_layers, len(LOCAL_SPIKE_POOL_NAMES),
-                               len(LOCAL_SPIKE_METRIC_NAMES)),
-                              dtype=jnp.float32)),
-                'local_spike_locs': result.get(
-                    'local_spike_locs',
-                    jnp.full((_local_layers, len(LOCAL_SPIKE_POOL_NAMES),
-                              len(LOCAL_SPIKE_METRIC_NAMES), 3),
-                             -1, dtype=jnp.int32)),
-                'local_top1_values': result.get(
-                    'local_top1_values',
-                    jnp.zeros((_local_layers, len(LOCAL_SPIKE_POOL_NAMES),
-                               len(LOCAL_TOP1_FIELD_NAMES)),
-                              dtype=jnp.float32)),
-                'local_top1_locs': result.get(
-                    'local_top1_locs',
-                    jnp.full((_local_layers, len(LOCAL_SPIKE_POOL_NAMES), 3),
-                             -1, dtype=jnp.int32)),
-                'attn_local_layer_values': result.get(
-                    'attn_local_layer_values',
-                    jnp.zeros((_local_layers, len(ATTN_LOCAL_FIELD_NAMES)),
-                              dtype=jnp.float32)),
-            })
         if not _rpe_enabled:
             for _key in (
                     'exploration_warmup_factor',
@@ -4853,320 +4787,6 @@ def create_analysis_step(model, sharded_fns=None,
         return result
 
     return analysis_step
-
-
-def create_debug_forward_step(model, sharded_fns=None, drop_compare=False):
-    """Optional diagnostics-only forward for tiny debug/val batches.
-
-    No gradients are taken and the result is never fed to the optimizer.
-    The main train loop does not call this on the current train batch.
-    """
-    _pass_analysis_kw = _model_accepts_analysis(model)
-    _drop_compare = bool(drop_compare)
-
-    def _summary(result):
-        local_vals = result.get(
-            'local_spike_values',
-            jnp.zeros((1, 1, len(LOCAL_SPIKE_METRIC_NAMES)),
-                      dtype=jnp.float32))
-        attn_vals = result.get(
-            'attn_local_layer_values',
-            jnp.zeros((1, len(ATTN_LOCAL_FIELD_NAMES)), dtype=jnp.float32))
-        top1_idx = LOCAL_SPIKE_METRIC_NAMES.index('top1_share')
-        int_idx = LOCAL_SPIKE_METRIC_NAMES.index('intensity')
-        tau_idx = LOCAL_SPIKE_METRIC_NAMES.index('tau_abs')
-        out_idx = LOCAL_SPIKE_METRIC_NAMES.index('out_norm')
-        den_idx = LOCAL_SPIKE_METRIC_NAMES.index('gate_den_sum')
-        logit_idx = ATTN_LOCAL_FIELD_NAMES.index('attn_logit_max')
-        active = (
-            result.get('attn_qk_active', jnp.float32(0.0))
-            + result.get('attn_v_active', jnp.float32(0.0))
-            + result.get('rst_active', jnp.float32(0.0))) / jnp.float32(3.0)
-        return {
-            'loss': result.get('loss', jnp.float32(0.0)),
-            'ce': result.get('loss', jnp.float32(0.0)),
-            'top1_max': jnp.max(local_vals[:, :, top1_idx]),
-            'int_max': jnp.max(local_vals[:, :, int_idx]),
-            'tau_abs_max': jnp.max(local_vals[:, :, tau_idx]),
-            'local_out_norm_max': jnp.max(local_vals[:, :, out_idx]),
-            'active_frac': active,
-            'gate_den_sum_max': jnp.max(local_vals[:, :, den_idx]),
-            'attention_logit_max': jnp.max(attn_vals[:, logit_idx]),
-        }
-
-    def _run_forward(params, input_ids, attention_mask, dropout_key,
-                     deterministic):
-        labels = jnp.where(attention_mask == 1, input_ids, -100)
-        extra_kw = {}
-        if sharded_fns is not None:
-            extra_kw['sharded_fns'] = sharded_fns
-        if _pass_analysis_kw:
-            extra_kw['analysis'] = False
-        result = model.apply(
-            {'params': params},
-            input_ids,
-            labels=labels,
-            attention_mask=attention_mask,
-            deterministic=deterministic,
-            rngs={'dropout': dropout_key},
-            **extra_kw,
-        )
-        result = dict(result)
-        result['debug_forward_summary'] = _summary(result)
-        return result
-
-    @jax.jit
-    def debug_forward_step(params, input_ids, attention_mask, dropout_key):
-        normal = _run_forward(
-            params, input_ids, attention_mask, dropout_key,
-            deterministic=False)
-        if _drop_compare:
-            det_key = jax.random.fold_in(dropout_key, jnp.int32(12345))
-            deterministic = _run_forward(
-                params, input_ids, attention_mask, det_key,
-                deterministic=True)
-        else:
-            deterministic = {
-                'debug_forward_summary': {
-                    'loss': jnp.float32(0.0),
-                    'ce': jnp.float32(0.0),
-                    'top1_max': jnp.float32(0.0),
-                    'int_max': jnp.float32(0.0),
-                    'tau_abs_max': jnp.float32(0.0),
-                    'local_out_norm_max': jnp.float32(0.0),
-                    'active_frac': jnp.float32(0.0),
-                    'gate_den_sum_max': jnp.float32(0.0),
-                    'attention_logit_max': jnp.float32(0.0),
-                }
-            }
-        return {
-            'normal': normal,
-            'deterministic': deterministic,
-            'drop_compare_enabled': jnp.asarray(_drop_compare),
-        }
-
-    return debug_forward_step
-
-
-def create_spike_probe_step(model, sharded_fns=None, topk=8,
-                            total_training_steps=1,
-                            soft_gate_enabled=False,
-                            soft_gate_t_start=1.5,
-                            soft_gate_t_final=0.07,
-                            soft_gate_t_hold_frac=0.10,
-                            soft_gate_t_anneal_end_frac=0.80,
-                            soft_gate_schedule='cosine',
-                            soft_gate_t_power=4.0,
-                            soft_gate_t_gompertz_center=0.25,
-                            soft_gate_t_gompertz_steepness=8.0,
-                            soft_gate_t_pool_specific=False,
-                            soft_gate_pool_schedules=None,
-                            soft_gate_boundary_power_enabled=False,
-                            soft_gate_boundary_power_start=3.0,
-                            soft_gate_boundary_power_mid=3.15,
-                            soft_gate_boundary_power_final=4.0,
-                            soft_gate_boundary_power_start_frac=0.0,
-                            soft_gate_boundary_power_mid_frac=0.800,
-                            soft_gate_boundary_power_final_frac=0.950,
-                            admission_den_power=1.0):
-    """Event-only forward probe. No gradients, no optimizer updates.
-
-    Two-pass design for v4.1.6.0+ focused spike debugging:
-      pass 1: regular spike_probe finds the actual top-CE tokens.
-      pass 2: re-runs the same batch/dropout key focused on those b,pos tokens,
-              so the model can emit layer/stage traces for the exact tokens
-              that triggered the event. This avoids storing all hidden states
-              for all tokens during training.
-    """
-    _pass_analysis_kw = _model_accepts_analysis(model)
-    _pass_spike_kw = _model_accepts_spike_probe(model)
-    _pass_focus_kw = _model_accepts_spike_focus_probe(model)
-    _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
-    _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
-    _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
-    _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
-    _pass_den_power_kw = _model_accepts_admission_den_power(model)
-    _soft_gate_runtime_enabled = bool(
-        soft_gate_enabled
-        and getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        in SOFT_DIRECT_TAU_MODEL_VERSIONS)
-    _is_boundary_power_model = (
-        getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
-    _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
-    _soft_gate_t_start = jnp.float32(soft_gate_t_start)
-    _soft_gate_t_final = jnp.float32(soft_gate_t_final)
-    _soft_gate_t_hold_frac = jnp.float32(soft_gate_t_hold_frac)
-    _soft_gate_t_anneal_end_frac = jnp.float32(soft_gate_t_anneal_end_frac)
-    _soft_gate_schedule = str(soft_gate_schedule).lower()
-    _soft_gate_t_power = jnp.float32(soft_gate_t_power)
-    _soft_gate_t_gompertz_center = jnp.float32(soft_gate_t_gompertz_center)
-    _soft_gate_t_gompertz_steepness = jnp.float32(
-        soft_gate_t_gompertz_steepness)
-    _soft_gate_pool_defaults = {
-        'start': soft_gate_t_start,
-        'final': soft_gate_t_final,
-        'hold_frac': soft_gate_t_hold_frac,
-        'anneal_end_frac': soft_gate_t_anneal_end_frac,
-        'schedule': soft_gate_schedule,
-        'power': soft_gate_t_power,
-        'gompertz_center': soft_gate_t_gompertz_center,
-        'gompertz_steepness': soft_gate_t_gompertz_steepness,
-    }
-    _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
-        (soft_gate_pool_schedules
-         if (soft_gate_t_pool_specific
-             or _soft_gate_schedule == 'developmental_band')
-         else None),
-        _soft_gate_pool_defaults)
-    _soft_gate_boundary_power_enabled = bool(
-        soft_gate_boundary_power_enabled)
-    _soft_gate_boundary_power_start = jnp.float32(
-        soft_gate_boundary_power_start)
-    _soft_gate_boundary_power_mid = jnp.float32(
-        soft_gate_boundary_power_mid)
-    _soft_gate_boundary_power_final = jnp.float32(
-        soft_gate_boundary_power_final)
-    _soft_gate_boundary_power_start_frac = jnp.float32(
-        soft_gate_boundary_power_start_frac)
-    _soft_gate_boundary_power_mid_frac = jnp.float32(
-        soft_gate_boundary_power_mid_frac)
-    _soft_gate_boundary_power_final_frac = jnp.float32(
-        soft_gate_boundary_power_final_frac)
-    _admission_den_power = jnp.float32(admission_den_power)
-    _topk = int(topk)
-
-    @jax.jit
-    def spike_probe_step(params, input_ids, attention_mask, dropout_key, step):
-        labels = jnp.where(attention_mask == 1, input_ids, -100)
-        extra_kw = {}
-        if sharded_fns is not None:
-            extra_kw['sharded_fns'] = sharded_fns
-        if _pass_analysis_kw:
-            extra_kw['analysis'] = False
-        if _pass_spike_kw:
-            extra_kw['spike_probe'] = True
-            extra_kw['spike_probe_topk'] = _topk
-        if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
-            soft_gate_T_qk = _scheduled_from_config(
-                step, _total_training_steps, _soft_gate_pool_cfg['qk'])
-            extra_kw['soft_gate_temperature'] = soft_gate_T_qk
-            extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
-            extra_kw['soft_gate_T_v'] = _scheduled_from_config(
-                step, _total_training_steps, _soft_gate_pool_cfg['v'])
-            extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
-                step, _total_training_steps, _soft_gate_pool_cfg['rst'])
-        if _pass_boundary_power_kw:
-            boundary_power_p = scheduled_boundary_power_by_frac(
-                step, _total_training_steps,
-                _soft_gate_boundary_power_enabled and _is_boundary_power_model,
-                _soft_gate_boundary_power_start,
-                _soft_gate_boundary_power_mid,
-                _soft_gate_boundary_power_final,
-                _soft_gate_boundary_power_mid_frac,
-                _soft_gate_boundary_power_final_frac,
-                _soft_gate_boundary_power_start_frac)
-            extra_kw['soft_gate_boundary_power'] = boundary_power_p
-            extra_kw['soft_gate_boundary_power_final'] = (
-                _soft_gate_boundary_power_final)
-        if _pass_soft_gate_t_final_kw:
-            extra_kw['soft_gate_t_final'] = _soft_gate_t_final
-        if _pass_den_power_kw:
-            extra_kw['admission_den_power'] = _admission_den_power
-        if _pass_execution_prune_kw:
-            extra_kw['execution_prune_eps'] = jnp.float32(0.0)
-        result = model.apply(
-            {'params': params},
-            input_ids,
-            labels=labels,
-            attention_mask=attention_mask,
-            deterministic=False,
-            rngs={'dropout': dropout_key},
-            **extra_kw,
-        )
-        token_rows = result.get(
-            'spike_top_token_ce',
-            jnp.full((_topk, len(SPIKE_TOKEN_FIELD_NAMES)),
-                     -jnp.inf, dtype=jnp.float32))
-        focus_result = {}
-        if _pass_focus_kw:
-            focus_bpos = token_rows[:, 1:3].astype(jnp.int32)
-            focus_bpos = jnp.where(jnp.isfinite(token_rows[:, 6:7]),
-                                   focus_bpos, 0)
-            focus_input = jnp.where(
-                jnp.isfinite(token_rows[:, 3]),
-                token_rows[:, 3], 0).astype(jnp.int32)
-            focus_target = jnp.where(
-                jnp.isfinite(token_rows[:, 4]),
-                token_rows[:, 4], 0).astype(jnp.int32)
-            focus_pred = jnp.where(
-                jnp.isfinite(token_rows[:, 5]),
-                token_rows[:, 5], 0).astype(jnp.int32)
-            focus_kw = dict(extra_kw)
-            focus_kw.update({
-                'spike_focus_bpos': focus_bpos,
-                'spike_focus_input_ids': focus_input,
-                'spike_focus_target_ids': focus_target,
-                'spike_focus_pred_ids': focus_pred,
-            })
-            focus_result = model.apply(
-                {'params': params},
-                input_ids,
-                labels=labels,
-                attention_mask=attention_mask,
-                deterministic=False,
-                rngs={'dropout': dropout_key},
-                **focus_kw,
-            )
-        return {
-            'spike_top_token_ce': token_rows,
-            'spike_top_token_alignment': result.get(
-                'spike_top_token_alignment',
-                jnp.full((_topk, len(SPIKE_TOKEN_ALIGN_FIELD_NAMES)),
-                         -jnp.inf, dtype=jnp.float32)),
-            'spike_srw_top': result.get(
-                'spike_srw_top',
-                jnp.full((1, len(LOCAL_SPIKE_POOL_NAMES), _topk,
-                          len(SPIKE_SRW_FIELD_NAMES)),
-                         -jnp.inf, dtype=jnp.float32)),
-            'spike_attention_top': result.get(
-                'spike_attention_top',
-                jnp.full((1, _topk, len(SPIKE_ATTN_FIELD_NAMES)),
-                         -jnp.inf, dtype=jnp.float32)),
-            'spike_layer_attn_out_norm_max': result.get(
-                'spike_layer_attn_out_norm_max',
-                jnp.zeros((1,), dtype=jnp.float32)),
-            'spike_layer_rst_out_norm_max': result.get(
-                'spike_layer_rst_out_norm_max',
-                jnp.zeros((1,), dtype=jnp.float32)),
-            'spike_layer_resid_norm_max_after_attn': result.get(
-                'spike_layer_resid_norm_max_after_attn',
-                jnp.zeros((1,), dtype=jnp.float32)),
-            'spike_layer_resid_norm_max_after_rst': result.get(
-                'spike_layer_resid_norm_max_after_rst',
-                jnp.zeros((1,), dtype=jnp.float32)),
-            'spike_layer_lm_logit_abs_proxy_if_available': result.get(
-                'spike_layer_lm_logit_abs_proxy_if_available',
-                jnp.zeros((1,), dtype=jnp.float32)),
-            'spike_focus_path_trace': focus_result.get(
-                'spike_focus_path_trace',
-                jnp.full((1, _topk, 1, len(SPIKE_FOCUS_PATH_FIELD_NAMES)),
-                         -jnp.inf, dtype=jnp.float32)),
-            'spike_focus_route_trace': focus_result.get(
-                'spike_focus_route_trace',
-                jnp.full((1, _topk, len(SPIKE_FOCUS_ROUTE_FIELD_NAMES)),
-                         -jnp.inf, dtype=jnp.float32)),
-            'spike_focus_srw_top': focus_result.get(
-                'spike_focus_srw_top',
-                jnp.full((1, _topk, _topk, len(SPIKE_FOCUS_SRW_FIELD_NAMES)),
-                         -jnp.inf, dtype=jnp.float32)),
-            'spike_focus_attention_top': focus_result.get(
-                'spike_focus_attention_top',
-                jnp.full((1, _topk, _topk, len(SPIKE_FOCUS_ATTN_FIELD_NAMES)),
-                         -jnp.inf, dtype=jnp.float32)),
-        }
-
-    return spike_probe_step if _pass_spike_kw else None
 
 
 def create_geometry_step(max_sample=512):
@@ -5799,22 +5419,17 @@ _train_logger = None
 _jsonl_logger = None
 _debug_logger = None
 _debug_jsonl_logger = None
-_spike_logger = None
-_spike_jsonl_logger = None
 
 
 def _setup_loggers(training_log_file, jsonl_log_file, resume=False,
                    debug_log_file=None, debug_jsonl_log_file=None,
-                   debug_resume=False,
-                   spike_log_file=None, spike_jsonl_log_file=None,
-                   spike_resume=False):
+                   debug_resume=False):
     """Create GCSLogger instances for training/debug text + JSONL logs.
 
     resume=True downloads existing GCS content to the local scratch file
     first so new lines append rather than overwrite.
     """
     global _train_logger, _jsonl_logger, _debug_logger, _debug_jsonl_logger
-    global _spike_logger, _spike_jsonl_logger
     import tempfile
     tmpdir = Path(tempfile.gettempdir()) / "dawn_logs"
     tmpdir.mkdir(parents=True, exist_ok=True)
@@ -5853,29 +5468,6 @@ def _setup_loggers(training_log_file, jsonl_log_file, resume=False,
     else:
         _debug_jsonl_logger = None
 
-    if spike_log_file:
-        if _is_gcs(spike_log_file):
-            local_spike = str(tmpdir / Path(spike_log_file).name)
-            _spike_logger = GCSLogger(
-                spike_log_file, local_spike, resume=spike_resume)
-        else:
-            _spike_logger = GCSLogger(
-                None, spike_log_file, resume=spike_resume)
-    else:
-        _spike_logger = None
-
-    if spike_jsonl_log_file:
-        if _is_gcs(spike_jsonl_log_file):
-            local_spike_jsonl = str(tmpdir / Path(spike_jsonl_log_file).name)
-            _spike_jsonl_logger = GCSLogger(
-                spike_jsonl_log_file, local_spike_jsonl,
-                resume=spike_resume)
-        else:
-            _spike_jsonl_logger = GCSLogger(
-                None, spike_jsonl_log_file, resume=spike_resume)
-    else:
-        _spike_jsonl_logger = None
-
 
 def sync_logs():
     """Flush local logs to GCS. Call every FAST log for live visibility."""
@@ -5887,10 +5479,6 @@ def sync_logs():
         _debug_logger.sync()
     if _debug_jsonl_logger:
         _debug_jsonl_logger.sync()
-    if _spike_logger:
-        _spike_logger.sync()
-    if _spike_jsonl_logger:
-        _spike_jsonl_logger.sync()
 
 
 def log_message(msg, log_file=None):
@@ -5949,31 +5537,6 @@ def log_debug_jsonl(record):
         _debug_jsonl_logger.write(line + '\n')
     except Exception as e:
         print(f"  [warn] log_debug_jsonl write failed: {e}", flush=True)
-
-
-def log_spike_message(msg):
-    """Write to the spike event log only. Host 0 only."""
-    if jax.process_index() != 0:
-        return
-    if not _spike_logger:
-        return
-    try:
-        _spike_logger.write(msg + '\n')
-    except Exception as e:
-        print(f"  [warn] log_spike_message write failed: {e}", flush=True)
-
-
-def log_spike_jsonl(record):
-    """Append one structured spike event. Host 0 only."""
-    if jax.process_index() != 0:
-        return
-    if not _spike_jsonl_logger:
-        return
-    try:
-        line = json.dumps(record, default=str)
-        _spike_jsonl_logger.write(line + '\n')
-    except Exception as e:
-        print(f"  [warn] log_spike_jsonl write failed: {e}", flush=True)
 
 
 def _dead_pool_totals(ctx):
@@ -7200,11 +6763,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         pl_a, pl_k = [], []
     rec['per_layer_attn_out_norm'] = pl_a
     rec['per_layer_rst_out_norm'] = pl_k
-    for _diag_key in ('local_spike_values', 'local_spike_locs',
-                      'local_top1_values', 'local_top1_locs',
-                      'attn_local_layer_values'):
-        if _diag_key in m:
-            rec[_diag_key] = _jsonable_diag_value(jax.device_get(m[_diag_key]))
     return rec
 
 
@@ -7312,12 +6870,10 @@ def _print_regular_block(rec, ctx):
     )
     if is_v4160:
         if is_v4162_soft:
-            if bool(ctx.get('regular_sparsity_enabled', True)):
-                if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
-                    _print_v4164_sparsity_block(rec)
-                else:
-                    _print_v4162_sparsity_block(
-                        rec, ctx.get('regular_diagnostics_level', 'compact'))
+            if (ctx.get('model_version') not in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                    and bool(ctx.get('regular_sparsity_enabled', True))):
+                _print_v4162_sparsity_block(
+                    rec, ctx.get('regular_diagnostics_level', 'compact'))
             log_message(
                 f"  strong: q={rec['attn_q_strong']*100:.1f}%"
                 f" k={rec['attn_k_strong']*100:.1f}%"
@@ -9743,9 +9299,6 @@ def _print_debug_block(rec, ctx):
         f"layer_attn_max={_layer_max('per_layer_attn_out_norm'):.3f} "
         f"layer_rst_max={_layer_max('per_layer_rst_out_norm'):.3f}"
     )
-    _print_local_spike_inline_block(rec)
-    _print_local_spike_block(rec)
-    _print_attention_local_block(rec)
     if is_v4160:
         log_debug_message(
             f"raw_tau_grad[qk={_g('grad_router_raw_tau_qk'):.6f} "
@@ -9853,7 +9406,6 @@ def _print_debug_block(rec, ctx):
     if _cap_window_line:
         log_debug_message(_cap_window_line)
     _print_grad_layer_block(rec, is_v4160=is_v4160)
-    _print_drop_compare_block(rec)
     reasons = _collapse_reasons(rec, ctx)
     if reasons:
         log_debug_message(
@@ -10494,10 +10046,10 @@ def main():
     set_seed(seed)
 
     # Training params (from YAML first, may be overridden by checkpoint config below).
-    # Keep the CLI surface small: --debug controls cadence, while the diagnostic
-    # feature switches themselves live in training: config.
+    # Keep the CLI surface small: --debug controls cadence.
     tcfg = cfg['training']
     model_version_cfg = cfg['model'].get('model_version', 'dawn_srw')
+    is_v4164_cfg = model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
     tau_init_cfg = (
         _v4162_tau_init_config(cfg)
         if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
@@ -10510,10 +10062,6 @@ def main():
         or cfg.get('resume_from'))
     debug_interval = max(0, int(cli_args.debug or 0))
     debug_mode = debug_interval > 0
-    debug_local_spikes = bool(
-        debug_mode and tcfg.get('debug_local_spikes', False))
-    debug_drop_compare = bool(
-        tcfg.get('debug_drop_compare', False) or cli_args.debug_drop_compare)
     run_speed_check = bool(
         cli_args.speed_check
         or tcfg.get('speed_check', tcfg.get('run_speed_check', False)))
@@ -10522,54 +10070,13 @@ def main():
         or run_speed_check
         or tcfg.get('oom_check', tcfg.get('run_oom_check', False)))
     collapse_warn_ctx = _collapse_warn_context(tcfg)
-    crash_snapshot_enabled = bool(tcfg.get(
-        'crash_snapshot_enabled', tcfg.get('crash_snapshot', False)))
-    stop_on_collapse = bool(tcfg.get('stop_on_collapse', False))
-    if stop_on_collapse:
-        crash_snapshot_enabled = True
-    crash_save_post_update = bool(tcfg.get('crash_snapshot_save_post', False))
-    # Host-local crash metric history. This stores already-materialized
-    # diagnostics and is written only when a severe trigger fires.
-    crash_history_steps = int(tcfg.get('crash_history_steps', 6))
-    crash_snapshot_save_host_batches = bool(
-        tcfg.get('crash_snapshot_save_host_batches', True))
-    collapse_grad_threshold = float(tcfg.get('collapse_grad_threshold', 100.0))
-    collapse_loss_minus_ce_threshold = float(
-        tcfg.get('collapse_loss_minus_ce_threshold', 10.0))
-    collapse_ce_extreme_threshold = float(
-        tcfg.get('collapse_ce_extreme_threshold', 10.0))
-    collapse_ce_grad_ce_threshold = float(
-        tcfg.get('collapse_ce_grad_ce_threshold', 6.0))
-    collapse_ce_grad_grad_threshold = float(
-        tcfg.get('collapse_ce_grad_grad_threshold', 5.0))
-    spike_event_logger = bool(tcfg.get('spike_event_logger', True))
-    spike_thresholds = {
-        'spike_grad_threshold': float(tcfg.get('spike_grad_threshold', 5.0)),
-        'spike_ce_threshold': float(tcfg.get('spike_ce_threshold', 5.0)),
-        'spike_ce_grad_ce_threshold': float(
-            tcfg.get('spike_ce_grad_ce_threshold', 4.0)),
-        'spike_ce_grad_grad_threshold': float(
-            tcfg.get('spike_ce_grad_grad_threshold', 2.0)),
-        'spike_logit_abs_threshold': float(
-            tcfg.get('spike_logit_abs_threshold', 40.0)),
-        'spike_rst_out_threshold': float(
-            tcfg.get('spike_rst_out_threshold', 8.0)),
-    }
-    spike_probe_on_event = bool(tcfg.get('spike_probe_on_event', True))
-    spike_probe_topk = int(tcfg.get('spike_probe_topk', 8))
-    # Ignore early random-model CE spikes. The probe stays enabled, but
-    # events before this optimizer step are not recorded or probed.
-    spike_probe_min_step = int(tcfg.get('spike_probe_min_step', 1000))
-    spike_history_steps = int(tcfg.get('spike_history_steps', 20))
     # Resume log append policy. Defaults preserve the previous behavior.
-    # Set debug/spike to false in config to start fresh diagnostic files
-    # on resume without touching the main training log.
+    # Set debug to false in config to start fresh diagnostic files on resume
+    # without touching the main training log.
     training_log_append_on_resume = bool(
         tcfg.get('training_log_append_on_resume', True))
     debug_log_append_on_resume = bool(
         tcfg.get('debug_log_append_on_resume', True))
-    spike_log_append_on_resume = bool(
-        tcfg.get('spike_log_append_on_resume', True))
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
@@ -10577,20 +10084,22 @@ def main():
     # v4.1 free-norm: pool params (qk/v/know 횞 emb/read/write, 9 tensors)
     # get a lower WD than dense kernels. Bias / LayerNorm / *_scale
     # excluded from both groups.
-    pool_weight_decay = tcfg.get('pool_weight_decay', 0.02)
+    pool_weight_decay = tcfg.get(
+        'pool_weight_decay', 0.0 if is_v4164_cfg else 0.02)
     warmup_ratio = tcfg.get('warmup_ratio', 0.06)
     orth_weight = tcfg.get('orthogonality_weight', 0.01)
-    div_weight = tcfg.get('diversity_weight', 0.1)
-    lb_weight = tcfg.get('load_balance_weight', 2e-5)
+    div_weight = tcfg.get('diversity_weight', 0.0 if is_v4164_cfg else 0.1)
+    lb_weight = tcfg.get('load_balance_weight', 0.0 if is_v4164_cfg else 2e-5)
     tau_reg_weight = tcfg.get('tau_reg_weight', 0.0)
-    dead_penalty_weight = tcfg.get('dead_penalty_weight', 0.0)  # v4.0.6
+    dead_penalty_weight = tcfg.get('dead_penalty_weight', 0.0)
     dead_penalty_qk_weight = tcfg.get(
         'dead_penalty_qk_weight', dead_penalty_weight)
     dead_penalty_v_weight = tcfg.get(
         'dead_penalty_v_weight', dead_penalty_weight)
     dead_penalty_rst_weight = tcfg.get(
         'dead_penalty_rst_weight', dead_penalty_weight)
-    dead_exposure_target = float(tcfg.get('dead_exposure_target', 0.1))
+    dead_exposure_target = float(tcfg.get(
+        'dead_exposure_target', 0.0 if is_v4164_cfg else 0.1))
     removed_margin_reg_weight_qk = tcfg.get(
         'removed_margin_reg_weight_qk', 0.0)
     removed_margin_reg_weight_v = tcfg.get(
@@ -10598,9 +10107,11 @@ def main():
     removed_margin_reg_weight_rst = tcfg.get(
         'removed_margin_reg_weight_rst', 0.0)
     if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS:
-        # v4162/v4163 clean paths have no hard-boundary dead repair or configurable
-        # selection-margin auxiliary.  Keep config defaults harmless even if
-        # an old YAML/checkpoint config contains legacy nonzero values.
+        # Soft DirectTau paths have no hard-boundary dead repair or
+        # configurable selection-margin auxiliary.
+        pool_weight_decay = 0.0 if is_v4164_cfg else pool_weight_decay
+        div_weight = 0.0 if is_v4164_cfg else div_weight
+        lb_weight = 0.0 if is_v4164_cfg else lb_weight
         dead_penalty_weight = 0.0
         dead_penalty_qk_weight = 0.0
         dead_penalty_v_weight = 0.0
@@ -10663,10 +10174,12 @@ def main():
         exploration_normalize_by_layers_default))
     if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS:
         exploration_normalize_by_layers = True
-    rpe_enabled = bool(tcfg.get('rpe_enabled', True))
-    soft_gate_enabled = bool(tcfg.get(
-        'soft_gate_enabled',
-        model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS))
+    rpe_enabled = (
+        False if is_v4164_cfg else bool(tcfg.get('rpe_enabled', True)))
+    soft_gate_enabled = (
+        True if is_v4164_cfg else bool(tcfg.get(
+            'soft_gate_enabled',
+            model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS)))
     soft_gate_t_start = float(tcfg.get('soft_gate_t_start', 1.5))
     soft_gate_t_final = float(tcfg.get('soft_gate_t_final', 0.07))
     soft_gate_t_hold_frac = float(tcfg.get('soft_gate_t_hold_frac', 0.10))
@@ -10679,16 +10192,18 @@ def main():
         tcfg.get('soft_gate_t_gompertz_center', 0.25))
     soft_gate_t_gompertz_steepness = float(
         tcfg.get('soft_gate_t_gompertz_steepness', 8.0))
-    soft_gate_t_pool_specific = bool(tcfg.get(
-        'soft_gate_t_pool_specific', False))
+    soft_gate_t_pool_specific = (
+        True if is_v4164_cfg else bool(tcfg.get(
+            'soft_gate_t_pool_specific', False)))
     soft_gate_pool_schedules = _training_soft_gate_pool_schedules(
         tcfg, soft_gate_t_start, soft_gate_t_final,
         soft_gate_t_hold_frac, soft_gate_t_anneal_end_frac,
         soft_gate_schedule, soft_gate_t_power,
         soft_gate_t_gompertz_center, soft_gate_t_gompertz_steepness)
-    soft_gate_boundary_power_enabled = bool(tcfg.get(
-        'soft_gate_boundary_power_enabled',
-        model_version_cfg in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS))
+    soft_gate_boundary_power_enabled = (
+        True if is_v4164_cfg else bool(tcfg.get(
+            'soft_gate_boundary_power_enabled',
+            model_version_cfg in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)))
     soft_gate_boundary_power_start = float(tcfg.get(
         'soft_gate_boundary_power_start', 3.0))
     soft_gate_boundary_power_mid = float(tcfg.get(
@@ -10715,16 +10230,19 @@ def main():
     )
     current_admission_den_config_override = any(
         key in tcfg for key in admission_den_config_keys)
-    regular_diagnostics_level_default = (
-        'compact'
-        if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
-        else 'full')
-    regular_diagnostics_level = str(tcfg.get(
-        'regular_diagnostics_level',
-        regular_diagnostics_level_default)).lower()
-    if regular_diagnostics_level not in ('compact', 'full'):
-        raise ValueError(
-            "training.regular_diagnostics_level must be 'compact' or 'full'.")
+    if is_v4164_cfg:
+        regular_diagnostics_level = 'analysis'
+    else:
+        regular_diagnostics_level_default = (
+            'compact'
+            if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
+            else 'full')
+        regular_diagnostics_level = str(tcfg.get(
+            'regular_diagnostics_level',
+            regular_diagnostics_level_default)).lower()
+        if regular_diagnostics_level not in ('compact', 'full'):
+            raise ValueError(
+                "training.regular_diagnostics_level must be 'compact' or 'full'.")
     regular_console_level_default = 'full'
     regular_console_level = str(tcfg.get(
         'regular_console_level',
@@ -10747,24 +10265,24 @@ def main():
         'regular_console_drive_max_warn', 1.20))
     regular_console_logging_overhead_warn = float(tcfg.get(
         'regular_console_logging_overhead_warn', 0.05))
-    regular_current_eps_default = (
-        [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]
-        if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-        else [1.0e-1, 1.0e-2, 1.0e-3])
-    regular_projected_eps_default = [1.0e-6]
-    regular_current_eps = [
-        float(x) for x in tcfg.get(
-            'regular_current_eps', regular_current_eps_default)]
-    regular_projected_eps = [
-        float(x) for x in tcfg.get(
-            'regular_projected_eps', regular_projected_eps_default)]
-    regular_mass_enabled = bool(tcfg.get('regular_mass_enabled', False))
-    regular_sparsity_enabled = bool(tcfg.get(
-        'regular_sparsity_enabled',
-        (True if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-         else model_version_cfg not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)))
-    effective_prune_eps_list = list(
-        tcfg.get('effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
+    if is_v4164_cfg:
+        regular_current_eps = []
+        regular_projected_eps = []
+        regular_mass_enabled = False
+        regular_sparsity_enabled = False
+    else:
+        regular_current_eps_default = [1.0e-1, 1.0e-2, 1.0e-3]
+        regular_projected_eps_default = [1.0e-6]
+        regular_current_eps = [
+            float(x) for x in tcfg.get(
+                'regular_current_eps', regular_current_eps_default)]
+        regular_projected_eps = [
+            float(x) for x in tcfg.get(
+                'regular_projected_eps', regular_projected_eps_default)]
+        regular_mass_enabled = bool(tcfg.get('regular_mass_enabled', False))
+        regular_sparsity_enabled = bool(tcfg.get(
+            'regular_sparsity_enabled',
+            model_version_cfg not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS))
     eval_effective_prune_enabled = bool(tcfg.get(
         'eval_effective_prune_enabled',
         model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS))
@@ -10777,13 +10295,18 @@ def main():
         sorted(k for k in tcfg if k.startswith('tau_ce_grad_scale'))
         if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
         else [])
-    rpe_start_frac = float(tcfg.get(
-        'rpe_start_frac',
-        0.20 if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS else 0.0))
-    rpe_full_frac = float(tcfg.get(
-        'rpe_full_frac',
-        0.45 if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS else 0.0))
-    rpe_schedule = str(tcfg.get('rpe_schedule', 'linear'))
+    if is_v4164_cfg:
+        rpe_start_frac = 0.0
+        rpe_full_frac = 0.0
+        rpe_schedule = 'linear'
+    else:
+        rpe_start_frac = float(tcfg.get(
+            'rpe_start_frac',
+            0.20 if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS else 0.0))
+        rpe_full_frac = float(tcfg.get(
+            'rpe_full_frac',
+            0.45 if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS else 0.0))
+        rpe_schedule = str(tcfg.get('rpe_schedule', 'linear'))
     if not rpe_enabled:
         exploration_weight = 0.0
         exploration_weight_q = 0.0
@@ -11155,13 +10678,23 @@ def main():
             exploration_normalize_by_layers = bool(saved_training_config.get(
                 'exploration_normalize_by_layers',
                 exploration_normalize_by_layers))
-            rpe_enabled = bool(saved_training_config.get(
-                'rpe_enabled', rpe_enabled))
-            regular_diagnostics_level = str(saved_training_config.get(
-                'regular_diagnostics_level', regular_diagnostics_level)).lower()
-            if regular_diagnostics_level not in ('compact', 'full'):
-                raise ValueError(
-                    "training.regular_diagnostics_level must be 'compact' or 'full'.")
+            if is_v4164_cfg:
+                rpe_enabled = False
+                regular_diagnostics_level = 'analysis'
+                regular_current_eps = []
+                regular_projected_eps = []
+                regular_mass_enabled = False
+                regular_sparsity_enabled = False
+                soft_gate_boundary_power_enabled = True
+            else:
+                rpe_enabled = bool(saved_training_config.get(
+                    'rpe_enabled', rpe_enabled))
+                regular_diagnostics_level = str(saved_training_config.get(
+                    'regular_diagnostics_level',
+                    regular_diagnostics_level)).lower()
+                if regular_diagnostics_level not in ('compact', 'full'):
+                    raise ValueError(
+                        "training.regular_diagnostics_level must be 'compact' or 'full'.")
             regular_console_level = str(saved_training_config.get(
                 'regular_console_level', regular_console_level)).lower()
             if regular_console_level not in ('compact', 'full'):
@@ -11184,20 +10717,21 @@ def main():
                 saved_training_config.get(
                     'regular_console_logging_overhead_warn',
                     regular_console_logging_overhead_warn))
-            regular_current_eps = [
-                float(x) for x in saved_training_config.get(
-                    'regular_current_eps', regular_current_eps)]
-            regular_projected_eps = [
-                float(x) for x in saved_training_config.get(
-                    'regular_projected_eps', regular_projected_eps)]
-            regular_mass_enabled = bool(saved_training_config.get(
-                'regular_mass_enabled', regular_mass_enabled))
-            regular_sparsity_enabled = bool(saved_training_config.get(
-                'regular_sparsity_enabled', regular_sparsity_enabled))
-            soft_gate_boundary_power_enabled = bool(
-                saved_training_config.get(
-                    'soft_gate_boundary_power_enabled',
-                    soft_gate_boundary_power_enabled))
+            if not is_v4164_cfg:
+                regular_current_eps = [
+                    float(x) for x in saved_training_config.get(
+                        'regular_current_eps', regular_current_eps)]
+                regular_projected_eps = [
+                    float(x) for x in saved_training_config.get(
+                        'regular_projected_eps', regular_projected_eps)]
+                regular_mass_enabled = bool(saved_training_config.get(
+                    'regular_mass_enabled', regular_mass_enabled))
+                regular_sparsity_enabled = bool(saved_training_config.get(
+                    'regular_sparsity_enabled', regular_sparsity_enabled))
+                soft_gate_boundary_power_enabled = bool(
+                    saved_training_config.get(
+                        'soft_gate_boundary_power_enabled',
+                        soft_gate_boundary_power_enabled))
             soft_gate_boundary_power_start = float(
                 saved_training_config.get(
                     'soft_gate_boundary_power_start',
@@ -11382,6 +10916,28 @@ def main():
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
+    if is_v4164_cfg:
+        pool_weight_decay = 0.0
+        div_weight = 0.0
+        lb_weight = 0.0
+        dead_penalty_weight = 0.0
+        dead_penalty_qk_weight = 0.0
+        dead_penalty_v_weight = 0.0
+        dead_penalty_rst_weight = 0.0
+        dead_exposure_target = 0.0
+        removed_margin_reg_weight_qk = 0.0
+        removed_margin_reg_weight_v = 0.0
+        removed_margin_reg_weight_rst = 0.0
+        rpe_enabled = False
+        soft_gate_enabled = True
+        soft_gate_t_pool_specific = True
+        soft_gate_boundary_power_enabled = True
+        regular_diagnostics_level = 'analysis'
+        regular_current_eps = []
+        regular_projected_eps = []
+        regular_mass_enabled = False
+        regular_sparsity_enabled = False
+
     if not rpe_enabled:
         exploration_weight = 0.0
         exploration_weight_q = 0.0
@@ -11524,7 +11080,6 @@ def main():
         'regular_projected_eps': regular_projected_eps,
         'regular_mass_enabled': regular_mass_enabled,
         'regular_sparsity_enabled': regular_sparsity_enabled,
-        'effective_prune_eps_list': effective_prune_eps_list,
         'eval_effective_prune_enabled': eval_effective_prune_enabled,
         'eval_effective_prune_eps_list': eval_effective_prune_eps_list,
         'rpe_start_frac': rpe_start_frac,
@@ -11542,15 +11097,6 @@ def main():
         'cb1a_forward_influence': False,
         'cb1a_ce_mode': cb1a_ce_mode,
         'cb1a_eps': cb1a_eps,
-        'stop_on_collapse': stop_on_collapse,
-        'crash_snapshot': crash_snapshot_enabled,
-        'crash_snapshot_enabled': crash_snapshot_enabled,
-        'crash_snapshot_save_post': crash_save_post_update,
-        'spike_event_logger': spike_event_logger,
-        **spike_thresholds,
-        'spike_probe_on_event': spike_probe_on_event,
-        'spike_probe_topk': spike_probe_topk,
-        'spike_history_steps': spike_history_steps,
         'dead_penalty_weighted_clip': dead_penalty_weighted_clip,
         'global_grad_clip': global_grad_clip,
         'tau_lr_mult': tau_lr_mult,
@@ -11651,6 +11197,34 @@ def main():
                 'exploration_z_clip',
                 'exploration_z_tanh',
                 'exploration_weighted_clip'):
+            training_config.pop(_key, None)
+            cfg.setdefault('training', {}).pop(_key, None)
+    if is_v4164_cfg:
+        for _key in (
+                'pool_weight_decay',
+                'diversity_weight',
+                'load_balance_weight',
+                'dead_penalty_weight',
+                'dead_penalty_qk_weight',
+                'dead_penalty_v_weight',
+                'dead_penalty_rst_weight',
+                'dead_exposure_target',
+                'removed_margin_reg_weight_qk',
+                'removed_margin_reg_weight_v',
+                'removed_margin_reg_weight_rst',
+                'rpe_enabled',
+                'rpe_start_frac',
+                'rpe_full_frac',
+                'rpe_schedule',
+                'soft_gate_enabled',
+                'soft_gate_t_pool_specific',
+                'soft_gate_boundary_power_enabled',
+                'regular_diagnostics_level',
+                'regular_current_eps',
+                'regular_projected_eps',
+                'regular_mass_enabled',
+                'regular_sparsity_enabled',
+                'dead_penalty_weighted_clip'):
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
     cfg.setdefault('training', {}).update(training_config)
@@ -12046,8 +11620,7 @@ def main():
                     print("  gate = exp(-((max(tau-score,0)/B)^p)) * intensity")
                 print("  Boundary power:")
                 print(
-                    f"    enabled={soft_gate_boundary_power_enabled} "
-                    f"start={soft_gate_boundary_power_start} "
+                    f"    start={soft_gate_boundary_power_start} "
                     f"mid={soft_gate_boundary_power_mid} "
                     f"final={soft_gate_boundary_power_final} "
                     f"start_frac={soft_gate_boundary_power_start_frac} "
@@ -12060,8 +11633,7 @@ def main():
                         f"admission_den_grad_scale={admission_den_grad_scale}")
             else:
                 print("  Soft gate:")
-            print(f"    enabled={soft_gate_enabled} "
-                  f"pool_specific={soft_gate_t_pool_specific} "
+            print(f"    pool_specific={soft_gate_t_pool_specific} "
                   f"effective_active_eps={soft_gate_effective_active_eps}")
             _scale_label = (
                 'B'
@@ -12120,21 +11692,16 @@ def main():
             if ignored_tau_ce_grad_scale_keys:
                 print("  tau_ce_grad_scale config fields are ignored in "
                       "v4162+; tau movement is controlled by tau_lr_mult.")
-            print("  RPE schedule:")
-            print(f"    start_frac={rpe_start_frac} full_frac={rpe_full_frac} "
-                  f"final exploration_weight={exploration_weight} "
-                  f"qk/v/rst=({exploration_weight_qk}, "
-                  f"{exploration_weight_v}, {exploration_weight_rst})")
+            if rpe_enabled:
+                print("  RPE schedule:")
+                print(f"    start_frac={rpe_start_frac} full_frac={rpe_full_frac} "
+                      f"final exploration_weight={exploration_weight} "
+                      f"qk/v/rst=({exploration_weight_qk}, "
+                      f"{exploration_weight_v}, {exploration_weight_rst})")
             print("  Effective pruning:")
             print(
-                f"    regular diagnostics={regular_diagnostics_level} "
-                f"console={regular_console_level} "
-                f"host_timing={regular_console_host_timing} "
-                f"current_eps={regular_current_eps} "
-                f"projected_eps={regular_projected_eps} "
-                f"mass={regular_mass_enabled} "
-                f"sparsity={regular_sparsity_enabled}")
-            print(f"    train diagnostic eps={effective_prune_eps_list}")
+                f"    console={regular_console_level} "
+                f"host_timing={regular_console_host_timing}")
             print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
             _gate_intensity_part = (
                 ""
@@ -12147,7 +11714,6 @@ def main():
                 f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
                 f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
                 f"{_gate_intensity_part}"
-                f"soft_gate_enabled={soft_gate_enabled} "
                 f"dropout={cfg['model'].get('dropout', None)} "
                 f"router_dropout={cfg['model'].get('router_dropout', None)}"
             )
@@ -12195,7 +11761,6 @@ def main():
         if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
             print(
                 "  v4158 contrib-den diagnostics: "
-                f"debug_local_spikes={debug_local_spikes} "
                 f"warn_compose={collapse_warn_ctx['collapse_warn_compose_norm_threshold']} "
                 f"warn_top1={collapse_warn_ctx['collapse_warn_top1_threshold']} "
                 f"warn_low_den_frac={collapse_warn_ctx['collapse_warn_low_den_floor_frac_threshold']} "
@@ -12392,14 +11957,10 @@ def main():
     # Create shard_map functions if mesh_model > 1 or the model demands
     # the sharded path (v4.1 removed its non-sharded fallback).
     #
-    # v4.1: `_sharded_fns` = slim train path. config debug_local_spikes appends
-    # scalar-only inline local diagnostics to that same train kernel.
-    # `_sharded_fns_analysis` = full observational stats, used only by
-    # analysis_step at the configured analysis cadence.
+    # v4.1: `_sharded_fns` is the slim train path; `_sharded_fns_analysis`
+    # is the full observational path used only by analysis_step.
     _sharded_fns = None
     _sharded_fns_analysis = None
-    _sharded_fns_spike_probe = None
-    _train_local_diag = False
     _spec = MODEL_REGISTRY.get(model_version)
     _force_sharded = bool(_spec and _spec.force_sharded)
     if _spec is not None and (mesh_model > 1 or _force_sharded):
@@ -12426,18 +11987,8 @@ def main():
         _supports_analysis = (
             'analysis' in _inspect.signature(make_sharded_srw).parameters
         )
-        _supports_local_diag = (
-            'local_diagnostics' in _inspect.signature(make_sharded_srw).parameters
-        )
-        _supports_spike_probe = (
-            'spike_probe' in _inspect.signature(make_sharded_srw).parameters
-        )
-        _train_local_diag = bool(debug_local_spikes and _supports_local_diag)
         _srw_train_kwargs = dict(_srw_base_kwargs)
-        if _train_local_diag:
-            _srw_train_kwargs['local_diagnostics'] = True
-        # Slim (train) -analysis defaults to False. Local spike diagnostics,
-        # when explicitly enabled, are scalar-only outputs on this path.
+        # Slim train kernel; analysis defaults to False.
         _sharded_single_v = make_sharded_srw(
             max_chunk_size=attn_v_max_chunk,
             **_factory_kwargs(make_sharded_srw, _srw_train_kwargs))
@@ -12483,39 +12034,11 @@ def main():
                 }
             else:
                 _sharded_fns_analysis = _sharded_single_rst_a
-        if _supports_spike_probe and spike_event_logger and spike_probe_on_event:
-            _srw_spike_kwargs = dict(_srw_base_kwargs)
-            _srw_spike_kwargs.update({
-                'spike_probe': True,
-                'spike_probe_topk': spike_probe_topk,
-            })
-            _sharded_single_v_sp = make_sharded_srw(
-                max_chunk_size=attn_v_max_chunk,
-                **_factory_kwargs(make_sharded_srw, _srw_spike_kwargs))
-            _sharded_single_rst_sp = make_sharded_srw(
-                max_chunk_size=rst_max_chunk,
-                **_factory_kwargs(make_sharded_srw, _srw_spike_kwargs))
-            if hasattr(_v3, 'make_sharded_srw_paired'):
-                _paired_factory = _v3.make_sharded_srw_paired
-                _sharded_paired_sp = _v3.make_sharded_srw_paired(
-                    max_chunk_size=attn_qk_max_chunk,
-                    **_factory_kwargs(_paired_factory, _srw_spike_kwargs))
-                _sharded_fns_spike_probe = {
-                    'single': _sharded_single_v_sp,
-                    'attn_v_single': _sharded_single_v_sp,
-                    'rst_single': _sharded_single_rst_sp,
-                    'paired': _sharded_paired_sp,
-                    'attn_qk_paired': _sharded_paired_sp,
-                }
-            else:
-                _sharded_fns_spike_probe = _sharded_single_rst_sp
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
-                  f"; analysis kernels={'on' if _supports_analysis else 'off'}"
-                  f"; inline local spikes={'on' if _train_local_diag else 'off'}"
-                  f"; spike probe={'on' if _sharded_fns_spike_probe is not None else 'off'})")
+                  f"; analysis kernels={'on' if _supports_analysis else 'off'})")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -12602,14 +12125,10 @@ def main():
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh,
         debug_diagnostics=debug_mode,
-        debug_local_spikes=_train_local_diag,
         compact_train_metrics=(
             model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
-            and regular_diagnostics_level == 'compact'
-            and not debug_mode
-            and not _train_local_diag),
-        keep_train_layer_metrics=(
-            spike_event_logger or crash_snapshot_enabled))
+            and not debug_mode),
+        keep_train_layer_metrics=False)
     eval_step_fn = create_eval_step(
         model, sharded_fns=_sharded_fns, return_dead_stats=True,
         total_training_steps=total_steps,
@@ -12687,39 +12206,8 @@ def main():
             admission_den_power=admission_den_power)
     else:
         analysis_step_fn = None
-    spike_probe_step_fn = None
-    if spike_event_logger and spike_probe_on_event:
-        spike_probe_step_fn = create_spike_probe_step(
-            model,
-            sharded_fns=(_sharded_fns_spike_probe or _sharded_fns),
-            topk=spike_probe_topk,
-            total_training_steps=total_steps,
-            soft_gate_enabled=soft_gate_enabled,
-            soft_gate_t_start=soft_gate_t_start,
-            soft_gate_t_final=soft_gate_t_final,
-            soft_gate_t_hold_frac=soft_gate_t_hold_frac,
-            soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
-            soft_gate_schedule=soft_gate_schedule,
-            soft_gate_t_power=soft_gate_t_power,
-            soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
-            soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
-            soft_gate_t_pool_specific=soft_gate_t_pool_specific,
-            soft_gate_pool_schedules=soft_gate_pool_schedules,
-            soft_gate_boundary_power_enabled=soft_gate_boundary_power_enabled,
-            soft_gate_boundary_power_start=soft_gate_boundary_power_start,
-            soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
-            soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-            soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
-            soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
-            soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-            admission_den_power=admission_den_power)
     # No current-train-batch debug forward: --debug uses regular scalar
-    # train_step metrics. Local spike diagnostics require training.debug_local_spikes=true.
-    debug_forward_step_fn = None
-    if debug_drop_compare and is_host0:
-        print("  Drop compare requested, but current-train-batch debug "
-              "forwards are disabled; regular train diagnostics remain on.",
-              flush=True)
+    # train_step metrics.
     geometry_step_fn = create_geometry_step(
         max_sample=int(tcfg.get(
             'geometry_max_sample',
@@ -13287,8 +12775,6 @@ def main():
         _existing_jsonls = sorted(_list_files(log_dir, "metrics_*.jsonl"))
         _existing_debug_logs = sorted(_list_files(log_dir, "debug_log_*.txt"))
         _existing_debug_jsonls = sorted(_list_files(log_dir, "debug_metrics_*.jsonl"))
-        _existing_spike_logs = sorted(_list_files(log_dir, "spike_events_*.txt"))
-        _existing_spike_jsonls = sorted(_list_files(log_dir, "spike_events_*.jsonl"))
         _is_log_resume = (
             training_log_append_on_resume
             and (resume_path is not None)
@@ -13318,34 +12804,13 @@ def main():
             debug_log_file = None
             debug_jsonl_log_file = None
             _is_debug_log_resume = False
-        if spike_event_logger:
-            if (spike_log_append_on_resume
-                    and (resume_path is not None)
-                    and _existing_spike_logs):
-                spike_log_file = _existing_spike_logs[-1]
-                spike_jsonl_log_file = (
-                    _existing_spike_jsonls[-1] if _existing_spike_jsonls
-                    else _join(log_dir, f'spike_events_{timestamp}.jsonl'))
-                _is_spike_log_resume = True
-            else:
-                spike_log_file = _join(log_dir, f'spike_events_{timestamp}.txt')
-                spike_jsonl_log_file = _join(
-                    log_dir, f'spike_events_{timestamp}.jsonl')
-                _is_spike_log_resume = False
-        else:
-            spike_log_file = None
-            spike_jsonl_log_file = None
-            _is_spike_log_resume = False
 
         # Set up loggers (local append + periodic GCS sync)
         _setup_loggers(
             training_log_file, jsonl_log_file, resume=_is_log_resume,
             debug_log_file=debug_log_file,
             debug_jsonl_log_file=debug_jsonl_log_file,
-            debug_resume=_is_debug_log_resume,
-            spike_log_file=spike_log_file,
-            spike_jsonl_log_file=spike_jsonl_log_file,
-            spike_resume=_is_spike_log_resume)
+            debug_resume=_is_debug_log_resume)
 
         n_params = count_parameters(params)
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
@@ -13358,8 +12823,7 @@ def main():
         log_message(
             "Resume log append policy: "
             f"training={training_log_append_on_resume} "
-            f"debug={debug_log_append_on_resume} "
-            f"spike={spike_log_append_on_resume}")
+            f"debug={debug_log_append_on_resume}")
         if debug_mode:
             log_message(
                 f"Debug diagnostics: every {debug_interval} step(s) -> {debug_log_file}")
@@ -13369,36 +12833,9 @@ def main():
             log_debug_message(f"Training log: {training_log_file}")
             log_debug_message(f"Debug interval: {debug_interval}")
             log_debug_message(
-                f"Local spike inline: {'on' if _train_local_diag else 'off'}")
-            log_debug_message(
-                f"Drop compare: {'on' if debug_drop_compare else 'off'}")
-            log_debug_message(
-                f"Crash snapshot: {'on' if crash_snapshot_enabled else 'off'}")
-            log_debug_message(
-                f"Stop on collapse: {'on' if stop_on_collapse else 'off'}")
-            if crash_snapshot_enabled:
-                log_debug_message(
-                    f"Crash history: last {crash_history_steps} local metric records; "
-                    f"host batches: {'on' if crash_snapshot_save_host_batches else 'off'}")
-            log_debug_message(
                 f"Resume append: {_is_debug_log_resume} "
                 f"(config debug_log_append_on_resume={debug_log_append_on_resume})")
             log_debug_message("")
-        if spike_event_logger:
-            log_message(
-                f"Spike event logger: on -> {spike_log_file}, {spike_jsonl_log_file}")
-            log_spike_message(
-                f"DAWN {model_version} Spike Events - {timestamp}")
-            log_spike_message(f"Config: {config_path}")
-            log_spike_message(f"Training log: {training_log_file}")
-            log_spike_message(
-                f"Probe on event: {'on' if spike_probe_step_fn is not None else 'off'} topk={spike_probe_topk} min_step={spike_probe_min_step}")
-            log_spike_message(
-                f"Thresholds: {json.dumps(spike_thresholds, sort_keys=True)}")
-            log_spike_message(
-                f"Resume append: {_is_spike_log_resume} "
-                f"(config spike_log_append_on_resume={spike_log_append_on_resume})")
-            log_spike_message("")
         log_message("")
         sync_logs()
 
@@ -13417,111 +12854,6 @@ def main():
 
     def _ckpt_path(name):
         return _join(checkpoint_dir, name)
-
-    def _crash_path(step, name):
-        return _join(_join(checkpoint_dir, 'crash_snapshots'),
-                     f"step_{int(step):08d}/{name}")
-
-    def _save_crash_snapshot(step, epoch_idx, step_in_epoch, pre_params, pre_opt_state,
-                             post_params, post_opt_state, batch_ids_np, mask_np,
-                             metrics_rec, reasons, local_history=None,
-                             full_metrics_rec=None, host_trigger_summary=None,
-                             trigger_on_this_host=False):
-        """Collective crash snapshot writer. All hosts must enter.
-
-        Host 0 writes the replicated checkpoint. Every host writes its own
-        metric history/current metrics under a unique filename so an
-        other-host trigger is diagnosable without guessing from host-0 logs.
-        """
-        pre_params_single = _gather_for_save(pre_params)
-        pre_opt_single = _gather_for_save(pre_opt_state)
-        post_params_single = None
-        post_opt_single = None
-        if crash_save_post_update:
-            post_params_single = _gather_for_save(post_params)
-            post_opt_single = _gather_for_save(post_opt_state)
-        # Per-host diagnostics. These are written only after a severe
-        # trigger, so there is no steady-state training cost.
-        host_prefix = f"host_{int(host_id):04d}"
-        local_payload = {
-            'type': 'crash_host_metrics',
-            'process_index': int(host_id),
-            'step': int(step),
-            'epoch': int(epoch_idx),
-            'step_in_epoch': int(step_in_epoch),
-            'trigger_on_this_host': bool(trigger_on_this_host),
-            'reasons': list(reasons),
-            'current_metrics': _annotate_crash_record(
-                full_metrics_rec if full_metrics_rec is not None else metrics_rec,
-                reasons if trigger_on_this_host else []),
-            'history': list(local_history or []),
-            'timestamp': datetime.now().isoformat(),
-        }
-        _write_json_file(_crash_path(step, f'{host_prefix}_history.json'),
-                         local_payload)
-        if full_metrics_rec is not None:
-            _write_json_file(_crash_path(step, f'{host_prefix}_current_metrics.json'),
-                             full_metrics_rec)
-        if crash_snapshot_save_host_batches and batch_ids_np is not None:
-            _write_npy_file(_crash_path(step, f'{host_prefix}_batch_input_ids.npy'),
-                            batch_ids_np)
-            _write_npy_file(_crash_path(step, f'{host_prefix}_batch_attention_mask.npy'),
-                            mask_np)
-
-        if is_host0:
-            base_note = {
-                'type': 'crash_snapshot',
-                'step': int(step),
-                'epoch': int(epoch_idx),
-                'step_in_epoch': int(step_in_epoch),
-                'reasons': list(reasons),
-                'timestamp': datetime.now().isoformat(),
-                'config_path': str(config_path),
-                'model_version': model_version,
-                'trigger_on_this_host': bool(trigger_on_this_host),
-                'triggering_hosts': [
-                    int(r['process_index']) for r in (host_trigger_summary or [])
-                    if r.get('triggered')
-                ],
-                'metrics_are_from_process_index': int(host_id),
-                'note': (
-                    'pre_update.flax is the replicated training state before '
-                    'the optimizer update. Host-specific metric histories are '
-                    'stored as host_XXXX_history.json. If trigger_on_this_host '
-                    'is false, host_0000 batch files are not necessarily the '
-                    'triggering microbatch; inspect host_trigger_summary.json '
-                    'and the triggering host files.'),
-            }
-            _write_checkpoint_bytes(
-                _crash_path(step, 'pre_update.flax'),
-                _serialize_checkpoint(
-                    pre_params_single, pre_opt_single, epoch_idx, step,
-                    best_val_loss, cfg['model'],
-                    step_in_epoch=step_in_epoch,
-                    steps_per_epoch=steps_per_epoch,
-                    training_config=training_config))
-            if crash_save_post_update and post_params_single is not None:
-                _write_checkpoint_bytes(
-                    _crash_path(step, 'post_update.flax'),
-                    _serialize_checkpoint(
-                        post_params_single, post_opt_single, epoch_idx, step,
-                        best_val_loss, cfg['model'],
-                        step_in_epoch=step_in_epoch,
-                        steps_per_epoch=steps_per_epoch,
-                        training_config=training_config))
-            _write_npy_file(_crash_path(step, 'batch_input_ids.npy'), batch_ids_np)
-            _write_npy_file(_crash_path(step, 'batch_attention_mask.npy'), mask_np)
-            _write_json_file(_crash_path(step, 'metrics.json'), metrics_rec)
-            if host_trigger_summary is not None:
-                _write_json_file(_crash_path(step, 'host_trigger_summary.json'),
-                                 host_trigger_summary)
-            _write_json_file(_crash_path(step, 'trigger.json'), base_note)
-            _write_json_file(_crash_path(step, 'config.json'), cfg)
-            log_message(
-                f"  [CRASH_SNAPSHOT] step={step} reasons={','.join(reasons)} "
-                f"saved under {_crash_path(step, '')}")
-            log_jsonl({**base_note, 'snapshot_dir': _crash_path(step, '')})
-        del pre_params_single, pre_opt_single, post_params_single, post_opt_single
 
     def handle_preemption(signum, frame):
         """Flag-only SIGTERM handler (spot preemption).
@@ -13553,11 +12885,6 @@ def main():
         print("  SIGTERM handler registered (spot preemption safety)")
 
     # ----------------------------------------------------------
-    # Training loop
-    crash_metric_history = []
-    spike_metric_history = []
-
-    # ----------------------------------------------------------
     if is_host0:
         print(f"\n{'='*60}")
         print("=== Starting training loop ===", flush=True)
@@ -13579,9 +12906,7 @@ def main():
               f" analysis={LOG_ANALYSIS}"
               f" geometry={LOG_GEOMETRY}"
               f" val={val_interval}"
-              f" debug={'off' if not debug_mode else debug_interval}"
-              f" local_spikes={'on' if _train_local_diag else 'off'}"
-              f" drop_compare={'on' if debug_drop_compare else 'off'}",
+              f" debug={'off' if not debug_mode else debug_interval}",
               flush=True)
 
     # Emb drift snapshot (sense vectors). Held on every host, refreshed at
@@ -13641,19 +12966,9 @@ def main():
                     print("Preemption requested -- exiting training loop.", flush=True)
                 break
 
-            # Shard data and run train step.  Keep lightweight Python
-            # references to the pre-update state and raw batch only when crash
-            # snapshots are enabled; this lets a collapse be replayed even if
-            # regular checkpoint retention later deletes nearby checkpoints.
+            # Shard data and run the official v4164 train step.
             rng, step_rng = jax.random.split(rng)
             step_rng = jax.random.fold_in(step_rng, host_id)  # per-host dropout
-            _keep_pre_step = (
-                crash_snapshot_enabled
-                or (spike_event_logger and spike_probe_step_fn is not None))
-            _crash_batch_ids = np.asarray(input_ids) if crash_snapshot_enabled else None
-            _crash_batch_mask = np.asarray(attention_mask) if crash_snapshot_enabled else None
-            _pre_step_params = params if _keep_pre_step else None
-            _pre_step_opt_state = opt_state if crash_snapshot_enabled else None
             input_ids = shard_to_mesh(
                 input_ids, data_sharding, (batch_size, max_seq_len))
             attention_mask = shard_to_mesh(
@@ -13701,289 +13016,13 @@ def main():
             # Per-step NaN check on total_loss only. A single scalar sync
             # catches loss explosions immediately; the full 6-key check runs
             # at log boundary on already-materialized window averages.
-            if crash_snapshot_enabled:
-                _crash_probe = jax.device_get({
-                    'total_loss': metrics['total_loss'],
-                    'ce_loss': metrics['ce_loss'],
-                    'total_loss_minus_ce': metrics.get(
-                        'total_loss_minus_ce', jnp.float32(0.0)),
-                    'grad_norm': metrics.get('grad_norm', jnp.float32(0.0)),
-                    'grad_global_preclip': metrics.get(
-                        'grad_global_preclip', metrics.get('grad_norm', jnp.float32(0.0))),
-                    'grad_global_postclip': metrics.get(
-                        'grad_global_postclip', jnp.float32(0.0)),
-                    'attn_qk_active': metrics.get('attn_qk_active', jnp.float32(0.0)),
-                    'attn_q_active': metrics.get(
-                        'attn_q_active',
-                        metrics.get('attn_qk_active', jnp.float32(0.0))),
-                    'attn_k_active': metrics.get(
-                        'attn_k_active',
-                        metrics.get('attn_qk_active', jnp.float32(0.0))),
-                    'attn_v_active': metrics.get('attn_v_active', jnp.float32(0.0)),
-                    'rst_active': metrics.get('rst_active', jnp.float32(0.0)),
-                    'attn_top1_gate_frac_max': metrics.get(
-                        'attn_top1_gate_frac_max', metrics.get('attn_top1_gate_frac', jnp.float32(0.0))),
-                    'rst_top1_gate_frac_max': metrics.get(
-                        'rst_top1_gate_frac_max', metrics.get('rst_top1_gate_frac', jnp.float32(0.0))),
-                    'per_layer_attn_out_norm': metrics.get(
-                        'per_layer_attn_out_norm', jnp.zeros(1)),
-                    'per_layer_rst_out_norm': metrics.get(
-                        'per_layer_rst_out_norm', jnp.zeros(1)),
-                    'attn_gate_den_sum_mean': metrics.get(
-                        'attn_gate_den_sum_mean', jnp.float32(0.0)),
-                    'rst_gate_den_sum_mean': metrics.get(
-                        'rst_gate_den_sum_mean', jnp.float32(0.0)),
-                    'attn_raw_gate_max': metrics.get('attn_raw_gate_max', jnp.float32(0.0)),
-                    'rst_raw_gate_max': metrics.get('rst_raw_gate_max', jnp.float32(0.0)),
-                    'attn_int_max': metrics.get('attn_int_max', jnp.float32(0.0)),
-                    'rst_int_max': metrics.get('rst_int_max', jnp.float32(0.0)),
-                    'grad_router_proj_attn': metrics.get(
-                        'grad_router_proj_attn', jnp.float32(0.0)),
-                    'grad_router_proj_rst': metrics.get(
-                        'grad_router_proj_rst', jnp.float32(0.0)),
-                    'grad_router_tau_attn': metrics.get(
-                        'grad_router_tau_attn', jnp.float32(0.0)),
-                    'grad_router_tau_rst': metrics.get(
-                        'grad_router_tau_rst', jnp.float32(0.0)),
-                    'grad_pool_rst_read': metrics.get(
-                        'grad_pool_rst_read', jnp.float32(0.0)),
-                    'grad_pool_rst_write': metrics.get(
-                        'grad_pool_rst_write', jnp.float32(0.0)),
-                    'grad_pool_emb': metrics.get('grad_pool_emb', jnp.float32(0.0)),
-                    'grad_pool_read': metrics.get('grad_pool_read', jnp.float32(0.0)),
-                    'grad_pool_write': metrics.get('grad_pool_write', jnp.float32(0.0)),
-                    'grad_expand_O': metrics.get('grad_expand_O', jnp.float32(0.0)),
-                    'attn_qk_emb_norm_max': metrics.get(
-                        'attn_qk_emb_norm_max', jnp.float32(0.0)),
-                    'attn_v_emb_norm_max': metrics.get(
-                        'attn_v_emb_norm_max', jnp.float32(0.0)),
-                    'rst_emb_norm_max': metrics.get(
-                        'rst_emb_norm_max', jnp.float32(0.0)),
-                })
-                _m_total_for_nan = float(_crash_probe['total_loss'])
-            else:
-                _crash_probe = None
-                _m_total_for_nan = float(metrics['total_loss'])
+            _m_total_for_nan = float(metrics['total_loss'])
             if not np.isfinite(_m_total_for_nan):
                 raise ValueError(
                     f"NaN/INF total_loss at epoch {epoch}, step {global_step + 1}")
 
-            if spike_event_logger:
-                _event_step = global_step + 1
-                _event_lr = float(schedule(_event_step // grad_accum_steps))
-                _spike_raw = jax.device_get({
-                    'total_loss': metrics['total_loss'],
-                    'ce_loss': metrics['ce_loss'],
-                    'grad_norm': metrics.get('grad_norm', jnp.float32(0.0)),
-                    'grad_global_preclip': metrics.get(
-                        'grad_global_preclip',
-                        metrics.get('grad_norm', jnp.float32(0.0))),
-                    'grad_global_postclip': metrics.get(
-                        'grad_global_postclip', jnp.float32(0.0)),
-                    'debug_logit_max': metrics.get(
-                        'debug_logit_max', jnp.float32(0.0)),
-                    'per_layer_attn_out_norm': metrics.get(
-                        'per_layer_attn_out_norm', jnp.zeros(1)),
-                    'per_layer_rst_out_norm': metrics.get(
-                        'per_layer_rst_out_norm', jnp.zeros(1)),
-                    'attn_q_active_n_mean': metrics.get(
-                        'attn_q_active_n_mean', jnp.float32(0.0)),
-                    'attn_k_active_n_mean': metrics.get(
-                        'attn_k_active_n_mean', jnp.float32(0.0)),
-                    'attn_qk_active_n_mean': metrics.get(
-                        'attn_qk_active_n_mean', jnp.float32(0.0)),
-                    'attn_v_active_n_mean': metrics.get(
-                        'attn_v_active_n_mean', jnp.float32(0.0)),
-                    'attn_active_n_mean': metrics.get(
-                        'attn_active_n_mean', jnp.float32(0.0)),
-                    'rst_active_n_mean': metrics.get(
-                        'rst_active_n_mean', jnp.float32(0.0)),
-                    'attn_qk_no_active_frac': metrics.get(
-                        'attn_qk_no_active_frac',
-                        metrics.get('attn_no_active_frac', jnp.float32(0.0))),
-                    'attn_v_no_active_frac': metrics.get(
-                        'attn_v_no_active_frac',
-                        metrics.get('attn_no_active_frac', jnp.float32(0.0))),
-                    'rst_no_active_frac': metrics.get(
-                        'rst_no_active_frac', jnp.float32(0.0)),
-                    'attn_qk_top1_gate_frac_max': metrics.get(
-                        'attn_qk_top1_gate_frac_max',
-                        metrics.get('attn_top1_gate_frac_max',
-                                    jnp.float32(0.0))),
-                    'attn_v_top1_gate_frac_max': metrics.get(
-                        'attn_v_top1_gate_frac_max',
-                        metrics.get('attn_top1_gate_frac_max',
-                                    jnp.float32(0.0))),
-                    'rst_top1_gate_frac_max': metrics.get(
-                        'rst_top1_gate_frac_max', jnp.float32(0.0)),
-                    'attn_qk_gate_den_sum_mean': metrics.get(
-                        'attn_qk_gate_den_sum_mean',
-                        metrics.get('attn_gate_den_sum_mean',
-                                    jnp.float32(0.0))),
-                    'attn_v_gate_den_sum_mean': metrics.get(
-                        'attn_v_gate_den_sum_mean',
-                        metrics.get('attn_gate_den_sum_mean',
-                                    jnp.float32(0.0))),
-                    'rst_gate_den_sum_mean': metrics.get(
-                        'rst_gate_den_sum_mean', jnp.float32(0.0)),
-                    'grad_token_emb': metrics.get(
-                        'grad_token_emb', jnp.float32(0.0)),
-                    'grad_pos_emb': metrics.get(
-                        'grad_pos_emb', jnp.float32(0.0)),
-                    'grad_router_proj_attn': metrics.get(
-                        'grad_router_proj_attn', jnp.float32(0.0)),
-                    'grad_router_proj_rst': metrics.get(
-                        'grad_router_proj_rst', jnp.float32(0.0)),
-                    'grad_router_raw_tau_qk': metrics.get(
-                        'grad_router_raw_tau_qk', jnp.float32(0.0)),
-                    'grad_router_raw_tau_v': metrics.get(
-                        'grad_router_raw_tau_v', jnp.float32(0.0)),
-                    'grad_router_raw_tau_rst': metrics.get(
-                        'grad_router_raw_tau_rst', jnp.float32(0.0)),
-                    'grad_pool_attn_qk_read': metrics.get(
-                        'grad_pool_attn_qk_read', jnp.float32(0.0)),
-                    'grad_pool_attn_qk_write': metrics.get(
-                        'grad_pool_attn_qk_write', jnp.float32(0.0)),
-                    'grad_pool_attn_v_read': metrics.get(
-                        'grad_pool_attn_v_read', jnp.float32(0.0)),
-                    'grad_pool_attn_v_write': metrics.get(
-                        'grad_pool_attn_v_write', jnp.float32(0.0)),
-                    'grad_pool_rst_read': metrics.get(
-                        'grad_pool_rst_read', jnp.float32(0.0)),
-                    'grad_pool_rst_write': metrics.get(
-                        'grad_pool_rst_write', jnp.float32(0.0)),
-                    'grad_expand_O': metrics.get(
-                        'grad_expand_O', jnp.float32(0.0)),
-                    'grad_layernorms': metrics.get(
-                        'grad_layernorms', jnp.float32(0.0)),
-                    'grad_expand_O_per_layer': metrics.get(
-                        'grad_expand_O_per_layer', jnp.zeros(1)),
-                    'grad_layernorms_per_layer': metrics.get(
-                        'grad_layernorms_per_layer', jnp.zeros(1)),
-                })
-                _spike_rec = _spike_history_record(
-                    _spike_raw, _event_step, epoch, _event_lr)
-                _spike_reasons = _spike_trigger_reasons(
-                    _spike_rec, spike_thresholds)
-                if int(_event_step) < spike_probe_min_step:
-                    _spike_reasons = []
-                _spike_vec = np.asarray([
-                    float(host_id),
-                    1.0 if _spike_reasons else 0.0,
-                    _spike_rec['grad_pre'],
-                    _spike_rec['ce'],
-                    _spike_rec['lm_logit_abs_max'],
-                    _spike_rec['layer_rst_max'],
-                ], dtype=np.float64)
-                _spike_all = process_allgather(_spike_vec)
-                _spike_all_arr = np.asarray(
-                    _spike_all, dtype=np.float64).reshape(-1, 6)
-                _spike_any = bool(np.any(_spike_all_arr[:, 1] >= 0.5))
-                if _spike_any:
-                    _probe_decoded = {}
-                    if spike_probe_step_fn is not None and _pre_step_params is not None:
-                        _probe_raw = jax.device_get(spike_probe_step_fn(
-                            _pre_step_params, input_ids, attention_mask,
-                            step_rng, jnp.asarray(_event_step, dtype=jnp.int32)))
-                        _probe_decoded = _decode_spike_probe(_probe_raw)
-                        del _probe_raw
-                    if is_host0:
-                        _event = {
-                            'type': 'spike_event',
-                            'step': int(_event_step),
-                            'epoch': int(epoch),
-                            'process_index': int(host_id),
-                            'timestamp': datetime.now().isoformat(),
-                            'trigger': {
-                                'reasons': list(_spike_reasons),
-                                'thresholds': dict(spike_thresholds),
-                                'host_trigger_summary': (
-                                    _spike_all_arr.tolist()),
-                            },
-                            'metrics': _spike_rec,
-                            'grad_evidence': _spike_grad_evidence(_spike_raw),
-                            'history': list(spike_metric_history),
-                            'probe': _probe_decoded,
-                        }
-                        _diag_ctx = {
-                            'intensity_beta': (
-                                0.0
-                                if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-                                else float(tcfg.get('intensity_beta', 0.0))),
-                            'd_route_unified': (
-                                int(cfg['model'].get('d_route', 0))
-                                if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-                                else 0),
-                        }
-                        _event['diagnosis'] = _diagnose_spike(
-                            _spike_rec, _probe_decoded,
-                            spike_thresholds, _diag_ctx)
-                        log_spike_message(_format_spike_text(_event))
-                        log_spike_jsonl(_event)
-                        sync_logs()
-                if spike_history_steps > 0:
-                    spike_metric_history.append(dict(_spike_rec))
-                    if len(spike_metric_history) > spike_history_steps:
-                        spike_metric_history = (
-                            spike_metric_history[-spike_history_steps:])
-
             global_step += 1
             epoch_step_counter += 1
-
-            if crash_snapshot_enabled and _crash_probe is not None:
-                _crash_rec = {
-                    k: _jsonable_diag_value(v) for k, v in _crash_probe.items()
-                }
-                _crash_rec.update({
-                    'step': global_step,
-                    'epoch': epoch,
-                    'process_index': int(host_id),
-                    'timestamp': datetime.now().isoformat(),
-                })
-                _crash_reasons = _severe_collapse_reasons(
-                    _crash_rec,
-                    grad_threshold=collapse_grad_threshold,
-                    loss_minus_ce_threshold=collapse_loss_minus_ce_threshold,
-                    ce_extreme_threshold=collapse_ce_extreme_threshold,
-                    ce_grad_ce_threshold=collapse_ce_grad_ce_threshold,
-                    ce_grad_grad_threshold=collapse_ce_grad_grad_threshold)
-                _crash_rec = _annotate_crash_record(_crash_rec, _crash_reasons)
-                if crash_history_steps > 0:
-                    crash_metric_history.append(dict(_crash_rec))
-                    if len(crash_metric_history) > crash_history_steps:
-                        crash_metric_history = crash_metric_history[-crash_history_steps:]
-
-                _trigger_vec = _host_trigger_vector(
-                    host_id, _crash_rec, _crash_reasons)
-                _trigger_all = process_allgather(_trigger_vec)
-                _host_trigger_summary = _decode_host_trigger_summary(_trigger_all)
-                _crash_any = any(row.get('triggered') for row in _host_trigger_summary)
-                if _crash_any:
-                    # All hosts enter the collective snapshot path. Host 0
-                    # writes the replicated checkpoint; every host writes its
-                    # own metric history/current metrics for diagnosis.
-                    _trigger_on_this_host = bool(_crash_reasons)
-                    _save_reasons = (list(_crash_reasons) if _crash_reasons
-                                     else ['collapse_on_other_host'])
-                    _full_crash_metrics = _full_metrics_record(
-                        metrics, global_step, epoch, host_id)
-                    _full_crash_metrics = _annotate_crash_record(
-                        _full_crash_metrics,
-                        _crash_reasons if _trigger_on_this_host else [])
-                    _save_crash_snapshot(
-                        global_step, epoch, epoch_step_counter,
-                        _pre_step_params, _pre_step_opt_state,
-                        params, opt_state, _crash_batch_ids, _crash_batch_mask,
-                        _crash_rec, _save_reasons,
-                        local_history=crash_metric_history,
-                        full_metrics_rec=_full_crash_metrics,
-                        host_trigger_summary=_host_trigger_summary,
-                        trigger_on_this_host=_trigger_on_this_host)
-                    sync_logs()
-                    if stop_on_collapse:
-                        raise RuntimeError(
-                            f"Severe collapse snapshot saved at step {global_step}: "
-                            f"{','.join(_save_reasons)}")
 
             # ---- REGULAR periodic logging ----
             # ANALYSIS is driven from the val path (below), not from here -
@@ -13994,8 +13033,6 @@ def main():
             is_debug_log = (
                 debug_mode and global_step > 0
                 and (global_step % debug_interval == 0))
-
-            debug_forward_result = None
 
             if is_regular:
                 # Refresh emb-drift snapshot on every host (ref reassignment
@@ -14264,9 +13301,6 @@ def main():
                     debug_metrics, debug_avgs, debug_ctx, global_step, epoch)
                 debug_rec = _attach_update_cap_window_stats(
                     debug_rec, jax.device_get(_debug_cap_window_jax))
-                if debug_forward_result is not None:
-                    debug_rec = _attach_debug_forward_record(
-                        debug_rec, jax.device_get(debug_forward_result))
                 _print_debug_block(debug_rec, debug_ctx)
                 log_debug_jsonl({'type': 'debug_train', **debug_rec})
                 sync_logs()
