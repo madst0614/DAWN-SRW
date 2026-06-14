@@ -1,23 +1,16 @@
 """
-DAWN v17.1-JAX Training Script (TPU Multi-Device)
+DAWN-SRW v4.1.6.4 JAX trainer (TPU multi-device).
 
-JAX/Flax native training for DAWN v17.1 model.
-- Multi-device data parallelism via jax.pmap
-- Pure numpy/JAX data pipeline (no PyTorch dependency)
-- GCS checkpoint support for TPU spot instances
+Official v4164 training path:
+- model version is fixed to spatial-r1-v4.1.6.4
+- JAX/Flax SPMD training with sharded SRW pools
+- GCS checkpoint support and auto-resume
 - optax optimizer with warmup + cosine decay
-- jax.jit / jax.pmap compiled train/eval steps
-- Auto-resume: automatically finds latest checkpoint in config's checkpoint_dir
 
 Usage:
-    # Just provide config - auto-resumes if checkpoint exists, otherwise starts fresh
-    python scripts/train_jax.py --config configs/train_config_tpu.yaml
-
-    # Resume from a specific run folder or .flax checkpoint
-    python scripts/train_jax.py --config configs/train_config_tpu.yaml --resume gs://.../run_v...
-
-    # Force start from scratch (ignores existing checkpoints)
-    python scripts/train_jax.py --config configs/train_config_tpu.yaml --from-scratch
+    python scripts/train_jax.py --config configs/train_config_v4164_40M_c4_5B_ggauss_boundary_panneal.yaml
+    python scripts/train_jax.py --config configs/train_config_v4164_40M_c4_5B_ggauss_boundary_panneal.yaml --resume gs://.../run_v...
+    python scripts/train_jax.py --config configs/train_config_v4164_40M_c4_5B_ggauss_boundary_panneal.yaml --from-scratch
 """
 
 import sys
@@ -264,7 +257,7 @@ def _attach_update_cap_window_stats(rec, window_stats):
     return rec
 
 
-def _format_update_cap_window_line(rec, indent="  ", is_v4160=False):
+def _format_update_cap_window_line(rec, indent="  ", is_v4164=False):
     def _g(key, default=0.0):
         val = rec.get(key, default)
         if val is None:
@@ -279,11 +272,11 @@ def _format_update_cap_window_line(rec, indent="  ", is_v4160=False):
     scale_parts = []
     hit_total = 0.0
     for group_name, label, _, _, _, pre_kind in UPDATE_CAP_GROUP_SPECS:
-        if is_v4160 and group_name in ('tau_attn', 'tau_rst'):
+        if is_v4164 and group_name in ('tau_attn', 'tau_rst'):
             continue
-        if (not is_v4160) and group_name.startswith('raw_tau_'):
+        if (not is_v4164) and group_name.startswith('raw_tau_'):
             continue
-        if (is_v4160 and group_name.startswith('raw_tau_')
+        if (is_v4164 and group_name.startswith('raw_tau_')
                 and _g('update_cap_raw_tau_enabled') <= 0.0):
             continue
         hit_parts.append(
@@ -427,7 +420,7 @@ def _v4164_base_kwargs(cfg):
 
 
 def _v4164_model_base_kwargs(cfg):
-    """v4.1.5.2 active path: d_route-only routing."""
+    """v4164 d_route-only routing kwargs."""
     kw = _v4164_base_kwargs(cfg)
     m = cfg['model']
     d_route = m.get('d_route')
@@ -1612,28 +1605,28 @@ def _pool_update_diagnostics(params, grads):
 
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
-                      exploration_weight, exploration_asymmetry,
-                      exploration_weight_q,
-                      exploration_weight_k,
-                      exploration_weight_v,
-                      exploration_weight_rst,
+                      inactive_aux_weight, inactive_aux_asymmetry,
+                      inactive_aux_weight_q,
+                      inactive_aux_weight_k,
+                      inactive_aux_weight_v,
+                      inactive_aux_weight_rst,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       weight_decay=0.0, pool_weight_decay=0.0,
-                      exploration_warmup_steps=5000,
-                      exploration_lower_bound=-0.5,
-                      exploration_upper_bound=2.0,
-                      exploration_bound_eps=1.0e-3,
-                      exploration_dev_mode='raw',
-                      exploration_ce_clip_std=2.0,
-                      exploration_z_clip=2.0,
-                      exploration_z_tanh=True,
-                      exploration_weighted_clip=0.0,
-                      exploration_normalize_by_layers=False,
-                      exploration_asymmetry_q=None,
-                      exploration_asymmetry_k=None,
-                      exploration_asymmetry_v=None,
-                      exploration_asymmetry_rst=None,
-                      rpe_enabled=True,
+                      inactive_aux_warmup_steps=5000,
+                      inactive_aux_lower_bound=-0.5,
+                      inactive_aux_upper_bound=2.0,
+                      inactive_aux_bound_eps=1.0e-3,
+                      inactive_aux_dev_mode='raw',
+                      inactive_aux_ce_clip_std=2.0,
+                      inactive_aux_z_clip=2.0,
+                      inactive_aux_z_tanh=True,
+                      inactive_aux_weighted_clip=0.0,
+                      inactive_aux_normalize_by_layers=False,
+                      inactive_aux_asymmetry_q=None,
+                      inactive_aux_asymmetry_k=None,
+                      inactive_aux_asymmetry_v=None,
+                      inactive_aux_asymmetry_rst=None,
+                      inactive_aux_enabled=True,
                       dead_penalty_qk_weight=0.0,
                       dead_penalty_v_weight=0.0,
                       dead_penalty_rst_weight=0.0,
@@ -1687,34 +1680,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       soft_gate_boundary_power_mid_frac=0.800,
                       soft_gate_boundary_power_final_frac=0.950,
                       admission_den_power=1.0,
-                      rpe_start_frac=0.0,
-                      rpe_full_frac=0.0,
-                      rpe_schedule='linear',
-                      is_baseline=False, is_spatial=False,
+                      inactive_aux_start_frac=0.0,
+                      inactive_aux_full_frac=0.0,
+                      inactive_aux_schedule='linear',
+                      is_baseline=False,
                       sharded_fns=None, mesh=None,
                       debug_diagnostics=False,
                       compact_train_metrics=False,
                       keep_train_layer_metrics=False):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
 
-    v4.1 explore (redesigned): no EMA, no warmup. For every step compute
-    a batch-global per-token CE mean, define
-        deviation = per_token_ce - sg(global_mean_ce)
-        signal    = where(deviation > 0, deviation, asymmetry 쨌 deviation)
-    and add
-        explore_loss = 貫 쨌 valid_weighted_mean(signal 쨌 誇 tau_offset)
-    to total_loss.  Positive deviations (surprising tokens) push
-    tau_offset DOWN at full intensity; negative deviations (easy tokens)
-    push UP at `exploration_asymmetry` of the intensity.  The global mean
-    baseline makes the net push roughly zero-sum each batch, so tau does
-    not accumulate monotonically.
-
-    `mesh` is required when the v4.1 exploration loss is active -the
-    per-batch global mean is computed via a small shard_map.
+    Disabled auxiliary path retained for metric compatibility.
     """
     # Shard_map'd valid-weighted global statistics reducer. Inputs are
     # sharded on 'data' (batch-parallel); psum aggregates across shards + hosts.
-    # The mean/std pair lets exploration use a bounded robust z-score instead
     # of raw CE deviations, which prevents a few easy/hard outlier tokens from
     # applying a very large auxiliary control signal to router tau.
     _global_mean_std_reducer = None
@@ -1739,41 +1718,41 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return mean, std
         _global_mean_std_reducer = _mean_std_reducer_fn
 
-    _explore_weight_q = jnp.float32(
-        exploration_weight if exploration_weight_q is None else exploration_weight_q)
-    _explore_weight_k = jnp.float32(
-        exploration_weight if exploration_weight_k is None else exploration_weight_k)
-    _explore_weight_v = jnp.float32(
-        exploration_weight if exploration_weight_v is None else exploration_weight_v)
-    _explore_weight_rst = jnp.float32(
-        exploration_weight if exploration_weight_rst is None else exploration_weight_rst)
+    _inactive_aux_weight_q = jnp.float32(
+        inactive_aux_weight if inactive_aux_weight_q is None else inactive_aux_weight_q)
+    _inactive_aux_weight_k = jnp.float32(
+        inactive_aux_weight if inactive_aux_weight_k is None else inactive_aux_weight_k)
+    _inactive_aux_weight_v = jnp.float32(
+        inactive_aux_weight if inactive_aux_weight_v is None else inactive_aux_weight_v)
+    _inactive_aux_weight_rst = jnp.float32(
+        inactive_aux_weight if inactive_aux_weight_rst is None else inactive_aux_weight_rst)
     _asym_q = jnp.float32(
-        exploration_asymmetry
-        if exploration_asymmetry_q is None else exploration_asymmetry_q)
+        inactive_aux_asymmetry
+        if inactive_aux_asymmetry_q is None else inactive_aux_asymmetry_q)
     _asym_k = jnp.float32(
-        exploration_asymmetry
-        if exploration_asymmetry_k is None else exploration_asymmetry_k)
+        inactive_aux_asymmetry
+        if inactive_aux_asymmetry_k is None else inactive_aux_asymmetry_k)
     _asym_v = jnp.float32(
-        exploration_asymmetry
-        if exploration_asymmetry_v is None else exploration_asymmetry_v)
+        inactive_aux_asymmetry
+        if inactive_aux_asymmetry_v is None else inactive_aux_asymmetry_v)
     _asym_rst = jnp.float32(
-        exploration_asymmetry
-        if exploration_asymmetry_rst is None else exploration_asymmetry_rst)
+        inactive_aux_asymmetry
+        if inactive_aux_asymmetry_rst is None else inactive_aux_asymmetry_rst)
     _asym = (_asym_q + _asym_k + _asym_v + _asym_rst) / jnp.float32(4.0)
-    _explore_lower = jnp.float32(exploration_lower_bound)
-    _explore_upper = jnp.float32(exploration_upper_bound)
-    _explore_eps = jnp.float32(exploration_bound_eps)
-    _warmup_steps = jnp.int32(exploration_warmup_steps)
-    _explore_dev_mode = str(exploration_dev_mode).lower()
-    _explore_use_bounded_z = _explore_dev_mode in ('bounded_z', 'robust_z', 'z')
-    _explore_ce_clip_std = jnp.float32(exploration_ce_clip_std)
-    _explore_z_clip = jnp.float32(exploration_z_clip)
-    _explore_z_tanh = bool(exploration_z_tanh)
-    _explore_weighted_clip = jnp.float32(exploration_weighted_clip)
-    _explore_norm_by_layers = bool(exploration_normalize_by_layers)
-    _explore_norm_by_layers_f = jnp.float32(
-        1.0 if _explore_norm_by_layers else 0.0)
-    _rpe_enabled = bool(rpe_enabled)
+    _inactive_aux_lower = jnp.float32(inactive_aux_lower_bound)
+    _inactive_aux_upper = jnp.float32(inactive_aux_upper_bound)
+    _inactive_aux_eps = jnp.float32(inactive_aux_bound_eps)
+    _warmup_steps = jnp.int32(inactive_aux_warmup_steps)
+    _inactive_aux_dev_mode = str(inactive_aux_dev_mode).lower()
+    _inactive_aux_use_bounded_z = _inactive_aux_dev_mode in ('bounded_z', 'robust_z', 'z')
+    _inactive_aux_ce_clip_std = jnp.float32(inactive_aux_ce_clip_std)
+    _inactive_aux_z_clip = jnp.float32(inactive_aux_z_clip)
+    _inactive_aux_z_tanh = bool(inactive_aux_z_tanh)
+    _inactive_aux_weighted_clip = jnp.float32(inactive_aux_weighted_clip)
+    _inactive_aux_norm_by_layers = bool(inactive_aux_normalize_by_layers)
+    _inactive_aux_norm_by_layers_f = jnp.float32(
+        1.0 if _inactive_aux_norm_by_layers else 0.0)
+    _inactive_aux_enabled = bool(inactive_aux_enabled)
     _dead_penalty_qk_weight = jnp.float32(dead_penalty_qk_weight)
     _dead_penalty_v_weight = jnp.float32(dead_penalty_v_weight)
     _dead_penalty_rst_weight = jnp.float32(dead_penalty_rst_weight)
@@ -1836,21 +1815,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         str(_model_version) == OFFICIAL_MODEL_VERSION)
     if _is_soft_direct_tau:
         # v4164 soft DirectTau paths keep the loss surface
-        # auditable: CE + scheduled RPE only. Hard-boundary dead repair
         # and CB1A/boundary auxiliaries are disabled for v4164.
         _cb1a_enabled = False
         _dead_penalty_qk_weight = jnp.float32(0.0)
         _dead_penalty_v_weight = jnp.float32(0.0)
         _dead_penalty_rst_weight = jnp.float32(0.0)
         _dead_weighted_clip = jnp.float32(0.0)
-        _explore_norm_by_layers = True
-        _explore_norm_by_layers_f = jnp.float32(1.0)
+        _inactive_aux_norm_by_layers = True
+        _inactive_aux_norm_by_layers_f = jnp.float32(1.0)
     # v4.1.6.1 now runs CB1A together with the bounded
-    # RPE/exploration auxiliary.  CB1A remains aux-only/stopgrad-protected,
-    # while RPE provides the weak easy-token sparsity / hard-token relaxation
-    # pressure.  Do not hard-disable _rpe_enabled by version here; respect the
     # training config/defaults prepared in main().
-    _rpe_requires_no_active_direct = False
+    _inactive_aux_requires_no_active_direct = False
 
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active and _is_soft_direct_tau)
@@ -1895,9 +1870,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
     _admission_den_power = jnp.float32(admission_den_power)
-    _rpe_start_frac = jnp.float32(rpe_start_frac)
-    _rpe_full_frac = jnp.float32(rpe_full_frac)
-    _rpe_schedule = str(rpe_schedule).lower()
+    _inactive_aux_start_frac = jnp.float32(inactive_aux_start_frac)
+    _inactive_aux_full_frac = jnp.float32(inactive_aux_full_frac)
+    _inactive_aux_schedule = str(inactive_aux_schedule).lower()
     _compact_train_metrics = bool(compact_train_metrics)
     _keep_train_layer_metrics = bool(keep_train_layer_metrics)
     _heavy_keys = {
@@ -1935,15 +1910,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     step, _total_training_steps, _soft_gate_pool_cfg['v'])
                 soft_gate_T_rst = _scheduled_from_config(
                     step, _total_training_steps, _soft_gate_pool_cfg['rst'])
-                rpe_schedule_scale = _scheduled_scalar(
+                inactive_aux_schedule_scale = _scheduled_scalar(
                     step, _total_training_steps,
-                    0.0, 1.0, _rpe_start_frac, _rpe_full_frac,
-                    _rpe_schedule)
+                    0.0, 1.0, _inactive_aux_start_frac, _inactive_aux_full_frac,
+                    _inactive_aux_schedule)
             else:
                 soft_gate_T_qk = jnp.float32(0.07)
                 soft_gate_T_v = jnp.float32(0.07)
                 soft_gate_T_rst = jnp.float32(0.07)
-                rpe_schedule_scale = (step >= _warmup_steps).astype(jnp.float32)
+                inactive_aux_schedule_scale = (step >= _warmup_steps).astype(jnp.float32)
             boundary_power_p = scheduled_boundary_power_by_frac(
                 step, _total_training_steps,
                 _boundary_power_schedule_active and _is_boundary_power_model,
@@ -1999,49 +1974,46 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 dead_penalty = dead_penalty_unweighted
                 dead_penalty_weighted_unclipped = (
                     jnp.float32(dead_penalty_weight) * dead_penalty)
-            # v4.1 batch-global-mean exploration loss.
             per_token_ce = result.get('per_token_ce', None)
             attn_tau_off = result.get('attn_tau_direct', result.get('attn_tau_offset', None))
             rst_tau_off = result.get('rst_tau_direct', result.get('rst_tau_offset', None))
             attn_no_active = result.get('attn_no_active_direct', None)
             rst_no_active = result.get('rst_no_active_direct', None)
             valid_mask = result.get('valid_mask', None)
-            if (_rpe_enabled and _rpe_requires_no_active_direct
+            if (_inactive_aux_enabled and _inactive_aux_requires_no_active_direct
                     and (attn_no_active is None or rst_no_active is None)):
                 raise ValueError(
-                    "v4.1.6.0 RPE requires attn_no_active_direct and "
-                    "rst_no_active_direct from the model.")
-            have_explore = (_rpe_enabled
+                    "The disabled auxiliary path requires attn_no_active_direct "
+                    "and rst_no_active_direct from the model.")
+            have_inactive_aux = (_inactive_aux_enabled
                             and per_token_ce is not None
                             and attn_tau_off is not None
                             and rst_tau_off is not None
-                            and (not _rpe_requires_no_active_direct
+                            and (not _inactive_aux_requires_no_active_direct
                                  or (attn_no_active is not None
                                      and rst_no_active is not None))
                             and valid_mask is not None
                             and _global_mean_std_reducer is not None)
-            if have_explore:
+            if have_inactive_aux:
                 vmask_f = valid_mask.astype(jnp.float32)
-                # CE-based exploration is measurement feedback only. Keep CE's
-                # own gradient path through ce_loss, not through RPE/explore.
                 ce_sg = jax.lax.stop_gradient(per_token_ce.astype(jnp.float32))
                 mean_ce0, std_ce0 = _global_mean_std_reducer(ce_sg, valid_mask)
-                if _explore_use_bounded_z:
+                if _inactive_aux_use_bounded_z:
                     # Robust center/scale: first clip extreme CE tokens using
                     # global mean/std, then recompute a clipped mean/std.  This
                     # prevents a few hard/easy tokens from shifting the batch
                     # baseline and creating a huge one-step tau control signal.
-                    clip_lo = mean_ce0 - _explore_ce_clip_std * std_ce0
-                    clip_hi = mean_ce0 + _explore_ce_clip_std * std_ce0
+                    clip_lo = mean_ce0 - _inactive_aux_ce_clip_std * std_ce0
+                    clip_hi = mean_ce0 + _inactive_aux_ce_clip_std * std_ce0
                     ce_clip = jnp.clip(ce_sg, clip_lo, clip_hi)
                     global_mean_ce, global_std_ce = _global_mean_std_reducer(
                         ce_clip, valid_mask)
                     raw_deviation = ce_sg - jax.lax.stop_gradient(global_mean_ce)
                     z = raw_deviation / (jax.lax.stop_gradient(global_std_ce) + 1e-8)
-                    if _explore_z_tanh:
-                        deviation = _explore_z_clip * jnp.tanh(z / _explore_z_clip)
+                    if _inactive_aux_z_tanh:
+                        deviation = _inactive_aux_z_clip * jnp.tanh(z / _inactive_aux_z_clip)
                     else:
-                        deviation = jnp.clip(z, -_explore_z_clip, _explore_z_clip)
+                        deviation = jnp.clip(z, -_inactive_aux_z_clip, _inactive_aux_z_clip)
                     deviation = jax.lax.stop_gradient(deviation)
                 else:
                     global_mean_ce = jax.lax.stop_gradient(mean_ce0)
@@ -2059,8 +2031,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 signal_rst = jax.lax.stop_gradient(
                     jnp.where(deviation > 0, deviation, _asym_rst * deviation))
 
-                # v4.1+ per-token/layer/route bounded explore. tau_offset is
-                # NOT clipped (CE keeps full gradient); only the explore-loss
                 # contribution is turned off per-element when further push in
                 # that direction would breach [lower, upper].
                 # attn_tau_off shape [L, B, S, 3]; rst_tau_off [L, B, S, 1].
@@ -2074,7 +2044,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     k_no_active_t = jnp.zeros_like(k_tau_t, dtype=jnp.bool_)
                 else:
                     k_no_active_t = rst_no_active[:, :, :-1, :]
-                explore_layer_count = jnp.float32(a_tau_t.shape[0])
+                inactive_aux_layer_count = jnp.float32(a_tau_t.shape[0])
                 a_dev_b = jnp.stack(
                     (signal_q, signal_k, signal_v), axis=-1)[None, :, :, :]
                 k_dev_b = signal_rst[None, :, :, None]
@@ -2099,11 +2069,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # Per-element bound-hit masks. Hard off, not soft decay.
                 # The block decision is measurement feedback; the loss below
                 # still differentiates through the original tau_offset tensor.
-                a_down_off = (a_dev_b > 0) & (a_tau_ref <= _explore_lower + _explore_eps)
-                a_up_off   = (a_dev_b < 0) & (a_tau_ref >= _explore_upper - _explore_eps)
+                a_down_off = (a_dev_b > 0) & (a_tau_ref <= _inactive_aux_lower + _inactive_aux_eps)
+                a_up_off   = (a_dev_b < 0) & (a_tau_ref >= _inactive_aux_upper - _inactive_aux_eps)
                 a_off_mask = jax.lax.stop_gradient(a_down_off | a_up_off)
-                k_down_off = (k_dev_b > 0) & (k_tau_ref <= _explore_lower + _explore_eps)
-                k_up_off   = (k_dev_b < 0) & (k_tau_ref >= _explore_upper - _explore_eps)
+                k_down_off = (k_dev_b > 0) & (k_tau_ref <= _inactive_aux_lower + _inactive_aux_eps)
+                k_up_off   = (k_dev_b < 0) & (k_tau_ref >= _inactive_aux_upper - _inactive_aux_eps)
                 k_off_mask = jax.lax.stop_gradient(k_down_off | k_up_off)
 
                 a_active = jax.lax.stop_gradient(jnp.where(a_off_mask, 0.0, 1.0))
@@ -2126,9 +2096,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # Per-element contribution -reduce. Gradient flows through
                 # the tau_offset tensor only (signal is stop_gradient'd).
                 vsum_eps = vmask_f.sum() + 1e-8
-                explore_norm = vsum_eps
-                if _explore_norm_by_layers:
-                    explore_norm = explore_norm * explore_layer_count
+                inactive_aux_norm = vsum_eps
+                if _inactive_aux_norm_by_layers:
+                    inactive_aux_norm = inactive_aux_norm * inactive_aux_layer_count
                 a_contrib_pre = a_dev_b * a_tau_t * vmask_b
                 k_contrib_pre = k_dev_b * k_tau_t * vmask_b
                 a_contrib = a_contrib_pre * a_active
@@ -2139,22 +2109,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 a_q_contrib = a_contrib[..., 0:1]
                 a_k_contrib = a_contrib[..., 1:2]
                 a_v_contrib = a_contrib[..., 2:3]
-                explore_q_pre_bound = a_q_contrib_pre.sum() / explore_norm
-                explore_k_pre_bound = a_k_contrib_pre.sum() / explore_norm
-                explore_qk_pre_bound = (
-                    explore_q_pre_bound + explore_k_pre_bound)
-                explore_v_pre_bound = a_v_contrib_pre.sum() / explore_norm
-                explore_attn_pre_bound = a_contrib_pre.sum() / explore_norm
-                explore_rst_pre_bound = k_contrib_pre.sum() / explore_norm
-                explore_loss_pre_bound = (
-                    explore_attn_pre_bound + explore_rst_pre_bound)
-                explore_q_raw = a_q_contrib.sum() / explore_norm
-                explore_k_raw = a_k_contrib.sum() / explore_norm
-                explore_qk_raw = explore_q_raw + explore_k_raw
-                explore_v_raw = a_v_contrib.sum() / explore_norm
-                explore_attn_raw = a_contrib.sum() / explore_norm
-                explore_rst_raw = k_contrib.sum() / explore_norm
-                explore_loss_raw = explore_attn_raw + explore_rst_raw
+                inactive_aux_q_pre_bound = a_q_contrib_pre.sum() / inactive_aux_norm
+                inactive_aux_k_pre_bound = a_k_contrib_pre.sum() / inactive_aux_norm
+                inactive_aux_qk_pre_bound = (
+                    inactive_aux_q_pre_bound + inactive_aux_k_pre_bound)
+                inactive_aux_v_pre_bound = a_v_contrib_pre.sum() / inactive_aux_norm
+                inactive_aux_attn_pre_bound = a_contrib_pre.sum() / inactive_aux_norm
+                inactive_aux_rst_pre_bound = k_contrib_pre.sum() / inactive_aux_norm
+                inactive_aux_loss_pre_bound = (
+                    inactive_aux_attn_pre_bound + inactive_aux_rst_pre_bound)
+                inactive_aux_q_raw = a_q_contrib.sum() / inactive_aux_norm
+                inactive_aux_k_raw = a_k_contrib.sum() / inactive_aux_norm
+                inactive_aux_qk_raw = inactive_aux_q_raw + inactive_aux_k_raw
+                inactive_aux_v_raw = a_v_contrib.sum() / inactive_aux_norm
+                inactive_aux_attn_raw = a_contrib.sum() / inactive_aux_norm
+                inactive_aux_rst_raw = k_contrib.sum() / inactive_aux_norm
+                inactive_aux_loss_raw = inactive_aux_attn_raw + inactive_aux_rst_raw
 
                 # Observational stats (same interface as before).
                 pos_mask = (deviation > 0).astype(jnp.float32) * vmask_f
@@ -2173,16 +2143,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _key_tot = vmask_b.sum() * a_tau_t.shape[0]
                 _v_tot = vmask_b.sum() * a_tau_t.shape[0]
                 _k_tot = vmask_b.sum() * k_tau_t.shape[0] * k_tau_t.shape[-1]
-                rpe_no_active_easy_shutoff_q = jax.lax.stop_gradient(
+                inactive_aux_no_active_easy_shutoff_q = jax.lax.stop_gradient(
                     (a_easy_shutoff[..., 0:1].astype(jnp.float32)
                      * vmask_b).sum() / (_q_tot + 1e-8))
-                rpe_no_active_easy_shutoff_k = jax.lax.stop_gradient(
+                inactive_aux_no_active_easy_shutoff_k = jax.lax.stop_gradient(
                     (a_easy_shutoff[..., 1:2].astype(jnp.float32)
                      * vmask_b).sum() / (_key_tot + 1e-8))
-                rpe_no_active_easy_shutoff_v = jax.lax.stop_gradient(
+                inactive_aux_no_active_easy_shutoff_v = jax.lax.stop_gradient(
                     (a_easy_shutoff[..., 2:3].astype(jnp.float32)
                      * vmask_b).sum() / (_v_tot + 1e-8))
-                rpe_no_active_easy_shutoff_rst = jax.lax.stop_gradient(
+                inactive_aux_no_active_easy_shutoff_rst = jax.lax.stop_gradient(
                     (k_easy_shutoff.astype(jnp.float32) * vmask_b).sum()
                     / (_k_tot + 1e-8))
                 block_frac_a = jax.lax.stop_gradient(
@@ -2209,22 +2179,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 dev_neg_max = (-_dev_sg).max()
             else:
                 global_mean_ce = jnp.float32(0.0)
-                explore_loss_raw = jnp.float32(0.0)
-                explore_q_raw = jnp.float32(0.0)
-                explore_k_raw = jnp.float32(0.0)
-                explore_qk_raw = jnp.float32(0.0)
-                explore_v_raw = jnp.float32(0.0)
-                explore_attn_raw = jnp.float32(0.0)
-                explore_rst_raw = jnp.float32(0.0)
-                explore_loss_pre_bound = jnp.float32(0.0)
-                explore_q_pre_bound = jnp.float32(0.0)
-                explore_k_pre_bound = jnp.float32(0.0)
-                explore_qk_pre_bound = jnp.float32(0.0)
-                explore_v_pre_bound = jnp.float32(0.0)
-                explore_attn_pre_bound = jnp.float32(0.0)
-                explore_rst_pre_bound = jnp.float32(0.0)
-                explore_layer_count = jnp.float32(_local_layers)
-                explore_norm = jnp.float32(0.0)
+                inactive_aux_loss_raw = jnp.float32(0.0)
+                inactive_aux_q_raw = jnp.float32(0.0)
+                inactive_aux_k_raw = jnp.float32(0.0)
+                inactive_aux_qk_raw = jnp.float32(0.0)
+                inactive_aux_v_raw = jnp.float32(0.0)
+                inactive_aux_attn_raw = jnp.float32(0.0)
+                inactive_aux_rst_raw = jnp.float32(0.0)
+                inactive_aux_loss_pre_bound = jnp.float32(0.0)
+                inactive_aux_q_pre_bound = jnp.float32(0.0)
+                inactive_aux_k_pre_bound = jnp.float32(0.0)
+                inactive_aux_qk_pre_bound = jnp.float32(0.0)
+                inactive_aux_v_pre_bound = jnp.float32(0.0)
+                inactive_aux_attn_pre_bound = jnp.float32(0.0)
+                inactive_aux_rst_pre_bound = jnp.float32(0.0)
+                inactive_aux_layer_count = jnp.float32(_local_layers)
+                inactive_aux_norm = jnp.float32(0.0)
                 pos_frac = jnp.float32(0.0)
                 pos_mean = jnp.float32(0.0)
                 neg_mean = jnp.float32(0.0)
@@ -2234,10 +2204,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 block_frac_qk = jnp.float32(0.0)
                 block_frac_v = jnp.float32(0.0)
                 block_frac_rst = jnp.float32(0.0)
-                rpe_no_active_easy_shutoff_q = jnp.float32(0.0)
-                rpe_no_active_easy_shutoff_k = jnp.float32(0.0)
-                rpe_no_active_easy_shutoff_v = jnp.float32(0.0)
-                rpe_no_active_easy_shutoff_rst = jnp.float32(0.0)
+                inactive_aux_no_active_easy_shutoff_q = jnp.float32(0.0)
+                inactive_aux_no_active_easy_shutoff_k = jnp.float32(0.0)
+                inactive_aux_no_active_easy_shutoff_v = jnp.float32(0.0)
+                inactive_aux_no_active_easy_shutoff_rst = jnp.float32(0.0)
                 dev_pos_max = jnp.float32(0.0)
                 dev_neg_max = jnp.float32(0.0)
                 attn_tau_off_min = jnp.float32(0.0)
@@ -2353,21 +2323,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 cb1a_raw = jnp.float32(0.0)
                 cb1a_loss_weighted = jnp.float32(0.0)
 
-            # Warmup gate: zero out explore loss until warmup_steps has passed.
-            # W_sense needs time to settle before exploration signals become
             # meaningful; early CE-dominated learning keeps tau gradient clean.
-            explore_active = rpe_schedule_scale
-            explore_loss_weighted_unclipped = (
-                (_explore_weight_q * explore_q_raw
-                 + _explore_weight_k * explore_k_raw
-                 + _explore_weight_v * explore_v_raw
-                 + _explore_weight_rst * explore_rst_raw)
-                * explore_active)
-            explore_loss_weighted = jnp.where(
-                _explore_weighted_clip > 0.0,
-                jnp.clip(explore_loss_weighted_unclipped,
-                         -_explore_weighted_clip, _explore_weighted_clip),
-                explore_loss_weighted_unclipped)
+            inactive_aux_active = inactive_aux_schedule_scale
+            inactive_aux_loss_weighted_unclipped = (
+                (_inactive_aux_weight_q * inactive_aux_q_raw
+                 + _inactive_aux_weight_k * inactive_aux_k_raw
+                 + _inactive_aux_weight_v * inactive_aux_v_raw
+                 + _inactive_aux_weight_rst * inactive_aux_rst_raw)
+                * inactive_aux_active)
+            inactive_aux_loss_weighted = jnp.where(
+                _inactive_aux_weighted_clip > 0.0,
+                jnp.clip(inactive_aux_loss_weighted_unclipped,
+                         -_inactive_aux_weighted_clip, _inactive_aux_weighted_clip),
+                inactive_aux_loss_weighted_unclipped)
             dead_penalty_weighted = jnp.where(
                 _dead_weighted_clip > 0.0,
                 jnp.minimum(dead_penalty_weighted_unclipped, _dead_weighted_clip),
@@ -2381,15 +2349,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
             if _is_soft_direct_tau:
                 # v4162/v4163 loss surface is intentionally clean:
-                # CE + scheduled RPE only.
                 orth_loss = jnp.float32(0.0)
                 div_loss = jnp.float32(0.0)
-                total_loss = ce_loss + explore_loss_weighted
+                total_loss = ce_loss + inactive_aux_loss_weighted
             elif is_baseline:
                 orth_loss = jnp.float32(0.0)
                 div_loss = jnp.float32(0.0)
                 total_loss = ce_loss
-            elif is_spatial:
+            else:
                 orth_loss = jnp.float32(0.0)
                 div_loss = compute_spatial_diversity_loss(params)
                 total_loss = (ce_loss
@@ -2397,45 +2364,33 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + tau_reg_weight * tau_reg
                               + div_weight * div_loss
                               + dead_penalty_weighted
-                              + explore_loss_weighted
-                              + cb1a_loss_weighted)
-            else:
-                orth_loss = compute_orthogonality_loss(
-                    params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
-                div_loss = compute_knowledge_diversity_loss(params)
-                total_loss = (ce_loss
-                              + lb_weight * aux_loss
-                              + tau_reg_weight * tau_reg
-                              + orth_weight * orth_loss
-                              + div_weight * div_loss
-                              + dead_penalty_weighted
-                              + explore_loss_weighted
+                              + inactive_aux_loss_weighted
                               + cb1a_loss_weighted)
 
-            explore_stats = dict(
+            inactive_aux_stats = dict(
                 global_mean_ce=global_mean_ce,
-                explore_loss_raw=explore_loss_raw,
-                explore_q_raw=explore_q_raw,
-                explore_k_raw=explore_k_raw,
-                explore_qk_raw=explore_qk_raw,
-                explore_v_raw=explore_v_raw,
-                explore_attn_raw=explore_attn_raw,
-                explore_rst_raw=explore_rst_raw,
-                explore_loss_pre_bound=explore_loss_pre_bound,
-                explore_q_pre_bound=explore_q_pre_bound,
-                explore_k_pre_bound=explore_k_pre_bound,
-                explore_qk_pre_bound=explore_qk_pre_bound,
-                explore_v_pre_bound=explore_v_pre_bound,
-                explore_attn_pre_bound=explore_attn_pre_bound,
-                explore_rst_pre_bound=explore_rst_pre_bound,
+                inactive_aux_loss_raw=inactive_aux_loss_raw,
+                inactive_aux_q_raw=inactive_aux_q_raw,
+                inactive_aux_k_raw=inactive_aux_k_raw,
+                inactive_aux_qk_raw=inactive_aux_qk_raw,
+                inactive_aux_v_raw=inactive_aux_v_raw,
+                inactive_aux_attn_raw=inactive_aux_attn_raw,
+                inactive_aux_rst_raw=inactive_aux_rst_raw,
+                inactive_aux_loss_pre_bound=inactive_aux_loss_pre_bound,
+                inactive_aux_q_pre_bound=inactive_aux_q_pre_bound,
+                inactive_aux_k_pre_bound=inactive_aux_k_pre_bound,
+                inactive_aux_qk_pre_bound=inactive_aux_qk_pre_bound,
+                inactive_aux_v_pre_bound=inactive_aux_v_pre_bound,
+                inactive_aux_attn_pre_bound=inactive_aux_attn_pre_bound,
+                inactive_aux_rst_pre_bound=inactive_aux_rst_pre_bound,
                 pos_frac=pos_frac, pos_mean=pos_mean, neg_mean=neg_mean,
                 block_frac_a=block_frac_a, block_frac_q=block_frac_q,
                 block_frac_key=block_frac_key, block_frac_qk=block_frac_qk,
                 block_frac_v=block_frac_v, block_frac_rst=block_frac_rst,
-                rpe_no_active_easy_shutoff_q=rpe_no_active_easy_shutoff_q,
-                rpe_no_active_easy_shutoff_k=rpe_no_active_easy_shutoff_k,
-                rpe_no_active_easy_shutoff_v=rpe_no_active_easy_shutoff_v,
-                rpe_no_active_easy_shutoff_rst=rpe_no_active_easy_shutoff_rst,
+                inactive_aux_no_active_easy_shutoff_q=inactive_aux_no_active_easy_shutoff_q,
+                inactive_aux_no_active_easy_shutoff_k=inactive_aux_no_active_easy_shutoff_k,
+                inactive_aux_no_active_easy_shutoff_v=inactive_aux_no_active_easy_shutoff_v,
+                inactive_aux_no_active_easy_shutoff_rst=inactive_aux_no_active_easy_shutoff_rst,
                 dev_pos_max=dev_pos_max, dev_neg_max=dev_neg_max,
                 attn_tau_off_min=attn_tau_off_min, attn_tau_off_max=attn_tau_off_max,
                 attn_tau_off_p99=attn_tau_off_p99, attn_tau_off_p01=attn_tau_off_p01,
@@ -2443,9 +2398,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 rst_tau_off_min=rst_tau_off_min, rst_tau_off_max=rst_tau_off_max,
                 rst_tau_off_p99=rst_tau_off_p99, rst_tau_off_p01=rst_tau_off_p01,
                 rst_tau_off_neg_frac=rst_tau_off_neg_frac,
-                explore_active=explore_active,
-                explore_loss_weighted_unclipped=explore_loss_weighted_unclipped,
-                explore_loss_weighted_clipped=explore_loss_weighted,
+                inactive_aux_active=inactive_aux_active,
+                inactive_aux_loss_weighted_unclipped=inactive_aux_loss_weighted_unclipped,
+                inactive_aux_loss_weighted_clipped=inactive_aux_loss_weighted,
                 cb1a_ce_mean=cb1a_ce_mean,
                 cb1a_ce_std=cb1a_ce_std,
                 cb1a_raw=cb1a_raw,
@@ -2474,9 +2429,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 dead_penalty_rst_weight=_dead_penalty_rst_weight,
                 dead_penalty_weighted_unclipped=dead_penalty_weighted_unclipped,
                 dead_penalty_weighted_clipped=dead_penalty_weighted,
-                exploration_layer_norm_enabled=_explore_norm_by_layers_f,
-                exploration_layer_count=explore_layer_count,
-                exploration_norm=explore_norm,
+                inactive_aux_layer_norm_enabled=_inactive_aux_norm_by_layers_f,
+                inactive_aux_layer_count=inactive_aux_layer_count,
+                inactive_aux_norm=inactive_aux_norm,
                 step_in_train=step,
                 soft_gate_T=soft_gate_T,
                 soft_gate_T_qk=soft_gate_T_qk,
@@ -2484,7 +2439,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 soft_gate_T_rst=soft_gate_T_rst,
                 boundary_power_p=boundary_power_p,
                 admission_den_power=_admission_den_power,
-                rpe_schedule_scale=rpe_schedule_scale,
+                inactive_aux_schedule_scale=inactive_aux_schedule_scale,
             )
             result_payload = result
             if _compact_train_metrics:
@@ -2492,10 +2447,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     k: v for k, v in result.items()
                     if k not in _train_result_heavy_keys}
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
-                                dead_penalty, explore_stats, result_payload)
+                                dead_penalty, inactive_aux_stats, result_payload)
 
         (total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
-                      dead_penalty, explore_stats, result)), grads = \
+                      dead_penalty, inactive_aux_stats, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
         # XLA SPMD handles gradient all-reduce automatically
@@ -3161,13 +3116,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             params.get('router', {}).get('raw_scan_offset_attn', {})).get(
                 'bias', jnp.zeros(3))
         # loss_fn-local weighted aux variables are returned through
-        # explore_stats; keep metric/reconstruction paths JIT-safe even when
-        # exploration is disabled or have_explore=False.
-        explore_loss_weighted_metric = explore_stats['explore_loss_weighted_clipped']
-        explore_loss_weighted_unclipped_metric = explore_stats['explore_loss_weighted_unclipped']
-        cb1a_weighted_metric = explore_stats['cb1a_weighted']
-        dead_penalty_weighted_metric = explore_stats['dead_penalty_weighted_clipped']
-        dead_penalty_weighted_unclipped_metric = explore_stats['dead_penalty_weighted_unclipped']
+        inactive_aux_loss_weighted_metric = inactive_aux_stats['inactive_aux_loss_weighted_clipped']
+        inactive_aux_loss_weighted_unclipped_metric = inactive_aux_stats['inactive_aux_loss_weighted_unclipped']
+        cb1a_weighted_metric = inactive_aux_stats['cb1a_weighted']
+        dead_penalty_weighted_metric = inactive_aux_stats['dead_penalty_weighted_clipped']
+        dead_penalty_weighted_unclipped_metric = inactive_aux_stats['dead_penalty_weighted_unclipped']
 
         if _is_soft_direct_tau:
             aux_loss_weighted_metric = jnp.float32(0.0)
@@ -3192,7 +3145,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             + orth_loss_weighted_metric
             + diversity_loss_weighted_metric
             + dead_penalty_weighted_metric
-            + explore_loss_weighted_metric
+            + inactive_aux_loss_weighted_metric
             + cb1a_weighted_metric)
         metrics = {
             'total_loss': total_loss,
@@ -3211,11 +3164,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'diversity_loss_weighted': diversity_loss_weighted_metric,
             'dead_penalty_weight': jnp.float32(dead_penalty_weight),
             'dead_penalty_weighted_total': dead_penalty_weighted_metric,
-            'dead_penalty_raw_unweighted': explore_stats['dead_penalty_raw_unweighted'],
-            'dead_penalty_raw_weighted_pools': explore_stats['dead_penalty_raw_weighted_pools'],
-            'dead_penalty_qk_weight': explore_stats['dead_penalty_qk_weight'],
-            'dead_penalty_v_weight': explore_stats['dead_penalty_v_weight'],
-            'dead_penalty_rst_weight': explore_stats['dead_penalty_rst_weight'],
+            'dead_penalty_raw_unweighted': inactive_aux_stats['dead_penalty_raw_unweighted'],
+            'dead_penalty_raw_weighted_pools': inactive_aux_stats['dead_penalty_raw_weighted_pools'],
+            'dead_penalty_qk_weight': inactive_aux_stats['dead_penalty_qk_weight'],
+            'dead_penalty_v_weight': inactive_aux_stats['dead_penalty_v_weight'],
+            'dead_penalty_rst_weight': inactive_aux_stats['dead_penalty_rst_weight'],
             'attn_qk_dead_penalty': result.get(
                 'attn_qk_dead_penalty', jnp.float32(0.0)),
             'attn_v_dead_penalty': result.get(
@@ -3224,120 +3177,120 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'attn_qk_dead_count', jnp.float32(0.0)),
             'attn_v_dead_count': result.get(
                 'attn_v_dead_count', jnp.float32(0.0)),
-            'exploration_warmup_factor': explore_stats['explore_active'],
-            'exploration_weight_effective': (
-                (_explore_weight_q + _explore_weight_k
-                 + _explore_weight_v + _explore_weight_rst)
-                / jnp.float32(4.0) * explore_stats['explore_active']),
-            'soft_gate_T': explore_stats['soft_gate_T'],
-            'soft_gate_T_qk': explore_stats['soft_gate_T_qk'],
-            'soft_gate_T_v': explore_stats['soft_gate_T_v'],
-            'soft_gate_T_rst': explore_stats['soft_gate_T_rst'],
-            'boundary_power_p': explore_stats['boundary_power_p'],
-            'admission_den_power': explore_stats['admission_den_power'],
-            'rpe_effective_weight': (
-                (_explore_weight_q + _explore_weight_k
-                 + _explore_weight_v + _explore_weight_rst)
-                / jnp.float32(4.0) * explore_stats['explore_active']),
-            'rpe_schedule_scale': explore_stats['rpe_schedule_scale'],
-            'exploration_asymmetry': _asym,
-            'exploration_asymmetry_q': _asym_q,
-            'exploration_asymmetry_k': _asym_k,
-            'exploration_asymmetry_qk': (
+            'inactive_aux_warmup_factor': inactive_aux_stats['inactive_aux_active'],
+            'inactive_aux_weight_effective': (
+                (_inactive_aux_weight_q + _inactive_aux_weight_k
+                 + _inactive_aux_weight_v + _inactive_aux_weight_rst)
+                / jnp.float32(4.0) * inactive_aux_stats['inactive_aux_active']),
+            'soft_gate_T': inactive_aux_stats['soft_gate_T'],
+            'soft_gate_T_qk': inactive_aux_stats['soft_gate_T_qk'],
+            'soft_gate_T_v': inactive_aux_stats['soft_gate_T_v'],
+            'soft_gate_T_rst': inactive_aux_stats['soft_gate_T_rst'],
+            'boundary_power_p': inactive_aux_stats['boundary_power_p'],
+            'admission_den_power': inactive_aux_stats['admission_den_power'],
+            'inactive_aux_effective_weight': (
+                (_inactive_aux_weight_q + _inactive_aux_weight_k
+                 + _inactive_aux_weight_v + _inactive_aux_weight_rst)
+                / jnp.float32(4.0) * inactive_aux_stats['inactive_aux_active']),
+            'inactive_aux_schedule_scale': inactive_aux_stats['inactive_aux_schedule_scale'],
+            'inactive_aux_asymmetry': _asym,
+            'inactive_aux_asymmetry_q': _asym_q,
+            'inactive_aux_asymmetry_k': _asym_k,
+            'inactive_aux_asymmetry_qk': (
                 (_asym_q + _asym_k) / jnp.float32(2.0)),
-            'exploration_asymmetry_v': _asym_v,
-            'exploration_asymmetry_rst': _asym_rst,
-            'exploration_layer_norm_enabled': explore_stats[
-                'exploration_layer_norm_enabled'],
-            'exploration_layer_count': explore_stats['exploration_layer_count'],
-            'exploration_norm': explore_stats['exploration_norm'],
-            'rpe_no_active_easy_shutoff_q': explore_stats[
-                'rpe_no_active_easy_shutoff_q'],
-            'rpe_no_active_easy_shutoff_k': explore_stats[
-                'rpe_no_active_easy_shutoff_k'],
-            'rpe_no_active_easy_shutoff_v': explore_stats[
-                'rpe_no_active_easy_shutoff_v'],
-            'rpe_no_active_easy_shutoff_rst': explore_stats[
-                'rpe_no_active_easy_shutoff_rst'],
-            'exploration_loss_raw_total': explore_stats['explore_loss_raw'],
-            'exploration_loss_raw_q': explore_stats['explore_q_raw'],
-            'exploration_loss_raw_k': explore_stats['explore_k_raw'],
-            'exploration_loss_raw_qk': explore_stats['explore_qk_raw'],
-            'exploration_loss_raw_v': explore_stats['explore_v_raw'],
-            'exploration_loss_raw_attn': explore_stats['explore_attn_raw'],
-            'exploration_loss_raw_rst': explore_stats['explore_rst_raw'],
-            'exploration_loss_weighted_q': (
-                _explore_weight_q * explore_stats['explore_q_raw']
-                * explore_stats['explore_active']),
-            'exploration_loss_weighted_k': (
-                _explore_weight_k * explore_stats['explore_k_raw']
-                * explore_stats['explore_active']),
-            'exploration_loss_weighted_qk': (
-                (_explore_weight_q * explore_stats['explore_q_raw']
-                 + _explore_weight_k * explore_stats['explore_k_raw'])
-                * explore_stats['explore_active']),
-            'exploration_loss_weighted_v': (
-                _explore_weight_v * explore_stats['explore_v_raw']
-                * explore_stats['explore_active']),
-            'exploration_loss_weighted_attn': (
-                (_explore_weight_q * explore_stats['explore_q_raw']
-                 + _explore_weight_k * explore_stats['explore_k_raw']
-                 + _explore_weight_v * explore_stats['explore_v_raw'])
-                * explore_stats['explore_active']),
-            'exploration_loss_weighted_rst': (
-                _explore_weight_rst * explore_stats['explore_rst_raw']
-                * explore_stats['explore_active']),
-            'exploration_loss_weighted_total': explore_loss_weighted_metric,
-            'exploration_loss_weighted_unclipped': explore_loss_weighted_unclipped_metric,
-            'exploration_loss_weighted_clipped': explore_loss_weighted_metric,
-            'cb1a_raw': explore_stats['cb1a_raw'],
+            'inactive_aux_asymmetry_v': _asym_v,
+            'inactive_aux_asymmetry_rst': _asym_rst,
+            'inactive_aux_layer_norm_enabled': inactive_aux_stats[
+                'inactive_aux_layer_norm_enabled'],
+            'inactive_aux_layer_count': inactive_aux_stats['inactive_aux_layer_count'],
+            'inactive_aux_norm': inactive_aux_stats['inactive_aux_norm'],
+            'inactive_aux_no_active_easy_shutoff_q': inactive_aux_stats[
+                'inactive_aux_no_active_easy_shutoff_q'],
+            'inactive_aux_no_active_easy_shutoff_k': inactive_aux_stats[
+                'inactive_aux_no_active_easy_shutoff_k'],
+            'inactive_aux_no_active_easy_shutoff_v': inactive_aux_stats[
+                'inactive_aux_no_active_easy_shutoff_v'],
+            'inactive_aux_no_active_easy_shutoff_rst': inactive_aux_stats[
+                'inactive_aux_no_active_easy_shutoff_rst'],
+            'inactive_aux_loss_raw_total': inactive_aux_stats['inactive_aux_loss_raw'],
+            'inactive_aux_loss_raw_q': inactive_aux_stats['inactive_aux_q_raw'],
+            'inactive_aux_loss_raw_k': inactive_aux_stats['inactive_aux_k_raw'],
+            'inactive_aux_loss_raw_qk': inactive_aux_stats['inactive_aux_qk_raw'],
+            'inactive_aux_loss_raw_v': inactive_aux_stats['inactive_aux_v_raw'],
+            'inactive_aux_loss_raw_attn': inactive_aux_stats['inactive_aux_attn_raw'],
+            'inactive_aux_loss_raw_rst': inactive_aux_stats['inactive_aux_rst_raw'],
+            'inactive_aux_loss_weighted_q': (
+                _inactive_aux_weight_q * inactive_aux_stats['inactive_aux_q_raw']
+                * inactive_aux_stats['inactive_aux_active']),
+            'inactive_aux_loss_weighted_k': (
+                _inactive_aux_weight_k * inactive_aux_stats['inactive_aux_k_raw']
+                * inactive_aux_stats['inactive_aux_active']),
+            'inactive_aux_loss_weighted_qk': (
+                (_inactive_aux_weight_q * inactive_aux_stats['inactive_aux_q_raw']
+                 + _inactive_aux_weight_k * inactive_aux_stats['inactive_aux_k_raw'])
+                * inactive_aux_stats['inactive_aux_active']),
+            'inactive_aux_loss_weighted_v': (
+                _inactive_aux_weight_v * inactive_aux_stats['inactive_aux_v_raw']
+                * inactive_aux_stats['inactive_aux_active']),
+            'inactive_aux_loss_weighted_attn': (
+                (_inactive_aux_weight_q * inactive_aux_stats['inactive_aux_q_raw']
+                 + _inactive_aux_weight_k * inactive_aux_stats['inactive_aux_k_raw']
+                 + _inactive_aux_weight_v * inactive_aux_stats['inactive_aux_v_raw'])
+                * inactive_aux_stats['inactive_aux_active']),
+            'inactive_aux_loss_weighted_rst': (
+                _inactive_aux_weight_rst * inactive_aux_stats['inactive_aux_rst_raw']
+                * inactive_aux_stats['inactive_aux_active']),
+            'inactive_aux_loss_weighted_total': inactive_aux_loss_weighted_metric,
+            'inactive_aux_loss_weighted_unclipped': inactive_aux_loss_weighted_unclipped_metric,
+            'inactive_aux_loss_weighted_clipped': inactive_aux_loss_weighted_metric,
+            'cb1a_raw': inactive_aux_stats['cb1a_raw'],
             'cb1a_w': cb1a_weighted_metric,
             'cb1a_weighted': cb1a_weighted_metric,
-            'cb1a_challenge_raw': explore_stats['cb1a_challenge_raw'],
-            'cb1a_prune_raw': explore_stats['cb1a_prune_raw'],
+            'cb1a_challenge_raw': inactive_aux_stats['cb1a_challenge_raw'],
+            'cb1a_prune_raw': inactive_aux_stats['cb1a_prune_raw'],
             'cb1a_challenge': result.get(
-                'cb1a_challenge', explore_stats['cb1a_challenge_raw']),
+                'cb1a_challenge', inactive_aux_stats['cb1a_challenge_raw']),
             'cb1a_prune': result.get(
-                'cb1a_prune', explore_stats['cb1a_prune_raw']),
+                'cb1a_prune', inactive_aux_stats['cb1a_prune_raw']),
             'cb1a_valid': result.get('cb1a_valid', jnp.float32(0.0)),
             'cb1a_has_above': result.get('cb1a_has_above', jnp.float32(0.0)),
             'cb1a_has_below': result.get('cb1a_has_below', jnp.float32(0.0)),
-            'cb1a_qk_challenge': explore_stats['cb1a_qk_challenge_raw'],
-            'cb1a_qk_prune': explore_stats['cb1a_qk_prune_raw'],
-            'cb1a_v_challenge': explore_stats['cb1a_v_challenge_raw'],
-            'cb1a_v_prune': explore_stats['cb1a_v_prune_raw'],
-            'cb1a_rst_challenge': explore_stats['cb1a_rst_challenge_raw'],
-            'cb1a_rst_prune': explore_stats['cb1a_rst_prune_raw'],
-            'cb1a_qk_raw': explore_stats['cb1a_qk_raw'],
-            'cb1a_v_raw': explore_stats['cb1a_v_raw'],
-            'cb1a_rst_raw': explore_stats['cb1a_rst_raw'],
+            'cb1a_qk_challenge': inactive_aux_stats['cb1a_qk_challenge_raw'],
+            'cb1a_qk_prune': inactive_aux_stats['cb1a_qk_prune_raw'],
+            'cb1a_v_challenge': inactive_aux_stats['cb1a_v_challenge_raw'],
+            'cb1a_v_prune': inactive_aux_stats['cb1a_v_prune_raw'],
+            'cb1a_rst_challenge': inactive_aux_stats['cb1a_rst_challenge_raw'],
+            'cb1a_rst_prune': inactive_aux_stats['cb1a_rst_prune_raw'],
+            'cb1a_qk_raw': inactive_aux_stats['cb1a_qk_raw'],
+            'cb1a_v_raw': inactive_aux_stats['cb1a_v_raw'],
+            'cb1a_rst_raw': inactive_aux_stats['cb1a_rst_raw'],
             'cb1a_weight': _cb1a_weight,
             'cb1a_challenge_weight': _cb1a_challenge_weight,
             'cb1a_prune_weight': _cb1a_prune_weight,
             'cb1a_qk_weight': _cb1a_qk_weight,
             'cb1a_v_weight': _cb1a_v_weight,
             'cb1a_rst_weight': _cb1a_rst_weight,
-            'cb1a_qk_challenge_weight': explore_stats[
+            'cb1a_qk_challenge_weight': inactive_aux_stats[
                 'cb1a_qk_challenge_weight'],
-            'cb1a_qk_prune_weight': explore_stats['cb1a_qk_prune_weight'],
-            'cb1a_v_challenge_weight': explore_stats[
+            'cb1a_qk_prune_weight': inactive_aux_stats['cb1a_qk_prune_weight'],
+            'cb1a_v_challenge_weight': inactive_aux_stats[
                 'cb1a_v_challenge_weight'],
-            'cb1a_v_prune_weight': explore_stats['cb1a_v_prune_weight'],
-            'cb1a_rst_challenge_weight': explore_stats[
+            'cb1a_v_prune_weight': inactive_aux_stats['cb1a_v_prune_weight'],
+            'cb1a_rst_challenge_weight': inactive_aux_stats[
                 'cb1a_rst_challenge_weight'],
-            'cb1a_rst_prune_weight': explore_stats['cb1a_rst_prune_weight'],
-            'cb1a_ce_mean': explore_stats['cb1a_ce_mean'],
-            'cb1a_ce_std': explore_stats['cb1a_ce_std'],
+            'cb1a_rst_prune_weight': inactive_aux_stats['cb1a_rst_prune_weight'],
+            'cb1a_ce_mean': inactive_aux_stats['cb1a_ce_mean'],
+            'cb1a_ce_std': inactive_aux_stats['cb1a_ce_std'],
             'dead_penalty_weighted_unclipped': dead_penalty_weighted_unclipped_metric,
             'dead_penalty_weighted_clipped': dead_penalty_weighted_metric,
-            'exploration_raw_pre_bound': explore_stats['explore_loss_pre_bound'],
-            'exploration_q_pre_bound': explore_stats['explore_q_pre_bound'],
-            'exploration_k_pre_bound': explore_stats['explore_k_pre_bound'],
-            'exploration_qk_pre_bound': explore_stats['explore_qk_pre_bound'],
-            'exploration_v_pre_bound': explore_stats['explore_v_pre_bound'],
-            'exploration_raw_post_bound': explore_stats['explore_loss_raw'],
-            'exploration_attn_pre_bound': explore_stats['explore_attn_pre_bound'],
-            'exploration_rst_pre_bound': explore_stats['explore_rst_pre_bound'],
+            'inactive_aux_raw_pre_bound': inactive_aux_stats['inactive_aux_loss_pre_bound'],
+            'inactive_aux_q_pre_bound': inactive_aux_stats['inactive_aux_q_pre_bound'],
+            'inactive_aux_k_pre_bound': inactive_aux_stats['inactive_aux_k_pre_bound'],
+            'inactive_aux_qk_pre_bound': inactive_aux_stats['inactive_aux_qk_pre_bound'],
+            'inactive_aux_v_pre_bound': inactive_aux_stats['inactive_aux_v_pre_bound'],
+            'inactive_aux_raw_post_bound': inactive_aux_stats['inactive_aux_loss_raw'],
+            'inactive_aux_attn_pre_bound': inactive_aux_stats['inactive_aux_attn_pre_bound'],
+            'inactive_aux_rst_pre_bound': inactive_aux_stats['inactive_aux_rst_pre_bound'],
             'pool_weight_decay_loss': pool_weight_decay_loss,
             'normal_weight_decay_loss': normal_weight_decay_loss,
             'total_loss_minus_ce': total_loss - ce_loss,
@@ -3346,8 +3299,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 total_loss - reconstructed_total_loss_metric),
             'dead_loss_raw': dead_penalty,
             'dead_loss_weighted': dead_penalty_weighted_metric,
-            'rpe_loss_raw': explore_stats['explore_loss_raw'],
-            'rpe_loss_weighted': explore_loss_weighted_metric,
+            'inactive_aux_loss_raw': inactive_aux_stats['inactive_aux_loss_raw'],
+            'inactive_aux_loss_weighted': inactive_aux_loss_weighted_metric,
             'weight_decay_pool': pool_weight_decay_loss,
             'weight_decay_normal': normal_weight_decay_loss,
             'correct': result['correct'],
@@ -3580,7 +3533,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_dead_exposure_target': result.get(
                 'rst_dead_exposure_target', jnp.float32(0.0)),
             # v4162/v4163 soft-gate exposure diagnostics. Old hard-boundary
-            # exposure keys above are kept for v4160/v4161 compatibility.
+            # exposure keys above are kept for v4164/v4164 compatibility.
             'attn_soft_exposure_mean': result.get('attn_soft_exposure_mean', jnp.float32(0.0)),
             'attn_soft_exposure_min': result.get('attn_soft_exposure_min', jnp.float32(0.0)),
             'attn_soft_exposure_max': result.get('attn_soft_exposure_max', jnp.float32(0.0)),
@@ -3626,50 +3579,49 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 result.get('rst_dead_penalty', jnp.float32(0.0))
                 / jnp.maximum(result.get('rst_dead_count', jnp.float32(0.0)),
                               jnp.float32(1.0))),
-            # v4.1 RPE exploration + diagnostics.
-            'global_mean_ce': explore_stats['global_mean_ce'],
-            'pos_frac': explore_stats['pos_frac'],
-            'pos_mean': explore_stats['pos_mean'],
-            'neg_mean': explore_stats['neg_mean'],
-            'rpe_pos_frac': explore_stats['pos_frac'],
-            'rpe_pos_avg': explore_stats['pos_mean'],
-            'rpe_neg_avg': explore_stats['neg_mean'],
-            'rpe_dev_pos': explore_stats['dev_pos_max'],
-            'rpe_dev_neg': explore_stats['dev_neg_max'],
-            'explore_loss_raw': explore_stats['explore_loss_raw'],
-            'explore_q_raw': explore_stats['explore_q_raw'],
-            'explore_k_raw': explore_stats['explore_k_raw'],
-            'explore_qk_raw': explore_stats['explore_qk_raw'],
-            'explore_v_raw': explore_stats['explore_v_raw'],
-            'explore_attn_raw': explore_stats['explore_attn_raw'],
-            'explore_rst_raw': explore_stats['explore_rst_raw'],
-            'explore_loss_weighted': explore_loss_weighted_metric,
-            'explore_active': explore_stats['explore_active'],
-            'explore_block_frac_q': explore_stats['block_frac_q'],
-            'explore_block_frac_key': explore_stats['block_frac_key'],
-            'explore_block_frac_qk': explore_stats['block_frac_qk'],
-            'explore_block_frac_v': explore_stats['block_frac_v'],
-            'explore_block_frac_a': explore_stats['block_frac_a'],
-            'explore_block_frac_rst': explore_stats['block_frac_rst'],
-            'explore_block_frac_k': explore_stats['block_frac_rst'],
-            'rpe_block_q': explore_stats['block_frac_q'],
-            'rpe_block_key': explore_stats['block_frac_key'],
-            'rpe_block_qk': explore_stats['block_frac_qk'],
-            'rpe_block_v': explore_stats['block_frac_v'],
-            'rpe_block_attn': explore_stats['block_frac_a'],
-            'rpe_block_rst': explore_stats['block_frac_rst'],
-            'dev_pos_max': explore_stats['dev_pos_max'],
-            'dev_neg_max': explore_stats['dev_neg_max'],
-            'attn_tau_off_min': explore_stats['attn_tau_off_min'],
-            'attn_tau_off_max': explore_stats['attn_tau_off_max'],
-            'attn_tau_off_p99': explore_stats['attn_tau_off_p99'],
-            'attn_tau_off_p01': explore_stats['attn_tau_off_p01'],
-            'attn_tau_off_neg_frac': explore_stats['attn_tau_off_neg_frac'],
-            'rst_tau_off_min': explore_stats['rst_tau_off_min'],
-            'rst_tau_off_max': explore_stats['rst_tau_off_max'],
-            'rst_tau_off_p99': explore_stats['rst_tau_off_p99'],
-            'rst_tau_off_p01': explore_stats['rst_tau_off_p01'],
-            'rst_tau_off_neg_frac': explore_stats['rst_tau_off_neg_frac'],
+            'global_mean_ce': inactive_aux_stats['global_mean_ce'],
+            'pos_frac': inactive_aux_stats['pos_frac'],
+            'pos_mean': inactive_aux_stats['pos_mean'],
+            'neg_mean': inactive_aux_stats['neg_mean'],
+            'inactive_aux_pos_frac': inactive_aux_stats['pos_frac'],
+            'inactive_aux_pos_avg': inactive_aux_stats['pos_mean'],
+            'inactive_aux_neg_avg': inactive_aux_stats['neg_mean'],
+            'inactive_aux_dev_pos': inactive_aux_stats['dev_pos_max'],
+            'inactive_aux_dev_neg': inactive_aux_stats['dev_neg_max'],
+            'inactive_aux_loss_raw': inactive_aux_stats['inactive_aux_loss_raw'],
+            'inactive_aux_q_raw': inactive_aux_stats['inactive_aux_q_raw'],
+            'inactive_aux_k_raw': inactive_aux_stats['inactive_aux_k_raw'],
+            'inactive_aux_qk_raw': inactive_aux_stats['inactive_aux_qk_raw'],
+            'inactive_aux_v_raw': inactive_aux_stats['inactive_aux_v_raw'],
+            'inactive_aux_attn_raw': inactive_aux_stats['inactive_aux_attn_raw'],
+            'inactive_aux_rst_raw': inactive_aux_stats['inactive_aux_rst_raw'],
+            'inactive_aux_loss_weighted': inactive_aux_loss_weighted_metric,
+            'inactive_aux_active': inactive_aux_stats['inactive_aux_active'],
+            'inactive_aux_block_frac_q': inactive_aux_stats['block_frac_q'],
+            'inactive_aux_block_frac_key': inactive_aux_stats['block_frac_key'],
+            'inactive_aux_block_frac_qk': inactive_aux_stats['block_frac_qk'],
+            'inactive_aux_block_frac_v': inactive_aux_stats['block_frac_v'],
+            'inactive_aux_block_frac_a': inactive_aux_stats['block_frac_a'],
+            'inactive_aux_block_frac_rst': inactive_aux_stats['block_frac_rst'],
+            'inactive_aux_block_frac_k': inactive_aux_stats['block_frac_rst'],
+            'inactive_aux_block_q': inactive_aux_stats['block_frac_q'],
+            'inactive_aux_block_key': inactive_aux_stats['block_frac_key'],
+            'inactive_aux_block_qk': inactive_aux_stats['block_frac_qk'],
+            'inactive_aux_block_v': inactive_aux_stats['block_frac_v'],
+            'inactive_aux_block_attn': inactive_aux_stats['block_frac_a'],
+            'inactive_aux_block_rst': inactive_aux_stats['block_frac_rst'],
+            'dev_pos_max': inactive_aux_stats['dev_pos_max'],
+            'dev_neg_max': inactive_aux_stats['dev_neg_max'],
+            'attn_tau_off_min': inactive_aux_stats['attn_tau_off_min'],
+            'attn_tau_off_max': inactive_aux_stats['attn_tau_off_max'],
+            'attn_tau_off_p99': inactive_aux_stats['attn_tau_off_p99'],
+            'attn_tau_off_p01': inactive_aux_stats['attn_tau_off_p01'],
+            'attn_tau_off_neg_frac': inactive_aux_stats['attn_tau_off_neg_frac'],
+            'rst_tau_off_min': inactive_aux_stats['rst_tau_off_min'],
+            'rst_tau_off_max': inactive_aux_stats['rst_tau_off_max'],
+            'rst_tau_off_p99': inactive_aux_stats['rst_tau_off_p99'],
+            'rst_tau_off_p01': inactive_aux_stats['rst_tau_off_p01'],
+            'rst_tau_off_neg_frac': inactive_aux_stats['rst_tau_off_neg_frac'],
             # v4.1 intensity / v4.1.5 gate-denominator diagnostics.
             'attn_int_max': result.get('attn_int_max', jnp.float32(0.0)),
             'rst_int_max': result.get('rst_int_max', jnp.float32(0.0)),
@@ -3832,78 +3784,78 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 metrics[f'{_pool}_{_name}'] = result.get(
                     f'{_pool}_{_name}',
                     result.get(f'attn_{_name}', jnp.float32(0.0)))
-        if not _rpe_enabled:
+        if not _inactive_aux_enabled:
             for _key in (
-                    'exploration_warmup_factor',
-                    'exploration_weight_effective',
-                    'exploration_asymmetry',
-                    'exploration_asymmetry_q',
-                    'exploration_asymmetry_k',
-                    'exploration_asymmetry_qk',
-                    'exploration_asymmetry_v',
-                    'exploration_asymmetry_rst',
-                    'exploration_loss_raw_total',
-                    'exploration_loss_raw_q',
-                    'exploration_loss_raw_k',
-                    'exploration_loss_raw_qk',
-                    'exploration_loss_raw_v',
-                    'exploration_loss_raw_attn',
-                    'exploration_loss_raw_rst',
-                    'exploration_loss_weighted_q',
-                    'exploration_loss_weighted_k',
-                    'exploration_loss_weighted_qk',
-                    'exploration_loss_weighted_v',
-                    'exploration_loss_weighted_attn',
-                    'exploration_loss_weighted_rst',
-                    'exploration_loss_weighted_total',
-                    'exploration_loss_weighted_unclipped',
-                    'exploration_loss_weighted_clipped',
-                    'exploration_layer_norm_enabled',
-                    'exploration_layer_count',
-                    'exploration_norm',
-                    'rpe_no_active_easy_shutoff_q',
-                    'rpe_no_active_easy_shutoff_k',
-                    'rpe_no_active_easy_shutoff_v',
-                    'rpe_no_active_easy_shutoff_rst',
-                    'exploration_raw_pre_bound',
-                    'exploration_q_pre_bound',
-                    'exploration_k_pre_bound',
-                    'exploration_qk_pre_bound',
-                    'exploration_v_pre_bound',
-                    'exploration_raw_post_bound',
-                    'exploration_attn_pre_bound',
-                    'exploration_rst_pre_bound',
+                    'inactive_aux_warmup_factor',
+                    'inactive_aux_weight_effective',
+                    'inactive_aux_asymmetry',
+                    'inactive_aux_asymmetry_q',
+                    'inactive_aux_asymmetry_k',
+                    'inactive_aux_asymmetry_qk',
+                    'inactive_aux_asymmetry_v',
+                    'inactive_aux_asymmetry_rst',
+                    'inactive_aux_loss_raw_total',
+                    'inactive_aux_loss_raw_q',
+                    'inactive_aux_loss_raw_k',
+                    'inactive_aux_loss_raw_qk',
+                    'inactive_aux_loss_raw_v',
+                    'inactive_aux_loss_raw_attn',
+                    'inactive_aux_loss_raw_rst',
+                    'inactive_aux_loss_weighted_q',
+                    'inactive_aux_loss_weighted_k',
+                    'inactive_aux_loss_weighted_qk',
+                    'inactive_aux_loss_weighted_v',
+                    'inactive_aux_loss_weighted_attn',
+                    'inactive_aux_loss_weighted_rst',
+                    'inactive_aux_loss_weighted_total',
+                    'inactive_aux_loss_weighted_unclipped',
+                    'inactive_aux_loss_weighted_clipped',
+                    'inactive_aux_layer_norm_enabled',
+                    'inactive_aux_layer_count',
+                    'inactive_aux_norm',
+                    'inactive_aux_no_active_easy_shutoff_q',
+                    'inactive_aux_no_active_easy_shutoff_k',
+                    'inactive_aux_no_active_easy_shutoff_v',
+                    'inactive_aux_no_active_easy_shutoff_rst',
+                    'inactive_aux_raw_pre_bound',
+                    'inactive_aux_q_pre_bound',
+                    'inactive_aux_k_pre_bound',
+                    'inactive_aux_qk_pre_bound',
+                    'inactive_aux_v_pre_bound',
+                    'inactive_aux_raw_post_bound',
+                    'inactive_aux_attn_pre_bound',
+                    'inactive_aux_rst_pre_bound',
                     'global_mean_ce',
                     'pos_frac',
                     'pos_mean',
                     'neg_mean',
-                    'rpe_pos_frac',
-                    'rpe_pos_avg',
-                    'rpe_neg_avg',
-                    'rpe_dev_pos',
-                    'rpe_dev_neg',
-                    'rpe_block_q',
-                    'rpe_block_key',
-                    'rpe_block_qk',
-                    'rpe_block_v',
-                    'rpe_block_attn',
-                    'rpe_block_rst',
-                    'explore_loss_raw',
-                    'explore_q_raw',
-                    'explore_k_raw',
-                    'explore_qk_raw',
-                    'explore_v_raw',
-                    'explore_attn_raw',
-                    'explore_rst_raw',
-                    'explore_loss_weighted',
-                    'explore_active',
-                    'explore_block_frac_q',
-                    'explore_block_frac_key',
-                    'explore_block_frac_qk',
-                    'explore_block_frac_v',
-                    'explore_block_frac_a',
-                    'explore_block_frac_rst',
-                    'explore_block_frac_k',
+                    'inactive_aux_pos_frac',
+                    'inactive_aux_pos_avg',
+                    'inactive_aux_neg_avg',
+                    'inactive_aux_dev_pos',
+                    'inactive_aux_dev_neg',
+                    'inactive_aux_block_q',
+                    'inactive_aux_block_key',
+                    'inactive_aux_block_qk',
+                    'inactive_aux_block_v',
+                    'inactive_aux_block_attn',
+                    'inactive_aux_block_rst',
+                    'inactive_aux_loss_raw',
+                    'inactive_aux_q_raw',
+                    'inactive_aux_k_raw',
+                    'inactive_aux_qk_raw',
+                    'inactive_aux_v_raw',
+                    'inactive_aux_attn_raw',
+                    'inactive_aux_rst_raw',
+                    'inactive_aux_loss_weighted',
+                    'inactive_aux_active',
+                    'inactive_aux_block_frac_q',
+                    'inactive_aux_block_frac_key',
+                    'inactive_aux_block_frac_qk',
+                    'inactive_aux_block_frac_v',
+                    'inactive_aux_block_frac_a',
+                    'inactive_aux_block_frac_rst',
+                    'inactive_aux_block_frac_k',
                     'dev_pos_max',
                     'dev_neg_max'):
                 metrics.pop(_key, None)
@@ -4879,7 +4831,6 @@ def check_nan_inf(metrics_dict, global_step, epoch):
 # shard_map kernels (analysis_step), so the multiplier controls that cost.
 #
 # REGULAR carries the training-dynamics block (loss, activity, tau
-# structure, emb norms, RPE, per-layer). ANALYSIS (`type='train_analysis'`)
 # adds distribution-shape / boundary /
 # saturation / debug diagnostics.
 #
@@ -4888,75 +4839,6 @@ def check_nan_inf(metrics_dict, global_step, epoch):
 # record is now standalone.
 
 
-RPE_REGULAR_RECORD_KEYS = (
-    'explore_loss_raw',
-    'explore_loss_weighted',
-    'exploration_loss_raw_total',
-    'exploration_loss_raw_q',
-    'exploration_loss_raw_k',
-    'exploration_loss_raw_qk',
-    'exploration_loss_raw_v',
-    'exploration_loss_raw_attn',
-    'exploration_loss_raw_rst',
-    'exploration_warmup_factor',
-    'exploration_weight_effective',
-    'exploration_asymmetry',
-    'exploration_asymmetry_q',
-    'exploration_asymmetry_k',
-    'exploration_asymmetry_qk',
-    'exploration_asymmetry_v',
-    'exploration_asymmetry_rst',
-    'exploration_layer_norm_enabled',
-    'exploration_layer_count',
-    'exploration_norm',
-    'rpe_no_active_easy_shutoff_q',
-    'rpe_no_active_easy_shutoff_k',
-    'rpe_no_active_easy_shutoff_v',
-    'rpe_no_active_easy_shutoff_rst',
-    'exploration_loss_weighted_q',
-    'exploration_loss_weighted_k',
-    'exploration_loss_weighted_qk',
-    'exploration_loss_weighted_v',
-    'exploration_loss_weighted_attn',
-    'exploration_loss_weighted_rst',
-    'exploration_loss_weighted_total',
-    'exploration_raw_pre_bound',
-    'exploration_q_pre_bound',
-    'exploration_k_pre_bound',
-    'exploration_qk_pre_bound',
-    'exploration_v_pre_bound',
-    'exploration_raw_post_bound',
-    'global_mean_ce',
-    'pos_frac',
-    'pos_mean',
-    'neg_mean',
-    'rpe_pos_frac',
-    'rpe_pos_avg',
-    'rpe_neg_avg',
-    'rpe_dev_pos',
-    'rpe_dev_neg',
-    'rpe_block_attn',
-    'rpe_block_q',
-    'rpe_block_key',
-    'rpe_block_qk',
-    'rpe_block_v',
-    'rpe_block_rst',
-    'explore_q_raw',
-    'explore_k_raw',
-    'explore_qk_raw',
-    'explore_v_raw',
-    'explore_attn_raw',
-    'explore_rst_raw',
-    'explore_block_frac_q',
-    'explore_block_frac_key',
-    'explore_block_frac_qk',
-    'explore_block_frac_v',
-    'explore_block_frac_a',
-    'explore_block_frac_rst',
-    'explore_block_frac_k',
-    'dev_pos_max',
-    'dev_neg_max',
-)
 
 
 def _fmt_act_count(frac, total):
@@ -5211,10 +5093,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'dead_loss_raw': float(m.get('dead_loss_raw', m.get('dead_penalty', 0.0))),
         'dead_loss_weighted': float(m.get(
             'dead_loss_weighted', m.get('dead_penalty_weighted_total', 0.0))),
-        'rpe_loss_raw': float(m.get(
-            'rpe_loss_raw', m.get('exploration_loss_raw_total', 0.0))),
-        'rpe_loss_weighted': float(m.get(
-            'rpe_loss_weighted', m.get('exploration_loss_weighted_total', 0.0))),
+        'inactive_aux_loss_raw': float(m.get(
+            'inactive_aux_loss_raw', m.get('inactive_aux_loss_raw_total', 0.0))),
+        'inactive_aux_loss_weighted': float(m.get(
+            'inactive_aux_loss_weighted', m.get('inactive_aux_loss_weighted_total', 0.0))),
         'weight_decay_pool': float(m.get(
             'weight_decay_pool', m.get('pool_weight_decay_loss', 0.0))),
         'weight_decay_normal': float(m.get(
@@ -5227,10 +5109,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'dead_loss_raw': float(m.get('dead_loss_raw', m.get('dead_penalty', 0.0))),
         'dead_loss_weighted': float(m.get(
             'dead_loss_weighted', m.get('dead_penalty_weighted_total', 0.0))),
-        'rpe_loss_raw': float(m.get(
-            'rpe_loss_raw', m.get('exploration_loss_raw_total', 0.0))),
-        'rpe_loss_weighted': float(m.get(
-            'rpe_loss_weighted', m.get('exploration_loss_weighted_total', 0.0))),
+        'inactive_aux_loss_raw': float(m.get(
+            'inactive_aux_loss_raw', m.get('inactive_aux_loss_raw_total', 0.0))),
+        'inactive_aux_loss_weighted': float(m.get(
+            'inactive_aux_loss_weighted', m.get('inactive_aux_loss_weighted_total', 0.0))),
         'weight_decay_pool': float(m.get(
             'weight_decay_pool', m.get('pool_weight_decay_loss', 0.0))),
         'weight_decay_normal': float(m.get(
@@ -5313,26 +5195,25 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_soft_dead_frac_eps_1e_6': float(m.get('rst_soft_dead_frac_eps_1e_6', 0.0)),
         'rst_soft_dead_frac_eps_1e_5': float(m.get('rst_soft_dead_frac_eps_1e_5', 0.0)),
         'rst_soft_dead_frac_eps_1e_4': float(m.get('rst_soft_dead_frac_eps_1e_4', 0.0)),
-        # Explore loss (RPE).
-        'explore_loss_raw': float(m.get('explore_loss_raw', 0.0)),
-        'explore_loss_weighted': float(m.get('explore_loss_weighted', 0.0)),
-        'exploration_loss_raw_total': float(m.get(
-            'exploration_loss_raw_total', m.get('explore_loss_raw', 0.0))),
-        'exploration_loss_raw_q': float(m.get(
-            'exploration_loss_raw_q', m.get('explore_q_raw', 0.0))),
-        'exploration_loss_raw_k': float(m.get(
-            'exploration_loss_raw_k', m.get('explore_k_raw', 0.0))),
-        'exploration_loss_raw_qk': float(m.get(
-            'exploration_loss_raw_qk', m.get('explore_qk_raw', 0.0))),
-        'exploration_loss_raw_v': float(m.get(
-            'exploration_loss_raw_v', m.get('explore_v_raw', 0.0))),
-        'exploration_loss_raw_attn': float(m.get(
-            'exploration_loss_raw_attn', m.get('explore_attn_raw', 0.0))),
-        'exploration_loss_raw_rst': float(m.get(
-            'exploration_loss_raw_rst', m.get('explore_rst_raw', 0.0))),
-        'exploration_warmup_factor': float(m.get('exploration_warmup_factor', 0.0)),
-        'exploration_weight_effective': float(m.get(
-            'exploration_weight_effective', 0.0)),
+        'inactive_aux_loss_raw': float(m.get('inactive_aux_loss_raw', 0.0)),
+        'inactive_aux_loss_weighted': float(m.get('inactive_aux_loss_weighted', 0.0)),
+        'inactive_aux_loss_raw_total': float(m.get(
+            'inactive_aux_loss_raw_total', m.get('inactive_aux_loss_raw', 0.0))),
+        'inactive_aux_loss_raw_q': float(m.get(
+            'inactive_aux_loss_raw_q', m.get('inactive_aux_q_raw', 0.0))),
+        'inactive_aux_loss_raw_k': float(m.get(
+            'inactive_aux_loss_raw_k', m.get('inactive_aux_k_raw', 0.0))),
+        'inactive_aux_loss_raw_qk': float(m.get(
+            'inactive_aux_loss_raw_qk', m.get('inactive_aux_qk_raw', 0.0))),
+        'inactive_aux_loss_raw_v': float(m.get(
+            'inactive_aux_loss_raw_v', m.get('inactive_aux_v_raw', 0.0))),
+        'inactive_aux_loss_raw_attn': float(m.get(
+            'inactive_aux_loss_raw_attn', m.get('inactive_aux_attn_raw', 0.0))),
+        'inactive_aux_loss_raw_rst': float(m.get(
+            'inactive_aux_loss_raw_rst', m.get('inactive_aux_rst_raw', 0.0))),
+        'inactive_aux_warmup_factor': float(m.get('inactive_aux_warmup_factor', 0.0)),
+        'inactive_aux_weight_effective': float(m.get(
+            'inactive_aux_weight_effective', 0.0)),
         'soft_gate_T': float(m.get('soft_gate_T', 0.0)),
         'soft_gate_T_qk': float(m.get(
             'soft_gate_T_qk', m.get('soft_gate_T', 0.0))),
@@ -5352,52 +5233,52 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'soft_gate_t_gompertz_center', 0.25)),
         'soft_gate_t_gompertz_steepness': float(ctx.get(
             'soft_gate_t_gompertz_steepness', 8.0)),
-        'rpe_effective_weight': float(m.get(
-            'rpe_effective_weight', m.get('exploration_weight_effective', 0.0))),
-        'rpe_schedule_scale': float(m.get('rpe_schedule_scale', 0.0)),
-        'exploration_asymmetry': float(m.get('exploration_asymmetry', 0.0)),
-        'exploration_asymmetry_q': float(m.get(
-            'exploration_asymmetry_q', m.get('exploration_asymmetry', 0.0))),
-        'exploration_asymmetry_k': float(m.get(
-            'exploration_asymmetry_k', m.get('exploration_asymmetry', 0.0))),
-        'exploration_asymmetry_qk': float(m.get(
-            'exploration_asymmetry_qk', m.get('exploration_asymmetry', 0.0))),
-        'exploration_asymmetry_v': float(m.get(
-            'exploration_asymmetry_v', m.get('exploration_asymmetry', 0.0))),
-        'exploration_asymmetry_rst': float(m.get(
-            'exploration_asymmetry_rst', m.get('exploration_asymmetry', 0.0))),
-        'exploration_layer_norm_enabled': float(m.get(
-            'exploration_layer_norm_enabled', 0.0)),
-        'exploration_layer_count': float(m.get('exploration_layer_count', 0.0)),
-        'exploration_norm': float(m.get('exploration_norm', 0.0)),
-        'rpe_no_active_easy_shutoff_q': float(m.get(
-            'rpe_no_active_easy_shutoff_q', 0.0)),
-        'rpe_no_active_easy_shutoff_k': float(m.get(
-            'rpe_no_active_easy_shutoff_k', 0.0)),
-        'rpe_no_active_easy_shutoff_v': float(m.get(
-            'rpe_no_active_easy_shutoff_v', 0.0)),
-        'rpe_no_active_easy_shutoff_rst': float(m.get(
-            'rpe_no_active_easy_shutoff_rst', 0.0)),
-        'exploration_loss_weighted_q': float(m.get(
-            'exploration_loss_weighted_q', 0.0)),
-        'exploration_loss_weighted_k': float(m.get(
-            'exploration_loss_weighted_k', 0.0)),
-        'exploration_loss_weighted_qk': float(m.get(
-            'exploration_loss_weighted_qk', 0.0)),
-        'exploration_loss_weighted_v': float(m.get(
-            'exploration_loss_weighted_v', 0.0)),
-        'exploration_loss_weighted_attn': float(m.get(
-            'exploration_loss_weighted_attn', 0.0)),
-        'exploration_loss_weighted_rst': float(m.get(
-            'exploration_loss_weighted_rst', 0.0)),
-        'exploration_loss_weighted_total': float(m.get(
-            'exploration_loss_weighted_total', m.get('explore_loss_weighted', 0.0))),
-        'exploration_raw_pre_bound': float(m.get('exploration_raw_pre_bound', 0.0)),
-        'exploration_q_pre_bound': float(m.get('exploration_q_pre_bound', 0.0)),
-        'exploration_k_pre_bound': float(m.get('exploration_k_pre_bound', 0.0)),
-        'exploration_qk_pre_bound': float(m.get('exploration_qk_pre_bound', 0.0)),
-        'exploration_v_pre_bound': float(m.get('exploration_v_pre_bound', 0.0)),
-        'exploration_raw_post_bound': float(m.get('exploration_raw_post_bound', 0.0)),
+        'inactive_aux_effective_weight': float(m.get(
+            'inactive_aux_effective_weight', m.get('inactive_aux_weight_effective', 0.0))),
+        'inactive_aux_schedule_scale': float(m.get('inactive_aux_schedule_scale', 0.0)),
+        'inactive_aux_asymmetry': float(m.get('inactive_aux_asymmetry', 0.0)),
+        'inactive_aux_asymmetry_q': float(m.get(
+            'inactive_aux_asymmetry_q', m.get('inactive_aux_asymmetry', 0.0))),
+        'inactive_aux_asymmetry_k': float(m.get(
+            'inactive_aux_asymmetry_k', m.get('inactive_aux_asymmetry', 0.0))),
+        'inactive_aux_asymmetry_qk': float(m.get(
+            'inactive_aux_asymmetry_qk', m.get('inactive_aux_asymmetry', 0.0))),
+        'inactive_aux_asymmetry_v': float(m.get(
+            'inactive_aux_asymmetry_v', m.get('inactive_aux_asymmetry', 0.0))),
+        'inactive_aux_asymmetry_rst': float(m.get(
+            'inactive_aux_asymmetry_rst', m.get('inactive_aux_asymmetry', 0.0))),
+        'inactive_aux_layer_norm_enabled': float(m.get(
+            'inactive_aux_layer_norm_enabled', 0.0)),
+        'inactive_aux_layer_count': float(m.get('inactive_aux_layer_count', 0.0)),
+        'inactive_aux_norm': float(m.get('inactive_aux_norm', 0.0)),
+        'inactive_aux_no_active_easy_shutoff_q': float(m.get(
+            'inactive_aux_no_active_easy_shutoff_q', 0.0)),
+        'inactive_aux_no_active_easy_shutoff_k': float(m.get(
+            'inactive_aux_no_active_easy_shutoff_k', 0.0)),
+        'inactive_aux_no_active_easy_shutoff_v': float(m.get(
+            'inactive_aux_no_active_easy_shutoff_v', 0.0)),
+        'inactive_aux_no_active_easy_shutoff_rst': float(m.get(
+            'inactive_aux_no_active_easy_shutoff_rst', 0.0)),
+        'inactive_aux_loss_weighted_q': float(m.get(
+            'inactive_aux_loss_weighted_q', 0.0)),
+        'inactive_aux_loss_weighted_k': float(m.get(
+            'inactive_aux_loss_weighted_k', 0.0)),
+        'inactive_aux_loss_weighted_qk': float(m.get(
+            'inactive_aux_loss_weighted_qk', 0.0)),
+        'inactive_aux_loss_weighted_v': float(m.get(
+            'inactive_aux_loss_weighted_v', 0.0)),
+        'inactive_aux_loss_weighted_attn': float(m.get(
+            'inactive_aux_loss_weighted_attn', 0.0)),
+        'inactive_aux_loss_weighted_rst': float(m.get(
+            'inactive_aux_loss_weighted_rst', 0.0)),
+        'inactive_aux_loss_weighted_total': float(m.get(
+            'inactive_aux_loss_weighted_total', m.get('inactive_aux_loss_weighted', 0.0))),
+        'inactive_aux_raw_pre_bound': float(m.get('inactive_aux_raw_pre_bound', 0.0)),
+        'inactive_aux_q_pre_bound': float(m.get('inactive_aux_q_pre_bound', 0.0)),
+        'inactive_aux_k_pre_bound': float(m.get('inactive_aux_k_pre_bound', 0.0)),
+        'inactive_aux_qk_pre_bound': float(m.get('inactive_aux_qk_pre_bound', 0.0)),
+        'inactive_aux_v_pre_bound': float(m.get('inactive_aux_v_pre_bound', 0.0)),
+        'inactive_aux_raw_post_bound': float(m.get('inactive_aux_raw_post_bound', 0.0)),
         # CB1A boundary audition loss.
         'cb1a_enabled': bool(ctx.get('cb1a_enabled', False)),
         'cb1a_ce_mean': float(m.get('cb1a_ce_mean', 0.0)),
@@ -5911,43 +5792,42 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_z_mean_active': float(m.get('rst_z_mean_active', 0.0)),
         'attn_qk_z_mean_active': float(m.get('attn_qk_z_mean_active', 0.0)),
         'attn_v_z_mean_active': float(m.get('attn_v_z_mean_active', 0.0)),
-        # RPE exploration diag.
         'global_mean_ce': float(m.get('global_mean_ce', 0.0)),
         'pos_frac': float(m.get('pos_frac', 0.0)),
         'pos_mean': float(m.get('pos_mean', 0.0)),
         'neg_mean': float(m.get('neg_mean', 0.0)),
-        'rpe_pos_frac': float(m.get('rpe_pos_frac', m.get('pos_frac', 0.0))),
-        'rpe_pos_avg': float(m.get('rpe_pos_avg', m.get('pos_mean', 0.0))),
-        'rpe_neg_avg': float(m.get('rpe_neg_avg', m.get('neg_mean', 0.0))),
-        'rpe_dev_pos': float(m.get('rpe_dev_pos', m.get('dev_pos_max', 0.0))),
-        'rpe_dev_neg': float(m.get('rpe_dev_neg', m.get('dev_neg_max', 0.0))),
-        'rpe_block_attn': float(m.get(
-            'rpe_block_attn', m.get('explore_block_frac_a', 0.0))),
-        'rpe_block_q': float(m.get(
-            'rpe_block_q', m.get('explore_block_frac_q', 0.0))),
-        'rpe_block_key': float(m.get(
-            'rpe_block_key', m.get('explore_block_frac_key', 0.0))),
-        'rpe_block_qk': float(m.get(
-            'rpe_block_qk', m.get('explore_block_frac_qk', 0.0))),
-        'rpe_block_v': float(m.get(
-            'rpe_block_v', m.get('explore_block_frac_v', 0.0))),
-        'rpe_block_rst': float(m.get(
-            'rpe_block_rst', m.get(
-                'explore_block_frac_rst', m.get('explore_block_frac_k', 0.0)))),
-        'explore_q_raw': float(m.get('explore_q_raw', 0.0)),
-        'explore_k_raw': float(m.get('explore_k_raw', 0.0)),
-        'explore_qk_raw': float(m.get('explore_qk_raw', 0.0)),
-        'explore_v_raw': float(m.get('explore_v_raw', 0.0)),
-        'explore_attn_raw': float(m.get('explore_attn_raw', 0.0)),
-        'explore_rst_raw': float(m.get('explore_rst_raw', 0.0)),
-        'explore_block_frac_q': float(m.get('explore_block_frac_q', 0.0)),
-        'explore_block_frac_key': float(m.get('explore_block_frac_key', 0.0)),
-        'explore_block_frac_qk': float(m.get('explore_block_frac_qk', 0.0)),
-        'explore_block_frac_v': float(m.get('explore_block_frac_v', 0.0)),
-        'explore_block_frac_a': float(m.get('explore_block_frac_a', 0.0)),
-        'explore_block_frac_rst': float(m.get(
-            'explore_block_frac_rst', m.get('explore_block_frac_k', 0.0))),
-        'explore_block_frac_k': float(m.get('explore_block_frac_k', 0.0)),
+        'inactive_aux_pos_frac': float(m.get('inactive_aux_pos_frac', m.get('pos_frac', 0.0))),
+        'inactive_aux_pos_avg': float(m.get('inactive_aux_pos_avg', m.get('pos_mean', 0.0))),
+        'inactive_aux_neg_avg': float(m.get('inactive_aux_neg_avg', m.get('neg_mean', 0.0))),
+        'inactive_aux_dev_pos': float(m.get('inactive_aux_dev_pos', m.get('dev_pos_max', 0.0))),
+        'inactive_aux_dev_neg': float(m.get('inactive_aux_dev_neg', m.get('dev_neg_max', 0.0))),
+        'inactive_aux_block_attn': float(m.get(
+            'inactive_aux_block_attn', m.get('inactive_aux_block_frac_a', 0.0))),
+        'inactive_aux_block_q': float(m.get(
+            'inactive_aux_block_q', m.get('inactive_aux_block_frac_q', 0.0))),
+        'inactive_aux_block_key': float(m.get(
+            'inactive_aux_block_key', m.get('inactive_aux_block_frac_key', 0.0))),
+        'inactive_aux_block_qk': float(m.get(
+            'inactive_aux_block_qk', m.get('inactive_aux_block_frac_qk', 0.0))),
+        'inactive_aux_block_v': float(m.get(
+            'inactive_aux_block_v', m.get('inactive_aux_block_frac_v', 0.0))),
+        'inactive_aux_block_rst': float(m.get(
+            'inactive_aux_block_rst', m.get(
+                'inactive_aux_block_frac_rst', m.get('inactive_aux_block_frac_k', 0.0)))),
+        'inactive_aux_q_raw': float(m.get('inactive_aux_q_raw', 0.0)),
+        'inactive_aux_k_raw': float(m.get('inactive_aux_k_raw', 0.0)),
+        'inactive_aux_qk_raw': float(m.get('inactive_aux_qk_raw', 0.0)),
+        'inactive_aux_v_raw': float(m.get('inactive_aux_v_raw', 0.0)),
+        'inactive_aux_attn_raw': float(m.get('inactive_aux_attn_raw', 0.0)),
+        'inactive_aux_rst_raw': float(m.get('inactive_aux_rst_raw', 0.0)),
+        'inactive_aux_block_frac_q': float(m.get('inactive_aux_block_frac_q', 0.0)),
+        'inactive_aux_block_frac_key': float(m.get('inactive_aux_block_frac_key', 0.0)),
+        'inactive_aux_block_frac_qk': float(m.get('inactive_aux_block_frac_qk', 0.0)),
+        'inactive_aux_block_frac_v': float(m.get('inactive_aux_block_frac_v', 0.0)),
+        'inactive_aux_block_frac_a': float(m.get('inactive_aux_block_frac_a', 0.0)),
+        'inactive_aux_block_frac_rst': float(m.get(
+            'inactive_aux_block_frac_rst', m.get('inactive_aux_block_frac_k', 0.0))),
+        'inactive_aux_block_frac_k': float(m.get('inactive_aux_block_frac_k', 0.0)),
         'dev_pos_max': float(m.get('dev_pos_max', 0.0)),
         'dev_neg_max': float(m.get('dev_neg_max', 0.0)),
         'timestamp': datetime.now().isoformat(),
@@ -6088,7 +5968,7 @@ def _print_cb1a_regular_block(rec):
 
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
-    is_v4160 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
+    is_v4164 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
     is_v4162_soft = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
     is_v4162_compact = False
     aux_note = (
@@ -6102,7 +5982,7 @@ def _print_regular_block(rec, ctx):
         f"grad={rec['grad_norm']:.2f} | "
         f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
     )
-    if is_v4160:
+    if is_v4164:
         if is_v4162_soft:
             log_message(
                 f"  strong: q={rec['attn_q_strong']*100:.1f}%"
@@ -6160,7 +6040,7 @@ def _print_regular_block(rec, ctx):
             f" no_active[a={rec['attn_no_active_frac']*100:.2f}%"
             f" rst={rec['rst_no_active_frac']*100:.2f}%]"
         )
-    elif is_v4160:
+    elif is_v4164:
         _weight_label = (
             'admission'
             if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
@@ -6196,7 +6076,7 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['rst_positive_margin_mean']:.4f}]"
             f"{_select_status}"
         )
-    if is_v4160 and not is_v4162_soft:
+    if is_v4164 and not is_v4162_soft:
         log_message(
             f"  gate_max[qk={rec['attn_qk_raw_gate_max']:.1f}"
             f" v={rec['attn_v_raw_gate_max']:.1f}"
@@ -6210,7 +6090,7 @@ def _print_regular_block(rec, ctx):
             f" v={rec['drift_attn_v_emb']:.2e}"
             f" rst={rec['drift_rst_emb']:.2e}]"
         )
-    elif not is_v4160:
+    elif not is_v4164:
         log_message(
             f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
             f" rst={rec['rst_raw_gate_max']:.1f}]"
@@ -6222,40 +6102,7 @@ def _print_regular_block(rec, ctx):
         )
     if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
         pass
-    elif ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
-        log_message(
-            f"  soft_exposure: mean[a={rec['attn_angular_exposure_mean']:+.4f}"
-            f" rst={rec['rst_angular_exposure_mean']:+.4f}]"
-            f" min[a={rec['attn_angular_exposure_min']:+.4f}"
-            f" rst={rec['rst_angular_exposure_min']:+.4f}]"
-            f" max[a={rec['attn_angular_exposure_max']:+.4f}"
-            f" rst={rec['rst_angular_exposure_max']:+.4f}]"
-            f" dead[a={rec['attn_dead_exposure_frac']*100:.2f}%"
-            f" rst={rec['rst_dead_exposure_frac']*100:.2f}%]"
-            f" weak[a={rec['attn_weak_exposure_frac']*100:.2f}%"
-            f" rst={rec['rst_weak_exposure_frac']*100:.2f}%]"
-            f" target={rec['attn_dead_exposure_target']:.3f}"
-        )
-    elif is_v4160:
-        log_message(
-            f"  soft_exposure: mean[qk={rec['attn_qk_angular_exposure_mean']:+.4f}"
-            f" v={rec['attn_v_angular_exposure_mean']:+.4f}"
-            f" rst={rec['rst_angular_exposure_mean']:+.4f}]"
-            f" min[qk={rec['attn_qk_angular_exposure_min']:+.4f}"
-            f" v={rec['attn_v_angular_exposure_min']:+.4f}"
-            f" rst={rec['rst_angular_exposure_min']:+.4f}]"
-            f" max[qk={rec['attn_qk_angular_exposure_max']:+.4f}"
-            f" v={rec['attn_v_angular_exposure_max']:+.4f}"
-            f" rst={rec['rst_angular_exposure_max']:+.4f}]"
-            f" dead[qk={rec['attn_qk_dead_exposure_frac']*100:.2f}%"
-            f" v={rec['attn_v_dead_exposure_frac']*100:.2f}%"
-            f" rst={rec['rst_dead_exposure_frac']*100:.2f}%]"
-            f" weak[qk={rec['attn_qk_weak_exposure_frac']*100:.2f}%"
-            f" v={rec['attn_v_weak_exposure_frac']*100:.2f}%"
-            f" rst={rec['rst_weak_exposure_frac']*100:.2f}%]"
-            f" target={rec['attn_qk_dead_exposure_target']:.3f}"
-        )
-    if is_v4160:
+    if is_v4164:
         _pool_scale_part = ""
         if not is_v4162_compact:
             _pool_scale_part = (
@@ -6317,7 +6164,7 @@ def _print_regular_block(rec, ctx):
         )
     if ctx.get('model_version') in (
             OFFICIAL_MODEL_VERSION):
-        if is_v4160:
+        if is_v4164:
             if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
                 pass
             else:
@@ -6363,7 +6210,7 @@ def _print_regular_block(rec, ctx):
         rec.get('update_cap_scan_attn_scale', 1.0),
         rec.get('update_cap_scan_rst_scale', 1.0),
     )
-    if is_v4160 and _update_cap_hit_total > 0.0:
+    if is_v4164 and _update_cap_hit_total > 0.0:
         raw_tau_part = ""
         raw_tau_hit_part = ""
         if rec.get('update_cap_raw_tau_enabled', 0.0) > 0.0:
@@ -6423,10 +6270,10 @@ def _print_regular_block(rec, ctx):
             f" r={rec.get('update_cap_scan_rst_abs_pre', 0.0):.1e}]"
         )
     _cap_window_line = _format_update_cap_window_line(
-        rec, indent="  ", is_v4160=is_v4160)
+        rec, indent="  ", is_v4164=is_v4164)
     if _cap_window_line:
         log_message(_cap_window_line)
-    if is_v4160:
+    if is_v4164:
         log_message(
             f"  tau: tau_mean[qk={rec['attn_qk_tau_mean']:+.3f}"
             f" v={rec['attn_v_tau_mean']:+.3f}"
@@ -6458,7 +6305,7 @@ def _print_regular_block(rec, ctx):
             f" p99={rec['attn_tau_off_p99']:+.2f} max={rec['attn_tau_off_max']:+.2f}"
             f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
         )
-    elif is_v4160 and not is_v4162_soft:
+    elif is_v4164 and not is_v4162_soft:
         rst_raw_tau_min = rec.get('rst_raw_tau_min', rec.get('rst_raw_tau_mean', 0.0))
         rst_raw_tau_max = rec.get('rst_raw_tau_max', rec.get('rst_raw_tau_mean', 0.0))
         qk_raw_tau_min = rec.get(
@@ -6477,7 +6324,7 @@ def _print_regular_block(rec, ctx):
     route_std_label = (
         "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
         else "score_std")
-    if is_v4160 and not is_v4162_soft:
+    if is_v4164 and not is_v4162_soft:
         log_message(
             f"  emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
             f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
@@ -6486,7 +6333,7 @@ def _print_regular_block(rec, ctx):
             f" v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
             f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
         )
-    elif not is_v4160:
+    elif not is_v4164:
         log_message(
             f"  {route_std_label}[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
             f" | emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
@@ -6519,46 +6366,6 @@ def _print_regular_block(rec, ctx):
             f" k[m={rec['rst_op_gain_mean']:.2f} s={rec['rst_op_gain_std']:.2f}"
             f" max={rec['rst_op_gain_max']:.2f}]"
         )
-    if ctx.get('rpe_enabled', True):
-        if is_v4160 or ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
-            log_message(
-                f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
-                f" pos={rec['pos_frac']*100:.1f}%"
-                f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-                f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
-                f" norm[layer_norm={rec['exploration_layer_norm_enabled']:.0f}"
-                f" layer_count={rec['exploration_layer_count']:.0f}"
-                f" norm={rec['exploration_norm']:.1f}]"
-                f" rpe_guard: shutoff[q={rec['rpe_no_active_easy_shutoff_q']*100:.1f}%"
-                f" k={rec['rpe_no_active_easy_shutoff_k']*100:.1f}%"
-                f" v={rec['rpe_no_active_easy_shutoff_v']*100:.1f}%"
-                f" rst={rec['rpe_no_active_easy_shutoff_rst']*100:.1f}%]"
-                f" expl[q={rec['explore_q_raw']:+.3f}"
-                f" k={rec['explore_k_raw']:+.3f}"
-                f" v={rec['explore_v_raw']:+.3f}"
-                f" rst={rec['explore_rst_raw']:+.3f}"
-                f" total={rec['explore_loss_raw']:+.3f}]"
-                f" weighted[q={rec['exploration_loss_weighted_q']:+.4f}"
-                f" k={rec['exploration_loss_weighted_k']:+.4f}"
-                f" v={rec['exploration_loss_weighted_v']:+.4f}"
-                f" rst={rec['exploration_loss_weighted_rst']:+.4f}"
-                f" total={rec['explore_loss_weighted']:+.4f}]"
-                f" block[q={rec['explore_block_frac_q']*100:.1f}%"
-                f" k={rec['explore_block_frac_key']*100:.1f}%"
-                f" v={rec['explore_block_frac_v']*100:.1f}%"
-                f" rst={rec['explore_block_frac_rst']*100:.1f}%]"
-            )
-        else:
-            log_message(
-                f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
-                f" pos={rec['pos_frac']*100:.1f}%"
-                f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-                f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
-                f" expl[a={rec['explore_attn_raw']:+.3f} rst={rec['explore_rst_raw']:+.3f}]"
-                f" w={rec['explore_loss_weighted']:+.4f}"
-                f" block[a={rec['explore_block_frac_a']*100:.1f}%"
-                f" rst={rec['explore_block_frac_rst']*100:.1f}%]"
-            )
     if _should_print_cb1a_line(rec, ctx):
         _print_cb1a_regular_block(rec)
     _pl_a = rec.get('per_layer_attn_out_norm', []) or []
@@ -6644,13 +6451,13 @@ def _fmt_grad_array(rec, key):
     return "[" + ", ".join(f"{float(v):.6g}" for v in arr) + "]"
 
 
-def _print_grad_layer_block(rec, is_v4160=False):
+def _print_grad_layer_block(rec, is_v4164=False):
     if 'grad_expand_O_per_layer' not in rec:
         return
     log_debug_message("[GRAD_LAYER]")
     log_debug_message(
         "shared_note=router/pool_rw are shared params; single-entry arrays are pool-level")
-    if is_v4160:
+    if is_v4164:
         raw_tau_items = (
             ('raw_tau_qk', 'grad_router_raw_tau_qk_per_layer'),
             ('raw_tau_v', 'grad_router_raw_tau_v_per_layer'),
@@ -6697,7 +6504,7 @@ def _print_drop_compare_block(rec):
 
 
 def _print_debug_block(rec, ctx):
-    is_v4160 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
+    is_v4164 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
 
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
@@ -6732,13 +6539,7 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('soft_gate_T_rst', _g('soft_gate_T')):.6f}"
             f"{_power_part}"
         )
-        log_debug_message(
-            f"rpe_effective_weight={_g('rpe_effective_weight', _g('exploration_weight_effective')):.6f} "
-            f"rpe_schedule_scale={_g('rpe_schedule_scale'):.3f}"
-        )
-    rpe_loss_terms = (
-        f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
-        f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
+    aux_loss_terms = (
         f"cb1a_raw={_g('cb1a_raw'):+.6f} "
         f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
     )
@@ -6752,14 +6553,14 @@ def _print_debug_block(rec, ctx):
         f"load_balance_w={_g('load_balance_loss_weighted', _g('aux_weighted')):.6f} "
         f"dead_raw={_g('dead_penalty_raw_total', _g('dead_penalty')):.6f} "
         f"dead_w={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f} "
-        f"{rpe_loss_terms}"
+        f"{aux_loss_terms}"
         f"wd_pool={_g('pool_weight_decay_loss'):.6f} "
         f"wd_normal={_g('normal_weight_decay_loss'):.6f} "
         f"total_minus_ce={_g('total_loss_minus_ce'):.6f} "
         f"reconstructed={_g('reconstructed_total_loss'):.6f} "
         f"recon_err={_g('reconstructed_loss_error'):.3e}"
     )
-    if is_v4160:
+    if is_v4164:
         _qk_per_dead = _g('attn_qk_dead_penalty') / max(_g('attn_qk_dead_count'), 1.0)
         _v_per_dead = _g('attn_v_dead_penalty') / max(_g('attn_v_dead_count'), 1.0)
         log_debug_message(
@@ -6854,7 +6655,7 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('rst_weak_exposure_frac'):.5f}] "
             f"target={_g('attn_dead_exposure_target'):.5f}"
         )
-    elif is_v4160:
+    elif is_v4164:
         log_debug_message(
             f"soft_exposure_diag: "
             f"mean[qk={_g('attn_qk_angular_exposure_mean'):+.5f} "
@@ -6874,68 +6675,7 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('rst_weak_exposure_frac'):.5f}] "
             f"target={_g('attn_qk_dead_exposure_target'):.5f}"
         )
-    if is_v4160 or ctx.get('model_version') == 'spatial-r1-v4.1.6.1':
-        log_debug_message(
-            f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
-            f"w_eff={_g('exploration_weight_effective'):.6f} "
-            f"norm[layer_norm={_g('exploration_layer_norm_enabled'):.0f} "
-            f"layer_count={_g('exploration_layer_count'):.0f} "
-            f"norm={_g('exploration_norm'):.1f}] "
-            f"rpe_guard: shutoff[q={_g('rpe_no_active_easy_shutoff_q'):.3f} "
-            f"k={_g('rpe_no_active_easy_shutoff_k'):.3f} "
-            f"v={_g('rpe_no_active_easy_shutoff_v'):.3f} "
-            f"rst={_g('rpe_no_active_easy_shutoff_rst'):.3f}] "
-            f"asym[q={_g('exploration_asymmetry_q', _g('exploration_asymmetry')):.3f} "
-            f"k={_g('exploration_asymmetry_k', _g('exploration_asymmetry')):.3f} "
-            f"v={_g('exploration_asymmetry_v', _g('exploration_asymmetry')):.3f} "
-            f"rst={_g('exploration_asymmetry_rst', _g('exploration_asymmetry')):.3f}] "
-            f"raw[q={_g('exploration_loss_raw_q', _g('explore_q_raw')):+.6f} "
-            f"k={_g('exploration_loss_raw_k', _g('explore_k_raw')):+.6f} "
-            f"v={_g('exploration_loss_raw_v', _g('explore_v_raw')):+.6f} "
-            f"rst={_g('exploration_loss_raw_rst', _g('explore_rst_raw')):+.6f} "
-            f"total={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f}] "
-            f"weighted[q={_g('exploration_loss_weighted_q'):+.6f} "
-            f"k={_g('exploration_loss_weighted_k'):+.6f} "
-            f"v={_g('exploration_loss_weighted_v'):+.6f} "
-            f"rst={_g('exploration_loss_weighted_rst'):+.6f} "
-            f"total={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f}] "
-            f"pre_bound[q={_g('exploration_q_pre_bound'):+.6f} "
-            f"k={_g('exploration_k_pre_bound'):+.6f} "
-            f"v={_g('exploration_v_pre_bound'):+.6f} "
-            f"total={_g('exploration_raw_pre_bound'):+.6f}] "
-            f"post_bound={_g('exploration_raw_post_bound'):+.6f} "
-            f"rpe[pos_frac={_g('rpe_pos_frac', _g('pos_frac')):.3f} "
-            f"pos_avg={_g('rpe_pos_avg', _g('pos_mean')):.4f} "
-            f"neg_avg={_g('rpe_neg_avg', _g('neg_mean')):.4f} "
-            f"dev_pos={_g('rpe_dev_pos', _g('dev_pos_max')):.4f} "
-            f"dev_neg={_g('rpe_dev_neg', _g('dev_neg_max')):.4f} "
-            f"block[q={_g('rpe_block_q', _g('explore_block_frac_q')):.3f} "
-            f"k={_g('rpe_block_key', _g('explore_block_frac_key')):.3f} "
-            f"v={_g('rpe_block_v', _g('explore_block_frac_v')):.3f} "
-            f"rst={_g('rpe_block_rst', _g('explore_block_frac_rst')):.3f}]]"
-        )
-    else:
-        log_debug_message(
-            f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
-            f"w_eff={_g('exploration_weight_effective'):.6f} "
-            f"asym={_g('exploration_asymmetry'):.3f} "
-            f"raw[a={_g('exploration_loss_raw_attn', _g('explore_attn_raw')):+.6f} "
-            f"rst={_g('exploration_loss_raw_rst', _g('explore_rst_raw')):+.6f} "
-            f"total={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f}] "
-            f"weighted[a={_g('exploration_loss_weighted_attn'):+.6f} "
-            f"rst={_g('exploration_loss_weighted_rst'):+.6f} "
-            f"total={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f}] "
-            f"pre_bound={_g('exploration_raw_pre_bound'):+.6f} "
-            f"post_bound={_g('exploration_raw_post_bound'):+.6f} "
-            f"rpe[pos_frac={_g('rpe_pos_frac', _g('pos_frac')):.3f} "
-            f"pos_avg={_g('rpe_pos_avg', _g('pos_mean')):.4f} "
-            f"neg_avg={_g('rpe_neg_avg', _g('neg_mean')):.4f} "
-            f"dev_pos={_g('rpe_dev_pos', _g('dev_pos_max')):.4f} "
-            f"dev_neg={_g('rpe_dev_neg', _g('dev_neg_max')):.4f} "
-            f"block_attn={_g('rpe_block_attn', _g('explore_block_frac_a')):.3f} "
-            f"block_rst={_g('rpe_block_rst', _g('explore_block_frac_rst')):.3f}]"
-        )
-    if is_v4160:
+    if is_v4164:
         log_debug_message(
             f"route_diag: active_n[q={_g('attn_q_active') * ctx.get('n_qk_cfg', 0):.1f} "
             f"k={_g('attn_k_active') * ctx.get('n_qk_cfg', 0):.1f} "
@@ -7093,7 +6833,7 @@ def _print_debug_block(rec, ctx):
     route_std_label = (
         "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
         else "score_std")
-    if is_v4160:
+    if is_v4164:
         log_debug_message(
             f"tau_diag: tau_abs[qk={_g('attn_qk_tau_abs_mean'):.4f} "
             f"v={_g('attn_v_tau_abs_mean'):.4f} "
@@ -7158,7 +6898,7 @@ def _print_debug_block(rec, ctx):
         f"layer_attn_max={_layer_max('per_layer_attn_out_norm'):.3f} "
         f"layer_rst_max={_layer_max('per_layer_rst_out_norm'):.3f}"
     )
-    if is_v4160:
+    if is_v4164:
         log_debug_message(
             f"raw_tau_grad[qk={_g('grad_router_raw_tau_qk'):.6f} "
             f"v={_g('grad_router_raw_tau_v'):.6f} "
@@ -7189,7 +6929,7 @@ def _print_debug_block(rec, ctx):
         f"ln={_g('grad_layernorms'):.6f} "
         f"lm_head_or_token_tied={_g('grad_lm_head_or_token_tied'):.6f}"
     )
-    if is_v4160:
+    if is_v4164:
         raw_tau_part = ""
         if _g('update_cap_raw_tau_enabled') > 0.0:
             raw_tau_part = (
@@ -7261,10 +7001,10 @@ def _print_debug_block(rec, ctx):
             f"hit={_g('update_cap_scan_rst_hit'):.0f}]"
         )
     _cap_window_line = _format_update_cap_window_line(
-        rec, indent="", is_v4160=is_v4160)
+        rec, indent="", is_v4164=is_v4164)
     if _cap_window_line:
         log_debug_message(_cap_window_line)
-    _print_grad_layer_block(rec, is_v4160=is_v4160)
+    _print_grad_layer_block(rec, is_v4164=is_v4164)
     reasons = []
     log_debug_message("")
 
@@ -7630,7 +7370,7 @@ def _build_analysis_record(base, metrics, ctx):
 def _print_analysis_block(rec, ctx):
     # Analysis logging must never kill a run.  Missing optional fields are
     # printed as 0.0 instead of raising KeyError.
-    is_v4160 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
+    is_v4164 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
 
     def _g(key, default=0.0):
         return float(rec.get(key, default))
@@ -7653,7 +7393,7 @@ def _print_analysis_block(rec, ctx):
         f" a[skew={rec['attn_score_skew']:+.2f} kurt={rec['attn_score_kurt']:.2f}"
         f" apt_std={rec['attn_active_per_token_std']:.1f} ent={rec['attn_gate_entropy']:.2f}]"
     )
-    if is_v4160:
+    if is_v4164:
         log_message(
             f"  rho_stats qk[mean={_g('attn_qk_rho_mean'):+.5f}"
             f" std={_g('attn_qk_rho_std'):.5f}"
@@ -7707,7 +7447,7 @@ def _print_analysis_block(rec, ctx):
         f" v[{_full('attn_v_op_gain')}]"
         f" k[{_full('rst_op_gain')}]"
     )
-    if is_v4160:
+    if is_v4164:
         log_message(
             f"  gate_conc qk[eff={rec['attn_qk_gate_eff_n']:.1f}"
             f" ratio={rec['attn_qk_gate_eff_ratio']:.3f}"
@@ -7739,7 +7479,7 @@ def _print_analysis_block(rec, ctx):
         )
     if ctx.get('model_version') in (
             OFFICIAL_MODEL_VERSION):
-        if is_v4160:
+        if is_v4164:
             log_message(
                 f"  admission_den: qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
                 f" v={rec['attn_v_gate_den_sum_mean']:.1f}"
@@ -7860,12 +7600,6 @@ def main():
                         help='Override batch_size from config (global)')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override learning rate from config')
-    parser.add_argument('--debug', nargs='?', const=1, default=0, type=int,
-                        help=('Write detailed diagnostics to a separate debug log '
-                              'every N steps (default N=1 when flag is present)'))
-    parser.add_argument('--debug-drop-compare', action='store_true',
-                        help=('Reserved for tiny opt-in debug/val forwards; '
-                              'never runs on the current train batch.'))
     parser.add_argument('--oom-check', action='store_true',
                         help=('Run the startup OOM/JIT train_step probe '
                               '(disabled by default; can also set '
@@ -7895,7 +7629,6 @@ def main():
     set_seed(seed)
 
     # Training params (from YAML first, may be overridden by checkpoint config below).
-    # Keep the CLI surface small: --debug controls cadence.
     tcfg = cfg['training']
     model_version_cfg = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     is_v4164_cfg = model_version_cfg == OFFICIAL_MODEL_VERSION
@@ -7909,8 +7642,8 @@ def main():
         cli_args.resume
         or tcfg.get('resume_from')
         or cfg.get('resume_from'))
-    debug_interval = max(0, int(cli_args.debug or 0))
-    debug_mode = debug_interval > 0
+    debug_interval = 0
+    debug_mode = False
     run_speed_check = bool(
         cli_args.speed_check
         or tcfg.get('speed_check', tcfg.get('run_speed_check', False)))
@@ -7929,7 +7662,6 @@ def main():
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
     weight_decay = tcfg.get('weight_decay', 0.1)
-    # v4164 official path: auxiliary exploration/RPE/dead/load-balance
     # losses are off. Keep optimizer weight_decay separate below.
     pool_weight_decay = 0.0
     warmup_ratio = tcfg.get('warmup_ratio', 0.06)
@@ -7942,29 +7674,29 @@ def main():
     dead_penalty_v_weight = 0.0
     dead_penalty_rst_weight = 0.0
     dead_exposure_target = 0.0
-    exploration_weight = 0.0
-    exploration_weight_qk = 0.0
-    exploration_weight_q = 0.0
-    exploration_weight_k = 0.0
-    exploration_weight_v = 0.0
-    exploration_weight_rst = 0.0
-    exploration_asymmetry = 0.0
-    exploration_asymmetry_qk = 0.0
-    exploration_asymmetry_q = 0.0
-    exploration_asymmetry_k = 0.0
-    exploration_asymmetry_v = 0.0
-    exploration_asymmetry_rst = 0.0
-    exploration_warmup_steps = 0
-    exploration_lower_bound = 0.0
-    exploration_upper_bound = 0.0
-    exploration_bound_eps = 0.0
-    exploration_dev_mode = 'raw'
-    exploration_ce_clip_std = 0.0
-    exploration_z_clip = 0.0
-    exploration_z_tanh = False
-    exploration_weighted_clip = 0.0
-    exploration_normalize_by_layers = True
-    rpe_enabled = False
+    inactive_aux_weight = 0.0
+    inactive_aux_weight_qk = 0.0
+    inactive_aux_weight_q = 0.0
+    inactive_aux_weight_k = 0.0
+    inactive_aux_weight_v = 0.0
+    inactive_aux_weight_rst = 0.0
+    inactive_aux_asymmetry = 0.0
+    inactive_aux_asymmetry_qk = 0.0
+    inactive_aux_asymmetry_q = 0.0
+    inactive_aux_asymmetry_k = 0.0
+    inactive_aux_asymmetry_v = 0.0
+    inactive_aux_asymmetry_rst = 0.0
+    inactive_aux_warmup_steps = 0
+    inactive_aux_lower_bound = 0.0
+    inactive_aux_upper_bound = 0.0
+    inactive_aux_bound_eps = 0.0
+    inactive_aux_dev_mode = 'raw'
+    inactive_aux_ce_clip_std = 0.0
+    inactive_aux_z_clip = 0.0
+    inactive_aux_z_tanh = False
+    inactive_aux_weighted_clip = 0.0
+    inactive_aux_normalize_by_layers = True
+    inactive_aux_enabled = False
     soft_gate_schedule_active = True
     soft_gate_t_start = float(tcfg.get('soft_gate_t_start', 1.5))
     soft_gate_t_final = float(tcfg.get('soft_gate_t_final', 0.07))
@@ -8045,22 +7777,22 @@ def main():
         sorted(k for k in tcfg if k.startswith('tau_ce_grad_scale'))
         if model_version_cfg == OFFICIAL_MODEL_VERSION
         else [])
-    rpe_start_frac = 0.0
-    rpe_full_frac = 0.0
-    rpe_schedule = 'linear'
-    if not rpe_enabled:
-        exploration_weight = 0.0
-        exploration_weight_q = 0.0
-        exploration_weight_k = 0.0
-        exploration_weight_qk = 0.0
-        exploration_weight_v = 0.0
-        exploration_weight_rst = 0.0
-        exploration_asymmetry_q = 0.0
-        exploration_asymmetry_k = 0.0
-        exploration_asymmetry_qk = 0.0
-        exploration_asymmetry_v = 0.0
-        exploration_asymmetry_rst = 0.0
-        exploration_weighted_clip = 0.0
+    inactive_aux_start_frac = 0.0
+    inactive_aux_full_frac = 0.0
+    inactive_aux_schedule = 'linear'
+    if not inactive_aux_enabled:
+        inactive_aux_weight = 0.0
+        inactive_aux_weight_q = 0.0
+        inactive_aux_weight_k = 0.0
+        inactive_aux_weight_qk = 0.0
+        inactive_aux_weight_v = 0.0
+        inactive_aux_weight_rst = 0.0
+        inactive_aux_asymmetry_q = 0.0
+        inactive_aux_asymmetry_k = 0.0
+        inactive_aux_asymmetry_qk = 0.0
+        inactive_aux_asymmetry_v = 0.0
+        inactive_aux_asymmetry_rst = 0.0
+        inactive_aux_weighted_clip = 0.0
     cb1a_enabled = False
     cb1a_weight = 0.0
     cb1a_challenge_weight = 0.0
@@ -8374,20 +8106,20 @@ def main():
             dead_penalty_v_weight = 0.0
             dead_penalty_rst_weight = 0.0
             dead_exposure_target = 0.0
-            rpe_enabled = False
-            exploration_weight = 0.0
-            exploration_weight_q = 0.0
-            exploration_weight_k = 0.0
-            exploration_weight_qk = 0.0
-            exploration_weight_v = 0.0
-            exploration_weight_rst = 0.0
-            exploration_asymmetry = 0.0
-            exploration_asymmetry_q = 0.0
-            exploration_asymmetry_k = 0.0
-            exploration_asymmetry_qk = 0.0
-            exploration_asymmetry_v = 0.0
-            exploration_asymmetry_rst = 0.0
-            exploration_weighted_clip = 0.0
+            inactive_aux_enabled = False
+            inactive_aux_weight = 0.0
+            inactive_aux_weight_q = 0.0
+            inactive_aux_weight_k = 0.0
+            inactive_aux_weight_qk = 0.0
+            inactive_aux_weight_v = 0.0
+            inactive_aux_weight_rst = 0.0
+            inactive_aux_asymmetry = 0.0
+            inactive_aux_asymmetry_q = 0.0
+            inactive_aux_asymmetry_k = 0.0
+            inactive_aux_asymmetry_qk = 0.0
+            inactive_aux_asymmetry_v = 0.0
+            inactive_aux_asymmetry_rst = 0.0
+            inactive_aux_weighted_clip = 0.0
             dead_penalty_weighted_clip = 0.0
             cb1a_enabled = False
             cb1a_weight = 0.0
@@ -8455,20 +8187,20 @@ def main():
             dead_penalty_v_weight = 0.0
             dead_penalty_rst_weight = 0.0
             dead_exposure_target = 0.0
-            rpe_enabled = False
-            exploration_weight = 0.0
-            exploration_weight_q = 0.0
-            exploration_weight_k = 0.0
-            exploration_weight_qk = 0.0
-            exploration_weight_v = 0.0
-            exploration_weight_rst = 0.0
-            exploration_asymmetry = 0.0
-            exploration_asymmetry_q = 0.0
-            exploration_asymmetry_k = 0.0
-            exploration_asymmetry_qk = 0.0
-            exploration_asymmetry_v = 0.0
-            exploration_asymmetry_rst = 0.0
-            exploration_weighted_clip = 0.0
+            inactive_aux_enabled = False
+            inactive_aux_weight = 0.0
+            inactive_aux_weight_q = 0.0
+            inactive_aux_weight_k = 0.0
+            inactive_aux_weight_qk = 0.0
+            inactive_aux_weight_v = 0.0
+            inactive_aux_weight_rst = 0.0
+            inactive_aux_asymmetry = 0.0
+            inactive_aux_asymmetry_q = 0.0
+            inactive_aux_asymmetry_k = 0.0
+            inactive_aux_asymmetry_qk = 0.0
+            inactive_aux_asymmetry_v = 0.0
+            inactive_aux_asymmetry_rst = 0.0
+            inactive_aux_weighted_clip = 0.0
             dead_penalty_weighted_clip = 0.0
             cb1a_enabled = False
             cb1a_weight = 0.0
@@ -8495,24 +8227,24 @@ def main():
         dead_penalty_v_weight = 0.0
         dead_penalty_rst_weight = 0.0
         dead_exposure_target = 0.0
-        rpe_enabled = False
+        inactive_aux_enabled = False
         soft_gate_schedule_active = True
         pool_specific_gate_t = True
         boundary_power_schedule_active = True
 
-    if not rpe_enabled:
-        exploration_weight = 0.0
-        exploration_weight_q = 0.0
-        exploration_weight_k = 0.0
-        exploration_weight_qk = 0.0
-        exploration_weight_v = 0.0
-        exploration_weight_rst = 0.0
-        exploration_asymmetry_q = 0.0
-        exploration_asymmetry_k = 0.0
-        exploration_asymmetry_qk = 0.0
-        exploration_asymmetry_v = 0.0
-        exploration_asymmetry_rst = 0.0
-        exploration_weighted_clip = 0.0
+    if not inactive_aux_enabled:
+        inactive_aux_weight = 0.0
+        inactive_aux_weight_q = 0.0
+        inactive_aux_weight_k = 0.0
+        inactive_aux_weight_qk = 0.0
+        inactive_aux_weight_v = 0.0
+        inactive_aux_weight_rst = 0.0
+        inactive_aux_asymmetry_q = 0.0
+        inactive_aux_asymmetry_k = 0.0
+        inactive_aux_asymmetry_qk = 0.0
+        inactive_aux_asymmetry_v = 0.0
+        inactive_aux_asymmetry_rst = 0.0
+        inactive_aux_weighted_clip = 0.0
 
     if soft_gate_schedule_active:
         _soft_gate_schedule_name = soft_gate_schedule.lower()
@@ -8588,25 +8320,25 @@ def main():
         'dead_penalty_v_weight': dead_penalty_v_weight,
         'dead_penalty_rst_weight': dead_penalty_rst_weight,
         'dead_exposure_target': dead_exposure_target,
-        'exploration_weight': exploration_weight,
-        'exploration_weight_qk': exploration_weight_qk,
-        'exploration_weight_v': exploration_weight_v,
-        'exploration_weight_rst': exploration_weight_rst,
-        'exploration_asymmetry': exploration_asymmetry,
-        'exploration_asymmetry_qk': exploration_asymmetry_qk,
-        'exploration_asymmetry_v': exploration_asymmetry_v,
-        'exploration_asymmetry_rst': exploration_asymmetry_rst,
-        'exploration_warmup_steps': exploration_warmup_steps,
-        'exploration_lower_bound': exploration_lower_bound,
-        'exploration_upper_bound': exploration_upper_bound,
-        'exploration_bound_eps': exploration_bound_eps,
-        'exploration_dev_mode': exploration_dev_mode,
-        'exploration_ce_clip_std': exploration_ce_clip_std,
-        'exploration_z_clip': exploration_z_clip,
-        'exploration_z_tanh': exploration_z_tanh,
-        'exploration_weighted_clip': exploration_weighted_clip,
-        'exploration_normalize_by_layers': exploration_normalize_by_layers,
-        'rpe_enabled': rpe_enabled,
+        'inactive_aux_weight': inactive_aux_weight,
+        'inactive_aux_weight_qk': inactive_aux_weight_qk,
+        'inactive_aux_weight_v': inactive_aux_weight_v,
+        'inactive_aux_weight_rst': inactive_aux_weight_rst,
+        'inactive_aux_asymmetry': inactive_aux_asymmetry,
+        'inactive_aux_asymmetry_qk': inactive_aux_asymmetry_qk,
+        'inactive_aux_asymmetry_v': inactive_aux_asymmetry_v,
+        'inactive_aux_asymmetry_rst': inactive_aux_asymmetry_rst,
+        'inactive_aux_warmup_steps': inactive_aux_warmup_steps,
+        'inactive_aux_lower_bound': inactive_aux_lower_bound,
+        'inactive_aux_upper_bound': inactive_aux_upper_bound,
+        'inactive_aux_bound_eps': inactive_aux_bound_eps,
+        'inactive_aux_dev_mode': inactive_aux_dev_mode,
+        'inactive_aux_ce_clip_std': inactive_aux_ce_clip_std,
+        'inactive_aux_z_clip': inactive_aux_z_clip,
+        'inactive_aux_z_tanh': inactive_aux_z_tanh,
+        'inactive_aux_weighted_clip': inactive_aux_weighted_clip,
+        'inactive_aux_normalize_by_layers': inactive_aux_normalize_by_layers,
+        'inactive_aux_enabled': inactive_aux_enabled,
         'soft_gate_t_start': soft_gate_t_start,
         'soft_gate_t_final': soft_gate_t_final,
         'soft_gate_t_hold_frac': soft_gate_t_hold_frac,
@@ -8633,9 +8365,9 @@ def main():
             regular_console_logging_overhead_warn,
         'eval_effective_prune_enabled': eval_effective_prune_enabled,
         'eval_effective_prune_eps_list': eval_effective_prune_eps_list,
-        'rpe_start_frac': rpe_start_frac,
-        'rpe_full_frac': rpe_full_frac,
-        'rpe_schedule': rpe_schedule,
+        'inactive_aux_start_frac': inactive_aux_start_frac,
+        'inactive_aux_full_frac': inactive_aux_full_frac,
+        'inactive_aux_schedule': inactive_aux_schedule,
         'cb1a_enabled': cb1a_enabled,
         'cb1a_qk_challenge_weight': cb1a_qk_challenge_weight,
         'cb1a_qk_prune_weight': cb1a_qk_prune_weight,
@@ -8693,40 +8425,39 @@ def main():
             })
         for _clean_key in list(training_config.keys()):
             if (_clean_key.startswith('cb1a_')
-                    or _clean_key.startswith('legacy_count_init_')
-                    or _clean_key == 'exploration_normalize_by_layers'):
+                    or _clean_key == 'inactive_aux_normalize_by_layers'):
                 training_config.pop(_clean_key, None)
                 cfg.setdefault('training', {}).pop(_clean_key, None)
 
     for _key in (
-            'exploration_weight_q',
-            'exploration_weight_k',
-            'exploration_asymmetry_q',
-            'exploration_asymmetry_k'):
+            'inactive_aux_weight_q',
+            'inactive_aux_weight_k',
+            'inactive_aux_asymmetry_q',
+            'inactive_aux_asymmetry_k'):
         cfg.setdefault('training', {}).pop(_key, None)
-    if not rpe_enabled:
+    if not inactive_aux_enabled:
         for _key in (
-                'exploration_weight',
-                'exploration_weight_q',
-                'exploration_weight_k',
-                'exploration_weight_qk',
-                'exploration_weight_v',
-                'exploration_weight_rst',
-                'exploration_asymmetry',
-                'exploration_asymmetry_q',
-                'exploration_asymmetry_k',
-                'exploration_asymmetry_qk',
-                'exploration_asymmetry_v',
-                'exploration_asymmetry_rst',
-                'exploration_warmup_steps',
-                'exploration_lower_bound',
-                'exploration_upper_bound',
-                'exploration_bound_eps',
-                'exploration_dev_mode',
-                'exploration_ce_clip_std',
-                'exploration_z_clip',
-                'exploration_z_tanh',
-                'exploration_weighted_clip'):
+                'inactive_aux_weight',
+                'inactive_aux_weight_q',
+                'inactive_aux_weight_k',
+                'inactive_aux_weight_qk',
+                'inactive_aux_weight_v',
+                'inactive_aux_weight_rst',
+                'inactive_aux_asymmetry',
+                'inactive_aux_asymmetry_q',
+                'inactive_aux_asymmetry_k',
+                'inactive_aux_asymmetry_qk',
+                'inactive_aux_asymmetry_v',
+                'inactive_aux_asymmetry_rst',
+                'inactive_aux_warmup_steps',
+                'inactive_aux_lower_bound',
+                'inactive_aux_upper_bound',
+                'inactive_aux_bound_eps',
+                'inactive_aux_dev_mode',
+                'inactive_aux_ce_clip_std',
+                'inactive_aux_z_clip',
+                'inactive_aux_z_tanh',
+                'inactive_aux_weighted_clip'):
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
     if is_v4164_cfg:
@@ -8739,10 +8470,10 @@ def main():
                 'dead_penalty_v_weight',
                 'dead_penalty_rst_weight',
                 'dead_exposure_target',
-                'rpe_enabled',
-                'rpe_start_frac',
-                'rpe_full_frac',
-                'rpe_schedule',
+                'inactive_aux_enabled',
+                'inactive_aux_start_frac',
+                'inactive_aux_full_frac',
+                'inactive_aux_schedule',
                                                 'dead_penalty_weighted_clip'):
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
@@ -9023,10 +8754,10 @@ def main():
         print(f"  Total optimizer steps: {total_steps}")
         print(f"  Warmup steps: {warmup_steps}")
         print(f"  LR: {lr}")
-        _rpe_stabilizer_part = (
-            f"expl_clip={exploration_weighted_clip}, "
-            f"explore_dev_mode={exploration_dev_mode}, "
-            if rpe_enabled else "")
+        _inactive_aux_stabilizer_part = (
+            f"expl_clip={inactive_aux_weighted_clip}, "
+            f"inactive_aux_dev_mode={inactive_aux_dev_mode}, "
+            if inactive_aux_enabled else "")
         print("  Stabilizers: "
               f"global_grad_clip={global_grad_clip}, "
               f"tau_lr_mult={tau_lr_mult}, tau_grad_clip={tau_grad_clip}, "
@@ -9034,7 +8765,7 @@ def main():
               f"router_scan_lr_mult={router_scan_lr_mult}, "
               f"route_emb_lr_mult={route_emb_lr_mult}, "
               f"dead_clip={dead_penalty_weighted_clip}, "
-              f"{_rpe_stabilizer_part}"
+              f"{_inactive_aux_stabilizer_part}"
               f"resume_restore_training_config={restore_training_config_on_resume}")
         print("  Control update caps: "
               f"enabled={enable_control_update_caps}, "
@@ -9050,19 +8781,19 @@ def main():
               f"exposure_target={dead_exposure_target} "
               f"direct_w[qk={dead_penalty_qk_weight}, v={dead_penalty_v_weight}, "
               f"rst={dead_penalty_rst_weight}]")
-        if rpe_enabled:
-            print(f"  Exploration weight: {exploration_weight}")
+        if inactive_aux_enabled:
+            print(f"  Exploration weight: {inactive_aux_weight}")
             print("    weight split: "
-                  f"qk={exploration_weight_qk} "
-                  f"v={exploration_weight_v} rst={exploration_weight_rst}")
+                  f"qk={inactive_aux_weight_qk} "
+                  f"v={inactive_aux_weight_v} rst={inactive_aux_weight_rst}")
             print("    asymmetry split: "
-                  f"qk={exploration_asymmetry_qk} "
-                  f"v={exploration_asymmetry_v} rst={exploration_asymmetry_rst}")
+                  f"qk={inactive_aux_asymmetry_qk} "
+                  f"v={inactive_aux_asymmetry_v} rst={inactive_aux_asymmetry_rst}")
             print("    normalization: "
-                  f"by_layers={exploration_normalize_by_layers}")
-            print(f"    warmup_steps={exploration_warmup_steps} "
-                  f"bounds=[{exploration_lower_bound}, {exploration_upper_bound}] "
-                  f"eps={exploration_bound_eps}")
+                  f"by_layers={inactive_aux_normalize_by_layers}")
+            print(f"    warmup_steps={inactive_aux_warmup_steps} "
+                  f"bounds=[{inactive_aux_lower_bound}, {inactive_aux_upper_bound}] "
+                  f"eps={inactive_aux_bound_eps}")
         if model_version_cfg != OFFICIAL_MODEL_VERSION:
             print("  CB1A: "
                   f"enabled={cb1a_enabled} "
@@ -9077,8 +8808,7 @@ def main():
                   f"{cb1a_rst_prune_weight})")
         print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
               f"router={cfg['model'].get('router_dropout', 0.0)}")
-        # Active v4.1.5 gate closure constants.
-        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.9':
+        if False:
             gate_msg = (
                 "  Gate (v4.1.5.9 angular): "
                 f"tau_min={tcfg.get('tau_min', 0.0)} "
@@ -9180,12 +8910,6 @@ def main():
             if ignored_tau_ce_grad_scale_keys:
                 print("  tau_ce_grad_scale config fields are ignored in "
                       "v4164; tau movement is controlled by tau_lr_mult.")
-            if rpe_enabled:
-                print("  RPE schedule:")
-                print(f"    start_frac={rpe_start_frac} full_frac={rpe_full_frac} "
-                      f"final exploration_weight={exploration_weight} "
-                      f"qk/v/rst=({exploration_weight_qk}, "
-                      f"{exploration_weight_v}, {exploration_weight_rst})")
             print("  Effective pruning:")
             print(
                 f"    console={regular_console_level} "
@@ -9204,46 +8928,6 @@ def main():
                 f"{_gate_intensity_part}"
                 f"dropout={cfg['model'].get('dropout', None)} "
                 f"router_dropout={cfg['model'].get('router_dropout', None)}"
-            )
-        elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.0':
-            gate_msg = (
-                f"  Gate ({cfg['model'].get('model_version')} direct-tau): "
-                f"legacy_count_init_attn_qk={tcfg.get('legacy_count_init_attn_qk', cfg['model'].get('legacy_count_init_attn_qk', None))} "
-                f"legacy_count_init_attn_v={tcfg.get('legacy_count_init_attn_v', cfg['model'].get('legacy_count_init_attn_v', None))} "
-                f"legacy_count_init_rst={tcfg.get('legacy_count_init_rst', cfg['model'].get('legacy_count_init_rst', None))} "
-                f"intensity_beta={tcfg.get('intensity_beta', 0.5)}"
-            )
-        elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.1':
-            gate_msg = (
-                f"  Gate ({cfg['model'].get('model_version')} direct-tau + CB1A): "
-                f"legacy_count_init_attn_qk={tcfg.get('legacy_count_init_attn_qk', cfg['model'].get('legacy_count_init_attn_qk', None))} "
-                f"legacy_count_init_attn_v={tcfg.get('legacy_count_init_attn_v', cfg['model'].get('legacy_count_init_attn_v', None))} "
-                f"legacy_count_init_rst={tcfg.get('legacy_count_init_rst', cfg['model'].get('legacy_count_init_rst', None))} "
-                f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
-                f"exploration=off cb1a={cb1a_enabled}"
-            )
-        else:
-            gate_msg = (
-                f"  Gate (legacy v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
-                f"eps={tcfg.get('epsilon', 1.0e-4)} "
-                f"max_int={tcfg.get('max_intensity', 10.0)}"
-            )
-        if cfg['model'].get('model_version') in (
-                OFFICIAL_MODEL_VERSION):
-            if cfg['model'].get('model_version') not in (
-                    'spatial-r1-v4.1.5.9',
-                    'spatial-r1-v4.1.6.0',
-                    'spatial-r1-v4.1.6.1',
-                    'spatial-r1-v4.1.6.2',
-                    'spatial-r1-v4.1.6.3',
-                    'spatial-r1-v4.1.6.4'):
-                gate_msg += (
-                    f" scan_scale={tcfg.get('scan_scale', 0.01)} "
-                    f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
-                )
-        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
-            gate_msg += (
-                f" rw_contrib_den_floor={tcfg.get('rw_contrib_den_floor', 1.0)}"
             )
         print(gate_msg)
         if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
@@ -9352,11 +9036,6 @@ def main():
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
     model_version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     is_baseline = model_version == 'baseline'
-    is_spatial = model_version in (
-        'spatial-r1-v3.9.4',
-        'spatial-r1-v4.1.5.2',
-        OFFICIAL_MODEL_VERSION,
-    )
 
     mesh_model = cfg['training'].get('mesh_model', 1)
     mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
@@ -9520,26 +9199,26 @@ def main():
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
         tau_reg_weight, dead_penalty_weight,
-        exploration_weight, exploration_asymmetry,
-        exploration_weight_q, exploration_weight_k,
-        exploration_weight_v, exploration_weight_rst,
+        inactive_aux_weight, inactive_aux_asymmetry,
+        inactive_aux_weight_q, inactive_aux_weight_k,
+        inactive_aux_weight_v, inactive_aux_weight_rst,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         weight_decay=weight_decay, pool_weight_decay=pool_weight_decay,
-        exploration_warmup_steps=exploration_warmup_steps,
-        exploration_lower_bound=exploration_lower_bound,
-        exploration_upper_bound=exploration_upper_bound,
-        exploration_bound_eps=exploration_bound_eps,
-        exploration_dev_mode=exploration_dev_mode,
-        exploration_ce_clip_std=exploration_ce_clip_std,
-        exploration_z_clip=exploration_z_clip,
-        exploration_z_tanh=exploration_z_tanh,
-        exploration_weighted_clip=exploration_weighted_clip,
-        exploration_normalize_by_layers=exploration_normalize_by_layers,
-        exploration_asymmetry_q=exploration_asymmetry_q,
-        exploration_asymmetry_k=exploration_asymmetry_k,
-        exploration_asymmetry_v=exploration_asymmetry_v,
-        exploration_asymmetry_rst=exploration_asymmetry_rst,
-        rpe_enabled=rpe_enabled,
+        inactive_aux_warmup_steps=inactive_aux_warmup_steps,
+        inactive_aux_lower_bound=inactive_aux_lower_bound,
+        inactive_aux_upper_bound=inactive_aux_upper_bound,
+        inactive_aux_bound_eps=inactive_aux_bound_eps,
+        inactive_aux_dev_mode=inactive_aux_dev_mode,
+        inactive_aux_ce_clip_std=inactive_aux_ce_clip_std,
+        inactive_aux_z_clip=inactive_aux_z_clip,
+        inactive_aux_z_tanh=inactive_aux_z_tanh,
+        inactive_aux_weighted_clip=inactive_aux_weighted_clip,
+        inactive_aux_normalize_by_layers=inactive_aux_normalize_by_layers,
+        inactive_aux_asymmetry_q=inactive_aux_asymmetry_q,
+        inactive_aux_asymmetry_k=inactive_aux_asymmetry_k,
+        inactive_aux_asymmetry_v=inactive_aux_asymmetry_v,
+        inactive_aux_asymmetry_rst=inactive_aux_asymmetry_rst,
+        inactive_aux_enabled=inactive_aux_enabled,
         dead_penalty_qk_weight=dead_penalty_qk_weight,
         dead_penalty_v_weight=dead_penalty_v_weight,
         dead_penalty_rst_weight=dead_penalty_rst_weight,
@@ -9593,10 +9272,10 @@ def main():
         soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
         soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
         admission_den_power=admission_den_power,
-        rpe_start_frac=rpe_start_frac,
-        rpe_full_frac=rpe_full_frac,
-        rpe_schedule=rpe_schedule,
-        is_baseline=is_baseline, is_spatial=is_spatial,
+        inactive_aux_start_frac=inactive_aux_start_frac,
+        inactive_aux_full_frac=inactive_aux_full_frac,
+        inactive_aux_schedule=inactive_aux_schedule,
+        is_baseline=is_baseline,
         sharded_fns=_sharded_fns, mesh=mesh,
         debug_diagnostics=debug_mode,
         compact_train_metrics=(
@@ -9680,8 +9359,7 @@ def main():
             admission_den_power=admission_den_power)
     else:
         analysis_step_fn = None
-    # No current-train-batch debug forward: --debug uses regular scalar
-    # train_step metrics.
+    # No current-train-batch diagnostic forward.
     geometry_step_fn = create_geometry_step(
         max_sample=int(tcfg.get(
             'geometry_max_sample',
@@ -10378,8 +10056,7 @@ def main():
         print(f"  Log cadence: regular={LOG_REGULAR}"
               f" analysis={LOG_ANALYSIS}"
               f" geometry={LOG_GEOMETRY}"
-              f" val={val_interval}"
-              f" debug={'off' if not debug_mode else debug_interval}",
+              f" val={val_interval}",
               flush=True)
 
     # Emb drift snapshot (sense vectors). Held on every host, refreshed at
@@ -10589,8 +10266,7 @@ def main():
                             regular_console_drive_max_warn,
                         'regular_console_logging_overhead_warn':
                             regular_console_logging_overhead_warn,
-                                        'rpe_enabled': bool(rpe_enabled),
-                        'soft_gate_schedule': soft_gate_schedule,
+                                'soft_gate_schedule': soft_gate_schedule,
                         'soft_gate_t_power': soft_gate_t_power,
                         'soft_gate_t_gompertz_center':
                             soft_gate_t_gompertz_center,
@@ -10723,7 +10399,6 @@ def main():
                         regular_console_drive_max_warn,
                     'regular_console_logging_overhead_warn':
                         regular_console_logging_overhead_warn,
-                                'rpe_enabled': bool(rpe_enabled),
                     'soft_gate_schedule': soft_gate_schedule,
                     'soft_gate_t_power': soft_gate_t_power,
                     'soft_gate_t_gompertz_center':
@@ -10773,8 +10448,6 @@ def main():
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
             _do_val = (global_step % val_interval == 0 and global_step > 0)
             _do_analysis = (global_step % LOG_ANALYSIS == 0 and global_step > 0)
-            # --debug is served by inline train_step metrics. Do not trigger
-            # the full analysis forward on debug ticks.
             _do_debug_analysis = False
             _do_geometry = (global_step % LOG_GEOMETRY == 0 and global_step > 0)
             _do_ckpt = (global_step % ckpt_interval == 0 and global_step > 0)

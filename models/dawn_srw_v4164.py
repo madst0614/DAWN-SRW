@@ -10,7 +10,6 @@ Implemented concepts:
 - scheduled soft-gate boundary-scale input
 - scheduled boundary power input
 - tau movement controlled by optimizer-side tau_lr_mult
-- delayed RPE/exploration weight input
 - train-time effective gate statistics
 - validation-time execution pruning through execution_prune_eps
 """
@@ -2577,7 +2576,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_v_select_diag = jnp.stack(v_select_diag).astype(jnp.float32)
     attn_qk_exposure_diag = jnp.stack(qk_exposure_diag).astype(jnp.float32)
     attn_v_exposure_diag = jnp.stack(v_exposure_diag).astype(jnp.float32)
-    # Exploration/RPE feedback consumes per-layer direct tau/no-active stacks.
+    # Per-layer direct tau/no-active stacks are diagnostics only.
     attn_tau_direct = jnp.concatenate(
         (qk_tau_direct[:, :, 0, :],
          qk_tau_direct[:, :, 1, :],
@@ -2902,7 +2901,6 @@ class DAWN(nn.Module):
                  soft_gate_boundary_power=2.0,
                  soft_gate_boundary_power_final=4.0,
                  admission_den_power=1.0,
-                 rpe_effective_weight=0.0,
                  execution_prune_eps=0.0):
         """Run the shared-pool SRW Transformer forward pass.
 
@@ -3460,7 +3458,6 @@ class DAWN(nn.Module):
                 soft_gate_boundary_power, dtype=jnp.float32),
             'soft_gate_boundary_power_final': jnp.asarray(
                 soft_gate_boundary_power_final, dtype=jnp.float32),
-            'rpe_effective_weight': jnp.asarray(rpe_effective_weight, dtype=jnp.float32),
             'execution_prune_eps': jnp.asarray(execution_prune_eps, dtype=jnp.float32),
             'execution_gate_mass_retained': (
                 (attn_den_cost_mean_all.mean() + rst_den_cost_mean_all.mean())
@@ -3662,8 +3659,7 @@ class DAWN(nn.Module):
 
             'per_layer_attn_out_norm': attn_out_norm_all,
             'per_layer_rst_out_norm': rst_out_norm_all,
-            # Per-layer direct tau stacks. RPE/exploration is disabled in
-            # v4.1.6.1, but these remain diagnostics and keep 4160 parity.
+            # Per-layer direct tau stacks retained for diagnostics.
             # Shapes: attn [L, B, S, 3], RST [L, B, S, 1].
             'attn_tau_direct': attn_tau_direct_all,
             'rst_tau_direct': rst_tau_direct_all,
@@ -4791,7 +4787,7 @@ def _rename_key_if_needed(d, old, new):
 
 def migrate_legacy_v4155_params(params):
     """
-    Convert legacy v4.1.5.5 parameter names to the new DAWN-SRW/RST names.
+    Convert older checkpoint parameter names to DAWN-SRW/RST names.
 
     Legacy:
         qk_* -> attn_qk_*
