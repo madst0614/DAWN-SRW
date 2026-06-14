@@ -472,9 +472,6 @@ def _topk_rows(candidates, topk, field_count):
 
 def make_sharded_srw(mesh, max_chunk_size=2048,
                      analysis=False,
-                     local_diagnostics=False,
-                     spike_probe=False,
-                     spike_probe_topk=8,
                      dead_exposure_target=0.1,
                      soft_gate_effective_active_eps=1.0e-6,
                      admission_den_power=1.0,
@@ -497,9 +494,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     four gate-concentration diagnostics, and skips distribution-shape stats
     (skew/kurt), selection-residency/entropy diagnostics and drive extrema.
     XLA DCE's the unused work.
-    `local_diagnostics=True` appends a lightweight, scalar-only local-spike
-    summary to either path. It is independent of `analysis=True` and is
-    collected inline during the existing chunk scan.
     `analysis=True`: returns the SLIM/concentration tuple followed by
     observational scalars/arrays for route shape, gate concentration, and
     denominator diagnostics.
@@ -509,9 +503,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _data_axis_size = mesh.shape['data']
     _dead_exposure_target = jnp.float32(dead_exposure_target)
     _soft_gate_effective_active_eps = jnp.float32(soft_gate_effective_active_eps)
-    _local_diagnostics = bool(local_diagnostics)
-    _spike_probe = bool(spike_probe)
-    _spike_probe_topk = max(1, int(spike_probe_topk))
+    _debug_local_removed_flag = False
+    _debug_probe_removed_flag = False
+    _debug_topk_removed = 1
     _sparsity_diag_enabled = bool(analysis)
     _current_suffixes = GATE_EPS_NAME_SUFFIXES
     _projected_suffixes = GATE_PROJECTED_EPS_NAME_SUFFIXES
@@ -583,13 +577,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _sparsity_diag_specs = (
         P(),                     # gate sparsity diagnostics [metric]
     )
-    _local_diag_specs = (
+    _debug_local_specs_removed = (
         P(),                     # local_spike_values [1, metric]
         P(),                     # local_spike_locs [1, metric, b/t/neuron]
         P(),                     # top1_breakdown_values [1, field]
         P(),                     # top1_breakdown_locs [1, b/t/neuron]
     )
-    _spike_probe_specs = (
+    _debug_probe_specs_removed = (
         P(),                     # spike SRW top rows [1, K, field]
     )
     _out_specs = (_slim_out_specs + _conc_out_specs + _analysis_extra_specs
@@ -597,10 +591,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _out_specs = _out_specs + _select_diag_specs
     _out_specs = _out_specs + _dead_exposure_diag_specs
     _out_specs = _out_specs + _sparsity_diag_specs
-    if _local_diagnostics:
-        _out_specs = _out_specs + _local_diag_specs
-    if _spike_probe:
-        _out_specs = _out_specs + _spike_probe_specs
+    if _debug_local_removed_flag:
+        _out_specs = _out_specs + _debug_local_specs_removed
+    if _debug_probe_removed_flag:
+        _out_specs = _out_specs + _debug_probe_specs_removed
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),    # x [B,S,D]
@@ -640,7 +634,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         diag_vals_init = jnp.full(
             (1, LOCAL_SPIKE_METRIC_COUNT), diag_neg_inf)
         spike_rows_init = jnp.full(
-            (_spike_probe_topk, SPIKE_SRW_FIELD_COUNT),
+            (_debug_topk_removed, SPIKE_SRW_FIELD_COUNT),
             diag_neg_inf, dtype=jnp.float32)
         spike_rows_init = spike_rows_init.at[:, 1:4].set(0.0)
 
@@ -975,7 +969,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             flat_score = contrib_proxy.reshape((-1,))
             top_scores, top_idx = jax.lax.top_k(
                 flat_score,
-                min(_spike_probe_topk, int(flat_score.shape[0])))
+                min(_debug_topk_removed, int(flat_score.shape[0])))
             b_idx = top_idx // (S * cs)
             rem = top_idx - b_idx * (S * cs)
             pos_idx = rem // cs
@@ -1023,9 +1017,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 resid_norm_i,
                 h_norm_i,
             ], axis=-1).astype(jnp.float32)
-            if int(top_scores.shape[0]) < _spike_probe_topk:
+            if int(top_scores.shape[0]) < _debug_topk_removed:
                 pad = jnp.full(
-                    (_spike_probe_topk - int(top_scores.shape[0]),
+                    (_debug_topk_removed - int(top_scores.shape[0]),
                      SPIKE_SRW_FIELD_COUNT),
                     diag_neg_inf, dtype=jnp.float32)
                 pad = pad.at[:, 1:4].set(0.0)
@@ -1035,7 +1029,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         def spike_merge_rows(rows_a, rows_b):
             return _topk_rows(
                 jnp.concatenate([rows_a, rows_b], axis=0),
-                _spike_probe_topk, SPIKE_SRW_FIELD_COUNT)
+                _debug_topk_removed, SPIKE_SRW_FIELD_COUNT)
 
         def spike_finalize_rows(rows, raw_out, out, global_den_cost_m,
                                 global_gate_max_m, global_active_m,
@@ -1067,7 +1061,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             gathered = jax.lax.all_gather(gathered, 'data', axis=0)
             return _topk_rows(
                 gathered.reshape((-1, SPIKE_SRW_FIELD_COUNT)),
-                _spike_probe_topk, SPIKE_SRW_FIELD_COUNT)[None, :, :]
+                _debug_topk_removed, SPIKE_SRW_FIELD_COUNT)[None, :, :]
 
         # --- Pass 2: admission + drive SRW fused (scan + checkpoint) ---
         if analysis:
@@ -1111,7 +1105,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
                 chunk_den_cost = admission.sum(axis=-1, keepdims=True)
-                if _local_diagnostics:
+                if _debug_local_removed_flag:
                     write_norm = jnp.linalg.norm(
                         wc.astype(jnp.float32), axis=-1)
                     contrib_proxy = (
@@ -1131,7 +1125,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                             jax.lax.stop_gradient(route.astype(jnp.float32)),
                             axis=-1)))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
-                if _spike_probe:
+                if _debug_probe_removed_flag:
                     read_norm = jnp.linalg.norm(
                         jax.lax.dynamic_slice_in_dim(
                             read_bf, s, cs, axis=0).astype(jnp.float32),
@@ -1254,7 +1248,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
                 chunk_den_cost = admission.sum(axis=-1, keepdims=True)
-                if _local_diagnostics:
+                if _debug_local_removed_flag:
                     write_norm = jnp.linalg.norm(
                         wc.astype(jnp.float32), axis=-1)
                     contrib_proxy = (
@@ -1274,7 +1268,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                             jax.lax.stop_gradient(route.astype(jnp.float32)),
                             axis=-1)))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
-                if _spike_probe:
+                if _debug_probe_removed_flag:
                     read_norm = jnp.linalg.norm(
                         jax.lax.dynamic_slice_in_dim(
                             read_bf, s, cs, axis=0).astype(jnp.float32),
@@ -1485,7 +1479,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
         local_diag_out = ()
-        if _local_diagnostics:
+        if _debug_local_removed_flag:
             tau_abs_max = jnp.max(jax.lax.stop_gradient(tau))
             top1_share_max = jnp.max(
                 global_gate_max_m / jnp.maximum(global_den_cost_m, 1e-8))
@@ -1522,9 +1516,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             local_diag_out = (
                 metric_vals.astype(jnp.float32), metric_locs,
                 top1_details, top1_locs)
-        spike_probe_out = ()
-        if _spike_probe:
-            spike_probe_out = (
+        debug_probe_removed_out = ()
+        if _debug_probe_removed_flag:
+            debug_probe_removed_out = (
                 spike_finalize_rows(
                     spike_rows, raw_out, out, global_den_cost_m,
                     global_gate_max_m, global_active_m,
@@ -1532,7 +1526,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         if not analysis:
             return (slim_out + conc_out + select_diag_out
                     + dead_exposure_diag_out + (sparsity_diag_out,)
-                    + local_diag_out + spike_probe_out)
+                    + local_diag_out + debug_probe_removed_out)
 
         # --- Analysis-only extras ---
         margin_band_frac = jax.lax.psum(total_margin_band, 'model') / N_total
@@ -1567,16 +1561,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                    current_cost_out, rho_kurt, int_cap_frac_out)
                 + select_diag_out + dead_exposure_diag_out
                 + (sparsity_diag_out,)
-                + local_diag_out + spike_probe_out)
+                + local_diag_out + debug_probe_removed_out)
 
     return fused_gate_srw
 
 
 def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             analysis=False,
-                            local_diagnostics=False,
-                            spike_probe=False,
-                            spike_probe_topk=8,
                             dead_exposure_target=0.1,
                             soft_gate_effective_active_eps=1.0e-6,
                             admission_den_power=1.0,
@@ -1594,15 +1585,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         drive = softplus((rho - tau) / B) / softplus((1 - tau) / B)
         execution_weight = admission * drive
         admission_den = max(sum(admission), 1.0) ** admission_den_power
-    analysis/local_diagnostics: see make_sharded_srw docstring.
+    analysis: see make_sharded_srw docstring.
     """
     _model_axis_size = mesh.shape['model']
     _data_axis_size = mesh.shape['data']
     _dead_exposure_target = jnp.float32(dead_exposure_target)
     _soft_gate_effective_active_eps = jnp.float32(soft_gate_effective_active_eps)
-    _local_diagnostics = bool(local_diagnostics)
-    _spike_probe = bool(spike_probe)
-    _spike_probe_topk = max(1, int(spike_probe_topk))
+    _debug_local_removed_flag = False
+    _debug_probe_removed_flag = False
+    _debug_topk_removed = 1
     _sparsity_diag_enabled = bool(analysis)
     _current_suffixes = GATE_EPS_NAME_SUFFIXES
     _projected_suffixes = GATE_PROJECTED_EPS_NAME_SUFFIXES
@@ -1680,13 +1671,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _sparsity_diag_specs = (
         P(),                          # gate sparsity diagnostics [2, metric]
     )
-    _local_diag_specs = (
+    _debug_local_specs_removed = (
         P(),                          # local_spike_values [2, metric]
         P(),                          # local_spike_locs [2, metric, b/t/neuron]
         P(),                          # top1_breakdown_values [2, field]
         P(),                          # top1_breakdown_locs [2, b/t/neuron]
     )
-    _spike_probe_specs = (
+    _debug_probe_specs_removed = (
         P(),                          # spike SRW top rows [2, K, field]
     )
     _out_specs = (_slim_out_specs + _conc_out_specs + _route_split_out_specs
@@ -1696,10 +1687,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _out_specs = _out_specs + _select_diag_specs
     _out_specs = _out_specs + _dead_exposure_diag_specs
     _out_specs = _out_specs + _sparsity_diag_specs
-    if _local_diagnostics:
-        _out_specs = _out_specs + _local_diag_specs
-    if _spike_probe:
-        _out_specs = _out_specs + _spike_probe_specs
+    if _debug_local_removed_flag:
+        _out_specs = _out_specs + _debug_local_specs_removed
+    if _debug_probe_removed_flag:
+        _out_specs = _out_specs + _debug_probe_specs_removed
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),        # x [B,S,D]
@@ -1740,7 +1731,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         diag_vals_init = jnp.full(
             (2, LOCAL_SPIKE_METRIC_COUNT), diag_neg_inf)
         spike_rows_init = jnp.full(
-            (2, _spike_probe_topk, SPIKE_SRW_FIELD_COUNT),
+            (2, _debug_topk_removed, SPIKE_SRW_FIELD_COUNT),
             diag_neg_inf, dtype=jnp.float32)
         spike_rows_init = spike_rows_init.at[:, :, 1:4].set(0.0)
 
@@ -2077,7 +2068,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 jnp.abs(jax.lax.stop_gradient(execution_weight * xr_r))
                 * write_norm[None, None, None, :])
             out_rows = []
-            local_k = min(_spike_probe_topk, int(B * S * cs))
+            local_k = min(_debug_topk_removed, int(B * S * cs))
             for route_idx in range(2):
                 flat_score = contrib_proxy[:, :, route_idx, :].reshape((-1,))
                 top_scores, top_idx = jax.lax.top_k(flat_score, local_k)
@@ -2131,9 +2122,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     resid_norm_i,
                     h_norm_i,
                 ], axis=-1).astype(jnp.float32)
-                if local_k < _spike_probe_topk:
+                if local_k < _debug_topk_removed:
                     pad = jnp.full(
-                        (_spike_probe_topk - local_k,
+                        (_debug_topk_removed - local_k,
                          SPIKE_SRW_FIELD_COUNT),
                         diag_neg_inf, dtype=jnp.float32)
                     pad = pad.at[:, 1:4].set(0.0)
@@ -2147,7 +2138,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 merged.append(_topk_rows(
                     jnp.concatenate(
                         [rows_a[route_idx], rows_b[route_idx]], axis=0),
-                    _spike_probe_topk, SPIKE_SRW_FIELD_COUNT))
+                    _debug_topk_removed, SPIKE_SRW_FIELD_COUNT))
             return jnp.stack(merged, axis=0)
 
         def spike_finalize_rows_paired(rows, raw_out, out,
@@ -2187,7 +2178,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 gathered = jax.lax.all_gather(gathered, 'data', axis=0)
                 finalized.append(_topk_rows(
                     gathered.reshape((-1, SPIKE_SRW_FIELD_COUNT)),
-                    _spike_probe_topk, SPIKE_SRW_FIELD_COUNT))
+                    _debug_topk_removed, SPIKE_SRW_FIELD_COUNT))
             return jnp.stack(finalized, axis=0)
 
         # --- Pass 2: gate + srw fused ---
@@ -2232,7 +2223,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
                 chunk_den_cost = admission.sum(axis=-1, keepdims=True)
-                if _local_diagnostics:
+                if _debug_local_removed_flag:
                     write_norm = jnp.linalg.norm(
                         wc.astype(jnp.float32), axis=-1)
                     xr_r = xr_f[:, :, None, :]
@@ -2257,7 +2248,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     diag_chunk = diag_chunk.at[:, 10].set(
                         jnp.repeat(_route_norm_max, 2))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
-                if _spike_probe:
+                if _debug_probe_removed_flag:
                     read_norm = jnp.linalg.norm(
                         jax.lax.dynamic_slice_in_dim(
                             read_bf, s, cs, axis=0).astype(jnp.float32),
@@ -2381,7 +2372,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
                 chunk_den_cost = admission.sum(axis=-1, keepdims=True)
-                if _local_diagnostics:
+                if _debug_local_removed_flag:
                     write_norm = jnp.linalg.norm(
                         wc.astype(jnp.float32), axis=-1)
                     xr_r = xr_f[:, :, None, :]
@@ -2406,7 +2397,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     diag_chunk = diag_chunk.at[:, 10].set(
                         jnp.repeat(_route_norm_max, 2))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
-                if _spike_probe:
+                if _debug_probe_removed_flag:
                     read_norm = jnp.linalg.norm(
                         jax.lax.dynamic_slice_in_dim(
                             read_bf, s, cs, axis=0).astype(jnp.float32),
@@ -2631,7 +2622,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             if _sparsity_diag_enabled
             else jnp.zeros((2, GATE_SPARSITY_DIAG_COUNT), dtype=jnp.float32))
         local_diag_out = ()
-        if _local_diagnostics:
+        if _debug_local_removed_flag:
             tau_abs_max = jnp.max(
                 jax.lax.stop_gradient(tau[..., 0]),
                 axis=(0, 1))
@@ -2674,9 +2665,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             local_diag_out = (
                 metric_vals.astype(jnp.float32), metric_locs,
                 top1_details, top1_locs)
-        spike_probe_out = ()
-        if _spike_probe:
-            spike_probe_out = (
+        debug_probe_removed_out = ()
+        if _debug_probe_removed_flag:
+            debug_probe_removed_out = (
                 spike_finalize_rows_paired(
                     spike_rows, raw_out, out, global_den_cost_m,
                     global_gate_max_m, global_active_m,
@@ -2684,7 +2675,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         if not analysis:
             return (slim_out + conc_out + route_split_out + select_diag_out
                     + dead_exposure_diag_out + (sparsity_diag_out,)
-                    + local_diag_out + spike_probe_out)
+                    + local_diag_out + debug_probe_removed_out)
 
         # --- Analysis-only extras ---
         margin_band_frac = jax.lax.psum(total_margin_band, 'model') / N_total
@@ -2718,7 +2709,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                    current_cost_out, rho_kurt, int_cap_frac_out)
                 + select_diag_out + dead_exposure_diag_out
                 + (sparsity_diag_out,)
-                + local_diag_out + spike_probe_out)
+                + local_diag_out + debug_probe_removed_out)
 
     return fused_gate_srw_paired
 
@@ -2836,10 +2827,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_heads, d_model, n_layers,
                   router_dropout, dropout_rate, deterministic,
                   sharded_fns, analysis=False,
-                  local_diagnostics=False,
-                  spike_probe=False,
-                  spike_probe_topk=8,
-                  focus_probe_enabled=False,
+                  debug_local_removed=False,
+                  debug_probe_removed=False,
+                  debug_topk_removed=8,
+                  debug_focus_enabled_removed=False,
                   focus_b=None,
                   focus_pos=None,
                   focus_rank=None,
@@ -2946,10 +2937,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     qk_exposure_start = qk_select_start + SELECT_DIAG_COUNT
     qk_exposure_diag = qk_ret[
         qk_exposure_start:qk_exposure_start + DEAD_EXPOSURE_DIAG_COUNT]
-    if spike_probe:
+    if debug_probe_removed:
         qk_spike_rows = qk_ret[-1]
-    if local_diagnostics:
-        _qk_local_tail = qk_ret[-5:-1] if spike_probe else qk_ret[-4:]
+    if debug_local_removed:
+        _qk_local_tail = qk_ret[-5:-1] if debug_probe_removed else qk_ret[-4:]
         (qk_local_values, qk_local_locs,
          qk_top1_values, qk_top1_locs) = _qk_local_tail
     Q = QK_out[:, :, 0, :] * qk_scale
@@ -2987,10 +2978,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     qk_sparsity_diag = qk_route_sparsity_diag.mean(axis=0)
     v_sparsity_start = v_exposure_start + DEAD_EXPOSURE_DIAG_COUNT
     v_sparsity_diag = v_ret[v_sparsity_start]
-    if spike_probe:
+    if debug_probe_removed:
         v_spike_rows = v_ret[-1]
-    if local_diagnostics:
-        _v_local_tail = v_ret[-5:-1] if spike_probe else v_ret[-4:]
+    if debug_local_removed:
+        _v_local_tail = v_ret[-5:-1] if debug_probe_removed else v_ret[-4:]
         (v_local_values, v_local_locs,
          v_top1_values, v_top1_locs) = _v_local_tail
     V = V * v_scale
@@ -3002,9 +2993,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     scale = jnp.sqrt(jnp.float32(d_head))
     rng, rng_attn_drop = jax.random.split(rng)
-    _spike_probe_topk = max(1, int(spike_probe_topk))
-    _focus_probe_enabled = bool(focus_probe_enabled)
-    _focus_take_k = _spike_probe_topk
+    _debug_topk_removed = max(1, int(debug_topk_removed))
+    _debug_focus_enabled_removed_flag = bool(debug_focus_enabled_removed)
+    _focus_take_k = _debug_topk_removed
     _focus_b = focus_b if focus_b is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
     _focus_pos = focus_pos if focus_pos is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
     _focus_rank = focus_rank if focus_rank is not None else jnp.arange(_focus_take_k, dtype=jnp.float32)
@@ -3207,7 +3198,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             jnp.abs(top1_logits),
             jnp.maximum(top1_w * jnp.float32(10.0), o_in_norm))
         flat_score = score.reshape((-1,))
-        local_k = min(_spike_probe_topk, int(flat_score.shape[0]))
+        local_k = min(_debug_topk_removed, int(flat_score.shape[0]))
         top_scores, flat_idx = jax.lax.top_k(flat_score, local_k)
         b_idx = flat_idx // (n_heads * S)
         rem = flat_idx - b_idx * (n_heads * S)
@@ -3229,9 +3220,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             o_in_norm[b_idx, h_idx, q_idx],
             jnp.zeros_like(top_scores),
         ], axis=-1).astype(jnp.float32)
-        if local_k < _spike_probe_topk:
+        if local_k < _debug_topk_removed:
             pad = jnp.full(
-                (_spike_probe_topk - local_k, SPIKE_ATTN_FIELD_COUNT),
+                (_debug_topk_removed - local_k, SPIKE_ATTN_FIELD_COUNT),
                 -jnp.inf, dtype=jnp.float32)
             pad = pad.at[:, 1:4].set(0.0)
             rows = jnp.concatenate([rows, pad], axis=0)
@@ -3287,14 +3278,14 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             softmax_entropy = -jnp.sum(entropy_terms, axis=-1)
             softmax_entropy_mean = softmax_entropy.mean()
             softmax_entropy_min = softmax_entropy.min()
-        elif local_diagnostics:
+        elif debug_local_removed:
             attn_logit_max_dbg = jnp.max(attn_scores)
             softmax_top1_max = jnp.max(attn_w)
         attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
         out_dbg = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
-        if spike_probe:
+        if debug_probe_removed:
             attn_rows = _attention_spike_rows(attn_scores, attn_w, out_dbg)
-            if _focus_probe_enabled:
+            if _debug_focus_enabled_removed_flag:
                 attn_focus_rows = _attention_focus_rows(attn_scores, attn_w, out_dbg)
         if analysis:
             return (
@@ -3305,15 +3296,15 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 logit_gap_mean, logit_gap_max,
                 softmax_entropy_mean, softmax_entropy_min,
             )
-        if local_diagnostics:
+        if debug_local_removed:
             return out_dbg, attn_logit_max_dbg, softmax_top1_max
-        if spike_probe:
-            if _focus_probe_enabled:
+        if debug_probe_removed:
+            if _debug_focus_enabled_removed_flag:
                 return out_dbg, attn_rows, attn_focus_rows
             return out_dbg, attn_rows
         return out_dbg
 
-    if analysis or local_diagnostics or spike_probe:
+    if analysis or debug_local_removed or debug_probe_removed:
         q_norms_dbg = jnp.linalg.norm(Q, axis=-1)
         k_norms_dbg = jnp.linalg.norm(K, axis=-1)
         v_norms_dbg = jnp.linalg.norm(V, axis=-1)
@@ -3333,19 +3324,19 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          logit_gap_mean, logit_gap_max,
          softmax_entropy_mean, softmax_entropy_min) = _attn_scores(
             Q, K, V, rng_attn_drop)
-    elif local_diagnostics:
+    elif debug_local_removed:
         out, attn_logit_max_actual, attn_softmax_top1_max = _attn_scores(
             Q, K, V, rng_attn_drop)
-    elif spike_probe:
-        if _focus_probe_enabled:
+    elif debug_probe_removed:
+        if _debug_focus_enabled_removed_flag:
             out, attn_spike_rows, attn_focus_rows = _attn_scores(Q, K, V, rng_attn_drop)
         else:
             out, attn_spike_rows = _attn_scores(Q, K, V, rng_attn_drop)
     else:
         out = _attn_scores(Q, K, V, rng_attn_drop)
-    if analysis or local_diagnostics or spike_probe:
+    if analysis or debug_local_removed or debug_probe_removed:
         o_input_norm = jnp.linalg.norm(out, axis=-1).mean()
-        if local_diagnostics and not analysis:
+        if debug_local_removed and not analysis:
             q_norm_max = q_norms_dbg.max()
             k_norm_max = k_norms_dbg.max()
         v_norm_max = v_norms_dbg.max()
@@ -3353,15 +3344,15 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
     attn_out_norm = jnp.linalg.norm(out, axis=-1).mean()
-    if analysis or local_diagnostics or spike_probe:
+    if analysis or debug_local_removed or debug_probe_removed:
         o_out_norm_max = jnp.linalg.norm(out, axis=-1).max()
-    if spike_probe:
+    if debug_probe_removed:
         _row_b = attn_spike_rows[:, 1].astype(jnp.int32)
         _row_q = attn_spike_rows[:, 2].astype(jnp.int32)
         _o_out_by_token = jnp.linalg.norm(out, axis=-1)
         attn_spike_rows = attn_spike_rows.at[:, 13].set(
             _o_out_by_token[_row_b, _row_q])
-        if _focus_probe_enabled:
+        if _debug_focus_enabled_removed_flag:
             attn_focus_rows = attn_focus_rows.at[:, :, 15].set(
                 _o_out_by_token[_focus_b, _focus_pos][:, None])
     rng, rng_out = jax.random.split(rng)
@@ -3461,7 +3452,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          qk_no_active_direct[:, :, 1, :],
          v_no_active_direct),
         axis=-1).astype(jnp.float32))
-    if spike_probe and _focus_probe_enabled:
+    if debug_probe_removed and _debug_focus_enabled_removed_flag:
         _q_focus_rows = _focus_srw_rows_for_pool(
             0, x, h_Q, qk_emb_unit, raw_tau_all[:, :, 0:1],
             qk_read, qk_write, qk_scale)
@@ -3507,7 +3498,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 k_sparsity_diag)
     if not analysis:
         ret = slim_ret
-        if local_diagnostics:
+        if debug_local_removed:
             attn_local_layer_values = jnp.stack([
                 q_norm_max, k_norm_max, v_norm_max,
                 attn_logit_max_actual, attn_softmax_top1_max,
@@ -3526,8 +3517,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_local_values, attn_local_locs,
                 attn_top1_values, attn_top1_locs,
             )
-        if spike_probe:
-            if _focus_probe_enabled:
+        if debug_probe_removed:
+            if _debug_focus_enabled_removed_flag:
                 ret = ret + (
                     jnp.concatenate([qk_spike_rows, v_spike_rows], axis=0),
                     attn_spike_rows,
@@ -3575,7 +3566,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         softmax_entropy_mean, softmax_entropy_min,
         o_input_norm_max, o_out_norm_max,
     )
-    if local_diagnostics:
+    if debug_local_removed:
         attn_local_layer_values = jnp.stack([
             q_norm_max, k_norm_max, v_norm_max,
             attn_logit_max_actual, attn_softmax_top1_max,
@@ -3590,8 +3581,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             attn_local_values, attn_local_locs,
             attn_top1_values, attn_top1_locs,
         )
-    if spike_probe:
-        if _focus_probe_enabled:
+    if debug_probe_removed:
+        if _debug_focus_enabled_removed_flag:
             analysis_ret = analysis_ret + (
                 jnp.concatenate([qk_spike_rows, v_spike_rows], axis=0),
                 attn_spike_rows,
@@ -3611,11 +3602,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 def _rst_forward(x, pool_params, router_params, rng,
                   router_dropout, dropout_rate, deterministic,
                   sharded_fns, analysis=False,
-                  local_diagnostics=False,
-                  spike_probe=False,
-                  spike_probe_topk=8,
+                  debug_local_removed=False,
+                  debug_probe_removed=False,
+                  debug_topk_removed=8,
                   d_model=None, n_layers=None,
-                  focus_probe_enabled=False,
+                  debug_focus_enabled_removed=False,
                   focus_b=None,
                   focus_pos=None,
                   focus_rank=None,
@@ -3663,8 +3654,8 @@ def _rst_forward(x, pool_params, router_params, rng,
         raise ValueError(
             "depth-scaled pool outputs require d_model and n_layers.")
     _, _, rst_scale = _pool_output_scales(d_model, n_layers)
-    _focus_probe_enabled = bool(focus_probe_enabled)
-    _focus_take_k = max(1, int(spike_probe_topk))
+    _debug_focus_enabled_removed_flag = bool(debug_focus_enabled_removed)
+    _focus_take_k = max(1, int(debug_topk_removed))
     _focus_b = focus_b if focus_b is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
     _focus_pos = focus_pos if focus_pos is not None else jnp.zeros((_focus_take_k,), dtype=jnp.int32)
     _focus_rank = focus_rank if focus_rank is not None else jnp.arange(_focus_take_k, dtype=jnp.float32)
@@ -3782,16 +3773,16 @@ def _rst_forward(x, pool_params, router_params, rng,
         rst_exposure_start:rst_exposure_start + DEAD_EXPOSURE_DIAG_COUNT]
     rst_sparsity_start = rst_exposure_start + DEAD_EXPOSURE_DIAG_COUNT
     rst_sparsity_diag = rst_ret[rst_sparsity_start]
-    if spike_probe:
+    if debug_probe_removed:
         rst_spike_rows = rst_ret[-1]
-    if local_diagnostics:
-        _rst_local_tail = rst_ret[-5:-1] if spike_probe else rst_ret[-4:]
+    if debug_local_removed:
+        _rst_local_tail = rst_ret[-5:-1] if debug_probe_removed else rst_ret[-4:]
         (rst_local_values, rst_local_locs,
          rst_top1_values, rst_top1_locs) = _rst_local_tail
     out = out * rst_scale
     rst_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     rst_out_norm_max = jnp.linalg.norm(out, axis=-1).max()
-    if spike_probe and _focus_probe_enabled:
+    if debug_probe_removed and _debug_focus_enabled_removed_flag:
         rst_focus_srw_rows = _focus_srw_rows_for_pool(
             3, x, h, rst_emb_unit, raw_tau, rst_read, rst_write, rst_scale)
     rng, rng_out = jax.random.split(rng)
@@ -3829,13 +3820,13 @@ def _rst_forward(x, pool_params, router_params, rng,
                 rst_sparsity_diag)
     if not analysis:
         ret = slim_ret
-        if local_diagnostics:
+        if debug_local_removed:
             ret = ret + (
                 rst_local_values, rst_local_locs,
                 rst_top1_values, rst_top1_locs,
             )
-        if spike_probe:
-            if _focus_probe_enabled:
+        if debug_probe_removed:
+            if _debug_focus_enabled_removed_flag:
                 ret = ret + (
                     rst_spike_rows,
                     rst_focus_srw_rows,
@@ -3861,13 +3852,13 @@ def _rst_forward(x, pool_params, router_params, rng,
         rst_margin_band,
         rst_int_cap_frac,
     )
-    if local_diagnostics:
+    if debug_local_removed:
         analysis_ret = analysis_ret + (
             rst_local_values, rst_local_locs,
             rst_top1_values, rst_top1_locs,
         )
-    if spike_probe:
-        if _focus_probe_enabled:
+    if debug_probe_removed:
+        if _debug_focus_enabled_removed_flag:
             analysis_ret = analysis_ret + (
                 rst_spike_rows,
                 rst_focus_srw_rows,
@@ -3985,12 +3976,6 @@ class DAWN(nn.Module):
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
                  deterministic=False, sharded_fns=None, analysis=False,
-                 local_diagnostics=False, spike_probe=False,
-                 spike_probe_topk=8,
-                 spike_focus_bpos=None,
-                 spike_focus_input_ids=None,
-                 spike_focus_target_ids=None,
-                 spike_focus_pred_ids=None,
                  soft_gate_temperature=0.07,
                  soft_gate_t_final=0.07,
                  soft_gate_T_qk=None,
@@ -4020,20 +4005,10 @@ class DAWN(nn.Module):
             soft_gate_temperature
             if soft_gate_T_rst is None else soft_gate_T_rst)
         B, S = input_ids.shape
-        focus_probe_enabled = bool(spike_probe and spike_focus_bpos is not None)
-        focus_k = int(spike_probe_topk)
-        if focus_probe_enabled:
-            _focus_b = jnp.clip(
-                spike_focus_bpos[:, 0].astype(jnp.int32), 0, B - 1)
-            _focus_pos = jnp.clip(
-                spike_focus_bpos[:, 1].astype(jnp.int32), 0, S - 1)
-            _focus_rank = jnp.arange(focus_k, dtype=jnp.float32)
-            _focus_input_tok = spike_focus_input_ids.astype(jnp.int32)
-            _focus_target_tok = spike_focus_target_ids.astype(jnp.int32)
-            _focus_pred_tok = spike_focus_pred_ids.astype(jnp.int32)
-            _focus_vocab_emb = self.token_emb.embedding.astype(jnp.float32)
-            _focus_target_emb = _focus_vocab_emb[_focus_target_tok]
-            _focus_pred_emb = _focus_vocab_emb[_focus_pred_tok]
+        debug_local_removed = False
+        debug_probe_removed = False
+        debug_topk_removed = 1
+        debug_focus_enabled_removed = False
         if S > self.max_seq_len:
             raise ValueError(f"Sequence length {S} exceeds max_seq_len")
 
@@ -4322,15 +4297,15 @@ class DAWN(nn.Module):
                     self.n_heads, self.d_model, self.n_layers,
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
-                    local_diagnostics=local_diagnostics,
-                    spike_probe=spike_probe,
-                    spike_probe_topk=spike_probe_topk,
-                    focus_probe_enabled=focus_probe_enabled,
-                    focus_b=_focus_b if focus_probe_enabled else None,
-                    focus_pos=_focus_pos if focus_probe_enabled else None,
-                    focus_rank=_focus_rank if focus_probe_enabled else None,
-                    focus_target_emb=_focus_target_emb if focus_probe_enabled else None,
-                    focus_pred_emb=_focus_pred_emb if focus_probe_enabled else None,
+                    debug_local_removed=debug_local_removed,
+                    debug_probe_removed=debug_probe_removed,
+                    debug_topk_removed=debug_topk_removed,
+                    debug_focus_enabled_removed=debug_focus_enabled_removed,
+                    focus_b=_focus_b if debug_focus_enabled_removed else None,
+                    focus_pos=_focus_pos if debug_focus_enabled_removed else None,
+                    focus_rank=_focus_rank if debug_focus_enabled_removed else None,
+                    focus_target_emb=_focus_target_emb if debug_focus_enabled_removed else None,
+                    focus_pred_emb=_focus_pred_emb if debug_focus_enabled_removed else None,
                     soft_gate_temperature=soft_gate_temperature,
                     soft_gate_t_final=soft_gate_t_final,
                     soft_gate_T_qk=soft_gate_T_qk,
@@ -4390,18 +4365,18 @@ class DAWN(nn.Module):
                      a_logit_gap_mean, a_logit_gap_max,
                      a_softmax_entropy_mean, a_softmax_entropy_min,
                      a_o_input_norm_max, a_o_out_norm_max) = attn_ret[67:104]
-                if local_diagnostics:
-                    if spike_probe and focus_probe_enabled:
+                if debug_local_removed:
+                    if debug_probe_removed and debug_focus_enabled_removed:
                         _a_local_tail = attn_ret[-10:-5]
-                    elif spike_probe:
+                    elif debug_probe_removed:
                         _a_local_tail = attn_ret[-8:-3]
                     else:
                         _a_local_tail = attn_ret[-5:]
                     (a_attn_local_layer_values,
                      a_attn_local_values, a_attn_local_locs,
                      a_attn_top1_values, a_attn_top1_locs) = _a_local_tail
-                if spike_probe:
-                    if focus_probe_enabled:
+                if debug_probe_removed:
+                    if debug_focus_enabled_removed:
                         (a_spike_srw_rows,
                          a_spike_attn_rows,
                          a_focus_srw_rows,
@@ -4417,7 +4392,7 @@ class DAWN(nn.Module):
                          a_out_norm_max) = attn_ret[-3:]
                 x = x + attn_out
                 x_post_attn = x
-                if spike_probe:
+                if debug_probe_removed:
                     a_resid_norm_max = jnp.linalg.norm(
                         jax.lax.stop_gradient(x), axis=-1).max()
 
@@ -4427,16 +4402,16 @@ class DAWN(nn.Module):
                     normed, pool_params, router_params, rng_rst,
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
-                    local_diagnostics=local_diagnostics,
-                    spike_probe=spike_probe,
-                    spike_probe_topk=spike_probe_topk,
+                    debug_local_removed=debug_local_removed,
+                    debug_probe_removed=debug_probe_removed,
+                    debug_topk_removed=debug_topk_removed,
                     d_model=self.d_model, n_layers=self.n_layers,
-                    focus_probe_enabled=focus_probe_enabled,
-                    focus_b=_focus_b if focus_probe_enabled else None,
-                    focus_pos=_focus_pos if focus_probe_enabled else None,
-                    focus_rank=_focus_rank if focus_probe_enabled else None,
-                    focus_target_emb=_focus_target_emb if focus_probe_enabled else None,
-                    focus_pred_emb=_focus_pred_emb if focus_probe_enabled else None,
+                    debug_focus_enabled_removed=debug_focus_enabled_removed,
+                    focus_b=_focus_b if debug_focus_enabled_removed else None,
+                    focus_pos=_focus_pos if debug_focus_enabled_removed else None,
+                    focus_rank=_focus_rank if debug_focus_enabled_removed else None,
+                    focus_target_emb=_focus_target_emb if debug_focus_enabled_removed else None,
+                    focus_pred_emb=_focus_pred_emb if debug_focus_enabled_removed else None,
                     soft_gate_temperature=soft_gate_temperature,
                     soft_gate_t_final=soft_gate_t_final,
                     soft_gate_T_rst=soft_gate_T_rst,
@@ -4475,17 +4450,17 @@ class DAWN(nn.Module):
                      k_den_cost, k_selection_cost, k_current_cost,
                      k_emb_n_max, k_rho_kurt, k_margin_band,
                      k_int_cap_frac) = rst_ret[52:67]
-                if local_diagnostics:
-                    if spike_probe and focus_probe_enabled:
+                if debug_local_removed:
+                    if debug_probe_removed and debug_focus_enabled_removed:
                         _k_local_tail = rst_ret[-7:-3]
-                    elif spike_probe:
+                    elif debug_probe_removed:
                         _k_local_tail = rst_ret[-6:-2]
                     else:
                         _k_local_tail = rst_ret[-4:]
                     (k_local_values, k_local_locs,
                      k_top1_values, k_top1_locs) = _k_local_tail
-                if spike_probe:
-                    if focus_probe_enabled:
+                if debug_probe_removed:
+                    if debug_focus_enabled_removed:
                         (k_spike_srw_rows,
                          k_focus_srw_rows,
                          k_out_norm_max) = rst_ret[-3:]
@@ -4496,10 +4471,10 @@ class DAWN(nn.Module):
                          k_out_norm_max) = rst_ret[-2:]
                 x = x + rst_out
                 x_post_rst = x
-                if spike_probe:
+                if debug_probe_removed:
                     k_resid_norm_max = jnp.linalg.norm(
                         jax.lax.stop_gradient(x), axis=-1).max()
-                if focus_probe_enabled:
+                if debug_focus_enabled_removed:
                     _zero_ref = jnp.zeros_like(x_pre_attn)
                     focus_path_rows = jnp.stack([
                         _focus_alignment_rows(layer_idx, 0, x_pre_attn, x_pre_attn),
@@ -4585,7 +4560,7 @@ class DAWN(nn.Module):
                            k_sparsity_diag,
                            )
                 if not analysis:
-                    if local_diagnostics:
+                    if debug_local_removed:
                         slim_ys = slim_ys + (
                             a_attn_local_layer_values,
                             a_attn_local_values, a_attn_local_locs,
@@ -4593,7 +4568,7 @@ class DAWN(nn.Module):
                             k_local_values, k_local_locs,
                             k_top1_values, k_top1_locs,
                         )
-                    if spike_probe:
+                    if debug_probe_removed:
                         slim_ys = slim_ys + (
                             a_spike_srw_rows,
                             a_spike_attn_rows,
@@ -4603,7 +4578,7 @@ class DAWN(nn.Module):
                             a_resid_norm_max,
                             k_resid_norm_max,
                         )
-                    if focus_probe_enabled:
+                    if debug_focus_enabled_removed:
                         focus_srw_candidates = jnp.concatenate(
                             [a_focus_srw_rows, k_focus_srw_rows], axis=1)
                         _fs_scores = focus_srw_candidates[:, :, 6]
@@ -4645,7 +4620,7 @@ class DAWN(nn.Module):
                     a_softmax_entropy_mean, a_softmax_entropy_min,
                     a_o_input_norm_max, a_o_out_norm_max,
                 )
-                if local_diagnostics:
+                if debug_local_removed:
                     analysis_ys = analysis_ys + (
                         a_attn_local_layer_values,
                         a_attn_local_values, a_attn_local_locs,
@@ -4653,7 +4628,7 @@ class DAWN(nn.Module):
                         k_local_values, k_local_locs,
                         k_top1_values, k_top1_locs,
                     )
-                if spike_probe:
+                if debug_probe_removed:
                     analysis_ys = analysis_ys + (
                         a_spike_srw_rows,
                         a_spike_attn_rows,
@@ -4663,7 +4638,7 @@ class DAWN(nn.Module):
                         a_resid_norm_max,
                         k_resid_norm_max,
                     )
-                if focus_probe_enabled:
+                if debug_focus_enabled_removed:
                     focus_srw_candidates = jnp.concatenate(
                         [a_focus_srw_rows, k_focus_srw_rows], axis=1)
                     _fs_scores = focus_srw_candidates[:, :, 6]
@@ -4792,7 +4767,7 @@ class DAWN(nn.Module):
                  attn_o_output_norm_max_all) = scan_ys[
                     _scan_offset:_scan_offset + 52]
                 _scan_offset += 52
-            if local_diagnostics:
+            if debug_local_removed:
                 (attn_local_layer_values_all,
                  attn_local_values_all, attn_local_locs_all,
                  attn_top1_values_all, attn_top1_locs_all,
@@ -4800,7 +4775,7 @@ class DAWN(nn.Module):
                  rst_top1_values_all, rst_top1_locs_all) = scan_ys[
                     _scan_offset:_scan_offset + 9]
                 _scan_offset += 9
-            if spike_probe:
+            if debug_probe_removed:
                 (spike_attn_srw_rows_all,
                  spike_attn_rows_all,
                  spike_rst_srw_rows_all,
@@ -4810,11 +4785,11 @@ class DAWN(nn.Module):
                  spike_layer_resid_norm_max_after_rst_all) = scan_ys[
                     _scan_offset:_scan_offset + 7]
                 _scan_offset += 7
-            if focus_probe_enabled:
-                (spike_focus_path_trace_all,
-                 spike_focus_route_trace_all,
-                 spike_focus_srw_top_all,
-                 spike_focus_attention_top_all) = scan_ys[
+            if debug_focus_enabled_removed:
+                (debug_focus_removed_path_trace_all,
+                 debug_focus_removed_route_trace_all,
+                 debug_focus_removed_srw_top_all,
+                 debug_focus_removed_attention_top_all) = scan_ys[
                     _scan_offset:_scan_offset + 4]
                 _scan_offset += 4
             # Aux is averaged over layers after attention and RST terms are
@@ -4823,8 +4798,8 @@ class DAWN(nn.Module):
 
         x_pre_final_norm = x
         x = self.norm(x)
-        if focus_probe_enabled and not self.is_initializing():
-            spike_focus_final_trace = _focus_alignment_rows(
+        if debug_focus_enabled_removed and not self.is_initializing():
+            debug_focus_removed_final_trace = _focus_alignment_rows(
                 jnp.asarray(self.n_layers, dtype=jnp.int32),
                 7, x, x_pre_final_norm)[:, None, :]
 
@@ -5290,7 +5265,7 @@ class DAWN(nn.Module):
                 'attn_int_cap_frac': attn_int_cap_frac_all.mean(),
                 'rst_int_cap_frac': rst_int_cap_frac_all.mean(),
             })
-        if local_diagnostics and not self.is_initializing():
+        if debug_local_removed and not self.is_initializing():
             result.update({
                 'attn_local_layer_values': attn_local_layer_values_all,
                 'local_spike_values': jnp.concatenate([
@@ -5310,7 +5285,7 @@ class DAWN(nn.Module):
                     rst_top1_locs_all,
                 ], axis=1),
             })
-        if spike_probe and not self.is_initializing():
+        if debug_probe_removed and not self.is_initializing():
             result.update({
                 'spike_srw_top': jnp.concatenate([
                     spike_attn_srw_rows_all,
@@ -5328,20 +5303,20 @@ class DAWN(nn.Module):
                 'spike_layer_lm_logit_abs_proxy_if_available': jnp.zeros(
                     (self.n_layers,), dtype=jnp.float32),
             })
-        if focus_probe_enabled and not self.is_initializing():
+        if debug_focus_enabled_removed and not self.is_initializing():
             _focus_final_block = jnp.full(
                 (focus_k, 7, SPIKE_FOCUS_PATH_FIELD_COUNT),
                 -jnp.inf, dtype=jnp.float32)
             _focus_final_block = _focus_final_block.at[:, 0, :].set(
-                spike_focus_final_trace[:, 0, :])
+                debug_focus_removed_final_trace[:, 0, :])
             result.update({
-                'spike_focus_path_trace': jnp.concatenate([
-                    spike_focus_path_trace_all,
+                'debug_focus_removed_path_trace': jnp.concatenate([
+                    debug_focus_removed_path_trace_all,
                     _focus_final_block[None, :, :, :],
                 ], axis=0),
-                'spike_focus_route_trace': spike_focus_route_trace_all,
-                'spike_focus_srw_top': spike_focus_srw_top_all,
-                'spike_focus_attention_top': spike_focus_attention_top_all,
+                'debug_focus_removed_route_trace': debug_focus_removed_route_trace_all,
+                'debug_focus_removed_srw_top': debug_focus_removed_srw_top_all,
+                'debug_focus_removed_attention_top': debug_focus_removed_attention_top_all,
             })
 
 
@@ -5382,7 +5357,7 @@ class DAWN(nn.Module):
             result['debug_logit_std'] = logit_std
             result['per_token_ce'] = per_token_ce
             result['valid_mask'] = valid_mask
-            if spike_probe:
+            if debug_probe_removed:
                 logits_f = (shift_x @ embedding_matrix.T).astype(jnp.float32)
                 pred_ids = jnp.argmax(logits_f, axis=-1).astype(jnp.int32)
                 max_logits = jnp.max(logits_f, axis=-1)
@@ -5395,7 +5370,7 @@ class DAWN(nn.Module):
                 score = jnp.where(
                     valid_mask, per_token_ce, jnp.float32(-jnp.inf))
                 flat_score = score.reshape((-1,))
-                _tok_k = min(max(1, int(spike_probe_topk)),
+                _tok_k = min(max(1, int(debug_topk_removed)),
                              int(flat_score.shape[0]))
                 top_scores, flat_idx = jax.lax.top_k(flat_score, _tok_k)
                 tok_b = flat_idx // (S - 1)
@@ -5418,9 +5393,9 @@ class DAWN(nn.Module):
                     pred_logits[tok_b, tok_pos]
                     - target_logits[tok_b, tok_pos],
                 ], axis=-1).astype(jnp.float32)
-                if _tok_k < int(spike_probe_topk):
+                if _tok_k < int(debug_topk_removed):
                     pad = jnp.full(
-                        (int(spike_probe_topk) - _tok_k,
+                        (int(debug_topk_removed) - _tok_k,
                          SPIKE_TOKEN_FIELD_COUNT),
                         -jnp.inf, dtype=jnp.float32)
                     pad = pad.at[:, 1:6].set(0.0)

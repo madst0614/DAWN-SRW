@@ -54,54 +54,12 @@ from typing import Any, Callable, Optional
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental.shard_map import shard_map
 
-# Model registry imports. Legacy DAWN experiments live in models/legacy/;
-# restore and re-register them only when reproducing an old run.
-from models.baseline_transformer_jax import VanillaTransformer
-from models.legacy.dawn_spatial_v394_exp import DAWN as DAWN_V394
-from models.legacy.dawn_spatial_v4152 import DAWN as DAWN_V4152
-from models.dawn_srw import (
-    DAWN as DAWN_SRW,
-    migrate_legacy_v4155_params,
+# Official v4.1.6.4 model path.
+from models.dawn_srw_v4164 import (
+    DAWN as DAWN_SRW_V4164,
+    _raw_tau_init_from_cosine_tau as _v4164_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4164_tau_init_calibration_scores,
 )
-try:
-    from models.dawn_srw_v4156 import DAWN as DAWN_SRW_V4156
-except ImportError:
-    DAWN_SRW_V4156 = None
-try:
-    from models.dawn_srw_v4158 import DAWN as DAWN_SRW_V4158
-except ImportError:
-    DAWN_SRW_V4158 = None
-try:
-    from models.dawn_srw_v4159 import DAWN as DAWN_SRW_V4159
-except ImportError:
-    DAWN_SRW_V4159 = None
-try:
-    from models.dawn_srw_v4160 import DAWN as DAWN_SRW_V4160
-except ImportError:
-    DAWN_SRW_V4160 = None
-try:
-    from models.dawn_srw_v4161 import DAWN as DAWN_SRW_V4161
-except ImportError:
-    DAWN_SRW_V4161 = None
-from models.dawn_srw_v4162 import (
-    DAWN as DAWN_SRW_V4162,
-    _raw_tau_init_from_cosine_tau as _v4162_raw_tau_init_from_cosine_tau,
-    _tau_init_calibration_scores as _v4162_tau_init_calibration_scores,
-)
-try:
-    from models.dawn_srw_v4163 import DAWN as DAWN_SRW_V4163
-except ImportError:
-    DAWN_SRW_V4163 = None
-try:
-    from models.dawn_srw_v4164 import (
-        DAWN as DAWN_SRW_V4164,
-        _raw_tau_init_from_cosine_tau as _v4164_raw_tau_init_from_cosine_tau,
-        _tau_init_calibration_scores as _v4164_tau_init_calibration_scores,
-    )
-except ImportError:
-    DAWN_SRW_V4164 = None
-    _v4164_raw_tau_init_from_cosine_tau = None
-    _v4164_tau_init_calibration_scores = None
 
 # ============================================================
 # Constants
@@ -110,125 +68,12 @@ except ImportError:
 # Log cadence is config-driven: see log_interval / log_analysis_multiplier
 # in `training:`. The legacy module-level LOG_INTERVAL constant was removed.
 
-SRW_ACTIVE_MODEL_VERSIONS = (
-    'dawn_srw',
-    'spatial-r1-v4.1.5.5',
-    'spatial-r1-v4.1.5.6',
-    'spatial-r1-v4.1.5.8',
-    'spatial-r1-v4.1.5.9',
-    'spatial-r1-v4.1.6.0',
-    'spatial-r1-v4.1.6.1',
-    'spatial-r1-v4.1.6.2',
-    'spatial-r1-v4.1.6.3',
-    'spatial-r1-v4.1.6.4',
-)
-
-DIRECT_TAU_SPLIT_MODEL_VERSIONS = (
-    'spatial-r1-v4.1.6.0',
-    'spatial-r1-v4.1.6.1',
-    'spatial-r1-v4.1.6.2',
-    'spatial-r1-v4.1.6.3',
-    'spatial-r1-v4.1.6.4',
-)
-
-SOFT_DIRECT_TAU_MODEL_VERSIONS = (
-    'spatial-r1-v4.1.6.2',
-    'spatial-r1-v4.1.6.3',
-    'spatial-r1-v4.1.6.4',
-)
-
-ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS = (
-    'spatial-r1-v4.1.6.3',
-    'spatial-r1-v4.1.6.4',
-)
-
-UNIFIED_ROUTE_DEN_MODEL_VERSIONS = (
-    'spatial-r1-v4.1.6.4',
-)
-
-LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
-# These names must match model local_spike_values slots. Top1-only fields
-# live in LOCAL_TOP1_FIELD_NAMES.
-LOCAL_SPIKE_METRIC_NAMES = (
-    'tau_abs', 'gate_raw', 'top1_share', 'gate_den_sum', 'intensity',
-    'read_abs', 'contrib_norm', 'out_norm', 'resid_norm',
-    'h_norm', 'emb_norm', 'score', 'margin', 'write_norm',
-    'read_norm', 'op_gain')
-LOCAL_TOP1_FIELD_NAMES = (
-    'top1', 'score', 'tau', 'margin', 'gate_raw', 'gate_norm',
-    'gate_den', 'intensity', 'read_scalar', 'write_norm', 'read_norm',
-    'op_gain', 'contrib_norm', 'total_out_norm', 'contrib_frac',
-    'h_norm', 'emb_norm')
-ATTN_LOCAL_FIELD_NAMES = (
-    'q_norm_max', 'k_norm_max', 'v_norm_max', 'attn_logit_max',
-    'softmax_top1_max', 'o_in_norm_max', 'o_out_norm_max')
-SPIKE_SRW_FIELD_NAMES = (
-    'score', 'batch', 'pos', 'neuron_global_id', 'rho', 'raw_tau', 'tau',
-    'margin', 'positive_margin', 'intensity', 'gate_raw', 'gate_den',
-    'gate_share', 'top1_share_for_token', 'active_n_for_token',
-    'no_active_for_token', 'read_scalar_xr', 'abs_read_scalar_xr',
-    'read_norm', 'write_norm', 'op_gain', 'contrib_proxy',
-    'raw_out_norm_for_token', 'out_norm_for_token', 'resid_norm_for_token',
-    'h_norm_for_token')
-SPIKE_ATTN_FIELD_NAMES = (
-    'score', 'batch', 'query_pos', 'key_pos', 'attn_logit_max',
-    'attn_logit_min', 'attn_logit_gap_top1_top2', 'attn_top1_weight',
-    'attn_entropy', 'q_norm', 'k_norm', 'v_norm',
-    'attn_o_input_norm', 'attn_o_output_norm')
-SPIKE_TOKEN_FIELD_NAMES = (
-    'rank', 'batch', 'pos', 'input_token_id', 'target_token_id',
-    'pred_token_id', 'token_ce', 'target_logit', 'pred_logit',
-    'max_logit', 'min_logit', 'logit_abs_max',
-    'logit_gap_pred_minus_target')
-
-SPIKE_TOKEN_ALIGN_FIELD_NAMES = (
-    'rank', 'batch', 'pos', 'input_token_id', 'target_token_id',
-    'pred_token_id', 'input_cos', 'target_cos', 'pred_cos',
-    'input_dot', 'target_dot', 'pred_dot', 'hidden_norm',
-    'input_emb_norm', 'target_emb_norm', 'pred_emb_norm',
-    'pred_equals_input', 'target_equals_input', 'pred_equals_target')
-
-SPIKE_FOCUS_PATH_FIELD_NAMES = (
-    'rank', 'batch', 'pos', 'layer', 'stage_id',
-    'input_token_id', 'target_token_id', 'pred_token_id',
-    'hidden_norm', 'delta_norm_from_prev',
-    'input_cos', 'target_cos', 'pred_cos',
-    'input_dot', 'target_dot', 'pred_dot',
-    'pred_minus_target_dot', 'pred_minus_target_cos',
-    'target_minus_input_dot',
-    'delta_target_dot', 'delta_pred_dot',
-    'delta_pred_minus_target_dot',
-    'delta_target_cos', 'delta_pred_cos',
-    'delta_pred_minus_target_cos',
-    'pred_equals_input', 'target_equals_input', 'pred_equals_target')
-
-SPIKE_FOCUS_ROUTE_FIELD_NAMES = (
-    'rank', 'batch', 'pos', 'layer',
-    'attn_out_norm', 'rst_out_norm',
-    'pre_attn_resid_norm', 'post_attn_resid_norm', 'post_rst_resid_norm',
-    'qk_active', 'v_active', 'rst_active',
-    'q_tau', 'k_tau', 'v_tau', 'rst_tau',
-    'q_no_active', 'k_no_active', 'v_no_active', 'rst_no_active',
-    'qk_positive_margin', 'v_positive_margin', 'rst_positive_margin',
-    'full_block_delta_norm')
-
-SPIKE_FOCUS_SRW_FIELD_NAMES = (
-    'rank', 'batch', 'pos', 'layer', 'pool_id', 'neuron_global_id',
-    'score', 'rho', 'tau', 'margin', 'positive_margin', 'intensity',
-    'gate_raw', 'gate_den', 'gate_share', 'active_n_for_token',
-    'read_scalar_xr', 'abs_read_scalar_xr', 'read_norm', 'write_norm',
-    'op_gain', 'raw_out_norm_for_token', 'out_norm_for_token',
-    'resid_norm_for_token', 'h_norm_for_token',
-    'read_dot_target', 'read_dot_pred',
-    'write_dot_target', 'write_dot_pred',
-    'write_pred_minus_target', 'contrib_pred_minus_target')
-
-SPIKE_FOCUS_ATTN_FIELD_NAMES = (
-    'rank', 'batch', 'query_pos', 'layer', 'head', 'key_pos', 'score',
-    'attn_logit', 'attn_weight', 'attn_logit_gap_top1_top2',
-    'attn_entropy', 'q_norm', 'k_norm', 'v_norm',
-    'attn_o_input_norm', 'attn_o_output_norm',
-    'key_relpos', 'key_is_self')
+OFFICIAL_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
+SRW_ACTIVE_MODEL_VERSIONS = (OFFICIAL_MODEL_VERSION,)
+DIRECT_TAU_SPLIT_MODEL_VERSIONS = (OFFICIAL_MODEL_VERSION,)
+SOFT_DIRECT_TAU_MODEL_VERSIONS = (OFFICIAL_MODEL_VERSION,)
+ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS = (OFFICIAL_MODEL_VERSION,)
+UNIFIED_ROUTE_DEN_MODEL_VERSIONS = (OFFICIAL_MODEL_VERSION,)
 
 DIRECT_TAU_SELECT_METRIC_NAMES = (
     'rho_mean', 'rho_std', 'rho_max',
@@ -668,8 +513,8 @@ def _dawn_v4152_kwargs(cfg):
     return kw
 
 
-def _v4162_tau_init_config(cfg):
-    """Parse and validate v4162/v4163/v4164 explicit or quantile tau init."""
+def _v4164_tau_init_config(cfg):
+    """Parse and validate v4164 explicit or quantile tau init."""
     model_cfg = cfg['model']
     training_cfg = cfg['training']
 
@@ -683,7 +528,7 @@ def _v4162_tau_init_config(cfg):
     mode = str(_cfg_get('tau_init_mode', 'explicit')).strip().lower()
     if mode not in ('explicit', 'quantile_frac'):
         raise ValueError(
-            "v4162/v4163/v4164 tau_init_mode must be 'explicit' or 'quantile_frac', "
+            "v4164 tau_init_mode must be 'explicit' or 'quantile_frac', "
             f"got {mode!r}.")
 
     parsed = {'mode': mode}
@@ -695,7 +540,7 @@ def _v4162_tau_init_config(cfg):
         }
         if any(value is None for value in explicit.values()):
             raise ValueError(
-                "v4162/v4163/v4164 requires explicit cosine-space "
+                "v4164 requires explicit cosine-space "
                 "tau_init_attn_qk/v/rst.")
         parsed['explicit'] = explicit
         return parsed
@@ -706,7 +551,7 @@ def _v4162_tau_init_config(cfg):
         value = _cfg_get(name, None)
         if value is None:
             raise ValueError(
-                f"v4162/v4163/v4164 tau_init_mode=quantile_frac "
+                f"v4164 tau_init_mode=quantile_frac "
                 f"requires {name}.")
         value = float(value)
         if not np.isfinite(value) or not (0.0 < value < 1.0):
@@ -735,347 +580,76 @@ def _v4162_tau_init_config(cfg):
 
 
 def _dawn_srw_kwargs(cfg):
-    """Official DAWN-SRW path; accepts n_rst while preserving n_know configs."""
+    """Official v4.1.6.4 DAWN-SRW constructor kwargs."""
     kw = _dawn_v4152_kwargs(cfg)
     m = cfg['model']
     t = cfg['training']
-    version = cfg['model'].get('model_version', 'dawn_srw')
-    if 'n_rst' in m:
-        kw['n_rst'] = m['n_rst']
-        kw['n_know'] = m.get('n_know', None)
+    if 'n_rst' not in m and 'n_know' not in m:
+        raise ValueError("v4164 requires model.n_rst or legacy model.n_know.")
+    kw['n_rst'] = m.get('n_rst', m.get('n_know'))
+    kw['n_know'] = m.get('n_know', None)
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
-    if version == 'spatial-r1-v4.1.5.9':
-        if ('tau_offset_init' in m or 'tau_offset_init' in t):
-            kw['tau_offset_init'] = m.get(
-                'tau_offset_init', t.get('tau_offset_init'))
-        if ('tau_offset_init_attn' in m or 'tau_offset_init_attn' in t):
-            kw['tau_offset_init_attn'] = m.get(
-                'tau_offset_init_attn', t.get('tau_offset_init_attn'))
-        if ('tau_offset_init_attn_qk' in m or 'tau_offset_init_attn_qk' in t):
-            kw['tau_offset_init_attn_qk'] = m.get(
-                'tau_offset_init_attn_qk', t.get('tau_offset_init_attn_qk'))
-        if ('tau_offset_init_attn_v' in m or 'tau_offset_init_attn_v' in t):
-            kw['tau_offset_init_attn_v'] = m.get(
-                'tau_offset_init_attn_v', t.get('tau_offset_init_attn_v'))
-        if ('tau_offset_init_rst' in m or 'tau_offset_init_rst' in t):
-            kw['tau_offset_init_rst'] = m.get(
-                'tau_offset_init_rst', t.get('tau_offset_init_rst'))
-        if ('d_select' in m or 'd_select' in t):
-            kw['d_select'] = m.get('d_select', t.get('d_select'))
-    if version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1',
-                   'spatial-r1-v4.1.6.2', 'spatial-r1-v4.1.6.3',
-                   'spatial-r1-v4.1.6.4'):
-        def _cfg_get(name, default=None):
-            if name in m:
-                return m[name]
-            if name in t:
-                return t[name]
-            return default
-
-        def _legacy_count_init_cfg(name):
-            val = _cfg_get(name, None)
-            if val is None:
-                raise ValueError(
-                    f"{version} requires {name} for count-based "
-                    "DirectTau initialization.")
-            return val
-
-        if version in SOFT_DIRECT_TAU_MODEL_VERSIONS:
-            tau_init_cfg = _v4162_tau_init_config(cfg)
-            if tau_init_cfg['mode'] == 'explicit':
-                kw['tau_init_attn_qk'] = tau_init_cfg['explicit']['qk']
-                kw['tau_init_attn_v'] = tau_init_cfg['explicit']['v']
-                kw['tau_init_rst'] = tau_init_cfg['explicit']['rst']
-            else:
-                # Safe constructor placeholders. Fresh quantile_frac starts
-                # overwrite these biases once, before optimizer init/training.
-                kw['tau_init_attn_qk'] = 0.0
-                kw['tau_init_attn_v'] = 0.0
-                kw['tau_init_rst'] = 0.0
-        else:
-            kw['legacy_count_init_attn_qk'] = _legacy_count_init_cfg(
-                'legacy_count_init_attn_qk')
-            kw['legacy_count_init_attn_v'] = _legacy_count_init_cfg(
-                'legacy_count_init_attn_v')
-            kw['legacy_count_init_rst'] = _legacy_count_init_cfg(
-                'legacy_count_init_rst')
-        if (version not in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-                and ('d_select' in m or 'd_select' in t)):
-            kw['d_select'] = m.get('d_select', t.get('d_select'))
+    tau_init_cfg = _v4164_tau_init_config(cfg)
+    if tau_init_cfg['mode'] == 'explicit':
+        kw['tau_init_attn_qk'] = tau_init_cfg['explicit']['qk']
+        kw['tau_init_attn_v'] = tau_init_cfg['explicit']['v']
+        kw['tau_init_rst'] = tau_init_cfg['explicit']['rst']
+    else:
+        # Fresh quantile starts overwrite these before optimizer init.
+        kw['tau_init_attn_qk'] = 0.0
+        kw['tau_init_attn_v'] = 0.0
+        kw['tau_init_rst'] = 0.0
     return kw
 
 
-def _v415_sharded_kwargs(cfg):
-    """Gate constants for the active v4.1.5 sharded SRW path."""
+def _v4164_sharded_kwargs(cfg):
+    """Fixed v4164 sharded SRW execution kwargs."""
     t = cfg['training']
-    version = cfg['model'].get('model_version')
-    if version == 'spatial-r1-v4.1.5.9':
-        kw = dict(
-            dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
-            scan_scale=t.get('scan_scale', 0.0),
-            scan_std_floor=t.get('scan_std_floor', 0.5),
-            tau_min=t.get('tau_min', 0.0),
-        )
-    elif version == 'spatial-r1-v4.1.6.0':
-        kw = dict(
-            dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
-        )
-    elif version == 'spatial-r1-v4.1.6.1':
-        # v4161 is intentionally left on its original CB1A path.
-        kw = dict(
-            dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
-            cb1a_enabled=True,
-            cb1a_tau_stopgrad=True,
-            cb1a_anchor_stopgrad=True,
-            cb1a_forward_influence=False,
-            cb1a_eps=float(t.get('cb1a_eps', 1.0e-8)),
-        )
-    elif version in SOFT_DIRECT_TAU_MODEL_VERSIONS:
-        if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
-            admission_den_power_cfg = t.get(
-                'admission_den_power',
-                t.get('v4164_den_power', 1.0))
-            admission_den_grad_scale_cfg = t.get(
-                'admission_den_grad_scale',
-                t.get('v4164_den_grad_scale', 1.0))
-            kw = dict(
-                dead_exposure_target=0.0,
-                soft_gate_effective_active_eps=float(
-                    t.get('soft_gate_effective_active_eps', 1.0e-6)),
-                admission_den_power=float(admission_den_power_cfg),
-                admission_den_grad_scale=float(admission_den_grad_scale_cfg),
-            )
-        else:
-            # v4162/v4163 compatibility path: DirectTau only. no CB1A/edge
-            # auxiliary kwargs.
-            regular_level = str(t.get('regular_diagnostics_level', 'compact')).lower()
-            if regular_level not in ('compact', 'full'):
-                raise ValueError(
-                    "training.regular_diagnostics_level must be 'compact' or 'full'.")
-            kw = dict(
-                dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
-                soft_gate_enabled=bool(t.get('soft_gate_enabled', True)),
-                soft_gate_effective_active_eps=float(
-                    t.get('soft_gate_effective_active_eps', 1.0e-6)),
-                regular_diagnostics_level=regular_level,
-                regular_current_eps=tuple(
-                    float(x) for x in t.get(
-                        'regular_current_eps', [1.0e-1, 1.0e-2, 1.0e-3])),
-                regular_projected_eps=tuple(
-                    float(x) for x in t.get(
-                        'regular_projected_eps', [1.0e-6])),
-                regular_mass_enabled=bool(t.get('regular_mass_enabled', False)),
-                regular_sparsity_enabled=bool(t.get(
-                    'regular_sparsity_enabled',
-                    version not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)),
-            )
-    else:
-        kw = dict(
-            sharpness=t.get('sharpness', 500.0),
-            epsilon=t.get('epsilon', 1e-4),
-            max_intensity=t.get('max_intensity', 10.0),
-            scan_scale=t.get('scan_scale', 0.01),
-            scan_std_floor=t.get('scan_std_floor', 0.5),
-        )
-    # v4.1.5.9-v4.1.6.3 split d_route into select/intensity dims.
-    # v4.1.6.4 keeps d_route as one unified angular space.
-    m = cfg['model']
-    d_route = int(m.get('d_route', m.get('d_bottleneck', 128)))
-    d_select_cfg = m.get('d_select', t.get('d_select', None))
-    if version in (
-            'spatial-r1-v4.1.5.9',
-            'spatial-r1-v4.1.6.0',
-            'spatial-r1-v4.1.6.1',
-            'spatial-r1-v4.1.6.2',
-            'spatial-r1-v4.1.6.3') and d_select_cfg is None:
-        raise ValueError(
-            f"{version} angular SRW requires model.d_select.")
-    if version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
-        intensity_route_dim = 0
-    elif d_select_cfg is not None:
-        d_select = int(d_select_cfg)
-        if not (0 < d_select < d_route):
-            raise ValueError(
-                f"d_select must satisfy 0 < d_select < d_route; "
-                f"got d_select={d_select}, d_route={d_route}")
-        intensity_route_dim = d_route - d_select
-    else:
-        intensity_route_dim = int(t.get('intensity_route_dim', 0) or 0)
-    if intensity_route_dim > 0:
-        kw['intensity_route_dim'] = int(intensity_route_dim)
-        kw['intensity_beta'] = float(t.get('intensity_beta', 0.5))
-    if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
-        kw['rw_contrib_den_floor'] = t.get('rw_contrib_den_floor', 1.0)
-    return kw
+    admission_den_power_cfg = t.get(
+        'admission_den_power',
+        t.get('v4164_den_power', 1.0))
+    admission_den_grad_scale_cfg = t.get(
+        'admission_den_grad_scale',
+        t.get('v4164_den_grad_scale', 1.0))
+    return dict(
+        dead_exposure_target=0.0,
+        soft_gate_effective_active_eps=float(
+            t.get('soft_gate_effective_active_eps', 1.0e-6)),
+        admission_den_power=float(admission_den_power_cfg),
+        admission_den_grad_scale=float(admission_den_grad_scale_cfg),
+    )
 
 
 MODEL_REGISTRY = {
-    'baseline': ModelSpec(
-        name='baseline',
-        module_path='models.baseline_transformer_jax',
-        cls=VanillaTransformer,
-        build_kwargs=_baseline_kwargs,
-    ),
-    'spatial-r1-v3.9.4': ModelSpec(
-        name='spatial-r1-v3.9.4',
-        module_path='models.legacy.dawn_spatial_v394_exp',
-        cls=DAWN_V394,
-        build_kwargs=_dawn_shared_kwargs,
-        supports_sharded=True,
-    ),
-    'spatial-r1-v4.1.5.2': ModelSpec(
-        name='spatial-r1-v4.1.5.2',
-        module_path='models.legacy.dawn_spatial_v4152',
-        cls=DAWN_V4152,
-        build_kwargs=_dawn_v4152_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    ),
-    'dawn_srw': ModelSpec(
-        name='dawn_srw',
-        module_path='models.dawn_srw',
-        cls=DAWN_SRW,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    ),
-    # Legacy model_version alias for existing configs/checkpoints.
-    'spatial-r1-v4.1.5.5': ModelSpec(
-        name='dawn_srw',
-        module_path='models.dawn_srw',
-        cls=DAWN_SRW,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    ),
-}
-
-if DAWN_SRW_V4156 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.5.6'] = ModelSpec(
-        name='spatial-r1-v4.1.5.6',
-        module_path='models.dawn_srw_v4156',
-        cls=DAWN_SRW_V4156,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
-
-if DAWN_SRW_V4158 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.5.8'] = ModelSpec(
-        name='spatial-r1-v4.1.5.8',
-        module_path='models.dawn_srw_v4158',
-        cls=DAWN_SRW_V4158,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
-
-if DAWN_SRW_V4159 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.5.9'] = ModelSpec(
-        name='spatial-r1-v4.1.5.9',
-        module_path='models.dawn_srw_v4159',
-        cls=DAWN_SRW_V4159,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
-
-if DAWN_SRW_V4160 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.6.0'] = ModelSpec(
-        name='spatial-r1-v4.1.6.0',
-        module_path='models.dawn_srw_v4160',
-        cls=DAWN_SRW_V4160,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
-
-if DAWN_SRW_V4161 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.6.1'] = ModelSpec(
-        name='spatial-r1-v4.1.6.1',
-        module_path='models.dawn_srw_v4161',
-        cls=DAWN_SRW_V4161,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
-
-if DAWN_SRW_V4162 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.6.2'] = ModelSpec(
-        name='spatial-r1-v4.1.6.2',
-        module_path='models.dawn_srw_v4162',
-        cls=DAWN_SRW_V4162,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
-
-if DAWN_SRW_V4163 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.6.3'] = ModelSpec(
-        name='spatial-r1-v4.1.6.3',
-        module_path='models.dawn_srw_v4163',
-        cls=DAWN_SRW_V4163,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
-
-if DAWN_SRW_V4164 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.6.4'] = ModelSpec(
-        name='spatial-r1-v4.1.6.4',
+    OFFICIAL_MODEL_VERSION: ModelSpec(
+        name=OFFICIAL_MODEL_VERSION,
         module_path='models.dawn_srw_v4164',
         cls=DAWN_SRW_V4164,
         build_kwargs=_dawn_srw_kwargs,
         supports_sharded=True,
         force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
+        sharded_kwargs=_v4164_sharded_kwargs,
+    ),
+}
+
 
 def build_model_from_config(cfg):
-    """Build model from config via MODEL_REGISTRY.
-
-    Unknown versions raise ValueError with restoration instructions:
-    legacy versions live in models/legacy/ and can be re-registered in
-    MODEL_REGISTRY when resuming old checkpoints or reproducing paper
-    results. See models/legacy/README.md.
-    """
-    version = cfg['model'].get('model_version', 'dawn_srw')
-    if version not in MODEL_REGISTRY:
+    """Build the official v4.1.6.4 model from config."""
+    version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
+    if version != OFFICIAL_MODEL_VERSION:
         raise ValueError(
-            f"Unknown model_version: {version!r}. "
-            f"Known: {sorted(MODEL_REGISTRY.keys())}. "
-            f"Legacy versions live in models/legacy/; to resume an old "
-            f"checkpoint, move the model file back to models/ and add a "
-            f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
-    spec = MODEL_REGISTRY[version]
+            f"scripts/train_jax.py is the official {OFFICIAL_MODEL_VERSION} "
+            f"trainer; got model_version={version!r}.")
+    spec = MODEL_REGISTRY[OFFICIAL_MODEL_VERSION]
     kwargs = spec.build_kwargs(cfg)
-    if version in ('spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
-        print(f"route dims: d_route={kwargs['d_route']}")
+    print(f"route dims: d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
 
-def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
+def _compute_v4164_quantile_tau_init(params, input_ids, cfg,
                                      tau_init_cfg):
     """Compute host-side quantiles from a small deterministic score sample."""
-    version = cfg['model'].get('model_version', 'dawn_srw')
-    is_unified_route_den = version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-    d_select = cfg['model'].get(
-        'd_select', cfg['training'].get('d_select', None))
-    if d_select is None and not is_unified_route_den:
-        raise ValueError(
-            "v4162/v4163 tau_init_mode=quantile_frac requires model.d_select.")
-    if (version == 'spatial-r1-v4.1.6.4'
-            and _v4164_tau_init_calibration_scores is None):
+    if _v4164_tau_init_calibration_scores is None:
         raise ValueError(
             "v4164 tau_init_mode=quantile_frac requires "
             "models.dawn_srw_v4164 to import cleanly.")
@@ -1098,15 +672,10 @@ def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
             'rst_emb': params['neuron_pool']['rst_emb'],
         },
     }
-    score_impl = (
-        _v4164_tau_init_calibration_scores
-        if version == 'spatial-r1-v4.1.6.4'
-        else _v4162_tau_init_calibration_scores)
+    score_impl = _v4164_tau_init_calibration_scores
     score_kwargs = {
         'max_tokens': tau_init_cfg['calibration_tokens'],
     }
-    if not is_unified_route_den:
-        score_kwargs['d_select'] = int(d_select)
     score_fn = jax.jit(partial(score_impl, **score_kwargs))
     sampled = jax.device_get(score_fn(score_params, input_ids))
     scores = {
@@ -1153,12 +722,12 @@ def _compute_v4162_quantile_tau_init(params, input_ids, cfg,
     }
 
 
-def _set_v4162_quantile_tau_biases(params, tau_summary):
-    """Overwrite v4162+ raw tau biases, preserving the pytree structure."""
+def _set_v4164_quantile_tau_biases(params, tau_summary):
+    """Overwrite v4164 raw tau biases, preserving the pytree structure."""
     tau = tau_summary['tau_init_quantile_tau']
-    raw_qk = _v4162_raw_tau_init_from_cosine_tau(tau['qk'])
-    raw_v = _v4162_raw_tau_init_from_cosine_tau(tau['v'])
-    raw_rst = _v4162_raw_tau_init_from_cosine_tau(tau['rst'])
+    raw_qk = _v4164_raw_tau_init_from_cosine_tau(tau['qk'])
+    raw_v = _v4164_raw_tau_init_from_cosine_tau(tau['v'])
+    raw_rst = _v4164_raw_tau_init_from_cosine_tau(tau['rst'])
 
     def _replace(path, value):
         keys = tuple(
@@ -1173,7 +742,7 @@ def _set_v4162_quantile_tau_biases(params, tau_summary):
     return jax.tree.map_with_path(_replace, params)
 
 
-def _v4162_tau_init_summary_lines(summary):
+def _v4164_tau_init_summary_lines(summary):
     targets = summary['tau_init_target_frac']
     tau = summary['tau_init_quantile_tau']
     active = summary['tau_init_est_active']
@@ -2186,7 +1755,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_update_abs_cap=0.0,
                       scan_update_abs_cap=0.0,
                       total_training_steps=1,
-                      soft_gate_enabled=False,
+                      soft_gate_schedule_active=False,
                       soft_gate_t_start=1.5,
                       soft_gate_t_final=0.07,
                       soft_gate_t_hold_frac=0.10,
@@ -2195,9 +1764,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       soft_gate_t_power=4.0,
                       soft_gate_t_gompertz_center=0.25,
                       soft_gate_t_gompertz_steepness=8.0,
-                      soft_gate_t_pool_specific=False,
+                      pool_specific_gate_t=False,
                       soft_gate_pool_schedules=None,
-                      soft_gate_boundary_power_enabled=False,
+                      boundary_power_schedule_active=False,
                       soft_gate_boundary_power_start=3.0,
                       soft_gate_boundary_power_mid=3.15,
                       soft_gate_boundary_power_final=4.0,
@@ -2356,7 +1925,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _is_boundary_power_model = (
         str(_model_version) in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
     if _is_soft_direct_tau:
-        # v4162+ soft DirectTau paths keep the loss surface
+        # v4164 soft DirectTau paths keep the loss surface
         # auditable: CE + scheduled RPE only. All hard-boundary dead repair,
         # CB1A/boundary auxiliaries, and removed legacy margin auxiliaries are
         # disabled here without affecting v4160/v4161.
@@ -2375,11 +1944,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     # while RPE provides the weak easy-token sparsity / hard-token relaxation
     # pressure.  Do not hard-disable _rpe_enabled by version here; respect the
     # training config/defaults prepared in main().
-    _rpe_requires_no_active_direct = (
-        str(_model_version) == 'spatial-r1-v4.1.6.0')
+    _rpe_requires_no_active_direct = False
 
     _soft_gate_runtime_enabled = bool(
-        soft_gate_enabled and _is_soft_direct_tau)
+        soft_gate_schedule_active and _is_soft_direct_tau)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -2402,12 +1970,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     }
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
         (soft_gate_pool_schedules
-         if (soft_gate_t_pool_specific
+         if (pool_specific_gate_t
              or _soft_gate_schedule == 'developmental_band')
          else None),
         _soft_gate_pool_defaults)
-    _soft_gate_boundary_power_enabled = bool(
-        soft_gate_boundary_power_enabled)
+    _boundary_power_schedule_active = bool(
+        boundary_power_schedule_active)
     _soft_gate_boundary_power_start = jnp.float32(
         soft_gate_boundary_power_start)
     _soft_gate_boundary_power_mid = jnp.float32(
@@ -2472,7 +2040,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 rpe_schedule_scale = (step >= _warmup_steps).astype(jnp.float32)
             boundary_power_p = scheduled_boundary_power_by_frac(
                 step, _total_training_steps,
-                _soft_gate_boundary_power_enabled and _is_boundary_power_model,
+                _boundary_power_schedule_active and _is_boundary_power_model,
                 _soft_gate_boundary_power_start,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
@@ -4410,10 +3978,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 metrics[f'{_pool}_{_name}'] = result.get(
                     f'{_pool}_{_name}',
                     result.get(f'attn_{_name}', jnp.float32(0.0)))
-        for _pool in ('attn_qk', 'attn_v', 'attn_q', 'attn_k', 'rst'):
-            for _name in DIRECT_TAU_SPARSITY_METRIC_NAMES:
-                metrics[f'{_pool}_{_name}'] = result.get(
-                    f'{_pool}_{_name}', jnp.float32(0.0))
         if not _rpe_enabled:
             for _key in (
                     'exploration_warmup_factor',
@@ -4500,7 +4064,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      return_prune_stats=False, execution_prune_eps=0.0,
                      total_training_steps=1,
-                     soft_gate_enabled=False,
+                     soft_gate_schedule_active=False,
                      soft_gate_t_start=1.5,
                      soft_gate_t_final=0.07,
                      soft_gate_t_hold_frac=0.10,
@@ -4509,9 +4073,9 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_t_power=4.0,
                      soft_gate_t_gompertz_center=0.25,
                      soft_gate_t_gompertz_steepness=8.0,
-                     soft_gate_t_pool_specific=False,
+                     pool_specific_gate_t=False,
                      soft_gate_pool_schedules=None,
-                     soft_gate_boundary_power_enabled=False,
+                     boundary_power_schedule_active=False,
                      soft_gate_boundary_power_start=3.0,
                      soft_gate_boundary_power_mid=3.15,
                      soft_gate_boundary_power_final=4.0,
@@ -4534,7 +4098,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _execution_prune_eps = jnp.float32(execution_prune_eps)
     _return_prune_stats = bool(return_prune_stats)
     _soft_gate_runtime_enabled = bool(
-        soft_gate_enabled
+        soft_gate_schedule_active
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
         in SOFT_DIRECT_TAU_MODEL_VERSIONS)
     _is_boundary_power_model = (
@@ -4562,12 +4126,12 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     }
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
         (soft_gate_pool_schedules
-         if (soft_gate_t_pool_specific
+         if (pool_specific_gate_t
              or _soft_gate_schedule == 'developmental_band')
          else None),
         _soft_gate_pool_defaults)
-    _soft_gate_boundary_power_enabled = bool(
-        soft_gate_boundary_power_enabled)
+    _boundary_power_schedule_active = bool(
+        boundary_power_schedule_active)
     _soft_gate_boundary_power_start = jnp.float32(
         soft_gate_boundary_power_start)
     _soft_gate_boundary_power_mid = jnp.float32(
@@ -4603,7 +4167,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         if _pass_boundary_power_kw:
             boundary_power_p = scheduled_boundary_power_by_frac(
                 step, _total_training_steps,
-                _soft_gate_boundary_power_enabled and _is_boundary_power_model,
+                _boundary_power_schedule_active and _is_boundary_power_model,
                 _soft_gate_boundary_power_start,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
@@ -4655,7 +4219,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
 
 def create_analysis_step(model, sharded_fns=None,
                          total_training_steps=1,
-                         soft_gate_enabled=False,
+                         soft_gate_schedule_active=False,
                          soft_gate_t_start=1.5,
                          soft_gate_t_final=0.07,
                          soft_gate_t_hold_frac=0.10,
@@ -4664,9 +4228,9 @@ def create_analysis_step(model, sharded_fns=None,
                          soft_gate_t_power=4.0,
                          soft_gate_t_gompertz_center=0.25,
                          soft_gate_t_gompertz_steepness=8.0,
-                         soft_gate_t_pool_specific=False,
+                         pool_specific_gate_t=False,
                          soft_gate_pool_schedules=None,
-                         soft_gate_boundary_power_enabled=False,
+                         boundary_power_schedule_active=False,
                          soft_gate_boundary_power_start=3.0,
                          soft_gate_boundary_power_mid=3.15,
                          soft_gate_boundary_power_final=4.0,
@@ -4688,7 +4252,7 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _soft_gate_runtime_enabled = bool(
-        soft_gate_enabled
+        soft_gate_schedule_active
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
         in SOFT_DIRECT_TAU_MODEL_VERSIONS)
     _is_boundary_power_model = (
@@ -4716,12 +4280,12 @@ def create_analysis_step(model, sharded_fns=None,
     }
     _soft_gate_pool_cfg = _coerce_pool_schedule_configs(
         (soft_gate_pool_schedules
-         if (soft_gate_t_pool_specific
+         if (pool_specific_gate_t
              or _soft_gate_schedule == 'developmental_band')
          else None),
         _soft_gate_pool_defaults)
-    _soft_gate_boundary_power_enabled = bool(
-        soft_gate_boundary_power_enabled)
+    _boundary_power_schedule_active = bool(
+        boundary_power_schedule_active)
     _soft_gate_boundary_power_start = jnp.float32(
         soft_gate_boundary_power_start)
     _soft_gate_boundary_power_mid = jnp.float32(
@@ -4757,7 +4321,7 @@ def create_analysis_step(model, sharded_fns=None,
         if _pass_boundary_power_kw:
             boundary_power_p = scheduled_boundary_power_by_frac(
                 step, _total_training_steps,
-                _soft_gate_boundary_power_enabled and _is_boundary_power_model,
+                _boundary_power_schedule_active and _is_boundary_power_model,
                 _soft_gate_boundary_power_start,
                 _soft_gate_boundary_power_mid,
                 _soft_gate_boundary_power_final,
@@ -5174,160 +4738,6 @@ _V4152_OBSOLETE_ROUTE_KEYS = tuple(
 )
 
 
-def _drop_v4152_obsolete_route_keys(tree):
-    """Drop route leaves that existed only in pre-cleanup v4.1.5.2 checkpoints."""
-    if isinstance(tree, dict):
-        return {
-            k: _drop_v4152_obsolete_route_keys(v)
-            for k, v in tree.items()
-            if k not in _V4152_OBSOLETE_ROUTE_KEYS
-        }
-    if isinstance(tree, list):
-        return [_drop_v4152_obsolete_route_keys(v) for v in tree]
-    if isinstance(tree, tuple):
-        return tuple(_drop_v4152_obsolete_route_keys(v) for v in tree)
-    return tree
-
-
-def _migrate_v4152_route_params(raw, target):
-    """Convert old split-route checkpoints into the current d_route-only state."""
-    params = raw.get('params')
-    target_params = target.get('params')
-    if not isinstance(params, dict) or not isinstance(target_params, dict):
-        return raw
-    pool = params.get('neuron_pool')
-    target_pool = target_params.get('neuron_pool')
-    if not isinstance(pool, dict) or not isinstance(target_pool, dict):
-        return raw
-
-    old_suffix = 's' + 'ig_proj'
-    changed = False
-    target_route_shapes = {}
-
-    def _row_unit(x):
-        x = np.asarray(x, dtype=np.float32)
-        return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
-
-    specs = (
-        ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write'),
-        ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write'),
-        ('rst', 'rst_emb', 'rst_read', 'rst_write'),
-    )
-    for name, emb_key, read_key, write_key in specs:
-        read_proj_key = f'{name}_read_{old_suffix}'
-        write_proj_key = f'{name}_write_{old_suffix}'
-        if emb_key not in pool or emb_key not in target_pool:
-            continue
-        old_emb = np.asarray(pool[emb_key])
-        target_shape = np.asarray(target_pool[emb_key]).shape
-        target_route_shapes[emb_key] = target_shape
-        if old_emb.shape == target_shape:
-            continue
-        needed = target_shape[-1]
-        parts = [old_emb.astype(np.float32)]
-        if (read_key in pool and write_key in pool
-                and read_proj_key in pool and write_proj_key in pool):
-            r = _row_unit(pool[read_key])
-            w = _row_unit(pool[write_key])
-            r_proj = np.asarray(pool[read_proj_key], dtype=np.float32)
-            w_proj = np.asarray(pool[write_proj_key], dtype=np.float32)
-            r_part = _row_unit(r @ r_proj)
-            w_part = _row_unit(w @ w_proj)
-            parts.extend([r_part, w_part])
-        route = np.concatenate(parts, axis=-1)
-        if route.shape[-1] < needed:
-            pad = np.zeros(route.shape[:-1] + (needed - route.shape[-1],), dtype=route.dtype)
-            route = np.concatenate([route, pad], axis=-1)
-        pool[emb_key] = route[..., :needed].astype(old_emb.dtype)
-        changed = True
-
-    def _fit_leaf(x, shape):
-        arr = np.asarray(x)
-        if arr.shape == shape:
-            return x
-        out = np.zeros(shape, dtype=arr.dtype)
-        slices = tuple(slice(0, min(a, b)) for a, b in zip(arr.shape, shape))
-        out[slices] = arr[slices]
-        return out
-
-    def _fit_opt_state(tree):
-        if isinstance(tree, dict):
-            out = {}
-            for k, v in tree.items():
-                if k in _V4152_OBSOLETE_ROUTE_KEYS:
-                    continue
-                if k in target_route_shapes and hasattr(v, 'shape'):
-                    out[k] = _fit_leaf(v, target_route_shapes[k])
-                else:
-                    out[k] = _fit_opt_state(v)
-            return out
-        if isinstance(tree, list):
-            return [_fit_opt_state(v) for v in tree]
-        if isinstance(tree, tuple):
-            return tuple(_fit_opt_state(v) for v in tree)
-        return tree
-
-    if changed and 'opt_state' in raw:
-        raw['opt_state'] = _fit_opt_state(raw['opt_state'])
-    raw = _drop_v4152_obsolete_route_keys(raw)
-    return raw
-
-
-def _align_opt_state_slot_count(raw, target_opt_state):
-    """Handle optimizer-chain slot additions/removals around no-op transforms.
-
-    The global-grad-clip slot is kept for checkpoint compatibility.  This
-    helper also accepts any short-lived checkpoints saved while that slot was
-    absent by inserting the current target slot state at index 1.
-    """
-    if 'opt_state' not in raw:
-        return raw
-    import flax.serialization as serialization
-
-    state = raw['opt_state']
-    target_state = serialization.to_state_dict(target_opt_state)
-
-    def _is_numeric_seq_dict(x):
-        return (isinstance(x, dict)
-                and all(str(k).isdigit() for k in x.keys()))
-
-    def _to_items(x):
-        if _is_numeric_seq_dict(x):
-            return [x[k] for k in sorted(x.keys(), key=lambda k: int(str(k)))]
-        if isinstance(x, (list, tuple)):
-            return list(x)
-        return None
-
-    def _from_items(items, like):
-        if _is_numeric_seq_dict(like):
-            return {str(i): item for i, item in enumerate(items)}
-        if isinstance(like, tuple):
-            return tuple(items)
-        if isinstance(like, list):
-            return items
-        return like
-
-    state_items = _to_items(state)
-    target_items = _to_items(target_state)
-    if state_items is None or target_items is None:
-        return raw
-    if len(state_items) == len(target_items):
-        return raw
-
-    # Slot 1 is the legacy global-clip/current no-op compatibility transform.
-    compat_slot_index = 1
-    if len(state_items) + 1 == len(target_items):
-        state_items.insert(compat_slot_index, target_items[compat_slot_index])
-    elif len(state_items) - 1 == len(target_items):
-        del state_items[compat_slot_index]
-    else:
-        return raw
-
-    raw = dict(raw)
-    raw['opt_state'] = _from_items(state_items, state)
-    return raw
-
-
 def load_checkpoint(path, target_params, target_opt_state):
     """Load checkpoint using flax serialization. Supports local and GCS paths."""
     import flax.serialization as serialization
@@ -5345,10 +4755,7 @@ def load_checkpoint(path, target_params, target_opt_state):
         'training_config': {},
     }
     raw = serialization.msgpack_restore(bytes_data)
-    raw = migrate_legacy_v4155_params(raw)
-    migrated = _migrate_v4152_route_params(raw, target)
-    migrated = _align_opt_state_slot_count(migrated, target_opt_state)
-    ckpt = serialization.from_state_dict(target, migrated)
+    ckpt = serialization.from_state_dict(target, raw)
     if jax.process_index() == 0:
         print(f"  Checkpoint loaded: {path}")
     return ckpt
@@ -6726,10 +6133,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             rec[f'{_pool}_{_name}'] = float(m.get(
                 f'{_pool}_{_name}',
                 rec.get(f'attn_{_name}', 0.0)))
-    for _pool in ('attn_qk', 'attn_v', 'attn_q', 'attn_k', 'rst'):
-        for _name in DIRECT_TAU_SPARSITY_METRIC_NAMES:
-            rec[f'{_pool}_{_name}'] = float(m.get(
-                f'{_pool}_{_name}', 0.0))
     if rec['attn_top1_gate_frac'] == 0.0:
         rec['attn_top1_gate_frac'] = rec['attn_raw_gate_max'] / max(rec['attn_gate_sum'], 1e-8)
     if rec['rst_top1_gate_frac'] == 0.0:
@@ -6871,7 +6274,7 @@ def _print_regular_block(rec, ctx):
     if is_v4160:
         if is_v4162_soft:
             if (ctx.get('model_version') not in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-                    and bool(ctx.get('regular_sparsity_enabled', True))):
+                    and bool(ctx.get('regular_sparsity_metrics_active', True))):
                 _print_v4162_sparsity_block(
                     rec, ctx.get('regular_diagnostics_level', 'compact'))
             log_message(
@@ -7693,1076 +7096,6 @@ def _spike_layer_max(value):
     if arr.size == 0:
         return 0.0
     return _finite_float(np.nanmax(arr), 0.0)
-
-
-def _spike_history_record(raw, step, epoch, lr):
-    def _g(key, default=0.0):
-        return _finite_float(raw.get(key, default), default)
-
-    layer_attn = _jsonable_diag_value(
-        raw.get('per_layer_attn_out_norm', []))
-    layer_rst = _jsonable_diag_value(
-        raw.get('per_layer_rst_out_norm', []))
-    return {
-        'step': int(step),
-        'epoch': int(epoch),
-        'ce': _g('ce_loss'),
-        'loss': _g('total_loss'),
-        'grad_pre': _g('grad_global_preclip', _g('grad_norm')),
-        'grad_post': _g('grad_global_postclip'),
-        'lr': float(lr),
-        'active_n': {
-            'q': _g('attn_q_active_n_mean',
-                    _g('attn_qk_active_n_mean',
-                       _g('attn_active_n_mean'))),
-            'k': _g('attn_k_active_n_mean',
-                    _g('attn_qk_active_n_mean',
-                       _g('attn_active_n_mean'))),
-            'v': _g('attn_v_active_n_mean'),
-            'rst': _g('rst_active_n_mean'),
-        },
-        'no_active': {
-            'qk': _g('attn_qk_no_active_frac',
-                     _g('attn_no_active_frac')),
-            'v': _g('attn_v_no_active_frac',
-                    _g('attn_no_active_frac')),
-            'rst': _g('rst_no_active_frac'),
-        },
-        'top1_max': {
-            'qk': _g('attn_qk_top1_gate_frac_max',
-                     _g('attn_top1_gate_frac_max')),
-            'v': _g('attn_v_top1_gate_frac_max',
-                    _g('attn_top1_gate_frac_max')),
-            'rst': _g('rst_top1_gate_frac_max'),
-        },
-        'den': {
-            'qk': _g('attn_qk_gate_den_sum_mean',
-                     _g('attn_gate_den_sum_mean')),
-            'v': _g('attn_v_gate_den_sum_mean',
-                    _g('attn_gate_den_sum_mean')),
-            'rst': _g('rst_gate_den_sum_mean'),
-        },
-        'lm_logit_abs_max': _g('debug_logit_max'),
-        'layer_attn_max': _spike_layer_max(layer_attn),
-        'layer_rst_max': _spike_layer_max(layer_rst),
-        'grad_group_summary': {
-            'token_emb': _g('grad_token_emb'),
-            'pos_emb': _g('grad_pos_emb'),
-            'router_proj_attn': _g('grad_router_proj_attn'),
-            'router_proj_rst': _g('grad_router_proj_rst'),
-            'raw_tau_qk': _g('grad_router_raw_tau_qk'),
-            'raw_tau_v': _g('grad_router_raw_tau_v'),
-            'raw_tau_rst': _g('grad_router_raw_tau_rst'),
-            'qk_rw': [_g('grad_pool_attn_qk_read'),
-                      _g('grad_pool_attn_qk_write')],
-            'v_rw': [_g('grad_pool_attn_v_read'),
-                     _g('grad_pool_attn_v_write')],
-            'rst_rw': [_g('grad_pool_rst_read'),
-                       _g('grad_pool_rst_write')],
-            'expand_O': _g('grad_expand_O'),
-            'layernorm': _g('grad_layernorms'),
-        },
-    }
-
-
-def _spike_grad_evidence(raw):
-    def _g(key, default=0.0):
-        return _finite_float(raw.get(key, default), default)
-
-    return {
-        'grad_global_pre': _g('grad_global_preclip', _g('grad_norm')),
-        'grad_global_post': _g('grad_global_postclip'),
-        'token_emb_grad': _g('grad_token_emb'),
-        'pos_emb_grad': _g('grad_pos_emb'),
-        'router_proj_attn_grad': _g('grad_router_proj_attn'),
-        'router_proj_rst_grad': _g('grad_router_proj_rst'),
-        'raw_tau_qk_grad': _g('grad_router_raw_tau_qk'),
-        'raw_tau_v_grad': _g('grad_router_raw_tau_v'),
-        'raw_tau_rst_grad': _g('grad_router_raw_tau_rst'),
-        'qk_rw_read_grad': _g('grad_pool_attn_qk_read'),
-        'qk_rw_write_grad': _g('grad_pool_attn_qk_write'),
-        'v_rw_read_grad': _g('grad_pool_attn_v_read'),
-        'v_rw_write_grad': _g('grad_pool_attn_v_write'),
-        'rst_rw_read_grad': _g('grad_pool_rst_read'),
-        'rst_rw_write_grad': _g('grad_pool_rst_write'),
-        'expand_O_grad_by_layer': _jsonable_diag_value(
-            raw.get('grad_expand_O_per_layer', [])),
-        'layernorm_grad_by_layer': _jsonable_diag_value(
-            raw.get('grad_layernorms_per_layer', [])),
-    }
-
-
-def _decode_spike_rows(rows, field_names, int_fields=()):
-    arr = np.asarray(rows, dtype=np.float64)
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    out = []
-    for row in arr:
-        if row.size < len(field_names):
-            continue
-        score = row[0]
-        if not np.isfinite(score) or score <= -1.0e20:
-            continue
-        item = {}
-        for idx, name in enumerate(field_names):
-            val = row[idx]
-            if name in int_fields:
-                item[name] = int(round(float(val)))
-            elif name == 'no_active_for_token':
-                item[name] = bool(float(val) >= 0.5)
-            else:
-                item[name] = _finite_float(val)
-        out.append(item)
-    return out
-
-
-def _decode_spike_probe(probe_raw):
-    if not probe_raw:
-        return {}
-    token_rows = _decode_spike_rows(
-        probe_raw.get('spike_top_token_ce', []),
-        SPIKE_TOKEN_FIELD_NAMES,
-        int_fields={
-            'rank', 'batch', 'pos', 'input_token_id',
-            'target_token_id', 'pred_token_id',
-        })
-    token_align_rows = _decode_spike_rows(
-        probe_raw.get('spike_top_token_alignment', []),
-        SPIKE_TOKEN_ALIGN_FIELD_NAMES,
-        int_fields={
-            'rank', 'batch', 'pos', 'input_token_id',
-            'target_token_id', 'pred_token_id',
-        })
-    srw_rows = []
-    srw_arr = np.asarray(
-        probe_raw.get('spike_srw_top', []), dtype=np.float64)
-    if srw_arr.ndim == 4:
-        for layer in range(srw_arr.shape[0]):
-            for pool_idx, pool in enumerate(LOCAL_SPIKE_POOL_NAMES):
-                decoded = _decode_spike_rows(
-                    srw_arr[layer, pool_idx],
-                    SPIKE_SRW_FIELD_NAMES,
-                    int_fields={'batch', 'pos', 'neuron_global_id'})
-                for rank, item in enumerate(decoded):
-                    item['rank'] = int(rank)
-                    item['layer'] = int(layer)
-                    item['pool'] = pool
-                    item.pop('score', None)
-                    srw_rows.append(item)
-    attn_rows = []
-    attn_arr = np.asarray(
-        probe_raw.get('spike_attention_top', []), dtype=np.float64)
-    if attn_arr.ndim == 3:
-        for layer in range(attn_arr.shape[0]):
-            decoded = _decode_spike_rows(
-                attn_arr[layer],
-                SPIKE_ATTN_FIELD_NAMES,
-                int_fields={'batch', 'query_pos', 'key_pos'})
-            for rank, item in enumerate(decoded):
-                item['rank'] = int(rank)
-                item['layer'] = int(layer)
-                item.pop('score', None)
-                attn_rows.append(item)
-
-    focus_path_rows = []
-    focus_path_arr = np.asarray(
-        probe_raw.get('spike_focus_path_trace', []), dtype=np.float64)
-    if focus_path_arr.ndim == 4:
-        # [layer_or_final_block, token_rank, stage_slot, field]
-        flat = focus_path_arr.reshape((-1, focus_path_arr.shape[-1]))
-        decoded = _decode_spike_rows(
-            flat, SPIKE_FOCUS_PATH_FIELD_NAMES,
-            int_fields={
-                'rank', 'batch', 'pos', 'layer', 'stage_id',
-                'input_token_id', 'target_token_id', 'pred_token_id',
-            })
-        focus_path_rows.extend(decoded)
-
-    focus_route_rows = []
-    focus_route_arr = np.asarray(
-        probe_raw.get('spike_focus_route_trace', []), dtype=np.float64)
-    if focus_route_arr.ndim == 3:
-        flat = focus_route_arr.reshape((-1, focus_route_arr.shape[-1]))
-        decoded = _decode_spike_rows(
-            flat, SPIKE_FOCUS_ROUTE_FIELD_NAMES,
-            int_fields={'rank', 'batch', 'pos', 'layer'})
-        focus_route_rows.extend(decoded)
-
-    focus_srw_rows = []
-    focus_srw_arr = np.asarray(
-        probe_raw.get('spike_focus_srw_top', []), dtype=np.float64)
-    if focus_srw_arr.ndim == 4:
-        flat = focus_srw_arr.reshape((-1, focus_srw_arr.shape[-1]))
-        decoded = _decode_spike_rows(
-            flat, SPIKE_FOCUS_SRW_FIELD_NAMES,
-            int_fields={
-                'rank', 'batch', 'pos', 'layer',
-                'pool_id', 'neuron_global_id',
-            })
-        pool_names = {0: 'attn_q', 1: 'attn_k', 2: 'attn_v', 3: 'rst'}
-        for item in decoded:
-            item['pool'] = pool_names.get(int(item.get('pool_id', -1)), 'unknown')
-            focus_srw_rows.append(item)
-
-    focus_attn_rows = []
-    focus_attn_arr = np.asarray(
-        probe_raw.get('spike_focus_attention_top', []), dtype=np.float64)
-    if focus_attn_arr.ndim == 4:
-        flat = focus_attn_arr.reshape((-1, focus_attn_arr.shape[-1]))
-        decoded = _decode_spike_rows(
-            flat, SPIKE_FOCUS_ATTN_FIELD_NAMES,
-            int_fields={
-                'rank', 'batch', 'query_pos', 'layer',
-                'head', 'key_pos', 'key_is_self',
-            })
-        focus_attn_rows.extend(decoded)
-
-    return {
-        'top_token_ce': token_rows,
-        'top_token_alignment': token_align_rows,
-        'srw_top_contributors': srw_rows,
-        'attention_top': attn_rows,
-        'focus_path_trace': focus_path_rows,
-        'focus_route_trace': focus_route_rows,
-        'focus_srw_top': focus_srw_rows,
-        'focus_attention_top': focus_attn_rows,
-        'layer_forward_norms': {
-            'layer_attn_out_norm_max': _jsonable_diag_value(
-                probe_raw.get('spike_layer_attn_out_norm_max', [])),
-            'layer_rst_out_norm_max': _jsonable_diag_value(
-                probe_raw.get('spike_layer_rst_out_norm_max', [])),
-            'layer_resid_norm_max_after_attn': _jsonable_diag_value(
-                probe_raw.get('spike_layer_resid_norm_max_after_attn', [])),
-            'layer_resid_norm_max_after_rst': _jsonable_diag_value(
-                probe_raw.get('spike_layer_resid_norm_max_after_rst', [])),
-            'layer_lm_logit_abs_proxy_if_available': _jsonable_diag_value(
-                probe_raw.get(
-                    'spike_layer_lm_logit_abs_proxy_if_available', [])),
-        },
-    }
-
-
-def _diagnose_spike(metrics_rec, probe, thresholds, ctx):
-    """Classify a spike event from probe evidence.
-
-    Important distinction:
-    - `top_token_ce`, `top_srw`, and `top_attention` are global maxima from
-      the same batch, not necessarily the same token/event path.
-    - Do NOT call an SRW/attention global max the primary cause unless it is
-      located at the top-CE token or the gradient evidence agrees with that
-      pool.  Otherwise mark it as an unrelated global outlier.
-    """
-    def _g(key, default=0.0):
-        return _finite_float(metrics_rec.get(key, default), default)
-
-    def _same_token(row, token, pos_key='pos'):
-        if not row or not token:
-            return False
-        return (int(row.get('batch', -999999)) == int(token.get('batch', -1))
-                and int(row.get(pos_key, -999999)) == int(token.get('pos', -1)))
-
-    def _pool_grad(row, grad_summary):
-        pool = str(row.get('pool', ''))
-        if pool in ('attn_q', 'attn_k'):
-            vals = grad_summary.get('qk_rw', [0.0, 0.0])
-        elif pool == 'attn_v':
-            vals = grad_summary.get('v_rw', [0.0, 0.0])
-        elif pool == 'rst':
-            vals = grad_summary.get('rst_rw', [0.0, 0.0])
-        else:
-            vals = [0.0, 0.0]
-        if isinstance(vals, (list, tuple)):
-            return max((_finite_float(v, 0.0) for v in vals), default=0.0)
-        return _finite_float(vals, 0.0)
-
-    top_token = max(
-        probe.get('top_token_ce', []),
-        key=lambda r: r.get('token_ce', 0.0),
-        default={})
-    top_srw = max(
-        probe.get('srw_top_contributors', []),
-        key=lambda r: r.get('contrib_proxy', 0.0),
-        default={})
-    top_attn = max(
-        probe.get('attention_top', []),
-        key=lambda r: max(r.get('attn_top1_weight', 0.0) * 10.0,
-                          abs(r.get('attn_logit_max', 0.0)),
-                          r.get('attn_o_output_norm', 0.0)),
-        default={})
-    top_align = next(
-        (r for r in probe.get('top_token_alignment', [])
-         if int(r.get('batch', -999999)) == int(top_token.get('batch', -1))
-         and int(r.get('pos', -999999)) == int(top_token.get('pos', -1))),
-        {})
-
-    ce = _g('ce')
-    grad = _g('grad_pre')
-    logit_abs = _g('lm_logit_abs_max')
-    layer_rst_max = _g('layer_rst_max')
-    intensity_bound = float(np.exp(float(ctx.get('intensity_beta', 0.0))))
-    evidence = []
-    secondary = []
-    not_primary = []
-
-    trigger_bits = []
-    if grad > thresholds['spike_grad_threshold']:
-        trigger_bits.append(
-            f"grad_global_pre={grad:.4g} > threshold={thresholds['spike_grad_threshold']:.4g}")
-    if ce > thresholds['spike_ce_threshold']:
-        trigger_bits.append(
-            f"ce_loss={ce:.4g} > threshold={thresholds['spike_ce_threshold']:.4g}")
-    if logit_abs > thresholds['spike_logit_abs_threshold']:
-        trigger_bits.append(
-            f"lm_logit_abs_max={logit_abs:.4g} > threshold={thresholds['spike_logit_abs_threshold']:.4g}")
-    if layer_rst_max > thresholds['spike_rst_out_threshold']:
-        trigger_bits.append(
-            f"layer_rst_max={layer_rst_max:.4g} > threshold={thresholds['spike_rst_out_threshold']:.4g}")
-    evidence.extend(trigger_bits)
-
-    top_ce = top_token.get('token_ce', 0.0)
-    token_pos = int(top_token.get('pos', -1)) if top_token else -1
-    pred_id = int(top_token.get('pred_token_id', -2)) if top_token else -2
-    input_id = int(top_token.get('input_token_id', -1)) if top_token else -1
-    pred_is_input = bool(top_token) and pred_id == input_id
-    token_ce_huge = top_ce > max(thresholds['spike_ce_threshold'], ce * 2.0, 10.0)
-    input_cos = _finite_float(top_align.get('input_cos', 0.0)) if top_align else 0.0
-    pred_cos = _finite_float(top_align.get('pred_cos', 0.0)) if top_align else 0.0
-    target_cos = _finite_float(top_align.get('target_cos', 0.0)) if top_align else 0.0
-    input_dot = _finite_float(top_align.get('input_dot', 0.0)) if top_align else 0.0
-    pred_dot = _finite_float(top_align.get('pred_dot', 0.0)) if top_align else 0.0
-    target_dot = _finite_float(top_align.get('target_dot', 0.0)) if top_align else 0.0
-    alignment_self_copy = bool(
-        top_align and pred_is_input and (
-            pred_cos > max(target_cos + 0.10, 0.25)
-            or pred_dot > target_dot + 5.0))
-
-    # Focused path trace, when available, is stronger evidence than the
-    # global top-SRW/top-attention rows. It follows the actual top-CE token
-    # through every layer/stage and tells us where pred-vs-target alignment
-    # first worsens.
-    focus_rank0 = sorted(
-        [r for r in probe.get('focus_path_trace', [])
-         if int(r.get('rank', -1)) == 0],
-        key=lambda r: (int(r.get('layer', -1)), int(r.get('stage_id', -1))))
-    focus_route0 = sorted(
-        [r for r in probe.get('focus_route_trace', [])
-         if int(r.get('rank', -1)) == 0],
-        key=lambda r: int(r.get('layer', -1)))
-
-    def _pt_margin(row):
-        return _finite_float(row.get('pred_minus_target_dot', 0.0), 0.0)
-
-    def _by_layer_stage(rows):
-        return {(int(r.get('layer', -1)), int(r.get('stage_id', -1))): r
-                for r in rows}
-
-    path_map = _by_layer_stage(focus_rank0)
-    attn_shift = (0.0, -1)
-    rst_shift = (0.0, -1)
-    final_shift = 0.0
-    for layer in sorted({k[0] for k in path_map if k[0] >= 0}):
-        pre = path_map.get((layer, 0))
-        post_a = path_map.get((layer, 3))
-        post_r = path_map.get((layer, 6))
-        if pre and post_a:
-            val = _pt_margin(post_a) - _pt_margin(pre)
-            if val > attn_shift[0]:
-                attn_shift = (val, layer)
-        if post_a and post_r:
-            val = _pt_margin(post_r) - _pt_margin(post_a)
-            if val > rst_shift[0]:
-                rst_shift = (val, layer)
-    final_target_shift = 0.0
-    final_pred_shift = 0.0
-    final_norm_gain_ratio = 0.0
-    if focus_rank0:
-        final_rows = [r for r in focus_rank0 if int(r.get('stage_id', -1)) == 7]
-        last_post_rows = [r for r in focus_rank0 if int(r.get('stage_id', -1)) == 6]
-        last_post = (max(last_post_rows, key=lambda r: int(r.get('layer', -1)))
-                     if last_post_rows else None)
-        if final_rows and last_post:
-            final_row = final_rows[-1]
-            final_shift = _finite_float(
-                final_row.get('delta_pred_minus_target_dot',
-                              _pt_margin(final_row) - _pt_margin(last_post)),
-                0.0)
-            final_target_shift = _finite_float(final_row.get('delta_target_dot', 0.0), 0.0)
-            final_pred_shift = _finite_float(final_row.get('delta_pred_dot', 0.0), 0.0)
-            raw_last_pt = _pt_margin(last_post)
-            final_norm_gain_ratio = (_pt_margin(final_row)
-                                     / max(abs(raw_last_pt), 1.0e-6))
-
-    max_focus_attn_out = max(
-        (_finite_float(r.get('attn_out_norm', 0.0), 0.0)
-         for r in focus_route0), default=0.0)
-    max_focus_rst_out = max(
-        (_finite_float(r.get('rst_out_norm', 0.0), 0.0)
-         for r in focus_route0), default=0.0)
-
-    grad_e = metrics_rec.get('grad_group_summary', {})
-    grad_global = max(_g('grad_pre'), 1e-8)
-    token_emb_grad = _finite_float(grad_e.get('token_emb', 0.0))
-    pos_emb_grad = _finite_float(grad_e.get('pos_emb', 0.0))
-    expand_grad = _finite_float(grad_e.get('expand_O', 0.0))
-    early = max(token_emb_grad, pos_emb_grad, expand_grad)
-    early_dominant = (early / grad_global) > 0.25
-
-    srw_contrib = top_srw.get('contrib_proxy', 0.0)
-    srw_gate_share = max(
-        top_srw.get('gate_share', 0.0),
-        top_srw.get('top1_share_for_token', 0.0))
-    srw_read = top_srw.get('abs_read_scalar_xr', 0.0)
-    srw_intensity = top_srw.get('intensity', 0.0)
-    srw_margin = abs(top_srw.get('margin', 1.0))
-    srw_large = srw_contrib >= max(
-        2.0, thresholds['spike_rst_out_threshold'] * 0.25)
-    srw_same_token = _same_token(top_srw, top_token, pos_key='pos')
-    srw_pool_grad = _pool_grad(top_srw, grad_e)
-    srw_pool_grad_agrees = srw_pool_grad > max(5.0, 0.10 * grad_global)
-
-    attn_top1 = top_attn.get('attn_top1_weight', 0.0)
-    attn_entropy = top_attn.get('attn_entropy', 99.0)
-    attn_out = top_attn.get('attn_o_output_norm', 0.0)
-    attn_same_token = _same_token(top_attn, top_token, pos_key='query_pos')
-
-    primary = 'unclassified_spike'
-    confidence = 'medium'
-
-    # Highest-priority diagnosis: a single token CE outlier, especially pos=0,
-    # with token/pos/early gradients dominating.  This should override unrelated
-    # global SRW/attention maxima from other positions.
-    if token_ce_huge and token_pos == 0 and early_dominant:
-        primary = 'pos0_hard_token_ce_spike'
-        confidence = 'high'
-        evidence.append(
-            f"top token CE={top_ce:.4g} at pos=0 b={top_token.get('batch')} target={top_token.get('target_token_id')} pred={top_token.get('pred_token_id')}")
-        evidence.append(
-            f"early grads dominate: token_emb={token_emb_grad:.4g}, pos_emb={pos_emb_grad:.4g}, expand_O={expand_grad:.4g}, grad={grad_global:.4g}")
-        if pred_is_input:
-            secondary.append('pos0_self_copy_logit_spike')
-            evidence.append(
-                f"pred_id equals input_id={input_id}; current-token self-copy at first position")
-        if top_align:
-            evidence.append(
-                f"final-hidden alignment: cos[input={input_cos:.4f}, pred={pred_cos:.4f}, target={target_cos:.4f}] dot[input={input_dot:.4g}, pred={pred_dot:.4g}, target={target_dot:.4g}]")
-    elif token_ce_huge and early_dominant:
-        primary = 'hard_token_ce_spike'
-        confidence = 'high'
-        if alignment_self_copy:
-            secondary.append('self_copy_candidate_not_primary_without_path_persistence')
-        evidence.append(
-            f"top token CE={top_ce:.4g} at b={top_token.get('batch')} pos={top_token.get('pos')}")
-        evidence.append(
-            f"early grads dominate: token_emb={token_emb_grad:.4g}, pos_emb={pos_emb_grad:.4g}, expand_O={expand_grad:.4g}, grad={grad_global:.4g}")
-        if top_align:
-            evidence.append(
-                f"final-hidden alignment: cos[input={input_cos:.4f}, pred={pred_cos:.4f}, target={target_cos:.4f}] dot[input={input_dot:.4g}, pred={pred_dot:.4g}, target={target_dot:.4g}]")
-        if focus_rank0:
-            evidence.append(
-                f"focus path shift: max_attn_pred_minus_target_delta={attn_shift[0]:.4g}@L{attn_shift[1]}, max_rst_pred_minus_target_delta={rst_shift[0]:.4g}@L{rst_shift[1]}, final_norm_delta={final_shift:.4g}, final_norm_delta[tgt={final_target_shift:.4g}, pred={final_pred_shift:.4g}], final_norm_gain={final_norm_gain_ratio:.4g}x")
-            evidence.append(
-                f"focus route out_norm max: attn={max_focus_attn_out:.4g}, rst={max_focus_rst_out:.4g}")
-            if attn_shift[0] > max(rst_shift[0], final_shift, 2.0):
-                secondary.append('attention_forward_alignment_shift')
-            elif rst_shift[0] > max(attn_shift[0], final_shift, 2.0):
-                secondary.append('rst_forward_alignment_shift')
-            elif final_shift > max(attn_shift[0], rst_shift[0], 2.0):
-                secondary.append('final_norm_readout_alignment_shift')
-            else:
-                secondary.append('no_single_forward_stage_dominates_focus_trace')
-    elif logit_abs > thresholds['spike_logit_abs_threshold']:
-        primary = 'logit_output_scale_spike'
-        evidence.append(f"lm_logit_abs_max={logit_abs:.4g}")
-    elif (attn_same_token and attn_top1 >= 0.98 and attn_entropy <= 0.15
-          and attn_out >= thresholds['spike_rst_out_threshold']):
-        primary = 'attention_top1_collapse'
-        evidence.append(
-            f"same-token attention layer={top_attn.get('layer')} query=(b={top_attn.get('batch')},pos={top_attn.get('query_pos')}) top1={attn_top1:.4f} entropy={attn_entropy:.4f} out={attn_out:.4g}")
-        confidence = 'high'
-    elif srw_large and srw_same_token and srw_gate_share >= 0.95 and srw_pool_grad_agrees:
-        primary = 'srw_top1_contribution_spike'
-        evidence.append(
-            f"same-token SRW culprit pool={top_srw.get('pool')} layer={top_srw.get('layer')} token=(b={top_srw.get('batch')},pos={top_srw.get('pos')})")
-        evidence.append(
-            f"gate_share={top_srw.get('gate_share', 0.0):.4f}, top1_share={top_srw.get('top1_share_for_token', 0.0):.4f}, pool_grad={srw_pool_grad:.4g}")
-        evidence.append(
-            f"read_scalar_xr={top_srw.get('read_scalar_xr', 0.0):.4g}, contrib_proxy={srw_contrib:.4g}")
-        confidence = 'high'
-        if srw_read >= max(10.0, srw_contrib * 0.5):
-            secondary.append('srw_read_scalar_spike')
-        if intensity_bound > 0 and srw_intensity >= intensity_bound * 0.90:
-            secondary.append('srw_intensity_spike')
-        if srw_margin <= 1.0e-3:
-            secondary.append('tau_margin_boundary_spike')
-        if top_srw.get('no_active_for_token', False):
-            secondary.append('no_active_noop_boundary_spike')
-            not_primary.append('no_active marked on same-token culprit; treat as symptom unless history shows it first')
-    elif srw_large and srw_same_token and srw_read >= max(10.0, srw_contrib * 0.5) and srw_pool_grad_agrees:
-        primary = 'srw_read_scalar_spike'
-        evidence.append(
-            f"same-token read_scalar_xr={top_srw.get('read_scalar_xr', 0.0):.4g}, contrib_proxy={srw_contrib:.4g}, pool_grad={srw_pool_grad:.4g}")
-    elif srw_large and srw_same_token and intensity_bound > 0 and srw_intensity >= intensity_bound * 0.90 and srw_pool_grad_agrees:
-        primary = 'srw_intensity_spike'
-        evidence.append(
-            f"same-token intensity={srw_intensity:.4g} near exp(beta)={intensity_bound:.4g}, pool_grad={srw_pool_grad:.4g}")
-    elif srw_same_token and srw_margin <= 1.0e-3 and srw_gate_share >= 0.5:
-        primary = 'tau_margin_boundary_spike'
-        evidence.append(
-            f"same-token rho={top_srw.get('rho', 0.0):.6f}, tau={top_srw.get('tau', 0.0):.6f}, margin={top_srw.get('margin', 0.0):.6g}")
-
-    if top_ce > 0.0:
-        evidence.append(
-            f"token_ce={top_ce:.4g} target={top_token.get('target_token_id')} pred={top_token.get('pred_token_id')}")
-
-    # Mark unrelated global maxima so they are not mistaken for the cause.
-    if top_srw and top_token and not srw_same_token:
-        not_primary.append(
-            f"global top_srw is at b={top_srw.get('batch')} pos={top_srw.get('pos')}, not top-CE token b={top_token.get('batch')} pos={top_token.get('pos')}")
-    if top_srw and srw_pool_grad <= max(5.0, 0.05 * grad_global):
-        not_primary.append(
-            f"top_srw pool={top_srw.get('pool')} pool_grad={srw_pool_grad:.4g} is not dominant vs grad={grad_global:.4g}")
-    if top_attn and top_token and not attn_same_token:
-        not_primary.append(
-            f"global top_attention is at b={top_attn.get('batch')} q={top_attn.get('query_pos')}, not top-CE token b={top_token.get('batch')} pos={top_token.get('pos')}")
-
-    if early_dominant:
-        secondary.append('output_to_early_path_backprop_spike')
-    if max(_finite_float(v, 0.0) for v in grad_e.get('v_rw', [0.0, 0.0])) > max(5.0, 0.10 * grad_global):
-        secondary.append('v_rw_backward_amplification')
-    if max(_finite_float(v, 0.0) for v in grad_e.get('rst_rw', [0.0, 0.0])) > max(5.0, 0.10 * grad_global):
-        secondary.append('rst_rw_backward_amplification')
-
-    # De-duplicate while preserving order.
-    secondary = list(dict.fromkeys(secondary)) or ['none_clear']
-    not_primary = list(dict.fromkeys(not_primary)) or [
-        'raw_tau_grad was not dominant unless shown in grad_evidence']
-
-    return {
-        'primary': primary,
-        'confidence': confidence,
-        'evidence': evidence,
-        'secondary': secondary,
-        'not_primary': not_primary,
-    }
-
-def _format_spike_text(event):
-    m = event.get('metrics', {})
-    diag = event.get('diagnosis', {})
-    probe = event.get('probe', {})
-    lines = [
-        "=" * 88,
-        f"SPIKE EVENT step={event.get('step')} epoch={event.get('epoch')} reasons={','.join(event.get('trigger', {}).get('reasons', []))}",
-        f"loss={m.get('loss', 0.0):.6f} ce={m.get('ce', 0.0):.6f} grad_pre={m.get('grad_pre', 0.0):.6f} grad_post={m.get('grad_post', 0.0):.6f} lr={m.get('lr', 0.0):.3e}",
-        f"lm_logit_abs_max={m.get('lm_logit_abs_max', 0.0):.6f} layer_attn_max={m.get('layer_attn_max', 0.0):.6f} layer_rst_max={m.get('layer_rst_max', 0.0):.6f}",
-        f"diagnosis: primary={diag.get('primary')} confidence={diag.get('confidence')}",
-    ]
-    for item in diag.get('evidence', [])[:12]:
-        lines.append(f"  evidence: {item}")
-    if diag.get('secondary'):
-        lines.append("  secondary: " + ", ".join(str(x) for x in diag.get('secondary', [])))
-    if diag.get('not_primary'):
-        for item in diag.get('not_primary', [])[:8]:
-            lines.append(f"  not_primary: {item}")
-
-    tokens = sorted(
-        probe.get('top_token_ce', []),
-        key=lambda r: r.get('token_ce', 0.0),
-        reverse=True)
-    if tokens:
-        lines.append("top_token_ce_topk:")
-        for token in tokens[:5]:
-            self_copy = " self_copy" if token.get('pred_token_id') == token.get('input_token_id') else ""
-            pos0 = " pos0" if int(token.get('pos', -1)) == 0 else ""
-            lines.append(
-                "  "
-                f"rank={token.get('rank')} b={token.get('batch')} pos={token.get('pos')}"
-                f"{pos0}{self_copy} in={token.get('input_token_id')} "
-                f"target={token.get('target_token_id')} pred={token.get('pred_token_id')} "
-                f"ce={token.get('token_ce', 0.0):.6f} "
-                f"target_logit={token.get('target_logit', 0.0):.6f} "
-                f"pred_logit={token.get('pred_logit', 0.0):.6f}")
-
-    top_token = tokens[0] if tokens else {}
-    tb = int(top_token.get('batch', -1)) if top_token else -1
-    tp = int(top_token.get('pos', -1)) if top_token else -1
-
-    align_rows = probe.get('top_token_alignment', [])[:5]
-    if align_rows:
-        lines.append("top_token_alignment:")
-        for r in align_rows:
-            if not np.isfinite(float(r.get('rank', -np.inf))):
-                continue
-            flags = []
-            if float(r.get('pred_equals_input', 0.0)) >= 0.5:
-                flags.append('pred=input')
-            if float(r.get('target_equals_input', 0.0)) >= 0.5:
-                flags.append('target=input')
-            if float(r.get('pred_equals_target', 0.0)) >= 0.5:
-                flags.append('pred=target')
-            flag_s = (' ' + ' '.join(flags)) if flags else ''
-            lines.append(
-                f"  rank={r.get('rank')} b={r.get('batch')} pos={r.get('pos')}{flag_s} "
-                f"cos[in={r.get('input_cos', 0.0):.4f} target={r.get('target_cos', 0.0):.4f} pred={r.get('pred_cos', 0.0):.4f}] "
-                f"dot[in={r.get('input_dot', 0.0):.3f} target={r.get('target_dot', 0.0):.3f} pred={r.get('pred_dot', 0.0):.3f}] "
-                f"norm[h={r.get('hidden_norm', 0.0):.3f} in={r.get('input_emb_norm', 0.0):.3f} target={r.get('target_emb_norm', 0.0):.3f} pred={r.get('pred_emb_norm', 0.0):.3f}]")
-
-    focus_srw = sorted(
-        [r for r in probe.get('focus_srw_top', [])
-         if int(r.get('rank', -1)) in (0, 1)],
-        key=lambda r: r.get('score', 0.0),
-        reverse=True)
-    if focus_srw:
-        lines.append("same_top_token_srw_focus_topk:")
-        for row in focus_srw[:12]:
-            lines.append(
-                "  "
-                f"rank={row.get('rank')} L{int(row.get('layer', -1)):02d} pool={row.get('pool')} "
-                f"b={row.get('batch')} pos={row.get('pos')} neuron={row.get('neuron_global_id')} "
-                f"score={row.get('score', 0.0):.6f} gate_share={row.get('gate_share', 0.0):.6f} "
-                f"xr={row.get('read_scalar_xr', 0.0):.6f} int={row.get('intensity', 0.0):.6f} "
-                f"rho={row.get('rho', 0.0):.6f} tau={row.get('tau', 0.0):.6f} "
-                f"margin={row.get('margin', 0.0):.6f} out={row.get('out_norm_for_token', 0.0):.3f} "
-                f"write[tgt={row.get('write_dot_target', 0.0):+.4f} pred={row.get('write_dot_pred', 0.0):+.4f} p-t={row.get('write_pred_minus_target', 0.0):+.4f}] "
-                f"contrib_p-t={row.get('contrib_pred_minus_target', 0.0):+.4f}")
-    elif probe.get('focus_path_trace'):
-        lines.append("same_top_token_srw_focus_topk: empty_or_not_returned")
-
-    focus_attn = sorted(
-        [r for r in probe.get('focus_attention_top', [])
-         if int(r.get('rank', -1)) in (0, 1)],
-        key=lambda r: max(
-            abs(r.get('attn_logit', 0.0)),
-            r.get('attn_weight', 0.0) * 10.0,
-            r.get('attn_o_output_norm', 0.0)),
-        reverse=True)
-    if focus_attn:
-        lines.append("same_top_token_attention_focus_topk:")
-        for row in focus_attn[:12]:
-            lines.append(
-                "  "
-                f"rank={row.get('rank')} L{int(row.get('layer', -1)):02d} h={row.get('head')} "
-                f"b={row.get('batch')} q={row.get('query_pos')} k={row.get('key_pos')} "
-                f"rel={row.get('key_relpos', 0.0):.0f} self={row.get('key_is_self', 0)} "
-                f"logit={row.get('attn_logit', 0.0):.6f} w={row.get('attn_weight', 0.0):.6f} "
-                f"gap={row.get('attn_logit_gap_top1_top2', 0.0):.6f} ent={row.get('attn_entropy', 0.0):.6f} "
-                f"q={row.get('q_norm', 0.0):.3f} k_norm={row.get('k_norm', 0.0):.3f} "
-                f"v={row.get('v_norm', 0.0):.3f} o_out={row.get('attn_o_output_norm', 0.0):.3f}")
-    elif probe.get('focus_path_trace'):
-        lines.append("same_top_token_attention_focus_topk: empty_or_not_returned")
-
-    stage_names = {
-        0: 'pre_attn', 1: 'norm1', 2: 'attn_out', 3: 'post_attn',
-        4: 'norm2', 5: 'rst_out', 6: 'post_rst', 7: 'final_norm',
-    }
-    focus_path = [
-        r for r in probe.get('focus_path_trace', [])
-        if int(r.get('rank', -1)) in (0, 1)
-    ]
-    if focus_path:
-        lines.append("focus_path_trace_top_ce:")
-        for rank in (0, 1):
-            rank_rows = [r for r in focus_path if int(r.get('rank', -1)) == rank]
-            if not rank_rows:
-                continue
-            rank_rows = sorted(
-                rank_rows, key=lambda r: (int(r.get('layer', -1)), int(r.get('stage_id', -1))))
-            head = rank_rows[0]
-            lines.append(
-                f"  rank={rank} b={head.get('batch')} pos={head.get('pos')} "
-                f"input={head.get('input_token_id')} target={head.get('target_token_id')} pred={head.get('pred_token_id')}")
-            # Print all stages for rank 0; for rank 1 print compactly every major residual stage.
-            for r in rank_rows:
-                st = int(r.get('stage_id', -1))
-                if rank == 1 and st not in (0, 3, 6, 7):
-                    continue
-                lines.append(
-                    f"    L{int(r.get('layer', -1)):02d} {stage_names.get(st, str(st)):>10s} "
-                    f"h={r.get('hidden_norm', 0.0):.3f} dprev={r.get('delta_norm_from_prev', 0.0):.3f} "
-                    f"cos[in={r.get('input_cos', 0.0):+.4f} tgt={r.get('target_cos', 0.0):+.4f} pred={r.get('pred_cos', 0.0):+.4f}] "
-                    f"dot[tgt={r.get('target_dot', 0.0):+.3f} pred={r.get('pred_dot', 0.0):+.3f} "
-                    f"p-t={r.get('pred_minus_target_dot', 0.0):+.3f}] "
-                    f"delta[p-t={r.get('delta_pred_minus_target_dot', 0.0):+.3f} "
-                    f"tgt={r.get('delta_target_dot', 0.0):+.3f} pred={r.get('delta_pred_dot', 0.0):+.3f}]")
-
-    focus_route = [
-        r for r in probe.get('focus_route_trace', [])
-        if int(r.get('rank', -1)) in (0, 1)
-    ]
-    if focus_route:
-        lines.append("focus_route_trace_top_ce:")
-        for rank in (0, 1):
-            rank_rows = sorted(
-                [r for r in focus_route if int(r.get('rank', -1)) == rank],
-                key=lambda r: int(r.get('layer', -1)))
-            if not rank_rows:
-                continue
-            lines.append(f"  rank={rank}:")
-            # Print layers with largest block delta or nontrivial no-active flags first.
-            rank_rows_sorted = sorted(
-                rank_rows,
-                key=lambda r: max(
-                    r.get('full_block_delta_norm', 0.0),
-                    r.get('attn_out_norm', 0.0),
-                    r.get('rst_out_norm', 0.0)),
-                reverse=True)
-            for r in rank_rows_sorted[:8]:
-                lines.append(
-                    f"    L{int(r.get('layer', -1)):02d} "
-                    f"out[attn={r.get('attn_out_norm', 0.0):.3f} rst={r.get('rst_out_norm', 0.0):.3f} block={r.get('full_block_delta_norm', 0.0):.3f}] "
-                    f"resid[pre={r.get('pre_attn_resid_norm', 0.0):.3f} postA={r.get('post_attn_resid_norm', 0.0):.3f} postR={r.get('post_rst_resid_norm', 0.0):.3f}] "
-                    f"active[qk={r.get('qk_active', 0.0):.1f} v={r.get('v_active', 0.0):.1f} rst={r.get('rst_active', 0.0):.1f}] "
-                    f"tau[q={r.get('q_tau', 0.0):.4f} k={r.get('k_tau', 0.0):.4f} v={r.get('v_tau', 0.0):.4f} rst={r.get('rst_tau', 0.0):.4f}] "
-                    f"no[q={r.get('q_no_active', 0.0):.0f} k={r.get('k_no_active', 0.0):.0f} v={r.get('v_no_active', 0.0):.0f} rst={r.get('rst_no_active', 0.0):.0f}]")
-
-
-    srw = sorted(
-        probe.get('srw_top_contributors', []),
-        key=lambda r: r.get('contrib_proxy', 0.0),
-        reverse=True)
-    if srw:
-        lines.append("global_srw_topk:")
-        for row in srw[:5]:
-            same = (int(row.get('batch', -2)) == tb
-                    and int(row.get('pos', -2)) == tp)
-            lines.append(
-                "  "
-                f"same_top_ce={same} layer={row.get('layer')} pool={row.get('pool')} "
-                f"b={row.get('batch')} pos={row.get('pos')} neuron={row.get('neuron_global_id')} "
-                f"contrib={row.get('contrib_proxy', 0.0):.6f} "
-                f"gate_share={row.get('gate_share', 0.0):.6f} "
-                f"top1={row.get('top1_share_for_token', 0.0):.6f} "
-                f"xr={row.get('read_scalar_xr', 0.0):.6f} "
-                f"int={row.get('intensity', 0.0):.6f} "
-                f"rho={row.get('rho', 0.0):.6f} tau={row.get('tau', 0.0):.6f} "
-                f"margin={row.get('margin', 0.0):.6f}")
-
-    same_token_srw = [
-        row for row in srw
-        if int(row.get('batch', -2)) == tb and int(row.get('pos', -2)) == tp
-    ]
-    if same_token_srw:
-        lines.append("same_top_token_srw_topk:")
-        for row in same_token_srw[:5]:
-            lines.append(
-                "  "
-                f"layer={row.get('layer')} pool={row.get('pool')} neuron={row.get('neuron_global_id')} "
-                f"contrib={row.get('contrib_proxy', 0.0):.6f} "
-                f"gate_share={row.get('gate_share', 0.0):.6f} "
-                f"top1={row.get('top1_share_for_token', 0.0):.6f} "
-                f"xr={row.get('read_scalar_xr', 0.0):.6f} "
-                f"margin={row.get('margin', 0.0):.6f}")
-    elif top_token:
-        lines.append("same_top_token_srw_topk: none_in_global_topk")
-
-    attn = sorted(
-        probe.get('attention_top', []),
-        key=lambda r: max(r.get('attn_top1_weight', 0.0) * 10.0,
-                          abs(r.get('attn_logit_max', 0.0)),
-                          r.get('attn_o_output_norm', 0.0)),
-        reverse=True)
-    if attn:
-        lines.append("global_attention_topk:")
-        for row in attn[:5]:
-            same = (int(row.get('batch', -2)) == tb
-                    and int(row.get('query_pos', -2)) == tp)
-            lines.append(
-                "  "
-                f"same_top_ce={same} layer={row.get('layer')} b={row.get('batch')} "
-                f"q={row.get('query_pos')} k={row.get('key_pos')} "
-                f"logit_max={row.get('attn_logit_max', 0.0):.6f} "
-                f"gap={row.get('attn_logit_gap_top1_top2', 0.0):.6f} "
-                f"top1={row.get('attn_top1_weight', 0.0):.6f} "
-                f"entropy={row.get('attn_entropy', 0.0):.6f} "
-                f"o_out={row.get('attn_o_output_norm', 0.0):.6f}")
-
-    same_token_attn = [
-        row for row in attn
-        if int(row.get('batch', -2)) == tb and int(row.get('query_pos', -2)) == tp
-    ]
-    if same_token_attn:
-        lines.append("same_top_token_attention_topk:")
-        for row in same_token_attn[:5]:
-            lines.append(
-                "  "
-                f"layer={row.get('layer')} k={row.get('key_pos')} "
-                f"logit_max={row.get('attn_logit_max', 0.0):.6f} "
-                f"top1={row.get('attn_top1_weight', 0.0):.6f} "
-                f"entropy={row.get('attn_entropy', 0.0):.6f} "
-                f"o_out={row.get('attn_o_output_norm', 0.0):.6f}")
-    elif top_token:
-        lines.append("same_top_token_attention_topk: none_in_global_topk")
-
-    lines.append("grad_evidence: " + json.dumps(
-        event.get('grad_evidence', {}), default=str))
-    lines.append("")
-    return "\n".join(lines)
-
-def _spike_trigger_reasons(rec, thresholds):
-    grad = rec.get('grad_pre', 0.0)
-    ce = rec.get('ce', 0.0)
-    logit_abs = rec.get('lm_logit_abs_max', 0.0)
-    layer_rst = rec.get('layer_rst_max', 0.0)
-    reasons = []
-    if grad > thresholds['spike_grad_threshold']:
-        reasons.append('grad_pre')
-    if ce > thresholds['spike_ce_threshold']:
-        reasons.append('ce_loss')
-    if (ce > thresholds['spike_ce_grad_ce_threshold']
-            and grad > thresholds['spike_ce_grad_grad_threshold']):
-        reasons.append('ce_grad_combo')
-    if logit_abs > thresholds['spike_logit_abs_threshold']:
-        reasons.append('lm_logit_abs_max')
-    if layer_rst > thresholds['spike_rst_out_threshold']:
-        reasons.append('layer_rst_max')
-    return reasons
-
-
-def _attach_debug_forward_record(rec, debug_forward):
-    """Merge diagnostics-only forward outputs into a host-side log record."""
-    if not debug_forward:
-        return rec
-    normal = debug_forward.get('normal', {})
-    for key in ('local_spike_values', 'local_spike_locs',
-                'local_top1_values', 'local_top1_locs',
-                'attn_local_layer_values'):
-        if key in normal:
-            rec[key] = _jsonable_diag_value(normal[key])
-    if 'debug_forward_summary' in normal:
-        for key, val in normal['debug_forward_summary'].items():
-            rec[f'debug_normal_{key}'] = float(val)
-    enabled = bool(debug_forward.get('drop_compare_enabled', False))
-    rec['debug_drop_compare_enabled'] = enabled
-    if enabled:
-        det = debug_forward.get('deterministic', {})
-        if 'debug_forward_summary' in det:
-            for key, val in det['debug_forward_summary'].items():
-                rec[f'debug_deterministic_{key}'] = float(val)
-    return rec
-
-
-def _diag_array(rec, key, ndim=None):
-    arr = np.asarray(rec.get(key, []), dtype=np.float32)
-    if ndim is not None and arr.ndim != ndim:
-        return None
-    if arr.size == 0:
-        return None
-    return arr
-
-
-def _format_loc(loc):
-    loc = np.asarray(loc).astype(np.int64).reshape(-1)
-    b = int(loc[0]) if loc.size > 0 else -1
-    t = int(loc[1]) if loc.size > 1 else -1
-    n = int(loc[2]) if loc.size > 2 else -1
-    n_part = "neuron=NA" if n < 0 else f"neuron={n}"
-    return f"b={b} t={t} {n_part}"
-
-
-def _best_from_values(values, metric_idx):
-    sub = values[:, :, metric_idx]
-    flat_idx = int(np.nanargmax(sub))
-    layer, pool = np.unravel_index(flat_idx, sub.shape)
-    return layer, pool, float(sub[layer, pool])
-
-
-def _print_local_spike_inline_block(rec):
-    values = _diag_array(rec, 'local_spike_values', ndim=3)
-    if values is None:
-        return
-
-    def _metric(name):
-        if name not in LOCAL_SPIKE_METRIC_NAMES:
-            return 0.0, -1, -1
-        idx = LOCAL_SPIKE_METRIC_NAMES.index(name)
-        if idx >= values.shape[2]:
-            return 0.0, -1, -1
-        layer, pool, val = _best_from_values(values, idx)
-        return val, layer, pool
-
-    def _pool_name(pool):
-        return LOCAL_SPIKE_POOL_NAMES[pool] if 0 <= pool < len(LOCAL_SPIKE_POOL_NAMES) else 'NA'
-
-    top1_val, top1_layer, top1_pool = _metric('top1_share')
-    score_val, score_layer, score_pool = _metric('score')
-    int_val, int_layer, int_pool = _metric('intensity')
-    tau_val, tau_layer, tau_pool = _metric('tau_abs')
-    gate_raw_val, gate_raw_layer, gate_raw_pool = _metric('gate_raw')
-    margin_val, margin_layer, margin_pool = _metric('margin')
-    den_val, den_layer, den_pool = _metric('gate_den_sum')
-    read_val, read_layer, read_pool = _metric('read_abs')
-    write_norm_val, write_norm_layer, write_norm_pool = _metric('write_norm')
-    read_norm_val, read_norm_layer, read_norm_pool = _metric('read_norm')
-    op_gain_val, op_gain_layer, op_gain_pool = _metric('op_gain')
-    contrib_val, contrib_layer, contrib_pool = _metric('contrib_norm')
-    out_val, out_layer, out_pool = _metric('out_norm')
-    h_val, h_layer, h_pool = _metric('h_norm')
-    emb_val, emb_layer, emb_pool = _metric('emb_norm')
-
-    attn_vals = _diag_array(rec, 'attn_local_layer_values', ndim=2)
-    attn_logit = 0.0
-    attn_logit_layer = -1
-    softmax_top1 = 0.0
-    softmax_top1_layer = -1
-    if attn_vals is not None:
-        logit_idx = ATTN_LOCAL_FIELD_NAMES.index('attn_logit_max')
-        softmax_idx = ATTN_LOCAL_FIELD_NAMES.index('softmax_top1_max')
-        attn_logit_layer = int(np.nanargmax(attn_vals[:, logit_idx]))
-        softmax_top1_layer = int(np.nanargmax(attn_vals[:, softmax_idx]))
-        attn_logit = float(attn_vals[attn_logit_layer, logit_idx])
-        softmax_top1 = float(attn_vals[softmax_top1_layer, softmax_idx])
-
-    log_debug_message("[LOCAL_SPIKE_INLINE]")
-    log_debug_message("source=train_forward extra_forward=false")
-    log_debug_message(
-        f"top1_max={top1_val:.6f} top1_layer={top1_layer} "
-        f"top1_pool={_pool_name(top1_pool)}")
-    log_debug_message(
-        f"score_max={score_val:.6f} score_layer={score_layer} "
-        f"score_pool={_pool_name(score_pool)}")
-    log_debug_message(
-        f"int_max={int_val:.6f} int_layer={int_layer} "
-        f"int_pool={_pool_name(int_pool)}")
-    log_debug_message(
-        f"tau_abs_max={tau_val:.6f} tau_layer={tau_layer} "
-        f"tau_pool={_pool_name(tau_pool)}")
-    log_debug_message(
-        f"gate_raw_max={gate_raw_val:.6f} gate_raw_layer={gate_raw_layer} "
-        f"gate_raw_pool={_pool_name(gate_raw_pool)} "
-        f"margin_max={margin_val:.6f} margin_layer={margin_layer} "
-        f"margin_pool={_pool_name(margin_pool)}")
-    log_debug_message(
-        f"gate_den_sum_max={den_val:.6f} den_layer={den_layer} "
-        f"den_pool={_pool_name(den_pool)}")
-    log_debug_message(
-        f"read_abs_max={read_val:.6f} read_layer={read_layer} "
-        f"read_pool={_pool_name(read_pool)}")
-    log_debug_message(
-        f"write_norm_max={write_norm_val:.6f} "
-        f"write_norm_layer={write_norm_layer} "
-        f"write_norm_pool={_pool_name(write_norm_pool)} "
-        f"read_norm_max={read_norm_val:.6f} "
-        f"read_norm_layer={read_norm_layer} "
-        f"read_norm_pool={_pool_name(read_norm_pool)} "
-        f"op_gain_max={op_gain_val:.6f} "
-        f"op_gain_layer={op_gain_layer} "
-        f"op_gain_pool={_pool_name(op_gain_pool)}")
-    log_debug_message(
-        f"contrib_proxy_max={contrib_val:.6f} "
-        f"contrib_layer={contrib_layer} "
-        f"contrib_pool={_pool_name(contrib_pool)}")
-    log_debug_message(
-        f"out_norm_max={out_val:.6f} out_layer={out_layer} "
-        f"out_pool={_pool_name(out_pool)}")
-    log_debug_message(
-        f"h_norm_max={h_val:.6f} h_layer={h_layer} "
-        f"h_pool={_pool_name(h_pool)} emb_norm_max={emb_val:.6f} "
-        f"emb_layer={emb_layer} emb_pool={_pool_name(emb_pool)}")
-    log_debug_message(
-        f"attn_logit_max={attn_logit:.6f} "
-        f"attn_logit_layer={attn_logit_layer} "
-        f"softmax_top1_max={softmax_top1:.6f} "
-        f"softmax_top1_layer={softmax_top1_layer}")
-
-
-def _print_local_spike_block(rec):
-    values = _diag_array(rec, 'local_spike_values', ndim=3)
-    locs = _diag_array(rec, 'local_spike_locs', ndim=4)
-    top1_values = _diag_array(rec, 'local_top1_values', ndim=3)
-    top1_locs = _diag_array(rec, 'local_top1_locs', ndim=3)
-    if values is None or locs is None or top1_values is None or top1_locs is None:
-        return
-
-    top1_idx = LOCAL_TOP1_FIELD_NAMES.index('top1')
-    top1_sub = top1_values[:, :, top1_idx]
-    flat_idx = int(np.nanargmax(top1_sub))
-    layer, pool = np.unravel_index(flat_idx, top1_sub.shape)
-    fields = {
-        name: float(top1_values[layer, pool, i])
-        for i, name in enumerate(LOCAL_TOP1_FIELD_NAMES)
-    }
-    loc = top1_locs[layer, pool]
-    log_debug_message("[LOCAL_SPIKE]")
-    log_debug_message(
-        f"top1_global: pool={LOCAL_SPIKE_POOL_NAMES[pool]} "
-        f"layer={layer} {_format_loc(loc)} "
-        f"top1={fields['top1']:.6f} gate_raw={fields['gate_raw']:.6f} "
-        f"den={fields['gate_den']:.6f} int={fields['intensity']:.6f} "
-        f"score={fields['score']:.6f} tau={fields['tau']:.6f} "
-        f"margin={fields['margin']:.6f} read={fields['read_scalar']:.6f} "
-        f"gate_norm={fields['gate_norm']:.6f} "
-        f"read_norm={fields['read_norm']:.6f} "
-        f"write_norm={fields['write_norm']:.6f} "
-        f"op_gain={fields['op_gain']:.6f} "
-        f"contrib={fields['contrib_norm']:.6f} "
-        f"out_norm={fields['total_out_norm']:.6f} "
-        f"contrib_frac={fields['contrib_frac']:.6f} "
-        f"h_norm={fields.get('h_norm', 0.0):.6f} "
-        f"emb_norm={fields.get('emb_norm', 0.0):.6f}"
-    )
-
-    for metric in ('top1_share', 'score', 'gate_raw', 'margin',
-                   'gate_den_sum', 'intensity', 'read_abs', 'write_norm',
-                   'read_norm', 'op_gain', 'contrib_norm', 'out_norm',
-                   'resid_norm', 'h_norm', 'emb_norm'):
-        if metric not in LOCAL_SPIKE_METRIC_NAMES:
-            continue
-        mi = LOCAL_SPIKE_METRIC_NAMES.index(metric)
-        if mi >= values.shape[2]:
-            continue
-        l, p, val = _best_from_values(values, mi)
-        log_debug_message(
-            f"{metric}_max: pool={LOCAL_SPIKE_POOL_NAMES[p]} "
-            f"layer={l} {_format_loc(locs[l, p, mi])} value={val:.6f}")
-
-    for p, pool_name in enumerate(LOCAL_SPIKE_POOL_NAMES):
-        parts = []
-        for mi, metric in enumerate(LOCAL_SPIKE_METRIC_NAMES):
-            if mi >= values.shape[2]:
-                continue
-            l = int(np.nanargmax(values[:, p, mi]))
-            parts.append(
-                f"{metric}=L{l}:{values[l, p, mi]:.4g}"
-                f"@{_format_loc(locs[l, p, mi])}")
-        log_debug_message(f"pool_max[{pool_name}]: " + " ".join(parts))
-        top1_layer = int(np.nanargmax(top1_values[:, p, top1_idx]))
-        top1_fields = {
-            name: float(top1_values[top1_layer, p, i])
-            for i, name in enumerate(LOCAL_TOP1_FIELD_NAMES)
-        }
-        log_debug_message(
-            f"pool_top1[{pool_name}]: layer={top1_layer} "
-            f"{_format_loc(top1_locs[top1_layer, p])} "
-            f"top1={top1_fields['top1']:.6f} "
-            f"score={top1_fields['score']:.6f} "
-            f"margin={top1_fields['margin']:.6f} "
-            f"gate_raw={top1_fields['gate_raw']:.6f} "
-            f"gate_norm={top1_fields['gate_norm']:.6f} "
-            f"gate_den={top1_fields['gate_den']:.6f} "
-            f"intensity={top1_fields['intensity']:.6f} "
-            f"read_scalar_abs={abs(top1_fields['read_scalar']):.6f} "
-            f"write_norm={top1_fields['write_norm']:.6f} "
-            f"read_norm={top1_fields['read_norm']:.6f} "
-            f"op_gain={top1_fields['op_gain']:.6f} "
-            f"contrib_norm={top1_fields['contrib_norm']:.6f} "
-            f"total_out_norm={top1_fields['total_out_norm']:.6f} "
-            f"contrib_frac={top1_fields['contrib_frac']:.6f} "
-            f"h_norm={top1_fields['h_norm']:.6f} "
-            f"emb_norm={top1_fields['emb_norm']:.6f}")
-
-
-def _print_attention_local_block(rec):
-    vals = _diag_array(rec, 'attn_local_layer_values', ndim=2)
-    if vals is None:
-        return
-    logit_idx = ATTN_LOCAL_FIELD_NAMES.index('attn_logit_max')
-    layer = int(np.nanargmax(vals[:, logit_idx]))
-    row = vals[layer]
-    pieces = [
-        f"{name}={float(row[i]):.6f}"
-        for i, name in enumerate(ATTN_LOCAL_FIELD_NAMES)
-    ]
-    log_debug_message("[ATTN_LOCAL]")
-    log_debug_message(f"layer_max: layer={layer} " + " ".join(pieces))
 
 
 def _fmt_grad_array(rec, key):
@@ -10048,10 +8381,10 @@ def main():
     # Training params (from YAML first, may be overridden by checkpoint config below).
     # Keep the CLI surface small: --debug controls cadence.
     tcfg = cfg['training']
-    model_version_cfg = cfg['model'].get('model_version', 'dawn_srw')
+    model_version_cfg = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     is_v4164_cfg = model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
     tau_init_cfg = (
-        _v4162_tau_init_config(cfg)
+        _v4164_tau_init_config(cfg)
         if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
         else None)
     # Optional config-driven resume. CLI --resume remains an override for
@@ -10069,7 +8402,6 @@ def main():
         cli_args.oom_check
         or run_speed_check
         or tcfg.get('oom_check', tcfg.get('run_oom_check', False)))
-    collapse_warn_ctx = _collapse_warn_context(tcfg)
     # Resume log append policy. Defaults preserve the previous behavior.
     # Set debug to false in config to start fresh diagnostic files on resume
     # without touching the main training log.
@@ -10081,105 +8413,46 @@ def main():
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
     weight_decay = tcfg.get('weight_decay', 0.1)
-    # v4.1 free-norm: pool params (qk/v/know 횞 emb/read/write, 9 tensors)
-    # get a lower WD than dense kernels. Bias / LayerNorm / *_scale
-    # excluded from both groups.
-    pool_weight_decay = tcfg.get(
-        'pool_weight_decay', 0.0 if is_v4164_cfg else 0.02)
+    # v4164 official path: auxiliary exploration/RPE/dead/load-balance
+    # losses are off. Keep optimizer weight_decay separate below.
+    pool_weight_decay = 0.0
     warmup_ratio = tcfg.get('warmup_ratio', 0.06)
     orth_weight = tcfg.get('orthogonality_weight', 0.01)
-    div_weight = tcfg.get('diversity_weight', 0.0 if is_v4164_cfg else 0.1)
-    lb_weight = tcfg.get('load_balance_weight', 0.0 if is_v4164_cfg else 2e-5)
-    tau_reg_weight = tcfg.get('tau_reg_weight', 0.0)
-    dead_penalty_weight = tcfg.get('dead_penalty_weight', 0.0)
-    dead_penalty_qk_weight = tcfg.get(
-        'dead_penalty_qk_weight', dead_penalty_weight)
-    dead_penalty_v_weight = tcfg.get(
-        'dead_penalty_v_weight', dead_penalty_weight)
-    dead_penalty_rst_weight = tcfg.get(
-        'dead_penalty_rst_weight', dead_penalty_weight)
-    dead_exposure_target = float(tcfg.get(
-        'dead_exposure_target', 0.0 if is_v4164_cfg else 0.1))
-    removed_margin_reg_weight_qk = tcfg.get(
-        'removed_margin_reg_weight_qk', 0.0)
-    removed_margin_reg_weight_v = tcfg.get(
-        'removed_margin_reg_weight_v', 0.0)
-    removed_margin_reg_weight_rst = tcfg.get(
-        'removed_margin_reg_weight_rst', 0.0)
-    if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS:
-        # Soft DirectTau paths have no hard-boundary dead repair or
-        # configurable selection-margin auxiliary.
-        pool_weight_decay = 0.0 if is_v4164_cfg else pool_weight_decay
-        div_weight = 0.0 if is_v4164_cfg else div_weight
-        lb_weight = 0.0 if is_v4164_cfg else lb_weight
-        dead_penalty_weight = 0.0
-        dead_penalty_qk_weight = 0.0
-        dead_penalty_v_weight = 0.0
-        dead_penalty_rst_weight = 0.0
-        dead_exposure_target = 0.0
-        removed_margin_reg_weight_qk = 0.0
-        removed_margin_reg_weight_v = 0.0
-        removed_margin_reg_weight_rst = 0.0
-    # v4.1 RPE/exploration loss.
-    # v4.1.6.1 default: run weak RPE together with CB1A.  Keep it mild by
-    # default; explicit config values still override this.
-    _v4161_exp_default_on = model_version_cfg == 'spatial-r1-v4.1.6.1'
-    _v4161_exp_default_weight = 0.0002
-    _v4161_exp_default_asymmetry = 1.2
-    exploration_weight = tcfg.get(
-        'exploration_weight',
-        _v4161_exp_default_weight if _v4161_exp_default_on else 0.0)
-    exploration_weight_qk = tcfg.get('exploration_weight_qk', exploration_weight)
-    if ('exploration_weight_qk' not in tcfg
-            and ('exploration_weight_q' in tcfg or 'exploration_weight_k' in tcfg)):
-        exploration_weight_qk = (
-            float(tcfg.get('exploration_weight_q', exploration_weight))
-            + float(tcfg.get('exploration_weight_k', exploration_weight))) * 0.5
-    exploration_weight_q = exploration_weight_qk
-    exploration_weight_k = exploration_weight_qk
-    exploration_weight_v = tcfg.get('exploration_weight_v', exploration_weight)
-    exploration_weight_rst = tcfg.get('exploration_weight_rst', exploration_weight)
-    exploration_asymmetry = tcfg.get(
-        'exploration_asymmetry',
-        _v4161_exp_default_asymmetry if _v4161_exp_default_on else 0.15)
-    exploration_asymmetry_qk = tcfg.get(
-        'exploration_asymmetry_qk', exploration_asymmetry)
-    if ('exploration_asymmetry_qk' not in tcfg
-            and ('exploration_asymmetry_q' in tcfg
-                 or 'exploration_asymmetry_k' in tcfg)):
-        exploration_asymmetry_qk = (
-            float(tcfg.get('exploration_asymmetry_q', exploration_asymmetry))
-            + float(tcfg.get('exploration_asymmetry_k', exploration_asymmetry))) * 0.5
-    exploration_asymmetry_q = exploration_asymmetry_qk
-    exploration_asymmetry_k = exploration_asymmetry_qk
-    exploration_asymmetry_v = tcfg.get(
-        'exploration_asymmetry_v', exploration_asymmetry)
-    exploration_asymmetry_rst = tcfg.get(
-        'exploration_asymmetry_rst', exploration_asymmetry)
-    # v4.1+ bounded-explore: warmup + per-element bound-off cap.
-    exploration_warmup_steps = tcfg.get('exploration_warmup_steps', 5000)
-    exploration_lower_bound = tcfg.get('exploration_lower_bound', -0.5)
-    exploration_upper_bound = tcfg.get('exploration_upper_bound', 2.0)
-    exploration_bound_eps = tcfg.get('exploration_bound_eps', 1.0e-3)
-    exploration_dev_mode = tcfg.get('exploration_dev_mode', 'raw')
-    exploration_ce_clip_std = tcfg.get('exploration_ce_clip_std', 2.0)
-    exploration_z_clip = tcfg.get('exploration_z_clip', 2.0)
-    exploration_z_tanh = tcfg.get('exploration_z_tanh', True)
-    exploration_weighted_clip = tcfg.get(
-        'exploration_weighted_clip', tcfg.get('expl_w_clip', 0.0))
-    exploration_normalize_by_layers_default = (
-        model_version_cfg in DIRECT_TAU_SPLIT_MODEL_VERSIONS)
-    exploration_normalize_by_layers = bool(tcfg.get(
-        'exploration_normalize_by_layers',
-        exploration_normalize_by_layers_default))
-    if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS:
-        exploration_normalize_by_layers = True
-    rpe_enabled = (
-        False if is_v4164_cfg else bool(tcfg.get('rpe_enabled', True)))
-    soft_gate_enabled = (
-        True if is_v4164_cfg else bool(tcfg.get(
-            'soft_gate_enabled',
-            model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS)))
+    div_weight = 0.0
+    lb_weight = 0.0
+    tau_reg_weight = 0.0
+    dead_penalty_weight = 0.0
+    dead_penalty_qk_weight = 0.0
+    dead_penalty_v_weight = 0.0
+    dead_penalty_rst_weight = 0.0
+    dead_exposure_target = 0.0
+    removed_margin_reg_weight_qk = 0.0
+    removed_margin_reg_weight_v = 0.0
+    removed_margin_reg_weight_rst = 0.0
+    exploration_weight = 0.0
+    exploration_weight_qk = 0.0
+    exploration_weight_q = 0.0
+    exploration_weight_k = 0.0
+    exploration_weight_v = 0.0
+    exploration_weight_rst = 0.0
+    exploration_asymmetry = 0.0
+    exploration_asymmetry_qk = 0.0
+    exploration_asymmetry_q = 0.0
+    exploration_asymmetry_k = 0.0
+    exploration_asymmetry_v = 0.0
+    exploration_asymmetry_rst = 0.0
+    exploration_warmup_steps = 0
+    exploration_lower_bound = 0.0
+    exploration_upper_bound = 0.0
+    exploration_bound_eps = 0.0
+    exploration_dev_mode = 'raw'
+    exploration_ce_clip_std = 0.0
+    exploration_z_clip = 0.0
+    exploration_z_tanh = False
+    exploration_weighted_clip = 0.0
+    exploration_normalize_by_layers = True
+    rpe_enabled = False
+    soft_gate_schedule_active = True
     soft_gate_t_start = float(tcfg.get('soft_gate_t_start', 1.5))
     soft_gate_t_final = float(tcfg.get('soft_gate_t_final', 0.07))
     soft_gate_t_hold_frac = float(tcfg.get('soft_gate_t_hold_frac', 0.10))
@@ -10192,18 +8465,13 @@ def main():
         tcfg.get('soft_gate_t_gompertz_center', 0.25))
     soft_gate_t_gompertz_steepness = float(
         tcfg.get('soft_gate_t_gompertz_steepness', 8.0))
-    soft_gate_t_pool_specific = (
-        True if is_v4164_cfg else bool(tcfg.get(
-            'soft_gate_t_pool_specific', False)))
+    pool_specific_gate_t = True
     soft_gate_pool_schedules = _training_soft_gate_pool_schedules(
         tcfg, soft_gate_t_start, soft_gate_t_final,
         soft_gate_t_hold_frac, soft_gate_t_anneal_end_frac,
         soft_gate_schedule, soft_gate_t_power,
         soft_gate_t_gompertz_center, soft_gate_t_gompertz_steepness)
-    soft_gate_boundary_power_enabled = (
-        True if is_v4164_cfg else bool(tcfg.get(
-            'soft_gate_boundary_power_enabled',
-            model_version_cfg in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)))
+    boundary_power_schedule_active = True
     soft_gate_boundary_power_start = float(tcfg.get(
         'soft_gate_boundary_power_start', 3.0))
     soft_gate_boundary_power_mid = float(tcfg.get(
@@ -10230,19 +8498,7 @@ def main():
     )
     current_admission_den_config_override = any(
         key in tcfg for key in admission_den_config_keys)
-    if is_v4164_cfg:
-        regular_diagnostics_level = 'analysis'
-    else:
-        regular_diagnostics_level_default = (
-            'compact'
-            if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
-            else 'full')
-        regular_diagnostics_level = str(tcfg.get(
-            'regular_diagnostics_level',
-            regular_diagnostics_level_default)).lower()
-        if regular_diagnostics_level not in ('compact', 'full'):
-            raise ValueError(
-                "training.regular_diagnostics_level must be 'compact' or 'full'.")
+    regular_diagnostics_level = 'analysis'
     regular_console_level_default = 'full'
     regular_console_level = str(tcfg.get(
         'regular_console_level',
@@ -10265,24 +8521,10 @@ def main():
         'regular_console_drive_max_warn', 1.20))
     regular_console_logging_overhead_warn = float(tcfg.get(
         'regular_console_logging_overhead_warn', 0.05))
-    if is_v4164_cfg:
-        regular_current_eps = []
-        regular_projected_eps = []
-        regular_mass_enabled = False
-        regular_sparsity_enabled = False
-    else:
-        regular_current_eps_default = [1.0e-1, 1.0e-2, 1.0e-3]
-        regular_projected_eps_default = [1.0e-6]
-        regular_current_eps = [
-            float(x) for x in tcfg.get(
-                'regular_current_eps', regular_current_eps_default)]
-        regular_projected_eps = [
-            float(x) for x in tcfg.get(
-                'regular_projected_eps', regular_projected_eps_default)]
-        regular_mass_enabled = bool(tcfg.get('regular_mass_enabled', False))
-        regular_sparsity_enabled = bool(tcfg.get(
-            'regular_sparsity_enabled',
-            model_version_cfg not in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS))
+    regular_current_eps = []
+    regular_projected_eps = []
+    regular_mass_metrics_active = False
+    regular_sparsity_metrics_active = False
     eval_effective_prune_enabled = bool(tcfg.get(
         'eval_effective_prune_enabled',
         model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS))
@@ -10295,18 +8537,9 @@ def main():
         sorted(k for k in tcfg if k.startswith('tau_ce_grad_scale'))
         if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
         else [])
-    if is_v4164_cfg:
-        rpe_start_frac = 0.0
-        rpe_full_frac = 0.0
-        rpe_schedule = 'linear'
-    else:
-        rpe_start_frac = float(tcfg.get(
-            'rpe_start_frac',
-            0.20 if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS else 0.0))
-        rpe_full_frac = float(tcfg.get(
-            'rpe_full_frac',
-            0.45 if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS else 0.0))
-        rpe_schedule = str(tcfg.get('rpe_schedule', 'linear'))
+    rpe_start_frac = 0.0
+    rpe_full_frac = 0.0
+    rpe_schedule = 'linear'
     if not rpe_enabled:
         exploration_weight = 0.0
         exploration_weight_q = 0.0
@@ -10320,42 +8553,22 @@ def main():
         exploration_asymmetry_v = 0.0
         exploration_asymmetry_rst = 0.0
         exploration_weighted_clip = 0.0
-    _cb1a_default_on = model_version_cfg == 'spatial-r1-v4.1.6.1'
-    # 4161 policy: CB1A is always enabled and runs together with weak RPE by default.
-    # Do not expose cb1a_enabled, cb1a_tau_stopgrad,
-    # cb1a_anchor_stopgrad, or cb1a_forward_influence as config knobs.
-    cb1a_enabled = _cb1a_default_on
-    cb1a_weight = tcfg.get('cb1a_weight', 1.0 if _cb1a_default_on else 0.0)
-    # Public CB1A scaling is per pool and per branch. The old shared
-    # challenge/prune and coarse pool weights are fixed to 1.0 so the six
-    # direct weights below are the effective knobs.
-    cb1a_challenge_weight = 1.0 if _cb1a_default_on else 0.0
-    cb1a_prune_weight = 1.0 if _cb1a_default_on else 0.0
-    cb1a_qk_weight = tcfg.get(
-        'cb1a_qk_weight',
-        tcfg.get('cb1a_weight_qk', 1.0 if _cb1a_default_on else 0.0))
-    cb1a_v_weight = tcfg.get(
-        'cb1a_v_weight',
-        tcfg.get('cb1a_weight_v', 1.0 if _cb1a_default_on else 0.0))
-    cb1a_rst_weight = tcfg.get(
-        'cb1a_rst_weight',
-        tcfg.get('cb1a_weight_rst', 1.0 if _cb1a_default_on else 0.0))
-    cb1a_qk_challenge_weight = tcfg.get(
-        'cb1a_qk_challenge_weight', 0.05 if _cb1a_default_on else None)
-    cb1a_qk_prune_weight = tcfg.get(
-        'cb1a_qk_prune_weight', 0.05 if _cb1a_default_on else None)
-    cb1a_v_challenge_weight = tcfg.get(
-        'cb1a_v_challenge_weight', 0.20 if _cb1a_default_on else None)
-    cb1a_v_prune_weight = tcfg.get(
-        'cb1a_v_prune_weight', 0.30 if _cb1a_default_on else None)
-    cb1a_rst_challenge_weight = tcfg.get(
-        'cb1a_rst_challenge_weight', 0.40 if _cb1a_default_on else None)
-    cb1a_rst_prune_weight = tcfg.get(
-        'cb1a_rst_prune_weight', 0.70 if _cb1a_default_on else None)
-    cb1a_ce_mode = tcfg.get('cb1a_ce_mode', 'sigmoid_z')
-    cb1a_eps = tcfg.get('cb1a_eps', 1.0e-8)
-    dead_penalty_weighted_clip = tcfg.get(
-        'dead_penalty_weighted_clip', tcfg.get('dead_w_clip', 0.0))
+    cb1a_enabled = False
+    cb1a_weight = 0.0
+    cb1a_challenge_weight = 0.0
+    cb1a_prune_weight = 0.0
+    cb1a_qk_weight = 0.0
+    cb1a_v_weight = 0.0
+    cb1a_rst_weight = 0.0
+    cb1a_qk_challenge_weight = 0.0
+    cb1a_qk_prune_weight = 0.0
+    cb1a_v_challenge_weight = 0.0
+    cb1a_v_prune_weight = 0.0
+    cb1a_rst_challenge_weight = 0.0
+    cb1a_rst_prune_weight = 0.0
+    cb1a_ce_mode = 'sigmoid_z'
+    cb1a_eps = 1.0e-8
+    dead_penalty_weighted_clip = 0.0
     global_grad_clip = tcfg.get('global_grad_clip', 0.0)
     tau_lr_mult = tcfg.get('tau_lr_mult', 1.0)
     tau_grad_clip = tcfg.get('tau_grad_clip', 0.0)
@@ -10519,7 +8732,7 @@ def main():
         kst = timezone(timedelta(hours=9))
         ts = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
         rand_suffix = _random.randint(1000, 9999)
-        version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5.2')
+        version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
         run_name = f"run_v{version}_{ts}_{rand_suffix}"
         checkpoint_dir = _join(base_checkpoint_dir, run_name)
         _makedirs(checkpoint_dir)
@@ -10586,115 +8799,14 @@ def main():
             if cli_args.lr is None:
                 lr = saved_training_config.get('lr', lr)
             weight_decay = saved_training_config.get('weight_decay', weight_decay)
-            pool_weight_decay = saved_training_config.get(
-                'pool_weight_decay', pool_weight_decay)
             warmup_ratio = saved_training_config.get('warmup_ratio', warmup_ratio)
             orth_weight = saved_training_config.get('orthogonality_weight', orth_weight)
-            div_weight = saved_training_config.get('diversity_weight', div_weight)
-            lb_weight = saved_training_config.get('load_balance_weight', lb_weight)
-            tau_reg_weight = saved_training_config.get('tau_reg_weight', tau_reg_weight)
-            dead_penalty_weight = saved_training_config.get('dead_penalty_weight', dead_penalty_weight)
-            dead_penalty_qk_weight = saved_training_config.get(
-                'dead_penalty_qk_weight', dead_penalty_qk_weight)
-            dead_penalty_v_weight = saved_training_config.get(
-                'dead_penalty_v_weight', dead_penalty_v_weight)
-            dead_penalty_rst_weight = saved_training_config.get(
-                'dead_penalty_rst_weight', dead_penalty_rst_weight)
-            dead_exposure_target = float(saved_training_config.get(
-                'dead_exposure_target', dead_exposure_target))
-            if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS:
-                dead_penalty_weight = 0.0
-                dead_penalty_qk_weight = 0.0
-                dead_penalty_v_weight = 0.0
-                dead_penalty_rst_weight = 0.0
-                dead_exposure_target = 0.0
-                removed_margin_reg_weight_qk = 0.0
-                removed_margin_reg_weight_v = 0.0
-                removed_margin_reg_weight_rst = 0.0
-            else:
-                removed_margin_reg_weight_qk = saved_training_config.get(
-                    'removed_margin_reg_weight_qk',
-                    removed_margin_reg_weight_qk)
-                removed_margin_reg_weight_v = saved_training_config.get(
-                    'removed_margin_reg_weight_v',
-                    removed_margin_reg_weight_v)
-                removed_margin_reg_weight_rst = saved_training_config.get(
-                    'removed_margin_reg_weight_rst',
-                    removed_margin_reg_weight_rst)
-            exploration_weight = saved_training_config.get(
-                'exploration_weight', exploration_weight)
-            exploration_weight_qk = saved_training_config.get(
-                'exploration_weight_qk', exploration_weight)
-            if ('exploration_weight_qk' not in saved_training_config
-                    and ('exploration_weight_q' in saved_training_config
-                         or 'exploration_weight_k' in saved_training_config)):
-                exploration_weight_qk = (
-                    float(saved_training_config.get(
-                        'exploration_weight_q', exploration_weight))
-                    + float(saved_training_config.get(
-                        'exploration_weight_k', exploration_weight))) * 0.5
-            exploration_weight_q = exploration_weight_qk
-            exploration_weight_k = exploration_weight_qk
-            exploration_weight_v = saved_training_config.get(
-                'exploration_weight_v', exploration_weight)
-            exploration_weight_rst = saved_training_config.get(
-                'exploration_weight_rst', exploration_weight)
-            exploration_asymmetry = saved_training_config.get(
-                'exploration_asymmetry', exploration_asymmetry)
-            exploration_asymmetry_qk = saved_training_config.get(
-                'exploration_asymmetry_qk', exploration_asymmetry)
-            if ('exploration_asymmetry_qk' not in saved_training_config
-                    and ('exploration_asymmetry_q' in saved_training_config
-                         or 'exploration_asymmetry_k' in saved_training_config)):
-                exploration_asymmetry_qk = (
-                    float(saved_training_config.get(
-                        'exploration_asymmetry_q', exploration_asymmetry))
-                    + float(saved_training_config.get(
-                        'exploration_asymmetry_k', exploration_asymmetry))) * 0.5
-            exploration_asymmetry_q = exploration_asymmetry_qk
-            exploration_asymmetry_k = exploration_asymmetry_qk
-            exploration_asymmetry_v = saved_training_config.get(
-                'exploration_asymmetry_v', exploration_asymmetry)
-            exploration_asymmetry_rst = saved_training_config.get(
-                'exploration_asymmetry_rst', exploration_asymmetry)
-            exploration_warmup_steps = saved_training_config.get(
-                'exploration_warmup_steps', exploration_warmup_steps)
-            exploration_lower_bound = saved_training_config.get(
-                'exploration_lower_bound', exploration_lower_bound)
-            exploration_upper_bound = saved_training_config.get(
-                'exploration_upper_bound', exploration_upper_bound)
-            exploration_bound_eps = saved_training_config.get(
-                'exploration_bound_eps', exploration_bound_eps)
-            exploration_dev_mode = saved_training_config.get(
-                'exploration_dev_mode', exploration_dev_mode)
-            exploration_ce_clip_std = saved_training_config.get(
-                'exploration_ce_clip_std', exploration_ce_clip_std)
-            exploration_z_clip = saved_training_config.get(
-                'exploration_z_clip', exploration_z_clip)
-            exploration_z_tanh = saved_training_config.get(
-                'exploration_z_tanh', exploration_z_tanh)
-            exploration_weighted_clip = saved_training_config.get(
-                'exploration_weighted_clip', exploration_weighted_clip)
-            exploration_normalize_by_layers = bool(saved_training_config.get(
-                'exploration_normalize_by_layers',
-                exploration_normalize_by_layers))
-            if is_v4164_cfg:
-                rpe_enabled = False
-                regular_diagnostics_level = 'analysis'
-                regular_current_eps = []
-                regular_projected_eps = []
-                regular_mass_enabled = False
-                regular_sparsity_enabled = False
-                soft_gate_boundary_power_enabled = True
-            else:
-                rpe_enabled = bool(saved_training_config.get(
-                    'rpe_enabled', rpe_enabled))
-                regular_diagnostics_level = str(saved_training_config.get(
-                    'regular_diagnostics_level',
-                    regular_diagnostics_level)).lower()
-                if regular_diagnostics_level not in ('compact', 'full'):
-                    raise ValueError(
-                        "training.regular_diagnostics_level must be 'compact' or 'full'.")
+            regular_diagnostics_level = 'analysis'
+            regular_current_eps = []
+            regular_projected_eps = []
+            regular_mass_metrics_active = False
+            regular_sparsity_metrics_active = False
+            boundary_power_schedule_active = True
             regular_console_level = str(saved_training_config.get(
                 'regular_console_level', regular_console_level)).lower()
             if regular_console_level not in ('compact', 'full'):
@@ -10717,21 +8829,6 @@ def main():
                 saved_training_config.get(
                     'regular_console_logging_overhead_warn',
                     regular_console_logging_overhead_warn))
-            if not is_v4164_cfg:
-                regular_current_eps = [
-                    float(x) for x in saved_training_config.get(
-                        'regular_current_eps', regular_current_eps)]
-                regular_projected_eps = [
-                    float(x) for x in saved_training_config.get(
-                        'regular_projected_eps', regular_projected_eps)]
-                regular_mass_enabled = bool(saved_training_config.get(
-                    'regular_mass_enabled', regular_mass_enabled))
-                regular_sparsity_enabled = bool(saved_training_config.get(
-                    'regular_sparsity_enabled', regular_sparsity_enabled))
-                soft_gate_boundary_power_enabled = bool(
-                    saved_training_config.get(
-                        'soft_gate_boundary_power_enabled',
-                        soft_gate_boundary_power_enabled))
             soft_gate_boundary_power_start = float(
                 saved_training_config.get(
                     'soft_gate_boundary_power_start',
@@ -10765,111 +8862,46 @@ def main():
                     'admission_den_grad_scale',
                     saved_training_config.get(
                         'v4164_den_grad_scale', admission_den_grad_scale)))
-            if model_version_cfg == 'spatial-r1-v4.1.6.1':
-                # Older 4161 checkpoints may have saved rpe_enabled=False and
-                # exploration_weight=0 because the old code hard-disabled RPE.
-                # For the current run, prefer the current config/defaults so
-                # CB1A + weak RPE is enabled by default on resume too.
-                rpe_enabled = bool(tcfg.get('rpe_enabled', True))
-                exploration_weight = tcfg.get(
-                    'exploration_weight', _v4161_exp_default_weight)
-                exploration_weight_qk = tcfg.get(
-                    'exploration_weight_qk', exploration_weight)
-                if ('exploration_weight_qk' not in tcfg
-                        and ('exploration_weight_q' in tcfg
-                             or 'exploration_weight_k' in tcfg)):
-                    exploration_weight_qk = (
-                        float(tcfg.get('exploration_weight_q', exploration_weight))
-                        + float(tcfg.get('exploration_weight_k', exploration_weight))) * 0.5
-                exploration_weight_q = exploration_weight_qk
-                exploration_weight_k = exploration_weight_qk
-                exploration_weight_v = tcfg.get(
-                    'exploration_weight_v', exploration_weight)
-                exploration_weight_rst = tcfg.get(
-                    'exploration_weight_rst', exploration_weight)
-                exploration_asymmetry = tcfg.get(
-                    'exploration_asymmetry', _v4161_exp_default_asymmetry)
-                exploration_asymmetry_qk = tcfg.get(
-                    'exploration_asymmetry_qk', exploration_asymmetry)
-                if ('exploration_asymmetry_qk' not in tcfg
-                        and ('exploration_asymmetry_q' in tcfg
-                             or 'exploration_asymmetry_k' in tcfg)):
-                    exploration_asymmetry_qk = (
-                        float(tcfg.get('exploration_asymmetry_q', exploration_asymmetry))
-                        + float(tcfg.get('exploration_asymmetry_k', exploration_asymmetry))) * 0.5
-                exploration_asymmetry_q = exploration_asymmetry_qk
-                exploration_asymmetry_k = exploration_asymmetry_qk
-                exploration_asymmetry_v = tcfg.get(
-                    'exploration_asymmetry_v', exploration_asymmetry)
-                exploration_asymmetry_rst = tcfg.get(
-                    'exploration_asymmetry_rst', exploration_asymmetry)
-                exploration_weighted_clip = tcfg.get(
-                    'exploration_weighted_clip',
-                    tcfg.get('expl_w_clip', exploration_weighted_clip))
-            # For 4161, ignore legacy saved CB1A control knobs. CB1A is
-            # fixed-on, aux-only, stopgrad-protected; restore only the
-            # intended scalar/direct branch weights.
-            cb1a_enabled = model_version_cfg == 'spatial-r1-v4.1.6.1'
-            cb1a_weight = saved_training_config.get(
-                'cb1a_weight', cb1a_weight)
-            cb1a_challenge_weight = 1.0 if cb1a_enabled else 0.0
-            cb1a_prune_weight = 1.0 if cb1a_enabled else 0.0
-            cb1a_qk_weight = saved_training_config.get(
-                'cb1a_qk_weight',
-                saved_training_config.get('cb1a_weight_qk', cb1a_qk_weight))
-            cb1a_v_weight = saved_training_config.get(
-                'cb1a_v_weight',
-                saved_training_config.get('cb1a_weight_v', cb1a_v_weight))
-            cb1a_rst_weight = saved_training_config.get(
-                'cb1a_rst_weight',
-                saved_training_config.get('cb1a_weight_rst', cb1a_rst_weight))
-            cb1a_qk_challenge_weight = saved_training_config.get(
-                'cb1a_qk_challenge_weight', cb1a_qk_challenge_weight)
-            cb1a_qk_prune_weight = saved_training_config.get(
-                'cb1a_qk_prune_weight', cb1a_qk_prune_weight)
-            cb1a_v_challenge_weight = saved_training_config.get(
-                'cb1a_v_challenge_weight', cb1a_v_challenge_weight)
-            cb1a_v_prune_weight = saved_training_config.get(
-                'cb1a_v_prune_weight', cb1a_v_prune_weight)
-            cb1a_rst_challenge_weight = saved_training_config.get(
-                'cb1a_rst_challenge_weight', cb1a_rst_challenge_weight)
-            cb1a_rst_prune_weight = saved_training_config.get(
-                'cb1a_rst_prune_weight', cb1a_rst_prune_weight)
-            cb1a_ce_mode = saved_training_config.get(
-                'cb1a_ce_mode', cb1a_ce_mode)
-            cb1a_eps = saved_training_config.get('cb1a_eps', cb1a_eps)
-            if model_version_cfg == 'spatial-r1-v4.1.6.1':
-                # For 4161 runs, prefer current config/defaults over legacy
-                # checkpoint values so CB1A+RPE knobs can be changed on resume.
-                cb1a_enabled = True
-                cb1a_weight = tcfg.get('cb1a_weight', cb1a_weight)
-                cb1a_challenge_weight = 1.0
-                cb1a_prune_weight = 1.0
-                cb1a_qk_weight = tcfg.get(
-                    'cb1a_qk_weight',
-                    tcfg.get('cb1a_weight_qk', cb1a_qk_weight))
-                cb1a_v_weight = tcfg.get(
-                    'cb1a_v_weight',
-                    tcfg.get('cb1a_weight_v', cb1a_v_weight))
-                cb1a_rst_weight = tcfg.get(
-                    'cb1a_rst_weight',
-                    tcfg.get('cb1a_weight_rst', cb1a_rst_weight))
-                cb1a_qk_challenge_weight = tcfg.get(
-                    'cb1a_qk_challenge_weight', cb1a_qk_challenge_weight)
-                cb1a_qk_prune_weight = tcfg.get(
-                    'cb1a_qk_prune_weight', cb1a_qk_prune_weight)
-                cb1a_v_challenge_weight = tcfg.get(
-                    'cb1a_v_challenge_weight', cb1a_v_challenge_weight)
-                cb1a_v_prune_weight = tcfg.get(
-                    'cb1a_v_prune_weight', cb1a_v_prune_weight)
-                cb1a_rst_challenge_weight = tcfg.get(
-                    'cb1a_rst_challenge_weight', cb1a_rst_challenge_weight)
-                cb1a_rst_prune_weight = tcfg.get(
-                    'cb1a_rst_prune_weight', cb1a_rst_prune_weight)
-                cb1a_ce_mode = tcfg.get('cb1a_ce_mode', cb1a_ce_mode)
-                cb1a_eps = tcfg.get('cb1a_eps', cb1a_eps)
-            dead_penalty_weighted_clip = saved_training_config.get(
-                'dead_penalty_weighted_clip', dead_penalty_weighted_clip)
+            pool_weight_decay = 0.0
+            div_weight = 0.0
+            lb_weight = 0.0
+            tau_reg_weight = 0.0
+            dead_penalty_weight = 0.0
+            dead_penalty_qk_weight = 0.0
+            dead_penalty_v_weight = 0.0
+            dead_penalty_rst_weight = 0.0
+            dead_exposure_target = 0.0
+            removed_margin_reg_weight_qk = 0.0
+            removed_margin_reg_weight_v = 0.0
+            removed_margin_reg_weight_rst = 0.0
+            rpe_enabled = False
+            exploration_weight = 0.0
+            exploration_weight_q = 0.0
+            exploration_weight_k = 0.0
+            exploration_weight_qk = 0.0
+            exploration_weight_v = 0.0
+            exploration_weight_rst = 0.0
+            exploration_asymmetry = 0.0
+            exploration_asymmetry_q = 0.0
+            exploration_asymmetry_k = 0.0
+            exploration_asymmetry_qk = 0.0
+            exploration_asymmetry_v = 0.0
+            exploration_asymmetry_rst = 0.0
+            exploration_weighted_clip = 0.0
+            dead_penalty_weighted_clip = 0.0
+            cb1a_enabled = False
+            cb1a_weight = 0.0
+            cb1a_challenge_weight = 0.0
+            cb1a_prune_weight = 0.0
+            cb1a_qk_weight = 0.0
+            cb1a_v_weight = 0.0
+            cb1a_rst_weight = 0.0
+            cb1a_qk_challenge_weight = 0.0
+            cb1a_qk_prune_weight = 0.0
+            cb1a_v_challenge_weight = 0.0
+            cb1a_v_prune_weight = 0.0
+            cb1a_rst_challenge_weight = 0.0
+            cb1a_rst_prune_weight = 0.0
             global_grad_clip = saved_training_config.get(
                 'global_grad_clip', global_grad_clip)
             tau_lr_mult = saved_training_config.get(
@@ -10913,6 +8945,47 @@ def main():
                 'log_analysis_multiplier', log_analysis_multiplier))
             heavy_geometry_multiplier = int(saved_training_config.get(
                 'heavy_geometry_multiplier', heavy_geometry_multiplier))
+
+            pool_weight_decay = 0.0
+            div_weight = 0.0
+            lb_weight = 0.0
+            tau_reg_weight = 0.0
+            dead_penalty_weight = 0.0
+            dead_penalty_qk_weight = 0.0
+            dead_penalty_v_weight = 0.0
+            dead_penalty_rst_weight = 0.0
+            dead_exposure_target = 0.0
+            removed_margin_reg_weight_qk = 0.0
+            removed_margin_reg_weight_v = 0.0
+            removed_margin_reg_weight_rst = 0.0
+            rpe_enabled = False
+            exploration_weight = 0.0
+            exploration_weight_q = 0.0
+            exploration_weight_k = 0.0
+            exploration_weight_qk = 0.0
+            exploration_weight_v = 0.0
+            exploration_weight_rst = 0.0
+            exploration_asymmetry = 0.0
+            exploration_asymmetry_q = 0.0
+            exploration_asymmetry_k = 0.0
+            exploration_asymmetry_qk = 0.0
+            exploration_asymmetry_v = 0.0
+            exploration_asymmetry_rst = 0.0
+            exploration_weighted_clip = 0.0
+            dead_penalty_weighted_clip = 0.0
+            cb1a_enabled = False
+            cb1a_weight = 0.0
+            cb1a_challenge_weight = 0.0
+            cb1a_prune_weight = 0.0
+            cb1a_qk_weight = 0.0
+            cb1a_v_weight = 0.0
+            cb1a_rst_weight = 0.0
+            cb1a_qk_challenge_weight = 0.0
+            cb1a_qk_prune_weight = 0.0
+            cb1a_v_challenge_weight = 0.0
+            cb1a_v_prune_weight = 0.0
+            cb1a_rst_challenge_weight = 0.0
+            cb1a_rst_prune_weight = 0.0
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
@@ -10929,14 +9002,14 @@ def main():
         removed_margin_reg_weight_v = 0.0
         removed_margin_reg_weight_rst = 0.0
         rpe_enabled = False
-        soft_gate_enabled = True
-        soft_gate_t_pool_specific = True
-        soft_gate_boundary_power_enabled = True
+        soft_gate_schedule_active = True
+        pool_specific_gate_t = True
+        boundary_power_schedule_active = True
         regular_diagnostics_level = 'analysis'
         regular_current_eps = []
         regular_projected_eps = []
-        regular_mass_enabled = False
-        regular_sparsity_enabled = False
+        regular_mass_metrics_active = False
+        regular_sparsity_metrics_active = False
 
     if not rpe_enabled:
         exploration_weight = 0.0
@@ -10952,14 +9025,14 @@ def main():
         exploration_asymmetry_rst = 0.0
         exploration_weighted_clip = 0.0
 
-    if soft_gate_enabled:
+    if soft_gate_schedule_active:
         _soft_gate_schedule_name = soft_gate_schedule.lower()
         if _soft_gate_schedule_name not in SOFT_GATE_T_SCHEDULE_NAMES:
             raise ValueError(
                 f"Unsupported soft_gate_t_schedule={soft_gate_schedule!r}; "
                 f"{_soft_gate_schedule_expected_msg()}")
         if not (_soft_gate_schedule_name == 'developmental_band'
-                and soft_gate_t_pool_specific):
+                and pool_specific_gate_t):
             if _soft_gate_schedule_name == 'developmental_band':
                 _validate_soft_gate_schedule_config(
                     'soft_gate_t', soft_gate_pool_schedules['qk'])
@@ -10974,12 +9047,12 @@ def main():
                     'gompertz_center': soft_gate_t_gompertz_center,
                     'gompertz_steepness': soft_gate_t_gompertz_steepness,
                 })
-        if soft_gate_t_pool_specific:
+        if pool_specific_gate_t:
             for _pool, _cfg in soft_gate_pool_schedules.items():
                 _validate_soft_gate_schedule_config(
                     f"soft_gate_t_{_pool}", _cfg,
                     require_pool_specific_devband_fields=True)
-    if soft_gate_boundary_power_enabled:
+    if boundary_power_schedule_active:
         if soft_gate_boundary_power_start <= 0.0:
             raise ValueError(
                 "soft_gate_boundary_power_start must be > 0, got "
@@ -11048,7 +9121,6 @@ def main():
         'exploration_weighted_clip': exploration_weighted_clip,
         'exploration_normalize_by_layers': exploration_normalize_by_layers,
         'rpe_enabled': rpe_enabled,
-        'soft_gate_enabled': soft_gate_enabled,
         'soft_gate_t_start': soft_gate_t_start,
         'soft_gate_t_final': soft_gate_t_final,
         'soft_gate_t_hold_frac': soft_gate_t_hold_frac,
@@ -11057,9 +9129,7 @@ def main():
         'soft_gate_t_power': soft_gate_t_power,
         'soft_gate_t_gompertz_center': soft_gate_t_gompertz_center,
         'soft_gate_t_gompertz_steepness': soft_gate_t_gompertz_steepness,
-        'soft_gate_t_pool_specific': soft_gate_t_pool_specific,
         **_flatten_soft_gate_pool_schedules(soft_gate_pool_schedules),
-        'soft_gate_boundary_power_enabled': soft_gate_boundary_power_enabled,
         'soft_gate_boundary_power_start': soft_gate_boundary_power_start,
         'soft_gate_boundary_power_mid': soft_gate_boundary_power_mid,
         'soft_gate_boundary_power_final': soft_gate_boundary_power_final,
@@ -11078,8 +9148,6 @@ def main():
             regular_console_logging_overhead_warn,
         'regular_current_eps': regular_current_eps,
         'regular_projected_eps': regular_projected_eps,
-        'regular_mass_enabled': regular_mass_enabled,
-        'regular_sparsity_enabled': regular_sparsity_enabled,
         'eval_effective_prune_enabled': eval_effective_prune_enabled,
         'eval_effective_prune_eps_list': eval_effective_prune_eps_list,
         'rpe_start_frac': rpe_start_frac,
@@ -11112,25 +9180,6 @@ def main():
         'route_emb_update_ratio_cap': route_emb_update_ratio_cap,
         'tau_update_abs_cap': tau_update_abs_cap,
         'scan_update_abs_cap': scan_update_abs_cap,
-        'tau_offset_init': tcfg.get(
-            'tau_offset_init', cfg['model'].get('tau_offset_init', -0.5)),
-        'tau_offset_init_attn': tcfg.get(
-            'tau_offset_init_attn', cfg['model'].get('tau_offset_init_attn', None)),
-        'tau_offset_init_attn_qk': tcfg.get(
-            'tau_offset_init_attn_qk', cfg['model'].get('tau_offset_init_attn_qk', None)),
-        'tau_offset_init_attn_v': tcfg.get(
-            'tau_offset_init_attn_v', cfg['model'].get('tau_offset_init_attn_v', None)),
-        'tau_offset_init_rst': tcfg.get(
-            'tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', None)),
-        'legacy_count_init_attn_qk': tcfg.get(
-            'legacy_count_init_attn_qk',
-            cfg['model'].get('legacy_count_init_attn_qk', None)),
-        'legacy_count_init_attn_v': tcfg.get(
-            'legacy_count_init_attn_v',
-            cfg['model'].get('legacy_count_init_attn_v', None)),
-        'legacy_count_init_rst': tcfg.get(
-            'legacy_count_init_rst',
-            cfg['model'].get('legacy_count_init_rst', None)),
         'tau_init_attn_qk': tcfg.get(
             'tau_init_attn_qk',
             cfg['model'].get('tau_init_attn_qk', None)),
@@ -11216,15 +9265,10 @@ def main():
                 'rpe_start_frac',
                 'rpe_full_frac',
                 'rpe_schedule',
-                'soft_gate_enabled',
-                'soft_gate_t_pool_specific',
-                'soft_gate_boundary_power_enabled',
-                'regular_diagnostics_level',
+                                                                'regular_diagnostics_level',
                 'regular_current_eps',
                 'regular_projected_eps',
-                'regular_mass_enabled',
-                'regular_sparsity_enabled',
-                'dead_penalty_weighted_clip'):
+                                                'dead_penalty_weighted_clip'):
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
     cfg.setdefault('training', {}).update(training_config)
@@ -11314,30 +9358,8 @@ def main():
     )
     params = variables['params']
 
-    def _print_v4159_tau_bias(label, p):
-        if not is_host0 or cfg['model'].get('model_version') != 'spatial-r1-v4.1.5.9':
-            return
-        tau_attn_node = p['router'].get('tau_attn', p['router'].get('raw_tau_attn'))
-        tau_rst_node = p['router'].get('tau_rst', p['router'].get('raw_tau_rst'))
-        tau_attn_bias = np.asarray(tau_attn_node['bias'])
-        tau_rst_bias = np.asarray(tau_rst_node['bias'])
-        print(
-            f"  v4159 {label} tau bias: "
-            f"attn=[Q={tau_attn_bias[0]:.6g}, K={tau_attn_bias[1]:.6g}, V={tau_attn_bias[2]:.6g}] "
-            f"rst={tau_rst_bias.tolist()} "
-            f"(config tau_offset_init="
-            f"{tcfg.get('tau_offset_init', cfg['model'].get('tau_offset_init', -0.5))} "
-            f"attn={tcfg.get('tau_offset_init_attn', cfg['model'].get('tau_offset_init_attn', 'default'))} "
-            f"attn_qk={tcfg.get('tau_offset_init_attn_qk', cfg['model'].get('tau_offset_init_attn_qk', 'default'))} "
-            f"attn_v={tcfg.get('tau_offset_init_attn_v', cfg['model'].get('tau_offset_init_attn_v', 'default'))} "
-            f"rst={tcfg.get('tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', 'default'))})",
-            flush=True,
-        )
-
     if is_host0:
         print("=== model.init done ===", flush=True)
-        _print_v4159_tau_bias("init", params)
-
         n_params = count_parameters(params)
         print(f"\nModel parameters: {n_params:,}")
         for line in model.get_model_info():
@@ -11374,11 +9396,8 @@ def main():
     # two masked add_decayed_weights (base + pool -masks are disjoint so
     # each param is touched at most once), then a single scale_by_lr.
 
-    _MODEL_VERSION = cfg['model'].get('model_version', 'dawn_srw')
-    _FORWARD_UNIT_RW_VERSIONS = {
-        'spatial-r1-v4.1.5.2',
-        'spatial-r1-v4.1.5.6',
-    }
+    _MODEL_VERSION = OFFICIAL_MODEL_VERSION
+    _FORWARD_UNIT_RW_VERSIONS = set()
 
     _POOL_PARAM_NAMES = (
         'attn_qk_emb', 'attn_v_emb', 'rst_emb',
@@ -11633,7 +9652,7 @@ def main():
                         f"admission_den_grad_scale={admission_den_grad_scale}")
             else:
                 print("  Soft gate:")
-            print(f"    pool_specific={soft_gate_t_pool_specific} "
+            print(f"    pool_specific={pool_specific_gate_t} "
                   f"effective_active_eps={soft_gate_effective_active_eps}")
             _scale_label = (
                 'B'
@@ -11650,7 +9669,7 @@ def main():
                     f"sharpen_end_frac={_cfg['sharpen_end_frac']} "
                     f"formation_power={_cfg['formation_power']} "
                     f"sharpen_power={_cfg['sharpen_power']}")
-            if soft_gate_t_pool_specific:
+            if pool_specific_gate_t:
                 for _pool in POOL_SCHEDULE_NAMES:
                     _cfg = soft_gate_pool_schedules[_pool]
                     _schedule_name = str(_cfg['schedule']).lower()
@@ -11691,7 +9710,7 @@ def main():
                   "tau_ce_grad_scale=removed")
             if ignored_tau_ce_grad_scale_keys:
                 print("  tau_ce_grad_scale config fields are ignored in "
-                      "v4162+; tau movement is controlled by tau_lr_mult.")
+                      "v4164; tau movement is controlled by tau_lr_mult.")
             if rpe_enabled:
                 print("  RPE schedule:")
                 print(f"    start_frac={rpe_start_frac} full_frac={rpe_full_frac} "
@@ -11820,7 +9839,7 @@ def main():
         _tau_init_summary_json = None
         if is_host0:
             calibration_input_ids, _ = next(iter(train_loader))
-            tau_init_summary = _compute_v4162_quantile_tau_init(
+            tau_init_summary = _compute_v4164_quantile_tau_init(
                 params, calibration_input_ids, cfg, tau_init_cfg)
             _tau_init_summary_json = json.dumps(tau_init_summary)
         _tau_init_summary_json = _broadcast_str_from_host0(
@@ -11829,13 +9848,12 @@ def main():
             raise RuntimeError(
                 "Failed to broadcast quantile tau initialization summary.")
         tau_init_summary = json.loads(_tau_init_summary_json)
-        params = _set_v4162_quantile_tau_biases(params, tau_init_summary)
+        params = _set_v4164_quantile_tau_biases(params, tau_init_summary)
         if is_host0:
             print("\n=== Quantile tau initialization ===", flush=True)
-            for _line in _v4162_tau_init_summary_lines(tau_init_summary):
+            for _line in _v4164_tau_init_summary_lines(tau_init_summary):
                 print(_line, flush=True)
 
-    _print_v4159_tau_bias("effective pre-shard", params)
 
     # Fail-fast check: global_step must match across hosts after resume.
     # broadcast handles the common path but we still verify -if it ever
@@ -11867,7 +9885,7 @@ def main():
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
-    model_version = cfg['model'].get('model_version', 'dawn_srw')
+    model_version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     is_baseline = model_version == 'baseline'
     is_spatial = model_version in (
         'spatial-r1-v3.9.4',
@@ -12100,7 +10118,7 @@ def main():
         tau_update_abs_cap=tau_update_abs_cap,
         scan_update_abs_cap=scan_update_abs_cap,
         total_training_steps=total_steps,
-        soft_gate_enabled=soft_gate_enabled,
+        soft_gate_schedule_active=soft_gate_schedule_active,
         soft_gate_t_start=soft_gate_t_start,
         soft_gate_t_final=soft_gate_t_final,
         soft_gate_t_hold_frac=soft_gate_t_hold_frac,
@@ -12109,9 +10127,9 @@ def main():
         soft_gate_t_power=soft_gate_t_power,
         soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
         soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
-        soft_gate_t_pool_specific=soft_gate_t_pool_specific,
+        pool_specific_gate_t=pool_specific_gate_t,
         soft_gate_pool_schedules=soft_gate_pool_schedules,
-        soft_gate_boundary_power_enabled=soft_gate_boundary_power_enabled,
+        boundary_power_schedule_active=boundary_power_schedule_active,
         soft_gate_boundary_power_start=soft_gate_boundary_power_start,
         soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
@@ -12132,7 +10150,7 @@ def main():
     eval_step_fn = create_eval_step(
         model, sharded_fns=_sharded_fns, return_dead_stats=True,
         total_training_steps=total_steps,
-        soft_gate_enabled=soft_gate_enabled,
+        soft_gate_schedule_active=soft_gate_schedule_active,
         soft_gate_t_start=soft_gate_t_start,
         soft_gate_t_final=soft_gate_t_final,
         soft_gate_t_hold_frac=soft_gate_t_hold_frac,
@@ -12141,9 +10159,9 @@ def main():
         soft_gate_t_power=soft_gate_t_power,
         soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
         soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
-        soft_gate_t_pool_specific=soft_gate_t_pool_specific,
+        pool_specific_gate_t=pool_specific_gate_t,
         soft_gate_pool_schedules=soft_gate_pool_schedules,
-        soft_gate_boundary_power_enabled=soft_gate_boundary_power_enabled,
+        boundary_power_schedule_active=boundary_power_schedule_active,
         soft_gate_boundary_power_start=soft_gate_boundary_power_start,
         soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
@@ -12159,7 +10177,7 @@ def main():
                 model, sharded_fns=_sharded_fns, return_dead_stats=True,
                 return_prune_stats=True, execution_prune_eps=_eps_f,
                 total_training_steps=total_steps,
-                soft_gate_enabled=soft_gate_enabled,
+                soft_gate_schedule_active=soft_gate_schedule_active,
                 soft_gate_t_start=soft_gate_t_start,
                 soft_gate_t_final=soft_gate_t_final,
                 soft_gate_t_hold_frac=soft_gate_t_hold_frac,
@@ -12168,9 +10186,9 @@ def main():
                 soft_gate_t_power=soft_gate_t_power,
                 soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
                 soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
-                soft_gate_t_pool_specific=soft_gate_t_pool_specific,
+                pool_specific_gate_t=pool_specific_gate_t,
                 soft_gate_pool_schedules=soft_gate_pool_schedules,
-                soft_gate_boundary_power_enabled=soft_gate_boundary_power_enabled,
+                boundary_power_schedule_active=boundary_power_schedule_active,
                 soft_gate_boundary_power_start=soft_gate_boundary_power_start,
                 soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
                 soft_gate_boundary_power_final=soft_gate_boundary_power_final,
@@ -12185,7 +10203,7 @@ def main():
         analysis_step_fn = create_analysis_step(
             model, sharded_fns=_sharded_fns_analysis,
             total_training_steps=total_steps,
-            soft_gate_enabled=soft_gate_enabled,
+            soft_gate_schedule_active=soft_gate_schedule_active,
             soft_gate_t_start=soft_gate_t_start,
             soft_gate_t_final=soft_gate_t_final,
             soft_gate_t_hold_frac=soft_gate_t_hold_frac,
@@ -12194,9 +10212,9 @@ def main():
             soft_gate_t_power=soft_gate_t_power,
             soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
             soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
-            soft_gate_t_pool_specific=soft_gate_t_pool_specific,
+            pool_specific_gate_t=pool_specific_gate_t,
             soft_gate_pool_schedules=soft_gate_pool_schedules,
-            soft_gate_boundary_power_enabled=soft_gate_boundary_power_enabled,
+            boundary_power_schedule_active=boundary_power_schedule_active,
             soft_gate_boundary_power_start=soft_gate_boundary_power_start,
             soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
             soft_gate_boundary_power_final=soft_gate_boundary_power_final,
@@ -13117,16 +11135,13 @@ def main():
                             regular_console_drive_max_warn,
                         'regular_console_logging_overhead_warn':
                             regular_console_logging_overhead_warn,
-                        'regular_sparsity_enabled': regular_sparsity_enabled,
-                        'rpe_enabled': bool(rpe_enabled),
+                                        'rpe_enabled': bool(rpe_enabled),
                         'soft_gate_schedule': soft_gate_schedule,
                         'soft_gate_t_power': soft_gate_t_power,
                         'soft_gate_t_gompertz_center':
                             soft_gate_t_gompertz_center,
                         'soft_gate_t_gompertz_steepness':
                             soft_gate_t_gompertz_steepness,
-                        'soft_gate_boundary_power_enabled':
-                            soft_gate_boundary_power_enabled,
                         'soft_gate_boundary_power_start':
                             soft_gate_boundary_power_start,
                         'soft_gate_boundary_power_mid':
@@ -13156,7 +11171,6 @@ def main():
                             if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                             else 0),
                     }
-                    ctx.update(collapse_warn_ctx)
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
                     rec = _attach_update_cap_window_stats(
                         rec, jax.device_get(_regular_cap_window_jax))
@@ -13256,16 +11270,13 @@ def main():
                         regular_console_drive_max_warn,
                     'regular_console_logging_overhead_warn':
                         regular_console_logging_overhead_warn,
-                    'regular_sparsity_enabled': regular_sparsity_enabled,
-                    'rpe_enabled': bool(rpe_enabled),
+                                'rpe_enabled': bool(rpe_enabled),
                     'soft_gate_schedule': soft_gate_schedule,
                     'soft_gate_t_power': soft_gate_t_power,
                     'soft_gate_t_gompertz_center':
                         soft_gate_t_gompertz_center,
                     'soft_gate_t_gompertz_steepness':
                         soft_gate_t_gompertz_steepness,
-                    'soft_gate_boundary_power_enabled':
-                        soft_gate_boundary_power_enabled,
                     'soft_gate_boundary_power_start':
                         soft_gate_boundary_power_start,
                     'soft_gate_boundary_power_mid':
@@ -13295,7 +11306,6 @@ def main():
                         if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
                         else 0),
                 }
-                debug_ctx.update(collapse_warn_ctx)
                 debug_metrics = jax.device_get(metrics)
                 debug_rec = _build_regular_record(
                     debug_metrics, debug_avgs, debug_ctx, global_step, epoch)
@@ -13408,7 +11418,6 @@ def main():
                                 'current_lr': float(schedule(global_step // grad_accum_steps)),
                                 'model_version': model_version,
                             }
-                            _ctx_a.update(collapse_warn_ctx)
                             analysis_payload = dict(analysis_result)
                             if _latest_val_dead_step == global_step \
                                     and _latest_val_dead_stats is not None:
