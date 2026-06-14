@@ -46,6 +46,11 @@ training:
   route_emb_lr_mult: 1.0
   route_emb_grad_clip: 2.0
 
+  diversity_weight: 0.0
+  load_balance_weight: 0.0
+  dead_penalty_weight: 0.0
+  dead_exposure_target: 0.0
+
   soft_gate_effective_active_eps: 1.0e-06
   admission_den_power: 0.5
   admission_den_grad_scale: 1.0
