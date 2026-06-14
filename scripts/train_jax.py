@@ -47,7 +47,6 @@ import argparse
 import yaml
 import numpy as np
 from datetime import datetime
-from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -66,14 +65,9 @@ from models.dawn_srw_v4164 import (
 # ============================================================
 
 # Log cadence is config-driven: see log_interval / log_analysis_multiplier
-# in `training:`. The legacy module-level LOG_INTERVAL constant was removed.
+# in `training:`.
 
 OFFICIAL_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
-SRW_ACTIVE_MODEL_VERSIONS = (OFFICIAL_MODEL_VERSION,)
-DIRECT_TAU_SPLIT_MODEL_VERSIONS = (OFFICIAL_MODEL_VERSION,)
-SOFT_DIRECT_TAU_MODEL_VERSIONS = (OFFICIAL_MODEL_VERSION,)
-ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS = (OFFICIAL_MODEL_VERSION,)
-UNIFIED_ROUTE_DEN_MODEL_VERSIONS = (OFFICIAL_MODEL_VERSION,)
 
 DIRECT_TAU_SELECT_METRIC_NAMES = (
     'rho_mean', 'rho_std', 'rho_max',
@@ -310,38 +304,6 @@ def _format_update_cap_window_line(rec, indent="  ", is_v4160=False):
     )
 
 
-def _collapse_warn_context(tcfg):
-    return {
-        'max_intensity': float(tcfg.get('max_intensity', 10.0)),
-        'rw_contrib_den_floor': float(tcfg.get('rw_contrib_den_floor', 1.0)),
-        'collapse_warn_compose_norm_threshold': float(
-            tcfg.get('collapse_warn_compose_norm_threshold', 1.2)),
-        'collapse_warn_top1_threshold': float(
-            tcfg.get('collapse_warn_top1_threshold', 0.999)),
-        'collapse_warn_low_den_floor_frac_threshold': float(
-            tcfg.get('collapse_warn_low_den_floor_frac_threshold', 0.001)),
-        # Disabled by default because scaled-pool/output ratios are model-size
-        # dependent; set >0 in config to enable the warning.
-        'collapse_warn_scaled_out_threshold': float(
-            tcfg.get('collapse_warn_scaled_out_threshold', 0.0)),
-        'collapse_warn_dead_count_threshold': float(
-            tcfg.get('collapse_warn_dead_count_threshold', 100.0)),
-        'collapse_warn_dead_raw_threshold': float(
-            tcfg.get('collapse_warn_dead_raw_threshold', 0.0)),
-        'collapse_warn_dead_weighted_threshold': float(
-            tcfg.get('collapse_warn_dead_weighted_threshold', 0.0)),
-        'collapse_warn_dead_frac_threshold': float(
-            tcfg.get('collapse_warn_dead_frac_threshold', 0.0)),
-        'collapse_warn_weak_frac_threshold': float(
-            tcfg.get('collapse_warn_weak_frac_threshold', 0.0)),
-    }
-
-
-
-# ============================================================
-# Seed
-# ============================================================
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -441,40 +403,7 @@ def load_config(config_path):
 # Model Registry
 # ============================================================
 
-@dataclass
-class ModelSpec:
-    """Registered model entry.
-
-    - build_kwargs: cfg -> kwargs dict for the model constructor.
-    - sharded_kwargs: cfg -> extra kwargs for make_sharded_srw /
-      make_sharded_srw_paired (v4.1 closure constants live here).
-    - force_sharded: require shard_map path even when mesh_model==1
-      (v4.1 removed non-sharded fallback).
-    """
-    name: str
-    module_path: str
-    cls: Any
-    build_kwargs: Callable[[dict], dict]
-    supports_sharded: bool = False
-    force_sharded: bool = False
-    sharded_kwargs: Optional[Callable[[dict], dict]] = None
-
-
-def _baseline_kwargs(cfg):
-    m = cfg['model']
-    return dict(
-        vocab_size=m.get('vocab_size', 30522),
-        d_model=m.get('d_model', 384),
-        d_ff=m.get('d_ff', 1536),
-        n_layers=m.get('n_layers', 12),
-        n_heads=m.get('n_heads', 6),
-        max_seq_len=m.get('max_seq_len', 512),
-        dropout_rate=m.get('dropout', 0.1),
-        gradient_checkpointing=m.get('gradient_checkpointing', False),
-    )
-
-
-def _dawn_shared_kwargs(cfg):
+def _v4164_base_kwargs(cfg):
     """Init kwargs shared by active DAWN variants."""
     m = cfg['model']
     t = cfg['training']
@@ -497,9 +426,9 @@ def _dawn_shared_kwargs(cfg):
     )
 
 
-def _dawn_v4152_kwargs(cfg):
+def _v4164_model_base_kwargs(cfg):
     """v4.1.5.2 active path: d_route-only routing."""
-    kw = _dawn_shared_kwargs(cfg)
+    kw = _v4164_base_kwargs(cfg)
     m = cfg['model']
     d_route = m.get('d_route')
     if d_route is None:
@@ -581,7 +510,7 @@ def _v4164_tau_init_config(cfg):
 
 def _dawn_srw_kwargs(cfg):
     """Official v4.1.6.4 DAWN-SRW constructor kwargs."""
-    kw = _dawn_v4152_kwargs(cfg)
+    kw = _v4164_model_base_kwargs(cfg)
     m = cfg['model']
     t = cfg['training']
     if 'n_rst' not in m and 'n_know' not in m:
@@ -620,17 +549,6 @@ def _v4164_sharded_kwargs(cfg):
     )
 
 
-MODEL_REGISTRY = {
-    OFFICIAL_MODEL_VERSION: ModelSpec(
-        name=OFFICIAL_MODEL_VERSION,
-        module_path='models.dawn_srw_v4164',
-        cls=DAWN_SRW_V4164,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v4164_sharded_kwargs,
-    ),
-}
 
 
 def build_model_from_config(cfg):
@@ -640,11 +558,9 @@ def build_model_from_config(cfg):
         raise ValueError(
             f"scripts/train_jax.py is the official {OFFICIAL_MODEL_VERSION} "
             f"trainer; got model_version={version!r}.")
-    spec = MODEL_REGISTRY[OFFICIAL_MODEL_VERSION]
-    kwargs = spec.build_kwargs(cfg)
+    kwargs = _dawn_srw_kwargs(cfg)
     print(f"route dims: d_route={kwargs['d_route']}")
-    return spec.cls(**kwargs)
-
+    return DAWN_SRW_V4164(**kwargs)
 
 def _compute_v4164_quantile_tau_init(params, input_ids, cfg,
                                      tau_init_cfg):
@@ -1737,9 +1653,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       cb1a_ce_mode='sigmoid_z',
                       cb1a_eps=1.0e-8,
                       dead_penalty_weighted_clip=0.0,
-                      removed_margin_reg_weight_qk=0.0,
-                      removed_margin_reg_weight_v=0.0,
-                      removed_margin_reg_weight_rst=0.0,
                       global_grad_clip=0.0,
                       tau_lr_mult=1.0,
                       tau_grad_clip=0.0,
@@ -1896,9 +1809,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             "expected 'sigmoid_z'.")
     _cb1a_eps = jnp.float32(cb1a_eps)
     _dead_weighted_clip = jnp.float32(dead_penalty_weighted_clip)
-    _removed_margin_reg_weight_qk = jnp.float32(removed_margin_reg_weight_qk)
-    _removed_margin_reg_weight_v = jnp.float32(removed_margin_reg_weight_v)
-    _removed_margin_reg_weight_rst = jnp.float32(removed_margin_reg_weight_rst)
     _global_grad_clip = jnp.float32(global_grad_clip)
     _tau_lr_mult = jnp.float32(tau_lr_mult)
     _tau_grad_clip = jnp.float32(tau_grad_clip)
@@ -1921,22 +1831,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
-    _is_soft_direct_tau = str(_model_version) in SOFT_DIRECT_TAU_MODEL_VERSIONS
+    _is_soft_direct_tau = str(_model_version) == OFFICIAL_MODEL_VERSION
     _is_boundary_power_model = (
-        str(_model_version) in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
+        str(_model_version) == OFFICIAL_MODEL_VERSION)
     if _is_soft_direct_tau:
         # v4164 soft DirectTau paths keep the loss surface
-        # auditable: CE + scheduled RPE only. All hard-boundary dead repair,
-        # CB1A/boundary auxiliaries, and removed legacy margin auxiliaries are
-        # disabled here without affecting v4160/v4161.
+        # auditable: CE + scheduled RPE only. Hard-boundary dead repair
+        # and CB1A/boundary auxiliaries are disabled for v4164.
         _cb1a_enabled = False
         _dead_penalty_qk_weight = jnp.float32(0.0)
         _dead_penalty_v_weight = jnp.float32(0.0)
         _dead_penalty_rst_weight = jnp.float32(0.0)
         _dead_weighted_clip = jnp.float32(0.0)
-        _removed_margin_reg_weight_qk = jnp.float32(0.0)
-        _removed_margin_reg_weight_v = jnp.float32(0.0)
-        _removed_margin_reg_weight_rst = jnp.float32(0.0)
         _explore_norm_by_layers = True
         _explore_norm_by_layers_f = jnp.float32(1.0)
     # v4.1.6.1 now runs CB1A together with the bounded
@@ -2093,22 +1999,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 dead_penalty = dead_penalty_unweighted
                 dead_penalty_weighted_unclipped = (
                     jnp.float32(dead_penalty_weight) * dead_penalty)
-            removed_margin_reg_raw_qk = result.get(
-                'removed_margin_reg_qk', jnp.float32(0.0))
-            removed_margin_reg_raw_v = result.get(
-                'removed_margin_reg_v', jnp.float32(0.0))
-            removed_margin_reg_raw_rst = result.get(
-                'removed_margin_reg_rst', jnp.float32(0.0))
-            removed_margin_reg_weighted_qk = (
-                _removed_margin_reg_weight_qk * removed_margin_reg_raw_qk)
-            removed_margin_reg_weighted_v = (
-                _removed_margin_reg_weight_v * removed_margin_reg_raw_v)
-            removed_margin_reg_weighted_rst = (
-                _removed_margin_reg_weight_rst * removed_margin_reg_raw_rst)
-            removed_margin_reg_loss = (
-                removed_margin_reg_weighted_qk
-                + removed_margin_reg_weighted_v
-                + removed_margin_reg_weighted_rst)
             # v4.1 batch-global-mean exploration loss.
             per_token_ce = result.get('per_token_ce', None)
             attn_tau_off = result.get('attn_tau_direct', result.get('attn_tau_offset', None))
@@ -2508,8 +2398,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + div_weight * div_loss
                               + dead_penalty_weighted
                               + explore_loss_weighted
-                              + cb1a_loss_weighted
-                              + removed_margin_reg_loss)
+                              + cb1a_loss_weighted)
             else:
                 orth_loss = compute_orthogonality_loss(
                     params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
@@ -2521,8 +2410,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + div_weight * div_loss
                               + dead_penalty_weighted
                               + explore_loss_weighted
-                              + cb1a_loss_weighted
-                              + removed_margin_reg_loss)
+                              + cb1a_loss_weighted)
 
             explore_stats = dict(
                 global_mean_ce=global_mean_ce,
@@ -2586,16 +2474,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 dead_penalty_rst_weight=_dead_penalty_rst_weight,
                 dead_penalty_weighted_unclipped=dead_penalty_weighted_unclipped,
                 dead_penalty_weighted_clipped=dead_penalty_weighted,
-                removed_margin_reg_raw_qk=removed_margin_reg_raw_qk,
-                removed_margin_reg_raw_v=removed_margin_reg_raw_v,
-                removed_margin_reg_raw_rst=removed_margin_reg_raw_rst,
-                removed_margin_reg_weight_qk=_removed_margin_reg_weight_qk,
-                removed_margin_reg_weight_v=_removed_margin_reg_weight_v,
-                removed_margin_reg_weight_rst=_removed_margin_reg_weight_rst,
-                removed_margin_reg_weighted_qk=removed_margin_reg_weighted_qk,
-                removed_margin_reg_weighted_v=removed_margin_reg_weighted_v,
-                removed_margin_reg_weighted_rst=removed_margin_reg_weighted_rst,
-                removed_margin_reg_weighted_total=removed_margin_reg_loss,
                 exploration_layer_norm_enabled=_explore_norm_by_layers_f,
                 exploration_layer_count=explore_layer_count,
                 exploration_norm=explore_norm,
@@ -3290,8 +3168,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         cb1a_weighted_metric = explore_stats['cb1a_weighted']
         dead_penalty_weighted_metric = explore_stats['dead_penalty_weighted_clipped']
         dead_penalty_weighted_unclipped_metric = explore_stats['dead_penalty_weighted_unclipped']
-        removed_margin_reg_weighted_total_metric = explore_stats[
-            'removed_margin_reg_weighted_total']
 
         if _is_soft_direct_tau:
             aux_loss_weighted_metric = jnp.float32(0.0)
@@ -3302,7 +3178,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             cb1a_weighted_metric = jnp.float32(0.0)
             dead_penalty_weighted_metric = jnp.float32(0.0)
             dead_penalty_weighted_unclipped_metric = jnp.float32(0.0)
-            removed_margin_reg_weighted_total_metric = jnp.float32(0.0)
         else:
             aux_loss_weighted_metric = lb_weight * aux_loss
             load_balance_loss_weighted_metric = lb_weight * aux_loss
@@ -3318,8 +3193,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             + diversity_loss_weighted_metric
             + dead_penalty_weighted_metric
             + explore_loss_weighted_metric
-            + cb1a_weighted_metric
-            + removed_margin_reg_weighted_total_metric)
+            + cb1a_weighted_metric)
         metrics = {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
@@ -3342,26 +3216,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'dead_penalty_qk_weight': explore_stats['dead_penalty_qk_weight'],
             'dead_penalty_v_weight': explore_stats['dead_penalty_v_weight'],
             'dead_penalty_rst_weight': explore_stats['dead_penalty_rst_weight'],
-            'removed_margin_reg_raw_qk': explore_stats[
-                'removed_margin_reg_raw_qk'],
-            'removed_margin_reg_raw_v': explore_stats[
-                'removed_margin_reg_raw_v'],
-            'removed_margin_reg_raw_rst': explore_stats[
-                'removed_margin_reg_raw_rst'],
-            'removed_margin_reg_weight_qk': explore_stats[
-                'removed_margin_reg_weight_qk'],
-            'removed_margin_reg_weight_v': explore_stats[
-                'removed_margin_reg_weight_v'],
-            'removed_margin_reg_weight_rst': explore_stats[
-                'removed_margin_reg_weight_rst'],
-            'removed_margin_reg_weighted_qk': explore_stats[
-                'removed_margin_reg_weighted_qk'],
-            'removed_margin_reg_weighted_v': explore_stats[
-                'removed_margin_reg_weighted_v'],
-            'removed_margin_reg_weighted_rst': explore_stats[
-                'removed_margin_reg_weighted_rst'],
-            'removed_margin_reg_weighted_total': (
-                removed_margin_reg_weighted_total_metric),
             'attn_qk_dead_penalty': result.get(
                 'attn_qk_dead_penalty', jnp.float32(0.0)),
             'attn_v_dead_penalty': result.get(
@@ -4100,10 +3954,10 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        in SOFT_DIRECT_TAU_MODEL_VERSIONS)
+        == OFFICIAL_MODEL_VERSION)
     _is_boundary_power_model = (
         getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
+        == OFFICIAL_MODEL_VERSION)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -4254,10 +4108,10 @@ def create_analysis_step(model, sharded_fns=None,
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
         and getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        in SOFT_DIRECT_TAU_MODEL_VERSIONS)
+        == OFFICIAL_MODEL_VERSION)
     _is_boundary_power_model = (
         getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS)
+        == OFFICIAL_MODEL_VERSION)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -5324,7 +5178,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             return []
 
     is_v415 = ctx.get('model_version') in (
-        'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS)
+        OFFICIAL_MODEL_VERSION)
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -5406,26 +5260,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'dead_penalty_weighted_total',
             ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)))),
         'dead_count_total': float(m.get('dead_count_total', 0.0)),
-        'removed_margin_reg_raw_qk': float(m.get(
-            'removed_margin_reg_raw_qk', 0.0)),
-        'removed_margin_reg_raw_v': float(m.get(
-            'removed_margin_reg_raw_v', 0.0)),
-        'removed_margin_reg_raw_rst': float(m.get(
-            'removed_margin_reg_raw_rst', 0.0)),
-        'removed_margin_reg_weight_qk': float(m.get(
-            'removed_margin_reg_weight_qk', 0.0)),
-        'removed_margin_reg_weight_v': float(m.get(
-            'removed_margin_reg_weight_v', 0.0)),
-        'removed_margin_reg_weight_rst': float(m.get(
-            'removed_margin_reg_weight_rst', 0.0)),
-        'removed_margin_reg_weighted_qk': float(m.get(
-            'removed_margin_reg_weighted_qk', 0.0)),
-        'removed_margin_reg_weighted_v': float(m.get(
-            'removed_margin_reg_weighted_v', 0.0)),
-        'removed_margin_reg_weighted_rst': float(m.get(
-            'removed_margin_reg_weighted_rst', 0.0)),
-        'removed_margin_reg_weighted_total': float(m.get(
-            'removed_margin_reg_weighted_total', 0.0)),
         'dead_penalty_per_dead': float(m.get('dead_penalty_per_dead', 0.0)),
         'attn_dead_penalty_per_dead': float(m.get(
             'attn_dead_penalty_per_dead', 0.0)),
@@ -6254,12 +6088,9 @@ def _print_cb1a_regular_block(rec):
 
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
-    is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
-    is_v4162_soft = ctx.get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS
-    is_v4162_compact = (
-        is_v4162_soft
-        and str(ctx.get('regular_diagnostics_level', 'compact')).lower()
-        == 'compact')
+    is_v4160 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
+    is_v4162_soft = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
+    is_v4162_compact = False
     aux_note = (
         " aux_is_not_total_minus_ce"
         if is_v4162_soft
@@ -6273,10 +6104,6 @@ def _print_regular_block(rec, ctx):
     )
     if is_v4160:
         if is_v4162_soft:
-            if (ctx.get('model_version') not in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-                    and bool(ctx.get('regular_sparsity_metrics_active', True))):
-                _print_v4162_sparsity_block(
-                    rec, ctx.get('regular_diagnostics_level', 'compact'))
             log_message(
                 f"  strong: q={rec['attn_q_strong']*100:.1f}%"
                 f" k={rec['attn_k_strong']*100:.1f}%"
@@ -6285,12 +6112,12 @@ def _print_regular_block(rec, ctx):
             )
             _soft_gate_label = (
                 'soft_gate_B'
-                if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
+                if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
                 else 'soft_gate_T')
             _power_part = (
                 f" boundary_power_p={rec.get('boundary_power_p', 2.0):.3f}"
                 f" admission_den_power={rec.get('admission_den_power', rec.get('den_power', 1.0)):.3f}"
-                if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
+                if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
                 else "")
             log_message(
                 f"  {_soft_gate_label}: qk={rec['soft_gate_T_qk']:.6f}"
@@ -6336,12 +6163,12 @@ def _print_regular_block(rec, ctx):
     elif is_v4160:
         _weight_label = (
             'admission'
-            if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+            if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
             else ('soft_weight' if is_v4162_soft else 'pos'))
         _select_status = ""
         if (is_v4162_soft
-                and ctx.get('model_version') not in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
-                and ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS):
+                and ctx.get('model_version') != OFFICIAL_MODEL_VERSION
+                and ctx.get('model_version') == OFFICIAL_MODEL_VERSION):
             _select_status = (
                 f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
                 f" v={rec['attn_v_selected_frac']*100:.1f}%"
@@ -6369,17 +6196,6 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['rst_positive_margin_mean']:.4f}]"
             f"{_select_status}"
         )
-        if not is_v4162_soft:
-            log_message(
-                f"  removed_margin_reg: "
-                f"raw[qk={rec['removed_margin_reg_raw_qk']:.6f}"
-                f" v={rec['removed_margin_reg_raw_v']:.6f}"
-                f" rst={rec['removed_margin_reg_raw_rst']:.6f}]"
-                f" weighted[qk={rec['removed_margin_reg_weighted_qk']:.6f}"
-                f" v={rec['removed_margin_reg_weighted_v']:.6f}"
-                f" rst={rec['removed_margin_reg_weighted_rst']:.6f}"
-                f" total={rec['removed_margin_reg_weighted_total']:.6f}]"
-            )
     if is_v4160 and not is_v4162_soft:
         log_message(
             f"  gate_max[qk={rec['attn_qk_raw_gate_max']:.1f}"
@@ -6404,7 +6220,7 @@ def _print_regular_block(rec, ctx):
             f" attn_v={rec['drift_attn_v_emb']:.2e}"
             f" rst={rec['drift_rst_emb']:.2e}]"
         )
-    if ctx.get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS:
+    if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
         pass
     elif ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_message(
@@ -6446,7 +6262,7 @@ def _print_regular_block(rec, ctx):
                 f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
                 f" v={rec['attn_v_pool_scale']:.3f}"
                 f" rst={rec['rst_pool_scale']:.3f}")
-        if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+        if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
             log_message(
                 f"  drive: "
                 f"qk[m={rec['attn_qk_drive_mean']:.5f}"
@@ -6500,9 +6316,9 @@ def _print_regular_block(rec, ctx):
             f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
         )
     if ctx.get('model_version') in (
-            'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
+            OFFICIAL_MODEL_VERSION):
         if is_v4160:
-            if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+            if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
                 pass
             else:
                 log_message(
@@ -6758,170 +6574,6 @@ def _print_regular_block(rec, ctx):
     )
 
 
-def _dead_trigger_info(rec, ctx=None):
-    ctx = ctx or {}
-
-    def _g(key, default=0.0):
-        return float(rec.get(key, default) or 0.0)
-
-    is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
-    if is_v4160:
-        qk_count = _g('attn_qk_dead_count')
-        v_count = _g('attn_v_dead_count')
-        rst_count = _g('rst_dead_count')
-        qk_dead_frac = _g('attn_qk_dead_exposure_frac')
-        v_dead_frac = _g('attn_v_dead_exposure_frac')
-        rst_dead_frac = _g('rst_dead_exposure_frac')
-        qk_weak_frac = _g('attn_qk_weak_exposure_frac')
-        v_weak_frac = _g('attn_v_weak_exposure_frac')
-        rst_weak_frac = _g('rst_weak_exposure_frac')
-    else:
-        qk_count = _g('attn_dead_count')
-        v_count = 0.0
-        rst_count = _g('rst_dead_count')
-        qk_dead_frac = _g('attn_dead_exposure_frac')
-        v_dead_frac = 0.0
-        rst_dead_frac = _g('rst_dead_exposure_frac')
-        qk_weak_frac = _g('attn_weak_exposure_frac')
-        v_weak_frac = 0.0
-        rst_weak_frac = _g('rst_weak_exposure_frac')
-
-    total_count = _g('dead_count_total', qk_count + v_count + rst_count)
-    dead_raw = _g('dead_penalty_raw_total', _g('dead_penalty'))
-    dead_w = _g('dead_penalty_weighted_total', _g('dead_penalty_weighted'))
-    max_dead_frac = max(qk_dead_frac, v_dead_frac, rst_dead_frac)
-    max_weak_frac = max(qk_weak_frac, v_weak_frac, rst_weak_frac)
-
-    checks = []
-    count_threshold = float(ctx.get('collapse_warn_dead_count_threshold', 100.0))
-    if count_threshold > 0.0:
-        checks.append(('dead_count', total_count, count_threshold))
-    raw_threshold = float(ctx.get('collapse_warn_dead_raw_threshold', 0.0))
-    if raw_threshold > 0.0:
-        checks.append(('raw_dead_sum', dead_raw, raw_threshold))
-    weighted_threshold = float(ctx.get('collapse_warn_dead_weighted_threshold', 0.0))
-    if weighted_threshold > 0.0:
-        checks.append(('dead_weighted', dead_w, weighted_threshold))
-    dead_frac_threshold = float(ctx.get('collapse_warn_dead_frac_threshold', 0.0))
-    if dead_frac_threshold > 0.0:
-        checks.append(('dead_frac', max_dead_frac, dead_frac_threshold))
-    weak_frac_threshold = float(ctx.get('collapse_warn_weak_frac_threshold', 0.0))
-    if weak_frac_threshold > 0.0:
-        checks.append(('weak_frac', max_weak_frac, weak_frac_threshold))
-
-    fired = [(name, value, threshold)
-             for name, value, threshold in checks if value > threshold]
-    return {
-        'triggered': bool(fired),
-        'trigger_reason': '+'.join(name for name, _, _ in fired) if fired else 'none',
-        'threshold_used': '+'.join(
-            f'{name}>{threshold:g}' for name, _, threshold in fired) if fired else 'none',
-        'dead_raw': dead_raw,
-        'dead_w': dead_w,
-        'dead_count_qk': qk_count,
-        'dead_count_v': v_count,
-        'dead_count_rst': rst_count,
-        'dead_frac_qk': qk_dead_frac,
-        'dead_frac_v': v_dead_frac,
-        'dead_frac_rst': rst_dead_frac,
-        'weak_frac_qk': qk_weak_frac,
-        'weak_frac_v': v_weak_frac,
-        'weak_frac_rst': rst_weak_frac,
-    }
-
-
-def _log_dead_trigger(rec, ctx, log_fn):
-    info = _dead_trigger_info(rec, ctx)
-    log_fn("dead_trigger:")
-    log_fn(
-        f"  dead_raw={info['dead_raw']:.6f} "
-        f"dead_w={info['dead_w']:.6f}")
-    log_fn(
-        f"  dead_count[qk={info['dead_count_qk']:.1f} "
-        f"v={info['dead_count_v']:.1f} "
-        f"rst={info['dead_count_rst']:.1f}]")
-    log_fn(
-        f"  dead_frac[qk={info['dead_frac_qk']:.6f} "
-        f"v={info['dead_frac_v']:.6f} "
-        f"rst={info['dead_frac_rst']:.6f}]")
-    log_fn(
-        f"  weak_frac[qk={info['weak_frac_qk']:.6f} "
-        f"v={info['weak_frac_v']:.6f} "
-        f"rst={info['weak_frac_rst']:.6f}]")
-    log_fn(
-        f"  threshold_used={info['threshold_used']} "
-        f"trigger_reason={info['trigger_reason']}")
-
-
-def _collapse_reasons(rec, ctx=None):
-    ctx = ctx or {}
-
-    def _g(key, default=0.0):
-        return float(rec.get(key, default) or 0.0)
-
-    def _positive_min(*keys):
-        vals = [_g(key, 0.0) for key in keys]
-        vals = [v for v in vals if v > 0.0]
-        return min(vals) if vals else float('inf')
-
-    reasons = []
-    if _g('grad_global_preclip', _g('grad_norm')) > 50.0:
-        reasons.append('grad_spike')
-    if _g('total_loss_minus_ce') > 5.0:
-        reasons.append('loss_minus_ce_spike')
-    if _dead_trigger_info(rec, ctx)['triggered']:
-        reasons.append('dead_spike')
-    if max(_g('attn_int_cap_frac'), _g('rst_int_cap_frac')) > 0.001:
-        reasons.append('int_cap_hit')
-    max_intensity = float(ctx.get('max_intensity', 10.0))
-    if max(_g('attn_int_max'), _g('rst_int_max')) >= max_intensity - 1.0e-3:
-        reasons.append('intensity_saturated')
-    if max(_g('attn_qk_op_gain_max'), _g('attn_v_op_gain_max'),
-           _g('rst_op_gain_max')) > 20.0:
-        reasons.append('op_gain_high')
-    layer_out_max = 0.0
-    for key in ('per_layer_attn_out_norm', 'per_layer_rst_out_norm'):
-        vals = rec.get(key, []) or []
-        try:
-            layer_out_max = max(layer_out_max, max(float(v) for v in vals))
-        except ValueError:
-            pass
-    if layer_out_max > 50.0:
-        reasons.append('late_layer_out_high')
-    if max(_g('attn_top1_gate_frac'), _g('rst_top1_gate_frac')) > 0.5:
-        reasons.append('top1_gate_high')
-    top1_threshold = float(ctx.get('collapse_warn_top1_threshold', 0.999))
-    if max(_g('attn_top1_gate_frac_max', _g('attn_top1_gate_frac')),
-           _g('rst_top1_gate_frac_max', _g('rst_top1_gate_frac'))) >= top1_threshold:
-        reasons.append('local_top1_saturated')
-    compose_threshold = float(
-        ctx.get('collapse_warn_compose_norm_threshold', 1.2))
-    if max(_g('attn_compose_norm_max'), _g('rst_compose_norm_max')) > compose_threshold:
-        reasons.append('compose_high')
-    low_den_threshold = float(
-        ctx.get('collapse_warn_low_den_floor_frac_threshold', 0.001))
-    den_floor = float(ctx.get('rw_contrib_den_floor', 1.0))
-    den_floor_frac = max(_g('attn_contrib_den_floor_frac'),
-                         _g('rst_contrib_den_floor_frac'))
-    den_min = _positive_min('attn_contrib_den_min', 'rst_contrib_den_min')
-    if den_floor_frac > low_den_threshold or den_min <= den_floor + 1.0e-6:
-        reasons.append('low_contrib_den')
-    scaled_threshold = float(ctx.get('collapse_warn_scaled_out_threshold', 0.0))
-    if scaled_threshold > 0.0:
-        attn_scaled_ratio = (
-            _g('attn_scaled_out_norm_max')
-            / max(_g('attn_out_norm'), 1.0e-8))
-        rst_scaled_ratio = (
-            _g('rst_scaled_out_norm_max')
-            / max(_g('rst_out_norm'), 1.0e-8))
-        if max(attn_scaled_ratio, rst_scaled_ratio) > scaled_threshold:
-            reasons.append('scaled_out_high')
-    if min(_g('attn_gate_eff_ratio', 1.0),
-           _g('rst_gate_eff_ratio', 1.0)) < 0.05:
-        reasons.append('gate_eff_low')
-    return reasons
-
-
 def _layer_out_max_from_rec(rec):
     layer_out_max = 0.0
     for key in ('per_layer_attn_out_norm', 'per_layer_rst_out_norm'):
@@ -6933,44 +6585,6 @@ def _layer_out_max_from_rec(rec):
     return layer_out_max
 
 
-def _severe_collapse_reasons(
-        rec, grad_threshold=100.0,
-        loss_minus_ce_threshold=10.0,
-        ce_extreme_threshold=10.0,
-        ce_grad_ce_threshold=6.0,
-        ce_grad_grad_threshold=5.0):
-    """Strict trigger for crash snapshots/stopping.
-
-    Stop only on signals that indicate the optimization state is likely to be
-    unsafe: non-local gradient shock, extreme CE, CE+grad shock, or auxiliary
-    loss explosion. Structural diagnostics such as top1, active fraction,
-    layer-output max, and dead_spike remain warning/diagnostic-only because
-    sparse routing can produce high local values without harming CE/grad.
-    """
-    def _g(key, default=0.0):
-        return float(rec.get(key, default) or 0.0)
-
-    reasons = []
-    grad = _g('grad_global_preclip', _g('grad_norm'))
-    ce = _g('ce_loss')
-    if grad > grad_threshold:
-        reasons.append('severe_grad_spike')
-    if ce > ce_extreme_threshold:
-        reasons.append('severe_ce_spike')
-    if ce > ce_grad_ce_threshold and grad > ce_grad_grad_threshold:
-        reasons.append('severe_ce_grad_spike')
-    if _g('total_loss_minus_ce') > loss_minus_ce_threshold:
-        reasons.append('severe_loss_minus_ce_spike')
-    return reasons
-
-
-CRASH_REASON_NAMES = (
-    'severe_grad_spike',
-    'severe_ce_spike',
-    'severe_ce_grad_spike',
-    'severe_loss_minus_ce_spike',
-    'nan_or_inf',
-)
 
 
 def _active_max_from_rec(rec):
@@ -6988,75 +6602,6 @@ def _top1_max_from_rec(rec):
         return float(rec.get(key, default) or 0.0)
     return max(_g('attn_top1_gate_frac_max', _g('attn_top1_gate_frac')),
                _g('rst_top1_gate_frac_max', _g('rst_top1_gate_frac')))
-
-
-def _annotate_crash_record(rec, reasons=None):
-    """Add derived crash-sentinel fields to a JSON-safe metric record."""
-    out = dict(rec)
-    out['layer_out_max'] = _layer_out_max_from_rec(out)
-    out['active_frac_max'] = _active_max_from_rec(out)
-    out['top1_gate_frac_max_any'] = _top1_max_from_rec(out)
-    if reasons is not None:
-        out['severe_reasons'] = list(reasons)
-        out['severe_triggered'] = bool(reasons)
-    return out
-
-
-def _reason_bit_vector(reasons):
-    rs = set(reasons or [])
-    return [1.0 if name in rs else 0.0 for name in CRASH_REASON_NAMES]
-
-
-def _host_trigger_vector(process_index, rec, reasons):
-    def _g(key, default=0.0):
-        return float(rec.get(key, default) or 0.0)
-    base = [
-        float(process_index),
-        1.0 if reasons else 0.0,
-        _g('grad_global_preclip', _g('grad_norm')),
-        _layer_out_max_from_rec(rec),
-        _g('total_loss_minus_ce'),
-        _active_max_from_rec(rec),
-        _top1_max_from_rec(rec),
-        _g('total_loss'),
-        _g('ce_loss'),
-    ]
-    return np.asarray(base + _reason_bit_vector(reasons), dtype=np.float64)
-
-
-def _decode_host_trigger_summary(arr):
-    rows = np.asarray(arr, dtype=np.float64).reshape(-1, 9 + len(CRASH_REASON_NAMES))
-    out = []
-    for row in rows:
-        reasons = [name for bit, name in zip(row[9:], CRASH_REASON_NAMES) if bit >= 0.5]
-        out.append({
-            'process_index': int(row[0]),
-            'triggered': bool(row[1] >= 0.5),
-            'reasons': reasons,
-            'grad_preclip': float(row[2]),
-            'layer_out_max': float(row[3]),
-            'loss_minus_ce': float(row[4]),
-            'active_frac_max': float(row[5]),
-            'top1_gate_frac_max': float(row[6]),
-            'total_loss': float(row[7]),
-            'ce_loss': float(row[8]),
-        })
-    return out
-
-
-def _full_metrics_record(metrics, step, epoch, process_index):
-    """JSON-safe full metrics dump. Called only on crash, so no steady-state cost."""
-    raw = jax.device_get(metrics)
-    out = {}
-    for k, v in raw.items():
-        out[k] = _jsonable_diag_value(v)
-    out.update({
-        'step': int(step),
-        'epoch': int(epoch),
-        'process_index': int(process_index),
-        'timestamp': datetime.now().isoformat(),
-    })
-    return _annotate_crash_record(out)
 
 
 def _write_json_file(path, obj):
@@ -7089,13 +6634,6 @@ def _finite_float(value, default=0.0):
     except Exception:
         return default
     return out if np.isfinite(out) else default
-
-
-def _spike_layer_max(value):
-    arr = np.asarray(_jsonable_diag_value(value), dtype=np.float32)
-    if arr.size == 0:
-        return 0.0
-    return _finite_float(np.nanmax(arr), 0.0)
 
 
 def _fmt_grad_array(rec, key):
@@ -7159,8 +6697,7 @@ def _print_drop_compare_block(rec):
 
 
 def _print_debug_block(rec, ctx):
-    """Write debug-only DAWN-SRW collapse diagnostics to debug_log_*.txt."""
-    is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
+    is_v4160 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
 
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
@@ -7182,12 +6719,12 @@ def _print_debug_block(rec, ctx):
     if _g('soft_gate_T', 0.0) > 0.0:
         _soft_gate_label = (
             'soft_gate_B'
-            if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
+            if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
             else 'soft_gate_T')
         _power_part = (
             f" boundary_power_p={_g('boundary_power_p', 2.0):.3f}"
             f" admission_den_power={_g('admission_den_power', _g('den_power', 1.0)):.3f}"
-            if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
+            if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
             else "")
         log_debug_message(
             f"{_soft_gate_label}: qk={_g('soft_gate_T_qk', _g('soft_gate_T')):.6f} "
@@ -7223,17 +6760,6 @@ def _print_debug_block(rec, ctx):
         f"recon_err={_g('reconstructed_loss_error'):.3e}"
     )
     if is_v4160:
-        if ctx.get('model_version') not in SOFT_DIRECT_TAU_MODEL_VERSIONS:
-            log_debug_message(
-                f"removed_margin_reg: "
-                f"raw[qk={_g('removed_margin_reg_raw_qk'):.6f} "
-                f"v={_g('removed_margin_reg_raw_v'):.6f} "
-                f"rst={_g('removed_margin_reg_raw_rst'):.6f}] "
-                f"weighted[qk={_g('removed_margin_reg_weighted_qk'):.6f} "
-                f"v={_g('removed_margin_reg_weighted_v'):.6f} "
-                f"rst={_g('removed_margin_reg_weighted_rst'):.6f} "
-                f"total={_g('removed_margin_reg_weighted_total'):.6f}]"
-            )
         _qk_per_dead = _g('attn_qk_dead_penalty') / max(_g('attn_qk_dead_count'), 1.0)
         _v_per_dead = _g('attn_v_dead_penalty') / max(_g('attn_v_dead_count'), 1.0)
         log_debug_message(
@@ -7291,7 +6817,7 @@ def _print_debug_block(rec, ctx):
             f"rst=({_g('cb1a_rst_challenge_weight', 0.0):.4g},"
             f"{_g('cb1a_rst_prune_weight', 0.0):.4g})]"
         )
-    if ctx.get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS:
+    if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
         log_debug_message(
             f"soft_exposure_diag: "
             f"mean[qk={_g('attn_qk_soft_exposure_mean'):+.5f} "
@@ -7480,11 +7006,11 @@ def _print_debug_block(rec, ctx):
             f"selected[attn={_g('attn_selected_frac'):.5f} rst={_g('rst_selected_frac'):.5f}] "
             f"no_active[attn={_g('attn_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
         )
-    elif ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS:
-        _is_v4162_soft = ctx.get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS
+    elif ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
+        _is_v4162_soft = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
         _weight_label = (
             'admission'
-            if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+            if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
             else ('soft_weight' if _is_v4162_soft else 'positive_margin'))
         _select_status = ""
         if not _is_v4162_soft:
@@ -7509,7 +7035,7 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
             f"{_select_status}"
         )
-    if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+    if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
         log_debug_message(
             "v4164_thresholds: active_tau["
             + _fmt_sparsity_pool_values(
@@ -7739,12 +7265,7 @@ def _print_debug_block(rec, ctx):
     if _cap_window_line:
         log_debug_message(_cap_window_line)
     _print_grad_layer_block(rec, is_v4160=is_v4160)
-    reasons = _collapse_reasons(rec, ctx)
-    if reasons:
-        log_debug_message(
-            f"[COLLAPSE_WARN] step={step} reasons={','.join(reasons)}")
-        if 'dead_spike' in reasons:
-            _log_dead_trigger(rec, ctx, log_debug_message)
+    reasons = []
     log_debug_message("")
 
 
@@ -7781,12 +7302,7 @@ def _print_debug_analysis_block(rec, ctx):
     )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_debug_message(_format_output_stab_line(rec, indent=""))
-    reasons = _collapse_reasons(rec, ctx)
-    if reasons:
-        log_debug_message(
-            f"[COLLAPSE_WARN] step={rec.get('step', 0)} reasons={','.join(reasons)}")
-        if 'dead_spike' in reasons:
-            _log_dead_trigger(rec, ctx, log_debug_message)
+    reasons = []
     log_debug_message("")
 
 
@@ -7802,7 +7318,7 @@ def _build_analysis_record(base, metrics, ctx):
     """
     m = metrics
     is_v415 = ctx.get('model_version') in (
-        'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS)
+        OFFICIAL_MODEL_VERSION)
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -8114,7 +7630,7 @@ def _build_analysis_record(base, metrics, ctx):
 def _print_analysis_block(rec, ctx):
     # Analysis logging must never kill a run.  Missing optional fields are
     # printed as 0.0 instead of raising KeyError.
-    is_v4160 = ctx.get('model_version') in DIRECT_TAU_SPLIT_MODEL_VERSIONS
+    is_v4160 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
 
     def _g(key, default=0.0):
         return float(rec.get(key, default))
@@ -8149,8 +7665,8 @@ def _print_analysis_block(rec, ctx):
             f" std={_g('rst_rho_std'):.5f}"
             f" max={_g('rst_rho_max'):.5f}]"
         )
-    if ctx.get('model_version') in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS:
-        if ctx.get('model_version') in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+    if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
+        if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
             _print_v4164_sparsity_block(rec)
         else:
             _print_v4162_sparsity_block(rec, 'full')
@@ -8222,7 +7738,7 @@ def _print_analysis_block(rec, ctx):
             f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
         )
     if ctx.get('model_version') in (
-            'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
+            OFFICIAL_MODEL_VERSION):
         if is_v4160:
             log_message(
                 f"  admission_den: qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
@@ -8382,10 +7898,10 @@ def main():
     # Keep the CLI surface small: --debug controls cadence.
     tcfg = cfg['training']
     model_version_cfg = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
-    is_v4164_cfg = model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+    is_v4164_cfg = model_version_cfg == OFFICIAL_MODEL_VERSION
     tau_init_cfg = (
         _v4164_tau_init_config(cfg)
-        if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
+        if model_version_cfg == OFFICIAL_MODEL_VERSION
         else None)
     # Optional config-driven resume. CLI --resume remains an override for
     # ad-hoc launches, but diagnostic configs can be one-shot.
@@ -8426,9 +7942,6 @@ def main():
     dead_penalty_v_weight = 0.0
     dead_penalty_rst_weight = 0.0
     dead_exposure_target = 0.0
-    removed_margin_reg_weight_qk = 0.0
-    removed_margin_reg_weight_v = 0.0
-    removed_margin_reg_weight_rst = 0.0
     exploration_weight = 0.0
     exploration_weight_qk = 0.0
     exploration_weight_q = 0.0
@@ -8498,7 +8011,6 @@ def main():
     )
     current_admission_den_config_override = any(
         key in tcfg for key in admission_den_config_keys)
-    regular_diagnostics_level = 'analysis'
     regular_console_level_default = 'full'
     regular_console_level = str(tcfg.get(
         'regular_console_level',
@@ -8521,21 +8033,17 @@ def main():
         'regular_console_drive_max_warn', 1.20))
     regular_console_logging_overhead_warn = float(tcfg.get(
         'regular_console_logging_overhead_warn', 0.05))
-    regular_current_eps = []
-    regular_projected_eps = []
-    regular_mass_metrics_active = False
-    regular_sparsity_metrics_active = False
     eval_effective_prune_enabled = bool(tcfg.get(
         'eval_effective_prune_enabled',
-        model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS))
+        model_version_cfg == OFFICIAL_MODEL_VERSION))
     eval_effective_prune_eps_list = list(tcfg.get(
         'eval_effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
-    if model_version_cfg not in SOFT_DIRECT_TAU_MODEL_VERSIONS:
+    if model_version_cfg != OFFICIAL_MODEL_VERSION:
         eval_effective_prune_enabled = False
         eval_effective_prune_eps_list = []
     ignored_tau_ce_grad_scale_keys = (
         sorted(k for k in tcfg if k.startswith('tau_ce_grad_scale'))
-        if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
+        if model_version_cfg == OFFICIAL_MODEL_VERSION
         else [])
     rpe_start_frac = 0.0
     rpe_full_frac = 0.0
@@ -8801,11 +8309,6 @@ def main():
             weight_decay = saved_training_config.get('weight_decay', weight_decay)
             warmup_ratio = saved_training_config.get('warmup_ratio', warmup_ratio)
             orth_weight = saved_training_config.get('orthogonality_weight', orth_weight)
-            regular_diagnostics_level = 'analysis'
-            regular_current_eps = []
-            regular_projected_eps = []
-            regular_mass_metrics_active = False
-            regular_sparsity_metrics_active = False
             boundary_power_schedule_active = True
             regular_console_level = str(saved_training_config.get(
                 'regular_console_level', regular_console_level)).lower()
@@ -8871,9 +8374,6 @@ def main():
             dead_penalty_v_weight = 0.0
             dead_penalty_rst_weight = 0.0
             dead_exposure_target = 0.0
-            removed_margin_reg_weight_qk = 0.0
-            removed_margin_reg_weight_v = 0.0
-            removed_margin_reg_weight_rst = 0.0
             rpe_enabled = False
             exploration_weight = 0.0
             exploration_weight_q = 0.0
@@ -8955,9 +8455,6 @@ def main():
             dead_penalty_v_weight = 0.0
             dead_penalty_rst_weight = 0.0
             dead_exposure_target = 0.0
-            removed_margin_reg_weight_qk = 0.0
-            removed_margin_reg_weight_v = 0.0
-            removed_margin_reg_weight_rst = 0.0
             rpe_enabled = False
             exploration_weight = 0.0
             exploration_weight_q = 0.0
@@ -8998,18 +8495,10 @@ def main():
         dead_penalty_v_weight = 0.0
         dead_penalty_rst_weight = 0.0
         dead_exposure_target = 0.0
-        removed_margin_reg_weight_qk = 0.0
-        removed_margin_reg_weight_v = 0.0
-        removed_margin_reg_weight_rst = 0.0
         rpe_enabled = False
         soft_gate_schedule_active = True
         pool_specific_gate_t = True
         boundary_power_schedule_active = True
-        regular_diagnostics_level = 'analysis'
-        regular_current_eps = []
-        regular_projected_eps = []
-        regular_mass_metrics_active = False
-        regular_sparsity_metrics_active = False
 
     if not rpe_enabled:
         exploration_weight = 0.0
@@ -9099,9 +8588,6 @@ def main():
         'dead_penalty_v_weight': dead_penalty_v_weight,
         'dead_penalty_rst_weight': dead_penalty_rst_weight,
         'dead_exposure_target': dead_exposure_target,
-        'removed_margin_reg_weight_qk': removed_margin_reg_weight_qk,
-        'removed_margin_reg_weight_v': removed_margin_reg_weight_v,
-        'removed_margin_reg_weight_rst': removed_margin_reg_weight_rst,
         'exploration_weight': exploration_weight,
         'exploration_weight_qk': exploration_weight_qk,
         'exploration_weight_v': exploration_weight_v,
@@ -9139,15 +8625,12 @@ def main():
         'admission_den_power': admission_den_power,
         'admission_den_grad_scale': admission_den_grad_scale,
         'soft_gate_effective_active_eps': soft_gate_effective_active_eps,
-        'regular_diagnostics_level': regular_diagnostics_level,
         'regular_console_level': regular_console_level,
         'regular_console_host_timing': regular_console_host_timing,
         'regular_console_top1_warn': regular_console_top1_warn,
         'regular_console_drive_max_warn': regular_console_drive_max_warn,
         'regular_console_logging_overhead_warn':
             regular_console_logging_overhead_warn,
-        'regular_current_eps': regular_current_eps,
-        'regular_projected_eps': regular_projected_eps,
         'eval_effective_prune_enabled': eval_effective_prune_enabled,
         'eval_effective_prune_eps_list': eval_effective_prune_eps_list,
         'rpe_start_frac': rpe_start_frac,
@@ -9196,7 +8679,7 @@ def main():
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
-    if model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS:
+    if model_version_cfg == OFFICIAL_MODEL_VERSION:
         training_config['tau_init_mode'] = tau_init_cfg['mode']
         if tau_init_cfg['mode'] == 'quantile_frac':
             training_config.update({
@@ -9210,8 +8693,6 @@ def main():
             })
         for _clean_key in list(training_config.keys()):
             if (_clean_key.startswith('cb1a_')
-                    or _clean_key.startswith('removed_margin_reg_')
-                    or _clean_key.startswith('removed_diag_')
                     or _clean_key.startswith('legacy_count_init_')
                     or _clean_key == 'exploration_normalize_by_layers'):
                 training_config.pop(_clean_key, None)
@@ -9258,16 +8739,10 @@ def main():
                 'dead_penalty_v_weight',
                 'dead_penalty_rst_weight',
                 'dead_exposure_target',
-                'removed_margin_reg_weight_qk',
-                'removed_margin_reg_weight_v',
-                'removed_margin_reg_weight_rst',
                 'rpe_enabled',
                 'rpe_start_frac',
                 'rpe_full_frac',
                 'rpe_schedule',
-                                                                'regular_diagnostics_level',
-                'regular_current_eps',
-                'regular_projected_eps',
                                                 'dead_penalty_weighted_clip'):
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
@@ -9575,11 +9050,6 @@ def main():
               f"exposure_target={dead_exposure_target} "
               f"direct_w[qk={dead_penalty_qk_weight}, v={dead_penalty_v_weight}, "
               f"rst={dead_penalty_rst_weight}]")
-        if model_version_cfg not in SOFT_DIRECT_TAU_MODEL_VERSIONS:
-            print("  Selection-margin regularization: "
-                  f"qk={removed_margin_reg_weight_qk} "
-                  f"v={removed_margin_reg_weight_v} "
-                  f"rst={removed_margin_reg_weight_rst}")
         if rpe_enabled:
             print(f"  Exploration weight: {exploration_weight}")
             print("    weight split: "
@@ -9593,7 +9063,7 @@ def main():
             print(f"    warmup_steps={exploration_warmup_steps} "
                   f"bounds=[{exploration_lower_bound}, {exploration_upper_bound}] "
                   f"eps={exploration_bound_eps}")
-        if model_version_cfg not in SOFT_DIRECT_TAU_MODEL_VERSIONS:
+        if model_version_cfg != OFFICIAL_MODEL_VERSION:
             print("  CB1A: "
                   f"enabled={cb1a_enabled} "
                   f"ce_mode={cb1a_ce_mode} eps={cb1a_eps}")
@@ -9620,15 +9090,15 @@ def main():
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
                 f"scan_scale={tcfg.get('scan_scale', 0.0)}"
             )
-        elif cfg['model'].get('model_version') in SOFT_DIRECT_TAU_MODEL_VERSIONS:
+        elif cfg['model'].get('model_version') == OFFICIAL_MODEL_VERSION:
             _soft_model_version = cfg['model'].get('model_version')
-            _soft_module_path = MODEL_REGISTRY[_soft_model_version].module_path
+            _soft_module_path = 'models.dawn_srw_v4164'
             print(f"  Module path: {_soft_module_path}")
             print("  Tau parameterization: bounded sigmoid min/max")
             print("  tau = -1 + 2 * sigmoid(raw_tau)")
-            if _soft_model_version in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS:
+            if _soft_model_version == OFFICIAL_MODEL_VERSION:
                 print("  Boundary admission: one-sided generalized Gaussian")
-                if _soft_model_version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+                if _soft_model_version == OFFICIAL_MODEL_VERSION:
                     print("  drive = softplus((rho-tau)/B) / softplus((1-tau)/B)")
                     print("  execution_weight = admission * drive")
                     print("  admission_den = max(sum(admission), 1.0) ** admission_den_power")
@@ -9645,7 +9115,7 @@ def main():
                     f"start_frac={soft_gate_boundary_power_start_frac} "
                     f"mid_frac={soft_gate_boundary_power_mid_frac} "
                     f"final_frac={soft_gate_boundary_power_final_frac}")
-                if _soft_model_version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS:
+                if _soft_model_version == OFFICIAL_MODEL_VERSION:
                     print("  Admission denominator:")
                     print(
                         f"    admission_den_power={admission_den_power} "
@@ -9656,7 +9126,7 @@ def main():
                   f"effective_active_eps={soft_gate_effective_active_eps}")
             _scale_label = (
                 'B'
-                if _soft_model_version in ANGULAR_BOUNDARY_POWER_MODEL_VERSIONS
+                if _soft_model_version == OFFICIAL_MODEL_VERSION
                 else 'T')
             def _devband_summary(_cfg):
                 return (
@@ -9706,8 +9176,7 @@ def main():
                           f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
                           f"schedule={soft_gate_schedule} "
                           f"{_soft_gate_shape_msg}")
-            print(f"  tau control: tau_lr_mult={tau_lr_mult}; "
-                  "tau_ce_grad_scale=removed")
+            print(f"  tau control: tau_lr_mult={tau_lr_mult}")
             if ignored_tau_ce_grad_scale_keys:
                 print("  tau_ce_grad_scale config fields are ignored in "
                       "v4164; tau movement is controlled by tau_lr_mult.")
@@ -9724,7 +9193,7 @@ def main():
             print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
             _gate_intensity_part = (
                 ""
-                if _soft_model_version in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                if _soft_model_version == OFFICIAL_MODEL_VERSION
                 else f"intensity_beta={tcfg.get('intensity_beta', 0.5)} ")
             gate_msg = (
                 f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
@@ -9760,7 +9229,7 @@ def main():
                 f"max_int={tcfg.get('max_intensity', 10.0)}"
             )
         if cfg['model'].get('model_version') in (
-                'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
+                OFFICIAL_MODEL_VERSION):
             if cfg['model'].get('model_version') not in (
                     'spatial-r1-v4.1.5.9',
                     'spatial-r1-v4.1.6.0',
@@ -9780,10 +9249,6 @@ def main():
         if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
             print(
                 "  v4158 contrib-den diagnostics: "
-                f"warn_compose={collapse_warn_ctx['collapse_warn_compose_norm_threshold']} "
-                f"warn_top1={collapse_warn_ctx['collapse_warn_top1_threshold']} "
-                f"warn_low_den_frac={collapse_warn_ctx['collapse_warn_low_den_floor_frac_threshold']} "
-                f"warn_scaled_out={collapse_warn_ctx['collapse_warn_scaled_out_threshold']}"
             )
 
     # ----------------------------------------------------------
@@ -9803,7 +9268,7 @@ def main():
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('step', 0)
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
-        # v4.1 redesign removed EMA state; silently ignore any ema_ce left
+        # v4.1 has no EMA state; silently ignore any ema_ce left
         # in older checkpoints.
         # Precise resume: use step_in_epoch if available
         saved_step_in_epoch = ckpt.get('step_in_epoch', 0)
@@ -9829,7 +9294,7 @@ def main():
     tau_init_summary = None
     _has_resume_checkpoint = bool(
         resume_path is not None and _file_exists(resume_path))
-    if (model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
+    if (model_version_cfg == OFFICIAL_MODEL_VERSION
             and tau_init_cfg['mode'] == 'quantile_frac'
             and not _has_resume_checkpoint):
         if len(train_loader) <= 0:
@@ -9890,7 +9355,7 @@ def main():
     is_spatial = model_version in (
         'spatial-r1-v3.9.4',
         'spatial-r1-v4.1.5.2',
-        *SRW_ACTIVE_MODEL_VERSIONS,
+        OFFICIAL_MODEL_VERSION,
     )
 
     mesh_model = cfg['training'].get('mesh_model', 1)
@@ -9973,28 +9438,22 @@ def main():
         opt_state = optimizer.init(params)
 
     # Create shard_map functions if mesh_model > 1 or the model demands
-    # the sharded path (v4.1 removed its non-sharded fallback).
+    # the sharded path.
     #
     # v4.1: `_sharded_fns` is the slim train path; `_sharded_fns_analysis`
     # is the full observational path used only by analysis_step.
     _sharded_fns = None
     _sharded_fns_analysis = None
-    _spec = MODEL_REGISTRY.get(model_version)
-    _force_sharded = bool(_spec and _spec.force_sharded)
-    if _spec is not None and (mesh_model > 1 or _force_sharded):
-        if not _spec.supports_sharded:
-            raise RuntimeError(
-                f"model_version={model_version!r} is registered without "
-                f"supports_sharded=True but mesh_model>1 or force_sharded=True.")
-        _v3 = __import__(_spec.module_path, fromlist=['make_sharded_srw'])
+    _force_sharded = True
+    if mesh_model > 1 or _force_sharded:
+        _v3 = __import__('models.dawn_srw_v4164', fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', None)
         if max_chunk is not None:
             attn_qk_max_chunk = attn_v_max_chunk = rst_max_chunk = int(max_chunk)
 
         _srw_base_kwargs = {'mesh': mesh}
-        if _spec.sharded_kwargs is not None:
-            _srw_base_kwargs.update(_spec.sharded_kwargs(cfg))
+        _srw_base_kwargs.update(_v4164_sharded_kwargs(cfg))
         import inspect as _inspect
         def _factory_kwargs(factory, kwargs):
             sig = _inspect.signature(factory)
@@ -10100,9 +9559,6 @@ def main():
         cb1a_ce_mode=cb1a_ce_mode,
         cb1a_eps=cb1a_eps,
         dead_penalty_weighted_clip=dead_penalty_weighted_clip,
-        removed_margin_reg_weight_qk=removed_margin_reg_weight_qk,
-        removed_margin_reg_weight_v=removed_margin_reg_weight_v,
-        removed_margin_reg_weight_rst=removed_margin_reg_weight_rst,
         global_grad_clip=global_grad_clip,
         tau_lr_mult=tau_lr_mult,
         tau_grad_clip=tau_grad_clip,
@@ -10144,7 +9600,7 @@ def main():
         sharded_fns=_sharded_fns, mesh=mesh,
         debug_diagnostics=debug_mode,
         compact_train_metrics=(
-            model_version_cfg in SOFT_DIRECT_TAU_MODEL_VERSIONS
+            model_version_cfg == OFFICIAL_MODEL_VERSION
             and not debug_mode),
         keep_train_layer_metrics=False)
     eval_step_fn = create_eval_step(
@@ -10349,15 +9805,14 @@ def main():
                     "baseline model has no DAWN neuron_pool/router")
 
             _is_sharded = _sharded_fns is not None
-            _uses_scan_offset = model_version in (
-                'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS)
+            _uses_scan_offset = model_version == OFFICIAL_MODEL_VERSION
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
             _v3 = __import__(
-                MODEL_REGISTRY[model_version].module_path,
+                'models.dawn_srw_v4164',
                 fromlist=['_layer_norm', '_attn_forward', '_rst_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _rst_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._rst_forward, _v3._srw_chunked
 
@@ -11125,7 +10580,6 @@ def main():
                         'total_micro_steps': total_micro_steps,
                         'progress': _progress,
                         'model_version': model_version,
-                        'regular_diagnostics_level': regular_diagnostics_level,
                         'regular_console_level': regular_console_level,
                         'regular_console_host_timing':
                             regular_console_host_timing,
@@ -11154,21 +10608,21 @@ def main():
                             soft_gate_boundary_power_final_frac,
                         'intensity_beta': (
                             0.0
-                            if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                            if model_version_cfg == OFFICIAL_MODEL_VERSION
                             else float(tcfg.get('intensity_beta', 0.0))),
                         'd_select': (
                             0
-                            if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                            if model_version_cfg == OFFICIAL_MODEL_VERSION
                             else int(cfg['model'].get('d_select', 0) or 0)),
                         'd_intensity': (
                             0
-                            if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                            if model_version_cfg == OFFICIAL_MODEL_VERSION
                             else int(
                                 cfg['model'].get('d_route', 0)
                                 - cfg['model'].get('d_select', 0))),
                         'd_route_unified': (
                             int(cfg['model'].get('d_route', 0))
-                            if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                            if model_version_cfg == OFFICIAL_MODEL_VERSION
                             else 0),
                     }
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
@@ -11262,7 +10716,6 @@ def main():
                     'total_micro_steps': total_micro_steps,
                     'progress': _progress,
                     'model_version': model_version,
-                    'regular_diagnostics_level': regular_diagnostics_level,
                     'regular_console_level': regular_console_level,
                     'regular_console_host_timing': regular_console_host_timing,
                     'regular_console_top1_warn': regular_console_top1_warn,
@@ -11289,21 +10742,21 @@ def main():
                         soft_gate_boundary_power_final_frac,
                     'intensity_beta': (
                         0.0
-                        if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                        if model_version_cfg == OFFICIAL_MODEL_VERSION
                         else float(tcfg.get('intensity_beta', 0.0))),
                     'd_select': (
                         0
-                        if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                        if model_version_cfg == OFFICIAL_MODEL_VERSION
                         else int(cfg['model'].get('d_select', 0) or 0)),
                     'd_intensity': (
                         0
-                        if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                        if model_version_cfg == OFFICIAL_MODEL_VERSION
                         else int(
                             cfg['model'].get('d_route', 0)
                             - cfg['model'].get('d_select', 0))),
                     'd_route_unified': (
                         int(cfg['model'].get('d_route', 0))
-                        if model_version_cfg in UNIFIED_ROUTE_DEN_MODEL_VERSIONS
+                        if model_version_cfg == OFFICIAL_MODEL_VERSION
                         else 0),
                 }
                 debug_metrics = jax.device_get(metrics)

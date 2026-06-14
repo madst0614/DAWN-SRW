@@ -5,6 +5,7 @@ data:
   max_train_tokens: 5000000000
   max_val_tokens: 10000000
   local_cache_dir: /tmp/data
+
 model:
   model_version: spatial-r1-v4.1.6.4
   vocab_size: 30522
@@ -21,12 +22,11 @@ model:
   n_rst: 20560
   tau_init_min: -0.95
   tau_init_max: 0.95
-
-  # One-time local tau initialization from the first training batch
   tau_init_mode: quantile_frac
   tau_init_target_qk_frac: 0.10
   tau_init_target_v_frac: 0.04
   tau_init_target_rst_frac: 0.02
+
 training:
   batch_size: 128
   mesh_model: 1
@@ -47,24 +47,16 @@ training:
   route_emb_grad_clip: 2.0
 
   soft_gate_effective_active_eps: 1.0e-06
-  # Admission-based divisive normalization / inhibition
-  # admission_den = max(sum(admission), 1) ** admission_den_power
-  # admission_den_grad_scale controls only the backward denominator branch:
-  #   0.0 = detached admission_den, 1.0 = full live admission_den.
   admission_den_power: 0.5
   admission_den_grad_scale: 1.0
+
   soft_gate_boundary_power_start: 3.0
   soft_gate_boundary_power_mid: 3.0
   soft_gate_boundary_power_final: 4.0
   soft_gate_boundary_power_mid_frac: 0.001
   soft_gate_boundary_power_final_frac: 1.000
 
-  # Developmental Band Annealing
-  # Phase A: no-sorting / direct small target band
-  # Phase B: stable small-band formation
-  # Phase C: formation band
-  # Phase D/E: micro-sharpening -> final sparse consolidation
-
+  # Developmental Band Annealing values are intentionally kept unchanged.
   soft_gate_t_qk_schedule: developmental_band
   soft_gate_t_qk_sort: 0.035
   soft_gate_t_qk_band: 0.035
@@ -106,12 +98,13 @@ training:
 
   eval_effective_prune_enabled: true
   eval_effective_prune_eps_list:
-  - 1.0e-06
-  - 1.0e-05
-  - 0.0001
+    - 1.0e-06
+    - 1.0e-05
+    - 0.0001
   checkpoint_interval: 1000
   val_interval: 500
   log_interval: 100
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
+
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4164_40M_c4_5B_ggauss_boundary_panneal
