@@ -1,14 +1,15 @@
 """
 DAWN-SRW v4.1.6.4 JAX trainer (TPU multi-device).
 
-Official v4164 training path:
-- model version is fixed to spatial-r1-v4.1.6.4
+Active DAWN-SRW training path:
+- model versions are registered in MODEL_REGISTRY
 - JAX/Flax SPMD training with sharded SRW pools
 - GCS checkpoint support and auto-resume
 - optax optimizer with warmup + cosine decay
 
 Usage:
     python scripts/train_jax.py --config configs/train_config_v4164_40M_c4_5B_ggauss_boundary_panneal.yaml
+    python scripts/train_jax.py --config configs/train_config_v4166_40M_c4_5B_ggauss_boundary_panneal.yaml
     python scripts/train_jax.py --config configs/train_config_v4164_40M_c4_5B_ggauss_boundary_panneal.yaml --resume gs://.../run_v...
     python scripts/train_jax.py --config configs/train_config_v4164_40M_c4_5B_ggauss_boundary_panneal.yaml --from-scratch
 """
@@ -52,6 +53,11 @@ from models.dawn_srw_v4164 import (
     _raw_tau_init_from_cosine_tau as _v4164_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4164_tau_init_calibration_scores,
 )
+from models.dawn_srw_v4166 import (
+    DAWN_SRW_V4166,
+    _raw_tau_init_from_cosine_tau as _v4166_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4166_tau_init_calibration_scores,
+)
 
 # ============================================================
 # Constants
@@ -60,7 +66,37 @@ from models.dawn_srw_v4164 import (
 # Log cadence is config-driven: see log_interval / log_analysis_multiplier
 # in `training:`.
 
-OFFICIAL_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
+V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
+V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
+OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
+ACTIVE_SRW_MODEL_VERSIONS = (V4164_MODEL_VERSION, V4166_MODEL_VERSION)
+MODEL_REGISTRY = {
+    V4164_MODEL_VERSION: {
+        'class': DAWN_SRW_V4164,
+        'module': 'models.dawn_srw_v4164',
+        'raw_tau_init_from_cosine_tau': _v4164_raw_tau_init_from_cosine_tau,
+        'tau_init_calibration_scores': _v4164_tau_init_calibration_scores,
+    },
+    V4166_MODEL_VERSION: {
+        'class': DAWN_SRW_V4166,
+        'module': 'models.dawn_srw_v4166',
+        'raw_tau_init_from_cosine_tau': _v4166_raw_tau_init_from_cosine_tau,
+        'tau_init_calibration_scores': _v4166_tau_init_calibration_scores,
+    },
+}
+
+
+def _is_active_srw_version(version):
+    return str(version) in ACTIVE_SRW_MODEL_VERSIONS
+
+
+def _model_registry_entry(version):
+    try:
+        return MODEL_REGISTRY[str(version)]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported DAWN-SRW model_version={version!r}; "
+            f"supported={list(MODEL_REGISTRY)}") from exc
 
 DIRECT_TAU_SELECT_METRIC_NAMES = (
     'rho_mean', 'rho_std', 'rho_max',
@@ -545,25 +581,45 @@ def _v4164_sharded_kwargs(cfg):
 
 
 def build_model_from_config(cfg):
-    """Build the official v4.1.6.4 model from config."""
+    """Build an active DAWN-SRW model from config."""
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
-    if version != OFFICIAL_MODEL_VERSION:
-        raise ValueError(
-            f"scripts/train_jax.py is the official {OFFICIAL_MODEL_VERSION} "
-            f"trainer; got model_version={version!r}.")
+    entry = _model_registry_entry(version)
     kwargs = _dawn_srw_kwargs(cfg)
     print(f"route dims: d_route={kwargs['d_route']}")
-    return DAWN_SRW_V4164(**kwargs)
+    return entry['class'](**kwargs)
 
-def _compute_v4164_quantile_tau_init(params, input_ids, cfg,
-                                     tau_init_cfg):
+def _compute_srw_quantile_tau_init(params, input_ids, cfg,
+                                   tau_init_cfg):
     """Compute host-side quantiles from a small deterministic score sample."""
-    if _v4164_tau_init_calibration_scores is None:
+    version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
+    entry = _model_registry_entry(version)
+    score_impl = entry['tau_init_calibration_scores']
+    if score_impl is None:
         raise ValueError(
-            "v4164 tau_init_mode=quantile_frac requires "
-            "models.dawn_srw_v4164 to import cleanly.")
-    # Keep the one-time JIT signature small: calibration needs only route
-    # geometry, not read/write tensors, tau params, or LM output weights.
+            f"{version} tau_init_mode=quantile_frac requires "
+            f"{entry['module']} to import cleanly.")
+    # Keep the one-time JIT signature small: calibration needs only selection
+    # geometry, not tau params or LM output weights.
+    pool_params = {
+        'attn_qk_emb': params['neuron_pool']['attn_qk_emb'],
+        'attn_v_emb': params['neuron_pool']['attn_v_emb'],
+        'rst_emb': params['neuron_pool']['rst_emb'],
+    }
+    if version == V4166_MODEL_VERSION:
+        pool_params.update({
+            'attn_qk_read': params['neuron_pool']['attn_qk_read'],
+            'attn_qk_write': params['neuron_pool']['attn_qk_write'],
+            'attn_qk_op_read_proj': params['neuron_pool']['attn_qk_op_read_proj'],
+            'attn_qk_op_write_proj': params['neuron_pool']['attn_qk_op_write_proj'],
+            'attn_v_read': params['neuron_pool']['attn_v_read'],
+            'attn_v_write': params['neuron_pool']['attn_v_write'],
+            'attn_v_op_read_proj': params['neuron_pool']['attn_v_op_read_proj'],
+            'attn_v_op_write_proj': params['neuron_pool']['attn_v_op_write_proj'],
+            'rst_read': params['neuron_pool']['rst_read'],
+            'rst_write': params['neuron_pool']['rst_write'],
+            'rst_op_read_proj': params['neuron_pool']['rst_op_read_proj'],
+            'rst_op_write_proj': params['neuron_pool']['rst_op_write_proj'],
+        })
     score_params = {
         'token_emb': params['token_emb'],
         'pos_emb': params['pos_emb'],
@@ -575,13 +631,8 @@ def _compute_v4164_quantile_tau_init(params, input_ids, cfg,
             'proj_attn': params['router']['proj_attn'],
             'proj_rst': params['router']['proj_rst'],
         },
-        'neuron_pool': {
-            'attn_qk_emb': params['neuron_pool']['attn_qk_emb'],
-            'attn_v_emb': params['neuron_pool']['attn_v_emb'],
-            'rst_emb': params['neuron_pool']['rst_emb'],
-        },
+        'neuron_pool': pool_params,
     }
-    score_impl = _v4164_tau_init_calibration_scores
     score_kwargs = {
         'max_tokens': tau_init_cfg['calibration_tokens'],
     }
@@ -631,12 +682,14 @@ def _compute_v4164_quantile_tau_init(params, input_ids, cfg,
     }
 
 
-def _set_v4164_quantile_tau_biases(params, tau_summary):
-    """Overwrite v4164 raw tau biases, preserving the pytree structure."""
+def _set_srw_quantile_tau_biases(params, tau_summary, model_version=OFFICIAL_MODEL_VERSION):
+    """Overwrite SRW raw tau biases, preserving the pytree structure."""
+    entry = _model_registry_entry(model_version)
+    raw_tau_init_from_cosine_tau = entry['raw_tau_init_from_cosine_tau']
     tau = tau_summary['tau_init_quantile_tau']
-    raw_qk = _v4164_raw_tau_init_from_cosine_tau(tau['qk'])
-    raw_v = _v4164_raw_tau_init_from_cosine_tau(tau['v'])
-    raw_rst = _v4164_raw_tau_init_from_cosine_tau(tau['rst'])
+    raw_qk = raw_tau_init_from_cosine_tau(tau['qk'])
+    raw_v = raw_tau_init_from_cosine_tau(tau['v'])
+    raw_rst = raw_tau_init_from_cosine_tau(tau['rst'])
 
     def _replace(path, value):
         keys = tuple(
@@ -1538,13 +1591,44 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     pool = params.get('neuron_pool', {})
     out = {}
     fixed_scales = _depth_pool_scales_for(model, model_cfg)
+    model_version = getattr(model, '__version__', None)
+    if model_version is None and model_cfg is not None:
+        model_version = model_cfg.get('model_version')
+
+    def _diag_op_key(read, write, read_proj, write_proj, eps=1.0e-6):
+        def _unit(x):
+            x = jnp.asarray(x, dtype=jnp.float32)
+            return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
+        r_key = _unit(read) @ read_proj
+        w_key = _unit(write) @ write_proj
+        return _unit(_unit(r_key) * _unit(w_key))
+
     specs = (
         ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write', 'attn_qk_scale'),
         ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write', 'attn_v_scale'),
         ('rst', 'rst_emb', 'rst_read', 'rst_write', 'rst_scale'),
     )
     for i, (name, emb_key, read_key, write_key, scale_key) in enumerate(specs):
-        if emb_key in pool:
+        if (_is_active_srw_version(model_version)
+                and str(model_version) == V4166_MODEL_VERSION):
+            op_read_key = f'{name}_op_read_proj'
+            op_write_key = f'{name}_op_write_proj'
+            if name == 'attn_qk':
+                op_read_key = 'attn_qk_op_read_proj'
+                op_write_key = 'attn_qk_op_write_proj'
+            if name == 'attn_v':
+                op_read_key = 'attn_v_op_read_proj'
+                op_write_key = 'attn_v_op_write_proj'
+            if (read_key in pool and write_key in pool
+                    and op_read_key in pool and op_write_key in pool):
+                op_key = _diag_op_key(
+                    pool[read_key], pool[write_key],
+                    pool[op_read_key], pool[op_write_key])
+                out.update(_row_norm_stats(
+                    op_key, f'{name}_emb_norm', full))
+                out.update(_row_norm_stats(
+                    op_key, f'{name}_op_key_norm', full))
+        elif emb_key in pool:
             out.update(_row_norm_stats(pool[emb_key], f'{name}_emb_norm', full))
         if read_key in pool:
             out.update(_row_norm_stats(pool[read_key], f'{name}_read_norm', full))
@@ -1580,6 +1664,22 @@ def _pool_update_diagnostics(params, grads):
             out[f'{name}_{short}_param_norm'] = p_norm
             out[f'{name}_{short}_grad_norm'] = g_norm
             out[f'{name}_{short}_grad_ratio'] = g_norm / (p_norm + 1e-8)
+    op_specs = (
+        ('attn_qk', 'op_read_proj', 'attn_qk_op_read_proj'),
+        ('attn_qk', 'op_write_proj', 'attn_qk_op_write_proj'),
+        ('attn_v', 'op_read_proj', 'attn_v_op_read_proj'),
+        ('attn_v', 'op_write_proj', 'attn_v_op_write_proj'),
+        ('rst', 'op_read_proj', 'rst_op_read_proj'),
+        ('rst', 'op_write_proj', 'rst_op_write_proj'),
+    )
+    for name, short, key in op_specs:
+        p_norm = (_global_norm_array(pool_p[key])
+                  if key in pool_p else jnp.float32(0.0))
+        g_norm = (_global_norm_array(pool_g[key])
+                  if key in pool_g else jnp.float32(0.0))
+        out[f'{name}_{short}_param_norm'] = p_norm
+        out[f'{name}_{short}_grad_norm'] = g_norm
+        out[f'{name}_{short}_grad_ratio'] = g_norm / (p_norm + 1e-8)
     return out
 
 
@@ -1636,6 +1736,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       router_scan_grad_clip=0.0,
                       route_emb_lr_mult=1.0,
                       route_emb_grad_clip=0.0,
+                      op_key_lr_mult=1.0,
+                      op_key_grad_clip=0.0,
                       enable_control_update_caps=False,
                       router_proj_update_ratio_cap=0.0,
                       route_emb_update_ratio_cap=0.0,
@@ -1776,6 +1878,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _router_scan_grad_clip = jnp.float32(router_scan_grad_clip)
     _route_emb_lr_mult = jnp.float32(route_emb_lr_mult)
     _route_emb_grad_clip = jnp.float32(route_emb_grad_clip)
+    _op_key_lr_mult = jnp.float32(op_key_lr_mult)
+    _op_key_grad_clip = jnp.float32(op_key_grad_clip)
     _enable_control_update_caps = bool(enable_control_update_caps)
     _router_proj_update_ratio_cap = jnp.float32(router_proj_update_ratio_cap)
     _route_emb_update_ratio_cap = jnp.float32(route_emb_update_ratio_cap)
@@ -1789,9 +1893,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
-    _is_soft_direct_tau = str(_model_version) == OFFICIAL_MODEL_VERSION
-    _is_boundary_power_model = (
-        str(_model_version) == OFFICIAL_MODEL_VERSION)
+    _is_soft_direct_tau = _is_active_srw_version(_model_version)
+    _is_boundary_power_model = _is_active_srw_version(_model_version)
     if _is_soft_direct_tau:
         # Official v4164 train path keeps the soft DirectTau loss surface.
         _cb1a_enabled = False
@@ -2519,6 +2622,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/v_emb' in ps)
                     or ('neuron_pool/know_emb' in ps))
 
+        def _is_op_key_proj_path(ps):
+            return (('neuron_pool/attn_qk_op_read_proj' in ps)
+                    or ('neuron_pool/attn_qk_op_write_proj' in ps)
+                    or ('neuron_pool/attn_v_op_read_proj' in ps)
+                    or ('neuron_pool/attn_v_op_write_proj' in ps)
+                    or ('neuron_pool/rst_op_read_proj' in ps)
+                    or ('neuron_pool/rst_op_write_proj' in ps))
+
         def _is_router_proj_attn_path(ps):
             return 'router/proj_attn' in ps
 
@@ -2527,15 +2638,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         def _is_route_emb_qk_path(ps):
             return (('neuron_pool/attn_qk_emb' in ps)
-                    or ('neuron_pool/qk_emb' in ps))
+                    or ('neuron_pool/qk_emb' in ps)
+                    or ('neuron_pool/attn_qk_op_read_proj' in ps)
+                    or ('neuron_pool/attn_qk_op_write_proj' in ps))
 
         def _is_route_emb_v_path(ps):
             return (('neuron_pool/attn_v_emb' in ps)
-                    or ('neuron_pool/v_emb' in ps))
+                    or ('neuron_pool/v_emb' in ps)
+                    or ('neuron_pool/attn_v_op_read_proj' in ps)
+                    or ('neuron_pool/attn_v_op_write_proj' in ps))
 
         def _is_route_emb_rst_path(ps):
             return (('neuron_pool/rst_emb' in ps)
-                    or ('neuron_pool/know_emb' in ps))
+                    or ('neuron_pool/know_emb' in ps)
+                    or ('neuron_pool/rst_op_read_proj' in ps)
+                    or ('neuron_pool/rst_op_write_proj' in ps))
 
         def _is_tau_attn_path(ps):
             return (_is_tau_attn_bias_path(ps)
@@ -2639,6 +2756,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             _group_sq(grads, _is_router_scan_path) + 1e-12)
         route_emb_grad_norm_raw = jnp.sqrt(
             _group_sq(grads, _is_route_emb_path) + 1e-12)
+        op_key_grad_norm_raw = jnp.sqrt(
+            _group_sq(grads, _is_op_key_proj_path) + 1e-12)
 
         tau_clip_scale = _clip_scale(tau_grad_norm_raw, _tau_grad_clip)
         router_proj_clip_scale = _clip_scale(
@@ -2647,6 +2766,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             router_scan_grad_norm_raw, _router_scan_grad_clip)
         route_emb_clip_scale = _clip_scale(
             route_emb_grad_norm_raw, _route_emb_grad_clip)
+        op_key_clip_scale = _clip_scale(
+            op_key_grad_norm_raw, _op_key_grad_clip)
 
         def _clip_control_grad(path, g):
             ps = _path_to_str(path)
@@ -2655,12 +2776,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             scale = jnp.where(_is_router_proj_path(ps), router_proj_clip_scale, scale)
             scale = jnp.where(_is_router_scan_path(ps), router_scan_clip_scale, scale)
             scale = jnp.where(_is_route_emb_path(ps), route_emb_clip_scale, scale)
+            scale = jnp.where(_is_op_key_proj_path(ps), op_key_clip_scale, scale)
             return g * scale.astype(g.dtype)
 
         if (float(tau_grad_clip) > 0.0
                 or float(router_proj_grad_clip) > 0.0
                 or float(router_scan_grad_clip) > 0.0
-                or float(route_emb_grad_clip) > 0.0):
+                or float(route_emb_grad_clip) > 0.0
+                or float(op_key_grad_clip) > 0.0):
             grads = jax.tree.map_with_path(_clip_control_grad, grads)
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
@@ -2672,12 +2795,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             mult = jnp.where(_is_router_proj_path(ps), _router_proj_lr_mult, mult)
             mult = jnp.where(_is_router_scan_path(ps), _router_scan_lr_mult, mult)
             mult = jnp.where(_is_route_emb_path(ps), _route_emb_lr_mult, mult)
+            mult = jnp.where(_is_op_key_proj_path(ps), _op_key_lr_mult, mult)
             return u * mult.astype(u.dtype)
 
         if (float(tau_lr_mult) != 1.0
                 or float(router_proj_lr_mult) != 1.0
                 or float(router_scan_lr_mult) != 1.0
-                or float(route_emb_lr_mult) != 1.0):
+                or float(route_emb_lr_mult) != 1.0
+                or float(op_key_lr_mult) != 1.0):
             updates = jax.tree.map_with_path(_scale_control_update, updates)
 
         # ------------------------------------------------------------------
@@ -2905,12 +3030,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_router_scan_attn = _child_norm(_grouter, 'raw_scan_offset_attn')
         grad_router_scan_rst = _child_norm(_grouter, 'raw_scan_offset_rst')
         grad_pool_attn_qk_emb = _child_norm(_gpool, 'attn_qk_emb')
+        grad_pool_attn_qk_op_key = (
+            _child_norm(_gpool, 'attn_qk_op_read_proj')
+            + _child_norm(_gpool, 'attn_qk_op_write_proj'))
         grad_pool_attn_qk_read = _child_norm(_gpool, 'attn_qk_read')
         grad_pool_attn_qk_write = _child_norm(_gpool, 'attn_qk_write')
         grad_pool_attn_v_emb = _child_norm(_gpool, 'attn_v_emb')
+        grad_pool_attn_v_op_key = (
+            _child_norm(_gpool, 'attn_v_op_read_proj')
+            + _child_norm(_gpool, 'attn_v_op_write_proj'))
         grad_pool_attn_v_read = _child_norm(_gpool, 'attn_v_read')
         grad_pool_attn_v_write = _child_norm(_gpool, 'attn_v_write')
         grad_pool_rst_emb = _child_norm(_gpool, 'rst_emb')
+        grad_pool_rst_op_key = (
+            _child_norm(_gpool, 'rst_op_read_proj')
+            + _child_norm(_gpool, 'rst_op_write_proj'))
         grad_pool_rst_read = _child_norm(_gpool, 'rst_read')
         grad_pool_rst_write = _child_norm(_gpool, 'rst_write')
         if False:
@@ -2998,7 +3132,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             grad_router_scan_attn + grad_router_scan_rst)
         grad_pool_emb = (
             grad_pool_attn_qk_emb + grad_pool_attn_v_emb
-            + grad_pool_rst_emb)
+            + grad_pool_rst_emb + grad_pool_attn_qk_op_key
+            + grad_pool_attn_v_op_key + grad_pool_rst_op_key)
         grad_pool_read = (
             grad_pool_attn_qk_read + grad_pool_attn_v_read
             + grad_pool_rst_read)
@@ -3288,12 +3423,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_router_scan_attn': grad_router_scan_attn,
             'grad_router_scan_rst': grad_router_scan_rst,
             'grad_pool_attn_qk_emb': grad_pool_attn_qk_emb,
+            'grad_pool_attn_qk_op_key': grad_pool_attn_qk_op_key,
             'grad_pool_attn_qk_read': grad_pool_attn_qk_read,
             'grad_pool_attn_qk_write': grad_pool_attn_qk_write,
             'grad_pool_attn_v_emb': grad_pool_attn_v_emb,
+            'grad_pool_attn_v_op_key': grad_pool_attn_v_op_key,
             'grad_pool_attn_v_read': grad_pool_attn_v_read,
             'grad_pool_attn_v_write': grad_pool_attn_v_write,
             'grad_pool_rst_emb': grad_pool_rst_emb,
+            'grad_pool_rst_op_key': grad_pool_rst_op_key,
             'grad_pool_rst_read': grad_pool_rst_read,
             'grad_pool_rst_write': grad_pool_rst_write,
             'grad_pool_scales': grad_pool_scales,
@@ -3873,11 +4011,10 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _return_prune_stats = bool(return_prune_stats)
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
-        and getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        == OFFICIAL_MODEL_VERSION)
-    _is_boundary_power_model = (
-        getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        == OFFICIAL_MODEL_VERSION)
+        and _is_active_srw_version(
+            getattr(model, '__version__', getattr(type(model), '__version__', ''))))
+    _is_boundary_power_model = _is_active_srw_version(
+        getattr(model, '__version__', getattr(type(model), '__version__', '')))
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -4027,11 +4164,10 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
-        and getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        == OFFICIAL_MODEL_VERSION)
-    _is_boundary_power_model = (
-        getattr(model, '__version__', getattr(type(model), '__version__', ''))
-        == OFFICIAL_MODEL_VERSION)
+        and _is_active_srw_version(
+            getattr(model, '__version__', getattr(type(model), '__version__', ''))))
+    _is_boundary_power_model = _is_active_srw_version(
+        getattr(model, '__version__', getattr(type(model), '__version__', '')))
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -5863,8 +5999,8 @@ def _print_cb1a_regular_block(rec):
 
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
-    is_v4164 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
-    is_official_soft_direct_tau = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
+    is_v4164 = _is_active_srw_version(ctx.get('model_version'))
+    is_official_soft_direct_tau = _is_active_srw_version(ctx.get('model_version'))
     official_soft_sparsity_compact = False
     aux_note = (
         " aux_is_not_total_minus_ce"
@@ -5887,12 +6023,12 @@ def _print_regular_block(rec, ctx):
             )
             _soft_gate_label = (
                 'soft_gate_B'
-                if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
+                if _is_active_srw_version(ctx.get('model_version'))
                 else 'soft_gate_T')
             _power_part = (
                 f" boundary_power_p={rec.get('boundary_power_p', 2.0):.3f}"
                 f" admission_den_power={rec.get('admission_den_power', rec.get('den_power', 1.0)):.3f}"
-                if ctx.get('model_version') == OFFICIAL_MODEL_VERSION
+                if _is_active_srw_version(ctx.get('model_version'))
                 else "")
             log_message(
                 f"  {_soft_gate_label}: qk={rec['soft_gate_T_qk']:.6f}"
@@ -5959,7 +6095,7 @@ def _print_regular_block(rec, ctx):
             f" attn_v={rec['drift_attn_v_emb']:.2e}"
             f" rst={rec['drift_rst_emb']:.2e}]"
         )
-    if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
+    if _is_active_srw_version(ctx.get('model_version')):
         pass
     if is_v4164:
         _pool_scale_part = ""
@@ -5968,7 +6104,7 @@ def _print_regular_block(rec, ctx):
                 f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
                 f" v={rec['attn_v_pool_scale']:.3f}"
                 f" rst={rec['rst_pool_scale']:.3f}")
-        if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
+        if _is_active_srw_version(ctx.get('model_version')):
             log_message(
                 f"  drive: "
                 f"qk[m={rec['attn_qk_drive_mean']:.5f}"
@@ -6024,7 +6160,7 @@ def _print_regular_block(rec, ctx):
     if ctx.get('model_version') in (
             OFFICIAL_MODEL_VERSION):
         if is_v4164:
-            if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
+            if _is_active_srw_version(ctx.get('model_version')):
                 pass
             else:
                 log_message(
@@ -6617,7 +6753,7 @@ def _build_analysis_record(base, metrics, ctx):
 def _print_analysis_block(rec, ctx):
     # Analysis logging must never kill a run.  Missing optional fields are
     # printed as 0.0 instead of raising KeyError.
-    is_v4164 = ctx.get('model_version') == OFFICIAL_MODEL_VERSION
+    is_v4164 = _is_active_srw_version(ctx.get('model_version'))
 
     def _g(key, default=0.0):
         return float(rec.get(key, default))
@@ -6652,8 +6788,8 @@ def _print_analysis_block(rec, ctx):
             f" std={_g('rst_rho_std'):.5f}"
             f" max={_g('rst_rho_max'):.5f}]"
         )
-    if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
-        if ctx.get('model_version') == OFFICIAL_MODEL_VERSION:
+    if _is_active_srw_version(ctx.get('model_version')):
+        if _is_active_srw_version(ctx.get('model_version')):
             _print_v4164_sparsity_block(rec)
         else:
             _print_v4164_soft_sparsity_block(rec, 'full')
@@ -6840,10 +6976,10 @@ def main():
     # Training params (from YAML first, may be overridden by checkpoint config below).
     tcfg = cfg['training']
     model_version_cfg = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
-    is_v4164_cfg = model_version_cfg == OFFICIAL_MODEL_VERSION
+    is_v4164_cfg = _is_active_srw_version(model_version_cfg)
     tau_init_cfg = (
         _v4164_tau_init_config(cfg)
-        if model_version_cfg == OFFICIAL_MODEL_VERSION
+        if _is_active_srw_version(model_version_cfg)
         else None)
     # Optional config-driven resume. CLI --resume remains an override for
     # ad-hoc launches, but diagnostic configs can be one-shot.
@@ -6970,15 +7106,15 @@ def main():
         'regular_console_logging_overhead_warn', 0.05))
     eval_effective_prune_enabled = bool(tcfg.get(
         'eval_effective_prune_enabled',
-        model_version_cfg == OFFICIAL_MODEL_VERSION))
+        _is_active_srw_version(model_version_cfg)))
     eval_effective_prune_eps_list = list(tcfg.get(
         'eval_effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
-    if model_version_cfg != OFFICIAL_MODEL_VERSION:
+    if not _is_active_srw_version(model_version_cfg):
         eval_effective_prune_enabled = False
         eval_effective_prune_eps_list = []
     ignored_tau_ce_grad_scale_keys = (
         sorted(k for k in tcfg if k.startswith('tau_ce_grad_scale'))
-        if model_version_cfg == OFFICIAL_MODEL_VERSION
+        if _is_active_srw_version(model_version_cfg)
         else [])
     inactive_aux_start_frac = 0.0
     inactive_aux_full_frac = 0.0
@@ -7021,6 +7157,8 @@ def main():
     router_scan_grad_clip = tcfg.get('router_scan_grad_clip', 0.0)
     route_emb_lr_mult = tcfg.get('route_emb_lr_mult', 1.0)
     route_emb_grad_clip = tcfg.get('route_emb_grad_clip', 0.0)
+    op_key_lr_mult = tcfg.get('op_key_lr_mult', route_emb_lr_mult)
+    op_key_grad_clip = tcfg.get('op_key_grad_clip', route_emb_grad_clip)
     enable_control_update_caps = tcfg.get('enable_control_update_caps', False)
     router_proj_update_ratio_cap = tcfg.get('router_proj_update_ratio_cap', 0.0)
     route_emb_update_ratio_cap = tcfg.get('route_emb_update_ratio_cap', 0.0)
@@ -7355,6 +7493,10 @@ def main():
                 'route_emb_lr_mult', route_emb_lr_mult)
             route_emb_grad_clip = saved_training_config.get(
                 'route_emb_grad_clip', route_emb_grad_clip)
+            op_key_lr_mult = saved_training_config.get(
+                'op_key_lr_mult', op_key_lr_mult)
+            op_key_grad_clip = saved_training_config.get(
+                'op_key_grad_clip', op_key_grad_clip)
             enable_control_update_caps = saved_training_config.get(
                 'enable_control_update_caps', enable_control_update_caps)
             router_proj_update_ratio_cap = saved_training_config.get(
@@ -7593,6 +7735,8 @@ def main():
         'router_scan_grad_clip': router_scan_grad_clip,
         'route_emb_lr_mult': route_emb_lr_mult,
         'route_emb_grad_clip': route_emb_grad_clip,
+        'op_key_lr_mult': op_key_lr_mult,
+        'op_key_grad_clip': op_key_grad_clip,
         'enable_control_update_caps': enable_control_update_caps,
         'router_proj_update_ratio_cap': router_proj_update_ratio_cap,
         'route_emb_update_ratio_cap': route_emb_update_ratio_cap,
@@ -7614,7 +7758,7 @@ def main():
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
-    if model_version_cfg == OFFICIAL_MODEL_VERSION:
+    if _is_active_srw_version(model_version_cfg):
         training_config['tau_init_mode'] = tau_init_cfg['mode']
         if tau_init_cfg['mode'] == 'quantile_frac':
             training_config.update({
@@ -7810,6 +7954,9 @@ def main():
 
     _POOL_PARAM_NAMES = (
         'attn_qk_emb', 'attn_v_emb', 'rst_emb',
+        'attn_qk_op_read_proj', 'attn_qk_op_write_proj',
+        'attn_v_op_read_proj', 'attn_v_op_write_proj',
+        'rst_op_read_proj', 'rst_op_write_proj',
         'qk_emb', 'v_emb', 'rst_emb',
         'q_read', 'k_read',
         'attn_qk_read', 'attn_v_read', 'rst_read',
@@ -7947,6 +8094,7 @@ def main():
               f"router_proj_lr_mult={router_proj_lr_mult}, "
               f"router_scan_lr_mult={router_scan_lr_mult}, "
               f"route_emb_lr_mult={route_emb_lr_mult}, "
+              f"op_key_lr_mult={op_key_lr_mult}, "
               f"dead_clip={dead_penalty_weighted_clip}, "
               f"{_inactive_aux_stabilizer_part}"
               f"resume_restore_training_config={restore_training_config_on_resume}")
@@ -7979,7 +8127,7 @@ def main():
                   f"eps={inactive_aux_bound_eps}")
         print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
               f"router={cfg['model'].get('router_dropout', 0.0)}")
-        print("  Module path: models.dawn_srw_v4164")
+        print(f"  Module path: {_model_registry_entry(model_version_cfg)['module']}")
         print("  Tau parameterization: bounded sigmoid min/max")
         print("  tau = -1 + 2 * sigmoid(raw_tau)")
         print("  Boundary admission: one-sided generalized Gaussian")
@@ -8116,7 +8264,7 @@ def main():
     tau_init_summary = None
     _has_resume_checkpoint = bool(
         resume_path is not None and _file_exists(resume_path))
-    if (model_version_cfg == OFFICIAL_MODEL_VERSION
+    if (_is_active_srw_version(model_version_cfg)
             and tau_init_cfg['mode'] == 'quantile_frac'
             and not _has_resume_checkpoint):
         if len(train_loader) <= 0:
@@ -8126,7 +8274,7 @@ def main():
         _tau_init_summary_json = None
         if is_host0:
             calibration_input_ids, _ = next(iter(train_loader))
-            tau_init_summary = _compute_v4164_quantile_tau_init(
+            tau_init_summary = _compute_srw_quantile_tau_init(
                 params, calibration_input_ids, cfg, tau_init_cfg)
             _tau_init_summary_json = json.dumps(tau_init_summary)
         _tau_init_summary_json = _broadcast_str_from_host0(
@@ -8135,7 +8283,8 @@ def main():
             raise RuntimeError(
                 "Failed to broadcast quantile tau initialization summary.")
         tau_init_summary = json.loads(_tau_init_summary_json)
-        params = _set_v4164_quantile_tau_biases(params, tau_init_summary)
+        params = _set_srw_quantile_tau_biases(
+            params, tau_init_summary, model_version_cfg)
         if is_host0:
             print("\n=== Quantile tau initialization ===", flush=True)
             for _line in _v4164_tau_init_summary_lines(tau_init_summary):
@@ -8262,7 +8411,8 @@ def main():
     _sharded_fns_analysis = None
     _force_sharded = True
     if mesh_model > 1 or _force_sharded:
-        _v4164_module = __import__('models.dawn_srw_v4164', fromlist=['make_sharded_srw'])
+        _srw_module_name = _model_registry_entry(model_version_cfg)['module']
+        _v4164_module = __import__(_srw_module_name, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v4164_module.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', None)
         if max_chunk is not None:
@@ -8382,6 +8532,8 @@ def main():
         router_scan_grad_clip=router_scan_grad_clip,
         route_emb_lr_mult=route_emb_lr_mult,
         route_emb_grad_clip=route_emb_grad_clip,
+        op_key_lr_mult=op_key_lr_mult,
+        op_key_grad_clip=op_key_grad_clip,
         enable_control_update_caps=enable_control_update_caps,
         router_proj_update_ratio_cap=router_proj_update_ratio_cap,
         route_emb_update_ratio_cap=route_emb_update_ratio_cap,
@@ -8411,7 +8563,7 @@ def main():
         inactive_aux_full_frac=inactive_aux_full_frac,
         inactive_aux_schedule=inactive_aux_schedule,
         sharded_fns=_sharded_fns, mesh=mesh,
-        compact_train_metrics=(model_version_cfg == OFFICIAL_MODEL_VERSION),
+        compact_train_metrics=_is_active_srw_version(model_version_cfg),
         keep_train_layer_metrics=False)
     eval_step_fn = create_eval_step(
         model, sharded_fns=_sharded_fns, return_dead_stats=True,
@@ -8608,14 +8760,14 @@ def main():
                 raise _SkipBreakdown("speed check disabled")
 
             _is_sharded = _sharded_fns is not None
-            _uses_scan_offset = model_version == OFFICIAL_MODEL_VERSION
+            _uses_scan_offset = _is_active_srw_version(model_version)
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
             _v4164_module = __import__(
-                'models.dawn_srw_v4164',
+                _model_registry_entry(model_version)['module'],
                 fromlist=['_layer_norm', '_attn_forward', '_rst_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _rst_forward, _srw_chunked = _v4164_module._layer_norm, _v4164_module._attn_forward, _v4164_module._rst_forward, _v4164_module._srw_chunked
 
@@ -8802,9 +8954,18 @@ def main():
                                     rst_read, rst_write, n_chunks_rst)
 
             # --- Prepare intermediate values ---
-            qk_emb = _get_param(pool_p, 'attn_qk_emb', 'qk_emb')
-            v_emb = _get_param(pool_p, 'attn_v_emb', 'v_emb')
-            rst_emb = _get_param(pool_p, 'rst_emb', 'rst_emb')
+            pool_select_p = (
+                _v4164_module._pool_params_with_operator_keys(pool_p)
+                if hasattr(_v4164_module, '_pool_params_with_operator_keys')
+                else pool_p)
+            qk_emb = _get_param(
+                pool_select_p, 'attn_qk_op_key',
+                'attn_qk_emb' if 'attn_qk_emb' in pool_select_p else 'qk_emb')
+            v_emb = _get_param(
+                pool_select_p, 'attn_v_op_key',
+                'attn_v_emb' if 'attn_v_emb' in pool_select_p else 'v_emb')
+            rst_emb = _get_param(
+                pool_select_p, 'rst_op_key', 'rst_emb')
             qk_read = _get_param(pool_p, 'attn_qk_read', 'qk_read')
             qk_write = _get_param(pool_p, 'attn_qk_write', 'qk_write')
             v_read = _get_param(pool_p, 'attn_v_read', 'v_read')
@@ -9366,21 +9527,21 @@ def main():
                             soft_gate_boundary_power_final_frac,
                         'intensity_beta': (
                             0.0
-                            if model_version_cfg == OFFICIAL_MODEL_VERSION
+                            if _is_active_srw_version(model_version_cfg)
                             else float(tcfg.get('intensity_beta', 0.0))),
                         'd_select': (
                             0
-                            if model_version_cfg == OFFICIAL_MODEL_VERSION
+                            if _is_active_srw_version(model_version_cfg)
                             else int(cfg['model'].get('d_select', 0) or 0)),
                         'd_intensity': (
                             0
-                            if model_version_cfg == OFFICIAL_MODEL_VERSION
+                            if _is_active_srw_version(model_version_cfg)
                             else int(
                                 cfg['model'].get('d_route', 0)
                                 - cfg['model'].get('d_select', 0))),
                         'd_route_unified': (
                             int(cfg['model'].get('d_route', 0))
-                            if model_version_cfg == OFFICIAL_MODEL_VERSION
+                            if _is_active_srw_version(model_version_cfg)
                             else 0),
                     }
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
