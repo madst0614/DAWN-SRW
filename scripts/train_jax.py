@@ -537,16 +537,41 @@ def _v4164_tau_init_config(cfg):
     return parsed
 
 
+def _cfg_bool(value, *, name):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in ('1', 'true', 'yes', 'on'):
+            return True
+        if norm in ('0', 'false', 'no', 'off'):
+            return False
+        raise ValueError(f"{name} must be a boolean, got {value!r}.")
+    return bool(value)
+
+
+def _v4166_op_key_stopgrad_rw(cfg):
+    model_cfg = cfg['model']
+    training_cfg = cfg['training']
+    value = model_cfg.get(
+        'op_key_stopgrad_rw',
+        training_cfg.get('op_key_stopgrad_rw', False))
+    return _cfg_bool(value, name='op_key_stopgrad_rw')
+
+
 def _dawn_srw_kwargs(cfg):
     """Official v4.1.6.4 DAWN-SRW constructor kwargs."""
     kw = _v4164_model_base_kwargs(cfg)
     m = cfg['model']
     t = cfg['training']
+    version = m.get('model_version', OFFICIAL_MODEL_VERSION)
     if 'n_rst' not in m and 'n_know' not in m:
         raise ValueError("v4164 requires model.n_rst or model.n_know checkpoint alias.")
     kw['n_rst'] = m.get('n_rst', m.get('n_know'))
     kw['n_know'] = m.get('n_know', None)
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
+    if version == V4166_MODEL_VERSION:
+        kw['op_key_stopgrad_rw'] = _v4166_op_key_stopgrad_rw(cfg)
     tau_init_cfg = _v4164_tau_init_config(cfg)
     if tau_init_cfg['mode'] == 'explicit':
         kw['tau_init_attn_qk'] = tau_init_cfg['explicit']['qk']
@@ -636,6 +661,8 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
     score_kwargs = {
         'max_tokens': tau_init_cfg['calibration_tokens'],
     }
+    if version == V4166_MODEL_VERSION:
+        score_kwargs['op_key_stopgrad_rw'] = _v4166_op_key_stopgrad_rw(cfg)
     score_fn = jax.jit(partial(score_impl, **score_kwargs))
     sampled = jax.device_get(score_fn(score_params, input_ids))
     scores = {
@@ -6977,6 +7004,12 @@ def main():
     tcfg = cfg['training']
     model_version_cfg = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     is_v4164_cfg = _is_active_srw_version(model_version_cfg)
+    op_key_stopgrad_rw = (
+        _v4166_op_key_stopgrad_rw(cfg)
+        if model_version_cfg == V4166_MODEL_VERSION
+        else False)
+    if model_version_cfg == V4166_MODEL_VERSION:
+        cfg['model']['op_key_stopgrad_rw'] = op_key_stopgrad_rw
     tau_init_cfg = (
         _v4164_tau_init_config(cfg)
         if _is_active_srw_version(model_version_cfg)
@@ -7497,6 +7530,12 @@ def main():
                 'op_key_lr_mult', op_key_lr_mult)
             op_key_grad_clip = saved_training_config.get(
                 'op_key_grad_clip', op_key_grad_clip)
+            if model_version_cfg == V4166_MODEL_VERSION:
+                op_key_stopgrad_rw = _cfg_bool(
+                    saved_training_config.get(
+                        'op_key_stopgrad_rw', op_key_stopgrad_rw),
+                    name='op_key_stopgrad_rw')
+                cfg['model']['op_key_stopgrad_rw'] = op_key_stopgrad_rw
             enable_control_update_caps = saved_training_config.get(
                 'enable_control_update_caps', enable_control_update_caps)
             router_proj_update_ratio_cap = saved_training_config.get(
@@ -7760,6 +7799,8 @@ def main():
     }
     if _is_active_srw_version(model_version_cfg):
         training_config['tau_init_mode'] = tau_init_cfg['mode']
+        if model_version_cfg == V4166_MODEL_VERSION:
+            training_config['op_key_stopgrad_rw'] = op_key_stopgrad_rw
         if tau_init_cfg['mode'] == 'quantile_frac':
             training_config.update({
                 'tau_init_target_qk_frac': tau_init_cfg['targets']['qk'],
@@ -8128,6 +8169,10 @@ def main():
         print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
               f"router={cfg['model'].get('router_dropout', 0.0)}")
         print(f"  Module path: {_model_registry_entry(model_version_cfg)['module']}")
+        if model_version_cfg == V4166_MODEL_VERSION:
+            print(
+                "  op_key_stopgrad_rw="
+                f"{str(op_key_stopgrad_rw).lower()}")
         print("  Tau parameterization: bounded sigmoid min/max")
         print("  tau = -1 + 2 * sigmoid(raw_tau)")
         print("  Boundary admission: one-sided generalized Gaussian")

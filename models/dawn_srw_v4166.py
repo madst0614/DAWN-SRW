@@ -305,13 +305,19 @@ def _forward_unit_direction(x):
                 + RW_FORWARD_NORM_EPS)
 
 
-def _rw_operator_key(read, write, read_proj, write_proj, eps=1e-6):
+def _rw_operator_key(read, write, read_proj, write_proj, *,
+                     stopgrad_rw=False, eps=1e-6):
     """Compressed RW operator identity used for v4166 selection.
 
-    Gradients intentionally flow through read/write and both projections.
+    By default, gradients flow through read/write and both projections.
+    When stopgrad_rw is true, only the selection-path gradients into
+    read/write are blocked; op-key projection gradients remain live.
     The projections are bias-free so (-read, -write) preserves the same key.
     """
     eps = jnp.asarray(eps, dtype=jnp.float32)
+    if stopgrad_rw:
+        read = jax.lax.stop_gradient(read)
+        write = jax.lax.stop_gradient(write)
 
     def _unit(x):
         return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
@@ -331,37 +337,41 @@ def _rw_operator_key(read, write, read_proj, write_proj, eps=1e-6):
     return op_key.astype(jnp.float32)
 
 
-def _pool_operator_keys(pool_params):
+def _pool_operator_keys(pool_params, *, stopgrad_rw=False):
     return {
         'attn_qk_op_key': _rw_operator_key(
             pool_params['attn_qk_read'],
             pool_params['attn_qk_write'],
             pool_params['attn_qk_op_read_proj'],
-            pool_params['attn_qk_op_write_proj']),
+            pool_params['attn_qk_op_write_proj'],
+            stopgrad_rw=stopgrad_rw),
         'attn_v_op_key': _rw_operator_key(
             pool_params['attn_v_read'],
             pool_params['attn_v_write'],
             pool_params['attn_v_op_read_proj'],
-            pool_params['attn_v_op_write_proj']),
+            pool_params['attn_v_op_write_proj'],
+            stopgrad_rw=stopgrad_rw),
         'rst_op_key': _rw_operator_key(
             pool_params['rst_read'],
             pool_params['rst_write'],
             pool_params['rst_op_read_proj'],
-            pool_params['rst_op_write_proj']),
+            pool_params['rst_op_write_proj'],
+            stopgrad_rw=stopgrad_rw),
     }
 
 
-def _pool_params_with_operator_keys(pool_params):
+def _pool_params_with_operator_keys(pool_params, *, stopgrad_rw=False):
     """Attach per-forward shared op keys without recomputing in each layer."""
     out = unfreeze(pool_params) if isinstance(pool_params, FrozenDict) else dict(pool_params)
-    out.update(_pool_operator_keys(pool_params))
+    out.update(_pool_operator_keys(pool_params, stopgrad_rw=stopgrad_rw))
     return out
 
 
-def _ensure_pool_operator_keys(pool_params):
+def _ensure_pool_operator_keys(pool_params, *, stopgrad_rw=False):
     if 'attn_qk_op_key' in pool_params:
         return pool_params
-    return _pool_params_with_operator_keys(pool_params)
+    return _pool_params_with_operator_keys(
+        pool_params, stopgrad_rw=stopgrad_rw)
 
 
 @jax.custom_vjp
@@ -2942,6 +2952,7 @@ class DAWN_SRW_V4166(nn.Module):
     tau_init_attn_qk: Optional[float] = None
     tau_init_attn_v: Optional[float] = None
     tau_init_rst: Optional[float] = None
+    op_key_stopgrad_rw: bool = False
 
     def setup(self):
         if self.d_model % self.n_heads != 0:
@@ -3159,7 +3170,8 @@ class DAWN_SRW_V4166(nn.Module):
         else:
             all_params = self.variables['params']
             pool_params = _pool_params_with_operator_keys(
-                all_params['neuron_pool'])
+                all_params['neuron_pool'],
+                stopgrad_rw=self.op_key_stopgrad_rw)
             router_params = all_params['router']
 
             _sharded = sharded_fns
@@ -4033,6 +4045,7 @@ class DAWN_SRW_V4166(nn.Module):
             'd_route': self.d_route,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
+            'op_key_stopgrad_rw': bool(self.op_key_stopgrad_rw),
         }
         return cfg
 
@@ -4047,6 +4060,7 @@ class DAWN_SRW_V4166(nn.Module):
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  Attention-QK: {self.n_qk}, Attention-V: {self.n_v}, RST: {n_rst_eff}",
             f"  Selection: RW operator keys in d_route={self.d_route}",
+            f"  op_key_stopgrad_rw={bool(self.op_key_stopgrad_rw)}",
             "  Pool scales: fixed depth-scaled "
             f"(qk={float(qk_scale):.6g}, v={float(v_scale):.6g}, "
             f"rst={float(rst_scale):.6g})",
@@ -4093,7 +4107,21 @@ def _angular_execution_kwargs_from_model_cfg(model_cfg):
     }
 
 
-def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
+def _op_key_stopgrad_rw_from_model_cfg(model_cfg):
+    value = model_cfg.get('op_key_stopgrad_rw', False)
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in ('1', 'true', 'yes', 'on'):
+            return True
+        if norm in ('0', 'false', 'no', 'off'):
+            return False
+        raise ValueError(
+            f"op_key_stopgrad_rw must be a boolean, got {value!r}.")
+    return bool(value)
+
+
+def _tau_init_calibration_scores(params, input_ids, max_tokens=128,
+                                 op_key_stopgrad_rw=False):
     """Sample fresh-init cosine scores without changing forward semantics.
 
     The sample uses the first block's freshly initialized normalized route
@@ -4145,7 +4173,8 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
         return (q_unit @ op_key_unit.T).astype(jnp.float32)
 
     pool = params['neuron_pool']
-    op_keys = _pool_operator_keys(pool)
+    op_keys = _pool_operator_keys(
+        pool, stopgrad_rw=bool(op_key_stopgrad_rw))
     qk_op_key = op_keys['attn_qk_op_key']
     v_op_key = op_keys['attn_v_op_key']
     rst_op_key = op_keys['rst_op_key']
@@ -4336,7 +4365,9 @@ def prefill(params, model_cfg, input_ids):
     max_seq = model_cfg['max_seq_len']
     d_head = d_model // n_heads
 
-    pool_params = _pool_params_with_operator_keys(params['neuron_pool'])
+    pool_params = _pool_params_with_operator_keys(
+        params['neuron_pool'],
+        stopgrad_rw=_op_key_stopgrad_rw_from_model_cfg(model_cfg))
     router_params = params['router']
     qk_scale_eff, v_scale_eff, _ = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
@@ -4423,7 +4454,9 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     n_heads = model_cfg['n_heads']
     angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
 
-    pool_params = _pool_params_with_operator_keys(params['neuron_pool'])
+    pool_params = _pool_params_with_operator_keys(
+        params['neuron_pool'],
+        stopgrad_rw=_op_key_stopgrad_rw_from_model_cfg(model_cfg))
     router_params = params['router']
 
     x = (params['token_emb']['embedding'][token_id]
@@ -4487,7 +4520,9 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     max_seq = model_cfg['max_seq_len']
     angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
 
-    pool_params = _pool_params_with_operator_keys(params['neuron_pool'])
+    pool_params = _pool_params_with_operator_keys(
+        params['neuron_pool'],
+        stopgrad_rw=_op_key_stopgrad_rw_from_model_cfg(model_cfg))
     router_params = params['router']
     qk_scale_eff, v_scale_eff, rst_scale_eff = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
@@ -4680,7 +4715,9 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
     n_heads = model_cfg['n_heads']
     angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
 
-    pool_params = _pool_params_with_operator_keys(params['neuron_pool'])
+    pool_params = _pool_params_with_operator_keys(
+        params['neuron_pool'],
+        stopgrad_rw=_op_key_stopgrad_rw_from_model_cfg(model_cfg))
     router_params = params['router']
     qk_scale_eff, v_scale_eff, rst_scale_eff = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
@@ -4822,7 +4859,9 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         n_layers = model_cfg['n_layers']
         n_heads = model_cfg['n_heads']
         d_head = d_model // n_heads
-        pp = _pool_params_with_operator_keys(params['neuron_pool'])
+        pp = _pool_params_with_operator_keys(
+            params['neuron_pool'],
+            stopgrad_rw=_op_key_stopgrad_rw_from_model_cfg(model_cfg))
         rp = params['router']
         qk_scale_eff, v_scale_eff, rst_scale_eff = _effective_pool_output_scales(
             pp, d_model, n_layers)

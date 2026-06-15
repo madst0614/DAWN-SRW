@@ -20,7 +20,7 @@ model:
   n_qk: 1480
   n_v: 7330
   n_rst: 20560
-  op_key_stopgrad_rw: false
+  op_key_stopgrad_rw: true
   tau_init_min: -0.95
   tau_init_max: 0.95
   tau_init_mode: quantile_frac
@@ -113,4 +113,4 @@ training:
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_40M_c4_5B_ggauss_boundary_panneal
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_40M_c4_5B_ggauss_boundary_panneal_op_key_stopgrad_rw
