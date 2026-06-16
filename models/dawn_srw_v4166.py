@@ -305,6 +305,21 @@ def _forward_unit_direction(x):
                 + RW_FORWARD_NORM_EPS)
 
 
+def _factorized_operator_query(q_primary, h, q_factor_proj, eps=1e-6):
+    q_r = q_primary.astype(jnp.float32)
+    q_r = q_r / (
+        jnp.linalg.norm(q_r, axis=-1, keepdims=True) + eps)
+
+    q_w = h.astype(jnp.float32) @ q_factor_proj
+    q_w = q_w / (
+        jnp.linalg.norm(q_w, axis=-1, keepdims=True) + eps)
+
+    q_op = q_r * q_w
+    q_op = q_op / (
+        jnp.linalg.norm(q_op, axis=-1, keepdims=True) + eps)
+    return q_op.astype(jnp.float32)
+
+
 def _rw_operator_key(read, write, read_proj, write_proj, *,
                      stopgrad_rw=False, eps=1e-6):
     """Compressed RW operator identity used for v4166 selection.
@@ -2293,12 +2308,21 @@ class Router(nn.Module):
     tau_init_attn_qk: Optional[float] = None
     tau_init_attn_v: Optional[float] = None
     tau_init_rst: Optional[float] = None
+    op_query_factorized: bool = False
+    op_query_factorized_mode: str = 'product'
 
     def setup(self):
         db = self.d_route
+        dm = self.d_model
         n_rst_eff = self.n_rst if self.n_rst is not None else self.n_know
         if n_rst_eff is None:
             raise ValueError("Router requires n_rst or n_know checkpoint alias.")
+        op_query_factorized_mode = str(
+            self.op_query_factorized_mode).strip().lower()
+        if op_query_factorized_mode != 'product':
+            raise ValueError(
+                "v4166 op_query_factorized_mode must be 'product', got "
+                f"{self.op_query_factorized_mode!r}.")
 
         missing_tau = [
             name for name, value in (
@@ -2325,6 +2349,16 @@ class Router(nn.Module):
             _raw_tau_init_from_cosine_tau(rst_tau_init), dtype=jnp.float32)
         self.proj_attn = nn.Dense(db * 3, name='proj_attn')
         self.proj_rst = nn.Dense(db, name='proj_rst')
+        if self.op_query_factorized:
+            factor_init = nn.initializers.lecun_normal()
+            self.q_op_query_factor_proj = self.param(
+                'q_op_query_factor_proj', factor_init, (dm, db))
+            self.k_op_query_factor_proj = self.param(
+                'k_op_query_factor_proj', factor_init, (dm, db))
+            self.v_op_query_factor_proj = self.param(
+                'v_op_query_factor_proj', factor_init, (dm, db))
+            self.rst_op_query_factor_proj = self.param(
+                'rst_op_query_factor_proj', factor_init, (dm, db))
         self.raw_tau_attn = nn.Dense(3, name='raw_tau_attn',
             kernel_init=nn.initializers.zeros,
             bias_init=lambda k, s, d: raw_tau_attn_bias_init.astype(d))
@@ -2349,7 +2383,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   soft_gate_boundary_power=2.0,
                   soft_gate_boundary_power_final=4.0,
                   admission_den_power=1.0,
-                  execution_prune_eps=0.0):
+                  execution_prune_eps=0.0,
+                  op_query_factorized=False):
     """v4166 sharded-only path. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -2391,6 +2426,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
     h_all = safe_dropout(h_all, router_dropout, deterministic, rng_drop)
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+    if op_query_factorized:
+        h_Q = _factorized_operator_query(
+            h_Q, x, router_params['q_op_query_factor_proj'])
+        h_K = _factorized_operator_query(
+            h_K, x, router_params['k_op_query_factor_proj'])
+        h_V = _factorized_operator_query(
+            h_V, x, router_params['v_op_query_factor_proj'])
 
     raw_tau_all = (
         x @ router_params['raw_tau_attn']['kernel']
@@ -2755,7 +2797,8 @@ def _rst_forward(x, pool_params, router_params, rng,
                   soft_gate_boundary_power=2.0,
                   soft_gate_boundary_power_final=4.0,
                   admission_den_power=1.0,
-                  execution_prune_eps=0.0):
+                  execution_prune_eps=0.0,
+                  op_query_factorized=False):
     """v4166 sharded-only path. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis` see _attn_forward docstring.
@@ -2772,6 +2815,9 @@ def _rst_forward(x, pool_params, router_params, rng,
     rng, rng_drop = jax.random.split(rng)
     h = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
+    if op_query_factorized:
+        h = _factorized_operator_query(
+            h, x, router_params['rst_op_query_factor_proj'])
 
     # RW-derived operator keys are passed into the sharded SRW closure.
     # The closure forward-normalizes them for selection stability.
@@ -2953,12 +2999,20 @@ class DAWN_SRW_V4166(nn.Module):
     tau_init_attn_v: Optional[float] = None
     tau_init_rst: Optional[float] = None
     op_key_stopgrad_rw: bool = False
+    op_query_factorized: bool = False
+    op_query_factorized_mode: str = 'product'
 
     def setup(self):
         if self.d_model % self.n_heads != 0:
             raise ValueError(
                 f"d_model ({self.d_model}) must be divisible by "
                 f"n_heads ({self.n_heads})")
+        op_query_factorized_mode = str(
+            self.op_query_factorized_mode).strip().lower()
+        if op_query_factorized_mode != 'product':
+            raise ValueError(
+                "v4166 op_query_factorized_mode must be 'product', got "
+                f"{self.op_query_factorized_mode!r}.")
         self.token_emb = nn.Embed(
             self.vocab_size, self.d_model, embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(
@@ -2974,7 +3028,9 @@ class DAWN_SRW_V4166(nn.Module):
             router_dropout=self.router_dropout,
             tau_init_attn_qk=self.tau_init_attn_qk,
             tau_init_attn_v=self.tau_init_attn_v,
-            tau_init_rst=self.tau_init_rst)
+            tau_init_rst=self.tau_init_rst,
+            op_query_factorized=self.op_query_factorized,
+            op_query_factorized_mode=op_query_factorized_mode)
         self.layers = [
             DAWNBlock(d_model=self.d_model, n_heads=self.n_heads,
                       dropout_rate=self.dropout_rate, name=f'block_{i}')
@@ -3208,7 +3264,8 @@ class DAWN_SRW_V4166(nn.Module):
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
                     admission_den_power=admission_den_power,
-                    execution_prune_eps=execution_prune_eps)
+                    execution_prune_eps=execution_prune_eps,
+                    op_query_factorized=self.op_query_factorized)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -3275,7 +3332,8 @@ class DAWN_SRW_V4166(nn.Module):
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
                     admission_den_power=admission_den_power,
-                    execution_prune_eps=execution_prune_eps)
+                    execution_prune_eps=execution_prune_eps,
+                    op_query_factorized=self.op_query_factorized)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_strong, k_positive_margin_active, k_tau_abs,
@@ -3556,6 +3614,9 @@ class DAWN_SRW_V4166(nn.Module):
                 soft_gate_boundary_power, dtype=jnp.float32),
             'soft_gate_boundary_power_final': jnp.asarray(
                 soft_gate_boundary_power_final, dtype=jnp.float32),
+            'op_query_factorized': jnp.asarray(
+                1.0 if self.op_query_factorized else 0.0,
+                dtype=jnp.float32),
             'execution_prune_eps': jnp.asarray(execution_prune_eps, dtype=jnp.float32),
             'execution_gate_mass_retained': (
                 (attn_den_cost_mean_all.mean() + rst_den_cost_mean_all.mean())
@@ -4046,6 +4107,8 @@ class DAWN_SRW_V4166(nn.Module):
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
             'op_key_stopgrad_rw': bool(self.op_key_stopgrad_rw),
+            'op_query_factorized': bool(self.op_query_factorized),
+            'op_query_factorized_mode': str(self.op_query_factorized_mode),
         }
         return cfg
 
@@ -4061,6 +4124,8 @@ class DAWN_SRW_V4166(nn.Module):
             f"  Attention-QK: {self.n_qk}, Attention-V: {self.n_v}, RST: {n_rst_eff}",
             f"  Selection: RW operator keys in d_route={self.d_route}",
             f"  op_key_stopgrad_rw={bool(self.op_key_stopgrad_rw)}",
+            f"  op_query_factorized={bool(self.op_query_factorized)} "
+            f"mode={str(self.op_query_factorized_mode)}",
             "  Pool scales: fixed depth-scaled "
             f"(qk={float(qk_scale):.6g}, v={float(v_scale):.6g}, "
             f"rst={float(rst_scale):.6g})",
@@ -4120,8 +4185,33 @@ def _op_key_stopgrad_rw_from_model_cfg(model_cfg):
     return bool(value)
 
 
+def _op_query_factorized_from_model_cfg(model_cfg):
+    value = model_cfg.get('op_query_factorized', False)
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in ('1', 'true', 'yes', 'on'):
+            return True
+        if norm in ('0', 'false', 'no', 'off'):
+            return False
+        raise ValueError(
+            f"op_query_factorized must be a boolean, got {value!r}.")
+    return bool(value)
+
+
+def _op_query_factorized_mode_from_model_cfg(model_cfg):
+    mode = str(model_cfg.get(
+        'op_query_factorized_mode', 'product')).strip().lower()
+    if mode != 'product':
+        raise ValueError(
+            "op_query_factorized_mode must be 'product', got "
+            f"{mode!r}.")
+    return mode
+
+
 def _tau_init_calibration_scores(params, input_ids, max_tokens=128,
-                                 op_key_stopgrad_rw=False):
+                                 op_key_stopgrad_rw=False,
+                                 op_query_factorized=False,
+                                 op_query_factorized_mode='product'):
     """Sample fresh-init cosine scores without changing forward semantics.
 
     The sample uses the first block's freshly initialized normalized route
@@ -4157,6 +4247,11 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128,
     rst_x = _layer_norm(
         x, block0['norm2']['scale'], block0['norm2']['bias'])
     router = params['router']
+    op_query_factorized_mode = str(op_query_factorized_mode).strip().lower()
+    if op_query_factorized_mode != 'product':
+        raise ValueError(
+            "op_query_factorized_mode must be 'product', got "
+            f"{op_query_factorized_mode!r}.")
     h_all = (
         attn_x @ router['proj_attn']['kernel']
         + router['proj_attn']['bias'])
@@ -4164,6 +4259,15 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128,
     h_rst = (
         rst_x @ router['proj_rst']['kernel']
         + router['proj_rst']['bias'])
+    if op_query_factorized:
+        h_q = _factorized_operator_query(
+            h_q, attn_x, router['q_op_query_factor_proj'])
+        h_k = _factorized_operator_query(
+            h_k, attn_x, router['k_op_query_factor_proj'])
+        h_v = _factorized_operator_query(
+            h_v, attn_x, router['v_op_query_factor_proj'])
+        h_rst = _factorized_operator_query(
+            h_rst, rst_x, router['rst_op_query_factor_proj'])
 
     def _selection_rho(h, op_key):
         q_unit = _forward_unit_direction(
@@ -4219,6 +4323,28 @@ def _angular_execution_weight(h, op_key, raw_tau, raw_scan_offset=None,
         execution_prune_eps=execution_prune_eps,
         soft_gate_effective_active_eps=soft_gate_effective_active_eps)
     return execution_weight.astype(jnp.float32)
+
+
+def _maybe_factorize_attn_queries(router_params, x, h_q, h_k, h_v,
+                                  op_query_factorized=False):
+    if not op_query_factorized:
+        return h_q, h_k, h_v
+    return (
+        _factorized_operator_query(
+            h_q, x, router_params['q_op_query_factor_proj']),
+        _factorized_operator_query(
+            h_k, x, router_params['k_op_query_factor_proj']),
+        _factorized_operator_query(
+            h_v, x, router_params['v_op_query_factor_proj']),
+    )
+
+
+def _maybe_factorize_rst_query(router_params, x, h,
+                               op_query_factorized=False):
+    if not op_query_factorized:
+        return h
+    return _factorized_operator_query(
+        h, x, router_params['rst_op_query_factor_proj'])
 
 
 def _split_admission_den_kwargs(angular_execution_kwargs):
@@ -4278,7 +4404,8 @@ def _srw_inference_with_gates(x, h, op_key, raw_tau, raw_scan_offset, w_read,
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
                          n_heads, d_model, n_layers,
                          cache_K, cache_V, cache_len,
-                         angular_execution_kwargs=None):
+                         angular_execution_kwargs=None,
+                         op_query_factorized=False):
     """Cached attention decode step. x: [B, 1, D]."""
     B = x.shape[0]
     d_head = d_model // n_heads
@@ -4290,6 +4417,8 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
     v_norm = pool_params['attn_v_op_key']
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+    h_Q, h_K, h_V = _maybe_factorize_attn_queries(
+        router_params, x, h_Q, h_K, h_V, op_query_factorized)
     tau_all = x @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
     raw_scan_offset_all = jnp.zeros_like(tau_all)
 
@@ -4330,13 +4459,16 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
 def _rst_forward_inference(x, pool_params, router_params,
                            d_model=None, n_layers=None,
-                           angular_execution_kwargs=None):
+                           angular_execution_kwargs=None,
+                           op_query_factorized=False):
     """Inference-only RST Layer forward. No chunking, no LB, no dropout."""
     if angular_execution_kwargs is None:
         angular_execution_kwargs = {}
     pool_params = _ensure_pool_operator_keys(pool_params)
     rst_norm = pool_params['rst_op_key']
     h = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
+    h = _maybe_factorize_rst_query(
+        router_params, x, h, op_query_factorized)
     tau = x @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
     raw_scan_offset = jnp.zeros_like(tau)
     out = _srw_inference(x, h, rst_norm, tau, raw_scan_offset,
@@ -4362,6 +4494,8 @@ def prefill(params, model_cfg, input_ids):
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
     angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
+    op_query_factorized = _op_query_factorized_from_model_cfg(model_cfg)
+    _op_query_factorized_mode_from_model_cfg(model_cfg)
     max_seq = model_cfg['max_seq_len']
     d_head = d_model // n_heads
 
@@ -4392,6 +4526,8 @@ def prefill(params, model_cfg, input_ids):
         normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
         h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        h_Q, h_K, h_V = _maybe_factorize_attn_queries(
+            router_params, normed, h_Q, h_K, h_V, op_query_factorized)
         tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
         raw_scan_offset_all = jnp.zeros_like(tau_all)
 
@@ -4431,7 +4567,8 @@ def prefill(params, model_cfg, input_ids):
         rst_out = _rst_forward_inference(
             normed, pool_params, router_params,
             d_model=d_model, n_layers=n_layers,
-            angular_execution_kwargs=angular_execution_kwargs)
+            angular_execution_kwargs=angular_execution_kwargs,
+            op_query_factorized=op_query_factorized)
         x = x + rst_out
         return (x, cK, cV), None
 
@@ -4453,6 +4590,8 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
     angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
+    op_query_factorized = _op_query_factorized_from_model_cfg(model_cfg)
+    _op_query_factorized_mode_from_model_cfg(model_cfg)
 
     pool_params = _pool_params_with_operator_keys(
         params['neuron_pool'],
@@ -4476,7 +4615,8 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
             bp['attn']['expand_O']['kernel'],
             n_heads, d_model, n_layers,
             cK[layer_idx], cV[layer_idx], pos,
-            angular_execution_kwargs=angular_execution_kwargs)
+            angular_execution_kwargs=angular_execution_kwargs,
+            op_query_factorized=op_query_factorized)
         cK = cK.at[layer_idx].set(new_cK)
         cV = cV.at[layer_idx].set(new_cV)
         x = x + attn_out
@@ -4485,7 +4625,8 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
         rst_out = _rst_forward_inference(
             normed, pool_params, router_params,
             d_model=d_model, n_layers=n_layers,
-            angular_execution_kwargs=angular_execution_kwargs)
+            angular_execution_kwargs=angular_execution_kwargs,
+            op_query_factorized=op_query_factorized)
         x = x + rst_out
         return (x, cK, cV, pos), None
 
@@ -4519,6 +4660,8 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     n_heads = model_cfg['n_heads']
     max_seq = model_cfg['max_seq_len']
     angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
+    op_query_factorized = _op_query_factorized_from_model_cfg(model_cfg)
+    _op_query_factorized_mode_from_model_cfg(model_cfg)
 
     pool_params = _pool_params_with_operator_keys(
         params['neuron_pool'],
@@ -4546,6 +4689,9 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
             h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            h_Q, h_K, h_V = _maybe_factorize_attn_queries(
+                router_params, normed, h_Q, h_K, h_V,
+                op_query_factorized)
             tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
             raw_scan_offset_all = jnp.zeros_like(tau_all)
 
@@ -4581,6 +4727,8 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
 
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
+            h_k = _maybe_factorize_rst_query(
+                router_params, normed, h_k, op_query_factorized)
             tau_k = normed @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
             raw_scan_offset_k = jnp.zeros_like(tau_k)
             rst_out = _srw_inference(normed, h_k, rst_norm, tau_k, raw_scan_offset_k,
@@ -4714,6 +4862,8 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
     angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
+    op_query_factorized = _op_query_factorized_from_model_cfg(model_cfg)
+    _op_query_factorized_mode_from_model_cfg(model_cfg)
 
     pool_params = _pool_params_with_operator_keys(
         params['neuron_pool'],
@@ -4741,6 +4891,9 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
         h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        h_Q, h_K, h_V = _maybe_factorize_attn_queries(
+            router_params, normed, h_Q, h_K, h_V,
+            op_query_factorized)
         tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
         raw_scan_offset_all = jnp.zeros_like(tau_all)
 
@@ -4779,6 +4932,8 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
 
         normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
         h_k = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
+        h_k = _maybe_factorize_rst_query(
+            router_params, normed, h_k, op_query_factorized)
         tau_k = normed @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
         raw_scan_offset_k = jnp.zeros_like(tau_k)
         rst_out, gate_RST_raw, gate_RST = _srw_inference_with_gates(
@@ -4826,6 +4981,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
     params = _squeeze_params(params)
     params = jax.tree.map(jnp.asarray, params)
     angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
+    op_query_factorized = _op_query_factorized_from_model_cfg(model_cfg)
+    _op_query_factorized_mode_from_model_cfg(model_cfg)
     qk_mult = jnp.where(suppress_masks.get('qk', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
         if 'qk' in suppress_masks else None
     v_mult = jnp.where(suppress_masks.get('v', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
@@ -4877,6 +5034,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
             h_all = normed @ rp['proj_attn']['kernel'] + rp['proj_attn']['bias']
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            h_Q, h_K, h_V = _maybe_factorize_attn_queries(
+                rp, normed, h_Q, h_K, h_V, op_query_factorized)
             tau_all = normed @ rp['raw_tau_attn']['kernel'] + rp['raw_tau_attn']['bias']
             raw_scan_offset_all = jnp.zeros_like(tau_all)
 
@@ -4903,6 +5062,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
 
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ rp['proj_rst']['kernel'] + rp['proj_rst']['bias']
+            h_k = _maybe_factorize_rst_query(
+                rp, normed, h_k, op_query_factorized)
             tau_k = normed @ rp['raw_tau_rst']['kernel'] + rp['raw_tau_rst']['bias']
             raw_scan_offset_k = jnp.zeros_like(tau_k)
             x = x + _srw_sup(normed, h_k, kn_n, tau_k, raw_scan_offset_k, pp['rst_read'], pp['rst_write'], rst_mult) * rst_scale_eff

@@ -559,6 +559,28 @@ def _v4166_op_key_stopgrad_rw(cfg):
     return _cfg_bool(value, name='op_key_stopgrad_rw')
 
 
+def _v4166_op_query_factorized(cfg):
+    model_cfg = cfg['model']
+    training_cfg = cfg['training']
+    value = model_cfg.get(
+        'op_query_factorized',
+        training_cfg.get('op_query_factorized', False))
+    return _cfg_bool(value, name='op_query_factorized')
+
+
+def _v4166_op_query_factorized_mode(cfg):
+    model_cfg = cfg['model']
+    training_cfg = cfg['training']
+    mode = str(model_cfg.get(
+        'op_query_factorized_mode',
+        training_cfg.get('op_query_factorized_mode', 'product'))).strip().lower()
+    if mode != 'product':
+        raise ValueError(
+            "op_query_factorized_mode must be 'product', got "
+            f"{mode!r}.")
+    return mode
+
+
 def _dawn_srw_kwargs(cfg):
     """Official v4.1.6.4 DAWN-SRW constructor kwargs."""
     kw = _v4164_model_base_kwargs(cfg)
@@ -572,6 +594,8 @@ def _dawn_srw_kwargs(cfg):
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
     if version == V4166_MODEL_VERSION:
         kw['op_key_stopgrad_rw'] = _v4166_op_key_stopgrad_rw(cfg)
+        kw['op_query_factorized'] = _v4166_op_query_factorized(cfg)
+        kw['op_query_factorized_mode'] = _v4166_op_query_factorized_mode(cfg)
     tau_init_cfg = _v4164_tau_init_config(cfg)
     if tau_init_cfg['mode'] == 'explicit':
         kw['tau_init_attn_qk'] = tau_init_cfg['explicit']['qk']
@@ -658,11 +682,25 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
         },
         'neuron_pool': pool_params,
     }
+    if version == V4166_MODEL_VERSION and _v4166_op_query_factorized(cfg):
+        score_params['router'].update({
+            'q_op_query_factor_proj':
+                params['router']['q_op_query_factor_proj'],
+            'k_op_query_factor_proj':
+                params['router']['k_op_query_factor_proj'],
+            'v_op_query_factor_proj':
+                params['router']['v_op_query_factor_proj'],
+            'rst_op_query_factor_proj':
+                params['router']['rst_op_query_factor_proj'],
+        })
     score_kwargs = {
         'max_tokens': tau_init_cfg['calibration_tokens'],
     }
     if version == V4166_MODEL_VERSION:
         score_kwargs['op_key_stopgrad_rw'] = _v4166_op_key_stopgrad_rw(cfg)
+        score_kwargs['op_query_factorized'] = _v4166_op_query_factorized(cfg)
+        score_kwargs['op_query_factorized_mode'] = (
+            _v4166_op_query_factorized_mode(cfg))
     score_fn = jax.jit(partial(score_impl, **score_kwargs))
     sampled = jax.device_get(score_fn(score_params, input_ids))
     scores = {
@@ -698,6 +736,9 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
         'tau_init_est_active_rst': estimated_active['rst'],
         'tau_init_est_active_q': float(np.mean(scores['q'] > tau['qk'])),
         'tau_init_est_active_k': float(np.mean(scores['k'] > tau['qk'])),
+        'op_query_factorized': (
+            bool(_v4166_op_query_factorized(cfg))
+            if version == V4166_MODEL_VERSION else False),
         'tau_init_calibration': {
             'batch': 'first_train_batch_host0',
             'token_sampling': 'evenly_spaced_flat',
@@ -2633,7 +2674,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or _is_raw_tau_path(ps))
 
         def _is_router_proj_path(ps):
-            return ('router/proj_attn' in ps) or ('router/proj_rst' in ps)
+            return (('router/proj_attn' in ps)
+                    or ('router/proj_rst' in ps)
+                    or ('router/q_op_query_factor_proj' in ps)
+                    or ('router/k_op_query_factor_proj' in ps)
+                    or ('router/v_op_query_factor_proj' in ps)
+                    or ('router/rst_op_query_factor_proj' in ps))
 
         def _is_router_scan_path(ps):
             return (('router/raw_scan_offset_attn' in ps)
@@ -2658,10 +2704,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/rst_op_write_proj' in ps))
 
         def _is_router_proj_attn_path(ps):
-            return 'router/proj_attn' in ps
+            return (('router/proj_attn' in ps)
+                    or ('router/q_op_query_factor_proj' in ps)
+                    or ('router/k_op_query_factor_proj' in ps)
+                    or ('router/v_op_query_factor_proj' in ps))
 
         def _is_router_proj_rst_path(ps):
-            return 'router/proj_rst' in ps
+            return (('router/proj_rst' in ps)
+                    or ('router/rst_op_query_factor_proj' in ps))
 
         def _is_route_emb_qk_path(ps):
             return (('neuron_pool/attn_qk_emb' in ps)
@@ -3040,8 +3090,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         _grouter = grads.get('router', {})
         _gpool = grads.get('neuron_pool', {})
-        grad_router_proj_attn = _child_norm(_grouter, 'proj_attn')
-        grad_router_proj_rst = _child_norm(_grouter, 'proj_rst')
+        grad_router_proj_attn = (
+            _child_norm(_grouter, 'proj_attn')
+            + _child_norm(_grouter, 'q_op_query_factor_proj')
+            + _child_norm(_grouter, 'k_op_query_factor_proj')
+            + _child_norm(_grouter, 'v_op_query_factor_proj'))
+        grad_router_proj_rst = (
+            _child_norm(_grouter, 'proj_rst')
+            + _child_norm(_grouter, 'rst_op_query_factor_proj'))
         grad_router_raw_tau_qk = jnp.sqrt(
             _raw_tau_component_sq(grads, 'qk') + 1e-12)
         grad_router_raw_tau_v = jnp.sqrt(
@@ -5128,6 +5184,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     rec = {
         'step': global_step,
         'epoch': epoch,
+        'op_query_factorized': bool(ctx.get('op_query_factorized', False)),
+        'op_query_factorized_mode': str(
+            ctx.get('op_query_factorized_mode', 'product')),
         # Loss components (window-averaged).
         'total_loss': win_avgs['loss'],
         'ce_loss': win_avgs['ce'],
@@ -6480,6 +6539,9 @@ def _build_analysis_record(base, metrics, ctx):
     except Exception:
         a_tau_s = np.zeros(3, dtype=np.float32)
     rec.update({
+        'op_query_factorized': bool(ctx.get('op_query_factorized', False)),
+        'op_query_factorized_mode': str(
+            ctx.get('op_query_factorized_mode', 'product')),
         'attn_out_norm': float(m.get('attn_out_norm', 0.0)),
         'rst_out_norm': float(m.get('rst_out_norm', 0.0)),
         'attn_score_skew': float(m.get(
@@ -7008,8 +7070,18 @@ def main():
         _v4166_op_key_stopgrad_rw(cfg)
         if model_version_cfg == V4166_MODEL_VERSION
         else False)
+    op_query_factorized = (
+        _v4166_op_query_factorized(cfg)
+        if model_version_cfg == V4166_MODEL_VERSION
+        else False)
+    op_query_factorized_mode = (
+        _v4166_op_query_factorized_mode(cfg)
+        if model_version_cfg == V4166_MODEL_VERSION
+        else 'product')
     if model_version_cfg == V4166_MODEL_VERSION:
         cfg['model']['op_key_stopgrad_rw'] = op_key_stopgrad_rw
+        cfg['model']['op_query_factorized'] = op_query_factorized
+        cfg['model']['op_query_factorized_mode'] = op_query_factorized_mode
     tau_init_cfg = (
         _v4164_tau_init_config(cfg)
         if _is_active_srw_version(model_version_cfg)
@@ -7535,7 +7607,22 @@ def main():
                     saved_training_config.get(
                         'op_key_stopgrad_rw', op_key_stopgrad_rw),
                     name='op_key_stopgrad_rw')
+                op_query_factorized = _cfg_bool(
+                    saved_training_config.get(
+                        'op_query_factorized', False),
+                    name='op_query_factorized')
+                op_query_factorized_mode = str(
+                    saved_training_config.get(
+                        'op_query_factorized_mode',
+                        'product')).strip().lower()
+                if op_query_factorized_mode != 'product':
+                    raise ValueError(
+                        "op_query_factorized_mode must be 'product', got "
+                        f"{op_query_factorized_mode!r}.")
                 cfg['model']['op_key_stopgrad_rw'] = op_key_stopgrad_rw
+                cfg['model']['op_query_factorized'] = op_query_factorized
+                cfg['model']['op_query_factorized_mode'] = (
+                    op_query_factorized_mode)
             enable_control_update_caps = saved_training_config.get(
                 'enable_control_update_caps', enable_control_update_caps)
             router_proj_update_ratio_cap = saved_training_config.get(
@@ -7801,6 +7888,9 @@ def main():
         training_config['tau_init_mode'] = tau_init_cfg['mode']
         if model_version_cfg == V4166_MODEL_VERSION:
             training_config['op_key_stopgrad_rw'] = op_key_stopgrad_rw
+            training_config['op_query_factorized'] = op_query_factorized
+            training_config['op_query_factorized_mode'] = (
+                op_query_factorized_mode)
         if tau_init_cfg['mode'] == 'quantile_frac':
             training_config.update({
                 'tau_init_target_qk_frac': tau_init_cfg['targets']['qk'],
@@ -8173,6 +8263,10 @@ def main():
             print(
                 "  op_key_stopgrad_rw="
                 f"{str(op_key_stopgrad_rw).lower()}")
+            print(
+                "  op_query_factorized="
+                f"{str(op_query_factorized).lower()} "
+                f"mode={op_query_factorized_mode}")
         print("  Tau parameterization: bounded sigmoid min/max")
         print("  tau = -1 + 2 * sigmoid(raw_tau)")
         print("  Boundary admission: one-sided generalized Gaussian")
@@ -8889,6 +8983,19 @@ def main():
                 h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
                 h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
                 h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
+                if op_query_factorized:
+                    def _factor(q_primary, key):
+                        q_w = x @ router_p[key]
+                        q_w = q_w / (
+                            jnp.linalg.norm(
+                                q_w, axis=-1, keepdims=True) + 1e-8)
+                        q_op = q_primary * q_w
+                        return q_op / (
+                            jnp.linalg.norm(
+                                q_op, axis=-1, keepdims=True) + 1e-8)
+                    h_Q = _factor(h_Q, 'q_op_query_factor_proj')
+                    h_K = _factor(h_K, 'k_op_query_factor_proj')
+                    h_V = _factor(h_V, 'v_op_query_factor_proj')
                 tau_all = (x @ router_p.get('tau_attn', router_p.get('raw_tau_attn'))['kernel']
                            + router_p.get('tau_attn', router_p.get('raw_tau_attn'))['bias'])
                 if _uses_scan_offset:
@@ -8970,6 +9077,14 @@ def main():
                 proj_p = _get_param(router_p, 'proj_rst', 'proj_know')
                 h = (x @ proj_p['kernel'] + proj_p['bias'])
                 h = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
+                if op_query_factorized:
+                    q_w = x @ router_p['rst_op_query_factor_proj']
+                    q_w = q_w / (
+                        jnp.linalg.norm(
+                            q_w, axis=-1, keepdims=True) + 1e-8)
+                    h = h * q_w
+                    h = h / (
+                        jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
                 tau_p = _get_param(router_p, 'tau_rst', 'tau_rst')
                 tau = (x @ tau_p['kernel'] + tau_p['bias'])
                 if _uses_scan_offset:
@@ -9274,6 +9389,11 @@ def main():
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
         log_message(f"Config: {config_path}")
         log_message(f"Parameters: {n_params:,}")
+        if model_version_cfg == V4166_MODEL_VERSION:
+            log_message(
+                "op_query_factorized="
+                f"{str(op_query_factorized).lower()} "
+                f"mode={op_query_factorized_mode}")
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
         log_message(f"Total steps: {total_steps}")
         if tau_init_summary is not None:
@@ -9545,6 +9665,8 @@ def main():
                         'total_micro_steps': total_micro_steps,
                         'progress': _progress,
                         'model_version': model_version,
+                        'op_query_factorized': op_query_factorized,
+                        'op_query_factorized_mode': op_query_factorized_mode,
                         'regular_console_level': regular_console_level,
                         'regular_console_host_timing':
                             regular_console_host_timing,
@@ -9673,6 +9795,8 @@ def main():
                         'type': 'val',
                         'step': global_step,
                         'epoch': epoch,
+                        'op_query_factorized': bool(op_query_factorized),
+                        'op_query_factorized_mode': op_query_factorized_mode,
                         'val_loss': val_loss,
                         'val_acc': val_acc,
                         **val_dead_log,
@@ -9720,6 +9844,9 @@ def main():
                                     'n_rst', cfg['model'].get('n_know', 0)),
                                 'current_lr': float(schedule(global_step // grad_accum_steps)),
                                 'model_version': model_version,
+                                'op_query_factorized': op_query_factorized,
+                                'op_query_factorized_mode':
+                                    op_query_factorized_mode,
                             }
                             analysis_payload = dict(analysis_result)
                             if _latest_val_dead_step == global_step \
@@ -9894,6 +10021,8 @@ def main():
                 'type': 'val_epoch',
                 'step': global_step,
                 'epoch': epoch,
+                'op_query_factorized': bool(op_query_factorized),
+                'op_query_factorized_mode': op_query_factorized_mode,
                 'val_loss': val_loss,
                 'val_acc': val_acc,
                 **val_dead_log,
