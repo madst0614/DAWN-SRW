@@ -18,8 +18,8 @@ model:
   gradient_checkpointing: true
   d_route: 256
   n_qk: 2262
-  n_v: 11207
-  n_rst: 31433
+  n_v: 11206
+  n_rst: 31432
   op_key_stopgrad_rw: false
   op_query_factorized: true
   op_query_factorized_mode: product
