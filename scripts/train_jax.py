@@ -19,6 +19,7 @@ import os
 import signal
 import json
 import re
+import math
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -637,15 +638,15 @@ def build_model_from_config(cfg):
     print(f"route dims: d_route={kwargs['d_route']}")
     return entry['class'](**kwargs)
 
-def _compute_srw_quantile_tau_init(params, input_ids, cfg,
-                                   tau_init_cfg):
-    """Compute host-side quantiles from a small deterministic score sample."""
+
+def _srw_selection_score_setup(params, cfg, max_tokens):
+    """Build the minimal score params/kwargs used by SRW score calibration."""
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     entry = _model_registry_entry(version)
     score_impl = entry['tau_init_calibration_scores']
     if score_impl is None:
         raise ValueError(
-            f"{version} tau_init_mode=quantile_frac requires "
+            f"{version} score calibration requires "
             f"{entry['module']} to import cleanly.")
     # Keep the one-time JIT signature small: calibration needs only selection
     # geometry, not tau params or LM output weights.
@@ -694,26 +695,43 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
                 params['router']['rst_op_query_factor_proj'],
         })
     score_kwargs = {
-        'max_tokens': tau_init_cfg['calibration_tokens'],
+        'max_tokens': int(max_tokens),
     }
     if version == V4166_MODEL_VERSION:
         score_kwargs['op_key_stopgrad_rw'] = _v4166_op_key_stopgrad_rw(cfg)
         score_kwargs['op_query_factorized'] = _v4166_op_query_factorized(cfg)
         score_kwargs['op_query_factorized_mode'] = (
             _v4166_op_query_factorized_mode(cfg))
+    return version, score_impl, score_params, score_kwargs
+
+
+def _sample_srw_selection_scores(params, input_ids, cfg, max_tokens):
+    """Return host-side fresh-init selection score samples by SRW pool."""
+    _version, score_impl, score_params, score_kwargs = (
+        _srw_selection_score_setup(params, cfg, max_tokens))
     score_fn = jax.jit(partial(score_impl, **score_kwargs))
-    sampled = jax.device_get(score_fn(score_params, input_ids))
+    score_out = score_fn(score_params, input_ids)
+    sampled = jax.device_get(score_out)
     scores = {
         name: np.asarray(value, dtype=np.float32).reshape(-1)
         for name, value in sampled.items()
     }
-    scores['qk'] = np.concatenate([scores['q'], scores['k']])
+    scores['qk'] = np.concatenate((scores['q'], scores['k']))
+    return scores, sampled
+
+
+def _compute_srw_quantile_tau_init(params, input_ids, cfg,
+                                   tau_init_cfg):
+    """Compute host-side quantiles from a small deterministic score sample."""
+    version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
+    scores, sampled = _sample_srw_selection_scores(
+        params, input_ids, cfg, tau_init_cfg['calibration_tokens'])
 
     tau = {}
     estimated_active = {}
     for pool in ('qk', 'v', 'rst'):
         target = tau_init_cfg['targets'][pool]
-        quantile_tau = float(np.quantile(scores[pool], 1.0 - target))
+        quantile_tau = _array_quantile(scores[pool], 1.0 - target)
         quantile_tau = float(np.clip(
             quantile_tau, tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
         tau[pool] = quantile_tau
@@ -748,6 +766,572 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
             'neurons_rst': int(sampled['rst'].shape[1]),
         },
     }
+
+
+def _dict_without_private_keys(src):
+    return {k: v for k, v in dict(src).items() if not str(k).startswith('_')}
+
+
+def _array_quantile(values, q):
+    return float(np.quantile(np.asarray(values), q))
+
+
+def _selection_calibration_config(cfg, tau_init_cfg=None):
+    """Parse optional training.selection_calibration configuration."""
+    tcfg = cfg.get('training', {})
+    if 'selection_policy' in tcfg:
+        raise ValueError(
+            "Use training.selection_calibration; selection_policy is not "
+            "a supported config key.")
+
+    raw = tcfg.get('selection_calibration', None)
+    if raw is None:
+        return {'enabled': False, 'present': False}
+    if not isinstance(raw, dict):
+        raise ValueError("training.selection_calibration must be a mapping.")
+
+    enabled = _cfg_bool(
+        raw.get('enabled', False),
+        name='selection_calibration.enabled')
+    if not enabled:
+        return {
+            'enabled': False,
+            'present': True,
+            'raw': _dict_without_private_keys(raw),
+        }
+
+    forbidden = (
+        'max_tokens',
+        'calibration_batches',
+        'tau',
+        'soft_gate',
+        'candidate_multiplier',
+        'min_candidate_delta',
+        'max_candidate_frac',
+        'min_band',
+        'max_band',
+    )
+    present_forbidden = [key for key in forbidden if key in raw]
+    if present_forbidden:
+        raise ValueError(
+            "training.selection_calibration enabled schema does not support "
+            f"these legacy keys: {present_forbidden}.")
+
+    run_on = str(raw.get('run_on', '')).strip().lower()
+    if run_on != 'fresh_init_only':
+        raise ValueError(
+            "selection_calibration.run_on must be 'fresh_init_only', "
+            f"got {raw.get('run_on')!r}.")
+
+    calibration_tokens = int(raw.get('calibration_tokens', 0))
+    calibration_max_batches = int(raw.get('calibration_max_batches', 0))
+    histogram_bins = int(raw.get('histogram_bins', 0))
+    score_min = float(raw.get('score_min', -1.0))
+    score_max = float(raw.get('score_max', 1.0))
+    candidate_eps = float(raw.get('candidate_eps', 1.0e-3))
+    if calibration_tokens <= 0:
+        raise ValueError(
+            "selection_calibration.calibration_tokens must be > 0, "
+            f"got {calibration_tokens}.")
+    if calibration_max_batches <= 0:
+        raise ValueError(
+            "selection_calibration.calibration_max_batches must be > 0, "
+            f"got {calibration_max_batches}.")
+    if histogram_bins <= 0:
+        raise ValueError(
+            "selection_calibration.histogram_bins must be > 0, "
+            f"got {histogram_bins}.")
+    if (not np.isfinite(score_min) or not np.isfinite(score_max)
+            or score_min >= score_max):
+        raise ValueError(
+            "selection_calibration score range must satisfy "
+            f"score_min < score_max, got {score_min}/{score_max}.")
+    if not np.isfinite(candidate_eps) or not (0.0 < candidate_eps < 1.0):
+        raise ValueError(
+            "selection_calibration.candidate_eps must be in (0, 1), "
+            f"got {candidate_eps}.")
+
+    def _pool_targets(name):
+        src = raw.get(name)
+        if not isinstance(src, dict):
+            raise ValueError(f"selection_calibration.{name} must be a mapping.")
+        out = {}
+        for pool in POOL_SCHEDULE_NAMES:
+            if pool not in src:
+                raise ValueError(
+                    f"selection_calibration.{name}.{pool} is required.")
+            value = float(src[pool])
+            if not np.isfinite(value) or not (0.0 < value < 1.0):
+                raise ValueError(
+                    f"selection_calibration.{name}.{pool} must be in "
+                    f"(0, 1), got {value}.")
+            out[pool] = value
+        return out
+
+    def _pool_positive_values(name):
+        src = raw.get(name)
+        if not isinstance(src, dict):
+            raise ValueError(f"selection_calibration.{name} must be a mapping.")
+        out = {}
+        for pool in POOL_SCHEDULE_NAMES:
+            if pool not in src:
+                raise ValueError(
+                    f"selection_calibration.{name}.{pool} is required.")
+            value = float(src[pool])
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"selection_calibration.{name}.{pool} must be > 0, "
+                    f"got {value}.")
+            out[pool] = value
+        return out
+
+    active_target = _pool_targets('active_target')
+    candidate_target_start = _pool_targets('candidate_target_start')
+    candidate_target_final = _pool_targets('candidate_target_final')
+    b_floor = _pool_positive_values('B_floor')
+    for pool in POOL_SCHEDULE_NAMES:
+        if candidate_target_start[pool] <= active_target[pool]:
+            raise ValueError(
+                "selection_calibration.candidate_target_start must be "
+                f"larger than active_target for {pool}, got "
+                f"{candidate_target_start[pool]} <= {active_target[pool]}.")
+        if candidate_target_final[pool] <= active_target[pool]:
+            raise ValueError(
+                "selection_calibration.candidate_target_final must be "
+                f"larger than active_target for {pool}, got "
+                f"{candidate_target_final[pool]} <= {active_target[pool]}.")
+    annealing = raw.get('annealing')
+    if not isinstance(annealing, dict):
+        raise ValueError(
+            "selection_calibration.annealing must be a mapping.")
+    unit = str(annealing.get('unit', '')).strip().lower()
+    if unit != 'tokens':
+        raise ValueError(
+            "selection_calibration.annealing.unit must be 'tokens', "
+            f"got {annealing.get('unit')!r}.")
+    open_until_tokens = int(annealing.get('open_until_tokens', 0))
+    shrink_start_tokens = int(annealing.get('shrink_start_tokens', 0))
+    shrink_end_tokens = int(annealing.get('shrink_end_tokens', 0))
+    if open_until_tokens < 0:
+        raise ValueError(
+            "selection_calibration.annealing.open_until_tokens must be >= 0.")
+    if not (0 <= open_until_tokens <= shrink_start_tokens < shrink_end_tokens):
+        raise ValueError(
+            "selection_calibration annealing tokens must satisfy "
+            "0 <= open_until_tokens <= shrink_start_tokens < "
+            f"shrink_end_tokens, got {open_until_tokens}, "
+            f"{shrink_start_tokens}, {shrink_end_tokens}.")
+
+    max_train_tokens = int(cfg.get('data', {}).get('max_train_tokens', 0))
+    if max_train_tokens <= 0:
+        raise ValueError(
+            "data.max_train_tokens must be > 0 for selection_calibration.")
+    formation_end_frac = float(np.clip(
+        shrink_start_tokens / max_train_tokens, 0.0, 1.0))
+    sharpen_end_frac = float(np.clip(
+        shrink_end_tokens / max_train_tokens, 0.0, 1.0))
+    if not (0.0 < formation_end_frac < sharpen_end_frac <= 1.0):
+        raise ValueError(
+            "selection_calibration annealing fractions must satisfy "
+            "0 < formation_end_frac < sharpen_end_frac <= 1 after "
+            f"conversion/clamp, got {formation_end_frac}, "
+            f"{sharpen_end_frac}.")
+
+    boundary_power_start = float(tcfg.get(
+        'soft_gate_boundary_power_start', 3.0))
+    boundary_power_mid = float(tcfg.get(
+        'soft_gate_boundary_power_mid', 3.0))
+    boundary_power_final = float(tcfg.get(
+        'soft_gate_boundary_power_final', 4.0))
+
+    return {
+        'enabled': True,
+        'present': True,
+        'raw': _dict_without_private_keys(raw),
+        'run_on': run_on,
+        'calibration_tokens': calibration_tokens,
+        'calibration_max_batches': calibration_max_batches,
+        'histogram_bins': histogram_bins,
+        'score_min': score_min,
+        'score_max': score_max,
+        'candidate_eps': candidate_eps,
+        'active_target': active_target,
+        'candidate_target_start': candidate_target_start,
+        'candidate_target_final': candidate_target_final,
+        'B_floor': b_floor,
+        'annealing': {
+            'unit': unit,
+            'open_until_tokens': open_until_tokens,
+            'shrink_start_tokens': shrink_start_tokens,
+            'shrink_end_tokens': shrink_end_tokens,
+        },
+        'formation_end_frac': formation_end_frac,
+        'sharpen_end_frac': sharpen_end_frac,
+        'boundary_power_start': boundary_power_start,
+        'boundary_power_mid': boundary_power_mid,
+        'boundary_power_final': boundary_power_final,
+    }
+
+
+def _histogram_quantile(counts, score_min, score_max, q):
+    """Approximate a quantile from fixed-width histogram counts."""
+    counts = np.asarray(counts, dtype=np.float64)
+    if counts.ndim != 1 or counts.size <= 0:
+        raise ValueError("histogram quantile counts must be a 1-D array.")
+    total = float(np.sum(counts))
+    if total <= 0.0:
+        raise ValueError("histogram quantile requires at least one count.")
+    q = float(np.clip(q, 0.0, 1.0))
+    cumulative = np.cumsum(counts)
+    threshold = q * total
+    idx = int(np.searchsorted(cumulative, threshold, side='left'))
+    idx = max(0, min(idx, counts.size - 1))
+    bin_width = (float(score_max) - float(score_min)) / float(counts.size)
+    return float(score_min + (idx + 0.5) * bin_width)
+
+
+def _make_selection_calibration_histogram_fn(
+        score_impl, score_kwargs, histogram_bins, score_min, score_max):
+    """Create a jitted per-batch histogram function returning counts only."""
+
+    def _hist_counts(x):
+        counts, _edges = jnp.histogram(
+            jnp.ravel(jnp.asarray(x, dtype=jnp.float32)),
+            bins=histogram_bins,
+            range=(score_min, score_max))
+        return counts.astype(jnp.int32)
+
+    def _hist_fn(score_params, input_ids):
+        score_tensors = score_impl(score_params, input_ids, **score_kwargs)
+        q_counts = _hist_counts(score_tensors['q'])
+        k_counts = _hist_counts(score_tensors['k'])
+        return {
+            'qk': q_counts + k_counts,
+            'v': _hist_counts(score_tensors['v']),
+            'rst': _hist_counts(score_tensors['rst']),
+        }, jnp.asarray(score_tensors['q'].shape[0], dtype=jnp.int32)
+
+    return jax.jit(_hist_fn)
+
+
+def _collect_selection_calibration_histograms(
+        params, train_loader, cfg, selection_calibration_cfg):
+    """Stream real training batches and keep only host-side hist counts."""
+    global_calibration_tokens = int(
+        selection_calibration_cfg['calibration_tokens'])
+    process_count = max(1, int(jax.process_count()))
+    local_calibration_tokens = int(
+        math.ceil(global_calibration_tokens / process_count))
+    _version, score_impl, score_params, score_kwargs = (
+        _srw_selection_score_setup(
+            params, cfg, local_calibration_tokens))
+    hist_fn = _make_selection_calibration_histogram_fn(
+        score_impl,
+        score_kwargs,
+        selection_calibration_cfg['histogram_bins'],
+        selection_calibration_cfg['score_min'],
+        selection_calibration_cfg['score_max'])
+    counts = {
+        pool: np.zeros(
+            selection_calibration_cfg['histogram_bins'], dtype=np.int64)
+        for pool in POOL_SCHEDULE_NAMES
+    }
+    seen_tokens = 0
+    actual_batches = 0
+    for input_ids, _attention_mask in train_loader:
+        if (seen_tokens >= local_calibration_tokens
+                or actual_batches >=
+                selection_calibration_cfg['calibration_max_batches']):
+            break
+        batch_counts, token_count = hist_fn(score_params, input_ids)
+        host_counts = jax.device_get(batch_counts)
+        for pool in POOL_SCHEDULE_NAMES:
+            counts[pool] += np.asarray(host_counts[pool], dtype=np.int64)
+        seen_tokens += int(jax.device_get(token_count))
+        actual_batches += 1
+    if actual_batches <= 0:
+        raise ValueError(
+            "selection_calibration requires at least one training batch.")
+    return (
+        counts,
+        seen_tokens,
+        actual_batches,
+        local_calibration_tokens,
+        process_count,
+    )
+
+
+def _aggregate_selection_calibration_histograms(
+        local_counts, local_seen_tokens, local_actual_batches):
+    """Aggregate per-host histogram counts for multi-host calibration."""
+    if jax.process_count() <= 1:
+        return local_counts, int(local_seen_tokens), int(local_actual_batches)
+
+    local_stack = np.stack(
+        [local_counts[pool] for pool in POOL_SCHEDULE_NAMES],
+        axis=0).astype(np.int64)
+    gathered_stack = np.asarray(process_allgather(local_stack))
+    gathered_stack = gathered_stack.reshape(
+        (jax.process_count(),) + local_stack.shape)
+    global_stack = np.sum(gathered_stack, axis=0, dtype=np.int64)
+
+    local_meta = np.asarray(
+        [local_seen_tokens, local_actual_batches], dtype=np.int64)
+    gathered_meta = np.asarray(process_allgather(local_meta))
+    gathered_meta = gathered_meta.reshape((jax.process_count(), 2))
+    global_counts = {
+        pool: global_stack[idx]
+        for idx, pool in enumerate(POOL_SCHEDULE_NAMES)
+    }
+    return (
+        global_counts,
+        int(np.sum(gathered_meta[:, 0], dtype=np.int64)),
+        int(np.max(gathered_meta[:, 1])),
+    )
+
+
+def _compute_srw_selection_calibration(
+        histogram_counts, cfg, selection_calibration_cfg,
+        seen_tokens, actual_batches, local_calibration_tokens,
+        process_count):
+    """Calibrate tau init and soft-gate candidate bands from histograms."""
+    model_cfg = cfg['model']
+    tau_min = float(model_cfg.get('tau_init_min', -1.0))
+    tau_max = float(model_cfg.get('tau_init_max', 1.0))
+    if (not np.isfinite(tau_min) or not np.isfinite(tau_max)
+            or tau_min > tau_max):
+        raise ValueError(
+            "model.tau_init_min/max must satisfy tau_init_min <= "
+            f"tau_init_max, got {tau_min}/{tau_max}.")
+
+    tau = {}
+    q_start = {}
+    q_final = {}
+    b_start = {}
+    b_final = {}
+    active_target = selection_calibration_cfg['active_target']
+    candidate_start = selection_calibration_cfg['candidate_target_start']
+    candidate_final = selection_calibration_cfg['candidate_target_final']
+    b_floor = selection_calibration_cfg['B_floor']
+    score_min = selection_calibration_cfg['score_min']
+    score_max = selection_calibration_cfg['score_max']
+    eps_scale = -np.log(selection_calibration_cfg['candidate_eps'])
+    power_start = selection_calibration_cfg['boundary_power_start']
+    power_final = selection_calibration_cfg['boundary_power_final']
+    for pool in POOL_SCHEDULE_NAMES:
+        counts = histogram_counts[pool]
+        tau_raw = _histogram_quantile(
+            counts, score_min, score_max, 1.0 - active_target[pool])
+        tau_pool = float(np.clip(tau_raw, tau_min, tau_max))
+        q_start_pool = _histogram_quantile(
+            counts, score_min, score_max, 1.0 - candidate_start[pool])
+        q_final_pool = _histogram_quantile(
+            counts, score_min, score_max, 1.0 - candidate_final[pool])
+        tau[pool] = tau_pool
+        q_start[pool] = q_start_pool
+        q_final[pool] = q_final_pool
+
+        delta_start = tau_pool - q_start_pool
+        if delta_start <= 0.0:
+            b_start[pool] = float(b_floor[pool])
+        else:
+            b_start[pool] = float(max(
+                b_floor[pool],
+                delta_start / (eps_scale ** (1.0 / power_start))))
+
+        delta_final = tau_pool - q_final_pool
+        if delta_final <= 0.0:
+            b_final[pool] = float(b_floor[pool])
+        else:
+            b_final[pool] = float(max(
+                b_floor[pool],
+                delta_final / (eps_scale ** (1.0 / power_final))))
+
+    return {
+        'type': 'selection_calibration',
+        'selection_calibration_enabled': True,
+        'selection_calibration_applied': True,
+        'selection_calibration_run_on': 'fresh_init_only',
+        'selection_calibration_seen_tokens_target':
+            int(selection_calibration_cfg['calibration_tokens']),
+        'selection_calibration_tokens_target_global':
+            int(selection_calibration_cfg['calibration_tokens']),
+        'selection_calibration_tokens_target_local':
+            int(local_calibration_tokens),
+        'selection_calibration_process_count': int(process_count),
+        'selection_calibration_seen_tokens': int(seen_tokens),
+        'selection_calibration_seen_tokens_global': int(seen_tokens),
+        'selection_calibration_actual_batches': int(actual_batches),
+        'selection_calibration_actual_batches_per_host_or_max':
+            int(actual_batches),
+        'selection_calibration_histogram_bins':
+            int(selection_calibration_cfg['histogram_bins']),
+        'selection_calibration_score_min': float(score_min),
+        'selection_calibration_score_max': float(score_max),
+        'selection_calibration_candidate_eps':
+            float(selection_calibration_cfg['candidate_eps']),
+        'selection_calibration_active_target': dict(active_target),
+        'selection_calibration_candidate_target_start': dict(candidate_start),
+        'selection_calibration_candidate_target_final': dict(candidate_final),
+        'selection_calibration_B_floor': dict(b_floor),
+        'selection_calibration_tau': tau,
+        'selection_calibration_q_start': q_start,
+        'selection_calibration_q_final': q_final,
+        'selection_calibration_B_start': b_start,
+        'selection_calibration_B_final': b_final,
+        'selection_calibration_formation_end_frac':
+            float(selection_calibration_cfg['formation_end_frac']),
+        'selection_calibration_sharpen_end_frac':
+            float(selection_calibration_cfg['sharpen_end_frac']),
+        'tau_init_mode': 'selection_calibration',
+        'tau_init_quantile_tau': tau,
+        'op_query_factorized': (
+            bool(_v4166_op_query_factorized(cfg))
+            if cfg['model'].get('model_version') == V4166_MODEL_VERSION
+            else False),
+    }
+
+
+def _selection_calibration_materialized_training_updates(
+        selection_summary, selection_calibration_cfg):
+    updates = {}
+    b_start = selection_summary['selection_calibration_B_start']
+    b_final = selection_summary['selection_calibration_B_final']
+    formation_end_frac = float(
+        selection_summary['selection_calibration_formation_end_frac'])
+    sharpen_end_frac = float(
+        selection_summary['selection_calibration_sharpen_end_frac'])
+    for pool in POOL_SCHEDULE_NAMES:
+        prefix = f'soft_gate_t_{pool}'
+        updates.update({
+            f'{prefix}_schedule': 'developmental_band',
+            f'{prefix}_sort': float(b_start[pool]),
+            f'{prefix}_band': float(b_start[pool]),
+            f'{prefix}_mid': float(b_start[pool]),
+            f'{prefix}_late': float(b_final[pool]),
+            f'{prefix}_final': float(b_final[pool]),
+            f'{prefix}_sort_end_frac': 0.0,
+            f'{prefix}_band_reach_frac': formation_end_frac,
+            f'{prefix}_formation_end_frac': formation_end_frac,
+            f'{prefix}_sharpen_end_frac': sharpen_end_frac,
+            f'{prefix}_formation_power': 1.0,
+            f'{prefix}_sharpen_power': 1.0,
+        })
+    updates.update({
+        'soft_gate_boundary_power_start':
+            float(selection_calibration_cfg['boundary_power_start']),
+        'soft_gate_boundary_power_mid':
+            float(selection_calibration_cfg['boundary_power_mid']),
+        'soft_gate_boundary_power_final':
+            float(selection_calibration_cfg['boundary_power_final']),
+        'soft_gate_boundary_power_start_frac': 0.0,
+        'soft_gate_boundary_power_mid_frac': formation_end_frac,
+        'soft_gate_boundary_power_final_frac': sharpen_end_frac,
+    })
+    return updates
+
+
+def _apply_selection_calibrated_soft_gate_schedules(
+        pool_schedules, materialized_updates):
+    """Return soft-gate schedules with calibrated developmental bands."""
+    updated = {pool: dict(pool_schedules[pool]) for pool in POOL_SCHEDULE_NAMES}
+    for pool in POOL_SCHEDULE_NAMES:
+        prefix = f'soft_gate_t_{pool}'
+        for key in (
+                'schedule',
+                'sort',
+                'band',
+                'mid',
+                'late',
+                'final',
+                'sort_end_frac',
+                'band_reach_frac',
+                'formation_end_frac',
+                'sharpen_end_frac',
+                'formation_power',
+                'sharpen_power'):
+            updated[pool][key] = materialized_updates[f'{prefix}_{key}']
+    return updated
+
+
+def _selection_calibration_checkpoint_updates(selection_summary):
+    tau = selection_summary['selection_calibration_tau']
+    b_start = selection_summary['selection_calibration_B_start']
+    b_final = selection_summary['selection_calibration_B_final']
+    return {
+        'selection_calibration_applied': True,
+        'selection_calibration_seen_tokens':
+            selection_summary['selection_calibration_seen_tokens'],
+        'selection_calibration_actual_batches':
+            selection_summary['selection_calibration_actual_batches'],
+        'selection_calibration_histogram_bins':
+            selection_summary['selection_calibration_histogram_bins'],
+        'selection_calibration_tau_qk': tau['qk'],
+        'selection_calibration_tau_v': tau['v'],
+        'selection_calibration_tau_rst': tau['rst'],
+        'selection_calibration_B_start_qk': b_start['qk'],
+        'selection_calibration_B_start_v': b_start['v'],
+        'selection_calibration_B_start_rst': b_start['rst'],
+        'selection_calibration_B_final_qk': b_final['qk'],
+        'selection_calibration_B_final_v': b_final['v'],
+        'selection_calibration_B_final_rst': b_final['rst'],
+        'selection_calibration_formation_end_frac':
+            selection_summary['selection_calibration_formation_end_frac'],
+        'selection_calibration_sharpen_end_frac':
+            selection_summary['selection_calibration_sharpen_end_frac'],
+    }
+
+
+def _selection_calibration_summary_lines(summary):
+    active = summary['selection_calibration_active_target']
+    candidate_start = summary['selection_calibration_candidate_target_start']
+    candidate_final = summary['selection_calibration_candidate_target_final']
+    tau = summary['selection_calibration_tau']
+    b_start = summary['selection_calibration_B_start']
+    b_final = summary['selection_calibration_B_final']
+    return [
+        "enabled=true",
+        "run_on=fresh_init_only",
+        "calibration_tokens_target_global="
+        f"{summary['selection_calibration_tokens_target_global']}",
+        "calibration_tokens_target_local="
+        f"{summary['selection_calibration_tokens_target_local']}",
+        f"process_count={summary['selection_calibration_process_count']}",
+        "seen_tokens_global="
+        f"{summary['selection_calibration_seen_tokens_global']}",
+        "actual_batches_per_host_or_max="
+        f"{summary['selection_calibration_actual_batches_per_host_or_max']}",
+        f"histogram_bins={summary['selection_calibration_histogram_bins']}",
+        "score_range=["
+        f"{summary['selection_calibration_score_min']}, "
+        f"{summary['selection_calibration_score_max']}]",
+        f"candidate_eps={summary['selection_calibration_candidate_eps']}",
+        "",
+        "active_target["
+        f"qk={active['qk']} v={active['v']} rst={active['rst']}]",
+        "candidate_target_start["
+        f"qk={candidate_start['qk']} v={candidate_start['v']} "
+        f"rst={candidate_start['rst']}]",
+        "candidate_target_final["
+        f"qk={candidate_final['qk']} v={candidate_final['v']} "
+        f"rst={candidate_final['rst']}]",
+        "",
+        "tau["
+        f"qk={tau['qk']:.6f} v={tau['v']:.6f} "
+        f"rst={tau['rst']:.6f}]",
+        "B_start["
+        f"qk={b_start['qk']:.6f} v={b_start['v']:.6f} "
+        f"rst={b_start['rst']:.6f}]",
+        "B_final["
+        f"qk={b_final['qk']:.6f} v={b_final['v']:.6f} "
+        f"rst={b_final['rst']:.6f}]",
+        "",
+        "fractions["
+        "formation_end="
+        f"{summary['selection_calibration_formation_end_frac']:.6f} "
+        "sharpen_end="
+        f"{summary['selection_calibration_sharpen_end_frac']:.6f}]",
+    ]
 
 
 def _set_srw_quantile_tau_biases(params, tau_summary, model_version=OFFICIAL_MODEL_VERSION):
@@ -1549,10 +2133,10 @@ def _validate_soft_gate_schedule_config(
         formation_end = cfg['formation_end_frac']
         sharpen_end = cfg['sharpen_end_frac']
         if not (0.0 <= sort_end < band_reach
-                < formation_end < sharpen_end <= 1.0):
+                <= formation_end < sharpen_end <= 1.0):
             raise ValueError(
                 f"{label} developmental_band fractions must satisfy "
-                "0 <= sort_end_frac < band_reach_frac < "
+                "0 <= sort_end_frac < band_reach_frac <= "
                 "formation_end_frac < sharpen_end_frac <= 1, got "
                 f"{sort_end}, {band_reach}, {formation_end}, {sharpen_end}")
         if cfg['formation_power'] <= 0.0:
@@ -7086,6 +7670,13 @@ def main():
         _v4164_tau_init_config(cfg)
         if _is_active_srw_version(model_version_cfg)
         else None)
+    selection_calibration_cfg = _selection_calibration_config(
+        cfg, tau_init_cfg)
+    if (selection_calibration_cfg.get('enabled', False)
+            and not _is_active_srw_version(model_version_cfg)):
+        raise ValueError(
+            "training.selection_calibration is only supported for active "
+            "DAWN-SRW model versions.")
     # Optional config-driven resume. CLI --resume remains an override for
     # ad-hoc launches, but diagnostic configs can be one-shot.
     configured_resume_from = (
@@ -7432,11 +8023,12 @@ def main():
     # ----------------------------------------------------------
     # Resume config override: load training config from checkpoint
     # ----------------------------------------------------------
+    saved_training_config = None
+    selection_calibration_resume_training_updates = {}
     if resume_path and _file_exists(resume_path):
         # Try config.json in run folder
         config_json_path = _join(checkpoint_dir, 'config.json')
 
-        saved_training_config = None
         if _file_exists(config_json_path):
             try:
                 with _open_file(config_json_path, 'r') as f:
@@ -7689,6 +8281,103 @@ def main():
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
+        if (saved_training_config
+                and selection_calibration_cfg.get('enabled', False)
+                and saved_training_config.get(
+                    'selection_calibration_applied', False)):
+            soft_gate_t_start = float(saved_training_config.get(
+                'soft_gate_t_start', soft_gate_t_start))
+            soft_gate_t_final = float(saved_training_config.get(
+                'soft_gate_t_final', soft_gate_t_final))
+            soft_gate_t_hold_frac = float(saved_training_config.get(
+                'soft_gate_t_hold_frac', soft_gate_t_hold_frac))
+            soft_gate_t_anneal_end_frac = float(saved_training_config.get(
+                'soft_gate_t_anneal_end_frac',
+                soft_gate_t_anneal_end_frac))
+            soft_gate_schedule = str(saved_training_config.get(
+                'soft_gate_t_schedule', soft_gate_schedule))
+            soft_gate_t_power = float(saved_training_config.get(
+                'soft_gate_t_power', soft_gate_t_power))
+            soft_gate_t_gompertz_center = float(saved_training_config.get(
+                'soft_gate_t_gompertz_center',
+                soft_gate_t_gompertz_center))
+            soft_gate_t_gompertz_steepness = float(saved_training_config.get(
+                'soft_gate_t_gompertz_steepness',
+                soft_gate_t_gompertz_steepness))
+            soft_gate_pool_schedules = _training_soft_gate_pool_schedules(
+                saved_training_config, soft_gate_t_start,
+                soft_gate_t_final, soft_gate_t_hold_frac,
+                soft_gate_t_anneal_end_frac, soft_gate_schedule,
+                soft_gate_t_power, soft_gate_t_gompertz_center,
+                soft_gate_t_gompertz_steepness)
+            _restored_calibrated_schedules = (
+                _flatten_soft_gate_pool_schedules(soft_gate_pool_schedules))
+            selection_calibration_resume_training_updates.update(
+                _restored_calibrated_schedules)
+            soft_gate_boundary_power_start = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_start',
+                    soft_gate_boundary_power_start))
+            soft_gate_boundary_power_mid = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_mid',
+                    soft_gate_boundary_power_mid))
+            soft_gate_boundary_power_final = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_final',
+                    soft_gate_boundary_power_final))
+            soft_gate_boundary_power_start_frac = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_start_frac',
+                    soft_gate_boundary_power_start_frac))
+            soft_gate_boundary_power_mid_frac = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_mid_frac',
+                    soft_gate_boundary_power_mid_frac))
+            soft_gate_boundary_power_final_frac = float(
+                saved_training_config.get(
+                    'soft_gate_boundary_power_final_frac',
+                    soft_gate_boundary_power_final_frac))
+            selection_calibration_resume_training_updates.update({
+                'soft_gate_boundary_power_start':
+                    soft_gate_boundary_power_start,
+                'soft_gate_boundary_power_mid':
+                    soft_gate_boundary_power_mid,
+                'soft_gate_boundary_power_final':
+                    soft_gate_boundary_power_final,
+                'soft_gate_boundary_power_start_frac':
+                    soft_gate_boundary_power_start_frac,
+                'soft_gate_boundary_power_mid_frac':
+                    soft_gate_boundary_power_mid_frac,
+                'soft_gate_boundary_power_final_frac':
+                    soft_gate_boundary_power_final_frac,
+            })
+            for _key in (
+                    'selection_calibration_applied',
+                    'selection_calibration_seen_tokens',
+                    'selection_calibration_actual_batches',
+                    'selection_calibration_histogram_bins',
+                    'selection_calibration_tau_qk',
+                    'selection_calibration_tau_v',
+                    'selection_calibration_tau_rst',
+                    'selection_calibration_B_start_qk',
+                    'selection_calibration_B_start_v',
+                    'selection_calibration_B_start_rst',
+                    'selection_calibration_B_final_qk',
+                    'selection_calibration_B_final_v',
+                    'selection_calibration_B_final_rst',
+                    'selection_calibration_formation_end_frac',
+                    'selection_calibration_sharpen_end_frac'):
+                if _key in saved_training_config:
+                    selection_calibration_resume_training_updates[_key] = (
+                        saved_training_config[_key])
+            cfg.setdefault('training', {}).update(
+                _restored_calibrated_schedules)
+            if jax.process_index() == 0:
+                print(
+                    "  Selection calibration schedule restored from "
+                    "checkpoint config; calibration will not rerun on resume.")
+
     if is_v4164_cfg:
         pool_weight_decay = 0.0
         div_weight = 0.0
@@ -7884,6 +8573,13 @@ def main():
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
+    if selection_calibration_cfg.get('present', False):
+        training_config['selection_calibration'] = (
+            selection_calibration_cfg.get('raw', {'enabled': False}))
+    if selection_calibration_resume_training_updates:
+        training_config.update(selection_calibration_resume_training_updates)
+        cfg.setdefault('training', {}).update(
+            selection_calibration_resume_training_updates)
     if _is_active_srw_version(model_version_cfg):
         training_config['tau_init_mode'] = tau_init_cfg['mode']
         if model_version_cfg == V4166_MODEL_VERSION:
@@ -8401,11 +9097,90 @@ def main():
                 print("\nStarting from scratch (--from-scratch).")
 
     tau_init_summary = None
+    selection_calibration_summary = None
+    selection_calibration_tau_applied = False
     _has_resume_checkpoint = bool(
         resume_path is not None and _file_exists(resume_path))
+    if (selection_calibration_cfg.get('enabled', False)
+            and not _has_resume_checkpoint):
+        if len(train_loader) <= 0:
+            raise ValueError(
+                "selection_calibration requires at least one training batch.")
+        (
+            local_histograms,
+            local_seen_tokens,
+            local_actual_batches,
+            local_calibration_tokens,
+            calibration_process_count,
+        ) = _collect_selection_calibration_histograms(
+            params, train_loader, cfg, selection_calibration_cfg)
+        calibration_histograms, seen_tokens, actual_calibration_batches = (
+            _aggregate_selection_calibration_histograms(
+                local_histograms, local_seen_tokens, local_actual_batches))
+        _selection_summary_json = None
+        if is_host0:
+            selection_calibration_summary = (
+                _compute_srw_selection_calibration(
+                    calibration_histograms, cfg, selection_calibration_cfg,
+                    seen_tokens, actual_calibration_batches,
+                    local_calibration_tokens, calibration_process_count))
+            _selection_summary_json = json.dumps(selection_calibration_summary)
+        _selection_summary_json = _broadcast_str_from_host0(
+            _selection_summary_json, max_len=32768)
+        if not _selection_summary_json:
+            raise RuntimeError(
+                "Failed to broadcast selection calibration summary.")
+        selection_calibration_summary = json.loads(_selection_summary_json)
+        params = _set_srw_quantile_tau_biases(
+            params, selection_calibration_summary, model_version_cfg)
+        selection_calibration_tau_applied = True
+        materialized_training_updates = (
+            _selection_calibration_materialized_training_updates(
+                selection_calibration_summary, selection_calibration_cfg))
+        soft_gate_pool_schedules = (
+            _apply_selection_calibrated_soft_gate_schedules(
+                soft_gate_pool_schedules, materialized_training_updates))
+        soft_gate_boundary_power_start = materialized_training_updates[
+            'soft_gate_boundary_power_start']
+        soft_gate_boundary_power_mid = materialized_training_updates[
+            'soft_gate_boundary_power_mid']
+        soft_gate_boundary_power_final = materialized_training_updates[
+            'soft_gate_boundary_power_final']
+        soft_gate_boundary_power_start_frac = materialized_training_updates[
+            'soft_gate_boundary_power_start_frac']
+        soft_gate_boundary_power_mid_frac = materialized_training_updates[
+            'soft_gate_boundary_power_mid_frac']
+        soft_gate_boundary_power_final_frac = materialized_training_updates[
+            'soft_gate_boundary_power_final_frac']
+        calibrated_flat_schedules = _flatten_soft_gate_pool_schedules(
+            soft_gate_pool_schedules)
+        training_config.update(calibrated_flat_schedules)
+        training_config.update(materialized_training_updates)
+        training_config.update(
+            _selection_calibration_checkpoint_updates(
+                selection_calibration_summary))
+        cfg.setdefault('training', {}).update(calibrated_flat_schedules)
+        cfg.setdefault('training', {}).update(materialized_training_updates)
+        cfg.setdefault('training', {}).update(
+            _selection_calibration_checkpoint_updates(
+                selection_calibration_summary))
+        if is_host0:
+            print("\n=== Selection calibration ===", flush=True)
+            for _line in _selection_calibration_summary_lines(
+                    selection_calibration_summary):
+                print(_line, flush=True)
+    elif (selection_calibration_cfg.get('enabled', False)
+          and _has_resume_checkpoint
+          and is_host0):
+        print(
+            "\nSelection calibration skipped on resume; "
+            "checkpoint tau params preserved.",
+            flush=True)
+
     if (_is_active_srw_version(model_version_cfg)
             and tau_init_cfg['mode'] == 'quantile_frac'
-            and not _has_resume_checkpoint):
+            and not _has_resume_checkpoint
+            and not selection_calibration_tau_applied):
         if len(train_loader) <= 0:
             raise ValueError(
                 "tau_init_mode=quantile_frac requires at least one "
@@ -9398,6 +10173,8 @@ def main():
         log_message(f"Total steps: {total_steps}")
         if tau_init_summary is not None:
             log_jsonl(tau_init_summary)
+        if selection_calibration_summary is not None:
+            log_jsonl(selection_calibration_summary)
         log_message(
             "Resume log append policy: "
             f"training={training_log_append_on_resume}")
