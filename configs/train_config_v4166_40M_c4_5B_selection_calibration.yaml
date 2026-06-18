@@ -17,11 +17,11 @@ model:
   router_dropout: 0.0
   gradient_checkpointing: true
   d_route: 128
-  n_qk: 1480
-  n_v: 7330
-  n_rst: 20560
+  n_qk: 1452
+  n_v: 7192
+  n_rst: 20176
   op_key_stopgrad_rw: false
-  op_query_factorized: false
+  op_query_factorized: true
   tau_init_min: -0.95
   tau_init_max: 0.95
   tau_init_mode: quantile_frac
