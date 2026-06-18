@@ -9,6 +9,7 @@ Strict behavior:
   - ACTIVE + SSH_READY: call scripts/launch_tpu_pod.sh exactly once for this keeper process.
   - ACTIVE + SSH_NOT_READY longer than timeout, 300 seconds by default: delete QR/node and recreate.
   - QR FAILED/SUSPENDED/etc.: delete QR/node and recreate.
+  - Every gcloud subprocess has a timeout so the keeper poll loop cannot freeze forever.
   - All events are written to log.txt by default.
   - No repeated same-state spam unless --verbose is used.
 
@@ -58,6 +59,7 @@ NOT_FOUND_MARKERS = (
 )
 
 DESCRIBE_ERROR = object()
+COMMAND_TIMEOUT = object()
 
 
 def default_local_repo() -> str:
@@ -78,6 +80,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--runtime-version", default="tpu-ubuntu2204-base")
     p.add_argument("--queued-resource-id", default=None)
     p.add_argument("--poll-seconds", type=int, default=20)
+    p.add_argument(
+        "--describe-timeout-seconds",
+        type=int,
+        default=60,
+        help="Timeout for QR describe calls. Default: 60.",
+    )
+    p.add_argument(
+        "--ssh-check-timeout-seconds",
+        type=int,
+        default=60,
+        help="Timeout for ACTIVE-state SSH readiness checks. Default: 60.",
+    )
+    p.add_argument(
+        "--operation-timeout-seconds",
+        type=int,
+        default=300,
+        help="Timeout for QR/node create/delete and git pull commands. Default: 300.",
+    )
+    p.add_argument(
+        "--launch-timeout-seconds",
+        type=int,
+        default=1800,
+        help="Timeout for scripts/launch_tpu_pod.sh. Default: 1800.",
+    )
     p.add_argument(
         "--ssh-ready-timeout-seconds",
         type=int,
@@ -100,6 +126,14 @@ def parse_args() -> argparse.Namespace:
 
     if args.poll_seconds <= 0:
         p.error("--poll-seconds must be positive")
+    if args.describe_timeout_seconds <= 0:
+        p.error("--describe-timeout-seconds must be positive")
+    if args.ssh_check_timeout_seconds <= 0:
+        p.error("--ssh-check-timeout-seconds must be positive")
+    if args.operation_timeout_seconds <= 0:
+        p.error("--operation-timeout-seconds must be positive")
+    if args.launch_timeout_seconds <= 0:
+        p.error("--launch-timeout-seconds must be positive")
     if args.ssh_ready_timeout_seconds <= 0:
         p.error("--ssh-ready-timeout-seconds must be positive")
     if not args.queued_resource_id:
@@ -138,20 +172,47 @@ def state_event(args: argparse.Namespace, state: str) -> None:
         args._last_qr_state = state
 
 
-def run_capture(cmd: list[str]) -> subprocess.CompletedProcess[str] | None:
+def run_capture(
+    args: argparse.Namespace,
+    cmd: list[str],
+    label: str,
+    timeout: int,
+) -> subprocess.CompletedProcess[str] | None | object:
     try:
-        return subprocess.run(cmd, text=True, capture_output=True, check=False)
+        return subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        log(args, f"ERROR command_timeout label={label} seconds={timeout} cmd={cmd[0]}")
+        return COMMAND_TIMEOUT
     except FileNotFoundError:
         return None
 
 
-def run_stream(args: argparse.Namespace, cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess[str] | None:
+def run_stream(
+    args: argparse.Namespace,
+    cmd: list[str],
+    cwd: str | None = None,
+    timeout: int | None = None,
+) -> subprocess.CompletedProcess[str] | None | object:
     log(args, "CMD " + " ".join(cmd))
     try:
-        return subprocess.run(cmd, text=True, cwd=cwd, check=False)
+        return subprocess.run(cmd, text=True, cwd=cwd, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timeout_msg = "none" if timeout is None else str(timeout)
+        log(args, f"ERROR command_timeout seconds={timeout_msg} cmd={cmd[0]}")
+        return COMMAND_TIMEOUT
     except FileNotFoundError as exc:
         log(args, f"ERROR command not found: {cmd[0]} ({exc})")
         return None
+
+
+def proc_ok(proc: Any) -> bool:
+    return isinstance(proc, subprocess.CompletedProcess) and proc.returncode == 0
 
 
 def is_not_found(stderr: str) -> bool:
@@ -160,7 +221,9 @@ def is_not_found(stderr: str) -> bool:
 
 
 def describe_json(args: argparse.Namespace, cmd: list[str], label: str) -> dict[str, Any] | None | object:
-    proc = run_capture(cmd)
+    proc = run_capture(args, cmd, label, args.describe_timeout_seconds)
+    if proc is COMMAND_TIMEOUT:
+        return DESCRIBE_ERROR
     if proc is None:
         log(args, f"ERROR command not found: {cmd[0]}")
         return DESCRIBE_ERROR
@@ -253,8 +316,9 @@ def create_qr(args: argparse.Namespace) -> bool:
             "--runtime-version", args.runtime_version,
             "--spot",
         ],
+        timeout=args.operation_timeout_seconds,
     )
-    return bool(proc and proc.returncode == 0)
+    return proc_ok(proc)
 
 
 def delete_qr(args: argparse.Namespace) -> bool:
@@ -268,8 +332,9 @@ def delete_qr(args: argparse.Namespace) -> bool:
             "--project", args.project,
             "--quiet",
         ],
+        timeout=args.operation_timeout_seconds,
     )
-    return bool(proc and proc.returncode == 0)
+    return proc_ok(proc)
 
 
 def delete_node(args: argparse.Namespace) -> bool:
@@ -284,8 +349,9 @@ def delete_node(args: argparse.Namespace) -> bool:
             "--project", args.project,
             "--quiet",
         ],
+        timeout=args.operation_timeout_seconds,
     )
-    return bool(proc and proc.returncode == 0)
+    return proc_ok(proc)
 
 
 def recreate(args: argparse.Namespace, reason: str, qr_exists: bool = True) -> None:
@@ -302,6 +368,7 @@ def recreate(args: argparse.Namespace, reason: str, qr_exists: bool = True) -> N
 
 def ssh_ready(args: argparse.Namespace) -> bool:
     proc = run_capture(
+        args,
         [
             "gcloud", "compute", "tpus", "tpu-vm", "ssh",
             args.node_id,
@@ -309,9 +376,11 @@ def ssh_ready(args: argparse.Namespace) -> bool:
             "--project", args.project,
             "--worker=all",
             "--command=echo keeper_ssh_ok",
-        ]
+        ],
+        "ssh_ready",
+        args.ssh_check_timeout_seconds,
     )
-    return bool(proc and proc.returncode == 0 and "keeper_ssh_ok" in (proc.stdout or ""))
+    return bool(proc_ok(proc) and "keeper_ssh_ok" in (proc.stdout or ""))
 
 
 def launch(args: argparse.Namespace) -> None:
@@ -323,8 +392,13 @@ def launch(args: argparse.Namespace) -> None:
         log(args, f"ERROR launcher_missing path={launcher}")
         return
 
-    pull = run_stream(args, ["git", "pull", "--ff-only"], cwd=str(local_repo))
-    if pull is None or pull.returncode != 0:
+    pull = run_stream(
+        args,
+        ["git", "pull", "--ff-only"],
+        cwd=str(local_repo),
+        timeout=args.operation_timeout_seconds,
+    )
+    if not proc_ok(pull):
         log(args, "WARN git_pull_failed continuing=true")
 
     cmd = [
@@ -338,8 +412,8 @@ def launch(args: argparse.Namespace) -> None:
     if args.token:
         cmd.extend(["--token", args.token])
 
-    proc = run_stream(args, cmd, cwd=str(local_repo))
-    if proc is None or proc.returncode != 0:
+    proc = run_stream(args, cmd, cwd=str(local_repo), timeout=args.launch_timeout_seconds)
+    if not proc_ok(proc):
         log(args, "EVENT launch_failed will_not_retry_until_qr_changes=true")
     else:
         log(args, "EVENT launch_done")
