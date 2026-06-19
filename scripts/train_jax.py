@@ -993,13 +993,20 @@ def _histogram_quantile(counts, score_min, score_max, q):
 def _make_selection_calibration_histogram_fn(
         score_impl, score_kwargs, histogram_bins, score_min, score_max):
     """Create a jitted per-batch histogram function returning counts only."""
+    histogram_bins = int(histogram_bins)
+    score_min = float(score_min)
+    score_max = float(score_max)
 
     def _hist_counts(x):
-        counts, _edges = jnp.histogram(
-            jnp.ravel(jnp.asarray(x, dtype=jnp.float32)),
-            bins=histogram_bins,
-            range=(score_min, score_max))
-        return counts.astype(jnp.int32)
+        x = jnp.ravel(jnp.asarray(x, dtype=jnp.float32))
+        x = jnp.clip(x, score_min, score_max)
+
+        scale = float(histogram_bins) / float(score_max - score_min)
+        idx = jnp.floor((x - float(score_min)) * scale).astype(jnp.int32)
+        idx = jnp.clip(idx, 0, int(histogram_bins) - 1)
+
+        return jnp.bincount(
+            idx, length=int(histogram_bins)).astype(jnp.int32)
 
     def _hist_fn(score_params, input_ids):
         score_tensors = score_impl(score_params, input_ids, **score_kwargs)
@@ -1038,6 +1045,12 @@ def _collect_selection_calibration_histograms(
     }
     seen_tokens = 0
     actual_batches = 0
+    if jax.process_index() == 0:
+        print(
+            "\r[selection_calibration] "
+            "compiling/running histogram calibration...",
+            end="",
+            flush=True)
     for input_ids, _attention_mask in train_loader:
         if (seen_tokens >= local_calibration_tokens
                 or actual_batches >=
@@ -1049,6 +1062,19 @@ def _collect_selection_calibration_histograms(
             counts[pool] += np.asarray(host_counts[pool], dtype=np.int64)
         seen_tokens += int(jax.device_get(token_count))
         actual_batches += 1
+        if jax.process_index() == 0:
+            pct = min(
+                100.0,
+                100.0 * seen_tokens / max(1, local_calibration_tokens))
+            print(
+                "\r[selection_calibration] "
+                f"batch={actual_batches} "
+                f"seen_tokens_local={seen_tokens}/{local_calibration_tokens} "
+                f"({pct:.1f}%)",
+                end="",
+                flush=True)
+    if jax.process_index() == 0:
+        print("", flush=True)
     if actual_batches <= 0:
         raise ValueError(
             "selection_calibration requires at least one training batch.")
