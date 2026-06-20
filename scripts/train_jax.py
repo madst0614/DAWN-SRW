@@ -533,7 +533,10 @@ def _safe_config_snapshot(obj):
 
 def _materialized_config_snapshot(cfg, training_config):
     full_cfg = deepcopy(cfg)
-    full_cfg['training'] = deepcopy(training_config or {})
+    merged_training = deepcopy(cfg.get('training', {}))
+    if training_config:
+        merged_training.update(deepcopy(training_config))
+    full_cfg['training'] = merged_training
     return _json_safe(full_cfg)
 
 
@@ -5917,6 +5920,39 @@ def _is_full_mesh_sharding(value, mesh):
     return devs == _mesh_device_set(mesh)
 
 
+def _maybe_get_opt_state_count(opt_state):
+    candidates = []
+    try:
+        candidates.append(opt_state.count)
+    except Exception:
+        pass
+    try:
+        candidates.append(opt_state[2].count)
+    except Exception:
+        pass
+    try:
+        candidates.append(opt_state[0].count)
+    except Exception:
+        pass
+
+    for value in candidates:
+        try:
+            return int(jax.device_get(value))
+        except Exception:
+            continue
+    return None
+
+
+def _debug_leaf_device_ids(x):
+    try:
+        return sorted(int(d.id) for d in x.sharding.device_set)
+    except Exception:
+        try:
+            return sorted(int(d.id) for d in x.devices())
+        except Exception:
+            return "unknown"
+
+
 def _put_leaf_on_template_or_replicated_mesh(restored_val, template_val, mesh):
     """Match dtype/shape, then place on template sharding or replicated mesh.
 
@@ -10200,6 +10236,43 @@ def main():
                     "from beginning.")
             start_step_in_epoch = 0
         if is_host0:
+            opt_count = _maybe_get_opt_state_count(opt_state)
+            print(f"  [resume check] global_step={global_step}", flush=True)
+            print(f"  [resume check] opt_state_count={opt_count}", flush=True)
+            print(f"  [resume check] best_val_loss={best_val_loss}", flush=True)
+            print(
+                f"  [resume check] step_in_epoch={start_step_in_epoch}",
+                flush=True)
+            if opt_count is not None and int(opt_count) != int(global_step):
+                print(
+                    "  WARNING: optimizer count does not match global_step: "
+                    f"opt_count={opt_count} global_step={global_step}",
+                    flush=True,
+                )
+            try:
+                param_leaf = params['block_0']['attn']['expand_O']['kernel']
+                print(
+                    "  [resume sharding check] param expand_O devices="
+                    f"{_debug_leaf_device_ids(param_leaf)}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    "  [resume sharding check] param inspect failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            opt_count_leaf = None
+            try:
+                opt_count_leaf = opt_state[2].count
+            except Exception:
+                pass
+            if opt_count_leaf is not None:
+                print(
+                    "  [resume sharding check] opt_state count devices="
+                    f"{_debug_leaf_device_ids(opt_count_leaf)}",
+                    flush=True,
+                )
             print(
                 f"  Restored Orbax checkpoint: epoch={start_epoch}, "
                 f"global_step={global_step}, "
@@ -11109,7 +11182,7 @@ def main():
 
     train_start_time = time.time()
     total_micro_steps = num_epochs * steps_per_epoch
-    val_interval = cfg['training'].get('val_interval', 5000)
+    val_interval = int(cfg['training'].get('val_interval', 5000))
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
     # Logging cadence. REGULAR every log_interval steps. ANALYSIS every
