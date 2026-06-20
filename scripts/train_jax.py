@@ -21,6 +21,7 @@ import json
 import re
 import math
 import subprocess
+import inspect
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -1660,11 +1661,17 @@ def _makedirs(path):
 
 
 def _ensure_orbax_checkpoint_root(path):
-    """Ensure an Orbax checkpoint root exists before manager construction."""
+    """Best-effort pre-create for an Orbax checkpoint root.
+
+    Orbax CheckpointManagerOptions(create=True) remains the source of truth for
+    creating the top-level checkpoint directory.  On multi-host TPU runs, Orbax
+    coordinates creation through its multiprocessing options; this helper only
+    reduces first-use races and must not become a separate GCS synchronization
+    mechanism.
+    """
     path_str = str(path).rstrip('/')
     last_exc = None
 
-    # Prefer etils.epath because Orbax uses epath-compatible paths.
     try:
         from etils import epath
         epath.Path(path_str).mkdir(parents=True, exist_ok=True)
@@ -1680,9 +1687,15 @@ def _ensure_orbax_checkpoint_root(path):
         except Exception as tf_exc:
             last_exc = tf_exc
 
-        raise RuntimeError(
-            f"Failed to create Orbax checkpoint root: {path_str}"
-        ) from last_exc
+        if jax.process_index() == 0:
+            print(
+                "Warning: best-effort Orbax GCS root creation failed for "
+                f"{path_str}: {type(last_exc).__name__}: {last_exc}. "
+                "Continuing; Orbax create=True with multiprocessing_options "
+                "will perform the authoritative create/barrier path.",
+                flush=True,
+            )
+        return
 
     Path(path_str).mkdir(parents=True, exist_ok=True)
 
@@ -5438,26 +5451,103 @@ def _orbax_best_metric(metrics):
     return val if np.isfinite(val) else float('inf')
 
 
+def _checkpoint_manager_options_accepts(name):
+    """Return whether the installed Orbax options object accepts a kwarg."""
+    try:
+        sig = inspect.signature(ocp.CheckpointManagerOptions)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    params = sig.parameters
+    if name in params:
+        return True
+    return any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in params.values()
+    )
+
+
+def _orbax_multiprocessing_options(primary_host=0):
+    """Create Orbax MultiprocessingOptions across compatible API paths."""
+    candidates = (
+        ('options', 'MultiprocessingOptions'),
+        ('checkpoint_manager', 'MultiprocessingOptions'),
+        ('', 'MultiprocessingOptions'),
+    )
+    for module_name, attr_name in candidates:
+        module = ocp if not module_name else getattr(ocp, module_name, None)
+        cls = getattr(module, attr_name, None) if module is not None else None
+        if cls is not None:
+            return cls(primary_host=primary_host)
+    raise RuntimeError(
+        "Could not find Orbax MultiprocessingOptions API. "
+        "Check orbax-checkpoint version compatibility."
+    )
+
+
+def _sync_orbax_checkpoint_root_created():
+    """Best-effort host barrier before Orbax manager construction."""
+    try:
+        from jax.experimental import multihost_utils
+    except Exception:
+        return
+
+    sync_devices = getattr(multihost_utils, 'sync_global_devices', None)
+    if sync_devices is not None:
+        try:
+            sync_devices('orbax_checkpoint_root_created')
+            return
+        except Exception:
+            pass
+
+    sync_processes = getattr(multihost_utils, 'sync_global_processes', None)
+    if sync_processes is not None:
+        try:
+            sync_processes('orbax_checkpoint_root_created')
+        except Exception:
+            pass
+
+
 def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
                                      keep_last=3, create=True,
                                      read_only=False):
     """Create the Orbax manager for Composite(state, metadata) checkpoints."""
+    create = bool(create)
+    read_only = bool(read_only)
+    primary_host = 0
+
     if create and not read_only:
-        _ensure_orbax_checkpoint_root(checkpoint_dir)
+        if jax.process_index() == primary_host:
+            _ensure_orbax_checkpoint_root(checkpoint_dir)
+        _sync_orbax_checkpoint_root_created()
+
     options_kwargs = {
         'save_interval_steps': max(1, int(checkpoint_interval or 1)),
         'best_fn': _orbax_best_metric,
         'best_mode': 'min',
         'keep_checkpoints_without_metrics': True,
         'step_format_fixed_length': 12,
-        'create': bool(create),
-        'read_only': bool(read_only),
-        'enable_async_checkpointing': not bool(read_only),
+        'create': create,
+        'read_only': read_only,
+        'enable_async_checkpointing': not read_only,
     }
+    if _checkpoint_manager_options_accepts('multiprocessing_options'):
+        options_kwargs['multiprocessing_options'] = (
+            _orbax_multiprocessing_options(primary_host=primary_host))
+    if _checkpoint_manager_options_accepts('single_host_load_and_broadcast'):
+        options_kwargs['single_host_load_and_broadcast'] = True
     if keep_last is not None and int(keep_last) > 0:
         # Orbax 0.6.4 has no preservation-policy object; max_to_keep is the
         # reliable official option in the installed version.
         options_kwargs['max_to_keep'] = int(keep_last)
+
+    if jax.process_index() == primary_host:
+        print(
+            f"Creating Orbax CheckpointManager: dir={checkpoint_dir} "
+            f"create={create} read_only={read_only} "
+            f"primary_host={primary_host}",
+            flush=True,
+        )
+
     options = ocp.CheckpointManagerOptions(**options_kwargs)
     return ocp.CheckpointManager(
         checkpoint_dir,
@@ -8469,7 +8559,6 @@ def main():
         run_name = f"run_v{version}_{ts}_{rand_suffix}"
         checkpoint_dir = _join(base_checkpoint_dir, run_name)
         _makedirs(checkpoint_dir)
-        _ensure_orbax_checkpoint_root(_join(checkpoint_dir, 'checkpoints'))
         if jax.process_index() == 0:
             if cli_args.from_scratch:
                 print(f"  Starting from scratch (--from-scratch)")
@@ -9737,8 +9826,6 @@ def main():
     best_val_loss = float('inf')
     _has_resume_checkpoint = resume_step is not None
     orbax_root = _join_path(checkpoint_dir, "checkpoints")
-    if not _has_resume_checkpoint:
-        _ensure_orbax_checkpoint_root(orbax_root)
 
     if _has_resume_checkpoint:
         if is_host0:
