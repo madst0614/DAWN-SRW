@@ -540,6 +540,110 @@ def _materialized_config_snapshot(cfg, training_config):
     return _json_safe(full_cfg)
 
 
+ACTIVE_SRW_RESUME_REQUIRED_FIELDS = (
+    ('model', 'model_version'),
+    ('model', 'd_model'),
+    ('model', 'n_layers'),
+    ('model', 'n_heads'),
+    ('model', 'max_seq_len'),
+    ('model', 'd_route'),
+    ('model', 'n_qk'),
+    ('model', 'n_v'),
+    ('model', 'n_rst'),
+    ('data', 'max_train_tokens'),
+    ('training', 'batch_size'),
+    ('training', 'num_epochs'),
+    ('training', 'mesh_model'),
+    ('training', 'mesh_data'),
+    ('training', 'gradient_accumulation_steps'),
+    ('training', 'lr'),
+    ('training', 'warmup_ratio'),
+    ('training', 'weight_decay'),
+    ('training', 'checkpoint_interval'),
+    ('training', 'val_interval'),
+    ('training', 'log_interval'),
+    ('training', 'log_analysis_multiplier'),
+    ('training', 'heavy_geometry_multiplier'),
+    ('training', 'n_chunks_qk'),
+    ('training', 'n_chunks_v'),
+    ('training', 'n_chunks_rst'),
+    ('training', 'admission_den_power'),
+    ('training', 'admission_den_grad_scale'),
+    ('training', 'soft_gate_effective_active_eps'),
+)
+
+
+def _missing_config_paths(cfg, paths):
+    missing = []
+    for path in paths:
+        cur = cfg
+        for key in path:
+            if (not isinstance(cur, dict)
+                    or key not in cur
+                    or cur[key] is None):
+                missing.append('.'.join(path))
+                break
+            cur = cur[key]
+    return missing
+
+
+def _require_resume_full_config(full_config):
+    if full_config is None or full_config == {}:
+        raise RuntimeError(
+            "Resume checkpoint is missing full_config. Automatic config "
+            "fallback is disabled. Restart from scratch or use a separate "
+            "explicit legacy/eval-only loader."
+        )
+    if not isinstance(full_config, dict):
+        raise RuntimeError(
+            "Resume checkpoint full_config is invalid. Expected a config "
+            "dict; restart from scratch."
+        )
+
+    missing_top = [
+        key for key in ('model', 'training') if key not in full_config
+    ]
+    if missing_top:
+        raise RuntimeError(
+            "Resume checkpoint full_config is incomplete: missing "
+            + "/".join(missing_top)
+            + ". This checkpoint cannot be resumed deterministically."
+        )
+    if not isinstance(full_config['model'], dict):
+        raise RuntimeError(
+            "Resume checkpoint full_config.model is invalid. Cannot resume "
+            "deterministically."
+        )
+    if not isinstance(full_config['training'], dict):
+        raise RuntimeError(
+            "Resume checkpoint full_config.training is invalid. Cannot resume "
+            "deterministically."
+        )
+
+
+def _require_resume_materialized_fields(full_config):
+    model_version_missing = _missing_config_paths(
+        full_config, (('model', 'model_version'),))
+    if model_version_missing:
+        raise RuntimeError(
+            "Resume checkpoint full_config is missing required materialized "
+            "fields. Automatic config fallback is disabled. Missing keys: "
+            + ", ".join(model_version_missing)
+        )
+    model_version = full_config['model']['model_version']
+    if not _is_active_srw_version(model_version):
+        return
+
+    missing = _missing_config_paths(
+        full_config, ACTIVE_SRW_RESUME_REQUIRED_FIELDS)
+    if missing:
+        raise RuntimeError(
+            "Resume checkpoint full_config is missing required materialized "
+            "active SRW fields. Automatic config fallback is disabled. "
+            "Missing keys: " + ", ".join(missing)
+        )
+
+
 def _write_json_file(path, obj):
     with _open_file(path, 'w') as f:
         f.write(json.dumps(_json_safe(obj), indent=2, default=str))
@@ -867,6 +971,11 @@ def _selection_calibration_config(cfg, tau_init_cfg=None):
         return {'enabled': False, 'present': False}
     if not isinstance(raw, dict):
         raise ValueError("training.selection_calibration must be a mapping.")
+    if 'run_on' in raw:
+        raise ValueError(
+            "training.selection_calibration.run_on was removed. Selection "
+            "calibration policy is fixed: fresh init computes, resume "
+            "restores.")
 
     enabled = _cfg_bool(
         raw.get('enabled', False),
@@ -894,12 +1003,6 @@ def _selection_calibration_config(cfg, tau_init_cfg=None):
         raise ValueError(
             "training.selection_calibration enabled schema does not support "
             f"these legacy keys: {present_forbidden}.")
-
-    run_on = str(raw.get('run_on', '')).strip().lower()
-    if run_on != 'fresh_init_only':
-        raise ValueError(
-            "selection_calibration.run_on must be 'fresh_init_only', "
-            f"got {raw.get('run_on')!r}.")
 
     calibration_tokens = int(raw.get('calibration_tokens', 0))
     calibration_max_batches = int(raw.get('calibration_max_batches', 0))
@@ -1027,7 +1130,6 @@ def _selection_calibration_config(cfg, tau_init_cfg=None):
         'enabled': True,
         'present': True,
         'raw': raw_out,
-        'run_on': run_on,
         'calibration_tokens': calibration_tokens,
         'calibration_max_batches': calibration_max_batches,
         'histogram_bins': histogram_bins,
@@ -1257,7 +1359,6 @@ def _compute_srw_selection_calibration(
         'type': 'selection_calibration',
         'selection_calibration_enabled': True,
         'selection_calibration_applied': True,
-        'selection_calibration_run_on': 'fresh_init_only',
         'selection_calibration_seen_tokens_target':
             int(selection_calibration_cfg['calibration_tokens']),
         'selection_calibration_tokens_target_global':
@@ -1390,6 +1491,94 @@ def _selection_calibration_checkpoint_updates(selection_summary):
     }
 
 
+SELECTION_CALIBRATION_RESUME_REQUIRED_FIELDS = (
+    'selection_calibration_applied',
+    'selection_calibration_seen_tokens',
+    'selection_calibration_actual_batches',
+    'selection_calibration_histogram_bins',
+    'selection_calibration_tau_qk',
+    'selection_calibration_tau_v',
+    'selection_calibration_tau_rst',
+    'selection_calibration_B_start_qk',
+    'selection_calibration_B_start_v',
+    'selection_calibration_B_start_rst',
+    'selection_calibration_B_final_qk',
+    'selection_calibration_B_final_v',
+    'selection_calibration_B_final_rst',
+    'selection_calibration_formation_end_frac',
+    'selection_calibration_sharpen_end_frac',
+    'soft_gate_t_qk_schedule',
+    'soft_gate_t_qk_sort',
+    'soft_gate_t_qk_band',
+    'soft_gate_t_qk_mid',
+    'soft_gate_t_qk_late',
+    'soft_gate_t_qk_final',
+    'soft_gate_t_qk_sort_end_frac',
+    'soft_gate_t_qk_band_reach_frac',
+    'soft_gate_t_qk_formation_end_frac',
+    'soft_gate_t_qk_sharpen_end_frac',
+    'soft_gate_t_qk_formation_power',
+    'soft_gate_t_qk_sharpen_power',
+    'soft_gate_t_v_schedule',
+    'soft_gate_t_v_sort',
+    'soft_gate_t_v_band',
+    'soft_gate_t_v_mid',
+    'soft_gate_t_v_late',
+    'soft_gate_t_v_final',
+    'soft_gate_t_v_sort_end_frac',
+    'soft_gate_t_v_band_reach_frac',
+    'soft_gate_t_v_formation_end_frac',
+    'soft_gate_t_v_sharpen_end_frac',
+    'soft_gate_t_v_formation_power',
+    'soft_gate_t_v_sharpen_power',
+    'soft_gate_t_rst_schedule',
+    'soft_gate_t_rst_sort',
+    'soft_gate_t_rst_band',
+    'soft_gate_t_rst_mid',
+    'soft_gate_t_rst_late',
+    'soft_gate_t_rst_final',
+    'soft_gate_t_rst_sort_end_frac',
+    'soft_gate_t_rst_band_reach_frac',
+    'soft_gate_t_rst_formation_end_frac',
+    'soft_gate_t_rst_sharpen_end_frac',
+    'soft_gate_t_rst_formation_power',
+    'soft_gate_t_rst_sharpen_power',
+    'soft_gate_boundary_power_start',
+    'soft_gate_boundary_power_mid',
+    'soft_gate_boundary_power_final',
+    'soft_gate_boundary_power_start_frac',
+    'soft_gate_boundary_power_mid_frac',
+    'soft_gate_boundary_power_final_frac',
+    'admission_den_power',
+    'admission_den_grad_scale',
+    'soft_gate_effective_active_eps',
+)
+
+
+def _require_selection_calibration_resume_fields(training_cfg):
+    """Require checkpoint-materialized selection calibration resume fields."""
+    if not isinstance(training_cfg, dict):
+        missing = list(SELECTION_CALIBRATION_RESUME_REQUIRED_FIELDS)
+    else:
+        missing = [
+            key for key in SELECTION_CALIBRATION_RESUME_REQUIRED_FIELDS
+            if key not in training_cfg or training_cfg[key] is None
+        ]
+    if missing:
+        raise RuntimeError(
+            'Resume checkpoint is missing required materialized selection '
+            'calibration fields. This checkpoint cannot be resumed '
+            'deterministically; restart from scratch. Missing keys: '
+            + ', '.join(missing)
+        )
+    if not bool(training_cfg.get('selection_calibration_applied', False)):
+        raise RuntimeError(
+            'Resume checkpoint selection_calibration_applied is not true. '
+            'This checkpoint cannot be resumed deterministically with '
+            'selection calibration enabled; restart from scratch.'
+        )
+
+
 def _selection_calibration_summary_lines(summary):
     active = summary['selection_calibration_active_target']
     candidate_start = summary['selection_calibration_candidate_target_start']
@@ -1407,7 +1596,7 @@ def _selection_calibration_summary_lines(summary):
         for pool in POOL_SCHEDULE_NAMES)
     return [
         "enabled=true",
-        "run_on=fresh_init_only",
+        "policy=fresh_init_computes_resume_restores",
         "calibration_tokens_target_global="
         f"{summary['selection_calibration_tokens_target_global']}",
         "calibration_tokens_target_local="
@@ -8356,6 +8545,7 @@ def main():
             raise FileNotFoundError(f"Config file not found: {config_path}")
     cfg = load_config(config_path)
     raw_cfg_snapshot = deepcopy(cfg)
+    current_yaml_config_snapshot = deepcopy(cfg)
     seed = cfg.get('seed', 42)
     set_seed(seed)
 
@@ -8726,7 +8916,7 @@ def main():
     checkpoint_git_info = _safe_git_info()
 
     # ----------------------------------------------------------
-    # Resume config override: load training config from checkpoint
+    # Resume config policy: checkpoint full_config is the only source of truth.
     # ----------------------------------------------------------
     saved_training_config = None
     saved_raw_config = None
@@ -8736,151 +8926,86 @@ def main():
     resume_config_restore_read_only = False
     resume_readonly_log_printed = False
     selection_calibration_resume_training_updates = {}
+    selection_calibration_resume_restored = False
+    selection_calibration_restore_required = False
     if resume_step is not None:
         resume_config_restore_read_only = True
-        config_json_path = _join(checkpoint_dir, 'config.json')
-        config_raw_json_path = _join(checkpoint_dir, 'config_raw.json')
         checkpoint_metadata = {}
         try:
             checkpoint_metadata = _restore_orbax_metadata(
                 _join(checkpoint_dir, 'checkpoints'), resume_step)
         except Exception as e:
-            if jax.process_index() == 0:
-                print(f"  Warning: Failed to read checkpoint metadata: {e}")
+            raise RuntimeError(
+                "Failed to read resume checkpoint metadata. Automatic config "
+                "fallback is disabled; cannot resume deterministically."
+            ) from e
 
         checkpoint_full_config = checkpoint_metadata.get('full_config')
         checkpoint_raw_config = checkpoint_metadata.get('raw_config')
-        checkpoint_training_config = checkpoint_metadata.get('training_config')
-        checkpoint_model_config = (
-            checkpoint_metadata.get('model_config')
-            or checkpoint_metadata.get('config'))
+        _require_resume_full_config(checkpoint_full_config)
+        saved_full_config = deepcopy(checkpoint_full_config)
+        saved_raw_config = (
+            deepcopy(checkpoint_raw_config)
+            if isinstance(checkpoint_raw_config, dict)
+            and checkpoint_raw_config else None)
+        _require_resume_materialized_fields(saved_full_config)
 
-        if isinstance(checkpoint_full_config, dict) and checkpoint_full_config:
-            saved_full_config = deepcopy(checkpoint_full_config)
-            saved_raw_config = (
-                deepcopy(checkpoint_raw_config)
-                if isinstance(checkpoint_raw_config, dict)
-                and checkpoint_raw_config else None)
-            saved_training_config = (
-                deepcopy(saved_full_config.get('training'))
-                if isinstance(saved_full_config.get('training'), dict)
-                else deepcopy(checkpoint_training_config)
-                if isinstance(checkpoint_training_config, dict)
-                else None)
-            saved_model_config = (
-                deepcopy(saved_full_config.get('model'))
-                if isinstance(saved_full_config.get('model'), dict)
-                else deepcopy(checkpoint_model_config)
-                if isinstance(checkpoint_model_config, dict)
-                else None)
+        cfg = deepcopy(saved_full_config)
+        saved_training_config = deepcopy(cfg['training'])
+        saved_model_config = deepcopy(cfg['model'])
+        resume_config_source = 'checkpoint full_config'
+        raw_cfg_snapshot = deepcopy(current_yaml_config_snapshot)
+        seed = cfg.get('seed', seed)
+        set_seed(seed)
+        tcfg = cfg['training']
+        model_version_cfg = cfg['model']['model_version']
+        is_v4164_cfg = _is_active_srw_version(model_version_cfg)
+        tau_init_cfg = (
+            _v4164_tau_init_config(cfg)
+            if _is_active_srw_version(model_version_cfg)
+            else None)
+        selection_calibration_cfg = _selection_calibration_config(
+            cfg, tau_init_cfg)
+        max_seq_len = cfg['model']['max_seq_len']
+        training_log_append_on_resume = bool(tcfg.get(
+            'training_log_append_on_resume',
+            training_log_append_on_resume))
+        ckpt_interval = int(tcfg['checkpoint_interval'])
+        checkpoint_keep_last = int(tcfg.get(
+            'checkpoint_keep_last',
+            tcfg.get('max_checkpoints_to_keep', checkpoint_keep_last)))
+        current_admission_den_config_override = False
+        if jax.process_index() == 0:
+            print("Resume config source: checkpoint full_config")
+            print("Resume config fallback: disabled")
+            print("  Preserving existing run-folder config snapshots.")
+
+        checkpoint_full_training_config = (
+            saved_full_config.get('training')
+            if isinstance(saved_full_config, dict)
+            and isinstance(saved_full_config.get('training'), dict)
+            else None)
+        checkpoint_selection_calibration_applied = (
+            isinstance(checkpoint_full_training_config, dict)
+            and bool(checkpoint_full_training_config.get(
+                'selection_calibration_applied', False)))
+        selection_calibration_restore_required = bool(
+            selection_calibration_cfg.get('enabled', False)
+            or checkpoint_selection_calibration_applied)
+        if selection_calibration_restore_required:
+            _require_selection_calibration_resume_fields(
+                checkpoint_full_training_config)
+            if resume_config_source != 'checkpoint full_config':
+                raise RuntimeError(
+                    'Selection calibration resume requires checkpoint '
+                    'full_config as the source of truth; restart from '
+                    'scratch.')
+            saved_training_config = deepcopy(checkpoint_full_training_config)
             cfg = deepcopy(saved_full_config)
-            if saved_training_config is not None:
-                cfg['training'] = deepcopy(saved_training_config)
-            if saved_model_config is not None:
-                cfg['model'] = deepcopy(saved_model_config)
-            resume_config_source = 'checkpoint full_config'
-        elif isinstance(checkpoint_raw_config, dict) and checkpoint_raw_config:
-            saved_raw_config = deepcopy(checkpoint_raw_config)
-            cfg = deepcopy(checkpoint_raw_config)
-            if isinstance(checkpoint_model_config, dict):
-                saved_model_config = deepcopy(checkpoint_model_config)
-                cfg['model'] = deepcopy(saved_model_config)
-            if isinstance(checkpoint_training_config, dict):
-                saved_training_config = deepcopy(checkpoint_training_config)
-                cfg['training'] = deepcopy(saved_training_config)
-            elif isinstance(cfg.get('training'), dict):
-                saved_training_config = deepcopy(cfg['training'])
-            resume_config_source = 'checkpoint raw_config'
-        elif (isinstance(checkpoint_training_config, dict)
-              or isinstance(checkpoint_model_config, dict)):
-            cfg = deepcopy(cfg)
-            if isinstance(checkpoint_model_config, dict):
-                saved_model_config = deepcopy(checkpoint_model_config)
-                cfg['model'] = deepcopy(saved_model_config)
-            if isinstance(checkpoint_training_config, dict):
-                saved_training_config = deepcopy(checkpoint_training_config)
-                cfg['training'] = deepcopy(saved_training_config)
-            resume_config_source = 'checkpoint training_config'
-
-        if resume_config_source == 'current_yaml' and _file_exists(config_json_path):
-            try:
-                saved_cfg = _read_json_file(config_json_path)
-                if isinstance(saved_cfg, dict):
-                    saved_raw_config = (
-                        deepcopy(saved_cfg.get('_raw_config'))
-                        if isinstance(saved_cfg.get('_raw_config'), dict)
-                        else saved_raw_config)
-                    materialized_cfg = {
-                        k: deepcopy(v)
-                        for k, v in saved_cfg.items()
-                        if not str(k).startswith('_')
-                    }
-                    if isinstance(materialized_cfg.get('training'), dict):
-                        saved_training_config = deepcopy(
-                            materialized_cfg.get('training'))
-                    if isinstance(materialized_cfg.get('model'), dict):
-                        saved_model_config = deepcopy(
-                            materialized_cfg.get('model'))
-                    if saved_training_config or saved_model_config:
-                        cfg = deepcopy(materialized_cfg)
-                        resume_config_source = 'run-folder config.json'
-                if jax.process_index() == 0:
-                    print(f"Loaded config snapshot from {config_json_path}")
-            except Exception as e:
-                if jax.process_index() == 0:
-                    print(f"  Warning: Failed to read config.json: {e}")
-                saved_cfg = None
-
-        if saved_raw_config is None and _file_exists(config_raw_json_path):
-            try:
-                saved_raw_config = _read_json_file(config_raw_json_path)
-                if jax.process_index() == 0:
-                    print(
-                        f"  Loaded raw config snapshot from "
-                        f"{config_raw_json_path}")
-            except Exception as e:
-                if jax.process_index() == 0:
-                    print(f"  Warning: Failed to read config_raw.json: {e}")
-
-        if (resume_config_source == 'current_yaml'
-                and isinstance(saved_raw_config, dict)
-                and saved_raw_config):
-            raw_fallback_cfg = deepcopy(saved_raw_config)
-            if isinstance(raw_fallback_cfg.get('training'), dict):
-                saved_training_config = deepcopy(raw_fallback_cfg['training'])
-            if isinstance(raw_fallback_cfg.get('model'), dict):
-                saved_model_config = deepcopy(raw_fallback_cfg['model'])
-            if saved_training_config or saved_model_config:
-                cfg = raw_fallback_cfg
-                resume_config_source = 'run-folder config_raw.json'
-
-        if resume_config_source != 'current_yaml':
-            raw_cfg_snapshot = deepcopy(saved_raw_config or cfg)
-            seed = cfg.get('seed', seed)
-            set_seed(seed)
+            cfg['training'] = deepcopy(saved_training_config)
+            if isinstance(cfg.get('model'), dict):
+                saved_model_config = deepcopy(cfg['model'])
             tcfg = cfg.setdefault('training', {})
-            model_version_cfg = cfg.setdefault('model', {}).get(
-                'model_version', OFFICIAL_MODEL_VERSION)
-            is_v4164_cfg = _is_active_srw_version(model_version_cfg)
-            tau_init_cfg = (
-                _v4164_tau_init_config(cfg)
-                if _is_active_srw_version(model_version_cfg)
-                else None)
-            selection_calibration_cfg = _selection_calibration_config(
-                cfg, tau_init_cfg)
-            max_seq_len = cfg['model'].get('max_seq_len', max_seq_len)
-            training_log_append_on_resume = bool(tcfg.get(
-                'training_log_append_on_resume',
-                training_log_append_on_resume))
-            ckpt_interval = int(tcfg.get(
-                'checkpoint_interval', ckpt_interval))
-            checkpoint_keep_last = int(tcfg.get(
-                'checkpoint_keep_last',
-                tcfg.get('max_checkpoints_to_keep', checkpoint_keep_last)))
-            current_admission_den_config_override = False
-            if jax.process_index() == 0:
-                print(f"  Resume config source: {resume_config_source}")
-                print("  Preserving existing run-folder config snapshots.")
 
         if saved_training_config:
             saved_admission_den_signature = {
@@ -8909,17 +9034,13 @@ def main():
                         "the current config override; use a fresh run for the "
                         "new admission_den settings or remove the override to "
                         "reproduce the checkpoint config.")
-            # Apply restored training config. Exact resume keeps checkpoint
-            # config ahead of current invocation overrides.
-            allow_launch_overrides = (resume_config_source == 'current_yaml')
-            if cli_args.batch_size is None or not allow_launch_overrides:
-                batch_size = saved_training_config.get('batch_size', batch_size)
-            if cli_args.epochs is None or not allow_launch_overrides:
-                num_epochs = saved_training_config.get('num_epochs', num_epochs)
-            if cli_args.lr is None or not allow_launch_overrides:
-                lr = saved_training_config.get('lr', lr)
-            weight_decay = saved_training_config.get('weight_decay', weight_decay)
-            warmup_ratio = saved_training_config.get('warmup_ratio', warmup_ratio)
+            # Apply restored training config. Resume ignores launch-time
+            # training/model overrides and keeps checkpoint full_config first.
+            batch_size = saved_training_config['batch_size']
+            num_epochs = saved_training_config['num_epochs']
+            lr = saved_training_config['lr']
+            weight_decay = saved_training_config['weight_decay']
+            warmup_ratio = saved_training_config['warmup_ratio']
             orth_weight = saved_training_config.get('orthogonality_weight', orth_weight)
             boundary_power_schedule_active = True
             soft_gate_t_start = float(saved_training_config.get(
@@ -8951,9 +9072,7 @@ def main():
                 soft_gate_t_power, soft_gate_t_gompertz_center,
                 soft_gate_t_gompertz_steepness)
             soft_gate_effective_active_eps = float(
-                saved_training_config.get(
-                    'soft_gate_effective_active_eps',
-                    soft_gate_effective_active_eps))
+                saved_training_config['soft_gate_effective_active_eps'])
             regular_console_level = str(saved_training_config.get(
                 'regular_console_level', regular_console_level)).lower()
             if regular_console_level not in ('compact', 'full'):
@@ -9012,14 +9131,10 @@ def main():
                     'soft_gate_boundary_power_final_frac',
                     soft_gate_boundary_power_final_frac))
             if not current_admission_den_config_override:
-                admission_den_power = float(saved_training_config.get(
-                    'admission_den_power',
-                    saved_training_config.get(
-                        'v4164_den_power', admission_den_power)))
-                admission_den_grad_scale = float(saved_training_config.get(
-                    'admission_den_grad_scale',
-                    saved_training_config.get(
-                        'v4164_den_grad_scale', admission_den_grad_scale)))
+                admission_den_power = float(
+                    saved_training_config['admission_den_power'])
+                admission_den_grad_scale = float(
+                    saved_training_config['admission_den_grad_scale'])
             pool_weight_decay = 0.0
             div_weight = 0.0
             lb_weight = 0.0
@@ -9102,18 +9217,16 @@ def main():
                 saved_training_config.get(
                     'training_log_append_on_resume',
                     training_log_append_on_resume))
-            ckpt_interval = int(saved_training_config.get(
-                'checkpoint_interval', ckpt_interval))
+            ckpt_interval = int(saved_training_config['checkpoint_interval'])
             checkpoint_keep_last = int(saved_training_config.get(
                 'checkpoint_keep_last',
                 saved_training_config.get(
                     'max_checkpoints_to_keep', checkpoint_keep_last)))
-            log_interval = int(saved_training_config.get(
-                'log_interval', log_interval))
-            log_analysis_multiplier = int(saved_training_config.get(
-                'log_analysis_multiplier', log_analysis_multiplier))
-            heavy_geometry_multiplier = int(saved_training_config.get(
-                'heavy_geometry_multiplier', heavy_geometry_multiplier))
+            log_interval = int(saved_training_config['log_interval'])
+            log_analysis_multiplier = int(
+                saved_training_config['log_analysis_multiplier'])
+            heavy_geometry_multiplier = int(
+                saved_training_config['heavy_geometry_multiplier'])
 
             pool_weight_decay = 0.0
             div_weight = 0.0
@@ -9158,102 +9271,64 @@ def main():
                     "(restored config takes precedence)")
 
         restore_saved_selection_calibration = (
-            saved_training_config
-            and saved_training_config.get(
-                'selection_calibration_applied', False))
+            selection_calibration_restore_required)
         if restore_saved_selection_calibration:
-            soft_gate_t_start = float(saved_training_config.get(
-                'soft_gate_t_start', soft_gate_t_start))
-            soft_gate_t_final = float(saved_training_config.get(
-                'soft_gate_t_final', soft_gate_t_final))
-            soft_gate_t_hold_frac = float(saved_training_config.get(
-                'soft_gate_t_hold_frac', soft_gate_t_hold_frac))
-            soft_gate_t_anneal_end_frac = float(saved_training_config.get(
-                'soft_gate_t_anneal_end_frac',
-                soft_gate_t_anneal_end_frac))
-            soft_gate_schedule = str(saved_training_config.get(
-                'soft_gate_t_schedule', soft_gate_schedule))
-            soft_gate_t_power = float(saved_training_config.get(
-                'soft_gate_t_power', soft_gate_t_power))
-            soft_gate_t_gompertz_center = float(saved_training_config.get(
-                'soft_gate_t_gompertz_center',
-                soft_gate_t_gompertz_center))
-            soft_gate_t_gompertz_steepness = float(saved_training_config.get(
-                'soft_gate_t_gompertz_steepness',
-                soft_gate_t_gompertz_steepness))
-            soft_gate_pool_schedules = _training_soft_gate_pool_schedules(
-                saved_training_config, soft_gate_t_start,
-                soft_gate_t_final, soft_gate_t_hold_frac,
-                soft_gate_t_anneal_end_frac, soft_gate_schedule,
-                soft_gate_t_power, soft_gate_t_gompertz_center,
-                soft_gate_t_gompertz_steepness)
-            _restored_calibrated_schedules = (
-                _flatten_soft_gate_pool_schedules(soft_gate_pool_schedules))
-            selection_calibration_resume_training_updates.update(
-                _restored_calibrated_schedules)
+            for _pool in POOL_SCHEDULE_NAMES:
+                _prefix = f'soft_gate_t_{_pool}'
+                for _key in (
+                        'schedule',
+                        'sort',
+                        'band',
+                        'mid',
+                        'late',
+                        'final',
+                        'sort_end_frac',
+                        'band_reach_frac',
+                        'formation_end_frac',
+                        'sharpen_end_frac',
+                        'formation_power',
+                        'sharpen_power'):
+                    _field = f'{_prefix}_{_key}'
+                    _raw_value = saved_training_config[_field]
+                    _value = (
+                        str(_raw_value)
+                        if _key == 'schedule'
+                        else float(_raw_value))
+                    soft_gate_pool_schedules[_pool][_key] = _value
+                    selection_calibration_resume_training_updates[_field] = (
+                        _value)
             soft_gate_boundary_power_start = float(
-                saved_training_config.get(
-                    'soft_gate_boundary_power_start',
-                    soft_gate_boundary_power_start))
+                saved_training_config['soft_gate_boundary_power_start'])
             soft_gate_boundary_power_mid = float(
-                saved_training_config.get(
-                    'soft_gate_boundary_power_mid',
-                    soft_gate_boundary_power_mid))
+                saved_training_config['soft_gate_boundary_power_mid'])
             soft_gate_boundary_power_final = float(
-                saved_training_config.get(
-                    'soft_gate_boundary_power_final',
-                    soft_gate_boundary_power_final))
+                saved_training_config['soft_gate_boundary_power_final'])
             soft_gate_boundary_power_start_frac = float(
-                saved_training_config.get(
-                    'soft_gate_boundary_power_start_frac',
-                    soft_gate_boundary_power_start_frac))
+                saved_training_config['soft_gate_boundary_power_start_frac'])
             soft_gate_boundary_power_mid_frac = float(
-                saved_training_config.get(
-                    'soft_gate_boundary_power_mid_frac',
-                    soft_gate_boundary_power_mid_frac))
+                saved_training_config['soft_gate_boundary_power_mid_frac'])
             soft_gate_boundary_power_final_frac = float(
-                saved_training_config.get(
-                    'soft_gate_boundary_power_final_frac',
-                    soft_gate_boundary_power_final_frac))
-            selection_calibration_resume_training_updates.update({
-                'soft_gate_boundary_power_start':
-                    soft_gate_boundary_power_start,
-                'soft_gate_boundary_power_mid':
-                    soft_gate_boundary_power_mid,
-                'soft_gate_boundary_power_final':
-                    soft_gate_boundary_power_final,
-                'soft_gate_boundary_power_start_frac':
-                    soft_gate_boundary_power_start_frac,
-                'soft_gate_boundary_power_mid_frac':
-                    soft_gate_boundary_power_mid_frac,
-                'soft_gate_boundary_power_final_frac':
-                    soft_gate_boundary_power_final_frac,
-            })
-            for _key in (
-                    'selection_calibration_applied',
-                    'selection_calibration_seen_tokens',
-                    'selection_calibration_actual_batches',
-                    'selection_calibration_histogram_bins',
-                    'selection_calibration_tau_qk',
-                    'selection_calibration_tau_v',
-                    'selection_calibration_tau_rst',
-                    'selection_calibration_B_start_qk',
-                    'selection_calibration_B_start_v',
-                    'selection_calibration_B_start_rst',
-                    'selection_calibration_B_final_qk',
-                    'selection_calibration_B_final_v',
-                    'selection_calibration_B_final_rst',
-                    'selection_calibration_formation_end_frac',
-                    'selection_calibration_sharpen_end_frac'):
-                if _key in saved_training_config:
+                saved_training_config['soft_gate_boundary_power_final_frac'])
+            admission_den_power = float(
+                saved_training_config['admission_den_power'])
+            admission_den_grad_scale = float(
+                saved_training_config['admission_den_grad_scale'])
+            soft_gate_effective_active_eps = float(
+                saved_training_config['soft_gate_effective_active_eps'])
+            for _key in SELECTION_CALIBRATION_RESUME_REQUIRED_FIELDS:
+                if _key not in selection_calibration_resume_training_updates:
                     selection_calibration_resume_training_updates[_key] = (
                         saved_training_config[_key])
             cfg.setdefault('training', {}).update(
-                _restored_calibrated_schedules)
+                selection_calibration_resume_training_updates)
+            selection_calibration_resume_restored = True
             if jax.process_index() == 0:
                 print(
+                    "  Selection calibration policy: resume restores from "
+                    "checkpoint; recomputation disabled.")
+                print(
                     "  Selection calibration schedule restored from "
-                    "checkpoint config; calibration will not rerun on resume.")
+                    "checkpoint config.")
 
     if is_v4164_cfg:
         pool_weight_decay = 0.0
@@ -9564,6 +9639,11 @@ def main():
         print(f"Total device count: {jax.device_count()}")
         print(f"Backend: {jax.default_backend()}")
         print(f"Config: {config_path}")
+        if resume_step is None:
+            print("Config source: current YAML")
+            print(
+                "Selection calibration policy: fresh init computes; "
+                "resume restores from checkpoint.")
         print(f"Run folder: {checkpoint_dir}")
         print(f"Seed: {seed}")
         print(f"Global batch size: {batch_size}")
@@ -9952,6 +10032,15 @@ def main():
     selection_calibration_tau_applied = False
     if (selection_calibration_cfg.get('enabled', False)
             and not _has_resume_checkpoint):
+        if is_host0:
+            print(
+                "Selection calibration policy: fresh init computes; "
+                "resume restores from checkpoint.",
+                flush=True)
+            print(
+                "Selection calibration: computing from fresh "
+                "initialization...",
+                flush=True)
         if len(train_loader) <= 0:
             raise ValueError(
                 "selection_calibration requires at least one training batch.")
@@ -10021,10 +10110,11 @@ def main():
     elif (selection_calibration_cfg.get('enabled', False)
           and _has_resume_checkpoint
           and is_host0):
-        print(
-            "\nSelection calibration skipped on resume; "
-            "checkpoint tau params preserved.",
-            flush=True)
+        if not selection_calibration_resume_restored:
+            print(
+                "\nSelection calibration policy: resume restores from "
+                "checkpoint; recomputation disabled.",
+                flush=True)
 
     if (_is_active_srw_version(model_version_cfg)
             and tau_init_cfg['mode'] == 'quantile_frac'
@@ -10073,7 +10163,14 @@ def main():
                     'config_json_read_only':
                         bool(resume_config_restore_read_only),
                     'resume_config_source': resume_config_source,
-                    'loaded_config_raw_json': saved_raw_config is not None,
+                    'resume_config_fallback': 'disabled',
+                    'checkpoint_raw_config_present':
+                        saved_raw_config is not None,
+                    'current_yaml_config':
+                        _safe_config_snapshot(current_yaml_config_snapshot),
+                    'checkpoint_full_config':
+                        _safe_config_snapshot(saved_full_config),
+                    'selected_full_config': full_config_snapshot,
                     'current_raw_config': raw_config_snapshot,
                     'current_materialized_config': full_config_snapshot,
                 }
