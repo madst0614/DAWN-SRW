@@ -33,7 +33,7 @@ echo "============================================"
 echo "[1/4] Installing dependencies..."
 pip install --upgrade pip -q
 pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-pip install flax optax orbax-checkpoint==0.6.4 numpy pyyaml gcsfs conllu transformers matplotlib -q
+pip install flax optax orbax-checkpoint==0.11.24 numpy pyyaml gcsfs conllu transformers matplotlib -q
 python3 -c "import importlib.metadata as m; print('  orbax-checkpoint version: ' + m.version('orbax-checkpoint'))"
 
 # 2. Deploy code via git (clone or update)

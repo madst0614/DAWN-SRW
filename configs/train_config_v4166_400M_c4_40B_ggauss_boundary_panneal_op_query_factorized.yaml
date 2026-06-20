@@ -20,9 +20,6 @@ model:
   n_qk: 2262
   n_v: 11206
   n_rst: 31432
-  op_key_stopgrad_rw: false
-  op_query_factorized: true
-  op_query_factorized_mode: product
   tau_init_min: -0.95
   tau_init_max: 0.95
   tau_init_mode: quantile_frac

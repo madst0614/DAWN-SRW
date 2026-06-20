@@ -20,8 +20,6 @@ model:
   n_qk: 1480
   n_v: 7330
   n_rst: 20560
-  op_key_stopgrad_rw: false
-  op_query_factorized: false
   tau_init_min: -0.95
   tau_init_max: 0.95
   tau_init_mode: quantile_frac
