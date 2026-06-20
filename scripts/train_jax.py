@@ -8083,8 +8083,11 @@ def main():
     # Resume config override: load training config from checkpoint
     # ----------------------------------------------------------
     saved_training_config = None
+    resume_config_restore_read_only = False
     selection_calibration_resume_training_updates = {}
     if resume_path and _file_exists(resume_path):
+        resume_config_restore_read_only = bool(
+            restore_training_config_on_resume)
         # Try config.json in run folder
         config_json_path = _join(checkpoint_dir, 'config.json')
 
@@ -8095,11 +8098,19 @@ def main():
                 saved_cfg = json.loads(content)
                 saved_training_config = saved_cfg.get('training')
                 if jax.process_index() == 0:
-                    print(f"  Loaded training config from {config_json_path}")
+                    print(f"Loaded training config from {config_json_path}")
+                    if restore_training_config_on_resume:
+                        print(
+                            "Resume config restore enabled; preserving "
+                            "existing config.json read-only.")
             except Exception as e:
                 if jax.process_index() == 0:
                     print(f"  Warning: Failed to read config.json: {e}")
                 saved_cfg = None
+        elif restore_training_config_on_resume and jax.process_index() == 0:
+            print(
+                f"  Warning: config.json missing at {config_json_path}; "
+                "continuing with current config.")
 
         if saved_training_config and restore_training_config_on_resume:
             saved_admission_den_signature = {
@@ -8340,10 +8351,13 @@ def main():
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
-        if (saved_training_config
-                and selection_calibration_cfg.get('enabled', False)
-                and saved_training_config.get(
-                    'selection_calibration_applied', False)):
+        restore_saved_selection_calibration = (
+            saved_training_config
+            and saved_training_config.get(
+                'selection_calibration_applied', False)
+            and (restore_training_config_on_resume
+                 or selection_calibration_cfg.get('enabled', False)))
+        if restore_saved_selection_calibration:
             soft_gate_t_start = float(saved_training_config.get(
                 'soft_gate_t_start', soft_gate_t_start))
             soft_gate_t_final = float(saved_training_config.get(
@@ -9280,14 +9294,15 @@ def main():
 
     # Save config.json for this run (host 0 only)
     if is_host0:
-        try:
-            cj_path = _join(checkpoint_dir, 'config.json')
-            full_cfg = {'model': cfg['model'], 'training': training_config}
-            with _open_file(cj_path, 'w') as f:
-                f.write(json.dumps(full_cfg, indent=2, default=str))
-            print(f"  Saved config.json: {cj_path}")
-        except Exception as e:
-            print(f"  Warning: Failed to save config.json: {e}")
+        if not resume_config_restore_read_only:
+            try:
+                cj_path = _join(checkpoint_dir, 'config.json')
+                full_cfg = {'model': cfg['model'], 'training': training_config}
+                with _open_file(cj_path, 'w') as f:
+                    f.write(json.dumps(full_cfg, indent=2, default=str))
+                print(f"  Saved config.json: {cj_path}")
+            except Exception as e:
+                print(f"  Warning: Failed to save config.json: {e}")
 
     # ----------------------------------------------------------
     # Create Mesh + shard params
