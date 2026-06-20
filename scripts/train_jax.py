@@ -121,7 +121,7 @@ def _require_orbax_checkpoint_compat():
     if _ORBAX_IMPORT_ERROR is not None:
         raise RuntimeError(
             "Failed to import orbax.checkpoint. Install the tested "
-            "checkpoint dependency with `pip install orbax-checkpoint==0.6.4`. "
+            "checkpoint dependency with `pip install orbax-checkpoint==0.11.24`. "
             f"Detected orbax-checkpoint version: {version}. "
             f"Import error: {_ORBAX_IMPORT_ERROR}") from _ORBAX_IMPORT_ERROR
 
@@ -1660,7 +1660,7 @@ def _materialize_gcs_directory_object(path_str):
 def _ensure_orbax_checkpoint_root(path):
     """Ensure an Orbax checkpoint root is visible/listable before init.
 
-    Orbax 0.6.4 may call CheckpointManager._load_checkpoint_infos() during
+    Orbax may call CheckpointManager._load_checkpoint_infos() during manager
     construction, which lists the checkpoint root before the first save.  On
     GCS, mkdir can succeed without making a fresh empty prefix listable through
     epath/gcsfs.  For GCS roots, verify listability after mkdir and, if needed,
@@ -5537,8 +5537,8 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
     if _checkpoint_manager_options_accepts('single_host_load_and_broadcast'):
         options_kwargs['single_host_load_and_broadcast'] = True
     if keep_last is not None and int(keep_last) > 0:
-        # Orbax 0.6.4 has no preservation-policy object; max_to_keep is the
-        # reliable official option in the installed version.
+        # max_to_keep is the stable retention option across supported Orbax
+        # versions.
         options_kwargs['max_to_keep'] = int(keep_last)
 
     if jax.process_index() == primary_host:
@@ -5891,6 +5891,37 @@ def _restore_orbax_state(manager, step, target_state):
     metadata = _composite_item(restored, 'metadata')
     return (state if isinstance(state, dict) else {},
             metadata if isinstance(metadata, dict) else {})
+
+
+def _match_leaf_to_template(restored_val, template_val):
+    """Cast/reshape/device-place a restored leaf to match a template leaf."""
+    if template_val is None:
+        return restored_val
+
+    dtype = getattr(template_val, 'dtype', None)
+    restored_arr = jnp.asarray(restored_val, dtype=dtype)
+    if hasattr(template_val, 'shape'):
+        restored_arr = jnp.reshape(restored_arr, template_val.shape)
+
+    sharding = getattr(template_val, 'sharding', None)
+    if sharding is not None:
+        try:
+            return jax.device_put(restored_arr, sharding)
+        except Exception:
+            pass
+
+    # Fallback: zeros_like(template_val) carries the template placement/sharding.
+    return jnp.zeros_like(template_val) + restored_arr
+
+
+def _match_tree_to_template(restored_tree, template_tree, *, name):
+    try:
+        return jax.tree.map(
+            _match_leaf_to_template, restored_tree, template_tree)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to match restored {name} to target template/sharding."
+        ) from exc
 
 
 def _state_scalar(state, key, default=None, cast=None):
@@ -10052,6 +10083,8 @@ def main():
     params = shard_params_to_mesh(params, param_shardings)
 
     opt_state = optimizer.init(params)
+    target_params = params
+    target_opt_state = opt_state
     checkpoint_manager = _create_orbax_checkpoint_manager(
         _join(checkpoint_dir, 'checkpoints'),
         checkpoint_interval=ckpt_interval,
@@ -10061,7 +10094,7 @@ def main():
 
     if _has_resume_checkpoint:
         target_state = _build_orbax_state(
-            params, opt_state, rng,
+            target_params, target_opt_state, rng,
             epoch=0,
             global_step=0,
             step_in_epoch=0,
@@ -10073,8 +10106,12 @@ def main():
         )
         restored_state, restored_metadata = _restore_orbax_state(
             checkpoint_manager, resume_step, target_state)
-        params = restored_state['params']
-        opt_state = restored_state['opt_state']
+        params = _match_tree_to_template(
+            restored_state['params'], target_params, name='params')
+        opt_state = _match_tree_to_template(
+            restored_state['opt_state'], target_opt_state, name='opt_state')
+        if is_host0:
+            print("  Restored params/optimizer state matched to target mesh sharding.")
         if 'rng' not in restored_state:
             raise KeyError("Orbax checkpoint state is missing required rng.")
         rng = jnp.asarray(restored_state['rng'], dtype=jnp.uint32)
