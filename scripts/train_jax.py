@@ -10,7 +10,7 @@ Active DAWN-SRW training path:
 Usage:
     python scripts/train_jax.py --config configs/train_config_v4164_40M_c4_5B_ggauss_boundary_panneal.yaml
     python scripts/train_jax.py --config configs/train_config_v4166_40M_c4_5B_ggauss_boundary_panneal.yaml
-    python scripts/train_jax.py --config configs/train_config_v4164_40M_c4_5B_ggauss_boundary_panneal.yaml --resume gs://.../run_v...
+    python scripts/train_jax.py --config configs/train_config_v4164_40M_c4_5B_ggauss_boundary_panneal.yaml --resume-from gs://.../run_v...
     python scripts/train_jax.py --config configs/train_config_v4164_40M_c4_5B_ggauss_boundary_panneal.yaml --from-scratch
 """
 
@@ -20,6 +20,7 @@ import signal
 import json
 import re
 import math
+import subprocess
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -35,12 +36,20 @@ except ImportError:
     _bcast_one_to_all = None
     _HAVE_BROADCAST = False
 import optax
+try:
+    import orbax.checkpoint as ocp
+    _ORBAX_IMPORT_ERROR = None
+except Exception as exc:
+    ocp = None
+    _ORBAX_IMPORT_ERROR = exc
 import numpy as np
 import time
 import random
 import argparse
+from importlib import metadata as importlib_metadata
 import yaml
 import numpy as np
+from copy import deepcopy
 from datetime import datetime
 from functools import partial
 from typing import Any, Callable, Optional
@@ -71,6 +80,7 @@ V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
 V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (V4164_MODEL_VERSION, V4166_MODEL_VERSION)
+CHECKPOINT_SCHEMA_VERSION = 3
 MODEL_REGISTRY = {
     V4164_MODEL_VERSION: {
         'class': DAWN_SRW_V4164,
@@ -85,6 +95,56 @@ MODEL_REGISTRY = {
         'tau_init_calibration_scores': _v4166_tau_init_calibration_scores,
     },
 }
+
+
+def _orbax_checkpoint_version():
+    try:
+        return importlib_metadata.version("orbax-checkpoint")
+    except importlib_metadata.PackageNotFoundError:
+        return "<not installed>"
+    except Exception as exc:
+        return f"<unknown: {type(exc).__name__}: {exc}>"
+
+
+def _get_dotted_attr(root, dotted):
+    current = root
+    for part in dotted.split('.'):
+        current = getattr(current, part, None)
+        if current is None:
+            return None
+    return current
+
+
+def _require_orbax_checkpoint_compat():
+    version = _orbax_checkpoint_version()
+    if _ORBAX_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "Failed to import orbax.checkpoint. Install the tested "
+            "checkpoint dependency with `pip install orbax-checkpoint==0.6.4`. "
+            f"Detected orbax-checkpoint version: {version}. "
+            f"Import error: {_ORBAX_IMPORT_ERROR}") from _ORBAX_IMPORT_ERROR
+
+    required = (
+        'CheckpointManager',
+        'CheckpointManagerOptions',
+        'args.Composite',
+        'args.StandardSave',
+        'args.StandardRestore',
+        'args.JsonSave',
+        'args.JsonRestore',
+    )
+    missing = [
+        f"ocp.{name}"
+        for name in required
+        if _get_dotted_attr(ocp, name) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "Installed orbax-checkpoint is missing required APIs for this "
+            f"Orbax-only trainer. Version: {version}. Missing: "
+            + ", ".join(missing))
+    print(f"Detected orbax-checkpoint version: {version}", flush=True)
+    return version
 
 
 def _is_active_srw_version(version):
@@ -427,6 +487,63 @@ def load_config(config_path):
             return yaml.safe_load(f)
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
+
+
+def _json_safe(obj):
+    """Convert config snapshots to JSON/msgpack-friendly Python values."""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {str(_json_safe(k)): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            return obj.decode('utf-8')
+        except UnicodeDecodeError:
+            return str(obj)
+    if hasattr(obj, 'tolist'):
+        try:
+            return _json_safe(obj.tolist())
+        except Exception:
+            pass
+    if hasattr(obj, 'item'):
+        try:
+            return _json_safe(obj.item())
+        except Exception:
+            pass
+    if hasattr(obj, 'shape') and hasattr(obj, 'dtype'):
+        try:
+            return _json_safe(np.asarray(obj).tolist())
+        except Exception:
+            pass
+    return str(obj)
+
+
+def _safe_config_snapshot(obj):
+    return _json_safe(deepcopy(obj))
+
+
+def _materialized_config_snapshot(cfg, training_config):
+    full_cfg = deepcopy(cfg)
+    full_cfg['training'] = deepcopy(training_config or {})
+    return _json_safe(full_cfg)
+
+
+def _write_json_file(path, obj):
+    with _open_file(path, 'w') as f:
+        f.write(json.dumps(_json_safe(obj), indent=2, default=str))
+
+
+def _read_json_file(path):
+    with _open_file(path, 'r') as f:
+        return json.loads(f.read())
 
 
 # ============================================================
@@ -1508,18 +1625,13 @@ def _file_exists(path):
     return Path(path_str).exists()
 
 
-def _list_files(directory, pattern="*.flax"):
-    """List files in a directory (local or GCS), sorted by step number."""
-    import re
+def _list_files(directory, pattern="*"):
+    """List files in a directory (local or GCS), sorted by name."""
     dir_str = str(directory)
 
     def _sort_key(path):
-        """Extract step number for numeric sort. best_model sorts last."""
         name = path.rsplit('/', 1)[-1] if '/' in path else path
-        if 'best_model' in name:
-            return float('inf')
-        m = re.search(r'(\d+)', name)
-        return int(m.group(1)) if m else 0
+        return name
 
     if _is_gcs(dir_str):
         fs = _get_gcs_fs()
@@ -1541,107 +1653,31 @@ def _list_files(directory, pattern="*.flax"):
     return sorted((str(f) for f in Path(dir_str).glob(pattern)), key=_sort_key)
 
 
-def _select_resume_checkpoint(folder):
-    """Pick the best checkpoint for continuing training from a run folder.
-
-    best_model.flax may point to an older validation-best step, so it is only
-    used as a fallback when no step/epoch/emergency checkpoint exists.
-    """
-    import re
-    candidates = _list_files(folder, "*.flax")
-    if not candidates:
-        return None
-
-    def _name(path):
-        return str(path).rsplit('/', 1)[-1]
-
-    def _step_key(path):
-        name = _name(path)
-        m = re.match(r'(?:checkpoint_step|emergency_step)(\d+)\.flax$', name)
-        if m:
-            return (3, int(m.group(1)))
-        m = re.match(r'checkpoint_epoch(\d+)\.flax$', name)
-        if m:
-            return (2, int(m.group(1)))
-        if name == 'best_model.flax':
-            return (1, -1)
-        return (0, -1)
-
-    return max(candidates, key=_step_key)
-
-
-def _checkpoint_parent_dir(path):
-    """Return the containing run folder for a checkpoint path."""
-    path_str = str(path).rstrip('/')
-    if '/' not in path_str:
-        return '.'
-    return path_str.rsplit('/', 1)[0]
-
-
-def _resolve_resume_from(resume_from):
-    """Resolve --resume to (checkpoint_file, checkpoint_dir).
-
-    Accepts either a run folder or a concrete .flax file.  Passing
-    best_model.flax is therefore explicit and will not be overridden by a
-    newer checkpoint_step*.flax in the same folder.
-    """
-    target = str(resume_from).rstrip('/')
-    if target.endswith('.flax'):
-        if not _file_exists(target):
-            return None, _checkpoint_parent_dir(target)
-        return target, _checkpoint_parent_dir(target)
-    selected = _select_resume_checkpoint(target)
-    if selected:
-        return selected, target
-    return None, target
-
-
 def _makedirs(path):
     """Create directory (local only; GCS doesn't need explicit mkdir)."""
     if not _is_gcs(path):
         Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def _delete_file(path):
-    """Delete a single file (local or GCS). Warns on failure; never silent."""
-    path_str = str(path)
-    if _is_gcs(path_str):
-        fs = _get_gcs_fs()
-        if fs is not None:
-            try:
-                fs.rm(path_str)
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                if jax.process_index() == 0:
-                    print(f"Warning: _delete_file({path_str}) failed: {e}", flush=True)
-            return
-        try:
-            import tensorflow as tf
-            tf.io.gfile.remove(path_str)
-            return
-        except ImportError:
-            raise ImportError(
-                f"Cannot delete GCS path {path_str}: "
-                f"neither gcsfs nor tensorflow available.")
-    p = Path(path_str)
-    if p.exists():
-        p.unlink()
+def _join_path(base, *parts):
+    base_str = str(base)
+    if _is_gcs(base_str):
+        out = base_str.rstrip('/')
+        for part in parts:
+            out += '/' + str(part).strip('/\\')
+        return out
+    return str(Path(base_str, *map(str, parts)))
 
 
-def cleanup_old_checkpoints(checkpoint_dir, keep_last=3):
-    """Keep only the last N step checkpoints. best_model/epoch/emergency are never deleted."""
-    all_files = _list_files(checkpoint_dir, "checkpoint_step*.flax")
-    if len(all_files) <= keep_last:
-        return
-    import re
-    def _step_num(path):
-        m = re.search(r'checkpoint_step(\d+)\.flax', str(path))
-        return int(m.group(1)) if m else 0
-    all_files.sort(key=_step_num)
-    to_delete = all_files[:-keep_last]
-    for f in to_delete:
-        _delete_file(f)
+def _path_name(path):
+    return str(path).rstrip('/\\').replace('\\', '/').rsplit('/', 1)[-1]
+
+
+def _path_parent(path):
+    path_str = str(path).rstrip('/\\').replace('\\', '/')
+    if '/' not in path_str:
+        return '.'
+    return path_str.rsplit('/', 1)[0]
 
 
 # ============================================================
@@ -5321,70 +5357,386 @@ def run_eval_prune_sweep(eval_prune_step_fns, params, val_loader, n_devices,
 
 
 # ============================================================
-# Checkpoint save / load (with GCS support)
+# Orbax checkpoint save / load
 # ============================================================
 
-def _serialize_checkpoint(params, opt_state, epoch, step, best_val_loss, model_config,
-                          step_in_epoch=0, steps_per_epoch=0, training_config=None):
-    """Serialize a checkpoint dict to bytes (no write).
 
-    Split out so callers that write the same bytes to multiple paths
-    (e.g. checkpoint_epochN.flax + best_model.flax in the same event)
-    can reuse a single serialization pass.
-    """
-    import flax.serialization as serialization
-    ckpt = {
+def _checkpoint_consumed_counts(step, training_config=None, full_config=None,
+                                model_config=None):
+    """Best-effort example/token counters for checkpoint metadata."""
+    training_config = training_config or {}
+    full_config = full_config or {}
+    model_config = model_config or {}
+    full_training = (
+        full_config.get('training', {})
+        if isinstance(full_config, dict) else {})
+    full_model = (
+        full_config.get('model', {})
+        if isinstance(full_config, dict) else {})
+
+    batch_size = training_config.get(
+        'batch_size', full_training.get('batch_size'))
+    max_seq_len = model_config.get(
+        'max_seq_len', full_model.get('max_seq_len'))
+    try:
+        consumed_examples = int(step) * int(batch_size)
+    except (TypeError, ValueError):
+        consumed_examples = None
+    try:
+        consumed_tokens = int(consumed_examples) * int(max_seq_len)
+    except (TypeError, ValueError):
+        consumed_tokens = None
+    return consumed_examples, consumed_tokens
+
+
+LEGACY_FLAX_CHECKPOINT_ERROR = (
+    "Legacy .flax checkpoints are not supported in this Orbax-only branch. "
+    "Use the old branch or write a separate converter."
+)
+
+
+def _orbax_best_metric(metrics):
+    if not isinstance(metrics, dict):
+        return float('inf')
+    val = metrics.get('val_loss')
+    try:
+        val = float(val)
+    except (TypeError, ValueError):
+        return float('inf')
+    return val if np.isfinite(val) else float('inf')
+
+
+def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
+                                     keep_last=3, create=True,
+                                     read_only=False):
+    """Create the Orbax manager for Composite(state, metadata) checkpoints."""
+    options_kwargs = {
+        'save_interval_steps': max(1, int(checkpoint_interval or 1)),
+        'best_fn': _orbax_best_metric,
+        'best_mode': 'min',
+        'keep_checkpoints_without_metrics': True,
+        'step_format_fixed_length': 12,
+        'create': bool(create),
+        'read_only': bool(read_only),
+        'enable_async_checkpointing': not bool(read_only),
+    }
+    if keep_last is not None and int(keep_last) > 0:
+        # Orbax 0.6.4 has no preservation-policy object; max_to_keep is the
+        # reliable official option in the installed version.
+        options_kwargs['max_to_keep'] = int(keep_last)
+    options = ocp.CheckpointManagerOptions(**options_kwargs)
+    return ocp.CheckpointManager(
+        checkpoint_dir,
+        options=options,
+        item_names=('state', 'metadata'),
+    )
+
+
+def _is_orbax_missing_dir_error(exc):
+    return isinstance(exc, ValueError) and 'does not exist' in str(exc)
+
+
+def _parse_orbax_resume_target(resume_from):
+    target = str(resume_from).strip().rstrip('/\\')
+    if not target:
+        return None, None
+    if target.endswith('.flax'):
+        raise ValueError(LEGACY_FLAX_CHECKPOINT_ERROR)
+    name = _path_name(target)
+    if name.isdigit():
+        parent = _path_parent(target)
+        if _path_name(parent) != 'checkpoints':
+            raise ValueError(
+                "--resume-from STEP is ambiguous; pass a run folder or "
+                "run_folder/checkpoints/STEP.")
+        return _path_parent(parent), int(name)
+    if name == 'checkpoints':
+        return _path_parent(target), None
+    return target, None
+
+
+def _latest_orbax_step_for_run(run_folder):
+    try:
+        manager = _create_orbax_checkpoint_manager(
+            _join_path(run_folder, 'checkpoints'),
+            create=False,
+            read_only=True,
+        )
+    except Exception as exc:
+        if _is_orbax_missing_dir_error(exc):
+            return None
+        raise
+    try:
+        latest = manager.latest_step()
+        return None if latest is None else int(latest)
+    finally:
+        manager.close()
+
+
+def _resolve_orbax_resume_from(resume_from):
+    run_folder, requested_step = _parse_orbax_resume_target(resume_from)
+    if run_folder is None:
+        return None, None, False
+    try:
+        manager = _create_orbax_checkpoint_manager(
+            _join_path(run_folder, 'checkpoints'),
+            create=False,
+            read_only=True,
+        )
+    except Exception as exc:
+        if _is_orbax_missing_dir_error(exc):
+            return run_folder, requested_step, False
+        raise
+    try:
+        if requested_step is not None:
+            steps = {int(s) for s in manager.all_steps(read=True)}
+            return run_folder, int(requested_step), int(requested_step) in steps
+        latest = manager.latest_step()
+        if latest is None:
+            return run_folder, None, False
+        return run_folder, int(latest), True
+    finally:
+        manager.close()
+
+
+def _composite_item(restored, name):
+    if isinstance(restored, dict):
+        return restored.get(name)
+    try:
+        return restored[name]
+    except Exception:
+        pass
+    if hasattr(restored, 'items'):
+        try:
+            return dict(restored.items()).get(name)
+        except Exception:
+            pass
+    return None
+
+
+def _restore_orbax_metadata(checkpoint_dir, step):
+    manager = _create_orbax_checkpoint_manager(
+        checkpoint_dir,
+        create=False,
+        read_only=True,
+    )
+    try:
+        restored = manager.restore(
+            int(step),
+            args=ocp.args.Composite(metadata=ocp.args.JsonRestore()),
+        )
+        metadata = _composite_item(restored, 'metadata')
+        return metadata if isinstance(metadata, dict) else {}
+    finally:
+        manager.close()
+
+
+def _safe_git_info():
+    def _run_git(args):
+        try:
+            proc = subprocess.run(
+                ['git', *args],
+                cwd=str(PROJECT_ROOT),
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            return None
+        value = (proc.stdout or '').strip()
+        return value or None
+
+    return {
+        'git_branch': _run_git(['rev-parse', '--abbrev-ref', 'HEAD']),
+        'git_commit': _run_git(['rev-parse', 'HEAD']),
+    }
+
+
+def _build_orbax_state(params, opt_state, rng, epoch, global_step,
+                       step_in_epoch, steps_per_epoch, best_val_loss,
+                       consumed_examples=None, consumed_tokens=None,
+                       training_config=None, full_config=None,
+                       model_config=None):
+    if consumed_examples is None or consumed_tokens is None:
+        inferred_examples, inferred_tokens = _checkpoint_consumed_counts(
+            global_step, training_config, full_config, model_config)
+        if consumed_examples is None:
+            consumed_examples = inferred_examples
+        if consumed_tokens is None:
+            consumed_tokens = inferred_tokens
+    return {
         'params': params,
         'opt_state': opt_state,
-        'epoch': epoch,
-        'step': step,
-        'step_in_epoch': step_in_epoch,
-        'steps_per_epoch': steps_per_epoch,
-        'best_val_loss': best_val_loss,
-        'config': model_config,
-        'training_config': training_config or {},
+        'rng': rng,
+        'epoch': np.asarray(int(epoch), dtype=np.int64),
+        'global_step': np.asarray(int(global_step), dtype=np.int64),
+        'step': np.asarray(int(global_step), dtype=np.int64),
+        'step_in_epoch': np.asarray(int(step_in_epoch), dtype=np.int64),
+        'steps_per_epoch': np.asarray(int(steps_per_epoch), dtype=np.int64),
+        'best_val_loss': np.asarray(float(best_val_loss), dtype=np.float64),
+        'consumed_examples': np.asarray(
+            -1 if consumed_examples is None else int(consumed_examples),
+            dtype=np.int64),
+        'consumed_tokens': np.asarray(
+            -1 if consumed_tokens is None else int(consumed_tokens),
+            dtype=np.int64),
     }
-    return serialization.to_bytes(ckpt)
 
 
-def _write_checkpoint_bytes(path, bytes_data):
-    """Write pre-serialized checkpoint bytes to path."""
-    with _open_file(path, 'wb') as f:
-        f.write(bytes_data)
-    print(f"  Checkpoint saved: {path} ({len(bytes_data) / 1e6:.1f} MB)")
+def _json_loss(value):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
 
 
-def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config,
-                    step_in_epoch=0, steps_per_epoch=0, training_config=None):
-    """Save checkpoint using flax serialization. Supports local and GCS paths."""
-    bytes_data = _serialize_checkpoint(
-        params, opt_state, epoch, step, best_val_loss, model_config,
-        step_in_epoch, steps_per_epoch, training_config)
-    _write_checkpoint_bytes(path, bytes_data)
-
-
-
-def load_checkpoint(path, target_params, target_opt_state):
-    """Load checkpoint using flax serialization. Supports local and GCS paths."""
-    import flax.serialization as serialization
-    with _open_file(path, 'rb') as f:
-        bytes_data = f.read()
-    target = {
-        'params': target_params,
-        'opt_state': target_opt_state,
-        'epoch': 0,
-        'step': 0,
-        'step_in_epoch': 0,
-        'steps_per_epoch': 0,
-        'best_val_loss': float('inf'),
-        'config': {},
-        'training_config': {},
+def _build_orbax_metadata(run_id, global_step, epoch, step_in_epoch,
+                          steps_per_epoch, best_val_loss, val_loss,
+                          checkpoint_kind, model_config, training_config,
+                          full_config, raw_config, config_path,
+                          consumed_examples=None, consumed_tokens=None,
+                          git_info=None):
+    model_snapshot = _safe_config_snapshot(model_config or {})
+    training_snapshot = _safe_config_snapshot(training_config or {})
+    full_snapshot = _safe_config_snapshot(full_config or {})
+    raw_snapshot = _safe_config_snapshot(raw_config or {})
+    if consumed_examples is None or consumed_tokens is None:
+        inferred_examples, inferred_tokens = _checkpoint_consumed_counts(
+            global_step, training_snapshot, full_snapshot, model_snapshot)
+        if consumed_examples is None:
+            consumed_examples = inferred_examples
+        if consumed_tokens is None:
+            consumed_tokens = inferred_tokens
+    metadata = {
+        'type': 'dawn_srw_orbax_checkpoint',
+        'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION,
+        'created_at': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+        'run_id': str(run_id),
+        'global_step': int(global_step),
+        'epoch': int(epoch),
+        'step_in_epoch': int(step_in_epoch),
+        'steps_per_epoch': int(steps_per_epoch),
+        'best_val_loss': _json_loss(best_val_loss),
+        'val_loss': _json_loss(val_loss),
+        'checkpoint_kind': str(checkpoint_kind),
+        'consumed_examples': (
+            None if consumed_examples is None else int(consumed_examples)),
+        'consumed_tokens': (
+            None if consumed_tokens is None else int(consumed_tokens)),
+        'model_config': model_snapshot,
+        'training_config': training_snapshot,
+        'full_config': full_snapshot,
+        'raw_config': raw_snapshot,
+        'config_path': str(config_path),
     }
-    raw = serialization.msgpack_restore(bytes_data)
-    ckpt = serialization.from_state_dict(target, raw)
-    if jax.process_index() == 0:
-        print(f"  Checkpoint loaded: {path}")
-    return ckpt
+    for key, value in (git_info or {}).items():
+        if value:
+            metadata[key] = value
+    return _json_safe(metadata)
+
+
+def _checkpoint_metrics(val_loss=None, best_val_loss=None, train_loss=None):
+    metrics = {}
+    if val_loss is not None:
+        val = _json_loss(val_loss)
+        if val is not None:
+            metrics['val_loss'] = val
+    if best_val_loss is not None:
+        best = _json_loss(best_val_loss)
+        if best is not None:
+            metrics['best_val_loss'] = best
+    if train_loss is not None:
+        train = _json_loss(train_loss)
+        if train is not None:
+            metrics['train_loss'] = train
+    return metrics
+
+
+def save_orbax_checkpoint(manager, params, opt_state, rng, epoch,
+                          global_step, step_in_epoch, steps_per_epoch,
+                          best_val_loss, model_config, training_config,
+                          full_config, raw_config, config_path, run_id,
+                          checkpoint_kind, val_loss=None, train_loss=None,
+                          git_info=None, wait=False):
+    consumed_examples, consumed_tokens = _checkpoint_consumed_counts(
+        global_step, training_config, full_config, model_config)
+    state = _build_orbax_state(
+        params, opt_state, rng, epoch, global_step, step_in_epoch,
+        steps_per_epoch, best_val_loss,
+        consumed_examples=consumed_examples,
+        consumed_tokens=consumed_tokens,
+        training_config=training_config,
+        full_config=full_config,
+        model_config=model_config,
+    )
+    metadata = _build_orbax_metadata(
+        run_id, global_step, epoch, step_in_epoch, steps_per_epoch,
+        best_val_loss, val_loss, checkpoint_kind, model_config,
+        training_config, full_config, raw_config, config_path,
+        consumed_examples=consumed_examples,
+        consumed_tokens=consumed_tokens,
+        git_info=git_info,
+    )
+    metrics = _checkpoint_metrics(
+        val_loss=val_loss,
+        best_val_loss=best_val_loss,
+        train_loss=train_loss,
+    )
+    saved = manager.save(
+        int(global_step),
+        args=ocp.args.Composite(
+            state=ocp.args.StandardSave(state),
+            metadata=ocp.args.JsonSave(metadata),
+        ),
+        metrics=metrics,
+        force=True,
+    )
+    manager.check_for_errors()
+    if wait:
+        manager.wait_until_finished()
+        manager.check_for_errors()
+    return saved
+
+
+def _restore_orbax_state(manager, step, target_state):
+    restored = manager.restore(
+        int(step),
+        args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(target_state),
+            metadata=ocp.args.JsonRestore(),
+        ),
+    )
+    state = _composite_item(restored, 'state')
+    metadata = _composite_item(restored, 'metadata')
+    return (state if isinstance(state, dict) else {},
+            metadata if isinstance(metadata, dict) else {})
+
+
+def _state_scalar(state, key, default=None, cast=None):
+    value = state.get(key, default)
+    try:
+        value = jax.device_get(value)
+    except Exception:
+        pass
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            value = default
+        else:
+            value = value.reshape(-1)[0].item()
+    elif hasattr(value, 'item'):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if cast is not None and value is not None:
+        return cast(value)
+    return value
 
 
 # ============================================================
@@ -7124,7 +7476,7 @@ def _top1_max_from_rec(rec):
 
 def _write_json_file(path, obj):
     with _open_file(path, 'w') as f:
-        f.write(json.dumps(obj, indent=2, default=str))
+        f.write(json.dumps(_json_safe(obj), indent=2, default=str))
 
 
 def _write_npy_file(path, arr):
@@ -7666,6 +8018,8 @@ def _print_geometry_block(geom):
 # ============================================================
 
 def main():
+    _require_orbax_checkpoint_compat()
+
     parser = argparse.ArgumentParser(description='Train DAWN-SRW v4164 (JAX/Flax, Multi-Device)')
     parser.add_argument('--config', type=str, required=True,
                         help='Path to config YAML file')
@@ -7685,10 +8039,12 @@ def main():
                         help=('Run the startup step-time/profiling check '
                               '(disabled by default; implies --oom-check; '
                               'can also set training.speed_check: true).'))
-    parser.add_argument('--resume', type=str, default=None,
-                        help=('Resume from a checkpoint file or run folder. '
-                              'Examples: gs://.../run_v.../best_model.flax or '
-                              'gs://.../run_v...'))
+    parser.add_argument('--resume-from', '--resume', dest='resume_from',
+                        type=str, default=None,
+                        help=('Resume from an Orbax run folder or specific '
+                              'Orbax step directory. '
+                              'Examples: gs://.../run_v... or '
+                              'gs://.../run_v.../checkpoints/000000001000'))
     cli_args = parser.parse_args()
 
     # ----------------------------------------------------------
@@ -7702,6 +8058,7 @@ def main():
         else:
             raise FileNotFoundError(f"Config file not found: {config_path}")
     cfg = load_config(config_path)
+    raw_cfg_snapshot = deepcopy(cfg)
     seed = cfg.get('seed', 42)
     set_seed(seed)
 
@@ -7739,7 +8096,7 @@ def main():
     # Optional config-driven resume. CLI --resume remains an override for
     # ad-hoc launches, but diagnostic configs can be one-shot.
     configured_resume_from = (
-        cli_args.resume
+        cli_args.resume_from
         or tcfg.get('resume_from')
         or cfg.get('resume_from'))
     run_speed_check = bool(
@@ -7919,8 +8276,10 @@ def main():
     route_emb_update_ratio_cap = tcfg.get('route_emb_update_ratio_cap', 0.0)
     tau_update_abs_cap = tcfg.get('tau_update_abs_cap', 0.0)
     scan_update_abs_cap = tcfg.get('scan_update_abs_cap', 0.0)
-    restore_training_config_on_resume = tcfg.get(
-        'restore_training_config_on_resume', False)
+    ckpt_interval = int(tcfg.get('checkpoint_interval', 5000))
+    checkpoint_keep_last = int(tcfg.get(
+        'checkpoint_keep_last',
+        tcfg.get('max_checkpoints_to_keep', 3)))
     # 2-tier logging cadence.
     log_interval = int(tcfg.get('log_interval', 100))
     log_analysis_multiplier = int(tcfg.get('log_analysis_multiplier', 20))
@@ -7936,12 +8295,12 @@ def main():
     # All checkpoints + logs go in the same run folder (like train.py).
     # ----------------------------------------------------------
     resume_path = None
+    resume_step = None
     checkpoint_dir = None  # will be set to a run folder
+    checkpoint_manager = None
 
     def _join(base, name):
-        if _is_gcs(base):
-            return base.rstrip('/') + '/' + name
-        return str(Path(base) / name)
+        return _join_path(base, name)
 
     def _list_run_folders(base):
         """List run_* subdirectories under base (local or GCS).
@@ -8008,58 +8367,62 @@ def main():
         result = bytes(broadcast_buf).rstrip(b'\x00').decode('utf-8')
         return result if result else None
 
-    # Auto-resume: find latest run folder with checkpoints (unless --from-scratch)
-    # --resume takes priority: resume from a specific run folder or file.
+    # Auto-resume: find latest run folder with Orbax checkpoints
+    # (unless --from-scratch). --resume-from takes priority.
     #
-    # Only host 0 lists GCS; the resulting (resume_path, checkpoint_dir)
-    # is broadcast to all hosts. Independent per-host listing can diverge
+    # Only host 0 lists GCS; the resulting (run folder, step) is broadcast
+    # to all hosts. Independent per-host listing can diverge
     # under gcsfs caching, concurrent cleanup, or preemption-timing
     # races -a split resume mis-syncs global_step across the mesh and
     # later halts collectives inside train_step.
     if not cli_args.from_scratch:
+        if configured_resume_from:
+            _parse_orbax_resume_target(configured_resume_from)
         _host0_resume_path = None
         _host0_checkpoint_dir = None
+        _host0_resume_step = None
         _host0_explicit_missing = False
 
         if jax.process_index() == 0:
             if configured_resume_from:
-                selected, folder = _resolve_resume_from(configured_resume_from)
-                if selected:
-                    _host0_resume_path = selected
+                folder, selected_step, found = _resolve_orbax_resume_from(
+                    configured_resume_from)
+                if found:
+                    _host0_resume_path = folder
                     _host0_checkpoint_dir = folder
-                    if str(configured_resume_from).rstrip('/').endswith('.flax'):
-                        print(f"  Resume from specified checkpoint file: {_host0_resume_path}")
-                        print(f"  Checkpoint dir: {_host0_checkpoint_dir}")
-                    else:
-                        print(f"  Resume from specified folder: {_host0_checkpoint_dir}")
-                        print(f"  Resuming from: {_host0_resume_path}")
+                    _host0_resume_step = int(selected_step)
+                    print(f"  Resume from specified folder: {_host0_checkpoint_dir}")
+                    print(f"  Resuming from Orbax step: {_host0_resume_step}")
                 else:
                     _host0_explicit_missing = True
-                    if str(configured_resume_from).rstrip('/').endswith('.flax'):
-                        print(f"  Specified checkpoint file does not exist: {configured_resume_from}")
-                    else:
-                        print(f"  No .flax checkpoint found in {folder}")
+                    print(
+                        f"  No Orbax checkpoint found in "
+                        f"{configured_resume_from}")
             else:
                 run_folders = _list_run_folders(base_checkpoint_dir)
                 for folder in reversed(run_folders):
-                    selected = _select_resume_checkpoint(folder)
-                    if selected:
-                        _host0_resume_path = selected
+                    selected_step = _latest_orbax_step_for_run(folder)
+                    if selected_step is not None:
+                        _host0_resume_path = folder
                         _host0_checkpoint_dir = folder
+                        _host0_resume_step = int(selected_step)
                         print(f"  Auto-resume: found checkpoint in {_host0_checkpoint_dir}")
-                        print(f"  Resuming from: {_host0_resume_path}")
+                        print(f"  Resuming from Orbax step: {_host0_resume_step}")
                         break
 
         # Collective broadcast -all hosts must call.
         resume_path = _broadcast_str_from_host0(_host0_resume_path)
         checkpoint_dir = _broadcast_str_from_host0(_host0_checkpoint_dir)
+        _resume_step_str = _broadcast_str_from_host0(
+            '' if _host0_resume_step is None else str(_host0_resume_step))
+        resume_step = int(_resume_step_str) if _resume_step_str else None
         # Broadcast the explicit-missing signal as a single-byte string
         # so every host raises together.
         _missing_signal = _broadcast_str_from_host0(
             'MISSING' if _host0_explicit_missing else '')
         if _missing_signal == 'MISSING':
             raise FileNotFoundError(
-                f"No .flax checkpoint found in {configured_resume_from}")
+                f"No Orbax checkpoint found in {configured_resume_from}")
 
     # Create new run folder if not resuming
     if checkpoint_dir is None:
@@ -8078,41 +8441,184 @@ def main():
             print(f"  Created new run folder: {checkpoint_dir}")
 
     log_dir = checkpoint_dir  # logs go in same run folder
+    run_id = _path_name(checkpoint_dir)
+    checkpoint_git_info = _safe_git_info()
 
     # ----------------------------------------------------------
     # Resume config override: load training config from checkpoint
     # ----------------------------------------------------------
     saved_training_config = None
+    saved_raw_config = None
+    saved_full_config = None
+    saved_model_config = None
+    resume_config_source = 'current_yaml'
     resume_config_restore_read_only = False
+    resume_readonly_log_printed = False
     selection_calibration_resume_training_updates = {}
-    if resume_path and _file_exists(resume_path):
-        resume_config_restore_read_only = bool(
-            restore_training_config_on_resume)
-        # Try config.json in run folder
+    if resume_step is not None:
+        resume_config_restore_read_only = True
         config_json_path = _join(checkpoint_dir, 'config.json')
+        config_raw_json_path = _join(checkpoint_dir, 'config_raw.json')
+        checkpoint_metadata = {}
+        try:
+            checkpoint_metadata = _restore_orbax_metadata(
+                _join(checkpoint_dir, 'checkpoints'), resume_step)
+        except Exception as e:
+            if jax.process_index() == 0:
+                print(f"  Warning: Failed to read checkpoint metadata: {e}")
 
-        if _file_exists(config_json_path):
+        checkpoint_full_config = checkpoint_metadata.get('full_config')
+        checkpoint_raw_config = checkpoint_metadata.get('raw_config')
+        checkpoint_training_config = checkpoint_metadata.get('training_config')
+        checkpoint_model_config = (
+            checkpoint_metadata.get('model_config')
+            or checkpoint_metadata.get('config'))
+
+        if isinstance(checkpoint_full_config, dict) and checkpoint_full_config:
+            saved_full_config = deepcopy(checkpoint_full_config)
+            saved_raw_config = (
+                deepcopy(checkpoint_raw_config)
+                if isinstance(checkpoint_raw_config, dict)
+                and checkpoint_raw_config else None)
+            saved_training_config = (
+                deepcopy(saved_full_config.get('training'))
+                if isinstance(saved_full_config.get('training'), dict)
+                else deepcopy(checkpoint_training_config)
+                if isinstance(checkpoint_training_config, dict)
+                else None)
+            saved_model_config = (
+                deepcopy(saved_full_config.get('model'))
+                if isinstance(saved_full_config.get('model'), dict)
+                else deepcopy(checkpoint_model_config)
+                if isinstance(checkpoint_model_config, dict)
+                else None)
+            cfg = deepcopy(saved_full_config)
+            if saved_training_config is not None:
+                cfg['training'] = deepcopy(saved_training_config)
+            if saved_model_config is not None:
+                cfg['model'] = deepcopy(saved_model_config)
+            resume_config_source = 'checkpoint full_config'
+        elif isinstance(checkpoint_raw_config, dict) and checkpoint_raw_config:
+            saved_raw_config = deepcopy(checkpoint_raw_config)
+            cfg = deepcopy(checkpoint_raw_config)
+            if isinstance(checkpoint_model_config, dict):
+                saved_model_config = deepcopy(checkpoint_model_config)
+                cfg['model'] = deepcopy(saved_model_config)
+            if isinstance(checkpoint_training_config, dict):
+                saved_training_config = deepcopy(checkpoint_training_config)
+                cfg['training'] = deepcopy(saved_training_config)
+            elif isinstance(cfg.get('training'), dict):
+                saved_training_config = deepcopy(cfg['training'])
+            resume_config_source = 'checkpoint raw_config'
+        elif (isinstance(checkpoint_training_config, dict)
+              or isinstance(checkpoint_model_config, dict)):
+            cfg = deepcopy(cfg)
+            if isinstance(checkpoint_model_config, dict):
+                saved_model_config = deepcopy(checkpoint_model_config)
+                cfg['model'] = deepcopy(saved_model_config)
+            if isinstance(checkpoint_training_config, dict):
+                saved_training_config = deepcopy(checkpoint_training_config)
+                cfg['training'] = deepcopy(saved_training_config)
+            resume_config_source = 'checkpoint training_config'
+
+        if resume_config_source == 'current_yaml' and _file_exists(config_json_path):
             try:
-                with _open_file(config_json_path, 'r') as f:
-                    content = f.read()
-                saved_cfg = json.loads(content)
-                saved_training_config = saved_cfg.get('training')
+                saved_cfg = _read_json_file(config_json_path)
+                if isinstance(saved_cfg, dict):
+                    saved_raw_config = (
+                        deepcopy(saved_cfg.get('_raw_config'))
+                        if isinstance(saved_cfg.get('_raw_config'), dict)
+                        else saved_raw_config)
+                    materialized_cfg = {
+                        k: deepcopy(v)
+                        for k, v in saved_cfg.items()
+                        if not str(k).startswith('_')
+                    }
+                    if isinstance(materialized_cfg.get('training'), dict):
+                        saved_training_config = deepcopy(
+                            materialized_cfg.get('training'))
+                    if isinstance(materialized_cfg.get('model'), dict):
+                        saved_model_config = deepcopy(
+                            materialized_cfg.get('model'))
+                    if saved_training_config or saved_model_config:
+                        cfg = deepcopy(materialized_cfg)
+                        resume_config_source = 'run-folder config.json'
                 if jax.process_index() == 0:
-                    print(f"Loaded training config from {config_json_path}")
-                    if restore_training_config_on_resume:
-                        print(
-                            "Resume config restore enabled; preserving "
-                            "existing config.json read-only.")
+                    print(f"Loaded config snapshot from {config_json_path}")
             except Exception as e:
                 if jax.process_index() == 0:
                     print(f"  Warning: Failed to read config.json: {e}")
                 saved_cfg = None
-        elif restore_training_config_on_resume and jax.process_index() == 0:
-            print(
-                f"  Warning: config.json missing at {config_json_path}; "
-                "continuing with current config.")
 
-        if saved_training_config and restore_training_config_on_resume:
+        if saved_raw_config is None and _file_exists(config_raw_json_path):
+            try:
+                saved_raw_config = _read_json_file(config_raw_json_path)
+                if jax.process_index() == 0:
+                    print(
+                        f"  Loaded raw config snapshot from "
+                        f"{config_raw_json_path}")
+            except Exception as e:
+                if jax.process_index() == 0:
+                    print(f"  Warning: Failed to read config_raw.json: {e}")
+
+        if (resume_config_source == 'current_yaml'
+                and isinstance(saved_raw_config, dict)
+                and saved_raw_config):
+            raw_fallback_cfg = deepcopy(saved_raw_config)
+            if isinstance(raw_fallback_cfg.get('training'), dict):
+                saved_training_config = deepcopy(raw_fallback_cfg['training'])
+            if isinstance(raw_fallback_cfg.get('model'), dict):
+                saved_model_config = deepcopy(raw_fallback_cfg['model'])
+            if saved_training_config or saved_model_config:
+                cfg = raw_fallback_cfg
+                resume_config_source = 'run-folder config_raw.json'
+
+        if resume_config_source != 'current_yaml':
+            raw_cfg_snapshot = deepcopy(saved_raw_config or cfg)
+            seed = cfg.get('seed', seed)
+            set_seed(seed)
+            tcfg = cfg.setdefault('training', {})
+            model_version_cfg = cfg.setdefault('model', {}).get(
+                'model_version', OFFICIAL_MODEL_VERSION)
+            is_v4164_cfg = _is_active_srw_version(model_version_cfg)
+            op_key_stopgrad_rw = (
+                _v4166_op_key_stopgrad_rw(cfg)
+                if model_version_cfg == V4166_MODEL_VERSION
+                else False)
+            op_query_factorized = (
+                _v4166_op_query_factorized(cfg)
+                if model_version_cfg == V4166_MODEL_VERSION
+                else False)
+            op_query_factorized_mode = (
+                _v4166_op_query_factorized_mode(cfg)
+                if model_version_cfg == V4166_MODEL_VERSION
+                else 'product')
+            if model_version_cfg == V4166_MODEL_VERSION:
+                cfg['model']['op_key_stopgrad_rw'] = op_key_stopgrad_rw
+                cfg['model']['op_query_factorized'] = op_query_factorized
+                cfg['model']['op_query_factorized_mode'] = (
+                    op_query_factorized_mode)
+            tau_init_cfg = (
+                _v4164_tau_init_config(cfg)
+                if _is_active_srw_version(model_version_cfg)
+                else None)
+            selection_calibration_cfg = _selection_calibration_config(
+                cfg, tau_init_cfg)
+            max_seq_len = cfg['model'].get('max_seq_len', max_seq_len)
+            training_log_append_on_resume = bool(tcfg.get(
+                'training_log_append_on_resume',
+                training_log_append_on_resume))
+            ckpt_interval = int(tcfg.get(
+                'checkpoint_interval', ckpt_interval))
+            checkpoint_keep_last = int(tcfg.get(
+                'checkpoint_keep_last',
+                tcfg.get('max_checkpoints_to_keep', checkpoint_keep_last)))
+            current_admission_den_config_override = False
+            if jax.process_index() == 0:
+                print(f"  Resume config source: {resume_config_source}")
+                print("  Preserving existing run-folder config snapshots.")
+
+        if saved_training_config:
             saved_admission_den_signature = {
                 key: saved_training_config.get(key, '<missing>')
                 for key in admission_den_config_keys
@@ -8139,17 +8645,51 @@ def main():
                         "the current config override; use a fresh run for the "
                         "new admission_den settings or remove the override to "
                         "reproduce the checkpoint config.")
-            # Apply checkpoint training config (CLI args take precedence)
-            if cli_args.batch_size is None:
+            # Apply restored training config. Exact resume keeps checkpoint
+            # config ahead of current invocation overrides.
+            allow_launch_overrides = (resume_config_source == 'current_yaml')
+            if cli_args.batch_size is None or not allow_launch_overrides:
                 batch_size = saved_training_config.get('batch_size', batch_size)
-            if cli_args.epochs is None:
+            if cli_args.epochs is None or not allow_launch_overrides:
                 num_epochs = saved_training_config.get('num_epochs', num_epochs)
-            if cli_args.lr is None:
+            if cli_args.lr is None or not allow_launch_overrides:
                 lr = saved_training_config.get('lr', lr)
             weight_decay = saved_training_config.get('weight_decay', weight_decay)
             warmup_ratio = saved_training_config.get('warmup_ratio', warmup_ratio)
             orth_weight = saved_training_config.get('orthogonality_weight', orth_weight)
             boundary_power_schedule_active = True
+            soft_gate_t_start = float(saved_training_config.get(
+                'soft_gate_t_start', soft_gate_t_start))
+            soft_gate_t_final = float(saved_training_config.get(
+                'soft_gate_t_final', soft_gate_t_final))
+            soft_gate_t_hold_frac = float(saved_training_config.get(
+                'soft_gate_t_hold_frac', soft_gate_t_hold_frac))
+            soft_gate_t_anneal_end_frac = float(saved_training_config.get(
+                'soft_gate_t_anneal_end_frac',
+                soft_gate_t_anneal_end_frac))
+            soft_gate_schedule = str(saved_training_config.get(
+                'soft_gate_t_schedule',
+                saved_training_config.get(
+                    'soft_gate_schedule', soft_gate_schedule)))
+            soft_gate_t_power = float(saved_training_config.get(
+                'soft_gate_t_power', soft_gate_t_power))
+            soft_gate_t_gompertz_center = float(saved_training_config.get(
+                'soft_gate_t_gompertz_center',
+                soft_gate_t_gompertz_center))
+            soft_gate_t_gompertz_steepness = float(
+                saved_training_config.get(
+                    'soft_gate_t_gompertz_steepness',
+                    soft_gate_t_gompertz_steepness))
+            soft_gate_pool_schedules = _training_soft_gate_pool_schedules(
+                saved_training_config, soft_gate_t_start,
+                soft_gate_t_final, soft_gate_t_hold_frac,
+                soft_gate_t_anneal_end_frac, soft_gate_schedule,
+                soft_gate_t_power, soft_gate_t_gompertz_center,
+                soft_gate_t_gompertz_steepness)
+            soft_gate_effective_active_eps = float(
+                saved_training_config.get(
+                    'soft_gate_effective_active_eps',
+                    soft_gate_effective_active_eps))
             regular_console_level = str(saved_training_config.get(
                 'regular_console_level', regular_console_level)).lower()
             if regular_console_level not in ('compact', 'full'):
@@ -8172,6 +8712,17 @@ def main():
                 saved_training_config.get(
                     'regular_console_logging_overhead_warn',
                     regular_console_logging_overhead_warn))
+            eval_effective_prune_enabled = bool(
+                saved_training_config.get(
+                    'eval_effective_prune_enabled',
+                    eval_effective_prune_enabled))
+            eval_effective_prune_eps_list = list(
+                saved_training_config.get(
+                    'eval_effective_prune_eps_list',
+                    eval_effective_prune_eps_list))
+            if not _is_active_srw_version(model_version_cfg):
+                eval_effective_prune_enabled = False
+                eval_effective_prune_eps_list = []
             soft_gate_boundary_power_start = float(
                 saved_training_config.get(
                     'soft_gate_boundary_power_start',
@@ -8304,6 +8855,16 @@ def main():
                     'speed_check',
                     saved_training_config.get('run_speed_check', run_speed_check)))
             run_oom_check = bool(run_oom_check or run_speed_check)
+            training_log_append_on_resume = bool(
+                saved_training_config.get(
+                    'training_log_append_on_resume',
+                    training_log_append_on_resume))
+            ckpt_interval = int(saved_training_config.get(
+                'checkpoint_interval', ckpt_interval))
+            checkpoint_keep_last = int(saved_training_config.get(
+                'checkpoint_keep_last',
+                saved_training_config.get(
+                    'max_checkpoints_to_keep', checkpoint_keep_last)))
             log_interval = int(saved_training_config.get(
                 'log_interval', log_interval))
             log_analysis_multiplier = int(saved_training_config.get(
@@ -8349,14 +8910,14 @@ def main():
             cb1a_rst_challenge_weight = 0.0
             cb1a_rst_prune_weight = 0.0
             if jax.process_index() == 0:
-                print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
+                print(
+                    f"  Training config restored from {resume_config_source} "
+                    "(restored config takes precedence)")
 
         restore_saved_selection_calibration = (
             saved_training_config
             and saved_training_config.get(
-                'selection_calibration_applied', False)
-            and (restore_training_config_on_resume
-                 or selection_calibration_cfg.get('enabled', False)))
+                'selection_calibration_applied', False))
         if restore_saved_selection_calibration:
             soft_gate_t_start = float(saved_training_config.get(
                 'soft_gate_t_start', soft_gate_t_start))
@@ -8641,7 +9202,9 @@ def main():
             cfg['model'].get('tau_init_rst', None)),
         'oom_check': run_oom_check,
         'speed_check': run_speed_check,
-        'restore_training_config_on_resume': restore_training_config_on_resume,
+        'checkpoint_interval': ckpt_interval,
+        'checkpoint_keep_last': checkpoint_keep_last,
+        'training_log_append_on_resume': training_log_append_on_resume,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
@@ -8964,7 +9527,6 @@ def main():
         optimizer = optax.MultiSteps(base_optimizer, every_k_schedule=grad_accum_steps)
     else:
         optimizer = base_optimizer
-    opt_state = optimizer.init(params)
 
     if is_host0:
         print(f"\nTraining config:")
@@ -8997,7 +9559,7 @@ def main():
               f"op_key_lr_mult={op_key_lr_mult}, "
               f"dead_clip={dead_penalty_weighted_clip}, "
               f"{_inactive_aux_stabilizer_part}"
-              f"resume_restore_training_config={restore_training_config_on_resume}")
+              "checkpoint_backend=orbax")
         print("  Control update caps: "
               f"enabled={enable_control_update_caps}, "
               f"proj_ratio={router_proj_update_ratio_cap}, "
@@ -9131,37 +9693,19 @@ def main():
         print(gate_msg)
 
     # ----------------------------------------------------------
-    # Resume from checkpoint (resume_path detected earlier for config override)
+    # Resume defaults. Orbax state restore runs after mesh sharding so
+    # params/opt_state restore directly into their target shardings.
     # ----------------------------------------------------------
     start_epoch = 0
     global_step = 0
     start_step_in_epoch = 0
     best_val_loss = float('inf')
+    _has_resume_checkpoint = resume_step is not None
 
-    if resume_path and _file_exists(resume_path):
+    if _has_resume_checkpoint:
         if is_host0:
-            print(f"\nResuming from: {resume_path}")
-        ckpt = load_checkpoint(resume_path, params, opt_state)
-        params = ckpt['params']
-        opt_state = ckpt['opt_state']
-        start_epoch = ckpt.get('epoch', 0)
-        global_step = ckpt.get('step', 0)
-        best_val_loss = ckpt.get('best_val_loss', float('inf'))
-        # v4164 has no EMA state; silently ignore any ema_ce left in checkpoints.
-        # Precise resume: use step_in_epoch if available
-        saved_step_in_epoch = ckpt.get('step_in_epoch', 0)
-        saved_steps_per_epoch = ckpt.get('steps_per_epoch', 0)
-        if saved_step_in_epoch > 0 and saved_steps_per_epoch == steps_per_epoch:
-            start_step_in_epoch = saved_step_in_epoch
-        elif saved_step_in_epoch > 0:
-            # steps_per_epoch changed (batch size or data changed) -fallback
-            if is_host0:
-                print(f"  Warning: steps_per_epoch changed ({saved_steps_per_epoch} -> {steps_per_epoch}), "
-                      f"cannot use step_in_epoch for resume. Starting epoch from beginning.")
-            start_step_in_epoch = 0
-        if is_host0:
-            print(f"  Resuming: epoch={start_epoch}, global_step={global_step}, "
-                  f"step_in_epoch={start_step_in_epoch}, best_val_loss={best_val_loss:.4f}")
+            print(f"\nResuming from run folder: {resume_path}")
+            print(f"  Orbax step: {resume_step}")
     else:
         if is_host0:
             if not cli_args.from_scratch:
@@ -9172,8 +9716,6 @@ def main():
     tau_init_summary = None
     selection_calibration_summary = None
     selection_calibration_tau_applied = False
-    _has_resume_checkpoint = bool(
-        resume_path is not None and _file_exists(resume_path))
     if (selection_calibration_cfg.get('enabled', False)
             and not _has_resume_checkpoint):
         if len(train_loader) <= 0:
@@ -9277,32 +9819,60 @@ def main():
             for _line in _v4164_tau_init_summary_lines(tau_init_summary):
                 print(_line, flush=True)
 
+    raw_config_snapshot = _safe_config_snapshot(raw_cfg_snapshot)
+    full_config_snapshot = _materialized_config_snapshot(cfg, training_config)
 
-    # Fail-fast check: global_step must match across hosts after resume.
-    # broadcast handles the common path but we still verify -if it ever
-    # drifts, hang diagnostics mid-training is painful; raise now instead.
-    if n_hosts > 1:
-        _gs_local = np.array([global_step], dtype=np.int64)
-        _gs_all = np.asarray(process_allgather(_gs_local)).flatten()
-        if not np.all(_gs_all == global_step):
-            raise RuntimeError(
-                f"global_step inconsistent across hosts after resume: "
-                f"host {host_id} sees {global_step}, all hosts: {_gs_all.tolist()}. "
-                f"Resume broadcast likely failed or checkpoint files diverged.")
-        if is_host0:
-            print(f"  [verified] global_step={global_step} consistent across {n_hosts} hosts")
-
-    # Save config.json for this run (host 0 only)
+    # Save config snapshots for this run (host 0 only)
     if is_host0:
-        if not resume_config_restore_read_only:
+        if _has_resume_checkpoint:
+            try:
+                session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                session_path = _join(
+                    checkpoint_dir,
+                    f"config_resume_session_{session_ts}.json")
+                session_cfg = {
+                    'type': 'resume_session_config',
+                    'timestamp': datetime.now().isoformat(),
+                    'config_path': str(config_path),
+                    'resume_path': resume_path,
+                    'resume_step': int(resume_step),
+                    'config_json_read_only':
+                        bool(resume_config_restore_read_only),
+                    'resume_config_source': resume_config_source,
+                    'loaded_config_raw_json': saved_raw_config is not None,
+                    'current_raw_config': raw_config_snapshot,
+                    'current_materialized_config': full_config_snapshot,
+                }
+                _write_json_file(session_path, session_cfg)
+                print(f"  Saved resume session config snapshot: {session_path}")
+            except Exception as e:
+                print(
+                    f"  Warning: Failed to save resume session config: {e}")
+
+        if resume_config_restore_read_only:
+            if not resume_readonly_log_printed:
+                print(
+                    "Resume detected; preserving existing config.json and "
+                    "config_raw.json snapshots.")
+            print("  Skipped run-folder config snapshot rewrite on resume.")
+        else:
             try:
                 cj_path = _join(checkpoint_dir, 'config.json')
-                full_cfg = {'model': cfg['model'], 'training': training_config}
-                with _open_file(cj_path, 'w') as f:
-                    f.write(json.dumps(full_cfg, indent=2, default=str))
+                config_record_snapshot = deepcopy(full_config_snapshot)
+                config_record_snapshot['_raw_config'] = raw_config_snapshot
+                config_record_snapshot['_metadata'] = {
+                    'type': 'fresh_run_config_snapshot',
+                    'timestamp': datetime.now().isoformat(),
+                    'config_path': str(config_path),
+                    'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION,
+                }
+                _write_json_file(cj_path, config_record_snapshot)
                 print(f"  Saved config.json: {cj_path}")
+                print(
+                    "  Top-level config keys saved: "
+                    + ", ".join(sorted(config_record_snapshot.keys())))
             except Exception as e:
-                print(f"  Warning: Failed to save config.json: {e}")
+                print(f"  Warning: Failed to save config snapshot: {e}")
 
     # ----------------------------------------------------------
     # Create Mesh + shard params
@@ -9375,20 +9945,82 @@ def main():
     param_shardings = get_param_shardings(params, mesh)
     params = shard_params_to_mesh(params, param_shardings)
 
-    _is_resuming = (resume_path is not None and _file_exists(resume_path))
-    if _is_resuming:
-        _opt_template = optimizer.init(params)
-        def _restore_leaf(restored_val, template_val):
-            # template_val is already correctly sharded across all devices.
-            # Create a zero with the same sharding, then add restored value.
-            # This forces the result to inherit template's sharding.
-            return jnp.zeros_like(template_val) + jnp.asarray(restored_val, dtype=template_val.dtype).reshape(template_val.shape)
-        opt_state = jax.tree.map(_restore_leaf, opt_state, _opt_template)
-        del _opt_template
+    opt_state = optimizer.init(params)
+    checkpoint_manager = _create_orbax_checkpoint_manager(
+        _join(checkpoint_dir, 'checkpoints'),
+        checkpoint_interval=ckpt_interval,
+        keep_last=checkpoint_keep_last,
+        create=True,
+    )
+
+    if _has_resume_checkpoint:
+        target_state = _build_orbax_state(
+            params, opt_state, rng,
+            epoch=0,
+            global_step=0,
+            step_in_epoch=0,
+            steps_per_epoch=steps_per_epoch,
+            best_val_loss=float('inf'),
+            training_config=training_config,
+            full_config=full_config_snapshot,
+            model_config=cfg['model'],
+        )
+        restored_state, restored_metadata = _restore_orbax_state(
+            checkpoint_manager, resume_step, target_state)
+        params = restored_state['params']
+        opt_state = restored_state['opt_state']
+        if 'rng' not in restored_state:
+            raise KeyError("Orbax checkpoint state is missing required rng.")
+        rng = jnp.asarray(restored_state['rng'], dtype=jnp.uint32)
+        start_epoch = _state_scalar(restored_state, 'epoch', 0, int)
+        global_step = _state_scalar(
+            restored_state, 'global_step',
+            _state_scalar(restored_state, 'step', 0, int),
+            int)
+        best_val_loss = _state_scalar(
+            restored_state, 'best_val_loss', float('inf'), float)
+        saved_step_in_epoch = _state_scalar(
+            restored_state, 'step_in_epoch', 0, int)
+        saved_steps_per_epoch = _state_scalar(
+            restored_state, 'steps_per_epoch', 0, int)
+        if saved_step_in_epoch > 0 and saved_steps_per_epoch == steps_per_epoch:
+            start_step_in_epoch = saved_step_in_epoch
+        elif saved_step_in_epoch > 0:
+            if is_host0:
+                print(
+                    f"  Warning: steps_per_epoch changed "
+                    f"({saved_steps_per_epoch} -> {steps_per_epoch}), "
+                    "cannot use step_in_epoch for resume. Starting epoch "
+                    "from beginning.")
+            start_step_in_epoch = 0
         if is_host0:
-            print(f"  Optimizer state restored from checkpoint and sharded to mesh")
-    else:
-        opt_state = optimizer.init(params)
+            print(
+                f"  Restored Orbax checkpoint: epoch={start_epoch}, "
+                f"global_step={global_step}, "
+                f"step_in_epoch={start_step_in_epoch}, "
+                f"best_val_loss={best_val_loss:.4f}")
+            if restored_metadata:
+                print(
+                    "  Restored checkpoint metadata kind="
+                    f"{restored_metadata.get('checkpoint_kind', '<unknown>')}")
+            print("  Restored training RNG from Orbax checkpoint.")
+    elif is_host0:
+        print(f"  Orbax checkpoints: {_join(checkpoint_dir, 'checkpoints')}")
+
+    # Fail-fast check: global_step must match across hosts after restore.
+    if n_hosts > 1:
+        _gs_local = np.array([global_step], dtype=np.int64)
+        _gs_all = np.asarray(process_allgather(_gs_local)).flatten()
+        if not np.all(_gs_all == global_step):
+            raise RuntimeError(
+                f"global_step inconsistent across hosts after resume: "
+                f"host {host_id} sees {global_step}, all hosts: "
+                f"{_gs_all.tolist()}. Resume broadcast likely failed or "
+                "checkpoint files diverged.")
+        if is_host0:
+            print(
+                f"  [verified] global_step={global_step} consistent "
+                f"across {n_hosts} hosts")
 
     # Create shard_map functions if mesh_model > 1 or the model demands
     # the sharded path.
@@ -10190,25 +10822,6 @@ def main():
                 print("  This is not necessarily OOM; it is a code/runtime error during the dummy train_step.")
         raise
 
-    # Resume from the current startup RNG state. Startup checks may consume
-    # zero, one (OOM/JIT), or two (OOM/JIT + speed) splits, so the completed
-    # training-step advance starts after whichever checks were selected.
-    if _is_resuming and global_step > 0:
-        if is_host0:
-            print(
-                f"  Advancing train RNG by {global_step} completed step(s) "
-                "for deterministic resume",
-                flush=True,
-            )
-
-        def _advance_rng_by_splits(key, n_steps):
-            def _body(_, k):
-                k, _ = jax.random.split(k)
-                return k
-            return jax.lax.fori_loop(0, int(n_steps), _body, key)
-
-        rng = _advance_rng_by_splits(rng, global_step)
-
     # ----------------------------------------------------------
     # Training log file (host 0 only)
     # ----------------------------------------------------------
@@ -10268,33 +10881,17 @@ def main():
     # ----------------------------------------------------------
     preemption_requested = [False]  # mutable container for closure
 
-    def _ckpt_path(name):
-        return _join(checkpoint_dir, name)
-
     def handle_preemption(signum, frame):
         """Flag-only SIGTERM handler (spot preemption).
 
-        Saving from a signal handler is unsafe on multi-host: calling a
-        collective here (_gather_for_save / process_allgather) requires
-        every host to enter at the same point, but SIGTERM fires
-        asynchronously per host. We just flag here; the main loop
-        cooperatively saves after the inner-loop break.
+        Saving from a signal handler is unsafe on multi-host; hosts can
+        receive SIGTERM at different Python points. We just flag here; the
+        main loop cooperatively saves after the inner-loop break.
         """
         if preemption_requested[0]:
             return
         preemption_requested[0] = True
         print(f"\n!!! SIGTERM received (host {host_id}) at step={global_step} -- flagging preemption !!!", flush=True)
-
-    def _gather_for_save(x):
-        """Gather sharded params to host-local full arrays for checkpoint save.
-
-        Uses process_allgather with tiled=True so the output reconstructs
-        the global shape: sharded axes get concatenated across processes
-        and replicated arrays pass through unchanged.
-
-        Must be called from ALL hosts simultaneously (collective).
-        """
-        return jax.device_get(process_allgather(x, tiled=True))
 
     signal.signal(signal.SIGTERM, handle_preemption)
     if is_host0:
@@ -10309,7 +10906,6 @@ def main():
     train_start_time = time.time()
     total_micro_steps = num_epochs * steps_per_epoch
     val_interval = cfg['training'].get('val_interval', 5000)
-    ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
     # Logging cadence. REGULAR every log_interval steps. ANALYSIS every
@@ -10750,55 +11346,54 @@ def main():
                     except NameError:
                         pass
 
-            # ---- Unified save path ----
-            # best_model + mid-epoch checkpoint share a single gather +
-            # serialize when both fire on the same step (val_interval ==
-            # ckpt_interval is the common case). Previously that meant two
-            # independent _gather_for_save collectives and two full
-            # re-serializations of the same params -expensive at 1B.
+            # ---- Unified Orbax save path ----
             if _new_best or _do_ckpt:
-                params_single = _gather_for_save(params)
-                opt_state_single = _gather_for_save(opt_state)
+                _checkpoint_kind = 'best' if _new_best else 'regular'
+                _checkpoint_val_loss = val_loss if _do_val else None
+                saved = save_orbax_checkpoint(
+                    checkpoint_manager,
+                    params, opt_state, rng,
+                    epoch, global_step, epoch_step_counter,
+                    steps_per_epoch, best_val_loss,
+                    cfg['model'], training_config,
+                    full_config_snapshot, raw_config_snapshot,
+                    config_path, run_id,
+                    _checkpoint_kind,
+                    val_loss=_checkpoint_val_loss,
+                    git_info=checkpoint_git_info,
+                )
                 if is_host0:
-                    bytes_data = _serialize_checkpoint(
-                        params_single, opt_state_single,
-                        epoch, global_step, best_val_loss,
-                        cfg['model'],
-                        step_in_epoch=epoch_step_counter,
-                        steps_per_epoch=steps_per_epoch,
-                        training_config=training_config)
                     if _new_best:
-                        _write_checkpoint_bytes(
-                            _ckpt_path("best_model.flax"), bytes_data)
-                        log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
-                    if _do_ckpt:
-                        _write_checkpoint_bytes(
-                            _ckpt_path(f"checkpoint_step{global_step}.flax"), bytes_data)
-                        # GCS list+delete only from host 0 -racing cleanups across
-                        # hosts can drop the checkpoint that was just written.
-                        cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
-                del params_single, opt_state_single
+                        log_message(
+                            f"  New best Orbax checkpoint saved at "
+                            f"step {global_step}! "
+                            f"val_loss={best_val_loss:.4f}")
+                    elif saved:
+                        log_message(
+                            f"  Orbax checkpoint saved at step {global_step}")
 
         if preemption_requested[0]:
-            # Cooperative emergency save. All hosts participate in
-            # _gather_for_save (collective); only host 0 writes the file.
-            # Previously this ran from the SIGTERM signal handler, which
-            # was unsafe because hosts enter the handler asynchronously.
+            # Cooperative emergency save. Previously this ran from the
+            # SIGTERM signal handler, which was unsafe because hosts enter
+            # the handler asynchronously.
             try:
-                _emerg_params = _gather_for_save(params)
-                _emerg_opt = _gather_for_save(opt_state)
+                save_orbax_checkpoint(
+                    checkpoint_manager,
+                    params, opt_state, rng,
+                    epoch, global_step, epoch_step_counter,
+                    steps_per_epoch, best_val_loss,
+                    cfg['model'], training_config,
+                    full_config_snapshot, raw_config_snapshot,
+                    config_path, run_id,
+                    'emergency',
+                    git_info=checkpoint_git_info,
+                    wait=True,
+                )
                 if is_host0:
-                    epath = _ckpt_path(f"emergency_step{global_step}.flax")
-                    save_checkpoint(
-                        epath, _emerg_params, _emerg_opt,
-                        epoch, global_step, best_val_loss,
-                        cfg['model'],
-                        step_in_epoch=epoch_step_counter,
-                        steps_per_epoch=steps_per_epoch,
-                        training_config=training_config,
-                    )
-                    print(f"!!! Emergency checkpoint saved: {epath} !!!", flush=True)
-                del _emerg_params, _emerg_opt
+                    print(
+                        f"!!! Emergency Orbax checkpoint saved at "
+                        f"step {global_step} !!!",
+                        flush=True)
             except Exception as e:
                 if is_host0:
                     print(f"!!! Emergency save FAILED: {e} !!!", flush=True)
@@ -10884,32 +11479,29 @@ def main():
                 'timestamp': datetime.now().isoformat(),
             })
 
-        # Save epoch checkpoint (device_get on ALL hosts). best_model reuses
-        # the same serialized bytes -no double serialize at 1B scale.
-        params_single = _gather_for_save(params)
-        opt_state_single = _gather_for_save(opt_state)
-
+        save_orbax_checkpoint(
+            checkpoint_manager,
+            params, opt_state, rng,
+            epoch + 1, global_step, 0,
+            steps_per_epoch, best_val_loss,
+            cfg['model'], training_config,
+            full_config_snapshot, raw_config_snapshot,
+            config_path, run_id,
+            'best' if is_best else 'epoch',
+            val_loss=val_loss,
+            train_loss=epoch_avg_loss,
+            git_info=checkpoint_git_info,
+        )
         if is_host0:
-            bytes_data = _serialize_checkpoint(
-                params_single, opt_state_single,
-                epoch + 1, global_step, best_val_loss,
-                cfg['model'],
-                step_in_epoch=0,
-                steps_per_epoch=steps_per_epoch,
-                training_config=training_config)
-            _write_checkpoint_bytes(
-                _ckpt_path(f"checkpoint_epoch{epoch}.flax"), bytes_data)
             if is_best:
-                _write_checkpoint_bytes(
-                    _ckpt_path("best_model.flax"), bytes_data)
-                log_message(f"  New best model! val_loss={best_val_loss:.4f}")
-
+                log_message(
+                    f"  New best Orbax checkpoint! "
+                    f"val_loss={best_val_loss:.4f}")
+            else:
+                log_message(
+                    f"  Epoch Orbax checkpoint saved at step {global_step}")
             log_message(f"  Best val loss so far: {best_val_loss:.4f}")
             sync_logs()
-
-        # Release gathered copies on every host -all hosts hold them after
-        # _gather_for_save; host-0-only del leaves multi-GB pinned elsewhere.
-        del params_single, opt_state_single
 
         # Reset data loader for next epoch (no re-read, just reset position)
         if epoch < num_epochs - 1:
@@ -10919,6 +11511,30 @@ def main():
     # ----------------------------------------------------------
     # Done
     # ----------------------------------------------------------
+    if not preemption_requested[0]:
+        final_epoch = (
+            int(epoch + 1) if 'epoch' in locals() else int(start_epoch))
+        try:
+            save_orbax_checkpoint(
+                checkpoint_manager,
+                params, opt_state, rng,
+                final_epoch, global_step, epoch_step_counter,
+                steps_per_epoch, best_val_loss,
+                cfg['model'], training_config,
+                full_config_snapshot, raw_config_snapshot,
+                config_path, run_id,
+                'final',
+                git_info=checkpoint_git_info,
+                wait=True,
+            )
+            if is_host0:
+                log_message(
+                    f"  Final Orbax checkpoint saved at step {global_step}")
+        except Exception as e:
+            if is_host0:
+                print(f"  Warning: final Orbax checkpoint failed: {e}",
+                      flush=True)
+
     total_time = time.time() - train_start_time
     if is_host0:
         log_message(
@@ -10930,6 +11546,9 @@ def main():
             f"{'='*60}"
         )
         sync_logs()
+
+    if checkpoint_manager is not None:
+        checkpoint_manager.close()
 
 
 if __name__ == '__main__':

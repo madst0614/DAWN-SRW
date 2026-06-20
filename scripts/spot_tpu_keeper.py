@@ -88,8 +88,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--resume-from",
         default=None,
-        metavar="CKPT_OR_RUN",
-        help="Forward --resume-from CKPT_OR_RUN to scripts/launch_tpu_pod.sh.",
+        metavar="RUN_FOLDER_OR_ORBAX_STEP",
+        help=("Forward --resume-from RUN_FOLDER_OR_ORBAX_STEP to "
+              "scripts/launch_tpu_pod.sh."),
     )
     p.add_argument(
         "--debug",

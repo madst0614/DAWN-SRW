@@ -50,7 +50,7 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -h|--help)
-            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch] [--resume-from CKPT_OR_RUN] [--debug [N]]"
+            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch] [--resume-from RUN_FOLDER_OR_ORBAX_STEP] [--debug [N]]"
             echo ""
             echo "Supports single-host TPU VMs such as v4-8 and multi-host TPU pods such as v4-64/v4-128."
             echo "The TPU VM or queued resource must already exist; this script only launches setup/training."
@@ -61,7 +61,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --branch   Git branch to clone  (default: $BRANCH)"
             echo "  --config   Training config YAML (default: $CONFIG)"
             echo "  --from-scratch  Start training from scratch (ignore checkpoints)"
-            echo "  --resume-from CKPT_OR_RUN  Resume from a .flax checkpoint file or run folder"
+            echo "  --resume-from RUN_FOLDER_OR_ORBAX_STEP  Resume from an Orbax run folder or step directory"
             echo "  --debug [N]  Enable train_jax.py debug diagnostics every N steps (default: 1)"
             echo "  --token    GitHub access token   (for private repos)"
             exit 0
