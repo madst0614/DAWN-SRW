@@ -87,8 +87,8 @@ training:
 
     annealing:
       unit: tokens
-      shrink_start_tokens: 6000000000
-      shrink_end_tokens: 24000000000
+      shrink_start_tokens: 5000000000
+      shrink_end_tokens: 20000000000
 
   soft_gate_effective_active_eps: 1.0e-06
   admission_den_power: 0.5
