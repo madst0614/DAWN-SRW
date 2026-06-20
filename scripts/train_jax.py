@@ -1659,45 +1659,58 @@ def _makedirs(path):
         Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def _ensure_orbax_dir(path):
+def _ensure_orbax_checkpoint_root(path):
     """Ensure an Orbax checkpoint root exists before manager construction."""
-    path_str = str(path)
-    epath_exc = None
+    path_str = str(path).rstrip('/')
+    last_exc = None
+
+    # Prefer etils.epath because Orbax uses epath-compatible paths.
     try:
         from etils import epath
-        epath.Path(path_str).mkdir(parents=True, exist_ok=True)
+        p = epath.Path(path_str)
+        p.mkdir(parents=True, exist_ok=True)
+
+        # On object stores like GCS, an empty prefix may still not appear
+        # during iterdir/existence checks. Write a hidden marker file.
+        marker = p / ".orbax_root"
+        with marker.open("w") as f:
+            f.write("")
         return
-    except Exception as exc:
-        epath_exc = exc
+    except Exception as epath_exc:
+        last_exc = epath_exc
 
     if _is_gcs(path_str):
         fs = _get_gcs_fs()
         if fs is not None:
             try:
-                marker = path_str.rstrip('/') + '/.orbax_dir'
-                with fs.open(marker, 'w') as f:
-                    f.write('')
+                marker = path_str + "/.orbax_root"
+                with fs.open(marker, "w") as f:
+                    f.write("")
                 return
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to create Orbax checkpoint directory: "
-                    f"{path_str}") from exc
+            except Exception as fs_exc:
+                last_exc = fs_exc
+
         try:
             import tensorflow as tf
             tf.io.gfile.makedirs(path_str)
+            with tf.io.gfile.GFile(path_str + "/.orbax_root", "w") as f:
+                f.write("")
             return
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to create Orbax checkpoint directory: {path_str}"
-            ) from exc
+        except Exception as tf_exc:
+            last_exc = tf_exc
 
-    try:
-        Path(path_str).mkdir(parents=True, exist_ok=True)
-        return
-    except Exception as exc:
         raise RuntimeError(
-            f"Failed to create Orbax checkpoint directory: {path_str}"
-        ) from (epath_exc or exc)
+            f"Failed to create Orbax checkpoint root: {path_str}"
+        ) from last_exc
+
+    Path(path_str).mkdir(parents=True, exist_ok=True)
+    marker = Path(path_str) / ".orbax_root"
+    marker.write_text("", encoding="utf-8")
+
+
+def _ensure_orbax_dir(path):
+    """Backward-compatible alias for Orbax checkpoint root creation."""
+    return _ensure_orbax_checkpoint_root(path)
 
 
 def _join_path(base, *parts):
@@ -5452,7 +5465,7 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
                                      read_only=False):
     """Create the Orbax manager for Composite(state, metadata) checkpoints."""
     if create and not read_only:
-        _ensure_orbax_dir(checkpoint_dir)
+        _ensure_orbax_checkpoint_root(checkpoint_dir)
     options_kwargs = {
         'save_interval_steps': max(1, int(checkpoint_interval or 1)),
         'best_fn': _orbax_best_metric,
@@ -8478,7 +8491,7 @@ def main():
         run_name = f"run_v{version}_{ts}_{rand_suffix}"
         checkpoint_dir = _join(base_checkpoint_dir, run_name)
         _makedirs(checkpoint_dir)
-        _ensure_orbax_dir(_join(checkpoint_dir, 'checkpoints'))
+        _ensure_orbax_checkpoint_root(_join(checkpoint_dir, 'checkpoints'))
         if jax.process_index() == 0:
             if cli_args.from_scratch:
                 print(f"  Starting from scratch (--from-scratch)")
@@ -9745,6 +9758,9 @@ def main():
     start_step_in_epoch = 0
     best_val_loss = float('inf')
     _has_resume_checkpoint = resume_step is not None
+    orbax_root = _join_path(checkpoint_dir, "checkpoints")
+    if not _has_resume_checkpoint:
+        _ensure_orbax_checkpoint_root(orbax_root)
 
     if _has_resume_checkpoint:
         if is_host0:

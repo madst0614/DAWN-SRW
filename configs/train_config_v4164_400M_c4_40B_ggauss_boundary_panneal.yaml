@@ -51,6 +51,42 @@ training:
   dead_penalty_weight: 0.0
   dead_exposure_target: 0.0
 
+  selection_calibration:
+    enabled: true
+    run_on: fresh_init_only
+
+    calibration_tokens: 4194304
+    calibration_max_batches: 64
+    histogram_bins: 16384
+    score_min: -1.0
+    score_max: 1.0
+    candidate_eps: 1.0e-3
+
+    active_target:
+      qk: 0.08
+      v: 0.04
+      rst: 0.025
+
+    candidate_target_start:
+      qk: 0.16
+      v: 0.07
+      rst: 0.045
+
+    candidate_target_final:
+      qk: 0.08
+      v: 0.04
+      rst: 0.025
+
+    B_floor:
+      qk: 0.001
+      v: 0.001
+      rst: 0.001
+
+    annealing:
+      unit: tokens
+      shrink_start_tokens: 5000000000
+      shrink_end_tokens: 20000000000
+
   soft_gate_effective_active_eps: 1.0e-06
   admission_den_power: 0.5
   admission_den_grad_scale: 1.0
@@ -58,7 +94,8 @@ training:
   soft_gate_boundary_power_start: 3.0
   soft_gate_boundary_power_mid: 3.0
   soft_gate_boundary_power_final: 4.0
-  soft_gate_boundary_power_mid_frac: 0.001
+  soft_gate_boundary_power_start_frac: 0.0
+  soft_gate_boundary_power_mid_frac: 0.360
   soft_gate_boundary_power_final_frac: 1.000
 
   # Developmental Band Annealing values are intentionally kept unchanged.
@@ -69,8 +106,8 @@ training:
   soft_gate_t_qk_late: 0.001
   soft_gate_t_qk_final: 0.001
   soft_gate_t_qk_sort_end_frac: 0.0
-  soft_gate_t_qk_band_reach_frac: 0.001
-  soft_gate_t_qk_formation_end_frac: 0.002
+  soft_gate_t_qk_band_reach_frac: 0.360
+  soft_gate_t_qk_formation_end_frac: 0.360
   soft_gate_t_qk_sharpen_end_frac: 1.000
   soft_gate_t_qk_formation_power: 1.0
   soft_gate_t_qk_sharpen_power: 1.0
@@ -82,8 +119,8 @@ training:
   soft_gate_t_v_late: 0.001
   soft_gate_t_v_final: 0.001
   soft_gate_t_v_sort_end_frac: 0.0
-  soft_gate_t_v_band_reach_frac: 0.001
-  soft_gate_t_v_formation_end_frac: 0.002
+  soft_gate_t_v_band_reach_frac: 0.360
+  soft_gate_t_v_formation_end_frac: 0.360
   soft_gate_t_v_sharpen_end_frac: 1.000
   soft_gate_t_v_formation_power: 1.0
   soft_gate_t_v_sharpen_power: 1.0
@@ -95,8 +132,8 @@ training:
   soft_gate_t_rst_late: 0.001
   soft_gate_t_rst_final: 0.001
   soft_gate_t_rst_sort_end_frac: 0.0
-  soft_gate_t_rst_band_reach_frac: 0.001
-  soft_gate_t_rst_formation_end_frac: 0.002
+  soft_gate_t_rst_band_reach_frac: 0.360
+  soft_gate_t_rst_formation_end_frac: 0.360
   soft_gate_t_rst_sharpen_end_frac: 1.000
   soft_gate_t_rst_formation_power: 1.0
   soft_gate_t_rst_sharpen_power: 1.0
