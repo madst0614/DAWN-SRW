@@ -22,6 +22,7 @@ model:
   n_rst: 20176
   op_key_stopgrad_rw: false
   op_query_factorized: true
+  op_query_factorized_mode: product
   tau_init_min: -0.95
   tau_init_max: 0.95
   tau_init_mode: quantile_frac
@@ -76,9 +77,9 @@ training:
       rst: 0.045
 
     candidate_target_final:
-      qk: 0.11
-      v: 0.055
-      rst: 0.035
+      qk: 0.08
+      v: 0.04
+      rst: 0.025
 
     B_floor:
       qk: 0.001
@@ -87,9 +88,8 @@ training:
 
     annealing:
       unit: tokens
-      open_until_tokens: 1000000000
-      shrink_start_tokens: 1800000000
-      shrink_end_tokens: 5000000000
+      shrink_start_tokens: 1600000000
+      shrink_end_tokens: 4000000000
 
   soft_gate_effective_active_eps: 1.0e-06
   admission_den_power: 0.5

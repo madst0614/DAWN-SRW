@@ -895,11 +895,11 @@ def _selection_calibration_config(cfg, tau_init_cfg=None):
                 "selection_calibration.candidate_target_start must be "
                 f"larger than active_target for {pool}, got "
                 f"{candidate_target_start[pool]} <= {active_target[pool]}.")
-        if candidate_target_final[pool] <= active_target[pool]:
+        if candidate_target_final[pool] < active_target[pool]:
             raise ValueError(
                 "selection_calibration.candidate_target_final must be "
-                f"larger than active_target for {pool}, got "
-                f"{candidate_target_final[pool]} <= {active_target[pool]}.")
+                f">= active_target for {pool}, got "
+                f"{candidate_target_final[pool]} < {active_target[pool]}.")
     annealing = raw.get('annealing')
     if not isinstance(annealing, dict):
         raise ValueError(
@@ -909,17 +909,12 @@ def _selection_calibration_config(cfg, tau_init_cfg=None):
         raise ValueError(
             "selection_calibration.annealing.unit must be 'tokens', "
             f"got {annealing.get('unit')!r}.")
-    open_until_tokens = int(annealing.get('open_until_tokens', 0))
     shrink_start_tokens = int(annealing.get('shrink_start_tokens', 0))
     shrink_end_tokens = int(annealing.get('shrink_end_tokens', 0))
-    if open_until_tokens < 0:
-        raise ValueError(
-            "selection_calibration.annealing.open_until_tokens must be >= 0.")
-    if not (0 <= open_until_tokens <= shrink_start_tokens < shrink_end_tokens):
+    if not (0 <= shrink_start_tokens < shrink_end_tokens):
         raise ValueError(
             "selection_calibration annealing tokens must satisfy "
-            "0 <= open_until_tokens <= shrink_start_tokens < "
-            f"shrink_end_tokens, got {open_until_tokens}, "
+            "0 <= shrink_start_tokens < shrink_end_tokens, got "
             f"{shrink_start_tokens}, {shrink_end_tokens}.")
 
     max_train_tokens = int(cfg.get('data', {}).get('max_train_tokens', 0))
@@ -943,11 +938,17 @@ def _selection_calibration_config(cfg, tau_init_cfg=None):
         'soft_gate_boundary_power_mid', 3.0))
     boundary_power_final = float(tcfg.get(
         'soft_gate_boundary_power_final', 4.0))
+    raw_out = _dict_without_private_keys(raw)
+    raw_out['annealing'] = {
+        'unit': unit,
+        'shrink_start_tokens': shrink_start_tokens,
+        'shrink_end_tokens': shrink_end_tokens,
+    }
 
     return {
         'enabled': True,
         'present': True,
-        'raw': _dict_without_private_keys(raw),
+        'raw': raw_out,
         'run_on': run_on,
         'calibration_tokens': calibration_tokens,
         'calibration_max_batches': calibration_max_batches,
@@ -961,7 +962,6 @@ def _selection_calibration_config(cfg, tau_init_cfg=None):
         'B_floor': b_floor,
         'annealing': {
             'unit': unit,
-            'open_until_tokens': open_until_tokens,
             'shrink_start_tokens': shrink_start_tokens,
             'shrink_end_tokens': shrink_end_tokens,
         },
@@ -1135,6 +1135,8 @@ def _compute_srw_selection_calibration(
     q_final = {}
     b_start = {}
     b_final = {}
+    final_hard_close = {}
+    b_final_set_by_floor = {}
     active_target = selection_calibration_cfg['active_target']
     candidate_start = selection_calibration_cfg['candidate_target_start']
     candidate_final = selection_calibration_cfg['candidate_target_final']
@@ -1144,6 +1146,8 @@ def _compute_srw_selection_calibration(
     eps_scale = -np.log(selection_calibration_cfg['candidate_eps'])
     power_start = selection_calibration_cfg['boundary_power_start']
     power_final = selection_calibration_cfg['boundary_power_final']
+    scale_start = eps_scale ** (1.0 / power_start)
+    scale_final = eps_scale ** (1.0 / power_final)
     for pool in POOL_SCHEDULE_NAMES:
         counts = histogram_counts[pool]
         tau_raw = _histogram_quantile(
@@ -1156,22 +1160,20 @@ def _compute_srw_selection_calibration(
         tau[pool] = tau_pool
         q_start[pool] = q_start_pool
         q_final[pool] = q_final_pool
+        final_hard_close[pool] = (
+            candidate_final[pool] == active_target[pool])
 
-        delta_start = tau_pool - q_start_pool
-        if delta_start <= 0.0:
-            b_start[pool] = float(b_floor[pool])
-        else:
-            b_start[pool] = float(max(
-                b_floor[pool],
-                delta_start / (eps_scale ** (1.0 / power_start))))
+        delta_start = max(tau_pool - q_start_pool, 0.0)
+        b_start_raw = delta_start / scale_start
+        b_start[pool] = float(max(b_floor[pool], b_start_raw))
 
-        delta_final = tau_pool - q_final_pool
-        if delta_final <= 0.0:
+        delta_final = max(tau_pool - q_final_pool, 0.0)
+        b_final_raw = delta_final / scale_final
+        if final_hard_close[pool]:
             b_final[pool] = float(b_floor[pool])
         else:
-            b_final[pool] = float(max(
-                b_floor[pool],
-                delta_final / (eps_scale ** (1.0 / power_final))))
+            b_final[pool] = float(max(b_floor[pool], b_final_raw))
+        b_final_set_by_floor[pool] = (b_final[pool] == float(b_floor[pool]))
 
     return {
         'type': 'selection_calibration',
@@ -1205,6 +1207,12 @@ def _compute_srw_selection_calibration(
         'selection_calibration_q_final': q_final,
         'selection_calibration_B_start': b_start,
         'selection_calibration_B_final': b_final,
+        'selection_calibration_final_hard_close': final_hard_close,
+        'selection_calibration_B_final_set_by_floor': b_final_set_by_floor,
+        'selection_calibration_shrink_start_tokens':
+            int(selection_calibration_cfg['annealing']['shrink_start_tokens']),
+        'selection_calibration_shrink_end_tokens':
+            int(selection_calibration_cfg['annealing']['shrink_end_tokens']),
         'selection_calibration_formation_end_frac':
             float(selection_calibration_cfg['formation_end_frac']),
         'selection_calibration_sharpen_end_frac':
@@ -1315,6 +1323,14 @@ def _selection_calibration_summary_lines(summary):
     tau = summary['selection_calibration_tau']
     b_start = summary['selection_calibration_B_start']
     b_final = summary['selection_calibration_B_final']
+    b_floor = summary['selection_calibration_B_floor']
+    final_hard_close = summary.get(
+        'selection_calibration_final_hard_close', {})
+    b_final_set_by_floor = summary.get(
+        'selection_calibration_B_final_set_by_floor', {})
+    final_hard_close_any = any(
+        bool(final_hard_close.get(pool, False))
+        for pool in POOL_SCHEDULE_NAMES)
     return [
         "enabled=true",
         "run_on=fresh_init_only",
@@ -1351,7 +1367,24 @@ def _selection_calibration_summary_lines(summary):
         "B_final["
         f"qk={b_final['qk']:.6f} v={b_final['v']:.6f} "
         f"rst={b_final['rst']:.6f}]",
+        "B_floor["
+        f"qk={b_floor['qk']:.6f} v={b_floor['v']:.6f} "
+        f"rst={b_floor['rst']:.6f}]",
+        "final_hard_close="
+        f"{str(final_hard_close_any).lower()} pools["
+        f"qk={str(bool(final_hard_close.get('qk', False))).lower()} "
+        f"v={str(bool(final_hard_close.get('v', False))).lower()} "
+        f"rst={str(bool(final_hard_close.get('rst', False))).lower()}]",
+        "B_final set by B_floor["
+        f"qk={str(bool(b_final_set_by_floor.get('qk', False))).lower()} "
+        f"v={str(bool(b_final_set_by_floor.get('v', False))).lower()} "
+        f"rst={str(bool(b_final_set_by_floor.get('rst', False))).lower()}]",
         "",
+        "annealing_tokens["
+        "shrink_start="
+        f"{summary['selection_calibration_shrink_start_tokens']} "
+        "shrink_end="
+        f"{summary['selection_calibration_shrink_end_tokens']}]",
         "fractions["
         "formation_end="
         f"{summary['selection_calibration_formation_end_frac']:.6f} "
