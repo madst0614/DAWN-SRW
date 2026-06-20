@@ -5557,7 +5557,33 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
 
 
 def _is_orbax_missing_dir_error(exc):
-    return isinstance(exc, ValueError) and 'does not exist' in str(exc)
+    """Return True if Orbax/GCS reports a missing checkpoint directory."""
+    seen = set()
+    stack = [exc]
+    while stack:
+        cur = stack.pop()
+        if cur is None:
+            continue
+        ident = id(cur)
+        if ident in seen:
+            continue
+        seen.add(ident)
+
+        if isinstance(cur, FileNotFoundError):
+            return True
+
+        msg = str(cur).lower()
+        if isinstance(cur, ValueError) and 'does not exist' in msg:
+            return True
+        if 'no such file or directory' in msg:
+            return True
+        if 'filenotfounderror' in msg and 'checkpoints' in msg:
+            return True
+
+        stack.append(getattr(cur, '__cause__', None))
+        stack.append(getattr(cur, '__context__', None))
+
+    return False
 
 
 def _parse_orbax_resume_target(resume_from):
@@ -5588,6 +5614,12 @@ def _latest_orbax_step_for_run(run_folder):
         )
     except Exception as exc:
         if _is_orbax_missing_dir_error(exc):
+            if jax.process_index() == 0:
+                print(
+                    "Skipping run without readable Orbax checkpoints: "
+                    f"{run_folder}",
+                    flush=True,
+                )
             return None
         raise
     try:

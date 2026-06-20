@@ -66,19 +66,19 @@ training:
     candidate_eps: 1.0e-3
 
     active_target:
-      qk: 0.08
+      qk: 0.10
       v: 0.04
-      rst: 0.025
+      rst: 0.018
 
     candidate_target_start:
-      qk: 0.16
-      v: 0.07
-      rst: 0.045
+      qk: 0.20
+      v: 0.08
+      rst: 0.036
 
     candidate_target_final:
       qk: 0.08
       v: 0.04
-      rst: 0.025
+      rst: 0.018
 
     B_floor:
       qk: 0.001
