@@ -5893,35 +5893,96 @@ def _restore_orbax_state(manager, step, target_state):
             metadata if isinstance(metadata, dict) else {})
 
 
-def _match_leaf_to_template(restored_val, template_val):
-    """Cast/reshape/device-place a restored leaf to match a template leaf."""
+def _sharding_device_set(sharding):
+    try:
+        return set(sharding.device_set)
+    except Exception:
+        return None
+
+
+def _mesh_device_set(mesh):
+    try:
+        return set(np.asarray(mesh.devices).reshape(-1).tolist())
+    except Exception:
+        return set(jax.devices())
+
+
+def _is_full_mesh_sharding(value, mesh):
+    sharding = getattr(value, 'sharding', None)
+    if sharding is None:
+        return False
+    devs = _sharding_device_set(sharding)
+    if devs is None:
+        return False
+    return devs == _mesh_device_set(mesh)
+
+
+def _put_leaf_on_template_or_replicated_mesh(restored_val, template_val, mesh):
+    """Match dtype/shape, then place on template sharding or replicated mesh.
+
+    For scalar optimizer leaves such as opt_state count, optimizer.init can
+    create a SingleDeviceSharding leaf on device 0. Such leaves are incompatible
+    with jitted computations whose params live on the full mesh, so they must
+    be replicated to NamedSharding(mesh, P()).
+    """
     if template_val is None:
         return restored_val
 
     dtype = getattr(template_val, 'dtype', None)
     restored_arr = jnp.asarray(restored_val, dtype=dtype)
+
     if hasattr(template_val, 'shape'):
         restored_arr = jnp.reshape(restored_arr, template_val.shape)
 
+    replicated = NamedSharding(mesh, P())
+
+    # Scalars and any incomplete/single-device leaves should be replicated
+    # across the full mesh.
+    if getattr(template_val, 'shape', ()) == ():
+        return jax.device_put(restored_arr, replicated)
+
+    if not _is_full_mesh_sharding(template_val, mesh):
+        return jax.device_put(restored_arr, replicated)
+
     sharding = getattr(template_val, 'sharding', None)
     if sharding is not None:
-        try:
-            return jax.device_put(restored_arr, sharding)
-        except Exception:
-            pass
+        return jax.device_put(restored_arr, sharding)
 
-    # Fallback: zeros_like(template_val) carries the template placement/sharding.
-    return jnp.zeros_like(template_val) + restored_arr
+    return jax.device_put(restored_arr, replicated)
 
 
-def _match_tree_to_template(restored_tree, template_tree, *, name):
+def _match_tree_to_template_on_mesh(restored_tree, template_tree, mesh, *, name):
     try:
         return jax.tree.map(
-            _match_leaf_to_template, restored_tree, template_tree)
+            lambda restored_val, template_val:
+                _put_leaf_on_template_or_replicated_mesh(
+                    restored_val, template_val, mesh),
+            restored_tree,
+            template_tree,
+        )
     except Exception as exc:
         raise RuntimeError(
-            f"Failed to match restored {name} to target template/sharding."
+            f"Failed to match restored {name} to target mesh/template."
         ) from exc
+
+
+def _replicate_optimizer_state_scalars_to_mesh(opt_state, mesh):
+    """Ensure fresh optimizer state has mesh-compatible scalar leaves."""
+    replicated = NamedSharding(mesh, P())
+
+    def _fix_leaf(x):
+        if not hasattr(x, 'shape'):
+            return x
+        if x.shape == ():
+            return jax.device_put(jnp.asarray(x), replicated)
+
+        # If optimizer.init produced a non-mesh leaf, replicate it.
+        if not _is_full_mesh_sharding(x, mesh):
+            return jax.device_put(jnp.asarray(x), replicated)
+
+        return x
+
+    return jax.tree.map(_fix_leaf, opt_state)
 
 
 def _state_scalar(state, key, default=None, cast=None):
@@ -10083,6 +10144,7 @@ def main():
     params = shard_params_to_mesh(params, param_shardings)
 
     opt_state = optimizer.init(params)
+    opt_state = _replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
     target_params = params
     target_opt_state = opt_state
     checkpoint_manager = _create_orbax_checkpoint_manager(
@@ -10106,12 +10168,13 @@ def main():
         )
         restored_state, restored_metadata = _restore_orbax_state(
             checkpoint_manager, resume_step, target_state)
-        params = _match_tree_to_template(
-            restored_state['params'], target_params, name='params')
-        opt_state = _match_tree_to_template(
-            restored_state['opt_state'], target_opt_state, name='opt_state')
+        params = _match_tree_to_template_on_mesh(
+            restored_state['params'], target_params, mesh, name='params')
+        opt_state = _match_tree_to_template_on_mesh(
+            restored_state['opt_state'], target_opt_state, mesh,
+            name='opt_state')
         if is_host0:
-            print("  Restored params/optimizer state matched to target mesh sharding.")
+            print("  Restored params/optimizer state matched to full mesh sharding.")
         if 'rng' not in restored_state:
             raise KeyError("Orbax checkpoint state is missing required rng.")
         rng = jnp.asarray(restored_state['rng'], dtype=jnp.uint32)
