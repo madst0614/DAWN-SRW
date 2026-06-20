@@ -55,40 +55,40 @@ training:
   dead_exposure_target: 0.0
 
   selection_calibration:
-  enabled: true
-  run_on: fresh_init_only
+    enabled: true
+    run_on: fresh_init_only
 
-  calibration_tokens: 4194304
-  calibration_max_batches: 64
-  histogram_bins: 16384
-  score_min: -1.0
-  score_max: 1.0
-  candidate_eps: 1.0e-3
+    calibration_tokens: 4194304
+    calibration_max_batches: 64
+    histogram_bins: 16384
+    score_min: -1.0
+    score_max: 1.0
+    candidate_eps: 1.0e-3
 
-  active_target:
-    qk: 0.08
-    v: 0.04
-    rst: 0.025
+    active_target:
+      qk: 0.08
+      v: 0.04
+      rst: 0.025
 
-  candidate_target_start:
-    qk: 0.16
-    v: 0.07
-    rst: 0.045
+    candidate_target_start:
+      qk: 0.16
+      v: 0.07
+      rst: 0.045
 
-  candidate_target_final:
-    qk: 0.08
-    v: 0.04
-    rst: 0.025
+    candidate_target_final:
+      qk: 0.08
+      v: 0.04
+      rst: 0.025
 
-  B_floor:
-    qk: 0.001
-    v: 0.001
-    rst: 0.001
+    B_floor:
+      qk: 0.001
+      v: 0.001
+      rst: 0.001
 
-  annealing:
-    unit: tokens
-    shrink_start_tokens: 6000000000
-    shrink_end_tokens: 24000000000
+    annealing:
+      unit: tokens
+      shrink_start_tokens: 6000000000
+      shrink_end_tokens: 24000000000
 
   soft_gate_effective_active_eps: 1.0e-06
   admission_den_power: 0.5
