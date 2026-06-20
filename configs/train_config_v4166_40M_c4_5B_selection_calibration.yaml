@@ -17,9 +17,9 @@ model:
   router_dropout: 0.0
   gradient_checkpointing: true
   d_route: 128
-  n_qk: 1452
+  n_qk: 2312
   n_v: 7192
-  n_rst: 20176
+  n_rst: 19316
   op_key_stopgrad_rw: false
   op_query_factorized: true
   op_query_factorized_mode: product
@@ -68,17 +68,17 @@ training:
     active_target:
       qk: 0.08
       v: 0.04
-      rst: 0.025
+      rst: 0.020
 
     candidate_target_start:
       qk: 0.16
-      v: 0.07
-      rst: 0.045
+      v: 0.08
+      rst: 0.040
 
     candidate_target_final:
       qk: 0.08
       v: 0.04
-      rst: 0.025
+      rst: 0.020
 
     B_floor:
       qk: 0.001

@@ -1660,42 +1660,90 @@ def _makedirs(path):
         Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def _ensure_orbax_checkpoint_root(path):
-    """Best-effort pre-create for an Orbax checkpoint root.
+def _orbax_root_is_listable(path_str):
+    """Return True only when Orbax/epath can list the checkpoint root."""
+    try:
+        from etils import epath
+        list(epath.Path(str(path_str).rstrip('/')).iterdir())
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
 
-    Orbax CheckpointManagerOptions(create=True) remains the source of truth for
-    creating the top-level checkpoint directory.  On multi-host TPU runs, Orbax
-    coordinates creation through its multiprocessing options; this helper only
-    reduces first-use races and must not become a separate GCS synchronization
-    mechanism.
+
+def _gcsfs_object_path(path_str):
+    """Convert gs://bucket/name to the bucket/name form accepted by gcsfs."""
+    path_str = str(path_str)
+    if path_str.startswith('gs://'):
+        return path_str[len('gs://'):]
+    return path_str
+
+
+def _materialize_gcs_directory_object(path_str):
+    """Create the GCS directory placeholder object path/, not path/.marker.
+
+    Orbax scans direct children of the checkpoint root as step entries, so this
+    must not create arbitrary files such as .orbax_root, .keep, or _marker
+    under the checkpoint root.
+    """
+    path_str = str(path_str).rstrip('/')
+    dir_object_gs = path_str + '/'
+
+    # Prefer gcsfs because the Orbax/etils failure path commonly goes through
+    # gcsfs on TPU runs.  Use the directory object itself, not a child marker.
+    fs = _get_gcs_fs()
+    if fs is not None:
+        object_path = _gcsfs_object_path(dir_object_gs)
+        with fs.open(object_path, 'wb') as f:
+            f.write(b'')
+        return
+
+    import tensorflow as tf
+    with tf.io.gfile.GFile(dir_object_gs, 'wb') as f:
+        f.write(b'')
+
+
+def _ensure_orbax_checkpoint_root(path):
+    """Ensure an Orbax checkpoint root is visible/listable before init.
+
+    Orbax 0.6.4 may call CheckpointManager._load_checkpoint_infos() during
+    construction, which lists the checkpoint root before the first save.  On
+    GCS, mkdir can succeed without making a fresh empty prefix listable through
+    epath/gcsfs.  For GCS roots, verify listability after mkdir and, if needed,
+    materialize the directory object itself (path/) without creating any child
+    marker file under the checkpoint root.
     """
     path_str = str(path).rstrip('/')
     last_exc = None
 
-    try:
-        from etils import epath
-        epath.Path(path_str).mkdir(parents=True, exist_ok=True)
-        return
-    except Exception as epath_exc:
-        last_exc = epath_exc
-
     if _is_gcs(path_str):
+        try:
+            from etils import epath
+            epath.Path(path_str).mkdir(parents=True, exist_ok=True)
+        except Exception as epath_exc:
+            last_exc = epath_exc
+
         try:
             import tensorflow as tf
             tf.io.gfile.makedirs(path_str)
-            return
         except Exception as tf_exc:
             last_exc = tf_exc
 
-        if jax.process_index() == 0:
-            print(
-                "Warning: best-effort Orbax GCS root creation failed for "
-                f"{path_str}: {type(last_exc).__name__}: {last_exc}. "
-                "Continuing; Orbax create=True with multiprocessing_options "
-                "will perform the authoritative create/barrier path.",
-                flush=True,
-            )
-        return
+        if _orbax_root_is_listable(path_str):
+            return
+
+        try:
+            _materialize_gcs_directory_object(path_str)
+        except Exception as mat_exc:
+            last_exc = mat_exc
+
+        if _orbax_root_is_listable(path_str):
+            return
+
+        raise RuntimeError(
+            f"Failed to create/list Orbax checkpoint root on GCS: {path_str}"
+        ) from last_exc
 
     Path(path_str).mkdir(parents=True, exist_ok=True)
 
@@ -5549,11 +5597,29 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
         )
 
     options = ocp.CheckpointManagerOptions(**options_kwargs)
-    return ocp.CheckpointManager(
-        checkpoint_dir,
-        options=options,
-        item_names=('state', 'metadata'),
-    )
+
+    def _construct_manager():
+        return ocp.CheckpointManager(
+            checkpoint_dir,
+            options=options,
+            item_names=('state', 'metadata'),
+        )
+
+    try:
+        return _construct_manager()
+    except Exception as exc:
+        if create and not read_only and _is_orbax_missing_dir_error(exc):
+            if jax.process_index() == primary_host:
+                print(
+                    "Orbax CheckpointManager saw a missing checkpoint root "
+                    "during fresh creation; re-materializing and retrying "
+                    f"once: {checkpoint_dir}",
+                    flush=True,
+                )
+                _ensure_orbax_checkpoint_root(checkpoint_dir)
+            _sync_orbax_checkpoint_root_created()
+            return _construct_manager()
+        raise
 
 
 def _is_orbax_missing_dir_error(exc):
