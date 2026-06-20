@@ -1667,34 +1667,15 @@ def _ensure_orbax_checkpoint_root(path):
     # Prefer etils.epath because Orbax uses epath-compatible paths.
     try:
         from etils import epath
-        p = epath.Path(path_str)
-        p.mkdir(parents=True, exist_ok=True)
-
-        # On object stores like GCS, an empty prefix may still not appear
-        # during iterdir/existence checks. Write a hidden marker file.
-        marker = p / ".orbax_root"
-        with marker.open("w") as f:
-            f.write("")
+        epath.Path(path_str).mkdir(parents=True, exist_ok=True)
         return
     except Exception as epath_exc:
         last_exc = epath_exc
 
     if _is_gcs(path_str):
-        fs = _get_gcs_fs()
-        if fs is not None:
-            try:
-                marker = path_str + "/.orbax_root"
-                with fs.open(marker, "w") as f:
-                    f.write("")
-                return
-            except Exception as fs_exc:
-                last_exc = fs_exc
-
         try:
             import tensorflow as tf
             tf.io.gfile.makedirs(path_str)
-            with tf.io.gfile.GFile(path_str + "/.orbax_root", "w") as f:
-                f.write("")
             return
         except Exception as tf_exc:
             last_exc = tf_exc
@@ -1704,9 +1685,6 @@ def _ensure_orbax_checkpoint_root(path):
         ) from last_exc
 
     Path(path_str).mkdir(parents=True, exist_ok=True)
-    marker = Path(path_str) / ".orbax_root"
-    marker.write_text("", encoding="utf-8")
-
 
 def _ensure_orbax_dir(path):
     """Backward-compatible alias for Orbax checkpoint root creation."""
