@@ -76,7 +76,7 @@ training:
       rst: 0.036
 
     candidate_target_final:
-      qk: 0.08
+      qk: 0.10
       v: 0.04
       rst: 0.018
 
