@@ -81,6 +81,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--queued-resource-id", default=None)
     p.add_argument("--poll-seconds", type=int, default=20)
     p.add_argument(
+        "--from-scratch",
+        action="store_true",
+        help="Forward --from-scratch to scripts/launch_tpu_pod.sh.",
+    )
+    p.add_argument(
+        "--resume-from",
+        default=None,
+        metavar="CKPT_OR_RUN",
+        help="Forward --resume-from CKPT_OR_RUN to scripts/launch_tpu_pod.sh.",
+    )
+    p.add_argument(
+        "--debug",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="N",
+        help="Forward --debug or --debug N to scripts/launch_tpu_pod.sh.",
+    )
+    p.add_argument(
         "--describe-timeout-seconds",
         type=int,
         default=60,
@@ -411,6 +430,14 @@ def launch(args: argparse.Namespace) -> None:
     ]
     if args.token:
         cmd.extend(["--token", args.token])
+    if args.from_scratch:
+        cmd.append("--from-scratch")
+    if args.resume_from is not None:
+        cmd.extend(["--resume-from", args.resume_from])
+    if args.debug is not None:
+        cmd.append("--debug")
+        if args.debug:
+            cmd.append(args.debug)
 
     proc = run_stream(args, cmd, cwd=str(local_repo), timeout=args.launch_timeout_seconds)
     if not proc_ok(proc):
