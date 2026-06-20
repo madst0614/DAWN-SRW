@@ -1659,6 +1659,47 @@ def _makedirs(path):
         Path(path).mkdir(parents=True, exist_ok=True)
 
 
+def _ensure_orbax_dir(path):
+    """Ensure an Orbax checkpoint root exists before manager construction."""
+    path_str = str(path)
+    epath_exc = None
+    try:
+        from etils import epath
+        epath.Path(path_str).mkdir(parents=True, exist_ok=True)
+        return
+    except Exception as exc:
+        epath_exc = exc
+
+    if _is_gcs(path_str):
+        fs = _get_gcs_fs()
+        if fs is not None:
+            try:
+                marker = path_str.rstrip('/') + '/.orbax_dir'
+                with fs.open(marker, 'w') as f:
+                    f.write('')
+                return
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to create Orbax checkpoint directory: "
+                    f"{path_str}") from exc
+        try:
+            import tensorflow as tf
+            tf.io.gfile.makedirs(path_str)
+            return
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to create Orbax checkpoint directory: {path_str}"
+            ) from exc
+
+    try:
+        Path(path_str).mkdir(parents=True, exist_ok=True)
+        return
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to create Orbax checkpoint directory: {path_str}"
+        ) from (epath_exc or exc)
+
+
 def _join_path(base, *parts):
     base_str = str(base)
     if _is_gcs(base_str):
@@ -5410,6 +5451,8 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
                                      keep_last=3, create=True,
                                      read_only=False):
     """Create the Orbax manager for Composite(state, metadata) checkpoints."""
+    if create and not read_only:
+        _ensure_orbax_dir(checkpoint_dir)
     options_kwargs = {
         'save_interval_steps': max(1, int(checkpoint_interval or 1)),
         'best_fn': _orbax_best_metric,
@@ -8435,6 +8478,7 @@ def main():
         run_name = f"run_v{version}_{ts}_{rand_suffix}"
         checkpoint_dir = _join(base_checkpoint_dir, run_name)
         _makedirs(checkpoint_dir)
+        _ensure_orbax_dir(_join(checkpoint_dir, 'checkpoints'))
         if jax.process_index() == 0:
             if cli_args.from_scratch:
                 print(f"  Starting from scratch (--from-scratch)")

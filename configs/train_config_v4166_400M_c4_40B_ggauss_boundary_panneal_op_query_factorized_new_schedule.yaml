@@ -31,7 +31,6 @@ model:
   tau_init_target_rst_frac: 0.02
 
 training:
-  restore_training_config_on_resume: true
   batch_size: 1024
   mesh_model: 2
   mesh_data: 16
