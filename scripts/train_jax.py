@@ -5900,6 +5900,14 @@ def _orbax_step_from_path_name(name):
     return None
 
 
+def _orbax_commit_success_path(step_dir):
+    return _join_path(step_dir, "commit_success.txt")
+
+
+def _orbax_step_is_committed(step_dir):
+    return _file_exists(_orbax_commit_success_path(step_dir))
+
+
 def _list_orbax_steps_for_run(run_folder):
     """List Orbax checkpoint steps without constructing an Orbax manager.
 
@@ -5922,11 +5930,33 @@ def _list_orbax_steps_for_run(run_folder):
         raise
 
     steps = []
+    skipped = []
     for path in entries:
         step = _orbax_step_from_path_name(_path_name(path))
-        if step is not None:
-            steps.append(step)
-    return sorted(set(steps))
+        if step is None:
+            continue
+        if not _orbax_step_is_committed(path):
+            skipped.append((step, path))
+            continue
+        steps.append(step)
+
+    steps = sorted(set(int(step) for step in steps))
+
+    if skipped and jax.process_index() == 0:
+        for step, path in skipped[:8]:
+            print(
+                "Auto-resume discovery: skipping incomplete Orbax checkpoint "
+                f"step={step} path={path} missing commit_success.txt",
+                flush=True,
+            )
+        if len(skipped) > 8:
+            print(
+                "Auto-resume discovery: skipped "
+                f"{len(skipped)} incomplete checkpoints total.",
+                flush=True,
+            )
+
+    return steps
 
 
 def _latest_orbax_step_for_run(run_folder):
@@ -5944,6 +5974,25 @@ def _resolve_orbax_resume_from(resume_from):
 
     if requested_step is not None:
         requested_step = int(requested_step)
+        ckpt_dir = _join_path(run_folder, 'checkpoints')
+        requested_step_dir = None
+        try:
+            entries = _list_files(ckpt_dir, '*')
+        except Exception:
+            entries = []
+        for path in entries:
+            step = _orbax_step_from_path_name(_path_name(path))
+            if step == requested_step:
+                requested_step_dir = path
+                break
+        if (
+            requested_step_dir is not None
+            and not _orbax_step_is_committed(requested_step_dir)
+        ):
+            raise RuntimeError(
+                "Requested Orbax checkpoint step exists but is "
+                "incomplete/uncommitted:\n"
+                f"{requested_step_dir} is missing commit_success.txt")
         return run_folder, requested_step, requested_step in step_set
     if not steps:
         return run_folder, None, False
@@ -8989,22 +9038,27 @@ def main():
         _host0_checkpoint_dir = None
         _host0_resume_step = None
         _host0_explicit_missing = False
+        _host0_explicit_error = None
 
         if jax.process_index() == 0:
             if configured_resume_from:
-                folder, selected_step, found = _resolve_orbax_resume_from(
-                    configured_resume_from)
-                if found:
-                    _host0_resume_path = folder
-                    _host0_checkpoint_dir = folder
-                    _host0_resume_step = int(selected_step)
-                    print(f"  Resume from specified folder: {_host0_checkpoint_dir}")
-                    print(f"  Resuming from Orbax step: {_host0_resume_step}")
+                try:
+                    folder, selected_step, found = _resolve_orbax_resume_from(
+                        configured_resume_from)
+                except RuntimeError as exc:
+                    _host0_explicit_error = str(exc)
                 else:
-                    _host0_explicit_missing = True
-                    print(
-                        f"  No Orbax checkpoint found in "
-                        f"{configured_resume_from}")
+                    if found:
+                        _host0_resume_path = folder
+                        _host0_checkpoint_dir = folder
+                        _host0_resume_step = int(selected_step)
+                        print(f"  Resume from specified folder: {_host0_checkpoint_dir}")
+                        print(f"  Resuming from Orbax step: {_host0_resume_step}")
+                    else:
+                        _host0_explicit_missing = True
+                        print(
+                            f"  No Orbax checkpoint found in "
+                            f"{configured_resume_from}")
             else:
                 run_folders = _list_run_folders(base_checkpoint_dir)
                 print(
@@ -9033,6 +9087,10 @@ def main():
         _resume_step_str = _broadcast_str_from_host0(
             '' if _host0_resume_step is None else str(_host0_resume_step))
         resume_step = int(_resume_step_str) if _resume_step_str else None
+        _explicit_error = _broadcast_str_from_host0(
+            _host0_explicit_error, max_len=4096)
+        if _explicit_error:
+            raise RuntimeError(_explicit_error)
         # Broadcast the explicit-missing signal as a single-byte string
         # so every host raises together.
         _missing_signal = _broadcast_str_from_host0(
