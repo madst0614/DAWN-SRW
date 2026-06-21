@@ -6006,6 +6006,46 @@ def _safe_git_info():
     }
 
 
+def _is_single_device_jax_array(x):
+    jax_array_type = getattr(jax, "Array", None)
+    if jax_array_type is None or not isinstance(x, jax_array_type):
+        return False
+    sharding = getattr(x, "sharding", None)
+    return type(sharding).__name__ == "SingleDeviceSharding"
+
+
+def _host_local_jax_array_to_numpy(x):
+    return np.asarray(jax.device_get(x))
+
+
+def _sanitize_host_local_checkpoint_leaf(x):
+    """Convert host-local SingleDevice JAX arrays to NumPy for Orbax save.
+
+    Orbax StandardSave in multi-host mode rejects host-local SingleDevice
+    jax.Array leaves. Sharded global arrays, such as model params and large
+    optimizer tensors, must be preserved as JAX arrays.
+    """
+    if _is_single_device_jax_array(x):
+        return _host_local_jax_array_to_numpy(x)
+    return x
+
+
+def _sanitize_opt_state_for_orbax_save(opt_state):
+    return jax.tree_util.tree_map(
+        _sanitize_host_local_checkpoint_leaf,
+        opt_state,
+    )
+
+
+def _rng_to_orbax_state_array(rng):
+    arr = np.asarray(jax.device_get(rng), dtype=np.uint32)
+    if arr.size != 2:
+        raise ValueError(
+            f"Expected PRNGKey with 2 uint32 values, got shape={arr.shape}."
+        )
+    return np.reshape(arr, (2,))
+
+
 def _build_orbax_state(params, opt_state, rng, epoch, global_step,
                        step_in_epoch, steps_per_epoch, best_val_loss,
                        consumed_examples=None, consumed_tokens=None,
@@ -6020,8 +6060,8 @@ def _build_orbax_state(params, opt_state, rng, epoch, global_step,
             consumed_tokens = inferred_tokens
     return {
         'params': params,
-        'opt_state': opt_state,
-        'rng': rng,
+        'opt_state': _sanitize_opt_state_for_orbax_save(opt_state),
+        'rng': _rng_to_orbax_state_array(rng),
         'epoch': np.asarray(int(epoch), dtype=np.int64),
         'global_step': np.asarray(int(global_step), dtype=np.int64),
         'step': np.asarray(int(global_step), dtype=np.int64),
@@ -6139,6 +6179,18 @@ def save_orbax_checkpoint(manager, params, opt_state, rng, epoch,
         best_val_loss=best_val_loss,
         train_loss=train_loss,
     )
+    if (jax.process_index() == 0
+            and not getattr(save_orbax_checkpoint,
+                            "_printed_serialization_check", False)):
+        rng_leaf = state.get('rng')
+        print(
+            "Orbax state serialization check: "
+            f"rng_type={type(rng_leaf).__name__} "
+            f"rng_shape={getattr(rng_leaf, 'shape', None)} "
+            f"rng_dtype={getattr(rng_leaf, 'dtype', None)}",
+            flush=True,
+        )
+        save_orbax_checkpoint._printed_serialization_check = True
     saved = manager.save(
         int(global_step),
         args=ocp.args.Composite(
@@ -10404,7 +10456,9 @@ def main():
             print("  Restored params/optimizer state matched to full mesh sharding.")
         if 'rng' not in restored_state:
             raise KeyError("Orbax checkpoint state is missing required rng.")
-        rng = jnp.asarray(restored_state['rng'], dtype=jnp.uint32)
+        restored_rng = np.asarray(
+            restored_state['rng'], dtype=np.uint32).reshape((2,))
+        rng = jnp.asarray(restored_rng, dtype=jnp.uint32)
         start_epoch = _state_scalar(restored_state, 'epoch', 0, int)
         global_step = _state_scalar(
             restored_state, 'global_step',
