@@ -7949,6 +7949,7 @@ def _print_regular_block(rec, ctx):
     is_v4166 = ctx.get('model_version') == V4166_MODEL_VERSION
     is_official_soft_direct_tau = _is_active_srw_version(ctx.get('model_version'))
     official_soft_sparsity_compact = False
+    route_std_label = 'rho_std' if is_official_soft_direct_tau else 'score_std'
     aux_note = (
         " aux_is_not_total_minus_ce"
         if is_official_soft_direct_tau
