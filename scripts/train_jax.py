@@ -70,6 +70,100 @@ from models.dawn_srw_v4166 import (
     _tau_init_calibration_scores as _v4166_tau_init_calibration_scores,
 )
 
+
+def _jax_distributed_is_initialized():
+    try:
+        # Safe after initialization. Before initialization this may still
+        # return values in single-process cases, so do not rely on it alone
+        # for policy.
+        return bool(getattr(jax.distributed, "is_initialized", lambda: False)())
+    except Exception:
+        return False
+
+
+def _maybe_initialize_jax_distributed(cfg=None, args=None):
+    """Initialize JAX distributed before any backend/device access.
+
+    This trainer uses multi-host TPU + Orbax CheckpointManager. JAX
+    distributed initialization is required for multi-host topology discovery
+    and distributed checkpointing.
+
+    On Cloud TPU, JAX can auto-detect coordinator/process parameters, so the
+    default path is `jax.distributed.initialize()` with no arguments.
+    """
+    del args  # Reserved for future CLI overrides without changing call sites.
+    dist_cfg = {}
+    if cfg is not None:
+        dist_cfg = dict(cfg.get("distributed", {}) or {})
+
+    enabled = dist_cfg.get("enabled", None)
+
+    # Default policy:
+    # - If explicitly disabled, do nothing.
+    # - Otherwise, initialize. This is safe for TPU multi-host and also works
+    #   for single-controller cases when called before backend initialization.
+    if enabled is False:
+        print("JAX distributed initialization disabled by config.", flush=True)
+        return False
+
+    if _jax_distributed_is_initialized():
+        print("JAX distributed runtime already initialized.", flush=True)
+        return True
+
+    init_kwargs = {}
+    for key in (
+        "coordinator_address",
+        "num_processes",
+        "process_id",
+        "local_device_ids",
+        "cluster_detection_method",
+        "initialization_timeout",
+        "heartbeat_timeout_seconds",
+        "shutdown_timeout_seconds",
+        "coordinator_bind_address",
+        "partition_index",
+    ):
+        if key in dist_cfg and dist_cfg[key] is not None:
+            init_kwargs[key] = dist_cfg[key]
+
+    try:
+        if init_kwargs:
+            print(
+                "Initializing jax.distributed with explicit config keys: "
+                + ", ".join(sorted(init_kwargs.keys())),
+                flush=True,
+            )
+            jax.distributed.initialize(**init_kwargs)
+        else:
+            print(
+                "Initializing jax.distributed with Cloud TPU auto-detection.",
+                flush=True,
+            )
+            jax.distributed.initialize()
+        print(
+            "Initialized jax.distributed: "
+            f"process_index={jax.process_index()} "
+            f"process_count={jax.process_count()}",
+            flush=True,
+        )
+        return True
+    except RuntimeError as exc:
+        if "already initialized" in str(exc).lower():
+            print("jax.distributed already initialized.", flush=True)
+            return True
+        raise RuntimeError(
+            "Failed to initialize jax.distributed before device access. "
+            "This trainer requires JAX distributed for multi-host TPU and "
+            "Orbax CheckpointManager checkpointing."
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to initialize jax.distributed before device access. "
+            "This trainer requires JAX distributed for multi-host TPU and "
+            "Orbax CheckpointManager checkpointing."
+        ) from exc
+
+
 # ============================================================
 # Constants
 # ============================================================
@@ -5702,11 +5796,8 @@ def _sync_orbax_checkpoint_root_created():
 
 def _orbax_async_checkpointing_enabled():
     """Return whether this trainer may use Orbax async checkpointing."""
-    # This trainer does not call jax.distributed.initialize().
-    # Orbax async checkpointing in orbax-checkpoint 0.11.x creates an
-    # AsyncCheckpointer and requires a JAX distributed client for multihost
-    # barrier synchronization. Keep checkpointing synchronous unless the
-    # entire launcher/runtime is migrated to explicit jax.distributed.
+    # Keep checkpointing synchronous for correctness-first TPU runs even
+    # though the trainer initializes jax.distributed before device access.
     return False
 
 
@@ -5758,7 +5849,7 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
         )
         print(
             "Orbax checkpointing mode: synchronous "
-            "(async disabled; no jax.distributed runtime)",
+            "(async disabled)",
             flush=True,
         )
 
@@ -8536,8 +8627,6 @@ def _print_geometry_block(geom):
 # ============================================================
 
 def main():
-    _require_orbax_checkpoint_compat()
-
     parser = argparse.ArgumentParser(description='Train DAWN-SRW v4164 (JAX/Flax, Multi-Device)')
     parser.add_argument('--config', type=str, required=True,
                         help='Path to config YAML file')
@@ -8576,6 +8665,8 @@ def main():
         else:
             raise FileNotFoundError(f"Config file not found: {config_path}")
     cfg = load_config(config_path)
+    _maybe_initialize_jax_distributed(cfg, cli_args)
+    _require_orbax_checkpoint_compat()
     raw_cfg_snapshot = deepcopy(cfg)
     current_yaml_config_snapshot = deepcopy(cfg)
     seed = cfg.get('seed', 42)
