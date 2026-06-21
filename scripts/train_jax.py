@@ -6709,6 +6709,79 @@ def _rec_float(rec, key, default=0.0):
     return float(rec.get(key, default) or 0.0)
 
 
+def _optional_rec_float(rec, key):
+    if key not in rec:
+        return None
+    try:
+        return float(rec[key])
+    except Exception:
+        return None
+
+
+def _fmt_optional_pct(value):
+    if value is None:
+        return "nan%"
+    return f"{100.0 * value:.1f}%"
+
+
+def _first_optional_rec_float(rec, keys):
+    for key in keys:
+        value = _optional_rec_float(rec, key)
+        if value is not None:
+            return value
+    return None
+
+
+def _active_tau_display_value(rec, active_tau_keys, active_key):
+    value = _first_optional_rec_float(rec, active_tau_keys)
+    fallback = _optional_rec_float(rec, active_key)
+    if (
+        fallback is not None
+        and (value is None or (abs(value) <= 1.0e-12 and abs(fallback) > 1.0e-12))
+    ):
+        return fallback
+    return value
+
+
+def _print_active_tau_regular_line(rec):
+    explicit_keys = (
+        'q_active_tau_frac', 'k_active_tau_frac', 'qk_active_tau_frac',
+        'v_active_tau_frac', 'rst_active_tau_frac',
+        'attn_q_active_tau_frac', 'attn_k_active_tau_frac',
+        'attn_qk_active_tau_frac', 'attn_v_active_tau_frac',
+    )
+    if (
+        rec.get('_active_tau_regular_available') is False
+        and not any(key in rec for key in explicit_keys)
+    ):
+        return
+    q = _active_tau_display_value(
+        rec, ('q_active_tau_frac', 'attn_q_active_tau_frac'), 'attn_q_active')
+    k = _active_tau_display_value(
+        rec, ('k_active_tau_frac', 'attn_k_active_tau_frac'), 'attn_k_active')
+    qk = _first_optional_rec_float(
+        rec, ('qk_active_tau_frac', 'attn_qk_active_tau_frac'))
+    v = _active_tau_display_value(
+        rec, ('v_active_tau_frac', 'attn_v_active_tau_frac'), 'attn_v_active')
+    rst = _active_tau_display_value(
+        rec, ('rst_active_tau_frac',), 'rst_active')
+    if (
+        q is not None
+        and k is not None
+        and (qk is None or (abs(qk) <= 1.0e-12 and abs(q + k) > 1.0e-12))
+    ):
+        qk = 0.5 * (q + k)
+    if all(value is None for value in (q, k, qk, v, rst)):
+        return
+    log_message(
+        f"  active_tau: q={_fmt_optional_pct(q)}"
+        f" k={_fmt_optional_pct(k)}"
+        f" qk={_fmt_optional_pct(qk)}"
+        f" v={_fmt_optional_pct(v)}"
+        f" rst={_fmt_optional_pct(rst)}"
+    )
+
+
 def _print_regular_host_timing(raw_step_time_window, logging_time, ctx):
     mode = str(ctx.get('regular_console_host_timing', 'always')).lower()
     if mode in ('off', 'false', 'none'):
@@ -7624,6 +7697,15 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'dev_neg_max': float(m.get('dev_neg_max', 0.0)),
         'timestamp': datetime.now().isoformat(),
     }
+    rec['_active_tau_regular_available'] = any(
+        key in m for key in (
+            'q_active_tau_frac', 'k_active_tau_frac', 'qk_active_tau_frac',
+            'v_active_tau_frac', 'rst_active_tau_frac',
+            'attn_q_active_tau_frac', 'attn_k_active_tau_frac',
+            'attn_qk_active_tau_frac', 'attn_v_active_tau_frac',
+            'attn_q_active', 'attn_k_active', 'attn_qk_active',
+            'attn_v_active', 'rst_active',
+        ))
     for _pool in ('attn_qk', 'attn_v'):
         for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
             _fallback = rec.get(f"attn_{_name}", 0.0)
@@ -7639,6 +7721,11 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             rec[f'{_pool}_{_name}'] = float(m.get(
                 f'{_pool}_{_name}',
                 rec.get(f'attn_{_name}', 0.0)))
+    for _pool in ('attn_qk', 'attn_v', 'attn_q', 'attn_k', 'rst'):
+        for _name in DIRECT_TAU_SPARSITY_METRIC_NAMES:
+            _key = f'{_pool}_{_name}'
+            if _key in m:
+                rec[_key] = float(m[_key])
     if rec['attn_top1_gate_frac'] == 0.0:
         rec['attn_top1_gate_frac'] = rec['attn_raw_gate_max'] / max(rec['attn_gate_sum'], 1e-8)
     if rec['rst_top1_gate_frac'] == 0.0:
@@ -7776,6 +7863,7 @@ def _print_regular_block(rec, ctx):
                 f" v={rec['attn_v_strong']*100:.1f}%"
                 f" rst={rec['rst_strong']*100:.1f}%"
             )
+            _print_active_tau_regular_line(rec)
             _soft_gate_label = (
                 'soft_gate_B'
                 if _is_active_srw_version(ctx.get('model_version'))
@@ -11742,6 +11830,7 @@ def main():
                     rec['raw_step_time_window'] = float(_raw_step_time_window)
                     rec['logging_time'] = 0.0
                     _print_regular_block(rec, ctx)
+                    rec.pop('_active_tau_regular_available', None)
                     log_jsonl({'type': 'train', **rec})
                     sync_logs()
                     _regular_logging_time = time.time() - _regular_logging_t0
