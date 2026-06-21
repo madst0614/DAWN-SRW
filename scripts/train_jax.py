@@ -5700,6 +5700,16 @@ def _sync_orbax_checkpoint_root_created():
             pass
 
 
+def _orbax_async_checkpointing_enabled():
+    """Return whether this trainer may use Orbax async checkpointing."""
+    # This trainer does not call jax.distributed.initialize().
+    # Orbax async checkpointing in orbax-checkpoint 0.11.x creates an
+    # AsyncCheckpointer and requires a JAX distributed client for multihost
+    # barrier synchronization. Keep checkpointing synchronous unless the
+    # entire launcher/runtime is migrated to explicit jax.distributed.
+    return False
+
+
 def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
                                      keep_last=3, create=True,
                                      read_only=False):
@@ -5707,6 +5717,12 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
     create = bool(create)
     read_only = bool(read_only)
     primary_host = 0
+    enable_async_checkpointing = _orbax_async_checkpointing_enabled()
+    if enable_async_checkpointing:
+        raise AssertionError(
+            "Orbax async checkpointing must remain disabled unless the "
+            "trainer runtime initializes jax.distributed."
+        )
 
     if create and not read_only:
         if jax.process_index() == primary_host:
@@ -5721,7 +5737,7 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
         'step_format_fixed_length': 12,
         'create': create,
         'read_only': read_only,
-        'enable_async_checkpointing': not read_only,
+        'enable_async_checkpointing': enable_async_checkpointing,
     }
     if _checkpoint_manager_options_accepts('multiprocessing_options'):
         options_kwargs['multiprocessing_options'] = (
@@ -5738,6 +5754,11 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
             f"Creating Orbax CheckpointManager: dir={checkpoint_dir} "
             f"create={create} read_only={read_only} "
             f"primary_host={primary_host}",
+            flush=True,
+        )
+        print(
+            "Orbax checkpointing mode: synchronous "
+            "(async disabled; no jax.distributed runtime)",
             flush=True,
         )
 
