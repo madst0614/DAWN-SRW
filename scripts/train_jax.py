@@ -22,6 +22,7 @@ import re
 import math
 import subprocess
 import inspect
+import hashlib
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -580,6 +581,20 @@ def _json_safe(obj):
         except Exception:
             pass
     return str(obj)
+
+
+def _stable_json_dumps(obj):
+    return json.dumps(
+        _json_safe(obj),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _config_sha256(obj):
+    payload = _stable_json_dumps(obj).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _safe_config_snapshot(obj):
@@ -6146,6 +6161,7 @@ def _build_orbax_metadata(run_id, global_step, epoch, step_in_epoch,
     training_snapshot = _safe_config_snapshot(training_config or {})
     full_snapshot = _safe_config_snapshot(full_config or {})
     raw_snapshot = _safe_config_snapshot(raw_config or {})
+    full_config_sha256 = _config_sha256(full_snapshot)
     if consumed_examples is None or consumed_tokens is None:
         inferred_examples, inferred_tokens = _checkpoint_consumed_counts(
             global_step, training_snapshot, full_snapshot, model_snapshot)
@@ -6172,6 +6188,8 @@ def _build_orbax_metadata(run_id, global_step, epoch, step_in_epoch,
         'model_config': model_snapshot,
         'training_config': training_snapshot,
         'full_config': full_snapshot,
+        'full_config_sha256': full_config_sha256,
+        'selected_full_config_sha256': full_config_sha256,
         'raw_config': raw_snapshot,
         'config_path': str(config_path),
     }
@@ -10436,10 +10454,42 @@ def main():
                 print(_line, flush=True)
 
     raw_config_snapshot = _safe_config_snapshot(raw_cfg_snapshot)
-    full_config_snapshot = _materialized_config_snapshot(cfg, training_config)
+    if _has_resume_checkpoint:
+        full_config_snapshot = _safe_config_snapshot(saved_full_config)
+        current_materialized_config_snapshot = _materialized_config_snapshot(
+            current_yaml_config_snapshot,
+            (current_yaml_config_snapshot.get('training', {})
+             if isinstance(current_yaml_config_snapshot, dict)
+             else {}))
+    else:
+        full_config_snapshot = _materialized_config_snapshot(
+            cfg, training_config)
+        current_materialized_config_snapshot = full_config_snapshot
+    selected_full_config_sha256 = _config_sha256(full_config_snapshot)
+    current_materialized_config_sha256 = _config_sha256(
+        current_materialized_config_snapshot)
+    checkpoint_full_config_sha256 = (
+        _config_sha256(saved_full_config)
+        if _has_resume_checkpoint and saved_full_config is not None
+        else None)
 
     # Save config snapshots for this run (host 0 only)
     if is_host0:
+        if _has_resume_checkpoint:
+            print(
+                "Config hash: "
+                f"selected_full_config_sha256={selected_full_config_sha256} "
+                f"checkpoint_full_config_sha256={checkpoint_full_config_sha256} "
+                "current_materialized_config_sha256="
+                f"{current_materialized_config_sha256}",
+                flush=True,
+            )
+        else:
+            print(
+                "Config hash: "
+                f"selected_full_config_sha256={selected_full_config_sha256}",
+                flush=True,
+            )
         if _has_resume_checkpoint:
             try:
                 session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -10458,13 +10508,20 @@ def main():
                     'resume_config_fallback': 'disabled',
                     'checkpoint_raw_config_present':
                         saved_raw_config is not None,
+                    'current_materialized_config_sha256':
+                        current_materialized_config_sha256,
+                    'checkpoint_full_config_sha256':
+                        checkpoint_full_config_sha256,
+                    'selected_full_config_sha256':
+                        selected_full_config_sha256,
                     'current_yaml_config':
                         _safe_config_snapshot(current_yaml_config_snapshot),
                     'checkpoint_full_config':
                         _safe_config_snapshot(saved_full_config),
                     'selected_full_config': full_config_snapshot,
                     'current_raw_config': raw_config_snapshot,
-                    'current_materialized_config': full_config_snapshot,
+                    'current_materialized_config':
+                        current_materialized_config_snapshot,
                 }
                 _write_json_file(session_path, session_cfg)
                 print(f"  Saved resume session config snapshot: {session_path}")
@@ -10488,6 +10545,10 @@ def main():
                     'timestamp': datetime.now().isoformat(),
                     'config_path': str(config_path),
                     'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION,
+                    'current_materialized_config_sha256':
+                        current_materialized_config_sha256,
+                    'selected_full_config_sha256':
+                        selected_full_config_sha256,
                 }
                 _write_json_file(cj_path, config_record_snapshot)
                 print(f"  Saved config.json: {cj_path}")
