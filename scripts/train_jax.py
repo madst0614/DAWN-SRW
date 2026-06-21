@@ -5816,54 +5816,65 @@ def _parse_orbax_resume_target(resume_from):
     return target, None
 
 
-def _latest_orbax_step_for_run(run_folder):
+def _orbax_step_from_path_name(name):
+    """Return int step if name is a valid Orbax numeric step dir, else None."""
+    name = str(name).rstrip('/\\')
+    name = name.replace('\\', '/').rsplit('/', 1)[-1]
+    if not name:
+        return None
+    if name.isdigit():
+        return int(name)
+    return None
+
+
+def _list_orbax_steps_for_run(run_folder):
+    """List Orbax checkpoint steps without constructing an Orbax manager.
+
+    This is safe for host0-only discovery because it performs only
+    filesystem/GCS listing and does not enter Orbax/JAX multihost barriers.
+    """
+    ckpt_dir = _join_path(run_folder, 'checkpoints')
     try:
-        manager = _create_orbax_checkpoint_manager(
-            _join_path(run_folder, 'checkpoints'),
-            create=False,
-            read_only=True,
-        )
+        entries = _list_files(ckpt_dir, '*')
     except Exception as exc:
-        if _is_orbax_missing_dir_error(exc):
-            if jax.process_index() == 0:
-                print(
-                    "Skipping run without readable Orbax checkpoints: "
-                    f"{run_folder}",
-                    flush=True,
-                )
-            return None
+        msg = str(exc).lower()
+        missing_dir_error = (
+            'not found' in msg
+            or 'no such' in msg
+            or 'does not exist' in msg
+            or '404' in msg
+        )
+        if missing_dir_error or _is_orbax_missing_dir_error(exc):
+            return []
         raise
-    try:
-        latest = manager.latest_step()
-        return None if latest is None else int(latest)
-    finally:
-        manager.close()
+
+    steps = []
+    for path in entries:
+        step = _orbax_step_from_path_name(_path_name(path))
+        if step is not None:
+            steps.append(step)
+    return sorted(set(steps))
+
+
+def _latest_orbax_step_for_run(run_folder):
+    """Return latest checkpoint step using filesystem listing only."""
+    steps = _list_orbax_steps_for_run(run_folder)
+    return steps[-1] if steps else None
 
 
 def _resolve_orbax_resume_from(resume_from):
     run_folder, requested_step = _parse_orbax_resume_target(resume_from)
     if run_folder is None:
         return None, None, False
-    try:
-        manager = _create_orbax_checkpoint_manager(
-            _join_path(run_folder, 'checkpoints'),
-            create=False,
-            read_only=True,
-        )
-    except Exception as exc:
-        if _is_orbax_missing_dir_error(exc):
-            return run_folder, requested_step, False
-        raise
-    try:
-        if requested_step is not None:
-            steps = {int(s) for s in manager.all_steps(read=True)}
-            return run_folder, int(requested_step), int(requested_step) in steps
-        latest = manager.latest_step()
-        if latest is None:
-            return run_folder, None, False
-        return run_folder, int(latest), True
-    finally:
-        manager.close()
+    steps = _list_orbax_steps_for_run(run_folder)
+    step_set = set(steps)
+
+    if requested_step is not None:
+        requested_step = int(requested_step)
+        return run_folder, requested_step, requested_step in step_set
+    if not steps:
+        return run_folder, None, False
+    return run_folder, int(steps[-1]), True
 
 
 def _composite_item(restored, name):
@@ -8871,8 +8882,18 @@ def main():
                         f"{configured_resume_from}")
             else:
                 run_folders = _list_run_folders(base_checkpoint_dir)
+                print(
+                    "Auto-resume discovery: scanning checkpoint step "
+                    "directories by filesystem listing.",
+                    flush=True,
+                )
                 for folder in reversed(run_folders):
                     selected_step = _latest_orbax_step_for_run(folder)
+                    print(
+                        "Auto-resume discovery: "
+                        f"folder={folder} latest_step={selected_step}",
+                        flush=True,
+                    )
                     if selected_step is not None:
                         _host0_resume_path = folder
                         _host0_checkpoint_dir = folder
