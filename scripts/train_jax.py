@@ -322,14 +322,14 @@ UPDATE_CAP_GROUP_SPECS = (
     ('proj_rst', 'pR', 'update_cap_proj_rst_hit',
      'update_cap_proj_rst_ratio_pre', 'update_cap_proj_rst_scale',
      'ratio_pre'),
-    ('emb_qk', 'eQ', 'update_cap_emb_qk_hit',
-     'update_cap_emb_qk_ratio_pre', 'update_cap_emb_qk_scale',
+    ('op_key_qk', 'oQ', 'update_cap_op_key_qk_hit',
+     'update_cap_op_key_qk_ratio_pre', 'update_cap_op_key_qk_scale',
      'ratio_pre'),
-    ('emb_v', 'eV', 'update_cap_emb_v_hit',
-     'update_cap_emb_v_ratio_pre', 'update_cap_emb_v_scale',
+    ('op_key_v', 'oV', 'update_cap_op_key_v_hit',
+     'update_cap_op_key_v_ratio_pre', 'update_cap_op_key_v_scale',
      'ratio_pre'),
-    ('emb_rst', 'eR', 'update_cap_emb_rst_hit',
-     'update_cap_emb_rst_ratio_pre', 'update_cap_emb_rst_scale',
+    ('op_key_rst', 'oR', 'update_cap_op_key_rst_hit',
+     'update_cap_op_key_rst_ratio_pre', 'update_cap_op_key_rst_scale',
      'ratio_pre'),
     ('tau_attn', 'tA', 'update_cap_tau_attn_hit',
      'update_cap_tau_attn_abs_pre', 'update_cap_tau_attn_scale',
@@ -946,14 +946,14 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
     }
     if version == V4166_MODEL_VERSION:
         score_params['router'].update({
-            'q_op_query_factor_proj':
-                params['router']['q_op_query_factor_proj'],
-            'k_op_query_factor_proj':
-                params['router']['k_op_query_factor_proj'],
-            'v_op_query_factor_proj':
-                params['router']['v_op_query_factor_proj'],
-            'rst_op_query_factor_proj':
-                params['router']['rst_op_query_factor_proj'],
+            'q_op_write_query_proj':
+                params['router']['q_op_write_query_proj'],
+            'k_op_write_query_proj':
+                params['router']['k_op_write_query_proj'],
+            'v_op_write_query_proj':
+                params['router']['v_op_write_query_proj'],
+            'rst_op_write_query_proj':
+                params['router']['rst_op_write_query_proj'],
         })
     score_kwargs = {
         'max_tokens': int(max_tokens),
@@ -2948,6 +2948,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_soft_direct_tau = _is_active_srw_version(_model_version)
+    _is_v4166_model = str(_model_version) == V4166_MODEL_VERSION
     _is_boundary_power_model = _is_active_srw_version(_model_version)
     if _is_soft_direct_tau:
         # Official v4164 train path keeps the soft DirectTau loss surface.
@@ -3027,7 +3028,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
-                   prev_emb_snap, step):
+                   prev_op_key_snap, step):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
 
         def loss_fn(params):
@@ -3662,10 +3663,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _is_router_proj_path(ps):
             return (('router/proj_attn' in ps)
                     or ('router/proj_rst' in ps)
-                    or ('router/q_op_query_factor_proj' in ps)
-                    or ('router/k_op_query_factor_proj' in ps)
-                    or ('router/v_op_query_factor_proj' in ps)
-                    or ('router/rst_op_query_factor_proj' in ps))
+                    or ('router/q_op_write_query_proj' in ps)
+                    or ('router/k_op_write_query_proj' in ps)
+                    or ('router/v_op_write_query_proj' in ps)
+                    or ('router/rst_op_write_query_proj' in ps))
 
         def _is_router_scan_path(ps):
             return (('router/raw_scan_offset_attn' in ps)
@@ -3673,7 +3674,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('router/scan_attn' in ps)
                     or ('router/scan_rst' in ps))
 
-        def _is_route_emb_path(ps):
+        def _is_legacy_operator_key_path(ps):
             return (('neuron_pool/attn_qk_emb' in ps)
                     or ('neuron_pool/attn_v_emb' in ps)
                     or ('neuron_pool/rst_emb' in ps)
@@ -3691,27 +3692,27 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         def _is_router_proj_attn_path(ps):
             return (('router/proj_attn' in ps)
-                    or ('router/q_op_query_factor_proj' in ps)
-                    or ('router/k_op_query_factor_proj' in ps)
-                    or ('router/v_op_query_factor_proj' in ps))
+                    or ('router/q_op_write_query_proj' in ps)
+                    or ('router/k_op_write_query_proj' in ps)
+                    or ('router/v_op_write_query_proj' in ps))
 
         def _is_router_proj_rst_path(ps):
             return (('router/proj_rst' in ps)
-                    or ('router/rst_op_query_factor_proj' in ps))
+                    or ('router/rst_op_write_query_proj' in ps))
 
-        def _is_route_emb_qk_path(ps):
+        def _is_op_key_qk_path(ps):
             return (('neuron_pool/attn_qk_emb' in ps)
                     or ('neuron_pool/qk_emb' in ps)
                     or ('neuron_pool/attn_qk_op_read_proj' in ps)
                     or ('neuron_pool/attn_qk_op_write_proj' in ps))
 
-        def _is_route_emb_v_path(ps):
+        def _is_op_key_v_path(ps):
             return (('neuron_pool/attn_v_emb' in ps)
                     or ('neuron_pool/v_emb' in ps)
                     or ('neuron_pool/attn_v_op_read_proj' in ps)
                     or ('neuron_pool/attn_v_op_write_proj' in ps))
 
-        def _is_route_emb_rst_path(ps):
+        def _is_op_key_rst_path(ps):
             return (('neuron_pool/rst_emb' in ps)
                     or ('neuron_pool/know_emb' in ps)
                     or ('neuron_pool/rst_op_read_proj' in ps)
@@ -3818,7 +3819,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         router_scan_grad_norm_raw = jnp.sqrt(
             _group_sq(grads, _is_router_scan_path) + 1e-12)
         route_emb_grad_norm_raw = jnp.sqrt(
-            _group_sq(grads, _is_route_emb_path) + 1e-12)
+            _group_sq(grads, _is_legacy_operator_key_path) + 1e-12)
         op_key_grad_norm_raw = jnp.sqrt(
             _group_sq(grads, _is_op_key_proj_path) + 1e-12)
 
@@ -3838,7 +3839,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             scale = jnp.where(_is_tau_path(ps), tau_clip_scale, scale)
             scale = jnp.where(_is_router_proj_path(ps), router_proj_clip_scale, scale)
             scale = jnp.where(_is_router_scan_path(ps), router_scan_clip_scale, scale)
-            scale = jnp.where(_is_route_emb_path(ps), route_emb_clip_scale, scale)
+            scale = jnp.where(
+                _is_legacy_operator_key_path(ps), route_emb_clip_scale, scale)
             scale = jnp.where(_is_op_key_proj_path(ps), op_key_clip_scale, scale)
             return g * scale.astype(g.dtype)
 
@@ -3857,7 +3859,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             mult = jnp.where(_is_tau_path(ps), _tau_lr_mult, mult)
             mult = jnp.where(_is_router_proj_path(ps), _router_proj_lr_mult, mult)
             mult = jnp.where(_is_router_scan_path(ps), _router_scan_lr_mult, mult)
-            mult = jnp.where(_is_route_emb_path(ps), _route_emb_lr_mult, mult)
+            mult = jnp.where(
+                _is_legacy_operator_key_path(ps), _route_emb_lr_mult, mult)
             mult = jnp.where(_is_op_key_proj_path(ps), _op_key_lr_mult, mult)
             return u * mult.astype(u.dtype)
 
@@ -3927,17 +3930,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
              upd_proj_rst_scale, upd_proj_rst_hit) = _ratio_cap_stats(
                 params, updates, _is_router_proj_rst_path,
                 _router_proj_update_ratio_cap)
-            (upd_emb_qk_ratio_pre, upd_emb_qk_ratio_post,
-             upd_emb_qk_scale, upd_emb_qk_hit) = _ratio_cap_stats(
-                params, updates, _is_route_emb_qk_path,
+            (upd_op_key_qk_ratio_pre, upd_op_key_qk_ratio_post,
+             upd_op_key_qk_scale, upd_op_key_qk_hit) = _ratio_cap_stats(
+                params, updates, _is_op_key_qk_path,
                 _route_emb_update_ratio_cap)
-            (upd_emb_v_ratio_pre, upd_emb_v_ratio_post,
-             upd_emb_v_scale, upd_emb_v_hit) = _ratio_cap_stats(
-                params, updates, _is_route_emb_v_path,
+            (upd_op_key_v_ratio_pre, upd_op_key_v_ratio_post,
+             upd_op_key_v_scale, upd_op_key_v_hit) = _ratio_cap_stats(
+                params, updates, _is_op_key_v_path,
                 _route_emb_update_ratio_cap)
-            (upd_emb_rst_ratio_pre, upd_emb_rst_ratio_post,
-             upd_emb_rst_scale, upd_emb_rst_hit) = _ratio_cap_stats(
-                params, updates, _is_route_emb_rst_path,
+            (upd_op_key_rst_ratio_pre, upd_op_key_rst_ratio_post,
+             upd_op_key_rst_scale, upd_op_key_rst_hit) = _ratio_cap_stats(
+                params, updates, _is_op_key_rst_path,
                 _route_emb_update_ratio_cap)
             (upd_tau_attn_abs_pre, upd_tau_attn_abs_post,
              upd_tau_attn_scale, upd_tau_attn_hit) = _abs_cap_stats(
@@ -3997,9 +4000,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 scale = jnp.float32(1.0)
                 scale = jnp.where(_is_router_proj_attn_path(ps), upd_proj_attn_scale, scale)
                 scale = jnp.where(_is_router_proj_rst_path(ps), upd_proj_rst_scale, scale)
-                scale = jnp.where(_is_route_emb_qk_path(ps), upd_emb_qk_scale, scale)
-                scale = jnp.where(_is_route_emb_v_path(ps), upd_emb_v_scale, scale)
-                scale = jnp.where(_is_route_emb_rst_path(ps), upd_emb_rst_scale, scale)
+                scale = jnp.where(_is_op_key_qk_path(ps), upd_op_key_qk_scale, scale)
+                scale = jnp.where(_is_op_key_v_path(ps), upd_op_key_v_scale, scale)
+                scale = jnp.where(_is_op_key_rst_path(ps), upd_op_key_rst_scale, scale)
                 scale = jnp.where(_is_tau_attn_bias_path(ps), upd_tau_attn_scale, scale)
                 scale = jnp.where(_is_tau_rst_bias_path(ps), upd_tau_rst_scale, scale)
                 scale = jnp.where(_is_scan_attn_path(ps), upd_scan_attn_scale, scale)
@@ -4014,15 +4017,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             upd_proj_rst_ratio_pre = upd_proj_rst_ratio_post = jnp.float32(0.0)
             upd_proj_rst_scale = jnp.float32(1.0)
             upd_proj_rst_hit = jnp.float32(0.0)
-            upd_emb_qk_ratio_pre = upd_emb_qk_ratio_post = jnp.float32(0.0)
-            upd_emb_qk_scale = jnp.float32(1.0)
-            upd_emb_qk_hit = jnp.float32(0.0)
-            upd_emb_v_ratio_pre = upd_emb_v_ratio_post = jnp.float32(0.0)
-            upd_emb_v_scale = jnp.float32(1.0)
-            upd_emb_v_hit = jnp.float32(0.0)
-            upd_emb_rst_ratio_pre = upd_emb_rst_ratio_post = jnp.float32(0.0)
-            upd_emb_rst_scale = jnp.float32(1.0)
-            upd_emb_rst_hit = jnp.float32(0.0)
+            upd_op_key_qk_ratio_pre = upd_op_key_qk_ratio_post = jnp.float32(0.0)
+            upd_op_key_qk_scale = jnp.float32(1.0)
+            upd_op_key_qk_hit = jnp.float32(0.0)
+            upd_op_key_v_ratio_pre = upd_op_key_v_ratio_post = jnp.float32(0.0)
+            upd_op_key_v_scale = jnp.float32(1.0)
+            upd_op_key_v_hit = jnp.float32(0.0)
+            upd_op_key_rst_ratio_pre = upd_op_key_rst_ratio_post = jnp.float32(0.0)
+            upd_op_key_rst_scale = jnp.float32(1.0)
+            upd_op_key_rst_hit = jnp.float32(0.0)
             upd_tau_attn_abs_pre = upd_tau_attn_abs_post = jnp.float32(0.0)
             upd_tau_attn_scale = jnp.float32(1.0)
             upd_tau_attn_hit = jnp.float32(0.0)
@@ -4078,12 +4081,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _gpool = grads.get('neuron_pool', {})
         grad_router_proj_attn = (
             _child_norm(_grouter, 'proj_attn')
-            + _child_norm(_grouter, 'q_op_query_factor_proj')
-            + _child_norm(_grouter, 'k_op_query_factor_proj')
-            + _child_norm(_grouter, 'v_op_query_factor_proj'))
+            + _child_norm(_grouter, 'q_op_write_query_proj')
+            + _child_norm(_grouter, 'k_op_write_query_proj')
+            + _child_norm(_grouter, 'v_op_write_query_proj'))
         grad_router_proj_rst = (
             _child_norm(_grouter, 'proj_rst')
-            + _child_norm(_grouter, 'rst_op_query_factor_proj'))
+            + _child_norm(_grouter, 'rst_op_write_query_proj'))
         grad_router_raw_tau_qk = jnp.sqrt(
             _raw_tau_component_sq(grads, 'qk') + 1e-12)
         grad_router_raw_tau_v = jnp.sqrt(
@@ -4201,8 +4204,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             grad_router_scan_attn + grad_router_scan_rst)
         grad_pool_emb = (
             grad_pool_attn_qk_emb + grad_pool_attn_v_emb
-            + grad_pool_rst_emb + grad_pool_attn_qk_op_key
-            + grad_pool_attn_v_op_key + grad_pool_rst_op_key)
+            + grad_pool_rst_emb)
+        grad_pool_op_key = (
+            grad_pool_attn_qk_op_key + grad_pool_attn_v_op_key
+            + grad_pool_rst_op_key)
         grad_pool_read = (
             grad_pool_attn_qk_read + grad_pool_attn_v_read
             + grad_pool_rst_read)
@@ -4235,12 +4240,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             pool_diag = {}
             pool_update_diag = {}
 
-        # Emb drift is diagnostic-only.  It is computed inside jit when enabled so
+        # Operator-key drift is diagnostic-only. It is computed inside jit so
         # every host participates in the same reductions on multi-host meshes.
         if 'neuron_pool' not in new_params:
-            drift_attn_qk_emb = jnp.float32(0.0)
-            drift_attn_v_emb = jnp.float32(0.0)
-            drift_rst_emb = jnp.float32(0.0)
+            drift_attn_qk_op_key = jnp.float32(0.0)
+            drift_attn_v_op_key = jnp.float32(0.0)
+            drift_rst_op_key = jnp.float32(0.0)
         else:
             _pool = new_params['neuron_pool']
             if 'attn_qk_op_read_proj' in _pool:
@@ -4279,15 +4284,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _cur_qk = _pool['q_read']
                 _cur_v = _pool['v_read']
                 _cur_rst = _pool['rst_read']
-            _prev_qk = prev_emb_snap['attn_qk_emb']
-            _prev_v = prev_emb_snap['attn_v_emb']
-            _prev_rst = prev_emb_snap['rst_emb']
-            drift_attn_qk_emb = (jnp.linalg.norm(_cur_qk - _prev_qk)
+            _prev_qk = prev_op_key_snap['attn_qk_op_key']
+            _prev_v = prev_op_key_snap['attn_v_op_key']
+            _prev_rst = prev_op_key_snap['rst_op_key']
+            drift_attn_qk_op_key = (jnp.linalg.norm(_cur_qk - _prev_qk)
                             / (jnp.linalg.norm(_prev_qk) + 1e-8))
-            drift_attn_v_emb = (jnp.linalg.norm(_cur_v - _prev_v)
+            drift_attn_v_op_key = (jnp.linalg.norm(_cur_v - _prev_v)
                            / (jnp.linalg.norm(_prev_v) + 1e-8))
-            drift_rst_emb = (jnp.linalg.norm(_cur_rst - _prev_rst)
-                              / (jnp.linalg.norm(_prev_rst) + 1e-8))
+            drift_rst_op_key = (jnp.linalg.norm(_cur_rst - _prev_rst)
+                                / (jnp.linalg.norm(_prev_rst) + 1e-8))
+        drift_attn_qk_emb = (
+            jnp.float32(0.0) if _is_v4166_model else drift_attn_qk_op_key)
+        drift_attn_v_emb = (
+            jnp.float32(0.0) if _is_v4166_model else drift_attn_v_op_key)
+        drift_rst_emb = (
+            jnp.float32(0.0) if _is_v4166_model else drift_rst_op_key)
 
         # Tau / scan-offset parameters (read inside jit -safe, no cross-device issue)
         tau_rst_b = params.get('router', {}).get(
@@ -4545,6 +4556,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_router_tau': grad_router_tau,
             'grad_router_scan': grad_router_scan,
             'grad_pool_emb': grad_pool_emb,
+            'grad_pool_op_key': grad_pool_op_key,
             'grad_pool_read': grad_pool_read,
             'grad_pool_write': grad_pool_write,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
@@ -4913,13 +4925,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_act_cost_mean': result.get('rst_act_cost_mean', jnp.float32(0.0)),
             'attn_current_cost_mean': result.get('attn_current_cost_mean', jnp.float32(0.0)),
             'rst_current_cost_mean': result.get('rst_current_cost_mean', jnp.float32(0.0)),
-            # Emb drift (relative L2) since prev snapshot -see top of fn.
+            # Operator-key drift (relative L2) since prev snapshot.
             'drift_attn_qk_emb': drift_attn_qk_emb,
             'drift_attn_v_emb': drift_attn_v_emb,
             'drift_rst_emb': drift_rst_emb,
-            'drift_attn_qk_op_key': drift_attn_qk_emb,
-            'drift_attn_v_op_key': drift_attn_v_emb,
-            'drift_rst_op_key': drift_rst_emb,
+            'drift_attn_qk_op_key': drift_attn_qk_op_key,
+            'drift_attn_v_op_key': drift_attn_v_op_key,
+            'drift_rst_op_key': drift_rst_op_key,
             # Actual post-Adam control update caps. *_pre are measured after
             # LR multipliers and before capping; *_post are after cap scaling.
             'update_cap_proj_attn_ratio_pre': upd_proj_attn_ratio_pre,
@@ -4930,18 +4942,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'update_cap_proj_rst_ratio_post': upd_proj_rst_ratio_post,
             'update_cap_proj_rst_scale': upd_proj_rst_scale,
             'update_cap_proj_rst_hit': upd_proj_rst_hit,
-            'update_cap_emb_qk_ratio_pre': upd_emb_qk_ratio_pre,
-            'update_cap_emb_qk_ratio_post': upd_emb_qk_ratio_post,
-            'update_cap_emb_qk_scale': upd_emb_qk_scale,
-            'update_cap_emb_qk_hit': upd_emb_qk_hit,
-            'update_cap_emb_v_ratio_pre': upd_emb_v_ratio_pre,
-            'update_cap_emb_v_ratio_post': upd_emb_v_ratio_post,
-            'update_cap_emb_v_scale': upd_emb_v_scale,
-            'update_cap_emb_v_hit': upd_emb_v_hit,
-            'update_cap_emb_rst_ratio_pre': upd_emb_rst_ratio_pre,
-            'update_cap_emb_rst_ratio_post': upd_emb_rst_ratio_post,
-            'update_cap_emb_rst_scale': upd_emb_rst_scale,
-            'update_cap_emb_rst_hit': upd_emb_rst_hit,
+            'update_cap_op_key_qk_ratio_pre': upd_op_key_qk_ratio_pre,
+            'update_cap_op_key_qk_ratio_post': upd_op_key_qk_ratio_post,
+            'update_cap_op_key_qk_scale': upd_op_key_qk_scale,
+            'update_cap_op_key_qk_hit': upd_op_key_qk_hit,
+            'update_cap_op_key_v_ratio_pre': upd_op_key_v_ratio_pre,
+            'update_cap_op_key_v_ratio_post': upd_op_key_v_ratio_post,
+            'update_cap_op_key_v_scale': upd_op_key_v_scale,
+            'update_cap_op_key_v_hit': upd_op_key_v_hit,
+            'update_cap_op_key_rst_ratio_pre': upd_op_key_rst_ratio_pre,
+            'update_cap_op_key_rst_ratio_post': upd_op_key_rst_ratio_post,
+            'update_cap_op_key_rst_scale': upd_op_key_rst_scale,
+            'update_cap_op_key_rst_hit': upd_op_key_rst_hit,
             'update_cap_tau_attn_abs_pre': upd_tau_attn_abs_pre,
             'update_cap_tau_attn_abs_post': upd_tau_attn_abs_post,
             'update_cap_tau_attn_scale': upd_tau_attn_scale,
@@ -7333,6 +7345,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'grad_router_tau': float(m.get('grad_router_tau', 0.0)),
         'grad_router_scan': float(m.get('grad_router_scan', 0.0)),
         'grad_pool_emb': float(m.get('grad_pool_emb', 0.0)),
+        'grad_pool_op_key': float(m.get('grad_pool_op_key', 0.0)),
         'grad_pool_read': float(m.get('grad_pool_read', 0.0)),
         'grad_pool_write': float(m.get('grad_pool_write', 0.0)),
         'update_cap_proj_attn_ratio_pre': float(m.get('update_cap_proj_attn_ratio_pre', 0.0)),
@@ -7343,18 +7356,18 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'update_cap_proj_rst_ratio_post': float(m.get('update_cap_proj_rst_ratio_post', 0.0)),
         'update_cap_proj_rst_scale': float(m.get('update_cap_proj_rst_scale', 1.0)),
         'update_cap_proj_rst_hit': float(m.get('update_cap_proj_rst_hit', 0.0)),
-        'update_cap_emb_qk_ratio_pre': float(m.get('update_cap_emb_qk_ratio_pre', 0.0)),
-        'update_cap_emb_qk_ratio_post': float(m.get('update_cap_emb_qk_ratio_post', 0.0)),
-        'update_cap_emb_qk_scale': float(m.get('update_cap_emb_qk_scale', 1.0)),
-        'update_cap_emb_qk_hit': float(m.get('update_cap_emb_qk_hit', 0.0)),
-        'update_cap_emb_v_ratio_pre': float(m.get('update_cap_emb_v_ratio_pre', 0.0)),
-        'update_cap_emb_v_ratio_post': float(m.get('update_cap_emb_v_ratio_post', 0.0)),
-        'update_cap_emb_v_scale': float(m.get('update_cap_emb_v_scale', 1.0)),
-        'update_cap_emb_v_hit': float(m.get('update_cap_emb_v_hit', 0.0)),
-        'update_cap_emb_rst_ratio_pre': float(m.get('update_cap_emb_rst_ratio_pre', 0.0)),
-        'update_cap_emb_rst_ratio_post': float(m.get('update_cap_emb_rst_ratio_post', 0.0)),
-        'update_cap_emb_rst_scale': float(m.get('update_cap_emb_rst_scale', 1.0)),
-        'update_cap_emb_rst_hit': float(m.get('update_cap_emb_rst_hit', 0.0)),
+        'update_cap_op_key_qk_ratio_pre': float(m.get('update_cap_op_key_qk_ratio_pre', 0.0)),
+        'update_cap_op_key_qk_ratio_post': float(m.get('update_cap_op_key_qk_ratio_post', 0.0)),
+        'update_cap_op_key_qk_scale': float(m.get('update_cap_op_key_qk_scale', 1.0)),
+        'update_cap_op_key_qk_hit': float(m.get('update_cap_op_key_qk_hit', 0.0)),
+        'update_cap_op_key_v_ratio_pre': float(m.get('update_cap_op_key_v_ratio_pre', 0.0)),
+        'update_cap_op_key_v_ratio_post': float(m.get('update_cap_op_key_v_ratio_post', 0.0)),
+        'update_cap_op_key_v_scale': float(m.get('update_cap_op_key_v_scale', 1.0)),
+        'update_cap_op_key_v_hit': float(m.get('update_cap_op_key_v_hit', 0.0)),
+        'update_cap_op_key_rst_ratio_pre': float(m.get('update_cap_op_key_rst_ratio_pre', 0.0)),
+        'update_cap_op_key_rst_ratio_post': float(m.get('update_cap_op_key_rst_ratio_post', 0.0)),
+        'update_cap_op_key_rst_scale': float(m.get('update_cap_op_key_rst_scale', 1.0)),
+        'update_cap_op_key_rst_hit': float(m.get('update_cap_op_key_rst_hit', 0.0)),
         'update_cap_tau_attn_abs_pre': float(m.get('update_cap_tau_attn_abs_pre', 0.0)),
         'update_cap_tau_attn_abs_post': float(m.get('update_cap_tau_attn_abs_post', 0.0)),
         'update_cap_tau_attn_scale': float(m.get('update_cap_tau_attn_scale', 1.0)),
@@ -8127,9 +8140,9 @@ def _print_regular_block(rec, ctx):
         for _key in (
             'update_cap_proj_attn_hit',
             'update_cap_proj_rst_hit',
-            'update_cap_emb_qk_hit',
-            'update_cap_emb_v_hit',
-            'update_cap_emb_rst_hit',
+            'update_cap_op_key_qk_hit',
+            'update_cap_op_key_v_hit',
+            'update_cap_op_key_rst_hit',
             'update_cap_tau_attn_hit',
             'update_cap_tau_rst_hit',
             'update_cap_raw_tau_qk_hit',
@@ -8141,9 +8154,9 @@ def _print_regular_block(rec, ctx):
     _cap_scale_min = min(
         rec.get('update_cap_proj_attn_scale', 1.0),
         rec.get('update_cap_proj_rst_scale', 1.0),
-        rec.get('update_cap_emb_qk_scale', 1.0),
-        rec.get('update_cap_emb_v_scale', 1.0),
-        rec.get('update_cap_emb_rst_scale', 1.0),
+        rec.get('update_cap_op_key_qk_scale', 1.0),
+        rec.get('update_cap_op_key_v_scale', 1.0),
+        rec.get('update_cap_op_key_rst_scale', 1.0),
         rec.get('update_cap_tau_attn_scale', 1.0),
         rec.get('update_cap_tau_rst_scale', 1.0),
         rec.get('update_cap_raw_tau_qk_scale', 1.0),
@@ -8174,18 +8187,18 @@ def _print_regular_block(rec, ctx):
         log_message(
             f"  update_cap: hit[pA={rec.get('update_cap_proj_attn_hit', 0.0):.0f}"
             f" pR={rec.get('update_cap_proj_rst_hit', 0.0):.0f}"
-            f" eQ={rec.get('update_cap_emb_qk_hit', 0.0):.0f}"
-            f" eV={rec.get('update_cap_emb_v_hit', 0.0):.0f}"
-            f" eR={rec.get('update_cap_emb_rst_hit', 0.0):.0f}"
+            f" oQ={rec.get('update_cap_op_key_qk_hit', 0.0):.0f}"
+            f" oV={rec.get('update_cap_op_key_v_hit', 0.0):.0f}"
+            f" oR={rec.get('update_cap_op_key_rst_hit', 0.0):.0f}"
             f"{raw_tau_hit_part}"
             f" sA={rec.get('update_cap_scan_attn_hit', 0.0):.0f}"
             f" sR={rec.get('update_cap_scan_rst_hit', 0.0):.0f}]"
             f" scale_min={_cap_scale_min:.3f}"
             f" proj_pre[a={rec.get('update_cap_proj_attn_ratio_pre', 0.0):.1e}"
             f" r={rec.get('update_cap_proj_rst_ratio_pre', 0.0):.1e}]"
-            f" {_op_key_cap_pre_label}[q={rec.get('update_cap_emb_qk_ratio_pre', 0.0):.1e}"
-            f" v={rec.get('update_cap_emb_v_ratio_pre', 0.0):.1e}"
-            f" r={rec.get('update_cap_emb_rst_ratio_pre', 0.0):.1e}]"
+            f" {_op_key_cap_pre_label}[q={rec.get('update_cap_op_key_qk_ratio_pre', 0.0):.1e}"
+            f" v={rec.get('update_cap_op_key_v_ratio_pre', 0.0):.1e}"
+            f" r={rec.get('update_cap_op_key_rst_ratio_pre', 0.0):.1e}]"
             f"{raw_tau_part}"
             f" scan_pre[a={rec.get('update_cap_scan_attn_abs_pre', 0.0):.1e}"
             f" r={rec.get('update_cap_scan_rst_abs_pre', 0.0):.1e}]"
@@ -8194,9 +8207,9 @@ def _print_regular_block(rec, ctx):
         log_message(
             f"  update_cap: hit[pA={rec.get('update_cap_proj_attn_hit', 0.0):.0f}"
             f" pR={rec.get('update_cap_proj_rst_hit', 0.0):.0f}"
-            f" eQ={rec.get('update_cap_emb_qk_hit', 0.0):.0f}"
-            f" eV={rec.get('update_cap_emb_v_hit', 0.0):.0f}"
-            f" eR={rec.get('update_cap_emb_rst_hit', 0.0):.0f}"
+            f" oQ={rec.get('update_cap_op_key_qk_hit', 0.0):.0f}"
+            f" oV={rec.get('update_cap_op_key_v_hit', 0.0):.0f}"
+            f" oR={rec.get('update_cap_op_key_rst_hit', 0.0):.0f}"
             f" tA={rec.get('update_cap_tau_attn_hit', 0.0):.0f}"
             f" tR={rec.get('update_cap_tau_rst_hit', 0.0):.0f}"
             f" sA={rec.get('update_cap_scan_attn_hit', 0.0):.0f}"
@@ -8204,9 +8217,9 @@ def _print_regular_block(rec, ctx):
             f" scale_min={_cap_scale_min:.3f}"
             f" proj_pre[a={rec.get('update_cap_proj_attn_ratio_pre', 0.0):.1e}"
             f" r={rec.get('update_cap_proj_rst_ratio_pre', 0.0):.1e}]"
-            f" {_op_key_cap_pre_label}[q={rec.get('update_cap_emb_qk_ratio_pre', 0.0):.1e}"
-            f" v={rec.get('update_cap_emb_v_ratio_pre', 0.0):.1e}"
-            f" r={rec.get('update_cap_emb_rst_ratio_pre', 0.0):.1e}]"
+            f" {_op_key_cap_pre_label}[q={rec.get('update_cap_op_key_qk_ratio_pre', 0.0):.1e}"
+            f" v={rec.get('update_cap_op_key_v_ratio_pre', 0.0):.1e}"
+            f" r={rec.get('update_cap_op_key_rst_ratio_pre', 0.0):.1e}]"
             f" tau_pre[a={rec.get('update_cap_tau_attn_abs_pre', 0.0):.1e}"
             f" r={rec.get('update_cap_tau_rst_abs_pre', 0.0):.1e}]"
             f" scan_pre[a={rec.get('update_cap_scan_attn_abs_pre', 0.0):.1e}"
@@ -10371,7 +10384,7 @@ def main():
         print(f"  Module path: {_model_registry_entry(model_version_cfg)['module']}")
         if model_version_cfg == V4166_MODEL_VERSION:
             print("  v4166 operator path: live-gradient RW keys, "
-                  "fixed factorized product queries")
+                  "RW-matched operator queries")
         print("  Tau parameterization: bounded sigmoid min/max")
         print("  tau = -1 + 2 * sigmoid(raw_tau)")
         print("  Boundary admission: one-sided generalized Gaussian")
@@ -11148,8 +11161,8 @@ def main():
             'geometry_max_sample',
             tcfg.get('heavy_geometry_max_sample', 512))))
 
-    # Initial emb-drift snapshot: pytree of sharded refs matching
-    # params['neuron_pool'][*_emb]. Identity here -drift=0 on first step.
+    # Initial operator-key drift snapshot. Identity here means drift=0 on the
+    # first step; legacy pools use their route embeddings as the signature.
     def _drift_snap(p):
         def _unit(x):
             x = jnp.asarray(x, dtype=jnp.float32)
@@ -11163,42 +11176,42 @@ def main():
         if 'neuron_pool' not in p:
             z = jnp.float32(0.0)
             return {
-                'attn_qk_emb': z,
-                'attn_v_emb': z,
-                'rst_emb': z,
+                'attn_qk_op_key': z,
+                'attn_v_op_key': z,
+                'rst_op_key': z,
             }
 
         pool = p['neuron_pool']
         if 'attn_qk_op_read_proj' in pool:
             return {
-                'attn_qk_emb': _op_key(
+                'attn_qk_op_key': _op_key(
                     pool['attn_qk_read'], pool['attn_qk_write'],
                     pool['attn_qk_op_read_proj'],
                     pool['attn_qk_op_write_proj']),
-                'attn_v_emb': _op_key(
+                'attn_v_op_key': _op_key(
                     pool['attn_v_read'], pool['attn_v_write'],
                     pool['attn_v_op_read_proj'],
                     pool['attn_v_op_write_proj']),
-                'rst_emb': _op_key(
+                'rst_op_key': _op_key(
                     pool['rst_read'], pool['rst_write'],
                     pool['rst_op_read_proj'], pool['rst_op_write_proj']),
             }
         if 'attn_qk_emb' in pool:
             return {
-                'attn_qk_emb': pool['attn_qk_emb'],
-                'attn_v_emb': pool['attn_v_emb'],
-                'rst_emb': pool['rst_emb'],
+                'attn_qk_op_key': pool['attn_qk_emb'],
+                'attn_v_op_key': pool['attn_v_emb'],
+                'rst_op_key': pool['rst_emb'],
             }
         if 'qk_emb' in pool:
             return {
-                'attn_qk_emb': pool['qk_emb'],
-                'attn_v_emb': pool['v_emb'],
-                'rst_emb': pool['rst_emb'],
+                'attn_qk_op_key': pool['qk_emb'],
+                'attn_v_op_key': pool['v_emb'],
+                'rst_op_key': pool['rst_emb'],
             }
         return {
-            'attn_qk_emb': pool['q_read'],
-            'attn_v_emb': pool['v_read'],
-            'rst_emb': pool['rst_read'],
+            'attn_qk_op_key': pool['q_read'],
+            'attn_v_op_key': pool['v_read'],
+            'rst_op_key': pool['rst_read'],
         }
 
     # ----------------------------------------------------------
@@ -11228,13 +11241,13 @@ def main():
             data_sharding, global_shape)
         rng, dummy_step_rng = jax.random.split(rng)
 
-        _dummy_emb_snap = _drift_snap(params)
+        _dummy_op_key_snap = _drift_snap(params)
 
         # First call: JIT compilation (slow)
         jit_start = time.time()
         _dp, _do, dummy_metrics = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_step_rng,
-            _dummy_emb_snap, jnp.asarray(0, jnp.int32))
+            _dummy_op_key_snap, jnp.asarray(0, jnp.int32))
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         jit_loss = float(dummy_metrics['total_loss'])
@@ -11251,7 +11264,7 @@ def main():
             step_start = time.time()
             _dp2, _do2, dummy_metrics2 = train_step_fn(
                 params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
-                _dummy_emb_snap, jnp.asarray(0, jnp.int32))
+                _dummy_op_key_snap, jnp.asarray(0, jnp.int32))
             jax.block_until_ready(dummy_metrics2['total_loss'])
             step_time = time.time() - step_start
         else:
@@ -11370,18 +11383,18 @@ def main():
                 h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
                 h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
                 if model_version == V4166_MODEL_VERSION:
-                    def _factor(q_primary, key):
-                        q_w = x @ router_p[key]
-                        q_w = q_w / (
+                    def _operator_query(read_query, key):
+                        write_query = x @ router_p[key]
+                        write_query = write_query / (
                             jnp.linalg.norm(
-                                q_w, axis=-1, keepdims=True) + 1e-8)
-                        q_op = q_primary * q_w
-                        return q_op / (
+                                write_query, axis=-1, keepdims=True) + 1e-8)
+                        operator_query = read_query * write_query
+                        return operator_query / (
                             jnp.linalg.norm(
-                                q_op, axis=-1, keepdims=True) + 1e-8)
-                    h_Q = _factor(h_Q, 'q_op_query_factor_proj')
-                    h_K = _factor(h_K, 'k_op_query_factor_proj')
-                    h_V = _factor(h_V, 'v_op_query_factor_proj')
+                                operator_query, axis=-1, keepdims=True) + 1e-8)
+                    h_Q = _operator_query(h_Q, 'q_op_write_query_proj')
+                    h_K = _operator_query(h_K, 'k_op_write_query_proj')
+                    h_V = _operator_query(h_V, 'v_op_write_query_proj')
                 tau_all = (x @ router_p.get('tau_attn', router_p.get('raw_tau_attn'))['kernel']
                            + router_p.get('tau_attn', router_p.get('raw_tau_attn'))['bias'])
                 if _uses_scan_offset:
@@ -11464,11 +11477,11 @@ def main():
                 h = (x @ proj_p['kernel'] + proj_p['bias'])
                 h = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
                 if model_version == V4166_MODEL_VERSION:
-                    q_w = x @ router_p['rst_op_query_factor_proj']
-                    q_w = q_w / (
+                    write_query = x @ router_p['rst_op_write_query_proj']
+                    write_query = write_query / (
                         jnp.linalg.norm(
-                            q_w, axis=-1, keepdims=True) + 1e-8)
-                    h = h * q_w
+                            write_query, axis=-1, keepdims=True) + 1e-8)
+                    h = h * write_query
                     h = h / (
                         jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
                 tau_p = _get_param(router_p, 'tau_rst', 'tau_rst')
@@ -11504,13 +11517,13 @@ def main():
                 _v4164_module._pool_params_with_operator_keys(pool_p)
                 if hasattr(_v4164_module, '_pool_params_with_operator_keys')
                 else pool_p)
-            qk_emb = _get_param(
+            qk_op_key = _get_param(
                 pool_select_p, 'attn_qk_op_key',
                 'attn_qk_emb' if 'attn_qk_emb' in pool_select_p else 'qk_emb')
-            v_emb = _get_param(
+            v_op_key = _get_param(
                 pool_select_p, 'attn_v_op_key',
                 'attn_v_emb' if 'attn_v_emb' in pool_select_p else 'v_emb')
-            rst_emb = _get_param(
+            rst_op_key = _get_param(
                 pool_select_p, 'rst_op_key', 'rst_emb')
             qk_read = _get_param(pool_p, 'attn_qk_read', 'qk_read')
             qk_write = _get_param(pool_p, 'attn_qk_write', 'qk_write')
@@ -11518,12 +11531,12 @@ def main():
             v_write = _get_param(pool_p, 'attn_v_write', 'v_write')
             rst_read = _get_param(pool_p, 'rst_read', 'rst_read')
             rst_write = _get_param(pool_p, 'rst_write', 'rst_write')
-            qk_norm = qk_emb / (jnp.linalg.norm(
-                qk_emb, axis=-1, keepdims=True) + 1e-8)
-            v_norm = v_emb / (jnp.linalg.norm(
-                v_emb, axis=-1, keepdims=True) + 1e-8)
-            rst_norm = rst_emb / (jnp.linalg.norm(
-                rst_emb, axis=-1, keepdims=True) + 1e-8)
+            qk_norm = qk_op_key / (jnp.linalg.norm(
+                qk_op_key, axis=-1, keepdims=True) + 1e-8)
+            v_norm = v_op_key / (jnp.linalg.norm(
+                v_op_key, axis=-1, keepdims=True) + 1e-8)
+            rst_norm = rst_op_key / (jnp.linalg.norm(
+                rst_op_key, axis=-1, keepdims=True) + 1e-8)
 
             normed = prof_layernorm(
                 dummy_x, block_p['norm1']['scale'],
@@ -11758,7 +11771,7 @@ def main():
         log_message(f"Parameters: {n_params:,}")
         if model_version_cfg == V4166_MODEL_VERSION:
             log_message("v4166 operator path: live-gradient RW keys, "
-                        "fixed factorized product queries")
+                        "RW-matched operator queries")
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
         log_message(f"Total steps: {total_steps}")
         if tau_init_summary is not None:
@@ -11823,10 +11836,10 @@ def main():
               f" val={val_interval}",
               flush=True)
 
-    # Emb drift snapshot (sense vectors). Held on every host, refreshed at
+    # Operator-key drift snapshot. Held on every host, refreshed at
     # each log event. Fed into train_step so the drift collective runs inside
-    # jit on all hosts; the actual ||쨌|| reductions live there.
-    _prev_emb_snap = _drift_snap(params)
+    # jit on all hosts; the actual norm reductions live there.
+    _prev_op_key_snap = _drift_snap(params)
     _latest_val_dead_stats = None
     _latest_val_dead_step = None
 
@@ -11889,7 +11902,7 @@ def main():
 
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
-                input_ids, attention_mask, step_rng, _prev_emb_snap,
+                input_ids, attention_mask, step_rng, _prev_op_key_snap,
                 jnp.asarray(global_step, jnp.int32))
 
             # Scalar helper kept for log-block use (m_grad etc.).
@@ -11943,10 +11956,10 @@ def main():
             is_regular = (global_step % LOG_REGULAR == 0) or _is_early_log
 
             if is_regular:
-                # Refresh emb-drift snapshot on every host (ref reassignment
+                # Refresh op-key drift snapshot on every host (ref reassignment
                 # only -no collective). Must run outside is_host0 so the
                 # next jit'd train_step sees a consistent snap pytree.
-                _prev_emb_snap = _drift_snap(params)
+                _prev_op_key_snap = _drift_snap(params)
                 _raw_step_time_window = time.time() - win_start_time
                 _regular_logging_t0 = time.time()
                 # One TPU-to-CPU sync for the whole window.

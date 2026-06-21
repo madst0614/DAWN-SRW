@@ -8,7 +8,7 @@ Implemented concepts:
 - one-sided generalized Gaussian boundary DirectTau admission
 - boundary-relative drive RW composition
 - RW-derived live-gradient operator-key selection
-- fixed factorized product operator queries
+- RW-matched operator queries
 - scheduled soft-gate boundary-scale input
 - scheduled boundary power input
 - tau movement controlled by optimizer-side tau_lr_mult
@@ -307,19 +307,20 @@ def _forward_unit_direction(x):
                 + RW_FORWARD_NORM_EPS)
 
 
-def _factorized_operator_query(q_primary, h, q_factor_proj, eps=1e-6):
-    q_r = q_primary.astype(jnp.float32)
-    q_r = q_r / (
-        jnp.linalg.norm(q_r, axis=-1, keepdims=True) + eps)
+def _read_write_operator_query(read_query, x, write_query_proj, eps=1e-6):
+    """RW-matched read-query x write-query signature for selection."""
+    read_query = read_query.astype(jnp.float32)
+    read_query = read_query / (
+        jnp.linalg.norm(read_query, axis=-1, keepdims=True) + eps)
 
-    q_w = h.astype(jnp.float32) @ q_factor_proj
-    q_w = q_w / (
-        jnp.linalg.norm(q_w, axis=-1, keepdims=True) + eps)
+    write_query = x.astype(jnp.float32) @ write_query_proj
+    write_query = write_query / (
+        jnp.linalg.norm(write_query, axis=-1, keepdims=True) + eps)
 
-    q_op = q_r * q_w
-    q_op = q_op / (
-        jnp.linalg.norm(q_op, axis=-1, keepdims=True) + eps)
-    return q_op.astype(jnp.float32)
+    operator_query = read_query * write_query
+    operator_query = operator_query / (
+        jnp.linalg.norm(operator_query, axis=-1, keepdims=True) + eps)
+    return operator_query.astype(jnp.float32)
 
 
 def _rw_operator_key(read, write, read_proj, write_proj, *, eps=1e-6):
@@ -2323,17 +2324,25 @@ class Router(nn.Module):
             dtype=jnp.float32)
         raw_tau_rst_bias_init = jnp.asarray(
             _raw_tau_init_from_cosine_tau(rst_tau_init), dtype=jnp.float32)
-        self.proj_attn = nn.Dense(db * 3, name='proj_attn')
-        self.proj_rst = nn.Dense(db, name='proj_rst')
-        factor_init = nn.initializers.lecun_normal()
-        self.q_op_query_factor_proj = self.param(
-            'q_op_query_factor_proj', factor_init, (dm, db))
-        self.k_op_query_factor_proj = self.param(
-            'k_op_query_factor_proj', factor_init, (dm, db))
-        self.v_op_query_factor_proj = self.param(
-            'v_op_query_factor_proj', factor_init, (dm, db))
-        self.rst_op_query_factor_proj = self.param(
-            'rst_op_query_factor_proj', factor_init, (dm, db))
+        query_proj_init = nn.initializers.orthogonal(scale=1.0)
+        self.proj_attn = nn.Dense(
+            db * 3,
+            name='proj_attn',
+            kernel_init=query_proj_init,
+            bias_init=nn.initializers.zeros)
+        self.proj_rst = nn.Dense(
+            db,
+            name='proj_rst',
+            kernel_init=query_proj_init,
+            bias_init=nn.initializers.zeros)
+        self.q_op_write_query_proj = self.param(
+            'q_op_write_query_proj', query_proj_init, (dm, db))
+        self.k_op_write_query_proj = self.param(
+            'k_op_write_query_proj', query_proj_init, (dm, db))
+        self.v_op_write_query_proj = self.param(
+            'v_op_write_query_proj', query_proj_init, (dm, db))
+        self.rst_op_write_query_proj = self.param(
+            'rst_op_write_query_proj', query_proj_init, (dm, db))
         self.raw_tau_attn = nn.Dense(3, name='raw_tau_attn',
             kernel_init=nn.initializers.zeros,
             bias_init=lambda k, s, d: raw_tau_attn_bias_init.astype(d))
@@ -2398,15 +2407,21 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         attn_v_op_key_norm_max = _v_op_key_norms.max()
 
     rng, rng_drop = jax.random.split(rng)
-    h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
-    h_all = safe_dropout(h_all, router_dropout, deterministic, rng_drop)
-    h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-    h_Q = _factorized_operator_query(
-        h_Q, x, router_params['q_op_query_factor_proj'])
-    h_K = _factorized_operator_query(
-        h_K, x, router_params['k_op_query_factor_proj'])
-    h_V = _factorized_operator_query(
-        h_V, x, router_params['v_op_query_factor_proj'])
+    # read-query side: state-conditioned condition/read demand.
+    attn_read_query = (
+        x @ router_params['proj_attn']['kernel']
+        + router_params['proj_attn']['bias'])
+    attn_read_query = safe_dropout(
+        attn_read_query, router_dropout, deterministic, rng_drop)
+    q_read_query, k_read_query, v_read_query = jnp.split(
+        attn_read_query, 3, axis=-1)
+    # operator query: RW-matched read-query x write-query signature.
+    h_Q = _read_write_operator_query(
+        q_read_query, x, router_params['q_op_write_query_proj'])
+    h_K = _read_write_operator_query(
+        k_read_query, x, router_params['k_op_write_query_proj'])
+    h_V = _read_write_operator_query(
+        v_read_query, x, router_params['v_op_write_query_proj'])
 
     raw_tau_all = (
         x @ router_params['raw_tau_attn']['kernel']
@@ -2786,10 +2801,13 @@ def _rst_forward(x, pool_params, router_params, rng,
     rst_write = pool_params['rst_write']
 
     rng, rng_drop = jax.random.split(rng)
-    h = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
-    h = safe_dropout(h, router_dropout, deterministic, rng_drop)
-    h = _factorized_operator_query(
-        h, x, router_params['rst_op_query_factor_proj'])
+    rst_read_query = (
+        x @ router_params['proj_rst']['kernel']
+        + router_params['proj_rst']['bias'])
+    rst_read_query = safe_dropout(
+        rst_read_query, router_dropout, deterministic, rng_drop)
+    h = _read_write_operator_query(
+        rst_read_query, x, router_params['rst_op_write_query_proj'])
 
     # RW-derived operator keys are passed into the sharded SRW closure.
     # The closure forward-normalizes them for selection stability.
@@ -4067,7 +4085,7 @@ class DAWN_SRW_V4166(nn.Module):
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  Attention-QK: {self.n_qk}, Attention-V: {self.n_v}, RST: {n_rst_eff}",
             "  Selection: live-gradient RW operator keys with fixed "
-            "factorized product queries",
+            "RW-matched operator queries",
             "  Pool scales: fixed depth-scaled "
             f"(qk={float(qk_scale):.6g}, v={float(v_scale):.6g}, "
             f"rst={float(rst_scale):.6g})",
@@ -4119,7 +4137,7 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
 
     The sample uses the first block's freshly initialized normalized route
     states and the shared v4166 router/pool parameters. Rho follows the
-    train path exactly: fixed factorized product queries against live-gradient
+    train path exactly: RW-matched operator queries against live-gradient
     RW-derived operator keys.
     """
     max_tokens = int(max_tokens)
@@ -4151,21 +4169,22 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
     rst_x = _layer_norm(
         x, block0['norm2']['scale'], block0['norm2']['bias'])
     router = params['router']
-    h_all = (
+    attn_read_query = (
         attn_x @ router['proj_attn']['kernel']
         + router['proj_attn']['bias'])
-    h_q, h_k, h_v = jnp.split(h_all, 3, axis=-1)
-    h_rst = (
+    q_read_query, k_read_query, v_read_query = jnp.split(
+        attn_read_query, 3, axis=-1)
+    rst_read_query = (
         rst_x @ router['proj_rst']['kernel']
         + router['proj_rst']['bias'])
-    h_q = _factorized_operator_query(
-        h_q, attn_x, router['q_op_query_factor_proj'])
-    h_k = _factorized_operator_query(
-        h_k, attn_x, router['k_op_query_factor_proj'])
-    h_v = _factorized_operator_query(
-        h_v, attn_x, router['v_op_query_factor_proj'])
-    h_rst = _factorized_operator_query(
-        h_rst, rst_x, router['rst_op_query_factor_proj'])
+    h_q = _read_write_operator_query(
+        q_read_query, attn_x, router['q_op_write_query_proj'])
+    h_k = _read_write_operator_query(
+        k_read_query, attn_x, router['k_op_write_query_proj'])
+    h_v = _read_write_operator_query(
+        v_read_query, attn_x, router['v_op_write_query_proj'])
+    h_rst = _read_write_operator_query(
+        rst_read_query, rst_x, router['rst_op_write_query_proj'])
 
     def _selection_rho(h, op_key):
         q_unit = _forward_unit_direction(
@@ -4222,20 +4241,21 @@ def _angular_execution_weight(h, op_key, raw_tau, raw_scan_offset=None,
     return execution_weight.astype(jnp.float32)
 
 
-def _factorized_attn_queries(router_params, x, h_q, h_k, h_v):
+def _read_write_attn_operator_queries(
+        router_params, x, q_read_query, k_read_query, v_read_query):
     return (
-        _factorized_operator_query(
-            h_q, x, router_params['q_op_query_factor_proj']),
-        _factorized_operator_query(
-            h_k, x, router_params['k_op_query_factor_proj']),
-        _factorized_operator_query(
-            h_v, x, router_params['v_op_query_factor_proj']),
+        _read_write_operator_query(
+            q_read_query, x, router_params['q_op_write_query_proj']),
+        _read_write_operator_query(
+            k_read_query, x, router_params['k_op_write_query_proj']),
+        _read_write_operator_query(
+            v_read_query, x, router_params['v_op_write_query_proj']),
     )
 
 
-def _factorized_rst_query(router_params, x, h):
-    return _factorized_operator_query(
-        h, x, router_params['rst_op_query_factor_proj'])
+def _read_write_rst_operator_query(router_params, x, rst_read_query):
+    return _read_write_operator_query(
+        rst_read_query, x, router_params['rst_op_write_query_proj'])
 
 
 def _split_admission_den_kwargs(angular_execution_kwargs):
@@ -4307,7 +4327,7 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
     v_norm = pool_params['attn_v_op_key']
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-    h_Q, h_K, h_V = _factorized_attn_queries(
+    h_Q, h_K, h_V = _read_write_attn_operator_queries(
         router_params, x, h_Q, h_K, h_V)
     tau_all = x @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
     raw_scan_offset_all = jnp.zeros_like(tau_all)
@@ -4356,7 +4376,7 @@ def _rst_forward_inference(x, pool_params, router_params,
     pool_params = _ensure_pool_operator_keys(pool_params)
     rst_norm = pool_params['rst_op_key']
     h = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
-    h = _factorized_rst_query(router_params, x, h)
+    h = _read_write_rst_operator_query(router_params, x, h)
     tau = x @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
     raw_scan_offset = jnp.zeros_like(tau)
     out = _srw_inference(x, h, rst_norm, tau, raw_scan_offset,
@@ -4410,7 +4430,7 @@ def prefill(params, model_cfg, input_ids):
         normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
         h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-        h_Q, h_K, h_V = _factorized_attn_queries(
+        h_Q, h_K, h_V = _read_write_attn_operator_queries(
             router_params, normed, h_Q, h_K, h_V)
         tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
         raw_scan_offset_all = jnp.zeros_like(tau_all)
@@ -4562,7 +4582,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
             h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-            h_Q, h_K, h_V = _factorized_attn_queries(
+            h_Q, h_K, h_V = _read_write_attn_operator_queries(
                 router_params, normed, h_Q, h_K, h_V)
             tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
             raw_scan_offset_all = jnp.zeros_like(tau_all)
@@ -4599,7 +4619,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
 
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
-            h_k = _factorized_rst_query(router_params, normed, h_k)
+            h_k = _read_write_rst_operator_query(router_params, normed, h_k)
             tau_k = normed @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
             raw_scan_offset_k = jnp.zeros_like(tau_k)
             rst_out = _srw_inference(normed, h_k, rst_norm, tau_k, raw_scan_offset_k,
@@ -4759,7 +4779,7 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
         h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-        h_Q, h_K, h_V = _factorized_attn_queries(
+        h_Q, h_K, h_V = _read_write_attn_operator_queries(
             router_params, normed, h_Q, h_K, h_V)
         tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
         raw_scan_offset_all = jnp.zeros_like(tau_all)
@@ -4799,7 +4819,7 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
 
         normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
         h_k = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
-        h_k = _factorized_rst_query(router_params, normed, h_k)
+        h_k = _read_write_rst_operator_query(router_params, normed, h_k)
         tau_k = normed @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
         raw_scan_offset_k = jnp.zeros_like(tau_k)
         rst_out, gate_RST_raw, gate_RST = _srw_inference_with_gates(
@@ -4896,7 +4916,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
             h_all = normed @ rp['proj_attn']['kernel'] + rp['proj_attn']['bias']
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-            h_Q, h_K, h_V = _factorized_attn_queries(
+            h_Q, h_K, h_V = _read_write_attn_operator_queries(
                 rp, normed, h_Q, h_K, h_V)
             tau_all = normed @ rp['raw_tau_attn']['kernel'] + rp['raw_tau_attn']['bias']
             raw_scan_offset_all = jnp.zeros_like(tau_all)
@@ -4924,7 +4944,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
 
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ rp['proj_rst']['kernel'] + rp['proj_rst']['bias']
-            h_k = _factorized_rst_query(rp, normed, h_k)
+            h_k = _read_write_rst_operator_query(rp, normed, h_k)
             tau_k = normed @ rp['raw_tau_rst']['kernel'] + rp['raw_tau_rst']['bias']
             raw_scan_offset_k = jnp.zeros_like(tau_k)
             x = x + _srw_sup(normed, h_k, kn_n, tau_k, raw_scan_offset_k, pp['rst_read'], pp['rst_write'], rst_mult) * rst_scale_eff
