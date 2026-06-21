@@ -97,7 +97,7 @@ training:
   soft_gate_boundary_power_mid_frac: 0.360
   soft_gate_boundary_power_final_frac: 1.000
 
-  eval_effective_prune_enabled: true
+  eval_effective_prune_enabled: false
   eval_effective_prune_eps_list:
     - 1.0e-06
     - 1.0e-05
