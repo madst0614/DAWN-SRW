@@ -910,13 +910,8 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
             f"{entry['module']} to import cleanly.")
     # Keep the one-time JIT signature small: calibration needs only selection
     # geometry, not tau params or LM output weights.
-    pool_params = {
-        'attn_qk_emb': params['neuron_pool']['attn_qk_emb'],
-        'attn_v_emb': params['neuron_pool']['attn_v_emb'],
-        'rst_emb': params['neuron_pool']['rst_emb'],
-    }
     if version == V4166_MODEL_VERSION:
-        pool_params.update({
+        pool_params = {
             'attn_qk_read': params['neuron_pool']['attn_qk_read'],
             'attn_qk_write': params['neuron_pool']['attn_qk_write'],
             'attn_qk_op_read_proj': params['neuron_pool']['attn_qk_op_read_proj'],
@@ -929,7 +924,13 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
             'rst_write': params['neuron_pool']['rst_write'],
             'rst_op_read_proj': params['neuron_pool']['rst_op_read_proj'],
             'rst_op_write_proj': params['neuron_pool']['rst_op_write_proj'],
-        })
+        }
+    else:
+        pool_params = {
+            'attn_qk_emb': params['neuron_pool']['attn_qk_emb'],
+            'attn_v_emb': params['neuron_pool']['attn_v_emb'],
+            'rst_emb': params['neuron_pool']['rst_emb'],
+        }
     score_params = {
         'token_emb': params['token_emb'],
         'pos_emb': params['pos_emb'],
@@ -2680,8 +2681,6 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
                     pool[read_key], pool[write_key],
                     pool[op_read_key], pool[op_write_key])
                 out.update(_row_norm_stats(
-                    op_key, f'{name}_emb_norm', full))
-                out.update(_row_norm_stats(
                     op_key, f'{name}_op_key_norm', full))
         elif emb_key in pool:
             out.update(_row_norm_stats(pool[emb_key], f'{name}_emb_norm', full))
@@ -4244,7 +4243,29 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             drift_rst_emb = jnp.float32(0.0)
         else:
             _pool = new_params['neuron_pool']
-            if 'attn_qk_emb' in _pool:
+            if 'attn_qk_op_read_proj' in _pool:
+                def _drift_unit(x):
+                    x = jnp.asarray(x, dtype=jnp.float32)
+                    return x / (
+                        jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-6)
+
+                def _drift_op_key(read, write, read_proj, write_proj):
+                    r_key = _drift_unit(read) @ read_proj
+                    w_key = _drift_unit(write) @ write_proj
+                    return _drift_unit(_drift_unit(r_key) * _drift_unit(w_key))
+
+                _cur_qk = _drift_op_key(
+                    _pool['attn_qk_read'], _pool['attn_qk_write'],
+                    _pool['attn_qk_op_read_proj'],
+                    _pool['attn_qk_op_write_proj'])
+                _cur_v = _drift_op_key(
+                    _pool['attn_v_read'], _pool['attn_v_write'],
+                    _pool['attn_v_op_read_proj'],
+                    _pool['attn_v_op_write_proj'])
+                _cur_rst = _drift_op_key(
+                    _pool['rst_read'], _pool['rst_write'],
+                    _pool['rst_op_read_proj'], _pool['rst_op_write_proj'])
+            elif 'attn_qk_emb' in _pool:
                 _cur_qk = _pool['attn_qk_emb']
                 _cur_v = _pool['attn_v_emb']
                 _cur_rst = _pool['rst_emb']
@@ -4645,16 +4666,33 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_positive_margin_max': result.get('rst_positive_margin_max', jnp.float32(0.0)),
             'rst_selected_frac': result.get('rst_selected_frac', jnp.float32(0.0)),
             'rst_no_active_frac': result.get('rst_no_active_frac', jnp.float32(0.0)),
-            # Emb norm stats (REGULAR subset; *_max moved to analysis_step).
-            'rst_emb_norm': result.get('rst_emb_norm', jnp.float32(0.0)),
-            'rst_emb_norm_min': result.get('rst_emb_norm_min', jnp.float32(0.0)),
-            'rst_emb_norm_std': result.get('rst_emb_norm_std', jnp.float32(0.0)),
-            'attn_qk_emb_norm_mean': result.get('attn_qk_emb_norm_mean', jnp.float32(0.0)),
-            'attn_qk_emb_norm_min': result.get('attn_qk_emb_norm_min', jnp.float32(0.0)),
-            'attn_qk_emb_norm_std': result.get('attn_qk_emb_norm_std', jnp.float32(0.0)),
-            'attn_v_emb_norm_mean': result.get('attn_v_emb_norm_mean', jnp.float32(0.0)),
-            'attn_v_emb_norm_min': result.get('attn_v_emb_norm_min', jnp.float32(0.0)),
-            'attn_v_emb_norm_std': result.get('attn_v_emb_norm_std', jnp.float32(0.0)),
+            # Operator-key norm stats (REGULAR subset; *_max moved to analysis_step).
+            'rst_op_key_norm': result.get(
+                'rst_op_key_norm', result.get('rst_emb_norm', jnp.float32(0.0))),
+            'rst_op_key_norm_min': result.get(
+                'rst_op_key_norm_min',
+                result.get('rst_emb_norm_min', jnp.float32(0.0))),
+            'rst_op_key_norm_std': result.get(
+                'rst_op_key_norm_std',
+                result.get('rst_emb_norm_std', jnp.float32(0.0))),
+            'attn_qk_op_key_norm_mean': result.get(
+                'attn_qk_op_key_norm_mean',
+                result.get('attn_qk_emb_norm_mean', jnp.float32(0.0))),
+            'attn_qk_op_key_norm_min': result.get(
+                'attn_qk_op_key_norm_min',
+                result.get('attn_qk_emb_norm_min', jnp.float32(0.0))),
+            'attn_qk_op_key_norm_std': result.get(
+                'attn_qk_op_key_norm_std',
+                result.get('attn_qk_emb_norm_std', jnp.float32(0.0))),
+            'attn_v_op_key_norm_mean': result.get(
+                'attn_v_op_key_norm_mean',
+                result.get('attn_v_emb_norm_mean', jnp.float32(0.0))),
+            'attn_v_op_key_norm_min': result.get(
+                'attn_v_op_key_norm_min',
+                result.get('attn_v_emb_norm_min', jnp.float32(0.0))),
+            'attn_v_op_key_norm_std': result.get(
+                'attn_v_op_key_norm_std',
+                result.get('attn_v_emb_norm_std', jnp.float32(0.0))),
             'rst_read_norm': result.get('rst_read_norm', jnp.float32(0.0)),
             'rst_write_norm': result.get('rst_write_norm', jnp.float32(0.0)),
             # tau bias (scalar learned params).
@@ -4879,6 +4917,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'drift_attn_qk_emb': drift_attn_qk_emb,
             'drift_attn_v_emb': drift_attn_v_emb,
             'drift_rst_emb': drift_rst_emb,
+            'drift_attn_qk_op_key': drift_attn_qk_emb,
+            'drift_attn_v_op_key': drift_attn_v_emb,
+            'drift_rst_op_key': drift_rst_emb,
             # Actual post-Adam control update caps. *_pre are measured after
             # LR multipliers and before capping; *_post are after cap scaling.
             'update_cap_proj_attn_ratio_pre': upd_proj_attn_ratio_pre,
@@ -5362,14 +5403,33 @@ def create_geometry_step(max_sample=512):
             f'{prefix}_geom_sv4': s[4],
         }
 
+    def _geom_op_key(read, write, read_proj, write_proj, eps=1.0e-6):
+        def _unit(x):
+            x = jnp.asarray(x, dtype=jnp.float32)
+            return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
+        r_key = _unit(read) @ read_proj
+        w_key = _unit(write) @ write_proj
+        return _unit(_unit(r_key) * _unit(w_key))
+
     @jax.jit
     def geometry_step(params):
         pool = params.get('neuron_pool', {})
         out = {}
-        for name, emb_key, read_key, write_key in (
-                ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write'),
-                ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write'),
-                ('rst', 'rst_emb', 'rst_read', 'rst_write')):
+        for name, emb_key, read_key, write_key, op_read_key, op_write_key in (
+                ('attn_qk', 'attn_qk_emb', 'attn_qk_read',
+                 'attn_qk_write', 'attn_qk_op_read_proj',
+                 'attn_qk_op_write_proj'),
+                ('attn_v', 'attn_v_emb', 'attn_v_read',
+                 'attn_v_write', 'attn_v_op_read_proj',
+                 'attn_v_op_write_proj'),
+                ('rst', 'rst_emb', 'rst_read', 'rst_write',
+                 'rst_op_read_proj', 'rst_op_write_proj')):
+            if (read_key in pool and write_key in pool
+                    and op_read_key in pool and op_write_key in pool):
+                op_key = _geom_op_key(
+                    pool[read_key], pool[write_key],
+                    pool[op_read_key], pool[op_write_key])
+                out.update(_geom_one(op_key, f'{name}_op_key'))
             if emb_key in pool:
                 out.update(_geom_one(pool[emb_key], f'{name}_emb'))
             if read_key in pool:
@@ -7331,6 +7391,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'drift_attn_qk_emb': float(m.get('drift_attn_qk_emb', 0.0)),
         'drift_attn_v_emb': float(m.get('drift_attn_v_emb', 0.0)),
         'drift_rst_emb': float(m.get('drift_rst_emb', 0.0)),
+        'drift_attn_qk_op_key': float(m.get(
+            'drift_attn_qk_op_key', m.get('drift_attn_qk_emb', 0.0))),
+        'drift_attn_v_op_key': float(m.get(
+            'drift_attn_v_op_key', m.get('drift_attn_v_emb', 0.0))),
+        'drift_rst_op_key': float(m.get(
+            'drift_rst_op_key', m.get('drift_rst_emb', 0.0))),
         # Core activity.
         'drive_mean': float(m.get('drive_mean', 0.0)),
         'drive_max': float(m.get('drive_max', 0.0)),
@@ -7612,21 +7678,41 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'attn_score_std', m.get('attn_rho_std', 0.0))),
         'rst_score_std': float(m.get(
             'rst_score_std', m.get('rst_rho_std', 0.0))),
-        # Emb norm stats.
-        'rst_emb_norm': float(m.get('rst_emb_norm', 0.0)),
-        'rst_emb_norm_min': float(m.get('rst_emb_norm_min', 0.0)),
-        'rst_emb_norm_std': float(m.get('rst_emb_norm_std', 0.0)),
-        'attn_qk_emb_norm_mean': float(m.get('attn_qk_emb_norm_mean', 0.0)),
-        'attn_qk_emb_norm_min': float(m.get('attn_qk_emb_norm_min', 0.0)),
-        'attn_qk_emb_norm_std': float(m.get('attn_qk_emb_norm_std', 0.0)),
-        'attn_qk_emb_norm_max': float(m.get('attn_qk_emb_norm_max', 0.0)),
-        'attn_v_emb_norm_mean': float(m.get('attn_v_emb_norm_mean', 0.0)),
-        'attn_v_emb_norm_min': float(m.get('attn_v_emb_norm_min', 0.0)),
-        'attn_v_emb_norm_std': float(m.get('attn_v_emb_norm_std', 0.0)),
-        'attn_v_emb_norm_max': float(m.get('attn_v_emb_norm_max', 0.0)),
+        # Operator-key norm stats.
+        'rst_op_key_norm': float(m.get(
+            'rst_op_key_norm', m.get('rst_emb_norm', 0.0))),
+        'rst_op_key_norm_min': float(m.get(
+            'rst_op_key_norm_min', m.get('rst_emb_norm_min', 0.0))),
+        'rst_op_key_norm_std': float(m.get(
+            'rst_op_key_norm_std', m.get('rst_emb_norm_std', 0.0))),
+        'attn_qk_op_key_norm_mean': float(m.get(
+            'attn_qk_op_key_norm_mean',
+            m.get('attn_qk_emb_norm_mean', 0.0))),
+        'attn_qk_op_key_norm_min': float(m.get(
+            'attn_qk_op_key_norm_min',
+            m.get('attn_qk_emb_norm_min', 0.0))),
+        'attn_qk_op_key_norm_std': float(m.get(
+            'attn_qk_op_key_norm_std',
+            m.get('attn_qk_emb_norm_std', 0.0))),
+        'attn_qk_op_key_norm_max': float(m.get(
+            'attn_qk_op_key_norm_max',
+            m.get('attn_qk_emb_norm_max', 0.0))),
+        'attn_v_op_key_norm_mean': float(m.get(
+            'attn_v_op_key_norm_mean',
+            m.get('attn_v_emb_norm_mean', 0.0))),
+        'attn_v_op_key_norm_min': float(m.get(
+            'attn_v_op_key_norm_min',
+            m.get('attn_v_emb_norm_min', 0.0))),
+        'attn_v_op_key_norm_std': float(m.get(
+            'attn_v_op_key_norm_std',
+            m.get('attn_v_emb_norm_std', 0.0))),
+        'attn_v_op_key_norm_max': float(m.get(
+            'attn_v_op_key_norm_max',
+            m.get('attn_v_emb_norm_max', 0.0))),
         'rst_read_norm': float(m.get('rst_read_norm', 0.0)),
         'rst_write_norm': float(m.get('rst_write_norm', 0.0)),
-        'rst_emb_norm_max': float(m.get('rst_emb_norm_max', 0.0)),
+        'rst_op_key_norm_max': float(m.get(
+            'rst_op_key_norm_max', m.get('rst_emb_norm_max', 0.0))),
         'attn_qk_read_norm_mean': float(m.get('attn_qk_read_norm_mean', 0.0)),
         'attn_qk_read_norm_std': float(m.get('attn_qk_read_norm_std', 0.0)),
         'attn_qk_read_norm_max': float(m.get('attn_qk_read_norm_max', 0.0)),
@@ -7860,6 +7946,7 @@ def _print_cb1a_regular_block(rec):
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4164 = _is_active_srw_version(ctx.get('model_version'))
+    is_v4166 = ctx.get('model_version') == V4166_MODEL_VERSION
     is_official_soft_direct_tau = _is_active_srw_version(ctx.get('model_version'))
     official_soft_sparsity_compact = False
     aux_note = (
@@ -8064,6 +8151,7 @@ def _print_regular_block(rec, ctx):
         rec.get('update_cap_scan_attn_scale', 1.0),
         rec.get('update_cap_scan_rst_scale', 1.0),
     )
+    _op_key_cap_pre_label = 'op_key_pre' if is_v4166 else 'emb_pre'
     if is_v4164 and _update_cap_hit_total > 0.0:
         raw_tau_part = ""
         raw_tau_hit_part = ""
@@ -8094,7 +8182,7 @@ def _print_regular_block(rec, ctx):
             f" scale_min={_cap_scale_min:.3f}"
             f" proj_pre[a={rec.get('update_cap_proj_attn_ratio_pre', 0.0):.1e}"
             f" r={rec.get('update_cap_proj_rst_ratio_pre', 0.0):.1e}]"
-            f" emb_pre[q={rec.get('update_cap_emb_qk_ratio_pre', 0.0):.1e}"
+            f" {_op_key_cap_pre_label}[q={rec.get('update_cap_emb_qk_ratio_pre', 0.0):.1e}"
             f" v={rec.get('update_cap_emb_v_ratio_pre', 0.0):.1e}"
             f" r={rec.get('update_cap_emb_rst_ratio_pre', 0.0):.1e}]"
             f"{raw_tau_part}"
@@ -8115,7 +8203,7 @@ def _print_regular_block(rec, ctx):
             f" scale_min={_cap_scale_min:.3f}"
             f" proj_pre[a={rec.get('update_cap_proj_attn_ratio_pre', 0.0):.1e}"
             f" r={rec.get('update_cap_proj_rst_ratio_pre', 0.0):.1e}]"
-            f" emb_pre[q={rec.get('update_cap_emb_qk_ratio_pre', 0.0):.1e}"
+            f" {_op_key_cap_pre_label}[q={rec.get('update_cap_emb_qk_ratio_pre', 0.0):.1e}"
             f" v={rec.get('update_cap_emb_v_ratio_pre', 0.0):.1e}"
             f" r={rec.get('update_cap_emb_rst_ratio_pre', 0.0):.1e}]"
             f" tau_pre[a={rec.get('update_cap_tau_attn_abs_pre', 0.0):.1e}"
@@ -8167,7 +8255,17 @@ def _print_regular_block(rec, ctx):
             f" v[min={v_raw_tau_min:+.2f} max={v_raw_tau_max:+.2f}]"
             f" rst[min={rst_raw_tau_min:+.2f} max={rst_raw_tau_max:+.2f}]"
         )
-    if is_v4164 and not is_official_soft_direct_tau:
+    if is_v4166:
+        log_message(
+            f"  {route_std_label}[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
+            f" | op_key_n rst[m={rec['rst_op_key_norm']:.2f} s={rec['rst_op_key_norm_std']:.2f}"
+            f" min={rec['rst_op_key_norm_min']:.2f} max={rec['rst_op_key_norm_max']:.2f}]"
+            f" attn_qk[m={rec['attn_qk_op_key_norm_mean']:.2f} s={rec['attn_qk_op_key_norm_std']:.2f}"
+            f" min={rec['attn_qk_op_key_norm_min']:.2f} max={rec['attn_qk_op_key_norm_max']:.2f}]"
+            f" attn_v[m={rec['attn_v_op_key_norm_mean']:.2f} s={rec['attn_v_op_key_norm_std']:.2f}"
+            f" min={rec['attn_v_op_key_norm_min']:.2f} max={rec['attn_v_op_key_norm_max']:.2f}]"
+        )
+    elif is_v4164 and not is_official_soft_direct_tau:
         log_message(
             f"  emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
             f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
@@ -8362,9 +8460,14 @@ def _build_analysis_record(base, metrics, ctx):
         'rst_int_cap_frac': float(m.get('rst_int_cap_frac', 0.0)),
         'attn_int_max': float(m.get('attn_int_max', float('nan'))),
         'rst_int_max': float(m.get('rst_int_max', float('nan'))),
-        'attn_qk_emb_norm_max': float(m.get('attn_qk_emb_norm_max', 0.0)),
-        'attn_v_emb_norm_max': float(m.get('attn_v_emb_norm_max', 0.0)),
-        'rst_emb_norm_max': float(m.get('rst_emb_norm_max', 0.0)),
+        'attn_qk_op_key_norm_max': float(m.get(
+            'attn_qk_op_key_norm_max',
+            m.get('attn_qk_emb_norm_max', 0.0))),
+        'attn_v_op_key_norm_max': float(m.get(
+            'attn_v_op_key_norm_max',
+            m.get('attn_v_emb_norm_max', 0.0))),
+        'rst_op_key_norm_max': float(m.get(
+            'rst_op_key_norm_max', m.get('rst_emb_norm_max', 0.0))),
         'attn_tau_std_q': float(a_tau_s[0]),
         'attn_tau_std_k': float(a_tau_s[1]),
         'attn_tau_std_v': float(a_tau_s[2]),
@@ -8537,7 +8640,9 @@ def _build_analysis_record(base, metrics, ctx):
     # non-full scalar names.
     def _copy_full_pool_stats(dst_prefix, src_prefix=None):
         src_prefix = src_prefix or dst_prefix
-        for _kind in ('emb_norm', 'read_norm', 'write_norm', 'op_gain'):
+        for _kind in (
+                'op_key_norm', 'emb_norm', 'read_norm',
+                'write_norm', 'op_gain'):
             base_key = f'{src_prefix}_{_kind}'
             for _stat in ('mean', 'std', 'min', 'p50', 'p95', 'p99', 'max'):
                 key = f'{base_key}_{_stat}'
@@ -8615,6 +8720,7 @@ def _print_analysis_block(rec, ctx):
     # Analysis logging must never kill a run.  Missing optional fields are
     # printed as 0.0 instead of raising KeyError.
     is_v4164 = _is_active_srw_version(ctx.get('model_version'))
+    is_v4166 = ctx.get('model_version') == V4166_MODEL_VERSION
 
     def _g(key, default=0.0):
         return float(rec.get(key, default))
@@ -8663,21 +8769,39 @@ def _print_analysis_block(rec, ctx):
         f" attn[z<075={rec['attn_z_lt_075']*100:.1f}%"
         f" z<030={rec['attn_z_lt_030']*100:.1f}%]"
     )
-    log_message(
-        f"  saturation cap_frac[attn={_g('attn_int_cap_frac')*100:.4f}%"
-        f" rst={_g('rst_int_cap_frac')*100:.4f}%]"
-        f" | int_max[attn={_g('attn_int_max', float('nan')):.3f}"
-        f" rst={_g('rst_int_max', float('nan')):.3f}]"
-        f" | emb_max rst={rec['rst_emb_norm_max']:.2f}"
-        f" attn_qk={rec['attn_qk_emb_norm_max']:.2f}"
-        f" attn_v={rec['attn_v_emb_norm_max']:.2f}"
-    )
+    if is_v4166:
+        log_message(
+            f"  saturation cap_frac[attn={_g('attn_int_cap_frac')*100:.4f}%"
+            f" rst={_g('rst_int_cap_frac')*100:.4f}%]"
+            f" | int_max[attn={_g('attn_int_max', float('nan')):.3f}"
+            f" rst={_g('rst_int_max', float('nan')):.3f}]"
+            f" | op_key_max rst={rec['rst_op_key_norm_max']:.2f}"
+            f" attn_qk={rec['attn_qk_op_key_norm_max']:.2f}"
+            f" attn_v={rec['attn_v_op_key_norm_max']:.2f}"
+        )
+    else:
+        log_message(
+            f"  saturation cap_frac[attn={_g('attn_int_cap_frac')*100:.4f}%"
+            f" rst={_g('rst_int_cap_frac')*100:.4f}%]"
+            f" | int_max[attn={_g('attn_int_max', float('nan')):.3f}"
+            f" rst={_g('rst_int_max', float('nan')):.3f}]"
+            f" | emb_max rst={rec['rst_emb_norm_max']:.2f}"
+            f" attn_qk={rec['attn_qk_emb_norm_max']:.2f}"
+            f" attn_v={rec['attn_v_emb_norm_max']:.2f}"
+        )
     _print_validation_dead_stats(rec, ctx)
-    log_message(
-        f"  emb_full qk[{_emb_full('attn_qk_emb_norm')}]"
-        f" v[{_emb_full('attn_v_emb_norm')}]"
-        f" k[{_emb_full('rst_emb_norm')}]"
-    )
+    if is_v4166:
+        log_message(
+            f"  op_key_full qk[{_emb_full('attn_qk_op_key_norm')}]"
+            f" v[{_emb_full('attn_v_op_key_norm')}]"
+            f" k[{_emb_full('rst_op_key_norm')}]"
+        )
+    else:
+        log_message(
+            f"  emb_full qk[{_emb_full('attn_qk_emb_norm')}]"
+            f" v[{_emb_full('attn_v_emb_norm')}]"
+            f" k[{_emb_full('rst_emb_norm')}]"
+        )
     log_message(
         f"  rw_full qk_r[{_full('attn_qk_read_norm')}]"
         f" qk_w[{_full('attn_qk_write_norm')}]"
@@ -8757,14 +8881,15 @@ def _print_analysis_block(rec, ctx):
         f" logit_max={rec['logit_max']:.1f}"
         f" o_in={rec['o_input_norm']:.2f}"
     )
-    log_message(
-        f"  grad_ratio qk[emb={rec['qk_emb_grad_ratio']:.2e}"
-        f" r={rec['qk_read_grad_ratio']:.2e} w={rec['qk_write_grad_ratio']:.2e}]"
-        f" v[emb={rec['v_emb_grad_ratio']:.2e}"
-        f" r={rec['v_read_grad_ratio']:.2e} w={rec['v_write_grad_ratio']:.2e}]"
-        f" k[emb={rec['rst_emb_grad_ratio']:.2e}"
-        f" r={rec['rst_read_grad_ratio']:.2e} w={rec['rst_write_grad_ratio']:.2e}]"
-    )
+    if not is_v4166:
+        log_message(
+            f"  grad_ratio qk[emb={rec['qk_emb_grad_ratio']:.2e}"
+            f" r={rec['qk_read_grad_ratio']:.2e} w={rec['qk_write_grad_ratio']:.2e}]"
+            f" v[emb={rec['v_emb_grad_ratio']:.2e}"
+            f" r={rec['v_read_grad_ratio']:.2e} w={rec['v_write_grad_ratio']:.2e}]"
+            f" k[emb={rec['rst_emb_grad_ratio']:.2e}"
+            f" r={rec['rst_read_grad_ratio']:.2e} w={rec['rst_write_grad_ratio']:.2e}]"
+        )
     if 'hbm_used_gb' in rec:
         log_message(
             f"  HBM: {rec['hbm_used_gb']:.2f}G / {rec['hbm_limit_gb']:.2f}G"
@@ -8783,9 +8908,19 @@ def _print_geometry_block(geom):
             f" sv5=[{' '.join(f'{v:.2f}' for v in sv)}]]"
         )
     for _name, _label in (
-            ('attn_qk_emb', 'attn_qk_emb'), ('attn_qk_read', 'attn_qk_r'), ('attn_qk_write', 'attn_qk_w'),
-            ('v_emb', 'v_emb'), ('attn_v_read', 'attn_v_r'), ('attn_v_write', 'attn_v_w'),
-            ('rst_emb', 'k_emb'), ('rst_read', 'k_r'), ('rst_write', 'k_w')):
+            ('attn_qk_op_key', 'attn_qk_op_key'),
+            ('attn_qk_emb', 'attn_qk_emb'),
+            ('attn_qk_read', 'attn_qk_r'),
+            ('attn_qk_write', 'attn_qk_w'),
+            ('attn_v_op_key', 'attn_v_op_key'),
+            ('attn_v_emb', 'attn_v_emb'),
+            ('v_emb', 'v_emb'),
+            ('attn_v_read', 'attn_v_r'),
+            ('attn_v_write', 'attn_v_w'),
+            ('rst_op_key', 'rst_op_key'),
+            ('rst_emb', 'k_emb'),
+            ('rst_read', 'k_r'),
+            ('rst_write', 'k_w')):
         if f'{_name}_geom_rank' in geom:
             _line(_name, _label)
 
@@ -9837,6 +9972,12 @@ def main():
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
+    if model_version_cfg == V4166_MODEL_VERSION:
+        for _key in (
+                'route_emb_lr_mult',
+                'route_emb_grad_clip',
+                'route_emb_update_ratio_cap'):
+            training_config.pop(_key, None)
     if selection_calibration_cfg.get('present', False):
         training_config['selection_calibration'] = (
             selection_calibration_cfg.get('raw', {'enabled': False}))
@@ -10178,20 +10319,29 @@ def main():
             f"expl_clip={inactive_aux_weighted_clip}, "
             f"inactive_aux_dev_mode={inactive_aux_dev_mode}, "
             if inactive_aux_enabled else "")
+        _route_or_op_key_part = (
+            f"op_key_lr_mult={op_key_lr_mult}, "
+            if model_version_cfg == V4166_MODEL_VERSION
+            else (
+                f"route_emb_lr_mult={route_emb_lr_mult}, "
+                f"op_key_lr_mult={op_key_lr_mult}, "))
         print("  Stabilizers: "
               f"global_grad_clip={global_grad_clip}, "
               f"tau_lr_mult={tau_lr_mult}, tau_grad_clip={tau_grad_clip}, "
               f"router_proj_lr_mult={router_proj_lr_mult}, "
               f"router_scan_lr_mult={router_scan_lr_mult}, "
-              f"route_emb_lr_mult={route_emb_lr_mult}, "
-              f"op_key_lr_mult={op_key_lr_mult}, "
+              f"{_route_or_op_key_part}"
               f"dead_clip={dead_penalty_weighted_clip}, "
               f"{_inactive_aux_stabilizer_part}"
               "checkpoint_backend=orbax")
+        _route_or_op_key_cap_part = (
+            f"op_key_ratio={route_emb_update_ratio_cap}, "
+            if model_version_cfg == V4166_MODEL_VERSION
+            else f"emb_ratio={route_emb_update_ratio_cap}, ")
         print("  Control update caps: "
               f"enabled={enable_control_update_caps}, "
               f"proj_ratio={router_proj_update_ratio_cap}, "
-              f"emb_ratio={route_emb_update_ratio_cap}, "
+              f"{_route_or_op_key_cap_part}"
               f"tau_abs={tau_update_abs_cap}, scan_abs={scan_update_abs_cap}")
         print(f"  Weight decay: {weight_decay} (pool: {pool_weight_decay})")
         print(f"  Orth weight: {orth_weight}")
@@ -11000,6 +11150,15 @@ def main():
     # Initial emb-drift snapshot: pytree of sharded refs matching
     # params['neuron_pool'][*_emb]. Identity here -drift=0 on first step.
     def _drift_snap(p):
+        def _unit(x):
+            x = jnp.asarray(x, dtype=jnp.float32)
+            return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-6)
+
+        def _op_key(read, write, read_proj, write_proj):
+            r_key = _unit(read) @ read_proj
+            w_key = _unit(write) @ write_proj
+            return _unit(_unit(r_key) * _unit(w_key))
+
         if 'neuron_pool' not in p:
             z = jnp.float32(0.0)
             return {
@@ -11009,6 +11168,20 @@ def main():
             }
 
         pool = p['neuron_pool']
+        if 'attn_qk_op_read_proj' in pool:
+            return {
+                'attn_qk_emb': _op_key(
+                    pool['attn_qk_read'], pool['attn_qk_write'],
+                    pool['attn_qk_op_read_proj'],
+                    pool['attn_qk_op_write_proj']),
+                'attn_v_emb': _op_key(
+                    pool['attn_v_read'], pool['attn_v_write'],
+                    pool['attn_v_op_read_proj'],
+                    pool['attn_v_op_write_proj']),
+                'rst_emb': _op_key(
+                    pool['rst_read'], pool['rst_write'],
+                    pool['rst_op_read_proj'], pool['rst_op_write_proj']),
+            }
         if 'attn_qk_emb' in pool:
             return {
                 'attn_qk_emb': pool['attn_qk_emb'],
@@ -12050,7 +12223,10 @@ def main():
                 try:
                     geom = geometry_step_fn(params)
                     jax.block_until_ready(
-                        geom.get('qk_emb_geom_rank', jnp.float32(0.0)))
+                        geom.get(
+                            'attn_qk_op_key_geom_rank',
+                            geom.get('attn_qk_emb_geom_rank',
+                                     jnp.float32(0.0))))
                     if is_host0:
                         geom_host = jax.device_get(geom)
                         log_message("  Rare geometry diagnostics:")

@@ -20,6 +20,7 @@ Implemented concepts:
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+import math
 from flax.core import FrozenDict, freeze, unfreeze
 from typing import Optional, Dict
 from functools import partial
@@ -631,13 +632,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                        P()),                      # execution_prune_eps scalar
              out_specs=_out_specs,
              check_rep=False)
-    def fused_gate_srw(x, h, emb_local, raw_tau,
+    def fused_gate_srw(x, h, op_key_local, raw_tau,
                        read_local, write_local,
                        soft_gate_temperature, soft_gate_t_final,
                        soft_gate_boundary_power,
                        soft_gate_boundary_power_final,
                        execution_prune_eps):
-        N_local = emb_local.shape[0]
+        N_local = op_key_local.shape[0]
         nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
             nc += 1
@@ -646,32 +647,31 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         B, S, D = x.shape
         h_bf = h.astype(jnp.bfloat16)
         x_bf = x.astype(jnp.bfloat16)
-        emb_bf = emb_local.astype(jnp.bfloat16)
+        op_key_bf = op_key_local.astype(jnp.bfloat16)
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
         z1 = jnp.zeros((B, S, 1))
         diag_neg_inf = jnp.float32(-1.0e30)
         diag_pos_inf = jnp.float32(1.0e30)
 
-        def route_emb_chunk(start):
-            # Historical name; this slices the RW-derived operator-key array.
-            ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
-            return ec
+        def op_key_chunk(start):
+            return jax.lax.dynamic_slice_in_dim(
+                op_key_bf, start, cs, axis=0)
 
-        def route_relation(h_in, route):
-            # Cosine between router state and RW-derived operator key.
+        def operator_relation(h_in, op_key):
+            # Cosine between operator query and RW-derived operator key.
             q_unit = _forward_unit_direction(
                 h_in.astype(jnp.float32)).astype(jnp.bfloat16)
-            route_unit = _forward_unit_direction(
-                route.astype(jnp.float32)).astype(jnp.bfloat16)
-            rho = (q_unit @ route_unit.T).astype(jnp.float32)
+            op_key_unit = _forward_unit_direction(
+                op_key.astype(jnp.float32)).astype(jnp.bfloat16)
+            rho = (q_unit @ op_key_unit.T).astype(jnp.float32)
             rho_exposure = (
-                jax.lax.stop_gradient(q_unit) @ route_unit.T
+                jax.lax.stop_gradient(q_unit) @ op_key_unit.T
             ).astype(jnp.float32)
             return rho, rho_exposure
 
-        def route_rw_chunk(start):
-            ec = route_emb_chunk(start)
+        def op_key_rw_chunk(start):
+            ec = op_key_chunk(start)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, start, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, start, cs, axis=0)
             rc_f = rc.astype(jnp.float32)
@@ -692,8 +692,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             def stats_step(carry, i):
                 s_sum, sq_sum, cube_sum, quad_sum = carry
                 s = i * cs
-                route = route_emb_chunk(s)
-                rho, _ = route_relation(h_bf, route)
+                op_key = op_key_chunk(s)
+                rho, _ = operator_relation(h_bf, op_key)
                 s_sum = s_sum + rho.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (rho ** 2).sum(axis=-1, keepdims=True)
                 cube_sum = cube_sum + (rho ** 3).sum(axis=-1, keepdims=True)
@@ -992,8 +992,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  total_edge_margin_stat,
                  sparsity_carry, select_diag_carry) = carry
                 s = i * cs
-                route, rc, wc = route_rw_chunk(s)
-                rho, rho_exposure = route_relation(h_bf, route)
+                op_key, rc, wc = op_key_rw_chunk(s)
+                rho, rho_exposure = operator_relation(h_bf, op_key)
                 (selection_margin, admission, drive, execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(rho)
                 select_diag_carry = update_select_diag(
@@ -1096,8 +1096,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  total_edge_margin_stat,
                  sparsity_carry, select_diag_carry) = carry
                 s = i * cs
-                route, rc, wc = route_rw_chunk(s)
-                rho, rho_exposure = route_relation(h_bf, route)
+                op_key, rc, wc = op_key_rw_chunk(s)
+                rho, rho_exposure = operator_relation(h_bf, op_key)
                 (selection_margin, admission, drive, execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(rho)
                 select_diag_carry = update_select_diag(
@@ -1478,13 +1478,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                        P()),                          # execution_prune_eps scalar
              out_specs=_out_specs,
              check_rep=False)
-    def fused_gate_srw_paired(x, h, emb_local, raw_tau,
+    def fused_gate_srw_paired(x, h, op_key_local, raw_tau,
                               read_local, write_local,
                               soft_gate_temperature, soft_gate_t_final,
                               soft_gate_boundary_power,
                               soft_gate_boundary_power_final,
                               execution_prune_eps):
-        N_local = emb_local.shape[0]
+        N_local = op_key_local.shape[0]
         nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
             nc += 1
@@ -1494,34 +1494,33 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         # h: [B,S,2,d_route], raw_tau: [B,S,2,1]
         h_bf = h.astype(jnp.bfloat16)
         x_bf = x.astype(jnp.bfloat16)
-        emb_bf = emb_local.astype(jnp.bfloat16)
+        op_key_bf = op_key_local.astype(jnp.bfloat16)
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
         z1_r = jnp.zeros((B, S, 2, 1))
         diag_neg_inf = jnp.float32(-1.0e30)
         diag_pos_inf = jnp.float32(1.0e30)
 
-        def route_emb_chunk(start):
-            # Historical name; this slices the RW-derived operator-key array.
-            ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
-            return ec
+        def op_key_chunk(start):
+            return jax.lax.dynamic_slice_in_dim(
+                op_key_bf, start, cs, axis=0)
 
-        def route_relation(h_in, route):
-            # Cosine between router state and RW-derived operator key.
+        def operator_relation(h_in, op_key):
+            # Cosine between operator query and RW-derived operator key.
             q_unit = _forward_unit_direction(
                 h_in.astype(jnp.float32)).astype(jnp.bfloat16)
-            route_unit = _forward_unit_direction(
-                route.astype(jnp.float32)).astype(jnp.bfloat16)
+            op_key_unit = _forward_unit_direction(
+                op_key.astype(jnp.float32)).astype(jnp.bfloat16)
             rho = jnp.einsum(
-                'bsrd,nd->bsrn', q_unit, route_unit).astype(jnp.float32)
+                'bsrd,nd->bsrn', q_unit, op_key_unit).astype(jnp.float32)
             rho_exposure = jnp.einsum(
                 'bsrd,nd->bsrn',
                 jax.lax.stop_gradient(q_unit),
-                route_unit).astype(jnp.float32)
+                op_key_unit).astype(jnp.float32)
             return rho, rho_exposure
 
-        def route_rw_chunk(start):
-            ec = route_emb_chunk(start)
+        def op_key_rw_chunk(start):
+            ec = op_key_chunk(start)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, start, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, start, cs, axis=0)
             rc_f = rc.astype(jnp.float32)
@@ -1542,8 +1541,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             def stats_step(carry, i):
                 s_sum, sq_sum, cube_sum, quad_sum = carry
                 s = i * cs
-                route = route_emb_chunk(s)
-                rho, _ = route_relation(h_bf, route)
+                op_key = op_key_chunk(s)
+                rho, _ = operator_relation(h_bf, op_key)
                 s_sum = s_sum + rho.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (rho ** 2).sum(axis=-1, keepdims=True)
                 cube_sum = cube_sum + (rho ** 3).sum(axis=-1, keepdims=True)
@@ -1842,8 +1841,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  total_edge_margin_stat,
                  sparsity_carry, select_diag_carry) = carry
                 s = i * cs
-                route, rc, wc = route_rw_chunk(s)
-                rho, rho_exposure = route_relation(h_bf, route)
+                op_key, rc, wc = op_key_rw_chunk(s)
+                rho, rho_exposure = operator_relation(h_bf, op_key)
                 (selection_margin, admission, drive, execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(rho)
                 select_diag_carry = update_select_diag(
@@ -1947,8 +1946,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  total_edge_margin_stat,
                  sparsity_carry, select_diag_carry) = carry
                 s = i * cs
-                route, rc, wc = route_rw_chunk(s)
-                rho, rho_exposure = route_relation(h_bf, route)
+                op_key, rc, wc = op_key_rw_chunk(s)
+                rho, rho_exposure = operator_relation(h_bf, op_key)
                 (selection_margin, admission, drive, execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(rho)
                 select_diag_carry = update_select_diag(
@@ -2220,7 +2219,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
 
 
 # ================================================================
-# 4. NeuronPool -- inactive route emb + read/write operator vectors
+# 4. NeuronPool -- read/write directions + RW-derived operator keys
 # ================================================================
 
 class NeuronPool(nn.Module):
@@ -2238,13 +2237,6 @@ class NeuronPool(nn.Module):
         if n_rst_eff is None:
             raise ValueError("NeuronPool requires n_rst or n_know checkpoint alias.")
 
-        # v4166 selection uses RW-derived operator keys. These legacy route
-        # embeddings remain inactive compatibility slots and are never used
-        # for rho in this file.
-        self.attn_qk_emb = self.param('attn_qk_emb', unit_norm_init(), (self.n_qk, db))
-        self.attn_v_emb = self.param('attn_v_emb', unit_norm_init(), (self.n_v, db))
-        self.rst_emb = self.param('rst_emb', unit_norm_init(), (n_rst_eff, db))
-
         # Read vectors define what each neuron extracts from x.
         # Stored vectors remain raw; SRW forward uses their directions.
         self.attn_qk_read = self.param('attn_qk_read', unit_norm_init(), (self.n_qk, dm))
@@ -2257,7 +2249,8 @@ class NeuronPool(nn.Module):
         self.attn_v_write = self.param('attn_v_write', unit_norm_init(), (self.n_v, dm))
         self.rst_write = self.param('rst_write', unit_norm_init(), (n_rst_eff, dm))
 
-        op_proj_init = scaled_normal(1.0 / jnp.sqrt(jnp.asarray(dm, dtype=jnp.float32)))
+        op_proj_scale = math.sqrt(float(dm) / float(db))
+        op_proj_init = nn.initializers.orthogonal(scale=op_proj_scale)
         self.attn_qk_op_read_proj = self.param(
             'attn_qk_op_read_proj', op_proj_init, (dm, db))
         self.attn_qk_op_write_proj = self.param(
@@ -2390,18 +2383,19 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     qk_op_key_unit = qk_op_key
     v_op_key_unit = v_op_key
 
-    # Historical emb-norm metric slots now report operator-key norms.
-    _qk_emb_norms = jax.lax.stop_gradient(jnp.linalg.norm(qk_op_key, axis=-1))
-    attn_qk_emb_norm_mean = _qk_emb_norms.mean()
-    attn_qk_emb_norm_min = _qk_emb_norms.min()
-    attn_qk_emb_norm_std = _qk_emb_norms.std()
-    _v_emb_norms = jax.lax.stop_gradient(jnp.linalg.norm(v_op_key, axis=-1))
-    attn_v_emb_norm_mean = _v_emb_norms.mean()
-    attn_v_emb_norm_min = _v_emb_norms.min()
-    attn_v_emb_norm_std = _v_emb_norms.std()
+    _qk_op_key_norms = jax.lax.stop_gradient(
+        jnp.linalg.norm(qk_op_key, axis=-1))
+    attn_qk_op_key_norm_mean = _qk_op_key_norms.mean()
+    attn_qk_op_key_norm_min = _qk_op_key_norms.min()
+    attn_qk_op_key_norm_std = _qk_op_key_norms.std()
+    _v_op_key_norms = jax.lax.stop_gradient(
+        jnp.linalg.norm(v_op_key, axis=-1))
+    attn_v_op_key_norm_mean = _v_op_key_norms.mean()
+    attn_v_op_key_norm_min = _v_op_key_norms.min()
+    attn_v_op_key_norm_std = _v_op_key_norms.std()
     if analysis:
-        attn_qk_emb_norm_max = _qk_emb_norms.max()
-        attn_v_emb_norm_max = _v_emb_norms.max()
+        attn_qk_op_key_norm_max = _qk_op_key_norms.max()
+        attn_v_op_key_norm_max = _v_op_key_norms.max()
 
     rng, rng_drop = jax.random.split(rng)
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
@@ -2705,9 +2699,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_qk_positive_margin_mean_active,
                 attn_v_positive_margin_mean_active,
                 attn_tau_abs_mean,
-                attn_qk_emb_norm_mean, attn_v_emb_norm_mean,
-                attn_qk_emb_norm_min, attn_qk_emb_norm_std,
-                attn_v_emb_norm_min, attn_v_emb_norm_std,
+                attn_qk_op_key_norm_mean, attn_v_op_key_norm_mean,
+                attn_qk_op_key_norm_min, attn_qk_op_key_norm_std,
+                attn_v_op_key_norm_min, attn_v_op_key_norm_std,
                 attn_dead_penalty, attn_dead_count,
                 attn_tau_direct, attn_no_active_direct,
                 attn_int_max,
@@ -2753,7 +2747,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         attn_rho_skew, attn_active_per_token_std, attn_gate_entropy,
         attn_den_cost,
         attn_selection_cost, attn_current_cost,
-        attn_qk_emb_norm_max, attn_v_emb_norm_max,
+        attn_qk_op_key_norm_max, attn_v_op_key_norm_max,
         attn_rho_kurt,
         attn_int_cap_frac,
         q_norm_std, q_norm_max,
@@ -2853,23 +2847,23 @@ def _rst_forward(x, pool_params, router_params, rng,
 
     tau_reg = jnp.maximum(tau, 0.0).mean() * 0.01
     aux = lb_loss + tau_reg
-    # Historical emb-norm metric slots now report operator-key norms.
-    _rst_emb_norms = jax.lax.stop_gradient(jnp.linalg.norm(rst_op_key, axis=-1))
-    emb_norm_val = _rst_emb_norms.mean()
-    rst_emb_norm_min = _rst_emb_norms.min()
-    rst_emb_norm_std = _rst_emb_norms.std()
+    _rst_op_key_norms = jax.lax.stop_gradient(
+        jnp.linalg.norm(rst_op_key, axis=-1))
+    rst_op_key_norm = _rst_op_key_norms.mean()
+    rst_op_key_norm_min = _rst_op_key_norms.min()
+    rst_op_key_norm_std = _rst_op_key_norms.std()
     if analysis:
-        rst_emb_norm_max = _rst_emb_norms.max()
+        rst_op_key_norm_max = _rst_op_key_norms.max()
     read_norm_val = jnp.linalg.norm(rst_read, axis=-1).mean()
     write_norm_val = jnp.linalg.norm(rst_write, axis=-1).mean()
     rst_tau_mean = tau.mean()
     rst_strong = strong_frac.mean()
     rst_positive_margin_mean_active = positive_margin_mean_active.mean()
     slim_ret = (out, aux, active_frac, raw_gate_max, rho_std_slim, gate_sum, active_n_mean,
-                emb_norm_val, read_norm_val, write_norm_val, rst_out_norm,
+                rst_op_key_norm, read_norm_val, write_norm_val, rst_out_norm,
                 rst_tau_mean, rst_strong, rst_positive_margin_mean_active,
                 rst_tau_abs_mean,
-                rst_emb_norm_min, rst_emb_norm_std,
+                rst_op_key_norm_min, rst_op_key_norm_std,
                 rst_dead_penalty, rst_dead_count,
                 rst_tau_direct, rst_no_active_direct,
                 rst_int_max,
@@ -2894,7 +2888,7 @@ def _rst_forward(x, pool_params, router_params, rng,
         rst_rho_skew, rst_active_per_token_std, rst_gate_entropy,
         rst_den_cost,
         rst_selection_cost, rst_current_cost,
-        rst_emb_norm_max,
+        rst_op_key_norm_max,
         rst_rho_kurt,
         rst_margin_band,
         rst_int_cap_frac,
@@ -3065,7 +3059,7 @@ class DAWN_SRW_V4166(nn.Module):
             rst_positive_margin_active_all = _z
             attn_qk_positive_margin_active_all = _z
             attn_v_positive_margin_active_all = _z
-            k_emb_n_all = _z
+            rst_op_key_n_all = _z
             k_read_n_all = _z
             k_write_n_all = _z
             rst_out_norm_all = _z
@@ -3074,14 +3068,14 @@ class DAWN_SRW_V4166(nn.Module):
             rst_tau_mean_all = _z
             attn_tau_abs_all = _z
             rst_tau_abs_all = _z
-            attn_qk_emb_n_mean_all = _z
-            attn_v_emb_n_mean_all = _z
-            rst_emb_n_std_all = _z
-            attn_qk_emb_n_min_all = _z
-            attn_qk_emb_n_std_all = _z
-            attn_v_emb_n_min_all = _z
-            attn_v_emb_n_std_all = _z
-            rst_emb_n_min_all = _z
+            attn_qk_op_key_n_mean_all = _z
+            attn_v_op_key_n_mean_all = _z
+            rst_op_key_n_std_all = _z
+            attn_qk_op_key_n_min_all = _z
+            attn_qk_op_key_n_std_all = _z
+            attn_v_op_key_n_min_all = _z
+            attn_v_op_key_n_std_all = _z
+            rst_op_key_n_min_all = _z
             attn_dead_penalty_all = _z
             rst_dead_penalty_all = _z
             attn_dead_count_all = _z
@@ -3175,7 +3169,7 @@ class DAWN_SRW_V4166(nn.Module):
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
-            _ = self.neuron_pool.attn_qk_emb  # triggers NeuronPool.setup
+            _ = self.neuron_pool.attn_qk_read  # triggers NeuronPool.setup
             _ = self.neuron_pool.attn_qk_op_read_proj
             _ = self.neuron_pool.attn_qk_op_write_proj
             _ = self.neuron_pool.attn_v_op_read_proj
@@ -3237,9 +3231,9 @@ class DAWN_SRW_V4166(nn.Module):
                  a_qk_strong, a_v_strong,
                  a_qk_positive_margin_active, a_v_positive_margin_active,
                  a_tau_abs,
-                 a_qk_emb_n_mean, a_v_emb_n_mean,
-                 a_qk_emb_n_min, a_qk_emb_n_std,
-                 a_v_emb_n_min, a_v_emb_n_std,
+                 a_qk_op_key_n_mean, a_v_op_key_n_mean,
+                 a_qk_op_key_n_min, a_qk_op_key_n_std,
+                 a_v_op_key_n_min, a_v_op_key_n_std,
                  a_dead_penalty, a_dead_count,
                  a_tau_direct, a_no_active_direct,
                  a_int_max,
@@ -3273,7 +3267,7 @@ class DAWN_SRW_V4166(nn.Module):
                      a_margin_band_wide, a_margin_band_mid,
                      a_skew, a_apt_std, a_entropy,
                      a_den_cost, a_selection_cost, a_current_cost,
-                     a_qk_emb_n_max, a_v_emb_n_max,
+                     a_qk_op_key_n_max, a_v_op_key_n_max,
                      a_rho_kurt, a_int_cap_frac,
                      a_q_norm_std, a_q_norm_max,
                      a_k_norm_std, a_k_norm_max,
@@ -3299,9 +3293,9 @@ class DAWN_SRW_V4166(nn.Module):
                     admission_den_power=admission_den_power,
                     execution_prune_eps=execution_prune_eps)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
-                 k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
+                 k_active_n_mean, k_op_key_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_strong, k_positive_margin_active, k_tau_abs,
-                 k_emb_n_min, k_emb_n_std,
+                 k_op_key_n_min, k_op_key_n_std,
                  k_dead_penalty, k_dead_count,
                  k_tau_direct, k_no_active_direct,
                  k_int_max,
@@ -3327,14 +3321,14 @@ class DAWN_SRW_V4166(nn.Module):
                      k_margin_band_wide, k_margin_band_mid,
                      k_skew, k_apt_std, k_entropy,
                      k_den_cost, k_selection_cost, k_current_cost,
-                     k_emb_n_max, k_rho_kurt, k_margin_band,
+                     k_op_key_n_max, k_rho_kurt, k_margin_band,
                      k_int_cap_frac) = rst_ret[52:67]
                 x = x + rst_out
                 x_post_rst = x
                 slim_ys = (attn_aux, rst_aux,
                            k_active, k_raw_gmax, k_sstd, k_gsum, k_active_n_mean,
                            a_qk_active, a_v_active, a_raw_gmax, a_sstd, a_gsum, a_active_n_mean,
-                           k_emb_n, k_read_n, k_write_n,
+                           k_op_key_n, k_read_n, k_write_n,
                            k_out_norm,
                            a_out_norm, a_tau_mean, k_tau_mean,
                            k_strong, a_strong,
@@ -3343,11 +3337,11 @@ class DAWN_SRW_V4166(nn.Module):
                            a_qk_positive_margin_active,
                            a_v_positive_margin_active,
                            a_tau_abs, k_tau_abs,
-                           a_qk_emb_n_mean, a_v_emb_n_mean,
-                           k_emb_n_std,
-                           a_qk_emb_n_min, a_qk_emb_n_std,
-                           a_v_emb_n_min, a_v_emb_n_std,
-                           k_emb_n_min,
+                           a_qk_op_key_n_mean, a_v_op_key_n_mean,
+                           k_op_key_n_std,
+                           a_qk_op_key_n_min, a_qk_op_key_n_std,
+                           a_v_op_key_n_min, a_v_op_key_n_std,
+                           k_op_key_n_min,
                            a_dead_penalty, k_dead_penalty,
                            a_dead_count, k_dead_count,
                            a_tau_direct, k_tau_direct,
@@ -3411,8 +3405,8 @@ class DAWN_SRW_V4166(nn.Module):
                     a_den_cost, k_den_cost,
                     a_selection_cost, k_selection_cost,
                     a_current_cost, k_current_cost,
-                    a_qk_emb_n_max, a_v_emb_n_max,
-                    k_emb_n_max,
+                    a_qk_op_key_n_max, a_v_op_key_n_max,
+                    k_op_key_n_max,
                     a_rho_kurt, k_rho_kurt,
                     a_int_cap_frac, k_int_cap_frac,
                     a_q_norm_std, a_q_norm_max,
@@ -3438,7 +3432,7 @@ class DAWN_SRW_V4166(nn.Module):
             (attn_auxes, rst_auxes,
              rst_active_all, rst_raw_gmax_all, rst_sstd_all, rst_gsum_all, rst_active_n_mean_all,
              attn_qk_active_all, attn_v_active_all, attn_raw_gmax_all, attn_sstd_all, attn_gsum_all, attn_active_n_mean_all,
-             k_emb_n_all, k_read_n_all, k_write_n_all,
+             rst_op_key_n_all, k_read_n_all, k_write_n_all,
              rst_out_norm_all,
              attn_out_norm_all, attn_tau_mean_all, rst_tau_mean_all,
              rst_strong_all, attn_strong_all,
@@ -3447,11 +3441,11 @@ class DAWN_SRW_V4166(nn.Module):
              attn_qk_positive_margin_active_all,
              attn_v_positive_margin_active_all,
              attn_tau_abs_all, rst_tau_abs_all,
-             attn_qk_emb_n_mean_all, attn_v_emb_n_mean_all,
-             rst_emb_n_std_all,
-             attn_qk_emb_n_min_all, attn_qk_emb_n_std_all,
-             attn_v_emb_n_min_all, attn_v_emb_n_std_all,
-             rst_emb_n_min_all,
+             attn_qk_op_key_n_mean_all, attn_v_op_key_n_mean_all,
+             rst_op_key_n_std_all,
+             attn_qk_op_key_n_min_all, attn_qk_op_key_n_std_all,
+             attn_v_op_key_n_min_all, attn_v_op_key_n_std_all,
+             rst_op_key_n_min_all,
             attn_dead_penalty_all, rst_dead_penalty_all,
             attn_dead_count_all, rst_dead_count_all,
             attn_tau_direct_all, rst_tau_direct_all,
@@ -3522,8 +3516,8 @@ class DAWN_SRW_V4166(nn.Module):
                  attn_den_cost_all, rst_den_cost_all,
                  attn_selection_cost_all, rst_selection_cost_all,
                  attn_current_cost_all, rst_current_cost_all,
-                 attn_qk_emb_n_max_all, attn_v_emb_n_max_all,
-                 rst_emb_n_max_all,
+                 attn_qk_op_key_n_max_all, attn_v_op_key_n_max_all,
+                 rst_op_key_n_max_all,
                  attn_rho_kurt_all, rst_rho_kurt_all,
                  attn_int_cap_frac_all, rst_int_cap_frac_all,
                  attn_q_norm_std_all, attn_q_norm_max_all,
@@ -3631,8 +3625,7 @@ class DAWN_SRW_V4166(nn.Module):
             'attn_v_positive_margin_mean_active': (
                 attn_v_positive_margin_active_all.mean()),
 
-            'rst_emb_norm': k_emb_n_all.mean(),
-            'rst_op_key_norm': k_emb_n_all.mean(),
+            'rst_op_key_norm': rst_op_key_n_all.mean(),
             'rst_read_norm': k_read_n_all.mean(),
             'rst_write_norm': k_write_n_all.mean(),
 
@@ -3752,23 +3745,18 @@ class DAWN_SRW_V4166(nn.Module):
             'rst_soft_dead_frac_eps_1e_6': rst_dead_exposure_frac_all.mean(),
             'rst_soft_dead_frac_eps_1e_5': rst_weak_exposure_frac_all.mean(),
             'rst_soft_dead_frac_eps_1e_4': rst_dead_exposure_target_all.mean(),
-            'attn_qk_emb_norm_mean': attn_qk_emb_n_mean_all.mean(),
-            'attn_qk_emb_norm_min': attn_qk_emb_n_min_all.min(),
-            'attn_qk_emb_norm_std': attn_qk_emb_n_std_all.mean(),
-            'attn_v_emb_norm_mean': attn_v_emb_n_mean_all.mean(),
-            'attn_v_emb_norm_min': attn_v_emb_n_min_all.min(),
-            'attn_v_emb_norm_std': attn_v_emb_n_std_all.mean(),
-            'rst_emb_norm_min': rst_emb_n_min_all.min(),
-            'rst_emb_norm_std': rst_emb_n_std_all.mean(),
-            'attn_qk_op_key_norm_mean': attn_qk_emb_n_mean_all.mean(),
-            'attn_qk_op_key_norm_min': attn_qk_emb_n_min_all.min(),
-            'attn_qk_op_key_norm_std': attn_qk_emb_n_std_all.mean(),
-            'attn_v_op_key_norm_mean': attn_v_emb_n_mean_all.mean(),
-            'attn_v_op_key_norm_min': attn_v_emb_n_min_all.min(),
-            'attn_v_op_key_norm_std': attn_v_emb_n_std_all.mean(),
-            'rst_op_key_norm_mean': k_emb_n_all.mean(),
-            'rst_op_key_norm_min': rst_emb_n_min_all.min(),
-            'rst_op_key_norm_std': rst_emb_n_std_all.mean(),
+            'attn_qk_op_key_norm_mean': (
+                attn_qk_op_key_n_mean_all.mean()),
+            'attn_qk_op_key_norm_min': (
+                attn_qk_op_key_n_min_all.min()),
+            'attn_qk_op_key_norm_std': (
+                attn_qk_op_key_n_std_all.mean()),
+            'attn_v_op_key_norm_mean': attn_v_op_key_n_mean_all.mean(),
+            'attn_v_op_key_norm_min': attn_v_op_key_n_min_all.min(),
+            'attn_v_op_key_norm_std': attn_v_op_key_n_std_all.mean(),
+            'rst_op_key_norm_mean': rst_op_key_n_all.mean(),
+            'rst_op_key_norm_min': rst_op_key_n_min_all.min(),
+            'rst_op_key_norm_std': rst_op_key_n_std_all.mean(),
 
             # Dead-only penalty is separate from aux and weighted in train_jax.
             # Mean across layers so the training weight is layer-count-agnostic.
@@ -3953,12 +3941,10 @@ class DAWN_SRW_V4166(nn.Module):
                 'rst_gate_entropy': rst_entropy_all.mean(),
                 'attn_gate_den_sum': attn_den_cost_all.mean(),
                 'rst_gate_den_sum': rst_den_cost_all.mean(),
-                'attn_qk_emb_norm_max': attn_qk_emb_n_max_all.max(),
-                'attn_v_emb_norm_max': attn_v_emb_n_max_all.max(),
-                'rst_emb_norm_max': rst_emb_n_max_all.max(),
-                'attn_qk_op_key_norm_max': attn_qk_emb_n_max_all.max(),
-                'attn_v_op_key_norm_max': attn_v_emb_n_max_all.max(),
-                'rst_op_key_norm_max': rst_emb_n_max_all.max(),
+                'attn_qk_op_key_norm_max': (
+                    attn_qk_op_key_n_max_all.max()),
+                'attn_v_op_key_norm_max': attn_v_op_key_n_max_all.max(),
+                'rst_op_key_norm_max': rst_op_key_n_max_all.max(),
                 'attn_rho_kurt': attn_rho_kurt_all.mean(),
                 'rst_rho_kurt': rst_rho_kurt_all.mean(),
                 'attn_qk_raw_norm': attn_qk_raw_norm_all.mean(),
@@ -4660,20 +4646,21 @@ def vectorized_neuron_health(params):
     params = _squeeze_params(params)
     pool = _pool_params_with_operator_keys(params['neuron_pool'])
     results = {}
-    for pool_name, emb_key, read_key, write_key in [
+    for pool_name, op_key_key, read_key, write_key in [
             ('Attention-QK', 'attn_qk_op_key', 'attn_qk_read', 'attn_qk_write'),
             ('Attention-V', 'attn_v_op_key', 'attn_v_read', 'attn_v_write'),
             ('RST', 'rst_op_key', 'rst_read', 'rst_write')]:
-        emb = pool[emb_key]
+        op_key = pool[op_key_key]
         read = pool[read_key]
         write = pool[write_key]
-        emb_n = jnp.linalg.norm(emb, axis=-1)
+        op_key_n = jnp.linalg.norm(op_key, axis=-1)
         read_n = jnp.linalg.norm(read, axis=-1)
         write_n = jnp.linalg.norm(write, axis=-1)
         results[pool_name] = {
-            'N': emb.shape[0],
-            'emb_mean': emb_n.mean(), 'emb_std': emb_n.std(),
-            'emb_dead': (emb_n < 1e-6).sum(),
+            'N': op_key.shape[0],
+            'op_key_mean': op_key_n.mean(),
+            'op_key_std': op_key_n.std(),
+            'op_key_dead': (op_key_n < 1e-6).sum(),
             'read_mean': read_n.mean(), 'read_std': read_n.std(),
             'read_dead': (read_n < 1e-6).sum(),
             'write_mean': write_n.mean(), 'write_std': write_n.std(),
@@ -4689,27 +4676,27 @@ def vectorized_weight_analysis(params, max_sample=2048):
     params = _squeeze_params(params)
     pool = _pool_params_with_operator_keys(params['neuron_pool'])
     results = {}
-    for pool_name, emb_key in [
+    for pool_name, op_key_key in [
             ('Attention-QK', 'attn_qk_op_key'),
             ('Attention-V', 'attn_v_op_key'),
             ('RST', 'rst_op_key')]:
-        emb = pool[emb_key]
-        N, d = emb.shape
+        op_key = pool[op_key_key]
+        N, d = op_key.shape
         if N > max_sample:
             idx = jnp.linspace(0, N - 1, max_sample, dtype=jnp.int32)
-            emb_s = emb[idx]
+            op_key_s = op_key[idx]
         else:
-            emb_s = emb
-        norms = jnp.linalg.norm(emb_s, axis=-1, keepdims=True) + 1e-8
-        emb_normed = emb_s / norms
-        n_s = emb_normed.shape[0]
+            op_key_s = op_key
+        norms = jnp.linalg.norm(op_key_s, axis=-1, keepdims=True) + 1e-8
+        op_key_normed = op_key_s / norms
+        n_s = op_key_normed.shape[0]
 
-        gram = emb_normed @ emb_normed.T
+        gram = op_key_normed @ op_key_normed.T
         gram = gram - jnp.eye(n_s) * gram
         mean_sim = jnp.abs(gram).sum() / (n_s * (n_s - 1))
         max_sim = jnp.abs(gram).max()
 
-        sv = jnp.linalg.svd(emb_s, compute_uv=False)
+        sv = jnp.linalg.svd(op_key_s, compute_uv=False)
         sv_norm = sv / (sv.sum() + 1e-8)
         entropy = -(sv_norm * jnp.log(sv_norm + 1e-10)).sum()
         eff_rank = jnp.exp(entropy)
