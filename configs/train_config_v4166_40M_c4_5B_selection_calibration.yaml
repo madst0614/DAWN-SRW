@@ -17,9 +17,9 @@ model:
   router_dropout: 0.0
   gradient_checkpointing: true
   d_route: 128
-  n_qk: 2312
-  n_v: 7192
-  n_rst: 19316
+  n_qk: 2698
+  n_v: 8391
+  n_rst: 22536
   tau_init_min: -0.95
   tau_init_max: 0.95
   tau_init_mode: quantile_frac
@@ -107,4 +107,4 @@ training:
   log_analysis_multiplier: 5
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_40M_c4_5B_selection_calibration_v2
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_40M_c4_5B_selection_calibration_v3
