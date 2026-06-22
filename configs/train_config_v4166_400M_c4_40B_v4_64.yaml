@@ -64,17 +64,17 @@ training:
     active_target:
       qk: 0.08
       v: 0.05
-      rst: 0.015
+      rst: 0.014
 
     candidate_target_start:
       qk: 0.16
       v: 0.10
-      rst: 0.030
+      rst: 0.020
 
     candidate_target_final:
       qk: 0.08
       v: 0.05
-      rst: 0.015
+      rst: 0.014
 
     B_floor:
       qk: 0.001
