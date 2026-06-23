@@ -5851,10 +5851,12 @@ def _orbax_async_checkpointing_enabled():
 
 def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
                                      keep_last=3, create=True,
-                                     read_only=False):
+                                     read_only=False,
+                                     best_tracking=False):
     """Create the Orbax manager for Composite(state, metadata) checkpoints."""
     create = bool(create)
     read_only = bool(read_only)
+    best_tracking = bool(best_tracking)
     primary_host = 0
     enable_async_checkpointing = _orbax_async_checkpointing_enabled()
     if enable_async_checkpointing:
@@ -5870,14 +5872,15 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
 
     options_kwargs = {
         'save_interval_steps': max(1, int(checkpoint_interval or 1)),
-        'best_fn': _orbax_best_metric,
-        'best_mode': 'min',
         'keep_checkpoints_without_metrics': True,
         'step_format_fixed_length': 12,
         'create': create,
         'read_only': read_only,
         'enable_async_checkpointing': enable_async_checkpointing,
     }
+    if best_tracking:
+        options_kwargs['best_fn'] = _orbax_best_metric
+        options_kwargs['best_mode'] = 'min'
     if _checkpoint_manager_options_accepts('multiprocessing_options'):
         options_kwargs['multiprocessing_options'] = (
             _orbax_multiprocessing_options(primary_host=primary_host))
@@ -5892,6 +5895,7 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
         print(
             f"Creating Orbax CheckpointManager: dir={checkpoint_dir} "
             f"create={create} read_only={read_only} "
+            f"best_tracking={best_tracking} "
             f"primary_host={primary_host}",
             flush=True,
         )
@@ -9191,6 +9195,7 @@ def main():
     checkpoint_keep_last = int(tcfg.get(
         'checkpoint_keep_last',
         tcfg.get('max_checkpoints_to_keep', 3)))
+    best_checkpoint_keep_last = int(tcfg.get('best_checkpoint_keep_last', 3))
     # 2-tier logging cadence.
     log_interval = int(tcfg.get('log_interval', 100))
     log_analysis_multiplier = int(tcfg.get('log_analysis_multiplier', 20))
@@ -9208,7 +9213,8 @@ def main():
     resume_path = None
     resume_step = None
     checkpoint_dir = None  # will be set to a run folder
-    checkpoint_manager = None
+    latest_checkpoint_manager = None
+    best_checkpoint_manager = None
 
     def _join(base, name):
         return _join_path(base, name)
@@ -9433,6 +9439,8 @@ def main():
         checkpoint_keep_last = int(tcfg.get(
             'checkpoint_keep_last',
             tcfg.get('max_checkpoints_to_keep', checkpoint_keep_last)))
+        best_checkpoint_keep_last = int(tcfg.get(
+            'best_checkpoint_keep_last', best_checkpoint_keep_last))
         current_admission_den_config_override = False
         if jax.process_index() == 0:
             print("Resume config source: checkpoint full_config")
@@ -9681,6 +9689,8 @@ def main():
                 'checkpoint_keep_last',
                 saved_training_config.get(
                     'max_checkpoints_to_keep', checkpoint_keep_last)))
+            best_checkpoint_keep_last = int(saved_training_config.get(
+                'best_checkpoint_keep_last', best_checkpoint_keep_last))
             log_interval = int(saved_training_config['log_interval'])
             log_analysis_multiplier = int(
                 saved_training_config['log_analysis_multiplier'])
@@ -9981,6 +9991,7 @@ def main():
         'speed_check': run_speed_check,
         'checkpoint_interval': ckpt_interval,
         'checkpoint_keep_last': checkpoint_keep_last,
+        'best_checkpoint_keep_last': best_checkpoint_keep_last,
         'training_log_append_on_resume': training_log_append_on_resume,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
@@ -10110,6 +10121,14 @@ def main():
                 "Selection calibration policy: fresh init computes; "
                 "resume restores from checkpoint.")
         print(f"Run folder: {checkpoint_dir}")
+        print(f"Latest checkpoint dir: {_join(checkpoint_dir, 'checkpoints')}")
+        print(
+            f"Best checkpoint dir: "
+            f"{_join(checkpoint_dir, 'best_checkpoints')}")
+        print(
+            f"Latest checkpoint keep_last={checkpoint_keep_last}, "
+            f"interval={ckpt_interval}")
+        print(f"Best checkpoint keep_last={best_checkpoint_keep_last}")
         print(f"Seed: {seed}")
         print(f"Global batch size: {batch_size}")
         print(f"Per-host batch size: {per_host_batch}")
@@ -10797,11 +10816,19 @@ def main():
     opt_state = _replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
     target_params = params
     target_opt_state = opt_state
-    checkpoint_manager = _create_orbax_checkpoint_manager(
+    latest_checkpoint_manager = _create_orbax_checkpoint_manager(
         _join(checkpoint_dir, 'checkpoints'),
         checkpoint_interval=ckpt_interval,
         keep_last=checkpoint_keep_last,
         create=True,
+        best_tracking=False,
+    )
+    best_checkpoint_manager = _create_orbax_checkpoint_manager(
+        _join(checkpoint_dir, 'best_checkpoints'),
+        checkpoint_interval=1,
+        keep_last=best_checkpoint_keep_last,
+        create=True,
+        best_tracking=True,
     )
 
     if _has_resume_checkpoint:
@@ -10817,7 +10844,7 @@ def main():
             model_config=cfg['model'],
         )
         restored_state, restored_metadata = _restore_orbax_state(
-            checkpoint_manager, resume_step, target_state)
+            latest_checkpoint_manager, resume_step, target_state)
         params = _match_tree_to_template_on_mesh(
             restored_state['params'], target_params, mesh, name='params')
         opt_state = _match_tree_to_template_on_mesh(
@@ -12163,7 +12190,7 @@ def main():
                         **prune_eval_log,
                         'timestamp': datetime.now().isoformat(),
                     })
-                if val_loss < best_val_loss:
+                if np.isfinite(val_loss) and val_loss < best_val_loss:
                     best_val_loss = val_loss
                     _new_best = True
 
@@ -12259,31 +12286,42 @@ def main():
                     except NameError:
                         pass
 
-            # ---- Unified Orbax save path ----
-            if _new_best or _do_ckpt:
-                _checkpoint_kind = 'best' if _new_best else 'regular'
-                _checkpoint_val_loss = val_loss if _do_val else None
+            # ---- Split Orbax save paths ----
+            if _do_ckpt:
                 saved = save_orbax_checkpoint(
-                    checkpoint_manager,
+                    latest_checkpoint_manager,
                     params, opt_state, rng,
                     epoch, global_step, epoch_step_counter,
                     steps_per_epoch, best_val_loss,
                     cfg['model'], training_config,
                     full_config_snapshot, raw_config_snapshot,
                     config_path, run_id,
-                    _checkpoint_kind,
-                    val_loss=_checkpoint_val_loss,
+                    'regular',
+                    val_loss=None,
+                    git_info=checkpoint_git_info,
+                )
+                if is_host0 and saved:
+                    log_message(
+                        f"  Orbax latest checkpoint saved at "
+                        f"step {global_step}")
+            if _new_best:
+                save_orbax_checkpoint(
+                    best_checkpoint_manager,
+                    params, opt_state, rng,
+                    epoch, global_step, epoch_step_counter,
+                    steps_per_epoch, best_val_loss,
+                    cfg['model'], training_config,
+                    full_config_snapshot, raw_config_snapshot,
+                    config_path, run_id,
+                    'best',
+                    val_loss=val_loss,
                     git_info=checkpoint_git_info,
                 )
                 if is_host0:
-                    if _new_best:
-                        log_message(
-                            f"  New best Orbax checkpoint saved at "
-                            f"step {global_step}! "
-                            f"val_loss={best_val_loss:.4f}")
-                    elif saved:
-                        log_message(
-                            f"  Orbax checkpoint saved at step {global_step}")
+                    log_message(
+                        f"  New best Orbax checkpoint saved at "
+                        f"step {global_step}! "
+                        f"val_loss={best_val_loss:.4f}")
 
         if preemption_requested[0]:
             # Cooperative emergency save. Previously this ran from the
@@ -12291,7 +12329,7 @@ def main():
             # the handler asynchronously.
             try:
                 save_orbax_checkpoint(
-                    checkpoint_manager,
+                    latest_checkpoint_manager,
                     params, opt_state, rng,
                     epoch, global_step, epoch_step_counter,
                     steps_per_epoch, best_val_loss,
@@ -12304,7 +12342,7 @@ def main():
                 )
                 if is_host0:
                     print(
-                        f"!!! Emergency Orbax checkpoint saved at "
+                        f"!!! Emergency Orbax latest checkpoint saved at "
                         f"step {global_step} !!!",
                         flush=True)
             except Exception as e:
@@ -12350,7 +12388,7 @@ def main():
                 eval_prune_step_fns, params, val_loader, n_local_devices,
                 data_sharding, global_step, val_loss, val_acc, verbose=False)
 
-        is_best = val_loss < best_val_loss
+        is_best = np.isfinite(val_loss) and val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
 
@@ -12391,26 +12429,41 @@ def main():
             })
 
         save_orbax_checkpoint(
-            checkpoint_manager,
+            latest_checkpoint_manager,
             params, opt_state, rng,
             epoch + 1, global_step, 0,
             steps_per_epoch, best_val_loss,
             cfg['model'], training_config,
             full_config_snapshot, raw_config_snapshot,
             config_path, run_id,
-            'best' if is_best else 'epoch',
+            'epoch',
             val_loss=val_loss,
             train_loss=epoch_avg_loss,
             git_info=checkpoint_git_info,
         )
+        if is_best:
+            save_orbax_checkpoint(
+                best_checkpoint_manager,
+                params, opt_state, rng,
+                epoch + 1, global_step, 0,
+                steps_per_epoch, best_val_loss,
+                cfg['model'], training_config,
+                full_config_snapshot, raw_config_snapshot,
+                config_path, run_id,
+                'best',
+                val_loss=val_loss,
+                train_loss=epoch_avg_loss,
+                git_info=checkpoint_git_info,
+            )
         if is_host0:
+            log_message(
+                f"  Epoch Orbax latest checkpoint saved at "
+                f"step {global_step}")
             if is_best:
                 log_message(
-                    f"  New best Orbax checkpoint! "
+                    f"  New best Orbax checkpoint saved at "
+                    f"step {global_step}! "
                     f"val_loss={best_val_loss:.4f}")
-            else:
-                log_message(
-                    f"  Epoch Orbax checkpoint saved at step {global_step}")
             log_message(f"  Best val loss so far: {best_val_loss:.4f}")
             sync_logs()
 
@@ -12427,7 +12480,7 @@ def main():
             int(epoch + 1) if 'epoch' in locals() else int(start_epoch))
         try:
             save_orbax_checkpoint(
-                checkpoint_manager,
+                latest_checkpoint_manager,
                 params, opt_state, rng,
                 final_epoch, global_step, epoch_step_counter,
                 steps_per_epoch, best_val_loss,
@@ -12440,7 +12493,8 @@ def main():
             )
             if is_host0:
                 log_message(
-                    f"  Final Orbax checkpoint saved at step {global_step}")
+                    f"  Final Orbax latest checkpoint saved at "
+                    f"step {global_step}")
         except Exception as e:
             if is_host0:
                 print(f"  Warning: final Orbax checkpoint failed: {e}",
@@ -12458,8 +12512,10 @@ def main():
         )
         sync_logs()
 
-    if checkpoint_manager is not None:
-        checkpoint_manager.close()
+    if latest_checkpoint_manager is not None:
+        latest_checkpoint_manager.close()
+    if best_checkpoint_manager is not None:
+        best_checkpoint_manager.close()
 
 
 if __name__ == '__main__':
