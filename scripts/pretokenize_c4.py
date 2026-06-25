@@ -61,6 +61,35 @@ def open_output(path: str, mode: str = "wb"):
         return open(path, mode)
 
 
+def output_exists(path: str) -> bool:
+    """Check whether an output path exists, supporting both local and GCS paths."""
+    if is_gcs_path(path):
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
+            return fs.exists(path)
+        except ImportError:
+            try:
+                import tensorflow as tf
+                return tf.io.gfile.exists(path)
+            except ImportError:
+                raise ImportError(
+                    "GCS output requires 'gcsfs' or 'tensorflow'. "
+                    "Install with: pip install gcsfs  OR  pip install tensorflow"
+                )
+    return os.path.exists(path)
+
+
+def open_new_output(path: str):
+    """Open a new binary output file, refusing to overwrite existing data."""
+    if output_exists(path):
+        raise RuntimeError(
+            f"Refusing to overwrite existing output file: {path}. "
+            "Metadata and shards may be inconsistent, or a previous resume partially ran."
+        )
+    return open_output(path, "wb")
+
+
 def read_json(path: str) -> dict:
     """Read JSON from local or GCS."""
     if is_gcs_path(path):
@@ -93,6 +122,27 @@ def write_json(path: str, data: dict):
 def shard_path(base: str, shard_idx: int) -> str:
     """Generate shard file path: base_000.bin, base_001.bin, ..."""
     return f"{base}_{shard_idx:03d}.bin"
+
+
+def require_nonnegative_int(metadata: dict, key: str) -> int:
+    if key not in metadata:
+        raise RuntimeError(f"Resume metadata missing required field '{key}'")
+    value = metadata[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(
+            f"Resume metadata field '{key}' must be a non-negative integer, got {value!r}"
+        )
+    return value
+
+
+def resume_docs_from_metadata(metadata: dict) -> int:
+    if "docs_consumed" in metadata:
+        return require_nonnegative_int(metadata, "docs_consumed")
+    if "docs_processed" in metadata:
+        return require_nonnegative_int(metadata, "docs_processed")
+    raise RuntimeError(
+        "Resume metadata missing docs_consumed/docs_processed; refusing to resume."
+    )
 
 
 def main():
@@ -142,29 +192,78 @@ def main():
     if args.resume:
         try:
             prev_meta = read_json(meta_path)
-            resume_docs = prev_meta["docs_consumed"]
-            resume_tokens = prev_meta["total_tokens"]
-            resume_seqs = prev_meta["total_sequences"]
-            resume_shards = prev_meta["num_shards"]
-            prev_shard_infos = prev_meta.get("shards", [])
-            prev_tail_tokens = prev_meta.get("tail_token_buffer", [])
-            print(f"{'='*60}")
-            print(f"RESUME MODE")
-            print(f"{'='*60}")
-            print(f"Previous run: {resume_tokens:,} tokens, {resume_docs:,} docs, {resume_shards} shards")
-            print(f"Remaining: {target_tokens - resume_tokens:,} tokens to collect")
-            print(f"Will skip {resume_docs:,} docs then continue...")
-            if prev_tail_tokens:
-                print(f"Restoring {len(prev_tail_tokens)} leftover tokens from previous run")
-            print()
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"--resume requested but metadata not found at {meta_path}; "
+                "refusing to start from scratch."
+            ) from e
+        except Exception as e:
+            raise RuntimeError(
+                f"--resume requested but metadata at {meta_path} could not be read; "
+                f"refusing to start from scratch: {e}"
+            ) from e
+        if not isinstance(prev_meta, dict):
+            raise RuntimeError(
+                f"--resume requested but metadata at {meta_path} is not a JSON object; "
+                "refusing to start from scratch."
+            )
 
-            if resume_tokens >= target_tokens:
-                print(f"Already have {resume_tokens:,} >= target {target_tokens:,}. Nothing to do.")
-                return
-        except (FileNotFoundError, KeyError) as e:
-            print(f"WARNING: --resume specified but no valid meta found at {meta_path}: {e}")
-            print(f"Starting from scratch.")
-            args.resume = False
+        resume_docs = resume_docs_from_metadata(prev_meta)
+        resume_tokens = require_nonnegative_int(prev_meta, "total_tokens")
+        resume_seqs = require_nonnegative_int(prev_meta, "total_sequences")
+        resume_shards = require_nonnegative_int(prev_meta, "num_shards")
+
+        prev_seq_len = prev_meta.get("seq_len", seq_len)
+        if prev_seq_len != seq_len:
+            raise RuntimeError(
+                f"Resume metadata seq_len={prev_seq_len} does not match --seq_len={seq_len}"
+            )
+        if resume_tokens != resume_seqs * seq_len:
+            raise RuntimeError(
+                f"Resume metadata total_tokens={resume_tokens:,} does not match "
+                f"total_sequences*seq_len={resume_seqs * seq_len:,}"
+            )
+
+        prev_shard_infos = prev_meta.get("shards", [])
+        if not isinstance(prev_shard_infos, list):
+            raise RuntimeError("Resume metadata field 'shards' must be a list")
+        if len(prev_shard_infos) != resume_shards:
+            raise RuntimeError(
+                f"Resume metadata says num_shards={resume_shards}, but has "
+                f"{len(prev_shard_infos)} shard records; refusing to guess next shard."
+            )
+
+        if "tail_token_buffer" in prev_meta:
+            prev_tail_tokens = prev_meta["tail_token_buffer"]
+            if not isinstance(prev_tail_tokens, list):
+                raise RuntimeError("Resume metadata field 'tail_token_buffer' must be a list")
+        else:
+            prev_tail_tokens = []
+
+        print(f"{'='*60}")
+        print(f"RESUME MODE")
+        print(f"{'='*60}")
+        print(f"Previous run: {resume_tokens:,} tokens, {resume_docs:,} docs, {resume_shards} shards")
+        print(f"Remaining: {target_tokens - resume_tokens:,} tokens to collect")
+        print(f"Will skip {resume_docs:,} docs then continue...")
+        if prev_tail_tokens:
+            print(f"Restoring {len(prev_tail_tokens)} leftover tokens from previous run")
+        elif "tail_token_buffer" not in prev_meta and "discarded_tail_tokens" in prev_meta:
+            discarded = prev_meta["discarded_tail_tokens"]
+            print(
+                "Legacy metadata has no tail_token_buffer; "
+                f"discarded_tail_tokens={discarded} will remain discarded."
+            )
+        print()
+
+        if resume_tokens >= target_tokens:
+            print(f"Already have {resume_tokens:,} >= target {target_tokens:,}. Nothing to do.")
+            return
+        if is_sharded and resume_shards >= num_shards:
+            raise RuntimeError(
+                f"Resume metadata already has {resume_shards} shards, but --num_shards={num_shards}; "
+                "increase --num_shards or verify metadata before resuming."
+            )
 
     print(f"{'='*60}")
     print(f"Pretokenize C4 (TPU)")
@@ -241,7 +340,7 @@ def main():
         current_path = shard_path(output_base, current_shard)
     else:
         current_path = output_base + ".bin"
-    f_out = open_output(current_path, "wb")
+    f_out = open_new_output(current_path)
 
     def flush_pending():
         nonlocal pending_seqs
@@ -270,7 +369,7 @@ def main():
         nonlocal current_shard, f_out, current_path
         current_shard += 1
         current_path = shard_path(output_base, current_shard)
-        f_out = open_output(current_path, "wb")
+        f_out = open_new_output(current_path)
 
     try:
         for example in data_iter:
@@ -351,6 +450,7 @@ def main():
         "num_shards": len(shard_infos),
         "shards": shard_infos,
         "docs_consumed": docs_processed,
+        "docs_processed": docs_processed,
         "tail_token_buffer": token_buffer[:seq_len],  # save leftover for resume
         "discarded_tail_tokens": len(token_buffer),
         "elapsed_seconds": round(elapsed, 1),
