@@ -186,9 +186,11 @@ class ShardedBinDataset:
     """
 
     def __init__(self, meta_path: str, seq_len: int = 512,
-                 max_sequences: int = None, local_cache_dir: str = None):
+                 max_sequences: int = None, local_cache_dir: str = None,
+                 evict_previous_cache: bool = False):
         self.seq_len = seq_len
         self.local_cache_dir = local_cache_dir
+        self.evict_previous_cache = evict_previous_cache
 
         meta = _read_json(meta_path)
         self.shard_infos = meta['shards']  # list of {path, sequences, tokens}
@@ -209,23 +211,28 @@ class ShardedBinDataset:
         # Current shard state
         self._current_shard_idx = -1
         self._current_data = None
+        self._current_cache_path = None
 
         print(f"  ShardedBinDataset: {meta_path}")
         print(f"    {len(self.shard_infos)} shards, {self._total_seqs:,} sequences, "
               f"{self._total_seqs * seq_len:,} tokens")
+        if self.evict_previous_cache:
+            print("    Evict previous local shard cache: enabled")
 
     def _load_shard(self, shard_idx: int):
         """Load a specific shard into memory."""
         if shard_idx == self._current_shard_idx:
             return  # already loaded
 
+        previous_cache_path = self._current_cache_path
         info = self.shard_infos[shard_idx]
         path = info['path']
+        cache_path = None
 
         if is_gcs_path(path) and self.local_cache_dir:
-            local_path = _gcs_path_to_local(path, self.local_cache_dir)
-            _copy_gcs_to_local(path, local_path)
-            raw = _read_bin_local(local_path)
+            cache_path = _gcs_path_to_local(path, self.local_cache_dir)
+            _copy_gcs_to_local(path, cache_path)
+            raw = _read_bin_local(cache_path)
         elif is_gcs_path(path):
             raw = _read_bin_gcs(path)
         else:
@@ -234,6 +241,19 @@ class ShardedBinDataset:
         n_seqs = len(raw) // self.seq_len
         self._current_data = raw[:n_seqs * self.seq_len].reshape(n_seqs, self.seq_len)
         self._current_shard_idx = shard_idx
+        self._current_cache_path = cache_path
+
+        if (self.evict_previous_cache and previous_cache_path
+                and previous_cache_path != cache_path):
+            try:
+                import gc
+                gc.collect()
+                os.remove(previous_cache_path)
+                print(f"    Evicted cache: {previous_cache_path}")
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"    Warning: failed to evict cache {previous_cache_path}: {e}")
 
     def _find_shard(self, global_seq_idx: int):
         """Find which shard contains a given global sequence index."""
@@ -387,6 +407,7 @@ def load_data(data_config, max_length=512, batch_size=128,
          bin_train: gs://bucket/data/c4_train
          bin_val: gs://bucket/data/c4_val.bin
          local_cache_dir: /tmp/data
+         evict_train_shard_cache: true  # optional, useful for one-pass training
 
     Args:
         data_config: Dict with bin_train, bin_val, and optional fields.
@@ -406,6 +427,9 @@ def load_data(data_config, max_length=512, batch_size=128,
     train_path = data_config.get("bin_train")
     val_path = data_config.get("bin_val")
     local_cache_dir = data_config.get("local_cache_dir", None)
+    evict_train_shard_cache = bool(
+        data_config.get("evict_train_shard_cache", False)
+    )
 
     if train_path is None or val_path is None:
         raise ValueError(
@@ -423,9 +447,11 @@ def load_data(data_config, max_length=512, batch_size=128,
 
     # ---- Build datasets (all hosts load the full dataset for offset-based slicing) ----
     train_dataset = _build_dataset(
-        train_path, seq_len, max_train_seqs, local_cache_dir)
+        train_path, seq_len, max_train_seqs, local_cache_dir,
+        evict_previous_cache=evict_train_shard_cache)
     val_dataset = _build_dataset(
-        val_path, seq_len, max_val_seqs, local_cache_dir)
+        val_path, seq_len, max_val_seqs, local_cache_dir,
+        evict_previous_cache=False)
 
     # ---- Create loaders (multi-host: each host reads its own slice) ----
     train_loader = BinDataLoader(
@@ -462,6 +488,8 @@ def load_data(data_config, max_length=512, batch_size=128,
             print(f"  Per-device batch: {per_host_batch // n_devices}")
         if local_cache_dir:
             print(f"  Local cache: {local_cache_dir}")
+        if evict_train_shard_cache:
+            print("  Evict train shard cache: enabled")
 
     return train_loader, val_loader, vocab_size
 
@@ -500,14 +528,16 @@ def _is_sharded(path: str) -> bool:
         return False
 
 
-def _build_dataset(path, seq_len, max_sequences, local_cache_dir):
+def _build_dataset(path, seq_len, max_sequences, local_cache_dir,
+                   evict_previous_cache=False):
     """Build the appropriate dataset type based on path and metadata."""
     if _is_sharded(path):
         meta_path = _meta_path_for(path)
         return ShardedBinDataset(
             meta_path, seq_len,
             max_sequences=max_sequences,
-            local_cache_dir=local_cache_dir)
+            local_cache_dir=local_cache_dir,
+            evict_previous_cache=evict_previous_cache)
     else:
         # Single .bin file
         bin_path = path if path.endswith(".bin") else path + ".bin"

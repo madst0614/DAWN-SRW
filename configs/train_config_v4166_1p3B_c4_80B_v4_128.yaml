@@ -1,0 +1,112 @@
+seed: 1
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 80000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+  evict_train_shard_cache: true
+
+model:
+  model_version: spatial-r1-v4.1.6.6
+  vocab_size: 30522
+  d_model: 4096
+  n_layers: 24
+  n_heads: 32      # head_dim = 128
+  max_seq_len: 512
+  dropout: 0.0
+  router_dropout: 0.0
+  gradient_checkpointing: true
+  d_route: 384
+  n_qk: 7048
+  n_v: 21932
+  n_rst: 58896
+  tau_init_min: -0.95
+  tau_init_max: 0.95
+  tau_init_mode: quantile_frac
+  tau_init_target_qk_frac: 0.10
+  tau_init_target_v_frac: 0.04
+  tau_init_target_rst_frac: 0.02
+
+training:
+  batch_size: 2048
+  mesh_model: 4
+  mesh_data: 16
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  n_chunks_qk: 1
+  n_chunks_v: 2
+  n_chunks_rst: 8
+  lr: 0.0002
+  warmup_ratio: 0.06
+  weight_decay: 0.1
+  tau_lr_mult: 0.0
+  tau_grad_clip: 2.0
+  router_proj_lr_mult: 1.0
+  router_proj_grad_clip: 2.0
+  op_key_lr_mult: 1.0
+  op_key_grad_clip: 2.0
+
+  diversity_weight: 0.0
+  load_balance_weight: 0.0
+  dead_penalty_weight: 0.0
+  dead_exposure_target: 0.0
+
+  selection_calibration:
+    enabled: true
+
+    calibration_tokens: 16777216
+    calibration_max_batches: 64
+    histogram_bins: 16384
+    score_min: -1.0
+    score_max: 1.0
+    candidate_eps: 1.0e-3
+
+    active_target:
+      qk: 0.08
+      v: 0.05
+      rst: 0.012
+
+    candidate_target_start:
+      qk: 0.16
+      v: 0.10
+      rst: 0.016
+
+    candidate_target_final:
+      qk: 0.08
+      v: 0.05
+      rst: 0.012
+
+    B_floor:
+      qk: 0.001
+      v: 0.001
+      rst: 0.001
+
+    annealing:
+      unit: tokens
+      shrink_start_tokens: 5000000000
+      shrink_end_tokens: 20000000000
+
+  soft_gate_effective_active_eps: 1.0e-06
+  admission_den_power: 0.5
+  admission_den_grad_scale: 1.0
+
+  soft_gate_boundary_power_start: 3.0
+  soft_gate_boundary_power_mid: 3.0
+  soft_gate_boundary_power_final: 4.0
+  soft_gate_boundary_power_start_frac: 0.0
+  soft_gate_boundary_power_mid_frac: 0.360
+  soft_gate_boundary_power_final_frac: 1.000
+
+  eval_effective_prune_enabled: true
+  eval_effective_prune_eps_list:
+    - 1.0e-06
+    - 1.0e-05
+    - 0.0001
+  checkpoint_interval: 200
+  val_interval: 200
+  log_interval: 100
+  log_analysis_multiplier: 10
+  heavy_geometry_multiplier: 10
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_80B_v4_128
