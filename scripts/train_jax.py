@@ -3091,6 +3091,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _inactive_aux_full_frac = jnp.float32(inactive_aux_full_frac)
     _inactive_aux_schedule = str(inactive_aux_schedule).lower()
     _compact_train_metrics = bool(compact_train_metrics)
+    _train_drift_diagnostics = not _compact_train_metrics
     _keep_train_layer_metrics = bool(keep_train_layer_metrics)
     _heavy_keys = {
         'per_token_ce',
@@ -4336,7 +4337,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         # Operator-key drift is diagnostic-only. It is computed inside jit so
         # every host participates in the same reductions on multi-host meshes.
-        if 'neuron_pool' not in new_params:
+        if (not _train_drift_diagnostics) or _is_baseline_model:
+            drift_attn_qk_op_key = jnp.float32(0.0)
+            drift_attn_v_op_key = jnp.float32(0.0)
+            drift_rst_op_key = jnp.float32(0.0)
+        elif 'neuron_pool' not in new_params:
             drift_attn_qk_op_key = jnp.float32(0.0)
             drift_attn_v_op_key = jnp.float32(0.0)
             drift_rst_op_key = jnp.float32(0.0)
@@ -9957,6 +9962,10 @@ def main():
         pool_specific_gate_t = False
         boundary_power_schedule_active = False
 
+    compact_train_metrics = _is_active_srw_version(model_version_cfg)
+    drift_diagnostics_enabled = (
+        (not bool(compact_train_metrics)) and not is_baseline)
+
     if not inactive_aux_enabled:
         inactive_aux_weight = 0.0
         inactive_aux_weight_q = 0.0
@@ -11269,7 +11278,7 @@ def main():
         inactive_aux_schedule=inactive_aux_schedule,
         sharded_fns=_sharded_fns, mesh=mesh,
         is_baseline=is_baseline,
-        compact_train_metrics=_is_active_srw_version(model_version_cfg),
+        compact_train_metrics=compact_train_metrics,
         keep_train_layer_metrics=False)
     eval_step_fn = create_eval_step(
         model, sharded_fns=_sharded_fns, return_dead_stats=True,
@@ -11405,6 +11414,14 @@ def main():
             'rst_op_key': pool['rst_read'],
         }
 
+    def _dummy_drift_snap():
+        z = jnp.zeros((), dtype=jnp.float32)
+        return {
+            'attn_qk_op_key': z,
+            'attn_v_op_key': z,
+            'rst_op_key': z,
+        }
+
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile
     # ----------------------------------------------------------
@@ -11432,7 +11449,10 @@ def main():
             data_sharding, global_shape)
         rng, dummy_step_rng = jax.random.split(rng)
 
-        _dummy_op_key_snap = _drift_snap(params)
+        if drift_diagnostics_enabled:
+            _dummy_op_key_snap = _drift_snap(params)
+        else:
+            _dummy_op_key_snap = _dummy_drift_snap()
 
         # First call: JIT compilation (slow)
         jit_start = time.time()
@@ -12029,10 +12049,12 @@ def main():
               f" val={val_interval}",
               flush=True)
 
-    # Operator-key drift snapshot. Held on every host, refreshed at
-    # each log event. Fed into train_step so the drift collective runs inside
-    # jit on all hosts; the actual norm reductions live there.
-    _prev_op_key_snap = _drift_snap(params)
+    # Operator-key drift snapshot. Non-compact runs refresh the real snap at
+    # log events; compact/baseline runs carry dummy zero leaves.
+    if drift_diagnostics_enabled:
+        _prev_op_key_snap = _drift_snap(params)
+    else:
+        _prev_op_key_snap = _dummy_drift_snap()
     _latest_val_dead_stats = None
     _latest_val_dead_step = None
 
@@ -12149,10 +12171,10 @@ def main():
             is_regular = (global_step % LOG_REGULAR == 0) or _is_early_log
 
             if is_regular:
-                # Refresh op-key drift snapshot on every host (ref reassignment
-                # only -no collective). Must run outside is_host0 so the
-                # next jit'd train_step sees a consistent snap pytree.
-                _prev_op_key_snap = _drift_snap(params)
+                # Refresh the real op-key drift snapshot on every host when
+                # diagnostics are enabled; compact/baseline keep the dummy snap.
+                if drift_diagnostics_enabled:
+                    _prev_op_key_snap = _drift_snap(params)
                 _raw_step_time_window = time.time() - win_start_time
                 _regular_logging_t0 = time.time()
                 # One TPU-to-CPU sync for the whole window.
