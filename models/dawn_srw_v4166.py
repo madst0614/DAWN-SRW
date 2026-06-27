@@ -4189,12 +4189,11 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
     def _selection_rho(h, op_key):
         q_unit = _forward_unit_direction(
             h.astype(jnp.float32)).astype(jnp.bfloat16)
-        op_key_unit = _forward_unit_direction(
-            op_key.astype(jnp.float32)).astype(jnp.bfloat16)
+        op_key_unit = op_key.astype(jnp.bfloat16)
         return (q_unit @ op_key_unit.T).astype(jnp.float32)
 
     pool = params['neuron_pool']
-    op_keys = _pool_operator_keys(pool)
+    op_keys = _ensure_pool_operator_keys(pool)
     qk_op_key = op_keys['attn_qk_op_key']
     v_op_key = op_keys['attn_v_op_key']
     rst_op_key = op_keys['rst_op_key']

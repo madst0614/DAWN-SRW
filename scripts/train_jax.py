@@ -67,6 +67,7 @@ from models.dawn_srw_v4164 import (
 )
 from models.dawn_srw_v4166 import (
     DAWN_SRW_V4166,
+    _pool_operator_keys as _v4166_pool_operator_keys,
     _raw_tau_init_from_cosine_tau as _v4166_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4166_tau_init_calibration_scores,
 )
@@ -138,6 +139,7 @@ V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (V4164_MODEL_VERSION, V4166_MODEL_VERSION)
 CHECKPOINT_SCHEMA_VERSION = 3
+DEFAULT_SELECTION_CALIBRATION_SCORE_CHUNK_TOKENS = 2048
 MODEL_REGISTRY = {
     V4164_MODEL_VERSION: {
         'class': DAWN_SRW_V4164,
@@ -911,20 +913,8 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
     # Keep the one-time JIT signature small: calibration needs only selection
     # geometry, not tau params or LM output weights.
     if version == V4166_MODEL_VERSION:
-        pool_params = {
-            'attn_qk_read': params['neuron_pool']['attn_qk_read'],
-            'attn_qk_write': params['neuron_pool']['attn_qk_write'],
-            'attn_qk_op_read_proj': params['neuron_pool']['attn_qk_op_read_proj'],
-            'attn_qk_op_write_proj': params['neuron_pool']['attn_qk_op_write_proj'],
-            'attn_v_read': params['neuron_pool']['attn_v_read'],
-            'attn_v_write': params['neuron_pool']['attn_v_write'],
-            'attn_v_op_read_proj': params['neuron_pool']['attn_v_op_read_proj'],
-            'attn_v_op_write_proj': params['neuron_pool']['attn_v_op_write_proj'],
-            'rst_read': params['neuron_pool']['rst_read'],
-            'rst_write': params['neuron_pool']['rst_write'],
-            'rst_op_read_proj': params['neuron_pool']['rst_op_read_proj'],
-            'rst_op_write_proj': params['neuron_pool']['rst_op_write_proj'],
-        }
+        pool_params = jax.jit(_v4166_pool_operator_keys)(
+            params['neuron_pool'])
     else:
         pool_params = {
             'attn_qk_emb': params['neuron_pool']['attn_qk_emb'],
@@ -1078,6 +1068,9 @@ def _selection_calibration_config(cfg, tau_init_cfg=None):
     calibration_tokens = int(raw.get('calibration_tokens', 0))
     calibration_max_batches = int(raw.get('calibration_max_batches', 0))
     histogram_bins = int(raw.get('histogram_bins', 0))
+    score_chunk_tokens = int(raw.get(
+        'score_chunk_tokens',
+        DEFAULT_SELECTION_CALIBRATION_SCORE_CHUNK_TOKENS))
     score_min = float(raw.get('score_min', -1.0))
     score_max = float(raw.get('score_max', 1.0))
     candidate_eps = float(raw.get('candidate_eps', 1.0e-3))
@@ -1093,6 +1086,10 @@ def _selection_calibration_config(cfg, tau_init_cfg=None):
         raise ValueError(
             "selection_calibration.histogram_bins must be > 0, "
             f"got {histogram_bins}.")
+    if score_chunk_tokens <= 0:
+        raise ValueError(
+            "selection_calibration.score_chunk_tokens must be > 0, "
+            f"got {score_chunk_tokens}.")
     if (not np.isfinite(score_min) or not np.isfinite(score_max)
             or score_min >= score_max):
         raise ValueError(
@@ -1204,6 +1201,7 @@ def _selection_calibration_config(cfg, tau_init_cfg=None):
         'calibration_tokens': calibration_tokens,
         'calibration_max_batches': calibration_max_batches,
         'histogram_bins': histogram_bins,
+        'score_chunk_tokens': score_chunk_tokens,
         'score_min': score_min,
         'score_max': score_max,
         'candidate_eps': candidate_eps,
@@ -1272,6 +1270,29 @@ def _make_selection_calibration_histogram_fn(
     return jax.jit(_hist_fn)
 
 
+def _selection_calibration_row_chunk_size(
+        batch_rows, seq_len, score_chunk_tokens):
+    """Pick a stable row chunk whose token count fits the score budget."""
+    batch_rows = int(batch_rows)
+    seq_len = int(seq_len)
+    score_chunk_tokens = int(score_chunk_tokens)
+    if batch_rows <= 0:
+        raise ValueError(
+            f"selection calibration batch must have rows, got {batch_rows}.")
+    if seq_len <= 0:
+        raise ValueError(
+            f"selection calibration sequence length must be > 0, got {seq_len}.")
+    if score_chunk_tokens <= 0:
+        raise ValueError(
+            "selection_calibration.score_chunk_tokens must be > 0, "
+            f"got {score_chunk_tokens}.")
+
+    row_chunk = max(1, min(batch_rows, score_chunk_tokens // seq_len))
+    while row_chunk > 1 and batch_rows % row_chunk != 0:
+        row_chunk -= 1
+    return row_chunk
+
+
 def _collect_selection_calibration_histograms(
         params, train_loader, cfg, selection_calibration_cfg):
     """Stream real training batches and keep only host-side hist counts."""
@@ -1280,9 +1301,10 @@ def _collect_selection_calibration_histograms(
     process_count = max(1, int(jax.process_count()))
     local_calibration_tokens = int(
         math.ceil(global_calibration_tokens / process_count))
+    score_chunk_tokens = int(
+        selection_calibration_cfg['score_chunk_tokens'])
     _version, score_impl, score_params, score_kwargs = (
-        _srw_selection_score_setup(
-            params, cfg, local_calibration_tokens))
+        _srw_selection_score_setup(params, cfg, score_chunk_tokens))
     hist_fn = _make_selection_calibration_histogram_fn(
         score_impl,
         score_kwargs,
@@ -1299,7 +1321,8 @@ def _collect_selection_calibration_histograms(
     if jax.process_index() == 0:
         print(
             "\r[selection_calibration] "
-            "compiling/running histogram calibration...",
+            "compiling/running histogram calibration "
+            f"(score_chunk_tokens={score_chunk_tokens})...",
             end="",
             flush=True)
     for input_ids, _attention_mask in train_loader:
@@ -1307,11 +1330,29 @@ def _collect_selection_calibration_histograms(
                 or actual_batches >=
                 selection_calibration_cfg['calibration_max_batches']):
             break
-        batch_counts, token_count = hist_fn(score_params, input_ids)
-        host_counts = jax.device_get(batch_counts)
-        for pool in POOL_SCHEDULE_NAMES:
-            counts[pool] += np.asarray(host_counts[pool], dtype=np.int64)
-        seen_tokens += int(jax.device_get(token_count))
+        input_ids = np.asarray(input_ids, dtype=np.int32)
+        if input_ids.ndim != 2:
+            raise ValueError(
+                "selection calibration input_ids must be rank 2 "
+                f"[batch, seq], got shape={input_ids.shape}.")
+        batch_rows, seq_len = input_ids.shape
+        row_chunk = _selection_calibration_row_chunk_size(
+            batch_rows, seq_len, score_chunk_tokens)
+        batch_processed = False
+        for row_start in range(0, batch_rows, row_chunk):
+            if seen_tokens >= local_calibration_tokens:
+                break
+            row_end = min(row_start + row_chunk, batch_rows)
+            batch_counts, token_count = hist_fn(
+                score_params, input_ids[row_start:row_end])
+            host_counts = jax.device_get(batch_counts)
+            for pool in POOL_SCHEDULE_NAMES:
+                counts[pool] += np.asarray(
+                    host_counts[pool], dtype=np.int64)
+            seen_tokens += int(jax.device_get(token_count))
+            batch_processed = True
+        if not batch_processed:
+            break
         actual_batches += 1
         if jax.process_index() == 0:
             pct = min(
@@ -1444,6 +1485,8 @@ def _compute_srw_selection_calibration(
             int(actual_batches),
         'selection_calibration_histogram_bins':
             int(selection_calibration_cfg['histogram_bins']),
+        'selection_calibration_score_chunk_tokens':
+            int(selection_calibration_cfg['score_chunk_tokens']),
         'selection_calibration_score_min': float(score_min),
         'selection_calibration_score_max': float(score_max),
         'selection_calibration_candidate_eps':
@@ -1678,6 +1721,8 @@ def _selection_calibration_summary_lines(summary):
         "actual_batches_per_host_or_max="
         f"{summary['selection_calibration_actual_batches_per_host_or_max']}",
         f"histogram_bins={summary['selection_calibration_histogram_bins']}",
+        "score_chunk_tokens="
+        f"{summary.get('selection_calibration_score_chunk_tokens', 'unknown')}",
         "score_range=["
         f"{summary['selection_calibration_score_min']}, "
         f"{summary['selection_calibration_score_max']}]",
