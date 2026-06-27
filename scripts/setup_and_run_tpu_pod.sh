@@ -93,10 +93,37 @@ else
     export XLA_FLAGS="$XLA_FLAGS --xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
 fi
 
+# Route baseline configs to the trainer that registers model_version=baseline.
+MODEL_VERSION="$(python3 - "$CONFIG" <<'PY'
+import sys
+import yaml
+
+path = sys.argv[1]
+if path.startswith("gs://"):
+    import gcsfs
+    with gcsfs.GCSFileSystem().open(path, "r") as f:
+        cfg = yaml.safe_load(f) or {}
+else:
+    with open(path, "r") as f:
+        cfg = yaml.safe_load(f) or {}
+print(str((cfg.get("model") or {}).get("model_version", "")))
+PY
+)"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-}"
+if [ -z "$TRAIN_SCRIPT" ]; then
+    if [ "$MODEL_VERSION" = "baseline" ]; then
+        TRAIN_SCRIPT="scripts/train_jax_legacy.py"
+    else
+        TRAIN_SCRIPT="scripts/train_jax.py"
+    fi
+fi
+
 # Start new tmux session running training, tee to ~/train.log
 TRAIN_ARGS="${TRAIN_ARGS:-}"
+echo "  Model version: $MODEL_VERSION"
+echo "  Trainer: $TRAIN_SCRIPT"
 tmux new-session -d -s train \
-    "export XLA_DUMP_DIR='$XLA_DUMP_DIR'; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; export XLA_FLAGS='$XLA_FLAGS'; python3 scripts/train_jax.py --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+    "export XLA_DUMP_DIR='$XLA_DUMP_DIR'; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; export XLA_FLAGS='$XLA_FLAGS'; python3 '$TRAIN_SCRIPT' --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"
