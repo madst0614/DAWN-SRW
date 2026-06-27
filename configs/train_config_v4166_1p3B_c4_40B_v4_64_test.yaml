@@ -35,8 +35,8 @@ training:
   gradient_accumulation_steps: 1
   num_epochs: 1
   n_chunks_qk: 1
-  n_chunks_v: 2
-  n_chunks_rst: 8
+  n_chunks_v: 1
+  n_chunks_rst: 4
   lr: 0.0002
   warmup_ratio: 0.06
   weight_decay: 0.1
@@ -98,7 +98,7 @@ training:
   soft_gate_boundary_power_mid_frac: 0.360
   soft_gate_boundary_power_final_frac: 1.000
 
-  eval_effective_prune_enabled: true
+  eval_effective_prune_enabled: false
   eval_effective_prune_eps_list:
     - 1.0e-06
     - 1.0e-05
@@ -106,7 +106,8 @@ training:
   checkpoint_interval: 2
   val_interval: 2
   log_interval: 1
-  log_analysis_multiplier: 1
-  heavy_geometry_multiplier: 1
+  log_analysis_multiplier: 1000000
+  heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_40B_v4_64_test
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_40B_v4_64_b512_eval_ckpt_test
+log_dir: logs/dawn_srw_v4166_1p3B_c4_40B_v4_64_b512_eval_ckpt_test

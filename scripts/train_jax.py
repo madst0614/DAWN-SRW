@@ -71,6 +71,7 @@ from models.dawn_srw_v4166 import (
     _raw_tau_init_from_cosine_tau as _v4166_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4166_tau_init_calibration_scores,
 )
+from models.baseline_transformer_jax import VanillaTransformer
 
 
 def _jax_distributed_is_initialized():
@@ -136,11 +137,19 @@ def _maybe_initialize_jax_distributed():
 
 V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
 V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
+BASELINE_MODEL_VERSION = 'baseline'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (V4164_MODEL_VERSION, V4166_MODEL_VERSION)
 CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_SELECTION_CALIBRATION_SCORE_CHUNK_TOKENS = 2048
 MODEL_REGISTRY = {
+    BASELINE_MODEL_VERSION: {
+        'class': VanillaTransformer,
+        'module': 'models.baseline_transformer_jax',
+        'raw_tau_init_from_cosine_tau': None,
+        'tau_init_calibration_scores': None,
+        'is_baseline': True,
+    },
     V4164_MODEL_VERSION: {
         'class': DAWN_SRW_V4164,
         'module': 'models.dawn_srw_v4164',
@@ -210,12 +219,16 @@ def _is_active_srw_version(version):
     return str(version) in ACTIVE_SRW_MODEL_VERSIONS
 
 
+def _is_baseline_version(version):
+    return str(version) in (BASELINE_MODEL_VERSION, 'baseline-JAX')
+
+
 def _model_registry_entry(version):
     try:
         return MODEL_REGISTRY[str(version)]
     except KeyError as exc:
         raise ValueError(
-            f"Unsupported DAWN-SRW model_version={version!r}; "
+            f"Unsupported model_version={version!r}; "
             f"supported={list(MODEL_REGISTRY)}") from exc
 
 DIRECT_TAU_SELECT_METRIC_NAMES = (
@@ -753,6 +766,20 @@ def _v4164_base_kwargs(cfg):
     )
 
 
+def _baseline_kwargs(cfg):
+    m = cfg["model"]
+    return dict(
+        vocab_size=m.get("vocab_size", 30522),
+        d_model=m.get("d_model", 384),
+        d_ff=m.get("d_ff", 1536),
+        n_layers=m.get("n_layers", 12),
+        n_heads=m.get("n_heads", 6),
+        max_seq_len=m.get("max_seq_len", 512),
+        dropout_rate=m.get("dropout", 0.1),
+        gradient_checkpointing=m.get("gradient_checkpointing", False),
+    )
+
+
 def _v4164_model_base_kwargs(cfg):
     """v4164 d_route-only routing kwargs."""
     kw = _v4164_base_kwargs(cfg)
@@ -895,6 +922,8 @@ def _v4164_sharded_kwargs(cfg):
 def build_model_from_config(cfg):
     """Build an active DAWN-SRW model from config."""
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
+    if _is_baseline_version(version):
+        return VanillaTransformer(**_baseline_kwargs(cfg))
     entry = _model_registry_entry(version)
     kwargs = _dawn_srw_kwargs(cfg)
     print(f"route dims: d_route={kwargs['d_route']}")
@@ -2866,6 +2895,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       inactive_aux_full_frac=0.0,
                       inactive_aux_schedule='linear',
                       sharded_fns=None, mesh=None,
+                      is_baseline=False,
                       compact_train_metrics=False,
                       keep_train_layer_metrics=False):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
@@ -2992,9 +3022,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
+    _is_baseline_model = bool(is_baseline) or _is_baseline_version(_model_version)
     _is_soft_direct_tau = _is_active_srw_version(_model_version)
     _is_v4166_model = str(_model_version) == V4166_MODEL_VERSION
     _is_boundary_power_model = _is_active_srw_version(_model_version)
+    if _is_baseline_model:
+        _cb1a_enabled = False
+        _dead_penalty_qk_weight = jnp.float32(0.0)
+        _dead_penalty_v_weight = jnp.float32(0.0)
+        _dead_penalty_rst_weight = jnp.float32(0.0)
+        _dead_weighted_clip = jnp.float32(0.0)
+        _inactive_aux_enabled = False
     if _is_soft_direct_tau:
         # Official v4164 train path keeps the soft DirectTau loss surface.
         _cb1a_enabled = False
@@ -3134,7 +3172,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 **extra_kw,
             )
             ce_loss = result['loss']
-            aux_loss = result['aux_loss']
+            aux_loss = result.get('aux_loss', jnp.float32(0.0))
             tau_reg = result.get('tau_reg', jnp.float32(0.0))
             dead_penalty_unweighted = result.get(
                 'dead_penalty', jnp.float32(0.0))
@@ -3519,7 +3557,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _dead_weighted_clip > 0.0,
                 jnp.minimum(dead_penalty_weighted_unclipped, _dead_weighted_clip),
                 dead_penalty_weighted_unclipped)
-            if _is_soft_direct_tau:
+            if _is_baseline_model:
+                tau_reg = jnp.float32(0.0)
+                dead_penalty = jnp.float32(0.0)
+                dead_penalty_weighted_unclipped = jnp.float32(0.0)
+                dead_penalty_weighted = jnp.float32(0.0)
+                inactive_aux_loss_weighted_unclipped = jnp.float32(0.0)
+                inactive_aux_loss_weighted = jnp.float32(0.0)
+                cb1a_loss_weighted = jnp.float32(0.0)
+                orth_loss = jnp.float32(0.0)
+                div_loss = jnp.float32(0.0)
+                total_loss = ce_loss
+            elif _is_soft_direct_tau:
                 # v4164 reports admission exposure diagnostics but keeps the
                 # active loss surface clean. No dead repair loss is active here.
                 dead_penalty_weighted_unclipped = jnp.float32(0.0)
@@ -4372,7 +4421,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         dead_penalty_weighted_metric = inactive_aux_stats['dead_penalty_weighted_clipped']
         dead_penalty_weighted_unclipped_metric = inactive_aux_stats['dead_penalty_weighted_unclipped']
 
-        if _is_soft_direct_tau:
+        if _is_baseline_model:
+            aux_loss_weighted_metric = jnp.float32(0.0)
+            load_balance_loss_weighted_metric = jnp.float32(0.0)
+            tau_reg_weighted_metric = jnp.float32(0.0)
+            orth_loss_weighted_metric = jnp.float32(0.0)
+            diversity_loss_weighted_metric = jnp.float32(0.0)
+            inactive_aux_loss_weighted_metric = jnp.float32(0.0)
+            inactive_aux_loss_weighted_unclipped_metric = jnp.float32(0.0)
+            cb1a_weighted_metric = jnp.float32(0.0)
+            dead_penalty_weighted_metric = jnp.float32(0.0)
+            dead_penalty_weighted_unclipped_metric = jnp.float32(0.0)
+        elif _is_soft_direct_tau:
             aux_loss_weighted_metric = jnp.float32(0.0)
             load_balance_loss_weighted_metric = jnp.float32(0.0)
             tau_reg_weighted_metric = jnp.float32(0.0)
@@ -9042,6 +9102,7 @@ def main():
     tcfg = cfg['training']
     model_version_cfg = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     is_v4164_cfg = _is_active_srw_version(model_version_cfg)
+    is_baseline = _is_baseline_version(model_version_cfg)
     tau_init_cfg = (
         _v4164_tau_init_config(cfg)
         if _is_active_srw_version(model_version_cfg)
@@ -9470,6 +9531,7 @@ def main():
         tcfg = cfg['training']
         model_version_cfg = cfg['model']['model_version']
         is_v4164_cfg = _is_active_srw_version(model_version_cfg)
+        is_baseline = _is_baseline_version(model_version_cfg)
         tau_init_cfg = (
             _v4164_tau_init_config(cfg)
             if _is_active_srw_version(model_version_cfg)
@@ -9858,6 +9920,43 @@ def main():
         pool_specific_gate_t = True
         boundary_power_schedule_active = True
 
+    is_baseline = _is_baseline_version(model_version_cfg)
+    if is_baseline:
+        pool_weight_decay = 0.0
+        div_weight = 0.0
+        lb_weight = 0.0
+        tau_reg_weight = 0.0
+        dead_penalty_weight = 0.0
+        dead_penalty_qk_weight = 0.0
+        dead_penalty_v_weight = 0.0
+        dead_penalty_rst_weight = 0.0
+        dead_exposure_target = 0.0
+        inactive_aux_enabled = False
+        inactive_aux_weight = 0.0
+        inactive_aux_weight_q = 0.0
+        inactive_aux_weight_k = 0.0
+        inactive_aux_weight_qk = 0.0
+        inactive_aux_weight_v = 0.0
+        inactive_aux_weight_rst = 0.0
+        inactive_aux_asymmetry = 0.0
+        inactive_aux_asymmetry_q = 0.0
+        inactive_aux_asymmetry_k = 0.0
+        inactive_aux_asymmetry_qk = 0.0
+        inactive_aux_asymmetry_v = 0.0
+        inactive_aux_asymmetry_rst = 0.0
+        inactive_aux_weighted_clip = 0.0
+        dead_penalty_weighted_clip = 0.0
+        cb1a_enabled = False
+        cb1a_weight = 0.0
+        cb1a_challenge_weight = 0.0
+        cb1a_prune_weight = 0.0
+        cb1a_qk_weight = 0.0
+        cb1a_v_weight = 0.0
+        cb1a_rst_weight = 0.0
+        soft_gate_schedule_active = False
+        pool_specific_gate_t = False
+        boundary_power_schedule_active = False
+
     if not inactive_aux_enabled:
         inactive_aux_weight = 0.0
         inactive_aux_weight_q = 0.0
@@ -10162,9 +10261,12 @@ def main():
         print(f"Config: {config_path}")
         if resume_step is None:
             print("Config source: current YAML")
-            print(
-                "Selection calibration policy: fresh init computes; "
-                "resume restores from checkpoint.")
+            if _is_active_srw_version(model_version_cfg):
+                print(
+                    "Selection calibration policy: fresh init computes; "
+                    "resume restores from checkpoint.")
+            elif is_baseline:
+                print("Selection calibration/tau init: disabled for baseline.")
         print(f"Run folder: {checkpoint_dir}")
         print(f"Latest checkpoint dir: {_join(checkpoint_dir, 'checkpoints')}")
         print(
@@ -10530,18 +10632,21 @@ def main():
             f"    console={regular_console_level} "
             f"host_timing={regular_console_host_timing}")
         print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
-        _gate_intensity_part = ""
-        gate_msg = (
-            f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
-            f"tau_init_mode={tau_init_cfg['mode']} "
-            f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
-            f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
-            f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
-            f"{_gate_intensity_part}"
-            f"dropout={cfg['model'].get('dropout', None)} "
-            f"router_dropout={cfg['model'].get('router_dropout', None)}"
-        )
-        print(gate_msg)
+        if _is_active_srw_version(model_version_cfg):
+            _gate_intensity_part = ""
+            gate_msg = (
+                f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
+                f"tau_init_mode={tau_init_cfg['mode']} "
+                f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
+                f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
+                f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
+                f"{_gate_intensity_part}"
+                f"dropout={cfg['model'].get('dropout', None)} "
+                f"router_dropout={cfg['model'].get('router_dropout', None)}"
+            )
+            print(gate_msg)
+        elif is_baseline:
+            print("  Baseline loss: CE only; SRW tau/selection disabled.")
 
     # ----------------------------------------------------------
     # Resume defaults. Orbax state restore runs after mesh sharding so
@@ -10811,27 +10916,6 @@ def main():
             nc += 1
         return min(nc, N)
 
-    target_chunk_gb = cfg['training'].get('target_chunk_gb', 2.0)
-    n_rst = cfg['model'].get('n_rst', cfg['model'].get('n_know', 25200))
-    n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
-    n_v = cfg['model'].get('n_v', 2600)
-    for _name, _N in (('n_rst', n_rst), ('n_qk', n_qk), ('n_v', n_v)):
-        if _N % mesh_model != 0:
-            raise ValueError(
-                f"{_name}={_N} must be divisible by mesh_model={mesh_model} "
-                "for model-axis sharding.")
-    # N_local = N / mesh_model (each chip's share)
-    nrst_local = n_rst // mesh_model
-    nqk_local = n_qk // mesh_model
-    nv_local = n_v // mesh_model
-
-    n_chunks_rst = cfg['training'].get('n_chunks_rst',
-                                         auto_n_chunks(nrst_local, target_chunk_gb))
-    n_chunks_qk = cfg['training'].get('n_chunks_qk',
-                                       auto_n_chunks(nqk_local, target_chunk_gb))
-    n_chunks_v = cfg['training'].get('n_chunks_v',
-                                      auto_n_chunks(nv_local, target_chunk_gb))
-
     def _chunk_size_from_count(name, n_local, n_chunks):
         n_chunks = int(n_chunks)
         if n_chunks < 1:
@@ -10841,17 +10925,50 @@ def main():
                 f"{name} chunks={n_chunks} exceeds local pool size {n_local}")
         return max(1, int(np.ceil(n_local / n_chunks)))
 
-    attn_qk_max_chunk = _chunk_size_from_count('attn_qk', nqk_local, n_chunks_qk)
-    attn_v_max_chunk = _chunk_size_from_count('attn_v', nv_local, n_chunks_v)
-    rst_max_chunk = _chunk_size_from_count('rst', nrst_local, n_chunks_rst)
+    if _is_active_srw_version(model_version_cfg):
+        target_chunk_gb = cfg['training'].get('target_chunk_gb', 2.0)
+        n_rst = cfg['model'].get('n_rst', cfg['model'].get('n_know', 25200))
+        n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
+        n_v = cfg['model'].get('n_v', 2600)
+        for _name, _N in (('n_rst', n_rst), ('n_qk', n_qk), ('n_v', n_v)):
+            if _N % mesh_model != 0:
+                raise ValueError(
+                    f"{_name}={_N} must be divisible by mesh_model={mesh_model} "
+                    "for model-axis sharding.")
+        # N_local = N / mesh_model (each chip's share)
+        nrst_local = n_rst // mesh_model
+        nqk_local = n_qk // mesh_model
+        nv_local = n_v // mesh_model
+
+        n_chunks_rst = cfg['training'].get(
+            'n_chunks_rst', auto_n_chunks(nrst_local, target_chunk_gb))
+        n_chunks_qk = cfg['training'].get(
+            'n_chunks_qk', auto_n_chunks(nqk_local, target_chunk_gb))
+        n_chunks_v = cfg['training'].get(
+            'n_chunks_v', auto_n_chunks(nv_local, target_chunk_gb))
+
+        attn_qk_max_chunk = _chunk_size_from_count(
+            'attn_qk', nqk_local, n_chunks_qk)
+        attn_v_max_chunk = _chunk_size_from_count(
+            'attn_v', nv_local, n_chunks_v)
+        rst_max_chunk = _chunk_size_from_count(
+            'rst', nrst_local, n_chunks_rst)
+    else:
+        n_rst = n_qk = n_v = 0
+        nrst_local = nqk_local = nv_local = 0
+        n_chunks_rst = n_chunks_qk = n_chunks_v = 1
+        attn_qk_max_chunk = attn_v_max_chunk = rst_max_chunk = 1
 
     if is_host0:
         print(f"\n=== Mesh: ({mesh_data}, {mesh_model}) = "
               f"{total_devices} devices, per_device_batch={per_device_batch} ===")
-        print(f"  Chunks: rst={n_chunks_rst} (cs={nrst_local // max(n_chunks_rst,1)}), "
-              f"qk={n_chunks_qk}, attn_v={n_chunks_v}")
-        chunk_mem = per_device_batch * max_seq_len * rst_max_chunk * 2 / 1e9
-        print(f"  Est chunk mem (rst): {chunk_mem:.2f}GB bf16")
+        if _is_active_srw_version(model_version_cfg):
+            print(f"  Chunks: rst={n_chunks_rst} (cs={nrst_local // max(n_chunks_rst,1)}), "
+                  f"qk={n_chunks_qk}, attn_v={n_chunks_v}")
+            chunk_mem = per_device_batch * max_seq_len * rst_max_chunk * 2 / 1e9
+            print(f"  Est chunk mem (rst): {chunk_mem:.2f}GB bf16")
+        elif is_baseline:
+            print("  Baseline params: replicated; SRW shard_map disabled.")
 
     # Shard params: neuron_pool N-axis on 'model', rest replicated
     param_shardings = get_param_shardings(params, mesh)
@@ -10996,8 +11113,9 @@ def main():
     # is the full observational path used only by analysis_step.
     _sharded_fns = None
     _sharded_fns_analysis = None
-    _force_sharded = True
-    if mesh_model > 1 or _force_sharded:
+    _force_sharded = _is_active_srw_version(model_version_cfg)
+    if _is_active_srw_version(model_version_cfg) and (
+            mesh_model > 1 or _force_sharded):
         _srw_module_name = _model_registry_entry(model_version_cfg)['module']
         _v4164_module = __import__(_srw_module_name, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v4164_module.make_sharded_srw
@@ -11150,6 +11268,7 @@ def main():
         inactive_aux_full_frac=inactive_aux_full_frac,
         inactive_aux_schedule=inactive_aux_schedule,
         sharded_fns=_sharded_fns, mesh=mesh,
+        is_baseline=is_baseline,
         compact_train_metrics=_is_active_srw_version(model_version_cfg),
         keep_train_layer_metrics=False)
     eval_step_fn = create_eval_step(
@@ -11228,7 +11347,7 @@ def main():
     else:
         analysis_step_fn = None
     # No current-train-batch diagnostic forward.
-    geometry_step_fn = create_geometry_step(
+    geometry_step_fn = None if is_baseline else create_geometry_step(
         max_sample=int(tcfg.get(
             'geometry_max_sample',
             tcfg.get('heavy_geometry_max_sample', 512))))
@@ -11368,6 +11487,8 @@ def main():
         try:
             if not run_speed_check:
                 raise _SkipBreakdown("speed check disabled")
+            if is_baseline:
+                raise _SkipBreakdown("baseline has no SRW layer breakdown")
 
             _is_sharded = _sharded_fns is not None
             _uses_scan_offset = _is_active_srw_version(model_version)

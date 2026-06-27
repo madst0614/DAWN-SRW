@@ -55,7 +55,7 @@ training:
   selection_calibration:
     enabled: true
 
-    calibration_tokens: 16777216
+    calibration_tokens: 1
     calibration_max_batches: 64
     histogram_bins: 16384
     score_min: -1.0
@@ -103,11 +103,11 @@ training:
     - 1.0e-06
     - 1.0e-05
     - 0.0001
-  checkpoint_interval: 400
-  val_interval: 400
-  log_interval: 200
+  checkpoint_interval: 100
+  val_interval: 100
+  log_interval: 1
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_40B_v4_64_b512_trainonly
-log_dir: logs/dawn_srw_v4166_1p3B_c4_40B_v4_64_b512_trainonly
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_40B_v4_64_b512_trainonly_test
+log_dir: logs/dawn_srw_v4166_1p3B_c4_40B_v4_64_b512_trainonly_test

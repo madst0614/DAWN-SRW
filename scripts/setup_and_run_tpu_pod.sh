@@ -78,52 +78,38 @@ cd "$WORK_DIR"
 # Kill existing train session if any
 tmux kill-session -t train 2>/dev/null || true
 
-# Enable XLA dumps by default so OOM-check failures can point at the HLO
-# memory report. Keep console logging quiet; train_jax.py prints a compact
-# excerpt from the dump only when the OOM check fails.
-XLA_DUMP_DIR="${XLA_DUMP_DIR:-/tmp/xla_dump_train}"
-mkdir -p "$XLA_DUMP_DIR"
-export XLA_DUMP_DIR
+# Keep default logging quiet for normal runs. XLA HLO dumps are opt-in for
+# OOM/debug runs because they can create large amounts of text.
 export JAX_TRACEBACK_FILTERING="${JAX_TRACEBACK_FILTERING:-auto}"
 export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-0}"
 export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-2}"
-if [ -z "${XLA_FLAGS:-}" ]; then
-    export XLA_FLAGS="--xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
-else
-    export XLA_FLAGS="$XLA_FLAGS --xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
-fi
 
-# Route baseline configs to the trainer that registers model_version=baseline.
-MODEL_VERSION="$(python3 - "$CONFIG" <<'PY'
-import sys
-import yaml
-
-path = sys.argv[1]
-if path.startswith("gs://"):
-    import gcsfs
-    with gcsfs.GCSFileSystem().open(path, "r") as f:
-        cfg = yaml.safe_load(f) or {}
-else:
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f) or {}
-print(str((cfg.get("model") or {}).get("model_version", "")))
-PY
-)"
-TRAIN_SCRIPT="${TRAIN_SCRIPT:-}"
-if [ -z "$TRAIN_SCRIPT" ]; then
-    if [ "$MODEL_VERSION" = "baseline" ]; then
-        TRAIN_SCRIPT="scripts/train_jax_legacy.py"
+XLA_DUMP_EXPORT=""
+XLA_FLAGS_EXPORT=""
+if [ "${ENABLE_XLA_DUMP:-0}" = "1" ]; then
+    XLA_DUMP_DIR="${XLA_DUMP_DIR:-/tmp/xla_dump_train}"
+    mkdir -p "$XLA_DUMP_DIR"
+    export XLA_DUMP_DIR
+    if [ -z "${XLA_FLAGS:-}" ]; then
+        export XLA_FLAGS="--xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
     else
-        TRAIN_SCRIPT="scripts/train_jax.py"
+        export XLA_FLAGS="$XLA_FLAGS --xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
     fi
+    XLA_DUMP_EXPORT="export XLA_DUMP_DIR='$XLA_DUMP_DIR'; "
+    XLA_FLAGS_EXPORT="export XLA_FLAGS='$XLA_FLAGS'; "
+    echo "  XLA HLO dump: enabled ($XLA_DUMP_DIR)"
+else
+    unset XLA_DUMP_DIR
+    if [ -n "${XLA_FLAGS:-}" ]; then
+        XLA_FLAGS_EXPORT="export XLA_FLAGS='$XLA_FLAGS'; "
+    fi
+    echo "  XLA HLO dump: disabled (set ENABLE_XLA_DUMP=1 to enable)"
 fi
 
 # Start new tmux session running training, tee to ~/train.log
 TRAIN_ARGS="${TRAIN_ARGS:-}"
-echo "  Model version: $MODEL_VERSION"
-echo "  Trainer: $TRAIN_SCRIPT"
 tmux new-session -d -s train \
-    "export XLA_DUMP_DIR='$XLA_DUMP_DIR'; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; export XLA_FLAGS='$XLA_FLAGS'; python3 '$TRAIN_SCRIPT' --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+    "${XLA_DUMP_EXPORT}export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; ${XLA_FLAGS_EXPORT}python3 scripts/train_jax.py --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"
