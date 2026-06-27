@@ -36,7 +36,7 @@ training:
   num_epochs: 1
   n_chunks_qk: 1
   n_chunks_v: 1
-  n_chunks_rst: 4
+  n_chunks_rst: 8
   lr: 0.0002
   warmup_ratio: 0.06
   weight_decay: 0.1
