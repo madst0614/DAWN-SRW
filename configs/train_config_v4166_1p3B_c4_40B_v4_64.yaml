@@ -19,7 +19,7 @@ model:
   gradient_checkpointing: true
   d_route: 384
   n_qk: 7048
-  n_v: 21932
+  n_v: 21928
   n_rst: 58896
   tau_init_min: -0.95
   tau_init_max: 0.95
@@ -34,9 +34,9 @@ training:
   mesh_data: 8
   gradient_accumulation_steps: 1
   num_epochs: 1
-  n_chunks_qk: 1
-  n_chunks_v: 1
-  n_chunks_rst: 8
+  n_chunks_qk: 2
+  n_chunks_v: 2
+  n_chunks_rst: 4
   lr: 0.0002
   warmup_ratio: 0.06
   weight_decay: 0.1
