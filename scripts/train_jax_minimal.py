@@ -34,6 +34,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 import train_jax as full
 
 
+OFFICIAL_MODEL_VERSION = full.OFFICIAL_MODEL_VERSION
 POOL_SCHEDULE_NAMES = ('qk', 'v', 'rst')
 
 debug_interval = 0
@@ -217,93 +218,38 @@ def _resolve_or_create_run(cfg, cli_args, is_host0):
 def _maybe_load_resume_config(cfg, checkpoint_dir, resume_step, is_host0):
     if resume_step is None:
         return cfg, None
-    config_path = full._join_path(checkpoint_dir, 'config.json')
-    config_json = None
-    if is_host0 and full._file_exists(config_path):
-        config_json = json.dumps(full._read_json_file(config_path))
-    config_json = _broadcast_str_from_host0(config_json, max_len=2 * 1024 * 1024)
-    if not config_json:
-        if is_host0:
-            print("  Warning: resume config.json not found; using current YAML.")
-        return cfg, None
-    record = json.loads(config_json)
-    saved_cfg = {
-        k: deepcopy(v) for k, v in record.items()
-        if not str(k).startswith('_')
+    try:
+        checkpoint_metadata = full._restore_orbax_metadata(
+            full._join_path(checkpoint_dir, 'checkpoints'), resume_step)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to read resume checkpoint metadata. Automatic config "
+            "fallback is disabled; cannot resume deterministically."
+        ) from exc
+
+    checkpoint_full_config = checkpoint_metadata.get('full_config')
+    checkpoint_raw_config = checkpoint_metadata.get('raw_config')
+    full._require_resume_full_config(checkpoint_full_config)
+    saved_cfg = deepcopy(checkpoint_full_config)
+    full._require_resume_materialized_fields(saved_cfg)
+    record = {
+        'full_config': deepcopy(saved_cfg),
+        'raw_config': (
+            deepcopy(checkpoint_raw_config)
+            if isinstance(checkpoint_raw_config, dict)
+            and checkpoint_raw_config else None),
+        'metadata': deepcopy(checkpoint_metadata),
+        'source': 'checkpoint full_config',
     }
     if is_host0:
-        print(f"  Training config restored from {config_path}")
+        print("Resume config source: checkpoint full_config")
+        print("Resume config fallback: disabled")
+        print("  Preserving existing run-folder config snapshots.")
     return saved_cfg, record
 
 
 def _path_str(path):
     return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
-
-
-_POOL_PARAM_NAMES = (
-    'attn_qk_emb', 'attn_v_emb', 'rst_emb',
-    'attn_qk_op_read_proj', 'attn_qk_op_write_proj',
-    'attn_v_op_read_proj', 'attn_v_op_write_proj',
-    'rst_op_read_proj', 'rst_op_write_proj',
-    'qk_emb', 'v_emb',
-    'q_read', 'k_read',
-    'attn_qk_read', 'attn_v_read', 'rst_read',
-    'qk_read', 'v_read',
-    'q_write', 'k_write',
-    'attn_qk_write', 'attn_v_write', 'rst_write',
-    'qk_write', 'v_write',
-)
-
-
-def _is_pool_param(path_str):
-    return any(name in path_str for name in _POOL_PARAM_NAMES)
-
-
-def _is_excluded_from_wd(path_str):
-    leaf = path_str.rsplit('/', 1)[-1]
-    if leaf == 'bias':
-        return True
-    if 'scale' in path_str and 'norm' in path_str.lower():
-        return True
-    return (
-        path_str.endswith('_scale')
-        or path_str.endswith('/qk_scale')
-        or path_str.endswith('/v_scale')
-        or path_str.endswith('/rst_scale')
-        or path_str.endswith('/attn_qk_scale')
-        or path_str.endswith('/attn_v_scale'))
-
-
-def create_optimizer_minimal(params, schedule, weight_decay,
-                             pool_weight_decay, global_grad_clip=0.0):
-    def _wd_mask_base(params):
-        def _f(path, _):
-            ps = _path_str(path)
-            return (not _is_excluded_from_wd(ps)) and (not _is_pool_param(ps))
-        return jax.tree.map_with_path(_f, params)
-
-    def _wd_mask_pool(params):
-        def _f(path, _):
-            ps = _path_str(path)
-            return (not _is_excluded_from_wd(ps)) and _is_pool_param(ps)
-        return jax.tree.map_with_path(_f, params)
-
-    def _no_param_mask(params):
-        return jax.tree.map(lambda _: False, params)
-
-    parts = [optax.masked(optax.set_to_zero(), mask=_no_param_mask)]
-    if float(global_grad_clip) > 0.0:
-        parts.append(optax.clip_by_global_norm(global_grad_clip))
-    else:
-        parts.append(optax.scale(1.0))
-    parts.extend([
-        optax.scale_by_adam(b2=0.95),
-        optax.add_decayed_weights(weight_decay, mask=_wd_mask_base),
-        optax.add_decayed_weights(pool_weight_decay, mask=_wd_mask_pool),
-        optax.scale_by_learning_rate(schedule),
-        optax.masked(optax.set_to_zero(), mask=_no_param_mask),
-    ])
-    return optax.chain(*parts)
 
 
 def _path_parts(ps):
@@ -1078,11 +1024,10 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
 
 def _write_fresh_config_snapshot(checkpoint_dir, cfg, raw_cfg_snapshot,
                                  config_path, training_config):
-    full_config_snapshot = deepcopy(cfg)
-    raw_config_snapshot = deepcopy(raw_cfg_snapshot)
-    materialized_snapshot = full._materialized_config_snapshot(
-        full_config_snapshot, training_config)
-    materialized_sha = full._config_sha256(materialized_snapshot)
+    full_config_snapshot = full._materialized_config_snapshot(
+        cfg, training_config)
+    raw_config_snapshot = full._safe_config_snapshot(raw_cfg_snapshot)
+    materialized_sha = full._config_sha256(full_config_snapshot)
     selected_sha = full._config_sha256(full_config_snapshot)
     record = deepcopy(full_config_snapshot)
     record['_raw_config'] = raw_config_snapshot
@@ -1096,7 +1041,7 @@ def _write_fresh_config_snapshot(checkpoint_dir, cfg, raw_cfg_snapshot,
         'trainer': 'scripts/train_jax_minimal.py',
     }
     full._write_json_file(full._join_path(checkpoint_dir, 'config.json'), record)
-    return full_config_snapshot, raw_config_snapshot
+    return full_config_snapshot, raw_config_snapshot, selected_sha, materialized_sha
 
 
 def main():
@@ -1130,6 +1075,7 @@ def main():
 
     cfg = full.load_config(config_path)
     raw_cfg_snapshot = deepcopy(cfg)
+    current_yaml_config_snapshot = deepcopy(cfg)
     full._maybe_initialize_jax_distributed()
     full._require_orbax_checkpoint_compat()
 
@@ -1142,6 +1088,8 @@ def main():
         cfg, cli_args, is_host0)
     cfg, resume_config_record = _maybe_load_resume_config(
         cfg, checkpoint_dir, resume_step, is_host0)
+    deprecated_log_dir_present = (
+        'log_dir' in current_yaml_config_snapshot or 'log_dir' in cfg)
 
     seed = cfg.get('seed', 42)
     full.set_seed(seed)
@@ -1157,18 +1105,28 @@ def main():
     selection_calibration_cfg = full._selection_calibration_config(
         cfg, tau_init_cfg)
 
-    batch_size = cli_args.batch_size or int(tcfg['batch_size'])
-    num_epochs = cli_args.epochs or int(tcfg['num_epochs'])
-    lr = cli_args.lr or float(tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4)))
+    if resume_step is not None and is_host0 and (
+            cli_args.batch_size is not None
+            or cli_args.epochs is not None
+            or cli_args.lr is not None):
+        print(
+            "Resume detected; ignoring launch-time --epochs/--batch-size/--lr "
+            "because checkpoint full_config is the source of truth.",
+            flush=True)
+    batch_size = (
+        int(tcfg['batch_size']) if resume_step is not None
+        else (cli_args.batch_size or int(tcfg['batch_size'])))
+    num_epochs = (
+        int(tcfg['num_epochs']) if resume_step is not None
+        else (cli_args.epochs or int(tcfg['num_epochs'])))
+    lr = (
+        float(tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4)))
+        if resume_step is not None
+        else (cli_args.lr or float(
+            tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4)))))
     weight_decay = float(tcfg.get('weight_decay', 0.1))
     pool_weight_decay = 0.0
     warmup_ratio = float(tcfg.get('warmup_ratio', 0.06))
-    grad_accum_steps = int(tcfg.get('gradient_accumulation_steps', 1))
-    if grad_accum_steps != 1:
-        raise ValueError(
-            "Minimal trainer does not use gradient accumulation; "
-            f"got gradient_accumulation_steps={grad_accum_steps}")
-
     soft_gate_schedule_active = True
     soft_gate_t_start = float(tcfg.get('soft_gate_t_start', 1.5))
     soft_gate_t_final = float(tcfg.get('soft_gate_t_final', 0.07))
@@ -1251,7 +1209,8 @@ def main():
         'weight_decay': weight_decay,
         'pool_weight_decay': pool_weight_decay,
         'warmup_ratio': warmup_ratio,
-        'gradient_accumulation_steps': grad_accum_steps,
+        'gradient_accumulation_steps': tcfg.get(
+            'gradient_accumulation_steps', 1),
         'soft_gate_t_start': soft_gate_t_start,
         'soft_gate_t_final': soft_gate_t_final,
         'soft_gate_t_hold_frac': soft_gate_t_hold_frac,
@@ -1276,6 +1235,7 @@ def main():
         'checkpoint_keep_last': checkpoint_keep_last,
         'training_log_append_on_resume': bool(
             tcfg.get('training_log_append_on_resume', True)),
+        'val_interval': val_interval,
         'log_interval': log_interval,
         'log_analysis_multiplier': int(tcfg.get('log_analysis_multiplier', 1000000)),
         'heavy_geometry_multiplier': int(tcfg.get('heavy_geometry_multiplier', 1000000)),
@@ -1472,6 +1432,11 @@ def main():
         _stage_barrier("before_selection_json_broadcast")
         selection_json = _broadcast_str_from_host0(
             selection_json, max_len=32768)
+        if not selection_json:
+            raise RuntimeError(
+                "Failed to broadcast selection calibration summary.")
+        _stage_log("after_selection_json_broadcast")
+        _stage_barrier("after_selection_json_broadcast")
         selection_calibration_summary = json.loads(selection_json)
         params = full._set_srw_quantile_tau_biases(
             params, selection_calibration_summary, model_version_cfg)
@@ -1483,6 +1448,18 @@ def main():
         soft_gate_pool_schedules = (
             full._apply_selection_calibrated_soft_gate_schedules(
                 soft_gate_pool_schedules, materialized_updates))
+        soft_gate_boundary_power_start = materialized_updates[
+            'soft_gate_boundary_power_start']
+        soft_gate_boundary_power_mid = materialized_updates[
+            'soft_gate_boundary_power_mid']
+        soft_gate_boundary_power_final = materialized_updates[
+            'soft_gate_boundary_power_final']
+        soft_gate_boundary_power_start_frac = materialized_updates[
+            'soft_gate_boundary_power_start_frac']
+        soft_gate_boundary_power_mid_frac = materialized_updates[
+            'soft_gate_boundary_power_mid_frac']
+        soft_gate_boundary_power_final_frac = materialized_updates[
+            'soft_gate_boundary_power_final_frac']
         calibrated_flat = full._flatten_soft_gate_pool_schedules(
             soft_gate_pool_schedules)
         training_config.update(materialized_updates)
@@ -1513,15 +1490,91 @@ def main():
             for line in full._v4164_tau_init_summary_lines(tau_init_summary):
                 print(line)
 
-    if resume_config_record is None and is_host0:
-        full_config_snapshot, raw_config_snapshot = _write_fresh_config_snapshot(
-            checkpoint_dir, cfg, raw_cfg_snapshot, config_path, training_config)
-        print(f"Saved config.json: {full._join_path(checkpoint_dir, 'config.json')}")
+    raw_config_snapshot = full._safe_config_snapshot(raw_cfg_snapshot)
+    if resume_config_record is None:
+        full_config_snapshot = full._materialized_config_snapshot(
+            cfg, training_config)
+        selected_full_config_sha256 = full._config_sha256(
+            full_config_snapshot)
+        current_materialized_config_sha256 = selected_full_config_sha256
+        if is_host0:
+            (
+                full_config_snapshot,
+                raw_config_snapshot,
+                selected_full_config_sha256,
+                current_materialized_config_sha256,
+            ) = _write_fresh_config_snapshot(
+                checkpoint_dir, cfg, raw_cfg_snapshot, config_path,
+                training_config)
+            print(
+                "Config hash: "
+                f"selected_full_config_sha256={selected_full_config_sha256}",
+                flush=True)
+            print(
+                f"Saved config.json: "
+                f"{full._join_path(checkpoint_dir, 'config.json')}")
     else:
-        full_config_snapshot = deepcopy(cfg)
-        raw_config_snapshot = deepcopy(
-            resume_config_record.get('_raw_config', cfg)
-            if resume_config_record else raw_cfg_snapshot)
+        saved_full_config = resume_config_record['full_config']
+        full_config_snapshot = full._safe_config_snapshot(saved_full_config)
+        current_materialized_config_snapshot = full._materialized_config_snapshot(
+            current_yaml_config_snapshot,
+            (current_yaml_config_snapshot.get('training', {})
+             if isinstance(current_yaml_config_snapshot, dict)
+             else {}))
+        selected_full_config_sha256 = full._config_sha256(
+            full_config_snapshot)
+        current_materialized_config_sha256 = full._config_sha256(
+            current_materialized_config_snapshot)
+        checkpoint_full_config_sha256 = full._config_sha256(saved_full_config)
+        if is_host0:
+            print(
+                "Config hash: "
+                f"selected_full_config_sha256={selected_full_config_sha256} "
+                f"checkpoint_full_config_sha256={checkpoint_full_config_sha256} "
+                "current_materialized_config_sha256="
+                f"{current_materialized_config_sha256}",
+                flush=True)
+            try:
+                session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                session_path = full._join_path(
+                    checkpoint_dir,
+                    f"config_resume_session_{session_ts}.json")
+                session_cfg = {
+                    'type': 'resume_session_config',
+                    'timestamp': datetime.now().isoformat(),
+                    'config_path': str(config_path),
+                    'resume_path': resume_path,
+                    'resume_step': int(resume_step),
+                    'config_json_read_only': True,
+                    'resume_config_source': resume_config_record.get(
+                        'source', 'checkpoint full_config'),
+                    'resume_config_fallback': 'disabled',
+                    'checkpoint_raw_config_present':
+                        resume_config_record.get('raw_config') is not None,
+                    'current_materialized_config_sha256':
+                        current_materialized_config_sha256,
+                    'checkpoint_full_config_sha256':
+                        checkpoint_full_config_sha256,
+                    'selected_full_config_sha256':
+                        selected_full_config_sha256,
+                    'current_yaml_config':
+                        full._safe_config_snapshot(current_yaml_config_snapshot),
+                    'checkpoint_full_config':
+                        full._safe_config_snapshot(saved_full_config),
+                    'selected_full_config': full_config_snapshot,
+                    'current_raw_config': raw_config_snapshot,
+                    'current_materialized_config':
+                        current_materialized_config_snapshot,
+                }
+                full._write_json_file(session_path, session_cfg)
+                print(f"  Saved resume session config snapshot: {session_path}")
+            except Exception as exc:
+                print(
+                    f"  Warning: Failed to save resume session config: {exc}")
+            print(
+                "Resume detected; preserving existing config.json and "
+                "config_raw.json snapshots.")
+            print("  Skipped run-folder config snapshot rewrite on resume.")
     _stage_log("after_config_snapshot")
     _stage_barrier("after_config_snapshot")
 
@@ -1550,9 +1603,17 @@ def main():
     _stage_log("after_shard_params")
     _stage_barrier("after_shard_params")
 
+    # ----------------------------------------------------------
+    # Optimizer (warmup + cosine decay + optional gradient accumulation)
+    # ----------------------------------------------------------
+    grad_accum_steps = tcfg.get('gradient_accumulation_steps', 1)
+
     steps_per_epoch = len(train_loader)
-    total_steps = num_epochs * steps_per_epoch
+    # Schedule counts optimizer steps (after accumulation), not micro-steps
+    effective_steps_per_epoch = steps_per_epoch // grad_accum_steps
+    total_steps = num_epochs * effective_steps_per_epoch
     warmup_steps = int(total_steps * warmup_ratio)
+
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=lr * 0.1,
         peak_value=lr,
@@ -1560,10 +1621,133 @@ def main():
         decay_steps=total_steps,
         end_value=lr * 0.1,
     )
+
+    # v4164 per-group WD: pool tensors (attn-qk/attn-v/RST emb/read/write) get
+    # pool_weight_decay; dense kernels get weight_decay. Bias / LayerNorm /
+    # learnable *_scale excluded from both groups.
+    #
+    # optax.adamw is chain(scale_by_adam, add_decayed_weights, scale_by_lr).
+    # To apply two different WDs we decompose it: one scale_by_adam, then
+    # two masked add_decayed_weights (base + pool -masks are disjoint so
+    # each param is touched at most once), then a single scale_by_lr.
+
+    _MODEL_VERSION = OFFICIAL_MODEL_VERSION
+    _FORWARD_UNIT_RW_VERSIONS = set()
+
+    _POOL_PARAM_NAMES = (
+        'attn_qk_emb', 'attn_v_emb', 'rst_emb',
+        'attn_qk_op_read_proj', 'attn_qk_op_write_proj',
+        'attn_v_op_read_proj', 'attn_v_op_write_proj',
+        'rst_op_read_proj', 'rst_op_write_proj',
+        'qk_emb', 'v_emb', 'rst_emb',
+        'q_read', 'k_read',
+        'attn_qk_read', 'attn_v_read', 'rst_read',
+        'qk_read', 'v_read', 'rst_read',
+        'q_write', 'k_write',
+        'attn_qk_write', 'attn_v_write', 'rst_write',
+        'qk_write', 'v_write', 'rst_write',
+    )
+    _RW_PARAM_NAMES = (
+        'q_read', 'k_read',
+        'attn_qk_read', 'attn_v_read', 'rst_read',
+        'qk_read', 'v_read', 'rst_read',
+        'q_write', 'k_write',
+        'attn_qk_write', 'attn_v_write', 'rst_write',
+        'qk_write', 'v_write', 'rst_write',
+    )
+
+    def _path_str(path):
+        return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
+
+    def _is_pool_param(path_str):
+        return any(name in path_str for name in _POOL_PARAM_NAMES)
+
+    def _is_rw_param(path_str):
+        return any(name in path_str for name in _RW_PARAM_NAMES)
+
+    def _is_excluded(path_str):
+        leaf = path_str.rsplit('/', 1)[-1]
+        if leaf == 'bias':
+            return True
+        if 'scale' in path_str and 'norm' in path_str.lower():
+            return True  # LayerNorm scale
+        if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
+           or path_str.endswith('/v_scale') or path_str.endswith('/rst_scale') \
+           or path_str.endswith('/attn_qk_scale') \
+           or path_str.endswith('/attn_v_scale') \
+           or path_str.endswith('/rst_scale'):
+            return True  # learnable output_scale
+        if _MODEL_VERSION in _FORWARD_UNIT_RW_VERSIONS and _is_rw_param(path_str):
+            return True  # forward-normalized read/write directions
+        return False
+
+    def _wd_mask_base(params):
+        def _f(path, _):
+            ps = _path_str(path)
+            if _is_excluded(ps):
+                return False
+            return not _is_pool_param(ps)
+        return jax.tree.map_with_path(_f, params)
+
+    def _wd_mask_pool(params):
+        def _f(path, _):
+            ps = _path_str(path)
+            if _is_excluded(ps):
+                return False
+            return _is_pool_param(ps)
+        return jax.tree.map_with_path(_f, params)
+
+    def _no_param_mask(params):
+        return jax.tree.map(lambda _: False, params)
+
+    optimizer_parts = [
+        optax.masked(optax.set_to_zero(), mask=_no_param_mask),
+    ]
+    if float(global_grad_clip) > 0.0:
+        optimizer_parts.append(optax.clip_by_global_norm(global_grad_clip))
+    else:
+        # Keep the global-clip opt_state slot for checkpoint resume stability,
+        # but make it an exact no-op unless config explicitly enables clipping.
+        optimizer_parts.append(optax.scale(1.0))
+    optimizer_parts.extend([
+        optax.scale_by_adam(b2=0.95),
+        optax.add_decayed_weights(weight_decay, mask=_wd_mask_base),
+        optax.add_decayed_weights(pool_weight_decay, mask=_wd_mask_pool),
+        optax.scale_by_learning_rate(schedule),
+        optax.masked(optax.set_to_zero(), mask=_no_param_mask),
+    ])
+    base_optimizer = optax.chain(*optimizer_parts)
+
+    if is_host0:
+        def _count_true(mask):
+            n = [0]
+            def _f(v):
+                if v:
+                    n[0] += 1
+                return v
+            jax.tree.map(_f, mask)
+            return n[0]
+        def _collect_pool_paths(mask):
+            out = []
+            def _f(path, v):
+                if v:
+                    out.append(_path_str(path))
+                return v
+            jax.tree.map_with_path(_f, mask)
+            return out
+        _base_mask = _wd_mask_base(params)
+        _pool_mask = _wd_mask_pool(params)
+        print(f"  WD groups: base ({weight_decay}) = {_count_true(_base_mask)} tensors, "
+              f"pool ({pool_weight_decay}) = {_count_true(_pool_mask)} tensors")
+        _pool_paths = _collect_pool_paths(_pool_mask)
+        if _pool_paths:
+            print(f"    pool params: {_pool_paths[:9]}")
+    if grad_accum_steps > 1:
+        optimizer = optax.MultiSteps(base_optimizer, every_k_schedule=grad_accum_steps)
+    else:
+        optimizer = base_optimizer
+
     _stage_log("before_optimizer_init")
-    optimizer = create_optimizer_minimal(
-        params, schedule, weight_decay, pool_weight_decay,
-        global_grad_clip=global_grad_clip)
     opt_state = optimizer.init(params)
     opt_state = full._replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
     _stage_log("after_optimizer_init")
@@ -1724,7 +1908,7 @@ def main():
         print(f"  Checkpoint interval: {ckpt_interval}")
         print("  analysis kernels=off")
 
-    log_dir = cfg.get('log_dir', full._join_path(checkpoint_dir, 'logs'))
+    log_dir = checkpoint_dir
     full._makedirs(log_dir)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     existing_logs = sorted(full._list_files(log_dir, "training_log_*.txt"))
@@ -1747,6 +1931,10 @@ def main():
         full.log_message(
             f"DAWN {model_version_cfg} Minimal Training Log - {timestamp}")
         full.log_message(f"Config: {config_path}")
+        if deprecated_log_dir_present:
+            full.log_message(
+                "Deprecated top-level log_dir ignored; logs are stored in "
+                "the run folder.")
         full.log_message(f"Parameters: {full.count_parameters(params):,}")
         full.log_message(f"Hosts: {n_hosts}, total_devices={jax.device_count()}")
         full.log_message(f"Total steps: {total_steps}")
@@ -1776,7 +1964,7 @@ def main():
     checkpoint_git_info = full._safe_git_info()
     run_id = full._path_name(checkpoint_dir)
     train_start_time = time.time()
-    total_micro_steps = total_steps
+    total_micro_steps = num_epochs * steps_per_epoch
     epoch_step_counter = start_step_in_epoch
 
     if is_host0:
@@ -1833,7 +2021,8 @@ def main():
             global_step += 1
             epoch_step_counter += 1
 
-            do_log = (global_step % log_interval == 0) or global_step in (1, 2, 3)
+            is_early_log = global_step in (1, 5, 10, 20, 50)
+            do_log = (global_step % log_interval == 0) or is_early_log
             do_val = (global_step % val_interval == 0 and global_step > 0)
             do_ckpt = (
                 ckpt_interval > 0
@@ -1860,7 +2049,7 @@ def main():
                 if is_host0:
                     elapsed = time.time() - win_start_time
                     sec_per_it = elapsed / max(1, win_count)
-                    current_lr = float(schedule(global_step))
+                    current_lr = float(schedule(global_step // grad_accum_steps))
                     pct = 100.0 * global_step / max(1, total_micro_steps)
                     elapsed_total = time.time() - train_start_time
                     remaining_steps = max(total_micro_steps - global_step, 0)
@@ -1872,8 +2061,8 @@ def main():
                     line = (
                         f"[Step {global_step}/{total_micro_steps} "
                         f"({pct:.1f}%)] "
-                        f"loss={loss_py:.4f} ce={ce_py:.4f} "
-                        f"acc={acc_py:.4f} grad={grad_py:.4f} "
+                        f"loss={loss_py:.4f} ce={ce_py:.4f} aux=0.0000 | "
+                        f"grad={grad_py:.4f} | acc={acc_py:.4f} "
                         f"lr={current_lr:.6g} "
                         f"time={sec_per_it:.2f}s/it "
                         f"eta={eta_str} elapsed={elapsed_str} "
@@ -1883,8 +2072,14 @@ def main():
                         'type': 'train',
                         'step': int(global_step),
                         'epoch': int(epoch),
-                        'loss': loss_py,
+                        'total_loss': ce_py,
+                        'loss': ce_py,
                         'ce_loss': ce_py,
+                        'aux_loss': 0.0,
+                        'tau_reg': 0.0,
+                        'orth_loss': 0.0,
+                        'div_loss': 0.0,
+                        'accuracy': acc_py,
                         'acc': acc_py,
                         'grad_norm': grad_py,
                         'lr': current_lr,

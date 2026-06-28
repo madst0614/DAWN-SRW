@@ -74,6 +74,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--node-id", required=True)
     p.add_argument("--accelerator-type", required=True)
     p.add_argument("--config", required=True)
+    p.add_argument(
+        "--script",
+        default="scripts/train_jax.py",
+        help="Training script forwarded to scripts/launch_tpu_pod.sh.",
+    )
     p.add_argument("--branch", default="main")
     p.add_argument("--zone", default="us-central2-b")
     p.add_argument("--project", default="dawn-486218")
@@ -406,7 +411,11 @@ def ssh_ready(args: argparse.Namespace) -> bool:
 def launch(args: argparse.Namespace) -> None:
     local_repo = Path(args.local_repo)
     launcher = local_repo / "scripts" / "launch_tpu_pod.sh"
-    log(args, f"EVENT launch_start repo={local_repo} config={args.config}")
+    log(
+        args,
+        f"EVENT launch_start repo={local_repo} config={args.config} "
+        f"script={args.script}",
+    )
 
     if not launcher.exists():
         log(args, f"ERROR launcher_missing path={launcher}")
@@ -428,6 +437,7 @@ def launch(args: argparse.Namespace) -> None:
         "--project", args.project,
         "--branch", args.branch,
         "--config", args.config,
+        "--script", args.script,
     ]
     if args.token:
         cmd.extend(["--token", args.token])
@@ -459,7 +469,7 @@ def main() -> int:
         args,
         f"EVENT keeper_start qr={args.queued_resource_id} node={args.node_id} "
         f"project={args.project} zone={args.zone} accel={args.accelerator_type} "
-        f"config={args.config} log_file={args.log_file}",
+        f"config={args.config} script={args.script} log_file={args.log_file}",
     )
 
     while True:
