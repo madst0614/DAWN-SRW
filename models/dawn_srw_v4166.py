@@ -2219,6 +2219,234 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     return fused_gate_srw_paired
 
 
+def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
+                             dead_exposure_target=0.1,
+                             soft_gate_effective_active_eps=1.0e-6,
+                             admission_den_power=1.0,
+                             admission_den_grad_scale=1.0):
+    """Create a shard_map'd single-route SRW kernel that returns only output."""
+    del dead_exposure_target
+    _soft_gate_effective_active_eps = jnp.float32(
+        soft_gate_effective_active_eps)
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+    _admission_den_grad_scale = jnp.clip(
+        jnp.asarray(admission_den_grad_scale, dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0))
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('model', None),
+                       P(), P(), P(), P(), P()),
+             out_specs=P('data', None, None),
+             check_rep=False)
+    def fused_gate_srw_minimal(x, h, op_key_local, raw_tau,
+                               read_local, write_local,
+                               soft_gate_temperature, soft_gate_t_final,
+                               soft_gate_boundary_power,
+                               soft_gate_boundary_power_final,
+                               execution_prune_eps):
+        del soft_gate_t_final, soft_gate_boundary_power_final
+        N_local = op_key_local.shape[0]
+        nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
+        while N_local % nc != 0 and nc < N_local:
+            nc += 1
+        cs = N_local // nc
+
+        B, S, D = x.shape
+        h_bf = h.astype(jnp.bfloat16)
+        x_bf = x.astype(jnp.bfloat16)
+        op_key_bf = op_key_local.astype(jnp.bfloat16)
+        read_bf = read_local.astype(jnp.bfloat16)
+        write_bf = write_local.astype(jnp.bfloat16)
+        tau = _tau_from_param(raw_tau)
+
+        def op_key_chunk(start):
+            return jax.lax.dynamic_slice_in_dim(
+                op_key_bf, start, cs, axis=0)
+
+        def operator_relation(h_in, op_key):
+            q_unit = _forward_unit_direction(
+                h_in.astype(jnp.float32)).astype(jnp.bfloat16)
+            op_key_unit = _forward_unit_direction(
+                op_key.astype(jnp.float32)).astype(jnp.bfloat16)
+            return (q_unit @ op_key_unit.T).astype(jnp.float32)
+
+        def op_key_rw_chunk(start):
+            ec = op_key_chunk(start)
+            rc = jax.lax.dynamic_slice_in_dim(read_bf, start, cs, axis=0)
+            wc = jax.lax.dynamic_slice_in_dim(write_bf, start, cs, axis=0)
+            rc_dir = _forward_unit_direction(rc.astype(jnp.float32))
+            wc_dir = _forward_unit_direction(wc.astype(jnp.float32))
+            return ec, rc_dir.astype(jnp.bfloat16), wc_dir.astype(jnp.bfloat16)
+
+        def angular_compose_parts(rho):
+            _, admission, _drive, execution_weight, _ = _compute_admission_drive(
+                rho, tau, soft_gate_temperature,
+                boundary_power=soft_gate_boundary_power,
+                effective_active_eps=_soft_gate_effective_active_eps,
+                execution_prune_eps=execution_prune_eps)
+            return admission, execution_weight
+
+        @jax.checkpoint
+        def gate_srw_step(carry, i):
+            raw_out, total_den_cost = carry
+            s = i * cs
+            op_key, rc, wc = op_key_rw_chunk(s)
+            rho = operator_relation(h_bf, op_key)
+            admission, execution_weight = angular_compose_parts(rho)
+            xr = x_bf @ rc.T
+            a = execution_weight * xr.astype(jnp.float32)
+            c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
+            chunk_den_cost = admission.sum(axis=-1, keepdims=True)
+            return (raw_out + c_out,
+                    total_den_cost + chunk_den_cost), None
+
+        (raw_out, total_den_cost), _ = jax.lax.scan(
+            gate_srw_step,
+            (jnp.zeros((B, S, D), dtype=jnp.float32),
+             jnp.zeros((B, S, 1), dtype=jnp.float32)),
+            jnp.arange(nc))
+
+        global_den_cost = jax.lax.psum(total_den_cost, 'model')
+        admission_den_base = jnp.maximum(global_den_cost, 1.0)
+        admission_den_forward = jnp.power(
+            admission_den_base, _admission_den_power)
+        admission_den_sg = jax.lax.stop_gradient(admission_den_forward)
+        admission_den = (
+            admission_den_sg
+            + _admission_den_grad_scale
+            * (admission_den_forward - admission_den_sg))
+        out = raw_out / admission_den
+        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
+        return out.astype(jnp.float32)
+
+    return fused_gate_srw_minimal
+
+
+def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
+                                    dead_exposure_target=0.1,
+                                    soft_gate_effective_active_eps=1.0e-6,
+                                    admission_den_power=1.0,
+                                    admission_den_grad_scale=1.0):
+    """Create a shard_map'd Q/K SRW kernel that returns only paired output."""
+    del dead_exposure_target
+    _soft_gate_effective_active_eps = jnp.float32(
+        soft_gate_effective_active_eps)
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+    _admission_den_grad_scale = jnp.clip(
+        jnp.asarray(admission_den_grad_scale, dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0))
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),
+                       P('data', None, None, None),
+                       P('model', None),
+                       P('data', None, None, None),
+                       P('model', None),
+                       P('model', None),
+                       P(), P(), P(), P(), P()),
+             out_specs=P('data', None, None, None),
+             check_rep=False)
+    def fused_gate_srw_paired_minimal(x, h, op_key_local, raw_tau,
+                                      read_local, write_local,
+                                      soft_gate_temperature,
+                                      soft_gate_t_final,
+                                      soft_gate_boundary_power,
+                                      soft_gate_boundary_power_final,
+                                      execution_prune_eps):
+        del soft_gate_t_final, soft_gate_boundary_power_final
+        N_local = op_key_local.shape[0]
+        nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
+        while N_local % nc != 0 and nc < N_local:
+            nc += 1
+        cs = N_local // nc
+
+        B, S, _, _ = h.shape
+        D = x.shape[-1]
+        h_bf = h.astype(jnp.bfloat16)
+        x_bf = x.astype(jnp.bfloat16)
+        op_key_bf = op_key_local.astype(jnp.bfloat16)
+        read_bf = read_local.astype(jnp.bfloat16)
+        write_bf = write_local.astype(jnp.bfloat16)
+        tau = _tau_from_param(raw_tau)
+
+        def op_key_chunk(start):
+            return jax.lax.dynamic_slice_in_dim(
+                op_key_bf, start, cs, axis=0)
+
+        def operator_relation(h_in, op_key):
+            q_unit = _forward_unit_direction(
+                h_in.astype(jnp.float32)).astype(jnp.bfloat16)
+            op_key_unit = _forward_unit_direction(
+                op_key.astype(jnp.float32)).astype(jnp.bfloat16)
+            return jnp.einsum(
+                'bsrd,nd->bsrn', q_unit, op_key_unit).astype(jnp.float32)
+
+        def op_key_rw_chunk(start):
+            ec = op_key_chunk(start)
+            rc = jax.lax.dynamic_slice_in_dim(read_bf, start, cs, axis=0)
+            wc = jax.lax.dynamic_slice_in_dim(write_bf, start, cs, axis=0)
+            rc_dir = _forward_unit_direction(rc.astype(jnp.float32))
+            wc_dir = _forward_unit_direction(wc.astype(jnp.float32))
+            return ec, rc_dir.astype(jnp.bfloat16), wc_dir.astype(jnp.bfloat16)
+
+        def angular_compose_parts(rho):
+            _, admission, _drive, execution_weight, _ = _compute_admission_drive(
+                rho, tau, soft_gate_temperature,
+                boundary_power=soft_gate_boundary_power,
+                effective_active_eps=_soft_gate_effective_active_eps,
+                execution_prune_eps=execution_prune_eps)
+            return admission, execution_weight
+
+        @jax.checkpoint
+        def gate_srw_step(carry, i):
+            raw_out, total_den_cost = carry
+            s = i * cs
+            op_key, rc, wc = op_key_rw_chunk(s)
+            rho = operator_relation(h_bf, op_key)
+            admission, execution_weight = angular_compose_parts(rho)
+            xr = x_bf @ rc.T
+            a = execution_weight * xr.astype(jnp.float32)[:, :, None, :]
+            c_out = jnp.einsum(
+                'bsrn,nd->bsrd',
+                a.astype(jnp.bfloat16),
+                wc).astype(jnp.float32)
+            chunk_den_cost = admission.sum(axis=-1, keepdims=True)
+            return (raw_out + c_out,
+                    total_den_cost + chunk_den_cost), None
+
+        (raw_out, total_den_cost), _ = jax.lax.scan(
+            gate_srw_step,
+            (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
+             jnp.zeros((B, S, 2, 1), dtype=jnp.float32)),
+            jnp.arange(nc))
+
+        global_den_cost = jax.lax.psum(total_den_cost, 'model')
+        admission_den_base = jnp.maximum(global_den_cost, 1.0)
+        admission_den_forward = jnp.power(
+            admission_den_base, _admission_den_power)
+        admission_den_sg = jax.lax.stop_gradient(admission_den_forward)
+        admission_den = (
+            admission_den_sg
+            + _admission_den_grad_scale
+            * (admission_den_forward - admission_den_sg))
+        out = raw_out / admission_den
+        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
+        return out.astype(jnp.float32)
+
+    return fused_gate_srw_paired_minimal
+
+
 # ================================================================
 # 4. NeuronPool -- read/write directions + RW-derived operator keys
 # ================================================================
@@ -2354,6 +2582,156 @@ class Router(nn.Module):
 # ================================================================
 # 6. Pure functions for scan body
 # ================================================================
+
+def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
+                          n_qk, n_v,
+                          n_heads, d_model, n_layers,
+                          router_dropout, dropout_rate, deterministic,
+                          sharded_fns,
+                          soft_gate_temperature=0.07,
+                          soft_gate_t_final=0.07,
+                          soft_gate_T_qk=None,
+                          soft_gate_T_v=None,
+                          soft_gate_boundary_power=2.0,
+                          soft_gate_boundary_power_final=4.0,
+                          admission_den_power=1.0,
+                          execution_prune_eps=0.0):
+    """Minimal v4166 attention path: SRW output, causal attention, O-proj."""
+    del n_qk, n_v, admission_den_power
+    B, S, D = x.shape
+    soft_gate_T_qk = (
+        soft_gate_temperature if soft_gate_T_qk is None else soft_gate_T_qk)
+    soft_gate_T_v = (
+        soft_gate_temperature if soft_gate_T_v is None else soft_gate_T_v)
+    pool_params = _ensure_pool_operator_keys(pool_params)
+
+    qk_op_key = pool_params['attn_qk_op_key']
+    qk_read = pool_params['attn_qk_read']
+    qk_write = pool_params['attn_qk_write']
+    v_op_key = pool_params['attn_v_op_key']
+    v_read = pool_params['attn_v_read']
+    v_write = pool_params['attn_v_write']
+
+    rng, rng_drop = jax.random.split(rng)
+    attn_read_query = (
+        x @ router_params['proj_attn']['kernel']
+        + router_params['proj_attn']['bias'])
+    attn_read_query = safe_dropout(
+        attn_read_query, router_dropout, deterministic, rng_drop)
+    q_read_query, k_read_query, v_read_query = jnp.split(
+        attn_read_query, 3, axis=-1)
+    h_Q = _read_write_operator_query(
+        q_read_query, x, router_params['q_op_write_query_proj'])
+    h_K = _read_write_operator_query(
+        k_read_query, x, router_params['k_op_write_query_proj'])
+    h_V = _read_write_operator_query(
+        v_read_query, x, router_params['v_op_write_query_proj'])
+
+    raw_tau_all = (
+        x @ router_params['raw_tau_attn']['kernel']
+        + router_params['raw_tau_attn']['bias'])
+    qk_scale, v_scale, _ = _effective_pool_output_scales(
+        pool_params, d_model, n_layers)
+
+    if isinstance(sharded_fns, dict):
+        fused_paired = sharded_fns.get(
+            'attn_qk_paired_minimal',
+            sharded_fns.get('attn_qk_paired', sharded_fns['paired']))
+        fused_single_v = sharded_fns.get(
+            'attn_v_single_minimal',
+            sharded_fns.get('attn_v_single', sharded_fns['single']))
+    else:
+        fused_single_v, fused_paired = sharded_fns
+
+    h_QK = jnp.stack([h_Q, h_K], axis=2)
+    raw_tau_QK = jnp.stack(
+        [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
+    QK_out = fused_paired(
+        x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
+        soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
+        soft_gate_boundary_power_final, execution_prune_eps)
+    Q = QK_out[:, :, 0, :] * qk_scale
+    K = QK_out[:, :, 1, :] * qk_scale
+    V = fused_single_v(
+        x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
+        soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
+        soft_gate_boundary_power_final, execution_prune_eps)
+    V = V * v_scale
+
+    d_head = d_model // n_heads
+    Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+
+    scale = jnp.sqrt(jnp.float32(d_head))
+    rng, rng_attn_drop = jax.random.split(rng)
+
+    @jax.checkpoint
+    def _attn_scores(Q, K, V, rng_drop):
+        attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        attn_scores = jnp.where(
+            causal, attn_scores, jnp.finfo(attn_scores.dtype).min)
+        attn_w = jax.nn.softmax(attn_scores, axis=-1)
+        attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
+        return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+
+    out = _attn_scores(Q, K, V, rng_attn_drop)
+    out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
+    out = out @ expand_O_kernel
+    rng, rng_out = jax.random.split(rng)
+    return safe_dropout(out, dropout_rate, deterministic, rng_out)
+
+
+def _rst_forward_minimal(x, pool_params, router_params, rng,
+                         router_dropout, dropout_rate, deterministic,
+                         sharded_fns,
+                         d_model=None, n_layers=None,
+                         soft_gate_temperature=0.07,
+                         soft_gate_t_final=0.07,
+                         soft_gate_T_rst=None,
+                         soft_gate_boundary_power=2.0,
+                         soft_gate_boundary_power_final=4.0,
+                         admission_den_power=1.0,
+                         execution_prune_eps=0.0):
+    """Minimal v4166 RST path: one SRW output and residual dropout."""
+    del admission_den_power
+    if d_model is None or n_layers is None:
+        raise ValueError(
+            "depth-scaled pool outputs require d_model and n_layers.")
+    soft_gate_T_rst = (
+        soft_gate_temperature if soft_gate_T_rst is None else soft_gate_T_rst)
+    pool_params = _ensure_pool_operator_keys(pool_params)
+    rst_op_key = pool_params['rst_op_key']
+    rst_read = pool_params['rst_read']
+    rst_write = pool_params['rst_write']
+
+    rng, rng_drop = jax.random.split(rng)
+    rst_read_query = (
+        x @ router_params['proj_rst']['kernel']
+        + router_params['proj_rst']['bias'])
+    rst_read_query = safe_dropout(
+        rst_read_query, router_dropout, deterministic, rng_drop)
+    h = _read_write_operator_query(
+        rst_read_query, x, router_params['rst_op_write_query_proj'])
+    raw_tau = (
+        x @ router_params['raw_tau_rst']['kernel']
+        + router_params['raw_tau_rst']['bias'])
+    _, _, rst_scale = _pool_output_scales(d_model, n_layers)
+    if isinstance(sharded_fns, dict):
+        fused_single = sharded_fns.get(
+            'rst_single_minimal',
+            sharded_fns.get('rst_single', sharded_fns['single']))
+    else:
+        fused_single, _ = sharded_fns
+    out = fused_single(
+        x, h, rst_op_key, raw_tau, rst_read, rst_write,
+        soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
+        soft_gate_boundary_power_final, execution_prune_eps)
+    out = out * rst_scale
+    rng, rng_out = jax.random.split(rng)
+    return safe_dropout(out, dropout_rate, deterministic, rng_out)
+
 
 def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
@@ -3026,7 +3404,8 @@ class DAWN_SRW_V4166(nn.Module):
                  soft_gate_boundary_power=2.0,
                  soft_gate_boundary_power_final=4.0,
                  admission_den_power=1.0,
-                 execution_prune_eps=0.0):
+                 execution_prune_eps=0.0,
+                 minimal_train=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -3217,6 +3596,92 @@ class DAWN_SRW_V4166(nn.Module):
 
             base_rng = self.make_rng('dropout')
             layer_rngs = jax.random.split(base_rng, self.n_layers)
+
+            if minimal_train:
+                def scan_body_minimal(carry, xs):
+                    x = carry
+                    bp = xs['params']
+                    rng = xs['rng']
+                    rng, rng_attn, rng_rst = jax.random.split(rng, 3)
+
+                    normed = _layer_norm(
+                        x, bp['norm1']['scale'], bp['norm1']['bias'])
+                    attn_out = _attn_forward_minimal(
+                        normed, pool_params, router_params,
+                        bp['attn']['expand_O']['kernel'], rng_attn,
+                        self.n_qk, self.n_v,
+                        self.n_heads, self.d_model, self.n_layers,
+                        self.router_dropout, self.dropout_rate,
+                        deterministic,
+                        sharded_fns=_sharded,
+                        soft_gate_temperature=soft_gate_temperature,
+                        soft_gate_t_final=soft_gate_t_final,
+                        soft_gate_T_qk=soft_gate_T_qk,
+                        soft_gate_T_v=soft_gate_T_v,
+                        soft_gate_boundary_power=soft_gate_boundary_power,
+                        soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+                        admission_den_power=admission_den_power,
+                        execution_prune_eps=execution_prune_eps)
+                    x = x + attn_out
+
+                    normed = _layer_norm(
+                        x, bp['norm2']['scale'], bp['norm2']['bias'])
+                    rst_out = _rst_forward_minimal(
+                        normed, pool_params, router_params, rng_rst,
+                        self.router_dropout, self.dropout_rate,
+                        deterministic,
+                        sharded_fns=_sharded,
+                        d_model=self.d_model,
+                        n_layers=self.n_layers,
+                        soft_gate_temperature=soft_gate_temperature,
+                        soft_gate_t_final=soft_gate_t_final,
+                        soft_gate_T_rst=soft_gate_T_rst,
+                        soft_gate_boundary_power=soft_gate_boundary_power,
+                        soft_gate_boundary_power_final=soft_gate_boundary_power_final,
+                        admission_den_power=admission_den_power,
+                        execution_prune_eps=execution_prune_eps)
+                    return x + rst_out, None
+
+                if self.gradient_checkpointing:
+                    scan_body_minimal = jax.checkpoint(scan_body_minimal)
+
+                xs_minimal = {
+                    'params': stacked,
+                    'rng': layer_rngs,
+                }
+                x, _ = jax.lax.scan(scan_body_minimal, x, xs_minimal)
+                x = self.norm(x)
+                if labels is None:
+                    return {'logits': self.token_emb.attend(x)}
+
+                embedding_matrix = self.token_emb.embedding
+                shift_x = x[:, :-1, :]
+                shift_labels = labels[:, 1:].astype(jnp.int32)
+                valid_mask = (shift_labels != -100)
+
+                @jax.checkpoint
+                def compute_loss_and_acc(x_chunk, emb, labs, vmask):
+                    logits = x_chunk @ emb.T
+                    log_probs = jax.nn.log_softmax(logits, axis=-1)
+                    safe = jnp.where(vmask, labs, 0)
+                    token_loss = -jnp.take_along_axis(
+                        log_probs, safe[..., jnp.newaxis],
+                        axis=-1).squeeze(-1)
+                    loss = (
+                        (token_loss * vmask).sum()
+                        / (vmask.sum() + 1e-8))
+                    preds = jnp.argmax(logits, axis=-1)
+                    correct = jnp.sum((preds == labs) & vmask)
+                    return loss, correct, jnp.sum(vmask)
+
+                loss, correct, valid_count = compute_loss_and_acc(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)
+                return {
+                    'loss': loss,
+                    'correct': correct,
+                    'valid_count': valid_count,
+                    'aux_loss': jnp.float32(0.0),
+                }
 
             def scan_body(carry, xs):
                 x = carry

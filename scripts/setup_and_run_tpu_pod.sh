@@ -21,12 +21,14 @@ else
 fi
 BRANCH="${BRANCH:?ERROR: BRANCH env var not set}"
 CONFIG="${CONFIG:?ERROR: CONFIG env var not set}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-scripts/train_jax.py}"
 WORK_DIR="$HOME/DAWN-SRW"
 
 echo "============================================"
 echo "Host $(hostname) -- Setting up TPU Pod training"
 echo "  Branch: $BRANCH"
 echo "  Config: $CONFIG"
+echo "  Train script: $TRAIN_SCRIPT"
 echo "============================================"
 
 # 1. Install dependencies (all workers)
@@ -68,6 +70,7 @@ echo "[3/4] Skipping standalone JAX TPU preflight; train_jax.py will verify devi
 # 4. Launch training in tmux (survives SSH disconnect)
 echo "[4/4] Starting training in tmux session 'train'..."
 echo "  Config: $CONFIG"
+echo "  Train script: $TRAIN_SCRIPT"
 echo "  Train args: ${TRAIN_ARGS:-}"
 echo "  Host: $(hostname)"
 echo "  Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -109,7 +112,7 @@ fi
 # Start new tmux session running training, tee to ~/train.log
 TRAIN_ARGS="${TRAIN_ARGS:-}"
 tmux new-session -d -s train \
-    "${XLA_DUMP_EXPORT}export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; ${XLA_FLAGS_EXPORT}python3 scripts/train_jax.py --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+    "${XLA_DUMP_EXPORT}export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; ${XLA_FLAGS_EXPORT}python3 '$TRAIN_SCRIPT' --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"

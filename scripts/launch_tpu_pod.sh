@@ -28,6 +28,7 @@ BRANCH="main"
 CONFIG="configs/train_config_v17_1_tpu_400M_c4_5B_v4_64.yaml"
 GH_TOKEN=""
 TRAIN_ARGS=""
+TRAIN_SCRIPT="scripts/train_jax.py"
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -37,6 +38,7 @@ while [[ $# -gt 0 ]]; do
         --project)  PROJECT="$2";  shift 2 ;;
         --branch)   BRANCH="$2";   shift 2 ;;
         --config)   CONFIG="$2";   shift 2 ;;
+        --script)   TRAIN_SCRIPT="$2"; shift 2 ;;
         --token)    GH_TOKEN="$2"; shift 2 ;;
         --from-scratch) TRAIN_ARGS="$TRAIN_ARGS --from-scratch"; shift ;;
         --resume-from) TRAIN_ARGS="$TRAIN_ARGS --resume-from $2"; shift 2 ;;
@@ -50,7 +52,7 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -h|--help)
-            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch] [--resume-from RUN_FOLDER_OR_ORBAX_STEP] [--debug [N]]"
+            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--script TRAIN_SCRIPT] [--token GH_TOKEN] [--from-scratch] [--resume-from RUN_FOLDER_OR_ORBAX_STEP] [--debug [N]]"
             echo ""
             echo "Supports single-host TPU VMs such as v4-8 and multi-host TPU pods such as v4-64/v4-128."
             echo "The TPU VM or queued resource must already exist; this script only launches setup/training."
@@ -60,6 +62,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --project  GCP project          (default: $PROJECT)"
             echo "  --branch   Git branch to clone  (default: $BRANCH)"
             echo "  --config   Training config YAML (default: $CONFIG)"
+            echo "  --script   Training script      (default: $TRAIN_SCRIPT)"
             echo "  --from-scratch  Start training from scratch (ignore checkpoints)"
             echo "  --resume-from RUN_FOLDER_OR_ORBAX_STEP  Resume from an Orbax run folder or step directory"
             echo "  --debug [N]  Enable train_jax.py debug diagnostics every N steps (default: 1)"
@@ -80,6 +83,7 @@ echo "  Zone:    $ZONE"
 echo "  Project: $PROJECT"
 echo "  Branch:  $BRANCH"
 echo "  Config:  $CONFIG"
+echo "  Script:  $TRAIN_SCRIPT"
 if [ -n "$TRAIN_ARGS" ]; then
 echo "  Args:    $TRAIN_ARGS"
 fi
@@ -104,9 +108,10 @@ set -e
 REPO_URL='${REPO_URL}'
 BRANCH='${BRANCH}'
 CONFIG='${CONFIG}'
+TRAIN_SCRIPT='${TRAIN_SCRIPT}'
 GH_TOKEN='${GH_TOKEN}'
 TRAIN_ARGS='${TRAIN_ARGS}'
-export BRANCH CONFIG GH_TOKEN TRAIN_ARGS
+export BRANCH CONFIG TRAIN_SCRIPT GH_TOKEN TRAIN_ARGS
 
 # Bootstrap: ensure ~/DAWN-SRW exists with the right branch
 if [ -d ~/DAWN-SRW/.git ]; then
