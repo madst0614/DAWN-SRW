@@ -1,7 +1,7 @@
 """
-Minimal DAWN-SRW v4.1.6.6 JAX trainer.
+Minimal DAWN-SRW v4.1.6.6/v4.1.6.7 JAX trainer.
 
-This path is dedicated to large v4166 CE training.  It reuses the full
+This path is dedicated to large v4166/v4167 CE training.  It reuses the full
 trainer's config, selection calibration, sharding, optimizer, data, logging,
 and Orbax helpers, but avoids analysis/geometry/prune/drift diagnostics and
 uses model.apply(..., minimal_train=True).
@@ -991,15 +991,21 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
             return dict(kwargs)
         return {k: v for k, v in kwargs.items() if k in sig.parameters}
 
+    def _srw_pool_kwargs(pool):
+        kwargs = dict(base_kwargs)
+        if model_version == full.V4167_MODEL_VERSION:
+            kwargs.update(full._operator_page_pool_kwargs(cfg, pool))
+        return kwargs
+
     sharded_single_v = make_single(
         max_chunk_size=attn_v_max_chunk,
-        **_factory_kwargs(make_single, base_kwargs))
+        **_factory_kwargs(make_single, _srw_pool_kwargs('v')))
     sharded_single_rst = make_single(
         max_chunk_size=rst_max_chunk,
-        **_factory_kwargs(make_single, base_kwargs))
+        **_factory_kwargs(make_single, _srw_pool_kwargs('rst')))
     sharded_paired_attn_qk = make_paired(
         max_chunk_size=attn_qk_max_chunk,
-        **_factory_kwargs(make_paired, base_kwargs))
+        **_factory_kwargs(make_paired, _srw_pool_kwargs('qk')))
 
     if is_host0:
         print(
@@ -1046,7 +1052,7 @@ def _write_fresh_config_snapshot(checkpoint_dir, cfg, raw_cfg_snapshot,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Minimal DAWN-SRW v4166 JAX trainer')
+        description='Minimal DAWN-SRW v4166/v4167 JAX trainer')
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--from-scratch', action='store_true')
     parser.add_argument('--epochs', type=int, default=None)
@@ -1096,10 +1102,12 @@ def main():
     tcfg = cfg['training']
     model_version_cfg = cfg['model'].get(
         'model_version', full.OFFICIAL_MODEL_VERSION)
-    if model_version_cfg != full.V4166_MODEL_VERSION:
+    if model_version_cfg not in (
+            full.V4166_MODEL_VERSION, full.V4167_MODEL_VERSION):
         raise ValueError(
             "scripts/train_jax_minimal.py is dedicated to "
-            f"{full.V4166_MODEL_VERSION}, got {model_version_cfg!r}")
+            f"{full.V4166_MODEL_VERSION}/{full.V4167_MODEL_VERSION}, "
+            f"got {model_version_cfg!r}")
 
     tau_init_cfg = full._v4164_tau_init_config(cfg)
     selection_calibration_cfg = full._selection_calibration_config(
@@ -1322,7 +1330,7 @@ def main():
             f"n_local_devices={n_local_devices}")
 
     if is_host0:
-        print("\n=== DAWN-SRW v4166 Minimal Training ===")
+        print(f"\n=== DAWN-SRW {model_version_cfg} Minimal Training ===")
         print(f"Config: {config_path}")
         print(f"Run folder: {checkpoint_dir}")
         print(f"Global batch size: {batch_size}")
@@ -1363,7 +1371,7 @@ def main():
     _stage_barrier("after_build_model")
     if not _model_accepts_minimal_train(model):
         raise RuntimeError(
-            "v4166 model does not expose minimal_train; minimal trainer "
+            "v4166/v4167 model does not expose minimal_train; minimal trainer "
             "requires the model-level minimal path.")
 
     rng = jax.random.PRNGKey(seed)

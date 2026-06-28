@@ -72,6 +72,12 @@ from models.dawn_srw_v4166 import (
     _raw_tau_init_from_cosine_tau as _v4166_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4166_tau_init_calibration_scores,
 )
+from models.dawn_srw_v4167 import (
+    DAWN_SRW_V4167,
+    _pool_operator_keys as _v4167_pool_operator_keys,
+    _raw_tau_init_from_cosine_tau as _v4167_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4167_tau_init_calibration_scores,
+)
 from models.baseline_transformer_jax import VanillaTransformer
 
 
@@ -248,9 +254,12 @@ def _strict_multihost_barrier(name: str, context=None):
 
 V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
 V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
+V4167_MODEL_VERSION = 'spatial-r1-v4.1.6.7'
 BASELINE_MODEL_VERSION = 'baseline'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
-ACTIVE_SRW_MODEL_VERSIONS = (V4164_MODEL_VERSION, V4166_MODEL_VERSION)
+ACTIVE_SRW_MODEL_VERSIONS = (
+    V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION)
+RW_KEY_SRW_MODEL_VERSIONS = (V4166_MODEL_VERSION, V4167_MODEL_VERSION)
 CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_SELECTION_CALIBRATION_SCORE_CHUNK_TOKENS = 2048
 MODEL_REGISTRY = {
@@ -272,6 +281,12 @@ MODEL_REGISTRY = {
         'module': 'models.dawn_srw_v4166',
         'raw_tau_init_from_cosine_tau': _v4166_raw_tau_init_from_cosine_tau,
         'tau_init_calibration_scores': _v4166_tau_init_calibration_scores,
+    },
+    V4167_MODEL_VERSION: {
+        'class': DAWN_SRW_V4167,
+        'module': 'models.dawn_srw_v4167',
+        'raw_tau_init_from_cosine_tau': _v4167_raw_tau_init_from_cosine_tau,
+        'tau_init_calibration_scores': _v4167_tau_init_calibration_scores,
     },
 }
 
@@ -332,6 +347,10 @@ def _is_active_srw_version(version):
 
 def _is_baseline_version(version):
     return str(version) in (BASELINE_MODEL_VERSION, 'baseline-JAX')
+
+
+def _is_rw_key_srw_version(version):
+    return str(version) in RW_KEY_SRW_MODEL_VERSIONS
 
 
 def _model_registry_entry(version):
@@ -401,6 +420,29 @@ DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES = (
     'int_max', 'drive_mean', 'gate_den_sum_mean', 'gate_eff_n',
     'gate_eff_ratio', 'top1_gate_frac', 'top1_gate_frac_max',
     'score_std',
+)
+
+PAGE_METRIC_NAMES = (
+    'pages_enabled',
+    'page_size',
+    'page_capacity',
+    'page_count_total',
+    'page_count_effective',
+    'page_top1_frac',
+    'page_entropy',
+    'page_score_max',
+    'page_score_mean',
+    'page_score_std',
+    'candidate_ops',
+    'candidate_valid_ops',
+    'candidate_frac',
+    'candidate_valid_frac',
+    'candidate_den_mean',
+    'candidate_execution_mass',
+    'estimated_compute_frac_page',
+    'page_fallback_used_frac',
+    'page_random_used_frac',
+    'page_no_route_frac',
 )
 
 V4164_SCALAR_METRIC_NAMES = (
@@ -727,12 +769,58 @@ def _safe_config_snapshot(obj):
     return _json_safe(deepcopy(obj))
 
 
+V4167_PAGE_CONFIG_DEFAULTS = (
+    ('operator_pages_enabled', True),
+    ('operator_pages_pools', ('rst',)),
+    ('operator_page_size_qk', 128),
+    ('operator_page_size_v', 128),
+    ('operator_page_size_rst', 128),
+    ('operator_page_capacity_qk', 8),
+    ('operator_page_capacity_v', 8),
+    ('operator_page_capacity_rst', 32),
+    ('operator_page_microgroup_sequences', 2),
+    ('operator_page_score_mode', 'maxmean'),
+    ('operator_page_fallback_pages', 1),
+    ('operator_page_random_pages', 0),
+    ('operator_page_cost_weight', 0.0),
+    ('operator_pages_analysis_full_scan', False),
+)
+
+V4167_PAGE_RESUME_REQUIRED_FIELDS = tuple(
+    ('model', key) for key, _ in V4167_PAGE_CONFIG_DEFAULTS)
+
+
+def _materialize_v4167_page_config(cfg):
+    if not isinstance(cfg, dict):
+        return cfg
+    model_cfg = cfg.setdefault('model', {})
+    if not isinstance(model_cfg, dict):
+        return cfg
+    if model_cfg.get('model_version', OFFICIAL_MODEL_VERSION) != V4167_MODEL_VERSION:
+        return cfg
+    training_cfg = cfg.get('training', {})
+    if not isinstance(training_cfg, dict):
+        training_cfg = {}
+    for key, default in V4167_PAGE_CONFIG_DEFAULTS:
+        if key in model_cfg and model_cfg[key] is not None:
+            value = model_cfg[key]
+        elif key in training_cfg and training_cfg[key] is not None:
+            value = training_cfg[key]
+        else:
+            value = default
+        if key == 'operator_pages_pools' and isinstance(value, tuple):
+            value = list(value)
+        model_cfg[key] = value
+    return cfg
+
+
 def _materialized_config_snapshot(cfg, training_config):
     full_cfg = deepcopy(cfg)
     merged_training = deepcopy(cfg.get('training', {}))
     if training_config:
         merged_training.update(deepcopy(training_config))
     full_cfg['training'] = merged_training
+    _materialize_v4167_page_config(full_cfg)
     return _json_safe(full_cfg)
 
 
@@ -832,6 +920,9 @@ def _require_resume_materialized_fields(full_config):
 
     missing = _missing_config_paths(
         full_config, ACTIVE_SRW_RESUME_REQUIRED_FIELDS)
+    if model_version == V4167_MODEL_VERSION:
+        missing.extend(_missing_config_paths(
+            full_config, V4167_PAGE_RESUME_REQUIRED_FIELDS))
     if missing:
         raise RuntimeError(
             "Resume checkpoint full_config is missing required materialized "
@@ -986,6 +1077,62 @@ def _cfg_bool(value, *, name):
     return bool(value)
 
 
+def _operator_page_cfg_get(cfg, key, default=None):
+    m = cfg.get('model', {})
+    t = cfg.get('training', {})
+    if key in m:
+        return m[key]
+    return t.get(key, default)
+
+
+def _operator_pages_pool_enabled(cfg, pool):
+    enabled = _cfg_bool(
+        _operator_page_cfg_get(cfg, 'operator_pages_enabled', True),
+        name='operator_pages_enabled')
+    if not enabled:
+        return False
+    pools = _operator_page_cfg_get(cfg, 'operator_pages_pools', ('rst',))
+    if pools is None:
+        return pool == 'rst'
+    if isinstance(pools, bool):
+        return pools
+    if isinstance(pools, dict):
+        return _cfg_bool(
+            pools.get(pool, pools.get(f'operator_pages_{pool}', False)),
+            name=f'operator_pages_pools.{pool}')
+    if isinstance(pools, str):
+        values = {
+            item.strip().lower()
+            for item in pools.replace(',', ' ').split()
+            if item.strip()
+        }
+    else:
+        values = {str(item).strip().lower() for item in pools}
+    return ('all' in values or pool in values
+            or ('qk' in values and pool == 'attn_qk'))
+
+
+def _operator_page_pool_kwargs(cfg, pool):
+    if pool not in ('qk', 'v', 'rst'):
+        raise ValueError(f"unknown operator page pool {pool!r}")
+    default_capacity = {'qk': 8, 'v': 8, 'rst': 32}[pool]
+    return {
+        'operator_pages_enabled': _operator_pages_pool_enabled(cfg, pool),
+        'operator_page_size': int(_operator_page_cfg_get(
+            cfg, f'operator_page_size_{pool}', 128)),
+        'operator_page_capacity': int(_operator_page_cfg_get(
+            cfg, f'operator_page_capacity_{pool}', default_capacity)),
+        'operator_page_microgroup_sequences': int(_operator_page_cfg_get(
+            cfg, 'operator_page_microgroup_sequences', 2)),
+        'operator_page_score_mode': str(_operator_page_cfg_get(
+            cfg, 'operator_page_score_mode', 'maxmean')),
+        'operator_page_fallback_pages': int(_operator_page_cfg_get(
+            cfg, 'operator_page_fallback_pages', 1)),
+        'operator_page_random_pages': int(_operator_page_cfg_get(
+            cfg, 'operator_page_random_pages', 0)),
+    }
+
+
 def _dawn_srw_kwargs(cfg):
     """Official v4.1.6.4 DAWN-SRW constructor kwargs."""
     kw = _v4164_model_base_kwargs(cfg)
@@ -1007,6 +1154,33 @@ def _dawn_srw_kwargs(cfg):
         kw['tau_init_attn_qk'] = 0.0
         kw['tau_init_attn_v'] = 0.0
         kw['tau_init_rst'] = 0.0
+    if version == V4167_MODEL_VERSION:
+        for key, default in (
+                ('operator_pages_enabled', True),
+                ('operator_pages_pools', ('rst',)),
+                ('operator_page_size_qk', 128),
+                ('operator_page_size_v', 128),
+                ('operator_page_size_rst', 128),
+                ('operator_page_capacity_qk', 8),
+                ('operator_page_capacity_v', 8),
+                ('operator_page_capacity_rst', 32),
+                ('operator_page_microgroup_sequences', 2),
+                ('operator_page_score_mode', 'maxmean'),
+                ('operator_page_fallback_pages', 1),
+                ('operator_page_random_pages', 0),
+                ('operator_page_cost_weight', 0.0),
+                ('operator_pages_analysis_full_scan', False)):
+            value = _operator_page_cfg_get(cfg, key, default)
+            if key == 'operator_pages_pools':
+                if isinstance(value, list):
+                    value = tuple(value)
+                elif isinstance(value, dict):
+                    value = tuple(
+                        pool for pool in ('qk', 'v', 'rst')
+                        if _cfg_bool(value.get(pool, False),
+                                     name=f'operator_pages_pools.{pool}'))
+            if value is not None:
+                kw[key] = value
     return kw
 
 
@@ -1052,9 +1226,12 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
             f"{entry['module']} to import cleanly.")
     # Keep the one-time JIT signature small: calibration needs only selection
     # geometry, not tau params or LM output weights.
-    if version == V4166_MODEL_VERSION:
-        pool_params = jax.jit(_v4166_pool_operator_keys)(
-            params['neuron_pool'])
+    if _is_rw_key_srw_version(version):
+        pool_operator_keys = (
+            _v4167_pool_operator_keys
+            if version == V4167_MODEL_VERSION
+            else _v4166_pool_operator_keys)
+        pool_params = jax.jit(pool_operator_keys)(params['neuron_pool'])
     else:
         pool_params = {
             'attn_qk_emb': params['neuron_pool']['attn_qk_emb'],
@@ -1074,7 +1251,7 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
         },
         'neuron_pool': pool_params,
     }
-    if version == V4166_MODEL_VERSION:
+    if _is_rw_key_srw_version(version):
         score_params['router'].update({
             'q_op_write_query_proj':
                 params['router']['q_op_write_query_proj'],
@@ -2851,7 +3028,7 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     )
     for i, (name, emb_key, read_key, write_key, scale_key) in enumerate(specs):
         if (_is_active_srw_version(model_version)
-                and str(model_version) == V4166_MODEL_VERSION):
+                and _is_rw_key_srw_version(model_version)):
             op_read_key = f'{name}_op_read_proj'
             op_write_key = f'{name}_op_write_proj'
             if name == 'attn_qk':
@@ -3135,7 +3312,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_baseline_model = bool(is_baseline) or _is_baseline_version(_model_version)
     _is_soft_direct_tau = _is_active_srw_version(_model_version)
-    _is_v4166_model = str(_model_version) == V4166_MODEL_VERSION
+    _is_v4166_model = _is_rw_key_srw_version(_model_version)
     _is_boundary_power_model = _is_active_srw_version(_model_version)
     if _is_baseline_model:
         _cb1a_enabled = False
@@ -5216,6 +5393,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             })
         for _name in V4164_SCALAR_METRIC_NAMES:
             metrics[_name] = result.get(_name, jnp.float32(0.0))
+        for _pool in ('attn_qk', 'attn_v', 'rst'):
+            for _name in PAGE_METRIC_NAMES:
+                metrics[f'{_pool}_{_name}'] = result.get(
+                    f'{_pool}_{_name}', jnp.float32(0.0))
+        for _name in (
+                'estimated_compute_frac_page',
+                'selected_page_count',
+                'operator_page_cost'):
+            metrics[_name] = result.get(_name, jnp.float32(0.0))
         for _pool in ('attn_qk', 'attn_v'):
             for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
                 _fallback = result.get(
@@ -5607,9 +5793,25 @@ def create_analysis_step(model, sharded_fns=None,
     return analysis_step
 
 
-def create_geometry_step(max_sample=512):
+def create_geometry_step(max_sample=512,
+                         operator_page_size_qk=128,
+                         operator_page_size_v=128,
+                         operator_page_size_rst=128,
+                         operator_page_enabled_qk=False,
+                         operator_page_enabled_v=False,
+                         operator_page_enabled_rst=True):
     """Rare, observational geometry diagnostics on a deterministic row sample."""
     max_sample = int(max_sample)
+    page_sizes = {
+        'attn_qk': int(operator_page_size_qk),
+        'attn_v': int(operator_page_size_v),
+        'rst': int(operator_page_size_rst),
+    }
+    page_enabled = {
+        'attn_qk': bool(operator_page_enabled_qk),
+        'attn_v': bool(operator_page_enabled_v),
+        'rst': bool(operator_page_enabled_rst),
+    }
 
     def _geom_one(x, prefix):
         x = jax.lax.stop_gradient(jnp.asarray(x, dtype=jnp.float32))
@@ -5625,15 +5827,16 @@ def create_geometry_step(max_sample=512):
         mask = 1.0 - jnp.eye(sim.shape[0], dtype=jnp.float32)
         denom = mask.sum() + 1e-8
         sim_off = sim * mask
+        s5 = jnp.pad(s, (0, max(0, 5 - s.shape[0])))[:5]
         return {
             f'{prefix}_geom_rank': eff_rank,
             f'{prefix}_geom_cos_mean': sim_off.sum() / denom,
             f'{prefix}_geom_cos_max': sim_off.max(),
-            f'{prefix}_geom_sv0': s[0],
-            f'{prefix}_geom_sv1': s[1],
-            f'{prefix}_geom_sv2': s[2],
-            f'{prefix}_geom_sv3': s[3],
-            f'{prefix}_geom_sv4': s[4],
+            f'{prefix}_geom_sv0': s5[0],
+            f'{prefix}_geom_sv1': s5[1],
+            f'{prefix}_geom_sv2': s5[2],
+            f'{prefix}_geom_sv3': s5[3],
+            f'{prefix}_geom_sv4': s5[4],
         }
 
     def _geom_op_key(read, write, read_proj, write_proj, eps=1.0e-6):
@@ -5643,6 +5846,89 @@ def create_geometry_step(max_sample=512):
         r_key = _unit(read) @ read_proj
         w_key = _unit(write) @ write_proj
         return _unit(_unit(r_key) * _unit(w_key))
+
+    def _page_geom(op_key, page_size, prefix):
+        op_key = jax.lax.stop_gradient(jnp.asarray(op_key, dtype=jnp.float32))
+        page_size = int(page_size)
+        n_valid = int(op_key.shape[0])
+        n_pad = ((n_valid + page_size - 1) // page_size) * page_size
+        pad_n = n_pad - n_valid
+        page_count = n_pad // page_size
+        valid = jnp.arange(n_pad, dtype=jnp.int32) < jnp.int32(n_valid)
+        op_pad = jnp.pad(op_key, ((0, pad_n), (0, 0)))
+        op_pages = op_pad.reshape(page_count, page_size, op_key.shape[-1])
+        valid_pages = valid.reshape(page_count, page_size)
+        valid_f = valid_pages.astype(jnp.float32)
+        valid_count = valid_f.sum(axis=1)
+        valid_page = valid_count > 0.0
+        centroid = (
+            (op_pages * valid_f[..., None]).sum(axis=1)
+            / jnp.maximum(valid_count[:, None], 1.0))
+        centroid = centroid / (
+            jnp.linalg.norm(centroid, axis=-1, keepdims=True) + 1.0e-6)
+
+        page_f = valid_page.astype(jnp.float32)
+        page_den = jnp.maximum(page_f.sum(), 1.0)
+        centroid_mean = (centroid * page_f[:, None]).sum(axis=0) / page_den
+        cent_svd = (centroid - centroid_mean[None, :]) * page_f[:, None]
+        s = jnp.linalg.svd(cent_svd, full_matrices=False, compute_uv=False)
+        s5 = jnp.pad(s, (0, max(0, 5 - s.shape[0])))[:5]
+        energy = jnp.sum(jnp.square(s))
+        eff_rank = energy / (jnp.max(jnp.square(s)) + 1.0e-8)
+
+        cent_sim = jnp.abs(centroid @ centroid.T)
+        cent_mask = (
+            page_f[:, None] * page_f[None, :]
+            * (1.0 - jnp.eye(page_count, dtype=jnp.float32)))
+        cent_den = cent_mask.sum() + 1.0e-8
+        cent_off = cent_sim * cent_mask
+
+        op_unit = op_pages / (
+            jnp.linalg.norm(op_pages, axis=-1, keepdims=True) + 1.0e-6)
+        compact = jnp.sum(op_unit * centroid[:, None, :], axis=-1)
+        compact_flat = compact.reshape(-1)
+        valid_flat = valid_pages.reshape(-1)
+        valid_n = jnp.maximum(valid_flat.astype(jnp.int32).sum(), 1)
+        compact_sorted = jnp.sort(jnp.where(valid_flat, compact_flat, 2.0))
+        compact_p05_idx = jnp.floor(
+            jnp.float32(valid_n - 1) * jnp.float32(0.05)).astype(jnp.int32)
+        compact_p05 = compact_sorted[compact_p05_idx]
+        compact_min = compact_sorted[0]
+        compact_mean = (
+            (compact_flat * valid_flat.astype(jnp.float32)).sum()
+            / jnp.float32(valid_n))
+
+        radius_flat = (1.0 - compact_flat)
+        total_n = jnp.int32(n_pad)
+        invalid_n = total_n - valid_n
+        radius_sorted = jnp.sort(jnp.where(valid_flat, radius_flat, -1.0))
+        radius_p95_idx = invalid_n + jnp.floor(
+            jnp.float32(valid_n - 1) * jnp.float32(0.95)).astype(jnp.int32)
+        radius_valid = jnp.where(valid_flat, radius_flat, 0.0)
+        radius_mean = radius_valid.sum() / jnp.float32(valid_n)
+
+        valid_count_for_min = jnp.where(valid_page, valid_count, page_size)
+        return {
+            f'{prefix}_page_centroid_rank': eff_rank,
+            f'{prefix}_page_centroid_cos_mean': cent_off.sum() / cent_den,
+            f'{prefix}_page_centroid_cos_max': cent_off.max(),
+            f'{prefix}_page_centroid_sv0': s5[0],
+            f'{prefix}_page_centroid_sv1': s5[1],
+            f'{prefix}_page_centroid_sv2': s5[2],
+            f'{prefix}_page_centroid_sv3': s5[3],
+            f'{prefix}_page_centroid_sv4': s5[4],
+            f'{prefix}_page_compact_cos_mean': compact_mean,
+            f'{prefix}_page_compact_cos_p05': compact_p05,
+            f'{prefix}_page_compact_cos_min': compact_min,
+            f'{prefix}_page_radius_mean': radius_mean,
+            f'{prefix}_page_radius_p95': radius_sorted[radius_p95_idx],
+            f'{prefix}_page_radius_max': radius_sorted[-1],
+            f'{prefix}_page_valid_count_min': valid_count_for_min.min(),
+            f'{prefix}_page_valid_count_mean': valid_count.sum() / page_den,
+            f'{prefix}_page_valid_count_max': valid_count.max(),
+            f'{prefix}_page_padding_frac': (
+                jnp.float32(pad_n) / jnp.maximum(jnp.float32(n_pad), 1.0)),
+        }
 
     @jax.jit
     def geometry_step(params):
@@ -5663,6 +5949,8 @@ def create_geometry_step(max_sample=512):
                     pool[read_key], pool[write_key],
                     pool[op_read_key], pool[op_write_key])
                 out.update(_geom_one(op_key, f'{name}_op_key'))
+                if page_enabled.get(name, False):
+                    out.update(_page_geom(op_key, page_sizes[name], name))
             if emb_key in pool:
                 out.update(_geom_one(pool[emb_key], f'{name}_emb'))
             if read_key in pool:
@@ -8143,6 +8431,15 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_gate_den_sum_mean': float(m.get(
             'rst_gate_den_sum_mean', m.get('rst_intensity_sum_mean', 0.0))),
     })
+    for _pool in ('attn_qk', 'attn_v', 'rst'):
+        for _name in PAGE_METRIC_NAMES:
+            rec[f'{_pool}_{_name}'] = float(
+                m.get(f'{_pool}_{_name}', 0.0))
+    for _name in (
+            'estimated_compute_frac_page',
+            'selected_page_count',
+            'operator_page_cost'):
+        rec[_name] = float(m.get(_name, 0.0))
     # Per-layer norms (materialise lists).
     try:
         pl_a = jax.device_get(m['per_layer_attn_out_norm']).tolist()
@@ -8240,10 +8537,13 @@ def _print_cb1a_regular_block(rec):
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4164 = _is_active_srw_version(ctx.get('model_version'))
-    is_v4166 = ctx.get('model_version') == V4166_MODEL_VERSION
+    is_v4167 = str(ctx.get('model_version')) == V4167_MODEL_VERSION
+    is_v4166 = _is_rw_key_srw_version(ctx.get('model_version'))
     is_official_soft_direct_tau = _is_active_srw_version(ctx.get('model_version'))
     official_soft_sparsity_compact = False
     route_std_label = 'rho_std' if is_official_soft_direct_tau else 'score_std'
+    def _g(key, default=0.0):
+        return float(rec.get(key, default))
     aux_note = (
         " aux_is_not_total_minus_ce"
         if is_official_soft_direct_tau
@@ -8367,6 +8667,24 @@ def _print_regular_block(rec, ctx):
                 f" v={rec['attn_v_execution_mass_sum']:.1f}"
                 f" rst={rec['rst_execution_mass_sum']:.1f}"
             )
+            if is_v4167:
+                log_message(
+                    f"  page_rst: enabled={_g('rst_pages_enabled'):.0f}"
+                    f" page={_g('rst_page_size'):.0f}"
+                    f" cap={_g('rst_page_capacity'):.0f}"
+                    f" eff_pages={_g('rst_page_count_effective'):.0f}"
+                    f" cand={_g('rst_candidate_ops'):.0f}"
+                    f" valid={_g('rst_candidate_valid_ops'):.0f}"
+                    f" frac={_g('rst_candidate_frac'):.4f}"
+                    f" valid_frac={_g('rst_candidate_valid_frac'):.4f}"
+                    f" entropy={_g('rst_page_entropy'):.3f}"
+                    f" top1={_g('rst_page_top1_frac'):.3f}"
+                    f" score[m={_g('rst_page_score_mean'):.3f}"
+                    f" max={_g('rst_page_score_max'):.3f}]"
+                    f" den={_g('rst_candidate_den_mean'):.3f}"
+                    f" mass={_g('rst_candidate_execution_mass'):.3f}"
+                    f" compute={_g('estimated_compute_frac_page'):.4f}"
+                )
             log_message(
                 f"  execution_conc: qk[eff={rec['attn_qk_execution_eff_n']:.1f}"
                 f" top1={rec['attn_qk_execution_top1_frac']:.3f}]"
@@ -8953,6 +9271,15 @@ def _build_analysis_record(base, metrics, ctx):
     # Keep qk/v/know aliases populated for JSONL continuity.
     for _dst, _src in (('qk', 'attn_qk'), ('v', 'attn_v'), ('know', 'rst')):
         _copy_full_pool_stats(_dst, _src)
+    for _pool in ('attn_qk', 'attn_v', 'rst'):
+        for _name in PAGE_METRIC_NAMES:
+            rec[f'{_pool}_{_name}'] = float(
+                m.get(f'{_pool}_{_name}', 0.0))
+    for _name in (
+            'estimated_compute_frac_page',
+            'selected_page_count',
+            'operator_page_cost'):
+        rec[_name] = float(m.get(_name, 0.0))
     rec['attn_gate_eff_n'] = float(m.get('attn_gate_eff_n', 0.0))
     rec['attn_gate_eff_ratio'] = float(m.get('attn_gate_eff_ratio', 0.0))
     rec['attn_top1_gate_frac'] = float(m.get('attn_top1_gate_frac', 0.0))
@@ -9015,7 +9342,7 @@ def _print_analysis_block(rec, ctx):
     # Analysis logging must never kill a run.  Missing optional fields are
     # printed as 0.0 instead of raising KeyError.
     is_v4164 = _is_active_srw_version(ctx.get('model_version'))
-    is_v4166 = ctx.get('model_version') == V4166_MODEL_VERSION
+    is_v4166 = _is_rw_key_srw_version(ctx.get('model_version'))
 
     def _g(key, default=0.0):
         return float(rec.get(key, default))
@@ -9202,6 +9529,22 @@ def _print_geometry_block(geom):
             f" cos_max={float(geom.get(f'{name}_geom_cos_max', 0.0)):.3f}"
             f" sv5=[{' '.join(f'{v:.2f}' for v in sv)}]]"
         )
+    def _page_line(prefix, label):
+        if f'{prefix}_page_centroid_rank' not in geom:
+            return
+        log_message(
+            f"  page_geom {label}:"
+            f" cent_rank={float(geom.get(f'{prefix}_page_centroid_rank', 0.0)):.1f}"
+            f" cent_cos_m={float(geom.get(f'{prefix}_page_centroid_cos_mean', 0.0)):.3f}"
+            f" cent_cos_max={float(geom.get(f'{prefix}_page_centroid_cos_max', 0.0)):.3f}"
+            f" compact={float(geom.get(f'{prefix}_page_compact_cos_mean', 0.0)):.3f}/"
+            f"{float(geom.get(f'{prefix}_page_compact_cos_p05', 0.0)):.3f}/"
+            f"{float(geom.get(f'{prefix}_page_compact_cos_min', 0.0)):.3f}"
+            f" radius={float(geom.get(f'{prefix}_page_radius_mean', 0.0)):.3f}/"
+            f"{float(geom.get(f'{prefix}_page_radius_p95', 0.0)):.3f}/"
+            f"{float(geom.get(f'{prefix}_page_radius_max', 0.0)):.3f}"
+            f" pad={float(geom.get(f'{prefix}_page_padding_frac', 0.0)):.3f}"
+        )
     for _name, _label in (
             ('attn_qk_op_key', 'attn_qk_op_key'),
             ('attn_qk_emb', 'attn_qk_emb'),
@@ -9218,6 +9561,11 @@ def _print_geometry_block(geom):
             ('rst_write', 'k_w')):
         if f'{_name}_geom_rank' in geom:
             _line(_name, _label)
+    for _name, _label in (
+            ('attn_qk', 'attn_qk'),
+            ('attn_v', 'attn_v'),
+            ('rst', 'rst')):
+        _page_line(_name, _label)
 
 
 # ============================================================
@@ -10351,7 +10699,7 @@ def main():
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
-    if model_version_cfg == V4166_MODEL_VERSION:
+    if _is_rw_key_srw_version(model_version_cfg):
         for _key in (
                 'route_emb_lr_mult',
                 'route_emb_grad_clip',
@@ -10431,6 +10779,7 @@ def main():
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
     cfg.setdefault('training', {}).update(training_config)
+    _materialize_v4167_page_config(cfg)
 
     # ----------------------------------------------------------
     # Detect devices (multi-host aware)
@@ -10732,7 +11081,7 @@ def main():
             if inactive_aux_enabled else "")
         _route_or_op_key_part = (
             f"op_key_lr_mult={op_key_lr_mult}, "
-            if model_version_cfg == V4166_MODEL_VERSION
+            if _is_rw_key_srw_version(model_version_cfg)
             else (
                 f"route_emb_lr_mult={route_emb_lr_mult}, "
                 f"op_key_lr_mult={op_key_lr_mult}, "))
@@ -10747,7 +11096,7 @@ def main():
               "checkpoint_backend=orbax")
         _route_or_op_key_cap_part = (
             f"op_key_ratio={route_emb_update_ratio_cap}, "
-            if model_version_cfg == V4166_MODEL_VERSION
+            if _is_rw_key_srw_version(model_version_cfg)
             else f"emb_ratio={route_emb_update_ratio_cap}, ")
         print("  Control update caps: "
               f"enabled={enable_control_update_caps}, "
@@ -10779,9 +11128,20 @@ def main():
         print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
               f"router={cfg['model'].get('router_dropout', 0.0)}")
         print(f"  Module path: {_model_registry_entry(model_version_cfg)['module']}")
-        if model_version_cfg == V4166_MODEL_VERSION:
-            print("  v4166 operator path: live-gradient RW keys, "
+        if _is_rw_key_srw_version(model_version_cfg):
+            print("  RW-key operator path: live-gradient RW keys, "
                   "RW-matched operator queries")
+        if model_version_cfg == V4167_MODEL_VERSION:
+            _page_bits = []
+            for _pool in ('qk', 'v', 'rst'):
+                _pk = _operator_page_pool_kwargs(cfg, _pool)
+                _page_bits.append(
+                    f"{_pool}[enabled={_pk['operator_pages_enabled']} "
+                    f"page={_pk['operator_page_size']} "
+                    f"cap={_pk['operator_page_capacity']} "
+                    f"fallback={_pk['operator_page_fallback_pages']} "
+                    f"random={_pk['operator_page_random_pages']}]")
+            print("  Global CEU operator pages: " + " ".join(_page_bits))
         print("  Tau parameterization: bounded sigmoid min/max")
         print("  tau = -1 + 2 * sigmoid(raw_tau)")
         print("  Boundary admission: one-sided generalized Gaussian")
@@ -11363,22 +11723,27 @@ def main():
                 return dict(kwargs)
             return {k: v for k, v in kwargs.items() if k in sig.parameters}
 
+        def _srw_pool_kwargs(pool):
+            kwargs = dict(_srw_base_kwargs)
+            if model_version_cfg == V4167_MODEL_VERSION:
+                kwargs.update(_operator_page_pool_kwargs(cfg, pool))
+            return kwargs
+
         _supports_analysis = (
             'analysis' in _inspect.signature(make_sharded_srw).parameters
         )
-        _srw_train_kwargs = dict(_srw_base_kwargs)
         # Slim train kernel; analysis defaults to False.
         _sharded_single_v = make_sharded_srw(
             max_chunk_size=attn_v_max_chunk,
-            **_factory_kwargs(make_sharded_srw, _srw_train_kwargs))
+            **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('v')))
         _sharded_single_rst = make_sharded_srw(
             max_chunk_size=rst_max_chunk,
-            **_factory_kwargs(make_sharded_srw, _srw_train_kwargs))
+            **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('rst')))
         if hasattr(_v4164_module, 'make_sharded_srw_paired'):
             _paired_factory = _v4164_module.make_sharded_srw_paired
             _sharded_paired_attn_qk = _v4164_module.make_sharded_srw_paired(
                 max_chunk_size=attn_qk_max_chunk,
-                **_factory_kwargs(_paired_factory, _srw_train_kwargs))
+                **_factory_kwargs(_paired_factory, _srw_pool_kwargs('qk')))
             _sharded_fns = {
                 'single': _sharded_single_v,
                 'attn_v_single': _sharded_single_v,
@@ -11393,15 +11758,15 @@ def main():
         if _supports_analysis:
             _sharded_single_v_a = make_sharded_srw(
                 analysis=True, max_chunk_size=attn_v_max_chunk,
-                **_factory_kwargs(make_sharded_srw, _srw_base_kwargs))
+                **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('v')))
             _sharded_single_rst_a = make_sharded_srw(
                 analysis=True, max_chunk_size=rst_max_chunk,
-                **_factory_kwargs(make_sharded_srw, _srw_base_kwargs))
+                **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('rst')))
             if hasattr(_v4164_module, 'make_sharded_srw_paired'):
                 _paired_factory = _v4164_module.make_sharded_srw_paired
                 _sharded_paired_a = _v4164_module.make_sharded_srw_paired(
                     analysis=True, max_chunk_size=attn_qk_max_chunk,
-                    **_factory_kwargs(_paired_factory, _srw_base_kwargs))
+                    **_factory_kwargs(_paired_factory, _srw_pool_kwargs('qk')))
                 _sharded_fns_analysis = {
                     'single': _sharded_single_v_a,
                     'attn_v_single': _sharded_single_v_a,
@@ -11578,10 +11943,28 @@ def main():
     else:
         analysis_step_fn = None
     # No current-train-batch diagnostic forward.
+    _page_geom_kwargs = {}
+    if not is_baseline:
+        _page_geom_active = model_version_cfg == V4167_MODEL_VERSION
+        _page_cfg_qk = _operator_page_pool_kwargs(cfg, 'qk')
+        _page_cfg_v = _operator_page_pool_kwargs(cfg, 'v')
+        _page_cfg_rst = _operator_page_pool_kwargs(cfg, 'rst')
+        _page_geom_kwargs = {
+            'operator_page_size_qk': _page_cfg_qk['operator_page_size'],
+            'operator_page_size_v': _page_cfg_v['operator_page_size'],
+            'operator_page_size_rst': _page_cfg_rst['operator_page_size'],
+            'operator_page_enabled_qk': (
+                _page_geom_active and _page_cfg_qk['operator_pages_enabled']),
+            'operator_page_enabled_v': (
+                _page_geom_active and _page_cfg_v['operator_pages_enabled']),
+            'operator_page_enabled_rst': (
+                _page_geom_active and _page_cfg_rst['operator_pages_enabled']),
+        }
     geometry_step_fn = None if is_baseline else create_geometry_step(
         max_sample=int(tcfg.get(
             'geometry_max_sample',
-            tcfg.get('heavy_geometry_max_sample', 512))))
+            tcfg.get('heavy_geometry_max_sample', 512))),
+        **_page_geom_kwargs)
 
     # Initial operator-key drift snapshot. Identity here means drift=0 on the
     # first step; legacy pools use their route embeddings as the signature.
@@ -11817,7 +12200,7 @@ def main():
                 h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
                 h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
                 h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
-                if model_version == V4166_MODEL_VERSION:
+                if _is_rw_key_srw_version(model_version):
                     def _operator_query(read_query, key):
                         write_query = x @ router_p[key]
                         write_query = write_query / (
@@ -11911,7 +12294,7 @@ def main():
                 proj_p = _get_param(router_p, 'proj_rst', 'proj_know')
                 h = (x @ proj_p['kernel'] + proj_p['bias'])
                 h = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
-                if model_version == V4166_MODEL_VERSION:
+                if _is_rw_key_srw_version(model_version):
                     write_query = x @ router_p['rst_op_write_query_proj']
                     write_query = write_query / (
                         jnp.linalg.norm(
@@ -12204,9 +12587,20 @@ def main():
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
         log_message(f"Config: {config_path}")
         log_message(f"Parameters: {n_params:,}")
-        if model_version_cfg == V4166_MODEL_VERSION:
-            log_message("v4166 operator path: live-gradient RW keys, "
+        if _is_rw_key_srw_version(model_version_cfg):
+            log_message("RW-key operator path: live-gradient RW keys, "
                         "RW-matched operator queries")
+        if model_version_cfg == V4167_MODEL_VERSION:
+            page_summary = []
+            for pool in ('qk', 'v', 'rst'):
+                pk = _operator_page_pool_kwargs(cfg, pool)
+                page_summary.append(
+                    f"{pool}[enabled={pk['operator_pages_enabled']} "
+                    f"page={pk['operator_page_size']} "
+                    f"cap={pk['operator_page_capacity']} "
+                    f"fallback={pk['operator_page_fallback_pages']} "
+                    f"random={pk['operator_page_random_pages']}]")
+            log_message("Global CEU operator pages: " + " ".join(page_summary))
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
         log_message(f"Total steps: {total_steps}")
         if tau_init_summary is not None:
