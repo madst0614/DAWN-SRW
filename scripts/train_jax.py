@@ -771,7 +771,7 @@ def _safe_config_snapshot(obj):
 
 V4167_PAGE_CONFIG_DEFAULTS = (
     ('operator_pages_enabled', True),
-    ('operator_pages_pools', ('rst',)),
+    ('operator_pages_pools', ('qk', 'v', 'rst')),
     ('operator_page_size_qk', 128),
     ('operator_page_size_v', 128),
     ('operator_page_size_rst', 128),
@@ -780,7 +780,7 @@ V4167_PAGE_CONFIG_DEFAULTS = (
     ('operator_page_capacity_rst', 32),
     ('operator_page_microgroup_sequences', 2),
     ('operator_page_score_mode', 'maxmean'),
-    ('operator_page_fallback_pages', 1),
+    ('operator_page_fallback_pages', 0),
     ('operator_page_random_pages', 0),
     ('operator_page_cost_weight', 0.0),
     ('operator_pages_analysis_full_scan', False),
@@ -1091,9 +1091,10 @@ def _operator_pages_pool_enabled(cfg, pool):
         name='operator_pages_enabled')
     if not enabled:
         return False
-    pools = _operator_page_cfg_get(cfg, 'operator_pages_pools', ('rst',))
+    pools = _operator_page_cfg_get(
+        cfg, 'operator_pages_pools', ('qk', 'v', 'rst'))
     if pools is None:
-        return pool == 'rst'
+        return True
     if isinstance(pools, bool):
         return pools
     if isinstance(pools, dict):
@@ -1127,7 +1128,7 @@ def _operator_page_pool_kwargs(cfg, pool):
         'operator_page_score_mode': str(_operator_page_cfg_get(
             cfg, 'operator_page_score_mode', 'maxmean')),
         'operator_page_fallback_pages': int(_operator_page_cfg_get(
-            cfg, 'operator_page_fallback_pages', 1)),
+            cfg, 'operator_page_fallback_pages', 0)),
         'operator_page_random_pages': int(_operator_page_cfg_get(
             cfg, 'operator_page_random_pages', 0)),
     }
@@ -1157,7 +1158,7 @@ def _dawn_srw_kwargs(cfg):
     if version == V4167_MODEL_VERSION:
         for key, default in (
                 ('operator_pages_enabled', True),
-                ('operator_pages_pools', ('rst',)),
+                ('operator_pages_pools', ('qk', 'v', 'rst')),
                 ('operator_page_size_qk', 128),
                 ('operator_page_size_v', 128),
                 ('operator_page_size_rst', 128),
@@ -1166,7 +1167,7 @@ def _dawn_srw_kwargs(cfg):
                 ('operator_page_capacity_rst', 32),
                 ('operator_page_microgroup_sequences', 2),
                 ('operator_page_score_mode', 'maxmean'),
-                ('operator_page_fallback_pages', 1),
+                ('operator_page_fallback_pages', 0),
                 ('operator_page_random_pages', 0),
                 ('operator_page_cost_weight', 0.0),
                 ('operator_pages_analysis_full_scan', False)):
@@ -8668,22 +8669,25 @@ def _print_regular_block(rec, ctx):
                 f" rst={rec['rst_execution_mass_sum']:.1f}"
             )
             if is_v4167:
+                def _page_part(label, prefix):
+                    return (
+                        f"{label}[en={_g(prefix + '_pages_enabled'):.0f}"
+                        f" cap={_g(prefix + '_page_capacity'):.0f}"
+                        f" cand={_g(prefix + '_candidate_ops'):.0f}"
+                        f"/valid={_g(prefix + '_candidate_valid_ops'):.0f}"
+                        f" frac={_g(prefix + '_candidate_frac'):.4f}"
+                        f" ent={_g(prefix + '_page_entropy'):.3f}"
+                        f" top1={_g(prefix + '_page_top1_frac'):.3f}"
+                        f" den={_g(prefix + '_candidate_den_mean'):.3f}]")
                 log_message(
-                    f"  page_rst: enabled={_g('rst_pages_enabled'):.0f}"
-                    f" page={_g('rst_page_size'):.0f}"
-                    f" cap={_g('rst_page_capacity'):.0f}"
-                    f" eff_pages={_g('rst_page_count_effective'):.0f}"
-                    f" cand={_g('rst_candidate_ops'):.0f}"
-                    f" valid={_g('rst_candidate_valid_ops'):.0f}"
-                    f" frac={_g('rst_candidate_frac'):.4f}"
-                    f" valid_frac={_g('rst_candidate_valid_frac'):.4f}"
-                    f" entropy={_g('rst_page_entropy'):.3f}"
-                    f" top1={_g('rst_page_top1_frac'):.3f}"
-                    f" score[m={_g('rst_page_score_mean'):.3f}"
-                    f" max={_g('rst_page_score_max'):.3f}]"
-                    f" den={_g('rst_candidate_den_mean'):.3f}"
-                    f" mass={_g('rst_candidate_execution_mass'):.3f}"
-                    f" compute={_g('estimated_compute_frac_page'):.4f}"
+                    "  page: "
+                    + " ".join((
+                        _page_part('qk', 'attn_qk'),
+                        _page_part('v', 'attn_v'),
+                        _page_part('rst', 'rst')))
+                    + f" compute={_g('estimated_compute_frac_page'):.4f}"
+                    f" selected={_g('selected_page_count'):.0f}"
+                    f" cost={_g('operator_page_cost'):.3g}"
                 )
             log_message(
                 f"  execution_conc: qk[eff={rec['attn_qk_execution_eff_n']:.1f}"
@@ -11710,6 +11714,10 @@ def main():
         _srw_module_name = _model_registry_entry(model_version_cfg)['module']
         _v4164_module = __import__(_srw_module_name, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v4164_module.make_sharded_srw
+        make_sharded_srw_minimal = getattr(
+            _v4164_module, 'make_sharded_srw_minimal', None)
+        make_sharded_srw_paired_minimal = getattr(
+            _v4164_module, 'make_sharded_srw_paired_minimal', None)
         max_chunk = cfg['training'].get('max_chunk_size', None)
         if max_chunk is not None:
             attn_qk_max_chunk = attn_v_max_chunk = rst_max_chunk = int(max_chunk)
@@ -11739,11 +11747,30 @@ def main():
         _sharded_single_rst = make_sharded_srw(
             max_chunk_size=rst_max_chunk,
             **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('rst')))
+        _sharded_single_v_minimal = None
+        _sharded_single_rst_minimal = None
+        if make_sharded_srw_minimal is not None:
+            _sharded_single_v_minimal = make_sharded_srw_minimal(
+                max_chunk_size=attn_v_max_chunk,
+                **_factory_kwargs(
+                    make_sharded_srw_minimal, _srw_pool_kwargs('v')))
+            _sharded_single_rst_minimal = make_sharded_srw_minimal(
+                max_chunk_size=rst_max_chunk,
+                **_factory_kwargs(
+                    make_sharded_srw_minimal, _srw_pool_kwargs('rst')))
         if hasattr(_v4164_module, 'make_sharded_srw_paired'):
             _paired_factory = _v4164_module.make_sharded_srw_paired
             _sharded_paired_attn_qk = _v4164_module.make_sharded_srw_paired(
                 max_chunk_size=attn_qk_max_chunk,
                 **_factory_kwargs(_paired_factory, _srw_pool_kwargs('qk')))
+            _sharded_paired_attn_qk_minimal = None
+            if make_sharded_srw_paired_minimal is not None:
+                _sharded_paired_attn_qk_minimal = (
+                    make_sharded_srw_paired_minimal(
+                        max_chunk_size=attn_qk_max_chunk,
+                        **_factory_kwargs(
+                            make_sharded_srw_paired_minimal,
+                            _srw_pool_kwargs('qk'))))
             _sharded_fns = {
                 'single': _sharded_single_v,
                 'attn_v_single': _sharded_single_v,
@@ -11751,6 +11778,14 @@ def main():
                 'paired': _sharded_paired_attn_qk,
                 'attn_qk_paired': _sharded_paired_attn_qk,
             }
+            if _sharded_single_v_minimal is not None:
+                _sharded_fns.update({
+                    'attn_v_single_minimal': _sharded_single_v_minimal,
+                    'rst_single_minimal': _sharded_single_rst_minimal,
+                })
+            if _sharded_paired_attn_qk_minimal is not None:
+                _sharded_fns['attn_qk_paired_minimal'] = (
+                    _sharded_paired_attn_qk_minimal)
         else:
             _sharded_fns = _sharded_single_rst
         # Analysis (observation only). Factory kwargs forward analysis=True

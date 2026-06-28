@@ -2,24 +2,24 @@ seed: 1
 data:
   bin_train: gs://dawn-tpu-data-c4/c4_train_40B
   bin_val: gs://dawn-tpu-data-c4/c4_val.bin
-  max_train_tokens: 5000000000
+  max_train_tokens: 40000000000
   max_val_tokens: 10000000
   local_cache_dir: /tmp/data
 
 model:
   model_version: spatial-r1-v4.1.6.7
   vocab_size: 30522
-  d_model: 384
-  n_layers: 12
-  n_heads: 6
+  d_model: 2304
+  n_layers: 18
+  n_heads: 36
   max_seq_len: 512
   dropout: 0.0
   router_dropout: 0.0
   gradient_checkpointing: true
-  d_route: 128
-  n_qk: 2698
-  n_v: 8391
-  n_rst: 22536
+  d_route: 256
+  n_qk: 3798
+  n_v: 11824
+  n_rst: 31756
   tau_init_min: -0.95
   tau_init_max: 0.95
   tau_init_mode: quantile_frac
@@ -39,16 +39,16 @@ model:
   operator_page_fallback_pages: 0
 
 training:
-  batch_size: 128
-  mesh_model: 1
-  mesh_data: 4
+  batch_size: 1024
+  mesh_model: 2
+  mesh_data: 16
   gradient_accumulation_steps: 1
   num_epochs: 1
   n_chunks_qk: 1
   n_chunks_v: 1
   n_chunks_rst: 4
-  lr: 0.00065
-  warmup_ratio: 0.06
+  lr: 0.0003
+  warmup_ratio: 0.08
   weight_decay: 0.1
   tau_lr_mult: 0.0
   tau_grad_clip: 2.0
@@ -75,17 +75,17 @@ training:
     active_target:
       qk: 0.08
       v: 0.05
-      rst: 0.015
+      rst: 0.014
 
     candidate_target_start:
       qk: 0.16
       v: 0.10
-      rst: 0.030
+      rst: 0.020
 
     candidate_target_final:
       qk: 0.08
       v: 0.05
-      rst: 0.015
+      rst: 0.014
 
     B_floor:
       qk: 0.001
@@ -94,8 +94,8 @@ training:
 
     annealing:
       unit: tokens
-      shrink_start_tokens: 1600000000
-      shrink_end_tokens: 4000000000
+      shrink_start_tokens: 5000000000
+      shrink_end_tokens: 20000000000
 
   soft_gate_effective_active_eps: 1.0e-06
   admission_den_power: 0.5
@@ -110,12 +110,13 @@ training:
 
   eval_effective_prune_enabled: true
   eval_effective_prune_eps_list:
-    - 0.01
-    - 0.1
-  checkpoint_interval: 1000
-  val_interval: 500
+    - 1.0e-06
+    - 1.0e-05
+    - 0.0001
+  checkpoint_interval: 200
+  val_interval: 1000
   log_interval: 100
-  log_analysis_multiplier: 5
+  log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4167_40M_c4_5B_all_pages_topk
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4167_400M_c4_40B_v4_64_all_pages_topk

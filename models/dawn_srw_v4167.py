@@ -548,7 +548,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                      operator_page_capacity=32,
                      operator_page_microgroup_sequences=2,
                      operator_page_score_mode='maxmean',
-                     operator_page_fallback_pages=1,
+                     operator_page_fallback_pages=0,
                      operator_page_random_pages=0):
     """Create fused shard_map'd angular Select + SRW.
 
@@ -1414,7 +1414,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             operator_page_capacity=8,
                             operator_page_microgroup_sequences=2,
                             operator_page_score_mode='maxmean',
-                            operator_page_fallback_pages=1,
+                            operator_page_fallback_pages=0,
                             operator_page_random_pages=0):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
@@ -2296,7 +2296,7 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
                              operator_page_capacity=32,
                              operator_page_microgroup_sequences=2,
                              operator_page_score_mode='maxmean',
-                             operator_page_fallback_pages=1,
+                             operator_page_fallback_pages=0,
                              operator_page_random_pages=0):
     """Create a shard_map'd single-route SRW kernel that returns only output."""
     if operator_pages_enabled:
@@ -2427,7 +2427,7 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
                                     operator_page_capacity=8,
                                     operator_page_microgroup_sequences=2,
                                     operator_page_score_mode='maxmean',
-                                    operator_page_fallback_pages=1,
+                                    operator_page_fallback_pages=0,
                                     operator_page_random_pages=0):
     """Create a shard_map'd Q/K SRW kernel that returns only paired output."""
     if operator_pages_enabled:
@@ -2672,7 +2672,7 @@ def _operator_pages_pool_enabled_static(enabled, pools, pool):
     if not bool(enabled):
         return False
     if pools is None:
-        return pool == 'rst'
+        return True
     if isinstance(pools, bool):
         return pools
     if isinstance(pools, dict):
@@ -2750,7 +2750,7 @@ def make_sharded_srw_page_minimal(mesh, max_chunk_size=2048,
                                   operator_page_capacity=32,
                                   operator_page_microgroup_sequences=2,
                                   operator_page_score_mode='maxmean',
-                                  operator_page_fallback_pages=1,
+                                  operator_page_fallback_pages=0,
                                   operator_page_random_pages=0):
     """Minimal page-sparse single-route SRW.
 
@@ -2925,7 +2925,7 @@ def make_sharded_srw_paired_page_minimal(mesh, max_chunk_size=2048,
                                          operator_page_capacity=8,
                                          operator_page_microgroup_sequences=2,
                                          operator_page_score_mode='maxmean',
-                                         operator_page_fallback_pages=1,
+                                         operator_page_fallback_pages=0,
                                          operator_page_random_pages=0):
     """Minimal page-sparse paired Q/K SRW over a shared qk page set."""
     del max_chunk_size, dead_exposure_target
@@ -3100,7 +3100,7 @@ def make_sharded_srw_page(mesh, max_chunk_size=2048, analysis=False,
                           operator_page_capacity=32,
                           operator_page_microgroup_sequences=2,
                           operator_page_score_mode='maxmean',
-                          operator_page_fallback_pages=1,
+                          operator_page_fallback_pages=0,
                           operator_page_random_pages=0):
     """Page-sparse single-route SRW with v4166-compatible diagnostics."""
     del max_chunk_size, dead_exposure_target
@@ -3388,9 +3388,12 @@ def make_sharded_srw_page(mesh, max_chunk_size=2048, analysis=False,
         valid_page_den = jnp.maximum(valid_page_f.sum(), jnp.float32(1.0))
         score_sum = (page_scores * valid_page_f[None, :]).sum(axis=-1)
         page_score_mean_per_group = score_sum / valid_page_den
+        page_score_delta = jnp.where(
+            valid_page_mask[None, :],
+            page_scores - page_score_mean_per_group[:, None],
+            jnp.float32(0.0))
         page_score_var_per_group = (
-            jnp.square(page_scores - page_score_mean_per_group[:, None])
-            * valid_page_f[None, :]).sum(axis=-1) / valid_page_den
+            jnp.square(page_score_delta).sum(axis=-1) / valid_page_den)
         page_score_std = jnp.sqrt(page_score_var_per_group + 1.0e-8).mean()
         page_score_max = jnp.where(
             valid_page_mask[None, :], page_scores, jnp.float32(-1.0e30)
@@ -3532,23 +3535,64 @@ def make_sharded_srw_paired_page(mesh, max_chunk_size=2048, analysis=False,
                                  operator_page_capacity=8,
                                  operator_page_microgroup_sequences=2,
                                  operator_page_score_mode='maxmean',
-                                 operator_page_fallback_pages=1,
+                                 operator_page_fallback_pages=0,
                                  operator_page_random_pages=0):
-    """Compatibility diagnostics wrapper around page-sparse paired Q/K SRW."""
-    page_minimal = make_sharded_srw_paired_page_minimal(
-        mesh, max_chunk_size=max_chunk_size,
-        dead_exposure_target=dead_exposure_target,
-        soft_gate_effective_active_eps=soft_gate_effective_active_eps,
-        admission_den_power=admission_den_power,
-        admission_den_grad_scale=admission_den_grad_scale,
-        operator_page_size=operator_page_size,
-        operator_page_capacity=operator_page_capacity,
-        operator_page_microgroup_sequences=operator_page_microgroup_sequences,
-        operator_page_score_mode=operator_page_score_mode,
-        operator_page_fallback_pages=operator_page_fallback_pages,
-        operator_page_random_pages=operator_page_random_pages)
-    model_axis_size = mesh.shape['model']
+    """Page-sparse paired Q/K SRW with v4166-compatible diagnostics."""
+    del max_chunk_size, dead_exposure_target
+    _model_axis_size = mesh.shape['model']
+    _soft_gate_effective_active_eps = jnp.float32(
+        soft_gate_effective_active_eps)
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+    _admission_den_grad_scale = jnp.clip(
+        jnp.asarray(admission_den_grad_scale, dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0))
+    _page_size = int(operator_page_size)
+    _page_capacity = int(operator_page_capacity)
+    _microgroup_sequences = max(1, int(operator_page_microgroup_sequences))
+    _score_mode = _normalize_operator_page_score_mode(
+        operator_page_score_mode)
+    _fallback_pages = int(operator_page_fallback_pages)
+    _random_pages = int(operator_page_random_pages)
+    _angular_strong_margin = jnp.float32(0.05)
 
+    _slim_out_specs = (
+        P('data', None, None, None),  # out [B,S,2,D]
+        P('data', None, None),        # active [B,S,1]
+        P('data', None, None),        # gate_max [B,S,1]
+        P(), P(), P(), P(),
+        P('data', None, None),        # strong [B,S,1]
+        P('data', None, None),        # positive-margin mean [B,S,1]
+        P(), P(), P(), P(), P(), P(), P(), P(), P(),
+        P('data', None, None, None),  # tau_direct [B,S,2,1]
+        P('data', None, None, None),  # no_active_direct [B,S,2,1]
+    )
+    _conc_out_specs = (P(), P(), P(), P())
+    _route_split_out_specs = (P(), P(), P(), P(), P(), P())
+    _analysis_extra_specs = (
+        P('data', None, None), P(), P(), P(), P(), P(),
+        P(), P(), P(), P(), P(),
+    )
+    _select_diag_specs = tuple(P() for _ in range(SELECT_DIAG_COUNT))
+    _dead_exposure_diag_specs = tuple(
+        P() for _ in range(DEAD_EXPOSURE_DIAG_COUNT))
+    _out_specs = (
+        _slim_out_specs + _conc_out_specs + _route_split_out_specs
+        + (_analysis_extra_specs if analysis else ())
+        + _select_diag_specs + _dead_exposure_diag_specs + (P(), P()))
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),
+                       P('data', None, None, None),
+                       P('model', None),
+                       P('data', None, None, None),
+                       P('model', None),
+                       P('model', None),
+                       P(), P(), P(), P(), P()),
+             out_specs=_out_specs,
+             check_rep=False)
     def fused_gate_srw_paired_page(x, h, op_key_local, raw_tau,
                                    read_local, write_local,
                                    soft_gate_temperature,
@@ -3556,38 +3600,388 @@ def make_sharded_srw_paired_page(mesh, max_chunk_size=2048, analysis=False,
                                    soft_gate_boundary_power,
                                    soft_gate_boundary_power_final,
                                    execution_prune_eps):
-        out = page_minimal(
-            x, h, op_key_local, raw_tau, read_local, write_local,
-            soft_gate_temperature, soft_gate_t_final,
-            soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps)
-        B, S, _, _ = h.shape
+        del soft_gate_t_final, soft_gate_boundary_power_final
+        N_local = op_key_local.shape[0]
+        page_count, effective_pages = _validate_operator_page_args(
+            'qk-paired', N_local, _page_size, _page_capacity,
+            _fallback_pages, _random_pages)
+        K = effective_pages * _page_size
+        N_total = N_local * _model_axis_size
+        K_total = K * _model_axis_size
+
+        B, S, R, _ = h.shape
+        D = x.shape[-1]
+        mg = min(_microgroup_sequences, B)
+        group_count = (B + mg - 1) // mg
+        B_pad = group_count * mg
+        pad_b = B_pad - B
+        x_pad = jnp.pad(x, ((0, pad_b), (0, 0), (0, 0)))
+        h_pad = jnp.pad(h, ((0, pad_b), (0, 0), (0, 0), (0, 0)))
+        raw_tau_pad = jnp.pad(
+            raw_tau, ((0, pad_b), (0, 0), (0, 0), (0, 0)))
+
+        x_groups = x_pad.reshape(group_count, mg, S, D)
+        h_groups = h_pad.reshape(group_count, mg, S, R, h.shape[-1])
+        raw_tau_groups = raw_tau_pad.reshape(group_count, mg, S, R, 1)
+
+        (op_key_pages_f, read_pages_f, write_pages_f, valid_pages,
+         valid_page_mask, page_keys, _, _, _) = _operator_page_tables(
+            op_key_local, read_local, write_local, _page_size)
+        page_key_bf = page_keys.astype(jnp.bfloat16)
+        h_unit = _forward_unit_direction(
+            h_groups.astype(jnp.float32)).astype(jnp.bfloat16)
+
+        if _score_mode == 'maxmean':
+            evidence = jnp.einsum(
+                'gmsrd,pd->gmsrp', h_unit, page_key_bf).astype(jnp.float32)
+            evidence = evidence.max(axis=3)
+            page_scores = (
+                evidence.mean(axis=(1, 2)) + evidence.max(axis=(1, 2))
+            ) * jnp.float32(0.5)
+        else:
+            route_summary = _forward_unit_direction(
+                h_groups.astype(jnp.float32).mean(axis=(1, 2, 3)))
+            page_scores = (
+                route_summary.astype(jnp.bfloat16) @ page_key_bf.T
+            ).astype(jnp.float32)
+        page_scores = jnp.where(
+            valid_page_mask[None, :], page_scores, jnp.float32(-1.0e30))
+
+        protected = jnp.zeros((group_count, page_count), dtype=jnp.bool_)
+        if _fallback_pages:
+            fallback_ids = jnp.arange(_fallback_pages, dtype=jnp.int32)
+            fallback_ids = jnp.broadcast_to(
+                fallback_ids[None, :], (group_count, _fallback_pages))
+            protected = protected.at[:, :_fallback_pages].set(True)
+        else:
+            fallback_ids = jnp.zeros((group_count, 0), dtype=jnp.int32)
+        if _random_pages:
+            random_span = page_count - _fallback_pages
+            random_offsets = (
+                jnp.arange(group_count, dtype=jnp.int32)[:, None]
+                * jnp.int32(1103515245)
+                + jnp.arange(_random_pages, dtype=jnp.int32)[None, :]
+                * jnp.int32(12345)
+                + jnp.int32(17))
+            random_ids = _fallback_pages + jnp.mod(
+                random_offsets, jnp.int32(random_span))
+            protected = protected.at[
+                jnp.arange(group_count, dtype=jnp.int32)[:, None],
+                random_ids].set(True)
+        else:
+            random_ids = jnp.zeros((group_count, 0), dtype=jnp.int32)
+
+        top_scores = jnp.where(protected, jnp.float32(-1.0e30), page_scores)
+        _, top_ids = jax.lax.top_k(top_scores, _page_capacity)
+        selected_page_ids = jnp.concatenate(
+            (fallback_ids, top_ids.astype(jnp.int32), random_ids), axis=1)
+        cand_valid = valid_pages[selected_page_ids].reshape(group_count, K)
+        cand_valid_f = cand_valid.astype(jnp.float32)
+        candidate_valid_ops = jax.lax.stop_gradient(
+            jax.lax.psum(cand_valid_f.sum(axis=-1), 'model').mean())
+
+        cand_key = op_key_pages_f[selected_page_ids].reshape(
+            group_count, K, op_key_local.shape[-1])
+        cand_read = _forward_unit_direction(
+            read_pages_f[selected_page_ids].reshape(group_count, K, D)
+        ).astype(jnp.bfloat16)
+        cand_write = _forward_unit_direction(
+            write_pages_f[selected_page_ids].reshape(group_count, K, D)
+        ).astype(jnp.bfloat16)
+        cand_key = _forward_unit_direction(
+            cand_key.astype(jnp.float32)).astype(jnp.bfloat16)
+
+        rho_raw = jnp.einsum(
+            'gmsrd,gkd->gmsrk', h_unit, cand_key).astype(jnp.float32)
+        cand_valid_b = cand_valid[:, None, None, None, :]
+        rho_for_gate = jnp.where(cand_valid_b, rho_raw, jnp.float32(-1.0))
+        rho = jnp.where(cand_valid_b, rho_raw, jnp.float32(0.0))
+        tau = _tau_from_param(raw_tau_groups)
+        (selection_margin, admission, drive, execution_weight,
+         active_mask) = _compute_admission_drive(
+            rho_for_gate, tau, soft_gate_temperature,
+            boundary_power=soft_gate_boundary_power,
+            effective_active_eps=_soft_gate_effective_active_eps,
+            execution_prune_eps=execution_prune_eps)
+        selection_margin = jnp.where(
+            cand_valid_b, selection_margin, jnp.float32(-1.0e9))
+        drive = drive * cand_valid_f[:, None, None, None, :]
+        admission = admission * cand_valid_f[:, None, None, None, :]
+        execution_weight = (
+            execution_weight * cand_valid_f[:, None, None, None, :])
+        active_mask = active_mask & cand_valid_b
+        strong_mask = (selection_margin > _angular_strong_margin) & cand_valid_b
+
+        xr = jnp.einsum(
+            'gmsd,gkd->gmsk', x_groups.astype(jnp.bfloat16), cand_read)
+        raw_out = jnp.einsum(
+            'gmsrk,gkd->gmsrd',
+            (execution_weight * xr.astype(jnp.float32)[:, :, :, None, :]
+             ).astype(jnp.bfloat16),
+            cand_write).astype(jnp.float32)
+
+        den_cost = admission.sum(axis=-1, keepdims=True)
+        weighted_cost = execution_weight.sum(axis=-1, keepdims=True)
+        gate_sq = jnp.square(execution_weight).sum(axis=-1, keepdims=True)
+        gate_max = execution_weight.max(axis=-1, keepdims=True)
+        active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
+        strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
+        positive_margin = jax.nn.relu(selection_margin)
+        positive_margin_sum = positive_margin.sum(axis=-1, keepdims=True)
+        selection_margin_sum = jnp.where(
+            cand_valid_b, selection_margin, jnp.float32(0.0)).sum()
+        selected = (
+            (selection_margin > 0.0) & cand_valid_b).astype(jnp.float32)
+        selected_count = selected.sum(axis=-1, keepdims=True)
+        rho_sum = rho.sum(axis=-1, keepdims=True)
+        rho_sq_sum = jnp.square(rho).sum(axis=-1, keepdims=True)
+        total_rho_max = jnp.where(
+            cand_valid_b, rho_raw, jnp.float32(-1.0)).max()
+        total_positive_margin_max = positive_margin.max()
+        selection_margin_max = selection_margin.max(axis=-1, keepdims=True)
+        edge_margin_stat = jnp.square(positive_margin).sum()
+        int_max = drive.max()
+        current_cost = drive.sum(axis=-1, keepdims=True) / jnp.maximum(
+            cand_valid_f.sum(axis=-1)[:, None, None, None, None],
+            jnp.float32(1.0))
+
+        def _unpad(t, *shape_tail):
+            return t.reshape((B_pad, S, R) + shape_tail)[:B]
+
+        raw_out = raw_out.reshape(B_pad, S, R, D)[:B]
+        den_cost = _unpad(den_cost, 1)
+        weighted_cost = _unpad(weighted_cost, 1)
+        gate_sq = _unpad(gate_sq, 1)
+        gate_max = _unpad(gate_max, 1)
+        active = _unpad(active, 1)
+        strong = _unpad(strong, 1)
+        positive_margin_sum = _unpad(positive_margin_sum, 1)
+        selected_count = _unpad(selected_count, 1)
+        rho_sum = _unpad(rho_sum, 1)
+        rho_sq_sum = _unpad(rho_sq_sum, 1)
+        selection_margin_max = _unpad(selection_margin_max, 1)
+        current_cost = _unpad(current_cost, 1)
+
+        global_den_cost = jax.lax.psum(den_cost, 'model')
+        admission_den_base = jnp.maximum(global_den_cost, 1.0)
+        admission_den_forward = jnp.power(
+            admission_den_base, _admission_den_power)
+        admission_den_sg = jax.lax.stop_gradient(admission_den_forward)
+        admission_den = (
+            admission_den_sg
+            + _admission_den_grad_scale
+            * (admission_den_forward - admission_den_sg))
+        out = raw_out / admission_den
+        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
+
+        global_weighted = jax.lax.psum(weighted_cost, 'model')
+        global_gate_sq = jax.lax.psum(gate_sq, 'model')
+        global_gate_max = jax.lax.pmax(
+            jax.lax.stop_gradient(gate_max), 'model')
+        global_active = jax.lax.psum(active, 'model')
+        global_strong = jax.lax.psum(strong, 'model')
+        global_positive_margin_sum = jax.lax.psum(
+            positive_margin_sum, 'model')
+        global_selected = jax.lax.psum(selected_count, 'model')
+        global_rho_sum = jax.lax.psum(rho_sum, 'model')
+        global_rho_sq_sum = jax.lax.psum(rho_sq_sum, 'model')
+        global_selection_margin_max = jax.lax.pmax(
+            jax.lax.stop_gradient(selection_margin_max), 'model')
+        no_active_direct = jax.lax.stop_gradient(
+            (global_selection_margin_max <= 0.0).astype(jnp.float32))
+        tau_direct = _block_tau_up_when_no_active(
+            _tau_from_param(raw_tau), no_active_direct.astype(jnp.bool_))
+
+        candidate_valid_ops_safe = jnp.maximum(
+            candidate_valid_ops, jnp.float32(1.0))
+        rho_count = jnp.float32(B * S * R) * candidate_valid_ops_safe
+        rho_mean_token = global_rho_sum / candidate_valid_ops_safe
+        rho_var_token = jnp.maximum(
+            global_rho_sq_sum / candidate_valid_ops_safe
+            - jnp.square(rho_mean_token),
+            0.0)
+        rho_std_token = jnp.sqrt(rho_var_token + 1e-8)
+        active_frac = jax.lax.stop_gradient(
+            global_active / candidate_valid_ops_safe)
+        strong_frac = jax.lax.stop_gradient(
+            global_strong / candidate_valid_ops_safe)
+        positive_margin_mean_active = (
+            jax.lax.stop_gradient(global_positive_margin_sum)
+            / (jax.lax.stop_gradient(global_active) + 1e-8))
+        gate_eff_n = (
+            jnp.square(jax.lax.stop_gradient(global_weighted))
+            / (jax.lax.stop_gradient(global_gate_sq) + 1e-8))
+        gate_eff_ratio = gate_eff_n / jnp.maximum(
+            jax.lax.stop_gradient(global_active), 1.0)
+        top1_gate_frac = global_gate_max / jnp.maximum(
+            jax.lax.stop_gradient(global_weighted), 1e-8)
+        tau_sg = jax.lax.stop_gradient(_tau_from_param(raw_tau))
+        raw_tau_sg = jax.lax.stop_gradient(raw_tau)
+        selection_margin_mean = (
+            jax.lax.psum(selection_margin_sum, 'model') / rho_count)
+        positive_margin_mean = (
+            jax.lax.psum(positive_margin.sum(), 'model') / rho_count)
+        edge_margin_out = (
+            jax.lax.psum(edge_margin_stat, 'model') / rho_count)
+        int_max_out = jax.lax.pmax(jax.lax.stop_gradient(int_max), 'model')
+        current_cost_mean = jax.lax.stop_gradient(
+            jax.lax.psum(current_cost, 'model')).mean()
+
+        probs = jax.nn.softmax(page_scores, axis=-1)
+        page_entropy = -jnp.sum(
+            probs * jnp.log(jnp.maximum(probs, 1e-30)), axis=-1).mean()
+        page_top1 = probs.max(axis=-1).mean()
+        valid_page_f = valid_page_mask.astype(jnp.float32)
+        valid_page_den = jnp.maximum(valid_page_f.sum(), jnp.float32(1.0))
+        score_sum = jnp.where(
+            valid_page_mask[None, :], page_scores, jnp.float32(0.0)
+        ).sum(axis=-1)
+        page_score_mean_per_group = score_sum / valid_page_den
+        page_score_delta = jnp.where(
+            valid_page_mask[None, :],
+            page_scores - page_score_mean_per_group[:, None],
+            jnp.float32(0.0))
+        page_score_std = jnp.sqrt(
+            jnp.square(page_score_delta).sum(axis=-1)
+            / valid_page_den + 1.0e-8).mean()
+        page_score_max = jnp.where(
+            valid_page_mask[None, :], page_scores, jnp.float32(-1.0e30)
+        ).max()
+        page_score_mean = page_score_mean_per_group.mean()
+        candidate_ops = jnp.float32(K_total)
+        candidate_valid_frac = candidate_valid_ops / jnp.float32(N_total)
+        candidate_valid_group = jax.lax.psum(
+            cand_valid_f.sum(axis=-1), 'model')
+        page_no_route_frac = (
+            candidate_valid_group <= 0.0).astype(jnp.float32).mean()
+        page_diag = jnp.zeros((PAGE_DIAG_COUNT,), dtype=jnp.float32)
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['page_size']].set(
+            jnp.float32(_page_size))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['page_capacity']].set(
+            jnp.float32(_page_capacity))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['page_count_total']].set(
+            jnp.float32(page_count * _model_axis_size))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['page_count_effective']].set(
+            jnp.float32(effective_pages))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['page_top1_frac']].set(
+            jax.lax.stop_gradient(page_top1))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['page_entropy']].set(
+            jax.lax.stop_gradient(page_entropy))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['page_score_max']].set(
+            jax.lax.stop_gradient(page_score_max))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['page_score_mean']].set(
+            jax.lax.stop_gradient(page_score_mean))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['page_score_std']].set(
+            jax.lax.stop_gradient(page_score_std))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_ops']].set(
+            candidate_ops)
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_valid_ops']].set(
+            jax.lax.stop_gradient(candidate_valid_ops))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_frac']].set(
+            candidate_ops / jnp.float32(N_total))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_valid_frac']].set(
+            jax.lax.stop_gradient(candidate_valid_frac))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_den_mean']].set(
+            jax.lax.stop_gradient(global_den_cost.mean()))
+        page_diag = page_diag.at[
+            PAGE_DIAG_INDEX['candidate_execution_mass']].set(
+                jax.lax.stop_gradient(global_weighted.mean()))
+        page_diag = page_diag.at[
+            PAGE_DIAG_INDEX['page_fallback_used_frac']].set(
+                jnp.float32(_fallback_pages) / jnp.float32(effective_pages))
+        page_diag = page_diag.at[
+            PAGE_DIAG_INDEX['page_random_used_frac']].set(
+                jnp.float32(_random_pages) / jnp.float32(effective_pages))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['page_no_route_frac']].set(
+            jax.lax.stop_gradient(page_no_route_frac))
+        page_diag = page_diag.at[PAGE_DIAG_INDEX['selected_page_count']].set(
+            jnp.float32(effective_pages))
+        page_diag = page_diag.at[
+            PAGE_DIAG_INDEX['estimated_compute_frac_page']].set(
+                candidate_ops / jnp.float32(N_total))
+
         z = jnp.float32(0.0)
-        z_bs1 = jnp.zeros((B, S, 1), dtype=jnp.float32)
-        z_bsr1 = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
-        tau = _tau_from_param(raw_tau)
-        page_diag = _static_page_diag(
-            op_key_local.shape[0], model_axis_size, operator_page_size,
-            operator_page_capacity, operator_page_fallback_pages,
-            operator_page_random_pages)
+        active_mean = active_frac.mean(axis=2)
+        gate_max_mean = global_gate_max.max(axis=2)
+        strong_mean = strong_frac.mean(axis=2)
+        positive_active_mean = positive_margin_mean_active.mean(axis=2)
+        qk_den_cost_mean = jax.lax.stop_gradient(global_den_cost.mean())
+        qk_execution_mass = jax.lax.stop_gradient(global_weighted.mean())
+        q_active_frac = active_frac[:, :, 0, :].mean()
+        k_active_frac = active_frac[:, :, 1, :].mean()
+        q_strong_frac = strong_frac[:, :, 0, :].mean()
+        k_strong_frac = strong_frac[:, :, 1, :].mean()
+        q_active_n_mean = jax.lax.stop_gradient(
+            global_active[:, :, 0, :]).mean()
+        k_active_n_mean = jax.lax.stop_gradient(
+            global_active[:, :, 1, :]).mean()
+
         slim_out = (
-            out, z_bs1, z_bs1, z, z, z, z, z_bs1, z_bs1,
-            jax.lax.stop_gradient(tau).mean(), z, z, z, z, z, z, z, z,
-            tau.astype(jnp.float32), z_bsr1)
-        conc_out = (z, z, z, z)
-        route_split = (z, z, z, z, z, z)
+            out.astype(jnp.float32),
+            active_mean,
+            gate_max_mean,
+            z,
+            jax.lax.stop_gradient(rho_std_token.mean()),
+            qk_execution_mass,
+            jax.lax.stop_gradient(global_active).mean(),
+            strong_mean,
+            positive_active_mean,
+            jnp.abs(tau_sg).mean(),
+            z,
+            z,
+            int_max_out,
+            qk_den_cost_mean,
+            z,
+            current_cost_mean,
+            z,
+            edge_margin_out,
+            tau_direct.astype(jnp.float32),
+            no_active_direct.astype(jnp.float32))
+        conc_out = (
+            gate_eff_n.mean(),
+            gate_eff_ratio.mean(),
+            top1_gate_frac.mean(),
+            top1_gate_frac.max(),
+        )
+        route_split = (
+            q_active_frac, k_active_frac,
+            q_strong_frac, k_strong_frac,
+            q_active_n_mean, k_active_n_mean)
         if analysis:
+            entropy_per_token = -(
+                jax.lax.stop_gradient(global_weighted)
+                * jnp.log(jnp.maximum(
+                    jax.lax.stop_gradient(global_weighted), 1e-30))
+            ) / jnp.maximum(jax.lax.stop_gradient(global_weighted), 1e-8)
             analysis_out = (
-                z_bs1, z, z, z, z, z, z, z, z, z, z)
+                active_mean,
+                z,
+                z,
+                z,
+                jax.lax.stop_gradient(global_active).std(),
+                jax.lax.stop_gradient(entropy_per_token.mean()),
+                qk_den_cost_mean,
+                z,
+                current_cost_mean,
+                z,
+                z,
+            )
         else:
             analysis_out = ()
-        raw_tau_sg = jax.lax.stop_gradient(raw_tau)
-        tau_sg = jax.lax.stop_gradient(tau)
         select_diag = (
-            z, z, z,
+            jax.lax.stop_gradient(rho_mean_token.mean()),
+            jax.lax.stop_gradient(rho_std_token.mean()),
+            jax.lax.pmax(jax.lax.stop_gradient(total_rho_max), 'model'),
             tau_sg.mean(), tau_sg.min(), tau_sg.max(),
             raw_tau_sg.mean(), raw_tau_sg.min(), raw_tau_sg.max(),
-            z, z, z, z, z)
+            jax.lax.stop_gradient(selection_margin_mean),
+            jax.lax.stop_gradient(positive_margin_mean),
+            jax.lax.pmax(
+                jax.lax.stop_gradient(total_positive_margin_max), 'model'),
+            jax.lax.stop_gradient(
+                global_selected.mean() / candidate_valid_ops_safe),
+            jax.lax.stop_gradient(no_active_direct.mean()),
+        )
         exposure_diag = (z, z, z, z, z, z)
         sparsity_diag = jnp.zeros(
             (2, GATE_SPARSITY_DIAG_COUNT), dtype=jnp.float32)
@@ -4527,7 +4921,7 @@ class DAWN_SRW_V4167(nn.Module):
     n_chunks_qk: int = 1     # N-axis chunking for qk pool
     n_chunks_v: int = 1      # N-axis chunking for v pool
     operator_pages_enabled: bool = True
-    operator_pages_pools: Optional[Any] = ('rst',)
+    operator_pages_pools: Optional[Any] = ('qk', 'v', 'rst')
     operator_page_size_qk: int = 128
     operator_page_size_v: int = 128
     operator_page_size_rst: int = 128
@@ -4536,7 +4930,7 @@ class DAWN_SRW_V4167(nn.Module):
     operator_page_capacity_rst: int = 32
     operator_page_microgroup_sequences: int = 2
     operator_page_score_mode: str = 'maxmean'
-    operator_page_fallback_pages: int = 1
+    operator_page_fallback_pages: int = 0
     operator_page_random_pages: int = 0
     operator_page_cost_weight: float = 0.0
     operator_pages_analysis_full_scan: bool = False
@@ -5843,10 +6237,15 @@ class DAWN_SRW_V4167(nn.Module):
             f"rst={float(rst_scale):.6g})",
             "  Global CEU operator pages: page-routed candidate RW execution "
             "over the live RW-derived operator-key atlas",
-            "  Page defaults: RST-first "
-            f"(rst page_size={self.operator_page_size_rst}, "
-            f"capacity={self.operator_page_capacity_rst}, "
-            f"microgroup_sequences={self.operator_page_microgroup_sequences})",
+            "  Page defaults: all-pool top-k "
+            f"(qk page_size={self.operator_page_size_qk}, "
+            f"cap={self.operator_page_capacity_qk}, "
+            f"v page_size={self.operator_page_size_v}, "
+            f"cap={self.operator_page_capacity_v}, "
+            f"rst page_size={self.operator_page_size_rst}, "
+            f"cap={self.operator_page_capacity_rst}, "
+            f"microgroup_sequences={self.operator_page_microgroup_sequences}, "
+            f"fallback={self.operator_page_fallback_pages})",
         ]
 
 
