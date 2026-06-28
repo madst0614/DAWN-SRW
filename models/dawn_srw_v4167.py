@@ -6003,15 +6003,16 @@ class DAWN_SRW_V4167(nn.Module):
             self.operator_page_size_rst, self.operator_page_capacity_rst,
             self.operator_page_fallback_pages,
             self.operator_page_random_pages))
-        for _prefix, _enabled, _diag_all in (
-                ('attn_qk', qk_pages_enabled, attn_qk_page_diag_all),
-                ('attn_v', v_pages_enabled, attn_v_page_diag_all),
-                ('rst', rst_pages_enabled, rst_page_diag_all)):
-            if _enabled:
-                result.update({
-                    f'{_prefix}_{_name}': _page_mean(_diag_all, _name)
-                    for _name in PAGE_DIAG_NAMES
-                })
+        if not self.is_initializing():
+            for _prefix, _enabled, _diag_all in (
+                    ('attn_qk', qk_pages_enabled, attn_qk_page_diag_all),
+                    ('attn_v', v_pages_enabled, attn_v_page_diag_all),
+                    ('rst', rst_pages_enabled, rst_page_diag_all)):
+                if _enabled:
+                    result.update({
+                        f'{_prefix}_{_name}': _page_mean(_diag_all, _name)
+                        for _name in PAGE_DIAG_NAMES
+                    })
         result['selected_page_count'] = (
             result['attn_qk_page_count_effective']
             + result['attn_v_page_count_effective']
