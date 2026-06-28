@@ -105,11 +105,13 @@ NETWORK_ENDPOINTS="$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
     --project="$PROJECT" \
     --format="value(networkEndpoints[].ipAddress)" || true)"
 WORKER_COUNT="$(printf '%s\n' "$NETWORK_ENDPOINTS" | awk 'NF {count += NF} END {print count + 0}')"
-if [ "$WORKER_COUNT" -le 0 ]; then
-    ACCELERATOR_SIZE="${ACCELERATOR_TYPE##*-}"
-    if [[ "$ACCELERATOR_SIZE" =~ ^[0-9]+$ ]]; then
-        WORKER_COUNT=$(( (ACCELERATOR_SIZE + 7) / 8 ))
-    fi
+ACCELERATOR_WORKER_COUNT=0
+ACCELERATOR_SIZE="${ACCELERATOR_TYPE##*-}"
+if [[ "$ACCELERATOR_SIZE" =~ ^[0-9]+$ ]]; then
+    ACCELERATOR_WORKER_COUNT=$(( (ACCELERATOR_SIZE + 7) / 8 ))
+fi
+if [ "$ACCELERATOR_WORKER_COUNT" -gt "$WORKER_COUNT" ]; then
+    WORKER_COUNT="$ACCELERATOR_WORKER_COUNT"
 fi
 if [ "$WORKER_COUNT" -le 0 ]; then
     echo "ERROR: Could not determine TPU worker count." >&2
@@ -146,17 +148,15 @@ done
 
 read -r -d '' CLEANUP_CMD <<'EOFCLEANUP' || true
 set -e
-TRAIN_JAX="train"
-TRAIN_JAX="${TRAIN_JAX}_jax"
-TRAIN_JAX_MINIMAL="${TRAIN_JAX}_minimal"
-PY_PREFIX="python3 script"
-PY_PREFIX="${PY_PREFIX}s"
-PGREP_PATTERN="${TRAIN_JAX}|${TRAIN_JAX_MINIMAL}|${PY_PREFIX}"
+TRAIN_JAX_PATTERN="[t]rain_jax"
+TRAIN_JAX_MINIMAL_PATTERN="[t]rain_jax_minimal"
+PYTHON_PATTERN="[p]ython3"
+PGREP_PATTERN="${TRAIN_JAX_PATTERN}|${TRAIN_JAX_MINIMAL_PATTERN}|${PYTHON_PATTERN} scripts"
 tmux kill-session -t train 2>/dev/null || true
-pkill -9 -f "python3 scripts/${TRAIN_JAX}.py" || true
-pkill -9 -f "python3 scripts/${TRAIN_JAX_MINIMAL}.py" || true
-pkill -9 -f "${TRAIN_JAX}.py" || true
-pkill -9 -f "${TRAIN_JAX_MINIMAL}.py" || true
+pkill -9 -f "${PYTHON_PATTERN} scripts/${TRAIN_JAX_PATTERN}\\.py" || true
+pkill -9 -f "${PYTHON_PATTERN} scripts/${TRAIN_JAX_MINIMAL_PATTERN}\\.py" || true
+pkill -9 -f "${TRAIN_JAX_PATTERN}\\.py" || true
+pkill -9 -f "${TRAIN_JAX_MINIMAL_PATTERN}\\.py" || true
 sudo lsof /dev/accel* 2>/dev/null | grep -v PID | awk '{print $2}' | sort -u | xargs -r sudo kill -9 || true
 sleep 3
 pgrep -af "$PGREP_PATTERN" || true
