@@ -36,8 +36,13 @@ import train_jax as full
 
 POOL_SCHEDULE_NAMES = ('qk', 'v', 'rst')
 
+debug_interval = 0
+debug_enabled = False
 
-def _stage_log(stage, extra=None):
+
+def _stage_log(stage, extra=None, *, force=False):
+    if not (debug_enabled or force):
+        return
     msg = {
         "stage": stage,
         "hostname": socket.gethostname(),
@@ -50,16 +55,30 @@ def _stage_log(stage, extra=None):
     print("[minimal-stage] " + json.dumps(msg, sort_keys=True), flush=True)
 
 
+def _quiet_multihost_barrier(name):
+    from jax.experimental import multihost_utils
+    multihost_utils.sync_global_devices(name)
+
+
 def _stage_barrier(stage):
+    name = f"minimal:{stage}"
+    context = {
+        "hostname": socket.gethostname(),
+        "process_index": int(jax.process_index()),
+        "trainer": "train_jax_minimal.py",
+    }
     _stage_log(f"enter_barrier:{stage}")
-    full._strict_multihost_barrier(
-        f"minimal:{stage}",
-        context={
-            "hostname": socket.gethostname(),
-            "process_index": int(jax.process_index()),
-            "trainer": "train_jax_minimal.py",
-        },
-    )
+    try:
+        if debug_enabled:
+            full._strict_multihost_barrier(name, context=context)
+        else:
+            _quiet_multihost_barrier(name)
+    except Exception as exc:
+        _stage_log(
+            f"FAILED barrier:{stage}",
+            {**context, "barrier": name, "error": str(exc)},
+            force=True)
+        raise
     _stage_log(f"passed_barrier:{stage}")
 
 
@@ -1090,7 +1109,17 @@ def main():
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--resume-from', '--resume', dest='resume_from',
                         type=str, default=None)
+    parser.add_argument(
+        '--debug',
+        nargs='?',
+        const=1,
+        default=0,
+        type=int,
+        help='Enable verbose minimal trainer diagnostics. Optional interval.')
     cli_args = parser.parse_args()
+    global debug_interval, debug_enabled
+    debug_interval = int(cli_args.debug or 0)
+    debug_enabled = debug_interval > 0
 
     config_path = Path(PROJECT_ROOT) / cli_args.config
     if not config_path.exists():
@@ -1272,26 +1301,33 @@ def main():
 
     cfg.setdefault('training', {}).update(training_config)
 
-    print(
-        f"[Host {host_id}/{n_hosts}] local_devices={n_local_devices} "
-        f"total_devices={jax.device_count()} backend={jax.default_backend()} "
-        f"devices={[str(d) for d in jax.local_devices()]}",
-        flush=True)
+    if debug_enabled:
+        print(
+            f"[Host {host_id}/{n_hosts}] local_devices={n_local_devices} "
+            f"total_devices={jax.device_count()} backend={jax.default_backend()} "
+            f"devices={[str(d) for d in jax.local_devices()]}",
+            flush=True)
+    elif is_host0:
+        print(
+            f"[Host {host_id}/{n_hosts}] local_devices={n_local_devices} "
+            f"total_devices={jax.device_count()} backend={jax.default_backend()}",
+            flush=True)
 
     train_script_git_commit = full._safe_git_info().get('git_commit')
-    full._print_jax_distributed_identity(
-        'scripts/train_jax_minimal.py',
-        config_path,
-        checkpoint_dir,
-        cli_args.from_scratch,
-        resume_step,
-    )
+    if debug_enabled:
+        full._print_jax_distributed_identity(
+            'scripts/train_jax_minimal.py',
+            config_path,
+            checkpoint_dir,
+            cli_args.from_scratch,
+            resume_step,
+        )
 
     startup_mesh_model = int(cfg['training'].get('mesh_model', 1))
     startup_mesh_data = int(cfg['training'].get('mesh_data', 0))
     if startup_mesh_data == 0:
         startup_mesh_data = jax.device_count() // startup_mesh_model
-    full._assert_multihost_same_startup_context({
+    startup_contexts = full._assert_multihost_same_startup_context({
         'trainer_script': 'scripts/train_jax_minimal.py',
         'config_path': str(config_path),
         'model_version': model_version_cfg,
@@ -1307,6 +1343,12 @@ def main():
         'host_id': host_id,
         'process_index': host_id,
     })
+    if debug_enabled and is_host0:
+        print(
+            "Distributed startup contexts:\n"
+            + json.dumps(startup_contexts, indent=2, sort_keys=True,
+                         default=str),
+            flush=True)
     _stage_barrier("after_startup_context_check")
 
     per_host_batch = batch_size // n_hosts
@@ -1819,11 +1861,23 @@ def main():
                     elapsed = time.time() - win_start_time
                     sec_per_it = elapsed / max(1, win_count)
                     current_lr = float(schedule(global_step))
+                    pct = 100.0 * global_step / max(1, total_micro_steps)
+                    elapsed_total = time.time() - train_start_time
+                    remaining_steps = max(total_micro_steps - global_step, 0)
+                    eta_seconds = remaining_steps * sec_per_it
+                    eta_str = full.format_time(eta_seconds)
+                    elapsed_str = full.format_time(elapsed_total)
+                    tokens_per_step = batch_size * max_seq_len
+                    tok_per_sec = tokens_per_step / max(sec_per_it, 1.0e-12)
                     line = (
-                        f"[Step {global_step}/{total_micro_steps}] "
+                        f"[Step {global_step}/{total_micro_steps} "
+                        f"({pct:.1f}%)] "
                         f"loss={loss_py:.4f} ce={ce_py:.4f} "
                         f"acc={acc_py:.4f} grad={grad_py:.4f} "
-                        f"lr={current_lr:.6g} time={sec_per_it:.2f} sec/it")
+                        f"lr={current_lr:.6g} "
+                        f"time={sec_per_it:.2f}s/it "
+                        f"eta={eta_str} elapsed={elapsed_str} "
+                        f"tok/s={tok_per_sec:.0f}")
                     full.log_message(line)
                     full.log_jsonl({
                         'type': 'train',
@@ -1835,6 +1889,9 @@ def main():
                         'grad_norm': grad_py,
                         'lr': current_lr,
                         'sec_per_it': sec_per_it,
+                        'eta_seconds': eta_seconds,
+                        'elapsed_seconds': elapsed_total,
+                        'tok_per_sec': tok_per_sec,
                         'timestamp': datetime.now().isoformat(),
                     })
                     full.sync_logs()
