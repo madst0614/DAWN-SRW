@@ -35,7 +35,7 @@ if [ -n "$PROJECT" ]; then
     PROJECT_ARG=(--project="$PROJECT")
 fi
 
-REMOTE_GREP='grep -nE "Traceback|RuntimeError|AssertionError|RESOURCE_EXHAUSTED|CheckpointManager|sync_global_devices|DEADLINE_EXCEEDED|F external|Terminating process|process_index|FAILED barrier|entering barrier|passed barrier|startup context" ~/train.log | tail -n 120'
+REMOTE_GREP='grep -nE "minimal-stage|entering barrier|passed barrier|FAILED barrier|task:7|unhealthy|Traceback|RuntimeError|AssertionError|RESOURCE_EXHAUSTED|Terminating process|SIGABRT|Aborted" ~/train.log | tail -n 120'
 
 for worker in $(seq 0 $((WORKERS - 1))); do
     echo "===== worker $worker ====="

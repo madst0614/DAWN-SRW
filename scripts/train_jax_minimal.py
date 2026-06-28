@@ -37,6 +37,32 @@ import train_jax as full
 POOL_SCHEDULE_NAMES = ('qk', 'v', 'rst')
 
 
+def _stage_log(stage, extra=None):
+    msg = {
+        "stage": stage,
+        "hostname": socket.gethostname(),
+        "process_index": int(jax.process_index()),
+        "process_count": int(jax.process_count()),
+        "time": datetime.now().isoformat(),
+    }
+    if extra:
+        msg.update(extra)
+    print("[minimal-stage] " + json.dumps(msg, sort_keys=True), flush=True)
+
+
+def _stage_barrier(stage):
+    _stage_log(f"enter_barrier:{stage}")
+    full._strict_multihost_barrier(
+        f"minimal:{stage}",
+        context={
+            "hostname": socket.gethostname(),
+            "process_index": int(jax.process_index()),
+            "trainer": "train_jax_minimal.py",
+        },
+    )
+    _stage_log(f"passed_barrier:{stage}")
+
+
 def _model_accepts_minimal_train(model):
     try:
         sig = inspect.signature(model.__call__)
@@ -1281,6 +1307,7 @@ def main():
         'host_id': host_id,
         'process_index': host_id,
     })
+    _stage_barrier("after_startup_context_check")
 
     per_host_batch = batch_size // n_hosts
     per_device_batch = per_host_batch // n_local_devices
@@ -1301,6 +1328,12 @@ def main():
         print(f"Per-device batch size: {per_device_batch}")
         print("Analysis/geometry/prune/drift diagnostics: off")
 
+    _stage_log("before_load_data", {
+        "batch_size": batch_size,
+        "max_seq_len": max_seq_len,
+        "n_hosts": n_hosts,
+        "host_id": host_id,
+    })
     from utils.data_jax import load_data
     train_loader, val_loader, vocab_size = load_data(
         cfg['data'],
@@ -1310,13 +1343,22 @@ def main():
         n_hosts=n_hosts,
         host_id=host_id,
     )
+    _stage_log("after_load_data", {
+        "train_batches": len(train_loader),
+        "val_batches": len(val_loader),
+        "vocab_size": vocab_size,
+    })
+    _stage_barrier("after_load_data")
     if is_host0:
         print(f"Vocab size: {vocab_size}")
         print(f"Train batches: {len(train_loader)}")
         print(f"Val batches: {len(val_loader)}")
 
     cfg['model']['vocab_size'] = vocab_size
+    _stage_log("before_build_model")
     model = full.build_model_from_config(cfg)
+    _stage_log("after_build_model")
+    _stage_barrier("after_build_model")
     if not _model_accepts_minimal_train(model):
         raise RuntimeError(
             "v4166 model does not expose minimal_train; minimal trainer "
@@ -1327,12 +1369,17 @@ def main():
     dummy_input = jnp.ones((1, max_seq_len), dtype=jnp.int32)
     if is_host0:
         print("=== Starting model.init ===", flush=True)
+    _stage_log("before_model_init")
     variables = model.init(
         {'params': init_rng, 'dropout': dropout_rng},
         dummy_input,
         deterministic=True,
     )
     params = variables['params']
+    _stage_log("after_model_init", {
+        "param_count": full.count_parameters(params) if host_id == 0 else -1,
+    })
+    _stage_barrier("after_model_init")
     if is_host0:
         print("=== model.init done ===", flush=True)
         print(f"Model parameters: {full.count_parameters(params):,}")
@@ -1341,6 +1388,11 @@ def main():
 
     selection_calibration_summary = None
     tau_init_summary = None
+    _stage_log("before_selection_calibration_branch", {
+        "enabled": bool(selection_calibration_cfg.get("enabled", False)),
+        "resume_step": None if resume_step is None else int(resume_step),
+    })
+    _stage_barrier("before_selection_calibration")
     if (selection_calibration_cfg.get('enabled', False)
             and resume_step is None):
         if len(train_loader) <= 0:
@@ -1348,13 +1400,24 @@ def main():
                 "selection_calibration requires at least one training batch.")
         if is_host0:
             print("\nSelection calibration: computing from fresh init.")
+        _stage_log("before_collect_selection_calibration_histograms")
+        _stage_barrier("before_collect_selection_calibration_histograms")
         (hist_counts, seen_tokens, actual_batches,
          local_calibration_tokens, calibration_process_count) = (
             full._collect_selection_calibration_histograms(
                 params, train_loader, cfg, selection_calibration_cfg))
+        _stage_log("after_collect_selection_calibration_histograms", {
+            "seen_tokens_local": int(seen_tokens),
+            "actual_batches": int(actual_batches),
+        })
+        _stage_barrier("after_collect_selection_calibration_histograms")
+        _stage_log("before_aggregate_selection_calibration_histograms")
+        _stage_barrier("before_aggregate_selection_calibration_histograms")
         hist_counts, seen_tokens, actual_batches = (
             full._aggregate_selection_calibration_histograms(
                 hist_counts, seen_tokens, actual_batches))
+        _stage_log("after_aggregate_selection_calibration_histograms")
+        _stage_barrier("after_aggregate_selection_calibration_histograms")
         selection_json = None
         if is_host0:
             selection_calibration_summary = (
@@ -1363,11 +1426,15 @@ def main():
                     seen_tokens, actual_batches,
                     local_calibration_tokens, calibration_process_count))
             selection_json = json.dumps(selection_calibration_summary)
+        _stage_log("before_selection_json_broadcast")
+        _stage_barrier("before_selection_json_broadcast")
         selection_json = _broadcast_str_from_host0(
             selection_json, max_len=32768)
         selection_calibration_summary = json.loads(selection_json)
         params = full._set_srw_quantile_tau_biases(
             params, selection_calibration_summary, model_version_cfg)
+        _stage_log("after_selection_calibration_applied")
+        _stage_barrier("after_selection_calibration_applied")
         materialized_updates = (
             full._selection_calibration_materialized_training_updates(
                 selection_calibration_summary, selection_calibration_cfg))
@@ -1413,21 +1480,33 @@ def main():
         raw_config_snapshot = deepcopy(
             resume_config_record.get('_raw_config', cfg)
             if resume_config_record else raw_cfg_snapshot)
+    _stage_log("after_config_snapshot")
+    _stage_barrier("after_config_snapshot")
 
     mesh_model = int(cfg['training'].get('mesh_model', 1))
     mesh_data = int(cfg['training'].get('mesh_data', 0))
     total_devices = jax.device_count()
     if mesh_data == 0:
         mesh_data = total_devices // mesh_model
+    _stage_log("before_create_mesh")
     mesh = full.create_mesh(mesh_data, mesh_model)
+    _stage_log("after_create_mesh", {
+        "mesh_data": mesh_data,
+        "mesh_model": mesh_model,
+        "total_devices": total_devices,
+    })
+    _stage_barrier("after_create_mesh")
     data_sharding = NamedSharding(mesh, P('data', None))
     if is_host0:
         print(
             f"\n=== Mesh: ({mesh_data}, {mesh_model}) = "
             f"{total_devices} devices, per_device_batch={per_device_batch} ===")
 
+    _stage_log("before_shard_params")
     param_shardings = full.get_param_shardings(params, mesh)
     params = full.shard_params_to_mesh(params, param_shardings)
+    _stage_log("after_shard_params")
+    _stage_barrier("after_shard_params")
 
     steps_per_epoch = len(train_loader)
     total_steps = num_epochs * steps_per_epoch
@@ -1439,11 +1518,14 @@ def main():
         decay_steps=total_steps,
         end_value=lr * 0.1,
     )
+    _stage_log("before_optimizer_init")
     optimizer = create_optimizer_minimal(
         params, schedule, weight_decay, pool_weight_decay,
         global_grad_clip=global_grad_clip)
     opt_state = optimizer.init(params)
     opt_state = full._replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
+    _stage_log("after_optimizer_init")
+    _stage_barrier("after_optimizer_init")
     target_params = params
     target_opt_state = opt_state
 
@@ -1533,9 +1615,15 @@ def main():
             raise RuntimeError(
                 f"global_step inconsistent across hosts: {gathered.tolist()}")
 
+    _stage_log("before_make_minimal_sharded_fns")
     sharded_fns, chunk_counts, max_chunks = _make_minimal_sharded_fns(
         cfg, mesh, mesh_model, batch_size, max_seq_len,
         per_device_batch, is_host0)
+    _stage_log("after_make_minimal_sharded_fns", {
+        "chunk_counts": [int(x) for x in chunk_counts],
+        "max_chunks": [int(x) for x in max_chunks],
+    })
+    _stage_barrier("after_make_minimal_sharded_fns")
     del chunk_counts, max_chunks
 
     step_kwargs = dict(
@@ -1559,6 +1647,7 @@ def main():
         soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
         soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
         admission_den_power=admission_den_power)
+    _stage_log("before_create_train_eval_steps")
     train_step_fn = create_train_step_minimal(
         model, optimizer, sharded_fns=sharded_fns,
         tau_lr_mult=tau_lr_mult,
@@ -1579,6 +1668,8 @@ def main():
         **step_kwargs)
     eval_step_fn = create_eval_step_minimal(
         model, sharded_fns=sharded_fns, **step_kwargs)
+    _stage_log("after_create_train_eval_steps")
+    _stage_barrier("after_create_train_eval_steps")
 
     if is_host0:
         print("\nTraining config:")
@@ -1648,6 +1739,8 @@ def main():
 
     if is_host0:
         print("\n=== Starting minimal training loop ===", flush=True)
+    _stage_log("before_training_loop")
+    _stage_barrier("before_training_loop")
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
