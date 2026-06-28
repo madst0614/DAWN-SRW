@@ -22,13 +22,32 @@ fi
 BRANCH="${BRANCH:?ERROR: BRANCH env var not set}"
 CONFIG="${CONFIG:?ERROR: CONFIG env var not set}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-scripts/train_jax.py}"
+TRAIN_ARGS="${TRAIN_ARGS:-}"
 WORK_DIR="$HOME/DAWN-SRW"
+export PYTHONUNBUFFERED=1
+
+echo "=== TPU worker startup ==="
+echo "HOSTNAME=$(hostname)"
+echo "DATE=$(date -Is)"
+echo "PWD=$(pwd)"
+echo "BRANCH=$(git branch --show-current 2>/dev/null || true)"
+echo "COMMIT=$(git rev-parse HEAD 2>/dev/null || true)"
+echo "TRAIN_SCRIPT=$TRAIN_SCRIPT"
+echo "CONFIG=$CONFIG"
+echo "TRAIN_ARGS=$TRAIN_ARGS"
+echo "PYTHON=$(which python3)"
+echo "PYTHON_VERSION=$(python3 --version)"
 
 echo "============================================"
 echo "Host $(hostname) -- Setting up TPU Pod training"
 echo "  Branch: $BRANCH"
 echo "  Config: $CONFIG"
 echo "  Train script: $TRAIN_SCRIPT"
+echo "TRAIN_SCRIPT=$TRAIN_SCRIPT"
+echo "CONFIG=$CONFIG"
+echo "TRAIN_ARGS=$TRAIN_ARGS"
+echo "HOSTNAME=$(hostname)"
+echo "DATE=$(date -Is)"
 echo "============================================"
 
 # 1. Install dependencies (all workers)
@@ -58,6 +77,14 @@ else
     cd "$WORK_DIR"
 fi
 
+echo "=== TPU worker repo ready ==="
+echo "PWD=$(pwd)"
+echo "BRANCH=$(git branch --show-current 2>/dev/null || true)"
+echo "COMMIT=$(git rev-parse HEAD 2>/dev/null || true)"
+echo "TRAIN_SCRIPT=$TRAIN_SCRIPT"
+echo "CONFIG=$CONFIG"
+echo "TRAIN_ARGS=$TRAIN_ARGS"
+
 # 3. Skip standalone JAX preflight.
 #
 # On multi-host TPU pods a short-lived standalone JAX process can initialize
@@ -75,6 +102,11 @@ echo "  Train args: ${TRAIN_ARGS:-}"
 echo "  Host: $(hostname)"
 echo "  Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "  Log: ~/train.log"
+echo "TRAIN_SCRIPT=$TRAIN_SCRIPT"
+echo "CONFIG=$CONFIG"
+echo "TRAIN_ARGS=$TRAIN_ARGS"
+echo "HOSTNAME=$(hostname)"
+echo "DATE=$(date -Is)"
 
 cd "$WORK_DIR"
 
@@ -110,9 +142,8 @@ else
 fi
 
 # Start new tmux session running training, tee to ~/train.log
-TRAIN_ARGS="${TRAIN_ARGS:-}"
 tmux new-session -d -s train \
-    "${XLA_DUMP_EXPORT}export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; ${XLA_FLAGS_EXPORT}python3 '$TRAIN_SCRIPT' --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+    "${XLA_DUMP_EXPORT}export PYTHONUNBUFFERED=1; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; ${XLA_FLAGS_EXPORT}{ echo '=== TPU training process startup ==='; echo \"TRAIN_SCRIPT=$TRAIN_SCRIPT\"; echo \"CONFIG=$CONFIG\"; echo \"TRAIN_ARGS=$TRAIN_ARGS\"; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"PYTHONUNBUFFERED=\$PYTHONUNBUFFERED\"; python3 -u \"$TRAIN_SCRIPT\" --config \"$CONFIG\" $TRAIN_ARGS; } 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"

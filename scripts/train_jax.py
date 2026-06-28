@@ -23,6 +23,7 @@ import math
 import subprocess
 import inspect
 import hashlib
+import socket
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -126,6 +127,116 @@ def _maybe_initialize_jax_distributed():
             "This trainer requires JAX distributed for TPU multi-host and "
             "Orbax CheckpointManager checkpointing."
         ) from exc
+
+
+_MULTIHOST_STARTUP_CONTEXT = {}
+
+
+def _stable_short_hash(value):
+    return hashlib.sha1(str(value).encode('utf-8')).hexdigest()[:8]
+
+
+def _assert_multihost_same_startup_context(context, max_len=65536):
+    """Fail if TPU hosts launched with different startup-critical context."""
+    local_context = dict(context or {})
+    local_context.setdefault('process_index', jax.process_index())
+    local_context.setdefault('host_id', jax.process_index())
+    local_context.setdefault('process_count', jax.process_count())
+
+    payload = json.dumps(
+        local_context,
+        sort_keys=True,
+        separators=(',', ':'),
+        default=str,
+    )
+    encoded = payload.encode('utf-8')
+    if len(encoded) > max_len:
+        raise ValueError(
+            f"startup context JSON too large: {len(encoded)} > {max_len}"
+        )
+
+    buf = np.zeros(max_len, dtype=np.uint8)
+    buf[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+    gathered = np.asarray(process_allgather(buf))
+    gathered = gathered.reshape((jax.process_count(), max_len))
+
+    contexts = []
+    for row in gathered:
+        raw = bytes(row).rstrip(b'\x00')
+        contexts.append(json.loads(raw.decode('utf-8')) if raw else {})
+    contexts = sorted(
+        contexts,
+        key=lambda item: int(item.get('process_index', -1)),
+    )
+
+    ignored = {'host_id', 'hostname', 'process_index'}
+    comparable = [
+        {k: v for k, v in item.items() if k not in ignored}
+        for item in contexts
+    ]
+    expected = comparable[0] if comparable else {}
+    if any(item != expected for item in comparable):
+        print(
+            "Distributed startup context mismatch across hosts:\n"
+            + json.dumps(contexts, indent=2, sort_keys=True, default=str),
+            file=sys.stderr,
+            flush=True,
+        )
+        raise RuntimeError(
+            "Distributed startup context mismatch across hosts; all hosts "
+            "must launch the same script, config, checkpoint path, and mesh "
+            "settings before Orbax CheckpointManager construction."
+        )
+
+    global _MULTIHOST_STARTUP_CONTEXT
+    _MULTIHOST_STARTUP_CONTEXT = dict(local_context)
+    if jax.process_index() == 0:
+        print(
+            "Distributed startup context check passed: "
+            f"script={local_context.get('trainer_script')} "
+            f"config={local_context.get('config_path')} "
+            f"checkpoint_dir={local_context.get('checkpoint_dir')}",
+            flush=True,
+        )
+    return contexts
+
+
+def _print_jax_distributed_identity(trainer_script, config_path,
+                                    checkpoint_dir, from_scratch,
+                                    resume_step):
+    print("=== JAX distributed identity ===", flush=True)
+    print(f"hostname={socket.gethostname()}", flush=True)
+    print(f"process_index={jax.process_index()}", flush=True)
+    print(f"process_count={jax.process_count()}", flush=True)
+    print(f"local_device_count={jax.local_device_count()}", flush=True)
+    print(f"global_device_count={jax.device_count()}", flush=True)
+    print(f"trainer_script={trainer_script}", flush=True)
+    print(f"config_path={config_path}", flush=True)
+    print(f"checkpoint_dir={checkpoint_dir}", flush=True)
+    print(f"from_scratch={bool(from_scratch)}", flush=True)
+    print(f"resume_step={resume_step}", flush=True)
+
+
+def _strict_multihost_barrier(name: str, context=None):
+    from jax.experimental import multihost_utils
+    try:
+        print(
+            f"[process {jax.process_index()}] entering barrier {name} "
+            f"context={context}",
+            flush=True,
+        )
+        multihost_utils.sync_global_devices(name)
+        print(
+            f"[process {jax.process_index()}] passed barrier {name}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[process {jax.process_index()}] FAILED barrier {name} "
+            f"context={context}: {exc}",
+            flush=True,
+        )
+        raise
 
 
 # ============================================================
@@ -5929,27 +6040,49 @@ def _orbax_multiprocessing_options(primary_host=0):
     )
 
 
-def _sync_orbax_checkpoint_root_created():
-    """Best-effort host barrier before Orbax manager construction."""
+def _sync_orbax_checkpoint_root_created(name='orbax_checkpoint_root_created',
+                                        context=None):
+    """Strict host barrier before Orbax manager construction."""
+    _strict_multihost_barrier(name, context=context)
+
+
+def _orbax_manager_debug_context(name, checkpoint_dir, create, read_only,
+                                 best_tracking, primary_host):
+    startup = _MULTIHOST_STARTUP_CONTEXT or {}
+    return {
+        'barrier': name,
+        'process_index': jax.process_index(),
+        'process_count': jax.process_count(),
+        'checkpoint_dir': str(checkpoint_dir),
+        'create': bool(create),
+        'read_only': bool(read_only),
+        'best_tracking': bool(best_tracking),
+        'primary_host': int(primary_host),
+        'trainer_script': startup.get('trainer_script'),
+        'config_path': startup.get('config_path'),
+        'hostname': socket.gethostname(),
+    }
+
+
+def _strict_orbax_manager_barrier(name, checkpoint_dir, create, read_only,
+                                  best_tracking, primary_host):
+    context = _orbax_manager_debug_context(
+        name, checkpoint_dir, create, read_only, best_tracking, primary_host)
     try:
-        from jax.experimental import multihost_utils
-    except Exception:
-        return
-
-    sync_devices = getattr(multihost_utils, 'sync_global_devices', None)
-    if sync_devices is not None:
-        try:
-            sync_devices('orbax_checkpoint_root_created')
-            return
-        except Exception:
-            pass
-
-    sync_processes = getattr(multihost_utils, 'sync_global_processes', None)
-    if sync_processes is not None:
-        try:
-            sync_processes('orbax_checkpoint_root_created')
-        except Exception:
-            pass
+        _strict_multihost_barrier(name, context=context)
+    except Exception as exc:
+        print(
+            "Orbax CheckpointManager synchronization failure:\n"
+            + json.dumps(
+                context,
+                indent=2,
+                sort_keys=True,
+                default=str,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
 
 
 def _orbax_async_checkpointing_enabled():
@@ -5978,7 +6111,21 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
     if create and not read_only:
         if jax.process_index() == primary_host:
             _ensure_orbax_checkpoint_root(checkpoint_dir)
-        _sync_orbax_checkpoint_root_created()
+        _strict_orbax_manager_barrier(
+            "orbax_root_created:" + _stable_short_hash(checkpoint_dir),
+            checkpoint_dir,
+            create,
+            read_only,
+            best_tracking,
+            primary_host,
+        )
+
+    manager_barrier_suffix = (
+        _stable_short_hash(checkpoint_dir)
+        + f":best={int(best_tracking)}"
+        + f":create={int(create)}"
+        + f":read={int(read_only)}"
+    )
 
     options_kwargs = {
         'save_interval_steps': max(1, int(checkpoint_interval or 1)),
@@ -6017,28 +6164,48 @@ def _create_orbax_checkpoint_manager(checkpoint_dir, checkpoint_interval=1,
 
     options = ocp.CheckpointManagerOptions(**options_kwargs)
 
-    def _construct_manager():
-        return ocp.CheckpointManager(
+    _strict_orbax_manager_barrier(
+        "before_orbax_manager:" + manager_barrier_suffix,
+        checkpoint_dir,
+        create,
+        read_only,
+        best_tracking,
+        primary_host,
+    )
+    try:
+        manager = ocp.CheckpointManager(
             checkpoint_dir,
             options=options,
             item_names=('state', 'metadata'),
         )
-
-    try:
-        return _construct_manager()
     except Exception as exc:
-        if create and not read_only and _is_orbax_missing_dir_error(exc):
-            if jax.process_index() == primary_host:
-                print(
-                    "Orbax CheckpointManager saw a missing checkpoint root "
-                    "during fresh creation; re-materializing and retrying "
-                    f"once: {checkpoint_dir}",
-                    flush=True,
-                )
-                _ensure_orbax_checkpoint_root(checkpoint_dir)
-            _sync_orbax_checkpoint_root_created()
-            return _construct_manager()
+        print(
+            "Orbax CheckpointManager construction failure:\n"
+            + json.dumps(
+                _orbax_manager_debug_context(
+                    "manager_construct:" + manager_barrier_suffix,
+                    checkpoint_dir,
+                    create,
+                    read_only,
+                    best_tracking,
+                    primary_host),
+                indent=2,
+                sort_keys=True,
+                default=str,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
         raise
+    _strict_orbax_manager_barrier(
+        "after_orbax_manager:" + manager_barrier_suffix,
+        checkpoint_dir,
+        create,
+        read_only,
+        best_tracking,
+        primary_host,
+    )
+    return manager
 
 
 def _is_orbax_missing_dir_error(exc):
@@ -9473,14 +9640,20 @@ def main():
 
     # Create new run folder if not resuming
     if checkpoint_dir is None:
-        import random as _random
-        from datetime import timezone, timedelta
-        kst = timezone(timedelta(hours=9))
-        ts = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
-        rand_suffix = _random.randint(1000, 9999)
-        version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
-        run_name = f"run_v{version}_{ts}_{rand_suffix}"
-        checkpoint_dir = _join(base_checkpoint_dir, run_name)
+        host0_checkpoint_dir = None
+        if jax.process_index() == 0:
+            import random as _random
+            from datetime import timezone, timedelta
+            kst = timezone(timedelta(hours=9))
+            ts = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
+            rand_suffix = _random.randint(1000, 9999)
+            version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
+            run_name = f"run_v{version}_{ts}_{rand_suffix}"
+            host0_checkpoint_dir = _join(base_checkpoint_dir, run_name)
+        checkpoint_dir = _broadcast_str_from_host0(
+            host0_checkpoint_dir, max_len=2048)
+        if checkpoint_dir is None:
+            raise RuntimeError("Failed to broadcast new run folder from host 0.")
         _makedirs(checkpoint_dir)
         if jax.process_index() == 0:
             if cli_args.from_scratch:
@@ -9490,6 +9663,14 @@ def main():
     log_dir = checkpoint_dir  # logs go in same run folder
     run_id = _path_name(checkpoint_dir)
     checkpoint_git_info = _safe_git_info()
+    train_script_git_commit = checkpoint_git_info.get('git_commit')
+    _print_jax_distributed_identity(
+        'scripts/train_jax.py',
+        config_path,
+        checkpoint_dir,
+        cli_args.from_scratch,
+        resume_step,
+    )
 
     # ----------------------------------------------------------
     # Resume config policy: checkpoint full_config is the only source of truth.
@@ -9505,6 +9686,26 @@ def main():
     selection_calibration_resume_restored = False
     selection_calibration_restore_required = False
     if resume_step is not None:
+        startup_mesh_model = int(tcfg.get('mesh_model', 1))
+        startup_mesh_data = int(tcfg.get('mesh_data', 0))
+        if startup_mesh_data == 0:
+            startup_mesh_data = jax.device_count() // startup_mesh_model
+        _assert_multihost_same_startup_context({
+            'trainer_script': 'scripts/train_jax.py',
+            'config_path': str(config_path),
+            'model_version': model_version_cfg,
+            'checkpoint_dir': checkpoint_dir,
+            'resume_step': resume_step,
+            'from_scratch': bool(cli_args.from_scratch),
+            'process_count': jax.process_count(),
+            'mesh_data': startup_mesh_data,
+            'mesh_model': startup_mesh_model,
+            'batch_size': batch_size,
+            'train_script_git_commit': train_script_git_commit,
+            'hostname': socket.gethostname(),
+            'host_id': jax.process_index(),
+            'process_index': jax.process_index(),
+        })
         resume_config_restore_read_only = True
         checkpoint_metadata = {}
         try:
@@ -10245,6 +10446,27 @@ def main():
           f"local_devices={n_local_devices} total_devices={jax.device_count()} "
           f"backend={jax.default_backend()} "
           f"devices={[str(d) for d in local_devices]}", flush=True)
+
+    startup_mesh_model = int(tcfg.get('mesh_model', 1))
+    startup_mesh_data = int(tcfg.get('mesh_data', 0))
+    if startup_mesh_data == 0:
+        startup_mesh_data = jax.device_count() // startup_mesh_model
+    _assert_multihost_same_startup_context({
+        'trainer_script': 'scripts/train_jax.py',
+        'config_path': str(config_path),
+        'model_version': model_version_cfg,
+        'checkpoint_dir': checkpoint_dir,
+        'resume_step': resume_step,
+        'from_scratch': bool(cli_args.from_scratch),
+        'process_count': n_hosts,
+        'mesh_data': startup_mesh_data,
+        'mesh_model': startup_mesh_model,
+        'batch_size': batch_size,
+        'train_script_git_commit': train_script_git_commit,
+        'hostname': socket.gethostname(),
+        'host_id': host_id,
+        'process_index': host_id,
+    })
 
     per_host_batch = batch_size // n_hosts
     per_device_batch = per_host_batch // n_local_devices

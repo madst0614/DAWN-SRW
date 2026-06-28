@@ -89,12 +89,34 @@ echo "  Args:    $TRAIN_ARGS"
 fi
 echo "============================================"
 
-# Check TPU status
+# Check TPU status and discover worker count
 echo "Checking TPU status..."
-gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+TPU_STATE="$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
     --zone="$ZONE" \
     --project="$PROJECT" \
-    --format="value(state)"
+    --format="value(state)")"
+echo "$TPU_STATE"
+ACCELERATOR_TYPE="$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+    --zone="$ZONE" \
+    --project="$PROJECT" \
+    --format="value(acceleratorType)")"
+NETWORK_ENDPOINTS="$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+    --zone="$ZONE" \
+    --project="$PROJECT" \
+    --format="value(networkEndpoints[].ipAddress)" || true)"
+WORKER_COUNT="$(printf '%s\n' "$NETWORK_ENDPOINTS" | awk 'NF {count += NF} END {print count + 0}')"
+if [ "$WORKER_COUNT" -le 0 ]; then
+    ACCELERATOR_SIZE="${ACCELERATOR_TYPE##*-}"
+    if [[ "$ACCELERATOR_SIZE" =~ ^[0-9]+$ ]]; then
+        WORKER_COUNT=$(( (ACCELERATOR_SIZE + 7) / 8 ))
+    fi
+fi
+if [ "$WORKER_COUNT" -le 0 ]; then
+    echo "ERROR: Could not determine TPU worker count." >&2
+    exit 1
+fi
+echo "  Accelerator: $ACCELERATOR_TYPE"
+echo "  Workers:     $WORKER_COUNT"
 
 if [ -n "$GH_TOKEN" ]; then
     REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/madst0614/DAWN-SRW.git"
@@ -102,16 +124,84 @@ else
     REPO_URL="https://github.com/madst0614/DAWN-SRW.git"
 fi
 
-# Build inline bootstrap: clone/update repo first, then run setup script
-read -r -d '' REMOTE_CMD <<EOFCMD || true
+run_worker_command() {
+    local worker="$1"
+    local command="$2"
+    gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+        --zone="$ZONE" \
+        --project="$PROJECT" \
+        --worker="$worker" \
+        --command="$command"
+}
+
+echo "Preflighting SSH on every worker..."
+for worker in $(seq 0 $((WORKER_COUNT - 1))); do
+    echo "=== Launching TPU worker index $worker ==="
+    echo "  Worker $worker SSH preflight..."
+    if ! run_worker_command "$worker" 'hostname; date -Is'; then
+        echo "ERROR: worker $worker SSH failed. Aborting launch. No training started." >&2
+        exit 1
+    fi
+done
+
+read -r -d '' CLEANUP_CMD <<'EOFCLEANUP' || true
 set -e
+TRAIN_JAX="train"
+TRAIN_JAX="${TRAIN_JAX}_jax"
+TRAIN_JAX_MINIMAL="${TRAIN_JAX}_minimal"
+PY_PREFIX="python3 script"
+PY_PREFIX="${PY_PREFIX}s"
+PGREP_PATTERN="${TRAIN_JAX}|${TRAIN_JAX_MINIMAL}|${PY_PREFIX}"
+tmux kill-session -t train 2>/dev/null || true
+pkill -9 -f "python3 scripts/${TRAIN_JAX}.py" || true
+pkill -9 -f "python3 scripts/${TRAIN_JAX_MINIMAL}.py" || true
+pkill -9 -f "${TRAIN_JAX}.py" || true
+pkill -9 -f "${TRAIN_JAX_MINIMAL}.py" || true
+sudo lsof /dev/accel* 2>/dev/null | grep -v PID | awk '{print $2}' | sort -u | xargs -r sudo kill -9 || true
+sleep 3
+pgrep -af "$PGREP_PATTERN" || true
+REMAINING="$(pgrep -af "$PGREP_PATTERN" || true)"
+if [ -n "$REMAINING" ]; then
+    echo "ERROR: DAWN training process remains after cleanup:" >&2
+    echo "$REMAINING" >&2
+    exit 1
+fi
+EOFCLEANUP
+
+cleanup_all_workers() {
+    local failed=0
+    for worker in $(seq 0 $((WORKER_COUNT - 1))); do
+        echo "  Cleaning worker $worker..."
+        if ! run_worker_command "$worker" "$CLEANUP_CMD"; then
+            echo "ERROR: worker $worker cleanup failed." >&2
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+echo "Cleaning old training processes on every worker..."
+if ! cleanup_all_workers; then
+    echo "ERROR: cleanup verification failed. Aborting launch." >&2
+    exit 1
+fi
+
+# Build inline bootstrap: clone/update repo first, then run setup script
+read -r -d '' REMOTE_CMD_TEMPLATE <<EOFCMD || true
+set -e
+TPU_WORKER_INDEX='__TPU_WORKER_INDEX__'
 REPO_URL='${REPO_URL}'
 BRANCH='${BRANCH}'
 CONFIG='${CONFIG}'
 TRAIN_SCRIPT='${TRAIN_SCRIPT}'
 GH_TOKEN='${GH_TOKEN}'
 TRAIN_ARGS='${TRAIN_ARGS}'
-export BRANCH CONFIG TRAIN_SCRIPT GH_TOKEN TRAIN_ARGS
+export TPU_WORKER_INDEX BRANCH CONFIG TRAIN_SCRIPT GH_TOKEN TRAIN_ARGS
+
+echo "=== Launching TPU worker index \$TPU_WORKER_INDEX ==="
+echo "TPU_WORKER_INDEX=\$TPU_WORKER_INDEX"
+echo "HOSTNAME=\$(hostname)"
+echo "DATE=\$(date -Is)"
 
 # Bootstrap: ensure ~/DAWN-SRW exists with the right branch
 if [ -d ~/DAWN-SRW/.git ]; then
@@ -132,15 +222,39 @@ EOFCMD
 
 # Send command to all workers
 echo "Sending bootstrap+training command to all workers..."
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
-    --zone="$ZONE" \
-    --project="$PROJECT" \
-    --worker=all \
-    --command="$REMOTE_CMD" \
-    2>&1 | tee "launch_${TPU_NAME}_$(date +%Y%m%d_%H%M%S).log"
+LAUNCH_TS="$(date +%Y%m%d_%H%M%S)"
+declare -a LAUNCH_PIDS=()
+declare -a LAUNCH_LOGS=()
+for worker in $(seq 0 $((WORKER_COUNT - 1))); do
+    log_file="launch_${TPU_NAME}_${LAUNCH_TS}_worker_${worker}.log"
+    LAUNCH_LOGS[$worker]="$log_file"
+    REMOTE_CMD="${REMOTE_CMD_TEMPLATE//__TPU_WORKER_INDEX__/$worker}"
+    echo "=== Launching TPU worker index $worker ==="
+    (
+        run_worker_command "$worker" "$REMOTE_CMD"
+    ) >"$log_file" 2>&1 &
+    LAUNCH_PIDS[$worker]=$!
+    echo "  Worker $worker launch started (log: $log_file)"
+done
+
+declare -a FAILED_WORKERS=()
+for worker in $(seq 0 $((WORKER_COUNT - 1))); do
+    if ! wait "${LAUNCH_PIDS[$worker]}"; then
+        FAILED_WORKERS+=("$worker")
+        echo "ERROR: worker $worker setup/start failed. See ${LAUNCH_LOGS[$worker]}" >&2
+    fi
+done
+
+if [ "${#FAILED_WORKERS[@]}" -gt 0 ]; then
+    echo "ERROR: launch failed on worker(s): ${FAILED_WORKERS[*]}. Cleaning up all workers." >&2
+    echo "First-failure log grep: bash scripts/grep_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --workers $WORKER_COUNT" >&2
+    cleanup_all_workers || true
+    exit 1
+fi
 
 echo ""
 echo "Launch complete. Training is running in tmux session 'train' on all workers."
 echo "  Log:     gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=0 --command='tail -f ~/train.log'"
 echo "  Attach:  gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=0 --command='tmux attach -t train'"
 echo "  Kill:    gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all --command='tmux kill-session -t train'"
+echo "  First failure grep: bash scripts/grep_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --workers $WORKER_COUNT"

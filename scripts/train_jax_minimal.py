@@ -13,6 +13,7 @@ import json
 import math
 import random
 import signal
+import socket
 import sys
 import time
 from copy import deepcopy
@@ -145,12 +146,20 @@ def _resolve_or_create_run(cfg, cli_args, is_host0):
                 f"No Orbax checkpoint found in {configured_resume_from}")
 
     if checkpoint_dir is None:
-        kst = timezone(timedelta(hours=9))
-        ts = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
-        rand_suffix = random.randint(1000, 9999)
-        version = cfg['model'].get('model_version', full.OFFICIAL_MODEL_VERSION)
-        run_name = f"run_v{version}_{ts}_{rand_suffix}"
-        checkpoint_dir = full._join_path(base_checkpoint_dir, run_name)
+        host0_checkpoint_dir = None
+        if is_host0:
+            kst = timezone(timedelta(hours=9))
+            ts = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
+            rand_suffix = random.randint(1000, 9999)
+            version = cfg['model'].get(
+                'model_version', full.OFFICIAL_MODEL_VERSION)
+            run_name = f"run_v{version}_{ts}_{rand_suffix}"
+            host0_checkpoint_dir = full._join_path(
+                base_checkpoint_dir, run_name)
+        checkpoint_dir = _broadcast_str_from_host0(
+            host0_checkpoint_dir, max_len=2048)
+        if checkpoint_dir is None:
+            raise RuntimeError("Failed to broadcast new run folder from host 0.")
         full._makedirs(checkpoint_dir)
         if is_host0:
             if cli_args.from_scratch:
@@ -1176,6 +1185,8 @@ def main():
     log_interval = int(tcfg.get('log_interval', 100))
     checkpoint_keep_last = int(tcfg.get(
         'checkpoint_keep_last', tcfg.get('max_checkpoints_to_keep', 3)))
+    checkpointing_enabled = ckpt_interval > 0
+    checkpoint_manager_required = checkpointing_enabled or resume_step is not None
     max_seq_len = int(cfg['model'].get('max_seq_len', 512))
 
     training_config = {
@@ -1240,6 +1251,36 @@ def main():
         f"total_devices={jax.device_count()} backend={jax.default_backend()} "
         f"devices={[str(d) for d in jax.local_devices()]}",
         flush=True)
+
+    train_script_git_commit = full._safe_git_info().get('git_commit')
+    full._print_jax_distributed_identity(
+        'scripts/train_jax_minimal.py',
+        config_path,
+        checkpoint_dir,
+        cli_args.from_scratch,
+        resume_step,
+    )
+
+    startup_mesh_model = int(cfg['training'].get('mesh_model', 1))
+    startup_mesh_data = int(cfg['training'].get('mesh_data', 0))
+    if startup_mesh_data == 0:
+        startup_mesh_data = jax.device_count() // startup_mesh_model
+    full._assert_multihost_same_startup_context({
+        'trainer_script': 'scripts/train_jax_minimal.py',
+        'config_path': str(config_path),
+        'model_version': model_version_cfg,
+        'checkpoint_dir': checkpoint_dir,
+        'resume_step': resume_step,
+        'from_scratch': bool(cli_args.from_scratch),
+        'process_count': n_hosts,
+        'mesh_data': startup_mesh_data,
+        'mesh_model': startup_mesh_model,
+        'batch_size': batch_size,
+        'train_script_git_commit': train_script_git_commit,
+        'hostname': socket.gethostname(),
+        'host_id': host_id,
+        'process_index': host_id,
+    })
 
     per_host_batch = batch_size // n_hosts
     per_device_batch = per_host_batch // n_local_devices
@@ -1406,12 +1447,31 @@ def main():
     target_params = params
     target_opt_state = opt_state
 
-    latest_checkpoint_manager = full._create_orbax_checkpoint_manager(
-        full._join_path(checkpoint_dir, 'checkpoints'),
-        checkpoint_interval=ckpt_interval,
-        keep_last=checkpoint_keep_last,
-        create=True,
-        best_tracking=False)
+    checkpoint_manager_path = full._join_path(checkpoint_dir, 'checkpoints')
+    if is_host0:
+        print(
+            "Minimal trainer checkpoint manager: "
+            f"{'enabled' if checkpoint_manager_required else 'disabled'}",
+            flush=True)
+        print(f"checkpoint_interval={ckpt_interval}", flush=True)
+        print(f"manager path={checkpoint_manager_path}", flush=True)
+        if ckpt_interval <= 0:
+            print(
+                "Checkpointing disabled because checkpoint_interval <= 0",
+                flush=True)
+        if resume_step is not None and ckpt_interval <= 0:
+            print(
+                "Orbax CheckpointManager still enabled for requested resume.",
+                flush=True)
+
+    latest_checkpoint_manager = None
+    if checkpoint_manager_required:
+        latest_checkpoint_manager = full._create_orbax_checkpoint_manager(
+            checkpoint_manager_path,
+            checkpoint_interval=ckpt_interval,
+            keep_last=checkpoint_keep_last,
+            create=True,
+            best_tracking=False)
 
     start_epoch = 0
     start_step_in_epoch = 0
@@ -1463,8 +1523,8 @@ def main():
                 print(
                     "  Restored checkpoint metadata kind="
                     f"{restored_metadata.get('checkpoint_kind', '<unknown>')}")
-    elif is_host0:
-        print(f"Orbax checkpoints: {full._join_path(checkpoint_dir, 'checkpoints')}")
+    elif is_host0 and checkpointing_enabled:
+        print(f"Orbax checkpoints: {checkpoint_manager_path}")
 
     if n_hosts > 1:
         gathered = np.asarray(process_allgather(
@@ -1640,7 +1700,10 @@ def main():
 
             do_log = (global_step % log_interval == 0) or global_step in (1, 2, 3)
             do_val = (global_step % val_interval == 0 and global_step > 0)
-            do_ckpt = (global_step % ckpt_interval == 0 and global_step > 0)
+            do_ckpt = (
+                ckpt_interval > 0
+                and global_step % ckpt_interval == 0
+                and global_step > 0)
 
             if do_log:
                 vals = jax.device_get({
@@ -1730,20 +1793,26 @@ def main():
 
         if preemption_requested[0]:
             try:
-                full.save_orbax_checkpoint(
-                    latest_checkpoint_manager,
-                    params, opt_state, rng,
-                    epoch, global_step, epoch_step_counter,
-                    steps_per_epoch, best_val_loss,
-                    cfg['model'], training_config,
-                    full_config_snapshot, raw_config_snapshot,
-                    config_path, run_id,
-                    'emergency',
-                    git_info=checkpoint_git_info,
-                    wait=True)
-                if is_host0:
+                if checkpointing_enabled:
+                    full.save_orbax_checkpoint(
+                        latest_checkpoint_manager,
+                        params, opt_state, rng,
+                        epoch, global_step, epoch_step_counter,
+                        steps_per_epoch, best_val_loss,
+                        cfg['model'], training_config,
+                        full_config_snapshot, raw_config_snapshot,
+                        config_path, run_id,
+                        'emergency',
+                        git_info=checkpoint_git_info,
+                        wait=True)
+                    if is_host0:
+                        print(
+                            f"Emergency checkpoint saved at step {global_step}",
+                            flush=True)
+                elif is_host0:
                     print(
-                        f"Emergency checkpoint saved at step {global_step}",
+                        "Emergency checkpoint skipped because "
+                        "checkpoint_interval <= 0",
                         flush=True)
             except Exception as exc:
                 if is_host0:
@@ -1768,7 +1837,7 @@ def main():
             train_loader.reset(start_step=0)
             epoch_step_counter = 0
 
-    if not preemption_requested[0]:
+    if not preemption_requested[0] and checkpointing_enabled:
         final_epoch = int(epoch + 1) if 'epoch' in locals() else int(start_epoch)
         try:
             full.save_orbax_checkpoint(
@@ -1788,6 +1857,10 @@ def main():
         except Exception as exc:
             if is_host0:
                 print(f"Warning: final Orbax checkpoint failed: {exc}")
+    elif (not preemption_requested[0]) and is_host0:
+        print(
+            "Final checkpoint skipped because checkpoint_interval <= 0",
+            flush=True)
 
     if is_host0:
         elapsed = time.time() - train_start_time
@@ -1795,6 +1868,9 @@ def main():
             f"Minimal training complete: step={global_step}, "
             f"elapsed={full.format_time(elapsed)}")
         full.sync_logs()
+
+    if latest_checkpoint_manager is not None:
+        latest_checkpoint_manager.close()
 
 
 if __name__ == '__main__':
