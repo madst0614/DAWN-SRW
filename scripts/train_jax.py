@@ -8139,6 +8139,21 @@ def _soft_gate_schedule_shape(ctx):
     return schedule, ""
 
 
+def _fixed_depth_pool_scale_from_ctx(ctx):
+    model_cfg = ctx.get('model_config') or ctx.get('model_cfg') or {}
+    d_model = ctx.get('d_model_cfg', ctx.get('d_model', model_cfg.get('d_model')))
+    n_layers = ctx.get(
+        'n_layers_cfg', ctx.get('n_layers', model_cfg.get('n_layers')))
+    try:
+        d_model = float(d_model)
+        n_layers = float(n_layers)
+    except (TypeError, ValueError):
+        return 0.0
+    if d_model <= 0.0 or n_layers <= 0.0:
+        return 0.0
+    return math.sqrt(d_model / n_layers)
+
+
 def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     """REGULAR tier: all training-dynamics fields needed for live monitoring.
 
@@ -8146,6 +8161,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     old train_fast / train_deep JSONL types should switch to type='train'.
     """
     m = metrics
+    fixed_pool_scale = _fixed_depth_pool_scale_from_ctx(ctx)
+    is_rw_key_model = _is_rw_key_srw_version(ctx.get('model_version'))
+
+    def _metric_present(*keys):
+        return any(key in m for key in keys)
+
     def _arr(key):
         try:
             return [float(v) for v in np.asarray(
@@ -8894,9 +8915,11 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_op_gain_std': float(m.get('rst_op_gain_std', 0.0)),
         'rst_op_gain_p99': float(m.get('rst_op_gain_p99', 0.0)),
         'rst_op_gain_max': float(m.get('rst_op_gain_max', 0.0)),
-        'attn_qk_pool_scale': float(m.get('attn_qk_pool_scale', 0.0)),
-        'attn_v_pool_scale': float(m.get('attn_v_pool_scale', 0.0)),
-        'rst_pool_scale': float(m.get('rst_pool_scale', 0.0)),
+        'attn_qk_pool_scale': float(
+            m.get('attn_qk_pool_scale', fixed_pool_scale)),
+        'attn_v_pool_scale': float(
+            m.get('attn_v_pool_scale', fixed_pool_scale)),
+        'rst_pool_scale': float(m.get('rst_pool_scale', fixed_pool_scale)),
         'attn_qk_raw_norm': float(m.get('attn_qk_raw_norm', 0.0)),
         'attn_v_raw_norm': float(m.get('attn_v_raw_norm', 0.0)),
         'rst_raw_out_norm': float(m.get('rst_raw_out_norm', 0.0)),
@@ -8961,6 +8984,18 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'attn_q_active', 'attn_k_active', 'attn_qk_active',
             'attn_v_active', 'rst_active',
         ))
+    rec['_rst_op_key_norm_max_available'] = _metric_present(
+        'rst_op_key_norm_max',
+        *(() if is_rw_key_model else ('rst_emb_norm_max',)))
+    rec['_attn_qk_op_key_norm_max_available'] = _metric_present(
+        'attn_qk_op_key_norm_max',
+        *(() if is_rw_key_model else ('attn_qk_emb_norm_max',)))
+    rec['_attn_v_op_key_norm_max_available'] = _metric_present(
+        'attn_v_op_key_norm_max',
+        *(() if is_rw_key_model else ('attn_v_emb_norm_max',)))
+    for _prefix in ('rst', 'attn_qk', 'attn_v'):
+        if not rec.get(f'_{_prefix}_op_key_norm_max_available', False):
+            rec[f'{_prefix}_op_key_norm_max'] = None
     for _pool in ('attn_qk', 'attn_v'):
         for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
             _fallback = rec.get(f"attn_{_name}", 0.0)
@@ -9111,6 +9146,11 @@ def _print_regular_block(rec, ctx):
     is_v4166 = _is_rw_key_srw_version(ctx.get('model_version'))
     is_official_soft_direct_tau = _is_active_srw_version(ctx.get('model_version'))
     official_soft_sparsity_compact = False
+
+    def _fmt_optional_max(prefix):
+        if rec.get(f'_{prefix}_op_key_norm_max_available', False):
+            return f"{rec[f'{prefix}_op_key_norm_max']:.2f}"
+        return "n/a"
     route_std_label = 'rho_std' if is_official_soft_direct_tau else 'score_std'
     def _g(key, default=0.0):
         return float(rec.get(key, default))
@@ -9465,11 +9505,11 @@ def _print_regular_block(rec, ctx):
         log_message(
             f"  {route_std_label}[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
             f" | op_key_n rst[m={rec['rst_op_key_norm']:.2f} s={rec['rst_op_key_norm_std']:.2f}"
-            f" min={rec['rst_op_key_norm_min']:.2f} max={rec['rst_op_key_norm_max']:.2f}]"
+            f" min={rec['rst_op_key_norm_min']:.2f} max={_fmt_optional_max('rst')}]"
             f" attn_qk[m={rec['attn_qk_op_key_norm_mean']:.2f} s={rec['attn_qk_op_key_norm_std']:.2f}"
-            f" min={rec['attn_qk_op_key_norm_min']:.2f} max={rec['attn_qk_op_key_norm_max']:.2f}]"
+            f" min={rec['attn_qk_op_key_norm_min']:.2f} max={_fmt_optional_max('attn_qk')}]"
             f" attn_v[m={rec['attn_v_op_key_norm_mean']:.2f} s={rec['attn_v_op_key_norm_std']:.2f}"
-            f" min={rec['attn_v_op_key_norm_min']:.2f} max={rec['attn_v_op_key_norm_max']:.2f}]"
+            f" min={rec['attn_v_op_key_norm_min']:.2f} max={_fmt_optional_max('attn_v')}]"
         )
     elif is_v4164 and not is_official_soft_direct_tau:
         log_message(
@@ -9610,6 +9650,7 @@ def _build_analysis_record(base, metrics, ctx):
     """
     m = metrics
     rec = dict(base)
+    fixed_pool_scale = _fixed_depth_pool_scale_from_ctx(ctx)
     # tau per-route std (attn [3]) -materialise once.
     try:
         a_tau_s = np.asarray(jax.device_get(m.get('attn_tau_std', jnp.zeros(3))))
@@ -9856,7 +9897,8 @@ def _build_analysis_record(base, metrics, ctx):
                 # instead of rst_emb_norm_mean.  Use that as a mean fallback.
                 fallback = m.get(base_key, 0.0) if _stat == 'mean' else 0.0
                 rec[f'{dst_prefix}_{_kind}_{_stat}'] = float(m.get(key, fallback))
-        rec[f'{dst_prefix}_pool_scale'] = float(m.get(f'{src_prefix}_pool_scale', 0.0))
+        rec[f'{dst_prefix}_pool_scale'] = float(
+            m.get(f'{src_prefix}_pool_scale', fixed_pool_scale))
 
     for _pool in ('attn_qk', 'attn_v', 'rst'):
         _copy_full_pool_stats(_pool)
@@ -12351,6 +12393,8 @@ def main():
             _v4164_module, 'make_sharded_srw_minimal', None)
         make_sharded_srw_paired_minimal = getattr(
             _v4164_module, 'make_sharded_srw_paired_minimal', None)
+        make_sharded_operator_page_tables = getattr(
+            _v4164_module, 'make_sharded_operator_page_tables', None)
         max_chunk = cfg['training'].get('max_chunk_size', None)
         if max_chunk is not None:
             attn_qk_max_chunk = attn_v_max_chunk = rst_max_chunk = int(max_chunk)
@@ -12369,6 +12413,20 @@ def main():
             if model_version_cfg == V4167_MODEL_VERSION:
                 kwargs.update(_operator_page_pool_kwargs(cfg, pool))
             return kwargs
+
+        _page_table_builders = {}
+        if (model_version_cfg == V4167_MODEL_VERSION
+                and make_sharded_operator_page_tables is not None):
+            for _pool, _builder_key in (
+                    ('qk', 'attn_qk_page_tables'),
+                    ('v', 'attn_v_page_tables'),
+                    ('rst', 'rst_page_tables')):
+                _pk = _operator_page_pool_kwargs(cfg, _pool)
+                if _pk['operator_pages_enabled']:
+                    _page_table_builders[_builder_key] = (
+                        make_sharded_operator_page_tables(
+                            mesh=mesh,
+                            operator_page_size=_pk['operator_page_size']))
 
         _supports_analysis = (
             'analysis' in _inspect.signature(make_sharded_srw).parameters
@@ -12419,6 +12477,8 @@ def main():
             if _sharded_paired_attn_qk_minimal is not None:
                 _sharded_fns['attn_qk_paired_minimal'] = (
                     _sharded_paired_attn_qk_minimal)
+            if _page_table_builders:
+                _sharded_fns.update(_page_table_builders)
         else:
             _sharded_fns = _sharded_single_rst
         # Analysis (observation only). Factory kwargs forward analysis=True
@@ -12442,13 +12502,16 @@ def main():
                     'paired': _sharded_paired_a,
                     'attn_qk_paired': _sharded_paired_a,
                 }
+                if _page_table_builders:
+                    _sharded_fns_analysis.update(_page_table_builders)
             else:
                 _sharded_fns_analysis = _sharded_single_rst_a
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
-                  f"; analysis kernels={'on' if _supports_analysis else 'off'})")
+                  f"; analysis kernels={'on' if _supports_analysis else 'off'}"
+                  f"; page_table_reuse={'on' if _page_table_builders else 'off'})")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -13003,6 +13066,9 @@ def main():
                 _v4164_module._pool_params_with_operator_keys(pool_p)
                 if hasattr(_v4164_module, '_pool_params_with_operator_keys')
                 else pool_p)
+            if hasattr(_v4164_module, '_pool_params_with_operator_page_tables'):
+                pool_select_p = _v4164_module._pool_params_with_operator_page_tables(
+                    pool_select_p, _sharded_fns)
             qk_op_key = _get_param(
                 pool_select_p, 'attn_qk_op_key',
                 'attn_qk_emb' if 'attn_qk_emb' in pool_select_p else 'qk_emb')
@@ -13023,6 +13089,9 @@ def main():
                 v_op_key, axis=-1, keepdims=True) + 1e-8)
             rst_norm = rst_op_key / (jnp.linalg.norm(
                 rst_op_key, axis=-1, keepdims=True) + 1e-8)
+            qk_route_arg = pool_select_p.get('attn_qk_page_tables', qk_norm)
+            v_route_arg = pool_select_p.get('attn_v_page_tables', v_norm)
+            rst_route_arg = pool_select_p.get('rst_page_tables', rst_norm)
 
             normed = prof_layernorm(
                 dummy_x, block_p['norm1']['scale'],
@@ -13034,17 +13103,17 @@ def main():
 
             if _is_sharded:
                 Q, K, *_ = prof_qk_fused(
-                    normed, h_Q, h_K, qk_norm, tau_all, raw_scan_offset_all,
+                    normed, h_Q, h_K, qk_route_arg, tau_all, raw_scan_offset_all,
                     qk_read, qk_write)
                 V, *_ = prof_v_sharded(
-                    normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
+                    normed, h_V, v_route_arg, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                     v_read, v_write)
             else:
                 Q, K = prof_qk_chunked(
-                    normed, h_Q, h_K, qk_norm, tau_all,
+                    normed, h_Q, h_K, qk_route_arg, tau_all,
                     qk_read, qk_write)
                 V, *_ = prof_v_chunked(
-                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    normed, h_V, v_route_arg, tau_all[:, :, 2:3],
                     v_read, v_write)
             jax.block_until_ready((Q, K, V))
 
@@ -13052,11 +13121,11 @@ def main():
             jax.block_until_ready(tau_rst)
             if _is_sharded:
                 _kout = prof_rst_sharded(
-                    normed, h_rst, rst_norm, tau_rst, raw_scan_offset_rst,
+                    normed, h_rst, rst_route_arg, tau_rst, raw_scan_offset_rst,
                     rst_read, rst_write)[0]
             else:
                 _kout, _, _, _, _, _, _, _ = prof_rst_chunked(
-                    normed, h_rst, rst_norm, tau_rst,
+                    normed, h_rst, rst_route_arg, tau_rst,
                     rst_read, rst_write)
             jax.block_until_ready(_kout)
 
@@ -13075,20 +13144,20 @@ def main():
 
             if _is_sharded:
                 ms, dg, pk = _t(lambda: prof_qk_fused(
-                    normed, h_Q, h_K, qk_norm, tau_all, raw_scan_offset_all,
+                    normed, h_Q, h_K, qk_route_arg, tau_all, raw_scan_offset_all,
                     qk_read, qk_write))
                 items.append(("A QK fused shard", ms, dg, pk))
                 ms, dg, pk = _t(lambda: prof_v_sharded(
-                    normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
+                    normed, h_V, v_route_arg, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                     v_read, v_write))
                 items.append(("A V shard", ms, dg, pk))
             else:
                 ms, dg, pk = _t(lambda: prof_qk_chunked(
-                    normed, h_Q, h_K, qk_norm, tau_all,
+                    normed, h_Q, h_K, qk_route_arg, tau_all,
                     qk_read, qk_write))
                 items.append(("A QK chunked(x2)", ms, dg, pk))
                 ms, dg, pk = _t(lambda: prof_v_chunked(
-                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    normed, h_V, v_route_arg, tau_all[:, :, 2:3],
                     v_read, v_write))
                 items.append(("A V chunked", ms, dg, pk))
 
@@ -13518,6 +13587,8 @@ def main():
                         'n_v_cfg': cfg['model'].get('n_v', 0),
                         'n_rst_cfg': cfg['model'].get(
                             'n_rst', cfg['model'].get('n_know', 0)),
+                        'd_model_cfg': cfg['model'].get('d_model', 0),
+                        'n_layers_cfg': cfg['model'].get('n_layers', 0),
                         'current_lr': _current_lr,
                         'steps_per_sec': _steps_per_sec,
                         'total_elapsed': _total_elapsed,
@@ -13701,6 +13772,9 @@ def main():
                                 'n_v_cfg': cfg['model'].get('n_v', 0),
                                 'n_rst_cfg': cfg['model'].get(
                                     'n_rst', cfg['model'].get('n_know', 0)),
+                                'd_model_cfg': cfg['model'].get('d_model', 0),
+                                'n_layers_cfg': cfg['model'].get(
+                                    'n_layers', 0),
                                 'current_lr': float(schedule(global_step // grad_accum_steps)),
                                 'model_version': model_version,
                             }

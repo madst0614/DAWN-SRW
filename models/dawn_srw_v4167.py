@@ -2596,6 +2596,9 @@ def _validate_operator_page_args(pool_name, n_valid, page_size,
 
 
 def _operator_page_tables(op_key_local, read_local, write_local, page_size):
+    op_key_local = _forward_unit_direction(op_key_local.astype(jnp.float32))
+    read_local = _forward_unit_direction(read_local.astype(jnp.float32))
+    write_local = _forward_unit_direction(write_local.astype(jnp.float32))
     (op_key_pad, read_pad, write_pad, valid_mask, n_valid, n_pad,
      page_count) = _pad_operator_pool_for_pages(
         op_key_local, read_local, write_local, page_size)
@@ -2615,6 +2618,121 @@ def _operator_page_tables(op_key_local, read_local, write_local, page_size):
     return (
         op_key_pages, read_pages, write_pages, valid_pages,
         valid_page_mask, page_keys, n_valid, n_pad, page_count)
+
+
+def _operator_page_table_arg(op_key_local, read_local, write_local, page_size):
+    """Shard-local normalized page tables for reuse across layers.
+
+    The returned pytree contains only arrays that are safe to pass through
+    shard_map.  Full-pool size diagnostics are recovered from valid_pages with
+    a model-axis psum inside the page kernels, so no host-side/global table is
+    needed.
+    """
+    (op_key_pages, read_pages, write_pages, valid_pages, valid_page_mask,
+     page_keys, _, _, _) = _operator_page_tables(
+        op_key_local, read_local, write_local, page_size)
+    return (
+        op_key_pages, read_pages, write_pages, valid_pages,
+        valid_page_mask, page_keys)
+
+
+def _unpack_operator_page_tables(page_tables):
+    return page_tables
+
+
+OPERATOR_PAGE_TABLE_SPECS = (
+    P('model', None, None),  # op_key_pages [P_local, page_size, d_route]
+    P('model', None, None),  # read_pages   [P_local, page_size, d_model]
+    P('model', None, None),  # write_pages  [P_local, page_size, d_model]
+    P('model', None),        # valid_pages  [P_local, page_size]
+    P('model'),              # valid_page_mask [P_local]
+    P('model', None),        # page_keys [P_local, d_route]
+)
+
+
+def make_sharded_operator_page_tables(mesh, operator_page_size=128):
+    """Build reusable shard-local page tables for one operator pool.
+
+    This is intentionally inside the JAX graph and inside shard_map: each model
+    shard converts only its local operator slice into page tables, gradients stay
+    live through op_key/read/write, and no global all_gather or host precompute
+    is introduced.
+    """
+    _page_size = int(operator_page_size)
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('model', None),
+                       P('model', None),
+                       P('model', None)),
+             out_specs=OPERATOR_PAGE_TABLE_SPECS,
+             check_rep=False)
+    def build_page_tables(op_key_local, read_local, write_local):
+        return _operator_page_table_arg(
+            op_key_local, read_local, write_local, _page_size)
+
+    return build_page_tables
+
+
+def _pool_params_with_operator_page_tables(pool_params, sharded_fns):
+    """Attach per-forward reusable page tables when builders are available.
+
+    The builders are supplied by the trainer because they are mesh-dependent.
+    Missing builders mean the caller is using the old full-pool path or a
+    non-page pool; in that case the original pool params are returned.
+    """
+    if not isinstance(sharded_fns, dict):
+        return pool_params
+    out = dict(pool_params)
+
+    def _maybe_add(prefix, builder_key, op_key_key, read_key, write_key):
+        builder = sharded_fns.get(builder_key)
+        if builder is None or f'{prefix}_page_tables' in out:
+            return
+        out[f'{prefix}_page_tables'] = builder(
+            out[op_key_key], out[read_key], out[write_key])
+
+    _maybe_add(
+        'attn_qk', 'attn_qk_page_tables',
+        'attn_qk_op_key', 'attn_qk_read', 'attn_qk_write')
+    _maybe_add(
+        'attn_v', 'attn_v_page_tables',
+        'attn_v_op_key', 'attn_v_read', 'attn_v_write')
+    _maybe_add(
+        'rst', 'rst_page_tables',
+        'rst_op_key', 'rst_read', 'rst_write')
+    return out
+
+
+def _validate_operator_page_table_args(pool_name, page_count, page_size,
+                                       page_capacity, fallback_pages,
+                                       random_pages):
+    page_size = int(page_size)
+    page_capacity = int(page_capacity)
+    fallback_pages = int(fallback_pages)
+    random_pages = int(random_pages)
+    page_count = int(page_count)
+    if page_size <= 0:
+        raise ValueError(f"{pool_name} operator_page_size must be > 0.")
+    if page_count <= 0:
+        raise ValueError(f"{pool_name} local page table must be non-empty.")
+    if page_capacity <= 0:
+        raise ValueError(f"{pool_name} operator_page_capacity must be > 0.")
+    if fallback_pages < 0 or random_pages < 0:
+        raise ValueError(
+            f"{pool_name} fallback/random pages must be non-negative.")
+    effective_pages = page_capacity + fallback_pages + random_pages
+    if effective_pages > page_count:
+        raise ValueError(
+            f"{pool_name} requests {effective_pages} candidate pages "
+            f"(capacity={page_capacity}, fallback={fallback_pages}, "
+            f"random={random_pages}) but only {page_count} local pages exist.")
+    return effective_pages
+
+
+def _sorted_selected_page_ids(fallback_ids, top_ids, random_ids):
+    selected_page_ids = jnp.concatenate(
+        (fallback_ids, top_ids.astype(jnp.int32), random_ids), axis=1)
+    return jnp.sort(selected_page_ids, axis=1)
 
 
 def _normalize_operator_page_score_mode(score_mode):
@@ -2833,14 +2951,13 @@ def _select_operator_pages_for_calibration(
 
     top_scores = jnp.where(protected, jnp.float32(-1.0e30), page_scores)
     _, top_ids = jax.lax.top_k(top_scores, int(page_capacity))
-    selected_page_ids = jnp.concatenate(
-        (fallback_ids, top_ids.astype(jnp.int32), random_ids), axis=1)
+    selected_page_ids = _sorted_selected_page_ids(
+        fallback_ids, top_ids, random_ids)
     cand_valid = valid_pages[selected_page_ids].reshape(
         group_count, k_candidates)
     cand_key = op_key_pages_f[selected_page_ids].reshape(
         group_count, k_candidates, op_key.shape[-1])
-    cand_key = _forward_unit_direction(
-        cand_key.astype(jnp.float32)).astype(jnp.bfloat16)
+    cand_key = cand_key.astype(jnp.bfloat16)
 
     if paired:
         rho_raw = jnp.einsum(
@@ -3029,14 +3146,14 @@ def make_sharded_srw_page_minimal(mesh, max_chunk_size=2048,
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),
                        P('data', None, None),
-                       P('model', None),
+                       OPERATOR_PAGE_TABLE_SPECS,
                        P('data', None, None),
                        P('model', None),
                        P('model', None),
                        P(), P(), P(), P(), P()),
              out_specs=P('data', None, None),
              check_rep=False)
-    def fused_gate_srw_page_minimal(x, h, op_key_local, raw_tau,
+    def fused_gate_srw_page_minimal(x, h, page_tables, raw_tau,
                                     read_local, write_local,
                                     soft_gate_temperature,
                                     soft_gate_t_final,
@@ -3044,9 +3161,13 @@ def make_sharded_srw_page_minimal(mesh, max_chunk_size=2048,
                                     soft_gate_boundary_power_final,
                                     execution_prune_eps):
         del soft_gate_t_final, soft_gate_boundary_power_final
-        N_local = op_key_local.shape[0]
-        page_count, effective_pages = _validate_operator_page_args(
-            'single-route', N_local, _page_size, _page_capacity,
+        del read_local, write_local
+        (op_key_pages_f, read_pages_f, write_pages_f, valid_pages,
+         valid_page_mask, page_keys) = _unpack_operator_page_tables(
+            page_tables)
+        page_count = op_key_pages_f.shape[0]
+        effective_pages = _validate_operator_page_table_args(
+            'single-route', page_count, _page_size, _page_capacity,
             _fallback_pages, _random_pages)
         K = effective_pages * _page_size
 
@@ -3062,10 +3183,6 @@ def make_sharded_srw_page_minimal(mesh, max_chunk_size=2048,
         x_groups = x_pad.reshape(group_count, mg, S, D)
         h_groups = h_pad.reshape(group_count, mg, S, h.shape[-1])
         raw_tau_groups = raw_tau_pad.reshape(group_count, mg, S, 1)
-
-        (op_key_pages_f, read_pages_f, write_pages_f, valid_pages,
-         valid_page_mask, page_keys, _, _, _) = _operator_page_tables(
-            op_key_local, read_local, write_local, _page_size)
 
         page_key_bf = page_keys.astype(jnp.bfloat16)
         h_unit = _forward_unit_direction(
@@ -3111,21 +3228,18 @@ def make_sharded_srw_page_minimal(mesh, max_chunk_size=2048,
 
         top_scores = jnp.where(protected, jnp.float32(-1.0e30), page_scores)
         _, top_ids = jax.lax.top_k(top_scores, _page_capacity)
-        selected_page_ids = jnp.concatenate(
-            (fallback_ids, top_ids.astype(jnp.int32), random_ids), axis=1)
+        selected_page_ids = _sorted_selected_page_ids(
+            fallback_ids, top_ids, random_ids)
         cand_valid = valid_pages[selected_page_ids].reshape(group_count, K)
         cand_valid_f = cand_valid.astype(jnp.float32)
 
         cand_key = op_key_pages_f[selected_page_ids].reshape(
-            group_count, K, op_key_local.shape[-1])
-        cand_read = _forward_unit_direction(
-            read_pages_f[selected_page_ids].reshape(group_count, K, D)
-        ).astype(jnp.bfloat16)
-        cand_write = _forward_unit_direction(
-            write_pages_f[selected_page_ids].reshape(group_count, K, D)
-        ).astype(jnp.bfloat16)
-        cand_key = _forward_unit_direction(
-            cand_key.astype(jnp.float32)).astype(jnp.bfloat16)
+            group_count, K, op_key_pages_f.shape[-1])
+        cand_read = read_pages_f[selected_page_ids].reshape(
+            group_count, K, D).astype(jnp.bfloat16)
+        cand_write = write_pages_f[selected_page_ids].reshape(
+            group_count, K, D).astype(jnp.bfloat16)
+        cand_key = cand_key.astype(jnp.bfloat16)
 
         rho_raw = jnp.einsum(
             'gmsd,gkd->gmsk', h_unit, cand_key).astype(jnp.float32)
@@ -3200,14 +3314,14 @@ def make_sharded_srw_paired_page_minimal(mesh, max_chunk_size=2048,
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),
                        P('data', None, None, None),
-                       P('model', None),
+                       OPERATOR_PAGE_TABLE_SPECS,
                        P('data', None, None, None),
                        P('model', None),
                        P('model', None),
                        P(), P(), P(), P(), P()),
              out_specs=P('data', None, None, None),
              check_rep=False)
-    def fused_gate_srw_paired_page_minimal(x, h, op_key_local, raw_tau,
+    def fused_gate_srw_paired_page_minimal(x, h, page_tables, raw_tau,
                                            read_local, write_local,
                                            soft_gate_temperature,
                                            soft_gate_t_final,
@@ -3215,9 +3329,13 @@ def make_sharded_srw_paired_page_minimal(mesh, max_chunk_size=2048,
                                            soft_gate_boundary_power_final,
                                            execution_prune_eps):
         del soft_gate_t_final, soft_gate_boundary_power_final
-        N_local = op_key_local.shape[0]
-        page_count, effective_pages = _validate_operator_page_args(
-            'qk-paired', N_local, _page_size, _page_capacity,
+        del read_local, write_local
+        (op_key_pages_f, read_pages_f, write_pages_f, valid_pages,
+         valid_page_mask, page_keys) = _unpack_operator_page_tables(
+            page_tables)
+        page_count = op_key_pages_f.shape[0]
+        effective_pages = _validate_operator_page_table_args(
+            'qk-paired', page_count, _page_size, _page_capacity,
             _fallback_pages, _random_pages)
         K = effective_pages * _page_size
 
@@ -3236,9 +3354,6 @@ def make_sharded_srw_paired_page_minimal(mesh, max_chunk_size=2048,
         h_groups = h_pad.reshape(group_count, mg, S, R, h.shape[-1])
         raw_tau_groups = raw_tau_pad.reshape(group_count, mg, S, R, 1)
 
-        (op_key_pages_f, read_pages_f, write_pages_f, valid_pages,
-         valid_page_mask, page_keys, _, _, _) = _operator_page_tables(
-            op_key_local, read_local, write_local, _page_size)
         page_key_bf = page_keys.astype(jnp.bfloat16)
         h_unit = _forward_unit_direction(
             h_groups.astype(jnp.float32)).astype(jnp.bfloat16)
@@ -3285,21 +3400,18 @@ def make_sharded_srw_paired_page_minimal(mesh, max_chunk_size=2048,
 
         top_scores = jnp.where(protected, jnp.float32(-1.0e30), page_scores)
         _, top_ids = jax.lax.top_k(top_scores, _page_capacity)
-        selected_page_ids = jnp.concatenate(
-            (fallback_ids, top_ids.astype(jnp.int32), random_ids), axis=1)
+        selected_page_ids = _sorted_selected_page_ids(
+            fallback_ids, top_ids, random_ids)
         cand_valid = valid_pages[selected_page_ids].reshape(group_count, K)
         cand_valid_f = cand_valid.astype(jnp.float32)
 
         cand_key = op_key_pages_f[selected_page_ids].reshape(
-            group_count, K, op_key_local.shape[-1])
-        cand_read = _forward_unit_direction(
-            read_pages_f[selected_page_ids].reshape(group_count, K, D)
-        ).astype(jnp.bfloat16)
-        cand_write = _forward_unit_direction(
-            write_pages_f[selected_page_ids].reshape(group_count, K, D)
-        ).astype(jnp.bfloat16)
-        cand_key = _forward_unit_direction(
-            cand_key.astype(jnp.float32)).astype(jnp.bfloat16)
+            group_count, K, op_key_pages_f.shape[-1])
+        cand_read = read_pages_f[selected_page_ids].reshape(
+            group_count, K, D).astype(jnp.bfloat16)
+        cand_write = write_pages_f[selected_page_ids].reshape(
+            group_count, K, D).astype(jnp.bfloat16)
+        cand_key = cand_key.astype(jnp.bfloat16)
 
         rho_raw = jnp.einsum(
             'gmsrd,gkd->gmsrk', h_unit, cand_key).astype(jnp.float32)
@@ -3395,25 +3507,31 @@ def make_sharded_srw_page(mesh, max_chunk_size=2048, analysis=False,
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),
                        P('data', None, None),
-                       P('model', None),
+                       OPERATOR_PAGE_TABLE_SPECS,
                        P('data', None, None),
                        P('model', None),
                        P('model', None),
                        P(), P(), P(), P(), P()),
              out_specs=_out_specs,
              check_rep=False)
-    def fused_gate_srw_page(x, h, op_key_local, raw_tau,
+    def fused_gate_srw_page(x, h, page_tables, raw_tau,
                             read_local, write_local,
                             soft_gate_temperature, soft_gate_t_final,
                             soft_gate_boundary_power,
                             soft_gate_boundary_power_final,
                             execution_prune_eps):
-        N_local = op_key_local.shape[0]
-        page_count, effective_pages = _validate_operator_page_args(
-            'single-route', N_local, _page_size, _page_capacity,
+        del read_local, write_local
+        (op_key_pages_f, read_pages_f, write_pages_f, valid_pages,
+         valid_page_mask, page_keys) = _unpack_operator_page_tables(
+            page_tables)
+        page_count = op_key_pages_f.shape[0]
+        effective_pages = _validate_operator_page_table_args(
+            'single-route', page_count, _page_size, _page_capacity,
             _fallback_pages, _random_pages)
         K = effective_pages * _page_size
-        N_total = N_local * _model_axis_size
+        N_total = jax.lax.psum(
+            valid_pages.astype(jnp.float32).sum(), 'model')
+        N_total = jnp.maximum(N_total, jnp.float32(1.0))
         K_total = K * _model_axis_size
 
         B, S, D = x.shape
@@ -3429,9 +3547,6 @@ def make_sharded_srw_page(mesh, max_chunk_size=2048, analysis=False,
         h_groups = h_pad.reshape(group_count, mg, S, h.shape[-1])
         raw_tau_groups = raw_tau_pad.reshape(group_count, mg, S, 1)
 
-        (op_key_pages_f, read_pages_f, write_pages_f, valid_pages,
-         valid_page_mask, page_keys, _, _, _) = _operator_page_tables(
-            op_key_local, read_local, write_local, _page_size)
         page_key_bf = page_keys.astype(jnp.bfloat16)
         h_unit = _forward_unit_direction(
             h_groups.astype(jnp.float32)).astype(jnp.bfloat16)
@@ -3476,23 +3591,20 @@ def make_sharded_srw_page(mesh, max_chunk_size=2048, analysis=False,
             random_ids = jnp.zeros((group_count, 0), dtype=jnp.int32)
         top_scores = jnp.where(protected, jnp.float32(-1.0e30), page_scores)
         _, top_ids = jax.lax.top_k(top_scores, _page_capacity)
-        selected_page_ids = jnp.concatenate(
-            (fallback_ids, top_ids.astype(jnp.int32), random_ids), axis=1)
+        selected_page_ids = _sorted_selected_page_ids(
+            fallback_ids, top_ids, random_ids)
         cand_valid = valid_pages[selected_page_ids].reshape(group_count, K)
         cand_valid_f = cand_valid.astype(jnp.float32)
         candidate_valid_ops = jax.lax.stop_gradient(
             jax.lax.psum(cand_valid_f.sum(axis=-1), 'model').mean())
 
         cand_key = op_key_pages_f[selected_page_ids].reshape(
-            group_count, K, op_key_local.shape[-1])
-        cand_read = _forward_unit_direction(
-            read_pages_f[selected_page_ids].reshape(group_count, K, D)
-        ).astype(jnp.bfloat16)
-        cand_write = _forward_unit_direction(
-            write_pages_f[selected_page_ids].reshape(group_count, K, D)
-        ).astype(jnp.bfloat16)
-        cand_key = _forward_unit_direction(
-            cand_key.astype(jnp.float32)).astype(jnp.bfloat16)
+            group_count, K, op_key_pages_f.shape[-1])
+        cand_read = read_pages_f[selected_page_ids].reshape(
+            group_count, K, D).astype(jnp.bfloat16)
+        cand_write = write_pages_f[selected_page_ids].reshape(
+            group_count, K, D).astype(jnp.bfloat16)
+        cand_key = cand_key.astype(jnp.bfloat16)
 
         rho_raw = jnp.einsum(
             'gmsd,gkd->gmsk', h_unit, cand_key).astype(jnp.float32)
@@ -3654,7 +3766,7 @@ def make_sharded_srw_page(mesh, max_chunk_size=2048, analysis=False,
         ).max()
         page_score_mean = page_score_mean_per_group.mean()
         candidate_ops = jnp.float32(K_total)
-        candidate_valid_frac = candidate_valid_ops / jnp.float32(N_total)
+        candidate_valid_frac = candidate_valid_ops / N_total
         candidate_valid_group = jax.lax.psum(
             cand_valid_f.sum(axis=-1), 'model')
         page_no_route_frac = (
@@ -3683,7 +3795,7 @@ def make_sharded_srw_page(mesh, max_chunk_size=2048, analysis=False,
         page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_valid_ops']].set(
             jax.lax.stop_gradient(candidate_valid_ops))
         page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_frac']].set(
-            candidate_ops / jnp.float32(N_total))
+            candidate_ops / N_total)
         page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_valid_frac']].set(
             jax.lax.stop_gradient(candidate_valid_frac))
         page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_den_mean']].set(
@@ -3703,7 +3815,7 @@ def make_sharded_srw_page(mesh, max_chunk_size=2048, analysis=False,
             jnp.float32(effective_pages))
         page_diag = page_diag.at[
             PAGE_DIAG_INDEX['estimated_compute_frac_page']].set(
-                candidate_ops / jnp.float32(N_total))
+                candidate_ops / N_total)
 
         slim_out = (
             out.astype(jnp.float32),
@@ -3846,26 +3958,32 @@ def make_sharded_srw_paired_page(mesh, max_chunk_size=2048, analysis=False,
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),
                        P('data', None, None, None),
-                       P('model', None),
+                       OPERATOR_PAGE_TABLE_SPECS,
                        P('data', None, None, None),
                        P('model', None),
                        P('model', None),
                        P(), P(), P(), P(), P()),
              out_specs=_out_specs,
              check_rep=False)
-    def fused_gate_srw_paired_page(x, h, op_key_local, raw_tau,
+    def fused_gate_srw_paired_page(x, h, page_tables, raw_tau,
                                    read_local, write_local,
                                    soft_gate_temperature,
                                    soft_gate_t_final,
                                    soft_gate_boundary_power,
                                    soft_gate_boundary_power_final,
                                    execution_prune_eps):
-        N_local = op_key_local.shape[0]
-        page_count, effective_pages = _validate_operator_page_args(
-            'qk-paired', N_local, _page_size, _page_capacity,
+        del read_local, write_local
+        (op_key_pages_f, read_pages_f, write_pages_f, valid_pages,
+         valid_page_mask, page_keys) = _unpack_operator_page_tables(
+            page_tables)
+        page_count = op_key_pages_f.shape[0]
+        effective_pages = _validate_operator_page_table_args(
+            'qk-paired', page_count, _page_size, _page_capacity,
             _fallback_pages, _random_pages)
         K = effective_pages * _page_size
-        N_total = N_local * _model_axis_size
+        N_total = jax.lax.psum(
+            valid_pages.astype(jnp.float32).sum(), 'model')
+        N_total = jnp.maximum(N_total, jnp.float32(1.0))
         K_total = K * _model_axis_size
 
         B, S, R, _ = h.shape
@@ -3883,9 +4001,6 @@ def make_sharded_srw_paired_page(mesh, max_chunk_size=2048, analysis=False,
         h_groups = h_pad.reshape(group_count, mg, S, R, h.shape[-1])
         raw_tau_groups = raw_tau_pad.reshape(group_count, mg, S, R, 1)
 
-        (op_key_pages_f, read_pages_f, write_pages_f, valid_pages,
-         valid_page_mask, page_keys, _, _, _) = _operator_page_tables(
-            op_key_local, read_local, write_local, _page_size)
         page_key_bf = page_keys.astype(jnp.bfloat16)
         h_unit = _forward_unit_direction(
             h_groups.astype(jnp.float32)).astype(jnp.bfloat16)
@@ -3932,23 +4047,20 @@ def make_sharded_srw_paired_page(mesh, max_chunk_size=2048, analysis=False,
 
         top_scores = jnp.where(protected, jnp.float32(-1.0e30), page_scores)
         _, top_ids = jax.lax.top_k(top_scores, _page_capacity)
-        selected_page_ids = jnp.concatenate(
-            (fallback_ids, top_ids.astype(jnp.int32), random_ids), axis=1)
+        selected_page_ids = _sorted_selected_page_ids(
+            fallback_ids, top_ids, random_ids)
         cand_valid = valid_pages[selected_page_ids].reshape(group_count, K)
         cand_valid_f = cand_valid.astype(jnp.float32)
         candidate_valid_ops = jax.lax.stop_gradient(
             jax.lax.psum(cand_valid_f.sum(axis=-1), 'model').mean())
 
         cand_key = op_key_pages_f[selected_page_ids].reshape(
-            group_count, K, op_key_local.shape[-1])
-        cand_read = _forward_unit_direction(
-            read_pages_f[selected_page_ids].reshape(group_count, K, D)
-        ).astype(jnp.bfloat16)
-        cand_write = _forward_unit_direction(
-            write_pages_f[selected_page_ids].reshape(group_count, K, D)
-        ).astype(jnp.bfloat16)
-        cand_key = _forward_unit_direction(
-            cand_key.astype(jnp.float32)).astype(jnp.bfloat16)
+            group_count, K, op_key_pages_f.shape[-1])
+        cand_read = read_pages_f[selected_page_ids].reshape(
+            group_count, K, D).astype(jnp.bfloat16)
+        cand_write = write_pages_f[selected_page_ids].reshape(
+            group_count, K, D).astype(jnp.bfloat16)
+        cand_key = cand_key.astype(jnp.bfloat16)
 
         rho_raw = jnp.einsum(
             'gmsrd,gkd->gmsrk', h_unit, cand_key).astype(jnp.float32)
@@ -4115,7 +4227,7 @@ def make_sharded_srw_paired_page(mesh, max_chunk_size=2048, analysis=False,
         ).max()
         page_score_mean = page_score_mean_per_group.mean()
         candidate_ops = jnp.float32(K_total)
-        candidate_valid_frac = candidate_valid_ops / jnp.float32(N_total)
+        candidate_valid_frac = candidate_valid_ops / N_total
         candidate_valid_group = jax.lax.psum(
             cand_valid_f.sum(axis=-1), 'model')
         page_no_route_frac = (
@@ -4144,7 +4256,7 @@ def make_sharded_srw_paired_page(mesh, max_chunk_size=2048, analysis=False,
         page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_valid_ops']].set(
             jax.lax.stop_gradient(candidate_valid_ops))
         page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_frac']].set(
-            candidate_ops / jnp.float32(N_total))
+            candidate_ops / N_total)
         page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_valid_frac']].set(
             jax.lax.stop_gradient(candidate_valid_frac))
         page_diag = page_diag.at[PAGE_DIAG_INDEX['candidate_den_mean']].set(
@@ -4164,7 +4276,7 @@ def make_sharded_srw_paired_page(mesh, max_chunk_size=2048, analysis=False,
             jnp.float32(effective_pages))
         page_diag = page_diag.at[
             PAGE_DIAG_INDEX['estimated_compute_frac_page']].set(
-                candidate_ops / jnp.float32(N_total))
+                candidate_ops / N_total)
 
         z = jnp.float32(0.0)
         active_mean = active_frac.mean(axis=2)
@@ -4434,9 +4546,13 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     qk_op_key = pool_params['attn_qk_op_key']
     qk_read = pool_params['attn_qk_read']
     qk_write = pool_params['attn_qk_write']
+    qk_page_tables = pool_params.get('attn_qk_page_tables', None)
+    qk_op_arg = qk_page_tables if qk_page_tables is not None else qk_op_key
     v_op_key = pool_params['attn_v_op_key']
     v_read = pool_params['attn_v_read']
     v_write = pool_params['attn_v_write']
+    v_page_tables = pool_params.get('attn_v_page_tables', None)
+    v_op_arg = v_page_tables if v_page_tables is not None else v_op_key
 
     rng, rng_drop = jax.random.split(rng)
     attn_read_query = (
@@ -4473,13 +4589,13 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     raw_tau_QK = jnp.stack(
         [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
     QK_out = fused_paired(
-        x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
+        x, h_QK, qk_op_arg, raw_tau_QK, qk_read, qk_write,
         soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps)
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
     V = fused_single_v(
-        x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
+        x, h_V, v_op_arg, raw_tau_all[:, :, 2:3], v_read, v_write,
         soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps)
     V = V * v_scale
@@ -4531,6 +4647,8 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
     rst_op_key = pool_params['rst_op_key']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
+    rst_page_tables = pool_params.get('rst_page_tables', None)
+    rst_op_arg = rst_page_tables if rst_page_tables is not None else rst_op_key
 
     rng, rng_drop = jax.random.split(rng)
     rst_read_query = (
@@ -4551,7 +4669,7 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
     else:
         fused_single, _ = sharded_fns
     out = fused_single(
-        x, h, rst_op_key, raw_tau, rst_read, rst_write,
+        x, h, rst_op_arg, raw_tau, rst_read, rst_write,
         soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps)
     out = out * rst_scale
@@ -4587,14 +4705,18 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     qk_op_key = pool_params['attn_qk_op_key']
     qk_read = pool_params['attn_qk_read']
     qk_write = pool_params['attn_qk_write']
+    qk_page_tables = pool_params.get('attn_qk_page_tables', None)
+    qk_op_arg = qk_page_tables if qk_page_tables is not None else qk_op_key
     v_op_key = pool_params['attn_v_op_key']
     v_read = pool_params['attn_v_read']
     v_write = pool_params['attn_v_write']
+    v_page_tables = pool_params.get('attn_v_page_tables', None)
+    v_op_arg = v_page_tables if v_page_tables is not None else v_op_key
 
     # RW-derived operator keys are passed into the sharded SRW closure.
     # The closure forward-normalizes them for selection stability.
-    qk_op_key_unit = qk_op_key
-    v_op_key_unit = v_op_key
+    qk_op_key_unit = qk_op_arg
+    v_op_key_unit = v_op_arg
 
     _qk_op_key_norms = jax.lax.stop_gradient(
         jnp.linalg.norm(qk_op_key, axis=-1))
@@ -5013,6 +5135,8 @@ def _rst_forward(x, pool_params, router_params, rng,
     rst_op_key = pool_params['rst_op_key']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
+    rst_page_tables = pool_params.get('rst_page_tables', None)
+    rst_op_arg = rst_page_tables if rst_page_tables is not None else rst_op_key
 
     rng, rng_drop = jax.random.split(rng)
     rst_read_query = (
@@ -5025,7 +5149,7 @@ def _rst_forward(x, pool_params, router_params, rng,
 
     # RW-derived operator keys are passed into the sharded SRW closure.
     # The closure forward-normalizes them for selection stability.
-    rst_op_key_unit = rst_op_key
+    rst_op_key_unit = rst_op_arg
     raw_tau = (
         x @ router_params['raw_tau_rst']['kernel']
         + router_params['raw_tau_rst']['bias'])
@@ -5443,6 +5567,8 @@ class DAWN_SRW_V4167(nn.Module):
             all_params = self.variables['params']
             pool_params = _pool_params_with_operator_keys(
                 all_params['neuron_pool'])
+            pool_params = _pool_params_with_operator_page_tables(
+                pool_params, sharded_fns)
             router_params = all_params['router']
 
             _sharded = sharded_fns
