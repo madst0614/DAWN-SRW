@@ -72,18 +72,6 @@ from models.dawn_srw_v4166 import (
     _raw_tau_init_from_cosine_tau as _v4166_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4166_tau_init_calibration_scores,
 )
-from models.dawn_srw_v4167 import (
-    DAWN_SRW_V4167,
-    _pool_operator_keys as _v4167_pool_operator_keys,
-    _raw_tau_init_from_cosine_tau as _v4167_raw_tau_init_from_cosine_tau,
-    _tau_init_calibration_scores as _v4167_tau_init_calibration_scores,
-)
-from models.dawn_srw_v4168 import (
-    DAWN_SRW_V4168,
-    _pool_operator_keys as _v4168_pool_operator_keys,
-    _raw_tau_init_from_cosine_tau as _v4168_raw_tau_init_from_cosine_tau,
-    _tau_init_calibration_scores as _v4168_tau_init_calibration_scores,
-)
 from models.baseline_transformer_jax import VanillaTransformer
 
 
@@ -260,15 +248,11 @@ def _strict_multihost_barrier(name: str, context=None):
 
 V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
 V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
-V4167_MODEL_VERSION = 'spatial-r1-v4.1.6.7'
-V4168_MODEL_VERSION = 'spatial-r1-v4.1.6.8'
 BASELINE_MODEL_VERSION = 'baseline'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (
-    V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION,
-    V4168_MODEL_VERSION)
-RW_KEY_SRW_MODEL_VERSIONS = (
-    V4166_MODEL_VERSION, V4167_MODEL_VERSION, V4168_MODEL_VERSION)
+    V4164_MODEL_VERSION, V4166_MODEL_VERSION)
+RW_KEY_SRW_MODEL_VERSIONS = (V4166_MODEL_VERSION,)
 CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_SELECTION_CALIBRATION_SCORE_CHUNK_TOKENS = 2048
 MODEL_REGISTRY = {
@@ -290,18 +274,6 @@ MODEL_REGISTRY = {
         'module': 'models.dawn_srw_v4166',
         'raw_tau_init_from_cosine_tau': _v4166_raw_tau_init_from_cosine_tau,
         'tau_init_calibration_scores': _v4166_tau_init_calibration_scores,
-    },
-    V4167_MODEL_VERSION: {
-        'class': DAWN_SRW_V4167,
-        'module': 'models.dawn_srw_v4167',
-        'raw_tau_init_from_cosine_tau': _v4167_raw_tau_init_from_cosine_tau,
-        'tau_init_calibration_scores': _v4167_tau_init_calibration_scores,
-    },
-    V4168_MODEL_VERSION: {
-        'class': DAWN_SRW_V4168,
-        'module': 'models.dawn_srw_v4168',
-        'raw_tau_init_from_cosine_tau': _v4168_raw_tau_init_from_cosine_tau,
-        'tau_init_calibration_scores': _v4168_tau_init_calibration_scores,
     },
 }
 
@@ -368,16 +340,8 @@ def _is_rw_key_srw_version(version):
     return str(version) in RW_KEY_SRW_MODEL_VERSIONS
 
 
-def _is_operator_page_srw_version(version):
-    return str(version) in (V4167_MODEL_VERSION, V4168_MODEL_VERSION)
-
-
 def _pool_operator_keys_for_version(version):
     version = str(version)
-    if version == V4168_MODEL_VERSION:
-        return _v4168_pool_operator_keys
-    if version == V4167_MODEL_VERSION:
-        return _v4167_pool_operator_keys
     if version == V4166_MODEL_VERSION:
         return _v4166_pool_operator_keys
     raise ValueError(f"{version} does not expose RW-derived operator keys.")
@@ -799,89 +763,12 @@ def _safe_config_snapshot(obj):
     return _json_safe(deepcopy(obj))
 
 
-V4167_PAGE_CONFIG_DEFAULTS = (
-    ('operator_pages_enabled', True),
-    ('operator_pages_pools', ('qk', 'v', 'rst')),
-    ('operator_page_size_qk', 128),
-    ('operator_page_size_v', 128),
-    ('operator_page_size_rst', 128),
-    ('operator_page_capacity_qk', 8),
-    ('operator_page_capacity_v', 8),
-    ('operator_page_capacity_rst', 32),
-    ('operator_page_microgroup_sequences', 2),
-    ('operator_page_score_mode', 'maxmean'),
-    ('operator_page_fallback_pages', 0),
-    ('operator_page_random_pages', 0),
-    ('operator_page_cost_weight', 0.0),
-    ('operator_pages_analysis_full_scan', False),
-)
-
-V4167_PAGE_RESUME_REQUIRED_FIELDS = tuple(
-    ('model', key) for key, _ in V4167_PAGE_CONFIG_DEFAULTS)
-
-V4168_PAGE_CONFIG_DEFAULTS = V4167_PAGE_CONFIG_DEFAULTS + (
-    ('operator_page_repack_interval', 0),
-)
-
-V4168_PAGE_RESUME_REQUIRED_FIELDS = tuple(
-    ('model', key) for key, _ in V4168_PAGE_CONFIG_DEFAULTS)
-
-
-def _operator_page_config_defaults_for_version(version):
-    version = str(version)
-    if version == V4168_MODEL_VERSION:
-        return V4168_PAGE_CONFIG_DEFAULTS
-    if version == V4167_MODEL_VERSION:
-        return V4167_PAGE_CONFIG_DEFAULTS
-    return None
-
-
-def _operator_page_resume_required_fields_for_version(version):
-    version = str(version)
-    if version == V4168_MODEL_VERSION:
-        return V4168_PAGE_RESUME_REQUIRED_FIELDS
-    if version == V4167_MODEL_VERSION:
-        return V4167_PAGE_RESUME_REQUIRED_FIELDS
-    return ()
-
-
-def _materialize_operator_page_config(cfg):
-    if not isinstance(cfg, dict):
-        return cfg
-    model_cfg = cfg.setdefault('model', {})
-    if not isinstance(model_cfg, dict):
-        return cfg
-    defaults = _operator_page_config_defaults_for_version(
-        model_cfg.get('model_version', OFFICIAL_MODEL_VERSION))
-    if defaults is None:
-        return cfg
-    training_cfg = cfg.get('training', {})
-    if not isinstance(training_cfg, dict):
-        training_cfg = {}
-    for key, default in defaults:
-        if key in model_cfg and model_cfg[key] is not None:
-            value = model_cfg[key]
-        elif key in training_cfg and training_cfg[key] is not None:
-            value = training_cfg[key]
-        else:
-            value = default
-        if key == 'operator_pages_pools' and isinstance(value, tuple):
-            value = list(value)
-        model_cfg[key] = value
-    return cfg
-
-
-def _materialize_v4167_page_config(cfg):
-    return _materialize_operator_page_config(cfg)
-
-
 def _materialized_config_snapshot(cfg, training_config):
     full_cfg = deepcopy(cfg)
     merged_training = deepcopy(cfg.get('training', {}))
     if training_config:
         merged_training.update(deepcopy(training_config))
     full_cfg['training'] = merged_training
-    _materialize_operator_page_config(full_cfg)
     return _json_safe(full_cfg)
 
 
@@ -981,10 +868,6 @@ def _require_resume_materialized_fields(full_config):
 
     missing = _missing_config_paths(
         full_config, ACTIVE_SRW_RESUME_REQUIRED_FIELDS)
-    if _is_operator_page_srw_version(model_version):
-        missing.extend(_missing_config_paths(
-            full_config,
-            _operator_page_resume_required_fields_for_version(model_version)))
     if missing:
         raise RuntimeError(
             "Resume checkpoint full_config is missing required materialized "
@@ -1139,85 +1022,11 @@ def _cfg_bool(value, *, name):
     return bool(value)
 
 
-def _operator_page_cfg_get(cfg, key, default=None):
-    m = cfg.get('model', {})
-    t = cfg.get('training', {})
-    if key in m:
-        return m[key]
-    return t.get(key, default)
-
-
-def _operator_page_repack_interval(cfg):
-    value = _operator_page_cfg_get(cfg, 'operator_page_repack_interval', 0)
-    if value is None:
-        value = 0
-    value = int(value)
-    if value < 0:
-        raise ValueError("operator_page_repack_interval must be >= 0")
-    return value
-
-
-def _is_v4168_repack_enabled(cfg):
-    version = cfg.get('model', {}).get('model_version', OFFICIAL_MODEL_VERSION)
-    return (str(version) == V4168_MODEL_VERSION
-            and _operator_page_repack_interval(cfg) > 0)
-
-
-def _operator_pages_pool_enabled(cfg, pool):
-    enabled = _cfg_bool(
-        _operator_page_cfg_get(cfg, 'operator_pages_enabled', True),
-        name='operator_pages_enabled')
-    if not enabled:
-        return False
-    pools = _operator_page_cfg_get(
-        cfg, 'operator_pages_pools', ('qk', 'v', 'rst'))
-    if pools is None:
-        return True
-    if isinstance(pools, bool):
-        return pools
-    if isinstance(pools, dict):
-        return _cfg_bool(
-            pools.get(pool, pools.get(f'operator_pages_{pool}', False)),
-            name=f'operator_pages_pools.{pool}')
-    if isinstance(pools, str):
-        values = {
-            item.strip().lower()
-            for item in pools.replace(',', ' ').split()
-            if item.strip()
-        }
-    else:
-        values = {str(item).strip().lower() for item in pools}
-    return ('all' in values or pool in values
-            or ('qk' in values and pool == 'attn_qk'))
-
-
-def _operator_page_pool_kwargs(cfg, pool):
-    if pool not in ('qk', 'v', 'rst'):
-        raise ValueError(f"unknown operator page pool {pool!r}")
-    default_capacity = {'qk': 8, 'v': 8, 'rst': 32}[pool]
-    return {
-        'operator_pages_enabled': _operator_pages_pool_enabled(cfg, pool),
-        'operator_page_size': int(_operator_page_cfg_get(
-            cfg, f'operator_page_size_{pool}', 128)),
-        'operator_page_capacity': int(_operator_page_cfg_get(
-            cfg, f'operator_page_capacity_{pool}', default_capacity)),
-        'operator_page_microgroup_sequences': int(_operator_page_cfg_get(
-            cfg, 'operator_page_microgroup_sequences', 2)),
-        'operator_page_score_mode': str(_operator_page_cfg_get(
-            cfg, 'operator_page_score_mode', 'maxmean')),
-        'operator_page_fallback_pages': int(_operator_page_cfg_get(
-            cfg, 'operator_page_fallback_pages', 0)),
-        'operator_page_random_pages': int(_operator_page_cfg_get(
-            cfg, 'operator_page_random_pages', 0)),
-    }
-
-
 def _dawn_srw_kwargs(cfg):
     """Official v4.1.6.4 DAWN-SRW constructor kwargs."""
     kw = _v4164_model_base_kwargs(cfg)
     m = cfg['model']
     t = cfg['training']
-    version = m.get('model_version', OFFICIAL_MODEL_VERSION)
     if 'n_rst' not in m and 'n_know' not in m:
         raise ValueError("v4164 requires model.n_rst or model.n_know checkpoint alias.")
     kw['n_rst'] = m.get('n_rst', m.get('n_know'))
@@ -1233,22 +1042,6 @@ def _dawn_srw_kwargs(cfg):
         kw['tau_init_attn_qk'] = 0.0
         kw['tau_init_attn_v'] = 0.0
         kw['tau_init_rst'] = 0.0
-    page_defaults = _operator_page_config_defaults_for_version(version)
-    if page_defaults is not None:
-        for key, default in page_defaults:
-            if key == 'operator_page_repack_interval' and version != V4168_MODEL_VERSION:
-                continue
-            value = _operator_page_cfg_get(cfg, key, default)
-            if key == 'operator_pages_pools':
-                if isinstance(value, list):
-                    value = tuple(value)
-                elif isinstance(value, dict):
-                    value = tuple(
-                        pool for pool in ('qk', 'v', 'rst')
-                        if _cfg_bool(value.get(pool, False),
-                                     name=f'operator_pages_pools.{pool}'))
-            if value is not None:
-                kw[key] = value
     return kw
 
 
@@ -1330,732 +1123,7 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
     score_kwargs = {
         'max_tokens': int(max_tokens),
     }
-    if _is_operator_page_srw_version(version):
-        score_kwargs.update({
-            'operator_pages_enabled': _operator_page_cfg_get(
-                cfg, 'operator_pages_enabled', True),
-            'operator_pages_pools': _operator_page_cfg_get(
-                cfg, 'operator_pages_pools', ('qk', 'v', 'rst')),
-            'operator_page_size_qk': int(_operator_page_cfg_get(
-                cfg, 'operator_page_size_qk', 128)),
-            'operator_page_size_v': int(_operator_page_cfg_get(
-                cfg, 'operator_page_size_v', 128)),
-            'operator_page_size_rst': int(_operator_page_cfg_get(
-                cfg, 'operator_page_size_rst', 128)),
-            'operator_page_capacity_qk': int(_operator_page_cfg_get(
-                cfg, 'operator_page_capacity_qk', 8)),
-            'operator_page_capacity_v': int(_operator_page_cfg_get(
-                cfg, 'operator_page_capacity_v', 8)),
-            'operator_page_capacity_rst': int(_operator_page_cfg_get(
-                cfg, 'operator_page_capacity_rst', 32)),
-            'operator_page_microgroup_sequences': int(_operator_page_cfg_get(
-                cfg, 'operator_page_microgroup_sequences', 2)),
-            'operator_page_score_mode': str(_operator_page_cfg_get(
-                cfg, 'operator_page_score_mode', 'maxmean')),
-            'operator_page_fallback_pages': int(_operator_page_cfg_get(
-                cfg, 'operator_page_fallback_pages', 0)),
-            'operator_page_random_pages': int(_operator_page_cfg_get(
-                cfg, 'operator_page_random_pages', 0)),
-        })
     return version, score_impl, score_params, score_kwargs
-
-
-V4168_REPACK_POOL_SPECS = {
-    'qk': {
-        'prefix': 'attn_qk',
-        'op_key': 'attn_qk_op_key',
-        'size_key': 'n_qk',
-        'page_size_key': 'operator_page_size_qk',
-        'excluded': {
-            'attn_qk_op_read_proj',
-            'attn_qk_op_write_proj',
-        },
-    },
-    'v': {
-        'prefix': 'attn_v',
-        'op_key': 'attn_v_op_key',
-        'size_key': 'n_v',
-        'page_size_key': 'operator_page_size_v',
-        'excluded': {
-            'attn_v_op_read_proj',
-            'attn_v_op_write_proj',
-        },
-    },
-    'rst': {
-        'prefix': 'rst',
-        'op_key': 'rst_op_key',
-        'size_key': 'n_rst',
-        'page_size_key': 'operator_page_size_rst',
-        'excluded': {
-            'rst_op_read_proj',
-            'rst_op_write_proj',
-        },
-    },
-}
-
-V4168_LOCAL_SWAP_GAIN_MARGIN = 0.02
-V4168_LOCAL_SWAP_MAX_CHANGED_FRAC = 0.10
-V4168_LOCAL_SWAP_MAX_SWAPS_PER_PAGE = 8
-V4168_LOCAL_SWAP_TOPK_TARGET_PAGES = 4
-V4168_LOCAL_SWAP_MIN_PAGE_SIZE_FOR_REPAIR = 2
-
-
-def _normalize_rows_numpy(x, eps=1.0e-8):
-    x = np.asarray(x, dtype=np.float32)
-    norms = np.linalg.norm(x, axis=-1, keepdims=True)
-    return x / np.maximum(norms, np.float32(eps))
-
-
-def _normalize_vector_numpy(x, eps=1.0e-8):
-    x = np.asarray(x, dtype=np.float32)
-    norm = float(np.linalg.norm(x))
-    if (not np.isfinite(norm)) or norm < eps:
-        return None
-    return x / np.float32(norm)
-
-
-def _local_swap_repair_perm_and_stats_numpy(op_key, page_size):
-    """Repair current physical pages with shard-local pairwise swaps."""
-    page_size = int(page_size)
-    if page_size <= 0:
-        raise ValueError("page_size must be > 0")
-
-    x = _normalize_rows_numpy(op_key)
-    if x.ndim != 2:
-        raise ValueError(
-            f"op_key must have shape [N, d_route], got {x.shape}")
-    n_ops, _ = x.shape
-    ids = np.arange(n_ops, dtype=np.int32)
-    page_count = int((n_ops + page_size - 1) // page_size)
-    stats = {
-        'candidate_count': 0,
-        'swap_count': 0,
-        'changed_count': 0,
-        'changed_frac': 0.0,
-        'gain_mean': 0.0,
-        'gain_max': 0.0,
-        'swap_gain_mean': 0.0,
-        'swap_gain_max': 0.0,
-        'page_swap_max': 0,
-        'page_swap_mean': 0.0,
-        'page_swap_sum': 0,
-        'page_swap_page_count': page_count,
-        'skipped_page_cap': 0,
-        'skipped_used_operator': 0,
-        'skipped_no_partner': 0,
-        'skipped_low_gain': 0,
-    }
-    if n_ops <= 1 or page_count <= 1:
-        return ids, stats
-
-    page_id = np.arange(n_ops, dtype=np.int32) // page_size
-    page_valid_count = np.zeros((page_count,), dtype=np.int32)
-    centers = np.zeros((page_count, x.shape[1]), dtype=np.float32)
-    for page in range(page_count):
-        start = page * page_size
-        stop = min(start + page_size, n_ops)
-        page_valid_count[page] = int(stop - start)
-        if stop <= start:
-            continue
-        page_rows = x[start:stop]
-        center = _normalize_vector_numpy(page_rows.mean(axis=0))
-        if center is None:
-            center = page_rows[0]
-        centers[page] = center.astype(np.float32, copy=False)
-
-    current_sim = np.sum(x * centers[page_id], axis=-1)
-    all_page_sim = x @ centers.T
-    topk = min(
-        int(V4168_LOCAL_SWAP_TOPK_TARGET_PAGES),
-        max(0, page_count - 1))
-    min_page_size = int(V4168_LOCAL_SWAP_MIN_PAGE_SIZE_FOR_REPAIR)
-    margin = float(V4168_LOCAL_SWAP_GAIN_MARGIN)
-
-    candidates = []
-    candidate_gains = []
-    for i in range(n_ops):
-        page_a = int(page_id[i])
-        if int(page_valid_count[page_a]) < min_page_size:
-            continue
-        gains = all_page_sim[i] - current_sim[i]
-        valid_targets = [
-            page for page in range(page_count)
-            if page != page_a
-            and int(page_valid_count[page]) >= min_page_size
-            and float(gains[page]) > margin
-        ]
-        if not valid_targets:
-            continue
-        valid_targets.sort(key=lambda page: (-float(gains[page]), int(page)))
-        target_pages = tuple(int(page) for page in valid_targets[:topk])
-        best_gain = float(gains[target_pages[0]])
-        candidates.append((i, page_a, best_gain, target_pages))
-        candidate_gains.append(best_gain)
-
-    stats['candidate_count'] = int(len(candidates))
-    if candidate_gains:
-        stats['gain_mean'] = float(np.mean(candidate_gains))
-        stats['gain_max'] = float(np.max(candidate_gains))
-
-    candidates.sort(key=lambda item: (-item[2], item[0]))
-
-    order = ids.copy()
-    used = np.zeros((n_ops,), dtype=np.bool_)
-    page_swap_count = np.zeros((page_count,), dtype=np.int32)
-    max_changed = int(math.floor(
-        float(n_ops) * float(V4168_LOCAL_SWAP_MAX_CHANGED_FRAC)))
-    changed_count = 0
-    swap_gains = []
-    max_swaps_per_page = int(V4168_LOCAL_SWAP_MAX_SWAPS_PER_PAGE)
-
-    for i, page_a, _, target_pages in candidates:
-        if changed_count + 2 > max_changed:
-            break
-        if used[i]:
-            stats['skipped_used_operator'] += 1
-            continue
-        if page_swap_count[page_a] >= max_swaps_per_page:
-            stats['skipped_page_cap'] += 1
-            continue
-
-        accepted = False
-        saw_uncapped_page = False
-        saw_partner = False
-        saw_low_gain = False
-        for page_b in target_pages:
-            if page_swap_count[page_b] >= max_swaps_per_page:
-                continue
-            saw_uncapped_page = True
-            start = int(page_b * page_size)
-            stop = int(min(start + page_size, n_ops))
-            best_j = None
-            best_swap_gain = None
-            for j in range(start, stop):
-                if used[j] or j == i:
-                    continue
-                saw_partner = True
-                swap_gain = (
-                    float(all_page_sim[i, page_b])
-                    + float(all_page_sim[j, page_a])
-                    - float(all_page_sim[i, page_a])
-                    - float(all_page_sim[j, page_b])
-                )
-                if (best_swap_gain is None
-                        or swap_gain > best_swap_gain
-                        or (swap_gain == best_swap_gain and j < best_j)):
-                    best_swap_gain = swap_gain
-                    best_j = j
-
-            if best_j is None:
-                continue
-            if float(best_swap_gain) <= margin:
-                saw_low_gain = True
-                continue
-
-            order[i], order[best_j] = order[best_j], order[i]
-            used[i] = True
-            used[best_j] = True
-            page_swap_count[page_a] += 1
-            page_swap_count[page_b] += 1
-            changed_count += 2
-            swap_gains.append(float(best_swap_gain))
-            accepted = True
-            break
-
-        if accepted:
-            continue
-        if not saw_uncapped_page:
-            stats['skipped_page_cap'] += 1
-        elif not saw_partner:
-            stats['skipped_no_partner'] += 1
-        elif saw_low_gain:
-            stats['skipped_low_gain'] += 1
-        else:
-            stats['skipped_no_partner'] += 1
-
-    perm = order.astype(np.int32, copy=False)
-    if perm.shape != (n_ops,):
-        raise RuntimeError(
-            f"local swap repair produced shape {perm.shape}, expected {(n_ops,)}")
-    if not np.array_equal(np.sort(perm), ids):
-        raise RuntimeError(
-            "local swap repair did not produce a true permutation")
-
-    changed_count = int(np.sum(perm != ids))
-    stats['swap_count'] = int(len(swap_gains))
-    stats['changed_count'] = changed_count
-    stats['changed_frac'] = float(changed_count / max(n_ops, 1))
-    if swap_gains:
-        stats['swap_gain_mean'] = float(np.mean(swap_gains))
-        stats['swap_gain_max'] = float(np.max(swap_gains))
-    stats['page_swap_max'] = (
-        int(np.max(page_swap_count)) if page_swap_count.size else 0)
-    stats['page_swap_mean'] = (
-        float(np.mean(page_swap_count)) if page_swap_count.size else 0.0)
-    stats['page_swap_sum'] = int(np.sum(page_swap_count))
-    return perm, stats
-
-
-def local_swap_repair_perm_numpy(op_key, page_size):
-    """Return a true permutation for shard-local physical page repair."""
-    perm, _ = _local_swap_repair_perm_and_stats_numpy(op_key, page_size)
-    return perm
-
-
-def _page_compact_cos_values_numpy(op_key, page_size):
-    page_size = int(page_size)
-    if page_size <= 0:
-        raise ValueError("page_size must be > 0")
-    x = _normalize_rows_numpy(op_key)
-    values = []
-    for start in range(0, x.shape[0], page_size):
-        page = x[start:start + page_size]
-        if page.size == 0:
-            continue
-        center = _normalize_vector_numpy(page.mean(axis=0))
-        if center is None:
-            center = page[0]
-        values.append(page @ center)
-    if not values:
-        return np.zeros((0,), dtype=np.float32), 0
-    return np.concatenate(values).astype(np.float32, copy=False), len(values)
-
-
-def _summarize_compact_values(values):
-    values = np.asarray(values, dtype=np.float32).reshape(-1)
-    if values.size <= 0:
-        return 0.0, 0.0
-    return float(np.mean(values)), float(np.quantile(values, 0.05))
-
-
-def _compute_local_swap_repair_perm_for_pool(op_key_local, page_size):
-    return _local_swap_repair_perm_and_stats_numpy(op_key_local, page_size)
-
-
-def _compute_pool_repack_perms_and_stats(pool, op_key_shards, page_size):
-    t0 = time.time()
-    perms_by_slice = {}
-    before_values = []
-    after_values = []
-    changed = 0
-    total = 0
-    page_count = 0
-    repair_candidate_count = 0
-    repair_swap_count = 0
-    repair_gain_sum = 0.0
-    repair_gain_max = 0.0
-    repair_swap_gain_sum = 0.0
-    repair_swap_gain_max = 0.0
-    repair_page_swap_max = 0
-    repair_page_swap_sum = 0
-    repair_page_swap_page_count = 0
-    repair_skipped_page_cap = 0
-    repair_skipped_used_operator = 0
-    repair_skipped_no_partner = 0
-    repair_skipped_low_gain = 0
-
-    for slice_key, op_key_local in sorted(op_key_shards.items()):
-        op_key_local = np.asarray(op_key_local, dtype=np.float32)
-        if op_key_local.ndim != 2:
-            raise ValueError(
-                f"{pool} op_key shard must be rank 2, got {op_key_local.shape}")
-        perm, repair_stats = _compute_local_swap_repair_perm_for_pool(
-            op_key_local, page_size)
-        perms_by_slice[slice_key] = perm
-
-        before, pages = _page_compact_cos_values_numpy(
-            op_key_local, page_size)
-        after, _ = _page_compact_cos_values_numpy(
-            op_key_local[perm], page_size)
-        before_values.append(before)
-        after_values.append(after)
-        changed += int(np.sum(perm != np.arange(perm.size, dtype=np.int32)))
-        total += int(perm.size)
-        page_count += int(pages)
-
-        _candidate_count = int(repair_stats.get('candidate_count', 0))
-        _swap_count = int(repair_stats.get('swap_count', 0))
-        repair_candidate_count += _candidate_count
-        repair_swap_count += _swap_count
-        repair_gain_sum += (
-            float(repair_stats.get('gain_mean', 0.0)) * _candidate_count)
-        repair_gain_max = max(
-            repair_gain_max, float(repair_stats.get('gain_max', 0.0)))
-        repair_swap_gain_sum += (
-            float(repair_stats.get('swap_gain_mean', 0.0)) * _swap_count)
-        repair_swap_gain_max = max(
-            repair_swap_gain_max,
-            float(repair_stats.get('swap_gain_max', 0.0)))
-        repair_page_swap_max = max(
-            repair_page_swap_max,
-            int(repair_stats.get('page_swap_max', 0)))
-        repair_page_swap_sum += int(repair_stats.get('page_swap_sum', 0))
-        repair_page_swap_page_count += int(
-            repair_stats.get('page_swap_page_count', 0))
-        repair_skipped_page_cap += int(
-            repair_stats.get('skipped_page_cap', 0))
-        repair_skipped_used_operator += int(
-            repair_stats.get('skipped_used_operator', 0))
-        repair_skipped_no_partner += int(
-            repair_stats.get('skipped_no_partner', 0))
-        repair_skipped_low_gain += int(
-            repair_stats.get('skipped_low_gain', 0))
-
-    before_all = (
-        np.concatenate(before_values)
-        if before_values else np.zeros((0,), dtype=np.float32))
-    after_all = (
-        np.concatenate(after_values)
-        if after_values else np.zeros((0,), dtype=np.float32))
-    before_mean, before_p05 = _summarize_compact_values(before_all)
-    after_mean, after_p05 = _summarize_compact_values(after_all)
-    changed_frac = float(changed / max(total, 1))
-    duration = time.time() - t0
-
-    stats = {
-        f'{pool}_perm_changed_frac': changed_frac,
-        f'{pool}_compact_cos_mean_before': before_mean,
-        f'{pool}_compact_cos_mean_after': after_mean,
-        f'{pool}_compact_cos_p05_before': before_p05,
-        f'{pool}_compact_cos_p05_after': after_p05,
-        f'{pool}_page_radius_mean_before': 1.0 - before_mean,
-        f'{pool}_page_radius_mean_after': 1.0 - after_mean,
-        f'{pool}_page_radius_p95_before': 1.0 - before_p05,
-        f'{pool}_page_radius_p95_after': 1.0 - after_p05,
-        f'{pool}_page_count': int(page_count),
-        f'{pool}_page_size': int(page_size),
-        f'{pool}_duration_sec': float(duration),
-        f'{pool}_repair_candidate_count': int(repair_candidate_count),
-        f'{pool}_repair_swap_count': int(repair_swap_count),
-        f'{pool}_repair_changed_frac': changed_frac,
-        f'{pool}_repair_gain_mean': float(
-            repair_gain_sum / max(repair_candidate_count, 1)),
-        f'{pool}_repair_gain_max': float(repair_gain_max),
-        f'{pool}_repair_swap_gain_mean': float(
-            repair_swap_gain_sum / max(repair_swap_count, 1)),
-        f'{pool}_repair_swap_gain_max': float(repair_swap_gain_max),
-        f'{pool}_repair_page_swap_max': int(repair_page_swap_max),
-        f'{pool}_repair_page_swap_mean': float(
-            repair_page_swap_sum / max(repair_page_swap_page_count, 1)),
-        f'{pool}_repair_skipped_page_cap': int(repair_skipped_page_cap),
-        f'{pool}_repair_skipped_used_operator': int(
-            repair_skipped_used_operator),
-        f'{pool}_repair_skipped_no_partner': int(repair_skipped_no_partner),
-        f'{pool}_repair_skipped_low_gain': int(repair_skipped_low_gain),
-    }
-    return perms_by_slice, stats
-
-
-def _tree_path_to_str(path):
-    parts = []
-    for item in path:
-        if hasattr(item, 'key'):
-            parts.append(str(item.key))
-        elif hasattr(item, 'idx'):
-            parts.append(str(item.idx))
-        elif hasattr(item, 'name'):
-            parts.append(str(item.name))
-        else:
-            parts.append(str(item))
-    return '/'.join(parts)
-
-
-def _path_leaf_name(path_str):
-    return str(path_str).rsplit('/', 1)[-1]
-
-
-def _operator_repack_pool_for_leaf(path_str, leaf, cfg):
-    shape = getattr(leaf, 'shape', None)
-    if shape is None or len(shape) < 1:
-        return None
-    if 'neuron_pool/' not in path_str:
-        return None
-    model_cfg = cfg.get('model', {})
-    leaf_name = _path_leaf_name(path_str)
-    for pool, spec in V4168_REPACK_POOL_SPECS.items():
-        prefix = spec['prefix']
-        if f'neuron_pool/{prefix}_' not in path_str:
-            continue
-        if leaf_name in spec['excluded']:
-            return None
-        pool_size = int(model_cfg.get(spec['size_key'], 0) or 0)
-        if pool_size > 0 and int(shape[0]) == pool_size:
-            return pool
-    return None
-
-
-def _normalize_index_key(index, shape):
-    if not isinstance(index, tuple):
-        index = (index,)
-    if len(index) < len(shape):
-        index = index + (slice(None),) * (len(shape) - len(index))
-    out = []
-    for axis, item in enumerate(index):
-        dim = int(shape[axis])
-        if isinstance(item, slice):
-            start = 0 if item.start is None else int(item.start)
-            stop = dim if item.stop is None else int(item.stop)
-            step = 1 if item.step is None else int(item.step)
-            out.append(('slice', start, stop, step))
-        elif isinstance(item, (int, np.integer)):
-            out.append(('index', int(item)))
-        else:
-            arr = np.asarray(item)
-            out.append(('array', tuple(arr.reshape(-1).astype(int).tolist())))
-    return tuple(out)
-
-
-def _first_slice_key_from_index(index, full_len):
-    if isinstance(index, tuple):
-        first = index[0]
-    else:
-        first = index
-    if isinstance(first, slice):
-        start = 0 if first.start is None else int(first.start)
-        stop = int(full_len) if first.stop is None else int(first.stop)
-        step = 1 if first.step is None else int(first.step)
-        if step != 1:
-            raise ValueError(f"operator shard slice step must be 1, got {step}")
-        return (start, stop)
-    if isinstance(first, (int, np.integer)):
-        start = int(first)
-        return (start, start + 1)
-    raise TypeError(f"unsupported shard index for repack: {index!r}")
-
-
-def _addressable_shards_by_first_slice(x):
-    shards = getattr(x, 'addressable_shards', None)
-    if not shards:
-        arr = np.asarray(jax.device_get(x))
-        return {(0, int(arr.shape[0])): arr}
-
-    out = {}
-    full_len = int(x.shape[0])
-    for shard in shards:
-        slice_key = _first_slice_key_from_index(shard.index, full_len)
-        if slice_key not in out:
-            out[slice_key] = np.asarray(jax.device_get(shard.data))
-    return out
-
-
-def _split_full_op_key_for_model_axis(op_key, mesh_model):
-    arr = np.asarray(jax.device_get(op_key), dtype=np.float32)
-    mesh_model = int(mesh_model)
-    if mesh_model <= 0:
-        raise ValueError(f"mesh_model must be > 0, got {mesh_model}")
-    if arr.shape[0] % mesh_model != 0:
-        raise ValueError(
-            f"operator pool size {arr.shape[0]} must be divisible by "
-            f"mesh_model={mesh_model} for shard-local initial repack.")
-    shard_n = arr.shape[0] // mesh_model
-    return {
-        (i * shard_n, (i + 1) * shard_n): arr[i * shard_n:(i + 1) * shard_n]
-        for i in range(mesh_model)
-    }
-
-
-def _repack_host_array_by_model_slices(leaf, perms_by_slice):
-    arr = np.asarray(jax.device_get(leaf))
-    out = np.array(arr, copy=True)
-    for (start, stop), perm in sorted(perms_by_slice.items()):
-        if stop > out.shape[0]:
-            raise ValueError(
-                f"repack slice {(start, stop)} exceeds leaf shape {out.shape}")
-        if (stop - start) != int(perm.shape[0]):
-            raise ValueError(
-                f"repack perm length {perm.shape[0]} does not match slice "
-                f"{(start, stop)}")
-        out[start:stop] = arr[start:stop][perm]
-    return jnp.asarray(out, dtype=getattr(leaf, 'dtype', None))
-
-
-def _repack_jax_array_by_addressable_shards(leaf, perms_by_slice):
-    shards = getattr(leaf, 'addressable_shards', None)
-    if not shards:
-        return _repack_host_array_by_model_slices(leaf, perms_by_slice)
-
-    full_len = int(leaf.shape[0])
-    local_data = {}
-    for shard in shards:
-        slice_key = _first_slice_key_from_index(shard.index, full_len)
-        perm = perms_by_slice[slice_key]
-        data = np.asarray(jax.device_get(shard.data))
-        if data.shape[0] != int(perm.shape[0]):
-            raise ValueError(
-                f"local shard shape {data.shape} does not match perm "
-                f"length {perm.shape[0]}")
-        local_data[_normalize_index_key(shard.index, leaf.shape)] = np.take(
-            data, perm, axis=0)
-
-    def _callback(index):
-        key = _normalize_index_key(index, leaf.shape)
-        if key not in local_data:
-            raise RuntimeError(
-                f"repack callback requested non-addressable shard {key}")
-        return local_data[key]
-
-    out = jax.make_array_from_callback(leaf.shape, leaf.sharding, _callback)
-    if out.shape != leaf.shape or out.dtype != leaf.dtype:
-        raise RuntimeError(
-            f"repack changed leaf metadata from {leaf.shape}/{leaf.dtype} "
-            f"to {out.shape}/{out.dtype}")
-    if str(getattr(out, 'sharding', None)) != str(getattr(leaf, 'sharding', None)):
-        raise RuntimeError("repack changed a leaf sharding")
-    return out
-
-
-def _repack_leaf_by_perms(leaf, perms_by_slice):
-    shape = getattr(leaf, 'shape', None)
-    if shape is None or len(shape) < 1:
-        return leaf
-
-    shards = getattr(leaf, 'addressable_shards', None)
-    if shards:
-        full_len = int(shape[0])
-        local_slice_keys = {
-            _first_slice_key_from_index(shard.index, full_len)
-            for shard in shards
-        }
-        if local_slice_keys and all(
-                key in perms_by_slice for key in local_slice_keys):
-            return _repack_jax_array_by_addressable_shards(
-                leaf, perms_by_slice)
-        sharding_name = type(getattr(leaf, 'sharding', None)).__name__
-        if sharding_name != 'SingleDeviceSharding':
-            raise RuntimeError(
-                "missing local operator permutation for a sharded leaf; "
-                f"available={sorted(perms_by_slice)} "
-                f"leaf_slices={sorted(local_slice_keys)}")
-
-    return _repack_host_array_by_model_slices(leaf, perms_by_slice)
-
-
-def _apply_pool_permutation_to_params(params, pool_name, perms_by_slice, cfg):
-    def _apply(path, leaf):
-        path_str = _tree_path_to_str(path)
-        if _operator_repack_pool_for_leaf(path_str, leaf, cfg) == pool_name:
-            return _repack_leaf_by_perms(leaf, perms_by_slice)
-        return leaf
-
-    return jax.tree.map_with_path(_apply, params)
-
-
-def _apply_pool_permutation_to_opt_state(opt_state, pool_name, perms_by_slice,
-                                         cfg):
-    def _apply(path, leaf):
-        path_str = _tree_path_to_str(path)
-        if _operator_repack_pool_for_leaf(path_str, leaf, cfg) == pool_name:
-            return _repack_leaf_by_perms(leaf, perms_by_slice)
-        return leaf
-
-    return jax.tree.map_with_path(_apply, opt_state)
-
-
-def _current_pool_operator_keys_host_or_local(params, cfg):
-    version = cfg.get('model', {}).get('model_version', OFFICIAL_MODEL_VERSION)
-    pool_operator_keys = _pool_operator_keys_for_version(version)
-    return jax.jit(pool_operator_keys)(params['neuron_pool'])
-
-
-def _physical_local_swap_repair_operator_pages(params, opt_state, cfg, mesh=None,
-                                               step=0, reason='periodic',
-                                               mesh_model=None):
-    del mesh
-    if not _is_v4168_repack_enabled(cfg):
-        return params, opt_state, None
-
-    interval = _operator_page_repack_interval(cfg)
-    t0 = time.time()
-    pool_keys = _current_pool_operator_keys_host_or_local(params, cfg)
-    jax.block_until_ready(jax.tree.leaves(pool_keys))
-
-    use_full_slices = opt_state is None
-    if mesh_model is None:
-        mesh_model = int(cfg.get('training', {}).get('mesh_model', 1))
-
-    pool_perms = {}
-    summary = {
-        'type': 'operator_page_repack',
-        'step': int(step),
-        'reason': str(reason),
-        'operator_page_repack_interval': int(interval),
-        'physical': True,
-        'shard_local': True,
-        'method': 'local_swap_repair',
-        'process_index': int(jax.process_index()),
-    }
-
-    for pool, spec in V4168_REPACK_POOL_SPECS.items():
-        page_size = int(_operator_page_cfg_get(
-            cfg, spec['page_size_key'], 128))
-        op_key = pool_keys[spec['op_key']]
-        if use_full_slices:
-            op_key_shards = _split_full_op_key_for_model_axis(
-                op_key, mesh_model)
-        else:
-            op_key_shards = _addressable_shards_by_first_slice(op_key)
-        perms_by_slice, pool_stats = _compute_pool_repack_perms_and_stats(
-            pool, op_key_shards, page_size)
-        pool_perms[pool] = perms_by_slice
-        summary.update(pool_stats)
-
-    for pool, perms_by_slice in pool_perms.items():
-        params = _apply_pool_permutation_to_params(
-            params, pool, perms_by_slice, cfg)
-        if opt_state is not None:
-            before_count = _maybe_get_opt_state_count(opt_state)
-            opt_state = _apply_pool_permutation_to_opt_state(
-                opt_state, pool, perms_by_slice, cfg)
-            after_count = _maybe_get_opt_state_count(opt_state)
-            if (before_count is not None and after_count is not None
-                    and before_count != after_count):
-                raise RuntimeError(
-                    "operator page repair changed optimizer step count "
-                    f"from {before_count} to {after_count}")
-
-    summary['duration_sec'] = float(time.time() - t0)
-    return params, opt_state, summary
-
-
-def _emit_operator_page_repack_summary(summary, use_loggers=False):
-    if not summary or jax.process_index() != 0:
-        return
-
-    def _line(msg):
-        if use_loggers:
-            log_message(msg)
-        else:
-            print(msg, flush=True)
-
-    _line(
-        "v4168_page_repair: "
-        f"step={summary['step']} reason={summary['reason']} "
-        f"interval={summary['operator_page_repack_interval']} "
-        f"method={summary.get('method', 'local_swap_repair')} "
-        f"duration={summary.get('duration_sec', 0.0):.3f}s")
-    for pool in ('qk', 'v', 'rst'):
-        changed = summary.get(f'{pool}_perm_changed_frac', 0.0) * 100.0
-        before_mean = summary.get(f'{pool}_compact_cos_mean_before', 0.0)
-        after_mean = summary.get(f'{pool}_compact_cos_mean_after', 0.0)
-        before_p05 = summary.get(f'{pool}_compact_cos_p05_before', 0.0)
-        after_p05 = summary.get(f'{pool}_compact_cos_p05_after', 0.0)
-        swaps = summary.get(f'{pool}_repair_swap_count', 0)
-        candidates = summary.get(f'{pool}_repair_candidate_count', 0)
-        gain_mean = summary.get(f'{pool}_repair_gain_mean', 0.0)
-        gain_max = summary.get(f'{pool}_repair_gain_max', 0.0)
-        swap_gain_mean = summary.get(f'{pool}_repair_swap_gain_mean', 0.0)
-        swap_gain_max = summary.get(f'{pool}_repair_swap_gain_max', 0.0)
-        _line(
-            f"  {pool}: changed={changed:.2f}% "
-            f"compact_mean={before_mean:.4f}->{after_mean:.4f} "
-            f"compact_p05={before_p05:.4f}->{after_p05:.4f} "
-            f"swaps={swaps} candidates={candidates} "
-            f"gain={gain_mean:.4f}/{gain_max:.4f} "
-            f"swap_gain={swap_gain_mean:.4f}/{swap_gain_max:.4f} "
-            f"pages={summary.get(f'{pool}_page_count', 0)} "
-            f"page_size={summary.get(f'{pool}_page_size', 0)}")
-    if use_loggers:
-        log_jsonl(summary)
 
 
 def _score_route_values(sampled, route):
@@ -6611,8 +5679,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     f'{_pool}_{_name}', jnp.float32(0.0))
         for _name in (
                 'estimated_compute_frac_page',
-                'selected_page_count',
-                'operator_page_cost'):
+                'selected_page_count'):
             metrics[_name] = result.get(_name, jnp.float32(0.0))
         for _pool in ('attn_qk', 'attn_v'):
             for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
@@ -7005,25 +6072,9 @@ def create_analysis_step(model, sharded_fns=None,
     return analysis_step
 
 
-def create_geometry_step(max_sample=512,
-                         operator_page_size_qk=128,
-                         operator_page_size_v=128,
-                         operator_page_size_rst=128,
-                         operator_page_enabled_qk=False,
-                         operator_page_enabled_v=False,
-                         operator_page_enabled_rst=True):
+def create_geometry_step(max_sample=512):
     """Rare, observational geometry diagnostics on a deterministic row sample."""
     max_sample = int(max_sample)
-    page_sizes = {
-        'attn_qk': int(operator_page_size_qk),
-        'attn_v': int(operator_page_size_v),
-        'rst': int(operator_page_size_rst),
-    }
-    page_enabled = {
-        'attn_qk': bool(operator_page_enabled_qk),
-        'attn_v': bool(operator_page_enabled_v),
-        'rst': bool(operator_page_enabled_rst),
-    }
 
     def _geom_one(x, prefix):
         x = jax.lax.stop_gradient(jnp.asarray(x, dtype=jnp.float32))
@@ -7059,89 +6110,6 @@ def create_geometry_step(max_sample=512,
         w_key = _unit(write) @ write_proj
         return _unit(_unit(r_key) * _unit(w_key))
 
-    def _page_geom(op_key, page_size, prefix):
-        op_key = jax.lax.stop_gradient(jnp.asarray(op_key, dtype=jnp.float32))
-        page_size = int(page_size)
-        n_valid = int(op_key.shape[0])
-        n_pad = ((n_valid + page_size - 1) // page_size) * page_size
-        pad_n = n_pad - n_valid
-        page_count = n_pad // page_size
-        valid = jnp.arange(n_pad, dtype=jnp.int32) < jnp.int32(n_valid)
-        op_pad = jnp.pad(op_key, ((0, pad_n), (0, 0)))
-        op_pages = op_pad.reshape(page_count, page_size, op_key.shape[-1])
-        valid_pages = valid.reshape(page_count, page_size)
-        valid_f = valid_pages.astype(jnp.float32)
-        valid_count = valid_f.sum(axis=1)
-        valid_page = valid_count > 0.0
-        centroid = (
-            (op_pages * valid_f[..., None]).sum(axis=1)
-            / jnp.maximum(valid_count[:, None], 1.0))
-        centroid = centroid / (
-            jnp.linalg.norm(centroid, axis=-1, keepdims=True) + 1.0e-6)
-
-        page_f = valid_page.astype(jnp.float32)
-        page_den = jnp.maximum(page_f.sum(), 1.0)
-        centroid_mean = (centroid * page_f[:, None]).sum(axis=0) / page_den
-        cent_svd = (centroid - centroid_mean[None, :]) * page_f[:, None]
-        s = jnp.linalg.svd(cent_svd, full_matrices=False, compute_uv=False)
-        s5 = jnp.pad(s, (0, max(0, 5 - s.shape[0])))[:5]
-        energy = jnp.sum(jnp.square(s))
-        eff_rank = energy / (jnp.max(jnp.square(s)) + 1.0e-8)
-
-        cent_sim = jnp.abs(centroid @ centroid.T)
-        cent_mask = (
-            page_f[:, None] * page_f[None, :]
-            * (1.0 - jnp.eye(page_count, dtype=jnp.float32)))
-        cent_den = cent_mask.sum() + 1.0e-8
-        cent_off = cent_sim * cent_mask
-
-        op_unit = op_pages / (
-            jnp.linalg.norm(op_pages, axis=-1, keepdims=True) + 1.0e-6)
-        compact = jnp.sum(op_unit * centroid[:, None, :], axis=-1)
-        compact_flat = compact.reshape(-1)
-        valid_flat = valid_pages.reshape(-1)
-        valid_n = jnp.maximum(valid_flat.astype(jnp.int32).sum(), 1)
-        compact_sorted = jnp.sort(jnp.where(valid_flat, compact_flat, 2.0))
-        compact_p05_idx = jnp.floor(
-            jnp.float32(valid_n - 1) * jnp.float32(0.05)).astype(jnp.int32)
-        compact_p05 = compact_sorted[compact_p05_idx]
-        compact_min = compact_sorted[0]
-        compact_mean = (
-            (compact_flat * valid_flat.astype(jnp.float32)).sum()
-            / jnp.float32(valid_n))
-
-        radius_flat = (1.0 - compact_flat)
-        total_n = jnp.int32(n_pad)
-        invalid_n = total_n - valid_n
-        radius_sorted = jnp.sort(jnp.where(valid_flat, radius_flat, -1.0))
-        radius_p95_idx = invalid_n + jnp.floor(
-            jnp.float32(valid_n - 1) * jnp.float32(0.95)).astype(jnp.int32)
-        radius_valid = jnp.where(valid_flat, radius_flat, 0.0)
-        radius_mean = radius_valid.sum() / jnp.float32(valid_n)
-
-        valid_count_for_min = jnp.where(valid_page, valid_count, page_size)
-        return {
-            f'{prefix}_page_centroid_rank': eff_rank,
-            f'{prefix}_page_centroid_cos_mean': cent_off.sum() / cent_den,
-            f'{prefix}_page_centroid_cos_max': cent_off.max(),
-            f'{prefix}_page_centroid_sv0': s5[0],
-            f'{prefix}_page_centroid_sv1': s5[1],
-            f'{prefix}_page_centroid_sv2': s5[2],
-            f'{prefix}_page_centroid_sv3': s5[3],
-            f'{prefix}_page_centroid_sv4': s5[4],
-            f'{prefix}_page_compact_cos_mean': compact_mean,
-            f'{prefix}_page_compact_cos_p05': compact_p05,
-            f'{prefix}_page_compact_cos_min': compact_min,
-            f'{prefix}_page_radius_mean': radius_mean,
-            f'{prefix}_page_radius_p95': radius_sorted[radius_p95_idx],
-            f'{prefix}_page_radius_max': radius_sorted[-1],
-            f'{prefix}_page_valid_count_min': valid_count_for_min.min(),
-            f'{prefix}_page_valid_count_mean': valid_count.sum() / page_den,
-            f'{prefix}_page_valid_count_max': valid_count.max(),
-            f'{prefix}_page_padding_frac': (
-                jnp.float32(pad_n) / jnp.maximum(jnp.float32(n_pad), 1.0)),
-        }
-
     @jax.jit
     def geometry_step(params):
         pool = params.get('neuron_pool', {})
@@ -7161,8 +6129,6 @@ def create_geometry_step(max_sample=512,
                     pool[read_key], pool[write_key],
                     pool[op_read_key], pool[op_write_key])
                 out.update(_geom_one(op_key, f'{name}_op_key'))
-                if page_enabled.get(name, False):
-                    out.update(_page_geom(op_key, page_sizes[name], name))
             if emb_key in pool:
                 out.update(_geom_one(pool[emb_key], f'{name}_emb'))
             if read_key in pool:
@@ -9859,8 +8825,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
                 m.get(f'{_pool}_{_name}', 0.0))
     for _name in (
             'estimated_compute_frac_page',
-            'selected_page_count',
-            'operator_page_cost'):
+            'selected_page_count'):
         rec[_name] = float(m.get(_name, 0.0))
     _attach_page_aware_metrics(rec, ctx)
     # Per-layer norms (materialise lists).
@@ -9960,8 +8925,6 @@ def _print_cb1a_regular_block(rec):
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4164 = _is_active_srw_version(ctx.get('model_version'))
-    is_operator_page_version = _is_operator_page_srw_version(
-        ctx.get('model_version'))
     is_v4166 = _is_rw_key_srw_version(ctx.get('model_version'))
     is_official_soft_direct_tau = _is_active_srw_version(ctx.get('model_version'))
     official_soft_sparsity_compact = False
@@ -10115,28 +9078,6 @@ def _print_regular_block(rec, ctx):
                 f"qk={_lp('qk', 'eff')} "
                 f"v={_lp('v', 'eff')} "
                 f"rst={_lp('rst', 'eff')}")
-            if is_operator_page_version:
-                def _page_part(label, prefix):
-                    return (
-                        f"{label}[en={_g(prefix + '_pages_enabled'):.0f}"
-                        f" cap={_g(prefix + '_page_capacity'):.0f}"
-                        f" cand={_g(prefix + '_candidate_ops'):.0f}"
-                        f"/valid={_g(prefix + '_candidate_valid_ops'):.0f}"
-                        f" frac_cfg={_g(prefix + '_candidate_frac'):.4f}"
-                        f" frac_valid={_g(prefix + '_candidate_valid_frac'):.4f}"
-                        f" ent={_g(prefix + '_page_entropy'):.3f}"
-                        f" top1={_g(prefix + '_page_top1_frac'):.3f}"
-                        f" den={_g(prefix + '_candidate_den_mean'):.3f}]")
-                log_message(
-                    "  page: "
-                    + " ".join((
-                        _page_part('qk', 'attn_qk'),
-                        _page_part('v', 'attn_v'),
-                        _page_part('rst', 'rst')))
-                    + f" page_compute_frac_avg={_g('estimated_compute_frac_page'):.4f}"
-                    f" selected={_g('selected_page_count'):.0f}"
-                    f" cost={_g('operator_page_cost'):.3g}"
-                )
             log_message(
                 f"  execution_conc: qk[eff={rec['attn_qk_execution_eff_n']:.1f}"
                 f" top1={rec['attn_qk_execution_top1_frac']:.3f}]"
@@ -10731,8 +9672,7 @@ def _build_analysis_record(base, metrics, ctx):
                 m.get(f'{_pool}_{_name}', 0.0))
     for _name in (
             'estimated_compute_frac_page',
-            'selected_page_count',
-            'operator_page_cost'):
+            'selected_page_count'):
         rec[_name] = float(m.get(_name, 0.0))
     _attach_page_aware_metrics(rec, ctx)
     rec['attn_gate_eff_n'] = float(m.get('attn_gate_eff_n', 0.0))
@@ -12270,7 +11210,6 @@ def main():
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
     cfg.setdefault('training', {}).update(training_config)
-    _materialize_operator_page_config(cfg)
 
     # ----------------------------------------------------------
     # Detect devices (multi-host aware)
@@ -12624,24 +11563,6 @@ def main():
         if _is_rw_key_srw_version(model_version_cfg):
             print("  RW-key operator path: live-gradient RW keys, "
                   "RW-matched operator queries")
-        if _is_operator_page_srw_version(model_version_cfg):
-            _page_bits = []
-            for _pool in ('qk', 'v', 'rst'):
-                _pk = _operator_page_pool_kwargs(cfg, _pool)
-                _page_bits.append(
-                    f"{_pool}[enabled={_pk['operator_pages_enabled']} "
-                    f"page={_pk['operator_page_size']} "
-                    f"cap={_pk['operator_page_capacity']} "
-                    f"fallback={_pk['operator_page_fallback_pages']} "
-                    f"random={_pk['operator_page_random_pages']}]")
-            print("  Global CEU operator pages: " + " ".join(_page_bits))
-        if model_version_cfg == V4168_MODEL_VERSION:
-            _repack_interval = _operator_page_repack_interval(cfg)
-            print(
-                "  v4168 local-swap physical page repair: "
-                f"interval={_repack_interval} "
-                "initial=false "
-                "physical=true shard_local=true")
         print("  Tau parameterization: bounded sigmoid min/max")
         print("  tau = -1 + 2 * sigmoid(raw_tau)")
         print("  Boundary admission: one-sided generalized Gaussian")
@@ -13221,8 +12142,6 @@ def main():
             _v4164_module, 'make_sharded_srw_minimal', None)
         make_sharded_srw_paired_minimal = getattr(
             _v4164_module, 'make_sharded_srw_paired_minimal', None)
-        make_sharded_operator_page_tables = getattr(
-            _v4164_module, 'make_sharded_operator_page_tables', None)
         max_chunk = cfg['training'].get('max_chunk_size', None)
         if max_chunk is not None:
             attn_qk_max_chunk = attn_v_max_chunk = rst_max_chunk = int(max_chunk)
@@ -13238,23 +12157,7 @@ def main():
 
         def _srw_pool_kwargs(pool):
             kwargs = dict(_srw_base_kwargs)
-            if _is_operator_page_srw_version(model_version_cfg):
-                kwargs.update(_operator_page_pool_kwargs(cfg, pool))
             return kwargs
-
-        _page_table_builders = {}
-        if (_is_operator_page_srw_version(model_version_cfg)
-                and make_sharded_operator_page_tables is not None):
-            for _pool, _builder_key in (
-                    ('qk', 'attn_qk_page_tables'),
-                    ('v', 'attn_v_page_tables'),
-                    ('rst', 'rst_page_tables')):
-                _pk = _operator_page_pool_kwargs(cfg, _pool)
-                if _pk['operator_pages_enabled']:
-                    _page_table_builders[_builder_key] = (
-                        make_sharded_operator_page_tables(
-                            mesh=mesh,
-                            operator_page_size=_pk['operator_page_size']))
 
         _supports_analysis = (
             'analysis' in _inspect.signature(make_sharded_srw).parameters
@@ -13305,8 +12208,6 @@ def main():
             if _sharded_paired_attn_qk_minimal is not None:
                 _sharded_fns['attn_qk_paired_minimal'] = (
                     _sharded_paired_attn_qk_minimal)
-            if _page_table_builders:
-                _sharded_fns.update(_page_table_builders)
         else:
             _sharded_fns = _sharded_single_rst
         # Analysis (observation only). Factory kwargs forward analysis=True
@@ -13330,16 +12231,13 @@ def main():
                     'paired': _sharded_paired_a,
                     'attn_qk_paired': _sharded_paired_a,
                 }
-                if _page_table_builders:
-                    _sharded_fns_analysis.update(_page_table_builders)
             else:
                 _sharded_fns_analysis = _sharded_single_rst_a
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
-                  f"; analysis kernels={'on' if _supports_analysis else 'off'}"
-                  f"; page_table_reuse={'on' if _page_table_builders else 'off'})")
+                  f"; analysis kernels={'on' if _supports_analysis else 'off'})")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -13502,28 +12400,10 @@ def main():
     else:
         analysis_step_fn = None
     # No current-train-batch diagnostic forward.
-    _page_geom_kwargs = {}
-    if not is_baseline:
-        _page_geom_active = _is_operator_page_srw_version(model_version_cfg)
-        _page_cfg_qk = _operator_page_pool_kwargs(cfg, 'qk')
-        _page_cfg_v = _operator_page_pool_kwargs(cfg, 'v')
-        _page_cfg_rst = _operator_page_pool_kwargs(cfg, 'rst')
-        _page_geom_kwargs = {
-            'operator_page_size_qk': _page_cfg_qk['operator_page_size'],
-            'operator_page_size_v': _page_cfg_v['operator_page_size'],
-            'operator_page_size_rst': _page_cfg_rst['operator_page_size'],
-            'operator_page_enabled_qk': (
-                _page_geom_active and _page_cfg_qk['operator_pages_enabled']),
-            'operator_page_enabled_v': (
-                _page_geom_active and _page_cfg_v['operator_pages_enabled']),
-            'operator_page_enabled_rst': (
-                _page_geom_active and _page_cfg_rst['operator_pages_enabled']),
-        }
     geometry_step_fn = None if is_baseline else create_geometry_step(
         max_sample=int(tcfg.get(
             'geometry_max_sample',
-            tcfg.get('heavy_geometry_max_sample', 512))),
-        **_page_geom_kwargs)
+            tcfg.get('heavy_geometry_max_sample', 512))))
 
     # Initial operator-key drift snapshot. Identity here means drift=0 on the
     # first step; legacy pools use their route embeddings as the signature.
@@ -13894,9 +12774,6 @@ def main():
                 _v4164_module._pool_params_with_operator_keys(pool_p)
                 if hasattr(_v4164_module, '_pool_params_with_operator_keys')
                 else pool_p)
-            if hasattr(_v4164_module, '_pool_params_with_operator_page_tables'):
-                pool_select_p = _v4164_module._pool_params_with_operator_page_tables(
-                    pool_select_p, _sharded_fns)
             qk_op_key = _get_param(
                 pool_select_p, 'attn_qk_op_key',
                 'attn_qk_emb' if 'attn_qk_emb' in pool_select_p else 'qk_emb')
@@ -13917,9 +12794,6 @@ def main():
                 v_op_key, axis=-1, keepdims=True) + 1e-8)
             rst_norm = rst_op_key / (jnp.linalg.norm(
                 rst_op_key, axis=-1, keepdims=True) + 1e-8)
-            qk_route_arg = pool_select_p.get('attn_qk_page_tables', qk_norm)
-            v_route_arg = pool_select_p.get('attn_v_page_tables', v_norm)
-            rst_route_arg = pool_select_p.get('rst_page_tables', rst_norm)
 
             normed = prof_layernorm(
                 dummy_x, block_p['norm1']['scale'],
@@ -13931,17 +12805,17 @@ def main():
 
             if _is_sharded:
                 Q, K, *_ = prof_qk_fused(
-                    normed, h_Q, h_K, qk_route_arg, tau_all, raw_scan_offset_all,
+                    normed, h_Q, h_K, qk_norm, tau_all, raw_scan_offset_all,
                     qk_read, qk_write)
                 V, *_ = prof_v_sharded(
-                    normed, h_V, v_route_arg, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
+                    normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                     v_read, v_write)
             else:
                 Q, K = prof_qk_chunked(
-                    normed, h_Q, h_K, qk_route_arg, tau_all,
+                    normed, h_Q, h_K, qk_norm, tau_all,
                     qk_read, qk_write)
                 V, *_ = prof_v_chunked(
-                    normed, h_V, v_route_arg, tau_all[:, :, 2:3],
+                    normed, h_V, v_norm, tau_all[:, :, 2:3],
                     v_read, v_write)
             jax.block_until_ready((Q, K, V))
 
@@ -13949,11 +12823,11 @@ def main():
             jax.block_until_ready(tau_rst)
             if _is_sharded:
                 _kout = prof_rst_sharded(
-                    normed, h_rst, rst_route_arg, tau_rst, raw_scan_offset_rst,
+                    normed, h_rst, rst_norm, tau_rst, raw_scan_offset_rst,
                     rst_read, rst_write)[0]
             else:
                 _kout, _, _, _, _, _, _, _ = prof_rst_chunked(
-                    normed, h_rst, rst_route_arg, tau_rst,
+                    normed, h_rst, rst_norm, tau_rst,
                     rst_read, rst_write)
             jax.block_until_ready(_kout)
 
@@ -13972,20 +12846,20 @@ def main():
 
             if _is_sharded:
                 ms, dg, pk = _t(lambda: prof_qk_fused(
-                    normed, h_Q, h_K, qk_route_arg, tau_all, raw_scan_offset_all,
+                    normed, h_Q, h_K, qk_norm, tau_all, raw_scan_offset_all,
                     qk_read, qk_write))
                 items.append(("A QK fused shard", ms, dg, pk))
                 ms, dg, pk = _t(lambda: prof_v_sharded(
-                    normed, h_V, v_route_arg, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
+                    normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                     v_read, v_write))
                 items.append(("A V shard", ms, dg, pk))
             else:
                 ms, dg, pk = _t(lambda: prof_qk_chunked(
-                    normed, h_Q, h_K, qk_route_arg, tau_all,
+                    normed, h_Q, h_K, qk_norm, tau_all,
                     qk_read, qk_write))
                 items.append(("A QK chunked(x2)", ms, dg, pk))
                 ms, dg, pk = _t(lambda: prof_v_chunked(
-                    normed, h_V, v_route_arg, tau_all[:, :, 2:3],
+                    normed, h_V, v_norm, tau_all[:, :, 2:3],
                     v_read, v_write))
                 items.append(("A V chunked", ms, dg, pk))
 
@@ -14155,24 +13029,6 @@ def main():
         if _is_rw_key_srw_version(model_version_cfg):
             log_message("RW-key operator path: live-gradient RW keys, "
                         "RW-matched operator queries")
-        if _is_operator_page_srw_version(model_version_cfg):
-            page_summary = []
-            for pool in ('qk', 'v', 'rst'):
-                pk = _operator_page_pool_kwargs(cfg, pool)
-                page_summary.append(
-                    f"{pool}[enabled={pk['operator_pages_enabled']} "
-                    f"page={pk['operator_page_size']} "
-                    f"cap={pk['operator_page_capacity']} "
-                    f"fallback={pk['operator_page_fallback_pages']} "
-                    f"random={pk['operator_page_random_pages']}]")
-            log_message("Global CEU operator pages: " + " ".join(page_summary))
-        if model_version_cfg == V4168_MODEL_VERSION:
-            repack_interval = _operator_page_repack_interval(cfg)
-            log_message(
-                "v4168 local-swap physical page repair: "
-                f"interval={repack_interval} "
-                "initial=false "
-                "physical=true shard_local=true")
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
         log_message(f"Total steps: {total_steps}")
         if tau_init_summary is not None:
@@ -14350,33 +13206,6 @@ def main():
 
             global_step += 1
             epoch_step_counter += 1
-
-            _repack_interval = _operator_page_repack_interval(cfg)
-            if (model_version_cfg == V4168_MODEL_VERSION
-                    and _repack_interval > 0
-                    and global_step > 0
-                    and global_step % _repack_interval == 0):
-                _repack_context = {
-                    'step': int(global_step),
-                    'reason': 'periodic',
-                    'model_version': model_version_cfg,
-                    'interval': int(_repack_interval),
-                }
-                _strict_multihost_barrier(
-                    f"before_v4168_page_repair:{global_step}",
-                    context=_repack_context)
-                params, opt_state, _repack_summary = (
-                    _physical_local_swap_repair_operator_pages(
-                        params, opt_state, cfg, mesh=mesh,
-                        step=global_step, reason='periodic',
-                        mesh_model=mesh_model))
-                if drift_diagnostics_enabled:
-                    _prev_op_key_snap = _drift_snap(params)
-                _emit_operator_page_repack_summary(
-                    _repack_summary, use_loggers=True)
-                _strict_multihost_barrier(
-                    f"after_v4168_page_repair:{global_step}",
-                    context=_repack_context)
 
             # ---- REGULAR periodic logging ----
             # ANALYSIS is driven from the val path (below), not from here -
