@@ -7803,6 +7803,13 @@ def _fmt_sparsity_frac_count(rec, pool, prefix):
     return f"{frac * 100:.2f}%({count:.2f})"
 
 
+def _fmt_optional_pct_count(value, count):
+    pct = _fmt_optional_pct(value)
+    if count is None:
+        return pct
+    return f"{pct}({count:.2f})"
+
+
 def _fmt_sparsity_mass(rec, pool, key):
     mass = float(rec.get(f'{pool}_{key}', 0.0) or 0.0)
     return f"{mass * 100:.2f}%"
@@ -7839,6 +7846,53 @@ def _first_optional_rec_float(rec, keys):
         if value is not None:
             return value
     return None
+
+
+def _active_tau_count_for_label(rec, label, frac_key):
+    count_keys = {
+        'q': ('attn_q_active_tau_count', 'q_active_tau_count'),
+        'k': ('attn_k_active_tau_count', 'k_active_tau_count'),
+        'qk': ('attn_qk_active_tau_count', 'qk_active_tau_count'),
+        'v': ('attn_v_active_tau_count', 'v_active_tau_count'),
+        'rst': ('rst_active_tau_count',),
+    }.get(label, ())
+    count = _first_optional_rec_float(rec, count_keys)
+    if count is not None:
+        return count
+    frac = _optional_rec_float(rec, frac_key)
+    if frac is None:
+        return None
+    page_prefix = {
+        'q': 'attn_qk',
+        'k': 'attn_qk',
+        'qk': 'attn_qk',
+        'v': 'attn_v',
+        'rst': 'rst',
+    }.get(label)
+    if page_prefix is None:
+        return None
+    if frac_key.endswith('_local'):
+        denom_keys = (
+            f'{label}_valid_candidate_count',
+            f'{page_prefix}_candidate_valid_ops',
+            f'{page_prefix}_candidate_valid_count',
+        )
+    else:
+        denom_keys = (
+            f'{label}_full_pool_size',
+            f'{page_prefix}_full_pool_size',
+        )
+    denom = _first_optional_rec_float(rec, denom_keys)
+    if denom is None:
+        return None
+    return frac * denom
+
+
+def _fmt_active_label_pct_count(rec, label, scope):
+    key = f'{label}_active_{scope}'
+    return _fmt_optional_pct_count(
+        _optional_rec_float(rec, key),
+        _active_tau_count_for_label(rec, label, key))
 
 
 def _attach_page_aware_metrics(rec, ctx=None):
@@ -7934,18 +7988,18 @@ def _active_tau_display_value(rec, active_tau_keys, active_key):
 def _print_active_tau_regular_line(rec):
     if any(f'{name}_active_local' in rec for name in ('q', 'k', 'qk', 'v', 'rst')):
         log_message(
-            f"  active_local: q={_fmt_optional_pct(_optional_rec_float(rec, 'q_active_local'))}"
-            f" k={_fmt_optional_pct(_optional_rec_float(rec, 'k_active_local'))}"
-            f" qk={_fmt_optional_pct(_optional_rec_float(rec, 'qk_active_local'))}"
-            f" v={_fmt_optional_pct(_optional_rec_float(rec, 'v_active_local'))}"
-            f" rst={_fmt_optional_pct(_optional_rec_float(rec, 'rst_active_local'))}"
+            f"  active_local: q={_fmt_active_label_pct_count(rec, 'q', 'local')}"
+            f" k={_fmt_active_label_pct_count(rec, 'k', 'local')}"
+            f" qk={_fmt_active_label_pct_count(rec, 'qk', 'local')}"
+            f" v={_fmt_active_label_pct_count(rec, 'v', 'local')}"
+            f" rst={_fmt_active_label_pct_count(rec, 'rst', 'local')}"
         )
         log_message(
-            f"  active_pool: q={_fmt_optional_pct(_optional_rec_float(rec, 'q_active_pool'))}"
-            f" k={_fmt_optional_pct(_optional_rec_float(rec, 'k_active_pool'))}"
-            f" qk={_fmt_optional_pct(_optional_rec_float(rec, 'qk_active_pool'))}"
-            f" v={_fmt_optional_pct(_optional_rec_float(rec, 'v_active_pool'))}"
-            f" rst={_fmt_optional_pct(_optional_rec_float(rec, 'rst_active_pool'))}"
+            f"  active_pool: q={_fmt_active_label_pct_count(rec, 'q', 'pool')}"
+            f" k={_fmt_active_label_pct_count(rec, 'k', 'pool')}"
+            f" qk={_fmt_active_label_pct_count(rec, 'qk', 'pool')}"
+            f" v={_fmt_active_label_pct_count(rec, 'v', 'pool')}"
+            f" rst={_fmt_active_label_pct_count(rec, 'rst', 'pool')}"
         )
         return
     explicit_keys = (
@@ -8077,7 +8131,9 @@ def _print_v4164_sparsity_block(rec):
         def _fmt_local_pool(pool, prefix):
             local = _rec_float(rec, f'{pool}_{prefix}_frac', 0.0)
             frac = _rec_float(rec, f'{pool}_candidate_valid_frac', 1.0)
-            return f"{local * 100:.2f}%/{local * frac * 100:.2f}%"
+            count = _optional_rec_float(rec, f'{pool}_{prefix}_count')
+            count_part = "" if count is None else f"({count:.2f})"
+            return f"{local * 100:.2f}%/{local * frac * 100:.2f}%{count_part}"
 
         for eps_label, suffix in (('1e-2', '1e_2'), ('1e-1', '1e_1')):
             log_message(
