@@ -1,10 +1,10 @@
 """
-DAWN-SRW v4.1.6.8 Global CEU Operator Pages + Physical Page Repack
+DAWN-SRW v4.1.6.8 Global CEU Operator Pages + Local-Swap Page Repair
 
 Page-sparse RW execution version of the v4167 experimental path. 4168 v1
 keeps the v4167 forward/page-routing semantics and lets the trainer
-periodically repack the physical operator order by shard-local spherical
-operator-key neighborhoods.
+periodically repair the physical operator order with shard-local swaps over
+existing operator-key pages.
 
 Implemented concepts:
 - cosine-space tau reference with bounded sigmoid min/max mapping
@@ -13,7 +13,7 @@ Implemented concepts:
 - RW-derived live-gradient operator-key selection
 - RW-matched operator queries
 - Global CEU operator pages with page-routed candidate RW execution
-- trainer-supported spherical physical page repacking
+- trainer-supported local-swap physical page repair
 - scheduled soft-gate boundary-scale input
 - scheduled boundary power input
 - tau movement controlled by optimizer-side tau_lr_mult
@@ -5309,7 +5309,7 @@ class DAWNBlock(nn.Module):
 # ================================================================
 
 class DAWN_SRW_V4168(nn.Module):
-    """DAWN-SRW v4.1.6.8 with trainer-supported physical page repack."""
+    """DAWN-SRW v4.1.6.8 with trainer-supported page repair."""
     __version__ = MODEL_VERSION
 
     vocab_size: int = 30000
@@ -5346,7 +5346,7 @@ class DAWN_SRW_V4168(nn.Module):
     operator_pages_analysis_full_scan: bool = False
     operator_page_repack_interval: int = 0
     # Learned anchors and compactness/separation losses are intentionally not
-    # part of 4168 v1; physical repacking is host-level trainer policy.
+    # part of 4168 v1; physical repair is host-level trainer policy.
     # Constructor receives cosine-space tau values. The train driver may use
     # safe placeholders before one-time quantile calibration.
     tau_init_attn_qk: Optional[float] = None
@@ -6652,7 +6652,7 @@ class DAWN_SRW_V4168(nn.Module):
             f"rst={float(rst_scale):.6g})",
             "  Global CEU operator pages: page-routed candidate RW execution "
             "over the live RW-derived operator-key atlas",
-            "  Spherical physical page repacking supported by trainer "
+            "  Local-swap physical page repair supported by trainer "
             f"(interval={self.operator_page_repack_interval})",
             "  Page defaults: all-pool top-k "
             f"(qk page_size={self.operator_page_size_qk}, "

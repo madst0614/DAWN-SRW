@@ -1393,6 +1393,12 @@ V4168_REPACK_POOL_SPECS = {
     },
 }
 
+V4168_LOCAL_SWAP_GAIN_MARGIN = 0.02
+V4168_LOCAL_SWAP_MAX_CHANGED_FRAC = 0.10
+V4168_LOCAL_SWAP_MAX_SWAPS_PER_PAGE = 8
+V4168_LOCAL_SWAP_TOPK_TARGET_PAGES = 4
+V4168_LOCAL_SWAP_MIN_PAGE_SIZE_FOR_REPAIR = 2
+
 
 def _normalize_rows_numpy(x, eps=1.0e-8):
     x = np.asarray(x, dtype=np.float32)
@@ -1408,8 +1414,8 @@ def _normalize_vector_numpy(x, eps=1.0e-8):
     return x / np.float32(norm)
 
 
-def spherical_repack_perm_numpy(op_key, page_size):
-    """Deterministic recursive spherical PCA page packing."""
+def _local_swap_repair_perm_and_stats_numpy(op_key, page_size):
+    """Repair current physical pages with shard-local pairwise swaps."""
     page_size = int(page_size)
     if page_size <= 0:
         raise ValueError("page_size must be > 0")
@@ -1418,62 +1424,181 @@ def spherical_repack_perm_numpy(op_key, page_size):
     if x.ndim != 2:
         raise ValueError(
             f"op_key must have shape [N, d_route], got {x.shape}")
-    n_ops, d_route = x.shape
+    n_ops, _ = x.shape
     ids = np.arange(n_ops, dtype=np.int32)
-    if n_ops <= 1:
-        return ids
+    page_count = int((n_ops + page_size - 1) // page_size)
+    stats = {
+        'candidate_count': 0,
+        'swap_count': 0,
+        'changed_count': 0,
+        'changed_frac': 0.0,
+        'gain_mean': 0.0,
+        'gain_max': 0.0,
+        'swap_gain_mean': 0.0,
+        'swap_gain_max': 0.0,
+        'page_swap_max': 0,
+        'page_swap_mean': 0.0,
+        'page_swap_sum': 0,
+        'page_swap_page_count': page_count,
+        'skipped_page_cap': 0,
+        'skipped_used_operator': 0,
+        'skipped_no_partner': 0,
+        'skipped_low_gain': 0,
+    }
+    if n_ops <= 1 or page_count <= 1:
+        return ids, stats
 
-    fallback_v = np.linspace(-1.0, 1.0, d_route, dtype=np.float32)
-    fallback_v = _normalize_vector_numpy(fallback_v)
-    if fallback_v is None:
-        fallback_v = np.ones((d_route,), dtype=np.float32)
-        fallback_v = fallback_v / np.float32(max(d_route, 1) ** 0.5)
+    page_id = np.arange(n_ops, dtype=np.int32) // page_size
+    page_valid_count = np.zeros((page_count,), dtype=np.int32)
+    centers = np.zeros((page_count, x.shape[1]), dtype=np.float32)
+    for page in range(page_count):
+        start = page * page_size
+        stop = min(start + page_size, n_ops)
+        page_valid_count[page] = int(stop - start)
+        if stop <= start:
+            continue
+        page_rows = x[start:stop]
+        center = _normalize_vector_numpy(page_rows.mean(axis=0))
+        if center is None:
+            center = page_rows[0]
+        centers[page] = center.astype(np.float32, copy=False)
 
-    def _pca_order(indices):
-        indices = np.asarray(indices, dtype=np.int32)
-        sub = x[indices]
-        mean = _normalize_vector_numpy(sub.mean(axis=0))
-        if mean is None:
-            mean = sub[0]
-        centered = sub - mean[None, :]
+    current_sim = np.sum(x * centers[page_id], axis=-1)
+    all_page_sim = x @ centers.T
+    topk = min(
+        int(V4168_LOCAL_SWAP_TOPK_TARGET_PAGES),
+        max(0, page_count - 1))
+    min_page_size = int(V4168_LOCAL_SWAP_MIN_PAGE_SIZE_FOR_REPAIR)
+    margin = float(V4168_LOCAL_SWAP_GAIN_MARGIN)
 
-        v = _normalize_vector_numpy(centered[0])
-        if v is None:
-            v = fallback_v
-        for _ in range(4):
-            candidate = centered.T @ (centered @ v)
-            next_v = _normalize_vector_numpy(candidate)
-            if next_v is None:
-                break
-            v = next_v
+    candidates = []
+    candidate_gains = []
+    for i in range(n_ops):
+        page_a = int(page_id[i])
+        if int(page_valid_count[page_a]) < min_page_size:
+            continue
+        gains = all_page_sim[i] - current_sim[i]
+        valid_targets = [
+            page for page in range(page_count)
+            if page != page_a
+            and int(page_valid_count[page]) >= min_page_size
+            and float(gains[page]) > margin
+        ]
+        if not valid_targets:
+            continue
+        valid_targets.sort(key=lambda page: (-float(gains[page]), int(page)))
+        target_pages = tuple(int(page) for page in valid_targets[:topk])
+        best_gain = float(gains[target_pages[0]])
+        candidates.append((i, page_a, best_gain, target_pages))
+        candidate_gains.append(best_gain)
 
-        score = centered @ v
-        return indices[np.lexsort((indices, score))]
+    stats['candidate_count'] = int(len(candidates))
+    if candidate_gains:
+        stats['gain_mean'] = float(np.mean(candidate_gains))
+        stats['gain_max'] = float(np.max(candidate_gains))
 
-    def _split(indices):
-        indices = np.asarray(indices, dtype=np.int32)
-        n = int(indices.size)
-        if n <= page_size:
-            return [indices]
+    candidates.sort(key=lambda item: (-item[2], item[0]))
 
-        order = _pca_order(indices)
-        if n <= 2 * page_size:
-            left = order[:page_size]
-            right = order[page_size:]
-            return [part for part in (left, right) if part.size > 0]
+    order = ids.copy()
+    used = np.zeros((n_ops,), dtype=np.bool_)
+    page_swap_count = np.zeros((page_count,), dtype=np.int32)
+    max_changed = int(math.floor(
+        float(n_ops) * float(V4168_LOCAL_SWAP_MAX_CHANGED_FRAC)))
+    changed_count = 0
+    swap_gains = []
+    max_swaps_per_page = int(V4168_LOCAL_SWAP_MAX_SWAPS_PER_PAGE)
 
-        half = n // 2
-        split_at = int(round(float(half) / float(page_size)) * page_size)
-        split_at = min(max(page_size, split_at), n - page_size)
-        return _split(order[:split_at]) + _split(order[split_at:])
+    for i, page_a, _, target_pages in candidates:
+        if changed_count + 2 > max_changed:
+            break
+        if used[i]:
+            stats['skipped_used_operator'] += 1
+            continue
+        if page_swap_count[page_a] >= max_swaps_per_page:
+            stats['skipped_page_cap'] += 1
+            continue
 
-    pages = _split(ids)
-    perm = np.concatenate(pages).astype(np.int32, copy=False)
+        accepted = False
+        saw_uncapped_page = False
+        saw_partner = False
+        saw_low_gain = False
+        for page_b in target_pages:
+            if page_swap_count[page_b] >= max_swaps_per_page:
+                continue
+            saw_uncapped_page = True
+            start = int(page_b * page_size)
+            stop = int(min(start + page_size, n_ops))
+            best_j = None
+            best_swap_gain = None
+            for j in range(start, stop):
+                if used[j] or j == i:
+                    continue
+                saw_partner = True
+                swap_gain = (
+                    float(all_page_sim[i, page_b])
+                    + float(all_page_sim[j, page_a])
+                    - float(all_page_sim[i, page_a])
+                    - float(all_page_sim[j, page_b])
+                )
+                if (best_swap_gain is None
+                        or swap_gain > best_swap_gain
+                        or (swap_gain == best_swap_gain and j < best_j)):
+                    best_swap_gain = swap_gain
+                    best_j = j
+
+            if best_j is None:
+                continue
+            if float(best_swap_gain) <= margin:
+                saw_low_gain = True
+                continue
+
+            order[i], order[best_j] = order[best_j], order[i]
+            used[i] = True
+            used[best_j] = True
+            page_swap_count[page_a] += 1
+            page_swap_count[page_b] += 1
+            changed_count += 2
+            swap_gains.append(float(best_swap_gain))
+            accepted = True
+            break
+
+        if accepted:
+            continue
+        if not saw_uncapped_page:
+            stats['skipped_page_cap'] += 1
+        elif not saw_partner:
+            stats['skipped_no_partner'] += 1
+        elif saw_low_gain:
+            stats['skipped_low_gain'] += 1
+        else:
+            stats['skipped_no_partner'] += 1
+
+    perm = order.astype(np.int32, copy=False)
     if perm.shape != (n_ops,):
         raise RuntimeError(
-            f"spherical repack produced shape {perm.shape}, expected {(n_ops,)}")
+            f"local swap repair produced shape {perm.shape}, expected {(n_ops,)}")
     if not np.array_equal(np.sort(perm), ids):
-        raise RuntimeError("spherical repack did not produce a true permutation")
+        raise RuntimeError(
+            "local swap repair did not produce a true permutation")
+
+    changed_count = int(np.sum(perm != ids))
+    stats['swap_count'] = int(len(swap_gains))
+    stats['changed_count'] = changed_count
+    stats['changed_frac'] = float(changed_count / max(n_ops, 1))
+    if swap_gains:
+        stats['swap_gain_mean'] = float(np.mean(swap_gains))
+        stats['swap_gain_max'] = float(np.max(swap_gains))
+    stats['page_swap_max'] = (
+        int(np.max(page_swap_count)) if page_swap_count.size else 0)
+    stats['page_swap_mean'] = (
+        float(np.mean(page_swap_count)) if page_swap_count.size else 0.0)
+    stats['page_swap_sum'] = int(np.sum(page_swap_count))
+    return perm, stats
+
+
+def local_swap_repair_perm_numpy(op_key, page_size):
+    """Return a true permutation for shard-local physical page repair."""
+    perm, _ = _local_swap_repair_perm_and_stats_numpy(op_key, page_size)
     return perm
 
 
@@ -1503,8 +1628,8 @@ def _summarize_compact_values(values):
     return float(np.mean(values)), float(np.quantile(values, 0.05))
 
 
-def _compute_spherical_repack_perm_for_pool(op_key_local, page_size):
-    return spherical_repack_perm_numpy(op_key_local, page_size)
+def _compute_local_swap_repair_perm_for_pool(op_key_local, page_size):
+    return _local_swap_repair_perm_and_stats_numpy(op_key_local, page_size)
 
 
 def _compute_pool_repack_perms_and_stats(pool, op_key_shards, page_size):
@@ -1515,13 +1640,26 @@ def _compute_pool_repack_perms_and_stats(pool, op_key_shards, page_size):
     changed = 0
     total = 0
     page_count = 0
+    repair_candidate_count = 0
+    repair_swap_count = 0
+    repair_gain_sum = 0.0
+    repair_gain_max = 0.0
+    repair_swap_gain_sum = 0.0
+    repair_swap_gain_max = 0.0
+    repair_page_swap_max = 0
+    repair_page_swap_sum = 0
+    repair_page_swap_page_count = 0
+    repair_skipped_page_cap = 0
+    repair_skipped_used_operator = 0
+    repair_skipped_no_partner = 0
+    repair_skipped_low_gain = 0
 
     for slice_key, op_key_local in sorted(op_key_shards.items()):
         op_key_local = np.asarray(op_key_local, dtype=np.float32)
         if op_key_local.ndim != 2:
             raise ValueError(
                 f"{pool} op_key shard must be rank 2, got {op_key_local.shape}")
-        perm = _compute_spherical_repack_perm_for_pool(
+        perm, repair_stats = _compute_local_swap_repair_perm_for_pool(
             op_key_local, page_size)
         perms_by_slice[slice_key] = perm
 
@@ -1534,6 +1672,34 @@ def _compute_pool_repack_perms_and_stats(pool, op_key_shards, page_size):
         changed += int(np.sum(perm != np.arange(perm.size, dtype=np.int32)))
         total += int(perm.size)
         page_count += int(pages)
+
+        _candidate_count = int(repair_stats.get('candidate_count', 0))
+        _swap_count = int(repair_stats.get('swap_count', 0))
+        repair_candidate_count += _candidate_count
+        repair_swap_count += _swap_count
+        repair_gain_sum += (
+            float(repair_stats.get('gain_mean', 0.0)) * _candidate_count)
+        repair_gain_max = max(
+            repair_gain_max, float(repair_stats.get('gain_max', 0.0)))
+        repair_swap_gain_sum += (
+            float(repair_stats.get('swap_gain_mean', 0.0)) * _swap_count)
+        repair_swap_gain_max = max(
+            repair_swap_gain_max,
+            float(repair_stats.get('swap_gain_max', 0.0)))
+        repair_page_swap_max = max(
+            repair_page_swap_max,
+            int(repair_stats.get('page_swap_max', 0)))
+        repair_page_swap_sum += int(repair_stats.get('page_swap_sum', 0))
+        repair_page_swap_page_count += int(
+            repair_stats.get('page_swap_page_count', 0))
+        repair_skipped_page_cap += int(
+            repair_stats.get('skipped_page_cap', 0))
+        repair_skipped_used_operator += int(
+            repair_stats.get('skipped_used_operator', 0))
+        repair_skipped_no_partner += int(
+            repair_stats.get('skipped_no_partner', 0))
+        repair_skipped_low_gain += int(
+            repair_stats.get('skipped_low_gain', 0))
 
     before_all = (
         np.concatenate(before_values)
@@ -1559,6 +1725,23 @@ def _compute_pool_repack_perms_and_stats(pool, op_key_shards, page_size):
         f'{pool}_page_count': int(page_count),
         f'{pool}_page_size': int(page_size),
         f'{pool}_duration_sec': float(duration),
+        f'{pool}_repair_candidate_count': int(repair_candidate_count),
+        f'{pool}_repair_swap_count': int(repair_swap_count),
+        f'{pool}_repair_changed_frac': changed_frac,
+        f'{pool}_repair_gain_mean': float(
+            repair_gain_sum / max(repair_candidate_count, 1)),
+        f'{pool}_repair_gain_max': float(repair_gain_max),
+        f'{pool}_repair_swap_gain_mean': float(
+            repair_swap_gain_sum / max(repair_swap_count, 1)),
+        f'{pool}_repair_swap_gain_max': float(repair_swap_gain_max),
+        f'{pool}_repair_page_swap_max': int(repair_page_swap_max),
+        f'{pool}_repair_page_swap_mean': float(
+            repair_page_swap_sum / max(repair_page_swap_page_count, 1)),
+        f'{pool}_repair_skipped_page_cap': int(repair_skipped_page_cap),
+        f'{pool}_repair_skipped_used_operator': int(
+            repair_skipped_used_operator),
+        f'{pool}_repair_skipped_no_partner': int(repair_skipped_no_partner),
+        f'{pool}_repair_skipped_low_gain': int(repair_skipped_low_gain),
     }
     return perms_by_slice, stats
 
@@ -1774,9 +1957,9 @@ def _current_pool_operator_keys_host_or_local(params, cfg):
     return jax.jit(pool_operator_keys)(params['neuron_pool'])
 
 
-def _physical_spherical_repack_operator_pages(params, opt_state, cfg, mesh=None,
-                                              step=0, reason='periodic',
-                                              mesh_model=None):
+def _physical_local_swap_repair_operator_pages(params, opt_state, cfg, mesh=None,
+                                               step=0, reason='periodic',
+                                               mesh_model=None):
     del mesh
     if not _is_v4168_repack_enabled(cfg):
         return params, opt_state, None
@@ -1798,6 +1981,7 @@ def _physical_spherical_repack_operator_pages(params, opt_state, cfg, mesh=None,
         'operator_page_repack_interval': int(interval),
         'physical': True,
         'shard_local': True,
+        'method': 'local_swap_repair',
         'process_index': int(jax.process_index()),
     }
 
@@ -1826,7 +2010,7 @@ def _physical_spherical_repack_operator_pages(params, opt_state, cfg, mesh=None,
             if (before_count is not None and after_count is not None
                     and before_count != after_count):
                 raise RuntimeError(
-                    "operator page repack changed optimizer step count "
+                    "operator page repair changed optimizer step count "
                     f"from {before_count} to {after_count}")
 
     summary['duration_sec'] = float(time.time() - t0)
@@ -1844,9 +2028,10 @@ def _emit_operator_page_repack_summary(summary, use_loggers=False):
             print(msg, flush=True)
 
     _line(
-        "v4168_page_repack: "
+        "v4168_page_repair: "
         f"step={summary['step']} reason={summary['reason']} "
         f"interval={summary['operator_page_repack_interval']} "
+        f"method={summary.get('method', 'local_swap_repair')} "
         f"duration={summary.get('duration_sec', 0.0):.3f}s")
     for pool in ('qk', 'v', 'rst'):
         changed = summary.get(f'{pool}_perm_changed_frac', 0.0) * 100.0
@@ -1854,10 +2039,19 @@ def _emit_operator_page_repack_summary(summary, use_loggers=False):
         after_mean = summary.get(f'{pool}_compact_cos_mean_after', 0.0)
         before_p05 = summary.get(f'{pool}_compact_cos_p05_before', 0.0)
         after_p05 = summary.get(f'{pool}_compact_cos_p05_after', 0.0)
+        swaps = summary.get(f'{pool}_repair_swap_count', 0)
+        candidates = summary.get(f'{pool}_repair_candidate_count', 0)
+        gain_mean = summary.get(f'{pool}_repair_gain_mean', 0.0)
+        gain_max = summary.get(f'{pool}_repair_gain_max', 0.0)
+        swap_gain_mean = summary.get(f'{pool}_repair_swap_gain_mean', 0.0)
+        swap_gain_max = summary.get(f'{pool}_repair_swap_gain_max', 0.0)
         _line(
             f"  {pool}: changed={changed:.2f}% "
             f"compact_mean={before_mean:.4f}->{after_mean:.4f} "
             f"compact_p05={before_p05:.4f}->{after_p05:.4f} "
+            f"swaps={swaps} candidates={candidates} "
+            f"gain={gain_mean:.4f}/{gain_max:.4f} "
+            f"swap_gain={swap_gain_mean:.4f}/{swap_gain_max:.4f} "
             f"pages={summary.get(f'{pool}_page_count', 0)} "
             f"page_size={summary.get(f'{pool}_page_size', 0)}")
     if use_loggers:
@@ -12208,26 +12402,6 @@ def main():
             print(line)
 
     _has_resume_checkpoint = resume_step is not None
-    operator_page_initial_repack_summary = None
-    if _is_v4168_repack_enabled(cfg) and not _has_resume_checkpoint:
-        _initial_repack_context = {
-            'step': 0,
-            'reason': 'initial',
-            'model_version': model_version_cfg,
-            'interval': _operator_page_repack_interval(cfg),
-        }
-        _strict_multihost_barrier(
-            "before_v4168_page_repack:0",
-            context=_initial_repack_context)
-        params, _, operator_page_initial_repack_summary = (
-            _physical_spherical_repack_operator_pages(
-                params, None, cfg, step=0, reason='initial',
-                mesh_model=int(cfg['training'].get('mesh_model', 1))))
-        _emit_operator_page_repack_summary(
-            operator_page_initial_repack_summary, use_loggers=False)
-        _strict_multihost_barrier(
-            "after_v4168_page_repack:0",
-            context=_initial_repack_context)
 
     rank = cfg['model'].get('rank', 64)
     knowledge_rank = cfg['model'].get('knowledge_rank', 128)
@@ -12464,9 +12638,9 @@ def main():
         if model_version_cfg == V4168_MODEL_VERSION:
             _repack_interval = _operator_page_repack_interval(cfg)
             print(
-                "  v4168 spherical physical page repack: "
+                "  v4168 local-swap physical page repair: "
                 f"interval={_repack_interval} "
-                f"initial={str(_repack_interval > 0 and not _has_resume_checkpoint).lower()} "
+                "initial=false "
                 "physical=true shard_local=true")
         print("  Tau parameterization: bounded sigmoid min/max")
         print("  tau = -1 + 2 * sigmoid(raw_tau)")
@@ -13995,9 +14169,9 @@ def main():
         if model_version_cfg == V4168_MODEL_VERSION:
             repack_interval = _operator_page_repack_interval(cfg)
             log_message(
-                "v4168 spherical physical page repack: "
+                "v4168 local-swap physical page repair: "
                 f"interval={repack_interval} "
-                f"initial={str(repack_interval > 0 and not _has_resume_checkpoint).lower()} "
+                "initial=false "
                 "physical=true shard_local=true")
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
         log_message(f"Total steps: {total_steps}")
@@ -14005,9 +14179,6 @@ def main():
             log_jsonl(tau_init_summary)
         if selection_calibration_summary is not None:
             log_jsonl(selection_calibration_summary)
-        if operator_page_initial_repack_summary is not None:
-            _emit_operator_page_repack_summary(
-                operator_page_initial_repack_summary, use_loggers=True)
         log_message(
             "Resume log append policy: "
             f"training={training_log_append_on_resume}")
@@ -14192,10 +14363,10 @@ def main():
                     'interval': int(_repack_interval),
                 }
                 _strict_multihost_barrier(
-                    f"before_v4168_page_repack:{global_step}",
+                    f"before_v4168_page_repair:{global_step}",
                     context=_repack_context)
                 params, opt_state, _repack_summary = (
-                    _physical_spherical_repack_operator_pages(
+                    _physical_local_swap_repair_operator_pages(
                         params, opt_state, cfg, mesh=mesh,
                         step=global_step, reason='periodic',
                         mesh_model=mesh_model))
@@ -14204,7 +14375,7 @@ def main():
                 _emit_operator_page_repack_summary(
                     _repack_summary, use_loggers=True)
                 _strict_multihost_barrier(
-                    f"after_v4168_page_repack:{global_step}",
+                    f"after_v4168_page_repair:{global_step}",
                     context=_repack_context)
 
             # ---- REGULAR periodic logging ----
