@@ -78,6 +78,12 @@ from models.dawn_srw_v4167 import (
     _raw_tau_init_from_cosine_tau as _v4167_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4167_tau_init_calibration_scores,
 )
+from models.dawn_srw_v4168 import (
+    DAWN_SRW_V4168,
+    _pool_operator_keys as _v4168_pool_operator_keys,
+    _raw_tau_init_from_cosine_tau as _v4168_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4168_tau_init_calibration_scores,
+)
 from models.baseline_transformer_jax import VanillaTransformer
 
 
@@ -255,11 +261,14 @@ def _strict_multihost_barrier(name: str, context=None):
 V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
 V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
 V4167_MODEL_VERSION = 'spatial-r1-v4.1.6.7'
+V4168_MODEL_VERSION = 'spatial-r1-v4.1.6.8'
 BASELINE_MODEL_VERSION = 'baseline'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (
-    V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION)
-RW_KEY_SRW_MODEL_VERSIONS = (V4166_MODEL_VERSION, V4167_MODEL_VERSION)
+    V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION,
+    V4168_MODEL_VERSION)
+RW_KEY_SRW_MODEL_VERSIONS = (
+    V4166_MODEL_VERSION, V4167_MODEL_VERSION, V4168_MODEL_VERSION)
 CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_SELECTION_CALIBRATION_SCORE_CHUNK_TOKENS = 2048
 MODEL_REGISTRY = {
@@ -287,6 +296,12 @@ MODEL_REGISTRY = {
         'module': 'models.dawn_srw_v4167',
         'raw_tau_init_from_cosine_tau': _v4167_raw_tau_init_from_cosine_tau,
         'tau_init_calibration_scores': _v4167_tau_init_calibration_scores,
+    },
+    V4168_MODEL_VERSION: {
+        'class': DAWN_SRW_V4168,
+        'module': 'models.dawn_srw_v4168',
+        'raw_tau_init_from_cosine_tau': _v4168_raw_tau_init_from_cosine_tau,
+        'tau_init_calibration_scores': _v4168_tau_init_calibration_scores,
     },
 }
 
@@ -351,6 +366,21 @@ def _is_baseline_version(version):
 
 def _is_rw_key_srw_version(version):
     return str(version) in RW_KEY_SRW_MODEL_VERSIONS
+
+
+def _is_operator_page_srw_version(version):
+    return str(version) in (V4167_MODEL_VERSION, V4168_MODEL_VERSION)
+
+
+def _pool_operator_keys_for_version(version):
+    version = str(version)
+    if version == V4168_MODEL_VERSION:
+        return _v4168_pool_operator_keys
+    if version == V4167_MODEL_VERSION:
+        return _v4167_pool_operator_keys
+    if version == V4166_MODEL_VERSION:
+        return _v4166_pool_operator_keys
+    raise ValueError(f"{version} does not expose RW-derived operator keys.")
 
 
 def _model_registry_entry(version):
@@ -789,19 +819,46 @@ V4167_PAGE_CONFIG_DEFAULTS = (
 V4167_PAGE_RESUME_REQUIRED_FIELDS = tuple(
     ('model', key) for key, _ in V4167_PAGE_CONFIG_DEFAULTS)
 
+V4168_PAGE_CONFIG_DEFAULTS = V4167_PAGE_CONFIG_DEFAULTS + (
+    ('operator_page_repack_interval', 0),
+)
 
-def _materialize_v4167_page_config(cfg):
+V4168_PAGE_RESUME_REQUIRED_FIELDS = tuple(
+    ('model', key) for key, _ in V4168_PAGE_CONFIG_DEFAULTS)
+
+
+def _operator_page_config_defaults_for_version(version):
+    version = str(version)
+    if version == V4168_MODEL_VERSION:
+        return V4168_PAGE_CONFIG_DEFAULTS
+    if version == V4167_MODEL_VERSION:
+        return V4167_PAGE_CONFIG_DEFAULTS
+    return None
+
+
+def _operator_page_resume_required_fields_for_version(version):
+    version = str(version)
+    if version == V4168_MODEL_VERSION:
+        return V4168_PAGE_RESUME_REQUIRED_FIELDS
+    if version == V4167_MODEL_VERSION:
+        return V4167_PAGE_RESUME_REQUIRED_FIELDS
+    return ()
+
+
+def _materialize_operator_page_config(cfg):
     if not isinstance(cfg, dict):
         return cfg
     model_cfg = cfg.setdefault('model', {})
     if not isinstance(model_cfg, dict):
         return cfg
-    if model_cfg.get('model_version', OFFICIAL_MODEL_VERSION) != V4167_MODEL_VERSION:
+    defaults = _operator_page_config_defaults_for_version(
+        model_cfg.get('model_version', OFFICIAL_MODEL_VERSION))
+    if defaults is None:
         return cfg
     training_cfg = cfg.get('training', {})
     if not isinstance(training_cfg, dict):
         training_cfg = {}
-    for key, default in V4167_PAGE_CONFIG_DEFAULTS:
+    for key, default in defaults:
         if key in model_cfg and model_cfg[key] is not None:
             value = model_cfg[key]
         elif key in training_cfg and training_cfg[key] is not None:
@@ -814,13 +871,17 @@ def _materialize_v4167_page_config(cfg):
     return cfg
 
 
+def _materialize_v4167_page_config(cfg):
+    return _materialize_operator_page_config(cfg)
+
+
 def _materialized_config_snapshot(cfg, training_config):
     full_cfg = deepcopy(cfg)
     merged_training = deepcopy(cfg.get('training', {}))
     if training_config:
         merged_training.update(deepcopy(training_config))
     full_cfg['training'] = merged_training
-    _materialize_v4167_page_config(full_cfg)
+    _materialize_operator_page_config(full_cfg)
     return _json_safe(full_cfg)
 
 
@@ -920,9 +981,10 @@ def _require_resume_materialized_fields(full_config):
 
     missing = _missing_config_paths(
         full_config, ACTIVE_SRW_RESUME_REQUIRED_FIELDS)
-    if model_version == V4167_MODEL_VERSION:
+    if _is_operator_page_srw_version(model_version):
         missing.extend(_missing_config_paths(
-            full_config, V4167_PAGE_RESUME_REQUIRED_FIELDS))
+            full_config,
+            _operator_page_resume_required_fields_for_version(model_version)))
     if missing:
         raise RuntimeError(
             "Resume checkpoint full_config is missing required materialized "
@@ -1085,6 +1147,22 @@ def _operator_page_cfg_get(cfg, key, default=None):
     return t.get(key, default)
 
 
+def _operator_page_repack_interval(cfg):
+    value = _operator_page_cfg_get(cfg, 'operator_page_repack_interval', 0)
+    if value is None:
+        value = 0
+    value = int(value)
+    if value < 0:
+        raise ValueError("operator_page_repack_interval must be >= 0")
+    return value
+
+
+def _is_v4168_repack_enabled(cfg):
+    version = cfg.get('model', {}).get('model_version', OFFICIAL_MODEL_VERSION)
+    return (str(version) == V4168_MODEL_VERSION
+            and _operator_page_repack_interval(cfg) > 0)
+
+
 def _operator_pages_pool_enabled(cfg, pool):
     enabled = _cfg_bool(
         _operator_page_cfg_get(cfg, 'operator_pages_enabled', True),
@@ -1155,22 +1233,11 @@ def _dawn_srw_kwargs(cfg):
         kw['tau_init_attn_qk'] = 0.0
         kw['tau_init_attn_v'] = 0.0
         kw['tau_init_rst'] = 0.0
-    if version == V4167_MODEL_VERSION:
-        for key, default in (
-                ('operator_pages_enabled', True),
-                ('operator_pages_pools', ('qk', 'v', 'rst')),
-                ('operator_page_size_qk', 128),
-                ('operator_page_size_v', 128),
-                ('operator_page_size_rst', 128),
-                ('operator_page_capacity_qk', 8),
-                ('operator_page_capacity_v', 8),
-                ('operator_page_capacity_rst', 32),
-                ('operator_page_microgroup_sequences', 2),
-                ('operator_page_score_mode', 'maxmean'),
-                ('operator_page_fallback_pages', 0),
-                ('operator_page_random_pages', 0),
-                ('operator_page_cost_weight', 0.0),
-                ('operator_pages_analysis_full_scan', False)):
+    page_defaults = _operator_page_config_defaults_for_version(version)
+    if page_defaults is not None:
+        for key, default in page_defaults:
+            if key == 'operator_page_repack_interval' and version != V4168_MODEL_VERSION:
+                continue
             value = _operator_page_cfg_get(cfg, key, default)
             if key == 'operator_pages_pools':
                 if isinstance(value, list):
@@ -1228,10 +1295,7 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
     # Keep the one-time JIT signature small: calibration needs only selection
     # geometry, not tau params or LM output weights.
     if _is_rw_key_srw_version(version):
-        pool_operator_keys = (
-            _v4167_pool_operator_keys
-            if version == V4167_MODEL_VERSION
-            else _v4166_pool_operator_keys)
+        pool_operator_keys = _pool_operator_keys_for_version(version)
         pool_params = jax.jit(pool_operator_keys)(params['neuron_pool'])
     else:
         pool_params = {
@@ -1266,7 +1330,7 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
     score_kwargs = {
         'max_tokens': int(max_tokens),
     }
-    if version == V4167_MODEL_VERSION:
+    if _is_operator_page_srw_version(version):
         score_kwargs.update({
             'operator_pages_enabled': _operator_page_cfg_get(
                 cfg, 'operator_pages_enabled', True),
@@ -1294,6 +1358,510 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
                 cfg, 'operator_page_random_pages', 0)),
         })
     return version, score_impl, score_params, score_kwargs
+
+
+V4168_REPACK_POOL_SPECS = {
+    'qk': {
+        'prefix': 'attn_qk',
+        'op_key': 'attn_qk_op_key',
+        'size_key': 'n_qk',
+        'page_size_key': 'operator_page_size_qk',
+        'excluded': {
+            'attn_qk_op_read_proj',
+            'attn_qk_op_write_proj',
+        },
+    },
+    'v': {
+        'prefix': 'attn_v',
+        'op_key': 'attn_v_op_key',
+        'size_key': 'n_v',
+        'page_size_key': 'operator_page_size_v',
+        'excluded': {
+            'attn_v_op_read_proj',
+            'attn_v_op_write_proj',
+        },
+    },
+    'rst': {
+        'prefix': 'rst',
+        'op_key': 'rst_op_key',
+        'size_key': 'n_rst',
+        'page_size_key': 'operator_page_size_rst',
+        'excluded': {
+            'rst_op_read_proj',
+            'rst_op_write_proj',
+        },
+    },
+}
+
+
+def _normalize_rows_numpy(x, eps=1.0e-8):
+    x = np.asarray(x, dtype=np.float32)
+    norms = np.linalg.norm(x, axis=-1, keepdims=True)
+    return x / np.maximum(norms, np.float32(eps))
+
+
+def _normalize_vector_numpy(x, eps=1.0e-8):
+    x = np.asarray(x, dtype=np.float32)
+    norm = float(np.linalg.norm(x))
+    if (not np.isfinite(norm)) or norm < eps:
+        return None
+    return x / np.float32(norm)
+
+
+def spherical_repack_perm_numpy(op_key, page_size):
+    """Deterministic recursive spherical PCA page packing."""
+    page_size = int(page_size)
+    if page_size <= 0:
+        raise ValueError("page_size must be > 0")
+
+    x = _normalize_rows_numpy(op_key)
+    if x.ndim != 2:
+        raise ValueError(
+            f"op_key must have shape [N, d_route], got {x.shape}")
+    n_ops, d_route = x.shape
+    ids = np.arange(n_ops, dtype=np.int32)
+    if n_ops <= 1:
+        return ids
+
+    fallback_v = np.linspace(-1.0, 1.0, d_route, dtype=np.float32)
+    fallback_v = _normalize_vector_numpy(fallback_v)
+    if fallback_v is None:
+        fallback_v = np.ones((d_route,), dtype=np.float32)
+        fallback_v = fallback_v / np.float32(max(d_route, 1) ** 0.5)
+
+    def _pca_order(indices):
+        indices = np.asarray(indices, dtype=np.int32)
+        sub = x[indices]
+        mean = _normalize_vector_numpy(sub.mean(axis=0))
+        if mean is None:
+            mean = sub[0]
+        centered = sub - mean[None, :]
+
+        v = _normalize_vector_numpy(centered[0])
+        if v is None:
+            v = fallback_v
+        for _ in range(4):
+            candidate = centered.T @ (centered @ v)
+            next_v = _normalize_vector_numpy(candidate)
+            if next_v is None:
+                break
+            v = next_v
+
+        score = centered @ v
+        return indices[np.lexsort((indices, score))]
+
+    def _split(indices):
+        indices = np.asarray(indices, dtype=np.int32)
+        n = int(indices.size)
+        if n <= page_size:
+            return [indices]
+
+        order = _pca_order(indices)
+        if n <= 2 * page_size:
+            left = order[:page_size]
+            right = order[page_size:]
+            return [part for part in (left, right) if part.size > 0]
+
+        half = n // 2
+        split_at = int(round(float(half) / float(page_size)) * page_size)
+        split_at = min(max(page_size, split_at), n - page_size)
+        return _split(order[:split_at]) + _split(order[split_at:])
+
+    pages = _split(ids)
+    perm = np.concatenate(pages).astype(np.int32, copy=False)
+    if perm.shape != (n_ops,):
+        raise RuntimeError(
+            f"spherical repack produced shape {perm.shape}, expected {(n_ops,)}")
+    if not np.array_equal(np.sort(perm), ids):
+        raise RuntimeError("spherical repack did not produce a true permutation")
+    return perm
+
+
+def _page_compact_cos_values_numpy(op_key, page_size):
+    page_size = int(page_size)
+    if page_size <= 0:
+        raise ValueError("page_size must be > 0")
+    x = _normalize_rows_numpy(op_key)
+    values = []
+    for start in range(0, x.shape[0], page_size):
+        page = x[start:start + page_size]
+        if page.size == 0:
+            continue
+        center = _normalize_vector_numpy(page.mean(axis=0))
+        if center is None:
+            center = page[0]
+        values.append(page @ center)
+    if not values:
+        return np.zeros((0,), dtype=np.float32), 0
+    return np.concatenate(values).astype(np.float32, copy=False), len(values)
+
+
+def _summarize_compact_values(values):
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size <= 0:
+        return 0.0, 0.0
+    return float(np.mean(values)), float(np.quantile(values, 0.05))
+
+
+def _compute_spherical_repack_perm_for_pool(op_key_local, page_size):
+    return spherical_repack_perm_numpy(op_key_local, page_size)
+
+
+def _compute_pool_repack_perms_and_stats(pool, op_key_shards, page_size):
+    t0 = time.time()
+    perms_by_slice = {}
+    before_values = []
+    after_values = []
+    changed = 0
+    total = 0
+    page_count = 0
+
+    for slice_key, op_key_local in sorted(op_key_shards.items()):
+        op_key_local = np.asarray(op_key_local, dtype=np.float32)
+        if op_key_local.ndim != 2:
+            raise ValueError(
+                f"{pool} op_key shard must be rank 2, got {op_key_local.shape}")
+        perm = _compute_spherical_repack_perm_for_pool(
+            op_key_local, page_size)
+        perms_by_slice[slice_key] = perm
+
+        before, pages = _page_compact_cos_values_numpy(
+            op_key_local, page_size)
+        after, _ = _page_compact_cos_values_numpy(
+            op_key_local[perm], page_size)
+        before_values.append(before)
+        after_values.append(after)
+        changed += int(np.sum(perm != np.arange(perm.size, dtype=np.int32)))
+        total += int(perm.size)
+        page_count += int(pages)
+
+    before_all = (
+        np.concatenate(before_values)
+        if before_values else np.zeros((0,), dtype=np.float32))
+    after_all = (
+        np.concatenate(after_values)
+        if after_values else np.zeros((0,), dtype=np.float32))
+    before_mean, before_p05 = _summarize_compact_values(before_all)
+    after_mean, after_p05 = _summarize_compact_values(after_all)
+    changed_frac = float(changed / max(total, 1))
+    duration = time.time() - t0
+
+    stats = {
+        f'{pool}_perm_changed_frac': changed_frac,
+        f'{pool}_compact_cos_mean_before': before_mean,
+        f'{pool}_compact_cos_mean_after': after_mean,
+        f'{pool}_compact_cos_p05_before': before_p05,
+        f'{pool}_compact_cos_p05_after': after_p05,
+        f'{pool}_page_radius_mean_before': 1.0 - before_mean,
+        f'{pool}_page_radius_mean_after': 1.0 - after_mean,
+        f'{pool}_page_radius_p95_before': 1.0 - before_p05,
+        f'{pool}_page_radius_p95_after': 1.0 - after_p05,
+        f'{pool}_page_count': int(page_count),
+        f'{pool}_page_size': int(page_size),
+        f'{pool}_duration_sec': float(duration),
+    }
+    return perms_by_slice, stats
+
+
+def _tree_path_to_str(path):
+    parts = []
+    for item in path:
+        if hasattr(item, 'key'):
+            parts.append(str(item.key))
+        elif hasattr(item, 'idx'):
+            parts.append(str(item.idx))
+        elif hasattr(item, 'name'):
+            parts.append(str(item.name))
+        else:
+            parts.append(str(item))
+    return '/'.join(parts)
+
+
+def _path_leaf_name(path_str):
+    return str(path_str).rsplit('/', 1)[-1]
+
+
+def _operator_repack_pool_for_leaf(path_str, leaf, cfg):
+    shape = getattr(leaf, 'shape', None)
+    if shape is None or len(shape) < 1:
+        return None
+    if 'neuron_pool/' not in path_str:
+        return None
+    model_cfg = cfg.get('model', {})
+    leaf_name = _path_leaf_name(path_str)
+    for pool, spec in V4168_REPACK_POOL_SPECS.items():
+        prefix = spec['prefix']
+        if f'neuron_pool/{prefix}_' not in path_str:
+            continue
+        if leaf_name in spec['excluded']:
+            return None
+        pool_size = int(model_cfg.get(spec['size_key'], 0) or 0)
+        if pool_size > 0 and int(shape[0]) == pool_size:
+            return pool
+    return None
+
+
+def _normalize_index_key(index, shape):
+    if not isinstance(index, tuple):
+        index = (index,)
+    if len(index) < len(shape):
+        index = index + (slice(None),) * (len(shape) - len(index))
+    out = []
+    for axis, item in enumerate(index):
+        dim = int(shape[axis])
+        if isinstance(item, slice):
+            start = 0 if item.start is None else int(item.start)
+            stop = dim if item.stop is None else int(item.stop)
+            step = 1 if item.step is None else int(item.step)
+            out.append(('slice', start, stop, step))
+        elif isinstance(item, (int, np.integer)):
+            out.append(('index', int(item)))
+        else:
+            arr = np.asarray(item)
+            out.append(('array', tuple(arr.reshape(-1).astype(int).tolist())))
+    return tuple(out)
+
+
+def _first_slice_key_from_index(index, full_len):
+    if isinstance(index, tuple):
+        first = index[0]
+    else:
+        first = index
+    if isinstance(first, slice):
+        start = 0 if first.start is None else int(first.start)
+        stop = int(full_len) if first.stop is None else int(first.stop)
+        step = 1 if first.step is None else int(first.step)
+        if step != 1:
+            raise ValueError(f"operator shard slice step must be 1, got {step}")
+        return (start, stop)
+    if isinstance(first, (int, np.integer)):
+        start = int(first)
+        return (start, start + 1)
+    raise TypeError(f"unsupported shard index for repack: {index!r}")
+
+
+def _addressable_shards_by_first_slice(x):
+    shards = getattr(x, 'addressable_shards', None)
+    if not shards:
+        arr = np.asarray(jax.device_get(x))
+        return {(0, int(arr.shape[0])): arr}
+
+    out = {}
+    full_len = int(x.shape[0])
+    for shard in shards:
+        slice_key = _first_slice_key_from_index(shard.index, full_len)
+        if slice_key not in out:
+            out[slice_key] = np.asarray(jax.device_get(shard.data))
+    return out
+
+
+def _split_full_op_key_for_model_axis(op_key, mesh_model):
+    arr = np.asarray(jax.device_get(op_key), dtype=np.float32)
+    mesh_model = int(mesh_model)
+    if mesh_model <= 0:
+        raise ValueError(f"mesh_model must be > 0, got {mesh_model}")
+    if arr.shape[0] % mesh_model != 0:
+        raise ValueError(
+            f"operator pool size {arr.shape[0]} must be divisible by "
+            f"mesh_model={mesh_model} for shard-local initial repack.")
+    shard_n = arr.shape[0] // mesh_model
+    return {
+        (i * shard_n, (i + 1) * shard_n): arr[i * shard_n:(i + 1) * shard_n]
+        for i in range(mesh_model)
+    }
+
+
+def _repack_host_array_by_model_slices(leaf, perms_by_slice):
+    arr = np.asarray(jax.device_get(leaf))
+    out = np.array(arr, copy=True)
+    for (start, stop), perm in sorted(perms_by_slice.items()):
+        if stop > out.shape[0]:
+            raise ValueError(
+                f"repack slice {(start, stop)} exceeds leaf shape {out.shape}")
+        if (stop - start) != int(perm.shape[0]):
+            raise ValueError(
+                f"repack perm length {perm.shape[0]} does not match slice "
+                f"{(start, stop)}")
+        out[start:stop] = arr[start:stop][perm]
+    return jnp.asarray(out, dtype=getattr(leaf, 'dtype', None))
+
+
+def _repack_jax_array_by_addressable_shards(leaf, perms_by_slice):
+    shards = getattr(leaf, 'addressable_shards', None)
+    if not shards:
+        return _repack_host_array_by_model_slices(leaf, perms_by_slice)
+
+    full_len = int(leaf.shape[0])
+    local_data = {}
+    for shard in shards:
+        slice_key = _first_slice_key_from_index(shard.index, full_len)
+        perm = perms_by_slice[slice_key]
+        data = np.asarray(jax.device_get(shard.data))
+        if data.shape[0] != int(perm.shape[0]):
+            raise ValueError(
+                f"local shard shape {data.shape} does not match perm "
+                f"length {perm.shape[0]}")
+        local_data[_normalize_index_key(shard.index, leaf.shape)] = np.take(
+            data, perm, axis=0)
+
+    def _callback(index):
+        key = _normalize_index_key(index, leaf.shape)
+        if key not in local_data:
+            raise RuntimeError(
+                f"repack callback requested non-addressable shard {key}")
+        return local_data[key]
+
+    out = jax.make_array_from_callback(leaf.shape, leaf.sharding, _callback)
+    if out.shape != leaf.shape or out.dtype != leaf.dtype:
+        raise RuntimeError(
+            f"repack changed leaf metadata from {leaf.shape}/{leaf.dtype} "
+            f"to {out.shape}/{out.dtype}")
+    if str(getattr(out, 'sharding', None)) != str(getattr(leaf, 'sharding', None)):
+        raise RuntimeError("repack changed a leaf sharding")
+    return out
+
+
+def _repack_leaf_by_perms(leaf, perms_by_slice):
+    shape = getattr(leaf, 'shape', None)
+    if shape is None or len(shape) < 1:
+        return leaf
+
+    shards = getattr(leaf, 'addressable_shards', None)
+    if shards:
+        full_len = int(shape[0])
+        local_slice_keys = {
+            _first_slice_key_from_index(shard.index, full_len)
+            for shard in shards
+        }
+        if local_slice_keys and all(
+                key in perms_by_slice for key in local_slice_keys):
+            return _repack_jax_array_by_addressable_shards(
+                leaf, perms_by_slice)
+        sharding_name = type(getattr(leaf, 'sharding', None)).__name__
+        if sharding_name != 'SingleDeviceSharding':
+            raise RuntimeError(
+                "missing local operator permutation for a sharded leaf; "
+                f"available={sorted(perms_by_slice)} "
+                f"leaf_slices={sorted(local_slice_keys)}")
+
+    return _repack_host_array_by_model_slices(leaf, perms_by_slice)
+
+
+def _apply_pool_permutation_to_params(params, pool_name, perms_by_slice, cfg):
+    def _apply(path, leaf):
+        path_str = _tree_path_to_str(path)
+        if _operator_repack_pool_for_leaf(path_str, leaf, cfg) == pool_name:
+            return _repack_leaf_by_perms(leaf, perms_by_slice)
+        return leaf
+
+    return jax.tree.map_with_path(_apply, params)
+
+
+def _apply_pool_permutation_to_opt_state(opt_state, pool_name, perms_by_slice,
+                                         cfg):
+    def _apply(path, leaf):
+        path_str = _tree_path_to_str(path)
+        if _operator_repack_pool_for_leaf(path_str, leaf, cfg) == pool_name:
+            return _repack_leaf_by_perms(leaf, perms_by_slice)
+        return leaf
+
+    return jax.tree.map_with_path(_apply, opt_state)
+
+
+def _current_pool_operator_keys_host_or_local(params, cfg):
+    version = cfg.get('model', {}).get('model_version', OFFICIAL_MODEL_VERSION)
+    pool_operator_keys = _pool_operator_keys_for_version(version)
+    return jax.jit(pool_operator_keys)(params['neuron_pool'])
+
+
+def _physical_spherical_repack_operator_pages(params, opt_state, cfg, mesh=None,
+                                              step=0, reason='periodic',
+                                              mesh_model=None):
+    del mesh
+    if not _is_v4168_repack_enabled(cfg):
+        return params, opt_state, None
+
+    interval = _operator_page_repack_interval(cfg)
+    t0 = time.time()
+    pool_keys = _current_pool_operator_keys_host_or_local(params, cfg)
+    jax.block_until_ready(jax.tree.leaves(pool_keys))
+
+    use_full_slices = opt_state is None
+    if mesh_model is None:
+        mesh_model = int(cfg.get('training', {}).get('mesh_model', 1))
+
+    pool_perms = {}
+    summary = {
+        'type': 'operator_page_repack',
+        'step': int(step),
+        'reason': str(reason),
+        'operator_page_repack_interval': int(interval),
+        'physical': True,
+        'shard_local': True,
+        'process_index': int(jax.process_index()),
+    }
+
+    for pool, spec in V4168_REPACK_POOL_SPECS.items():
+        page_size = int(_operator_page_cfg_get(
+            cfg, spec['page_size_key'], 128))
+        op_key = pool_keys[spec['op_key']]
+        if use_full_slices:
+            op_key_shards = _split_full_op_key_for_model_axis(
+                op_key, mesh_model)
+        else:
+            op_key_shards = _addressable_shards_by_first_slice(op_key)
+        perms_by_slice, pool_stats = _compute_pool_repack_perms_and_stats(
+            pool, op_key_shards, page_size)
+        pool_perms[pool] = perms_by_slice
+        summary.update(pool_stats)
+
+    for pool, perms_by_slice in pool_perms.items():
+        params = _apply_pool_permutation_to_params(
+            params, pool, perms_by_slice, cfg)
+        if opt_state is not None:
+            before_count = _maybe_get_opt_state_count(opt_state)
+            opt_state = _apply_pool_permutation_to_opt_state(
+                opt_state, pool, perms_by_slice, cfg)
+            after_count = _maybe_get_opt_state_count(opt_state)
+            if (before_count is not None and after_count is not None
+                    and before_count != after_count):
+                raise RuntimeError(
+                    "operator page repack changed optimizer step count "
+                    f"from {before_count} to {after_count}")
+
+    summary['duration_sec'] = float(time.time() - t0)
+    return params, opt_state, summary
+
+
+def _emit_operator_page_repack_summary(summary, use_loggers=False):
+    if not summary or jax.process_index() != 0:
+        return
+
+    def _line(msg):
+        if use_loggers:
+            log_message(msg)
+        else:
+            print(msg, flush=True)
+
+    _line(
+        "v4168_page_repack: "
+        f"step={summary['step']} reason={summary['reason']} "
+        f"interval={summary['operator_page_repack_interval']} "
+        f"duration={summary.get('duration_sec', 0.0):.3f}s")
+    for pool in ('qk', 'v', 'rst'):
+        changed = summary.get(f'{pool}_perm_changed_frac', 0.0) * 100.0
+        before_mean = summary.get(f'{pool}_compact_cos_mean_before', 0.0)
+        after_mean = summary.get(f'{pool}_compact_cos_mean_after', 0.0)
+        before_p05 = summary.get(f'{pool}_compact_cos_p05_before', 0.0)
+        after_p05 = summary.get(f'{pool}_compact_cos_p05_after', 0.0)
+        _line(
+            f"  {pool}: changed={changed:.2f}% "
+            f"compact_mean={before_mean:.4f}->{after_mean:.4f} "
+            f"compact_p05={before_p05:.4f}->{after_p05:.4f} "
+            f"pages={summary.get(f'{pool}_page_count', 0)} "
+            f"page_size={summary.get(f'{pool}_page_size', 0)}")
+    if use_loggers:
+        log_jsonl(summary)
 
 
 def _score_route_values(sampled, route):
@@ -9198,7 +9766,8 @@ def _print_cb1a_regular_block(rec):
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4164 = _is_active_srw_version(ctx.get('model_version'))
-    is_v4167 = str(ctx.get('model_version')) == V4167_MODEL_VERSION
+    is_operator_page_version = _is_operator_page_srw_version(
+        ctx.get('model_version'))
     is_v4166 = _is_rw_key_srw_version(ctx.get('model_version'))
     is_official_soft_direct_tau = _is_active_srw_version(ctx.get('model_version'))
     official_soft_sparsity_compact = False
@@ -9352,7 +9921,7 @@ def _print_regular_block(rec, ctx):
                 f"qk={_lp('qk', 'eff')} "
                 f"v={_lp('v', 'eff')} "
                 f"rst={_lp('rst', 'eff')}")
-            if is_v4167:
+            if is_operator_page_version:
                 def _page_part(label, prefix):
                     return (
                         f"{label}[en={_g(prefix + '_pages_enabled'):.0f}"
@@ -11507,7 +12076,7 @@ def main():
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
     cfg.setdefault('training', {}).update(training_config)
-    _materialize_v4167_page_config(cfg)
+    _materialize_operator_page_config(cfg)
 
     # ----------------------------------------------------------
     # Detect devices (multi-host aware)
@@ -11637,6 +12206,28 @@ def main():
         print(f"\nModel parameters: {n_params:,}")
         for line in model.get_model_info():
             print(line)
+
+    _has_resume_checkpoint = resume_step is not None
+    operator_page_initial_repack_summary = None
+    if _is_v4168_repack_enabled(cfg) and not _has_resume_checkpoint:
+        _initial_repack_context = {
+            'step': 0,
+            'reason': 'initial',
+            'model_version': model_version_cfg,
+            'interval': _operator_page_repack_interval(cfg),
+        }
+        _strict_multihost_barrier(
+            "before_v4168_page_repack:0",
+            context=_initial_repack_context)
+        params, _, operator_page_initial_repack_summary = (
+            _physical_spherical_repack_operator_pages(
+                params, None, cfg, step=0, reason='initial',
+                mesh_model=int(cfg['training'].get('mesh_model', 1))))
+        _emit_operator_page_repack_summary(
+            operator_page_initial_repack_summary, use_loggers=False)
+        _strict_multihost_barrier(
+            "after_v4168_page_repack:0",
+            context=_initial_repack_context)
 
     rank = cfg['model'].get('rank', 64)
     knowledge_rank = cfg['model'].get('knowledge_rank', 128)
@@ -11859,7 +12450,7 @@ def main():
         if _is_rw_key_srw_version(model_version_cfg):
             print("  RW-key operator path: live-gradient RW keys, "
                   "RW-matched operator queries")
-        if model_version_cfg == V4167_MODEL_VERSION:
+        if _is_operator_page_srw_version(model_version_cfg):
             _page_bits = []
             for _pool in ('qk', 'v', 'rst'):
                 _pk = _operator_page_pool_kwargs(cfg, _pool)
@@ -11870,6 +12461,13 @@ def main():
                     f"fallback={_pk['operator_page_fallback_pages']} "
                     f"random={_pk['operator_page_random_pages']}]")
             print("  Global CEU operator pages: " + " ".join(_page_bits))
+        if model_version_cfg == V4168_MODEL_VERSION:
+            _repack_interval = _operator_page_repack_interval(cfg)
+            print(
+                "  v4168 spherical physical page repack: "
+                f"interval={_repack_interval} "
+                f"initial={str(_repack_interval > 0 and not _has_resume_checkpoint).lower()} "
+                "physical=true shard_local=true")
         print("  Tau parameterization: bounded sigmoid min/max")
         print("  tau = -1 + 2 * sigmoid(raw_tau)")
         print("  Boundary admission: one-sided generalized Gaussian")
@@ -12466,12 +13064,12 @@ def main():
 
         def _srw_pool_kwargs(pool):
             kwargs = dict(_srw_base_kwargs)
-            if model_version_cfg == V4167_MODEL_VERSION:
+            if _is_operator_page_srw_version(model_version_cfg):
                 kwargs.update(_operator_page_pool_kwargs(cfg, pool))
             return kwargs
 
         _page_table_builders = {}
-        if (model_version_cfg == V4167_MODEL_VERSION
+        if (_is_operator_page_srw_version(model_version_cfg)
                 and make_sharded_operator_page_tables is not None):
             for _pool, _builder_key in (
                     ('qk', 'attn_qk_page_tables'),
@@ -12732,7 +13330,7 @@ def main():
     # No current-train-batch diagnostic forward.
     _page_geom_kwargs = {}
     if not is_baseline:
-        _page_geom_active = model_version_cfg == V4167_MODEL_VERSION
+        _page_geom_active = _is_operator_page_srw_version(model_version_cfg)
         _page_cfg_qk = _operator_page_pool_kwargs(cfg, 'qk')
         _page_cfg_v = _operator_page_pool_kwargs(cfg, 'v')
         _page_cfg_rst = _operator_page_pool_kwargs(cfg, 'rst')
@@ -13383,7 +13981,7 @@ def main():
         if _is_rw_key_srw_version(model_version_cfg):
             log_message("RW-key operator path: live-gradient RW keys, "
                         "RW-matched operator queries")
-        if model_version_cfg == V4167_MODEL_VERSION:
+        if _is_operator_page_srw_version(model_version_cfg):
             page_summary = []
             for pool in ('qk', 'v', 'rst'):
                 pk = _operator_page_pool_kwargs(cfg, pool)
@@ -13394,12 +13992,22 @@ def main():
                     f"fallback={pk['operator_page_fallback_pages']} "
                     f"random={pk['operator_page_random_pages']}]")
             log_message("Global CEU operator pages: " + " ".join(page_summary))
+        if model_version_cfg == V4168_MODEL_VERSION:
+            repack_interval = _operator_page_repack_interval(cfg)
+            log_message(
+                "v4168 spherical physical page repack: "
+                f"interval={repack_interval} "
+                f"initial={str(repack_interval > 0 and not _has_resume_checkpoint).lower()} "
+                "physical=true shard_local=true")
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
         log_message(f"Total steps: {total_steps}")
         if tau_init_summary is not None:
             log_jsonl(tau_init_summary)
         if selection_calibration_summary is not None:
             log_jsonl(selection_calibration_summary)
+        if operator_page_initial_repack_summary is not None:
+            _emit_operator_page_repack_summary(
+                operator_page_initial_repack_summary, use_loggers=True)
         log_message(
             "Resume log append policy: "
             f"training={training_log_append_on_resume}")
@@ -13571,6 +14179,33 @@ def main():
 
             global_step += 1
             epoch_step_counter += 1
+
+            _repack_interval = _operator_page_repack_interval(cfg)
+            if (model_version_cfg == V4168_MODEL_VERSION
+                    and _repack_interval > 0
+                    and global_step > 0
+                    and global_step % _repack_interval == 0):
+                _repack_context = {
+                    'step': int(global_step),
+                    'reason': 'periodic',
+                    'model_version': model_version_cfg,
+                    'interval': int(_repack_interval),
+                }
+                _strict_multihost_barrier(
+                    f"before_v4168_page_repack:{global_step}",
+                    context=_repack_context)
+                params, opt_state, _repack_summary = (
+                    _physical_spherical_repack_operator_pages(
+                        params, opt_state, cfg, mesh=mesh,
+                        step=global_step, reason='periodic',
+                        mesh_model=mesh_model))
+                if drift_diagnostics_enabled:
+                    _prev_op_key_snap = _drift_snap(params)
+                _emit_operator_page_repack_summary(
+                    _repack_summary, use_loggers=True)
+                _strict_multihost_barrier(
+                    f"after_v4168_page_repack:{global_step}",
+                    context=_repack_context)
 
             # ---- REGULAR periodic logging ----
             # ANALYSIS is driven from the val path (below), not from here -
