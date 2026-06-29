@@ -1266,7 +1266,103 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
     score_kwargs = {
         'max_tokens': int(max_tokens),
     }
+    if version == V4167_MODEL_VERSION:
+        score_kwargs.update({
+            'operator_pages_enabled': _operator_page_cfg_get(
+                cfg, 'operator_pages_enabled', True),
+            'operator_pages_pools': _operator_page_cfg_get(
+                cfg, 'operator_pages_pools', ('qk', 'v', 'rst')),
+            'operator_page_size_qk': int(_operator_page_cfg_get(
+                cfg, 'operator_page_size_qk', 128)),
+            'operator_page_size_v': int(_operator_page_cfg_get(
+                cfg, 'operator_page_size_v', 128)),
+            'operator_page_size_rst': int(_operator_page_cfg_get(
+                cfg, 'operator_page_size_rst', 128)),
+            'operator_page_capacity_qk': int(_operator_page_cfg_get(
+                cfg, 'operator_page_capacity_qk', 8)),
+            'operator_page_capacity_v': int(_operator_page_cfg_get(
+                cfg, 'operator_page_capacity_v', 8)),
+            'operator_page_capacity_rst': int(_operator_page_cfg_get(
+                cfg, 'operator_page_capacity_rst', 32)),
+            'operator_page_microgroup_sequences': int(_operator_page_cfg_get(
+                cfg, 'operator_page_microgroup_sequences', 2)),
+            'operator_page_score_mode': str(_operator_page_cfg_get(
+                cfg, 'operator_page_score_mode', 'maxmean')),
+            'operator_page_fallback_pages': int(_operator_page_cfg_get(
+                cfg, 'operator_page_fallback_pages', 0)),
+            'operator_page_random_pages': int(_operator_page_cfg_get(
+                cfg, 'operator_page_random_pages', 0)),
+        })
     return version, score_impl, score_params, score_kwargs
+
+
+def _score_route_values(sampled, route):
+    values = np.asarray(sampled[route], dtype=np.float32).reshape(-1)
+    mask_key = f'{route}_valid_mask'
+    if mask_key in sampled:
+        mask = np.asarray(sampled[mask_key], dtype=bool).reshape(-1)
+        values = values[mask]
+    return values
+
+
+def _score_route_meta(sampled, route, values):
+    def _scalar(name, default):
+        key = f'{route}_{name}'
+        if key not in sampled:
+            return float(default)
+        try:
+            value = np.asarray(sampled[key]).reshape(-1)[0]
+            return float(value)
+        except Exception:
+            return float(default)
+
+    full_default = 1.0
+    if route in sampled and np.asarray(sampled[route]).ndim > 0:
+        full_default = float(np.asarray(sampled[route]).shape[-1])
+    full_pool_size = _scalar('full_pool_size', full_default)
+    candidate_valid_count = _scalar(
+        'candidate_valid_count', full_pool_size)
+    candidate_count = _scalar('candidate_count', full_pool_size)
+    pages_enabled = _scalar('pages_enabled', 0.0) > 0.5
+    candidate_frac = (
+        candidate_valid_count / max(full_pool_size, 1.0)
+        if pages_enabled else 1.0)
+    return {
+        'pages_enabled': bool(pages_enabled),
+        'candidate_valid_count': float(candidate_valid_count),
+        'candidate_count': float(candidate_count),
+        'full_pool_size': float(full_pool_size),
+        'candidate_frac': float(candidate_frac),
+        'sample_count': int(values.size),
+    }
+
+
+def _pool_score_page_stats(route_stats):
+    q_meta = route_stats['q']
+    k_meta = route_stats['k']
+    qk_group = {
+        'pages_enabled': bool(
+            q_meta['pages_enabled'] or k_meta['pages_enabled']),
+        'candidate_valid_count': 0.5 * (
+            q_meta['candidate_valid_count']
+            + k_meta['candidate_valid_count']),
+        'candidate_count': 0.5 * (
+            q_meta['candidate_count'] + k_meta['candidate_count']),
+        'full_pool_size': max(
+            q_meta['full_pool_size'], k_meta['full_pool_size']),
+    }
+    qk_group['candidate_frac'] = (
+        qk_group['candidate_valid_count']
+        / max(qk_group['full_pool_size'], 1.0)
+        if qk_group['pages_enabled'] else 1.0)
+    out = {
+        'q': q_meta,
+        'k': k_meta,
+        'qk': qk_group,
+        'v': route_stats['v'],
+        'rst': route_stats['rst'],
+    }
+    return out
 
 
 def _sample_srw_selection_scores(params, input_ids, cfg, max_tokens):
@@ -1277,54 +1373,135 @@ def _sample_srw_selection_scores(params, input_ids, cfg, max_tokens):
     score_out = score_fn(score_params, input_ids)
     sampled = jax.device_get(score_out)
     scores = {
-        name: np.asarray(value, dtype=np.float32).reshape(-1)
-        for name, value in sampled.items()
+        name: _score_route_values(sampled, name)
+        for name in ('q', 'k', 'v', 'rst')
     }
     scores['qk'] = np.concatenate((scores['q'], scores['k']))
-    return scores, sampled
+    route_stats = {
+        name: _score_route_meta(sampled, name, scores[name])
+        for name in ('q', 'k', 'v', 'rst')
+    }
+    return scores, sampled, _pool_score_page_stats(route_stats)
+
+
+def _local_target_from_pool_target(target_pool, candidate_frac,
+                                   pages_enabled):
+    target_pool = float(target_pool)
+    candidate_frac = float(candidate_frac)
+    if not pages_enabled:
+        return float(np.clip(target_pool, 1.0e-4, 0.95))
+    return float(np.clip(
+        target_pool / max(candidate_frac, 1.0e-8), 1.0e-4, 0.95))
+
+
+def _score_distribution_stats(values):
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size <= 0:
+        raise ValueError("tau calibration score sample is empty.")
+    return {
+        'rho_cand_mean': float(np.mean(values)),
+        'rho_cand_std': float(np.std(values)),
+        'rho_cand_p50': float(np.quantile(values, 0.50)),
+        'rho_cand_p90': float(np.quantile(values, 0.90)),
+        'rho_cand_p99': float(np.quantile(values, 0.99)),
+    }
+
+
+def _tau_calibration_diag(pool, scores, pool_stats, target_pool,
+                          target_local, tau):
+    stats = _score_distribution_stats(scores)
+    meta = dict(pool_stats)
+    return {
+        'pool': pool,
+        'target_pool': float(target_pool),
+        'candidate_frac': float(meta.get('candidate_frac', 1.0)),
+        'target_local': float(target_local),
+        'tau': float(tau),
+        'candidate_count': float(meta.get('candidate_count', 0.0)),
+        'valid_candidate_count': float(
+            meta.get('candidate_valid_count', 0.0)),
+        'full_pool_size': float(meta.get('full_pool_size', 0.0)),
+        'pages_enabled': bool(meta.get('pages_enabled', False)),
+        **stats,
+    }
 
 
 def _compute_srw_quantile_tau_init(params, input_ids, cfg,
                                    tau_init_cfg):
     """Compute host-side quantiles from a small deterministic score sample."""
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
-    scores, sampled = _sample_srw_selection_scores(
+    del version
+    scores, sampled, page_stats = _sample_srw_selection_scores(
         params, input_ids, cfg, tau_init_cfg['calibration_tokens'])
 
     tau = {}
     estimated_active = {}
+    estimated_active_local = {}
+    estimated_active_pool = {}
+    target_local = {}
+    tau_calibration = {}
     for pool in ('qk', 'v', 'rst'):
         target = tau_init_cfg['targets'][pool]
-        quantile_tau = _array_quantile(scores[pool], 1.0 - target)
+        meta = page_stats[pool]
+        local_target = _local_target_from_pool_target(
+            target, meta.get('candidate_frac', 1.0),
+            bool(meta.get('pages_enabled', False)))
+        quantile_tau = _array_quantile(scores[pool], 1.0 - local_target)
         quantile_tau = float(np.clip(
             quantile_tau, tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
         tau[pool] = quantile_tau
-        estimated_active[pool] = float(np.mean(scores[pool] > quantile_tau))
+        target_local[pool] = local_target
+        active_local = float(np.mean(scores[pool] > quantile_tau))
+        active_pool = active_local * float(meta.get('candidate_frac', 1.0))
+        estimated_active_local[pool] = active_local
+        estimated_active_pool[pool] = active_pool
+        estimated_active[pool] = active_pool
+        tau_calibration[pool] = _tau_calibration_diag(
+            pool, scores[pool], meta, target, local_target, quantile_tau)
 
     return {
         'type': 'tau_init',
         'tau_init_mode': 'quantile_frac',
         'tau_init_target_frac': dict(tau_init_cfg['targets']),
+        'tau_init_target_local_frac': target_local,
         'tau_init_quantile_tau': tau,
         'tau_init_est_active': estimated_active,
+        'tau_init_est_active_local': estimated_active_local,
+        'tau_init_est_active_pool': estimated_active_pool,
         'tau_init_target_qk_frac': tau_init_cfg['targets']['qk'],
         'tau_init_target_v_frac': tau_init_cfg['targets']['v'],
         'tau_init_target_rst_frac': tau_init_cfg['targets']['rst'],
+        'tau_init_target_local_qk_frac': target_local['qk'],
+        'tau_init_target_local_v_frac': target_local['v'],
+        'tau_init_target_local_rst_frac': target_local['rst'],
         'tau_init_quantile_tau_qk': tau['qk'],
         'tau_init_quantile_tau_v': tau['v'],
         'tau_init_quantile_tau_rst': tau['rst'],
-        'tau_init_est_active_qk': estimated_active['qk'],
-        'tau_init_est_active_v': estimated_active['v'],
-        'tau_init_est_active_rst': estimated_active['rst'],
-        'tau_init_est_active_q': float(np.mean(scores['q'] > tau['qk'])),
-        'tau_init_est_active_k': float(np.mean(scores['k'] > tau['qk'])),
+        'tau_init_est_active_qk': estimated_active_pool['qk'],
+        'tau_init_est_active_v': estimated_active_pool['v'],
+        'tau_init_est_active_rst': estimated_active_pool['rst'],
+        'tau_init_est_active_local_qk': estimated_active_local['qk'],
+        'tau_init_est_active_local_v': estimated_active_local['v'],
+        'tau_init_est_active_local_rst': estimated_active_local['rst'],
+        'tau_init_est_active_q': (
+            float(np.mean(scores['q'] > tau['qk']))
+            * float(page_stats['q'].get('candidate_frac', 1.0))),
+        'tau_init_est_active_k': (
+            float(np.mean(scores['k'] > tau['qk']))
+            * float(page_stats['k'].get('candidate_frac', 1.0))),
+        'tau_init_est_active_local_q': float(
+            np.mean(scores['q'] > tau['qk'])),
+        'tau_init_est_active_local_k': float(
+            np.mean(scores['k'] > tau['qk'])),
+        'tau_calibration': tau_calibration,
         'tau_init_calibration': {
             'batch': 'first_train_batch_host0',
             'token_sampling': 'evenly_spaced_flat',
-            'tokens': int(sampled['q'].shape[0]),
-            'neurons_qk': int(sampled['q'].shape[1]),
-            'neurons_v': int(sampled['v'].shape[1]),
-            'neurons_rst': int(sampled['rst'].shape[1]),
+            'tokens': int(np.asarray(sampled.get(
+                'tokens', np.asarray(sampled['q']).shape[0]))),
+            'neurons_qk': int(page_stats['qk']['full_pool_size']),
+            'neurons_v': int(page_stats['v']['full_pool_size']),
+            'neurons_rst': int(page_stats['rst']['full_pool_size']),
         },
     }
 
@@ -1557,6 +1734,21 @@ def _histogram_quantile(counts, score_min, score_max, q):
     return float(score_min + (idx + 0.5) * bin_width)
 
 
+SELECTION_CALIBRATION_SCORE_ROUTES = ('q', 'k', 'v', 'rst')
+SELECTION_CALIBRATION_PAGE_STAT_FIELDS = (
+    'candidate_valid_count_weighted_sum',
+    'candidate_count_weighted_sum',
+    'candidate_group_count',
+    'full_pool_size',
+    'pages_enabled',
+)
+SELECTION_CALIBRATION_PAGE_STAT_KEYS = tuple(
+    f'{route}_{field}'
+    for route in SELECTION_CALIBRATION_SCORE_ROUTES
+    for field in SELECTION_CALIBRATION_PAGE_STAT_FIELDS
+)
+
+
 def _make_selection_calibration_histogram_fn(
         score_impl, score_kwargs, histogram_bins, score_min, score_max):
     """Create a jitted per-batch histogram function returning counts only."""
@@ -1564,26 +1756,73 @@ def _make_selection_calibration_histogram_fn(
     score_min = float(score_min)
     score_max = float(score_max)
 
-    def _hist_counts(x):
+    def _hist_counts(x, valid_mask=None):
         x = jnp.ravel(jnp.asarray(x, dtype=jnp.float32))
+        if valid_mask is None:
+            valid = jnp.ones_like(x, dtype=jnp.bool_)
+        else:
+            valid = jnp.ravel(jnp.asarray(valid_mask, dtype=jnp.bool_))
         x = jnp.clip(x, score_min, score_max)
+        x = jnp.where(valid, x, jnp.float32(score_min))
 
         scale = float(histogram_bins) / float(score_max - score_min)
         idx = jnp.floor((x - float(score_min)) * scale).astype(jnp.int32)
         idx = jnp.clip(idx, 0, int(histogram_bins) - 1)
 
         return jnp.bincount(
-            idx, length=int(histogram_bins)).astype(jnp.int32)
+            idx,
+            weights=valid.astype(jnp.int32),
+            length=int(histogram_bins)).astype(jnp.int32)
 
     def _hist_fn(score_params, input_ids):
         score_tensors = score_impl(score_params, input_ids, **score_kwargs)
-        q_counts = _hist_counts(score_tensors['q'])
-        k_counts = _hist_counts(score_tensors['k'])
+        q_counts = _hist_counts(
+            score_tensors['q'], score_tensors.get('q_valid_mask', None))
+        k_counts = _hist_counts(
+            score_tensors['k'], score_tensors.get('k_valid_mask', None))
+        page_stats = {}
+        for route in SELECTION_CALIBRATION_SCORE_ROUTES:
+            values = score_tensors[route]
+            full_pool_size = jnp.asarray(
+                score_tensors.get(
+                    f'{route}_full_pool_size',
+                    jnp.float32(values.shape[-1])),
+                dtype=jnp.float32)
+            candidate_valid_count = jnp.asarray(
+                score_tensors.get(
+                    f'{route}_candidate_valid_count', full_pool_size),
+                dtype=jnp.float32)
+            candidate_count = jnp.asarray(
+                score_tensors.get(
+                    f'{route}_candidate_count', full_pool_size),
+                dtype=jnp.float32)
+            candidate_group_count = jnp.asarray(
+                score_tensors.get(
+                    f'{route}_candidate_group_count', jnp.float32(1.0)),
+                dtype=jnp.float32)
+            pages_enabled = jnp.asarray(
+                score_tensors.get(
+                    f'{route}_pages_enabled', jnp.float32(0.0)),
+                dtype=jnp.float32)
+            page_stats[
+                f'{route}_candidate_valid_count_weighted_sum'] = (
+                    candidate_valid_count * candidate_group_count)
+            page_stats[f'{route}_candidate_count_weighted_sum'] = (
+                candidate_count * candidate_group_count)
+            page_stats[f'{route}_candidate_group_count'] = (
+                candidate_group_count)
+            page_stats[f'{route}_full_pool_size'] = full_pool_size
+            page_stats[f'{route}_pages_enabled'] = pages_enabled
         return {
             'qk': q_counts + k_counts,
-            'v': _hist_counts(score_tensors['v']),
-            'rst': _hist_counts(score_tensors['rst']),
-        }, jnp.asarray(score_tensors['q'].shape[0], dtype=jnp.int32)
+            'v': _hist_counts(
+                score_tensors['v'], score_tensors.get('v_valid_mask', None)),
+            'rst': _hist_counts(
+                score_tensors['rst'],
+                score_tensors.get('rst_valid_mask', None)),
+        }, jnp.asarray(
+            score_tensors.get('tokens', score_tensors['q'].shape[0]),
+            dtype=jnp.int32), page_stats
 
     return jax.jit(_hist_fn)
 
@@ -1634,6 +1873,9 @@ def _collect_selection_calibration_histograms(
             selection_calibration_cfg['histogram_bins'], dtype=np.int64)
         for pool in POOL_SCHEDULE_NAMES
     }
+    page_stats = {
+        key: 0.0 for key in SELECTION_CALIBRATION_PAGE_STAT_KEYS
+    }
     seen_tokens = 0
     actual_batches = 0
     if jax.process_index() == 0:
@@ -1661,12 +1903,19 @@ def _collect_selection_calibration_histograms(
             if seen_tokens >= local_calibration_tokens:
                 break
             row_end = min(row_start + row_chunk, batch_rows)
-            batch_counts, token_count = hist_fn(
+            batch_counts, token_count, batch_page_stats = hist_fn(
                 score_params, input_ids[row_start:row_end])
             host_counts = jax.device_get(batch_counts)
             for pool in POOL_SCHEDULE_NAMES:
                 counts[pool] += np.asarray(
                     host_counts[pool], dtype=np.int64)
+            host_page_stats = jax.device_get(batch_page_stats)
+            for key in SELECTION_CALIBRATION_PAGE_STAT_KEYS:
+                value = float(host_page_stats.get(key, 0.0))
+                if key.endswith('_full_pool_size') or key.endswith('_pages_enabled'):
+                    page_stats[key] = max(page_stats[key], value)
+                else:
+                    page_stats[key] += value
             seen_tokens += int(jax.device_get(token_count))
             batch_processed = True
         if not batch_processed:
@@ -1690,6 +1939,7 @@ def _collect_selection_calibration_histograms(
             "selection_calibration requires at least one training batch.")
     return (
         counts,
+        page_stats,
         seen_tokens,
         actual_batches,
         local_calibration_tokens,
@@ -1698,10 +1948,16 @@ def _collect_selection_calibration_histograms(
 
 
 def _aggregate_selection_calibration_histograms(
-        local_counts, local_seen_tokens, local_actual_batches):
+        local_counts, local_page_stats, local_seen_tokens,
+        local_actual_batches):
     """Aggregate per-host histogram counts for multi-host calibration."""
     if jax.process_count() <= 1:
-        return local_counts, int(local_seen_tokens), int(local_actual_batches)
+        return (
+            local_counts,
+            dict(local_page_stats),
+            int(local_seen_tokens),
+            int(local_actual_batches),
+        )
 
     local_stack = np.stack(
         [local_counts[pool] for pool in POOL_SCHEDULE_NAMES],
@@ -1719,15 +1975,102 @@ def _aggregate_selection_calibration_histograms(
         pool: global_stack[idx]
         for idx, pool in enumerate(POOL_SCHEDULE_NAMES)
     }
+    local_page_vec = np.asarray(
+        [float(local_page_stats.get(key, 0.0))
+         for key in SELECTION_CALIBRATION_PAGE_STAT_KEYS],
+        dtype=np.float64)
+    gathered_page_vec = np.asarray(process_allgather(local_page_vec))
+    gathered_page_vec = gathered_page_vec.reshape(
+        (jax.process_count(), local_page_vec.shape[0]))
+    global_page_stats = {}
+    for idx, key in enumerate(SELECTION_CALIBRATION_PAGE_STAT_KEYS):
+        if key.endswith('_full_pool_size') or key.endswith('_pages_enabled'):
+            global_page_stats[key] = float(np.max(gathered_page_vec[:, idx]))
+        else:
+            global_page_stats[key] = float(np.sum(gathered_page_vec[:, idx]))
     return (
         global_counts,
+        global_page_stats,
         int(np.sum(gathered_meta[:, 0], dtype=np.int64)),
         int(np.max(gathered_meta[:, 1])),
     )
 
 
+def _selection_calibration_pool_page_stats(page_stats):
+    page_stats = dict(page_stats or {})
+
+    def _route(route):
+        groups = float(page_stats.get(
+            f'{route}_candidate_group_count', 0.0))
+        full_pool_size = float(page_stats.get(
+            f'{route}_full_pool_size', 0.0))
+        pages_enabled = (
+            float(page_stats.get(f'{route}_pages_enabled', 0.0)) > 0.5)
+        if groups > 0.0:
+            valid_count = float(page_stats.get(
+                f'{route}_candidate_valid_count_weighted_sum', 0.0)) / groups
+            candidate_count = float(page_stats.get(
+                f'{route}_candidate_count_weighted_sum', 0.0)) / groups
+        else:
+            valid_count = full_pool_size
+            candidate_count = full_pool_size
+        candidate_frac = (
+            valid_count / max(full_pool_size, 1.0)
+            if pages_enabled else 1.0)
+        return {
+            'pages_enabled': bool(pages_enabled),
+            'candidate_valid_count': float(valid_count),
+            'candidate_count': float(candidate_count),
+            'full_pool_size': float(full_pool_size),
+            'candidate_frac': float(candidate_frac),
+        }
+
+    route = {name: _route(name) for name in SELECTION_CALIBRATION_SCORE_ROUTES}
+    q = route['q']
+    k = route['k']
+    qk = {
+        'pages_enabled': bool(q['pages_enabled'] or k['pages_enabled']),
+        'candidate_valid_count': 0.5 * (
+            q['candidate_valid_count'] + k['candidate_valid_count']),
+        'candidate_count': 0.5 * (
+            q['candidate_count'] + k['candidate_count']),
+        'full_pool_size': max(q['full_pool_size'], k['full_pool_size']),
+    }
+    qk['candidate_frac'] = (
+        qk['candidate_valid_count'] / max(qk['full_pool_size'], 1.0)
+        if qk['pages_enabled'] else 1.0)
+    return {
+        'qk': qk,
+        'v': route['v'],
+        'rst': route['rst'],
+    }
+
+
+def _histogram_distribution_stats(counts, score_min, score_max):
+    counts = np.asarray(counts, dtype=np.float64)
+    total = float(np.sum(counts))
+    if total <= 0.0:
+        raise ValueError("histogram stats require at least one count.")
+    bin_width = (float(score_max) - float(score_min)) / float(counts.size)
+    centers = (
+        float(score_min)
+        + (np.arange(counts.size, dtype=np.float64) + 0.5) * bin_width)
+    mean = float(np.sum(counts * centers) / total)
+    var = float(np.sum(counts * np.square(centers - mean)) / total)
+    return {
+        'rho_cand_mean': mean,
+        'rho_cand_std': float(np.sqrt(max(var, 0.0))),
+        'rho_cand_p50': _histogram_quantile(
+            counts, score_min, score_max, 0.50),
+        'rho_cand_p90': _histogram_quantile(
+            counts, score_min, score_max, 0.90),
+        'rho_cand_p99': _histogram_quantile(
+            counts, score_min, score_max, 0.99),
+    }
+
+
 def _compute_srw_selection_calibration(
-        histogram_counts, cfg, selection_calibration_cfg,
+        histogram_counts, cfg, selection_calibration_cfg, page_stats,
         seen_tokens, actual_batches, local_calibration_tokens,
         process_count):
     """Calibrate tau init and soft-gate candidate bands from histograms."""
@@ -1758,15 +2101,30 @@ def _compute_srw_selection_calibration(
     power_final = selection_calibration_cfg['boundary_power_final']
     scale_start = eps_scale ** (1.0 / power_start)
     scale_final = eps_scale ** (1.0 / power_final)
+    pool_page_stats = _selection_calibration_pool_page_stats(page_stats)
+    active_target_local = {}
+    candidate_start_local = {}
+    candidate_final_local = {}
+    tau_calibration = {}
     for pool in POOL_SCHEDULE_NAMES:
         counts = histogram_counts[pool]
+        meta = pool_page_stats[pool]
+        active_target_local[pool] = _local_target_from_pool_target(
+            active_target[pool], meta.get('candidate_frac', 1.0),
+            bool(meta.get('pages_enabled', False)))
+        candidate_start_local[pool] = _local_target_from_pool_target(
+            candidate_start[pool], meta.get('candidate_frac', 1.0),
+            bool(meta.get('pages_enabled', False)))
+        candidate_final_local[pool] = _local_target_from_pool_target(
+            candidate_final[pool], meta.get('candidate_frac', 1.0),
+            bool(meta.get('pages_enabled', False)))
         tau_raw = _histogram_quantile(
-            counts, score_min, score_max, 1.0 - active_target[pool])
+            counts, score_min, score_max, 1.0 - active_target_local[pool])
         tau_pool = float(np.clip(tau_raw, tau_min, tau_max))
         q_start_pool = _histogram_quantile(
-            counts, score_min, score_max, 1.0 - candidate_start[pool])
+            counts, score_min, score_max, 1.0 - candidate_start_local[pool])
         q_final_pool = _histogram_quantile(
-            counts, score_min, score_max, 1.0 - candidate_final[pool])
+            counts, score_min, score_max, 1.0 - candidate_final_local[pool])
         tau[pool] = tau_pool
         q_start[pool] = q_start_pool
         q_final[pool] = q_final_pool
@@ -1784,6 +2142,19 @@ def _compute_srw_selection_calibration(
         else:
             b_final[pool] = float(max(b_floor[pool], b_final_raw))
         b_final_set_by_floor[pool] = (b_final[pool] == float(b_floor[pool]))
+        tau_calibration[pool] = {
+            'pool': pool,
+            'target_pool': float(active_target[pool]),
+            'candidate_frac': float(meta.get('candidate_frac', 1.0)),
+            'target_local': float(active_target_local[pool]),
+            'tau': float(tau_pool),
+            'candidate_count': float(meta.get('candidate_count', 0.0)),
+            'valid_candidate_count': float(
+                meta.get('candidate_valid_count', 0.0)),
+            'full_pool_size': float(meta.get('full_pool_size', 0.0)),
+            'pages_enabled': bool(meta.get('pages_enabled', False)),
+            **_histogram_distribution_stats(counts, score_min, score_max),
+        }
 
     return {
         'type': 'selection_calibration',
@@ -1812,6 +2183,13 @@ def _compute_srw_selection_calibration(
         'selection_calibration_active_target': dict(active_target),
         'selection_calibration_candidate_target_start': dict(candidate_start),
         'selection_calibration_candidate_target_final': dict(candidate_final),
+        'selection_calibration_active_target_local':
+            dict(active_target_local),
+        'selection_calibration_candidate_target_start_local':
+            dict(candidate_start_local),
+        'selection_calibration_candidate_target_final_local':
+            dict(candidate_final_local),
+        'selection_calibration_page_candidate_stats': pool_page_stats,
         'selection_calibration_B_floor': dict(b_floor),
         'selection_calibration_tau': tau,
         'selection_calibration_q_start': q_start,
@@ -1830,6 +2208,7 @@ def _compute_srw_selection_calibration(
             float(selection_calibration_cfg['sharpen_end_frac']),
         'tau_init_mode': 'selection_calibration',
         'tau_init_quantile_tau': tau,
+        'tau_calibration': tau_calibration,
     }
 
 
@@ -2013,8 +2392,16 @@ def _require_selection_calibration_resume_fields(training_cfg):
 
 def _selection_calibration_summary_lines(summary):
     active = summary['selection_calibration_active_target']
+    active_local = summary.get(
+        'selection_calibration_active_target_local', active)
     candidate_start = summary['selection_calibration_candidate_target_start']
+    candidate_start_local = summary.get(
+        'selection_calibration_candidate_target_start_local',
+        candidate_start)
     candidate_final = summary['selection_calibration_candidate_target_final']
+    candidate_final_local = summary.get(
+        'selection_calibration_candidate_target_final_local',
+        candidate_final)
     tau = summary['selection_calibration_tau']
     b_start = summary['selection_calibration_B_start']
     b_final = summary['selection_calibration_B_final']
@@ -2026,7 +2413,7 @@ def _selection_calibration_summary_lines(summary):
     final_hard_close_any = any(
         bool(final_hard_close.get(pool, False))
         for pool in POOL_SCHEDULE_NAMES)
-    return [
+    lines = [
         "enabled=true",
         "policy=fresh_init_computes_resume_restores",
         "calibration_tokens_target_global="
@@ -2048,12 +2435,23 @@ def _selection_calibration_summary_lines(summary):
         "",
         "active_target["
         f"qk={active['qk']} v={active['v']} rst={active['rst']}]",
+        "active_target_local["
+        f"qk={active_local['qk']} v={active_local['v']} "
+        f"rst={active_local['rst']}]",
         "candidate_target_start["
         f"qk={candidate_start['qk']} v={candidate_start['v']} "
         f"rst={candidate_start['rst']}]",
+        "candidate_target_start_local["
+        f"qk={candidate_start_local['qk']} "
+        f"v={candidate_start_local['v']} "
+        f"rst={candidate_start_local['rst']}]",
         "candidate_target_final["
         f"qk={candidate_final['qk']} v={candidate_final['v']} "
         f"rst={candidate_final['rst']}]",
+        "candidate_target_final_local["
+        f"qk={candidate_final_local['qk']} "
+        f"v={candidate_final_local['v']} "
+        f"rst={candidate_final_local['rst']}]",
         "",
         "tau["
         f"qk={tau['qk']:.6f} v={tau['v']:.6f} "
@@ -2088,6 +2486,25 @@ def _selection_calibration_summary_lines(summary):
         "sharpen_end="
         f"{summary['selection_calibration_sharpen_end_frac']:.6f}]",
     ]
+    for pool in ('qk', 'v', 'rst'):
+        diag = summary.get('tau_calibration', {}).get(pool)
+        if diag:
+            lines.append(
+                "tau_calib: "
+                f"pool={pool} "
+                f"target_pool={diag['target_pool']:.6f} "
+                f"candidate_frac={diag['candidate_frac']:.6f} "
+                f"target_local={diag['target_local']:.6f} "
+                f"tau={diag['tau']:.6f} "
+                f"rho_cand_mean={diag['rho_cand_mean']:+.6f} "
+                f"rho_cand_std={diag['rho_cand_std']:.6f} "
+                f"rho_cand_p50={diag['rho_cand_p50']:+.6f} "
+                f"rho_cand_p90={diag['rho_cand_p90']:+.6f} "
+                f"rho_cand_p99={diag['rho_cand_p99']:+.6f} "
+                f"cand={diag['candidate_count']:.0f} "
+                f"valid={diag['valid_candidate_count']:.1f} "
+                f"full={diag['full_pool_size']:.0f}")
+    return lines
 
 
 def _set_srw_quantile_tau_biases(params, tau_summary, model_version=OFFICIAL_MODEL_VERSION):
@@ -2114,22 +2531,35 @@ def _set_srw_quantile_tau_biases(params, tau_summary, model_version=OFFICIAL_MOD
 
 def _v4164_tau_init_summary_lines(summary):
     targets = summary['tau_init_target_frac']
+    local_targets = summary.get('tau_init_target_local_frac', targets)
     tau = summary['tau_init_quantile_tau']
     active = summary['tau_init_est_active']
+    active_local = summary.get('tau_init_est_active_local', active)
     sample = summary['tau_init_calibration']
-    return [
+    lines = [
         "tau_init_mode=quantile_frac",
         "tau_init_target_frac["
         f"qk={targets['qk']:.3f} v={targets['v']:.3f} "
         f"rst={targets['rst']:.3f}]",
+        "tau_init_target_local_frac["
+        f"qk={local_targets['qk']:.6f} "
+        f"v={local_targets['v']:.6f} "
+        f"rst={local_targets['rst']:.6f}]",
         "tau_init_quantile_tau["
         f"qk={tau['qk']:.6f} v={tau['v']:.6f} rst={tau['rst']:.6f}]",
-        "tau_init_est_active["
+        "tau_init_est_active_pool["
         f"qk={active['qk']:.6f} v={active['v']:.6f} "
         f"rst={active['rst']:.6f}]",
+        "tau_init_est_active_local["
+        f"qk={active_local['qk']:.6f} "
+        f"v={active_local['v']:.6f} "
+        f"rst={active_local['rst']:.6f}]",
         "tau_init_est_active_qk_split["
         f"q={summary['tau_init_est_active_q']:.6f} "
         f"k={summary['tau_init_est_active_k']:.6f}]",
+        "tau_init_est_active_local_qk_split["
+        f"q={summary.get('tau_init_est_active_local_q', summary['tau_init_est_active_q']):.6f} "
+        f"k={summary.get('tau_init_est_active_local_k', summary['tau_init_est_active_k']):.6f}]",
         "tau_init_calibration_sample["
         f"batch={sample['batch']} token_sampling={sample['token_sampling']} "
         f"tokens={sample['tokens']} "
@@ -2137,6 +2567,25 @@ def _v4164_tau_init_summary_lines(summary):
         f"neurons_v={sample['neurons_v']} "
         f"neurons_rst={sample['neurons_rst']}]",
     ]
+    for pool in ('qk', 'v', 'rst'):
+        diag = summary.get('tau_calibration', {}).get(pool)
+        if diag:
+            lines.append(
+                "tau_calib: "
+                f"pool={pool} "
+                f"target_pool={diag['target_pool']:.6f} "
+                f"candidate_frac={diag['candidate_frac']:.6f} "
+                f"target_local={diag['target_local']:.6f} "
+                f"tau={diag['tau']:.6f} "
+                f"rho_cand_mean={diag['rho_cand_mean']:+.6f} "
+                f"rho_cand_std={diag['rho_cand_std']:.6f} "
+                f"rho_cand_p50={diag['rho_cand_p50']:+.6f} "
+                f"rho_cand_p90={diag['rho_cand_p90']:+.6f} "
+                f"rho_cand_p99={diag['rho_cand_p99']:+.6f} "
+                f"cand={diag['candidate_count']:.0f} "
+                f"valid={diag['valid_candidate_count']:.1f} "
+                f"full={diag['full_pool_size']:.0f}")
+    return lines
 
 
 # ============================================================
@@ -7392,6 +7841,85 @@ def _first_optional_rec_float(rec, keys):
     return None
 
 
+def _attach_page_aware_metrics(rec, ctx=None):
+    ctx = ctx or {}
+
+    def _g(key, default=0.0):
+        try:
+            return float(rec.get(key, default) or 0.0)
+        except Exception:
+            return float(default)
+
+    def _full_size(prefix, cfg_key):
+        valid = _g(f'{prefix}_candidate_valid_ops', 0.0)
+        frac = _g(f'{prefix}_candidate_valid_frac', 0.0)
+        if valid > 0.0 and frac > 0.0:
+            return valid / frac
+        return float(ctx.get(cfg_key, valid if valid > 0.0 else 1.0) or 1.0)
+
+    page_prefixes = {
+        'qk': ('attn_qk', 'n_qk_cfg'),
+        'v': ('attn_v', 'n_v_cfg'),
+        'rst': ('rst', 'n_rst_cfg'),
+    }
+    for label, (prefix, cfg_key) in page_prefixes.items():
+        full = max(_full_size(prefix, cfg_key), 1.0)
+        valid = _g(f'{prefix}_candidate_valid_ops', full)
+        if valid <= 0.0:
+            valid = full
+        cand = _g(f'{prefix}_candidate_ops', valid)
+        valid_frac = valid / full
+        rec[f'{label}_candidate_count'] = cand
+        rec[f'{label}_valid_candidate_count'] = valid
+        rec[f'{label}_full_pool_size'] = full
+        rec[f'{label}_candidate_valid_frac'] = valid_frac
+        rec[f'{prefix}_candidate_ops'] = cand
+        rec[f'{prefix}_candidate_valid_ops'] = valid
+        rec[f'{prefix}_candidate_valid_frac'] = valid_frac
+        rec[f'{prefix}_full_pool_size'] = full
+
+        admission = _g(f'{prefix}_admission_den_sum', _g(
+            f'{prefix}_gate_den_sum_mean', 0.0))
+        execution = _g(f'{prefix}_execution_mass_sum', _g(
+            f'{prefix}_gate_sum', 0.0))
+        eff = _g(f'{prefix}_execution_eff_n', _g(
+            f'{prefix}_gate_eff_n', 0.0))
+        for metric, value in (
+                ('admission', admission),
+                ('execution', execution),
+                ('eff', eff)):
+            local = value / max(valid, 1.0e-8)
+            pool = value / max(full, 1.0e-8)
+            rec[f'{label}_{metric}_local'] = local
+            rec[f'{label}_{metric}_pool'] = pool
+            rec[f'{prefix}_{metric}_local'] = local
+            rec[f'{prefix}_{metric}_pool'] = pool
+
+    active_specs = (
+        ('q', 'attn_q', 'attn_qk'),
+        ('k', 'attn_k', 'attn_qk'),
+        ('qk', 'attn_qk', 'attn_qk'),
+        ('v', 'attn_v', 'attn_v'),
+        ('rst', 'rst', 'rst'),
+    )
+    for label, metric_prefix, page_prefix in active_specs:
+        local = _optional_rec_float(rec, f'{metric_prefix}_active_tau_frac')
+        if local is None:
+            local = _optional_rec_float(rec, f'{label}_active_tau_frac')
+        if local is None:
+            continue
+        frac = _g(f'{page_prefix}_candidate_valid_frac', 1.0)
+        if frac <= 0.0:
+            frac = 1.0
+        pool = float(local) * max(frac, 0.0)
+        rec[f'{label}_active_local'] = float(local)
+        rec[f'{label}_active_pool'] = pool
+        rec[f'{metric_prefix}_active_local'] = float(local)
+        rec[f'{metric_prefix}_active_pool'] = pool
+
+    return rec
+
+
 def _active_tau_display_value(rec, active_tau_keys, active_key):
     value = _first_optional_rec_float(rec, active_tau_keys)
     fallback = _optional_rec_float(rec, active_key)
@@ -7404,6 +7932,22 @@ def _active_tau_display_value(rec, active_tau_keys, active_key):
 
 
 def _print_active_tau_regular_line(rec):
+    if any(f'{name}_active_local' in rec for name in ('q', 'k', 'qk', 'v', 'rst')):
+        log_message(
+            f"  active_local: q={_fmt_optional_pct(_optional_rec_float(rec, 'q_active_local'))}"
+            f" k={_fmt_optional_pct(_optional_rec_float(rec, 'k_active_local'))}"
+            f" qk={_fmt_optional_pct(_optional_rec_float(rec, 'qk_active_local'))}"
+            f" v={_fmt_optional_pct(_optional_rec_float(rec, 'v_active_local'))}"
+            f" rst={_fmt_optional_pct(_optional_rec_float(rec, 'rst_active_local'))}"
+        )
+        log_message(
+            f"  active_pool: q={_fmt_optional_pct(_optional_rec_float(rec, 'q_active_pool'))}"
+            f" k={_fmt_optional_pct(_optional_rec_float(rec, 'k_active_pool'))}"
+            f" qk={_fmt_optional_pct(_optional_rec_float(rec, 'qk_active_pool'))}"
+            f" v={_fmt_optional_pct(_optional_rec_float(rec, 'v_active_pool'))}"
+            f" rst={_fmt_optional_pct(_optional_rec_float(rec, 'rst_active_pool'))}"
+        )
+        return
     explicit_keys = (
         'q_active_tau_frac', 'k_active_tau_frac', 'qk_active_tau_frac',
         'v_active_tau_frac', 'rst_active_tau_frac',
@@ -7527,6 +8071,30 @@ def _print_v4164_soft_sparsity_block(rec, level='compact'):
 
 
 def _print_v4164_sparsity_block(rec):
+    if any(f'{name}_active_local' in rec for name in ('q', 'k', 'qk', 'v', 'rst')):
+        _print_active_tau_regular_line(rec)
+
+        def _fmt_local_pool(pool, prefix):
+            local = _rec_float(rec, f'{pool}_{prefix}_frac', 0.0)
+            frac = _rec_float(rec, f'{pool}_candidate_valid_frac', 1.0)
+            return f"{local * 100:.2f}%/{local * frac * 100:.2f}%"
+
+        for eps_label, suffix in (('1e-2', '1e_2'), ('1e-1', '1e_1')):
+            log_message(
+                f"  admission_local/pool@{eps_label}: "
+                f"qk={_fmt_local_pool('attn_qk', f'admission_active_eps_{suffix}')} "
+                f"v={_fmt_local_pool('attn_v', f'admission_active_eps_{suffix}')} "
+                f"rst={_fmt_local_pool('rst', f'admission_active_eps_{suffix}')}")
+        for eps_label, suffix in (
+                ('1e-4', '1e_4'),
+                ('1e-3', '1e_3'),
+                ('1e-2', '1e_2')):
+            log_message(
+                f"  weight_local/pool@{eps_label}: "
+                f"qk={_fmt_local_pool('attn_qk', f'active_eps_{suffix}')} "
+                f"v={_fmt_local_pool('attn_v', f'active_eps_{suffix}')} "
+                f"rst={_fmt_local_pool('rst', f'active_eps_{suffix}')}")
+        return
     qkv_rst_pools = (
         ('attn_qk', 'qk'),
         ('attn_v', 'v'),
@@ -8441,6 +9009,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'selected_page_count',
             'operator_page_cost'):
         rec[_name] = float(m.get(_name, 0.0))
+    _attach_page_aware_metrics(rec, ctx)
     # Per-layer norms (materialise lists).
     try:
         pl_a = jax.device_get(m['per_layer_attn_out_norm']).tolist()
@@ -8668,6 +9237,25 @@ def _print_regular_block(rec, ctx):
                 f" v={rec['attn_v_execution_mass_sum']:.1f}"
                 f" rst={rec['rst_execution_mass_sum']:.1f}"
             )
+            def _lp(label, metric):
+                return (
+                    f"{rec.get(f'{label}_{metric}_local', 0.0) * 100:.2f}%/"
+                    f"{rec.get(f'{label}_{metric}_pool', 0.0) * 100:.2f}%")
+            log_message(
+                "  admission local/pool: "
+                f"qk={_lp('qk', 'admission')} "
+                f"v={_lp('v', 'admission')} "
+                f"rst={_lp('rst', 'admission')}")
+            log_message(
+                "  execution local/pool: "
+                f"qk={_lp('qk', 'execution')} "
+                f"v={_lp('v', 'execution')} "
+                f"rst={_lp('rst', 'execution')}")
+            log_message(
+                "  eff local/pool: "
+                f"qk={_lp('qk', 'eff')} "
+                f"v={_lp('v', 'eff')} "
+                f"rst={_lp('rst', 'eff')}")
             if is_v4167:
                 def _page_part(label, prefix):
                     return (
@@ -8675,7 +9263,8 @@ def _print_regular_block(rec, ctx):
                         f" cap={_g(prefix + '_page_capacity'):.0f}"
                         f" cand={_g(prefix + '_candidate_ops'):.0f}"
                         f"/valid={_g(prefix + '_candidate_valid_ops'):.0f}"
-                        f" frac={_g(prefix + '_candidate_frac'):.4f}"
+                        f" frac_cfg={_g(prefix + '_candidate_frac'):.4f}"
+                        f" frac_valid={_g(prefix + '_candidate_valid_frac'):.4f}"
                         f" ent={_g(prefix + '_page_entropy'):.3f}"
                         f" top1={_g(prefix + '_page_top1_frac'):.3f}"
                         f" den={_g(prefix + '_candidate_den_mean'):.3f}]")
@@ -8685,7 +9274,7 @@ def _print_regular_block(rec, ctx):
                         _page_part('qk', 'attn_qk'),
                         _page_part('v', 'attn_v'),
                         _page_part('rst', 'rst')))
-                    + f" compute={_g('estimated_compute_frac_page'):.4f}"
+                    + f" page_compute_frac_avg={_g('estimated_compute_frac_page'):.4f}"
                     f" selected={_g('selected_page_count'):.0f}"
                     f" cost={_g('operator_page_cost'):.3g}"
                 )
@@ -9284,6 +9873,7 @@ def _build_analysis_record(base, metrics, ctx):
             'selected_page_count',
             'operator_page_cost'):
         rec[_name] = float(m.get(_name, 0.0))
+    _attach_page_aware_metrics(rec, ctx)
     rec['attn_gate_eff_n'] = float(m.get('attn_gate_eff_n', 0.0))
     rec['attn_gate_eff_ratio'] = float(m.get('attn_gate_eff_ratio', 0.0))
     rec['attn_top1_gate_frac'] = float(m.get('attn_top1_gate_frac', 0.0))
@@ -9458,6 +10048,42 @@ def _print_analysis_block(rec, ctx):
             f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
             f" v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
         )
+        if any(f'{label}_candidate_valid_frac' in rec
+               for label in ('qk', 'v', 'rst')):
+            def _lp(label, metric):
+                return (
+                    f"{rec.get(f'{label}_{metric}_local', 0.0) * 100:.2f}%/"
+                    f"{rec.get(f'{label}_{metric}_pool', 0.0) * 100:.2f}%")
+
+            log_message(
+                "  candidate: "
+                f"qk[cand={rec.get('qk_candidate_count', 0.0):.0f}"
+                f" valid={rec.get('qk_valid_candidate_count', 0.0):.1f}"
+                f" full={rec.get('qk_full_pool_size', 0.0):.0f}"
+                f" frac_valid={rec.get('qk_candidate_valid_frac', 0.0):.4f}] "
+                f"v[cand={rec.get('v_candidate_count', 0.0):.0f}"
+                f" valid={rec.get('v_valid_candidate_count', 0.0):.1f}"
+                f" full={rec.get('v_full_pool_size', 0.0):.0f}"
+                f" frac_valid={rec.get('v_candidate_valid_frac', 0.0):.4f}] "
+                f"rst[cand={rec.get('rst_candidate_count', 0.0):.0f}"
+                f" valid={rec.get('rst_valid_candidate_count', 0.0):.1f}"
+                f" full={rec.get('rst_full_pool_size', 0.0):.0f}"
+                f" frac_valid={rec.get('rst_candidate_valid_frac', 0.0):.4f}]")
+            log_message(
+                "  admission local/pool: "
+                f"qk={_lp('qk', 'admission')} "
+                f"v={_lp('v', 'admission')} "
+                f"rst={_lp('rst', 'admission')}")
+            log_message(
+                "  execution local/pool: "
+                f"qk={_lp('qk', 'execution')} "
+                f"v={_lp('v', 'execution')} "
+                f"rst={_lp('rst', 'execution')}")
+            log_message(
+                "  eff local/pool: "
+                f"qk={_lp('qk', 'eff')} "
+                f"v={_lp('v', 'eff')} "
+                f"rst={_lp('rst', 'eff')}")
     else:
         log_message(
             f"  gate_conc a[eff={rec['attn_gate_eff_n']:.1f}"
@@ -11284,20 +11910,27 @@ def main():
                 "selection_calibration requires at least one training batch.")
         (
             local_histograms,
+            local_page_stats,
             local_seen_tokens,
             local_actual_batches,
             local_calibration_tokens,
             calibration_process_count,
         ) = _collect_selection_calibration_histograms(
             params, train_loader, cfg, selection_calibration_cfg)
-        calibration_histograms, seen_tokens, actual_calibration_batches = (
-            _aggregate_selection_calibration_histograms(
-                local_histograms, local_seen_tokens, local_actual_batches))
+        (
+            calibration_histograms,
+            calibration_page_stats,
+            seen_tokens,
+            actual_calibration_batches,
+        ) = _aggregate_selection_calibration_histograms(
+            local_histograms, local_page_stats,
+            local_seen_tokens, local_actual_batches)
         _selection_summary_json = None
         if is_host0:
             selection_calibration_summary = (
                 _compute_srw_selection_calibration(
                     calibration_histograms, cfg, selection_calibration_cfg,
+                    calibration_page_stats,
                     seen_tokens, actual_calibration_batches,
                     local_calibration_tokens, calibration_process_count))
             _selection_summary_json = json.dumps(selection_calibration_summary)
@@ -11369,7 +12002,7 @@ def main():
                 params, calibration_input_ids, cfg, tau_init_cfg)
             _tau_init_summary_json = json.dumps(tau_init_summary)
         _tau_init_summary_json = _broadcast_str_from_host0(
-            _tau_init_summary_json, max_len=4096)
+            _tau_init_summary_json, max_len=16384)
         if not _tau_init_summary_json:
             raise RuntimeError(
                 "Failed to broadcast quantile tau initialization summary.")
