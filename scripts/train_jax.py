@@ -5054,17 +5054,44 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             drift_rst_op_key = jnp.float32(0.0)
         else:
             _pool = new_params['neuron_pool']
-            if 'attn_qk_op_read_proj' in _pool:
-                def _drift_unit(x):
-                    x = jnp.asarray(x, dtype=jnp.float32)
-                    return x / (
-                        jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-6)
+            def _drift_unit(x):
+                x = jnp.asarray(x, dtype=jnp.float32)
+                return x / (
+                    jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-6)
 
-                def _drift_op_key(read, write, read_proj, write_proj):
-                    r_key = _drift_unit(read) @ read_proj
-                    w_key = _drift_unit(write) @ write_proj
-                    return _drift_unit(_drift_unit(r_key) * _drift_unit(w_key))
+            def _drift_op_key(read, write, read_proj, write_proj):
+                r_key = _drift_unit(read) @ read_proj
+                w_key = _drift_unit(write) @ write_proj
+                return _drift_unit(_drift_unit(r_key) * _drift_unit(w_key))
 
+            if 'attn_qk_read_shared' in _pool:
+                def _flat_stage_op_key(prefix):
+                    op_shared = _drift_op_key(
+                        _pool[f'{prefix}_read_shared'],
+                        _pool[f'{prefix}_write_shared'],
+                        _pool[f'{prefix}_op_read_proj'],
+                        _pool[f'{prefix}_op_write_proj'])
+
+                    read_stage_key = f'{prefix}_read_stage'
+                    write_stage_key = f'{prefix}_write_stage'
+                    if read_stage_key not in _pool:
+                        return op_shared
+
+                    op_stage = _drift_op_key(
+                        _pool[read_stage_key],
+                        _pool[write_stage_key],
+                        _pool[f'{prefix}_op_read_proj'],
+                        _pool[f'{prefix}_op_write_proj'])
+
+                    return jnp.concatenate(
+                        [op_shared,
+                         op_stage.reshape((-1, op_shared.shape[-1]))],
+                        axis=0)
+
+                _cur_qk = _flat_stage_op_key('attn_qk')
+                _cur_v = _flat_stage_op_key('attn_v')
+                _cur_rst = _flat_stage_op_key('rst')
+            elif 'attn_qk_op_read_proj' in _pool:
                 _cur_qk = _drift_op_key(
                     _pool['attn_qk_read'], _pool['attn_qk_write'],
                     _pool['attn_qk_op_read_proj'],
