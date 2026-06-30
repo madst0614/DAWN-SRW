@@ -340,7 +340,6 @@ def create_qr(args: argparse.Namespace) -> bool:
             "--accelerator-type", args.accelerator_type,
             "--runtime-version", args.runtime_version,
             "--spot",
-            "--internal-ips",
         ],
         timeout=args.operation_timeout_seconds,
     )
