@@ -7211,16 +7211,49 @@ def _checkpoint_metrics(val_loss=None, best_val_loss=None, train_loss=None):
     return metrics
 
 
+def _orbax_manager_has_step(manager, step):
+    """Return True if a manager already knows about a checkpoint step."""
+    try:
+        steps = manager.all_steps()
+    except Exception:
+        return False
+    try:
+        return int(step) in {int(existing_step) for existing_step in steps}
+    except Exception:
+        return step in steps
+
+
+def _is_orbax_step_already_exists_error(exc):
+    """Detect Orbax duplicate-step save errors across supported versions."""
+    if exc.__class__.__name__ == 'StepAlreadyExistsError':
+        return True
+    msg = str(exc).lower()
+    return (
+        'checkpoint for step' in msg
+        and 'already exists' in msg
+    )
+
+
 def save_orbax_checkpoint(manager, params, opt_state, rng, epoch,
                           global_step, step_in_epoch, steps_per_epoch,
                           best_val_loss, model_config, training_config,
                           full_config, raw_config, config_path, run_id,
                           checkpoint_kind, val_loss=None, train_loss=None,
                           git_info=None, wait=False):
+    checkpoint_step = int(global_step)
+    if _orbax_manager_has_step(manager, checkpoint_step):
+        if jax.process_index() == 0:
+            print(
+                "Orbax checkpoint save skipped: "
+                f"step {checkpoint_step} already exists.",
+                flush=True,
+            )
+        return False
+
     consumed_examples, consumed_tokens = _checkpoint_consumed_counts(
-        global_step, training_config, full_config, model_config)
+        checkpoint_step, training_config, full_config, model_config)
     state = _build_orbax_state(
-        params, opt_state, rng, epoch, global_step, step_in_epoch,
+        params, opt_state, rng, epoch, checkpoint_step, step_in_epoch,
         steps_per_epoch, best_val_loss,
         consumed_examples=consumed_examples,
         consumed_tokens=consumed_tokens,
@@ -7229,7 +7262,7 @@ def save_orbax_checkpoint(manager, params, opt_state, rng, epoch,
         model_config=model_config,
     )
     metadata = _build_orbax_metadata(
-        run_id, global_step, epoch, step_in_epoch, steps_per_epoch,
+        run_id, checkpoint_step, epoch, step_in_epoch, steps_per_epoch,
         best_val_loss, val_loss, checkpoint_kind, model_config,
         training_config, full_config, raw_config, config_path,
         consumed_examples=consumed_examples,
@@ -7253,15 +7286,26 @@ def save_orbax_checkpoint(manager, params, opt_state, rng, epoch,
             flush=True,
         )
         save_orbax_checkpoint._printed_serialization_check = True
-    saved = manager.save(
-        int(global_step),
-        args=ocp.args.Composite(
-            state=ocp.args.StandardSave(state),
-            metadata=ocp.args.JsonSave(metadata),
-        ),
-        metrics=metrics,
-        force=True,
-    )
+    try:
+        saved = manager.save(
+            checkpoint_step,
+            args=ocp.args.Composite(
+                state=ocp.args.StandardSave(state),
+                metadata=ocp.args.JsonSave(metadata),
+            ),
+            metrics=metrics,
+            force=True,
+        )
+    except Exception as exc:
+        if _is_orbax_step_already_exists_error(exc):
+            if jax.process_index() == 0:
+                print(
+                    "Orbax checkpoint save skipped after duplicate-step "
+                    f"response: step {checkpoint_step} already exists.",
+                    flush=True,
+                )
+            return False
+        raise
     manager.check_for_errors()
     if wait:
         manager.wait_until_finished()
