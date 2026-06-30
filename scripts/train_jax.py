@@ -72,6 +72,12 @@ from models.dawn_srw_v4166 import (
     _raw_tau_init_from_cosine_tau as _v4166_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4166_tau_init_calibration_scores,
 )
+from models.dawn_srw_v4167 import (
+    DAWN_SRW_V4167,
+    _pool_operator_keys as _v4167_pool_operator_keys,
+    _raw_tau_init_from_cosine_tau as _v4167_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4167_tau_init_calibration_scores,
+)
 from models.baseline_transformer_jax import VanillaTransformer
 
 
@@ -248,11 +254,13 @@ def _strict_multihost_barrier(name: str, context=None):
 
 V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
 V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
+V4167_MODEL_VERSION = 'spatial-r1-v4.1.6.7'
 BASELINE_MODEL_VERSION = 'baseline'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (
-    V4164_MODEL_VERSION, V4166_MODEL_VERSION)
-RW_KEY_SRW_MODEL_VERSIONS = (V4166_MODEL_VERSION,)
+    V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION)
+RW_KEY_SRW_MODEL_VERSIONS = (V4166_MODEL_VERSION, V4167_MODEL_VERSION)
+FIXED_TAU_SRW_MODEL_VERSIONS = (V4167_MODEL_VERSION,)
 CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_SELECTION_CALIBRATION_SCORE_CHUNK_TOKENS = 2048
 MODEL_REGISTRY = {
@@ -274,6 +282,12 @@ MODEL_REGISTRY = {
         'module': 'models.dawn_srw_v4166',
         'raw_tau_init_from_cosine_tau': _v4166_raw_tau_init_from_cosine_tau,
         'tau_init_calibration_scores': _v4166_tau_init_calibration_scores,
+    },
+    V4167_MODEL_VERSION: {
+        'class': DAWN_SRW_V4167,
+        'module': 'models.dawn_srw_v4167',
+        'raw_tau_init_from_cosine_tau': _v4167_raw_tau_init_from_cosine_tau,
+        'tau_init_calibration_scores': _v4167_tau_init_calibration_scores,
     },
 }
 
@@ -340,10 +354,16 @@ def _is_rw_key_srw_version(version):
     return str(version) in RW_KEY_SRW_MODEL_VERSIONS
 
 
+def _is_fixed_tau_srw_version(version):
+    return str(version) in FIXED_TAU_SRW_MODEL_VERSIONS
+
+
 def _pool_operator_keys_for_version(version):
     version = str(version)
     if version == V4166_MODEL_VERSION:
         return _v4166_pool_operator_keys
+    if version == V4167_MODEL_VERSION:
+        return _v4167_pool_operator_keys
     raise ValueError(f"{version} does not expose RW-derived operator keys.")
 
 
@@ -1022,8 +1042,73 @@ def _cfg_bool(value, *, name):
     return bool(value)
 
 
+def _materialize_v4167_model_config(cfg):
+    m = cfg['model']
+    n_layers = int(m.get('n_layers', 12))
+
+    def _int_field(name, default):
+        value = int(m.get(name, default))
+        if value < 0:
+            raise ValueError(f"model.{name} must be >= 0, got {value}")
+        m[name] = value
+        return value
+
+    def _stage_field(name, default):
+        value = int(m.get(name, default))
+        if value <= 0:
+            raise ValueError(f"model.{name} must be > 0, got {value}")
+        if n_layers % value != 0:
+            raise ValueError(
+                f"model.n_layers={n_layers} must be divisible by "
+                f"model.{name}={value}")
+        m[name] = value
+        return value
+
+    m['fixed_tau'] = _cfg_bool(m.get('fixed_tau', True), name='model.fixed_tau')
+    if not m['fixed_tau']:
+        raise ValueError("v4167 supports fixed_tau: true only.")
+
+    qk_num_stages = _stage_field('qk_num_stages', 1)
+    v_num_stages = _stage_field('v_num_stages', 1)
+    rst_num_stages = _stage_field('rst_num_stages', 1)
+    router_num_stages = _stage_field('router_num_stages', n_layers)
+
+    n_qk_shared = _int_field('n_qk_shared', int(m.get('n_qk', 1580)))
+    n_qk_stage = _int_field('n_qk_stage', 0)
+    n_v_shared = _int_field('n_v_shared', int(m.get('n_v', 2600)))
+    n_v_stage = _int_field('n_v_stage', 0)
+    n_rst_shared = _int_field(
+        'n_rst_shared', int(m.get('n_rst', m.get('n_know', 25200))))
+    n_rst_stage = _int_field('n_rst_stage', 0)
+
+    totals = {
+        'n_qk': n_qk_shared + qk_num_stages * n_qk_stage,
+        'n_v': n_v_shared + v_num_stages * n_v_stage,
+        'n_rst': n_rst_shared + rst_num_stages * n_rst_stage,
+    }
+    for key, total in totals.items():
+        if key in m and int(m[key]) != total:
+            raise ValueError(
+                f"model.{key}={m[key]} must equal shared + stages*stage "
+                f"for v4167 ({total}).")
+        m[key] = total
+    m['n_know'] = m.get('n_know', m['n_rst'])
+    if int(m['n_know']) != int(m['n_rst']):
+        raise ValueError(
+            f"model.n_know={m['n_know']} must match model.n_rst={m['n_rst']} "
+            "for v4167.")
+
+    m['qk_visible_n'] = n_qk_shared + n_qk_stage
+    m['v_visible_n'] = n_v_shared + n_v_stage
+    m['rst_visible_n'] = n_rst_shared + n_rst_stage
+    return m
+
+
 def _dawn_srw_kwargs(cfg):
     """Official v4.1.6.4 DAWN-SRW constructor kwargs."""
+    version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
+    if str(version) == V4167_MODEL_VERSION:
+        _materialize_v4167_model_config(cfg)
     kw = _v4164_model_base_kwargs(cfg)
     m = cfg['model']
     t = cfg['training']
@@ -1038,10 +1123,43 @@ def _dawn_srw_kwargs(cfg):
         kw['tau_init_attn_v'] = tau_init_cfg['explicit']['v']
         kw['tau_init_rst'] = tau_init_cfg['explicit']['rst']
     else:
-        # Fresh quantile starts overwrite these before optimizer init.
-        kw['tau_init_attn_qk'] = 0.0
-        kw['tau_init_attn_v'] = 0.0
-        kw['tau_init_rst'] = 0.0
+        fixed_tau_values = {
+            'tau_init_attn_qk': t.get(
+                'tau_init_attn_qk',
+                m.get('tau_init_attn_qk',
+                      t.get('selection_calibration_tau_qk', None))),
+            'tau_init_attn_v': t.get(
+                'tau_init_attn_v',
+                m.get('tau_init_attn_v',
+                      t.get('selection_calibration_tau_v', None))),
+            'tau_init_rst': t.get(
+                'tau_init_rst',
+                m.get('tau_init_rst',
+                      t.get('selection_calibration_tau_rst', None))),
+        }
+        if (_is_fixed_tau_srw_version(version)
+                and all(value is not None
+                        for value in fixed_tau_values.values())):
+            kw.update(fixed_tau_values)
+        else:
+            # Fresh quantile starts overwrite these before optimizer init.
+            kw['tau_init_attn_qk'] = 0.0
+            kw['tau_init_attn_v'] = 0.0
+            kw['tau_init_rst'] = 0.0
+    if str(version) == V4167_MODEL_VERSION:
+        kw.update({
+            'fixed_tau': m.get('fixed_tau', True),
+            'qk_num_stages': m['qk_num_stages'],
+            'v_num_stages': m['v_num_stages'],
+            'rst_num_stages': m['rst_num_stages'],
+            'router_num_stages': m['router_num_stages'],
+            'n_qk_shared': m['n_qk_shared'],
+            'n_qk_stage': m['n_qk_stage'],
+            'n_v_shared': m['n_v_shared'],
+            'n_v_stage': m['n_v_stage'],
+            'n_rst_shared': m['n_rst_shared'],
+            'n_rst_stage': m['n_rst_stage'],
+        })
     return kw
 
 
@@ -1087,7 +1205,11 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
             f"{entry['module']} to import cleanly.")
     # Keep the one-time JIT signature small: calibration needs only selection
     # geometry, not tau params or LM output weights.
-    if _is_rw_key_srw_version(version):
+    if str(version) == V4167_MODEL_VERSION:
+        pool_operator_keys = _pool_operator_keys_for_version(version)
+        pool_params = {k: v for k, v in params['neuron_pool'].items()}
+        pool_params.update(jax.jit(pool_operator_keys)(params['neuron_pool']))
+    elif _is_rw_key_srw_version(version):
         pool_operator_keys = _pool_operator_keys_for_version(version)
         pool_params = jax.jit(pool_operator_keys)(params['neuron_pool'])
     else:
@@ -2357,6 +2479,23 @@ def _set_srw_quantile_tau_biases(params, tau_summary, model_version=OFFICIAL_MOD
         return value
 
     return jax.tree.map_with_path(_replace, params)
+
+
+def _materialize_fixed_tau_config(cfg, training_config, tau_summary,
+                                  model_version=OFFICIAL_MODEL_VERSION):
+    """Store calibrated fixed tau in config/metadata for param-free tau models."""
+    if not _is_fixed_tau_srw_version(model_version):
+        return False
+    tau = tau_summary['tau_init_quantile_tau']
+    updates = {
+        'tau_init_attn_qk': float(tau['qk']),
+        'tau_init_attn_v': float(tau['v']),
+        'tau_init_rst': float(tau['rst']),
+    }
+    cfg.setdefault('model', {}).update(updates)
+    cfg.setdefault('training', {}).update(updates)
+    training_config.update(updates)
+    return True
 
 
 def _v4164_tau_init_summary_lines(summary):
@@ -6164,11 +6303,21 @@ def get_param_shardings(params, mesh):
     replicated = NamedSharding(mesh, P())
     n_sharded = NamedSharding(mesh, P('model', None))
     n_sharded_3d = NamedSharding(mesh, P('model', None, None))
+    stage_n_sharded_3d = NamedSharding(mesh, P(None, 'model', None))
+    pool_root = params.get('neuron_pool', {}) if hasattr(params, 'get') else {}
+    is_stage_partitioned_pool = 'attn_qk_read_shared' in pool_root
 
     def _get_sharding(path, value):
         path_str = '/'.join(str(p) for p in path)
+        leaf = str(path[-1].key if hasattr(path[-1], 'key') else path[-1])
         # NeuronPool params: shard N axis (first dim) on 'model'
         if 'neuron_pool' in path_str:
+            if is_stage_partitioned_pool and leaf.endswith('_stage'):
+                return stage_n_sharded_3d
+            if (is_stage_partitioned_pool
+                    and (leaf.endswith('_op_read_proj')
+                         or leaf.endswith('_op_write_proj'))):
+                return replicated
             if value.ndim == 2:
                 return n_sharded       # [N, d_bn] or [N, D]
             elif value.ndim == 3:
@@ -11339,6 +11488,22 @@ def main():
         print(f"\nModel parameters: {n_params:,}")
         for line in model.get_model_info():
             print(line)
+        if str(model_version_cfg) == V4167_MODEL_VERSION:
+            m = cfg['model']
+            print("v4167 pool diagnostics:")
+            print(
+                f"  qk_visible_n={m['qk_visible_n']} "
+                f"v_visible_n={m['v_visible_n']} "
+                f"rst_visible_n={m['rst_visible_n']}")
+            print(
+                f"  qk_total_n={m['n_qk']} "
+                f"v_total_n={m['n_v']} rst_total_n={m['n_rst']}")
+            print(
+                f"  qk_num_stages={m['qk_num_stages']} "
+                f"v_num_stages={m['v_num_stages']} "
+                f"rst_num_stages={m['rst_num_stages']} "
+                f"router_num_stages={m['router_num_stages']} "
+                f"fixed_tau={m['fixed_tau']}")
 
     _has_resume_checkpoint = resume_step is not None
 
@@ -11733,6 +11898,18 @@ def main():
         selection_calibration_summary = json.loads(_selection_summary_json)
         params = _set_srw_quantile_tau_biases(
             params, selection_calibration_summary, model_version_cfg)
+        fixed_tau_materialized = _materialize_fixed_tau_config(
+            cfg, training_config, selection_calibration_summary,
+            model_version_cfg)
+        if fixed_tau_materialized:
+            model = build_model_from_config(cfg)
+            if is_host0:
+                print(
+                    "v4167 fixed tau materialized from selection calibration: "
+                    f"qk={cfg['model']['tau_init_attn_qk']:.6f} "
+                    f"v={cfg['model']['tau_init_attn_v']:.6f} "
+                    f"rst={cfg['model']['tau_init_rst']:.6f}",
+                    flush=True)
         selection_calibration_tau_applied = True
         materialized_training_updates = (
             _selection_calibration_materialized_training_updates(
@@ -11800,6 +11977,17 @@ def main():
         tau_init_summary = json.loads(_tau_init_summary_json)
         params = _set_srw_quantile_tau_biases(
             params, tau_init_summary, model_version_cfg)
+        fixed_tau_materialized = _materialize_fixed_tau_config(
+            cfg, training_config, tau_init_summary, model_version_cfg)
+        if fixed_tau_materialized:
+            model = build_model_from_config(cfg)
+            if is_host0:
+                print(
+                    "v4167 fixed tau materialized from quantile init: "
+                    f"qk={cfg['model']['tau_init_attn_qk']:.6f} "
+                    f"v={cfg['model']['tau_init_attn_v']:.6f} "
+                    f"rst={cfg['model']['tau_init_rst']:.6f}",
+                    flush=True)
         if is_host0:
             print("\n=== Quantile tau initialization ===", flush=True)
             for _line in _v4164_tau_init_summary_lines(tau_init_summary):
@@ -11949,15 +12137,35 @@ def main():
         n_rst = cfg['model'].get('n_rst', cfg['model'].get('n_know', 25200))
         n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
         n_v = cfg['model'].get('n_v', 2600)
-        for _name, _N in (('n_rst', n_rst), ('n_qk', n_qk), ('n_v', n_v)):
+        if str(model_version_cfg) == V4167_MODEL_VERSION:
+            shard_checks = [
+                ('n_qk_shared', cfg['model']['n_qk_shared']),
+                ('n_v_shared', cfg['model']['n_v_shared']),
+                ('n_rst_shared', cfg['model']['n_rst_shared']),
+            ]
+            for _name, _N in (
+                    ('n_qk_stage', cfg['model']['n_qk_stage']),
+                    ('n_v_stage', cfg['model']['n_v_stage']),
+                    ('n_rst_stage', cfg['model']['n_rst_stage'])):
+                if int(_N) > 0:
+                    shard_checks.append((_name, _N))
+            chunk_n_qk = cfg['model']['qk_visible_n']
+            chunk_n_v = cfg['model']['v_visible_n']
+            chunk_n_rst = cfg['model']['rst_visible_n']
+        else:
+            shard_checks = [('n_rst', n_rst), ('n_qk', n_qk), ('n_v', n_v)]
+            chunk_n_qk = n_qk
+            chunk_n_v = n_v
+            chunk_n_rst = n_rst
+        for _name, _N in shard_checks:
             if _N % mesh_model != 0:
                 raise ValueError(
                     f"{_name}={_N} must be divisible by mesh_model={mesh_model} "
                     "for model-axis sharding.")
-        # N_local = N / mesh_model (each chip's share)
-        nrst_local = n_rst // mesh_model
-        nqk_local = n_qk // mesh_model
-        nv_local = n_v // mesh_model
+        # N_local = visible_N / mesh_model (each chip's share).
+        nrst_local = chunk_n_rst // mesh_model
+        nqk_local = chunk_n_qk // mesh_model
+        nv_local = chunk_n_v // mesh_model
 
         n_chunks_rst = cfg['training'].get(
             'n_chunks_rst', auto_n_chunks(nrst_local, target_chunk_gb))
@@ -12426,6 +12634,29 @@ def main():
             }
 
         pool = p['neuron_pool']
+        if 'attn_qk_read_shared' in pool:
+            def _flat_op_key(prefix):
+                op_shared = _op_key(
+                    pool[f'{prefix}_read_shared'],
+                    pool[f'{prefix}_write_shared'],
+                    pool[f'{prefix}_op_read_proj'],
+                    pool[f'{prefix}_op_write_proj'])
+                stage_read_key = f'{prefix}_read_stage'
+                stage_write_key = f'{prefix}_write_stage'
+                if stage_read_key not in pool:
+                    return op_shared
+                op_stage = _op_key(
+                    pool[stage_read_key], pool[stage_write_key],
+                    pool[f'{prefix}_op_read_proj'],
+                    pool[f'{prefix}_op_write_proj'])
+                return jnp.concatenate(
+                    [op_shared, op_stage.reshape((-1, op_shared.shape[-1]))],
+                    axis=0)
+            return {
+                'attn_qk_op_key': _flat_op_key('attn_qk'),
+                'attn_v_op_key': _flat_op_key('attn_v'),
+                'rst_op_key': _flat_op_key('rst'),
+            }
         if 'attn_qk_op_read_proj' in pool:
             return {
                 'attn_qk_op_key': _op_key(

@@ -1,5 +1,5 @@
 """
-DAWN-SRW v4.1.6.6 Operator-Key Select DirectTau
+DAWN-SRW v4.1.6.7 Operator-Key Select FixedTau StagePools
 
 Clean v4166 experimental model path.
 
@@ -11,7 +11,9 @@ Implemented concepts:
 - RW-matched operator queries
 - scheduled soft-gate boundary-scale input
 - scheduled boundary power input
-- tau movement controlled by optimizer-side tau_lr_mult
+- fixed tau from calibrated cosine thresholds; no token-conditioned tau params
+- shared + stage-local V/RST operator pools selected before fused SRW
+- layer-specific router bank
 - train-time effective gate statistics
 - validation-time execution pruning through execution_prune_eps
 """
@@ -22,7 +24,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 import math
 from flax.core import FrozenDict, freeze, unfreeze
-from typing import Optional, Dict
+from typing import Optional, Dict, Callable
 from functools import partial
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
@@ -279,7 +281,7 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 
 DEFAULT_D_ROUTE = 64
 RW_FORWARD_NORM_EPS = 1e-6     # forward-only read/write direction floor
-MODEL_VERSION = "spatial-r1-v4.1.6.6"
+MODEL_VERSION = "spatial-r1-v4.1.6.7"
 
 
 # ================================================================
@@ -350,23 +352,27 @@ def _rw_operator_key(read, write, read_proj, write_proj, *, eps=1e-6):
 
 
 def _pool_operator_keys(pool_params):
-    return {
-        'attn_qk_op_key': _rw_operator_key(
-            pool_params['attn_qk_read'],
-            pool_params['attn_qk_write'],
-            pool_params['attn_qk_op_read_proj'],
-            pool_params['attn_qk_op_write_proj']),
-        'attn_v_op_key': _rw_operator_key(
-            pool_params['attn_v_read'],
-            pool_params['attn_v_write'],
-            pool_params['attn_v_op_read_proj'],
-            pool_params['attn_v_op_write_proj']),
-        'rst_op_key': _rw_operator_key(
-            pool_params['rst_read'],
-            pool_params['rst_write'],
-            pool_params['rst_op_read_proj'],
-            pool_params['rst_op_write_proj']),
-    }
+    out = {}
+    for prefix in ('attn_qk', 'attn_v', 'rst'):
+        read_proj = pool_params[f'{prefix}_op_read_proj']
+        write_proj = pool_params[f'{prefix}_op_write_proj']
+        read_shared_key = f'{prefix}_read_shared'
+        write_shared_key = f'{prefix}_write_shared'
+        if read_shared_key in pool_params and write_shared_key in pool_params:
+            out[f'{prefix}_op_key_shared'] = _rw_operator_key(
+                pool_params[read_shared_key],
+                pool_params[write_shared_key],
+                read_proj,
+                write_proj)
+        read_stage_key = f'{prefix}_read_stage'
+        write_stage_key = f'{prefix}_write_stage'
+        if read_stage_key in pool_params and write_stage_key in pool_params:
+            out[f'{prefix}_op_key_stage'] = _rw_operator_key(
+                pool_params[read_stage_key],
+                pool_params[write_stage_key],
+                read_proj,
+                write_proj)
+    return out
 
 
 def _pool_params_with_operator_keys(pool_params):
@@ -377,9 +383,134 @@ def _pool_params_with_operator_keys(pool_params):
 
 
 def _ensure_pool_operator_keys(pool_params):
-    if 'attn_qk_op_key' in pool_params:
+    if 'attn_qk_op_key_shared' in pool_params:
         return pool_params
     return _pool_params_with_operator_keys(pool_params)
+
+
+def _stage_id(layer_idx, n_layers, num_stages):
+    if int(num_stages) <= 0:
+        raise ValueError(f"num_stages must be > 0, got {num_stages}")
+    if int(n_layers) % int(num_stages) != 0:
+        raise ValueError(
+            f"n_layers={n_layers} must be divisible by num_stages={num_stages}")
+    layers_per_stage = int(n_layers) // int(num_stages)
+    return jnp.asarray(layer_idx, dtype=jnp.int32) // jnp.asarray(
+        layers_per_stage, dtype=jnp.int32)
+
+
+def _visible_pool(pool_params, prefix, stage_id):
+    """Return shared plus one selected stage, already reduced for fused SRW."""
+    pool_params = _ensure_pool_operator_keys(pool_params)
+    op_key = pool_params[f'{prefix}_op_key_shared']
+    read = pool_params[f'{prefix}_read_shared']
+    write = pool_params[f'{prefix}_write_shared']
+
+    op_stage_key = f'{prefix}_op_key_stage'
+    read_stage_key = f'{prefix}_read_stage'
+    write_stage_key = f'{prefix}_write_stage'
+    if op_stage_key not in pool_params:
+        return op_key, read, write
+
+    stage_op_key = jax.lax.dynamic_index_in_dim(
+        pool_params[op_stage_key], stage_id, axis=0, keepdims=False)
+    stage_read = jax.lax.dynamic_index_in_dim(
+        pool_params[read_stage_key], stage_id, axis=0, keepdims=False)
+    stage_write = jax.lax.dynamic_index_in_dim(
+        pool_params[write_stage_key], stage_id, axis=0, keepdims=False)
+    return (
+        jnp.concatenate([op_key, stage_op_key], axis=0),
+        jnp.concatenate([read, stage_read], axis=0),
+        jnp.concatenate([write, stage_write], axis=0),
+    )
+
+
+def _visible_pool_params(pool_params, qk_stage_id, v_stage_id, rst_stage_id):
+    qk_op_key, qk_read, qk_write = _visible_pool(
+        pool_params, 'attn_qk', qk_stage_id)
+    v_op_key, v_read, v_write = _visible_pool(
+        pool_params, 'attn_v', v_stage_id)
+    rst_op_key, rst_read, rst_write = _visible_pool(
+        pool_params, 'rst', rst_stage_id)
+    return {
+        'attn_qk_op_key': qk_op_key,
+        'attn_qk_read': qk_read,
+        'attn_qk_write': qk_write,
+        'attn_v_op_key': v_op_key,
+        'attn_v_read': v_read,
+        'attn_v_write': v_write,
+        'rst_op_key': rst_op_key,
+        'rst_read': rst_read,
+        'rst_write': rst_write,
+        'attn_qk_scale': pool_params.get('attn_qk_scale', jnp.ones((1,))),
+        'attn_v_scale': pool_params.get('attn_v_scale', jnp.ones((1,))),
+        'rst_scale': pool_params.get('rst_scale', jnp.ones((1,))),
+    }
+
+
+def _select_router_params(router_params, router_id):
+    def _select(x):
+        return jax.lax.dynamic_index_in_dim(
+            x, router_id, axis=0, keepdims=False)
+
+    return {
+        'proj_attn': {
+            'kernel': _select(router_params['proj_attn']['kernel']),
+            'bias': _select(router_params['proj_attn']['bias']),
+        },
+        'proj_rst': {
+            'kernel': _select(router_params['proj_rst']['kernel']),
+            'bias': _select(router_params['proj_rst']['bias']),
+        },
+        'q_op_write_query_proj': _select(
+            router_params['q_op_write_query_proj']),
+        'k_op_write_query_proj': _select(
+            router_params['k_op_write_query_proj']),
+        'v_op_write_query_proj': _select(
+            router_params['v_op_write_query_proj']),
+        'rst_op_write_query_proj': _select(
+            router_params['rst_op_write_query_proj']),
+    }
+
+
+def _fixed_raw_attn_tau(x, tau_init_attn_qk, tau_init_attn_v):
+    B, S = x.shape[:2]
+    raw_qk = _raw_tau_init_from_cosine_tau(tau_init_attn_qk)
+    raw_v = _raw_tau_init_from_cosine_tau(tau_init_attn_v)
+    return jnp.broadcast_to(
+        jnp.asarray([raw_qk, raw_qk, raw_v], dtype=jnp.float32),
+        (B, S, 3))
+
+
+def _fixed_raw_rst_tau(x, tau_init_rst):
+    B, S = x.shape[:2]
+    raw_rst = _raw_tau_init_from_cosine_tau(tau_init_rst)
+    return jnp.broadcast_to(
+        jnp.asarray(raw_rst, dtype=jnp.float32),
+        (B, S, 1))
+
+
+def _flat_pool_for_health(pool_params, prefix):
+    pool_params = _ensure_pool_operator_keys(pool_params)
+    op_key = pool_params[f'{prefix}_op_key_shared']
+    read = pool_params[f'{prefix}_read_shared']
+    write = pool_params[f'{prefix}_write_shared']
+    if f'{prefix}_op_key_stage' not in pool_params:
+        return op_key, read, write
+    return (
+        jnp.concatenate(
+            [op_key, pool_params[f'{prefix}_op_key_stage'].reshape(
+                (-1, op_key.shape[-1]))],
+            axis=0),
+        jnp.concatenate(
+            [read, pool_params[f'{prefix}_read_stage'].reshape(
+                (-1, read.shape[-1]))],
+            axis=0),
+        jnp.concatenate(
+            [write, pool_params[f'{prefix}_write_stage'].reshape(
+                (-1, write.shape[-1]))],
+            axis=0),
+    )
 
 
 @jax.custom_vjp
@@ -2584,31 +2715,63 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
 # ================================================================
 
 class NeuronPool(nn.Module):
-    n_qk: int
-    n_v: int
+    n_qk_shared: int
+    n_qk_stage: int
+    n_v_shared: int
+    n_v_stage: int
+    n_rst_shared: int
+    n_rst_stage: int
+    qk_num_stages: int
+    v_num_stages: int
+    rst_num_stages: int
     d_model: int
     d_route: int
-    n_rst: Optional[int] = None
-    n_know: Optional[int] = None  # Checkpoint/config alias for rst pool size.
 
     def setup(self):
         db = self.d_route
         dm = self.d_model
-        n_rst_eff = self.n_rst if self.n_rst is not None else self.n_know
-        if n_rst_eff is None:
-            raise ValueError("NeuronPool requires n_rst or n_know checkpoint alias.")
 
         # Read vectors define what each neuron extracts from x.
         # Stored vectors remain raw; SRW forward uses their directions.
-        self.attn_qk_read = self.param('attn_qk_read', unit_norm_init(), (self.n_qk, dm))
-        self.attn_v_read = self.param('attn_v_read', unit_norm_init(), (self.n_v, dm))
-        self.rst_read = self.param('rst_read', unit_norm_init(), (n_rst_eff, dm))
+        self.attn_qk_read_shared = self.param(
+            'attn_qk_read_shared', unit_norm_init(), (self.n_qk_shared, dm))
+        self.attn_v_read_shared = self.param(
+            'attn_v_read_shared', unit_norm_init(), (self.n_v_shared, dm))
+        self.rst_read_shared = self.param(
+            'rst_read_shared', unit_norm_init(), (self.n_rst_shared, dm))
+        if self.n_qk_stage > 0:
+            self.attn_qk_read_stage = self.param(
+                'attn_qk_read_stage', unit_norm_init(),
+                (self.qk_num_stages, self.n_qk_stage, dm))
+        if self.n_v_stage > 0:
+            self.attn_v_read_stage = self.param(
+                'attn_v_read_stage', unit_norm_init(),
+                (self.v_num_stages, self.n_v_stage, dm))
+        if self.n_rst_stage > 0:
+            self.rst_read_stage = self.param(
+                'rst_read_stage', unit_norm_init(),
+                (self.rst_num_stages, self.n_rst_stage, dm))
 
         # Write vectors define the output direction for each neuron.
         # Raw parameter norms are still observable diagnostics.
-        self.attn_qk_write = self.param('attn_qk_write', unit_norm_init(), (self.n_qk, dm))
-        self.attn_v_write = self.param('attn_v_write', unit_norm_init(), (self.n_v, dm))
-        self.rst_write = self.param('rst_write', unit_norm_init(), (n_rst_eff, dm))
+        self.attn_qk_write_shared = self.param(
+            'attn_qk_write_shared', unit_norm_init(), (self.n_qk_shared, dm))
+        self.attn_v_write_shared = self.param(
+            'attn_v_write_shared', unit_norm_init(), (self.n_v_shared, dm))
+        self.rst_write_shared = self.param(
+            'rst_write_shared', unit_norm_init(), (self.n_rst_shared, dm))
+        if self.n_qk_stage > 0:
+            self.attn_qk_write_stage = self.param(
+                'attn_qk_write_stage', unit_norm_init(),
+                (self.qk_num_stages, self.n_qk_stage, dm))
+        if self.n_v_stage > 0:
+            self.attn_v_write_stage = self.param(
+                'attn_v_write_stage', unit_norm_init(),
+                (self.v_num_stages, self.n_v_stage, dm))
+        if self.n_rst_stage > 0:
+            self.rst_write_stage = self.param(
+                'rst_write_stage', unit_norm_init(),
+                (self.rst_num_stages, self.n_rst_stage, dm))
 
         op_proj_scale = math.sqrt(float(dm) / float(db))
         op_proj_init = nn.initializers.orthogonal(scale=op_proj_scale)
@@ -2637,78 +2800,70 @@ class NeuronPool(nn.Module):
 
 
 # ================================================================
-# 5. Router -- route queries and cosine-space tau references
+# 5. RouterBank -- layer/stage-specific route queries only
 # ================================================================
 
-class Router(nn.Module):
+class DenseBank(nn.Module):
+    num_stages: int
+    in_features: int
+    out_features: int
+    kernel_init: Callable = nn.initializers.orthogonal(scale=1.0)
+    bias_init: Callable = nn.initializers.zeros
+
+    def setup(self):
+        self.kernel = self.param(
+            'kernel', self.kernel_init,
+            (self.num_stages, self.in_features, self.out_features))
+        self.bias = self.param(
+            'bias', self.bias_init,
+            (self.num_stages, self.out_features))
+
+    def __call__(self, x, stage_id=0):
+        kernel = jax.lax.dynamic_index_in_dim(
+            self.kernel, stage_id, axis=0, keepdims=False)
+        bias = jax.lax.dynamic_index_in_dim(
+            self.bias, stage_id, axis=0, keepdims=False)
+        return x @ kernel + bias
+
+
+class RouterBank(nn.Module):
     d_model: int
     d_route: int
-    n_qk: int
-    n_v: int
-    n_rst: Optional[int] = None
-    n_know: Optional[int] = None  # Checkpoint/config alias for rst pool size.
+    router_num_stages: int
     router_dropout: float = 0.1
-    # Constructor receives cosine-space tau values. The train driver may use
-    # safe placeholders before one-time quantile calibration.
-    tau_init_attn_qk: Optional[float] = None
-    tau_init_attn_v: Optional[float] = None
-    tau_init_rst: Optional[float] = None
 
     def setup(self):
         db = self.d_route
         dm = self.d_model
-        n_rst_eff = self.n_rst if self.n_rst is not None else self.n_know
-        if n_rst_eff is None:
-            raise ValueError("Router requires n_rst or n_know checkpoint alias.")
-
-        missing_tau = [
-            name for name, value in (
-                ('tau_init_attn_qk', self.tau_init_attn_qk),
-                ('tau_init_attn_v', self.tau_init_attn_v),
-                ('tau_init_rst', self.tau_init_rst),
-            ) if value is None
-        ]
-        if missing_tau:
-            raise ValueError(
-                "v4166 requires explicit cosine-space tau_init_attn_qk/v/rst; "
-                f"missing {', '.join(missing_tau)}.")
-        qk_tau_init = float(self.tau_init_attn_qk)
-        v_tau_init = float(self.tau_init_attn_v)
-        rst_tau_init = float(self.tau_init_rst)
-        raw_tau_attn_bias_init = jnp.asarray(
-            [
-                _raw_tau_init_from_cosine_tau(qk_tau_init),
-                _raw_tau_init_from_cosine_tau(qk_tau_init),
-                _raw_tau_init_from_cosine_tau(v_tau_init),
-            ],
-            dtype=jnp.float32)
-        raw_tau_rst_bias_init = jnp.asarray(
-            _raw_tau_init_from_cosine_tau(rst_tau_init), dtype=jnp.float32)
         query_proj_init = nn.initializers.orthogonal(scale=1.0)
-        self.proj_attn = nn.Dense(
-            db * 3,
+        self.proj_attn = DenseBank(
+            self.router_num_stages, dm, db * 3,
             name='proj_attn',
             kernel_init=query_proj_init,
             bias_init=nn.initializers.zeros)
-        self.proj_rst = nn.Dense(
-            db,
+        self.proj_rst = DenseBank(
+            self.router_num_stages, dm, db,
             name='proj_rst',
             kernel_init=query_proj_init,
             bias_init=nn.initializers.zeros)
         self.q_op_write_query_proj = self.param(
-            'q_op_write_query_proj', query_proj_init, (dm, db))
+            'q_op_write_query_proj', query_proj_init,
+            (self.router_num_stages, dm, db))
         self.k_op_write_query_proj = self.param(
-            'k_op_write_query_proj', query_proj_init, (dm, db))
+            'k_op_write_query_proj', query_proj_init,
+            (self.router_num_stages, dm, db))
         self.v_op_write_query_proj = self.param(
-            'v_op_write_query_proj', query_proj_init, (dm, db))
+            'v_op_write_query_proj', query_proj_init,
+            (self.router_num_stages, dm, db))
         self.rst_op_write_query_proj = self.param(
-            'rst_op_write_query_proj', query_proj_init, (dm, db))
-        self.raw_tau_attn = nn.Dense(3, name='raw_tau_attn',
-            kernel_init=nn.initializers.zeros,
-            bias_init=lambda k, s, d: raw_tau_attn_bias_init.astype(d))
-        self.raw_tau_rst = nn.Dense(1, name='raw_tau_rst',
-            kernel_init=nn.initializers.zeros,
-            bias_init=lambda k, s, d: jnp.full(s, raw_tau_rst_bias_init, d))
+            'rst_op_write_query_proj', query_proj_init,
+            (self.router_num_stages, dm, db))
+
+    def __call__(self, x):
+        stage0 = jnp.asarray(0, dtype=jnp.int32)
+        return self.proj_attn(x, stage0) + jnp.pad(
+            self.proj_rst(x, stage0),
+            ((0, 0), (0, 0), (0, self.d_route * 2)))
 
 
 # ================================================================
@@ -2718,6 +2873,7 @@ class Router(nn.Module):
 def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           n_qk, n_v,
                           n_heads, d_model, n_layers,
+                          tau_init_attn_qk, tau_init_attn_v,
                           router_dropout, dropout_rate, deterministic,
                           sharded_fns,
                           soft_gate_temperature=0.07,
@@ -2759,9 +2915,8 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     h_V = _read_write_operator_query(
         v_read_query, x, router_params['v_op_write_query_proj'])
 
-    raw_tau_all = (
-        x @ router_params['raw_tau_attn']['kernel']
-        + router_params['raw_tau_attn']['bias'])
+    raw_tau_all = _fixed_raw_attn_tau(
+        x, tau_init_attn_qk, tau_init_attn_v)
     qk_scale, v_scale, _ = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
 
@@ -2819,6 +2974,7 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
                          router_dropout, dropout_rate, deterministic,
                          sharded_fns,
                          d_model=None, n_layers=None,
+                         tau_init_rst=None,
                          soft_gate_temperature=0.07,
                          soft_gate_t_final=0.07,
                          soft_gate_T_rst=None,
@@ -2846,9 +3002,7 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         rst_read_query, router_dropout, deterministic, rng_drop)
     h = _read_write_operator_query(
         rst_read_query, x, router_params['rst_op_write_query_proj'])
-    raw_tau = (
-        x @ router_params['raw_tau_rst']['kernel']
-        + router_params['raw_tau_rst']['bias'])
+    raw_tau = _fixed_raw_rst_tau(x, tau_init_rst)
     _, _, rst_scale = _pool_output_scales(d_model, n_layers)
     if isinstance(sharded_fns, dict):
         fused_single = sharded_fns.get(
@@ -2868,6 +3022,7 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
 def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
                   n_heads, d_model, n_layers,
+                  tau_init_attn_qk, tau_init_attn_v,
                   router_dropout, dropout_rate, deterministic,
                   sharded_fns, analysis=False,
                   soft_gate_temperature=0.07,
@@ -2933,15 +3088,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     h_V = _read_write_operator_query(
         v_read_query, x, router_params['v_op_write_query_proj'])
 
-    raw_tau_all = (
-        x @ router_params['raw_tau_attn']['kernel']
-        + router_params['raw_tau_attn']['bias'])
+    raw_tau_all = _fixed_raw_attn_tau(
+        x, tau_init_attn_qk, tau_init_attn_v)
     tau_all = _tau_from_param(raw_tau_all)
     if analysis:
         _tau_all_sg = jax.lax.stop_gradient(tau_all)
         attn_tau_std = _tau_all_sg.std(axis=(0, 1))  # [3] Q/K/V
-        attn_tau_kernel_norm = jnp.sqrt(
-            jnp.sum(jax.lax.stop_gradient(router_params['raw_tau_attn']['kernel']) ** 2) + 1e-12)
+        attn_tau_kernel_norm = jnp.float32(0.0)
 
     qk_scale, v_scale, _ = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
@@ -3290,6 +3443,7 @@ def _rst_forward(x, pool_params, router_params, rng,
                   router_dropout, dropout_rate, deterministic,
                   sharded_fns, analysis=False,
                   d_model=None, n_layers=None,
+                  tau_init_rst=None,
                   soft_gate_temperature=0.07,
                   soft_gate_t_final=0.07,
                   soft_gate_T_rst=None,
@@ -3322,14 +3476,11 @@ def _rst_forward(x, pool_params, router_params, rng,
     # RW-derived operator keys are passed into the sharded SRW closure.
     # The closure forward-normalizes them for selection stability.
     rst_op_key_unit = rst_op_key
-    raw_tau = (
-        x @ router_params['raw_tau_rst']['kernel']
-        + router_params['raw_tau_rst']['bias'])
+    raw_tau = _fixed_raw_rst_tau(x, tau_init_rst)
     tau = _tau_from_param(raw_tau)
     if analysis:
         rst_tau_std = jax.lax.stop_gradient(tau).std()
-        rst_tau_kernel_norm = jnp.sqrt(
-            jnp.sum(jax.lax.stop_gradient(router_params['raw_tau_rst']['kernel']) ** 2) + 1e-12)
+        rst_tau_kernel_norm = jnp.float32(0.0)
     if d_model is None or n_layers is None:
         raise ValueError(
             "depth-scaled pool outputs require d_model and n_layers.")
@@ -3471,8 +3622,8 @@ class DAWNBlock(nn.Module):
 # 8. DAWN Model
 # ================================================================
 
-class DAWN_SRW_V4166(nn.Module):
-    """DAWN-SRW v4.1.6.6 with live RW operator keys and product queries."""
+class DAWN_SRW_V4167(nn.Module):
+    """DAWN-SRW v4.1.6.7 with fixed tau and visible stage-local pools."""
     __version__ = MODEL_VERSION
 
     vocab_size: int = 30000
@@ -3488,6 +3639,17 @@ class DAWN_SRW_V4166(nn.Module):
     n_v: int = 2600
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Checkpoint/config alias; n_rst is canonical.
+    fixed_tau: bool = True
+    qk_num_stages: int = 1
+    v_num_stages: int = 1
+    rst_num_stages: int = 1
+    router_num_stages: int = 1
+    n_qk_shared: Optional[int] = None
+    n_qk_stage: int = 0
+    n_v_shared: Optional[int] = None
+    n_v_stage: int = 0
+    n_rst_shared: Optional[int] = None
+    n_rst_stage: int = 0
     router_dropout: float = 0.1
     n_chunks_rst: Optional[int] = None
     n_chunks_know: int = 1    # Config alias; n_chunks_rst is canonical.
@@ -3504,22 +3666,72 @@ class DAWN_SRW_V4166(nn.Module):
             raise ValueError(
                 f"d_model ({self.d_model}) must be divisible by "
                 f"n_heads ({self.n_heads})")
+        if not self.fixed_tau:
+            raise ValueError("v4167 is fixed-tau only; set fixed_tau: true.")
+        missing_tau = [
+            name for name, value in (
+                ('tau_init_attn_qk', self.tau_init_attn_qk),
+                ('tau_init_attn_v', self.tau_init_attn_v),
+                ('tau_init_rst', self.tau_init_rst),
+            ) if value is None
+        ]
+        if missing_tau:
+            raise ValueError(
+                "v4167 requires fixed cosine-space tau_init_attn_qk/v/rst; "
+                f"missing {', '.join(missing_tau)}.")
+        for name, num_stages in (
+                ('qk_num_stages', self.qk_num_stages),
+                ('v_num_stages', self.v_num_stages),
+                ('rst_num_stages', self.rst_num_stages),
+                ('router_num_stages', self.router_num_stages)):
+            if int(num_stages) <= 0:
+                raise ValueError(f"{name} must be > 0, got {num_stages}")
+            if self.n_layers % int(num_stages) != 0:
+                raise ValueError(
+                    f"n_layers={self.n_layers} must be divisible by "
+                    f"{name}={num_stages}")
+        n_rst_eff = self.n_rst if self.n_rst is not None else (
+            self.n_know if self.n_know is not None else 25200)
+        n_qk_shared = (
+            self.n_qk if self.n_qk_shared is None else self.n_qk_shared)
+        n_v_shared = (
+            self.n_v if self.n_v_shared is None else self.n_v_shared)
+        n_rst_shared = (
+            n_rst_eff if self.n_rst_shared is None else self.n_rst_shared)
+        expected_n_qk = n_qk_shared + self.qk_num_stages * self.n_qk_stage
+        expected_n_v = n_v_shared + self.v_num_stages * self.n_v_stage
+        expected_n_rst = n_rst_shared + self.rst_num_stages * self.n_rst_stage
+        if self.n_qk != expected_n_qk:
+            raise ValueError(
+                f"n_qk={self.n_qk} must equal n_qk_shared + "
+                f"qk_num_stages*n_qk_stage = {expected_n_qk}")
+        if self.n_v != expected_n_v:
+            raise ValueError(
+                f"n_v={self.n_v} must equal n_v_shared + "
+                f"v_num_stages*n_v_stage = {expected_n_v}")
+        if n_rst_eff != expected_n_rst:
+            raise ValueError(
+                f"n_rst={n_rst_eff} must equal n_rst_shared + "
+                f"rst_num_stages*n_rst_stage = {expected_n_rst}")
         self.token_emb = nn.Embed(
             self.vocab_size, self.d_model, embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(
             self.max_seq_len, self.d_model, embedding_init=scaled_normal(0.02))
-        n_rst_eff = self.n_rst if self.n_rst is not None else (
-            self.n_know if self.n_know is not None else 25200)
         self.neuron_pool = NeuronPool(
-            n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
+            n_qk_shared=n_qk_shared,
+            n_qk_stage=self.n_qk_stage,
+            n_v_shared=n_v_shared,
+            n_v_stage=self.n_v_stage,
+            n_rst_shared=n_rst_shared,
+            n_rst_stage=self.n_rst_stage,
+            qk_num_stages=self.qk_num_stages,
+            v_num_stages=self.v_num_stages,
+            rst_num_stages=self.rst_num_stages,
             d_model=self.d_model, d_route=self.d_route)
-        self.router = Router(
+        self.router = RouterBank(
             d_model=self.d_model, d_route=self.d_route,
-            n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
-            router_dropout=self.router_dropout,
-            tau_init_attn_qk=self.tau_init_attn_qk,
-            tau_init_attn_v=self.tau_init_attn_v,
-            tau_init_rst=self.tau_init_rst)
+            router_num_stages=self.router_num_stages,
+            router_dropout=self.router_dropout)
         self.layers = [
             DAWNBlock(d_model=self.d_model, n_heads=self.n_heads,
                       dropout_rate=self.dropout_rate, name=f'block_{i}')
@@ -3559,6 +3771,15 @@ class DAWN_SRW_V4166(nn.Module):
         B, S = input_ids.shape
         if S > self.max_seq_len:
             raise ValueError(f"Sequence length {S} exceeds max_seq_len")
+        n_qk_shared = (
+            self.n_qk if self.n_qk_shared is None else self.n_qk_shared)
+        n_v_shared = (
+            self.n_v if self.n_v_shared is None else self.n_v_shared)
+        n_rst_shared = (
+            n_rst_eff if self.n_rst_shared is None else self.n_rst_shared)
+        qk_visible_n = n_qk_shared + self.n_qk_stage
+        v_visible_n = n_v_shared + self.n_v_stage
+        rst_visible_n = n_rst_shared + self.n_rst_stage
 
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = self.token_emb(input_ids) + self.pos_emb(positions)
@@ -3698,17 +3919,19 @@ class DAWN_SRW_V4166(nn.Module):
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
-            _ = self.neuron_pool.attn_qk_read  # triggers NeuronPool.setup
+            _ = self.neuron_pool.attn_qk_read_shared  # triggers NeuronPool.setup
+            _ = self.neuron_pool.attn_v_read_shared
+            _ = self.neuron_pool.rst_read_shared
+            _ = self.neuron_pool.attn_qk_write_shared
+            _ = self.neuron_pool.attn_v_write_shared
+            _ = self.neuron_pool.rst_write_shared
             _ = self.neuron_pool.attn_qk_op_read_proj
             _ = self.neuron_pool.attn_qk_op_write_proj
             _ = self.neuron_pool.attn_v_op_read_proj
             _ = self.neuron_pool.attn_v_op_write_proj
             _ = self.neuron_pool.rst_op_read_proj
             _ = self.neuron_pool.rst_op_write_proj
-            _ = self.router.proj_attn(x)
-            _ = self.router.proj_rst(x)
-            _ = self.router.raw_tau_attn(x)
-            _ = self.router.raw_tau_rst(x)
+            _ = self.router(x)
             for layer in self.layers:
                 _ = layer.norm1(x)
                 _ = layer.norm2(x)
@@ -3734,15 +3957,29 @@ class DAWN_SRW_V4166(nn.Module):
                     x = carry
                     bp = xs['params']
                     rng = xs['rng']
+                    layer_idx = xs['layer_idx']
                     rng, rng_attn, rng_rst = jax.random.split(rng, 3)
+                    qk_stage_id = _stage_id(
+                        layer_idx, self.n_layers, self.qk_num_stages)
+                    v_stage_id = _stage_id(
+                        layer_idx, self.n_layers, self.v_num_stages)
+                    rst_stage_id = _stage_id(
+                        layer_idx, self.n_layers, self.rst_num_stages)
+                    router_id = _stage_id(
+                        layer_idx, self.n_layers, self.router_num_stages)
+                    visible_pool_params = _visible_pool_params(
+                        pool_params, qk_stage_id, v_stage_id, rst_stage_id)
+                    router_params_layer = _select_router_params(
+                        router_params, router_id)
 
                     normed = _layer_norm(
                         x, bp['norm1']['scale'], bp['norm1']['bias'])
                     attn_out = _attn_forward_minimal(
-                        normed, pool_params, router_params,
+                        normed, visible_pool_params, router_params_layer,
                         bp['attn']['expand_O']['kernel'], rng_attn,
-                        self.n_qk, self.n_v,
+                        qk_visible_n, v_visible_n,
                         self.n_heads, self.d_model, self.n_layers,
+                        self.tau_init_attn_qk, self.tau_init_attn_v,
                         self.router_dropout, self.dropout_rate,
                         deterministic,
                         sharded_fns=_sharded,
@@ -3759,12 +3996,14 @@ class DAWN_SRW_V4166(nn.Module):
                     normed = _layer_norm(
                         x, bp['norm2']['scale'], bp['norm2']['bias'])
                     rst_out = _rst_forward_minimal(
-                        normed, pool_params, router_params, rng_rst,
+                        normed, visible_pool_params, router_params_layer,
+                        rng_rst,
                         self.router_dropout, self.dropout_rate,
                         deterministic,
                         sharded_fns=_sharded,
                         d_model=self.d_model,
                         n_layers=self.n_layers,
+                        tau_init_rst=self.tau_init_rst,
                         soft_gate_temperature=soft_gate_temperature,
                         soft_gate_t_final=soft_gate_t_final,
                         soft_gate_T_rst=soft_gate_T_rst,
@@ -3780,6 +4019,7 @@ class DAWN_SRW_V4166(nn.Module):
                 xs_minimal = {
                     'params': stacked,
                     'rng': layer_rngs,
+                    'layer_idx': jnp.arange(self.n_layers, dtype=jnp.int32),
                 }
                 x, _ = jax.lax.scan(scan_body_minimal, x, xs_minimal)
                 x = self.norm(x)
@@ -3821,15 +4061,28 @@ class DAWN_SRW_V4166(nn.Module):
                 rng = xs['rng']
                 layer_idx = xs['layer_idx']
                 rng, rng_attn, rng_rst = jax.random.split(rng, 3)
+                qk_stage_id = _stage_id(
+                    layer_idx, self.n_layers, self.qk_num_stages)
+                v_stage_id = _stage_id(
+                    layer_idx, self.n_layers, self.v_num_stages)
+                rst_stage_id = _stage_id(
+                    layer_idx, self.n_layers, self.rst_num_stages)
+                router_id = _stage_id(
+                    layer_idx, self.n_layers, self.router_num_stages)
+                visible_pool_params = _visible_pool_params(
+                    pool_params, qk_stage_id, v_stage_id, rst_stage_id)
+                router_params_layer = _select_router_params(
+                    router_params, router_id)
 
                 x_pre_attn = x
                 normed = _layer_norm(
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
                 attn_ret = _attn_forward(
-                    normed, pool_params, router_params,
+                    normed, visible_pool_params, router_params_layer,
                     bp['attn']['expand_O']['kernel'], rng_attn,
-                    self.n_qk, self.n_v,
+                    qk_visible_n, v_visible_n,
                     self.n_heads, self.d_model, self.n_layers,
+                    self.tau_init_attn_qk, self.tau_init_attn_v,
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
                     soft_gate_temperature=soft_gate_temperature,
@@ -3896,10 +4149,12 @@ class DAWN_SRW_V4166(nn.Module):
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
                 rst_ret = _rst_forward(
-                    normed, pool_params, router_params, rng_rst,
+                    normed, visible_pool_params, router_params_layer,
+                    rng_rst,
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
                     d_model=self.d_model, n_layers=self.n_layers,
+                    tau_init_rst=self.tau_init_rst,
                     soft_gate_temperature=soft_gate_temperature,
                     soft_gate_t_final=soft_gate_t_final,
                     soft_gate_T_rst=soft_gate_T_rst,
@@ -4194,8 +4449,8 @@ class DAWN_SRW_V4166(nn.Module):
                               + rst_current_cost_mean_all.mean(), 1.0e-8)),
             'execution_estimated_compute_frac': (
                 (attn_active_n_mean_all.mean() + rst_active_n_mean_all.mean())
-                / jnp.maximum(jnp.float32(self.n_qk + self.n_v)
-                              + jnp.float32(n_rst_eff), 1.0)),
+                / jnp.maximum(jnp.float32(qk_visible_n + v_visible_n)
+                              + jnp.float32(rst_visible_n), 1.0)),
             'execution_prune_gate_den_mean': (
                 attn_den_cost_mean_all.mean() + rst_den_cost_mean_all.mean()) / 2.0,
             'execution_prune_gate_den_min': jnp.minimum(
@@ -4214,6 +4469,17 @@ class DAWN_SRW_V4166(nn.Module):
                 attn_v_edge_margin_stat_all.mean()),
             'edge_margin_stat_rst': (
                 rst_edge_margin_stat_all.mean()),
+            'qk_visible_n': jnp.float32(qk_visible_n),
+            'v_visible_n': jnp.float32(v_visible_n),
+            'rst_visible_n': jnp.float32(rst_visible_n),
+            'qk_total_n': jnp.float32(self.n_qk),
+            'v_total_n': jnp.float32(self.n_v),
+            'rst_total_n': jnp.float32(n_rst_eff),
+            'qk_num_stages': jnp.float32(self.qk_num_stages),
+            'v_num_stages': jnp.float32(self.v_num_stages),
+            'rst_num_stages': jnp.float32(self.rst_num_stages),
+            'router_num_stages': jnp.float32(self.router_num_stages),
+            'fixed_tau': jnp.float32(1.0 if self.fixed_tau else 0.0),
 
             'rst_active': rst_active_all.mean(),
             'rst_raw_gate_max': rst_raw_gmax_all.mean(),
@@ -4660,6 +4926,12 @@ class DAWN_SRW_V4166(nn.Module):
     def get_config(self):
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
+        n_qk_shared = (
+            self.n_qk if self.n_qk_shared is None else self.n_qk_shared)
+        n_v_shared = (
+            self.n_v if self.n_v_shared is None else self.n_v_shared)
+        n_rst_shared = (
+            n_rst_eff if self.n_rst_shared is None else self.n_rst_shared)
         cfg = {
             'model_version': self.__version__,
             'vocab_size': self.vocab_size, 'd_model': self.d_model,
@@ -4668,28 +4940,57 @@ class DAWN_SRW_V4166(nn.Module):
             'd_route': self.d_route,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
+            'fixed_tau': self.fixed_tau,
+            'qk_num_stages': self.qk_num_stages,
+            'v_num_stages': self.v_num_stages,
+            'rst_num_stages': self.rst_num_stages,
+            'router_num_stages': self.router_num_stages,
+            'n_qk_shared': n_qk_shared,
+            'n_qk_stage': self.n_qk_stage,
+            'n_v_shared': n_v_shared,
+            'n_v_stage': self.n_v_stage,
+            'n_rst_shared': n_rst_shared,
+            'n_rst_stage': self.n_rst_stage,
+            'qk_visible_n': n_qk_shared + self.n_qk_stage,
+            'v_visible_n': n_v_shared + self.n_v_stage,
+            'rst_visible_n': n_rst_shared + self.n_rst_stage,
         }
         return cfg
 
     def get_model_info(self):
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
+        n_qk_shared = (
+            self.n_qk if self.n_qk_shared is None else self.n_qk_shared)
+        n_v_shared = (
+            self.n_v if self.n_v_shared is None else self.n_v_shared)
+        n_rst_shared = (
+            n_rst_eff if self.n_rst_shared is None else self.n_rst_shared)
+        qk_visible_n = n_qk_shared + self.n_qk_stage
+        v_visible_n = n_v_shared + self.n_v_stage
+        rst_visible_n = n_rst_shared + self.n_rst_stage
         qk_scale, v_scale, rst_scale = _pool_output_scales(
             self.d_model, self.n_layers)
         return [
             f"DAWN-SRW ({self.__version__})",
             f"  d_model={self.d_model}, d_route={self.d_route}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
-            f"  Attention-QK: {self.n_qk}, Attention-V: {self.n_v}, RST: {n_rst_eff}",
-            "  Selection: live-gradient RW operator keys with fixed "
-            "RW-matched operator queries",
+            f"  Visible pools: qk={qk_visible_n}, v={v_visible_n}, "
+            f"rst={rst_visible_n}",
+            f"  Total pools: qk={self.n_qk}, v={self.n_v}, rst={n_rst_eff}",
+            f"  Stages: qk={self.qk_num_stages}, v={self.v_num_stages}, "
+            f"rst={self.rst_num_stages}, router={self.router_num_stages}",
+            f"  Fixed tau: qk={self.tau_init_attn_qk}, "
+            f"v={self.tau_init_attn_v}, rst={self.tau_init_rst}",
+            "  Selection: live-gradient RW operator keys with fixed tau "
+            "and RW-matched operator queries",
             "  Pool scales: fixed depth-scaled "
             f"(qk={float(qk_scale):.6g}, v={float(v_scale):.6g}, "
             f"rst={float(rst_scale):.6g})",
         ]
 
 
-DAWN = DAWN_SRW_V4166
+DAWN = DAWN_SRW_V4167
 
 
 # ================================================================
@@ -4732,10 +5033,10 @@ def _angular_execution_kwargs_from_model_cfg(model_cfg):
 def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
     """Sample fresh-init cosine scores without changing forward semantics.
 
-    The sample uses the first block's freshly initialized normalized route
-    states and the shared v4166 router/pool parameters. Rho follows the
-    train path exactly: RW-matched operator queries against live-gradient
-    RW-derived operator keys.
+    For the v4167 POC this uses layer 0 / router 0 and the corresponding
+    visible shared+stage-0 pools. Random init distributions are homogeneous
+    enough for the one-time quantile pass, and the important invariant is that
+    tau targets see visible_N rather than total_N.
     """
     max_tokens = int(max_tokens)
     if max_tokens <= 0:
@@ -4765,7 +5066,7 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
         x, block0['norm1']['scale'], block0['norm1']['bias'])
     rst_x = _layer_norm(
         x, block0['norm2']['scale'], block0['norm2']['bias'])
-    router = params['router']
+    router = _select_router_params(params['router'], jnp.asarray(0, jnp.int32))
     attn_read_query = (
         attn_x @ router['proj_attn']['kernel']
         + router['proj_attn']['bias'])
@@ -4789,16 +5090,23 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
         op_key_unit = op_key.astype(jnp.bfloat16)
         return (q_unit @ op_key_unit.T).astype(jnp.float32)
 
-    pool = params['neuron_pool']
-    op_keys = _ensure_pool_operator_keys(pool)
-    qk_op_key = op_keys['attn_qk_op_key']
-    v_op_key = op_keys['attn_v_op_key']
-    rst_op_key = op_keys['rst_op_key']
+    pool = _visible_pool_params(
+        _pool_params_with_operator_keys(params['neuron_pool']),
+        jnp.asarray(0, jnp.int32),
+        jnp.asarray(0, jnp.int32),
+        jnp.asarray(0, jnp.int32))
+    qk_op_key = pool['attn_qk_op_key']
+    v_op_key = pool['attn_v_op_key']
+    rst_op_key = pool['rst_op_key']
     return {
         'q': _selection_rho(h_q, qk_op_key),
         'k': _selection_rho(h_k, qk_op_key),
         'v': _selection_rho(h_v, v_op_key),
         'rst': _selection_rho(h_rst, rst_op_key),
+        'q_full_pool_size': jnp.asarray(qk_op_key.shape[0], dtype=jnp.float32),
+        'k_full_pool_size': jnp.asarray(qk_op_key.shape[0], dtype=jnp.float32),
+        'v_full_pool_size': jnp.asarray(v_op_key.shape[0], dtype=jnp.float32),
+        'rst_full_pool_size': jnp.asarray(rst_op_key.shape[0], dtype=jnp.float32),
     }
 
 
@@ -4911,6 +5219,8 @@ def _srw_inference_with_gates(x, h, op_key, raw_tau, raw_scan_offset, w_read,
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
                          n_heads, d_model, n_layers,
                          cache_K, cache_V, cache_len,
+                         tau_init_attn_qk=0.0,
+                         tau_init_attn_v=0.0,
                          angular_execution_kwargs=None):
     """Cached attention decode step. x: [B, 1, D]."""
     B = x.shape[0]
@@ -4925,7 +5235,7 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
     h_Q, h_K, h_V = _read_write_attn_operator_queries(
         router_params, x, h_Q, h_K, h_V)
-    tau_all = x @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
+    tau_all = _fixed_raw_attn_tau(x, tau_init_attn_qk, tau_init_attn_v)
     raw_scan_offset_all = jnp.zeros_like(tau_all)
 
     Q = _srw_inference(x, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
@@ -4965,6 +5275,7 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
 def _rst_forward_inference(x, pool_params, router_params,
                            d_model=None, n_layers=None,
+                           tau_init_rst=0.0,
                            angular_execution_kwargs=None):
     """Inference-only RST Layer forward. No chunking, no LB, no dropout."""
     if angular_execution_kwargs is None:
@@ -4973,7 +5284,7 @@ def _rst_forward_inference(x, pool_params, router_params,
     rst_norm = pool_params['rst_op_key']
     h = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
     h = _read_write_rst_operator_query(router_params, x, h)
-    tau = x @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
+    tau = _fixed_raw_rst_tau(x, tau_init_rst)
     raw_scan_offset = jnp.zeros_like(tau)
     out = _srw_inference(x, h, rst_norm, tau, raw_scan_offset,
                          pool_params['rst_read'], pool_params['rst_write'],
@@ -4992,6 +5303,9 @@ def prefill(params, model_cfg, input_ids):
 
     Returns: logits [B,S,vocab], cache_K, cache_V [n_layers,B,H,max_seq,d_head], cache_len
     """
+    raise NotImplementedError(
+        "v4167 generation prefill needs stage-aware KV cache wiring; "
+        "train/eval model.apply forward is implemented for the POC.")
     params = _squeeze_params(params)
     B, S = input_ids.shape
     d_model = model_cfg['d_model']
@@ -5028,7 +5342,10 @@ def prefill(params, model_cfg, input_ids):
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
         h_Q, h_K, h_V = _read_write_attn_operator_queries(
             router_params, normed, h_Q, h_K, h_V)
-        tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
+        tau_all = _fixed_raw_attn_tau(
+            normed,
+            model_cfg.get('tau_init_attn_qk', 0.0),
+            model_cfg.get('tau_init_attn_v', 0.0))
         raw_scan_offset_all = jnp.zeros_like(tau_all)
 
         Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
@@ -5082,6 +5399,9 @@ def prefill(params, model_cfg, input_ids):
 
 def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     """Single token decode with KV cache. Returns logits [B,vocab], updated cache."""
+    raise NotImplementedError(
+        "v4167 generation decode needs stage-aware KV cache wiring; "
+        "train/eval model.apply forward is implemented for the POC.")
     params = _squeeze_params(params)
     token_id = token_id.reshape(-1, 1)
     B = token_id.shape[0]
@@ -5143,6 +5463,9 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     Uses jax.lax.scan over batches, _srw_inference per layer (no chunking).
     Returns jnp scalars: avg_loss, ppl, accuracy, total_valid.
     """
+    raise NotImplementedError(
+        "v4167 vectorized_eval needs stage-aware router/pool selection; "
+        "use model.apply for POC train/eval forward.")
     params = _squeeze_params(params)
     n_seqs = all_tokens.shape[0]
     n_batches = n_seqs // batch_size
@@ -5180,7 +5503,10 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
             h_Q, h_K, h_V = _read_write_attn_operator_queries(
                 router_params, normed, h_Q, h_K, h_V)
-            tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
+            tau_all = _fixed_raw_attn_tau(
+                normed,
+                model_cfg.get('tau_init_attn_qk', 0.0),
+                model_cfg.get('tau_init_attn_v', 0.0))
             raw_scan_offset_all = jnp.zeros_like(tau_all)
 
             Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
@@ -5216,7 +5542,8 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
             h_k = _read_write_rst_operator_query(router_params, normed, h_k)
-            tau_k = normed @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
+            tau_k = _fixed_raw_rst_tau(
+                normed, model_cfg.get('tau_init_rst', 0.0))
             raw_scan_offset_k = jnp.zeros_like(tau_k)
             rst_out = _srw_inference(normed, h_k, rst_norm, tau_k, raw_scan_offset_k,
                                      pool_params['rst_read'], pool_params['rst_write'],
@@ -5262,13 +5589,11 @@ def vectorized_neuron_health(params):
     params = _squeeze_params(params)
     pool = _pool_params_with_operator_keys(params['neuron_pool'])
     results = {}
-    for pool_name, op_key_key, read_key, write_key in [
-            ('Attention-QK', 'attn_qk_op_key', 'attn_qk_read', 'attn_qk_write'),
-            ('Attention-V', 'attn_v_op_key', 'attn_v_read', 'attn_v_write'),
-            ('RST', 'rst_op_key', 'rst_read', 'rst_write')]:
-        op_key = pool[op_key_key]
-        read = pool[read_key]
-        write = pool[write_key]
+    for pool_name, prefix in [
+            ('Attention-QK', 'attn_qk'),
+            ('Attention-V', 'attn_v'),
+            ('RST', 'rst')]:
+        op_key, read, write = _flat_pool_for_health(pool, prefix)
         op_key_n = jnp.linalg.norm(op_key, axis=-1)
         read_n = jnp.linalg.norm(read, axis=-1)
         write_n = jnp.linalg.norm(write, axis=-1)
@@ -5282,8 +5607,7 @@ def vectorized_neuron_health(params):
             'write_mean': write_n.mean(), 'write_std': write_n.std(),
             'write_dead': (write_n < 1e-6).sum(),
         }
-    results['raw_tau_attn_bias'] = params['router']['raw_tau_attn']['bias']
-    results['raw_tau_rst_bias'] = params['router']['raw_tau_rst']['bias']
+    results['fixed_tau'] = jnp.asarray(1.0, dtype=jnp.float32)
     return results
 
 
@@ -5292,11 +5616,11 @@ def vectorized_weight_analysis(params, max_sample=2048):
     params = _squeeze_params(params)
     pool = _pool_params_with_operator_keys(params['neuron_pool'])
     results = {}
-    for pool_name, op_key_key in [
-            ('Attention-QK', 'attn_qk_op_key'),
-            ('Attention-V', 'attn_v_op_key'),
-            ('RST', 'rst_op_key')]:
-        op_key = pool[op_key_key]
+    for pool_name, prefix in [
+            ('Attention-QK', 'attn_qk'),
+            ('Attention-V', 'attn_v'),
+            ('RST', 'rst')]:
+        op_key, _, _ = _flat_pool_for_health(pool, prefix)
         N, d = op_key.shape
         if N > max_sample:
             idx = jnp.linspace(0, N - 1, max_sample, dtype=jnp.int32)
@@ -5344,6 +5668,9 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
             attn_out_norm: [n_layers]
             rst_out_norm: [n_layers]
     """
+    raise NotImplementedError(
+        "v4167 analysis_forward needs stage-aware gate tensor packing; "
+        "core train/eval forward and health/calibration helpers are implemented.")
     params = _squeeze_params(params)
     B, S = input_ids.shape
     d_model = model_cfg['d_model']
@@ -5377,7 +5704,10 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
         h_Q, h_K, h_V = _read_write_attn_operator_queries(
             router_params, normed, h_Q, h_K, h_V)
-        tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
+        tau_all = _fixed_raw_attn_tau(
+            normed,
+            model_cfg.get('tau_init_attn_qk', 0.0),
+            model_cfg.get('tau_init_attn_v', 0.0))
         raw_scan_offset_all = jnp.zeros_like(tau_all)
 
         Q, gate_Q_raw, gate_Q = _srw_inference_with_gates(
@@ -5416,7 +5746,8 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
         h_k = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
         h_k = _read_write_rst_operator_query(router_params, normed, h_k)
-        tau_k = normed @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
+        tau_k = _fixed_raw_rst_tau(
+            normed, model_cfg.get('tau_init_rst', 0.0))
         raw_scan_offset_k = jnp.zeros_like(tau_k)
         rst_out, gate_RST_raw, gate_RST = _srw_inference_with_gates(
             normed, h_k, rst_norm_w, tau_k, raw_scan_offset_k,
@@ -5460,6 +5791,9 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
     True = suppress.
     Returns: forward_fn(input_ids) -> logits [B, S, vocab]
     """
+    raise NotImplementedError(
+        "v4167 suppressed forward needs stage-aware suppress masks; "
+        "core POC training forward is implemented.")
     params = _squeeze_params(params)
     params = jax.tree.map(jnp.asarray, params)
     angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
@@ -5514,7 +5848,10 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
             h_Q, h_K, h_V = _read_write_attn_operator_queries(
                 rp, normed, h_Q, h_K, h_V)
-            tau_all = normed @ rp['raw_tau_attn']['kernel'] + rp['raw_tau_attn']['bias']
+            tau_all = _fixed_raw_attn_tau(
+                normed,
+                model_cfg.get('tau_init_attn_qk', 0.0),
+                model_cfg.get('tau_init_attn_v', 0.0))
             raw_scan_offset_all = jnp.zeros_like(tau_all)
 
             Q = _srw_sup(normed, h_Q, qk_n, tau_all[:,:,0:1], raw_scan_offset_all[:,:,0:1], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult)
@@ -5541,7 +5878,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ rp['proj_rst']['kernel'] + rp['proj_rst']['bias']
             h_k = _read_write_rst_operator_query(rp, normed, h_k)
-            tau_k = normed @ rp['raw_tau_rst']['kernel'] + rp['raw_tau_rst']['bias']
+            tau_k = _fixed_raw_rst_tau(
+                normed, model_cfg.get('tau_init_rst', 0.0))
             raw_scan_offset_k = jnp.zeros_like(tau_k)
             x = x + _srw_sup(normed, h_k, kn_n, tau_k, raw_scan_offset_k, pp['rst_read'], pp['rst_write'], rst_mult) * rst_scale_eff
 
