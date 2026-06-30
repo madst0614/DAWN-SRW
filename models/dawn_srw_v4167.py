@@ -383,7 +383,8 @@ def _pool_params_with_operator_keys(pool_params):
 
 
 def _ensure_pool_operator_keys(pool_params):
-    if 'attn_qk_op_key_shared' in pool_params:
+    if ('attn_qk_op_key_shared' in pool_params
+            or 'attn_qk_op_key' in pool_params):
         return pool_params
     return _pool_params_with_operator_keys(pool_params)
 
