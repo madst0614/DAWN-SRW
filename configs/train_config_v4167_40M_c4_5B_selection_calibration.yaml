@@ -20,24 +20,24 @@ model:
   fixed_tau: true
   layers_per_stage: 3
   router_scope: local
-  n_qk: 1764
-  n_v: 5490
-  n_rst: 14746
-  n_qk_global: 176
+  n_qk: 1754
+  n_v: 5461
+  n_rst: 14666
+  n_qk_global: 178
   n_qk_stage: 88
-  n_qk_local: 103
-  n_v_global: 554
+  n_qk_local: 102
+  n_v_global: 549
   n_v_stage: 274
-  n_v_local: 320
-  n_rst_global: 1478
-  n_rst_stage: 737
-  n_rst_local: 860
+  n_v_local: 318
+  n_rst_global: 1462
+  n_rst_stage: 733
+  n_rst_local: 856
   tau_init_min: -0.95
   tau_init_max: 0.95
   tau_init_mode: quantile_frac
-  tau_init_target_qk_frac: 0.10
-  tau_init_target_v_frac: 0.04
-  tau_init_target_rst_frac: 0.02
+  tau_init_target_qk_frac: 0.466
+  tau_init_target_v_frac: 0.284
+  tau_init_target_rst_frac: 0.300
 
 training:
   batch_size: 128
@@ -74,19 +74,19 @@ training:
     candidate_eps: 1.0e-3
 
     active_target:
-      qk: 0.08
-      v: 0.08
-      rst: 0.04
+      qk: 0.466
+      v: 0.284
+      rst: 0.300
 
     candidate_target_start:
-      qk: 0.16
-      v: 0.16
-      rst: 0.08
+      qk: 0.62
+      v: 0.42
+      rst: 0.42
 
     candidate_target_final:
-      qk: 0.08
-      v: 0.08
-      rst: 0.04
+      qk: 0.466
+      v: 0.284
+      rst: 0.300
 
     B_floor:
       qk: 0.001
@@ -119,4 +119,4 @@ training:
   log_analysis_multiplier: 5
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_gsl_40M_c4_5B_d432_ratio400
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4167_40M_c4_5B
