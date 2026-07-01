@@ -1,5 +1,5 @@
 """
-DAWN-SRW v4.1.6.7 Operator-Key Select FixedTau StagePools
+DAWN-SRW v4.1.6.7 Operator-Key Select FixedTau GSL Pools
 
 Clean v4166 experimental model path.
 
@@ -12,8 +12,8 @@ Implemented concepts:
 - scheduled soft-gate boundary-scale input
 - scheduled boundary power input
 - fixed tau from calibrated cosine thresholds; no token-conditioned tau params
-- shared + stage-local V/RST operator pools selected before fused SRW
-- layer-specific router bank
+- global + stage + layer-local operator pools selected before fused SRW
+- layer-local router bank
 - train-time effective gate statistics
 - validation-time execution pruning through execution_prune_eps
 """
@@ -356,83 +356,87 @@ def _pool_operator_keys(pool_params):
     for prefix in ('attn_qk', 'attn_v', 'rst'):
         read_proj = pool_params[f'{prefix}_op_read_proj']
         write_proj = pool_params[f'{prefix}_op_write_proj']
-        read_shared_key = f'{prefix}_read_shared'
-        write_shared_key = f'{prefix}_write_shared'
-        if read_shared_key in pool_params and write_shared_key in pool_params:
-            out[f'{prefix}_op_key_shared'] = _rw_operator_key(
-                pool_params[read_shared_key],
-                pool_params[write_shared_key],
-                read_proj,
-                write_proj)
-        read_stage_key = f'{prefix}_read_stage'
-        write_stage_key = f'{prefix}_write_stage'
-        if read_stage_key in pool_params and write_stage_key in pool_params:
-            out[f'{prefix}_op_key_stage'] = _rw_operator_key(
-                pool_params[read_stage_key],
-                pool_params[write_stage_key],
-                read_proj,
-                write_proj)
+        for scope in ('global', 'stage', 'local'):
+            read_key = f'{prefix}_read_{scope}'
+            write_key = f'{prefix}_write_{scope}'
+            if read_key in pool_params and write_key in pool_params:
+                out[f'{prefix}_op_key_{scope}'] = _rw_operator_key(
+                    pool_params[read_key],
+                    pool_params[write_key],
+                    read_proj,
+                    write_proj)
     return out
 
 
 def _pool_params_with_operator_keys(pool_params):
-    """Attach per-forward shared op keys without recomputing in each layer."""
+    """Attach per-forward GSL op keys without recomputing in each layer."""
     out = unfreeze(pool_params) if isinstance(pool_params, FrozenDict) else dict(pool_params)
     out.update(_pool_operator_keys(pool_params))
     return out
 
 
 def _ensure_pool_operator_keys(pool_params):
-    if ('attn_qk_op_key_shared' in pool_params
+    if ('attn_qk_op_key_global' in pool_params
             or 'attn_qk_op_key' in pool_params):
         return pool_params
     return _pool_params_with_operator_keys(pool_params)
 
 
-def _stage_id(layer_idx, n_layers, num_stages):
-    if int(num_stages) <= 0:
-        raise ValueError(f"num_stages must be > 0, got {num_stages}")
-    if int(n_layers) % int(num_stages) != 0:
+def _stage_id(layer_idx, n_layers, layers_per_stage):
+    if int(layers_per_stage) <= 0:
         raise ValueError(
-            f"n_layers={n_layers} must be divisible by num_stages={num_stages}")
-    layers_per_stage = int(n_layers) // int(num_stages)
+            f"layers_per_stage must be > 0, got {layers_per_stage}")
+    if int(n_layers) % int(layers_per_stage) != 0:
+        raise ValueError(
+            f"n_layers={n_layers} must be divisible by "
+            f"layers_per_stage={layers_per_stage}")
     return jnp.asarray(layer_idx, dtype=jnp.int32) // jnp.asarray(
         layers_per_stage, dtype=jnp.int32)
 
 
-def _visible_pool(pool_params, prefix, stage_id):
-    """Return shared plus one selected stage, already reduced for fused SRW."""
+def _visible_pool(pool_params, prefix, stage_id, layer_idx):
+    """Return global + selected stage + selected layer-local pool."""
     pool_params = _ensure_pool_operator_keys(pool_params)
-    op_key = pool_params[f'{prefix}_op_key_shared']
-    read = pool_params[f'{prefix}_read_shared']
-    write = pool_params[f'{prefix}_write_shared']
+    op_parts = [pool_params[f'{prefix}_op_key_global']]
+    read_parts = [pool_params[f'{prefix}_read_global']]
+    write_parts = [pool_params[f'{prefix}_write_global']]
 
     op_stage_key = f'{prefix}_op_key_stage'
     read_stage_key = f'{prefix}_read_stage'
     write_stage_key = f'{prefix}_write_stage'
-    if op_stage_key not in pool_params:
-        return op_key, read, write
+    if op_stage_key in pool_params:
+        op_parts.append(jax.lax.dynamic_index_in_dim(
+            pool_params[op_stage_key], stage_id, axis=0, keepdims=False))
+        read_parts.append(jax.lax.dynamic_index_in_dim(
+            pool_params[read_stage_key], stage_id, axis=0, keepdims=False))
+        write_parts.append(jax.lax.dynamic_index_in_dim(
+            pool_params[write_stage_key], stage_id, axis=0, keepdims=False))
 
-    stage_op_key = jax.lax.dynamic_index_in_dim(
-        pool_params[op_stage_key], stage_id, axis=0, keepdims=False)
-    stage_read = jax.lax.dynamic_index_in_dim(
-        pool_params[read_stage_key], stage_id, axis=0, keepdims=False)
-    stage_write = jax.lax.dynamic_index_in_dim(
-        pool_params[write_stage_key], stage_id, axis=0, keepdims=False)
+    op_local_key = f'{prefix}_op_key_local'
+    read_local_key = f'{prefix}_read_local'
+    write_local_key = f'{prefix}_write_local'
+    if op_local_key in pool_params:
+        op_parts.append(jax.lax.dynamic_index_in_dim(
+            pool_params[op_local_key], layer_idx, axis=0, keepdims=False))
+        read_parts.append(jax.lax.dynamic_index_in_dim(
+            pool_params[read_local_key], layer_idx, axis=0, keepdims=False))
+        write_parts.append(jax.lax.dynamic_index_in_dim(
+            pool_params[write_local_key], layer_idx, axis=0, keepdims=False))
+
     return (
-        jnp.concatenate([op_key, stage_op_key], axis=0),
-        jnp.concatenate([read, stage_read], axis=0),
-        jnp.concatenate([write, stage_write], axis=0),
+        jnp.concatenate(op_parts, axis=0),
+        jnp.concatenate(read_parts, axis=0),
+        jnp.concatenate(write_parts, axis=0),
     )
 
 
-def _visible_pool_params(pool_params, qk_stage_id, v_stage_id, rst_stage_id):
+def _visible_pool_params(pool_params, stage_id, layer_idx):
     qk_op_key, qk_read, qk_write = _visible_pool(
-        pool_params, 'attn_qk', qk_stage_id)
+        pool_params, 'attn_qk', stage_id, layer_idx)
     v_op_key, v_read, v_write = _visible_pool(
-        pool_params, 'attn_v', v_stage_id)
+        pool_params, 'attn_v', stage_id, layer_idx)
     rst_op_key, rst_read, rst_write = _visible_pool(
-        pool_params, 'rst', rst_stage_id)
+        pool_params, 'rst', stage_id, layer_idx)
     return {
         'attn_qk_op_key': qk_op_key,
         'attn_qk_read': qk_read,
@@ -493,24 +497,24 @@ def _fixed_raw_rst_tau(x, tau_init_rst):
 
 def _flat_pool_for_health(pool_params, prefix):
     pool_params = _ensure_pool_operator_keys(pool_params)
-    op_key = pool_params[f'{prefix}_op_key_shared']
-    read = pool_params[f'{prefix}_read_shared']
-    write = pool_params[f'{prefix}_write_shared']
-    if f'{prefix}_op_key_stage' not in pool_params:
-        return op_key, read, write
+    op_parts = [pool_params[f'{prefix}_op_key_global']]
+    read_parts = [pool_params[f'{prefix}_read_global']]
+    write_parts = [pool_params[f'{prefix}_write_global']]
+    for scope in ('stage', 'local'):
+        op_key = f'{prefix}_op_key_{scope}'
+        read_key = f'{prefix}_read_{scope}'
+        write_key = f'{prefix}_write_{scope}'
+        if op_key in pool_params:
+            op_parts.append(pool_params[op_key].reshape(
+                (-1, pool_params[op_key].shape[-1])))
+            read_parts.append(pool_params[read_key].reshape(
+                (-1, pool_params[read_key].shape[-1])))
+            write_parts.append(pool_params[write_key].reshape(
+                (-1, pool_params[write_key].shape[-1])))
     return (
-        jnp.concatenate(
-            [op_key, pool_params[f'{prefix}_op_key_stage'].reshape(
-                (-1, op_key.shape[-1]))],
-            axis=0),
-        jnp.concatenate(
-            [read, pool_params[f'{prefix}_read_stage'].reshape(
-                (-1, read.shape[-1]))],
-            axis=0),
-        jnp.concatenate(
-            [write, pool_params[f'{prefix}_write_stage'].reshape(
-                (-1, write.shape[-1]))],
-            axis=0),
+        jnp.concatenate(op_parts, axis=0),
+        jnp.concatenate(read_parts, axis=0),
+        jnp.concatenate(write_parts, axis=0),
     )
 
 
@@ -2716,15 +2720,17 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
 # ================================================================
 
 class NeuronPool(nn.Module):
-    n_qk_shared: int
+    n_qk_global: int
     n_qk_stage: int
-    n_v_shared: int
+    n_qk_local: int
+    n_v_global: int
     n_v_stage: int
-    n_rst_shared: int
+    n_v_local: int
+    n_rst_global: int
     n_rst_stage: int
-    qk_num_stages: int
-    v_num_stages: int
-    rst_num_stages: int
+    n_rst_local: int
+    stage_count: int
+    n_layers: int
     d_model: int
     d_route: int
 
@@ -2734,45 +2740,69 @@ class NeuronPool(nn.Module):
 
         # Read vectors define what each neuron extracts from x.
         # Stored vectors remain raw; SRW forward uses their directions.
-        self.attn_qk_read_shared = self.param(
-            'attn_qk_read_shared', unit_norm_init(), (self.n_qk_shared, dm))
-        self.attn_v_read_shared = self.param(
-            'attn_v_read_shared', unit_norm_init(), (self.n_v_shared, dm))
-        self.rst_read_shared = self.param(
-            'rst_read_shared', unit_norm_init(), (self.n_rst_shared, dm))
+        self.attn_qk_read_global = self.param(
+            'attn_qk_read_global', unit_norm_init(), (self.n_qk_global, dm))
+        self.attn_v_read_global = self.param(
+            'attn_v_read_global', unit_norm_init(), (self.n_v_global, dm))
+        self.rst_read_global = self.param(
+            'rst_read_global', unit_norm_init(), (self.n_rst_global, dm))
         if self.n_qk_stage > 0:
             self.attn_qk_read_stage = self.param(
                 'attn_qk_read_stage', unit_norm_init(),
-                (self.qk_num_stages, self.n_qk_stage, dm))
+                (self.stage_count, self.n_qk_stage, dm))
         if self.n_v_stage > 0:
             self.attn_v_read_stage = self.param(
                 'attn_v_read_stage', unit_norm_init(),
-                (self.v_num_stages, self.n_v_stage, dm))
+                (self.stage_count, self.n_v_stage, dm))
         if self.n_rst_stage > 0:
             self.rst_read_stage = self.param(
                 'rst_read_stage', unit_norm_init(),
-                (self.rst_num_stages, self.n_rst_stage, dm))
+                (self.stage_count, self.n_rst_stage, dm))
+        if self.n_qk_local > 0:
+            self.attn_qk_read_local = self.param(
+                'attn_qk_read_local', unit_norm_init(),
+                (self.n_layers, self.n_qk_local, dm))
+        if self.n_v_local > 0:
+            self.attn_v_read_local = self.param(
+                'attn_v_read_local', unit_norm_init(),
+                (self.n_layers, self.n_v_local, dm))
+        if self.n_rst_local > 0:
+            self.rst_read_local = self.param(
+                'rst_read_local', unit_norm_init(),
+                (self.n_layers, self.n_rst_local, dm))
 
         # Write vectors define the output direction for each neuron.
         # Raw parameter norms are still observable diagnostics.
-        self.attn_qk_write_shared = self.param(
-            'attn_qk_write_shared', unit_norm_init(), (self.n_qk_shared, dm))
-        self.attn_v_write_shared = self.param(
-            'attn_v_write_shared', unit_norm_init(), (self.n_v_shared, dm))
-        self.rst_write_shared = self.param(
-            'rst_write_shared', unit_norm_init(), (self.n_rst_shared, dm))
+        self.attn_qk_write_global = self.param(
+            'attn_qk_write_global', unit_norm_init(), (self.n_qk_global, dm))
+        self.attn_v_write_global = self.param(
+            'attn_v_write_global', unit_norm_init(), (self.n_v_global, dm))
+        self.rst_write_global = self.param(
+            'rst_write_global', unit_norm_init(), (self.n_rst_global, dm))
         if self.n_qk_stage > 0:
             self.attn_qk_write_stage = self.param(
                 'attn_qk_write_stage', unit_norm_init(),
-                (self.qk_num_stages, self.n_qk_stage, dm))
+                (self.stage_count, self.n_qk_stage, dm))
         if self.n_v_stage > 0:
             self.attn_v_write_stage = self.param(
                 'attn_v_write_stage', unit_norm_init(),
-                (self.v_num_stages, self.n_v_stage, dm))
+                (self.stage_count, self.n_v_stage, dm))
         if self.n_rst_stage > 0:
             self.rst_write_stage = self.param(
                 'rst_write_stage', unit_norm_init(),
-                (self.rst_num_stages, self.n_rst_stage, dm))
+                (self.stage_count, self.n_rst_stage, dm))
+        if self.n_qk_local > 0:
+            self.attn_qk_write_local = self.param(
+                'attn_qk_write_local', unit_norm_init(),
+                (self.n_layers, self.n_qk_local, dm))
+        if self.n_v_local > 0:
+            self.attn_v_write_local = self.param(
+                'attn_v_write_local', unit_norm_init(),
+                (self.n_layers, self.n_v_local, dm))
+        if self.n_rst_local > 0:
+            self.rst_write_local = self.param(
+                'rst_write_local', unit_norm_init(),
+                (self.n_layers, self.n_rst_local, dm))
 
         op_proj_scale = math.sqrt(float(dm) / float(db))
         op_proj_init = nn.initializers.orthogonal(scale=op_proj_scale)
@@ -2830,7 +2860,7 @@ class DenseBank(nn.Module):
 class RouterBank(nn.Module):
     d_model: int
     d_route: int
-    router_num_stages: int
+    router_count: int
     router_dropout: float = 0.1
 
     def setup(self):
@@ -2838,27 +2868,27 @@ class RouterBank(nn.Module):
         dm = self.d_model
         query_proj_init = nn.initializers.orthogonal(scale=1.0)
         self.proj_attn = DenseBank(
-            self.router_num_stages, dm, db * 3,
+            self.router_count, dm, db * 3,
             name='proj_attn',
             kernel_init=query_proj_init,
             bias_init=nn.initializers.zeros)
         self.proj_rst = DenseBank(
-            self.router_num_stages, dm, db,
+            self.router_count, dm, db,
             name='proj_rst',
             kernel_init=query_proj_init,
             bias_init=nn.initializers.zeros)
         self.q_op_write_query_proj = self.param(
             'q_op_write_query_proj', query_proj_init,
-            (self.router_num_stages, dm, db))
+            (self.router_count, dm, db))
         self.k_op_write_query_proj = self.param(
             'k_op_write_query_proj', query_proj_init,
-            (self.router_num_stages, dm, db))
+            (self.router_count, dm, db))
         self.v_op_write_query_proj = self.param(
             'v_op_write_query_proj', query_proj_init,
-            (self.router_num_stages, dm, db))
+            (self.router_count, dm, db))
         self.rst_op_write_query_proj = self.param(
             'rst_op_write_query_proj', query_proj_init,
-            (self.router_num_stages, dm, db))
+            (self.router_count, dm, db))
 
     def __call__(self, x):
         stage0 = jnp.asarray(0, dtype=jnp.int32)
@@ -3624,7 +3654,7 @@ class DAWNBlock(nn.Module):
 # ================================================================
 
 class DAWN_SRW_V4167(nn.Module):
-    """DAWN-SRW v4.1.6.7 with fixed tau and visible stage-local pools."""
+    """DAWN-SRW v4.1.6.7 with fixed tau and GSL visible pools."""
     __version__ = MODEL_VERSION
 
     vocab_size: int = 30000
@@ -3641,16 +3671,17 @@ class DAWN_SRW_V4167(nn.Module):
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Checkpoint/config alias; n_rst is canonical.
     fixed_tau: bool = True
-    qk_num_stages: int = 1
-    v_num_stages: int = 1
-    rst_num_stages: int = 1
-    router_num_stages: int = 1
-    n_qk_shared: Optional[int] = None
+    layers_per_stage: int = 1
+    router_scope: str = 'local'
+    n_qk_global: Optional[int] = None
     n_qk_stage: int = 0
-    n_v_shared: Optional[int] = None
+    n_qk_local: int = 0
+    n_v_global: Optional[int] = None
     n_v_stage: int = 0
-    n_rst_shared: Optional[int] = None
+    n_v_local: int = 0
+    n_rst_global: Optional[int] = None
     n_rst_stage: int = 0
+    n_rst_local: int = 0
     router_dropout: float = 0.1
     n_chunks_rst: Optional[int] = None
     n_chunks_know: int = 1    # Config alias; n_chunks_rst is canonical.
@@ -3661,6 +3692,79 @@ class DAWN_SRW_V4167(nn.Module):
     tau_init_attn_qk: Optional[float] = None
     tau_init_attn_v: Optional[float] = None
     tau_init_rst: Optional[float] = None
+
+    def _gsl_layout(self):
+        n_rst_eff = self.n_rst if self.n_rst is not None else (
+            self.n_know if self.n_know is not None else 25200)
+        layers_per_stage = int(self.layers_per_stage)
+        if layers_per_stage <= 0:
+            raise ValueError(
+                f"layers_per_stage must be > 0, got {layers_per_stage}")
+        if self.n_layers % layers_per_stage != 0:
+            raise ValueError(
+                f"n_layers={self.n_layers} must be divisible by "
+                f"layers_per_stage={layers_per_stage}")
+        stage_count = self.n_layers // layers_per_stage
+        router_scope = str(self.router_scope).strip().lower()
+        if router_scope != 'local':
+            raise ValueError(
+                f"router_scope must be 'local', got {self.router_scope!r}")
+
+        def _count(name, value, default):
+            value = default if value is None else value
+            value = int(value)
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+            return value
+
+        layout = {
+            'n_rst_eff': int(n_rst_eff),
+            'layers_per_stage': layers_per_stage,
+            'stage_count': int(stage_count),
+            'local_count': int(self.n_layers),
+            'router_scope': router_scope,
+            'router_count': int(self.n_layers),
+            'n_qk_global': _count(
+                'n_qk_global', self.n_qk_global, self.n_qk),
+            'n_qk_stage': _count(
+                'n_qk_stage', self.n_qk_stage, 0),
+            'n_qk_local': _count(
+                'n_qk_local', self.n_qk_local, 0),
+            'n_v_global': _count(
+                'n_v_global', self.n_v_global, self.n_v),
+            'n_v_stage': _count(
+                'n_v_stage', self.n_v_stage, 0),
+            'n_v_local': _count(
+                'n_v_local', self.n_v_local, 0),
+            'n_rst_global': _count(
+                'n_rst_global', self.n_rst_global, n_rst_eff),
+            'n_rst_stage': _count(
+                'n_rst_stage', self.n_rst_stage, 0),
+            'n_rst_local': _count(
+                'n_rst_local', self.n_rst_local, 0),
+        }
+        layout['qk_visible_n'] = (
+            layout['n_qk_global'] + layout['n_qk_stage']
+            + layout['n_qk_local'])
+        layout['v_visible_n'] = (
+            layout['n_v_global'] + layout['n_v_stage']
+            + layout['n_v_local'])
+        layout['rst_visible_n'] = (
+            layout['n_rst_global'] + layout['n_rst_stage']
+            + layout['n_rst_local'])
+        layout['expected_n_qk'] = (
+            layout['n_qk_global']
+            + stage_count * layout['n_qk_stage']
+            + self.n_layers * layout['n_qk_local'])
+        layout['expected_n_v'] = (
+            layout['n_v_global']
+            + stage_count * layout['n_v_stage']
+            + self.n_layers * layout['n_v_local'])
+        layout['expected_n_rst'] = (
+            layout['n_rst_global']
+            + stage_count * layout['n_rst_stage']
+            + self.n_layers * layout['n_rst_local'])
+        return layout
 
     def setup(self):
         if self.d_model % self.n_heads != 0:
@@ -3680,58 +3784,42 @@ class DAWN_SRW_V4167(nn.Module):
             raise ValueError(
                 "v4167 requires fixed cosine-space tau_init_attn_qk/v/rst; "
                 f"missing {', '.join(missing_tau)}.")
-        for name, num_stages in (
-                ('qk_num_stages', self.qk_num_stages),
-                ('v_num_stages', self.v_num_stages),
-                ('rst_num_stages', self.rst_num_stages),
-                ('router_num_stages', self.router_num_stages)):
-            if int(num_stages) <= 0:
-                raise ValueError(f"{name} must be > 0, got {num_stages}")
-            if self.n_layers % int(num_stages) != 0:
-                raise ValueError(
-                    f"n_layers={self.n_layers} must be divisible by "
-                    f"{name}={num_stages}")
-        n_rst_eff = self.n_rst if self.n_rst is not None else (
-            self.n_know if self.n_know is not None else 25200)
-        n_qk_shared = (
-            self.n_qk if self.n_qk_shared is None else self.n_qk_shared)
-        n_v_shared = (
-            self.n_v if self.n_v_shared is None else self.n_v_shared)
-        n_rst_shared = (
-            n_rst_eff if self.n_rst_shared is None else self.n_rst_shared)
-        expected_n_qk = n_qk_shared + self.qk_num_stages * self.n_qk_stage
-        expected_n_v = n_v_shared + self.v_num_stages * self.n_v_stage
-        expected_n_rst = n_rst_shared + self.rst_num_stages * self.n_rst_stage
-        if self.n_qk != expected_n_qk:
+        layout = self._gsl_layout()
+        if self.n_qk != layout['expected_n_qk']:
             raise ValueError(
-                f"n_qk={self.n_qk} must equal n_qk_shared + "
-                f"qk_num_stages*n_qk_stage = {expected_n_qk}")
-        if self.n_v != expected_n_v:
+                f"n_qk={self.n_qk} must equal n_qk_global + "
+                f"stage_count*n_qk_stage + n_layers*n_qk_local = "
+                f"{layout['expected_n_qk']}")
+        if self.n_v != layout['expected_n_v']:
             raise ValueError(
-                f"n_v={self.n_v} must equal n_v_shared + "
-                f"v_num_stages*n_v_stage = {expected_n_v}")
-        if n_rst_eff != expected_n_rst:
+                f"n_v={self.n_v} must equal n_v_global + "
+                f"stage_count*n_v_stage + n_layers*n_v_local = "
+                f"{layout['expected_n_v']}")
+        if layout['n_rst_eff'] != layout['expected_n_rst']:
             raise ValueError(
-                f"n_rst={n_rst_eff} must equal n_rst_shared + "
-                f"rst_num_stages*n_rst_stage = {expected_n_rst}")
+                f"n_rst={layout['n_rst_eff']} must equal n_rst_global + "
+                f"stage_count*n_rst_stage + n_layers*n_rst_local = "
+                f"{layout['expected_n_rst']}")
         self.token_emb = nn.Embed(
             self.vocab_size, self.d_model, embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(
             self.max_seq_len, self.d_model, embedding_init=scaled_normal(0.02))
         self.neuron_pool = NeuronPool(
-            n_qk_shared=n_qk_shared,
-            n_qk_stage=self.n_qk_stage,
-            n_v_shared=n_v_shared,
-            n_v_stage=self.n_v_stage,
-            n_rst_shared=n_rst_shared,
-            n_rst_stage=self.n_rst_stage,
-            qk_num_stages=self.qk_num_stages,
-            v_num_stages=self.v_num_stages,
-            rst_num_stages=self.rst_num_stages,
+            n_qk_global=layout['n_qk_global'],
+            n_qk_stage=layout['n_qk_stage'],
+            n_qk_local=layout['n_qk_local'],
+            n_v_global=layout['n_v_global'],
+            n_v_stage=layout['n_v_stage'],
+            n_v_local=layout['n_v_local'],
+            n_rst_global=layout['n_rst_global'],
+            n_rst_stage=layout['n_rst_stage'],
+            n_rst_local=layout['n_rst_local'],
+            stage_count=layout['stage_count'],
+            n_layers=self.n_layers,
             d_model=self.d_model, d_route=self.d_route)
         self.router = RouterBank(
             d_model=self.d_model, d_route=self.d_route,
-            router_num_stages=self.router_num_stages,
+            router_count=layout['router_count'],
             router_dropout=self.router_dropout)
         self.layers = [
             DAWNBlock(d_model=self.d_model, n_heads=self.n_heads,
@@ -3758,8 +3846,11 @@ class DAWN_SRW_V4167(nn.Module):
         such as distribution shape, selection diagnostics, entropy, tau stats,
         raw norms, and output-stability norms.
         """
-        n_rst_eff = self.n_rst if self.n_rst is not None else (
-            self.n_know if self.n_know is not None else 25200)
+        layout = self._gsl_layout()
+        n_rst_eff = layout['n_rst_eff']
+        layers_per_stage = layout['layers_per_stage']
+        stage_count = layout['stage_count']
+        router_count = layout['router_count']
         soft_gate_T_qk = (
             soft_gate_temperature
             if soft_gate_T_qk is None else soft_gate_T_qk)
@@ -3772,15 +3863,9 @@ class DAWN_SRW_V4167(nn.Module):
         B, S = input_ids.shape
         if S > self.max_seq_len:
             raise ValueError(f"Sequence length {S} exceeds max_seq_len")
-        n_qk_shared = (
-            self.n_qk if self.n_qk_shared is None else self.n_qk_shared)
-        n_v_shared = (
-            self.n_v if self.n_v_shared is None else self.n_v_shared)
-        n_rst_shared = (
-            n_rst_eff if self.n_rst_shared is None else self.n_rst_shared)
-        qk_visible_n = n_qk_shared + self.n_qk_stage
-        v_visible_n = n_v_shared + self.n_v_stage
-        rst_visible_n = n_rst_shared + self.n_rst_stage
+        qk_visible_n = layout['qk_visible_n']
+        v_visible_n = layout['v_visible_n']
+        rst_visible_n = layout['rst_visible_n']
 
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = self.token_emb(input_ids) + self.pos_emb(positions)
@@ -3920,12 +4005,12 @@ class DAWN_SRW_V4167(nn.Module):
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
-            _ = self.neuron_pool.attn_qk_read_shared  # triggers NeuronPool.setup
-            _ = self.neuron_pool.attn_v_read_shared
-            _ = self.neuron_pool.rst_read_shared
-            _ = self.neuron_pool.attn_qk_write_shared
-            _ = self.neuron_pool.attn_v_write_shared
-            _ = self.neuron_pool.rst_write_shared
+            _ = self.neuron_pool.attn_qk_read_global  # triggers NeuronPool.setup
+            _ = self.neuron_pool.attn_v_read_global
+            _ = self.neuron_pool.rst_read_global
+            _ = self.neuron_pool.attn_qk_write_global
+            _ = self.neuron_pool.attn_v_write_global
+            _ = self.neuron_pool.rst_write_global
             _ = self.neuron_pool.attn_qk_op_read_proj
             _ = self.neuron_pool.attn_qk_op_write_proj
             _ = self.neuron_pool.attn_v_op_read_proj
@@ -3960,16 +4045,11 @@ class DAWN_SRW_V4167(nn.Module):
                     rng = xs['rng']
                     layer_idx = xs['layer_idx']
                     rng, rng_attn, rng_rst = jax.random.split(rng, 3)
-                    qk_stage_id = _stage_id(
-                        layer_idx, self.n_layers, self.qk_num_stages)
-                    v_stage_id = _stage_id(
-                        layer_idx, self.n_layers, self.v_num_stages)
-                    rst_stage_id = _stage_id(
-                        layer_idx, self.n_layers, self.rst_num_stages)
-                    router_id = _stage_id(
-                        layer_idx, self.n_layers, self.router_num_stages)
+                    stage_id = _stage_id(
+                        layer_idx, self.n_layers, layers_per_stage)
+                    router_id = layer_idx
                     visible_pool_params = _visible_pool_params(
-                        pool_params, qk_stage_id, v_stage_id, rst_stage_id)
+                        pool_params, stage_id, layer_idx)
                     router_params_layer = _select_router_params(
                         router_params, router_id)
 
@@ -4062,16 +4142,11 @@ class DAWN_SRW_V4167(nn.Module):
                 rng = xs['rng']
                 layer_idx = xs['layer_idx']
                 rng, rng_attn, rng_rst = jax.random.split(rng, 3)
-                qk_stage_id = _stage_id(
-                    layer_idx, self.n_layers, self.qk_num_stages)
-                v_stage_id = _stage_id(
-                    layer_idx, self.n_layers, self.v_num_stages)
-                rst_stage_id = _stage_id(
-                    layer_idx, self.n_layers, self.rst_num_stages)
-                router_id = _stage_id(
-                    layer_idx, self.n_layers, self.router_num_stages)
+                stage_id = _stage_id(
+                    layer_idx, self.n_layers, layers_per_stage)
+                router_id = layer_idx
                 visible_pool_params = _visible_pool_params(
-                    pool_params, qk_stage_id, v_stage_id, rst_stage_id)
+                    pool_params, stage_id, layer_idx)
                 router_params_layer = _select_router_params(
                     router_params, router_id)
 
@@ -4476,10 +4551,10 @@ class DAWN_SRW_V4167(nn.Module):
             'qk_total_n': jnp.float32(self.n_qk),
             'v_total_n': jnp.float32(self.n_v),
             'rst_total_n': jnp.float32(n_rst_eff),
-            'qk_num_stages': jnp.float32(self.qk_num_stages),
-            'v_num_stages': jnp.float32(self.v_num_stages),
-            'rst_num_stages': jnp.float32(self.rst_num_stages),
-            'router_num_stages': jnp.float32(self.router_num_stages),
+            'layers_per_stage': jnp.float32(layers_per_stage),
+            'stage_count': jnp.float32(stage_count),
+            'router_count': jnp.float32(router_count),
+            'router_scope_local': jnp.float32(1.0),
             'fixed_tau': jnp.float32(1.0 if self.fixed_tau else 0.0),
 
             'rst_active': rst_active_all.mean(),
@@ -4925,14 +5000,8 @@ class DAWN_SRW_V4167(nn.Module):
         return result
 
     def get_config(self):
-        n_rst_eff = self.n_rst if self.n_rst is not None else (
-            self.n_know if self.n_know is not None else 25200)
-        n_qk_shared = (
-            self.n_qk if self.n_qk_shared is None else self.n_qk_shared)
-        n_v_shared = (
-            self.n_v if self.n_v_shared is None else self.n_v_shared)
-        n_rst_shared = (
-            n_rst_eff if self.n_rst_shared is None else self.n_rst_shared)
+        layout = self._gsl_layout()
+        n_rst_eff = layout['n_rst_eff']
         cfg = {
             'model_version': self.__version__,
             'vocab_size': self.vocab_size, 'd_model': self.d_model,
@@ -4942,34 +5011,32 @@ class DAWN_SRW_V4167(nn.Module):
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
             'fixed_tau': self.fixed_tau,
-            'qk_num_stages': self.qk_num_stages,
-            'v_num_stages': self.v_num_stages,
-            'rst_num_stages': self.rst_num_stages,
-            'router_num_stages': self.router_num_stages,
-            'n_qk_shared': n_qk_shared,
-            'n_qk_stage': self.n_qk_stage,
-            'n_v_shared': n_v_shared,
-            'n_v_stage': self.n_v_stage,
-            'n_rst_shared': n_rst_shared,
-            'n_rst_stage': self.n_rst_stage,
-            'qk_visible_n': n_qk_shared + self.n_qk_stage,
-            'v_visible_n': n_v_shared + self.n_v_stage,
-            'rst_visible_n': n_rst_shared + self.n_rst_stage,
+            'layers_per_stage': layout['layers_per_stage'],
+            'stage_count': layout['stage_count'],
+            'local_count': layout['local_count'],
+            'router_scope': layout['router_scope'],
+            'router_count': layout['router_count'],
+            'n_qk_global': layout['n_qk_global'],
+            'n_qk_stage': layout['n_qk_stage'],
+            'n_qk_local': layout['n_qk_local'],
+            'n_v_global': layout['n_v_global'],
+            'n_v_stage': layout['n_v_stage'],
+            'n_v_local': layout['n_v_local'],
+            'n_rst_global': layout['n_rst_global'],
+            'n_rst_stage': layout['n_rst_stage'],
+            'n_rst_local': layout['n_rst_local'],
+            'qk_visible_n': layout['qk_visible_n'],
+            'v_visible_n': layout['v_visible_n'],
+            'rst_visible_n': layout['rst_visible_n'],
         }
         return cfg
 
     def get_model_info(self):
-        n_rst_eff = self.n_rst if self.n_rst is not None else (
-            self.n_know if self.n_know is not None else 25200)
-        n_qk_shared = (
-            self.n_qk if self.n_qk_shared is None else self.n_qk_shared)
-        n_v_shared = (
-            self.n_v if self.n_v_shared is None else self.n_v_shared)
-        n_rst_shared = (
-            n_rst_eff if self.n_rst_shared is None else self.n_rst_shared)
-        qk_visible_n = n_qk_shared + self.n_qk_stage
-        v_visible_n = n_v_shared + self.n_v_stage
-        rst_visible_n = n_rst_shared + self.n_rst_stage
+        layout = self._gsl_layout()
+        n_rst_eff = layout['n_rst_eff']
+        qk_visible_n = layout['qk_visible_n']
+        v_visible_n = layout['v_visible_n']
+        rst_visible_n = layout['rst_visible_n']
         qk_scale, v_scale, rst_scale = _pool_output_scales(
             self.d_model, self.n_layers)
         return [
@@ -4979,8 +5046,17 @@ class DAWN_SRW_V4167(nn.Module):
             f"  Visible pools: qk={qk_visible_n}, v={v_visible_n}, "
             f"rst={rst_visible_n}",
             f"  Total pools: qk={self.n_qk}, v={self.n_v}, rst={n_rst_eff}",
-            f"  Stages: qk={self.qk_num_stages}, v={self.v_num_stages}, "
-            f"rst={self.rst_num_stages}, router={self.router_num_stages}",
+            "  GSL pools: "
+            f"qk={layout['n_qk_global']}/{layout['n_qk_stage']}/"
+            f"{layout['n_qk_local']}, "
+            f"v={layout['n_v_global']}/{layout['n_v_stage']}/"
+            f"{layout['n_v_local']}, "
+            f"rst={layout['n_rst_global']}/{layout['n_rst_stage']}/"
+            f"{layout['n_rst_local']}",
+            f"  Staging: layers_per_stage={layout['layers_per_stage']}, "
+            f"stage_count={layout['stage_count']}, "
+            f"router_scope={layout['router_scope']}, "
+            f"router_count={layout['router_count']}",
             f"  Fixed tau: qk={self.tau_init_attn_qk}, "
             f"v={self.tau_init_attn_v}, rst={self.tau_init_rst}",
             "  Selection: live-gradient RW operator keys with fixed tau "
@@ -5034,10 +5110,10 @@ def _angular_execution_kwargs_from_model_cfg(model_cfg):
 def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
     """Sample fresh-init cosine scores without changing forward semantics.
 
-    For the v4167 POC this uses layer 0 / router 0 and the corresponding
-    visible shared+stage-0 pools. Random init distributions are homogeneous
-    enough for the one-time quantile pass, and the important invariant is that
-    tau targets see visible_N rather than total_N.
+    For v4167 GSL this uses layer 0 / router 0 and the corresponding visible
+    global + stage[0] + local[0] pools. Random init distributions are
+    homogeneous enough for the one-time quantile pass, and the important
+    invariant is that tau targets see visible_N rather than total_N.
     """
     max_tokens = int(max_tokens)
     if max_tokens <= 0:
@@ -5093,7 +5169,6 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
 
     pool = _visible_pool_params(
         _pool_params_with_operator_keys(params['neuron_pool']),
-        jnp.asarray(0, jnp.int32),
         jnp.asarray(0, jnp.int32),
         jnp.asarray(0, jnp.int32))
     qk_op_key = pool['attn_qk_op_key']

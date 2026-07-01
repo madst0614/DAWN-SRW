@@ -1046,21 +1046,30 @@ def _materialize_v4167_model_config(cfg):
     m = cfg['model']
     n_layers = int(m.get('n_layers', 12))
 
-    def _int_field(name, default):
+    deprecated_keys = (
+        'qk_num_stages', 'v_num_stages', 'rst_num_stages',
+        'router_num_stages', 'n_qk_shared', 'n_v_shared', 'n_rst_shared')
+    present_deprecated = [key for key in deprecated_keys if key in m]
+    if present_deprecated:
+        raise ValueError(
+            "v4167 GSL config no longer accepts shared/stage pool keys: "
+            + ", ".join(present_deprecated))
+
+    if 'stage_count' in m:
+        raise ValueError(
+            "model.stage_count is derived from n_layers // layers_per_stage; "
+            "do not set it in config.")
+    if 'router_count' in m:
+        raise ValueError(
+            "model.router_count is derived from router_scope=local and "
+            "n_layers; do not set it in config.")
+
+    def _int_field(name, default=None, *, required=False):
+        if required and name not in m:
+            raise ValueError(f"v4167 GSL requires model.{name}.")
         value = int(m.get(name, default))
         if value < 0:
             raise ValueError(f"model.{name} must be >= 0, got {value}")
-        m[name] = value
-        return value
-
-    def _stage_field(name, default):
-        value = int(m.get(name, default))
-        if value <= 0:
-            raise ValueError(f"model.{name} must be > 0, got {value}")
-        if n_layers % value != 0:
-            raise ValueError(
-                f"model.n_layers={n_layers} must be divisible by "
-                f"model.{name}={value}")
         m[name] = value
         return value
 
@@ -1068,29 +1077,47 @@ def _materialize_v4167_model_config(cfg):
     if not m['fixed_tau']:
         raise ValueError("v4167 supports fixed_tau: true only.")
 
-    qk_num_stages = _stage_field('qk_num_stages', 1)
-    v_num_stages = _stage_field('v_num_stages', 1)
-    rst_num_stages = _stage_field('rst_num_stages', 1)
-    router_num_stages = _stage_field('router_num_stages', n_layers)
+    if 'layers_per_stage' not in m:
+        raise ValueError("v4167 GSL requires model.layers_per_stage.")
+    layers_per_stage = int(m['layers_per_stage'])
+    if layers_per_stage <= 0:
+        raise ValueError(
+            f"model.layers_per_stage must be > 0, got {layers_per_stage}")
+    if n_layers % layers_per_stage != 0:
+        raise ValueError(
+            f"model.n_layers={n_layers} must be divisible by "
+            f"model.layers_per_stage={layers_per_stage}")
+    m['layers_per_stage'] = layers_per_stage
+    stage_count = n_layers // layers_per_stage
 
-    n_qk_shared = _int_field('n_qk_shared', int(m.get('n_qk', 1580)))
-    n_qk_stage = _int_field('n_qk_stage', 0)
-    n_v_shared = _int_field('n_v_shared', int(m.get('n_v', 2600)))
-    n_v_stage = _int_field('n_v_stage', 0)
-    n_rst_shared = _int_field(
-        'n_rst_shared', int(m.get('n_rst', m.get('n_know', 25200))))
-    n_rst_stage = _int_field('n_rst_stage', 0)
+    router_scope = str(m.get('router_scope', 'local')).strip().lower()
+    if router_scope != 'local':
+        raise ValueError(
+            f"v4167 GSL currently requires model.router_scope: local, "
+            f"got {m.get('router_scope')!r}.")
+    m['router_scope'] = 'local'
+
+    n_qk_global = _int_field('n_qk_global', required=True)
+    n_qk_stage = _int_field('n_qk_stage', required=True)
+    n_qk_local = _int_field('n_qk_local', required=True)
+    n_v_global = _int_field('n_v_global', required=True)
+    n_v_stage = _int_field('n_v_stage', required=True)
+    n_v_local = _int_field('n_v_local', required=True)
+    n_rst_global = _int_field('n_rst_global', required=True)
+    n_rst_stage = _int_field('n_rst_stage', required=True)
+    n_rst_local = _int_field('n_rst_local', required=True)
 
     totals = {
-        'n_qk': n_qk_shared + qk_num_stages * n_qk_stage,
-        'n_v': n_v_shared + v_num_stages * n_v_stage,
-        'n_rst': n_rst_shared + rst_num_stages * n_rst_stage,
+        'n_qk': n_qk_global + stage_count * n_qk_stage + n_layers * n_qk_local,
+        'n_v': n_v_global + stage_count * n_v_stage + n_layers * n_v_local,
+        'n_rst': n_rst_global + stage_count * n_rst_stage + n_layers * n_rst_local,
     }
     for key, total in totals.items():
         if key in m and int(m[key]) != total:
             raise ValueError(
-                f"model.{key}={m[key]} must equal shared + stages*stage "
-                f"for v4167 ({total}).")
+                f"model.{key}={m[key]} must equal global + "
+                f"stage_count*stage + n_layers*local for v4167 GSL "
+                f"({total}).")
         m[key] = total
     m['n_know'] = m.get('n_know', m['n_rst'])
     if int(m['n_know']) != int(m['n_rst']):
@@ -1098,9 +1125,9 @@ def _materialize_v4167_model_config(cfg):
             f"model.n_know={m['n_know']} must match model.n_rst={m['n_rst']} "
             "for v4167.")
 
-    m['qk_visible_n'] = n_qk_shared + n_qk_stage
-    m['v_visible_n'] = n_v_shared + n_v_stage
-    m['rst_visible_n'] = n_rst_shared + n_rst_stage
+    m['qk_visible_n'] = n_qk_global + n_qk_stage + n_qk_local
+    m['v_visible_n'] = n_v_global + n_v_stage + n_v_local
+    m['rst_visible_n'] = n_rst_global + n_rst_stage + n_rst_local
     return m
 
 
@@ -1149,16 +1176,17 @@ def _dawn_srw_kwargs(cfg):
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
             'fixed_tau': m.get('fixed_tau', True),
-            'qk_num_stages': m['qk_num_stages'],
-            'v_num_stages': m['v_num_stages'],
-            'rst_num_stages': m['rst_num_stages'],
-            'router_num_stages': m['router_num_stages'],
-            'n_qk_shared': m['n_qk_shared'],
+            'layers_per_stage': m['layers_per_stage'],
+            'router_scope': m['router_scope'],
+            'n_qk_global': m['n_qk_global'],
             'n_qk_stage': m['n_qk_stage'],
-            'n_v_shared': m['n_v_shared'],
+            'n_qk_local': m['n_qk_local'],
+            'n_v_global': m['n_v_global'],
             'n_v_stage': m['n_v_stage'],
-            'n_rst_shared': m['n_rst_shared'],
+            'n_v_local': m['n_v_local'],
+            'n_rst_global': m['n_rst_global'],
             'n_rst_stage': m['n_rst_stage'],
+            'n_rst_local': m['n_rst_local'],
         })
     return kw
 
@@ -3445,7 +3473,24 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
         ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write', 'attn_v_scale'),
         ('rst', 'rst_emb', 'rst_read', 'rst_write', 'rst_scale'),
     )
+
+    def _flat_pool_tensor(prefix, kind):
+        key = f'{prefix}_{kind}'
+        if key in pool:
+            return pool[key]
+        parts = []
+        for scope in ('global', 'stage', 'local'):
+            part_key = f'{prefix}_{kind}_{scope}'
+            if part_key in pool:
+                part = pool[part_key]
+                parts.append(part.reshape((-1, part.shape[-1])))
+        if not parts:
+            return None
+        return jnp.concatenate(parts, axis=0)
+
     for i, (name, emb_key, read_key, write_key, scale_key) in enumerate(specs):
+        read = _flat_pool_tensor(name, 'read')
+        write = _flat_pool_tensor(name, 'write')
         if (_is_active_srw_version(model_version)
                 and _is_rw_key_srw_version(model_version)):
             op_read_key = f'{name}_op_read_proj'
@@ -3456,22 +3501,21 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
             if name == 'attn_v':
                 op_read_key = 'attn_v_op_read_proj'
                 op_write_key = 'attn_v_op_write_proj'
-            if (read_key in pool and write_key in pool
+            if (read is not None and write is not None
                     and op_read_key in pool and op_write_key in pool):
                 op_key = _diag_op_key(
-                    pool[read_key], pool[write_key],
+                    read, write,
                     pool[op_read_key], pool[op_write_key])
                 out.update(_row_norm_stats(
                     op_key, f'{name}_op_key_norm', full))
         elif emb_key in pool:
             out.update(_row_norm_stats(pool[emb_key], f'{name}_emb_norm', full))
-        if read_key in pool:
-            out.update(_row_norm_stats(pool[read_key], f'{name}_read_norm', full))
-        if write_key in pool:
-            out.update(_row_norm_stats(pool[write_key], f'{name}_write_norm', full))
-        if read_key in pool and write_key in pool:
-            out.update(_op_gain_stats(pool[read_key], pool[write_key],
-                                      f'{name}_op_gain', full))
+        if read is not None:
+            out.update(_row_norm_stats(read, f'{name}_read_norm', full))
+        if write is not None:
+            out.update(_row_norm_stats(write, f'{name}_write_norm', full))
+        if read is not None and write is not None:
+            out.update(_op_gain_stats(read, write, f'{name}_op_gain', full))
         if scale_key in pool:
             out[f'{name}_pool_scale'] = fixed_scales[i]
             if full:
@@ -3490,12 +3534,33 @@ def _pool_update_diagnostics(params, grads):
         ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write'),
         ('rst', 'rst_emb', 'rst_read', 'rst_write'),
     )
+
+    def _partition_norm(tree, prefix, kind):
+        key = f'{prefix}_{kind}'
+        if key in tree:
+            return _global_norm_array(tree[key])
+        norms_sq = jnp.float32(0.0)
+        found = False
+        for scope in ('global', 'stage', 'local'):
+            part_key = f'{prefix}_{kind}_{scope}'
+            if part_key in tree:
+                n = _global_norm_array(tree[part_key])
+                norms_sq = norms_sq + jnp.square(n)
+                found = True
+        if not found:
+            return jnp.float32(0.0)
+        return jnp.sqrt(norms_sq + 1e-12)
+
     for name, emb_key, read_key, write_key in specs:
         for short, key in (('emb', emb_key), ('read', read_key), ('write', write_key)):
-            p_norm = (_global_norm_array(pool_p[key])
-                      if key in pool_p else jnp.float32(0.0))
-            g_norm = (_global_norm_array(pool_g[key])
-                      if key in pool_g else jnp.float32(0.0))
+            if short in ('read', 'write'):
+                p_norm = _partition_norm(pool_p, name, short)
+                g_norm = _partition_norm(pool_g, name, short)
+            else:
+                p_norm = (_global_norm_array(pool_p[key])
+                          if key in pool_p else jnp.float32(0.0))
+                g_norm = (_global_norm_array(pool_g[key])
+                          if key in pool_g else jnp.float32(0.0))
             out[f'{name}_{short}_param_norm'] = p_norm
             out[f'{name}_{short}_grad_norm'] = g_norm
             out[f'{name}_{short}_grad_ratio'] = g_norm / (p_norm + 1e-8)
@@ -4865,6 +4930,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _child_norm(tree, key):
             return _tree_norm(tree[key]) if key in tree else jnp.float32(0.0)
 
+        def _pool_partition_norm(tree, prefix, kind):
+            return (
+                _child_norm(tree, f'{prefix}_{kind}')
+                + _child_norm(tree, f'{prefix}_{kind}_global')
+                + _child_norm(tree, f'{prefix}_{kind}_stage')
+                + _child_norm(tree, f'{prefix}_{kind}_local'))
+
         def _path_tree(tree, *keys):
             cur = tree
             for key in keys:
@@ -4907,20 +4979,24 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_pool_attn_qk_op_key = (
             _child_norm(_gpool, 'attn_qk_op_read_proj')
             + _child_norm(_gpool, 'attn_qk_op_write_proj'))
-        grad_pool_attn_qk_read = _child_norm(_gpool, 'attn_qk_read')
-        grad_pool_attn_qk_write = _child_norm(_gpool, 'attn_qk_write')
+        grad_pool_attn_qk_read = _pool_partition_norm(
+            _gpool, 'attn_qk', 'read')
+        grad_pool_attn_qk_write = _pool_partition_norm(
+            _gpool, 'attn_qk', 'write')
         grad_pool_attn_v_emb = _child_norm(_gpool, 'attn_v_emb')
         grad_pool_attn_v_op_key = (
             _child_norm(_gpool, 'attn_v_op_read_proj')
             + _child_norm(_gpool, 'attn_v_op_write_proj'))
-        grad_pool_attn_v_read = _child_norm(_gpool, 'attn_v_read')
-        grad_pool_attn_v_write = _child_norm(_gpool, 'attn_v_write')
+        grad_pool_attn_v_read = _pool_partition_norm(
+            _gpool, 'attn_v', 'read')
+        grad_pool_attn_v_write = _pool_partition_norm(
+            _gpool, 'attn_v', 'write')
         grad_pool_rst_emb = _child_norm(_gpool, 'rst_emb')
         grad_pool_rst_op_key = (
             _child_norm(_gpool, 'rst_op_read_proj')
             + _child_norm(_gpool, 'rst_op_write_proj'))
-        grad_pool_rst_read = _child_norm(_gpool, 'rst_read')
-        grad_pool_rst_write = _child_norm(_gpool, 'rst_write')
+        grad_pool_rst_read = _pool_partition_norm(_gpool, 'rst', 'read')
+        grad_pool_rst_write = _pool_partition_norm(_gpool, 'rst', 'write')
         if False:
             grad_token_emb = _tree_norm(_path_tree(grads, 'token_emb'))
             grad_pos_emb = _tree_norm(_path_tree(grads, 'pos_emb'))
@@ -5064,33 +5140,49 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 w_key = _drift_unit(write) @ write_proj
                 return _drift_unit(_drift_unit(r_key) * _drift_unit(w_key))
 
-            if 'attn_qk_read_shared' in _pool:
-                def _flat_stage_op_key(prefix):
+            if ('attn_qk_read_global' in _pool
+                    or 'attn_qk_read_shared' in _pool):
+                def _flat_partitioned_op_key(prefix):
+                    if f'{prefix}_read_global' in _pool:
+                        parts = [_drift_op_key(
+                            _pool[f'{prefix}_read_global'],
+                            _pool[f'{prefix}_write_global'],
+                            _pool[f'{prefix}_op_read_proj'],
+                            _pool[f'{prefix}_op_write_proj'])]
+                        for _scope in ('stage', 'local'):
+                            read_key = f'{prefix}_read_{_scope}'
+                            write_key = f'{prefix}_write_{_scope}'
+                            if read_key in _pool:
+                                op_key = _drift_op_key(
+                                    _pool[read_key], _pool[write_key],
+                                    _pool[f'{prefix}_op_read_proj'],
+                                    _pool[f'{prefix}_op_write_proj'])
+                                parts.append(op_key.reshape(
+                                    (-1, parts[0].shape[-1])))
+                        return jnp.concatenate(parts, axis=0)
+
                     op_shared = _drift_op_key(
                         _pool[f'{prefix}_read_shared'],
                         _pool[f'{prefix}_write_shared'],
                         _pool[f'{prefix}_op_read_proj'],
                         _pool[f'{prefix}_op_write_proj'])
-
                     read_stage_key = f'{prefix}_read_stage'
                     write_stage_key = f'{prefix}_write_stage'
                     if read_stage_key not in _pool:
                         return op_shared
-
                     op_stage = _drift_op_key(
                         _pool[read_stage_key],
                         _pool[write_stage_key],
                         _pool[f'{prefix}_op_read_proj'],
                         _pool[f'{prefix}_op_write_proj'])
-
                     return jnp.concatenate(
                         [op_shared,
                          op_stage.reshape((-1, op_shared.shape[-1]))],
                         axis=0)
 
-                _cur_qk = _flat_stage_op_key('attn_qk')
-                _cur_v = _flat_stage_op_key('attn_v')
-                _cur_rst = _flat_stage_op_key('rst')
+                _cur_qk = _flat_partitioned_op_key('attn_qk')
+                _cur_v = _flat_partitioned_op_key('attn_v')
+                _cur_rst = _flat_partitioned_op_key('rst')
             elif 'attn_qk_op_read_proj' in _pool:
                 _cur_qk = _drift_op_key(
                     _pool['attn_qk_read'], _pool['attn_qk_write'],
@@ -6332,14 +6424,18 @@ def get_param_shardings(params, mesh):
     n_sharded_3d = NamedSharding(mesh, P('model', None, None))
     stage_n_sharded_3d = NamedSharding(mesh, P(None, 'model', None))
     pool_root = params.get('neuron_pool', {}) if hasattr(params, 'get') else {}
-    is_stage_partitioned_pool = 'attn_qk_read_shared' in pool_root
+    is_stage_partitioned_pool = (
+        'attn_qk_read_shared' in pool_root
+        or 'attn_qk_read_global' in pool_root)
 
     def _get_sharding(path, value):
         path_str = '/'.join(str(p) for p in path)
         leaf = str(path[-1].key if hasattr(path[-1], 'key') else path[-1])
         # NeuronPool params: shard N axis (first dim) on 'model'
         if 'neuron_pool' in path_str:
-            if is_stage_partitioned_pool and leaf.endswith('_stage'):
+            if (is_stage_partitioned_pool
+                    and (leaf.endswith('_stage')
+                         or leaf.endswith('_local'))):
                 return stage_n_sharded_3d
             if (is_stage_partitioned_pool
                     and (leaf.endswith('_op_read_proj')
@@ -11561,20 +11657,36 @@ def main():
             print(line)
         if str(model_version_cfg) == V4167_MODEL_VERSION:
             m = cfg['model']
-            print("v4167 pool diagnostics:")
+            stage_count = int(m['n_layers']) // int(m['layers_per_stage'])
+            router_count = int(m['n_layers'])
+            d_model_cfg = float(m['d_model'])
+            print("v4167 GSL pool sanity:")
             print(
-                f"  qk_visible_n={m['qk_visible_n']} "
-                f"v_visible_n={m['v_visible_n']} "
-                f"rst_visible_n={m['rst_visible_n']}")
+                f"  total pool counts: qk={m['n_qk']} "
+                f"v={m['n_v']} rst={m['n_rst']}")
             print(
-                f"  qk_total_n={m['n_qk']} "
-                f"v_total_n={m['n_v']} rst_total_n={m['n_rst']}")
+                "  global/stage/local counts: "
+                f"qk={m['n_qk_global']}/{m['n_qk_stage']}/"
+                f"{m['n_qk_local']} "
+                f"v={m['n_v_global']}/{m['n_v_stage']}/"
+                f"{m['n_v_local']} "
+                f"rst={m['n_rst_global']}/{m['n_rst_stage']}/"
+                f"{m['n_rst_local']}")
             print(
-                f"  qk_num_stages={m['qk_num_stages']} "
-                f"v_num_stages={m['v_num_stages']} "
-                f"rst_num_stages={m['rst_num_stages']} "
-                f"router_num_stages={m['router_num_stages']} "
-                f"fixed_tau={m['fixed_tau']}")
+                f"  visible counts per layer: qk={m['qk_visible_n']} "
+                f"v={m['v_visible_n']} rst={m['rst_visible_n']}")
+            print(
+                f"  layers_per_stage={m['layers_per_stage']} "
+                f"stage_count={stage_count} "
+                f"router_scope={m['router_scope']} "
+                f"router_count={router_count}")
+            print(f"  estimated parameter count: {n_params:,}")
+            print(
+                "  ratio QK/V/RST (total/d_model): "
+                f"qk={m['n_qk'] / d_model_cfg:.3f} "
+                f"v={m['n_v'] / d_model_cfg:.3f} "
+                f"rst={m['n_rst'] / d_model_cfg:.3f}")
+            print(f"  fixed_tau={m['fixed_tau']}")
 
     _has_resume_checkpoint = resume_step is not None
 
@@ -12209,15 +12321,17 @@ def main():
         n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
         n_v = cfg['model'].get('n_v', 2600)
         if str(model_version_cfg) == V4167_MODEL_VERSION:
-            shard_checks = [
-                ('n_qk_shared', cfg['model']['n_qk_shared']),
-                ('n_v_shared', cfg['model']['n_v_shared']),
-                ('n_rst_shared', cfg['model']['n_rst_shared']),
-            ]
+            shard_checks = []
             for _name, _N in (
+                    ('n_qk_global', cfg['model']['n_qk_global']),
                     ('n_qk_stage', cfg['model']['n_qk_stage']),
+                    ('n_qk_local', cfg['model']['n_qk_local']),
+                    ('n_v_global', cfg['model']['n_v_global']),
                     ('n_v_stage', cfg['model']['n_v_stage']),
-                    ('n_rst_stage', cfg['model']['n_rst_stage'])):
+                    ('n_v_local', cfg['model']['n_v_local']),
+                    ('n_rst_global', cfg['model']['n_rst_global']),
+                    ('n_rst_stage', cfg['model']['n_rst_stage']),
+                    ('n_rst_local', cfg['model']['n_rst_local'])):
                 if int(_N) > 0:
                     shard_checks.append((_name, _N))
             chunk_n_qk = cfg['model']['qk_visible_n']
@@ -12705,8 +12819,27 @@ def main():
             }
 
         pool = p['neuron_pool']
-        if 'attn_qk_read_shared' in pool:
+        if ('attn_qk_read_global' in pool
+                or 'attn_qk_read_shared' in pool):
             def _flat_op_key(prefix):
+                if f'{prefix}_read_global' in pool:
+                    parts = [_op_key(
+                        pool[f'{prefix}_read_global'],
+                        pool[f'{prefix}_write_global'],
+                        pool[f'{prefix}_op_read_proj'],
+                        pool[f'{prefix}_op_write_proj'])]
+                    for _scope in ('stage', 'local'):
+                        read_key = f'{prefix}_read_{_scope}'
+                        write_key = f'{prefix}_write_{_scope}'
+                        if read_key in pool:
+                            op_key = _op_key(
+                                pool[read_key], pool[write_key],
+                                pool[f'{prefix}_op_read_proj'],
+                                pool[f'{prefix}_op_write_proj'])
+                            parts.append(op_key.reshape(
+                                (-1, parts[0].shape[-1])))
+                    return jnp.concatenate(parts, axis=0)
+
                 op_shared = _op_key(
                     pool[f'{prefix}_read_shared'],
                     pool[f'{prefix}_write_shared'],
@@ -13076,6 +13209,14 @@ def main():
                 _v4164_module._pool_params_with_operator_keys(pool_p)
                 if hasattr(_v4164_module, '_pool_params_with_operator_keys')
                 else pool_p)
+            if ('attn_qk_read_global' in pool_p
+                    and hasattr(_v4164_module, '_visible_pool_params')):
+                pool_select_p = _v4164_module._visible_pool_params(
+                    pool_select_p,
+                    jnp.asarray(0, dtype=jnp.int32),
+                    jnp.asarray(0, dtype=jnp.int32))
+            pool_read_p = (
+                pool_select_p if 'attn_qk_read' in pool_select_p else pool_p)
             qk_op_key = _get_param(
                 pool_select_p, 'attn_qk_op_key',
                 'attn_qk_emb' if 'attn_qk_emb' in pool_select_p else 'qk_emb')
@@ -13084,12 +13225,12 @@ def main():
                 'attn_v_emb' if 'attn_v_emb' in pool_select_p else 'v_emb')
             rst_op_key = _get_param(
                 pool_select_p, 'rst_op_key', 'rst_emb')
-            qk_read = _get_param(pool_p, 'attn_qk_read', 'qk_read')
-            qk_write = _get_param(pool_p, 'attn_qk_write', 'qk_write')
-            v_read = _get_param(pool_p, 'attn_v_read', 'v_read')
-            v_write = _get_param(pool_p, 'attn_v_write', 'v_write')
-            rst_read = _get_param(pool_p, 'rst_read', 'rst_read')
-            rst_write = _get_param(pool_p, 'rst_write', 'rst_write')
+            qk_read = _get_param(pool_read_p, 'attn_qk_read', 'qk_read')
+            qk_write = _get_param(pool_read_p, 'attn_qk_write', 'qk_write')
+            v_read = _get_param(pool_read_p, 'attn_v_read', 'v_read')
+            v_write = _get_param(pool_read_p, 'attn_v_write', 'v_write')
+            rst_read = _get_param(pool_read_p, 'rst_read', 'rst_read')
+            rst_write = _get_param(pool_read_p, 'rst_write', 'rst_write')
             qk_norm = qk_op_key / (jnp.linalg.norm(
                 qk_op_key, axis=-1, keepdims=True) + 1e-8)
             v_norm = v_op_key / (jnp.linalg.norm(
