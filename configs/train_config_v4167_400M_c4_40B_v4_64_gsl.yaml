@@ -36,8 +36,8 @@ model:
   tau_init_max: 0.95
   tau_init_mode: quantile_frac
   tau_init_target_qk_frac: 0.62
-  tau_init_target_v_frac: 0.44
-  tau_init_target_rst_frac: 0.22
+  tau_init_target_v_frac: 0.46
+  tau_init_target_rst_frac: 0.24
 
 training:
   batch_size: 1024
@@ -75,18 +75,18 @@ training:
 
     active_target:
       qk: 0.62
-      v: 0.44
-      rst: 0.22
+      v: 0.46
+      rst: 0.24
 
     candidate_target_start:
       qk: 0.76
-      v: 0.58
-      rst: 0.32
+      v: 0.60
+      rst: 0.34
 
     candidate_target_final:
       qk: 0.62
-      v: 0.44
-      rst: 0.22
+      v: 0.46
+      rst: 0.24
 
     B_floor:
       qk: 0.001
