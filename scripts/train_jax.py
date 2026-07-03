@@ -78,10 +78,9 @@ from models.dawn_srw_v4167 import (
     _raw_tau_init_from_cosine_tau as _v4167_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4167_tau_init_calibration_scores,
 )
-from models.baseline_transformer_jax import VanillaTransformer
-from models.baseline_transformer_tp_jax import (
-    TensorParallelVanillaTransformer,
-    create_baseline_tp_sharded_fns,
+from models.baseline_transformer_jax import (
+    VanillaTransformer,
+    create_baseline_sharded_fns,
 )
 
 
@@ -259,8 +258,8 @@ def _strict_multihost_barrier(name: str, context=None):
 V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
 V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
 V4167_MODEL_VERSION = 'spatial-r1-v4.1.6.7'
-BASELINE_MODEL_VERSION = 'baseline'
-BASELINE_TP_MODEL_VERSION = 'baseline-tp'
+BASELINE_MODEL_VERSION = 'baseline-JAX'
+LEGACY_BASELINE_MODEL_VERSION = 'baseline'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (
     V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION)
@@ -272,13 +271,6 @@ MODEL_REGISTRY = {
     BASELINE_MODEL_VERSION: {
         'class': VanillaTransformer,
         'module': 'models.baseline_transformer_jax',
-        'raw_tau_init_from_cosine_tau': None,
-        'tau_init_calibration_scores': None,
-        'is_baseline': True,
-    },
-    BASELINE_TP_MODEL_VERSION: {
-        'class': TensorParallelVanillaTransformer,
-        'module': 'models.baseline_transformer_tp_jax',
         'raw_tau_init_from_cosine_tau': None,
         'tau_init_calibration_scores': None,
         'is_baseline': True,
@@ -360,7 +352,7 @@ def _is_active_srw_version(version):
 
 def _is_baseline_version(version):
     return str(version) in (
-        BASELINE_MODEL_VERSION, BASELINE_TP_MODEL_VERSION, 'baseline-JAX')
+        BASELINE_MODEL_VERSION, LEGACY_BASELINE_MODEL_VERSION)
 
 
 def _is_rw_key_srw_version(version):
@@ -381,6 +373,8 @@ def _pool_operator_keys_for_version(version):
 
 
 def _model_registry_entry(version):
+    if str(version) == LEGACY_BASELINE_MODEL_VERSION:
+        version = BASELINE_MODEL_VERSION
     try:
         return MODEL_REGISTRY[str(version)]
     except KeyError as exc:
@@ -950,6 +944,8 @@ def _baseline_kwargs(cfg):
     m = cfg["model"]
     return dict(
         vocab_size=m.get("vocab_size", 30522),
+        logical_vocab_size=m.get("logical_vocab_size", None),
+        vocab_size_padded=m.get("vocab_size_padded", None),
         d_model=m.get("d_model", 384),
         d_ff=m.get("d_ff", 1536),
         n_layers=m.get("n_layers", 12),
@@ -958,6 +954,23 @@ def _baseline_kwargs(cfg):
         dropout_rate=m.get("dropout", 0.1),
         gradient_checkpointing=m.get("gradient_checkpointing", False),
     )
+
+
+def _maybe_materialize_vocab_parallel_config(cfg):
+    model_version = str(cfg["model"].get("model_version", ""))
+    mesh_model = int(cfg.get("training", {}).get("mesh_model", 1))
+    if mesh_model <= 1:
+        return
+    if model_version not in (
+            V4167_MODEL_VERSION,
+            BASELINE_MODEL_VERSION,
+            LEGACY_BASELINE_MODEL_VERSION):
+        return
+    logical_vocab_size = int(cfg["model"]["vocab_size"])
+    from models.vocab_parallel import padded_vocab_size
+    padded = padded_vocab_size(logical_vocab_size, mesh_model)
+    cfg["model"]["logical_vocab_size"] = logical_vocab_size
+    cfg["model"]["vocab_size_padded"] = padded
 
 
 def _v4164_model_base_kwargs(cfg):
@@ -1189,6 +1202,8 @@ def _dawn_srw_kwargs(cfg):
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
             'fixed_tau': m.get('fixed_tau', True),
+            'logical_vocab_size': m.get('logical_vocab_size', None),
+            'vocab_size_padded': m.get('vocab_size_padded', None),
             'layers_per_stage': m['layers_per_stage'],
             'router_scope': m['router_scope'],
             'n_qk_global': m['n_qk_global'],
@@ -1228,8 +1243,6 @@ def build_model_from_config(cfg):
     """Build an active DAWN-SRW model from config."""
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     if _is_baseline_version(version):
-        if str(version) == BASELINE_TP_MODEL_VERSION:
-            return TensorParallelVanillaTransformer(**_baseline_kwargs(cfg))
         return VanillaTransformer(**_baseline_kwargs(cfg))
     entry = _model_registry_entry(version)
     kwargs = _dawn_srw_kwargs(cfg)
@@ -4141,7 +4154,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     neg_mask.sum() + 1e-8)
 
                 # Off fractions replace pool-mean block fractions. Denominator
-                # is total (layer 횞 batch 횞 valid-time 횞 route) slots.
+                # is total (layer x batch x valid-time x route) slots.
                 _a_tot = vmask_b.sum() * a_tau_t.shape[0] * a_tau_t.shape[-1]
                 _qk_tot = vmask_b.sum() * a_tau_t.shape[0] * 2
                 _q_tot = vmask_b.sum() * a_tau_t.shape[0]
@@ -6449,7 +6462,11 @@ def get_param_shardings(params, mesh, model_version=None):
             p.key if hasattr(p, 'key') else str(p) for p in path)
         path_str = '/'.join(str(p) for p in key_path)
         leaf = str(path[-1].key if hasattr(path[-1], 'key') else path[-1])
-        if version == BASELINE_TP_MODEL_VERSION:
+        if (path_str == 'token_emb/embedding'
+                and (version == V4167_MODEL_VERSION
+                     or _is_baseline_version(version))):
+            return row_sharded
+        if _is_baseline_version(version):
             if (len(key_path) >= 4
                     and str(key_path[0]).startswith('layer_')):
                 module = key_path[1]
@@ -6519,8 +6536,10 @@ def _print_param_sharding_summary(param_shardings, model_version):
     interesting = []
     for path, sharding in jax.tree.leaves_with_path(param_shardings):
         ps = _path_str(path)
-        if version == BASELINE_TP_MODEL_VERSION:
-            if (ps.startswith('layer_0/attn/')
+        if _is_baseline_version(version):
+            if ps == 'token_emb/embedding':
+                interesting.append((ps, sharding))
+            elif (ps.startswith('layer_0/attn/')
                     and ps.endswith('/kernel')):
                 interesting.append((ps, sharding))
             elif (ps.startswith('layer_0/ffn/')
@@ -6528,6 +6547,7 @@ def _print_param_sharding_summary(param_shardings, model_version):
                 interesting.append((ps, sharding))
         elif version == V4167_MODEL_VERSION:
             if ps in (
+                    'token_emb/embedding',
                     'router/proj_attn/kernel',
                     'router/proj_rst/kernel',
                     'router/q_op_write_query_proj',
@@ -11718,6 +11738,7 @@ def main():
     # Build model
     # ----------------------------------------------------------
     cfg['model']['vocab_size'] = vocab_size
+    _maybe_materialize_vocab_parallel_config(cfg)
     model = build_model_from_config(cfg)
 
     # Initialize
@@ -12464,12 +12485,12 @@ def main():
                   f"qk={n_chunks_qk}, attn_v={n_chunks_v}")
             chunk_mem = per_device_batch * max_seq_len * rst_max_chunk * 2 / 1e9
             print(f"  Est chunk mem (rst): {chunk_mem:.2f}GB bf16")
-        elif str(model_version_cfg) == BASELINE_TP_MODEL_VERSION:
-            print("  Baseline-TP params: model-axis tensor parallel shards.")
+        elif is_baseline and mesh_model > 1:
+            print("  Baseline params: model-axis tensor/vocab parallel shards.")
         elif is_baseline:
             print("  Baseline params: replicated; SRW shard_map disabled.")
 
-    if str(model_version_cfg) == BASELINE_TP_MODEL_VERSION:
+    if is_baseline and mesh_model > 1:
         for _name, _value in (
                 ('model.n_heads', cfg['model']['n_heads']),
                 ('model.d_model', cfg['model']['d_model']),
@@ -12477,7 +12498,7 @@ def main():
             if int(_value) % int(mesh_model) != 0:
                 raise ValueError(
                     f"{_name}={_value} must be divisible by "
-                    f"mesh_model={mesh_model} for baseline-tp.")
+                    f"mesh_model={mesh_model} for baseline TP.")
     if str(model_version_cfg) == V4167_MODEL_VERSION:
         for _name, _value in (
                 ('model.n_heads', cfg['model']['n_heads']),
@@ -12633,12 +12654,12 @@ def main():
     _sharded_fns = None
     _sharded_fns_analysis = None
     _force_sharded = _is_active_srw_version(model_version_cfg)
-    if str(model_version_cfg) == BASELINE_TP_MODEL_VERSION:
-        _sharded_fns = create_baseline_tp_sharded_fns(mesh, cfg)
+    if is_baseline and mesh_model > 1:
+        _sharded_fns = create_baseline_sharded_fns(mesh, cfg)
         if is_host0:
             print(
-                f"  baseline-tp shard_map enabled "
-                f"(mesh_model={mesh_model}; attention+ffn TP)",
+                f"  baseline-JAX shard_map enabled "
+                f"(mesh_model={mesh_model}; attention+ffn+vocab TP)",
                 flush=True)
     elif _is_active_srw_version(model_version_cfg) and (
             mesh_model > 1 or _force_sharded):
@@ -12756,7 +12777,7 @@ def main():
                 _sharded_fns_analysis.update(_v4167_extra_fns)
         if is_host0:
             _extra_msg = (
-                "; v4167 TP extras=router_dense,attention_o"
+                "; v4167 TP extras=router_dense,attention_o,vocab_parallel"
                 if str(model_version_cfg) == V4167_MODEL_VERSION else "")
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
@@ -13983,9 +14004,9 @@ def main():
                             log_message(
                                 f"  Pruned eval eps={float(_eps):.0e}: "
                                 f"loss={prune_eval_log.get('val_loss_prune_eps_' + _tag, 0.0):.4f} "
-                                f"Δloss={prune_eval_log.get('val_loss_delta_prune_eps_' + _tag, 0.0):+.4f} "
+                                f"delta_loss={prune_eval_log.get('val_loss_delta_prune_eps_' + _tag, 0.0):+.4f} "
                                 f"acc={prune_eval_log.get('val_acc_prune_eps_' + _tag, 0.0):.4f} "
-                                f"compute≈{prune_eval_log.get('estimated_compute_frac_prune_eps_' + _tag, 0.0):.4f} "
+                                f"compute={prune_eval_log.get('estimated_compute_frac_prune_eps_' + _tag, 0.0):.4f} "
                                 f"mass={prune_eval_log.get('gate_mass_retained_prune_eps_' + _tag, 0.0):.4f}")
                     if not (_do_analysis and analysis_step_fn is not None):
                         _print_validation_dead_stats(val_dead_log, _val_dead_ctx)
@@ -14221,9 +14242,9 @@ def main():
                     log_message(
                         f"  Pruned eval eps={float(_eps):.0e}: "
                         f"loss={prune_eval_log.get('val_loss_prune_eps_' + _tag, 0.0):.4f} "
-                        f"Δloss={prune_eval_log.get('val_loss_delta_prune_eps_' + _tag, 0.0):+.4f} "
+                        f"delta_loss={prune_eval_log.get('val_loss_delta_prune_eps_' + _tag, 0.0):+.4f} "
                         f"acc={prune_eval_log.get('val_acc_prune_eps_' + _tag, 0.0):.4f} "
-                        f"compute≈{prune_eval_log.get('estimated_compute_frac_prune_eps_' + _tag, 0.0):.4f} "
+                        f"compute={prune_eval_log.get('estimated_compute_frac_prune_eps_' + _tag, 0.0):.4f} "
                         f"mass={prune_eval_log.get('gate_mass_retained_prune_eps_' + _tag, 0.0):.4f}")
             _print_validation_dead_stats(val_dead_log, _val_dead_ctx)
             log_jsonl({

@@ -29,6 +29,12 @@ from functools import partial
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
+from models.vocab_parallel import (
+    make_vocab_parallel_cross_entropy,
+    make_vocab_parallel_embedding,
+    padded_vocab_size,
+)
+
 SELECT_DIAG_NAMES = (
     'rho_mean',                 # analysis/validation only; zero on fast train path
     'rho_std',                  # analysis/validation only; zero on fast train path
@@ -2876,12 +2882,21 @@ def make_v4167_tp_attention_o(mesh, n_heads, d_model):
 def create_v4167_tp_sharded_fns(mesh, cfg):
     """Build v4167 tensor-parallel helpers layered onto SRW sharded kernels."""
     model_cfg = cfg.get('model', cfg)
+    logical_vocab_size = int(model_cfg.get(
+        'logical_vocab_size', model_cfg.get('vocab_size', 30522)))
+    padded_vocab = int(model_cfg.get(
+        'vocab_size_padded',
+        padded_vocab_size(logical_vocab_size, int(mesh.shape['model']))))
     return {
         'v4167_router_dense': make_v4167_router_dense(mesh),
         'v4167_tp_attention_o': make_v4167_tp_attention_o(
             mesh,
             n_heads=int(model_cfg.get('n_heads', 6)),
             d_model=int(model_cfg.get('d_model', 384))),
+        'vocab_parallel_embedding': make_vocab_parallel_embedding(
+            mesh, logical_vocab_size, padded_vocab),
+        'vocab_parallel_ce': make_vocab_parallel_cross_entropy(
+            mesh, logical_vocab_size, padded_vocab),
     }
 
 
@@ -3861,6 +3876,8 @@ class DAWN_SRW_V4167(nn.Module):
     max_seq_len: int = 512
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
+    logical_vocab_size: Optional[int] = None
+    vocab_size_padded: Optional[int] = None
 
     d_route: int = DEFAULT_D_ROUTE
     n_qk: int = 1580
@@ -3889,6 +3906,21 @@ class DAWN_SRW_V4167(nn.Module):
     tau_init_attn_qk: Optional[float] = None
     tau_init_attn_v: Optional[float] = None
     tau_init_rst: Optional[float] = None
+
+    def _vocab_sizes(self):
+        logical = (
+            int(self.logical_vocab_size)
+            if self.logical_vocab_size is not None
+            else int(self.vocab_size))
+        embedding = (
+            int(self.vocab_size_padded)
+            if self.vocab_size_padded is not None
+            else logical)
+        if embedding < logical:
+            raise ValueError(
+                f"vocab_size_padded={embedding} must be >= "
+                f"logical_vocab_size={logical}")
+        return logical, embedding
 
     def _gsl_layout(self):
         n_rst_eff = self.n_rst if self.n_rst is not None else (
@@ -3997,8 +4029,10 @@ class DAWN_SRW_V4167(nn.Module):
                 f"n_rst={layout['n_rst_eff']} must equal n_rst_global + "
                 f"stage_count*n_rst_stage + n_layers*n_rst_local = "
                 f"{layout['expected_n_rst']}")
+        _, embedding_vocab_size = self._vocab_sizes()
         self.token_emb = nn.Embed(
-            self.vocab_size, self.d_model, embedding_init=scaled_normal(0.02))
+            embedding_vocab_size, self.d_model,
+            embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(
             self.max_seq_len, self.d_model, embedding_init=scaled_normal(0.02))
         self.neuron_pool = NeuronPool(
@@ -4065,7 +4099,14 @@ class DAWN_SRW_V4167(nn.Module):
         rst_visible_n = layout['rst_visible_n']
 
         positions = jnp.arange(S)[jnp.newaxis, :]
-        x = self.token_emb(input_ids) + self.pos_emb(positions)
+        vp_embed = (
+            sharded_fns.get('vocab_parallel_embedding')
+            if isinstance(sharded_fns, dict) else None)
+        if vp_embed is not None:
+            x = vp_embed(input_ids, self.token_emb.embedding)
+        else:
+            x = self.token_emb(input_ids)
+        x = x + self.pos_emb(positions)
         emb_rng = self.make_rng('dropout')
         x = safe_dropout(x, self.dropout_rate, deterministic, emb_rng)
 
@@ -4302,6 +4343,11 @@ class DAWN_SRW_V4167(nn.Module):
                 x, _ = jax.lax.scan(scan_body_minimal, x, xs_minimal)
                 x = self.norm(x)
                 if labels is None:
+                    if vp_embed is not None:
+                        raise NotImplementedError(
+                            "Full logits are disabled on the vocab-parallel "
+                            "v4167 minimal training path. Pass labels or run "
+                            "without sharded_fns.")
                     return {'logits': self.token_emb.attend(x)}
 
                 embedding_matrix = self.token_emb.embedding
@@ -4309,8 +4355,15 @@ class DAWN_SRW_V4167(nn.Module):
                 shift_labels = labels[:, 1:].astype(jnp.int32)
                 valid_mask = (shift_labels != -100)
 
-                loss, correct, valid_count = _chunked_ce_loss_and_acc(
-                    shift_x, embedding_matrix, shift_labels, valid_mask)
+                vp_ce = (
+                    sharded_fns.get('vocab_parallel_ce')
+                    if isinstance(sharded_fns, dict) else None)
+                if vp_ce is not None:
+                    loss, correct, valid_count = vp_ce(
+                        shift_x, embedding_matrix, shift_labels, valid_mask)
+                else:
+                    loss, correct, valid_count = _chunked_ce_loss_and_acc(
+                        shift_x, embedding_matrix, shift_labels, valid_mask)
                 return {
                     'loss': loss,
                     'correct': correct,
@@ -5145,38 +5198,62 @@ class DAWN_SRW_V4167(nn.Module):
             shift_labels = labels[:, 1:].astype(jnp.int32)
             valid_mask = (shift_labels != -100)
 
-            @jax.checkpoint
-            def compute_loss_and_acc(x_chunk, emb, labs, vmask):
-                logits = x_chunk @ emb.T
-                log_probs = jax.nn.log_softmax(logits, axis=-1)
-                safe = jnp.where(vmask, labs, 0)
-                tl = -jnp.take_along_axis(
-                    log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
-                per_token_ce = tl * vmask            # [B, S-1], 0 on invalid
-                loss = per_token_ce.sum() / (vmask.sum() + 1e-8)
-                preds = jnp.argmax(logits, axis=-1)
-                correct = jnp.sum((preds == labs) & vmask)
-                logits_f = logits.astype(jnp.float32)
-                logit_abs_max = jnp.max(jnp.abs(logits_f))
-                logit_norm_mean = jnp.linalg.norm(logits_f, axis=-1).mean()
-                logit_mean = logits_f.mean()
-                logit_std = logits_f.std()
-                return (loss, per_token_ce, correct, jnp.sum(vmask),
-                        logit_abs_max, logit_norm_mean, logit_mean, logit_std)
+            vp_ce = (
+                sharded_fns.get('vocab_parallel_ce')
+                if isinstance(sharded_fns, dict) else None)
+            if vp_ce is not None and not analysis:
+                loss, correct, valid_count = vp_ce(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)
+                result['loss'] = loss
+                result['correct'] = correct
+                result['valid_count'] = valid_count
+            else:
+                logical_vocab_size, _ = self._vocab_sizes()
 
-            (loss, per_token_ce, correct, valid_count,
-             logit_abs_max, logit_norm_mean, logit_mean, logit_std) = compute_loss_and_acc(
-                shift_x, embedding_matrix, shift_labels, valid_mask)
-            result['loss'] = loss
-            result['correct'] = correct
-            result['valid_count'] = valid_count
-            result['logit_max'] = logit_abs_max
-            result['logit_norm_mean'] = logit_norm_mean
-            result['logit_mean'] = logit_mean
-            result['logit_std'] = logit_std
-            result['per_token_ce'] = per_token_ce
-            result['valid_mask'] = valid_mask
+                @jax.checkpoint
+                def compute_loss_and_acc(x_chunk, emb, labs, vmask):
+                    logits = x_chunk @ emb.T
+                    if emb.shape[0] != logical_vocab_size:
+                        vocab_ids = jnp.arange(emb.shape[0])
+                        logits = jnp.where(
+                            vocab_ids[None, None, :] < logical_vocab_size,
+                            logits,
+                            jnp.finfo(logits.dtype).min)
+                    log_probs = jax.nn.log_softmax(logits, axis=-1)
+                    safe = jnp.where(vmask, labs, 0)
+                    tl = -jnp.take_along_axis(
+                        log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
+                    per_token_ce = tl * vmask
+                    loss = per_token_ce.sum() / (vmask.sum() + 1e-8)
+                    preds = jnp.argmax(logits, axis=-1)
+                    correct = jnp.sum((preds == labs) & vmask)
+                    logits_f = logits.astype(jnp.float32)
+                    logit_abs_max = jnp.max(jnp.abs(logits_f))
+                    logit_norm_mean = jnp.linalg.norm(logits_f, axis=-1).mean()
+                    logit_mean = logits_f.mean()
+                    logit_std = logits_f.std()
+                    return (loss, per_token_ce, correct, jnp.sum(vmask),
+                            logit_abs_max, logit_norm_mean, logit_mean,
+                            logit_std)
+
+                (loss, per_token_ce, correct, valid_count,
+                 logit_abs_max, logit_norm_mean, logit_mean,
+                 logit_std) = compute_loss_and_acc(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)
+                result['loss'] = loss
+                result['correct'] = correct
+                result['valid_count'] = valid_count
+                result['logit_max'] = logit_abs_max
+                result['logit_norm_mean'] = logit_norm_mean
+                result['logit_mean'] = logit_mean
+                result['logit_std'] = logit_std
+                result['per_token_ce'] = per_token_ce
+                result['valid_mask'] = valid_mask
         else:
+            if vp_embed is not None:
+                raise NotImplementedError(
+                    "Full logits are disabled on the vocab-parallel v4167 "
+                    "training path. Pass labels or run without sharded_fns.")
             result['logits'] = self.token_emb.attend(x)
 
         return result
@@ -5186,7 +5263,10 @@ class DAWN_SRW_V4167(nn.Module):
         n_rst_eff = layout['n_rst_eff']
         cfg = {
             'model_version': self.__version__,
-            'vocab_size': self.vocab_size, 'd_model': self.d_model,
+            'vocab_size': self.vocab_size,
+            'logical_vocab_size': self.logical_vocab_size,
+            'vocab_size_padded': self.vocab_size_padded,
+            'd_model': self.d_model,
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'max_seq_len': self.max_seq_len,
             'd_route': self.d_route,
@@ -5216,6 +5296,7 @@ class DAWN_SRW_V4167(nn.Module):
     def get_model_info(self):
         layout = self._gsl_layout()
         n_rst_eff = layout['n_rst_eff']
+        logical_vocab_size, embedding_vocab_size = self._vocab_sizes()
         qk_visible_n = layout['qk_visible_n']
         v_visible_n = layout['v_visible_n']
         rst_visible_n = layout['rst_visible_n']
@@ -5225,6 +5306,7 @@ class DAWN_SRW_V4167(nn.Module):
             f"DAWN-SRW ({self.__version__})",
             f"  d_model={self.d_model}, d_route={self.d_route}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
+            f"  vocab logical/padded={logical_vocab_size}/{embedding_vocab_size}",
             f"  Visible pools: qk={qk_visible_n}, v={v_visible_n}, "
             f"rst={rst_visible_n}",
             f"  Total pools: qk={self.n_qk}, v={self.n_v}, rst={n_rst_eff}",

@@ -23,7 +23,7 @@ downstream:
   add_eos: false
   task: wic
 model:
-  model_version: baseline
+  model_version: baseline-JAX
   vocab_size: 30522
   d_model: 1280
   d_ff: 5120

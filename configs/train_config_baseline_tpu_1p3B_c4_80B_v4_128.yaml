@@ -14,7 +14,7 @@ data:
   evict_train_shard_cache: true
 
 model:
-  model_version: "baseline"
+  model_version: "baseline-JAX"
   vocab_size: 30522
   d_model: 2048
   d_ff: 8192

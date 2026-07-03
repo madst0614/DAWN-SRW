@@ -1,19 +1,158 @@
-"""
-Vanilla Transformer Baseline — JAX/Flax
-
-DAWN과 공정한 TPU 비교를 위한 Standard Transformer 구현.
-train_jax.py와 동일한 인터페이스: dict 반환 (loss, aux_loss, correct, valid_count).
-"""
+"""Vanilla Transformer baseline for JAX/Flax."""
+from functools import partial
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from jax.experimental.shard_map import shard_map
+from jax.sharding import PartitionSpec as P
+
+from models.vocab_parallel import (
+    make_vocab_parallel_cross_entropy,
+    make_vocab_parallel_embedding,
+    padded_vocab_size,
+)
 
 
 def scaled_normal(scale=0.02):
     def init(key, shape, dtype=jnp.float32):
         return jax.random.normal(key, shape, dtype) * scale
     return init
+
+
+def _check_divisible(name, value, divisor):
+    if int(value) % int(divisor) != 0:
+        raise ValueError(
+            f"{name}={value} must be divisible by mesh_model={divisor} "
+            "for baseline tensor parallelism.")
+
+
+def _local_causal_attention(q, k, v, d_head):
+    scale = jnp.sqrt(jnp.float32(d_head))
+    scores = jnp.einsum("bhsd,bhtd->bhst", q, k) / scale
+    seq_len = q.shape[2]
+    causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
+    scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+    attn = jax.nn.softmax(scores, axis=-1)
+    return jnp.einsum("bhst,bhtd->bhsd", attn, v)
+
+
+def make_baseline_model_parallel_attention(mesh, n_heads, d_model):
+    mesh_model = int(mesh.shape["model"])
+    _check_divisible("n_heads", n_heads, mesh_model)
+    _check_divisible("d_model", d_model, mesh_model)
+    if int(d_model) % int(n_heads) != 0:
+        raise ValueError(
+            f"d_model={d_model} must be divisible by n_heads={n_heads}.")
+
+    d_head = int(d_model) // int(n_heads)
+    heads_per_shard = int(n_heads) // mesh_model
+    d_local = heads_per_shard * d_head
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(
+            P("data", None, None),
+            P(None, "model"),
+            P("model"),
+            P(None, "model"),
+            P("model"),
+            P(None, "model"),
+            P("model"),
+            P("model", None),
+        ),
+        out_specs=P("data", None, None),
+        check_rep=False,
+    )
+    def baseline_attention(x, q_kernel, q_bias, k_kernel, k_bias,
+                              v_kernel, v_bias, o_kernel):
+        batch, seq_len, _ = x.shape
+        q = x @ q_kernel + q_bias
+        k = x @ k_kernel + k_bias
+        v = x @ v_kernel + v_bias
+
+        q = q.reshape(batch, seq_len, heads_per_shard, d_head)
+        k = k.reshape(batch, seq_len, heads_per_shard, d_head)
+        v = v.reshape(batch, seq_len, heads_per_shard, d_head)
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        out = _local_causal_attention(q, k, v, d_head)
+        out = out.transpose(0, 2, 1, 3).reshape(batch, seq_len, d_local)
+        partial_out = out @ o_kernel
+        return jax.lax.psum(partial_out, "model")
+
+    return baseline_attention
+
+
+def make_baseline_model_parallel_ffn(mesh, d_ff):
+    mesh_model = int(mesh.shape["model"])
+    _check_divisible("d_ff", d_ff, mesh_model)
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(
+            P("data", None, None),
+            P(None, "model"),
+            P("model"),
+            P("model", None),
+            P(),
+        ),
+        out_specs=P("data", None, None),
+        check_rep=False,
+    )
+    def baseline_ffn(x, up_kernel, up_bias, down_kernel, down_bias):
+        h = x @ up_kernel + up_bias
+        h = nn.gelu(h)
+        partial_out = h @ down_kernel
+        out = jax.lax.psum(partial_out, "model")
+        return out + down_bias
+
+    return baseline_ffn
+
+
+def create_baseline_sharded_fns(mesh, cfg):
+    """Build optional tensor/vocab-parallel helpers for VanillaTransformer."""
+    model_cfg = cfg.get("model", cfg)
+    training_cfg = cfg.get("training", {})
+    mesh_model = int(mesh.shape["model"])
+    d_model = int(model_cfg.get("d_model", 384))
+    n_heads = int(model_cfg.get("n_heads", 6))
+    d_ff = int(model_cfg.get("d_ff", 1536))
+    dropout_rate = float(model_cfg.get("dropout", model_cfg.get(
+        "dropout_rate", 0.0)))
+
+    _check_divisible("n_heads", n_heads, mesh_model)
+    _check_divisible("d_model", d_model, mesh_model)
+    _check_divisible("d_ff", d_ff, mesh_model)
+    if dropout_rate > 0.0 and mesh_model > 1:
+        raise ValueError(
+            "baseline tensor-parallel train path requires dropout=0.0 "
+            f"when mesh_model > 1; got dropout={dropout_rate}.")
+    if int(training_cfg.get("mesh_model", mesh_model)) != mesh_model:
+        raise ValueError(
+            "baseline mesh_model mismatch between config and mesh: "
+            f"config={training_cfg.get('mesh_model')} mesh={mesh_model}.")
+
+    logical_vocab_size = int(model_cfg.get(
+        "logical_vocab_size", model_cfg.get("vocab_size", 30522)))
+    padded_vocab = int(model_cfg.get(
+        "vocab_size_padded",
+        padded_vocab_size(logical_vocab_size, mesh_model)))
+
+    return {
+        "baseline_attention": make_baseline_model_parallel_attention(
+            mesh, n_heads=n_heads, d_model=d_model),
+        "baseline_ffn": make_baseline_model_parallel_ffn(mesh, d_ff=d_ff),
+        "vocab_parallel_embedding": make_vocab_parallel_embedding(
+            mesh, logical_vocab_size, padded_vocab),
+        "vocab_parallel_ce": make_vocab_parallel_cross_entropy(
+            mesh, logical_vocab_size, padded_vocab),
+    }
 
 
 class StandardAttention(nn.Module):
@@ -91,11 +230,7 @@ class TransformerLayer(nn.Module):
 
 
 class VanillaTransformer(nn.Module):
-    """Vanilla Transformer for Language Modeling — JAX/Flax
-
-    DAWN과 동일한 인터페이스. train_jax.py에서 그대로 사용 가능.
-    aux_loss=0, orthogonality_loss=0, knowledge_diversity_loss=0.
-    """
+    """Vanilla Transformer with optional tensor/vocab-parallel execution."""
     __version__ = "baseline-JAX"
 
     vocab_size: int = 30522
@@ -106,9 +241,27 @@ class VanillaTransformer(nn.Module):
     max_seq_len: int = 512
     dropout_rate: float = 0.0
     gradient_checkpointing: bool = False
+    logical_vocab_size: Optional[int] = None
+    vocab_size_padded: Optional[int] = None
+
+    def _vocab_sizes(self):
+        logical = (
+            int(self.logical_vocab_size)
+            if self.logical_vocab_size is not None
+            else int(self.vocab_size))
+        embedding = (
+            int(self.vocab_size_padded)
+            if self.vocab_size_padded is not None
+            else logical)
+        if embedding < logical:
+            raise ValueError(
+                f"vocab_size_padded={embedding} must be >= "
+                f"logical_vocab_size={logical}")
+        return logical, embedding
 
     def setup(self):
-        self.token_emb = nn.Embed(self.vocab_size, self.d_model,
+        _, embedding_vocab_size = self._vocab_sizes()
+        self.token_emb = nn.Embed(embedding_vocab_size, self.d_model,
                                   embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(self.max_seq_len, self.d_model,
                                 embedding_init=scaled_normal(0.02))
@@ -124,15 +277,78 @@ class VanillaTransformer(nn.Module):
         self.emb_dropout = nn.Dropout(self.dropout_rate)
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
-                 deterministic=False):
+                 deterministic=False, sharded_fns=None):
         B, S = input_ids.shape
         positions = jnp.arange(S)[jnp.newaxis, :]
-        x = self.token_emb(input_ids) + self.pos_emb(positions)
+
+        vp_embed = (
+            sharded_fns.get("vocab_parallel_embedding")
+            if isinstance(sharded_fns, dict) else None)
+        if vp_embed is not None:
+            x = vp_embed(input_ids, self.token_emb.embedding)
+        else:
+            x = self.token_emb(input_ids)
+        x = x + self.pos_emb(positions)
 
         x = self.emb_dropout(x, deterministic=deterministic)
 
-        for layer in self.layers:
-            x = layer(x, deterministic)
+        attn_fn = None
+        ffn_fn = None
+        if isinstance(sharded_fns, dict):
+            attn_fn = sharded_fns.get("baseline_attention")
+            ffn_fn = sharded_fns.get("baseline_ffn")
+
+        use_tp_path = (
+            not self.is_initializing()
+            and attn_fn is not None
+            and ffn_fn is not None)
+        if use_tp_path:
+            if self.dropout_rate > 0.0 and not deterministic:
+                raise ValueError(
+                    "baseline tensor-parallel train path requires "
+                    f"dropout_rate=0.0; got dropout_rate={self.dropout_rate}.")
+
+            def layer_forward(x_in, layer_params):
+                normed = _layer_norm(
+                    x_in,
+                    layer_params["norm1"]["scale"],
+                    layer_params["norm1"]["bias"])
+                attn_params = layer_params["attn"]
+                attn_out = attn_fn(
+                    normed,
+                    attn_params["q_proj"]["kernel"],
+                    attn_params["q_proj"]["bias"],
+                    attn_params["k_proj"]["kernel"],
+                    attn_params["k_proj"]["bias"],
+                    attn_params["v_proj"]["kernel"],
+                    attn_params["v_proj"]["bias"],
+                    attn_params["o_proj"]["kernel"],
+                )
+                x_mid = x_in + attn_out
+
+                normed = _layer_norm(
+                    x_mid,
+                    layer_params["norm2"]["scale"],
+                    layer_params["norm2"]["bias"])
+                ffn_params = layer_params["ffn"]
+                ffn_out = ffn_fn(
+                    normed,
+                    ffn_params["Dense_0"]["kernel"],
+                    ffn_params["Dense_0"]["bias"],
+                    ffn_params["Dense_1"]["kernel"],
+                    ffn_params["Dense_1"]["bias"],
+                )
+                return x_mid + ffn_out
+
+            if self.gradient_checkpointing:
+                layer_forward = jax.checkpoint(layer_forward)
+
+            params = self.variables["params"]
+            for i in range(self.n_layers):
+                x = layer_forward(x, params[f"layer_{i}"])
+        else:
+            for layer in self.layers:
+                x = layer(x, deterministic)
 
         x = self.norm(x)
 
@@ -146,25 +362,44 @@ class VanillaTransformer(nn.Module):
             shift_labels = labels[:, 1:].astype(jnp.int32)
             valid_mask = (shift_labels != -100)
 
-            @jax.checkpoint
-            def compute_loss_and_acc(x_chunk, emb, labs, vmask):
-                logits = x_chunk @ emb.T
-                log_probs = jax.nn.log_softmax(logits, axis=-1)
-                safe = jnp.where(vmask, labs, 0)
-                tl = -jnp.take_along_axis(
-                    log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
-                loss = (tl * vmask).sum() / (vmask.sum() + 1e-8)
-                preds = jnp.argmax(logits, axis=-1)
-                correct = jnp.sum((preds == labs) & vmask)
-                valid_count = jnp.sum(vmask)
-                return loss, correct, valid_count
+            vp_ce = (
+                sharded_fns.get("vocab_parallel_ce")
+                if isinstance(sharded_fns, dict) else None)
+            if vp_ce is not None:
+                loss, correct, valid_count = vp_ce(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)
+            else:
+                logical_vocab_size, _ = self._vocab_sizes()
 
-            loss, correct, valid_count = compute_loss_and_acc(
-                shift_x, embedding_matrix, shift_labels, valid_mask)
+                @jax.checkpoint
+                def compute_loss_and_acc(x_chunk, emb, labs, vmask):
+                    logits = x_chunk @ emb.T
+                    if emb.shape[0] != logical_vocab_size:
+                        vocab_ids = jnp.arange(emb.shape[0])
+                        logits = jnp.where(
+                            vocab_ids[None, None, :] < logical_vocab_size,
+                            logits,
+                            jnp.finfo(logits.dtype).min)
+                    log_probs = jax.nn.log_softmax(logits, axis=-1)
+                    safe = jnp.where(vmask, labs, 0)
+                    tl = -jnp.take_along_axis(
+                        log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
+                    loss = (tl * vmask).sum() / (vmask.sum() + 1e-8)
+                    preds = jnp.argmax(logits, axis=-1)
+                    correct = jnp.sum((preds == labs) & vmask)
+                    valid_count = jnp.sum(vmask)
+                    return loss, correct, valid_count
+
+                loss, correct, valid_count = compute_loss_and_acc(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)
             result['loss'] = loss
             result['correct'] = correct
             result['valid_count'] = valid_count
         else:
+            if vp_embed is not None:
+                raise NotImplementedError(
+                    "Full logits are disabled on the vocab-parallel baseline "
+                    "training path. Pass labels or run without sharded_fns.")
             logits = self.token_emb.attend(x)
             result['logits'] = logits
 
@@ -179,7 +414,10 @@ class VanillaTransformer(nn.Module):
     def get_config(self):
         return {
             'model_version': self.__version__,
-            'vocab_size': self.vocab_size, 'd_model': self.d_model,
+            'vocab_size': self.vocab_size,
+            'logical_vocab_size': self.logical_vocab_size,
+            'vocab_size_padded': self.vocab_size_padded,
+            'd_model': self.d_model,
             'd_ff': self.d_ff,
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'max_seq_len': self.max_seq_len,
@@ -187,9 +425,11 @@ class VanillaTransformer(nn.Module):
 
     def get_model_info(self):
         ffn_ratio = self.d_ff / self.d_model
+        logical_vocab_size, embedding_vocab_size = self._vocab_sizes()
         return [
-            f"  Model: VanillaTransformer (baseline-JAX, standard 4x FFN, parameter-matched)",
+            "  Model: VanillaTransformer (baseline-JAX, optional TP)",
             f"  d_model={self.d_model}, d_ff={self.d_ff}, n_layers={self.n_layers}, n_heads={self.n_heads}",
+            f"  vocab logical/padded={logical_vocab_size}/{embedding_vocab_size}",
             f"  FFN ratio={ffn_ratio:.2f}, dropout={self.dropout_rate}",
             f"  gradient_checkpointing={self.gradient_checkpointing}",
         ]

@@ -1,4 +1,4 @@
-# Vanilla Transformer Baseline — TPU Training Config
+# Vanilla Transformer Baseline - TPU Training Config
 # Conservative parameter-matched baseline for DAWN-SRW 40M @ 5B tokens
 # Uses standard 4x FFN ratio: d_model=432, d_ff=1728
 # Approx params with BERT uncased vocab 30522: ~40.34M
@@ -15,7 +15,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "baseline"
+  model_version: "baseline-JAX"
   d_model: 432
   d_ff: 1728
   n_layers: 12

@@ -14,7 +14,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "baseline"
+  model_version: "baseline-JAX"
   d_model: 1280
   d_ff: 5120
   n_layers: 18

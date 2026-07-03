@@ -1058,6 +1058,8 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
             'rst_single_minimal',
             'v4167_router_dense',
             'v4167_tp_attention_o',
+            'vocab_parallel_embedding',
+            'vocab_parallel_ce',
         )
         missing = [name for name in required if name not in sharded_fns]
         if missing:
@@ -1067,7 +1069,7 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
 
     if is_host0:
         extra_msg = (
-            "; v4167 TP extras=router_dense,attention_o"
+            "; v4167 TP extras=router_dense,attention_o,vocab_parallel"
             if model_version == full.V4167_MODEL_VERSION else "")
         print(
             "  shard_map minimal enabled "
@@ -1417,6 +1419,7 @@ def main():
         print(f"Val batches: {len(val_loader)}")
 
     cfg['model']['vocab_size'] = vocab_size
+    full._maybe_materialize_vocab_parallel_config(cfg)
     _stage_log("before_build_model")
     model = full.build_model_from_config(cfg)
     _stage_log("after_build_model")
