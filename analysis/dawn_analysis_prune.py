@@ -24,7 +24,8 @@ from analysis.dawn_analysis_storage import (
 )
 
 
-DEFAULT_PRUNE_EPS = [0.0, 1e-7, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
+DEFAULT_PRUNE_EPS = [0.0, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
+PRUNE_ANALYSIS_IMPL = "trainer_eval_step_v2"
 
 
 def parse_eps_list(value: str | None) -> List[float]:
@@ -37,6 +38,48 @@ def eps_tag(eps: float) -> str:
     if float(eps) == 0.0:
         return "0"
     return f"{float(eps):.0e}".replace("-", "m")
+
+
+def _expected_params(ctx: AnalysisContext, eps: float, batch_size: int,
+                     max_len: int, max_tokens: int, max_batches: int) -> Dict[str, Any]:
+    expected = {
+        "analysis_impl": PRUNE_ANALYSIS_IMPL,
+        "eps": float(eps),
+        "batch_size": int(batch_size),
+        "seq_len": int(max_len),
+        "max_tokens": int(max_tokens),
+        "max_batches": int(max_batches),
+        "total_training_steps": int(ctx.total_training_steps),
+    }
+    if ctx.checkpoint_step is not None:
+        expected["checkpoint_step"] = int(ctx.checkpoint_step)
+    return expected
+
+
+def _params_match(actual: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    for key, expected_value in expected.items():
+        if key == "analysis_impl":
+            if actual.get(key) != expected_value:
+                return False
+            continue
+        try:
+            if isinstance(expected_value, float):
+                if not math.isclose(float(actual.get(key)), expected_value, rel_tol=0.0, abs_tol=1e-12):
+                    return False
+            elif int(actual.get(key)) != int(expected_value):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _row_matches(row: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    if not _params_match(row.get("analysis_params", {}), expected):
+        return False
+    try:
+        return math.isfinite(float(row.get("loss", float("nan"))))
+    except Exception:
+        return False
 
 
 def _aggregate(rows: List[Dict[str, Any]], eps: float, base_loss: float | None = None) -> Dict[str, Any]:
@@ -74,20 +117,37 @@ def _run_one_eps(ctx: AnalysisContext, eps: float, max_batches: int,
     eps_dir = store.path("prune", f"eps_{tag}")
     by_batch_path = store.path("prune", f"eps_{tag}", "by_batch.jsonl")
     summary_path = store.path("prune", f"eps_{tag}", "prune_summary.json")
-    if args.resume and should_skip_job(summary_path, ["val_loss", "valid_tokens"]):
-        summary = _aggregate(read_jsonl(by_batch_path), eps, base_loss)
-        store.log_event(
-            stage,
-            "eps_skip",
-            message=(
-                f"PRUNE eps={eps:g} SKIP "
-                f"loss={summary['val_loss']:.6f} "
-                f"delta={summary.get('delta_loss_vs_eps0')} "
-                f"compute={summary['estimated_compute_frac']:.4f}"
-            ),
-            **summary,
+    expected_params = _expected_params(ctx, eps, batch_size, max_len, max_tokens, max_batches)
+    if args.resume and should_skip_job(summary_path, ["val_loss", "valid_tokens", "analysis_params"]):
+        summary = _aggregate(
+            [r for r in read_jsonl(by_batch_path) if _row_matches(r, expected_params)],
+            eps,
+            base_loss,
         )
-        return summary
+        saved_summary = {}
+        try:
+            from analysis.dawn_analysis_storage import read_json
+
+            saved_summary = read_json(summary_path)
+        except Exception:
+            saved_summary = {}
+        if (
+            _params_match(saved_summary.get("analysis_params", {}), expected_params)
+            and int(summary.get("valid_tokens", 0)) > 0
+        ):
+            summary["analysis_params"] = expected_params
+            store.log_event(
+                stage,
+                "eps_skip",
+                message=(
+                    f"PRUNE eps={eps:g} SKIP "
+                    f"loss={summary['val_loss']:.6f} "
+                    f"delta={summary.get('delta_loss_vs_eps0')} "
+                    f"compute={summary['estimated_compute_frac']:.4f}"
+                ),
+                **summary,
+            )
+            return summary
 
     loader = load_eval_data(
         ctx.config,
@@ -107,7 +167,11 @@ def _run_one_eps(ctx: AnalysisContext, eps: float, max_batches: int,
         total_training_steps=ctx.total_training_steps,
     )
     existing_rows = read_jsonl(by_batch_path) if args.resume else []
-    rows_by_idx = {int(r["batch_idx"]): r for r in existing_rows if "batch_idx" in r}
+    rows_by_idx = {
+        int(r["batch_idx"]): r
+        for r in existing_rows
+        if "batch_idx" in r and _row_matches(r, expected_params)
+    }
     completed = set(rows_by_idx)
 
     store.log_event(
@@ -163,6 +227,7 @@ def _run_one_eps(ctx: AnalysisContext, eps: float, max_batches: int,
         row = {
             "batch_idx": int(batch_idx),
             "eps": float(eps),
+            "analysis_params": expected_params,
             "loss": loss,
             "loss_sum": loss * valid,
             "correct": correct,
@@ -198,6 +263,7 @@ def _run_one_eps(ctx: AnalysisContext, eps: float, max_batches: int,
 
     rows = [rows_by_idx[i] for i in sorted(rows_by_idx) if i < max_batches]
     summary = _aggregate(rows, eps, base_loss)
+    summary["analysis_params"] = expected_params
     if not ctx.is_primary:
         store.log_event(
             stage,

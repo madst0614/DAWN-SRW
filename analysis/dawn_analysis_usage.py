@@ -85,7 +85,7 @@ def _top_contexts_for_pool(pool: str, ids: np.ndarray, vals: np.ndarray,
                            route: np.ndarray, batch_tokens: np.ndarray,
                            tokenizer, top_contexts_per_op: int) -> Dict[str, List[Dict[str, Any]]]:
     # ids/vals: [layers, batch, positions_or_routes, topk]
-    contexts: Dict[int, List[Tuple[float, Dict[str, Any]]]] = defaultdict(list)
+    contexts: Dict[int, List[Tuple[float, int, Dict[str, Any]]]] = defaultdict(list)
     layers, batch, positions, topk = ids.shape
     flat_order = np.argwhere(vals > 0)
     if flat_order.shape[0] > 200_000:
@@ -93,7 +93,7 @@ def _top_contexts_for_pool(pool: str, ids: np.ndarray, vals: np.ndarray,
         kth = max(0, weights.size - 200_000)
         cutoff = np.partition(weights, kth)[kth]
         flat_order = np.argwhere(vals >= cutoff)
-    for layer, row, pos, k_idx in flat_order:
+    for seq, (layer, row, pos, k_idx) in enumerate(flat_order):
         weight = float(vals[layer, row, pos, k_idx])
         op = int(ids[layer, row, pos, k_idx])
         token_pos = int(pos)
@@ -112,14 +112,14 @@ def _top_contexts_for_pool(pool: str, ids: np.ndarray, vals: np.ndarray,
             "text_window": token_window_text(tokenizer, token_ids, token_pos),
         }
         heap = contexts[op]
-        item = (weight, rec)
+        item = (weight, int(seq), rec)
         if len(heap) < top_contexts_per_op:
             heapq.heappush(heap, item)
         elif weight > heap[0][0]:
             heapq.heapreplace(heap, item)
     out = {}
     for op, heap in contexts.items():
-        out[str(op)] = [rec for _, rec in sorted(heap, key=lambda x: -x[0])]
+        out[str(op)] = [rec for _, _, rec in sorted(heap, key=lambda x: (-x[0], x[1]))]
     return out
 
 
