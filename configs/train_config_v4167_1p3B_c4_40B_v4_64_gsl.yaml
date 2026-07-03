@@ -25,21 +25,21 @@ model:
   router_scope: local
 
   # Parameter-matched pool target:
-  # total operators = 4214 + 13116 + 35224 = 52554
+  # total operators = 4176 + 13152 + 35224 = 52552
   # expected params ~= baseline - 4093
-  n_qk: 4214
-  n_v: 13116
+  n_qk: 4176
+  n_v: 13152
   n_rst: 35224
 
   # GSL 5/10/85-ish split, n_layers=24, stage_count=8
-  # qk: 214 + 8*50 + 24*150 = 4214
-  n_qk_global: 214
-  n_qk_stage: 50
-  n_qk_local: 150
+  # qk: 208 + 8*52 + 24*148 = 4176
+  n_qk_global: 208
+  n_qk_stage: 52
+  n_qk_local: 148
 
-  # v: 668 + 8*164 + 24*464 = 13116
-  n_v_global: 668
-  n_v_stage: 164
+  # v: 672 + 8*168 + 24*464 = 13152
+  n_v_global: 672
+  n_v_stage: 168
   n_v_local: 464
 
   # rst: 1752 + 8*440 + 24*1248 = 35224
@@ -56,8 +56,8 @@ model:
 
 training:
   batch_size: 512
-  mesh_model: 2
-  mesh_data: 16
+  mesh_model: 4
+  mesh_data: 8
   gradient_accumulation_steps: 2
   num_epochs: 1
 
