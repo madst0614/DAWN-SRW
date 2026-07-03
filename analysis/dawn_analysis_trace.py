@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import jax
@@ -11,6 +12,7 @@ import numpy as np
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    format_duration,
     load_eval_data,
     maybe_load_tokenizer,
 )
@@ -319,6 +321,7 @@ def run_trace_stage(ctx: AnalysisContext) -> Dict[str, Any]:
 
     summaries = []
     trace_fn = jax.jit(lambda p, x: topk_trace_forward(p, ctx.model_cfg, x, topk=topk))
+    trace_t0 = time.time()
     for i, prompt in enumerate(prompts):
         json_path = store.path("trace", f"prompt-{i:06d}.json")
         npz_path = store.path("trace", f"prompt-{i:06d}_topk.npz")
@@ -326,12 +329,27 @@ def run_trace_stage(ctx: AnalysisContext) -> Dict[str, Any]:
         if args.resume and should_skip_job(json_path, ["prompt_id", "summary"]) and should_skip_job(npz_path):
             meta = json.loads(json.dumps(prompt, default=str))
             summaries.append({"prompt_idx": i, "prompt_id": prompt["prompt_id"], "skipped": True})
-            store.log_event(stage, "prompt_skip", message=f"TRACE prompt {i + 1}/{len(prompts)} SKIP id={prompt['prompt_id']}")
+            done = i + 1
+            elapsed = time.time() - trace_t0
+            eta = (elapsed / done) * max(0, len(prompts) - done) if done else None
+            store.log_event(
+                stage,
+                "prompt_skip",
+                message=(
+                    f"TRACE prompt {done}/{len(prompts)} SKIP id={prompt['prompt_id']} "
+                    f"elapsed={format_duration(elapsed)} eta={format_duration(eta)}"
+                ),
+            )
             continue
         job_id = f"prompt-{i:06d}"
         store.mark_job_started(stage, job_id)
+        prompt_t0 = time.time()
         input_arr = np.asarray(prompt["input_array"], dtype=np.int32)[None, :]
         trace_host = jax.device_get(trace_fn(ctx.params, jnp.asarray(input_arr)))
+        prompt_sec = time.time() - prompt_t0
+        done = i + 1
+        elapsed = time.time() - trace_t0
+        eta = (elapsed / done) * max(0, len(prompts) - done) if done else None
         trace_np = {k: np.asarray(v) for k, v in trace_host.items()}
         actual_len = int(prompt["length"])
         summary = _prompt_summary(trace_np, actual_len)
@@ -356,6 +374,8 @@ def run_trace_stage(ctx: AnalysisContext) -> Dict[str, Any]:
                 message=(
                     f"TRACE prompt {i + 1}/{len(prompts)} id={prompt['prompt_id']} "
                     f"len={actual_len} "
+                    f"prompt_sec={prompt_sec:.1f} "
+                    f"elapsed={format_duration(elapsed)} eta={format_duration(eta)} "
                     f"q_active={summary['q']['active_mean']:.1f} "
                     f"k_active={summary['k']['active_mean']:.1f} "
                     f"v_active={summary['v']['active_mean']:.1f} "
@@ -372,4 +392,3 @@ def run_trace_stage(ctx: AnalysisContext) -> Dict[str, Any]:
         store.set_stage_status(stage, "complete")
         store.log_event(stage, "summary", message=f"TRACE SUMMARY prompts={len(prompts)}", **final)
     return final if ctx.is_primary else {}
-

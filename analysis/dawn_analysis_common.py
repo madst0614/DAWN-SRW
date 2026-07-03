@@ -644,6 +644,33 @@ def host_aligned_batch_size(batch_size: int, n_hosts: int) -> int:
     return ((batch_size + n_hosts - 1) // n_hosts) * n_hosts
 
 
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    try:
+        seconds_f = float(seconds)
+    except Exception:
+        return "unknown"
+    if not math.isfinite(seconds_f) or seconds_f < 0:
+        return "unknown"
+    total = int(round(seconds_f))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:d}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m:d}m{s:02d}s"
+    return f"{s:d}s"
+
+
+def sync_hosts(label: str) -> None:
+    if int(jax.process_count()) <= 1:
+        return
+    from jax.experimental import multihost_utils
+
+    multihost_utils.sync_global_devices(str(label))
+
+
 def shard_batch_to_mesh(input_ids, attention_mask, data_sharding):
     train = get_train()
     gb = int(input_ids.shape[0]) * int(jax.process_count())

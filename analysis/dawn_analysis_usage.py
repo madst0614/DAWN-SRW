@@ -5,6 +5,7 @@ from __future__ import annotations
 import heapq
 import re
 import random
+import time
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -14,9 +15,11 @@ import numpy as np
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    format_duration,
     host_aligned_batch_size,
     load_eval_data,
     maybe_load_tokenizer,
+    sync_hosts,
     token_window_text,
 )
 from analysis.dawn_analysis_storage import (
@@ -220,19 +223,51 @@ def _reduce_parts(ctx: AnalysisContext, part_paths: List[str]) -> Tuple[Dict[str
     return arrays, summary, contexts
 
 
+def _part_identity(path: str) -> Tuple[int, int] | None:
+    name = path.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
+    match = PART_RE.match(name)
+    if not match:
+        return None
+    return int(match.group("host")), int(match.group("part"))
+
+
 def _current_run_part_paths(ctx: AnalysisContext, max_parts: int) -> List[str]:
     paths = list_paths(ctx.store.path("usage", "usage_parts"), "part-host*-*.json")
     selected = []
     for path in paths:
-        name = path.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
-        match = PART_RE.match(name)
-        if not match:
+        identity = _part_identity(path)
+        if identity is None:
             continue
-        host_id = int(match.group("host"))
-        part_idx = int(match.group("part"))
+        host_id, part_idx = identity
         if 0 <= host_id < int(ctx.n_hosts) and 0 <= part_idx < int(max_parts):
             selected.append(path)
     return sorted(selected)
+
+
+def _usage_metadata_matches(meta: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    for key, expected_value in expected.items():
+        try:
+            if int(meta.get(key)) != int(expected_value):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _usage_part_matches(path: str, *, expected_params: Dict[str, Any],
+                        host_id: int, part_idx: int) -> bool:
+    if not should_skip_job(path, ["counts", "mass_sum", "analysis_params"]):
+        return False
+    try:
+        part = read_json(path)
+    except Exception:
+        return False
+    if not _usage_metadata_matches(part.get("analysis_params", {}), expected_params):
+        return False
+    try:
+        return int(part.get("host_id")) == int(host_id) and int(part.get("batch_idx")) == int(part_idx)
+    except Exception:
+        return False
 
 
 def _write_top_context_files(ctx: AnalysisContext, contexts: Dict[str, Dict[str, List[Dict[str, Any]]]],
@@ -319,29 +354,41 @@ def run_usage_stage(ctx: AnalysisContext) -> Dict[str, Any]:
     stage = "usage"
     summary_path = store.path("usage", "operator_usage_summary.json")
     npz_path = store.path("usage", "operator_usage_by_pool.npz")
-    if args.resume and should_skip_job(summary_path, ["pools"]) and should_skip_job(npz_path):
-        summary = read_json(summary_path)
-        store.log_event(
-            stage,
-            "skip",
-            message=(
-                "USAGE SKIP complete "
-                f"tokens={int(summary.get('tokens_observed', 0)):,} "
-                + " ".join(
-                    f"{p}_active={summary.get('pools', {}).get(p, {}).get('active_ops_observed', 0):,}"
-                    for p in ATLAS_POOLS
-                )
-            ),
-            **summary,
-        )
-        return summary
-
-    store.set_stage_status(stage, "running")
     seq_len = int(args.usage_seq_len)
     requested_batch_size = int(args.usage_batch_size)
     batch_size = host_aligned_batch_size(requested_batch_size, ctx.n_hosts)
     topk = int(args.usage_topk)
     max_sequences = int(args.usage_max_sequences)
+    top_contexts_per_op = int(args.usage_top_contexts_per_op)
+    expected_params = {
+        "seq_len": seq_len,
+        "topk": topk,
+        "global_batch_size": batch_size,
+        "usage_max_sequences": max_sequences,
+        "top_contexts_per_op": top_contexts_per_op,
+    }
+    if ctx.checkpoint_step is not None:
+        expected_params["checkpoint_step"] = int(ctx.checkpoint_step)
+
+    if args.resume and should_skip_job(summary_path, ["pools", "analysis_params"]) and should_skip_job(npz_path):
+        summary = read_json(summary_path)
+        if _usage_metadata_matches(summary.get("analysis_params", {}), expected_params):
+            store.log_event(
+                stage,
+                "skip",
+                message=(
+                    "USAGE SKIP complete "
+                    f"tokens={int(summary.get('tokens_observed', 0)):,} "
+                    + " ".join(
+                        f"{p}_active={summary.get('pools', {}).get(p, {}).get('active_ops_observed', 0):,}"
+                        for p in ATLAS_POOLS
+                    )
+                ),
+                **summary,
+            )
+            return summary
+
+    store.set_stage_status(stage, "running")
     max_tokens = max_sequences * seq_len
     tokenizer = maybe_load_tokenizer(local_only=True)
     loader = load_eval_data(ctx.config, seq_len, batch_size, ctx.host_id, ctx.n_hosts, max_tokens=max_tokens)
@@ -366,16 +413,34 @@ def run_usage_stage(ctx: AnalysisContext) -> Dict[str, Any]:
     )
 
     part_paths = []
+    stage_t0 = time.time()
     for part_idx, (input_ids, _attention_mask) in enumerate(loader):
         if part_idx >= max_parts:
             break
         part_path = store.path("usage", "usage_parts", f"part-host{ctx.host_id:03d}-{part_idx:06d}.json")
         part_paths.append(part_path)
-        if args.resume and should_skip_job(part_path, ["counts", "mass_sum"]):
-            store.log_event(stage, "part_skip", message=f"USAGE part {part_idx + 1}/{max_parts} SKIP")
+        if args.resume and _usage_part_matches(
+            part_path,
+            expected_params=expected_params,
+            host_id=ctx.host_id,
+            part_idx=part_idx,
+        ):
+            done = part_idx + 1
+            elapsed = time.time() - stage_t0
+            eta = (elapsed / done) * max(0, max_parts - done) if done else None
+            store.log_event(
+                stage,
+                "part_skip",
+                message=(
+                    f"USAGE part {done:05d}/{max_parts:05d} SKIP "
+                    f"elapsed={format_duration(elapsed)} eta={format_duration(eta)} "
+                    f"host={ctx.host_id}/{ctx.n_hosts}"
+                ),
+            )
             continue
         job_id = f"part-host{ctx.host_id:03d}-{part_idx:06d}"
         store.mark_job_started(stage, job_id)
+        part_t0 = time.time()
         batch_tokens = np.asarray(input_ids, dtype=np.int32)
         trace_np = {
             k: np.asarray(v)
@@ -385,11 +450,20 @@ def run_usage_stage(ctx: AnalysisContext) -> Dict[str, Any]:
             trace_np,
             batch_tokens,
             tokenizer,
-            int(args.usage_top_contexts_per_op),
+            top_contexts_per_op,
         )
         part["batch_idx"] = int(part_idx)
         part["host_id"] = int(ctx.host_id)
+        part["analysis_params"] = {
+            **expected_params,
+            "requested_batch_size": requested_batch_size,
+        }
         write_json_atomic(part_path, part)
+        part_sec = time.time() - part_t0
+        done = part_idx + 1
+        elapsed = time.time() - stage_t0
+        eta = (elapsed / done) * max(0, max_parts - done) if done else None
+        tok_per_sec = part["tokens_observed"] / part_sec if part_sec > 0 else 0.0
         if ctx.is_primary:
             store.mark_job_complete(stage, job_id, part_path, {
                 "tokens": part["tokens_observed"],
@@ -403,24 +477,58 @@ def run_usage_stage(ctx: AnalysisContext) -> Dict[str, Any]:
             message=(
                 f"USAGE part {part_idx + 1:05d}/{max_parts:05d} "
                 f"tokens={part['tokens_observed']:,} "
+                f"part_sec={part_sec:.1f} tok/s={tok_per_sec:.0f} "
+                f"elapsed={format_duration(elapsed)} eta={format_duration(eta)} "
+                f"host={ctx.host_id}/{ctx.n_hosts} "
                 f"unique(qk/v/rst)="
                 f"{len(part['counts']['qk'])}/{len(part['counts']['v'])}/{len(part['counts']['rst'])}"
             ),
             tokens=part["tokens_observed"],
+            part_sec=part_sec,
+            tok_per_sec=tok_per_sec,
+            elapsed_sec=elapsed,
+            eta_sec=eta,
             qk_unique=len(part["counts"]["qk"]),
             v_unique=len(part["counts"]["v"]),
             rst_unique=len(part["counts"]["rst"]),
         )
 
+    sync_hosts("dawn-analysis-usage-parts-done")
+
     if not ctx.is_primary:
         return {}
 
-    all_part_paths = (
-        list_paths(store.path("usage", "usage_parts"), "part-host*-*.json")
-        if args.resume
-        else _current_run_part_paths(ctx, max_parts)
+    reduce_t0 = time.time()
+    all_part_paths = []
+    for path in _current_run_part_paths(ctx, max_parts):
+        identity = _part_identity(path)
+        if identity is None:
+            continue
+        host_id, part_idx = identity
+        if _usage_part_matches(
+            path,
+            expected_params=expected_params,
+            host_id=host_id,
+            part_idx=part_idx,
+        ):
+            all_part_paths.append(path)
+    expected_parts = int(ctx.n_hosts) * int(max_parts)
+    if len(all_part_paths) != expected_parts:
+        raise RuntimeError(
+            f"USAGE reduce expected {expected_parts} current-run parts "
+            f"but found {len(all_part_paths)} matching parts."
+        )
+    store.log_event(
+        stage,
+        "reduce_start",
+        message=f"USAGE REDUCE START parts={len(all_part_paths)}",
+        parts=len(all_part_paths),
     )
     arrays, summary, contexts = _reduce_parts(ctx, all_part_paths)
+    summary["analysis_params"] = {
+        **expected_params,
+        "requested_batch_size": requested_batch_size,
+    }
     write_npz_atomic(npz_path, **arrays)
     write_json_atomic(summary_path, summary)
     _write_top_context_files(ctx, contexts, summary)
@@ -434,6 +542,7 @@ def run_usage_stage(ctx: AnalysisContext) -> Dict[str, Any]:
         message=(
             "USAGE SUMMARY "
             f"tokens={summary['tokens_observed']:,} "
+            f"reduce_sec={time.time() - reduce_t0:.1f} "
             + " ".join(
                 f"{p}_active={summary['pools'][p]['active_ops_observed']:,}"
                 for p in ATLAS_POOLS

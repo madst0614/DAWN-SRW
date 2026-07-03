@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import traceback
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -13,6 +14,7 @@ import numpy as np
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    format_duration,
     host_aligned_batch_size,
     load_eval_data,
 )
@@ -177,6 +179,9 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
         )
 
     records = []
+    total_jobs = len(pools) * len(k_list) * 3
+    completed_jobs = 0
+    jobs_t0 = time.time()
     for pool in pools:
         for strategy in ("top", "random", "low"):
             candidates = operator_lists[pool][strategy]
@@ -194,21 +199,31 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
                 if args.resume and should_skip_job(path, ["delta_loss"]):
                     rec = read_json(path)
                     records.append(rec)
+                    completed_jobs += 1
+                    elapsed = time.time() - jobs_t0
+                    eta = (elapsed / completed_jobs) * max(0, total_jobs - completed_jobs)
                     store.log_event(
                         stage,
                         "job_skip",
                         message=(
-                            f"ABLATION {pool}/{strategy}/k={k} SKIP "
-                            f"delta_loss={float(rec.get('delta_loss', 0.0)):.6f}"
+                            f"ABLATION job {completed_jobs:03d}/{total_jobs:03d} "
+                            f"{pool}/{strategy}/k={k} SKIP "
+                            f"delta_loss={float(rec.get('delta_loss', 0.0)):.6f} "
+                            f"elapsed={format_duration(elapsed)} eta={format_duration(eta)}"
                         ),
                         **rec,
                     )
                     continue
                 store.mark_job_started(stage, jid)
                 try:
+                    job_t0 = time.time()
                     masks = _make_mask(ctx, pool, op_ids)
                     forward = jax.jit(v4166.build_suppressed_forward(ctx.params, ctx.model_cfg, masks))
                     ablated = _eval_forward(forward, batches)
+                    job_sec = time.time() - job_t0
+                    completed_jobs += 1
+                    elapsed = time.time() - jobs_t0
+                    eta = (elapsed / completed_jobs) * max(0, total_jobs - completed_jobs)
                     rec = {
                         **payload,
                         "job_id": jid,
@@ -219,6 +234,7 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
                         "ablated_acc": ablated["accuracy"],
                         "delta_acc": ablated["accuracy"] - base["accuracy"],
                         "valid_tokens": ablated["valid_count"],
+                        "job_sec": job_sec,
                     }
                     if ctx.is_primary:
                         write_json_atomic(path, rec)
@@ -227,10 +243,14 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
                             stage,
                             "job",
                             message=(
-                                f"ABLATION {pool}/{strategy}/k={k} "
+                                f"ABLATION job {completed_jobs:03d}/{total_jobs:03d} "
+                                f"{pool}/{strategy}/k={k} "
                                 f"delta_loss={rec['delta_loss']:.6f} "
                                 f"delta_acc={rec['delta_acc']:.4f} "
-                                f"ablated_loss={rec['ablated_loss']:.6f}"
+                                f"ablated_loss={rec['ablated_loss']:.6f} "
+                                f"job_sec={job_sec:.1f} "
+                                f"elapsed={format_duration(elapsed)} "
+                                f"eta={format_duration(eta)}"
                             ),
                             **rec,
                         )

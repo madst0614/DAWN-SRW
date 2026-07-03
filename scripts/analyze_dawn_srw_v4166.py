@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--geometry-max-sample", type=int, default=2048)
 
     p.add_argument("--usage-max-sequences", type=int, default=512)
-    p.add_argument("--usage-batch-size", type=int, default=1)
+    p.add_argument("--usage-batch-size", type=int, default=64)
     p.add_argument("--usage-seq-len", type=int, default=128)
     p.add_argument("--usage-topk", type=int, default=8)
     p.add_argument("--usage-top-contexts-per-op", type=int, default=16)
@@ -107,8 +107,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trace-topk", type=int, default=None)
     p.add_argument("--trace-save-full-gates", action="store_true")
 
-    p.add_argument("--ablation-max-sequences", type=int, default=512)
-    p.add_argument("--ablation-batch-size", type=int, default=1)
+    p.add_argument("--ablation-max-sequences", type=int, default=64)
+    p.add_argument("--ablation-batch-size", type=int, default=64)
     p.add_argument("--ablation-seq-len", type=int, default=128)
     p.add_argument("--ablation-k-list", default="1,4,16,64")
     p.add_argument("--ablation-pools", default="qk,v,rst")
