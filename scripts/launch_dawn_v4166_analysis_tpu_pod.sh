@@ -145,16 +145,101 @@ echo "  Args:       ${ANALYSIS_ARGS:-<none>}"
 echo "============================================"
 
 echo "Checking TPU status..."
-gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+TPU_STATE="$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
     --zone="$ZONE" \
     --project="$PROJECT" \
-    --format="value(state)"
+    --format="value(state)")"
+echo "$TPU_STATE"
 
 ACCELERATOR_TYPE="$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
     --zone="$ZONE" \
     --project="$PROJECT" \
     --format="value(acceleratorType)" || true)"
+NETWORK_ENDPOINTS="$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+    --zone="$ZONE" \
+    --project="$PROJECT" \
+    --format="value(networkEndpoints[].ipAddress)" || true)"
+WORKER_COUNT="$(printf '%s\n' "$NETWORK_ENDPOINTS" | awk 'NF {count += NF} END {print count + 0}')"
+ACCELERATOR_WORKER_COUNT=0
+ACCELERATOR_SIZE="${ACCELERATOR_TYPE##*-}"
+if [[ "$ACCELERATOR_SIZE" =~ ^[0-9]+$ ]]; then
+    ACCELERATOR_WORKER_COUNT=$(( (ACCELERATOR_SIZE + 7) / 8 ))
+fi
+if [ "$ACCELERATOR_WORKER_COUNT" -gt "$WORKER_COUNT" ]; then
+    WORKER_COUNT="$ACCELERATOR_WORKER_COUNT"
+fi
+if [ "$WORKER_COUNT" -le 0 ]; then
+    echo "ERROR: Could not determine TPU worker count." >&2
+    exit 1
+fi
 echo "  Accelerator: ${ACCELERATOR_TYPE:-unknown}"
+echo "  Detected workers: $WORKER_COUNT"
+
+declare -a TARGET_WORKERS=()
+if [[ "$WORKERS" = "all" ]]; then
+    for worker in $(seq 0 $((WORKER_COUNT - 1))); do
+        TARGET_WORKERS+=("$worker")
+    done
+else
+    TARGET_WORKERS+=("$WORKERS")
+fi
+
+run_worker_command() {
+    local worker="$1"
+    local command="$2"
+    gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+        --zone="$ZONE" \
+        --project="$PROJECT" \
+        --worker="$worker" \
+        --command="$command"
+}
+
+echo "Preflighting SSH on target worker(s): ${TARGET_WORKERS[*]}"
+for worker in "${TARGET_WORKERS[@]}"; do
+    echo "  Worker $worker SSH preflight..."
+    if ! run_worker_command "$worker" 'hostname; date -Is'; then
+        echo "ERROR: worker $worker SSH failed. Aborting launch." >&2
+        exit 1
+    fi
+done
+
+read -r -d '' CLEANUP_CMD <<'EOFCLEANUP' || true
+set -e
+ANALYSIS_PATTERN="[a]nalyze_dawn_srw_v4166"
+TRAIN_JAX_PATTERN="[t]rain_jax"
+TRAIN_JAX_MINIMAL_PATTERN="[t]rain_jax_minimal"
+PGREP_PATTERN="${ANALYSIS_PATTERN}|${TRAIN_JAX_PATTERN}|${TRAIN_JAX_MINIMAL_PATTERN}"
+tmux kill-session -t train 2>/dev/null || true
+pkill -9 -f "${ANALYSIS_PATTERN}\\.py" || true
+pkill -9 -f "${TRAIN_JAX_PATTERN}\\.py" || true
+pkill -9 -f "${TRAIN_JAX_MINIMAL_PATTERN}\\.py" || true
+sudo lsof /dev/accel* 2>/dev/null | grep -v PID | awk '{print $2}' | sort -u | xargs -r sudo kill -9 || true
+sleep 3
+REMAINING="$(pgrep -af "$PGREP_PATTERN" || true)"
+if [ -n "$REMAINING" ]; then
+    echo "ERROR: DAWN process remains after cleanup:" >&2
+    echo "$REMAINING" >&2
+    exit 1
+fi
+EOFCLEANUP
+
+cleanup_target_workers() {
+    local failed=0
+    for worker in "${TARGET_WORKERS[@]}"; do
+        echo "  Cleaning worker $worker..."
+        if ! run_worker_command "$worker" "$CLEANUP_CMD"; then
+            echo "ERROR: worker $worker cleanup failed." >&2
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+echo "Cleaning old train/analysis processes on target worker(s)..."
+if ! cleanup_target_workers; then
+    echo "ERROR: cleanup verification failed. Aborting launch." >&2
+    exit 1
+fi
 
 read -r -d '' REMOTE_CMD <<EOFCMD || true
 set -euo pipefail
@@ -229,13 +314,33 @@ else
 fi
 EOFCMD
 
-echo "Sending analysis command to worker(s): $WORKERS"
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
-    --zone="$ZONE" \
-    --project="$PROJECT" \
-    --worker="$WORKERS" \
-    --command="$REMOTE_CMD" \
-    2>&1 | tee "launch_dawn_v4166_analysis_${TPU_NAME}_$(date +%Y%m%d_%H%M%S).log"
+echo "Sending analysis command to target worker(s): ${TARGET_WORKERS[*]}"
+LAUNCH_TS="$(date +%Y%m%d_%H%M%S)"
+declare -a LAUNCH_PIDS=()
+declare -a LAUNCH_LOGS=()
+for worker in "${TARGET_WORKERS[@]}"; do
+    log_file="launch_dawn_v4166_analysis_${TPU_NAME}_${LAUNCH_TS}_worker_${worker}.log"
+    LAUNCH_LOGS[$worker]="$log_file"
+    echo "  Worker $worker launch starting (log: $log_file)"
+    (
+        run_worker_command "$worker" "$REMOTE_CMD"
+    ) >"$log_file" 2>&1 &
+    LAUNCH_PIDS[$worker]=$!
+done
+
+declare -a FAILED_WORKERS=()
+for worker in "${TARGET_WORKERS[@]}"; do
+    if ! wait "${LAUNCH_PIDS[$worker]}"; then
+        FAILED_WORKERS+=("$worker")
+        echo "ERROR: worker $worker setup/start failed. See ${LAUNCH_LOGS[$worker]}" >&2
+    fi
+done
+
+if [ "${#FAILED_WORKERS[@]}" -gt 0 ]; then
+    echo "ERROR: launch failed on worker(s): ${FAILED_WORKERS[*]}. Cleaning up target workers." >&2
+    cleanup_target_workers || true
+    exit 1
+fi
 
 echo ""
 echo "Launch request sent."
