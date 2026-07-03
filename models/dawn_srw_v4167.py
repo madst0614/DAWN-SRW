@@ -325,6 +325,39 @@ def _read_write_operator_query(read_query, x, write_query_proj, eps=1e-6):
     return operator_query.astype(jnp.float32)
 
 
+def _router_dense_tp_or_local(x, kernel, bias, sharded_fns):
+    """Router dense with optional model-axis row parallelism."""
+    fn = None
+    if isinstance(sharded_fns, dict):
+        fn = sharded_fns.get('v4167_router_dense')
+    if fn is None:
+        out = x.astype(jnp.float32) @ kernel
+        if bias is not None:
+            out = out + bias
+        return out
+    if bias is None:
+        bias = jnp.zeros((kernel.shape[-1],), dtype=x.dtype)
+    return fn(x, kernel, bias)
+
+
+def _read_write_operator_query_tp(read_query, x, write_query_proj,
+                                  sharded_fns, eps=1e-6):
+    """RW-matched operator query with optional row-parallel write projection."""
+    read_query = read_query.astype(jnp.float32)
+    read_query = read_query / (
+        jnp.linalg.norm(read_query, axis=-1, keepdims=True) + eps)
+
+    write_query = _router_dense_tp_or_local(
+        x, write_query_proj, None, sharded_fns).astype(jnp.float32)
+    write_query = write_query / (
+        jnp.linalg.norm(write_query, axis=-1, keepdims=True) + eps)
+
+    operator_query = read_query * write_query
+    operator_query = operator_query / (
+        jnp.linalg.norm(operator_query, axis=-1, keepdims=True) + eps)
+    return operator_query.astype(jnp.float32)
+
+
 def _rw_operator_key(read, write, read_proj, write_proj, *, eps=1e-6):
     """Compressed live-gradient RW operator identity for v4166 selection.
 
@@ -2715,6 +2748,94 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
     return fused_gate_srw_paired_minimal
 
 
+def make_v4167_router_dense(mesh):
+    """Create row-parallel router projection over the input hidden dimension."""
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),  # x [B, S, D], model-replicated
+                       P('model', None),       # kernel [D_local, O]
+                       P()),                   # bias [O], replicated
+             out_specs=P('data', None, None),
+             check_rep=False)
+    def router_dense(x, kernel, bias):
+        axis_idx = jax.lax.axis_index('model')
+        d_local = kernel.shape[0]
+        x_local = jax.lax.dynamic_slice_in_dim(
+            x.astype(jnp.float32), axis_idx * d_local, d_local, axis=-1)
+        partial_out = x_local @ kernel
+        out = jax.lax.psum(partial_out, 'model')
+        return out + bias
+
+    return router_dense
+
+
+def make_v4167_tp_attention_o(mesh, n_heads, d_model):
+    """Create local-head causal attention plus row-parallel expand_O."""
+    mesh_model = int(mesh.shape['model'])
+    if int(n_heads) % mesh_model != 0:
+        raise ValueError(
+            f"n_heads={n_heads} must be divisible by "
+            f"mesh_model={mesh_model} for v4167 TP attention.")
+    if int(d_model) % mesh_model != 0:
+        raise ValueError(
+            f"d_model={d_model} must be divisible by "
+            f"mesh_model={mesh_model} for v4167 TP attention/O.")
+    if int(d_model) % int(n_heads) != 0:
+        raise ValueError(
+            f"d_model={d_model} must be divisible by n_heads={n_heads}.")
+
+    d_head = int(d_model) // int(n_heads)
+    heads_per_shard = int(n_heads) // mesh_model
+    d_local = heads_per_shard * d_head
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),  # Q [B, S, D]
+                       P('data', None, None),  # K [B, S, D]
+                       P('data', None, None),  # V [B, S, D]
+                       P('model', None)),      # expand_O [D_local, D]
+             out_specs=P('data', None, None),
+             check_rep=False)
+    def attention_o(Q, K, V, expand_O_kernel):
+        B, S, _ = Q.shape
+        axis_idx = jax.lax.axis_index('model')
+        head_start = axis_idx * heads_per_shard
+
+        Qh = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        Kh = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        Vh = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        Ql = jax.lax.dynamic_slice_in_dim(
+            Qh, head_start, heads_per_shard, axis=1)
+        Kl = jax.lax.dynamic_slice_in_dim(
+            Kh, head_start, heads_per_shard, axis=1)
+        Vl = jax.lax.dynamic_slice_in_dim(
+            Vh, head_start, heads_per_shard, axis=1)
+
+        scale = jnp.sqrt(jnp.float32(d_head))
+        scores = jnp.einsum('bhsd,bhtd->bhst', Ql, Kl) / scale
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        scores = jnp.where(
+            causal, scores, jnp.finfo(scores.dtype).min)
+        attn_w = jax.nn.softmax(scores, axis=-1)
+        out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vl)
+        out = out.transpose(0, 2, 1, 3).reshape(B, S, d_local)
+        partial_out = out @ expand_O_kernel
+        return jax.lax.psum(partial_out, 'model')
+
+    return attention_o
+
+
+def create_v4167_tp_sharded_fns(mesh, cfg):
+    """Build v4167 tensor-parallel helpers layered onto SRW sharded kernels."""
+    model_cfg = cfg.get('model', cfg)
+    return {
+        'v4167_router_dense': make_v4167_router_dense(mesh),
+        'v4167_tp_attention_o': make_v4167_tp_attention_o(
+            mesh,
+            n_heads=int(model_cfg.get('n_heads', 6)),
+            d_model=int(model_cfg.get('d_model', 384))),
+    }
+
+
 # ================================================================
 # 4. NeuronPool -- read/write directions + RW-derived operator keys
 # ================================================================
@@ -2932,19 +3053,21 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     v_write = pool_params['attn_v_write']
 
     rng, rng_drop = jax.random.split(rng)
-    attn_read_query = (
-        x @ router_params['proj_attn']['kernel']
-        + router_params['proj_attn']['bias'])
+    attn_read_query = _router_dense_tp_or_local(
+        x,
+        router_params['proj_attn']['kernel'],
+        router_params['proj_attn']['bias'],
+        sharded_fns)
     attn_read_query = safe_dropout(
         attn_read_query, router_dropout, deterministic, rng_drop)
     q_read_query, k_read_query, v_read_query = jnp.split(
         attn_read_query, 3, axis=-1)
-    h_Q = _read_write_operator_query(
-        q_read_query, x, router_params['q_op_write_query_proj'])
-    h_K = _read_write_operator_query(
-        k_read_query, x, router_params['k_op_write_query_proj'])
-    h_V = _read_write_operator_query(
-        v_read_query, x, router_params['v_op_write_query_proj'])
+    h_Q = _read_write_operator_query_tp(
+        q_read_query, x, router_params['q_op_write_query_proj'], sharded_fns)
+    h_K = _read_write_operator_query_tp(
+        k_read_query, x, router_params['k_op_write_query_proj'], sharded_fns)
+    h_V = _read_write_operator_query_tp(
+        v_read_query, x, router_params['v_op_write_query_proj'], sharded_fns)
 
     raw_tau_all = _fixed_raw_attn_tau(
         x, tau_init_attn_qk, tau_init_attn_v)
@@ -2976,27 +3099,34 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         soft_gate_boundary_power_final, execution_prune_eps)
     V = V * v_scale
 
-    d_head = d_model // n_heads
-    Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-    K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-    V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    tp_attention_o = (
+        sharded_fns.get('v4167_tp_attention_o')
+        if isinstance(sharded_fns, dict) else None)
+    if tp_attention_o is not None and (dropout_rate == 0.0 or deterministic):
+        out = tp_attention_o(Q, K, V, expand_O_kernel)
+    else:
+        d_head = d_model // n_heads
+        Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
 
-    scale = jnp.sqrt(jnp.float32(d_head))
-    rng, rng_attn_drop = jax.random.split(rng)
+        scale = jnp.sqrt(jnp.float32(d_head))
+        rng, rng_attn_drop = jax.random.split(rng)
 
-    @jax.checkpoint
-    def _attn_scores(Q, K, V, rng_drop):
-        attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
-        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-        attn_scores = jnp.where(
-            causal, attn_scores, jnp.finfo(attn_scores.dtype).min)
-        attn_w = jax.nn.softmax(attn_scores, axis=-1)
-        attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
-        return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+        @jax.checkpoint
+        def _attn_scores(Q, K, V, rng_drop):
+            attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            attn_scores = jnp.where(
+                causal, attn_scores, jnp.finfo(attn_scores.dtype).min)
+            attn_w = jax.nn.softmax(attn_scores, axis=-1)
+            attn_w = safe_dropout(
+                attn_w, dropout_rate, deterministic, rng_drop)
+            return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
 
-    out = _attn_scores(Q, K, V, rng_attn_drop)
-    out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
-    out = out @ expand_O_kernel
+        out = _attn_scores(Q, K, V, rng_attn_drop)
+        out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
+        out = out @ expand_O_kernel
     rng, rng_out = jax.random.split(rng)
     return safe_dropout(out, dropout_rate, deterministic, rng_out)
 
@@ -3026,13 +3156,16 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
     rst_write = pool_params['rst_write']
 
     rng, rng_drop = jax.random.split(rng)
-    rst_read_query = (
-        x @ router_params['proj_rst']['kernel']
-        + router_params['proj_rst']['bias'])
+    rst_read_query = _router_dense_tp_or_local(
+        x,
+        router_params['proj_rst']['kernel'],
+        router_params['proj_rst']['bias'],
+        sharded_fns)
     rst_read_query = safe_dropout(
         rst_read_query, router_dropout, deterministic, rng_drop)
-    h = _read_write_operator_query(
-        rst_read_query, x, router_params['rst_op_write_query_proj'])
+    h = _read_write_operator_query_tp(
+        rst_read_query, x, router_params['rst_op_write_query_proj'],
+        sharded_fns)
     raw_tau = _fixed_raw_rst_tau(x, tau_init_rst)
     _, _, rst_scale = _pool_output_scales(d_model, n_layers)
     if isinstance(sharded_fns, dict):
@@ -3104,20 +3237,22 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     rng, rng_drop = jax.random.split(rng)
     # read-query side: state-conditioned condition/read demand.
-    attn_read_query = (
-        x @ router_params['proj_attn']['kernel']
-        + router_params['proj_attn']['bias'])
+    attn_read_query = _router_dense_tp_or_local(
+        x,
+        router_params['proj_attn']['kernel'],
+        router_params['proj_attn']['bias'],
+        sharded_fns)
     attn_read_query = safe_dropout(
         attn_read_query, router_dropout, deterministic, rng_drop)
     q_read_query, k_read_query, v_read_query = jnp.split(
         attn_read_query, 3, axis=-1)
     # operator query: RW-matched read-query x write-query signature.
-    h_Q = _read_write_operator_query(
-        q_read_query, x, router_params['q_op_write_query_proj'])
-    h_K = _read_write_operator_query(
-        k_read_query, x, router_params['k_op_write_query_proj'])
-    h_V = _read_write_operator_query(
-        v_read_query, x, router_params['v_op_write_query_proj'])
+    h_Q = _read_write_operator_query_tp(
+        q_read_query, x, router_params['q_op_write_query_proj'], sharded_fns)
+    h_K = _read_write_operator_query_tp(
+        k_read_query, x, router_params['k_op_write_query_proj'], sharded_fns)
+    h_V = _read_write_operator_query_tp(
+        v_read_query, x, router_params['v_op_write_query_proj'], sharded_fns)
 
     raw_tau_all = _fixed_raw_attn_tau(
         x, tau_init_attn_qk, tau_init_attn_v)
@@ -3202,104 +3337,114 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     v_sparsity_diag = v_ret[v_sparsity_start]
     V = V * v_scale
 
-    d_head = d_model // n_heads
-    Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-    K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-    V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-
-    scale = jnp.sqrt(jnp.float32(d_head))
-    rng, rng_attn_drop = jax.random.split(rng)
-    @jax.checkpoint
-    def _attn_scores(Q, K, V, rng_drop):
-        attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
-        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-        attn_scores = jnp.where(causal, attn_scores,
-                                jnp.finfo(attn_scores.dtype).min)
-        attn_w = jax.nn.softmax(attn_scores, axis=-1)
-        if analysis:
-            scores_sg = jax.lax.stop_gradient(attn_scores.astype(jnp.float32))
-            score_floor = jnp.finfo(scores_sg.dtype).min
-            causal_4d = causal[None, None, :, :]
-            causal_f = causal_4d.astype(jnp.float32)
-            valid_count = causal_f.sum() * jnp.float32(B * n_heads)
-            valid_scores = jnp.where(causal_4d, scores_sg, 0.0)
-            attn_logit_mean = valid_scores.sum() / valid_count
-            attn_logit_var = (
-                jnp.where(causal_4d, scores_sg - attn_logit_mean, 0.0) ** 2
-            ).sum() / valid_count
-            attn_logit_std = jnp.sqrt(attn_logit_var + 1e-12)
-
-            masked_scores = jnp.where(causal_4d, scores_sg, score_floor)
-            attn_logit_max_dbg = jnp.max(masked_scores)
-
-            attn_w_sg = jax.lax.stop_gradient(attn_w.astype(jnp.float32))
-            softmax_top1 = jnp.max(attn_w_sg, axis=-1)
-            softmax_top1_mean = softmax_top1.mean()
-            softmax_top1_max = softmax_top1.max()
-
-            top1_logits = jnp.max(masked_scores, axis=-1)
-            top1_idx = jnp.argmax(masked_scores, axis=-1)
-            attn_idx = jnp.arange(S)
-            second_scores = jnp.where(
-                attn_idx[None, None, None, :] == top1_idx[..., None],
-                score_floor,
-                masked_scores)
-            top2_logits = jnp.max(second_scores, axis=-1)
-            has_top2 = (jnp.arange(S) + 1) > 1
-            top2_logits = jnp.where(
-                has_top2[None, None, :], top2_logits, top1_logits)
-            logit_gap = top1_logits - top2_logits
-            logit_gap_mean = logit_gap.mean()
-            logit_gap_max = logit_gap.max()
-
-            entropy_terms = jnp.where(
-                attn_w_sg > 0.0,
-                attn_w_sg * jnp.log(jnp.maximum(attn_w_sg, 1e-30)),
-                0.0)
-            softmax_entropy = -jnp.sum(entropy_terms, axis=-1)
-            softmax_entropy_mean = softmax_entropy.mean()
-            softmax_entropy_min = softmax_entropy.min()
-        attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
-        out_dbg = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
-        if analysis:
-            return (
-                out_dbg,
-                attn_logit_mean, attn_logit_std,
-                attn_logit_max_dbg,
-                softmax_top1_mean, softmax_top1_max,
-                logit_gap_mean, logit_gap_max,
-                softmax_entropy_mean, softmax_entropy_min,
-            )
-        return out_dbg
-
-    if analysis:
-        q_norms_dbg = jnp.linalg.norm(Q, axis=-1)
-        k_norms_dbg = jnp.linalg.norm(K, axis=-1)
-        v_norms_dbg = jnp.linalg.norm(V, axis=-1)
-    if analysis:
-        q_norm = q_norms_dbg.mean()
-        q_norm_std = q_norms_dbg.std()
-        q_norm_max = q_norms_dbg.max()
-        k_norm = k_norms_dbg.mean()
-        k_norm_std = k_norms_dbg.std()
-        k_norm_max = k_norms_dbg.max()
-        v_norm_dbg = v_norms_dbg.mean()
-
-    if analysis:
-        (out,
-         attn_logit_mean, attn_logit_std, attn_logit_max_actual,
-         softmax_top1_mean, attn_softmax_top1_max,
-         logit_gap_mean, logit_gap_max,
-         softmax_entropy_mean, softmax_entropy_min) = _attn_scores(
-            Q, K, V, rng_attn_drop)
+    tp_attention_o = (
+        sharded_fns.get('v4167_tp_attention_o')
+        if isinstance(sharded_fns, dict) else None)
+    if (tp_attention_o is not None and not analysis
+            and (dropout_rate == 0.0 or deterministic)):
+        out = tp_attention_o(Q, K, V, expand_O_kernel)
     else:
-        out = _attn_scores(Q, K, V, rng_attn_drop)
-    if analysis:
-        o_input_norm = jnp.linalg.norm(out, axis=-1).mean()
-        v_norm_max = v_norms_dbg.max()
-        o_input_norm_max = jnp.linalg.norm(out, axis=-1).max()
-    out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
-    out = out @ expand_O_kernel
+        d_head = d_model // n_heads
+        Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+
+        scale = jnp.sqrt(jnp.float32(d_head))
+        rng, rng_attn_drop = jax.random.split(rng)
+        @jax.checkpoint
+        def _attn_scores(Q, K, V, rng_drop):
+            attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            attn_scores = jnp.where(causal, attn_scores,
+                                    jnp.finfo(attn_scores.dtype).min)
+            attn_w = jax.nn.softmax(attn_scores, axis=-1)
+            if analysis:
+                scores_sg = jax.lax.stop_gradient(
+                    attn_scores.astype(jnp.float32))
+                score_floor = jnp.finfo(scores_sg.dtype).min
+                causal_4d = causal[None, None, :, :]
+                causal_f = causal_4d.astype(jnp.float32)
+                valid_count = causal_f.sum() * jnp.float32(B * n_heads)
+                valid_scores = jnp.where(causal_4d, scores_sg, 0.0)
+                attn_logit_mean = valid_scores.sum() / valid_count
+                attn_logit_var = (
+                    jnp.where(
+                        causal_4d, scores_sg - attn_logit_mean, 0.0) ** 2
+                ).sum() / valid_count
+                attn_logit_std = jnp.sqrt(attn_logit_var + 1e-12)
+
+                masked_scores = jnp.where(causal_4d, scores_sg, score_floor)
+                attn_logit_max_dbg = jnp.max(masked_scores)
+
+                attn_w_sg = jax.lax.stop_gradient(attn_w.astype(jnp.float32))
+                softmax_top1 = jnp.max(attn_w_sg, axis=-1)
+                softmax_top1_mean = softmax_top1.mean()
+                softmax_top1_max = softmax_top1.max()
+
+                top1_logits = jnp.max(masked_scores, axis=-1)
+                top1_idx = jnp.argmax(masked_scores, axis=-1)
+                attn_idx = jnp.arange(S)
+                second_scores = jnp.where(
+                    attn_idx[None, None, None, :] == top1_idx[..., None],
+                    score_floor,
+                    masked_scores)
+                top2_logits = jnp.max(second_scores, axis=-1)
+                has_top2 = (jnp.arange(S) + 1) > 1
+                top2_logits = jnp.where(
+                    has_top2[None, None, :], top2_logits, top1_logits)
+                logit_gap = top1_logits - top2_logits
+                logit_gap_mean = logit_gap.mean()
+                logit_gap_max = logit_gap.max()
+
+                entropy_terms = jnp.where(
+                    attn_w_sg > 0.0,
+                    attn_w_sg * jnp.log(jnp.maximum(attn_w_sg, 1e-30)),
+                    0.0)
+                softmax_entropy = -jnp.sum(entropy_terms, axis=-1)
+                softmax_entropy_mean = softmax_entropy.mean()
+                softmax_entropy_min = softmax_entropy.min()
+            attn_w = safe_dropout(
+                attn_w, dropout_rate, deterministic, rng_drop)
+            out_dbg = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+            if analysis:
+                return (
+                    out_dbg,
+                    attn_logit_mean, attn_logit_std,
+                    attn_logit_max_dbg,
+                    softmax_top1_mean, softmax_top1_max,
+                    logit_gap_mean, logit_gap_max,
+                    softmax_entropy_mean, softmax_entropy_min,
+                )
+            return out_dbg
+
+        if analysis:
+            q_norms_dbg = jnp.linalg.norm(Q, axis=-1)
+            k_norms_dbg = jnp.linalg.norm(K, axis=-1)
+            v_norms_dbg = jnp.linalg.norm(V, axis=-1)
+        if analysis:
+            q_norm = q_norms_dbg.mean()
+            q_norm_std = q_norms_dbg.std()
+            q_norm_max = q_norms_dbg.max()
+            k_norm = k_norms_dbg.mean()
+            k_norm_std = k_norms_dbg.std()
+            k_norm_max = k_norms_dbg.max()
+            v_norm_dbg = v_norms_dbg.mean()
+
+        if analysis:
+            (out,
+             attn_logit_mean, attn_logit_std, attn_logit_max_actual,
+             softmax_top1_mean, attn_softmax_top1_max,
+             logit_gap_mean, logit_gap_max,
+             softmax_entropy_mean, softmax_entropy_min) = _attn_scores(
+                Q, K, V, rng_attn_drop)
+        else:
+            out = _attn_scores(Q, K, V, rng_attn_drop)
+        if analysis:
+            o_input_norm = jnp.linalg.norm(out, axis=-1).mean()
+            v_norm_max = v_norms_dbg.max()
+            o_input_norm_max = jnp.linalg.norm(out, axis=-1).max()
+        out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
+        out = out @ expand_O_kernel
     attn_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     if analysis:
         o_out_norm_max = jnp.linalg.norm(out, axis=-1).max()
@@ -3496,13 +3641,16 @@ def _rst_forward(x, pool_params, router_params, rng,
     rst_write = pool_params['rst_write']
 
     rng, rng_drop = jax.random.split(rng)
-    rst_read_query = (
-        x @ router_params['proj_rst']['kernel']
-        + router_params['proj_rst']['bias'])
+    rst_read_query = _router_dense_tp_or_local(
+        x,
+        router_params['proj_rst']['kernel'],
+        router_params['proj_rst']['bias'],
+        sharded_fns)
     rst_read_query = safe_dropout(
         rst_read_query, router_dropout, deterministic, rng_drop)
-    h = _read_write_operator_query(
-        rst_read_query, x, router_params['rst_op_write_query_proj'])
+    h = _read_write_operator_query_tp(
+        rst_read_query, x, router_params['rst_op_write_query_proj'],
+        sharded_fns)
 
     # RW-derived operator keys are passed into the sharded SRW closure.
     # The closure forward-normalizes them for selection stability.

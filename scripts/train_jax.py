@@ -79,6 +79,10 @@ from models.dawn_srw_v4167 import (
     _tau_init_calibration_scores as _v4167_tau_init_calibration_scores,
 )
 from models.baseline_transformer_jax import VanillaTransformer
+from models.baseline_transformer_tp_jax import (
+    TensorParallelVanillaTransformer,
+    create_baseline_tp_sharded_fns,
+)
 
 
 def _jax_distributed_is_initialized():
@@ -256,6 +260,7 @@ V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
 V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
 V4167_MODEL_VERSION = 'spatial-r1-v4.1.6.7'
 BASELINE_MODEL_VERSION = 'baseline'
+BASELINE_TP_MODEL_VERSION = 'baseline-tp'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (
     V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION)
@@ -267,6 +272,13 @@ MODEL_REGISTRY = {
     BASELINE_MODEL_VERSION: {
         'class': VanillaTransformer,
         'module': 'models.baseline_transformer_jax',
+        'raw_tau_init_from_cosine_tau': None,
+        'tau_init_calibration_scores': None,
+        'is_baseline': True,
+    },
+    BASELINE_TP_MODEL_VERSION: {
+        'class': TensorParallelVanillaTransformer,
+        'module': 'models.baseline_transformer_tp_jax',
         'raw_tau_init_from_cosine_tau': None,
         'tau_init_calibration_scores': None,
         'is_baseline': True,
@@ -347,7 +359,8 @@ def _is_active_srw_version(version):
 
 
 def _is_baseline_version(version):
-    return str(version) in (BASELINE_MODEL_VERSION, 'baseline-JAX')
+    return str(version) in (
+        BASELINE_MODEL_VERSION, BASELINE_TP_MODEL_VERSION, 'baseline-JAX')
 
 
 def _is_rw_key_srw_version(version):
@@ -1215,6 +1228,8 @@ def build_model_from_config(cfg):
     """Build an active DAWN-SRW model from config."""
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     if _is_baseline_version(version):
+        if str(version) == BASELINE_TP_MODEL_VERSION:
+            return TensorParallelVanillaTransformer(**_baseline_kwargs(cfg))
         return VanillaTransformer(**_baseline_kwargs(cfg))
     entry = _model_registry_entry(version)
     kwargs = _dawn_srw_kwargs(cfg)
@@ -6413,24 +6428,65 @@ def create_mesh(mesh_data, mesh_model):
     return Mesh(device_array, ('data', 'model'))
 
 
-def get_param_shardings(params, mesh):
-    """Create sharding specs for v4164 parameters.
-
-    Neuron-pool first dimensions are sharded on the model axis; all other
-    parameters are replicated.
-    """
+def get_param_shardings(params, mesh, model_version=None):
+    """Create model-version-aware parameter shardings."""
     replicated = NamedSharding(mesh, P())
+    vector_sharded = NamedSharding(mesh, P('model'))
+    col_sharded = NamedSharding(mesh, P(None, 'model'))
+    row_sharded = NamedSharding(mesh, P('model', None))
     n_sharded = NamedSharding(mesh, P('model', None))
     n_sharded_3d = NamedSharding(mesh, P('model', None, None))
     stage_n_sharded_3d = NamedSharding(mesh, P(None, 'model', None))
+    router_input_sharded_3d = NamedSharding(mesh, P(None, 'model', None))
+    version = str(model_version) if model_version is not None else None
     pool_root = params.get('neuron_pool', {}) if hasattr(params, 'get') else {}
     is_stage_partitioned_pool = (
         'attn_qk_read_shared' in pool_root
         or 'attn_qk_read_global' in pool_root)
 
     def _get_sharding(path, value):
-        path_str = '/'.join(str(p) for p in path)
+        key_path = tuple(
+            p.key if hasattr(p, 'key') else str(p) for p in path)
+        path_str = '/'.join(str(p) for p in key_path)
         leaf = str(path[-1].key if hasattr(path[-1], 'key') else path[-1])
+        if version == BASELINE_TP_MODEL_VERSION:
+            if (len(key_path) >= 4
+                    and str(key_path[0]).startswith('layer_')):
+                module = key_path[1]
+                submodule = key_path[2]
+                name = key_path[3]
+                if module == 'attn':
+                    if submodule in ('q_proj', 'k_proj', 'v_proj'):
+                        if name == 'kernel':
+                            return col_sharded
+                        if name == 'bias':
+                            return vector_sharded
+                    if submodule == 'o_proj' and name == 'kernel':
+                        return row_sharded
+                if module == 'ffn':
+                    if submodule == 'Dense_0':
+                        if name == 'kernel':
+                            return col_sharded
+                        if name == 'bias':
+                            return vector_sharded
+                    if submodule == 'Dense_1':
+                        if name == 'kernel':
+                            return row_sharded
+                        if name == 'bias':
+                            return replicated
+            return replicated
+        if version == V4167_MODEL_VERSION:
+            if (path_str.startswith('router/proj_attn/kernel')
+                    or path_str.startswith('router/proj_rst/kernel')
+                    or path_str.startswith('router/q_op_write_query_proj')
+                    or path_str.startswith('router/k_op_write_query_proj')
+                    or path_str.startswith('router/v_op_write_query_proj')
+                    or path_str.startswith('router/rst_op_write_query_proj')):
+                return router_input_sharded_3d
+            if (len(key_path) >= 4
+                    and str(key_path[0]).startswith('block_')
+                    and key_path[1:] == ('attn', 'expand_O', 'kernel')):
+                return row_sharded
         # NeuronPool params: shard N axis (first dim) on 'model'
         if 'neuron_pool' in path_str:
             if (is_stage_partitioned_pool
@@ -6449,16 +6505,45 @@ def get_param_shardings(params, mesh):
                 return replicated
         return replicated
 
-    flat_params = jax.tree.leaves_with_path(params)
-    shardings = {}
-    for path, leaf in flat_params:
-        key_path = tuple(
-            p.key if hasattr(p, 'key') else str(p) for p in path)
-        shardings[key_path] = _get_sharding(path, leaf)
-
     # Build matching pytree of shardings
     return jax.tree.map_with_path(
         lambda path, x: _get_sharding(path, x), params)
+
+
+def _print_param_sharding_summary(param_shardings, model_version):
+    version = str(model_version)
+
+    def _path_str(path):
+        return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
+
+    interesting = []
+    for path, sharding in jax.tree.leaves_with_path(param_shardings):
+        ps = _path_str(path)
+        if version == BASELINE_TP_MODEL_VERSION:
+            if (ps.startswith('layer_0/attn/')
+                    and ps.endswith('/kernel')):
+                interesting.append((ps, sharding))
+            elif (ps.startswith('layer_0/ffn/')
+                  and ps.endswith('/kernel')):
+                interesting.append((ps, sharding))
+        elif version == V4167_MODEL_VERSION:
+            if ps in (
+                    'router/proj_attn/kernel',
+                    'router/proj_rst/kernel',
+                    'router/q_op_write_query_proj',
+                    'router/k_op_write_query_proj',
+                    'router/v_op_write_query_proj',
+                    'router/rst_op_write_query_proj',
+                    'block_0/attn/expand_O/kernel'):
+                interesting.append((ps, sharding))
+            elif ps.startswith('neuron_pool/') and len(interesting) < 16:
+                interesting.append((ps, sharding))
+    if not interesting:
+        return
+    print("\n=== Parameter sharding summary ===", flush=True)
+    for ps, sharding in interesting:
+        spec = getattr(sharding, 'spec', '<unknown>')
+        print(f"  {ps}: {spec}", flush=True)
 
 
 def shard_params_to_mesh(params, param_shardings):
@@ -12296,7 +12381,7 @@ def main():
 
     mesh = create_mesh(mesh_data, mesh_model)
     data_sharding = NamedSharding(mesh, P('data', None))
-    per_device_batch = batch_size // total_devices
+    per_device_batch = batch_size // mesh_data
 
     # Auto n_chunks: target ~2GB per chunk (bf16)
     def auto_n_chunks(N, target_gb=2.0):
@@ -12379,11 +12464,33 @@ def main():
                   f"qk={n_chunks_qk}, attn_v={n_chunks_v}")
             chunk_mem = per_device_batch * max_seq_len * rst_max_chunk * 2 / 1e9
             print(f"  Est chunk mem (rst): {chunk_mem:.2f}GB bf16")
+        elif str(model_version_cfg) == BASELINE_TP_MODEL_VERSION:
+            print("  Baseline-TP params: model-axis tensor parallel shards.")
         elif is_baseline:
             print("  Baseline params: replicated; SRW shard_map disabled.")
 
-    # Shard params: neuron_pool N-axis on 'model', rest replicated
-    param_shardings = get_param_shardings(params, mesh)
+    if str(model_version_cfg) == BASELINE_TP_MODEL_VERSION:
+        for _name, _value in (
+                ('model.n_heads', cfg['model']['n_heads']),
+                ('model.d_model', cfg['model']['d_model']),
+                ('model.d_ff', cfg['model']['d_ff'])):
+            if int(_value) % int(mesh_model) != 0:
+                raise ValueError(
+                    f"{_name}={_value} must be divisible by "
+                    f"mesh_model={mesh_model} for baseline-tp.")
+    if str(model_version_cfg) == V4167_MODEL_VERSION:
+        for _name, _value in (
+                ('model.n_heads', cfg['model']['n_heads']),
+                ('model.d_model', cfg['model']['d_model'])):
+            if int(_value) % int(mesh_model) != 0:
+                raise ValueError(
+                    f"{_name}={_value} must be divisible by "
+                    f"mesh_model={mesh_model} for v4167 TP attention/O.")
+
+    # Shard params using the model-version-specific policy.
+    param_shardings = get_param_shardings(params, mesh, model_version_cfg)
+    if is_host0:
+        _print_param_sharding_summary(param_shardings, model_version_cfg)
     params = shard_params_to_mesh(params, param_shardings)
 
     opt_state = optimizer.init(params)
@@ -12526,7 +12633,14 @@ def main():
     _sharded_fns = None
     _sharded_fns_analysis = None
     _force_sharded = _is_active_srw_version(model_version_cfg)
-    if _is_active_srw_version(model_version_cfg) and (
+    if str(model_version_cfg) == BASELINE_TP_MODEL_VERSION:
+        _sharded_fns = create_baseline_tp_sharded_fns(mesh, cfg)
+        if is_host0:
+            print(
+                f"  baseline-tp shard_map enabled "
+                f"(mesh_model={mesh_model}; attention+ffn TP)",
+                flush=True)
+    elif _is_active_srw_version(model_version_cfg) and (
             mesh_model > 1 or _force_sharded):
         _srw_module_name = _model_registry_entry(model_version_cfg)['module']
         _v4164_module = __import__(_srw_module_name, fromlist=['make_sharded_srw'])
@@ -12603,6 +12717,17 @@ def main():
                     _sharded_paired_attn_qk_minimal)
         else:
             _sharded_fns = _sharded_single_rst
+        if str(model_version_cfg) == V4167_MODEL_VERSION:
+            _extra_factory = getattr(
+                _v4164_module, 'create_v4167_tp_sharded_fns', None)
+            if _extra_factory is None:
+                raise RuntimeError(
+                    "v4167 module is missing create_v4167_tp_sharded_fns.")
+            if not isinstance(_sharded_fns, dict):
+                raise RuntimeError(
+                    "v4167 TP extras require dict-style sharded_fns.")
+            _v4167_extra_fns = _extra_factory(mesh, cfg)
+            _sharded_fns.update(_v4167_extra_fns)
         # Analysis (observation only). Factory kwargs forward analysis=True
         # only when the v4164 factory advertises the kwarg.
         if _supports_analysis:
@@ -12626,11 +12751,18 @@ def main():
                 }
             else:
                 _sharded_fns_analysis = _sharded_single_rst_a
+            if (str(model_version_cfg) == V4167_MODEL_VERSION
+                    and isinstance(_sharded_fns_analysis, dict)):
+                _sharded_fns_analysis.update(_v4167_extra_fns)
         if is_host0:
+            _extra_msg = (
+                "; v4167 TP extras=router_dense,attention_o"
+                if str(model_version_cfg) == V4167_MODEL_VERSION else "")
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
-                  f"; analysis kernels={'on' if _supports_analysis else 'off'})")
+                  f"; analysis kernels={'on' if _supports_analysis else 'off'}"
+                  f"{_extra_msg})")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
