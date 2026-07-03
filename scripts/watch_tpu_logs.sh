@@ -7,14 +7,17 @@ TPU_NAME=""
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
 REMOTE_LOG="~/train.log"
-WORKERS="0"
+WORKERS="primary"
 TAIL_LINES=160
 FOLLOW=1
 FILTER_PATTERN=""
 MODE="tail"
+PRIMARY_DETECT_ATTEMPTS=6
+PRIMARY_DETECT_SLEEP=5
 
 SUMMARY_PATTERN='EVAL |PRUNE .*SUMMARY|PRUNE eps=.*(SKIP|SUMMARY)|USAGE (REDUCE|SUMMARY|HOST DONE)|TRACE (START|prompt|SUMMARY)|ABLATION (START|BASE|job|SUMMARY)|REPORT|Epoch .*complete|Training complete|Val loss|Pruned eval|Best val|Final step|ERROR|FAILED|Traceback|RuntimeError|AssertionError|RESOURCE_EXHAUSTED'
 ERROR_PATTERN='Traceback|RuntimeError|AssertionError|FAILED|ERROR|RESOURCE_EXHAUSTED|OutOfMemory|SIGABRT|Aborted|Terminating process|unhealthy|CONSUMER_INVALID|PERMISSION_DENIED'
+PRIMARY_DETECT_PATTERN='primary=True|host=0/[0-9]+|process_index=0|Host ID: 0|USAGE (REDUCE|SUMMARY)|PRUNE SUMMARY|TRACE SUMMARY|ABLATION SUMMARY|REPORT'
 
 usage() {
     printf '%s\n' \
@@ -27,9 +30,9 @@ usage() {
         "  --log PATH             Remote log path. Default: $REMOTE_LOG" \
         "" \
         "Workers:" \
-        "  --primary              Follow worker 0 only (default)" \
+        "  --primary              Auto-detect and follow the JAX primary host (default)" \
         "  --all                  Follow all detected workers, prefixing lines with [wNN]" \
-        "  --worker N             Follow one worker" \
+        "  --worker N             Follow one literal gcloud worker index" \
         "  --workers LIST|all     Follow comma-separated workers or all" \
         "" \
         "Output:" \
@@ -53,7 +56,7 @@ while [[ $# -gt 0 ]]; do
         --zone) ZONE="$2"; shift 2 ;;
         --project) PROJECT="$2"; shift 2 ;;
         --log) REMOTE_LOG="$2"; shift 2 ;;
-        --primary) WORKERS="0"; shift ;;
+        --primary) WORKERS="primary"; shift ;;
         --all) WORKERS="all"; shift ;;
         --worker) WORKERS="$2"; shift 2 ;;
         --workers) WORKERS="$2"; shift 2 ;;
@@ -104,14 +107,6 @@ detect_worker_count() {
 }
 
 worker_count="$(detect_worker_count)"
-declare -a TARGET_WORKERS=()
-if [[ "$WORKERS" == "all" || "$WORKERS" == "auto" ]]; then
-    for worker in $(seq 0 $((worker_count - 1))); do
-        TARGET_WORKERS+=("$worker")
-    done
-else
-    IFS=',' read -r -a TARGET_WORKERS <<< "$WORKERS"
-fi
 
 quote_remote() {
     printf '%q' "$1"
@@ -161,12 +156,55 @@ run_worker_command() {
         --command="$command"
 }
 
+detect_primary_worker() {
+    local attempt worker out cmd pattern_q
+    pattern_q="$(quote_remote "$PRIMARY_DETECT_PATTERN")"
+    cmd="tail -n 5000 $remote_log_q 2>/dev/null | grep -E $pattern_q | tail -n 1 || true"
+    for attempt in $(seq 1 "$PRIMARY_DETECT_ATTEMPTS"); do
+        for worker in $(seq 0 $((worker_count - 1))); do
+            out="$(run_worker_command "$worker" "$cmd" 2>/dev/null || true)"
+            if [[ -n "${out//[[:space:]]/}" ]]; then
+                echo "$worker"
+                return 0
+            fi
+        done
+        if [[ "$attempt" -lt "$PRIMARY_DETECT_ATTEMPTS" ]]; then
+            sleep "$PRIMARY_DETECT_SLEEP"
+        fi
+    done
+    return 1
+}
+
+declare -a TARGET_WORKERS=()
+PRIMARY_WORKER=""
+if [[ "$WORKERS" == "all" || "$WORKERS" == "auto" ]]; then
+    for worker in $(seq 0 $((worker_count - 1))); do
+        TARGET_WORKERS+=("$worker")
+    done
+elif [[ "$WORKERS" == "primary" ]]; then
+    echo "Detecting JAX primary host from remote logs..."
+    PRIMARY_WORKER="$(detect_primary_worker || true)"
+    if [[ -n "$PRIMARY_WORKER" ]]; then
+        TARGET_WORKERS+=("$PRIMARY_WORKER")
+    else
+        echo "WARNING: Could not detect primary host yet; falling back to all workers with prefixes." >&2
+        for worker in $(seq 0 $((worker_count - 1))); do
+            TARGET_WORKERS+=("$worker")
+        done
+    fi
+else
+    IFS=',' read -r -a TARGET_WORKERS <<< "$WORKERS"
+fi
+
 echo "TPU log watcher"
 echo "  TPU:     $TPU_NAME"
 echo "  Project: $PROJECT"
 echo "  Zone:    $ZONE"
 echo "  Log:     $REMOTE_LOG"
 echo "  Workers: ${TARGET_WORKERS[*]} (detected=$worker_count)"
+if [[ -n "$PRIMARY_WORKER" ]]; then
+    echo "  Primary: gcloud worker $PRIMARY_WORKER"
+fi
 if [[ -n "$FILTER_PATTERN" ]]; then
     echo "  Filter:  enabled"
 fi
