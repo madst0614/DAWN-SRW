@@ -2746,13 +2746,10 @@ def make_sharded_srw_block_sparse_minimal(
             op_key_local, read_local, write_local, _block_size)
 
         T = int(B) * int(S)
-        max_candidate_pairs = T * int(n_blocks)
-        candidate_capacity_i = jnp.asarray(
-            max_candidate_pairs, dtype=jnp.int32)
-        max_bucket_chunks = (
-            int(n_blocks)
-            + ((max_candidate_pairs + _bucket_chunk_size - 1)
-               // _bucket_chunk_size))
+        token_capacity_i = jnp.asarray(T, dtype=jnp.int32)
+        token_pos = jnp.arange(T, dtype=jnp.int32)
+        max_token_chunks = max(
+            1, (T + _bucket_chunk_size - 1) // _bucket_chunk_size)
 
         flat_x_bf = x.reshape(T, D).astype(jnp.bfloat16)
         h_unit_bf = _forward_unit_direction(
@@ -2761,64 +2758,7 @@ def make_sharded_srw_block_sparse_minimal(
         flat_h_bf = h_unit_bf.reshape(T, h_unit_bf.shape[-1])
         tau = _tau_from_param(raw_tau)
         flat_tau = tau.reshape(T, 1)
-
-        block_score_ub = (
-            flat_h_bf @ block_center.T
-        ).astype(jnp.float32) + block_radius[None, :]
-        block_execution_ub = _v4168_block_execution_upper_bound(
-            block_score_ub, flat_tau, soft_gate_temperature,
-            soft_gate_boundary_power)
-        candidate_mask = block_execution_ub >= _execution_pair_prune_eps
-        candidate_mask_flat = candidate_mask.T.reshape(max_candidate_pairs)
-        candidate_i = candidate_mask_flat.astype(jnp.int32)
-        candidate_pair_count = candidate_i.sum()
-        candidate_rank = jnp.cumsum(candidate_i) - 1
-
-        capacity_pos = jnp.arange(max_candidate_pairs, dtype=jnp.int32)
-        candidate_scatter_rank = jnp.where(
-            candidate_mask_flat, candidate_rank, candidate_capacity_i)
-        candidate_source_pos = jnp.zeros(
-            (max_candidate_pairs,), dtype=jnp.int32).at[
-                candidate_scatter_rank
-            ].set(capacity_pos, mode='drop')
-        candidate_block_id = (
-            candidate_source_pos // int(T)).astype(jnp.int32)
-        candidate_token_id = (
-            candidate_source_pos % int(T)).astype(jnp.int32)
-
-        def bucket_chunks_for_sorted_pairs(block_ids, valid_pair_count):
-            in_range = capacity_pos < valid_pair_count
-            prev_pos = jnp.maximum(capacity_pos - 1, 0)
-            prev_block_id = block_ids[prev_pos]
-            block_group_start = jnp.logical_and(
-                in_range,
-                jnp.logical_or(
-                    capacity_pos == 0, block_ids != prev_block_id))
-            group_start_pos = jnp.where(block_group_start, capacity_pos, 0)
-            group_start_pos = jax.lax.associative_scan(
-                jnp.maximum, group_start_pos, axis=0)
-            rank_in_group = capacity_pos - group_start_pos
-            bucket_chunk_start = jnp.logical_and(
-                in_range,
-                jnp.logical_or(
-                    block_group_start,
-                    (rank_in_group % _bucket_chunk_size) == 0))
-            bucket_chunk_ord = (
-                jnp.cumsum(bucket_chunk_start.astype(jnp.int32)) - 1)
-            safe_chunk_ord = jnp.where(
-                bucket_chunk_start, bucket_chunk_ord, max_bucket_chunks)
-            n_bucket_chunks = bucket_chunk_start.astype(jnp.int32).sum()
-            bucket_chunk_starts = jnp.zeros(
-                (max_bucket_chunks,), dtype=jnp.int32).at[
-                    safe_chunk_ord
-                ].max(
-                    jnp.where(bucket_chunk_start, capacity_pos, 0),
-                    mode='drop')
-            return bucket_chunk_starts, n_bucket_chunks
-
-        bucket_chunk_starts, n_bucket_chunks = (
-            bucket_chunks_for_sorted_pairs(
-                candidate_block_id, candidate_pair_count))
+        flat_tau_scalar = tau.reshape(T)
 
         def angular_compose_parts(rho, tau_b, valid_mask):
             _, admission, _drive, execution_weight, _ = _compute_admission_drive(
@@ -2831,121 +2771,147 @@ def make_sharded_srw_block_sparse_minimal(
             return admission, execution_weight
 
         @jax.checkpoint
-        def gate_pair_keep_step(keep_pair, chunk_i):
-            def process_chunk(keep_pair):
-                start = bucket_chunk_starts[chunk_i]
-                offsets = start + jnp.arange(
-                    _bucket_chunk_size, dtype=jnp.int32)
-                safe_offsets = jnp.minimum(
-                    offsets, jnp.maximum(candidate_pair_count - 1, 0))
-                block_id = candidate_block_id[start]
-                in_pair_range = offsets < candidate_pair_count
-                same_block = candidate_block_id[safe_offsets] == block_id
-                valid_pairs = jnp.logical_and(in_pair_range, same_block)
-                token_ids = jnp.where(
-                    valid_pairs, candidate_token_id[safe_offsets], 0)
+        def block_step(carry, block_i):
+            flat_raw_out, flat_den_cost = carry
+            op_key_b = op_key_blocks[block_i]
+            read_b = read_blocks[block_i]
+            write_b = write_blocks[block_i]
+            valid_ops = valid_blocks[block_i]
 
-                h_b = flat_h_bf[token_ids]
-                tau_b = flat_tau[token_ids]
-                op_key_b = op_key_blocks[block_id]
-                valid_ops = valid_blocks[block_id]
-                valid_mask = jnp.logical_and(
-                    valid_pairs[:, None], valid_ops[None, :])
+            block_score_ub = (
+                flat_h_bf @ block_center[block_i]
+            ).astype(jnp.float32) + block_radius[block_i]
+            block_execution_ub = _v4168_block_execution_upper_bound(
+                block_score_ub, flat_tau_scalar, soft_gate_temperature,
+                soft_gate_boundary_power)
+            candidate_mask = block_execution_ub >= _execution_pair_prune_eps
+            candidate_i = candidate_mask.astype(jnp.int32)
+            candidate_count = candidate_i.sum()
+            candidate_rank = jnp.cumsum(candidate_i) - 1
+            candidate_scatter_rank = jnp.where(
+                candidate_mask, candidate_rank, token_capacity_i)
+            candidate_tokens = jnp.zeros(
+                (T,), dtype=jnp.int32).at[
+                    candidate_scatter_rank
+                ].set(token_pos, mode='drop')
+            candidate_chunk_count = (
+                (candidate_count + _bucket_chunk_size - 1)
+                // _bucket_chunk_size)
 
-                rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
-                rho_compute = jnp.where(valid_ops[None, :], rho_raw, tau_b)
-                _admission, execution_weight = angular_compose_parts(
-                    rho_compute, tau_b, valid_mask)
-                pair_exec_max = execution_weight.max(axis=-1)
-                keep_pair_chunk = jnp.logical_and(
-                    valid_pairs,
-                    pair_exec_max >= _execution_pair_prune_eps)
-                keep_pair = keep_pair.at[offsets].set(
-                    keep_pair_chunk, mode='drop')
-                return keep_pair
+            @jax.checkpoint
+            def gate_candidate_chunk(keep_candidate, chunk_i):
+                def process_chunk(keep_candidate):
+                    start = chunk_i * _bucket_chunk_size
+                    offsets = start + jnp.arange(
+                        _bucket_chunk_size, dtype=jnp.int32)
+                    safe_offsets = jnp.minimum(
+                        offsets, jnp.maximum(candidate_count - 1, 0))
+                    valid_pairs = offsets < candidate_count
+                    token_ids = jnp.where(
+                        valid_pairs, candidate_tokens[safe_offsets], 0)
 
-            keep_pair = jax.lax.cond(
-                chunk_i < n_bucket_chunks,
-                process_chunk,
-                lambda k: k,
-                keep_pair)
-            return keep_pair, None
+                    h_b = flat_h_bf[token_ids]
+                    tau_b = flat_tau[token_ids]
+                    valid_mask = jnp.logical_and(
+                        valid_pairs[:, None], valid_ops[None, :])
 
-        keep_pair, _ = jax.lax.scan(
-            gate_pair_keep_step,
-            jnp.zeros((max_candidate_pairs,), dtype=jnp.bool_),
-            jnp.arange(max_bucket_chunks, dtype=jnp.int32))
+                    rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
+                    rho_compute = jnp.where(
+                        valid_ops[None, :], rho_raw, tau_b)
+                    _admission, execution_weight = angular_compose_parts(
+                        rho_compute, tau_b, valid_mask)
+                    pair_exec_max = execution_weight.max(axis=-1)
+                    keep_chunk = jnp.logical_and(
+                        valid_pairs,
+                        pair_exec_max >= _execution_pair_prune_eps)
+                    keep_candidate = keep_candidate.at[offsets].set(
+                        keep_chunk, mode='drop')
+                    return keep_candidate
 
-        keep_pair_i = keep_pair.astype(jnp.int32)
-        kept_pair_count = keep_pair_i.sum()
-        kept_pair_rank = jnp.cumsum(keep_pair_i) - 1
-        kept_scatter_rank = jnp.where(
-            keep_pair, kept_pair_rank, candidate_capacity_i)
-        kept_pair_pos = jnp.zeros(
-            (max_candidate_pairs,), dtype=jnp.int32).at[
-            kept_scatter_rank
-        ].set(capacity_pos, mode='drop')
-        kept_block_id = candidate_block_id[kept_pair_pos]
-        kept_token_id = candidate_token_id[kept_pair_pos]
-        kept_bucket_chunk_starts, kept_n_bucket_chunks = (
-            bucket_chunks_for_sorted_pairs(kept_block_id, kept_pair_count))
+                keep_candidate = jax.lax.cond(
+                    chunk_i < candidate_chunk_count,
+                    process_chunk,
+                    lambda k: k,
+                    keep_candidate)
+                return keep_candidate, None
 
-        @jax.checkpoint
-        def bucket_chunk_step(carry, chunk_i):
-            def process_chunk(carry):
-                flat_raw_out, flat_den_cost = carry
-                start = kept_bucket_chunk_starts[chunk_i]
-                offsets = start + jnp.arange(
-                    _bucket_chunk_size, dtype=jnp.int32)
-                safe_offsets = jnp.minimum(
-                    offsets, jnp.maximum(kept_pair_count - 1, 0))
-                block_id = kept_block_id[start]
-                in_pair_range = offsets < kept_pair_count
-                same_block = kept_block_id[safe_offsets] == block_id
-                valid_pairs = jnp.logical_and(in_pair_range, same_block)
-                token_ids = jnp.where(
-                    valid_pairs, kept_token_id[safe_offsets], 0)
+            keep_candidate, _ = jax.lax.scan(
+                gate_candidate_chunk,
+                jnp.zeros((T,), dtype=jnp.bool_),
+                jnp.arange(max_token_chunks, dtype=jnp.int32))
 
-                x_b = flat_x_bf[token_ids]
-                h_b = flat_h_bf[token_ids]
-                tau_b = flat_tau[token_ids]
-                op_key_b = op_key_blocks[block_id]
-                read_b = read_blocks[block_id]
-                write_b = write_blocks[block_id]
-                valid_ops = valid_blocks[block_id]
-                valid_mask = jnp.logical_and(
-                    valid_pairs[:, None], valid_ops[None, :])
+            kept_i = keep_candidate.astype(jnp.int32)
+            kept_count = kept_i.sum()
+            kept_rank = jnp.cumsum(kept_i) - 1
+            kept_scatter_rank = jnp.where(
+                keep_candidate, kept_rank, token_capacity_i)
+            kept_tokens = jnp.zeros(
+                (T,), dtype=jnp.int32).at[
+                    kept_scatter_rank
+                ].set(candidate_tokens, mode='drop')
+            kept_chunk_count = (
+                (kept_count + _bucket_chunk_size - 1)
+                // _bucket_chunk_size)
 
-                rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
-                rho_compute = jnp.where(valid_ops[None, :], rho_raw, tau_b)
-                admission, execution_weight = angular_compose_parts(
-                    rho_compute, tau_b, valid_mask)
-                pair_exec_max = execution_weight.max(axis=-1, keepdims=True)
-                pair_active = pair_exec_max >= _execution_pair_prune_eps
-                admission = jnp.where(pair_active, admission, 0.0)
-                execution_weight = jnp.where(
-                    pair_active, execution_weight, 0.0)
-                xr = (x_b @ read_b.T).astype(jnp.float32)
-                weighted = execution_weight * xr
-                out_b = (weighted.astype(jnp.bfloat16) @ write_b).astype(
-                    jnp.float32)
-                den_b = admission.sum(axis=-1, keepdims=True)
-                flat_raw_out = flat_raw_out.at[token_ids].add(out_b)
-                flat_den_cost = flat_den_cost.at[token_ids].add(den_b)
-                return flat_raw_out, flat_den_cost
+            @jax.checkpoint
+            def kept_chunk_step(carry, chunk_i):
+                def process_chunk(carry):
+                    flat_raw_out, flat_den_cost = carry
+                    start = chunk_i * _bucket_chunk_size
+                    offsets = start + jnp.arange(
+                        _bucket_chunk_size, dtype=jnp.int32)
+                    safe_offsets = jnp.minimum(
+                        offsets, jnp.maximum(kept_count - 1, 0))
+                    valid_pairs = offsets < kept_count
+                    fallback_token = kept_tokens[0]
+                    token_ids = jnp.where(
+                        valid_pairs, kept_tokens[safe_offsets],
+                        fallback_token)
 
-            carry = jax.lax.cond(
-                chunk_i < kept_n_bucket_chunks,
-                process_chunk,
-                lambda c: c,
-                carry)
-            return carry, None
+                    x_b = flat_x_bf[token_ids]
+                    h_b = flat_h_bf[token_ids]
+                    tau_b = flat_tau[token_ids]
+                    valid_mask = jnp.logical_and(
+                        valid_pairs[:, None], valid_ops[None, :])
+
+                    rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
+                    rho_compute = jnp.where(
+                        valid_ops[None, :], rho_raw, tau_b)
+                    admission, execution_weight = angular_compose_parts(
+                        rho_compute, tau_b, valid_mask)
+                    pair_exec_max = execution_weight.max(
+                        axis=-1, keepdims=True)
+                    pair_active = pair_exec_max >= _execution_pair_prune_eps
+                    admission = jnp.where(pair_active, admission, 0.0)
+                    execution_weight = jnp.where(
+                        pair_active, execution_weight, 0.0)
+                    xr = (x_b @ read_b.T).astype(jnp.float32)
+                    weighted = execution_weight * xr
+                    out_b = (weighted.astype(jnp.bfloat16) @ write_b).astype(
+                        jnp.float32)
+                    den_b = admission.sum(axis=-1, keepdims=True)
+                    flat_raw_out = flat_raw_out.at[token_ids].add(out_b)
+                    flat_den_cost = flat_den_cost.at[token_ids].add(den_b)
+                    return flat_raw_out, flat_den_cost
+
+                carry = jax.lax.cond(
+                    chunk_i < kept_chunk_count,
+                    process_chunk,
+                    lambda c: c,
+                    carry)
+                return carry, None
+
+            (flat_raw_out, flat_den_cost), _ = jax.lax.scan(
+                kept_chunk_step,
+                (flat_raw_out, flat_den_cost),
+                jnp.arange(max_token_chunks, dtype=jnp.int32))
+            return (flat_raw_out, flat_den_cost), None
 
         (flat_raw_out, flat_den_cost), _ = jax.lax.scan(
-            bucket_chunk_step,
+            block_step,
             (jnp.zeros((T, D), dtype=jnp.float32),
              jnp.zeros((T, 1), dtype=jnp.float32)),
-            jnp.arange(max_bucket_chunks, dtype=jnp.int32))
+            jnp.arange(n_blocks, dtype=jnp.int32))
 
         raw_out = flat_raw_out.reshape(B, S, D)
         total_den_cost = flat_den_cost.reshape(B, S, 1)
@@ -3015,13 +2981,11 @@ def make_sharded_srw_paired_block_sparse_minimal(
 
         T = int(B) * int(S)
         route_token_span = int(R) * int(T)
-        max_candidate_pairs = route_token_span * int(n_blocks)
-        candidate_capacity_i = jnp.asarray(
-            max_candidate_pairs, dtype=jnp.int32)
-        max_bucket_chunks = (
-            int(n_blocks)
-            + ((max_candidate_pairs + _bucket_chunk_size - 1)
-               // _bucket_chunk_size))
+        pair_capacity_i = jnp.asarray(route_token_span, dtype=jnp.int32)
+        pair_pos = jnp.arange(route_token_span, dtype=jnp.int32)
+        max_pair_chunks = max(
+            1, (route_token_span + _bucket_chunk_size - 1)
+            // _bucket_chunk_size)
 
         flat_x_bf = x.reshape(T, D).astype(jnp.bfloat16)
         h_unit_bf = _forward_unit_direction(
@@ -3030,69 +2994,7 @@ def make_sharded_srw_paired_block_sparse_minimal(
         flat_h_bf = h_unit_bf.reshape(T, R, h_unit_bf.shape[-1])
         tau = _tau_from_param(raw_tau)
         flat_tau = tau.reshape(T, R, 1)
-
-        block_score_ub = (
-            jnp.einsum('trd,nd->trn', flat_h_bf, block_center)
-        ).astype(jnp.float32) + block_radius[None, None, :]
-        block_execution_ub = _v4168_block_execution_upper_bound(
-            block_score_ub, flat_tau, soft_gate_temperature,
-            soft_gate_boundary_power)
-        candidate_mask = block_execution_ub >= _execution_pair_prune_eps
-        candidate_mask_flat = jnp.transpose(
-            candidate_mask, (2, 1, 0)).reshape(max_candidate_pairs)
-        candidate_i = candidate_mask_flat.astype(jnp.int32)
-        candidate_pair_count = candidate_i.sum()
-        candidate_rank = jnp.cumsum(candidate_i) - 1
-
-        capacity_pos = jnp.arange(max_candidate_pairs, dtype=jnp.int32)
-        candidate_scatter_rank = jnp.where(
-            candidate_mask_flat, candidate_rank, candidate_capacity_i)
-        candidate_source_pos = jnp.zeros(
-            (max_candidate_pairs,), dtype=jnp.int32).at[
-                candidate_scatter_rank
-            ].set(capacity_pos, mode='drop')
-        candidate_block_id = (
-            candidate_source_pos // int(route_token_span)).astype(jnp.int32)
-        candidate_block_rem = (
-            candidate_source_pos % int(route_token_span)).astype(jnp.int32)
-        candidate_route_id = (
-            candidate_block_rem // int(T)).astype(jnp.int32)
-        candidate_token_id = (
-            candidate_block_rem % int(T)).astype(jnp.int32)
-
-        def bucket_chunks_for_sorted_pairs(block_ids, valid_pair_count):
-            in_range = capacity_pos < valid_pair_count
-            prev_pos = jnp.maximum(capacity_pos - 1, 0)
-            prev_block_id = block_ids[prev_pos]
-            block_group_start = jnp.logical_and(
-                in_range,
-                jnp.logical_or(
-                    capacity_pos == 0, block_ids != prev_block_id))
-            group_start_pos = jnp.where(block_group_start, capacity_pos, 0)
-            group_start_pos = jax.lax.associative_scan(
-                jnp.maximum, group_start_pos, axis=0)
-            rank_in_group = capacity_pos - group_start_pos
-            bucket_chunk_start = jnp.logical_and(
-                in_range,
-                jnp.logical_or(
-                    block_group_start,
-                    (rank_in_group % _bucket_chunk_size) == 0))
-            bucket_chunk_ord = (
-                jnp.cumsum(bucket_chunk_start.astype(jnp.int32)) - 1)
-            safe_chunk_ord = jnp.where(
-                bucket_chunk_start, bucket_chunk_ord, max_bucket_chunks)
-            n_bucket_chunks = bucket_chunk_start.astype(jnp.int32).sum()
-            bucket_chunk_starts = jnp.zeros(
-                (max_bucket_chunks,), dtype=jnp.int32).at[
-                    safe_chunk_ord
-                ].max(
-                    jnp.where(bucket_chunk_start, capacity_pos, 0),
-                    mode='drop')
-            return bucket_chunk_starts, n_bucket_chunks
-
-        bucket_chunk_starts, n_bucket_chunks = (
-            bucket_chunks_for_sorted_pairs(
-                candidate_block_id, candidate_pair_count))
+        flat_tau_scalar = tau.reshape(T, R)
 
         def angular_compose_parts(rho, tau_b, valid_mask):
             _, admission, _drive, execution_weight, _ = _compute_admission_drive(
@@ -3105,128 +3007,153 @@ def make_sharded_srw_paired_block_sparse_minimal(
             return admission, execution_weight
 
         @jax.checkpoint
-        def gate_pair_keep_step(keep_pair, chunk_i):
-            def process_chunk(keep_pair):
-                start = bucket_chunk_starts[chunk_i]
-                offsets = start + jnp.arange(
-                    _bucket_chunk_size, dtype=jnp.int32)
-                safe_offsets = jnp.minimum(
-                    offsets, jnp.maximum(candidate_pair_count - 1, 0))
-                block_id = candidate_block_id[start]
-                in_pair_range = offsets < candidate_pair_count
-                same_block = candidate_block_id[safe_offsets] == block_id
-                valid_pairs = jnp.logical_and(in_pair_range, same_block)
-                token_ids = jnp.where(
-                    valid_pairs, candidate_token_id[safe_offsets], 0)
-                route_ids = jnp.where(
-                    valid_pairs, candidate_route_id[safe_offsets], 0)
+        def block_step(carry, block_i):
+            flat_raw_out, flat_den_cost = carry
+            op_key_b = op_key_blocks[block_i]
+            read_b = read_blocks[block_i]
+            write_b = write_blocks[block_i]
+            valid_ops = valid_blocks[block_i]
 
-                h_b = flat_h_bf[token_ids, route_ids]
-                tau_b = flat_tau[token_ids, route_ids]
-                op_key_b = op_key_blocks[block_id]
-                valid_ops = valid_blocks[block_id]
-                valid_mask = jnp.logical_and(
-                    valid_pairs[:, None], valid_ops[None, :])
+            block_score_ub = jnp.einsum(
+                'trd,d->tr', flat_h_bf, block_center[block_i]
+            ).astype(jnp.float32) + block_radius[block_i]
+            block_execution_ub = _v4168_block_execution_upper_bound(
+                block_score_ub, flat_tau_scalar, soft_gate_temperature,
+                soft_gate_boundary_power)
+            candidate_mask = block_execution_ub >= _execution_pair_prune_eps
+            candidate_flat = candidate_mask.T.reshape(route_token_span)
+            candidate_i = candidate_flat.astype(jnp.int32)
+            candidate_count = candidate_i.sum()
+            candidate_rank = jnp.cumsum(candidate_i) - 1
+            candidate_scatter_rank = jnp.where(
+                candidate_flat, candidate_rank, pair_capacity_i)
+            candidate_pairs = jnp.zeros(
+                (route_token_span,), dtype=jnp.int32).at[
+                    candidate_scatter_rank
+                ].set(pair_pos, mode='drop')
+            candidate_chunk_count = (
+                (candidate_count + _bucket_chunk_size - 1)
+                // _bucket_chunk_size)
 
-                rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
-                rho_compute = jnp.where(valid_ops[None, :], rho_raw, tau_b)
-                _admission, execution_weight = angular_compose_parts(
-                    rho_compute, tau_b, valid_mask)
-                pair_exec_max = execution_weight.max(axis=-1)
-                keep_pair_chunk = jnp.logical_and(
-                    valid_pairs,
-                    pair_exec_max >= _execution_pair_prune_eps)
-                keep_pair = keep_pair.at[offsets].set(
-                    keep_pair_chunk, mode='drop')
-                return keep_pair
+            @jax.checkpoint
+            def gate_candidate_chunk(keep_candidate, chunk_i):
+                def process_chunk(keep_candidate):
+                    start = chunk_i * _bucket_chunk_size
+                    offsets = start + jnp.arange(
+                        _bucket_chunk_size, dtype=jnp.int32)
+                    safe_offsets = jnp.minimum(
+                        offsets, jnp.maximum(candidate_count - 1, 0))
+                    valid_pairs = offsets < candidate_count
+                    pair_ids = jnp.where(
+                        valid_pairs, candidate_pairs[safe_offsets], 0)
+                    route_ids = pair_ids // int(T)
+                    token_ids = pair_ids % int(T)
 
-            keep_pair = jax.lax.cond(
-                chunk_i < n_bucket_chunks,
-                process_chunk,
-                lambda k: k,
-                keep_pair)
-            return keep_pair, None
+                    h_b = flat_h_bf[token_ids, route_ids]
+                    tau_b = flat_tau[token_ids, route_ids]
+                    valid_mask = jnp.logical_and(
+                        valid_pairs[:, None], valid_ops[None, :])
 
-        keep_pair, _ = jax.lax.scan(
-            gate_pair_keep_step,
-            jnp.zeros((max_candidate_pairs,), dtype=jnp.bool_),
-            jnp.arange(max_bucket_chunks, dtype=jnp.int32))
+                    rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
+                    rho_compute = jnp.where(
+                        valid_ops[None, :], rho_raw, tau_b)
+                    _admission, execution_weight = angular_compose_parts(
+                        rho_compute, tau_b, valid_mask)
+                    pair_exec_max = execution_weight.max(axis=-1)
+                    keep_chunk = jnp.logical_and(
+                        valid_pairs,
+                        pair_exec_max >= _execution_pair_prune_eps)
+                    keep_candidate = keep_candidate.at[offsets].set(
+                        keep_chunk, mode='drop')
+                    return keep_candidate
 
-        keep_pair_i = keep_pair.astype(jnp.int32)
-        kept_pair_count = keep_pair_i.sum()
-        kept_pair_rank = jnp.cumsum(keep_pair_i) - 1
-        kept_scatter_rank = jnp.where(
-            keep_pair, kept_pair_rank, candidate_capacity_i)
-        kept_pair_pos = jnp.zeros(
-            (max_candidate_pairs,), dtype=jnp.int32).at[
-            kept_scatter_rank
-        ].set(capacity_pos, mode='drop')
-        kept_block_id = candidate_block_id[kept_pair_pos]
-        kept_route_id = candidate_route_id[kept_pair_pos]
-        kept_token_id = candidate_token_id[kept_pair_pos]
-        kept_bucket_chunk_starts, kept_n_bucket_chunks = (
-            bucket_chunks_for_sorted_pairs(kept_block_id, kept_pair_count))
+                keep_candidate = jax.lax.cond(
+                    chunk_i < candidate_chunk_count,
+                    process_chunk,
+                    lambda k: k,
+                    keep_candidate)
+                return keep_candidate, None
 
-        @jax.checkpoint
-        def bucket_chunk_step(carry, chunk_i):
-            def process_chunk(carry):
-                flat_raw_out, flat_den_cost = carry
-                start = kept_bucket_chunk_starts[chunk_i]
-                offsets = start + jnp.arange(
-                    _bucket_chunk_size, dtype=jnp.int32)
-                safe_offsets = jnp.minimum(
-                    offsets, jnp.maximum(kept_pair_count - 1, 0))
-                block_id = kept_block_id[start]
-                in_pair_range = offsets < kept_pair_count
-                same_block = kept_block_id[safe_offsets] == block_id
-                valid_pairs = jnp.logical_and(in_pair_range, same_block)
-                token_ids = jnp.where(
-                    valid_pairs, kept_token_id[safe_offsets], 0)
-                route_ids = jnp.where(
-                    valid_pairs, kept_route_id[safe_offsets], 0)
+            keep_candidate, _ = jax.lax.scan(
+                gate_candidate_chunk,
+                jnp.zeros((route_token_span,), dtype=jnp.bool_),
+                jnp.arange(max_pair_chunks, dtype=jnp.int32))
 
-                x_b = flat_x_bf[token_ids]
-                h_b = flat_h_bf[token_ids, route_ids]
-                tau_b = flat_tau[token_ids, route_ids]
-                op_key_b = op_key_blocks[block_id]
-                read_b = read_blocks[block_id]
-                write_b = write_blocks[block_id]
-                valid_ops = valid_blocks[block_id]
-                valid_mask = jnp.logical_and(
-                    valid_pairs[:, None], valid_ops[None, :])
+            kept_i = keep_candidate.astype(jnp.int32)
+            kept_count = kept_i.sum()
+            kept_rank = jnp.cumsum(kept_i) - 1
+            kept_scatter_rank = jnp.where(
+                keep_candidate, kept_rank, pair_capacity_i)
+            kept_pairs = jnp.zeros(
+                (route_token_span,), dtype=jnp.int32).at[
+                    kept_scatter_rank
+                ].set(candidate_pairs, mode='drop')
+            kept_chunk_count = (
+                (kept_count + _bucket_chunk_size - 1)
+                // _bucket_chunk_size)
 
-                rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
-                rho_compute = jnp.where(valid_ops[None, :], rho_raw, tau_b)
-                admission, execution_weight = angular_compose_parts(
-                    rho_compute, tau_b, valid_mask)
-                pair_exec_max = execution_weight.max(axis=-1, keepdims=True)
-                pair_active = pair_exec_max >= _execution_pair_prune_eps
-                admission = jnp.where(pair_active, admission, 0.0)
-                execution_weight = jnp.where(
-                    pair_active, execution_weight, 0.0)
-                xr = (x_b @ read_b.T).astype(jnp.float32)
-                weighted = execution_weight * xr
-                out_b = (weighted.astype(jnp.bfloat16) @ write_b).astype(
-                    jnp.float32)
-                den_b = admission.sum(axis=-1, keepdims=True)
-                flat_raw_out = flat_raw_out.at[token_ids, route_ids].add(
-                    out_b)
-                flat_den_cost = flat_den_cost.at[token_ids, route_ids].add(
-                    den_b)
-                return flat_raw_out, flat_den_cost
+            @jax.checkpoint
+            def kept_chunk_step(carry, chunk_i):
+                def process_chunk(carry):
+                    flat_raw_out, flat_den_cost = carry
+                    start = chunk_i * _bucket_chunk_size
+                    offsets = start + jnp.arange(
+                        _bucket_chunk_size, dtype=jnp.int32)
+                    safe_offsets = jnp.minimum(
+                        offsets, jnp.maximum(kept_count - 1, 0))
+                    valid_pairs = offsets < kept_count
+                    fallback_pair = kept_pairs[0]
+                    pair_ids = jnp.where(
+                        valid_pairs, kept_pairs[safe_offsets], fallback_pair)
+                    route_ids = pair_ids // int(T)
+                    token_ids = pair_ids % int(T)
 
-            carry = jax.lax.cond(
-                chunk_i < kept_n_bucket_chunks,
-                process_chunk,
-                lambda c: c,
-                carry)
-            return carry, None
+                    x_b = flat_x_bf[token_ids]
+                    h_b = flat_h_bf[token_ids, route_ids]
+                    tau_b = flat_tau[token_ids, route_ids]
+                    valid_mask = jnp.logical_and(
+                        valid_pairs[:, None], valid_ops[None, :])
+
+                    rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
+                    rho_compute = jnp.where(
+                        valid_ops[None, :], rho_raw, tau_b)
+                    admission, execution_weight = angular_compose_parts(
+                        rho_compute, tau_b, valid_mask)
+                    pair_exec_max = execution_weight.max(
+                        axis=-1, keepdims=True)
+                    pair_active = pair_exec_max >= _execution_pair_prune_eps
+                    admission = jnp.where(pair_active, admission, 0.0)
+                    execution_weight = jnp.where(
+                        pair_active, execution_weight, 0.0)
+                    xr = (x_b @ read_b.T).astype(jnp.float32)
+                    weighted = execution_weight * xr
+                    out_b = (weighted.astype(jnp.bfloat16) @ write_b).astype(
+                        jnp.float32)
+                    den_b = admission.sum(axis=-1, keepdims=True)
+                    flat_raw_out = flat_raw_out.at[token_ids, route_ids].add(
+                        out_b)
+                    flat_den_cost = flat_den_cost.at[token_ids, route_ids].add(
+                        den_b)
+                    return flat_raw_out, flat_den_cost
+
+                carry = jax.lax.cond(
+                    chunk_i < kept_chunk_count,
+                    process_chunk,
+                    lambda c: c,
+                    carry)
+                return carry, None
+
+            (flat_raw_out, flat_den_cost), _ = jax.lax.scan(
+                kept_chunk_step,
+                (flat_raw_out, flat_den_cost),
+                jnp.arange(max_pair_chunks, dtype=jnp.int32))
+            return (flat_raw_out, flat_den_cost), None
 
         (flat_raw_out, flat_den_cost), _ = jax.lax.scan(
-            bucket_chunk_step,
+            block_step,
             (jnp.zeros((T, R, D), dtype=jnp.float32),
              jnp.zeros((T, R, 1), dtype=jnp.float32)),
-            jnp.arange(max_bucket_chunks, dtype=jnp.int32))
+            jnp.arange(n_blocks, dtype=jnp.int32))
 
         raw_out = flat_raw_out.reshape(B, S, R, D)
         total_den_cost = flat_den_cost.reshape(B, S, R, 1)
