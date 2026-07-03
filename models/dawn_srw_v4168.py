@@ -2638,7 +2638,8 @@ def _v4168_block_sparse_config(block_size, top_blocks):
     return block_size, top_blocks
 
 
-_V4168_BUCKET_CHUNK_SIZE = 128
+_V4168_BUCKET_CHUNK_SIZE = 512
+_V4168_EXECUTION_PAIR_PRUNE_EPS = 1.0e-6
 
 
 def _v4168_block_sparse_blocks(op_key_local, read_local, write_local,
@@ -2701,6 +2702,8 @@ def make_sharded_srw_block_sparse_minimal(
     _block_size, _top_blocks = _v4168_block_sparse_config(
         block_size, top_blocks)
     _bucket_chunk_size = int(_V4168_BUCKET_CHUNK_SIZE)
+    _execution_pair_prune_eps = jnp.float32(
+        _V4168_EXECUTION_PAIR_PRUNE_EPS)
     _soft_gate_effective_active_eps = jnp.float32(
         soft_gate_effective_active_eps)
     _admission_den_power = jnp.maximum(
@@ -2735,6 +2738,7 @@ def make_sharded_srw_block_sparse_minimal(
 
         T = int(B) * int(S)
         pair_count = T * int(k_blocks)
+        pair_count_i = jnp.asarray(pair_count, dtype=jnp.int32)
         max_bucket_chunks = (
             int(n_blocks)
             + (pair_count + _bucket_chunk_size - 1) // _bucket_chunk_size)
@@ -2760,24 +2764,36 @@ def make_sharded_srw_block_sparse_minimal(
         sorted_token_id = pair_token_id[sort_idx]
 
         pair_pos = jnp.arange(pair_count, dtype=jnp.int32)
-        prev_block_id = jnp.concatenate(
-            [sorted_block_id[:1], sorted_block_id[:-1]], axis=0)
-        block_group_start = jnp.logical_or(
-            pair_pos == 0, sorted_block_id != prev_block_id)
-        group_start_pos = jnp.where(block_group_start, pair_pos, 0)
-        group_start_pos = jax.lax.associative_scan(
-            jnp.maximum, group_start_pos, axis=0)
-        rank_in_group = pair_pos - group_start_pos
-        bucket_chunk_start = jnp.logical_or(
-            block_group_start,
-            (rank_in_group % _bucket_chunk_size) == 0)
-        bucket_chunk_ord = (
-            jnp.cumsum(bucket_chunk_start.astype(jnp.int32)) - 1)
-        n_bucket_chunks = bucket_chunk_start.astype(jnp.int32).sum()
-        bucket_chunk_starts = jnp.zeros(
-            (max_bucket_chunks,), dtype=jnp.int32).at[
-                bucket_chunk_ord
-            ].max(jnp.where(bucket_chunk_start, pair_pos, 0), mode='drop')
+
+        def bucket_chunks_for_sorted_pairs(block_ids, valid_pair_count):
+            in_range = pair_pos < valid_pair_count
+            prev_pos = jnp.maximum(pair_pos - 1, 0)
+            prev_block_id = block_ids[prev_pos]
+            block_group_start = jnp.logical_and(
+                in_range,
+                jnp.logical_or(pair_pos == 0, block_ids != prev_block_id))
+            group_start_pos = jnp.where(block_group_start, pair_pos, 0)
+            group_start_pos = jax.lax.associative_scan(
+                jnp.maximum, group_start_pos, axis=0)
+            rank_in_group = pair_pos - group_start_pos
+            bucket_chunk_start = jnp.logical_and(
+                in_range,
+                jnp.logical_or(
+                    block_group_start,
+                    (rank_in_group % _bucket_chunk_size) == 0))
+            bucket_chunk_ord = (
+                jnp.cumsum(bucket_chunk_start.astype(jnp.int32)) - 1)
+            safe_chunk_ord = jnp.where(
+                bucket_chunk_start, bucket_chunk_ord, max_bucket_chunks)
+            n_bucket_chunks = bucket_chunk_start.astype(jnp.int32).sum()
+            bucket_chunk_starts = jnp.zeros(
+                (max_bucket_chunks,), dtype=jnp.int32).at[
+                    safe_chunk_ord
+                ].max(jnp.where(bucket_chunk_start, pair_pos, 0), mode='drop')
+            return bucket_chunk_starts, n_bucket_chunks
+
+        bucket_chunk_starts, n_bucket_chunks = (
+            bucket_chunks_for_sorted_pairs(sorted_block_id, pair_count_i))
 
         def angular_compose_parts(rho, tau_b, valid_mask):
             _, admission, _drive, execution_weight, _ = _compute_admission_drive(
@@ -2790,9 +2806,8 @@ def make_sharded_srw_block_sparse_minimal(
             return admission, execution_weight
 
         @jax.checkpoint
-        def bucket_chunk_step(carry, chunk_i):
-            def process_chunk(carry):
-                flat_raw_out, flat_den_cost = carry
+        def gate_pair_keep_step(keep_pair, chunk_i):
+            def process_chunk(keep_pair):
                 start = bucket_chunk_starts[chunk_i]
                 offsets = start + jnp.arange(
                     _bucket_chunk_size, dtype=jnp.int32)
@@ -2803,6 +2818,66 @@ def make_sharded_srw_block_sparse_minimal(
                 valid_pairs = jnp.logical_and(in_pair_range, same_block)
                 token_ids = jnp.where(
                     valid_pairs, sorted_token_id[safe_offsets], 0)
+
+                h_b = flat_h_bf[token_ids]
+                tau_b = flat_tau[token_ids]
+                op_key_b = op_key_blocks[block_id]
+                valid_ops = valid_blocks[block_id]
+                valid_mask = jnp.logical_and(
+                    valid_pairs[:, None], valid_ops[None, :])
+
+                rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
+                rho_compute = jnp.where(valid_ops[None, :], rho_raw, tau_b)
+                _admission, execution_weight = angular_compose_parts(
+                    rho_compute, tau_b, valid_mask)
+                pair_exec_max = execution_weight.max(axis=-1)
+                keep_pair_chunk = jnp.logical_and(
+                    valid_pairs,
+                    pair_exec_max >= _execution_pair_prune_eps)
+                keep_pair = keep_pair.at[offsets].set(
+                    keep_pair_chunk, mode='drop')
+                return keep_pair
+
+            keep_pair = jax.lax.cond(
+                chunk_i < n_bucket_chunks,
+                process_chunk,
+                lambda k: k,
+                keep_pair)
+            return keep_pair, None
+
+        keep_pair, _ = jax.lax.scan(
+            gate_pair_keep_step,
+            jnp.zeros((pair_count,), dtype=jnp.bool_),
+            jnp.arange(max_bucket_chunks, dtype=jnp.int32))
+
+        keep_pair_i = keep_pair.astype(jnp.int32)
+        kept_pair_count = keep_pair_i.sum()
+        kept_pair_rank = jnp.cumsum(keep_pair_i) - 1
+        kept_scatter_rank = jnp.where(
+            keep_pair, kept_pair_rank, pair_count_i)
+        kept_pair_pos = jnp.zeros((pair_count,), dtype=jnp.int32).at[
+            kept_scatter_rank
+        ].set(pair_pos, mode='drop')
+        kept_block_id = sorted_block_id[kept_pair_pos]
+        kept_token_id = sorted_token_id[kept_pair_pos]
+        kept_bucket_chunk_starts, kept_n_bucket_chunks = (
+            bucket_chunks_for_sorted_pairs(kept_block_id, kept_pair_count))
+
+        @jax.checkpoint
+        def bucket_chunk_step(carry, chunk_i):
+            def process_chunk(carry):
+                flat_raw_out, flat_den_cost = carry
+                start = kept_bucket_chunk_starts[chunk_i]
+                offsets = start + jnp.arange(
+                    _bucket_chunk_size, dtype=jnp.int32)
+                safe_offsets = jnp.minimum(
+                    offsets, jnp.maximum(kept_pair_count - 1, 0))
+                block_id = kept_block_id[start]
+                in_pair_range = offsets < kept_pair_count
+                same_block = kept_block_id[safe_offsets] == block_id
+                valid_pairs = jnp.logical_and(in_pair_range, same_block)
+                token_ids = jnp.where(
+                    valid_pairs, kept_token_id[safe_offsets], 0)
 
                 x_b = flat_x_bf[token_ids]
                 h_b = flat_h_bf[token_ids]
@@ -2818,6 +2893,11 @@ def make_sharded_srw_block_sparse_minimal(
                 rho_compute = jnp.where(valid_ops[None, :], rho_raw, tau_b)
                 admission, execution_weight = angular_compose_parts(
                     rho_compute, tau_b, valid_mask)
+                pair_exec_max = execution_weight.max(axis=-1, keepdims=True)
+                pair_active = pair_exec_max >= _execution_pair_prune_eps
+                admission = jnp.where(pair_active, admission, 0.0)
+                execution_weight = jnp.where(
+                    pair_active, execution_weight, 0.0)
                 xr = (x_b @ read_b.T).astype(jnp.float32)
                 weighted = execution_weight * xr
                 out_b = (weighted.astype(jnp.bfloat16) @ write_b).astype(
@@ -2828,7 +2908,7 @@ def make_sharded_srw_block_sparse_minimal(
                 return flat_raw_out, flat_den_cost
 
             carry = jax.lax.cond(
-                chunk_i < n_bucket_chunks,
+                chunk_i < kept_n_bucket_chunks,
                 process_chunk,
                 lambda c: c,
                 carry)
