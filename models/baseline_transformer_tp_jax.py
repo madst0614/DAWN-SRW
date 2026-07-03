@@ -291,7 +291,7 @@ class TensorParallelVanillaTransformer(nn.Module):
         layer_cls = TensorParallelTransformerLayer
         if self.gradient_checkpointing:
             layer_cls = nn.remat(
-                TensorParallelTransformerLayer, static_argnums=(2, 3))
+                TensorParallelTransformerLayer, static_argnums=(1, 2))
         self.layers = [
             layer_cls(self.d_model, self.n_heads, self.d_ff,
                       self.dropout_rate, name=f"layer_{i}")
@@ -311,8 +311,7 @@ class TensorParallelVanillaTransformer(nn.Module):
         x = self.emb_dropout(x, deterministic=deterministic)
 
         for layer in self.layers:
-            x = layer(
-                x, deterministic=deterministic, sharded_fns=sharded_fns)
+            x = layer(x, deterministic, sharded_fns)
 
         x = self.norm(x)
         result = {"aux_loss": jnp.float32(0.0)}
