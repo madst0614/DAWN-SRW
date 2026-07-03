@@ -1,7 +1,7 @@
 """
-Minimal DAWN-SRW v4.1.6.6/v4.1.6.7 JAX trainer.
+Minimal DAWN-SRW v4.1.6.6/v4.1.6.7/v4.1.6.8 JAX trainer.
 
-This path is dedicated to large v4166/v4167 CE training.  It reuses the full
+This path is dedicated to large v4166/v4167/v4168 CE training.  It reuses the full
 trainer's config, selection calibration, sharding, optimizer, data, logging,
 and Orbax helpers, but avoids analysis/geometry/prune/drift diagnostics and
 uses model.apply(..., minimal_train=True).
@@ -40,6 +40,7 @@ POOL_SCHEDULE_NAMES = ('qk', 'v', 'rst')
 SUPPORTED_MINIMAL_SRW_VERSIONS = (
     full.V4166_MODEL_VERSION,
     full.V4167_MODEL_VERSION,
+    full.V4168_MODEL_VERSION,
 )
 
 debug_interval = 0
@@ -1023,6 +1024,13 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
 
     def _srw_pool_kwargs(pool):
         kwargs = dict(base_kwargs)
+        if model_version == full.V4168_MODEL_VERSION:
+            m_cfg = cfg['model']
+            kwargs.update({
+                'block_size': int(m_cfg.get(f'{pool}_block_size', 256)),
+                'top_blocks': int(m_cfg.get(f'{pool}_top_blocks', 2)),
+                'block_margin': float(m_cfg.get('block_margin', 0.0)),
+            })
         return kwargs
 
     sharded_single_v = make_single(
@@ -1071,6 +1079,15 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
         extra_msg = (
             "; v4167 TP extras=router_dense,attention_o,vocab_parallel"
             if model_version == full.V4167_MODEL_VERSION else "")
+        if model_version == full.V4168_MODEL_VERSION:
+            extra_msg = (
+                "; v4168 block_sparse "
+                f"block_size qk/v/rst={cfg['model'].get('qk_block_size', 256)}/"
+                f"{cfg['model'].get('v_block_size', 256)}/"
+                f"{cfg['model'].get('rst_block_size', 256)}, "
+                f"top_blocks qk/v/rst={cfg['model'].get('qk_top_blocks', 2)}/"
+                f"{cfg['model'].get('v_top_blocks', 2)}/"
+                f"{cfg['model'].get('rst_top_blocks', 2)}")
         print(
             "  shard_map minimal enabled "
             f"(mesh_model={mesh_model}, QK fused; "

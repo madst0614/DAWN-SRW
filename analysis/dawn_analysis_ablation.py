@@ -396,24 +396,38 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
         requested_batch_size=requested_batch_size,
     )
 
-    if ctx.is_primary:
+    store.log_event(
+        stage,
+        "base_start",
+        message=(
+            f"ABLATION BASE START dynamic_mask_jit_compile_and_eval "
+            f"batches={len(batches)} batch_size={batch_size} "
+            f"host={ctx.host_id}/{ctx.n_hosts} primary={ctx.is_primary}"
+        ),
+    )
+    forward = jax.jit(_build_dynamic_suppressed_forward(ctx.params, ctx.model_cfg))
+    base_t0 = time.time()
+    base = _eval_forward(forward, batches, _base_multipliers(ctx))
+    base_sec = time.time() - base_t0
+    if not ctx.is_primary:
         store.log_event(
             stage,
-            "base_start",
+            "base_host_done",
             message=(
-                f"ABLATION BASE START dynamic_mask_jit batches={len(batches)} "
-                f"batch_size={batch_size} host_count={ctx.n_hosts}"
+                f"ABLATION BASE HOST DONE loss={base['loss']:.6f} "
+                f"acc={base['accuracy']:.4f} tokens={base['valid_count']:,} "
+                f"base_sec={base_sec:.1f} host={ctx.host_id}/{ctx.n_hosts} "
+                "primary host=0 writes summary"
             ),
+            **base,
         )
-    forward = jax.jit(_build_dynamic_suppressed_forward(ctx.params, ctx.model_cfg))
-    base = _eval_forward(forward, batches, _base_multipliers(ctx))
     if ctx.is_primary:
         store.log_event(
             stage,
             "base",
             message=(
                 f"ABLATION BASE loss={base['loss']:.6f} acc={base['accuracy']:.4f} "
-                f"tokens={base['valid_count']:,} hosts={ctx.n_hosts}"
+                f"tokens={base['valid_count']:,} base_sec={base_sec:.1f} hosts={ctx.n_hosts}"
             ),
             **base,
         )
@@ -453,7 +467,17 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
                     completed_jobs += 1
                     elapsed = time.time() - jobs_t0
                     eta = (elapsed / completed_jobs) * max(0, total_jobs - completed_jobs)
-                    if ctx.is_primary:
+                    if not ctx.is_primary:
+                        store.log_event(
+                            stage,
+                            "job_host_skip",
+                            message=(
+                                f"ABLATION job {completed_jobs:03d}/{total_jobs:03d} "
+                                f"{pool}/{strategy}/k={k} SKIP "
+                                f"host={ctx.host_id}/{ctx.n_hosts} primary host=0 writes summary"
+                            ),
+                        )
+                    else:
                         store.log_event(
                             stage,
                             "job_skip",
@@ -470,15 +494,15 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
                 try:
                     job_t0 = time.time()
                     job_no = completed_jobs + 1
-                    if ctx.is_primary:
-                        store.log_event(
-                            stage,
-                            "job_start",
-                            message=(
-                                f"ABLATION job {job_no:03d}/{total_jobs:03d} START "
-                                f"{pool}/{strategy}/k={k} ops={len(op_ids)}"
-                            ),
-                        )
+                    store.log_event(
+                        stage,
+                        "job_start",
+                        message=(
+                            f"ABLATION job {job_no:03d}/{total_jobs:03d} START "
+                            f"{pool}/{strategy}/k={k} ops={len(op_ids)} "
+                            f"host={ctx.host_id}/{ctx.n_hosts} primary={ctx.is_primary}"
+                        ),
+                    )
                     ablated = _eval_forward(forward, batches, _make_multipliers(ctx, pool, op_ids))
                     job_sec = time.time() - job_t0
                     completed_jobs += 1
@@ -497,6 +521,18 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
                         "valid_tokens": ablated["valid_count"],
                         "job_sec": job_sec,
                     }
+                    if not ctx.is_primary:
+                        store.log_event(
+                            stage,
+                            "job_host_done",
+                            message=(
+                                f"ABLATION job {completed_jobs:03d}/{total_jobs:03d} HOST DONE "
+                                f"{pool}/{strategy}/k={k} job_sec={job_sec:.1f} "
+                                f"elapsed={format_duration(elapsed)} eta={format_duration(eta)} "
+                                f"host={ctx.host_id}/{ctx.n_hosts} primary host=0 writes result"
+                            ),
+                            **rec,
+                        )
                     if ctx.is_primary:
                         write_json_atomic(path, rec)
                         store.mark_job_complete(stage, jid, path, rec)
@@ -569,4 +605,12 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
             **summary,
         )
         return summary
+    store.log_event(
+        stage,
+        "host_done",
+        message=(
+            f"ABLATION HOST DONE host={ctx.host_id}/{ctx.n_hosts} "
+            "summary is emitted by primary host=0"
+        ),
+    )
     return {}

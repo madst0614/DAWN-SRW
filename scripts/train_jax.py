@@ -78,6 +78,12 @@ from models.dawn_srw_v4167 import (
     _raw_tau_init_from_cosine_tau as _v4167_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4167_tau_init_calibration_scores,
 )
+from models.dawn_srw_v4168 import (
+    DAWN_SRW_V4168,
+    _pool_operator_keys as _v4168_pool_operator_keys,
+    _raw_tau_init_from_cosine_tau as _v4168_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4168_tau_init_calibration_scores,
+)
 from models.baseline_transformer_jax import (
     VanillaTransformer,
     create_baseline_sharded_fns,
@@ -258,12 +264,15 @@ def _strict_multihost_barrier(name: str, context=None):
 V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
 V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
 V4167_MODEL_VERSION = 'spatial-r1-v4.1.6.7'
+V4168_MODEL_VERSION = 'spatial-r1-v4.1.6.8'
 BASELINE_MODEL_VERSION = 'baseline-JAX'
 LEGACY_BASELINE_MODEL_VERSION = 'baseline'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (
-    V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION)
-RW_KEY_SRW_MODEL_VERSIONS = (V4166_MODEL_VERSION, V4167_MODEL_VERSION)
+    V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION,
+    V4168_MODEL_VERSION)
+RW_KEY_SRW_MODEL_VERSIONS = (
+    V4166_MODEL_VERSION, V4167_MODEL_VERSION, V4168_MODEL_VERSION)
 FIXED_TAU_SRW_MODEL_VERSIONS = (V4167_MODEL_VERSION,)
 CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_SELECTION_CALIBRATION_SCORE_CHUNK_TOKENS = 2048
@@ -292,6 +301,12 @@ MODEL_REGISTRY = {
         'module': 'models.dawn_srw_v4167',
         'raw_tau_init_from_cosine_tau': _v4167_raw_tau_init_from_cosine_tau,
         'tau_init_calibration_scores': _v4167_tau_init_calibration_scores,
+    },
+    V4168_MODEL_VERSION: {
+        'class': DAWN_SRW_V4168,
+        'module': 'models.dawn_srw_v4168',
+        'raw_tau_init_from_cosine_tau': _v4168_raw_tau_init_from_cosine_tau,
+        'tau_init_calibration_scores': _v4168_tau_init_calibration_scores,
     },
 }
 
@@ -369,6 +384,8 @@ def _pool_operator_keys_for_version(version):
         return _v4166_pool_operator_keys
     if version == V4167_MODEL_VERSION:
         return _v4167_pool_operator_keys
+    if version == V4168_MODEL_VERSION:
+        return _v4168_pool_operator_keys
     raise ValueError(f"{version} does not expose RW-derived operator keys.")
 
 
@@ -1215,6 +1232,16 @@ def _dawn_srw_kwargs(cfg):
             'n_rst_global': m['n_rst_global'],
             'n_rst_stage': m['n_rst_stage'],
             'n_rst_local': m['n_rst_local'],
+        })
+    if str(version) == V4168_MODEL_VERSION:
+        kw.update({
+            'qk_block_size': int(m.get('qk_block_size', 256)),
+            'v_block_size': int(m.get('v_block_size', 256)),
+            'rst_block_size': int(m.get('rst_block_size', 256)),
+            'qk_top_blocks': int(m.get('qk_top_blocks', 2)),
+            'v_top_blocks': int(m.get('v_top_blocks', 2)),
+            'rst_top_blocks': int(m.get('rst_top_blocks', 2)),
+            'block_margin': float(m.get('block_margin', 0.0)),
         })
     return kw
 
@@ -12685,6 +12712,13 @@ def main():
 
         def _srw_pool_kwargs(pool):
             kwargs = dict(_srw_base_kwargs)
+            if str(model_version_cfg) == V4168_MODEL_VERSION:
+                m_cfg = cfg['model']
+                kwargs.update({
+                    'block_size': int(m_cfg.get(f'{pool}_block_size', 256)),
+                    'top_blocks': int(m_cfg.get(f'{pool}_top_blocks', 2)),
+                    'block_margin': float(m_cfg.get('block_margin', 0.0)),
+                })
             return kwargs
 
         _supports_analysis = (
@@ -12779,6 +12813,15 @@ def main():
             _extra_msg = (
                 "; v4167 TP extras=router_dense,attention_o,vocab_parallel"
                 if str(model_version_cfg) == V4167_MODEL_VERSION else "")
+            if str(model_version_cfg) == V4168_MODEL_VERSION:
+                _extra_msg = (
+                    "; v4168 minimal block_sparse "
+                    f"block_size qk/v/rst={cfg['model'].get('qk_block_size', 256)}/"
+                    f"{cfg['model'].get('v_block_size', 256)}/"
+                    f"{cfg['model'].get('rst_block_size', 256)}, "
+                    f"top_blocks qk/v/rst={cfg['model'].get('qk_top_blocks', 2)}/"
+                    f"{cfg['model'].get('v_top_blocks', 2)}/"
+                    f"{cfg['model'].get('rst_top_blocks', 2)}")
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"

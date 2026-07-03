@@ -496,6 +496,14 @@ def run_usage_stage(ctx: AnalysisContext) -> Dict[str, Any]:
     sync_hosts("dawn-analysis-usage-parts-done")
 
     if not ctx.is_primary:
+        store.log_event(
+            stage,
+            "host_done",
+            message=(
+                f"USAGE HOST DONE host={ctx.host_id}/{ctx.n_hosts} "
+                "summary/reduce is emitted by primary host=0"
+            ),
+        )
         return {}
 
     reduce_t0 = time.time()
