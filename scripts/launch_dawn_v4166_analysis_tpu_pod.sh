@@ -30,6 +30,7 @@ ZONE="us-central2-b"
 PROJECT="dawn-486218"
 BRANCH="main"
 GH_TOKEN=""
+REPO_URL="https://github.com/madst0614/DAWN-SRW.git"
 
 CHECKPOINT="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_400M_c4_40B_v4_64/run_vspatial-r1-v4.1.6.6_20260622_212706_3201/checkpoints/000000076293"
 OUTPUT="gs://dawn-tpu-data-c4/analysis/v4166_400M_final"
@@ -48,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --project) PROJECT="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         --token) GH_TOKEN="$2"; shift 2 ;;
+        --repo-url) REPO_URL="$2"; shift 2 ;;
         --checkpoint) CHECKPOINT="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
         --stages) STAGES="$2"; shift 2 ;;
@@ -81,6 +83,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --output PATH_OR_GS       Default: $OUTPUT"
             echo "  --stages CSV              Default: $STAGES"
             echo "  --branch BRANCH           Default: $BRANCH"
+            echo "  --repo-url URL            Default: $REPO_URL"
             echo ""
             echo "TPU/GCP:"
             echo "  --zone ZONE               Default: $ZONE"
@@ -115,10 +118,15 @@ if [[ "$WORKERS" = "auto" ]]; then
     WORKERS="all"
 fi
 
+if [[ "$REPO_URL" == git@github.com:* ]]; then
+    REPO_URL="https://github.com/${REPO_URL#git@github.com:}"
+fi
+if [[ -n "$GH_TOKEN" && "$REPO_URL" == https://github.com/* ]]; then
+    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO_URL#https://github.com/}"
+fi
+REPO_URL_DISPLAY="$REPO_URL"
 if [[ -n "$GH_TOKEN" ]]; then
-    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/madst0614/dawn-spatial.git"
-else
-    REPO_URL="https://github.com/madst0614/dawn-spatial.git"
+    REPO_URL_DISPLAY="${REPO_URL_DISPLAY/$GH_TOKEN/***}"
 fi
 
 echo "============================================"
@@ -127,6 +135,7 @@ echo "  TPU:        $TPU_NAME"
 echo "  Zone:       $ZONE"
 echo "  Project:    $PROJECT"
 echo "  Branch:     $BRANCH"
+echo "  Repo:       $REPO_URL_DISPLAY"
 echo "  Workers:    $WORKERS"
 echo "  Detached:   $DETACH"
 echo "  Checkpoint: $CHECKPOINT"
@@ -234,4 +243,3 @@ echo "  tmux session: $TMUX_SESSION"
 echo "  Worker 0 log: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/train.log'"
 echo "  Worker 0 attach: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tmux attach -t train'"
 echo "  Your capture flow works on worker 0: tmux pipe-pane -t train 'cat >> ~/rebuttal_log.txt'"
-

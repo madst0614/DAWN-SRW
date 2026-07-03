@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -73,13 +74,40 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Event-based Spot TPU QR keeper.")
     p.add_argument("--node-id", required=True)
     p.add_argument("--accelerator-type", required=True)
-    p.add_argument("--config", required=True)
+    p.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Training config forwarded to the default training launcher. "
+            "Not required when --launcher points at an analysis launcher."
+        ),
+    )
     p.add_argument(
         "--script",
         default="scripts/train_jax.py",
         help="Training script forwarded to scripts/launch_tpu_pod.sh.",
     )
-    p.add_argument("--branch", default="main")
+    p.add_argument(
+        "--launcher",
+        default="scripts/launch_tpu_pod.sh",
+        help=(
+            "Launcher script to call once the QR is ACTIVE and SSH-ready. "
+            "Default: scripts/launch_tpu_pod.sh."
+        ),
+    )
+    p.add_argument(
+        "--launcher-args",
+        default="",
+        help=(
+            "Extra shell-style args forwarded to --launcher. Useful for "
+            "analysis launchers, e.g. --launcher-args \"--output gs://...\"."
+        ),
+    )
+    p.add_argument(
+        "--branch",
+        default="main",
+        help="Git branch passed to the launcher. Default: main.",
+    )
     p.add_argument("--zone", default="us-central2-b")
     p.add_argument("--project", default="dawn-486218")
     p.add_argument("--runtime-version", default="tpu-ubuntu2204-base")
@@ -410,11 +438,12 @@ def ssh_ready(args: argparse.Namespace) -> bool:
 
 def launch(args: argparse.Namespace) -> None:
     local_repo = Path(args.local_repo)
-    launcher = local_repo / "scripts" / "launch_tpu_pod.sh"
+    launcher = local_repo / args.launcher
     log(
         args,
-        f"EVENT launch_start repo={local_repo} config={args.config} "
-        f"script={args.script}",
+        f"EVENT launch_start repo={local_repo} launcher={args.launcher} "
+        f"config={args.config} script={args.script} "
+        f"launcher_args={args.launcher_args}",
     )
 
     if not launcher.exists():
@@ -431,24 +460,32 @@ def launch(args: argparse.Namespace) -> None:
         log(args, "WARN git_pull_failed continuing=true")
 
     cmd = [
-        "bash", "scripts/launch_tpu_pod.sh",
+        "bash", args.launcher,
         "--tpu", args.node_id,
         "--zone", args.zone,
         "--project", args.project,
         "--branch", args.branch,
-        "--config", args.config,
-        "--script", args.script,
     ]
+    if args.launcher == "scripts/launch_tpu_pod.sh":
+        if not args.config:
+            log(args, "ERROR config_required_for_default_training_launcher")
+            return
+        cmd.extend([
+            "--config", args.config,
+            "--script", args.script,
+        ])
     if args.token:
         cmd.extend(["--token", args.token])
     if args.from_scratch:
         cmd.append("--from-scratch")
-    if args.resume_from is not None:
+    if args.resume_from is not None and args.launcher == "scripts/launch_tpu_pod.sh":
         cmd.extend(["--resume-from", args.resume_from])
-    if args.debug is not None:
+    if args.debug is not None and args.launcher == "scripts/launch_tpu_pod.sh":
         cmd.append("--debug")
         if args.debug:
             cmd.append(args.debug)
+    if args.launcher_args:
+        cmd.extend(shlex.split(args.launcher_args))
 
     proc = run_stream(args, cmd, cwd=str(local_repo), timeout=args.launch_timeout_seconds)
     if not proc_ok(proc):
