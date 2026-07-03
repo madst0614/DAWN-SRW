@@ -1,7 +1,7 @@
 """
-Minimal DAWN-SRW v4.1.6.6 JAX trainer.
+Minimal DAWN-SRW v4.1.6.6/v4.1.6.7 JAX trainer.
 
-This path is dedicated to large v4166 CE training.  It reuses the full
+This path is dedicated to large v4166/v4167 CE training.  It reuses the full
 trainer's config, selection calibration, sharding, optimizer, data, logging,
 and Orbax helpers, but avoids analysis/geometry/prune/drift diagnostics and
 uses model.apply(..., minimal_train=True).
@@ -36,6 +36,10 @@ import train_jax as full
 
 OFFICIAL_MODEL_VERSION = full.OFFICIAL_MODEL_VERSION
 POOL_SCHEDULE_NAMES = ('qk', 'v', 'rst')
+SUPPORTED_MINIMAL_SRW_VERSIONS = (
+    full.V4166_MODEL_VERSION,
+    full.V4167_MODEL_VERSION,
+)
 
 debug_interval = 0
 debug_enabled = False
@@ -934,22 +938,46 @@ def _chunk_size_from_count(name, n_local, n_chunks):
 
 def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
                               per_device_batch, is_host0):
-    model_version = cfg['model'].get('model_version', full.OFFICIAL_MODEL_VERSION)
+    model_version = str(cfg['model'].get(
+        'model_version', full.OFFICIAL_MODEL_VERSION))
     if not full._is_active_srw_version(model_version):
         return None, (1, 1, 1), (1, 1, 1)
+    if model_version == full.V4167_MODEL_VERSION:
+        full._dawn_srw_kwargs(cfg)
 
     target_chunk_gb = cfg['training'].get('target_chunk_gb', 2.0)
-    n_rst = cfg['model'].get('n_rst', cfg['model'].get('n_know', 25200))
-    n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
-    n_v = cfg['model'].get('n_v', 2600)
-    for name, n in (('n_rst', n_rst), ('n_qk', n_qk), ('n_v', n_v)):
-        if n % mesh_model != 0:
-            raise ValueError(
-                f"{name}={n} must be divisible by mesh_model={mesh_model}")
+    if model_version == full.V4167_MODEL_VERSION:
+        for name in (
+                'n_qk_global', 'n_qk_stage', 'n_qk_local',
+                'n_v_global', 'n_v_stage', 'n_v_local',
+                'n_rst_global', 'n_rst_stage', 'n_rst_local'):
+            value = int(cfg['model'][name])
+            if value % mesh_model != 0:
+                raise ValueError(
+                    f"{name}={value} must be divisible by "
+                    f"mesh_model={mesh_model} for v4167 model-axis GSL "
+                    "sharding.")
+        n_qk_for_chunks = int(cfg['model']['qk_visible_n'])
+        n_v_for_chunks = int(cfg['model']['v_visible_n'])
+        n_rst_for_chunks = int(cfg['model']['rst_visible_n'])
+    else:
+        n_qk_for_chunks = int(cfg['model'].get(
+            'n_qk', cfg['model'].get('n_q', 1580)))
+        n_v_for_chunks = int(cfg['model'].get('n_v', 2600))
+        n_rst_for_chunks = int(cfg['model'].get(
+            'n_rst', cfg['model'].get('n_know', 25200)))
+        for name, value in (
+                ('n_qk', n_qk_for_chunks),
+                ('n_v', n_v_for_chunks),
+                ('n_rst', n_rst_for_chunks)):
+            if value % mesh_model != 0:
+                raise ValueError(
+                    f"{name}={value} must be divisible by "
+                    f"mesh_model={mesh_model}")
 
-    nrst_local = n_rst // mesh_model
-    nqk_local = n_qk // mesh_model
-    nv_local = n_v // mesh_model
+    nqk_local = n_qk_for_chunks // mesh_model
+    nv_local = n_v_for_chunks // mesh_model
+    nrst_local = n_rst_for_chunks // mesh_model
 
     def auto_n_chunks(n, target_gb=2.0):
         full_gb = per_device_batch * max_seq_len * n * 2 / 1e9
@@ -975,6 +1003,7 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
     srw_module = __import__(module_name, fromlist=[
         'make_sharded_srw_minimal',
         'make_sharded_srw_paired_minimal',
+        'create_v4167_tp_sharded_fns',
     ])
     make_single = getattr(srw_module, 'make_sharded_srw_minimal')
     make_paired = getattr(srw_module, 'make_sharded_srw_paired_minimal')
@@ -1005,15 +1034,7 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
         max_chunk_size=attn_qk_max_chunk,
         **_factory_kwargs(make_paired, _srw_pool_kwargs('qk')))
 
-    if is_host0:
-        print(
-            "  shard_map minimal enabled "
-            f"(mesh_model={mesh_model}, QK fused; "
-            f"chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}; "
-            f"max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}; "
-            "analysis kernels=off)")
-
-    return {
+    sharded_fns = {
         'single': sharded_single_rst,
         'attn_v_single': sharded_single_v,
         'rst_single': sharded_single_rst,
@@ -1022,7 +1043,39 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
         'attn_v_single_minimal': sharded_single_v,
         'rst_single_minimal': sharded_single_rst,
         'attn_qk_paired_minimal': sharded_paired_attn_qk,
-    }, (n_chunks_qk, n_chunks_v, n_chunks_rst), (
+    }
+    if model_version == full.V4167_MODEL_VERSION:
+        extra_factory = getattr(srw_module, 'create_v4167_tp_sharded_fns', None)
+        if extra_factory is None:
+            raise RuntimeError(
+                "v4167 module is missing create_v4167_tp_sharded_fns.")
+        v4167_extra_fns = extra_factory(mesh, cfg)
+        sharded_fns.update(v4167_extra_fns)
+        required = (
+            'attn_qk_paired_minimal',
+            'attn_v_single_minimal',
+            'rst_single_minimal',
+            'v4167_router_dense',
+            'v4167_tp_attention_o',
+        )
+        missing = [name for name in required if name not in sharded_fns]
+        if missing:
+            raise RuntimeError(
+                "v4167 minimal sharded_fns missing required entries: "
+                + ", ".join(missing))
+
+    if is_host0:
+        extra_msg = (
+            "; v4167 TP extras=router_dense,attention_o"
+            if model_version == full.V4167_MODEL_VERSION else "")
+        print(
+            "  shard_map minimal enabled "
+            f"(mesh_model={mesh_model}, QK fused; "
+            f"chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}; "
+            f"max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}; "
+            f"analysis kernels=off{extra_msg})")
+
+    return sharded_fns, (n_chunks_qk, n_chunks_v, n_chunks_rst), (
         attn_qk_max_chunk, attn_v_max_chunk, rst_max_chunk)
 
 
@@ -1050,7 +1103,7 @@ def _write_fresh_config_snapshot(checkpoint_dir, cfg, raw_cfg_snapshot,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Minimal DAWN-SRW v4166 JAX trainer')
+        description='Minimal DAWN-SRW v4166/v4167 JAX trainer')
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--from-scratch', action='store_true')
     parser.add_argument('--epochs', type=int, default=None)
@@ -1100,10 +1153,10 @@ def main():
     tcfg = cfg['training']
     model_version_cfg = cfg['model'].get(
         'model_version', full.OFFICIAL_MODEL_VERSION)
-    if model_version_cfg != full.V4166_MODEL_VERSION:
+    if model_version_cfg not in SUPPORTED_MINIMAL_SRW_VERSIONS:
         raise ValueError(
-            "scripts/train_jax_minimal.py is dedicated to "
-            f"{full.V4166_MODEL_VERSION}, "
+            "scripts/train_jax_minimal.py supports only minimal active SRW "
+            f"versions {SUPPORTED_MINIMAL_SRW_VERSIONS}, "
             f"got {model_version_cfg!r}")
 
     tau_init_cfg = full._v4164_tau_init_config(cfg)
@@ -1368,8 +1421,8 @@ def main():
     _stage_barrier("after_build_model")
     if not _model_accepts_minimal_train(model):
         raise RuntimeError(
-            "v4166 model does not expose minimal_train; minimal trainer "
-            "requires the model-level minimal path.")
+            f"{model_version_cfg} model does not expose minimal_train; "
+            "minimal trainer requires the model-level minimal path.")
 
     rng = jax.random.PRNGKey(seed)
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
@@ -1409,28 +1462,39 @@ def main():
             print("\nSelection calibration: computing from fresh init.")
         _stage_log("before_collect_selection_calibration_histograms")
         _stage_barrier("before_collect_selection_calibration_histograms")
-        (hist_counts, seen_tokens, actual_batches,
-         local_calibration_tokens, calibration_process_count) = (
-            full._collect_selection_calibration_histograms(
-                params, train_loader, cfg, selection_calibration_cfg))
+        (
+            local_histograms,
+            local_page_stats,
+            local_seen_tokens,
+            local_actual_batches,
+            local_calibration_tokens,
+            calibration_process_count,
+        ) = full._collect_selection_calibration_histograms(
+            params, train_loader, cfg, selection_calibration_cfg)
         _stage_log("after_collect_selection_calibration_histograms", {
-            "seen_tokens_local": int(seen_tokens),
-            "actual_batches": int(actual_batches),
+            "seen_tokens_local": int(local_seen_tokens),
+            "actual_batches": int(local_actual_batches),
         })
         _stage_barrier("after_collect_selection_calibration_histograms")
         _stage_log("before_aggregate_selection_calibration_histograms")
         _stage_barrier("before_aggregate_selection_calibration_histograms")
-        hist_counts, seen_tokens, actual_batches = (
-            full._aggregate_selection_calibration_histograms(
-                hist_counts, seen_tokens, actual_batches))
+        (
+            calibration_histograms,
+            calibration_page_stats,
+            seen_tokens,
+            actual_calibration_batches,
+        ) = full._aggregate_selection_calibration_histograms(
+            local_histograms, local_page_stats,
+            local_seen_tokens, local_actual_batches)
         _stage_log("after_aggregate_selection_calibration_histograms")
         _stage_barrier("after_aggregate_selection_calibration_histograms")
         selection_json = None
         if is_host0:
             selection_calibration_summary = (
                 full._compute_srw_selection_calibration(
-                    hist_counts, cfg, selection_calibration_cfg,
-                    seen_tokens, actual_batches,
+                    calibration_histograms, cfg, selection_calibration_cfg,
+                    calibration_page_stats, seen_tokens,
+                    actual_calibration_batches,
                     local_calibration_tokens, calibration_process_count))
             selection_json = json.dumps(selection_calibration_summary)
         _stage_log("before_selection_json_broadcast")
@@ -1445,6 +1509,27 @@ def main():
         selection_calibration_summary = json.loads(selection_json)
         params = full._set_srw_quantile_tau_biases(
             params, selection_calibration_summary, model_version_cfg)
+        fixed_tau_materialized = full._materialize_fixed_tau_config(
+            cfg,
+            training_config,
+            selection_calibration_summary,
+            model_version_cfg,
+        )
+        if fixed_tau_materialized:
+            model = full.build_model_from_config(cfg)
+            if is_host0:
+                print(
+                    "v4167 fixed tau materialized from selection calibration: "
+                    f"qk={cfg['model']['tau_init_attn_qk']:.6f} "
+                    f"v={cfg['model']['tau_init_attn_v']:.6f} "
+                    f"rst={cfg['model']['tau_init_rst']:.6f}",
+                    flush=True,
+                )
+            if not _model_accepts_minimal_train(model):
+                raise RuntimeError(
+                    f"{model_version_cfg} model does not expose "
+                    "minimal_train after fixed-tau materialization; minimal "
+                    "trainer requires the model-level minimal path.")
         _stage_log("after_selection_calibration_applied")
         _stage_barrier("after_selection_calibration_applied")
         materialized_updates = (
@@ -1491,6 +1576,22 @@ def main():
             params, calibration_input_ids, cfg, tau_init_cfg)
         params = full._set_srw_quantile_tau_biases(
             params, tau_init_summary, model_version_cfg)
+        fixed_tau_materialized = full._materialize_fixed_tau_config(
+            cfg, training_config, tau_init_summary, model_version_cfg)
+        if fixed_tau_materialized:
+            model = full.build_model_from_config(cfg)
+            if is_host0:
+                print(
+                    "v4167 fixed tau materialized from quantile init: "
+                    f"qk={cfg['model']['tau_init_attn_qk']:.6f} "
+                    f"v={cfg['model']['tau_init_attn_v']:.6f} "
+                    f"rst={cfg['model']['tau_init_rst']:.6f}",
+                    flush=True)
+            if not _model_accepts_minimal_train(model):
+                raise RuntimeError(
+                    f"{model_version_cfg} model does not expose "
+                    "minimal_train after fixed-tau materialization; minimal "
+                    "trainer requires the model-level minimal path.")
         if is_host0:
             for line in full._v4164_tau_init_summary_lines(tau_init_summary):
                 print(line)
@@ -1603,7 +1704,14 @@ def main():
             f"{total_devices} devices, per_device_batch={per_device_batch} ===")
 
     _stage_log("before_shard_params")
-    param_shardings = full.get_param_shardings(params, mesh)
+    if 'model_version' not in inspect.signature(
+            full.get_param_shardings).parameters:
+        raise RuntimeError(
+            "full.get_param_shardings must accept model_version before "
+            "scripts/train_jax_minimal.py can run v4167 minimal training. "
+            "Update scripts/train_jax.py first.")
+    param_shardings = full.get_param_shardings(
+        params, mesh, model_version=model_version_cfg)
     params = full.shard_params_to_mesh(params, param_shardings)
     _stage_log("after_shard_params")
     _stage_barrier("after_shard_params")
