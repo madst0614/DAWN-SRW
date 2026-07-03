@@ -521,55 +521,83 @@ def create_ce_eval_step(model, sharded_fns=None, *, minimal_train: bool = True,
                         execution_prune_eps: float = 0.0,
                         total_training_steps: int = 1,
                         cfg: Optional[Dict[str, Any]] = None):
-    """JIT CE-only or diagnostics eval step used by eval/prune stages."""
+    """Trainer-matched CE eval step used by eval/prune stages."""
     cfg = cfg or {}
     t = cfg.get("training", {})
-    boundary_power = float(t.get("soft_gate_boundary_power_final", 4.0))
-    den_power = float(t.get("admission_den_power", 1.0))
+    train = get_train()
+    soft_gate_t_start = float(t.get("soft_gate_t_start", 1.5))
     soft_gate_t_final = float(t.get("soft_gate_t_final", 0.07))
-    eps = float(execution_prune_eps)
-    minimal = bool(minimal_train)
+    soft_gate_t_hold_frac = float(t.get("soft_gate_t_hold_frac", 0.10))
+    soft_gate_t_anneal_end_frac = float(t.get("soft_gate_t_anneal_end_frac", 0.80))
+    soft_gate_schedule = str(t.get("soft_gate_schedule", "cosine"))
+    soft_gate_t_power = float(t.get("soft_gate_t_power", 4.0))
+    soft_gate_t_gompertz_center = float(t.get("soft_gate_t_gompertz_center", 0.25))
+    soft_gate_t_gompertz_steepness = float(t.get("soft_gate_t_gompertz_steepness", 8.0))
+    pool_schedules = train._training_soft_gate_pool_schedules(
+        t,
+        soft_gate_t_start,
+        soft_gate_t_final,
+        soft_gate_t_hold_frac,
+        soft_gate_t_anneal_end_frac,
+        soft_gate_schedule,
+        soft_gate_t_power,
+        soft_gate_t_gompertz_center,
+        soft_gate_t_gompertz_steepness,
+    )
+    eval_step = train.create_eval_step(
+        model,
+        sharded_fns=sharded_fns,
+        return_dead_stats=bool(return_prune_stats),
+        return_prune_stats=bool(return_prune_stats),
+        execution_prune_eps=float(execution_prune_eps),
+        total_training_steps=int(total_training_steps or 1),
+        soft_gate_schedule_active=True,
+        soft_gate_t_start=soft_gate_t_start,
+        soft_gate_t_final=soft_gate_t_final,
+        soft_gate_t_hold_frac=soft_gate_t_hold_frac,
+        soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
+        soft_gate_schedule=soft_gate_schedule,
+        soft_gate_t_power=soft_gate_t_power,
+        soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
+        soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
+        pool_specific_gate_t=True,
+        soft_gate_pool_schedules=pool_schedules,
+        boundary_power_schedule_active=True,
+        soft_gate_boundary_power_start=float(t.get("soft_gate_boundary_power_start", 3.0)),
+        soft_gate_boundary_power_mid=float(t.get("soft_gate_boundary_power_mid", 3.15)),
+        soft_gate_boundary_power_final=float(t.get("soft_gate_boundary_power_final", 4.0)),
+        soft_gate_boundary_power_start_frac=float(t.get("soft_gate_boundary_power_start_frac", 0.0)),
+        soft_gate_boundary_power_mid_frac=float(t.get("soft_gate_boundary_power_mid_frac", 0.800)),
+        soft_gate_boundary_power_final_frac=float(t.get("soft_gate_boundary_power_final_frac", 0.950)),
+        admission_den_power=float(t.get("admission_den_power", 1.0)),
+    )
 
-    @jax.jit
     def step(params, input_ids, attention_mask, current_step):
-        labels = jnp.where(attention_mask == 1, input_ids, -100)
-        extra_kw = {
-            "analysis": False,
-            "soft_gate_temperature": jnp.float32(soft_gate_t_final),
-            "soft_gate_t_final": jnp.float32(soft_gate_t_final),
-            "soft_gate_T_qk": jnp.float32(soft_gate_t_final),
-            "soft_gate_T_v": jnp.float32(soft_gate_t_final),
-            "soft_gate_T_rst": jnp.float32(soft_gate_t_final),
-            "soft_gate_boundary_power": jnp.float32(boundary_power),
-            "soft_gate_boundary_power_final": jnp.float32(boundary_power),
-            "admission_den_power": jnp.float32(den_power),
-            "execution_prune_eps": jnp.float32(eps),
-            "minimal_train": minimal,
-        }
-        if sharded_fns is not None:
-            extra_kw["sharded_fns"] = sharded_fns
-        result = model.apply(
-            {"params": params},
-            input_ids,
-            labels=labels,
-            attention_mask=attention_mask,
-            deterministic=True,
-            rngs={"dropout": jax.random.PRNGKey(0)},
-            **extra_kw,
-        )
-        base = (
-            result["loss"],
-            result["correct"],
-            result["valid_count"],
-        )
+        ret = eval_step(params, input_ids, attention_mask, current_step)
         if not return_prune_stats:
-            return base
-        return base + (
-            result.get("execution_estimated_compute_frac", jnp.float32(0.0)),
-            result.get("execution_gate_mass_retained", jnp.float32(1.0)),
-            result.get("execution_prune_gate_den_mean", jnp.float32(0.0)),
-            result.get("execution_prune_no_active_frac", jnp.float32(0.0)),
-            result.get("execution_prune_unpruned_gate_den_mean", jnp.float32(0.0)),
+            return ret
+        (
+            loss,
+            correct,
+            valid_count,
+            _attn_dead_count,
+            _rst_dead_count,
+            compute_frac,
+            mass_retained,
+            gate_den,
+            _gate_den_min,
+            no_active,
+            unpruned_den,
+        ) = ret
+        return (
+            loss,
+            correct,
+            valid_count,
+            compute_frac,
+            mass_retained,
+            gate_den,
+            no_active,
+            unpruned_den,
         )
 
     return step

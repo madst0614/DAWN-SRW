@@ -231,7 +231,11 @@ def build_context(args: argparse.Namespace, stages: List[str], store: AnalysisSt
         )
         for line in info_lines:
             print("MODEL " + str(line), flush=True)
-    total_training_steps = int(checkpoint_metadata.get("global_step") or checkpoint_step or 1)
+    steps_per_epoch = int(checkpoint_metadata.get("steps_per_epoch") or 0)
+    num_epochs = int(cfg.get("training", {}).get("num_epochs") or 0)
+    grad_accum = max(1, int(cfg.get("training", {}).get("gradient_accumulation_steps", 1)))
+    planned_steps = (steps_per_epoch // grad_accum) * num_epochs if steps_per_epoch and num_epochs else 0
+    total_training_steps = int(planned_steps or checkpoint_metadata.get("global_step") or checkpoint_step or 1)
     return AnalysisContext(
         args=args,
         store=store,
