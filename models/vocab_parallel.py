@@ -89,7 +89,8 @@ def make_vocab_parallel_cross_entropy(mesh, vocab_size, padded_vocab_size):
             vocab_valid[None, None, :], logits_local, neg_inf)
 
         local_max = jnp.max(logits_local, axis=-1)
-        global_max = jax.lax.pmax(jax.lax.stop_gradient(local_max), "model")
+        global_max = jax.lax.stop_gradient(
+            jax.lax.pmax(jax.lax.stop_gradient(local_max), "model"))
 
         exp_local = jnp.exp(logits_local - global_max[..., None])
         exp_local = jnp.where(vocab_valid[None, None, :], exp_local, 0.0)
@@ -116,7 +117,8 @@ def make_vocab_parallel_cross_entropy(mesh, vocab_size, padded_vocab_size):
         valid_count_local_data = jnp.sum(valid.astype(jnp.int32))
 
         local_pred_val = jnp.max(logits_local, axis=-1)
-        global_pred_val = jax.lax.pmax(jax.lax.stop_gradient(local_pred_val), "model")
+        global_pred_val = jax.lax.stop_gradient(
+            jax.lax.pmax(jax.lax.stop_gradient(local_pred_val), "model"))
         correct_local_data = jnp.sum(
             ((target_logit == global_pred_val) & valid).astype(jnp.int32))
 
