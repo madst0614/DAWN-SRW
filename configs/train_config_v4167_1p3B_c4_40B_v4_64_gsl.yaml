@@ -25,27 +25,27 @@ model:
   router_scope: local
 
   # Parameter-matched pool target:
-  # total operators = 4215 + 13116 + 35223 = 52554
+  # total operators = 4214 + 13116 + 35224 = 52554
   # expected params ~= baseline - 4093
-  n_qk: 4215
+  n_qk: 4214
   n_v: 13116
-  n_rst: 35223
+  n_rst: 35224
 
   # GSL 5/10/85-ish split, n_layers=24, stage_count=8
-  # qk: 215 + 8*53 + 24*149 = 4215
-  n_qk_global: 215
-  n_qk_stage: 53
-  n_qk_local: 149
+  # qk: 214 + 8*50 + 24*150 = 4214
+  n_qk_global: 214
+  n_qk_stage: 50
+  n_qk_local: 150
 
   # v: 668 + 8*164 + 24*464 = 13116
   n_v_global: 668
   n_v_stage: 164
   n_v_local: 464
 
-  # rst: 1775 + 8*440 + 24*1247 = 35223
-  n_rst_global: 1775
+  # rst: 1752 + 8*440 + 24*1248 = 35224
+  n_rst_global: 1752
   n_rst_stage: 440
-  n_rst_local: 1247
+  n_rst_local: 1248
 
   tau_init_min: -0.95
   tau_init_max: 0.95
