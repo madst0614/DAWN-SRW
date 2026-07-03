@@ -7,6 +7,8 @@ TPU_NAME=""
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
 REMOTE_LOG="~/train.log"
+PANE_TARGET="train"
+SOURCE="auto"
 WORKERS="primary"
 TAIL_LINES=160
 FOLLOW=1
@@ -28,6 +30,7 @@ usage() {
         "  --zone ZONE            Default: $ZONE" \
         "  --project PROJECT      Default: $PROJECT" \
         "  --log PATH             Remote log path. Default: $REMOTE_LOG" \
+        "  --target TMUX_TARGET   tmux target for pane output. Default: $PANE_TARGET" \
         "" \
         "Workers:" \
         "  --primary              Auto-detect and follow the JAX primary host (default)" \
@@ -36,6 +39,9 @@ usage() {
         "  --workers LIST|all     Follow comma-separated workers or all" \
         "" \
         "Output:" \
+        "  --file                 Follow the remote log file" \
+        "  --pane                 Follow tmux pane output without requiring ~/train.log" \
+        "  --attach               Attach to the tmux session on the detected primary worker" \
         "  --summary              Show result/progress/error lines only" \
         "  --errors               Show error lines only" \
         "  --grep PATTERN         Custom remote grep -E pattern" \
@@ -56,6 +62,10 @@ while [[ $# -gt 0 ]]; do
         --zone) ZONE="$2"; shift 2 ;;
         --project) PROJECT="$2"; shift 2 ;;
         --log) REMOTE_LOG="$2"; shift 2 ;;
+        --target|--session) PANE_TARGET="$2"; shift 2 ;;
+        --file) SOURCE="file"; shift ;;
+        --pane|--screen) SOURCE="pane"; shift ;;
+        --attach) MODE="attach"; SOURCE="pane"; FOLLOW=0; shift ;;
         --primary) WORKERS="primary"; shift ;;
         --all) WORKERS="all"; shift ;;
         --worker) WORKERS="$2"; shift 2 ;;
@@ -113,12 +123,21 @@ quote_remote() {
 }
 
 remote_log_q="$(quote_remote "$REMOTE_LOG")"
+pane_target_q="$(quote_remote "$PANE_TARGET")"
 filter_q=""
 if [[ -n "$FILTER_PATTERN" ]]; then
     filter_q="$(quote_remote "$FILTER_PATTERN")"
 fi
 
-build_tail_cmd() {
+filter_range_cmd() {
+    if [[ -n "$FILTER_PATTERN" ]]; then
+        printf 'grep -E %s || true' "$filter_q"
+    else
+        printf 'cat'
+    fi
+}
+
+build_file_tail_cmd() {
     local cmd
     if [[ "$FOLLOW" -eq 1 ]]; then
         cmd="tail -n $TAIL_LINES -F $remote_log_q"
@@ -135,6 +154,69 @@ build_tail_cmd() {
     printf '%s' "$cmd"
 }
 
+build_pane_tail_cmd() {
+    local emit_filter
+    emit_filter="$(filter_range_cmd)"
+    if [[ "$FOLLOW" -eq 0 ]]; then
+        printf 'tmux capture-pane -t %s -pS - 2>/dev/null | tail -n %s | %s' \
+            "$pane_target_q" "$TAIL_LINES" "$emit_filter"
+        return
+    fi
+    printf '%s' "\
+tmp=\"/tmp/watch_tpu_pane_${PANE_TARGET//[^A-Za-z0-9_]/_}.\${USER:-user}.log\"
+last=0
+echo \"[watch] source=tmux-pane target=$PANE_TARGET tail=$TAIL_LINES\"
+while true; do
+  if ! tmux has-session -t $pane_target_q 2>/dev/null; then
+    echo \"[watch] waiting for tmux target $PANE_TARGET\"
+    sleep 2
+    continue
+  fi
+  tmux capture-pane -t $pane_target_q -pS - > \"\$tmp\" 2>/dev/null || { sleep 2; continue; }
+  total=\$(wc -l < \"\$tmp\" | tr -d ' ')
+  if [ \"\${total:-0}\" -le 0 ]; then
+    sleep 2
+    continue
+  fi
+  if [ \"\$last\" -eq 0 ]; then
+    start=\$((total - $TAIL_LINES + 1))
+    [ \"\$start\" -lt 1 ] && start=1
+    sed -n \"\${start},\${total}p\" \"\$tmp\" | $emit_filter
+  elif [ \"\$total\" -gt \"\$last\" ]; then
+    start=\$((last + 1))
+    sed -n \"\${start},\${total}p\" \"\$tmp\" | $emit_filter
+  elif [ \"\$total\" -lt \"\$last\" ]; then
+    echo \"[watch] pane history reset; showing last $TAIL_LINES lines\"
+    start=\$((total - $TAIL_LINES + 1))
+    [ \"\$start\" -lt 1 ] && start=1
+    sed -n \"\${start},\${total}p\" \"\$tmp\" | $emit_filter
+  fi
+  last=\"\$total\"
+  sleep 2
+done"
+}
+
+build_auto_tail_cmd() {
+    local file_cmd pane_cmd
+    file_cmd="$(build_file_tail_cmd)"
+    pane_cmd="$(build_pane_tail_cmd)"
+    printf 'if [ -r %s ]; then echo "[watch] source=file log=%s"; %s; else echo "[watch] source=tmux-pane because log file is missing: %s"; %s; fi' \
+        "$remote_log_q" "$REMOTE_LOG" "$file_cmd" "$REMOTE_LOG" "$pane_cmd"
+}
+
+build_tail_cmd() {
+    case "$SOURCE" in
+        file) build_file_tail_cmd ;;
+        pane) build_pane_tail_cmd ;;
+        auto) build_auto_tail_cmd ;;
+        *) echo "ERROR: unknown source $SOURCE" >&2; exit 1 ;;
+    esac
+}
+
+build_attach_cmd() {
+    printf 'tmux attach -t %s' "$pane_target_q"
+}
+
 build_status_cmd() {
     printf '%s\n' \
         'echo "HOST=$(hostname) DATE=$(date -Is)"' \
@@ -143,7 +225,9 @@ build_status_cmd() {
         'echo "PROCS:"' \
         'pgrep -af "train_jax|train_jax_minimal|analyze_dawn_srw_v4166" | head -n 8 || true' \
         'echo "LAST_LOG:"' \
-        "tail -n 5 $remote_log_q 2>/dev/null || echo \"no log at $REMOTE_LOG\""
+        "tail -n 5 $remote_log_q 2>/dev/null || echo \"no log at $REMOTE_LOG\"" \
+        'echo "PANE:"' \
+        "tmux capture-pane -t $pane_target_q -p -S -20 2>/dev/null || echo \"no tmux target $PANE_TARGET\""
 }
 
 run_worker_command() {
@@ -159,7 +243,7 @@ run_worker_command() {
 detect_primary_worker() {
     local attempt worker out cmd pattern_q
     pattern_q="$(quote_remote "$PRIMARY_DETECT_PATTERN")"
-    cmd="tail -n 5000 $remote_log_q 2>/dev/null | grep -E $pattern_q | tail -n 1 || true"
+    cmd="{ if [ -r $remote_log_q ]; then tail -n 5000 $remote_log_q; fi; tmux capture-pane -t $pane_target_q -pS - 2>/dev/null || true; } | grep -E $pattern_q | tail -n 1 || true"
     for attempt in $(seq 1 "$PRIMARY_DETECT_ATTEMPTS"); do
         for worker in $(seq 0 $((worker_count - 1))); do
             out="$(run_worker_command "$worker" "$cmd" 2>/dev/null || true)"
@@ -201,6 +285,8 @@ echo "  TPU:     $TPU_NAME"
 echo "  Project: $PROJECT"
 echo "  Zone:    $ZONE"
 echo "  Log:     $REMOTE_LOG"
+echo "  Source:  $SOURCE"
+echo "  Tmux:    $PANE_TARGET"
 echo "  Workers: ${TARGET_WORKERS[*]} (detected=$worker_count)"
 if [[ -n "$PRIMARY_WORKER" ]]; then
     echo "  Primary: gcloud worker $PRIMARY_WORKER"
@@ -216,6 +302,15 @@ if [[ "$MODE" == "status" ]]; then
         echo "===== worker $worker ====="
         run_worker_command "$worker" "$status_cmd" || echo "FAILED worker $worker"
     done
+    exit 0
+fi
+
+if [[ "$MODE" == "attach" ]]; then
+    if [[ "${#TARGET_WORKERS[@]}" -ne 1 ]]; then
+        echo "ERROR: --attach needs a single detected worker. Use --worker N --attach or retry after primary is detectable." >&2
+        exit 1
+    fi
+    run_worker_command "${TARGET_WORKERS[0]}" "$(build_attach_cmd)"
     exit 0
 fi
 

@@ -3040,6 +3040,15 @@ def _model_accepts_admission_den_power(model):
         return False
 
 
+def _model_accepts_minimal_train(model):
+    """Return True if model.__call__ accepts the minimal train path switch."""
+    import inspect as _inspect
+    try:
+        return 'minimal_train' in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _scalar0(x):
     return jnp.asarray(x, dtype=jnp.float32).reshape(())
 
@@ -3847,8 +3856,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
+    _pass_minimal_train_kw = _model_accepts_minimal_train(model)
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
+    _use_minimal_train_path = (
+        str(_model_version) == V4168_MODEL_VERSION
+        and _pass_minimal_train_kw)
     _is_baseline_model = bool(is_baseline) or _is_baseline_version(_model_version)
     _is_soft_direct_tau = _is_active_srw_version(_model_version)
     _is_v4166_model = _is_rw_key_srw_version(_model_version)
@@ -3948,6 +3961,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 extra_kw['sharded_fns'] = sharded_fns
             if _pass_analysis_kw:
                 extra_kw['analysis'] = False
+            if _use_minimal_train_path:
+                extra_kw['minimal_train'] = True
             if _soft_gate_runtime_enabled:
                 soft_gate_T_qk = _scheduled_from_config(
                     step, _total_training_steps, _soft_gate_pool_cfg['qk'])
@@ -6129,14 +6144,18 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
+    _pass_minimal_train_kw = _model_accepts_minimal_train(model)
     _execution_prune_eps = jnp.float32(execution_prune_eps)
     _return_prune_stats = bool(return_prune_stats)
+    _model_version = getattr(
+        model, '__version__', getattr(type(model), '__version__', ''))
+    _use_minimal_train_path = (
+        str(_model_version) == V4168_MODEL_VERSION
+        and _pass_minimal_train_kw)
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
-        and _is_active_srw_version(
-            getattr(model, '__version__', getattr(type(model), '__version__', ''))))
-    _is_boundary_power_model = _is_active_srw_version(
-        getattr(model, '__version__', getattr(type(model), '__version__', '')))
+        and _is_active_srw_version(_model_version))
+    _is_boundary_power_model = _is_active_srw_version(_model_version)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -6188,6 +6207,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             extra_kw['sharded_fns'] = sharded_fns
         if _pass_analysis_kw:
             extra_kw['analysis'] = False
+        if _use_minimal_train_path:
+            extra_kw['minimal_train'] = True
         if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
             soft_gate_T_qk = _scheduled_from_config(
                 step, _total_training_steps, _soft_gate_pool_cfg['qk'])

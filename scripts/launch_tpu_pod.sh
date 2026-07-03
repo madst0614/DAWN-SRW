@@ -255,6 +255,8 @@ fi
 echo ""
 echo "Launch complete. Training is running in tmux session 'train' on all workers."
 echo "  Primary log:     bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT"
+echo "  Primary pane:    bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --pane"
+echo "  Attach primary:  bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --attach"
 echo "  Primary summary: bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --summary"
 echo "  All summary:     bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --all --summary"
 echo "  Literal worker 0 log: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=0 --command='tail -f ~/train.log'"

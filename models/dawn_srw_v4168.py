@@ -4997,6 +4997,13 @@ class DAWN_SRW_V4168(nn.Module):
             'd_route': self.d_route,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
+            'qk_block_size': self.qk_block_size,
+            'v_block_size': self.v_block_size,
+            'rst_block_size': self.rst_block_size,
+            'qk_top_blocks': self.qk_top_blocks,
+            'v_top_blocks': self.v_top_blocks,
+            'rst_top_blocks': self.rst_top_blocks,
+            'block_margin': self.block_margin,
         }
         return cfg
 
