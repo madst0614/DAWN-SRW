@@ -14,9 +14,10 @@ Implemented concepts:
 - tau movement controlled by optimizer-side tau_lr_mult
 - train-time effective gate statistics
 - validation-time execution pruning through execution_prune_eps
-- v4168 hardware-sector execution uses an exact global-sector-topK,
-  replicated-SPMD kernel: every model shard carries topK sector slots, masks
-  remote sector ids locally, and psums useful local fixed-size sector tiles.
+- v4168 hardware-sector execution uses exact global-sector-topK selection and
+  owner-local sector buckets: each shard batches all local token/sector pairs
+  by physical sector tile, with the older token-gather path retained as an
+  exact overflow/debug fallback.
 """
 
 
@@ -3007,45 +3008,68 @@ def _apply_pool_permutations_to_params_and_opt_state(params, opt_state,
     return new_params, new_opt_state
 
 
-def hardware_sector_static_metrics(model_config, model_axis_size=1):
-    """Cheap exact-global-sector-topK replicated-SPMD cost metrics."""
+def hardware_sector_static_metrics(model_config, model_axis_size=1,
+                                   batch_size=None, max_seq_len=None,
+                                   data_axis_size=1,
+                                   bucketed_execution_enabled=True):
+    """Cheap exact-global-sector-topK bucketed execution cost metrics."""
     metrics = {}
     model_axis_size = max(1, int(model_axis_size))
+    data_axis_size = max(1, int(data_axis_size))
+    bucketed_execution_enabled = bool(bucketed_execution_enabled)
+    if batch_size is not None and max_seq_len is not None:
+        local_batch = max(1, int(batch_size) // data_axis_size)
+        token_pair_span = max(1, local_batch * int(max_seq_len))
+    else:
+        token_pair_span = None
     for pool, _op_key, _read_key, _write_key, block_key, top_key in (
             _HARDWARE_REPACK_POOLS):
         if pool == 'attn_qk':
             n_key = 'n_qk'
+            route_count = 2
         elif pool == 'attn_v':
             n_key = 'n_v'
+            route_count = 1
         else:
             n_key = 'n_rst'
+            route_count = 1
         n_ops = int(model_config.get(n_key, model_config.get('n_know', 0)))
         sector_size = int(model_config.get(block_key, 256))
         topk = int(model_config.get(top_key, 2))
-        n_sectors = max(1, (n_ops + sector_size - 1) // sector_size)
+        n_local_ops = max(
+            1, (n_ops + model_axis_size - 1) // model_axis_size)
+        n_local_sectors = max(
+            1, (n_local_ops + sector_size - 1) // sector_size)
+        n_sectors = n_local_sectors * model_axis_size
         topk_eff = min(max(1, topk), n_sectors)
         semantic_selected = topk_eff * sector_size
-        spmd_tile_slots = model_axis_size * semantic_selected
+        token_gather_spmd_slots = model_axis_size * semantic_selected
         dense_ops = max(1, n_ops)
         valid_est = min(n_ops, semantic_selected)
         metrics[f'sector/{pool}/topk'] = float(topk_eff)
         metrics[f'sector/{pool}/sector_size'] = float(sector_size)
         metrics[f'sector/{pool}/num_global_sectors'] = float(n_sectors)
+        metrics[f'sector/{pool}/num_local_sectors'] = float(n_local_sectors)
         metrics[f'sector/{pool}/model_axis_size'] = float(model_axis_size)
+        metrics[f'sector/{pool}/route_count'] = float(route_count)
         metrics[f'sector/{pool}/semantic_selected_ops_per_token'] = float(
             semantic_selected)
+        metrics[f'sector/{pool}/token_gather_spmd_slots_per_token'] = float(
+            token_gather_spmd_slots)
         metrics[f'sector/{pool}/spmd_tile_slots_per_token'] = float(
-            spmd_tile_slots)
+            token_gather_spmd_slots)
         metrics[f'sector/{pool}/useful_local_tile_slots_per_token'] = float(
             semantic_selected)
         metrics[f'sector/{pool}/remote_dummy_tile_slot_frac'] = (
-            1.0 - (float(semantic_selected) / float(max(spmd_tile_slots, 1))))
+            1.0 - (
+                float(semantic_selected)
+                / float(max(token_gather_spmd_slots, 1))))
         metrics[f'sector/{pool}/estimated_dense_ops_per_token'] = float(
             n_ops)
         metrics[f'sector/{pool}/semantic_compute_frac_vs_dense'] = float(
             semantic_selected) / float(dense_ops)
         metrics[f'sector/{pool}/spmd_compute_frac_vs_dense'] = float(
-            spmd_tile_slots) / float(dense_ops)
+            token_gather_spmd_slots) / float(dense_ops)
         metrics[f'sector/{pool}/selected_valid_ops_mean'] = float(valid_est)
         metrics[f'sector/{pool}/selected_sector_count_mean'] = float(topk_eff)
         metrics[f'sector/{pool}/useful_local_sector_slots_mean'] = float(
@@ -3054,6 +3078,33 @@ def hardware_sector_static_metrics(model_config, model_axis_size=1):
             float(topk_eff) / float(model_axis_size))
         metrics[f'sector/{pool}/remote_dummy_sector_slot_frac'] = (
             1.0 - (float(topk_eff) / float(max(model_axis_size * topk_eff, 1))))
+        metrics[f'sector/{pool}/bucketed_execution_enabled'] = float(
+            bucketed_execution_enabled)
+        metrics[f'sector/{pool}/bucket_fallback_used'] = 0.0
+        metrics[f'sector/{pool}/bucket_overflow_count'] = 0.0
+        metrics[f'sector/{pool}/bucket_overflow_frac'] = 0.0
+        if token_pair_span is not None:
+            pair_span = token_pair_span * route_count
+            bucket_capacity, bucket_avg = _v4168_sector_bucket_capacity(
+                pair_span, topk_eff, n_sectors)
+            bucket_total_slots = n_local_sectors * bucket_capacity
+            bucket_expected_used = (
+                float(pair_span * topk_eff) / float(model_axis_size))
+            bucket_fill = (
+                bucket_expected_used / float(max(bucket_total_slots, 1)))
+            metrics[f'sector/{pool}/bucket_pair_span'] = float(pair_span)
+            metrics[f'sector/{pool}/bucket_avg_expected'] = float(bucket_avg)
+            metrics[f'sector/{pool}/bucket_capacity'] = float(bucket_capacity)
+            metrics[f'sector/{pool}/bucket_total_slots'] = float(
+                bucket_total_slots)
+            metrics[f'sector/{pool}/bucket_used_slots'] = float(
+                bucket_expected_used)
+            metrics[f'sector/{pool}/bucket_expected_used_slots'] = float(
+                bucket_expected_used)
+            metrics[f'sector/{pool}/bucket_fill_frac'] = float(bucket_fill)
+            metrics[f'sector/{pool}/bucket_max_fill'] = float(bucket_capacity)
+            metrics[f'sector/{pool}/bucket_mean_fill'] = float(
+                bucket_expected_used / float(max(n_local_sectors, 1)))
     return metrics
 
 
@@ -3189,7 +3240,9 @@ def maybe_hardware_repack(params, opt_state, model_config, mesh, step, config):
     metrics['repack/step'] = float(int(step))
     metrics['repack/drift_snapshot_refreshed'] = 0.0
     metrics.update(hardware_sector_static_metrics(
-        model_config, model_axis_size=model_axis_size))
+        model_config, model_axis_size=model_axis_size,
+        bucketed_execution_enabled=bool(
+            config.get('hardware_sector_execution_enabled', False))))
     if total_moved == 0.0:
         return params, opt_state, metrics
 
@@ -3210,6 +3263,84 @@ def _v4168_block_sparse_config(block_size, top_blocks):
 
 _V4168_BUCKET_CHUNK_SIZE = 512
 _V4168_EXECUTION_PAIR_PRUNE_EPS = 1.0e-6
+_V4168_SECTOR_BUCKET_CAPACITY_MULT = 4.0
+_V4168_SECTOR_BUCKET_MIN_CAPACITY = 32
+_V4168_SECTOR_BUCKET_ROUND_POWER_OF_TWO = True
+
+
+def _v4168_next_power_of_two(x):
+    x = max(1, int(x))
+    return 1 << (x - 1).bit_length()
+
+
+def _v4168_sector_bucket_capacity(pair_span, topk, global_n_sectors):
+    """Static sector-bucket capacity policy for token/route-sector pairs."""
+    pair_span = max(1, int(pair_span))
+    topk = max(1, int(topk))
+    global_n_sectors = max(1, int(global_n_sectors))
+    selected_pairs = pair_span * topk
+    avg_pairs = int(math.ceil(float(selected_pairs) / float(global_n_sectors)))
+    capacity = max(
+        int(_V4168_SECTOR_BUCKET_MIN_CAPACITY),
+        int(math.ceil(
+            float(avg_pairs) * float(_V4168_SECTOR_BUCKET_CAPACITY_MULT))),
+    )
+    if _V4168_SECTOR_BUCKET_ROUND_POWER_OF_TWO:
+        capacity = _v4168_next_power_of_two(capacity)
+    capacity = min(max(1, capacity), selected_pairs)
+    return capacity, avg_pairs
+
+
+def _v4168_build_sector_buckets(local_sector_ids, selected_here, pair_span,
+                                topk, n_local_sectors, bucket_capacity):
+    """Build fixed-size local-sector buckets from exact selected sectors."""
+    pair_span = int(pair_span)
+    topk = int(topk)
+    n_local_sectors = int(n_local_sectors)
+    bucket_capacity = int(bucket_capacity)
+    flat_count = pair_span * topk
+
+    flat_pair_ids = (
+        jnp.arange(flat_count, dtype=jnp.int32)
+        // jnp.asarray(topk, dtype=jnp.int32))
+    flat_sector = local_sector_ids.reshape(flat_count).astype(jnp.int32)
+    flat_selected = selected_here.reshape(flat_count).astype(jnp.bool_)
+
+    sector_ids = jnp.arange(n_local_sectors, dtype=jnp.int32)
+    sector_onehot = jnp.logical_and(
+        flat_selected[:, None],
+        flat_sector[:, None] == sector_ids[None, :])
+    rank_by_sector = jnp.cumsum(
+        sector_onehot.astype(jnp.int32), axis=0) - 1
+    rank = jnp.sum(
+        jnp.where(sector_onehot, rank_by_sector, 0), axis=1).astype(jnp.int32)
+    in_capacity = jnp.logical_and(
+        flat_selected,
+        rank < jnp.asarray(bucket_capacity, dtype=jnp.int32))
+    overflow = jnp.logical_and(flat_selected, jnp.logical_not(in_capacity))
+
+    safe_sector = jnp.where(
+        in_capacity, flat_sector,
+        jnp.asarray(n_local_sectors, dtype=jnp.int32))
+    safe_rank = jnp.where(
+        in_capacity, rank,
+        jnp.asarray(bucket_capacity, dtype=jnp.int32))
+    pair_buckets = jnp.zeros(
+        (n_local_sectors, bucket_capacity), dtype=jnp.int32).at[
+            safe_sector, safe_rank
+        ].set(flat_pair_ids, mode='drop')
+    bucket_valid = jnp.zeros(
+        (n_local_sectors, bucket_capacity), dtype=jnp.bool_).at[
+            safe_sector, safe_rank
+        ].set(in_capacity, mode='drop')
+    bucket_fill = bucket_valid.astype(jnp.int32).sum(axis=1)
+    return (
+        pair_buckets,
+        bucket_valid,
+        overflow.astype(jnp.int32).sum(),
+        bucket_fill.max(),
+        bucket_fill.astype(jnp.float32).mean(),
+    )
 
 
 def _v4168_block_execution_upper_bound(block_score_ub, tau, boundary_scale,
@@ -3777,12 +3908,13 @@ def make_sharded_srw_sector_topk_minimal(
         block_size=256,
         top_blocks=2,
         block_margin=0.0):
-    """Create exact_global_sector_topk_replicated_spmd single-route SRW.
+    """Create exact token-gather sector-topK fallback single-route SRW.
 
     This is semantically exact global sector topK: local sector centers are
     all-gathered across the model axis, global topK sector ids are selected per
     token, and each model shard masks out selected sectors it does not own.
-    The shape cost is replicated across model shards; it is not owner-routed.
+    The shape cost is token-centric and dynamically gathers sector tiles, so it
+    is retained as a correctness/debug fallback for the bucketed path.
     """
     del max_chunk_size, dead_exposure_target, block_margin
     _sector_size, _top_sectors = _v4168_block_sparse_config(
@@ -3934,11 +4066,12 @@ def make_sharded_srw_paired_sector_topk_minimal(
         block_size=256,
         top_blocks=2,
         block_margin=0.0):
-    """Create exact_global_sector_topk_replicated_spmd paired Q/K SRW.
+    """Create exact token-gather sector-topK fallback paired Q/K SRW.
 
     This has the same exact global topK semantics and replicated SPMD shape
     cost as make_sharded_srw_sector_topk_minimal, with route-local Q/K
-    denominators and outputs preserved.
+    denominators and outputs preserved. It is retained as a correctness/debug
+    fallback for the bucketed path.
     """
     del max_chunk_size, dead_exposure_target, block_margin
     _sector_size, _top_sectors = _v4168_block_sparse_config(
@@ -4088,6 +4221,462 @@ def make_sharded_srw_paired_sector_topk_minimal(
     return fused_gate_srw_paired_sector_topk_minimal
 
 
+make_sharded_srw_sector_topk_token_gather_minimal_fallback = (
+    make_sharded_srw_sector_topk_minimal)
+make_sharded_srw_paired_sector_topk_token_gather_minimal_fallback = (
+    make_sharded_srw_paired_sector_topk_minimal)
+
+
+def make_sharded_srw_sector_bucketed_minimal(
+        mesh, max_chunk_size=2048,
+        dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=1.0,
+        admission_den_grad_scale=1.0,
+        block_size=256,
+        top_blocks=2,
+        block_margin=0.0,
+        _debug_bucket_capacity_override=None):
+    """Create exact global-sector-topK owner-local bucketed single-route SRW."""
+    del max_chunk_size, dead_exposure_target, block_margin
+    _sector_size, _top_sectors = _v4168_block_sparse_config(
+        block_size, top_blocks)
+    _token_gather_chunk_size = min(64, int(_V4168_BUCKET_CHUNK_SIZE))
+    _model_axis_size = int(mesh.shape['model'])
+    _soft_gate_effective_active_eps = jnp.float32(
+        soft_gate_effective_active_eps)
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+    _admission_den_grad_scale = jnp.clip(
+        jnp.asarray(admission_den_grad_scale, dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0))
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('model', None),
+                       P(), P(), P(), P(), P()),
+             out_specs=P('data', None, None),
+             check_rep=False)
+    def fused_gate_srw_sector_bucketed_minimal(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps):
+        del soft_gate_t_final, soft_gate_boundary_power_final
+        B, S, D = x.shape
+        (op_key_blocks, read_blocks, write_blocks, valid_blocks,
+         sector_center, n_sectors) = _v4168_sector_topk_blocks(
+            op_key_local, read_local, write_local, _sector_size)
+        n_local_sectors = int(n_sectors)
+        topk = min(_top_sectors, n_local_sectors * _model_axis_size)
+        global_n_sectors = n_local_sectors * _model_axis_size
+        all_sector_center = jax.lax.all_gather(
+            sector_center, 'model', axis=0, tiled=True)
+        local_sector_offset = (
+            jax.lax.axis_index('model')
+            * jnp.asarray(n_local_sectors, jnp.int32))
+
+        T = int(B) * int(S)
+        max_token_chunks = max(
+            1, (T + _token_gather_chunk_size - 1)
+            // _token_gather_chunk_size)
+        token_pos = jnp.arange(T, dtype=jnp.int32)
+        flat_x_bf = x.reshape(T, D).astype(jnp.bfloat16)
+        h_unit_bf = _forward_unit_direction(
+            h.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        flat_h_bf = h_unit_bf.reshape(T, h_unit_bf.shape[-1])
+        tau = _tau_from_param(raw_tau)
+        flat_tau = tau.reshape(T, 1)
+
+        sector_scores = (
+            flat_h_bf @ all_sector_center.T
+        ).astype(jnp.float32)
+        _top_scores, top_sector_ids = jax.lax.top_k(sector_scores, topk)
+        del _top_scores
+
+        local_sector_ids = top_sector_ids - local_sector_offset
+        selected_here = jnp.logical_and(
+            local_sector_ids >= 0,
+            local_sector_ids < n_local_sectors)
+        if _debug_bucket_capacity_override is None:
+            bucket_capacity, _avg_pairs_per_sector = (
+                _v4168_sector_bucket_capacity(T, topk, global_n_sectors))
+        else:
+            bucket_capacity = max(1, int(_debug_bucket_capacity_override))
+        (sector_token_ids, sector_bucket_valid, overflow_count,
+         _bucket_max_fill, _bucket_mean_fill) = _v4168_build_sector_buckets(
+            local_sector_ids, selected_here, T, topk, n_local_sectors,
+            bucket_capacity)
+        global_overflow_count = jax.lax.psum(overflow_count, 'model')
+
+        def angular_compose_parts(rho, tau_b, valid_mask):
+            _, admission, _drive, execution_weight, _ = _compute_admission_drive(
+                rho, tau_b, soft_gate_temperature,
+                boundary_power=soft_gate_boundary_power,
+                effective_active_eps=_soft_gate_effective_active_eps,
+                execution_prune_eps=execution_prune_eps)
+            admission = jnp.where(valid_mask, admission, 0.0)
+            execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
+            return admission, execution_weight
+
+        def finish(flat_raw_out, flat_den_cost):
+            raw_out = flat_raw_out.reshape(B, S, D)
+            total_den_cost = flat_den_cost.reshape(B, S, 1)
+            global_raw_out = jax.lax.psum(raw_out, 'model')
+            global_den_cost = jax.lax.psum(total_den_cost, 'model')
+            admission_den_base = jnp.maximum(global_den_cost, 1.0)
+            admission_den_forward = jnp.power(
+                admission_den_base, _admission_den_power)
+            admission_den_sg = jax.lax.stop_gradient(admission_den_forward)
+            admission_den = (
+                admission_den_sg
+                + _admission_den_grad_scale
+                * (admission_den_forward - admission_den_sg))
+            return (global_raw_out / admission_den).astype(jnp.float32)
+
+        def bucket_execute(_):
+            @jax.checkpoint
+            def sector_step(carry, sector_i):
+                flat_raw_out, flat_den_cost = carry
+                token_ids = sector_token_ids[sector_i]
+                valid_t = sector_bucket_valid[sector_i]
+                op_key_b = op_key_blocks[sector_i]
+                read_b = read_blocks[sector_i]
+                write_b = write_blocks[sector_i]
+                valid_ops = valid_blocks[sector_i]
+
+                x_b = flat_x_bf[token_ids]
+                h_b = flat_h_bf[token_ids]
+                tau_b = flat_tau[token_ids]
+                valid_mask = jnp.logical_and(
+                    valid_t[:, None], valid_ops[None, :])
+
+                rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
+                rho_compute = jnp.where(
+                    valid_ops[None, :], rho_raw, tau_b)
+                admission, execution_weight = angular_compose_parts(
+                    rho_compute, tau_b, valid_mask)
+                xr = (x_b @ read_b.T).astype(jnp.float32)
+                weighted = execution_weight * xr
+                out_b = (weighted.astype(jnp.bfloat16) @ write_b).astype(
+                    jnp.float32)
+                den_b = admission.sum(axis=-1, keepdims=True)
+                flat_raw_out = flat_raw_out.at[token_ids].add(
+                    out_b, mode='drop')
+                flat_den_cost = flat_den_cost.at[token_ids].add(
+                    den_b, mode='drop')
+                return (flat_raw_out, flat_den_cost), None
+
+            (flat_raw_out, flat_den_cost), _ = jax.lax.scan(
+                sector_step,
+                (jnp.zeros((T, D), dtype=jnp.float32),
+                 jnp.zeros((T, 1), dtype=jnp.float32)),
+                jnp.arange(n_local_sectors, dtype=jnp.int32))
+            return finish(flat_raw_out, flat_den_cost)
+
+        def token_gather_execute(_):
+            @jax.checkpoint
+            def token_chunk_step(carry, chunk_i):
+                flat_raw_out, flat_den_cost = carry
+                start = chunk_i * _token_gather_chunk_size
+                offsets = start + jnp.arange(
+                    _token_gather_chunk_size, dtype=jnp.int32)
+                valid_tokens = offsets < T
+                safe_offsets = jnp.minimum(offsets, T - 1)
+                token_ids = jnp.where(valid_tokens, token_pos[safe_offsets], 0)
+
+                x_b = flat_x_bf[token_ids]
+                h_b = flat_h_bf[token_ids]
+                tau_b = flat_tau[token_ids]
+                sector_ids = top_sector_ids[token_ids]
+                chunk_local_sector_ids = sector_ids - local_sector_offset
+                chunk_selected_here = jnp.logical_and(
+                    chunk_local_sector_ids >= 0,
+                    chunk_local_sector_ids < n_local_sectors)
+                safe_sector_ids = jnp.clip(
+                    chunk_local_sector_ids, 0,
+                    n_local_sectors - 1).astype(jnp.int32)
+                op_key_b = op_key_blocks[safe_sector_ids]
+                read_b = read_blocks[safe_sector_ids]
+                write_b = write_blocks[safe_sector_ids]
+                valid_ops = jnp.logical_and(
+                    valid_blocks[safe_sector_ids],
+                    chunk_selected_here[:, :, None])
+                valid_mask = jnp.logical_and(
+                    valid_tokens[:, None, None], valid_ops)
+
+                rho_raw = jnp.einsum(
+                    'cd,cknd->ckn', h_b, op_key_b).astype(jnp.float32)
+                rho_compute = jnp.where(valid_ops, rho_raw, tau_b[:, None, :])
+                admission, execution_weight = angular_compose_parts(
+                    rho_compute, tau_b[:, None, :], valid_mask)
+                xr = jnp.einsum(
+                    'cd,cknd->ckn', x_b, read_b).astype(jnp.float32)
+                weighted = execution_weight * xr
+                out_b = jnp.einsum(
+                    'ckn,cknd->cd',
+                    weighted.astype(jnp.bfloat16),
+                    write_b).astype(jnp.float32)
+                den_b = admission.sum(axis=(1, 2), keepdims=False)[:, None]
+                flat_raw_out = flat_raw_out.at[token_ids].add(
+                    out_b, mode='drop')
+                flat_den_cost = flat_den_cost.at[token_ids].add(
+                    den_b, mode='drop')
+                return (flat_raw_out, flat_den_cost), None
+
+            (flat_raw_out, flat_den_cost), _ = jax.lax.scan(
+                token_chunk_step,
+                (jnp.zeros((T, D), dtype=jnp.float32),
+                 jnp.zeros((T, 1), dtype=jnp.float32)),
+                jnp.arange(max_token_chunks, dtype=jnp.int32))
+            return finish(flat_raw_out, flat_den_cost)
+
+        return jax.lax.cond(
+            global_overflow_count > 0,
+            token_gather_execute,
+            bucket_execute,
+            operand=None)
+
+    return fused_gate_srw_sector_bucketed_minimal
+
+
+def make_sharded_srw_paired_sector_bucketed_minimal(
+        mesh, max_chunk_size=2048,
+        dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=1.0,
+        admission_den_grad_scale=1.0,
+        block_size=256,
+        top_blocks=2,
+        block_margin=0.0,
+        _debug_bucket_capacity_override=None):
+    """Create exact global-sector-topK owner-local bucketed paired Q/K SRW."""
+    del max_chunk_size, dead_exposure_target, block_margin
+    _sector_size, _top_sectors = _v4168_block_sparse_config(
+        block_size, top_blocks)
+    _token_gather_chunk_size = min(64, int(_V4168_BUCKET_CHUNK_SIZE))
+    _model_axis_size = int(mesh.shape['model'])
+    _soft_gate_effective_active_eps = jnp.float32(
+        soft_gate_effective_active_eps)
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+    _admission_den_grad_scale = jnp.clip(
+        jnp.asarray(admission_den_grad_scale, dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0))
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),
+                       P('data', None, None, None),
+                       P('model', None),
+                       P('data', None, None, None),
+                       P('model', None),
+                       P('model', None),
+                       P(), P(), P(), P(), P()),
+             out_specs=P('data', None, None, None),
+             check_rep=False)
+    def fused_gate_srw_paired_sector_bucketed_minimal(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps):
+        del soft_gate_t_final, soft_gate_boundary_power_final
+        B, S, D = x.shape
+        R = int(h.shape[2])
+        (op_key_blocks, read_blocks, write_blocks, valid_blocks,
+         sector_center, n_sectors) = _v4168_sector_topk_blocks(
+            op_key_local, read_local, write_local, _sector_size)
+        n_local_sectors = int(n_sectors)
+        topk = min(_top_sectors, n_local_sectors * _model_axis_size)
+        global_n_sectors = n_local_sectors * _model_axis_size
+        all_sector_center = jax.lax.all_gather(
+            sector_center, 'model', axis=0, tiled=True)
+        local_sector_offset = (
+            jax.lax.axis_index('model')
+            * jnp.asarray(n_local_sectors, jnp.int32))
+
+        T = int(B) * int(S)
+        pair_span = int(R) * int(T)
+        max_pair_chunks = max(
+            1, (pair_span + _token_gather_chunk_size - 1)
+            // _token_gather_chunk_size)
+        pair_pos = jnp.arange(pair_span, dtype=jnp.int32)
+        flat_x_bf = x.reshape(T, D).astype(jnp.bfloat16)
+        h_unit_bf = _forward_unit_direction(
+            h.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        flat_h_pair_bf = jnp.transpose(
+            h_unit_bf.reshape(T, R, h_unit_bf.shape[-1]),
+            (1, 0, 2)).reshape(pair_span, h_unit_bf.shape[-1])
+        tau = _tau_from_param(raw_tau)
+        flat_tau_pair = jnp.transpose(
+            tau.reshape(T, R, 1), (1, 0, 2)).reshape(pair_span, 1)
+
+        sector_scores = (
+            flat_h_pair_bf @ all_sector_center.T
+        ).astype(jnp.float32)
+        _top_scores, top_sector_ids = jax.lax.top_k(sector_scores, topk)
+        del _top_scores
+
+        local_sector_ids = top_sector_ids - local_sector_offset
+        selected_here = jnp.logical_and(
+            local_sector_ids >= 0,
+            local_sector_ids < n_local_sectors)
+        if _debug_bucket_capacity_override is None:
+            bucket_capacity, _avg_pairs_per_sector = (
+                _v4168_sector_bucket_capacity(
+                    pair_span, topk, global_n_sectors))
+        else:
+            bucket_capacity = max(1, int(_debug_bucket_capacity_override))
+        (sector_pair_ids, sector_bucket_valid, overflow_count,
+         _bucket_max_fill, _bucket_mean_fill) = _v4168_build_sector_buckets(
+            local_sector_ids, selected_here, pair_span, topk, n_local_sectors,
+            bucket_capacity)
+        global_overflow_count = jax.lax.psum(overflow_count, 'model')
+
+        def angular_compose_parts(rho, tau_b, valid_mask):
+            _, admission, _drive, execution_weight, _ = _compute_admission_drive(
+                rho, tau_b, soft_gate_temperature,
+                boundary_power=soft_gate_boundary_power,
+                effective_active_eps=_soft_gate_effective_active_eps,
+                execution_prune_eps=execution_prune_eps)
+            admission = jnp.where(valid_mask, admission, 0.0)
+            execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
+            return admission, execution_weight
+
+        def finish(flat_raw_out, flat_den_cost):
+            raw_out = flat_raw_out.reshape(B, S, R, D)
+            total_den_cost = flat_den_cost.reshape(B, S, R, 1)
+            global_raw_out = jax.lax.psum(raw_out, 'model')
+            global_den_cost = jax.lax.psum(total_den_cost, 'model')
+            admission_den_base = jnp.maximum(global_den_cost, 1.0)
+            admission_den_forward = jnp.power(
+                admission_den_base, _admission_den_power)
+            admission_den_sg = jax.lax.stop_gradient(admission_den_forward)
+            admission_den = (
+                admission_den_sg
+                + _admission_den_grad_scale
+                * (admission_den_forward - admission_den_sg))
+            return (global_raw_out / admission_den).astype(jnp.float32)
+
+        def bucket_execute(_):
+            @jax.checkpoint
+            def sector_step(carry, sector_i):
+                flat_raw_out, flat_den_cost = carry
+                pair_ids = sector_pair_ids[sector_i]
+                valid_p = sector_bucket_valid[sector_i]
+                route_ids = pair_ids // int(T)
+                token_ids = pair_ids % int(T)
+                op_key_b = op_key_blocks[sector_i]
+                read_b = read_blocks[sector_i]
+                write_b = write_blocks[sector_i]
+                valid_ops = valid_blocks[sector_i]
+
+                x_b = flat_x_bf[token_ids]
+                h_b = flat_h_pair_bf[pair_ids]
+                tau_b = flat_tau_pair[pair_ids]
+                valid_mask = jnp.logical_and(
+                    valid_p[:, None], valid_ops[None, :])
+
+                rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
+                rho_compute = jnp.where(
+                    valid_ops[None, :], rho_raw, tau_b)
+                admission, execution_weight = angular_compose_parts(
+                    rho_compute, tau_b, valid_mask)
+                xr = (x_b @ read_b.T).astype(jnp.float32)
+                weighted = execution_weight * xr
+                out_b = (weighted.astype(jnp.bfloat16) @ write_b).astype(
+                    jnp.float32)
+                den_b = admission.sum(axis=-1, keepdims=True)
+                flat_raw_out = flat_raw_out.at[token_ids, route_ids].add(
+                    out_b, mode='drop')
+                flat_den_cost = flat_den_cost.at[token_ids, route_ids].add(
+                    den_b, mode='drop')
+                return (flat_raw_out, flat_den_cost), None
+
+            (flat_raw_out, flat_den_cost), _ = jax.lax.scan(
+                sector_step,
+                (jnp.zeros((T, R, D), dtype=jnp.float32),
+                 jnp.zeros((T, R, 1), dtype=jnp.float32)),
+                jnp.arange(n_local_sectors, dtype=jnp.int32))
+            return finish(flat_raw_out, flat_den_cost)
+
+        def token_gather_execute(_):
+            @jax.checkpoint
+            def pair_chunk_step(carry, chunk_i):
+                flat_raw_out, flat_den_cost = carry
+                start = chunk_i * _token_gather_chunk_size
+                offsets = start + jnp.arange(
+                    _token_gather_chunk_size, dtype=jnp.int32)
+                valid_pairs = offsets < pair_span
+                safe_offsets = jnp.minimum(offsets, pair_span - 1)
+                pair_ids = jnp.where(valid_pairs, pair_pos[safe_offsets], 0)
+                route_ids = pair_ids // int(T)
+                token_ids = pair_ids % int(T)
+
+                x_b = flat_x_bf[token_ids]
+                h_b = flat_h_pair_bf[pair_ids]
+                tau_b = flat_tau_pair[pair_ids]
+                sector_ids = top_sector_ids[pair_ids]
+                chunk_local_sector_ids = sector_ids - local_sector_offset
+                chunk_selected_here = jnp.logical_and(
+                    chunk_local_sector_ids >= 0,
+                    chunk_local_sector_ids < n_local_sectors)
+                safe_sector_ids = jnp.clip(
+                    chunk_local_sector_ids, 0,
+                    n_local_sectors - 1).astype(jnp.int32)
+                op_key_b = op_key_blocks[safe_sector_ids]
+                read_b = read_blocks[safe_sector_ids]
+                write_b = write_blocks[safe_sector_ids]
+                valid_ops = jnp.logical_and(
+                    valid_blocks[safe_sector_ids],
+                    chunk_selected_here[:, :, None])
+                valid_mask = jnp.logical_and(
+                    valid_pairs[:, None, None], valid_ops)
+
+                rho_raw = jnp.einsum(
+                    'cd,cknd->ckn', h_b, op_key_b).astype(jnp.float32)
+                rho_compute = jnp.where(valid_ops, rho_raw, tau_b[:, None, :])
+                admission, execution_weight = angular_compose_parts(
+                    rho_compute, tau_b[:, None, :], valid_mask)
+                xr = jnp.einsum(
+                    'cd,cknd->ckn', x_b, read_b).astype(jnp.float32)
+                weighted = execution_weight * xr
+                out_b = jnp.einsum(
+                    'ckn,cknd->cd',
+                    weighted.astype(jnp.bfloat16),
+                    write_b).astype(jnp.float32)
+                den_b = admission.sum(axis=(1, 2), keepdims=False)[:, None]
+                flat_raw_out = flat_raw_out.at[token_ids, route_ids].add(
+                    out_b, mode='drop')
+                flat_den_cost = flat_den_cost.at[token_ids, route_ids].add(
+                    den_b, mode='drop')
+                return (flat_raw_out, flat_den_cost), None
+
+            (flat_raw_out, flat_den_cost), _ = jax.lax.scan(
+                pair_chunk_step,
+                (jnp.zeros((T, R, D), dtype=jnp.float32),
+                 jnp.zeros((T, R, 1), dtype=jnp.float32)),
+                jnp.arange(max_pair_chunks, dtype=jnp.int32))
+            return finish(flat_raw_out, flat_den_cost)
+
+        return jax.lax.cond(
+            global_overflow_count > 0,
+            token_gather_execute,
+            bucket_execute,
+            operand=None)
+
+    return fused_gate_srw_paired_sector_bucketed_minimal
+
+
 def make_sharded_srw_minimal(
         mesh, max_chunk_size=2048,
         dead_exposure_target=0.1,
@@ -4097,9 +4686,20 @@ def make_sharded_srw_minimal(
         block_size=256,
         top_blocks=2,
         block_margin=0.0,
-        hardware_sector_execution_enabled=False):
+        hardware_sector_execution_enabled=False,
+        hardware_sector_debug_token_gather_fallback=False):
     if hardware_sector_execution_enabled:
-        return make_sharded_srw_sector_topk_minimal(
+        if hardware_sector_debug_token_gather_fallback:
+            return make_sharded_srw_sector_topk_minimal(
+                mesh, max_chunk_size=max_chunk_size,
+                dead_exposure_target=dead_exposure_target,
+                soft_gate_effective_active_eps=soft_gate_effective_active_eps,
+                admission_den_power=admission_den_power,
+                admission_den_grad_scale=admission_den_grad_scale,
+                block_size=block_size,
+                top_blocks=top_blocks,
+                block_margin=block_margin)
+        return make_sharded_srw_sector_bucketed_minimal(
             mesh, max_chunk_size=max_chunk_size,
             dead_exposure_target=dead_exposure_target,
             soft_gate_effective_active_eps=soft_gate_effective_active_eps,
@@ -4128,9 +4728,20 @@ def make_sharded_srw_paired_minimal(
         block_size=256,
         top_blocks=2,
         block_margin=0.0,
-        hardware_sector_execution_enabled=False):
+        hardware_sector_execution_enabled=False,
+        hardware_sector_debug_token_gather_fallback=False):
     if hardware_sector_execution_enabled:
-        return make_sharded_srw_paired_sector_topk_minimal(
+        if hardware_sector_debug_token_gather_fallback:
+            return make_sharded_srw_paired_sector_topk_minimal(
+                mesh, max_chunk_size=max_chunk_size,
+                dead_exposure_target=dead_exposure_target,
+                soft_gate_effective_active_eps=soft_gate_effective_active_eps,
+                admission_den_power=admission_den_power,
+                admission_den_grad_scale=admission_den_grad_scale,
+                block_size=block_size,
+                top_blocks=top_blocks,
+                block_margin=block_margin)
+        return make_sharded_srw_paired_sector_bucketed_minimal(
             mesh, max_chunk_size=max_chunk_size,
             dead_exposure_target=dead_exposure_target,
             soft_gate_effective_active_eps=soft_gate_effective_active_eps,

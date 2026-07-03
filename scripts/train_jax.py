@@ -12849,6 +12849,10 @@ def main():
                     'block_margin': float(m_cfg.get('block_margin', 0.0)),
                     'hardware_sector_execution_enabled':
                         hardware_sector_execution_enabled,
+                    'hardware_sector_debug_token_gather_fallback': bool(
+                        cfg['training'].get(
+                            'hardware_sector_debug_token_gather_fallback',
+                            False)),
                 })
             return kwargs
 
@@ -12952,7 +12956,7 @@ def main():
                 if str(model_version_cfg) == V4167_MODEL_VERSION else "")
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 _v4168_exec_mode = (
-                    "sector_topk"
+                    "sector_bucketed"
                     if hardware_sector_execution_enabled
                     else "block_sparse_fallback")
                 _extra_msg = (
@@ -12976,7 +12980,7 @@ def main():
                 print(
                     "Hardware sector execution:\n"
                     f"  enabled={str(hardware_sector_execution_enabled).lower()}\n"
-                    f"  main_val_path={'sector_topk' if hardware_sector_execution_enabled else 'block_sparse_fallback'}\n"
+                    f"  main_val_path={'sector_bucketed' if hardware_sector_execution_enabled else 'block_sparse_fallback'}\n"
                     "  dense_ref_enabled=false",
                     flush=True)
 
@@ -13878,7 +13882,7 @@ def main():
     LOG_ANALYSIS = max(1, log_interval * log_analysis_multiplier)
     LOG_GEOMETRY = max(1, LOG_REGULAR * heavy_geometry_multiplier)
     main_val_path = (
-        'sector_topk'
+        'sector_bucketed'
         if hardware_sector_execution_enabled
         else ('block_sparse_fallback'
               if str(model_version_cfg) == V4168_MODEL_VERSION else 'standard'))
@@ -13966,7 +13970,12 @@ def main():
                     k: jnp.asarray(v, dtype=jnp.float32)
                     for k, v in _v4168_hardware_sector_static_metrics(
                         cfg['model'],
-                        model_axis_size=mesh_model).items()
+                        model_axis_size=mesh_model,
+                        batch_size=batch_size,
+                        max_seq_len=max_seq_len,
+                        data_axis_size=mesh_data,
+                        bucketed_execution_enabled=
+                        hardware_sector_execution_enabled).items()
                 })
             if _v4168_should_hardware_repack(
                     step_after_update, hardware_repack_config):
