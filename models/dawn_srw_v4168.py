@@ -14,6 +14,9 @@ Implemented concepts:
 - tau movement controlled by optimizer-side tau_lr_mult
 - train-time effective gate statistics
 - validation-time execution pruning through execution_prune_eps
+- v4168 hardware-sector execution uses an exact global-sector-topK,
+  replicated-SPMD kernel: every model shard carries topK sector slots, masks
+  remote sector ids locally, and psums useful local fixed-size sector tiles.
 """
 
 
@@ -2699,6 +2702,44 @@ def _hardware_perm_checksum(perm):
     return np.int64(np.sum(weights * (perm64 + np.int64(1))))
 
 
+def _validate_hardware_permutation_np(perm, n_ops=None, pool=''):
+    perm = np.asarray(perm, dtype=np.int32)
+    expected_n = int(perm.size if n_ops is None else n_ops)
+    if int(perm.size) != expected_n:
+        raise RuntimeError(
+            f"hardware repack {pool} permutation length {perm.size} "
+            f"!= expected {expected_n}")
+    if not np.array_equal(np.sort(perm), np.arange(expected_n, dtype=np.int32)):
+        raise RuntimeError(
+            f"hardware repack {pool} planner produced duplicate, missing, "
+            "or padded row ids")
+    return perm
+
+
+def _identity_hardware_repack_metrics(perm, compact_before,
+                                      radius_before_mean,
+                                      radius_before_max,
+                                      candidate_count=0.0):
+    compact_mean = (
+        float(np.mean(compact_before))
+        if np.asarray(compact_before).size else 0.0)
+    return {
+        'moved_count': 0.0,
+        'moved_frac': 0.0,
+        'candidate_count': float(candidate_count),
+        'mean_gain': 0.0,
+        'max_gain': 0.0,
+        'compactness_before_mean': compact_mean,
+        'compactness_after_mean': compact_mean,
+        'radius_before_mean': float(radius_before_mean),
+        'radius_after_mean': float(radius_before_mean),
+        'radius_before_max': float(radius_before_max),
+        'radius_after_max': float(radius_before_max),
+        'perm_checksum': float(_hardware_perm_checksum(perm)),
+        'perm_broadcast_ok': 1.0,
+    }
+
+
 def _plan_hardware_sector_repack(op_keys, block_size,
                                  farthest_per_sector=10,
                                  gain_eps=1.0e-3):
@@ -2716,28 +2757,22 @@ def _plan_hardware_sector_repack(op_keys, block_size,
     keys = _np_unit_direction(op_keys)
     n_ops = int(keys.shape[0])
     perm = np.arange(n_ops, dtype=np.int32)
+    compact_before = np.zeros((0,), dtype=np.float32)
+    radius_before_mean = np.float32(0.0)
+    radius_before_max = np.float32(0.0)
     if n_ops == 0:
-        metrics = {
-            'moved_count': 0.0,
-            'moved_frac': 0.0,
-            'candidate_count': 0.0,
-            'mean_gain': 0.0,
-            'max_gain': 0.0,
-            'compactness_before_mean': 0.0,
-            'compactness_after_mean': 0.0,
-            'radius_before_mean': 0.0,
-            'radius_after_mean': 0.0,
-            'radius_before_max': 0.0,
-            'radius_after_max': 0.0,
-            'perm_checksum': 0.0,
-        }
-        return perm, metrics
+        return perm, _identity_hardware_repack_metrics(
+            perm, compact_before, radius_before_mean, radius_before_max)
 
     n_sectors = (n_ops + block_size - 1) // block_size
     sums, counts = _sector_sums_np(keys, block_size)
     centers = _np_unit_direction(sums)
     compact_before, radius_before_mean, radius_before_max = (
         _sector_compactness_and_radius_np(keys, block_size))
+
+    if farthest_per_sector <= 0:
+        return perm, _identity_hardware_repack_metrics(
+            perm, compact_before, radius_before_mean, radius_before_max)
 
     candidate_indices = []
     if farthest_per_sector > 0:
@@ -2756,24 +2791,9 @@ def _plan_hardware_sector_repack(op_keys, block_size,
                                    dtype=np.int32)
     candidate_count = int(candidate_indices.size)
     if candidate_count == 0:
-        metrics = {
-            'moved_count': 0.0,
-            'moved_frac': 0.0,
-            'candidate_count': 0.0,
-            'mean_gain': 0.0,
-            'max_gain': 0.0,
-            'compactness_before_mean': float(compact_before.mean()),
-            'compactness_after_mean': float(compact_before.mean()),
-            'radius_before_mean': float(radius_before_mean),
-            'radius_after_mean': float(radius_before_mean),
-            'radius_before_max': float(radius_before_max),
-            'radius_after_max': float(radius_before_max),
-            'perm_checksum': float(_hardware_perm_checksum(perm)),
-        }
-        return perm, metrics
+        return perm, _identity_hardware_repack_metrics(
+            perm, compact_before, radius_before_mean, radius_before_max)
 
-    candidate_mask = np.zeros((n_ops,), dtype=np.bool_)
-    candidate_mask[candidate_indices] = True
     candidate_sectors = candidate_indices // block_size
     sums_base = np.array(sums, copy=True)
     holes_by_sector = [[] for _ in range(n_sectors)]
@@ -2782,58 +2802,96 @@ def _plan_hardware_sector_repack(op_keys, block_size,
         holes_by_sector[sector].append(int(old_idx))
 
     capacities = np.asarray([len(h) for h in holes_by_sector], dtype=np.int32)
-    assigned_sum = np.zeros_like(sums_base)
     assigned_by_sector = [[] for _ in range(n_sectors)]
+    assigned_dst = {}
     move_gains = {}
 
+    possible_moves = []
     for old_idx in candidate_indices:
         old_idx_i = int(old_idx)
         src = old_idx_i // block_size
         k = keys[old_idx_i]
-        current = sums_base + assigned_sum
-        current_norm = np.linalg.norm(current, axis=-1)
-        deltas = np.linalg.norm(current + k[None, :], axis=-1) - current_norm
-
-        best_sector = src
-        best_delta = deltas[src] if capacities[src] > 0 else -np.inf
-        best_gain = 0.0
         for dst in range(n_sectors):
-            if capacities[dst] <= 0:
+            if dst == src or len(holes_by_sector[dst]) == 0:
                 continue
-            if dst == src:
-                gain = 0.0
-                eligible = True
-            else:
-                gain = (
-                    np.linalg.norm(sums[src] - k)
-                    + np.linalg.norm(sums[dst] + k)
-                    - np.linalg.norm(sums[src])
-                    - np.linalg.norm(sums[dst])
-                )
-                eligible = gain > gain_eps
-            if not eligible:
+            src_sum = sums_base[src] + k
+            dst_sum = sums_base[dst]
+            gain = (
+                np.linalg.norm(src_sum - k)
+                + np.linalg.norm(dst_sum + k)
+                - np.linalg.norm(src_sum)
+                - np.linalg.norm(dst_sum)
+            )
+            if gain > gain_eps:
+                possible_moves.append(
+                    (-float(gain), old_idx_i, int(dst), float(gain)))
+
+    possible_moves.sort()
+
+    for _neg_gain, old_idx_i, dst, gain in possible_moves:
+        if old_idx_i in assigned_dst or capacities[dst] <= 0:
+            continue
+        assigned_dst[old_idx_i] = dst
+        move_gains[old_idx_i] = gain
+        capacities[dst] -= 1
+        assigned_by_sector[dst].append(old_idx_i)
+
+    def undo_lowest_gain_incoming(sector):
+        incoming = [
+            old_idx_i for old_idx_i in assigned_by_sector[sector]
+            if (old_idx_i // block_size) != sector
+        ]
+        if not incoming:
+            return False
+        undo_old = sorted(
+            incoming,
+            key=lambda old_idx_i: (move_gains.get(old_idx_i, 0.0),
+                                   old_idx_i))[0]
+        assigned_by_sector[sector].remove(undo_old)
+        capacities[sector] += 1
+        assigned_dst.pop(undo_old, None)
+        move_gains.pop(undo_old, None)
+        return True
+
+    # Non-moved candidates keep their original physical-sector hole whenever
+    # possible. If a greedy positive move consumed that capacity, undo the
+    # lowest-gain incoming move instead of forcing a no-gain candidate out.
+    while True:
+        progress = False
+        for old_idx in candidate_indices:
+            old_idx_i = int(old_idx)
+            if old_idx_i in assigned_dst:
                 continue
-            delta = deltas[dst]
-            if (delta > best_delta + 1.0e-12
-                    or (abs(delta - best_delta) <= 1.0e-12
-                        and dst < best_sector)):
-                best_sector = dst
-                best_delta = delta
-                best_gain = float(gain)
+            src = old_idx_i // block_size
+            if capacities[src] <= 0:
+                progress = undo_lowest_gain_incoming(src) or progress
+                if capacities[src] <= 0:
+                    continue
+            assigned_dst[old_idx_i] = src
+            capacities[src] -= 1
+            assigned_by_sector[src].append(old_idx_i)
+            progress = True
+        if len(assigned_dst) == candidate_count or not progress:
+            break
 
-        if capacities[best_sector] <= 0:
-            available = np.flatnonzero(capacities > 0)
-            if available.size == 0:
-                raise RuntimeError(
-                    "hardware repack planner exhausted candidate holes")
-            best_sector = int(available[0])
-            best_gain = 0.0
+    # Capacity is fixed. If accepted positive moves consumed a sector's holes,
+    # fill remaining holes deterministically with the lowest old indices.
+    for old_idx in candidate_indices:
+        old_idx_i = int(old_idx)
+        if old_idx_i in assigned_dst:
+            continue
+        available = np.flatnonzero(capacities > 0)
+        if available.size == 0:
+            raise RuntimeError(
+                "hardware repack planner exhausted candidate holes")
+        dst = int(available[0])
+        assigned_dst[old_idx_i] = dst
+        capacities[dst] -= 1
+        assigned_by_sector[dst].append(old_idx_i)
 
-        capacities[best_sector] -= 1
-        assigned_sum[best_sector] += k
-        assigned_by_sector[best_sector].append(old_idx_i)
-        if best_sector != src:
-            move_gains[old_idx_i] = best_gain
+    if np.any(capacities != 0):
+        raise RuntimeError(
+            "hardware repack planner did not fill every candidate hole")
 
     new_perm = np.arange(n_ops, dtype=np.int32)
     for sector, assigned_old in enumerate(assigned_by_sector):
@@ -2845,8 +2903,7 @@ def _plan_hardware_sector_repack(op_keys, block_size,
         for new_slot, old_slot in zip(holes, assigned_old):
             new_perm[new_slot] = old_slot
 
-    if not np.array_equal(np.sort(new_perm), np.arange(n_ops, dtype=np.int32)):
-        raise RuntimeError("hardware repack planner produced a non-permutation")
+    new_perm = _validate_hardware_permutation_np(new_perm, n_ops)
 
     moved_mask = new_perm != np.arange(n_ops, dtype=np.int32)
     moved_count = int(moved_mask.sum())
@@ -2950,9 +3007,10 @@ def _apply_pool_permutations_to_params_and_opt_state(params, opt_state,
     return new_params, new_opt_state
 
 
-def hardware_sector_static_metrics(model_config):
-    """Cheap sector execution metrics from config/pool sizes."""
+def hardware_sector_static_metrics(model_config, model_axis_size=1):
+    """Cheap exact-global-sector-topK replicated-SPMD cost metrics."""
     metrics = {}
+    model_axis_size = max(1, int(model_axis_size))
     for pool, _op_key, _read_key, _write_key, block_key, top_key in (
             _HARDWARE_REPACK_POOLS):
         if pool == 'attn_qk':
@@ -2966,12 +3024,36 @@ def hardware_sector_static_metrics(model_config):
         topk = int(model_config.get(top_key, 2))
         n_sectors = max(1, (n_ops + sector_size - 1) // sector_size)
         topk_eff = min(max(1, topk), n_sectors)
-        valid_est = min(n_ops, topk_eff * sector_size)
+        semantic_selected = topk_eff * sector_size
+        spmd_tile_slots = model_axis_size * semantic_selected
+        dense_ops = max(1, n_ops)
+        valid_est = min(n_ops, semantic_selected)
         metrics[f'sector/{pool}/topk'] = float(topk_eff)
         metrics[f'sector/{pool}/sector_size'] = float(sector_size)
-        metrics[f'sector/{pool}/selected_sector_count_mean'] = float(topk_eff)
+        metrics[f'sector/{pool}/num_global_sectors'] = float(n_sectors)
+        metrics[f'sector/{pool}/model_axis_size'] = float(model_axis_size)
+        metrics[f'sector/{pool}/semantic_selected_ops_per_token'] = float(
+            semantic_selected)
+        metrics[f'sector/{pool}/spmd_tile_slots_per_token'] = float(
+            spmd_tile_slots)
+        metrics[f'sector/{pool}/useful_local_tile_slots_per_token'] = float(
+            semantic_selected)
+        metrics[f'sector/{pool}/remote_dummy_tile_slot_frac'] = (
+            1.0 - (float(semantic_selected) / float(max(spmd_tile_slots, 1))))
+        metrics[f'sector/{pool}/estimated_dense_ops_per_token'] = float(
+            n_ops)
+        metrics[f'sector/{pool}/semantic_compute_frac_vs_dense'] = float(
+            semantic_selected) / float(dense_ops)
+        metrics[f'sector/{pool}/spmd_compute_frac_vs_dense'] = float(
+            spmd_tile_slots) / float(dense_ops)
         metrics[f'sector/{pool}/selected_valid_ops_mean'] = float(valid_est)
-        metrics[f'sector/{pool}/estimated_ops_per_token'] = float(valid_est)
+        metrics[f'sector/{pool}/selected_sector_count_mean'] = float(topk_eff)
+        metrics[f'sector/{pool}/useful_local_sector_slots_mean'] = float(
+            topk_eff)
+        metrics[f'sector/{pool}/local_selected_sector_count_mean'] = (
+            float(topk_eff) / float(model_axis_size))
+        metrics[f'sector/{pool}/remote_dummy_sector_slot_frac'] = (
+            1.0 - (float(topk_eff) / float(max(model_axis_size * topk_eff, 1))))
     return metrics
 
 
@@ -3018,9 +3100,52 @@ def _global_jax_array_to_host_np(x, dtype=np.float32):
         raise
 
 
+def _canonical_hardware_permutation_across_hosts(perm, pool=''):
+    """Return the process-0 permutation on every host, with loud validation."""
+    perm = _validate_hardware_permutation_np(perm, pool=pool)
+    checksum = _hardware_perm_checksum(perm)
+    if jax.process_count() <= 1:
+        return perm, checksum, 1.0
+
+    from jax.experimental.multihost_utils import process_allgather
+
+    local_meta = np.asarray(
+        [int(perm.size), int(checksum)], dtype=np.int64)
+    all_meta = np.asarray(process_allgather(local_meta)).reshape(-1, 2)
+    if not np.all(all_meta[:, 0] == int(perm.size)):
+        raise RuntimeError(
+            f"hardware repack {pool} permutation length mismatch across "
+            f"hosts: {all_meta[:, 0].tolist()}")
+
+    try:
+        from jax.experimental.multihost_utils import broadcast_one_to_all
+        perm = np.asarray(
+            broadcast_one_to_all(np.asarray(perm, dtype=np.int32)),
+            dtype=np.int32)
+        perm = _validate_hardware_permutation_np(perm, pool=pool)
+        checksum = _hardware_perm_checksum(perm)
+    except Exception as exc:
+        if not np.all(all_meta[:, 1] == int(checksum)):
+            raise RuntimeError(
+                f"hardware repack {pool} permutation checksum mismatch "
+                f"across hosts and broadcast failed: "
+                f"{all_meta[:, 1].tolist()}") from exc
+        perm = _validate_hardware_permutation_np(perm, pool=pool)
+
+    final_meta = np.asarray(
+        process_allgather(
+            np.asarray([int(perm.size), int(checksum)], dtype=np.int64))
+    ).reshape(-1, 2)
+    if (not np.all(final_meta[:, 0] == int(perm.size))
+            or not np.all(final_meta[:, 1] == int(checksum))):
+        raise RuntimeError(
+            f"hardware repack {pool} broadcast produced inconsistent "
+            f"permutation metadata: {final_meta.tolist()}")
+    return perm, checksum, 1.0
+
+
 def maybe_hardware_repack(params, opt_state, model_config, mesh, step, config):
     """Physically repack v4168 SRW pool rows and matching optimizer slots."""
-    del mesh
     if not _hardware_repack_enabled(config):
         return params, opt_state, {}
 
@@ -3031,6 +3156,7 @@ def maybe_hardware_repack(params, opt_state, model_config, mesh, step, config):
     pool_params = params['neuron_pool']
     op_keys = _pool_operator_keys(pool_params)
 
+    model_axis_size = int(getattr(mesh, 'shape', {}).get('model', 1))
     pool_perms = {}
     metrics = {}
     total_moved = 0.0
@@ -3044,6 +3170,14 @@ def maybe_hardware_repack(params, opt_state, model_config, mesh, step, config):
             key_host, block_size,
             farthest_per_sector=farthest_per_sector,
             gain_eps=gain_eps)
+        perm, perm_checksum, perm_broadcast_ok = (
+            _canonical_hardware_permutation_across_hosts(perm, pool=pool))
+        moved_mask = perm != np.arange(int(perm.size), dtype=np.int32)
+        pool_metrics['moved_count'] = float(int(moved_mask.sum()))
+        pool_metrics['moved_frac'] = (
+            float(pool_metrics['moved_count']) / float(max(int(perm.size), 1)))
+        pool_metrics['perm_checksum'] = float(perm_checksum)
+        pool_metrics['perm_broadcast_ok'] = float(perm_broadcast_ok)
         moved = int(pool_metrics['moved_count'])
         total_moved += float(moved)
         if moved > 0:
@@ -3053,7 +3187,9 @@ def maybe_hardware_repack(params, opt_state, model_config, mesh, step, config):
 
     metrics['repack/total_moved_count'] = float(total_moved)
     metrics['repack/step'] = float(int(step))
-    metrics.update(hardware_sector_static_metrics(model_config))
+    metrics['repack/drift_snapshot_refreshed'] = 0.0
+    metrics.update(hardware_sector_static_metrics(
+        model_config, model_axis_size=model_axis_size))
     if total_moved == 0.0:
         return params, opt_state, metrics
 
@@ -3607,6 +3743,8 @@ def make_sharded_srw_paired_block_sparse_minimal(
     return fused_gate_srw_paired_block_sparse_minimal
 
 
+# Legacy block-sparse candidate execution is retained only as a fallback/debug
+# path. The hardware-sector path below executes exact global topK fixed tiles.
 make_sharded_srw_block_sparse_minimal_fallback = (
     make_sharded_srw_block_sparse_minimal)
 make_sharded_srw_paired_block_sparse_minimal_fallback = (
@@ -3639,7 +3777,13 @@ def make_sharded_srw_sector_topk_minimal(
         block_size=256,
         top_blocks=2,
         block_margin=0.0):
-    """Create v4168 single-route hardware-sector topK SRW."""
+    """Create exact_global_sector_topk_replicated_spmd single-route SRW.
+
+    This is semantically exact global sector topK: local sector centers are
+    all-gathered across the model axis, global topK sector ids are selected per
+    token, and each model shard masks out selected sectors it does not own.
+    The shape cost is replicated across model shards; it is not owner-routed.
+    """
     del max_chunk_size, dead_exposure_target, block_margin
     _sector_size, _top_sectors = _v4168_block_sparse_config(
         block_size, top_blocks)
@@ -3790,7 +3934,12 @@ def make_sharded_srw_paired_sector_topk_minimal(
         block_size=256,
         top_blocks=2,
         block_margin=0.0):
-    """Create v4168 paired Q/K hardware-sector topK SRW."""
+    """Create exact_global_sector_topk_replicated_spmd paired Q/K SRW.
+
+    This has the same exact global topK semantics and replicated SPMD shape
+    cost as make_sharded_srw_sector_topk_minimal, with route-local Q/K
+    denominators and outputs preserved.
+    """
     del max_chunk_size, dead_exposure_target, block_margin
     _sector_size, _top_sectors = _v4168_block_sparse_config(
         block_size, top_blocks)
@@ -3999,6 +4148,12 @@ def make_sharded_srw_paired_minimal(
         block_size=block_size,
         top_blocks=top_blocks,
         block_margin=block_margin)
+
+
+make_sharded_srw_exact_global_sector_topk_replicated_spmd_minimal = (
+    make_sharded_srw_sector_topk_minimal)
+make_sharded_srw_paired_exact_global_sector_topk_replicated_spmd_minimal = (
+    make_sharded_srw_paired_sector_topk_minimal)
 
 
 # ================================================================

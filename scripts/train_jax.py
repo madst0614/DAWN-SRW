@@ -12972,6 +12972,13 @@ def main():
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
                   f"; analysis kernels={'on' if _supports_analysis else 'off'}"
                   f"{_extra_msg})")
+            if str(model_version_cfg) == V4168_MODEL_VERSION:
+                print(
+                    "Hardware sector execution:\n"
+                    f"  enabled={str(hardware_sector_execution_enabled).lower()}\n"
+                    f"  main_val_path={'sector_topk' if hardware_sector_execution_enabled else 'block_sparse_fallback'}\n"
+                    "  dense_ref_enabled=false",
+                    flush=True)
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -13870,6 +13877,11 @@ def main():
     LOG_REGULAR = log_interval
     LOG_ANALYSIS = max(1, log_interval * log_analysis_multiplier)
     LOG_GEOMETRY = max(1, LOG_REGULAR * heavy_geometry_multiplier)
+    main_val_path = (
+        'sector_topk'
+        if hardware_sector_execution_enabled
+        else ('block_sparse_fallback'
+              if str(model_version_cfg) == V4168_MODEL_VERSION else 'standard'))
     if is_host0:
         print(f"  Log cadence: regular={LOG_REGULAR}"
               f" analysis={LOG_ANALYSIS}"
@@ -13953,7 +13965,8 @@ def main():
                 metrics.update({
                     k: jnp.asarray(v, dtype=jnp.float32)
                     for k, v in _v4168_hardware_sector_static_metrics(
-                        cfg['model']).items()
+                        cfg['model'],
+                        model_axis_size=mesh_model).items()
                 })
             if _v4168_should_hardware_repack(
                     step_after_update, hardware_repack_config):
@@ -13962,6 +13975,12 @@ def main():
                         params, opt_state, cfg['model'], mesh,
                         step_after_update, hardware_repack_config))
                 if repack_metrics:
+                    _repack_moved = (
+                        float(repack_metrics.get(
+                            'repack/total_moved_count', 0.0)) > 0.0)
+                    if _repack_moved and drift_diagnostics_enabled:
+                        _prev_op_key_snap = _drift_snap(params)
+                        repack_metrics['repack/drift_snapshot_refreshed'] = 1.0
                     metrics.update({
                         k: jnp.asarray(v, dtype=jnp.float32)
                         for k, v in repack_metrics.items()
@@ -14214,7 +14233,9 @@ def main():
                     }
                     val_dead_log = _attach_validation_dead_fractions(
                         dict(val_dead_stats), _val_dead_ctx)
-                    log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
+                    log_message(
+                        f"  Val path={main_val_path}, "
+                        f"Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
                     if prune_eval_log:
                         for _eps in eval_effective_prune_eps_list:
                             _tag = _format_prune_eps(_eps)
@@ -14231,6 +14252,7 @@ def main():
                         'type': 'val',
                         'step': global_step,
                         'epoch': epoch,
+                        'main_val_path': main_val_path,
                         'val_loss': val_loss,
                         'val_acc': val_acc,
                         **val_dead_log,
@@ -14452,7 +14474,9 @@ def main():
             }
             val_dead_log = _attach_validation_dead_fractions(
                 dict(val_dead_stats), _val_dead_ctx)
-            log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
+            log_message(
+                f"  Val path={main_val_path}, "
+                f"Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
             if prune_eval_log:
                 for _eps in eval_effective_prune_eps_list:
                     _tag = _format_prune_eps(_eps)
@@ -14468,6 +14492,7 @@ def main():
                 'type': 'val_epoch',
                 'step': global_step,
                 'epoch': epoch,
+                'main_val_path': main_val_path,
                 'val_loss': val_loss,
                 'val_acc': val_acc,
                 **val_dead_log,
