@@ -635,6 +635,15 @@ def load_eval_data(cfg: Dict[str, Any], max_length: int, batch_size: int,
     return loader
 
 
+def host_aligned_batch_size(batch_size: int, n_hosts: int) -> int:
+    """Round a global batch size up so BinDataLoader can split it by host."""
+    batch_size = max(1, int(batch_size))
+    n_hosts = max(1, int(n_hosts))
+    if batch_size % n_hosts == 0:
+        return batch_size
+    return ((batch_size + n_hosts - 1) // n_hosts) * n_hosts
+
+
 def shard_batch_to_mesh(input_ids, attention_mask, data_sharding):
     train = get_train()
     gb = int(input_ids.shape[0]) * int(jax.process_count())

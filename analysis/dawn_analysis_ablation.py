@@ -11,7 +11,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from analysis.dawn_analysis_common import AnalysisContext, load_eval_data
+from analysis.dawn_analysis_common import (
+    AnalysisContext,
+    host_aligned_batch_size,
+    load_eval_data,
+)
 from analysis.dawn_analysis_storage import (
     list_paths,
     read_json,
@@ -119,7 +123,7 @@ def _make_mask(ctx: AnalysisContext, pool: str, ids: Sequence[int]) -> Dict[str,
 def _load_batches(ctx: AnalysisContext) -> List[np.ndarray]:
     args = ctx.args
     seq_len = int(args.ablation_seq_len)
-    batch_size = int(args.ablation_batch_size)
+    batch_size = host_aligned_batch_size(int(args.ablation_batch_size), ctx.n_hosts)
     max_sequences = int(args.ablation_max_sequences)
     max_tokens = seq_len * max_sequences
     loader = load_eval_data(ctx.config, seq_len, batch_size, ctx.host_id, ctx.n_hosts, max_tokens)
@@ -143,17 +147,23 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
     pools = _parse_pools(args.ablation_pools)
     operator_lists = _operator_lists(ctx)
     batches = _load_batches(ctx)
+    requested_batch_size = int(args.ablation_batch_size)
+    batch_size = host_aligned_batch_size(requested_batch_size, ctx.n_hosts)
 
     store.log_event(
         stage,
         "start",
         message=(
             f"ABLATION START jobs={len(pools) * len(k_list) * 3} "
-            f"batches={len(batches)} k={k_list} pools={','.join(pools)}"
+            f"batches={len(batches)} batch_size={batch_size} "
+            f"requested_batch_size={requested_batch_size} "
+            f"k={k_list} pools={','.join(pools)} host={ctx.host_id}/{ctx.n_hosts}"
         ),
         pools=pools,
         k_list=k_list,
         batches=len(batches),
+        batch_size=batch_size,
+        requested_batch_size=requested_batch_size,
     )
 
     base_forward = jax.jit(v4166.build_suppressed_forward(ctx.params, ctx.model_cfg, {}))

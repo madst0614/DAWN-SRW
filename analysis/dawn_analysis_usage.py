@@ -14,6 +14,7 @@ import numpy as np
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    host_aligned_batch_size,
     load_eval_data,
     maybe_load_tokenizer,
     token_window_text,
@@ -337,7 +338,8 @@ def run_usage_stage(ctx: AnalysisContext) -> Dict[str, Any]:
 
     store.set_stage_status(stage, "running")
     seq_len = int(args.usage_seq_len)
-    batch_size = int(args.usage_batch_size)
+    requested_batch_size = int(args.usage_batch_size)
+    batch_size = host_aligned_batch_size(requested_batch_size, ctx.n_hosts)
     topk = int(args.usage_topk)
     max_sequences = int(args.usage_max_sequences)
     max_tokens = max_sequences * seq_len
@@ -351,10 +353,15 @@ def run_usage_stage(ctx: AnalysisContext) -> Dict[str, Any]:
     store.log_event(
         stage,
         "start",
-        message=f"USAGE START parts={max_parts} seq_len={seq_len} batch_size={batch_size} topk={topk}",
+        message=(
+            f"USAGE START parts={max_parts} seq_len={seq_len} "
+            f"batch_size={batch_size} requested_batch_size={requested_batch_size} "
+            f"topk={topk} host={ctx.host_id}/{ctx.n_hosts}"
+        ),
         parts=max_parts,
         seq_len=seq_len,
         batch_size=batch_size,
+        requested_batch_size=requested_batch_size,
         topk=topk,
     )
 
