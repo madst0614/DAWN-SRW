@@ -6,11 +6,12 @@ import hashlib
 import json
 import time
 import traceback
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental.multihost_utils import process_allgather
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
@@ -28,11 +29,28 @@ from analysis.dawn_analysis_storage import (
 )
 from models import dawn_srw_v4166 as v4166
 
+ABLATION_ANALYSIS_IMPL = "dynamic_mask_forward_v2"
+
 
 def _parse_csv_ints(value: str | None, default: Sequence[int]) -> List[int]:
     if not value:
         return list(default)
     return [int(x.strip()) for x in value.split(",") if x.strip()]
+
+
+def _parse_csv_strs(value: str | None, default: Sequence[str]) -> List[str]:
+    if not value:
+        return list(default)
+    allowed = {"top", "random", "low"}
+    out = []
+    for item in value.split(","):
+        name = item.strip()
+        if not name:
+            continue
+        if name not in allowed:
+            raise ValueError(f"Unknown ablation strategy {name!r}; expected one of {sorted(allowed)}")
+        out.append(name)
+    return out or list(default)
 
 
 def _parse_pools(value: str | None) -> List[str]:
@@ -63,17 +81,160 @@ def _loss_from_logits(logits, input_ids):
     )
 
 
-def _eval_forward(forward_fn, batches: List[np.ndarray]) -> Dict[str, Any]:
+def _build_dynamic_suppressed_forward(params, model_cfg):
+    params = v4166._squeeze_params(params)
+    params = jax.tree.map(jnp.asarray, params)
+    angular_execution_kwargs = v4166._angular_execution_kwargs_from_model_cfg(model_cfg)
+
+    def _srw_sup(x, h, op_key, tau_off, raw_scan_offset, w_read, w_write, mult):
+        r_n = v4166._forward_unit_direction(w_read.astype(jnp.float32))
+        w_n = v4166._forward_unit_direction(w_write.astype(jnp.float32))
+        execution_kwargs, admission_den_power = v4166._split_admission_den_kwargs(
+            angular_execution_kwargs
+        )
+        _, admission, _, execution_weight, _ = v4166._angular_execution(
+            h, op_key, tau_off, raw_scan_offset, **execution_kwargs
+        )
+        mult = jnp.asarray(mult, dtype=jnp.float32)
+        execution_weight = execution_weight * mult[None, None, :]
+        admission = admission * mult[None, None, :]
+        xr = x.astype(jnp.float32) @ r_n.T
+        out = (execution_weight * xr) @ w_n
+        admission_den = jnp.power(
+            jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0),
+            admission_den_power,
+        )
+        return (out.astype(jnp.float32) / admission_den).astype(jnp.float32)
+
+    def forward_fn(input_ids, qk_mult, v_mult, rst_mult):
+        input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
+        qk_mult = jnp.asarray(qk_mult, dtype=jnp.float32)
+        v_mult = jnp.asarray(v_mult, dtype=jnp.float32)
+        rst_mult = jnp.asarray(rst_mult, dtype=jnp.float32)
+        bsz, seq_len = input_ids.shape
+        d_model = int(model_cfg["d_model"])
+        n_layers = int(model_cfg["n_layers"])
+        n_heads = int(model_cfg["n_heads"])
+        d_head = d_model // n_heads
+        pp = v4166._pool_params_with_operator_keys(params["neuron_pool"])
+        rp = params["router"]
+        qk_scale_eff, v_scale_eff, rst_scale_eff = v4166._effective_pool_output_scales(
+            pp,
+            d_model,
+            n_layers,
+        )
+
+        positions = jnp.arange(seq_len)[jnp.newaxis, :]
+        x = params["token_emb"]["embedding"][input_ids] + params["pos_emb"]["embedding"][positions]
+        qk_n = pp["attn_qk_op_key"]
+        v_n = pp["attn_v_op_key"]
+        rst_n = pp["rst_op_key"]
+
+        for i in range(n_layers):
+            bp = params[f"block_{i}"]
+            normed = v4166._layer_norm(x, bp["norm1"]["scale"], bp["norm1"]["bias"])
+            h_all = normed @ rp["proj_attn"]["kernel"] + rp["proj_attn"]["bias"]
+            h_q, h_k, h_v = jnp.split(h_all, 3, axis=-1)
+            h_q, h_k, h_v = v4166._read_write_attn_operator_queries(
+                rp,
+                normed,
+                h_q,
+                h_k,
+                h_v,
+            )
+            tau_all = normed @ rp["raw_tau_attn"]["kernel"] + rp["raw_tau_attn"]["bias"]
+            raw_scan_offset_all = jnp.zeros_like(tau_all)
+
+            q = _srw_sup(
+                normed,
+                h_q,
+                qk_n,
+                tau_all[:, :, 0:1],
+                raw_scan_offset_all[:, :, 0:1],
+                pp["attn_qk_read"],
+                pp["attn_qk_write"],
+                qk_mult,
+            )
+            k = _srw_sup(
+                normed,
+                h_k,
+                qk_n,
+                tau_all[:, :, 1:2],
+                raw_scan_offset_all[:, :, 1:2],
+                pp["attn_qk_read"],
+                pp["attn_qk_write"],
+                qk_mult,
+            )
+            v = _srw_sup(
+                normed,
+                h_v,
+                v_n,
+                tau_all[:, :, 2:3],
+                raw_scan_offset_all[:, :, 2:3],
+                pp["attn_v_read"],
+                pp["attn_v_write"],
+                v_mult,
+            )
+            q = q * qk_scale_eff
+            k = k * qk_scale_eff
+            v = v * v_scale_eff
+
+            qr = q.reshape(bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
+            kr = k.reshape(bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
+            vr = v.reshape(bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
+            scores = jnp.einsum("bhsd,bhtd->bhst", qr, kr) / jnp.sqrt(jnp.float32(d_head))
+            causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
+            scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+            attn_w = jax.nn.softmax(scores, axis=-1)
+            attn_out = jnp.einsum("bhst,bhtd->bhsd", attn_w, vr)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(bsz, seq_len, d_model)
+            attn_out = attn_out @ bp["attn"]["expand_O"]["kernel"]
+            x = x + attn_out
+
+            normed = v4166._layer_norm(x, bp["norm2"]["scale"], bp["norm2"]["bias"])
+            h_rst = normed @ rp["proj_rst"]["kernel"] + rp["proj_rst"]["bias"]
+            h_rst = v4166._read_write_rst_operator_query(rp, normed, h_rst)
+            tau_rst = normed @ rp["raw_tau_rst"]["kernel"] + rp["raw_tau_rst"]["bias"]
+            raw_scan_offset_rst = jnp.zeros_like(tau_rst)
+            rst = _srw_sup(
+                normed,
+                h_rst,
+                rst_n,
+                tau_rst,
+                raw_scan_offset_rst,
+                pp["rst_read"],
+                pp["rst_write"],
+                rst_mult,
+            )
+            x = x + rst * rst_scale_eff
+
+        norm_p = params["norm"]
+        x = v4166._layer_norm(x, norm_p["scale"], norm_p["bias"])
+        return x @ params["token_emb"]["embedding"].T
+
+    return forward_fn
+
+
+def _eval_forward(forward_fn, batches: List[np.ndarray],
+                  mults: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> Dict[str, Any]:
     loss_sum = jnp.float32(0.0)
     correct = jnp.int32(0)
     valid = jnp.int32(0)
+    qk_mult, v_mult, rst_mult = mults
     for batch in batches:
         ids = jnp.asarray(batch, dtype=jnp.int32)
-        lsum, corr, val = _loss_from_logits(forward_fn(ids), ids)
+        logits = forward_fn(ids, qk_mult, v_mult, rst_mult)
+        lsum, corr, val = _loss_from_logits(logits, ids)
         loss_sum = loss_sum + lsum
         correct = correct + corr
         valid = valid + val
-    loss_sum_h, correct_h, valid_h = jax.device_get((loss_sum, correct, valid))
+    local = jnp.asarray([loss_sum, correct.astype(jnp.float32), valid.astype(jnp.float32)], dtype=jnp.float32)
+    if int(jax.process_count()) > 1:
+        gathered = np.asarray(process_allgather(local)).reshape(-1, 3)
+        totals = gathered.sum(axis=0)
+    else:
+        totals = np.asarray(jax.device_get(local), dtype=np.float32)
+    loss_sum_h, correct_h, valid_h = float(totals[0]), int(totals[1]), int(totals[2])
     loss = float(loss_sum_h) / max(1, int(valid_h))
     return {
         "loss_sum": float(loss_sum_h),
@@ -122,6 +283,67 @@ def _make_mask(ctx: AnalysisContext, pool: str, ids: Sequence[int]) -> Dict[str,
     return {key: jnp.asarray(arr)}
 
 
+def _make_multipliers(ctx: AnalysisContext, pool: str, ids: Sequence[int]) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    qk = np.ones((_pool_size(ctx, "qk"),), dtype=np.float32)
+    v = np.ones((_pool_size(ctx, "v"),), dtype=np.float32)
+    rst = np.ones((_pool_size(ctx, "rst"),), dtype=np.float32)
+    target = {"qk": qk, "v": v, "rst": rst}[pool]
+    valid_ids = [int(i) for i in ids if 0 <= int(i) < target.shape[0]]
+    if valid_ids:
+        target[np.asarray(valid_ids, dtype=np.int64)] = 0.0
+    return jnp.asarray(qk), jnp.asarray(v), jnp.asarray(rst)
+
+
+def _base_multipliers(ctx: AnalysisContext) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    return (
+        jnp.ones((_pool_size(ctx, "qk"),), dtype=jnp.float32),
+        jnp.ones((_pool_size(ctx, "v"),), dtype=jnp.float32),
+        jnp.ones((_pool_size(ctx, "rst"),), dtype=jnp.float32),
+    )
+
+
+def _job_expected_params(ctx: AnalysisContext, payload: Dict[str, Any],
+                         batch_size: int, seq_len: int, max_sequences: int,
+                         num_batches: int) -> Dict[str, Any]:
+    out = {
+        "analysis_impl": ABLATION_ANALYSIS_IMPL,
+        "pool": payload["pool"],
+        "strategy": payload["strategy"],
+        "k": int(payload["k"]),
+        "batch_size": int(batch_size),
+        "seq_len": int(seq_len),
+        "max_sequences": int(max_sequences),
+        "num_batches": int(num_batches),
+        "n_hosts": int(ctx.n_hosts),
+    }
+    if ctx.checkpoint_step is not None:
+        out["checkpoint_step"] = int(ctx.checkpoint_step)
+    return out
+
+
+def _job_params_match(rec: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    actual = rec.get("analysis_params", {})
+    for key, expected_value in expected.items():
+        if isinstance(expected_value, str):
+            if actual.get(key) != expected_value:
+                return False
+            continue
+        try:
+            if int(actual.get(key)) != int(expected_value):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _all_hosts_true(value: bool) -> bool:
+    if int(jax.process_count()) <= 1:
+        return bool(value)
+    local = jnp.asarray([1 if value else 0], dtype=jnp.int32)
+    gathered = np.asarray(process_allgather(local)).reshape(-1)
+    return bool(np.all(gathered == 1))
+
+
 def _load_batches(ctx: AnalysisContext) -> List[np.ndarray]:
     args = ctx.args
     seq_len = int(args.ablation_seq_len)
@@ -145,45 +367,62 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
     store = ctx.store
     stage = "ablation"
     store.set_stage_status(stage, "running")
-    k_list = _parse_csv_ints(args.ablation_k_list, [1, 4, 16, 64])
+    k_list = _parse_csv_ints(args.ablation_k_list, [1, 16, 64])
     pools = _parse_pools(args.ablation_pools)
+    strategies = _parse_csv_strs(getattr(args, "ablation_strategies", None), ["top"])
     operator_lists = _operator_lists(ctx)
     batches = _load_batches(ctx)
     requested_batch_size = int(args.ablation_batch_size)
     batch_size = host_aligned_batch_size(requested_batch_size, ctx.n_hosts)
+    seq_len = int(args.ablation_seq_len)
+    max_sequences = int(args.ablation_max_sequences)
+    total_jobs = len(pools) * len(k_list) * len(strategies)
 
     store.log_event(
         stage,
         "start",
         message=(
-            f"ABLATION START jobs={len(pools) * len(k_list) * 3} "
+            f"ABLATION START jobs={total_jobs} "
             f"batches={len(batches)} batch_size={batch_size} "
             f"requested_batch_size={requested_batch_size} "
-            f"k={k_list} pools={','.join(pools)} host={ctx.host_id}/{ctx.n_hosts}"
+            f"k={k_list} pools={','.join(pools)} "
+            f"strategies={','.join(strategies)} host={ctx.host_id}/{ctx.n_hosts}"
         ),
         pools=pools,
         k_list=k_list,
+        strategies=strategies,
         batches=len(batches),
         batch_size=batch_size,
         requested_batch_size=requested_batch_size,
     )
 
-    base_forward = jax.jit(v4166.build_suppressed_forward(ctx.params, ctx.model_cfg, {}))
-    base = _eval_forward(base_forward, batches)
+    if ctx.is_primary:
+        store.log_event(
+            stage,
+            "base_start",
+            message=(
+                f"ABLATION BASE START dynamic_mask_jit batches={len(batches)} "
+                f"batch_size={batch_size} host_count={ctx.n_hosts}"
+            ),
+        )
+    forward = jax.jit(_build_dynamic_suppressed_forward(ctx.params, ctx.model_cfg))
+    base = _eval_forward(forward, batches, _base_multipliers(ctx))
     if ctx.is_primary:
         store.log_event(
             stage,
             "base",
-            message=f"ABLATION BASE loss={base['loss']:.6f} acc={base['accuracy']:.4f} tokens={base['valid_count']:,}",
+            message=(
+                f"ABLATION BASE loss={base['loss']:.6f} acc={base['accuracy']:.4f} "
+                f"tokens={base['valid_count']:,} hosts={ctx.n_hosts}"
+            ),
             **base,
         )
 
     records = []
-    total_jobs = len(pools) * len(k_list) * 3
     completed_jobs = 0
     jobs_t0 = time.time()
     for pool in pools:
-        for strategy in ("top", "random", "low"):
+        for strategy in strategies:
             candidates = operator_lists[pool][strategy]
             for k in k_list:
                 op_ids = [int(x) for x in candidates[: min(int(k), len(candidates))]]
@@ -196,30 +435,51 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
                 }
                 jid = _job_id(payload)
                 path = store.path("ablation", "jobs", f"job-{jid}.json")
-                if args.resume and should_skip_job(path, ["delta_loss"]):
+                expected_params = _job_expected_params(
+                    ctx,
+                    payload,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    max_sequences=max_sequences,
+                    num_batches=len(batches),
+                )
+                rec = {}
+                local_skip = False
+                if args.resume and should_skip_job(path, ["delta_loss", "analysis_params"]):
                     rec = read_json(path)
+                    local_skip = _job_params_match(rec, expected_params)
+                if _all_hosts_true(local_skip):
                     records.append(rec)
                     completed_jobs += 1
                     elapsed = time.time() - jobs_t0
                     eta = (elapsed / completed_jobs) * max(0, total_jobs - completed_jobs)
-                    store.log_event(
-                        stage,
-                        "job_skip",
-                        message=(
-                            f"ABLATION job {completed_jobs:03d}/{total_jobs:03d} "
-                            f"{pool}/{strategy}/k={k} SKIP "
-                            f"delta_loss={float(rec.get('delta_loss', 0.0)):.6f} "
-                            f"elapsed={format_duration(elapsed)} eta={format_duration(eta)}"
-                        ),
-                        **rec,
-                    )
+                    if ctx.is_primary:
+                        store.log_event(
+                            stage,
+                            "job_skip",
+                            message=(
+                                f"ABLATION job {completed_jobs:03d}/{total_jobs:03d} "
+                                f"{pool}/{strategy}/k={k} SKIP "
+                                f"delta_loss={float(rec.get('delta_loss', 0.0)):.6f} "
+                                f"elapsed={format_duration(elapsed)} eta={format_duration(eta)}"
+                            ),
+                            **rec,
+                        )
                     continue
                 store.mark_job_started(stage, jid)
                 try:
                     job_t0 = time.time()
-                    masks = _make_mask(ctx, pool, op_ids)
-                    forward = jax.jit(v4166.build_suppressed_forward(ctx.params, ctx.model_cfg, masks))
-                    ablated = _eval_forward(forward, batches)
+                    job_no = completed_jobs + 1
+                    if ctx.is_primary:
+                        store.log_event(
+                            stage,
+                            "job_start",
+                            message=(
+                                f"ABLATION job {job_no:03d}/{total_jobs:03d} START "
+                                f"{pool}/{strategy}/k={k} ops={len(op_ids)}"
+                            ),
+                        )
+                    ablated = _eval_forward(forward, batches, _make_multipliers(ctx, pool, op_ids))
                     job_sec = time.time() - job_t0
                     completed_jobs += 1
                     elapsed = time.time() - jobs_t0
@@ -227,6 +487,7 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
                     rec = {
                         **payload,
                         "job_id": jid,
+                        "analysis_params": expected_params,
                         "base_loss": base["loss"],
                         "ablated_loss": ablated["loss"],
                         "delta_loss": ablated["loss"] - base["loss"],
@@ -269,11 +530,7 @@ def run_ablation_stage(ctx: AnalysisContext) -> Dict[str, Any]:
                         raise
 
     if ctx.is_primary:
-        if args.resume:
-            job_paths = list_paths(store.path("ablation", "jobs"), "job-*.json")
-            all_records = [read_json(p) for p in job_paths if should_skip_job(p, ["delta_loss"])]
-        else:
-            all_records = list(records)
+        all_records = list(records)
         csv_rows = [
             {
                 "pool": r["pool"],

@@ -70,6 +70,9 @@ while [[ $# -gt 0 ]]; do
         --usage-seq-len) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-seq-len $2"; shift 2 ;;
         --trace-max-prompts) ANALYSIS_ARGS="$ANALYSIS_ARGS --trace-max-prompts $2"; shift 2 ;;
         --ablation-max-sequences) ANALYSIS_ARGS="$ANALYSIS_ARGS --ablation-max-sequences $2"; shift 2 ;;
+        --ablation-batch-size) ANALYSIS_ARGS="$ANALYSIS_ARGS --ablation-batch-size $2"; shift 2 ;;
+        --ablation-k-list) ANALYSIS_ARGS="$ANALYSIS_ARGS --ablation-k-list $2"; shift 2 ;;
+        --ablation-strategies) ANALYSIS_ARGS="$ANALYSIS_ARGS --ablation-strategies $2"; shift 2 ;;
         --max-jobs-per-stage) ANALYSIS_ARGS="$ANALYSIS_ARGS --max-jobs-per-stage $2"; shift 2 ;;
         --extra-arg) ANALYSIS_ARGS="$ANALYSIS_ARGS $2"; shift 2 ;;
         -h|--help)

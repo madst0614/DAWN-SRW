@@ -110,8 +110,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ablation-max-sequences", type=int, default=64)
     p.add_argument("--ablation-batch-size", type=int, default=64)
     p.add_argument("--ablation-seq-len", type=int, default=128)
-    p.add_argument("--ablation-k-list", default="1,4,16,64")
+    p.add_argument("--ablation-k-list", default="1,16,64")
     p.add_argument("--ablation-pools", default="qk,v,rst")
+    p.add_argument("--ablation-strategies", default="top")
     p.add_argument("--ablation-random-seeds", type=int, default=3)
 
     p.add_argument("--enable-patching", action="store_true")
