@@ -55,10 +55,10 @@ model:
   tau_init_target_rst_frac: 0.24
 
 training:
-  batch_size: 1024
+  batch_size: 512
   mesh_model: 2
   mesh_data: 16
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2
   num_epochs: 1
 
   n_chunks_qk: 1
