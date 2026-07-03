@@ -106,14 +106,18 @@ def _run_one_eps(ctx: AnalysisContext, eps: float, max_batches: int,
         cfg=ctx.config,
         total_training_steps=ctx.total_training_steps,
     )
-    existing_rows = read_jsonl(by_batch_path) if args.resume and ctx.is_primary else []
+    existing_rows = read_jsonl(by_batch_path) if args.resume else []
     rows_by_idx = {int(r["batch_idx"]): r for r in existing_rows if "batch_idx" in r}
     completed = set(rows_by_idx)
 
     store.log_event(
         stage,
         "eps_start",
-        message=f"PRUNE eps={eps:g} START batches={max_batches} batch_size={batch_size} seq_len={max_len}",
+        message=(
+            f"PRUNE eps={eps:g} START batches={max_batches} "
+            f"batch_size={batch_size} seq_len={max_len} "
+            f"host={ctx.host_id}/{ctx.n_hosts} primary={ctx.is_primary}"
+        ),
         eps=eps,
         batches=max_batches,
     )
@@ -122,6 +126,20 @@ def _run_one_eps(ctx: AnalysisContext, eps: float, max_batches: int,
         if batch_idx >= max_batches:
             break
         if args.resume and batch_idx in completed:
+            row = rows_by_idx[batch_idx]
+            store.log_event(
+                stage,
+                "batch_skip",
+                message=(
+                    f"PRUNE eps={eps:g} batch {batch_idx + 1:05d}/{max_batches:05d} SKIP "
+                    f"loss={float(row.get('loss', 0.0)):.6f} "
+                    f"acc={float(row.get('accuracy', 0.0)):.4f} "
+                    f"compute={float(row.get('estimated_compute_frac', 0.0)):.4f} "
+                    f"host={ctx.host_id}/{ctx.n_hosts} primary={ctx.is_primary}"
+                ),
+                print_stdout=(batch_idx % max(1, int(args.log_every_batches)) == 0),
+                **row,
+            )
             continue
         job_id = f"eps-{tag}-batch-{batch_idx:06d}"
         store.mark_job_started(stage, job_id)
@@ -159,27 +177,43 @@ def _run_one_eps(ctx: AnalysisContext, eps: float, max_batches: int,
             "tok_per_sec": valid / sec if sec > 0 else 0.0,
         }
         rows_by_idx[batch_idx] = row
+        rows = [rows_by_idx[i] for i in sorted(rows_by_idx)]
         if ctx.is_primary:
-            rows = [rows_by_idx[i] for i in sorted(rows_by_idx)]
             write_jsonl_atomic(by_batch_path, rows)
             store.mark_job_complete(stage, job_id, by_batch_path, row)
-            store.log_event(
-                stage,
-                "batch",
-                message=(
-                    f"PRUNE eps={eps:g} batch {batch_idx + 1:05d}/{max_batches:05d} "
-                    f"loss={loss:.6f} acc={row['accuracy']:.4f} "
-                    f"compute={row['estimated_compute_frac']:.4f} "
-                    f"mass={row['execution_gate_mass_retained']:.4f} "
-                    f"tok/s={row['tok_per_sec']:.0f}"
-                ),
-                **row,
-            )
+        store.log_event(
+            stage,
+            "batch",
+            message=(
+                f"PRUNE eps={eps:g} batch {batch_idx + 1:05d}/{max_batches:05d} "
+                f"loss={loss:.6f} acc={row['accuracy']:.4f} "
+                f"compute={row['estimated_compute_frac']:.4f} "
+                f"mass={row['execution_gate_mass_retained']:.4f} "
+                f"tok/s={row['tok_per_sec']:.0f} "
+                f"host={ctx.host_id}/{ctx.n_hosts} primary={ctx.is_primary}"
+            ),
+            print_stdout=(batch_idx % max(1, int(args.log_every_batches)) == 0),
+            **row,
+        )
 
-    if not ctx.is_primary:
-        return {}
     rows = [rows_by_idx[i] for i in sorted(rows_by_idx) if i < max_batches]
     summary = _aggregate(rows, eps, base_loss)
+    if not ctx.is_primary:
+        store.log_event(
+            stage,
+            "host_eps_summary",
+            message=(
+                f"PRUNE eps={eps:g} HOST SUMMARY "
+                f"loss={summary['val_loss']:.6f} "
+                f"delta={summary['delta_loss_vs_eps0']} "
+                f"acc={summary['accuracy']:.4f} "
+                f"compute={summary['estimated_compute_frac']:.4f} "
+                f"mass={summary['execution_gate_mass_retained']:.4f} "
+                f"host={ctx.host_id}/{ctx.n_hosts}"
+            ),
+            **summary,
+        )
+        return {}
     write_json_atomic(summary_path, summary)
     store.mark_job_complete(stage, f"eps-{tag}", summary_path, summary)
     store.log_event(
@@ -259,4 +293,3 @@ def run_prune_stage(ctx: AnalysisContext) -> Dict[str, Any]:
         )
         return final
     return {}
-

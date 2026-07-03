@@ -90,7 +90,7 @@ def run_eval_stage(ctx: AnalysisContext) -> Dict[str, Any]:
         total_training_steps=ctx.total_training_steps,
     )
 
-    existing_rows = read_jsonl(by_batch_path) if args.resume and ctx.is_primary else []
+    existing_rows = read_jsonl(by_batch_path) if args.resume else []
     completed = {int(r["batch_idx"]) for r in existing_rows if "batch_idx" in r}
     rows_by_idx = {int(r["batch_idx"]): r for r in existing_rows if "batch_idx" in r}
 
@@ -100,7 +100,8 @@ def run_eval_stage(ctx: AnalysisContext) -> Dict[str, Any]:
         message=(
             "EVAL START "
             f"batches={max_batches} batch_size={batch_size} seq_len={max_len} "
-            f"max_tokens={max_tokens:,} checkpoint_step={ctx.checkpoint_step}"
+            f"max_tokens={max_tokens:,} checkpoint_step={ctx.checkpoint_step} "
+            f"host={ctx.host_id}/{ctx.n_hosts} primary={ctx.is_primary}"
         ),
         batches=max_batches,
         batch_size=batch_size,
@@ -113,19 +114,19 @@ def run_eval_stage(ctx: AnalysisContext) -> Dict[str, Any]:
             break
         if args.resume and batch_idx in completed:
             row = rows_by_idx[batch_idx]
-            if ctx.is_primary:
-                store.log_event(
-                    stage,
-                    "batch_skip",
-                    message=(
-                        "EVAL batch "
-                        f"{batch_idx + 1:05d}/{max_batches:05d} SKIP "
-                        f"loss={float(row.get('loss', 0.0)):.6f} "
-                        f"acc={float(row.get('accuracy', 0.0)):.4f}"
-                    ),
-                    print_stdout=(batch_idx % max(1, int(args.log_every_batches)) == 0),
-                    **row,
-                )
+            store.log_event(
+                stage,
+                "batch_skip",
+                message=(
+                    "EVAL batch "
+                    f"{batch_idx + 1:05d}/{max_batches:05d} SKIP "
+                    f"loss={float(row.get('loss', 0.0)):.6f} "
+                    f"acc={float(row.get('accuracy', 0.0)):.4f} "
+                    f"host={ctx.host_id}/{ctx.n_hosts} primary={ctx.is_primary}"
+                ),
+                print_stdout=(batch_idx % max(1, int(args.log_every_batches)) == 0),
+                **row,
+            )
             continue
         job_id = f"batch-{batch_idx:06d}"
         store.mark_job_started(stage, job_id)
@@ -153,31 +154,33 @@ def run_eval_stage(ctx: AnalysisContext) -> Dict[str, Any]:
             "host_count": int(ctx.n_hosts),
         }
         rows_by_idx[batch_idx] = row
+        rows = [rows_by_idx[i] for i in sorted(rows_by_idx)]
         if ctx.is_primary:
-            rows = [rows_by_idx[i] for i in sorted(rows_by_idx)]
             write_jsonl_atomic(by_batch_path, rows)
             store.mark_job_complete(stage, job_id, by_batch_path, row)
-            store.log_event(
-                stage,
-                "batch",
-                message=(
-                    "EVAL batch "
-                    f"{batch_idx + 1:05d}/{max_batches:05d} "
-                    f"loss={loss_f:.6f} acc={row['accuracy']:.4f} "
-                    f"tokens={valid_i:,} tok/s={row['tok_per_sec']:.0f} "
-                    f"sec={sec:.2f}"
-                ),
-                **row,
-            )
+        store.log_event(
+            stage,
+            "batch",
+            message=(
+                "EVAL batch "
+                f"{batch_idx + 1:05d}/{max_batches:05d} "
+                f"loss={loss_f:.6f} acc={row['accuracy']:.4f} "
+                f"tokens={valid_i:,} tok/s={row['tok_per_sec']:.0f} "
+                f"sec={sec:.2f} host={ctx.host_id}/{ctx.n_hosts} "
+                f"primary={ctx.is_primary}"
+            ),
+            print_stdout=(batch_idx % max(1, int(args.log_every_batches)) == 0),
+            **row,
+        )
 
+    rows = [rows_by_idx[i] for i in sorted(rows_by_idx) if i < max_batches]
+    summary = _aggregate(rows)
+    summary.update({
+        "checkpoint_step": ctx.checkpoint_step,
+        "batch_size": batch_size,
+        "max_val_tokens": max_tokens,
+    })
     if ctx.is_primary:
-        rows = [rows_by_idx[i] for i in sorted(rows_by_idx) if i < max_batches]
-        summary = _aggregate(rows)
-        summary.update({
-            "checkpoint_step": ctx.checkpoint_step,
-            "batch_size": batch_size,
-            "max_val_tokens": max_tokens,
-        })
         write_json_atomic(final_path, summary)
         store.mark_job_complete(stage, "final", final_path, summary)
         store.set_stage_status(stage, "complete")
@@ -195,5 +198,18 @@ def run_eval_stage(ctx: AnalysisContext) -> Dict[str, Any]:
             **summary,
         )
         return summary
+    store.log_event(
+        stage,
+        "host_summary",
+        message=(
+            "EVAL HOST SUMMARY "
+            f"loss={summary['val_loss']:.6f} "
+            f"ppl={summary['ppl']:.3f} "
+            f"acc={summary['accuracy']:.4f} "
+            f"tokens={summary['valid_tokens']:,} "
+            f"tok/s={summary['tok_per_sec']:.0f} "
+            f"host={ctx.host_id}/{ctx.n_hosts}"
+        ),
+        **summary,
+    )
     return {}
-
