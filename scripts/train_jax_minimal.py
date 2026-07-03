@@ -18,6 +18,7 @@ import sys
 import time
 from copy import deepcopy
 from datetime import datetime, timezone, timedelta
+from functools import partial
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -569,7 +570,7 @@ def create_train_step_minimal(
     _tau_update_abs_cap = jnp.float32(tau_update_abs_cap)
     _scan_update_abs_cap = jnp.float32(scan_update_abs_cap)
 
-    @jax.jit
+    @partial(jax.jit, donate_argnums=(0, 1))
     def train_step(params, opt_state, input_ids, attention_mask,
                    dropout_key, step):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
@@ -937,7 +938,7 @@ def _chunk_size_from_count(name, n_local, n_chunks):
 
 
 def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
-                              per_device_batch, is_host0):
+                              per_data_shard_batch, is_host0):
     model_version = str(cfg['model'].get(
         'model_version', full.OFFICIAL_MODEL_VERSION))
     if not full._is_active_srw_version(model_version):
@@ -980,7 +981,7 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
     nrst_local = n_rst_for_chunks // mesh_model
 
     def auto_n_chunks(n, target_gb=2.0):
-        full_gb = per_device_batch * max_seq_len * n * 2 / 1e9
+        full_gb = per_data_shard_batch * max_seq_len * n * 2 / 1e9
         nc = max(1, int(np.ceil(full_gb / target_gb)))
         while n % nc != 0 and nc < n:
             nc += 1
@@ -1071,6 +1072,7 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
         print(
             "  shard_map minimal enabled "
             f"(mesh_model={mesh_model}, QK fused; "
+            f"per_data_shard_batch={per_data_shard_batch}; "
             f"chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}; "
             f"max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}; "
             f"analysis kernels=off{extra_msg})")
@@ -1689,6 +1691,11 @@ def main():
     total_devices = jax.device_count()
     if mesh_data == 0:
         mesh_data = total_devices // mesh_model
+    if batch_size % mesh_data != 0:
+        raise ValueError(
+            f"batch_size={batch_size} must be divisible by "
+            f"mesh_data={mesh_data}")
+    per_data_shard_batch = batch_size // mesh_data
     _stage_log("before_create_mesh")
     mesh = full.create_mesh(mesh_data, mesh_model)
     _stage_log("after_create_mesh", {
@@ -1701,7 +1708,8 @@ def main():
     if is_host0:
         print(
             f"\n=== Mesh: ({mesh_data}, {mesh_model}) = "
-            f"{total_devices} devices, per_device_batch={per_device_batch} ===")
+            f"{total_devices} devices, per_device_batch={per_device_batch}, "
+            f"per_data_shard_batch={per_data_shard_batch} ===")
 
     _stage_log("before_shard_params")
     if 'model_version' not in inspect.signature(
@@ -1712,6 +1720,9 @@ def main():
             "Update scripts/train_jax.py first.")
     param_shardings = full.get_param_shardings(
         params, mesh, model_version=model_version_cfg)
+    if is_host0:
+        full._print_param_sharding_summary(
+            param_shardings, model_version_cfg)
     params = full.shard_params_to_mesh(params, param_shardings)
     _stage_log("after_shard_params")
     _stage_barrier("after_shard_params")
@@ -1744,7 +1755,7 @@ def main():
     # two masked add_decayed_weights (base + pool -masks are disjoint so
     # each param is touched at most once), then a single scale_by_lr.
 
-    _MODEL_VERSION = OFFICIAL_MODEL_VERSION
+    _MODEL_VERSION = str(model_version_cfg)
     _FORWARD_UNIT_RW_VERSIONS = set()
 
     _POOL_PARAM_NAMES = (
@@ -1957,7 +1968,7 @@ def main():
     _stage_log("before_make_minimal_sharded_fns")
     sharded_fns, chunk_counts, max_chunks = _make_minimal_sharded_fns(
         cfg, mesh, mesh_model, batch_size, max_seq_len,
-        per_device_batch, is_host0)
+        per_data_shard_batch, is_host0)
     _stage_log("after_make_minimal_sharded_fns", {
         "chunk_counts": [int(x) for x in chunk_counts],
         "max_chunks": [int(x) for x in max_chunks],

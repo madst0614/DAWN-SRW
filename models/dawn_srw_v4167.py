@@ -579,6 +579,55 @@ def scaled_normal(scale=0.02):
     return init
 
 
+def _chunked_ce_loss_and_acc(shift_x, embedding_matrix, shift_labels,
+                             valid_mask, token_chunk_size=2048):
+    B, T, D = shift_x.shape
+    flat_x = shift_x.reshape(B * T, D)
+    flat_labels = shift_labels.reshape(B * T)
+    flat_valid = valid_mask.reshape(B * T)
+
+    n_tokens = flat_x.shape[0]
+    pad = (-n_tokens) % token_chunk_size
+    flat_x = jnp.pad(flat_x, ((0, pad), (0, 0)))
+    flat_labels = jnp.pad(flat_labels, ((0, pad),), constant_values=0)
+    flat_valid = jnp.pad(flat_valid, ((0, pad),), constant_values=False)
+
+    flat_x = flat_x.reshape(-1, token_chunk_size, D)
+    flat_labels = flat_labels.reshape(-1, token_chunk_size)
+    flat_valid = flat_valid.reshape(-1, token_chunk_size)
+
+    @jax.checkpoint
+    def step(carry, xs):
+        loss_sum, correct_sum, valid_sum = carry
+        x_c, labels_c, valid_c = xs
+
+        logits = x_c @ embedding_matrix.T
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        safe_labels = jnp.where(valid_c, labels_c, 0)
+        token_loss = -jnp.take_along_axis(
+            log_probs, safe_labels[..., None], axis=-1).squeeze(-1)
+        token_loss = token_loss.astype(jnp.float32)
+        valid_f = valid_c.astype(jnp.float32)
+
+        preds = jnp.argmax(logits, axis=-1)
+        loss_sum = loss_sum + (token_loss * valid_f).sum()
+        correct_sum = (
+            correct_sum
+            + ((preds == labels_c) & valid_c).astype(jnp.int32).sum())
+        valid_sum = valid_sum + valid_c.astype(jnp.int32).sum()
+        return (loss_sum, correct_sum, valid_sum), None
+
+    init = (
+        jnp.array(0.0, dtype=jnp.float32),
+        jnp.array(0, dtype=jnp.int32),
+        jnp.array(0, dtype=jnp.int32),
+    )
+    (loss_sum, correct, valid_count), _ = jax.lax.scan(
+        step, init, (flat_x, flat_labels, flat_valid))
+    loss = loss_sum / (valid_count.astype(jnp.float32) + 1e-8)
+    return loss, correct, valid_count
+
+
 def unit_norm_init(scale=1.0):
     def init(key, shape, dtype=jnp.float32):
         x = jax.random.normal(key, shape, dtype)
@@ -4260,22 +4309,7 @@ class DAWN_SRW_V4167(nn.Module):
                 shift_labels = labels[:, 1:].astype(jnp.int32)
                 valid_mask = (shift_labels != -100)
 
-                @jax.checkpoint
-                def compute_loss_and_acc(x_chunk, emb, labs, vmask):
-                    logits = x_chunk @ emb.T
-                    log_probs = jax.nn.log_softmax(logits, axis=-1)
-                    safe = jnp.where(vmask, labs, 0)
-                    token_loss = -jnp.take_along_axis(
-                        log_probs, safe[..., jnp.newaxis],
-                        axis=-1).squeeze(-1)
-                    loss = (
-                        (token_loss * vmask).sum()
-                        / (vmask.sum() + 1e-8))
-                    preds = jnp.argmax(logits, axis=-1)
-                    correct = jnp.sum((preds == labs) & vmask)
-                    return loss, correct, jnp.sum(vmask)
-
-                loss, correct, valid_count = compute_loss_and_acc(
+                loss, correct, valid_count = _chunked_ce_loss_and_acc(
                     shift_x, embedding_matrix, shift_labels, valid_mask)
                 return {
                     'loss': loss,
