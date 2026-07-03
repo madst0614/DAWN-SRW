@@ -80,6 +80,8 @@ from models.dawn_srw_v4167 import (
 )
 from models.dawn_srw_v4168 import (
     DAWN_SRW_V4168,
+    hardware_sector_static_metrics as _v4168_hardware_sector_static_metrics,
+    maybe_hardware_repack as _v4168_maybe_hardware_repack,
     _pool_operator_keys as _v4168_pool_operator_keys,
     _raw_tau_init_from_cosine_tau as _v4168_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4168_tau_init_calibration_scores,
@@ -1083,6 +1085,83 @@ def _cfg_bool(value, *, name):
             return False
         raise ValueError(f"{name} must be a boolean, got {value!r}.")
     return bool(value)
+
+
+def _v4168_hardware_repack_config(training_cfg, model_version):
+    """Parse hardware-sector repack/execution config with disabled defaults."""
+    is_v4168 = str(model_version) == V4168_MODEL_VERSION
+    enabled = (
+        _cfg_bool(training_cfg.get('hardware_repack_enabled', False),
+                  name='training.hardware_repack_enabled')
+        if is_v4168 else False)
+    sector_execution_enabled = (
+        _cfg_bool(
+            training_cfg.get(
+                'hardware_sector_execution_enabled', enabled),
+            name='training.hardware_sector_execution_enabled')
+        if is_v4168 else False)
+    interval_steps = int(training_cfg.get(
+        'hardware_repack_interval_steps', 100))
+    farthest_per_sector = int(training_cfg.get(
+        'hardware_repack_farthest_per_sector', 10))
+    gain_eps = float(training_cfg.get('hardware_repack_gain_eps', 1.0e-3))
+    warmup_steps = int(training_cfg.get('hardware_repack_warmup_steps', 0))
+    freeze_after_step = training_cfg.get(
+        'hardware_repack_freeze_after_step', None)
+    if freeze_after_step is not None:
+        freeze_after_step = int(freeze_after_step)
+
+    if enabled and not is_v4168:
+        raise ValueError(
+            "training.hardware_repack_enabled is only supported for "
+            f"{V4168_MODEL_VERSION}.")
+    if sector_execution_enabled and not is_v4168:
+        raise ValueError(
+            "training.hardware_sector_execution_enabled is only supported for "
+            f"{V4168_MODEL_VERSION}.")
+    if interval_steps <= 0:
+        raise ValueError(
+            "training.hardware_repack_interval_steps must be > 0, got "
+            f"{interval_steps}.")
+    if farthest_per_sector < 0:
+        raise ValueError(
+            "training.hardware_repack_farthest_per_sector must be >= 0, got "
+            f"{farthest_per_sector}.")
+    if gain_eps < 0.0:
+        raise ValueError(
+            "training.hardware_repack_gain_eps must be >= 0, got "
+            f"{gain_eps}.")
+    if warmup_steps < 0:
+        raise ValueError(
+            "training.hardware_repack_warmup_steps must be >= 0, got "
+            f"{warmup_steps}.")
+    if freeze_after_step is not None and freeze_after_step < 0:
+        raise ValueError(
+            "training.hardware_repack_freeze_after_step must be null or >= 0, "
+            f"got {freeze_after_step}.")
+
+    return {
+        'hardware_repack_enabled': bool(enabled),
+        'hardware_sector_execution_enabled': bool(sector_execution_enabled),
+        'hardware_repack_interval_steps': interval_steps,
+        'hardware_repack_farthest_per_sector': farthest_per_sector,
+        'hardware_repack_gain_eps': gain_eps,
+        'hardware_repack_warmup_steps': warmup_steps,
+        'hardware_repack_freeze_after_step': freeze_after_step,
+    }
+
+
+def _v4168_should_hardware_repack(step, repack_cfg):
+    if not repack_cfg.get('hardware_repack_enabled', False):
+        return False
+    step = int(step)
+    if step < int(repack_cfg.get('hardware_repack_warmup_steps', 0)):
+        return False
+    freeze_after = repack_cfg.get('hardware_repack_freeze_after_step', None)
+    if freeze_after is not None and step > int(freeze_after):
+        return False
+    interval = int(repack_cfg.get('hardware_repack_interval_steps', 100))
+    return step > 0 and (step % interval == 0)
 
 
 def _materialize_v4167_model_config(cfg):
@@ -9305,6 +9384,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         pl_a, pl_k = [], []
     rec['per_layer_attn_out_norm'] = pl_a
     rec['per_layer_rst_out_norm'] = pl_k
+    for _key, _value in m.items():
+        if isinstance(_key, str) and (
+                _key.startswith('repack/') or _key.startswith('sector/')):
+            rec[_key] = float(_value)
     return rec
 
 
@@ -10523,6 +10606,12 @@ def main():
     model_version_cfg = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     is_v4164_cfg = _is_active_srw_version(model_version_cfg)
     is_baseline = _is_baseline_version(model_version_cfg)
+    hardware_repack_config = _v4168_hardware_repack_config(
+        tcfg, model_version_cfg)
+    hardware_repack_enabled = bool(
+        hardware_repack_config['hardware_repack_enabled'])
+    hardware_sector_execution_enabled = bool(
+        hardware_repack_config['hardware_sector_execution_enabled'])
     tau_init_cfg = (
         _v4164_tau_init_config(cfg)
         if _is_active_srw_version(model_version_cfg)
@@ -10986,6 +11075,12 @@ def main():
         model_version_cfg = cfg['model']['model_version']
         is_v4164_cfg = _is_active_srw_version(model_version_cfg)
         is_baseline = _is_baseline_version(model_version_cfg)
+        hardware_repack_config = _v4168_hardware_repack_config(
+            tcfg, model_version_cfg)
+        hardware_repack_enabled = bool(
+            hardware_repack_config['hardware_repack_enabled'])
+        hardware_sector_execution_enabled = bool(
+            hardware_repack_config['hardware_sector_execution_enabled'])
         tau_init_cfg = (
             _v4164_tau_init_config(cfg)
             if _is_active_srw_version(model_version_cfg)
@@ -11539,6 +11634,19 @@ def main():
         'soft_gate_boundary_power_final_frac': soft_gate_boundary_power_final_frac,
         'admission_den_power': admission_den_power,
         'admission_den_grad_scale': admission_den_grad_scale,
+        'hardware_repack_enabled': hardware_repack_enabled,
+        'hardware_sector_execution_enabled':
+            hardware_sector_execution_enabled,
+        'hardware_repack_interval_steps':
+            hardware_repack_config['hardware_repack_interval_steps'],
+        'hardware_repack_farthest_per_sector':
+            hardware_repack_config['hardware_repack_farthest_per_sector'],
+        'hardware_repack_gain_eps':
+            hardware_repack_config['hardware_repack_gain_eps'],
+        'hardware_repack_warmup_steps':
+            hardware_repack_config['hardware_repack_warmup_steps'],
+        'hardware_repack_freeze_after_step':
+            hardware_repack_config['hardware_repack_freeze_after_step'],
         'soft_gate_effective_active_eps': soft_gate_effective_active_eps,
         'regular_console_level': regular_console_level,
         'regular_console_host_timing': regular_console_host_timing,
@@ -12739,6 +12847,8 @@ def main():
                     'block_size': int(m_cfg.get(f'{pool}_block_size', 256)),
                     'top_blocks': int(m_cfg.get(f'{pool}_top_blocks', 2)),
                     'block_margin': float(m_cfg.get('block_margin', 0.0)),
+                    'hardware_sector_execution_enabled':
+                        hardware_sector_execution_enabled,
                 })
             return kwargs
 
@@ -12841,8 +12951,12 @@ def main():
                 "; v4167 TP extras=router_dense,attention_o,vocab_parallel"
                 if str(model_version_cfg) == V4167_MODEL_VERSION else "")
             if str(model_version_cfg) == V4168_MODEL_VERSION:
+                _v4168_exec_mode = (
+                    "sector_topk"
+                    if hardware_sector_execution_enabled
+                    else "block_sparse_fallback")
                 _extra_msg = (
-                    "; v4168 minimal block_sparse "
+                    f"; v4168 minimal {_v4168_exec_mode} "
                     f"block_size qk/v/rst={cfg['model'].get('qk_block_size', 256)}/"
                     f"{cfg['model'].get('v_block_size', 256)}/"
                     f"{cfg['model'].get('rst_block_size', 256)}, "
@@ -13833,6 +13947,35 @@ def main():
                 params, opt_state,
                 input_ids, attention_mask, step_rng, _prev_op_key_snap,
                 jnp.asarray(global_step, jnp.int32))
+
+            step_after_update = global_step + 1
+            if hardware_sector_execution_enabled:
+                metrics.update({
+                    k: jnp.asarray(v, dtype=jnp.float32)
+                    for k, v in _v4168_hardware_sector_static_metrics(
+                        cfg['model']).items()
+                })
+            if _v4168_should_hardware_repack(
+                    step_after_update, hardware_repack_config):
+                params, opt_state, repack_metrics = (
+                    _v4168_maybe_hardware_repack(
+                        params, opt_state, cfg['model'], mesh,
+                        step_after_update, hardware_repack_config))
+                if repack_metrics:
+                    metrics.update({
+                        k: jnp.asarray(v, dtype=jnp.float32)
+                        for k, v in repack_metrics.items()
+                    })
+                    if is_host0:
+                        log_jsonl({
+                            'type': 'hardware_repack',
+                            'step': int(step_after_update),
+                            'epoch': int(epoch),
+                            **{k: float(v)
+                               for k, v in repack_metrics.items()},
+                            'timestamp': datetime.now().isoformat(),
+                        })
+                        sync_logs()
 
             # Scalar helper kept for log-block use (m_grad etc.).
             def _m(v):

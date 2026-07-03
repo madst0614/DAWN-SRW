@@ -109,6 +109,12 @@ training:
     - 1.0e-06
     - 1.0e-05
     - 0.0001
+  hardware_repack_enabled: true
+  hardware_repack_interval_steps: 100
+  hardware_repack_farthest_per_sector: 10
+  hardware_repack_gain_eps: 1.0e-3
+  hardware_repack_warmup_steps: 0
+  hardware_repack_freeze_after_step: null
   checkpoint_interval: 200
   val_interval: 1000
   log_interval: 100
