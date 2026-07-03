@@ -115,6 +115,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ablation-strategies", default="top")
     p.add_argument("--ablation-random-seeds", type=int, default=3)
 
+    p.add_argument("--report-format", default="html,md", help="Comma-separated report outputs: html,md.")
+    p.add_argument("--report-max-operator-cards", type=int, default=100)
+    p.add_argument("--report-max-trace-figures", type=int, default=12)
+    p.add_argument("--report-include-appendix", action="store_true", default=True)
+    p.add_argument("--baseline-analysis-output", default=None, help="Optional baseline analysis output directory.")
+    p.add_argument("--baseline-eval-json", default=None, help="Optional baseline eval/final_eval.json path.")
+
     p.add_argument("--enable-patching", action="store_true")
     p.add_argument("--enable-steering", action="store_true")
     return p.parse_args()
@@ -332,7 +339,7 @@ def main() -> int:
     for stage in stages:
         try:
             if stage == "report" and ctx is None:
-                run_report_stage(None, store=store)
+                run_report_stage(None, store=store, args=args)
             elif ctx is None:
                 raise ValueError(f"Stage {stage} requires a loaded model context.")
             else:
