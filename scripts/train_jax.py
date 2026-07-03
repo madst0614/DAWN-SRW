@@ -12752,9 +12752,14 @@ def main():
         _sharded_single_rst = make_sharded_srw(
             max_chunk_size=rst_max_chunk,
             **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('rst')))
+        _sharded_single_qk_minimal = None
         _sharded_single_v_minimal = None
         _sharded_single_rst_minimal = None
         if make_sharded_srw_minimal is not None:
+            _sharded_single_qk_minimal = make_sharded_srw_minimal(
+                max_chunk_size=attn_qk_max_chunk,
+                **_factory_kwargs(
+                    make_sharded_srw_minimal, _srw_pool_kwargs('qk')))
             _sharded_single_v_minimal = make_sharded_srw_minimal(
                 max_chunk_size=attn_v_max_chunk,
                 **_factory_kwargs(
@@ -12785,6 +12790,7 @@ def main():
             }
             if _sharded_single_v_minimal is not None:
                 _sharded_fns.update({
+                    'attn_qk_single_minimal': _sharded_single_qk_minimal,
                     'attn_v_single_minimal': _sharded_single_v_minimal,
                     'rst_single_minimal': _sharded_single_rst_minimal,
                 })
@@ -12843,7 +12849,11 @@ def main():
                     f"top_blocks qk/v/rst={cfg['model'].get('qk_top_blocks', 2)}/"
                     f"{cfg['model'].get('v_top_blocks', 2)}/"
                     f"{cfg['model'].get('rst_top_blocks', 2)}")
-            print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
+            _qk_mode_msg = (
+                "QK single-route"
+                if str(model_version_cfg) == V4168_MODEL_VERSION
+                else "QK fused")
+            print(f"  shard_map enabled (mesh_model={mesh_model}, {_qk_mode_msg}"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
                   f"; analysis kernels={'on' if _supports_analysis else 'off'}"

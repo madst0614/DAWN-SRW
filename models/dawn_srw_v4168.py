@@ -2638,6 +2638,9 @@ def _v4168_block_sparse_config(block_size, top_blocks):
     return block_size, top_blocks
 
 
+_V4168_BUCKET_CHUNK_SIZE = 128
+
+
 def _v4168_block_sparse_blocks(op_key_local, read_local, write_local,
                                block_size):
     """Contiguous local operator Blocks plus current op-key metadata."""
@@ -2697,6 +2700,7 @@ def make_sharded_srw_block_sparse_minimal(
     del max_chunk_size, dead_exposure_target, block_margin
     _block_size, _top_blocks = _v4168_block_sparse_config(
         block_size, top_blocks)
+    _bucket_chunk_size = int(_V4168_BUCKET_CHUNK_SIZE)
     _soft_gate_effective_active_eps = jnp.float32(
         soft_gate_effective_active_eps)
     _admission_den_power = jnp.maximum(
@@ -2729,20 +2733,55 @@ def make_sharded_srw_block_sparse_minimal(
             op_key_local, read_local, write_local, _block_size)
         k_blocks = min(_top_blocks, int(n_blocks))
 
-        x_bf = x.astype(jnp.bfloat16)
+        T = int(B) * int(S)
+        pair_count = T * int(k_blocks)
+        max_bucket_chunks = (
+            int(n_blocks)
+            + (pair_count + _bucket_chunk_size - 1) // _bucket_chunk_size)
+
+        flat_x_bf = x.reshape(T, D).astype(jnp.bfloat16)
         h_unit_bf = _forward_unit_direction(
             h.astype(jnp.bfloat16).astype(jnp.float32)
         ).astype(jnp.bfloat16)
+        flat_h_bf = h_unit_bf.reshape(T, h_unit_bf.shape[-1])
         tau = _tau_from_param(raw_tau)
+        flat_tau = tau.reshape(T, 1)
 
         block_scores = (
-            h_unit_bf @ block_center.T
-        ).astype(jnp.float32) + block_radius[None, None, :]
+            flat_h_bf @ block_center.T
+        ).astype(jnp.float32) + block_radius[None, :]
         _, selected_blocks = jax.lax.top_k(block_scores, k_blocks)
 
-        def angular_compose_parts(rho, valid_mask):
+        pair_block_id = selected_blocks.reshape(pair_count)
+        pair_token_id = jnp.repeat(
+            jnp.arange(T, dtype=jnp.int32), int(k_blocks))
+        sort_idx = jnp.argsort(pair_block_id, stable=True)
+        sorted_block_id = pair_block_id[sort_idx].astype(jnp.int32)
+        sorted_token_id = pair_token_id[sort_idx]
+
+        pair_pos = jnp.arange(pair_count, dtype=jnp.int32)
+        prev_block_id = jnp.concatenate(
+            [sorted_block_id[:1], sorted_block_id[:-1]], axis=0)
+        block_group_start = jnp.logical_or(
+            pair_pos == 0, sorted_block_id != prev_block_id)
+        group_start_pos = jnp.where(block_group_start, pair_pos, 0)
+        group_start_pos = jax.lax.associative_scan(
+            jnp.maximum, group_start_pos, axis=0)
+        rank_in_group = pair_pos - group_start_pos
+        bucket_chunk_start = jnp.logical_or(
+            block_group_start,
+            (rank_in_group % _bucket_chunk_size) == 0)
+        bucket_chunk_ord = (
+            jnp.cumsum(bucket_chunk_start.astype(jnp.int32)) - 1)
+        n_bucket_chunks = bucket_chunk_start.astype(jnp.int32).sum()
+        bucket_chunk_starts = jnp.zeros(
+            (max_bucket_chunks,), dtype=jnp.int32).at[
+                bucket_chunk_ord
+            ].max(jnp.where(bucket_chunk_start, pair_pos, 0), mode='drop')
+
+        def angular_compose_parts(rho, tau_b, valid_mask):
             _, admission, _drive, execution_weight, _ = _compute_admission_drive(
-                rho, tau, soft_gate_temperature,
+                rho, tau_b, soft_gate_temperature,
                 boundary_power=soft_gate_boundary_power,
                 effective_active_eps=_soft_gate_effective_active_eps,
                 execution_prune_eps=execution_prune_eps)
@@ -2751,36 +2790,58 @@ def make_sharded_srw_block_sparse_minimal(
             return admission, execution_weight
 
         @jax.checkpoint
-        def block_srw_step(carry, slot):
-            raw_out, total_den_cost = carry
-            block_idx = selected_blocks[:, :, slot]
-            op_key = op_key_blocks[block_idx]
-            rc = read_blocks[block_idx]
-            wc = write_blocks[block_idx]
-            valid_bsn = valid_blocks[block_idx]
+        def bucket_chunk_step(carry, chunk_i):
+            def process_chunk(carry):
+                flat_raw_out, flat_den_cost = carry
+                start = bucket_chunk_starts[chunk_i]
+                offsets = start + jnp.arange(
+                    _bucket_chunk_size, dtype=jnp.int32)
+                safe_offsets = jnp.minimum(offsets, pair_count - 1)
+                block_id = sorted_block_id[start]
+                in_pair_range = offsets < pair_count
+                same_block = sorted_block_id[safe_offsets] == block_id
+                valid_pairs = jnp.logical_and(in_pair_range, same_block)
+                token_ids = jnp.where(
+                    valid_pairs, sorted_token_id[safe_offsets], 0)
 
-            rho_raw = jnp.einsum(
-                'bsd,bsnd->bsn', h_unit_bf, op_key).astype(jnp.float32)
-            rho_compute = jnp.where(valid_bsn, rho_raw, tau)
-            admission, execution_weight = angular_compose_parts(
-                rho_compute, valid_bsn)
-            xr = jnp.einsum(
-                'bsd,bsnd->bsn', x_bf, rc).astype(jnp.float32)
-            a = execution_weight * xr
-            c_out = jnp.einsum(
-                'bsn,bsnd->bsd',
-                a.astype(jnp.bfloat16),
-                wc).astype(jnp.float32)
-            block_den_cost = admission.sum(axis=-1, keepdims=True)
-            return (raw_out + c_out,
-                    total_den_cost + block_den_cost), None
+                x_b = flat_x_bf[token_ids]
+                h_b = flat_h_bf[token_ids]
+                tau_b = flat_tau[token_ids]
+                op_key_b = op_key_blocks[block_id]
+                read_b = read_blocks[block_id]
+                write_b = write_blocks[block_id]
+                valid_ops = valid_blocks[block_id]
+                valid_mask = jnp.logical_and(
+                    valid_pairs[:, None], valid_ops[None, :])
 
-        (raw_out, total_den_cost), _ = jax.lax.scan(
-            block_srw_step,
-            (jnp.zeros((B, S, D), dtype=jnp.float32),
-             jnp.zeros((B, S, 1), dtype=jnp.float32)),
-            jnp.arange(k_blocks))
+                rho_raw = (h_b @ op_key_b.T).astype(jnp.float32)
+                rho_compute = jnp.where(valid_ops[None, :], rho_raw, tau_b)
+                admission, execution_weight = angular_compose_parts(
+                    rho_compute, tau_b, valid_mask)
+                xr = (x_b @ read_b.T).astype(jnp.float32)
+                weighted = execution_weight * xr
+                out_b = (weighted.astype(jnp.bfloat16) @ write_b).astype(
+                    jnp.float32)
+                den_b = admission.sum(axis=-1, keepdims=True)
+                flat_raw_out = flat_raw_out.at[token_ids].add(out_b)
+                flat_den_cost = flat_den_cost.at[token_ids].add(den_b)
+                return flat_raw_out, flat_den_cost
 
+            carry = jax.lax.cond(
+                chunk_i < n_bucket_chunks,
+                process_chunk,
+                lambda c: c,
+                carry)
+            return carry, None
+
+        (flat_raw_out, flat_den_cost), _ = jax.lax.scan(
+            bucket_chunk_step,
+            (jnp.zeros((T, D), dtype=jnp.float32),
+             jnp.zeros((T, 1), dtype=jnp.float32)),
+            jnp.arange(max_bucket_chunks, dtype=jnp.int32))
+
+        raw_out = flat_raw_out.reshape(B, S, D)
+        total_den_cost = flat_den_cost.reshape(B, S, 1)
         global_raw_out = jax.lax.psum(raw_out, 'model')
         global_den_cost = jax.lax.psum(total_den_cost, 'model')
         admission_den_base = jnp.maximum(global_den_cost, 1.0)
@@ -2807,107 +2868,33 @@ def make_sharded_srw_paired_block_sparse_minimal(
         top_blocks=2,
         block_margin=0.0):
     """Create v4168 paired Q/K Block-sparse SRW returning only output."""
-    del max_chunk_size, dead_exposure_target, block_margin
-    _block_size, _top_blocks = _v4168_block_sparse_config(
-        block_size, top_blocks)
-    _soft_gate_effective_active_eps = jnp.float32(
-        soft_gate_effective_active_eps)
-    _admission_den_power = jnp.maximum(
-        jnp.asarray(admission_den_power, dtype=jnp.float32),
-        jnp.float32(0.0))
-    _admission_den_grad_scale = jnp.clip(
-        jnp.asarray(admission_den_grad_scale, dtype=jnp.float32),
-        jnp.float32(0.0),
-        jnp.float32(1.0))
+    fused_single = make_sharded_srw_block_sparse_minimal(
+        mesh=mesh,
+        max_chunk_size=max_chunk_size,
+        dead_exposure_target=dead_exposure_target,
+        soft_gate_effective_active_eps=soft_gate_effective_active_eps,
+        admission_den_power=admission_den_power,
+        admission_den_grad_scale=admission_den_grad_scale,
+        block_size=block_size,
+        top_blocks=top_blocks,
+        block_margin=block_margin)
 
-    @partial(shard_map, mesh=mesh,
-             in_specs=(P('data', None, None),
-                       P('data', None, None, None),
-                       P('model', None),
-                       P('data', None, None, None),
-                       P('model', None),
-                       P('model', None),
-                       P(), P(), P(), P(), P()),
-             out_specs=P('data', None, None, None),
-             check_rep=False)
     def fused_gate_srw_paired_block_sparse_minimal(
             x, h, op_key_local, raw_tau, read_local, write_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps):
-        del soft_gate_t_final, soft_gate_boundary_power_final
-        B, S, R, _ = h.shape
-        D = x.shape[-1]
-        (op_key_blocks, read_blocks, write_blocks, valid_blocks,
-         block_center, block_radius, n_blocks) = _v4168_block_sparse_blocks(
-            op_key_local, read_local, write_local, _block_size)
-        k_blocks = min(_top_blocks, int(n_blocks))
-
-        x_bf = x.astype(jnp.bfloat16)
-        h_unit_bf = _forward_unit_direction(
-            h.astype(jnp.bfloat16).astype(jnp.float32)
-        ).astype(jnp.bfloat16)
-        tau = _tau_from_param(raw_tau)
-
-        block_scores = jnp.einsum(
-            'bsrd,nd->bsrn',
-            h_unit_bf, block_center).astype(jnp.float32)
-        block_scores = block_scores + block_radius[None, None, None, :]
-        _, selected_blocks = jax.lax.top_k(block_scores, k_blocks)
-
-        def angular_compose_parts(rho, valid_mask):
-            _, admission, _drive, execution_weight, _ = _compute_admission_drive(
-                rho, tau, soft_gate_temperature,
-                boundary_power=soft_gate_boundary_power,
-                effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps)
-            admission = jnp.where(valid_mask, admission, 0.0)
-            execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
-            return admission, execution_weight
-
-        @jax.checkpoint
-        def block_srw_step(carry, slot):
-            raw_out, total_den_cost = carry
-            block_idx = selected_blocks[:, :, :, slot]
-            op_key = op_key_blocks[block_idx]
-            rc = read_blocks[block_idx]
-            wc = write_blocks[block_idx]
-            valid_bsrn = valid_blocks[block_idx]
-
-            rho_raw = jnp.einsum(
-                'bsrd,bsrnd->bsrn', h_unit_bf, op_key).astype(jnp.float32)
-            rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
-            admission, execution_weight = angular_compose_parts(
-                rho_compute, valid_bsrn)
-            xr = jnp.einsum(
-                'bsd,bsrnd->bsrn', x_bf, rc).astype(jnp.float32)
-            a = execution_weight * xr
-            c_out = jnp.einsum(
-                'bsrn,bsrnd->bsrd',
-                a.astype(jnp.bfloat16),
-                wc).astype(jnp.float32)
-            block_den_cost = admission.sum(axis=-1, keepdims=True)
-            return (raw_out + c_out,
-                    total_den_cost + block_den_cost), None
-
-        (raw_out, total_den_cost), _ = jax.lax.scan(
-            block_srw_step,
-            (jnp.zeros((B, S, R, D), dtype=jnp.float32),
-             jnp.zeros((B, S, R, 1), dtype=jnp.float32)),
-            jnp.arange(k_blocks))
-
-        global_raw_out = jax.lax.psum(raw_out, 'model')
-        global_den_cost = jax.lax.psum(total_den_cost, 'model')
-        admission_den_base = jnp.maximum(global_den_cost, 1.0)
-        admission_den_forward = jnp.power(
-            admission_den_base, _admission_den_power)
-        admission_den_sg = jax.lax.stop_gradient(admission_den_forward)
-        admission_den = (
-            admission_den_sg
-            + _admission_den_grad_scale
-            * (admission_den_forward - admission_den_sg))
-        out = global_raw_out / admission_den
-        return out.astype(jnp.float32)
+        q_out = fused_single(
+            x, h[:, :, 0, :], op_key_local, raw_tau[:, :, 0, :],
+            read_local, write_local, soft_gate_temperature,
+            soft_gate_t_final, soft_gate_boundary_power,
+            soft_gate_boundary_power_final, execution_prune_eps)
+        k_out = fused_single(
+            x, h[:, :, 1, :], op_key_local, raw_tau[:, :, 1, :],
+            read_local, write_local, soft_gate_temperature,
+            soft_gate_t_final, soft_gate_boundary_power,
+            soft_gate_boundary_power_final, execution_prune_eps)
+        return jnp.stack([q_out, k_out], axis=2)
 
     return fused_gate_srw_paired_block_sparse_minimal
 
@@ -3103,24 +3090,41 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         pool_params, d_model, n_layers)
 
     if isinstance(sharded_fns, dict):
-        fused_paired = sharded_fns.get(
-            'attn_qk_paired_minimal',
-            sharded_fns.get('attn_qk_paired', sharded_fns['paired']))
+        fused_single_qk = sharded_fns.get(
+            'attn_qk_single_minimal',
+            sharded_fns.get('attn_qk_single', None))
+        fused_paired = None if fused_single_qk is not None else (
+            sharded_fns.get(
+                'attn_qk_paired_minimal',
+                sharded_fns.get('attn_qk_paired', sharded_fns['paired'])))
         fused_single_v = sharded_fns.get(
             'attn_v_single_minimal',
             sharded_fns.get('attn_v_single', sharded_fns['single']))
     else:
+        fused_single_qk = None
         fused_single_v, fused_paired = sharded_fns
 
-    h_QK = jnp.stack([h_Q, h_K], axis=2)
-    raw_tau_QK = jnp.stack(
-        [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
-    QK_out = fused_paired(
-        x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
-        soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
-        soft_gate_boundary_power_final, execution_prune_eps)
-    Q = QK_out[:, :, 0, :] * qk_scale
-    K = QK_out[:, :, 1, :] * qk_scale
+    if fused_single_qk is not None:
+        Q = fused_single_qk(
+            x, h_Q, qk_op_key, raw_tau_all[:, :, 0:1], qk_read, qk_write,
+            soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
+            soft_gate_boundary_power_final, execution_prune_eps)
+        K = fused_single_qk(
+            x, h_K, qk_op_key, raw_tau_all[:, :, 1:2], qk_read, qk_write,
+            soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
+            soft_gate_boundary_power_final, execution_prune_eps)
+    else:
+        h_QK = jnp.stack([h_Q, h_K], axis=2)
+        raw_tau_QK = jnp.stack(
+            [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
+        QK_out = fused_paired(
+            x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
+            soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
+            soft_gate_boundary_power_final, execution_prune_eps)
+        Q = QK_out[:, :, 0, :]
+        K = QK_out[:, :, 1, :]
+    Q = Q * qk_scale
+    K = K * qk_scale
     V = fused_single_v(
         x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
         soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,

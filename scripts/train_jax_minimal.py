@@ -1039,12 +1039,16 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
     sharded_single_rst = make_single(
         max_chunk_size=rst_max_chunk,
         **_factory_kwargs(make_single, _srw_pool_kwargs('rst')))
+    sharded_single_qk = make_single(
+        max_chunk_size=attn_qk_max_chunk,
+        **_factory_kwargs(make_single, _srw_pool_kwargs('qk')))
     sharded_paired_attn_qk = make_paired(
         max_chunk_size=attn_qk_max_chunk,
         **_factory_kwargs(make_paired, _srw_pool_kwargs('qk')))
 
     sharded_fns = {
         'single': sharded_single_rst,
+        'attn_qk_single_minimal': sharded_single_qk,
         'attn_v_single': sharded_single_v,
         'rst_single': sharded_single_rst,
         'paired': sharded_paired_attn_qk,
@@ -1090,7 +1094,8 @@ def _make_minimal_sharded_fns(cfg, mesh, mesh_model, batch_size, max_seq_len,
                 f"{cfg['model'].get('rst_top_blocks', 2)}")
         print(
             "  shard_map minimal enabled "
-            f"(mesh_model={mesh_model}, QK fused; "
+            f"(mesh_model={mesh_model}, "
+            f"{'QK single-route' if model_version == full.V4168_MODEL_VERSION else 'QK fused'}; "
             f"per_data_shard_batch={per_data_shard_batch}; "
             f"chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}; "
             f"max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}; "

@@ -291,28 +291,39 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
             return dict(kwargs)
         return {k: v for k, v in kwargs.items() if k in sig.parameters}
 
+    def srw_pool_kwargs(pool):
+        kwargs = dict(base_kwargs_for_analysis)
+        if version == getattr(train, "V4168_MODEL_VERSION", "spatial-r1-v4.1.6.8"):
+            m_cfg = cfg.get("model", {})
+            kwargs.update({
+                "block_size": int(m_cfg.get(f"{pool}_block_size", 256)),
+                "top_blocks": int(m_cfg.get(f"{pool}_top_blocks", 2)),
+                "block_margin": float(m_cfg.get("block_margin", 0.0)),
+            })
+        return kwargs
+
     make_single = mod.make_sharded_srw
     make_paired = getattr(mod, "make_sharded_srw_paired", None)
     make_single_min = getattr(mod, "make_sharded_srw_minimal", None)
     make_paired_min = getattr(mod, "make_sharded_srw_paired_minimal", None)
 
-    kwargs = dict(base_kwargs)
+    base_kwargs_for_analysis = dict(base_kwargs)
     if analysis and "analysis" in inspect.signature(make_single).parameters:
-        kwargs["analysis"] = True
+        base_kwargs_for_analysis["analysis"] = True
 
     single_v = make_single(
         max_chunk_size=chunk["attn_v"],
-        **factory_kwargs(make_single, kwargs),
+        **factory_kwargs(make_single, srw_pool_kwargs("v")),
     )
     single_rst = make_single(
         max_chunk_size=chunk["rst"],
-        **factory_kwargs(make_single, kwargs),
+        **factory_kwargs(make_single, srw_pool_kwargs("rst")),
     )
     if make_paired is None:
         return single_rst
     paired = make_paired(
         max_chunk_size=chunk["attn_qk"],
-        **factory_kwargs(make_paired, kwargs),
+        **factory_kwargs(make_paired, srw_pool_kwargs("qk")),
     )
     fns = {
         "single": single_v,
@@ -322,18 +333,22 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
         "attn_qk_paired": paired,
     }
     if not analysis and make_single_min is not None:
+        fns["attn_qk_single_minimal"] = make_single_min(
+            max_chunk_size=chunk["attn_qk"],
+            **factory_kwargs(make_single_min, srw_pool_kwargs("qk")),
+        )
         fns["attn_v_single_minimal"] = make_single_min(
             max_chunk_size=chunk["attn_v"],
-            **factory_kwargs(make_single_min, base_kwargs),
+            **factory_kwargs(make_single_min, srw_pool_kwargs("v")),
         )
         fns["rst_single_minimal"] = make_single_min(
             max_chunk_size=chunk["rst"],
-            **factory_kwargs(make_single_min, base_kwargs),
+            **factory_kwargs(make_single_min, srw_pool_kwargs("rst")),
         )
     if not analysis and make_paired_min is not None:
         fns["attn_qk_paired_minimal"] = make_paired_min(
             max_chunk_size=chunk["attn_qk"],
-            **factory_kwargs(make_paired_min, base_kwargs),
+            **factory_kwargs(make_paired_min, srw_pool_kwargs("qk")),
         )
     return fns
 
