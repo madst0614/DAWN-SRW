@@ -411,7 +411,7 @@ def scaled_normal(scale=0.02):
 
 
 def _chunked_ce_loss_and_acc(shift_x, embedding_matrix, shift_labels,
-                             valid_mask, token_chunk_size=2048):
+                             valid_mask, token_chunk_size=8192):
     B, T, D = shift_x.shape
     flat_x = shift_x.reshape(B * T, D)
     flat_labels = shift_labels.reshape(B * T)
