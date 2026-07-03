@@ -1,7 +1,5 @@
-# Vanilla Transformer Baseline - TPU Training Config, 1p3B Scale, v4-128 Pod
-# Parameter-matched: d_model=2048, n_layers=24, d_ff=8192 (~1.272B params, tied LM head)
-# Training hyperparams matched to DAWN/SRW 1p3B config for fair comparison
-# Checkpoint compatible with v4-32 config for seamless migration
+# Vanilla Transformer Baseline - TPU Training Config, 1p3B Scale, v4-64
+# Tensor-parallel baseline for fair 1.3B comparison
 
 seed: 1
 
@@ -14,7 +12,7 @@ data:
   evict_train_shard_cache: true
 
 model:
-  model_version: "baseline"
+  model_version: "baseline-tp"
   vocab_size: 30522
   d_model: 2048
   d_ff: 8192
@@ -25,26 +23,30 @@ model:
   gradient_checkpointing: true
 
 training:
-  mesh_model: 1
-  mesh_data: 32
+  mesh_model: 4
+  mesh_data: 8
   batch_size: 512
   gradient_accumulation_steps: 1
   num_epochs: 1
+
   lr: 0.0002
   weight_decay: 0.1
   warmup_ratio: 0.06
+
   orthogonality_weight: 0.0
   diversity_weight: 0.0
   load_balance_weight: 0.0
   entropy_weight: 0.0
   process_norm_weight: 0.0
+
   checkpoint_interval: 400
-  val_interval: 400
+  val_interval: 1000
   log_interval: 200
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
   eval_effective_prune_enabled: false
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/baseline_1p3B_c4_40B_v4_64_b512_trainonly
-log_dir: logs/baseline_1p3B_c4_40B_v4_64_b512_trainonly
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/baseline_tp_1p3B_c4_40B_v4_64_b512_trainonly
+log_dir: logs/baseline_tp_1p3B_c4_40B_v4_64_b512_trainonly
