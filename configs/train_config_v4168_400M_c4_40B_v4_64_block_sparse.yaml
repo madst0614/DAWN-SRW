@@ -69,7 +69,7 @@ training:
         execution_mode: block_bucketed_dense
         lanes: 32
         k_exec: 32
-        exec_tiles_per_block: 2
+        exec_tiles_per_block: 4
 
     repack:
       enabled: true
