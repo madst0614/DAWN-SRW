@@ -14,7 +14,9 @@ Supports:
 """
 
 import json
+import glob
 import os
+import re
 import shutil
 import numpy as np
 import jax.numpy as jnp
@@ -71,6 +73,11 @@ def _copy_gcs_to_local(gcs_path: str, local_path: str):
         # Already cached
         gcs_size = _gcs_file_size(gcs_path)
         local_size = os.path.getsize(local_path)
+        if gcs_size is None and local_size > 0:
+            print(
+                f"    Cache source unavailable; using existing local cache: "
+                f"{local_path} ({local_size / 1e9:.2f} GB)")
+            return
         if gcs_size is not None and local_size == gcs_size:
             print(f"    Cache hit: {local_path} ({local_size / 1e9:.2f} GB)")
             return
@@ -187,12 +194,12 @@ class ShardedBinDataset:
 
     def __init__(self, meta_path: str, seq_len: int = 512,
                  max_sequences: int = None, local_cache_dir: str = None,
-                 evict_previous_cache: bool = False):
+                 evict_previous_cache: bool = False, meta: dict = None):
         self.seq_len = seq_len
         self.local_cache_dir = local_cache_dir
         self.evict_previous_cache = evict_previous_cache
 
-        meta = _read_json(meta_path)
+        meta = meta if meta is not None else _read_json(meta_path)
         self.shard_infos = meta['shards']  # list of {path, sequences, tokens}
         self.vocab_size = meta.get('vocab_size', 30522)
 
@@ -518,6 +525,151 @@ def _meta_exists(path: str) -> bool:
     return os.path.exists(meta_path)
 
 
+def _path_exists(path: str) -> bool:
+    """Check if a local or GCS path exists."""
+    if is_gcs_path(path):
+        try:
+            fs = _get_gcs_fs()
+            if hasattr(fs, 'exists'):
+                return fs.exists(path)
+            elif hasattr(fs, 'GFile'):
+                import tensorflow as tf
+                return tf.io.gfile.exists(path)
+        except Exception:
+            return False
+    return os.path.exists(path)
+
+
+def _cached_local_path(path: str, local_cache_dir: str = None):
+    """Return the local cache path for a GCS object, if caching is configured."""
+    if local_cache_dir and is_gcs_path(path):
+        return _gcs_path_to_local(path, local_cache_dir)
+    return None
+
+
+def _path_available(path: str, local_cache_dir: str = None) -> bool:
+    """Check if a path is available remotely/locally or already cached."""
+    if _path_exists(path):
+        return True
+    cached = _cached_local_path(path, local_cache_dir)
+    if not cached or not os.path.exists(cached):
+        return False
+    try:
+        return os.path.getsize(cached) > 0
+    except OSError:
+        return False
+
+
+def _file_size(path: str):
+    """Get file size in bytes, or None if unavailable."""
+    if is_gcs_path(path):
+        return _gcs_file_size(path)
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def _normalize_gcs_path(path: str) -> str:
+    """Normalize gcsfs bucket/name results back to gs://bucket/name."""
+    if is_gcs_path(path):
+        return path
+    return "gs://" + path.lstrip("/")
+
+
+def _shard_sort_key(path: str):
+    name = path.rstrip("/").split("/")[-1]
+    match = re.search(r"_(\d+)\.bin$", name)
+    if match:
+        return (0, int(match.group(1)), name)
+    return (1, name)
+
+
+def _list_shard_paths(base: str):
+    """List path_*.bin shard files for a local or GCS base path."""
+    pattern = base[:-4] if base.endswith(".bin") else base
+    pattern = pattern + "_*.bin"
+    paths = []
+
+    if is_gcs_path(pattern):
+        try:
+            fs = _get_gcs_fs()
+            if hasattr(fs, 'glob'):
+                paths = fs.glob(pattern)
+                paths = [
+                    _normalize_gcs_path(p) for p in paths
+                    if str(p).endswith(".bin")
+                ]
+            elif hasattr(fs, 'GFile'):
+                import tensorflow as tf
+                paths = list(tf.io.gfile.glob(pattern))
+        except Exception:
+            paths = []
+    else:
+        paths = glob.glob(pattern)
+
+    return sorted(paths, key=_shard_sort_key)
+
+
+def _infer_sharded_meta(path: str, seq_len: int):
+    """Build minimal shard metadata by inspecting path_*.bin files."""
+    shard_paths = _list_shard_paths(path)
+    if not shard_paths:
+        return None
+
+    shard_infos = []
+    total_sequences = 0
+    for shard_path in shard_paths:
+        size = _file_size(shard_path)
+        if size is None:
+            continue
+        sequences = size // (np.dtype(np.uint16).itemsize * seq_len)
+        if sequences <= 0:
+            continue
+        tokens = sequences * seq_len
+        shard_infos.append({
+            "path": shard_path,
+            "sequences": int(sequences),
+            "tokens": int(tokens),
+        })
+        total_sequences += int(sequences)
+
+    if not shard_infos:
+        return None
+
+    return {
+        "total_tokens": int(total_sequences * seq_len),
+        "total_sequences": int(total_sequences),
+        "seq_len": int(seq_len),
+        "vocab_size": 30522,
+        "dtype": "uint16",
+        "num_shards": len(shard_infos),
+        "shards": shard_infos,
+    }
+
+
+def _meta_shards_available(meta: dict, local_cache_dir: str = None) -> bool:
+    """Return True when all shard files listed in metadata are present."""
+    shards = meta.get("shards") or []
+    if not shards:
+        return False
+    for shard in shards:
+        shard_path = shard.get("path")
+        if not shard_path or not _path_available(shard_path, local_cache_dir):
+            return False
+    return True
+
+
+def _fallback_paths_for(path: str):
+    """Candidate dataset bases to try when the requested one is unavailable."""
+    candidates = []
+    if path.endswith("_40B"):
+        candidates.append(path[:-4])
+    elif path.endswith("_40B.bin"):
+        candidates.append(path[:-8] + ".bin")
+    return candidates
+
+
 def _is_sharded(path: str) -> bool:
     """Detect if a path refers to sharded data (has _meta.json with num_shards > 1)."""
     meta_path = _meta_path_for(path)
@@ -531,17 +683,52 @@ def _is_sharded(path: str) -> bool:
 def _build_dataset(path, seq_len, max_sequences, local_cache_dir,
                    evict_previous_cache=False):
     """Build the appropriate dataset type based on path and metadata."""
-    if _is_sharded(path):
-        meta_path = _meta_path_for(path)
-        return ShardedBinDataset(
-            meta_path, seq_len,
-            max_sequences=max_sequences,
-            local_cache_dir=local_cache_dir,
-            evict_previous_cache=evict_previous_cache)
-    else:
-        # Single .bin file
-        bin_path = path if path.endswith(".bin") else path + ".bin"
-        return BinDataset(
-            bin_path, seq_len,
-            max_sequences=max_sequences,
-            local_cache_dir=local_cache_dir)
+    attempted = []
+    for candidate in [path] + _fallback_paths_for(path):
+        meta_path = _meta_path_for(candidate)
+        bin_path = candidate if candidate.endswith(".bin") else candidate + ".bin"
+
+        attempted.append(meta_path)
+        attempted.append(bin_path)
+
+        try:
+            meta = _read_json(meta_path)
+        except Exception:
+            meta = None
+
+        if meta is not None and _meta_shards_available(meta, local_cache_dir):
+            print(f"  Using sharded metadata: {meta_path}")
+            if candidate != path:
+                print(f"  Warning: requested data {path} is unavailable; using {candidate}")
+            return ShardedBinDataset(
+                meta_path, seq_len,
+                max_sequences=max_sequences,
+                local_cache_dir=local_cache_dir,
+                evict_previous_cache=evict_previous_cache,
+                meta=meta)
+        elif meta is not None:
+            print(f"  Warning: metadata exists but shard files are unavailable: {meta_path}")
+
+        if _path_available(bin_path, local_cache_dir):
+            if candidate != path:
+                print(f"  Warning: requested data {path} is unavailable; using {candidate}")
+            return BinDataset(
+                bin_path, seq_len,
+                max_sequences=max_sequences,
+                local_cache_dir=local_cache_dir)
+
+        inferred_meta = _infer_sharded_meta(candidate, seq_len)
+        if inferred_meta is not None:
+            print(f"  Using inferred shard list: {candidate}_*.bin")
+            if candidate != path:
+                print(f"  Warning: requested data {path} is unavailable; using {candidate}")
+            return ShardedBinDataset(
+                meta_path, seq_len,
+                max_sequences=max_sequences,
+                local_cache_dir=local_cache_dir,
+                evict_previous_cache=evict_previous_cache,
+                meta=inferred_meta)
+
+    raise FileNotFoundError(
+        "Could not find pretokenized data. Tried: " + ", ".join(attempted)
+    )
