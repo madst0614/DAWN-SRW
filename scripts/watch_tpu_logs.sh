@@ -136,7 +136,18 @@ quote_remote() {
     printf '%q' "$1"
 }
 
-remote_log_q="$(quote_remote "$REMOTE_LOG")"
+quote_remote_path() {
+    local path="$1"
+    if [[ "$path" == "~" ]]; then
+        printf '$HOME'
+    elif [[ "$path" == "~/"* ]]; then
+        printf '$HOME/%s' "$(quote_remote "${path#~/}")"
+    else
+        quote_remote "$path"
+    fi
+}
+
+remote_log_q="$(quote_remote_path "$REMOTE_LOG")"
 pane_target_q="$(quote_remote "$PANE_TARGET")"
 filter_q=""
 if [[ -n "$FILTER_PATTERN" ]]; then
