@@ -156,9 +156,9 @@ fi
 
 filter_range_cmd() {
     if [[ -n "$FILTER_PATTERN" ]]; then
-        printf "tr '\\r' '\\n' | grep -E %s || true" "$filter_q"
+        printf "tr '\\r' '\\n' | sed 's/[[:blank:]]*$//' | grep -E %s || true" "$filter_q"
     else
-        printf "tr '\\r' '\\n'"
+        printf "tr '\\r' '\\n' | sed 's/[[:blank:]]*$//'"
     fi
 }
 
@@ -182,7 +182,7 @@ build_file_tail_cmd() {
     else
         cmd="tail -n $TAIL_LINES $remote_log_q"
     fi
-    cmd="$cmd | tr '\\r' '\\n'"
+    cmd="$cmd | tr '\\r' '\\n' | sed 's/[[:blank:]]*$//'"
     if [[ -n "$FILTER_PATTERN" ]]; then
         if [[ "$FOLLOW" -eq 1 ]]; then
             cmd="$cmd | grep --line-buffered -E $filter_q"
@@ -237,13 +237,10 @@ done"
 }
 
 build_auto_tail_cmd() {
-    local file_cmd pane_cmd
+    local file_cmd
     file_cmd="$(build_file_tail_cmd)"
-    pane_cmd="$(build_pane_tail_cmd)"
-    printf 'if [ -r %s ]; then echo "[watch] source=file log=%s"; %s; else echo "[watch] waiting for file log=%s; use --pane for tmux screen"; for _i in $(seq 1 15); do [ -r %s ] && break; sleep 2; done; if [ -r %s ]; then echo "[watch] source=file log=%s"; %s; else echo "[watch] source=tmux-pane because log file is still missing: %s"; %s; fi; fi' \
-        "$remote_log_q" "$REMOTE_LOG" "$file_cmd" \
-        "$REMOTE_LOG" "$remote_log_q" "$remote_log_q" "$REMOTE_LOG" \
-        "$file_cmd" "$REMOTE_LOG" "$pane_cmd"
+    printf 'echo "[watch] source=file log=%s"; echo "[watch] use --pane only for tmux screen capture"; %s' \
+        "$REMOTE_LOG" "$file_cmd"
 }
 
 build_tail_cmd() {
