@@ -4623,7 +4623,7 @@ def make_sharded_srw_sector_bucketed_minimal(
                        P('model', None),
                        P('model', None),
                        P(), P(), P(), P(), P()),
-             out_specs=P('data', None, None),
+             out_specs=(P('data', None, None), P()),
              check_rep=False)
     def fused_gate_srw_sector_bucketed_minimal(
             x, h, op_key_local, raw_tau, read_local, write_local,
@@ -4862,7 +4862,7 @@ def make_sharded_srw_paired_sector_bucketed_minimal(
                        P('model', None),
                        P('model', None),
                        P(), P(), P(), P(), P()),
-             out_specs=P('data', None, None, None),
+             out_specs=(P('data', None, None, None), P()),
              check_rep=False)
     def fused_gate_srw_paired_sector_bucketed_minimal(
             x, h, op_key_local, raw_tau, read_local, write_local,
