@@ -651,6 +651,7 @@ def build_sharded_fns(cfg, mesh):
                           t.get("hardware_repack_enabled", False))),
                 "hardware_sector_debug_token_gather_fallback": bool(
                     t.get("hardware_sector_debug_token_gather_fallback", False)),
+                "benchmark_runtime_metrics": True,
             })
         return kwargs
 
@@ -716,6 +717,7 @@ def create_benchmark_train_step(model, optimizer, sharded_fns, cfg):
                 soft_gate_boundary_power_final=boundary_power,
                 admission_den_power=admission_den_power,
                 execution_prune_eps=0.0,
+                benchmark_runtime_metrics=True,
             )
             loss = result["loss"] + result.get("aux_loss", jnp.float32(0.0))
             return loss, result

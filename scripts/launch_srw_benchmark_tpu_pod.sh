@@ -2,9 +2,9 @@
 # =============================================================================
 # DAWN-SRW TPU Pod Benchmark Launcher
 # =============================================================================
-# Launches scripts/benchmark_srw_tpu.py on every TPU host. Pass --config more
 # than once to run configs sequentially and print the comparison in ~/train.log.
-# Results are console-first by default: no JSONL/MD/CSV files are produced.
+# With a single standard v4166/v4168 400M config, the matching comparison config
+# is added automatically unless --no-auto-compare is passed.
 # =============================================================================
 
 set -euo pipefail
@@ -23,6 +23,8 @@ XLA_DUMP_BASE=""
 GH_TOKEN=""
 DUMMY_DATA="0"
 ALLOW_MODEL_VERSION_OVERRIDE="0"
+AUTO_COMPARE="1"
+FORCE_VQ_REPACK="1"
 
 usage() {
     cat <<EOF
@@ -39,6 +41,8 @@ Options:
   --xla-dump [DIR]               Enable XLA dumps (default: enabled)
   --no-xla-dump                  Disable XLA dumps
   --dummy-data                   Explicit synthetic-data smoke test
+  --no-auto-compare              Do not auto-add the matching v4166/v4168 config
+  --no-force-vq-repack           Do not force one v4168 VQ repack before measure
   --token TOKEN                  GitHub token for private repos
   -h, --help
 
@@ -96,6 +100,8 @@ while [[ $# -gt 0 ]]; do
         --no-xla-dump) XLA_DUMP_ENABLED="0"; shift ;;
         --dummy-data) DUMMY_DATA="1"; shift ;;
         --allow-model-version-override) ALLOW_MODEL_VERSION_OVERRIDE="1"; shift ;;
+        --no-auto-compare) AUTO_COMPARE="0"; shift ;;
+        --no-force-vq-repack) FORCE_VQ_REPACK="0"; shift ;;
         --token) GH_TOKEN="$2"; shift 2 ;;
         -h|--help)
             usage
@@ -133,6 +139,24 @@ if [[ -z "$XLA_DUMP_BASE" ]]; then
     XLA_DUMP_BASE="${OUTPUT_DIR}/xla"
 fi
 
+if [[ "$AUTO_COMPARE" = "1" && "${#CONFIGS[@]}" -eq 1 ]]; then
+    ONLY_CONFIG="${CONFIGS[0]}"
+    AUTO_CONFIG=""
+    case "$ONLY_CONFIG" in
+        configs/train_config_v4166_400M_c4_40B_v4_64.yaml)
+            AUTO_CONFIG="configs/train_config_v4168_400M_c4_40B_v4_64_block_sparse.yaml"
+            CONFIGS+=("$AUTO_CONFIG")
+            ;;
+        configs/train_config_v4168_400M_c4_40B_v4_64_block_sparse.yaml)
+            AUTO_CONFIG="configs/train_config_v4166_400M_c4_40B_v4_64.yaml"
+            CONFIGS=("$AUTO_CONFIG" "$ONLY_CONFIG")
+            ;;
+    esac
+    if [[ -n "$AUTO_CONFIG" ]]; then
+        echo "Auto-compare enabled: added $AUTO_CONFIG"
+    fi
+fi
+
 CONFIG_FIRST="${CONFIGS[0]}"
 CONFIG_REST_ARGS=""
 if [[ "${#CONFIGS[@]}" -gt 1 ]]; then
@@ -157,7 +181,9 @@ echo "  Steps:          $STEPS"
 echo "  Warmup steps:   $WARMUP_STEPS"
 echo "  XLA dumps:      $XLA_DUMP_ENABLED ($XLA_DUMP_BASE)"
 echo "  Dummy data:     $DUMMY_DATA"
-echo "  Result files:   none by default; benchmark prints to stdout/train.log"
+echo "  Auto compare:   $AUTO_COMPARE"
+echo "  Force VQ repack:$FORCE_VQ_REPACK"
+echo "  Result files:   ${OUTPUT_DIR}/benchmark_metrics_host_<worker>.jsonl"
 echo "============================================"
 
 echo "Checking TPU status..."
@@ -238,8 +264,10 @@ STEPS_Q="$(shell_quote "$STEPS")"
 WARMUP_STEPS_Q="$(shell_quote "$WARMUP_STEPS")"
 XLA_DUMP_ENABLED_Q="$(shell_quote "$XLA_DUMP_ENABLED")"
 XLA_DUMP_BASE_Q="$(shell_quote "$XLA_DUMP_BASE")"
+OUTPUT_DIR_Q="$(shell_quote "$OUTPUT_DIR")"
 DUMMY_DATA_Q="$(shell_quote "$DUMMY_DATA")"
 ALLOW_MODEL_VERSION_OVERRIDE_Q="$(shell_quote "$ALLOW_MODEL_VERSION_OVERRIDE")"
+FORCE_VQ_REPACK_Q="$(shell_quote "$FORCE_VQ_REPACK")"
 GH_TOKEN_Q="$(shell_quote "$GH_TOKEN")"
 
 read -r -d '' REMOTE_CMD_TEMPLATE <<EOFCMD || true
@@ -254,8 +282,10 @@ STEPS=${STEPS_Q}
 WARMUP_STEPS=${WARMUP_STEPS_Q}
 XLA_DUMP_ENABLED=${XLA_DUMP_ENABLED_Q}
 XLA_DUMP_BASE=${XLA_DUMP_BASE_Q}
+OUTPUT_DIR=${OUTPUT_DIR_Q}
 DUMMY_DATA=${DUMMY_DATA_Q}
 ALLOW_MODEL_VERSION_OVERRIDE=${ALLOW_MODEL_VERSION_OVERRIDE_Q}
+FORCE_VQ_REPACK=${FORCE_VQ_REPACK_Q}
 GH_TOKEN=${GH_TOKEN_Q}
 export TPU_WORKER_INDEX BRANCH CONFIG GH_TOKEN
 
@@ -278,6 +308,11 @@ if [ -n "\$CONFIG_REST" ]; then
     BENCH_ARGS="\$CONFIG_REST"
 fi
 BENCH_ARGS="\$BENCH_ARGS --steps \$STEPS --warmup-steps \$WARMUP_STEPS"
+BENCH_METRICS_JSONL="\${OUTPUT_DIR}/benchmark_metrics_host_\${TPU_WORKER_INDEX}.jsonl"
+BENCH_ARGS="\$BENCH_ARGS --metrics-jsonl \$BENCH_METRICS_JSONL"
+if [ "\$FORCE_VQ_REPACK" = "1" ]; then
+    BENCH_ARGS="\$BENCH_ARGS --benchmark-force-vq-repack-before-measure"
+fi
 if [ -n "\$MODEL_VERSION" ]; then
     BENCH_ARGS="\$BENCH_ARGS --model-version \$MODEL_VERSION"
 fi
@@ -302,6 +337,7 @@ echo "BENCHMARK_SCRIPT=\$TRAIN_SCRIPT"
 echo "CONFIG(first)=\$CONFIG"
 echo "CONFIG(rest)=\$CONFIG_REST"
 echo "BENCHMARK_ARGS=\$TRAIN_ARGS"
+echo "Benchmark metrics JSONL: \$BENCH_METRICS_JSONL"
 if [ "\$XLA_DUMP_ENABLED" = "1" ]; then
     echo "Benchmark XLA dump root: \$XLA_DUMP_BASE"
 else
@@ -343,7 +379,7 @@ echo ""
 echo "Benchmark launched in tmux session 'train' on every worker."
 echo "  Watch:       bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT"
 echo "  Main output: ~/train.log on each TPU worker"
-echo "  Result mode: console-only benchmark records and comparison table"
+echo "  Metrics:     ${OUTPUT_DIR}/benchmark_metrics_host_<worker>.jsonl"
 if [[ "$XLA_DUMP_ENABLED" = "1" ]]; then
     echo "  XLA dumps:   $XLA_DUMP_BASE"
 fi
