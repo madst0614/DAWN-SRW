@@ -141,7 +141,11 @@ quote_remote_path() {
     if [[ "$path" == "~" ]]; then
         printf '$HOME'
     elif [[ "$path" == "~/"* ]]; then
-        printf '$HOME/%s' "$(quote_remote "${path#~/}")"
+        printf '$HOME/%s' "$(quote_remote "${path:2}")"
+    elif [[ "$path" == "\$HOME" ]]; then
+        printf '$HOME'
+    elif [[ "$path" == "\$HOME/"* ]]; then
+        printf '$HOME/%s' "$(quote_remote "${path:6}")"
     else
         quote_remote "$path"
     fi
