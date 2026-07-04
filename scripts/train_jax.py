@@ -1102,9 +1102,15 @@ def _v4168_hardware_repack_config(training_cfg, model_version):
         if is_v4168 else False)
     interval_steps = int(training_cfg.get(
         'hardware_repack_interval_steps', 100))
+    strategy = str(training_cfg.get(
+        'hardware_repack_strategy', 'balanced_vq')).lower()
     farthest_per_sector = int(training_cfg.get(
         'hardware_repack_farthest_per_sector', 10))
     gain_eps = float(training_cfg.get('hardware_repack_gain_eps', 1.0e-3))
+    max_move_frac = float(training_cfg.get(
+        'hardware_repack_max_move_frac', 0.08))
+    vq_iterations = int(training_cfg.get(
+        'hardware_repack_vq_iterations', 4))
     warmup_steps = int(training_cfg.get('hardware_repack_warmup_steps', 0))
     freeze_after_step = training_cfg.get(
         'hardware_repack_freeze_after_step', None)
@@ -1127,10 +1133,22 @@ def _v4168_hardware_repack_config(training_cfg, model_version):
         raise ValueError(
             "training.hardware_repack_farthest_per_sector must be >= 0, got "
             f"{farthest_per_sector}.")
+    if strategy not in ('balanced_vq', 'sector_swap', 'legacy_swap', 'legacy'):
+        raise ValueError(
+            "training.hardware_repack_strategy must be 'balanced_vq' or "
+            f"'sector_swap', got {strategy!r}.")
     if gain_eps < 0.0:
         raise ValueError(
             "training.hardware_repack_gain_eps must be >= 0, got "
             f"{gain_eps}.")
+    if not (0.0 <= max_move_frac <= 1.0):
+        raise ValueError(
+            "training.hardware_repack_max_move_frac must be in [0, 1], got "
+            f"{max_move_frac}.")
+    if vq_iterations <= 0:
+        raise ValueError(
+            "training.hardware_repack_vq_iterations must be > 0, got "
+            f"{vq_iterations}.")
     if warmup_steps < 0:
         raise ValueError(
             "training.hardware_repack_warmup_steps must be >= 0, got "
@@ -1144,8 +1162,11 @@ def _v4168_hardware_repack_config(training_cfg, model_version):
         'hardware_repack_enabled': bool(enabled),
         'hardware_sector_execution_enabled': bool(sector_execution_enabled),
         'hardware_repack_interval_steps': interval_steps,
+        'hardware_repack_strategy': strategy,
         'hardware_repack_farthest_per_sector': farthest_per_sector,
         'hardware_repack_gain_eps': gain_eps,
+        'hardware_repack_max_move_frac': max_move_frac,
+        'hardware_repack_vq_iterations': vq_iterations,
         'hardware_repack_warmup_steps': warmup_steps,
         'hardware_repack_freeze_after_step': freeze_after_step,
     }
@@ -6088,6 +6109,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'estimated_compute_frac_page',
                 'selected_page_count'):
             metrics[_name] = result.get(_name, jnp.float32(0.0))
+        for _pool in ('attn_v', 'rst'):
+            for _name in (
+                    'sector_fill_mean',
+                    'sector_fill_max',
+                    'sector_overflow_count',
+                    'selected_sector_frac',
+                    'effective_operator_frac'):
+                _key = f'sector/{_pool}/{_name}'
+                metrics[_key] = result.get(_key, jnp.float32(0.0))
         for _pool in ('attn_qk', 'attn_v'):
             for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
                 _fallback = result.get(
@@ -11639,10 +11669,16 @@ def main():
             hardware_sector_execution_enabled,
         'hardware_repack_interval_steps':
             hardware_repack_config['hardware_repack_interval_steps'],
+        'hardware_repack_strategy':
+            hardware_repack_config['hardware_repack_strategy'],
         'hardware_repack_farthest_per_sector':
             hardware_repack_config['hardware_repack_farthest_per_sector'],
         'hardware_repack_gain_eps':
             hardware_repack_config['hardware_repack_gain_eps'],
+        'hardware_repack_max_move_frac':
+            hardware_repack_config['hardware_repack_max_move_frac'],
+        'hardware_repack_vq_iterations':
+            hardware_repack_config['hardware_repack_vq_iterations'],
         'hardware_repack_warmup_steps':
             hardware_repack_config['hardware_repack_warmup_steps'],
         'hardware_repack_freeze_after_step':
@@ -12826,6 +12862,8 @@ def main():
             _v4164_module, 'make_sharded_srw_minimal', None)
         make_sharded_srw_paired_minimal = getattr(
             _v4164_module, 'make_sharded_srw_paired_minimal', None)
+        make_sharded_srw_paired_dense_minimal = getattr(
+            _v4164_module, 'make_sharded_srw_paired_dense_minimal', None)
         max_chunk = cfg['training'].get('max_chunk_size', None)
         if max_chunk is not None:
             attn_qk_max_chunk = attn_v_max_chunk = rst_max_chunk = int(max_chunk)
@@ -12870,10 +12908,11 @@ def main():
         _sharded_single_v_minimal = None
         _sharded_single_rst_minimal = None
         if make_sharded_srw_minimal is not None:
-            _sharded_single_qk_minimal = make_sharded_srw_minimal(
-                max_chunk_size=attn_qk_max_chunk,
-                **_factory_kwargs(
-                    make_sharded_srw_minimal, _srw_pool_kwargs('qk')))
+            if str(model_version_cfg) != V4168_MODEL_VERSION:
+                _sharded_single_qk_minimal = make_sharded_srw_minimal(
+                    max_chunk_size=attn_qk_max_chunk,
+                    **_factory_kwargs(
+                        make_sharded_srw_minimal, _srw_pool_kwargs('qk')))
             _sharded_single_v_minimal = make_sharded_srw_minimal(
                 max_chunk_size=attn_v_max_chunk,
                 **_factory_kwargs(
@@ -12889,12 +12928,21 @@ def main():
                 **_factory_kwargs(_paired_factory, _srw_pool_kwargs('qk')))
             _sharded_paired_attn_qk_minimal = None
             if make_sharded_srw_paired_minimal is not None:
-                _sharded_paired_attn_qk_minimal = (
-                    make_sharded_srw_paired_minimal(
-                        max_chunk_size=attn_qk_max_chunk,
-                        **_factory_kwargs(
-                            make_sharded_srw_paired_minimal,
-                            _srw_pool_kwargs('qk'))))
+                if (str(model_version_cfg) == V4168_MODEL_VERSION
+                        and make_sharded_srw_paired_dense_minimal is not None):
+                    _sharded_paired_attn_qk_minimal = (
+                        make_sharded_srw_paired_dense_minimal(
+                            max_chunk_size=attn_qk_max_chunk,
+                            **_factory_kwargs(
+                                make_sharded_srw_paired_dense_minimal,
+                                _srw_base_kwargs)))
+                else:
+                    _sharded_paired_attn_qk_minimal = (
+                        make_sharded_srw_paired_minimal(
+                            max_chunk_size=attn_qk_max_chunk,
+                            **_factory_kwargs(
+                                make_sharded_srw_paired_minimal,
+                                _srw_pool_kwargs('qk'))))
             _sharded_fns = {
                 'single': _sharded_single_v,
                 'attn_v_single': _sharded_single_v,
@@ -12956,7 +13004,7 @@ def main():
                 if str(model_version_cfg) == V4167_MODEL_VERSION else "")
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 _v4168_exec_mode = (
-                    "sector_bucketed"
+                    "vq_ivf_sector_bucketed"
                     if hardware_sector_execution_enabled
                     else "block_sparse_fallback")
                 _extra_msg = (
@@ -12968,7 +13016,7 @@ def main():
                     f"{cfg['model'].get('v_top_blocks', 2)}/"
                     f"{cfg['model'].get('rst_top_blocks', 2)}")
             _qk_mode_msg = (
-                "QK single-route"
+                "QK dense-distributed"
                 if str(model_version_cfg) == V4168_MODEL_VERSION
                 else "QK fused")
             print(f"  shard_map enabled (mesh_model={mesh_model}, {_qk_mode_msg}"
@@ -12978,8 +13026,19 @@ def main():
                   f"{_extra_msg})")
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 print(
-                    "Hardware sector execution:\n"
-                    f"  enabled={str(hardware_sector_execution_enabled).lower()}\n"
+                    "v4168 hardware routing policy:\n"
+                    "  qk: dense_distributed\n"
+                    f"  v: vq_ivf_sector block_size={cfg['model'].get('v_block_size', 256)} "
+                    f"top_blocks={cfg['model'].get('v_top_blocks', 2)}\n"
+                    f"  rst: vq_ivf_sector block_size={cfg['model'].get('rst_block_size', 256)} "
+                    f"top_blocks={cfg['model'].get('rst_top_blocks', 2)}\n"
+                    f"  repack_strategy={hardware_repack_config['hardware_repack_strategy']}\n"
+                    f"  repack_interval_steps={hardware_repack_config['hardware_repack_interval_steps']}\n"
+                    f"  repack_warmup_steps={hardware_repack_config['hardware_repack_warmup_steps']}\n"
+                    f"  max_move_frac={hardware_repack_config['hardware_repack_max_move_frac']}\n"
+                    "  bucket_capacity_mult=1.5\n"
+                    "  bucket_capacity_round=multiple_of_128\n"
+                    "  fallback_in_fast_graph=false\n"
                     f"  main_val_path={'sector_bucketed' if hardware_sector_execution_enabled else 'block_sparse_fallback'}\n"
                     "  dense_ref_enabled=false",
                     flush=True)
@@ -13995,6 +14054,18 @@ def main():
                         for k, v in repack_metrics.items()
                     })
                     if is_host0:
+                        for _pool in ('attn_v', 'rst'):
+                            _prefix = f'repack/{_pool}/'
+                            if (_prefix + 'moved_frac') in repack_metrics:
+                                log_message(
+                                    f"[VQ repack] pool="
+                                    f"{'v' if _pool == 'attn_v' else 'rst'} "
+                                    f"moved_frac={float(repack_metrics.get(_prefix + 'moved_frac', 0.0)):.6f} "
+                                    f"mean_compactness_cos={float(repack_metrics.get(_prefix + 'mean_compactness_cos', 0.0)):.6f} "
+                                    f"min_sector_size={float(repack_metrics.get(_prefix + 'min_sector_size', 0.0)):.0f} "
+                                    f"max_sector_size={float(repack_metrics.get(_prefix + 'max_sector_size', 0.0)):.0f} "
+                                    f"mean_sector_radius={float(repack_metrics.get(_prefix + 'mean_sector_radius', 0.0)):.6f} "
+                                    f"max_sector_radius={float(repack_metrics.get(_prefix + 'max_sector_radius', 0.0)):.6f}")
                         log_jsonl({
                             'type': 'hardware_repack',
                             'step': int(step_after_update),

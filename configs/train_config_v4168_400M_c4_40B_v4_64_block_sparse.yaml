@@ -112,6 +112,9 @@ training:
   hardware_repack_enabled: true
   hardware_sector_execution_enabled: true
   hardware_repack_interval_steps: 100
+  hardware_repack_strategy: balanced_vq
+  hardware_repack_max_move_frac: 0.08
+  hardware_repack_vq_iterations: 4
   hardware_repack_farthest_per_sector: 10
   hardware_repack_gain_eps: 1.0e-3
   hardware_repack_warmup_steps: 0

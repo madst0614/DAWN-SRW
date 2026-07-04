@@ -14,10 +14,11 @@ Implemented concepts:
 - tau movement controlled by optimizer-side tau_lr_mult
 - train-time effective gate statistics
 - validation-time execution pruning through execution_prune_eps
-- v4168 hardware-sector execution uses exact global-sector-topK selection and
-  owner-local sector buckets: each shard batches all local token/sector pairs
-  by physical sector tile, with the older token-gather path retained as an
-  exact overflow/debug fallback.
+- v4168 hardware-sector execution uses VQ/IVF-style coarse sectors for V/RST:
+  host-side balanced VQ periodically packs nearby operator keys into physical
+  sector tiles, token queries select a few coarse sectors, and owner-local
+  buckets execute exact SRW inside selected tiles. QK remains dense-distributed
+  in the first-pass fast path.
 """
 
 
@@ -65,6 +66,22 @@ SELECT_DIAG_COUNT = len(SELECT_DIAG_NAMES)
     SELECT_SELECTED_FRAC,
     SELECT_NO_ACTIVE_FRAC,
 ) = range(SELECT_DIAG_COUNT)
+
+SECTOR_RUNTIME_DIAG_NAMES = (
+    'sector_fill_mean',
+    'sector_fill_max',
+    'sector_overflow_count',
+    'selected_sector_frac',
+    'effective_operator_frac',
+)
+SECTOR_RUNTIME_DIAG_COUNT = len(SECTOR_RUNTIME_DIAG_NAMES)
+(
+    SECTOR_FILL_MEAN,
+    SECTOR_FILL_MAX,
+    SECTOR_OVERFLOW_COUNT,
+    SECTOR_SELECTED_SECTOR_FRAC,
+    SECTOR_EFFECTIVE_OPERATOR_FRAC,
+) = range(SECTOR_RUNTIME_DIAG_COUNT)
 
 
 # v4164 exposure diagnostics are admission based, not hard score>tau based.
@@ -2641,6 +2658,11 @@ _HARDWARE_REPACK_POOLS = (
     ('rst', 'rst_op_key', 'rst_read', 'rst_write',
      'rst_block_size', 'rst_top_blocks'),
 )
+_HARDWARE_VQ_REPACK_POOLS = tuple(
+    entry for entry in _HARDWARE_REPACK_POOLS if entry[0] != 'attn_qk')
+_V4168_VQ_REPACK_ITERATIONS = 4
+_V4168_VQ_REPACK_MAX_MOVE_FRAC = 0.08
+_V4168_VQ_REPACK_STRATEGY = 'balanced_vq'
 
 
 def _np_unit_direction(x):
@@ -2741,9 +2763,291 @@ def _identity_hardware_repack_metrics(perm, compact_before,
     }
 
 
-def _plan_hardware_sector_repack(op_keys, block_size,
-                                 farthest_per_sector=10,
-                                 gain_eps=1.0e-3):
+def _sector_layout_quality_np(keys, block_size):
+    keys = _np_unit_direction(keys)
+    n_ops = int(keys.shape[0])
+    if n_ops == 0:
+        return {
+            'mean_compactness_cos': 0.0,
+            'mean_sector_radius': 0.0,
+            'max_sector_radius': 0.0,
+            'min_sector_size': 0.0,
+            'max_sector_size': 0.0,
+        }
+    sums, counts = _sector_sums_np(keys, block_size)
+    centers = _np_unit_direction(sums)
+    n_sectors = int(sums.shape[0])
+    compact = np.zeros((n_sectors,), dtype=np.float32)
+    radius_mean = np.zeros((n_sectors,), dtype=np.float32)
+    radius_max = np.zeros((n_sectors,), dtype=np.float32)
+    for sector in range(n_sectors):
+        start = sector * int(block_size)
+        stop = min(start + int(block_size), n_ops)
+        if start >= stop:
+            continue
+        cos = keys[start:stop] @ centers[sector]
+        dist = 1.0 - cos
+        compact[sector] = np.mean(cos).astype(np.float32)
+        radius_mean[sector] = np.mean(dist).astype(np.float32)
+        radius_max[sector] = np.max(dist).astype(np.float32)
+    valid = counts > 0
+    if not np.any(valid):
+        return {
+            'mean_compactness_cos': 0.0,
+            'mean_sector_radius': 0.0,
+            'max_sector_radius': 0.0,
+            'min_sector_size': 0.0,
+            'max_sector_size': 0.0,
+        }
+    return {
+        'mean_compactness_cos': float(np.mean(compact[valid])),
+        'mean_sector_radius': float(np.mean(radius_mean[valid])),
+        'max_sector_radius': float(np.max(radius_max[valid])),
+        'min_sector_size': float(np.min(counts[valid])),
+        'max_sector_size': float(np.max(counts[valid])),
+    }
+
+
+def _vq_target_sector_counts(n_ops, block_size):
+    n_ops = int(n_ops)
+    block_size = int(block_size)
+    if n_ops <= 0:
+        return np.zeros((0,), dtype=np.int32)
+    n_sectors = (n_ops + block_size - 1) // block_size
+    counts = np.full((n_sectors,), block_size, dtype=np.int32)
+    remainder = n_ops % block_size
+    if remainder:
+        counts[-1] = remainder
+    return counts
+
+
+def _balanced_vq_assign_np(keys, centroids, target_counts):
+    """Deterministic greedy fixed-capacity assignment."""
+    n_ops = int(keys.shape[0])
+    n_sectors = int(centroids.shape[0])
+    if n_ops == 0:
+        return np.zeros((0,), dtype=np.int32)
+    sim = (keys @ centroids.T).astype(np.float32)
+    flat_sim = sim.reshape(-1)
+    flat_ops = np.repeat(np.arange(n_ops, dtype=np.int32), n_sectors)
+    flat_sectors = np.tile(np.arange(n_sectors, dtype=np.int32), n_ops)
+    order = np.lexsort((flat_sectors, flat_ops, -flat_sim))
+    remaining = np.asarray(target_counts, dtype=np.int32).copy()
+    assignment = np.full((n_ops,), -1, dtype=np.int32)
+    assigned_count = 0
+    for flat_idx in order:
+        op_i = int(flat_ops[flat_idx])
+        if assignment[op_i] >= 0:
+            continue
+        sector = int(flat_sectors[flat_idx])
+        if remaining[sector] <= 0:
+            continue
+        assignment[op_i] = sector
+        remaining[sector] -= 1
+        assigned_count += 1
+        if assigned_count == n_ops:
+            break
+    if assigned_count != n_ops or np.any(remaining != 0):
+        raise RuntimeError(
+            "balanced VQ assignment failed to fill fixed sector capacities")
+    return assignment
+
+
+def _balanced_vq_recompute_centroids_np(keys, assignment, n_sectors,
+                                        previous_centroids):
+    sums = np.zeros((n_sectors, keys.shape[-1]), dtype=np.float32)
+    np.add.at(sums, assignment, keys)
+    empty = np.linalg.norm(sums, axis=-1) <= 1.0e-12
+    centroids = _np_unit_direction(sums)
+    if np.any(empty):
+        centroids[empty] = previous_centroids[empty]
+    return _np_unit_direction(centroids)
+
+
+def _decompose_balanced_assignment_cycles(current_assignment,
+                                          desired_assignment,
+                                          gains):
+    moved = np.flatnonzero(desired_assignment != current_assignment)
+    remaining = set(int(x) for x in moved.tolist())
+    by_src = {}
+    for op_i in remaining:
+        by_src.setdefault(int(current_assignment[op_i]), []).append(op_i)
+    for src, ops in by_src.items():
+        ops.sort(key=lambda op_i: (-float(gains[op_i]), int(op_i),
+                                   int(desired_assignment[op_i])))
+    cycles = []
+    while remaining:
+        start = min(
+            remaining,
+            key=lambda op_i: (-float(gains[op_i]), int(op_i)))
+        src0 = int(current_assignment[start])
+        visited = {src0: 0}
+        path_ops = []
+        sector = src0
+        while True:
+            candidates = [op_i for op_i in by_src.get(sector, [])
+                          if op_i in remaining]
+            if not candidates:
+                raise RuntimeError(
+                    "balanced VQ movement limiter lost sector flow balance")
+            op_i = candidates[0]
+            path_ops.append(op_i)
+            next_sector = int(desired_assignment[op_i])
+            if next_sector in visited:
+                cycle_ops = path_ops[visited[next_sector]:]
+                for cycle_op in cycle_ops:
+                    remaining.remove(cycle_op)
+                cycles.append(tuple(cycle_ops))
+                break
+            visited[next_sector] = len(path_ops)
+            sector = next_sector
+    cycles.sort(key=lambda cyc: (
+        -float(np.sum(gains[np.asarray(cyc, dtype=np.int32)])),
+        -float(np.mean(gains[np.asarray(cyc, dtype=np.int32)])),
+        len(cyc),
+        min(cyc)))
+    return cycles
+
+
+def _assignment_to_limited_hardware_perm(current_assignment,
+                                         desired_assignment,
+                                         gains,
+                                         block_size,
+                                         max_move_frac,
+                                         gain_eps):
+    n_ops = int(current_assignment.size)
+    if n_ops == 0:
+        return np.arange(0, dtype=np.int32), np.zeros((0,), dtype=np.int32)
+    max_move_frac = max(0.0, float(max_move_frac))
+    move_budget = int(math.floor(float(n_ops) * max_move_frac))
+    if max_move_frac > 0.0 and move_budget == 0:
+        move_budget = 1
+    selected = np.zeros((n_ops,), dtype=np.bool_)
+    moved_so_far = 0
+    for cycle in _decompose_balanced_assignment_cycles(
+            current_assignment, desired_assignment, gains):
+        cycle_arr = np.asarray(cycle, dtype=np.int32)
+        cycle_gain = float(np.sum(gains[cycle_arr]))
+        if cycle_gain <= float(gain_eps):
+            continue
+        if moved_so_far + int(cycle_arr.size) > move_budget:
+            continue
+        selected[cycle_arr] = True
+        moved_so_far += int(cycle_arr.size)
+    final_assignment = np.array(current_assignment, copy=True)
+    final_assignment[selected] = desired_assignment[selected]
+
+    perm = np.arange(n_ops, dtype=np.int32)
+    n_sectors = int(np.max(current_assignment)) + 1
+    for sector in range(n_sectors):
+        holes = np.flatnonzero(
+            np.logical_and(current_assignment == sector, selected))
+        incoming = np.flatnonzero(
+            np.logical_and(final_assignment == sector,
+                           current_assignment != sector))
+        holes = np.asarray(sorted(holes.tolist()), dtype=np.int32)
+        incoming = np.asarray(sorted(incoming.tolist()), dtype=np.int32)
+        if int(holes.size) != int(incoming.size):
+            raise RuntimeError(
+                "balanced VQ movement limiter produced unbalanced sector flow")
+        if holes.size:
+            perm[holes] = incoming
+
+    return _validate_hardware_permutation_np(perm, n_ops), final_assignment
+
+
+def _plan_hardware_sector_balanced_vq_repack(op_keys, block_size,
+                                             iterations=4,
+                                             max_move_frac=0.08,
+                                             gain_eps=1.0e-3):
+    """Plan VQ/IVF physical row packing for one operator pool.
+
+    Returns perm[new_slot] = old_slot.  The planner is host-side, deterministic,
+    and uses only current operator keys plus the existing physical layout.
+    """
+    block_size = int(block_size)
+    iterations = max(1, int(iterations))
+    gain_eps = float(gain_eps)
+    if block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
+
+    keys = _np_unit_direction(op_keys)
+    n_ops = int(keys.shape[0])
+    perm = np.arange(n_ops, dtype=np.int32)
+    compact_before, radius_before_mean, radius_before_max = (
+        _sector_compactness_and_radius_np(keys, block_size))
+    if n_ops == 0:
+        return perm, _identity_hardware_repack_metrics(
+            perm, compact_before, radius_before_mean, radius_before_max)
+
+    target_counts = _vq_target_sector_counts(n_ops, block_size)
+    n_sectors = int(target_counts.size)
+    current_assignment = (
+        np.arange(n_ops, dtype=np.int32) // np.int32(block_size))
+    sums, _counts = _sector_sums_np(keys, block_size)
+    centroids = _np_unit_direction(sums)
+
+    desired_assignment = np.array(current_assignment, copy=True)
+    for _ in range(iterations):
+        desired_assignment = _balanced_vq_assign_np(
+            keys, centroids, target_counts)
+        centroids = _balanced_vq_recompute_centroids_np(
+            keys, desired_assignment, n_sectors, centroids)
+
+    sim = keys @ centroids.T
+    gains = (
+        sim[np.arange(n_ops), desired_assignment]
+        - sim[np.arange(n_ops), current_assignment])
+    perm, final_assignment = _assignment_to_limited_hardware_perm(
+        current_assignment, desired_assignment, gains, block_size,
+        max_move_frac=max_move_frac, gain_eps=gain_eps)
+    moved_mask = perm != np.arange(n_ops, dtype=np.int32)
+    moved_count = int(moved_mask.sum())
+    new_keys = keys[perm]
+    compact_after, radius_after_mean, radius_after_max = (
+        _sector_compactness_and_radius_np(new_keys, block_size))
+    before_quality = _sector_layout_quality_np(keys, block_size)
+    after_quality = _sector_layout_quality_np(new_keys, block_size)
+    selected_gains = gains[perm[moved_mask]] if moved_count else np.zeros(
+        (0,), dtype=np.float32)
+    full_moved = int(np.count_nonzero(desired_assignment != current_assignment))
+    metrics = {
+        'moved_count': float(moved_count),
+        'moved_frac': float(moved_count) / float(max(n_ops, 1)),
+        'candidate_count': float(full_moved),
+        'full_vq_moved_count': float(full_moved),
+        'full_vq_moved_frac': float(full_moved) / float(max(n_ops, 1)),
+        'mean_gain': float(np.mean(selected_gains)) if moved_count else 0.0,
+        'max_gain': float(np.max(selected_gains)) if moved_count else 0.0,
+        'compactness_before_mean': float(compact_before.mean()),
+        'compactness_after_mean': float(compact_after.mean()),
+        'radius_before_mean': float(radius_before_mean),
+        'radius_after_mean': float(radius_after_mean),
+        'radius_before_max': float(radius_before_max),
+        'radius_after_max': float(radius_after_max),
+        'mean_compactness_cos': after_quality['mean_compactness_cos'],
+        'mean_compactness_cos_before':
+            before_quality['mean_compactness_cos'],
+        'mean_sector_radius': after_quality['mean_sector_radius'],
+        'max_sector_radius': after_quality['max_sector_radius'],
+        'min_sector_size': after_quality['min_sector_size'],
+        'max_sector_size': after_quality['max_sector_size'],
+        'max_move_frac': float(max_move_frac),
+        'vq_iterations': float(iterations),
+        'strategy_balanced_vq': 1.0,
+        'perm_checksum': float(_hardware_perm_checksum(perm)),
+    }
+    expected_counts = np.bincount(
+        final_assignment, minlength=n_sectors).astype(np.int32)
+    if not np.array_equal(expected_counts, target_counts):
+        raise RuntimeError(
+            "balanced VQ repack did not preserve fixed sector sizes")
+    return perm, metrics
+
+
+def _plan_hardware_sector_swap_repack(op_keys, block_size,
+                                      farthest_per_sector=10,
+                                      gain_eps=1.0e-3):
     """Plan a physical row permutation for one operator pool.
 
     Returns perm[new_slot] = old_slot.  Planning is intentionally host-side and
@@ -2934,6 +3238,29 @@ def _plan_hardware_sector_repack(op_keys, block_size,
     return new_perm, metrics
 
 
+def _plan_hardware_sector_repack(op_keys, block_size,
+                                 farthest_per_sector=10,
+                                 gain_eps=1.0e-3,
+                                 strategy=_V4168_VQ_REPACK_STRATEGY,
+                                 max_move_frac=_V4168_VQ_REPACK_MAX_MOVE_FRAC,
+                                 vq_iterations=_V4168_VQ_REPACK_ITERATIONS):
+    strategy = str(strategy or _V4168_VQ_REPACK_STRATEGY).lower()
+    if strategy == 'balanced_vq':
+        return _plan_hardware_sector_balanced_vq_repack(
+            op_keys, block_size,
+            iterations=vq_iterations,
+            max_move_frac=max_move_frac,
+            gain_eps=gain_eps)
+    if strategy in ('sector_swap', 'legacy_swap', 'legacy'):
+        return _plan_hardware_sector_swap_repack(
+            op_keys, block_size,
+            farthest_per_sector=farthest_per_sector,
+            gain_eps=gain_eps)
+    raise ValueError(
+        "hardware_repack_strategy must be 'balanced_vq' or 'sector_swap', "
+        f"got {strategy!r}")
+
+
 def _path_key_tuple(path):
     out = []
     for entry in path:
@@ -2975,6 +3302,7 @@ def _apply_pool_permutations_to_params_and_opt_state(params, opt_state,
     for pool, _op_key, read_key, write_key, _block_key, _top_key in (
             _HARDWARE_REPACK_POOLS):
         if pool in jax_perms:
+            pool_leaf_to_perm[_op_key] = jax_perms[pool]
             pool_leaf_to_perm[read_key] = jax_perms[pool]
             pool_leaf_to_perm[write_key] = jax_perms[pool]
 
@@ -3078,8 +3406,10 @@ def hardware_sector_static_metrics(model_config, model_axis_size=1,
             float(topk_eff) / float(model_axis_size))
         metrics[f'sector/{pool}/remote_dummy_sector_slot_frac'] = (
             1.0 - (float(topk_eff) / float(max(model_axis_size * topk_eff, 1))))
+        pool_bucketed_execution_enabled = (
+            bool(bucketed_execution_enabled) and pool != 'attn_qk')
         metrics[f'sector/{pool}/bucketed_execution_enabled'] = float(
-            bucketed_execution_enabled)
+            pool_bucketed_execution_enabled)
         metrics[f'sector/{pool}/bucket_fallback_used'] = 0.0
         metrics[f'sector/{pool}/bucket_overflow_count'] = 0.0
         metrics[f'sector/{pool}/bucket_overflow_frac'] = 0.0
@@ -3105,6 +3435,15 @@ def hardware_sector_static_metrics(model_config, model_axis_size=1,
             metrics[f'sector/{pool}/bucket_max_fill'] = float(bucket_capacity)
             metrics[f'sector/{pool}/bucket_mean_fill'] = float(
                 bucket_expected_used / float(max(n_local_sectors, 1)))
+            metrics[f'sector/{pool}/sector_fill_mean'] = float(
+                bucket_expected_used / float(max(n_local_sectors, 1)))
+            metrics[f'sector/{pool}/sector_fill_max'] = float(
+                bucket_capacity)
+            metrics[f'sector/{pool}/sector_overflow_count'] = 0.0
+            metrics[f'sector/{pool}/selected_sector_frac'] = float(
+                topk_eff) / float(max(n_sectors, 1))
+            metrics[f'sector/{pool}/effective_operator_frac'] = float(
+                valid_est) / float(dense_ops)
     return metrics
 
 
@@ -3200,9 +3539,18 @@ def maybe_hardware_repack(params, opt_state, model_config, mesh, step, config):
     if not _hardware_repack_enabled(config):
         return params, opt_state, {}
 
+    strategy = str(config.get(
+        'hardware_repack_strategy',
+        _V4168_VQ_REPACK_STRATEGY)).lower()
     farthest_per_sector = int(
         config.get('hardware_repack_farthest_per_sector', 10))
     gain_eps = float(config.get('hardware_repack_gain_eps', 1.0e-3))
+    max_move_frac = float(config.get(
+        'hardware_repack_max_move_frac',
+        _V4168_VQ_REPACK_MAX_MOVE_FRAC))
+    vq_iterations = int(config.get(
+        'hardware_repack_vq_iterations',
+        _V4168_VQ_REPACK_ITERATIONS))
 
     pool_params = params['neuron_pool']
     op_keys = _pool_operator_keys(pool_params)
@@ -3212,7 +3560,7 @@ def maybe_hardware_repack(params, opt_state, model_config, mesh, step, config):
     metrics = {}
     total_moved = 0.0
     for pool, op_key_key, _read_key, _write_key, block_key, _top_key in (
-            _HARDWARE_REPACK_POOLS):
+            _HARDWARE_VQ_REPACK_POOLS):
         block_size = int(model_config.get(block_key, 256))
         key_device = _forward_unit_direction(
             op_keys[op_key_key].astype(jnp.float32))
@@ -3220,7 +3568,10 @@ def maybe_hardware_repack(params, opt_state, model_config, mesh, step, config):
         perm, pool_metrics = _plan_hardware_sector_repack(
             key_host, block_size,
             farthest_per_sector=farthest_per_sector,
-            gain_eps=gain_eps)
+            gain_eps=gain_eps,
+            strategy=strategy,
+            max_move_frac=max_move_frac,
+            vq_iterations=vq_iterations)
         perm, perm_checksum, perm_broadcast_ok = (
             _canonical_hardware_permutation_across_hosts(perm, pool=pool))
         moved_mask = perm != np.arange(int(perm.size), dtype=np.int32)
@@ -3239,6 +3590,10 @@ def maybe_hardware_repack(params, opt_state, model_config, mesh, step, config):
     metrics['repack/total_moved_count'] = float(total_moved)
     metrics['repack/step'] = float(int(step))
     metrics['repack/drift_snapshot_refreshed'] = 0.0
+    metrics['repack/strategy_balanced_vq'] = float(
+        1.0 if strategy == 'balanced_vq' else 0.0)
+    metrics['repack/max_move_frac'] = float(max_move_frac)
+    metrics['repack/vq_iterations'] = float(vq_iterations)
     metrics.update(hardware_sector_static_metrics(
         model_config, model_axis_size=model_axis_size,
         bucketed_execution_enabled=bool(
@@ -3263,9 +3618,10 @@ def _v4168_block_sparse_config(block_size, top_blocks):
 
 _V4168_BUCKET_CHUNK_SIZE = 512
 _V4168_EXECUTION_PAIR_PRUNE_EPS = 1.0e-6
-_V4168_SECTOR_BUCKET_CAPACITY_MULT = 4.0
+_V4168_SECTOR_BUCKET_CAPACITY_MULT = 1.5
 _V4168_SECTOR_BUCKET_MIN_CAPACITY = 32
-_V4168_SECTOR_BUCKET_ROUND_POWER_OF_TWO = True
+_V4168_SECTOR_BUCKET_CAPACITY_ROUND_MULTIPLE = 128
+_V4168_SECTOR_BUCKET_ROUND_POWER_OF_TWO = False
 
 
 def _v4168_next_power_of_two(x):
@@ -3287,6 +3643,12 @@ def _v4168_sector_bucket_capacity(pair_span, topk, global_n_sectors):
     )
     if _V4168_SECTOR_BUCKET_ROUND_POWER_OF_TWO:
         capacity = _v4168_next_power_of_two(capacity)
+    else:
+        round_multiple = max(
+            1, int(_V4168_SECTOR_BUCKET_CAPACITY_ROUND_MULTIPLE))
+        capacity = int(
+            math.ceil(float(capacity) / float(round_multiple))
+            * round_multiple)
     capacity = min(max(1, capacity), selected_pairs)
     return capacity, avg_pairs
 
@@ -3433,7 +3795,7 @@ def make_sharded_srw_block_sparse_minimal(
                        P('model', None),
                        P('model', None),
                        P(), P(), P(), P(), P()),
-             out_specs=P('data', None, None),
+             out_specs=(P('data', None, None), P()),
              check_rep=False)
     def fused_gate_srw_block_sparse_minimal(
             x, h, op_key_local, raw_tau, read_local, write_local,
@@ -3666,7 +4028,7 @@ def make_sharded_srw_paired_block_sparse_minimal(
                        P('model', None),
                        P('model', None),
                        P(), P(), P(), P(), P()),
-             out_specs=P('data', None, None, None),
+             out_specs=(P('data', None, None, None), P()),
              check_rep=False)
     def fused_gate_srw_paired_block_sparse_minimal(
             x, h, op_key_local, raw_tau, read_local, write_local,
@@ -4315,6 +4677,28 @@ def make_sharded_srw_sector_bucketed_minimal(
             local_sector_ids, selected_here, T, topk, n_local_sectors,
             bucket_capacity)
         global_overflow_count = jax.lax.psum(overflow_count, 'model')
+        bucket_fill = sector_bucket_valid.astype(jnp.int32).sum(axis=1)
+        global_sector_fill_sum = jax.lax.psum(
+            bucket_fill.astype(jnp.float32).sum(), 'model')
+        global_sector_fill_max = jax.lax.pmax(
+            jax.lax.stop_gradient(bucket_fill.max()).astype(jnp.float32),
+            'model')
+        selected_sector_local = (bucket_fill > 0).astype(jnp.float32)
+        selected_sector_count = jax.lax.psum(
+            selected_sector_local.sum(), 'model')
+        selected_real_ops_local = (
+            selected_sector_local[:, None]
+            * valid_blocks.astype(jnp.float32)).sum()
+        total_real_ops = jax.lax.psum(
+            valid_blocks.astype(jnp.float32).sum(), 'model')
+        sector_diag = jnp.asarray((
+            global_sector_fill_sum / jnp.float32(max(global_n_sectors, 1)),
+            global_sector_fill_max,
+            global_overflow_count.astype(jnp.float32),
+            selected_sector_count / jnp.float32(max(global_n_sectors, 1)),
+            jax.lax.psum(selected_real_ops_local, 'model')
+            / jnp.maximum(total_real_ops, 1.0),
+        ), dtype=jnp.float32)
 
         def angular_compose_parts(rho, tau_b, valid_mask):
             _, admission, _drive, execution_weight, _ = _compute_admission_drive(
@@ -4438,11 +4822,8 @@ def make_sharded_srw_sector_bucketed_minimal(
                 jnp.arange(max_token_chunks, dtype=jnp.int32))
             return finish(flat_raw_out, flat_den_cost)
 
-        return jax.lax.cond(
-            global_overflow_count > 0,
-            token_gather_execute,
-            bucket_execute,
-            operand=None)
+        del token_gather_execute
+        return bucket_execute(None), sector_diag
 
     return fused_gate_srw_sector_bucketed_minimal
 
@@ -4541,6 +4922,28 @@ def make_sharded_srw_paired_sector_bucketed_minimal(
             local_sector_ids, selected_here, pair_span, topk, n_local_sectors,
             bucket_capacity)
         global_overflow_count = jax.lax.psum(overflow_count, 'model')
+        bucket_fill = sector_bucket_valid.astype(jnp.int32).sum(axis=1)
+        global_sector_fill_sum = jax.lax.psum(
+            bucket_fill.astype(jnp.float32).sum(), 'model')
+        global_sector_fill_max = jax.lax.pmax(
+            jax.lax.stop_gradient(bucket_fill.max()).astype(jnp.float32),
+            'model')
+        selected_sector_local = (bucket_fill > 0).astype(jnp.float32)
+        selected_sector_count = jax.lax.psum(
+            selected_sector_local.sum(), 'model')
+        selected_real_ops_local = (
+            selected_sector_local[:, None]
+            * valid_blocks.astype(jnp.float32)).sum()
+        total_real_ops = jax.lax.psum(
+            valid_blocks.astype(jnp.float32).sum(), 'model')
+        sector_diag = jnp.asarray((
+            global_sector_fill_sum / jnp.float32(max(global_n_sectors, 1)),
+            global_sector_fill_max,
+            global_overflow_count.astype(jnp.float32),
+            selected_sector_count / jnp.float32(max(global_n_sectors, 1)),
+            jax.lax.psum(selected_real_ops_local, 'model')
+            / jnp.maximum(total_real_ops, 1.0),
+        ), dtype=jnp.float32)
 
         def angular_compose_parts(rho, tau_b, valid_mask):
             _, admission, _drive, execution_weight, _ = _compute_admission_drive(
@@ -4668,11 +5071,8 @@ def make_sharded_srw_paired_sector_bucketed_minimal(
                 jnp.arange(max_pair_chunks, dtype=jnp.int32))
             return finish(flat_raw_out, flat_den_cost)
 
-        return jax.lax.cond(
-            global_overflow_count > 0,
-            token_gather_execute,
-            bucket_execute,
-            operand=None)
+        del token_gather_execute
+        return bucket_execute(None), sector_diag
 
     return fused_gate_srw_paired_sector_bucketed_minimal
 
@@ -4973,10 +5373,11 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         h_QK = jnp.stack([h_Q, h_K], axis=2)
         raw_tau_QK = jnp.stack(
             [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
-        QK_out = fused_paired(
+        qk_ret = fused_paired(
             x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
             soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
             soft_gate_boundary_power_final, execution_prune_eps)
+        QK_out = qk_ret[0] if isinstance(qk_ret, tuple) else qk_ret
         Q = QK_out[:, :, 0, :]
         K = QK_out[:, :, 1, :]
     elif fused_single_qk is not None:
@@ -4992,10 +5393,16 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         raise RuntimeError("v4168 minimal attention requires a Q/K SRW executor.")
     Q = Q * qk_scale
     K = K * qk_scale
-    V = fused_single_v(
+    v_ret = fused_single_v(
         x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
         soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps)
+    if isinstance(v_ret, tuple):
+        V, v_sector_diag = v_ret
+    else:
+        V = v_ret
+        v_sector_diag = jnp.zeros(
+            (SECTOR_RUNTIME_DIAG_COUNT,), dtype=jnp.float32)
     V = V * v_scale
 
     d_head = d_model // n_heads
@@ -5020,7 +5427,7 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
     rng, rng_out = jax.random.split(rng)
-    return safe_dropout(out, dropout_rate, deterministic, rng_out)
+    return safe_dropout(out, dropout_rate, deterministic, rng_out), v_sector_diag
 
 
 def _rst_forward_minimal(x, pool_params, router_params, rng,
@@ -5064,13 +5471,19 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
             sharded_fns.get('rst_single', sharded_fns['single']))
     else:
         fused_single, _ = sharded_fns
-    out = fused_single(
+    rst_ret = fused_single(
         x, h, rst_op_key, raw_tau, rst_read, rst_write,
         soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps)
+    if isinstance(rst_ret, tuple):
+        out, rst_sector_diag = rst_ret
+    else:
+        out = rst_ret
+        rst_sector_diag = jnp.zeros(
+            (SECTOR_RUNTIME_DIAG_COUNT,), dtype=jnp.float32)
     out = out * rst_scale
     rng, rng_out = jax.random.split(rng)
-    return safe_dropout(out, dropout_rate, deterministic, rng_out)
+    return safe_dropout(out, dropout_rate, deterministic, rng_out), rst_sector_diag
 
 
 def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
@@ -5953,7 +6366,7 @@ class DAWN_SRW_V4168(nn.Module):
 
                     normed = _layer_norm(
                         x, bp['norm1']['scale'], bp['norm1']['bias'])
-                    attn_out = _attn_forward_minimal(
+                    attn_out, attn_v_sector_diag = _attn_forward_minimal(
                         normed, pool_params, router_params,
                         bp['attn']['expand_O']['kernel'], rng_attn,
                         self.n_qk, self.n_v,
@@ -5973,7 +6386,7 @@ class DAWN_SRW_V4168(nn.Module):
 
                     normed = _layer_norm(
                         x, bp['norm2']['scale'], bp['norm2']['bias'])
-                    rst_out = _rst_forward_minimal(
+                    rst_out, rst_sector_diag = _rst_forward_minimal(
                         normed, pool_params, router_params, rng_rst,
                         self.router_dropout, self.dropout_rate,
                         deterministic,
@@ -5987,7 +6400,7 @@ class DAWN_SRW_V4168(nn.Module):
                         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
                         admission_den_power=admission_den_power,
                         execution_prune_eps=execution_prune_eps)
-                    return x + rst_out, None
+                    return x + rst_out, (attn_v_sector_diag, rst_sector_diag)
 
                 if self.gradient_checkpointing:
                     scan_body_minimal = jax.checkpoint(scan_body_minimal)
@@ -5996,7 +6409,9 @@ class DAWN_SRW_V4168(nn.Module):
                     'params': stacked,
                     'rng': layer_rngs,
                 }
-                x, _ = jax.lax.scan(scan_body_minimal, x, xs_minimal)
+                x, sector_ys = jax.lax.scan(scan_body_minimal, x, xs_minimal)
+                attn_v_sector_diag = jnp.mean(sector_ys[0], axis=0)
+                rst_sector_diag = jnp.mean(sector_ys[1], axis=0)
                 x = self.norm(x)
                 if labels is None:
                     return {'logits': self.token_emb.attend(x)}
@@ -6013,6 +6428,26 @@ class DAWN_SRW_V4168(nn.Module):
                     'correct': correct,
                     'valid_count': valid_count,
                     'aux_loss': jnp.float32(0.0),
+                    'sector/attn_v/sector_fill_mean':
+                        attn_v_sector_diag[SECTOR_FILL_MEAN],
+                    'sector/attn_v/sector_fill_max':
+                        attn_v_sector_diag[SECTOR_FILL_MAX],
+                    'sector/attn_v/sector_overflow_count':
+                        attn_v_sector_diag[SECTOR_OVERFLOW_COUNT],
+                    'sector/attn_v/selected_sector_frac':
+                        attn_v_sector_diag[SECTOR_SELECTED_SECTOR_FRAC],
+                    'sector/attn_v/effective_operator_frac':
+                        attn_v_sector_diag[SECTOR_EFFECTIVE_OPERATOR_FRAC],
+                    'sector/rst/sector_fill_mean':
+                        rst_sector_diag[SECTOR_FILL_MEAN],
+                    'sector/rst/sector_fill_max':
+                        rst_sector_diag[SECTOR_FILL_MAX],
+                    'sector/rst/sector_overflow_count':
+                        rst_sector_diag[SECTOR_OVERFLOW_COUNT],
+                    'sector/rst/selected_sector_frac':
+                        rst_sector_diag[SECTOR_SELECTED_SECTOR_FRAC],
+                    'sector/rst/effective_operator_frac':
+                        rst_sector_diag[SECTOR_EFFECTIVE_OPERATOR_FRAC],
                 }
 
             def scan_body(carry, xs):
