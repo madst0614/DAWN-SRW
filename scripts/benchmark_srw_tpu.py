@@ -688,6 +688,7 @@ def build_sharded_fns(cfg, mesh):
 def create_benchmark_train_step(model, optimizer, sharded_fns, cfg):
     optax_mod = require_optax()
     t = cfg["training"]
+    version = str(cfg["model"].get("model_version", ""))
     soft_gate_t = float(t.get("soft_gate_temperature", 0.07))
     boundary_power = float(t.get("soft_gate_boundary_power_final",
                                  t.get("soft_gate_boundary_power_mid",
@@ -699,26 +700,26 @@ def create_benchmark_train_step(model, optimizer, sharded_fns, cfg):
         del step
 
         def loss_fn(p):
-            result = model.apply(
-                {"params": p},
-                input_ids,
-                labels=input_ids,
-                attention_mask=attention_mask,
-                deterministic=True,
-                rngs={"dropout": rng},
-                sharded_fns=sharded_fns,
-                minimal_train=True,
-                soft_gate_temperature=soft_gate_t,
-                soft_gate_t_final=soft_gate_t,
-                soft_gate_T_qk=soft_gate_t,
-                soft_gate_T_v=soft_gate_t,
-                soft_gate_T_rst=soft_gate_t,
-                soft_gate_boundary_power=boundary_power,
-                soft_gate_boundary_power_final=boundary_power,
-                admission_den_power=admission_den_power,
-                execution_prune_eps=0.0,
-                benchmark_runtime_metrics=True,
-            )
+            apply_kwargs = {
+                "labels": input_ids,
+                "attention_mask": attention_mask,
+                "deterministic": True,
+                "rngs": {"dropout": rng},
+                "sharded_fns": sharded_fns,
+                "minimal_train": True,
+                "soft_gate_temperature": soft_gate_t,
+                "soft_gate_t_final": soft_gate_t,
+                "soft_gate_T_qk": soft_gate_t,
+                "soft_gate_T_v": soft_gate_t,
+                "soft_gate_T_rst": soft_gate_t,
+                "soft_gate_boundary_power": boundary_power,
+                "soft_gate_boundary_power_final": boundary_power,
+                "admission_den_power": admission_den_power,
+                "execution_prune_eps": 0.0,
+            }
+            if version == V4168_MODEL_VERSION:
+                apply_kwargs["benchmark_runtime_metrics"] = True
+            result = model.apply({"params": p}, input_ids, **apply_kwargs)
             loss = result["loss"] + result.get("aux_loss", jnp.float32(0.0))
             return loss, result
 
