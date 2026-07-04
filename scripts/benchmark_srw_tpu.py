@@ -5,8 +5,11 @@ Runs model modules directly and reports benchmark details to stdout.
 """
 
 import argparse
+from copy import deepcopy
 import importlib
 import inspect
+import itertools
+import json
 import os
 from pathlib import Path
 import random
@@ -31,6 +34,37 @@ MODEL_MODULES = {
     V4166_MODEL_VERSION: ("models.dawn_srw_v4166", "DAWN_SRW_V4166"),
     V4168_MODEL_VERSION: ("models.dawn_srw_v4168", "DAWN_SRW_V4168"),
 }
+SECTOR_RUNTIME_METRIC_NAMES = (
+    "bucket_fill_mean",
+    "bucket_fill_p50",
+    "bucket_fill_p90",
+    "bucket_fill_p95",
+    "bucket_fill_p99",
+    "bucket_fill_max",
+    "overflow_count",
+    "overflow_frac",
+    "bucket_capacity",
+    "bucket_capacity_util_p50",
+    "bucket_capacity_util_p95",
+    "bucket_capacity_util_p99",
+    "bucket_capacity_util_max",
+    "expected_selected_pair_count",
+    "executed_pair_count",
+    "executed_selected_pair_frac",
+    "batch_union_selected_sector_frac",
+    "batch_union_effective_operator_frac",
+    "per_token_selected_sector_count",
+    "per_token_selected_ops",
+    "per_token_effective_operator_frac",
+    "semantic_work_frac_vs_dense",
+    "padded_work_frac_vs_dense",
+    "hot_sector_skew_p99_over_mean",
+    "sector_fill_mean",
+    "sector_fill_max",
+    "sector_overflow_count",
+    "selected_sector_frac",
+    "effective_operator_frac",
+)
 
 
 def require_optax():
@@ -64,6 +98,29 @@ def main():
                         help="Optional XLA dump directory.")
     parser.add_argument("--dummy-data", action="store_true",
                         help="Use generated data instead of utils.data_jax.")
+    parser.add_argument("--metrics-jsonl",
+                        default="benchmark_srw_tpu_metrics.jsonl",
+                        help=("Optional JSONL path for sector_runtime, "
+                              "vq_layout, and summary records. Supports "
+                              "{index} and {config}. Pass an empty string to "
+                              "disable."))
+    parser.add_argument("--benchmark-force-vq-repack-before-measure",
+                        action="store_true",
+                        help=("After compile/warmup, force one v4168 V/RST "
+                              "hardware repack before measured steps."))
+    parser.add_argument("--override-sector-bucket-capacity-mult", type=float,
+                        default=None,
+                        help="Runtime override for v4168 sector bucket capacity multiplier.")
+    parser.add_argument("--sweep-sector-capacity-mult", default=None,
+                        help="Comma-separated sector bucket capacity multipliers.")
+    parser.add_argument("--sweep-v-top-blocks", default=None,
+                        help="Comma-separated v_top_blocks values.")
+    parser.add_argument("--sweep-rst-top-blocks", default=None,
+                        help="Comma-separated rst_top_blocks values.")
+    parser.add_argument("--sweep-v-block-size", default=None,
+                        help="Comma-separated v_block_size values.")
+    parser.add_argument("--sweep-rst-block-size", default=None,
+                        help="Comma-separated rst_block_size values.")
     args = parser.parse_args()
 
     if args.steps <= 0:
@@ -74,23 +131,102 @@ def main():
         raise SystemExit(
             f"--model-version must be one of {SUPPORTED_MODEL_VERSIONS}")
     configs = [item for group in args.config for item in group]
-    xla_dump_dir = _normalize_xla_dump_dir(args.xla_dump_dir, len(configs))
+    run_specs = expand_run_specs(configs, args)
+    xla_dump_dir = _normalize_xla_dump_dir(args.xla_dump_dir, len(run_specs))
     if xla_dump_dir:
         _enable_xla_dump(xla_dump_dir)
 
     _maybe_initialize_jax_distributed()
     summaries = []
-    for config_arg in configs:
+    for run_index, (config_arg, overrides, label) in enumerate(run_specs, 1):
         _log("\n" + "=" * 72)
         _log(
             f"SRW standalone benchmark "
-            f"{len(summaries) + 1}/{len(configs)}: {config_arg}")
+            f"{run_index}/{len(run_specs)}: {config_arg}")
+        if label:
+            _log(f"variant: {label}")
         _log("=" * 72)
-        summary = run_one_config(config_arg, args, xla_dump_dir)
+        summary = run_one_config(
+            config_arg, args, xla_dump_dir,
+            overrides=overrides, variant_label=label,
+            run_index=run_index, run_count=len(run_specs))
         summaries.append(summary)
 
     if len(summaries) > 1 and _is_host0():
         print_comparison(summaries)
+
+
+def parse_csv_values(text, cast, name):
+    if text is None:
+        return None
+    values = []
+    for raw in str(text).split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            values.append(cast(raw))
+        except ValueError as exc:
+            raise SystemExit(f"{name} contains invalid value {raw!r}") from exc
+    if not values:
+        raise SystemExit(f"{name} must contain at least one value")
+    return values
+
+
+def expand_run_specs(configs, args):
+    base = {}
+    if args.override_sector_bucket_capacity_mult is not None:
+        base["sector_capacity_mult"] = float(
+            args.override_sector_bucket_capacity_mult)
+
+    sweep_items = []
+    sweep_defs = (
+        ("sector_capacity_mult", args.sweep_sector_capacity_mult, float,
+         "--sweep-sector-capacity-mult"),
+        ("v_top_blocks", args.sweep_v_top_blocks, int,
+         "--sweep-v-top-blocks"),
+        ("rst_top_blocks", args.sweep_rst_top_blocks, int,
+         "--sweep-rst-top-blocks"),
+        ("v_block_size", args.sweep_v_block_size, int,
+         "--sweep-v-block-size"),
+        ("rst_block_size", args.sweep_rst_block_size, int,
+         "--sweep-rst-block-size"),
+    )
+    for key, text, cast, name in sweep_defs:
+        values = parse_csv_values(text, cast, name)
+        if values is not None:
+            sweep_items.append((key, values))
+
+    specs = []
+    for config_arg in configs:
+        if not sweep_items:
+            label = format_variant_label(base)
+            specs.append((config_arg, dict(base), label))
+            continue
+        keys = [item[0] for item in sweep_items]
+        value_lists = [item[1] for item in sweep_items]
+        for combo in itertools.product(*value_lists):
+            overrides = dict(base)
+            overrides.update(dict(zip(keys, combo)))
+            specs.append((config_arg, overrides, format_variant_label(overrides)))
+    return specs
+
+
+def format_variant_label(overrides):
+    if not overrides:
+        return ""
+    order = (
+        "sector_capacity_mult",
+        "v_top_blocks",
+        "rst_top_blocks",
+        "v_block_size",
+        "rst_block_size",
+    )
+    parts = []
+    for key in order:
+        if key in overrides:
+            parts.append(f"{key}={overrides[key]}")
+    return ",".join(parts)
 
 
 def _is_host0():
@@ -159,6 +295,29 @@ def _load_yaml(path):
         return yaml.safe_load(f)
 
 
+def apply_benchmark_overrides(cfg, overrides):
+    cfg = deepcopy(cfg)
+    if not overrides:
+        return cfg
+    model_cfg = cfg.setdefault("model", {})
+    train_cfg = cfg.setdefault("training", {})
+    if "sector_capacity_mult" in overrides:
+        train_cfg["benchmark_sector_bucket_capacity_mult"] = float(
+            overrides["sector_capacity_mult"])
+    for key in ("v_top_blocks", "rst_top_blocks",
+                "v_block_size", "rst_block_size"):
+        if key in overrides:
+            model_cfg[key] = int(overrides[key])
+    return cfg
+
+
+def format_output_template(template, run_index, config_path):
+    if not template:
+        return None
+    safe_config = Path(config_path).stem
+    return str(template).format(index=run_index, config=safe_config)
+
+
 def tree_map_with_path(fn, tree):
     mapper = getattr(jax.tree, "map_with_path", None)
     if mapper is not None:
@@ -166,9 +325,11 @@ def tree_map_with_path(fn, tree):
     return jax.tree_util.tree_map_with_path(fn, tree)
 
 
-def run_one_config(config_arg, args, xla_dump_dir):
+def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
+                   variant_label="", run_index=1, run_count=1):
     config_path = _resolve_config(config_arg)
     cfg = _load_yaml(config_path)
+    cfg = apply_benchmark_overrides(cfg, overrides or {})
     model_version = str(cfg.get("model", {}).get("model_version", ""))
     if args.model_version and model_version != args.model_version:
         if not args.allow_model_version_override:
@@ -217,8 +378,17 @@ def run_one_config(config_arg, args, xla_dump_dir):
     _log(f"  seq_len: {seq_len}")
     _log(f"  warmup_steps: {args.warmup_steps}")
     _log(f"  measure_steps: {args.steps}")
+    if variant_label:
+        _log(f"  variant: {variant_label}")
+    if overrides:
+        for key, value in overrides.items():
+            _log(f"  override/{key}: {value}")
     if xla_dump_dir:
         _log(f"  xla_dump_dir: {xla_dump_dir}")
+    metrics_jsonl = format_output_template(
+        args.metrics_jsonl, run_index, config_path)
+    if metrics_jsonl:
+        _log(f"  metrics_jsonl: {metrics_jsonl}")
 
     model = build_model(cfg)
     sharded_fns = build_sharded_fns(cfg, mesh)
@@ -271,11 +441,26 @@ def run_one_config(config_arg, args, xla_dump_dir):
     warmup_times = []
     measure_times = []
     measure_tokens = []
+    measure_sector_records = []
+    vq_layout_records = []
+    forced_repack_done = False
+    repack_metrics_host = {}
     peak_hbm = hbm_after.get("hbm_peak_gb")
     total_to_run = int(args.warmup_steps) + int(args.steps)
     for i in range(total_to_run):
         phase = "warmup" if i < int(args.warmup_steps) else "measure"
         step_no = i + 1
+        if (not forced_repack_done
+                and phase == "measure"
+                and model_version == V4168_MODEL_VERSION
+                and args.benchmark_force_vq_repack_before_measure):
+            _log("Forcing v4168 V/RST VQ repack before measured steps...")
+            params, opt_state, new_layout_records, repack_metrics_host = (
+                force_vq_repack_before_measure(
+                    params, opt_state, cfg, model_version, mesh, step_no,
+                    run_index, variant_label, metrics_jsonl))
+            vq_layout_records.extend(new_layout_records)
+            forced_repack_done = True
         batch, iterator = next_batch(iterator, train_loader)
         ids, mask = shard_batch_to_mesh(batch, data_sharding, batch_size, seq_len)
         rng, step_rng = jax.random.split(rng)
@@ -306,12 +491,28 @@ def run_one_config(config_arg, args, xla_dump_dir):
             f"grad={fmt(metrics_host.get('grad_norm'), 3)} "
             f"HBM={fmt(hbm.get('hbm_used_gb'))}G "
             f"peak={fmt(hbm.get('hbm_peak_gb'))}G")
-        if model_version == V4168_MODEL_VERSION and phase == "measure":
-            print_sector_metrics(metrics_host)
+        if model_version == V4168_MODEL_VERSION:
+            step_sector_records = sector_runtime_records(
+                metrics_host, cfg, step_no, phase, run_index, variant_label,
+                seconds, hbm)
+            write_jsonl_records(metrics_jsonl, step_sector_records)
+            if phase == "measure":
+                measure_sector_records.extend(step_sector_records)
+                print_sector_metrics(metrics_host)
 
     xla_report = collect_xla_memory_report(xla_dump_dir) if xla_dump_dir else {}
+    sector_summary = summarize_sector_records(measure_sector_records)
+    compute_summary = summarize_compute_records(measure_sector_records)
+    benchmark_valid = all(
+        record.get("benchmark_valid", True)
+        for record in measure_sector_records)
+    invalid_reason = (
+        "sector_bucket_overflow"
+        if measure_sector_records and not benchmark_valid else None)
     summary = {
         "config_path": config_arg,
+        "variant": variant_label,
+        "overrides": dict(overrides or {}),
         "model_version": model_version,
         "compile_seconds": compile_seconds,
         "warmup_steps": int(args.warmup_steps),
@@ -328,7 +529,25 @@ def run_one_config(config_arg, args, xla_dump_dir):
         "xla_program_hbm_requirement": xla_report.get(
             "program_hbm_requirement"),
         "xla_source_file": xla_report.get("source_file"),
+        "benchmark_valid": benchmark_valid,
+        "invalid_reason": invalid_reason,
+        "forced_repack_before_measure": bool(
+            args.benchmark_force_vq_repack_before_measure
+            and model_version == V4168_MODEL_VERSION),
+        "sector_summary": sector_summary,
+        "compute_summary": compute_summary,
+        "vq_layout_records": vq_layout_records,
+        "repack_metrics": {
+            key: float(value)
+            for key, value in (repack_metrics_host or {}).items()
+        },
     }
+    write_jsonl_record(metrics_jsonl, {
+        "type": "benchmark_summary",
+        "run_index": int(run_index),
+        "variant": variant_label,
+        **summary,
+    })
     print_summary(summary)
     return summary
 
@@ -388,6 +607,12 @@ def build_sharded_fns(cfg, mesh):
     version = str(cfg["model"].get("model_version", ""))
     module_name, _class_name = MODEL_MODULES[version]
     module = importlib.import_module(module_name)
+    capacity_mult = cfg["training"].get(
+        "benchmark_sector_bucket_capacity_mult", None)
+    if version == V4168_MODEL_VERSION and capacity_mult is not None:
+        setattr(module, "_V4168_SECTOR_BUCKET_CAPACITY_MULT",
+                float(capacity_mult))
+        _log(f"v4168 bucket_capacity_mult override: {float(capacity_mult)}")
     make_single = getattr(module, "make_sharded_srw_minimal", None)
     make_paired = getattr(module, "make_sharded_srw_paired_minimal", None)
     if make_single is None or make_paired is None:
@@ -506,19 +731,11 @@ def create_benchmark_train_step(model, optimizer, sharded_fns, cfg):
             "grad_norm": optax_mod.global_norm(grads),
             "valid_count": result.get("valid_count", jnp.float32(0.0)),
         }
-        for key in (
-                "sector/attn_v/sector_fill_mean",
-                "sector/attn_v/sector_fill_max",
-                "sector/attn_v/sector_overflow_count",
-                "sector/attn_v/selected_sector_frac",
-                "sector/attn_v/effective_operator_frac",
-                "sector/rst/sector_fill_mean",
-                "sector/rst/sector_fill_max",
-                "sector/rst/sector_overflow_count",
-                "sector/rst/selected_sector_frac",
-                "sector/rst/effective_operator_frac"):
-            if key in result:
-                metrics[key] = result[key]
+        for pool in ("attn_v", "rst"):
+            for name in SECTOR_RUNTIME_METRIC_NAMES:
+                key = f"sector/{pool}/{name}"
+                if key in result:
+                    metrics[key] = result[key]
         return params, opt_state, metrics
 
     return train_step
@@ -669,6 +886,238 @@ def collect_hbm_stats():
     }
 
 
+def write_jsonl_record(path, record):
+    if not path or not _is_host0():
+        return
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def write_jsonl_records(path, records):
+    for record in records:
+        write_jsonl_record(path, record)
+
+
+def json_float(value, default=0.0):
+    value = num(value)
+    if value is None:
+        return default
+    return float(value)
+
+
+def pool_static_info(cfg, pool):
+    m = cfg["model"]
+    t = cfg["training"]
+    mesh_model = int(t.get("mesh_model", 1))
+    if pool == "attn_v":
+        n_key = "n_v"
+        block_key = "v_block_size"
+        top_key = "v_top_blocks"
+    elif pool == "rst":
+        n_key = "n_rst"
+        block_key = "rst_block_size"
+        top_key = "rst_top_blocks"
+    else:
+        n_key = "n_qk"
+        block_key = "qk_block_size"
+        top_key = "qk_top_blocks"
+    n_ops = int(m.get(n_key, m.get("n_know", 0)))
+    block_size = int(m.get(block_key, 256))
+    top_blocks = int(m.get(top_key, 2))
+    n_local_ops = max(1, (n_ops + mesh_model - 1) // mesh_model)
+    n_local_sectors = max(1, (n_local_ops + block_size - 1) // block_size)
+    num_global_sectors = n_local_sectors * mesh_model
+    return {
+        "block_size": block_size,
+        "top_blocks": min(max(1, top_blocks), num_global_sectors),
+        "num_global_sectors": num_global_sectors,
+        "num_local_sectors": n_local_sectors,
+    }
+
+
+def sector_runtime_records(metrics, cfg, step, phase, run_index,
+                           variant_label, step_seconds, hbm):
+    records = []
+    for pool in ("attn_v", "rst"):
+        prefix = f"sector/{pool}/"
+        if prefix + "overflow_count" not in metrics:
+            continue
+        info = pool_static_info(cfg, pool)
+        expected = json_float(
+            metrics.get(prefix + "expected_selected_pair_count"))
+        top_blocks = max(1.0, float(info["top_blocks"]))
+        record = {
+            "type": "sector_runtime",
+            "run_index": int(run_index),
+            "variant": variant_label,
+            "step": int(step),
+            "phase": phase,
+            "pool": pool,
+            "block_size": int(info["block_size"]),
+            "top_blocks": int(info["top_blocks"]),
+            "num_global_sectors": int(info["num_global_sectors"]),
+            "num_local_sectors": int(info["num_local_sectors"]),
+            "pair_span": expected / top_blocks if expected else 0.0,
+            "step_seconds": float(step_seconds),
+            "hbm_used_gb": json_float(hbm.get("hbm_used_gb"), None),
+            "hbm_peak_gb": json_float(hbm.get("hbm_peak_gb"), None),
+        }
+        for name in SECTOR_RUNTIME_METRIC_NAMES:
+            key = prefix + name
+            if key in metrics:
+                record[name] = json_float(metrics[key])
+        record["benchmark_valid"] = record.get("overflow_count", 0.0) <= 0.0
+        if not record["benchmark_valid"]:
+            record["invalid_reason"] = "sector_bucket_overflow"
+        records.append(record)
+    return records
+
+
+def summarize_sector_records(records):
+    by_pool = {}
+    for record in records:
+        by_pool.setdefault(record["pool"], []).append(record)
+    summaries = {}
+    for pool, items in by_pool.items():
+        summaries[pool] = {
+            "overflow_frac": max(
+                item.get("overflow_frac", 0.0) for item in items),
+            "executed_pair_frac": min(
+                item.get("executed_selected_pair_frac", 0.0)
+                for item in items),
+            "bucket_util_p99": max(
+                item.get("bucket_capacity_util_p99", 0.0)
+                for item in items),
+            "bucket_fill_max": max(
+                item.get("bucket_fill_max", 0.0) for item in items),
+            "capacity": max(item.get("bucket_capacity", 0.0)
+                            for item in items),
+        }
+    return summaries
+
+
+def summarize_compute_records(records):
+    by_pool = {}
+    for record in records:
+        by_pool.setdefault(record["pool"], []).append(record)
+    summaries = {}
+    for pool, items in by_pool.items():
+        summaries[pool] = {
+            "semantic_frac": mean([
+                item.get("semantic_work_frac_vs_dense", 0.0)
+                for item in items]),
+            "padded_frac": mean([
+                item.get("padded_work_frac_vs_dense", 0.0)
+                for item in items]),
+            "batch_union_frac": mean([
+                item.get("batch_union_effective_operator_frac", 0.0)
+                for item in items]),
+            "per_token_frac": mean([
+                item.get("per_token_effective_operator_frac", 0.0)
+                for item in items]),
+        }
+    return summaries
+
+
+def benchmark_repack_config(cfg):
+    t = cfg["training"]
+    return {
+        "hardware_repack_enabled": True,
+        "hardware_sector_execution_enabled": bool(
+            t.get("hardware_sector_execution_enabled",
+                  t.get("hardware_repack_enabled", True))),
+        "hardware_repack_strategy": str(
+            t.get("hardware_repack_strategy", "balanced_vq")).lower(),
+        "hardware_repack_farthest_per_sector": int(
+            t.get("hardware_repack_farthest_per_sector", 10)),
+        "hardware_repack_gain_eps": float(
+            t.get("hardware_repack_gain_eps", 1.0e-3)),
+        "hardware_repack_max_move_frac": float(
+            t.get("hardware_repack_max_move_frac", 0.08)),
+        "hardware_repack_vq_iterations": int(
+            t.get("hardware_repack_vq_iterations", 4)),
+    }
+
+
+def collect_vq_layout_records(params, cfg, model_version, phase, run_index,
+                              variant_label, repack_metrics=None,
+                              repack_seconds=None):
+    if model_version != V4168_MODEL_VERSION:
+        return []
+    module_name, _class_name = MODEL_MODULES[model_version]
+    module = importlib.import_module(module_name)
+    records = []
+    pool_params = params["neuron_pool"]
+    op_keys = module._pool_operator_keys(pool_params)
+    for pool, op_key_name, block_key in (
+            ("attn_v", "attn_v_op_key", "v_block_size"),
+            ("rst", "rst_op_key", "rst_block_size")):
+        block_size = int(cfg["model"].get(block_key, 256))
+        key_device = module._forward_unit_direction(
+            op_keys[op_key_name].astype(jnp.float32))
+        key_host = module._global_jax_array_to_host_np(
+            key_device, dtype=np.float32)
+        quality = module._sector_layout_quality_np(key_host, block_size)
+        prefix = f"repack/{pool}/"
+        record = {
+            "type": "vq_layout",
+            "run_index": int(run_index),
+            "variant": variant_label,
+            "phase": phase,
+            "pool": pool,
+            "block_size": block_size,
+            "moved_frac": json_float(
+                (repack_metrics or {}).get(prefix + "moved_frac"), 0.0),
+            "mean_compactness_cos": float(
+                quality.get("mean_compactness_cos", 0.0)),
+            "mean_sector_radius": float(
+                quality.get("mean_sector_radius", 0.0)),
+            "max_sector_radius": float(
+                quality.get("max_sector_radius", 0.0)),
+        }
+        if repack_seconds is not None:
+            record["repack_seconds"] = float(repack_seconds)
+        records.append(record)
+    return records
+
+
+def force_vq_repack_before_measure(params, opt_state, cfg, model_version, mesh,
+                                   step, run_index, variant_label,
+                                   metrics_jsonl):
+    if model_version != V4168_MODEL_VERSION:
+        return params, opt_state, [], {}
+    module_name, _class_name = MODEL_MODULES[model_version]
+    module = importlib.import_module(module_name)
+    before_records = collect_vq_layout_records(
+        params, cfg, model_version, "before_repack", run_index,
+        variant_label)
+    write_jsonl_records(metrics_jsonl, before_records)
+    repack_cfg = benchmark_repack_config(cfg)
+    t0 = time.perf_counter()
+    params, opt_state, repack_metrics = module.maybe_hardware_repack(
+        params, opt_state, cfg["model"], mesh, step, repack_cfg)
+    repack_seconds = time.perf_counter() - t0
+    after_records = collect_vq_layout_records(
+        params, cfg, model_version, "after_repack", run_index,
+        variant_label, repack_metrics=repack_metrics,
+        repack_seconds=repack_seconds)
+    write_jsonl_records(metrics_jsonl, after_records)
+    if _is_host0():
+        for record in after_records:
+            print(
+                "[vq] "
+                f"pool={record['pool']} "
+                f"moved_frac={record['moved_frac']:.6f} "
+                f"compactness={record['mean_compactness_cos']:.6f} "
+                f"mean_radius={record['mean_sector_radius']:.6f} "
+                f"max_radius={record['max_sector_radius']:.6f} "
+                f"repack_s={repack_seconds:.3f}",
+                flush=True)
+    return params, opt_state, before_records + after_records, repack_metrics
+
+
 def collect_xla_memory_report(dump_dir):
     if not dump_dir:
         return {}
@@ -706,21 +1155,33 @@ def collect_xla_memory_report(dump_dir):
 def print_sector_metrics(metrics):
     if not _is_host0():
         return
-    keys = (
-        "sector/attn_v/sector_fill_mean",
-        "sector/attn_v/sector_fill_max",
-        "sector/attn_v/sector_overflow_count",
-        "sector/attn_v/selected_sector_frac",
-        "sector/attn_v/effective_operator_frac",
-        "sector/rst/sector_fill_mean",
-        "sector/rst/sector_fill_max",
-        "sector/rst/sector_overflow_count",
-        "sector/rst/selected_sector_frac",
-        "sector/rst/effective_operator_frac",
-    )
-    parts = [f"{k}={fmt(metrics[k], 4)}" for k in keys if k in metrics]
-    if parts:
-        print("[bench-sector] " + " ".join(parts), flush=True)
+    for pool in ("attn_v", "rst"):
+        prefix = f"sector/{pool}/"
+        if prefix + "overflow_frac" not in metrics:
+            continue
+        print(
+            "[sector-validity] "
+            f"{pool} "
+            f"overflow_frac={fmt(metrics.get(prefix + 'overflow_frac'), 6)} "
+            f"executed_pair_frac="
+            f"{fmt(metrics.get(prefix + 'executed_selected_pair_frac'), 6)} "
+            f"bucket_util_p99="
+            f"{fmt(metrics.get(prefix + 'bucket_capacity_util_p99'), 4)} "
+            f"bucket_fill_max={fmt(metrics.get(prefix + 'bucket_fill_max'), 1)} "
+            f"capacity={fmt(metrics.get(prefix + 'bucket_capacity'), 1)}",
+            flush=True)
+        print(
+            "[sector-work] "
+            f"{pool} "
+            f"per_token_effective_operator_frac="
+            f"{fmt(metrics.get(prefix + 'per_token_effective_operator_frac'), 6)} "
+            f"padded_work_frac_vs_dense="
+            f"{fmt(metrics.get(prefix + 'padded_work_frac_vs_dense'), 6)} "
+            f"semantic_work_frac_vs_dense="
+            f"{fmt(metrics.get(prefix + 'semantic_work_frac_vs_dense'), 6)} "
+            f"batch_union_effective_operator_frac="
+            f"{fmt(metrics.get(prefix + 'batch_union_effective_operator_frac'), 6)}",
+            flush=True)
 
 
 def print_summary(summary):
@@ -728,7 +1189,14 @@ def print_summary(summary):
         return
     print("\n=== SRW Standalone Benchmark Summary ===", flush=True)
     print(f"config={summary['config_path']}", flush=True)
+    if summary.get("variant"):
+        print(f"variant={summary['variant']}", flush=True)
     print(f"model={summary['model_version']}", flush=True)
+    print(
+        "valid "
+        f"benchmark_valid={str(summary.get('benchmark_valid', True)).lower()} "
+        f"reason={summary.get('invalid_reason') or 'none'}",
+        flush=True)
     print(
         "step_s "
         f"mean={fmt(summary.get('mean_step_seconds'), 4)} "
@@ -753,6 +1221,62 @@ def print_summary(summary):
             f"{summary.get('xla_total_hbm_usage')} "
             f"{summary.get('xla_program_hbm_requirement') or ''}",
             flush=True)
+    if summary.get("sector_summary"):
+        print("\n[sector-validity]", flush=True)
+        print(
+            "pool | overflow_frac | executed_pair_frac | "
+            "bucket_util_p99 | bucket_fill_max | capacity",
+            flush=True)
+        for pool, row in summary["sector_summary"].items():
+            print(
+                f"{pool} | {fmt(row.get('overflow_frac'), 6)} | "
+                f"{fmt(row.get('executed_pair_frac'), 6)} | "
+                f"{fmt(row.get('bucket_util_p99'), 4)} | "
+                f"{fmt(row.get('bucket_fill_max'), 1)} | "
+                f"{fmt(row.get('capacity'), 1)}",
+                flush=True)
+    if summary.get("compute_summary"):
+        print("\n[sector-work]", flush=True)
+        print(
+            "pool | semantic_frac | padded_frac | "
+            "batch_union_frac | per_token_frac",
+            flush=True)
+        for pool, row in summary["compute_summary"].items():
+            print(
+                f"{pool} | {fmt(row.get('semantic_frac'), 6)} | "
+                f"{fmt(row.get('padded_frac'), 6)} | "
+                f"{fmt(row.get('batch_union_frac'), 6)} | "
+                f"{fmt(row.get('per_token_frac'), 6)}",
+                flush=True)
+    if summary.get("model_version") == V4168_MODEL_VERSION:
+        print(
+            "\n[vq] "
+            f"forced_repack_before_measure="
+            f"{str(summary.get('forced_repack_before_measure', False)).lower()}",
+            flush=True)
+    if summary.get("vq_layout_records"):
+        print(
+            "pool | phase | moved_frac | compactness_cos | "
+            "mean_radius | max_radius",
+            flush=True)
+        for record in summary["vq_layout_records"]:
+            print(
+                f"{record.get('pool')} | {record.get('phase')} | "
+                f"{fmt(record.get('moved_frac'), 6)} | "
+                f"{fmt(record.get('mean_compactness_cos'), 6)} | "
+                f"{fmt(record.get('mean_sector_radius'), 6)} | "
+                f"{fmt(record.get('max_sector_radius'), 6)}",
+                flush=True)
+    print("\n[op-breakdown]", flush=True)
+    print(
+        "op | mean_ms | hbm_peak_gb | memory_note",
+        flush=True)
+    print(
+        "full_train_step | "
+        f"{fmt(num(summary.get('mean_step_seconds')) * 1000.0 if summary.get('mean_step_seconds') is not None else None, 3)} | "
+        f"{fmt(summary.get('peak_hbm_gb'))} | "
+        "process allocator stats, not exact op-local allocation",
+        flush=True)
 
 
 def print_comparison(summaries):
@@ -761,7 +1285,8 @@ def print_comparison(summaries):
     print("=" * 72, flush=True)
     header = (
         f"{'#':>2}  {'model':24s}  {'mean_s':>10s}  "
-        f"{'tok/s':>12s}  {'peak_hbm':>10s}  config")
+        f"{'tok/s':>12s}  {'peak_hbm':>10s}  {'valid':>5s}  "
+        f"{'variant':28s}  config")
     print(header, flush=True)
     print("-" * len(header), flush=True)
     for i, summary in enumerate(summaries, 1):
@@ -770,6 +1295,8 @@ def print_comparison(summaries):
             f"{fmt(summary.get('mean_step_seconds'), 4):>10s}  "
             f"{fmt(summary.get('mean_tokens_per_second'), 1):>12s}  "
             f"{fmt(summary.get('peak_hbm_gb')):>10s}  "
+            f"{str(summary.get('benchmark_valid', True)).lower():>5s}  "
+            f"{summary.get('variant', '')[:28]:28s}  "
             f"{summary.get('config_path', '')}",
             flush=True)
     base = summaries[0]
@@ -783,6 +1310,17 @@ def print_comparison(summaries):
             f"peak_hbm="
             f"{ratio(summary.get('peak_hbm_gb'), base.get('peak_hbm_gb'))}",
             flush=True)
+    if len(summaries) >= 2:
+        print("\n[compare]", flush=True)
+        base_step = base.get("mean_step_seconds")
+        for i, summary in enumerate(summaries[1:], 2):
+            print(
+                f"base_mean_step_s={fmt(base_step, 4)} "
+                f"run_{i}_mean_step_s={fmt(summary.get('mean_step_seconds'), 4)} "
+                f"speed_ratio="
+                f"{ratio(base_step, summary.get('mean_step_seconds'))} "
+                f"valid={str(summary.get('benchmark_valid', True)).lower()}",
+                flush=True)
 
 
 def num(value):

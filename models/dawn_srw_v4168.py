@@ -68,20 +68,62 @@ SELECT_DIAG_COUNT = len(SELECT_DIAG_NAMES)
 ) = range(SELECT_DIAG_COUNT)
 
 SECTOR_RUNTIME_DIAG_NAMES = (
-    'sector_fill_mean',
-    'sector_fill_max',
-    'sector_overflow_count',
-    'selected_sector_frac',
-    'effective_operator_frac',
+    'bucket_fill_mean',
+    'bucket_fill_p50',
+    'bucket_fill_p90',
+    'bucket_fill_p95',
+    'bucket_fill_p99',
+    'bucket_fill_max',
+    'overflow_count',
+    'overflow_frac',
+    'bucket_capacity',
+    'bucket_capacity_util_p50',
+    'bucket_capacity_util_p95',
+    'bucket_capacity_util_p99',
+    'bucket_capacity_util_max',
+    'expected_selected_pair_count',
+    'executed_pair_count',
+    'executed_selected_pair_frac',
+    'batch_union_selected_sector_frac',
+    'batch_union_effective_operator_frac',
+    'per_token_selected_sector_count',
+    'per_token_selected_ops',
+    'per_token_effective_operator_frac',
+    'semantic_work_frac_vs_dense',
+    'padded_work_frac_vs_dense',
+    'hot_sector_skew_p99_over_mean',
 )
 SECTOR_RUNTIME_DIAG_COUNT = len(SECTOR_RUNTIME_DIAG_NAMES)
 (
-    SECTOR_FILL_MEAN,
-    SECTOR_FILL_MAX,
+    SECTOR_BUCKET_FILL_MEAN,
+    SECTOR_BUCKET_FILL_P50,
+    SECTOR_BUCKET_FILL_P90,
+    SECTOR_BUCKET_FILL_P95,
+    SECTOR_BUCKET_FILL_P99,
+    SECTOR_BUCKET_FILL_MAX,
     SECTOR_OVERFLOW_COUNT,
-    SECTOR_SELECTED_SECTOR_FRAC,
-    SECTOR_EFFECTIVE_OPERATOR_FRAC,
+    SECTOR_OVERFLOW_FRAC,
+    SECTOR_BUCKET_CAPACITY,
+    SECTOR_BUCKET_CAPACITY_UTIL_P50,
+    SECTOR_BUCKET_CAPACITY_UTIL_P95,
+    SECTOR_BUCKET_CAPACITY_UTIL_P99,
+    SECTOR_BUCKET_CAPACITY_UTIL_MAX,
+    SECTOR_EXPECTED_SELECTED_PAIR_COUNT,
+    SECTOR_EXECUTED_PAIR_COUNT,
+    SECTOR_EXECUTED_SELECTED_PAIR_FRAC,
+    SECTOR_BATCH_UNION_SELECTED_SECTOR_FRAC,
+    SECTOR_BATCH_UNION_EFFECTIVE_OPERATOR_FRAC,
+    SECTOR_PER_TOKEN_SELECTED_SECTOR_COUNT,
+    SECTOR_PER_TOKEN_SELECTED_OPS,
+    SECTOR_PER_TOKEN_EFFECTIVE_OPERATOR_FRAC,
+    SECTOR_SEMANTIC_WORK_FRAC_VS_DENSE,
+    SECTOR_PADDED_WORK_FRAC_VS_DENSE,
+    SECTOR_HOT_SECTOR_SKEW_P99_OVER_MEAN,
 ) = range(SECTOR_RUNTIME_DIAG_COUNT)
+SECTOR_FILL_MEAN = SECTOR_BUCKET_FILL_MEAN
+SECTOR_FILL_MAX = SECTOR_BUCKET_FILL_MAX
+SECTOR_SELECTED_SECTOR_FRAC = SECTOR_BATCH_UNION_SELECTED_SECTOR_FRAC
+SECTOR_EFFECTIVE_OPERATOR_FRAC = SECTOR_BATCH_UNION_EFFECTIVE_OPERATOR_FRAC
 
 
 # v4164 exposure diagnostics are admission based, not hard score>tau based.
@@ -3705,6 +3747,107 @@ def _v4168_build_sector_buckets(local_sector_ids, selected_here, pair_span,
     )
 
 
+def _v4168_percentile_from_sorted(sorted_values, pct):
+    n = int(sorted_values.shape[0])
+    if n <= 1:
+        return sorted_values[0]
+    idx = int(math.ceil((float(pct) / 100.0) * float(n))) - 1
+    idx = min(max(idx, 0), n - 1)
+    return sorted_values[idx]
+
+
+def _v4168_sector_runtime_diag(bucket_fill, overflow_count, bucket_capacity,
+                               pair_span, topk, global_n_sectors,
+                               sector_size, selected_sector_count,
+                               selected_real_ops, total_real_ops):
+    """Replicated runtime diagnostics for exact sector bucket execution."""
+    bucket_fill_f = bucket_fill.astype(jnp.float32)
+    global_bucket_fill = jax.lax.all_gather(
+        bucket_fill_f, 'model', axis=0, tiled=True)
+    sorted_fill = jnp.sort(global_bucket_fill)
+    bucket_fill_mean = global_bucket_fill.mean()
+    bucket_fill_p50 = _v4168_percentile_from_sorted(sorted_fill, 50)
+    bucket_fill_p90 = _v4168_percentile_from_sorted(sorted_fill, 90)
+    bucket_fill_p95 = _v4168_percentile_from_sorted(sorted_fill, 95)
+    bucket_fill_p99 = _v4168_percentile_from_sorted(sorted_fill, 99)
+    bucket_fill_max = sorted_fill[-1]
+
+    bucket_capacity_f = jnp.asarray(bucket_capacity, dtype=jnp.float32)
+    expected_pair_count = jnp.asarray(
+        max(1, int(pair_span) * int(topk)), dtype=jnp.float32)
+    executed_pair_count = global_bucket_fill.sum()
+    overflow_count = overflow_count.astype(jnp.float32)
+    overflow_frac = overflow_count / expected_pair_count
+    executed_selected_pair_frac = executed_pair_count / expected_pair_count
+
+    selected_sector_frac = (
+        selected_sector_count
+        / jnp.asarray(max(global_n_sectors, 1), dtype=jnp.float32))
+    effective_operator_frac = selected_real_ops / jnp.maximum(total_real_ops, 1.0)
+
+    per_token_selected_ops = jnp.asarray(
+        int(topk) * int(sector_size), dtype=jnp.float32)
+    per_token_operator_frac = per_token_selected_ops / jnp.maximum(
+        total_real_ops, 1.0)
+    dense_work = jnp.maximum(
+        jnp.asarray(max(1, int(pair_span)), dtype=jnp.float32)
+        * jnp.maximum(total_real_ops, 1.0),
+        1.0)
+    semantic_work_frac = (
+        expected_pair_count * jnp.asarray(sector_size, dtype=jnp.float32)
+        / dense_work)
+    padded_pair_slots = jnp.asarray(
+        max(1, int(global_n_sectors) * int(bucket_capacity)),
+        dtype=jnp.float32)
+    padded_work_frac = (
+        padded_pair_slots * jnp.asarray(sector_size, dtype=jnp.float32)
+        / dense_work)
+    hot_sector_skew = bucket_fill_p99 / jnp.maximum(
+        bucket_fill_mean, jnp.float32(1.0e-6))
+
+    return jnp.asarray((
+        bucket_fill_mean,
+        bucket_fill_p50,
+        bucket_fill_p90,
+        bucket_fill_p95,
+        bucket_fill_p99,
+        bucket_fill_max,
+        overflow_count,
+        overflow_frac,
+        bucket_capacity_f,
+        bucket_fill_p50 / jnp.maximum(bucket_capacity_f, 1.0),
+        bucket_fill_p95 / jnp.maximum(bucket_capacity_f, 1.0),
+        bucket_fill_p99 / jnp.maximum(bucket_capacity_f, 1.0),
+        bucket_fill_max / jnp.maximum(bucket_capacity_f, 1.0),
+        expected_pair_count,
+        executed_pair_count,
+        executed_selected_pair_frac,
+        selected_sector_frac,
+        effective_operator_frac,
+        jnp.asarray(topk, dtype=jnp.float32),
+        per_token_selected_ops,
+        per_token_operator_frac,
+        semantic_work_frac,
+        padded_work_frac,
+        hot_sector_skew,
+    ), dtype=jnp.float32)
+
+
+def _sector_runtime_metric_dict(prefix, diag):
+    out = {
+        f'{prefix}/{name}': diag[i]
+        for i, name in enumerate(SECTOR_RUNTIME_DIAG_NAMES)
+    }
+    out[f'{prefix}/sector_fill_mean'] = diag[SECTOR_BUCKET_FILL_MEAN]
+    out[f'{prefix}/sector_fill_max'] = diag[SECTOR_BUCKET_FILL_MAX]
+    out[f'{prefix}/sector_overflow_count'] = diag[SECTOR_OVERFLOW_COUNT]
+    out[f'{prefix}/selected_sector_frac'] = (
+        diag[SECTOR_BATCH_UNION_SELECTED_SECTOR_FRAC])
+    out[f'{prefix}/effective_operator_frac'] = (
+        diag[SECTOR_BATCH_UNION_EFFECTIVE_OPERATOR_FRAC])
+    return out
+
+
 def _v4168_block_execution_upper_bound(block_score_ub, tau, boundary_scale,
                                        boundary_power):
     """DirectTau execution upper bound used to open Blocks."""
@@ -4678,27 +4821,19 @@ def make_sharded_srw_sector_bucketed_minimal(
             bucket_capacity)
         global_overflow_count = jax.lax.psum(overflow_count, 'model')
         bucket_fill = sector_bucket_valid.astype(jnp.int32).sum(axis=1)
-        global_sector_fill_sum = jax.lax.psum(
-            bucket_fill.astype(jnp.float32).sum(), 'model')
-        global_sector_fill_max = jax.lax.pmax(
-            jax.lax.stop_gradient(bucket_fill.max()).astype(jnp.float32),
-            'model')
         selected_sector_local = (bucket_fill > 0).astype(jnp.float32)
         selected_sector_count = jax.lax.psum(
             selected_sector_local.sum(), 'model')
         selected_real_ops_local = (
             selected_sector_local[:, None]
             * valid_blocks.astype(jnp.float32)).sum()
+        selected_real_ops = jax.lax.psum(selected_real_ops_local, 'model')
         total_real_ops = jax.lax.psum(
             valid_blocks.astype(jnp.float32).sum(), 'model')
-        sector_diag = jnp.asarray((
-            global_sector_fill_sum / jnp.float32(max(global_n_sectors, 1)),
-            global_sector_fill_max,
-            global_overflow_count.astype(jnp.float32),
-            selected_sector_count / jnp.float32(max(global_n_sectors, 1)),
-            jax.lax.psum(selected_real_ops_local, 'model')
-            / jnp.maximum(total_real_ops, 1.0),
-        ), dtype=jnp.float32)
+        sector_diag = _v4168_sector_runtime_diag(
+            bucket_fill, global_overflow_count, bucket_capacity,
+            T, topk, global_n_sectors, _sector_size, selected_sector_count,
+            selected_real_ops, total_real_ops)
 
         def angular_compose_parts(rho, tau_b, valid_mask):
             _, admission, _drive, execution_weight, _ = _compute_admission_drive(
@@ -4923,27 +5058,19 @@ def make_sharded_srw_paired_sector_bucketed_minimal(
             bucket_capacity)
         global_overflow_count = jax.lax.psum(overflow_count, 'model')
         bucket_fill = sector_bucket_valid.astype(jnp.int32).sum(axis=1)
-        global_sector_fill_sum = jax.lax.psum(
-            bucket_fill.astype(jnp.float32).sum(), 'model')
-        global_sector_fill_max = jax.lax.pmax(
-            jax.lax.stop_gradient(bucket_fill.max()).astype(jnp.float32),
-            'model')
         selected_sector_local = (bucket_fill > 0).astype(jnp.float32)
         selected_sector_count = jax.lax.psum(
             selected_sector_local.sum(), 'model')
         selected_real_ops_local = (
             selected_sector_local[:, None]
             * valid_blocks.astype(jnp.float32)).sum()
+        selected_real_ops = jax.lax.psum(selected_real_ops_local, 'model')
         total_real_ops = jax.lax.psum(
             valid_blocks.astype(jnp.float32).sum(), 'model')
-        sector_diag = jnp.asarray((
-            global_sector_fill_sum / jnp.float32(max(global_n_sectors, 1)),
-            global_sector_fill_max,
-            global_overflow_count.astype(jnp.float32),
-            selected_sector_count / jnp.float32(max(global_n_sectors, 1)),
-            jax.lax.psum(selected_real_ops_local, 'model')
-            / jnp.maximum(total_real_ops, 1.0),
-        ), dtype=jnp.float32)
+        sector_diag = _v4168_sector_runtime_diag(
+            bucket_fill, global_overflow_count, bucket_capacity,
+            pair_span, topk, global_n_sectors, _sector_size,
+            selected_sector_count, selected_real_ops, total_real_ops)
 
         def angular_compose_parts(rho, tau_b, valid_mask):
             _, admission, _drive, execution_weight, _ = _compute_admission_drive(
@@ -6423,31 +6550,17 @@ class DAWN_SRW_V4168(nn.Module):
 
                 loss, correct, valid_count = _chunked_ce_loss_and_acc(
                     shift_x, embedding_matrix, shift_labels, valid_mask)
+                sector_metrics = {}
+                sector_metrics.update(_sector_runtime_metric_dict(
+                    'sector/attn_v', attn_v_sector_diag))
+                sector_metrics.update(_sector_runtime_metric_dict(
+                    'sector/rst', rst_sector_diag))
                 return {
                     'loss': loss,
                     'correct': correct,
                     'valid_count': valid_count,
                     'aux_loss': jnp.float32(0.0),
-                    'sector/attn_v/sector_fill_mean':
-                        attn_v_sector_diag[SECTOR_FILL_MEAN],
-                    'sector/attn_v/sector_fill_max':
-                        attn_v_sector_diag[SECTOR_FILL_MAX],
-                    'sector/attn_v/sector_overflow_count':
-                        attn_v_sector_diag[SECTOR_OVERFLOW_COUNT],
-                    'sector/attn_v/selected_sector_frac':
-                        attn_v_sector_diag[SECTOR_SELECTED_SECTOR_FRAC],
-                    'sector/attn_v/effective_operator_frac':
-                        attn_v_sector_diag[SECTOR_EFFECTIVE_OPERATOR_FRAC],
-                    'sector/rst/sector_fill_mean':
-                        rst_sector_diag[SECTOR_FILL_MEAN],
-                    'sector/rst/sector_fill_max':
-                        rst_sector_diag[SECTOR_FILL_MAX],
-                    'sector/rst/sector_overflow_count':
-                        rst_sector_diag[SECTOR_OVERFLOW_COUNT],
-                    'sector/rst/selected_sector_frac':
-                        rst_sector_diag[SECTOR_SELECTED_SECTOR_FRAC],
-                    'sector/rst/effective_operator_frac':
-                        rst_sector_diag[SECTOR_EFFECTIVE_OPERATOR_FRAC],
+                    **sector_metrics,
                 }
 
             def scan_body(carry, xs):
