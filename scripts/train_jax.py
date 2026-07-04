@@ -80,6 +80,7 @@ from models.dawn_srw_v4167 import (
 )
 from models.dawn_srw_v4168 import (
     DAWN_SRW_V4168,
+    OPSPACE_RUNTIME_DIAG_NAMES as _V4168_OPSPACE_RUNTIME_DIAG_NAMES,
     hardware_sector_static_metrics as _v4168_hardware_sector_static_metrics,
     maybe_hardware_repack as _v4168_maybe_hardware_repack,
     operation_space_static_metrics as _v4168_operation_space_static_metrics,
@@ -1195,8 +1196,7 @@ def _ceil_to_multiple(value, multiple):
 
 def _v4168_operation_space_device_count(training_cfg):
     mesh_model = max(1, int(training_cfg.get('mesh_model', 1)))
-    mesh_data = max(1, int(training_cfg.get('mesh_data', 1)))
-    return max(1, mesh_model * mesh_data)
+    return mesh_model
 
 
 def _v4168_operation_space_cfg(training_cfg):
@@ -1228,7 +1228,7 @@ def _v4168_validate_operation_space_shape(opspace):
             "training.operation_space.pools only supports qk, v, rst; "
             f"remove: {', '.join(extra_pools)}")
     allowed_pool_keys = {
-        'qk': {'mode', 'lanes'},
+        'qk': {'mode', 'lanes', 'k_exec'},
         'v': {'mode', 'lanes', 'k_exec'},
         'rst': {'mode', 'lanes', 'k_exec'},
     }
@@ -1262,17 +1262,17 @@ def _v4168_validate_operation_space_shape(opspace):
     if not isinstance(max_swaps, dict):
         raise ValueError(
             "training.operation_space.repack.max_swaps must be a mapping.")
-    extra = sorted(set(max_swaps) - {'v', 'rst'})
+    extra = sorted(set(max_swaps) - {'rst'})
     if extra:
         raise ValueError(
-            "training.operation_space.repack.max_swaps only supports v/rst; "
+            "training.operation_space.repack.max_swaps only supports rst; "
             f"remove: {', '.join(extra)}")
 
 
 def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
     opspace = _v4168_operation_space_cfg(training_cfg)
     _v4168_validate_operation_space_shape(opspace)
-    tile_size = int(opspace.get('tile_size', 64))
+    tile_size = int(opspace.get('tile_size', 128))
     if tile_size <= 0:
         raise ValueError(
             f"training.operation_space.tile_size must be > 0, got {tile_size}.")
@@ -1281,12 +1281,12 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         pools = {}
     device_count = _v4168_operation_space_device_count(training_cfg)
     defaults = {
-        'qk': {'n_key': 'n_qk', 'mode': 'dense_tile', 'lanes': 4,
-               'k_exec': None},
-        'v': {'n_key': 'n_v', 'mode': 'factorized_lane_mean', 'lanes': 4,
-              'k_exec': 4},
-        'rst': {'n_key': 'n_rst', 'mode': 'factorized_lane_mean', 'lanes': 8,
-                'k_exec': 4},
+        'qk': {'n_key': 'n_qk', 'mode': 'factorized_lane_mean', 'lanes': 8,
+               'k_exec': 4},
+        'v': {'n_key': 'n_v', 'mode': 'factorized_lane_mean', 'lanes': 8,
+              'k_exec': 5},
+        'rst': {'n_key': 'n_rst', 'mode': 'factorized_lane_mean', 'lanes': 32,
+                'k_exec': 32},
     }
     layouts = {}
     for label, defaults_i in defaults.items():
@@ -1304,17 +1304,21 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 f"training.operation_space.pools.{label}.lanes must be > 0, "
                 f"got {lanes}.")
         k_exec = pool.get('k_exec', defaults_i['k_exec'])
-        if label == 'qk':
-            if k_exec is not None:
-                raise ValueError(
-                    "training.operation_space.pools.qk must not set k_exec; "
-                    "QK stays on the dense DirectTau path.")
-        else:
-            k_exec = int(k_exec)
-            if k_exec != 4:
-                raise ValueError(
-                    f"training.operation_space.pools.{label}.k_exec is fixed "
-                    f"at 4 for fixed_k4_repack_v1, got {k_exec}.")
+        k_exec = int(k_exec)
+        if k_exec <= 0 or k_exec > lanes:
+            raise ValueError(
+                f"training.operation_space.pools.{label}.k_exec must be "
+                f"in [1, lanes={lanes}], got {k_exec}.")
+        if label in ('qk', 'v') and k_exec != defaults_i['k_exec']:
+            raise ValueError(
+                f"training.operation_space.pools.{label}.k_exec is fixed at "
+                f"{defaults_i['k_exec']} for v4168 operation_space, got "
+                f"{k_exec}.")
+        if label == 'rst' and k_exec != lanes:
+            raise ValueError(
+                "training.operation_space.pools.rst.k_exec must equal lanes "
+                f"for one best tile per lane; got k_exec={k_exec}, "
+                f"lanes={lanes}.")
         n_ops = int(model_cfg.get(
             defaults_i['n_key'],
             model_cfg.get('n_know', 0) if label == 'rst' else 0))
@@ -1342,27 +1346,29 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
 
 def _v4168_operation_space_repack_config(training_cfg, model_cfg,
                                          model_version):
-    """Parse final fixed-K operation-space repack config."""
+    """Parse v4168 tau-free ReLU operation-space repack config."""
     is_v4168 = str(model_version) == V4168_MODEL_VERSION
     opspace = _v4168_operation_space_cfg(training_cfg)
     _v4168_validate_operation_space_shape(opspace)
-    version = str(opspace.get('version', 'fixed_k4_repack_v1')).lower()
-    if bool(opspace.get('enabled', False)) and not is_v4168:
+    operation_space_enabled = bool(opspace.get('enabled', False))
+    version = opspace.get('version', None)
+    version = str(version).lower() if version is not None else ''
+    if operation_space_enabled and not is_v4168:
         raise ValueError(
             "training.operation_space.enabled is only supported for "
             f"{V4168_MODEL_VERSION}.")
-    if bool(opspace.get('enabled', False)) and version != 'fixed_k4_repack_v1':
+    if operation_space_enabled and version not in ('', 'fixed_k4_repack_v1'):
         raise ValueError(
-            "training.operation_space.version must be "
-            f"'fixed_k4_repack_v1', got {version!r}.")
-    if bool(opspace.get('enabled', False)) and (
+            "training.operation_space.version is an optional compatibility "
+            f"label and may only be 'fixed_k4_repack_v1', got {version!r}.")
+    if operation_space_enabled and (
             _cfg_bool(training_cfg.get('hardware_repack_enabled', False),
                       name='training.hardware_repack_enabled')
             or _cfg_bool(
                 training_cfg.get('hardware_sector_execution_enabled', False),
                 name='training.hardware_sector_execution_enabled')):
         raise ValueError(
-            "fixed_k4_repack_v1 requires training.hardware_repack_enabled "
+            "v4168 operation_space requires training.hardware_repack_enabled "
             "and training.hardware_sector_execution_enabled to remain false.")
     repack = opspace.get('repack', {})
     if not isinstance(repack, dict):
@@ -1383,22 +1389,20 @@ def _v4168_operation_space_repack_config(training_cfg, model_cfg,
 
     def _repack_pool(label, max_swaps_default):
         return {
-            'enabled': label in ('v', 'rst'),
+            'enabled': label == 'rst',
             'max_swaps_per_repack': int(max_swaps.get(
                 label, max_swaps_default)),
         }
 
     parsed = {
+        'operation_space_enabled': bool(operation_space_enabled and is_v4168),
         'operation_space_repack_enabled': bool(enabled),
         'operation_space_repack_start_step': start_step,
         'operation_space_repack_interval_steps': interval_steps,
-        'operation_space_repack_std_mult': 2.0,
-        'operation_space_repack_min_assignment_gain': 0.03,
-        'operation_space_repack_min_swap_gain': 0.0,
         'operation_space_pool_layouts': pool_layouts,
         'operation_space_repack_pools': {
-            'v': _repack_pool('v', 64),
-            'rst': _repack_pool('rst', 160),
+            'rst': _repack_pool('rst', 256),
+            'v': _repack_pool('v', 0),
             'qk': _repack_pool('qk', 0),
         },
     }
@@ -1410,8 +1414,8 @@ def _v4168_operation_space_repack_config(training_cfg, model_cfg,
         raise ValueError(
             "training.operation_space.repack.interval_steps must be > 0, got "
             f"{interval_steps}.")
-    for label in ('v', 'rst'):
-        if int(max_swaps.get(label, 64 if label == 'v' else 160)) < 0:
+    for label in ('rst',):
+        if int(max_swaps.get(label, 256)) < 0:
             raise ValueError(
                 f"training.operation_space.repack.max_swaps.{label} must "
                 "be >= 0.")
@@ -6379,29 +6383,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _key = f'sector/{_pool}/{_name}'
                 metrics[_key] = result.get(_key, jnp.float32(0.0))
         for _pool in ('attn_v', 'rst'):
-            for _name in (
-                    'enabled',
-                    'K',
-                    'visible_slots',
-                    'valid_visible_mean',
-                    'tile_score_p50',
-                    'tile_score_p95',
-                    'selected_lane_top1_frac',
-                    'selected_tile_top1_frac',
-                    'selected_tile_p99_over_mean',
-                    'owner_load_p99_over_mean',
-                    'active_visible',
-                    'admission_den',
-                    'execution_mass',
-                    'effective_ops',
-                    'padded_selected_count',
-                    'padded_execution_mass',
-                    'no_nan',
-                    'owner_tile_major_grouped',
-                    'selected_request_count',
-                    'processed_request_count',
-                    'all_requests_processed',
-                    'factorized_tile_layout_ok'):
+            for _name in _V4168_OPSPACE_RUNTIME_DIAG_NAMES:
                 _key = f'opspace/{_pool}/{_name}'
                 metrics[_key] = result.get(_key, jnp.float32(0.0))
         for _pool in ('attn_qk', 'attn_v'):
@@ -6884,8 +6866,10 @@ def create_mesh(mesh_data, mesh_model):
     return Mesh(device_array, ('data', 'model'))
 
 
-def get_param_shardings(params, mesh, model_version=None):
+def get_param_shardings(params, mesh, model_version=None,
+                        operation_space_enabled=False):
     """Create model-version-aware parameter shardings."""
+    del operation_space_enabled
     replicated = NamedSharding(mesh, P())
     vector_sharded = NamedSharding(mesh, P('model'))
     col_sharded = NamedSharding(mesh, P(None, 'model'))
@@ -7000,6 +6984,15 @@ def _print_param_sharding_summary(param_shardings, model_version):
                     'block_0/attn/expand_O/kernel'):
                 interesting.append((ps, sharding))
             elif ps.startswith('neuron_pool/') and len(interesting) < 16:
+                interesting.append((ps, sharding))
+        elif version == V4168_MODEL_VERSION:
+            if ps in (
+                    'neuron_pool/attn_v_read',
+                    'neuron_pool/attn_v_write',
+                    'neuron_pool/rst_read',
+                    'neuron_pool/rst_write',
+                    'neuron_pool/attn_qk_read',
+                    'neuron_pool/attn_qk_write'):
                 interesting.append((ps, sharding))
     if not interesting:
         return
@@ -9825,7 +9818,8 @@ def _print_regular_block(rec, ctx):
                 f" v={rec['attn_v_strong']*100:.1f}%"
                 f" rst={rec['rst_strong']*100:.1f}%"
             )
-            _print_active_tau_regular_line(rec)
+            if _g('opspace/attn_v/enabled', 0.0) <= 0.5:
+                _print_active_tau_regular_line(rec)
             _soft_gate_label = (
                 'soft_gate_B'
                 if _is_active_srw_version(ctx.get('model_version'))
@@ -9835,15 +9829,13 @@ def _print_regular_block(rec, ctx):
                 f" admission_den_power={rec.get('admission_den_power', rec.get('den_power', 1.0)):.3f}"
                 if _is_active_srw_version(ctx.get('model_version'))
                 else "")
-            log_message(
-                f"  {_soft_gate_label}: qk={rec['soft_gate_T_qk']:.6f}"
-                f" v={rec['soft_gate_T_v']:.6f}"
-                f" rst={rec['soft_gate_T_rst']:.6f}"
-                f"{_power_part}"
-            )
             if _g('opspace/attn_v/enabled', 0.0) > 0.5:
                 log_message(
-                    "  [opspace] version=fixed_k4_repack_v1 tile=64"
+                    f"  {_soft_gate_label}: qk={rec['soft_gate_T_qk']:.6f}"
+                    f"{_power_part} (QK/V/RST ignored by operation_space)"
+                )
+                log_message(
+                    "  [opspace] v4168 tau_free_relu owner=model_axis"
                 )
                 for _label, _pool in (('v', 'attn_v'), ('rst', 'rst')):
                     _lane_part = (
@@ -9851,15 +9843,25 @@ def _print_regular_block(rec, ctx):
                         if _label == 'rst' else "")
                     log_message(
                         f"  [opspace/{_label}]"
-                        f" K={_g(f'opspace/{_pool}/K'):.0f}"
-                        f" visible={_g(f'opspace/{_pool}/visible_slots'):.0f}"
+                        f" k_exec={_g(f'opspace/{_pool}/k_exec'):.0f}"
+                        f" exec_slots={_g(f'opspace/{_pool}/exec_slots'):.0f}"
                         f"{_lane_part}"
                         f" tile_top1={_g(f'opspace/{_pool}/selected_tile_top1_frac'):.2f}"
-                        f" tile_p99/mean={_g(f'opspace/{_pool}/selected_tile_p99_over_mean'):.2f}"
-                        f" active_visible={_g(f'opspace/{_pool}/active_visible'):.1f}"
-                        f" den={_g(f'opspace/{_pool}/admission_den'):.2f}"
-                        f" mass={_g(f'opspace/{_pool}/execution_mass'):.2f}"
+                        f" tile_p99/mean={_g(f'opspace/{_pool}/tile_p99_over_mean'):.2f}"
+                        f" owner_p99/mean={_g(f'opspace/{_pool}/owner_p99_over_mean'):.2f}"
+                        f" gate=relu2"
+                        f" gate_mass={_g(f'opspace/{_pool}/gate_mass_mean'):.2f}"
+                        f" selected_req={_g(f'opspace/{_pool}/selected_requests'):.0f}"
+                        f" processed_req={_g(f'opspace/{_pool}/processed_requests'):.0f}"
+                        f" all_processed={_g(f'opspace/{_pool}/all_processed'):.0f}"
                     )
+            else:
+                log_message(
+                    f"  {_soft_gate_label}: qk={rec['soft_gate_T_qk']:.6f}"
+                    f" v={rec['soft_gate_T_v']:.6f}"
+                    f" rst={rec['soft_gate_T_rst']:.6f}"
+                    f"{_power_part}"
+                )
         else:
             log_message(
                 f"  act: q={_fmt_act_count(rec['attn_q_active'], ctx['n_qk_cfg'])}"
@@ -9883,18 +9885,23 @@ def _print_regular_block(rec, ctx):
     if is_v4164:
         _weight_label = 'admission'
         _select_status = ""
-        log_message(
-            f"  select: tau[qk={rec['attn_qk_tau_mean']:.4f}"
-            f" v={rec['attn_v_tau_mean']:.4f}"
-            f" rst={rec['rst_tau_mean']:.4f}]"
-            f" margin[qk={rec['attn_qk_selection_margin_mean']:+.4f}"
-            f" v={rec['attn_v_selection_margin_mean']:+.4f}"
-            f" rst={rec['rst_selection_margin_mean']:+.4f}]"
-            f" {_weight_label}[qk={rec['attn_qk_positive_margin_mean']:.4f}"
-            f" v={rec['attn_v_positive_margin_mean']:.4f}"
-            f" rst={rec['rst_positive_margin_mean']:.4f}]"
-            f"{_select_status}"
-        )
+        if _g('opspace/attn_v/enabled', 0.0) > 0.5:
+            log_message(
+                "  select: qk/v/rst=tau_free_relu"
+            )
+        else:
+            log_message(
+                f"  select: tau[qk={rec['attn_qk_tau_mean']:.4f}"
+                f" v={rec['attn_v_tau_mean']:.4f}"
+                f" rst={rec['rst_tau_mean']:.4f}]"
+                f" margin[qk={rec['attn_qk_selection_margin_mean']:+.4f}"
+                f" v={rec['attn_v_selection_margin_mean']:+.4f}"
+                f" rst={rec['rst_selection_margin_mean']:+.4f}]"
+                f" {_weight_label}[qk={rec['attn_qk_positive_margin_mean']:.4f}"
+                f" v={rec['attn_v_positive_margin_mean']:.4f}"
+                f" rst={rec['rst_positive_margin_mean']:.4f}]"
+                f"{_select_status}"
+            )
     if is_v4164 and not is_official_soft_direct_tau:
         log_message(
             f"  gate_max[qk={rec['attn_qk_raw_gate_max']:.1f}"
@@ -11457,8 +11464,11 @@ def main():
             isinstance(checkpoint_full_training_config, dict)
             and bool(checkpoint_full_training_config.get(
                 'selection_calibration_applied', False)))
+        operation_space_tau_free_resume = bool(
+            operation_space_repack_config.get('operation_space_enabled', False))
         selection_calibration_restore_required = bool(
-            selection_calibration_cfg.get('enabled', False)
+            (selection_calibration_cfg.get('enabled', False)
+             and not operation_space_tau_free_resume)
             or checkpoint_selection_calibration_applied)
         if selection_calibration_restore_required:
             _require_selection_calibration_resume_fields(
@@ -12535,6 +12545,12 @@ def main():
         print(
             "  admission_den_grad = admission_den_grad_scale * live_admission_den_grad "
             "+ detached remainder")
+        if bool(operation_space_repack_config.get(
+                'operation_space_enabled', False)):
+            print(
+                "  [opspace] QK/V/RST override: tau/admission disabled; "
+                "gate=relu(rho)^2; denominator uses gate_mass.",
+                flush=True)
         print("  Boundary power:")
         print(
             f"    start={soft_gate_boundary_power_start} "
@@ -12648,7 +12664,17 @@ def main():
     tau_init_summary = None
     selection_calibration_summary = None
     selection_calibration_tau_applied = False
+    operation_space_tau_free_enabled = bool(
+        operation_space_repack_config.get('operation_space_enabled', False))
     if (selection_calibration_cfg.get('enabled', False)
+            and operation_space_tau_free_enabled
+            and not _has_resume_checkpoint):
+        if is_host0:
+            print(
+                "[opspace] selection_calibration kept for config "
+                "compatibility but skipped for tau-free QK/V/RST.",
+                flush=True)
+    elif (selection_calibration_cfg.get('enabled', False)
             and not _has_resume_checkpoint):
         if is_host0:
             print(
@@ -12756,6 +12782,7 @@ def main():
     if (_is_active_srw_version(model_version_cfg)
             and tau_init_cfg['mode'] == 'quantile_frac'
             and not _has_resume_checkpoint
+            and not operation_space_tau_free_enabled
             and not selection_calibration_tau_applied):
         if len(train_loader) <= 0:
             raise ValueError(
@@ -13018,7 +13045,10 @@ def main():
                     f"mesh_model={mesh_model} for v4167 TP attention/O.")
 
     # Shard params using the model-version-specific policy.
-    param_shardings = get_param_shardings(params, mesh, model_version_cfg)
+    param_shardings = get_param_shardings(
+        params, mesh, model_version_cfg,
+        operation_space_enabled=bool(operation_space_repack_config.get(
+            'operation_space_enabled', False)))
     if is_host0:
         _print_param_sharding_summary(param_shardings, model_version_cfg)
     params = shard_params_to_mesh(params, param_shardings)
@@ -13216,23 +13246,24 @@ def main():
                 pool_cfg = {}
             if not _opspace_enabled:
                 return {}
-            if pool == 'qk':
-                return {}
             layout = _opspace_layouts.get(pool, {})
-            k_exec_cfg = layout.get('k_exec', pool_cfg.get('k_exec', 4))
+            k_exec_default = {'qk': 4, 'v': 5, 'rst': 32}[pool]
+            lanes_default = 32 if pool == 'rst' else 8
+            k_exec_cfg = layout.get(
+                'k_exec', pool_cfg.get('k_exec', k_exec_default))
             if k_exec_cfg is None:
-                k_exec_cfg = 4
+                k_exec_cfg = k_exec_default
             return {
                 'operation_space_mode': str(
                     layout.get('mode', pool_cfg.get('mode', 'block_sparse'))
                 ).lower(),
                 'opspace_lanes': int(layout.get(
-                    'lanes', pool_cfg.get('lanes', 4))),
+                    'lanes', pool_cfg.get('lanes', lanes_default))),
                 'opspace_tiles_per_lane': int(layout.get(
                     'tiles_per_lane', 1)),
                 'opspace_padded_ops': int(layout.get('padded_ops', 0)),
                 'opspace_tile_size': int(layout.get(
-                    'tile_size', _opspace_cfg.get('tile_size', 64))),
+                    'tile_size', _opspace_cfg.get('tile_size', 128))),
                 'opspace_k_exec': int(k_exec_cfg),
             }
 
@@ -13295,7 +13326,7 @@ def main():
                             max_chunk_size=attn_qk_max_chunk,
                             **_factory_kwargs(
                                 make_sharded_srw_paired_dense_minimal,
-                                _srw_base_kwargs)))
+                                _srw_pool_kwargs('qk'))))
                 else:
                     _sharded_paired_attn_qk_minimal = (
                         make_sharded_srw_paired_minimal(
@@ -13364,7 +13395,7 @@ def main():
                 if str(model_version_cfg) == V4167_MODEL_VERSION else "")
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 _v4168_exec_mode = (
-                    "operation_space_fixed_k4_repack_v1"
+                    "operation_space_tau_free_relu"
                     if _opspace_enabled
                     else ("vq_ivf_sector_bucketed"
                           if hardware_sector_execution_enabled
@@ -13378,7 +13409,8 @@ def main():
                     f"{cfg['model'].get('v_top_blocks', 2)}/"
                     f"{cfg['model'].get('rst_top_blocks', 2)}")
             _qk_mode_msg = (
-                "QK dense-distributed"
+                ("QK dense-masked opspace"
+                 if _opspace_enabled else "QK dense-distributed")
                 if str(model_version_cfg) == V4168_MODEL_VERSION
                 else "QK fused")
             print(f"  shard_map enabled (mesh_model={mesh_model}, {_qk_mode_msg}"
@@ -13388,13 +13420,47 @@ def main():
                   f"{_extra_msg})")
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 if _opspace_enabled:
+                    _qk_layout = _opspace_layouts.get('qk', {})
+                    _v_layout = _opspace_layouts.get('v', {})
+                    _rst_layout = _opspace_layouts.get('rst', {})
+                    _tile = int(_opspace_cfg.get('tile_size', 128))
+                    _qk_tiles = int(_qk_layout.get('total_tiles', 0))
+                    _v_tiles = int(_v_layout.get('total_tiles', 0))
+                    _rst_tiles = int(_rst_layout.get('total_tiles', 0))
+                    _rst_lanes = int(_rst_layout.get('lanes', 32))
+                    _rst_k = int(_rst_layout.get('k_exec', 32))
+                    _model_shards = max(1, int(mesh_model))
+                    _rst_local_lanes = max(1, _rst_lanes // _model_shards)
+                    _rst_tpl = int(_rst_layout.get('tiles_per_lane', 8))
                     print(
-                        "v4168 operation-space routing policy:\n"
-                        "  qk: dense_distributed\n"
-                        "  mode=fixed_k4_repack_v1\n"
-                        "  v: factorized_lane_mean K=4 owner_tile_major_grouped\n"
-                        "  rst: factorized_lane_mean K=4 owner_tile_major_grouped\n"
-                        "  tile_size=64\n"
+                        f"[opspace] v4168 tau_free_relu enabled tile={_tile}\n"
+                        "[opspace] qk_backend=dense_masked "
+                        "v_backend=dense_masked "
+                        "rst_backend=tile_grouped_sparse\n"
+                        "[opspace] QK/V/RST tau/admission disabled; "
+                        "relu-squared tile operation active.\n"
+                        f"[opspace/qk] lanes={int(_qk_layout.get('lanes', 8))} "
+                        f"k_exec={int(_qk_layout.get('k_exec', 4))} "
+                        f"tiles={_qk_tiles} "
+                        f"tiles_per_lane={int(_qk_layout.get('tiles_per_lane', 4))} "
+                        f"exec_logic_slots={int(_qk_layout.get('k_exec', 4)) * _tile} "
+                        "backend=dense_masked gate=relu2\n"
+                        f"[opspace/v] lanes={int(_v_layout.get('lanes', 8))} "
+                        f"k_exec={int(_v_layout.get('k_exec', 5))} "
+                        f"tiles={_v_tiles} "
+                        f"tiles_per_lane={int(_v_layout.get('tiles_per_lane', 12))} "
+                        f"exec_logic_slots={int(_v_layout.get('k_exec', 5)) * _tile} "
+                        "backend=dense_masked gate=relu2\n"
+                        f"[opspace/rst] lanes={_rst_lanes} "
+                        f"k_exec={_rst_k} "
+                        f"tiles={_rst_tiles} "
+                        f"tiles_per_lane={_rst_tpl} "
+                        f"tile_size={_tile} "
+                        "backend=tile_grouped_sparse gate=relu2\n"
+                        f"[opspace/rst] local_lanes={_rst_local_lanes} "
+                        f"local_groups={_rst_local_lanes * _rst_tpl} "
+                        f"requests_per_token_local={_rst_local_lanes} "
+                        f"requests_per_token_global={_rst_lanes}\n"
                         f"  operation_space_repack_enabled={operation_space_repack_enabled}\n"
                         "  vq_repack_used=false\n"
                         "  sector_overflow_execution_used=false",
@@ -14321,7 +14387,7 @@ def main():
         and isinstance(cfg.get('training', {}).get('operation_space'), dict)
         and bool(cfg['training']['operation_space'].get('enabled', False)))
     main_val_path = (
-        'operation_space_fixed_k4_repack_v1'
+        'operation_space_tau_free_relu'
         if operation_space_enabled_runtime else (
             'sector_bucketed'
             if hardware_sector_execution_enabled

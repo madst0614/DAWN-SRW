@@ -291,21 +291,63 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
             return dict(kwargs)
         return {k: v for k, v in kwargs.items() if k in sig.parameters}
 
+    v4168_version = getattr(
+        train, "V4168_MODEL_VERSION", "spatial-r1-v4.1.6.8")
+    opspace_cfg = cfg.get("training", {}).get("operation_space", {})
+    if not isinstance(opspace_cfg, dict):
+        opspace_cfg = {}
+    opspace_enabled = (
+        version == v4168_version and bool(opspace_cfg.get("enabled", False)))
+    opspace_pools = (
+        opspace_cfg.get("pools", {})
+        if isinstance(opspace_cfg.get("pools", {}), dict) else {})
+    opspace_layouts = (
+        train._v4168_operation_space_pool_layouts(
+            cfg.get("training", {}), cfg.get("model", {}))
+        if opspace_enabled else {})
+
+    def opspace_pool_kwargs(pool):
+        if not opspace_enabled:
+            return {}
+        pool_cfg = opspace_pools.get(pool, {})
+        if not isinstance(pool_cfg, dict):
+            pool_cfg = {}
+        layout = opspace_layouts.get(pool, {})
+        k_exec_default = {"qk": 4, "v": 5, "rst": 32}[pool]
+        lanes_default = 32 if pool == "rst" else 8
+        k_exec_cfg = layout.get(
+            "k_exec", pool_cfg.get("k_exec", k_exec_default))
+        return {
+            "operation_space_mode": str(
+                layout.get("mode", pool_cfg.get("mode", "block_sparse"))
+            ).lower(),
+            "opspace_lanes": int(layout.get(
+                "lanes", pool_cfg.get("lanes", lanes_default))),
+            "opspace_tiles_per_lane": int(layout.get("tiles_per_lane", 1)),
+            "opspace_padded_ops": int(layout.get("padded_ops", 0)),
+            "opspace_tile_size": int(layout.get(
+                "tile_size", opspace_cfg.get("tile_size", 128))),
+            "opspace_k_exec": int(k_exec_cfg),
+        }
+
     def srw_pool_kwargs(pool):
         kwargs = dict(base_kwargs_for_analysis)
-        if version == getattr(train, "V4168_MODEL_VERSION", "spatial-r1-v4.1.6.8"):
+        if version == v4168_version:
             m_cfg = cfg.get("model", {})
             kwargs.update({
                 "block_size": int(m_cfg.get(f"{pool}_block_size", 256)),
                 "top_blocks": int(m_cfg.get(f"{pool}_top_blocks", 2)),
                 "block_margin": float(m_cfg.get("block_margin", 0.0)),
             })
+            kwargs.update(opspace_pool_kwargs(pool))
         return kwargs
 
     make_single = mod.make_sharded_srw
     make_paired = getattr(mod, "make_sharded_srw_paired", None)
     make_single_min = getattr(mod, "make_sharded_srw_minimal", None)
     make_paired_min = getattr(mod, "make_sharded_srw_paired_minimal", None)
+    make_paired_dense_min = getattr(
+        mod, "make_sharded_srw_paired_dense_minimal", None)
 
     base_kwargs_for_analysis = dict(base_kwargs)
     if analysis and "analysis" in inspect.signature(make_single).parameters:
@@ -345,10 +387,13 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
             max_chunk_size=chunk["rst"],
             **factory_kwargs(make_single_min, srw_pool_kwargs("rst")),
         )
-    if not analysis and make_paired_min is not None:
-        fns["attn_qk_paired_minimal"] = make_paired_min(
+    paired_min_factory = make_paired_min
+    if opspace_enabled and make_paired_dense_min is not None:
+        paired_min_factory = make_paired_dense_min
+    if not analysis and paired_min_factory is not None:
+        fns["attn_qk_paired_minimal"] = paired_min_factory(
             max_chunk_size=chunk["attn_qk"],
-            **factory_kwargs(make_paired_min, srw_pool_kwargs("qk")),
+            **factory_kwargs(paired_min_factory, srw_pool_kwargs("qk")),
         )
     return fns
 
