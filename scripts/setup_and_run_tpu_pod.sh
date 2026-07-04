@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# TPU Pod Setup + Training Script (runs on each worker)
+# TPU Pod Setup + Runner Script (runs on each worker)
 # =============================================================================
 # Expects BRANCH and CONFIG passed as environment variables from the launcher.
 #
@@ -8,7 +8,7 @@
 #   BRANCH=main CONFIG=configs/train_config_v17_1_tpu_400M_c4_5B_v4_64.yaml \
 #     bash scripts/setup_and_run_tpu_pod.sh
 #
-# Usually invoked via launch_tpu_pod.sh which sets env vars automatically.
+# Usually invoked via a launcher script which sets env vars automatically.
 # =============================================================================
 
 set -euo pipefail
@@ -23,6 +23,7 @@ BRANCH="${BRANCH:?ERROR: BRANCH env var not set}"
 CONFIG="${CONFIG:?ERROR: CONFIG env var not set}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-scripts/train_jax.py}"
 TRAIN_ARGS="${TRAIN_ARGS:-}"
+RUN_KIND="${RUN_KIND:-training}"
 WORK_DIR="$HOME/DAWN-SRW"
 export PYTHONUNBUFFERED=1
 
@@ -35,17 +36,19 @@ echo "COMMIT=$(git rev-parse HEAD 2>/dev/null || true)"
 echo "TRAIN_SCRIPT=$TRAIN_SCRIPT"
 echo "CONFIG=$CONFIG"
 echo "TRAIN_ARGS=$TRAIN_ARGS"
+echo "RUN_KIND=$RUN_KIND"
 echo "PYTHON=$(which python3)"
 echo "PYTHON_VERSION=$(python3 --version)"
 
 echo "============================================"
-echo "Host $(hostname) -- Setting up TPU Pod training"
+echo "Host $(hostname) -- Setting up TPU Pod $RUN_KIND"
 echo "  Branch: $BRANCH"
 echo "  Config: $CONFIG"
-echo "  Train script: $TRAIN_SCRIPT"
+echo "  Script: $TRAIN_SCRIPT"
 echo "TRAIN_SCRIPT=$TRAIN_SCRIPT"
 echo "CONFIG=$CONFIG"
 echo "TRAIN_ARGS=$TRAIN_ARGS"
+echo "RUN_KIND=$RUN_KIND"
 echo "HOSTNAME=$(hostname)"
 echo "DATE=$(date -Is)"
 echo "============================================"
@@ -84,27 +87,29 @@ echo "COMMIT=$(git rev-parse HEAD 2>/dev/null || true)"
 echo "TRAIN_SCRIPT=$TRAIN_SCRIPT"
 echo "CONFIG=$CONFIG"
 echo "TRAIN_ARGS=$TRAIN_ARGS"
+echo "RUN_KIND=$RUN_KIND"
 
 # 3. Skip standalone JAX preflight.
 #
 # On multi-host TPU pods a short-lived standalone JAX process can initialize
 # PJRT, print device info, and then abort during teardown with:
 #   GetSliceInfo can only be invoked after a slice is built...
-# The real training process below performs the same backend/device checks and
-# keeps the slice alive, so avoid opening a throwaway slice here.
-echo "[3/4] Skipping standalone JAX TPU preflight; train_jax.py will verify devices."
+# The target process below performs the same backend/device checks and keeps
+# the slice alive, so avoid opening a throwaway slice here.
+echo "[3/4] Skipping standalone JAX TPU preflight; target process will verify devices."
 
-# 4. Launch training in tmux (survives SSH disconnect)
-echo "[4/4] Starting training in tmux session 'train'..."
+# 4. Launch target process in tmux (survives SSH disconnect)
+echo "[4/4] Starting $RUN_KIND in tmux session 'train'..."
 echo "  Config: $CONFIG"
-echo "  Train script: $TRAIN_SCRIPT"
-echo "  Train args: ${TRAIN_ARGS:-}"
+echo "  Script: $TRAIN_SCRIPT"
+echo "  Args: ${TRAIN_ARGS:-}"
 echo "  Host: $(hostname)"
 echo "  Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "  Log: ~/train.log"
 echo "TRAIN_SCRIPT=$TRAIN_SCRIPT"
 echo "CONFIG=$CONFIG"
 echo "TRAIN_ARGS=$TRAIN_ARGS"
+echo "RUN_KIND=$RUN_KIND"
 echo "HOSTNAME=$(hostname)"
 echo "DATE=$(date -Is)"
 
@@ -141,9 +146,9 @@ else
     echo "  XLA HLO dump: disabled (set ENABLE_XLA_DUMP=1 to enable)"
 fi
 
-# Start new tmux session running training, tee to ~/train.log
+# Start new tmux session running the target process, tee to ~/train.log
 tmux new-session -d -s train \
-    "${XLA_DUMP_EXPORT}export PYTHONUNBUFFERED=1; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; ${XLA_FLAGS_EXPORT}{ echo '=== TPU training process startup ==='; echo \"TRAIN_SCRIPT=$TRAIN_SCRIPT\"; echo \"CONFIG=$CONFIG\"; echo \"TRAIN_ARGS=$TRAIN_ARGS\"; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"PYTHONUNBUFFERED=\$PYTHONUNBUFFERED\"; python3 -u \"$TRAIN_SCRIPT\" --config \"$CONFIG\" $TRAIN_ARGS; } 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+    "${XLA_DUMP_EXPORT}export PYTHONUNBUFFERED=1; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; ${XLA_FLAGS_EXPORT}{ echo \"=== TPU $RUN_KIND process startup ===\"; echo \"TRAIN_SCRIPT=$TRAIN_SCRIPT\"; echo \"CONFIG=$CONFIG\"; echo \"TRAIN_ARGS=$TRAIN_ARGS\"; echo \"RUN_KIND=$RUN_KIND\"; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"PYTHONUNBUFFERED=\$PYTHONUNBUFFERED\"; python3 -u \"$TRAIN_SCRIPT\" --config \"$CONFIG\" $TRAIN_ARGS; } 2>&1 | tee ~/train.log; echo 'Process finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"

@@ -220,12 +220,10 @@ set -e
 tmux kill-session -t train 2>/dev/null || true
 pkill -9 -f "[p]ython3 .*scripts/benchmark_srw_tpu.py" || true
 pkill -9 -f "[p]ython .*scripts/benchmark_srw_tpu.py" || true
-pkill -9 -f "[p]ython3 .*scripts/train_jax.py" || true
-pkill -9 -f "[p]ython .*scripts/train_jax.py" || true
 sudo lsof /dev/accel* 2>/dev/null | grep -v PID | awk '{print $2}' | sort -u | xargs -r sudo kill -9 || true
 EOFCLEANUP
 
-echo "Cleaning old benchmark/training processes on every worker..."
+echo "Cleaning old benchmark processes on every worker..."
 for worker in $(seq 0 $((WORKER_COUNT - 1))); do
     echo "  Cleaning worker $worker..."
     run_worker_command "$worker" "$CLEANUP_CMD" || true
@@ -235,7 +233,6 @@ REPO_URL_Q="$(shell_quote "$REPO_URL")"
 BRANCH_Q="$(shell_quote "$BRANCH")"
 CONFIG_FIRST_Q="$(shell_quote "$CONFIG_FIRST")"
 CONFIG_REST_Q="$(shell_quote "$CONFIG_REST_ARGS")"
-CONFIG_COUNT_Q="$(shell_quote "$CONFIG_COUNT")"
 MODEL_VERSION_Q="$(shell_quote "$MODEL_VERSION")"
 STEPS_Q="$(shell_quote "$STEPS")"
 WARMUP_STEPS_Q="$(shell_quote "$WARMUP_STEPS")"
@@ -252,7 +249,6 @@ REPO_URL=${REPO_URL_Q}
 BRANCH=${BRANCH_Q}
 CONFIG=${CONFIG_FIRST_Q}
 CONFIG_REST=${CONFIG_REST_Q}
-CONFIG_COUNT=${CONFIG_COUNT_Q}
 MODEL_VERSION=${MODEL_VERSION_Q}
 STEPS=${STEPS_Q}
 WARMUP_STEPS=${WARMUP_STEPS_Q}
@@ -277,38 +273,35 @@ else
     cd ~/DAWN-SRW
 fi
 
-TRAIN_ARGS=""
+BENCH_ARGS=""
 if [ -n "\$CONFIG_REST" ]; then
-    TRAIN_ARGS="\$CONFIG_REST"
+    BENCH_ARGS="\$CONFIG_REST"
 fi
-TRAIN_ARGS="\$TRAIN_ARGS --steps \$STEPS --warmup-steps \$WARMUP_STEPS"
+BENCH_ARGS="\$BENCH_ARGS --steps \$STEPS --warmup-steps \$WARMUP_STEPS"
 if [ -n "\$MODEL_VERSION" ]; then
-    TRAIN_ARGS="\$TRAIN_ARGS --model-version \$MODEL_VERSION"
+    BENCH_ARGS="\$BENCH_ARGS --model-version \$MODEL_VERSION"
 fi
 if [ "\$ALLOW_MODEL_VERSION_OVERRIDE" = "1" ]; then
-    TRAIN_ARGS="\$TRAIN_ARGS --allow-model-version-override"
+    BENCH_ARGS="\$BENCH_ARGS --allow-model-version-override"
 fi
 if [ "\$XLA_DUMP_ENABLED" = "1" ]; then
-    if [ "\$CONFIG_COUNT" -gt 1 ]; then
-        BENCH_XLA="\${XLA_DUMP_BASE}/host_\${TPU_WORKER_INDEX}/{index}_{config}"
-    else
-        BENCH_XLA="\${XLA_DUMP_BASE}/host_\${TPU_WORKER_INDEX}"
-    fi
-    TRAIN_ARGS="\$TRAIN_ARGS --xla-dump-dir \$BENCH_XLA"
+    BENCH_XLA="\${XLA_DUMP_BASE}/host_\${TPU_WORKER_INDEX}"
+    BENCH_ARGS="\$BENCH_ARGS --xla-dump-dir \$BENCH_XLA"
 fi
 if [ "\$DUMMY_DATA" = "1" ]; then
-    TRAIN_ARGS="\$TRAIN_ARGS --dummy-data"
+    BENCH_ARGS="\$BENCH_ARGS --dummy-data"
 fi
 
+export RUN_KIND='benchmark'
 export TRAIN_SCRIPT='scripts/benchmark_srw_tpu.py'
-export TRAIN_ARGS
+export TRAIN_ARGS="\$BENCH_ARGS"
 export ENABLE_XLA_DUMP=0
 unset XLA_DUMP_DIR
 
-echo "TRAIN_SCRIPT=\$TRAIN_SCRIPT"
+echo "BENCHMARK_SCRIPT=\$TRAIN_SCRIPT"
 echo "CONFIG(first)=\$CONFIG"
 echo "CONFIG(rest)=\$CONFIG_REST"
-echo "TRAIN_ARGS=\$TRAIN_ARGS"
+echo "BENCHMARK_ARGS=\$TRAIN_ARGS"
 if [ "\$XLA_DUMP_ENABLED" = "1" ]; then
     echo "Benchmark XLA dump root: \$XLA_DUMP_BASE"
 else
