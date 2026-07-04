@@ -20,12 +20,12 @@ model:
   n_qk: 3798
   n_v: 11824
   n_rst: 31756
-  qk_block_size: 256
-  v_block_size: 256
-  rst_block_size: 256
-  qk_top_blocks: 2
-  v_top_blocks: 2
-  rst_top_blocks: 2
+  qk_block_size: 64
+  v_block_size: 64
+  rst_block_size: 64
+  qk_top_blocks: 0
+  v_top_blocks: 0
+  rst_top_blocks: 0
   block_margin: 0.0
   tau_init_min: -0.95
   tau_init_max: 0.95
@@ -109,20 +109,37 @@ training:
     - 1.0e-06
     - 1.0e-05
     - 0.0001
-  hardware_repack_enabled: true
-  hardware_sector_execution_enabled: true
-  hardware_repack_interval_steps: 100
-  hardware_repack_strategy: balanced_vq
-  hardware_repack_max_move_frac: 0.08
-  hardware_repack_vq_iterations: 4
-  hardware_repack_farthest_per_sector: 10
-  hardware_repack_gain_eps: 1.0e-3
-  hardware_repack_warmup_steps: 0
-  hardware_repack_freeze_after_step: null
+  operation_space:
+    enabled: true
+    version: fixed_k4_repack_v1
+    tile_size: 64
+
+    pools:
+      qk:
+        mode: dense_tile
+        lanes: 4
+
+      v:
+        mode: factorized_lane_mean
+        lanes: 4
+        k_exec: 4
+
+      rst:
+        mode: factorized_lane_mean
+        lanes: 8
+        k_exec: 4
+
+    repack:
+      enabled: true
+      start_step: 1000
+      interval_steps: 100
+      max_swaps:
+        v: 64
+        rst: 160
   checkpoint_interval: 200
   val_interval: 1000
   log_interval: 100
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_v4_64_block_sparse_v1
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_v4_64_fixed_k4_repack

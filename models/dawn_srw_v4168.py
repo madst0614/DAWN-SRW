@@ -83,6 +83,56 @@ SECTOR_RUNTIME_DIAG_COUNT = len(SECTOR_RUNTIME_DIAG_NAMES)
     SECTOR_EFFECTIVE_OPERATOR_FRAC,
 ) = range(SECTOR_RUNTIME_DIAG_COUNT)
 
+OPSPACE_RUNTIME_DIAG_NAMES = (
+    'enabled',
+    'K',
+    'visible_slots',
+    'valid_visible_mean',
+    'tile_score_p50',
+    'tile_score_p95',
+    'selected_lane_top1_frac',
+    'selected_tile_top1_frac',
+    'selected_tile_p99_over_mean',
+    'owner_load_p99_over_mean',
+    'active_visible',
+    'admission_den',
+    'execution_mass',
+    'effective_ops',
+    'padded_selected_count',
+    'padded_execution_mass',
+    'no_nan',
+    'owner_tile_major_grouped',
+    'selected_request_count',
+    'processed_request_count',
+    'all_requests_processed',
+    'factorized_tile_layout_ok',
+)
+OPSPACE_RUNTIME_DIAG_COUNT = len(OPSPACE_RUNTIME_DIAG_NAMES)
+(
+    OPSPACE_ENABLED,
+    OPSPACE_K,
+    OPSPACE_VISIBLE_SLOTS,
+    OPSPACE_VALID_VISIBLE_MEAN,
+    OPSPACE_TILE_SCORE_P50,
+    OPSPACE_TILE_SCORE_P95,
+    OPSPACE_SELECTED_LANE_TOP1_FRAC,
+    OPSPACE_SELECTED_TILE_TOP1_FRAC,
+    OPSPACE_SELECTED_TILE_P99_OVER_MEAN,
+    OPSPACE_OWNER_LOAD_P99_OVER_MEAN,
+    OPSPACE_ACTIVE_VISIBLE,
+    OPSPACE_ADMISSION_DEN,
+    OPSPACE_EXECUTION_MASS,
+    OPSPACE_EFFECTIVE_OPS,
+    OPSPACE_PADDED_SELECTED_COUNT,
+    OPSPACE_PADDED_EXECUTION_MASS,
+    OPSPACE_NO_NAN,
+    OPSPACE_OWNER_TILE_MAJOR_GROUPED,
+    OPSPACE_SELECTED_REQUEST_COUNT,
+    OPSPACE_PROCESSED_REQUEST_COUNT,
+    OPSPACE_ALL_REQUESTS_PROCESSED,
+    OPSPACE_FACTORIZE_TILE_LAYOUT_OK,
+) = range(OPSPACE_RUNTIME_DIAG_COUNT)
+
 BENCHMARK_SECTOR_RUNTIME_DIAG_NAMES = (
     'bucket_fill_mean',
     'bucket_fill_p50',
@@ -108,6 +158,14 @@ BENCHMARK_SECTOR_RUNTIME_DIAG_NAMES = (
     'semantic_work_frac_vs_dense',
     'padded_work_frac_vs_dense',
     'hot_sector_skew_p99_over_mean',
+    'attempted_fill_mean',
+    'attempted_fill_p50',
+    'attempted_fill_p95',
+    'attempted_fill_p99',
+    'attempted_fill_max',
+    'required_capacity_no_overflow',
+    'current_capacity',
+    'capacity_shortfall',
 )
 BENCHMARK_SECTOR_RUNTIME_DIAG_COUNT = len(
     BENCHMARK_SECTOR_RUNTIME_DIAG_NAMES)
@@ -136,6 +194,14 @@ BENCHMARK_SECTOR_RUNTIME_DIAG_COUNT = len(
     BENCHMARK_SECTOR_SEMANTIC_WORK_FRAC_VS_DENSE,
     BENCHMARK_SECTOR_PADDED_WORK_FRAC_VS_DENSE,
     BENCHMARK_SECTOR_HOT_SECTOR_SKEW_P99_OVER_MEAN,
+    BENCHMARK_SECTOR_ATTEMPTED_FILL_MEAN,
+    BENCHMARK_SECTOR_ATTEMPTED_FILL_P50,
+    BENCHMARK_SECTOR_ATTEMPTED_FILL_P95,
+    BENCHMARK_SECTOR_ATTEMPTED_FILL_P99,
+    BENCHMARK_SECTOR_ATTEMPTED_FILL_MAX,
+    BENCHMARK_SECTOR_REQUIRED_CAPACITY_NO_OVERFLOW,
+    BENCHMARK_SECTOR_CURRENT_CAPACITY,
+    BENCHMARK_SECTOR_CAPACITY_SHORTFALL,
 ) = range(BENCHMARK_SECTOR_RUNTIME_DIAG_COUNT)
 
 
@@ -3671,6 +3737,178 @@ def maybe_hardware_repack(params, opt_state, model_config, mesh, step, config):
     return new_params, new_opt_state, metrics
 
 
+def apply_operator_bundle_swaps(train_state, pool_name, layer_idx, swaps):
+    """Apply valid-row operator bundle swaps to (params, opt_state)."""
+    del layer_idx
+    if not isinstance(train_state, tuple) or len(train_state) < 2:
+        raise ValueError(
+            "apply_operator_bundle_swaps expects train_state as "
+            "(params, opt_state[, ...]) in this v4168 trainer.")
+    params, opt_state = train_state[0], train_state[1]
+    pool_name = str(pool_name)
+    if pool_name == 'v':
+        pool_name = 'attn_v'
+    if pool_name not in ('attn_v', 'rst', 'attn_qk'):
+        raise ValueError(f"unsupported operation-space pool {pool_name!r}")
+    pool_params = params['neuron_pool']
+    n_rows = None
+    for pool, _op_key, read_key, _write_key, _block_key, _top_key in (
+            _HARDWARE_REPACK_POOLS):
+        if pool == pool_name:
+            n_rows = int(pool_params[read_key].shape[0])
+            break
+    if n_rows is None:
+        raise ValueError(f"unsupported operation-space pool {pool_name!r}")
+    perm = np.arange(n_rows, dtype=np.int32)
+    for a, b in swaps:
+        a_i = int(a)
+        b_i = int(b)
+        if not (0 <= a_i < n_rows and 0 <= b_i < n_rows):
+            raise ValueError(
+                f"swap ({a_i}, {b_i}) outside pool {pool_name} rows={n_rows}")
+        perm[a_i] = b_i
+        perm[b_i] = a_i
+    new_params, new_opt_state = _apply_pool_permutations_to_params_and_opt_state(
+        params, opt_state, {pool_name: perm})
+    if len(train_state) == 2:
+        return new_params, new_opt_state
+    return (new_params, new_opt_state, *train_state[2:])
+
+
+def operation_space_static_metrics(model_config, config=None,
+                                   model_axis_size=1):
+    """Static fixed-K operation-space layout metrics for diagnostics."""
+    config = config if isinstance(config, dict) else {}
+    pool_cfgs = config.get('operation_space_pool_layouts', {})
+    if not isinstance(pool_cfgs, dict):
+        pool_cfgs = {}
+    model_axis_size = max(1, int(model_axis_size))
+    out = {
+        'opspace/mode_fixed_k4_repack_v1': 1.0,
+        'opspace/owner_tile_major_grouped': 1.0,
+        'opspace/no_selected_request_drop': 1.0,
+    }
+    defaults = {
+        'qk': ('n_qk', 4, 16, 64, 0),
+        'v': ('n_v', 4, 48, 64, 4),
+        'rst': ('n_rst', 8, 64, 64, 4),
+    }
+    for label, (n_key, lanes_d, tpl_d, tile_d, k_d) in defaults.items():
+        pcfg = pool_cfgs.get(label, {})
+        if not isinstance(pcfg, dict):
+            pcfg = {}
+        lanes = int(pcfg.get('lanes', lanes_d))
+        tiles_per_lane = int(pcfg.get('tiles_per_lane', tpl_d))
+        tile_size = int(pcfg.get('tile_size', tile_d))
+        k_exec_cfg = pcfg.get('k_exec', k_d)
+        k_exec = int(k_exec_cfg) if k_exec_cfg is not None else 0
+        total_tiles = lanes * tiles_per_lane
+        owner_count = int(pcfg.get('num_devices', model_axis_size))
+        owner_count = max(1, owner_count)
+        n_ops = int(model_config.get(n_key, 0))
+        padded_ops = total_tiles * tile_size
+        invalid = max(0, padded_ops - n_ops)
+        out[f'opspace/{label}/K'] = float(k_exec)
+        out[f'opspace/{label}/visible_slots'] = float(k_exec * tile_size)
+        out[f'opspace/{label}/total_tiles'] = float(total_tiles)
+        out[f'opspace/{label}/tiles_per_owner'] = (
+            float(total_tiles) / float(owner_count))
+        out[f'opspace/{label}/padded_ops'] = float(padded_ops)
+        out[f'opspace/{label}/invalid_padded_ops'] = float(invalid)
+    return out
+
+
+def _operation_space_repack_enabled(config):
+    if not isinstance(config, dict):
+        return False
+    return bool(config.get('operation_space_repack_enabled', False))
+
+
+def maybe_operation_space_repack(params, opt_state, model_config, mesh, step,
+                                 config):
+    """Run fixed-K operation-space positive-gain bundle repack."""
+    if not _operation_space_repack_enabled(config):
+        return params, opt_state, {}
+
+    pool_layouts = config.get('operation_space_pool_layouts', {})
+    if not isinstance(pool_layouts, dict):
+        pool_layouts = {}
+    repack_pools = config.get('operation_space_repack_pools', {})
+    if not isinstance(repack_pools, dict):
+        repack_pools = {}
+    std_mult = float(config.get('operation_space_repack_std_mult', 2.0))
+    min_assignment_gain = float(config.get(
+        'operation_space_repack_min_assignment_gain', 0.03))
+    min_swap_gain = float(config.get(
+        'operation_space_repack_min_swap_gain', 0.0))
+
+    pool_params = params['neuron_pool']
+    op_keys = _pool_operator_keys(pool_params)
+    pool_perms = {}
+    metrics = {}
+    total_swaps = 0.0
+    total_moved = 0.0
+    model_axis_size = int(getattr(mesh, 'shape', {}).get('model', 1))
+    for pool, op_key_key, _read_key, _write_key, _block_key, _top_key in (
+            _HARDWARE_VQ_REPACK_POOLS):
+        label = 'v' if pool == 'attn_v' else 'rst'
+        pcfg = pool_layouts.get(label, {})
+        if not isinstance(pcfg, dict):
+            pcfg = {}
+        rcfg = repack_pools.get(label, {})
+        if not isinstance(rcfg, dict):
+            rcfg = {}
+        if not bool(rcfg.get('enabled', True)):
+            continue
+        max_swaps = int(rcfg.get(
+            'max_swaps_per_repack', 64 if label == 'v' else 160))
+        key_device = _forward_unit_direction(
+            op_keys[op_key_key].astype(jnp.float32))
+        key_host = _global_jax_array_to_host_np(key_device, dtype=np.float32)
+        perm, pool_metrics = _plan_operation_space_threshold_repack(
+            key_host,
+            lanes=int(pcfg.get('lanes', 4 if label == 'v' else 8)),
+            tiles_per_lane=int(pcfg.get(
+                'tiles_per_lane', 48 if label == 'v' else 64)),
+            tile_size=int(pcfg.get('tile_size', 64)),
+            max_swaps_per_repack=max_swaps,
+            std_mult=std_mult,
+            min_assignment_gain=min_assignment_gain,
+            min_swap_gain=min_swap_gain)
+        perm, perm_checksum, perm_broadcast_ok = (
+            _canonical_hardware_permutation_across_hosts(
+                perm, pool=f'opspace/{label}'))
+        moved_mask = perm != np.arange(int(perm.size), dtype=np.int32)
+        moved_count = int(moved_mask.sum())
+        swap_count = int(pool_metrics.get('swaps', 0.0))
+        pool_metrics['moved_count'] = float(moved_count)
+        pool_metrics['moved_frac'] = float(moved_count) / float(
+            max(int(perm.size), 1))
+        pool_metrics['perm_checksum'] = float(perm_checksum)
+        pool_metrics['perm_broadcast_ok'] = float(perm_broadcast_ok)
+        pool_metrics['optimizer_state_swapped'] = 1.0
+        pool_metrics['tau_values_changed'] = 0.0
+        total_swaps += float(swap_count)
+        total_moved += float(moved_count)
+        if moved_count > 0:
+            pool_perms[pool] = perm
+        for name, value in pool_metrics.items():
+            metrics[f'repack/{label}/{name}'] = float(value)
+
+    metrics['repack/total_swaps'] = float(total_swaps)
+    metrics['repack/total_moved_count'] = float(total_moved)
+    metrics['repack/step'] = float(int(step))
+    metrics['repack/strategy_threshold_positive_gain_swap'] = 1.0
+    metrics.update(operation_space_static_metrics(
+        model_config, config=config, model_axis_size=model_axis_size))
+    if total_moved == 0.0:
+        return params, opt_state, metrics
+
+    new_params, new_opt_state = _apply_pool_permutations_to_params_and_opt_state(
+        params, opt_state, pool_perms)
+    return new_params, new_opt_state, metrics
+
+
 def _v4168_block_sparse_config(block_size, top_blocks):
     block_size = int(block_size)
     top_blocks = int(top_blocks)
@@ -3737,6 +3975,7 @@ def _v4168_build_sector_buckets(local_sector_ids, selected_here, pair_span,
     sector_onehot = jnp.logical_and(
         flat_selected[:, None],
         flat_sector[:, None] == sector_ids[None, :])
+    attempted_fill = sector_onehot.astype(jnp.int32).sum(axis=0)
     rank_by_sector = jnp.cumsum(
         sector_onehot.astype(jnp.int32), axis=0) - 1
     rank = jnp.sum(
@@ -3767,6 +4006,7 @@ def _v4168_build_sector_buckets(local_sector_ids, selected_here, pair_span,
         overflow.astype(jnp.int32).sum(),
         bucket_fill.max(),
         bucket_fill.astype(jnp.float32).mean(),
+        attempted_fill,
     )
 
 
@@ -3797,7 +4037,8 @@ def _v4168_sector_core_runtime_diag(bucket_fill, overflow_count,
     ), dtype=jnp.float32)
 
 
-def _v4168_sector_benchmark_runtime_diag(bucket_fill, overflow_count,
+def _v4168_sector_benchmark_runtime_diag(bucket_fill, attempted_fill,
+                                         overflow_count,
                                          bucket_capacity, pair_span, topk,
                                          global_n_sectors, sector_size,
                                          selected_sector_count,
@@ -3813,6 +4054,18 @@ def _v4168_sector_benchmark_runtime_diag(bucket_fill, overflow_count,
     bucket_fill_p95 = _v4168_percentile_from_sorted(sorted_fill, 95)
     bucket_fill_p99 = _v4168_percentile_from_sorted(sorted_fill, 99)
     bucket_fill_max = sorted_fill[-1]
+    attempted_fill_f = attempted_fill.astype(jnp.float32)
+    global_attempted_fill = jax.lax.all_gather(
+        attempted_fill_f, 'model', axis=0, tiled=True)
+    sorted_attempted_fill = jnp.sort(global_attempted_fill)
+    attempted_fill_mean = global_attempted_fill.mean()
+    attempted_fill_p50 = _v4168_percentile_from_sorted(
+        sorted_attempted_fill, 50)
+    attempted_fill_p95 = _v4168_percentile_from_sorted(
+        sorted_attempted_fill, 95)
+    attempted_fill_p99 = _v4168_percentile_from_sorted(
+        sorted_attempted_fill, 99)
+    attempted_fill_max = sorted_attempted_fill[-1]
 
     bucket_capacity_f = jnp.asarray(bucket_capacity, dtype=jnp.float32)
     expected_pair_count = jnp.asarray(
@@ -3846,6 +4099,9 @@ def _v4168_sector_benchmark_runtime_diag(bucket_fill, overflow_count,
         / dense_work)
     hot_sector_skew = bucket_fill_p99 / jnp.maximum(
         bucket_fill_mean, jnp.float32(1.0e-6))
+    required_capacity_no_overflow = attempted_fill_max
+    capacity_shortfall = (
+        attempted_fill_max / jnp.maximum(bucket_capacity_f, 1.0))
 
     return jnp.asarray((
         bucket_fill_mean,
@@ -3872,6 +4128,14 @@ def _v4168_sector_benchmark_runtime_diag(bucket_fill, overflow_count,
         semantic_work_frac,
         padded_work_frac,
         hot_sector_skew,
+        attempted_fill_mean,
+        attempted_fill_p50,
+        attempted_fill_p95,
+        attempted_fill_p99,
+        attempted_fill_max,
+        required_capacity_no_overflow,
+        bucket_capacity_f,
+        capacity_shortfall,
     ), dtype=jnp.float32)
 
 
@@ -3908,6 +4172,13 @@ def _sector_core_runtime_metric_dict(prefix, diag):
 def _sector_benchmark_runtime_metric_dict(prefix, diag):
     out = _sector_runtime_metric_dict(prefix, diag)
     return out
+
+
+def _opspace_runtime_metric_dict(prefix, diag):
+    return {
+        f'{prefix}/{name}': diag[i]
+        for i, name in enumerate(OPSPACE_RUNTIME_DIAG_NAMES)
+    }
 
 
 def _v4168_block_execution_upper_bound(block_score_ub, tau, boundary_scale,
@@ -3964,6 +4235,1049 @@ def _v4168_block_sparse_blocks(op_key_local, read_local, write_local,
     block_radius = spread.max(axis=1).astype(jnp.float32)
     return (op_key_blocks, read_blocks, write_blocks, valid_blocks,
             block_center, block_radius, n_blocks)
+
+
+def _opspace_piecewise(tokens, start_tokens, mid_tokens, end_tokens,
+                       v_start, v_mid, v_end):
+    tokens = jnp.asarray(tokens, dtype=jnp.float32)
+    start_tokens = jnp.asarray(start_tokens, dtype=jnp.float32)
+    mid_tokens = jnp.maximum(
+        jnp.asarray(mid_tokens, dtype=jnp.float32), start_tokens + 1.0)
+    end_tokens = jnp.maximum(
+        jnp.asarray(end_tokens, dtype=jnp.float32), mid_tokens + 1.0)
+    first = jnp.clip(
+        (tokens - start_tokens) / (mid_tokens - start_tokens), 0.0, 1.0)
+    second = jnp.clip(
+        (tokens - mid_tokens) / (end_tokens - mid_tokens), 0.0, 1.0)
+    v_start = jnp.asarray(v_start, dtype=jnp.float32)
+    v_mid = jnp.asarray(v_mid, dtype=jnp.float32)
+    v_end = jnp.asarray(v_end, dtype=jnp.float32)
+    return jnp.where(
+        tokens <= mid_tokens,
+        v_start + (v_mid - v_start) * first,
+        v_mid + (v_end - v_mid) * second)
+
+
+def _opspace_lb_weight(tokens, peak_weight, warmup_tokens,
+                       peak_start_tokens, peak_end_tokens,
+                       decay_end_tokens, final_weight_frac):
+    tokens = jnp.asarray(tokens, dtype=jnp.float32)
+    peak_weight = jnp.asarray(peak_weight, dtype=jnp.float32)
+    warmup_tokens = jnp.asarray(warmup_tokens, dtype=jnp.float32)
+    peak_start_tokens = jnp.maximum(
+        jnp.asarray(peak_start_tokens, dtype=jnp.float32),
+        warmup_tokens + 1.0)
+    peak_end_tokens = jnp.maximum(
+        jnp.asarray(peak_end_tokens, dtype=jnp.float32),
+        peak_start_tokens + 1.0)
+    decay_end_tokens = jnp.maximum(
+        jnp.asarray(decay_end_tokens, dtype=jnp.float32),
+        peak_end_tokens + 1.0)
+    final_weight = peak_weight * jnp.asarray(
+        final_weight_frac, dtype=jnp.float32)
+    ramp = jnp.clip(
+        (tokens - warmup_tokens) / (peak_start_tokens - warmup_tokens),
+        0.0, 1.0)
+    decay = jnp.clip(
+        (tokens - peak_end_tokens) / (decay_end_tokens - peak_end_tokens),
+        0.0, 1.0)
+    rising = peak_weight * ramp
+    falling = peak_weight + (final_weight - peak_weight) * decay
+    return jnp.where(
+        tokens < warmup_tokens,
+        jnp.float32(0.0),
+        jnp.where(tokens <= peak_end_tokens, rising, falling))
+
+
+def _opspace_capped_simplex_gate(selected_scores, candidate_mask, K_budget,
+                                 T_gate):
+    candidate_mask_f = candidate_mask.astype(jnp.float32)
+    m_eff = jnp.maximum(candidate_mask_f.sum(axis=-1, keepdims=True), 1.0)
+    K_budget = jnp.clip(
+        jnp.asarray(K_budget, dtype=jnp.float32), 1.0, m_eff)
+    T_gate = jnp.maximum(jnp.asarray(T_gate, dtype=jnp.float32), 1.0e-4)
+    q = selected_scores.astype(jnp.float32) / T_gate
+    q = jnp.where(candidate_mask, q, -1.0e6)
+    lo = jnp.min(jnp.where(candidate_mask, q, 1.0e6), axis=-1, keepdims=True) - 1.0
+    hi = jnp.max(q, axis=-1, keepdims=True) + 1.0
+
+    def body(_i, state):
+        lo, hi = state
+        mid = (lo + hi) * 0.5
+        gate = jnp.clip(q - mid, 0.0, 1.0) * candidate_mask_f
+        too_much = gate.sum(axis=-1, keepdims=True) > K_budget
+        lo = jnp.where(too_much, mid, lo)
+        hi = jnp.where(too_much, hi, mid)
+        return lo, hi
+
+    lo, hi = jax.lax.fori_loop(0, 20, body, (lo, hi))
+    lam = (lo + hi) * 0.5
+    gate = jnp.clip(q - lam, 0.0, 1.0) * candidate_mask_f
+    all_one_gate = candidate_mask_f
+    return jnp.where(K_budget >= m_eff - 1.0e-5, all_one_gate, gate)
+
+
+def _opspace_balanced_slot_layout_np(n_valid, total_tiles, tile_size):
+    """Map compact valid rows into fixed tiles with invalid slots spread out."""
+    n_valid = int(n_valid)
+    total_tiles = max(1, int(total_tiles))
+    tile_size = max(1, int(tile_size))
+    total_slots = total_tiles * tile_size
+    if n_valid > total_slots:
+        raise ValueError(
+            f"operation-space layout has {n_valid} valid rows but only "
+            f"{total_slots} padded slots")
+    counts = np.full((total_tiles,), n_valid // total_tiles, dtype=np.int32)
+    counts[:n_valid % total_tiles] += 1
+    if np.any(counts > tile_size):
+        raise ValueError(
+            "operation-space balanced padding requires tile_size large enough "
+            f"for max valid count {int(counts.max())}")
+    slot_to_row = np.zeros((total_slots,), dtype=np.int32)
+    valid = np.zeros((total_slots,), dtype=np.bool_)
+    row = 0
+    for tile_i, count in enumerate(counts.tolist()):
+        start = tile_i * tile_size
+        stop = start + int(count)
+        if count > 0:
+            slot_to_row[start:stop] = np.arange(
+                row, row + int(count), dtype=np.int32)
+            valid[start:stop] = True
+        row += int(count)
+    return slot_to_row, valid, counts
+
+
+def _opspace_tile_drift_percentiles_np(keys, row_to_tile, tile_means):
+    if int(keys.shape[0]) == 0:
+        return 0.0, 0.0, 0.0
+    current_cos = np.sum(keys * tile_means[row_to_tile], axis=-1)
+    drift = (1.0 - current_cos).astype(np.float32)
+    return (
+        float(np.percentile(drift, 50)),
+        float(np.percentile(drift, 95)),
+        float(np.percentile(drift, 99)),
+    )
+
+
+def _plan_operation_space_threshold_repack(
+        op_keys, lanes, tiles_per_lane, tile_size, max_swaps_per_repack,
+        std_mult=2.0, min_assignment_gain=0.03, min_swap_gain=0.0):
+    """Plan deterministic positive-gain valid-row swaps for one pool."""
+    lanes = max(1, int(lanes))
+    tiles_per_lane = max(1, int(tiles_per_lane))
+    tile_size = max(1, int(tile_size))
+    total_tiles = lanes * tiles_per_lane
+    max_swaps_per_repack = max(0, int(max_swaps_per_repack))
+    keys = _np_unit_direction(op_keys)
+    n_valid = int(keys.shape[0])
+    perm = np.arange(n_valid, dtype=np.int32)
+    if n_valid == 0 or max_swaps_per_repack <= 0:
+        return perm, {
+            'layers_touched': 0.0,
+            'candidates': 0.0,
+            'swaps': 0.0,
+            'mean_assignment_gain': 0.0,
+            'mean_swap_gain': 0.0,
+            'max_swap_gain': 0.0,
+            'drift_p50_before': 0.0,
+            'drift_p95_before': 0.0,
+            'drift_p99_before': 0.0,
+            'drift_p95_after': 0.0,
+            'drift_p99_after': 0.0,
+            'perm_checksum': float(_hardware_perm_checksum(perm)),
+        }
+
+    slot_to_row, slot_valid, counts = _opspace_balanced_slot_layout_np(
+        n_valid, total_tiles, tile_size)
+    row_to_tile = np.zeros((n_valid,), dtype=np.int32)
+    tile_rows = []
+    for tile_i in range(total_tiles):
+        start = tile_i * tile_size
+        stop = start + tile_size
+        rows = slot_to_row[start:stop][slot_valid[start:stop]]
+        rows = np.asarray(rows, dtype=np.int32)
+        tile_rows.append(rows)
+        row_to_tile[rows] = tile_i
+
+    sums = np.zeros((total_tiles, keys.shape[-1]), dtype=np.float32)
+    for tile_i, rows in enumerate(tile_rows):
+        if rows.size:
+            sums[tile_i] = keys[rows].sum(axis=0)
+    tile_means = _np_unit_direction(sums)
+    empty = counts <= 0
+    if np.any(empty):
+        tile_means[empty] = 0.0
+
+    current_cos = np.sum(keys * tile_means[row_to_tile], axis=-1)
+    drift = (1.0 - current_cos).astype(np.float32)
+    thresholds = np.zeros((total_tiles,), dtype=np.float32)
+    for tile_i, rows in enumerate(tile_rows):
+        if rows.size:
+            d = drift[rows]
+            thresholds[tile_i] = (
+                float(np.mean(d)) + float(std_mult) * float(np.std(d)))
+        else:
+            thresholds[tile_i] = np.inf
+
+    all_cos = keys @ tile_means.T
+    best_tile = np.argmax(all_cos, axis=-1).astype(np.int32)
+    best_cos = all_cos[np.arange(n_valid), best_tile]
+    assignment_gain = (best_cos - current_cos).astype(np.float32)
+    candidate_mask = (
+        (drift > thresholds[row_to_tile])
+        & (assignment_gain > float(min_assignment_gain))
+        & (best_tile != row_to_tile))
+    candidates = np.flatnonzero(candidate_mask).astype(np.int32)
+    candidate_order = sorted(
+        candidates.tolist(),
+        key=lambda row: (-float(assignment_gain[row]), int(row),
+                         int(best_tile[row])))
+
+    proposals = []
+    for row_i in candidate_order:
+        src = int(row_to_tile[row_i])
+        dst = int(best_tile[row_i])
+        rows_b = tile_rows[dst]
+        if rows_b.size == 0:
+            continue
+        i_to_src = float(all_cos[row_i, src])
+        i_to_dst = float(all_cos[row_i, dst])
+        victim_best = None
+        victim_gain = None
+        for row_j in rows_b.tolist():
+            if int(row_j) == int(row_i):
+                continue
+            swap_gain = (
+                i_to_dst + float(all_cos[row_j, src])
+                - i_to_src - float(all_cos[row_j, dst]))
+            if swap_gain <= float(min_swap_gain):
+                continue
+            key = (float(swap_gain), -int(row_i), -int(row_j))
+            if victim_best is None or key > victim_best:
+                victim_best = key
+                victim_gain = float(swap_gain)
+                victim_row = int(row_j)
+        if victim_best is None:
+            continue
+        proposals.append((
+            -float(victim_gain),
+            -float(assignment_gain[row_i]),
+            int(row_i),
+            int(victim_row),
+            src,
+            dst,
+            float(victim_gain),
+        ))
+    proposals.sort()
+
+    used_rows = set()
+    accepted = []
+    for _neg_swap, _neg_assign, row_i, row_j, src, dst, swap_gain in proposals:
+        if row_i in used_rows or row_j in used_rows:
+            continue
+        used_rows.add(row_i)
+        used_rows.add(row_j)
+        accepted.append((row_i, row_j, src, dst, swap_gain))
+        if len(accepted) >= max_swaps_per_repack:
+            break
+
+    for row_i, row_j, _src, _dst, _swap_gain in accepted:
+        perm[row_i] = row_j
+        perm[row_j] = row_i
+    perm = _validate_hardware_permutation_np(
+        perm, n_valid, pool='operation_space')
+
+    new_keys = keys[perm]
+    new_sums = np.zeros_like(sums)
+    for tile_i, rows in enumerate(tile_rows):
+        if rows.size:
+            new_sums[tile_i] = new_keys[rows].sum(axis=0)
+    new_tile_means = _np_unit_direction(new_sums)
+    if np.any(empty):
+        new_tile_means[empty] = 0.0
+    p50_before, p95_before, p99_before = _opspace_tile_drift_percentiles_np(
+        keys, row_to_tile, tile_means)
+    _p50_after, p95_after, p99_after = _opspace_tile_drift_percentiles_np(
+        new_keys, row_to_tile, new_tile_means)
+    assignment_vals = [
+        float(assignment_gain[row_i]) for row_i, *_rest in accepted
+    ]
+    swap_vals = [float(item[-1]) for item in accepted]
+    return perm, {
+        'layers_touched': 1.0,
+        'candidates': float(int(candidates.size)),
+        'swaps': float(len(accepted)),
+        'mean_assignment_gain': (
+            float(np.mean(assignment_vals)) if assignment_vals else 0.0),
+        'mean_swap_gain': float(np.mean(swap_vals)) if swap_vals else 0.0,
+        'max_swap_gain': float(np.max(swap_vals)) if swap_vals else 0.0,
+        'drift_p50_before': p50_before,
+        'drift_p95_before': p95_before,
+        'drift_p99_before': p99_before,
+        'drift_p95_after': p95_after,
+        'drift_p99_after': p99_after,
+        'perm_checksum': float(_hardware_perm_checksum(perm)),
+    }
+
+
+def make_sharded_srw_factorized_lane_mean_minimal(
+        mesh, max_chunk_size=2048,
+        dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=1.0,
+        admission_den_grad_scale=1.0,
+        lanes=4,
+        tiles_per_lane=48,
+        padded_ops=0,
+        tile_size=64,
+        budget_start_tokens=0.0,
+        budget_mid_tokens=15000000000.0,
+        budget_end_tokens=30000000000.0,
+        K_start=3.8,
+        K_mid=3.0,
+        K_final=2.0,
+        T_gate_start=1.0,
+        T_gate_mid=0.5,
+        T_gate_final=0.18,
+        T_lb_start=1.0,
+        T_lb_mid=0.5,
+        T_lb_final=0.20,
+        lb_enabled=True,
+        lb_capacity_factor=1.35,
+        lb_device_capacity_factor=1.25,
+        lb_tile_weight_peak=0.01,
+        lb_device_weight_peak=0.003,
+        lb_warmup_tokens=3000000000.0,
+        lb_peak_start_tokens=8000000000.0,
+        lb_peak_end_tokens=22000000000.0,
+        lb_decay_end_tokens=30000000000.0,
+        lb_final_weight_frac=0.10):
+    """Create v4168 factorized lane/tile-mean SRW for V/RST pools."""
+    del max_chunk_size, dead_exposure_target
+    _tile_size = int(tile_size)
+    _tiles_per_lane = max(1, int(tiles_per_lane))
+    _lanes = max(1, int(lanes))
+    _padded_ops = max(0, int(padded_ops))
+    _max_exec_lanes = max(
+        1, min(_lanes, int(math.ceil(max(K_start, K_mid, K_final)))))
+    _soft_gate_effective_active_eps = jnp.float32(
+        soft_gate_effective_active_eps)
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+    _admission_den_grad_scale = jnp.clip(
+        jnp.asarray(admission_den_grad_scale, dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0))
+    try:
+        _model_axis_size = int(mesh.shape.get('model', 1))
+    except AttributeError:
+        _model_axis_size = int(dict(getattr(mesh, 'shape', {})).get('model', 1))
+    _model_axis_size = max(1, _model_axis_size)
+    _configured_local_padded_ops = (
+        _padded_ops // _model_axis_size if _padded_ops > 0 else 0)
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('model', None),
+                       P(), P(), P(), P(), P(), P()),
+             out_specs=(P('data', None, None), P(), P()),
+             check_rep=False)
+    def fused_gate_srw_factorized_lane_mean_minimal(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, training_tokens):
+        del soft_gate_temperature, soft_gate_t_final
+        del soft_gate_boundary_power_final
+        B, S, D = x.shape
+        N_local = int(op_key_local.shape[0])
+        min_local_padded_ops = (
+            (N_local + _tile_size - 1) // _tile_size) * _tile_size
+        local_padded_ops = max(
+            _configured_local_padded_ops, min_local_padded_ops)
+        local_padded_ops = (
+            (local_padded_ops + _tile_size - 1) // _tile_size) * _tile_size
+        local_tile_count = max(1, local_padded_ops // _tile_size)
+        local_lanes = max(
+            1, local_tile_count // _tiles_per_lane)
+        local_tile_count = local_lanes * _tiles_per_lane
+        local_padded_ops = local_tile_count * _tile_size
+        global_lanes = local_lanes * _model_axis_size
+        max_exec = min(_max_exec_lanes, global_lanes)
+        pad_n = local_padded_ops - N_local
+        model_axis_index = jax.lax.axis_index('model')
+
+        training_tokens = jnp.asarray(training_tokens, dtype=jnp.float32)
+        K_budget = _opspace_piecewise(
+            training_tokens, budget_start_tokens, budget_mid_tokens,
+            budget_end_tokens, K_start, K_mid, K_final)
+        T_gate = _opspace_piecewise(
+            training_tokens, budget_start_tokens, budget_mid_tokens,
+            budget_end_tokens, T_gate_start, T_gate_mid, T_gate_final)
+        T_lb = _opspace_piecewise(
+            training_tokens, budget_start_tokens, budget_mid_tokens,
+            budget_end_tokens, T_lb_start, T_lb_mid, T_lb_final)
+        tile_weight = _opspace_lb_weight(
+            training_tokens, lb_tile_weight_peak, lb_warmup_tokens,
+            lb_peak_start_tokens, lb_peak_end_tokens, lb_decay_end_tokens,
+            lb_final_weight_frac)
+        device_weight = _opspace_lb_weight(
+            training_tokens, lb_device_weight_peak, lb_warmup_tokens,
+            lb_peak_start_tokens, lb_peak_end_tokens, lb_decay_end_tokens,
+            lb_final_weight_frac)
+        if not lb_enabled:
+            tile_weight = jnp.float32(0.0)
+            device_weight = jnp.float32(0.0)
+
+        op_key_padded = jnp.pad(op_key_local, ((0, pad_n), (0, 0)))
+        read_padded = jnp.pad(read_local, ((0, pad_n), (0, 0)))
+        write_padded = jnp.pad(write_local, ((0, pad_n), (0, 0)))
+        valid_padded = jnp.arange(local_padded_ops) < N_local
+
+        op_key_dir = _forward_unit_direction(
+            op_key_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        read_dir = _forward_unit_direction(
+            read_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        write_dir = _forward_unit_direction(
+            write_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+
+        key_tiles = op_key_dir.reshape(
+            local_lanes, _tiles_per_lane, _tile_size, op_key_dir.shape[-1])
+        read_tiles = read_dir.reshape(
+            local_lanes, _tiles_per_lane, _tile_size, read_dir.shape[-1])
+        write_tiles = write_dir.reshape(
+            local_lanes, _tiles_per_lane, _tile_size, write_dir.shape[-1])
+        valid_tiles = valid_padded.reshape(
+            local_lanes, _tiles_per_lane, _tile_size)
+
+        valid_f = valid_tiles.astype(jnp.float32)[..., None]
+        tile_count = jnp.maximum(valid_f.sum(axis=2), 1.0)
+        tile_mean_raw = (
+            key_tiles.astype(jnp.float32) * valid_f).sum(axis=2) / tile_count
+        tile_mean = jax.lax.stop_gradient(
+            _forward_unit_direction(tile_mean_raw)).astype(jnp.bfloat16)
+
+        h_unit = _forward_unit_direction(
+            h.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        x_bf = x.astype(jnp.bfloat16)
+        scores_local = jnp.einsum(
+            'bsd,ltd->bslt', h_unit, tile_mean).astype(jnp.float32)
+        best_score_local = scores_local.max(axis=-1)
+        best_tile_local = jnp.argmax(scores_local, axis=-1).astype(jnp.int32)
+        global_best_score = jax.lax.all_gather(
+            best_score_local, 'model', axis=2, tiled=True)
+        global_best_tile = jax.lax.all_gather(
+            best_tile_local, 'model', axis=2, tiled=True)
+        selected_scores, selected_global_lanes = jax.lax.top_k(
+            global_best_score, max_exec)
+        selected_tile = jnp.take_along_axis(
+            global_best_tile, selected_global_lanes, axis=2)
+
+        M_exec = jnp.clip(
+            jnp.ceil(K_budget).astype(jnp.int32), 1, max_exec)
+        candidate_mask = (
+            jnp.arange(max_exec, dtype=jnp.int32)[None, None, :] < M_exec)
+        tile_gate = _opspace_capped_simplex_gate(
+            selected_scores, candidate_mask, K_budget, T_gate)
+
+        owner = selected_global_lanes // local_lanes
+        selected_here = owner == model_axis_index
+        local_lane = selected_global_lanes - model_axis_index * local_lanes
+        safe_lane = jnp.clip(local_lane, 0, local_lanes - 1)
+        flat_tile_id = safe_lane * _tiles_per_lane + selected_tile
+        flat_key_tiles = key_tiles.reshape(
+            local_tile_count, _tile_size, key_tiles.shape[-1])
+        flat_read_tiles = read_tiles.reshape(
+            local_tile_count, _tile_size, read_tiles.shape[-1])
+        flat_write_tiles = write_tiles.reshape(
+            local_tile_count, _tile_size, write_tiles.shape[-1])
+        flat_valid_tiles = valid_tiles.reshape(local_tile_count, _tile_size)
+
+        selected_key = flat_key_tiles[flat_tile_id]
+        selected_read = flat_read_tiles[flat_tile_id]
+        selected_write = flat_write_tiles[flat_tile_id]
+        selected_valid = flat_valid_tiles[flat_tile_id]
+        selected_valid = jnp.logical_and(
+            selected_valid,
+            jnp.logical_and(selected_here, candidate_mask)[..., None])
+        selected_gate = tile_gate * selected_here.astype(jnp.float32)
+
+        tau = _tau_from_param(raw_tau).astype(jnp.float32)
+        rho = jnp.einsum(
+            'bsd,bsmtd->bsmt', h_unit, selected_key).astype(jnp.float32)
+        rho_compute = jnp.where(selected_valid, rho, tau[:, :, None, :])
+        _, admission, _drive, execution_weight, _ = _compute_admission_drive(
+            rho_compute, tau[:, :, None, :], soft_gate_boundary_power,
+            boundary_power=soft_gate_boundary_power,
+            effective_active_eps=_soft_gate_effective_active_eps,
+            execution_prune_eps=execution_prune_eps)
+        selected_gate_b = selected_gate[..., None]
+        admission = jnp.where(
+            selected_valid, admission * selected_gate_b, 0.0)
+        execution_weight = jnp.where(
+            selected_valid, execution_weight * selected_gate_b, 0.0)
+
+        xr = jnp.einsum(
+            'bsd,bsmtd->bsmt', x_bf, selected_read).astype(jnp.float32)
+        weighted = execution_weight * xr
+        raw_out = jnp.einsum(
+            'bsmt,bsmtd->bsd',
+            weighted.astype(jnp.bfloat16),
+            selected_write).astype(jnp.float32)
+        total_den_cost = admission.sum(axis=(2, 3), keepdims=False)[..., None]
+        global_raw_out = jax.lax.psum(raw_out, 'model')
+        global_den_cost = jax.lax.psum(total_den_cost, 'model')
+        admission_den_base = jnp.maximum(global_den_cost, 1.0)
+        admission_den_forward = jnp.power(
+            admission_den_base, _admission_den_power)
+        admission_den_sg = jax.lax.stop_gradient(admission_den_forward)
+        admission_den = (
+            admission_den_sg
+            + _admission_den_grad_scale
+            * (admission_den_forward - admission_den_sg))
+        out = global_raw_out / admission_den
+
+        T_lb_safe = jnp.maximum(T_lb, jnp.float32(1.0e-4))
+        p_tile_local = jax.nn.softmax(scores_local / T_lb_safe, axis=-1)
+        lane_score_local = (
+            T_lb_safe
+            * jax.nn.logsumexp(scores_local / T_lb_safe, axis=-1))
+        lane_score_global = jax.lax.all_gather(
+            lane_score_local, 'model', axis=2, tiled=True)
+        p_lane_global = jax.nn.softmax(lane_score_global / T_lb_safe, axis=-1)
+        p_lane_local = jax.lax.dynamic_slice_in_dim(
+            p_lane_global, model_axis_index * local_lanes,
+            local_lanes, axis=2)
+        tile_load_local = (
+            K_budget
+            * p_lane_local[..., None]
+            * p_tile_local).sum(axis=(0, 1))
+        tile_load_local = jax.lax.psum(tile_load_local, 'data')
+        tile_load_global = jax.lax.all_gather(
+            tile_load_local.reshape(-1), 'model', axis=0, tiled=True)
+        total_tokens = jax.lax.psum(
+            jnp.asarray(B * S, dtype=jnp.float32), 'data')
+        avg_tile_load = (
+            total_tokens * K_budget
+            / jnp.maximum(jnp.asarray(tile_load_global.size, dtype=jnp.float32), 1.0))
+        tile_capacity = avg_tile_load * jnp.asarray(
+            lb_capacity_factor, dtype=jnp.float32)
+        tile_over = jax.nn.relu(
+            tile_load_global / jnp.maximum(tile_capacity, 1.0e-6) - 1.0)
+        lb_tile = (tile_over * tile_over).mean()
+
+        device_load = tile_load_global.reshape(_model_axis_size, -1).sum(axis=1)
+        avg_device_load = device_load.mean()
+        device_capacity = avg_device_load * jnp.asarray(
+            lb_device_capacity_factor, dtype=jnp.float32)
+        device_over = jax.nn.relu(
+            device_load / jnp.maximum(device_capacity, 1.0e-6) - 1.0)
+        lb_device = (device_over * device_over).mean()
+        lb_total = tile_weight * lb_tile + device_weight * lb_device
+
+        def mesh_mean(v):
+            return jax.lax.pmean(jax.lax.pmean(v, 'data'), 'model')
+
+        def mesh_sum(v):
+            return jax.lax.psum(jax.lax.psum(v, 'data'), 'model')
+
+        selected_mask_f = candidate_mask.astype(jnp.float32)
+        gate_sum = tile_gate.sum(axis=-1)
+        gate_tail = jnp.min(
+            jnp.where(candidate_mask, tile_gate, 1.0), axis=-1)
+        gate_sum_error = jnp.abs(gate_sum - jnp.minimum(K_budget, M_exec))
+        active_ops_local = (
+            admission >= _soft_gate_effective_active_eps).astype(
+                jnp.float32).sum(axis=(2, 3))
+        effective_ops_local = (
+            selected_gate_b
+            * selected_valid.astype(jnp.float32)).sum(axis=(2, 3))
+        active_ops = jax.lax.psum(active_ops_local, 'model')
+        effective_ops = jax.lax.psum(effective_ops_local, 'model')
+        invalid_exec = jnp.where(
+            selected_valid, 0.0, jnp.abs(execution_weight)).sum()
+        invalid_exec = mesh_sum(invalid_exec)
+
+        lane_ids = jnp.arange(global_lanes, dtype=jnp.int32)
+        lane_hist = (
+            (selected_global_lanes[..., None] == lane_ids)
+            .astype(jnp.float32)
+            * selected_mask_f[..., None]).sum(axis=(0, 1, 2))
+        lane_hist = jax.lax.psum(lane_hist, 'data')
+        lane_total = jnp.maximum(lane_hist.sum(), 1.0)
+        lane_prob = lane_hist / lane_total
+        lane_entropy = -jnp.sum(jnp.where(
+            lane_prob > 0.0, lane_prob * jnp.log(lane_prob + 1.0e-8), 0.0))
+        lane_top1_frac = lane_prob.max()
+
+        sorted_tile_load = jnp.sort(tile_load_global)
+        sorted_device_load = jnp.sort(device_load)
+        tile_load_mean = jnp.maximum(tile_load_global.mean(), 1.0e-6)
+        device_load_mean = jnp.maximum(device_load.mean(), 1.0e-6)
+        tile_load_p95 = _v4168_percentile_from_sorted(sorted_tile_load, 95)
+        tile_load_p99 = _v4168_percentile_from_sorted(sorted_tile_load, 99)
+        device_load_p99 = _v4168_percentile_from_sorted(sorted_device_load, 99)
+
+        no_nan_gate = jax.lax.pmin(
+            jax.lax.pmin(
+                jnp.all(jnp.isfinite(tile_gate)).astype(jnp.float32), 'data'),
+            'model')
+        no_nan_load = jax.lax.pmin(
+            jax.lax.pmin(
+                jnp.all(jnp.isfinite(tile_load_global)).astype(jnp.float32),
+                'data'),
+            'model')
+        selected_count_ok = (
+            jnp.abs(selected_mask_f.sum(axis=-1).mean()
+                    - M_exec.astype(jnp.float32)) < 1.0e-5).astype(jnp.float32)
+        layout_ok = jnp.asarray(
+            1.0 if (
+                local_padded_ops == local_lanes * _tiles_per_lane * _tile_size
+                and local_tile_count > 0) else 0.0,
+            dtype=jnp.float32)
+
+        diag = jnp.asarray((
+            jnp.float32(1.0),
+            K_budget,
+            M_exec.astype(jnp.float32),
+            T_gate,
+            T_lb,
+            tile_weight * lb_tile,
+            device_weight * lb_device,
+            lb_total,
+            M_exec.astype(jnp.float32),
+            mesh_mean(gate_sum.mean()),
+            mesh_mean(tile_gate.max(axis=-1).mean()),
+            mesh_mean(gate_tail.mean()),
+            tile_load_p95,
+            tile_load_p99,
+            tile_load_global.max() / tile_load_mean,
+            device_load_p99 / device_load_mean,
+            lane_entropy,
+            lane_top1_frac,
+            mesh_mean(gate_sum_error.mean()),
+            no_nan_gate,
+            no_nan_load,
+            (invalid_exec <= 1.0e-8).astype(jnp.float32),
+            selected_count_ok,
+            layout_ok,
+            mesh_mean(active_ops.mean()),
+            mesh_mean(effective_ops.mean()),
+        ), dtype=jnp.float32)
+        return out.astype(jnp.float32), diag, lb_total.astype(jnp.float32)
+
+    fused_gate_srw_factorized_lane_mean_minimal._v4168_accepts_training_tokens = True
+    return fused_gate_srw_factorized_lane_mean_minimal
+
+
+def make_sharded_srw_fixed_k4_repack_minimal(
+        mesh, max_chunk_size=2048,
+        dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=1.0,
+        admission_den_grad_scale=1.0,
+        lanes=4,
+        tiles_per_lane=48,
+        padded_ops=0,
+        tile_size=64,
+        k_exec=4,
+        token_chunk_size=256):
+    """Create final v4168 operation-space fixed-K owner/tile-major SRW."""
+    del max_chunk_size, dead_exposure_target, padded_ops
+    _tile_size = int(tile_size)
+    _tiles_per_lane = max(1, int(tiles_per_lane))
+    _lanes = max(1, int(lanes))
+    _k_exec = max(1, min(int(k_exec), _lanes))
+    _token_chunk_size = max(1, int(token_chunk_size))
+    _global_tile_count = _lanes * _tiles_per_lane
+    _soft_gate_effective_active_eps = jnp.float32(
+        soft_gate_effective_active_eps)
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+    _admission_den_grad_scale = jnp.clip(
+        jnp.asarray(admission_den_grad_scale, dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0))
+    try:
+        _model_axis_size = int(mesh.shape.get('model', 1))
+    except AttributeError:
+        _model_axis_size = int(dict(getattr(mesh, 'shape', {})).get('model', 1))
+    _model_axis_size = max(1, _model_axis_size)
+    if _global_tile_count % _model_axis_size != 0:
+        raise ValueError(
+            "fixed_k4_repack_v1 requires total logical tiles divisible by "
+            f"model axis size; got tiles={_global_tile_count}, "
+            f"model_axis={_model_axis_size}")
+    _local_tile_count = _global_tile_count // _model_axis_size
+    _local_padded_ops = _local_tile_count * _tile_size
+    _visible_slots = _k_exec * _tile_size
+
+    gather_owner_np = np.repeat(
+        np.arange(_model_axis_size, dtype=np.int32), _local_tile_count)
+    gather_local_tile_np = np.tile(
+        np.arange(_local_tile_count, dtype=np.int32), _model_axis_size)
+    gather_global_tile_np = (
+        gather_owner_np + _model_axis_size * gather_local_tile_np)
+    gather_lane_np = gather_global_tile_np // _tiles_per_lane
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('model', None),
+                       P(), P(), P(), P(), P(), P()),
+             out_specs=(P('data', None, None), P(), P()),
+             check_rep=False)
+    def fused_gate_srw_fixed_k4_repack_minimal(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, training_tokens):
+        del soft_gate_t_final, soft_gate_boundary_power_final, training_tokens
+        B, S, D = x.shape
+        N_local = int(op_key_local.shape[0])
+        if N_local > _local_padded_ops:
+            raise ValueError(
+                "operation-space local valid rows exceed fixed local tile "
+                f"slots: rows={N_local}, slots={_local_padded_ops}")
+        (slot_to_row_np, valid_slot_np, valid_counts_np) = (
+            _opspace_balanced_slot_layout_np(
+                N_local, _local_tile_count, _tile_size))
+        slot_to_row = jnp.asarray(slot_to_row_np, dtype=jnp.int32)
+        valid_slot = jnp.asarray(valid_slot_np, dtype=jnp.bool_)
+        valid_counts_local = jnp.asarray(valid_counts_np, dtype=jnp.float32)
+        model_axis_index = jax.lax.axis_index('model')
+
+        op_key_padded = op_key_local[slot_to_row]
+        read_padded = read_local[slot_to_row]
+        write_padded = write_local[slot_to_row]
+        zero_key = jnp.zeros_like(op_key_padded)
+        zero_read = jnp.zeros_like(read_padded)
+        zero_write = jnp.zeros_like(write_padded)
+        op_key_padded = jnp.where(valid_slot[:, None], op_key_padded, zero_key)
+        read_padded = jnp.where(valid_slot[:, None], read_padded, zero_read)
+        write_padded = jnp.where(valid_slot[:, None], write_padded, zero_write)
+
+        op_key_dir = _forward_unit_direction(
+            op_key_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        read_dir = _forward_unit_direction(
+            read_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        write_dir = _forward_unit_direction(
+            write_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+
+        key_tiles = op_key_dir.reshape(
+            _local_tile_count, _tile_size, op_key_dir.shape[-1])
+        read_tiles = read_dir.reshape(
+            _local_tile_count, _tile_size, read_dir.shape[-1])
+        write_tiles = write_dir.reshape(
+            _local_tile_count, _tile_size, write_dir.shape[-1])
+        valid_tiles = valid_slot.reshape(_local_tile_count, _tile_size)
+
+        valid_f = valid_tiles.astype(jnp.float32)[..., None]
+        tile_count = jnp.maximum(valid_f.sum(axis=1), 1.0)
+        tile_mean_raw = (
+            key_tiles.astype(jnp.float32) * valid_f).sum(axis=1) / tile_count
+        tile_mean_local = jax.lax.stop_gradient(
+            _forward_unit_direction(tile_mean_raw)).astype(jnp.bfloat16)
+        tile_mean_all = jax.lax.all_gather(
+            tile_mean_local, 'model', axis=0, tiled=True)
+        valid_counts_all = jax.lax.all_gather(
+            valid_counts_local, 'model', axis=0, tiled=True)
+
+        gather_global_tile = jnp.asarray(
+            gather_global_tile_np, dtype=jnp.int32)
+        gather_owner = jnp.asarray(gather_owner_np, dtype=jnp.int32)
+        gather_local_tile = jnp.asarray(
+            gather_local_tile_np, dtype=jnp.int32)
+        gather_lane = jnp.asarray(gather_lane_np, dtype=jnp.int32)
+
+        T = int(B) * int(S)
+        h_unit = _forward_unit_direction(
+            h.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        flat_h = h_unit.reshape(T, h_unit.shape[-1])
+        flat_x = x.reshape(T, D).astype(jnp.bfloat16)
+        tau = _tau_from_param(raw_tau).astype(jnp.float32)
+        flat_tau = tau.reshape(T, 1)
+
+        scores_all = (flat_h @ tile_mean_all.T).astype(jnp.float32)
+        lane_ids = jnp.arange(_lanes, dtype=jnp.int32)
+        lane_scores = jnp.where(
+            gather_lane[None, None, :] == lane_ids[None, :, None],
+            scores_all[:, None, :],
+            jnp.float32(-1.0e6))
+        best_gather_by_lane = jnp.argmax(lane_scores, axis=-1).astype(jnp.int32)
+        best_score_by_lane = jnp.take_along_axis(
+            scores_all[:, None, :], best_gather_by_lane[:, :, None],
+            axis=-1)[..., 0]
+        if _k_exec >= _lanes:
+            selected_lanes = jnp.broadcast_to(
+                lane_ids[None, :], (T, _lanes))
+            selected_gather = best_gather_by_lane
+        else:
+            _selected_lane_score, selected_lanes = jax.lax.top_k(
+                best_score_by_lane, _k_exec)
+            selected_gather = jnp.take_along_axis(
+                best_gather_by_lane, selected_lanes, axis=1)
+        selected_global_tile = gather_global_tile[selected_gather]
+        selected_owner = gather_owner[selected_gather]
+        selected_local_tile = gather_local_tile[selected_gather]
+        selected_valid_counts = valid_counts_all[selected_gather]
+        request_count = T * _k_exec
+        padded_request_count = (
+            ((request_count + _token_chunk_size - 1)
+             // _token_chunk_size)
+            * _token_chunk_size)
+        max_request_chunks = max(
+            1, padded_request_count // _token_chunk_size)
+        request_token = jnp.repeat(
+            jnp.arange(T, dtype=jnp.int32), _k_exec)
+        request_local_tile = selected_local_tile.reshape(request_count)
+        request_owner = selected_owner.reshape(request_count)
+        request_valid_counts = selected_valid_counts.reshape(request_count)
+        request_here = request_owner == model_axis_index
+        request_ids = jnp.arange(request_count, dtype=jnp.int32)
+        request_sort_key = (
+            jnp.where(request_here, request_local_tile, _local_tile_count)
+            * jnp.asarray(request_count, dtype=jnp.int32)
+            + request_ids)
+        sorted_request_ids = jnp.argsort(request_sort_key)
+
+        def angular_compose_parts(rho, tau_b, valid_mask):
+            _, admission, _drive, execution_weight, _ = _compute_admission_drive(
+                rho, tau_b, soft_gate_temperature,
+                boundary_power=soft_gate_boundary_power,
+                effective_active_eps=_soft_gate_effective_active_eps,
+                execution_prune_eps=execution_prune_eps)
+            admission = jnp.where(valid_mask, admission, 0.0)
+            execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
+            return admission, execution_weight
+
+        @jax.checkpoint
+        def request_chunk_step(carry, chunk_i):
+            (flat_raw_out, flat_den_cost, flat_active_visible,
+             flat_execution_mass, processed_count, valid_visible_sum,
+             padded_exec_mass, finite_acc) = carry
+            start = chunk_i * _token_chunk_size
+            offsets = start + jnp.arange(
+                _token_chunk_size, dtype=jnp.int32)
+            valid_offsets = offsets < request_count
+            safe_offsets = jnp.minimum(offsets, request_count - 1)
+            req_ids = sorted_request_ids[safe_offsets]
+            valid_req = jnp.logical_and(valid_offsets, request_here[req_ids])
+
+            token_ids = request_token[req_ids]
+            x_b = flat_x[token_ids]
+            h_b = flat_h[token_ids]
+            tau_b = flat_tau[token_ids]
+            local_tile_b = request_local_tile[req_ids]
+            selected_key = key_tiles[local_tile_b]
+            selected_read = read_tiles[local_tile_b]
+            selected_write = write_tiles[local_tile_b]
+            selected_valid = jnp.logical_and(
+                valid_tiles[local_tile_b],
+                valid_req[:, None])
+
+            rho_raw = jnp.einsum(
+                'cd,cnd->cn', h_b, selected_key).astype(jnp.float32)
+            rho_compute = jnp.where(
+                selected_valid, rho_raw, tau_b)
+            admission, execution_weight = angular_compose_parts(
+                rho_compute, tau_b, selected_valid)
+            xr = jnp.einsum(
+                'cd,cnd->cn', x_b, selected_read).astype(jnp.float32)
+            weighted = execution_weight * xr
+            raw_out = jnp.einsum(
+                'cn,cnd->cd',
+                weighted.astype(jnp.bfloat16),
+                selected_write).astype(jnp.float32)
+            den_cost = admission.sum(axis=1, keepdims=True)
+            active_visible = (
+                admission >= _soft_gate_effective_active_eps).astype(
+                    jnp.float32).sum(axis=1)
+            execution_mass = jnp.abs(execution_weight).sum(axis=1)
+            invalid_exec_mass = jnp.where(
+                selected_valid, 0.0, jnp.abs(execution_weight)).sum()
+            valid_req_f = valid_req.astype(jnp.float32)
+            raw_out = raw_out * valid_req_f[:, None]
+            den_cost = den_cost * valid_req_f[:, None]
+            active_visible = active_visible * valid_req_f
+            execution_mass = execution_mass * valid_req_f
+
+            flat_raw_out = flat_raw_out.at[token_ids].add(raw_out, mode='drop')
+            flat_den_cost = flat_den_cost.at[token_ids].add(
+                den_cost, mode='drop')
+            flat_active_visible = flat_active_visible.at[token_ids].add(
+                active_visible, mode='drop')
+            flat_execution_mass = flat_execution_mass.at[token_ids].add(
+                execution_mass, mode='drop')
+            processed_count = processed_count + valid_req_f.sum()
+            valid_visible_sum = (
+                valid_visible_sum
+                + (request_valid_counts[req_ids] * valid_req_f).sum())
+            padded_exec_mass = padded_exec_mass + invalid_exec_mass
+            finite = jnp.logical_and(
+                jnp.all(jnp.isfinite(admission)),
+                jnp.all(jnp.isfinite(raw_out)))
+            finite_acc = jnp.minimum(finite_acc, finite.astype(jnp.float32))
+            return (
+                flat_raw_out, flat_den_cost, flat_active_visible,
+                flat_execution_mass, processed_count, valid_visible_sum,
+                padded_exec_mass, finite_acc), None
+
+        init_carry = (
+            jnp.zeros((T, D), dtype=jnp.float32),
+            jnp.zeros((T, 1), dtype=jnp.float32),
+            jnp.zeros((T,), dtype=jnp.float32),
+            jnp.zeros((T,), dtype=jnp.float32),
+            jnp.float32(0.0),
+            jnp.float32(0.0),
+            jnp.float32(0.0),
+            jnp.float32(1.0),
+        )
+        (flat_raw_out_local, flat_den_cost_local, flat_active_visible_local,
+         flat_execution_mass_local, processed_count_local,
+         valid_visible_sum_local, padded_exec_mass_local,
+         chunk_no_nan) = jax.lax.scan(
+            request_chunk_step,
+            init_carry,
+            jnp.arange(max_request_chunks, dtype=jnp.int32))[0]
+        global_raw_out = jax.lax.psum(flat_raw_out_local, 'model')
+        global_den_cost = jax.lax.psum(flat_den_cost_local, 'model')
+        global_active_visible = jax.lax.psum(
+            flat_active_visible_local, 'model')
+        global_execution_mass = jax.lax.psum(
+            flat_execution_mass_local, 'model')
+        global_processed_count = jax.lax.psum(processed_count_local, 'model')
+        global_valid_visible_sum = jax.lax.psum(
+            valid_visible_sum_local, 'model')
+        global_padded_exec_mass = jax.lax.psum(
+            padded_exec_mass_local, 'model')
+        admission_den_base = jnp.maximum(global_den_cost, 1.0)
+        admission_den_forward = jnp.power(
+            admission_den_base, _admission_den_power)
+        admission_den_sg = jax.lax.stop_gradient(admission_den_forward)
+        admission_den = (
+            admission_den_sg
+            + _admission_den_grad_scale
+            * (admission_den_forward - admission_den_sg))
+        flat_out = global_raw_out / admission_den
+        out = flat_out.reshape(B, S, D)
+
+        def mesh_mean(v):
+            return jax.lax.pmean(jax.lax.pmean(v, 'data'), 'model')
+
+        def data_sum(v):
+            return jax.lax.pmean(jax.lax.psum(v, 'data'), 'model')
+
+        token_count = data_sum(jnp.asarray(T, dtype=jnp.float32))
+        token_count = jnp.maximum(token_count, 1.0)
+        score_sorted = jnp.sort(scores_all.reshape(-1))
+        tile_score_p50 = mesh_mean(
+            _v4168_percentile_from_sorted(score_sorted, 50))
+        tile_score_p95 = mesh_mean(
+            _v4168_percentile_from_sorted(score_sorted, 95))
+
+        tile_ids = jnp.arange(_global_tile_count, dtype=jnp.int32)
+        tile_hist = (
+            selected_global_tile[:, :, None] == tile_ids[None, None, :]
+        ).astype(jnp.float32).sum(axis=(0, 1))
+        tile_hist = jax.lax.pmean(jax.lax.psum(tile_hist, 'data'), 'model')
+        tile_hist_sorted = jnp.sort(tile_hist)
+        tile_mean = jnp.maximum(tile_hist.mean(), 1.0e-6)
+        selected_tile_top1_frac = tile_hist.max() / jnp.maximum(
+            tile_hist.sum(), 1.0)
+        selected_tile_p99 = _v4168_percentile_from_sorted(
+            tile_hist_sorted, 99)
+        selected_tile_p99_over_mean = selected_tile_p99 / tile_mean
+
+        owner_ids = jnp.arange(_model_axis_size, dtype=jnp.int32)
+        tile_owner = tile_ids % jnp.asarray(_model_axis_size, dtype=jnp.int32)
+        owner_load = (
+            (tile_owner[:, None] == owner_ids[None, :]).astype(jnp.float32)
+            * tile_hist[:, None]).sum(axis=0)
+        owner_load_sorted = jnp.sort(owner_load)
+        owner_load_mean = jnp.maximum(owner_load.mean(), 1.0e-6)
+        owner_load_p99_over_mean = (
+            _v4168_percentile_from_sorted(owner_load_sorted, 99)
+            / owner_load_mean)
+
+        lane_hist = (
+            selected_lanes[:, :, None] == lane_ids[None, None, :]
+        ).astype(jnp.float32).sum(axis=(0, 1))
+        lane_hist = jax.lax.pmean(jax.lax.psum(lane_hist, 'data'), 'model')
+        selected_lane_top1_frac = lane_hist.max() / jnp.maximum(
+            lane_hist.sum(), 1.0)
+
+        valid_visible_mean = data_sum(global_valid_visible_sum) / token_count
+        active_visible_mean = data_sum(
+            global_active_visible.sum()) / token_count
+        admission_den_mean = data_sum(admission_den[:, 0].sum()) / token_count
+        execution_mass_mean = data_sum(
+            global_execution_mass.sum()) / token_count
+        padded_execution_mass = data_sum(global_padded_exec_mass)
+        processed_request_count = data_sum(global_processed_count)
+        selected_request_count = token_count * jnp.float32(_k_exec)
+        all_requests_processed = (
+            processed_request_count >= selected_request_count - 0.5
+        ).astype(jnp.float32)
+        chunk_no_nan = jax.lax.pmin(jax.lax.pmin(chunk_no_nan, 'data'), 'model')
+        score_no_nan = jnp.all(jnp.isfinite(scores_all)).astype(jnp.float32)
+        score_no_nan = jax.lax.pmin(
+            jax.lax.pmin(score_no_nan, 'data'), 'model')
+        no_nan = jnp.minimum(score_no_nan, chunk_no_nan)
+        padded_selected_count = (
+            jnp.float32(_visible_slots) - valid_visible_mean)
+        layout_ok = jnp.asarray(
+            1.0 if _local_padded_ops == _local_tile_count * _tile_size
+            else 0.0,
+            dtype=jnp.float32)
+
+        diag = jnp.asarray((
+            jnp.float32(1.0),
+            jnp.float32(_k_exec),
+            jnp.float32(_visible_slots),
+            valid_visible_mean,
+            tile_score_p50,
+            tile_score_p95,
+            selected_lane_top1_frac,
+            selected_tile_top1_frac,
+            selected_tile_p99_over_mean,
+            owner_load_p99_over_mean,
+            active_visible_mean,
+            admission_den_mean,
+            execution_mass_mean,
+            active_visible_mean,
+            padded_selected_count,
+            padded_execution_mass,
+            no_nan,
+            jnp.float32(1.0),
+            selected_request_count,
+            processed_request_count,
+            all_requests_processed,
+            layout_ok,
+        ), dtype=jnp.float32)
+        return out.astype(jnp.float32), diag, jnp.float32(0.0)
+
+    fused_gate_srw_fixed_k4_repack_minimal._v4168_accepts_training_tokens = True
+    return fused_gate_srw_fixed_k4_repack_minimal
+
+
+make_sharded_srw_factorized_lane_mean_minimal = (
+    make_sharded_srw_fixed_k4_repack_minimal)
 
 
 def make_sharded_srw_block_sparse_minimal(
@@ -4880,7 +6194,8 @@ def make_sharded_srw_sector_bucketed_minimal(
         else:
             bucket_capacity = max(1, int(_debug_bucket_capacity_override))
         (sector_token_ids, sector_bucket_valid, overflow_count,
-         _bucket_max_fill, _bucket_mean_fill) = _v4168_build_sector_buckets(
+         _bucket_max_fill, _bucket_mean_fill,
+         attempted_fill) = _v4168_build_sector_buckets(
             local_sector_ids, selected_here, T, topk, n_local_sectors,
             bucket_capacity)
         global_overflow_count = jax.lax.psum(overflow_count, 'model')
@@ -4896,7 +6211,8 @@ def make_sharded_srw_sector_bucketed_minimal(
             valid_blocks.astype(jnp.float32).sum(), 'model')
         if _benchmark_runtime_metrics:
             sector_diag = _v4168_sector_benchmark_runtime_diag(
-                bucket_fill, global_overflow_count, bucket_capacity,
+                bucket_fill, attempted_fill, global_overflow_count,
+                bucket_capacity,
                 T, topk, global_n_sectors, _sector_size,
                 selected_sector_count, selected_real_ops, total_real_ops)
         else:
@@ -5124,7 +6440,8 @@ def make_sharded_srw_paired_sector_bucketed_minimal(
         else:
             bucket_capacity = max(1, int(_debug_bucket_capacity_override))
         (sector_pair_ids, sector_bucket_valid, overflow_count,
-         _bucket_max_fill, _bucket_mean_fill) = _v4168_build_sector_buckets(
+         _bucket_max_fill, _bucket_mean_fill,
+         attempted_fill) = _v4168_build_sector_buckets(
             local_sector_ids, selected_here, pair_span, topk, n_local_sectors,
             bucket_capacity)
         global_overflow_count = jax.lax.psum(overflow_count, 'model')
@@ -5140,7 +6457,8 @@ def make_sharded_srw_paired_sector_bucketed_minimal(
             valid_blocks.astype(jnp.float32).sum(), 'model')
         if _benchmark_runtime_metrics:
             sector_diag = _v4168_sector_benchmark_runtime_diag(
-                bucket_fill, global_overflow_count, bucket_capacity,
+                bucket_fill, attempted_fill, global_overflow_count,
+                bucket_capacity,
                 pair_span, topk, global_n_sectors, _sector_size,
                 selected_sector_count, selected_real_ops, total_real_ops)
         else:
@@ -5291,7 +6609,51 @@ def make_sharded_srw_minimal(
         block_margin=0.0,
         hardware_sector_execution_enabled=False,
         hardware_sector_debug_token_gather_fallback=False,
-        benchmark_runtime_metrics=False):
+        benchmark_runtime_metrics=False,
+        operation_space_mode='block_sparse',
+        opspace_lanes=4,
+        opspace_tiles_per_lane=48,
+        opspace_padded_ops=0,
+        opspace_tile_size=64,
+        opspace_budget_start_tokens=0.0,
+        opspace_budget_mid_tokens=15000000000.0,
+        opspace_budget_end_tokens=30000000000.0,
+        opspace_K_start=3.8,
+        opspace_K_mid=3.0,
+        opspace_K_final=2.0,
+        opspace_k_exec=4,
+        opspace_token_chunk_size=256,
+        opspace_T_gate_start=1.0,
+        opspace_T_gate_mid=0.5,
+        opspace_T_gate_final=0.18,
+        opspace_T_lb_start=1.0,
+        opspace_T_lb_mid=0.5,
+        opspace_T_lb_final=0.20,
+        opspace_lb_enabled=True,
+        opspace_lb_capacity_factor=1.35,
+        opspace_lb_device_capacity_factor=1.25,
+        opspace_lb_tile_weight_peak=0.01,
+        opspace_lb_device_weight_peak=0.003,
+        opspace_lb_warmup_tokens=3000000000.0,
+        opspace_lb_peak_start_tokens=8000000000.0,
+        opspace_lb_peak_end_tokens=22000000000.0,
+        opspace_lb_decay_end_tokens=30000000000.0,
+        opspace_lb_final_weight_frac=0.10):
+    if str(operation_space_mode).lower() in (
+            'factorized_lane_mean',
+            'fixed_k4_repack_v1'):
+        return make_sharded_srw_fixed_k4_repack_minimal(
+            mesh, max_chunk_size=max_chunk_size,
+            dead_exposure_target=dead_exposure_target,
+            soft_gate_effective_active_eps=soft_gate_effective_active_eps,
+            admission_den_power=admission_den_power,
+            admission_den_grad_scale=admission_den_grad_scale,
+            lanes=opspace_lanes,
+            tiles_per_lane=opspace_tiles_per_lane,
+            padded_ops=opspace_padded_ops,
+            tile_size=opspace_tile_size,
+            k_exec=opspace_k_exec,
+            token_chunk_size=opspace_token_chunk_size)
     if hardware_sector_execution_enabled:
         if hardware_sector_debug_token_gather_fallback:
             return make_sharded_srw_sector_topk_minimal(
@@ -5510,6 +6872,39 @@ class Router(nn.Module):
 # 6. Pure functions for scan body
 # ================================================================
 
+def _call_minimal_srw(fused, x, h, op_key, raw_tau, read, write,
+                      soft_gate_temperature, soft_gate_t_final,
+                      soft_gate_boundary_power,
+                      soft_gate_boundary_power_final,
+                      execution_prune_eps, training_tokens):
+    if getattr(fused, '_v4168_accepts_training_tokens', False):
+        return fused(
+            x, h, op_key, raw_tau, read, write,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, training_tokens)
+    return fused(
+        x, h, op_key, raw_tau, read, write,
+        soft_gate_temperature, soft_gate_t_final,
+        soft_gate_boundary_power, soft_gate_boundary_power_final,
+        execution_prune_eps)
+
+
+def _split_minimal_srw_return(ret):
+    zero_sector = jnp.zeros((SECTOR_RUNTIME_DIAG_COUNT,), dtype=jnp.float32)
+    zero_opspace = jnp.zeros((OPSPACE_RUNTIME_DIAG_COUNT,), dtype=jnp.float32)
+    zero_aux = jnp.float32(0.0)
+    if not isinstance(ret, tuple):
+        return ret, zero_sector, zero_opspace, zero_aux
+    if len(ret) >= 4:
+        return ret[0], ret[1], ret[3], ret[2]
+    if len(ret) >= 3:
+        return ret[0], zero_sector, ret[1], ret[2]
+    if len(ret) >= 2:
+        return ret[0], ret[1], zero_opspace, zero_aux
+    return ret[0], zero_sector, zero_opspace, zero_aux
+
+
 def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           n_qk, n_v,
                           n_heads, d_model, n_layers,
@@ -5522,7 +6917,8 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           soft_gate_boundary_power=2.0,
                           soft_gate_boundary_power_final=4.0,
                           admission_den_power=1.0,
-                          execution_prune_eps=0.0):
+                          execution_prune_eps=0.0,
+                          training_tokens=0.0):
     """Minimal v4168 attention path: Block-sparse SRW, causal attention, O-proj."""
     del n_qk, n_v, admission_den_power
     B, S, D = x.shape
@@ -5580,36 +6976,39 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         h_QK = jnp.stack([h_Q, h_K], axis=2)
         raw_tau_QK = jnp.stack(
             [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
-        qk_ret = fused_paired(
+        qk_ret = _call_minimal_srw(
+            fused_paired,
             x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
             soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps)
+            soft_gate_boundary_power_final, execution_prune_eps,
+            training_tokens)
         QK_out = qk_ret[0] if isinstance(qk_ret, tuple) else qk_ret
         Q = QK_out[:, :, 0, :]
         K = QK_out[:, :, 1, :]
     elif fused_single_qk is not None:
-        Q = fused_single_qk(
+        Q = _call_minimal_srw(
+            fused_single_qk,
             x, h_Q, qk_op_key, raw_tau_all[:, :, 0:1], qk_read, qk_write,
             soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps)
-        K = fused_single_qk(
+            soft_gate_boundary_power_final, execution_prune_eps,
+            training_tokens)
+        K = _call_minimal_srw(
+            fused_single_qk,
             x, h_K, qk_op_key, raw_tau_all[:, :, 1:2], qk_read, qk_write,
             soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps)
+            soft_gate_boundary_power_final, execution_prune_eps,
+            training_tokens)
     else:
         raise RuntimeError("v4168 minimal attention requires a Q/K SRW executor.")
     Q = Q * qk_scale
     K = K * qk_scale
-    v_ret = fused_single_v(
+    v_ret = _call_minimal_srw(
+        fused_single_v,
         x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
         soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
-        soft_gate_boundary_power_final, execution_prune_eps)
-    if isinstance(v_ret, tuple):
-        V, v_sector_diag = v_ret
-    else:
-        V = v_ret
-        v_sector_diag = jnp.zeros(
-            (SECTOR_RUNTIME_DIAG_COUNT,), dtype=jnp.float32)
+        soft_gate_boundary_power_final, execution_prune_eps,
+        training_tokens)
+    V, v_sector_diag, v_opspace_diag, v_aux = _split_minimal_srw_return(v_ret)
     V = V * v_scale
 
     d_head = d_model // n_heads
@@ -5634,7 +7033,8 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
     rng, rng_out = jax.random.split(rng)
-    return safe_dropout(out, dropout_rate, deterministic, rng_out), v_sector_diag
+    return (safe_dropout(out, dropout_rate, deterministic, rng_out),
+            v_sector_diag, v_opspace_diag, v_aux)
 
 
 def _rst_forward_minimal(x, pool_params, router_params, rng,
@@ -5647,7 +7047,8 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
                          soft_gate_boundary_power=2.0,
                          soft_gate_boundary_power_final=4.0,
                          admission_den_power=1.0,
-                         execution_prune_eps=0.0):
+                         execution_prune_eps=0.0,
+                         training_tokens=0.0):
     """Minimal v4168 RST path: one Block-sparse SRW output and residual dropout."""
     del admission_den_power
     if d_model is None or n_layers is None:
@@ -5678,19 +7079,18 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
             sharded_fns.get('rst_single', sharded_fns['single']))
     else:
         fused_single, _ = sharded_fns
-    rst_ret = fused_single(
+    rst_ret = _call_minimal_srw(
+        fused_single,
         x, h, rst_op_key, raw_tau, rst_read, rst_write,
         soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
-        soft_gate_boundary_power_final, execution_prune_eps)
-    if isinstance(rst_ret, tuple):
-        out, rst_sector_diag = rst_ret
-    else:
-        out = rst_ret
-        rst_sector_diag = jnp.zeros(
-            (SECTOR_RUNTIME_DIAG_COUNT,), dtype=jnp.float32)
+        soft_gate_boundary_power_final, execution_prune_eps,
+        training_tokens)
+    out, rst_sector_diag, rst_opspace_diag, rst_aux = (
+        _split_minimal_srw_return(rst_ret))
     out = out * rst_scale
     rng, rng_out = jax.random.split(rng)
-    return safe_dropout(out, dropout_rate, deterministic, rng_out), rst_sector_diag
+    return (safe_dropout(out, dropout_rate, deterministic, rng_out),
+            rst_sector_diag, rst_opspace_diag, rst_aux)
 
 
 def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
@@ -6373,7 +7773,8 @@ class DAWN_SRW_V4168(nn.Module):
                  admission_den_power=1.0,
                  execution_prune_eps=0.0,
                  minimal_train=False,
-                 benchmark_runtime_metrics=False):
+                 benchmark_runtime_metrics=False,
+                 training_tokens=0.0):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -6574,7 +7975,8 @@ class DAWN_SRW_V4168(nn.Module):
 
                     normed = _layer_norm(
                         x, bp['norm1']['scale'], bp['norm1']['bias'])
-                    attn_out, attn_v_sector_diag = _attn_forward_minimal(
+                    (attn_out, attn_v_sector_diag, attn_v_opspace_diag,
+                     attn_v_opspace_aux) = _attn_forward_minimal(
                         normed, pool_params, router_params,
                         bp['attn']['expand_O']['kernel'], rng_attn,
                         self.n_qk, self.n_v,
@@ -6589,12 +7991,14 @@ class DAWN_SRW_V4168(nn.Module):
                         soft_gate_boundary_power=soft_gate_boundary_power,
                         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
                         admission_den_power=admission_den_power,
-                        execution_prune_eps=execution_prune_eps)
+                        execution_prune_eps=execution_prune_eps,
+                        training_tokens=training_tokens)
                     x = x + attn_out
 
                     normed = _layer_norm(
                         x, bp['norm2']['scale'], bp['norm2']['bias'])
-                    rst_out, rst_sector_diag = _rst_forward_minimal(
+                    (rst_out, rst_sector_diag, rst_opspace_diag,
+                     rst_opspace_aux) = _rst_forward_minimal(
                         normed, pool_params, router_params, rng_rst,
                         self.router_dropout, self.dropout_rate,
                         deterministic,
@@ -6607,8 +8011,12 @@ class DAWN_SRW_V4168(nn.Module):
                         soft_gate_boundary_power=soft_gate_boundary_power,
                         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
                         admission_den_power=admission_den_power,
-                        execution_prune_eps=execution_prune_eps)
-                    return x + rst_out, (attn_v_sector_diag, rst_sector_diag)
+                        execution_prune_eps=execution_prune_eps,
+                        training_tokens=training_tokens)
+                    return x + rst_out, (
+                        attn_v_sector_diag, rst_sector_diag,
+                        attn_v_opspace_diag, rst_opspace_diag,
+                        attn_v_opspace_aux, rst_opspace_aux)
 
                 if self.gradient_checkpointing:
                     scan_body_minimal = jax.checkpoint(scan_body_minimal)
@@ -6620,6 +8028,10 @@ class DAWN_SRW_V4168(nn.Module):
                 x, sector_ys = jax.lax.scan(scan_body_minimal, x, xs_minimal)
                 attn_v_sector_diag = jnp.mean(sector_ys[0], axis=0)
                 rst_sector_diag = jnp.mean(sector_ys[1], axis=0)
+                attn_v_opspace_diag = jnp.mean(sector_ys[2], axis=0)
+                rst_opspace_diag = jnp.mean(sector_ys[3], axis=0)
+                del sector_ys
+                opspace_aux = jnp.float32(0.0)
                 x = self.norm(x)
                 if labels is None:
                     return {'logits': self.token_emb.attend(x)}
@@ -6642,12 +8054,18 @@ class DAWN_SRW_V4168(nn.Module):
                         'sector/attn_v', attn_v_sector_diag))
                     sector_metrics.update(_sector_core_runtime_metric_dict(
                         'sector/rst', rst_sector_diag))
+                opspace_metrics = {}
+                opspace_metrics.update(_opspace_runtime_metric_dict(
+                    'opspace/attn_v', attn_v_opspace_diag))
+                opspace_metrics.update(_opspace_runtime_metric_dict(
+                    'opspace/rst', rst_opspace_diag))
                 return {
                     'loss': loss,
                     'correct': correct,
                     'valid_count': valid_count,
-                    'aux_loss': jnp.float32(0.0),
+                    'aux_loss': opspace_aux,
                     **sector_metrics,
+                    **opspace_metrics,
                 }
 
             def scan_body(carry, xs):
