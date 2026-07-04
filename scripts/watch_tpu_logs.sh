@@ -131,10 +131,15 @@ fi
 
 filter_range_cmd() {
     if [[ -n "$FILTER_PATTERN" ]]; then
-        printf 'grep -E %s || true' "$filter_q"
+        printf "tr '\\r' '\\n' | grep -E %s || true" "$filter_q"
     else
-        printf 'cat'
+        printf "tr '\\r' '\\n'"
     fi
+}
+
+capture_pane_cmd() {
+    printf 'tmux capture-pane -J -t %s -pS - 2>/dev/null || tmux capture-pane -t %s -pS - 2>/dev/null' \
+        "$pane_target_q" "$pane_target_q"
 }
 
 build_file_tail_cmd() {
@@ -144,6 +149,7 @@ build_file_tail_cmd() {
     else
         cmd="tail -n $TAIL_LINES $remote_log_q"
     fi
+    cmd="$cmd | tr '\\r' '\\n'"
     if [[ -n "$FILTER_PATTERN" ]]; then
         if [[ "$FOLLOW" -eq 1 ]]; then
             cmd="$cmd | grep --line-buffered -E $filter_q"
@@ -155,11 +161,12 @@ build_file_tail_cmd() {
 }
 
 build_pane_tail_cmd() {
-    local emit_filter
+    local emit_filter pane_capture
     emit_filter="$(filter_range_cmd)"
+    pane_capture="$(capture_pane_cmd)"
     if [[ "$FOLLOW" -eq 0 ]]; then
-        printf 'tmux capture-pane -t %s -pS - 2>/dev/null | tail -n %s | %s' \
-            "$pane_target_q" "$TAIL_LINES" "$emit_filter"
+        printf '{ %s; } | tail -n %s | %s' \
+            "$pane_capture" "$TAIL_LINES" "$emit_filter"
         return
     fi
     printf '%s' "\
@@ -172,7 +179,7 @@ while true; do
     sleep 2
     continue
   fi
-  tmux capture-pane -t $pane_target_q -pS - > \"\$tmp\" 2>/dev/null || { sleep 2; continue; }
+  { $pane_capture; } > \"\$tmp\" || { sleep 2; continue; }
   total=\$(wc -l < \"\$tmp\" | tr -d ' ')
   if [ \"\${total:-0}\" -le 0 ]; then
     sleep 2
@@ -218,6 +225,8 @@ build_attach_cmd() {
 }
 
 build_status_cmd() {
+    local pane_capture
+    pane_capture="$(capture_pane_cmd)"
     printf '%s\n' \
         'echo "HOST=$(hostname) DATE=$(date -Is)"' \
         'echo "TMUX:"' \
@@ -227,7 +236,7 @@ build_status_cmd() {
         'echo "LAST_LOG:"' \
         "tail -n 5 $remote_log_q 2>/dev/null || echo \"no log at $REMOTE_LOG\"" \
         'echo "PANE:"' \
-        "tmux capture-pane -t $pane_target_q -p -S -20 2>/dev/null || echo \"no tmux target $PANE_TARGET\""
+        "{ $pane_capture; } | tail -n 20 || echo \"no tmux target $PANE_TARGET\""
 }
 
 run_worker_command() {
@@ -241,9 +250,10 @@ run_worker_command() {
 }
 
 detect_primary_worker() {
-    local attempt worker out cmd pattern_q
+    local attempt worker out cmd pattern_q pane_capture
     pattern_q="$(quote_remote "$PRIMARY_DETECT_PATTERN")"
-    cmd="{ if [ -r $remote_log_q ]; then tail -n 5000 $remote_log_q; fi; tmux capture-pane -t $pane_target_q -pS - 2>/dev/null || true; } | grep -E $pattern_q | tail -n 1 || true"
+    pane_capture="$(capture_pane_cmd)"
+    cmd="{ if [ -r $remote_log_q ]; then tail -n 5000 $remote_log_q | tr '\\r' '\\n'; fi; { $pane_capture; } | tr '\\r' '\\n' || true; } | grep -E $pattern_q | tail -n 1 || true"
     for attempt in $(seq 1 "$PRIMARY_DETECT_ATTEMPTS"); do
         for worker in $(seq 0 $((worker_count - 1))); do
             out="$(run_worker_command "$worker" "$cmd" 2>/dev/null || true)"
