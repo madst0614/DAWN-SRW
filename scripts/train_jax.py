@@ -853,6 +853,62 @@ ACTIVE_SRW_RESUME_REQUIRED_FIELDS = (
     ('training', 'soft_gate_effective_active_eps'),
 )
 
+V4168_OPSPACE_RESUME_REQUIRED_FIELDS = (
+    ('model', 'model_version'),
+    ('model', 'd_model'),
+    ('model', 'n_layers'),
+    ('model', 'n_heads'),
+    ('model', 'max_seq_len'),
+    ('model', 'd_route'),
+    ('model', 'n_qk'),
+    ('model', 'n_v'),
+    ('model', 'n_rst'),
+    ('data', 'max_train_tokens'),
+    ('training', 'batch_size'),
+    ('training', 'num_epochs'),
+    ('training', 'mesh_model'),
+    ('training', 'mesh_data'),
+    ('training', 'gradient_accumulation_steps'),
+    ('training', 'lr'),
+    ('training', 'warmup_ratio'),
+    ('training', 'weight_decay'),
+    ('training', 'checkpoint_interval'),
+    ('training', 'val_interval'),
+    ('training', 'log_interval'),
+    ('training', 'log_analysis_multiplier'),
+    ('training', 'heavy_geometry_multiplier'),
+    ('training', 'n_chunks_qk'),
+    ('training', 'n_chunks_v'),
+    ('training', 'n_chunks_rst'),
+    ('training', 'admission_den_power'),
+    ('training', 'operation_space', 'enabled'),
+    ('training', 'operation_space', 'tile_size'),
+    ('training', 'operation_space', 'pools', 'qk', 'routing_mode'),
+    ('training', 'operation_space', 'pools', 'qk', 'execution_mode'),
+    ('training', 'operation_space', 'pools', 'qk', 'lanes'),
+    ('training', 'operation_space', 'pools', 'qk', 'k_exec'),
+    ('training', 'operation_space', 'pools', 'qk', 'exec_tiles_per_block'),
+    ('training', 'operation_space', 'pools', 'v', 'routing_mode'),
+    ('training', 'operation_space', 'pools', 'v', 'execution_mode'),
+    ('training', 'operation_space', 'pools', 'v', 'lanes'),
+    ('training', 'operation_space', 'pools', 'v', 'k_exec'),
+    ('training', 'operation_space', 'pools', 'v', 'exec_tiles_per_block'),
+    ('training', 'operation_space', 'pools', 'rst', 'routing_mode'),
+    ('training', 'operation_space', 'pools', 'rst', 'execution_mode'),
+    ('training', 'operation_space', 'pools', 'rst', 'lanes'),
+    ('training', 'operation_space', 'pools', 'rst', 'k_exec'),
+    ('training', 'operation_space', 'pools', 'rst', 'exec_tiles_per_block'),
+)
+
+V4168_OPSPACE_REPACK_RESUME_REQUIRED_FIELDS = (
+    ('training', 'operation_space', 'repack', 'enabled'),
+    ('training', 'operation_space', 'repack', 'start_step'),
+    ('training', 'operation_space', 'repack', 'interval_steps'),
+    ('training', 'operation_space', 'repack', 'max_swaps', 'qk'),
+    ('training', 'operation_space', 'repack', 'max_swaps', 'v'),
+    ('training', 'operation_space', 'repack', 'max_swaps', 'rst'),
+)
+
 
 def _missing_config_paths(cfg, paths):
     missing = []
@@ -913,6 +969,29 @@ def _require_resume_materialized_fields(full_config):
         )
     model_version = full_config['model']['model_version']
     if not _is_active_srw_version(model_version):
+        return
+    training_cfg = (
+        full_config.get('training', {})
+        if isinstance(full_config.get('training', {}), dict) else {})
+    opspace_cfg = (
+        training_cfg.get('operation_space', {})
+        if isinstance(training_cfg.get('operation_space', {}), dict) else {})
+    if (str(model_version) == V4168_MODEL_VERSION
+            and bool(opspace_cfg.get('enabled', False))):
+        required_fields = list(V4168_OPSPACE_RESUME_REQUIRED_FIELDS)
+        repack_cfg = (
+            opspace_cfg.get('repack', {})
+            if isinstance(opspace_cfg.get('repack', {}), dict) else {})
+        if bool(repack_cfg.get('enabled', False)):
+            required_fields.extend(V4168_OPSPACE_REPACK_RESUME_REQUIRED_FIELDS)
+        missing = _missing_config_paths(full_config, tuple(required_fields))
+        if missing:
+            raise RuntimeError(
+                "Resume checkpoint full_config is missing required "
+                "materialized v4168 operation-space fields. Automatic "
+                "config fallback is disabled. Missing keys: "
+                + ", ".join(missing)
+            )
         return
 
     missing = _missing_config_paths(
@@ -1228,22 +1307,26 @@ def _v4168_validate_operation_space_shape(opspace):
             "training.operation_space.pools only supports qk, v, rst; "
             f"remove: {', '.join(extra_pools)}")
     allowed_pool_keys = {
-        'qk': {'mode', 'lanes', 'k_exec'},
-        'v': {'mode', 'lanes', 'k_exec'},
-        'rst': {'mode', 'lanes', 'k_exec'},
+        'routing_mode',
+        'mode',
+        'execution_mode',
+        'lanes',
+        'k_exec',
+        'exec_tiles_per_block',
     }
-    for label, allowed_keys in allowed_pool_keys.items():
+    for label in ('qk', 'v', 'rst'):
         pool = pools.get(label, {})
         if pool is None:
             pool = {}
         if not isinstance(pool, dict):
             raise ValueError(
                 f"training.operation_space.pools.{label} must be a mapping.")
-        extra = sorted(set(pool) - allowed_keys)
+        extra = sorted(set(pool) - allowed_pool_keys)
         if extra:
             raise ValueError(
-                f"training.operation_space.pools.{label} derives tile layout "
-                f"in code; remove: {', '.join(extra)}")
+                f"training.operation_space.pools.{label} only supports "
+                "routing_mode, mode, execution_mode, lanes, k_exec, and "
+                f"exec_tiles_per_block; remove: {', '.join(extra)}")
     repack = opspace.get('repack', {})
     if repack is None:
         repack = {}
@@ -1262,10 +1345,11 @@ def _v4168_validate_operation_space_shape(opspace):
     if not isinstance(max_swaps, dict):
         raise ValueError(
             "training.operation_space.repack.max_swaps must be a mapping.")
-    extra = sorted(set(max_swaps) - {'rst'})
+    extra = sorted(set(max_swaps) - {'qk', 'v', 'rst'})
     if extra:
         raise ValueError(
-            "training.operation_space.repack.max_swaps only supports rst; "
+            "training.operation_space.repack.max_swaps only supports qk, v, "
+            "and rst; "
             f"remove: {', '.join(extra)}")
 
 
@@ -1281,23 +1365,55 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         pools = {}
     device_count = _v4168_operation_space_device_count(training_cfg)
     defaults = {
-        'qk': {'n_key': 'n_qk', 'mode': 'factorized_lane_mean', 'lanes': 8,
-               'k_exec': 4},
-        'v': {'n_key': 'n_v', 'mode': 'factorized_lane_mean', 'lanes': 8,
-              'k_exec': 5},
-        'rst': {'n_key': 'n_rst', 'mode': 'factorized_lane_mean', 'lanes': 32,
-                'k_exec': 32},
+        'qk': {
+            'n_key': 'n_qk',
+            'routing_mode': 'factorized_lane_mean',
+            'execution_mode': 'dense_masked',
+            'lanes': 8,
+            'k_exec': 4,
+        },
+        'v': {
+            'n_key': 'n_v',
+            'routing_mode': 'factorized_lane_mean',
+            'execution_mode': 'dense_masked',
+            'lanes': 8,
+            'k_exec': 5,
+        },
+        'rst': {
+            'n_key': 'n_rst',
+            'routing_mode': 'factorized_lane_mean',
+            'execution_mode': 'block_bucketed_dense',
+            'lanes': 32,
+            'k_exec': 32,
+        },
     }
     layouts = {}
     for label, defaults_i in defaults.items():
         pool = pools.get(label, {})
         if not isinstance(pool, dict):
             pool = {}
-        mode = str(pool.get('mode', defaults_i['mode'])).lower()
-        if mode != defaults_i['mode']:
+        routing_mode = pool.get('routing_mode', None)
+        mode_alias = pool.get('mode', None)
+        if routing_mode is None:
+            routing_mode = (
+                mode_alias
+                if mode_alias is not None else defaults_i['routing_mode'])
+        routing_mode = str(routing_mode).strip().lower()
+        if mode_alias is not None and str(mode_alias).strip().lower() != routing_mode:
             raise ValueError(
-                f"training.operation_space.pools.{label}.mode must be "
-                f"{defaults_i['mode']!r}, got {mode!r}.")
+                f"training.operation_space.pools.{label}.mode must match "
+                "routing_mode when both are present.")
+        if routing_mode != 'factorized_lane_mean':
+            raise ValueError(
+                f"training.operation_space.pools.{label}.routing_mode must "
+                f"be 'factorized_lane_mean', got {routing_mode!r}.")
+        execution_mode = str(pool.get(
+            'execution_mode', defaults_i['execution_mode'])).strip().lower()
+        if execution_mode not in ('dense_masked', 'block_bucketed_dense'):
+            raise ValueError(
+                f"training.operation_space.pools.{label}.execution_mode must "
+                "be 'dense_masked' or 'block_bucketed_dense', got "
+                f"{execution_mode!r}.")
         lanes = int(pool.get('lanes', defaults_i['lanes']))
         if lanes <= 0:
             raise ValueError(
@@ -1309,16 +1425,6 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             raise ValueError(
                 f"training.operation_space.pools.{label}.k_exec must be "
                 f"in [1, lanes={lanes}], got {k_exec}.")
-        if label in ('qk', 'v') and k_exec != defaults_i['k_exec']:
-            raise ValueError(
-                f"training.operation_space.pools.{label}.k_exec is fixed at "
-                f"{defaults_i['k_exec']} for v4168 operation_space, got "
-                f"{k_exec}.")
-        if label == 'rst' and k_exec != lanes:
-            raise ValueError(
-                "training.operation_space.pools.rst.k_exec must equal lanes "
-                f"for one best tile per lane; got k_exec={k_exec}, "
-                f"lanes={lanes}.")
         n_ops = int(model_cfg.get(
             defaults_i['n_key'],
             model_cfg.get('n_know', 0) if label == 'rst' else 0))
@@ -1329,14 +1435,34 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         align = math.lcm(lanes, device_count)
         total_tiles = _ceil_to_multiple(raw_tiles, align)
         tiles_per_lane = total_tiles // lanes
+        exec_tiles_default = 2 if execution_mode == 'block_bucketed_dense' else 1
+        exec_tiles_per_block = int(pool.get(
+            'exec_tiles_per_block', exec_tiles_default))
+        if exec_tiles_per_block <= 0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.exec_tiles_per_block must be > 0, got "
+                f"{exec_tiles_per_block}.")
+        if tiles_per_lane % exec_tiles_per_block != 0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.exec_tiles_per_block={exec_tiles_per_block} must "
+                f"divide tiles_per_lane={tiles_per_lane}.")
+        blocks_per_lane = tiles_per_lane // exec_tiles_per_block
+        block_size = tile_size * exec_tiles_per_block
         layouts[label] = {
-            'mode': mode,
+            'routing_mode': routing_mode,
+            'mode': routing_mode,
+            'execution_mode': execution_mode,
             'lanes': lanes,
             'k_exec': k_exec,
             'tile_size': tile_size,
             'raw_tiles': raw_tiles,
             'total_tiles': total_tiles,
             'tiles_per_lane': tiles_per_lane,
+            'exec_tiles_per_block': exec_tiles_per_block,
+            'blocks_per_lane': blocks_per_lane,
+            'block_size': block_size,
             'padded_ops': total_tiles * tile_size,
             'invalid_padded_ops': total_tiles * tile_size - n_ops,
             'num_devices': device_count,
@@ -1414,8 +1540,8 @@ def _v4168_operation_space_repack_config(training_cfg, model_cfg,
         raise ValueError(
             "training.operation_space.repack.interval_steps must be > 0, got "
             f"{interval_steps}.")
-    for label in ('rst',):
-        if int(max_swaps.get(label, 256)) < 0:
+    for label in ('qk', 'v', 'rst'):
+        if int(max_swaps.get(label, 256 if label == 'rst' else 0)) < 0:
             raise ValueError(
                 f"training.operation_space.repack.max_swaps.{label} must "
                 "be >= 0.")
@@ -1535,35 +1661,46 @@ def _dawn_srw_kwargs(cfg):
     kw['n_rst'] = m.get('n_rst', m.get('n_know'))
     kw['n_know'] = m.get('n_know', None)
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
-    tau_init_cfg = _v4164_tau_init_config(cfg)
-    if tau_init_cfg['mode'] == 'explicit':
-        kw['tau_init_attn_qk'] = tau_init_cfg['explicit']['qk']
-        kw['tau_init_attn_v'] = tau_init_cfg['explicit']['v']
-        kw['tau_init_rst'] = tau_init_cfg['explicit']['rst']
+    opspace_cfg = t.get('operation_space', {})
+    operation_space_tau_free_enabled = (
+        str(version) == V4168_MODEL_VERSION
+        and isinstance(opspace_cfg, dict)
+        and bool(opspace_cfg.get('enabled', False))
+    )
+    if operation_space_tau_free_enabled:
+        kw['tau_init_attn_qk'] = 0.0
+        kw['tau_init_attn_v'] = 0.0
+        kw['tau_init_rst'] = 0.0
     else:
-        fixed_tau_values = {
-            'tau_init_attn_qk': t.get(
-                'tau_init_attn_qk',
-                m.get('tau_init_attn_qk',
-                      t.get('selection_calibration_tau_qk', None))),
-            'tau_init_attn_v': t.get(
-                'tau_init_attn_v',
-                m.get('tau_init_attn_v',
-                      t.get('selection_calibration_tau_v', None))),
-            'tau_init_rst': t.get(
-                'tau_init_rst',
-                m.get('tau_init_rst',
-                      t.get('selection_calibration_tau_rst', None))),
-        }
-        if (_is_fixed_tau_srw_version(version)
-                and all(value is not None
-                        for value in fixed_tau_values.values())):
-            kw.update(fixed_tau_values)
+        tau_init_cfg = _v4164_tau_init_config(cfg)
+        if tau_init_cfg['mode'] == 'explicit':
+            kw['tau_init_attn_qk'] = tau_init_cfg['explicit']['qk']
+            kw['tau_init_attn_v'] = tau_init_cfg['explicit']['v']
+            kw['tau_init_rst'] = tau_init_cfg['explicit']['rst']
         else:
-            # Fresh quantile starts overwrite these before optimizer init.
-            kw['tau_init_attn_qk'] = 0.0
-            kw['tau_init_attn_v'] = 0.0
-            kw['tau_init_rst'] = 0.0
+            fixed_tau_values = {
+                'tau_init_attn_qk': t.get(
+                    'tau_init_attn_qk',
+                    m.get('tau_init_attn_qk',
+                          t.get('selection_calibration_tau_qk', None))),
+                'tau_init_attn_v': t.get(
+                    'tau_init_attn_v',
+                    m.get('tau_init_attn_v',
+                          t.get('selection_calibration_tau_v', None))),
+                'tau_init_rst': t.get(
+                    'tau_init_rst',
+                    m.get('tau_init_rst',
+                          t.get('selection_calibration_tau_rst', None))),
+            }
+            if (_is_fixed_tau_srw_version(version)
+                    and all(value is not None
+                            for value in fixed_tau_values.values())):
+                kw.update(fixed_tau_values)
+            else:
+                # Fresh quantile starts overwrite these before optimizer init.
+                kw['tau_init_attn_qk'] = 0.0
+                kw['tau_init_attn_v'] = 0.0
+                kw['tau_init_rst'] = 0.0
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
             'fixed_tau': m.get('fixed_tau', True),
@@ -1891,6 +2028,14 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
 
 def _dict_without_private_keys(src):
     return {k: v for k, v in dict(src).items() if not str(k).startswith('_')}
+
+
+def _operation_space_disabled_selection_calibration_config(cfg):
+    raw = cfg.get('training', {}).get('selection_calibration', None)
+    out = {'enabled': False, 'present': raw is not None}
+    if isinstance(raw, dict):
+        out['raw'] = _dict_without_private_keys(raw)
+    return out
 
 
 def _array_quantile(values, q):
@@ -9847,11 +9992,20 @@ def _print_regular_block(rec, ctx):
                         f" processed_req={_g(f'opspace/{_pool}/processed_requests'):.0f}"
                         f" all_processed={_g(f'opspace/{_pool}/all_processed'):.0f}"
                         if _label == 'rst' else "")
+                    _bucket_part = (
+                        f" bucket_capacity={_g(f'opspace/{_pool}/bucket_capacity'):.0f}"
+                        f" bucket_fill={_g(f'opspace/{_pool}/bucket_fill_mean'):.1f}"
+                        f" primary_accept={_g(f'opspace/{_pool}/primary_accept_frac'):.3f}"
+                        f" reroute={_g(f'opspace/{_pool}/reroute_frac'):.3f}"
+                        f" overflow={_g(f'opspace/{_pool}/overflow_frac'):.6f}"
+                        f" no_nan={_g(f'opspace/{_pool}/no_nan'):.0f}"
+                        if _label == 'rst' else "")
                     log_message(
                         f"  [opspace/{_label}]"
                         f" k_exec={_g(f'opspace/{_pool}/k_exec'):.0f}"
                         f" exec_slots={_g(f'opspace/{_pool}/exec_slots'):.0f}"
                         f"{_lane_part}"
+                        f"{_bucket_part}"
                         f" gate=relu2"
                         f" gate_mass={_g(f'opspace/{_pool}/gate_mass_mean'):.2f}"
                         f" relu_gate_count={_g(f'opspace/{_pool}/relu_gate_count_mean'):.2f}"
@@ -10975,11 +11129,16 @@ def main():
             'operation_space_enabled', False))
     )
     tau_init_cfg = (
-        _v4164_tau_init_config(cfg)
-        if _is_active_srw_version(model_version_cfg)
-        else None)
-    selection_calibration_cfg = _selection_calibration_config(
-        cfg, tau_init_cfg)
+        None
+        if operation_space_tau_free_enabled
+        else (
+            _v4164_tau_init_config(cfg)
+            if _is_active_srw_version(model_version_cfg)
+            else None))
+    selection_calibration_cfg = (
+        _operation_space_disabled_selection_calibration_config(cfg)
+        if operation_space_tau_free_enabled
+        else _selection_calibration_config(cfg, tau_init_cfg))
     if (selection_calibration_cfg.get('enabled', False)
             and not _is_active_srw_version(model_version_cfg)):
         raise ValueError(
@@ -11456,11 +11615,16 @@ def main():
                 'operation_space_enabled', False))
         )
         tau_init_cfg = (
-            _v4164_tau_init_config(cfg)
-            if _is_active_srw_version(model_version_cfg)
-            else None)
-        selection_calibration_cfg = _selection_calibration_config(
-            cfg, tau_init_cfg)
+            None
+            if operation_space_tau_free_enabled
+            else (
+                _v4164_tau_init_config(cfg)
+                if _is_active_srw_version(model_version_cfg)
+                else None))
+        selection_calibration_cfg = (
+            _operation_space_disabled_selection_calibration_config(cfg)
+            if operation_space_tau_free_enabled
+            else _selection_calibration_config(cfg, tau_init_cfg))
         max_seq_len = cfg['model']['max_seq_len']
         training_log_append_on_resume = bool(tcfg.get(
             'training_log_append_on_resume',
@@ -12103,15 +12267,161 @@ def main():
     if isinstance(tcfg.get('operation_space'), dict):
         training_config['operation_space'] = deepcopy(tcfg['operation_space'])
     if operation_space_tau_free_enabled:
+        _opspace_training_layouts = operation_space_repack_config.get(
+            'operation_space_pool_layouts', {})
+        if not isinstance(_opspace_training_layouts, dict):
+            _opspace_training_layouts = {}
+        _raw_opspace_training = (
+            deepcopy(tcfg.get('operation_space', {}))
+            if isinstance(tcfg.get('operation_space', {}), dict) else {})
+        _raw_repack_training = (
+            deepcopy(_raw_opspace_training.get('repack', {}))
+            if isinstance(_raw_opspace_training.get('repack', {}), dict)
+            else {})
+        _repack_pool_cfg = operation_space_repack_config.get(
+            'operation_space_repack_pools', {})
+        if not isinstance(_repack_pool_cfg, dict):
+            _repack_pool_cfg = {}
+
+        def _opspace_materialized_pool(_label):
+            _layout = _opspace_training_layouts.get(_label, {})
+            if not isinstance(_layout, dict):
+                _layout = {}
+            return {
+                'routing_mode': str(_layout.get(
+                    'routing_mode', 'factorized_lane_mean')).lower(),
+                'execution_mode': str(_layout.get(
+                    'execution_mode', 'dense_masked')).lower(),
+                'lanes': int(_layout.get(
+                    'lanes', 32 if _label == 'rst' else 8)),
+                'k_exec': int(_layout.get(
+                    'k_exec', 32 if _label == 'rst'
+                    else (5 if _label == 'v' else 4))),
+                'exec_tiles_per_block': int(_layout.get(
+                    'exec_tiles_per_block', 1)),
+            }
+
+        def _opspace_materialized_max_swaps(_label):
+            _pool = _repack_pool_cfg.get(_label, {})
+            if not isinstance(_pool, dict):
+                _pool = {}
+            _raw_max_swaps = (
+                _raw_repack_training.get('max_swaps', {})
+                if isinstance(_raw_repack_training.get('max_swaps', {}), dict)
+                else {})
+            return int(_pool.get(
+                'max_swaps_per_repack',
+                _raw_max_swaps.get(_label, 256 if _label == 'rst' else 0)))
+
+        _opspace_materialized_training = {
+            'enabled': True,
+            'tile_size': int(
+                next(iter(_opspace_training_layouts.values()), {}).get(
+                    'tile_size', _raw_opspace_training.get('tile_size', 128))),
+            'pools': {
+                'qk': _opspace_materialized_pool('qk'),
+                'v': _opspace_materialized_pool('v'),
+                'rst': _opspace_materialized_pool('rst'),
+            },
+            'repack': {
+                'enabled': bool(operation_space_repack_enabled),
+                'start_step': int(operation_space_repack_config.get(
+                    'operation_space_repack_start_step',
+                    _raw_repack_training.get('start_step', 1000))),
+                'interval_steps': int(operation_space_repack_config.get(
+                    'operation_space_repack_interval_steps',
+                    _raw_repack_training.get('interval_steps', 100))),
+                'max_swaps': {
+                    'qk': _opspace_materialized_max_swaps('qk'),
+                    'v': _opspace_materialized_max_swaps('v'),
+                    'rst': _opspace_materialized_max_swaps('rst'),
+                },
+            },
+        }
+        if 'version' in _raw_opspace_training:
+            _opspace_materialized_training['version'] = (
+                _raw_opspace_training['version'])
+        training_config['operation_space'] = deepcopy(
+            _opspace_materialized_training)
+        cfg.setdefault('training', {})['operation_space'] = deepcopy(
+            _opspace_materialized_training)
+
+        def _opspace_backend_name(_label, _default):
+            _layout = _opspace_training_layouts.get(_label, {})
+            if not isinstance(_layout, dict):
+                _layout = {}
+            return str(_layout.get('execution_mode', _default)).lower()
+
+        _inactive_tau_selection_keys = (
+            'selection_calibration',
+            'selection_calibration_applied',
+            'selection_calibration_seen_tokens',
+            'selection_calibration_actual_batches',
+            'selection_calibration_histogram_bins',
+            'selection_calibration_tau_qk',
+            'selection_calibration_tau_v',
+            'selection_calibration_tau_rst',
+            'selection_calibration_B_start_qk',
+            'selection_calibration_B_start_v',
+            'selection_calibration_B_start_rst',
+            'selection_calibration_B_final_qk',
+            'selection_calibration_B_final_v',
+            'selection_calibration_B_final_rst',
+            'selection_calibration_formation_end_frac',
+            'selection_calibration_sharpen_end_frac',
+            'tau_init_mode',
+            'tau_init_attn_qk',
+            'tau_init_attn_v',
+            'tau_init_rst',
+            'tau_init_min',
+            'tau_init_max',
+            'tau_init_target_qk_frac',
+            'tau_init_target_v_frac',
+            'tau_init_target_rst_frac',
+            'tau_init_calibration_tokens',
+            'soft_gate_effective_active_eps',
+            'admission_den_grad_scale',
+            'soft_gate_boundary_power_start',
+            'soft_gate_boundary_power_mid',
+            'soft_gate_boundary_power_final',
+            'soft_gate_boundary_power_start_frac',
+            'soft_gate_boundary_power_mid_frac',
+            'soft_gate_boundary_power_final_frac',
+            'soft_gate_t_start',
+            'soft_gate_t_final',
+            'soft_gate_t_hold_frac',
+            'soft_gate_t_anneal_end_frac',
+            'soft_gate_t_schedule',
+            'soft_gate_schedule',
+            'soft_gate_t_power',
+            'soft_gate_t_gompertz_center',
+            'soft_gate_t_gompertz_steepness',
+        )
+        for _key in _inactive_tau_selection_keys:
+            training_config.pop(_key, None)
+            cfg.setdefault('training', {}).pop(_key, None)
+        for _key in (
+                'tau_init_attn_qk',
+                'tau_init_attn_v',
+                'tau_init_rst',
+                'tau_init_min',
+                'tau_init_max',
+                'tau_init_mode',
+                'tau_init_target_qk_frac',
+                'tau_init_target_v_frac',
+                'tau_init_target_rst_frac'):
+            cfg.setdefault('model', {}).pop(_key, None)
         _operation_space_training_marks = {
             'operation_space_tau_free_active': True,
             'direct_tau_active_for_qk_v_rst': False,
             'selection_calibration_active_for_qk_v_rst': False,
-            'qk_v_rst_gate_rule': 'relu2_tile_visibility',
-            'rst_backend': 'lane_tile_grouped_sparse',
-            'qk_backend': 'paired_dense_masked',
-            'v_backend': 'dense_masked',
-            'tau_fields_compatibility_only': True,
+            'tau_init_required_for_qk_v_rst': False,
+            'qk_v_rst_gate_rule': 'relu2_operation_space',
+            'qk_backend': _opspace_backend_name('qk', 'dense_masked'),
+            'v_backend': _opspace_backend_name('v', 'dense_masked'),
+            'rst_backend': _opspace_backend_name(
+                'rst', 'block_bucketed_dense'),
+            'tau_fields_compatibility_only': False,
         }
         training_config.update(_operation_space_training_marks)
         cfg.setdefault('training', {}).update(_operation_space_training_marks)
@@ -12119,7 +12429,9 @@ def main():
         training_config.update(selection_calibration_resume_training_updates)
         cfg.setdefault('training', {}).update(
             selection_calibration_resume_training_updates)
-    if _is_active_srw_version(model_version_cfg):
+    if (_is_active_srw_version(model_version_cfg)
+            and not operation_space_tau_free_enabled
+            and tau_init_cfg is not None):
         training_config['tau_init_mode'] = tau_init_cfg['mode']
         if tau_init_cfg['mode'] == 'quantile_frac':
             training_config.update({
@@ -12582,26 +12894,37 @@ def main():
                 _layout = _opspace_layouts.get(_label, {})
                 if not isinstance(_layout, dict):
                     _layout = {}
-                return (
-                    f"{_label}: lanes={int(_layout.get('lanes', 0))} "
+                _line = (
+                    f"[opspace/{_label}] "
+                    f"routing={_layout.get('routing_mode', 'unknown')} "
+                    f"execution={_layout.get('execution_mode', 'unknown')} "
+                    f"lanes={int(_layout.get('lanes', 0))} "
                     f"k_exec={int(_layout.get('k_exec', 0))} "
                     f"tile_size={int(_layout.get('tile_size', 0))} "
                     f"tiles_per_lane={int(_layout.get('tiles_per_lane', 0))}")
+                if str(_layout.get('execution_mode', '')).lower() == (
+                        'block_bucketed_dense'):
+                    _line += (
+                        f" exec_tiles_per_block="
+                        f"{int(_layout.get('exec_tiles_per_block', 0))} "
+                        f"block_size={int(_layout.get('block_size', 0))} "
+                        f"blocks_per_lane="
+                        f"{int(_layout.get('blocks_per_lane', 0))}")
+                return _line
 
             print("[opspace] v4168 tau-free operation-space active")
-            print("[opspace] QK backend: paired dense-masked tile visibility, gate=relu(rho)^2")
-            print("[opspace] V backend: dense-masked tile visibility, gate=relu(rho)^2")
-            print("[opspace] RST backend: lane-local (lane,tile)-grouped sparse execution, gate=relu(rho)^2")
-            print("[opspace] DirectTau/admission/drive disabled for QK/V/RST outputs")
-            print("[opspace] selection_calibration and tau config retained only for compatibility")
+            print("[opspace] routing/execution split enabled")
+            print("[opspace] DirectTau/admission/drive/selection_calibration disabled for QK/V/RST outputs")
+            print("[opspace] tau_init config not required in tau-free operation-space mode")
             print("[opspace] denominator = max(sum(relu2_gate), 1.0) ** admission_den_power")
-            print(f"[opspace] {_opspace_startup_layout_line('qk')}")
-            print(f"[opspace] {_opspace_startup_layout_line('v')}")
-            print(f"[opspace] {_opspace_startup_layout_line('rst')}")
+            print(_opspace_startup_layout_line('qk'))
+            print(_opspace_startup_layout_line('v'))
+            print(_opspace_startup_layout_line('rst'))
             print(
                 f"  Gate ({cfg['model'].get('model_version')} operation-space tau-free): "
                 "direct_tau_active_for_qk_v_rst=false "
                 "selection_calibration_active_for_qk_v_rst=false "
+                "tau_init_required_for_qk_v_rst=false "
                 f"dropout={cfg['model'].get('dropout', None)} "
                 f"router_dropout={cfg['model'].get('router_dropout', None)}")
             print("  Effective pruning: disabled for operation-space QK/V/RST")
@@ -12842,9 +13165,10 @@ def main():
                 flush=True)
 
     if (_is_active_srw_version(model_version_cfg)
+            and not operation_space_tau_free_enabled
+            and tau_init_cfg is not None
             and tau_init_cfg['mode'] == 'quantile_frac'
             and not _has_resume_checkpoint
-            and not operation_space_tau_free_enabled
             and not selection_calibration_tau_applied):
         if len(train_loader) <= 0:
             raise ValueError(
@@ -13306,24 +13630,38 @@ def main():
             if not _opspace_enabled:
                 return {}
             layout = _opspace_layouts.get(pool, {})
-            k_exec_default = {'qk': 4, 'v': 5, 'rst': 32}[pool]
-            lanes_default = 32 if pool == 'rst' else 8
-            k_exec_cfg = layout.get(
-                'k_exec', pool_cfg.get('k_exec', k_exec_default))
-            if k_exec_cfg is None:
-                k_exec_cfg = k_exec_default
+            if not isinstance(layout, dict):
+                layout = {}
             return {
                 'operation_space_mode': str(
-                    layout.get('mode', pool_cfg.get('mode', 'block_sparse'))
+                    layout.get(
+                        'routing_mode',
+                        pool_cfg.get(
+                            'routing_mode',
+                            pool_cfg.get('mode', 'factorized_lane_mean')))
                 ).lower(),
+                'operation_space_routing_mode': str(layout.get(
+                    'routing_mode', 'factorized_lane_mean')).lower(),
+                'operation_space_execution_mode': str(layout.get(
+                    'execution_mode', 'dense_masked')).lower(),
                 'opspace_lanes': int(layout.get(
-                    'lanes', pool_cfg.get('lanes', lanes_default))),
+                    'lanes', pool_cfg.get(
+                        'lanes', 32 if pool == 'rst' else 8))),
                 'opspace_tiles_per_lane': int(layout.get(
                     'tiles_per_lane', 1)),
+                'opspace_exec_tiles_per_block': int(layout.get(
+                    'exec_tiles_per_block', 1)),
+                'opspace_blocks_per_lane': int(layout.get(
+                    'blocks_per_lane', 1)),
+                'opspace_block_size': int(layout.get(
+                    'block_size', layout.get(
+                        'tile_size', _opspace_cfg.get('tile_size', 128)))),
                 'opspace_padded_ops': int(layout.get('padded_ops', 0)),
                 'opspace_tile_size': int(layout.get(
                     'tile_size', _opspace_cfg.get('tile_size', 128))),
-                'opspace_k_exec': int(k_exec_cfg),
+                'opspace_k_exec': int(layout.get(
+                    'k_exec', pool_cfg.get(
+                        'k_exec', {'qk': 4, 'v': 5, 'rst': 32}[pool]))),
             }
 
         def _srw_pool_kwargs(pool):
@@ -13382,7 +13720,8 @@ def main():
                     if make_sharded_srw_paired_dense_minimal is None:
                         raise RuntimeError(
                             "operation_space enabled but required tau-free "
-                            "QK/V/RST executor is missing")
+                            "executor is missing: pool=qk "
+                            f"execution_mode={_opspace_layouts.get('qk', {}).get('execution_mode', 'unknown')}")
                     _sharded_paired_attn_qk_minimal = (
                         make_sharded_srw_paired_dense_minimal(
                             max_chunk_size=attn_qk_max_chunk,
@@ -13449,25 +13788,26 @@ def main():
                 raise RuntimeError(
                     "operation_space enabled but required QK/V/RST pool "
                     "layout is missing")
-            _rst_layout = _opspace_layouts['rst']
-            if int(_rst_layout.get('k_exec', -1)) != int(
-                    _rst_layout.get('lanes', -2)):
-                raise RuntimeError(
-                    "operation_space RST requires k_exec == lanes for "
-                    "tile-grouped sparse execution")
-            for _required_executor in (
-                    'attn_qk_paired_minimal',
-                    'attn_v_single_minimal',
-                    'rst_single_minimal'):
+            _opspace_backends = {
+                _pool: str(_opspace_layouts[_pool].get(
+                    'execution_mode', '')).lower()
+                for _pool in ('qk', 'v', 'rst')
+            }
+            for _pool, _required_executor in (
+                    ('qk', 'attn_qk_paired_minimal'),
+                    ('v', 'attn_v_single_minimal'),
+                    ('rst', 'rst_single_minimal')):
                 if _sharded_fns.get(_required_executor, None) is None:
                     raise RuntimeError(
                         "operation_space enabled but required tau-free "
-                        "QK/V/RST executor is missing")
+                        "executor is missing: "
+                        f"pool={_pool} "
+                        f"execution_mode={_opspace_backends[_pool]}")
             _sharded_fns.update({
                 'operation_space_tau_free': True,
-                'qk_backend': 'paired_dense_masked',
-                'v_backend': 'dense_masked',
-                'rst_backend': 'tile_grouped_sparse',
+                'qk_backend': _opspace_backends['qk'],
+                'v_backend': _opspace_backends['v'],
+                'rst_backend': _opspace_backends['rst'],
             })
         # Analysis (observation only). Factory kwargs forward analysis=True
         # only when the v4164 factory advertises the kwarg.
@@ -13508,14 +13848,21 @@ def main():
                           else "block_sparse_fallback"))
                 _extra_msg = (
                     f"; v4168 minimal {_v4168_exec_mode} "
-                    f"block_size qk/v/rst={cfg['model'].get('qk_block_size', 256)}/"
-                    f"{cfg['model'].get('v_block_size', 256)}/"
-                    f"{cfg['model'].get('rst_block_size', 256)}, "
-                    f"top_blocks qk/v/rst={cfg['model'].get('qk_top_blocks', 2)}/"
-                    f"{cfg['model'].get('v_top_blocks', 2)}/"
-                    f"{cfg['model'].get('rst_top_blocks', 2)}")
+                    f"opspace_backend qk/v/rst="
+                    f"{_opspace_layouts.get('qk', {}).get('execution_mode', 'n/a')}/"
+                    f"{_opspace_layouts.get('v', {}).get('execution_mode', 'n/a')}/"
+                    f"{_opspace_layouts.get('rst', {}).get('execution_mode', 'n/a')}"
+                    if _opspace_enabled
+                    else (
+                        f"; v4168 minimal {_v4168_exec_mode} "
+                        f"block_size qk/v/rst={cfg['model'].get('qk_block_size', 256)}/"
+                        f"{cfg['model'].get('v_block_size', 256)}/"
+                        f"{cfg['model'].get('rst_block_size', 256)}, "
+                        f"top_blocks qk/v/rst={cfg['model'].get('qk_top_blocks', 2)}/"
+                        f"{cfg['model'].get('v_top_blocks', 2)}/"
+                        f"{cfg['model'].get('rst_top_blocks', 2)}"))
             _qk_mode_msg = (
-                ("QK dense-masked opspace"
+                ("QK operation-space"
                  if _opspace_enabled else "QK dense-distributed")
                 if str(model_version_cfg) == V4168_MODEL_VERSION
                 else "QK fused")
@@ -13537,49 +13884,87 @@ def main():
                     _qk_tiles = int(_qk_layout.get('total_tiles', 0))
                     _v_tiles = int(_v_layout.get('total_tiles', 0))
                     _rst_tiles = int(_rst_layout.get('total_tiles', 0))
+                    _qk_backend = str(_qk_layout.get(
+                        'execution_mode', 'dense_masked')).lower()
+                    _v_backend = str(_v_layout.get(
+                        'execution_mode', 'dense_masked')).lower()
+                    _rst_backend = str(_rst_layout.get(
+                        'execution_mode', 'block_bucketed_dense')).lower()
                     _rst_lanes = int(_rst_layout.get('lanes', 32))
                     _rst_k = int(_rst_layout.get('k_exec', 32))
                     _model_shards = max(1, int(mesh_model))
                     _rst_local_lanes = max(1, _rst_lanes // _model_shards)
                     _rst_tpl = int(_rst_layout.get('tiles_per_lane', 8))
+                    _rst_exec_tiles = int(_rst_layout.get(
+                        'exec_tiles_per_block', 1))
+                    _rst_block_size = int(_rst_layout.get(
+                        'block_size', _tile * _rst_exec_tiles))
+                    _rst_blocks_per_lane = int(_rst_layout.get(
+                        'blocks_per_lane', max(1, _rst_tpl)))
+                    _rst_block_active = _rst_backend == 'block_bucketed_dense'
+                    _rst_block_flag = str(bool(_rst_block_active)).lower()
                     print(
-                        f"[opspace] v4168 tau-free operation-space active tile={_tile}\n"
-                        "[opspace] qk_backend=paired_dense_masked "
-                        "v_backend=dense_masked "
-                        "rst_backend=tile_grouped_sparse\n"
-                        "[opspace] DirectTau/admission/drive disabled for QK/V/RST outputs; "
-                        "relu-squared tile operation active.\n"
+                        "[opspace] v4168 tau-free operation-space active\n"
+                        "[opspace] routing/execution split enabled\n"
+                        f"[opspace] qk_backend={_qk_backend} "
+                        f"v_backend={_v_backend} "
+                        f"rst_backend={_rst_backend}\n"
+                        "[opspace] DirectTau/admission/drive/selection_calibration disabled for QK/V/RST outputs; "
+                        "relu-squared operation-space gates active.\n"
+                        "[opspace] tau_init config not required in tau-free operation-space mode\n"
+                        "[opspace] denominator=max(sum(relu2_gate),1.0)**admission_den_power\n"
                         f"[opspace/qk] lanes={int(_qk_layout.get('lanes', 8))} "
+                        f"routing={_qk_layout.get('routing_mode', 'unknown')} "
+                        f"execution={_qk_backend} "
                         f"k_exec={int(_qk_layout.get('k_exec', 4))} "
+                        f"tile_size={_tile} "
                         f"tiles={_qk_tiles} "
                         f"tiles_per_lane={int(_qk_layout.get('tiles_per_lane', 4))} "
-                        f"exec_logic_slots={int(_qk_layout.get('k_exec', 4)) * _tile} "
-                        "backend=paired_dense_masked gate=relu2\n"
+                        f"exec_slots={int(_qk_layout.get('k_exec', 4)) * int(_qk_layout.get('block_size', _tile))} "
+                        "gate=relu2\n"
                         f"[opspace/v] lanes={int(_v_layout.get('lanes', 8))} "
+                        f"routing={_v_layout.get('routing_mode', 'unknown')} "
+                        f"execution={_v_backend} "
                         f"k_exec={int(_v_layout.get('k_exec', 5))} "
+                        f"tile_size={_tile} "
                         f"tiles={_v_tiles} "
                         f"tiles_per_lane={int(_v_layout.get('tiles_per_lane', 12))} "
-                        f"exec_logic_slots={int(_v_layout.get('k_exec', 5)) * _tile} "
-                        "backend=dense_masked gate=relu2\n"
+                        f"exec_slots={int(_v_layout.get('k_exec', 5)) * int(_v_layout.get('block_size', _tile))} "
+                        "gate=relu2\n"
                         f"[opspace/rst] lanes={_rst_lanes} "
+                        f"routing={_rst_layout.get('routing_mode', 'unknown')} "
+                        f"execution={_rst_backend} "
                         f"k_exec={_rst_k} "
                         f"tiles={_rst_tiles} "
                         f"tiles_per_lane={_rst_tpl} "
                         f"tile_size={_tile} "
-                        "backend=tile_grouped_sparse gate=relu2\n"
+                        f"exec_tiles_per_block={_rst_exec_tiles} "
+                        f"block_size={_rst_block_size} "
+                        f"blocks_per_lane={_rst_blocks_per_lane} "
+                        "gate=relu2\n"
                         f"[opspace/rst] local_lanes={_rst_local_lanes} "
-                        f"local_groups={_rst_local_lanes * _rst_tpl} "
+                        f"local_blocks={_rst_local_lanes * _rst_blocks_per_lane} "
                         f"requests_per_token_local={_rst_local_lanes} "
                         f"requests_per_token_global={_rst_lanes}\n"
+                        f"[opspace/rst] backend={_rst_backend} regional_dense={_rst_block_flag}\n"
+                        "[opspace/rst] token_request_grouping=false old_grouped_sparse=false\n"
+                        f"[opspace/rst] bucketed_execution={_rst_block_flag} bucket_chunked={_rst_block_flag}\n"
+                        f"[opspace/rst] exec_tiles_per_block={_rst_exec_tiles} "
+                        f"block_size={_rst_block_size} "
+                        f"blocks_per_lane={_rst_blocks_per_lane}\n"
                         f"  operation_space_repack_enabled={operation_space_repack_enabled}\n"
                         "  vq_repack_used=false\n"
                         "  sector_overflow_execution_used=false\n"
                         "[opspace] active path verified:\n"
-                        "  qk=paired_dense_masked_tau_free_relu2\n"
-                        "  v=dense_masked_tau_free_relu2\n"
-                        "  rst=tile_grouped_sparse_tau_free_relu2\n"
+                        f"  qk.routing={_qk_layout.get('routing_mode', 'unknown')}\n"
+                        f"  qk.execution={_qk_backend}\n"
+                        f"  v.routing={_v_layout.get('routing_mode', 'unknown')}\n"
+                        f"  v.execution={_v_backend}\n"
+                        f"  rst.routing={_rst_layout.get('routing_mode', 'unknown')}\n"
+                        f"  rst.execution={_rst_backend}\n"
                         "  direct_tau_active_for_qk_v_rst=false\n"
-                        "  selection_calibration_active_for_qk_v_rst=false",
+                        "  selection_calibration_active_for_qk_v_rst=false\n"
+                        "  tau_init_required_for_qk_v_rst=false",
                         flush=True)
                 else:
                     print(

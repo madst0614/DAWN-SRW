@@ -2,10 +2,10 @@
 DAWN-SRW v4.1.6.8 operation-space SRW.
 
 When operation_space is enabled:
-- QK uses paired tau-free tile visibility with dense-masked execution.
-- V uses tau-free tile visibility with dense-masked execution.
-- RST uses tau-free lane-local tile visibility with (lane,tile)-grouped sparse
-  execution.
+- routing_mode selects token/operator-space regions.
+- execution_mode selects the physical backend.
+- QK and V default to dense_masked execution.
+- RST defaults to block_bucketed_dense regional block execution.
 - QK/V/RST do not use DirectTau, admission, drive, or selection calibration in
   the active output path.
 - Legacy DirectTau/sector code remains only for disabled operation_space or
@@ -79,18 +79,18 @@ OPSPACE_RUNTIME_DIAG_NAMES = (
     'k_exec',
     'exec_slots',
     'valid_exec_slots_mean',
-    'tile_score_p50',
-    'tile_score_p95',
+    'bucket_capacity',
+    'bucket_fill_mean',
     'selected_lane_top1_frac',
-    'selected_tile_top1_frac',
-    'tile_p99_over_mean',
-    'owner_p99_over_mean',
+    'primary_accept_frac',
+    'bucket_fill_skew',
+    'reroute_frac',
     'relu_gate_count_mean',
     'gate_denominator_mean',
     'gate_mass_mean',
     'effective_ops',
     'padded_exec_slots_mean',
-    'padded_gate_mass',
+    'overflow_frac',
     'no_nan',
     'owner_model_axis',
     'selected_requests',
@@ -104,18 +104,18 @@ OPSPACE_RUNTIME_DIAG_COUNT = len(OPSPACE_RUNTIME_DIAG_NAMES)
     OPSPACE_K_EXEC,
     OPSPACE_EXEC_SLOTS,
     OPSPACE_VALID_EXEC_SLOTS_MEAN,
-    OPSPACE_TILE_SCORE_P50,
-    OPSPACE_TILE_SCORE_P95,
+    OPSPACE_BUCKET_CAPACITY,
+    OPSPACE_BUCKET_FILL_MEAN,
     OPSPACE_SELECTED_LANE_TOP1_FRAC,
-    OPSPACE_SELECTED_TILE_TOP1_FRAC,
-    OPSPACE_TILE_P99_OVER_MEAN,
-    OPSPACE_OWNER_P99_OVER_MEAN,
+    OPSPACE_PRIMARY_ACCEPT_FRAC,
+    OPSPACE_BUCKET_FILL_SKEW,
+    OPSPACE_REROUTE_FRAC,
     OPSPACE_RELU_GATE_COUNT_MEAN,
     OPSPACE_GATE_DENOMINATOR_MEAN,
     OPSPACE_GATE_MASS_MEAN,
     OPSPACE_EFFECTIVE_OPS,
     OPSPACE_PADDED_EXEC_SLOTS_MEAN,
-    OPSPACE_PADDED_GATE_MASS,
+    OPSPACE_OVERFLOW_FRAC,
     OPSPACE_NO_NAN,
     OPSPACE_OWNER_MODEL_AXIS,
     OPSPACE_SELECTED_REQUESTS,
@@ -131,7 +131,7 @@ OPSPACE_REPACK_MIN_ASSIGNMENT_GAIN = 0.03
 OPSPACE_REPACK_MIN_SWAP_GAIN = 0.0
 OPSPACE_OWNER_AXIS = "model_axis"
 OPSPACE_NO_DROP = True
-OPSPACE_BUCKET_OVERFLOW_SEMANTICS = False
+OPSPACE_BUCKET_OVERFLOW_SEMANTICS = True
 
 BENCHMARK_SECTOR_RUNTIME_DIAG_NAMES = (
     'bucket_fill_mean',
@@ -2648,29 +2648,68 @@ def make_sharded_srw_paired_dense_minimal(mesh, max_chunk_size=2048,
                                           admission_den_power=1.0,
                                           admission_den_grad_scale=1.0,
                                           operation_space_mode='direct_tau_dense',
+                                          operation_space_routing_mode=None,
+                                          operation_space_execution_mode=None,
                                           opspace_lanes=8,
                                           opspace_tiles_per_lane=4,
+                                          opspace_exec_tiles_per_block=1,
+                                          opspace_blocks_per_lane=None,
+                                          opspace_block_size=None,
                                           opspace_padded_ops=0,
                                           opspace_tile_size=128,
                                           opspace_k_exec=4,
                                           opspace_token_chunk_size=256):
     """Create a shard_map'd Q/K SRW kernel that returns only paired output."""
-    if str(operation_space_mode).lower() in (
+    routing_mode = str(
+        operation_space_routing_mode
+        if operation_space_routing_mode is not None
+        else operation_space_mode).lower()
+    execution_mode = str(
+        operation_space_execution_mode
+        if operation_space_execution_mode is not None
+        else 'dense_masked').lower()
+    if routing_mode in (
             'factorized_lane_mean',
             'fixed_k4_repack_v1'):
-        return make_sharded_srw_paired_tau_free_relu_dense_masked_minimal(
-            mesh, max_chunk_size=max_chunk_size,
-            dead_exposure_target=dead_exposure_target,
-            soft_gate_effective_active_eps=soft_gate_effective_active_eps,
-            admission_den_power=admission_den_power,
-            admission_den_grad_scale=admission_den_grad_scale,
-            lanes=opspace_lanes,
-            tiles_per_lane=opspace_tiles_per_lane,
-            padded_ops=opspace_padded_ops,
-            tile_size=opspace_tile_size,
-            k_exec=opspace_k_exec,
-            token_chunk_size=opspace_token_chunk_size)
-    del operation_space_mode, opspace_lanes, opspace_tiles_per_lane
+        if execution_mode == 'dense_masked':
+            return make_sharded_srw_paired_tau_free_relu_dense_masked_minimal(
+                mesh, max_chunk_size=max_chunk_size,
+                dead_exposure_target=dead_exposure_target,
+                soft_gate_effective_active_eps=soft_gate_effective_active_eps,
+                admission_den_power=admission_den_power,
+                admission_den_grad_scale=admission_den_grad_scale,
+                lanes=opspace_lanes,
+                tiles_per_lane=opspace_tiles_per_lane,
+                padded_ops=opspace_padded_ops,
+                tile_size=opspace_tile_size,
+                k_exec=opspace_k_exec,
+                token_chunk_size=opspace_token_chunk_size)
+        if execution_mode == 'block_bucketed_dense':
+            return (
+                make_sharded_srw_paired_tau_free_relu_block_bucketed_dense_minimal(
+                    mesh, max_chunk_size=max_chunk_size,
+                    dead_exposure_target=dead_exposure_target,
+                    soft_gate_effective_active_eps=soft_gate_effective_active_eps,
+                    admission_den_power=admission_den_power,
+                    admission_den_grad_scale=admission_den_grad_scale,
+                    lanes=opspace_lanes,
+                    tiles_per_lane=opspace_tiles_per_lane,
+                    padded_ops=opspace_padded_ops,
+                    tile_size=opspace_tile_size,
+                    k_exec=opspace_k_exec,
+                    exec_tiles_per_block=opspace_exec_tiles_per_block,
+                    blocks_per_lane=opspace_blocks_per_lane,
+                    block_size=opspace_block_size,
+                    token_chunk_size=opspace_token_chunk_size))
+        raise ValueError(
+            "operation_space paired QK execution_mode must be "
+            f"'dense_masked' or 'block_bucketed_dense', got "
+            f"{execution_mode!r}.")
+    del operation_space_mode, operation_space_routing_mode
+    del operation_space_execution_mode
+    del opspace_lanes, opspace_tiles_per_lane
+    del opspace_exec_tiles_per_block, opspace_blocks_per_lane
+    del opspace_block_size
     del opspace_padded_ops, opspace_tile_size, opspace_k_exec
     del opspace_token_chunk_size
     del dead_exposure_target
@@ -3013,12 +3052,12 @@ def make_sharded_srw_tau_free_relu_dense_masked_minimal(
             jnp.float32(_k_exec),
             jnp.float32(_exec_slots),
             valid_exec_slots_mean,
-            tile_score_p50,
-            tile_score_p95,
+            jnp.float32(0.0),
+            jnp.float32(0.0),
             selected_lane_top1_frac,
-            selected_tile_top1_frac,
-            selected_tile_p99_over_mean,
-            owner_load_p99_over_mean,
+            jnp.float32(1.0),
+            jnp.float32(0.0),
+            jnp.float32(0.0),
             relu_gate_count_mean,
             gate_denominator_mean,
             gate_mass_mean,
@@ -3179,6 +3218,604 @@ def make_sharded_srw_paired_tau_free_relu_dense_masked_minimal(
         return (raw_out / gate_denominator).astype(jnp.float32)
 
     return fused_gate_srw_paired_tau_free_relu_dense_masked
+
+
+def _opspace_block_bucketed_layout(mesh, lanes, tiles_per_lane, tile_size,
+                                   exec_tiles_per_block, blocks_per_lane,
+                                   block_size):
+    _exec_tiles_per_block = max(1, int(exec_tiles_per_block))
+    _block_size = (
+        int(block_size)
+        if block_size is not None else int(tile_size) * _exec_tiles_per_block)
+    if _block_size != int(tile_size) * _exec_tiles_per_block:
+        raise ValueError(
+            "block_bucketed_dense requires block_size == "
+            "tile_size * exec_tiles_per_block; got "
+            f"block_size={_block_size}, tile_size={int(tile_size)}, "
+            f"exec_tiles_per_block={_exec_tiles_per_block}")
+    if int(tiles_per_lane) % _exec_tiles_per_block != 0:
+        raise ValueError(
+            "block_bucketed_dense requires exec_tiles_per_block to divide "
+            f"tiles_per_lane; got tiles_per_lane={int(tiles_per_lane)}, "
+            f"exec_tiles_per_block={_exec_tiles_per_block}")
+    _blocks_per_lane = int(tiles_per_lane) // _exec_tiles_per_block
+    if blocks_per_lane is not None and int(blocks_per_lane) != _blocks_per_lane:
+        raise ValueError(
+            "block_bucketed_dense blocks_per_lane mismatch: "
+            f"config={int(blocks_per_lane)} derived={_blocks_per_lane}")
+    layout = _opspace_model_axis_layout(
+        mesh, lanes, tiles_per_lane, tile_size)
+    layout.update({
+        'exec_tiles_per_block': _exec_tiles_per_block,
+        'blocks_per_lane': _blocks_per_lane,
+        'block_size': _block_size,
+    })
+    return layout
+
+
+def _opspace_tau_free_relu_block_bucketed_dense_core(
+        flat_x, flat_h, op_key_local, read_local, write_local, *,
+        lanes, tiles_per_lane, tile_size, local_lanes, local_tile_count,
+        local_padded_ops, blocks_per_lane, exec_tiles_per_block, block_size,
+        k_exec, exec_slots, admission_den_power, bucket_capacity_factor=1.25):
+    """Flattened operation-space block executor shared by single and paired."""
+    del exec_tiles_per_block
+    T = int(flat_x.shape[0])
+    D = int(flat_x.shape[-1])
+    d_route = int(flat_h.shape[-1])
+    N_local = int(op_key_local.shape[0])
+    if N_local > local_padded_ops:
+        raise ValueError(
+            "operation-space block_bucketed_dense local rows exceed "
+            f"lane-block slots: rows={N_local}, slots={local_padded_ops}")
+    bucket_capacity = max(
+        1, int(math.ceil(float(bucket_capacity_factor) * float(T)
+                         / float(blocks_per_lane))))
+    bucket_chunk_size = min(1024, bucket_capacity)
+    bucket_chunk_count = (
+        bucket_capacity + bucket_chunk_size - 1) // bucket_chunk_size
+    bucket_padded_capacity = bucket_chunk_count * bucket_chunk_size
+    bucket_capacity_i32 = jnp.asarray(bucket_capacity, dtype=jnp.int32)
+    block_ids = jnp.arange(blocks_per_lane, dtype=jnp.int32)
+
+    (slot_to_row_np, valid_slot_np, _valid_counts_np) = (
+        _opspace_balanced_slot_layout_np(
+            N_local, local_tile_count, tile_size))
+    slot_to_row = jnp.asarray(slot_to_row_np, dtype=jnp.int32)
+    valid_slot = jnp.asarray(valid_slot_np, dtype=jnp.bool_)
+    model_axis_index = jax.lax.axis_index('model')
+
+    op_key_padded = op_key_local[slot_to_row]
+    read_padded = read_local[slot_to_row]
+    write_padded = write_local[slot_to_row]
+    op_key_padded = jnp.where(
+        valid_slot[:, None], op_key_padded, jnp.zeros_like(op_key_padded))
+    read_padded = jnp.where(
+        valid_slot[:, None], read_padded, jnp.zeros_like(read_padded))
+    write_padded = jnp.where(
+        valid_slot[:, None], write_padded, jnp.zeros_like(write_padded))
+
+    op_key_dir = _forward_unit_direction(
+        op_key_padded.astype(jnp.bfloat16).astype(jnp.float32)
+    ).astype(jnp.bfloat16)
+    read_dir = _forward_unit_direction(
+        read_padded.astype(jnp.bfloat16).astype(jnp.float32)
+    ).astype(jnp.bfloat16)
+    write_dir = _forward_unit_direction(
+        write_padded.astype(jnp.bfloat16).astype(jnp.float32)
+    ).astype(jnp.bfloat16)
+
+    key_tiles = op_key_dir.reshape(
+        local_lanes, tiles_per_lane, tile_size, op_key_dir.shape[-1])
+    read_tiles = read_dir.reshape(
+        local_lanes, tiles_per_lane, tile_size, read_dir.shape[-1])
+    write_tiles = write_dir.reshape(
+        local_lanes, tiles_per_lane, tile_size, write_dir.shape[-1])
+    valid_tiles = valid_slot.reshape(local_lanes, tiles_per_lane, tile_size)
+
+    key_blocks = key_tiles.reshape(
+        local_lanes, blocks_per_lane, -1, tile_size,
+        key_tiles.shape[-1]).reshape(
+            local_lanes, blocks_per_lane, block_size, key_tiles.shape[-1])
+    read_blocks = read_tiles.reshape(
+        local_lanes, blocks_per_lane, -1, tile_size,
+        read_tiles.shape[-1]).reshape(
+            local_lanes, blocks_per_lane, block_size, read_tiles.shape[-1])
+    write_blocks = write_tiles.reshape(
+        local_lanes, blocks_per_lane, -1, tile_size,
+        write_tiles.shape[-1]).reshape(
+            local_lanes, blocks_per_lane, block_size, write_tiles.shape[-1])
+    valid_blocks = valid_tiles.reshape(
+        local_lanes, blocks_per_lane, -1, tile_size).reshape(
+            local_lanes, blocks_per_lane, block_size)
+
+    valid_f = valid_blocks.astype(jnp.float32)[..., None]
+    block_count = jnp.maximum(valid_f.sum(axis=2), 1.0)
+    block_center_raw = (
+        key_blocks.astype(jnp.float32) * valid_f).sum(axis=2) / block_count
+    block_center_local = jax.lax.stop_gradient(
+        _forward_unit_direction(block_center_raw)).astype(jnp.bfloat16)
+    block_center_all = jax.lax.all_gather(
+        block_center_local, 'model', axis=0, tiled=True)
+
+    flat_h = _forward_unit_direction(
+        flat_h.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+    flat_x = flat_x.astype(jnp.bfloat16)
+    scores_all = jnp.einsum(
+        'td,lbd->tlb', flat_h, block_center_all).astype(jnp.float32)
+    best_score_by_lane = scores_all.max(axis=-1)
+    _selected_lane_scores, selected_global_lanes = jax.lax.top_k(
+        best_score_by_lane, k_exec)
+    lane_ids_global = jnp.arange(lanes, dtype=jnp.int32)
+    selected_lane_mask_global = jnp.any(
+        selected_global_lanes[:, :, None] == lane_ids_global[None, None, :],
+        axis=1)
+    local_lane_start = model_axis_index * local_lanes
+    selected_lane_mask_local = jax.lax.dynamic_slice_in_dim(
+        selected_lane_mask_global, local_lane_start, local_lanes, axis=1)
+    scores_local = jax.lax.dynamic_slice_in_dim(
+        scores_all, local_lane_start, local_lanes, axis=1)
+    token_ids_all = jnp.arange(T, dtype=jnp.int32)
+
+    def assign_lane(scores_lane, lane_active):
+        _candidate_scores, candidate_blocks = jax.lax.top_k(
+            scores_lane, blocks_per_lane)
+        del _candidate_scores
+
+        def candidate_pass(carry, pass_i):
+            (assigned_block, assigned_slot, unresolved, bucket_counts,
+             primary_accepts, reroute_accepts) = carry
+            candidate = jax.lax.dynamic_index_in_dim(
+                candidate_blocks, pass_i, axis=1, keepdims=False)
+            candidate_match = candidate[:, None] == block_ids[None, :]
+            pass_mask = jnp.logical_and(unresolved[:, None], candidate_match)
+            pass_ranks = jnp.cumsum(pass_mask.astype(jnp.int32), axis=0) - 1
+            rank_for_token = jnp.sum(
+                jnp.where(pass_mask, pass_ranks, 0), axis=1)
+            slot = bucket_counts[candidate] + rank_for_token
+            accept = jnp.logical_and(unresolved, slot < bucket_capacity_i32)
+            accepted_by_block = (
+                candidate_match.astype(jnp.int32)
+                * accept[:, None].astype(jnp.int32)).sum(axis=0)
+            bucket_counts = bucket_counts + accepted_by_block
+            assigned_block = jnp.where(accept, candidate, assigned_block)
+            assigned_slot = jnp.where(accept, slot, assigned_slot)
+            unresolved = jnp.logical_and(unresolved, jnp.logical_not(accept))
+            accept_count = accept.astype(jnp.float32).sum()
+            primary_accepts = primary_accepts + jnp.where(
+                pass_i == jnp.asarray(0, dtype=jnp.int32),
+                accept_count, jnp.float32(0.0))
+            reroute_accepts = reroute_accepts + jnp.where(
+                pass_i == jnp.asarray(0, dtype=jnp.int32),
+                jnp.float32(0.0), accept_count)
+            return (
+                assigned_block, assigned_slot, unresolved, bucket_counts,
+                primary_accepts, reroute_accepts), None
+
+        init = (
+            jnp.full((T,), -1, dtype=jnp.int32),
+            jnp.zeros((T,), dtype=jnp.int32),
+            lane_active.astype(jnp.bool_),
+            jnp.zeros((blocks_per_lane,), dtype=jnp.int32),
+            jnp.float32(0.0),
+            jnp.float32(0.0),
+        )
+        (assigned_block, assigned_slot, unresolved, bucket_counts,
+         primary_accepts, reroute_accepts) = jax.lax.scan(
+            candidate_pass, init,
+            jnp.arange(blocks_per_lane, dtype=jnp.int32))[0]
+
+        def fallback_pass(carry, block_i):
+            (assigned_block, assigned_slot, unresolved, bucket_counts,
+             reroute_accepts) = carry
+            rank_for_token = jnp.cumsum(unresolved.astype(jnp.int32)) - 1
+            slot = bucket_counts[block_i] + rank_for_token
+            accept = jnp.logical_and(unresolved, slot < bucket_capacity_i32)
+            bucket_counts = bucket_counts.at[block_i].add(
+                accept.astype(jnp.int32).sum())
+            assigned_block = jnp.where(accept, block_i, assigned_block)
+            assigned_slot = jnp.where(accept, slot, assigned_slot)
+            unresolved = jnp.logical_and(unresolved, jnp.logical_not(accept))
+            reroute_accepts = reroute_accepts + accept.astype(jnp.float32).sum()
+            return (
+                assigned_block, assigned_slot, unresolved, bucket_counts,
+                reroute_accepts), None
+
+        (assigned_block, assigned_slot, unresolved, bucket_counts,
+         reroute_accepts) = jax.lax.scan(
+            fallback_pass,
+            (assigned_block, assigned_slot, unresolved, bucket_counts,
+             reroute_accepts),
+            jnp.arange(blocks_per_lane, dtype=jnp.int32))[0]
+        unresolved_count = unresolved.astype(jnp.float32).sum()
+        return (assigned_block, assigned_slot, unresolved_count, bucket_counts,
+                primary_accepts, reroute_accepts)
+
+    @jax.checkpoint
+    def lane_step(carry, lane_i):
+        (flat_raw_out, flat_gate_mass, flat_relu_gate_count,
+         processed_count, valid_exec_slots_sum, primary_accept_count,
+         reroute_accept_count, overflow_count, bucket_fill_sum,
+         bucket_fill_max, finite_acc) = carry
+        scores_lane = scores_local[:, lane_i, :]
+        lane_active = selected_lane_mask_local[:, lane_i]
+        (assigned_block, assigned_slot, unresolved_count, bucket_counts,
+         primary_accepts, reroute_accepts) = assign_lane(
+            scores_lane, lane_active)
+        valid_assignment = assigned_block >= 0
+        safe_block = jnp.where(valid_assignment, assigned_block, 0)
+        safe_slot = jnp.where(valid_assignment, assigned_slot, 0)
+        valid_f_token = valid_assignment.astype(jnp.float32)
+
+        bucket_valid_count = jnp.zeros(
+            (blocks_per_lane, bucket_padded_capacity), dtype=jnp.float32)
+        token_id_bucket = jnp.zeros(
+            (blocks_per_lane, bucket_padded_capacity), dtype=jnp.int32)
+        bucket_valid_count = bucket_valid_count.at[
+            safe_block, safe_slot].add(valid_f_token, mode='drop')
+        token_id_bucket = token_id_bucket.at[safe_block, safe_slot].max(
+            token_ids_all * valid_assignment.astype(jnp.int32), mode='drop')
+        assignment_collision_count = jnp.maximum(
+            bucket_valid_count - jnp.float32(1.0), jnp.float32(0.0)).sum()
+        bucket_valid = bucket_valid_count == jnp.float32(1.0)
+
+        key_lane = key_blocks[lane_i]
+        read_lane = read_blocks[lane_i]
+        write_lane = write_blocks[lane_i]
+        valid_lane = valid_blocks[lane_i]
+
+        def chunk_step(chunk_carry, chunk_i):
+            flat_raw_out, flat_gate_mass, flat_relu_gate_count, finite_acc = (
+                chunk_carry)
+            start = chunk_i * bucket_chunk_size
+            token_chunk = jax.lax.dynamic_slice(
+                token_id_bucket, (0, start),
+                (blocks_per_lane, bucket_chunk_size))
+            valid_chunk = jax.lax.dynamic_slice(
+                bucket_valid, (0, start),
+                (blocks_per_lane, bucket_chunk_size))
+            safe_token = jnp.where(valid_chunk, token_chunk, 0)
+            h_chunk = flat_h[safe_token]
+            x_chunk = flat_x[safe_token]
+            valid_chunk_f = valid_chunk.astype(jnp.float32)
+            h_chunk = h_chunk * valid_chunk_f[..., None].astype(jnp.bfloat16)
+            x_chunk = x_chunk * valid_chunk_f[..., None].astype(jnp.bfloat16)
+            rho = jnp.einsum(
+                'bcd,bnd->bcn', h_chunk, key_lane).astype(jnp.float32)
+            read_value = jnp.einsum(
+                'bcd,bnd->bcn', x_chunk, read_lane).astype(jnp.float32)
+            gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
+            gate = gate * valid_chunk_f[..., None]
+            gate = gate * valid_lane.astype(jnp.float32)[:, None, :]
+            raw_out_bucket = jnp.einsum(
+                'bcn,bnd->bcd',
+                (gate * read_value).astype(jnp.bfloat16),
+                write_lane).astype(jnp.float32)
+            gate_mass_bucket = gate.sum(axis=-1, keepdims=True)
+            relu_count_bucket = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
+
+            bucket_valid_f = valid_chunk.reshape(-1).astype(jnp.float32)
+            scatter_token = safe_token.reshape(-1)
+            flat_raw_out = flat_raw_out.at[scatter_token].add(
+                raw_out_bucket.reshape(-1, D) * bucket_valid_f[:, None],
+                mode='drop')
+            flat_gate_mass = flat_gate_mass.at[scatter_token].add(
+                gate_mass_bucket.reshape(-1, 1) * bucket_valid_f[:, None],
+                mode='drop')
+            flat_relu_gate_count = flat_relu_gate_count.at[scatter_token].add(
+                relu_count_bucket.reshape(-1) * bucket_valid_f,
+                mode='drop')
+            finite = jnp.logical_and(
+                jnp.all(jnp.isfinite(gate)),
+                jnp.all(jnp.isfinite(raw_out_bucket)))
+            finite_acc = jnp.minimum(finite_acc, finite.astype(jnp.float32))
+            return (
+                flat_raw_out, flat_gate_mass, flat_relu_gate_count,
+                finite_acc), None
+
+        (flat_raw_out, flat_gate_mass, flat_relu_gate_count,
+         finite_acc) = jax.lax.scan(
+            chunk_step,
+            (flat_raw_out, flat_gate_mass, flat_relu_gate_count, finite_acc),
+            jnp.arange(bucket_chunk_count, dtype=jnp.int32))[0]
+
+        valid_counts_by_block = valid_lane.astype(jnp.float32).sum(axis=1)
+        unique_by_block = bucket_valid.astype(jnp.float32).sum(axis=1)
+        processed_now = unique_by_block.sum()
+        valid_exec_slots_sum = valid_exec_slots_sum + jnp.sum(
+            unique_by_block * valid_counts_by_block)
+        processed_count = processed_count + processed_now
+        primary_accept_count = primary_accept_count + primary_accepts
+        reroute_accept_count = reroute_accept_count + reroute_accepts
+        assignment_error_count = unresolved_count + assignment_collision_count
+        overflow_count = overflow_count + assignment_error_count
+        bucket_fill_sum = bucket_fill_sum + unique_by_block.sum()
+        bucket_fill_max = jnp.maximum(bucket_fill_max, unique_by_block.max())
+        return (
+            flat_raw_out, flat_gate_mass, flat_relu_gate_count,
+            processed_count, valid_exec_slots_sum, primary_accept_count,
+            reroute_accept_count, overflow_count, bucket_fill_sum,
+            bucket_fill_max, finite_acc), None
+
+    init_carry = (
+        jnp.zeros((T, D), dtype=jnp.float32),
+        jnp.zeros((T, 1), dtype=jnp.float32),
+        jnp.zeros((T,), dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(1.0),
+    )
+    (flat_raw_out_local, flat_gate_mass_local, flat_relu_gate_count_local,
+     processed_count_local, valid_exec_slots_sum_local,
+     primary_accept_count_local, reroute_accept_count_local,
+     overflow_count_local, bucket_fill_sum_local, bucket_fill_max_local,
+     compute_no_nan) = jax.lax.scan(
+        lane_step, init_carry,
+        jnp.arange(local_lanes, dtype=jnp.int32))[0]
+
+    global_raw_out = jax.lax.psum(flat_raw_out_local, 'model')
+    global_gate_mass = jax.lax.psum(flat_gate_mass_local, 'model')
+    global_relu_gate_count = jax.lax.psum(
+        flat_relu_gate_count_local, 'model')
+    global_processed_count = jax.lax.psum(processed_count_local, 'model')
+    global_valid_exec_slots_sum = jax.lax.psum(
+        valid_exec_slots_sum_local, 'model')
+    global_primary_accept_count = jax.lax.psum(
+        primary_accept_count_local, 'model')
+    global_reroute_accept_count = jax.lax.psum(
+        reroute_accept_count_local, 'model')
+    global_overflow_count = jax.lax.psum(overflow_count_local, 'model')
+    global_bucket_fill_sum = jax.lax.psum(bucket_fill_sum_local, 'model')
+    global_bucket_fill_max = jax.lax.pmax(bucket_fill_max_local, 'model')
+
+    gate_denominator = jnp.power(
+        jnp.maximum(global_gate_mass, 1.0), admission_den_power)
+    flat_out = global_raw_out / gate_denominator
+
+    def data_sum(v):
+        return jax.lax.pmean(jax.lax.psum(v, 'data'), 'model')
+
+    token_count = jnp.maximum(
+        data_sum(jnp.asarray(T, dtype=jnp.float32)), 1.0)
+    selected_request_count = token_count * jnp.float32(k_exec)
+    processed_request_count = data_sum(global_processed_count)
+    valid_exec_slots_mean = (
+        data_sum(global_valid_exec_slots_sum) / token_count)
+    relu_gate_count_mean = (
+        data_sum(global_relu_gate_count.sum()) / token_count)
+    gate_denominator_mean = (
+        data_sum(gate_denominator.sum()) / token_count)
+    gate_mass_mean = data_sum(global_gate_mass.sum()) / token_count
+    primary_accept_frac = (
+        data_sum(global_primary_accept_count)
+        / jnp.maximum(selected_request_count, 1.0))
+    reroute_frac = (
+        data_sum(global_reroute_accept_count)
+        / jnp.maximum(selected_request_count, 1.0))
+    overflow_count_global = data_sum(global_overflow_count)
+    overflow_frac = overflow_count_global / jnp.maximum(
+        selected_request_count, 1.0)
+    bucket_count_global = jnp.float32(lanes * blocks_per_lane)
+    bucket_fill_mean = (
+        data_sum(global_bucket_fill_sum)
+        / jnp.maximum(bucket_count_global, 1.0))
+    bucket_fill_max = jax.lax.pmax(
+        jax.lax.pmax(global_bucket_fill_max, 'data'), 'model')
+    bucket_fill_skew = bucket_fill_max / jnp.maximum(bucket_fill_mean, 1.0)
+
+    lane_hist = selected_lane_mask_global.astype(jnp.float32).sum(axis=0)
+    lane_hist = jax.lax.pmean(jax.lax.psum(lane_hist, 'data'), 'model')
+    selected_lane_top1_frac = lane_hist.max() / jnp.maximum(
+        lane_hist.sum(), 1.0)
+    score_no_nan = jnp.all(jnp.isfinite(scores_all)).astype(jnp.float32)
+    score_no_nan = jax.lax.pmin(
+        jax.lax.pmin(score_no_nan, 'data'), 'model')
+    compute_no_nan = jax.lax.pmin(
+        jax.lax.pmin(compute_no_nan, 'data'), 'model')
+    out_no_nan = jnp.all(jnp.isfinite(flat_out)).astype(jnp.float32)
+    out_no_nan = jax.lax.pmin(jax.lax.pmin(out_no_nan, 'data'), 'model')
+    no_nan = jnp.minimum(score_no_nan, jnp.minimum(compute_no_nan, out_no_nan))
+    padded_exec_slots_mean = jnp.float32(exec_slots) - valid_exec_slots_mean
+    all_requests_processed = jnp.logical_and(
+        processed_request_count >= selected_request_count - 0.5,
+        overflow_count_global <= 0.0).astype(jnp.float32)
+    layout_ok = jnp.asarray(
+        1.0 if local_padded_ops == (
+            local_lanes * blocks_per_lane * block_size) else 0.0,
+        dtype=jnp.float32)
+
+    diag = jnp.asarray((
+        jnp.float32(1.0),
+        jnp.float32(k_exec),
+        jnp.float32(exec_slots),
+        valid_exec_slots_mean,
+        jnp.float32(bucket_capacity),
+        bucket_fill_mean,
+        selected_lane_top1_frac,
+        primary_accept_frac,
+        bucket_fill_skew,
+        reroute_frac,
+        relu_gate_count_mean,
+        gate_denominator_mean,
+        gate_mass_mean,
+        relu_gate_count_mean,
+        padded_exec_slots_mean,
+        overflow_frac,
+        no_nan,
+        jnp.float32(1.0),
+        selected_request_count,
+        processed_request_count,
+        all_requests_processed,
+        layout_ok,
+    ), dtype=jnp.float32)
+    return flat_out.astype(jnp.float32), global_gate_mass, diag
+
+
+def make_sharded_srw_tau_free_relu_block_bucketed_dense_minimal(
+        mesh, max_chunk_size=2048,
+        dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=1.0,
+        admission_den_grad_scale=1.0,
+        lanes=32,
+        tiles_per_lane=8,
+        padded_ops=0,
+        tile_size=128,
+        k_exec=32,
+        exec_tiles_per_block=2,
+        blocks_per_lane=None,
+        block_size=None,
+        token_chunk_size=256):
+    """Create tau-free relu2 regional block-bucketed dense SRW."""
+    del max_chunk_size, dead_exposure_target, padded_ops, token_chunk_size
+    del soft_gate_effective_active_eps, admission_den_grad_scale
+    layout = _opspace_block_bucketed_layout(
+        mesh, lanes, tiles_per_lane, tile_size, exec_tiles_per_block,
+        blocks_per_lane, block_size)
+    _lanes = layout['lanes']
+    _tiles_per_lane = layout['tiles_per_lane']
+    _tile_size = layout['tile_size']
+    _local_lanes = layout['local_lanes']
+    _local_tile_count = layout['local_tile_count']
+    _local_padded_ops = layout['local_padded_ops']
+    _exec_tiles_per_block = layout['exec_tiles_per_block']
+    _blocks_per_lane = layout['blocks_per_lane']
+    _block_size = layout['block_size']
+    _k_exec = max(1, min(int(k_exec), _lanes))
+    _exec_slots = _k_exec * _block_size
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('model', None),
+                       P(), P(), P(), P(), P(), P()),
+             out_specs=(P('data', None, None), P(), P()),
+             check_rep=False)
+    def fused_gate_srw_tau_free_relu_block_bucketed_dense(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, training_tokens):
+        del raw_tau, soft_gate_temperature, soft_gate_t_final
+        del soft_gate_boundary_power, soft_gate_boundary_power_final
+        del execution_prune_eps, training_tokens
+        B, S, D = x.shape
+        flat_out, _flat_gate_mass, diag = (
+            _opspace_tau_free_relu_block_bucketed_dense_core(
+                x.reshape(int(B) * int(S), D),
+                h.reshape(int(B) * int(S), h.shape[-1]),
+                op_key_local, read_local, write_local,
+                lanes=_lanes,
+                tiles_per_lane=_tiles_per_lane,
+                tile_size=_tile_size,
+                local_lanes=_local_lanes,
+                local_tile_count=_local_tile_count,
+                local_padded_ops=_local_padded_ops,
+                blocks_per_lane=_blocks_per_lane,
+                exec_tiles_per_block=_exec_tiles_per_block,
+                block_size=_block_size,
+                k_exec=_k_exec,
+                exec_slots=_exec_slots,
+                admission_den_power=_admission_den_power))
+        return flat_out.reshape(B, S, D), diag, jnp.float32(0.0)
+
+    fused_gate_srw_tau_free_relu_block_bucketed_dense._v4168_accepts_training_tokens = True
+    return fused_gate_srw_tau_free_relu_block_bucketed_dense
+
+
+def make_sharded_srw_paired_tau_free_relu_block_bucketed_dense_minimal(
+        mesh, max_chunk_size=2048,
+        dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=1.0,
+        admission_den_grad_scale=1.0,
+        lanes=8,
+        tiles_per_lane=4,
+        padded_ops=0,
+        tile_size=128,
+        k_exec=4,
+        exec_tiles_per_block=1,
+        blocks_per_lane=None,
+        block_size=None,
+        token_chunk_size=256):
+    """Create tau-free relu2 paired Q/K block-bucketed dense SRW."""
+    del max_chunk_size, dead_exposure_target, padded_ops, token_chunk_size
+    del soft_gate_effective_active_eps, admission_den_grad_scale
+    layout = _opspace_block_bucketed_layout(
+        mesh, lanes, tiles_per_lane, tile_size, exec_tiles_per_block,
+        blocks_per_lane, block_size)
+    _lanes = layout['lanes']
+    _tiles_per_lane = layout['tiles_per_lane']
+    _tile_size = layout['tile_size']
+    _local_lanes = layout['local_lanes']
+    _local_tile_count = layout['local_tile_count']
+    _local_padded_ops = layout['local_padded_ops']
+    _exec_tiles_per_block = layout['exec_tiles_per_block']
+    _blocks_per_lane = layout['blocks_per_lane']
+    _block_size = layout['block_size']
+    _k_exec = max(1, min(int(k_exec), _lanes))
+    _exec_slots = _k_exec * _block_size
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),
+                       P('data', None, None, None),
+                       P('model', None),
+                       P('data', None, None, None),
+                       P('model', None),
+                       P('model', None),
+                       P(), P(), P(), P(), P(), P()),
+             out_specs=P('data', None, None, None),
+             check_rep=False)
+    def fused_gate_srw_paired_tau_free_relu_block_bucketed_dense(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, training_tokens):
+        del raw_tau, soft_gate_temperature, soft_gate_t_final
+        del soft_gate_boundary_power, soft_gate_boundary_power_final
+        del execution_prune_eps, training_tokens
+        B, S, R, d_route = h.shape
+        D = x.shape[-1]
+        if int(R) != 2:
+            raise ValueError(
+                "operation-space paired QK block_bucketed_dense expects "
+                f"route dimension 2, got {int(R)}.")
+        x_route = jnp.broadcast_to(x[:, :, None, :], (B, S, R, D))
+        flat_out, _flat_gate_mass, _diag = (
+            _opspace_tau_free_relu_block_bucketed_dense_core(
+                x_route.reshape(int(B) * int(S) * int(R), D),
+                h.reshape(int(B) * int(S) * int(R), d_route),
+                op_key_local, read_local, write_local,
+                lanes=_lanes,
+                tiles_per_lane=_tiles_per_lane,
+                tile_size=_tile_size,
+                local_lanes=_local_lanes,
+                local_tile_count=_local_tile_count,
+                local_padded_ops=_local_padded_ops,
+                blocks_per_lane=_blocks_per_lane,
+                exec_tiles_per_block=_exec_tiles_per_block,
+                block_size=_block_size,
+                k_exec=_k_exec,
+                exec_slots=_exec_slots,
+                admission_den_power=_admission_den_power))
+        return flat_out.reshape(B, S, R, D)
+
+    fused_gate_srw_paired_tau_free_relu_block_bucketed_dense._v4168_accepts_training_tokens = True
+    return fused_gate_srw_paired_tau_free_relu_block_bucketed_dense
 
 
 _HARDWARE_REPACK_POOLS = (
@@ -4198,6 +4835,7 @@ def operation_space_static_metrics(model_config, config=None,
         'opspace/owner_model_axis': 1.0,
         'opspace/no_selected_request_drop': 1.0,
         'opspace/bucket_overflow_semantics': 0.0,
+        'opspace/block_bucketed_dense_bucket_capacity_factor': 1.25,
     }
     defaults = {
         'qk': ('n_qk', 8, 4, 128, 4),
@@ -4213,6 +4851,16 @@ def operation_space_static_metrics(model_config, config=None,
         tile_size = int(pcfg.get('tile_size', tile_d))
         k_exec_cfg = pcfg.get('k_exec', k_d)
         k_exec = int(k_exec_cfg) if k_exec_cfg is not None else 0
+        execution_mode = str(pcfg.get(
+            'execution_mode', 'dense_masked')).lower()
+        exec_tiles_per_block = int(pcfg.get(
+            'exec_tiles_per_block',
+            2 if execution_mode == 'block_bucketed_dense' else 1))
+        blocks_per_lane = int(pcfg.get(
+            'blocks_per_lane',
+            max(1, tiles_per_lane // max(1, exec_tiles_per_block))))
+        block_size = int(pcfg.get(
+            'block_size', tile_size * max(1, exec_tiles_per_block)))
         total_tiles = lanes * tiles_per_lane
         owner_count = int(pcfg.get('num_devices', model_axis_size))
         owner_count = max(1, owner_count)
@@ -4220,9 +4868,17 @@ def operation_space_static_metrics(model_config, config=None,
         padded_ops = total_tiles * tile_size
         invalid = max(0, padded_ops - n_ops)
         out[f'opspace/{label}/k_exec'] = float(k_exec)
-        out[f'opspace/{label}/exec_slots'] = float(k_exec * tile_size)
+        out[f'opspace/{label}/exec_slots'] = float(k_exec * block_size)
         out[f'opspace/{label}/selected_tiles'] = float(k_exec)
         out[f'opspace/{label}/tiles_total'] = float(total_tiles)
+        out[f'opspace/{label}/execution_dense_masked'] = float(
+            1.0 if execution_mode == 'dense_masked' else 0.0)
+        out[f'opspace/{label}/execution_block_bucketed_dense'] = float(
+            1.0 if execution_mode == 'block_bucketed_dense' else 0.0)
+        out[f'opspace/{label}/exec_tiles_per_block'] = float(
+            exec_tiles_per_block)
+        out[f'opspace/{label}/blocks_per_lane'] = float(blocks_per_lane)
+        out[f'opspace/{label}/block_size'] = float(block_size)
         out[f'opspace/{label}/tiles_per_model_shard'] = (
             float(total_tiles) / float(owner_count))
         out[f'opspace/{label}/padded_ops'] = float(padded_ops)
@@ -4260,27 +4916,31 @@ def maybe_operation_space_repack(params, opt_state, model_config, mesh, step,
     total_moved = 0.0
     model_axis_size = int(getattr(mesh, 'shape', {}).get('model', 1))
     for pool, op_key_key, _read_key, _write_key, _block_key, _top_key in (
-            _HARDWARE_VQ_REPACK_POOLS):
-        label = 'v' if pool == 'attn_v' else 'rst'
+            _HARDWARE_REPACK_POOLS):
+        label = (
+            'qk' if pool == 'attn_qk'
+            else ('v' if pool == 'attn_v' else 'rst'))
         pcfg = pool_layouts.get(label, {})
         if not isinstance(pcfg, dict):
             pcfg = {}
         rcfg = repack_pools.get(label, {})
         if not isinstance(rcfg, dict):
             rcfg = {}
-        if not bool(rcfg.get('enabled', True)):
+        if not bool(rcfg.get('enabled', label == 'rst')):
             continue
         max_swaps = int(rcfg.get(
-            'max_swaps_per_repack', 64 if label == 'v' else 160))
+            'max_swaps_per_repack', 256 if label == 'rst' else 0))
+        if max_swaps <= 0:
+            continue
         key_device = _forward_unit_direction(
             op_keys[op_key_key].astype(jnp.float32))
         key_host = _global_jax_array_to_host_np(key_device, dtype=np.float32)
         perm, pool_metrics = _plan_operation_space_threshold_repack(
             key_host,
-            lanes=int(pcfg.get('lanes', 4 if label == 'v' else 8)),
+            lanes=int(pcfg.get('lanes', 32 if label == 'rst' else 8)),
             tiles_per_lane=int(pcfg.get(
-                'tiles_per_lane', 48 if label == 'v' else 64)),
-            tile_size=int(pcfg.get('tile_size', 64)),
+                'tiles_per_lane', 8 if label == 'rst' else 4)),
+            tile_size=int(pcfg.get('tile_size', 128)),
             max_swaps_per_repack=max_swaps,
             std_mult=std_mult,
             min_assignment_gain=min_assignment_gain,
@@ -5344,7 +6004,7 @@ def make_sharded_srw_fixed_k4_repack_minimal(
     _k_exec = max(1, min(int(k_exec), _lanes))
     if _k_exec != _lanes:
         raise ValueError(
-            "RST operation-space tile_grouped_sparse requires one best tile "
+            "RST legacy fixed_k4_repack requires one best tile "
             f"per lane: k_exec must equal lanes; got k_exec={_k_exec}, "
             f"lanes={_lanes}")
     _token_chunk_size = max(1, int(token_chunk_size))
@@ -6999,8 +7659,13 @@ def make_sharded_srw_minimal(
         hardware_sector_debug_token_gather_fallback=False,
         benchmark_runtime_metrics=False,
         operation_space_mode='block_sparse',
+        operation_space_routing_mode=None,
+        operation_space_execution_mode=None,
         opspace_lanes=8,
         opspace_tiles_per_lane=12,
+        opspace_exec_tiles_per_block=1,
+        opspace_blocks_per_lane=None,
+        opspace_block_size=None,
         opspace_padded_ops=0,
         opspace_tile_size=128,
         opspace_budget_start_tokens=0.0,
@@ -7027,10 +7692,18 @@ def make_sharded_srw_minimal(
         opspace_lb_peak_end_tokens=22000000000.0,
         opspace_lb_decay_end_tokens=30000000000.0,
         opspace_lb_final_weight_frac=0.10):
-    if str(operation_space_mode).lower() in (
+    routing_mode = str(
+        operation_space_routing_mode
+        if operation_space_routing_mode is not None
+        else operation_space_mode).lower()
+    execution_mode = str(
+        operation_space_execution_mode
+        if operation_space_execution_mode is not None
+        else 'dense_masked').lower()
+    if routing_mode in (
             'factorized_lane_mean',
             'fixed_k4_repack_v1'):
-        if int(opspace_k_exec) < int(opspace_lanes):
+        if execution_mode == 'dense_masked':
             return make_sharded_srw_tau_free_relu_dense_masked_minimal(
                 mesh, max_chunk_size=max_chunk_size,
                 dead_exposure_target=dead_exposure_target,
@@ -7043,18 +7716,25 @@ def make_sharded_srw_minimal(
                 tile_size=opspace_tile_size,
                 k_exec=opspace_k_exec,
                 token_chunk_size=opspace_token_chunk_size)
-        return make_sharded_srw_tau_free_relu_opspace_minimal(
-            mesh, max_chunk_size=max_chunk_size,
-            dead_exposure_target=dead_exposure_target,
-            soft_gate_effective_active_eps=soft_gate_effective_active_eps,
-            admission_den_power=admission_den_power,
-            admission_den_grad_scale=admission_den_grad_scale,
-            lanes=opspace_lanes,
-            tiles_per_lane=opspace_tiles_per_lane,
-            padded_ops=opspace_padded_ops,
-            tile_size=opspace_tile_size,
-            k_exec=opspace_k_exec,
-            token_chunk_size=opspace_token_chunk_size)
+        if execution_mode == 'block_bucketed_dense':
+            return make_sharded_srw_tau_free_relu_block_bucketed_dense_minimal(
+                mesh, max_chunk_size=max_chunk_size,
+                dead_exposure_target=dead_exposure_target,
+                soft_gate_effective_active_eps=soft_gate_effective_active_eps,
+                admission_den_power=admission_den_power,
+                admission_den_grad_scale=admission_den_grad_scale,
+                lanes=opspace_lanes,
+                tiles_per_lane=opspace_tiles_per_lane,
+                padded_ops=opspace_padded_ops,
+                tile_size=opspace_tile_size,
+                k_exec=opspace_k_exec,
+                exec_tiles_per_block=opspace_exec_tiles_per_block,
+                blocks_per_lane=opspace_blocks_per_lane,
+                block_size=opspace_block_size,
+                token_chunk_size=opspace_token_chunk_size)
+        raise ValueError(
+            "operation_space execution_mode must be 'dense_masked' or "
+            f"'block_bucketed_dense', got {execution_mode!r}.")
     if hardware_sector_execution_enabled:
         if hardware_sector_debug_token_gather_fallback:
             return make_sharded_srw_sector_topk_minimal(
