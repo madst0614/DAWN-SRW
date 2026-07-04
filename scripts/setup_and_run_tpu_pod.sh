@@ -25,6 +25,8 @@ TRAIN_SCRIPT="${TRAIN_SCRIPT:-scripts/train_jax.py}"
 TRAIN_ARGS="${TRAIN_ARGS:-}"
 RUN_KIND="${RUN_KIND:-training}"
 WORK_DIR="$HOME/DAWN-SRW"
+TMUX_COLS="${TMUX_COLS:-240}"
+TMUX_ROWS="${TMUX_ROWS:-60}"
 export PYTHONUNBUFFERED=1
 
 echo "=== TPU worker startup ==="
@@ -37,6 +39,7 @@ echo "TRAIN_SCRIPT=$TRAIN_SCRIPT"
 echo "CONFIG=$CONFIG"
 echo "TRAIN_ARGS=$TRAIN_ARGS"
 echo "RUN_KIND=$RUN_KIND"
+echo "TMUX_SIZE=${TMUX_COLS}x${TMUX_ROWS}"
 echo "PYTHON=$(which python3)"
 echo "PYTHON_VERSION=$(python3 --version)"
 
@@ -147,7 +150,7 @@ else
 fi
 
 # Start new tmux session running the target process, tee to ~/train.log
-tmux new-session -d -s train \
+tmux new-session -d -x "$TMUX_COLS" -y "$TMUX_ROWS" -s train \
     "${XLA_DUMP_EXPORT}export PYTHONUNBUFFERED=1; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; ${XLA_FLAGS_EXPORT}{ echo \"=== TPU $RUN_KIND process startup ===\"; echo \"TRAIN_SCRIPT=$TRAIN_SCRIPT\"; echo \"CONFIG=$CONFIG\"; echo \"TRAIN_ARGS=$TRAIN_ARGS\"; echo \"RUN_KIND=$RUN_KIND\"; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"PYTHONUNBUFFERED=\$PYTHONUNBUFFERED\"; python3 -u \"$TRAIN_SCRIPT\" --config \"$CONFIG\" $TRAIN_ARGS; } 2>&1 | tee ~/train.log; echo 'Process finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."

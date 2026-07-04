@@ -16,6 +16,8 @@ FILTER_PATTERN=""
 MODE="tail"
 PRIMARY_DETECT_ATTEMPTS=6
 PRIMARY_DETECT_SLEEP=5
+PANE_COLS="${WATCH_TPU_LOG_COLS:-240}"
+PANE_ROWS="${WATCH_TPU_LOG_ROWS:-60}"
 
 SUMMARY_PATTERN='EVAL |PRUNE .*SUMMARY|PRUNE eps=.*(SKIP|SUMMARY)|USAGE (REDUCE|SUMMARY|HOST DONE)|TRACE (START|prompt|SUMMARY)|ABLATION (START|BASE|job|SUMMARY)|REPORT|Epoch .*complete|Training complete|Val loss|Pruned eval|Best val|Final step|ERROR|FAILED|Traceback|RuntimeError|AssertionError|RESOURCE_EXHAUSTED'
 ERROR_PATTERN='Traceback|RuntimeError|AssertionError|FAILED|ERROR|RESOURCE_EXHAUSTED|OutOfMemory|SIGABRT|Aborted|Terminating process|unhealthy|CONSUMER_INVALID|PERMISSION_DENIED'
@@ -46,6 +48,8 @@ usage() {
         "  --errors               Show error lines only" \
         "  --grep PATTERN         Custom remote grep -E pattern" \
         "  --tail N               Initial tail lines. Default: $TAIL_LINES" \
+        "  --cols N               Width for tmux pane capture. Default: $PANE_COLS" \
+        "  --rows N               Height for tmux pane capture. Default: $PANE_ROWS" \
         "  --no-follow            Print tail and exit" \
         "  --status               Snapshot tmux/process/last-log line on all workers and exit" \
         "" \
@@ -74,6 +78,8 @@ while [[ $# -gt 0 ]]; do
         --errors) FILTER_PATTERN="$ERROR_PATTERN"; shift ;;
         --grep) FILTER_PATTERN="$2"; shift 2 ;;
         --tail) TAIL_LINES="$2"; shift 2 ;;
+        --cols) PANE_COLS="$2"; shift 2 ;;
+        --rows) PANE_ROWS="$2"; shift 2 ;;
         --follow) FOLLOW=1; shift ;;
         --no-follow) FOLLOW=0; shift ;;
         --status) MODE="status"; WORKERS="all"; FOLLOW=0; shift ;;
@@ -88,6 +94,14 @@ if [[ -z "$TPU_NAME" ]]; then
 fi
 if ! [[ "$TAIL_LINES" =~ ^[0-9]+$ ]]; then
     echo "ERROR: --tail must be a non-negative integer." >&2
+    exit 1
+fi
+if ! [[ "$PANE_COLS" =~ ^[0-9]+$ && "$PANE_COLS" -gt 0 ]]; then
+    echo "ERROR: --cols must be a positive integer." >&2
+    exit 1
+fi
+if ! [[ "$PANE_ROWS" =~ ^[0-9]+$ && "$PANE_ROWS" -gt 0 ]]; then
+    echo "ERROR: --rows must be a positive integer." >&2
     exit 1
 fi
 
@@ -137,8 +151,16 @@ filter_range_cmd() {
     fi
 }
 
+resize_pane_cmd() {
+    printf 'tmux resize-window -t %s -x %s -y %s 2>/dev/null || true' \
+        "$pane_target_q" "$PANE_COLS" "$PANE_ROWS"
+}
+
 capture_pane_cmd() {
-    printf 'tmux capture-pane -J -t %s -pS - 2>/dev/null || tmux capture-pane -t %s -pS - 2>/dev/null' \
+    local resize_cmd
+    resize_cmd="$(resize_pane_cmd)"
+    printf '%s; tmux capture-pane -J -t %s -pS - 2>/dev/null || tmux capture-pane -t %s -pS - 2>/dev/null' \
+        "$resize_cmd" \
         "$pane_target_q" "$pane_target_q"
 }
 
@@ -207,8 +229,10 @@ build_auto_tail_cmd() {
     local file_cmd pane_cmd
     file_cmd="$(build_file_tail_cmd)"
     pane_cmd="$(build_pane_tail_cmd)"
-    printf 'if [ -r %s ]; then echo "[watch] source=file log=%s"; %s; else echo "[watch] source=tmux-pane because log file is missing: %s"; %s; fi' \
-        "$remote_log_q" "$REMOTE_LOG" "$file_cmd" "$REMOTE_LOG" "$pane_cmd"
+    printf 'if [ -r %s ]; then echo "[watch] source=file log=%s"; %s; else echo "[watch] waiting for file log=%s; use --pane for tmux screen"; for _i in $(seq 1 15); do [ -r %s ] && break; sleep 2; done; if [ -r %s ]; then echo "[watch] source=file log=%s"; %s; else echo "[watch] source=tmux-pane because log file is still missing: %s"; %s; fi; fi' \
+        "$remote_log_q" "$REMOTE_LOG" "$file_cmd" \
+        "$REMOTE_LOG" "$remote_log_q" "$remote_log_q" "$REMOTE_LOG" \
+        "$file_cmd" "$REMOTE_LOG" "$pane_cmd"
 }
 
 build_tail_cmd() {
@@ -221,7 +245,9 @@ build_tail_cmd() {
 }
 
 build_attach_cmd() {
-    printf 'tmux attach -t %s' "$pane_target_q"
+    local resize_cmd
+    resize_cmd="$(resize_pane_cmd)"
+    printf '%s; tmux attach -t %s' "$resize_cmd" "$pane_target_q"
 }
 
 build_status_cmd() {
@@ -297,6 +323,7 @@ echo "  Zone:    $ZONE"
 echo "  Log:     $REMOTE_LOG"
 echo "  Source:  $SOURCE"
 echo "  Tmux:    $PANE_TARGET"
+echo "  Pane:    ${PANE_COLS}x${PANE_ROWS}"
 echo "  Workers: ${TARGET_WORKERS[*]} (detected=$worker_count)"
 if [[ -n "$PRIMARY_WORKER" ]]; then
     echo "  Primary: gcloud worker $PRIMARY_WORKER"
