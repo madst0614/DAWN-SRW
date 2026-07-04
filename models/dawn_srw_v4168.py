@@ -1,24 +1,15 @@
 """
-DAWN-SRW v4.1.6.8 Sector/Block Sparse SRW
+DAWN-SRW v4.1.6.8 operation-space SRW.
 
-Isolated v4168 experimental model path based on v4166.
-
-Implemented concepts:
-- cosine-space tau reference with bounded sigmoid min/max mapping
-- one-sided generalized Gaussian boundary DirectTau admission
-- boundary-relative drive RW composition
-- RW-derived live-gradient operator-key selection
-- RW-matched operator queries
-- scheduled soft-gate boundary-scale input
-- scheduled boundary power input
-- tau movement controlled by optimizer-side tau_lr_mult
-- train-time effective gate statistics
-- validation-time execution pruning through execution_prune_eps
-- v4168 hardware-sector execution uses VQ/IVF-style coarse sectors for V/RST:
-  host-side balanced VQ periodically packs nearby operator keys into physical
-  sector tiles, token queries select a few coarse sectors, and owner-local
-  buckets execute exact SRW inside selected tiles. QK remains dense-distributed
-  in the first-pass fast path.
+When operation_space is enabled:
+- QK uses paired tau-free tile visibility with dense-masked execution.
+- V uses tau-free tile visibility with dense-masked execution.
+- RST uses tau-free lane-local tile visibility with (lane,tile)-grouped sparse
+  execution.
+- QK/V/RST do not use DirectTau, admission, drive, or selection calibration in
+  the active output path.
+- Legacy DirectTau/sector code remains only for disabled operation_space or
+  compatibility.
 """
 
 
@@ -5461,6 +5452,10 @@ def make_sharded_srw_fixed_k4_repack_minimal(
             sorted_request_ids,
             jnp.zeros((_token_chunk_size,), dtype=jnp.int32),
         ], axis=0)
+        max_group_chunks = max(
+            1, (request_count + _token_chunk_size - 1) // _token_chunk_size)
+        token_chunk_size_i32 = jnp.asarray(_token_chunk_size, dtype=jnp.int32)
+        chunk_offsets = jnp.arange(_token_chunk_size, dtype=jnp.int32)
 
         @jax.checkpoint
         def group_step(carry, group_i):
@@ -5478,19 +5473,16 @@ def make_sharded_srw_fixed_k4_repack_minimal(
             valid_ops_f = valid_ops.astype(jnp.float32)
             valid_count = valid_counts_local[lane_i, tile_i]
 
-            def cond_fn(state):
-                offset = state[0]
-                return offset < group_count
-
-            def body_fn(state):
-                (offset, flat_raw_out, flat_gate_mass, flat_relu_gate_count,
+            def chunk_step(state, chunk_i):
+                (flat_raw_out, flat_gate_mass, flat_relu_gate_count,
                  processed_count, valid_exec_slots_sum, padded_gate_mass,
                  finite_acc) = state
+                offset = chunk_i * token_chunk_size_i32
+                safe_offset = jnp.minimum(
+                    offset, jnp.maximum(group_count - 1, 0))
                 req_ids = jax.lax.dynamic_slice_in_dim(
-                    sorted_request_ids, group_start + offset,
+                    sorted_request_ids, group_start + safe_offset,
                     _token_chunk_size, axis=0)
-                chunk_offsets = jnp.arange(
-                    _token_chunk_size, dtype=jnp.int32)
                 valid_req = chunk_offsets < (group_count - offset)
                 token_ids = request_token[req_ids]
                 x_b = flat_x[token_ids]
@@ -5525,20 +5517,18 @@ def make_sharded_srw_fixed_k4_repack_minimal(
                 finite_acc = jnp.minimum(
                     finite_acc, finite.astype(jnp.float32))
                 return (
-                    offset + jnp.asarray(_token_chunk_size, dtype=jnp.int32),
                     flat_raw_out, flat_gate_mass, flat_relu_gate_count,
                     processed_count, valid_exec_slots_sum,
-                    padded_gate_mass, finite_acc)
+                    padded_gate_mass, finite_acc), None
 
-            (_offset, flat_raw_out, flat_gate_mass, flat_relu_gate_count,
+            (flat_raw_out, flat_gate_mass, flat_relu_gate_count,
              processed_count, valid_exec_slots_sum, padded_gate_mass,
-             finite_acc) = jax.lax.while_loop(
-                cond_fn,
-                body_fn,
-                (jnp.asarray(0, dtype=jnp.int32),
-                 flat_raw_out, flat_gate_mass, flat_relu_gate_count,
+             finite_acc) = jax.lax.scan(
+                chunk_step,
+                (flat_raw_out, flat_gate_mass, flat_relu_gate_count,
                  processed_count, valid_exec_slots_sum, padded_gate_mass,
-                 finite_acc))
+                 finite_acc),
+                jnp.arange(max_group_chunks, dtype=jnp.int32))[0]
             return (
                 flat_raw_out, flat_gate_mass, flat_relu_gate_count,
                 processed_count, valid_exec_slots_sum, padded_gate_mass,
@@ -7330,7 +7320,7 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           admission_den_power=1.0,
                           execution_prune_eps=0.0,
                           training_tokens=0.0):
-    """Minimal v4168 attention path: Block-sparse SRW, causal attention, O-proj."""
+    """Minimal v4168 attention path: tau-free opspace or legacy SRW."""
     del n_qk, n_v, admission_den_power
     B, S, D = x.shape
     soft_gate_T_qk = (
@@ -7361,32 +7351,53 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     h_V = _read_write_operator_query(
         v_read_query, x, router_params['v_op_write_query_proj'])
 
-    raw_tau_all = (
-        x @ router_params['raw_tau_attn']['kernel']
-        + router_params['raw_tau_attn']['bias'])
+    opspace_tau_free = (
+        isinstance(sharded_fns, dict)
+        and bool(sharded_fns.get('operation_space_tau_free', False)))
+    if opspace_tau_free:
+        raw_tau_QK = jnp.zeros((B, S, 2, 1), dtype=x.dtype)
+        raw_tau_Q = raw_tau_QK[:, :, 0, :]
+        raw_tau_K = raw_tau_QK[:, :, 1, :]
+        raw_tau_V = jnp.zeros((B, S, 1), dtype=x.dtype)
+    else:
+        raw_tau_all = (
+            x @ router_params['raw_tau_attn']['kernel']
+            + router_params['raw_tau_attn']['bias'])
+        raw_tau_QK = jnp.stack(
+            [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
+        raw_tau_Q = raw_tau_all[:, :, 0:1]
+        raw_tau_K = raw_tau_all[:, :, 1:2]
+        raw_tau_V = raw_tau_all[:, :, 2:3]
     qk_scale, v_scale, _ = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
 
     if isinstance(sharded_fns, dict):
-        fused_paired = sharded_fns.get(
-            'attn_qk_paired_minimal',
-            sharded_fns.get(
-                'attn_qk_paired', sharded_fns.get('paired', None)))
-        fused_single_qk = None if fused_paired is not None else (
-            sharded_fns.get(
-                'attn_qk_single_minimal',
-                sharded_fns.get('attn_qk_single', None)))
-        fused_single_v = sharded_fns.get(
-            'attn_v_single_minimal',
-            sharded_fns.get('attn_v_single', sharded_fns['single']))
+        if opspace_tau_free:
+            fused_paired = sharded_fns.get('attn_qk_paired_minimal', None)
+            fused_single_qk = None
+            fused_single_v = sharded_fns.get('attn_v_single_minimal', None)
+            if fused_paired is None or fused_single_v is None:
+                raise RuntimeError(
+                    "operation_space enabled but required tau-free QK/V/RST "
+                    "executor is missing")
+        else:
+            fused_paired = sharded_fns.get(
+                'attn_qk_paired_minimal',
+                sharded_fns.get(
+                    'attn_qk_paired', sharded_fns.get('paired', None)))
+            fused_single_qk = None if fused_paired is not None else (
+                sharded_fns.get(
+                    'attn_qk_single_minimal',
+                    sharded_fns.get('attn_qk_single', None)))
+            fused_single_v = sharded_fns.get(
+                'attn_v_single_minimal',
+                sharded_fns.get('attn_v_single', sharded_fns['single']))
     else:
         fused_single_qk = None
         fused_single_v, fused_paired = sharded_fns
 
     if fused_paired is not None:
         h_QK = jnp.stack([h_Q, h_K], axis=2)
-        raw_tau_QK = jnp.stack(
-            [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
         qk_ret = _call_minimal_srw(
             fused_paired,
             x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
@@ -7399,13 +7410,13 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     elif fused_single_qk is not None:
         Q = _call_minimal_srw(
             fused_single_qk,
-            x, h_Q, qk_op_key, raw_tau_all[:, :, 0:1], qk_read, qk_write,
+            x, h_Q, qk_op_key, raw_tau_Q, qk_read, qk_write,
             soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
             soft_gate_boundary_power_final, execution_prune_eps,
             training_tokens)
         K = _call_minimal_srw(
             fused_single_qk,
-            x, h_K, qk_op_key, raw_tau_all[:, :, 1:2], qk_read, qk_write,
+            x, h_K, qk_op_key, raw_tau_K, qk_read, qk_write,
             soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
             soft_gate_boundary_power_final, execution_prune_eps,
             training_tokens)
@@ -7415,7 +7426,7 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     K = K * qk_scale
     v_ret = _call_minimal_srw(
         fused_single_v,
-        x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
+        x, h_V, v_op_key, raw_tau_V, v_read, v_write,
         soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps,
         training_tokens)
@@ -7460,11 +7471,12 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
                          admission_den_power=1.0,
                          execution_prune_eps=0.0,
                          training_tokens=0.0):
-    """Minimal v4168 RST path: one Block-sparse SRW output and residual dropout."""
+    """Minimal v4168 RST path: tau-free opspace or legacy SRW."""
     del admission_den_power
     if d_model is None or n_layers is None:
         raise ValueError(
             "depth-scaled pool outputs require d_model and n_layers.")
+    B, S = x.shape[:2]
     soft_gate_T_rst = (
         soft_gate_temperature if soft_gate_T_rst is None else soft_gate_T_rst)
     pool_params = _ensure_pool_operator_keys(pool_params)
@@ -7480,14 +7492,27 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         rst_read_query, router_dropout, deterministic, rng_drop)
     h = _read_write_operator_query(
         rst_read_query, x, router_params['rst_op_write_query_proj'])
-    raw_tau = (
-        x @ router_params['raw_tau_rst']['kernel']
-        + router_params['raw_tau_rst']['bias'])
+    opspace_tau_free = (
+        isinstance(sharded_fns, dict)
+        and bool(sharded_fns.get('operation_space_tau_free', False)))
+    if opspace_tau_free:
+        raw_tau = jnp.zeros((B, S, 1), dtype=x.dtype)
+    else:
+        raw_tau = (
+            x @ router_params['raw_tau_rst']['kernel']
+            + router_params['raw_tau_rst']['bias'])
     _, _, rst_scale = _pool_output_scales(d_model, n_layers)
     if isinstance(sharded_fns, dict):
-        fused_single = sharded_fns.get(
-            'rst_single_minimal',
-            sharded_fns.get('rst_single', sharded_fns['single']))
+        if opspace_tau_free:
+            fused_single = sharded_fns.get('rst_single_minimal', None)
+            if fused_single is None:
+                raise RuntimeError(
+                    "operation_space enabled but required tau-free QK/V/RST "
+                    "executor is missing")
+        else:
+            fused_single = sharded_fns.get(
+                'rst_single_minimal',
+                sharded_fns.get('rst_single', sharded_fns['single']))
     else:
         fused_single, _ = sharded_fns
     rst_ret = _call_minimal_srw(

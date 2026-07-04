@@ -9799,6 +9799,8 @@ def _print_regular_block(rec, ctx):
     route_std_label = 'rho_std' if is_official_soft_direct_tau else 'score_std'
     def _g(key, default=0.0):
         return float(rec.get(key, default))
+    opspace_active = (
+        is_v4164 and _g('opspace/attn_v/enabled', 0.0) > 0.5)
     aux_note = (
         " aux_is_not_total_minus_ce"
         if is_official_soft_direct_tau
@@ -9812,13 +9814,13 @@ def _print_regular_block(rec, ctx):
     )
     if is_v4164:
         if is_official_soft_direct_tau:
-            log_message(
-                f"  strong: q={rec['attn_q_strong']*100:.1f}%"
-                f" k={rec['attn_k_strong']*100:.1f}%"
-                f" v={rec['attn_v_strong']*100:.1f}%"
-                f" rst={rec['rst_strong']*100:.1f}%"
-            )
-            if _g('opspace/attn_v/enabled', 0.0) <= 0.5:
+            if not opspace_active:
+                log_message(
+                    f"  strong: q={rec['attn_q_strong']*100:.1f}%"
+                    f" k={rec['attn_k_strong']*100:.1f}%"
+                    f" v={rec['attn_v_strong']*100:.1f}%"
+                    f" rst={rec['rst_strong']*100:.1f}%"
+                )
                 _print_active_tau_regular_line(rec)
             _soft_gate_label = (
                 'soft_gate_B'
@@ -9829,31 +9831,31 @@ def _print_regular_block(rec, ctx):
                 f" admission_den_power={rec.get('admission_den_power', rec.get('den_power', 1.0)):.3f}"
                 if _is_active_srw_version(ctx.get('model_version'))
                 else "")
-            if _g('opspace/attn_v/enabled', 0.0) > 0.5:
+            if opspace_active:
                 log_message(
-                    f"  {_soft_gate_label}: qk={rec['soft_gate_T_qk']:.6f}"
-                    f"{_power_part} (QK/V/RST ignored by operation_space)"
+                    "  [opspace] qk/v/rst=tau_free_relu2 "
+                    "direct_tau_active=false "
+                    "selection_calibration_active=false"
                 )
-                log_message(
-                    "  [opspace] v4168 tau_free_relu owner=model_axis"
-                )
-                for _label, _pool in (('v', 'attn_v'), ('rst', 'rst')):
+                for _label, _pool in (
+                        ('qk', 'qk'), ('v', 'attn_v'), ('rst', 'rst')):
                     _lane_part = (
                         f" lane_top1={_g(f'opspace/{_pool}/selected_lane_top1_frac'):.2f}"
+                        if _label == 'rst' else "")
+                    _request_part = (
+                        f" selected_req={_g(f'opspace/{_pool}/selected_requests'):.0f}"
+                        f" processed_req={_g(f'opspace/{_pool}/processed_requests'):.0f}"
+                        f" all_processed={_g(f'opspace/{_pool}/all_processed'):.0f}"
                         if _label == 'rst' else "")
                     log_message(
                         f"  [opspace/{_label}]"
                         f" k_exec={_g(f'opspace/{_pool}/k_exec'):.0f}"
                         f" exec_slots={_g(f'opspace/{_pool}/exec_slots'):.0f}"
                         f"{_lane_part}"
-                        f" tile_top1={_g(f'opspace/{_pool}/selected_tile_top1_frac'):.2f}"
-                        f" tile_p99/mean={_g(f'opspace/{_pool}/tile_p99_over_mean'):.2f}"
-                        f" owner_p99/mean={_g(f'opspace/{_pool}/owner_p99_over_mean'):.2f}"
                         f" gate=relu2"
                         f" gate_mass={_g(f'opspace/{_pool}/gate_mass_mean'):.2f}"
-                        f" selected_req={_g(f'opspace/{_pool}/selected_requests'):.0f}"
-                        f" processed_req={_g(f'opspace/{_pool}/processed_requests'):.0f}"
-                        f" all_processed={_g(f'opspace/{_pool}/all_processed'):.0f}"
+                        f" relu_gate_count={_g(f'opspace/{_pool}/relu_gate_count_mean'):.2f}"
+                        f"{_request_part}"
                     )
             else:
                 log_message(
@@ -9885,9 +9887,10 @@ def _print_regular_block(rec, ctx):
     if is_v4164:
         _weight_label = 'admission'
         _select_status = ""
-        if _g('opspace/attn_v/enabled', 0.0) > 0.5:
+        if opspace_active:
             log_message(
-                "  select: qk/v/rst=tau_free_relu"
+                "  [opspace] select: tile_mean_visibility "
+                "gate=relu2 denominator=max(sum(gate),1)^admission_den_power"
             )
         else:
             log_message(
@@ -10118,14 +10121,20 @@ def _print_regular_block(rec, ctx):
     if _cap_window_line:
         log_message(_cap_window_line)
     if is_v4164:
-        log_message(
-            f"  tau: tau_mean[qk={rec['attn_qk_tau_mean']:+.3f}"
-            f" v={rec['attn_v_tau_mean']:+.3f}"
-            f" rst={rec['rst_tau_mean']:+.3f}]"
-            f" abs[qk={rec['attn_qk_tau_abs_mean']:.3f}"
-            f" v={rec['attn_v_tau_abs_mean']:.3f}"
-            f" rst={rec['rst_tau_abs_mean']:.3f}]"
-        )
+        if opspace_active:
+            log_message(
+                "  [legacy/direct_tau_inactive] "
+                "tau/raw_tau/admission/drive metrics hidden for "
+                "operation-space QK/V/RST")
+        else:
+            log_message(
+                f"  tau: tau_mean[qk={rec['attn_qk_tau_mean']:+.3f}"
+                f" v={rec['attn_v_tau_mean']:+.3f}"
+                f" rst={rec['rst_tau_mean']:+.3f}]"
+                f" abs[qk={rec['attn_qk_tau_abs_mean']:.3f}"
+                f" v={rec['attn_v_tau_abs_mean']:.3f}"
+                f" rst={rec['rst_tau_abs_mean']:.3f}]"
+            )
     else:
         log_message(
             f"  tau: rst_b={rec['tau_rst_bias']:+.2f}"
@@ -10960,6 +10969,11 @@ def main():
         tcfg, cfg['model'], model_version_cfg)
     operation_space_repack_enabled = bool(
         operation_space_repack_config['operation_space_repack_enabled'])
+    operation_space_tau_free_enabled = (
+        str(model_version_cfg) == V4168_MODEL_VERSION
+        and bool(operation_space_repack_config.get(
+            'operation_space_enabled', False))
+    )
     tau_init_cfg = (
         _v4164_tau_init_config(cfg)
         if _is_active_srw_version(model_version_cfg)
@@ -11100,6 +11114,9 @@ def main():
     eval_effective_prune_eps_list = list(tcfg.get(
         'eval_effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
     if not _is_active_srw_version(model_version_cfg):
+        eval_effective_prune_enabled = False
+        eval_effective_prune_eps_list = []
+    if operation_space_tau_free_enabled:
         eval_effective_prune_enabled = False
         eval_effective_prune_eps_list = []
     ignored_tau_ce_grad_scale_keys = (
@@ -11433,6 +11450,11 @@ def main():
             tcfg, cfg['model'], model_version_cfg)
         operation_space_repack_enabled = bool(
             operation_space_repack_config['operation_space_repack_enabled'])
+        operation_space_tau_free_enabled = (
+            str(model_version_cfg) == V4168_MODEL_VERSION
+            and bool(operation_space_repack_config.get(
+                'operation_space_enabled', False))
+        )
         tau_init_cfg = (
             _v4164_tau_init_config(cfg)
             if _is_active_srw_version(model_version_cfg)
@@ -11464,12 +11486,10 @@ def main():
             isinstance(checkpoint_full_training_config, dict)
             and bool(checkpoint_full_training_config.get(
                 'selection_calibration_applied', False)))
-        operation_space_tau_free_resume = bool(
-            operation_space_repack_config.get('operation_space_enabled', False))
         selection_calibration_restore_required = bool(
-            (selection_calibration_cfg.get('enabled', False)
-             and not operation_space_tau_free_resume)
-            or checkpoint_selection_calibration_applied)
+            (not operation_space_tau_free_enabled)
+            and (selection_calibration_cfg.get('enabled', False)
+                 or checkpoint_selection_calibration_applied))
         if selection_calibration_restore_required:
             _require_selection_calibration_resume_fields(
                 checkpoint_full_training_config)
@@ -11582,6 +11602,9 @@ def main():
                     'eval_effective_prune_eps_list',
                     eval_effective_prune_eps_list))
             if not _is_active_srw_version(model_version_cfg):
+                eval_effective_prune_enabled = False
+                eval_effective_prune_eps_list = []
+            if operation_space_tau_free_enabled:
                 eval_effective_prune_enabled = False
                 eval_effective_prune_eps_list = []
             soft_gate_boundary_power_start = float(
@@ -12079,6 +12102,19 @@ def main():
             selection_calibration_cfg.get('raw', {'enabled': False}))
     if isinstance(tcfg.get('operation_space'), dict):
         training_config['operation_space'] = deepcopy(tcfg['operation_space'])
+    if operation_space_tau_free_enabled:
+        _operation_space_training_marks = {
+            'operation_space_tau_free_active': True,
+            'direct_tau_active_for_qk_v_rst': False,
+            'selection_calibration_active_for_qk_v_rst': False,
+            'qk_v_rst_gate_rule': 'relu2_tile_visibility',
+            'rst_backend': 'lane_tile_grouped_sparse',
+            'qk_backend': 'paired_dense_masked',
+            'v_backend': 'dense_masked',
+            'tau_fields_compatibility_only': True,
+        }
+        training_config.update(_operation_space_training_marks)
+        cfg.setdefault('training', {}).update(_operation_space_training_marks)
     if selection_calibration_resume_training_updates:
         training_config.update(selection_calibration_resume_training_updates)
         cfg.setdefault('training', {}).update(
@@ -12536,108 +12572,136 @@ def main():
         if _is_rw_key_srw_version(model_version_cfg):
             print("  RW-key operator path: live-gradient RW keys, "
                   "RW-matched operator queries")
-        print("  Tau parameterization: bounded sigmoid min/max")
-        print("  tau = -1 + 2 * sigmoid(raw_tau)")
-        print("  Boundary admission: one-sided generalized Gaussian")
-        print("  drive = softplus((rho-tau)/B) / softplus((1-tau)/B)")
-        print("  execution_weight = admission * drive")
-        print("  admission_den = max(sum(admission), 1.0) ** admission_den_power")
-        print(
-            "  admission_den_grad = admission_den_grad_scale * live_admission_den_grad "
-            "+ detached remainder")
-        if bool(operation_space_repack_config.get(
-                'operation_space_enabled', False)):
+        if operation_space_tau_free_enabled:
+            _opspace_layouts = operation_space_repack_config.get(
+                'operation_space_pool_layouts', {})
+            if not isinstance(_opspace_layouts, dict):
+                _opspace_layouts = {}
+
+            def _opspace_startup_layout_line(_label):
+                _layout = _opspace_layouts.get(_label, {})
+                if not isinstance(_layout, dict):
+                    _layout = {}
+                return (
+                    f"{_label}: lanes={int(_layout.get('lanes', 0))} "
+                    f"k_exec={int(_layout.get('k_exec', 0))} "
+                    f"tile_size={int(_layout.get('tile_size', 0))} "
+                    f"tiles_per_lane={int(_layout.get('tiles_per_lane', 0))}")
+
+            print("[opspace] v4168 tau-free operation-space active")
+            print("[opspace] QK backend: paired dense-masked tile visibility, gate=relu(rho)^2")
+            print("[opspace] V backend: dense-masked tile visibility, gate=relu(rho)^2")
+            print("[opspace] RST backend: lane-local (lane,tile)-grouped sparse execution, gate=relu(rho)^2")
+            print("[opspace] DirectTau/admission/drive disabled for QK/V/RST outputs")
+            print("[opspace] selection_calibration and tau config retained only for compatibility")
+            print("[opspace] denominator = max(sum(relu2_gate), 1.0) ** admission_den_power")
+            print(f"[opspace] {_opspace_startup_layout_line('qk')}")
+            print(f"[opspace] {_opspace_startup_layout_line('v')}")
+            print(f"[opspace] {_opspace_startup_layout_line('rst')}")
             print(
-                "  [opspace] QK/V/RST override: tau/admission disabled; "
-                "gate=relu(rho)^2; denominator uses gate_mass.",
-                flush=True)
-        print("  Boundary power:")
-        print(
-            f"    start={soft_gate_boundary_power_start} "
-            f"mid={soft_gate_boundary_power_mid} "
-            f"final={soft_gate_boundary_power_final} "
-            f"start_frac={soft_gate_boundary_power_start_frac} "
-            f"mid_frac={soft_gate_boundary_power_mid_frac} "
-            f"final_frac={soft_gate_boundary_power_final_frac}")
-        print("  Admission denominator:")
-        print(
-            f"    admission_den_power={admission_den_power} "
-            f"admission_den_grad_scale={admission_den_grad_scale}")
-        print(f"    pool_specific={pool_specific_gate_t} "
-              f"effective_active_eps={soft_gate_effective_active_eps}")
-        _scale_label = 'B'
-        def _devband_summary(_cfg):
-            return (
-                f"sort={_cfg['sort']} band={_cfg['band']} "
-                f"mid={_cfg['mid']} late={_cfg['late']} "
-                f"final={_cfg['final']} "
-                f"sort_end_frac={_cfg['sort_end_frac']} "
-                f"band_reach_frac={_cfg['band_reach_frac']} "
-                f"formation_end_frac={_cfg['formation_end_frac']} "
-                f"sharpen_end_frac={_cfg['sharpen_end_frac']} "
-                f"formation_power={_cfg['formation_power']} "
-                f"sharpen_power={_cfg['sharpen_power']}")
-        if pool_specific_gate_t:
-            for _pool in POOL_SCHEDULE_NAMES:
-                _cfg = soft_gate_pool_schedules[_pool]
-                _schedule_name = str(_cfg['schedule']).lower()
-                if _schedule_name == 'developmental_band':
-                    print(
-                        f"    {_pool}: schedule={_cfg['schedule']} "
-                        f"{_devband_summary(_cfg)}")
-                else:
-                    _shape_msg = (
-                        f"gompertz_center={_cfg['gompertz_center']} "
-                        f"gompertz_steepness={_cfg['gompertz_steepness']} "
-                        if _schedule_name == 'log_gompertz'
-                        else f"power={_cfg['power']} ")
-                    print(
-                        f"    {_pool}: {_scale_label}_start={_cfg['start']} "
-                        f"{_scale_label}_final={_cfg['final']} "
-                        f"hold_frac={_cfg['hold_frac']} "
-                        f"anneal_end_frac={_cfg['anneal_end_frac']} "
-                        f"schedule={_cfg['schedule']} {_shape_msg}")
-        else:
-            if soft_gate_schedule.lower() == 'developmental_band':
-                _cfg = soft_gate_pool_schedules['qk']
-                print(f"    schedule={soft_gate_schedule} "
-                      f"{_devband_summary(_cfg)}")
-            else:
-                _soft_gate_shape_msg = (
-                    f"gompertz_center={soft_gate_t_gompertz_center} "
-                    f"gompertz_steepness={soft_gate_t_gompertz_steepness} "
-                    if soft_gate_schedule.lower() == 'log_gompertz'
-                    else f"power={soft_gate_t_power} ")
-                print(f"    {_scale_label}_start={soft_gate_t_start} "
-                      f"{_scale_label}_final={soft_gate_t_final} "
-                      f"hold_frac={soft_gate_t_hold_frac} "
-                      f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
-                      f"schedule={soft_gate_schedule} "
-                      f"{_soft_gate_shape_msg}")
-        print(f"  tau control: tau_lr_mult={tau_lr_mult}")
-        if ignored_tau_ce_grad_scale_keys:
-            print("  tau_ce_grad_scale config fields are ignored in "
-                  "v4164; tau movement is controlled by tau_lr_mult.")
-        print("  Effective pruning:")
-        print(
-            f"    console={regular_console_level} "
-            f"host_timing={regular_console_host_timing}")
-        print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
-        if _is_active_srw_version(model_version_cfg):
-            _gate_intensity_part = ""
-            gate_msg = (
-                f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
-                f"tau_init_mode={tau_init_cfg['mode']} "
-                f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
-                f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
-                f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
-                f"{_gate_intensity_part}"
+                f"  Gate ({cfg['model'].get('model_version')} operation-space tau-free): "
+                "direct_tau_active_for_qk_v_rst=false "
+                "selection_calibration_active_for_qk_v_rst=false "
                 f"dropout={cfg['model'].get('dropout', None)} "
-                f"router_dropout={cfg['model'].get('router_dropout', None)}"
-            )
-            print(gate_msg)
-        elif is_baseline:
-            print("  Baseline loss: CE only; SRW tau/selection disabled.")
+                f"router_dropout={cfg['model'].get('router_dropout', None)}")
+            print("  Effective pruning: disabled for operation-space QK/V/RST")
+        else:
+            print("  Tau parameterization: bounded sigmoid min/max")
+            print("  tau = -1 + 2 * sigmoid(raw_tau)")
+            print("  Boundary admission: one-sided generalized Gaussian")
+            print("  drive = softplus((rho-tau)/B) / softplus((1-tau)/B)")
+            print("  execution_weight = admission * drive")
+            print("  admission_den = max(sum(admission), 1.0) ** admission_den_power")
+            print(
+                "  admission_den_grad = admission_den_grad_scale * live_admission_den_grad "
+                "+ detached remainder")
+            print("  Boundary power:")
+            print(
+                f"    start={soft_gate_boundary_power_start} "
+                f"mid={soft_gate_boundary_power_mid} "
+                f"final={soft_gate_boundary_power_final} "
+                f"start_frac={soft_gate_boundary_power_start_frac} "
+                f"mid_frac={soft_gate_boundary_power_mid_frac} "
+                f"final_frac={soft_gate_boundary_power_final_frac}")
+            print("  Admission denominator:")
+            print(
+                f"    admission_den_power={admission_den_power} "
+                f"admission_den_grad_scale={admission_den_grad_scale}")
+            print(f"    pool_specific={pool_specific_gate_t} "
+                  f"effective_active_eps={soft_gate_effective_active_eps}")
+            _scale_label = 'B'
+            def _devband_summary(_cfg):
+                return (
+                    f"sort={_cfg['sort']} band={_cfg['band']} "
+                    f"mid={_cfg['mid']} late={_cfg['late']} "
+                    f"final={_cfg['final']} "
+                    f"sort_end_frac={_cfg['sort_end_frac']} "
+                    f"band_reach_frac={_cfg['band_reach_frac']} "
+                    f"formation_end_frac={_cfg['formation_end_frac']} "
+                    f"sharpen_end_frac={_cfg['sharpen_end_frac']} "
+                    f"formation_power={_cfg['formation_power']} "
+                    f"sharpen_power={_cfg['sharpen_power']}")
+            if pool_specific_gate_t:
+                for _pool in POOL_SCHEDULE_NAMES:
+                    _cfg = soft_gate_pool_schedules[_pool]
+                    _schedule_name = str(_cfg['schedule']).lower()
+                    if _schedule_name == 'developmental_band':
+                        print(
+                            f"    {_pool}: schedule={_cfg['schedule']} "
+                            f"{_devband_summary(_cfg)}")
+                    else:
+                        _shape_msg = (
+                            f"gompertz_center={_cfg['gompertz_center']} "
+                            f"gompertz_steepness={_cfg['gompertz_steepness']} "
+                            if _schedule_name == 'log_gompertz'
+                            else f"power={_cfg['power']} ")
+                        print(
+                            f"    {_pool}: {_scale_label}_start={_cfg['start']} "
+                            f"{_scale_label}_final={_cfg['final']} "
+                            f"hold_frac={_cfg['hold_frac']} "
+                            f"anneal_end_frac={_cfg['anneal_end_frac']} "
+                            f"schedule={_cfg['schedule']} {_shape_msg}")
+            else:
+                if soft_gate_schedule.lower() == 'developmental_band':
+                    _cfg = soft_gate_pool_schedules['qk']
+                    print(f"    schedule={soft_gate_schedule} "
+                          f"{_devband_summary(_cfg)}")
+                else:
+                    _soft_gate_shape_msg = (
+                        f"gompertz_center={soft_gate_t_gompertz_center} "
+                        f"gompertz_steepness={soft_gate_t_gompertz_steepness} "
+                        if soft_gate_schedule.lower() == 'log_gompertz'
+                        else f"power={soft_gate_t_power} ")
+                    print(f"    {_scale_label}_start={soft_gate_t_start} "
+                          f"{_scale_label}_final={soft_gate_t_final} "
+                          f"hold_frac={soft_gate_t_hold_frac} "
+                          f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
+                          f"schedule={soft_gate_schedule} "
+                          f"{_soft_gate_shape_msg}")
+            print(f"  tau control: tau_lr_mult={tau_lr_mult}")
+            if ignored_tau_ce_grad_scale_keys:
+                print("  tau_ce_grad_scale config fields are ignored in "
+                      "v4164; tau movement is controlled by tau_lr_mult.")
+            print("  Effective pruning:")
+            print(
+                f"    console={regular_console_level} "
+                f"host_timing={regular_console_host_timing}")
+            print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
+            if _is_active_srw_version(model_version_cfg):
+                _gate_intensity_part = ""
+                gate_msg = (
+                    f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
+                    f"tau_init_mode={tau_init_cfg['mode']} "
+                    f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
+                    f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
+                    f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
+                    f"{_gate_intensity_part}"
+                    f"dropout={cfg['model'].get('dropout', None)} "
+                    f"router_dropout={cfg['model'].get('router_dropout', None)}"
+                )
+                print(gate_msg)
+            elif is_baseline:
+                print("  Baseline loss: CE only; SRW tau/selection disabled.")
 
     # ----------------------------------------------------------
     # Resume defaults. Orbax state restore runs after mesh sharding so
@@ -12664,15 +12728,13 @@ def main():
     tau_init_summary = None
     selection_calibration_summary = None
     selection_calibration_tau_applied = False
-    operation_space_tau_free_enabled = bool(
-        operation_space_repack_config.get('operation_space_enabled', False))
     if (selection_calibration_cfg.get('enabled', False)
             and operation_space_tau_free_enabled
             and not _has_resume_checkpoint):
         if is_host0:
             print(
-                "[opspace] selection_calibration kept for config "
-                "compatibility but skipped for tau-free QK/V/RST.",
+                "[opspace] selection_calibration present in config but "
+                "skipped: tau-free QK/V/RST do not use tau/admission.",
                 flush=True)
     elif (selection_calibration_cfg.get('enabled', False)
             and not _has_resume_checkpoint):
@@ -13047,8 +13109,7 @@ def main():
     # Shard params using the model-version-specific policy.
     param_shardings = get_param_shardings(
         params, mesh, model_version_cfg,
-        operation_space_enabled=bool(operation_space_repack_config.get(
-            'operation_space_enabled', False)))
+        operation_space_enabled=operation_space_tau_free_enabled)
     if is_host0:
         _print_param_sharding_summary(param_shardings, model_version_cfg)
     params = shard_params_to_mesh(params, param_shardings)
@@ -13229,9 +13290,7 @@ def main():
             cfg.get('model', {}).get('operation_space', {}))
         if not isinstance(_opspace_cfg, dict):
             _opspace_cfg = {}
-        _opspace_enabled = (
-            str(model_version_cfg) == V4168_MODEL_VERSION
-            and bool(_opspace_cfg.get('enabled', False)))
+        _opspace_enabled = operation_space_tau_free_enabled
         _opspace_pools = (
             _opspace_cfg.get('pools', {})
             if isinstance(_opspace_cfg.get('pools', {}), dict) else {})
@@ -13319,8 +13378,19 @@ def main():
                 **_factory_kwargs(_paired_factory, _srw_pool_kwargs('qk')))
             _sharded_paired_attn_qk_minimal = None
             if make_sharded_srw_paired_minimal is not None:
-                if (str(model_version_cfg) == V4168_MODEL_VERSION
-                        and make_sharded_srw_paired_dense_minimal is not None):
+                if operation_space_tau_free_enabled:
+                    if make_sharded_srw_paired_dense_minimal is None:
+                        raise RuntimeError(
+                            "operation_space enabled but required tau-free "
+                            "QK/V/RST executor is missing")
+                    _sharded_paired_attn_qk_minimal = (
+                        make_sharded_srw_paired_dense_minimal(
+                            max_chunk_size=attn_qk_max_chunk,
+                            **_factory_kwargs(
+                                make_sharded_srw_paired_dense_minimal,
+                                _srw_pool_kwargs('qk'))))
+                elif (str(model_version_cfg) == V4168_MODEL_VERSION
+                      and make_sharded_srw_paired_dense_minimal is not None):
                     _sharded_paired_attn_qk_minimal = (
                         make_sharded_srw_paired_dense_minimal(
                             max_chunk_size=attn_qk_max_chunk,
@@ -13363,9 +13433,45 @@ def main():
                     "v4167 TP extras require dict-style sharded_fns.")
             _v4167_extra_fns = _extra_factory(mesh, cfg)
             _sharded_fns.update(_v4167_extra_fns)
+        if operation_space_tau_free_enabled:
+            if hardware_repack_enabled or hardware_sector_execution_enabled:
+                raise RuntimeError(
+                    "operation_space enabled requires hardware repack and "
+                    "hardware sector execution to remain disabled.")
+            if not isinstance(_sharded_fns, dict):
+                raise RuntimeError(
+                    "operation_space enabled but required tau-free QK/V/RST "
+                    "executor is missing")
+            _required_opspace_layouts = {'qk', 'v', 'rst'}
+            if (not isinstance(_opspace_layouts, dict)
+                    or set(_opspace_layouts) & _required_opspace_layouts
+                    != _required_opspace_layouts):
+                raise RuntimeError(
+                    "operation_space enabled but required QK/V/RST pool "
+                    "layout is missing")
+            _rst_layout = _opspace_layouts['rst']
+            if int(_rst_layout.get('k_exec', -1)) != int(
+                    _rst_layout.get('lanes', -2)):
+                raise RuntimeError(
+                    "operation_space RST requires k_exec == lanes for "
+                    "tile-grouped sparse execution")
+            for _required_executor in (
+                    'attn_qk_paired_minimal',
+                    'attn_v_single_minimal',
+                    'rst_single_minimal'):
+                if _sharded_fns.get(_required_executor, None) is None:
+                    raise RuntimeError(
+                        "operation_space enabled but required tau-free "
+                        "QK/V/RST executor is missing")
+            _sharded_fns.update({
+                'operation_space_tau_free': True,
+                'qk_backend': 'paired_dense_masked',
+                'v_backend': 'dense_masked',
+                'rst_backend': 'tile_grouped_sparse',
+            })
         # Analysis (observation only). Factory kwargs forward analysis=True
         # only when the v4164 factory advertises the kwarg.
-        if _supports_analysis:
+        if _supports_analysis and not operation_space_tau_free_enabled:
             _sharded_single_v_a = make_sharded_srw(
                 analysis=True, max_chunk_size=attn_v_max_chunk,
                 **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('v')))
@@ -13413,10 +13519,14 @@ def main():
                  if _opspace_enabled else "QK dense-distributed")
                 if str(model_version_cfg) == V4168_MODEL_VERSION
                 else "QK fused")
+            _analysis_kernel_status = (
+                "off"
+                if operation_space_tau_free_enabled
+                else ("on" if _supports_analysis else "off"))
             print(f"  shard_map enabled (mesh_model={mesh_model}, {_qk_mode_msg}"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
-                  f"; analysis kernels={'on' if _supports_analysis else 'off'}"
+                  f"; analysis kernels={_analysis_kernel_status}"
                   f"{_extra_msg})")
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 if _opspace_enabled:
@@ -13433,18 +13543,18 @@ def main():
                     _rst_local_lanes = max(1, _rst_lanes // _model_shards)
                     _rst_tpl = int(_rst_layout.get('tiles_per_lane', 8))
                     print(
-                        f"[opspace] v4168 tau_free_relu enabled tile={_tile}\n"
-                        "[opspace] qk_backend=dense_masked "
+                        f"[opspace] v4168 tau-free operation-space active tile={_tile}\n"
+                        "[opspace] qk_backend=paired_dense_masked "
                         "v_backend=dense_masked "
                         "rst_backend=tile_grouped_sparse\n"
-                        "[opspace] QK/V/RST tau/admission disabled; "
+                        "[opspace] DirectTau/admission/drive disabled for QK/V/RST outputs; "
                         "relu-squared tile operation active.\n"
                         f"[opspace/qk] lanes={int(_qk_layout.get('lanes', 8))} "
                         f"k_exec={int(_qk_layout.get('k_exec', 4))} "
                         f"tiles={_qk_tiles} "
                         f"tiles_per_lane={int(_qk_layout.get('tiles_per_lane', 4))} "
                         f"exec_logic_slots={int(_qk_layout.get('k_exec', 4)) * _tile} "
-                        "backend=dense_masked gate=relu2\n"
+                        "backend=paired_dense_masked gate=relu2\n"
                         f"[opspace/v] lanes={int(_v_layout.get('lanes', 8))} "
                         f"k_exec={int(_v_layout.get('k_exec', 5))} "
                         f"tiles={_v_tiles} "
@@ -13463,7 +13573,13 @@ def main():
                         f"requests_per_token_global={_rst_lanes}\n"
                         f"  operation_space_repack_enabled={operation_space_repack_enabled}\n"
                         "  vq_repack_used=false\n"
-                        "  sector_overflow_execution_used=false",
+                        "  sector_overflow_execution_used=false\n"
+                        "[opspace] active path verified:\n"
+                        "  qk=paired_dense_masked_tau_free_relu2\n"
+                        "  v=dense_masked_tau_free_relu2\n"
+                        "  rst=tile_grouped_sparse_tau_free_relu2\n"
+                        "  direct_tau_active_for_qk_v_rst=false\n"
+                        "  selection_calibration_active_for_qk_v_rst=false",
                         flush=True)
                 else:
                     print(
@@ -13620,7 +13736,9 @@ def main():
                 soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
                 admission_den_power=admission_den_power)
     # v4164 analysis_step is active when the full analysis kernels exist.
-    if _sharded_fns_analysis is not None:
+    if operation_space_tau_free_enabled:
+        analysis_step_fn = None
+    elif _sharded_fns_analysis is not None:
         analysis_step_fn = create_analysis_step(
             model, sharded_fns=_sharded_fns_analysis,
             total_training_steps=total_steps,
@@ -13841,6 +13959,10 @@ def main():
                 raise _SkipBreakdown("speed check disabled")
             if is_baseline:
                 raise _SkipBreakdown("baseline has no SRW layer breakdown")
+            if operation_space_tau_free_enabled:
+                raise _SkipBreakdown(
+                    "operation-space tau-free path disables legacy DirectTau "
+                    "component breakdown")
 
             _is_sharded = _sharded_fns is not None
             _uses_scan_offset = _is_active_srw_version(model_version)
@@ -14382,13 +14504,9 @@ def main():
     LOG_REGULAR = log_interval
     LOG_ANALYSIS = max(1, log_interval * log_analysis_multiplier)
     LOG_GEOMETRY = max(1, LOG_REGULAR * heavy_geometry_multiplier)
-    operation_space_enabled_runtime = (
-        str(model_version_cfg) == V4168_MODEL_VERSION
-        and isinstance(cfg.get('training', {}).get('operation_space'), dict)
-        and bool(cfg['training']['operation_space'].get('enabled', False)))
     main_val_path = (
         'operation_space_tau_free_relu'
-        if operation_space_enabled_runtime else (
+        if operation_space_tau_free_enabled else (
             'sector_bucketed'
             if hardware_sector_execution_enabled
             else ('block_sparse_fallback'
@@ -14485,7 +14603,7 @@ def main():
                         bucketed_execution_enabled=
                         hardware_sector_execution_enabled).items()
                 })
-            if operation_space_enabled_runtime:
+            if operation_space_tau_free_enabled:
                 metrics.update({
                     k: jnp.asarray(v, dtype=jnp.float32)
                     for k, v in _v4168_operation_space_static_metrics(
