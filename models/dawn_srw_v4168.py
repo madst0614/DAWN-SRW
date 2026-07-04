@@ -2780,6 +2780,14 @@ def _hardware_perm_checksum(perm):
     return np.int64(np.sum(weights * (perm64 + np.int64(1))))
 
 
+def _hardware_perm_checksum_meta(checksum):
+    """Signed int32 checksum value stable through TPU multihost allgather."""
+    value = int(checksum) & 0xffffffff
+    if value >= 0x80000000:
+        value -= 0x100000000
+    return int(value)
+
+
 def _validate_hardware_permutation_np(perm, n_ops=None, pool=''):
     perm = np.asarray(perm, dtype=np.int32)
     expected_n = int(perm.size if n_ops is None else n_ops)
@@ -3549,13 +3557,14 @@ def _canonical_hardware_permutation_across_hosts(perm, pool=''):
     """Return the process-0 permutation on every host, with loud validation."""
     perm = _validate_hardware_permutation_np(perm, pool=pool)
     checksum = _hardware_perm_checksum(perm)
+    checksum_meta = _hardware_perm_checksum_meta(checksum)
     if jax.process_count() <= 1:
         return perm, checksum, 1.0
 
     from jax.experimental.multihost_utils import process_allgather
 
     local_meta = np.asarray(
-        [int(perm.size), int(checksum)], dtype=np.int64)
+        [int(perm.size), int(checksum_meta)], dtype=np.int32)
     all_meta = np.asarray(process_allgather(local_meta)).reshape(-1, 2)
     if not np.all(all_meta[:, 0] == int(perm.size)):
         raise RuntimeError(
@@ -3569,8 +3578,9 @@ def _canonical_hardware_permutation_across_hosts(perm, pool=''):
             dtype=np.int32)
         perm = _validate_hardware_permutation_np(perm, pool=pool)
         checksum = _hardware_perm_checksum(perm)
+        checksum_meta = _hardware_perm_checksum_meta(checksum)
     except Exception as exc:
-        if not np.all(all_meta[:, 1] == int(checksum)):
+        if not np.all(all_meta[:, 1] == int(checksum_meta)):
             raise RuntimeError(
                 f"hardware repack {pool} permutation checksum mismatch "
                 f"across hosts and broadcast failed: "
@@ -3579,10 +3589,10 @@ def _canonical_hardware_permutation_across_hosts(perm, pool=''):
 
     final_meta = np.asarray(
         process_allgather(
-            np.asarray([int(perm.size), int(checksum)], dtype=np.int64))
+            np.asarray([int(perm.size), int(checksum_meta)], dtype=np.int32))
     ).reshape(-1, 2)
     if (not np.all(final_meta[:, 0] == int(perm.size))
-            or not np.all(final_meta[:, 1] == int(checksum))):
+            or not np.all(final_meta[:, 1] == int(checksum_meta))):
         raise RuntimeError(
             f"hardware repack {pool} broadcast produced inconsistent "
             f"permutation metadata: {final_meta.tolist()}")
