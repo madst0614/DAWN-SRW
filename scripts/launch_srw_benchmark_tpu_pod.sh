@@ -2,9 +2,10 @@
 # =============================================================================
 # DAWN-SRW TPU Pod Benchmark Launcher
 # =============================================================================
+# Launches scripts/benchmark_srw_tpu.py on every TPU host. Pass --config more
 # than once to run configs sequentially and print the comparison in ~/train.log.
-# With a single standard v4166/v4168 400M config, the matching comparison config
-# is added automatically unless --no-auto-compare is passed.
+# Config selection is explicit by default; use --auto-compare to add the
+# matching standard v4166/v4168 400M config automatically.
 # =============================================================================
 
 set -euo pipefail
@@ -23,7 +24,7 @@ XLA_DUMP_BASE=""
 GH_TOKEN=""
 DUMMY_DATA="0"
 ALLOW_MODEL_VERSION_OVERRIDE="0"
-AUTO_COMPARE="1"
+AUTO_COMPARE="0"
 FORCE_VQ_REPACK="1"
 
 usage() {
@@ -41,7 +42,8 @@ Options:
   --xla-dump [DIR]               Enable XLA dumps (default: enabled)
   --no-xla-dump                  Disable XLA dumps
   --dummy-data                   Explicit synthetic-data smoke test
-  --no-auto-compare              Do not auto-add the matching v4166/v4168 config
+  --auto-compare                 Auto-add the matching standard v4166/v4168 config
+  --no-auto-compare              Keep only explicitly supplied configs (default)
   --no-force-vq-repack           Do not force one v4168 VQ repack before measure
   --token TOKEN                  GitHub token for private repos
   -h, --help
@@ -100,6 +102,7 @@ while [[ $# -gt 0 ]]; do
         --no-xla-dump) XLA_DUMP_ENABLED="0"; shift ;;
         --dummy-data) DUMMY_DATA="1"; shift ;;
         --allow-model-version-override) ALLOW_MODEL_VERSION_OVERRIDE="1"; shift ;;
+        --auto-compare) AUTO_COMPARE="1"; shift ;;
         --no-auto-compare) AUTO_COMPARE="0"; shift ;;
         --no-force-vq-repack) FORCE_VQ_REPACK="0"; shift ;;
         --token) GH_TOKEN="$2"; shift 2 ;;
