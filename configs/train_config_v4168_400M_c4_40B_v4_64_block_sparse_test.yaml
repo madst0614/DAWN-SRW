@@ -77,7 +77,7 @@ training:
         lane_output_mode: lane_local
 
     repack:
-      enabled: true
+      enabled: false
       start_step: 1000
       interval_steps: 100
       max_swaps:

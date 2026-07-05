@@ -4122,6 +4122,65 @@ def _opspace_execute_bucket_outputs_pallas(
             valid_blocks, token_id_bucket, bucket_valid, bucket_fill)
 
 
+def _opspace_execute_bucket_outputs_pallas_trainable_impl(
+        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
+        token_id_bucket, bucket_valid, bucket_fill, bucket_chunk_size,
+        bucket_chunk_count, interpret):
+    return _opspace_execute_bucket_outputs_pallas(
+        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
+        token_id_bucket, bucket_valid, bucket_fill,
+        bucket_chunk_size=bucket_chunk_size,
+        bucket_chunk_count=bucket_chunk_count,
+        interpret=interpret)
+
+
+_opspace_execute_bucket_outputs_pallas_trainable = jax.custom_vjp(
+    _opspace_execute_bucket_outputs_pallas_trainable_impl,
+    nondiff_argnums=(9, 10, 11))
+
+
+def _opspace_execute_bucket_outputs_pallas_trainable_fwd(
+        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
+        token_id_bucket, bucket_valid, bucket_fill, bucket_chunk_size,
+        bucket_chunk_count, interpret):
+    out = _opspace_execute_bucket_outputs_pallas_trainable_impl(
+        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
+        token_id_bucket, bucket_valid, bucket_fill, bucket_chunk_size,
+        bucket_chunk_count, interpret)
+    return out, (
+        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
+        token_id_bucket, bucket_valid, bucket_fill)
+
+
+def _opspace_execute_bucket_outputs_pallas_trainable_bwd(
+        bucket_chunk_size, bucket_chunk_count, interpret, residual, cotangent):
+    del interpret
+    (flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
+     token_id_bucket, bucket_valid, bucket_fill) = residual
+
+    def ref_outputs(_flat_x, _flat_h, _key_blocks, _read_blocks,
+                    _write_blocks):
+        lane_raw_out, lane_gate_mass, lane_relu_count, _compute_no_nan = (
+            _opspace_execute_buckets_jax(
+                _flat_x, _flat_h, _key_blocks, _read_blocks, _write_blocks,
+                valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
+                bucket_chunk_size=bucket_chunk_size,
+                bucket_chunk_count=bucket_chunk_count))
+        return lane_raw_out, lane_gate_mass, lane_relu_count
+
+    _, pullback = jax.vjp(
+        ref_outputs, flat_x, flat_h, key_blocks, read_blocks, write_blocks)
+    grad_x, grad_h, grad_key, grad_read, grad_write = pullback(cotangent)
+    return (
+        grad_x, grad_h, grad_key, grad_read, grad_write,
+        None, None, None, None)
+
+
+_opspace_execute_bucket_outputs_pallas_trainable.defvjp(
+    _opspace_execute_bucket_outputs_pallas_trainable_fwd,
+    _opspace_execute_bucket_outputs_pallas_trainable_bwd)
+
+
 def _opspace_pallas_execute_buckets(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill, *, bucket_chunk_size,
@@ -4148,12 +4207,10 @@ def _opspace_pallas_execute_buckets(
 
     if use_pallas and _PALLAS_API_AVAILABLE:
         lane_raw_out, lane_gate_mass, lane_relu_count = (
-            _opspace_execute_bucket_outputs_pallas(
+            _opspace_execute_bucket_outputs_pallas_trainable(
                 flat_x, flat_h, key_blocks, read_blocks, write_blocks,
                 valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
-                bucket_chunk_size=bucket_chunk_size,
-                bucket_chunk_count=bucket_chunk_count,
-                interpret=pallas_interpret))
+                bucket_chunk_size, bucket_chunk_count, pallas_interpret))
         lane_raw_out = jnp.where(
             assigned_lane_token[:, :, None], lane_raw_out, jnp.float32(0.0))
         lane_gate_mass = jnp.where(

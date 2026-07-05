@@ -108,7 +108,7 @@ training:
   eval_effective_prune_eps_list:
     - 0.01
     - 0.1
-  hardware_repack_enabled: true
+  hardware_repack_enabled: false
   hardware_sector_execution_enabled: true
   hardware_repack_interval_steps: 100
   hardware_repack_farthest_per_sector: 10
