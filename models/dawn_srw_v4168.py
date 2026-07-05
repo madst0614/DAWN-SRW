@@ -5007,6 +5007,12 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     def data_sum(v):
         return jax.lax.pmean(jax.lax.psum(v, 'data'), 'model')
 
+    def metric_pmax(v, axis_name):
+        return jax.lax.pmax(jax.lax.stop_gradient(v), axis_name)
+
+    def metric_pmin(v, axis_name):
+        return jax.lax.pmin(jax.lax.stop_gradient(v), axis_name)
+
     token_count = jnp.maximum(
         data_sum(jnp.asarray(T, dtype=jnp.float32)), 1.0)
     visible_blocks_per_region_f = jnp.float32(_visible_blocks_per_region)
@@ -5054,7 +5060,7 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     global_assignment_collision_count = jax.lax.psum(
         assignment_collision_count, 'model')
     global_bucket_fill_sum = jax.lax.psum(bucket_fill_sum_local, 'model')
-    global_bucket_fill_max = jax.lax.pmax(bucket_fill_max_local, 'model')
+    global_bucket_fill_max = metric_pmax(bucket_fill_max_local, 'model')
 
     accepted_region_request_count = data_sum(
         admission['accepted_request_count'])
@@ -5097,8 +5103,8 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     bucket_fill_mean = (
         data_sum(global_bucket_fill_sum)
         / jnp.maximum(bucket_count_global, 1.0))
-    bucket_fill_max = jax.lax.pmax(
-        jax.lax.pmax(global_bucket_fill_max, 'data'), 'model')
+    bucket_fill_max = metric_pmax(
+        metric_pmax(global_bucket_fill_max, 'data'), 'model')
     bucket_fill_skew = bucket_fill_max / jnp.maximum(bucket_fill_mean, 1.0)
 
     region_load_all = jax.lax.all_gather(
@@ -5133,12 +5139,12 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         region_high_regret_spill_count
         / jnp.maximum(selected_region_request_count, 1.0))
     score_no_nan = jnp.all(jnp.isfinite(scores_all)).astype(jnp.float32)
-    score_no_nan = jax.lax.pmin(
-        jax.lax.pmin(score_no_nan, 'data'), 'model')
-    compute_no_nan = jax.lax.pmin(
-        jax.lax.pmin(compute_no_nan, 'data'), 'model')
+    score_no_nan = metric_pmin(
+        metric_pmin(score_no_nan, 'data'), 'model')
+    compute_no_nan = metric_pmin(
+        metric_pmin(compute_no_nan, 'data'), 'model')
     out_no_nan = jnp.all(jnp.isfinite(flat_out)).astype(jnp.float32)
-    out_no_nan = jax.lax.pmin(jax.lax.pmin(out_no_nan, 'data'), 'model')
+    out_no_nan = metric_pmin(metric_pmin(out_no_nan, 'data'), 'model')
     no_nan = jnp.minimum(score_no_nan, jnp.minimum(compute_no_nan, out_no_nan))
     padded_exec_slots_mean = jnp.float32(exec_slots) - valid_exec_slots_mean
     all_requests_processed = jnp.logical_and(
@@ -5194,10 +5200,10 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     region_score_loss_mean = (
         data_sum(admission['score_loss_sum'])
         / jnp.maximum(accepted_region_request_count, 1.0))
-    region_score_loss_p95 = jax.lax.pmax(
-        jax.lax.pmax(admission['score_loss_p95'], 'model'), 'data')
-    region_score_loss_max = jax.lax.pmax(
-        jax.lax.pmax(admission['score_loss_max'], 'model'), 'data')
+    region_score_loss_p95 = metric_pmax(
+        metric_pmax(admission['score_loss_p95'], 'model'), 'data')
+    region_score_loss_max = metric_pmax(
+        metric_pmax(admission['score_loss_max'], 'model'), 'data')
     selected_mask = selected_f > 0.0
     assigned_mask = assigned_valid_f > 0.0
     # Keep final diagnostics cheap in the training step: exact global p95
@@ -5212,14 +5218,14 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         primary_regret_metric, selected_mask, 95.0)
     local_regret_max = jnp.max(jnp.where(
         selected_mask, primary_regret_metric, jnp.float32(0.0)))
-    assignment_score_loss_p95 = jax.lax.pmax(
-        jax.lax.pmax(local_score_loss_p95, 'model'), 'data')
-    assignment_score_loss_max = jax.lax.pmax(
-        jax.lax.pmax(local_score_loss_max, 'model'), 'data')
-    assignment_regret_p95 = jax.lax.pmax(
-        jax.lax.pmax(local_regret_p95, 'model'), 'data')
-    assignment_regret_max = jax.lax.pmax(
-        jax.lax.pmax(local_regret_max, 'model'), 'data')
+    assignment_score_loss_p95 = metric_pmax(
+        metric_pmax(local_score_loss_p95, 'model'), 'data')
+    assignment_score_loss_max = metric_pmax(
+        metric_pmax(local_score_loss_max, 'model'), 'data')
+    assignment_regret_p95 = metric_pmax(
+        metric_pmax(local_regret_p95, 'model'), 'data')
+    assignment_regret_max = metric_pmax(
+        metric_pmax(local_regret_max, 'model'), 'data')
     low_regret_spill_frac = (
         data_sum(jax.lax.psum(
             low_regret_spill.astype(jnp.float32).sum(), 'model'))
