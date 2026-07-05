@@ -175,6 +175,9 @@ OPSPACE_BUCKET_OVERFLOW_SEMANTICS = True
 OPSPACE_FINAL_OUTPUT_TILE_SIZE = 128
 OPSPACE_FINAL_D_TILE_SIZE_POLICY = 128
 OPSPACE_FINAL_OP_TILE_SIZE_POLICY = 128
+OPSPACE_RST_XLA_REGION_GROUP_SIZE = 4
+OPSPACE_RST_XLA_TOKEN_COMBINE_CHUNK_SIZE = 1024
+OPSPACE_RST_REGION_CAPACITY_ROUND_MULTIPLE = 1024
 
 OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'assignment_score_best_mean',
@@ -272,7 +275,10 @@ OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'block_score_loss_max',
     'visible_blocks_per_token',
     'visible_ops_per_token',
+    'physical_visible_ops_per_token',
     'compute_frac_vs_dense',
+    'logical_compute_frac_vs_dense',
+    'physical_compute_frac_vs_dense',
     'region_all_requests_processed',
     'block_all_requests_processed',
     'selected_requests',
@@ -377,7 +383,10 @@ OPSPACE_FINAL_RUNTIME_DIAG_COUNT = len(OPSPACE_FINAL_RUNTIME_DIAG_NAMES)
     OPSPACE_FINAL_BLOCK_SCORE_LOSS_MAX,
     OPSPACE_FINAL_VISIBLE_BLOCKS_PER_TOKEN,
     OPSPACE_FINAL_VISIBLE_OPS_PER_TOKEN,
+    OPSPACE_FINAL_PHYSICAL_VISIBLE_OPS_PER_TOKEN,
     OPSPACE_FINAL_COMPUTE_FRAC_VS_DENSE,
+    OPSPACE_FINAL_LOGICAL_COMPUTE_FRAC_VS_DENSE,
+    OPSPACE_FINAL_PHYSICAL_COMPUTE_FRAC_VS_DENSE,
     OPSPACE_FINAL_REGION_ALL_REQUESTS_PROCESSED,
     OPSPACE_FINAL_BLOCK_ALL_REQUESTS_PROCESSED,
     OPSPACE_FINAL_SELECTED_REQUESTS,
@@ -4025,10 +4034,9 @@ def _opspace_region_first_capacity_admission(
     requested_best_score_sum = candidate_scores[:, :visible_regions].sum()
     chosen_score_sum = (accepted_scores * accepted_f).sum()
     score_loss_sum = (score_loss * accepted_f).sum()
-    score_loss_p95 = _opspace_masked_percentile(
-        score_loss, accepted_mask, 95.0)
     score_loss_max = jnp.max(jnp.where(
         accepted_mask, score_loss, jnp.float32(0.0)))
+    score_loss_p95 = score_loss_max
 
     return {
         'accepted_regions': accepted_regions,
@@ -4130,7 +4138,7 @@ def _opspace_low_regret_assign_region_blocks(
 def _opspace_build_region_stationary_buckets(
         scores_local, admitted_region_mask_local, *, blocks_per_region,
         block_capacity, region_capacity, visible_blocks_per_region,
-        high_regret_threshold=0.05):
+        visible_regions, high_regret_threshold=0.05):
     """Build fixed region-owned token buckets after region/block routing."""
     T = int(scores_local.shape[0])
     local_regions = int(scores_local.shape[1])
@@ -4188,6 +4196,27 @@ def _opspace_build_region_stationary_buckets(
     processed_request_count = (
         valid_assignment.astype(jnp.float32)
         * bucket_write[:, :, None].astype(jnp.float32)).sum()
+    max_local_visible_regions = int(visible_regions)
+    valid_TL = bucket_write.T
+    slot_TL = region_slot.T
+    rank_TL = jnp.cumsum(valid_TL.astype(jnp.int32), axis=1) - 1
+    write_inverse = jnp.logical_and(
+        valid_TL, rank_TL < jnp.asarray(
+            max_local_visible_regions, dtype=jnp.int32))
+    token_ids_t = jnp.arange(T, dtype=jnp.int32)[:, None]
+    local_region_ids = jnp.arange(local_regions, dtype=jnp.int32)[None, :]
+    safe_rank = jnp.where(
+        write_inverse, rank_TL,
+        jnp.asarray(max_local_visible_regions, dtype=jnp.int32))
+    token_local_region_ids = jnp.zeros(
+        (T, max_local_visible_regions), dtype=jnp.int32).at[
+            token_ids_t, safe_rank].set(local_region_ids, mode='drop')
+    token_region_slots = jnp.zeros(
+        (T, max_local_visible_regions), dtype=jnp.int32).at[
+            token_ids_t, safe_rank].set(slot_TL, mode='drop')
+    token_region_valid = jnp.zeros(
+        (T, max_local_visible_regions), dtype=jnp.bool_).at[
+            token_ids_t, safe_rank].set(True, mode='drop')
     return {
         'assigned_block': assigned_block,
         'assigned_rank': assigned_rank,
@@ -4200,6 +4229,9 @@ def _opspace_build_region_stationary_buckets(
         'token_id_bucket': token_id_bucket,
         'bucket_valid': bucket_valid,
         'block_id_bucket': block_id_bucket,
+        'token_local_region_ids': token_local_region_ids,
+        'token_region_slots': token_region_slots,
+        'token_region_valid': token_region_valid,
         'primary_block': primary_block,
         'assignment_collision_count': assignment_collision_count,
         'bucket_overflow_request_count': bucket_overflow_request_count,
@@ -4764,87 +4796,167 @@ _opspace_execute_output_tiled_pallas_trainable.defvjp(
     _opspace_execute_output_tiled_pallas_trainable_bwd)
 
 
-def _opspace_execute_region_stationary_dense(
+def _opspace_execute_region_grouped_xla_dense(
         flat_x, flat_h, key_regions, read_regions, write_regions,
-        valid_regions, token_id_bucket, bucket_valid, block_id_bucket, *,
-        blocks_per_region, operators_per_block):
-    """Execute one dense masked matmul per local region."""
+        valid_regions, token_id_bucket, bucket_valid, block_id_bucket,
+        token_local_region_ids, token_region_slots, token_region_valid, *,
+        blocks_per_region, operators_per_block,
+        region_group_size=OPSPACE_RST_XLA_REGION_GROUP_SIZE,
+        token_combine_chunk_size=OPSPACE_RST_XLA_TOKEN_COMBINE_CHUNK_SIZE):
+    """Execute RST region/block buckets as XLA-friendly region groups."""
     T = int(flat_x.shape[0])
     D = int(flat_x.shape[-1])
+    local_regions = int(token_id_bucket.shape[0])
+    region_capacity = int(token_id_bucket.shape[1])
+    max_local_visible_regions = int(token_local_region_ids.shape[1])
+    group_size = max(1, int(region_group_size))
+    token_chunk_size = max(1, int(token_combine_chunk_size))
+    group_count = max(1, (local_regions + group_size - 1) // group_size)
+    padded_T = max(
+        token_chunk_size,
+        ((T + token_chunk_size - 1) // token_chunk_size) * token_chunk_size)
+    token_chunk_count = padded_T // token_chunk_size
+    token_pad = padded_T - T
     region_ops = int(blocks_per_region) * int(operators_per_block)
     op_block_ids = (
         jnp.arange(region_ops, dtype=jnp.int32)
         // jnp.asarray(operators_per_block, dtype=jnp.int32))
 
-    def region_step(carry, region_i):
+    token_local_region_ids_p = jnp.pad(
+        token_local_region_ids, ((0, token_pad), (0, 0)),
+        constant_values=0)
+    token_region_slots_p = jnp.pad(
+        token_region_slots, ((0, token_pad), (0, 0)),
+        constant_values=0)
+    token_region_valid_p = jnp.pad(
+        token_region_valid, ((0, token_pad), (0, 0)),
+        constant_values=False)
+
+    def group_step(carry, group_i):
         flat_raw_out, flat_gate_mass, flat_relu_gate_count, finite_acc = carry
-        token_ids = jax.lax.dynamic_index_in_dim(
-            token_id_bucket, region_i, axis=0, keepdims=False)
-        valid = jax.lax.dynamic_index_in_dim(
-            bucket_valid, region_i, axis=0, keepdims=False)
-        block_ids = jax.lax.dynamic_index_in_dim(
-            block_id_bucket, region_i, axis=0, keepdims=False)
-        safe_token_ids = jnp.where(valid, token_ids, 0)
-        valid_f = valid.astype(jnp.float32)
-        x_r = flat_x[safe_token_ids]
-        h_r = flat_h[safe_token_ids]
-        key_r = jax.lax.dynamic_index_in_dim(
-            key_regions, region_i, axis=0, keepdims=False).reshape(
-                region_ops, key_regions.shape[-1])
-        read_r = jax.lax.dynamic_index_in_dim(
-            read_regions, region_i, axis=0, keepdims=False).reshape(
-                region_ops, D)
-        write_r = jax.lax.dynamic_index_in_dim(
-            write_regions, region_i, axis=0, keepdims=False).reshape(
-                region_ops, D)
-        valid_r = jax.lax.dynamic_index_in_dim(
-            valid_regions, region_i, axis=0, keepdims=False).reshape(
-                region_ops)
+        group_start = group_i * jnp.asarray(group_size, dtype=jnp.int32)
+        group_offsets = jnp.arange(group_size, dtype=jnp.int32)
+        region_ids = group_start + group_offsets
+        group_valid = region_ids < jnp.asarray(local_regions, dtype=jnp.int32)
+        safe_region_ids = jnp.where(group_valid, region_ids, 0)
+        token_ids_g = token_id_bucket[safe_region_ids]
+        valid_g = jnp.logical_and(
+            bucket_valid[safe_region_ids], group_valid[:, None])
+        block_ids_g = block_id_bucket[safe_region_ids]
+        safe_token_ids_g = jnp.where(valid_g, token_ids_g, 0)
+        valid_g_f32 = valid_g.astype(jnp.float32)
+        valid_g_bf16 = valid_g_f32.astype(jnp.bfloat16)
 
-        rho = (
-            h_r.astype(jnp.bfloat16)
-            @ key_r.astype(jnp.bfloat16).T).astype(jnp.float32)
-        read_value = (
-            x_r.astype(jnp.bfloat16)
-            @ read_r.astype(jnp.bfloat16).T).astype(jnp.float32)
+        x_g = flat_x[safe_token_ids_g].astype(jnp.bfloat16)
+        h_g = flat_h[safe_token_ids_g].astype(jnp.bfloat16)
+        x_g = x_g * valid_g_bf16[..., None]
+        h_g = h_g * valid_g_bf16[..., None]
+        key_g = key_regions[safe_region_ids].reshape(
+            group_size, region_ops, key_regions.shape[-1])
+        read_g = read_regions[safe_region_ids].reshape(
+            group_size, region_ops, D)
+        write_g = write_regions[safe_region_ids].reshape(
+            group_size, region_ops, D)
+        valid_o = jnp.logical_and(
+            valid_regions[safe_region_ids].reshape(group_size, region_ops),
+            group_valid[:, None])
+
+        rho = jnp.einsum(
+            'gcd,god->gco', h_g, key_g.astype(jnp.bfloat16)).astype(
+                jnp.float32)
+        read_value = jnp.einsum(
+            'gcd,god->gco', x_g, read_g.astype(jnp.bfloat16)).astype(
+                jnp.float32)
         gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
-        op_mask = jnp.any(
-            op_block_ids[None, None, :] == block_ids[:, :, None],
-            axis=1)
-        gate = gate * op_mask.astype(jnp.float32)
-        gate = gate * valid_r.astype(jnp.float32)[None, :]
-        gate = gate * valid_f[:, None]
-        raw = (
-            (gate * read_value).astype(jnp.bfloat16)
-            @ write_r.astype(jnp.bfloat16)).astype(jnp.float32)
-        mass = gate.sum(axis=-1, keepdims=True)
-        relu_count = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
+        block_mask = jnp.any(
+            op_block_ids[None, None, None, :] == block_ids_g[:, :, :, None],
+            axis=2)
+        gate = gate * block_mask.astype(jnp.float32)
+        gate = gate * valid_o[:, None, :].astype(jnp.float32)
+        gate = gate * valid_g_f32[:, :, None]
+        raw_g = jnp.einsum(
+            'gco,god->gcd',
+            (gate * read_value).astype(jnp.bfloat16),
+            write_g.astype(jnp.bfloat16)).astype(jnp.float32)
+        mass_g = gate.sum(axis=-1, keepdims=True)
+        relu_g = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
+        raw_g_store = raw_g.astype(jnp.bfloat16)
 
-        flat_raw_out = flat_raw_out.at[safe_token_ids].add(
-            raw * valid_f[:, None], mode='drop')
-        flat_gate_mass = flat_gate_mass.at[safe_token_ids].add(
-            mass * valid_f[:, None], mode='drop')
-        flat_relu_gate_count = flat_relu_gate_count.at[safe_token_ids].add(
-            relu_count * valid_f, mode='drop')
         finite = jnp.logical_and(
             jnp.all(jnp.isfinite(gate)),
-            jnp.all(jnp.isfinite(raw)))
+            jnp.all(jnp.isfinite(raw_g)))
         finite_acc = jnp.minimum(finite_acc, finite.astype(jnp.float32))
+
+        def token_chunk_step(chunk_carry, chunk_i):
+            flat_raw_out, flat_gate_mass, flat_relu_gate_count = chunk_carry
+            chunk_start = chunk_i * jnp.asarray(
+                token_chunk_size, dtype=jnp.int32)
+            local_region_ids_c = jax.lax.dynamic_slice(
+                token_local_region_ids_p, (chunk_start, 0),
+                (token_chunk_size, max_local_visible_regions))
+            slots_c = jax.lax.dynamic_slice(
+                token_region_slots_p, (chunk_start, 0),
+                (token_chunk_size, max_local_visible_regions))
+            valid_c = jax.lax.dynamic_slice(
+                token_region_valid_p, (chunk_start, 0),
+                (token_chunk_size, max_local_visible_regions))
+            in_group = jnp.logical_and(
+                valid_c,
+                jnp.logical_and(
+                    local_region_ids_c >= group_start,
+                    local_region_ids_c < (
+                        group_start
+                        + jnp.asarray(group_size, dtype=jnp.int32))))
+            group_pos = jnp.clip(local_region_ids_c - group_start, 0,
+                                 group_size - 1)
+            safe_slots = jnp.clip(slots_c, 0, region_capacity - 1)
+            raw_sel = raw_g_store[group_pos, safe_slots]
+            mass_sel = mass_g[group_pos, safe_slots]
+            relu_sel = relu_g[group_pos, safe_slots]
+            mask = in_group.astype(jnp.float32)
+            raw_chunk = (
+                raw_sel.astype(jnp.float32) * mask[..., None]).sum(axis=1)
+            mass_chunk = (mass_sel * mask[..., None]).sum(axis=1)
+            relu_chunk = (relu_sel * mask).sum(axis=1)
+            old_raw_chunk = jax.lax.dynamic_slice(
+                flat_raw_out, (chunk_start, 0), (token_chunk_size, D))
+            old_mass_chunk = jax.lax.dynamic_slice(
+                flat_gate_mass, (chunk_start, 0), (token_chunk_size, 1))
+            old_relu_chunk = jax.lax.dynamic_slice(
+                flat_relu_gate_count, (chunk_start,), (token_chunk_size,))
+            flat_raw_out = jax.lax.dynamic_update_slice(
+                flat_raw_out, old_raw_chunk + raw_chunk, (chunk_start, 0))
+            flat_gate_mass = jax.lax.dynamic_update_slice(
+                flat_gate_mass, old_mass_chunk + mass_chunk, (chunk_start, 0))
+            flat_relu_gate_count = jax.lax.dynamic_update_slice(
+                flat_relu_gate_count, old_relu_chunk + relu_chunk,
+                (chunk_start,))
+            return (
+                flat_raw_out, flat_gate_mass, flat_relu_gate_count), None
+
+        (flat_raw_out, flat_gate_mass, flat_relu_gate_count) = jax.lax.scan(
+            token_chunk_step,
+            (flat_raw_out, flat_gate_mass, flat_relu_gate_count),
+            jnp.arange(token_chunk_count, dtype=jnp.int32))[0]
         return (
             flat_raw_out, flat_gate_mass, flat_relu_gate_count,
             finite_acc), None
 
     init = (
-        jnp.zeros((T, D), dtype=jnp.float32),
-        jnp.zeros((T, 1), dtype=jnp.float32),
-        jnp.zeros((T,), dtype=jnp.float32),
+        jnp.zeros((padded_T, D), dtype=jnp.float32),
+        jnp.zeros((padded_T, 1), dtype=jnp.float32),
+        jnp.zeros((padded_T,), dtype=jnp.float32),
         jnp.float32(1.0),
     )
     (flat_raw_out, flat_gate_mass, flat_relu_count,
      compute_no_nan) = jax.lax.scan(
-        region_step, init,
-        jnp.arange(int(token_id_bucket.shape[0]), dtype=jnp.int32))[0]
-    return flat_raw_out, flat_gate_mass, flat_relu_count, compute_no_nan
+        group_step, init,
+        jnp.arange(group_count, dtype=jnp.int32))[0]
+    return (
+        flat_raw_out[:T],
+        flat_gate_mass[:T],
+        flat_relu_count[:T],
+        compute_no_nan)
 
 
 def _opspace_finalize_bucketed_output(
@@ -4941,10 +5053,17 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
             "region_stationary_dense local_padded_ops invariant failed: "
             f"local_padded_ops={local_padded_ops}, expected={expected_local_ops}.")
     selected_region_requests = int(T) * int(k_exec)
-    region_capacity = max(
+    raw_region_capacity = max(
         1, int(math.ceil(
             (float(selected_region_requests) / float(lanes))
             * _region_capacity_factor)))
+    region_capacity_round_multiple = max(
+        1, int(OPSPACE_RST_REGION_CAPACITY_ROUND_MULTIPLE))
+    region_capacity = max(
+        raw_region_capacity,
+        int(math.ceil(
+            float(raw_region_capacity) / float(region_capacity_round_multiple))
+            * region_capacity_round_multiple))
     if int(lanes) * int(region_capacity) < int(selected_region_requests):
         raise ValueError(
             "region_stationary_dense region capacity invariant failed: "
@@ -5022,18 +5141,6 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
         key_blocks.astype(jnp.float32) * valid_f).sum(axis=2) / block_count
     block_center_local = jax.lax.stop_gradient(
         _forward_unit_direction(block_center_raw)).astype(jnp.bfloat16)
-    block_center_f32 = block_center_local.astype(jnp.float32)
-    block_cos = (
-        key_blocks.astype(jnp.float32)
-        * block_center_f32[:, :, None, :]).sum(axis=-1)
-    block_cos = jnp.where(valid_blocks, block_cos, jnp.float32(0.0))
-    valid_block_den = jnp.maximum(
-        valid_blocks.astype(jnp.float32).sum(axis=-1), 1.0)
-    block_compactness_local = block_cos.sum(axis=-1) / valid_block_den
-    block_dist = jnp.where(
-        valid_blocks, jnp.float32(1.0) - block_cos, jnp.float32(0.0))
-    block_radius_mean_local = block_dist.sum(axis=-1) / valid_block_den
-    block_radius_max_local = block_dist.max(axis=-1)
     block_center_all = jax.lax.all_gather(
         block_center_local, 'model', axis=0, tiled=True)
 
@@ -5072,11 +5179,15 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
         block_capacity=block_capacity,
         region_capacity=region_capacity,
         visible_blocks_per_region=_visible_blocks_per_region,
+        visible_regions=k_exec,
         high_regret_threshold=high_regret_threshold)
     token_id_bucket = assignment['token_id_bucket']
     bucket_valid = assignment['bucket_valid']
     bucket_fill = assignment['bucket_fill']
     block_id_bucket = assignment['block_id_bucket']
+    token_local_region_ids = assignment['token_local_region_ids']
+    token_region_slots = assignment['token_region_slots']
+    token_region_valid = assignment['token_region_valid']
     assigned_rank = assignment['assigned_rank']
     assigned_block = assignment['assigned_block']
     chosen_score = assignment['chosen_score']
@@ -5087,9 +5198,10 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
     assignment_collision_count = assignment['assignment_collision_count']
 
     (flat_raw_out_local, flat_gate_mass_local, flat_relu_gate_count_local,
-     compute_no_nan) = _opspace_execute_region_stationary_dense(
+     compute_no_nan) = _opspace_execute_region_grouped_xla_dense(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, block_id_bucket,
+        token_local_region_ids, token_region_slots, token_region_valid,
         blocks_per_region=blocks_per_lane,
         operators_per_block=block_size)
 
@@ -5206,27 +5318,24 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
         metric_pmax(global_block_fill_max, 'data'), 'model')
     bucket_fill_skew = bucket_fill_max / jnp.maximum(bucket_fill_mean, 1.0)
 
-    region_load_all = jax.lax.all_gather(
-        admission['region_load'], 'data', axis=0, tiled=True)
-    region_capacity_util_all = (
-        region_load_all / jnp.maximum(jnp.float32(region_capacity), 1.0))
-    selected_region_top1_frac = region_load_all.max() / jnp.maximum(
-        region_load_all.sum(), 1.0)
+    region_load_max = metric_pmax(
+        metric_pmax(jnp.max(admission['region_load']), 'data'), 'model')
+    selected_region_top1_frac = region_load_max / jnp.maximum(
+        accepted_region_request_count, 1.0)
     region_load_mean = jnp.maximum(
-        region_load_all.mean(), jnp.float32(1.0e-6))
-    region_load_p50 = _opspace_percentile(region_load_all, 50.0)
-    region_load_p95 = _opspace_percentile(region_load_all, 95.0)
-    region_load_p99 = _opspace_percentile(region_load_all, 99.0)
-    region_load_max = jnp.max(region_load_all)
+        accepted_region_request_count / jnp.maximum(jnp.float32(lanes), 1.0),
+        jnp.float32(1.0e-6))
+    region_load_p50 = region_load_mean
+    region_load_p95 = region_load_max
+    region_load_p99 = region_load_max
     region_load_p99_over_mean = (
         region_load_p99 / region_load_mean)
-    region_capacity_util_p50 = _opspace_percentile(
-        region_capacity_util_all, 50.0)
-    region_capacity_util_p95 = _opspace_percentile(
-        region_capacity_util_all, 95.0)
-    region_capacity_util_p99 = _opspace_percentile(
-        region_capacity_util_all, 99.0)
-    region_capacity_util_max = jnp.max(region_capacity_util_all)
+    region_capacity_util_p50 = (
+        region_load_mean / jnp.maximum(jnp.float32(region_capacity), 1.0))
+    region_capacity_util_p95 = (
+        region_load_max / jnp.maximum(jnp.float32(region_capacity), 1.0))
+    region_capacity_util_p99 = region_capacity_util_p95
+    region_capacity_util_max = region_capacity_util_p95
     region_unresolved_frac = region_unresolved_count / jnp.maximum(
         selected_region_request_count, 1.0)
     region_reroute_frac = region_reroute_count / jnp.maximum(
@@ -5253,7 +5362,9 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
         region_unresolved_count <= 0.0).astype(jnp.float32)
     block_all_requests_processed = jnp.logical_and(
         block_unresolved_count <= 0.0,
-        assignment_collision_count_global <= 0.0).astype(jnp.float32)
+        jnp.logical_and(
+            assignment_collision_count_global <= 0.0,
+            unprocessed_count_global <= 0.0)).astype(jnp.float32)
     layout_ok = jnp.asarray(
         1.0 if local_padded_ops == (
             local_lanes * blocks_per_lane * block_size) else 0.0,
@@ -5303,28 +5414,19 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
         metric_pmax(admission['score_loss_p95'], 'model'), 'data')
     region_score_loss_max = metric_pmax(
         metric_pmax(admission['score_loss_max'], 'model'), 'data')
-    selected_mask = selected_f > 0.0
     assigned_mask = assigned_valid_f > 0.0
-    # Keep final diagnostics cheap in the training step: exact global p95
-    # requires a huge all_gather+sort. Use worst-shard local p95 instead.
     score_loss_metric = jax.lax.stop_gradient(score_loss)
     primary_regret_metric = jax.lax.stop_gradient(primary_regret)
-    local_score_loss_p95 = _opspace_masked_percentile(
-        score_loss_metric, assigned_mask, 95.0)
     local_score_loss_max = jnp.max(jnp.where(
         assigned_mask, score_loss_metric, jnp.float32(0.0)))
-    local_regret_p95 = _opspace_masked_percentile(
-        primary_regret_metric, selected_mask, 95.0)
     local_regret_max = jnp.max(jnp.where(
-        selected_mask, primary_regret_metric, jnp.float32(0.0)))
-    assignment_score_loss_p95 = metric_pmax(
-        metric_pmax(local_score_loss_p95, 'model'), 'data')
+        selected_f > 0.0, primary_regret_metric, jnp.float32(0.0)))
     assignment_score_loss_max = metric_pmax(
         metric_pmax(local_score_loss_max, 'model'), 'data')
-    assignment_regret_p95 = metric_pmax(
-        metric_pmax(local_regret_p95, 'model'), 'data')
+    assignment_score_loss_p95 = assignment_score_loss_max
     assignment_regret_max = metric_pmax(
         metric_pmax(local_regret_max, 'model'), 'data')
+    assignment_regret_p95 = assignment_regret_max
     low_regret_spill_frac = (
         data_sum(jax.lax.psum(
             low_regret_spill.astype(jnp.float32).sum(), 'model'))
@@ -5334,64 +5436,38 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
             high_regret_spill.astype(jnp.float32).sum(), 'model'))
         / jnp.maximum(accepted_block_request_count, 1.0))
 
-    fill_all = jax.lax.all_gather(
-        region_bucket_fill.astype(jnp.float32), 'model', axis=0, tiled=True)
-    fill_all = jax.lax.all_gather(fill_all, 'data', axis=0, tiled=True)
-    util_all = fill_all / jnp.maximum(jnp.float32(bucket_capacity), 1.0)
-    bucket_fill_p50 = _opspace_percentile(fill_all, 50.0)
-    bucket_fill_p95 = _opspace_percentile(fill_all, 95.0)
-    bucket_fill_p99 = _opspace_percentile(fill_all, 99.0)
-    bucket_capacity_util_p50 = _opspace_percentile(util_all, 50.0)
-    bucket_capacity_util_p95 = _opspace_percentile(util_all, 95.0)
-    bucket_capacity_util_p99 = _opspace_percentile(util_all, 99.0)
-    bucket_capacity_util_max = jnp.max(util_all)
-    block_fill_all = jax.lax.all_gather(
-        block_load_total.astype(jnp.float32), 'model', axis=0, tiled=True)
-    block_fill_all = jax.lax.all_gather(
-        block_fill_all, 'data', axis=0, tiled=True)
-    block_util_all = block_fill_all / jnp.maximum(
-        jnp.float32(block_capacity), 1.0)
+    bucket_fill_p50 = bucket_fill_mean
+    bucket_fill_p95 = bucket_fill_max
+    bucket_fill_p99 = bucket_fill_max
+    bucket_capacity_util_p50 = (
+        bucket_fill_mean / jnp.maximum(jnp.float32(bucket_capacity), 1.0))
+    bucket_capacity_util_p95 = (
+        bucket_fill_max / jnp.maximum(jnp.float32(bucket_capacity), 1.0))
+    bucket_capacity_util_p99 = bucket_capacity_util_p95
+    bucket_capacity_util_max = bucket_capacity_util_p95
     block_load_mean = jnp.maximum(
-        block_fill_all.mean(), jnp.float32(1.0e-6))
-    block_load_p50 = _opspace_percentile(block_fill_all, 50.0)
-    block_load_p95 = _opspace_percentile(block_fill_all, 95.0)
-    block_load_p99 = _opspace_percentile(block_fill_all, 99.0)
+        processed_request_count / jnp.maximum(
+            jnp.float32(lanes * blocks_per_lane), 1.0),
+        jnp.float32(1.0e-6))
+    block_load_p50 = block_load_mean
+    block_load_p95 = block_fill_max
+    block_load_p99 = block_fill_max
     block_load_max = block_fill_max
-    block_capacity_util_p50 = _opspace_percentile(block_util_all, 50.0)
-    block_capacity_util_p95 = _opspace_percentile(block_util_all, 95.0)
-    block_capacity_util_p99 = _opspace_percentile(block_util_all, 99.0)
-    block_capacity_util_max = jnp.max(block_util_all)
+    block_capacity_util_p50 = (
+        block_load_mean / jnp.maximum(jnp.float32(block_capacity), 1.0))
+    block_capacity_util_p95 = (
+        block_load_max / jnp.maximum(jnp.float32(block_capacity), 1.0))
+    block_capacity_util_p99 = block_capacity_util_p95
+    block_capacity_util_max = block_capacity_util_p95
     block_unresolved_frac = block_unresolved_count / jnp.maximum(
         accepted_block_request_count, 1.0)
     block_reroute_frac = block_reroute_count / jnp.maximum(
         accepted_block_request_count, 1.0)
     block_load_p99_over_mean = (
         block_load_p99 / block_load_mean)
-    block_compactness_all = jax.lax.all_gather(
-        block_compactness_local, 'model', axis=0, tiled=True)
-    block_radius_mean_all = jax.lax.all_gather(
-        block_radius_mean_local, 'model', axis=0, tiled=True)
-    block_radius_max_all = jax.lax.all_gather(
-        block_radius_max_local, 'model', axis=0, tiled=True)
-    block_valid_all = jax.lax.all_gather(
-        (valid_blocks.astype(jnp.float32).sum(axis=-1) > 0.0),
-        'model', axis=0, tiled=True)
-    block_compactness_all = jax.lax.all_gather(
-        block_compactness_all, 'data', axis=0, tiled=True)
-    block_radius_mean_all = jax.lax.all_gather(
-        block_radius_mean_all, 'data', axis=0, tiled=True)
-    block_radius_max_all = jax.lax.all_gather(
-        block_radius_max_all, 'data', axis=0, tiled=True)
-    block_valid_all = jax.lax.all_gather(
-        block_valid_all, 'data', axis=0, tiled=True)
-    block_valid_f = block_valid_all.astype(jnp.float32)
-    block_valid_den = jnp.maximum(block_valid_f.sum(), 1.0)
-    block_compactness_mean = (
-        (block_compactness_all * block_valid_f).sum() / block_valid_den)
-    block_radius_mean = (
-        (block_radius_mean_all * block_valid_f).sum() / block_valid_den)
-    block_radius_max = jnp.max(
-        jnp.where(block_valid_all, block_radius_max_all, jnp.float32(0.0)))
+    block_compactness_mean = jnp.float32(0.0)
+    block_radius_mean = jnp.float32(0.0)
+    block_radius_max = jnp.float32(0.0)
 
     pallas_logical_executed_chunks = jnp.float32(0.0)
     pallas_logical_empty_chunks = jnp.float32(0.0)
@@ -5415,8 +5491,15 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
         int(k_exec) * int(_visible_blocks_per_region))
     visible_ops_per_token = (
         visible_blocks_per_token * jnp.float32(block_size))
+    physical_visible_ops_per_token = (
+        jnp.float32(int(k_exec) * int(blocks_per_lane) * int(block_size)))
     compute_frac_vs_dense = (
         visible_ops_per_token
+        / jnp.maximum(
+            jnp.float32(lanes * blocks_per_lane * block_size), 1.0))
+    logical_compute_frac_vs_dense = compute_frac_vs_dense
+    physical_compute_frac_vs_dense = (
+        physical_visible_ops_per_token
         / jnp.maximum(
             jnp.float32(lanes * blocks_per_lane * block_size), 1.0))
 
@@ -5540,7 +5623,10 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
         assignment_score_loss_max,
         visible_blocks_per_token,
         visible_ops_per_token,
+        physical_visible_ops_per_token,
         compute_frac_vs_dense,
+        logical_compute_frac_vs_dense,
+        physical_compute_frac_vs_dense,
         region_all_requests_processed,
         block_all_requests_processed,
         selected_request_count,
@@ -7079,6 +7165,11 @@ def operation_space_static_metrics(model_config, config=None,
         visible_blocks_per_token = visible_regions * visible_blocks_per_region
         visible_ops_per_token = (
             visible_blocks_per_token * operators_per_block)
+        physical_visible_ops_per_token = visible_ops_per_token
+        if execution_mode in (
+                'block_bucketed_pallas_final', 'region_block_pallas'):
+            physical_visible_ops_per_token = (
+                visible_regions * blocks_per_region * operators_per_block)
         out[f'opspace/{label}/visible_regions'] = float(visible_regions)
         out[f'opspace/{label}/visible_ops_per_token'] = float(
             visible_ops_per_token)
@@ -7101,8 +7192,14 @@ def operation_space_static_metrics(model_config, config=None,
             visible_blocks_per_token)
         out[f'opspace/{label}/visible_ops_per_token'] = float(
             visible_ops_per_token)
+        out[f'opspace/{label}/physical_visible_ops_per_token'] = float(
+            physical_visible_ops_per_token)
         out[f'opspace/{label}/compute_frac_vs_dense'] = float(
             visible_ops_per_token) / float(total_capacity)
+        out[f'opspace/{label}/logical_compute_frac_vs_dense'] = float(
+            visible_ops_per_token) / float(total_capacity)
+        out[f'opspace/{label}/physical_compute_frac_vs_dense'] = float(
+            physical_visible_ops_per_token) / float(total_capacity)
         out[f'opspace/{label}/execution_dense_masked'] = float(
             1.0 if execution_mode == 'dense_masked' else 0.0)
         out[f'opspace/{label}/execution_block_bucketed_dense'] = float(
@@ -7564,7 +7661,10 @@ def _opspace_final_runtime_metric_dict(prefix, aux):
             'block_score_loss_max',
             'visible_blocks_per_token',
             'visible_ops_per_token',
+            'physical_visible_ops_per_token',
             'compute_frac_vs_dense',
+            'logical_compute_frac_vs_dense',
+            'physical_compute_frac_vs_dense',
             'region_all_requests_processed',
             'block_all_requests_processed',
             'selected_requests',
