@@ -4038,6 +4038,8 @@ def _opspace_execute_bucket_outputs_pallas(
     valid_bucket = bucket_valid.reshape(
         local_lanes, blocks_per_lane, bucket_chunk_count,
         bucket_chunk_size)
+    valid_blocks_tpu = valid_blocks[..., None]
+    valid_bucket_tpu = valid_bucket[..., None]
 
     def bucket_kernel(x_bucket_ref, h_bucket_ref, key_blocks_ref,
                       read_blocks_ref, write_blocks_ref, valid_blocks_ref,
@@ -4048,8 +4050,8 @@ def _opspace_execute_bucket_outputs_pallas(
         key_block = key_blocks_ref[...]
         read_block = read_blocks_ref[...]
         write_block = write_blocks_ref[...]
-        valid_ops = valid_blocks_ref[...]
-        valid_token = valid_bucket_ref[...]
+        valid_ops = valid_blocks_ref[..., 0]
+        valid_token = valid_bucket_ref[..., 0]
 
         rho = pl.dot(
             h_chunk.astype(jnp.bfloat16),
@@ -4077,8 +4079,8 @@ def _opspace_execute_bucket_outputs_pallas(
         relu_count = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
 
         raw_bucket_ref[...] = raw_out
-        gate_mass_bucket_ref[...] = gate_mass
-        relu_count_bucket_ref[...] = relu_count
+        gate_mass_bucket_ref[...] = gate_mass[..., None]
+        relu_count_bucket_ref[...] = relu_count[..., None]
 
     out_shape = (
         jax.ShapeDtypeStruct(
@@ -4087,11 +4089,11 @@ def _opspace_execute_bucket_outputs_pallas(
             jnp.float32),
         jax.ShapeDtypeStruct(
             (local_lanes, blocks_per_lane, bucket_chunk_count,
-             bucket_chunk_size),
+             bucket_chunk_size, 1),
             jnp.float32),
         jax.ShapeDtypeStruct(
             (local_lanes, blocks_per_lane, bucket_chunk_count,
-             bucket_chunk_size),
+             bucket_chunk_size, 1),
             jnp.float32),
     )
     raw_bucket, gate_mass_bucket, relu_count_bucket = pl.pallas_call(
@@ -4120,13 +4122,13 @@ def _opspace_execute_bucket_outputs_pallas(
                     lambda lane_i, block_i, chunk_i: (
                         lane_i, block_i, 0, 0)),
                 pl.BlockSpec(
-                    (None, None, block_size),
+                    (None, None, block_size, 1),
                     lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, 0)),
+                        lane_i, block_i, 0, 0)),
                 pl.BlockSpec(
-                    (None, None, None, bucket_chunk_size),
+                    (None, None, None, bucket_chunk_size, 1),
                     lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, chunk_i, 0)),
+                        lane_i, block_i, chunk_i, 0, 0)),
             ],
             out_specs=(
                 pl.BlockSpec(
@@ -4134,13 +4136,13 @@ def _opspace_execute_bucket_outputs_pallas(
                     lambda lane_i, block_i, chunk_i: (
                         lane_i, block_i, chunk_i, 0, 0)),
                 pl.BlockSpec(
-                    (None, None, None, bucket_chunk_size),
+                    (None, None, None, bucket_chunk_size, 1),
                     lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, chunk_i, 0)),
+                        lane_i, block_i, chunk_i, 0, 0)),
                 pl.BlockSpec(
-                    (None, None, None, bucket_chunk_size),
+                    (None, None, None, bucket_chunk_size, 1),
                     lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, chunk_i, 0)),
+                        lane_i, block_i, chunk_i, 0, 0)),
             ),
             grid=(local_lanes, blocks_per_lane, bucket_chunk_count),
         ),
@@ -4149,14 +4151,14 @@ def _opspace_execute_bucket_outputs_pallas(
         interpret=bool(interpret),
         name='opspace_bucketed_pallas_final')(
             x_bucket, h_bucket, key_blocks, read_blocks, write_blocks,
-            valid_blocks, valid_bucket)
+            valid_blocks_tpu, valid_bucket_tpu)
 
     raw_bucket = raw_bucket.reshape(
         local_lanes, blocks_per_lane, bucket_padded_capacity, D)
     gate_mass_bucket = gate_mass_bucket.reshape(
-        local_lanes, blocks_per_lane, bucket_padded_capacity)
+        local_lanes, blocks_per_lane, bucket_padded_capacity, 1)[..., 0]
     relu_count_bucket = relu_count_bucket.reshape(
-        local_lanes, blocks_per_lane, bucket_padded_capacity)
+        local_lanes, blocks_per_lane, bucket_padded_capacity, 1)[..., 0]
     lane_ids = jnp.arange(local_lanes, dtype=jnp.int32)[:, None, None]
     lane_raw_out = jnp.zeros((local_lanes, T, D), dtype=jnp.float32).at[
         lane_ids, safe_token].add(
