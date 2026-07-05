@@ -49,27 +49,40 @@ training:
 
   operation_space:
     enabled: true
-    tile_size: 128
 
     pools:
+      qk:
+        execution_backend: dense
+        num_regions: 16
+        blocks_per_region: 2
+        operators_per_block: 128
+        visible_regions: 2
+        visible_blocks_per_region: 1
+
+      v:
+        execution_backend: dense
+        num_regions: 16
+        blocks_per_region: 8
+        operators_per_block: 128
+        visible_regions: 10
+        visible_blocks_per_region: 1
+
       rst:
-        execution_mode: region_block_pallas
+        execution_backend: sparse_region_block
         num_regions: 32
         blocks_per_region: 2
         operators_per_block: 512
         visible_regions: 4
         visible_blocks_per_region: 1
-        region_score_pooling: smoothmax
-        region_score_temperature: 0.25
         region_capacity_factor: 1.25
         block_capacity_factor: 1.25
-        bucket_chunk_size: 128
-        assignment_policy: low_regret
         high_regret_threshold: 0.05
+        region_score_pooling: smoothmax
+        region_score_temperature: 0.25
   checkpoint_interval: 200
   val_interval: 1000
   log_interval: 100
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_v4_64_test
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_region_block_test
