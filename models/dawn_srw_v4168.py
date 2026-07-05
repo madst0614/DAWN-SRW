@@ -4022,11 +4022,11 @@ def _opspace_execute_bucket_chunk_pallas(
     def bucket_kernel(flat_x_ref, flat_h_ref, key_blocks_ref,
                       read_blocks_ref, write_blocks_ref, valid_blocks_ref,
                       token_id_bucket_ref, bucket_valid_ref, bucket_fill_ref,
-                      lane_ref, block_ref, start_ref,
+                      chunk_index_ref,
                       raw_out_ref, gate_mass_ref, relu_count_ref):
-        lane = pl.load(lane_ref, ())
-        block = pl.load(block_ref, ())
-        start = pl.load(start_ref, ())
+        lane = pl.load(chunk_index_ref, jnp.asarray(0, dtype=jnp.int32))
+        block = pl.load(chunk_index_ref, jnp.asarray(1, dtype=jnp.int32))
+        start = pl.load(chunk_index_ref, jnp.asarray(2, dtype=jnp.int32))
         slots = jnp.arange(bucket_chunk_size, dtype=jnp.int32)
         bucket_slots = start + slots
         route_dims = jnp.arange(d_route, dtype=jnp.int32)
@@ -4110,9 +4110,10 @@ def _opspace_execute_bucket_chunk_pallas(
         name='opspace_bucketed_pallas_final_chunk')(
             flat_x, flat_h, key_blocks, read_blocks, write_blocks,
             valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
-            jnp.asarray(lane_i, dtype=jnp.int32),
-            jnp.asarray(block_i, dtype=jnp.int32),
-            jnp.asarray(start_i, dtype=jnp.int32))
+            jnp.stack((
+                jnp.asarray(lane_i, dtype=jnp.int32),
+                jnp.asarray(block_i, dtype=jnp.int32),
+                jnp.asarray(start_i, dtype=jnp.int32))))
 
 
 def _opspace_execute_bucket_outputs_pallas(
