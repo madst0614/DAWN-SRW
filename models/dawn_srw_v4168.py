@@ -4082,11 +4082,11 @@ def _opspace_execute_bucket_outputs_pallas_group(
         raw_out = pl.dot(
             (gate * read_value).astype(jnp.bfloat16),
             write_block.astype(jnp.bfloat16)).astype(jnp.float32)
-        reduce_ones = jnp.ones((block_size, 1), dtype=jnp.bfloat16)
+        reduce_ones = jnp.ones((block_size, 1), dtype=jnp.float32)
         gate_mass = pl.dot(
-            gate.astype(jnp.bfloat16), reduce_ones).astype(jnp.float32)
+            gate, reduce_ones).astype(jnp.float32)
         relu_count = pl.dot(
-            (gate > 0.0).astype(jnp.bfloat16),
+            (gate > 0.0).astype(jnp.float32),
             reduce_ones).astype(jnp.float32)
 
         raw_acc_ref[...] += raw_out
