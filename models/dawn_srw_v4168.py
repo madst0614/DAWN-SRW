@@ -167,6 +167,10 @@ OPSPACE_REPACK_MIN_SWAP_GAIN = 0.0
 OPSPACE_OWNER_AXIS = "model_axis"
 OPSPACE_NO_DROP = True
 OPSPACE_BUCKET_OVERFLOW_SEMANTICS = True
+OPSPACE_FINAL_OUTPUT_TILE_SIZE = 128
+OPSPACE_FINAL_D_TILE_SIZE = 256
+OPSPACE_FINAL_TILE_CAPACITY_FACTOR = 1.5
+OPSPACE_FINAL_TILE_CAPACITY_ALIGN = 128
 
 OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'assignment_score_best_mean',
@@ -199,6 +203,16 @@ OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'pallas_actual_launched_chunks',
     'pallas_actual_skipped_chunks',
     'actual_vs_logical_chunk_ratio',
+    'output_tile_capacity',
+    'output_tile_fill_p50',
+    'output_tile_fill_p95',
+    'output_tile_fill_p99',
+    'output_tile_fill_max',
+    'output_tile_overflow_frac',
+    'output_tile_padding_frac',
+    'd_tile_size',
+    'output_tile_size',
+    'output_tiled_backend_active',
 )
 OPSPACE_FINAL_RUNTIME_DIAG_COUNT = len(OPSPACE_FINAL_RUNTIME_DIAG_NAMES)
 (
@@ -232,6 +246,16 @@ OPSPACE_FINAL_RUNTIME_DIAG_COUNT = len(OPSPACE_FINAL_RUNTIME_DIAG_NAMES)
     OPSPACE_FINAL_PALLAS_ACTUAL_LAUNCHED_CHUNKS,
     OPSPACE_FINAL_PALLAS_ACTUAL_SKIPPED_CHUNKS,
     OPSPACE_FINAL_ACTUAL_VS_LOGICAL_CHUNK_RATIO,
+    OPSPACE_FINAL_OUTPUT_TILE_CAPACITY,
+    OPSPACE_FINAL_OUTPUT_TILE_FILL_P50,
+    OPSPACE_FINAL_OUTPUT_TILE_FILL_P95,
+    OPSPACE_FINAL_OUTPUT_TILE_FILL_P99,
+    OPSPACE_FINAL_OUTPUT_TILE_FILL_MAX,
+    OPSPACE_FINAL_OUTPUT_TILE_OVERFLOW_FRAC,
+    OPSPACE_FINAL_OUTPUT_TILE_PADDING_FRAC,
+    OPSPACE_FINAL_D_TILE_SIZE,
+    OPSPACE_FINAL_OUTPUT_TILE_SIZE_DIAG,
+    OPSPACE_FINAL_OUTPUT_TILED_BACKEND_ACTIVE,
 ) = range(OPSPACE_FINAL_RUNTIME_DIAG_COUNT)
 
 BENCHMARK_SECTOR_RUNTIME_DIAG_NAMES = (
@@ -3783,14 +3807,20 @@ def _opspace_masked_percentile(values, mask, q):
         count > 0, sorted_values[idx], jnp.float32(0.0))
 
 
-def _opspace_low_regret_assign_lane(
-        scores_lane, lane_active, *, blocks_per_lane, bucket_capacity,
+def _opspace_round_up_to_multiple(value, multiple):
+    multiple = max(1, int(multiple))
+    value = max(1, int(value))
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _opspace_low_regret_assign_lane_output_tiled(
+        scores_lane, lane_active, token_output_tile, *, blocks_per_lane,
+        output_tile_count, output_tile_capacity,
         regret_weight=1.0, spill_penalty=0.01):
-    """Capacity-constrained simultaneous proposal assignment for one lane."""
+    """Capacity-constrained assignment for one lane and output-tile buckets."""
     T = int(scores_lane.shape[0])
-    block_ids = jnp.arange(blocks_per_lane, dtype=jnp.int32)
     token_ids = jnp.arange(T, dtype=jnp.int32)
-    bucket_capacity_i32 = jnp.asarray(bucket_capacity, dtype=jnp.int32)
+    tile_capacity_i32 = jnp.asarray(output_tile_capacity, dtype=jnp.int32)
     candidate_scores, candidate_blocks = jax.lax.top_k(
         scores_lane.astype(jnp.float32), blocks_per_lane)
     very_low = jnp.asarray(-1.0e9, dtype=jnp.float32)
@@ -3824,37 +3854,45 @@ def _opspace_low_regret_assign_lane(
 
         active = unresolved.astype(jnp.bool_)
         sort_block = jnp.where(active, candidate, blocks_per_lane)
+        sort_tile = jnp.where(active, token_output_tile, output_tile_count)
         sort_neg_priority = jnp.where(
             active, -priority, jnp.float32(1.0e9))
-        order = jnp.lexsort((token_ids, sort_neg_priority, sort_block))
+        order = jnp.lexsort((
+            token_ids, sort_neg_priority, sort_tile, sort_block))
         ordered_token = order.astype(jnp.int32)
         ordered_block = sort_block[ordered_token]
+        ordered_tile = sort_tile[ordered_token]
         ordered_active = active[ordered_token]
         ordered_active_i = ordered_active.astype(jnp.int32)
         prev_block = jnp.concatenate((
             jnp.full((1,), -1, dtype=jnp.int32), ordered_block[:-1]))
-        group_start = ordered_block != prev_block
+        prev_tile = jnp.concatenate((
+            jnp.full((1,), -1, dtype=jnp.int32), ordered_tile[:-1]))
+        group_start = jnp.logical_or(
+            ordered_block != prev_block, ordered_tile != prev_tile)
         cum_active = jnp.cumsum(ordered_active_i) - 1
         active_before_group = jax.lax.associative_scan(
             jnp.maximum,
             jnp.where(group_start, cum_active - ordered_active_i, -1))
         rank_in_block = cum_active - active_before_group - 1
         safe_ordered_block = jnp.minimum(ordered_block, blocks_per_lane - 1)
-        existing_count = bucket_counts[safe_ordered_block]
+        safe_ordered_tile = jnp.minimum(ordered_tile, output_tile_count - 1)
+        existing_count = bucket_counts[safe_ordered_block, safe_ordered_tile]
         ordered_slot = existing_count + rank_in_block
         ordered_accept = jnp.logical_and(
             ordered_active,
             jnp.logical_and(
                 ordered_block < blocks_per_lane,
-                ordered_slot < bucket_capacity_i32))
+                jnp.logical_and(
+                    ordered_tile < output_tile_count,
+                    ordered_slot < tile_capacity_i32)))
         accept = jnp.zeros((T,), dtype=jnp.bool_).at[ordered_token].set(
             ordered_accept)
         slot = jnp.zeros((T,), dtype=jnp.int32).at[ordered_token].set(
             ordered_slot)
-        accepted_by_block = (
-            (candidate[:, None] == block_ids[None, :]).astype(jnp.int32)
-            * accept[:, None].astype(jnp.int32)).sum(axis=0)
-        bucket_counts = bucket_counts + accepted_by_block
+        bucket_counts = bucket_counts.at[
+            candidate, token_output_tile].add(
+                accept.astype(jnp.int32), mode='drop')
         assigned_block = jnp.where(accept, candidate, assigned_block)
         assigned_slot = jnp.where(accept, slot, assigned_slot)
         assigned_rank = jnp.where(accept, pass_i, assigned_rank)
@@ -3870,7 +3908,7 @@ def _opspace_low_regret_assign_lane(
         jnp.full((T,), -1, dtype=jnp.int32),
         jnp.zeros((T,), dtype=jnp.float32),
         lane_active.astype(jnp.bool_),
-        jnp.zeros((blocks_per_lane,), dtype=jnp.int32),
+        jnp.zeros((blocks_per_lane, output_tile_count), dtype=jnp.int32),
     )
     (assigned_block, assigned_slot, assigned_rank, chosen_score,
      unresolved, bucket_counts) = jax.lax.scan(
@@ -3884,18 +3922,23 @@ def _opspace_low_regret_assign_lane(
 
 def _opspace_build_lane_buckets(
         scores_local, selected_lane_mask_local, *, blocks_per_lane,
-        bucket_capacity, bucket_padded_capacity, regret_weight=1.0,
-        spill_penalty=0.01):
-    """Build fixed-shape buckets for all local lanes."""
+        output_tile_size, output_tile_count, output_tile_capacity,
+        regret_weight=1.0, spill_penalty=0.01):
+    """Build output-tile-local fixed-shape buckets for all local lanes."""
     T = int(scores_local.shape[0])
     local_lanes = int(scores_local.shape[1])
     token_ids = jnp.arange(T, dtype=jnp.int32)
+    token_output_tile = jnp.minimum(
+        token_ids // jnp.asarray(output_tile_size, dtype=jnp.int32),
+        jnp.asarray(output_tile_count - 1, dtype=jnp.int32))
 
     def assign_one(scores_lane, lane_active):
-        return _opspace_low_regret_assign_lane(
-            scores_lane, lane_active, blocks_per_lane=blocks_per_lane,
-            bucket_capacity=bucket_capacity, regret_weight=regret_weight,
-            spill_penalty=spill_penalty)
+        return _opspace_low_regret_assign_lane_output_tiled(
+            scores_lane, lane_active, token_output_tile,
+            blocks_per_lane=blocks_per_lane,
+            output_tile_count=output_tile_count,
+            output_tile_capacity=output_tile_capacity,
+            regret_weight=regret_weight, spill_penalty=spill_penalty)
 
     (assigned_block, assigned_slot, assigned_rank, chosen_score, best_score,
      primary_regret, unresolved, bucket_fill, primary_block) = jax.vmap(
@@ -3904,16 +3947,20 @@ def _opspace_build_lane_buckets(
     valid_assignment = assigned_block >= 0
     safe_block = jnp.where(valid_assignment, assigned_block, 0)
     safe_slot = jnp.where(valid_assignment, assigned_slot, 0)
+    safe_tile = jnp.broadcast_to(
+        token_output_tile[None, :], (local_lanes, T))
     lane_ids = jnp.arange(local_lanes, dtype=jnp.int32)[:, None]
     token_ids_l = jnp.broadcast_to(token_ids[None, :], (local_lanes, T))
     valid_f = valid_assignment.astype(jnp.float32)
     bucket_valid_count = jnp.zeros(
-        (local_lanes, blocks_per_lane, bucket_padded_capacity),
-        dtype=jnp.float32).at[lane_ids, safe_block, safe_slot].add(
+        (local_lanes, blocks_per_lane, output_tile_count,
+         output_tile_capacity),
+        dtype=jnp.float32).at[lane_ids, safe_block, safe_tile, safe_slot].add(
             valid_f, mode='drop')
     token_id_bucket = jnp.zeros(
-        (local_lanes, blocks_per_lane, bucket_padded_capacity),
-        dtype=jnp.int32).at[lane_ids, safe_block, safe_slot].max(
+        (local_lanes, blocks_per_lane, output_tile_count,
+         output_tile_capacity),
+        dtype=jnp.int32).at[lane_ids, safe_block, safe_tile, safe_slot].max(
             token_ids_l * valid_assignment.astype(jnp.int32), mode='drop')
     bucket_valid = bucket_valid_count == jnp.float32(1.0)
     assignment_collision_count = jnp.maximum(
@@ -3934,246 +3981,229 @@ def _opspace_build_lane_buckets(
     }
 
 
-def _opspace_execute_buckets_jax(
-        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
-        token_id_bucket, bucket_valid, bucket_fill, *, bucket_chunk_size,
-        bucket_chunk_count):
-    """Reference fixed-shape bucket executor for explicit local interpretation."""
-    local_lanes = int(token_id_bucket.shape[0])
-    blocks_per_lane = int(token_id_bucket.shape[1])
-    T = int(flat_x.shape[0])
-    D = int(flat_x.shape[-1])
-
-    def chunk_step(carry, chunk_i):
-        flat_raw_out, flat_gate_mass, flat_relu_count, finite_acc = carry
-        lane_i = chunk_i // (blocks_per_lane * bucket_chunk_count)
-        rem_i = chunk_i - lane_i * blocks_per_lane * bucket_chunk_count
-        block_i = rem_i // bucket_chunk_count
-        block_chunk_i = rem_i - block_i * bucket_chunk_count
-        start = block_chunk_i * bucket_chunk_size
-
-        token_chunk = jax.lax.dynamic_slice(
-            token_id_bucket, (lane_i, block_i, start),
-            (1, 1, bucket_chunk_size)).reshape(bucket_chunk_size)
-        valid_chunk = jax.lax.dynamic_slice(
-            bucket_valid, (lane_i, block_i, start),
-            (1, 1, bucket_chunk_size)).reshape(bucket_chunk_size)
-        slot_offsets = start + jnp.arange(bucket_chunk_size, dtype=jnp.int32)
-        valid_chunk = jnp.logical_and(
-            valid_chunk, slot_offsets < bucket_fill[lane_i, block_i])
-        safe_token = jnp.where(valid_chunk, token_chunk, 0)
-        h_chunk = flat_h[safe_token]
-        x_chunk = flat_x[safe_token]
-        valid_chunk_f = valid_chunk.astype(jnp.float32)
-        h_chunk = h_chunk * valid_chunk_f[:, None].astype(jnp.bfloat16)
-        x_chunk = x_chunk * valid_chunk_f[:, None].astype(jnp.bfloat16)
-        key_block = key_blocks[lane_i, block_i]
-        read_block = read_blocks[lane_i, block_i]
-        write_block = write_blocks[lane_i, block_i]
-        valid_block = valid_blocks[lane_i, block_i]
-        rho = jnp.einsum(
-            'cd,nd->cn', h_chunk, key_block).astype(jnp.float32)
-        read_value = jnp.einsum(
-            'cd,nd->cn', x_chunk, read_block).astype(jnp.float32)
-        gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
-        gate = gate * valid_chunk_f[:, None]
-        gate = gate * valid_block.astype(jnp.float32)[None, :]
-        raw_out_chunk = jnp.einsum(
-            'cn,nd->cd',
-            (gate * read_value).astype(jnp.bfloat16),
-            write_block).astype(jnp.float32)
-        gate_mass_chunk = gate.sum(axis=-1, keepdims=True)
-        relu_count_chunk = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
-        flat_raw_out = flat_raw_out.at[safe_token].add(
-            raw_out_chunk * valid_chunk_f[:, None], mode='drop')
-        flat_gate_mass = flat_gate_mass.at[safe_token].add(
-            gate_mass_chunk * valid_chunk_f[:, None], mode='drop')
-        flat_relu_count = flat_relu_count.at[safe_token].add(
-            relu_count_chunk * valid_chunk_f, mode='drop')
-        finite = jnp.logical_and(
-            jnp.all(jnp.isfinite(gate)),
-            jnp.all(jnp.isfinite(raw_out_chunk)))
-        finite_acc = jnp.minimum(finite_acc, finite.astype(jnp.float32))
-        return (flat_raw_out, flat_gate_mass, flat_relu_count, finite_acc), None
-
-    total_chunks = local_lanes * blocks_per_lane * bucket_chunk_count
-    init = (
-        jnp.zeros((T, D), dtype=jnp.float32),
-        jnp.zeros((T, 1), dtype=jnp.float32),
-        jnp.zeros((T,), dtype=jnp.float32),
-        jnp.float32(1.0),
-    )
-    return jax.lax.scan(
-        chunk_step, init, jnp.arange(total_chunks, dtype=jnp.int32))[0]
-
-
-def _opspace_execute_bucket_chunk_pallas(
-        x_chunk, h_chunk, key_block, read_block, write_block, valid_ops,
-        valid_slots, *, interpret=False):
-    """Run one owner-local bucket chunk from pre-gathered dense operands."""
-    if not _PALLAS_API_AVAILABLE:
-        raise RuntimeError(_pallas_unavailable_message())
-    bucket_chunk_size = int(x_chunk.shape[0])
-    D = int(x_chunk.shape[-1])
-    block_size = int(key_block.shape[0])
-
-    def bucket_kernel(x_chunk_ref, h_chunk_ref, key_block_ref,
-                      read_block_ref, write_block_ref, valid_ops_ref,
-                      valid_slots_ref,
-                      raw_out_ref, gate_mass_ref, relu_count_ref):
-        x_local = x_chunk_ref[...]
-        h_local = h_chunk_ref[...]
-        key_local = key_block_ref[...]
-        read_local = read_block_ref[...]
-        write_local = write_block_ref[...]
-        valid_ops_local = valid_ops_ref[...]
-        valid_slots = valid_slots_ref[...]
-        valid_slots_f = valid_slots.astype(jnp.float32)
-        x_local = x_local * valid_slots_f[:, None].astype(jnp.bfloat16)
-        h_local = h_local * valid_slots_f[:, None].astype(jnp.bfloat16)
-
-        rho = pl.dot(
-            h_local.astype(jnp.bfloat16),
-            jnp.swapaxes(key_local.astype(jnp.bfloat16), 0, 1)
-        ).astype(jnp.float32)
-        read_value = pl.dot(
-            x_local.astype(jnp.bfloat16),
-            jnp.swapaxes(read_local.astype(jnp.bfloat16), 0, 1)
-        ).astype(jnp.float32)
-        gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
-        gate = gate * valid_slots_f[:, None]
-        gate = gate * valid_ops_local.astype(jnp.float32)[None, :]
-        raw_out = pl.dot(
-            (gate * read_value).astype(jnp.bfloat16),
-            write_local.astype(jnp.bfloat16)).astype(jnp.float32)
-        reduce_ones = jnp.ones((block_size, 1), dtype=jnp.float32)
-        gate_mass = pl.dot(
-            gate, reduce_ones).astype(jnp.float32)
-        relu_count = pl.dot(
-            (gate > 0.0).astype(jnp.float32),
-            reduce_ones).astype(jnp.float32)
-
-        raw_out = raw_out * valid_slots_f[:, None]
-        gate_mass = gate_mass * valid_slots_f[:, None]
-        relu_count = relu_count * valid_slots_f[:, None]
-        raw_out_ref[...] = raw_out
-        gate_mass_ref[...] = gate_mass
-        relu_count_ref[...] = relu_count[:, 0]
-
-    return pl.pallas_call(
-        bucket_kernel,
-        out_shape=(
-            jax.ShapeDtypeStruct(
-                (bucket_chunk_size, D), jnp.float32),
-            jax.ShapeDtypeStruct(
-                (bucket_chunk_size, 1), jnp.float32),
-            jax.ShapeDtypeStruct(
-                (bucket_chunk_size,), jnp.float32),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",)),
-        grid=(1,),
-        interpret=bool(interpret),
-        name='opspace_bucketed_pallas_final_chunk')(
-            x_chunk, h_chunk, key_block, read_block, write_block, valid_ops,
-            valid_slots)
-
-
-def _opspace_execute_bucket_outputs_pallas(
+def _opspace_execute_output_tiled_pallas(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill, *,
-        bucket_chunk_size, bucket_chunk_count, interpret=False):
-    """Streaming Pallas executor that returns accumulated local outputs."""
+        output_tile_size, d_tile_size, output_tile_count, d_tile_count,
+        output_tile_capacity, interpret=False):
+    """Pallas executor whose programs own one output tile and one D tile."""
+    if not _PALLAS_API_AVAILABLE:
+        raise RuntimeError(_pallas_unavailable_message())
     local_lanes = int(token_id_bucket.shape[0])
     blocks_per_lane = int(token_id_bucket.shape[1])
     T = int(flat_x.shape[0])
     D = int(flat_x.shape[-1])
+    d_route = int(flat_h.shape[-1])
+    block_size = int(key_blocks.shape[2])
+    padded_T = output_tile_count * output_tile_size
+    padded_D = d_tile_count * d_tile_size
 
-    def chunk_step(carry, chunk_i):
-        flat_raw_out, flat_gate_mass, flat_relu_count = carry
-        lane_i = chunk_i // (blocks_per_lane * bucket_chunk_count)
-        rem_i = chunk_i - lane_i * blocks_per_lane * bucket_chunk_count
-        block_i = rem_i // bucket_chunk_count
-        block_chunk_i = rem_i - block_i * bucket_chunk_count
-        start = block_chunk_i * bucket_chunk_size
-        token_chunk = jax.lax.dynamic_slice(
-            token_id_bucket, (lane_i, block_i, start),
-            (1, 1, bucket_chunk_size)).reshape(bucket_chunk_size)
-        valid_chunk = jax.lax.dynamic_slice(
-            bucket_valid, (lane_i, block_i, start),
-            (1, 1, bucket_chunk_size)).reshape(bucket_chunk_size)
-        slot_offsets = start + jnp.arange(bucket_chunk_size, dtype=jnp.int32)
-        valid_chunk = jnp.logical_and(
-            valid_chunk, slot_offsets < bucket_fill[lane_i, block_i])
-        safe_token = jnp.where(valid_chunk, token_chunk, 0)
-        valid_chunk_f = valid_chunk.astype(jnp.float32)
-        h_chunk = (
-            flat_h[safe_token]
-            * valid_chunk_f[:, None].astype(jnp.bfloat16))
-        x_chunk = (
-            flat_x[safe_token]
-            * valid_chunk_f[:, None].astype(jnp.bfloat16))
-        key_block = key_blocks[lane_i, block_i]
-        read_block = read_blocks[lane_i, block_i]
-        write_block = write_blocks[lane_i, block_i]
-        valid_ops = valid_blocks[lane_i, block_i]
-        raw_chunk, mass_chunk, relu_chunk = (
-            _opspace_execute_bucket_chunk_pallas(
-                x_chunk, h_chunk, key_block, read_block, write_block,
-                valid_ops, valid_chunk, interpret=interpret))
-        flat_raw_out = flat_raw_out.at[safe_token].add(
-            raw_chunk * valid_chunk_f[:, None], mode='drop')
-        flat_gate_mass = flat_gate_mass.at[safe_token].add(
-            mass_chunk * valid_chunk_f[:, None], mode='drop')
-        flat_relu_count = flat_relu_count.at[safe_token].add(
-            relu_chunk * valid_chunk_f, mode='drop')
-        return (flat_raw_out, flat_gate_mass, flat_relu_count), None
+    def output_tile_kernel(
+            flat_x_ref, flat_h_ref, key_blocks_ref, read_blocks_ref,
+            write_blocks_ref, valid_blocks_ref, token_id_bucket_ref,
+            bucket_valid_ref, bucket_fill_ref,
+            raw_tiles_ref, gate_mass_tiles_ref, relu_count_tiles_ref):
+        output_tile_i = pl.program_id(0)
+        d_tile_i = pl.program_id(1)
+        slot_ids = jnp.arange(output_tile_capacity, dtype=jnp.int32)
+        local_token_ids = jnp.arange(output_tile_size, dtype=jnp.int32)
+        op_ids = jnp.arange(block_size, dtype=jnp.int32)
+        route_ids = jnp.arange(d_route, dtype=jnp.int32)
+        local_d_ids = jnp.arange(d_tile_size, dtype=jnp.int32)
+        output_start = output_tile_i * output_tile_size
+        d_start = d_tile_i * d_tile_size
+        d_ids = d_start + local_d_ids
+        d_valid = d_ids < D
 
-    init = (
-        jnp.zeros((T, D), dtype=jnp.float32),
-        jnp.zeros((T, 1), dtype=jnp.float32),
-        jnp.zeros((T,), dtype=jnp.float32),
-    )
-    total_chunks = local_lanes * blocks_per_lane * bucket_chunk_count
-    return jax.lax.scan(
-        chunk_step, init, jnp.arange(total_chunks, dtype=jnp.int32))[0]
+        scratch_raw = jnp.zeros(
+            (output_tile_size, d_tile_size), dtype=jnp.float32)
+        scratch_mass = jnp.zeros((output_tile_size,), dtype=jnp.float32)
+        scratch_relu = jnp.zeros((output_tile_size,), dtype=jnp.float32)
+
+        for lane_i in range(local_lanes):
+            for block_i in range(blocks_per_lane):
+                lane_idx = jnp.asarray(lane_i, dtype=jnp.int32)
+                block_idx = jnp.asarray(block_i, dtype=jnp.int32)
+                tile_fill = pl.load(
+                    bucket_fill_ref, (lane_idx, block_idx, output_tile_i))
+                token_ids = pl.load(
+                    token_id_bucket_ref,
+                    (lane_idx, block_idx, output_tile_i, slot_ids),
+                    other=jnp.asarray(0, dtype=jnp.int32))
+                valid_slots = pl.load(
+                    bucket_valid_ref,
+                    (lane_idx, block_idx, output_tile_i, slot_ids),
+                    other=jnp.asarray(False, dtype=jnp.bool_))
+                valid_slots = jnp.logical_and(valid_slots, slot_ids < tile_fill)
+                safe_token = jnp.where(valid_slots, token_ids, 0)
+                local_token = jnp.where(
+                    valid_slots, token_ids - output_start, 0)
+                valid_slots_f = valid_slots.astype(jnp.float32)
+                h_mask = jnp.broadcast_to(
+                    valid_slots[:, None],
+                    (output_tile_capacity, d_route))
+                d_mask = jnp.broadcast_to(
+                    d_valid[None, :], (block_size, d_tile_size))
+
+                h_local = pl.load(
+                    flat_h_ref,
+                    (safe_token[:, None], route_ids[None, :]),
+                    mask=h_mask,
+                    other=jnp.asarray(0.0, dtype=flat_h.dtype))
+                key_local = pl.load(
+                    key_blocks_ref,
+                    (lane_idx, block_idx, op_ids[:, None],
+                     route_ids[None, :]),
+                    other=jnp.asarray(0.0, dtype=key_blocks.dtype))
+                write_local = pl.load(
+                    write_blocks_ref,
+                    (lane_idx, block_idx, op_ids[:, None], d_ids[None, :]),
+                    mask=d_mask,
+                    other=jnp.asarray(0.0, dtype=write_blocks.dtype))
+                valid_ops = pl.load(
+                    valid_blocks_ref, (lane_idx, block_idx, op_ids),
+                    other=jnp.asarray(False, dtype=jnp.bool_))
+
+                h_local = (
+                    h_local
+                    * valid_slots_f[:, None].astype(jnp.bfloat16))
+                rho = pl.dot(
+                    h_local.astype(jnp.bfloat16),
+                    jnp.swapaxes(key_local.astype(jnp.bfloat16), 0, 1)
+                ).astype(jnp.float32)
+                read_value = jnp.zeros(
+                    (output_tile_capacity, block_size), dtype=jnp.float32)
+                for read_tile_i in range(d_tile_count):
+                    read_start = (
+                        jnp.asarray(read_tile_i, dtype=jnp.int32)
+                        * d_tile_size)
+                    read_d_ids = read_start + local_d_ids
+                    read_d_valid = read_d_ids < D
+                    read_d_mask = jnp.broadcast_to(
+                        read_d_valid[None, :], (block_size, d_tile_size))
+                    x_read_mask = jnp.logical_and(
+                        valid_slots[:, None], read_d_valid[None, :])
+                    x_read = pl.load(
+                        flat_x_ref,
+                        (safe_token[:, None], read_d_ids[None, :]),
+                        mask=x_read_mask,
+                        other=jnp.asarray(0.0, dtype=flat_x.dtype))
+                    read_local = pl.load(
+                        read_blocks_ref,
+                        (lane_idx, block_idx, op_ids[:, None],
+                         read_d_ids[None, :]),
+                        mask=read_d_mask,
+                        other=jnp.asarray(0.0, dtype=read_blocks.dtype))
+                    x_read = (
+                        x_read
+                        * valid_slots_f[:, None].astype(jnp.bfloat16))
+                    read_value = read_value + pl.dot(
+                        x_read.astype(jnp.bfloat16),
+                        jnp.swapaxes(
+                            read_local.astype(jnp.bfloat16), 0, 1)
+                    ).astype(jnp.float32)
+                gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
+                gate = gate * valid_slots_f[:, None]
+                gate = gate * valid_ops.astype(jnp.float32)[None, :]
+                mixed = gate * read_value
+                raw_slot = pl.dot(
+                    mixed.astype(jnp.bfloat16),
+                    write_local.astype(jnp.bfloat16)).astype(jnp.float32)
+                mass_slot = gate.sum(axis=-1)
+                relu_slot = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
+
+                scratch_raw = scratch_raw.at[local_token].add(
+                    raw_slot * valid_slots_f[:, None])
+                scratch_mass = scratch_mass.at[local_token].add(
+                    mass_slot * valid_slots_f)
+                scratch_relu = scratch_relu.at[local_token].add(
+                    relu_slot * valid_slots_f)
+
+        pl.store(
+            raw_tiles_ref,
+            (output_tile_i, d_tile_i, local_token_ids[:, None],
+             local_d_ids[None, :]),
+            scratch_raw)
+        pl.store(
+            gate_mass_tiles_ref,
+            (output_tile_i, d_tile_i, local_token_ids),
+            scratch_mass)
+        pl.store(
+            relu_count_tiles_ref,
+            (output_tile_i, d_tile_i, local_token_ids),
+            scratch_relu)
+
+    raw_tiles, gate_mass_tiles, relu_count_tiles = pl.pallas_call(
+        output_tile_kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct(
+                (output_tile_count, d_tile_count,
+                 output_tile_size, d_tile_size), jnp.float32),
+            jax.ShapeDtypeStruct(
+                (output_tile_count, d_tile_count,
+                 output_tile_size), jnp.float32),
+            jax.ShapeDtypeStruct(
+                (output_tile_count, d_tile_count,
+                 output_tile_size), jnp.float32),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary", "arbitrary")),
+        grid=(output_tile_count, d_tile_count),
+        interpret=bool(interpret),
+        name='opspace_output_tiled_pallas_final')(
+            flat_x, flat_h, key_blocks, read_blocks, write_blocks,
+            valid_blocks, token_id_bucket, bucket_valid, bucket_fill)
+
+    flat_raw_out = raw_tiles.transpose(0, 2, 1, 3).reshape(
+        padded_T, padded_D)[:T, :D]
+    flat_gate_mass = gate_mass_tiles[:, 0, :].reshape(
+        padded_T, 1)[:T]
+    flat_relu_count = relu_count_tiles[:, 0, :].reshape(padded_T)[:T]
+    return flat_raw_out, flat_gate_mass, flat_relu_count
 
 
-def _opspace_execute_bucket_outputs_pallas_trainable_impl(
+def _opspace_execute_output_tiled_pallas_trainable_impl(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill,
-        bucket_chunk_size, bucket_chunk_count, interpret):
-    return _opspace_execute_bucket_outputs_pallas(
+        output_tile_size, d_tile_size, output_tile_count, d_tile_count,
+        output_tile_capacity, interpret):
+    return _opspace_execute_output_tiled_pallas(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill,
-        bucket_chunk_size=bucket_chunk_size,
-        bucket_chunk_count=bucket_chunk_count,
+        output_tile_size=output_tile_size,
+        d_tile_size=d_tile_size,
+        output_tile_count=output_tile_count,
+        d_tile_count=d_tile_count,
+        output_tile_capacity=output_tile_capacity,
         interpret=interpret)
 
 
-_opspace_execute_bucket_outputs_pallas_trainable = jax.custom_vjp(
-    _opspace_execute_bucket_outputs_pallas_trainable_impl,
-    nondiff_argnums=(9, 10, 11))
+_opspace_execute_output_tiled_pallas_trainable = jax.custom_vjp(
+    _opspace_execute_output_tiled_pallas_trainable_impl,
+    nondiff_argnums=(9, 10, 11, 12, 13, 14))
 
 
-def _opspace_execute_bucket_outputs_pallas_trainable_fwd(
+def _opspace_execute_output_tiled_pallas_trainable_fwd(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill,
-        bucket_chunk_size, bucket_chunk_count, interpret):
-    out = _opspace_execute_bucket_outputs_pallas_trainable_impl(
+        output_tile_size, d_tile_size, output_tile_count, d_tile_count,
+        output_tile_capacity, interpret):
+    out = _opspace_execute_output_tiled_pallas_trainable_impl(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill,
-        bucket_chunk_size, bucket_chunk_count, interpret)
+        output_tile_size, d_tile_size, output_tile_count, d_tile_count,
+        output_tile_capacity, interpret)
     return out, (
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill)
 
 
-def _opspace_execute_bucket_outputs_manual_bwd(
+def _opspace_execute_output_tiled_manual_bwd(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill, cotangent, *,
-        bucket_chunk_size, bucket_chunk_count):
-    """Manual streaming VJP for the final bucket executor."""
+        output_tile_size, d_tile_size, output_tile_count, d_tile_count,
+        output_tile_capacity):
+    """Manual output-tile/D-tile VJP for the final Pallas executor."""
     d_raw_out, d_gate_mass, _d_relu_count = cotangent
     local_lanes = int(token_id_bucket.shape[0])
     blocks_per_lane = int(token_id_bucket.shape[1])
@@ -4181,87 +4211,162 @@ def _opspace_execute_bucket_outputs_manual_bwd(
     D = int(flat_x.shape[-1])
     d_route = int(flat_h.shape[-1])
     block_size = int(key_blocks.shape[2])
-    del D, d_route, block_size
+    del d_route, block_size
 
-    def chunk_step(carry, chunk_i):
+    def tile_step(carry, tile_i):
         grad_x, grad_h, grad_key, grad_read, grad_write = carry
-        lane_i = chunk_i // (blocks_per_lane * bucket_chunk_count)
-        rem_i = chunk_i - lane_i * blocks_per_lane * bucket_chunk_count
-        block_i = rem_i // bucket_chunk_count
-        block_chunk_i = rem_i - block_i * bucket_chunk_count
-        start = block_chunk_i * bucket_chunk_size
+        output_tile_i = tile_i // d_tile_count
+        d_tile_i = tile_i - output_tile_i * d_tile_count
+        token_offsets = (
+            output_tile_i * output_tile_size
+            + jnp.arange(output_tile_size, dtype=jnp.int32))
+        token_valid = token_offsets < T
+        safe_output_token = jnp.where(token_valid, token_offsets, 0)
+        d_offsets = (
+            d_tile_i * d_tile_size
+            + jnp.arange(d_tile_size, dtype=jnp.int32))
+        d_valid = d_offsets < D
+        safe_d = jnp.where(d_valid, d_offsets, 0)
+        d_y_tile = d_raw_out[
+            safe_output_token[:, None], safe_d[None, :]]
+        d_y_tile = d_y_tile * token_valid[:, None].astype(jnp.float32)
+        d_y_tile = d_y_tile * d_valid[None, :].astype(jnp.float32)
+        d_mass_tile = d_gate_mass[safe_output_token, 0]
+        d_mass_tile = d_mass_tile * token_valid.astype(jnp.float32)
+        d_mass_tile = jnp.where(
+            d_tile_i == jnp.asarray(0, dtype=jnp.int32),
+            d_mass_tile, jnp.zeros_like(d_mass_tile))
 
-        token_chunk = jax.lax.dynamic_slice(
-            token_id_bucket, (lane_i, block_i, start),
-            (1, 1, bucket_chunk_size)).reshape(bucket_chunk_size)
-        valid_chunk = jax.lax.dynamic_slice(
-            bucket_valid, (lane_i, block_i, start),
-            (1, 1, bucket_chunk_size)).reshape(bucket_chunk_size)
-        slot_offsets = start + jnp.arange(bucket_chunk_size, dtype=jnp.int32)
-        valid_chunk = jnp.logical_and(
-            valid_chunk, slot_offsets < bucket_fill[lane_i, block_i])
-        valid_chunk_f = valid_chunk.astype(jnp.float32)
-        safe_token = jnp.where(valid_chunk, token_chunk, 0)
-        h_chunk = flat_h[safe_token]
-        x_chunk = flat_x[safe_token]
-        h_chunk = h_chunk * valid_chunk_f[:, None].astype(jnp.bfloat16)
-        x_chunk = x_chunk * valid_chunk_f[:, None].astype(jnp.bfloat16)
-        key_block = key_blocks[lane_i, block_i]
-        read_block = read_blocks[lane_i, block_i]
-        write_block = write_blocks[lane_i, block_i]
-        valid_block = valid_blocks[lane_i, block_i]
-        valid_block_f = valid_block.astype(jnp.float32)
+        for lane_i in range(local_lanes):
+            for block_i in range(blocks_per_lane):
+                token_chunk = jax.lax.dynamic_slice(
+                    token_id_bucket,
+                    (lane_i, block_i, output_tile_i, 0),
+                    (1, 1, 1, output_tile_capacity)).reshape(
+                        output_tile_capacity)
+                valid_chunk = jax.lax.dynamic_slice(
+                    bucket_valid,
+                    (lane_i, block_i, output_tile_i, 0),
+                    (1, 1, 1, output_tile_capacity)).reshape(
+                        output_tile_capacity)
+                slot_offsets = jnp.arange(
+                    output_tile_capacity, dtype=jnp.int32)
+                valid_chunk = jnp.logical_and(
+                    valid_chunk,
+                    slot_offsets < bucket_fill[
+                        lane_i, block_i, output_tile_i])
+                valid_chunk_f = valid_chunk.astype(jnp.float32)
+                safe_token = jnp.where(valid_chunk, token_chunk, 0)
+                local_token = jnp.where(
+                    valid_chunk,
+                    token_chunk - output_tile_i * output_tile_size, 0)
 
-        rho = jnp.einsum(
-            'cd,nd->cn', h_chunk, key_block).astype(jnp.float32)
-        read_value = jnp.einsum(
-            'cd,nd->cn', x_chunk, read_block).astype(jnp.float32)
-        gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
-        gate = gate * valid_chunk_f[:, None]
-        gate = gate * valid_block_f[None, :]
-        mixed = gate * read_value
+                h_chunk = flat_h[safe_token]
+                h_chunk = (
+                    h_chunk * valid_chunk_f[:, None].astype(jnp.bfloat16))
+                key_block = key_blocks[lane_i, block_i]
+                write_block = jnp.take(
+                    write_blocks[lane_i, block_i], safe_d, axis=1)
+                write_block = write_block * d_valid[None, :].astype(
+                    write_block.dtype)
+                valid_block = valid_blocks[lane_i, block_i]
+                valid_block_f = valid_block.astype(jnp.float32)
 
-        d_y = d_raw_out[safe_token] * valid_chunk_f[:, None]
-        d_y_bf16 = d_y.astype(jnp.bfloat16)
-        d_mass = d_gate_mass[safe_token, 0] * valid_chunk_f
-        d_mixed = jnp.einsum(
-            'cd,nd->cn', d_y_bf16, write_block).astype(jnp.float32)
-        d_write = jnp.einsum(
-            'cn,cd->nd',
-            mixed.astype(jnp.bfloat16),
-            d_y_bf16).astype(jnp.float32)
-        d_read_value = d_mixed * gate
-        d_gate = d_mixed * read_value
-        d_gate = d_gate + d_mass[:, None]
-        d_read_value_bf16 = d_read_value.astype(jnp.bfloat16)
-        d_x = jnp.einsum(
-            'cn,nd->cd', d_read_value_bf16,
-            read_block).astype(jnp.float32)
-        d_read = jnp.einsum(
-            'cn,cd->nd', d_read_value_bf16,
-            x_chunk).astype(jnp.float32)
+                rho = jnp.einsum(
+                    'cd,nd->cn', h_chunk, key_block).astype(jnp.float32)
+                read_value = jnp.zeros(
+                    (output_tile_capacity, int(key_block.shape[0])),
+                    dtype=jnp.float32)
+                for read_tile_i in range(d_tile_count):
+                    read_offsets = (
+                        jnp.asarray(read_tile_i, dtype=jnp.int32)
+                        * d_tile_size
+                        + jnp.arange(d_tile_size, dtype=jnp.int32))
+                    read_valid = read_offsets < D
+                    safe_read_d = jnp.where(read_valid, read_offsets, 0)
+                    x_read = flat_x[
+                        safe_token[:, None], safe_read_d[None, :]]
+                    x_read = x_read * (
+                        valid_chunk_f[:, None]
+                        * read_valid[None, :]).astype(jnp.bfloat16)
+                    read_block_tile = jnp.take(
+                        read_blocks[lane_i, block_i],
+                        safe_read_d, axis=1)
+                    read_block_tile = read_block_tile * (
+                        read_valid[None, :].astype(read_block_tile.dtype))
+                    read_value = read_value + jnp.einsum(
+                        'cd,nd->cn', x_read,
+                        read_block_tile).astype(jnp.float32)
+                gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
+                gate = gate * valid_chunk_f[:, None]
+                gate = gate * valid_block_f[None, :]
+                mixed = gate * read_value
 
-        relu_rho = jax.nn.relu(rho)
-        d_rho = d_gate * (jnp.float32(2.0) * relu_rho)
-        d_rho = d_rho * (rho > 0.0).astype(jnp.float32)
-        d_rho = d_rho * valid_chunk_f[:, None]
-        d_rho = d_rho * valid_block_f[None, :]
-        d_rho_bf16 = d_rho.astype(jnp.bfloat16)
-        d_h = jnp.einsum(
-            'cn,nd->cd', d_rho_bf16, key_block).astype(jnp.float32)
-        d_key = jnp.einsum(
-            'cn,cd->nd', d_rho_bf16,
-            h_chunk).astype(jnp.float32)
+                d_y = d_y_tile[local_token] * valid_chunk_f[:, None]
+                d_y_bf16 = d_y.astype(jnp.bfloat16)
+                d_mass = d_mass_tile[local_token] * valid_chunk_f
+                d_mixed = jnp.einsum(
+                    'cd,nd->cn', d_y_bf16, write_block).astype(jnp.float32)
+                d_write = jnp.einsum(
+                    'cn,cd->nd',
+                    mixed.astype(jnp.bfloat16),
+                    d_y_bf16).astype(jnp.float32)
+                d_read_value = d_mixed * gate
+                d_gate = d_mixed * read_value
+                d_gate = d_gate + d_mass[:, None]
+                d_read_value_bf16 = d_read_value.astype(jnp.bfloat16)
 
-        grad_x = grad_x.at[safe_token].add(
-            (d_x * valid_chunk_f[:, None]).astype(flat_x.dtype),
-            mode='drop')
-        grad_h = grad_h.at[safe_token].add(
-            (d_h * valid_chunk_f[:, None]).astype(flat_h.dtype),
-            mode='drop')
-        grad_key = grad_key.at[lane_i, block_i].add(d_key)
-        grad_read = grad_read.at[lane_i, block_i].add(d_read)
-        grad_write = grad_write.at[lane_i, block_i].add(d_write)
+                relu_rho = jax.nn.relu(rho)
+                d_rho = d_gate * (jnp.float32(2.0) * relu_rho)
+                d_rho = d_rho * (rho > 0.0).astype(jnp.float32)
+                d_rho = d_rho * valid_chunk_f[:, None]
+                d_rho = d_rho * valid_block_f[None, :]
+                d_rho_bf16 = d_rho.astype(jnp.bfloat16)
+                d_h = jnp.einsum(
+                    'cn,nd->cd', d_rho_bf16,
+                    key_block).astype(jnp.float32)
+                d_key = jnp.einsum(
+                    'cn,cd->nd', d_rho_bf16,
+                    h_chunk).astype(jnp.float32)
+
+                for read_tile_i in range(d_tile_count):
+                    read_offsets = (
+                        jnp.asarray(read_tile_i, dtype=jnp.int32)
+                        * d_tile_size
+                        + jnp.arange(d_tile_size, dtype=jnp.int32))
+                    read_valid = read_offsets < D
+                    safe_read_d = jnp.where(read_valid, read_offsets, 0)
+                    x_read = flat_x[
+                        safe_token[:, None], safe_read_d[None, :]]
+                    x_read = x_read * (
+                        valid_chunk_f[:, None]
+                        * read_valid[None, :]).astype(jnp.bfloat16)
+                    read_block_tile = jnp.take(
+                        read_blocks[lane_i, block_i],
+                        safe_read_d, axis=1)
+                    read_block_tile = read_block_tile * (
+                        read_valid[None, :].astype(read_block_tile.dtype))
+                    d_x = jnp.einsum(
+                        'cn,nd->cd', d_read_value_bf16,
+                        read_block_tile).astype(jnp.float32)
+                    d_read = jnp.einsum(
+                        'cn,cd->nd', d_read_value_bf16,
+                        x_read).astype(jnp.float32)
+                    grad_x = grad_x.at[
+                        safe_token[:, None], safe_read_d[None, :]].add(
+                            (d_x * valid_chunk_f[:, None]
+                             * read_valid[None, :]).astype(flat_x.dtype),
+                            mode='drop')
+                    grad_read = grad_read.at[
+                        lane_i, block_i, :, safe_read_d].add(
+                            (d_read * read_valid[None, :]).T, mode='drop')
+                grad_h = grad_h.at[safe_token].add(
+                    (d_h * valid_chunk_f[:, None]).astype(flat_h.dtype),
+                    mode='drop')
+                grad_key = grad_key.at[lane_i, block_i].add(d_key)
+                grad_write = grad_write.at[
+                    lane_i, block_i, :, safe_d].add(
+                        (d_write * d_valid[None, :]).T, mode='drop')
         return (grad_x, grad_h, grad_key, grad_read, grad_write), None
 
     init = (
@@ -4271,9 +4376,9 @@ def _opspace_execute_bucket_outputs_manual_bwd(
         jnp.zeros_like(read_blocks, dtype=jnp.float32),
         jnp.zeros_like(write_blocks, dtype=jnp.float32),
     )
-    total_chunks = local_lanes * blocks_per_lane * bucket_chunk_count
+    total_tiles = output_tile_count * d_tile_count
     grad_x, grad_h, grad_key, grad_read, grad_write = jax.lax.scan(
-        chunk_step, init, jnp.arange(total_chunks, dtype=jnp.int32))[0]
+        tile_step, init, jnp.arange(total_tiles, dtype=jnp.int32))[0]
     return (
         grad_x.astype(flat_x.dtype),
         grad_h.astype(flat_h.dtype),
@@ -4283,62 +4388,56 @@ def _opspace_execute_bucket_outputs_manual_bwd(
     )
 
 
-def _opspace_execute_bucket_outputs_pallas_trainable_bwd(
-        bucket_chunk_size, bucket_chunk_count, interpret, residual, cotangent):
+def _opspace_execute_output_tiled_pallas_trainable_bwd(
+        output_tile_size, d_tile_size, output_tile_count, d_tile_count,
+        output_tile_capacity, interpret, residual, cotangent):
     del interpret
     (flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
      token_id_bucket, bucket_valid, bucket_fill) = residual
     grad_x, grad_h, grad_key, grad_read, grad_write = (
-        _opspace_execute_bucket_outputs_manual_bwd(
+        _opspace_execute_output_tiled_manual_bwd(
             flat_x, flat_h, key_blocks, read_blocks, write_blocks,
             valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
-            cotangent, bucket_chunk_size=bucket_chunk_size,
-            bucket_chunk_count=bucket_chunk_count))
+            cotangent, output_tile_size=output_tile_size,
+            d_tile_size=d_tile_size, output_tile_count=output_tile_count,
+            d_tile_count=d_tile_count,
+            output_tile_capacity=output_tile_capacity))
     return (
         grad_x, grad_h, grad_key, grad_read, grad_write,
         None, None, None, None)
 
 
-_opspace_execute_bucket_outputs_pallas_trainable.defvjp(
-    _opspace_execute_bucket_outputs_pallas_trainable_fwd,
-    _opspace_execute_bucket_outputs_pallas_trainable_bwd)
+_opspace_execute_output_tiled_pallas_trainable.defvjp(
+    _opspace_execute_output_tiled_pallas_trainable_fwd,
+    _opspace_execute_output_tiled_pallas_trainable_bwd)
 
 
 def _opspace_pallas_execute_buckets(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill, *,
-        bucket_chunk_size, bucket_chunk_count, use_pallas=True,
-        pallas_interpret=False):
-    """Execute fixed-shape buckets and return accumulated local state."""
-    if use_pallas and not _PALLAS_API_AVAILABLE:
+        output_tile_size, d_tile_size, output_tile_count, d_tile_count,
+        output_tile_capacity, use_pallas=True, pallas_interpret=False):
+    """Execute output-tiled buckets and return accumulated local state."""
+    if not use_pallas:
+        raise RuntimeError(
+            "block_bucketed_pallas_final requires the output-tiled Pallas "
+            "backend; the JAX token/chunk fallback is intentionally disabled.")
+    if not _PALLAS_API_AVAILABLE:
         raise RuntimeError(
             "block_bucketed_pallas_final requested Pallas execution, but "
-            f"{_pallas_unavailable_message()}. Select "
-            "execution_mode=block_bucketed_dense for the existing fallback "
-            "backend or call the factory with use_pallas=False for local "
-            "debug interpretation.")
-    if use_pallas and _PALLAS_API_AVAILABLE:
-        flat_raw_out, flat_gate_mass, flat_relu_count = (
-            _opspace_execute_bucket_outputs_pallas_trainable(
-                flat_x, flat_h, key_blocks, read_blocks, write_blocks,
-                valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
-                bucket_chunk_size, bucket_chunk_count, pallas_interpret))
-        compute_no_nan = jnp.logical_and(
-            jnp.all(jnp.isfinite(flat_raw_out)),
-            jnp.all(jnp.isfinite(flat_gate_mass))).astype(jnp.float32)
-        return (
-            flat_raw_out, flat_gate_mass, flat_relu_count, compute_no_nan,
-            jnp.float32(1.0))
-
-    flat_raw_out, flat_gate_mass, flat_relu_count, compute_no_nan = (
-        _opspace_execute_buckets_jax(
+            f"{_pallas_unavailable_message()}.")
+    flat_raw_out, flat_gate_mass, flat_relu_count = (
+        _opspace_execute_output_tiled_pallas_trainable(
             flat_x, flat_h, key_blocks, read_blocks, write_blocks,
             valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
-            bucket_chunk_size=bucket_chunk_size,
-            bucket_chunk_count=bucket_chunk_count))
+            output_tile_size, d_tile_size, output_tile_count, d_tile_count,
+            output_tile_capacity, pallas_interpret))
+    compute_no_nan = jnp.logical_and(
+        jnp.all(jnp.isfinite(flat_raw_out)),
+        jnp.all(jnp.isfinite(flat_gate_mass))).astype(jnp.float32)
     return (
         flat_raw_out, flat_gate_mass, flat_relu_count, compute_no_nan,
-        jnp.asarray(1.0 if _PALLAS_API_AVAILABLE else 0.0, dtype=jnp.float32))
+        jnp.float32(1.0))
 
 
 def _opspace_finalize_bucketed_output(
@@ -4382,10 +4481,18 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     bucket_capacity = max(
         1, int(math.ceil(float(bucket_capacity_factor) * float(T)
                          / float(blocks_per_lane))))
-    _bucket_chunk_size = max(1, min(int(bucket_chunk_size), bucket_capacity))
-    bucket_chunk_count = (
-        bucket_capacity + _bucket_chunk_size - 1) // _bucket_chunk_size
-    bucket_padded_capacity = bucket_chunk_count * _bucket_chunk_size
+    del bucket_chunk_size
+    output_tile_size = int(OPSPACE_FINAL_OUTPUT_TILE_SIZE)
+    d_tile_size = int(OPSPACE_FINAL_D_TILE_SIZE)
+    output_tile_count = max(
+        1, (T + output_tile_size - 1) // output_tile_size)
+    d_tile_count = max(1, (D + d_tile_size - 1) // d_tile_size)
+    avg_tile_fill = max(
+        1, int(math.ceil(float(bucket_capacity) / float(output_tile_count))))
+    output_tile_capacity = _opspace_round_up_to_multiple(
+        int(math.ceil(
+            float(avg_tile_fill) * OPSPACE_FINAL_TILE_CAPACITY_FACTOR)),
+        OPSPACE_FINAL_TILE_CAPACITY_ALIGN)
 
     (slot_to_row_np, valid_slot_np, _valid_counts_np) = (
         _opspace_balanced_slot_layout_np(
@@ -4468,8 +4575,9 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     assignment = _opspace_build_lane_buckets(
         scores_local, selected_lane_mask_local,
         blocks_per_lane=blocks_per_lane,
-        bucket_capacity=bucket_capacity,
-        bucket_padded_capacity=bucket_padded_capacity)
+        output_tile_size=output_tile_size,
+        output_tile_count=output_tile_count,
+        output_tile_capacity=output_tile_capacity)
     token_id_bucket = assignment['token_id_bucket']
     bucket_valid = assignment['bucket_valid']
     bucket_fill = assignment['bucket_fill']
@@ -4487,8 +4595,11 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
      pallas_backend_available) = _opspace_pallas_execute_buckets(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill,
-        bucket_chunk_size=_bucket_chunk_size,
-        bucket_chunk_count=bucket_chunk_count,
+        output_tile_size=output_tile_size,
+        d_tile_size=d_tile_size,
+        output_tile_count=output_tile_count,
+        d_tile_count=d_tile_count,
+        output_tile_capacity=output_tile_capacity,
         use_pallas=use_pallas,
         pallas_interpret=pallas_interpret)
 
@@ -4505,8 +4616,11 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         data_sum(jnp.asarray(T, dtype=jnp.float32)), 1.0)
     selected_request_count = token_count * jnp.float32(k_exec)
     valid_counts_by_block = valid_blocks.astype(jnp.float32).sum(axis=-1)
-    unique_by_block = bucket_valid.astype(jnp.float32).sum(axis=-1)
-    processed_count_local = unique_by_block.sum()
+    output_tile_fill = bucket_fill.astype(jnp.float32)
+    unique_by_output_tile = bucket_valid.astype(jnp.float32).sum(axis=-1)
+    unique_by_block = unique_by_output_tile.sum(axis=-1)
+    bucket_fill_total = output_tile_fill.sum(axis=-1)
+    processed_count_local = unique_by_output_tile.sum()
     valid_exec_slots_sum_local = jnp.sum(
         unique_by_block * valid_counts_by_block)
     assigned_valid = jnp.logical_and(
@@ -4520,8 +4634,8 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     unresolved_count_local = unresolved.astype(jnp.float32).sum()
     overflow_count_local = (
         unresolved_count_local + assignment_collision_count)
-    bucket_fill_sum_local = bucket_fill.astype(jnp.float32).sum()
-    bucket_fill_max_local = bucket_fill.astype(jnp.float32).max()
+    bucket_fill_sum_local = bucket_fill_total.sum()
+    bucket_fill_max_local = bucket_fill_total.max()
 
     global_processed_count = jax.lax.psum(processed_count_local, 'model')
     global_valid_exec_slots_sum = jax.lax.psum(
@@ -4650,7 +4764,7 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         / jnp.maximum(selected_request_count, 1.0))
 
     fill_all = jax.lax.all_gather(
-        bucket_fill.astype(jnp.float32), 'model', axis=0, tiled=True)
+        bucket_fill_total.astype(jnp.float32), 'model', axis=0, tiled=True)
     fill_all = jax.lax.all_gather(fill_all, 'data', axis=0, tiled=True)
     util_all = fill_all / jnp.maximum(jnp.float32(bucket_capacity), 1.0)
     bucket_fill_p50 = _opspace_percentile(fill_all, 50.0)
@@ -4661,20 +4775,31 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     bucket_capacity_util_p99 = _opspace_percentile(util_all, 99.0)
     bucket_capacity_util_max = jnp.max(util_all)
 
-    chunk_starts = (
-        jnp.arange(bucket_chunk_count, dtype=jnp.int32)
-        * _bucket_chunk_size)
-    executed_chunk_mask = (
-        chunk_starts[None, None, :] < bucket_fill[:, :, None])
+    output_tile_fill_all = jax.lax.all_gather(
+        output_tile_fill, 'model', axis=0, tiled=True)
+    output_tile_fill_all = jax.lax.all_gather(
+        output_tile_fill_all, 'data', axis=0, tiled=True)
+    output_tile_fill_p50 = _opspace_percentile(output_tile_fill_all, 50.0)
+    output_tile_fill_p95 = _opspace_percentile(output_tile_fill_all, 95.0)
+    output_tile_fill_p99 = _opspace_percentile(output_tile_fill_all, 99.0)
+    output_tile_fill_max = jnp.max(output_tile_fill_all)
+    output_tile_overflow_frac = semantic_drop_frac
+
+    active_output_tile_mask = output_tile_fill.sum(axis=(0, 1)) > 0.0
     logical_executed_chunks_local = (
-        executed_chunk_mask.astype(jnp.float32).sum())
+        active_output_tile_mask.astype(jnp.float32).sum()
+        * jnp.float32(d_tile_count))
     total_chunks_local = jnp.float32(
-        local_lanes * blocks_per_lane * bucket_chunk_count)
+        output_tile_count * d_tile_count)
     logical_empty_chunks_local = (
         total_chunks_local - logical_executed_chunks_local)
     actual_launched_chunks_local = jnp.float32(
-        local_lanes * blocks_per_lane * bucket_chunk_count)
+        output_tile_count * d_tile_count)
     actual_skipped_chunks_local = jnp.float32(0.0)
+    logical_bucket_tiles_local = (
+        (output_tile_fill > 0.0).astype(jnp.float32).sum())
+    output_tile_executed_slots_local = (
+        logical_bucket_tiles_local * jnp.float32(output_tile_capacity))
     global_logical_executed_chunks = jax.lax.psum(
         logical_executed_chunks_local, 'model')
     global_logical_empty_chunks = jax.lax.psum(
@@ -4692,12 +4817,13 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         pallas_actual_launched_chunks
         / jnp.maximum(pallas_logical_executed_chunks, jnp.float32(1.0)))
     pallas_valid_slots = processed_request_count
-    pallas_executed_slots = (
-        pallas_logical_executed_chunks * jnp.float32(_bucket_chunk_size))
+    pallas_executed_slots = data_sum(jax.lax.psum(
+        output_tile_executed_slots_local, 'model'))
     pallas_valid_token_frac = (
         pallas_valid_slots / jnp.maximum(pallas_executed_slots, 1.0))
-    pallas_padding_frac = jnp.maximum(
+    output_tile_padding_frac = jnp.maximum(
         jnp.float32(0.0), jnp.float32(1.0) - pallas_valid_token_frac)
+    pallas_padding_frac = output_tile_padding_frac
 
     diag = jnp.asarray((
         jnp.float32(1.0),
@@ -4754,6 +4880,16 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         pallas_actual_launched_chunks,
         pallas_actual_skipped_chunks,
         actual_vs_logical_chunk_ratio,
+        jnp.float32(output_tile_capacity),
+        output_tile_fill_p50,
+        output_tile_fill_p95,
+        output_tile_fill_p99,
+        output_tile_fill_max,
+        output_tile_overflow_frac,
+        output_tile_padding_frac,
+        jnp.float32(d_tile_size),
+        jnp.float32(output_tile_size),
+        jnp.float32(1.0),
     ), dtype=jnp.float32)
     aux = {
         'aux_loss': jnp.float32(0.0),
