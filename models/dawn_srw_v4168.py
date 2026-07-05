@@ -4039,16 +4039,11 @@ def _opspace_execute_output_tiled_pallas(
                 local_token = jnp.where(
                     valid_slots, token_ids - output_start, 0)
                 valid_slots_f = valid_slots.astype(jnp.float32)
-                h_mask = jnp.broadcast_to(
-                    valid_slots[:, None],
-                    (output_tile_capacity, d_route))
-                d_mask = jnp.broadcast_to(
-                    d_valid[None, :], (block_size, d_tile_size))
+                safe_d_ids = jnp.where(d_valid, d_ids, 0)
 
                 h_local = pl.load(
                     flat_h_ref,
                     (safe_token[:, None], route_ids[None, :]),
-                    mask=h_mask,
                     other=jnp.asarray(0.0, dtype=flat_h.dtype))
                 key_local = pl.load(
                     key_blocks_ref,
@@ -4057,9 +4052,11 @@ def _opspace_execute_output_tiled_pallas(
                     other=jnp.asarray(0.0, dtype=key_blocks.dtype))
                 write_local = pl.load(
                     write_blocks_ref,
-                    (lane_idx, block_idx, op_ids[:, None], d_ids[None, :]),
-                    mask=d_mask,
+                    (lane_idx, block_idx, op_ids[:, None],
+                     safe_d_ids[None, :]),
                     other=jnp.asarray(0.0, dtype=write_blocks.dtype))
+                write_local = write_local * d_valid[None, :].astype(
+                    write_local.dtype)
                 valid_ops = pl.load(
                     valid_blocks_ref, (lane_idx, block_idx, op_ids),
                     other=jnp.asarray(False, dtype=jnp.bool_))
@@ -4079,24 +4076,23 @@ def _opspace_execute_output_tiled_pallas(
                         * d_tile_size)
                     read_d_ids = read_start + local_d_ids
                     read_d_valid = read_d_ids < D
-                    read_d_mask = jnp.broadcast_to(
-                        read_d_valid[None, :], (block_size, d_tile_size))
-                    x_read_mask = jnp.logical_and(
-                        valid_slots[:, None], read_d_valid[None, :])
+                    safe_read_d_ids = jnp.where(read_d_valid, read_d_ids, 0)
                     x_read = pl.load(
                         flat_x_ref,
-                        (safe_token[:, None], read_d_ids[None, :]),
-                        mask=x_read_mask,
+                        (safe_token[:, None], safe_read_d_ids[None, :]),
                         other=jnp.asarray(0.0, dtype=flat_x.dtype))
                     read_local = pl.load(
                         read_blocks_ref,
                         (lane_idx, block_idx, op_ids[:, None],
-                         read_d_ids[None, :]),
-                        mask=read_d_mask,
+                         safe_read_d_ids[None, :]),
                         other=jnp.asarray(0.0, dtype=read_blocks.dtype))
+                    read_local = read_local * read_d_valid[None, :].astype(
+                        read_local.dtype)
                     x_read = (
                         x_read
-                        * valid_slots_f[:, None].astype(jnp.bfloat16))
+                        * (
+                            valid_slots_f[:, None]
+                            * read_d_valid[None, :]).astype(jnp.bfloat16))
                     read_value = read_value + pl.dot(
                         x_read.astype(jnp.bfloat16),
                         jnp.swapaxes(
