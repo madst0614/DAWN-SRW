@@ -3,9 +3,8 @@ DAWN-SRW v4.1.6.8 operation-space SRW.
 
 When operation_space is enabled:
 - routing_mode selects token/operator-space regions.
-- execution_mode selects the physical backend.
+- RST region/block routing uses one region-stationary masked-dense backend.
 - QK and V default to dense_masked execution.
-- RST defaults to block_bucketed_dense regional block execution.
 - QK/V/RST do not use DirectTau, admission, drive, or selection calibration in
   the active output path.
 - Legacy DirectTau/sector code remains only for disabled operation_space or
@@ -4128,20 +4127,16 @@ def _opspace_low_regret_assign_region_blocks(
         candidate_blocks[:, :visible_blocks])
 
 
-def _opspace_build_region_block_buckets(
+def _opspace_build_region_stationary_buckets(
         scores_local, admitted_region_mask_local, *, blocks_per_region,
-        block_capacity, visible_blocks_per_region, output_tile_size,
-        output_tile_count, output_tile_capacity, high_regret_threshold=0.05):
-    """Build fixed region/block buckets after region-first admission."""
-    del output_tile_capacity
+        block_capacity, region_capacity, visible_blocks_per_region,
+        high_regret_threshold=0.05):
+    """Build fixed region-owned token buckets after region/block routing."""
     T = int(scores_local.shape[0])
     local_regions = int(scores_local.shape[1])
     token_ids = jnp.arange(T, dtype=jnp.int32)
-    token_output_tile = jnp.minimum(
-        token_ids // jnp.asarray(output_tile_size, dtype=jnp.int32),
-        jnp.asarray(output_tile_count - 1, dtype=jnp.int32))
-    token_local_slot = (
-        token_ids % jnp.asarray(output_tile_size, dtype=jnp.int32))
+    visible_blocks = int(visible_blocks_per_region)
+    region_capacity_i32 = jnp.asarray(region_capacity, dtype=jnp.int32)
 
     def assign_one(scores_region, region_admitted):
         return _opspace_low_regret_assign_region_blocks(
@@ -4156,33 +4151,43 @@ def _opspace_build_region_block_buckets(
         assign_one, in_axes=(1, 1), out_axes=0)(
             scores_local, admitted_region_mask_local)
     valid_assignment = assigned_block >= 0
-    safe_block = jnp.where(valid_assignment, assigned_block, 0)
-    safe_tile = jnp.broadcast_to(
-        token_output_tile[None, :, None], assigned_block.shape)
-    safe_output_slot = jnp.broadcast_to(
-        token_local_slot[None, :, None], assigned_block.shape)
-    region_ids = jnp.broadcast_to(
-        jnp.arange(local_regions, dtype=jnp.int32)[:, None, None],
-        assigned_block.shape)
-    token_ids_l = jnp.broadcast_to(
-        token_ids[None, :, None], assigned_block.shape)
-    valid_f = valid_assignment.astype(jnp.float32)
+    valid_region_request = jnp.any(valid_assignment, axis=-1)
+    region_slot = (
+        jnp.cumsum(valid_region_request.astype(jnp.int32), axis=1) - 1)
+    bucket_write = jnp.logical_and(
+        valid_region_request, region_slot < region_capacity_i32)
+    safe_slot = jnp.where(bucket_write, region_slot, 0)
+    region_ids = jnp.arange(local_regions, dtype=jnp.int32)[:, None]
+    token_ids_l = jnp.broadcast_to(token_ids[None, :], (local_regions, T))
+    write_f = bucket_write.astype(jnp.float32)
     bucket_valid_count = jnp.zeros(
-        (local_regions, blocks_per_region, output_tile_count,
-         output_tile_size),
-        dtype=jnp.float32).at[
-            region_ids, safe_block, safe_tile, safe_output_slot].add(
-                valid_f, mode='drop')
+        (local_regions, region_capacity),
+        dtype=jnp.float32).at[region_ids, safe_slot].add(write_f, mode='drop')
     token_id_bucket = jnp.zeros(
-        (local_regions, blocks_per_region, output_tile_count,
-         output_tile_size),
-        dtype=jnp.int32).at[
-            region_ids, safe_block, safe_tile, safe_output_slot].max(
-                token_ids_l * valid_assignment.astype(jnp.int32), mode='drop')
+        (local_regions, region_capacity),
+        dtype=jnp.int32).at[region_ids, safe_slot].max(
+            token_ids_l * bucket_write.astype(jnp.int32), mode='drop')
+    block_slot_ids = jnp.arange(visible_blocks, dtype=jnp.int32)[None, None, :]
+    region_ids_b = region_ids[:, :, None]
+    safe_slot_b = safe_slot[:, :, None]
+    block_id_bucket = jnp.full(
+        (local_regions, region_capacity, visible_blocks),
+        -1, dtype=jnp.int32).at[
+            region_ids_b, safe_slot_b, block_slot_ids].max(
+                jnp.where(bucket_write[:, :, None], assigned_block, -1),
+                mode='drop')
     bucket_valid = bucket_valid_count == jnp.float32(1.0)
-    bucket_fill = bucket_valid.astype(jnp.int32).sum(axis=-1)
+    bucket_fill = bucket_valid.astype(jnp.float32).sum(axis=-1)
     assignment_collision_count = jnp.maximum(
         bucket_valid_count - jnp.float32(1.0), jnp.float32(0.0)).sum()
+    overflow_region = jnp.logical_and(
+        valid_region_request, region_slot >= region_capacity_i32)
+    bucket_overflow_request_count = (
+        valid_assignment.astype(jnp.float32)
+        * overflow_region[:, :, None].astype(jnp.float32)).sum()
+    processed_request_count = (
+        valid_assignment.astype(jnp.float32)
+        * bucket_write[:, :, None].astype(jnp.float32)).sum()
     return {
         'assigned_block': assigned_block,
         'assigned_rank': assigned_rank,
@@ -4194,8 +4199,11 @@ def _opspace_build_region_block_buckets(
         'bucket_fill': bucket_fill,
         'token_id_bucket': token_id_bucket,
         'bucket_valid': bucket_valid,
+        'block_id_bucket': block_id_bucket,
         'primary_block': primary_block,
         'assignment_collision_count': assignment_collision_count,
+        'bucket_overflow_request_count': bucket_overflow_request_count,
+        'processed_request_count': processed_request_count,
     }
 
 
@@ -4756,32 +4764,87 @@ _opspace_execute_output_tiled_pallas_trainable.defvjp(
     _opspace_execute_output_tiled_pallas_trainable_bwd)
 
 
-def _opspace_pallas_execute_buckets(
-        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
-        token_id_bucket, bucket_valid, bucket_fill, *,
-        output_tile_size, d_tile_size, output_tile_count, d_tile_count,
-        output_tile_capacity, use_pallas=True, pallas_interpret=False):
-    """Execute output-tiled buckets and return accumulated local state."""
-    if not use_pallas:
-        raise RuntimeError(
-            "block_bucketed_pallas_final requires the output-tiled Pallas "
-            "backend; the JAX token/chunk fallback is intentionally disabled.")
-    if not _PALLAS_API_AVAILABLE:
-        raise RuntimeError(
-            "block_bucketed_pallas_final requested Pallas execution, but "
-            f"{_pallas_unavailable_message()}.")
-    flat_raw_out, flat_gate_mass, flat_relu_count = (
-        _opspace_execute_output_tiled_pallas_trainable(
-            flat_x, flat_h, key_blocks, read_blocks, write_blocks,
-            valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
-            output_tile_size, d_tile_size, output_tile_count, d_tile_count,
-            output_tile_capacity, pallas_interpret))
-    compute_no_nan = jnp.logical_and(
-        jnp.all(jnp.isfinite(flat_raw_out)),
-        jnp.all(jnp.isfinite(flat_gate_mass))).astype(jnp.float32)
-    return (
-        flat_raw_out, flat_gate_mass, flat_relu_count, compute_no_nan,
-        jnp.float32(1.0))
+def _opspace_execute_region_stationary_dense(
+        flat_x, flat_h, key_regions, read_regions, write_regions,
+        valid_regions, token_id_bucket, bucket_valid, block_id_bucket, *,
+        blocks_per_region, operators_per_block):
+    """Execute one dense masked matmul per local region."""
+    T = int(flat_x.shape[0])
+    D = int(flat_x.shape[-1])
+    region_ops = int(blocks_per_region) * int(operators_per_block)
+    op_block_ids = (
+        jnp.arange(region_ops, dtype=jnp.int32)
+        // jnp.asarray(operators_per_block, dtype=jnp.int32))
+
+    def region_step(carry, region_i):
+        flat_raw_out, flat_gate_mass, flat_relu_gate_count, finite_acc = carry
+        token_ids = jax.lax.dynamic_index_in_dim(
+            token_id_bucket, region_i, axis=0, keepdims=False)
+        valid = jax.lax.dynamic_index_in_dim(
+            bucket_valid, region_i, axis=0, keepdims=False)
+        block_ids = jax.lax.dynamic_index_in_dim(
+            block_id_bucket, region_i, axis=0, keepdims=False)
+        safe_token_ids = jnp.where(valid, token_ids, 0)
+        valid_f = valid.astype(jnp.float32)
+        x_r = flat_x[safe_token_ids]
+        h_r = flat_h[safe_token_ids]
+        key_r = jax.lax.dynamic_index_in_dim(
+            key_regions, region_i, axis=0, keepdims=False).reshape(
+                region_ops, key_regions.shape[-1])
+        read_r = jax.lax.dynamic_index_in_dim(
+            read_regions, region_i, axis=0, keepdims=False).reshape(
+                region_ops, D)
+        write_r = jax.lax.dynamic_index_in_dim(
+            write_regions, region_i, axis=0, keepdims=False).reshape(
+                region_ops, D)
+        valid_r = jax.lax.dynamic_index_in_dim(
+            valid_regions, region_i, axis=0, keepdims=False).reshape(
+                region_ops)
+
+        rho = (
+            h_r.astype(jnp.bfloat16)
+            @ key_r.astype(jnp.bfloat16).T).astype(jnp.float32)
+        read_value = (
+            x_r.astype(jnp.bfloat16)
+            @ read_r.astype(jnp.bfloat16).T).astype(jnp.float32)
+        gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
+        op_mask = jnp.any(
+            op_block_ids[None, None, :] == block_ids[:, :, None],
+            axis=1)
+        gate = gate * op_mask.astype(jnp.float32)
+        gate = gate * valid_r.astype(jnp.float32)[None, :]
+        gate = gate * valid_f[:, None]
+        raw = (
+            (gate * read_value).astype(jnp.bfloat16)
+            @ write_r.astype(jnp.bfloat16)).astype(jnp.float32)
+        mass = gate.sum(axis=-1, keepdims=True)
+        relu_count = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
+
+        flat_raw_out = flat_raw_out.at[safe_token_ids].add(
+            raw * valid_f[:, None], mode='drop')
+        flat_gate_mass = flat_gate_mass.at[safe_token_ids].add(
+            mass * valid_f[:, None], mode='drop')
+        flat_relu_gate_count = flat_relu_gate_count.at[safe_token_ids].add(
+            relu_count * valid_f, mode='drop')
+        finite = jnp.logical_and(
+            jnp.all(jnp.isfinite(gate)),
+            jnp.all(jnp.isfinite(raw)))
+        finite_acc = jnp.minimum(finite_acc, finite.astype(jnp.float32))
+        return (
+            flat_raw_out, flat_gate_mass, flat_relu_gate_count,
+            finite_acc), None
+
+    init = (
+        jnp.zeros((T, D), dtype=jnp.float32),
+        jnp.zeros((T, 1), dtype=jnp.float32),
+        jnp.zeros((T,), dtype=jnp.float32),
+        jnp.float32(1.0),
+    )
+    (flat_raw_out, flat_gate_mass, flat_relu_count,
+     compute_no_nan) = jax.lax.scan(
+        region_step, init,
+        jnp.arange(int(token_id_bucket.shape[0]), dtype=jnp.int32))[0]
+    return flat_raw_out, flat_gate_mass, flat_relu_count, compute_no_nan
 
 
 def _opspace_finalize_bucketed_output(
@@ -4797,7 +4860,7 @@ def _opspace_finalize_bucketed_output(
     return flat_out, global_gate_mass, global_relu_gate_count, gate_denominator
 
 
-def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
+def _opspace_tau_free_relu_region_stationary_dense_core(
         flat_x, flat_h, op_key_local, read_local, write_local, *,
         lanes, tiles_per_lane, tile_size, local_lanes, local_tile_count,
         local_padded_ops, blocks_per_lane, exec_tiles_per_block, block_size,
@@ -4808,7 +4871,7 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         region_score_temperature=0.25, region_capacity_factor=1.25,
         block_capacity_factor=None, use_pallas=True,
         pallas_interpret=False):
-    """Final operation-space RST backend with low-regret fixed buckets.
+    """RST region-stationary masked-dense backend.
 
     Region-Block Operation Atlas
 
@@ -4823,55 +4886,60 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     operator bundle is visible. The only continuous mixing/intensity occurs at
     the RW operator gate inside each visible block.
     """
-    del exec_tiles_per_block
+    del bucket_chunk_size, exec_tiles_per_block, use_pallas, pallas_interpret
     if str(assignment_policy).lower() != 'low_regret':
         raise ValueError(
-            "block_bucketed_pallas_final requires assignment_policy="
+            "region_stationary_dense requires assignment_policy="
             f"'low_regret', got {assignment_policy!r}.")
+    if int(blocks_per_lane) <= 0:
+        raise ValueError(
+            "region_stationary_dense requires blocks_per_region > 0, got "
+            f"{blocks_per_lane}.")
+    if int(block_size) <= 0:
+        raise ValueError(
+            "region_stationary_dense requires operators_per_block > 0, got "
+            f"{block_size}.")
     _visible_blocks_per_region = int(visible_blocks_per_region)
     if not (1 <= _visible_blocks_per_region <= int(blocks_per_lane)):
         raise ValueError(
-            "region_block_pallas visible_blocks_per_region must be in "
+            "region_stationary_dense visible_blocks_per_region must be in "
             f"[1, blocks_per_region={blocks_per_lane}], got "
             f"{visible_blocks_per_region}.")
+    if not (1 <= int(k_exec) <= int(lanes)):
+        raise ValueError(
+            "region_stationary_dense visible_regions must be in "
+            f"[1, num_regions={lanes}], got {k_exec}.")
     _region_score_pooling = str(region_score_pooling).strip().lower()
     if _region_score_pooling != 'smoothmax':
         raise ValueError(
-            "region_block_pallas requires region_score_pooling='smoothmax', "
+            "region_stationary_dense requires region_score_pooling='smoothmax', "
             f"got {region_score_pooling!r}.")
     _region_score_temperature = max(
         float(region_score_temperature), 1.0e-6)
     _region_capacity_factor = float(region_capacity_factor)
     if _region_capacity_factor <= 0.0:
         raise ValueError(
-            "region_block_pallas region_capacity_factor must be > 0, got "
+            "region_stationary_dense region_capacity_factor must be > 0, got "
             f"{region_capacity_factor}.")
     _block_capacity_factor = (
         float(bucket_capacity_factor)
         if block_capacity_factor is None else float(block_capacity_factor))
     if _block_capacity_factor <= 0.0:
         raise ValueError(
-            "region_block_pallas block_capacity_factor must be > 0, got "
+            "region_stationary_dense block_capacity_factor must be > 0, got "
             f"{_block_capacity_factor}.")
     T = int(flat_x.shape[0])
     D = int(flat_x.shape[-1])
     N_local = int(op_key_local.shape[0])
     if N_local > local_padded_ops:
         raise ValueError(
-            "operation-space block_bucketed_pallas_final local rows exceed "
+            "operation-space region_stationary_dense local rows exceed "
             f"lane-block slots: rows={N_local}, slots={local_padded_ops}")
-    del bucket_chunk_size
-    output_tile_size = int(OPSPACE_FINAL_OUTPUT_TILE_SIZE)
-    d_tile_size = int(OPSPACE_FINAL_D_TILE_SIZE_POLICY)
-    if D % d_tile_size != 0:
+    expected_local_ops = int(local_lanes) * int(blocks_per_lane) * int(block_size)
+    if int(local_padded_ops) != expected_local_ops:
         raise ValueError(
-            "block_bucketed_pallas_final output-tiled backend requires "
-            f"D to be divisible by d_tile_size; got D={D}, "
-            f"d_tile_size={d_tile_size}.")
-    output_tile_count = max(
-        1, (T + output_tile_size - 1) // output_tile_size)
-    d_tile_count = max(1, (D + d_tile_size - 1) // d_tile_size)
-    output_tile_capacity = output_tile_size
+            "region_stationary_dense local_padded_ops invariant failed: "
+            f"local_padded_ops={local_padded_ops}, expected={expected_local_ops}.")
     selected_region_requests = int(T) * int(k_exec)
     region_capacity = max(
         1, int(math.ceil(
@@ -4879,7 +4947,7 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
             * _region_capacity_factor)))
     if int(lanes) * int(region_capacity) < int(selected_region_requests):
         raise ValueError(
-            "region_block_pallas region capacity invariant failed: "
+            "region_stationary_dense region capacity invariant failed: "
             f"num_regions={lanes}, region_capacity={region_capacity}, "
             f"selected_region_requests={selected_region_requests}.")
     block_capacity = max(
@@ -4890,12 +4958,12 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     if (int(blocks_per_lane) * int(block_capacity)
             < int(region_capacity) * int(_visible_blocks_per_region)):
         raise ValueError(
-            "region_block_pallas capacity invariant failed: "
+            "region_stationary_dense block capacity invariant failed: "
             f"blocks_per_region={blocks_per_lane}, "
             f"block_capacity={block_capacity}, "
             f"region_capacity={region_capacity}, "
             f"visible_blocks_per_region={_visible_blocks_per_region}.")
-    bucket_capacity = block_capacity
+    bucket_capacity = region_capacity
 
     (slot_to_row_np, valid_slot_np, _valid_counts_np) = (
         _opspace_balanced_slot_layout_np(
@@ -4998,18 +5066,17 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     scores_local = jax.lax.dynamic_slice_in_dim(
         scores_all, local_lane_start, local_lanes, axis=1)
 
-    assignment = _opspace_build_region_block_buckets(
+    assignment = _opspace_build_region_stationary_buckets(
         scores_local, admitted_region_mask_local,
         blocks_per_region=blocks_per_lane,
         block_capacity=block_capacity,
+        region_capacity=region_capacity,
         visible_blocks_per_region=_visible_blocks_per_region,
-        output_tile_size=output_tile_size,
-        output_tile_count=output_tile_count,
-        output_tile_capacity=output_tile_capacity,
         high_regret_threshold=high_regret_threshold)
     token_id_bucket = assignment['token_id_bucket']
     bucket_valid = assignment['bucket_valid']
     bucket_fill = assignment['bucket_fill']
+    block_id_bucket = assignment['block_id_bucket']
     assigned_rank = assignment['assigned_rank']
     assigned_block = assignment['assigned_block']
     chosen_score = assignment['chosen_score']
@@ -5020,17 +5087,11 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     assignment_collision_count = assignment['assignment_collision_count']
 
     (flat_raw_out_local, flat_gate_mass_local, flat_relu_gate_count_local,
-     compute_no_nan,
-     pallas_backend_available) = _opspace_pallas_execute_buckets(
+     compute_no_nan) = _opspace_execute_region_stationary_dense(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
-        token_id_bucket, bucket_valid, bucket_fill,
-        output_tile_size=output_tile_size,
-        d_tile_size=d_tile_size,
-        output_tile_count=output_tile_count,
-        d_tile_count=d_tile_count,
-        output_tile_capacity=output_tile_capacity,
-        use_pallas=use_pallas,
-        pallas_interpret=pallas_interpret)
+        token_id_bucket, bucket_valid, block_id_bucket,
+        blocks_per_region=blocks_per_lane,
+        operators_per_block=block_size)
 
     (flat_out, global_gate_mass, global_relu_gate_count,
      gate_denominator) = _opspace_finalize_bucketed_output(
@@ -5053,14 +5114,12 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     selected_region_request_count = token_count * jnp.float32(k_exec)
     selected_request_count = (
         selected_region_request_count * visible_blocks_per_region_f)
-    valid_counts_by_block = valid_blocks.astype(jnp.float32).sum(axis=-1)
-    output_tile_fill = bucket_valid.astype(jnp.float32).sum(axis=-1)
-    unique_by_output_tile = output_tile_fill
-    unique_by_block = unique_by_output_tile.sum(axis=-1)
-    bucket_fill_total = assignment['block_load']
-    processed_count_local = unique_by_output_tile.sum()
+    valid_counts_by_region = valid_blocks.astype(jnp.float32).sum(axis=(1, 2))
+    region_bucket_fill = bucket_fill.astype(jnp.float32)
+    block_load_total = assignment['block_load']
+    processed_count_local = assignment['processed_request_count']
     valid_exec_slots_sum_local = jnp.sum(
-        unique_by_block * valid_counts_by_block)
+        region_bucket_fill * valid_counts_by_region)
     region_selected_local = admitted_region_mask_local.T
     selected_f = jnp.broadcast_to(
         region_selected_local[:, :, None], assigned_block.shape).astype(
@@ -5077,9 +5136,12 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
             jnp.float32).sum()
     block_unresolved_count_local = unresolved.astype(jnp.float32).sum()
     unprocessed_count_local = (
-        block_unresolved_count_local + assignment_collision_count)
-    bucket_fill_sum_local = bucket_fill_total.sum()
-    bucket_fill_max_local = bucket_fill_total.max()
+        block_unresolved_count_local
+        + assignment_collision_count
+        + assignment['bucket_overflow_request_count'])
+    bucket_fill_sum_local = region_bucket_fill.sum()
+    bucket_fill_max_local = region_bucket_fill.max()
+    block_fill_max_local = block_load_total.max()
 
     global_processed_count = jax.lax.psum(processed_count_local, 'model')
     global_valid_exec_slots_sum = jax.lax.psum(
@@ -5095,6 +5157,7 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         assignment_collision_count, 'model')
     global_bucket_fill_sum = jax.lax.psum(bucket_fill_sum_local, 'model')
     global_bucket_fill_max = metric_pmax(bucket_fill_max_local, 'model')
+    global_block_fill_max = metric_pmax(block_fill_max_local, 'model')
 
     accepted_region_request_count = data_sum(
         admission['accepted_request_count'])
@@ -5133,12 +5196,14 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         selected_request_count, 1.0)
     semantic_drop_frac = semantic_drop_count / jnp.maximum(
         selected_request_count, 1.0)
-    bucket_count_global = jnp.float32(lanes * blocks_per_lane)
+    bucket_count_global = jnp.float32(lanes)
     bucket_fill_mean = (
         data_sum(global_bucket_fill_sum)
         / jnp.maximum(bucket_count_global, 1.0))
     bucket_fill_max = metric_pmax(
         metric_pmax(global_bucket_fill_max, 'data'), 'model')
+    block_fill_max = metric_pmax(
+        metric_pmax(global_block_fill_max, 'data'), 'model')
     bucket_fill_skew = bucket_fill_max / jnp.maximum(bucket_fill_mean, 1.0)
 
     region_load_all = jax.lax.all_gather(
@@ -5270,7 +5335,7 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         / jnp.maximum(accepted_block_request_count, 1.0))
 
     fill_all = jax.lax.all_gather(
-        bucket_fill_total.astype(jnp.float32), 'model', axis=0, tiled=True)
+        region_bucket_fill.astype(jnp.float32), 'model', axis=0, tiled=True)
     fill_all = jax.lax.all_gather(fill_all, 'data', axis=0, tiled=True)
     util_all = fill_all / jnp.maximum(jnp.float32(bucket_capacity), 1.0)
     bucket_fill_p50 = _opspace_percentile(fill_all, 50.0)
@@ -5280,21 +5345,28 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     bucket_capacity_util_p95 = _opspace_percentile(util_all, 95.0)
     bucket_capacity_util_p99 = _opspace_percentile(util_all, 99.0)
     bucket_capacity_util_max = jnp.max(util_all)
-    block_load_mean = jnp.maximum(fill_all.mean(), jnp.float32(1.0e-6))
-    block_load_p50 = bucket_fill_p50
-    block_load_p95 = bucket_fill_p95
-    block_load_p99 = bucket_fill_p99
-    block_load_max = bucket_fill_max
-    block_capacity_util_p50 = bucket_capacity_util_p50
-    block_capacity_util_p95 = bucket_capacity_util_p95
-    block_capacity_util_p99 = bucket_capacity_util_p99
-    block_capacity_util_max = bucket_capacity_util_max
+    block_fill_all = jax.lax.all_gather(
+        block_load_total.astype(jnp.float32), 'model', axis=0, tiled=True)
+    block_fill_all = jax.lax.all_gather(
+        block_fill_all, 'data', axis=0, tiled=True)
+    block_util_all = block_fill_all / jnp.maximum(
+        jnp.float32(block_capacity), 1.0)
+    block_load_mean = jnp.maximum(
+        block_fill_all.mean(), jnp.float32(1.0e-6))
+    block_load_p50 = _opspace_percentile(block_fill_all, 50.0)
+    block_load_p95 = _opspace_percentile(block_fill_all, 95.0)
+    block_load_p99 = _opspace_percentile(block_fill_all, 99.0)
+    block_load_max = block_fill_max
+    block_capacity_util_p50 = _opspace_percentile(block_util_all, 50.0)
+    block_capacity_util_p95 = _opspace_percentile(block_util_all, 95.0)
+    block_capacity_util_p99 = _opspace_percentile(block_util_all, 99.0)
+    block_capacity_util_max = jnp.max(block_util_all)
     block_unresolved_frac = block_unresolved_count / jnp.maximum(
         accepted_block_request_count, 1.0)
     block_reroute_frac = block_reroute_count / jnp.maximum(
         accepted_block_request_count, 1.0)
     block_load_p99_over_mean = (
-        _opspace_percentile(fill_all, 99.0) / block_load_mean)
+        block_load_p99 / block_load_mean)
     block_compactness_all = jax.lax.all_gather(
         block_compactness_local, 'model', axis=0, tiled=True)
     block_radius_mean_all = jax.lax.all_gather(
@@ -5321,54 +5393,24 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     block_radius_max = jnp.max(
         jnp.where(block_valid_all, block_radius_max_all, jnp.float32(0.0)))
 
-    output_tile_fill_all = jax.lax.all_gather(
-        output_tile_fill, 'model', axis=0, tiled=True)
-    output_tile_fill_all = jax.lax.all_gather(
-        output_tile_fill_all, 'data', axis=0, tiled=True)
-    output_tile_fill_p50 = _opspace_percentile(output_tile_fill_all, 50.0)
-    output_tile_fill_p95 = _opspace_percentile(output_tile_fill_all, 95.0)
-    output_tile_fill_p99 = _opspace_percentile(output_tile_fill_all, 99.0)
-    output_tile_fill_max = jnp.max(output_tile_fill_all)
-    output_tile_overflow_frac = semantic_drop_frac
-
-    active_output_tile_mask = output_tile_fill.sum(axis=(0, 1)) > 0.0
-    logical_executed_chunks_local = (
-        active_output_tile_mask.astype(jnp.float32).sum())
-    total_chunks_local = jnp.float32(
-        output_tile_count)
-    logical_empty_chunks_local = (
-        total_chunks_local - logical_executed_chunks_local)
-    actual_launched_chunks_local = jnp.float32(
-        output_tile_count)
-    actual_skipped_chunks_local = jnp.float32(0.0)
-    logical_bucket_tiles_local = (
-        (output_tile_fill > 0.0).astype(jnp.float32).sum())
-    output_tile_executed_slots_local = (
-        logical_bucket_tiles_local * jnp.float32(output_tile_capacity))
-    global_logical_executed_chunks = jax.lax.psum(
-        logical_executed_chunks_local, 'model')
-    global_logical_empty_chunks = jax.lax.psum(
-        logical_empty_chunks_local, 'model')
-    global_actual_launched_chunks = jax.lax.psum(
-        actual_launched_chunks_local, 'model')
-    global_actual_skipped_chunks = jax.lax.psum(
-        actual_skipped_chunks_local, 'model')
-    pallas_logical_executed_chunks = data_sum(
-        global_logical_executed_chunks)
-    pallas_logical_empty_chunks = data_sum(global_logical_empty_chunks)
-    pallas_actual_launched_chunks = data_sum(global_actual_launched_chunks)
-    pallas_actual_skipped_chunks = data_sum(global_actual_skipped_chunks)
-    actual_vs_logical_chunk_ratio = (
-        pallas_actual_launched_chunks
-        / jnp.maximum(pallas_logical_executed_chunks, jnp.float32(1.0)))
-    pallas_valid_slots = processed_request_count
-    pallas_executed_slots = data_sum(jax.lax.psum(
-        output_tile_executed_slots_local, 'model'))
-    pallas_valid_token_frac = (
-        pallas_valid_slots / jnp.maximum(pallas_executed_slots, 1.0))
-    output_tile_padding_frac = jnp.maximum(
-        jnp.float32(0.0), jnp.float32(1.0) - pallas_valid_token_frac)
-    pallas_padding_frac = output_tile_padding_frac
+    pallas_logical_executed_chunks = jnp.float32(0.0)
+    pallas_logical_empty_chunks = jnp.float32(0.0)
+    pallas_actual_launched_chunks = jnp.float32(0.0)
+    pallas_actual_skipped_chunks = jnp.float32(0.0)
+    actual_vs_logical_chunk_ratio = jnp.float32(1.0)
+    pallas_valid_token_frac = jnp.float32(0.0)
+    pallas_padding_frac = jnp.float32(0.0)
+    pallas_backend_available = jnp.float32(0.0)
+    output_tile_capacity_metric = jnp.float32(0.0)
+    output_tile_fill_p50 = jnp.float32(0.0)
+    output_tile_fill_p95 = jnp.float32(0.0)
+    output_tile_fill_p99 = jnp.float32(0.0)
+    output_tile_fill_max = jnp.float32(0.0)
+    output_tile_overflow_frac = jnp.float32(0.0)
+    output_tile_padding_frac = jnp.float32(0.0)
+    d_tile_size_metric = jnp.float32(0.0)
+    output_tile_size_metric = jnp.float32(0.0)
+    output_tiled_backend_active = jnp.float32(0.0)
     visible_blocks_per_token = jnp.float32(
         int(k_exec) * int(_visible_blocks_per_region))
     visible_ops_per_token = (
@@ -5433,16 +5475,16 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         pallas_actual_launched_chunks,
         pallas_actual_skipped_chunks,
         actual_vs_logical_chunk_ratio,
-        jnp.float32(output_tile_capacity),
+        output_tile_capacity_metric,
         output_tile_fill_p50,
         output_tile_fill_p95,
         output_tile_fill_p99,
         output_tile_fill_max,
         output_tile_overflow_frac,
         output_tile_padding_frac,
-        jnp.float32(d_tile_size),
-        jnp.float32(output_tile_size),
-        jnp.float32(1.0),
+        d_tile_size_metric,
+        output_tile_size_metric,
+        output_tiled_backend_active,
         region_load_p99_over_mean,
         block_load_p99_over_mean,
         block_compactness_mean,
@@ -5618,9 +5660,14 @@ def make_sharded_srw_tau_free_relu_block_bucketed_pallas_final_minimal(
         block_capacity_factor=None,
         use_pallas=True,
         pallas_interpret=False):
-    """Create final tau-free relu2 low-regret Pallas bucketed SRW."""
+    """Create tau-free relu2 region-stationary masked-dense RST SRW.
+
+    The public name is retained for older call sites; it no longer constructs
+    an output-tiled Pallas executor.
+    """
     del max_chunk_size, dead_exposure_target, padded_ops, token_chunk_size
     del soft_gate_effective_active_eps, admission_den_grad_scale
+    del use_pallas, pallas_interpret
     layout = _opspace_block_bucketed_layout(
         mesh, lanes, tiles_per_lane, tile_size, exec_tiles_per_block,
         blocks_per_lane, block_size)
@@ -5634,7 +5681,7 @@ def make_sharded_srw_tau_free_relu_block_bucketed_pallas_final_minimal(
     _blocks_per_lane = layout['blocks_per_lane']
     _block_size = layout['block_size']
     _k_exec = max(1, min(int(k_exec), _lanes))
-    _exec_slots = _k_exec * _block_size
+    _exec_slots = _k_exec * _blocks_per_lane * _block_size
     _admission_den_power = jnp.maximum(
         jnp.asarray(admission_den_power, dtype=jnp.float32),
         jnp.float32(0.0))
@@ -5648,9 +5695,6 @@ def make_sharded_srw_tau_free_relu_block_bucketed_pallas_final_minimal(
     _region_capacity_factor = float(region_capacity_factor)
     _block_capacity_factor = (
         None if block_capacity_factor is None else float(block_capacity_factor))
-    _use_pallas = bool(use_pallas)
-    _pallas_interpret = bool(pallas_interpret)
-
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),
                        P('data', None, None),
@@ -5662,7 +5706,7 @@ def make_sharded_srw_tau_free_relu_block_bucketed_pallas_final_minimal(
              out_specs=(P('data', None, None), P(),
                         {'aux_loss': P(), 'final_diag': P()}),
              check_rep=False)
-    def fused_gate_srw_tau_free_relu_block_bucketed_pallas_final(
+    def fused_gate_srw_tau_free_relu_region_stationary_dense(
             x, h, op_key_local, raw_tau, read_local, write_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
@@ -5672,7 +5716,7 @@ def make_sharded_srw_tau_free_relu_block_bucketed_pallas_final_minimal(
         del execution_prune_eps, training_tokens
         B, S, D = x.shape
         flat_out, _flat_gate_mass, diag, aux = (
-            _opspace_tau_free_relu_block_bucketed_pallas_final_core(
+            _opspace_tau_free_relu_region_stationary_dense_core(
                 x.reshape(int(B) * int(S), D),
                 h.reshape(int(B) * int(S), h.shape[-1]),
                 op_key_local, read_local, write_local,
@@ -5696,13 +5740,11 @@ def make_sharded_srw_tau_free_relu_block_bucketed_pallas_final_minimal(
                 region_score_pooling=_region_score_pooling,
                 region_score_temperature=_region_score_temperature,
                 region_capacity_factor=_region_capacity_factor,
-                block_capacity_factor=_block_capacity_factor,
-                use_pallas=_use_pallas,
-                pallas_interpret=_pallas_interpret))
+                block_capacity_factor=_block_capacity_factor))
         return flat_out.reshape(B, S, D), diag, aux
 
-    fused_gate_srw_tau_free_relu_block_bucketed_pallas_final._v4168_accepts_training_tokens = True
-    return fused_gate_srw_tau_free_relu_block_bucketed_pallas_final
+    fused_gate_srw_tau_free_relu_region_stationary_dense._v4168_accepts_training_tokens = True
+    return fused_gate_srw_tau_free_relu_region_stationary_dense
 
 
 def make_sharded_srw_tau_free_relu_region_block_pallas_minimal(
@@ -5729,10 +5771,10 @@ def make_sharded_srw_tau_free_relu_region_block_pallas_minimal(
         high_regret_threshold=0.05,
         use_pallas=True,
         pallas_interpret=False):
-    """Create the RST Region/Block atlas Pallas executor."""
+    """Create the RST Region/Block atlas region-stationary dense executor."""
     if int(operators_per_block) % int(tile_size) != 0:
         raise ValueError(
-            "region_block_pallas requires operators_per_block divisible by "
+            "region-stationary RST requires operators_per_block divisible by "
             f"tile_size; got operators_per_block={operators_per_block}, "
             f"tile_size={tile_size}.")
     _visible_regions = int(visible_regions)
@@ -10006,9 +10048,30 @@ def make_sharded_srw_minimal(
         operation_space_execution_mode
         if operation_space_execution_mode is not None
         else 'dense_masked').lower()
-    if routing_mode in (
-            'factorized_lane_mean',
-            'region_block'):
+    if routing_mode == 'region_block':
+        return make_sharded_srw_tau_free_relu_region_block_pallas_minimal(
+            mesh, max_chunk_size=max_chunk_size,
+            dead_exposure_target=dead_exposure_target,
+            soft_gate_effective_active_eps=soft_gate_effective_active_eps,
+            admission_den_power=admission_den_power,
+            admission_den_grad_scale=admission_den_grad_scale,
+            num_regions=opspace_num_regions,
+            blocks_per_region=opspace_blocks_per_region,
+            operators_per_block=opspace_operators_per_block,
+            visible_regions=opspace_visible_regions,
+            visible_blocks_per_region=opspace_visible_blocks_per_region,
+            region_score_pooling=opspace_region_score_pooling,
+            region_score_temperature=opspace_region_score_temperature,
+            tile_size=opspace_tile_size,
+            padded_ops=opspace_padded_ops,
+            token_chunk_size=opspace_token_chunk_size,
+            bucket_capacity_factor=opspace_bucket_capacity_factor,
+            bucket_chunk_size=opspace_bucket_chunk_size,
+            region_capacity_factor=opspace_region_capacity_factor,
+            block_capacity_factor=opspace_block_capacity_factor,
+            assignment_policy=opspace_assignment_policy,
+            high_regret_threshold=opspace_high_regret_threshold)
+    if routing_mode == 'factorized_lane_mean':
         if execution_mode == 'dense_masked':
             return make_sharded_srw_tau_free_relu_dense_masked_minimal(
                 mesh, max_chunk_size=max_chunk_size,
@@ -10038,58 +10101,9 @@ def make_sharded_srw_minimal(
                 blocks_per_lane=opspace_blocks_per_lane,
                 block_size=opspace_block_size,
                 token_chunk_size=opspace_token_chunk_size)
-        if execution_mode == 'block_bucketed_pallas_final':
-            return (
-                make_sharded_srw_tau_free_relu_block_bucketed_pallas_final_minimal(
-                    mesh, max_chunk_size=max_chunk_size,
-                    dead_exposure_target=dead_exposure_target,
-                    soft_gate_effective_active_eps=soft_gate_effective_active_eps,
-                    admission_den_power=admission_den_power,
-                    admission_den_grad_scale=admission_den_grad_scale,
-                    lanes=opspace_lanes,
-                    tiles_per_lane=opspace_tiles_per_lane,
-                    padded_ops=opspace_padded_ops,
-                    tile_size=opspace_tile_size,
-                    k_exec=opspace_k_exec,
-                    exec_tiles_per_block=opspace_exec_tiles_per_block,
-                    blocks_per_lane=opspace_blocks_per_lane,
-                    block_size=opspace_block_size,
-                    token_chunk_size=opspace_token_chunk_size,
-                    bucket_capacity_factor=opspace_bucket_capacity_factor,
-                    bucket_chunk_size=opspace_bucket_chunk_size,
-                    assignment_policy=opspace_assignment_policy,
-                    high_regret_threshold=opspace_high_regret_threshold,
-                    visible_blocks_per_region=opspace_visible_blocks_per_region,
-                    region_score_pooling=opspace_region_score_pooling,
-                    region_score_temperature=opspace_region_score_temperature))
-        if execution_mode == 'region_block_pallas':
-            return (
-                make_sharded_srw_tau_free_relu_region_block_pallas_minimal(
-                    mesh, max_chunk_size=max_chunk_size,
-                    dead_exposure_target=dead_exposure_target,
-                    soft_gate_effective_active_eps=soft_gate_effective_active_eps,
-                    admission_den_power=admission_den_power,
-                    admission_den_grad_scale=admission_den_grad_scale,
-                    num_regions=opspace_num_regions,
-                    blocks_per_region=opspace_blocks_per_region,
-                    operators_per_block=opspace_operators_per_block,
-                    visible_regions=opspace_visible_regions,
-                    visible_blocks_per_region=opspace_visible_blocks_per_region,
-                    region_score_pooling=opspace_region_score_pooling,
-                    region_score_temperature=opspace_region_score_temperature,
-                    tile_size=opspace_tile_size,
-                    padded_ops=opspace_padded_ops,
-                    token_chunk_size=opspace_token_chunk_size,
-                    bucket_capacity_factor=opspace_bucket_capacity_factor,
-                    bucket_chunk_size=opspace_bucket_chunk_size,
-                    region_capacity_factor=opspace_region_capacity_factor,
-                    block_capacity_factor=opspace_block_capacity_factor,
-                    assignment_policy=opspace_assignment_policy,
-                    high_regret_threshold=opspace_high_regret_threshold))
         raise ValueError(
             "operation_space execution_mode must be 'dense_masked', "
-            "'block_bucketed_dense', 'block_bucketed_pallas_final', or "
-            "'region_block_pallas', got "
+            "or 'block_bucketed_dense' for factorized_lane_mean routing, got "
             f"{execution_mode!r}.")
     if hardware_sector_execution_enabled:
         if hardware_sector_debug_token_gather_fallback:
