@@ -4055,8 +4055,14 @@ def _opspace_execute_bucket_outputs_pallas_group(
             relu_acc_ref[...] = jnp.zeros_like(relu_acc_ref)
 
         active_token = assigned_block_ref[...] == block_i
-        h_chunk = flat_h_ref[...] * active_token[:, None].astype(jnp.bfloat16)
-        x_chunk = flat_x_ref[...] * active_token[:, None].astype(jnp.bfloat16)
+        active_token_f = active_token.astype(jnp.float32)
+        active_token_2d = active_token_f[:, None]
+        h_chunk = (
+            flat_h_ref[...].astype(jnp.float32) * active_token_2d
+        ).astype(jnp.bfloat16)
+        x_chunk = (
+            flat_x_ref[...].astype(jnp.float32) * active_token_2d
+        ).astype(jnp.bfloat16)
         key_block = key_block_ref[...]
         read_block = read_block_ref[...]
         write_block = write_block_ref[...]
@@ -4071,7 +4077,7 @@ def _opspace_execute_bucket_outputs_pallas_group(
             jnp.swapaxes(read_block.astype(jnp.bfloat16), 0, 1)
         ).astype(jnp.float32)
         gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
-        gate = gate * active_token.astype(jnp.float32)[:, None]
+        gate = gate * active_token_2d
         gate = gate * valid_ops.astype(jnp.float32)[None, :]
         raw_out = pl.dot(
             (gate * read_value).astype(jnp.bfloat16),
