@@ -100,18 +100,46 @@ OPSPACE_RUNTIME_METRIC_NAMES = (
     "factorized_tile_layout_ok",
 )
 OPSPACE_FINAL_RUNTIME_METRIC_NAMES = (
+    "assignment_score_best_mean",
+    "assignment_score_chosen_mean",
     "assignment_score_loss_mean",
     "assignment_score_loss_p95",
     "assignment_score_loss_max",
     "assignment_regret_mean",
     "assignment_regret_p95",
+    "assignment_regret_max",
+    "low_regret_spill_frac",
     "high_regret_spill_frac",
+    "unresolved_after_rank_pass_count",
+    "assignment_collision_count",
+    "overflow_slowpath_frac",
     "semantic_drop_frac",
-    "pallas_executed_chunks",
-    "pallas_skipped_chunks",
-    "pallas_padding_frac",
+    "bucket_fill_p50",
+    "bucket_fill_p95",
     "bucket_fill_p99",
+    "bucket_fill_max",
+    "bucket_capacity_util_p50",
+    "bucket_capacity_util_p95",
     "bucket_capacity_util_p99",
+    "bucket_capacity_util_max",
+    "pallas_logical_executed_chunks",
+    "pallas_padding_frac",
+    "pallas_valid_token_frac",
+    "pallas_backend_available",
+    "pallas_logical_empty_chunks",
+    "pallas_actual_launched_chunks",
+    "pallas_actual_skipped_chunks",
+    "actual_vs_logical_chunk_ratio",
+    "output_tile_capacity",
+    "output_tile_fill_p50",
+    "output_tile_fill_p95",
+    "output_tile_fill_p99",
+    "output_tile_fill_max",
+    "output_tile_overflow_frac",
+    "output_tile_padding_frac",
+    "d_tile_size",
+    "output_tile_size",
+    "output_tiled_backend_active",
 )
 
 
@@ -1657,6 +1685,126 @@ def summarize_profile_records(records):
     return aggregates, layer_summary
 
 
+def summarize_runtime_metric_snapshots(snapshots):
+    if not snapshots:
+        return {}
+    base_names = (
+        "enabled",
+        "k_exec",
+        "exec_slots",
+        "bucket_capacity",
+        "bucket_fill_mean",
+        "bucket_fill_skew",
+        "reroute_frac",
+        "gate_mass_mean",
+        "effective_ops",
+        "padded_exec_slots_mean",
+        "overflow_frac",
+        "no_nan",
+        "selected_requests",
+        "processed_requests",
+        "all_processed",
+    )
+    final_names = (
+        "semantic_drop_frac",
+        "assignment_score_loss_p95",
+        "assignment_regret_p95",
+        "high_regret_spill_frac",
+        "overflow_slowpath_frac",
+        "bucket_fill_p99",
+        "bucket_capacity_util_p99",
+        "pallas_logical_executed_chunks",
+        "pallas_actual_launched_chunks",
+        "pallas_actual_skipped_chunks",
+        "pallas_padding_frac",
+        "pallas_backend_available",
+        "output_tile_capacity",
+        "output_tile_fill_p99",
+        "output_tile_overflow_frac",
+        "output_tile_padding_frac",
+        "output_tiled_backend_active",
+    )
+    summary = {}
+    for pool in ("attn_v", "rst"):
+        row = {}
+        for name in base_names:
+            collect_runtime_metric(
+                row, snapshots, f"opspace/{pool}/{name}", name)
+        for name in final_names:
+            collect_runtime_metric(
+                row, snapshots, f"opspace/{pool}/final/{name}", name)
+        if row:
+            summary[pool] = row
+    return summary
+
+
+def collect_runtime_metric(row, snapshots, key, name):
+    values = []
+    for metrics in snapshots:
+        if key not in metrics:
+            continue
+        value = num(metrics.get(key))
+        if value is not None:
+            values.append(value)
+    if values:
+        row[name] = {
+            "mean": mean(values),
+            "min": min(values),
+            "max": max(values),
+            "last": values[-1],
+        }
+
+
+def runtime_stat(summary, pool, name, stat="max"):
+    row = (summary.get("runtime_metric_summary") or {}).get(pool, {})
+    value = row.get(name, {})
+    if isinstance(value, dict):
+        return value.get(stat)
+    return None
+
+
+def profile_bottleneck_rows(summary):
+    rows = []
+    for row in summary.get("profile_aggregates", []) or []:
+        group = row.get("group")
+        if group == "fast_forward":
+            continue
+        total_s = num(row.get("total_seconds"))
+        if total_s is None:
+            continue
+        rows.append({
+            "group": group,
+            "total_seconds": total_s,
+            "mean_seconds": num(row.get("mean_seconds")),
+            "pct_module_split": num(row.get("pct_module_split")),
+            "max_hbm_peak_gb": num(row.get("max_hbm_peak_gb")),
+        })
+    rows.sort(key=lambda row: row["total_seconds"], reverse=True)
+    return rows
+
+
+def top_layer_bottlenecks(summary):
+    rows = summary.get("profile_layer_rows", []) or []
+    attn_rows = [
+        row for row in rows
+        if row.get("attn_seconds") is not None
+    ]
+    rst_rows = [
+        row for row in rows
+        if row.get("rst_seconds") is not None
+    ]
+    top_attn = max(
+        attn_rows, key=lambda row: num(row.get("attn_seconds")) or -1.0,
+        default=None)
+    top_rst = max(
+        rst_rows, key=lambda row: num(row.get("rst_seconds")) or -1.0,
+        default=None)
+    top_ratio = max(
+        rows, key=lambda row: num(row.get("rst_over_attn")) or -1.0,
+        default=None)
+    return top_attn, top_rst, top_ratio
+
+
 def ratio_float(a, b):
     a = num(a)
     b = num(b)
@@ -1672,6 +1820,7 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
     summary = {}
     next_step = int(start_step)
     peak_hbm = None
+    fast_metric_snapshots = []
     forward_step = create_benchmark_forward_step(model, sharded_fns, cfg)
 
     def next_profile_batch():
@@ -1719,6 +1868,7 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
             fast_times.append(seconds)
             fast_tokens.append(tok_s)
             metrics_host = jax.device_get(metrics)
+            fast_metric_snapshots.append(metrics_host)
             records.append(benchmark_profile_record(
                 run_index, variant_label, "fast_forward_measure", step_no,
                 "fast_forward_loss", "fast_forward", seconds,
@@ -1739,6 +1889,8 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
             "fast_forward_tokens_per_second": mean(fast_tokens),
             "fast_forward_speedup_vs_train_step": ratio_float(
                 train_mean_seconds, mean(fast_times)),
+            "runtime_metric_summary": summarize_runtime_metric_snapshots(
+                fast_metric_snapshots),
         })
 
     if int(args.module_profile_steps) > 0:
@@ -1897,10 +2049,17 @@ def opspace_brief(metrics, pool):
     final_prefix = prefix + "final/"
     final_text = ""
     if final_prefix + "semantic_drop_frac" in metrics:
+        skipped = metrics.get(
+            final_prefix + "pallas_actual_skipped_chunks",
+            metrics.get(final_prefix + "pallas_skipped_chunks"))
+        launched = metrics.get(
+            final_prefix + "pallas_actual_launched_chunks",
+            metrics.get(final_prefix + "pallas_executed_chunks"))
         final_text = (
             f" loss95={fmt(metrics.get(final_prefix + 'assignment_score_loss_p95'), 4)}"
             f" drop={fmt(metrics.get(final_prefix + 'semantic_drop_frac'), 6)}"
-            f" skip={fmt(metrics.get(final_prefix + 'pallas_skipped_chunks'), 1)}"
+            f" launch={fmt(launched, 1)}"
+            f" skip={fmt(skipped, 1)}"
             f" pad={fmt(metrics.get(final_prefix + 'pallas_padding_frac'), 3)}")
     return (
         f"op-{label}[ovf={fmt(metrics.get(prefix + 'overflow_frac'), 6)} "
@@ -2169,6 +2328,8 @@ def print_summary(summary):
                 f"padded_work_frac_vs_dense={fmt(work.get('padded_frac'), 6)} "
                 f"semantic_work_frac_vs_dense={fmt(work.get('semantic_frac'), 6)}",
                 flush=True)
+    print_runtime_bottleneck(summary)
+    print_profile_bottleneck(summary)
     print("\n[op-breakdown]", flush=True)
     print(
         "op | calls | total_ms | mean_ms | pct_split | "
@@ -2233,6 +2394,69 @@ def print_summary(summary):
                 f"{fmt(row.get('attn_hbm_peak_gb'))} | "
                 f"{fmt(row.get('rst_hbm_peak_gb'))}",
                 flush=True)
+
+
+def print_runtime_bottleneck(summary):
+    runtime = summary.get("runtime_metric_summary") or {}
+    if not runtime:
+        return
+    print("\n[runtime-bottleneck]", flush=True)
+    print(
+        "pool | overflow_max | semantic_drop_max | all_processed_min | "
+        "pallas_launch_max | pallas_skip_max | pallas_pad_max | "
+        "output_overflow_max | output_pad_max | backend_active",
+        flush=True)
+    for pool in ("attn_v", "rst"):
+        if pool not in runtime:
+            continue
+        print(
+            f"{pool} | "
+            f"{fmt(runtime_stat(summary, pool, 'overflow_frac'))} | "
+            f"{fmt(runtime_stat(summary, pool, 'semantic_drop_frac'))} | "
+            f"{fmt(runtime_stat(summary, pool, 'all_processed', 'min'))} | "
+            f"{fmt(runtime_stat(summary, pool, 'pallas_actual_launched_chunks'))} | "
+            f"{fmt(runtime_stat(summary, pool, 'pallas_actual_skipped_chunks'))} | "
+            f"{fmt(runtime_stat(summary, pool, 'pallas_padding_frac'))} | "
+            f"{fmt(runtime_stat(summary, pool, 'output_tile_overflow_frac'))} | "
+            f"{fmt(runtime_stat(summary, pool, 'output_tile_padding_frac'))} | "
+            f"{fmt(runtime_stat(summary, pool, 'output_tiled_backend_active'))}",
+            flush=True)
+
+
+def print_profile_bottleneck(summary):
+    rows = profile_bottleneck_rows(summary)
+    if not rows:
+        return
+    print("\n[bottleneck]", flush=True)
+    print(
+        "rank | module | total_ms | mean_ms | pct_split | hbm_peak_gb",
+        flush=True)
+    for rank, row in enumerate(rows, 1):
+        print(
+            f"{rank} | "
+            f"{row.get('group')} | "
+            f"{fmt_ms(row.get('total_seconds'))} | "
+            f"{fmt_ms(row.get('mean_seconds'))} | "
+            f"{fmt(row.get('pct_module_split'), 1)} | "
+            f"{fmt(row.get('max_hbm_peak_gb'))}",
+            flush=True)
+    top_attn, top_rst, top_ratio = top_layer_bottlenecks(summary)
+    if top_attn or top_rst or top_ratio:
+        print(
+            "[bottleneck-layer] "
+            f"top_attn_layer={layer_label(top_attn)} "
+            f"top_attn_ms={fmt_ms((top_attn or {}).get('attn_seconds'))} "
+            f"top_rst_layer={layer_label(top_rst)} "
+            f"top_rst_ms={fmt_ms((top_rst or {}).get('rst_seconds'))} "
+            f"max_rst_over_attn_layer={layer_label(top_ratio)} "
+            f"max_rst_over_attn={fmt((top_ratio or {}).get('rst_over_attn'))}",
+            flush=True)
+
+
+def layer_label(row):
+    if not row:
+        return "n/a"
+    return f"{int(row.get('layer')):02d}"
 
 
 def print_comparison(summaries):
@@ -2376,6 +2600,8 @@ def print_copy_summary(summaries, args):
             f"config={summary.get('config_path', '')} "
             f"variant={variant}",
             flush=True)
+        print_copy_bottleneck_summary(i, summary)
+        print_copy_runtime_summary(i, summary)
         print_copy_module_summary(i, summary)
         print_copy_layer_summary(i, summary)
 
@@ -2441,6 +2667,61 @@ def print_copy_module_summary(run_index, summary):
     if parts:
         print(f"run={run_index} module_summary " + " ".join(parts),
               flush=True)
+
+
+def print_copy_bottleneck_summary(run_index, summary):
+    rows = profile_bottleneck_rows(summary)
+    if rows:
+        parts = []
+        for rank, row in enumerate(rows, 1):
+            parts.append(
+                f"{rank}:{row.get('group')}"
+                f"_total_ms={fmt_ms(row.get('total_seconds'))}"
+                f"_pct={fmt(row.get('pct_module_split'), 1)}"
+                f"_hbm={fmt(row.get('max_hbm_peak_gb'))}")
+        print(f"run={run_index} bottleneck_rank " + " ".join(parts),
+              flush=True)
+    top_attn, top_rst, top_ratio = top_layer_bottlenecks(summary)
+    if top_attn or top_rst or top_ratio:
+        print(
+            f"run={run_index} layer_bottleneck "
+            f"top_attn={layer_label(top_attn)}:"
+            f"{fmt_ms((top_attn or {}).get('attn_seconds'))}ms "
+            f"top_rst={layer_label(top_rst)}:"
+            f"{fmt_ms((top_rst or {}).get('rst_seconds'))}ms "
+            f"max_rst_over_attn={layer_label(top_ratio)}:"
+            f"{fmt((top_ratio or {}).get('rst_over_attn'), 3)}",
+            flush=True)
+
+
+def print_copy_runtime_summary(run_index, summary):
+    runtime = summary.get("runtime_metric_summary") or {}
+    if not runtime:
+        return
+    for pool in ("attn_v", "rst"):
+        if pool not in runtime:
+            continue
+        print(
+            f"run={run_index} runtime_summary "
+            f"pool={pool} "
+            f"overflow_max={fmt(runtime_stat(summary, pool, 'overflow_frac'))} "
+            f"semantic_drop_max="
+            f"{fmt(runtime_stat(summary, pool, 'semantic_drop_frac'))} "
+            f"all_processed_min="
+            f"{fmt(runtime_stat(summary, pool, 'all_processed', 'min'))} "
+            f"pallas_launch_max="
+            f"{fmt(runtime_stat(summary, pool, 'pallas_actual_launched_chunks'))} "
+            f"pallas_skip_max="
+            f"{fmt(runtime_stat(summary, pool, 'pallas_actual_skipped_chunks'))} "
+            f"pallas_pad_max="
+            f"{fmt(runtime_stat(summary, pool, 'pallas_padding_frac'))} "
+            f"output_overflow_max="
+            f"{fmt(runtime_stat(summary, pool, 'output_tile_overflow_frac'))} "
+            f"output_pad_max="
+            f"{fmt(runtime_stat(summary, pool, 'output_tile_padding_frac'))} "
+            f"backend_active="
+            f"{fmt(runtime_stat(summary, pool, 'output_tiled_backend_active'))}",
+            flush=True)
 
 
 def print_copy_layer_summary(run_index, summary):
