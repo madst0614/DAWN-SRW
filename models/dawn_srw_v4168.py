@@ -3961,16 +3961,16 @@ def _opspace_execute_output_tiled_pallas(
         output_tile_i = pl.program_id(0)
         output_start = output_tile_i * output_tile_size
 
-        scratch_raw_all = jnp.zeros(
-            (d_tile_count, output_tile_size, d_tile_size),
-            dtype=jnp.float32)
+        scratch_raw_tiles = [
+            jnp.zeros((output_tile_size, d_tile_size), dtype=jnp.float32)
+            for _ in range(d_tile_count)
+        ]
         scratch_mass = jnp.zeros((output_tile_size,), dtype=jnp.float32)
         scratch_relu = jnp.zeros((output_tile_size,), dtype=jnp.float32)
         rows = jnp.arange(output_tile_size, dtype=jnp.int32)
         token_ids = output_start + rows
         tile_row_valid = token_ids < T
         tile_row_valid_f = tile_row_valid.astype(jnp.float32)
-        d_tile_ids = jnp.arange(d_tile_count, dtype=jnp.int32)
         h_rows_all = pl.load(
             flat_h_ref,
             (pl.dslice(output_start, output_tile_size),
@@ -4049,19 +4049,16 @@ def _opspace_execute_output_tiled_pallas(
                     raw_rows = pl.dot(
                         mixed.astype(jnp.bfloat16),
                         write_local.astype(jnp.bfloat16)).astype(jnp.float32)
-                    d_tile_mask = (
-                        d_tile_ids
-                        == jnp.asarray(out_d_tile_i, dtype=jnp.int32)
-                    ).astype(jnp.float32)
-                    scratch_raw_all = scratch_raw_all + (
-                        d_tile_mask[:, None, None] * raw_rows[None, :, :])
+                    scratch_raw_tiles[out_d_tile_i] = (
+                        scratch_raw_tiles[out_d_tile_i] + raw_rows)
 
-        pl.store(
-            raw_tiles_ref,
-            (output_tile_i, pl.dslice(0, d_tile_count),
-             pl.dslice(0, output_tile_size),
-             pl.dslice(0, d_tile_size)),
-            scratch_raw_all)
+        for out_d_tile_i in range(d_tile_count):
+            pl.store(
+                raw_tiles_ref,
+                (output_tile_i, jnp.asarray(out_d_tile_i, dtype=jnp.int32),
+                 pl.dslice(0, output_tile_size),
+                 pl.dslice(0, d_tile_size)),
+                scratch_raw_tiles[out_d_tile_i])
         pl.store(
             gate_mass_tiles_ref,
             (output_tile_i, pl.dslice(0, output_tile_size)),
