@@ -66,10 +66,15 @@ training:
 
       rst:
         routing_mode: factorized_lane_mean
-        execution_mode: block_bucketed_dense
+        execution_mode: block_bucketed_pallas_final
         lanes: 32
         k_exec: 32
         exec_tiles_per_block: 4
+        bucket_capacity_factor: 1.5
+        bucket_chunk_size: 128
+        assignment_policy: low_regret
+        high_regret_threshold: 0.05
+        lane_output_mode: lane_local
 
     repack:
       enabled: true
