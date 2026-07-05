@@ -34,7 +34,7 @@ except Exception:
     _PALLAS_AVAILABLE = False
 
 _PALLAS_REQUIRED_API = (
-    'BlockSpec', 'dot', 'pallas_call')
+    'BlockSpec', 'dot', 'load', 'pallas_call', 'store')
 _PALLAS_TPU_REQUIRED_API = ('CompilerParams', 'PrefetchScalarGridSpec')
 _PALLAS_API_AVAILABLE = (
     _PALLAS_AVAILABLE
@@ -196,6 +196,9 @@ OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'pallas_padding_frac',
     'pallas_valid_token_frac',
     'pallas_backend_available',
+    'pallas_logical_empty_chunks',
+    'pallas_actual_launched_chunks',
+    'pallas_actual_skipped_chunks',
 )
 OPSPACE_FINAL_RUNTIME_DIAG_COUNT = len(OPSPACE_FINAL_RUNTIME_DIAG_NAMES)
 (
@@ -226,6 +229,9 @@ OPSPACE_FINAL_RUNTIME_DIAG_COUNT = len(OPSPACE_FINAL_RUNTIME_DIAG_NAMES)
     OPSPACE_FINAL_PALLAS_PADDING_FRAC,
     OPSPACE_FINAL_PALLAS_VALID_TOKEN_FRAC,
     OPSPACE_FINAL_PALLAS_BACKEND_AVAILABLE,
+    OPSPACE_FINAL_PALLAS_LOGICAL_EMPTY_CHUNKS,
+    OPSPACE_FINAL_PALLAS_ACTUAL_LAUNCHED_CHUNKS,
+    OPSPACE_FINAL_PALLAS_ACTUAL_SKIPPED_CHUNKS,
 ) = range(OPSPACE_FINAL_RUNTIME_DIAG_COUNT)
 
 BENCHMARK_SECTOR_RUNTIME_DIAG_NAMES = (
@@ -4006,52 +4012,74 @@ def _opspace_execute_buckets_jax(
         chunk_step, init, jnp.arange(total_chunks, dtype=jnp.int32))[0]
 
 
-def _opspace_execute_bucket_outputs_pallas(
+def _opspace_execute_bucket_outputs_pallas_group(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
-        token_id_bucket, bucket_valid, bucket_fill, *, bucket_chunk_size,
-        bucket_chunk_count, interpret=False):
-    """Pallas fused bucket program over TPU-lowerable contiguous tiles."""
+        token_id_bucket, bucket_valid, bucket_fill, group_start, *,
+        lane_group_size, bucket_chunk_size, bucket_chunk_count,
+        interpret=False):
+    """Run one bounded lane group without materializing full bucket tensors."""
+    if lane_group_size != 1:
+        raise ValueError(
+            "block_bucketed_pallas_final currently requires "
+            f"lane_group_size=1, got {lane_group_size}.")
     if not _PALLAS_API_AVAILABLE:
         raise RuntimeError(_pallas_unavailable_message())
-    local_lanes = int(token_id_bucket.shape[0])
     blocks_per_lane = int(token_id_bucket.shape[1])
     T = int(flat_x.shape[0])
     D = int(flat_x.shape[-1])
     d_route = int(flat_h.shape[-1])
     block_size = int(key_blocks.shape[2])
     bucket_padded_capacity = int(token_id_bucket.shape[2])
+    del bucket_padded_capacity
 
-    safe_token = jnp.where(bucket_valid, token_id_bucket, 0)
-    valid_f = bucket_valid.astype(jnp.float32)
-    h_bucket = (
-        flat_h[safe_token]
-        * valid_f[..., None].astype(jnp.bfloat16))
-    x_bucket = (
-        flat_x[safe_token]
-        * valid_f[..., None].astype(jnp.bfloat16))
-    h_bucket = h_bucket.reshape(
-        local_lanes, blocks_per_lane, bucket_chunk_count,
-        bucket_chunk_size, d_route)
-    x_bucket = x_bucket.reshape(
-        local_lanes, blocks_per_lane, bucket_chunk_count,
-        bucket_chunk_size, D)
-    valid_bucket = bucket_valid.reshape(
-        local_lanes, blocks_per_lane, bucket_chunk_count,
-        bucket_chunk_size)
-    valid_blocks_tpu = valid_blocks[..., None]
-    valid_bucket_tpu = valid_bucket[..., None]
+    def bucket_kernel(group_start_ref, flat_x_ref, flat_h_ref,
+                      key_blocks_ref, read_blocks_ref, write_blocks_ref,
+                      valid_blocks_ref, token_id_bucket_ref,
+                      bucket_valid_ref, bucket_fill_ref, raw_zero_ref,
+                      gate_mass_zero_ref, relu_count_zero_ref,
+                      group_raw_out_ref, group_gate_mass_ref,
+                      group_relu_count_ref):
+        del raw_zero_ref, gate_mass_zero_ref, relu_count_zero_ref
+        group_start_i = group_start_ref[()]
+        lane_offset = pl.program_id(0)
+        block_i = pl.program_id(1)
+        chunk_i = pl.program_id(2)
+        lane_i = group_start_i + lane_offset
+        slot_offsets = (
+            chunk_i * bucket_chunk_size
+            + jnp.arange(bucket_chunk_size, dtype=jnp.int32))
+        slot_mask = slot_offsets < token_id_bucket_ref.shape[2]
+        bucket_fill_i = pl.load(bucket_fill_ref, (lane_i, block_i))
+        valid_token = pl.load(
+            bucket_valid_ref, (lane_i, block_i, slot_offsets),
+            mask=slot_mask, other=False)
+        valid_token = jnp.logical_and(
+            valid_token, slot_offsets < bucket_fill_i)
+        token_ids = pl.load(
+            token_id_bucket_ref, (lane_i, block_i, slot_offsets),
+            mask=slot_mask, other=0)
+        safe_token = jnp.where(valid_token, token_ids, 0)
 
-    def bucket_kernel(x_bucket_ref, h_bucket_ref, key_blocks_ref,
-                      read_blocks_ref, write_blocks_ref, valid_blocks_ref,
-                      valid_bucket_ref, raw_bucket_ref, gate_mass_bucket_ref,
-                      relu_count_bucket_ref):
-        h_chunk = h_bucket_ref[...]
-        x_chunk = x_bucket_ref[...]
-        key_block = key_blocks_ref[...]
-        read_block = read_blocks_ref[...]
-        write_block = write_blocks_ref[...]
-        valid_ops = valid_blocks_ref[..., 0]
-        valid_token = valid_bucket_ref[..., 0]
+        route_cols = jnp.arange(d_route, dtype=jnp.int32)
+        data_cols = jnp.arange(D, dtype=jnp.int32)
+        op_offsets = jnp.arange(block_size, dtype=jnp.int32)
+        h_chunk = pl.load(
+            flat_h_ref, (safe_token[:, None], route_cols[None, :]),
+            mask=valid_token[:, None], other=0.0)
+        x_chunk = pl.load(
+            flat_x_ref, (safe_token[:, None], data_cols[None, :]),
+            mask=valid_token[:, None], other=0.0)
+        key_block = pl.load(
+            key_blocks_ref,
+            (lane_i, block_i, op_offsets[:, None], route_cols[None, :]))
+        read_block = pl.load(
+            read_blocks_ref,
+            (lane_i, block_i, op_offsets[:, None], data_cols[None, :]))
+        write_block = pl.load(
+            write_blocks_ref,
+            (lane_i, block_i, op_offsets[:, None], data_cols[None, :]))
+        valid_ops = pl.load(
+            valid_blocks_ref, (lane_i, block_i, op_offsets), other=False)
 
         rho = pl.dot(
             h_chunk.astype(jnp.bfloat16),
@@ -4062,114 +4090,121 @@ def _opspace_execute_bucket_outputs_pallas(
             jnp.swapaxes(read_block.astype(jnp.bfloat16), 0, 1)
         ).astype(jnp.float32)
         gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
-        gate_zeros = jnp.zeros(
-            (bucket_chunk_size, block_size), dtype=jnp.float32)
-        valid_token_gate = (
-            jnp.expand_dims(valid_token.astype(jnp.float32), 1)
-            + gate_zeros)
-        valid_ops_gate = (
-            jnp.expand_dims(valid_ops.astype(jnp.float32), 0)
-            + gate_zeros)
-        gate = gate * valid_token_gate
-        gate = gate * valid_ops_gate
+        gate = gate * valid_token.astype(jnp.float32)[:, None]
+        gate = gate * valid_ops.astype(jnp.float32)[None, :]
         raw_out = pl.dot(
             (gate * read_value).astype(jnp.bfloat16),
             write_block.astype(jnp.bfloat16)).astype(jnp.float32)
         gate_mass = gate.sum(axis=-1)
         relu_count = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
 
-        raw_bucket_ref[...] = raw_out
-        gate_mass_bucket_ref[...] = gate_mass[..., None]
-        relu_count_bucket_ref[...] = relu_count[..., None]
+        raw_prev = pl.load(
+            group_raw_out_ref,
+            (lane_offset, safe_token[:, None], data_cols[None, :]),
+            mask=valid_token[:, None], other=0.0)
+        pl.store(
+            group_raw_out_ref,
+            (lane_offset, safe_token[:, None], data_cols[None, :]),
+            raw_prev + raw_out, mask=valid_token[:, None])
+        mass_prev = pl.load(
+            group_gate_mass_ref, (lane_offset, safe_token, 0),
+            mask=valid_token, other=0.0)
+        pl.store(
+            group_gate_mass_ref, (lane_offset, safe_token, 0),
+            mass_prev + gate_mass, mask=valid_token)
+        relu_prev = pl.load(
+            group_relu_count_ref, (lane_offset, safe_token),
+            mask=valid_token, other=0.0)
+        pl.store(
+            group_relu_count_ref, (lane_offset, safe_token),
+            relu_prev + relu_count, mask=valid_token)
 
-    out_shape = (
-        jax.ShapeDtypeStruct(
-            (local_lanes, blocks_per_lane, bucket_chunk_count,
-             bucket_chunk_size, D),
-            jnp.float32),
-        jax.ShapeDtypeStruct(
-            (local_lanes, blocks_per_lane, bucket_chunk_count,
-             bucket_chunk_size, 1),
-            jnp.float32),
-        jax.ShapeDtypeStruct(
-            (local_lanes, blocks_per_lane, bucket_chunk_count,
-             bucket_chunk_size, 1),
-            jnp.float32),
-    )
-    raw_bucket, gate_mass_bucket, relu_count_bucket = pl.pallas_call(
-        bucket_kernel, out_shape=out_shape,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=[
-                pl.BlockSpec(
-                    (None, None, None, bucket_chunk_size, D),
-                    lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, chunk_i, 0, 0)),
-                pl.BlockSpec(
-                    (None, None, None, bucket_chunk_size, d_route),
-                    lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, chunk_i, 0, 0)),
-                pl.BlockSpec(
-                    (None, None, block_size, d_route),
-                    lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, 0, 0)),
-                pl.BlockSpec(
-                    (None, None, block_size, D),
-                    lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, 0, 0)),
-                pl.BlockSpec(
-                    (None, None, block_size, D),
-                    lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, 0, 0)),
-                pl.BlockSpec(
-                    (None, None, block_size, 1),
-                    lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, 0, 0)),
-                pl.BlockSpec(
-                    (None, None, None, bucket_chunk_size, 1),
-                    lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, chunk_i, 0, 0)),
-            ],
-            out_specs=(
-                pl.BlockSpec(
-                    (None, None, None, bucket_chunk_size, D),
-                    lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, chunk_i, 0, 0)),
-                pl.BlockSpec(
-                    (None, None, None, bucket_chunk_size, 1),
-                    lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, chunk_i, 0, 0)),
-                pl.BlockSpec(
-                    (None, None, None, bucket_chunk_size, 1),
-                    lambda lane_i, block_i, chunk_i: (
-                        lane_i, block_i, chunk_i, 0, 0)),
-            ),
-            grid=(local_lanes, blocks_per_lane, bucket_chunk_count),
+    raw_zero = jnp.zeros((lane_group_size, T, D), dtype=jnp.float32)
+    gate_mass_zero = jnp.zeros((lane_group_size, T, 1), dtype=jnp.float32)
+    relu_count_zero = jnp.zeros((lane_group_size, T), dtype=jnp.float32)
+    full_ref_spec = pl.BlockSpec(memory_space=getattr(pltpu, 'ANY', None))
+    return pl.pallas_call(
+        bucket_kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct(raw_zero.shape, raw_zero.dtype),
+            jax.ShapeDtypeStruct(gate_mass_zero.shape, gate_mass_zero.dtype),
+            jax.ShapeDtypeStruct(relu_count_zero.shape,
+                                 relu_count_zero.dtype),
         ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[full_ref_spec] * 12,
+            out_specs=(full_ref_spec, full_ref_spec, full_ref_spec),
+            grid=(lane_group_size, blocks_per_lane, bucket_chunk_count),
+        ),
+        input_output_aliases={10: 0, 11: 1, 12: 2},
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "parallel")),
         interpret=bool(interpret),
-        name='opspace_bucketed_pallas_final')(
-            x_bucket, h_bucket, key_blocks, read_blocks, write_blocks,
-            valid_blocks_tpu, valid_bucket_tpu)
+        name='opspace_bucketed_pallas_final_group')(
+            jnp.asarray(group_start, dtype=jnp.int32),
+            flat_x, flat_h, key_blocks, read_blocks, write_blocks,
+            valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
+            raw_zero, gate_mass_zero, relu_count_zero)
 
-    raw_bucket = raw_bucket.reshape(
-        local_lanes, blocks_per_lane, bucket_padded_capacity, D)
-    gate_mass_bucket = gate_mass_bucket.reshape(
-        local_lanes, blocks_per_lane, bucket_padded_capacity, 1)[..., 0]
-    relu_count_bucket = relu_count_bucket.reshape(
-        local_lanes, blocks_per_lane, bucket_padded_capacity, 1)[..., 0]
-    lane_ids = jnp.arange(local_lanes, dtype=jnp.int32)[:, None, None]
-    lane_raw_out = jnp.zeros((local_lanes, T, D), dtype=jnp.float32).at[
-        lane_ids, safe_token].add(
-            raw_bucket * valid_f[..., None], mode='drop')
-    lane_gate_mass = jnp.zeros((local_lanes, T, 1), dtype=jnp.float32).at[
-        lane_ids, safe_token].add(
-            gate_mass_bucket[..., None] * valid_f[..., None], mode='drop')
-    lane_relu_count = jnp.zeros((local_lanes, T), dtype=jnp.float32).at[
-        lane_ids, safe_token].add(
-            relu_count_bucket * valid_f, mode='drop')
-    return lane_raw_out, lane_gate_mass, lane_relu_count
+
+def _opspace_execute_bucket_outputs_pallas(
+        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
+        token_id_bucket, bucket_valid, bucket_fill, *, bucket_chunk_size,
+        bucket_chunk_count, interpret=False):
+    """Streaming Pallas executor that returns accumulated local outputs."""
+    local_lanes = int(token_id_bucket.shape[0])
+    blocks_per_lane = int(token_id_bucket.shape[1])
+    bucket_padded_capacity = int(token_id_bucket.shape[2])
+    T = int(flat_x.shape[0])
+    D = int(flat_x.shape[-1])
+    lane_group_size = 1
+    group_count = (local_lanes + lane_group_size - 1) // lane_group_size
+    group_lane_ids = jnp.arange(
+        lane_group_size, dtype=jnp.int32)[:, None, None]
+
+    def group_step(carry, group_start):
+        flat_raw_out, flat_gate_mass, flat_relu_count = carry
+        group_raw, group_mass, group_relu = (
+            _opspace_execute_bucket_outputs_pallas_group(
+                flat_x, flat_h, key_blocks, read_blocks, write_blocks,
+                valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
+                group_start, lane_group_size=lane_group_size,
+                bucket_chunk_size=bucket_chunk_size,
+                bucket_chunk_count=bucket_chunk_count,
+                interpret=interpret))
+        group_tokens = jax.lax.dynamic_slice(
+            token_id_bucket, (group_start, 0, 0),
+            (lane_group_size, blocks_per_lane, bucket_padded_capacity))
+        group_valid = jax.lax.dynamic_slice(
+            bucket_valid, (group_start, 0, 0),
+            (lane_group_size, blocks_per_lane, bucket_padded_capacity))
+        safe_group_tokens = jnp.where(group_valid, group_tokens, 0)
+        group_assigned_count = jnp.zeros(
+            (lane_group_size, T), dtype=jnp.float32).at[
+                group_lane_ids, safe_group_tokens].add(
+                    group_valid.astype(jnp.float32), mode='drop')
+        group_assigned = group_assigned_count == jnp.float32(1.0)
+        group_raw = jnp.where(
+            group_assigned[:, :, None], group_raw, jnp.float32(0.0))
+        group_mass = jnp.where(
+            group_assigned[:, :, None], group_mass, jnp.float32(0.0))
+        group_relu = jnp.where(
+            group_assigned, group_relu, jnp.float32(0.0))
+        return (
+            flat_raw_out + group_raw.sum(axis=0),
+            flat_gate_mass + group_mass.sum(axis=0),
+            flat_relu_count + group_relu.sum(axis=0),
+        ), None
+
+    init = (
+        jnp.zeros((T, D), dtype=jnp.float32),
+        jnp.zeros((T, 1), dtype=jnp.float32),
+        jnp.zeros((T,), dtype=jnp.float32),
+    )
+    group_starts = (
+        jnp.arange(group_count, dtype=jnp.int32) * lane_group_size)
+    return jax.lax.scan(group_step, init, group_starts)[0]
 
 
 def _opspace_execute_bucket_outputs_pallas_trainable_impl(
@@ -4202,25 +4237,145 @@ def _opspace_execute_bucket_outputs_pallas_trainable_fwd(
         token_id_bucket, bucket_valid, bucket_fill)
 
 
+def _opspace_execute_bucket_outputs_manual_bwd(
+        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
+        token_id_bucket, bucket_valid, bucket_fill, cotangent, *,
+        bucket_chunk_size, bucket_chunk_count):
+    """Manual streaming VJP for the final bucket executor."""
+    d_raw_out, d_gate_mass, _d_relu_count = cotangent
+    local_lanes = int(token_id_bucket.shape[0])
+    blocks_per_lane = int(token_id_bucket.shape[1])
+    T = int(flat_x.shape[0])
+    D = int(flat_x.shape[-1])
+    d_route = int(flat_h.shape[-1])
+    block_size = int(key_blocks.shape[2])
+    del D, d_route, block_size
+
+    lane_ids = jnp.arange(local_lanes, dtype=jnp.int32)[:, None, None]
+    safe_token_all = jnp.where(bucket_valid, token_id_bucket, 0)
+    valid_all_f = bucket_valid.astype(jnp.float32)
+    assigned_lane_token_count = jnp.zeros(
+        (local_lanes, T), dtype=jnp.float32).at[
+            lane_ids, safe_token_all].add(valid_all_f, mode='drop')
+    assigned_lane_token = assigned_lane_token_count == jnp.float32(1.0)
+
+    def chunk_step(carry, chunk_i):
+        grad_x, grad_h, grad_key, grad_read, grad_write = carry
+        lane_i = chunk_i // (blocks_per_lane * bucket_chunk_count)
+        rem_i = chunk_i - lane_i * blocks_per_lane * bucket_chunk_count
+        block_i = rem_i // bucket_chunk_count
+        block_chunk_i = rem_i - block_i * bucket_chunk_count
+        start = block_chunk_i * bucket_chunk_size
+        active_chunk = start < bucket_fill[lane_i, block_i]
+
+        def compute(active_carry):
+            grad_x, grad_h, grad_key, grad_read, grad_write = active_carry
+            token_chunk = jax.lax.dynamic_slice(
+                token_id_bucket, (lane_i, block_i, start),
+                (1, 1, bucket_chunk_size)).reshape(bucket_chunk_size)
+            valid_chunk = jax.lax.dynamic_slice(
+                bucket_valid, (lane_i, block_i, start),
+                (1, 1, bucket_chunk_size)).reshape(bucket_chunk_size)
+            safe_token = jnp.where(valid_chunk, token_chunk, 0)
+            token_assigned = assigned_lane_token[lane_i, safe_token]
+            valid_chunk = jnp.logical_and(valid_chunk, token_assigned)
+            valid_chunk_f = valid_chunk.astype(jnp.float32)
+            h_chunk = flat_h[safe_token]
+            x_chunk = flat_x[safe_token]
+            h_chunk = h_chunk * valid_chunk_f[:, None].astype(jnp.bfloat16)
+            x_chunk = x_chunk * valid_chunk_f[:, None].astype(jnp.bfloat16)
+            key_block = key_blocks[lane_i, block_i]
+            read_block = read_blocks[lane_i, block_i]
+            write_block = write_blocks[lane_i, block_i]
+            valid_block = valid_blocks[lane_i, block_i]
+            valid_block_f = valid_block.astype(jnp.float32)
+
+            rho = jnp.einsum(
+                'cd,nd->cn', h_chunk, key_block).astype(jnp.float32)
+            read_value = jnp.einsum(
+                'cd,nd->cn', x_chunk, read_block).astype(jnp.float32)
+            gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
+            gate = gate * valid_chunk_f[:, None]
+            gate = gate * valid_block_f[None, :]
+            mixed = gate * read_value
+
+            d_y = d_raw_out[safe_token] * valid_chunk_f[:, None]
+            d_y_bf16 = d_y.astype(jnp.bfloat16)
+            d_mass = d_gate_mass[safe_token, 0] * valid_chunk_f
+            d_mixed = jnp.einsum(
+                'cd,nd->cn', d_y_bf16, write_block).astype(jnp.float32)
+            d_write = jnp.einsum(
+                'cn,cd->nd',
+                mixed.astype(jnp.bfloat16),
+                d_y_bf16).astype(jnp.float32)
+            d_read_value = d_mixed * gate
+            d_gate = d_mixed * read_value
+            d_gate = d_gate + d_mass[:, None]
+            d_read_value_bf16 = d_read_value.astype(jnp.bfloat16)
+            d_x = jnp.einsum(
+                'cn,nd->cd', d_read_value_bf16,
+                read_block).astype(jnp.float32)
+            d_read = jnp.einsum(
+                'cn,cd->nd', d_read_value_bf16,
+                x_chunk).astype(jnp.float32)
+
+            relu_rho = jax.nn.relu(rho)
+            d_rho = d_gate * (jnp.float32(2.0) * relu_rho)
+            d_rho = d_rho * (rho > 0.0).astype(jnp.float32)
+            d_rho = d_rho * valid_chunk_f[:, None]
+            d_rho = d_rho * valid_block_f[None, :]
+            d_rho_bf16 = d_rho.astype(jnp.bfloat16)
+            d_h = jnp.einsum(
+                'cn,nd->cd', d_rho_bf16, key_block).astype(jnp.float32)
+            d_key = jnp.einsum(
+                'cn,cd->nd', d_rho_bf16,
+                h_chunk).astype(jnp.float32)
+
+            grad_x = grad_x.at[safe_token].add(
+                (d_x * valid_chunk_f[:, None]).astype(flat_x.dtype),
+                mode='drop')
+            grad_h = grad_h.at[safe_token].add(
+                (d_h * valid_chunk_f[:, None]).astype(flat_h.dtype),
+                mode='drop')
+            grad_key = grad_key.at[lane_i, block_i].add(d_key)
+            grad_read = grad_read.at[lane_i, block_i].add(d_read)
+            grad_write = grad_write.at[lane_i, block_i].add(d_write)
+            return grad_x, grad_h, grad_key, grad_read, grad_write
+
+        return jax.lax.cond(
+            active_chunk, compute, lambda active_carry: active_carry,
+            (grad_x, grad_h, grad_key, grad_read, grad_write)), None
+
+    init = (
+        jnp.zeros_like(flat_x),
+        jnp.zeros_like(flat_h),
+        jnp.zeros_like(key_blocks, dtype=jnp.float32),
+        jnp.zeros_like(read_blocks, dtype=jnp.float32),
+        jnp.zeros_like(write_blocks, dtype=jnp.float32),
+    )
+    total_chunks = local_lanes * blocks_per_lane * bucket_chunk_count
+    grad_x, grad_h, grad_key, grad_read, grad_write = jax.lax.scan(
+        chunk_step, init, jnp.arange(total_chunks, dtype=jnp.int32))[0]
+    return (
+        grad_x.astype(flat_x.dtype),
+        grad_h.astype(flat_h.dtype),
+        grad_key.astype(key_blocks.dtype),
+        grad_read.astype(read_blocks.dtype),
+        grad_write.astype(write_blocks.dtype),
+    )
+
+
 def _opspace_execute_bucket_outputs_pallas_trainable_bwd(
         bucket_chunk_size, bucket_chunk_count, interpret, residual, cotangent):
     del interpret
     (flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
      token_id_bucket, bucket_valid, bucket_fill) = residual
-
-    def ref_outputs(_flat_x, _flat_h, _key_blocks, _read_blocks,
-                    _write_blocks):
-        lane_raw_out, lane_gate_mass, lane_relu_count, _compute_no_nan = (
-            _opspace_execute_buckets_jax(
-                _flat_x, _flat_h, _key_blocks, _read_blocks, _write_blocks,
-                valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
-                bucket_chunk_size=bucket_chunk_size,
-                bucket_chunk_count=bucket_chunk_count))
-        return lane_raw_out, lane_gate_mass, lane_relu_count
-
-    _, pullback = jax.vjp(
-        ref_outputs, flat_x, flat_h, key_blocks, read_blocks, write_blocks)
-    grad_x, grad_h, grad_key, grad_read, grad_write = pullback(cotangent)
+    grad_x, grad_h, grad_key, grad_read, grad_write = (
+        _opspace_execute_bucket_outputs_manual_bwd(
+            flat_x, flat_h, key_blocks, read_blocks, write_blocks,
+            valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
+            cotangent, bucket_chunk_size=bucket_chunk_size,
+            bucket_chunk_count=bucket_chunk_count))
     return (
         grad_x, grad_h, grad_key, grad_read, grad_write,
         None, None, None, None)
@@ -4235,7 +4390,7 @@ def _opspace_pallas_execute_buckets(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill, *, bucket_chunk_size,
         bucket_chunk_count, use_pallas=True, pallas_interpret=False):
-    """Execute fixed-shape buckets and return collision-free lane-local state."""
+    """Execute fixed-shape buckets and return accumulated local state."""
     if use_pallas and not _PALLAS_API_AVAILABLE:
         raise RuntimeError(
             "block_bucketed_pallas_final requested Pallas execution, but "
@@ -4245,7 +4400,6 @@ def _opspace_pallas_execute_buckets(
             "debug interpretation.")
     local_lanes = int(token_id_bucket.shape[0])
     T = int(flat_x.shape[0])
-    D = int(flat_x.shape[-1])
     lane_ids = jnp.arange(local_lanes, dtype=jnp.int32)[:, None, None]
     safe_token = jnp.where(bucket_valid, token_id_bucket, 0)
     valid_f = bucket_valid.astype(jnp.float32)
@@ -4256,22 +4410,16 @@ def _opspace_pallas_execute_buckets(
     assigned_lane_token_f = assigned_lane_token.astype(jnp.float32)
 
     if use_pallas and _PALLAS_API_AVAILABLE:
-        lane_raw_out, lane_gate_mass, lane_relu_count = (
+        flat_raw_out, flat_gate_mass, flat_relu_count = (
             _opspace_execute_bucket_outputs_pallas_trainable(
                 flat_x, flat_h, key_blocks, read_blocks, write_blocks,
                 valid_blocks, token_id_bucket, bucket_valid, bucket_fill,
                 bucket_chunk_size, bucket_chunk_count, pallas_interpret))
-        lane_raw_out = jnp.where(
-            assigned_lane_token[:, :, None], lane_raw_out, jnp.float32(0.0))
-        lane_gate_mass = jnp.where(
-            assigned_lane_token[:, :, None], lane_gate_mass, jnp.float32(0.0))
-        lane_relu_count = jnp.where(
-            assigned_lane_token, lane_relu_count, jnp.float32(0.0))
         compute_no_nan = jnp.logical_and(
-            jnp.all(jnp.isfinite(lane_raw_out)),
-            jnp.all(jnp.isfinite(lane_gate_mass))).astype(jnp.float32)
+            jnp.all(jnp.isfinite(flat_raw_out)),
+            jnp.all(jnp.isfinite(flat_gate_mass))).astype(jnp.float32)
         return (
-            lane_raw_out, lane_gate_mass, lane_relu_count, compute_no_nan,
+            flat_raw_out, flat_gate_mass, flat_relu_count, compute_no_nan,
             jnp.float32(1.0))
 
     lane_raw_out, lane_gate_mass, lane_relu_count, compute_no_nan = (
@@ -4284,15 +4432,14 @@ def _opspace_pallas_execute_buckets(
     lane_gate_mass = lane_gate_mass * assigned_lane_token_f[:, :, None]
     lane_relu_count = lane_relu_count * assigned_lane_token_f
     return (
-        lane_raw_out, lane_gate_mass, lane_relu_count, compute_no_nan,
+        lane_raw_out.sum(axis=0), lane_gate_mass.sum(axis=0),
+        lane_relu_count.sum(axis=0), compute_no_nan,
         jnp.asarray(1.0 if _PALLAS_API_AVAILABLE else 0.0, dtype=jnp.float32))
 
 
 def _opspace_finalize_bucketed_output(
-        lane_raw_out, lane_gate_mass, lane_relu_count, admission_den_power):
-    flat_raw_out_local = lane_raw_out.sum(axis=0)
-    flat_gate_mass_local = lane_gate_mass.sum(axis=0)
-    flat_relu_gate_count_local = lane_relu_count.sum(axis=0)
+        flat_raw_out_local, flat_gate_mass_local,
+        flat_relu_gate_count_local, admission_den_power):
     global_raw_out = jax.lax.psum(flat_raw_out_local, 'model')
     global_gate_mass = jax.lax.psum(flat_gate_mass_local, 'model')
     global_relu_gate_count = jax.lax.psum(
@@ -4431,7 +4578,8 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     primary_block = assignment['primary_block']
     assignment_collision_count = assignment['assignment_collision_count']
 
-    (lane_raw_out, lane_gate_mass, lane_relu_gate_count, compute_no_nan,
+    (flat_raw_out_local, flat_gate_mass_local, flat_relu_gate_count_local,
+     compute_no_nan,
      pallas_backend_available) = _opspace_pallas_execute_buckets(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, bucket_fill,
@@ -4442,7 +4590,8 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
 
     (flat_out, global_gate_mass, global_relu_gate_count,
      gate_denominator) = _opspace_finalize_bucketed_output(
-        lane_raw_out, lane_gate_mass, lane_relu_gate_count,
+        flat_raw_out_local, flat_gate_mass_local,
+        flat_relu_gate_count_local,
         admission_den_power)
 
     def data_sum(v):
@@ -4613,14 +4762,27 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         * _bucket_chunk_size)
     executed_chunk_mask = (
         chunk_starts[None, None, :] < bucket_fill[:, :, None])
-    executed_chunks_local = executed_chunk_mask.astype(jnp.float32).sum()
+    logical_executed_chunks_local = (
+        executed_chunk_mask.astype(jnp.float32).sum())
     total_chunks_local = jnp.float32(
         local_lanes * blocks_per_lane * bucket_chunk_count)
-    global_executed_chunks = jax.lax.psum(executed_chunks_local, 'model')
-    global_total_chunks = jax.lax.psum(total_chunks_local, 'model')
-    pallas_executed_chunks = data_sum(global_executed_chunks)
-    pallas_total_chunks = data_sum(global_total_chunks)
-    pallas_skipped_chunks = pallas_total_chunks - pallas_executed_chunks
+    logical_empty_chunks_local = (
+        total_chunks_local - logical_executed_chunks_local)
+    actual_launched_chunks_local = total_chunks_local
+    actual_skipped_chunks_local = jnp.float32(0.0)
+    global_logical_executed_chunks = jax.lax.psum(
+        logical_executed_chunks_local, 'model')
+    global_logical_empty_chunks = jax.lax.psum(
+        logical_empty_chunks_local, 'model')
+    global_actual_launched_chunks = jax.lax.psum(
+        actual_launched_chunks_local, 'model')
+    global_actual_skipped_chunks = jax.lax.psum(
+        actual_skipped_chunks_local, 'model')
+    pallas_executed_chunks = data_sum(global_logical_executed_chunks)
+    pallas_logical_empty_chunks = data_sum(global_logical_empty_chunks)
+    pallas_actual_launched_chunks = data_sum(global_actual_launched_chunks)
+    pallas_actual_skipped_chunks = data_sum(global_actual_skipped_chunks)
+    pallas_skipped_chunks = pallas_actual_skipped_chunks
     pallas_valid_slots = processed_request_count
     pallas_executed_slots = (
         pallas_executed_chunks * jnp.float32(_bucket_chunk_size))
@@ -4681,6 +4843,9 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         pallas_padding_frac,
         pallas_valid_token_frac,
         pallas_backend_available,
+        pallas_logical_empty_chunks,
+        pallas_actual_launched_chunks,
+        pallas_actual_skipped_chunks,
     ), dtype=jnp.float32)
     aux = {
         'aux_loss': jnp.float32(0.0),
