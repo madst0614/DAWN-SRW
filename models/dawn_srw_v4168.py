@@ -169,8 +169,6 @@ OPSPACE_NO_DROP = True
 OPSPACE_BUCKET_OVERFLOW_SEMANTICS = True
 OPSPACE_FINAL_OUTPUT_TILE_SIZE = 128
 OPSPACE_FINAL_D_TILE_SIZE_POLICY = 256
-OPSPACE_FINAL_TILE_CAPACITY_FACTOR = 1.5
-OPSPACE_FINAL_TILE_CAPACITY_ALIGN = 128
 
 OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'assignment_score_best_mean',
@@ -3807,19 +3805,13 @@ def _opspace_masked_percentile(values, mask, q):
         count > 0, sorted_values[idx], jnp.float32(0.0))
 
 
-def _opspace_round_up_to_multiple(value, multiple):
-    multiple = max(1, int(multiple))
-    value = max(1, int(value))
-    return ((value + multiple - 1) // multiple) * multiple
-
-
 def _opspace_low_regret_assign_lane_output_tiled(
-        scores_lane, lane_active, token_output_tile, *, blocks_per_lane,
-        output_tile_count, output_tile_capacity,
+        scores_lane, lane_active, token_output_tile, token_local_slot, *,
+        blocks_per_lane, output_tile_count, output_tile_capacity,
         regret_weight=1.0, spill_penalty=0.01):
-    """Capacity-constrained assignment for one lane and output-tile buckets."""
+    """Assign one lane into output-tile buckets with local-token slots."""
+    del regret_weight, spill_penalty
     T = int(scores_lane.shape[0])
-    token_ids = jnp.arange(T, dtype=jnp.int32)
     tile_capacity_i32 = jnp.asarray(output_tile_capacity, dtype=jnp.int32)
     candidate_scores, candidate_blocks = jax.lax.top_k(
         scores_lane.astype(jnp.float32), blocks_per_lane)
@@ -3829,8 +3821,6 @@ def _opspace_low_regret_assign_lane_output_tiled(
         candidate_scores[:, 1]
         if blocks_per_lane > 1 else jnp.full_like(best_score, very_low))
     primary_regret = best_score - second_score
-    regret_weight_f = jnp.asarray(regret_weight, dtype=jnp.float32)
-    spill_penalty_f = jnp.asarray(spill_penalty, dtype=jnp.float32)
 
     def candidate_pass(carry, pass_i):
         (assigned_block, assigned_slot, assigned_rank, chosen_score,
@@ -3839,57 +3829,16 @@ def _opspace_low_regret_assign_lane_output_tiled(
             candidate_blocks, pass_i, axis=1, keepdims=False)
         curr_score = jax.lax.dynamic_index_in_dim(
             candidate_scores, pass_i, axis=1, keepdims=False)
-        prev_i = jnp.maximum(pass_i - jnp.asarray(1, dtype=jnp.int32), 0)
-        prev_score = jax.lax.dynamic_index_in_dim(
-            candidate_scores, prev_i, axis=1, keepdims=False)
-        local_regret = prev_score - curr_score
-        rank_f = pass_i.astype(jnp.float32)
-        priority_rank0 = curr_score + regret_weight_f * primary_regret
-        priority_spill = (
-            curr_score - spill_penalty_f * rank_f
-            + regret_weight_f * local_regret)
-        priority = jnp.where(
-            pass_i == jnp.asarray(0, dtype=jnp.int32),
-            priority_rank0, priority_spill)
 
         active = unresolved.astype(jnp.bool_)
-        sort_block = jnp.where(active, candidate, blocks_per_lane)
-        sort_tile = jnp.where(active, token_output_tile, output_tile_count)
-        sort_neg_priority = jnp.where(
-            active, -priority, jnp.float32(1.0e9))
-        order = jnp.lexsort((
-            token_ids, sort_neg_priority, sort_tile, sort_block))
-        ordered_token = order.astype(jnp.int32)
-        ordered_block = sort_block[ordered_token]
-        ordered_tile = sort_tile[ordered_token]
-        ordered_active = active[ordered_token]
-        ordered_active_i = ordered_active.astype(jnp.int32)
-        prev_block = jnp.concatenate((
-            jnp.full((1,), -1, dtype=jnp.int32), ordered_block[:-1]))
-        prev_tile = jnp.concatenate((
-            jnp.full((1,), -1, dtype=jnp.int32), ordered_tile[:-1]))
-        group_start = jnp.logical_or(
-            ordered_block != prev_block, ordered_tile != prev_tile)
-        cum_active = jnp.cumsum(ordered_active_i) - 1
-        active_before_group = jax.lax.associative_scan(
-            jnp.maximum,
-            jnp.where(group_start, cum_active - ordered_active_i, -1))
-        rank_in_block = cum_active - active_before_group - 1
-        safe_ordered_block = jnp.minimum(ordered_block, blocks_per_lane - 1)
-        safe_ordered_tile = jnp.minimum(ordered_tile, output_tile_count - 1)
-        existing_count = bucket_counts[safe_ordered_block, safe_ordered_tile]
-        ordered_slot = existing_count + rank_in_block
-        ordered_accept = jnp.logical_and(
-            ordered_active,
+        slot = token_local_slot
+        accept = jnp.logical_and(
+            active,
             jnp.logical_and(
-                ordered_block < blocks_per_lane,
+                candidate < blocks_per_lane,
                 jnp.logical_and(
-                    ordered_tile < output_tile_count,
-                    ordered_slot < tile_capacity_i32)))
-        accept = jnp.zeros((T,), dtype=jnp.bool_).at[ordered_token].set(
-            ordered_accept)
-        slot = jnp.zeros((T,), dtype=jnp.int32).at[ordered_token].set(
-            ordered_slot)
+                    token_output_tile < output_tile_count,
+                    slot < tile_capacity_i32)))
         bucket_counts = bucket_counts.at[
             candidate, token_output_tile].add(
                 accept.astype(jnp.int32), mode='drop')
@@ -3931,10 +3880,12 @@ def _opspace_build_lane_buckets(
     token_output_tile = jnp.minimum(
         token_ids // jnp.asarray(output_tile_size, dtype=jnp.int32),
         jnp.asarray(output_tile_count - 1, dtype=jnp.int32))
+    token_local_slot = (
+        token_ids % jnp.asarray(output_tile_size, dtype=jnp.int32))
 
     def assign_one(scores_lane, lane_active):
         return _opspace_low_regret_assign_lane_output_tiled(
-            scores_lane, lane_active, token_output_tile,
+            scores_lane, lane_active, token_output_tile, token_local_slot,
             blocks_per_lane=blocks_per_lane,
             output_tile_count=output_tile_count,
             output_tile_capacity=output_tile_capacity,
@@ -3963,6 +3914,7 @@ def _opspace_build_lane_buckets(
         dtype=jnp.int32).at[lane_ids, safe_block, safe_tile, safe_slot].max(
             token_ids_l * valid_assignment.astype(jnp.int32), mode='drop')
     bucket_valid = bucket_valid_count == jnp.float32(1.0)
+    bucket_fill = bucket_valid.astype(jnp.int32).sum(axis=-1)
     assignment_collision_count = jnp.maximum(
         bucket_valid_count - jnp.float32(1.0), jnp.float32(0.0)).sum()
     return {
@@ -4012,13 +3964,12 @@ def _opspace_execute_output_tiled_pallas(
             (output_tile_size, d_tile_size), dtype=jnp.float32)
         scratch_mass = jnp.zeros((output_tile_size,), dtype=jnp.float32)
         scratch_relu = jnp.zeros((output_tile_size,), dtype=jnp.float32)
+        output_rows = jnp.arange(output_tile_size, dtype=jnp.int32)
 
         for lane_i in range(local_lanes):
             for block_i in range(blocks_per_lane):
                 lane_idx = jnp.asarray(lane_i, dtype=jnp.int32)
                 block_idx = jnp.asarray(block_i, dtype=jnp.int32)
-                tile_fill = pl.load(
-                    bucket_fill_ref, (lane_idx, block_idx, output_tile_i))
                 key_local = pl.load(
                     key_blocks_ref,
                     (lane_idx, block_idx, pl.dslice(0, block_size),
@@ -4034,21 +3985,16 @@ def _opspace_execute_output_tiled_pallas(
                     (lane_idx, block_idx, pl.dslice(0, block_size)),
                     other=jnp.asarray(False, dtype=jnp.bool_))
 
-                for slot_i in range(output_tile_capacity):
+                for slot_i in range(output_tile_size):
                     slot_idx = jnp.asarray(slot_i, dtype=jnp.int32)
-                    token_id = pl.load(
-                        token_id_bucket_ref,
-                        (lane_idx, block_idx, output_tile_i, slot_idx),
-                        other=jnp.asarray(0, dtype=jnp.int32))
+                    token_id = output_start + slot_idx
                     valid_slot = pl.load(
                         bucket_valid_ref,
                         (lane_idx, block_idx, output_tile_i, slot_idx),
                         other=jnp.asarray(False, dtype=jnp.bool_))
                     valid_slot = jnp.logical_and(
-                        valid_slot, slot_idx < tile_fill)
+                        valid_slot, token_id < T)
                     safe_token = jnp.where(valid_slot, token_id, 0)
-                    local_token = jnp.where(
-                        valid_slot, token_id - output_start, 0)
                     valid_slot_f = valid_slot.astype(jnp.float32)
 
                     h_vec = pl.load(
@@ -4096,12 +4042,13 @@ def _opspace_execute_output_tiled_pallas(
                     mass_slot = gate.sum()
                     relu_slot = (gate > 0.0).astype(jnp.float32).sum()
 
-                    scratch_raw = scratch_raw.at[local_token].add(
-                        raw_slot * valid_slot_f)
-                    scratch_mass = scratch_mass.at[local_token].add(
-                        mass_slot * valid_slot_f)
-                    scratch_relu = scratch_relu.at[local_token].add(
-                        relu_slot * valid_slot_f)
+                    row_mask = (output_rows == slot_idx).astype(jnp.float32)
+                    scratch_raw = scratch_raw + (
+                        row_mask[:, None] * raw_slot[None, :] * valid_slot_f)
+                    scratch_mass = scratch_mass + (
+                        row_mask * mass_slot * valid_slot_f)
+                    scratch_relu = scratch_relu + (
+                        row_mask * relu_slot * valid_slot_f)
 
         pl.store(
             raw_tiles_ref,
@@ -4220,30 +4167,19 @@ def _opspace_execute_output_tiled_manual_bwd(
         d_mass_tile = jnp.where(
             d_tile_i == jnp.asarray(0, dtype=jnp.int32),
             d_mass_tile, jnp.zeros_like(d_mass_tile))
+        local_tokens = jnp.arange(output_tile_size, dtype=jnp.int32)
 
         for lane_i in range(local_lanes):
             for block_i in range(blocks_per_lane):
-                token_chunk = jax.lax.dynamic_slice(
-                    token_id_bucket,
-                    (lane_i, block_i, output_tile_i, 0),
-                    (1, 1, 1, output_tile_capacity)).reshape(
-                        output_tile_capacity)
                 valid_chunk = jax.lax.dynamic_slice(
                     bucket_valid,
                     (lane_i, block_i, output_tile_i, 0),
-                    (1, 1, 1, output_tile_capacity)).reshape(
-                        output_tile_capacity)
-                slot_offsets = jnp.arange(
-                    output_tile_capacity, dtype=jnp.int32)
+                    (1, 1, 1, output_tile_size)).reshape(
+                        output_tile_size)
                 valid_chunk = jnp.logical_and(
-                    valid_chunk,
-                    slot_offsets < bucket_fill[
-                        lane_i, block_i, output_tile_i])
+                    valid_chunk, token_valid)
                 valid_chunk_f = valid_chunk.astype(jnp.float32)
-                safe_token = jnp.where(valid_chunk, token_chunk, 0)
-                local_token = jnp.where(
-                    valid_chunk,
-                    token_chunk - output_tile_i * output_tile_size, 0)
+                safe_token = jnp.where(valid_chunk, token_offsets, 0)
 
                 h_chunk = flat_h[safe_token]
                 h_chunk = (
@@ -4259,7 +4195,7 @@ def _opspace_execute_output_tiled_manual_bwd(
                 rho = jnp.einsum(
                     'cd,nd->cn', h_chunk, key_block).astype(jnp.float32)
                 read_value = jnp.zeros(
-                    (output_tile_capacity, int(key_block.shape[0])),
+                    (output_tile_size, int(key_block.shape[0])),
                     dtype=jnp.float32)
                 for read_tile_i in range(d_tile_count):
                     read_offsets = (
@@ -4286,9 +4222,9 @@ def _opspace_execute_output_tiled_manual_bwd(
                 gate = gate * valid_block_f[None, :]
                 mixed = gate * read_value
 
-                d_y = d_y_tile[local_token] * valid_chunk_f[:, None]
+                d_y = d_y_tile[local_tokens] * valid_chunk_f[:, None]
                 d_y_bf16 = d_y.astype(jnp.bfloat16)
-                d_mass = d_mass_tile[local_token] * valid_chunk_f
+                d_mass = d_mass_tile[local_tokens] * valid_chunk_f
                 d_mixed = jnp.einsum(
                     'cd,nd->cn', d_y_bf16, write_block).astype(jnp.float32)
                 d_write = jnp.einsum(
@@ -4462,10 +4398,7 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         raise ValueError(
             "operation-space block_bucketed_pallas_final local rows exceed "
             f"lane-block slots: rows={N_local}, slots={local_padded_ops}")
-    bucket_capacity = max(
-        1, int(math.ceil(float(bucket_capacity_factor) * float(T)
-                         / float(blocks_per_lane))))
-    del bucket_chunk_size
+    del bucket_capacity_factor, bucket_chunk_size
     output_tile_size = int(OPSPACE_FINAL_OUTPUT_TILE_SIZE)
     d_tile_size = int(OPSPACE_FINAL_D_TILE_SIZE_POLICY)
     if D % d_tile_size != 0:
@@ -4476,12 +4409,8 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     output_tile_count = max(
         1, (T + output_tile_size - 1) // output_tile_size)
     d_tile_count = max(1, (D + d_tile_size - 1) // d_tile_size)
-    avg_tile_fill = max(
-        1, int(math.ceil(float(bucket_capacity) / float(output_tile_count))))
-    output_tile_capacity = _opspace_round_up_to_multiple(
-        int(math.ceil(
-            float(avg_tile_fill) * OPSPACE_FINAL_TILE_CAPACITY_FACTOR)),
-        OPSPACE_FINAL_TILE_CAPACITY_ALIGN)
+    output_tile_capacity = output_tile_size
+    bucket_capacity = output_tile_count * output_tile_capacity
 
     (slot_to_row_np, valid_slot_np, _valid_counts_np) = (
         _opspace_balanced_slot_layout_np(
@@ -4605,8 +4534,8 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         data_sum(jnp.asarray(T, dtype=jnp.float32)), 1.0)
     selected_request_count = token_count * jnp.float32(k_exec)
     valid_counts_by_block = valid_blocks.astype(jnp.float32).sum(axis=-1)
-    output_tile_fill = bucket_fill.astype(jnp.float32)
-    unique_by_output_tile = bucket_valid.astype(jnp.float32).sum(axis=-1)
+    output_tile_fill = bucket_valid.astype(jnp.float32).sum(axis=-1)
+    unique_by_output_tile = output_tile_fill
     unique_by_block = unique_by_output_tile.sum(axis=-1)
     bucket_fill_total = output_tile_fill.sum(axis=-1)
     processed_count_local = unique_by_output_tile.sum()
