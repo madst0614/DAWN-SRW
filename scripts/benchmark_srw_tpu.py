@@ -74,6 +74,44 @@ SECTOR_RUNTIME_METRIC_NAMES = (
     "selected_sector_frac",
     "effective_operator_frac",
 )
+OPSPACE_RUNTIME_METRIC_NAMES = (
+    "enabled",
+    "k_exec",
+    "exec_slots",
+    "valid_exec_slots_mean",
+    "bucket_capacity",
+    "bucket_fill_mean",
+    "selected_lane_top1_frac",
+    "primary_accept_frac",
+    "bucket_fill_skew",
+    "reroute_frac",
+    "relu_gate_count_mean",
+    "gate_denominator_mean",
+    "gate_mass_mean",
+    "effective_ops",
+    "padded_exec_slots_mean",
+    "overflow_frac",
+    "no_nan",
+    "owner_model_axis",
+    "selected_requests",
+    "processed_requests",
+    "all_processed",
+    "factorized_tile_layout_ok",
+)
+OPSPACE_FINAL_RUNTIME_METRIC_NAMES = (
+    "assignment_score_loss_mean",
+    "assignment_score_loss_p95",
+    "assignment_score_loss_max",
+    "assignment_regret_mean",
+    "assignment_regret_p95",
+    "high_regret_spill_frac",
+    "semantic_drop_frac",
+    "pallas_executed_chunks",
+    "pallas_skipped_chunks",
+    "pallas_padding_frac",
+    "bucket_fill_p99",
+    "bucket_capacity_util_p99",
+)
 
 
 def require_optax():
@@ -868,6 +906,14 @@ def create_benchmark_train_step(model, optimizer, sharded_fns, cfg):
                 key = f"sector/{pool}/{name}"
                 if key in result:
                     metrics[key] = result[key]
+            for name in OPSPACE_RUNTIME_METRIC_NAMES:
+                key = f"opspace/{pool}/{name}"
+                if key in result:
+                    metrics[key] = result[key]
+            for name in OPSPACE_FINAL_RUNTIME_METRIC_NAMES:
+                key = f"opspace/{pool}/final/{name}"
+                if key in result:
+                    metrics[key] = result[key]
         return params, opt_state, metrics
 
     return train_step
@@ -1131,9 +1177,29 @@ def sector_brief(metrics, pool):
     )
 
 
+def opspace_brief(metrics, pool):
+    prefix = f"opspace/{pool}/"
+    if prefix + "enabled" not in metrics:
+        return ""
+    label = "v" if pool == "attn_v" else pool
+    final_prefix = prefix + "final/"
+    final_text = ""
+    if final_prefix + "semantic_drop_frac" in metrics:
+        final_text = (
+            f" loss95={fmt(metrics.get(final_prefix + 'assignment_score_loss_p95'), 4)}"
+            f" drop={fmt(metrics.get(final_prefix + 'semantic_drop_frac'), 6)}"
+            f" skip={fmt(metrics.get(final_prefix + 'pallas_skipped_chunks'), 1)}"
+            f" pad={fmt(metrics.get(final_prefix + 'pallas_padding_frac'), 3)}")
+    return (
+        f"op-{label}[ovf={fmt(metrics.get(prefix + 'overflow_frac'), 6)} "
+        f"reroute={fmt(metrics.get(prefix + 'reroute_frac'), 4)}"
+        f"{final_text}]"
+    )
+
+
 def benchmark_step_record(run_index, variant_label, step, phase, phase_step,
                           step_seconds, tokens_per_second, metrics, hbm):
-    return {
+    record = {
         "type": "benchmark_step",
         "run_index": int(run_index),
         "variant": variant_label,
@@ -1148,6 +1214,16 @@ def benchmark_step_record(run_index, variant_label, step, phase, phase_step,
         "hbm_peak_gb": json_float(hbm.get("hbm_peak_gb"), None),
         "hbm_limit_gb": json_float(hbm.get("hbm_limit_gb"), None),
     }
+    for pool in ("attn_v", "rst"):
+        for name in OPSPACE_RUNTIME_METRIC_NAMES:
+            key = f"opspace/{pool}/{name}"
+            if key in metrics:
+                record[key.replace("/", "_")] = json_float(metrics[key])
+        for name in OPSPACE_FINAL_RUNTIME_METRIC_NAMES:
+            key = f"opspace/{pool}/final/{name}"
+            if key in metrics:
+                record[key.replace("/", "_")] = json_float(metrics[key])
+    return record
 
 
 def format_step_status(phase, phase_step, phase_total, step_seconds,
@@ -1160,12 +1236,20 @@ def format_step_status(phase, phase_step, phase_total, step_seconds,
         if part
     ]
     sector_text = " | " + " ".join(sector_parts) if sector_parts else ""
+    opspace_parts = [
+        part for part in (
+            opspace_brief(metrics, "attn_v"),
+            opspace_brief(metrics, "rst"),
+        )
+        if part
+    ]
+    opspace_text = " | " + " ".join(opspace_parts) if opspace_parts else ""
     return (
         f"[bench] {phase} {int(phase_step)}/{int(phase_total)} "
         f"step_s={step_seconds:.4f} tok/s={tokens_per_second:.1f} "
         f"loss={fmt(metrics.get('loss'), 4)} "
         f"grad={fmt(metrics.get('grad_norm'), 3)} | "
-        f"{hbm_inline(hbm)}{sector_text}"
+        f"{hbm_inline(hbm)}{sector_text}{opspace_text}"
     )
 
 

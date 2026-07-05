@@ -319,15 +319,46 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
             "k_exec", pool_cfg.get("k_exec", k_exec_default))
         return {
             "operation_space_mode": str(
-                layout.get("mode", pool_cfg.get("mode", "block_sparse"))
+                layout.get(
+                    "routing_mode",
+                    pool_cfg.get(
+                        "routing_mode",
+                        pool_cfg.get("mode", "factorized_lane_mean")))
             ).lower(),
+            "operation_space_routing_mode": str(
+                layout.get("routing_mode", "factorized_lane_mean")).lower(),
+            "operation_space_execution_mode": str(
+                layout.get("execution_mode", "dense_masked")).lower(),
             "opspace_lanes": int(layout.get(
                 "lanes", pool_cfg.get("lanes", lanes_default))),
             "opspace_tiles_per_lane": int(layout.get("tiles_per_lane", 1)),
+            "opspace_exec_tiles_per_block": int(layout.get(
+                "exec_tiles_per_block", 1)),
+            "opspace_blocks_per_lane": int(layout.get(
+                "blocks_per_lane", 1)),
+            "opspace_block_size": int(layout.get(
+                "block_size", layout.get(
+                    "tile_size", opspace_cfg.get("tile_size", 128)))),
             "opspace_padded_ops": int(layout.get("padded_ops", 0)),
             "opspace_tile_size": int(layout.get(
                 "tile_size", opspace_cfg.get("tile_size", 128))),
             "opspace_k_exec": int(k_exec_cfg),
+            "opspace_bucket_capacity_factor": float(layout.get(
+                "bucket_capacity_factor",
+                1.5 if str(layout.get(
+                    "execution_mode", "dense_masked")).lower()
+                == "block_bucketed_pallas_final" else 1.25)),
+            "opspace_bucket_chunk_size": int(layout.get(
+                "bucket_chunk_size",
+                128 if str(layout.get(
+                    "execution_mode", "dense_masked")).lower()
+                == "block_bucketed_pallas_final" else 1024)),
+            "opspace_assignment_policy": str(layout.get(
+                "assignment_policy", "low_regret")).lower(),
+            "opspace_high_regret_threshold": float(layout.get(
+                "high_regret_threshold", 0.05)),
+            "opspace_lane_output_mode": str(layout.get(
+                "lane_output_mode", "lane_local")).lower(),
         }
 
     def srw_pool_kwargs(pool):

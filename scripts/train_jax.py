@@ -80,6 +80,7 @@ from models.dawn_srw_v4167 import (
 )
 from models.dawn_srw_v4168 import (
     DAWN_SRW_V4168,
+    OPSPACE_FINAL_RUNTIME_DIAG_NAMES as _V4168_OPSPACE_FINAL_RUNTIME_DIAG_NAMES,
     OPSPACE_RUNTIME_DIAG_NAMES as _V4168_OPSPACE_RUNTIME_DIAG_NAMES,
     hardware_sector_static_metrics as _v4168_hardware_sector_static_metrics,
     maybe_hardware_repack as _v4168_maybe_hardware_repack,
@@ -909,6 +910,19 @@ V4168_OPSPACE_REPACK_RESUME_REQUIRED_FIELDS = (
     ('training', 'operation_space', 'repack', 'max_swaps', 'rst'),
 )
 
+V4168_OPSPACE_FINAL_RESUME_REQUIRED_FIELDS = (
+    ('training', 'operation_space', 'pools', 'rst',
+     'bucket_capacity_factor'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'bucket_chunk_size'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'assignment_policy'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'high_regret_threshold'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'lane_output_mode'),
+)
+
 
 def _missing_config_paths(cfg, paths):
     missing = []
@@ -979,6 +993,15 @@ def _require_resume_materialized_fields(full_config):
     if (str(model_version) == V4168_MODEL_VERSION
             and bool(opspace_cfg.get('enabled', False))):
         required_fields = list(V4168_OPSPACE_RESUME_REQUIRED_FIELDS)
+        pools_cfg = (
+            opspace_cfg.get('pools', {})
+            if isinstance(opspace_cfg.get('pools', {}), dict) else {})
+        rst_cfg = (
+            pools_cfg.get('rst', {})
+            if isinstance(pools_cfg.get('rst', {}), dict) else {})
+        if str(rst_cfg.get('execution_mode', '')).lower() == (
+                'block_bucketed_pallas_final'):
+            required_fields.extend(V4168_OPSPACE_FINAL_RESUME_REQUIRED_FIELDS)
         repack_cfg = (
             opspace_cfg.get('repack', {})
             if isinstance(opspace_cfg.get('repack', {}), dict) else {})
@@ -1313,6 +1336,11 @@ def _v4168_validate_operation_space_shape(opspace):
         'lanes',
         'k_exec',
         'exec_tiles_per_block',
+        'bucket_capacity_factor',
+        'bucket_chunk_size',
+        'assignment_policy',
+        'high_regret_threshold',
+        'lane_output_mode',
     }
     for label in ('qk', 'v', 'rst'):
         pool = pools.get(label, {})
@@ -1325,8 +1353,11 @@ def _v4168_validate_operation_space_shape(opspace):
         if extra:
             raise ValueError(
                 f"training.operation_space.pools.{label} only supports "
-                "routing_mode, mode, execution_mode, lanes, k_exec, and "
-                f"exec_tiles_per_block; remove: {', '.join(extra)}")
+                "routing_mode, mode, execution_mode, lanes, k_exec, "
+                "exec_tiles_per_block, bucket_capacity_factor, "
+                "bucket_chunk_size, assignment_policy, "
+                "high_regret_threshold, and lane_output_mode; remove: "
+                f"{', '.join(extra)}")
     repack = opspace.get('repack', {})
     if repack is None:
         repack = {}
@@ -1409,11 +1440,22 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 f"be 'factorized_lane_mean', got {routing_mode!r}.")
         execution_mode = str(pool.get(
             'execution_mode', defaults_i['execution_mode'])).strip().lower()
-        if execution_mode not in ('dense_masked', 'block_bucketed_dense'):
+        valid_execution_modes = (
+            'dense_masked',
+            'block_bucketed_dense',
+            'block_bucketed_pallas_final',
+        )
+        if execution_mode not in valid_execution_modes:
             raise ValueError(
                 f"training.operation_space.pools.{label}.execution_mode must "
-                "be 'dense_masked' or 'block_bucketed_dense', got "
+                "be 'dense_masked', 'block_bucketed_dense', or "
+                "'block_bucketed_pallas_final', got "
                 f"{execution_mode!r}.")
+        if execution_mode == 'block_bucketed_pallas_final' and label != 'rst':
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.execution_mode=block_bucketed_pallas_final is "
+                "only supported for the RST single-route backend.")
         lanes = int(pool.get('lanes', defaults_i['lanes']))
         if lanes <= 0:
             raise ValueError(
@@ -1435,7 +1477,10 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         align = math.lcm(lanes, device_count)
         total_tiles = _ceil_to_multiple(raw_tiles, align)
         tiles_per_lane = total_tiles // lanes
-        exec_tiles_default = 2 if execution_mode == 'block_bucketed_dense' else 1
+        exec_tiles_default = (
+            2 if execution_mode in (
+                'block_bucketed_dense',
+                'block_bucketed_pallas_final') else 1)
         exec_tiles_per_block = int(pool.get(
             'exec_tiles_per_block', exec_tiles_default))
         if exec_tiles_per_block <= 0:
@@ -1450,6 +1495,52 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 f"divide tiles_per_lane={tiles_per_lane}.")
         blocks_per_lane = tiles_per_lane // exec_tiles_per_block
         block_size = tile_size * exec_tiles_per_block
+        bucket_capacity_factor = float(pool.get(
+            'bucket_capacity_factor',
+            1.5 if execution_mode == 'block_bucketed_pallas_final'
+            else 1.25))
+        if bucket_capacity_factor <= 0.0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.bucket_capacity_factor must be > 0, got "
+                f"{bucket_capacity_factor}.")
+        bucket_chunk_size = int(pool.get(
+            'bucket_chunk_size',
+            128 if execution_mode == 'block_bucketed_pallas_final' else 1024))
+        if bucket_chunk_size <= 0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.bucket_chunk_size must be > 0, got "
+                f"{bucket_chunk_size}.")
+        assignment_policy = str(pool.get(
+            'assignment_policy',
+            'low_regret'
+            if execution_mode == 'block_bucketed_pallas_final'
+            else 'token_order')).strip().lower()
+        if execution_mode == 'block_bucketed_pallas_final' and (
+                assignment_policy != 'low_regret'):
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.assignment_policy must be 'low_regret' for "
+                "block_bucketed_pallas_final.")
+        high_regret_threshold = float(pool.get(
+            'high_regret_threshold', 0.05))
+        if high_regret_threshold < 0.0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.high_regret_threshold must be >= 0, got "
+                f"{high_regret_threshold}.")
+        lane_output_mode = str(pool.get(
+            'lane_output_mode',
+            'lane_local'
+            if execution_mode == 'block_bucketed_pallas_final'
+            else 'scatter_add')).strip().lower()
+        if execution_mode == 'block_bucketed_pallas_final' and (
+                lane_output_mode != 'lane_local'):
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.lane_output_mode must be 'lane_local' for "
+                "block_bucketed_pallas_final.")
         layouts[label] = {
             'routing_mode': routing_mode,
             'mode': routing_mode,
@@ -1463,6 +1554,11 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             'exec_tiles_per_block': exec_tiles_per_block,
             'blocks_per_lane': blocks_per_lane,
             'block_size': block_size,
+            'bucket_capacity_factor': bucket_capacity_factor,
+            'bucket_chunk_size': bucket_chunk_size,
+            'assignment_policy': assignment_policy,
+            'high_regret_threshold': high_regret_threshold,
+            'lane_output_mode': lane_output_mode,
             'padded_ops': total_tiles * tile_size,
             'invalid_padded_ops': total_tiles * tile_size - n_ops,
             'num_devices': device_count,
@@ -6530,6 +6626,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         for _pool in ('attn_v', 'rst'):
             for _name in _V4168_OPSPACE_RUNTIME_DIAG_NAMES:
                 _key = f'opspace/{_pool}/{_name}'
+                metrics[_key] = result.get(_key, jnp.float32(0.0))
+        for _pool in ('attn_v', 'rst'):
+            for _name in _V4168_OPSPACE_FINAL_RUNTIME_DIAG_NAMES:
+                _key = f'opspace/{_pool}/final/{_name}'
                 metrics[_key] = result.get(_key, jnp.float32(0.0))
         for _pool in ('attn_qk', 'attn_v'):
             for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
@@ -12299,6 +12399,22 @@ def main():
                     else (5 if _label == 'v' else 4))),
                 'exec_tiles_per_block': int(_layout.get(
                     'exec_tiles_per_block', 1)),
+                'bucket_capacity_factor': float(_layout.get(
+                    'bucket_capacity_factor',
+                    1.5 if str(_layout.get(
+                        'execution_mode', 'dense_masked')).lower()
+                    == 'block_bucketed_pallas_final' else 1.25)),
+                'bucket_chunk_size': int(_layout.get(
+                    'bucket_chunk_size',
+                    128 if str(_layout.get(
+                        'execution_mode', 'dense_masked')).lower()
+                    == 'block_bucketed_pallas_final' else 1024)),
+                'assignment_policy': str(_layout.get(
+                    'assignment_policy', 'low_regret')).lower(),
+                'high_regret_threshold': float(_layout.get(
+                    'high_regret_threshold', 0.05)),
+                'lane_output_mode': str(_layout.get(
+                    'lane_output_mode', 'lane_local')).lower(),
             }
 
         def _opspace_materialized_max_swaps(_label):
@@ -12902,14 +13018,24 @@ def main():
                     f"k_exec={int(_layout.get('k_exec', 0))} "
                     f"tile_size={int(_layout.get('tile_size', 0))} "
                     f"tiles_per_lane={int(_layout.get('tiles_per_lane', 0))}")
-                if str(_layout.get('execution_mode', '')).lower() == (
-                        'block_bucketed_dense'):
+                if str(_layout.get('execution_mode', '')).lower() in (
+                        'block_bucketed_dense',
+                        'block_bucketed_pallas_final'):
                     _line += (
                         f" exec_tiles_per_block="
                         f"{int(_layout.get('exec_tiles_per_block', 0))} "
                         f"block_size={int(_layout.get('block_size', 0))} "
                         f"blocks_per_lane="
                         f"{int(_layout.get('blocks_per_lane', 0))}")
+                if str(_layout.get('execution_mode', '')).lower() == (
+                        'block_bucketed_pallas_final'):
+                    _line += (
+                        f" bucket_capacity_factor="
+                        f"{float(_layout.get('bucket_capacity_factor', 1.5))} "
+                        f"bucket_chunk_size="
+                        f"{int(_layout.get('bucket_chunk_size', 128))} "
+                        f"assignment="
+                        f"{_layout.get('assignment_policy', 'low_regret')}")
                 return _line
 
             print("[opspace] v4168 tau-free operation-space active")
@@ -13662,6 +13788,22 @@ def main():
                 'opspace_k_exec': int(layout.get(
                     'k_exec', pool_cfg.get(
                         'k_exec', {'qk': 4, 'v': 5, 'rst': 32}[pool]))),
+                'opspace_bucket_capacity_factor': float(layout.get(
+                    'bucket_capacity_factor',
+                    1.5 if str(layout.get(
+                        'execution_mode', 'dense_masked')).lower()
+                    == 'block_bucketed_pallas_final' else 1.25)),
+                'opspace_bucket_chunk_size': int(layout.get(
+                    'bucket_chunk_size',
+                    128 if str(layout.get(
+                        'execution_mode', 'dense_masked')).lower()
+                    == 'block_bucketed_pallas_final' else 1024)),
+                'opspace_assignment_policy': str(layout.get(
+                    'assignment_policy', 'low_regret')).lower(),
+                'opspace_high_regret_threshold': float(layout.get(
+                    'high_regret_threshold', 0.05)),
+                'opspace_lane_output_mode': str(layout.get(
+                    'lane_output_mode', 'lane_local')).lower(),
             }
 
         def _srw_pool_kwargs(pool):
@@ -13902,7 +14044,12 @@ def main():
                     _rst_blocks_per_lane = int(_rst_layout.get(
                         'blocks_per_lane', max(1, _rst_tpl)))
                     _rst_block_active = _rst_backend == 'block_bucketed_dense'
+                    _rst_bucketed_active = _rst_backend in (
+                        'block_bucketed_dense',
+                        'block_bucketed_pallas_final')
                     _rst_block_flag = str(bool(_rst_block_active)).lower()
+                    _rst_bucketed_flag = str(bool(
+                        _rst_bucketed_active)).lower()
                     print(
                         "[opspace] v4168 tau-free operation-space active\n"
                         "[opspace] routing/execution split enabled\n"
@@ -13948,7 +14095,7 @@ def main():
                         f"requests_per_token_global={_rst_lanes}\n"
                         f"[opspace/rst] backend={_rst_backend} regional_dense={_rst_block_flag}\n"
                         "[opspace/rst] token_request_grouping=false old_grouped_sparse=false\n"
-                        f"[opspace/rst] bucketed_execution={_rst_block_flag} bucket_chunked={_rst_block_flag}\n"
+                        f"[opspace/rst] bucketed_execution={_rst_bucketed_flag} bucket_chunked={_rst_bucketed_flag}\n"
                         f"[opspace/rst] exec_tiles_per_block={_rst_exec_tiles} "
                         f"block_size={_rst_block_size} "
                         f"blocks_per_lane={_rst_blocks_per_lane}\n"
@@ -14873,6 +15020,19 @@ def main():
     if is_host0:
         print("  SIGTERM handler registered (spot preemption safety)")
 
+    _rst_final_backend_enabled = False
+    if operation_space_tau_free_enabled:
+        _opspace_runtime_layouts = operation_space_repack_config.get(
+            'operation_space_pool_layouts', {})
+        if not isinstance(_opspace_runtime_layouts, dict):
+            _opspace_runtime_layouts = {}
+        _rst_runtime_layout = _opspace_runtime_layouts.get('rst', {})
+        if not isinstance(_rst_runtime_layout, dict):
+            _rst_runtime_layout = {}
+        _rst_final_backend_enabled = (
+            str(_rst_runtime_layout.get('execution_mode', '')).lower()
+            == 'block_bucketed_pallas_final')
+
     # ----------------------------------------------------------
     if is_host0:
         print(f"\n{'='*60}")
@@ -15115,6 +15275,37 @@ def main():
             if not np.isfinite(_m_total_for_nan):
                 raise ValueError(
                     f"NaN/INF total_loss at epoch {epoch}, step {global_step + 1}")
+            if _rst_final_backend_enabled:
+                _rst_final_guard = jax.device_get({
+                    'semantic_drop_frac': metrics.get(
+                        'opspace/rst/final/semantic_drop_frac',
+                        jnp.float32(0.0)),
+                    'all_processed': metrics.get(
+                        'opspace/rst/all_processed', jnp.float32(1.0)),
+                    'unresolved_after_rank_pass_count': metrics.get(
+                        'opspace/rst/final/unresolved_after_rank_pass_count',
+                        jnp.float32(0.0)),
+                    'assignment_collision_count': metrics.get(
+                        'opspace/rst/final/assignment_collision_count',
+                        jnp.float32(0.0)),
+                })
+                _rst_semantic_drop = float(
+                    _rst_final_guard['semantic_drop_frac'])
+                _rst_all_processed = float(
+                    _rst_final_guard['all_processed'])
+                if _rst_semantic_drop > 0.0 or _rst_all_processed < 1.0:
+                    raise RuntimeError(
+                        "block_bucketed_pallas_final RST fail-loud guard "
+                        f"at epoch {epoch}, step {global_step + 1}: "
+                        f"opspace/rst/final/semantic_drop_frac="
+                        f"{_rst_semantic_drop:.9g}, "
+                        f"opspace/rst/all_processed="
+                        f"{_rst_all_processed:.9g}, "
+                        "opspace/rst/final/"
+                        "unresolved_after_rank_pass_count="
+                        f"{float(_rst_final_guard['unresolved_after_rank_pass_count']):.9g}, "
+                        "opspace/rst/final/assignment_collision_count="
+                        f"{float(_rst_final_guard['assignment_collision_count']):.9g}")
 
             global_step += 1
             epoch_step_counter += 1

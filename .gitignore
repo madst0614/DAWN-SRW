@@ -32,6 +32,7 @@ venv/
 env/
 ENV/
 .venv
+.venv-jax062/
 
 # IDE
 .vscode/
