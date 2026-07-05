@@ -4558,14 +4558,16 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     assigned_mask = assigned_valid_f > 0.0
     # Keep final diagnostics cheap in the training step: exact global p95
     # requires a huge all_gather+sort. Use worst-shard local p95 instead.
+    score_loss_metric = jax.lax.stop_gradient(score_loss)
+    primary_regret_metric = jax.lax.stop_gradient(primary_regret)
     local_score_loss_p95 = _opspace_masked_percentile(
-        score_loss, assigned_mask, 95.0)
+        score_loss_metric, assigned_mask, 95.0)
     local_score_loss_max = jnp.max(jnp.where(
-        assigned_mask, score_loss, jnp.float32(0.0)))
+        assigned_mask, score_loss_metric, jnp.float32(0.0)))
     local_regret_p95 = _opspace_masked_percentile(
-        primary_regret, selected_mask, 95.0)
+        primary_regret_metric, selected_mask, 95.0)
     local_regret_max = jnp.max(jnp.where(
-        selected_mask, primary_regret, jnp.float32(0.0)))
+        selected_mask, primary_regret_metric, jnp.float32(0.0)))
     assignment_score_loss_p95 = jax.lax.pmax(
         jax.lax.pmax(local_score_loss_p95, 'model'), 'data')
     assignment_score_loss_max = jax.lax.pmax(
