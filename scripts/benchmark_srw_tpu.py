@@ -219,8 +219,10 @@ def main():
             run_index=run_index, run_count=len(run_specs))
         summaries.append(summary)
 
-    if len(summaries) > 1 and _is_host0():
-        print_comparison(summaries)
+    if _is_host0():
+        if len(summaries) > 1:
+            print_comparison(summaries)
+        print_copy_summary(summaries, args)
 
 
 def parse_csv_values(text, cast, name, aliases=None):
@@ -2335,6 +2337,130 @@ def print_comparison(summaries):
                 flush=True)
 
 
+def print_copy_summary(summaries, args):
+    _finish_status_line()
+    mode = "fast" if args.fast_only else "train+profile"
+    train_state = "skipped" if args.fast_only else "enabled"
+    measure_steps = 0 if args.fast_only else int(args.steps)
+    warmup_steps = 0 if args.fast_only else int(args.warmup_steps)
+    print("\n=== SRW BENCHMARK COPY SUMMARY BEGIN ===", flush=True)
+    print(
+        "run_config "
+        f"mode={mode} "
+        f"train_step={train_state} "
+        f"configs={len(summaries)} "
+        f"warmup_steps={warmup_steps} "
+        f"measure_steps={measure_steps} "
+        f"forward_profile_steps={int(args.forward_profile_steps)} "
+        f"module_profile_steps={int(args.module_profile_steps)} "
+        f"metrics_jsonl={args.metrics_jsonl or 'disabled'}",
+        flush=True)
+    print(
+        "columns "
+        "run model valid train_s fast_s fast_tok_s split_s "
+        "peak_hbm_gb profile_peak_hbm_gb config variant",
+        flush=True)
+    for i, summary in enumerate(summaries, 1):
+        variant = summary.get("variant") or "none"
+        print(
+            f"run={i} "
+            f"model={summary.get('model_version', 'unknown')} "
+            f"valid={str(summary.get('benchmark_valid', True)).lower()} "
+            f"reason={summary.get('invalid_reason') or 'none'} "
+            f"train_s={fmt(summary.get('mean_step_seconds'), 4)} "
+            f"fast_s={fmt(summary.get('fast_forward_mean_seconds'), 4)} "
+            f"fast_tok_s={fmt(summary.get('fast_forward_tokens_per_second'), 1)} "
+            f"split_s={fmt(summary.get('module_profile_mean_split_seconds'), 4)} "
+            f"peak_hbm_gb={fmt(summary.get('peak_hbm_gb'))} "
+            f"profile_peak_hbm_gb={fmt(summary.get('profile_peak_hbm_gb'))} "
+            f"config={summary.get('config_path', '')} "
+            f"variant={variant}",
+            flush=True)
+        print_copy_module_summary(i, summary)
+        print_copy_layer_summary(i, summary)
+
+    if len(summaries) >= 2:
+        base = summaries[0]
+        base_step = base.get("mean_step_seconds")
+        base_fast = base.get("fast_forward_mean_seconds")
+        base_split = base.get("module_profile_mean_split_seconds")
+        base_fast_tok = base.get("fast_forward_tokens_per_second")
+        print(
+            "compare_note "
+            "base=run_1 "
+            "speed_ratio_above_1_means_candidate_is_faster",
+            flush=True)
+        for i, summary in enumerate(summaries[1:], 2):
+            valid_pair = (
+                bool(base.get("benchmark_valid", True))
+                and bool(summary.get("benchmark_valid", True)))
+            train_speed = (
+                ratio(base_step, summary.get("mean_step_seconds"))
+                if valid_pair else "invalid_overflow")
+            print(
+                f"compare base=1 run={i} "
+                f"valid_pair={str(valid_pair).lower()} "
+                f"train_speed_vs_base={train_speed} "
+                f"train_time_vs_base="
+                f"{ratio(summary.get('mean_step_seconds'), base_step)} "
+                f"fast_speed_vs_base="
+                f"{ratio(base_fast, summary.get('fast_forward_mean_seconds'))} "
+                f"fast_time_vs_base="
+                f"{ratio(summary.get('fast_forward_mean_seconds'), base_fast)} "
+                f"fast_tok_vs_base="
+                f"{ratio(summary.get('fast_forward_tokens_per_second'), base_fast_tok)} "
+                f"split_speed_vs_base="
+                f"{ratio(base_split, summary.get('module_profile_mean_split_seconds'))} "
+                f"split_time_vs_base="
+                f"{ratio(summary.get('module_profile_mean_split_seconds'), base_split)} "
+                f"peak_hbm_vs_base="
+                f"{ratio(summary.get('peak_hbm_gb'), base.get('peak_hbm_gb'))}",
+                flush=True)
+    print("=== SRW BENCHMARK COPY SUMMARY END ===", flush=True)
+
+
+def print_copy_module_summary(run_index, summary):
+    rows = {
+        row.get("group"): row
+        for row in summary.get("profile_aggregates", []) or []
+    }
+    if not rows:
+        return
+    parts = []
+    for group in ("fast_forward", "setup", "embedding", "attn", "rst", "loss"):
+        row = rows.get(group)
+        if not row:
+            continue
+        parts.extend([
+            f"{group}_calls={int(row.get('calls') or 0)}",
+            f"{group}_total_ms={fmt_ms(row.get('total_seconds'))}",
+            f"{group}_mean_ms={fmt_ms(row.get('mean_seconds'))}",
+            f"{group}_pct_split={fmt(row.get('pct_module_split'), 1)}",
+            f"{group}_hbm_peak_gb={fmt(row.get('max_hbm_peak_gb'))}",
+        ])
+    if parts:
+        print(f"run={run_index} module_summary " + " ".join(parts),
+              flush=True)
+
+
+def print_copy_layer_summary(run_index, summary):
+    layer_rows = summary.get("profile_layer_rows", []) or []
+    if not layer_rows:
+        return
+    attn = []
+    rst = []
+    ratio_parts = []
+    for row in layer_rows:
+        layer = int(row.get("layer"))
+        attn.append(f"{layer:02d}:{fmt_ms(row.get('attn_seconds'))}")
+        rst.append(f"{layer:02d}:{fmt_ms(row.get('rst_seconds'))}")
+        ratio_parts.append(f"{layer:02d}:{fmt(row.get('rst_over_attn'), 3)}")
+    print(f"run={run_index} layer_attn_ms " + ",".join(attn), flush=True)
+    print(f"run={run_index} layer_rst_ms " + ",".join(rst), flush=True)
+    print(f"run={run_index} layer_rst_over_attn " + ",".join(ratio_parts),
+          flush=True)
+
+
 def num(value):
     try:
         if value is None:
@@ -2361,6 +2487,11 @@ def fmt(value, digits=3):
     if value is None:
         return "n/a"
     return f"{value:.{digits}f}"
+
+
+def fmt_ms(seconds, digits=3):
+    value = num(seconds)
+    return fmt(value * 1000.0 if value is not None else None, digits)
 
 
 def ratio(a, b):
