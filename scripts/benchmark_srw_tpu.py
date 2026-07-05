@@ -17,6 +17,7 @@ import random
 import shutil
 import sys
 import time
+import traceback
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -1378,6 +1379,39 @@ def benchmark_profile_record(run_index, variant_label, phase, step, op, group,
     return record
 
 
+def short_exception(exc, limit=260):
+    text = f"{type(exc).__name__}: {exc}"
+    text = " ".join(str(text).split())
+    if len(text) > limit:
+        return text[:limit - 3] + "..."
+    return text
+
+
+def traceback_text(limit=18):
+    return "".join(traceback.format_exc(limit=limit)).strip()
+
+
+def benchmark_profile_error_record(run_index, variant_label, phase, error):
+    return {
+        "type": "benchmark_profile_error",
+        "run_index": int(run_index),
+        "variant": variant_label,
+        "phase": phase,
+        "error": short_exception(error),
+        "traceback": traceback_text(),
+    }
+
+
+def log_profile_error(phase, error):
+    error_text = short_exception(error)
+    _log(f"[profile-error] {phase} failed: {error_text}")
+    trace = traceback_text(limit=14)
+    if trace:
+        for line in trace.splitlines()[-12:]:
+            _log(f"[profile-trace] {line}")
+    return error_text
+
+
 def profile_timed_call(fn, *args):
     t0 = time.perf_counter()
     value = fn(*args)
@@ -1821,7 +1855,6 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
     next_step = int(start_step)
     peak_hbm = None
     fast_metric_snapshots = []
-    forward_step = create_benchmark_forward_step(model, sharded_fns, cfg)
 
     def next_profile_batch():
         nonlocal iterator, rng, next_step
@@ -1835,102 +1868,127 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
     fast_times = []
     fast_tokens = []
     if int(args.forward_profile_steps) > 0:
-        _log("Compiling forward-only benchmark step...")
-        batch, ids, mask, step_rng, step_no = next_profile_batch()
-        hbm_before = collect_hbm_stats()
-        t0 = time.perf_counter()
-        metrics = forward_step(
-            params, ids, mask, step_rng, jnp.asarray(step_no, jnp.int32))
-        block_value(metrics)
-        compile_seconds = time.perf_counter() - t0
-        hbm = collect_hbm_stats()
-        peak_hbm = update_peak_hbm(peak_hbm, hbm)
-        records.append(benchmark_profile_record(
-            run_index, variant_label, "fast_forward_compile", step_no,
-            "fast_forward_loss", "fast_forward", compile_seconds,
-            batch_size, seq_len, hbm, hbm_before=hbm_before,
-            note="compile plus first forward-only execution"))
-        _log(
-            "[forward] compile "
-            f"{compile_seconds:.3f}s {hbm_inline(hbm)}")
-
-        for profile_i in range(int(args.forward_profile_steps)):
+        try:
+            forward_step = create_benchmark_forward_step(
+                model, sharded_fns, cfg)
+            _log("Compiling forward-only benchmark step...")
             batch, ids, mask, step_rng, step_no = next_profile_batch()
             hbm_before = collect_hbm_stats()
             t0 = time.perf_counter()
             metrics = forward_step(
                 params, ids, mask, step_rng, jnp.asarray(step_no, jnp.int32))
             block_value(metrics)
-            seconds = time.perf_counter() - t0
+            compile_seconds = time.perf_counter() - t0
             hbm = collect_hbm_stats()
             peak_hbm = update_peak_hbm(peak_hbm, hbm)
-            tok_s = float(batch_size) * float(seq_len) / seconds
-            fast_times.append(seconds)
-            fast_tokens.append(tok_s)
-            metrics_host = jax.device_get(metrics)
-            fast_metric_snapshots.append(metrics_host)
             records.append(benchmark_profile_record(
-                run_index, variant_label, "fast_forward_measure", step_no,
-                "fast_forward_loss", "fast_forward", seconds,
+                run_index, variant_label, "fast_forward_compile", step_no,
+                "fast_forward_loss", "fast_forward", compile_seconds,
                 batch_size, seq_len, hbm, hbm_before=hbm_before,
-                note="forward plus loss; no backward or optimizer"))
-            _status(
-                "[forward] "
-                f"{profile_i + 1}/{int(args.forward_profile_steps)} "
-                f"step_s={seconds:.4f} tok/s={tok_s:.1f} "
-                f"loss={fmt(metrics_host.get('loss'), 4)} | "
-                f"{hbm_inline(hbm)}",
-                persist=True)
+                note="compile plus first forward-only execution"))
+            _log(
+                "[forward] compile "
+                f"{compile_seconds:.3f}s {hbm_inline(hbm)}")
 
-        summary.update({
-            "fast_forward_compile_seconds": compile_seconds,
-            "fast_forward_steps": int(args.forward_profile_steps),
-            "fast_forward_mean_seconds": mean(fast_times),
-            "fast_forward_tokens_per_second": mean(fast_tokens),
-            "fast_forward_speedup_vs_train_step": ratio_float(
-                train_mean_seconds, mean(fast_times)),
-            "runtime_metric_summary": summarize_runtime_metric_snapshots(
-                fast_metric_snapshots),
-        })
+            for profile_i in range(int(args.forward_profile_steps)):
+                batch, ids, mask, step_rng, step_no = next_profile_batch()
+                hbm_before = collect_hbm_stats()
+                t0 = time.perf_counter()
+                metrics = forward_step(
+                    params, ids, mask, step_rng,
+                    jnp.asarray(step_no, jnp.int32))
+                block_value(metrics)
+                seconds = time.perf_counter() - t0
+                hbm = collect_hbm_stats()
+                peak_hbm = update_peak_hbm(peak_hbm, hbm)
+                tok_s = float(batch_size) * float(seq_len) / seconds
+                fast_times.append(seconds)
+                fast_tokens.append(tok_s)
+                metrics_host = jax.device_get(metrics)
+                fast_metric_snapshots.append(metrics_host)
+                records.append(benchmark_profile_record(
+                    run_index, variant_label, "fast_forward_measure", step_no,
+                    "fast_forward_loss", "fast_forward", seconds,
+                    batch_size, seq_len, hbm, hbm_before=hbm_before,
+                    note="forward plus loss; no backward or optimizer"))
+                _status(
+                    "[forward] "
+                    f"{profile_i + 1}/{int(args.forward_profile_steps)} "
+                    f"step_s={seconds:.4f} tok/s={tok_s:.1f} "
+                    f"loss={fmt(metrics_host.get('loss'), 4)} | "
+                    f"{hbm_inline(hbm)}",
+                    persist=True)
+
+            summary.update({
+                "fast_forward_compile_seconds": compile_seconds,
+                "fast_forward_steps": int(args.forward_profile_steps),
+                "fast_forward_mean_seconds": mean(fast_times),
+                "fast_forward_tokens_per_second": mean(fast_tokens),
+                "fast_forward_speedup_vs_train_step": ratio_float(
+                    train_mean_seconds, mean(fast_times)),
+                "runtime_metric_summary": summarize_runtime_metric_snapshots(
+                    fast_metric_snapshots),
+            })
+        except Exception as exc:
+            _finish_status_line()
+            error_text = log_profile_error("fast_forward", exc)
+            records.append(benchmark_profile_error_record(
+                run_index, variant_label, "fast_forward", exc))
+            summary.update({
+                "fast_forward_error": error_text,
+                "fast_forward_steps": 0,
+            })
 
     if int(args.module_profile_steps) > 0:
-        profile_fns = create_module_profile_fns(cfg, sharded_fns)
-        _log("Compiling split-module forward profile...")
-        batch, ids, _mask, step_rng, step_no = next_profile_batch()
-        t0 = time.perf_counter()
-        run_module_profile_pass(
-            profile_fns, params, ids, step_rng, step_no,
-            run_index, variant_label, batch_size, seq_len,
-            "module_compile", record=False)
-        module_compile_seconds = time.perf_counter() - t0
-        _log(f"[profile] module compile {module_compile_seconds:.3f}s")
-        module_total_times = []
-        for profile_i in range(int(args.module_profile_steps)):
+        try:
+            profile_fns = create_module_profile_fns(cfg, sharded_fns)
+            _log("Compiling split-module forward profile...")
             batch, ids, _mask, step_rng, step_no = next_profile_batch()
             t0 = time.perf_counter()
-            step_records = run_module_profile_pass(
+            run_module_profile_pass(
                 profile_fns, params, ids, step_rng, step_no,
                 run_index, variant_label, batch_size, seq_len,
-                "module_measure", record=True)
-            total_seconds = time.perf_counter() - t0
-            records.extend(step_records)
-            module_total_times.append(total_seconds)
-            for record in step_records:
-                peak_hbm = update_peak_hbm(
-                    peak_hbm, {"hbm_peak_gb": record.get("hbm_peak_gb")})
-            _status(
-                "[profile] module "
-                f"{profile_i + 1}/{int(args.module_profile_steps)} "
-                f"split_total_s={total_seconds:.4f}",
-                persist=True)
-        summary.update({
-            "module_profile_compile_seconds": module_compile_seconds,
-            "module_profile_steps": int(args.module_profile_steps),
-            "module_profile_mean_split_seconds": mean(module_total_times),
-            "module_profile_tokens_per_second": (
-                float(batch_size) * float(seq_len) / mean(module_total_times)
-                if module_total_times and mean(module_total_times) else None),
-        })
+                "module_compile", record=False)
+            module_compile_seconds = time.perf_counter() - t0
+            _log(f"[profile] module compile {module_compile_seconds:.3f}s")
+            module_total_times = []
+            for profile_i in range(int(args.module_profile_steps)):
+                batch, ids, _mask, step_rng, step_no = next_profile_batch()
+                t0 = time.perf_counter()
+                step_records = run_module_profile_pass(
+                    profile_fns, params, ids, step_rng, step_no,
+                    run_index, variant_label, batch_size, seq_len,
+                    "module_measure", record=True)
+                total_seconds = time.perf_counter() - t0
+                records.extend(step_records)
+                module_total_times.append(total_seconds)
+                for record in step_records:
+                    peak_hbm = update_peak_hbm(
+                        peak_hbm, {"hbm_peak_gb": record.get("hbm_peak_gb")})
+                _status(
+                    "[profile] module "
+                    f"{profile_i + 1}/{int(args.module_profile_steps)} "
+                    f"split_total_s={total_seconds:.4f}",
+                    persist=True)
+            summary.update({
+                "module_profile_compile_seconds": module_compile_seconds,
+                "module_profile_steps": int(args.module_profile_steps),
+                "module_profile_mean_split_seconds": mean(module_total_times),
+                "module_profile_tokens_per_second": (
+                    float(batch_size) * float(seq_len) / mean(
+                        module_total_times)
+                    if module_total_times and mean(module_total_times)
+                    else None),
+            })
+        except Exception as exc:
+            _finish_status_line()
+            error_text = log_profile_error("module_profile", exc)
+            records.append(benchmark_profile_error_record(
+                run_index, variant_label, "module_profile", exc))
+            summary.update({
+                "module_profile_error": error_text,
+                "module_profile_steps": 0,
+            })
 
     aggregates, layer_rows = summarize_profile_records(records)
     summary.update({
@@ -2289,6 +2347,11 @@ def print_summary(summary):
             f"speedup_vs_train_step="
             f"{fmt(summary.get('fast_forward_speedup_vs_train_step'), 3)}",
             flush=True)
+    if summary.get("fast_forward_error"):
+        print(
+            "fast_forward_error "
+            f"error={summary.get('fast_forward_error')}",
+            flush=True)
     if summary.get("module_profile_mean_split_seconds") is not None:
         print(
             "module_profile "
@@ -2298,6 +2361,11 @@ def print_summary(summary):
             f"{fmt(summary.get('module_profile_mean_split_seconds'), 4)} "
             f"tok/s={fmt(summary.get('module_profile_tokens_per_second'), 1)} "
             "note=diagnostic_split_launches_excluding_compile",
+            flush=True)
+    if summary.get("module_profile_error"):
+        print(
+            "module_profile_error "
+            f"error={summary.get('module_profile_error')}",
             flush=True)
     if summary.get("xla_total_hbm_usage"):
         print(
@@ -2561,6 +2629,12 @@ def print_comparison(summaries):
                 flush=True)
 
 
+def copy_safe(value):
+    if value is None or value == "":
+        return "none"
+    return "_".join(str(value).replace("\\", "/").split())
+
+
 def print_copy_summary(summaries, args):
     _finish_status_line()
     mode = "fast" if args.fast_only else "train+profile"
@@ -2582,7 +2656,8 @@ def print_copy_summary(summaries, args):
     print(
         "columns "
         "run model valid train_s fast_s fast_tok_s split_s "
-        "peak_hbm_gb profile_peak_hbm_gb config variant",
+        "peak_hbm_gb profile_peak_hbm_gb fast_error module_error "
+        "config variant",
         flush=True)
     for i, summary in enumerate(summaries, 1):
         variant = summary.get("variant") or "none"
@@ -2597,6 +2672,8 @@ def print_copy_summary(summaries, args):
             f"split_s={fmt(summary.get('module_profile_mean_split_seconds'), 4)} "
             f"peak_hbm_gb={fmt(summary.get('peak_hbm_gb'))} "
             f"profile_peak_hbm_gb={fmt(summary.get('profile_peak_hbm_gb'))} "
+            f"fast_error={copy_safe(summary.get('fast_forward_error'))} "
+            f"module_error={copy_safe(summary.get('module_profile_error'))} "
             f"config={summary.get('config_path', '')} "
             f"variant={variant}",
             flush=True)
@@ -2681,6 +2758,14 @@ def print_copy_bottleneck_summary(run_index, summary):
                 f"_hbm={fmt(row.get('max_hbm_peak_gb'))}")
         print(f"run={run_index} bottleneck_rank " + " ".join(parts),
               flush=True)
+    elif summary.get("fast_forward_error") or summary.get(
+            "module_profile_error"):
+        print(
+            f"run={run_index} bottleneck_rank unavailable "
+            "reason=profile_error "
+            f"fast_error={copy_safe(summary.get('fast_forward_error'))} "
+            f"module_error={copy_safe(summary.get('module_profile_error'))}",
+            flush=True)
     top_attn, top_rst, top_ratio = top_layer_bottlenecks(summary)
     if top_attn or top_rst or top_ratio:
         print(
