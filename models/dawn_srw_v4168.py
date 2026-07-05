@@ -4036,30 +4036,57 @@ def _opspace_execute_bucket_outputs_pallas(
                 token_id_bucket_ref, (lane_i, block_i, slot_offsets),
                 mask=chunk_in_bounds, other=0)
             safe_token = jnp.where(valid_token, token_ids, 0)
+            token_route_idx = jnp.broadcast_to(
+                jnp.expand_dims(safe_token, 1),
+                (bucket_chunk_size, d_route))
+            route_idx_for_tokens = jnp.broadcast_to(
+                jnp.expand_dims(route_offsets, 0),
+                (bucket_chunk_size, d_route))
+            token_d_idx = jnp.broadcast_to(
+                jnp.expand_dims(safe_token, 1),
+                (bucket_chunk_size, D))
+            d_idx_for_tokens = jnp.broadcast_to(
+                jnp.expand_dims(d_offsets, 0),
+                (bucket_chunk_size, D))
+            valid_token_route = jnp.broadcast_to(
+                jnp.expand_dims(valid_token, 1),
+                (bucket_chunk_size, d_route))
+            valid_token_d = jnp.broadcast_to(
+                jnp.expand_dims(valid_token, 1),
+                (bucket_chunk_size, D))
             h_chunk = pl.load(
-                flat_h_ref, (safe_token[:, None], route_offsets[None, :]),
-                mask=valid_token[:, None], other=0.0)
+                flat_h_ref, (token_route_idx, route_idx_for_tokens),
+                mask=valid_token_route, other=0.0)
             x_chunk = pl.load(
-                flat_x_ref, (safe_token[:, None], d_offsets[None, :]),
-                mask=valid_token[:, None], other=0.0)
+                flat_x_ref, (token_d_idx, d_idx_for_tokens),
+                mask=valid_token_d, other=0.0)
             valid_ops = pl.load(
                 valid_blocks_ref, (lane_i, block_i, op_offsets),
                 other=False)
+            op_route_idx = jnp.broadcast_to(
+                jnp.expand_dims(op_offsets, 1), (block_size, d_route))
+            route_idx_for_ops = jnp.broadcast_to(
+                jnp.expand_dims(route_offsets, 0), (block_size, d_route))
+            op_d_idx = jnp.broadcast_to(
+                jnp.expand_dims(op_offsets, 1), (block_size, D))
+            d_idx_for_ops = jnp.broadcast_to(
+                jnp.expand_dims(d_offsets, 0), (block_size, D))
+            valid_ops_route = jnp.broadcast_to(
+                jnp.expand_dims(valid_ops, 1), (block_size, d_route))
+            valid_ops_d = jnp.broadcast_to(
+                jnp.expand_dims(valid_ops, 1), (block_size, D))
             key_block = pl.load(
                 key_blocks_ref,
-                (lane_i, block_i, op_offsets[:, None],
-                 route_offsets[None, :]),
-                mask=valid_ops[:, None], other=0.0)
+                (lane_i, block_i, op_route_idx, route_idx_for_ops),
+                mask=valid_ops_route, other=0.0)
             read_block = pl.load(
                 read_blocks_ref,
-                (lane_i, block_i, op_offsets[:, None],
-                 d_offsets[None, :]),
-                mask=valid_ops[:, None], other=0.0)
+                (lane_i, block_i, op_d_idx, d_idx_for_ops),
+                mask=valid_ops_d, other=0.0)
             write_block = pl.load(
                 write_blocks_ref,
-                (lane_i, block_i, op_offsets[:, None],
-                 d_offsets[None, :]),
-                mask=valid_ops[:, None], other=0.0)
+                (lane_i, block_i, op_d_idx, d_idx_for_ops),
+                mask=valid_ops_d, other=0.0)
             rho = pl.dot(
                 h_chunk.astype(jnp.bfloat16),
                 jnp.swapaxes(key_block.astype(jnp.bfloat16), 0, 1)
@@ -4069,8 +4096,14 @@ def _opspace_execute_bucket_outputs_pallas(
                 jnp.swapaxes(read_block.astype(jnp.bfloat16), 0, 1)
             ).astype(jnp.float32)
             gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
-            gate = gate * valid_token.astype(jnp.float32)[:, None]
-            gate = gate * valid_ops.astype(jnp.float32)[None, :]
+            valid_token_gate = jnp.broadcast_to(
+                jnp.expand_dims(valid_token.astype(jnp.float32), 1),
+                (bucket_chunk_size, block_size))
+            valid_ops_gate = jnp.broadcast_to(
+                jnp.expand_dims(valid_ops.astype(jnp.float32), 0),
+                (bucket_chunk_size, block_size))
+            gate = gate * valid_token_gate
+            gate = gate * valid_ops_gate
             raw_out = pl.dot(
                 (gate * read_value).astype(jnp.bfloat16),
                 write_block.astype(jnp.bfloat16)).astype(jnp.float32)
@@ -4089,10 +4122,16 @@ def _opspace_execute_bucket_outputs_pallas(
 
         safe_token, valid_token, raw_out, gate_mass, relu_count = jax.lax.cond(
             active_chunk, compute, zeros, operand=None)
+        store_token_d_idx = jnp.broadcast_to(
+            jnp.expand_dims(safe_token, 1), (bucket_chunk_size, D))
+        store_d_idx = jnp.broadcast_to(
+            jnp.expand_dims(d_offsets, 0), (bucket_chunk_size, D))
+        store_valid_d = jnp.broadcast_to(
+            jnp.expand_dims(valid_token, 1), (bucket_chunk_size, D))
         pl.store(
             lane_raw_out_ref,
-            (lane_i, safe_token[:, None], d_offsets[None, :]),
-            raw_out, mask=valid_token[:, None])
+            (lane_i, store_token_d_idx, store_d_idx),
+            raw_out, mask=store_valid_d)
         pl.store(
             lane_gate_mass_ref,
             (lane_i, safe_token, jnp.zeros_like(safe_token)),
@@ -4517,30 +4556,24 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
         / jnp.maximum(selected_request_count, 1.0))
     selected_mask = selected_f > 0.0
     assigned_mask = assigned_valid_f > 0.0
-    score_loss_all = jax.lax.all_gather(
-        score_loss, 'model', axis=0, tiled=True)
-    selected_mask_all = jax.lax.all_gather(
-        selected_mask, 'model', axis=0, tiled=True)
-    assigned_mask_all = jax.lax.all_gather(
-        assigned_mask, 'model', axis=0, tiled=True)
-    primary_regret_all = jax.lax.all_gather(
-        primary_regret, 'model', axis=0, tiled=True)
-    score_loss_all = jax.lax.all_gather(
-        score_loss_all, 'data', axis=1, tiled=True)
-    selected_mask_all = jax.lax.all_gather(
-        selected_mask_all, 'data', axis=1, tiled=True)
-    assigned_mask_all = jax.lax.all_gather(
-        assigned_mask_all, 'data', axis=1, tiled=True)
-    primary_regret_all = jax.lax.all_gather(
-        primary_regret_all, 'data', axis=1, tiled=True)
-    assignment_score_loss_p95 = _opspace_masked_percentile(
-        score_loss_all, assigned_mask_all, 95.0)
-    assignment_score_loss_max = jnp.max(jnp.where(
-        assigned_mask_all, score_loss_all, jnp.float32(0.0)))
-    assignment_regret_p95 = _opspace_masked_percentile(
-        primary_regret_all, selected_mask_all, 95.0)
-    assignment_regret_max = jnp.max(jnp.where(
-        selected_mask_all, primary_regret_all, jnp.float32(0.0)))
+    # Keep final diagnostics cheap in the training step: exact global p95
+    # requires a huge all_gather+sort. Use worst-shard local p95 instead.
+    local_score_loss_p95 = _opspace_masked_percentile(
+        score_loss, assigned_mask, 95.0)
+    local_score_loss_max = jnp.max(jnp.where(
+        assigned_mask, score_loss, jnp.float32(0.0)))
+    local_regret_p95 = _opspace_masked_percentile(
+        primary_regret, selected_mask, 95.0)
+    local_regret_max = jnp.max(jnp.where(
+        selected_mask, primary_regret, jnp.float32(0.0)))
+    assignment_score_loss_p95 = jax.lax.pmax(
+        jax.lax.pmax(local_score_loss_p95, 'model'), 'data')
+    assignment_score_loss_max = jax.lax.pmax(
+        jax.lax.pmax(local_score_loss_max, 'model'), 'data')
+    assignment_regret_p95 = jax.lax.pmax(
+        jax.lax.pmax(local_regret_p95, 'model'), 'data')
+    assignment_regret_max = jax.lax.pmax(
+        jax.lax.pmax(local_regret_max, 'model'), 'data')
     low_regret_spill_frac = (
         data_sum(jax.lax.psum(
             low_regret_spill.astype(jnp.float32).sum(), 'model'))
