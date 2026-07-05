@@ -10086,6 +10086,263 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     return rec
 
 
+def get_metric(metrics, *keys, default=None):
+    for key in keys:
+        if key in metrics:
+            return metrics[key]
+    return default
+
+
+def _metric_float(value):
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) else None
+
+
+def fmt_float(x, digits=3, default="n/a"):
+    value = _metric_float(x)
+    if value is None:
+        return default
+    return f"{value:.{digits}f}"
+
+
+def fmt_pct(x, digits=2, default="n/a"):
+    value = _metric_float(x)
+    if value is None:
+        return default
+    return f"{value * 100.0:.{digits}f}%"
+
+
+def fmt_intlike(x, default="n/a"):
+    value = _metric_float(x)
+    if value is None:
+        return default
+    return str(int(round(value)))
+
+
+def _fmt_short_float(x, default="n/a"):
+    value = _metric_float(x)
+    if value is None:
+        return default
+    return f"{value:.3g}"
+
+
+def _opspace_metric(rec, prefixes, name, default=None):
+    if isinstance(prefixes, str):
+        prefixes = (prefixes,)
+    keys = []
+    for prefix in prefixes:
+        keys.append(f"{prefix}/{name}")
+        keys.append(f"{prefix}/final/{name}")
+    return get_metric(rec, *keys, default=default)
+
+
+def _opspace_has_metric(rec, prefixes, name):
+    return _opspace_metric(rec, prefixes, name, default=None) is not None
+
+
+def _opspace_product(rec, prefixes, *names):
+    product = 1.0
+    for name in names:
+        value = _metric_float(_opspace_metric(rec, prefixes, name))
+        if value is None:
+            return None
+        product *= value
+    return product
+
+
+def _opspace_logical_ops(rec, prefixes):
+    visible_ops = _metric_float(
+        _opspace_metric(rec, prefixes, 'visible_ops_per_token'))
+    if visible_ops is not None:
+        return visible_ops
+    return _opspace_product(
+        rec, prefixes, 'visible_regions',
+        'visible_blocks_per_region', 'operators_per_block')
+
+
+def _opspace_physical_ops(rec, prefixes):
+    physical_ops = _metric_float(
+        _opspace_metric(rec, prefixes, 'physical_visible_ops_per_token'))
+    if physical_ops is not None:
+        return physical_ops
+    return _opspace_product(
+        rec, prefixes, 'visible_regions',
+        'blocks_per_region', 'operators_per_block')
+
+
+def _opspace_dense_ops(rec, prefixes):
+    return _opspace_product(
+        rec, prefixes, 'region_count',
+        'blocks_per_region', 'operators_per_block')
+
+
+def _opspace_compute_frac(rec, prefixes, name, visible_ops):
+    compute_frac = _metric_float(_opspace_metric(rec, prefixes, name))
+    if compute_frac is not None:
+        return compute_frac
+    dense_ops = _opspace_dense_ops(rec, prefixes)
+    if visible_ops is None or dense_ops is None or dense_ops <= 0.0:
+        return None
+    return visible_ops / dense_ops
+
+
+def _opspace_backend_name(rec, prefixes):
+    for key, label in (
+            ('execution_region_block_pallas', 'region_block_pallas'),
+            ('execution_block_bucketed_pallas_final',
+             'block_bucketed_pallas_final'),
+            ('execution_block_bucketed_dense', 'block_bucketed_dense'),
+            ('execution_dense_masked', 'dense_masked')):
+        value = _metric_float(_opspace_metric(rec, prefixes, key))
+        if value is not None and value > 0.5:
+            return label
+    return "n/a"
+
+
+def _opspace_backend_summary(rec):
+    backends = {
+        'qk': _opspace_backend_name(rec, 'opspace/qk'),
+        'v': _opspace_backend_name(rec, ('opspace/v', 'opspace/attn_v')),
+        'rst': _opspace_backend_name(rec, 'opspace/rst'),
+    }
+    present = [value for value in backends.values() if value != "n/a"]
+    if present and len(set(present)) == 1:
+        return present[0]
+    return "qk={qk}/v={v}/rst={rst}".format(**backends)
+
+
+def _opspace_warning_lines(rec):
+    checks = (
+        ('semantic_drop_frac', 'rst semantic_drop_frac > 0',
+         lambda value: value > 0.0),
+        ('assignment_collision_count', 'rst assignment_collision_count > 0',
+         lambda value: value > 0.0),
+        ('all_processed', 'rst all_processed != 1',
+         lambda value: value < 0.5),
+        ('no_nan', 'rst no_nan != 1',
+         lambda value: value < 0.5),
+    )
+    lines = []
+    for name, message, pred in checks:
+        value = _metric_float(_opspace_metric(rec, 'opspace/rst', name))
+        if value is not None and pred(value):
+            lines.append(f"  [opspace/warn] {message}")
+    return lines
+
+
+def _print_train_progress_line(rec, ctx):
+    log_message(
+        f"  [train] loss={rec['total_loss']:.4f}"
+        f" ce={rec['ce_loss']:.4f}"
+        f" aux={rec['aux_loss']:.4f}"
+        f" grad={rec['grad_norm']:.2f}"
+        f" acc={rec['accuracy']:.4f}"
+        f" lr={rec['lr']:.2e}"
+        f" tok={ctx['progress']:.1f}%"
+    )
+
+
+def _print_v4168_opspace_regular_block(rec):
+    qk_prefix = 'opspace/qk'
+    v_prefixes = ('opspace/v', 'opspace/attn_v')
+    rst_prefix = 'opspace/rst'
+    den_power = _fmt_short_float(
+        rec.get('admission_den_power', rec.get('den_power', None)))
+    log_message(
+        "  [opspace] mode=tau_free_relu2"
+        f" backend={_opspace_backend_summary(rec)}"
+        " direct_tau=false selection_calibration=false"
+        f" gate=relu2 den=max(sum(gate),1)^{den_power}"
+    )
+
+    qk_diag_present = any(
+        _opspace_has_metric(rec, qk_prefix, name)
+        for name in ('gate_mass_mean', 'relu_gate_count_mean', 'no_nan'))
+    qk_line = (
+        "  [opspace/qk]"
+        f" visible_regions={fmt_intlike(_opspace_metric(rec, qk_prefix, 'visible_regions'))}"
+        f" visible_ops={fmt_intlike(_opspace_logical_ops(rec, qk_prefix))}"
+    )
+    if qk_diag_present:
+        qk_line += (
+            f" gate_mass={fmt_float(_opspace_metric(rec, qk_prefix, 'gate_mass_mean'), 2)}"
+            f" relu_active={fmt_float(_opspace_metric(rec, qk_prefix, 'relu_gate_count_mean'), 1)}")
+    else:
+        qk_line += " status=diag_missing"
+    log_message(qk_line)
+
+    v_parts = [
+        "  [opspace/v]",
+        f"visible_regions={fmt_intlike(_opspace_metric(rec, v_prefixes, 'visible_regions'))}",
+        f"visible_ops={fmt_intlike(_opspace_logical_ops(rec, v_prefixes))}",
+    ]
+    if _opspace_has_metric(rec, v_prefixes, 'gate_mass_mean'):
+        v_parts.append(
+            f"gate_mass={fmt_float(_opspace_metric(rec, v_prefixes, 'gate_mass_mean'), 2)}")
+    if _opspace_has_metric(rec, v_prefixes, 'relu_gate_count_mean'):
+        v_parts.append(
+            f"relu_active={fmt_float(_opspace_metric(rec, v_prefixes, 'relu_gate_count_mean'), 1)}")
+    if _opspace_has_metric(rec, v_prefixes, 'no_nan'):
+        v_parts.append(
+            f"no_nan={fmt_intlike(_opspace_metric(rec, v_prefixes, 'no_nan'))}")
+    log_message(" ".join(v_parts))
+
+    logical_ops = _opspace_logical_ops(rec, rst_prefix)
+    physical_ops = _opspace_physical_ops(rec, rst_prefix)
+    logical_compute = _opspace_compute_frac(
+        rec, rst_prefix, 'logical_compute_frac_vs_dense', logical_ops)
+    physical_compute = _opspace_compute_frac(
+        rec, rst_prefix, 'physical_compute_frac_vs_dense', physical_ops)
+    bucket_fill = _metric_float(
+        _opspace_metric(rec, rst_prefix, 'bucket_fill_mean'))
+    bucket_cap = _metric_float(
+        _opspace_metric(rec, rst_prefix, 'bucket_capacity'))
+    region_cap = _opspace_metric(
+        rec, rst_prefix, 'region_capacity',
+        default=_opspace_metric(rec, rst_prefix, 'bucket_capacity'))
+    capacity_regions = _metric_float(
+        _opspace_metric(rec, rst_prefix, 'regions_per_owner'))
+    bucket_total = None
+    if (bucket_fill is not None and bucket_cap is not None
+            and capacity_regions is not None and capacity_regions > 0.0):
+        bucket_total = bucket_cap * capacity_regions
+    if bucket_total is not None and bucket_total > 0.0:
+        bucket_part = (
+            f"bucket={fmt_intlike(bucket_fill)}/{fmt_intlike(bucket_total)}"
+            f" fill={fmt_pct(bucket_fill / bucket_total, 1)}")
+    else:
+        bucket_part = (
+            f"bucket_fill={fmt_intlike(bucket_fill)}"
+            f" fill=n/a")
+    log_message(
+        "  [opspace/rst]"
+        f" visible_regions={fmt_intlike(_opspace_metric(rec, rst_prefix, 'visible_regions'))}"
+        f" logical_ops={fmt_intlike(logical_ops)}"
+        f" physical_ops={fmt_intlike(physical_ops)}"
+        f" compute={fmt_pct(logical_compute, 2)}/{fmt_pct(physical_compute, 2)}"
+        f" {bucket_part}"
+        f" cap={fmt_intlike(region_cap)}"
+        f" accept={fmt_float(_opspace_metric(rec, rst_prefix, 'primary_accept_frac'), 3)}"
+        f" reroute={fmt_float(_opspace_metric(rec, rst_prefix, 'reroute_frac'), 3)}"
+        f" drop={fmt_float(_opspace_metric(rec, rst_prefix, 'semantic_drop_frac'), 6)}"
+        f" processed={fmt_intlike(_opspace_metric(rec, rst_prefix, 'processed_requests'))}/"
+        f"{fmt_intlike(_opspace_metric(rec, rst_prefix, 'selected_requests'))}"
+        f" all={fmt_intlike(_opspace_metric(rec, rst_prefix, 'all_processed'))}"
+        f" nan={fmt_intlike(_opspace_metric(rec, rst_prefix, 'no_nan'))}"
+        f" gate_mass={fmt_float(_opspace_metric(rec, rst_prefix, 'gate_mass_mean'), 2)}"
+        f" relu_active={fmt_float(_opspace_metric(rec, rst_prefix, 'relu_gate_count_mean'), 1)}"
+    )
+    for line in _opspace_warning_lines(rec):
+        log_message(line)
+    log_message(
+        "  [legacy/direct_tau_inactive] hidden for operation-space QK/V/RST")
+
+
 def _format_output_stab_line(rec, indent="  "):
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
@@ -10173,6 +10430,7 @@ def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4164 = _is_active_srw_version(ctx.get('model_version'))
     is_v4166 = _is_rw_key_srw_version(ctx.get('model_version'))
+    is_v4168 = str(ctx.get('model_version')) == V4168_MODEL_VERSION
     is_official_soft_direct_tau = _is_active_srw_version(ctx.get('model_version'))
     official_soft_sparsity_compact = False
 
@@ -10184,7 +10442,9 @@ def _print_regular_block(rec, ctx):
     def _g(key, default=0.0):
         return float(rec.get(key, default))
     opspace_active = (
-        is_v4164 and _g('opspace/attn_v/enabled', 0.0) > 0.5)
+        is_v4168 and (
+            bool(ctx.get('operation_space_enabled', False))
+            or _g('opspace/attn_v/enabled', 0.0) > 0.5))
     aux_note = (
         " aux_is_not_total_minus_ce"
         if is_official_soft_direct_tau
@@ -10196,6 +10456,9 @@ def _print_regular_block(rec, ctx):
         f"grad={rec['grad_norm']:.2f} | "
         f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
     )
+    if opspace_active:
+        _print_v4168_opspace_regular_block(rec)
+        _print_train_progress_line(rec, ctx)
     if is_v4164:
         if is_official_soft_direct_tau:
             if not opspace_active:
@@ -10215,44 +10478,7 @@ def _print_regular_block(rec, ctx):
                 f" admission_den_power={rec.get('admission_den_power', rec.get('den_power', 1.0)):.3f}"
                 if _is_active_srw_version(ctx.get('model_version'))
                 else "")
-            if opspace_active:
-                log_message(
-                    "  [opspace] qk/v/rst=tau_free_relu2 "
-                    "direct_tau_active=false "
-                    "selection_calibration_active=false"
-                )
-                for _label, _pool in (
-                        ('qk', 'qk'), ('v', 'attn_v'), ('rst', 'rst')):
-                    _region_part = (
-                        f" region_top1={_g(f'opspace/{_pool}/selected_region_top1_frac'):.2f}"
-                        if _label == 'rst' else "")
-                    _request_part = (
-                        f" selected_req={_g(f'opspace/{_pool}/selected_requests'):.0f}"
-                        f" processed_req={_g(f'opspace/{_pool}/processed_requests'):.0f}"
-                        f" all_processed={_g(f'opspace/{_pool}/all_processed'):.0f}"
-                        if _label == 'rst' else "")
-                    _bucket_part = (
-                        f" bucket_capacity={_g(f'opspace/{_pool}/bucket_capacity'):.0f}"
-                        f" bucket_fill={_g(f'opspace/{_pool}/bucket_fill_mean'):.1f}"
-                        f" primary_accept={_g(f'opspace/{_pool}/primary_accept_frac'):.3f}"
-                        f" reroute={_g(f'opspace/{_pool}/reroute_frac'):.3f}"
-                        f" overflow={_g(f'opspace/{_pool}/overflow_frac'):.6f}"
-                        f" no_nan={_g(f'opspace/{_pool}/no_nan'):.0f}"
-                        if _label == 'rst' else "")
-                    _selection_part = (
-                        f" visible_regions={_g(f'opspace/{_pool}/visible_regions'):.0f}"
-                        f" visible_ops_per_token={_g(f'opspace/{_pool}/visible_ops_per_token'):.0f}")
-                    log_message(
-                        f"  [opspace/{_label}]"
-                        f"{_selection_part}"
-                        f"{_region_part}"
-                        f"{_bucket_part}"
-                        f" gate=relu2"
-                        f" gate_mass={_g(f'opspace/{_pool}/gate_mass_mean'):.2f}"
-                        f" relu_gate_count={_g(f'opspace/{_pool}/relu_gate_count_mean'):.2f}"
-                        f"{_request_part}"
-                    )
-            else:
+            if not opspace_active:
                 log_message(
                     f"  {_soft_gate_label}: qk={rec['soft_gate_T_qk']:.6f}"
                     f" v={rec['soft_gate_T_v']:.6f}"
@@ -10282,12 +10508,7 @@ def _print_regular_block(rec, ctx):
     if is_v4164:
         _weight_label = 'admission'
         _select_status = ""
-        if opspace_active:
-            log_message(
-                "  [opspace] select: tile_mean_visibility "
-                "gate=relu2 denominator=max(sum(gate),1)^admission_den_power"
-            )
-        else:
+        if not opspace_active:
             log_message(
                 f"  select: tau[qk={rec['attn_qk_tau_mean']:.4f}"
                 f" v={rec['attn_v_tau_mean']:.4f}"
@@ -10333,7 +10554,8 @@ def _print_regular_block(rec, ctx):
                 f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
                 f" v={rec['attn_v_pool_scale']:.3f}"
                 f" rst={rec['rst_pool_scale']:.3f}")
-        if _is_active_srw_version(ctx.get('model_version')):
+        if (_is_active_srw_version(ctx.get('model_version'))
+                and not opspace_active):
             log_message(
                 f"  drive: "
                 f"qk[m={rec['attn_qk_drive_mean']:.5f}"
@@ -10381,7 +10603,7 @@ def _print_regular_block(rec, ctx):
                 f" top1={rec['rst_execution_top1_frac']:.3f}]"
                 f"{_pool_scale_part}"
             )
-        else:
+        elif not _is_active_srw_version(ctx.get('model_version')):
             log_message(
                 f"  gate_conc: qk[eff={rec['attn_qk_gate_eff_n']:.1f}"
                 f" ratio={rec['attn_qk_gate_eff_ratio']:.3f}"
@@ -10517,10 +10739,7 @@ def _print_regular_block(rec, ctx):
         log_message(_cap_window_line)
     if is_v4164:
         if opspace_active:
-            log_message(
-                "  [legacy/direct_tau_inactive] "
-                "tau/raw_tau/admission/drive metrics hidden for "
-                "operation-space QK/V/RST")
+            pass
         else:
             log_message(
                 f"  tau: tau_mean[qk={rec['attn_qk_tau_mean']:+.3f}"
@@ -10561,7 +10780,7 @@ def _print_regular_block(rec, ctx):
             f" v[min={v_raw_tau_min:+.2f} max={v_raw_tau_max:+.2f}]"
             f" rst[min={rst_raw_tau_min:+.2f} max={rst_raw_tau_max:+.2f}]"
         )
-    if is_v4166:
+    if is_v4166 and not opspace_active:
         log_message(
             f"  {route_std_label}[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
             f" | op_key_n rst[m={rec['rst_op_key_norm']:.2f} s={rec['rst_op_key_norm_std']:.2f}"
@@ -15687,6 +15906,8 @@ def main():
                         'total_micro_steps': total_micro_steps,
                         'progress': _progress,
                         'model_version': model_version,
+                        'operation_space_enabled':
+                            operation_space_tau_free_enabled,
                         'regular_console_level': regular_console_level,
                         'regular_console_host_timing':
                             regular_console_host_timing,
