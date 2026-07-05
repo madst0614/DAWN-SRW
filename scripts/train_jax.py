@@ -923,6 +923,30 @@ V4168_OPSPACE_FINAL_RESUME_REQUIRED_FIELDS = (
      'lane_output_mode'),
 )
 
+V4168_OPSPACE_REGION_BLOCK_RESUME_REQUIRED_FIELDS = (
+    ('training', 'operation_space', 'pools', 'rst', 'num_regions'),
+    ('training', 'operation_space', 'pools', 'rst', 'blocks_per_region'),
+    ('training', 'operation_space', 'pools', 'rst', 'operators_per_block'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'visible_regions_start'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'visible_regions_mid'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'visible_regions_final'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'visible_blocks_per_region'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'region_score_pooling'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'region_score_temperature'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'candidate_region_count'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'region_capacity_factor'),
+    ('training', 'operation_space', 'pools', 'rst',
+     'block_capacity_factor'),
+)
+
 
 def _missing_config_paths(cfg, paths):
     missing = []
@@ -999,9 +1023,15 @@ def _require_resume_materialized_fields(full_config):
         rst_cfg = (
             pools_cfg.get('rst', {})
             if isinstance(pools_cfg.get('rst', {}), dict) else {})
-        if str(rst_cfg.get('execution_mode', '')).lower() == (
-                'block_bucketed_pallas_final'):
+        rst_execution_mode = str(rst_cfg.get(
+            'execution_mode', '')).lower()
+        if rst_execution_mode in (
+                'block_bucketed_pallas_final',
+                'region_block_pallas'):
             required_fields.extend(V4168_OPSPACE_FINAL_RESUME_REQUIRED_FIELDS)
+        if rst_execution_mode == 'region_block_pallas':
+            required_fields.extend(
+                V4168_OPSPACE_REGION_BLOCK_RESUME_REQUIRED_FIELDS)
         repack_cfg = (
             opspace_cfg.get('repack', {})
             if isinstance(opspace_cfg.get('repack', {}), dict) else {})
@@ -1341,6 +1371,20 @@ def _v4168_validate_operation_space_shape(opspace):
         'assignment_policy',
         'high_regret_threshold',
         'lane_output_mode',
+        'num_regions',
+        'blocks_per_region',
+        'operators_per_block',
+        'visible_regions',
+        'visible_regions_start',
+        'visible_regions_mid',
+        'visible_regions_final',
+        'visible_blocks_per_region',
+        'candidate_region_count',
+        'region_score_pooling',
+        'region_score_temperature',
+        'region_capacity_factor',
+        'block_capacity_factor',
+        'block_mixing_enabled',
     }
     for label in ('qk', 'v', 'rst'):
         pool = pools.get(label, {})
@@ -1356,7 +1400,9 @@ def _v4168_validate_operation_space_shape(opspace):
                 "routing_mode, mode, execution_mode, lanes, k_exec, "
                 "exec_tiles_per_block, bucket_capacity_factor, "
                 "bucket_chunk_size, assignment_policy, "
-                "high_regret_threshold, and lane_output_mode; remove: "
+                "high_regret_threshold, lane_output_mode, and RST "
+                "region/block atlas fields including candidate/capacity "
+                "settings; remove: "
                 f"{', '.join(extra)}")
     repack = opspace.get('repack', {})
     if repack is None:
@@ -1434,34 +1480,49 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             raise ValueError(
                 f"training.operation_space.pools.{label}.mode must match "
                 "routing_mode when both are present.")
-        if routing_mode != 'factorized_lane_mean':
+        if label == 'rst' and routing_mode in (
+                'region_block', 'region_block_atlas_v1'):
+            pass
+        elif routing_mode != 'factorized_lane_mean':
             raise ValueError(
                 f"training.operation_space.pools.{label}.routing_mode must "
-                f"be 'factorized_lane_mean', got {routing_mode!r}.")
+                f"be 'factorized_lane_mean'"
+                f"{' or region_block' if label == 'rst' else ''}, "
+                f"got {routing_mode!r}.")
         execution_mode = str(pool.get(
             'execution_mode', defaults_i['execution_mode'])).strip().lower()
         valid_execution_modes = (
             'dense_masked',
             'block_bucketed_dense',
             'block_bucketed_pallas_final',
+            'region_block_pallas',
         )
         if execution_mode not in valid_execution_modes:
             raise ValueError(
                 f"training.operation_space.pools.{label}.execution_mode must "
                 "be 'dense_masked', 'block_bucketed_dense', or "
-                "'block_bucketed_pallas_final', got "
+                "'block_bucketed_pallas_final'/'region_block_pallas', got "
                 f"{execution_mode!r}.")
-        if execution_mode == 'block_bucketed_pallas_final' and label != 'rst':
+        if execution_mode in (
+                'block_bucketed_pallas_final',
+                'region_block_pallas') and label != 'rst':
             raise ValueError(
                 "training.operation_space.pools."
-                f"{label}.execution_mode=block_bucketed_pallas_final is "
+                f"{label}.execution_mode={execution_mode} is "
                 "only supported for the RST single-route backend.")
-        lanes = int(pool.get('lanes', defaults_i['lanes']))
+        lanes = int(pool.get(
+            'num_regions',
+            pool.get('lanes', defaults_i['lanes'])))
         if lanes <= 0:
             raise ValueError(
                 f"training.operation_space.pools.{label}.lanes must be > 0, "
                 f"got {lanes}.")
-        k_exec = pool.get('k_exec', defaults_i['k_exec'])
+        k_exec_default = defaults_i['k_exec']
+        if execution_mode == 'region_block_pallas':
+            k_exec_default = int(pool.get(
+                'visible_regions_final',
+                pool.get('visible_regions', 4)))
+        k_exec = pool.get('k_exec', k_exec_default)
         k_exec = int(k_exec)
         if k_exec <= 0 or k_exec > lanes:
             raise ValueError(
@@ -1473,31 +1534,169 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         if n_ops <= 0:
             raise ValueError(
                 f"model.{defaults_i['n_key']} must be > 0 for operation_space.")
-        raw_tiles = (n_ops + tile_size - 1) // tile_size
-        align = math.lcm(lanes, device_count)
-        total_tiles = _ceil_to_multiple(raw_tiles, align)
-        tiles_per_lane = total_tiles // lanes
-        exec_tiles_default = (
-            2 if execution_mode in (
-                'block_bucketed_dense',
-                'block_bucketed_pallas_final') else 1)
-        exec_tiles_per_block = int(pool.get(
-            'exec_tiles_per_block', exec_tiles_default))
-        if exec_tiles_per_block <= 0:
-            raise ValueError(
-                "training.operation_space.pools."
-                f"{label}.exec_tiles_per_block must be > 0, got "
-                f"{exec_tiles_per_block}.")
-        if tiles_per_lane % exec_tiles_per_block != 0:
-            raise ValueError(
-                "training.operation_space.pools."
-                f"{label}.exec_tiles_per_block={exec_tiles_per_block} must "
-                f"divide tiles_per_lane={tiles_per_lane}.")
-        blocks_per_lane = tiles_per_lane // exec_tiles_per_block
-        block_size = tile_size * exec_tiles_per_block
+        if execution_mode == 'region_block_pallas':
+            num_regions = lanes
+            blocks_per_region = int(pool.get('blocks_per_region', 2))
+            operators_per_block = int(pool.get('operators_per_block', 512))
+            if blocks_per_region <= 0:
+                raise ValueError(
+                    "training.operation_space.pools."
+                    f"{label}.blocks_per_region must be > 0, got "
+                    f"{blocks_per_region}.")
+            if operators_per_block <= 0:
+                raise ValueError(
+                    "training.operation_space.pools."
+                    f"{label}.operators_per_block must be > 0, got "
+                    f"{operators_per_block}.")
+            if operators_per_block % tile_size != 0:
+                raise ValueError(
+                    "training.operation_space.pools."
+                    f"{label}.operators_per_block={operators_per_block} "
+                    f"must be divisible by tile_size={tile_size}.")
+            if num_regions % device_count != 0:
+                raise ValueError(
+                    "training.operation_space.pools."
+                    f"{label}.num_regions={num_regions} must be divisible "
+                    f"by mesh_model={device_count}.")
+            total_capacity = (
+                num_regions * blocks_per_region * operators_per_block)
+            if n_ops > total_capacity:
+                raise ValueError(
+                    "training.operation_space.pools."
+                    f"{label} capacity {total_capacity} is smaller than "
+                    f"model.{defaults_i['n_key']}={n_ops}.")
+            exec_tiles_per_block = operators_per_block // tile_size
+            tiles_per_lane = blocks_per_region * exec_tiles_per_block
+            raw_tiles = (n_ops + tile_size - 1) // tile_size
+            total_tiles = num_regions * tiles_per_lane
+            blocks_per_lane = blocks_per_region
+            block_size = operators_per_block
+            visible_regions_start = int(pool.get(
+                'visible_regions_start', max(k_exec, 8)))
+            visible_regions_mid = int(pool.get(
+                'visible_regions_mid', max(k_exec, 6)))
+            visible_regions_final = int(pool.get(
+                'visible_regions_final', k_exec))
+            visible_regions = int(pool.get(
+                'visible_regions', visible_regions_final))
+            visible_blocks_per_region = int(pool.get(
+                'visible_blocks_per_region', 1))
+            if not (
+                    1 <= visible_regions_final <= visible_regions_mid
+                    <= visible_regions_start <= num_regions):
+                raise ValueError(
+                    "training.operation_space.pools.rst visible region "
+                    "schedule must satisfy 1 <= final <= mid <= start <= "
+                    f"num_regions; got start={visible_regions_start}, "
+                    f"mid={visible_regions_mid}, "
+                    f"final={visible_regions_final}, "
+                    f"num_regions={num_regions}.")
+            if visible_regions != visible_regions_final:
+                raise ValueError(
+                    "training.operation_space.pools.rst.visible_regions is "
+                    "a legacy alias and must match visible_regions_final.")
+            if k_exec != visible_regions_final:
+                raise ValueError(
+                    "training.operation_space.pools.rst.k_exec is a legacy "
+                    "alias and must match visible_regions_final.")
+            if visible_blocks_per_region != 1:
+                raise ValueError(
+                    "training.operation_space.pools.rst."
+                    "visible_blocks_per_region must be 1 for the first "
+                    "region_block_pallas implementation.")
+            region_score_pooling = str(pool.get(
+                'region_score_pooling', 'smoothmax')).strip().lower()
+            if region_score_pooling != 'smoothmax':
+                raise ValueError(
+                    "training.operation_space.pools.rst."
+                    "region_score_pooling must be 'smoothmax'.")
+            region_score_temperature = float(pool.get(
+                'region_score_temperature', 0.25))
+            if region_score_temperature <= 0.0:
+                raise ValueError(
+                    "training.operation_space.pools.rst."
+                    "region_score_temperature must be > 0, got "
+                    f"{region_score_temperature}.")
+            block_mixing_enabled = _cfg_bool(pool.get(
+                'block_mixing_enabled', False),
+                name='training.operation_space.pools.rst.block_mixing_enabled')
+            if block_mixing_enabled:
+                raise ValueError(
+                    "training.operation_space.pools.rst."
+                    "block_mixing_enabled must remain false for the first "
+                    "region_block_pallas implementation.")
+            candidate_region_count = int(pool.get(
+                'candidate_region_count',
+                max(visible_regions_final, 8)))
+            if not (
+                    visible_regions_final <= candidate_region_count
+                    <= num_regions):
+                raise ValueError(
+                    "training.operation_space.pools.rst."
+                    "candidate_region_count must satisfy "
+                    "visible_regions_final <= candidate_region_count <= "
+                    f"num_regions; got visible_regions_final="
+                    f"{visible_regions_final}, candidate_region_count="
+                    f"{candidate_region_count}, num_regions={num_regions}.")
+            region_capacity_factor = float(pool.get(
+                'region_capacity_factor',
+                pool.get('bucket_capacity_factor', 1.25)))
+            if region_capacity_factor <= 0.0:
+                raise ValueError(
+                    "training.operation_space.pools.rst."
+                    "region_capacity_factor must be > 0, got "
+                    f"{region_capacity_factor}.")
+            block_capacity_factor = float(pool.get(
+                'block_capacity_factor',
+                pool.get('bucket_capacity_factor', 1.25)))
+            if block_capacity_factor <= 0.0:
+                raise ValueError(
+                    "training.operation_space.pools.rst."
+                    "block_capacity_factor must be > 0, got "
+                    f"{block_capacity_factor}.")
+        else:
+            num_regions = lanes
+            raw_tiles = (n_ops + tile_size - 1) // tile_size
+            align = math.lcm(lanes, device_count)
+            total_tiles = _ceil_to_multiple(raw_tiles, align)
+            tiles_per_lane = total_tiles // lanes
+            exec_tiles_default = (
+                2 if execution_mode in (
+                    'block_bucketed_dense',
+                    'block_bucketed_pallas_final') else 1)
+            exec_tiles_per_block = int(pool.get(
+                'exec_tiles_per_block', exec_tiles_default))
+            if exec_tiles_per_block <= 0:
+                raise ValueError(
+                    "training.operation_space.pools."
+                    f"{label}.exec_tiles_per_block must be > 0, got "
+                    f"{exec_tiles_per_block}.")
+            if tiles_per_lane % exec_tiles_per_block != 0:
+                raise ValueError(
+                    "training.operation_space.pools."
+                    f"{label}.exec_tiles_per_block={exec_tiles_per_block} "
+                    f"must divide tiles_per_lane={tiles_per_lane}.")
+            blocks_per_lane = tiles_per_lane // exec_tiles_per_block
+            block_size = tile_size * exec_tiles_per_block
+            blocks_per_region = blocks_per_lane
+            operators_per_block = block_size
+            visible_regions_start = k_exec
+            visible_regions_mid = k_exec
+            visible_regions_final = k_exec
+            visible_regions = k_exec
+            visible_blocks_per_region = 1
+            region_score_pooling = 'smoothmax'
+            region_score_temperature = 0.25
+            block_mixing_enabled = False
+            candidate_region_count = k_exec
+            region_capacity_factor = 1.25
+            block_capacity_factor = 1.25
         bucket_capacity_factor = float(pool.get(
             'bucket_capacity_factor',
-            1.5 if execution_mode == 'block_bucketed_pallas_final'
+            block_capacity_factor if execution_mode == 'region_block_pallas'
+            else 1.5 if execution_mode in (
+                'block_bucketed_pallas_final',
+                'region_block_pallas')
             else 1.25))
         if bucket_capacity_factor <= 0.0:
             raise ValueError(
@@ -1506,7 +1705,9 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 f"{bucket_capacity_factor}.")
         bucket_chunk_size = int(pool.get(
             'bucket_chunk_size',
-            128 if execution_mode == 'block_bucketed_pallas_final' else 1024))
+            128 if execution_mode in (
+                'block_bucketed_pallas_final',
+                'region_block_pallas') else 1024))
         if bucket_chunk_size <= 0:
             raise ValueError(
                 "training.operation_space.pools."
@@ -1515,14 +1716,18 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         assignment_policy = str(pool.get(
             'assignment_policy',
             'low_regret'
-            if execution_mode == 'block_bucketed_pallas_final'
+            if execution_mode in (
+                'block_bucketed_pallas_final',
+                'region_block_pallas')
             else 'token_order')).strip().lower()
-        if execution_mode == 'block_bucketed_pallas_final' and (
+        if execution_mode in (
+                'block_bucketed_pallas_final',
+                'region_block_pallas') and (
                 assignment_policy != 'low_regret'):
             raise ValueError(
                 "training.operation_space.pools."
                 f"{label}.assignment_policy must be 'low_regret' for "
-                "block_bucketed_pallas_final.")
+                f"{execution_mode}.")
         high_regret_threshold = float(pool.get(
             'high_regret_threshold', 0.05))
         if high_regret_threshold < 0.0:
@@ -1533,20 +1738,38 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         lane_output_mode = str(pool.get(
             'lane_output_mode',
             'lane_local'
-            if execution_mode == 'block_bucketed_pallas_final'
+            if execution_mode in (
+                'block_bucketed_pallas_final',
+                'region_block_pallas')
             else 'scatter_add')).strip().lower()
-        if execution_mode == 'block_bucketed_pallas_final' and (
+        if execution_mode in (
+                'block_bucketed_pallas_final',
+                'region_block_pallas') and (
                 lane_output_mode != 'lane_local'):
             raise ValueError(
                 "training.operation_space.pools."
                 f"{label}.lane_output_mode must be 'lane_local' for "
-                "block_bucketed_pallas_final.")
+                f"{execution_mode}.")
         layouts[label] = {
             'routing_mode': routing_mode,
             'mode': routing_mode,
             'execution_mode': execution_mode,
             'lanes': lanes,
             'k_exec': k_exec,
+            'num_regions': num_regions,
+            'blocks_per_region': blocks_per_region,
+            'operators_per_block': operators_per_block,
+            'visible_regions': visible_regions,
+            'visible_regions_start': visible_regions_start,
+            'visible_regions_mid': visible_regions_mid,
+            'visible_regions_final': visible_regions_final,
+            'visible_blocks_per_region': visible_blocks_per_region,
+            'region_score_pooling': region_score_pooling,
+            'region_score_temperature': region_score_temperature,
+            'block_mixing_enabled': block_mixing_enabled,
+            'candidate_region_count': candidate_region_count,
+            'region_capacity_factor': region_capacity_factor,
+            'block_capacity_factor': block_capacity_factor,
             'tile_size': tile_size,
             'raw_tiles': raw_tiles,
             'total_tiles': total_tiles,
@@ -1579,10 +1802,12 @@ def _v4168_operation_space_repack_config(training_cfg, model_cfg,
         raise ValueError(
             "training.operation_space.enabled is only supported for "
             f"{V4168_MODEL_VERSION}.")
-    if operation_space_enabled and version not in ('', 'fixed_k4_repack_v1'):
+    if operation_space_enabled and version not in (
+            '', 'fixed_k4_repack_v1', 'region_block_atlas_v1'):
         raise ValueError(
             "training.operation_space.version is an optional compatibility "
-            f"label and may only be 'fixed_k4_repack_v1', got {version!r}.")
+            "label and may only be 'fixed_k4_repack_v1' or "
+            f"'region_block_atlas_v1', got {version!r}.")
     if operation_space_enabled and (
             _cfg_bool(training_cfg.get('hardware_repack_enabled', False),
                       name='training.hardware_repack_enabled')
@@ -6631,6 +6856,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             for _name in _V4168_OPSPACE_FINAL_RUNTIME_DIAG_NAMES:
                 _key = f'opspace/{_pool}/final/{_name}'
                 metrics[_key] = result.get(_key, jnp.float32(0.0))
+        for _pool in ('attn_v', 'rst'):
+            for _name in _V4168_OPSPACE_FINAL_RUNTIME_DIAG_NAMES:
+                _alias_key = f'opspace/{_pool}/{_name}'
+                _final_key = f'opspace/{_pool}/final/{_name}'
+                if _alias_key not in metrics:
+                    metrics[_alias_key] = result.get(
+                        _alias_key,
+                        result.get(_final_key, jnp.float32(0.0)))
         for _pool in ('attn_qk', 'attn_v'):
             for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
                 _fallback = result.get(
@@ -10084,8 +10317,8 @@ def _print_regular_block(rec, ctx):
                 )
                 for _label, _pool in (
                         ('qk', 'qk'), ('v', 'attn_v'), ('rst', 'rst')):
-                    _lane_part = (
-                        f" lane_top1={_g(f'opspace/{_pool}/selected_lane_top1_frac'):.2f}"
+                    _region_part = (
+                        f" region_top1={_g(f'opspace/{_pool}/selected_region_top1_frac'):.2f}"
                         if _label == 'rst' else "")
                     _request_part = (
                         f" selected_req={_g(f'opspace/{_pool}/selected_requests'):.0f}"
@@ -10104,7 +10337,7 @@ def _print_regular_block(rec, ctx):
                         f"  [opspace/{_label}]"
                         f" k_exec={_g(f'opspace/{_pool}/k_exec'):.0f}"
                         f" exec_slots={_g(f'opspace/{_pool}/exec_slots'):.0f}"
-                        f"{_lane_part}"
+                        f"{_region_part}"
                         f"{_bucket_part}"
                         f" gate=relu2"
                         f" gate_mass={_g(f'opspace/{_pool}/gate_mass_mean'):.2f}"
@@ -12405,18 +12638,69 @@ def main():
                     'bucket_capacity_factor',
                     1.5 if str(_layout.get(
                         'execution_mode', 'dense_masked')).lower()
-                    == 'block_bucketed_pallas_final' else 1.25)),
+                    in ('block_bucketed_pallas_final',
+                        'region_block_pallas') else 1.25)),
                 'bucket_chunk_size': int(_layout.get(
                     'bucket_chunk_size',
                     128 if str(_layout.get(
                         'execution_mode', 'dense_masked')).lower()
-                    == 'block_bucketed_pallas_final' else 1024)),
+                    in ('block_bucketed_pallas_final',
+                        'region_block_pallas') else 1024)),
                 'assignment_policy': str(_layout.get(
                     'assignment_policy', 'low_regret')).lower(),
                 'high_regret_threshold': float(_layout.get(
                     'high_regret_threshold', 0.05)),
                 'lane_output_mode': str(_layout.get(
                     'lane_output_mode', 'lane_local')).lower(),
+                'num_regions': int(_layout.get(
+                    'num_regions', _layout.get(
+                        'lanes', 32 if _label == 'rst' else 8))),
+                'blocks_per_region': int(_layout.get(
+                    'blocks_per_region', _layout.get(
+                        'blocks_per_lane', 1))),
+                'operators_per_block': int(_layout.get(
+                    'operators_per_block', _layout.get(
+                        'block_size', _layout.get(
+                            'tile_size', 128)))),
+                'visible_regions': int(_layout.get(
+                    'visible_regions', _layout.get(
+                        'visible_regions_final', _layout.get(
+                            'k_exec', 32 if _label == 'rst' else (
+                                5 if _label == 'v' else 4))))),
+                'visible_regions_start': int(_layout.get(
+                    'visible_regions_start', _layout.get(
+                        'k_exec', 32 if _label == 'rst' else (
+                            5 if _label == 'v' else 4)))),
+                'visible_regions_mid': int(_layout.get(
+                    'visible_regions_mid', _layout.get(
+                        'k_exec', 32 if _label == 'rst' else (
+                            5 if _label == 'v' else 4)))),
+                'visible_regions_final': int(_layout.get(
+                    'visible_regions_final', _layout.get(
+                        'k_exec', 32 if _label == 'rst' else (
+                            5 if _label == 'v' else 4)))),
+                'visible_blocks_per_region': int(_layout.get(
+                    'visible_blocks_per_region', 1)),
+                'region_score_pooling': str(_layout.get(
+                    'region_score_pooling', 'smoothmax')).lower(),
+                'region_score_temperature': float(_layout.get(
+                    'region_score_temperature', 0.25)),
+                'block_mixing_enabled': bool(_layout.get(
+                    'block_mixing_enabled', False)),
+                'candidate_region_count': int(_layout.get(
+                    'candidate_region_count',
+                    max(int(_layout.get(
+                        'visible_regions_final', _layout.get(
+                            'k_exec', 32 if _label == 'rst' else (
+                                5 if _label == 'v' else 4)))), 8)
+                    if _label == 'rst' else int(_layout.get(
+                        'k_exec', 32 if _label == 'rst' else (
+                            5 if _label == 'v' else 4))))),
+                'region_capacity_factor': float(_layout.get(
+                    'region_capacity_factor', 1.25)),
+                'block_capacity_factor': float(_layout.get(
+                    'block_capacity_factor',
+                    _layout.get('bucket_capacity_factor', 1.25))),
             }
 
         def _opspace_materialized_max_swaps(_label):
@@ -13012,10 +13296,39 @@ def main():
                 _layout = _opspace_layouts.get(_label, {})
                 if not isinstance(_layout, dict):
                     _layout = {}
+                _execution = str(_layout.get(
+                    'execution_mode', 'unknown')).lower()
+                if _execution == 'region_block_pallas':
+                    _visible_ops = (
+                        int(_layout.get('visible_regions_final', 0))
+                        * int(_layout.get('visible_blocks_per_region', 1))
+                        * int(_layout.get('operators_per_block', 0)))
+                    return (
+                        f"[opspace/{_label}] "
+                        f"routing={_layout.get('routing_mode', 'unknown')} "
+                        f"execution={_execution} "
+                        f"regions={int(_layout.get('num_regions', 0))} "
+                        f"blocks_per_region="
+                        f"{int(_layout.get('blocks_per_region', 0))} "
+                        f"operators_per_block="
+                        f"{int(_layout.get('operators_per_block', 0))} "
+                        f"visible_regions="
+                        f"{int(_layout.get('visible_regions_final', 0))} "
+                        f"visible_blocks_per_region="
+                        f"{int(_layout.get('visible_blocks_per_region', 0))} "
+                        f"visible_ops_per_token={_visible_ops} "
+                        f"candidate_regions="
+                        f"{int(_layout.get('candidate_region_count', 0))} "
+                        f"region_capacity_factor="
+                        f"{float(_layout.get('region_capacity_factor', 1.25))} "
+                        f"block_capacity_factor="
+                        f"{float(_layout.get('block_capacity_factor', 1.25))} "
+                        f"region_score={_layout.get('region_score_pooling', 'smoothmax')}"
+                    )
                 _line = (
                     f"[opspace/{_label}] "
                     f"routing={_layout.get('routing_mode', 'unknown')} "
-                    f"execution={_layout.get('execution_mode', 'unknown')} "
+                    f"execution={_execution} "
                     f"lanes={int(_layout.get('lanes', 0))} "
                     f"k_exec={int(_layout.get('k_exec', 0))} "
                     f"tile_size={int(_layout.get('tile_size', 0))} "
@@ -13794,18 +14107,60 @@ def main():
                     'bucket_capacity_factor',
                     1.5 if str(layout.get(
                         'execution_mode', 'dense_masked')).lower()
-                    == 'block_bucketed_pallas_final' else 1.25)),
+                    in ('block_bucketed_pallas_final',
+                        'region_block_pallas') else 1.25)),
                 'opspace_bucket_chunk_size': int(layout.get(
                     'bucket_chunk_size',
                     128 if str(layout.get(
                         'execution_mode', 'dense_masked')).lower()
-                    == 'block_bucketed_pallas_final' else 1024)),
+                    in ('block_bucketed_pallas_final',
+                        'region_block_pallas') else 1024)),
                 'opspace_assignment_policy': str(layout.get(
                     'assignment_policy', 'low_regret')).lower(),
                 'opspace_high_regret_threshold': float(layout.get(
                     'high_regret_threshold', 0.05)),
                 'opspace_lane_output_mode': str(layout.get(
                     'lane_output_mode', 'lane_local')).lower(),
+                'opspace_candidate_region_count': int(layout.get(
+                    'candidate_region_count',
+                    max(int(layout.get(
+                        'visible_regions_final', layout.get(
+                            'k_exec', {'qk': 4, 'v': 5, 'rst': 32}[pool]))),
+                        8) if pool == 'rst' else int(layout.get(
+                            'k_exec', {'qk': 4, 'v': 5, 'rst': 32}[pool])))),
+                'opspace_region_capacity_factor': float(layout.get(
+                    'region_capacity_factor', 1.25)),
+                'opspace_block_capacity_factor': float(layout.get(
+                    'block_capacity_factor',
+                    layout.get('bucket_capacity_factor', 1.25))),
+                'opspace_num_regions': int(layout.get(
+                    'num_regions', layout.get(
+                        'lanes', 32 if pool == 'rst' else 8))),
+                'opspace_blocks_per_region': int(layout.get(
+                    'blocks_per_region', layout.get(
+                        'blocks_per_lane', 1))),
+                'opspace_operators_per_block': int(layout.get(
+                    'operators_per_block', layout.get(
+                        'block_size', layout.get(
+                            'tile_size', _opspace_cfg.get(
+                                'tile_size', 128))))),
+                'opspace_visible_regions_start': int(layout.get(
+                    'visible_regions_start', layout.get(
+                        'k_exec', {'qk': 4, 'v': 5, 'rst': 32}[pool]))),
+                'opspace_visible_regions_mid': int(layout.get(
+                    'visible_regions_mid', layout.get(
+                        'k_exec', {'qk': 4, 'v': 5, 'rst': 32}[pool]))),
+                'opspace_visible_regions_final': int(layout.get(
+                    'visible_regions_final', layout.get(
+                        'k_exec', {'qk': 4, 'v': 5, 'rst': 32}[pool]))),
+                'opspace_visible_blocks_per_region': int(layout.get(
+                    'visible_blocks_per_region', 1)),
+                'opspace_region_score_pooling': str(layout.get(
+                    'region_score_pooling', 'smoothmax')).lower(),
+                'opspace_region_score_temperature': float(layout.get(
+                    'region_score_temperature', 0.25)),
+                'opspace_block_mixing_enabled': bool(layout.get(
+                    'block_mixing_enabled', False)),
             }
 
         def _srw_pool_kwargs(pool):
@@ -14048,10 +14403,75 @@ def main():
                     _rst_block_active = _rst_backend == 'block_bucketed_dense'
                     _rst_bucketed_active = _rst_backend in (
                         'block_bucketed_dense',
-                        'block_bucketed_pallas_final')
+                        'block_bucketed_pallas_final',
+                        'region_block_pallas')
                     _rst_block_flag = str(bool(_rst_block_active)).lower()
                     _rst_bucketed_flag = str(bool(
                         _rst_bucketed_active)).lower()
+                    if _rst_backend == 'region_block_pallas':
+                        _rst_visible_regions = int(_rst_layout.get(
+                            'visible_regions_final', _rst_k))
+                        _rst_visible_blocks_per_region = int(
+                            _rst_layout.get('visible_blocks_per_region', 1))
+                        _rst_ops_per_block = int(_rst_layout.get(
+                            'operators_per_block', _rst_block_size))
+                        _rst_region_summary = (
+                            f"[opspace/rst] regions="
+                            f"{int(_rst_layout.get('num_regions', _rst_lanes))} "
+                            f"routing={_rst_layout.get('routing_mode', 'unknown')} "
+                            f"execution={_rst_backend} "
+                            f"blocks_per_region="
+                            f"{int(_rst_layout.get('blocks_per_region', _rst_blocks_per_lane))} "
+                            f"operators_per_block={_rst_ops_per_block} "
+                            f"visible_regions={_rst_visible_regions} "
+                            f"visible_blocks_per_region="
+                            f"{_rst_visible_blocks_per_region} "
+                            f"visible_ops_per_token="
+                            f"{_rst_visible_regions * _rst_visible_blocks_per_region * _rst_ops_per_block} "
+                            f"candidate_regions="
+                            f"{int(_rst_layout.get('candidate_region_count', 0))} "
+                            f"region_capacity_factor="
+                            f"{float(_rst_layout.get('region_capacity_factor', 1.25))} "
+                            f"block_capacity_factor="
+                            f"{float(_rst_layout.get('block_capacity_factor', 1.25))} "
+                            f"region_score="
+                            f"{_rst_layout.get('region_score_pooling', 'smoothmax')}")
+                        _rst_request_summary = (
+                            f"[opspace/rst] local_regions={_rst_local_lanes} "
+                            f"local_blocks={_rst_local_lanes * _rst_blocks_per_lane} "
+                            f"requests_per_token_global={_rst_visible_regions}")
+                        _rst_backend_summary = (
+                            f"[opspace/rst] backend={_rst_backend} "
+                            "region_block_atlas=true")
+                        _rst_block_layout_summary = (
+                            f"[opspace/rst] blocks_per_region="
+                            f"{int(_rst_layout.get('blocks_per_region', _rst_blocks_per_lane))} "
+                            f"operators_per_block={_rst_ops_per_block}")
+                    else:
+                        _rst_region_summary = (
+                            f"[opspace/rst] lanes={_rst_lanes} "
+                            f"routing={_rst_layout.get('routing_mode', 'unknown')} "
+                            f"execution={_rst_backend} "
+                            f"k_exec={_rst_k} "
+                            f"tiles={_rst_tiles} "
+                            f"tiles_per_lane={_rst_tpl} "
+                            f"tile_size={_tile} "
+                            f"exec_tiles_per_block={_rst_exec_tiles} "
+                            f"block_size={_rst_block_size} "
+                            f"blocks_per_lane={_rst_blocks_per_lane} "
+                            "gate=relu2")
+                        _rst_request_summary = (
+                            f"[opspace/rst] local_lanes={_rst_local_lanes} "
+                            f"local_blocks={_rst_local_lanes * _rst_blocks_per_lane} "
+                            f"requests_per_token_local={_rst_local_lanes} "
+                            f"requests_per_token_global={_rst_lanes}")
+                        _rst_backend_summary = (
+                            f"[opspace/rst] backend={_rst_backend} "
+                            f"regional_dense={_rst_block_flag}")
+                        _rst_block_layout_summary = (
+                            f"[opspace/rst] exec_tiles_per_block={_rst_exec_tiles} "
+                            f"block_size={_rst_block_size} "
+                            f"blocks_per_lane={_rst_blocks_per_lane}")
                     print(
                         "[opspace] v4168 tau-free operation-space active\n"
                         "[opspace] routing/execution split enabled\n"
@@ -14080,30 +14500,14 @@ def main():
                         f"tiles_per_lane={int(_v_layout.get('tiles_per_lane', 12))} "
                         f"exec_slots={int(_v_layout.get('k_exec', 5)) * int(_v_layout.get('block_size', _tile))} "
                         "gate=relu2\n"
-                        f"[opspace/rst] lanes={_rst_lanes} "
-                        f"routing={_rst_layout.get('routing_mode', 'unknown')} "
-                        f"execution={_rst_backend} "
-                        f"k_exec={_rst_k} "
-                        f"tiles={_rst_tiles} "
-                        f"tiles_per_lane={_rst_tpl} "
-                        f"tile_size={_tile} "
-                        f"exec_tiles_per_block={_rst_exec_tiles} "
-                        f"block_size={_rst_block_size} "
-                        f"blocks_per_lane={_rst_blocks_per_lane} "
-                        "gate=relu2\n"
-                        f"[opspace/rst] local_lanes={_rst_local_lanes} "
-                        f"local_blocks={_rst_local_lanes * _rst_blocks_per_lane} "
-                        f"requests_per_token_local={_rst_local_lanes} "
-                        f"requests_per_token_global={_rst_lanes}\n"
-                        f"[opspace/rst] backend={_rst_backend} regional_dense={_rst_block_flag}\n"
+                        f"{_rst_region_summary}\n"
+                        f"{_rst_request_summary}\n"
+                        f"{_rst_backend_summary}\n"
                         "[opspace/rst] token_request_grouping=false old_grouped_sparse=false\n"
                         f"[opspace/rst] bucketed_execution={_rst_bucketed_flag} bucket_chunked={_rst_bucketed_flag}\n"
-                        f"[opspace/rst] exec_tiles_per_block={_rst_exec_tiles} "
-                        f"block_size={_rst_block_size} "
-                        f"blocks_per_lane={_rst_blocks_per_lane}\n"
+                        f"{_rst_block_layout_summary}\n"
                         f"  operation_space_repack_enabled={operation_space_repack_enabled}\n"
                         "  vq_repack_used=false\n"
-                        "  sector_overflow_execution_used=false\n"
                         "[opspace] active path verified:\n"
                         f"  qk.routing={_qk_layout.get('routing_mode', 'unknown')}\n"
                         f"  qk.execution={_qk_backend}\n"
@@ -15033,7 +15437,7 @@ def main():
             _rst_runtime_layout = {}
         _rst_final_backend_enabled = (
             str(_rst_runtime_layout.get('execution_mode', '')).lower()
-            == 'block_bucketed_pallas_final')
+            in ('block_bucketed_pallas_final', 'region_block_pallas'))
 
     # ----------------------------------------------------------
     if is_host0:
@@ -15280,16 +15684,20 @@ def main():
             if _rst_final_backend_enabled:
                 _rst_final_guard = jax.device_get({
                     'semantic_drop_frac': metrics.get(
-                        'opspace/rst/final/semantic_drop_frac',
-                        jnp.float32(0.0)),
+                        'opspace/rst/semantic_drop_frac',
+                        metrics.get(
+                            'opspace/rst/final/semantic_drop_frac',
+                            jnp.float32(0.0))),
                     'all_processed': metrics.get(
                         'opspace/rst/all_processed', jnp.float32(1.0)),
                     'unresolved_after_rank_pass_count': metrics.get(
                         'opspace/rst/final/unresolved_after_rank_pass_count',
                         jnp.float32(0.0)),
                     'assignment_collision_count': metrics.get(
-                        'opspace/rst/final/assignment_collision_count',
-                        jnp.float32(0.0)),
+                        'opspace/rst/assignment_collision_count',
+                        metrics.get(
+                            'opspace/rst/final/assignment_collision_count',
+                            jnp.float32(0.0))),
                 })
                 _rst_semantic_drop = float(
                     _rst_final_guard['semantic_drop_frac'])
@@ -15297,9 +15705,9 @@ def main():
                     _rst_final_guard['all_processed'])
                 if _rst_semantic_drop > 0.0 or _rst_all_processed < 1.0:
                     raise RuntimeError(
-                        "block_bucketed_pallas_final RST fail-loud guard "
+                        "region/block RST fail-loud guard "
                         f"at epoch {epoch}, step {global_step + 1}: "
-                        f"opspace/rst/final/semantic_drop_frac="
+                        f"opspace/rst/semantic_drop_frac="
                         f"{_rst_semantic_drop:.9g}, "
                         f"opspace/rst/all_processed="
                         f"{_rst_all_processed:.9g}, "

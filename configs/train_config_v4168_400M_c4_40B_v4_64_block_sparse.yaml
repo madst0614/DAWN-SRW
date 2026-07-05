@@ -49,6 +49,7 @@ training:
 
   operation_space:
     enabled: true
+    version: region_block_atlas_v1
     tile_size: 128
 
     pools:
@@ -65,11 +66,21 @@ training:
         k_exec: 5
 
       rst:
-        routing_mode: factorized_lane_mean
-        execution_mode: block_bucketed_dense
-        lanes: 32
-        k_exec: 32
-        exec_tiles_per_block: 4
+        routing_mode: region_block
+        execution_mode: region_block_pallas
+        num_regions: 32
+        blocks_per_region: 2
+        operators_per_block: 512
+        visible_regions_start: 8
+        visible_regions_mid: 6
+        visible_regions_final: 4
+        visible_blocks_per_region: 1
+        candidate_region_count: 8
+        region_score_pooling: smoothmax
+        region_score_temperature: 0.25
+        region_capacity_factor: 1.25
+        block_capacity_factor: 1.25
+        block_mixing_enabled: false
 
     repack:
       enabled: false
@@ -83,4 +94,4 @@ training:
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_v4_64_tau_free_relu_opspace
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_v4_64_region_block_atlas
