@@ -11834,7 +11834,8 @@ def main():
                 soft_gate_t_power, soft_gate_t_gompertz_center,
                 soft_gate_t_gompertz_steepness)
             soft_gate_effective_active_eps = float(
-                saved_training_config['soft_gate_effective_active_eps'])
+                saved_training_config.get(
+                    'soft_gate_effective_active_eps', 1.0e-6))
             regular_console_level = str(saved_training_config.get(
                 'regular_console_level', regular_console_level)).lower()
             if regular_console_level not in ('compact', 'full'):
@@ -11899,7 +11900,8 @@ def main():
                 admission_den_power = float(
                     saved_training_config['admission_den_power'])
                 admission_den_grad_scale = float(
-                    saved_training_config['admission_den_grad_scale'])
+                    saved_training_config.get(
+                        'admission_den_grad_scale', 1.0))
             pool_weight_decay = 0.0
             div_weight = 0.0
             lb_weight = 0.0
