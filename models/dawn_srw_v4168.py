@@ -4032,37 +4032,64 @@ def _opspace_execute_bucket_chunk_pallas(
         route_dims = jnp.arange(d_route, dtype=jnp.int32)
         model_dims = jnp.arange(D, dtype=jnp.int32)
         op_ids = jnp.arange(block_size, dtype=jnp.int32)
+        lane_slots = jnp.broadcast_to(lane, (bucket_chunk_size,))
+        block_slots = jnp.broadcast_to(block, (bucket_chunk_size,))
+        lane_route = jnp.broadcast_to(lane, (block_size, d_route))
+        block_route = jnp.broadcast_to(block, (block_size, d_route))
+        op_route = jnp.broadcast_to(op_ids[:, None], (block_size, d_route))
+        route_idx = jnp.broadcast_to(route_dims[None, :], (block_size, d_route))
+        lane_model = jnp.broadcast_to(lane, (block_size, D))
+        block_model = jnp.broadcast_to(block, (block_size, D))
+        op_model = jnp.broadcast_to(op_ids[:, None], (block_size, D))
+        model_idx = jnp.broadcast_to(model_dims[None, :], (block_size, D))
+        lane_ops = jnp.broadcast_to(lane, (block_size,))
+        block_ops = jnp.broadcast_to(block, (block_size,))
+        out_slots = jnp.broadcast_to(slots[:, None], (bucket_chunk_size, D))
+        out_dims = jnp.broadcast_to(model_dims[None, :], (bucket_chunk_size, D))
+        out_zero_col = jnp.zeros_like(slots)
 
         bucket_fill_i = pl.load(bucket_fill_ref, (lane, block))
         slot_in_range = bucket_slots < bucket_padded_capacity
         token_ids = pl.load(
-            token_id_bucket_ref, (lane, block, bucket_slots),
+            token_id_bucket_ref, (lane_slots, block_slots, bucket_slots),
             mask=slot_in_range, other=jnp.int32(0))
         valid_slots = pl.load(
-            bucket_valid_ref, (lane, block, bucket_slots),
+            bucket_valid_ref, (lane_slots, block_slots, bucket_slots),
             mask=slot_in_range, other=False)
         valid_slots = jnp.logical_and(valid_slots, bucket_slots < bucket_fill_i)
         safe_token_ids = jnp.where(valid_slots, token_ids, jnp.int32(0))
         valid_slots_f = valid_slots.astype(jnp.float32)
+        h_token_idx = jnp.broadcast_to(
+            safe_token_ids[:, None], (bucket_chunk_size, d_route))
+        h_dim_idx = jnp.broadcast_to(
+            route_dims[None, :], (bucket_chunk_size, d_route))
+        h_valid_mask = jnp.broadcast_to(
+            valid_slots[:, None], (bucket_chunk_size, d_route))
+        x_token_idx = jnp.broadcast_to(
+            safe_token_ids[:, None], (bucket_chunk_size, D))
+        x_dim_idx = jnp.broadcast_to(
+            model_dims[None, :], (bucket_chunk_size, D))
+        x_valid_mask = jnp.broadcast_to(
+            valid_slots[:, None], (bucket_chunk_size, D))
 
         h_chunk = pl.load(
             flat_h_ref,
-            (safe_token_ids[:, None], route_dims[None, :]),
-            mask=valid_slots[:, None], other=jnp.float32(0.0))
+            (h_token_idx, h_dim_idx),
+            mask=h_valid_mask, other=jnp.float32(0.0))
         x_chunk = pl.load(
             flat_x_ref,
-            (safe_token_ids[:, None], model_dims[None, :]),
-            mask=valid_slots[:, None], other=jnp.float32(0.0))
+            (x_token_idx, x_dim_idx),
+            mask=x_valid_mask, other=jnp.float32(0.0))
         key_block = pl.load(
             key_blocks_ref,
-            (lane, block, op_ids[:, None], route_dims[None, :]))
+            (lane_route, block_route, op_route, route_idx))
         read_block = pl.load(
             read_blocks_ref,
-            (lane, block, op_ids[:, None], model_dims[None, :]))
+            (lane_model, block_model, op_model, model_idx))
         write_block = pl.load(
             write_blocks_ref,
-            (lane, block, op_ids[:, None], model_dims[None, :]))
-        valid_ops = pl.load(valid_blocks_ref, (lane, block, op_ids))
+            (lane_model, block_model, op_model, model_idx))
+        valid_ops = pl.load(valid_blocks_ref, (lane_ops, block_ops, op_ids))
 
         rho = pl.dot(
             h_chunk.astype(jnp.bfloat16),
@@ -4089,8 +4116,8 @@ def _opspace_execute_bucket_chunk_pallas(
         gate_mass = gate_mass * valid_slots_f[:, None]
         relu_count = relu_count * valid_slots_f[:, None]
         pl.store(
-            raw_out_ref, (slots[:, None], model_dims[None, :]), raw_out)
-        pl.store(gate_mass_ref, (slots, 0), gate_mass[:, 0])
+            raw_out_ref, (out_slots, out_dims), raw_out)
+        pl.store(gate_mass_ref, (slots, out_zero_col), gate_mass[:, 0])
         pl.store(relu_count_ref, slots, relu_count[:, 0])
 
     return pl.pallas_call(
