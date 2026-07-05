@@ -4060,7 +4060,7 @@ def _opspace_execute_bucket_outputs_pallas_group(
         key_block = key_block_ref[...]
         read_block = read_block_ref[...]
         write_block = write_block_ref[...]
-        valid_ops = valid_block_ref[...]
+        valid_ops = valid_block_ref[block_i]
 
         rho = pl.dot(
             h_chunk.astype(jnp.bfloat16),
@@ -4102,12 +4102,12 @@ def _opspace_execute_bucket_outputs_pallas_group(
         return group_start + lane_offset, block_i, 0, 0
 
     def valid_block_index_map(lane_offset, token_chunk_i, block_i):
-        del token_chunk_i
-        return group_start + lane_offset, block_i, 0
+        del token_chunk_i, block_i
+        return group_start + lane_offset, 0, 0
 
     def assigned_index_map(lane_offset, token_chunk_i, block_i):
         del block_i
-        return group_start + lane_offset, token_chunk_i
+        return lane_offset, token_chunk_i
 
     def raw_out_index_map(lane_offset, token_chunk_i, block_i):
         del block_i
@@ -4145,7 +4145,8 @@ def _opspace_execute_bucket_outputs_pallas_group(
                 pl.BlockSpec(
                     (None, None, block_size, D), block_index_map),
                 pl.BlockSpec(
-                    (None, None, block_size), valid_block_index_map),
+                    (None, blocks_per_lane, block_size),
+                    valid_block_index_map),
                 pl.BlockSpec(
                     (None, token_chunk_size), assigned_index_map),
             ],
@@ -4169,7 +4170,9 @@ def _opspace_execute_bucket_outputs_pallas_group(
         interpret=bool(interpret),
         name='opspace_bucketed_pallas_final_group')(
             flat_x, flat_h, key_blocks, read_blocks, write_blocks,
-            valid_blocks, assigned_block)
+            valid_blocks,
+            jax.lax.dynamic_slice(
+                assigned_block, (group_start, 0), (lane_group_size, T)))
 
 
 def _opspace_execute_bucket_outputs_pallas(
