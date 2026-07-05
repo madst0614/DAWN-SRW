@@ -3969,6 +3969,7 @@ def _opspace_execute_output_tiled_pallas(
         rows = jnp.arange(output_tile_size, dtype=jnp.int32)
         token_ids = output_start + rows
         tile_row_valid = token_ids < T
+        tile_row_valid_f = tile_row_valid.astype(jnp.float32)
         d_tile_ids = jnp.arange(d_tile_count, dtype=jnp.int32)
         h_rows_all = pl.load(
             flat_h_ref,
@@ -3976,8 +3977,8 @@ def _opspace_execute_output_tiled_pallas(
              pl.dslice(0, d_route)),
             other=jnp.asarray(0.0, dtype=flat_h.dtype))
         h_rows_all = (
-            h_rows_all
-            * tile_row_valid[:, None].astype(jnp.bfloat16))
+            h_rows_all.astype(jnp.float32)
+            * tile_row_valid_f[:, None])
 
         for lane_i in range(local_lanes):
             for block_i in range(blocks_per_lane):
@@ -4001,7 +4002,7 @@ def _opspace_execute_output_tiled_pallas(
                 valid_rows_f = valid_rows.astype(jnp.float32)
                 h_rows = (
                     h_rows_all
-                    * valid_rows_f[:, None].astype(jnp.bfloat16))
+                    * valid_rows_f[:, None])
                 rho = pl.dot(
                     h_rows.astype(jnp.bfloat16),
                     key_local.astype(jnp.bfloat16).T).astype(jnp.float32)
@@ -4023,8 +4024,8 @@ def _opspace_execute_output_tiled_pallas(
                          pl.dslice(read_start, d_tile_size)),
                         other=jnp.asarray(0.0, dtype=read_blocks.dtype))
                     x_read_tile = (
-                        x_read_tile
-                        * valid_rows_f[:, None].astype(jnp.bfloat16))
+                        x_read_tile.astype(jnp.float32)
+                        * valid_rows_f[:, None])
                     read_value = read_value + pl.dot(
                         x_read_tile.astype(jnp.bfloat16),
                         read_local.astype(jnp.bfloat16).T).astype(jnp.float32)
