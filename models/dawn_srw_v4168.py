@@ -4055,8 +4055,8 @@ def _opspace_execute_output_tiled_pallas(
         for out_d_tile_i in range(d_tile_count):
             pl.store(
                 raw_tiles_ref,
-                (output_tile_i, jnp.asarray(out_d_tile_i, dtype=jnp.int32),
-                 pl.dslice(0, output_tile_size),
+                (output_tile_i, pl.dslice(0, output_tile_size),
+                 jnp.asarray(out_d_tile_i, dtype=jnp.int32),
                  pl.dslice(0, d_tile_size)),
                 scratch_raw_tiles[out_d_tile_i])
         pl.store(
@@ -4072,8 +4072,8 @@ def _opspace_execute_output_tiled_pallas(
         output_tile_kernel,
         out_shape=(
             jax.ShapeDtypeStruct(
-                (output_tile_count, d_tile_count,
-                 output_tile_size, d_tile_size), jnp.float32),
+                (output_tile_count, output_tile_size,
+                 d_tile_count, d_tile_size), jnp.float32),
             jax.ShapeDtypeStruct(
                 (output_tile_count, output_tile_size), jnp.float32),
             jax.ShapeDtypeStruct(
@@ -4087,8 +4087,7 @@ def _opspace_execute_output_tiled_pallas(
             flat_x_padded, flat_h_padded, key_blocks, read_blocks,
             write_blocks, valid_blocks, bucket_valid)
 
-    flat_raw_out = raw_tiles.transpose(0, 2, 1, 3).reshape(
-        padded_T, padded_D)[:T, :D]
+    flat_raw_out = raw_tiles.reshape(padded_T, padded_D)[:T, :D]
     flat_gate_mass = gate_mass_tiles.reshape(padded_T, 1)[:T]
     flat_relu_count = relu_count_tiles.reshape(padded_T)[:T]
     return flat_raw_out, flat_gate_mass, flat_relu_count
