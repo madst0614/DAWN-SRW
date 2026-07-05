@@ -4028,64 +4028,71 @@ def _opspace_execute_bucket_outputs_pallas(
         active_chunk = slot_offsets[0] < fill
 
         def compute(_):
+            lane_slot_idx = jnp.zeros_like(slot_offsets) + lane_i
+            block_slot_idx = jnp.zeros_like(slot_offsets) + block_i
             valid_token = pl.load(
-                bucket_valid_ref, (lane_i, block_i, slot_offsets),
+                bucket_valid_ref, (lane_slot_idx, block_slot_idx, slot_offsets),
                 mask=chunk_in_bounds, other=False)
             valid_token = jnp.logical_and(valid_token, slot_offsets < fill)
             token_ids = pl.load(
-                token_id_bucket_ref, (lane_i, block_i, slot_offsets),
+                token_id_bucket_ref,
+                (lane_slot_idx, block_slot_idx, slot_offsets),
                 mask=chunk_in_bounds, other=0)
             safe_token = jnp.where(valid_token, token_ids, 0)
-            token_route_idx = jnp.broadcast_to(
-                jnp.expand_dims(safe_token, 1),
-                (bucket_chunk_size, d_route))
-            route_idx_for_tokens = jnp.broadcast_to(
-                jnp.expand_dims(route_offsets, 0),
-                (bucket_chunk_size, d_route))
-            token_d_idx = jnp.broadcast_to(
-                jnp.expand_dims(safe_token, 1),
-                (bucket_chunk_size, D))
-            d_idx_for_tokens = jnp.broadcast_to(
-                jnp.expand_dims(d_offsets, 0),
-                (bucket_chunk_size, D))
-            valid_token_route = jnp.broadcast_to(
+            route_zeros = jnp.zeros(
+                (bucket_chunk_size, d_route), dtype=jnp.int32)
+            d_zeros = jnp.zeros((bucket_chunk_size, D), dtype=jnp.int32)
+            token_route_idx = jnp.expand_dims(safe_token, 1) + route_zeros
+            route_idx_for_tokens = (
+                jnp.expand_dims(route_offsets, 0) + route_zeros)
+            token_d_idx = jnp.expand_dims(safe_token, 1) + d_zeros
+            d_idx_for_tokens = jnp.expand_dims(d_offsets, 0) + d_zeros
+            valid_token_route = jnp.logical_and(
                 jnp.expand_dims(valid_token, 1),
-                (bucket_chunk_size, d_route))
-            valid_token_d = jnp.broadcast_to(
+                jnp.ones((bucket_chunk_size, d_route), dtype=jnp.bool_))
+            valid_token_d = jnp.logical_and(
                 jnp.expand_dims(valid_token, 1),
-                (bucket_chunk_size, D))
+                jnp.ones((bucket_chunk_size, D), dtype=jnp.bool_))
             h_chunk = pl.load(
                 flat_h_ref, (token_route_idx, route_idx_for_tokens),
                 mask=valid_token_route, other=0.0)
             x_chunk = pl.load(
                 flat_x_ref, (token_d_idx, d_idx_for_tokens),
                 mask=valid_token_d, other=0.0)
+            lane_op_idx = jnp.zeros_like(op_offsets) + lane_i
+            block_op_idx = jnp.zeros_like(op_offsets) + block_i
             valid_ops = pl.load(
-                valid_blocks_ref, (lane_i, block_i, op_offsets),
+                valid_blocks_ref, (lane_op_idx, block_op_idx, op_offsets),
                 other=False)
-            op_route_idx = jnp.broadcast_to(
-                jnp.expand_dims(op_offsets, 1), (block_size, d_route))
-            route_idx_for_ops = jnp.broadcast_to(
-                jnp.expand_dims(route_offsets, 0), (block_size, d_route))
-            op_d_idx = jnp.broadcast_to(
-                jnp.expand_dims(op_offsets, 1), (block_size, D))
-            d_idx_for_ops = jnp.broadcast_to(
-                jnp.expand_dims(d_offsets, 0), (block_size, D))
-            valid_ops_route = jnp.broadcast_to(
-                jnp.expand_dims(valid_ops, 1), (block_size, d_route))
-            valid_ops_d = jnp.broadcast_to(
-                jnp.expand_dims(valid_ops, 1), (block_size, D))
+            op_route_zeros = jnp.zeros((block_size, d_route), dtype=jnp.int32)
+            op_d_zeros = jnp.zeros((block_size, D), dtype=jnp.int32)
+            lane_op_route_idx = op_route_zeros + lane_i
+            block_op_route_idx = op_route_zeros + block_i
+            lane_op_d_idx = op_d_zeros + lane_i
+            block_op_d_idx = op_d_zeros + block_i
+            op_route_idx = jnp.expand_dims(op_offsets, 1) + op_route_zeros
+            route_idx_for_ops = (
+                jnp.expand_dims(route_offsets, 0) + op_route_zeros)
+            op_d_idx = jnp.expand_dims(op_offsets, 1) + op_d_zeros
+            d_idx_for_ops = jnp.expand_dims(d_offsets, 0) + op_d_zeros
+            valid_ops_route = jnp.logical_and(
+                jnp.expand_dims(valid_ops, 1),
+                jnp.ones((block_size, d_route), dtype=jnp.bool_))
+            valid_ops_d = jnp.logical_and(
+                jnp.expand_dims(valid_ops, 1),
+                jnp.ones((block_size, D), dtype=jnp.bool_))
             key_block = pl.load(
                 key_blocks_ref,
-                (lane_i, block_i, op_route_idx, route_idx_for_ops),
+                (lane_op_route_idx, block_op_route_idx, op_route_idx,
+                 route_idx_for_ops),
                 mask=valid_ops_route, other=0.0)
             read_block = pl.load(
                 read_blocks_ref,
-                (lane_i, block_i, op_d_idx, d_idx_for_ops),
+                (lane_op_d_idx, block_op_d_idx, op_d_idx, d_idx_for_ops),
                 mask=valid_ops_d, other=0.0)
             write_block = pl.load(
                 write_blocks_ref,
-                (lane_i, block_i, op_d_idx, d_idx_for_ops),
+                (lane_op_d_idx, block_op_d_idx, op_d_idx, d_idx_for_ops),
                 mask=valid_ops_d, other=0.0)
             rho = pl.dot(
                 h_chunk.astype(jnp.bfloat16),
@@ -4096,12 +4103,14 @@ def _opspace_execute_bucket_outputs_pallas(
                 jnp.swapaxes(read_block.astype(jnp.bfloat16), 0, 1)
             ).astype(jnp.float32)
             gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
-            valid_token_gate = jnp.broadcast_to(
-                jnp.expand_dims(valid_token.astype(jnp.float32), 1),
-                (bucket_chunk_size, block_size))
-            valid_ops_gate = jnp.broadcast_to(
-                jnp.expand_dims(valid_ops.astype(jnp.float32), 0),
-                (bucket_chunk_size, block_size))
+            gate_zeros = jnp.zeros(
+                (bucket_chunk_size, block_size), dtype=jnp.float32)
+            valid_token_gate = (
+                jnp.expand_dims(valid_token.astype(jnp.float32), 1)
+                + gate_zeros)
+            valid_ops_gate = (
+                jnp.expand_dims(valid_ops.astype(jnp.float32), 0)
+                + gate_zeros)
             gate = gate * valid_token_gate
             gate = gate * valid_ops_gate
             raw_out = pl.dot(
@@ -4122,23 +4131,25 @@ def _opspace_execute_bucket_outputs_pallas(
 
         safe_token, valid_token, raw_out, gate_mass, relu_count = jax.lax.cond(
             active_chunk, compute, zeros, operand=None)
-        store_token_d_idx = jnp.broadcast_to(
-            jnp.expand_dims(safe_token, 1), (bucket_chunk_size, D))
-        store_d_idx = jnp.broadcast_to(
-            jnp.expand_dims(d_offsets, 0), (bucket_chunk_size, D))
-        store_valid_d = jnp.broadcast_to(
-            jnp.expand_dims(valid_token, 1), (bucket_chunk_size, D))
+        store_d_zeros = jnp.zeros((bucket_chunk_size, D), dtype=jnp.int32)
+        store_lane_d_idx = store_d_zeros + lane_i
+        store_token_d_idx = jnp.expand_dims(safe_token, 1) + store_d_zeros
+        store_d_idx = jnp.expand_dims(d_offsets, 0) + store_d_zeros
+        store_valid_d = jnp.logical_and(
+            jnp.expand_dims(valid_token, 1),
+            jnp.ones((bucket_chunk_size, D), dtype=jnp.bool_))
         pl.store(
             lane_raw_out_ref,
-            (lane_i, store_token_d_idx, store_d_idx),
+            (store_lane_d_idx, store_token_d_idx, store_d_idx),
             raw_out, mask=store_valid_d)
+        store_lane_idx = jnp.zeros_like(safe_token) + lane_i
         pl.store(
             lane_gate_mass_ref,
-            (lane_i, safe_token, jnp.zeros_like(safe_token)),
+            (store_lane_idx, safe_token, jnp.zeros_like(safe_token)),
             gate_mass, mask=valid_token)
         pl.store(
             lane_relu_count_ref,
-            (lane_i, safe_token),
+            (store_lane_idx, safe_token),
             relu_count, mask=valid_token)
 
     out_shape = (
