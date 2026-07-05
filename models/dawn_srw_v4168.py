@@ -4082,11 +4082,15 @@ def _opspace_execute_bucket_outputs_pallas_group(
         raw_out = pl.dot(
             (gate * read_value).astype(jnp.bfloat16),
             write_block.astype(jnp.bfloat16)).astype(jnp.float32)
-        gate_mass = gate.sum(axis=-1)
-        relu_count = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
+        reduce_ones = jnp.ones((block_size, 1), dtype=jnp.bfloat16)
+        gate_mass = pl.dot(
+            gate.astype(jnp.bfloat16), reduce_ones).astype(jnp.float32)
+        relu_count = pl.dot(
+            (gate > 0.0).astype(jnp.bfloat16),
+            reduce_ones).astype(jnp.float32)
 
         raw_acc_ref[...] += raw_out
-        mass_acc_ref[...] += gate_mass[:, None]
+        mass_acc_ref[...] += gate_mass
         relu_acc_ref[...] += relu_count
 
         @pl.when(block_i == blocks_per_lane - 1)
@@ -4123,10 +4127,6 @@ def _opspace_execute_bucket_outputs_pallas_group(
         del block_i
         return lane_offset, token_chunk_i, 0
 
-    def relu_out_index_map(lane_offset, token_chunk_i, block_i):
-        del block_i
-        return lane_offset, token_chunk_i
-
     return pl.pallas_call(
         bucket_kernel,
         out_shape=(
@@ -4135,7 +4135,7 @@ def _opspace_execute_bucket_outputs_pallas_group(
             jax.ShapeDtypeStruct(
                 (lane_group_size, T, 1), jnp.float32),
             jax.ShapeDtypeStruct(
-                (lane_group_size, T), jnp.float32),
+                (lane_group_size, T, 1), jnp.float32),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
@@ -4162,13 +4162,13 @@ def _opspace_execute_bucket_outputs_pallas_group(
                 pl.BlockSpec(
                     (None, token_chunk_size, 1), mass_out_index_map),
                 pl.BlockSpec(
-                    (None, token_chunk_size), relu_out_index_map),
+                    (None, token_chunk_size, 1), mass_out_index_map),
             ),
             grid=(lane_group_size, token_chunk_count, blocks_per_lane),
             scratch_shapes=[
                 pltpu.VMEM((token_chunk_size, D), jnp.float32),
                 pltpu.VMEM((token_chunk_size, 1), jnp.float32),
-                pltpu.VMEM((token_chunk_size,), jnp.float32),
+                pltpu.VMEM((token_chunk_size, 1), jnp.float32),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -4227,10 +4227,10 @@ def _opspace_execute_bucket_outputs_pallas(
         group_mass = jnp.where(
             group_assigned[:, :, None], group_mass, jnp.float32(0.0))
         group_relu = jnp.where(
-            group_assigned, group_relu, jnp.float32(0.0))
+            group_assigned[:, :, None], group_relu, jnp.float32(0.0))
         flat_raw_out = flat_raw_out + group_raw.sum(axis=0)
         flat_gate_mass = flat_gate_mass + group_mass.sum(axis=0)
-        flat_relu_count = flat_relu_count + group_relu.sum(axis=0)
+        flat_relu_count = flat_relu_count + group_relu.sum(axis=0)[..., 0]
     return flat_raw_out, flat_gate_mass, flat_relu_count
 
 
