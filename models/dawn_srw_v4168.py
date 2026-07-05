@@ -4005,7 +4005,8 @@ def _opspace_execute_output_tiled_pallas(
                     * valid_rows_f[:, None])
                 rho = pl.dot(
                     h_rows.astype(jnp.bfloat16),
-                    key_local.astype(jnp.bfloat16).T).astype(jnp.float32)
+                    key_local.astype(jnp.bfloat16),
+                    trans_b=True).astype(jnp.float32)
                 read_value = jnp.zeros(
                     (output_tile_size, block_size), dtype=jnp.float32)
                 for read_tile_i in range(d_tile_count):
@@ -4028,7 +4029,8 @@ def _opspace_execute_output_tiled_pallas(
                         * valid_rows_f[:, None])
                     read_value = read_value + pl.dot(
                         x_read_tile.astype(jnp.bfloat16),
-                        read_local.astype(jnp.bfloat16).T).astype(jnp.float32)
+                        read_local.astype(jnp.bfloat16),
+                        trans_b=True).astype(jnp.float32)
                 gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
                 gate = gate * valid_rows_f[:, None]
                 gate = gate * valid_ops.astype(jnp.float32)[None, :]
@@ -4056,8 +4058,7 @@ def _opspace_execute_output_tiled_pallas(
             pl.store(
                 raw_tiles_ref,
                 (output_tile_i, pl.dslice(0, output_tile_size),
-                 jnp.asarray(out_d_tile_i, dtype=jnp.int32),
-                 pl.dslice(0, d_tile_size)),
+                 pl.dslice(out_d_tile_i * d_tile_size, d_tile_size)),
                 scratch_raw_tiles[out_d_tile_i])
         pl.store(
             gate_mass_tiles_ref,
@@ -4072,8 +4073,7 @@ def _opspace_execute_output_tiled_pallas(
         output_tile_kernel,
         out_shape=(
             jax.ShapeDtypeStruct(
-                (output_tile_count, output_tile_size,
-                 d_tile_count, d_tile_size), jnp.float32),
+                (output_tile_count, output_tile_size, padded_D), jnp.float32),
             jax.ShapeDtypeStruct(
                 (output_tile_count, output_tile_size), jnp.float32),
             jax.ShapeDtypeStruct(
