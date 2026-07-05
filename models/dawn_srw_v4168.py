@@ -4005,15 +4005,8 @@ def _opspace_execute_output_tiled_pallas(
             raw_tiles_ref, gate_mass_tiles_ref, relu_count_tiles_ref):
         output_tile_i = pl.program_id(0)
         d_tile_i = pl.program_id(1)
-        slot_ids = jnp.arange(output_tile_capacity, dtype=jnp.int32)
-        local_token_ids = jnp.arange(output_tile_size, dtype=jnp.int32)
-        op_ids = jnp.arange(block_size, dtype=jnp.int32)
-        route_ids = jnp.arange(d_route, dtype=jnp.int32)
-        local_d_ids = jnp.arange(d_tile_size, dtype=jnp.int32)
         output_start = output_tile_i * output_tile_size
         d_start = d_tile_i * d_tile_size
-        d_ids = d_start + local_d_ids
-        d_valid = d_ids < D
 
         scratch_raw = jnp.zeros(
             (output_tile_size, d_tile_size), dtype=jnp.float32)
@@ -4026,107 +4019,102 @@ def _opspace_execute_output_tiled_pallas(
                 block_idx = jnp.asarray(block_i, dtype=jnp.int32)
                 tile_fill = pl.load(
                     bucket_fill_ref, (lane_idx, block_idx, output_tile_i))
-                token_ids = pl.load(
-                    token_id_bucket_ref,
-                    (lane_idx, block_idx, output_tile_i, slot_ids),
-                    other=jnp.asarray(0, dtype=jnp.int32))
-                valid_slots = pl.load(
-                    bucket_valid_ref,
-                    (lane_idx, block_idx, output_tile_i, slot_ids),
-                    other=jnp.asarray(False, dtype=jnp.bool_))
-                valid_slots = jnp.logical_and(valid_slots, slot_ids < tile_fill)
-                safe_token = jnp.where(valid_slots, token_ids, 0)
-                local_token = jnp.where(
-                    valid_slots, token_ids - output_start, 0)
-                valid_slots_f = valid_slots.astype(jnp.float32)
-                safe_d_ids = jnp.where(d_valid, d_ids, 0)
-
-                h_local = pl.load(
-                    flat_h_ref,
-                    (safe_token[:, None], route_ids[None, :]),
-                    other=jnp.asarray(0.0, dtype=flat_h.dtype))
                 key_local = pl.load(
                     key_blocks_ref,
-                    (lane_idx, block_idx, op_ids[:, None],
-                     route_ids[None, :]),
+                    (lane_idx, block_idx, pl.dslice(0, block_size),
+                     pl.dslice(0, d_route)),
                     other=jnp.asarray(0.0, dtype=key_blocks.dtype))
                 write_local = pl.load(
                     write_blocks_ref,
-                    (lane_idx, block_idx, op_ids[:, None],
-                     safe_d_ids[None, :]),
+                    (lane_idx, block_idx, pl.dslice(0, block_size),
+                     pl.dslice(d_start, d_tile_size)),
                     other=jnp.asarray(0.0, dtype=write_blocks.dtype))
-                write_local = write_local * d_valid[None, :].astype(
-                    write_local.dtype)
                 valid_ops = pl.load(
-                    valid_blocks_ref, (lane_idx, block_idx, op_ids),
+                    valid_blocks_ref,
+                    (lane_idx, block_idx, pl.dslice(0, block_size)),
                     other=jnp.asarray(False, dtype=jnp.bool_))
 
-                h_local = (
-                    h_local
-                    * valid_slots_f[:, None].astype(jnp.bfloat16))
-                rho = pl.dot(
-                    h_local.astype(jnp.bfloat16),
-                    jnp.swapaxes(key_local.astype(jnp.bfloat16), 0, 1)
-                ).astype(jnp.float32)
-                read_value = jnp.zeros(
-                    (output_tile_capacity, block_size), dtype=jnp.float32)
-                for read_tile_i in range(d_tile_count):
-                    read_start = (
-                        jnp.asarray(read_tile_i, dtype=jnp.int32)
-                        * d_tile_size)
-                    read_d_ids = read_start + local_d_ids
-                    read_d_valid = read_d_ids < D
-                    safe_read_d_ids = jnp.where(read_d_valid, read_d_ids, 0)
-                    x_read = pl.load(
-                        flat_x_ref,
-                        (safe_token[:, None], safe_read_d_ids[None, :]),
-                        other=jnp.asarray(0.0, dtype=flat_x.dtype))
-                    read_local = pl.load(
-                        read_blocks_ref,
-                        (lane_idx, block_idx, op_ids[:, None],
-                         safe_read_d_ids[None, :]),
-                        other=jnp.asarray(0.0, dtype=read_blocks.dtype))
-                    read_local = read_local * read_d_valid[None, :].astype(
-                        read_local.dtype)
-                    x_read = (
-                        x_read
-                        * (
-                            valid_slots_f[:, None]
-                            * read_d_valid[None, :]).astype(jnp.bfloat16))
-                    read_value = read_value + pl.dot(
-                        x_read.astype(jnp.bfloat16),
-                        jnp.swapaxes(
-                            read_local.astype(jnp.bfloat16), 0, 1)
-                    ).astype(jnp.float32)
-                gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
-                gate = gate * valid_slots_f[:, None]
-                gate = gate * valid_ops.astype(jnp.float32)[None, :]
-                mixed = gate * read_value
-                raw_slot = pl.dot(
-                    mixed.astype(jnp.bfloat16),
-                    write_local.astype(jnp.bfloat16)).astype(jnp.float32)
-                mass_slot = gate.sum(axis=-1)
-                relu_slot = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
+                for slot_i in range(output_tile_capacity):
+                    slot_idx = jnp.asarray(slot_i, dtype=jnp.int32)
+                    token_id = pl.load(
+                        token_id_bucket_ref,
+                        (lane_idx, block_idx, output_tile_i, slot_idx),
+                        other=jnp.asarray(0, dtype=jnp.int32))
+                    valid_slot = pl.load(
+                        bucket_valid_ref,
+                        (lane_idx, block_idx, output_tile_i, slot_idx),
+                        other=jnp.asarray(False, dtype=jnp.bool_))
+                    valid_slot = jnp.logical_and(
+                        valid_slot, slot_idx < tile_fill)
+                    safe_token = jnp.where(valid_slot, token_id, 0)
+                    local_token = jnp.where(
+                        valid_slot, token_id - output_start, 0)
+                    valid_slot_f = valid_slot.astype(jnp.float32)
 
-                scratch_raw = scratch_raw.at[local_token].add(
-                    raw_slot * valid_slots_f[:, None])
-                scratch_mass = scratch_mass.at[local_token].add(
-                    mass_slot * valid_slots_f)
-                scratch_relu = scratch_relu.at[local_token].add(
-                    relu_slot * valid_slots_f)
+                    h_vec = pl.load(
+                        flat_h_ref,
+                        (safe_token, pl.dslice(0, d_route)),
+                        other=jnp.asarray(0.0, dtype=flat_h.dtype))
+                    h_vec = h_vec * valid_slot_f.astype(jnp.bfloat16)
+                    rho = pl.dot(
+                        key_local.astype(jnp.bfloat16),
+                        h_vec.astype(jnp.bfloat16).reshape(
+                            (d_route, 1))).astype(jnp.float32)
+                    rho = rho.reshape((block_size,))
+                    read_value = jnp.zeros(
+                        (block_size,), dtype=jnp.float32)
+                    for read_tile_i in range(d_tile_count):
+                        read_start = (
+                            jnp.asarray(read_tile_i, dtype=jnp.int32)
+                            * d_tile_size)
+                        x_read = pl.load(
+                            flat_x_ref,
+                            (safe_token, pl.dslice(read_start, d_tile_size)),
+                            other=jnp.asarray(0.0, dtype=flat_x.dtype))
+                        read_local = pl.load(
+                            read_blocks_ref,
+                            (lane_idx, block_idx,
+                             pl.dslice(0, block_size),
+                             pl.dslice(read_start, d_tile_size)),
+                            other=jnp.asarray(0.0, dtype=read_blocks.dtype))
+                        x_read = (
+                            x_read
+                            * valid_slot_f.astype(jnp.bfloat16))
+                        read_value = read_value + pl.dot(
+                            read_local.astype(jnp.bfloat16),
+                            x_read.astype(jnp.bfloat16).reshape(
+                                (d_tile_size, 1))).astype(jnp.float32).reshape(
+                                    (block_size,))
+                    gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
+                    gate = gate * valid_slot_f
+                    gate = gate * valid_ops.astype(jnp.float32)
+                    mixed = gate * read_value
+                    raw_slot = pl.dot(
+                        mixed.astype(jnp.bfloat16).reshape((1, block_size)),
+                        write_local.astype(jnp.bfloat16)).astype(jnp.float32)
+                    raw_slot = raw_slot.reshape((d_tile_size,))
+                    mass_slot = gate.sum()
+                    relu_slot = (gate > 0.0).astype(jnp.float32).sum()
+
+                    scratch_raw = scratch_raw.at[local_token].add(
+                        raw_slot * valid_slot_f)
+                    scratch_mass = scratch_mass.at[local_token].add(
+                        mass_slot * valid_slot_f)
+                    scratch_relu = scratch_relu.at[local_token].add(
+                        relu_slot * valid_slot_f)
 
         pl.store(
             raw_tiles_ref,
-            (output_tile_i, d_tile_i, local_token_ids[:, None],
-             local_d_ids[None, :]),
+            (output_tile_i, d_tile_i, pl.dslice(0, output_tile_size),
+             pl.dslice(0, d_tile_size)),
             scratch_raw)
         pl.store(
             gate_mass_tiles_ref,
-            (output_tile_i, d_tile_i, local_token_ids),
+            (output_tile_i, d_tile_i, pl.dslice(0, output_tile_size)),
             scratch_mass)
         pl.store(
             relu_count_tiles_ref,
-            (output_tile_i, d_tile_i, local_token_ids),
+            (output_tile_i, d_tile_i, pl.dslice(0, output_tile_size)),
             scratch_relu)
 
     raw_tiles, gate_mass_tiles, relu_count_tiles = pl.pallas_call(
@@ -4480,6 +4468,11 @@ def _opspace_tau_free_relu_block_bucketed_pallas_final_core(
     del bucket_chunk_size
     output_tile_size = int(OPSPACE_FINAL_OUTPUT_TILE_SIZE)
     d_tile_size = int(OPSPACE_FINAL_D_TILE_SIZE)
+    if D % d_tile_size != 0:
+        raise ValueError(
+            "block_bucketed_pallas_final output-tiled backend requires "
+            f"D to be divisible by d_tile_size; got D={D}, "
+            f"d_tile_size={d_tile_size}.")
     output_tile_count = max(
         1, (T + output_tile_size - 1) // output_tile_size)
     d_tile_count = max(1, (D + d_tile_size - 1) // d_tile_size)
