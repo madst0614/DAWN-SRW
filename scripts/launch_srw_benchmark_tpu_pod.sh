@@ -18,6 +18,9 @@ CONFIGS=()
 MODEL_VERSION=""
 STEPS="20"
 WARMUP_STEPS="5"
+FORWARD_PROFILE_STEPS="1"
+MODULE_PROFILE_STEPS="1"
+FAST_ONLY="0"
 OUTPUT_DIR=""
 XLA_DUMP_ENABLED="1"
 XLA_DUMP_BASE=""
@@ -25,7 +28,6 @@ GH_TOKEN=""
 DUMMY_DATA="0"
 ALLOW_MODEL_VERSION_OVERRIDE="0"
 AUTO_COMPARE="0"
-FORCE_VQ_REPACK="1"
 
 usage() {
     cat <<EOF
@@ -36,6 +38,9 @@ Options:
   --project PROJECT
   --steps N
   --warmup-steps N
+  --forward-profile-steps N     Forward-only profile steps per config (default: 1)
+  --module-profile-steps N      Split-module profile steps per config (default: 1)
+  --fast, --fast-only           Skip full train-step benchmark; run fast profiles only
   --model-version VERSION        Optional expected version check
   --allow-model-version-override Allow --model-version to override config
   --output-dir DIR               Remote artifact root for XLA dumps only
@@ -44,7 +49,6 @@ Options:
   --dummy-data                   Explicit synthetic-data smoke test
   --auto-compare                 Auto-add the matching standard v4166/v4168 config
   --no-auto-compare              Keep only explicitly supplied configs (default)
-  --no-force-vq-repack           Do not force one v4168 VQ repack before measure
   --token TOKEN                  GitHub token for private repos
   -h, --help
 
@@ -89,6 +93,9 @@ while [[ $# -gt 0 ]]; do
         --model-version) MODEL_VERSION="$2"; shift 2 ;;
         --steps) STEPS="$2"; shift 2 ;;
         --warmup-steps) WARMUP_STEPS="$2"; shift 2 ;;
+        --forward-profile-steps) FORWARD_PROFILE_STEPS="$2"; shift 2 ;;
+        --module-profile-steps) MODULE_PROFILE_STEPS="$2"; shift 2 ;;
+        --fast|--fast-only) FAST_ONLY="1"; shift ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --xla-dump)
             XLA_DUMP_ENABLED="1"
@@ -104,7 +111,6 @@ while [[ $# -gt 0 ]]; do
         --allow-model-version-override) ALLOW_MODEL_VERSION_OVERRIDE="1"; shift ;;
         --auto-compare) AUTO_COMPARE="1"; shift ;;
         --no-auto-compare) AUTO_COMPARE="0"; shift ;;
-        --no-force-vq-repack) FORCE_VQ_REPACK="0"; shift ;;
         --token) GH_TOKEN="$2"; shift 2 ;;
         -h|--help)
             usage
@@ -127,13 +133,35 @@ if [[ -n "$MODEL_VERSION" &&
     echo "ERROR: --model-version must be spatial-r1-v4.1.6.6 or spatial-r1-v4.1.6.8." >&2
     exit 1
 fi
-if ! is_nonnegative_int "$STEPS" || [[ "$STEPS" -le 0 ]]; then
-    echo "ERROR: --steps must be an integer > 0." >&2
+if ! is_nonnegative_int "$STEPS"; then
+    echo "ERROR: --steps must be an integer >= 0." >&2
+    exit 1
+fi
+if [[ "$FAST_ONLY" != "1" && "$STEPS" -le 0 ]]; then
+    echo "ERROR: --steps must be an integer > 0 unless --fast is set." >&2
     exit 1
 fi
 if ! is_nonnegative_int "$WARMUP_STEPS"; then
     echo "ERROR: --warmup-steps must be an integer >= 0." >&2
     exit 1
+fi
+if ! is_nonnegative_int "$FORWARD_PROFILE_STEPS"; then
+    echo "ERROR: --forward-profile-steps must be an integer >= 0." >&2
+    exit 1
+fi
+if ! is_nonnegative_int "$MODULE_PROFILE_STEPS"; then
+    echo "ERROR: --module-profile-steps must be an integer >= 0." >&2
+    exit 1
+fi
+if [[ "$FAST_ONLY" = "1" &&
+      "$FORWARD_PROFILE_STEPS" -le 0 &&
+      "$MODULE_PROFILE_STEPS" -le 0 ]]; then
+    echo "ERROR: --fast requires --forward-profile-steps or --module-profile-steps > 0." >&2
+    exit 1
+fi
+if [[ "$FAST_ONLY" = "1" ]]; then
+    STEPS="0"
+    WARMUP_STEPS="0"
 fi
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="benchmark_runs/srw_$(date +%Y%m%d_%H%M%S)"
@@ -180,12 +208,20 @@ for config in "${CONFIGS[@]}"; do
     echo "    - $config"
 done
 echo "  Model version:  $MODEL_VERSION_LABEL"
-echo "  Steps:          $STEPS"
-echo "  Warmup steps:   $WARMUP_STEPS"
+if [[ "$FAST_ONLY" = "1" ]]; then
+    echo "  Mode:           fast profile only"
+    echo "  Train steps:    skipped"
+else
+    echo "  Mode:           train benchmark + profiles"
+    echo "  Steps:          $STEPS"
+    echo "  Warmup steps:   $WARMUP_STEPS"
+fi
+echo "  Forward profile:$FORWARD_PROFILE_STEPS"
+echo "  Module profile: $MODULE_PROFILE_STEPS"
+echo "  Fast only:      $FAST_ONLY"
 echo "  XLA dumps:      $XLA_DUMP_ENABLED ($XLA_DUMP_BASE)"
 echo "  Dummy data:     $DUMMY_DATA"
 echo "  Auto compare:   $AUTO_COMPARE"
-echo "  Force VQ repack:$FORCE_VQ_REPACK"
 echo "  Result files:   ${OUTPUT_DIR}/benchmark_metrics_host_<worker>.jsonl"
 echo "============================================"
 
@@ -265,12 +301,14 @@ CONFIG_REST_Q="$(shell_quote "$CONFIG_REST_ARGS")"
 MODEL_VERSION_Q="$(shell_quote "$MODEL_VERSION")"
 STEPS_Q="$(shell_quote "$STEPS")"
 WARMUP_STEPS_Q="$(shell_quote "$WARMUP_STEPS")"
+FORWARD_PROFILE_STEPS_Q="$(shell_quote "$FORWARD_PROFILE_STEPS")"
+MODULE_PROFILE_STEPS_Q="$(shell_quote "$MODULE_PROFILE_STEPS")"
+FAST_ONLY_Q="$(shell_quote "$FAST_ONLY")"
 XLA_DUMP_ENABLED_Q="$(shell_quote "$XLA_DUMP_ENABLED")"
 XLA_DUMP_BASE_Q="$(shell_quote "$XLA_DUMP_BASE")"
 OUTPUT_DIR_Q="$(shell_quote "$OUTPUT_DIR")"
 DUMMY_DATA_Q="$(shell_quote "$DUMMY_DATA")"
 ALLOW_MODEL_VERSION_OVERRIDE_Q="$(shell_quote "$ALLOW_MODEL_VERSION_OVERRIDE")"
-FORCE_VQ_REPACK_Q="$(shell_quote "$FORCE_VQ_REPACK")"
 GH_TOKEN_Q="$(shell_quote "$GH_TOKEN")"
 
 read -r -d '' REMOTE_CMD_TEMPLATE <<EOFCMD || true
@@ -283,12 +321,14 @@ CONFIG_REST=${CONFIG_REST_Q}
 MODEL_VERSION=${MODEL_VERSION_Q}
 STEPS=${STEPS_Q}
 WARMUP_STEPS=${WARMUP_STEPS_Q}
+FORWARD_PROFILE_STEPS=${FORWARD_PROFILE_STEPS_Q}
+MODULE_PROFILE_STEPS=${MODULE_PROFILE_STEPS_Q}
+FAST_ONLY=${FAST_ONLY_Q}
 XLA_DUMP_ENABLED=${XLA_DUMP_ENABLED_Q}
 XLA_DUMP_BASE=${XLA_DUMP_BASE_Q}
 OUTPUT_DIR=${OUTPUT_DIR_Q}
 DUMMY_DATA=${DUMMY_DATA_Q}
 ALLOW_MODEL_VERSION_OVERRIDE=${ALLOW_MODEL_VERSION_OVERRIDE_Q}
-FORCE_VQ_REPACK=${FORCE_VQ_REPACK_Q}
 GH_TOKEN=${GH_TOKEN_Q}
 export TPU_WORKER_INDEX BRANCH CONFIG GH_TOKEN
 
@@ -311,11 +351,13 @@ if [ -n "\$CONFIG_REST" ]; then
     BENCH_ARGS="\$CONFIG_REST"
 fi
 BENCH_ARGS="\$BENCH_ARGS --steps \$STEPS --warmup-steps \$WARMUP_STEPS"
+BENCH_ARGS="\$BENCH_ARGS --forward-profile-steps \$FORWARD_PROFILE_STEPS"
+BENCH_ARGS="\$BENCH_ARGS --module-profile-steps \$MODULE_PROFILE_STEPS"
+if [ "\$FAST_ONLY" = "1" ]; then
+    BENCH_ARGS="\$BENCH_ARGS --fast"
+fi
 BENCH_METRICS_JSONL="\${OUTPUT_DIR}/benchmark_metrics_host_\${TPU_WORKER_INDEX}.jsonl"
 BENCH_ARGS="\$BENCH_ARGS --metrics-jsonl \$BENCH_METRICS_JSONL"
-if [ "\$FORCE_VQ_REPACK" = "1" ]; then
-    BENCH_ARGS="\$BENCH_ARGS --benchmark-force-vq-repack-before-measure"
-fi
 if [ -n "\$MODEL_VERSION" ]; then
     BENCH_ARGS="\$BENCH_ARGS --model-version \$MODEL_VERSION"
 fi

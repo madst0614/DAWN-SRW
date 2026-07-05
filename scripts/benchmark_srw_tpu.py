@@ -10,6 +10,7 @@ import importlib
 import inspect
 import itertools
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -137,6 +138,16 @@ def main():
                         help="Measured benchmark steps.")
     parser.add_argument("--warmup-steps", type=int, default=5,
                         help="Warmup steps excluded from summary.")
+    parser.add_argument("--forward-profile-steps", type=int, default=1,
+                        help=("Measured forward-only steps after the train "
+                              "benchmark. Set 0 to disable."))
+    parser.add_argument("--module-profile-steps", type=int, default=1,
+                        help=("Measured split-module forward passes "
+                              "after the train benchmark. Set 0 to disable."))
+    parser.add_argument("--fast", "--fast-only", dest="fast_only",
+                        action="store_true",
+                        help=("Skip full train-step benchmark and run only "
+                              "forward/module profiling for quick comparison."))
     parser.add_argument("--model-version", default=None,
                         help="Optional expected model version.")
     parser.add_argument("--allow-model-version-override", action="store_true",
@@ -148,22 +159,9 @@ def main():
     parser.add_argument("--metrics-jsonl",
                         default="benchmark_srw_tpu_metrics.jsonl",
                         help=("Optional JSONL path for sector_runtime, "
-                              "vq_layout, and summary records. Supports "
-                              "{index} and {config}. Pass an empty string to "
-                              "disable."))
-    parser.add_argument("--benchmark-force-vq-repack-before-measure",
-                        action="store_true",
-                        help=("After compile/warmup, force one v4168 V/RST "
-                              "hardware repack before measured steps."))
-    parser.add_argument("--post-repack-warmup-steps", type=int, default=2,
-                        help=("Warmup steps to run after forced VQ repack "
-                              "before measured steps. Excluded from summary."))
-    parser.add_argument("--override-hardware-repack-max-move-frac", type=float,
-                        default=None,
-                        help="Runtime override for benchmark VQ max_move_frac.")
-    parser.add_argument("--override-hardware-repack-vq-iterations", type=int,
-                        default=None,
-                        help="Runtime override for benchmark VQ iterations.")
+                              "benchmark_profile, and summary records. "
+                              "Supports {index} and {config}. Pass an empty "
+                              "string to disable."))
     parser.add_argument("--override-sector-bucket-capacity-mult", type=float,
                         default=None,
                         help="Runtime override for v4168 sector bucket capacity multiplier.")
@@ -171,10 +169,6 @@ def main():
                         help=("Comma-separated sector bucket capacity "
                               "multipliers, e.g. 2,4,8,12,16. "
                               "Use 'high' for 2,4,8,12,16."))
-    parser.add_argument("--sweep-hardware-repack-max-move-frac", default=None,
-                        help="Comma-separated VQ max_move_frac values.")
-    parser.add_argument("--sweep-hardware-repack-vq-iterations", default=None,
-                        help="Comma-separated VQ iteration counts.")
     parser.add_argument("--sweep-v-top-blocks", default=None,
                         help="Comma-separated v_top_blocks values.")
     parser.add_argument("--sweep-rst-top-blocks", default=None,
@@ -185,12 +179,21 @@ def main():
                         help="Comma-separated rst_block_size values.")
     args = parser.parse_args()
 
-    if args.steps <= 0:
-        raise SystemExit("--steps must be > 0")
+    if args.steps < 0:
+        raise SystemExit("--steps must be >= 0")
+    if args.steps == 0 and not args.fast_only:
+        raise SystemExit("--steps must be > 0 unless --fast is set")
     if args.warmup_steps < 0:
         raise SystemExit("--warmup-steps must be >= 0")
-    if args.post_repack_warmup_steps < 0:
-        raise SystemExit("--post-repack-warmup-steps must be >= 0")
+    if args.forward_profile_steps < 0:
+        raise SystemExit("--forward-profile-steps must be >= 0")
+    if args.module_profile_steps < 0:
+        raise SystemExit("--module-profile-steps must be >= 0")
+    if (args.fast_only and args.forward_profile_steps <= 0
+            and args.module_profile_steps <= 0):
+        raise SystemExit(
+            "--fast requires --forward-profile-steps or "
+            "--module-profile-steps to be > 0")
     if args.model_version and args.model_version not in SUPPORTED_MODEL_VERSIONS:
         raise SystemExit(
             f"--model-version must be one of {SUPPORTED_MODEL_VERSIONS}")
@@ -245,24 +248,12 @@ def expand_run_specs(configs, args):
     if args.override_sector_bucket_capacity_mult is not None:
         base["sector_capacity_mult"] = float(
             args.override_sector_bucket_capacity_mult)
-    if args.override_hardware_repack_max_move_frac is not None:
-        base["hardware_repack_max_move_frac"] = float(
-            args.override_hardware_repack_max_move_frac)
-    if args.override_hardware_repack_vq_iterations is not None:
-        base["hardware_repack_vq_iterations"] = int(
-            args.override_hardware_repack_vq_iterations)
 
     sweep_items = []
     sweep_defs = (
         ("sector_capacity_mult", args.sweep_sector_capacity_mult, float,
          "--sweep-sector-capacity-mult",
          {"high": (2, 4, 8, 12, 16)}),
-        ("hardware_repack_max_move_frac",
-         args.sweep_hardware_repack_max_move_frac, float,
-         "--sweep-hardware-repack-max-move-frac", None),
-        ("hardware_repack_vq_iterations",
-         args.sweep_hardware_repack_vq_iterations, int,
-         "--sweep-hardware-repack-vq-iterations", None),
         ("v_top_blocks", args.sweep_v_top_blocks, int,
          "--sweep-v-top-blocks", None),
         ("rst_top_blocks", args.sweep_rst_top_blocks, int,
@@ -297,8 +288,6 @@ def format_variant_label(overrides):
         return ""
     order = (
         "sector_capacity_mult",
-        "hardware_repack_max_move_frac",
-        "hardware_repack_vq_iterations",
         "v_top_blocks",
         "rst_top_blocks",
         "v_block_size",
@@ -430,12 +419,6 @@ def apply_benchmark_overrides(cfg, overrides):
     if "sector_capacity_mult" in overrides:
         train_cfg["benchmark_sector_bucket_capacity_mult"] = float(
             overrides["sector_capacity_mult"])
-    if "hardware_repack_max_move_frac" in overrides:
-        train_cfg["hardware_repack_max_move_frac"] = float(
-            overrides["hardware_repack_max_move_frac"])
-    if "hardware_repack_vq_iterations" in overrides:
-        train_cfg["hardware_repack_vq_iterations"] = int(
-            overrides["hardware_repack_vq_iterations"])
     for key in ("v_top_blocks", "rst_top_blocks",
                 "v_block_size", "rst_block_size"):
         if key in overrides:
@@ -508,8 +491,11 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
     _log(f"  batch_size: {batch_size}")
     _log(f"  per_host_batch: {per_host_batch}")
     _log(f"  seq_len: {seq_len}")
-    _log(f"  warmup_steps: {args.warmup_steps}")
-    _log(f"  measure_steps: {args.steps}")
+    _log(f"  fast_only: {str(bool(args.fast_only)).lower()}")
+    _log(f"  warmup_steps: {0 if args.fast_only else args.warmup_steps}")
+    _log(f"  measure_steps: {0 if args.fast_only else args.steps}")
+    _log(f"  forward_profile_steps: {args.forward_profile_steps}")
+    _log(f"  module_profile_steps: {args.module_profile_steps}")
     if variant_label:
         _log(f"  variant: {variant_label}")
     if overrides:
@@ -524,11 +510,17 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
 
     model = build_model(cfg)
     sharded_fns = build_sharded_fns(cfg, mesh)
+    train_step_budget = (
+        0 if args.fast_only
+        else int(args.steps) + int(args.warmup_steps) + 2)
+    profile_step_budget = (
+        (int(args.forward_profile_steps) + 1
+         if int(args.forward_profile_steps) > 0 else 0)
+        + (int(args.module_profile_steps) + 1
+           if int(args.module_profile_steps) > 0 else 0))
     train_loader = build_loader(
         cfg, batch_size, seq_len, n_hosts, host_id,
-        total_steps=(
-            args.steps + args.warmup_steps
-            + int(args.post_repack_warmup_steps) + 2),
+        total_steps=train_step_budget + profile_step_budget,
         dummy_data=args.dummy_data)
     iterator = iter(train_loader)
 
@@ -548,113 +540,117 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
     params = variables["params"]
     params = shard_params_to_mesh(params, get_param_shardings(params, mesh))
 
-    optax_mod = require_optax()
-    optimizer = optax_mod.adamw(
-        learning_rate=float(train_cfg.get("lr", 3e-4)),
-        weight_decay=float(train_cfg.get("weight_decay", 0.0)))
-    opt_state = optimizer.init(params)
-
-    train_step = create_benchmark_train_step(model, optimizer, sharded_fns, cfg)
-    prev_metrics = None
-    _log("Compiling benchmark step...")
-    batch, iterator = next_batch(iterator, train_loader)
-    ids, mask = shard_batch_to_mesh(batch, data_sharding, batch_size, seq_len)
-    rng, step_rng = jax.random.split(rng)
-    compile_t0 = time.perf_counter()
-    params, opt_state, prev_metrics = train_step(
-        params, opt_state, ids, mask, step_rng, jnp.asarray(0, jnp.int32))
-    block_until_ready(prev_metrics)
-    compile_seconds = time.perf_counter() - compile_t0
     hbm_after = collect_hbm_stats()
-    _log(
-        "[bench] compile "
-        f"{compile_seconds:.3f}s "
-        f"HBM={fmt(hbm_after.get('hbm_used_gb'))}G "
-        f"peak={fmt(hbm_after.get('hbm_peak_gb'))}G")
-
+    compile_seconds = None
     warmup_times = []
     measure_times = []
     measure_tokens = []
     measure_sector_records = []
-    vq_layout_records = []
-    forced_repack_done = False
-    repack_metrics_host = {}
-    repack_seconds = None
-    post_repack_warmup_times = []
     peak_hbm = hbm_after.get("hbm_peak_gb")
     execution_step_no = 0
 
-    def run_benchmark_step(phase, phase_step, phase_total, step_no):
-        nonlocal params, opt_state, iterator, rng, peak_hbm, execution_step_no
-        del step_no
-        execution_step_no += 1
+    if args.fast_only:
+        _log(
+            "[bench] full train step skipped (--fast) "
+            f"HBM={fmt(hbm_after.get('hbm_used_gb'))}G "
+            f"peak={fmt(hbm_after.get('hbm_peak_gb'))}G")
+    else:
+        optax_mod = require_optax()
+        optimizer = optax_mod.adamw(
+            learning_rate=float(train_cfg.get("lr", 3e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 0.0)))
+        opt_state = optimizer.init(params)
+
+        train_step = create_benchmark_train_step(
+            model, optimizer, sharded_fns, cfg)
+        prev_metrics = None
+        _log("Compiling benchmark step...")
         batch, iterator = next_batch(iterator, train_loader)
         ids, mask = shard_batch_to_mesh(
             batch, data_sharding, batch_size, seq_len)
         rng, step_rng = jax.random.split(rng)
-        t0 = time.perf_counter()
-        params, opt_state, metrics = train_step(
-            params, opt_state, ids, mask, step_rng,
-            jnp.asarray(execution_step_no, jnp.int32))
-        block_until_ready(metrics)
-        seconds = time.perf_counter() - t0
-        hbm = collect_hbm_stats()
-        if hbm.get("hbm_peak_gb") is not None:
-            peak_hbm = (
-                hbm["hbm_peak_gb"] if peak_hbm is None
-                else max(peak_hbm, hbm["hbm_peak_gb"]))
-        tokens_per_second = float(batch_size) * float(seq_len) / seconds
-        metrics_host = jax.device_get(metrics)
-        write_jsonl_record(metrics_jsonl, benchmark_step_record(
-            run_index, variant_label, execution_step_no, phase, phase_step,
-            seconds, tokens_per_second, metrics_host, hbm))
-        _status(format_step_status(
-            phase, phase_step, phase_total, seconds, tokens_per_second,
-            metrics_host, hbm), persist=True)
-        step_sector_records = []
-        if model_version == V4168_MODEL_VERSION:
-            step_sector_records = sector_runtime_records(
-                metrics_host, cfg, execution_step_no, phase, run_index,
-                variant_label, seconds, hbm)
-            write_jsonl_records(metrics_jsonl, step_sector_records)
-        return seconds, tokens_per_second, step_sector_records
+        compile_t0 = time.perf_counter()
+        params, opt_state, prev_metrics = train_step(
+            params, opt_state, ids, mask, step_rng, jnp.asarray(0, jnp.int32))
+        block_until_ready(prev_metrics)
+        compile_seconds = time.perf_counter() - compile_t0
+        hbm_after = collect_hbm_stats()
+        peak_hbm = hbm_after.get("hbm_peak_gb")
+        _log(
+            "[bench] compile "
+            f"{compile_seconds:.3f}s "
+            f"HBM={fmt(hbm_after.get('hbm_used_gb'))}G "
+            f"peak={fmt(hbm_after.get('hbm_peak_gb'))}G")
 
-    total_to_run = int(args.warmup_steps) + int(args.steps)
-    for i in range(total_to_run):
-        phase = "warmup" if i < int(args.warmup_steps) else "measure"
-        step_no = i + 1
-        if (not forced_repack_done
-                and phase == "measure"
-                and model_version == V4168_MODEL_VERSION
-                and args.benchmark_force_vq_repack_before_measure):
-            _status(
-                "[vq] forcing v4168 V/RST repack before measured steps...",
-                persist=True)
-            (params, opt_state, new_layout_records, repack_metrics_host,
-             repack_seconds) = (
-                force_vq_repack_before_measure(
-                    params, opt_state, cfg, model_version, mesh, step_no,
-                    run_index, variant_label, metrics_jsonl))
-            vq_layout_records.extend(new_layout_records)
-            forced_repack_done = True
-            for post_i in range(int(args.post_repack_warmup_steps)):
-                post_seconds, _post_tokens, _post_sector_records = (
-                    run_benchmark_step(
-                        "post_repack_warmup", post_i + 1,
-                        int(args.post_repack_warmup_steps),
-                        step_no + post_i))
-                post_repack_warmup_times.append(post_seconds)
-        phase_step = step_no if phase == "warmup" else len(measure_times) + 1
-        phase_total = int(args.warmup_steps) if phase == "warmup" else int(args.steps)
-        seconds, tokens_per_second, step_sector_records = run_benchmark_step(
-            phase, phase_step, phase_total, step_no)
-        if phase == "warmup":
-            warmup_times.append(seconds)
-        else:
-            measure_times.append(seconds)
-            measure_tokens.append(tokens_per_second)
+        def run_benchmark_step(phase, phase_step, phase_total, step_no):
+            nonlocal params, opt_state, iterator, rng
+            nonlocal peak_hbm, execution_step_no
+            del step_no
+            execution_step_no += 1
+            batch, iterator = next_batch(iterator, train_loader)
+            ids, mask = shard_batch_to_mesh(
+                batch, data_sharding, batch_size, seq_len)
+            rng, step_rng = jax.random.split(rng)
+            t0 = time.perf_counter()
+            params, opt_state, metrics = train_step(
+                params, opt_state, ids, mask, step_rng,
+                jnp.asarray(execution_step_no, jnp.int32))
+            block_until_ready(metrics)
+            seconds = time.perf_counter() - t0
+            hbm = collect_hbm_stats()
+            if hbm.get("hbm_peak_gb") is not None:
+                peak_hbm = (
+                    hbm["hbm_peak_gb"] if peak_hbm is None
+                    else max(peak_hbm, hbm["hbm_peak_gb"]))
+            tokens_per_second = float(batch_size) * float(seq_len) / seconds
+            metrics_host = jax.device_get(metrics)
+            write_jsonl_record(metrics_jsonl, benchmark_step_record(
+                run_index, variant_label, execution_step_no, phase, phase_step,
+                seconds, tokens_per_second, metrics_host, hbm))
+            _status(format_step_status(
+                phase, phase_step, phase_total, seconds, tokens_per_second,
+                metrics_host, hbm), persist=True)
+            step_sector_records = []
             if model_version == V4168_MODEL_VERSION:
-                measure_sector_records.extend(step_sector_records)
+                step_sector_records = sector_runtime_records(
+                    metrics_host, cfg, execution_step_no, phase, run_index,
+                    variant_label, seconds, hbm)
+                write_jsonl_records(metrics_jsonl, step_sector_records)
+            return seconds, tokens_per_second, step_sector_records
+
+        total_to_run = int(args.warmup_steps) + int(args.steps)
+        for i in range(total_to_run):
+            phase = "warmup" if i < int(args.warmup_steps) else "measure"
+            step_no = i + 1
+            phase_step = step_no if phase == "warmup" else len(measure_times) + 1
+            phase_total = (
+                int(args.warmup_steps)
+                if phase == "warmup" else int(args.steps))
+            seconds, tokens_per_second, step_sector_records = (
+                run_benchmark_step(phase, phase_step, phase_total, step_no))
+            if phase == "warmup":
+                warmup_times.append(seconds)
+            else:
+                measure_times.append(seconds)
+                measure_tokens.append(tokens_per_second)
+                if model_version == V4168_MODEL_VERSION:
+                    measure_sector_records.extend(step_sector_records)
+
+    train_peak_hbm = None if args.fast_only else peak_hbm
+    train_mean_step_seconds = mean(measure_times)
+    profile_summary = {}
+    profile_records = []
+    if (int(args.forward_profile_steps) > 0
+            or int(args.module_profile_steps) > 0):
+        (profile_summary, profile_records, iterator, rng,
+         execution_step_no) = run_forward_profile(
+            model, sharded_fns, params, cfg, args, iterator, train_loader,
+            data_sharding, batch_size, seq_len, rng, run_index,
+            variant_label, execution_step_no, train_mean_step_seconds)
+        write_jsonl_records(metrics_jsonl, profile_records)
+        peak_hbm = update_peak_hbm(
+            peak_hbm, {"hbm_peak_gb": profile_summary.get(
+                "profile_peak_hbm_gb")})
 
     xla_report = collect_xla_memory_report(xla_dump_dir) if xla_dump_dir else {}
     sector_summary = summarize_sector_records(measure_sector_records)
@@ -670,26 +666,19 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
         "variant": variant_label,
         "overrides": dict(overrides or {}),
         "model_version": model_version,
+        "train_benchmark_enabled": not bool(args.fast_only),
         "compile_seconds": compile_seconds,
-        "warmup_steps": int(args.warmup_steps),
-        "post_repack_warmup_steps": int(
-            args.post_repack_warmup_steps
-            if forced_repack_done else 0),
-        "measure_steps": int(args.steps),
-        "repack_seconds": repack_seconds,
-        "post_repack_warmup_mean_step_seconds": mean(
-            post_repack_warmup_times),
-        "mean_step_seconds": mean(measure_times),
-        "mean_step_seconds_without_repack": mean(measure_times),
-        "mean_step_seconds_plus_amortized_repack_100": (
-            mean(measure_times) + (float(repack_seconds) / 100.0)
-            if measure_times and repack_seconds is not None
-            else mean(measure_times)),
+        "warmup_steps": 0 if args.fast_only else int(args.warmup_steps),
+        "measure_steps": 0 if args.fast_only else int(args.steps),
+        "configured_warmup_steps": int(args.warmup_steps),
+        "configured_measure_steps": int(args.steps),
+        "mean_step_seconds": train_mean_step_seconds,
         "median_step_seconds": median(measure_times),
         "p90_step_seconds": percentile(measure_times, 90),
         "min_step_seconds": min(measure_times) if measure_times else None,
         "max_step_seconds": max(measure_times) if measure_times else None,
         "mean_tokens_per_second": mean(measure_tokens),
+        "train_peak_hbm_gb": train_peak_hbm,
         "peak_hbm_gb": peak_hbm,
         "hbm_limit_gb": hbm_after.get("hbm_limit_gb"),
         "xla_total_hbm_usage": xla_report.get("total_hbm_usage"),
@@ -698,17 +687,10 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
         "xla_source_file": xla_report.get("source_file"),
         "benchmark_valid": benchmark_valid,
         "invalid_reason": invalid_reason,
-        "forced_repack_before_measure": bool(
-            args.benchmark_force_vq_repack_before_measure
-            and model_version == V4168_MODEL_VERSION),
         "sector_summary": sector_summary,
         "compute_summary": compute_summary,
-        "vq_layout_records": vq_layout_records,
-        "repack_metrics": {
-            key: float(value)
-            for key, value in (repack_metrics_host or {}).items()
-        },
     }
+    summary.update(profile_summary)
     write_jsonl_record(metrics_jsonl, {
         "type": "benchmark_summary",
         "run_index": int(run_index),
@@ -770,6 +752,170 @@ def model_kwargs(cfg):
     return kw
 
 
+def _ceil_to_multiple(value, multiple):
+    value = int(value)
+    multiple = max(1, int(multiple))
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def v4168_operation_space_enabled(cfg):
+    version = str(cfg["model"].get("model_version", ""))
+    opspace = cfg["training"].get("operation_space", {})
+    return (
+        version == V4168_MODEL_VERSION
+        and isinstance(opspace, dict)
+        and bool(opspace.get("enabled", False))
+    )
+
+
+def v4168_operation_space_layouts(cfg):
+    if not v4168_operation_space_enabled(cfg):
+        return {}
+    t = cfg["training"]
+    m = cfg["model"]
+    opspace = t.get("operation_space", {})
+    if not isinstance(opspace, dict):
+        raise ValueError("training.operation_space must be a mapping.")
+    tile_size = int(opspace.get("tile_size", 128))
+    if tile_size <= 0:
+        raise ValueError(
+            f"training.operation_space.tile_size must be > 0, got {tile_size}.")
+    pools = opspace.get("pools", {})
+    if pools is None:
+        pools = {}
+    if not isinstance(pools, dict):
+        raise ValueError("training.operation_space.pools must be a mapping.")
+    mesh_model = max(1, int(t.get("mesh_model", 1)))
+    defaults = {
+        "qk": ("n_qk", "factorized_lane_mean", "dense_masked", 8, 4),
+        "v": ("n_v", "factorized_lane_mean", "dense_masked", 8, 5),
+        "rst": ("n_rst", "factorized_lane_mean", "block_bucketed_dense", 32, 32),
+    }
+    layouts = {}
+    for pool, (n_key, default_routing, default_execution,
+               default_lanes, default_k_exec) in defaults.items():
+        pool_cfg = pools.get(pool, {})
+        if pool_cfg is None:
+            pool_cfg = {}
+        if not isinstance(pool_cfg, dict):
+            raise ValueError(
+                f"training.operation_space.pools.{pool} must be a mapping.")
+        routing_mode = str(pool_cfg.get(
+            "routing_mode", pool_cfg.get("mode", default_routing))).lower()
+        if routing_mode not in ("factorized_lane_mean", "fixed_k4_repack_v1"):
+            raise ValueError(
+                f"training.operation_space.pools.{pool}.routing_mode must be "
+                "'factorized_lane_mean' or 'fixed_k4_repack_v1', got "
+                f"{routing_mode!r}.")
+        execution_mode = str(pool_cfg.get(
+            "execution_mode", default_execution)).lower()
+        valid_execution_modes = (
+            "dense_masked",
+            "block_bucketed_dense",
+            "block_bucketed_pallas_final",
+        )
+        if execution_mode not in valid_execution_modes:
+            raise ValueError(
+                f"training.operation_space.pools.{pool}.execution_mode must be "
+                "'dense_masked', 'block_bucketed_dense', or "
+                f"'block_bucketed_pallas_final', got {execution_mode!r}.")
+        if execution_mode == "block_bucketed_pallas_final" and pool != "rst":
+            raise ValueError(
+                "block_bucketed_pallas_final is only supported for the RST "
+                "single-route backend in v4168 benchmark mode.")
+        lanes = int(pool_cfg.get("lanes", default_lanes))
+        if lanes <= 0:
+            raise ValueError(
+                f"training.operation_space.pools.{pool}.lanes must be > 0, "
+                f"got {lanes}.")
+        k_exec = int(pool_cfg.get("k_exec", default_k_exec))
+        if k_exec <= 0 or k_exec > lanes:
+            raise ValueError(
+                f"training.operation_space.pools.{pool}.k_exec must be in "
+                f"[1, lanes={lanes}], got {k_exec}.")
+        n_ops = int(m.get(n_key, m.get("n_know", 0) if pool == "rst" else 0))
+        if n_ops <= 0:
+            raise ValueError(f"model.{n_key} must be > 0 for operation_space.")
+        raw_tiles = (n_ops + tile_size - 1) // tile_size
+        total_tiles = _ceil_to_multiple(raw_tiles, math.lcm(lanes, mesh_model))
+        tiles_per_lane = total_tiles // lanes
+        exec_default = (
+            2 if execution_mode in (
+                "block_bucketed_dense", "block_bucketed_pallas_final") else 1)
+        exec_tiles_per_block = int(pool_cfg.get(
+            "exec_tiles_per_block", exec_default))
+        if exec_tiles_per_block <= 0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{pool}.exec_tiles_per_block must be > 0, got "
+                f"{exec_tiles_per_block}.")
+        if tiles_per_lane % exec_tiles_per_block != 0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{pool}.exec_tiles_per_block={exec_tiles_per_block} must "
+                f"divide tiles_per_lane={tiles_per_lane}.")
+        block_size = tile_size * exec_tiles_per_block
+        bucket_capacity_factor = float(pool_cfg.get(
+            "bucket_capacity_factor",
+            1.5 if execution_mode == "block_bucketed_pallas_final" else 1.25))
+        bucket_chunk_size = int(pool_cfg.get(
+            "bucket_chunk_size",
+            128 if execution_mode == "block_bucketed_pallas_final" else 1024))
+        layouts[pool] = {
+            "routing_mode": routing_mode,
+            "execution_mode": execution_mode,
+            "lanes": lanes,
+            "k_exec": k_exec,
+            "tile_size": tile_size,
+            "raw_tiles": raw_tiles,
+            "total_tiles": total_tiles,
+            "tiles_per_lane": tiles_per_lane,
+            "exec_tiles_per_block": exec_tiles_per_block,
+            "blocks_per_lane": tiles_per_lane // exec_tiles_per_block,
+            "block_size": block_size,
+            "padded_ops": total_tiles * tile_size - n_ops,
+            "bucket_capacity_factor": bucket_capacity_factor,
+            "bucket_chunk_size": bucket_chunk_size,
+            "assignment_policy": str(pool_cfg.get(
+                "assignment_policy",
+                "low_regret"
+                if execution_mode == "block_bucketed_pallas_final"
+                else "token_order")).lower(),
+            "high_regret_threshold": float(pool_cfg.get(
+                "high_regret_threshold", 0.05)),
+            "lane_output_mode": str(pool_cfg.get(
+                "lane_output_mode",
+                "lane_local"
+                if execution_mode == "block_bucketed_pallas_final"
+                else "scatter_add")).lower(),
+        }
+    return layouts
+
+
+def v4168_operation_space_pool_kwargs(layout):
+    return {
+        "operation_space_mode": str(layout["routing_mode"]).lower(),
+        "operation_space_routing_mode": str(layout["routing_mode"]).lower(),
+        "operation_space_execution_mode": str(layout["execution_mode"]).lower(),
+        "opspace_lanes": int(layout["lanes"]),
+        "opspace_tiles_per_lane": int(layout["tiles_per_lane"]),
+        "opspace_exec_tiles_per_block": int(layout["exec_tiles_per_block"]),
+        "opspace_blocks_per_lane": int(layout["blocks_per_lane"]),
+        "opspace_block_size": int(layout["block_size"]),
+        "opspace_padded_ops": int(layout["padded_ops"]),
+        "opspace_tile_size": int(layout["tile_size"]),
+        "opspace_k_exec": int(layout["k_exec"]),
+        "opspace_bucket_capacity_factor": float(
+            layout["bucket_capacity_factor"]),
+        "opspace_bucket_chunk_size": int(layout["bucket_chunk_size"]),
+        "opspace_assignment_policy": str(
+            layout["assignment_policy"]).lower(),
+        "opspace_high_regret_threshold": float(
+            layout["high_regret_threshold"]),
+        "opspace_lane_output_mode": str(layout["lane_output_mode"]).lower(),
+    }
+
+
 def build_sharded_fns(cfg, mesh):
     version = str(cfg["model"].get("model_version", ""))
     module_name, _class_name = MODEL_MODULES[version]
@@ -782,6 +928,8 @@ def build_sharded_fns(cfg, mesh):
         _log(f"v4168 bucket_capacity_mult override: {float(capacity_mult)}")
     make_single = getattr(module, "make_sharded_srw_minimal", None)
     make_paired = getattr(module, "make_sharded_srw_paired_minimal", None)
+    make_paired_dense = getattr(
+        module, "make_sharded_srw_paired_dense_minimal", None)
     if make_single is None or make_paired is None:
         raise RuntimeError(f"{module_name} does not expose minimal SRW factories.")
     t = cfg["training"]
@@ -806,6 +954,9 @@ def build_sharded_fns(cfg, mesh):
             return dict(kwargs)
         return {k: v for k, v in kwargs.items() if k in sig.parameters}
 
+    opspace_enabled = v4168_operation_space_enabled(cfg)
+    opspace_layouts = v4168_operation_space_layouts(cfg)
+
     def pool_kwargs(pool):
         kwargs = dict(base_kwargs)
         if version == V4168_MODEL_VERSION:
@@ -820,6 +971,9 @@ def build_sharded_fns(cfg, mesh):
                     t.get("hardware_sector_debug_token_gather_fallback", False)),
                 "benchmark_runtime_metrics": True,
             })
+            if opspace_enabled:
+                kwargs.update(v4168_operation_space_pool_kwargs(
+                    opspace_layouts[pool]))
         return kwargs
 
     attn_v_single = make_single(
@@ -833,9 +987,18 @@ def build_sharded_fns(cfg, mesh):
         attn_qk_single = make_single(
             max_chunk_size=qk_chunk,
             **filtered(make_single, pool_kwargs("qk")))
-    attn_qk_paired = make_paired(
-        max_chunk_size=qk_chunk,
-        **filtered(make_paired, pool_kwargs("qk")))
+    if opspace_enabled:
+        if make_paired_dense is None:
+            raise RuntimeError(
+                "operation_space enabled but v4168 paired dense minimal "
+                "QK factory is missing.")
+        attn_qk_paired = make_paired_dense(
+            max_chunk_size=qk_chunk,
+            **filtered(make_paired_dense, pool_kwargs("qk")))
+    else:
+        attn_qk_paired = make_paired(
+            max_chunk_size=qk_chunk,
+            **filtered(make_paired, pool_kwargs("qk")))
     out = {
         "single": attn_v_single,
         "attn_v_single": attn_v_single,
@@ -848,45 +1011,107 @@ def build_sharded_fns(cfg, mesh):
     }
     if attn_qk_single is not None:
         out["attn_qk_single_minimal"] = attn_qk_single
-    _log("sharded SRW kernels: enabled")
+    if opspace_enabled:
+        out.update({
+            "operation_space_tau_free": True,
+            "qk_backend": opspace_layouts["qk"]["execution_mode"],
+            "v_backend": opspace_layouts["v"]["execution_mode"],
+            "rst_backend": opspace_layouts["rst"]["execution_mode"],
+        })
+        _log(
+            "sharded SRW kernels: operation_space "
+            f"qk/v/rst={out['qk_backend']}/{out['v_backend']}/"
+            f"{out['rst_backend']}")
+    else:
+        _log("sharded SRW kernels: enabled")
     return out
+
+
+def benchmark_apply_kwargs(cfg, version, sharded_fns, attention_mask, rng, step):
+    t = cfg["training"]
+    soft_gate_t = float(t.get("soft_gate_temperature", 0.07))
+    boundary_power = float(t.get(
+        "soft_gate_boundary_power_final",
+        t.get("soft_gate_boundary_power_mid",
+              t.get("soft_gate_boundary_power_start", 4.0))))
+    admission_den_power = float(t.get("admission_den_power", 1.0))
+    tokens_per_step = (
+        int(t["batch_size"])
+        * int(cfg["model"].get("max_seq_len", 512)))
+    out = {
+        "attention_mask": attention_mask,
+        "deterministic": True,
+        "rngs": {"dropout": rng},
+        "sharded_fns": sharded_fns,
+        "minimal_train": True,
+        "soft_gate_temperature": soft_gate_t,
+        "soft_gate_t_final": soft_gate_t,
+        "soft_gate_T_qk": soft_gate_t,
+        "soft_gate_T_v": soft_gate_t,
+        "soft_gate_T_rst": soft_gate_t,
+        "soft_gate_boundary_power": boundary_power,
+        "soft_gate_boundary_power_final": boundary_power,
+        "admission_den_power": admission_den_power,
+        "execution_prune_eps": 0.0,
+    }
+    if version == V4168_MODEL_VERSION:
+        training_tokens = (
+            jnp.asarray(step, dtype=jnp.float32)
+            * jnp.asarray(float(tokens_per_step), dtype=jnp.float32))
+        out["training_tokens"] = training_tokens
+        out["benchmark_runtime_metrics"] = True
+    return out
+
+
+def copy_runtime_metrics(result, metrics):
+    for pool in ("attn_v", "rst"):
+        for name in SECTOR_RUNTIME_METRIC_NAMES:
+            key = f"sector/{pool}/{name}"
+            if key in result:
+                metrics[key] = result[key]
+        for name in OPSPACE_RUNTIME_METRIC_NAMES:
+            key = f"opspace/{pool}/{name}"
+            if key in result:
+                metrics[key] = result[key]
+        for name in OPSPACE_FINAL_RUNTIME_METRIC_NAMES:
+            key = f"opspace/{pool}/final/{name}"
+            if key in result:
+                metrics[key] = result[key]
+    return metrics
+
+
+def create_benchmark_forward_step(model, sharded_fns, cfg):
+    version = str(cfg["model"].get("model_version", ""))
+
+    @jax.jit
+    def forward_step(params, input_ids, attention_mask, rng, step):
+        apply_kwargs = benchmark_apply_kwargs(
+            cfg, version, sharded_fns, attention_mask, rng, step)
+        result = model.apply(
+            {"params": params}, input_ids, labels=input_ids, **apply_kwargs)
+        loss = result["loss"] + result.get("aux_loss", jnp.float32(0.0))
+        metrics = {
+            "loss": loss,
+            "ce_loss": result["loss"],
+            "aux_loss": result.get("aux_loss", jnp.float32(0.0)),
+            "valid_count": result.get("valid_count", jnp.float32(0.0)),
+        }
+        return copy_runtime_metrics(result, metrics)
+
+    return forward_step
 
 
 def create_benchmark_train_step(model, optimizer, sharded_fns, cfg):
     optax_mod = require_optax()
-    t = cfg["training"]
     version = str(cfg["model"].get("model_version", ""))
-    soft_gate_t = float(t.get("soft_gate_temperature", 0.07))
-    boundary_power = float(t.get("soft_gate_boundary_power_final",
-                                 t.get("soft_gate_boundary_power_mid",
-                                       t.get("soft_gate_boundary_power_start", 4.0))))
-    admission_den_power = float(t.get("admission_den_power", 1.0))
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, rng, step):
-        del step
-
         def loss_fn(p):
-            apply_kwargs = {
-                "labels": input_ids,
-                "attention_mask": attention_mask,
-                "deterministic": True,
-                "rngs": {"dropout": rng},
-                "sharded_fns": sharded_fns,
-                "minimal_train": True,
-                "soft_gate_temperature": soft_gate_t,
-                "soft_gate_t_final": soft_gate_t,
-                "soft_gate_T_qk": soft_gate_t,
-                "soft_gate_T_v": soft_gate_t,
-                "soft_gate_T_rst": soft_gate_t,
-                "soft_gate_boundary_power": boundary_power,
-                "soft_gate_boundary_power_final": boundary_power,
-                "admission_den_power": admission_den_power,
-                "execution_prune_eps": 0.0,
-            }
-            if version == V4168_MODEL_VERSION:
-                apply_kwargs["benchmark_runtime_metrics"] = True
-            result = model.apply({"params": p}, input_ids, **apply_kwargs)
+            apply_kwargs = benchmark_apply_kwargs(
+                cfg, version, sharded_fns, attention_mask, rng, step)
+            result = model.apply(
+                {"params": p}, input_ids, labels=input_ids, **apply_kwargs)
             loss = result["loss"] + result.get("aux_loss", jnp.float32(0.0))
             return loss, result
 
@@ -901,20 +1126,7 @@ def create_benchmark_train_step(model, optimizer, sharded_fns, cfg):
             "grad_norm": optax_mod.global_norm(grads),
             "valid_count": result.get("valid_count", jnp.float32(0.0)),
         }
-        for pool in ("attn_v", "rst"):
-            for name in SECTOR_RUNTIME_METRIC_NAMES:
-                key = f"sector/{pool}/{name}"
-                if key in result:
-                    metrics[key] = result[key]
-            for name in OPSPACE_RUNTIME_METRIC_NAMES:
-                key = f"opspace/{pool}/{name}"
-                if key in result:
-                    metrics[key] = result[key]
-            for name in OPSPACE_FINAL_RUNTIME_METRIC_NAMES:
-                key = f"opspace/{pool}/final/{name}"
-                if key in result:
-                    metrics[key] = result[key]
-        return params, opt_state, metrics
+        return params, opt_state, copy_runtime_metrics(result, metrics)
 
     return train_step
 
@@ -1076,6 +1288,504 @@ def write_jsonl_record(path, record):
 def write_jsonl_records(path, records):
     for record in records:
         write_jsonl_record(path, record)
+
+
+def block_value(value):
+    jax.block_until_ready(jax.tree.leaves(value))
+    return value
+
+
+def hbm_peak_value(hbm):
+    return num(hbm.get("hbm_peak_gb"))
+
+
+def hbm_used_value(hbm):
+    return num(hbm.get("hbm_used_gb"))
+
+
+def update_peak_hbm(current_peak, hbm):
+    peak = hbm_peak_value(hbm)
+    if peak is None:
+        return current_peak
+    return peak if current_peak is None else max(current_peak, peak)
+
+
+def benchmark_profile_record(run_index, variant_label, phase, step, op, group,
+                             seconds, batch_size, seq_len, hbm,
+                             hbm_before=None, layer=None, note=None):
+    used = hbm_used_value(hbm)
+    peak = hbm_peak_value(hbm)
+    before_used = hbm_used_value(hbm_before or {})
+    before_peak = hbm_peak_value(hbm_before or {})
+    tokens_per_second = (
+        float(batch_size) * float(seq_len) / float(seconds)
+        if seconds and seconds > 0.0 else None)
+    record = {
+        "type": "benchmark_profile",
+        "run_index": int(run_index),
+        "variant": variant_label,
+        "phase": phase,
+        "step": int(step),
+        "op": op,
+        "group": group,
+        "seconds": float(seconds),
+        "tokens_per_second": json_float(tokens_per_second, None),
+        "hbm_used_gb": json_float(used, None),
+        "hbm_peak_gb": json_float(peak, None),
+        "hbm_used_delta_gb": json_float(
+            used - before_used
+            if used is not None and before_used is not None else None,
+            None),
+        "hbm_peak_delta_gb": json_float(
+            peak - before_peak
+            if peak is not None and before_peak is not None else None,
+            None),
+    }
+    if layer is not None:
+        record["layer"] = int(layer)
+    if note:
+        record["note"] = note
+    return record
+
+
+def profile_timed_call(fn, *args):
+    t0 = time.perf_counter()
+    value = fn(*args)
+    block_value(value)
+    return value, time.perf_counter() - t0
+
+
+def create_module_profile_fns(cfg, sharded_fns):
+    version = str(cfg["model"].get("model_version", ""))
+    module = importlib.import_module(MODEL_MODULES[version][0])
+    t = cfg["training"]
+    m = cfg["model"]
+    n_layers = int(m["n_layers"])
+    n_heads = int(m["n_heads"])
+    d_model = int(m["d_model"])
+    n_qk = int(m.get("n_qk", m.get("n_q", 0)))
+    n_v = int(m.get("n_v", 0))
+    dropout_rate = float(m.get("dropout", m.get("dropout_rate", 0.0)))
+    router_dropout = float(m.get("router_dropout", 0.0))
+    soft_gate_t = float(t.get("soft_gate_temperature", 0.07))
+    boundary_power = float(t.get(
+        "soft_gate_boundary_power_final",
+        t.get("soft_gate_boundary_power_mid",
+              t.get("soft_gate_boundary_power_start", 4.0))))
+    admission_den_power = float(t.get("admission_den_power", 1.0))
+    tokens_per_step = (
+        int(t["batch_size"])
+        * int(m.get("max_seq_len", 512)))
+
+    def training_tokens(step):
+        return (
+            jnp.asarray(step, dtype=jnp.float32)
+            * jnp.asarray(float(tokens_per_step), dtype=jnp.float32))
+
+    @jax.jit
+    def embed_step(token_embedding, pos_embedding, input_ids):
+        positions = jnp.arange(input_ids.shape[1])[jnp.newaxis, :]
+        return token_embedding[input_ids] + pos_embedding[positions]
+
+    @jax.jit
+    def attn_step(pool_params, router_params, block_params, x, rng, step):
+        normed = module._layer_norm(
+            x, block_params["norm1"]["scale"], block_params["norm1"]["bias"])
+        if version == V4168_MODEL_VERSION:
+            attn_out, sector_diag, opspace_diag, opspace_aux = (
+                module._attn_forward_minimal(
+                    normed, pool_params, router_params,
+                    block_params["attn"]["expand_O"]["kernel"], rng,
+                    n_qk, n_v, n_heads, d_model, n_layers,
+                    router_dropout, dropout_rate, True,
+                    sharded_fns=sharded_fns,
+                    soft_gate_temperature=soft_gate_t,
+                    soft_gate_t_final=soft_gate_t,
+                    soft_gate_T_qk=soft_gate_t,
+                    soft_gate_T_v=soft_gate_t,
+                    soft_gate_boundary_power=boundary_power,
+                    soft_gate_boundary_power_final=boundary_power,
+                    admission_den_power=admission_den_power,
+                    execution_prune_eps=0.0,
+                    training_tokens=training_tokens(step)))
+            diag_guard = (
+                jnp.sum(sector_diag)
+                + jnp.sum(opspace_diag)
+                + module._opspace_aux_loss(opspace_aux))
+        else:
+            attn_out = module._attn_forward_minimal(
+                normed, pool_params, router_params,
+                block_params["attn"]["expand_O"]["kernel"], rng,
+                n_qk, n_v, n_heads, d_model, n_layers,
+                router_dropout, dropout_rate, True,
+                sharded_fns=sharded_fns,
+                soft_gate_temperature=soft_gate_t,
+                soft_gate_t_final=soft_gate_t,
+                soft_gate_T_qk=soft_gate_t,
+                soft_gate_T_v=soft_gate_t,
+                soft_gate_boundary_power=boundary_power,
+                soft_gate_boundary_power_final=boundary_power,
+                admission_den_power=admission_den_power,
+                execution_prune_eps=0.0)
+            diag_guard = jnp.mean(attn_out)
+        return x + attn_out, diag_guard
+
+    @jax.jit
+    def rst_step(pool_params, router_params, block_params, x, rng, step):
+        normed = module._layer_norm(
+            x, block_params["norm2"]["scale"], block_params["norm2"]["bias"])
+        if version == V4168_MODEL_VERSION:
+            rst_out, sector_diag, opspace_diag, opspace_aux = (
+                module._rst_forward_minimal(
+                    normed, pool_params, router_params, rng,
+                    router_dropout, dropout_rate, True,
+                    sharded_fns=sharded_fns,
+                    d_model=d_model,
+                    n_layers=n_layers,
+                    soft_gate_temperature=soft_gate_t,
+                    soft_gate_t_final=soft_gate_t,
+                    soft_gate_T_rst=soft_gate_t,
+                    soft_gate_boundary_power=boundary_power,
+                    soft_gate_boundary_power_final=boundary_power,
+                    admission_den_power=admission_den_power,
+                    execution_prune_eps=0.0,
+                    training_tokens=training_tokens(step)))
+            diag_guard = (
+                jnp.sum(sector_diag)
+                + jnp.sum(opspace_diag)
+                + module._opspace_aux_loss(opspace_aux))
+        else:
+            rst_out = module._rst_forward_minimal(
+                normed, pool_params, router_params, rng,
+                router_dropout, dropout_rate, True,
+                sharded_fns=sharded_fns,
+                d_model=d_model,
+                n_layers=n_layers,
+                soft_gate_temperature=soft_gate_t,
+                soft_gate_t_final=soft_gate_t,
+                soft_gate_T_rst=soft_gate_t,
+                soft_gate_boundary_power=boundary_power,
+                soft_gate_boundary_power_final=boundary_power,
+                admission_den_power=admission_den_power,
+                execution_prune_eps=0.0)
+            diag_guard = jnp.mean(rst_out)
+        return x + rst_out, diag_guard
+
+    @jax.jit
+    def final_loss_step(norm_scale, norm_bias, embedding_matrix, x, labels):
+        x = module._layer_norm(x, norm_scale, norm_bias)
+        shift_x = x[:, :-1, :]
+        shift_labels = labels[:, 1:].astype(jnp.int32)
+        valid_mask = shift_labels != -100
+        loss, correct, valid_count = module._chunked_ce_loss_and_acc(
+            shift_x, embedding_matrix, shift_labels, valid_mask)
+        return {
+            "loss": loss,
+            "correct": correct,
+            "valid_count": valid_count,
+        }
+
+    return {
+        "module": module,
+        "model_version": version,
+        "embed_step": embed_step,
+        "attn_step": attn_step,
+        "rst_step": rst_step,
+        "final_loss_step": final_loss_step,
+        "n_layers": n_layers,
+    }
+
+
+def run_module_profile_pass(profile_fns, params, input_ids, rng, step,
+                            run_index, variant_label, batch_size,
+                            seq_len, phase, record=True):
+    module = profile_fns["module"]
+    records = []
+    hbm_before = collect_hbm_stats()
+    t0 = time.perf_counter()
+    pool_params = module._pool_params_with_operator_keys(params["neuron_pool"])
+    block_value(pool_params)
+    seconds = time.perf_counter() - t0
+    hbm_after = collect_hbm_stats()
+    if record:
+        records.append(benchmark_profile_record(
+            run_index, variant_label, phase, step, "op_key_setup", "setup",
+            seconds, batch_size, seq_len, hbm_after,
+            hbm_before=hbm_before,
+            note="shared op-key materialization"))
+
+    hbm_before = hbm_after
+    (x, seconds) = profile_timed_call(
+        profile_fns["embed_step"],
+        params["token_emb"]["embedding"],
+        params["pos_emb"]["embedding"],
+        input_ids)
+    hbm_after = collect_hbm_stats()
+    if record:
+        records.append(benchmark_profile_record(
+            run_index, variant_label, phase, step, "embedding", "embedding",
+            seconds, batch_size, seq_len, hbm_after,
+            hbm_before=hbm_before))
+
+    router_params = params["router"]
+    layer_rngs = jax.random.split(rng, int(profile_fns["n_layers"]))
+    step_array = jnp.asarray(step, dtype=jnp.int32)
+    for layer_idx in range(int(profile_fns["n_layers"])):
+        layer_rng = layer_rngs[layer_idx]
+        layer_rng, rng_attn, rng_rst = jax.random.split(layer_rng, 3)
+        block_params = params[f"block_{layer_idx}"]
+
+        hbm_before = hbm_after
+        (attn_result, seconds) = profile_timed_call(
+            profile_fns["attn_step"],
+            pool_params, router_params, block_params, x, rng_attn, step_array)
+        x = attn_result[0]
+        hbm_after = collect_hbm_stats()
+        if record:
+            records.append(benchmark_profile_record(
+                run_index, variant_label, phase, step,
+                f"layer_{layer_idx:02d}.attn", "attn",
+                seconds, batch_size, seq_len, hbm_after,
+                hbm_before=hbm_before, layer=layer_idx))
+
+        hbm_before = hbm_after
+        (rst_result, seconds) = profile_timed_call(
+            profile_fns["rst_step"],
+            pool_params, router_params, block_params, x, rng_rst, step_array)
+        x = rst_result[0]
+        hbm_after = collect_hbm_stats()
+        if record:
+            records.append(benchmark_profile_record(
+                run_index, variant_label, phase, step,
+                f"layer_{layer_idx:02d}.rst", "rst",
+                seconds, batch_size, seq_len, hbm_after,
+                hbm_before=hbm_before, layer=layer_idx))
+
+    hbm_before = hbm_after
+    (_loss_metrics, seconds) = profile_timed_call(
+        profile_fns["final_loss_step"],
+        params["norm"]["scale"],
+        params["norm"]["bias"],
+        params["token_emb"]["embedding"],
+        x,
+        input_ids)
+    hbm_after = collect_hbm_stats()
+    if record:
+        records.append(benchmark_profile_record(
+            run_index, variant_label, phase, step, "final_norm_ce_loss",
+            "loss", seconds, batch_size, seq_len, hbm_after,
+            hbm_before=hbm_before,
+            note="final layer norm plus chunked CE"))
+    return records
+
+
+def summarize_profile_records(records):
+    measured = [
+        r for r in records
+        if r.get("phase") in ("fast_forward_measure", "module_measure")]
+    groups = {}
+    layer_rows = {}
+    module_records = [
+        r for r in measured if r.get("phase") == "module_measure"]
+    module_total_s = sum(float(r.get("seconds", 0.0)) for r in module_records)
+    for record in measured:
+        group = record.get("group", "unknown")
+        row = groups.setdefault(group, {
+            "calls": 0,
+            "total_seconds": 0.0,
+            "max_hbm_peak_gb": None,
+            "max_hbm_used_delta_gb": None,
+        })
+        row["calls"] += 1
+        row["total_seconds"] += float(record.get("seconds", 0.0))
+        peak = num(record.get("hbm_peak_gb"))
+        delta = num(record.get("hbm_used_delta_gb"))
+        if peak is not None:
+            row["max_hbm_peak_gb"] = (
+                peak if row["max_hbm_peak_gb"] is None
+                else max(row["max_hbm_peak_gb"], peak))
+        if delta is not None:
+            row["max_hbm_used_delta_gb"] = (
+                delta if row["max_hbm_used_delta_gb"] is None
+                else max(row["max_hbm_used_delta_gb"], delta))
+        if record.get("layer") is not None:
+            layer = int(record["layer"])
+            layer_row = layer_rows.setdefault(layer, {})
+            layer_row[record["group"]] = record
+
+    aggregates = []
+    for group, row in groups.items():
+        calls = max(1, int(row["calls"]))
+        total_s = float(row["total_seconds"])
+        pct_split = (
+            total_s / module_total_s * 100.0
+            if module_total_s and group != "fast_forward" else None)
+        aggregates.append({
+            "group": group,
+            "calls": int(row["calls"]),
+            "total_seconds": total_s,
+            "mean_seconds": total_s / calls,
+            "pct_module_split": pct_split,
+            "max_hbm_peak_gb": row["max_hbm_peak_gb"],
+            "max_hbm_used_delta_gb": row["max_hbm_used_delta_gb"],
+        })
+    order = {
+        "fast_forward": 0,
+        "setup": 1,
+        "embedding": 2,
+        "attn": 3,
+        "rst": 4,
+        "loss": 5,
+    }
+    aggregates.sort(key=lambda r: order.get(r["group"], 99))
+    layer_summary = []
+    for layer, row in sorted(layer_rows.items()):
+        attn_s = num((row.get("attn") or {}).get("seconds"))
+        rst_s = num((row.get("rst") or {}).get("seconds"))
+        layer_summary.append({
+            "layer": int(layer),
+            "attn_seconds": attn_s,
+            "rst_seconds": rst_s,
+            "attn_hbm_peak_gb": num(
+                (row.get("attn") or {}).get("hbm_peak_gb")),
+            "rst_hbm_peak_gb": num(
+                (row.get("rst") or {}).get("hbm_peak_gb")),
+            "rst_over_attn": ratio_float(rst_s, attn_s),
+        })
+    return aggregates, layer_summary
+
+
+def ratio_float(a, b):
+    a = num(a)
+    b = num(b)
+    if a is None or b is None or abs(float(b)) < 1.0e-12:
+        return None
+    return float(a) / float(b)
+
+
+def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
+                        data_sharding, batch_size, seq_len, rng, run_index,
+                        variant_label, start_step, train_mean_seconds):
+    records = []
+    summary = {}
+    next_step = int(start_step)
+    peak_hbm = None
+    forward_step = create_benchmark_forward_step(model, sharded_fns, cfg)
+
+    def next_profile_batch():
+        nonlocal iterator, rng, next_step
+        next_step += 1
+        batch, iterator = next_batch(iterator, loader)
+        ids, mask = shard_batch_to_mesh(
+            batch, data_sharding, batch_size, seq_len)
+        rng, step_rng = jax.random.split(rng)
+        return batch, ids, mask, step_rng, next_step
+
+    fast_times = []
+    fast_tokens = []
+    if int(args.forward_profile_steps) > 0:
+        _log("Compiling forward-only benchmark step...")
+        batch, ids, mask, step_rng, step_no = next_profile_batch()
+        hbm_before = collect_hbm_stats()
+        t0 = time.perf_counter()
+        metrics = forward_step(
+            params, ids, mask, step_rng, jnp.asarray(step_no, jnp.int32))
+        block_value(metrics)
+        compile_seconds = time.perf_counter() - t0
+        hbm = collect_hbm_stats()
+        peak_hbm = update_peak_hbm(peak_hbm, hbm)
+        records.append(benchmark_profile_record(
+            run_index, variant_label, "fast_forward_compile", step_no,
+            "fast_forward_loss", "fast_forward", compile_seconds,
+            batch_size, seq_len, hbm, hbm_before=hbm_before,
+            note="compile plus first forward-only execution"))
+        _log(
+            "[forward] compile "
+            f"{compile_seconds:.3f}s {hbm_inline(hbm)}")
+
+        for profile_i in range(int(args.forward_profile_steps)):
+            batch, ids, mask, step_rng, step_no = next_profile_batch()
+            hbm_before = collect_hbm_stats()
+            t0 = time.perf_counter()
+            metrics = forward_step(
+                params, ids, mask, step_rng, jnp.asarray(step_no, jnp.int32))
+            block_value(metrics)
+            seconds = time.perf_counter() - t0
+            hbm = collect_hbm_stats()
+            peak_hbm = update_peak_hbm(peak_hbm, hbm)
+            tok_s = float(batch_size) * float(seq_len) / seconds
+            fast_times.append(seconds)
+            fast_tokens.append(tok_s)
+            metrics_host = jax.device_get(metrics)
+            records.append(benchmark_profile_record(
+                run_index, variant_label, "fast_forward_measure", step_no,
+                "fast_forward_loss", "fast_forward", seconds,
+                batch_size, seq_len, hbm, hbm_before=hbm_before,
+                note="forward plus loss; no backward or optimizer"))
+            _status(
+                "[forward] "
+                f"{profile_i + 1}/{int(args.forward_profile_steps)} "
+                f"step_s={seconds:.4f} tok/s={tok_s:.1f} "
+                f"loss={fmt(metrics_host.get('loss'), 4)} | "
+                f"{hbm_inline(hbm)}",
+                persist=True)
+
+        summary.update({
+            "fast_forward_compile_seconds": compile_seconds,
+            "fast_forward_steps": int(args.forward_profile_steps),
+            "fast_forward_mean_seconds": mean(fast_times),
+            "fast_forward_tokens_per_second": mean(fast_tokens),
+            "fast_forward_speedup_vs_train_step": ratio_float(
+                train_mean_seconds, mean(fast_times)),
+        })
+
+    if int(args.module_profile_steps) > 0:
+        profile_fns = create_module_profile_fns(cfg, sharded_fns)
+        _log("Compiling split-module forward profile...")
+        batch, ids, _mask, step_rng, step_no = next_profile_batch()
+        t0 = time.perf_counter()
+        run_module_profile_pass(
+            profile_fns, params, ids, step_rng, step_no,
+            run_index, variant_label, batch_size, seq_len,
+            "module_compile", record=False)
+        module_compile_seconds = time.perf_counter() - t0
+        _log(f"[profile] module compile {module_compile_seconds:.3f}s")
+        module_total_times = []
+        for profile_i in range(int(args.module_profile_steps)):
+            batch, ids, _mask, step_rng, step_no = next_profile_batch()
+            t0 = time.perf_counter()
+            step_records = run_module_profile_pass(
+                profile_fns, params, ids, step_rng, step_no,
+                run_index, variant_label, batch_size, seq_len,
+                "module_measure", record=True)
+            total_seconds = time.perf_counter() - t0
+            records.extend(step_records)
+            module_total_times.append(total_seconds)
+            for record in step_records:
+                peak_hbm = update_peak_hbm(
+                    peak_hbm, {"hbm_peak_gb": record.get("hbm_peak_gb")})
+            _status(
+                "[profile] module "
+                f"{profile_i + 1}/{int(args.module_profile_steps)} "
+                f"split_total_s={total_seconds:.4f}",
+                persist=True)
+        summary.update({
+            "module_profile_compile_seconds": module_compile_seconds,
+            "module_profile_steps": int(args.module_profile_steps),
+            "module_profile_mean_split_seconds": mean(module_total_times),
+            "module_profile_tokens_per_second": (
+                float(batch_size) * float(seq_len) / mean(module_total_times)
+                if module_total_times and mean(module_total_times) else None),
+        })
+
+    aggregates, layer_rows = summarize_profile_records(records)
+    summary.update({
+        "profile_records": records,
+        "profile_aggregates": aggregates,
+        "profile_layer_rows": layer_rows,
+        "profile_peak_hbm_gb": peak_hbm,
+    })
+    return summary, records, iterator, rng, next_step
 
 
 def json_float(value, default=0.0):
@@ -1308,159 +2018,6 @@ def summarize_compute_records(records):
     return summaries
 
 
-def benchmark_repack_config(cfg):
-    t = cfg["training"]
-    return {
-        "hardware_repack_enabled": True,
-        "hardware_sector_execution_enabled": bool(
-            t.get("hardware_sector_execution_enabled",
-                  t.get("hardware_repack_enabled", True))),
-        "hardware_repack_strategy": str(
-            t.get("hardware_repack_strategy", "balanced_vq")).lower(),
-        "hardware_repack_farthest_per_sector": int(
-            t.get("hardware_repack_farthest_per_sector", 10)),
-        "hardware_repack_gain_eps": float(
-            t.get("hardware_repack_gain_eps", 1.0e-3)),
-        "hardware_repack_max_move_frac": float(
-            t.get("hardware_repack_max_move_frac", 0.08)),
-        "hardware_repack_vq_iterations": int(
-            t.get("hardware_repack_vq_iterations", 4)),
-    }
-
-
-def collect_vq_layout_records(params, cfg, model_version, phase, run_index,
-                              variant_label, repack_metrics=None,
-                              repack_seconds=None):
-    if model_version != V4168_MODEL_VERSION:
-        return []
-    module_name, _class_name = MODEL_MODULES[model_version]
-    module = importlib.import_module(module_name)
-    records = []
-    pool_params = params["neuron_pool"]
-    op_keys = module._pool_operator_keys(pool_params)
-    for pool, op_key_name, block_key in (
-            ("attn_v", "attn_v_op_key", "v_block_size"),
-            ("rst", "rst_op_key", "rst_block_size")):
-        block_size = int(cfg["model"].get(block_key, 256))
-        key_device = module._forward_unit_direction(
-            op_keys[op_key_name].astype(jnp.float32))
-        key_host = module._global_jax_array_to_host_np(
-            key_device, dtype=np.float32)
-        quality = module._sector_layout_quality_np(key_host, block_size)
-        prefix = f"repack/{pool}/"
-        moved_frac = json_float(
-            (repack_metrics or {}).get(prefix + "moved_frac"), 0.0)
-        record = {
-            "type": "vq_layout",
-            "run_index": int(run_index),
-            "variant": variant_label,
-            "phase": phase,
-            "pool": pool,
-            "block_size": block_size,
-            "moved_frac": moved_frac,
-            "applied_moved_frac": moved_frac,
-            "full_vq_moved_frac": json_float(
-                (repack_metrics or {}).get(prefix + "full_vq_moved_frac"),
-                moved_frac),
-            "max_move_frac": json_float(
-                (repack_metrics or {}).get(
-                    prefix + "max_move_frac",
-                    (repack_metrics or {}).get("repack/max_move_frac")),
-                0.0),
-            "vq_iterations": json_float(
-                (repack_metrics or {}).get(
-                    prefix + "vq_iterations",
-                    (repack_metrics or {}).get("repack/vq_iterations")),
-                0.0),
-            "mean_compactness_cos": float(
-                quality.get("mean_compactness_cos", 0.0)),
-            "mean_sector_radius": float(
-                quality.get("mean_sector_radius", 0.0)),
-            "max_sector_radius": float(
-                quality.get("max_sector_radius", 0.0)),
-        }
-        if repack_seconds is not None:
-            record["repack_seconds"] = float(repack_seconds)
-        records.append(record)
-    return records
-
-
-def _records_by_pool(records):
-    return {record.get("pool"): record for record in records}
-
-
-def print_vq_repack_lines(before_records, after_records, repack_metrics,
-                          repack_seconds):
-    if not _is_host0():
-        return
-    _finish_status_line()
-    before_by_pool = _records_by_pool(before_records)
-    after_by_pool = _records_by_pool(after_records)
-    for pool in ("attn_v", "rst"):
-        before = before_by_pool.get(pool, {})
-        after = after_by_pool.get(pool, {})
-        prefix = f"repack/{pool}/"
-        applied = json_float(
-            (repack_metrics or {}).get(prefix + "moved_frac"),
-            after.get("applied_moved_frac", 0.0))
-        full = json_float(
-            (repack_metrics or {}).get(prefix + "full_vq_moved_frac"),
-            after.get("full_vq_moved_frac", applied))
-        max_move = json_float(
-            (repack_metrics or {}).get(
-                prefix + "max_move_frac",
-                (repack_metrics or {}).get("repack/max_move_frac")),
-            after.get("max_move_frac", 0.0))
-        iterations = json_float(
-            (repack_metrics or {}).get(
-                prefix + "vq_iterations",
-                (repack_metrics or {}).get("repack/vq_iterations")),
-            after.get("vq_iterations", 0.0))
-        print(
-            "[vq] "
-            f"pool={pool} "
-            f"before_compact={fmt(before.get('mean_compactness_cos'), 6)} "
-            f"after_compact={fmt(after.get('mean_compactness_cos'), 6)} "
-            f"before_mean_radius={fmt(before.get('mean_sector_radius'), 6)} "
-            f"after_mean_radius={fmt(after.get('mean_sector_radius'), 6)} "
-            f"before_max_radius={fmt(before.get('max_sector_radius'), 6)} "
-            f"after_max_radius={fmt(after.get('max_sector_radius'), 6)} "
-            f"full_vq_moved_frac={fmt(full, 6)} "
-            f"applied_moved_frac={fmt(applied, 6)} "
-            f"max_move_frac={fmt(max_move, 3)} "
-            f"vq_iterations={fmt(iterations, 0)} "
-            f"repack_s={fmt(repack_seconds, 3)}",
-            flush=True)
-
-
-def force_vq_repack_before_measure(params, opt_state, cfg, model_version, mesh,
-                                   step, run_index, variant_label,
-                                   metrics_jsonl):
-    if model_version != V4168_MODEL_VERSION:
-        return params, opt_state, [], {}, None
-    module_name, _class_name = MODEL_MODULES[model_version]
-    module = importlib.import_module(module_name)
-    before_records = collect_vq_layout_records(
-        params, cfg, model_version, "before_repack", run_index,
-        variant_label)
-    write_jsonl_records(metrics_jsonl, before_records)
-    repack_cfg = benchmark_repack_config(cfg)
-    t0 = time.perf_counter()
-    params, opt_state, repack_metrics = module.maybe_hardware_repack(
-        params, opt_state, cfg["model"], mesh, step, repack_cfg)
-    repack_seconds = time.perf_counter() - t0
-    after_records = collect_vq_layout_records(
-        params, cfg, model_version, "after_repack", run_index,
-        variant_label, repack_metrics=repack_metrics,
-        repack_seconds=repack_seconds)
-    write_jsonl_records(metrics_jsonl, after_records)
-    print_vq_repack_lines(
-        before_records, after_records, repack_metrics, repack_seconds)
-    return (
-        params, opt_state, before_records + after_records, repack_metrics,
-        repack_seconds)
-
-
 def collect_xla_memory_report(dump_dir):
     if not dump_dir:
         return {}
@@ -1549,19 +2106,6 @@ def print_summary(summary):
         f"min={fmt(summary.get('min_step_seconds'), 4)} "
         f"max={fmt(summary.get('max_step_seconds'), 4)}",
         flush=True)
-    if summary.get("repack_seconds") is not None:
-        print(
-            "repack "
-            f"repack_s={fmt(summary.get('repack_seconds'), 3)} "
-            f"post_repack_warmup_steps="
-            f"{int(summary.get('post_repack_warmup_steps') or 0)} "
-            f"post_repack_warmup_mean_step_s="
-            f"{fmt(summary.get('post_repack_warmup_mean_step_seconds'), 4)} "
-            f"mean_step_s_without_repack="
-            f"{fmt(summary.get('mean_step_seconds_without_repack'), 4)} "
-            f"mean_step_s_plus_amortized_repack_100="
-            f"{fmt(summary.get('mean_step_seconds_plus_amortized_repack_100'), 4)}",
-            flush=True)
     print(
         "throughput "
         f"mean_tokens_per_second="
@@ -1569,9 +2113,31 @@ def print_summary(summary):
         flush=True)
     print(
         "memory "
+        f"train_peak_hbm_gb={fmt(summary.get('train_peak_hbm_gb'))} "
+        f"profile_peak_hbm_gb={fmt(summary.get('profile_peak_hbm_gb'))} "
         f"peak_hbm_gb={fmt(summary.get('peak_hbm_gb'))} "
         f"limit_hbm_gb={fmt(summary.get('hbm_limit_gb'))}",
         flush=True)
+    if summary.get("fast_forward_mean_seconds") is not None:
+        print(
+            "fast_forward "
+            f"steps={int(summary.get('fast_forward_steps') or 0)} "
+            f"compile_s={fmt(summary.get('fast_forward_compile_seconds'), 3)} "
+            f"mean_s={fmt(summary.get('fast_forward_mean_seconds'), 4)} "
+            f"tok/s={fmt(summary.get('fast_forward_tokens_per_second'), 1)} "
+            f"speedup_vs_train_step="
+            f"{fmt(summary.get('fast_forward_speedup_vs_train_step'), 3)}",
+            flush=True)
+    if summary.get("module_profile_mean_split_seconds") is not None:
+        print(
+            "module_profile "
+            f"steps={int(summary.get('module_profile_steps') or 0)} "
+            f"compile_s={fmt(summary.get('module_profile_compile_seconds'), 3)} "
+            f"split_mean_s="
+            f"{fmt(summary.get('module_profile_mean_split_seconds'), 4)} "
+            f"tok/s={fmt(summary.get('module_profile_tokens_per_second'), 1)} "
+            "note=diagnostic_split_launches_excluding_compile",
+            flush=True)
     if summary.get("xla_total_hbm_usage"):
         print(
             "xla_memory "
@@ -1601,49 +2167,70 @@ def print_summary(summary):
                 f"padded_work_frac_vs_dense={fmt(work.get('padded_frac'), 6)} "
                 f"semantic_work_frac_vs_dense={fmt(work.get('semantic_frac'), 6)}",
                 flush=True)
-    if summary.get("model_version") == V4168_MODEL_VERSION:
-        print(
-            "\n[vq] "
-            f"forced_repack_before_measure="
-            f"{str(summary.get('forced_repack_before_measure', False)).lower()}",
-            flush=True)
-    if summary.get("vq_layout_records"):
-        by_phase = {}
-        for record in summary["vq_layout_records"]:
-            by_phase.setdefault(record.get("phase"), {})[
-                record.get("pool")] = record
-        before = by_phase.get("before_repack", {})
-        after = by_phase.get("after_repack", {})
-        for pool in ("attn_v", "rst"):
-            if pool not in before and pool not in after:
-                continue
-            b = before.get(pool, {})
-            a = after.get(pool, b)
-            print(
-                "[vq-summary] "
-                f"pool={pool} "
-                f"before_compact={fmt(b.get('mean_compactness_cos'), 6)} "
-                f"after_compact={fmt(a.get('mean_compactness_cos'), 6)} "
-                f"before_mean_radius={fmt(b.get('mean_sector_radius'), 6)} "
-                f"after_mean_radius={fmt(a.get('mean_sector_radius'), 6)} "
-                f"before_max_radius={fmt(b.get('max_sector_radius'), 6)} "
-                f"after_max_radius={fmt(a.get('max_sector_radius'), 6)} "
-                f"full_vq_moved_frac={fmt(a.get('full_vq_moved_frac'), 6)} "
-                f"applied_moved_frac={fmt(a.get('applied_moved_frac'), 6)} "
-                f"max_move_frac={fmt(a.get('max_move_frac'), 3)} "
-                f"vq_iterations={fmt(a.get('vq_iterations'), 0)} "
-                f"repack_s={fmt(a.get('repack_seconds'), 3)}",
-                flush=True)
     print("\n[op-breakdown]", flush=True)
     print(
-        "op | mean_ms | hbm_peak_gb | memory_note",
+        "op | calls | total_ms | mean_ms | pct_split | "
+        "hbm_peak_gb | hbm_delta_gb | note",
         flush=True)
+    train_ms = (
+        num(summary.get("mean_step_seconds")) * 1000.0
+        if summary.get("mean_step_seconds") is not None else None)
+    train_note = (
+        "forward+backward+optimizer"
+        if summary.get("train_benchmark_enabled", True)
+        else "skipped (--fast)")
     print(
         "full_train_step | "
-        f"{fmt(num(summary.get('mean_step_seconds')) * 1000.0 if summary.get('mean_step_seconds') is not None else None, 3)} | "
-        f"{fmt(summary.get('peak_hbm_gb'))} | "
-        "process allocator stats, not exact op-local allocation",
+        f"{int(summary.get('measure_steps') or 0)} | "
+        f"{fmt(train_ms, 3)} | {fmt(train_ms, 3)} | n/a | "
+        f"{fmt(summary.get('train_peak_hbm_gb'))} | n/a | "
+        f"{train_note}",
         flush=True)
+    note_by_group = {
+        "fast_forward": "forward+loss only, no backward/optimizer",
+        "setup": "shared op-key materialization",
+        "embedding": "token+position embedding",
+        "attn": "sum over layer attention modules",
+        "rst": "sum over layer RST modules",
+        "loss": "final norm plus chunked CE",
+    }
+    for row in summary.get("profile_aggregates", []) or []:
+        total_ms = num(row.get("total_seconds"))
+        mean_ms = num(row.get("mean_seconds"))
+        total_ms = total_ms * 1000.0 if total_ms is not None else None
+        mean_ms = mean_ms * 1000.0 if mean_ms is not None else None
+        print(
+            f"{row.get('group', 'unknown')} | "
+            f"{int(row.get('calls') or 0)} | "
+            f"{fmt(total_ms, 3)} | "
+            f"{fmt(mean_ms, 3)} | "
+            f"{fmt(row.get('pct_module_split'), 1)} | "
+            f"{fmt(row.get('max_hbm_peak_gb'))} | "
+            f"{fmt(row.get('max_hbm_used_delta_gb'))} | "
+            f"{note_by_group.get(row.get('group'), 'profile record')}",
+            flush=True)
+    layer_rows = summary.get("profile_layer_rows", []) or []
+    if layer_rows:
+        print("\n[op-breakdown/layers]", flush=True)
+        print(
+            "layer | attn_ms | rst_ms | rst/attn | "
+            "attn_hbm_peak_gb | rst_hbm_peak_gb",
+            flush=True)
+        for row in layer_rows:
+            attn_ms = (
+                num(row.get("attn_seconds")) * 1000.0
+                if row.get("attn_seconds") is not None else None)
+            rst_ms = (
+                num(row.get("rst_seconds")) * 1000.0
+                if row.get("rst_seconds") is not None else None)
+            print(
+                f"{int(row.get('layer')):02d} | "
+                f"{fmt(attn_ms, 3)} | "
+                f"{fmt(rst_ms, 3)} | "
+                f"{fmt(row.get('rst_over_attn'), 3)} | "
+                f"{fmt(row.get('attn_hbm_peak_gb'))} | "
+                f"{fmt(row.get('rst_hbm_peak_gb'))}",
+                flush=True)
 
 
 def print_comparison(summaries):
@@ -1652,16 +2239,24 @@ def print_comparison(summaries):
     print("SRW Benchmark Comparison", flush=True)
     print("=" * 72, flush=True)
     header = (
-        f"{'#':>2}  {'model':24s}  {'mean_s':>10s}  "
+        f"{'#':>2}  {'model':24s}  {'train_s':>9s}  "
+        f"{'fast_s':>9s}  {'fast_x':>7s}  {'split_s':>9s}  "
         f"{'tok/s':>12s}  {'peak_hbm':>10s}  {'valid':>5s}  "
         f"{'variant':28s}  config")
     print(header, flush=True)
     print("-" * len(header), flush=True)
     for i, summary in enumerate(summaries, 1):
+        display_tokens = (
+            summary.get("mean_tokens_per_second")
+            if summary.get("mean_tokens_per_second") is not None
+            else summary.get("fast_forward_tokens_per_second"))
         print(
             f"{i:>2}  {summary.get('model_version', ''):24s}  "
-            f"{fmt(summary.get('mean_step_seconds'), 4):>10s}  "
-            f"{fmt(summary.get('mean_tokens_per_second'), 1):>12s}  "
+            f"{fmt(summary.get('mean_step_seconds'), 4):>9s}  "
+            f"{fmt(summary.get('fast_forward_mean_seconds'), 4):>9s}  "
+            f"{fmt(summary.get('fast_forward_speedup_vs_train_step'), 2):>7s}  "
+            f"{fmt(summary.get('module_profile_mean_split_seconds'), 4):>9s}  "
+            f"{fmt(display_tokens, 1):>12s}  "
             f"{fmt(summary.get('peak_hbm_gb')):>10s}  "
             f"{str(summary.get('benchmark_valid', True)).lower():>5s}  "
             f"{summary.get('variant', '')[:28]:28s}  "
@@ -1678,6 +2273,15 @@ def print_comparison(summaries):
         raw_median_ratio = ratio(
             summary.get('median_step_seconds'),
             base.get('median_step_seconds'))
+        fast_time_ratio = ratio(
+            summary.get('fast_forward_mean_seconds'),
+            base.get('fast_forward_mean_seconds'))
+        fast_speed_ratio = ratio(
+            base.get('fast_forward_mean_seconds'),
+            summary.get('fast_forward_mean_seconds'))
+        split_time_ratio = ratio(
+            summary.get('module_profile_mean_split_seconds'),
+            base.get('module_profile_mean_split_seconds'))
         step_time_ratio = (
             raw_mean_ratio if valid_pair
             else f"invalid_overflow raw_mean={raw_mean_ratio} raw_median={raw_median_ratio}")
@@ -1690,6 +2294,9 @@ def print_comparison(summaries):
             f"{step_time_ratio} "
             f"tokens="
             f"{token_ratio} "
+            f"fast_time={fast_time_ratio} "
+            f"fast_speed={fast_speed_ratio} "
+            f"split_time={split_time_ratio} "
             f"peak_hbm="
             f"{ratio(summary.get('peak_hbm_gb'), base.get('peak_hbm_gb'))}",
             flush=True)
@@ -1697,6 +2304,8 @@ def print_comparison(summaries):
         print("\n[compare]", flush=True)
         base_step = base.get("mean_step_seconds")
         base_median = base.get("median_step_seconds")
+        base_fast = base.get("fast_forward_mean_seconds")
+        base_split = base.get("module_profile_mean_split_seconds")
         for i, summary in enumerate(summaries[1:], 2):
             valid_pair = (
                 bool(base.get("benchmark_valid", True))
@@ -1704,10 +2313,22 @@ def print_comparison(summaries):
             speed_ratio = (
                 ratio(base_step, summary.get("mean_step_seconds"))
                 if valid_pair else "invalid_overflow")
+            fast_speed_ratio = ratio(
+                base_fast, summary.get("fast_forward_mean_seconds"))
+            split_speed_ratio = ratio(
+                base_split, summary.get("module_profile_mean_split_seconds"))
             print(
                 f"base_mean_step_s={fmt(base_step, 4)} "
                 f"run_{i}_mean_step_s={fmt(summary.get('mean_step_seconds'), 4)} "
                 f"speed_ratio={speed_ratio} "
+                f"base_fast_s={fmt(base_fast, 4)} "
+                f"run_{i}_fast_s="
+                f"{fmt(summary.get('fast_forward_mean_seconds'), 4)} "
+                f"fast_speed_ratio={fast_speed_ratio} "
+                f"base_split_s={fmt(base_split, 4)} "
+                f"run_{i}_split_s="
+                f"{fmt(summary.get('module_profile_mean_split_seconds'), 4)} "
+                f"split_speed_ratio={split_speed_ratio} "
                 f"raw_median_ratio="
                 f"{ratio(summary.get('median_step_seconds'), base_median)} "
                 f"valid={str(summary.get('benchmark_valid', True)).lower()}",
