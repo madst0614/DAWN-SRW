@@ -3092,7 +3092,7 @@ def make_sharded_srw_tau_free_relu_region_block_dense_masked_minimal(
         h_unit = _forward_unit_direction(
             h.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
         scores = jnp.einsum(
-            'bsd,rbd->bsrb', h_unit, block_center_all).astype(jnp.float32)
+            'bsd,rkd->bsrk', h_unit, block_center_all).astype(jnp.float32)
         best_score_by_region = scores.max(axis=-1)
         best_block_by_region = jnp.argmax(scores, axis=-1).astype(jnp.int32)
         _selected_scores, selected_regions = jax.lax.top_k(
@@ -3290,7 +3290,7 @@ def make_sharded_srw_paired_tau_free_relu_region_block_dense_masked_minimal(
         h_unit = _forward_unit_direction(
             h.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
         scores = jnp.einsum(
-            'bsxd,rbd->bsxrb', h_unit, block_center_all).astype(jnp.float32)
+            'bsxd,rkd->bsxrk', h_unit, block_center_all).astype(jnp.float32)
         best_score_by_region = scores.max(axis=-1)
         best_block_by_region = jnp.argmax(scores, axis=-1).astype(jnp.int32)
         _selected_scores, selected_regions = jax.lax.top_k(
