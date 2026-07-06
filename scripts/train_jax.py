@@ -1321,6 +1321,33 @@ def _v4168_operation_space_cfg(training_cfg):
     return opspace
 
 
+def _v4168_strip_legacy_resume_opspace_fields(full_config):
+    """Normalize legacy checkpoint full_config for removed opspace fields."""
+    if not isinstance(full_config, dict):
+        return full_config, ()
+    normalized = deepcopy(full_config)
+    training_cfg = normalized.get('training', {})
+    if not isinstance(training_cfg, dict):
+        return normalized, ()
+    opspace = training_cfg.get('operation_space', {})
+    if not isinstance(opspace, dict):
+        return normalized, ()
+    pools = opspace.get('pools', {})
+    if not isinstance(pools, dict):
+        return normalized, ()
+    rst_pool = pools.get('rst', {})
+    if not isinstance(rst_pool, dict):
+        return normalized, ()
+
+    removed = []
+    for field in ('bucket_chunk_size', 'assignment_policy'):
+        if field in rst_pool:
+            rst_pool.pop(field, None)
+            removed.append(
+                f'training.operation_space.pools.rst.{field}')
+    return normalized, tuple(removed)
+
+
 def _v4168_validate_operation_space_shape(opspace):
     if not opspace:
         return
@@ -11956,7 +11983,9 @@ def main():
         checkpoint_full_config = checkpoint_metadata.get('full_config')
         checkpoint_raw_config = checkpoint_metadata.get('raw_config')
         _require_resume_full_config(checkpoint_full_config)
-        saved_full_config = deepcopy(checkpoint_full_config)
+        saved_full_config, legacy_opspace_fields_removed = (
+            _v4168_strip_legacy_resume_opspace_fields(
+                checkpoint_full_config))
         saved_raw_config = (
             deepcopy(checkpoint_raw_config)
             if isinstance(checkpoint_raw_config, dict)
@@ -12014,6 +12043,10 @@ def main():
         if jax.process_index() == 0:
             print("Resume config source: checkpoint full_config")
             print("Resume config fallback: disabled")
+            if legacy_opspace_fields_removed:
+                print(
+                    "  Normalized legacy checkpoint operation_space fields: "
+                    + ", ".join(legacy_opspace_fields_removed))
             print("  Preserving existing run-folder config snapshots.")
 
         checkpoint_full_training_config = (
