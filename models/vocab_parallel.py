@@ -130,3 +130,226 @@ def make_vocab_parallel_cross_entropy(mesh, vocab_size, padded_vocab_size):
         return loss, correct, valid_count
 
     return vocab_parallel_ce
+
+
+def make_vocab_parallel_ce(
+    mesh,
+    logical_vocab_size: int,
+    vocab_size_padded: int,
+    token_chunk_size: int = 32768,
+    compute_accuracy: bool = True,
+    compute_logit_stats: bool = True,
+):
+    """Exact vocab-parallel CE over a row-sharded tied embedding table.
+
+    Returns loss/per-token CE/correct/count plus logit diagnostics.  Padded
+    vocabulary rows are excluded from the loss, argmax, and diagnostics.
+    """
+    mesh_model = int(mesh.shape["model"])
+    logical_vocab_size = int(logical_vocab_size)
+    vocab_size_padded = int(vocab_size_padded)
+    token_chunk_size = int(token_chunk_size)
+    compute_accuracy = bool(compute_accuracy)
+    compute_logit_stats = bool(compute_logit_stats)
+    if logical_vocab_size <= 0:
+        raise ValueError(
+            f"logical_vocab_size must be > 0, got {logical_vocab_size}")
+    if token_chunk_size <= 0:
+        raise ValueError(
+            f"token_chunk_size must be > 0, got {token_chunk_size}")
+    if vocab_size_padded < logical_vocab_size:
+        raise ValueError(
+            f"vocab_size_padded={vocab_size_padded} must be >= "
+            f"logical_vocab_size={logical_vocab_size}")
+    if vocab_size_padded % mesh_model != 0:
+        raise ValueError(
+            f"vocab_size_padded={vocab_size_padded} must be divisible by "
+            f"mesh_model={mesh_model}")
+    vocab_per_shard = vocab_size_padded // mesh_model
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(
+            P("data", None, None),  # shift_x [B, T, D]
+            P("model", None),       # embedding local [V_local, D]
+            P("data", None),        # labels [B, T]
+            P("data", None),        # valid_mask [B, T]
+        ),
+        out_specs=(P(), P("data", None), P(), P(), P(), P(), P(), P()),
+        check_rep=False,
+    )
+    def vocab_parallel_ce(shift_x, embedding_local, shift_labels, valid_mask):
+        model_idx = jax.lax.axis_index("model")
+        vocab_start = model_idx * vocab_per_shard
+        local_vocab_ids = (
+            vocab_start
+            + jnp.arange(vocab_per_shard, dtype=jnp.int32))
+        valid_vocab = local_vocab_ids < logical_vocab_size
+        neg_inf = jnp.finfo(jnp.float32).min
+
+        B, T, D = shift_x.shape
+        flat_x = shift_x.reshape(B * T, D)
+        flat_labels = shift_labels.reshape(B * T).astype(jnp.int32)
+        flat_valid = valid_mask.reshape(B * T).astype(jnp.bool_)
+
+        n_tokens = flat_x.shape[0]
+        pad = (-n_tokens) % token_chunk_size
+        flat_x = jnp.pad(flat_x, ((0, pad), (0, 0)))
+        flat_labels = jnp.pad(flat_labels, ((0, pad),), constant_values=0)
+        flat_valid = jnp.pad(
+            flat_valid, ((0, pad),), constant_values=False)
+
+        flat_x = flat_x.reshape(-1, token_chunk_size, D)
+        flat_labels = flat_labels.reshape(-1, token_chunk_size)
+        flat_valid = flat_valid.reshape(-1, token_chunk_size)
+
+        def chunk_step(carry, xs):
+            del carry
+            x_c, labels_c, valid_c = xs
+            local_logits = (x_c @ embedding_local.T).astype(jnp.float32)
+            local_logits = jnp.where(
+                valid_vocab[None, :], local_logits, neg_inf)
+
+            local_max = jnp.max(local_logits, axis=-1)
+            global_max = jax.lax.pmax(local_max, "model")
+            local_exp_sum = jnp.sum(
+                jnp.exp(local_logits - global_max[:, None]), axis=-1)
+            global_exp_sum = jax.lax.psum(local_exp_sum, "model")
+            log_z = global_max + jnp.log(global_exp_sum + 1.0e-30)
+
+            safe_labels = jnp.where(valid_c, labels_c, 0)
+            in_local = (
+                (safe_labels >= vocab_start)
+                & (safe_labels < vocab_start + vocab_per_shard)
+                & (safe_labels < logical_vocab_size)
+                & valid_c)
+            local_idx = safe_labels - vocab_start
+            local_idx_safe = jnp.clip(local_idx, 0, vocab_per_shard - 1)
+            local_target = jnp.take_along_axis(
+                local_logits, local_idx_safe[:, None], axis=-1).squeeze(-1)
+            local_target = jnp.where(in_local, local_target, 0.0)
+            target_logit = jax.lax.psum(local_target, "model")
+
+            token_ce = (log_z - target_logit).astype(jnp.float32)
+            token_ce = jnp.where(valid_c, token_ce, 0.0)
+
+            if compute_accuracy:
+                local_best_score = jnp.max(local_logits, axis=-1)
+                local_best_idx = jnp.argmax(local_logits, axis=-1)
+                local_best_global_id = vocab_start + local_best_idx
+                global_best_score = jax.lax.pmax(
+                    local_best_score, "model")
+                is_winner = local_best_score == global_best_score
+                candidate_id = jnp.where(
+                    is_winner,
+                    local_best_global_id,
+                    jnp.asarray(logical_vocab_size + 1000000000,
+                                dtype=jnp.int32))
+                pred = jax.lax.pmin(candidate_id, "model")
+                correct = jnp.sum(
+                    ((pred == labels_c) & valid_c).astype(jnp.int32))
+            else:
+                correct = jnp.array(0, dtype=jnp.int32)
+
+            if compute_logit_stats:
+                valid_2d = valid_c[:, None] & valid_vocab[None, :]
+                logits_for_sum = jnp.where(valid_2d, local_logits, 0.0)
+                local_logit_sum = jnp.sum(logits_for_sum)
+                local_logit_sumsq = jnp.sum(logits_for_sum * logits_for_sum)
+                local_abs_max = jnp.max(jnp.where(
+                    valid_2d, jnp.abs(local_logits), 0.0))
+                local_token_sumsq = jnp.sum(
+                    jnp.where(valid_vocab[None, :],
+                              local_logits * local_logits, 0.0),
+                    axis=-1)
+                global_token_sumsq = jax.lax.psum(
+                    local_token_sumsq, "model")
+                logit_norm_sum = jnp.sum(
+                    jnp.where(
+                        valid_c,
+                        jnp.sqrt(jnp.maximum(global_token_sumsq, 0.0)),
+                        0.0))
+            else:
+                local_logit_sum = jnp.array(0.0, dtype=jnp.float32)
+                local_logit_sumsq = jnp.array(0.0, dtype=jnp.float32)
+                local_abs_max = jnp.array(0.0, dtype=jnp.float32)
+                logit_norm_sum = jnp.array(0.0, dtype=jnp.float32)
+
+            valid_count = jnp.sum(valid_c.astype(jnp.int32))
+            return None, (
+                token_ce,
+                correct,
+                valid_count,
+                jnp.sum(token_ce),
+                local_abs_max,
+                local_logit_sum,
+                local_logit_sumsq,
+                logit_norm_sum,
+            )
+
+        _, ys = jax.lax.scan(
+            chunk_step, None, (flat_x, flat_labels, flat_valid))
+        (token_ce_chunks, correct_chunks, valid_chunks, loss_chunks,
+         abs_max_chunks, logit_sum_chunks, logit_sumsq_chunks,
+         logit_norm_chunks) = ys
+
+        per_token_ce_flat = token_ce_chunks.reshape(-1)[:n_tokens]
+        per_token_ce = per_token_ce_flat.reshape(B, T)
+
+        loss_sum_local_data = jnp.sum(loss_chunks)
+        valid_sum_local_data = jnp.sum(valid_chunks)
+        correct_local_data = jnp.sum(correct_chunks)
+
+        loss_sum_global = jax.lax.psum(loss_sum_local_data, "data")
+        valid_count_global = jax.lax.psum(valid_sum_local_data, "data")
+        correct_global = jax.lax.psum(correct_local_data, "data")
+
+        loss = (
+            loss_sum_global
+            / (valid_count_global.astype(jnp.float32) + 1.0e-8))
+        loss = jax.lax.pmean(loss, "model")
+        correct = jax.lax.pmean(
+            correct_global.astype(jnp.float32), "model").astype(jnp.int32)
+        valid_count = jax.lax.pmean(
+            valid_count_global.astype(jnp.float32),
+            "model").astype(jnp.int32)
+
+        local_abs_max = jnp.max(abs_max_chunks)
+        logit_abs_max = jax.lax.pmax(
+            jax.lax.pmax(local_abs_max, "data"), "model")
+        logit_sum = jax.lax.psum(
+            jax.lax.psum(jnp.sum(logit_sum_chunks), "data"), "model")
+        logit_sumsq = jax.lax.psum(
+            jax.lax.psum(jnp.sum(logit_sumsq_chunks), "data"), "model")
+        logit_norm_sum = jax.lax.psum(
+            jax.lax.pmean(jnp.sum(logit_norm_chunks), "model"), "data")
+        diag_count = (
+            valid_count.astype(jnp.float32)
+            * jnp.asarray(logical_vocab_size, dtype=jnp.float32))
+        logit_mean = logit_sum / (diag_count + 1.0e-8)
+        logit_var = (
+            logit_sumsq / (diag_count + 1.0e-8)
+            - logit_mean * logit_mean)
+        logit_std = jnp.sqrt(jnp.maximum(logit_var, 0.0))
+        logit_norm_mean = (
+            logit_norm_sum
+            / (valid_count.astype(jnp.float32) + 1.0e-8))
+        if not compute_logit_stats:
+            logit_abs_max = jnp.array(0.0, dtype=jnp.float32)
+            logit_norm_mean = jnp.array(0.0, dtype=jnp.float32)
+            logit_mean = jnp.array(0.0, dtype=jnp.float32)
+            logit_std = jnp.array(0.0, dtype=jnp.float32)
+
+        return (
+            loss,
+            per_token_ce,
+            correct,
+            valid_count,
+            logit_abs_max,
+            logit_norm_mean,
+            logit_mean,
+            logit_std,
+        )
+
+    return vocab_parallel_ce

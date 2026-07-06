@@ -1098,14 +1098,28 @@ def _maybe_materialize_vocab_parallel_config(cfg):
         return
     if model_version not in (
             V4167_MODEL_VERSION,
+            V4168_MODEL_VERSION,
             BASELINE_MODEL_VERSION,
             LEGACY_BASELINE_MODEL_VERSION):
         return
-    logical_vocab_size = int(cfg["model"]["vocab_size"])
+    logical_vocab_size = int(
+        cfg["model"].get("logical_vocab_size", cfg["model"]["vocab_size"]))
     from models.vocab_parallel import padded_vocab_size
     padded = padded_vocab_size(logical_vocab_size, mesh_model)
+    if padded % mesh_model != 0:
+        raise ValueError(
+            f"vocab_size_padded={padded} must be divisible by "
+            f"mesh_model={mesh_model}")
     cfg["model"]["logical_vocab_size"] = logical_vocab_size
     cfg["model"]["vocab_size_padded"] = padded
+    if model_version == V4168_MODEL_VERSION:
+        cfg["model"]["vocab_size"] = padded
+        if jax.process_index() == 0:
+            print(
+                "vocab_parallel: enabled model=V4168 "
+                f"logical_vocab={logical_vocab_size} "
+                f"padded_vocab={padded} mesh_model={mesh_model}",
+                flush=True)
 
 
 def _v4164_model_base_kwargs(cfg):
@@ -1891,6 +1905,8 @@ def _dawn_srw_kwargs(cfg):
         })
     if str(version) == V4168_MODEL_VERSION:
         kw.update({
+            'logical_vocab_size': m.get('logical_vocab_size', None),
+            'vocab_size_padded': m.get('vocab_size_padded', None),
             'qk_block_size': int(m.get('qk_block_size', 256)),
             'v_block_size': int(m.get('v_block_size', 256)),
             'rst_block_size': int(m.get('rst_block_size', 256)),
@@ -4429,7 +4445,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       compact_train_metrics=False,
                       keep_train_layer_metrics=False,
                       tokens_per_step=0,
-                      ce_token_chunk_size=8192,
+                      ce_token_chunk_size=32768,
                       train_compute_accuracy=True):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
 
@@ -6871,7 +6887,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_boundary_power_mid_frac=0.800,
                      soft_gate_boundary_power_final_frac=0.950,
                      admission_den_power=1.0,
-                     ce_token_chunk_size=8192):
+                     ce_token_chunk_size=32768):
     """Create a jit-compiled evaluation step.
 
     Uses the SLIM forward (analysis=False). Eval normally needs only loss /
@@ -7043,7 +7059,7 @@ def create_analysis_step(model, sharded_fns=None,
                          soft_gate_boundary_power_mid_frac=0.800,
                          soft_gate_boundary_power_final_frac=0.950,
                          admission_den_power=1.0,
-                         ce_token_chunk_size=8192):
+                         ce_token_chunk_size=32768):
     """Create a jit-compiled analysis step (FULL forward, observational).
 
     Runs the model with `analysis=True` and the ANALYSIS variant of
@@ -7258,7 +7274,8 @@ def create_mesh(mesh_data, mesh_model):
 
 
 def get_param_shardings(params, mesh, model_version=None,
-                        operation_space_enabled=False):
+                        operation_space_enabled=False,
+                        vocab_size_padded=None):
     """Create model-version-aware parameter shardings."""
     del operation_space_enabled
     replicated = NamedSharding(mesh, P())
@@ -7270,6 +7287,8 @@ def get_param_shardings(params, mesh, model_version=None,
     stage_n_sharded_3d = NamedSharding(mesh, P(None, 'model', None))
     router_input_sharded_3d = NamedSharding(mesh, P(None, 'model', None))
     version = str(model_version) if model_version is not None else None
+    mesh_model = int(mesh.shape['model'])
+    has_padded_vocab = vocab_size_padded is not None
     pool_root = params.get('neuron_pool', {}) if hasattr(params, 'get') else {}
     is_stage_partitioned_pool = (
         'attn_qk_read_shared' in pool_root
@@ -7282,6 +7301,9 @@ def get_param_shardings(params, mesh, model_version=None,
         leaf = str(path[-1].key if hasattr(path[-1], 'key') else path[-1])
         if (path_str == 'token_emb/embedding'
                 and (version == V4167_MODEL_VERSION
+                     or (version == V4168_MODEL_VERSION
+                         and mesh_model > 1
+                         and has_padded_vocab)
                      or _is_baseline_version(version))):
             return row_sharded
         if _is_baseline_version(version):
@@ -7378,6 +7400,7 @@ def _print_param_sharding_summary(param_shardings, model_version):
                 interesting.append((ps, sharding))
         elif version == V4168_MODEL_VERSION:
             if ps in (
+                    'token_emb/embedding',
                     'neuron_pool/attn_v_read',
                     'neuron_pool/attn_v_write',
                     'neuron_pool/rst_read',
@@ -11634,7 +11657,7 @@ def main():
     # Resume log append policy. Defaults preserve the previous behavior.
     training_log_append_on_resume = bool(
         tcfg.get('training_log_append_on_resume', True))
-    ce_token_chunk_size = int(tcfg.get('ce_token_chunk_size', 8192))
+    ce_token_chunk_size = int(tcfg.get('ce_token_chunk_size', 32768))
     if ce_token_chunk_size <= 0:
         raise ValueError(
             "training.ce_token_chunk_size must be > 0, got "
@@ -11642,6 +11665,9 @@ def main():
     train_compute_accuracy = _cfg_bool(
         tcfg.get('train_compute_accuracy', True),
         name='training.train_compute_accuracy')
+    cfg.setdefault('training', {})['ce_token_chunk_size'] = ce_token_chunk_size
+    cfg.setdefault('training', {})['train_compute_accuracy'] = (
+        train_compute_accuracy)
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
@@ -12113,7 +12139,7 @@ def main():
         training_log_append_on_resume = bool(tcfg.get(
             'training_log_append_on_resume',
             training_log_append_on_resume))
-        ce_token_chunk_size = int(tcfg.get('ce_token_chunk_size', 8192))
+        ce_token_chunk_size = int(tcfg.get('ce_token_chunk_size', 32768))
         if ce_token_chunk_size <= 0:
             raise ValueError(
                 "training.ce_token_chunk_size must be > 0, got "
@@ -12121,6 +12147,10 @@ def main():
         train_compute_accuracy = _cfg_bool(
             tcfg.get('train_compute_accuracy', True),
             name='training.train_compute_accuracy')
+        cfg.setdefault('training', {})['ce_token_chunk_size'] = (
+            ce_token_chunk_size)
+        cfg.setdefault('training', {})['train_compute_accuracy'] = (
+            train_compute_accuracy)
         ckpt_interval = int(tcfg['checkpoint_interval'])
         checkpoint_keep_last = int(tcfg.get(
             'checkpoint_keep_last',
@@ -12386,6 +12416,10 @@ def main():
                 saved_training_config.get(
                     'train_compute_accuracy', train_compute_accuracy),
                 name='training.train_compute_accuracy')
+            cfg.setdefault('training', {})['ce_token_chunk_size'] = (
+                ce_token_chunk_size)
+            cfg.setdefault('training', {})['train_compute_accuracy'] = (
+                train_compute_accuracy)
             ckpt_interval = int(saved_training_config['checkpoint_interval'])
             checkpoint_keep_last = int(saved_training_config.get(
                 'checkpoint_keep_last',
@@ -13973,7 +14007,8 @@ def main():
     # Shard params using the model-version-specific policy.
     param_shardings = get_param_shardings(
         params, mesh, model_version_cfg,
-        operation_space_enabled=operation_space_tau_free_enabled)
+        operation_space_enabled=operation_space_tau_free_enabled,
+        vocab_size_padded=cfg['model'].get('vocab_size_padded', None))
     if is_host0:
         _print_param_sharding_summary(param_shardings, model_version_cfg)
     params = shard_params_to_mesh(params, param_shardings)
@@ -14116,6 +14151,7 @@ def main():
     # v4164: `_sharded_fns` is the slim train path; `_sharded_fns_analysis`
     # is the full observational path used only by analysis_step.
     _sharded_fns = None
+    _sharded_fns_eval = None
     _sharded_fns_analysis = None
     _force_sharded = _is_active_srw_version(model_version_cfg)
     if is_baseline and mesh_model > 1:
@@ -14370,6 +14406,52 @@ def main():
             if (str(model_version_cfg) == V4167_MODEL_VERSION
                     and isinstance(_sharded_fns_analysis, dict)):
                 _sharded_fns_analysis.update(_v4167_extra_fns)
+        _v4168_vocab_parallel_enabled = False
+        if (str(model_version_cfg) == V4168_MODEL_VERSION
+                and mesh_model > 1
+                and cfg['model'].get('logical_vocab_size') is not None
+                and cfg['model'].get('vocab_size_padded') is not None):
+            if not isinstance(_sharded_fns, dict):
+                raise RuntimeError(
+                    "v4168 vocab-parallel CE requires dict-style "
+                    "sharded_fns.")
+            from models.vocab_parallel import (
+                make_vocab_parallel_ce,
+                make_vocab_parallel_embedding,
+            )
+            _v4168_logical_vocab_size = int(
+                cfg['model']['logical_vocab_size'])
+            _v4168_vocab_size_padded = int(
+                cfg['model']['vocab_size_padded'])
+            if _v4168_vocab_size_padded % int(mesh_model) != 0:
+                raise ValueError(
+                    "model.vocab_size_padded must be divisible by "
+                    f"mesh_model: vocab_size_padded="
+                    f"{_v4168_vocab_size_padded} mesh_model={mesh_model}")
+            _v4168_vocab_embed = make_vocab_parallel_embedding(
+                mesh, _v4168_logical_vocab_size, _v4168_vocab_size_padded)
+            _v4168_vocab_ce_train = make_vocab_parallel_ce(
+                mesh,
+                logical_vocab_size=_v4168_logical_vocab_size,
+                vocab_size_padded=_v4168_vocab_size_padded,
+                token_chunk_size=ce_token_chunk_size,
+                compute_accuracy=train_compute_accuracy)
+            _v4168_vocab_ce_eval = make_vocab_parallel_ce(
+                mesh,
+                logical_vocab_size=_v4168_logical_vocab_size,
+                vocab_size_padded=_v4168_vocab_size_padded,
+                token_chunk_size=ce_token_chunk_size,
+                compute_accuracy=True)
+            _sharded_fns['vocab_parallel_embedding'] = _v4168_vocab_embed
+            _sharded_fns['vocab_ce'] = _v4168_vocab_ce_train
+            _sharded_fns_eval = dict(_sharded_fns)
+            _sharded_fns_eval['vocab_ce'] = _v4168_vocab_ce_eval
+            if isinstance(_sharded_fns_analysis, dict):
+                _sharded_fns_analysis = dict(_sharded_fns_analysis)
+                _sharded_fns_analysis['vocab_parallel_embedding'] = (
+                    _v4168_vocab_embed)
+                _sharded_fns_analysis['vocab_ce'] = _v4168_vocab_ce_eval
+            _v4168_vocab_parallel_enabled = True
         if is_host0:
             _extra_msg = (
                 "; v4167 TP extras=router_dense,attention_o,vocab_parallel"
@@ -14396,6 +14478,8 @@ def main():
                         f"top_blocks qk/v/rst={cfg['model'].get('qk_top_blocks', 2)}/"
                         f"{cfg['model'].get('v_top_blocks', 2)}/"
                         f"{cfg['model'].get('rst_top_blocks', 2)}"))
+                if _v4168_vocab_parallel_enabled:
+                    _extra_msg += "; v4168 TP extras=vocab_parallel_ce"
             _qk_mode_msg = (
                 ("QK operation-space"
                  if _opspace_enabled else "QK dense-distributed")
@@ -14497,6 +14581,9 @@ def main():
                         "  dense_ref_enabled=false",
                         flush=True)
 
+    _eval_sharded_fns = (
+        _sharded_fns_eval if _sharded_fns_eval is not None else _sharded_fns)
+
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
         tau_reg_weight, dead_penalty_weight,
@@ -14586,7 +14673,7 @@ def main():
         ce_token_chunk_size=ce_token_chunk_size,
         train_compute_accuracy=train_compute_accuracy)
     eval_step_fn = create_eval_step(
-        model, sharded_fns=_sharded_fns, return_dead_stats=True,
+        model, sharded_fns=_eval_sharded_fns, return_dead_stats=True,
         total_training_steps=total_steps,
         soft_gate_schedule_active=soft_gate_schedule_active,
         soft_gate_t_start=soft_gate_t_start,
@@ -14613,7 +14700,7 @@ def main():
         for _eps in eval_effective_prune_eps_list:
             _eps_f = float(_eps)
             eval_prune_step_fns[_eps_f] = create_eval_step(
-                model, sharded_fns=_sharded_fns, return_dead_stats=True,
+                model, sharded_fns=_eval_sharded_fns, return_dead_stats=True,
                 return_prune_stats=True, execution_prune_eps=_eps_f,
                 total_training_steps=total_steps,
                 soft_gate_schedule_active=soft_gate_schedule_active,
