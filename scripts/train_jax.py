@@ -910,9 +910,6 @@ V4168_OPSPACE_REPACK_RESUME_REQUIRED_FIELDS = (
 )
 
 V4168_OPSPACE_FINAL_RESUME_REQUIRED_FIELDS = (
-    ('training', 'operation_space', 'pools', 'rst', 'bucket_chunk_size'),
-    ('training', 'operation_space', 'pools', 'rst',
-     'assignment_policy'),
     ('training', 'operation_space', 'pools', 'rst',
      'high_regret_threshold'),
 )
@@ -1390,8 +1387,6 @@ def _v4168_validate_operation_space_shape(opspace):
         'region_capacity_factor',
         'block_capacity_factor',
         'bucket_capacity_factor',
-        'bucket_chunk_size',
-        'assignment_policy',
         'high_regret_threshold',
     }
     for label in ('qk', 'v', 'rst'):
@@ -1417,6 +1412,21 @@ def _v4168_validate_operation_space_shape(opspace):
                 + (f", training.operation_space.pools.{label}."
                    ).join(present_removed)
                 + " was removed from the clean Region-Block atlas config.")
+        if label == 'rst':
+            if 'bucket_chunk_size' in pool:
+                raise ValueError(
+                    "training.operation_space.pools.rst.bucket_chunk_size "
+                    "was removed.\n"
+                    "The selected-block sparse backend does not use "
+                    "bucket_chunk_size in the hot path.\n"
+                    "Remove this field from the config.")
+            if 'assignment_policy' in pool:
+                raise ValueError(
+                    "training.operation_space.pools.rst.assignment_policy "
+                    "was removed.\n"
+                    "RST operation-space assignment policy is fixed "
+                    "internally.\n"
+                    "Remove this field from the config.")
         allowed_pool_keys = (
             allowed_rst_keys if label == 'rst' else common_pool_keys)
         extra = sorted(set(pool) - allowed_pool_keys)
@@ -1559,19 +1569,6 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 "training.operation_space.pools."
                 f"{label}.bucket_capacity_factor must be > 0, got "
                 f"{bucket_capacity_factor}.")
-        bucket_chunk_size = int(pool.get(
-            'bucket_chunk_size', 128))
-        if bucket_chunk_size <= 0:
-            raise ValueError(
-                "training.operation_space.pools."
-                f"{label}.bucket_chunk_size must be > 0, got "
-                f"{bucket_chunk_size}.")
-        assignment_policy = str(pool.get(
-            'assignment_policy', 'low_regret')).strip().lower()
-        if label == 'rst' and assignment_policy != 'low_regret':
-            raise ValueError(
-                "training.operation_space.pools."
-                f"{label}.assignment_policy must be 'low_regret'.")
         high_regret_threshold = float(pool.get(
             'high_regret_threshold', 0.05))
         if high_regret_threshold < 0.0:
@@ -1600,8 +1597,6 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             'region_capacity_factor': region_capacity_factor,
             'block_capacity_factor': block_capacity_factor,
             'bucket_capacity_factor': bucket_capacity_factor,
-            'bucket_chunk_size': bucket_chunk_size,
-            'assignment_policy': assignment_policy,
             'high_regret_threshold': high_regret_threshold,
             'global_operator_capacity': total_capacity,
             'local_operator_capacity': total_capacity // device_count,
@@ -12696,10 +12691,6 @@ def main():
                     'bucket_capacity_factor': float(_layout.get(
                         'bucket_capacity_factor',
                         _layout.get('block_capacity_factor', 1.25))),
-                    'bucket_chunk_size': int(_layout.get(
-                        'bucket_chunk_size', 128)),
-                    'assignment_policy': str(_layout.get(
-                        'assignment_policy', 'low_regret')).lower(),
                     'high_regret_threshold': float(_layout.get(
                         'high_regret_threshold', 0.05)),
                 })
@@ -14051,10 +14042,6 @@ def main():
                 'opspace_bucket_capacity_factor': float(layout.get(
                     'bucket_capacity_factor',
                     layout.get('block_capacity_factor', 1.25))),
-                'opspace_bucket_chunk_size': int(layout.get(
-                    'bucket_chunk_size', 128)),
-                'opspace_assignment_policy': str(layout.get(
-                    'assignment_policy', 'low_regret')).lower(),
                 'opspace_high_regret_threshold': float(layout.get(
                     'high_regret_threshold', 0.05)),
                 'opspace_region_capacity_factor': float(layout.get(

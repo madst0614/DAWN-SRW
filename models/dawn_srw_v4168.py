@@ -3277,48 +3277,11 @@ def make_sharded_srw_tau_free_relu_dense_masked_minimal(
             jnp.maximum(gate_mass, 1.0), _admission_den_power)
         out = raw_out / gate_denominator
 
-        def mesh_mean(v):
-            return jax.lax.pmean(jax.lax.pmean(v, 'data'), 'model')
-
         def data_sum(v):
             return jax.lax.pmean(jax.lax.psum(v, 'data'), 'model')
 
         token_count = jnp.maximum(
             data_sum(jnp.asarray(B * S, dtype=jnp.float32)), 1.0)
-        score_sorted = jnp.sort(scores.reshape(-1))
-        tile_score_p50 = mesh_mean(
-            _v4168_percentile_from_sorted(score_sorted, 50))
-        tile_score_p95 = mesh_mean(
-            _v4168_percentile_from_sorted(score_sorted, 95))
-
-        tile_hist = selected_mask_global.astype(jnp.float32).sum(axis=(0, 1))
-        tile_hist = jax.lax.pmean(jax.lax.psum(tile_hist, 'data'), 'model')
-        tile_hist_flat = tile_hist.reshape(-1)
-        tile_hist_sorted = jnp.sort(tile_hist_flat)
-        tile_mean = jnp.maximum(tile_hist_flat.mean(), 1.0e-6)
-        selected_tile_top1_frac = tile_hist_flat.max() / jnp.maximum(
-            tile_hist_flat.sum(), 1.0)
-        selected_tile_p99_over_mean = (
-            _v4168_percentile_from_sorted(tile_hist_sorted, 99) / tile_mean)
-
-        owner_ids = jnp.arange(_model_axis_size, dtype=jnp.int32)
-        tile_owner = jnp.repeat(
-            lane_ids // jnp.asarray(_local_lanes, dtype=jnp.int32),
-            _tiles_per_lane)
-        owner_load = (
-            (tile_owner[:, None] == owner_ids[None, :]).astype(jnp.float32)
-            * tile_hist_flat[:, None]).sum(axis=0)
-        owner_load_sorted = jnp.sort(owner_load)
-        owner_load_p99_over_mean = (
-            _v4168_percentile_from_sorted(owner_load_sorted, 99)
-            / jnp.maximum(owner_load.mean(), 1.0e-6))
-
-        lane_hist = (
-            selected_lanes[:, :, :, None] == lane_ids[None, None, None, :]
-        ).astype(jnp.float32).sum(axis=(0, 1, 2))
-        lane_hist = jax.lax.pmean(jax.lax.psum(lane_hist, 'data'), 'model')
-        selected_lane_top1_frac = lane_hist.max() / jnp.maximum(
-            lane_hist.sum(), 1.0)
 
         valid_exec_slots = (
             selected_mask_global.astype(jnp.float32)
@@ -3346,7 +3309,7 @@ def make_sharded_srw_tau_free_relu_dense_masked_minimal(
             valid_exec_slots_mean,
             jnp.float32(0.0),
             jnp.float32(0.0),
-            selected_lane_top1_frac,
+            jnp.float32(0.0),
             jnp.float32(1.0),
             jnp.float32(0.0),
             jnp.float32(0.0),
@@ -4318,61 +4281,87 @@ def _opspace_selected_block_bucket_capacity(
 
 def _opspace_build_selected_block_buckets(
         selected_blocks_local, *, blocks_per_region, block_capacity):
-    """Create fixed selected-block token buckets without region outputs."""
+    """Create fixed selected-block token buckets without giant match tensors."""
     local_regions = int(selected_blocks_local.shape[0])
     T = int(selected_blocks_local.shape[1])
     visible_blocks = int(selected_blocks_local.shape[2])
-    flat_count = local_regions * T * visible_blocks
-    request_region = jnp.repeat(
-        jnp.arange(local_regions, dtype=jnp.int32), T * visible_blocks)
-    request_token = jnp.tile(
-        jnp.repeat(jnp.arange(T, dtype=jnp.int32), visible_blocks),
-        local_regions)
-    request_block = selected_blocks_local.reshape(flat_count).astype(jnp.int32)
-    request_valid = request_block >= 0
 
-    region_ids = jnp.arange(local_regions, dtype=jnp.int32)
-    block_ids = jnp.arange(blocks_per_region, dtype=jnp.int32)
-    request_match = jnp.logical_and(
-        request_valid[:, None, None],
-        jnp.logical_and(
-            request_region[:, None, None] == region_ids[None, :, None],
-            request_block[:, None, None] == block_ids[None, None, :]))
-    rank_by_block = jnp.cumsum(request_match.astype(jnp.int32), axis=0) - 1
-    rank = jnp.sum(
-        jnp.where(request_match, rank_by_block, 0), axis=(1, 2)).astype(
-            jnp.int32)
-    in_capacity = jnp.logical_and(
-        request_valid,
-        rank < jnp.asarray(block_capacity, dtype=jnp.int32))
-    safe_region = jnp.where(
-        in_capacity, request_region,
-        jnp.asarray(local_regions, dtype=jnp.int32))
-    safe_block = jnp.where(
-        in_capacity, request_block,
-        jnp.asarray(blocks_per_region, dtype=jnp.int32))
-    safe_rank = jnp.where(
-        in_capacity, rank,
-        jnp.asarray(block_capacity, dtype=jnp.int32))
-    bucket_valid_count = jnp.zeros(
-        (local_regions, blocks_per_region, block_capacity),
-        dtype=jnp.float32).at[safe_region, safe_block, safe_rank].add(
-            in_capacity.astype(jnp.float32), mode='drop')
+    token_ids = jnp.arange(T, dtype=jnp.int32)
+
     token_id_bucket = jnp.zeros(
         (local_regions, blocks_per_region, block_capacity),
-        dtype=jnp.int32).at[safe_region, safe_block, safe_rank].max(
-            request_token * in_capacity.astype(jnp.int32), mode='drop')
+        dtype=jnp.int32)
+    bucket_valid_count = jnp.zeros(
+        (local_regions, blocks_per_region, block_capacity),
+        dtype=jnp.float32)
+    overflow_count = jnp.float32(0.0)
+
+    def region_step(carry, region_i):
+        token_id_bucket, bucket_valid_count, overflow_count = carry
+        selected_for_region = selected_blocks_local[region_i]
+
+        def block_step(inner, block_i):
+            token_id_bucket, bucket_valid_count, overflow_count = inner
+
+            match = jnp.any(
+                selected_for_region == block_i,
+                axis=-1,
+            )
+
+            rank = jnp.cumsum(match.astype(jnp.int32)) - 1
+            in_capacity = jnp.logical_and(
+                match,
+                rank < jnp.asarray(block_capacity, dtype=jnp.int32),
+            )
+
+            safe_rank = jnp.where(in_capacity, rank, 0)
+            write_f = in_capacity.astype(jnp.float32)
+
+            token_id_bucket = token_id_bucket.at[
+                region_i, block_i, safe_rank
+            ].max(
+                token_ids * in_capacity.astype(jnp.int32),
+                mode='drop',
+            )
+
+            bucket_valid_count = bucket_valid_count.at[
+                region_i, block_i, safe_rank
+            ].add(
+                write_f,
+                mode='drop',
+            )
+
+            overflow_count = overflow_count + (
+                jnp.logical_and(match, jnp.logical_not(in_capacity))
+                .astype(jnp.float32)
+                .sum()
+            )
+
+            return token_id_bucket, bucket_valid_count, overflow_count
+
+        return jax.lax.scan(
+            block_step,
+            (token_id_bucket, bucket_valid_count, overflow_count),
+            jnp.arange(blocks_per_region, dtype=jnp.int32),
+        )[0], None
+
+    (token_id_bucket, bucket_valid_count, overflow_count), _ = jax.lax.scan(
+        region_step,
+        (token_id_bucket, bucket_valid_count, overflow_count),
+        jnp.arange(local_regions, dtype=jnp.int32),
+    )
+
     bucket_valid = bucket_valid_count == jnp.float32(1.0)
     bucket_fill = bucket_valid.astype(jnp.float32).sum(axis=-1)
+    processed_request_count = bucket_valid.astype(jnp.float32).sum()
     assignment_collision_count = jnp.maximum(
         bucket_valid_count - jnp.float32(1.0), jnp.float32(0.0)).sum()
-    overflow_count = jnp.logical_and(
-        request_valid, jnp.logical_not(in_capacity)).astype(jnp.float32).sum()
+
     return {
         'token_id_bucket': token_id_bucket,
         'bucket_valid': bucket_valid,
         'bucket_fill': bucket_fill,
-        'processed_request_count': bucket_valid.astype(jnp.float32).sum(),
+        'processed_request_count': processed_request_count,
         'assignment_collision_count': assignment_collision_count,
         'overflow_request_count': overflow_count,
     }
@@ -4393,7 +4382,8 @@ def _opspace_execute_rst_selected_block_sparse(
     flat_x = flat_x.astype(jnp.bfloat16)
 
     def block_step(carry, block_i):
-        flat_raw_out, flat_gate_mass, flat_relu_gate_count, finite_acc = carry
+        flat_raw_out, flat_gate_mass, relu_gate_count_sum_local, finite_acc = (
+            carry)
         region_i = block_i // jnp.asarray(blocks_per_region, dtype=jnp.int32)
         block_j = block_i - region_i * jnp.asarray(
             blocks_per_region, dtype=jnp.int32)
@@ -4420,33 +4410,33 @@ def _opspace_execute_rst_selected_block_sparse(
             write_b).astype(jnp.float32)
         mass_b = gate.sum(axis=-1, keepdims=True)
         relu_b = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
+        relu_sum_b = (relu_b * valid_f).sum()
 
         flat_raw_out = flat_raw_out.at[safe_token_ids].add(
             raw_b * valid_f[:, None], mode='drop')
         flat_gate_mass = flat_gate_mass.at[safe_token_ids].add(
             mass_b * valid_f[:, None], mode='drop')
-        flat_relu_gate_count = flat_relu_gate_count.at[safe_token_ids].add(
-            relu_b * valid_f, mode='drop')
+        relu_gate_count_sum_local = relu_gate_count_sum_local + relu_sum_b
         finite = jnp.logical_and(
             jnp.all(jnp.isfinite(gate)), jnp.all(jnp.isfinite(raw_b)))
         finite_acc = jnp.minimum(finite_acc, finite.astype(jnp.float32))
         return (
-            flat_raw_out, flat_gate_mass, flat_relu_gate_count,
+            flat_raw_out, flat_gate_mass, relu_gate_count_sum_local,
             finite_acc), None
 
     init = (
         jnp.zeros((T, D), dtype=jnp.float32),
         jnp.zeros((T, 1), dtype=jnp.float32),
-        jnp.zeros((T,), dtype=jnp.float32),
+        jnp.float32(0.0),
         jnp.float32(1.0),
     )
-    (flat_raw_out_local, flat_gate_mass_local, flat_relu_gate_count_local,
+    (flat_raw_out_local, flat_gate_mass_local, relu_gate_count_sum_local,
      compute_no_nan) = jax.lax.scan(
         block_step, init, jnp.arange(block_count, dtype=jnp.int32))[0]
     return (
         *_opspace_finalize_bucketed_output(
             flat_raw_out_local, flat_gate_mass_local,
-            flat_relu_gate_count_local, admission_den_power),
+            relu_gate_count_sum_local, admission_den_power),
         compute_no_nan)
 
 
@@ -5276,15 +5266,17 @@ def _opspace_execute_region_grouped_xla_dense(
 
 def _opspace_finalize_bucketed_output(
         flat_raw_out_local, flat_gate_mass_local,
-        flat_relu_gate_count_local, admission_den_power):
+        relu_gate_count_sum_local, admission_den_power):
     global_raw_out = jax.lax.psum(flat_raw_out_local, 'model')
     global_gate_mass = jax.lax.psum(flat_gate_mass_local, 'model')
-    global_relu_gate_count = jax.lax.psum(
-        flat_relu_gate_count_local, 'model')
+    global_relu_gate_count_sum = jax.lax.psum(
+        relu_gate_count_sum_local, 'model')
     gate_denominator = jnp.power(
         jnp.maximum(global_gate_mass, 1.0), admission_den_power)
     flat_out = global_raw_out / gate_denominator
-    return flat_out, global_gate_mass, global_relu_gate_count, gate_denominator
+    return (
+        flat_out, global_gate_mass, global_relu_gate_count_sum,
+        gate_denominator)
 
 
 def _opspace_tau_free_relu_region_stationary_dense_core(
@@ -5292,8 +5284,7 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
         lanes, tiles_per_lane, tile_size, local_lanes, local_tile_count,
         local_padded_ops, blocks_per_lane, exec_tiles_per_block, block_size,
         k_exec, exec_slots, admission_den_power, bucket_capacity_factor=1.5,
-        bucket_chunk_size=128, high_regret_threshold=0.05,
-        assignment_policy='low_regret',
+        high_regret_threshold=0.05,
         visible_blocks_per_region=1, region_score_pooling='smoothmax',
         region_score_temperature=0.25, region_capacity_factor=1.25,
         block_capacity_factor=None, use_pallas=True,
@@ -5313,11 +5304,7 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
     operator bundle is visible. The only continuous mixing/intensity occurs at
     the RW operator gate inside each visible block.
     """
-    del bucket_chunk_size, exec_tiles_per_block, use_pallas, pallas_interpret
-    if str(assignment_policy).lower() != 'low_regret':
-        raise ValueError(
-            "region_stationary_dense requires assignment_policy="
-            f"'low_regret', got {assignment_policy!r}.")
+    del exec_tiles_per_block, use_pallas, pallas_interpret
     if int(blocks_per_lane) <= 0:
         raise ValueError(
             "region_stationary_dense requires blocks_per_region > 0, got "
@@ -5487,7 +5474,7 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
     assignment_collision_count = block_buckets[
         'assignment_collision_count']
 
-    (flat_out, global_gate_mass, global_relu_gate_count,
+    (flat_out, global_gate_mass, global_relu_gate_count_sum,
      gate_denominator, compute_no_nan) = (
         _opspace_execute_rst_selected_block_sparse(
             flat_x, flat_h, key_blocks, read_blocks, write_blocks,
@@ -5570,7 +5557,7 @@ def _opspace_tau_free_relu_region_stationary_dense_core(
     valid_exec_slots_mean = (
         data_sum(global_valid_exec_slots_sum) / token_count)
     relu_gate_count_mean = (
-        data_sum(global_relu_gate_count.sum()) / token_count)
+        data_sum(global_relu_gate_count_sum) / token_count)
     gate_denominator_mean = (
         data_sum(gate_denominator.sum()) / token_count)
     gate_mass_mean = data_sum(global_gate_mass.sum()) / token_count
@@ -6018,8 +6005,6 @@ def make_sharded_srw_tau_free_relu_block_bucketed_pallas_final_minimal(
         block_size=None,
         token_chunk_size=256,
         bucket_capacity_factor=1.5,
-        bucket_chunk_size=128,
-        assignment_policy='low_regret',
         high_regret_threshold=0.05,
         visible_blocks_per_region=1,
         region_score_pooling='smoothmax',
@@ -6055,8 +6040,6 @@ def make_sharded_srw_tau_free_relu_block_bucketed_pallas_final_minimal(
         jnp.asarray(admission_den_power, dtype=jnp.float32),
         jnp.float32(0.0))
     _bucket_capacity_factor = float(bucket_capacity_factor)
-    _bucket_chunk_size = int(bucket_chunk_size)
-    _assignment_policy = str(assignment_policy).lower()
     _high_regret_threshold = float(high_regret_threshold)
     _region_score_pooling = str(region_score_pooling).lower()
     _region_score_temperature = float(region_score_temperature)
@@ -6101,9 +6084,7 @@ def make_sharded_srw_tau_free_relu_block_bucketed_pallas_final_minimal(
                 exec_slots=_exec_slots,
                 admission_den_power=_admission_den_power,
                 bucket_capacity_factor=_bucket_capacity_factor,
-                bucket_chunk_size=_bucket_chunk_size,
                 high_regret_threshold=_high_regret_threshold,
-                assignment_policy=_assignment_policy,
                 visible_blocks_per_region=_visible_blocks_per_region,
                 region_score_pooling=_region_score_pooling,
                 region_score_temperature=_region_score_temperature,
@@ -6132,10 +6113,8 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
         padded_ops=0,
         token_chunk_size=256,
         bucket_capacity_factor=1.5,
-        bucket_chunk_size=128,
         region_capacity_factor=1.25,
         block_capacity_factor=1.25,
-        assignment_policy='low_regret',
         high_regret_threshold=0.05,
         use_pallas=True,
         pallas_interpret=False):
@@ -6165,10 +6144,8 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
         block_size=int(operators_per_block),
         token_chunk_size=token_chunk_size,
         bucket_capacity_factor=bucket_capacity_factor,
-        bucket_chunk_size=bucket_chunk_size,
         region_capacity_factor=region_capacity_factor,
         block_capacity_factor=block_capacity_factor,
-        assignment_policy=assignment_policy,
         high_regret_threshold=high_regret_threshold,
         visible_blocks_per_region=visible_blocks_per_region,
         region_score_pooling=region_score_pooling,
@@ -7464,8 +7441,6 @@ def operation_space_static_metrics(model_config, config=None,
         if execution_backend == 'sparse_region_block':
             out[f'opspace/{label}/bucket_capacity_factor'] = float(
                 pcfg.get('bucket_capacity_factor', block_capacity_factor))
-            out[f'opspace/{label}/bucket_chunk_size'] = float(
-                pcfg.get('bucket_chunk_size', 128))
             out[f'opspace/{label}/high_regret_threshold'] = float(
                 pcfg.get('high_regret_threshold', 0.05))
     return out
@@ -8942,49 +8917,11 @@ def make_sharded_srw_fixed_k4_repack_minimal(
         flat_out = global_raw_out / gate_denominator
         out = flat_out.reshape(B, S, D)
 
-        def mesh_mean(v):
-            return jax.lax.pmean(jax.lax.pmean(v, 'data'), 'model')
-
         def data_sum(v):
             return jax.lax.pmean(jax.lax.psum(v, 'data'), 'model')
 
         token_count = jnp.maximum(
             data_sum(jnp.asarray(T, dtype=jnp.float32)), 1.0)
-        score_sorted = jnp.sort(scores_local.reshape(-1))
-        tile_score_p50 = mesh_mean(
-            _v4168_percentile_from_sorted(score_sorted, 50))
-        tile_score_p95 = mesh_mean(
-            _v4168_percentile_from_sorted(score_sorted, 95))
-
-        tile_hist_local = jax.lax.psum(
-            group_counts.astype(jnp.float32), 'data')
-        tile_hist = jax.lax.all_gather(
-            tile_hist_local, 'model', axis=0, tiled=True)
-        tile_hist_sorted = jnp.sort(tile_hist)
-        tile_mean = jnp.maximum(tile_hist.mean(), 1.0e-6)
-        selected_tile_top1_frac = tile_hist.max() / jnp.maximum(
-            tile_hist.sum(), 1.0)
-        selected_tile_p99 = _v4168_percentile_from_sorted(
-            tile_hist_sorted, 99)
-        selected_tile_p99_over_mean = selected_tile_p99 / tile_mean
-
-        owner_load_local = jax.lax.psum(
-            group_counts.astype(jnp.float32).sum(), 'data')
-        owner_load = jax.lax.all_gather(
-            owner_load_local.reshape((1,)), 'model', axis=0, tiled=True)
-        owner_load_sorted = jnp.sort(owner_load)
-        owner_load_mean = jnp.maximum(owner_load.mean(), 1.0e-6)
-        owner_load_p99_over_mean = (
-            _v4168_percentile_from_sorted(owner_load_sorted, 99)
-            / owner_load_mean)
-
-        lane_hist_local = group_counts.reshape(
-            _local_lanes, _tiles_per_lane).sum(axis=1).astype(jnp.float32)
-        lane_hist_local = jax.lax.psum(lane_hist_local, 'data')
-        lane_hist = jax.lax.all_gather(
-            lane_hist_local, 'model', axis=0, tiled=True)
-        selected_lane_top1_frac = lane_hist.max() / jnp.maximum(
-            lane_hist.sum(), 1.0)
 
         valid_exec_slots_mean = (
             data_sum(global_valid_exec_slots_sum) / token_count)
@@ -9016,12 +8953,12 @@ def make_sharded_srw_fixed_k4_repack_minimal(
             jnp.float32(_k_exec),
             jnp.float32(_exec_slots),
             valid_exec_slots_mean,
-            tile_score_p50,
-            tile_score_p95,
-            selected_lane_top1_frac,
-            selected_tile_top1_frac,
-            selected_tile_p99_over_mean,
-            owner_load_p99_over_mean,
+            jnp.float32(0.0),
+            jnp.float32(0.0),
+            jnp.float32(0.0),
+            jnp.float32(1.0),
+            jnp.float32(0.0),
+            jnp.float32(0.0),
             relu_gate_count_mean,
             gate_denominator_mean,
             gate_mass_mean,
@@ -10389,10 +10326,8 @@ def make_sharded_srw_minimal(
         opspace_padded_ops=0,
         opspace_tile_size=128,
         opspace_bucket_capacity_factor=1.5,
-        opspace_bucket_chunk_size=128,
         opspace_region_capacity_factor=1.25,
         opspace_block_capacity_factor=1.25,
-        opspace_assignment_policy='low_regret',
         opspace_high_regret_threshold=0.05,
         opspace_num_regions=32,
         opspace_blocks_per_region=2,
@@ -10464,10 +10399,8 @@ def make_sharded_srw_minimal(
             padded_ops=opspace_padded_ops,
             token_chunk_size=opspace_token_chunk_size,
             bucket_capacity_factor=opspace_bucket_capacity_factor,
-            bucket_chunk_size=opspace_bucket_chunk_size,
             region_capacity_factor=opspace_region_capacity_factor,
             block_capacity_factor=opspace_block_capacity_factor,
-            assignment_policy=opspace_assignment_policy,
             high_regret_threshold=opspace_high_regret_threshold)
     routing_mode = str(
         operation_space_routing_mode
@@ -10495,10 +10428,8 @@ def make_sharded_srw_minimal(
             padded_ops=opspace_padded_ops,
             token_chunk_size=opspace_token_chunk_size,
             bucket_capacity_factor=opspace_bucket_capacity_factor,
-            bucket_chunk_size=opspace_bucket_chunk_size,
             region_capacity_factor=opspace_region_capacity_factor,
             block_capacity_factor=opspace_block_capacity_factor,
-            assignment_policy=opspace_assignment_policy,
             high_regret_threshold=opspace_high_regret_threshold)
     if routing_mode == 'factorized_lane_mean':
         if execution_mode == 'dense_masked':
