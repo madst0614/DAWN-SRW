@@ -741,7 +741,13 @@ def scaled_normal(scale=0.02):
 
 
 def _chunked_ce_loss_and_acc(shift_x, embedding_matrix, shift_labels,
-                             valid_mask, token_chunk_size=8192):
+                             valid_mask, token_chunk_size=8192,
+                             compute_accuracy=True):
+    token_chunk_size = int(token_chunk_size)
+    if token_chunk_size <= 0:
+        raise ValueError(
+            f"token_chunk_size must be > 0, got {token_chunk_size}")
+    compute_accuracy = bool(compute_accuracy)
     B, T, D = shift_x.shape
     flat_x = shift_x.reshape(B * T, D)
     flat_labels = shift_labels.reshape(B * T)
@@ -763,18 +769,21 @@ def _chunked_ce_loss_and_acc(shift_x, embedding_matrix, shift_labels,
         x_c, labels_c, valid_c = xs
 
         logits = x_c @ embedding_matrix.T
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
         safe_labels = jnp.where(valid_c, labels_c, 0)
-        token_loss = -jnp.take_along_axis(
-            log_probs, safe_labels[..., None], axis=-1).squeeze(-1)
+        target_logits = jnp.take_along_axis(
+            logits, safe_labels[..., None], axis=-1).squeeze(-1)
+        token_loss = jax.nn.logsumexp(logits, axis=-1) - target_logits
         token_loss = token_loss.astype(jnp.float32)
         valid_f = valid_c.astype(jnp.float32)
 
-        preds = jnp.argmax(logits, axis=-1)
+        if compute_accuracy:
+            preds = jnp.argmax(logits, axis=-1)
+            correct_delta = ((preds == labels_c) & valid_c).astype(
+                jnp.int32).sum()
+        else:
+            correct_delta = jnp.array(0, dtype=jnp.int32)
         loss_sum = loss_sum + (token_loss * valid_f).sum()
-        correct_sum = (
-            correct_sum
-            + ((preds == labels_c) & valid_c).astype(jnp.int32).sum())
+        correct_sum = correct_sum + correct_delta
         valid_sum = valid_sum + valid_c.astype(jnp.int32).sum()
         return (loss_sum, correct_sum, valid_sum), None
 
@@ -9350,7 +9359,9 @@ class DAWN_SRW_V4168(nn.Module):
                  execution_prune_eps=0.0,
                  minimal_train=False,
                  benchmark_runtime_metrics=False,
-                 training_tokens=0.0):
+                 training_tokens=0.0,
+                 ce_token_chunk_size=8192,
+                 compute_accuracy=True):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -9618,13 +9629,21 @@ class DAWN_SRW_V4168(nn.Module):
                 if labels is None:
                     return {'logits': self.token_emb.attend(x)}
 
+                ce_token_chunk_size = int(ce_token_chunk_size)
+                if ce_token_chunk_size <= 0:
+                    raise ValueError(
+                        "ce_token_chunk_size must be > 0, got "
+                        f"{ce_token_chunk_size}")
+                compute_accuracy = bool(compute_accuracy)
                 embedding_matrix = self.token_emb.embedding
                 shift_x = x[:, :-1, :]
                 shift_labels = labels[:, 1:].astype(jnp.int32)
                 valid_mask = (shift_labels != -100)
 
                 loss, correct, valid_count = _chunked_ce_loss_and_acc(
-                    shift_x, embedding_matrix, shift_labels, valid_mask)
+                    shift_x, embedding_matrix, shift_labels, valid_mask,
+                    token_chunk_size=ce_token_chunk_size,
+                    compute_accuracy=compute_accuracy)
                 sector_metrics = {}
                 if benchmark_runtime_metrics:
                     sector_metrics.update(_sector_benchmark_runtime_metric_dict(
@@ -10455,6 +10474,12 @@ class DAWN_SRW_V4168(nn.Module):
                 'rst_int_cap_frac': rst_int_cap_frac_all.mean(),
             })
         if labels is not None:
+            ce_token_chunk_size = int(ce_token_chunk_size)
+            if ce_token_chunk_size <= 0:
+                raise ValueError(
+                    "ce_token_chunk_size must be > 0, got "
+                    f"{ce_token_chunk_size}")
+            compute_accuracy = bool(compute_accuracy)
             embedding_matrix = self.token_emb.embedding
             shift_x = x[:, :-1, :]
             shift_labels = labels[:, 1:].astype(jnp.int32)
@@ -10463,14 +10488,18 @@ class DAWN_SRW_V4168(nn.Module):
             @jax.checkpoint
             def compute_loss_and_acc(x_chunk, emb, labs, vmask):
                 logits = x_chunk @ emb.T
-                log_probs = jax.nn.log_softmax(logits, axis=-1)
                 safe = jnp.where(vmask, labs, 0)
-                tl = -jnp.take_along_axis(
-                    log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
+                target_logits = jnp.take_along_axis(
+                    logits, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
+                tl = jax.nn.logsumexp(logits, axis=-1) - target_logits
+                tl = tl.astype(jnp.float32)
                 per_token_ce = tl * vmask            # [B, S-1], 0 on invalid
                 loss = per_token_ce.sum() / (vmask.sum() + 1e-8)
-                preds = jnp.argmax(logits, axis=-1)
-                correct = jnp.sum((preds == labs) & vmask)
+                if compute_accuracy:
+                    preds = jnp.argmax(logits, axis=-1)
+                    correct = jnp.sum((preds == labs) & vmask)
+                else:
+                    correct = jnp.array(0, dtype=jnp.int32)
                 logits_f = logits.astype(jnp.float32)
                 logit_abs_max = jnp.max(jnp.abs(logits_f))
                 logit_norm_mean = jnp.linalg.norm(logits_f, axis=-1).mean()
@@ -11078,10 +11107,11 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
         valid_mask = shift_labels > 0
 
         logits = shift_x @ emb_matrix.T
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
         safe_labels = jnp.where(valid_mask, shift_labels, 0)
-        token_loss = -jnp.take_along_axis(
-            log_probs, safe_labels[..., jnp.newaxis], axis=-1).squeeze(-1)
+        target_logits = jnp.take_along_axis(
+            logits, safe_labels[..., jnp.newaxis], axis=-1).squeeze(-1)
+        token_loss = jax.nn.logsumexp(logits, axis=-1) - target_logits
+        token_loss = token_loss.astype(jnp.float32)
         total_loss = (token_loss * valid_mask).sum()
         preds = jnp.argmax(logits, axis=-1)
         correct = ((preds == shift_labels) & valid_mask).sum()

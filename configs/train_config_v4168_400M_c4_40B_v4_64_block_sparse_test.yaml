@@ -27,6 +27,8 @@ training:
   mesh_data: 16
   gradient_accumulation_steps: 1
   num_epochs: 1
+  ce_token_chunk_size: 32768
+  train_compute_accuracy: true
   n_chunks_qk: 1
   n_chunks_v: 1
   n_chunks_rst: 4

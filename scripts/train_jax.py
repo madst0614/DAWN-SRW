@@ -3723,6 +3723,26 @@ def _model_accepts_training_tokens(model):
         return False
 
 
+def _model_accepts_ce_token_chunk_size(model):
+    """Return True if model.__call__ accepts CE token chunk sizing."""
+    import inspect as _inspect
+    try:
+        return 'ce_token_chunk_size' in _inspect.signature(
+            model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _model_accepts_compute_accuracy(model):
+    """Return True if model.__call__ accepts accuracy computation control."""
+    import inspect as _inspect
+    try:
+        return 'compute_accuracy' in _inspect.signature(
+            model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _scalar0(x):
     return jnp.asarray(x, dtype=jnp.float32).reshape(())
 
@@ -4408,7 +4428,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       is_baseline=False,
                       compact_train_metrics=False,
                       keep_train_layer_metrics=False,
-                      tokens_per_step=0):
+                      tokens_per_step=0,
+                      ce_token_chunk_size=8192,
+                      train_compute_accuracy=True):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
 
     Creates the official v4164 train step and regular metric payload.
@@ -4525,6 +4547,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _route_emb_update_ratio_cap = jnp.float32(route_emb_update_ratio_cap)
     _tau_update_abs_cap = jnp.float32(tau_update_abs_cap)
     _scan_update_abs_cap = jnp.float32(scan_update_abs_cap)
+    _ce_token_chunk_size = int(ce_token_chunk_size)
+    if _ce_token_chunk_size <= 0:
+        raise ValueError(
+            "training.ce_token_chunk_size must be > 0, got "
+            f"{_ce_token_chunk_size}")
+    _train_compute_accuracy = bool(train_compute_accuracy)
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
@@ -4533,6 +4561,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _pass_minimal_train_kw = _model_accepts_minimal_train(model)
     _pass_training_tokens_kw = _model_accepts_training_tokens(model)
+    _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
+    _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _use_minimal_train_path = (
@@ -4685,6 +4715,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             if _pass_execution_prune_kw:
                 # Training never execution-prunes; pruning is eval-sweep only.
                 extra_kw['execution_prune_eps'] = jnp.float32(0.0)
+            if _pass_ce_token_chunk_size_kw:
+                extra_kw['ce_token_chunk_size'] = _ce_token_chunk_size
+            if _pass_compute_accuracy_kw:
+                extra_kw['compute_accuracy'] = _train_compute_accuracy
             result = model.apply(
                 {'params': params},
                 input_ids,
@@ -6836,7 +6870,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_boundary_power_start_frac=0.0,
                      soft_gate_boundary_power_mid_frac=0.800,
                      soft_gate_boundary_power_final_frac=0.950,
-                     admission_den_power=1.0):
+                     admission_den_power=1.0,
+                     ce_token_chunk_size=8192):
     """Create a jit-compiled evaluation step.
 
     Uses the SLIM forward (analysis=False). Eval normally needs only loss /
@@ -6850,8 +6885,15 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _pass_minimal_train_kw = _model_accepts_minimal_train(model)
+    _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
+    _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
     _execution_prune_eps = jnp.float32(execution_prune_eps)
     _return_prune_stats = bool(return_prune_stats)
+    _ce_token_chunk_size = int(ce_token_chunk_size)
+    if _ce_token_chunk_size <= 0:
+        raise ValueError(
+            "training.ce_token_chunk_size must be > 0, got "
+            f"{_ce_token_chunk_size}")
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _use_minimal_train_path = (
@@ -6942,6 +6984,10 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             extra_kw['admission_den_power'] = _admission_den_power
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = _execution_prune_eps
+        if _pass_ce_token_chunk_size_kw:
+            extra_kw['ce_token_chunk_size'] = _ce_token_chunk_size
+        if _pass_compute_accuracy_kw:
+            extra_kw['compute_accuracy'] = True
         result = model.apply(
             {'params': params},
             input_ids,
@@ -6996,7 +7042,8 @@ def create_analysis_step(model, sharded_fns=None,
                          soft_gate_boundary_power_start_frac=0.0,
                          soft_gate_boundary_power_mid_frac=0.800,
                          soft_gate_boundary_power_final_frac=0.950,
-                         admission_den_power=1.0):
+                         admission_den_power=1.0,
+                         ce_token_chunk_size=8192):
     """Create a jit-compiled analysis step (FULL forward, observational).
 
     Runs the model with `analysis=True` and the ANALYSIS variant of
@@ -7010,6 +7057,13 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
+    _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
+    _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
+    _ce_token_chunk_size = int(ce_token_chunk_size)
+    if _ce_token_chunk_size <= 0:
+        raise ValueError(
+            "training.ce_token_chunk_size must be > 0, got "
+            f"{_ce_token_chunk_size}")
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
         and _is_active_srw_version(
@@ -7095,6 +7149,10 @@ def create_analysis_step(model, sharded_fns=None,
             extra_kw['admission_den_power'] = _admission_den_power
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = jnp.float32(0.0)
+        if _pass_ce_token_chunk_size_kw:
+            extra_kw['ce_token_chunk_size'] = _ce_token_chunk_size
+        if _pass_compute_accuracy_kw:
+            extra_kw['compute_accuracy'] = True
         result = model.apply(
             {'params': params},
             input_ids,
@@ -9137,6 +9195,8 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     m = metrics
     fixed_pool_scale = _fixed_depth_pool_scale_from_ctx(ctx)
     is_rw_key_model = _is_rw_key_srw_version(ctx.get('model_version'))
+    train_compute_accuracy = bool(ctx.get('train_compute_accuracy', True))
+    train_acc = win_avgs['acc'] if train_compute_accuracy else None
 
     def _metric_present(*keys):
         return any(key in m for key in keys)
@@ -9433,7 +9493,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'cb1a_rst_prune_weight',
             m.get('cb1a_prune_weight', 1.0))),
         # Accuracy / training status.
-        'accuracy': win_avgs['acc'],
+        'accuracy': train_acc,
+        'train_acc': train_acc,
+        'train_compute_accuracy': train_compute_accuracy,
         'grad_norm': float(m['grad_norm']),
         'grad_global_preclip': float(m.get('grad_global_preclip', m['grad_norm'])),
         'grad_global_postclip': float(m.get('grad_global_postclip', 0.0)),
@@ -10187,13 +10249,20 @@ def _opspace_warning_lines(rec):
     return lines
 
 
+def _fmt_train_accuracy(value):
+    if value is None:
+        return "n/a"
+    return f"{float(value):.4f}"
+
+
 def _print_train_progress_line(rec, ctx):
+    acc_text = _fmt_train_accuracy(rec.get('accuracy'))
     log_message(
         f"  [train] loss={rec['total_loss']:.4f}"
         f" ce={rec['ce_loss']:.4f}"
         f" aux={rec['aux_loss']:.4f}"
         f" grad={rec['grad_norm']:.2f}"
-        f" acc={rec['accuracy']:.4f}"
+        f" acc={acc_text}"
         f" lr={rec['lr']:.2e}"
         f" tok={ctx['progress']:.1f}%"
     )
@@ -10393,12 +10462,13 @@ def _print_regular_block(rec, ctx):
         " aux_is_not_total_minus_ce"
         if is_official_soft_direct_tau
         else "")
+    acc_text = _fmt_train_accuracy(rec.get('accuracy'))
     log_message(
         f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
         f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} "
         f"total_minus_ce={rec['total_loss_minus_ce']:.4f}{aux_note} | "
         f"grad={rec['grad_norm']:.2f} | "
-        f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
+        f"acc={acc_text} lr={rec['lr']:.2e}"
     )
     if opspace_active:
         _print_v4168_opspace_regular_block(rec)
@@ -11564,6 +11634,14 @@ def main():
     # Resume log append policy. Defaults preserve the previous behavior.
     training_log_append_on_resume = bool(
         tcfg.get('training_log_append_on_resume', True))
+    ce_token_chunk_size = int(tcfg.get('ce_token_chunk_size', 8192))
+    if ce_token_chunk_size <= 0:
+        raise ValueError(
+            "training.ce_token_chunk_size must be > 0, got "
+            f"{ce_token_chunk_size}")
+    train_compute_accuracy = _cfg_bool(
+        tcfg.get('train_compute_accuracy', True),
+        name='training.train_compute_accuracy')
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
@@ -12035,6 +12113,14 @@ def main():
         training_log_append_on_resume = bool(tcfg.get(
             'training_log_append_on_resume',
             training_log_append_on_resume))
+        ce_token_chunk_size = int(tcfg.get('ce_token_chunk_size', 8192))
+        if ce_token_chunk_size <= 0:
+            raise ValueError(
+                "training.ce_token_chunk_size must be > 0, got "
+                f"{ce_token_chunk_size}")
+        train_compute_accuracy = _cfg_bool(
+            tcfg.get('train_compute_accuracy', True),
+            name='training.train_compute_accuracy')
         ckpt_interval = int(tcfg['checkpoint_interval'])
         checkpoint_keep_last = int(tcfg.get(
             'checkpoint_keep_last',
@@ -12290,6 +12376,16 @@ def main():
                 saved_training_config.get(
                     'training_log_append_on_resume',
                     training_log_append_on_resume))
+            ce_token_chunk_size = int(saved_training_config.get(
+                'ce_token_chunk_size', ce_token_chunk_size))
+            if ce_token_chunk_size <= 0:
+                raise ValueError(
+                    "training.ce_token_chunk_size must be > 0, got "
+                    f"{ce_token_chunk_size}")
+            train_compute_accuracy = _cfg_bool(
+                saved_training_config.get(
+                    'train_compute_accuracy', train_compute_accuracy),
+                name='training.train_compute_accuracy')
             ckpt_interval = int(saved_training_config['checkpoint_interval'])
             checkpoint_keep_last = int(saved_training_config.get(
                 'checkpoint_keep_last',
@@ -12659,6 +12755,8 @@ def main():
         'checkpoint_keep_last': checkpoint_keep_last,
         'best_checkpoint_keep_last': best_checkpoint_keep_last,
         'training_log_append_on_resume': training_log_append_on_resume,
+        'ce_token_chunk_size': ce_token_chunk_size,
+        'train_compute_accuracy': train_compute_accuracy,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
@@ -14484,7 +14582,9 @@ def main():
         is_baseline=is_baseline,
         compact_train_metrics=compact_train_metrics,
         keep_train_layer_metrics=False,
-        tokens_per_step=int(batch_size) * int(max_seq_len))
+        tokens_per_step=int(batch_size) * int(max_seq_len),
+        ce_token_chunk_size=ce_token_chunk_size,
+        train_compute_accuracy=train_compute_accuracy)
     eval_step_fn = create_eval_step(
         model, sharded_fns=_sharded_fns, return_dead_stats=True,
         total_training_steps=total_steps,
@@ -14506,7 +14606,8 @@ def main():
         soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
         soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
         soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-        admission_den_power=admission_den_power)
+        admission_den_power=admission_den_power,
+        ce_token_chunk_size=ce_token_chunk_size)
     eval_prune_step_fns = {}
     if eval_effective_prune_enabled:
         for _eps in eval_effective_prune_eps_list:
@@ -14533,7 +14634,8 @@ def main():
                 soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
                 soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
                 soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-                admission_den_power=admission_den_power)
+                admission_den_power=admission_den_power,
+                ce_token_chunk_size=ce_token_chunk_size)
     # v4164 analysis_step is active when the full analysis kernels exist.
     if operation_space_tau_free_enabled:
         analysis_step_fn = None
@@ -14559,7 +14661,8 @@ def main():
             soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
             soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
             soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-            admission_den_power=admission_den_power)
+            admission_den_power=admission_den_power,
+            ce_token_chunk_size=ce_token_chunk_size)
     else:
         analysis_step_fn = None
     # No current-train-batch diagnostic forward.
@@ -15617,6 +15720,9 @@ def main():
                 _win_correct_py = int(_win_vals['correct'])
                 _win_valid_py = int(_win_vals['valid'])
                 _vdiv = _win_valid_py if _win_valid_py > 0 else 1
+                _win_acc = (
+                    _win_correct_py / _vdiv
+                    if train_compute_accuracy else None)
                 win_avgs = {
                     'loss':    float(_win_vals['loss'])    / _vdiv,
                     'ce':      float(_win_vals['ce'])      / _vdiv,
@@ -15624,7 +15730,7 @@ def main():
                     'tau_reg': float(_win_vals['tau_reg']) / _vdiv,
                     'orth':    float(_win_vals['orth'])    / _vdiv,
                     'div':     float(_win_vals['div'])     / _vdiv,
-                    'acc':     _win_correct_py             / _vdiv,
+                    'acc':     _win_acc,
                 }
                 # Full NaN/INF check on the materialized window averages.
                 if check_nan_inf({
@@ -15677,6 +15783,7 @@ def main():
                         'model_version': model_version,
                         'operation_space_enabled':
                             operation_space_tau_free_enabled,
+                        'train_compute_accuracy': train_compute_accuracy,
                         'regular_console_level': regular_console_level,
                         'regular_console_host_timing':
                             regular_console_host_timing,
@@ -15990,13 +16097,16 @@ def main():
         epoch_correct = float(_ep['correct'])
         epoch_valid = float(_ep['valid'])
         epoch_avg_loss = epoch_loss / epoch_valid if epoch_valid > 0 else 0.0
-        epoch_avg_acc = epoch_correct / epoch_valid if epoch_valid > 0 else 0.0
+        epoch_avg_acc = (
+            epoch_correct / epoch_valid
+            if train_compute_accuracy and epoch_valid > 0 else None)
+        epoch_acc_text = _fmt_train_accuracy(epoch_avg_acc)
 
         if is_host0:
             log_message(
                 f"\n{'='*60}\n"
                 f"Epoch {epoch} complete in {format_time(epoch_elapsed)}\n"
-                f"  Train loss={epoch_avg_loss:.4f}, Train acc={epoch_avg_acc:.4f}\n"
+                f"  Train loss={epoch_avg_loss:.4f}, Train acc={epoch_acc_text}\n"
                 f"{'='*60}"
             )
 
@@ -16055,6 +16165,7 @@ def main():
                 **prune_eval_log,
                 'train_loss': epoch_avg_loss,
                 'train_acc': epoch_avg_acc,
+                'train_compute_accuracy': train_compute_accuracy,
                 'epoch_time': epoch_elapsed,
                 'timestamp': datetime.now().isoformat(),
             })
