@@ -4337,7 +4337,8 @@ def _opspace_build_selected_block_buckets(
                 .sum()
             )
 
-            return token_id_bucket, bucket_valid_count, overflow_count
+            return (
+                token_id_bucket, bucket_valid_count, overflow_count), None
 
         return jax.lax.scan(
             block_step,
