@@ -69,16 +69,16 @@ training:
 
       rst:
         execution_backend: sparse_region_block
-        num_regions: 32
-        blocks_per_region: 2
+        num_regions: 4
+        visible_regions: 1
+        blocks_per_region: 16
         operators_per_block: 512
-        visible_regions: 4
-        visible_blocks_per_region: 1
+        visible_blocks_per_region: 4
+        region_score_pooling: smoothmax
+        region_score_temperature: 0.25
         region_capacity_factor: 1.25
         block_capacity_factor: 1.25
         high_regret_threshold: 0.05
-        region_score_pooling: smoothmax
-        region_score_temperature: 0.25
   checkpoint_interval: 200
   val_interval: 1000
   log_interval: 100

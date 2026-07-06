@@ -1611,9 +1611,14 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 "training.operation_space.pools."
                 f"{label}.high_regret_threshold must be >= 0, got "
                 f"{high_regret_threshold}.")
-        physical_visible_ops_per_token = (
+        visible_ops_per_token = (
             visible_regions * visible_blocks_per_region
             * operators_per_block)
+        if execution_backend == 'sparse_region_block':
+            physical_visible_ops_per_token = (
+                visible_regions * blocks_per_region * operators_per_block)
+        else:
+            physical_visible_ops_per_token = visible_ops_per_token
         layouts[label] = {
             'execution_backend': execution_backend,
             'num_regions': num_regions,
@@ -1624,7 +1629,7 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 blocks_per_region * operators_per_block),
             'visible_regions': visible_regions,
             'visible_blocks_per_region': visible_blocks_per_region,
-            'visible_ops_per_token': physical_visible_ops_per_token,
+            'visible_ops_per_token': visible_ops_per_token,
             'physical_visible_ops_per_token': (
                 physical_visible_ops_per_token),
             'region_score_pooling': region_score_pooling,
@@ -10247,43 +10252,32 @@ def _print_v4168_opspace_regular_block(rec):
         rec, rst_prefix, 'logical_compute_frac_vs_dense', logical_ops)
     physical_compute = _opspace_compute_frac(
         rec, rst_prefix, 'physical_compute_frac_vs_dense', physical_ops)
-    bucket_fill = _metric_float(
-        _opspace_metric(rec, rst_prefix, 'bucket_fill_mean'))
-    bucket_cap = _metric_float(
-        _opspace_metric(rec, rst_prefix, 'bucket_capacity'))
     region_cap = _opspace_metric(
         rec, rst_prefix, 'region_capacity',
         default=_opspace_metric(rec, rst_prefix, 'bucket_capacity'))
-    capacity_regions = _metric_float(
-        _opspace_metric(rec, rst_prefix, 'regions_per_owner'))
-    bucket_total = None
-    if (bucket_fill is not None and bucket_cap is not None
-            and capacity_regions is not None and capacity_regions > 0.0):
-        bucket_total = bucket_cap * capacity_regions
-    if bucket_total is not None and bucket_total > 0.0:
-        bucket_part = (
-            f"bucket={fmt_intlike(bucket_fill)}/{fmt_intlike(bucket_total)}"
-            f" fill={fmt_pct(bucket_fill / bucket_total, 1)}")
-    else:
-        bucket_part = (
-            f"bucket_fill={fmt_intlike(bucket_fill)}"
-            f" fill=n/a")
+    region_load_mean = _opspace_metric(rec, rst_prefix, 'region_load_mean')
+    region_load_max = _opspace_metric(rec, rst_prefix, 'region_load_max')
     log_message(
         "  [opspace/rst]"
         f" backend={_opspace_backend_name(rec, rst_prefix)}"
+        " mode=region_dense_block_masked"
+        f" regions={fmt_intlike(_opspace_metric(rec, rst_prefix, 'region_count'))}"
         f" visible_regions={fmt_intlike(_opspace_metric(rec, rst_prefix, 'visible_regions'))}"
-        f" visible_ops={fmt_intlike(logical_ops)}"
-        f" physical_visible_ops={fmt_intlike(physical_ops)}"
+        f" blocks={fmt_intlike(_opspace_metric(rec, rst_prefix, 'blocks_per_region'))}"
+        f" visible_blocks={fmt_intlike(_opspace_metric(rec, rst_prefix, 'visible_blocks_per_region'))}"
+        f" ops/block={fmt_intlike(_opspace_metric(rec, rst_prefix, 'operators_per_block'))}"
+        f" semantic_ops={fmt_intlike(logical_ops)}"
+        f" physical_ops={fmt_intlike(physical_ops)}"
         f" compute={fmt_pct(logical_compute, 2)}/{fmt_pct(physical_compute, 2)}"
-        f" {bucket_part}"
-        f" cap={fmt_intlike(region_cap)}"
+        f" region_capacity={fmt_intlike(region_cap)}"
+        f" region_fill={fmt_intlike(region_load_mean)}/{fmt_intlike(region_load_max)}"
         f" accept={fmt_float(_opspace_metric(rec, rst_prefix, 'primary_accept_frac'), 3)}"
         f" reroute={fmt_float(_opspace_metric(rec, rst_prefix, 'reroute_frac'), 3)}"
         f" drop={fmt_float(_opspace_metric(rec, rst_prefix, 'semantic_drop_frac'), 6)}"
         f" processed={fmt_intlike(_opspace_metric(rec, rst_prefix, 'processed_requests'))}/"
         f"{fmt_intlike(_opspace_metric(rec, rst_prefix, 'selected_requests'))}"
         f" all={fmt_intlike(_opspace_metric(rec, rst_prefix, 'all_processed'))}"
-        f" nan={fmt_intlike(_opspace_metric(rec, rst_prefix, 'no_nan'))}"
+        f" no_nan={fmt_intlike(_opspace_metric(rec, rst_prefix, 'no_nan'))}"
         f" gate_mass={fmt_float(_opspace_metric(rec, rst_prefix, 'gate_mass_mean'), 2)}"
         f" relu_active={fmt_float(_opspace_metric(rec, rst_prefix, 'relu_gate_count_mean'), 1)}"
     )
@@ -13324,9 +13318,13 @@ def main():
                 _backend = str(_layout.get(
                     'execution_backend', 'unknown')).lower()
                 _visible_ops = (
-                    int(_layout.get('visible_regions', 0))
-                    * int(_layout.get('visible_blocks_per_region', 0))
-                    * int(_layout.get('operators_per_block', 0)))
+                    int(_layout.get(
+                        'visible_ops_per_token',
+                        int(_layout.get('visible_regions', 0))
+                        * int(_layout.get('visible_blocks_per_region', 0))
+                        * int(_layout.get('operators_per_block', 0)))))
+                _physical_ops = int(_layout.get(
+                    'physical_visible_ops_per_token', _visible_ops))
                 _line = (
                     f"[opspace/{_label}] "
                     f"backend={_backend} "
@@ -13341,7 +13339,12 @@ def main():
                     f"{int(_layout.get('visible_blocks_per_region', 0))} "
                     f"visible_ops={_visible_ops}")
                 if _label == 'rst':
+                    _dense_ops = max(
+                        int(_layout.get('global_operator_capacity', 1)), 1)
                     _line += (
+                        f" physical_ops={_physical_ops} "
+                        f"compute={(_visible_ops / _dense_ops) * 100.0:.2f}%/"
+                        f"{(_physical_ops / _dense_ops) * 100.0:.2f}% "
                         f" region_capacity_factor="
                         f"{float(_layout.get('region_capacity_factor', 1.25))} "
                         f"block_capacity_factor="
@@ -14323,11 +14326,16 @@ def main():
 
                     def _opspace_pool_line(_name, _layout, _backend):
                         _visible_ops = (
-                            int(_layout.get('visible_regions', 0))
-                            * int(_layout.get(
-                                'visible_blocks_per_region', 0))
-                            * int(_layout.get('operators_per_block', 0)))
-                        return (
+                            int(_layout.get(
+                                'visible_ops_per_token',
+                                int(_layout.get('visible_regions', 0))
+                                * int(_layout.get(
+                                    'visible_blocks_per_region', 0))
+                                * int(_layout.get(
+                                    'operators_per_block', 0)))))
+                        _physical_ops = int(_layout.get(
+                            'physical_visible_ops_per_token', _visible_ops))
+                        _line = (
                             f"[opspace/{_name}] backend={_backend} "
                             f"regions={int(_layout.get('num_regions', 0))} "
                             f"blocks/region="
@@ -14339,8 +14347,17 @@ def main():
                             f"visible_blocks="
                             f"{int(_layout.get('visible_blocks_per_region', 0))} "
                             f"visible_ops={_visible_ops}")
+                        if _backend == 'sparse_region_block':
+                            _line += f" physical_ops={_physical_ops}"
+                        return _line
 
-                    _rst_compute = (
+                    _rst_logical_compute = (
+                        float(_rst_layout.get(
+                            'visible_ops_per_token', 0.0))
+                        / float(max(
+                            int(_rst_layout.get(
+                                'global_operator_capacity', 1)), 1)))
+                    _rst_physical_compute = (
                         float(_rst_layout.get(
                             'physical_visible_ops_per_token', 0.0))
                         / float(max(
@@ -14356,7 +14373,8 @@ def main():
                         f"{_opspace_pool_line('qk', _qk_layout, _qk_backend)}\n"
                         f"{_opspace_pool_line('v', _v_layout, _v_backend)}\n"
                         f"{_opspace_pool_line('rst', _rst_layout, _rst_backend)} "
-                        f"compute={_rst_compute * 100.0:.2f}%\n"
+                        f"compute={_rst_logical_compute * 100.0:.2f}%/"
+                        f"{_rst_physical_compute * 100.0:.2f}%\n"
                         f"  operation_space_repack_enabled={operation_space_repack_enabled}\n"
                         "  direct_tau_active_for_qk_v_rst=false\n"
                         "  selection_calibration_active_for_qk_v_rst=false\n"
