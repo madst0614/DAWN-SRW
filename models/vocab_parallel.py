@@ -212,7 +212,8 @@ def make_vocab_parallel_ce(
                 valid_vocab[None, :], local_logits, neg_inf)
 
             local_max = jnp.max(local_logits, axis=-1)
-            global_max = jax.lax.pmax(local_max, "model")
+            global_max = jax.lax.stop_gradient(
+                jax.lax.pmax(jax.lax.stop_gradient(local_max), "model"))
             local_exp_sum = jnp.sum(
                 jnp.exp(local_logits - global_max[:, None]), axis=-1)
             global_exp_sum = jax.lax.psum(local_exp_sum, "model")
@@ -238,8 +239,9 @@ def make_vocab_parallel_ce(
                 local_best_score = jnp.max(local_logits, axis=-1)
                 local_best_idx = jnp.argmax(local_logits, axis=-1)
                 local_best_global_id = vocab_start + local_best_idx
-                global_best_score = jax.lax.pmax(
-                    local_best_score, "model")
+                global_best_score = jax.lax.stop_gradient(
+                    jax.lax.pmax(
+                        jax.lax.stop_gradient(local_best_score), "model"))
                 is_winner = local_best_score == global_best_score
                 candidate_id = jnp.where(
                     is_winner,
@@ -316,8 +318,10 @@ def make_vocab_parallel_ce(
             "model").astype(jnp.int32)
 
         local_abs_max = jnp.max(abs_max_chunks)
-        logit_abs_max = jax.lax.pmax(
-            jax.lax.pmax(local_abs_max, "data"), "model")
+        logit_abs_max = jax.lax.stop_gradient(
+            jax.lax.pmax(
+                jax.lax.pmax(jax.lax.stop_gradient(local_abs_max), "data"),
+                "model"))
         logit_sum = jax.lax.psum(
             jax.lax.psum(jnp.sum(logit_sum_chunks), "data"), "model")
         logit_sumsq = jax.lax.psum(
