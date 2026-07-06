@@ -1321,31 +1321,57 @@ def _v4168_operation_space_cfg(training_cfg):
     return opspace
 
 
-def _v4168_strip_legacy_resume_opspace_fields(full_config):
-    """Normalize legacy checkpoint full_config for removed opspace fields."""
+def _migrate_v4168_operation_space_full_config_for_clean_schema(full_config):
+    """Resume-only cleanup for removed v4168 operation-space config fields."""
     if not isinstance(full_config, dict):
-        return full_config, ()
+        return full_config
     normalized = deepcopy(full_config)
+    model_cfg = normalized.get('model', {})
+    if not isinstance(model_cfg, dict):
+        return normalized
+    if str(model_cfg.get('model_version', '')) != V4168_MODEL_VERSION:
+        return normalized
     training_cfg = normalized.get('training', {})
     if not isinstance(training_cfg, dict):
-        return normalized, ()
+        return normalized
     opspace = training_cfg.get('operation_space', {})
     if not isinstance(opspace, dict):
-        return normalized, ()
+        return normalized
     pools = opspace.get('pools', {})
     if not isinstance(pools, dict):
-        return normalized, ()
-    rst_pool = pools.get('rst', {})
-    if not isinstance(rst_pool, dict):
-        return normalized, ()
+        return normalized
 
-    removed = []
-    for field in ('bucket_chunk_size', 'assignment_policy'):
-        if field in rst_pool:
-            rst_pool.pop(field, None)
-            removed.append(
-                f'training.operation_space.pools.rst.{field}')
-    return normalized, tuple(removed)
+    removed_pool_keys = (
+        'routing_mode',
+        'execution_mode',
+        'execution_backend_mode',
+        'lanes',
+        'local_lanes',
+        'tiles_per_lane',
+        'tile_size',
+        'k_exec',
+        'exec_tiles_per_block',
+        'blocks_per_lane',
+        'block_size',
+        'local_padded_ops',
+        'local_operator_slots',
+        'exec_slots',
+        'region_block_pallas',
+        'block_bucketed_dense',
+        'block_bucketed_pallas_final',
+        'output_tiled',
+        'bucket_chunk_size',
+        'assignment_policy',
+    )
+    for label in ('qk', 'v', 'rst'):
+        pool = pools.get(label, {})
+        if not isinstance(pool, dict):
+            continue
+        for key in removed_pool_keys:
+            pool.pop(key, None)
+
+    opspace.pop('tile_size', None)
+    return normalized
 
 
 def _v4168_validate_operation_space_shape(opspace):
@@ -1391,6 +1417,11 @@ def _v4168_validate_operation_space_shape(opspace):
         'local_operator_slots',
         'exec_slots',
         'region_block_pallas',
+        'block_bucketed_dense',
+        'block_bucketed_pallas_final',
+        'output_tiled',
+        'bucket_chunk_size',
+        'assignment_policy',
         'factorized_lane_mean',
         'lane_output_' + 'mode',
         'visible_regions_' + 'start',
@@ -1423,14 +1454,6 @@ def _v4168_validate_operation_space_shape(opspace):
         if not isinstance(pool, dict):
             raise ValueError(
                 f"training.operation_space.pools.{label} must be a mapping.")
-        if 'routing_mode' in pool:
-            raise ValueError(
-                f"operation_space.pools.{label}.routing_mode has been "
-                "removed.\n"
-                "Region/Block routing is now the only operation-space "
-                "routing.\n"
-                "Remove routing_mode and use execution_backend only for "
-                "physical execution.")
         present_removed = sorted(set(pool) & removed_pool_keys)
         if present_removed:
             raise ValueError(
@@ -1439,21 +1462,6 @@ def _v4168_validate_operation_space_shape(opspace):
                 + (f", training.operation_space.pools.{label}."
                    ).join(present_removed)
                 + " was removed from the clean Region-Block atlas config.")
-        if label == 'rst':
-            if 'bucket_chunk_size' in pool:
-                raise ValueError(
-                    "training.operation_space.pools.rst.bucket_chunk_size "
-                    "was removed.\n"
-                    "The selected-block sparse backend does not use "
-                    "bucket_chunk_size in the hot path.\n"
-                    "Remove this field from the config.")
-            if 'assignment_policy' in pool:
-                raise ValueError(
-                    "training.operation_space.pools.rst.assignment_policy "
-                    "was removed.\n"
-                    "RST operation-space assignment policy is fixed "
-                    "internally.\n"
-                    "Remove this field from the config.")
         allowed_pool_keys = (
             allowed_rst_keys if label == 'rst' else common_pool_keys)
         extra = sorted(set(pool) - allowed_pool_keys)
@@ -11983,8 +11991,8 @@ def main():
         checkpoint_full_config = checkpoint_metadata.get('full_config')
         checkpoint_raw_config = checkpoint_metadata.get('raw_config')
         _require_resume_full_config(checkpoint_full_config)
-        saved_full_config, legacy_opspace_fields_removed = (
-            _v4168_strip_legacy_resume_opspace_fields(
+        saved_full_config = (
+            _migrate_v4168_operation_space_full_config_for_clean_schema(
                 checkpoint_full_config))
         saved_raw_config = (
             deepcopy(checkpoint_raw_config)
@@ -12043,10 +12051,6 @@ def main():
         if jax.process_index() == 0:
             print("Resume config source: checkpoint full_config")
             print("Resume config fallback: disabled")
-            if legacy_opspace_fields_removed:
-                print(
-                    "  Normalized legacy checkpoint operation_space fields: "
-                    + ", ".join(legacy_opspace_fields_removed))
             print("  Preserving existing run-folder config snapshots.")
 
         checkpoint_full_training_config = (
@@ -14065,13 +14069,10 @@ def main():
             if not isinstance(layout, dict):
                 layout = {}
             return {
-                'operation_space_mode': 'region_block',
                 'operation_space_execution_backend': str(layout.get(
                     'execution_backend',
                     'sparse_region_block' if pool == 'rst'
                     else 'dense')).lower(),
-                'opspace_padded_ops': int(layout.get(
-                    'operator_capacity', 0)),
                 'opspace_bucket_capacity_factor': float(layout.get(
                     'bucket_capacity_factor',
                     layout.get('block_capacity_factor', 1.25))),
