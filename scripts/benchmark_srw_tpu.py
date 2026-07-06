@@ -37,6 +37,12 @@ MODEL_MODULES = {
     V4166_MODEL_VERSION: ("models.dawn_srw_v4166", "DAWN_SRW_V4166"),
     V4168_MODEL_VERSION: ("models.dawn_srw_v4168", "DAWN_SRW_V4168"),
 }
+RUNTIME_POOLS = ("attn_qk", "attn_v", "rst")
+RUNTIME_POOL_LABELS = {
+    "attn_qk": "qk",
+    "attn_v": "v",
+    "rst": "rst",
+}
 SECTOR_RUNTIME_METRIC_NAMES = (
     "bucket_fill_mean",
     "bucket_fill_p50",
@@ -187,8 +193,8 @@ def main():
                               "after the train benchmark. Set 0 to disable."))
     parser.add_argument("--fast", "--fast-only", dest="fast_only",
                         action="store_true",
-                        help=("Skip full train-step benchmark and run only "
-                              "forward/module profiling for quick comparison."))
+                        help=("Run a quick real-data forward bottleneck "
+                              "diagnosis; skip train-step benchmark."))
     parser.add_argument("--model-version", default=None,
                         help="Optional expected model version.")
     parser.add_argument("--allow-model-version-override", action="store_true",
@@ -230,14 +236,16 @@ def main():
         raise SystemExit("--forward-profile-steps must be >= 0")
     if args.module_profile_steps < 0:
         raise SystemExit("--module-profile-steps must be >= 0")
-    if (args.fast_only and args.forward_profile_steps <= 0
-            and args.module_profile_steps <= 0):
-        raise SystemExit(
-            "--fast requires --forward-profile-steps or "
-            "--module-profile-steps to be > 0")
     if args.model_version and args.model_version not in SUPPORTED_MODEL_VERSIONS:
         raise SystemExit(
             f"--model-version must be one of {SUPPORTED_MODEL_VERSIONS}")
+    fast_detailed_profile = bool(args.fast_only)
+    if fast_detailed_profile:
+        args.forward_profile_steps = 1
+        args.module_profile_steps = 0
+        args.steps = 0
+        args.warmup_steps = 0
+    args.fast_detailed_profile = fast_detailed_profile
     configs = [item for group in args.config for item in group]
     run_specs = expand_run_specs(configs, args)
     xla_dump_dir = _normalize_xla_dump_dir(args.xla_dump_dir, len(run_specs))
@@ -550,6 +558,15 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
         args.metrics_jsonl, run_index, config_path)
     if metrics_jsonl:
         _log(f"  metrics_jsonl: {metrics_jsonl}")
+    data_source = "dummy" if args.dummy_data else "real_config_data"
+    if args.fast_only:
+        _log("fast_only=true")
+        _log("fast_mode=quick_detailed_forward_diagnosis")
+        _log(f"data_source={data_source}")
+        _log("train_step=skipped")
+        _log("forward_profile_steps=1")
+        _log("detailed_profile_steps=1")
+        _log("module_profile_steps=0")
 
     model = build_model(cfg)
     sharded_fns = build_sharded_fns(cfg, mesh)
@@ -560,7 +577,8 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
         (int(args.forward_profile_steps) + 1
          if int(args.forward_profile_steps) > 0 else 0)
         + (int(args.module_profile_steps) + 1
-           if int(args.module_profile_steps) > 0 else 0))
+           if int(args.module_profile_steps) > 0 else 0)
+        + (2 if bool(getattr(args, "fast_detailed_profile", False)) else 0))
     train_loader = build_loader(
         cfg, batch_size, seq_len, n_hosts, host_id,
         total_steps=train_step_budget + profile_step_budget,
@@ -705,10 +723,14 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
         "sector_bucket_overflow"
         if measure_sector_records and not benchmark_valid else None)
     summary = {
+        "run_index": int(run_index),
         "config_path": config_arg,
         "variant": variant_label,
         "overrides": dict(overrides or {}),
         "model_version": model_version,
+        "data_source": data_source,
+        "fast_detailed_profile": bool(
+            getattr(args, "fast_detailed_profile", False)),
         "train_benchmark_enabled": not bool(args.fast_only),
         "compile_seconds": compile_seconds,
         "warmup_steps": 0 if args.fast_only else int(args.warmup_steps),
@@ -1019,9 +1041,18 @@ def v4168_operation_space_backend_layouts(cfg):
                 f"{label}.high_regret_threshold must be >= 0, got "
                 f"{high_regret_threshold}.")
 
-        physical_visible_ops_per_token = (
+        semantic_visible_ops_per_token = (
             visible_regions * visible_blocks_per_region
             * operators_per_block)
+        if execution_backend == "sparse_region_block":
+            physical_visible_ops_per_token = (
+                visible_regions * blocks_per_region * operators_per_block)
+        else:
+            physical_visible_ops_per_token = total_capacity // mesh_model
+        semantic_compute_frac_vs_dense = (
+            float(semantic_visible_ops_per_token) / float(total_capacity))
+        physical_compute_frac_vs_dense = (
+            float(physical_visible_ops_per_token) / float(total_capacity))
         raw_tiles = (n_ops + operators_per_block - 1) // operators_per_block
         total_tiles = num_regions * blocks_per_region
         layouts[label] = {
@@ -1037,9 +1068,11 @@ def v4168_operation_space_backend_layouts(cfg):
             "operators_per_region": blocks_per_region * operators_per_block,
             "visible_regions": visible_regions,
             "visible_blocks_per_region": visible_blocks_per_region,
-            "visible_ops_per_token": physical_visible_ops_per_token,
-            "physical_visible_ops_per_token": (
-                physical_visible_ops_per_token),
+            "visible_ops_per_token": semantic_visible_ops_per_token,
+            "semantic_visible_ops_per_token": semantic_visible_ops_per_token,
+            "physical_visible_ops_per_token": physical_visible_ops_per_token,
+            "semantic_compute_frac_vs_dense": semantic_compute_frac_vs_dense,
+            "physical_compute_frac_vs_dense": physical_compute_frac_vs_dense,
             "region_score_pooling": region_score_pooling,
             "region_score_temperature": region_score_temperature,
             "region_capacity_factor": region_capacity_factor,
@@ -1570,7 +1603,7 @@ def benchmark_apply_kwargs(cfg, version, sharded_fns, attention_mask, rng, step)
 
 
 def copy_runtime_metrics(result, metrics):
-    for pool in ("attn_v", "rst"):
+    for pool in RUNTIME_POOLS:
         for name in SECTOR_RUNTIME_METRIC_NAMES:
             key = f"sector/{pool}/{name}"
             if key in result:
@@ -2118,6 +2151,401 @@ def run_module_profile_pass(profile_fns, params, input_ids, rng, step,
     return records
 
 
+def create_detailed_profile_fns(cfg, sharded_fns):
+    version = str(cfg["model"].get("model_version", ""))
+    module = importlib.import_module(MODEL_MODULES[version][0])
+    t = cfg["training"]
+    m = cfg["model"]
+    n_layers = int(m["n_layers"])
+    n_heads = int(m["n_heads"])
+    d_model = int(m["d_model"])
+    dropout_rate = float(m.get("dropout", m.get("dropout_rate", 0.0)))
+    router_dropout = float(m.get("router_dropout", 0.0))
+    del dropout_rate, router_dropout
+    soft_gate_t = float(t.get("soft_gate_temperature", 0.07))
+    boundary_power = float(t.get(
+        "soft_gate_boundary_power_final",
+        t.get("soft_gate_boundary_power_mid",
+              t.get("soft_gate_boundary_power_start", 4.0))))
+    tokens_per_step = (
+        int(t["batch_size"])
+        * int(m.get("max_seq_len", 512)))
+    opspace_tau_free = (
+        version == V4168_MODEL_VERSION
+        and isinstance(sharded_fns, dict)
+        and bool(sharded_fns.get("operation_space_tau_free", False)))
+
+    if isinstance(sharded_fns, dict):
+        fused_paired_qk = sharded_fns.get(
+            "attn_qk_paired_minimal",
+            sharded_fns.get(
+                "attn_qk_paired", sharded_fns.get("paired", None)))
+        fused_single_v = sharded_fns.get(
+            "attn_v_single_minimal",
+            sharded_fns.get("attn_v_single", sharded_fns.get("single", None)))
+        fused_single_rst = sharded_fns.get(
+            "rst_single_minimal",
+            sharded_fns.get("rst_single", sharded_fns.get("single", None)))
+    else:
+        fused_single_v, fused_paired_qk = sharded_fns
+        fused_single_rst, _unused_paired = sharded_fns
+    if fused_paired_qk is None:
+        raise RuntimeError("Detailed profile requires a QK paired SRW executor.")
+    if fused_single_v is None:
+        raise RuntimeError("Detailed profile requires a V SRW executor.")
+    if fused_single_rst is None:
+        raise RuntimeError("Detailed profile requires an RST SRW executor.")
+
+    call_minimal_srw_fn = getattr(module, "_call_minimal_srw", None)
+    split_minimal_srw_return_fn = getattr(
+        module, "_split_minimal_srw_return", None)
+
+    def training_tokens(step):
+        return (
+            jnp.asarray(step, dtype=jnp.float32)
+            * jnp.asarray(float(tokens_per_step), dtype=jnp.float32))
+
+    def call_minimal_srw(fused, x, h, op_key, raw_tau, read, write,
+                         step):
+        if call_minimal_srw_fn is not None:
+            return call_minimal_srw_fn(
+                fused, x, h, op_key, raw_tau, read, write,
+                soft_gate_t, soft_gate_t, boundary_power, boundary_power,
+                0.0, training_tokens(step))
+        return fused(
+            x, h, op_key, raw_tau, read, write,
+            soft_gate_t, soft_gate_t, boundary_power, boundary_power, 0.0)
+
+    def split_minimal_srw_return(ret):
+        if split_minimal_srw_return_fn is not None:
+            return split_minimal_srw_return_fn(ret)
+        out = ret[0] if isinstance(ret, tuple) else ret
+        zero = jnp.float32(0.0)
+        return out, zero, zero, zero
+
+    def first_scalar(value):
+        arr = jnp.asarray(value)
+        if arr.size == 0:
+            return jnp.float32(0.0)
+        return jnp.ravel(arr.astype(jnp.float32))[0]
+
+    def guard_from_values(*values):
+        total = jnp.float32(0.0)
+        leaves = []
+        for value in values:
+            leaves.extend(jax.tree.leaves(value))
+        for leaf in leaves[:8]:
+            total = total + first_scalar(leaf)
+        return total
+
+    @jax.jit
+    def embed_step(token_embedding, pos_embedding, input_ids):
+        positions = jnp.arange(input_ids.shape[1])[jnp.newaxis, :]
+        return token_embedding[input_ids] + pos_embedding[positions]
+
+    @jax.jit
+    def attn_norm_step(block_params, x):
+        return module._layer_norm(
+            x, block_params["norm1"]["scale"], block_params["norm1"]["bias"])
+
+    @jax.jit
+    def attn_route_step(router_params, normed):
+        B, S = normed.shape[:2]
+        attn_read_query = (
+            normed @ router_params["proj_attn"]["kernel"]
+            + router_params["proj_attn"]["bias"])
+        q_read_query, k_read_query, v_read_query = jnp.split(
+            attn_read_query, 3, axis=-1)
+        h_q = module._read_write_operator_query(
+            q_read_query, normed, router_params["q_op_write_query_proj"])
+        h_k = module._read_write_operator_query(
+            k_read_query, normed, router_params["k_op_write_query_proj"])
+        h_v = module._read_write_operator_query(
+            v_read_query, normed, router_params["v_op_write_query_proj"])
+        if opspace_tau_free:
+            raw_tau_qk = jnp.zeros((B, S, 2, 1), dtype=normed.dtype)
+            raw_tau_v = jnp.zeros((B, S, 1), dtype=normed.dtype)
+        else:
+            raw_tau_all = (
+                normed @ router_params["raw_tau_attn"]["kernel"]
+                + router_params["raw_tau_attn"]["bias"])
+            raw_tau_qk = jnp.stack(
+                [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
+            raw_tau_v = raw_tau_all[:, :, 2:3]
+        return h_q, h_k, h_v, raw_tau_qk, raw_tau_v, guard_from_values(
+            h_q, h_k, h_v, raw_tau_qk, raw_tau_v)
+
+    @jax.jit
+    def qk_srw_step(pool_params, normed, h_q, h_k, raw_tau_qk, step):
+        h_qk = jnp.stack([h_q, h_k], axis=2)
+        qk_ret = call_minimal_srw(
+            fused_paired_qk,
+            normed,
+            h_qk,
+            pool_params["attn_qk_op_key"],
+            raw_tau_qk,
+            pool_params["attn_qk_read"],
+            pool_params["attn_qk_write"],
+            step)
+        qk_out = qk_ret[0] if isinstance(qk_ret, tuple) else qk_ret
+        qk_scale, _v_scale, _rst_scale = module._effective_pool_output_scales(
+            pool_params, d_model, n_layers)
+        q = qk_out[:, :, 0, :] * qk_scale
+        k = qk_out[:, :, 1, :] * qk_scale
+        return q, k, guard_from_values(qk_ret)
+
+    @jax.jit
+    def v_srw_step(pool_params, normed, h_v, raw_tau_v, step):
+        v_ret = call_minimal_srw(
+            fused_single_v,
+            normed,
+            h_v,
+            pool_params["attn_v_op_key"],
+            raw_tau_v,
+            pool_params["attn_v_read"],
+            pool_params["attn_v_write"],
+            step)
+        v_out, v_sector_diag, v_opspace_diag, v_aux = (
+            split_minimal_srw_return(v_ret))
+        _qk_scale, v_scale, _rst_scale = module._effective_pool_output_scales(
+            pool_params, d_model, n_layers)
+        v_out = v_out * v_scale
+        return v_out, guard_from_values(
+            v_sector_diag, v_opspace_diag, v_aux)
+
+    @jax.jit
+    def attn_core_step(q, k, v):
+        B, S, D = q.shape
+        d_head = D // n_heads
+        q = q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        k = k.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        v = v.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        scores = (
+            jnp.einsum("bhsd,bhtd->bhst", q, k)
+            / jnp.sqrt(jnp.float32(d_head)))
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        scores = jnp.where(
+            causal[None, None, :, :],
+            scores,
+            jnp.finfo(scores.dtype).min)
+        weights = jax.nn.softmax(scores, axis=-1)
+        context = jnp.einsum("bhst,bhtd->bhsd", weights, v)
+        return context.transpose(0, 2, 1, 3).reshape(B, S, D)
+
+    @jax.jit
+    def attn_out_proj_step(block_params, x, context):
+        attn_out = context @ block_params["attn"]["expand_O"]["kernel"]
+        return x + attn_out
+
+    @jax.jit
+    def rst_norm_step(block_params, x):
+        return module._layer_norm(
+            x, block_params["norm2"]["scale"], block_params["norm2"]["bias"])
+
+    @jax.jit
+    def rst_route_step(router_params, normed):
+        B, S = normed.shape[:2]
+        rst_read_query = (
+            normed @ router_params["proj_rst"]["kernel"]
+            + router_params["proj_rst"]["bias"])
+        h_rst = module._read_write_operator_query(
+            rst_read_query, normed, router_params["rst_op_write_query_proj"])
+        if opspace_tau_free:
+            raw_tau_rst = jnp.zeros((B, S, 1), dtype=normed.dtype)
+        else:
+            raw_tau_rst = (
+                normed @ router_params["raw_tau_rst"]["kernel"]
+                + router_params["raw_tau_rst"]["bias"])
+        return h_rst, raw_tau_rst, guard_from_values(h_rst, raw_tau_rst)
+
+    @jax.jit
+    def rst_srw_step(pool_params, normed, h_rst, raw_tau_rst, x, step):
+        rst_ret = call_minimal_srw(
+            fused_single_rst,
+            normed,
+            h_rst,
+            pool_params["rst_op_key"],
+            raw_tau_rst,
+            pool_params["rst_read"],
+            pool_params["rst_write"],
+            step)
+        rst_out, rst_sector_diag, rst_opspace_diag, rst_aux = (
+            split_minimal_srw_return(rst_ret))
+        _qk_scale, _v_scale, rst_scale = module._effective_pool_output_scales(
+            pool_params, d_model, n_layers)
+        rst_out = rst_out * rst_scale
+        return x + rst_out, guard_from_values(
+            rst_sector_diag, rst_opspace_diag, rst_aux)
+
+    @jax.jit
+    def final_loss_step(norm_scale, norm_bias, embedding_matrix, x, labels):
+        x = module._layer_norm(x, norm_scale, norm_bias)
+        shift_x = x[:, :-1, :]
+        shift_labels = labels[:, 1:].astype(jnp.int32)
+        valid_mask = shift_labels != -100
+        loss, correct, valid_count = module._chunked_ce_loss_and_acc(
+            shift_x, embedding_matrix, shift_labels, valid_mask)
+        return {
+            "loss": loss,
+            "correct": correct,
+            "valid_count": valid_count,
+        }
+
+    return {
+        "module": module,
+        "model_version": version,
+        "embed_step": embed_step,
+        "attn_norm_step": attn_norm_step,
+        "attn_route_step": attn_route_step,
+        "qk_srw_step": qk_srw_step,
+        "v_srw_step": v_srw_step,
+        "attn_core_step": attn_core_step,
+        "attn_out_proj_step": attn_out_proj_step,
+        "rst_norm_step": rst_norm_step,
+        "rst_route_step": rst_route_step,
+        "rst_srw_step": rst_srw_step,
+        "final_loss_step": final_loss_step,
+        "n_layers": n_layers,
+    }
+
+
+def run_detailed_profile_pass(profile_fns, params, input_ids, step,
+                              run_index, variant_label, batch_size,
+                              seq_len, phase, record=True):
+    module = profile_fns["module"]
+    records = []
+    total_seconds = 0.0
+
+    def add_record(op, group, seconds, hbm_after, hbm_before,
+                   layer=None, note=None):
+        nonlocal total_seconds
+        total_seconds += float(seconds)
+        if not record:
+            return
+        records.append(benchmark_profile_record(
+            run_index, variant_label, phase, step, op, group,
+            seconds, batch_size, seq_len, hbm_after,
+            hbm_before=hbm_before, layer=layer, note=note))
+
+    hbm_before = collect_hbm_stats()
+    t0 = time.perf_counter()
+    pool_params = module._pool_params_with_operator_keys(params["neuron_pool"])
+    block_value(pool_params)
+    seconds = time.perf_counter() - t0
+    hbm_after = collect_hbm_stats()
+    add_record(
+        "op_key_setup", "setup", seconds, hbm_after, hbm_before,
+        note="shared op-key materialization")
+
+    hbm_before = hbm_after
+    (x, seconds) = profile_timed_call(
+        profile_fns["embed_step"],
+        params["token_emb"]["embedding"],
+        params["pos_emb"]["embedding"],
+        input_ids)
+    hbm_after = collect_hbm_stats()
+    add_record("embedding", "embedding", seconds, hbm_after, hbm_before)
+
+    router_params = params["router"]
+    step_array = jnp.asarray(step, dtype=jnp.int32)
+    for layer_idx in range(int(profile_fns["n_layers"])):
+        block_params = params[f"block_{layer_idx}"]
+
+        hbm_before = hbm_after
+        (normed, seconds) = profile_timed_call(
+            profile_fns["attn_norm_step"], block_params, x)
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.attn_norm", "attn_norm",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (route_result, seconds) = profile_timed_call(
+            profile_fns["attn_route_step"], router_params, normed)
+        h_q, h_k, h_v, raw_tau_qk, raw_tau_v, _guard = route_result
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.attn_route", "attn_route",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (qk_result, seconds) = profile_timed_call(
+            profile_fns["qk_srw_step"],
+            pool_params, normed, h_q, h_k, raw_tau_qk, step_array)
+        q, k, _guard = qk_result
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.qk_srw", "qk_srw",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (v_result, seconds) = profile_timed_call(
+            profile_fns["v_srw_step"],
+            pool_params, normed, h_v, raw_tau_v, step_array)
+        v, _guard = v_result
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.v_srw", "v_srw",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (context, seconds) = profile_timed_call(
+            profile_fns["attn_core_step"], q, k, v)
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.attn_core", "attn_core",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (x, seconds) = profile_timed_call(
+            profile_fns["attn_out_proj_step"], block_params, x, context)
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.attn_out_proj", "attn_out_proj",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (normed, seconds) = profile_timed_call(
+            profile_fns["rst_norm_step"], block_params, x)
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.rst_norm", "rst_norm",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (route_result, seconds) = profile_timed_call(
+            profile_fns["rst_route_step"], router_params, normed)
+        h_rst, raw_tau_rst, _guard = route_result
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.rst_route", "rst_route",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (rst_result, seconds) = profile_timed_call(
+            profile_fns["rst_srw_step"],
+            pool_params, normed, h_rst, raw_tau_rst, x, step_array)
+        x, _guard = rst_result
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.rst_srw", "rst_srw",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+    hbm_before = hbm_after
+    (_loss_metrics, seconds) = profile_timed_call(
+        profile_fns["final_loss_step"],
+        params["norm"]["scale"],
+        params["norm"]["bias"],
+        params["token_emb"]["embedding"],
+        x,
+        input_ids)
+    hbm_after = collect_hbm_stats()
+    add_record(
+        "final_norm_ce_loss", "loss", seconds, hbm_after, hbm_before,
+        note="final layer norm plus chunked CE")
+    return records, total_seconds
+
+
 def summarize_profile_records(records):
     measured = [
         r for r in records
@@ -2194,11 +2622,132 @@ def summarize_profile_records(records):
     return aggregates, layer_summary
 
 
+def summarize_detailed_profile_records(records):
+    measured = [
+        r for r in records
+        if r.get("phase") == "detailed_measure"]
+    groups = {}
+    layer_rows = {}
+    detailed_total_s = sum(float(r.get("seconds", 0.0)) for r in measured)
+    for record in measured:
+        group = record.get("group", "unknown")
+        row = groups.setdefault(group, {
+            "calls": 0,
+            "total_seconds": 0.0,
+            "max_hbm_peak_gb": None,
+            "max_hbm_used_delta_gb": None,
+        })
+        row["calls"] += 1
+        row["total_seconds"] += float(record.get("seconds", 0.0))
+        peak = num(record.get("hbm_peak_gb"))
+        delta = num(record.get("hbm_used_delta_gb"))
+        if peak is not None:
+            row["max_hbm_peak_gb"] = (
+                peak if row["max_hbm_peak_gb"] is None
+                else max(row["max_hbm_peak_gb"], peak))
+        if delta is not None:
+            row["max_hbm_used_delta_gb"] = (
+                delta if row["max_hbm_used_delta_gb"] is None
+                else max(row["max_hbm_used_delta_gb"], delta))
+        if record.get("layer") is not None:
+            layer = int(record["layer"])
+            layer_rows.setdefault(layer, {})[group] = record
+
+    aggregates = []
+    for group, row in groups.items():
+        calls = max(1, int(row["calls"]))
+        total_s = float(row["total_seconds"])
+        pct_split = (
+            total_s / detailed_total_s * 100.0
+            if detailed_total_s else None)
+        aggregates.append({
+            "group": group,
+            "calls": int(row["calls"]),
+            "total_seconds": total_s,
+            "mean_seconds": total_s / calls,
+            "pct_detailed_split": pct_split,
+            "max_hbm_peak_gb": row["max_hbm_peak_gb"],
+            "max_hbm_used_delta_gb": row["max_hbm_used_delta_gb"],
+        })
+    order = {
+        "setup": 1,
+        "embedding": 2,
+        "attn_norm": 3,
+        "attn_route": 4,
+        "qk_srw": 5,
+        "v_srw": 6,
+        "attn_core": 7,
+        "attn_out_proj": 8,
+        "rst_norm": 9,
+        "rst_route": 10,
+        "rst_srw": 11,
+        "loss": 12,
+    }
+    aggregates.sort(key=lambda r: order.get(r["group"], 99))
+
+    def layer_seconds(row, group):
+        return num((row.get(group) or {}).get("seconds"))
+
+    def layer_peak(row, group):
+        return num((row.get(group) or {}).get("hbm_peak_gb"))
+
+    layer_summary = []
+    for layer, row in sorted(layer_rows.items()):
+        qk_s = layer_seconds(row, "qk_srw")
+        v_s = layer_seconds(row, "v_srw")
+        attn_core_s = layer_seconds(row, "attn_core")
+        rst_s = layer_seconds(row, "rst_srw")
+        qkv_s = (qk_s or 0.0) + (v_s or 0.0)
+        layer_summary.append({
+            "layer": int(layer),
+            "attn_norm_seconds": layer_seconds(row, "attn_norm"),
+            "attn_route_seconds": layer_seconds(row, "attn_route"),
+            "qk_srw_seconds": qk_s,
+            "v_srw_seconds": v_s,
+            "attn_core_seconds": attn_core_s,
+            "attn_out_proj_seconds": layer_seconds(row, "attn_out_proj"),
+            "rst_norm_seconds": layer_seconds(row, "rst_norm"),
+            "rst_route_seconds": layer_seconds(row, "rst_route"),
+            "rst_srw_seconds": rst_s,
+            "qkv_srw_seconds": qkv_s,
+            "rst_over_qkv": ratio_float(rst_s, max(qkv_s, 1.0e-12)),
+            "v_over_qk": ratio_float(v_s, qk_s),
+            "rst_over_v": ratio_float(rst_s, v_s),
+            "qk_srw_hbm_peak_gb": layer_peak(row, "qk_srw"),
+            "v_srw_hbm_peak_gb": layer_peak(row, "v_srw"),
+            "attn_core_hbm_peak_gb": layer_peak(row, "attn_core"),
+            "rst_srw_hbm_peak_gb": layer_peak(row, "rst_srw"),
+        })
+
+    totals = {row["group"]: float(row["total_seconds"]) for row in aggregates}
+    attn_srw_total = totals.get("qk_srw", 0.0) + totals.get("v_srw", 0.0)
+    attn_non_srw_total = (
+        totals.get("attn_norm", 0.0)
+        + totals.get("attn_route", 0.0)
+        + totals.get("attn_core", 0.0)
+        + totals.get("attn_out_proj", 0.0))
+    rst_total = (
+        totals.get("rst_norm", 0.0)
+        + totals.get("rst_route", 0.0)
+        + totals.get("rst_srw", 0.0))
+    derived = {
+        "attn_srw_seconds": attn_srw_total,
+        "attn_non_srw_seconds": attn_non_srw_total,
+        "rst_total_seconds": rst_total,
+        "rst_srw_over_qkv": ratio_float(
+            totals.get("rst_srw", 0.0), max(attn_srw_total, 1.0e-12)),
+        "v_over_qk": ratio_float(
+            totals.get("v_srw", 0.0), max(totals.get("qk_srw", 0.0),
+                                          1.0e-12)),
+    }
+    return aggregates, layer_summary, derived
+
+
 def summarize_runtime_metric_snapshots(snapshots):
     if not snapshots:
         return {}
     summary = {}
-    for pool in ("attn_v", "rst"):
+    for pool in RUNTIME_POOLS:
         row = {}
         for name in OPSPACE_RUNTIME_METRIC_NAMES:
             collect_runtime_metric(
@@ -2256,6 +2805,23 @@ def profile_bottleneck_rows(summary):
     return rows
 
 
+def detailed_bottleneck_rows(summary):
+    rows = []
+    for row in summary.get("detailed_profile_aggregates", []) or []:
+        total_s = num(row.get("total_seconds"))
+        if total_s is None:
+            continue
+        rows.append({
+            "group": row.get("group"),
+            "total_seconds": total_s,
+            "mean_seconds": num(row.get("mean_seconds")),
+            "pct_detailed_split": num(row.get("pct_detailed_split")),
+            "max_hbm_peak_gb": num(row.get("max_hbm_peak_gb")),
+        })
+    rows.sort(key=lambda row: row["total_seconds"], reverse=True)
+    return rows
+
+
 def top_layer_bottlenecks(summary):
     rows = summary.get("profile_layer_rows", []) or []
     attn_rows = [
@@ -2294,6 +2860,8 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
     next_step = int(start_step)
     peak_hbm = None
     fast_metric_snapshots = []
+    fast_detailed_profile = bool(
+        getattr(args, "fast_detailed_profile", False))
 
     def next_profile_batch():
         nonlocal iterator, rng, next_step
@@ -2378,6 +2946,56 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
                 "fast_forward_steps": 0,
             })
 
+    if fast_detailed_profile:
+        try:
+            detailed_fns = create_detailed_profile_fns(cfg, sharded_fns)
+            _log("Compiling detailed split forward profile...")
+            _batch, ids, _mask, _step_rng, step_no = next_profile_batch()
+            (_compile_records, detailed_compile_seconds) = (
+                run_detailed_profile_pass(
+                    detailed_fns, params, ids, step_no,
+                    run_index, variant_label, batch_size, seq_len,
+                    "detailed_compile", record=False))
+            _log(
+                "[profile] detailed compile "
+                f"{detailed_compile_seconds:.3f}s")
+
+            _batch, ids, _mask, _step_rng, step_no = next_profile_batch()
+            step_records, detailed_total_seconds = run_detailed_profile_pass(
+                detailed_fns, params, ids, step_no,
+                run_index, variant_label, batch_size, seq_len,
+                "detailed_measure", record=True)
+            records.extend(step_records)
+            for record in step_records:
+                peak_hbm = update_peak_hbm(
+                    peak_hbm, {"hbm_peak_gb": record.get("hbm_peak_gb")})
+            tok_s = (
+                float(batch_size) * float(seq_len) / detailed_total_seconds
+                if detailed_total_seconds else None)
+            _status(
+                "[profile] detailed "
+                f"split_total_s={detailed_total_seconds:.4f}",
+                persist=True)
+            summary.update({
+                "fast_detailed_profile": True,
+                "detailed_profile_compile_seconds": (
+                    detailed_compile_seconds),
+                "detailed_profile_steps": 1,
+                "detailed_profile_mean_split_seconds": (
+                    detailed_total_seconds),
+                "detailed_profile_tokens_per_second": tok_s,
+            })
+        except Exception as exc:
+            _finish_status_line()
+            error_text = log_profile_error("detailed_profile", exc)
+            records.append(benchmark_profile_error_record(
+                run_index, variant_label, "detailed_profile", exc))
+            summary.update({
+                "fast_detailed_profile": True,
+                "detailed_profile_error": error_text,
+                "detailed_profile_steps": 0,
+            })
+
     if int(args.module_profile_steps) > 0:
         try:
             profile_fns = create_module_profile_fns(cfg, sharded_fns)
@@ -2430,10 +3048,15 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
             })
 
     aggregates, layer_rows = summarize_profile_records(records)
+    (detailed_aggregates, detailed_layer_rows,
+     detailed_derived) = summarize_detailed_profile_records(records)
     summary.update({
         "profile_records": records,
         "profile_aggregates": aggregates,
         "profile_layer_rows": layer_rows,
+        "detailed_profile_aggregates": detailed_aggregates,
+        "detailed_profile_layer_rows": detailed_layer_rows,
+        "detailed_profile_derived": detailed_derived,
         "profile_peak_hbm_gb": peak_hbm,
     })
     return summary, records, iterator, rng, next_step
@@ -2444,6 +3067,10 @@ def json_float(value, default=0.0):
     if value is None:
         return default
     return float(value)
+
+
+def runtime_pool_label(pool):
+    return RUNTIME_POOL_LABELS.get(pool, str(pool))
 
 
 def pool_static_info(cfg, pool):
@@ -2479,7 +3106,7 @@ def pool_static_info(cfg, pool):
 def sector_runtime_records(metrics, cfg, step, phase, run_index,
                            variant_label, step_seconds, hbm):
     records = []
-    for pool in ("attn_v", "rst"):
+    for pool in RUNTIME_POOLS:
         prefix = f"sector/{pool}/"
         if prefix + "overflow_count" not in metrics:
             continue
@@ -2529,7 +3156,7 @@ def sector_brief(metrics, pool):
     prefix = f"sector/{pool}/"
     if prefix + "overflow_frac" not in metrics:
         return ""
-    label = "v" if pool == "attn_v" else pool
+    label = runtime_pool_label(pool)
     return (
         f"{label}[ovf={fmt(metrics.get(prefix + 'overflow_frac'), 3)} "
         f"util99={fmt(metrics.get(prefix + 'bucket_capacity_util_p99'), 3)} "
@@ -2542,7 +3169,7 @@ def opspace_brief(metrics, pool):
     prefix = f"opspace/{pool}/"
     if prefix + "enabled" not in metrics:
         return ""
-    label = "v" if pool == "attn_v" else pool
+    label = runtime_pool_label(pool)
     final_prefix = prefix + "final/"
     final_text = ""
     if final_prefix + "semantic_drop_frac" in metrics:
@@ -2582,7 +3209,7 @@ def benchmark_step_record(run_index, variant_label, step, phase, phase_step,
         "hbm_peak_gb": json_float(hbm.get("hbm_peak_gb"), None),
         "hbm_limit_gb": json_float(hbm.get("hbm_limit_gb"), None),
     }
-    for pool in ("attn_v", "rst"):
+    for pool in RUNTIME_POOLS:
         for name in OPSPACE_RUNTIME_METRIC_NAMES:
             key = f"opspace/{pool}/{name}"
             if key in metrics:
@@ -2597,19 +3224,13 @@ def benchmark_step_record(run_index, variant_label, step, phase, phase_step,
 def format_step_status(phase, phase_step, phase_total, step_seconds,
                        tokens_per_second, metrics, hbm):
     sector_parts = [
-        part for part in (
-            sector_brief(metrics, "attn_v"),
-            sector_brief(metrics, "rst"),
-        )
-        if part
+        part for part in
+        (sector_brief(metrics, pool) for pool in RUNTIME_POOLS) if part
     ]
     sector_text = " | " + " ".join(sector_parts) if sector_parts else ""
     opspace_parts = [
-        part for part in (
-            opspace_brief(metrics, "attn_v"),
-            opspace_brief(metrics, "rst"),
-        )
-        if part
+        part for part in
+        (opspace_brief(metrics, pool) for pool in RUNTIME_POOLS) if part
     ]
     opspace_text = " | " + " ".join(opspace_parts) if opspace_parts else ""
     return (
@@ -2713,13 +3334,13 @@ def collect_xla_memory_report(dump_dir):
 def print_sector_metrics(metrics):
     if not _is_host0():
         return
-    for pool in ("attn_v", "rst"):
+    for pool in RUNTIME_POOLS:
         prefix = f"sector/{pool}/"
         if prefix + "overflow_frac" not in metrics:
             continue
         print(
             "[sector-validity] "
-            f"{pool} "
+            f"{runtime_pool_label(pool)} "
             f"overflow_frac={fmt(metrics.get(prefix + 'overflow_frac'), 6)} "
             f"executed_pair_frac="
             f"{fmt(metrics.get(prefix + 'executed_selected_pair_frac'), 6)} "
@@ -2730,7 +3351,7 @@ def print_sector_metrics(metrics):
             flush=True)
         print(
             "[sector-work] "
-            f"{pool} "
+            f"{runtime_pool_label(pool)} "
             f"per_token_effective_operator_frac="
             f"{fmt(metrics.get(prefix + 'per_token_effective_operator_frac'), 6)} "
             f"padded_work_frac_vs_dense="
@@ -2819,7 +3440,7 @@ def print_summary(summary):
             work = compute.get(pool, {})
             print(
                 "[sector] "
-                f"pool={pool} "
+                f"pool={runtime_pool_label(pool)} "
                 f"step_s={fmt(summary.get('mean_step_seconds'), 4)} "
                 f"overflow_frac={fmt(row.get('overflow_frac'), 6)} "
                 f"executed_pair_frac={fmt(row.get('executed_pair_frac'), 6)} "
@@ -2901,6 +3522,7 @@ def print_summary(summary):
                 f"{fmt(row.get('attn_hbm_peak_gb'))} | "
                 f"{fmt(row.get('rst_hbm_peak_gb'))}",
                 flush=True)
+    print_detailed_profile_summary(summary)
 
 
 def print_runtime_bottleneck(summary):
@@ -2913,11 +3535,11 @@ def print_runtime_bottleneck(summary):
         "pallas_launch_max | pallas_skip_max | pallas_pad_max | "
         "output_overflow_max | output_pad_max | backend_active",
         flush=True)
-    for pool in ("attn_v", "rst"):
+    for pool in RUNTIME_POOLS:
         if pool not in runtime:
             continue
         print(
-            f"{pool} | "
+            f"{runtime_pool_label(pool)} | "
             f"{fmt(runtime_stat(summary, pool, 'overflow_frac'))} | "
             f"{fmt(runtime_stat(summary, pool, 'semantic_drop_frac'))} | "
             f"{fmt(runtime_stat(summary, pool, 'all_processed', 'min'))} | "
@@ -2957,6 +3579,115 @@ def print_profile_bottleneck(summary):
             f"top_rst_ms={fmt_ms((top_rst or {}).get('rst_seconds'))} "
             f"max_rst_over_attn_layer={layer_label(top_ratio)} "
             f"max_rst_over_attn={fmt((top_ratio or {}).get('rst_over_attn'))}",
+            flush=True)
+
+
+def print_detailed_profile_summary(summary):
+    if not summary.get("fast_detailed_profile"):
+        return
+    print("\n=== SRW FAST BOTTLENECK SUMMARY ===", flush=True)
+    print(f"config={summary.get('config_path', '')}", flush=True)
+    print(
+        f"data_source={summary.get('data_source', 'real_config_data')}",
+        flush=True)
+    print("train_step=skipped", flush=True)
+    print(
+        f"forward_s={fmt(summary.get('fast_forward_mean_seconds'), 4)}",
+        flush=True)
+    print(
+        "detailed_split_s="
+        f"{fmt(summary.get('detailed_profile_mean_split_seconds'), 4)}",
+        flush=True)
+    if summary.get("detailed_profile_error"):
+        print(
+            "detailed_profile_error "
+            f"error={summary.get('detailed_profile_error')}",
+            flush=True)
+        return
+    rows = detailed_bottleneck_rows(summary)
+    if rows:
+        print("\n[detailed-bottleneck]", flush=True)
+        print("rank | group | total_ms | pct_split | hbm_peak_gb",
+              flush=True)
+        for rank, row in enumerate(rows, 1):
+            print(
+                f"{rank} | "
+                f"{row.get('group')} | "
+                f"{fmt_ms(row.get('total_seconds'))} | "
+                f"{fmt(row.get('pct_detailed_split'), 1)} | "
+                f"{fmt(row.get('max_hbm_peak_gb'))}",
+                flush=True)
+    print_detailed_copy_lines(int(summary.get("run_index") or 1), summary)
+
+
+def print_detailed_copy_lines(run_index, summary):
+    rows = {
+        row.get("group"): row
+        for row in summary.get("detailed_profile_aggregates", []) or []
+    }
+    if not rows:
+        return
+
+    def group_ms(group):
+        return fmt_ms((rows.get(group) or {}).get("total_seconds"))
+
+    module_groups = (
+        "qk_srw",
+        "v_srw",
+        "attn_core",
+        "attn_out_proj",
+        "rst_srw",
+        "attn_route",
+        "rst_route",
+        "loss",
+    )
+    print(
+        f"run={run_index} detailed_module_summary "
+        + " ".join(f"{group}_ms={group_ms(group)}"
+                   for group in module_groups),
+        flush=True)
+
+    rank_parts = []
+    for rank, row in enumerate(detailed_bottleneck_rows(summary), 1):
+        rank_parts.append(
+            f"{rank}:{row.get('group')}"
+            f"_ms={fmt_ms(row.get('total_seconds'))}"
+            f"_pct={fmt(row.get('pct_detailed_split'), 1)}"
+            f"_hbm={fmt(row.get('max_hbm_peak_gb'))}")
+    if rank_parts:
+        print(
+            f"run={run_index} detailed_bottleneck_rank "
+            + " ".join(rank_parts),
+            flush=True)
+
+    layer_rows = summary.get("detailed_profile_layer_rows", []) or []
+    if layer_rows:
+        def layer_line(label, key, formatter):
+            parts = []
+            for row in layer_rows:
+                layer = int(row.get("layer"))
+                parts.append(f"{layer:02d}:{formatter(row.get(key))}")
+            print(f"run={run_index} {label} " + ",".join(parts),
+                  flush=True)
+
+        layer_line("layer_qk_srw_ms", "qk_srw_seconds", fmt_ms)
+        layer_line("layer_v_srw_ms", "v_srw_seconds", fmt_ms)
+        layer_line("layer_attn_core_ms", "attn_core_seconds", fmt_ms)
+        layer_line("layer_rst_srw_ms", "rst_srw_seconds", fmt_ms)
+        layer_line("layer_rst_over_qkv", "rst_over_qkv",
+                   lambda value: fmt(value, 3))
+
+    derived = summary.get("detailed_profile_derived") or {}
+    if derived:
+        print(
+            f"run={run_index} derived_summary "
+            f"attn_srw_ms={fmt_ms(derived.get('attn_srw_seconds'))} "
+            f"attn_non_srw_ms="
+            f"{fmt_ms(derived.get('attn_non_srw_seconds'))} "
+            f"rst_total_ms={fmt_ms(derived.get('rst_total_seconds'))} "
+            f"rst_srw_over_qkv="
+            f"{fmt(derived.get('rst_srw_over_qkv'), 3)} "
+            f"v_over_qk={fmt(derived.get('v_over_qk'), 3)}",
             flush=True)
 
 
@@ -3089,6 +3820,7 @@ def print_copy_summary(summaries, args):
         f"warmup_steps={warmup_steps} "
         f"measure_steps={measure_steps} "
         f"forward_profile_steps={int(args.forward_profile_steps)} "
+        f"detailed_profile_steps={1 if args.fast_only else 0} "
         f"module_profile_steps={int(args.module_profile_steps)} "
         f"metrics_jsonl={args.metrics_jsonl or 'disabled'}",
         flush=True)
@@ -3120,6 +3852,7 @@ def print_copy_summary(summaries, args):
         print_copy_runtime_summary(i, summary)
         print_copy_module_summary(i, summary)
         print_copy_layer_summary(i, summary)
+        print_detailed_copy_lines(i, summary)
 
     if len(summaries) >= 2:
         base = summaries[0]
@@ -3222,12 +3955,12 @@ def print_copy_runtime_summary(run_index, summary):
     runtime = summary.get("runtime_metric_summary") or {}
     if not runtime:
         return
-    for pool in ("attn_v", "rst"):
+    for pool in RUNTIME_POOLS:
         if pool not in runtime:
             continue
         print(
             f"run={run_index} runtime_summary "
-            f"pool={pool} "
+            f"pool={runtime_pool_label(pool)} "
             f"overflow_max={fmt(runtime_stat(summary, pool, 'overflow_frac'))} "
             f"semantic_drop_max="
             f"{fmt(runtime_stat(summary, pool, 'semantic_drop_frac'))} "

@@ -20,6 +20,10 @@ STEPS="20"
 WARMUP_STEPS="5"
 FORWARD_PROFILE_STEPS="1"
 MODULE_PROFILE_STEPS="1"
+STEPS_SET="0"
+WARMUP_STEPS_SET="0"
+FORWARD_PROFILE_STEPS_SET="0"
+MODULE_PROFILE_STEPS_SET="0"
 FAST_ONLY="0"
 OUTPUT_DIR=""
 XLA_DUMP_ENABLED="1"
@@ -40,7 +44,7 @@ Options:
   --warmup-steps N
   --forward-profile-steps N     Forward-only profile steps per config (default: 1)
   --module-profile-steps N      Split-module profile steps per config (default: 1)
-  --fast, --fast-only           Skip full train-step benchmark; run fast profiles only
+  --fast, --fast-only           Run quick real-data detailed forward diagnosis
   --model-version VERSION        Optional expected version check
   --allow-model-version-override Allow --model-version to override config
   --output-dir DIR               Remote artifact root for XLA dumps only
@@ -91,10 +95,10 @@ while [[ $# -gt 0 ]]; do
         --branch) BRANCH="$2"; shift 2 ;;
         --config) CONFIGS+=("$2"); shift 2 ;;
         --model-version) MODEL_VERSION="$2"; shift 2 ;;
-        --steps) STEPS="$2"; shift 2 ;;
-        --warmup-steps) WARMUP_STEPS="$2"; shift 2 ;;
-        --forward-profile-steps) FORWARD_PROFILE_STEPS="$2"; shift 2 ;;
-        --module-profile-steps) MODULE_PROFILE_STEPS="$2"; shift 2 ;;
+        --steps) STEPS="$2"; STEPS_SET="1"; shift 2 ;;
+        --warmup-steps) WARMUP_STEPS="$2"; WARMUP_STEPS_SET="1"; shift 2 ;;
+        --forward-profile-steps) FORWARD_PROFILE_STEPS="$2"; FORWARD_PROFILE_STEPS_SET="1"; shift 2 ;;
+        --module-profile-steps) MODULE_PROFILE_STEPS="$2"; MODULE_PROFILE_STEPS_SET="1"; shift 2 ;;
         --fast|--fast-only) FAST_ONLY="1"; shift ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --xla-dump)
@@ -153,16 +157,6 @@ if ! is_nonnegative_int "$MODULE_PROFILE_STEPS"; then
     echo "ERROR: --module-profile-steps must be an integer >= 0." >&2
     exit 1
 fi
-if [[ "$FAST_ONLY" = "1" &&
-      "$FORWARD_PROFILE_STEPS" -le 0 &&
-      "$MODULE_PROFILE_STEPS" -le 0 ]]; then
-    echo "ERROR: --fast requires --forward-profile-steps or --module-profile-steps > 0." >&2
-    exit 1
-fi
-if [[ "$FAST_ONLY" = "1" ]]; then
-    STEPS="0"
-    WARMUP_STEPS="0"
-fi
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="benchmark_runs/srw_$(date +%Y%m%d_%H%M%S)"
 fi
@@ -209,15 +203,18 @@ for config in "${CONFIGS[@]}"; do
 done
 echo "  Model version:  $MODEL_VERSION_LABEL"
 if [[ "$FAST_ONLY" = "1" ]]; then
-    echo "  Mode:           fast profile only"
+    echo "  Mode:           quick detailed forward diagnosis"
     echo "  Train steps:    skipped"
+    echo "  Forward profile:1"
+    echo "  Detailed profile:1"
+    echo "  Module profile: 0"
 else
     echo "  Mode:           train benchmark + profiles"
     echo "  Steps:          $STEPS"
     echo "  Warmup steps:   $WARMUP_STEPS"
+    echo "  Forward profile:$FORWARD_PROFILE_STEPS"
+    echo "  Module profile: $MODULE_PROFILE_STEPS"
 fi
-echo "  Forward profile:$FORWARD_PROFILE_STEPS"
-echo "  Module profile: $MODULE_PROFILE_STEPS"
 echo "  Fast only:      $FAST_ONLY"
 echo "  XLA dumps:      $XLA_DUMP_ENABLED ($XLA_DUMP_BASE)"
 echo "  Dummy data:     $DUMMY_DATA"
@@ -303,6 +300,10 @@ STEPS_Q="$(shell_quote "$STEPS")"
 WARMUP_STEPS_Q="$(shell_quote "$WARMUP_STEPS")"
 FORWARD_PROFILE_STEPS_Q="$(shell_quote "$FORWARD_PROFILE_STEPS")"
 MODULE_PROFILE_STEPS_Q="$(shell_quote "$MODULE_PROFILE_STEPS")"
+STEPS_SET_Q="$(shell_quote "$STEPS_SET")"
+WARMUP_STEPS_SET_Q="$(shell_quote "$WARMUP_STEPS_SET")"
+FORWARD_PROFILE_STEPS_SET_Q="$(shell_quote "$FORWARD_PROFILE_STEPS_SET")"
+MODULE_PROFILE_STEPS_SET_Q="$(shell_quote "$MODULE_PROFILE_STEPS_SET")"
 FAST_ONLY_Q="$(shell_quote "$FAST_ONLY")"
 XLA_DUMP_ENABLED_Q="$(shell_quote "$XLA_DUMP_ENABLED")"
 XLA_DUMP_BASE_Q="$(shell_quote "$XLA_DUMP_BASE")"
@@ -323,6 +324,10 @@ STEPS=${STEPS_Q}
 WARMUP_STEPS=${WARMUP_STEPS_Q}
 FORWARD_PROFILE_STEPS=${FORWARD_PROFILE_STEPS_Q}
 MODULE_PROFILE_STEPS=${MODULE_PROFILE_STEPS_Q}
+STEPS_SET=${STEPS_SET_Q}
+WARMUP_STEPS_SET=${WARMUP_STEPS_SET_Q}
+FORWARD_PROFILE_STEPS_SET=${FORWARD_PROFILE_STEPS_SET_Q}
+MODULE_PROFILE_STEPS_SET=${MODULE_PROFILE_STEPS_SET_Q}
 FAST_ONLY=${FAST_ONLY_Q}
 XLA_DUMP_ENABLED=${XLA_DUMP_ENABLED_Q}
 XLA_DUMP_BASE=${XLA_DUMP_BASE_Q}
@@ -350,11 +355,24 @@ BENCH_ARGS=""
 if [ -n "\$CONFIG_REST" ]; then
     BENCH_ARGS="\$CONFIG_REST"
 fi
-BENCH_ARGS="\$BENCH_ARGS --steps \$STEPS --warmup-steps \$WARMUP_STEPS"
-BENCH_ARGS="\$BENCH_ARGS --forward-profile-steps \$FORWARD_PROFILE_STEPS"
-BENCH_ARGS="\$BENCH_ARGS --module-profile-steps \$MODULE_PROFILE_STEPS"
 if [ "\$FAST_ONLY" = "1" ]; then
     BENCH_ARGS="\$BENCH_ARGS --fast"
+    if [ "\$STEPS_SET" = "1" ]; then
+        BENCH_ARGS="\$BENCH_ARGS --steps \$STEPS"
+    fi
+    if [ "\$WARMUP_STEPS_SET" = "1" ]; then
+        BENCH_ARGS="\$BENCH_ARGS --warmup-steps \$WARMUP_STEPS"
+    fi
+    if [ "\$FORWARD_PROFILE_STEPS_SET" = "1" ]; then
+        BENCH_ARGS="\$BENCH_ARGS --forward-profile-steps \$FORWARD_PROFILE_STEPS"
+    fi
+    if [ "\$MODULE_PROFILE_STEPS_SET" = "1" ]; then
+        BENCH_ARGS="\$BENCH_ARGS --module-profile-steps \$MODULE_PROFILE_STEPS"
+    fi
+else
+    BENCH_ARGS="\$BENCH_ARGS --steps \$STEPS --warmup-steps \$WARMUP_STEPS"
+    BENCH_ARGS="\$BENCH_ARGS --forward-profile-steps \$FORWARD_PROFILE_STEPS"
+    BENCH_ARGS="\$BENCH_ARGS --module-profile-steps \$MODULE_PROFILE_STEPS"
 fi
 BENCH_METRICS_JSONL="\${OUTPUT_DIR}/benchmark_metrics_host_\${TPU_WORKER_INDEX}.jsonl"
 BENCH_ARGS="\$BENCH_ARGS --metrics-jsonl \$BENCH_METRICS_JSONL"
