@@ -801,6 +801,271 @@ def _ceil_to_multiple(value, multiple):
     return ((value + multiple - 1) // multiple) * multiple
 
 
+def _v4168_uses_execution_backend(pools):
+    if not isinstance(pools, dict):
+        return False
+    for pool in ("qk", "v", "rst"):
+        pool_cfg = pools.get(pool, {})
+        if isinstance(pool_cfg, dict) and "execution_backend" in pool_cfg:
+            return True
+    return False
+
+
+def v4168_operation_space_backend_layouts(cfg):
+    """Parse the v4168 clean Region-Block atlas config used by train_jax."""
+    t = cfg["training"]
+    m = cfg["model"]
+    opspace = t.get("operation_space", {})
+    pools = opspace.get("pools", {})
+    if pools is None:
+        pools = {}
+    if not isinstance(pools, dict):
+        raise ValueError("training.operation_space.pools must be a mapping.")
+
+    extra_pools = sorted(set(pools) - {"qk", "v", "rst"})
+    if extra_pools:
+        raise ValueError(
+            "training.operation_space.pools only supports qk, v, rst; "
+            f"remove: {', '.join(extra_pools)}")
+
+    removed_pool_keys = {
+        "mode",
+        "routing_mode",
+        "execution_mode",
+        "execution_backend_mode",
+        "lanes",
+        "local_lanes",
+        "k_exec",
+        "tiles_per_lane",
+        "tile_size",
+        "exec_tiles_per_block",
+        "blocks_per_lane",
+        "block_size",
+        "local_padded_ops",
+        "local_operator_slots",
+        "exec_slots",
+        "region_block_pallas",
+        "factorized_lane_mean",
+        "lane_output_mode",
+        "visible_regions_start",
+        "visible_regions_mid",
+        "visible_regions_final",
+        "candidate_region_count",
+        "block_mixing_enabled",
+    }
+    common_pool_keys = {
+        "execution_backend",
+        "num_regions",
+        "blocks_per_region",
+        "operators_per_block",
+        "visible_regions",
+        "visible_blocks_per_region",
+    }
+    allowed_rst_keys = {
+        *common_pool_keys,
+        "region_score_pooling",
+        "region_score_temperature",
+        "region_capacity_factor",
+        "block_capacity_factor",
+        "bucket_capacity_factor",
+        "high_regret_threshold",
+    }
+    defaults = {
+        "qk": {"n_key": "n_qk", "execution_backend": "dense"},
+        "v": {"n_key": "n_v", "execution_backend": "dense"},
+        "rst": {"n_key": "n_rst", "execution_backend": "sparse_region_block"},
+    }
+    mesh_model = max(1, int(t.get("mesh_model", 1)))
+    layouts = {}
+
+    for label, default in defaults.items():
+        pool = pools.get(label, {})
+        if not isinstance(pool, dict) or not pool:
+            raise ValueError(
+                f"training.operation_space.pools.{label} is required when "
+                "operation_space.enabled=true.")
+        if "routing_mode" in pool:
+            raise ValueError(
+                f"operation_space.pools.{label}.routing_mode has been "
+                "removed. Use execution_backend only.")
+        present_removed = sorted(set(pool) & removed_pool_keys)
+        if present_removed:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label} contains removed clean-config keys: "
+                + ", ".join(present_removed))
+        if label == "rst":
+            if "bucket_chunk_size" in pool:
+                raise ValueError(
+                    "training.operation_space.pools.rst.bucket_chunk_size "
+                    "was removed from the sparse Region-Block backend.")
+            if "assignment_policy" in pool:
+                raise ValueError(
+                    "training.operation_space.pools.rst.assignment_policy "
+                    "was removed from the sparse Region-Block backend.")
+        allowed_pool_keys = allowed_rst_keys if label == "rst" else common_pool_keys
+        extra = sorted(set(pool) - allowed_pool_keys)
+        if extra:
+            raise ValueError(
+                f"training.operation_space.pools.{label} only supports "
+                "the clean operation-space fields for that pool; remove: "
+                f"{', '.join(extra)}")
+
+        execution_backend = str(pool.get(
+            "execution_backend", default["execution_backend"])).strip().lower()
+        expected_backend = default["execution_backend"]
+        if execution_backend != expected_backend:
+            raise ValueError(
+                f"training.operation_space.pools.{label}.execution_backend "
+                f"must be {expected_backend!r}, got {execution_backend!r}.")
+
+        n_key = default["n_key"]
+        n_ops = int(m.get(n_key, m.get("n_know", 0) if label == "rst" else 0))
+        if n_ops <= 0:
+            raise ValueError(f"model.{n_key} must be > 0 for operation_space.")
+
+        required_ints = {
+            "num_regions": pool.get("num_regions"),
+            "blocks_per_region": pool.get("blocks_per_region"),
+            "operators_per_block": pool.get("operators_per_block"),
+            "visible_regions": pool.get("visible_regions"),
+            "visible_blocks_per_region": pool.get("visible_blocks_per_region"),
+        }
+        missing = [name for name, value in required_ints.items() if value is None]
+        if missing:
+            raise ValueError(
+                f"training.operation_space.pools.{label} missing required "
+                f"field(s): {', '.join(missing)}")
+        num_regions = int(required_ints["num_regions"])
+        blocks_per_region = int(required_ints["blocks_per_region"])
+        operators_per_block = int(required_ints["operators_per_block"])
+        visible_regions = int(required_ints["visible_regions"])
+        visible_blocks_per_region = int(
+            required_ints["visible_blocks_per_region"])
+        for field_name, value in (
+                ("num_regions", num_regions),
+                ("blocks_per_region", blocks_per_region),
+                ("operators_per_block", operators_per_block),
+                ("visible_regions", visible_regions),
+                ("visible_blocks_per_region", visible_blocks_per_region)):
+            if value < 1:
+                raise ValueError(
+                    "training.operation_space.pools."
+                    f"{label}.{field_name} must be >= 1, got {value}.")
+        if visible_regions > num_regions:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.visible_regions={visible_regions} must be <= "
+                f"num_regions={num_regions}.")
+        if visible_blocks_per_region > blocks_per_region:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.visible_blocks_per_region="
+                f"{visible_blocks_per_region} must be <= "
+                f"blocks_per_region={blocks_per_region}.")
+        if num_regions % mesh_model != 0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.num_regions={num_regions} must be divisible "
+                f"by mesh_model={mesh_model}.")
+
+        total_capacity = (
+            num_regions * blocks_per_region * operators_per_block)
+        if n_ops > total_capacity:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label} capacity {total_capacity} is smaller than "
+                f"model.{n_key}={n_ops}.")
+
+        region_score_pooling = str(pool.get(
+            "region_score_pooling", "smoothmax")).strip().lower()
+        if label == "rst" and region_score_pooling != "smoothmax":
+            raise ValueError(
+                "training.operation_space.pools.rst."
+                "region_score_pooling must be 'smoothmax'.")
+        region_score_temperature = float(pool.get(
+            "region_score_temperature", 0.25))
+        if region_score_temperature <= 0.0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.region_score_temperature must be > 0, got "
+                f"{region_score_temperature}.")
+        region_capacity_factor = float(pool.get(
+            "region_capacity_factor", 1.25))
+        block_capacity_factor = float(pool.get(
+            "block_capacity_factor", 1.25))
+        if region_capacity_factor <= 0.0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.region_capacity_factor must be > 0, got "
+                f"{region_capacity_factor}.")
+        if block_capacity_factor <= 0.0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.block_capacity_factor must be > 0, got "
+                f"{block_capacity_factor}.")
+        bucket_capacity_factor = float(pool.get(
+            "bucket_capacity_factor", block_capacity_factor))
+        if bucket_capacity_factor <= 0.0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.bucket_capacity_factor must be > 0, got "
+                f"{bucket_capacity_factor}.")
+        high_regret_threshold = float(pool.get(
+            "high_regret_threshold", 0.05))
+        if high_regret_threshold < 0.0:
+            raise ValueError(
+                "training.operation_space.pools."
+                f"{label}.high_regret_threshold must be >= 0, got "
+                f"{high_regret_threshold}.")
+
+        physical_visible_ops_per_token = (
+            visible_regions * visible_blocks_per_region
+            * operators_per_block)
+        raw_tiles = (n_ops + operators_per_block - 1) // operators_per_block
+        total_tiles = num_regions * blocks_per_region
+        layouts[label] = {
+            "routing_mode": "region_block",
+            "execution_mode": execution_backend,
+            "execution_backend": execution_backend,
+            "lanes": num_regions,
+            "k_exec": visible_regions,
+            "num_regions": num_regions,
+            "regions_per_owner": num_regions // mesh_model,
+            "blocks_per_region": blocks_per_region,
+            "operators_per_block": operators_per_block,
+            "operators_per_region": blocks_per_region * operators_per_block,
+            "visible_regions": visible_regions,
+            "visible_blocks_per_region": visible_blocks_per_region,
+            "visible_ops_per_token": physical_visible_ops_per_token,
+            "physical_visible_ops_per_token": (
+                physical_visible_ops_per_token),
+            "region_score_pooling": region_score_pooling,
+            "region_score_temperature": region_score_temperature,
+            "region_capacity_factor": region_capacity_factor,
+            "block_capacity_factor": block_capacity_factor,
+            "bucket_capacity_factor": bucket_capacity_factor,
+            "tile_size": operators_per_block,
+            "raw_tiles": raw_tiles,
+            "total_tiles": total_tiles,
+            "tiles_per_lane": blocks_per_region,
+            "exec_tiles_per_block": 1,
+            "blocks_per_lane": blocks_per_region,
+            "block_size": operators_per_block,
+            "padded_ops": total_capacity,
+            "invalid_padded_ops": total_capacity - n_ops,
+            "bucket_chunk_size": 256,
+            "assignment_policy": "region_block",
+            "high_regret_threshold": high_regret_threshold,
+            "global_operator_capacity": total_capacity,
+            "local_operator_capacity": total_capacity // mesh_model,
+            "operator_capacity": total_capacity,
+            "invalid_operator_capacity": total_capacity - n_ops,
+            "num_devices": mesh_model,
+        }
+    return layouts
+
+
 def v4168_operation_space_enabled(cfg):
     version = str(cfg["model"].get("model_version", ""))
     opspace = cfg["training"].get("operation_space", {})
@@ -828,6 +1093,8 @@ def v4168_operation_space_layouts(cfg):
         pools = {}
     if not isinstance(pools, dict):
         raise ValueError("training.operation_space.pools must be a mapping.")
+    if _v4168_uses_execution_backend(pools):
+        return v4168_operation_space_backend_layouts(cfg)
     mesh_model = max(1, int(t.get("mesh_model", 1)))
     defaults = {
         "qk": {
@@ -1105,7 +1372,7 @@ def v4168_operation_space_layouts(cfg):
 
 
 def v4168_operation_space_pool_kwargs(layout):
-    return {
+    kwargs = {
         "operation_space_mode": str(layout["routing_mode"]).lower(),
         "operation_space_routing_mode": str(layout["routing_mode"]).lower(),
         "operation_space_execution_mode": str(layout["execution_mode"]).lower(),
@@ -1139,6 +1406,15 @@ def v4168_operation_space_pool_kwargs(layout):
         "opspace_high_regret_threshold": float(
             layout["high_regret_threshold"]),
     }
+    if "execution_backend" in layout:
+        kwargs["operation_space_execution_backend"] = str(
+            layout["execution_backend"]).lower()
+    return kwargs
+
+
+def v4168_operation_space_backend_label(layout):
+    return str(layout.get(
+        "execution_backend", layout.get("execution_mode", "unknown"))).lower()
 
 
 def build_sharded_fns(cfg, mesh):
@@ -1241,9 +1517,12 @@ def build_sharded_fns(cfg, mesh):
     if opspace_enabled:
         out.update({
             "operation_space_tau_free": True,
-            "qk_backend": opspace_layouts["qk"]["execution_mode"],
-            "v_backend": opspace_layouts["v"]["execution_mode"],
-            "rst_backend": opspace_layouts["rst"]["execution_mode"],
+            "qk_backend": v4168_operation_space_backend_label(
+                opspace_layouts["qk"]),
+            "v_backend": v4168_operation_space_backend_label(
+                opspace_layouts["v"]),
+            "rst_backend": v4168_operation_space_backend_label(
+                opspace_layouts["rst"]),
         })
         _log(
             "sharded SRW kernels: operation_space "
