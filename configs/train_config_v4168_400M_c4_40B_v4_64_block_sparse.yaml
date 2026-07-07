@@ -45,7 +45,7 @@ training:
   operation_space_load_smoothing:
     enabled: true
     mode: capacity
-    load_temperature: 0.05
+    load_temperature: 0.03
     space_temperature: 0.12
     alpha: 1.25
     warmup_tokens: 0
@@ -98,7 +98,7 @@ training:
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
         region_capacity_factor: 1.5
-        spill_capacity: 8192
+        spill_capacity: 15000
   checkpoint_interval: 200
   val_interval: 200
   log_interval: 100
