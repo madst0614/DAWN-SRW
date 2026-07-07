@@ -148,7 +148,6 @@ OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'load_smoothing_enabled',
     'load_smoothing_region_weight',
     'load_smoothing_block_weight',
-    'load_smoothing_entropy_weight',
     'relu_gate_count_mean',
     'gate_denominator_mean',
     'gate_mass_mean',
@@ -579,6 +578,53 @@ def _opspace_region_block_model_axis_layout(
         'local_operator_capacity': local_operator_capacity,
         'global_operator_capacity': global_operator_capacity,
     }
+
+
+def _opspace_balanced_operator_slot_layout_np(
+        n_valid, total_blocks, operators_per_block):
+    """Map compact valid rows into fixed blocks with invalid slots spread out."""
+    n_valid = int(n_valid)
+    total_blocks = max(1, int(total_blocks))
+    operators_per_block = max(1, int(operators_per_block))
+    total_slots = total_blocks * operators_per_block
+
+    if n_valid > total_slots:
+        raise ValueError(
+            f"operation-space layout has {n_valid} valid rows but only "
+            f"{total_slots} padded slots"
+        )
+
+    counts = np.full(
+        (total_blocks,),
+        n_valid // total_blocks,
+        dtype=np.int32,
+    )
+    counts[:n_valid % total_blocks] += 1
+
+    if np.any(counts > operators_per_block):
+        raise ValueError(
+            "operation-space balanced padding requires "
+            "operators_per_block large enough for max valid count "
+            f"{int(counts.max())}"
+        )
+
+    slot_to_row = np.zeros((total_slots,), dtype=np.int32)
+    valid = np.zeros((total_slots,), dtype=np.bool_)
+
+    row = 0
+    for block_i, count in enumerate(counts.tolist()):
+        start = block_i * operators_per_block
+        stop = start + int(count)
+        if count > 0:
+            slot_to_row[start:stop] = np.arange(
+                row,
+                row + int(count),
+                dtype=np.int32,
+            )
+            valid[start:stop] = True
+        row += int(count)
+
+    return slot_to_row, valid, counts
 
 
 @jax.custom_vjp
@@ -4551,7 +4597,6 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         jnp.float32(1.0 if bool(load_smoothing_enabled) else 0.0),
         jnp.float32(load_smoothing_region_weight),
         jnp.float32(load_smoothing_block_weight),
-        jnp.float32(0.0),
         relu_gate_count_mean,
         gate_denominator_mean,
         gate_mass_mean,
