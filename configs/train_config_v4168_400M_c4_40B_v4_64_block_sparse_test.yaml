@@ -47,7 +47,7 @@ training:
     load_temperature: 0.7
     space_temperature: 0.12
     alpha: 1.25
-    warmup_tokens: 200000000
+    warmup_tokens: 0
     peak_tokens: 1000000000
     final_weight_frac: 1.0
 
