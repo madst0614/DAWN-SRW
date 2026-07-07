@@ -49,6 +49,23 @@ training:
 
   admission_den_power: 0.5
 
+  operation_space_load_smoothing:
+    enabled: true
+    rst_region_weight: 3.0e-4
+    rst_block_weight: 0.0
+    load_temperature: 0.7
+    space_temperature: 0.12
+    alpha: 1.25
+    warmup_tokens: 200000000
+    peak_tokens: 1000000000
+    final_weight_frac: 1.0
+
+  operation_space_completion:
+    enabled: true
+    spill_capacity_factor: 0.25
+    fallback_on_spill_overflow: true
+    assert_all_processed: true
+
   operation_space:
     enabled: true
 
@@ -78,8 +95,9 @@ training:
         visible_blocks_per_region: 4
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
-        region_capacity_factor: 1.10
-        block_capacity_factor: 1.25
+        region_capacity_factor: 1.50
+        block_capacity_factor: 1.50
+        bucket_capacity_factor: 1.50
         high_regret_threshold: 0.05
   checkpoint_interval: 200
   val_interval: 200

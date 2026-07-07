@@ -228,6 +228,27 @@ OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'processed_requests',
     'all_processed',
     'no_nan',
+    'main_processed_requests',
+    'overflow_requests',
+    'completion_processed_requests',
+    'spill_frac',
+    'spill_overflow_count',
+    'fallback_frac',
+    'attempted_fill_mean',
+    'attempted_fill_p50',
+    'attempted_fill_p95',
+    'attempted_fill_p99',
+    'attempted_fill_max',
+    'required_capacity_no_overflow',
+    'capacity_shortfall',
+    'load_smoothing_loss',
+    'load_smoothing_raw',
+    'load_max',
+    'load_mean',
+    'load_max_over_mean',
+    'smooth_load_max',
+    'spike_over_mean',
+    'spike_frac',
 )
 OPSPACE_FINAL_RUNTIME_DIAG_COUNT = len(OPSPACE_FINAL_RUNTIME_DIAG_NAMES)
 (
@@ -318,7 +339,62 @@ OPSPACE_FINAL_RUNTIME_DIAG_COUNT = len(OPSPACE_FINAL_RUNTIME_DIAG_NAMES)
     OPSPACE_FINAL_PROCESSED_REQUESTS,
     OPSPACE_FINAL_ALL_PROCESSED,
     OPSPACE_FINAL_NO_NAN,
+    OPSPACE_FINAL_MAIN_PROCESSED_REQUESTS,
+    OPSPACE_FINAL_OVERFLOW_REQUESTS,
+    OPSPACE_FINAL_COMPLETION_PROCESSED_REQUESTS,
+    OPSPACE_FINAL_SPILL_FRAC,
+    OPSPACE_FINAL_SPILL_OVERFLOW_COUNT,
+    OPSPACE_FINAL_FALLBACK_FRAC,
+    OPSPACE_FINAL_ATTEMPTED_FILL_MEAN,
+    OPSPACE_FINAL_ATTEMPTED_FILL_P50,
+    OPSPACE_FINAL_ATTEMPTED_FILL_P95,
+    OPSPACE_FINAL_ATTEMPTED_FILL_P99,
+    OPSPACE_FINAL_ATTEMPTED_FILL_MAX,
+    OPSPACE_FINAL_REQUIRED_CAPACITY_NO_OVERFLOW,
+    OPSPACE_FINAL_CAPACITY_SHORTFALL,
+    OPSPACE_FINAL_LOAD_SMOOTHING_LOSS,
+    OPSPACE_FINAL_LOAD_SMOOTHING_RAW,
+    OPSPACE_FINAL_LOAD_MAX,
+    OPSPACE_FINAL_LOAD_MEAN,
+    OPSPACE_FINAL_LOAD_MAX_OVER_MEAN,
+    OPSPACE_FINAL_SMOOTH_LOAD_MAX,
+    OPSPACE_FINAL_SPIKE_OVER_MEAN,
+    OPSPACE_FINAL_SPIKE_FRAC,
 ) = range(OPSPACE_FINAL_RUNTIME_DIAG_COUNT)
+
+OPSPACE_LOAD_SMOOTHING_DIAG_NAMES = (
+    'load_smoothing_loss',
+    'load_smoothing_raw',
+    'load_max',
+    'load_mean',
+    'load_max_over_mean',
+    'smooth_load_max',
+    'spike_over_mean',
+    'spike_frac',
+)
+OPSPACE_LOAD_SMOOTHING_DIAG_COUNT = len(OPSPACE_LOAD_SMOOTHING_DIAG_NAMES)
+
+OPSPACE_COMPLETION_DIAG_NAMES = (
+    'main_processed_requests',
+    'overflow_requests',
+    'completion_processed_requests',
+    'spill_frac',
+    'spill_overflow_count',
+    'fallback_frac',
+    'selected_requests',
+    'processed_requests',
+    'all_processed',
+    'semantic_drop_frac',
+    'reroute_frac',
+    'attempted_fill_mean',
+    'attempted_fill_p50',
+    'attempted_fill_p95',
+    'attempted_fill_p99',
+    'attempted_fill_max',
+    'required_capacity_no_overflow',
+    'capacity_shortfall',
+)
+OPSPACE_COMPLETION_DIAG_COUNT = len(OPSPACE_COMPLETION_DIAG_NAMES)
 
 BENCHMARK_SECTOR_RUNTIME_DIAG_NAMES = (
     'bucket_fill_mean',
@@ -3437,6 +3513,69 @@ def _opspace_masked_percentile(values, mask, q):
         count > 0, sorted_values[idx], jnp.float32(0.0))
 
 
+def _opspace_load_smoothing_weight(tokens, weight, warmup_tokens,
+                                   peak_tokens, final_weight_frac):
+    tokens = jnp.asarray(tokens, dtype=jnp.float32)
+    weight = jnp.asarray(weight, dtype=jnp.float32)
+    warmup_tokens = jnp.asarray(warmup_tokens, dtype=jnp.float32)
+    peak_tokens = jnp.maximum(
+        jnp.asarray(peak_tokens, dtype=jnp.float32),
+        warmup_tokens + jnp.float32(1.0))
+    final_weight = weight * jnp.asarray(
+        final_weight_frac, dtype=jnp.float32)
+    ramp = jnp.clip(
+        (tokens - warmup_tokens) / (peak_tokens - warmup_tokens),
+        jnp.float32(0.0), jnp.float32(1.0))
+    return jnp.where(
+        tokens < warmup_tokens,
+        jnp.float32(0.0),
+        jnp.where(tokens < peak_tokens, weight * ramp, final_weight))
+
+
+def _opspace_load_smoothing_loss(scores, centers, *, weight,
+                                 load_temperature, space_temperature,
+                                 alpha, eps=1.0e-6):
+    """Local route-density smoothing loss; it never alters route scores."""
+    scores = scores.astype(jnp.float32)
+    centers = centers.astype(jnp.float32)
+    weight = jnp.asarray(weight, dtype=jnp.float32)
+    eps_f = jnp.asarray(eps, dtype=jnp.float32)
+    load_temperature = jnp.maximum(
+        jnp.asarray(load_temperature, dtype=jnp.float32), eps_f)
+    space_temperature = jnp.maximum(
+        jnp.asarray(space_temperature, dtype=jnp.float32), eps_f)
+    alpha = jnp.asarray(alpha, dtype=jnp.float32)
+
+    p = jax.nn.softmax(scores / load_temperature, axis=-1)
+    load = jnp.mean(p, axis=0)
+    centers = _forward_unit_direction(centers)
+    sim = jnp.einsum('cd,ed->ce', centers, centers).astype(jnp.float32)
+    kernel = jnp.exp(jnp.clip(
+        sim / space_temperature, jnp.float32(-60.0), jnp.float32(60.0)))
+    kernel = kernel / jnp.maximum(
+        kernel.sum(axis=-1, keepdims=True), eps_f)
+    smooth_load = jax.lax.stop_gradient(kernel @ load)
+    over = jax.nn.relu(load - alpha * smooth_load)
+    raw_loss = jnp.mean(jnp.square(over))
+    weighted_loss = weight * raw_loss
+
+    load_mean = jnp.mean(load)
+    load_max = jnp.max(load)
+    smooth_load_max = jnp.max(smooth_load)
+    over_max = jnp.max(over)
+    diag = jnp.asarray((
+        weighted_loss,
+        raw_loss,
+        load_max,
+        load_mean,
+        load_max / jnp.maximum(load_mean, eps_f),
+        smooth_load_max,
+        over_max / jnp.maximum(load_mean, eps_f),
+        jnp.mean((over > 0.0).astype(jnp.float32)),
+    ), dtype=jnp.float32)
+    return weighted_loss, diag
+
+
 def _opspace_region_first_capacity_admission(
         region_scores, *, visible_regions, region_capacity,
         high_regret_threshold=0.05):
@@ -3636,6 +3775,7 @@ def _opspace_select_region_blocks(
     flat_h_unit = _forward_unit_direction(
         flat_h.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
     valid_f = valid_region_blocks.astype(jnp.float32)[..., None]
+    valid_counts_local = valid_region_blocks.astype(jnp.float32).sum(axis=2)
     block_count = jnp.maximum(valid_f.sum(axis=2), 1.0)
     block_center_raw = (
         op_key_region_blocks.astype(jnp.float32) * valid_f).sum(
@@ -3644,6 +3784,15 @@ def _opspace_select_region_blocks(
         _forward_unit_direction(block_center_raw)).astype(jnp.bfloat16)
     block_center_all = jax.lax.all_gather(
         block_center_local, 'model', axis=0, tiled=True)
+    valid_counts_all = jax.lax.all_gather(
+        valid_counts_local, 'model', axis=0, tiled=True).astype(jnp.float32)
+    region_center_weight = valid_counts_all[..., None]
+    region_center_raw = (
+        block_center_all.astype(jnp.float32) * region_center_weight).sum(
+            axis=1) / jnp.maximum(
+                region_center_weight.sum(axis=1), jnp.float32(1.0))
+    region_center_all = jax.lax.stop_gradient(
+        _forward_unit_direction(region_center_raw)).astype(jnp.bfloat16)
     scores_all = jnp.einsum(
         'td,rbd->trb', flat_h_unit, block_center_all).astype(jnp.float32)
     temperature = jnp.maximum(
@@ -3753,6 +3902,8 @@ def _opspace_select_region_blocks(
         'scores_all': scores_all,
         'scores_local': scores_local,
         'region_score': region_score,
+        'block_center_all': block_center_all,
+        'region_center_all': region_center_all,
         'admission': admission,
         'assigned_rank': selected_rank,
         'chosen_score': chosen_score,
@@ -4138,7 +4289,15 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         high_regret_threshold=0.05,
         visible_blocks_per_region=1, region_score_pooling='smoothmax',
         region_score_temperature=0.25, region_capacity_factor=1.25,
-        block_capacity_factor=None):
+        block_capacity_factor=None, training_tokens=0.0,
+        load_smoothing_enabled=True, load_smoothing_region_weight=3.0e-4,
+        load_smoothing_block_weight=0.0, load_smoothing_load_temperature=0.7,
+        load_smoothing_space_temperature=0.12, load_smoothing_alpha=1.25,
+        load_smoothing_warmup_tokens=2.0e8,
+        load_smoothing_peak_tokens=1.0e9,
+        load_smoothing_final_weight_frac=1.0,
+        completion_enabled=True, spill_capacity_factor=0.25,
+        fallback_on_spill_overflow=True, assert_all_processed=True):
     """RST region-owned dense backend with token-wise semantic block masks.
 
     Region-Block Operation Atlas
@@ -4147,14 +4306,13 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     projects to an operation coordinate z. Regions are hard visibility,
     communication, and RW execution boundaries. Blocks are token-wise semantic
     masks inside the selected region, not physical dispatch buckets. Region
-    admission uses all regions as candidates and applies
-    capacity-aware low-regret assignment, so hot regions are capped and excess
-    requests are rerouted to the nearest available regions by score loss.
-    After a request is admitted to a region, the whole region is evaluated as a
-    dense expert and token-specific hard semantic block masks decide which
-    operators contribute. The only continuous mixing/intensity occurs at the RW
-    operator gate inside each visible semantic block.
+    and block routes are token-local top-k semantic decisions. Fixed-capacity
+    buckets are only the fast execution schedule; overflow takes the exact
+    selected-route completion path and is never dropped or rerouted. The only
+    continuous mixing/intensity occurs at the RW operator gate inside each
+    visible semantic block.
     """
+    del assert_all_processed
     if int(blocks_per_region) <= 0:
         raise ValueError(
             "sparse_region_block requires blocks_per_region > 0, got "
@@ -4219,11 +4377,14 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         int(math.ceil(
             float(raw_region_capacity) / float(region_capacity_round_multiple))
             * region_capacity_round_multiple))
-    if int(num_regions) * int(region_capacity) < int(selected_region_requests):
-        raise ValueError(
-            "sparse_region_block region capacity invariant failed: "
-            f"num_regions={num_regions}, region_capacity={region_capacity}, "
-            f"selected_region_requests={selected_region_requests}.")
+    raw_spill_capacity = max(
+        0, int(math.ceil(
+            (float(selected_region_requests) / float(num_regions))
+            * float(spill_capacity_factor))))
+    spill_capacity = (
+        0 if raw_spill_capacity <= 0 else int(math.ceil(
+            float(raw_spill_capacity) / float(region_capacity_round_multiple))
+            * region_capacity_round_multiple))
     block_capacity = _opspace_selected_block_bucket_capacity(
         T,
         num_regions=num_regions,
@@ -4293,10 +4454,7 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         visible_regions=visible_regions,
         visible_blocks_per_region=_visible_blocks_per_region,
         region_score_temperature=_region_score_temperature,
-        capacity_policy={
-            'region_capacity': region_capacity,
-            'high_regret_threshold': high_regret_threshold,
-        })
+        capacity_policy=None)
     scores_all = selection['scores_all']
     scores_local = selection['scores_local']
     admission = selection['admission']
@@ -4309,6 +4467,53 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     unresolved = selection['unresolved']
     primary_block = selection['primary_block']
 
+    if bool(load_smoothing_enabled):
+        region_smoothing_weight = _opspace_load_smoothing_weight(
+            training_tokens, load_smoothing_region_weight,
+            load_smoothing_warmup_tokens, load_smoothing_peak_tokens,
+            load_smoothing_final_weight_frac)
+        region_smoothing_loss, region_smoothing_diag = (
+            _opspace_load_smoothing_loss(
+                selection['region_score'], selection['region_center_all'],
+                weight=region_smoothing_weight,
+                load_temperature=load_smoothing_load_temperature,
+                space_temperature=load_smoothing_space_temperature,
+                alpha=load_smoothing_alpha))
+        if float(load_smoothing_block_weight) > 0.0:
+            block_smoothing_weight = _opspace_load_smoothing_weight(
+                training_tokens, load_smoothing_block_weight,
+                load_smoothing_warmup_tokens, load_smoothing_peak_tokens,
+                load_smoothing_final_weight_frac)
+            block_smoothing_loss, block_smoothing_diag = (
+                _opspace_load_smoothing_loss(
+                    scores_all.reshape(
+                        int(T), int(num_regions) * int(blocks_per_region)),
+                    selection['block_center_all'].reshape(
+                        int(num_regions) * int(blocks_per_region),
+                        selection['block_center_all'].shape[-1]),
+                    weight=block_smoothing_weight,
+                    load_temperature=load_smoothing_load_temperature,
+                    space_temperature=load_smoothing_space_temperature,
+                    alpha=load_smoothing_alpha))
+        else:
+            block_smoothing_loss = jnp.float32(0.0)
+            block_smoothing_diag = jnp.zeros(
+                (OPSPACE_LOAD_SMOOTHING_DIAG_COUNT,), dtype=jnp.float32)
+        load_smoothing_aux_local = (
+            region_smoothing_loss + block_smoothing_loss)
+        load_smoothing_diag_local = (
+            region_smoothing_diag
+            .at[0].set(load_smoothing_aux_local)
+            .at[1].set(region_smoothing_diag[1] + block_smoothing_diag[1]))
+    else:
+        load_smoothing_aux_local = jnp.float32(0.0)
+        load_smoothing_diag_local = jnp.zeros(
+            (OPSPACE_LOAD_SMOOTHING_DIAG_COUNT,), dtype=jnp.float32)
+    load_smoothing_aux = jax.lax.pmean(
+        jax.lax.pmean(load_smoothing_aux_local, 'data'), 'model')
+    load_smoothing_diag = jax.lax.pmean(
+        jax.lax.pmean(load_smoothing_diag_local, 'data'), 'model')
+
     region_buckets = _opspace_build_region_buckets(
         selection['selected_regions_global'],
         selection['selected_regions_global'] >= 0,
@@ -4320,13 +4525,41 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     assignment_collision_count = region_buckets[
         'assignment_collision_count']
 
-    (flat_out, global_gate_mass, global_relu_gate_count_sum,
-     gate_denominator, compute_no_nan) = (
-        _opspace_execute_rst_region_dense_block_masked(
+    def execute_main_buckets(_):
+        return _opspace_execute_rst_region_dense_block_masked(
             flat_x, flat_h, key_blocks, read_blocks, write_blocks,
             valid_blocks, region_buckets['token_id_bucket'], bucket_valid,
             visible_blocks_per_region=_visible_blocks_per_region,
-            admission_den_power=admission_den_power))
+            admission_den_power=admission_den_power)
+
+    def execute_exact_selected_routes(_):
+        exact_region_buckets = _opspace_build_region_buckets(
+            selection['selected_regions_global'],
+            selection['selected_regions_global'] >= 0,
+            local_region_start=model_axis_index * int(local_regions),
+            local_regions=local_regions,
+            region_capacity=max(1, int(T)))
+        return _opspace_execute_rst_region_dense_block_masked(
+            flat_x, flat_h, key_blocks, read_blocks, write_blocks,
+            valid_blocks, exact_region_buckets['token_id_bucket'],
+            exact_region_buckets['bucket_valid'],
+            visible_blocks_per_region=_visible_blocks_per_region,
+            admission_den_power=admission_den_power)
+
+    fallback_active = (
+        jax.lax.psum(region_buckets['overflow_request_count'], 'model')
+        > jnp.float32(0.0))
+    if bool(completion_enabled) and bool(fallback_on_spill_overflow):
+        (flat_out, global_gate_mass, global_relu_gate_count_sum,
+         gate_denominator, compute_no_nan) = jax.lax.cond(
+            fallback_active,
+            execute_exact_selected_routes,
+            execute_main_buckets,
+            operand=None)
+    else:
+        fallback_active = jnp.asarray(False)
+        (flat_out, global_gate_mass, global_relu_gate_count_sum,
+         gate_denominator, compute_no_nan) = execute_main_buckets(None)
 
     def data_sum(v):
         return jax.lax.pmean(jax.lax.psum(v, 'data'), 'model')
@@ -4358,10 +4591,10 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     primary_accept_count_local = region_bucket_fill.sum()
     reroute_accept_count_local = jnp.float32(0.0)
     block_unresolved_count_local = unresolved.astype(jnp.float32).sum()
+    overflow_request_count_local = region_buckets['overflow_request_count']
     unprocessed_count_local = (
         block_unresolved_count_local
-        + assignment_collision_count
-        + region_buckets['overflow_request_count'])
+        + assignment_collision_count)
     bucket_fill_sum_local = region_bucket_fill.sum()
     bucket_fill_max_local = region_bucket_fill.max()
     block_fill_sum_local = block_load_total.sum()
@@ -4375,6 +4608,8 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     global_reroute_accept_count = jax.lax.psum(
         reroute_accept_count_local, 'model')
     global_unprocessed_count = jax.lax.psum(unprocessed_count_local, 'model')
+    global_overflow_count = jax.lax.psum(
+        overflow_request_count_local, 'model')
     global_block_unresolved_count = jax.lax.psum(
         block_unresolved_count_local, 'model')
     global_assignment_collision_count = jax.lax.psum(
@@ -4395,7 +4630,14 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         admission['high_regret_spill_count'])
     block_unresolved_count = data_sum(global_block_unresolved_count)
     block_reroute_count = data_sum(global_reroute_accept_count)
-    processed_request_count = data_sum(global_processed_count)
+    main_processed_request_count = data_sum(global_processed_count)
+    overflow_request_count = data_sum(global_overflow_count)
+    completion_processed_request_count = (
+        overflow_request_count
+        if bool(completion_enabled) and bool(fallback_on_spill_overflow)
+        else jnp.float32(0.0))
+    processed_request_count = (
+        main_processed_request_count + completion_processed_request_count)
     valid_operator_slots_mean = (
         data_sum(global_valid_operator_slots_sum) / token_count)
     relu_gate_count_mean = (
@@ -4413,9 +4655,17 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         global_assignment_collision_count)
     unprocessed_count_global = data_sum(global_unprocessed_count)
     semantic_drop_count = (
-        region_unresolved_count + unprocessed_count_global)
-    overflow_frac = semantic_drop_count / jnp.maximum(
+        jnp.maximum(selected_request_count - processed_request_count, 0.0)
+        + region_unresolved_count + unprocessed_count_global)
+    overflow_frac = overflow_request_count / jnp.maximum(
         selected_request_count, 1.0)
+    spill_frac = overflow_frac
+    spill_overflow_count = jnp.maximum(
+        overflow_request_count
+        - jnp.float32(num_regions * int(spill_capacity)),
+        jnp.float32(0.0))
+    fallback_frac = jax.lax.pmean(
+        jax.lax.pmean(fallback_active.astype(jnp.float32), 'data'), 'model')
     semantic_drop_frac = semantic_drop_count / jnp.maximum(
         selected_request_count, 1.0)
     bucket_count_global = jnp.float32(num_regions)
@@ -4435,6 +4685,21 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     region_load_mean = jnp.maximum(
         accepted_region_request_count / jnp.maximum(jnp.float32(num_regions), 1.0),
         jnp.float32(1.0e-6))
+    attempted_fill_mean = region_load_mean
+    attempted_fill_p50 = metric_pmax(
+        metric_pmax(_opspace_percentile(admission['region_load'], 50.0),
+                    'model'), 'data')
+    attempted_fill_p95 = metric_pmax(
+        metric_pmax(_opspace_percentile(admission['region_load'], 95.0),
+                    'model'), 'data')
+    attempted_fill_p99 = metric_pmax(
+        metric_pmax(_opspace_percentile(admission['region_load'], 99.0),
+                    'model'), 'data')
+    attempted_fill_max = region_load_max
+    required_capacity_no_overflow = attempted_fill_max
+    capacity_shortfall = jnp.maximum(
+        required_capacity_no_overflow - jnp.float32(region_capacity),
+        jnp.float32(0.0))
     region_load_p50 = region_load_mean
     region_load_p95 = region_load_max
     region_load_p99 = region_load_max
@@ -4631,7 +4896,7 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         high_regret_spill_frac,
         semantic_drop_count,
         assignment_collision_count_global,
-        jnp.float32(0.0),
+        fallback_frac,
         semantic_drop_frac,
         bucket_fill_p50,
         bucket_fill_p95,
@@ -4706,10 +4971,53 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         processed_request_count,
         all_requests_processed,
         no_nan,
+        main_processed_request_count,
+        overflow_request_count,
+        completion_processed_request_count,
+        spill_frac,
+        spill_overflow_count,
+        fallback_frac,
+        attempted_fill_mean,
+        attempted_fill_p50,
+        attempted_fill_p95,
+        attempted_fill_p99,
+        attempted_fill_max,
+        required_capacity_no_overflow,
+        capacity_shortfall,
+        load_smoothing_diag[0],
+        load_smoothing_diag[1],
+        load_smoothing_diag[2],
+        load_smoothing_diag[3],
+        load_smoothing_diag[4],
+        load_smoothing_diag[5],
+        load_smoothing_diag[6],
+        load_smoothing_diag[7],
+    ), dtype=jnp.float32)
+    completion_diag = jnp.asarray((
+        main_processed_request_count,
+        overflow_request_count,
+        completion_processed_request_count,
+        spill_frac,
+        spill_overflow_count,
+        fallback_frac,
+        selected_request_count,
+        processed_request_count,
+        all_requests_processed,
+        semantic_drop_frac,
+        reroute_frac,
+        attempted_fill_mean,
+        attempted_fill_p50,
+        attempted_fill_p95,
+        attempted_fill_p99,
+        attempted_fill_max,
+        required_capacity_no_overflow,
+        capacity_shortfall,
     ), dtype=jnp.float32)
     aux = {
-        'aux_loss': jnp.float32(0.0),
+        'aux_loss': load_smoothing_aux,
         'final_diag': final_diag,
+        'load_smoothing_diag': load_smoothing_diag,
+        'completion_diag': completion_diag,
     }
     del primary_block
     return flat_out.astype(jnp.float32), global_gate_mass, diag, aux
@@ -4733,7 +5041,20 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
         bucket_capacity_factor=1.5,
         region_capacity_factor=1.25,
         block_capacity_factor=1.25,
-        high_regret_threshold=0.05):
+        high_regret_threshold=0.05,
+        load_smoothing_enabled=True,
+        load_smoothing_region_weight=3.0e-4,
+        load_smoothing_block_weight=0.0,
+        load_smoothing_load_temperature=0.7,
+        load_smoothing_space_temperature=0.12,
+        load_smoothing_alpha=1.25,
+        load_smoothing_warmup_tokens=2.0e8,
+        load_smoothing_peak_tokens=1.0e9,
+        load_smoothing_final_weight_frac=1.0,
+        completion_enabled=True,
+        spill_capacity_factor=0.25,
+        fallback_on_spill_overflow=True,
+        assert_all_processed=True):
     """Create the RST region-dense semantic-block atlas executor."""
     del max_chunk_size, dead_exposure_target, padded_ops, token_chunk_size
     del soft_gate_effective_active_eps, admission_den_grad_scale
@@ -4758,6 +5079,26 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
     _high_regret_threshold = float(high_regret_threshold)
     _region_score_pooling = str(region_score_pooling).lower()
     _region_score_temperature = float(region_score_temperature)
+    _load_smoothing_enabled = bool(load_smoothing_enabled)
+    _load_smoothing_region_weight = float(load_smoothing_region_weight)
+    _load_smoothing_block_weight = float(load_smoothing_block_weight)
+    _load_smoothing_load_temperature = float(
+        load_smoothing_load_temperature)
+    _load_smoothing_space_temperature = float(
+        load_smoothing_space_temperature)
+    _load_smoothing_alpha = float(load_smoothing_alpha)
+    _load_smoothing_warmup_tokens = float(load_smoothing_warmup_tokens)
+    _load_smoothing_peak_tokens = float(load_smoothing_peak_tokens)
+    _load_smoothing_final_weight_frac = float(
+        load_smoothing_final_weight_frac)
+    _completion_enabled = bool(completion_enabled)
+    _spill_capacity_factor = float(spill_capacity_factor)
+    _fallback_on_spill_overflow = bool(fallback_on_spill_overflow)
+    _assert_all_processed = bool(assert_all_processed)
+    if _spill_capacity_factor < 0.0:
+        raise ValueError(
+            "operation-space completion spill_capacity_factor must be >= 0, "
+            f"got {spill_capacity_factor}.")
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),
@@ -4768,7 +5109,9 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
                        P('model', None),
                        P(), P(), P(), P(), P(), P()),
              out_specs=(P('data', None, None), P(),
-                        {'aux_loss': P(), 'final_diag': P()}),
+                        {'aux_loss': P(), 'final_diag': P(),
+                         'load_smoothing_diag': P(),
+                         'completion_diag': P()}),
              check_rep=False)
     def fused_gate_srw_tau_free_relu_region_block_sparse(
             x, h, op_key_local, raw_tau, read_local, write_local,
@@ -4777,7 +5120,7 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
             execution_prune_eps, training_tokens):
         del raw_tau, soft_gate_temperature, soft_gate_t_final
         del soft_gate_boundary_power, soft_gate_boundary_power_final
-        del execution_prune_eps, training_tokens
+        del execution_prune_eps
         B, S, D = x.shape
         flat_out, _flat_gate_mass, diag, aux = (
             _opspace_tau_free_relu_region_block_sparse_core(
@@ -4799,7 +5142,25 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
                 region_score_pooling=_region_score_pooling,
                 region_score_temperature=_region_score_temperature,
                 region_capacity_factor=_region_capacity_factor,
-                block_capacity_factor=_block_capacity_factor))
+                block_capacity_factor=_block_capacity_factor,
+                training_tokens=training_tokens,
+                load_smoothing_enabled=_load_smoothing_enabled,
+                load_smoothing_region_weight=_load_smoothing_region_weight,
+                load_smoothing_block_weight=_load_smoothing_block_weight,
+                load_smoothing_load_temperature=(
+                    _load_smoothing_load_temperature),
+                load_smoothing_space_temperature=(
+                    _load_smoothing_space_temperature),
+                load_smoothing_alpha=_load_smoothing_alpha,
+                load_smoothing_warmup_tokens=(
+                    _load_smoothing_warmup_tokens),
+                load_smoothing_peak_tokens=_load_smoothing_peak_tokens,
+                load_smoothing_final_weight_frac=(
+                    _load_smoothing_final_weight_frac),
+                completion_enabled=_completion_enabled,
+                spill_capacity_factor=_spill_capacity_factor,
+                fallback_on_spill_overflow=_fallback_on_spill_overflow,
+                assert_all_processed=_assert_all_processed))
         return flat_out.reshape(B, S, D), diag, aux
 
     fused_gate_srw_tau_free_relu_region_block_sparse._v4168_accepts_training_tokens = True
@@ -5934,7 +6295,7 @@ def operation_space_static_metrics(model_config, config=None,
         'opspace/mode_tau_free_relu': 1.0,
         'opspace/owner_model_axis': 1.0,
         'opspace/no_selected_request_drop': 1.0,
-        'opspace/bucket_overflow_semantics': 0.0,
+        'opspace/bucket_overflow_semantics': 1.0,
     }
     defaults = {
         'qk': ('n_qk', 'dense'),
@@ -6009,6 +6370,20 @@ def operation_space_static_metrics(model_config, config=None,
                 pcfg.get('bucket_capacity_factor', block_capacity_factor))
             out[f'opspace/{label}/high_regret_threshold'] = float(
                 pcfg.get('high_regret_threshold', 0.05))
+            out[f'opspace/{label}/load_smoothing_enabled'] = float(
+                pcfg.get('load_smoothing_enabled', True))
+            out[f'opspace/{label}/load_smoothing_rst_region_weight'] = float(
+                pcfg.get('load_smoothing_rst_region_weight', 3.0e-4))
+            out[f'opspace/{label}/load_smoothing_rst_block_weight'] = float(
+                pcfg.get('load_smoothing_rst_block_weight', 0.0))
+            out[f'opspace/{label}/completion_enabled'] = float(
+                pcfg.get('completion_enabled', True))
+            out[f'opspace/{label}/completion_spill_capacity_factor'] = float(
+                pcfg.get('completion_spill_capacity_factor', 0.25))
+            out[
+                f'opspace/{label}/completion_fallback_on_spill_overflow'
+            ] = float(pcfg.get(
+                'completion_fallback_on_spill_overflow', True))
     return out
 
 
@@ -6454,6 +6829,27 @@ def _opspace_final_runtime_metric_dict(prefix, aux):
             'processed_requests',
             'all_processed',
             'no_nan',
+            'main_processed_requests',
+            'overflow_requests',
+            'completion_processed_requests',
+            'spill_frac',
+            'spill_overflow_count',
+            'fallback_frac',
+            'attempted_fill_mean',
+            'attempted_fill_p50',
+            'attempted_fill_p95',
+            'attempted_fill_p99',
+            'attempted_fill_max',
+            'required_capacity_no_overflow',
+            'capacity_shortfall',
+            'load_smoothing_loss',
+            'load_smoothing_raw',
+            'load_max',
+            'load_mean',
+            'load_max_over_mean',
+            'smooth_load_max',
+            'spike_over_mean',
+            'spike_frac',
             'region_load_p99_over_mean',
             'block_load_p99_over_mean',
             'block_compactness_mean',
@@ -6462,6 +6858,14 @@ def _opspace_final_runtime_metric_dict(prefix, aux):
         final_key = f'{prefix}/final/{name}'
         if final_key in out:
             out[f'{prefix}/{name}'] = out[final_key]
+    if 'load_smoothing_diag' in aux:
+        load_diag = aux['load_smoothing_diag']
+        for i, name in enumerate(OPSPACE_LOAD_SMOOTHING_DIAG_NAMES):
+            out[f'{prefix}/{name}'] = load_diag[i]
+    if 'completion_diag' in aux:
+        completion_diag = aux['completion_diag']
+        for i, name in enumerate(OPSPACE_COMPLETION_DIAG_NAMES):
+            out[f'{prefix}/{name}'] = completion_diag[i]
     return out
 
 
@@ -8224,6 +8628,19 @@ def make_sharded_srw_minimal(
         opspace_region_capacity_factor=1.25,
         opspace_block_capacity_factor=1.25,
         opspace_high_regret_threshold=0.05,
+        opspace_load_smoothing_enabled=True,
+        opspace_load_smoothing_rst_region_weight=3.0e-4,
+        opspace_load_smoothing_rst_block_weight=0.0,
+        opspace_load_smoothing_load_temperature=0.7,
+        opspace_load_smoothing_space_temperature=0.12,
+        opspace_load_smoothing_alpha=1.25,
+        opspace_load_smoothing_warmup_tokens=2.0e8,
+        opspace_load_smoothing_peak_tokens=1.0e9,
+        opspace_load_smoothing_final_weight_frac=1.0,
+        opspace_completion_enabled=True,
+        opspace_completion_spill_capacity_factor=0.25,
+        opspace_completion_fallback_on_spill_overflow=True,
+        opspace_completion_assert_all_processed=True,
         opspace_token_chunk_size=256):
     execution_backend = str(
         operation_space_execution_backend
@@ -8263,7 +8680,29 @@ def make_sharded_srw_minimal(
             bucket_capacity_factor=opspace_bucket_capacity_factor,
             region_capacity_factor=opspace_region_capacity_factor,
             block_capacity_factor=opspace_block_capacity_factor,
-            high_regret_threshold=opspace_high_regret_threshold)
+            high_regret_threshold=opspace_high_regret_threshold,
+            load_smoothing_enabled=opspace_load_smoothing_enabled,
+            load_smoothing_region_weight=(
+                opspace_load_smoothing_rst_region_weight),
+            load_smoothing_block_weight=(
+                opspace_load_smoothing_rst_block_weight),
+            load_smoothing_load_temperature=(
+                opspace_load_smoothing_load_temperature),
+            load_smoothing_space_temperature=(
+                opspace_load_smoothing_space_temperature),
+            load_smoothing_alpha=opspace_load_smoothing_alpha,
+            load_smoothing_warmup_tokens=(
+                opspace_load_smoothing_warmup_tokens),
+            load_smoothing_peak_tokens=opspace_load_smoothing_peak_tokens,
+            load_smoothing_final_weight_frac=(
+                opspace_load_smoothing_final_weight_frac),
+            completion_enabled=opspace_completion_enabled,
+            spill_capacity_factor=(
+                opspace_completion_spill_capacity_factor),
+            fallback_on_spill_overflow=(
+                opspace_completion_fallback_on_spill_overflow),
+            assert_all_processed=(
+                opspace_completion_assert_all_processed))
     if execution_backend:
         raise ValueError(
             "v4168 operation_space supports execution_backend='dense' for QK/V "
@@ -9447,7 +9886,8 @@ class DAWN_SRW_V4168(nn.Module):
                  benchmark_runtime_metrics=False,
                  training_tokens=0.0,
                  ce_token_chunk_size=32768,
-                 compute_accuracy=True):
+                 compute_accuracy=True,
+                 return_hidden_for_vocab_check=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -9780,7 +10220,7 @@ class DAWN_SRW_V4168(nn.Module):
                     'opspace/attn_v', attn_v_opspace_aux))
                 opspace_metrics.update(_opspace_final_runtime_metric_dict(
                     'opspace/rst', rst_opspace_aux))
-                return {
+                result = {
                     'loss': loss,
                     'correct': correct,
                     'valid_count': valid_count,
@@ -9794,6 +10234,11 @@ class DAWN_SRW_V4168(nn.Module):
                     **sector_metrics,
                     **opspace_metrics,
                 }
+                if return_hidden_for_vocab_check:
+                    result['shift_x'] = shift_x
+                    result['shift_labels'] = shift_labels
+                    result['vocab_check_valid_mask'] = valid_mask
+                return result
 
             def scan_body(carry, xs):
                 x = carry
@@ -10633,6 +11078,10 @@ class DAWN_SRW_V4168(nn.Module):
             result['logit_std'] = logit_std
             result['per_token_ce'] = per_token_ce
             result['valid_mask'] = valid_mask
+            if return_hidden_for_vocab_check:
+                result['shift_x'] = shift_x
+                result['shift_labels'] = shift_labels
+                result['vocab_check_valid_mask'] = valid_mask
         else:
             if vp_embed is not None:
                 raise NotImplementedError(

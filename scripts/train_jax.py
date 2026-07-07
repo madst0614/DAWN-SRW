@@ -1516,6 +1516,82 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
     pools = opspace.get('pools', {})
     if not isinstance(pools, dict):
         pools = {}
+    load_smoothing = training_cfg.get('operation_space_load_smoothing', {})
+    if load_smoothing is None:
+        load_smoothing = {}
+    if not isinstance(load_smoothing, dict):
+        raise ValueError(
+            "training.operation_space_load_smoothing must be a mapping.")
+    completion = training_cfg.get('operation_space_completion', {})
+    if completion is None:
+        completion = {}
+    if not isinstance(completion, dict):
+        raise ValueError(
+            "training.operation_space_completion must be a mapping.")
+    load_smoothing_enabled = _cfg_bool(
+        load_smoothing.get('enabled', True),
+        name='training.operation_space_load_smoothing.enabled')
+    load_smoothing_region_weight = float(
+        load_smoothing.get('rst_region_weight', 3.0e-4))
+    load_smoothing_block_weight = float(
+        load_smoothing.get('rst_block_weight', 0.0))
+    load_smoothing_load_temperature = float(
+        load_smoothing.get('load_temperature', 0.7))
+    load_smoothing_space_temperature = float(
+        load_smoothing.get('space_temperature', 0.12))
+    load_smoothing_alpha = float(load_smoothing.get('alpha', 1.25))
+    load_smoothing_warmup_tokens = float(
+        load_smoothing.get('warmup_tokens', 2.0e8))
+    load_smoothing_peak_tokens = float(
+        load_smoothing.get('peak_tokens', 1.0e9))
+    load_smoothing_final_weight_frac = float(
+        load_smoothing.get('final_weight_frac', 1.0))
+    if load_smoothing_region_weight < 0.0:
+        raise ValueError(
+            "training.operation_space_load_smoothing.rst_region_weight "
+            "must be >= 0.")
+    if load_smoothing_block_weight < 0.0:
+        raise ValueError(
+            "training.operation_space_load_smoothing.rst_block_weight "
+            "must be >= 0.")
+    if load_smoothing_load_temperature <= 0.0:
+        raise ValueError(
+            "training.operation_space_load_smoothing.load_temperature "
+            "must be > 0.")
+    if load_smoothing_space_temperature <= 0.0:
+        raise ValueError(
+            "training.operation_space_load_smoothing.space_temperature "
+            "must be > 0.")
+    if load_smoothing_alpha <= 0.0:
+        raise ValueError(
+            "training.operation_space_load_smoothing.alpha must be > 0.")
+    if load_smoothing_warmup_tokens < 0.0:
+        raise ValueError(
+            "training.operation_space_load_smoothing.warmup_tokens "
+            "must be >= 0.")
+    if load_smoothing_peak_tokens < load_smoothing_warmup_tokens:
+        raise ValueError(
+            "training.operation_space_load_smoothing.peak_tokens must be "
+            ">= warmup_tokens.")
+    if load_smoothing_final_weight_frac < 0.0:
+        raise ValueError(
+            "training.operation_space_load_smoothing.final_weight_frac "
+            "must be >= 0.")
+    completion_enabled = _cfg_bool(
+        completion.get('enabled', True),
+        name='training.operation_space_completion.enabled')
+    completion_spill_capacity_factor = float(
+        completion.get('spill_capacity_factor', 0.25))
+    completion_fallback_on_spill_overflow = _cfg_bool(
+        completion.get('fallback_on_spill_overflow', True),
+        name='training.operation_space_completion.fallback_on_spill_overflow')
+    completion_assert_all_processed = _cfg_bool(
+        completion.get('assert_all_processed', True),
+        name='training.operation_space_completion.assert_all_processed')
+    if completion_spill_capacity_factor < 0.0:
+        raise ValueError(
+            "training.operation_space_completion.spill_capacity_factor "
+            "must be >= 0.")
     device_count = _v4168_operation_space_device_count(training_cfg)
     defaults = {
         'qk': {'n_key': 'n_qk', 'execution_backend': 'dense'},
@@ -1652,6 +1728,30 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             'block_capacity_factor': block_capacity_factor,
             'bucket_capacity_factor': bucket_capacity_factor,
             'high_regret_threshold': high_regret_threshold,
+            'load_smoothing_enabled': (
+                load_smoothing_enabled if label == 'rst' else False),
+            'load_smoothing_rst_region_weight': (
+                load_smoothing_region_weight if label == 'rst' else 0.0),
+            'load_smoothing_rst_block_weight': (
+                load_smoothing_block_weight if label == 'rst' else 0.0),
+            'load_smoothing_load_temperature': (
+                load_smoothing_load_temperature),
+            'load_smoothing_space_temperature': (
+                load_smoothing_space_temperature),
+            'load_smoothing_alpha': load_smoothing_alpha,
+            'load_smoothing_warmup_tokens': (
+                load_smoothing_warmup_tokens),
+            'load_smoothing_peak_tokens': load_smoothing_peak_tokens,
+            'load_smoothing_final_weight_frac': (
+                load_smoothing_final_weight_frac),
+            'completion_enabled': (
+                completion_enabled if label == 'rst' else False),
+            'completion_spill_capacity_factor': (
+                completion_spill_capacity_factor),
+            'completion_fallback_on_spill_overflow': (
+                completion_fallback_on_spill_overflow),
+            'completion_assert_all_processed': (
+                completion_assert_all_processed),
             'global_operator_capacity': total_capacity,
             'local_operator_capacity': total_capacity // device_count,
             'operator_capacity': total_capacity,
@@ -5148,7 +5248,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 dead_penalty_weighted = jnp.float32(0.0)
                 orth_loss = jnp.float32(0.0)
                 div_loss = jnp.float32(0.0)
-                total_loss = ce_loss + inactive_aux_loss_weighted
+                opspace_aux_active = (
+                    str(_model_version) == V4168_MODEL_VERSION
+                    and _use_minimal_train_path
+                )
+                total_loss = (
+                    ce_loss
+                    + jnp.where(opspace_aux_active, aux_loss, jnp.float32(0.0))
+                    + inactive_aux_loss_weighted
+                )
             else:
                 orth_loss = jnp.float32(0.0)
                 div_loss = compute_spatial_diversity_loss(params)
@@ -6064,8 +6172,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             dead_penalty_weighted_metric = jnp.float32(0.0)
             dead_penalty_weighted_unclipped_metric = jnp.float32(0.0)
         elif _is_soft_direct_tau:
-            aux_loss_weighted_metric = jnp.float32(0.0)
-            load_balance_loss_weighted_metric = jnp.float32(0.0)
+            opspace_aux_active = (
+                str(_model_version) == V4168_MODEL_VERSION
+                and _use_minimal_train_path
+            )
+            aux_loss_weighted_metric = jnp.where(
+                opspace_aux_active, aux_loss, jnp.float32(0.0))
+            load_balance_loss_weighted_metric = aux_loss_weighted_metric
             tau_reg_weighted_metric = jnp.float32(0.0)
             orth_loss_weighted_metric = jnp.float32(0.0)
             diversity_loss_weighted_metric = jnp.float32(0.0)
@@ -10257,6 +10370,8 @@ def _opspace_warning_lines(rec):
     checks = (
         ('semantic_drop_frac', 'rst semantic_drop_frac > 0',
          lambda value: value > 0.0),
+        ('reroute_frac', 'rst reroute_frac != 0',
+         lambda value: value != 0.0),
         ('assignment_collision_count', 'rst assignment_collision_count > 0',
          lambda value: value > 0.0),
         ('all_processed', 'rst all_processed != 1',
@@ -14233,6 +14348,33 @@ def main():
                     'region_score_pooling', 'smoothmax')).lower(),
                 'opspace_region_score_temperature': float(layout.get(
                     'region_score_temperature', 0.25)),
+                'opspace_load_smoothing_enabled': bool(layout.get(
+                    'load_smoothing_enabled', pool == 'rst')),
+                'opspace_load_smoothing_rst_region_weight': float(
+                    layout.get('load_smoothing_rst_region_weight', 3.0e-4)),
+                'opspace_load_smoothing_rst_block_weight': float(
+                    layout.get('load_smoothing_rst_block_weight', 0.0)),
+                'opspace_load_smoothing_load_temperature': float(
+                    layout.get('load_smoothing_load_temperature', 0.7)),
+                'opspace_load_smoothing_space_temperature': float(
+                    layout.get('load_smoothing_space_temperature', 0.12)),
+                'opspace_load_smoothing_alpha': float(
+                    layout.get('load_smoothing_alpha', 1.25)),
+                'opspace_load_smoothing_warmup_tokens': float(
+                    layout.get('load_smoothing_warmup_tokens', 2.0e8)),
+                'opspace_load_smoothing_peak_tokens': float(
+                    layout.get('load_smoothing_peak_tokens', 1.0e9)),
+                'opspace_load_smoothing_final_weight_frac': float(
+                    layout.get('load_smoothing_final_weight_frac', 1.0)),
+                'opspace_completion_enabled': bool(layout.get(
+                    'completion_enabled', pool == 'rst')),
+                'opspace_completion_spill_capacity_factor': float(
+                    layout.get('completion_spill_capacity_factor', 0.25)),
+                'opspace_completion_fallback_on_spill_overflow': bool(
+                    layout.get(
+                        'completion_fallback_on_spill_overflow', True)),
+                'opspace_completion_assert_all_processed': bool(layout.get(
+                    'completion_assert_all_processed', True)),
             }
 
         def _srw_pool_kwargs(pool):
@@ -15741,6 +15883,12 @@ def main():
                             jnp.float32(0.0))),
                     'all_processed': metrics.get(
                         'opspace/rst/all_processed', jnp.float32(1.0)),
+                    'selected_requests': metrics.get(
+                        'opspace/rst/selected_requests', jnp.float32(0.0)),
+                    'processed_requests': metrics.get(
+                        'opspace/rst/processed_requests', jnp.float32(0.0)),
+                    'reroute_frac': metrics.get(
+                        'opspace/rst/reroute_frac', jnp.float32(0.0)),
                     'no_nan': metrics.get(
                         'opspace/rst/no_nan',
                         metrics.get(
@@ -15762,8 +15910,16 @@ def main():
                 _rst_collision_count = float(
                     _rst_final_guard['assignment_collision_count'])
                 _rst_no_nan = float(_rst_final_guard['no_nan'])
+                _rst_selected_requests = float(
+                    _rst_final_guard['selected_requests'])
+                _rst_processed_requests = float(
+                    _rst_final_guard['processed_requests'])
+                _rst_reroute_frac = float(_rst_final_guard['reroute_frac'])
                 if (_rst_semantic_drop > 0.0
                         or _rst_all_processed < 1.0
+                        or (_rst_processed_requests
+                            < _rst_selected_requests - 0.5)
+                        or _rst_reroute_frac != 0.0
                         or _rst_collision_count > 0.0
                         or _rst_no_nan < 1.0):
                     raise RuntimeError(
@@ -15773,6 +15929,12 @@ def main():
                         f"{_rst_semantic_drop:.9g}, "
                         f"opspace/rst/all_processed="
                         f"{_rst_all_processed:.9g}, "
+                        f"opspace/rst/selected_requests="
+                        f"{_rst_selected_requests:.9g}, "
+                        f"opspace/rst/processed_requests="
+                        f"{_rst_processed_requests:.9g}, "
+                        f"opspace/rst/reroute_frac="
+                        f"{_rst_reroute_frac:.9g}, "
                         f"opspace/rst/no_nan={_rst_no_nan:.9g}, "
                         "opspace/rst/final/"
                         "unresolved_count="
