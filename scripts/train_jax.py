@@ -1097,6 +1097,7 @@ def _maybe_materialize_vocab_parallel_config(cfg):
     if mesh_model <= 1:
         return
     if model_version not in (
+            V4166_MODEL_VERSION,
             V4167_MODEL_VERSION,
             V4168_MODEL_VERSION,
             BASELINE_MODEL_VERSION,
@@ -1110,13 +1111,19 @@ def _maybe_materialize_vocab_parallel_config(cfg):
         raise ValueError(
             f"vocab_size_padded={padded} must be divisible by "
             f"mesh_model={mesh_model}")
+    if padded < logical_vocab_size:
+        raise ValueError(
+            f"vocab_size_padded={padded} must be >= "
+            f"logical_vocab_size={logical_vocab_size}")
     cfg["model"]["logical_vocab_size"] = logical_vocab_size
     cfg["model"]["vocab_size_padded"] = padded
-    if model_version == V4168_MODEL_VERSION:
+    if model_version in (V4166_MODEL_VERSION, V4168_MODEL_VERSION):
         cfg["model"]["vocab_size"] = padded
         if jax.process_index() == 0:
+            _model_label = (
+                "V4166" if model_version == V4166_MODEL_VERSION else "V4168")
             print(
-                "vocab_parallel: enabled model=V4168 "
+                f"vocab_parallel: enabled model={_model_label} "
                 f"logical_vocab={logical_vocab_size} "
                 f"padded_vocab={padded} mesh_model={mesh_model}",
                 flush=True)
@@ -1986,6 +1993,11 @@ def _dawn_srw_kwargs(cfg):
                 kw['tau_init_attn_qk'] = 0.0
                 kw['tau_init_attn_v'] = 0.0
                 kw['tau_init_rst'] = 0.0
+    if str(version) == V4166_MODEL_VERSION:
+        kw.update({
+            'logical_vocab_size': m.get('logical_vocab_size', None),
+            'vocab_size_padded': m.get('vocab_size_padded', None),
+        })
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
             'fixed_tau': m.get('fixed_tau', True),
@@ -7414,6 +7426,9 @@ def get_param_shardings(params, mesh, model_version=None,
         leaf = str(path[-1].key if hasattr(path[-1], 'key') else path[-1])
         if (path_str == 'token_emb/embedding'
                 and (version == V4167_MODEL_VERSION
+                     or (version == V4166_MODEL_VERSION
+                         and mesh_model > 1
+                         and has_padded_vocab)
                      or (version == V4168_MODEL_VERSION
                          and mesh_model > 1
                          and has_padded_vocab)
@@ -7510,6 +7525,16 @@ def _print_param_sharding_summary(param_shardings, model_version):
                     'block_0/attn/expand_O/kernel'):
                 interesting.append((ps, sharding))
             elif ps.startswith('neuron_pool/') and len(interesting) < 16:
+                interesting.append((ps, sharding))
+        elif version == V4166_MODEL_VERSION:
+            if ps in (
+                    'token_emb/embedding',
+                    'neuron_pool/attn_v_read',
+                    'neuron_pool/attn_v_write',
+                    'neuron_pool/rst_read',
+                    'neuron_pool/rst_write',
+                    'neuron_pool/attn_qk_read',
+                    'neuron_pool/attn_qk_write'):
                 interesting.append((ps, sharding))
         elif version == V4168_MODEL_VERSION:
             if ps in (
@@ -14548,56 +14573,63 @@ def main():
             if (str(model_version_cfg) == V4167_MODEL_VERSION
                     and isinstance(_sharded_fns_analysis, dict)):
                 _sharded_fns_analysis.update(_v4167_extra_fns)
-        _v4168_vocab_parallel_enabled = False
-        if (str(model_version_cfg) == V4168_MODEL_VERSION
+        _vocab_parallel_model = str(model_version_cfg) in (
+            V4166_MODEL_VERSION,
+            V4168_MODEL_VERSION,
+        )
+        _vocab_parallel_enabled = False
+        if (_vocab_parallel_model
                 and mesh_model > 1
                 and cfg['model'].get('logical_vocab_size') is not None
                 and cfg['model'].get('vocab_size_padded') is not None):
             if not isinstance(_sharded_fns, dict):
                 raise RuntimeError(
-                    "v4168 vocab-parallel CE requires dict-style "
+                    "vocab-parallel CE requires dict-style "
                     "sharded_fns.")
             from models.vocab_parallel import (
                 make_vocab_parallel_ce,
                 make_vocab_parallel_embedding,
             )
-            _v4168_logical_vocab_size = int(
+            _vp_logical_vocab_size = int(
                 cfg['model']['logical_vocab_size'])
-            _v4168_vocab_size_padded = int(
+            _vp_vocab_size_padded = int(
                 cfg['model']['vocab_size_padded'])
-            if _v4168_vocab_size_padded % int(mesh_model) != 0:
+            if _vp_vocab_size_padded % int(mesh_model) != 0:
                 raise ValueError(
                     "model.vocab_size_padded must be divisible by "
                     f"mesh_model: vocab_size_padded="
-                    f"{_v4168_vocab_size_padded} mesh_model={mesh_model}")
-            _v4168_vocab_embed = make_vocab_parallel_embedding(
-                mesh, _v4168_logical_vocab_size, _v4168_vocab_size_padded)
-            _v4168_vocab_ce_train = make_vocab_parallel_ce(
+                    f"{_vp_vocab_size_padded} mesh_model={mesh_model}")
+            _vp_vocab_embed = make_vocab_parallel_embedding(
+                mesh, _vp_logical_vocab_size, _vp_vocab_size_padded)
+            _vp_vocab_ce_train = make_vocab_parallel_ce(
                 mesh,
-                logical_vocab_size=_v4168_logical_vocab_size,
-                vocab_size_padded=_v4168_vocab_size_padded,
+                logical_vocab_size=_vp_logical_vocab_size,
+                vocab_size_padded=_vp_vocab_size_padded,
                 token_chunk_size=ce_token_chunk_size,
                 compute_accuracy=train_compute_accuracy)
-            _v4168_vocab_ce_eval = make_vocab_parallel_ce(
+            _vp_vocab_ce_eval = make_vocab_parallel_ce(
                 mesh,
-                logical_vocab_size=_v4168_logical_vocab_size,
-                vocab_size_padded=_v4168_vocab_size_padded,
+                logical_vocab_size=_vp_logical_vocab_size,
+                vocab_size_padded=_vp_vocab_size_padded,
                 token_chunk_size=ce_token_chunk_size,
                 compute_accuracy=True)
-            _sharded_fns['vocab_parallel_embedding'] = _v4168_vocab_embed
-            _sharded_fns['vocab_ce'] = _v4168_vocab_ce_train
+            _sharded_fns['vocab_parallel_embedding'] = _vp_vocab_embed
+            _sharded_fns['vocab_ce'] = _vp_vocab_ce_train
             _sharded_fns_eval = dict(_sharded_fns)
-            _sharded_fns_eval['vocab_ce'] = _v4168_vocab_ce_eval
+            _sharded_fns_eval['vocab_ce'] = _vp_vocab_ce_eval
             if isinstance(_sharded_fns_analysis, dict):
                 _sharded_fns_analysis = dict(_sharded_fns_analysis)
                 _sharded_fns_analysis['vocab_parallel_embedding'] = (
-                    _v4168_vocab_embed)
-                _sharded_fns_analysis['vocab_ce'] = _v4168_vocab_ce_eval
-            _v4168_vocab_parallel_enabled = True
+                    _vp_vocab_embed)
+                _sharded_fns_analysis['vocab_ce'] = _vp_vocab_ce_eval
+            _vocab_parallel_enabled = True
         if is_host0:
             _extra_msg = (
                 "; v4167 TP extras=router_dense,attention_o,vocab_parallel"
                 if str(model_version_cfg) == V4167_MODEL_VERSION else "")
+            if (str(model_version_cfg) == V4166_MODEL_VERSION
+                    and _vocab_parallel_enabled):
+                _extra_msg += "; v4166 TP extras=vocab_parallel_ce"
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 _v4168_exec_mode = (
                     "operation_space_tau_free_relu"
@@ -14620,7 +14652,7 @@ def main():
                         f"top_blocks qk/v/rst={cfg['model'].get('qk_top_blocks', 2)}/"
                         f"{cfg['model'].get('v_top_blocks', 2)}/"
                         f"{cfg['model'].get('rst_top_blocks', 2)}"))
-                if _v4168_vocab_parallel_enabled:
+                if _vocab_parallel_enabled:
                     _extra_msg += "; v4168 TP extras=vocab_parallel_ce"
             _qk_mode_msg = (
                 ("QK operation-space"
