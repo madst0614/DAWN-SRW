@@ -2831,6 +2831,7 @@ def make_sharded_srw_paired_dense_minimal(mesh, max_chunk_size=2048,
                                           opspace_region_score_pooling='smoothmax',
                                           opspace_region_score_temperature=0.25,
                                           opspace_load_smoothing_enabled=True,
+                                          opspace_load_smoothing_mode='neighbor',
                                           opspace_load_smoothing_region_weight=3.0e-4,
                                           opspace_load_smoothing_block_weight=0.0,
                                           opspace_load_smoothing_load_temperature=0.7,
@@ -2860,6 +2861,7 @@ def make_sharded_srw_paired_dense_minimal(mesh, max_chunk_size=2048,
             region_score_pooling=opspace_region_score_pooling,
             region_score_temperature=opspace_region_score_temperature,
             load_smoothing_enabled=opspace_load_smoothing_enabled,
+            load_smoothing_mode=opspace_load_smoothing_mode,
             load_smoothing_region_weight=(
                 opspace_load_smoothing_region_weight),
             load_smoothing_block_weight=(
@@ -3018,6 +3020,7 @@ def make_sharded_srw_tau_free_relu_region_block_dense_masked_minimal(
         region_score_pooling='smoothmax',
         region_score_temperature=0.25,
         load_smoothing_enabled=True,
+        load_smoothing_mode='neighbor',
         load_smoothing_region_weight=3.0e-4,
         load_smoothing_block_weight=0.0,
         load_smoothing_load_temperature=0.7,
@@ -3063,6 +3066,8 @@ def make_sharded_srw_tau_free_relu_region_block_dense_masked_minimal(
             "V operation-space dense-masked region_score_temperature must "
             f"be > 0, got {region_score_temperature}.")
     _load_smoothing_enabled = bool(load_smoothing_enabled)
+    _load_smoothing_mode = _opspace_normalize_load_smoothing_mode(
+        load_smoothing_mode)
     _load_smoothing_region_weight = float(load_smoothing_region_weight)
     _load_smoothing_block_weight = float(load_smoothing_block_weight)
     _load_smoothing_load_temperature = float(
@@ -3236,6 +3241,7 @@ def make_sharded_srw_tau_free_relu_region_block_dense_masked_minimal(
                 region_score, region_center_all, scores, block_center_all,
                 training_tokens=training_tokens,
                 enabled=_load_smoothing_enabled,
+                mode=_load_smoothing_mode,
                 region_weight=_load_smoothing_region_weight,
                 block_weight=_load_smoothing_block_weight,
                 load_temperature=_load_smoothing_load_temperature,
@@ -3309,6 +3315,7 @@ def make_sharded_srw_paired_tau_free_relu_region_block_dense_masked_minimal(
         region_score_pooling='smoothmax',
         region_score_temperature=0.25,
         load_smoothing_enabled=True,
+        load_smoothing_mode='neighbor',
         load_smoothing_region_weight=3.0e-4,
         load_smoothing_block_weight=0.0,
         load_smoothing_load_temperature=0.7,
@@ -3353,6 +3360,8 @@ def make_sharded_srw_paired_tau_free_relu_region_block_dense_masked_minimal(
             "QK operation-space dense-masked region_score_temperature must "
             f"be > 0, got {region_score_temperature}.")
     _load_smoothing_enabled = bool(load_smoothing_enabled)
+    _load_smoothing_mode = _opspace_normalize_load_smoothing_mode(
+        load_smoothing_mode)
     _load_smoothing_region_weight = float(load_smoothing_region_weight)
     _load_smoothing_block_weight = float(load_smoothing_block_weight)
     _load_smoothing_load_temperature = float(
@@ -3527,6 +3536,7 @@ def make_sharded_srw_paired_tau_free_relu_region_block_dense_masked_minimal(
                 region_score, region_center_all, scores, block_center_all,
                 training_tokens=training_tokens,
                 enabled=_load_smoothing_enabled,
+                mode=_load_smoothing_mode,
                 region_weight=_load_smoothing_region_weight,
                 block_weight=_load_smoothing_block_weight,
                 load_temperature=_load_smoothing_load_temperature,
@@ -3630,6 +3640,15 @@ def _opspace_load_smoothing_weight(tokens, weight, warmup_tokens,
         jnp.where(tokens < peak_tokens, weight * ramp, final_weight))
 
 
+def _opspace_normalize_load_smoothing_mode(mode):
+    mode = str('neighbor' if mode is None else mode).strip().lower()
+    if mode not in ('neighbor', 'capacity'):
+        raise ValueError(
+            "operation_space_load_smoothing.mode must be 'neighbor' or "
+            f"'capacity', got {mode!r}.")
+    return mode
+
+
 def _opspace_load_smoothing_loss(scores, centers, *, weight,
                                  load_temperature, space_temperature,
                                  alpha, eps=1.0e-6):
@@ -3674,6 +3693,49 @@ def _opspace_load_smoothing_loss(scores, centers, *, weight,
     return weighted_loss, diag
 
 
+def _opspace_capacity_load_smoothing_loss(
+        scores, *, weight, load_temperature, alpha,
+        region_capacity, local_token_count, eps=1.0e-6):
+    """Capacity-aware local region loss; it never alters route scores."""
+    if region_capacity is None or local_token_count is None:
+        raise ValueError(
+            "operation_space_load_smoothing.mode='capacity' requires "
+            "region_capacity and local_token_count.")
+    scores = scores.astype(jnp.float32)
+    weight = jnp.asarray(weight, dtype=jnp.float32)
+    eps_f = jnp.asarray(eps, dtype=jnp.float32)
+    load_temperature = jnp.maximum(
+        jnp.asarray(load_temperature, dtype=jnp.float32), eps_f)
+    alpha = jnp.asarray(alpha, dtype=jnp.float32)
+
+    p = jax.nn.softmax(scores / load_temperature, axis=-1)
+    load = jnp.mean(p, axis=0)
+    allowed_frac = (
+        alpha
+        * jnp.asarray(region_capacity, dtype=jnp.float32)
+        / jnp.maximum(
+            jnp.asarray(local_token_count, dtype=jnp.float32),
+            jnp.float32(1.0)))
+    over = jax.nn.relu(load - allowed_frac)
+    raw_loss = jnp.mean(jnp.square(over))
+    weighted_loss = weight * raw_loss
+
+    load_mean = jnp.mean(load)
+    load_max = jnp.max(load)
+    over_max = jnp.max(over)
+    diag = jnp.asarray((
+        weighted_loss,
+        raw_loss,
+        load_max,
+        load_mean,
+        load_max / jnp.maximum(load_mean, eps_f),
+        allowed_frac,
+        over_max / jnp.maximum(load_mean, eps_f),
+        jnp.mean((over > 0.0).astype(jnp.float32)),
+    ), dtype=jnp.float32)
+    return weighted_loss, diag
+
+
 def _opspace_region_score_from_block_scores(
         block_scores, *, blocks_per_region,
         region_score_pooling='smoothmax', region_score_temperature=0.25):
@@ -3697,7 +3759,9 @@ def _opspace_load_smoothing_aux_from_scores(
         block_weight=0.0, load_temperature=0.7,
         space_temperature=0.12, alpha=1.25,
         warmup_tokens=2.0e8, peak_tokens=1.0e9,
-        final_weight_frac=1.0):
+        final_weight_frac=1.0, mode='neighbor',
+        region_capacity=None, local_token_count=None):
+    mode = _opspace_normalize_load_smoothing_mode(mode)
     if not bool(enabled):
         return (
             jnp.float32(0.0),
@@ -3706,13 +3770,32 @@ def _opspace_load_smoothing_aux_from_scores(
     region_smoothing_weight = _opspace_load_smoothing_weight(
         training_tokens, region_weight, warmup_tokens, peak_tokens,
         final_weight_frac)
-    region_loss, region_diag = _opspace_load_smoothing_loss(
-        region_score.reshape(-1, int(region_score.shape[-1])),
-        region_center,
-        weight=region_smoothing_weight,
-        load_temperature=load_temperature,
-        space_temperature=space_temperature,
-        alpha=alpha)
+    region_score_flat = region_score.reshape(
+        -1, int(region_score.shape[-1]))
+    if mode == 'neighbor':
+        region_loss, region_diag = _opspace_load_smoothing_loss(
+            region_score_flat, region_center,
+            weight=region_smoothing_weight,
+            load_temperature=load_temperature,
+            space_temperature=space_temperature,
+            alpha=alpha)
+    elif region_capacity is not None and local_token_count is not None:
+        region_loss, region_diag = _opspace_capacity_load_smoothing_loss(
+            region_score_flat,
+            weight=region_smoothing_weight,
+            load_temperature=load_temperature,
+            alpha=alpha,
+            region_capacity=region_capacity,
+            local_token_count=local_token_count)
+    elif float(region_weight) > 0.0:
+        raise ValueError(
+            "operation_space_load_smoothing.mode='capacity' requires an "
+            "execution capacity; use it only for RST sparse_region_block or "
+            "set the pool region_weight to 0.")
+    else:
+        region_loss = jnp.float32(0.0)
+        region_diag = jnp.zeros((OPSPACE_LOAD_SMOOTHING_DIAG_COUNT,),
+                                dtype=jnp.float32)
     if float(block_weight) > 0.0:
         block_smoothing_weight = _opspace_load_smoothing_weight(
             training_tokens, block_weight, warmup_tokens, peak_tokens,
@@ -4145,7 +4228,8 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         visible_blocks_per_region=1, region_score_pooling='smoothmax',
         region_score_temperature=0.25, region_capacity_factor=1.25,
         spill_capacity=0, training_tokens=0.0,
-        load_smoothing_enabled=True, load_smoothing_region_weight=3.0e-4,
+        load_smoothing_enabled=True, load_smoothing_mode='neighbor',
+        load_smoothing_region_weight=3.0e-4,
         load_smoothing_block_weight=0.0, load_smoothing_load_temperature=0.7,
         load_smoothing_space_temperature=0.12, load_smoothing_alpha=1.25,
         load_smoothing_warmup_tokens=2.0e8,
@@ -4299,48 +4383,23 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     unresolved = selection['unresolved']
     primary_block = selection['primary_block']
 
-    if bool(load_smoothing_enabled):
-        region_smoothing_weight = _opspace_load_smoothing_weight(
-            training_tokens, load_smoothing_region_weight,
-            load_smoothing_warmup_tokens, load_smoothing_peak_tokens,
-            load_smoothing_final_weight_frac)
-        region_smoothing_loss, region_smoothing_diag = (
-            _opspace_load_smoothing_loss(
-                selection['region_score'], selection['region_center_all'],
-                weight=region_smoothing_weight,
-                load_temperature=load_smoothing_load_temperature,
-                space_temperature=load_smoothing_space_temperature,
-                alpha=load_smoothing_alpha))
-        if float(load_smoothing_block_weight) > 0.0:
-            block_smoothing_weight = _opspace_load_smoothing_weight(
-                training_tokens, load_smoothing_block_weight,
-                load_smoothing_warmup_tokens, load_smoothing_peak_tokens,
-                load_smoothing_final_weight_frac)
-            block_smoothing_loss, block_smoothing_diag = (
-                _opspace_load_smoothing_loss(
-                    scores_all.reshape(
-                        int(T), int(num_regions) * int(blocks_per_region)),
-                    selection['block_center_all'].reshape(
-                        int(num_regions) * int(blocks_per_region),
-                        selection['block_center_all'].shape[-1]),
-                    weight=block_smoothing_weight,
-                    load_temperature=load_smoothing_load_temperature,
-                    space_temperature=load_smoothing_space_temperature,
-                    alpha=load_smoothing_alpha))
-        else:
-            block_smoothing_loss = jnp.float32(0.0)
-            block_smoothing_diag = jnp.zeros(
-                (OPSPACE_LOAD_SMOOTHING_DIAG_COUNT,), dtype=jnp.float32)
-        load_smoothing_aux_local = (
-            region_smoothing_loss + block_smoothing_loss)
-        load_smoothing_diag_local = (
-            region_smoothing_diag
-            .at[0].set(load_smoothing_aux_local)
-            .at[1].set(region_smoothing_diag[1] + block_smoothing_diag[1]))
-    else:
-        load_smoothing_aux_local = jnp.float32(0.0)
-        load_smoothing_diag_local = jnp.zeros(
-            (OPSPACE_LOAD_SMOOTHING_DIAG_COUNT,), dtype=jnp.float32)
+    load_smoothing_aux_local, load_smoothing_diag_local = (
+        _opspace_load_smoothing_aux_from_scores(
+            selection['region_score'], selection['region_center_all'],
+            scores_all, selection['block_center_all'],
+            training_tokens=training_tokens,
+            enabled=load_smoothing_enabled,
+            mode=load_smoothing_mode,
+            region_weight=load_smoothing_region_weight,
+            block_weight=load_smoothing_block_weight,
+            load_temperature=load_smoothing_load_temperature,
+            space_temperature=load_smoothing_space_temperature,
+            alpha=load_smoothing_alpha,
+            warmup_tokens=load_smoothing_warmup_tokens,
+            peak_tokens=load_smoothing_peak_tokens,
+            final_weight_frac=load_smoothing_final_weight_frac,
+            region_capacity=region_capacity,
+            local_token_count=T))
     load_smoothing_aux = jax.lax.pmean(
         jax.lax.pmean(load_smoothing_aux_local, 'data'), 'model')
     load_smoothing_diag = jax.lax.pmean(
@@ -4678,6 +4737,7 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
         region_capacity_factor=1.25,
         spill_capacity=0,
         load_smoothing_enabled=True,
+        load_smoothing_mode='neighbor',
         load_smoothing_region_weight=3.0e-4,
         load_smoothing_block_weight=0.0,
         load_smoothing_load_temperature=0.7,
@@ -4712,6 +4772,8 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
             "operation-space dense-masked region_score_temperature must be "
             f"> 0, got {region_score_temperature}.")
     _load_smoothing_enabled = bool(load_smoothing_enabled)
+    _load_smoothing_mode = _opspace_normalize_load_smoothing_mode(
+        load_smoothing_mode)
     _load_smoothing_region_weight = float(load_smoothing_region_weight)
     _load_smoothing_block_weight = float(load_smoothing_block_weight)
     _load_smoothing_load_temperature = float(
@@ -4780,6 +4842,7 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
                 spill_capacity=_spill_capacity,
                 training_tokens=training_tokens,
                 load_smoothing_enabled=_load_smoothing_enabled,
+                load_smoothing_mode=_load_smoothing_mode,
                 load_smoothing_region_weight=_load_smoothing_region_weight,
                 load_smoothing_block_weight=_load_smoothing_block_weight,
                 load_smoothing_load_temperature=(
@@ -5383,6 +5446,7 @@ def make_sharded_srw_minimal(
         opspace_region_capacity_factor=1.25,
         opspace_spill_capacity=0,
         opspace_load_smoothing_enabled=True,
+        opspace_load_smoothing_mode='neighbor',
         opspace_load_smoothing_region_weight=3.0e-4,
         opspace_load_smoothing_block_weight=0.0,
         opspace_load_smoothing_load_temperature=0.7,
@@ -5411,6 +5475,7 @@ def make_sharded_srw_minimal(
             region_score_pooling=opspace_region_score_pooling,
             region_score_temperature=opspace_region_score_temperature,
             load_smoothing_enabled=opspace_load_smoothing_enabled,
+            load_smoothing_mode=opspace_load_smoothing_mode,
             load_smoothing_region_weight=(
                 opspace_load_smoothing_region_weight),
             load_smoothing_block_weight=(
@@ -5444,6 +5509,7 @@ def make_sharded_srw_minimal(
             region_capacity_factor=opspace_region_capacity_factor,
             spill_capacity=opspace_spill_capacity,
             load_smoothing_enabled=opspace_load_smoothing_enabled,
+            load_smoothing_mode=opspace_load_smoothing_mode,
             load_smoothing_region_weight=(
                 opspace_load_smoothing_region_weight),
             load_smoothing_block_weight=(

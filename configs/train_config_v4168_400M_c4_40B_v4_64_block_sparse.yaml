@@ -44,7 +44,8 @@ training:
 
   operation_space_load_smoothing:
     enabled: true
-    load_temperature: 0.7
+    mode: capacity
+    load_temperature: 0.10
     space_temperature: 0.12
     alpha: 1.25
     warmup_tokens: 0

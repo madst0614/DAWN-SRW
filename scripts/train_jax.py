@@ -1352,6 +1352,7 @@ def _v4168_normalize_operation_space_load_smoothing(load_smoothing,
             "rst_* keys with nested qk/v/rst settings; remove one form.")
     allowed = {
         'enabled',
+        'mode',
         'load_temperature',
         'space_temperature',
         'alpha',
@@ -1365,12 +1366,19 @@ def _v4168_normalize_operation_space_load_smoothing(load_smoothing,
     if extra:
         raise ValueError(
             "training.operation_space_load_smoothing only supports enabled, "
-            "qk, v, rst, and load-smoothing schedule fields; remove: "
+            "mode, qk, v, rst, and load-smoothing schedule fields; remove: "
             f"{', '.join(extra)}")
+    mode = str(load_smoothing.get('mode', 'neighbor')).strip().lower()
+    if mode not in ('neighbor', 'capacity'):
+        raise ValueError(
+            "training.operation_space_load_smoothing.mode must be "
+            "'neighbor' or 'capacity', got "
+            f"{load_smoothing.get('mode')!r}.")
     normalized = {
         'enabled': _cfg_bool(
             load_smoothing.get('enabled', True),
             name='training.operation_space_load_smoothing.enabled'),
+        'mode': mode,
         'load_temperature': float(load_smoothing.get(
             'load_temperature', 0.7)),
         'space_temperature': float(load_smoothing.get(
@@ -1801,6 +1809,7 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             'region_score_temperature': region_score_temperature,
             'load_smoothing_enabled': (
                 bool(load_smoothing['enabled'])),
+            'load_smoothing_mode': load_smoothing['mode'],
             'load_smoothing_region_weight': (
                 load_smoothing[label]['region_weight']),
             'load_smoothing_block_weight': (
@@ -14428,6 +14437,8 @@ def main():
                     'region_score_temperature', 0.25)),
                 'opspace_load_smoothing_enabled': bool(layout.get(
                     'load_smoothing_enabled', True)),
+                'opspace_load_smoothing_mode': str(layout.get(
+                    'load_smoothing_mode', 'neighbor')).lower(),
                 'opspace_load_smoothing_region_weight': float(
                     layout.get('load_smoothing_region_weight', 3.0e-4)),
                 'opspace_load_smoothing_block_weight': float(
