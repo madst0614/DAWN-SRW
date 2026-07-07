@@ -97,7 +97,6 @@ training:
         region_score_temperature: 0.25
         region_capacity_factor: 1.50
         block_capacity_factor: 1.50
-        bucket_capacity_factor: 1.50
         high_regret_threshold: 0.05
   checkpoint_interval: 200
   val_interval: 200
