@@ -539,6 +539,48 @@ def _ensure_pool_operator_keys(pool_params):
     return _pool_params_with_operator_keys(pool_params)
 
 
+def _opspace_region_block_model_axis_layout(
+        mesh, num_regions, blocks_per_region, operators_per_block):
+    num_regions = int(num_regions)
+    blocks_per_region = int(blocks_per_region)
+    operators_per_block = int(operators_per_block)
+    for field_name, value in (
+            ('num_regions', num_regions),
+            ('blocks_per_region', blocks_per_region),
+            ('operators_per_block', operators_per_block)):
+        if value < 1:
+            raise ValueError(
+                "v4168 Region-Block operation-space requires "
+                f"{field_name} >= 1, got {value}.")
+
+    model_axis_size = int(mesh.shape['model'])
+    if model_axis_size < 1:
+        raise ValueError(
+            "v4168 Region-Block operation-space requires model axis size "
+            f">= 1, got {model_axis_size}.")
+    if num_regions % model_axis_size != 0:
+        raise ValueError(
+            "v4168 Region-Block operation-space requires num_regions="
+            f"{num_regions} to be divisible by mesh model axis size "
+            f"{model_axis_size}.")
+
+    local_regions = num_regions // model_axis_size
+    local_block_count = local_regions * blocks_per_region
+    local_operator_capacity = local_block_count * operators_per_block
+    global_operator_capacity = (
+        num_regions * blocks_per_region * operators_per_block)
+    return {
+        'num_regions': num_regions,
+        'blocks_per_region': blocks_per_region,
+        'operators_per_block': operators_per_block,
+        'model_axis_size': model_axis_size,
+        'local_regions': local_regions,
+        'local_block_count': local_block_count,
+        'local_operator_capacity': local_operator_capacity,
+        'global_operator_capacity': global_operator_capacity,
+    }
+
+
 @jax.custom_vjp
 def _block_tau_up_when_no_active(tau, no_active):
     return tau
