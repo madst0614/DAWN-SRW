@@ -24,6 +24,7 @@ import subprocess
 import inspect
 import hashlib
 import socket
+import warnings
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -82,8 +83,6 @@ from models.dawn_srw_v4168 import (
     DAWN_SRW_V4168,
     OPSPACE_FINAL_RUNTIME_DIAG_NAMES as _V4168_OPSPACE_FINAL_RUNTIME_DIAG_NAMES,
     OPSPACE_RUNTIME_DIAG_NAMES as _V4168_OPSPACE_RUNTIME_DIAG_NAMES,
-    hardware_sector_static_metrics as _v4168_hardware_sector_static_metrics,
-    maybe_hardware_repack as _v4168_maybe_hardware_repack,
     operation_space_static_metrics as _v4168_operation_space_static_metrics,
     maybe_operation_space_repack as _v4168_maybe_operation_space_repack,
     _pool_operator_keys as _v4168_pool_operator_keys,
@@ -881,23 +880,27 @@ V4168_OPSPACE_RESUME_REQUIRED_FIELDS = (
     ('training', 'n_chunks_qk'),
     ('training', 'n_chunks_v'),
     ('training', 'n_chunks_rst'),
-    ('training', 'admission_den_power'),
+    ('training', 'opspace_gate_den_power'),
     ('training', 'operation_space', 'enabled'),
-    ('training', 'operation_space', 'pools', 'qk', 'execution_backend'),
-    ('training', 'operation_space', 'pools', 'qk', 'num_regions'),
-    ('training', 'operation_space', 'pools', 'qk', 'blocks_per_region'),
-    ('training', 'operation_space', 'pools', 'qk', 'operators_per_block'),
-    ('training', 'operation_space', 'pools', 'qk', 'visible_regions'),
-    ('training', 'operation_space', 'pools', 'qk',
-     'visible_blocks_per_region'),
-    ('training', 'operation_space', 'pools', 'v', 'execution_backend'),
-    ('training', 'operation_space', 'pools', 'v', 'num_regions'),
-    ('training', 'operation_space', 'pools', 'v', 'blocks_per_region'),
-    ('training', 'operation_space', 'pools', 'v', 'operators_per_block'),
-    ('training', 'operation_space', 'pools', 'v', 'visible_regions'),
-    ('training', 'operation_space', 'pools', 'v',
-     'visible_blocks_per_region'),
-    ('training', 'operation_space', 'pools', 'rst', 'execution_backend'),
+)
+
+V4168_OPSPACE_POOL_NAMES = ('qk', 'v', 'rst')
+V4168_OPSPACE_LOGICAL_POOL_FIELDS = (
+    'execution_backend',
+    'num_regions',
+    'visible_regions',
+    'blocks_per_region',
+    'operators_per_block',
+    'visible_blocks_per_region',
+    'region_score_pooling',
+    'region_score_temperature',
+)
+V4168_OPSPACE_RESUME_REQUIRED_FIELDS = (
+    V4168_OPSPACE_RESUME_REQUIRED_FIELDS
+    + tuple(
+        ('training', 'operation_space', 'pools', pool, field)
+        for pool in V4168_OPSPACE_POOL_NAMES
+        for field in V4168_OPSPACE_LOGICAL_POOL_FIELDS)
 )
 
 V4168_OPSPACE_REPACK_RESUME_REQUIRED_FIELDS = (
@@ -909,26 +912,19 @@ V4168_OPSPACE_REPACK_RESUME_REQUIRED_FIELDS = (
     ('training', 'operation_space', 'repack', 'max_swaps', 'rst'),
 )
 
-V4168_OPSPACE_FINAL_RESUME_REQUIRED_FIELDS = (
-    ('training', 'operation_space', 'pools', 'rst',
-     'high_regret_threshold'),
-)
-
-V4168_OPSPACE_REGION_BLOCK_RESUME_REQUIRED_FIELDS = (
-    ('training', 'operation_space', 'pools', 'rst', 'num_regions'),
-    ('training', 'operation_space', 'pools', 'rst', 'blocks_per_region'),
-    ('training', 'operation_space', 'pools', 'rst', 'operators_per_block'),
-    ('training', 'operation_space', 'pools', 'rst', 'visible_regions'),
-    ('training', 'operation_space', 'pools', 'rst',
-     'visible_blocks_per_region'),
-    ('training', 'operation_space', 'pools', 'rst',
-     'region_score_pooling'),
-    ('training', 'operation_space', 'pools', 'rst',
-     'region_score_temperature'),
+V4168_OPSPACE_SPARSE_RUNTIME_RESUME_REQUIRED_FIELDS = (
     ('training', 'operation_space', 'pools', 'rst',
      'region_capacity_factor'),
     ('training', 'operation_space', 'pools', 'rst',
-     'block_capacity_factor'),
+     'spill_capacity'),
+)
+
+V4168_OPSPACE_LOAD_SMOOTHING_RESUME_REQUIRED_FIELDS = (
+    ('training', 'operation_space_load_smoothing', 'enabled'),
+    *tuple(
+        ('training', 'operation_space_load_smoothing', pool, field)
+        for pool in V4168_OPSPACE_POOL_NAMES
+        for field in ('region_weight', 'block_weight'))
 )
 
 
@@ -1010,9 +1006,11 @@ def _require_resume_materialized_fields(full_config):
         rst_execution_backend = str(rst_cfg.get(
             'execution_backend', '')).lower()
         if rst_execution_backend == 'sparse_region_block':
-            required_fields.extend(V4168_OPSPACE_FINAL_RESUME_REQUIRED_FIELDS)
             required_fields.extend(
-                V4168_OPSPACE_REGION_BLOCK_RESUME_REQUIRED_FIELDS)
+                V4168_OPSPACE_SPARSE_RUNTIME_RESUME_REQUIRED_FIELDS)
+        if 'operation_space_load_smoothing' in training_cfg:
+            required_fields.extend(
+                V4168_OPSPACE_LOAD_SMOOTHING_RESUME_REQUIRED_FIELDS)
         repack_cfg = (
             opspace_cfg.get('repack', {})
             if isinstance(opspace_cfg.get('repack', {}), dict) else {})
@@ -1224,104 +1222,6 @@ def _cfg_bool(value, *, name):
     return bool(value)
 
 
-def _v4168_hardware_repack_config(training_cfg, model_version):
-    """Parse hardware-sector repack/execution config with disabled defaults."""
-    is_v4168 = str(model_version) == V4168_MODEL_VERSION
-    enabled = (
-        _cfg_bool(training_cfg.get('hardware_repack_enabled', False),
-                  name='training.hardware_repack_enabled')
-        if is_v4168 else False)
-    sector_execution_enabled = (
-        _cfg_bool(
-            training_cfg.get(
-                'hardware_sector_execution_enabled', enabled),
-            name='training.hardware_sector_execution_enabled')
-        if is_v4168 else False)
-    interval_steps = int(training_cfg.get(
-        'hardware_repack_interval_steps', 100))
-    strategy = str(training_cfg.get(
-        'hardware_repack_strategy', 'balanced_vq')).lower()
-    farthest_per_sector = int(training_cfg.get(
-        'hardware_repack_farthest_per_sector', 10))
-    gain_eps = float(training_cfg.get('hardware_repack_gain_eps', 1.0e-3))
-    max_move_frac = float(training_cfg.get(
-        'hardware_repack_max_move_frac', 0.08))
-    vq_iterations = int(training_cfg.get(
-        'hardware_repack_vq_iterations', 4))
-    warmup_steps = int(training_cfg.get('hardware_repack_warmup_steps', 0))
-    freeze_after_step = training_cfg.get(
-        'hardware_repack_freeze_after_step', None)
-    if freeze_after_step is not None:
-        freeze_after_step = int(freeze_after_step)
-
-    if enabled and not is_v4168:
-        raise ValueError(
-            "training.hardware_repack_enabled is only supported for "
-            f"{V4168_MODEL_VERSION}.")
-    if sector_execution_enabled and not is_v4168:
-        raise ValueError(
-            "training.hardware_sector_execution_enabled is only supported for "
-            f"{V4168_MODEL_VERSION}.")
-    if interval_steps <= 0:
-        raise ValueError(
-            "training.hardware_repack_interval_steps must be > 0, got "
-            f"{interval_steps}.")
-    if farthest_per_sector < 0:
-        raise ValueError(
-            "training.hardware_repack_farthest_per_sector must be >= 0, got "
-            f"{farthest_per_sector}.")
-    if strategy not in ('balanced_vq', 'sector_swap', 'legacy_swap', 'legacy'):
-        raise ValueError(
-            "training.hardware_repack_strategy must be 'balanced_vq' or "
-            f"'sector_swap', got {strategy!r}.")
-    if gain_eps < 0.0:
-        raise ValueError(
-            "training.hardware_repack_gain_eps must be >= 0, got "
-            f"{gain_eps}.")
-    if not (0.0 <= max_move_frac <= 1.0):
-        raise ValueError(
-            "training.hardware_repack_max_move_frac must be in [0, 1], got "
-            f"{max_move_frac}.")
-    if vq_iterations <= 0:
-        raise ValueError(
-            "training.hardware_repack_vq_iterations must be > 0, got "
-            f"{vq_iterations}.")
-    if warmup_steps < 0:
-        raise ValueError(
-            "training.hardware_repack_warmup_steps must be >= 0, got "
-            f"{warmup_steps}.")
-    if freeze_after_step is not None and freeze_after_step < 0:
-        raise ValueError(
-            "training.hardware_repack_freeze_after_step must be null or >= 0, "
-            f"got {freeze_after_step}.")
-
-    return {
-        'hardware_repack_enabled': bool(enabled),
-        'hardware_sector_execution_enabled': bool(sector_execution_enabled),
-        'hardware_repack_interval_steps': interval_steps,
-        'hardware_repack_strategy': strategy,
-        'hardware_repack_farthest_per_sector': farthest_per_sector,
-        'hardware_repack_gain_eps': gain_eps,
-        'hardware_repack_max_move_frac': max_move_frac,
-        'hardware_repack_vq_iterations': vq_iterations,
-        'hardware_repack_warmup_steps': warmup_steps,
-        'hardware_repack_freeze_after_step': freeze_after_step,
-    }
-
-
-def _v4168_should_hardware_repack(step, repack_cfg):
-    if not repack_cfg.get('hardware_repack_enabled', False):
-        return False
-    step = int(step)
-    if step < int(repack_cfg.get('hardware_repack_warmup_steps', 0)):
-        return False
-    freeze_after = repack_cfg.get('hardware_repack_freeze_after_step', None)
-    if freeze_after is not None and step > int(freeze_after):
-        return False
-    interval = int(repack_cfg.get('hardware_repack_interval_steps', 100))
-    return step > 0 and (step % interval == 0)
-
-
 def _ceil_to_multiple(value, multiple):
     value = int(value)
     multiple = max(1, int(multiple))
@@ -1342,6 +1242,210 @@ def _v4168_operation_space_cfg(training_cfg):
     return opspace
 
 
+V4168_OPSPACE_LEGACY_TRAINING_FIELDS = {
+    'tau_lr_mult',
+    'tau_grad_clip',
+    'tau_init_mode',
+    'tau_init_min',
+    'tau_init_max',
+    'tau_init_attn_qk',
+    'tau_init_attn_v',
+    'tau_init_rst',
+    'tau_init_target_qk_frac',
+    'tau_init_target_v_frac',
+    'tau_init_target_rst_frac',
+    'tau_init_calibration_tokens',
+    'selection_calibration',
+    'selection_calibration_tau_qk',
+    'selection_calibration_tau_v',
+    'selection_calibration_tau_rst',
+    'direct_tau',
+    'direct_tau_lr_mult',
+    'direct_tau_grad_clip',
+    'diversity_weight',
+    'load_balance_weight',
+    'dead_penalty_weight',
+    'dead_exposure_target',
+    'hardware_sector_execution',
+    'hardware_sector_execution_enabled',
+    'hardware_repack',
+    'hardware_repack_enabled',
+    'admission_den_grad_scale',
+    'soft_gate_effective_active_eps',
+    'operation_space_completion',
+    'completion_fallback',
+    'fallback_enabled',
+    'dense_fallback',
+    'no_route_fallback',
+}
+
+V4168_OPSPACE_LEGACY_MODEL_FIELDS = {
+    'qk_block_size',
+    'v_block_size',
+    'rst_block_size',
+    'qk_top_blocks',
+    'v_top_blocks',
+    'rst_top_blocks',
+    'block_margin',
+}
+
+V4168_OPSPACE_DEFAULT_SPILL_CAPACITY = 8192
+
+V4168_OPSPACE_IGNORED_POOL_FIELDS = {
+    'block_capacity_factor',
+    'bucket_capacity_factor',
+    'high_regret_threshold',
+    'spill_overflow_fail_loud',
+}
+
+V4168_OPSPACE_LEGACY_POOL_FIELDS = {
+    'completion_fallback',
+    'fallback_enabled',
+    'dense_fallback',
+    'no_route_fallback',
+}
+
+
+def _v4168_legacy_operation_space_error(field_path):
+    raise ValueError(
+        "Legacy config field "
+        f"'{field_path}' is not valid for v4.1.6.8 operation_space "
+        "official path.")
+
+
+def _v4168_reject_legacy_operation_space_fields(training_cfg, model_cfg):
+    present = sorted(
+        key for key in V4168_OPSPACE_LEGACY_TRAINING_FIELDS
+        if key in training_cfg)
+    if present:
+        _v4168_legacy_operation_space_error(f"training.{present[0]}")
+    if isinstance(model_cfg, dict):
+        present_model = sorted(
+            key for key in V4168_OPSPACE_LEGACY_MODEL_FIELDS
+            if key in model_cfg)
+        if present_model:
+            _v4168_legacy_operation_space_error(f"model.{present_model[0]}")
+
+
+def _v4168_default_load_smoothing_pool():
+    return {
+        'region_weight': 3.0e-4,
+        'block_weight': 0.0,
+    }
+
+
+def _v4168_normalize_operation_space_load_smoothing(load_smoothing,
+                                                    *,
+                                                    warn_legacy=True):
+    if load_smoothing is None:
+        load_smoothing = {}
+    if not isinstance(load_smoothing, dict):
+        raise ValueError(
+            "training.operation_space_load_smoothing must be a mapping.")
+    legacy_keys = {'rst_region_weight', 'rst_block_weight'}
+    nested_keys = set(V4168_OPSPACE_POOL_NAMES)
+    legacy_present = sorted(set(load_smoothing) & legacy_keys)
+    nested_present = sorted(set(load_smoothing) & nested_keys)
+    if legacy_present and nested_present:
+        raise ValueError(
+            "training.operation_space_load_smoothing mixes deprecated flat "
+            "rst_* keys with nested qk/v/rst settings; remove one form.")
+    allowed = {
+        'enabled',
+        'load_temperature',
+        'space_temperature',
+        'alpha',
+        'warmup_tokens',
+        'peak_tokens',
+        'final_weight_frac',
+        *legacy_keys,
+        *nested_keys,
+    }
+    extra = sorted(set(load_smoothing) - allowed)
+    if extra:
+        raise ValueError(
+            "training.operation_space_load_smoothing only supports enabled, "
+            "qk, v, rst, and load-smoothing schedule fields; remove: "
+            f"{', '.join(extra)}")
+    normalized = {
+        'enabled': _cfg_bool(
+            load_smoothing.get('enabled', True),
+            name='training.operation_space_load_smoothing.enabled'),
+        'load_temperature': float(load_smoothing.get(
+            'load_temperature', 0.7)),
+        'space_temperature': float(load_smoothing.get(
+            'space_temperature', 0.12)),
+        'alpha': float(load_smoothing.get('alpha', 1.25)),
+        'warmup_tokens': float(load_smoothing.get('warmup_tokens', 2.0e8)),
+        'peak_tokens': float(load_smoothing.get('peak_tokens', 1.0e9)),
+        'final_weight_frac': float(load_smoothing.get(
+            'final_weight_frac', 1.0)),
+    }
+    for pool in V4168_OPSPACE_POOL_NAMES:
+        normalized[pool] = _v4168_default_load_smoothing_pool()
+    if legacy_present:
+        if warn_legacy:
+            warnings.warn(
+                "operation_space_load_smoothing.rst_region_weight and "
+                "rst_block_weight are deprecated; use nested "
+                "operation_space_load_smoothing.rst.{region_weight,"
+                "block_weight}.",
+                DeprecationWarning,
+                stacklevel=2)
+        normalized['rst']['region_weight'] = float(load_smoothing.get(
+            'rst_region_weight',
+            normalized['rst']['region_weight']))
+        normalized['rst']['block_weight'] = float(load_smoothing.get(
+            'rst_block_weight',
+            normalized['rst']['block_weight']))
+    for pool in V4168_OPSPACE_POOL_NAMES:
+        pool_cfg = load_smoothing.get(pool, {})
+        if pool_cfg is None:
+            pool_cfg = {}
+        if not isinstance(pool_cfg, dict):
+            raise ValueError(
+                "training.operation_space_load_smoothing."
+                f"{pool} must be a mapping.")
+        extra_pool = sorted(set(pool_cfg) - {'region_weight', 'block_weight'})
+        if extra_pool:
+            raise ValueError(
+                "training.operation_space_load_smoothing."
+                f"{pool} only supports region_weight and block_weight; "
+                f"remove: {', '.join(extra_pool)}")
+        normalized[pool].update({
+            'region_weight': float(pool_cfg.get(
+                'region_weight',
+                normalized[pool]['region_weight'])),
+            'block_weight': float(pool_cfg.get(
+                'block_weight',
+                normalized[pool]['block_weight'])),
+        })
+    for field in ('load_temperature', 'space_temperature', 'alpha'):
+        if normalized[field] <= 0.0:
+            raise ValueError(
+                "training.operation_space_load_smoothing."
+                f"{field} must be > 0.")
+    if normalized['warmup_tokens'] < 0.0:
+        raise ValueError(
+            "training.operation_space_load_smoothing.warmup_tokens must be "
+            ">= 0.")
+    if normalized['peak_tokens'] < normalized['warmup_tokens']:
+        raise ValueError(
+            "training.operation_space_load_smoothing.peak_tokens must be "
+            ">= warmup_tokens.")
+    if normalized['final_weight_frac'] < 0.0:
+        raise ValueError(
+            "training.operation_space_load_smoothing.final_weight_frac must "
+            "be >= 0.")
+    for pool in V4168_OPSPACE_POOL_NAMES:
+        for field in ('region_weight', 'block_weight'):
+            if normalized[pool][field] < 0.0:
+                raise ValueError(
+                    "training.operation_space_load_smoothing."
+                    f"{pool}.{field} must be >= 0.")
+    return normalized
+
+
 def _migrate_v4168_operation_space_full_config_for_clean_schema(full_config):
     """Resume-only cleanup for removed v4168 operation-space config fields."""
     if not isinstance(full_config, dict):
@@ -1355,10 +1459,24 @@ def _migrate_v4168_operation_space_full_config_for_clean_schema(full_config):
     training_cfg = normalized.get('training', {})
     if not isinstance(training_cfg, dict):
         return normalized
-    training_cfg.pop('operation_space_completion', None)
     opspace = training_cfg.get('operation_space', {})
     if not isinstance(opspace, dict):
         return normalized
+    if not bool(opspace.get('enabled', False)):
+        return normalized
+    for key in V4168_OPSPACE_LEGACY_MODEL_FIELDS:
+        model_cfg.pop(key, None)
+    if 'opspace_gate_den_power' not in training_cfg:
+        if 'admission_den_power' in training_cfg:
+            training_cfg['opspace_gate_den_power'] = training_cfg.get(
+                'admission_den_power')
+    for key in V4168_OPSPACE_LEGACY_TRAINING_FIELDS:
+        training_cfg.pop(key, None)
+    load_smoothing = training_cfg.get('operation_space_load_smoothing', {})
+    if isinstance(load_smoothing, dict):
+        training_cfg['operation_space_load_smoothing'] = (
+            _v4168_normalize_operation_space_load_smoothing(
+                load_smoothing, warn_legacy=False))
     pools = opspace.get('pools', {})
     if not isinstance(pools, dict):
         return normalized
@@ -1391,6 +1509,11 @@ def _migrate_v4168_operation_space_full_config_for_clean_schema(full_config):
             continue
         for key in removed_pool_keys:
             pool.pop(key, None)
+        for key in (V4168_OPSPACE_IGNORED_POOL_FIELDS
+                    | V4168_OPSPACE_LEGACY_POOL_FIELDS):
+            pool.pop(key, None)
+        pool.setdefault('region_score_pooling', 'smoothmax')
+        pool.setdefault('region_score_temperature', 0.25)
 
     opspace.pop('tile_size', None)
     return normalized
@@ -1452,22 +1575,19 @@ def _v4168_validate_operation_space_shape(opspace):
         'candidate_region_' + 'count',
         'block_mixing_' + 'enabled',
     }
-    common_pool_keys = {
+    logical_pool_keys = {
         'execution_backend',
         'num_regions',
         'blocks_per_region',
         'operators_per_block',
         'visible_regions',
         'visible_blocks_per_region',
-    }
-    allowed_rst_keys = {
-        *common_pool_keys,
         'region_score_pooling',
         'region_score_temperature',
+    }
+    sparse_runtime_keys = {
         'region_capacity_factor',
-        'block_capacity_factor',
-        'bucket_capacity_factor',
-        'high_regret_threshold',
+        'spill_capacity',
     }
     for label in ('qk', 'v', 'rst'):
         pool = pools.get(label, {})
@@ -1484,13 +1604,22 @@ def _v4168_validate_operation_space_shape(opspace):
                 + (f", training.operation_space.pools.{label}."
                    ).join(present_removed)
                 + " was removed from the clean Region-Block atlas config.")
-        allowed_pool_keys = (
-            allowed_rst_keys if label == 'rst' else common_pool_keys)
+        present_legacy = sorted(set(pool) & V4168_OPSPACE_LEGACY_POOL_FIELDS)
+        if present_legacy:
+            _v4168_legacy_operation_space_error(
+                f"training.operation_space.pools.{label}."
+                f"{present_legacy[0]}")
+        allowed_pool_keys = set(logical_pool_keys)
+        allowed_pool_keys.update(V4168_OPSPACE_IGNORED_POOL_FIELDS)
+        if label == 'rst':
+            allowed_pool_keys.update(sparse_runtime_keys)
         extra = sorted(set(pool) - allowed_pool_keys)
         if extra:
             raise ValueError(
                 f"training.operation_space.pools.{label} only supports "
-                "the clean operation-space fields for that pool; remove: "
+                "the official operation-space logical selector fields"
+                + (" plus sparse runtime fields" if label == 'rst' else "")
+                + "; remove: "
                 f"{', '.join(extra)}")
     repack = opspace.get('repack', {})
     if repack is None:
@@ -1529,61 +1658,9 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
     pools = opspace.get('pools', {})
     if not isinstance(pools, dict):
         pools = {}
-    load_smoothing = training_cfg.get('operation_space_load_smoothing', {})
-    if load_smoothing is None:
-        load_smoothing = {}
-    if not isinstance(load_smoothing, dict):
-        raise ValueError(
-            "training.operation_space_load_smoothing must be a mapping.")
-    load_smoothing_enabled = _cfg_bool(
-        load_smoothing.get('enabled', True),
-        name='training.operation_space_load_smoothing.enabled')
-    load_smoothing_region_weight = float(
-        load_smoothing.get('rst_region_weight', 3.0e-4))
-    load_smoothing_block_weight = float(
-        load_smoothing.get('rst_block_weight', 0.0))
-    load_smoothing_load_temperature = float(
-        load_smoothing.get('load_temperature', 0.7))
-    load_smoothing_space_temperature = float(
-        load_smoothing.get('space_temperature', 0.12))
-    load_smoothing_alpha = float(load_smoothing.get('alpha', 1.25))
-    load_smoothing_warmup_tokens = float(
-        load_smoothing.get('warmup_tokens', 2.0e8))
-    load_smoothing_peak_tokens = float(
-        load_smoothing.get('peak_tokens', 1.0e9))
-    load_smoothing_final_weight_frac = float(
-        load_smoothing.get('final_weight_frac', 1.0))
-    if load_smoothing_region_weight < 0.0:
-        raise ValueError(
-            "training.operation_space_load_smoothing.rst_region_weight "
-            "must be >= 0.")
-    if load_smoothing_block_weight < 0.0:
-        raise ValueError(
-            "training.operation_space_load_smoothing.rst_block_weight "
-            "must be >= 0.")
-    if load_smoothing_load_temperature <= 0.0:
-        raise ValueError(
-            "training.operation_space_load_smoothing.load_temperature "
-            "must be > 0.")
-    if load_smoothing_space_temperature <= 0.0:
-        raise ValueError(
-            "training.operation_space_load_smoothing.space_temperature "
-            "must be > 0.")
-    if load_smoothing_alpha <= 0.0:
-        raise ValueError(
-            "training.operation_space_load_smoothing.alpha must be > 0.")
-    if load_smoothing_warmup_tokens < 0.0:
-        raise ValueError(
-            "training.operation_space_load_smoothing.warmup_tokens "
-            "must be >= 0.")
-    if load_smoothing_peak_tokens < load_smoothing_warmup_tokens:
-        raise ValueError(
-            "training.operation_space_load_smoothing.peak_tokens must be "
-            ">= warmup_tokens.")
-    if load_smoothing_final_weight_frac < 0.0:
-        raise ValueError(
-            "training.operation_space_load_smoothing.final_weight_frac "
-            "must be >= 0.")
+    load_smoothing = _v4168_normalize_operation_space_load_smoothing(
+        training_cfg.get('operation_space_load_smoothing', {}),
+        warn_legacy=True)
     device_count = _v4168_operation_space_device_count(training_cfg)
     defaults = {
         'qk': {'n_key': 'n_qk', 'execution_backend': 'dense'},
@@ -1612,12 +1689,25 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         if n_ops <= 0:
             raise ValueError(
                 f"model.{defaults_i['n_key']} must be > 0 for operation_space.")
-        num_regions = int(pool.get('num_regions'))
-        blocks_per_region = int(pool.get('blocks_per_region'))
-        operators_per_block = int(pool.get('operators_per_block'))
-        visible_regions = int(pool.get('visible_regions'))
-        visible_blocks_per_region = int(pool.get(
-            'visible_blocks_per_region'))
+        required_ints = {
+            'num_regions': pool.get('num_regions'),
+            'blocks_per_region': pool.get('blocks_per_region'),
+            'operators_per_block': pool.get('operators_per_block'),
+            'visible_regions': pool.get('visible_regions'),
+            'visible_blocks_per_region': pool.get('visible_blocks_per_region'),
+        }
+        missing = [
+            name for name, value in required_ints.items() if value is None]
+        if missing:
+            raise ValueError(
+                f"training.operation_space.pools.{label} missing required "
+                f"field(s): {', '.join(missing)}")
+        num_regions = int(required_ints['num_regions'])
+        blocks_per_region = int(required_ints['blocks_per_region'])
+        operators_per_block = int(required_ints['operators_per_block'])
+        visible_regions = int(required_ints['visible_regions'])
+        visible_blocks_per_region = int(
+            required_ints['visible_blocks_per_region'])
         for field_name, value in (
                 ('num_regions', num_regions),
                 ('blocks_per_region', blocks_per_region),
@@ -1654,10 +1744,10 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 f"model.{defaults_i['n_key']}={n_ops}.")
         region_score_pooling = str(pool.get(
             'region_score_pooling', 'smoothmax')).strip().lower()
-        if label == 'rst' and region_score_pooling != 'smoothmax':
+        if region_score_pooling != 'smoothmax':
             raise ValueError(
-                "training.operation_space.pools.rst."
-                "region_score_pooling must be 'smoothmax'.")
+                "training.operation_space.pools."
+                f"{label}.region_score_pooling must be 'smoothmax'.")
         region_score_temperature = float(pool.get(
             'region_score_temperature', 0.25))
         if region_score_temperature <= 0.0:
@@ -1665,34 +1755,26 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 "training.operation_space.pools."
                 f"{label}.region_score_temperature must be > 0, got "
                 f"{region_score_temperature}.")
-        region_capacity_factor = float(pool.get(
-            'region_capacity_factor', 1.25))
-        block_capacity_factor = float(pool.get(
-            'block_capacity_factor', 1.25))
-        if region_capacity_factor <= 0.0:
-            raise ValueError(
-                "training.operation_space.pools."
-                f"{label}.region_capacity_factor must be > 0, got "
-                f"{region_capacity_factor}.")
-        if block_capacity_factor <= 0.0:
-            raise ValueError(
-                "training.operation_space.pools."
-                f"{label}.block_capacity_factor must be > 0, got "
-                f"{block_capacity_factor}.")
-        bucket_capacity_factor = float(pool.get(
-            'bucket_capacity_factor', block_capacity_factor))
-        if bucket_capacity_factor <= 0.0:
-            raise ValueError(
-                "training.operation_space.pools."
-                f"{label}.bucket_capacity_factor must be > 0, got "
-                f"{bucket_capacity_factor}.")
-        high_regret_threshold = float(pool.get(
-            'high_regret_threshold', 0.05))
-        if high_regret_threshold < 0.0:
-            raise ValueError(
-                "training.operation_space.pools."
-                f"{label}.high_regret_threshold must be >= 0, got "
-                f"{high_regret_threshold}.")
+        region_capacity_factor = None
+        spill_capacity = None
+        if label == 'rst':
+            if 'region_capacity_factor' not in pool:
+                raise ValueError(
+                    "training.operation_space.pools.rst."
+                    "region_capacity_factor is required for "
+                    "sparse_region_block.")
+            region_capacity_factor = float(pool['region_capacity_factor'])
+            spill_capacity = int(pool.get(
+                'spill_capacity', V4168_OPSPACE_DEFAULT_SPILL_CAPACITY))
+            if region_capacity_factor <= 0.0:
+                raise ValueError(
+                    "training.operation_space.pools.rst."
+                    "region_capacity_factor must be > 0, got "
+                    f"{region_capacity_factor}.")
+            if spill_capacity < 0:
+                raise ValueError(
+                    "training.operation_space.pools.rst.spill_capacity "
+                    f"must be >= 0, got {spill_capacity}.")
         visible_ops_per_token = (
             visible_regions * visible_blocks_per_region
             * operators_per_block)
@@ -1700,7 +1782,7 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             physical_visible_ops_per_token = (
                 visible_regions * blocks_per_region * operators_per_block)
         else:
-            physical_visible_ops_per_token = visible_ops_per_token
+            physical_visible_ops_per_token = total_capacity // device_count
         layouts[label] = {
             'execution_backend': execution_backend,
             'num_regions': num_regions,
@@ -1712,36 +1794,36 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             'visible_regions': visible_regions,
             'visible_blocks_per_region': visible_blocks_per_region,
             'visible_ops_per_token': visible_ops_per_token,
+            'logical_visible_ops_per_token': visible_ops_per_token,
             'physical_visible_ops_per_token': (
                 physical_visible_ops_per_token),
             'region_score_pooling': region_score_pooling,
             'region_score_temperature': region_score_temperature,
-            'region_capacity_factor': region_capacity_factor,
-            'block_capacity_factor': block_capacity_factor,
-            'bucket_capacity_factor': bucket_capacity_factor,
-            'high_regret_threshold': high_regret_threshold,
             'load_smoothing_enabled': (
-                load_smoothing_enabled if label == 'rst' else False),
-            'load_smoothing_rst_region_weight': (
-                load_smoothing_region_weight if label == 'rst' else 0.0),
-            'load_smoothing_rst_block_weight': (
-                load_smoothing_block_weight if label == 'rst' else 0.0),
+                bool(load_smoothing['enabled'])),
+            'load_smoothing_region_weight': (
+                load_smoothing[label]['region_weight']),
+            'load_smoothing_block_weight': (
+                load_smoothing[label]['block_weight']),
             'load_smoothing_load_temperature': (
-                load_smoothing_load_temperature),
+                load_smoothing['load_temperature']),
             'load_smoothing_space_temperature': (
-                load_smoothing_space_temperature),
-            'load_smoothing_alpha': load_smoothing_alpha,
+                load_smoothing['space_temperature']),
+            'load_smoothing_alpha': load_smoothing['alpha'],
             'load_smoothing_warmup_tokens': (
-                load_smoothing_warmup_tokens),
-            'load_smoothing_peak_tokens': load_smoothing_peak_tokens,
+                load_smoothing['warmup_tokens']),
+            'load_smoothing_peak_tokens': load_smoothing['peak_tokens'],
             'load_smoothing_final_weight_frac': (
-                load_smoothing_final_weight_frac),
+                load_smoothing['final_weight_frac']),
             'global_operator_capacity': total_capacity,
             'local_operator_capacity': total_capacity // device_count,
             'operator_capacity': total_capacity,
             'invalid_operator_capacity': total_capacity - n_ops,
             'num_devices': device_count,
         }
+        if label == 'rst':
+            layouts[label]['region_capacity_factor'] = region_capacity_factor
+            layouts[label]['spill_capacity'] = spill_capacity
     return layouts
 
 
@@ -1756,15 +1838,9 @@ def _v4168_operation_space_repack_config(training_cfg, model_cfg,
         raise ValueError(
             "training.operation_space.enabled is only supported for "
             f"{V4168_MODEL_VERSION}.")
-    if operation_space_enabled and (
-            _cfg_bool(training_cfg.get('hardware_repack_enabled', False),
-                      name='training.hardware_repack_enabled')
-            or _cfg_bool(
-                training_cfg.get('hardware_sector_execution_enabled', False),
-                name='training.hardware_sector_execution_enabled')):
-        raise ValueError(
-            "v4168 operation_space requires training.hardware_repack_enabled "
-            "and training.hardware_sector_execution_enabled to remain false.")
+    if operation_space_enabled and is_v4168:
+        _v4168_reject_legacy_operation_space_fields(
+            training_cfg, model_cfg)
     repack = opspace.get('repack', {})
     if not isinstance(repack, dict):
         repack = {}
@@ -1996,13 +2072,6 @@ def _dawn_srw_kwargs(cfg):
         kw.update({
             'logical_vocab_size': m.get('logical_vocab_size', None),
             'vocab_size_padded': m.get('vocab_size_padded', None),
-            'qk_block_size': int(m.get('qk_block_size', 256)),
-            'v_block_size': int(m.get('v_block_size', 256)),
-            'rst_block_size': int(m.get('rst_block_size', 256)),
-            'qk_top_blocks': int(m.get('qk_top_blocks', 2)),
-            'v_top_blocks': int(m.get('v_top_blocks', 2)),
-            'rst_top_blocks': int(m.get('rst_top_blocks', 2)),
-            'block_margin': float(m.get('block_margin', 0.0)),
         })
     return kw
 
@@ -2010,16 +2079,29 @@ def _dawn_srw_kwargs(cfg):
 def _v4164_sharded_kwargs(cfg):
     """Fixed v4164 sharded SRW execution kwargs."""
     t = cfg['training']
-    admission_den_power_cfg = t.get(
-        'admission_den_power',
-        t.get('v4164_den_power', 1.0))
-    admission_den_grad_scale_cfg = t.get(
-        'admission_den_grad_scale',
-        t.get('v4164_den_grad_scale', 1.0))
+    opspace_cfg = t.get('operation_space', {})
+    operation_space_enabled = (
+        str(cfg.get('model', {}).get('model_version', ''))
+        == V4168_MODEL_VERSION
+        and isinstance(opspace_cfg, dict)
+        and bool(opspace_cfg.get('enabled', False)))
+    if operation_space_enabled:
+        admission_den_power_cfg = t.get('opspace_gate_den_power', 1.0)
+        admission_den_grad_scale_cfg = 1.0
+        soft_gate_effective_active_eps_cfg = 1.0e-6
+    else:
+        admission_den_power_cfg = t.get(
+            'admission_den_power',
+            t.get('v4164_den_power', 1.0))
+        admission_den_grad_scale_cfg = t.get(
+            'admission_den_grad_scale',
+            t.get('v4164_den_grad_scale', 1.0))
+        soft_gate_effective_active_eps_cfg = t.get(
+            'soft_gate_effective_active_eps', 1.0e-6)
     return dict(
         dead_exposure_target=0.0,
         soft_gate_effective_active_eps=float(
-            t.get('soft_gate_effective_active_eps', 1.0e-6)),
+            soft_gate_effective_active_eps_cfg),
         admission_den_power=float(admission_den_power_cfg),
         admission_den_grad_scale=float(admission_den_grad_scale_cfg),
     )
@@ -6847,24 +6929,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'estimated_compute_frac_page',
                 'selected_page_count'):
             metrics[_name] = result.get(_name, jnp.float32(0.0))
-        for _pool in ('attn_v', 'rst'):
-            for _name in (
-                    'sector_fill_mean',
-                    'sector_fill_max',
-                    'sector_overflow_count',
-                    'selected_sector_frac',
-                    'effective_operator_frac'):
-                _key = f'sector/{_pool}/{_name}'
-                metrics[_key] = result.get(_key, jnp.float32(0.0))
-        for _pool in ('attn_v', 'rst'):
+        for _pool in ('qk', 'attn_v', 'rst'):
             for _name in _V4168_OPSPACE_RUNTIME_DIAG_NAMES:
                 _key = f'opspace/{_pool}/{_name}'
                 metrics[_key] = result.get(_key, jnp.float32(0.0))
-        for _pool in ('attn_v', 'rst'):
+        for _pool in ('qk', 'attn_v', 'rst'):
             for _name in _V4168_OPSPACE_FINAL_RUNTIME_DIAG_NAMES:
                 _key = f'opspace/{_pool}/final/{_name}'
                 metrics[_key] = result.get(_key, jnp.float32(0.0))
-        for _pool in ('attn_v', 'rst'):
+        for _pool in ('qk', 'attn_v', 'rst'):
             for _name in _V4168_OPSPACE_FINAL_RUNTIME_DIAG_NAMES:
                 _alias_key = f'opspace/{_pool}/{_name}'
                 _final_key = f'opspace/{_pool}/final/{_name}'
@@ -10235,7 +10308,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     for _key, _value in m.items():
         if isinstance(_key, str) and (
                 _key.startswith('repack/')
-                or _key.startswith('sector/')
                 or _key.startswith('opspace/')):
             rec[_key] = float(_value)
     return rec
@@ -10270,6 +10342,13 @@ def fmt_pct(x, digits=2, default="n/a"):
     if value is None:
         return default
     return f"{value * 100.0:.{digits}f}%"
+
+
+def fmt_sci(x, digits=2, default="n/a"):
+    value = _metric_float(x)
+    if value is None:
+        return default
+    return f"{value:.{digits}e}"
 
 
 def fmt_intlike(x, default="n/a"):
@@ -10376,12 +10455,6 @@ def _opspace_backend_summary(rec):
 
 def _opspace_warning_lines(rec):
     checks = (
-        ('semantic_drop_frac', 'rst semantic_drop_frac > 0',
-         lambda value: value > 0.0),
-        ('reroute_frac', 'rst reroute_frac != 0',
-         lambda value: value != 0.0),
-        ('assignment_collision_count', 'rst assignment_collision_count > 0',
-         lambda value: value > 0.0),
         ('all_processed', 'rst all_processed != 1',
          lambda value: value < 0.5),
         ('no_nan', 'rst no_nan != 1',
@@ -10419,7 +10492,8 @@ def _print_v4168_opspace_regular_block(rec):
     v_prefixes = ('opspace/v', 'opspace/attn_v')
     rst_prefix = 'opspace/rst'
     den_power = _fmt_short_float(
-        rec.get('admission_den_power', rec.get('den_power', None)))
+        rec.get('opspace_gate_den_power',
+                rec.get('admission_den_power', rec.get('den_power', None))))
     log_message(
         "  [opspace] mode=tau_free_relu2"
         f" backend={_opspace_backend_summary(rec)}"
@@ -10476,7 +10550,7 @@ def _print_v4168_opspace_regular_block(rec):
         "  [opspace/rst]"
         f" backend={_opspace_backend_name(rec, rst_prefix)}"
         " mode=region_dense_block_masked"
-        f" regions={fmt_intlike(_opspace_metric(rec, rst_prefix, 'region_count'))}"
+        f" regions={fmt_intlike(_opspace_metric(rec, rst_prefix, 'num_regions'))}"
         f" visible_regions={fmt_intlike(_opspace_metric(rec, rst_prefix, 'visible_regions'))}"
         f" blocks={fmt_intlike(_opspace_metric(rec, rst_prefix, 'blocks_per_region'))}"
         f" visible_blocks={fmt_intlike(_opspace_metric(rec, rst_prefix, 'visible_blocks_per_region'))}"
@@ -10485,19 +10559,22 @@ def _print_v4168_opspace_regular_block(rec):
         f" physical_ops={fmt_intlike(physical_ops)}"
         f" compute={fmt_pct(logical_compute, 2)}/{fmt_pct(physical_compute, 2)}"
         f" region_capacity={fmt_intlike(region_cap)}"
+        f" spill_capacity={fmt_intlike(_opspace_metric(rec, rst_prefix, 'spill_capacity'))}"
         f" region_fill={fmt_intlike(region_load_mean)}/{fmt_intlike(region_load_max)}"
         f" accept={fmt_float(_opspace_metric(rec, rst_prefix, 'primary_accept_frac'), 3)}"
-        f" reroute={fmt_float(_opspace_metric(rec, rst_prefix, 'reroute_frac'), 3)}"
-        f" drop={fmt_float(_opspace_metric(rec, rst_prefix, 'semantic_drop_frac'), 6)}"
         f" processed={fmt_intlike(_opspace_metric(rec, rst_prefix, 'processed_requests'))}/"
         f"{fmt_intlike(_opspace_metric(rec, rst_prefix, 'selected_requests'))}"
-        f" overflow={fmt_intlike(_opspace_metric(rec, rst_prefix, 'overflow_requests'))}"
-        f" completion={fmt_intlike(_opspace_metric(rec, rst_prefix, 'completion_processed_requests'))}"
-        f" chunk_active={fmt_pct(_opspace_metric(rec, rst_prefix, 'completion_active_chunk_frac'), 2)}"
+        f" spill_used={fmt_intlike(_opspace_metric(rec, rst_prefix, 'overflow_requests'))}"
+        f" spill_processed={fmt_intlike(_opspace_metric(rec, rst_prefix, 'spill_processed_requests'))}"
+        f" spill_overflow={fmt_intlike(_opspace_metric(rec, rst_prefix, 'spill_overflow_count'))}"
         f" all={fmt_intlike(_opspace_metric(rec, rst_prefix, 'all_processed'))}"
         f" no_nan={fmt_intlike(_opspace_metric(rec, rst_prefix, 'no_nan'))}"
         f" gate_mass={fmt_float(_opspace_metric(rec, rst_prefix, 'gate_mass_mean'), 2)}"
         f" relu_active={fmt_float(_opspace_metric(rec, rst_prefix, 'relu_gate_count_mean'), 1)}"
+        f" smooth_loss={fmt_sci(_opspace_metric(rec, rst_prefix, 'load_smoothing_loss'))}"
+        f" smooth_raw={fmt_sci(_opspace_metric(rec, rst_prefix, 'load_smoothing_raw'))}"
+        f" load_max_mean={_fmt_short_float(_opspace_metric(rec, rst_prefix, 'load_max_over_mean'))}"
+        f" spike_frac={fmt_pct(_opspace_metric(rec, rst_prefix, 'spike_frac'), 2)}"
     )
     for line in _opspace_warning_lines(rec):
         log_message(line)
@@ -11736,12 +11813,6 @@ def main():
     model_version_cfg = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     is_v4164_cfg = _is_active_srw_version(model_version_cfg)
     is_baseline = _is_baseline_version(model_version_cfg)
-    hardware_repack_config = _v4168_hardware_repack_config(
-        tcfg, model_version_cfg)
-    hardware_repack_enabled = bool(
-        hardware_repack_config['hardware_repack_enabled'])
-    hardware_sector_execution_enabled = bool(
-        hardware_repack_config['hardware_sector_execution_enabled'])
     operation_space_repack_config = _v4168_operation_space_repack_config(
         tcfg, cfg['model'], model_version_cfg)
     operation_space_repack_enabled = bool(
@@ -11865,18 +11936,25 @@ def main():
         'soft_gate_boundary_power_mid_frac', 0.800))
     soft_gate_boundary_power_final_frac = float(tcfg.get(
         'soft_gate_boundary_power_final_frac', 0.950))
-    soft_gate_effective_active_eps = float(
-        tcfg.get('soft_gate_effective_active_eps', 1.0e-6))
-    admission_den_power = float(tcfg.get(
-        'admission_den_power',
-        tcfg.get('v4164_den_power', 1.0)))
-    admission_den_grad_scale = float(tcfg.get(
-        'admission_den_grad_scale',
-        tcfg.get('v4164_den_grad_scale', 1.0)))
-    admission_den_config_keys = (
-        'admission_den_power',
-        'admission_den_grad_scale',
-    )
+    if operation_space_tau_free_enabled:
+        soft_gate_effective_active_eps = 1.0e-6
+        admission_den_power = float(tcfg.get(
+            'opspace_gate_den_power', 1.0))
+        admission_den_grad_scale = 1.0
+        admission_den_config_keys = ('opspace_gate_den_power',)
+    else:
+        soft_gate_effective_active_eps = float(
+            tcfg.get('soft_gate_effective_active_eps', 1.0e-6))
+        admission_den_power = float(tcfg.get(
+            'admission_den_power',
+            tcfg.get('v4164_den_power', 1.0)))
+        admission_den_grad_scale = float(tcfg.get(
+            'admission_den_grad_scale',
+            tcfg.get('v4164_den_grad_scale', 1.0)))
+        admission_den_config_keys = (
+            'admission_den_power',
+            'admission_den_grad_scale',
+        )
     current_admission_den_config_override = any(
         key in tcfg for key in admission_den_config_keys)
     regular_console_level_default = 'full'
@@ -12235,12 +12313,6 @@ def main():
         model_version_cfg = cfg['model']['model_version']
         is_v4164_cfg = _is_active_srw_version(model_version_cfg)
         is_baseline = _is_baseline_version(model_version_cfg)
-        hardware_repack_config = _v4168_hardware_repack_config(
-            tcfg, model_version_cfg)
-        hardware_repack_enabled = bool(
-            hardware_repack_config['hardware_repack_enabled'])
-        hardware_sector_execution_enabled = bool(
-            hardware_repack_config['hardware_sector_execution_enabled'])
         operation_space_repack_config = _v4168_operation_space_repack_config(
             tcfg, cfg['model'], model_version_cfg)
         operation_space_repack_enabled = bool(
@@ -12323,8 +12395,12 @@ def main():
                 for key in admission_den_config_keys
             }
             current_admission_den_signature = {
-                'admission_den_power': admission_den_power,
-                'admission_den_grad_scale': admission_den_grad_scale,
+                key: (
+                    admission_den_power
+                    if key in ('admission_den_power',
+                               'opspace_gate_den_power')
+                    else admission_den_grad_scale)
+                for key in admission_den_config_keys
             }
             if current_admission_den_config_override:
                 def _norm_sig_value(v):
@@ -12445,11 +12521,16 @@ def main():
                     'soft_gate_boundary_power_final_frac',
                     soft_gate_boundary_power_final_frac))
             if not current_admission_den_config_override:
-                admission_den_power = float(
-                    saved_training_config['admission_den_power'])
-                admission_den_grad_scale = float(
-                    saved_training_config.get(
-                        'admission_den_grad_scale', 1.0))
+                if operation_space_tau_free_enabled:
+                    admission_den_power = float(
+                        saved_training_config['opspace_gate_den_power'])
+                    admission_den_grad_scale = 1.0
+                else:
+                    admission_den_power = float(
+                        saved_training_config['admission_den_power'])
+                    admission_den_grad_scale = float(
+                        saved_training_config.get(
+                            'admission_den_grad_scale', 1.0))
             pool_weight_decay = 0.0
             div_weight = 0.0
             lb_weight = 0.0
@@ -12840,25 +12921,6 @@ def main():
         'soft_gate_boundary_power_final_frac': soft_gate_boundary_power_final_frac,
         'admission_den_power': admission_den_power,
         'admission_den_grad_scale': admission_den_grad_scale,
-        'hardware_repack_enabled': hardware_repack_enabled,
-        'hardware_sector_execution_enabled':
-            hardware_sector_execution_enabled,
-        'hardware_repack_interval_steps':
-            hardware_repack_config['hardware_repack_interval_steps'],
-        'hardware_repack_strategy':
-            hardware_repack_config['hardware_repack_strategy'],
-        'hardware_repack_farthest_per_sector':
-            hardware_repack_config['hardware_repack_farthest_per_sector'],
-        'hardware_repack_gain_eps':
-            hardware_repack_config['hardware_repack_gain_eps'],
-        'hardware_repack_max_move_frac':
-            hardware_repack_config['hardware_repack_max_move_frac'],
-        'hardware_repack_vq_iterations':
-            hardware_repack_config['hardware_repack_vq_iterations'],
-        'hardware_repack_warmup_steps':
-            hardware_repack_config['hardware_repack_warmup_steps'],
-        'hardware_repack_freeze_after_step':
-            hardware_repack_config['hardware_repack_freeze_after_step'],
         'soft_gate_effective_active_eps': soft_gate_effective_active_eps,
         'regular_console_level': regular_console_level,
         'regular_console_host_timing': regular_console_host_timing,
@@ -12966,22 +13028,17 @@ def main():
                 'visible_regions': int(_layout.get('visible_regions', 1)),
                 'visible_blocks_per_region': int(_layout.get(
                     'visible_blocks_per_region', 1)),
+                'region_score_pooling': str(_layout.get(
+                    'region_score_pooling', 'smoothmax')).lower(),
+                'region_score_temperature': float(_layout.get(
+                    'region_score_temperature', 0.25)),
             }
             if _label == 'rst':
                 _pool.update({
-                    'region_score_pooling': str(_layout.get(
-                        'region_score_pooling', 'smoothmax')).lower(),
-                    'region_score_temperature': float(_layout.get(
-                        'region_score_temperature', 0.25)),
                     'region_capacity_factor': float(_layout.get(
                         'region_capacity_factor', 1.25)),
-                    'block_capacity_factor': float(_layout.get(
-                        'block_capacity_factor', 1.25)),
-                    'bucket_capacity_factor': float(_layout.get(
-                        'bucket_capacity_factor',
-                        _layout.get('block_capacity_factor', 1.25))),
-                    'high_regret_threshold': float(_layout.get(
-                        'high_regret_threshold', 0.05)),
+                    'spill_capacity': int(_layout.get(
+                        'spill_capacity', 0)),
                 })
             return _pool
 
@@ -13024,6 +13081,14 @@ def main():
             _opspace_materialized_training)
         cfg.setdefault('training', {})['operation_space'] = deepcopy(
             _opspace_materialized_training)
+        _opspace_load_smoothing_materialized = (
+            _v4168_normalize_operation_space_load_smoothing(
+                tcfg.get('operation_space_load_smoothing', {}),
+                warn_legacy=False))
+        training_config['operation_space_load_smoothing'] = deepcopy(
+            _opspace_load_smoothing_materialized)
+        cfg.setdefault('training', {})['operation_space_load_smoothing'] = (
+            deepcopy(_opspace_load_smoothing_materialized))
 
         def _opspace_backend_name(_label, _default):
             _layout = _opspace_training_layouts.get(_label, {})
@@ -13059,7 +13124,13 @@ def main():
             'tau_init_target_rst_frac',
             'tau_init_calibration_tokens',
             'soft_gate_effective_active_eps',
+            'admission_den_power',
             'admission_den_grad_scale',
+            'tau_lr_mult',
+            'tau_grad_clip',
+            'direct_tau',
+            'direct_tau_lr_mult',
+            'direct_tau_grad_clip',
             'soft_gate_boundary_power_start',
             'soft_gate_boundary_power_mid',
             'soft_gate_boundary_power_final',
@@ -13079,6 +13150,9 @@ def main():
         for _key in _inactive_tau_selection_keys:
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
+        training_config['opspace_gate_den_power'] = admission_den_power
+        cfg.setdefault('training', {})['opspace_gate_den_power'] = (
+            admission_den_power)
         for _key in (
                 'tau_init_attn_qk',
                 'tau_init_attn_v',
@@ -13605,10 +13679,8 @@ def main():
                         f"{(_physical_ops / _dense_ops) * 100.0:.2f}% "
                         f" region_capacity_factor="
                         f"{float(_layout.get('region_capacity_factor', 1.25))} "
-                        f"block_capacity_factor="
-                        f"{float(_layout.get('block_capacity_factor', 1.25))} "
-                        f"high_regret_threshold="
-                        f"{float(_layout.get('high_regret_threshold', 0.05))} "
+                        f"spill_capacity="
+                        f"{int(_layout.get('spill_capacity', 0))} "
                         f"region_score_pooling="
                         f"{_layout.get('region_score_pooling', 'smoothmax')}")
                 return _line
@@ -13616,7 +13688,7 @@ def main():
             print("[opspace] v4168 unified region/block/operator atlas active")
             print("[opspace] DirectTau/admission/drive/selection_calibration disabled for QK/V/RST outputs")
             print("[opspace] tau_init config not required in tau-free operation-space mode")
-            print("[opspace] denominator = max(sum(relu2_gate), 1.0) ** admission_den_power")
+            print("[opspace] denominator = max(sum(relu2_gate), 1.0) ** opspace_gate_den_power")
             print(_opspace_startup_layout_line('qk'))
             print(_opspace_startup_layout_line('v'))
             print(_opspace_startup_layout_line('rst'))
@@ -14336,15 +14408,10 @@ def main():
                     'execution_backend',
                     'sparse_region_block' if pool == 'rst'
                     else 'dense')).lower(),
-                'opspace_bucket_capacity_factor': float(layout.get(
-                    'bucket_capacity_factor',
-                    layout.get('block_capacity_factor', 1.25))),
-                'opspace_high_regret_threshold': float(layout.get(
-                    'high_regret_threshold', 0.05)),
                 'opspace_region_capacity_factor': float(layout.get(
                     'region_capacity_factor', 1.25)),
-                'opspace_block_capacity_factor': float(layout.get(
-                    'block_capacity_factor', 1.25)),
+                'opspace_spill_capacity': int(layout.get(
+                    'spill_capacity', 0)),
                 'opspace_num_regions': int(layout.get(
                     'num_regions', 32 if pool == 'rst' else 8)),
                 'opspace_blocks_per_region': int(layout.get(
@@ -14360,11 +14427,11 @@ def main():
                 'opspace_region_score_temperature': float(layout.get(
                     'region_score_temperature', 0.25)),
                 'opspace_load_smoothing_enabled': bool(layout.get(
-                    'load_smoothing_enabled', pool == 'rst')),
-                'opspace_load_smoothing_rst_region_weight': float(
-                    layout.get('load_smoothing_rst_region_weight', 3.0e-4)),
-                'opspace_load_smoothing_rst_block_weight': float(
-                    layout.get('load_smoothing_rst_block_weight', 0.0)),
+                    'load_smoothing_enabled', True)),
+                'opspace_load_smoothing_region_weight': float(
+                    layout.get('load_smoothing_region_weight', 3.0e-4)),
+                'opspace_load_smoothing_block_weight': float(
+                    layout.get('load_smoothing_block_weight', 0.0)),
                 'opspace_load_smoothing_load_temperature': float(
                     layout.get('load_smoothing_load_temperature', 0.7)),
                 'opspace_load_smoothing_space_temperature': float(
@@ -14382,18 +14449,6 @@ def main():
         def _srw_pool_kwargs(pool):
             kwargs = dict(_srw_base_kwargs)
             if str(model_version_cfg) == V4168_MODEL_VERSION:
-                m_cfg = cfg['model']
-                kwargs.update({
-                    'block_size': int(m_cfg.get(f'{pool}_block_size', 256)),
-                    'top_blocks': int(m_cfg.get(f'{pool}_top_blocks', 2)),
-                    'block_margin': float(m_cfg.get('block_margin', 0.0)),
-                    'hardware_sector_execution_enabled':
-                        hardware_sector_execution_enabled,
-                    'hardware_sector_debug_token_gather_fallback': bool(
-                        cfg['training'].get(
-                            'hardware_sector_debug_token_gather_fallback',
-                            False)),
-                })
                 kwargs.update(_opspace_pool_kwargs(pool))
             return kwargs
 
@@ -14401,12 +14456,16 @@ def main():
             'analysis' in _inspect.signature(make_sharded_srw).parameters
         )
         # Slim train kernel; analysis defaults to False.
-        _sharded_single_v = make_sharded_srw(
-            max_chunk_size=attn_v_max_chunk,
-            **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('v')))
-        _sharded_single_rst = make_sharded_srw(
-            max_chunk_size=rst_max_chunk,
-            **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('rst')))
+        if operation_space_tau_free_enabled:
+            _sharded_single_v = None
+            _sharded_single_rst = None
+        else:
+            _sharded_single_v = make_sharded_srw(
+                max_chunk_size=attn_v_max_chunk,
+                **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('v')))
+            _sharded_single_rst = make_sharded_srw(
+                max_chunk_size=rst_max_chunk,
+                **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('rst')))
         _sharded_single_qk_minimal = None
         _sharded_single_v_minimal = None
         _sharded_single_rst_minimal = None
@@ -14426,9 +14485,14 @@ def main():
                     make_sharded_srw_minimal, _srw_pool_kwargs('rst')))
         if hasattr(_v4164_module, 'make_sharded_srw_paired'):
             _paired_factory = _v4164_module.make_sharded_srw_paired
-            _sharded_paired_attn_qk = _v4164_module.make_sharded_srw_paired(
-                max_chunk_size=attn_qk_max_chunk,
-                **_factory_kwargs(_paired_factory, _srw_pool_kwargs('qk')))
+            if operation_space_tau_free_enabled:
+                _sharded_paired_attn_qk = None
+            else:
+                _sharded_paired_attn_qk = (
+                    _v4164_module.make_sharded_srw_paired(
+                        max_chunk_size=attn_qk_max_chunk,
+                        **_factory_kwargs(
+                            _paired_factory, _srw_pool_kwargs('qk'))))
             _sharded_paired_attn_qk_minimal = None
             if make_sharded_srw_paired_minimal is not None:
                 if operation_space_tau_free_enabled:
@@ -14488,10 +14552,6 @@ def main():
             _v4167_extra_fns = _extra_factory(mesh, cfg)
             _sharded_fns.update(_v4167_extra_fns)
         if operation_space_tau_free_enabled:
-            if hardware_repack_enabled or hardware_sector_execution_enabled:
-                raise RuntimeError(
-                    "operation_space enabled requires hardware repack and "
-                    "hardware sector execution to remain disabled.")
             if not isinstance(_sharded_fns, dict):
                 raise RuntimeError(
                     "operation_space enabled but required tau-free QK/V/RST "
@@ -14611,9 +14671,7 @@ def main():
                 _v4168_exec_mode = (
                     "operation_space_tau_free_relu"
                     if _opspace_enabled
-                    else ("vq_ivf_sector_bucketed"
-                          if hardware_sector_execution_enabled
-                          else "block_sparse_fallback"))
+                    else "operation_space_disabled")
                 _extra_msg = (
                     f"; v4168 minimal {_v4168_exec_mode} "
                     f"opspace_backend qk/v/rst="
@@ -14623,12 +14681,7 @@ def main():
                     if _opspace_enabled
                     else (
                         f"; v4168 minimal {_v4168_exec_mode} "
-                        f"block_size qk/v/rst={cfg['model'].get('qk_block_size', 256)}/"
-                        f"{cfg['model'].get('v_block_size', 256)}/"
-                        f"{cfg['model'].get('rst_block_size', 256)}, "
-                        f"top_blocks qk/v/rst={cfg['model'].get('qk_top_blocks', 2)}/"
-                        f"{cfg['model'].get('v_top_blocks', 2)}/"
-                        f"{cfg['model'].get('rst_top_blocks', 2)}"))
+                        "official operation_space inactive"))
                 if _vocab_parallel_enabled:
                     _extra_msg += "; v4168 TP extras=vocab_parallel_ce"
             _qk_mode_msg = (
@@ -14715,21 +14768,9 @@ def main():
                         flush=True)
                 else:
                     print(
-                        "v4168 hardware routing policy:\n"
-                        "  qk: dense_distributed\n"
-                        f"  v: vq_ivf_sector block_size={cfg['model'].get('v_block_size', 256)} "
-                        f"top_blocks={cfg['model'].get('v_top_blocks', 2)}\n"
-                        f"  rst: vq_ivf_sector block_size={cfg['model'].get('rst_block_size', 256)} "
-                        f"top_blocks={cfg['model'].get('rst_top_blocks', 2)}\n"
-                        f"  repack_strategy={hardware_repack_config['hardware_repack_strategy']}\n"
-                        f"  repack_interval_steps={hardware_repack_config['hardware_repack_interval_steps']}\n"
-                        f"  repack_warmup_steps={hardware_repack_config['hardware_repack_warmup_steps']}\n"
-                        f"  max_move_frac={hardware_repack_config['hardware_repack_max_move_frac']}\n"
-                        "  bucket_capacity_mult=1.5\n"
-                        "  bucket_capacity_round=multiple_of_128\n"
-                        "  fallback_in_fast_graph=false\n"
-                        f"  main_val_path={'sector_bucketed' if hardware_sector_execution_enabled else 'block_sparse_fallback'}\n"
-                        "  dense_ref_enabled=false",
+                        "v4168 operation_space is disabled; enable "
+                        "training.operation_space for the official "
+                        "Region/Block/Operator path.",
                         flush=True)
 
     _eval_sharded_fns = (
@@ -15660,11 +15701,9 @@ def main():
     main_val_path = (
         'operation_space_tau_free_relu'
         if operation_space_tau_free_enabled else (
-            'sector_bucketed'
-            if hardware_sector_execution_enabled
-            else ('block_sparse_fallback'
-                  if str(model_version_cfg) == V4168_MODEL_VERSION
-                  else 'standard')))
+            'operation_space_disabled'
+            if str(model_version_cfg) == V4168_MODEL_VERSION
+            else 'standard'))
     if is_host0:
         print(f"  Log cadence: regular={LOG_REGULAR}"
               f" analysis={LOG_ANALYSIS}"
@@ -15744,18 +15783,6 @@ def main():
                 jnp.asarray(global_step, jnp.int32))
 
             step_after_update = global_step + 1
-            if hardware_sector_execution_enabled:
-                metrics.update({
-                    k: jnp.asarray(v, dtype=jnp.float32)
-                    for k, v in _v4168_hardware_sector_static_metrics(
-                        cfg['model'],
-                        model_axis_size=mesh_model,
-                        batch_size=batch_size,
-                        max_seq_len=max_seq_len,
-                        data_axis_size=mesh_data,
-                        bucketed_execution_enabled=
-                        hardware_sector_execution_enabled).items()
-                })
             if operation_space_tau_free_enabled:
                 metrics.update({
                     k: jnp.asarray(v, dtype=jnp.float32)
@@ -15804,46 +15831,6 @@ def main():
                             'timestamp': datetime.now().isoformat(),
                         })
                         sync_logs()
-            if _v4168_should_hardware_repack(
-                    step_after_update, hardware_repack_config):
-                params, opt_state, repack_metrics = (
-                    _v4168_maybe_hardware_repack(
-                        params, opt_state, cfg['model'], mesh,
-                        step_after_update, hardware_repack_config))
-                if repack_metrics:
-                    _repack_moved = (
-                        float(repack_metrics.get(
-                            'repack/total_moved_count', 0.0)) > 0.0)
-                    if _repack_moved and drift_diagnostics_enabled:
-                        _prev_op_key_snap = _drift_snap(params)
-                        repack_metrics['repack/drift_snapshot_refreshed'] = 1.0
-                    metrics.update({
-                        k: jnp.asarray(v, dtype=jnp.float32)
-                        for k, v in repack_metrics.items()
-                    })
-                    if is_host0:
-                        for _pool in ('attn_v', 'rst'):
-                            _prefix = f'repack/{_pool}/'
-                            if (_prefix + 'moved_frac') in repack_metrics:
-                                log_message(
-                                    f"[VQ repack] pool="
-                                    f"{'v' if _pool == 'attn_v' else 'rst'} "
-                                    f"moved_frac={float(repack_metrics.get(_prefix + 'moved_frac', 0.0)):.6f} "
-                                    f"mean_compactness_cos={float(repack_metrics.get(_prefix + 'mean_compactness_cos', 0.0)):.6f} "
-                                    f"min_sector_size={float(repack_metrics.get(_prefix + 'min_sector_size', 0.0)):.0f} "
-                                    f"max_sector_size={float(repack_metrics.get(_prefix + 'max_sector_size', 0.0)):.0f} "
-                                    f"mean_sector_radius={float(repack_metrics.get(_prefix + 'mean_sector_radius', 0.0)):.6f} "
-                                    f"max_sector_radius={float(repack_metrics.get(_prefix + 'max_sector_radius', 0.0)):.6f}")
-                        log_jsonl({
-                            'type': 'hardware_repack',
-                            'step': int(step_after_update),
-                            'epoch': int(epoch),
-                            **{k: float(v)
-                               for k, v in repack_metrics.items()},
-                            'timestamp': datetime.now().isoformat(),
-                        })
-                        sync_logs()
-
             # Scalar helper kept for log-block use (m_grad etc.).
             def _m(v):
                 return float(v)
@@ -15885,19 +15872,12 @@ def main():
                     f"NaN/INF total_loss at epoch {epoch}, step {global_step + 1}")
             if _rst_final_backend_enabled:
                 _rst_final_guard = jax.device_get({
-                    'semantic_drop_frac': metrics.get(
-                        'opspace/rst/semantic_drop_frac',
-                        metrics.get(
-                            'opspace/rst/final/semantic_drop_frac',
-                            jnp.float32(0.0))),
                     'all_processed': metrics.get(
                         'opspace/rst/all_processed', jnp.float32(1.0)),
                     'selected_requests': metrics.get(
                         'opspace/rst/selected_requests', jnp.float32(0.0)),
                     'processed_requests': metrics.get(
                         'opspace/rst/processed_requests', jnp.float32(0.0)),
-                    'reroute_frac': metrics.get(
-                        'opspace/rst/reroute_frac', jnp.float32(0.0)),
                     'spill_overflow_count': metrics.get(
                         'opspace/rst/spill_overflow_count',
                         metrics.get(
@@ -15908,58 +15888,33 @@ def main():
                         metrics.get(
                             'opspace/rst/final/no_nan',
                             jnp.float32(1.0))),
-                    'unresolved_count': metrics.get(
-                        'opspace/rst/final/unresolved_count',
-                        jnp.float32(0.0)),
-                    'assignment_collision_count': metrics.get(
-                        'opspace/rst/assignment_collision_count',
-                        metrics.get(
-                            'opspace/rst/final/assignment_collision_count',
-                            jnp.float32(0.0))),
                 })
-                _rst_semantic_drop = float(
-                    _rst_final_guard['semantic_drop_frac'])
                 _rst_all_processed = float(
                     _rst_final_guard['all_processed'])
-                _rst_collision_count = float(
-                    _rst_final_guard['assignment_collision_count'])
                 _rst_no_nan = float(_rst_final_guard['no_nan'])
                 _rst_selected_requests = float(
                     _rst_final_guard['selected_requests'])
                 _rst_processed_requests = float(
                     _rst_final_guard['processed_requests'])
-                _rst_reroute_frac = float(_rst_final_guard['reroute_frac'])
                 _rst_spill_overflow_count = float(
                     _rst_final_guard['spill_overflow_count'])
-                if (_rst_semantic_drop > 0.0
-                        or _rst_all_processed < 1.0
+                if (_rst_all_processed < 1.0
                         or (_rst_processed_requests
                             < _rst_selected_requests - 0.5)
                         or _rst_spill_overflow_count > 0.0
-                        or _rst_reroute_frac != 0.0
-                        or _rst_collision_count > 0.0
                         or _rst_no_nan < 1.0):
                     raise RuntimeError(
                         "region/block RST fail-loud guard "
                         f"at epoch {epoch}, step {global_step + 1}: "
-                        f"opspace/rst/semantic_drop_frac="
-                        f"{_rst_semantic_drop:.9g}, "
                         f"opspace/rst/all_processed="
                         f"{_rst_all_processed:.9g}, "
                         f"opspace/rst/selected_requests="
                         f"{_rst_selected_requests:.9g}, "
                         f"opspace/rst/processed_requests="
                         f"{_rst_processed_requests:.9g}, "
-                        f"opspace/rst/reroute_frac="
-                        f"{_rst_reroute_frac:.9g}, "
                         f"opspace/rst/spill_overflow_count="
                         f"{_rst_spill_overflow_count:.9g}, "
-                        f"opspace/rst/no_nan={_rst_no_nan:.9g}, "
-                        "opspace/rst/final/"
-                        "unresolved_count="
-                        f"{float(_rst_final_guard['unresolved_count']):.9g}, "
-                        "opspace/rst/final/assignment_collision_count="
-                        f"{_rst_collision_count:.9g}")
+                        f"opspace/rst/no_nan={_rst_no_nan:.9g}")
 
             global_step += 1
             epoch_step_counter += 1

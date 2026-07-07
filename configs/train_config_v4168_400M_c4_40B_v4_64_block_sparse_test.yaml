@@ -35,24 +35,15 @@ training:
   lr: 0.0003
   warmup_ratio: 0.08
   weight_decay: 0.1
-  tau_lr_mult: 0.0
-  tau_grad_clip: 2.0
   router_proj_lr_mult: 1.0
   router_proj_grad_clip: 2.0
   op_key_lr_mult: 1.0
   op_key_grad_clip: 2.0
 
-  diversity_weight: 0.0
-  load_balance_weight: 0.0
-  dead_penalty_weight: 0.0
-  dead_exposure_target: 0.0
-
-  admission_den_power: 0.5
+  opspace_gate_den_power: 0.5
 
   operation_space_load_smoothing:
     enabled: true
-    rst_region_weight: 3.0e-4
-    rst_block_weight: 0.0
     load_temperature: 0.7
     space_temperature: 0.12
     alpha: 1.25
@@ -60,25 +51,41 @@ training:
     peak_tokens: 1000000000
     final_weight_frac: 1.0
 
+    qk:
+      region_weight: 3.0e-4
+      block_weight: 0.0
+
+    v:
+      region_weight: 3.0e-4
+      block_weight: 0.0
+
+    rst:
+      region_weight: 3.0e-4
+      block_weight: 0.0
+
   operation_space:
     enabled: true
 
     pools:
       qk:
         execution_backend: dense
-        num_regions: 16
-        blocks_per_region: 2
-        operators_per_block: 128
-        visible_regions: 2
-        visible_blocks_per_region: 1
+        num_regions: 8
+        visible_regions: 1
+        blocks_per_region: 5
+        operators_per_block: 96
+        visible_blocks_per_region: 3
+        region_score_pooling: smoothmax
+        region_score_temperature: 0.25
 
       v:
         execution_backend: dense
-        num_regions: 16
-        blocks_per_region: 8
-        operators_per_block: 128
-        visible_regions: 10
-        visible_blocks_per_region: 1
+        num_regions: 8
+        visible_regions: 1
+        blocks_per_region: 6
+        operators_per_block: 256
+        visible_blocks_per_region: 6
+        region_score_pooling: smoothmax
+        region_score_temperature: 0.25
 
       rst:
         execution_backend: sparse_region_block
@@ -86,12 +93,11 @@ training:
         visible_regions: 1
         blocks_per_region: 8
         operators_per_block: 512
-        visible_blocks_per_region: 4
+        visible_blocks_per_region: 7
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
-        region_capacity_factor: 1.50
-        block_capacity_factor: 1.50
-        high_regret_threshold: 0.05
+        region_capacity_factor: 1.5
+        spill_capacity: 8192
   checkpoint_interval: 200
   val_interval: 200
   log_interval: 100

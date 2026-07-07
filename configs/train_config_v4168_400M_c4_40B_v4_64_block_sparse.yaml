@@ -53,31 +53,31 @@ training:
     pools:
       qk:
         execution_backend: dense
-        num_regions: 16
-        blocks_per_region: 2
-        operators_per_block: 128
-        visible_regions: 2
-        visible_blocks_per_region: 1
+        num_regions: 8
+        visible_regions: 1
+        blocks_per_region: 5
+        operators_per_block: 96
+        visible_blocks_per_region: 3
 
       v:
         execution_backend: dense
-        num_regions: 16
-        blocks_per_region: 8
-        operators_per_block: 128
-        visible_regions: 10
-        visible_blocks_per_region: 1
+        num_regions: 8
+        visible_regions: 1
+        blocks_per_region: 6
+        operators_per_block: 256
+        visible_blocks_per_region: 6
 
       rst:
         execution_backend: sparse_region_block
-        num_regions: 4
+        num_regions: 8
         visible_regions: 1
-        blocks_per_region: 16
+        blocks_per_region: 8
         operators_per_block: 512
-        visible_blocks_per_region: 4
+        visible_blocks_per_region: 7
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
-        region_capacity_factor: 1.25
-        block_capacity_factor: 1.25
+        region_capacity_factor: 1.5
+        block_capacity_factor: 1.5
         high_regret_threshold: 0.05
   checkpoint_interval: 200
   val_interval: 1000
