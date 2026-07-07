@@ -53,11 +53,11 @@ training:
     final_weight_frac: 1.0
 
     qk:
-      region_weight: 3.0e-4
+      region_weight: 0.0
       block_weight: 0.0
 
     v:
-      region_weight: 3.0e-4
+      region_weight: 0.0
       block_weight: 0.0
 
     rst:
