@@ -139,7 +139,8 @@ OPSPACE_NO_DROP = True
 OPSPACE_BUCKET_OVERFLOW_SEMANTICS = True
 OPSPACE_RST_REGION_CAPACITY_ROUND_MULTIPLE = 1024
 OPSPACE_RST_BLOCK_CAPACITY_ROUND_MULTIPLE = 128
-OPSPACE_RST_COMPLETION_TOKEN_CHUNK_SIZE = 128
+OPSPACE_RST_SPILL_CAPACITY_FACTOR = 1.00
+OPSPACE_RST_SPILL_OVERFLOW_FAIL_LOUD = True
 
 OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'assignment_score_best_mean',
@@ -176,6 +177,8 @@ OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'visible_regions',
     'visible_blocks_per_region',
     'region_capacity',
+    'spill_capacity',
+    'total_region_capacity',
     'region_capacity_factor',
     'region_load_mean',
     'region_load_p50',
@@ -291,6 +294,8 @@ OPSPACE_FINAL_RUNTIME_DIAG_COUNT = len(OPSPACE_FINAL_RUNTIME_DIAG_NAMES)
     OPSPACE_FINAL_VISIBLE_REGIONS,
     OPSPACE_FINAL_VISIBLE_BLOCKS_PER_REGION,
     OPSPACE_FINAL_REGION_CAPACITY,
+    OPSPACE_FINAL_SPILL_CAPACITY,
+    OPSPACE_FINAL_TOTAL_REGION_CAPACITY,
     OPSPACE_FINAL_REGION_CAPACITY_FACTOR,
     OPSPACE_FINAL_REGION_LOAD_MEAN,
     OPSPACE_FINAL_REGION_LOAD_P50,
@@ -394,9 +399,13 @@ OPSPACE_COMPLETION_DIAG_NAMES = (
     'completion_active_chunks',
     'completion_total_chunks',
     'completion_active_chunk_frac',
+    'region_capacity',
+    'spill_capacity',
+    'total_region_capacity',
     'selected_requests',
     'processed_requests',
     'all_processed',
+    'no_nan',
     'semantic_drop_frac',
     'reroute_frac',
     'attempted_fill_mean',
@@ -4032,27 +4041,38 @@ def _opspace_build_selected_block_buckets(
 
 def _opspace_build_region_buckets(
         accepted_regions_global, accepted_mask, *, local_region_start,
-        local_regions, region_capacity):
-    """Create fixed region token buckets without block-level dispatch."""
+        local_regions, region_capacity, spill_capacity):
+    """Create fixed main+spill region token buckets."""
     T = int(accepted_regions_global.shape[0])
     visible_regions = int(accepted_regions_global.shape[1])
     del visible_regions
 
     token_ids = jnp.arange(T, dtype=jnp.int32)
-    token_id_bucket = jnp.zeros(
+    main_token_id_bucket = jnp.zeros(
         (int(local_regions), int(region_capacity)), dtype=jnp.int32)
-    bucket_valid_count = jnp.zeros(
+    main_bucket_valid_count = jnp.zeros(
         (int(local_regions), int(region_capacity)), dtype=jnp.float32)
-    overflow_token_mask = jnp.zeros(
-        (int(local_regions), T), dtype=jnp.bool_)
+    spill_token_id_bucket = jnp.zeros(
+        (int(local_regions), int(spill_capacity)), dtype=jnp.int32)
+    spill_bucket_valid_count = jnp.zeros(
+        (int(local_regions), int(spill_capacity)), dtype=jnp.float32)
     selected_request_count = jnp.float32(0.0)
+    main_processed_request_count = jnp.float32(0.0)
     overflow_count = jnp.float32(0.0)
+    completion_processed_request_count = jnp.float32(0.0)
+    spill_overflow_count = jnp.float32(0.0)
     local_region_start_i32 = jnp.asarray(local_region_start, dtype=jnp.int32)
     region_capacity_i32 = jnp.asarray(region_capacity, dtype=jnp.int32)
+    spill_capacity_i32 = jnp.asarray(spill_capacity, dtype=jnp.int32)
+    total_capacity_i32 = region_capacity_i32 + spill_capacity_i32
+    has_spill = int(spill_capacity) > 0
 
     def region_step(carry, region_i):
-        (token_id_bucket, bucket_valid_count, overflow_token_mask,
-         selected_request_count, overflow_count) = carry
+        (main_token_id_bucket, main_bucket_valid_count,
+         spill_token_id_bucket, spill_bucket_valid_count,
+         selected_request_count, main_processed_request_count,
+         overflow_count, completion_processed_request_count,
+         spill_overflow_count) = carry
         region_global = local_region_start_i32 + region_i
         match = jnp.any(
             jnp.logical_and(
@@ -4060,44 +4080,88 @@ def _opspace_build_region_buckets(
                 accepted_regions_global == region_global),
             axis=-1)
         rank = jnp.cumsum(match.astype(jnp.int32)) - 1
-        in_capacity = jnp.logical_and(match, rank < region_capacity_i32)
-        overflow = jnp.logical_and(match, jnp.logical_not(in_capacity))
-        write_rank = jnp.where(in_capacity, rank, region_capacity_i32)
-        write_f = in_capacity.astype(jnp.float32)
+        main_hit = jnp.logical_and(match, rank < region_capacity_i32)
+        overflow = jnp.logical_and(match, rank >= region_capacity_i32)
+        spill_rank = rank - region_capacity_i32
+        spill_hit = jnp.zeros_like(match)
+        spill_overflow = jnp.logical_and(match, rank >= total_capacity_i32)
 
-        token_id_bucket = token_id_bucket.at[region_i, write_rank].max(
+        main_write_rank = jnp.where(main_hit, rank, region_capacity_i32)
+        main_write_f = main_hit.astype(jnp.float32)
+        main_token_id_bucket = main_token_id_bucket.at[
+            region_i, main_write_rank].max(
             token_ids, mode='drop')
-        bucket_valid_count = bucket_valid_count.at[region_i, write_rank].add(
-            write_f, mode='drop')
-        overflow_token_mask = overflow_token_mask.at[region_i].set(overflow)
+        main_bucket_valid_count = main_bucket_valid_count.at[
+            region_i, main_write_rank].add(
+            main_write_f, mode='drop')
+
+        if has_spill:
+            spill_hit = jnp.logical_and(
+                overflow, spill_rank < spill_capacity_i32)
+            spill_write_rank = jnp.where(
+                spill_hit, spill_rank, spill_capacity_i32)
+            spill_write_f = spill_hit.astype(jnp.float32)
+            spill_token_id_bucket = spill_token_id_bucket.at[
+                region_i, spill_write_rank].max(
+                token_ids, mode='drop')
+            spill_bucket_valid_count = spill_bucket_valid_count.at[
+                region_i, spill_write_rank].add(
+                spill_write_f, mode='drop')
+
         selected_request_count = (
             selected_request_count + match.astype(jnp.float32).sum())
+        main_processed_request_count = (
+            main_processed_request_count + main_hit.astype(jnp.float32).sum())
         overflow_count = overflow_count + overflow.astype(jnp.float32).sum()
+        completion_processed_request_count = (
+            completion_processed_request_count
+            + spill_hit.astype(jnp.float32).sum())
+        spill_overflow_count = (
+            spill_overflow_count + spill_overflow.astype(jnp.float32).sum())
         return (
-            token_id_bucket, bucket_valid_count, overflow_token_mask,
-            selected_request_count, overflow_count), None
+            main_token_id_bucket, main_bucket_valid_count,
+            spill_token_id_bucket, spill_bucket_valid_count,
+            selected_request_count, main_processed_request_count,
+            overflow_count, completion_processed_request_count,
+            spill_overflow_count), None
 
-    (token_id_bucket, bucket_valid_count, overflow_token_mask,
-     selected_request_count, overflow_count), _ = jax.lax.scan(
+    (main_token_id_bucket, main_bucket_valid_count,
+     spill_token_id_bucket, spill_bucket_valid_count,
+     selected_request_count, main_processed_request_count,
+     overflow_count, completion_processed_request_count,
+     spill_overflow_count), _ = jax.lax.scan(
         region_step,
-        (token_id_bucket, bucket_valid_count, overflow_token_mask,
-         selected_request_count, overflow_count),
+        (main_token_id_bucket, main_bucket_valid_count,
+         spill_token_id_bucket, spill_bucket_valid_count,
+         selected_request_count, main_processed_request_count,
+         overflow_count, completion_processed_request_count,
+         spill_overflow_count),
         jnp.arange(int(local_regions), dtype=jnp.int32))
 
-    bucket_valid = bucket_valid_count == jnp.float32(1.0)
-    bucket_fill = bucket_valid.astype(jnp.float32).sum(axis=-1)
-    processed_request_count = bucket_valid.astype(jnp.float32).sum()
+    main_bucket_valid = main_bucket_valid_count == jnp.float32(1.0)
+    main_bucket_fill = main_bucket_valid.astype(jnp.float32).sum(axis=-1)
+    spill_bucket_valid = spill_bucket_valid_count == jnp.float32(1.0)
+    spill_bucket_fill = spill_bucket_valid.astype(jnp.float32).sum(axis=-1)
+    processed_request_count = (
+        main_processed_request_count + completion_processed_request_count)
     assignment_collision_count = jnp.maximum(
-        bucket_valid_count - jnp.float32(1.0), jnp.float32(0.0)).sum()
+        main_bucket_valid_count - jnp.float32(1.0), jnp.float32(0.0)).sum()
+    assignment_collision_count = assignment_collision_count + jnp.maximum(
+        spill_bucket_valid_count - jnp.float32(1.0), jnp.float32(0.0)).sum()
     return {
-        'token_id_bucket': token_id_bucket,
-        'bucket_valid': bucket_valid,
-        'bucket_fill': bucket_fill,
-        'overflow_token_mask': overflow_token_mask,
+        'main_token_id_bucket': main_token_id_bucket,
+        'main_bucket_valid': main_bucket_valid,
+        'main_bucket_fill': main_bucket_fill,
+        'spill_token_id_bucket': spill_token_id_bucket,
+        'spill_bucket_valid': spill_bucket_valid,
+        'spill_bucket_fill': spill_bucket_fill,
         'selected_request_count': selected_request_count,
         'processed_request_count': processed_request_count,
-        'main_processed_request_count': processed_request_count,
+        'main_processed_request_count': main_processed_request_count,
         'overflow_request_count': overflow_count,
+        'completion_processed_request_count': (
+            completion_processed_request_count),
+        'spill_overflow_count': spill_overflow_count,
         'assignment_collision_count': assignment_collision_count,
     }
 
@@ -4237,157 +4301,6 @@ def _opspace_execute_rst_region_dense_block_masked(
         compute_no_nan)
 
 
-def _opspace_accumulate_rst_overflow_completion_streaming(
-        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
-        overflow_token_mask, *, visible_blocks_per_region,
-        admission_den_power=None,
-        token_chunk_size=OPSPACE_RST_COMPLETION_TOKEN_CHUNK_SIZE):
-    """Stream exact overflow-only RST work in fixed token chunks."""
-    del admission_den_power
-    T = int(flat_x.shape[0])
-    D = int(flat_x.shape[-1])
-    local_regions = int(key_blocks.shape[0])
-    blocks_per_region = int(key_blocks.shape[1])
-    operators_per_block = int(key_blocks.shape[2])
-    region_ops = blocks_per_region * operators_per_block
-    route_dim = int(key_blocks.shape[-1])
-    chunk_size = max(1, int(token_chunk_size))
-    chunk_count = max(1, int(math.ceil(float(max(T, 1)) / float(chunk_size))))
-
-    flat_h_unit = _forward_unit_direction(
-        flat_h.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-    flat_x_bf = flat_x.astype(jnp.bfloat16)
-    chunk_offsets = jnp.arange(chunk_size, dtype=jnp.int32)
-    t_i32 = jnp.asarray(T, dtype=jnp.int32)
-    max_token_id = jnp.asarray(max(T - 1, 0), dtype=jnp.int32)
-
-    def compute_chunk(operand):
-        carry, args = operand
-        (flat_raw_out, flat_gate_mass, relu_gate_count_sum_local,
-         completion_processed_count, active_chunk_count, finite_acc) = carry
-        region_i, token_ids, safe_token_ids, overflow = args
-        valid_f = overflow.astype(jnp.float32)
-        valid_bf = valid_f.astype(jnp.bfloat16)
-
-        x_r = flat_x_bf[safe_token_ids] * valid_bf[:, None]
-        h_r = flat_h_unit[safe_token_ids] * valid_bf[:, None]
-        key_region_blocks = key_blocks[region_i]
-        valid_region_blocks = valid_blocks[region_i]
-        key_region = key_region_blocks.reshape(
-            region_ops, route_dim).astype(jnp.bfloat16)
-        read_region = read_blocks[region_i].reshape(
-            region_ops, D).astype(jnp.bfloat16)
-        write_region = write_blocks[region_i].reshape(
-            region_ops, D).astype(jnp.bfloat16)
-        valid_ops = valid_region_blocks.reshape(region_ops)
-
-        valid_block_f = valid_region_blocks.astype(jnp.float32)[..., None]
-        block_count = jnp.maximum(valid_block_f.sum(axis=1), 1.0)
-        block_center_raw = (
-            key_region_blocks.astype(jnp.float32) * valid_block_f
-        ).sum(axis=1) / block_count
-        block_center = jax.lax.stop_gradient(
-            _forward_unit_direction(block_center_raw)).astype(jnp.bfloat16)
-        block_score = jnp.einsum(
-            'cd,bd->cb', h_r, block_center).astype(jnp.float32)
-        block_mask = _opspace_semantic_block_mask_from_scores(
-            block_score, visible_blocks_per_region)
-        operator_mask = jnp.broadcast_to(
-            block_mask[..., None],
-            (chunk_size, blocks_per_region, operators_per_block)).reshape(
-                chunk_size, region_ops)
-        operator_mask = jnp.logical_and(operator_mask, valid_ops[None, :])
-
-        rho = jnp.einsum('cd,od->co', h_r, key_region).astype(jnp.float32)
-        read_value = jnp.einsum(
-            'cd,od->co', x_r, read_region).astype(jnp.float32)
-        gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
-        gate = gate * valid_f[:, None]
-        gate = gate * operator_mask.astype(jnp.float32)
-
-        raw_r = jnp.einsum(
-            'co,od->cd',
-            (gate * read_value).astype(jnp.bfloat16),
-            write_region).astype(jnp.float32)
-        mass_r = gate.sum(axis=-1, keepdims=True)
-        relu_r = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
-        relu_sum_r = (relu_r * valid_f).sum()
-
-        flat_raw_out = flat_raw_out.at[safe_token_ids].add(
-            raw_r * valid_f[:, None], mode='drop')
-        flat_gate_mass = flat_gate_mass.at[safe_token_ids].add(
-            mass_r * valid_f[:, None], mode='drop')
-        relu_gate_count_sum_local = (
-            relu_gate_count_sum_local + relu_sum_r)
-        completion_processed_count = (
-            completion_processed_count + valid_f.sum())
-        finite = jnp.logical_and(
-            jnp.all(jnp.isfinite(gate)), jnp.all(jnp.isfinite(raw_r)))
-        finite_acc = jnp.minimum(finite_acc, finite.astype(jnp.float32))
-        del token_ids
-        return (
-            flat_raw_out, flat_gate_mass, relu_gate_count_sum_local,
-            completion_processed_count, active_chunk_count, finite_acc)
-
-    def skip_chunk(operand):
-        carry, _args = operand
-        return carry
-
-    def chunk_step(carry, chunk_i):
-        region_i, chunk_j = carry[6]
-        token_start = chunk_j * jnp.asarray(chunk_size, dtype=jnp.int32)
-        token_ids = token_start + chunk_offsets
-        in_range = token_ids < t_i32
-        safe_token_ids = jnp.minimum(token_ids, max_token_id)
-        overflow = jnp.logical_and(
-            overflow_token_mask[region_i, safe_token_ids], in_range)
-        active = jnp.any(overflow)
-        carry_state = carry[:6]
-        carry_state = jax.lax.cond(
-            active,
-            compute_chunk,
-            skip_chunk,
-            (carry_state, (region_i, token_ids, safe_token_ids, overflow)))
-        (flat_raw_out, flat_gate_mass, relu_gate_count_sum_local,
-         completion_processed_count, active_chunk_count, finite_acc) = (
-            carry_state)
-        active_chunk_count = (
-            active_chunk_count + active.astype(jnp.float32))
-        return (
-            flat_raw_out, flat_gate_mass, relu_gate_count_sum_local,
-            completion_processed_count, active_chunk_count, finite_acc,
-            (region_i, chunk_j + jnp.asarray(1, dtype=jnp.int32))), None
-
-    def region_step(carry, region_i):
-        carry = (*carry, (region_i, jnp.asarray(0, dtype=jnp.int32)))
-        carry, _ = jax.lax.scan(
-            chunk_step, carry,
-            jnp.arange(chunk_count, dtype=jnp.int32))
-        return carry[:6], None
-
-    init = (
-        jnp.zeros((T, D), dtype=jnp.float32),
-        jnp.zeros((T, 1), dtype=jnp.float32),
-        jnp.float32(0.0),
-        jnp.float32(0.0),
-        jnp.float32(0.0),
-        jnp.float32(1.0),
-    )
-    (flat_raw_out_local, flat_gate_mass_local, relu_gate_count_sum_local,
-     completion_processed_count, active_chunk_count,
-     completion_no_nan) = jax.lax.scan(
-        region_step, init,
-        jnp.arange(local_regions, dtype=jnp.int32))[0]
-    return (
-        flat_raw_out_local,
-        flat_gate_mass_local,
-        relu_gate_count_sum_local,
-        completion_processed_count,
-        active_chunk_count,
-        jnp.float32(local_regions * chunk_count),
-        completion_no_nan)
-
-
 def _opspace_execute_rst_selected_block_sparse(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, *, admission_den_power):
@@ -4491,9 +4404,7 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         load_smoothing_space_temperature=0.12, load_smoothing_alpha=1.25,
         load_smoothing_warmup_tokens=2.0e8,
         load_smoothing_peak_tokens=1.0e9,
-        load_smoothing_final_weight_frac=1.0,
-        completion_enabled=True, spill_capacity_factor=0.25,
-        fallback_on_spill_overflow=True, assert_all_processed=True):
+        load_smoothing_final_weight_frac=1.0):
     """RST region-owned dense backend with token-wise semantic block masks.
 
     Region-Block Operation Atlas
@@ -4503,12 +4414,11 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     communication, and RW execution boundaries. Blocks are token-wise semantic
     masks inside the selected region, not physical dispatch buckets. Region
     and block routes are token-local top-k semantic decisions. Fixed-capacity
-    buckets are only the fast execution schedule; overflow takes the exact
-    selected-route completion path and is never dropped or rerouted. The only
-    continuous mixing/intensity occurs at the RW operator gate inside each
-    visible semantic block.
+    buckets are only the fast execution schedule; overflow from the main
+    bucket goes to a fixed spill/capacitor bucket and is never rerouted. The
+    only continuous mixing/intensity occurs at the RW operator gate inside
+    each visible semantic block.
     """
-    del assert_all_processed, fallback_on_spill_overflow
     if int(blocks_per_region) <= 0:
         raise ValueError(
             "sparse_region_block requires blocks_per_region > 0, got "
@@ -4576,7 +4486,7 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     raw_spill_capacity = max(
         0, int(math.ceil(
             (float(selected_region_requests) / float(num_regions))
-            * float(spill_capacity_factor))))
+            * float(OPSPACE_RST_SPILL_CAPACITY_FACTOR))))
     spill_capacity = (
         0 if raw_spill_capacity <= 0 else int(math.ceil(
             float(raw_spill_capacity) / float(region_capacity_round_multiple))
@@ -4715,55 +4625,51 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         selection['selected_regions_global'] >= 0,
         local_region_start=model_axis_index * int(local_regions),
         local_regions=local_regions,
-        region_capacity=region_capacity)
-    bucket_valid = region_buckets['bucket_valid']
-    bucket_fill = region_buckets['bucket_fill']
+        region_capacity=region_capacity,
+        spill_capacity=spill_capacity)
+    bucket_valid = region_buckets['main_bucket_valid']
+    bucket_fill = region_buckets['main_bucket_fill']
     assignment_collision_count = region_buckets[
         'assignment_collision_count']
 
     (main_raw_out_local, main_gate_mass_local, main_relu_gate_count_sum_local,
      main_no_nan) = _opspace_accumulate_rst_region_dense_block_masked(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks,
-        valid_blocks, region_buckets['token_id_bucket'], bucket_valid,
+        valid_blocks, region_buckets['main_token_id_bucket'], bucket_valid,
         visible_blocks_per_region=_visible_blocks_per_region,
         admission_den_power=admission_den_power)
 
-    if bool(completion_enabled):
-        (completion_raw_out_local, completion_gate_mass_local,
-         completion_relu_gate_count_sum_local,
-         completion_processed_count_local,
-         completion_active_chunk_count_local,
-         completion_total_chunk_count_local,
-         completion_no_nan) = (
-            _opspace_accumulate_rst_overflow_completion_streaming(
-                flat_x, flat_h, key_blocks, read_blocks, write_blocks,
-                valid_blocks, region_buckets['overflow_token_mask'],
-                visible_blocks_per_region=_visible_blocks_per_region,
-                admission_den_power=admission_den_power))
+    if int(spill_capacity) > 0:
+        (spill_raw_out_local, spill_gate_mass_local,
+         spill_relu_gate_count_sum_local,
+         spill_no_nan) = _opspace_accumulate_rst_region_dense_block_masked(
+            flat_x, flat_h, key_blocks, read_blocks, write_blocks,
+            valid_blocks, region_buckets['spill_token_id_bucket'],
+            region_buckets['spill_bucket_valid'],
+            visible_blocks_per_region=_visible_blocks_per_region,
+            admission_den_power=admission_den_power)
     else:
-        completion_raw_out_local = jnp.zeros_like(main_raw_out_local)
-        completion_gate_mass_local = jnp.zeros_like(main_gate_mass_local)
-        completion_relu_gate_count_sum_local = jnp.float32(0.0)
-        completion_processed_count_local = jnp.float32(0.0)
-        completion_active_chunk_count_local = jnp.float32(0.0)
-        completion_total_chunk_count_local = jnp.float32(
-            int(local_regions) * max(
-                1, int(math.ceil(
-                    float(max(T, 1))
-                    / float(OPSPACE_RST_COMPLETION_TOKEN_CHUNK_SIZE)))))
-        completion_no_nan = jnp.float32(1.0)
+        spill_raw_out_local = jnp.zeros_like(main_raw_out_local)
+        spill_gate_mass_local = jnp.zeros_like(main_gate_mass_local)
+        spill_relu_gate_count_sum_local = jnp.float32(0.0)
+        spill_no_nan = jnp.float32(1.0)
 
-    flat_raw_total_local = main_raw_out_local + completion_raw_out_local
+    completion_processed_count_local = region_buckets[
+        'completion_processed_request_count']
+    completion_active_chunk_count_local = jnp.float32(0.0)
+    completion_total_chunk_count_local = jnp.float32(0.0)
+
+    flat_raw_total_local = main_raw_out_local + spill_raw_out_local
     flat_gate_mass_total_local = (
-        main_gate_mass_local + completion_gate_mass_local)
+        main_gate_mass_local + spill_gate_mass_local)
     relu_gate_count_sum_total_local = (
         main_relu_gate_count_sum_local
-        + completion_relu_gate_count_sum_local)
+        + spill_relu_gate_count_sum_local)
     (flat_out, global_gate_mass, global_relu_gate_count_sum,
      gate_denominator) = _opspace_finalize_bucketed_output(
         flat_raw_total_local, flat_gate_mass_total_local,
         relu_gate_count_sum_total_local, admission_den_power)
-    compute_no_nan = jnp.minimum(main_no_nan, completion_no_nan)
+    compute_no_nan = jnp.minimum(main_no_nan, spill_no_nan)
 
     def data_sum(v):
         return jax.lax.pmean(jax.lax.psum(v, 'data'), 'model')
@@ -4784,6 +4690,8 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         'selected_block_mask_local'].astype(jnp.float32)
     block_load_total = semantic_block_mask_local.sum(axis=0)
     region_bucket_fill = bucket_fill.astype(jnp.float32)
+    main_processed_count_local = region_buckets[
+        'main_processed_request_count']
     processed_count_local = region_buckets['processed_request_count']
     valid_operator_slots_sum_local = jnp.sum(
         semantic_block_mask_local * valid_counts_by_block[None, :, :])
@@ -4796,6 +4704,7 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     reroute_accept_count_local = jnp.float32(0.0)
     block_unresolved_count_local = unresolved.astype(jnp.float32).sum()
     overflow_request_count_local = region_buckets['overflow_request_count']
+    spill_overflow_count_local = region_buckets['spill_overflow_count']
     unprocessed_count_local = (
         block_unresolved_count_local
         + assignment_collision_count)
@@ -4804,6 +4713,8 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     block_fill_sum_local = block_load_total.sum()
     block_fill_max_local = block_load_total.max()
 
+    global_main_processed_count = jax.lax.psum(
+        main_processed_count_local, 'model')
     global_processed_count = jax.lax.psum(processed_count_local, 'model')
     global_completion_processed_count = jax.lax.psum(
         completion_processed_count_local, 'model')
@@ -4820,6 +4731,8 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     global_unprocessed_count = jax.lax.psum(unprocessed_count_local, 'model')
     global_overflow_count = jax.lax.psum(
         overflow_request_count_local, 'model')
+    global_spill_overflow_count = jax.lax.psum(
+        spill_overflow_count_local, 'model')
     global_block_unresolved_count = jax.lax.psum(
         block_unresolved_count_local, 'model')
     global_assignment_collision_count = jax.lax.psum(
@@ -4840,18 +4753,17 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         admission['high_regret_spill_count'])
     block_unresolved_count = data_sum(global_block_unresolved_count)
     block_reroute_count = data_sum(global_reroute_accept_count)
-    main_processed_request_count = data_sum(global_processed_count)
+    main_processed_request_count = data_sum(global_main_processed_count)
     overflow_request_count = data_sum(global_overflow_count)
+    spill_overflow_count = data_sum(global_spill_overflow_count)
     completion_processed_request_count = data_sum(
         global_completion_processed_count)
     completion_active_chunks = data_sum(global_completion_active_chunk_count)
     completion_total_chunks = data_sum(global_completion_total_chunk_count)
     completion_active_chunk_frac = (
         completion_active_chunks / jnp.maximum(completion_total_chunks, 1.0))
-    completion_token_chunk_size = jnp.float32(
-        OPSPACE_RST_COMPLETION_TOKEN_CHUNK_SIZE)
-    processed_request_count = (
-        main_processed_request_count + completion_processed_request_count)
+    completion_token_chunk_size = jnp.float32(0.0)
+    processed_request_count = data_sum(global_processed_count)
     valid_operator_slots_mean = (
         data_sum(global_valid_operator_slots_sum) / token_count)
     relu_gate_count_mean = (
@@ -4870,15 +4782,12 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     unprocessed_count_global = data_sum(global_unprocessed_count)
     semantic_drop_count = (
         jnp.maximum(selected_request_count - processed_request_count, 0.0)
-        + region_unresolved_count + unprocessed_count_global)
+        + spill_overflow_count + region_unresolved_count
+        + unprocessed_count_global)
     overflow_frac = overflow_request_count / jnp.maximum(
         selected_request_count, 1.0)
     spill_frac = overflow_frac
-    spill_overflow_count = jnp.maximum(
-        overflow_request_count
-        - jnp.float32(num_regions * int(spill_capacity)),
-        jnp.float32(0.0))
-    fallback_frac = overflow_frac
+    fallback_frac = jnp.float32(0.0)
     semantic_drop_frac = semantic_drop_count / jnp.maximum(
         selected_request_count, 1.0)
     bucket_count_global = jnp.float32(num_regions)
@@ -4910,8 +4819,9 @@ def _opspace_tau_free_relu_region_block_sparse_core(
                     'model'), 'data')
     attempted_fill_max = region_load_max
     required_capacity_no_overflow = attempted_fill_max
+    total_region_capacity = int(region_capacity) + int(spill_capacity)
     capacity_shortfall = jnp.maximum(
-        required_capacity_no_overflow - jnp.float32(region_capacity),
+        required_capacity_no_overflow - jnp.float32(total_region_capacity),
         jnp.float32(0.0))
     region_load_p50 = region_load_mean
     region_load_p95 = region_load_max
@@ -4945,7 +4855,9 @@ def _opspace_tau_free_relu_region_block_sparse_core(
     padded_operator_slots_mean = (
         jnp.float32(visible_operator_slots) - valid_operator_slots_mean)
     all_requests_processed = jnp.logical_and(
-        processed_request_count >= selected_request_count - 0.5,
+        jnp.logical_and(
+            processed_request_count >= selected_request_count - 0.5,
+            spill_overflow_count <= 0.0),
         semantic_drop_count <= 0.0).astype(jnp.float32)
     region_all_requests_processed = (
         region_unresolved_count <= 0.0).astype(jnp.float32)
@@ -5131,6 +5043,8 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         jnp.float32(visible_regions),
         jnp.float32(_visible_blocks_per_region),
         jnp.float32(region_capacity),
+        jnp.float32(spill_capacity),
+        jnp.float32(total_region_capacity),
         jnp.float32(_region_capacity_factor),
         region_load_mean,
         region_load_p50,
@@ -5221,9 +5135,13 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         completion_active_chunks,
         completion_total_chunks,
         completion_active_chunk_frac,
+        jnp.float32(region_capacity),
+        jnp.float32(spill_capacity),
+        jnp.float32(total_region_capacity),
         selected_request_count,
         processed_request_count,
         all_requests_processed,
+        no_nan,
         semantic_drop_frac,
         reroute_frac,
         attempted_fill_mean,
@@ -5271,11 +5189,7 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
         load_smoothing_alpha=1.25,
         load_smoothing_warmup_tokens=2.0e8,
         load_smoothing_peak_tokens=1.0e9,
-        load_smoothing_final_weight_frac=1.0,
-        completion_enabled=True,
-        spill_capacity_factor=0.25,
-        fallback_on_spill_overflow=True,
-        assert_all_processed=True):
+        load_smoothing_final_weight_frac=1.0):
     """Create the RST region-dense semantic-block atlas executor."""
     del max_chunk_size, dead_exposure_target, padded_ops, token_chunk_size
     del soft_gate_effective_active_eps, admission_den_grad_scale
@@ -5312,14 +5226,6 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
     _load_smoothing_peak_tokens = float(load_smoothing_peak_tokens)
     _load_smoothing_final_weight_frac = float(
         load_smoothing_final_weight_frac)
-    _completion_enabled = bool(completion_enabled)
-    _spill_capacity_factor = float(spill_capacity_factor)
-    _fallback_on_spill_overflow = bool(fallback_on_spill_overflow)
-    _assert_all_processed = bool(assert_all_processed)
-    if _spill_capacity_factor < 0.0:
-        raise ValueError(
-            "operation-space completion spill_capacity_factor must be >= 0, "
-            f"got {spill_capacity_factor}.")
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),
@@ -5377,11 +5283,7 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
                     _load_smoothing_warmup_tokens),
                 load_smoothing_peak_tokens=_load_smoothing_peak_tokens,
                 load_smoothing_final_weight_frac=(
-                    _load_smoothing_final_weight_frac),
-                completion_enabled=_completion_enabled,
-                spill_capacity_factor=_spill_capacity_factor,
-                fallback_on_spill_overflow=_fallback_on_spill_overflow,
-                assert_all_processed=_assert_all_processed))
+                    _load_smoothing_final_weight_frac)))
         return flat_out.reshape(B, S, D), diag, aux
 
     fused_gate_srw_tau_free_relu_region_block_sparse._v4168_accepts_training_tokens = True
@@ -6597,14 +6499,10 @@ def operation_space_static_metrics(model_config, config=None,
                 pcfg.get('load_smoothing_rst_region_weight', 3.0e-4))
             out[f'opspace/{label}/load_smoothing_rst_block_weight'] = float(
                 pcfg.get('load_smoothing_rst_block_weight', 0.0))
-            out[f'opspace/{label}/completion_enabled'] = float(
-                pcfg.get('completion_enabled', True))
-            out[f'opspace/{label}/completion_spill_capacity_factor'] = float(
-                pcfg.get('completion_spill_capacity_factor', 0.25))
-            out[
-                f'opspace/{label}/completion_fallback_on_spill_overflow'
-            ] = float(pcfg.get(
-                'completion_fallback_on_spill_overflow', True))
+            out[f'opspace/{label}/spill_capacity_factor'] = float(
+                OPSPACE_RST_SPILL_CAPACITY_FACTOR)
+            out[f'opspace/{label}/spill_overflow_fail_loud'] = float(
+                OPSPACE_RST_SPILL_OVERFLOW_FAIL_LOUD)
     return out
 
 
@@ -6997,6 +6895,8 @@ def _opspace_final_runtime_metric_dict(prefix, aux):
             'visible_regions',
             'visible_blocks_per_region',
             'region_capacity',
+            'spill_capacity',
+            'total_region_capacity',
             'region_capacity_factor',
             'region_load_mean',
             'region_load_p50',
@@ -8862,10 +8762,6 @@ def make_sharded_srw_minimal(
         opspace_load_smoothing_warmup_tokens=2.0e8,
         opspace_load_smoothing_peak_tokens=1.0e9,
         opspace_load_smoothing_final_weight_frac=1.0,
-        opspace_completion_enabled=True,
-        opspace_completion_spill_capacity_factor=0.25,
-        opspace_completion_fallback_on_spill_overflow=True,
-        opspace_completion_assert_all_processed=True,
         opspace_token_chunk_size=256):
     execution_backend = str(
         operation_space_execution_backend
@@ -8920,14 +8816,7 @@ def make_sharded_srw_minimal(
                 opspace_load_smoothing_warmup_tokens),
             load_smoothing_peak_tokens=opspace_load_smoothing_peak_tokens,
             load_smoothing_final_weight_frac=(
-                opspace_load_smoothing_final_weight_frac),
-            completion_enabled=opspace_completion_enabled,
-            spill_capacity_factor=(
-                opspace_completion_spill_capacity_factor),
-            fallback_on_spill_overflow=(
-                opspace_completion_fallback_on_spill_overflow),
-            assert_all_processed=(
-                opspace_completion_assert_all_processed))
+                opspace_load_smoothing_final_weight_frac))
     if execution_backend:
         raise ValueError(
             "v4168 operation_space supports execution_backend='dense' for QK/V "

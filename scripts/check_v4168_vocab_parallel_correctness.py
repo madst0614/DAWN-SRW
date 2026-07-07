@@ -643,14 +643,6 @@ def _build_v4168_sharded_fns(cfg, mesh, token_chunk_size, seq_len):
                 layout.get("load_smoothing_peak_tokens", 1.0e9)),
             "opspace_load_smoothing_final_weight_frac": float(
                 layout.get("load_smoothing_final_weight_frac", 1.0)),
-            "opspace_completion_enabled": bool(layout.get(
-                "completion_enabled", pool == "rst")),
-            "opspace_completion_spill_capacity_factor": float(
-                layout.get("completion_spill_capacity_factor", 0.25)),
-            "opspace_completion_fallback_on_spill_overflow": bool(layout.get(
-                "completion_fallback_on_spill_overflow", True)),
-            "opspace_completion_assert_all_processed": bool(layout.get(
-                "completion_assert_all_processed", True)),
         }
 
     def srw_pool_kwargs(pool):

@@ -913,12 +913,6 @@ def v4168_operation_space_backend_layouts(cfg):
     if not isinstance(load_smoothing, dict):
         raise ValueError(
             "training.operation_space_load_smoothing must be a mapping.")
-    completion = t.get("operation_space_completion", {})
-    if completion is None:
-        completion = {}
-    if not isinstance(completion, dict):
-        raise ValueError(
-            "training.operation_space_completion must be a mapping.")
     load_smoothing_defaults = {
         "load_smoothing_enabled": _bool(load_smoothing.get("enabled", True)),
         "load_smoothing_rst_region_weight": float(
@@ -936,15 +930,6 @@ def v4168_operation_space_backend_layouts(cfg):
             load_smoothing.get("peak_tokens", 1.0e9)),
         "load_smoothing_final_weight_frac": float(
             load_smoothing.get("final_weight_frac", 1.0)),
-    }
-    completion_defaults = {
-        "completion_enabled": _bool(completion.get("enabled", True)),
-        "completion_spill_capacity_factor": float(
-            completion.get("spill_capacity_factor", 0.25)),
-        "completion_fallback_on_spill_overflow": _bool(
-            completion.get("fallback_on_spill_overflow", True)),
-        "completion_assert_all_processed": _bool(
-            completion.get("assert_all_processed", True)),
     }
 
     for label, default in defaults.items():
@@ -1163,16 +1148,6 @@ def v4168_operation_space_backend_layouts(cfg):
             "load_smoothing_final_weight_frac": (
                 load_smoothing_defaults[
                     "load_smoothing_final_weight_frac"]),
-            "completion_enabled": (
-                completion_defaults["completion_enabled"]
-                if label == "rst" else False),
-            "completion_spill_capacity_factor": (
-                completion_defaults["completion_spill_capacity_factor"]),
-            "completion_fallback_on_spill_overflow": (
-                completion_defaults[
-                    "completion_fallback_on_spill_overflow"]),
-            "completion_assert_all_processed": (
-                completion_defaults["completion_assert_all_processed"]),
             "global_operator_capacity": total_capacity,
             "local_operator_capacity": total_capacity // mesh_model,
             "operator_capacity": total_capacity,
@@ -1250,12 +1225,6 @@ def v4168_operation_space_layouts(cfg):
     if not isinstance(load_smoothing, dict):
         raise ValueError(
             "training.operation_space_load_smoothing must be a mapping.")
-    completion = t.get("operation_space_completion", {})
-    if completion is None:
-        completion = {}
-    if not isinstance(completion, dict):
-        raise ValueError(
-            "training.operation_space_completion must be a mapping.")
     load_smoothing_defaults = {
         "load_smoothing_enabled": _bool(load_smoothing.get("enabled", True)),
         "load_smoothing_rst_region_weight": float(
@@ -1273,15 +1242,6 @@ def v4168_operation_space_layouts(cfg):
             load_smoothing.get("peak_tokens", 1.0e9)),
         "load_smoothing_final_weight_frac": float(
             load_smoothing.get("final_weight_frac", 1.0)),
-    }
-    completion_defaults = {
-        "completion_enabled": _bool(completion.get("enabled", True)),
-        "completion_spill_capacity_factor": float(
-            completion.get("spill_capacity_factor", 0.25)),
-        "completion_fallback_on_spill_overflow": _bool(
-            completion.get("fallback_on_spill_overflow", True)),
-        "completion_assert_all_processed": _bool(
-            completion.get("assert_all_processed", True)),
     }
 
     removed_pool_keys = {
@@ -1557,16 +1517,6 @@ def v4168_operation_space_layouts(cfg):
             "load_smoothing_final_weight_frac": (
                 load_smoothing_defaults[
                     "load_smoothing_final_weight_frac"]),
-            "completion_enabled": (
-                completion_defaults["completion_enabled"]
-                if pool == "rst" else False),
-            "completion_spill_capacity_factor": (
-                completion_defaults["completion_spill_capacity_factor"]),
-            "completion_fallback_on_spill_overflow": (
-                completion_defaults[
-                    "completion_fallback_on_spill_overflow"]),
-            "completion_assert_all_processed": (
-                completion_defaults["completion_assert_all_processed"]),
         }
     return layouts
 
@@ -1623,14 +1573,6 @@ def v4168_operation_space_pool_kwargs(layout):
             layout.get("load_smoothing_peak_tokens", 1.0e9)),
         "opspace_load_smoothing_final_weight_frac": float(
             layout.get("load_smoothing_final_weight_frac", 1.0)),
-        "opspace_completion_enabled": bool(
-            layout.get("completion_enabled", False)),
-        "opspace_completion_spill_capacity_factor": float(
-            layout.get("completion_spill_capacity_factor", 0.25)),
-        "opspace_completion_fallback_on_spill_overflow": bool(
-            layout.get("completion_fallback_on_spill_overflow", True)),
-        "opspace_completion_assert_all_processed": bool(
-            layout.get("completion_assert_all_processed", True)),
     }
     if "execution_backend" in layout:
         kwargs["operation_space_execution_backend"] = str(

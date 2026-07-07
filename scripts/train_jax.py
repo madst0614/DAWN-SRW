@@ -1355,6 +1355,7 @@ def _migrate_v4168_operation_space_full_config_for_clean_schema(full_config):
     training_cfg = normalized.get('training', {})
     if not isinstance(training_cfg, dict):
         return normalized
+    training_cfg.pop('operation_space_completion', None)
     opspace = training_cfg.get('operation_space', {})
     if not isinstance(opspace, dict):
         return normalized
@@ -1518,6 +1519,11 @@ def _v4168_validate_operation_space_shape(opspace):
 
 
 def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
+    if 'operation_space_completion' in training_cfg:
+        raise ValueError(
+            "training.operation_space_completion was removed.\n"
+            "v4168 RST uses fixed main+spill capacitor buckets.\n"
+            "Remove operation_space_completion from the config.")
     opspace = _v4168_operation_space_cfg(training_cfg)
     _v4168_validate_operation_space_shape(opspace)
     pools = opspace.get('pools', {})
@@ -1529,12 +1535,6 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
     if not isinstance(load_smoothing, dict):
         raise ValueError(
             "training.operation_space_load_smoothing must be a mapping.")
-    completion = training_cfg.get('operation_space_completion', {})
-    if completion is None:
-        completion = {}
-    if not isinstance(completion, dict):
-        raise ValueError(
-            "training.operation_space_completion must be a mapping.")
     load_smoothing_enabled = _cfg_bool(
         load_smoothing.get('enabled', True),
         name='training.operation_space_load_smoothing.enabled')
@@ -1583,21 +1583,6 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
     if load_smoothing_final_weight_frac < 0.0:
         raise ValueError(
             "training.operation_space_load_smoothing.final_weight_frac "
-            "must be >= 0.")
-    completion_enabled = _cfg_bool(
-        completion.get('enabled', True),
-        name='training.operation_space_completion.enabled')
-    completion_spill_capacity_factor = float(
-        completion.get('spill_capacity_factor', 0.25))
-    completion_fallback_on_spill_overflow = _cfg_bool(
-        completion.get('fallback_on_spill_overflow', True),
-        name='training.operation_space_completion.fallback_on_spill_overflow')
-    completion_assert_all_processed = _cfg_bool(
-        completion.get('assert_all_processed', True),
-        name='training.operation_space_completion.assert_all_processed')
-    if completion_spill_capacity_factor < 0.0:
-        raise ValueError(
-            "training.operation_space_completion.spill_capacity_factor "
             "must be >= 0.")
     device_count = _v4168_operation_space_device_count(training_cfg)
     defaults = {
@@ -1751,14 +1736,6 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             'load_smoothing_peak_tokens': load_smoothing_peak_tokens,
             'load_smoothing_final_weight_frac': (
                 load_smoothing_final_weight_frac),
-            'completion_enabled': (
-                completion_enabled if label == 'rst' else False),
-            'completion_spill_capacity_factor': (
-                completion_spill_capacity_factor),
-            'completion_fallback_on_spill_overflow': (
-                completion_fallback_on_spill_overflow),
-            'completion_assert_all_processed': (
-                completion_assert_all_processed),
             'global_operator_capacity': total_capacity,
             'local_operator_capacity': total_capacity // device_count,
             'operator_capacity': total_capacity,
@@ -14400,15 +14377,6 @@ def main():
                     layout.get('load_smoothing_peak_tokens', 1.0e9)),
                 'opspace_load_smoothing_final_weight_frac': float(
                     layout.get('load_smoothing_final_weight_frac', 1.0)),
-                'opspace_completion_enabled': bool(layout.get(
-                    'completion_enabled', pool == 'rst')),
-                'opspace_completion_spill_capacity_factor': float(
-                    layout.get('completion_spill_capacity_factor', 0.25)),
-                'opspace_completion_fallback_on_spill_overflow': bool(
-                    layout.get(
-                        'completion_fallback_on_spill_overflow', True)),
-                'opspace_completion_assert_all_processed': bool(layout.get(
-                    'completion_assert_all_processed', True)),
             }
 
         def _srw_pool_kwargs(pool):
@@ -15930,6 +15898,11 @@ def main():
                         'opspace/rst/processed_requests', jnp.float32(0.0)),
                     'reroute_frac': metrics.get(
                         'opspace/rst/reroute_frac', jnp.float32(0.0)),
+                    'spill_overflow_count': metrics.get(
+                        'opspace/rst/spill_overflow_count',
+                        metrics.get(
+                            'opspace/rst/final/spill_overflow_count',
+                            jnp.float32(0.0))),
                     'no_nan': metrics.get(
                         'opspace/rst/no_nan',
                         metrics.get(
@@ -15956,10 +15929,13 @@ def main():
                 _rst_processed_requests = float(
                     _rst_final_guard['processed_requests'])
                 _rst_reroute_frac = float(_rst_final_guard['reroute_frac'])
+                _rst_spill_overflow_count = float(
+                    _rst_final_guard['spill_overflow_count'])
                 if (_rst_semantic_drop > 0.0
                         or _rst_all_processed < 1.0
                         or (_rst_processed_requests
                             < _rst_selected_requests - 0.5)
+                        or _rst_spill_overflow_count > 0.0
                         or _rst_reroute_frac != 0.0
                         or _rst_collision_count > 0.0
                         or _rst_no_nan < 1.0):
@@ -15976,6 +15952,8 @@ def main():
                         f"{_rst_processed_requests:.9g}, "
                         f"opspace/rst/reroute_frac="
                         f"{_rst_reroute_frac:.9g}, "
+                        f"opspace/rst/spill_overflow_count="
+                        f"{_rst_spill_overflow_count:.9g}, "
                         f"opspace/rst/no_nan={_rst_no_nan:.9g}, "
                         "opspace/rst/final/"
                         "unresolved_count="

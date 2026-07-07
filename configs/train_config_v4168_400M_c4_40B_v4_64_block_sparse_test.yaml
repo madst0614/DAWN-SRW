@@ -60,12 +60,6 @@ training:
     peak_tokens: 1000000000
     final_weight_frac: 1.0
 
-  operation_space_completion:
-    enabled: true
-    spill_capacity_factor: 0.25
-    fallback_on_spill_overflow: true
-    assert_all_processed: true
-
   operation_space:
     enabled: true
 
