@@ -27,25 +27,41 @@ training:
   mesh_data: 16
   gradient_accumulation_steps: 1
   num_epochs: 1
+  ce_token_chunk_size: 32768
+  train_compute_accuracy: true
   n_chunks_qk: 1
   n_chunks_v: 1
   n_chunks_rst: 4
   lr: 0.0003
   warmup_ratio: 0.08
   weight_decay: 0.1
-  tau_lr_mult: 0.0
-  tau_grad_clip: 2.0
   router_proj_lr_mult: 1.0
   router_proj_grad_clip: 2.0
   op_key_lr_mult: 1.0
   op_key_grad_clip: 2.0
 
-  diversity_weight: 0.0
-  load_balance_weight: 0.0
-  dead_penalty_weight: 0.0
-  dead_exposure_target: 0.0
+  opspace_gate_den_power: 0.5
 
-  admission_den_power: 0.5
+  operation_space_load_smoothing:
+    enabled: true
+    load_temperature: 0.7
+    space_temperature: 0.12
+    alpha: 1.25
+    warmup_tokens: 0
+    peak_tokens: 1000000000
+    final_weight_frac: 1.0
+
+    qk:
+      region_weight: 3.0e-4
+      block_weight: 0.0
+
+    v:
+      region_weight: 3.0e-4
+      block_weight: 0.0
+
+    rst:
+      region_weight: 3.0e-4
+      block_weight: 0.0
 
   operation_space:
     enabled: true
@@ -58,6 +74,8 @@ training:
         blocks_per_region: 5
         operators_per_block: 96
         visible_blocks_per_region: 3
+        region_score_pooling: smoothmax
+        region_score_temperature: 0.25
 
       v:
         execution_backend: dense
@@ -66,6 +84,8 @@ training:
         blocks_per_region: 6
         operators_per_block: 256
         visible_blocks_per_region: 6
+        region_score_pooling: smoothmax
+        region_score_temperature: 0.25
 
       rst:
         execution_backend: sparse_region_block
@@ -77,12 +97,11 @@ training:
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
         region_capacity_factor: 1.5
-        block_capacity_factor: 1.5
-        high_regret_threshold: 0.05
+        spill_capacity: 8192
   checkpoint_interval: 200
-  val_interval: 1000
+  val_interval: 200
   log_interval: 100
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_region_block_qk256_v1280_rst2048
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_region_block
