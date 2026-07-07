@@ -4694,8 +4694,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _use_minimal_train_path = (
-        str(_model_version) == V4168_MODEL_VERSION
+        str(_model_version) in (V4166_MODEL_VERSION, V4168_MODEL_VERSION)
         and _pass_minimal_train_kw)
+    if jax.process_index() == 0:
+        print(
+            f"train minimal path: enabled={_use_minimal_train_path} "
+            f"model_version={_model_version}",
+            flush=True,
+        )
     _is_baseline_model = bool(is_baseline) or _is_baseline_version(_model_version)
     _is_soft_direct_tau = _is_active_srw_version(_model_version)
     _is_v4166_model = _is_rw_key_srw_version(_model_version)
