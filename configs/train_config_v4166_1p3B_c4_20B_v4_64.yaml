@@ -35,7 +35,7 @@ training:
   mesh_data: 16
   gradient_accumulation_steps: 1
   num_epochs: 1
-  ce_token_chunk_size: 8192
+  ce_token_chunk_size: 16384
   train_compute_accuracy: false
   n_chunks_qk: 1
   n_chunks_v: 2
@@ -87,8 +87,8 @@ training:
 
     annealing:
       unit: tokens
-      shrink_start_tokens: 5000000000
-      shrink_end_tokens: 20000000000
+      shrink_start_tokens: 3000000000
+      shrink_end_tokens: 12000000000
 
   soft_gate_effective_active_eps: 1.0e-06
   admission_den_power: 0.5
@@ -112,4 +112,4 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new
