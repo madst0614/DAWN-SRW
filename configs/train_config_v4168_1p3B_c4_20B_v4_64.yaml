@@ -21,20 +21,20 @@ model:
   router_dropout: 0.0
   gradient_checkpointing: true
 
-  d_route: 384
+  d_route: 256
 
   n_qk: 7048
   n_v: 21928
   n_rst: 58896
 
 training:
-  batch_size: 448
+  batch_size: 512
   mesh_model: 4
   mesh_data: 8
   gradient_accumulation_steps: 1
   num_epochs: 1
 
-  ce_token_chunk_size: 8192
+  ce_token_chunk_size: 4096
   train_compute_accuracy: false
 
   n_chunks_qk: 1
