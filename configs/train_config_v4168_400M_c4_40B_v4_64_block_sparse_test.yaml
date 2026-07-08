@@ -43,7 +43,7 @@ training:
   opspace_gate_den_power: 0.5
 
   operation_space_load_smoothing:
-    enabled: true
+    enabled: false
     mode: barrier_capacity_geometry
 
     load_temperature: 0.1
@@ -61,7 +61,7 @@ training:
       block_weight: 0.0
 
     rst:
-      region_weight: 1.0e-1
+      region_weight: 1.0e-2
       block_weight: 0.0
 
   operation_space:
@@ -89,7 +89,7 @@ training:
         region_score_temperature: 0.25
 
       rst:
-        execution_backend: sparse_region_block
+        execution_backend: paged_region_pool
         num_regions: 8
         visible_regions: 1
         blocks_per_region: 8
@@ -97,8 +97,7 @@ training:
         visible_blocks_per_region: 7
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
-        region_capacity_factor: 1.5
-        spill_capacity: 30000
+        page_size: 4096
   checkpoint_interval: 200
   val_interval: 200
   log_interval: 100

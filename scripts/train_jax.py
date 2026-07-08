@@ -919,6 +919,10 @@ V4168_OPSPACE_SPARSE_RUNTIME_RESUME_REQUIRED_FIELDS = (
      'spill_capacity'),
 )
 
+V4168_OPSPACE_PAGED_RUNTIME_RESUME_REQUIRED_FIELDS = (
+    ('training', 'operation_space', 'pools', 'rst', 'page_size'),
+)
+
 V4168_OPSPACE_LOAD_SMOOTHING_RESUME_REQUIRED_FIELDS = (
     ('training', 'operation_space_load_smoothing', 'enabled'),
     *tuple(
@@ -1008,6 +1012,9 @@ def _require_resume_materialized_fields(full_config):
         if rst_execution_backend == 'sparse_region_block':
             required_fields.extend(
                 V4168_OPSPACE_SPARSE_RUNTIME_RESUME_REQUIRED_FIELDS)
+        if rst_execution_backend == 'paged_region_pool':
+            required_fields.extend(
+                V4168_OPSPACE_PAGED_RUNTIME_RESUME_REQUIRED_FIELDS)
         if 'operation_space_load_smoothing' in training_cfg:
             required_fields.extend(
                 V4168_OPSPACE_LOAD_SMOOTHING_RESUME_REQUIRED_FIELDS)
@@ -1602,6 +1609,7 @@ def _v4168_validate_operation_space_shape(opspace):
     sparse_runtime_keys = {
         'region_capacity_factor',
         'spill_capacity',
+        'page_size',
     }
     for label in ('qk', 'v', 'rst'):
         pool = pools.get(label, {})
@@ -1632,7 +1640,7 @@ def _v4168_validate_operation_space_shape(opspace):
             raise ValueError(
                 f"training.operation_space.pools.{label} only supports "
                 "the official operation-space logical selector fields"
-                + (" plus sparse runtime fields" if label == 'rst' else "")
+                + (" plus RST runtime fields" if label == 'rst' else "")
                 + "; remove: "
                 f"{', '.join(extra)}")
     repack = opspace.get('repack', {})
@@ -1691,12 +1699,6 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         execution_backend = str(pool.get(
             'execution_backend',
             defaults_i['execution_backend'])).strip().lower()
-        expected_backend = defaults_i['execution_backend']
-        if execution_backend != expected_backend:
-            raise ValueError(
-                f"training.operation_space.pools.{label}.execution_backend "
-                f"must be {expected_backend!r}, got "
-                f"{execution_backend!r}.")
         n_ops = int(model_cfg.get(
             defaults_i['n_key'],
             model_cfg.get('n_know', 0) if label == 'rst' else 0))
@@ -1771,28 +1773,62 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 f"{region_score_temperature}.")
         region_capacity_factor = None
         spill_capacity = None
+        page_size = None
         if label == 'rst':
-            if 'region_capacity_factor' not in pool:
+            allowed_rst_backends = (
+                'sparse_region_block',
+                'paged_region_pool',
+            )
+            if execution_backend not in allowed_rst_backends:
                 raise ValueError(
-                    "training.operation_space.pools.rst."
-                    "region_capacity_factor is required for "
-                    "sparse_region_block.")
-            region_capacity_factor = float(pool['region_capacity_factor'])
-            spill_capacity = int(pool.get(
-                'spill_capacity', V4168_OPSPACE_DEFAULT_SPILL_CAPACITY))
-            if region_capacity_factor <= 0.0:
+                    "training.operation_space.pools.rst.execution_backend "
+                    f"must be one of {allowed_rst_backends}, got "
+                    f"{execution_backend!r}.")
+            if execution_backend == 'sparse_region_block':
+                if 'region_capacity_factor' not in pool:
+                    raise ValueError(
+                        "training.operation_space.pools.rst."
+                        "region_capacity_factor is required for "
+                        "sparse_region_block.")
+                if 'spill_capacity' not in pool:
+                    raise ValueError(
+                        "training.operation_space.pools.rst."
+                        "spill_capacity is required for "
+                        "sparse_region_block.")
+                region_capacity_factor = float(
+                    pool['region_capacity_factor'])
+                spill_capacity = int(pool['spill_capacity'])
+                if region_capacity_factor <= 0.0:
+                    raise ValueError(
+                        "training.operation_space.pools.rst."
+                        "region_capacity_factor must be > 0, got "
+                        f"{region_capacity_factor}.")
+                if spill_capacity < 0:
+                    raise ValueError(
+                        "training.operation_space.pools.rst.spill_capacity "
+                        f"must be >= 0, got {spill_capacity}.")
+            if execution_backend == 'paged_region_pool':
+                if 'page_size' not in pool:
+                    raise ValueError(
+                        "training.operation_space.pools.rst.page_size is "
+                        "required for paged_region_pool.")
+                page_size = int(pool['page_size'])
+                if page_size <= 0:
+                    raise ValueError(
+                        "training.operation_space.pools.rst.page_size "
+                        f"must be > 0, got {page_size}.")
+        else:
+            expected_backend = defaults_i['execution_backend']
+            if execution_backend != expected_backend:
                 raise ValueError(
-                    "training.operation_space.pools.rst."
-                    "region_capacity_factor must be > 0, got "
-                    f"{region_capacity_factor}.")
-            if spill_capacity < 0:
-                raise ValueError(
-                    "training.operation_space.pools.rst.spill_capacity "
-                    f"must be >= 0, got {spill_capacity}.")
+                    f"training.operation_space.pools.{label}."
+                    "execution_backend "
+                    f"must be {expected_backend!r}, got "
+                    f"{execution_backend!r}.")
         visible_ops_per_token = (
             visible_regions * visible_blocks_per_region
             * operators_per_block)
-        if execution_backend == 'sparse_region_block':
+        if execution_backend in ('sparse_region_block', 'paged_region_pool'):
             physical_visible_ops_per_token = (
                 visible_regions * blocks_per_region * operators_per_block)
         else:
@@ -1837,8 +1873,12 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             'num_devices': device_count,
         }
         if label == 'rst':
-            layouts[label]['region_capacity_factor'] = region_capacity_factor
-            layouts[label]['spill_capacity'] = spill_capacity
+            if execution_backend == 'sparse_region_block':
+                layouts[label]['region_capacity_factor'] = (
+                    region_capacity_factor)
+                layouts[label]['spill_capacity'] = spill_capacity
+            if execution_backend == 'paged_region_pool':
+                layouts[label]['page_size'] = page_size
     return layouts
 
 
@@ -10449,6 +10489,8 @@ def _opspace_compute_frac(rec, prefixes, name, visible_ops):
 
 def _opspace_backend_name(rec, prefixes):
     for key, label in (
+            ('execution_backend_paged_region_pool',
+             'paged_region_pool'),
             ('execution_backend_sparse_region_block',
              'sparse_region_block'),
             ('execution_backend_dense', 'dense')):
@@ -10585,9 +10627,10 @@ def _print_v4168_opspace_regular_block(rec):
             f"spike_frac={fmt_pct(_opspace_metric(rec, rst_prefix, 'spike_frac'), 2)}",
         ])
     smooth_text = " ".join(smooth_parts)
-    log_message(
+    rst_backend = _opspace_backend_name(rec, rst_prefix)
+    rst_line = (
         "  [opspace/rst]"
-        f" backend={_opspace_backend_name(rec, rst_prefix)}"
+        f" backend={rst_backend}"
         " mode=region_dense_block_masked"
         f" regions={fmt_intlike(_opspace_metric(rec, rst_prefix, 'num_regions'))}"
         f" visible_regions={fmt_intlike(_opspace_metric(rec, rst_prefix, 'visible_regions'))}"
@@ -10596,22 +10639,34 @@ def _print_v4168_opspace_regular_block(rec):
         f" ops/block={fmt_intlike(_opspace_metric(rec, rst_prefix, 'operators_per_block'))}"
         f" semantic_ops={fmt_intlike(logical_ops)}"
         f" physical_ops={fmt_intlike(physical_ops)}"
-        f" compute={fmt_pct(logical_compute, 2)}/{fmt_pct(physical_compute, 2)}"
-        f" region_capacity={fmt_intlike(region_cap)}"
-        f" spill_capacity={fmt_intlike(_opspace_metric(rec, rst_prefix, 'spill_capacity'))}"
+        f" compute={fmt_pct(logical_compute, 2)}/{fmt_pct(physical_compute, 2)}")
+    if rst_backend == 'paged_region_pool':
+        rst_line += (
+            f" page_size={fmt_intlike(_opspace_metric(rec, rst_prefix, 'page_size'))}"
+            f" pages={fmt_intlike(_opspace_metric(rec, rst_prefix, 'used_pages'))}/"
+            f"{fmt_intlike(_opspace_metric(rec, rst_prefix, 'max_pages'))}"
+            f" fill={fmt_float(_opspace_metric(rec, rst_prefix, 'page_fill_mean'), 1)}/"
+            f"{fmt_intlike(_opspace_metric(rec, rst_prefix, 'page_fill_max'))}"
+            f" padding={fmt_pct(_opspace_metric(rec, rst_prefix, 'page_padding_frac'), 2)}"
+            f" page_overflow={fmt_intlike(_opspace_metric(rec, rst_prefix, 'page_overflow'))}")
+    else:
+        rst_line += (
+            f" region_capacity={fmt_intlike(region_cap)}"
+            f" spill_capacity={fmt_intlike(_opspace_metric(rec, rst_prefix, 'spill_capacity'))}"
+            f" spill_used={fmt_intlike(_opspace_metric(rec, rst_prefix, 'overflow_requests'))}"
+            f" spill_processed={fmt_intlike(_opspace_metric(rec, rst_prefix, 'spill_processed_requests'))}"
+            f" spill_overflow={fmt_intlike(_opspace_metric(rec, rst_prefix, 'spill_overflow_count'))}")
+    rst_line += (
         f" region_fill={fmt_intlike(region_load_mean)}/{fmt_intlike(region_load_max)}"
         f" accept={fmt_float(_opspace_metric(rec, rst_prefix, 'primary_accept_frac'), 3)}"
         f" processed={fmt_intlike(_opspace_metric(rec, rst_prefix, 'processed_requests'))}/"
         f"{fmt_intlike(_opspace_metric(rec, rst_prefix, 'selected_requests'))}"
-        f" spill_used={fmt_intlike(_opspace_metric(rec, rst_prefix, 'overflow_requests'))}"
-        f" spill_processed={fmt_intlike(_opspace_metric(rec, rst_prefix, 'spill_processed_requests'))}"
-        f" spill_overflow={fmt_intlike(_opspace_metric(rec, rst_prefix, 'spill_overflow_count'))}"
         f" all={fmt_intlike(_opspace_metric(rec, rst_prefix, 'all_processed'))}"
         f" no_nan={fmt_intlike(_opspace_metric(rec, rst_prefix, 'no_nan'))}"
         f" gate_mass={fmt_float(_opspace_metric(rec, rst_prefix, 'gate_mass_mean'), 2)}"
         f" relu_active={fmt_float(_opspace_metric(rec, rst_prefix, 'relu_gate_count_mean'), 1)}"
-        f" {smooth_text}"
-    )
+        f" {smooth_text}")
+    log_message(rst_line)
     for line in _opspace_warning_lines(rec):
         log_message(line)
     log_message(
@@ -13070,12 +13125,18 @@ def main():
                     'region_score_temperature', 0.25)),
             }
             if _label == 'rst':
-                _pool.update({
-                    'region_capacity_factor': float(_layout.get(
-                        'region_capacity_factor', 1.25)),
-                    'spill_capacity': int(_layout.get(
-                        'spill_capacity', 0)),
-                })
+                _backend = str(_pool.get(
+                    'execution_backend', 'sparse_region_block')).lower()
+                if _backend == 'sparse_region_block':
+                    _pool.update({
+                        'region_capacity_factor': float(_layout.get(
+                            'region_capacity_factor', 1.25)),
+                        'spill_capacity': int(_layout.get(
+                            'spill_capacity', 0)),
+                    })
+                if _backend == 'paged_region_pool':
+                    _pool['page_size'] = int(_layout.get(
+                        'page_size', 4096))
             return _pool
 
         def _opspace_materialized_max_swaps(_label):
@@ -13712,11 +13773,17 @@ def main():
                     _line += (
                         f" physical_ops={_physical_ops} "
                         f"compute={(_visible_ops / _dense_ops) * 100.0:.2f}%/"
-                        f"{(_physical_ops / _dense_ops) * 100.0:.2f}% "
-                        f" region_capacity_factor="
-                        f"{float(_layout.get('region_capacity_factor', 1.25))} "
-                        f"spill_capacity="
-                        f"{int(_layout.get('spill_capacity', 0))} "
+                        f"{(_physical_ops / _dense_ops) * 100.0:.2f}% ")
+                    if _backend == 'paged_region_pool':
+                        _line += (
+                            f"page_size={int(_layout.get('page_size', 0))} ")
+                    else:
+                        _line += (
+                            f"region_capacity_factor="
+                            f"{float(_layout.get('region_capacity_factor', 1.25))} "
+                            f"spill_capacity="
+                            f"{int(_layout.get('spill_capacity', 0))} ")
+                    _line += (
                         f"region_score_pooling="
                         f"{_layout.get('region_score_pooling', 'smoothmax')}")
                 return _line
@@ -14448,6 +14515,8 @@ def main():
                     'region_capacity_factor', 1.25)),
                 'opspace_spill_capacity': int(layout.get(
                     'spill_capacity', 0)),
+                'opspace_page_size': int(layout.get(
+                    'page_size', 4096)),
                 'opspace_num_regions': int(layout.get(
                     'num_regions', 32 if pool == 'rst' else 8)),
                 'opspace_blocks_per_region': int(layout.get(
@@ -14771,8 +14840,14 @@ def main():
                             f"visible_blocks="
                             f"{int(_layout.get('visible_blocks_per_region', 0))} "
                             f"visible_ops={_visible_ops}")
-                        if _backend == 'sparse_region_block':
+                        if _backend in (
+                                'sparse_region_block',
+                                'paged_region_pool'):
                             _line += f" physical_ops={_physical_ops}"
+                        if _backend == 'paged_region_pool':
+                            _line += (
+                                f" page_size="
+                                f"{int(_layout.get('page_size', 0))}")
                         return _line
 
                     _rst_logical_compute = (
@@ -15718,7 +15793,7 @@ def main():
             _rst_runtime_layout = {}
         _rst_final_backend_enabled = (
             str(_rst_runtime_layout.get('execution_backend', '')).lower()
-            == 'sparse_region_block')
+            in ('sparse_region_block', 'paged_region_pool'))
 
     # ----------------------------------------------------------
     if is_host0:

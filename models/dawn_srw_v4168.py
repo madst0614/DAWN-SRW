@@ -3,7 +3,8 @@ DAWN-SRW v4.1.6.8 operation-space SRW.
 
 When operation_space is enabled:
 - Region/Block/Operator Atlas selection is the only operation-space routing.
-- RST uses sparse_region_block region execution with semantic block masks.
+- RST uses sparse_region_block or paged_region_pool execution with semantic
+  block masks.
 - QK and V use dense execution with region/block masks.
 - QK/V/RST do not use DirectTau, admission, drive, or selection calibration in
   the active output path.
@@ -188,6 +189,16 @@ OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'smooth_load_max',
     'spike_over_mean',
     'spike_frac',
+    'execution_backend_paged_region_pool',
+    'page_size',
+    'max_pages',
+    'used_pages',
+    'active_pages',
+    'page_fill_mean',
+    'page_fill_max',
+    'page_padding_frac',
+    'page_overflow',
+    'page_overflow_count',
 )
 OPSPACE_FINAL_RUNTIME_DIAG_COUNT = len(OPSPACE_FINAL_RUNTIME_DIAG_NAMES)
 
@@ -3956,6 +3967,22 @@ def _opspace_fail_loud_on_spill_overflow(spill_overflow_count):
             jax.lax.stop_gradient(spill_overflow_count))
 
 
+def _opspace_raise_page_overflow(page_overflow_count):
+    count = float(np.asarray(page_overflow_count, dtype=np.float32))
+    if count > 0.0:
+        raise RuntimeError(
+            "v4.1.6.8 operation_space paged_region_pool page pool "
+            f"overflowed ({count:.0f} owner shards). The fixed max_pages "
+            "invariant was violated; silent fallback is disabled.")
+
+
+def _opspace_fail_loud_on_page_overflow(page_overflow_count):
+    if SPILL_OVERFLOW_FAIL_LOUD:
+        jax.debug.callback(
+            _opspace_raise_page_overflow,
+            jax.lax.stop_gradient(page_overflow_count))
+
+
 def _opspace_select_region_blocks(
         flat_h, op_key_region_blocks, valid_region_blocks, *,
         num_regions, local_regions, blocks_per_region, operators_per_block,
@@ -4188,6 +4215,106 @@ def _opspace_build_region_buckets(
     }
 
 
+def _opspace_build_region_page_pool(
+        accepted_regions_global, accepted_mask, *, local_region_start,
+        local_regions, page_size, max_pages):
+    """Pack owner-local selected region requests into a fixed page pool."""
+    T = int(accepted_regions_global.shape[0])
+    visible_regions = int(accepted_regions_global.shape[1])
+    if visible_regions != 1:
+        raise ValueError(
+            "paged_region_pool currently supports visible_regions=1 only.")
+
+    selected_region_global = accepted_regions_global[:, 0]
+    selected_valid = accepted_mask[:, 0]
+    local_region_start_i32 = jnp.asarray(local_region_start, dtype=jnp.int32)
+    local_region_stop_i32 = (
+        local_region_start_i32 + jnp.asarray(local_regions, dtype=jnp.int32))
+    selected_region_local_raw = (
+        selected_region_global - local_region_start_i32)
+    owned = jnp.logical_and(
+        selected_valid,
+        jnp.logical_and(
+            selected_region_global >= local_region_start_i32,
+            selected_region_global < local_region_stop_i32))
+    selected_region_local = jnp.where(
+        owned, selected_region_local_raw, jnp.int32(0))
+
+    region_ids = jnp.arange(int(local_regions), dtype=jnp.int32)
+    onehot = jnp.logical_and(
+        selected_region_local_raw[:, None] == region_ids[None, :],
+        owned[:, None])
+    rank_per_region = jnp.cumsum(onehot.astype(jnp.int32), axis=0) - 1
+    rank_t = jnp.take_along_axis(
+        rank_per_region, selected_region_local[:, None], axis=1).squeeze(-1)
+    rank_t = jnp.where(owned, rank_t, jnp.int32(0))
+
+    load_local_region = onehot.astype(jnp.int32).sum(axis=0)
+    page_size_i32 = jnp.asarray(page_size, dtype=jnp.int32)
+    pages_per_region = (
+        (load_local_region + page_size_i32 - 1) // page_size_i32)
+    page_start = jnp.cumsum(pages_per_region) - pages_per_region
+    used_pages = pages_per_region.sum()
+    max_pages_i32 = jnp.asarray(max_pages, dtype=jnp.int32)
+    page_overflow = used_pages > max_pages_i32
+
+    page_id_t = (
+        page_start[selected_region_local] + rank_t // page_size_i32)
+    slot_t = rank_t % page_size_i32
+    in_pool = jnp.logical_and(owned, page_id_t < max_pages_i32)
+    scatter_page_id = jnp.where(in_pool, page_id_t, max_pages_i32)
+    scatter_slot = jnp.where(in_pool, slot_t, jnp.int32(0))
+
+    token_ids = jnp.arange(T, dtype=jnp.int32)
+    page_token_ids = jnp.zeros(
+        (int(max_pages), int(page_size)), dtype=jnp.int32)
+    page_valid = jnp.zeros(
+        (int(max_pages), int(page_size)), dtype=jnp.bool_)
+    page_token_ids = page_token_ids.at[
+        scatter_page_id, scatter_slot].set(token_ids, mode='drop')
+    page_valid = page_valid.at[
+        scatter_page_id, scatter_slot].set(in_pool, mode='drop')
+
+    page_idx = jnp.arange(int(max_pages), dtype=jnp.int32)
+    page_region_local = jnp.zeros((int(max_pages),), dtype=jnp.int32)
+    active_page = jnp.zeros((int(max_pages),), dtype=jnp.bool_)
+
+    def region_page_step(carry, region_i):
+        region_for_page, active = carry
+        start = page_start[region_i]
+        stop = start + pages_per_region[region_i]
+        mask = jnp.logical_and(page_idx >= start, page_idx < stop)
+        region_for_page = jnp.where(mask, region_i, region_for_page)
+        active = jnp.logical_or(active, mask)
+        return (region_for_page, active), None
+
+    (page_region_local, active_page), _ = jax.lax.scan(
+        region_page_step,
+        (page_region_local, active_page),
+        jnp.arange(int(local_regions), dtype=jnp.int32))
+
+    page_fill = page_valid.astype(jnp.float32).sum(axis=1)
+    selected_request_count = owned.astype(jnp.float32).sum()
+    processed_request_count = page_valid.astype(jnp.float32).sum()
+    page_overflow_count = page_overflow.astype(jnp.float32)
+    return {
+        'page_token_ids': page_token_ids,
+        'page_valid': page_valid,
+        'page_region_local': page_region_local,
+        'active_page': active_page,
+        'page_fill': page_fill,
+        'load_local_region': load_local_region,
+        'pages_per_region': pages_per_region,
+        'page_start': page_start,
+        'used_pages': used_pages.astype(jnp.float32),
+        'active_pages': active_page.astype(jnp.float32).sum(),
+        'selected_request_count': selected_request_count,
+        'processed_request_count': processed_request_count,
+        'page_overflow': page_overflow.astype(jnp.float32),
+        'page_overflow_count': page_overflow_count,
+    }
+
+
 def _opspace_semantic_block_mask_from_scores(
         block_score, visible_blocks_per_region):
     """Hard token-wise semantic block visibility from per-token scores."""
@@ -4298,6 +4425,113 @@ def _opspace_accumulate_rst_region_dense_block_masked(
      compute_no_nan) = jax.lax.scan(
         region_step, init,
         jnp.arange(local_regions, dtype=jnp.int32))[0]
+    return (
+        flat_raw_out_local,
+        flat_gate_mass_local,
+        relu_gate_count_sum_local,
+        compute_no_nan)
+
+
+def _opspace_accumulate_rst_region_dense_block_masked_paged_pool(
+        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
+        page_token_ids, page_valid, page_region_local, active_page, *,
+        visible_blocks_per_region, admission_den_power=None):
+    """Accumulate RST contributions from a fixed owner-local page pool."""
+    del admission_den_power
+    T = int(flat_x.shape[0])
+    D = int(flat_x.shape[-1])
+    blocks_per_region = int(key_blocks.shape[1])
+    operators_per_block = int(key_blocks.shape[2])
+    region_ops = blocks_per_region * operators_per_block
+    route_dim = int(key_blocks.shape[-1])
+    max_pages = int(page_token_ids.shape[0])
+    page_size = int(page_token_ids.shape[1])
+
+    flat_h_unit = _forward_unit_direction(
+        flat_h.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+    flat_x_bf = flat_x.astype(jnp.bfloat16)
+
+    def page_step(carry, page_i):
+        def compute_active(active_carry):
+            flat_raw_out, flat_gate_mass, relu_gate_count_sum_local, finite_acc = (
+                active_carry)
+            token_ids = page_token_ids[page_i]
+            valid = page_valid[page_i]
+            safe_token_ids = jnp.where(valid, token_ids, 0)
+            valid_f = valid.astype(jnp.float32)
+            valid_bf = valid_f.astype(jnp.bfloat16)
+            region_i = page_region_local[page_i]
+
+            x_p = flat_x_bf[safe_token_ids] * valid_bf[:, None]
+            h_p = flat_h_unit[safe_token_ids] * valid_bf[:, None]
+            key_region_blocks = key_blocks[region_i]
+            valid_region_blocks = valid_blocks[region_i]
+            key_region = key_region_blocks.reshape(
+                region_ops, route_dim).astype(jnp.bfloat16)
+            read_region = read_blocks[region_i].reshape(
+                region_ops, D).astype(jnp.bfloat16)
+            write_region = write_blocks[region_i].reshape(
+                region_ops, D).astype(jnp.bfloat16)
+            valid_ops = valid_region_blocks.reshape(region_ops)
+
+            valid_block_f = valid_region_blocks.astype(jnp.float32)[..., None]
+            block_count = jnp.maximum(valid_block_f.sum(axis=1), 1.0)
+            block_center_raw = (
+                key_region_blocks.astype(jnp.float32) * valid_block_f
+            ).sum(axis=1) / block_count
+            block_center = jax.lax.stop_gradient(
+                _forward_unit_direction(block_center_raw)).astype(jnp.bfloat16)
+            block_score = jnp.einsum(
+                'cd,bd->cb', h_p, block_center).astype(jnp.float32)
+            block_mask = _opspace_semantic_block_mask_from_scores(
+                block_score, visible_blocks_per_region)
+            operator_mask = jnp.broadcast_to(
+                block_mask[..., None],
+                (page_size, blocks_per_region,
+                 operators_per_block)).reshape(page_size, region_ops)
+            operator_mask = jnp.logical_and(operator_mask, valid_ops[None, :])
+
+            rho = jnp.einsum('cd,od->co', h_p, key_region).astype(jnp.float32)
+            read_value = jnp.einsum(
+                'cd,od->co', x_p, read_region).astype(jnp.float32)
+            gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
+            gate = gate * valid_f[:, None]
+            gate = gate * operator_mask.astype(jnp.float32)
+
+            raw_p = jnp.einsum(
+                'co,od->cd',
+                (gate * read_value).astype(jnp.bfloat16),
+                write_region).astype(jnp.float32)
+            mass_p = gate.sum(axis=-1, keepdims=True)
+            relu_p = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
+            relu_sum_p = (relu_p * valid_f).sum()
+
+            flat_raw_out = flat_raw_out.at[safe_token_ids].add(
+                raw_p * valid_f[:, None], mode='drop')
+            flat_gate_mass = flat_gate_mass.at[safe_token_ids].add(
+                mass_p * valid_f[:, None], mode='drop')
+            relu_gate_count_sum_local = (
+                relu_gate_count_sum_local + relu_sum_p)
+            finite = jnp.logical_and(
+                jnp.all(jnp.isfinite(gate)), jnp.all(jnp.isfinite(raw_p)))
+            finite_acc = jnp.minimum(finite_acc, finite.astype(jnp.float32))
+            return (
+                flat_raw_out, flat_gate_mass, relu_gate_count_sum_local,
+                finite_acc)
+
+        carry = jax.lax.cond(
+            active_page[page_i], compute_active, lambda c: c, carry)
+        return carry, None
+
+    init = (
+        jnp.zeros((T, D), dtype=jnp.float32),
+        jnp.zeros((T, 1), dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0),
+    )
+    (flat_raw_out_local, flat_gate_mass_local, relu_gate_count_sum_local,
+     compute_no_nan) = jax.lax.scan(
+        page_step, init, jnp.arange(max_pages, dtype=jnp.int32))[0]
     return (
         flat_raw_out_local,
         flat_gate_mass_local,
@@ -4812,6 +5046,16 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         load_smoothing_diag[5],
         load_smoothing_diag[6],
         load_smoothing_diag[7],
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
     ), dtype=jnp.float32)
     spill_diag = jnp.asarray((
         main_processed_request_count,
@@ -4821,6 +5065,446 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         spill_overflow_count,
         jnp.float32(region_capacity),
         jnp.float32(spill_capacity),
+        jnp.float32(total_region_capacity),
+        selected_request_count,
+        processed_request_count,
+        all_requests_processed,
+        no_nan,
+        required_capacity_no_overflow,
+        capacity_shortfall,
+    ), dtype=jnp.float32)
+    aux = {
+        'aux_loss': load_smoothing_aux,
+        'final_diag': final_diag,
+        'load_smoothing_diag': load_smoothing_diag,
+        'spill_diag': spill_diag,
+    }
+    return flat_out.astype(jnp.float32), global_gate_mass, diag, aux
+
+
+def _opspace_tau_free_relu_region_block_paged_pool_core(
+        flat_x, flat_h, op_key_local, read_local, write_local, *,
+        num_regions, blocks_per_region, operators_per_block,
+        local_regions, local_block_count, local_operator_capacity,
+        visible_regions, visible_operator_slots, admission_den_power,
+        visible_blocks_per_region=1, region_score_pooling='smoothmax',
+        region_score_temperature=0.25, page_size=4096,
+        training_tokens=0.0,
+        load_smoothing_enabled=True, load_smoothing_mode='neighbor',
+        load_smoothing_region_weight=3.0e-4,
+        load_smoothing_block_weight=0.0, load_smoothing_load_temperature=0.7,
+        load_smoothing_space_temperature=0.12, load_smoothing_alpha=1.25,
+        load_smoothing_warmup_tokens=2.0e8,
+        load_smoothing_peak_tokens=1.0e9,
+        load_smoothing_final_weight_frac=1.0):
+    """RST owner-local shared page pool backend with unchanged routing."""
+    if int(blocks_per_region) <= 0:
+        raise ValueError(
+            "paged_region_pool requires blocks_per_region > 0, got "
+            f"{blocks_per_region}.")
+    if int(operators_per_block) <= 0:
+        raise ValueError(
+            "paged_region_pool requires operators_per_block > 0, got "
+            f"{operators_per_block}.")
+    _visible_blocks_per_region = int(visible_blocks_per_region)
+    if not (1 <= _visible_blocks_per_region <= int(blocks_per_region)):
+        raise ValueError(
+            "paged_region_pool visible_blocks_per_region must be in "
+            f"[1, blocks_per_region={blocks_per_region}], got "
+            f"{visible_blocks_per_region}.")
+    if int(visible_regions) != 1:
+        raise ValueError(
+            "paged_region_pool currently supports visible_regions=1 only.")
+    _region_score_pooling = str(region_score_pooling).strip().lower()
+    if _region_score_pooling != 'smoothmax':
+        raise ValueError(
+            "paged_region_pool requires region_score_pooling='smoothmax', "
+            f"got {region_score_pooling!r}.")
+    _region_score_temperature = max(
+        float(region_score_temperature), 1.0e-6)
+    _page_size = int(page_size)
+    if _page_size <= 0:
+        raise ValueError(
+            f"paged_region_pool page_size must be > 0, got {page_size}.")
+    T = int(flat_x.shape[0])
+    D = int(flat_x.shape[-1])
+    N_local = int(op_key_local.shape[0])
+    if N_local > local_operator_capacity:
+        raise ValueError(
+            "operation-space paged_region_pool local rows exceed "
+            "region/block slots: "
+            f"rows={N_local}, slots={local_operator_capacity}")
+    expected_local_ops = (
+        int(local_regions) * int(blocks_per_region)
+        * int(operators_per_block))
+    if int(local_operator_capacity) != expected_local_ops:
+        raise ValueError(
+            "paged_region_pool local_operator_capacity invariant failed: "
+            f"local_operator_capacity={local_operator_capacity}, expected={expected_local_ops}.")
+    max_pages = (T + _page_size - 1) // _page_size + int(local_regions)
+
+    (slot_to_row_np, valid_slot_np, _valid_counts_np) = (
+        _opspace_balanced_operator_slot_layout_np(
+            N_local, local_block_count, operators_per_block))
+    slot_to_row = jnp.asarray(slot_to_row_np, dtype=jnp.int32)
+    valid_slot = jnp.asarray(valid_slot_np, dtype=jnp.bool_)
+    model_axis_index = jax.lax.axis_index('model')
+
+    op_key_padded = op_key_local[slot_to_row]
+    read_padded = read_local[slot_to_row]
+    write_padded = write_local[slot_to_row]
+    op_key_padded = jnp.where(
+        valid_slot[:, None], op_key_padded, jnp.zeros_like(op_key_padded))
+    read_padded = jnp.where(
+        valid_slot[:, None], read_padded, jnp.zeros_like(read_padded))
+    write_padded = jnp.where(
+        valid_slot[:, None], write_padded, jnp.zeros_like(write_padded))
+
+    op_key_dir = _forward_unit_direction(
+        op_key_padded.astype(jnp.bfloat16).astype(jnp.float32)
+    ).astype(jnp.bfloat16)
+    read_dir = _forward_unit_direction(
+        read_padded.astype(jnp.bfloat16).astype(jnp.float32)
+    ).astype(jnp.bfloat16)
+    write_dir = _forward_unit_direction(
+        write_padded.astype(jnp.bfloat16).astype(jnp.float32)
+    ).astype(jnp.bfloat16)
+
+    key_block_slots = op_key_dir.reshape(
+        local_regions, blocks_per_region, operators_per_block,
+        op_key_dir.shape[-1])
+    read_block_slots = read_dir.reshape(
+        local_regions, blocks_per_region, operators_per_block,
+        read_dir.shape[-1])
+    write_block_slots = write_dir.reshape(
+        local_regions, blocks_per_region, operators_per_block,
+        write_dir.shape[-1])
+    valid_block_slots = valid_slot.reshape(
+        local_regions, blocks_per_region, operators_per_block)
+
+    key_blocks = key_block_slots.reshape(
+        local_regions, blocks_per_region, -1, operators_per_block,
+        key_block_slots.shape[-1]).reshape(
+            local_regions, blocks_per_region, operators_per_block,
+            key_block_slots.shape[-1])
+    read_blocks = read_block_slots.reshape(
+        local_regions, blocks_per_region, -1, operators_per_block,
+        read_block_slots.shape[-1]).reshape(
+            local_regions, blocks_per_region, operators_per_block,
+            read_block_slots.shape[-1])
+    write_blocks = write_block_slots.reshape(
+        local_regions, blocks_per_region, -1, operators_per_block,
+        write_block_slots.shape[-1]).reshape(
+            local_regions, blocks_per_region, operators_per_block,
+            write_block_slots.shape[-1])
+    valid_blocks = valid_block_slots.reshape(
+        local_regions, blocks_per_region, -1, operators_per_block).reshape(
+            local_regions, blocks_per_region, operators_per_block)
+
+    selection = _opspace_select_region_blocks(
+        flat_h, key_blocks, valid_blocks,
+        num_regions=num_regions,
+        local_regions=local_regions,
+        blocks_per_region=blocks_per_region,
+        operators_per_block=operators_per_block,
+        visible_regions=visible_regions,
+        visible_blocks_per_region=_visible_blocks_per_region,
+        region_score_temperature=_region_score_temperature)
+    scores_all = selection['scores_all']
+    admission = selection['admission']
+
+    load_smoothing_aux_local, load_smoothing_diag_local = (
+        _opspace_load_smoothing_aux_from_scores(
+            selection['region_score'], selection['region_center_all'],
+            scores_all, selection['block_center_all'],
+            training_tokens=training_tokens,
+            enabled=load_smoothing_enabled,
+            mode=load_smoothing_mode,
+            region_weight=load_smoothing_region_weight,
+            block_weight=load_smoothing_block_weight,
+            load_temperature=load_smoothing_load_temperature,
+            space_temperature=load_smoothing_space_temperature,
+            alpha=load_smoothing_alpha,
+            warmup_tokens=load_smoothing_warmup_tokens,
+            peak_tokens=load_smoothing_peak_tokens,
+            final_weight_frac=load_smoothing_final_weight_frac,
+            region_capacity=_page_size,
+            local_token_count=T,
+            hard_region_load=admission['region_load']))
+    load_smoothing_aux = jax.lax.pmean(
+        jax.lax.pmean(load_smoothing_aux_local, 'data'), 'model')
+    load_smoothing_diag = jax.lax.pmean(
+        jax.lax.pmean(load_smoothing_diag_local, 'data'), 'model')
+
+    page_pool = _opspace_build_region_page_pool(
+        selection['selected_regions_global'],
+        selection['selected_regions_global'] >= 0,
+        local_region_start=model_axis_index * int(local_regions),
+        local_regions=local_regions,
+        page_size=_page_size,
+        max_pages=max_pages)
+
+    (flat_raw_out_local, flat_gate_mass_local,
+     relu_gate_count_sum_local, compute_no_nan) = (
+        _opspace_accumulate_rst_region_dense_block_masked_paged_pool(
+            flat_x, flat_h, key_blocks, read_blocks, write_blocks,
+            valid_blocks, page_pool['page_token_ids'],
+            page_pool['page_valid'], page_pool['page_region_local'],
+            page_pool['active_page'],
+            visible_blocks_per_region=_visible_blocks_per_region,
+            admission_den_power=admission_den_power))
+
+    (flat_out, global_gate_mass, global_relu_gate_count_sum,
+     gate_denominator) = _opspace_finalize_bucketed_output(
+        flat_raw_out_local, flat_gate_mass_local,
+        relu_gate_count_sum_local, admission_den_power)
+
+    def data_sum(v):
+        return jax.lax.pmean(jax.lax.psum(v, 'data'), 'model')
+
+    def metric_pmax(v, axis_name):
+        return jax.lax.pmax(jax.lax.stop_gradient(v), axis_name)
+
+    def metric_pmin(v, axis_name):
+        return jax.lax.pmin(jax.lax.stop_gradient(v), axis_name)
+
+    token_count = jnp.maximum(
+        data_sum(jnp.asarray(T, dtype=jnp.float32)), 1.0)
+    valid_counts_by_block = valid_blocks.astype(jnp.float32).sum(axis=2)
+    semantic_block_mask_local = selection[
+        'selected_block_mask_local'].astype(jnp.float32)
+    valid_operator_slots_sum_local = jnp.sum(
+        semantic_block_mask_local * valid_counts_by_block[None, :, :])
+    global_valid_operator_slots_sum = jax.lax.psum(
+        valid_operator_slots_sum_local, 'model')
+    selected_count_local = page_pool['selected_request_count']
+    processed_count_local = page_pool['processed_request_count']
+    global_selected_count = jax.lax.psum(selected_count_local, 'model')
+    global_processed_count = jax.lax.psum(processed_count_local, 'model')
+    page_fill = page_pool['page_fill']
+    page_fill_sum_local = page_fill.sum()
+    page_fill_max_local = page_fill.max()
+    active_pages_local = page_pool['active_pages']
+    global_page_fill_sum = jax.lax.psum(page_fill_sum_local, 'model')
+    global_active_pages = jax.lax.psum(active_pages_local, 'model')
+    global_page_overflow_count = jax.lax.psum(
+        page_pool['page_overflow_count'], 'model')
+
+    selected_request_count = data_sum(global_selected_count)
+    processed_request_count = data_sum(global_processed_count)
+    page_overflow_count = data_sum(global_page_overflow_count)
+    _opspace_fail_loud_on_page_overflow(page_overflow_count)
+    active_pages_total = data_sum(global_active_pages)
+    page_fill_sum_total = data_sum(global_page_fill_sum)
+    page_fill_mean = (
+        page_fill_sum_total / jnp.maximum(active_pages_total, 1.0))
+    page_fill_max = metric_pmax(
+        metric_pmax(page_fill_max_local, 'model'), 'data')
+    bucket_fill_skew = page_fill_max / jnp.maximum(page_fill_mean, 1.0)
+    page_padding_frac = jnp.maximum(
+        jnp.float32(1.0)
+        - page_fill_sum_total / jnp.maximum(
+            active_pages_total * jnp.float32(_page_size), jnp.float32(1.0)),
+        jnp.float32(0.0))
+    used_pages = metric_pmax(
+        metric_pmax(page_pool['used_pages'], 'model'), 'data')
+    active_pages = metric_pmax(
+        metric_pmax(page_pool['active_pages'], 'model'), 'data')
+    page_overflow = metric_pmax(
+        metric_pmax(page_pool['page_overflow'], 'model'), 'data')
+
+    accepted_region_request_count = data_sum(
+        admission['accepted_request_count'])
+    valid_operator_slots_mean = (
+        data_sum(global_valid_operator_slots_sum) / token_count)
+    relu_gate_count_mean = (
+        data_sum(global_relu_gate_count_sum) / token_count)
+    gate_denominator_mean = (
+        data_sum(gate_denominator.sum()) / token_count)
+    gate_mass_mean = data_sum(global_gate_mass.sum()) / token_count
+    primary_accept_frac = (
+        processed_request_count
+        / jnp.maximum(selected_request_count, 1.0))
+    overflow_request_count = jnp.maximum(
+        selected_request_count - processed_request_count, 0.0)
+    overflow_frac = overflow_request_count / jnp.maximum(
+        selected_request_count, 1.0)
+
+    region_load_max = metric_pmax(
+        metric_pmax(jnp.max(admission['region_load']), 'data'), 'model')
+    selected_region_top1_frac = region_load_max / jnp.maximum(
+        accepted_region_request_count, 1.0)
+    region_load_mean = jnp.maximum(
+        accepted_region_request_count / jnp.maximum(
+            jnp.float32(num_regions), 1.0),
+        jnp.float32(1.0e-6))
+    region_load_p50 = metric_pmax(
+        metric_pmax(_opspace_percentile(admission['region_load'], 50.0),
+                    'model'), 'data')
+    region_load_p95 = metric_pmax(
+        metric_pmax(_opspace_percentile(admission['region_load'], 95.0),
+                    'model'), 'data')
+    region_load_p99 = metric_pmax(
+        metric_pmax(_opspace_percentile(admission['region_load'], 99.0),
+                    'model'), 'data')
+    required_capacity_no_overflow = page_fill_max
+    total_region_capacity = int(max_pages) * int(_page_size)
+    capacity_shortfall = jnp.maximum(
+        page_fill_max - jnp.float32(_page_size), jnp.float32(0.0))
+    region_capacity_util_p50 = (
+        region_load_mean / jnp.maximum(jnp.float32(_page_size), 1.0))
+    region_capacity_util_p95 = (
+        region_load_max / jnp.maximum(jnp.float32(_page_size), 1.0))
+    region_capacity_util_p99 = region_capacity_util_p95
+    region_capacity_util_max = region_capacity_util_p95
+    score_no_nan = jnp.all(jnp.isfinite(scores_all)).astype(jnp.float32)
+    score_no_nan = metric_pmin(
+        metric_pmin(score_no_nan, 'data'), 'model')
+    compute_no_nan = metric_pmin(
+        metric_pmin(compute_no_nan, 'data'), 'model')
+    out_no_nan = jnp.all(jnp.isfinite(flat_out)).astype(jnp.float32)
+    out_no_nan = metric_pmin(metric_pmin(out_no_nan, 'data'), 'model')
+    no_nan = jnp.minimum(score_no_nan, jnp.minimum(compute_no_nan, out_no_nan))
+    padded_operator_slots_mean = (
+        jnp.float32(visible_operator_slots) - valid_operator_slots_mean)
+    unprocessed_request_count = jnp.maximum(
+        selected_request_count - processed_request_count, 0.0)
+    all_requests_processed = jnp.logical_and(
+        jnp.logical_and(
+            processed_request_count >= selected_request_count - 0.5,
+            page_overflow_count <= 0.0),
+        unprocessed_request_count <= 0.0).astype(jnp.float32)
+    layout_ok = jnp.asarray(
+        1.0 if local_operator_capacity == (
+            local_regions * blocks_per_region * operators_per_block) else 0.0,
+        dtype=jnp.float32)
+
+    visible_ops_per_token = (
+        jnp.float32(visible_regions)
+        * jnp.float32(_visible_blocks_per_region)
+        * jnp.float32(operators_per_block))
+    physical_visible_ops_per_token = (
+        jnp.float32(visible_regions)
+        * jnp.float32(blocks_per_region)
+        * jnp.float32(operators_per_block))
+    dense_ops = jnp.maximum(
+        jnp.float32(num_regions * blocks_per_region * operators_per_block),
+        1.0)
+    compute_frac_vs_dense = visible_ops_per_token / dense_ops
+    logical_compute_frac_vs_dense = compute_frac_vs_dense
+    physical_compute_frac_vs_dense = (
+        physical_visible_ops_per_token / dense_ops)
+    operator_capacity = jnp.float32(
+        num_regions * blocks_per_region * operators_per_block)
+    valid_operator_count = jax.lax.pmean(
+        jax.lax.psum(jnp.float32(N_local), 'model'), 'data')
+    padding = jnp.maximum(operator_capacity - valid_operator_count, 0.0)
+    padding_frac = padding / jnp.maximum(operator_capacity, 1.0)
+
+    diag = jnp.asarray((
+        jnp.float32(1.0),
+        jnp.float32(visible_regions),
+        visible_ops_per_token,
+        valid_operator_slots_mean,
+        jnp.float32(_page_size),
+        page_fill_mean,
+        selected_region_top1_frac,
+        primary_accept_frac,
+        bucket_fill_skew,
+        overflow_frac,
+        relu_gate_count_mean,
+        gate_denominator_mean,
+        gate_mass_mean,
+        relu_gate_count_mean,
+        padded_operator_slots_mean,
+        overflow_frac,
+        no_nan,
+        jnp.float32(1.0),
+        selected_request_count,
+        processed_request_count,
+        all_requests_processed,
+        layout_ok,
+    ), dtype=jnp.float32)
+    final_diag = jnp.asarray((
+        jnp.float32(1.0),
+        jnp.float32(0.0),
+        jnp.float32(0.0),
+        jnp.float32(num_regions),
+        jnp.float32(local_regions),
+        jnp.float32(blocks_per_region),
+        jnp.float32(operators_per_block),
+        jnp.float32(visible_regions),
+        jnp.float32(_visible_blocks_per_region),
+        visible_ops_per_token,
+        visible_ops_per_token,
+        physical_visible_ops_per_token,
+        compute_frac_vs_dense,
+        logical_compute_frac_vs_dense,
+        physical_compute_frac_vs_dense,
+        operator_capacity,
+        padding,
+        padding_frac,
+        jnp.float32(1.0),
+        jnp.float32(_region_score_temperature),
+        jnp.float32(1.0 if bool(load_smoothing_enabled) else 0.0),
+        jnp.float32(load_smoothing_region_weight),
+        jnp.float32(load_smoothing_block_weight),
+        relu_gate_count_mean,
+        gate_denominator_mean,
+        gate_mass_mean,
+        valid_operator_slots_mean,
+        padded_operator_slots_mean,
+        selected_request_count,
+        processed_request_count,
+        all_requests_processed,
+        no_nan,
+        jnp.float32(_page_size),
+        jnp.float32(0.0),
+        jnp.float32(total_region_capacity),
+        jnp.float32(0.0),
+        region_load_mean,
+        region_load_p50,
+        region_load_p95,
+        region_load_p99,
+        region_load_max,
+        region_capacity_util_p50,
+        region_capacity_util_p95,
+        region_capacity_util_p99,
+        region_capacity_util_max,
+        processed_request_count,
+        overflow_request_count,
+        jnp.float32(0.0),
+        overflow_frac,
+        page_overflow_count,
+        required_capacity_no_overflow,
+        capacity_shortfall,
+        load_smoothing_diag[0],
+        load_smoothing_diag[1],
+        load_smoothing_diag[2],
+        load_smoothing_diag[3],
+        load_smoothing_diag[4],
+        load_smoothing_diag[5],
+        load_smoothing_diag[6],
+        load_smoothing_diag[7],
+        jnp.float32(1.0),
+        jnp.float32(_page_size),
+        jnp.float32(max_pages),
+        used_pages,
+        active_pages,
+        page_fill_mean,
+        page_fill_max,
+        page_padding_frac,
+        page_overflow,
+        page_overflow_count,
+    ), dtype=jnp.float32)
+    spill_diag = jnp.asarray((
+        processed_request_count,
+        overflow_request_count,
+        jnp.float32(0.0),
+        overflow_frac,
+        page_overflow_count,
+        jnp.float32(_page_size),
+        jnp.float32(0.0),
         jnp.float32(total_region_capacity),
         selected_request_count,
         processed_request_count,
@@ -4978,6 +5662,147 @@ def make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
 
     fused_gate_srw_tau_free_relu_region_block_sparse._v4168_accepts_training_tokens = True
     return fused_gate_srw_tau_free_relu_region_block_sparse
+
+
+def make_sharded_srw_tau_free_relu_region_block_paged_pool_minimal(
+        mesh, max_chunk_size=2048,
+        dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=1.0,
+        admission_den_grad_scale=1.0,
+        num_regions=32,
+        blocks_per_region=2,
+        operators_per_block=512,
+        visible_regions=1,
+        visible_blocks_per_region=1,
+        region_score_pooling='smoothmax',
+        region_score_temperature=0.25,
+        padded_ops=0,
+        token_chunk_size=256,
+        page_size=4096,
+        load_smoothing_enabled=True,
+        load_smoothing_mode='neighbor',
+        load_smoothing_region_weight=3.0e-4,
+        load_smoothing_block_weight=0.0,
+        load_smoothing_load_temperature=0.7,
+        load_smoothing_space_temperature=0.12,
+        load_smoothing_alpha=1.25,
+        load_smoothing_warmup_tokens=2.0e8,
+        load_smoothing_peak_tokens=1.0e9,
+        load_smoothing_final_weight_frac=1.0):
+    """Create the RST page-pool semantic-block atlas executor."""
+    del max_chunk_size, dead_exposure_target, padded_ops, token_chunk_size
+    del soft_gate_effective_active_eps, admission_den_grad_scale
+    layout = _opspace_region_block_model_axis_layout(
+        mesh, num_regions, blocks_per_region, operators_per_block)
+    _num_regions = layout['num_regions']
+    _blocks_per_region = layout['blocks_per_region']
+    _operators_per_block = layout['operators_per_block']
+    _local_regions = layout['local_regions']
+    _local_block_count = layout['local_block_count']
+    _local_operator_capacity = layout['local_operator_capacity']
+    _visible_regions = int(visible_regions)
+    if _visible_regions != 1:
+        raise ValueError(
+            "paged_region_pool currently supports visible_regions=1 only.")
+    _visible_blocks_per_region = int(visible_blocks_per_region)
+    if not (1 <= _visible_blocks_per_region <= _blocks_per_region):
+        raise ValueError(
+            "paged_region_pool visible_blocks_per_region must be in "
+            f"[1, {_blocks_per_region}], got {visible_blocks_per_region}.")
+    _visible_operator_slots = (
+        _visible_regions * _visible_blocks_per_region * _operators_per_block)
+    _region_score_pooling = str(region_score_pooling).strip().lower()
+    if _region_score_pooling != 'smoothmax':
+        raise ValueError(
+            "operation-space paged_region_pool region_score_pooling must be "
+            f"'smoothmax', got {region_score_pooling!r}.")
+    _region_score_temperature = float(region_score_temperature)
+    if _region_score_temperature <= 0.0:
+        raise ValueError(
+            "operation-space paged_region_pool region_score_temperature must "
+            f"be > 0, got {region_score_temperature}.")
+    _page_size = int(page_size)
+    if _page_size <= 0:
+        raise ValueError(
+            f"paged_region_pool page_size must be > 0, got {page_size}.")
+    _load_smoothing_enabled = bool(load_smoothing_enabled)
+    _load_smoothing_mode = _opspace_normalize_load_smoothing_mode(
+        load_smoothing_mode)
+    _load_smoothing_region_weight = float(load_smoothing_region_weight)
+    _load_smoothing_block_weight = float(load_smoothing_block_weight)
+    _load_smoothing_load_temperature = float(
+        load_smoothing_load_temperature)
+    _load_smoothing_space_temperature = float(
+        load_smoothing_space_temperature)
+    _load_smoothing_alpha = float(load_smoothing_alpha)
+    _load_smoothing_warmup_tokens = float(load_smoothing_warmup_tokens)
+    _load_smoothing_peak_tokens = float(load_smoothing_peak_tokens)
+    _load_smoothing_final_weight_frac = float(
+        load_smoothing_final_weight_frac)
+    _admission_den_power = jnp.maximum(
+        jnp.asarray(admission_den_power, dtype=jnp.float32),
+        jnp.float32(0.0))
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('data', None, None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('data', None, None),
+                       P('model', None),
+                       P('model', None),
+                       P(), P(), P(), P(), P(), P()),
+             out_specs=(P('data', None, None), P(),
+                         {'aux_loss': P(), 'final_diag': P(),
+                          'load_smoothing_diag': P(),
+                          'spill_diag': P()}),
+             check_rep=False)
+    def fused_gate_srw_tau_free_relu_region_block_paged_pool(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, training_tokens):
+        del raw_tau, soft_gate_temperature, soft_gate_t_final
+        del soft_gate_boundary_power, soft_gate_boundary_power_final
+        del execution_prune_eps
+        B, S, D = x.shape
+        flat_out, _flat_gate_mass, diag, aux = (
+            _opspace_tau_free_relu_region_block_paged_pool_core(
+                x.reshape(int(B) * int(S), D),
+                h.reshape(int(B) * int(S), h.shape[-1]),
+                op_key_local, read_local, write_local,
+                num_regions=_num_regions,
+                blocks_per_region=_blocks_per_region,
+                operators_per_block=_operators_per_block,
+                local_regions=_local_regions,
+                local_block_count=_local_block_count,
+                local_operator_capacity=_local_operator_capacity,
+                visible_regions=_visible_regions,
+                visible_operator_slots=_visible_operator_slots,
+                admission_den_power=_admission_den_power,
+                visible_blocks_per_region=_visible_blocks_per_region,
+                region_score_pooling=_region_score_pooling,
+                region_score_temperature=_region_score_temperature,
+                page_size=_page_size,
+                training_tokens=training_tokens,
+                load_smoothing_enabled=_load_smoothing_enabled,
+                load_smoothing_mode=_load_smoothing_mode,
+                load_smoothing_region_weight=_load_smoothing_region_weight,
+                load_smoothing_block_weight=_load_smoothing_block_weight,
+                load_smoothing_load_temperature=(
+                    _load_smoothing_load_temperature),
+                load_smoothing_space_temperature=(
+                    _load_smoothing_space_temperature),
+                load_smoothing_alpha=_load_smoothing_alpha,
+                load_smoothing_warmup_tokens=(
+                    _load_smoothing_warmup_tokens),
+                load_smoothing_peak_tokens=_load_smoothing_peak_tokens,
+                load_smoothing_final_weight_frac=(
+                    _load_smoothing_final_weight_frac)))
+        return flat_out.reshape(B, S, D), diag, aux
+
+    fused_gate_srw_tau_free_relu_region_block_paged_pool._v4168_accepts_training_tokens = True
+    return fused_gate_srw_tau_free_relu_region_block_paged_pool
 
 
 _OPSPACE_REPACK_POOLS = (
@@ -5342,6 +6167,7 @@ def operation_space_static_metrics(model_config, config=None,
         region_capacity_factor = float(pcfg.get(
             'region_capacity_factor', 1.25))
         spill_capacity = float(pcfg.get('spill_capacity', 0.0))
+        page_size = float(pcfg.get('page_size', 0.0))
         owner_count = int(pcfg.get('num_devices', model_axis_size))
         owner_count = max(1, owner_count)
         n_ops = int(model_config.get(n_key, 0))
@@ -5350,7 +6176,7 @@ def operation_space_static_metrics(model_config, config=None,
         visible_blocks_per_token = visible_regions * visible_blocks_per_region
         visible_ops_per_token = (
             visible_blocks_per_token * operators_per_block)
-        if execution_backend == 'sparse_region_block':
+        if execution_backend in ('sparse_region_block', 'paged_region_pool'):
             physical_visible_ops_per_token = (
                 visible_regions * blocks_per_region * operators_per_block)
         else:
@@ -5395,6 +6221,8 @@ def operation_space_static_metrics(model_config, config=None,
             1.0 if execution_backend == 'dense' else 0.0)
         out[f'opspace/{label}/execution_backend_sparse_region_block'] = float(
             1.0 if execution_backend == 'sparse_region_block' else 0.0)
+        out[f'opspace/{label}/execution_backend_paged_region_pool'] = float(
+            1.0 if execution_backend == 'paged_region_pool' else 0.0)
         out[f'opspace/{label}/load_smoothing_enabled'] = float(
             pcfg.get('load_smoothing_enabled', True))
         out[f'opspace/{label}/load_smoothing_region_weight'] = float(
@@ -5405,6 +6233,8 @@ def operation_space_static_metrics(model_config, config=None,
             out[f'opspace/{label}/region_capacity_factor'] = float(
                 region_capacity_factor)
             out[f'opspace/{label}/spill_capacity'] = float(spill_capacity)
+        if execution_backend == 'paged_region_pool':
+            out[f'opspace/{label}/page_size'] = float(page_size)
     return out
 
 
@@ -5564,6 +6394,7 @@ def make_sharded_srw_minimal(
         opspace_region_score_temperature=0.25,
         opspace_region_capacity_factor=1.25,
         opspace_spill_capacity=0,
+        opspace_page_size=4096,
         opspace_load_smoothing_enabled=True,
         opspace_load_smoothing_mode='neighbor',
         opspace_load_smoothing_region_weight=3.0e-4,
@@ -5643,14 +6474,48 @@ def make_sharded_srw_minimal(
             load_smoothing_peak_tokens=opspace_load_smoothing_peak_tokens,
             load_smoothing_final_weight_frac=(
                 opspace_load_smoothing_final_weight_frac))
+    if execution_backend == 'paged_region_pool':
+        return make_sharded_srw_tau_free_relu_region_block_paged_pool_minimal(
+            mesh, max_chunk_size=max_chunk_size,
+            dead_exposure_target=dead_exposure_target,
+            soft_gate_effective_active_eps=soft_gate_effective_active_eps,
+            admission_den_power=admission_den_power,
+            admission_den_grad_scale=admission_den_grad_scale,
+            num_regions=opspace_num_regions,
+            blocks_per_region=opspace_blocks_per_region,
+            operators_per_block=opspace_operators_per_block,
+            visible_regions=opspace_visible_regions,
+            visible_blocks_per_region=opspace_visible_blocks_per_region,
+            region_score_pooling=opspace_region_score_pooling,
+            region_score_temperature=opspace_region_score_temperature,
+            token_chunk_size=opspace_token_chunk_size,
+            page_size=opspace_page_size,
+            load_smoothing_enabled=opspace_load_smoothing_enabled,
+            load_smoothing_mode=opspace_load_smoothing_mode,
+            load_smoothing_region_weight=(
+                opspace_load_smoothing_region_weight),
+            load_smoothing_block_weight=(
+                opspace_load_smoothing_block_weight),
+            load_smoothing_load_temperature=(
+                opspace_load_smoothing_load_temperature),
+            load_smoothing_space_temperature=(
+                opspace_load_smoothing_space_temperature),
+            load_smoothing_alpha=opspace_load_smoothing_alpha,
+            load_smoothing_warmup_tokens=(
+                opspace_load_smoothing_warmup_tokens),
+            load_smoothing_peak_tokens=opspace_load_smoothing_peak_tokens,
+            load_smoothing_final_weight_frac=(
+                opspace_load_smoothing_final_weight_frac))
     if execution_backend:
         raise ValueError(
             "v4168 operation_space supports execution_backend='dense' for QK/V "
-            "and execution_backend='sparse_region_block' for RST only.")
+            "and execution_backend in ('sparse_region_block', "
+            "'paged_region_pool') for RST only.")
     raise ValueError(
         "v4.1.6.8 operation_space official path only supports "
         "execution_backend='dense' for qk/v and "
-        "execution_backend='sparse_region_block' for rst.")
+        "execution_backend in ('sparse_region_block', "
+        "'paged_region_pool') for rst.")
 
 
 def make_sharded_srw_paired_minimal(
