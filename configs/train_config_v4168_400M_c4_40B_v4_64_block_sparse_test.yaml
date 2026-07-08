@@ -89,7 +89,7 @@ training:
         region_score_temperature: 0.25
 
       rst:
-        execution_backend: paged_region_pool
+        execution_backend: paged_region_pool_region_outer
         num_regions: 8
         visible_regions: 1
         blocks_per_region: 8
@@ -104,4 +104,4 @@ training:
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_region_block_paged_region_pool_test
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_region_block_paged_region_outer_test

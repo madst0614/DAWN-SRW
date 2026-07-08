@@ -1012,7 +1012,8 @@ def _require_resume_materialized_fields(full_config):
         if rst_execution_backend == 'sparse_region_block':
             required_fields.extend(
                 V4168_OPSPACE_SPARSE_RUNTIME_RESUME_REQUIRED_FIELDS)
-        if rst_execution_backend == 'paged_region_pool':
+        if rst_execution_backend in ('paged_region_pool',
+                                     'paged_region_pool_region_outer'):
             required_fields.extend(
                 V4168_OPSPACE_PAGED_RUNTIME_RESUME_REQUIRED_FIELDS)
         if 'operation_space_load_smoothing' in training_cfg:
@@ -1778,6 +1779,7 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
             allowed_rst_backends = (
                 'sparse_region_block',
                 'paged_region_pool',
+                'paged_region_pool_region_outer',
             )
             if execution_backend not in allowed_rst_backends:
                 raise ValueError(
@@ -1807,11 +1809,12 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                     raise ValueError(
                         "training.operation_space.pools.rst.spill_capacity "
                         f"must be >= 0, got {spill_capacity}.")
-            if execution_backend == 'paged_region_pool':
+            if execution_backend in ('paged_region_pool',
+                                     'paged_region_pool_region_outer'):
                 if 'page_size' not in pool:
                     raise ValueError(
                         "training.operation_space.pools.rst.page_size is "
-                        "required for paged_region_pool.")
+                        "required for paged_region_pool backends.")
                 page_size = int(pool['page_size'])
                 if page_size <= 0:
                     raise ValueError(
@@ -1828,7 +1831,8 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         visible_ops_per_token = (
             visible_regions * visible_blocks_per_region
             * operators_per_block)
-        if execution_backend in ('sparse_region_block', 'paged_region_pool'):
+        if execution_backend in ('sparse_region_block', 'paged_region_pool',
+                                 'paged_region_pool_region_outer'):
             physical_visible_ops_per_token = (
                 visible_regions * blocks_per_region * operators_per_block)
         else:
@@ -1877,7 +1881,8 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 layouts[label]['region_capacity_factor'] = (
                     region_capacity_factor)
                 layouts[label]['spill_capacity'] = spill_capacity
-            if execution_backend == 'paged_region_pool':
+            if execution_backend in ('paged_region_pool',
+                                     'paged_region_pool_region_outer'):
                 layouts[label]['page_size'] = page_size
     return layouts
 
@@ -10489,6 +10494,8 @@ def _opspace_compute_frac(rec, prefixes, name, visible_ops):
 
 def _opspace_backend_name(rec, prefixes):
     for key, label in (
+            ('execution_backend_paged_region_pool_region_outer',
+             'paged_region_pool_region_outer'),
             ('execution_backend_paged_region_pool',
              'paged_region_pool'),
             ('execution_backend_sparse_region_block',
@@ -10640,7 +10647,7 @@ def _print_v4168_opspace_regular_block(rec):
         f" semantic_ops={fmt_intlike(logical_ops)}"
         f" physical_ops={fmt_intlike(physical_ops)}"
         f" compute={fmt_pct(logical_compute, 2)}/{fmt_pct(physical_compute, 2)}")
-    if rst_backend == 'paged_region_pool':
+    if rst_backend in ('paged_region_pool', 'paged_region_pool_region_outer'):
         rst_line += (
             f" page_size={fmt_intlike(_opspace_metric(rec, rst_prefix, 'page_size'))}"
             f" pages={fmt_intlike(_opspace_metric(rec, rst_prefix, 'used_pages'))}/"
@@ -13134,7 +13141,8 @@ def main():
                         'spill_capacity': int(_layout.get(
                             'spill_capacity', 0)),
                     })
-                if _backend == 'paged_region_pool':
+                if _backend in ('paged_region_pool',
+                                'paged_region_pool_region_outer'):
                     _pool['page_size'] = int(_layout.get(
                         'page_size', 4096))
             return _pool
@@ -13774,7 +13782,8 @@ def main():
                         f" physical_ops={_physical_ops} "
                         f"compute={(_visible_ops / _dense_ops) * 100.0:.2f}%/"
                         f"{(_physical_ops / _dense_ops) * 100.0:.2f}% ")
-                    if _backend == 'paged_region_pool':
+                    if _backend in ('paged_region_pool',
+                                    'paged_region_pool_region_outer'):
                         _line += (
                             f"page_size={int(_layout.get('page_size', 0))} ")
                     else:
@@ -14842,9 +14851,11 @@ def main():
                             f"visible_ops={_visible_ops}")
                         if _backend in (
                                 'sparse_region_block',
-                                'paged_region_pool'):
+                                'paged_region_pool',
+                                'paged_region_pool_region_outer'):
                             _line += f" physical_ops={_physical_ops}"
-                        if _backend == 'paged_region_pool':
+                        if _backend in ('paged_region_pool',
+                                        'paged_region_pool_region_outer'):
                             _line += (
                                 f" page_size="
                                 f"{int(_layout.get('page_size', 0))}")
@@ -15793,7 +15804,8 @@ def main():
             _rst_runtime_layout = {}
         _rst_final_backend_enabled = (
             str(_rst_runtime_layout.get('execution_backend', '')).lower()
-            in ('sparse_region_block', 'paged_region_pool'))
+            in ('sparse_region_block', 'paged_region_pool',
+                'paged_region_pool_region_outer'))
 
     # ----------------------------------------------------------
     if is_host0:

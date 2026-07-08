@@ -3,7 +3,7 @@ DAWN-SRW v4.1.6.8 operation-space SRW.
 
 When operation_space is enabled:
 - Region/Block/Operator Atlas selection is the only operation-space routing.
-- RST uses sparse_region_block or paged_region_pool execution with semantic
+- RST uses sparse_region_block, paged_region_pool, or paged_region_pool_region_outer execution with semantic
   block masks.
 - QK and V use dense execution with region/block masks.
 - QK/V/RST do not use DirectTau, admission, drive, or selection calibration in
@@ -199,6 +199,7 @@ OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'page_padding_frac',
     'page_overflow',
     'page_overflow_count',
+    'execution_backend_paged_region_pool_region_outer',
 )
 OPSPACE_FINAL_RUNTIME_DIAG_COUNT = len(OPSPACE_FINAL_RUNTIME_DIAG_NAMES)
 
@@ -4539,6 +4540,145 @@ def _opspace_accumulate_rst_region_dense_block_masked_paged_pool(
         compute_no_nan)
 
 
+
+def _opspace_accumulate_rst_region_dense_block_masked_paged_pool_region_outer(
+        flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
+        page_token_ids, page_valid, active_page, page_start,
+        pages_per_region, *, visible_blocks_per_region,
+        admission_den_power=None):
+    """Accumulate paged RST contributions with region-outer execution.
+
+    Page allocation is unchanged: selected region requests are packed into a
+    shared owner-local page pool. Execution order changes from page-major to
+    region-major: each local region fixes its key/read/write slice once, then
+    streams the pages assigned to that region through the same operator slice.
+    """
+    del admission_den_power
+    T = int(flat_x.shape[0])
+    D = int(flat_x.shape[-1])
+    local_regions = int(key_blocks.shape[0])
+    blocks_per_region = int(key_blocks.shape[1])
+    operators_per_block = int(key_blocks.shape[2])
+    region_ops = blocks_per_region * operators_per_block
+    route_dim = int(key_blocks.shape[-1])
+    max_pages = int(page_token_ids.shape[0])
+    page_size = int(page_token_ids.shape[1])
+    max_pages_i32 = jnp.asarray(max_pages, dtype=jnp.int32)
+
+    flat_h_unit = _forward_unit_direction(
+        flat_h.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+    flat_x_bf = flat_x.astype(jnp.bfloat16)
+
+    def region_step(carry, region_i):
+        key_region_blocks = key_blocks[region_i]
+        read_region_blocks = read_blocks[region_i]
+        write_region_blocks = write_blocks[region_i]
+        valid_region_blocks = valid_blocks[region_i]
+
+        key_region = key_region_blocks.reshape(
+            region_ops, route_dim).astype(jnp.bfloat16)
+        read_region = read_region_blocks.reshape(
+            region_ops, D).astype(jnp.bfloat16)
+        write_region = write_region_blocks.reshape(
+            region_ops, D).astype(jnp.bfloat16)
+        valid_ops = valid_region_blocks.reshape(region_ops)
+
+        valid_block_f = valid_region_blocks.astype(jnp.float32)[..., None]
+        block_count = jnp.maximum(valid_block_f.sum(axis=1), 1.0)
+        block_center_raw = (
+            key_region_blocks.astype(jnp.float32) * valid_block_f
+        ).sum(axis=1) / block_count
+        block_center = jax.lax.stop_gradient(
+            _forward_unit_direction(block_center_raw)).astype(jnp.bfloat16)
+
+        start = page_start[region_i]
+        count = pages_per_region[region_i]
+
+        def page_step(region_carry, page_offset):
+            page_i = start + page_offset
+            in_range = page_i < max_pages_i32
+            safe_page_i = jnp.minimum(page_i, max_pages_i32 - jnp.int32(1))
+            page_is_active = jnp.logical_and(
+                page_offset < count,
+                jnp.logical_and(in_range, active_page[safe_page_i]))
+
+            def compute_page(active_carry):
+                flat_raw_out, flat_gate_mass, relu_gate_count_sum_local, finite_acc = (
+                    active_carry)
+                token_ids = page_token_ids[safe_page_i]
+                valid = page_valid[safe_page_i]
+                safe_token_ids = jnp.where(valid, token_ids, 0)
+                valid_f = valid.astype(jnp.float32)
+                valid_bf = valid_f.astype(jnp.bfloat16)
+
+                x_p = flat_x_bf[safe_token_ids] * valid_bf[:, None]
+                h_p = flat_h_unit[safe_token_ids] * valid_bf[:, None]
+
+                block_score = jnp.einsum(
+                    'cd,bd->cb', h_p, block_center).astype(jnp.float32)
+                block_mask = _opspace_semantic_block_mask_from_scores(
+                    block_score, visible_blocks_per_region)
+                operator_mask = jnp.broadcast_to(
+                    block_mask[..., None],
+                    (page_size, blocks_per_region,
+                     operators_per_block)).reshape(page_size, region_ops)
+                operator_mask = jnp.logical_and(
+                    operator_mask, valid_ops[None, :])
+
+                rho = jnp.einsum(
+                    'cd,od->co', h_p, key_region).astype(jnp.float32)
+                read_value = jnp.einsum(
+                    'cd,od->co', x_p, read_region).astype(jnp.float32)
+                gate = jnp.square(jax.nn.relu(rho)).astype(jnp.float32)
+                gate = gate * valid_f[:, None]
+                gate = gate * operator_mask.astype(jnp.float32)
+
+                raw_p = jnp.einsum(
+                    'co,od->cd',
+                    (gate * read_value).astype(jnp.bfloat16),
+                    write_region).astype(jnp.float32)
+                mass_p = gate.sum(axis=-1, keepdims=True)
+                relu_p = (gate > 0.0).astype(jnp.float32).sum(axis=-1)
+                relu_sum_p = (relu_p * valid_f).sum()
+
+                flat_raw_out = flat_raw_out.at[safe_token_ids].add(
+                    raw_p * valid_f[:, None], mode='drop')
+                flat_gate_mass = flat_gate_mass.at[safe_token_ids].add(
+                    mass_p * valid_f[:, None], mode='drop')
+                relu_gate_count_sum_local = (
+                    relu_gate_count_sum_local + relu_sum_p)
+                finite = jnp.logical_and(
+                    jnp.all(jnp.isfinite(gate)), jnp.all(jnp.isfinite(raw_p)))
+                finite_acc = jnp.minimum(
+                    finite_acc, finite.astype(jnp.float32))
+                return (
+                    flat_raw_out, flat_gate_mass, relu_gate_count_sum_local,
+                    finite_acc)
+
+            region_carry = jax.lax.cond(
+                page_is_active, compute_page, lambda c: c, region_carry)
+            return region_carry, None
+
+        carry, _ = jax.lax.scan(
+            page_step, carry, jnp.arange(max_pages, dtype=jnp.int32))
+        return carry, None
+
+    init = (
+        jnp.zeros((T, D), dtype=jnp.float32),
+        jnp.zeros((T, 1), dtype=jnp.float32),
+        jnp.float32(0.0),
+        jnp.float32(1.0),
+    )
+    (flat_raw_out_local, flat_gate_mass_local, relu_gate_count_sum_local,
+     compute_no_nan) = jax.lax.scan(
+        region_step, init, jnp.arange(local_regions, dtype=jnp.int32))[0]
+    return (
+        flat_raw_out_local,
+        flat_gate_mass_local,
+        relu_gate_count_sum_local,
+        compute_no_nan)
+
+
 def _opspace_execute_rst_region_dense_block_masked(
         flat_x, flat_h, key_blocks, read_blocks, write_blocks, valid_blocks,
         token_id_bucket, bucket_valid, *, visible_blocks_per_region,
@@ -5056,6 +5196,7 @@ def _opspace_tau_free_relu_region_block_sparse_core(
         jnp.float32(0.0),
         jnp.float32(0.0),
         jnp.float32(0.0),
+        jnp.float32(0.0),
     ), dtype=jnp.float32)
     spill_diag = jnp.asarray((
         main_processed_request_count,
@@ -5096,7 +5237,8 @@ def _opspace_tau_free_relu_region_block_paged_pool_core(
         load_smoothing_space_temperature=0.12, load_smoothing_alpha=1.25,
         load_smoothing_warmup_tokens=2.0e8,
         load_smoothing_peak_tokens=1.0e9,
-        load_smoothing_final_weight_frac=1.0):
+        load_smoothing_final_weight_frac=1.0,
+        region_outer=False):
     """RST owner-local shared page pool backend with unchanged routing."""
     if int(blocks_per_region) <= 0:
         raise ValueError(
@@ -5244,15 +5386,26 @@ def _opspace_tau_free_relu_region_block_paged_pool_core(
         page_size=_page_size,
         max_pages=max_pages)
 
-    (flat_raw_out_local, flat_gate_mass_local,
-     relu_gate_count_sum_local, compute_no_nan) = (
-        _opspace_accumulate_rst_region_dense_block_masked_paged_pool(
-            flat_x, flat_h, key_blocks, read_blocks, write_blocks,
-            valid_blocks, page_pool['page_token_ids'],
-            page_pool['page_valid'], page_pool['page_region_local'],
-            page_pool['active_page'],
-            visible_blocks_per_region=_visible_blocks_per_region,
-            admission_den_power=admission_den_power))
+    if bool(region_outer):
+        (flat_raw_out_local, flat_gate_mass_local,
+         relu_gate_count_sum_local, compute_no_nan) = (
+            _opspace_accumulate_rst_region_dense_block_masked_paged_pool_region_outer(
+                flat_x, flat_h, key_blocks, read_blocks, write_blocks,
+                valid_blocks, page_pool['page_token_ids'],
+                page_pool['page_valid'], page_pool['active_page'],
+                page_pool['page_start'], page_pool['pages_per_region'],
+                visible_blocks_per_region=_visible_blocks_per_region,
+                admission_den_power=admission_den_power))
+    else:
+        (flat_raw_out_local, flat_gate_mass_local,
+         relu_gate_count_sum_local, compute_no_nan) = (
+            _opspace_accumulate_rst_region_dense_block_masked_paged_pool(
+                flat_x, flat_h, key_blocks, read_blocks, write_blocks,
+                valid_blocks, page_pool['page_token_ids'],
+                page_pool['page_valid'], page_pool['page_region_local'],
+                page_pool['active_page'],
+                visible_blocks_per_region=_visible_blocks_per_region,
+                admission_den_power=admission_den_power))
 
     (flat_out, global_gate_mass, global_relu_gate_count_sum,
      gate_denominator) = _opspace_finalize_bucketed_output(
@@ -5496,6 +5649,7 @@ def _opspace_tau_free_relu_region_block_paged_pool_core(
         page_padding_frac,
         page_overflow,
         page_overflow_count,
+        jnp.float32(1.0 if bool(region_outer) else 0.0),
     ), dtype=jnp.float32)
     spill_diag = jnp.asarray((
         processed_request_count,
@@ -5689,7 +5843,8 @@ def make_sharded_srw_tau_free_relu_region_block_paged_pool_minimal(
         load_smoothing_alpha=1.25,
         load_smoothing_warmup_tokens=2.0e8,
         load_smoothing_peak_tokens=1.0e9,
-        load_smoothing_final_weight_frac=1.0):
+        load_smoothing_final_weight_frac=1.0,
+        region_outer=False):
     """Create the RST page-pool semantic-block atlas executor."""
     del max_chunk_size, dead_exposure_target, padded_ops, token_chunk_size
     del soft_gate_effective_active_eps, admission_den_grad_scale
@@ -5743,6 +5898,7 @@ def make_sharded_srw_tau_free_relu_region_block_paged_pool_minimal(
     _admission_den_power = jnp.maximum(
         jnp.asarray(admission_den_power, dtype=jnp.float32),
         jnp.float32(0.0))
+    _region_outer = bool(region_outer)
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),
@@ -5798,7 +5954,8 @@ def make_sharded_srw_tau_free_relu_region_block_paged_pool_minimal(
                     _load_smoothing_warmup_tokens),
                 load_smoothing_peak_tokens=_load_smoothing_peak_tokens,
                 load_smoothing_final_weight_frac=(
-                    _load_smoothing_final_weight_frac)))
+                    _load_smoothing_final_weight_frac),
+                region_outer=_region_outer))
         return flat_out.reshape(B, S, D), diag, aux
 
     fused_gate_srw_tau_free_relu_region_block_paged_pool._v4168_accepts_training_tokens = True
@@ -6176,7 +6333,8 @@ def operation_space_static_metrics(model_config, config=None,
         visible_blocks_per_token = visible_regions * visible_blocks_per_region
         visible_ops_per_token = (
             visible_blocks_per_token * operators_per_block)
-        if execution_backend in ('sparse_region_block', 'paged_region_pool'):
+        if execution_backend in ('sparse_region_block', 'paged_region_pool',
+                                 'paged_region_pool_region_outer'):
             physical_visible_ops_per_token = (
                 visible_regions * blocks_per_region * operators_per_block)
         else:
@@ -6222,7 +6380,10 @@ def operation_space_static_metrics(model_config, config=None,
         out[f'opspace/{label}/execution_backend_sparse_region_block'] = float(
             1.0 if execution_backend == 'sparse_region_block' else 0.0)
         out[f'opspace/{label}/execution_backend_paged_region_pool'] = float(
-            1.0 if execution_backend == 'paged_region_pool' else 0.0)
+            1.0 if execution_backend in ('paged_region_pool',
+                                          'paged_region_pool_region_outer') else 0.0)
+        out[f'opspace/{label}/execution_backend_paged_region_pool_region_outer'] = float(
+            1.0 if execution_backend == 'paged_region_pool_region_outer' else 0.0)
         out[f'opspace/{label}/load_smoothing_enabled'] = float(
             pcfg.get('load_smoothing_enabled', True))
         out[f'opspace/{label}/load_smoothing_region_weight'] = float(
@@ -6233,7 +6394,7 @@ def operation_space_static_metrics(model_config, config=None,
             out[f'opspace/{label}/region_capacity_factor'] = float(
                 region_capacity_factor)
             out[f'opspace/{label}/spill_capacity'] = float(spill_capacity)
-        if execution_backend == 'paged_region_pool':
+        if execution_backend in ('paged_region_pool', 'paged_region_pool_region_outer'):
             out[f'opspace/{label}/page_size'] = float(page_size)
     return out
 
@@ -6474,7 +6635,7 @@ def make_sharded_srw_minimal(
             load_smoothing_peak_tokens=opspace_load_smoothing_peak_tokens,
             load_smoothing_final_weight_frac=(
                 opspace_load_smoothing_final_weight_frac))
-    if execution_backend == 'paged_region_pool':
+    if execution_backend in ('paged_region_pool', 'paged_region_pool_region_outer'):
         return make_sharded_srw_tau_free_relu_region_block_paged_pool_minimal(
             mesh, max_chunk_size=max_chunk_size,
             dead_exposure_target=dead_exposure_target,
@@ -6505,17 +6666,18 @@ def make_sharded_srw_minimal(
                 opspace_load_smoothing_warmup_tokens),
             load_smoothing_peak_tokens=opspace_load_smoothing_peak_tokens,
             load_smoothing_final_weight_frac=(
-                opspace_load_smoothing_final_weight_frac))
+                opspace_load_smoothing_final_weight_frac),
+            region_outer=(execution_backend == 'paged_region_pool_region_outer'))
     if execution_backend:
         raise ValueError(
             "v4168 operation_space supports execution_backend='dense' for QK/V "
             "and execution_backend in ('sparse_region_block', "
-            "'paged_region_pool') for RST only.")
+            "'paged_region_pool', 'paged_region_pool_region_outer') for RST only.")
     raise ValueError(
         "v4.1.6.8 operation_space official path only supports "
         "execution_backend='dense' for qk/v and "
         "execution_backend in ('sparse_region_block', "
-        "'paged_region_pool') for rst.")
+        "'paged_region_pool', 'paged_region_pool_region_outer') for rst.")
 
 
 def make_sharded_srw_paired_minimal(
