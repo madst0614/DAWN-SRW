@@ -920,6 +920,7 @@ V4168_OPSPACE_SPARSE_RUNTIME_RESUME_REQUIRED_FIELDS = (
 )
 
 V4168_OPSPACE_PAGED_RUNTIME_RESUME_REQUIRED_FIELDS = (
+    ('training', 'operation_space', 'pools', 'v', 'page_size'),
     ('training', 'operation_space', 'pools', 'rst', 'page_size'),
 )
 
@@ -944,6 +945,24 @@ def _missing_config_paths(cfg, paths):
                 break
             cur = cur[key]
     return missing
+
+
+def _v4168_opspace_paged_runtime_resume_required_fields(pools_cfg):
+    if not isinstance(pools_cfg, dict):
+        return ()
+    required = []
+    for pool_name in V4168_OPSPACE_POOL_NAMES:
+        pool_cfg = pools_cfg.get(pool_name, {})
+        if not isinstance(pool_cfg, dict):
+            continue
+        execution_backend = str(pool_cfg.get(
+            'execution_backend', '')).strip().lower()
+        if execution_backend in ('paged_region_pool',
+                                 'paged_region_pool_region_outer'):
+            required.append(
+                ('training', 'operation_space', 'pools', pool_name,
+                 'page_size'))
+    return tuple(required)
 
 
 def _require_resume_full_config(full_config):
@@ -1008,14 +1027,12 @@ def _require_resume_materialized_fields(full_config):
             pools_cfg.get('rst', {})
             if isinstance(pools_cfg.get('rst', {}), dict) else {})
         rst_execution_backend = str(rst_cfg.get(
-            'execution_backend', '')).lower()
+            'execution_backend', '')).strip().lower()
         if rst_execution_backend == 'sparse_region_block':
             required_fields.extend(
                 V4168_OPSPACE_SPARSE_RUNTIME_RESUME_REQUIRED_FIELDS)
-        if rst_execution_backend in ('paged_region_pool',
-                                     'paged_region_pool_region_outer'):
-            required_fields.extend(
-                V4168_OPSPACE_PAGED_RUNTIME_RESUME_REQUIRED_FIELDS)
+        required_fields.extend(
+            _v4168_opspace_paged_runtime_resume_required_fields(pools_cfg))
         if 'operation_space_load_smoothing' in training_cfg:
             required_fields.extend(
                 V4168_OPSPACE_LOAD_SMOOTHING_RESUME_REQUIRED_FIELDS)
@@ -1607,9 +1624,11 @@ def _v4168_validate_operation_space_shape(opspace):
         'region_score_pooling',
         'region_score_temperature',
     }
-    sparse_runtime_keys = {
+    rst_sparse_runtime_keys = {
         'region_capacity_factor',
         'spill_capacity',
+    }
+    paged_runtime_keys = {
         'page_size',
     }
     for label in ('qk', 'v', 'rst'):
@@ -1634,14 +1653,31 @@ def _v4168_validate_operation_space_shape(opspace):
                 f"{present_legacy[0]}")
         allowed_pool_keys = set(logical_pool_keys)
         allowed_pool_keys.update(V4168_OPSPACE_IGNORED_POOL_FIELDS)
-        if label == 'rst':
-            allowed_pool_keys.update(sparse_runtime_keys)
+        execution_backend = str(pool.get(
+            'execution_backend',
+            'sparse_region_block' if label == 'rst' else 'dense'
+        )).strip().lower()
+        if label == 'rst' and execution_backend == 'sparse_region_block':
+            allowed_pool_keys.update(rst_sparse_runtime_keys)
+        if (label in ('v', 'rst')
+                and execution_backend in ('paged_region_pool',
+                                          'paged_region_pool_region_outer')):
+            allowed_pool_keys.update(paged_runtime_keys)
         extra = sorted(set(pool) - allowed_pool_keys)
         if extra:
             raise ValueError(
                 f"training.operation_space.pools.{label} only supports "
                 "the official operation-space logical selector fields"
-                + (" plus RST runtime fields" if label == 'rst' else "")
+                + (
+                    " plus sparse RST runtime fields"
+                    if label == 'rst'
+                    and execution_backend == 'sparse_region_block' else "")
+                + (
+                    " plus paged V/RST runtime fields"
+                    if label in ('v', 'rst')
+                    and execution_backend in (
+                        'paged_region_pool',
+                        'paged_region_pool_region_outer') else "")
                 + "; remove: "
                 f"{', '.join(extra)}")
     repack = opspace.get('repack', {})
@@ -1775,7 +1811,33 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
         region_capacity_factor = None
         spill_capacity = None
         page_size = None
-        if label == 'rst':
+        if label == 'qk':
+            if execution_backend != 'dense':
+                raise ValueError(
+                    "training.operation_space.pools.qk.execution_backend "
+                    f"must be 'dense', got {execution_backend!r}.")
+        elif label == 'v':
+            allowed_v_backends = ('dense', 'paged_region_pool')
+            if execution_backend not in allowed_v_backends:
+                raise ValueError(
+                    "training.operation_space.pools.v.execution_backend "
+                    f"must be one of {allowed_v_backends}, got "
+                    f"{execution_backend!r}.")
+            if execution_backend == 'paged_region_pool':
+                if visible_regions != 1:
+                    raise ValueError(
+                        "training.operation_space.pools.v.visible_regions "
+                        "must be 1 for paged_region_pool.")
+                if 'page_size' not in pool:
+                    raise ValueError(
+                        "training.operation_space.pools.v.page_size is "
+                        "required for paged_region_pool.")
+                page_size = int(pool['page_size'])
+                if page_size <= 0:
+                    raise ValueError(
+                        "training.operation_space.pools.v.page_size "
+                        f"must be > 0, got {page_size}.")
+        elif label == 'rst':
             allowed_rst_backends = (
                 'sparse_region_block',
                 'paged_region_pool',
@@ -1820,14 +1882,6 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                     raise ValueError(
                         "training.operation_space.pools.rst.page_size "
                         f"must be > 0, got {page_size}.")
-        else:
-            expected_backend = defaults_i['execution_backend']
-            if execution_backend != expected_backend:
-                raise ValueError(
-                    f"training.operation_space.pools.{label}."
-                    "execution_backend "
-                    f"must be {expected_backend!r}, got "
-                    f"{execution_backend!r}.")
         visible_ops_per_token = (
             visible_regions * visible_blocks_per_region
             * operators_per_block)
@@ -1881,9 +1935,10 @@ def _v4168_operation_space_pool_layouts(training_cfg, model_cfg):
                 layouts[label]['region_capacity_factor'] = (
                     region_capacity_factor)
                 layouts[label]['spill_capacity'] = spill_capacity
-            if execution_backend in ('paged_region_pool',
-                                     'paged_region_pool_region_outer'):
-                layouts[label]['page_size'] = page_size
+        if (label in ('v', 'rst')
+                and execution_backend in ('paged_region_pool',
+                                          'paged_region_pool_region_outer')):
+            layouts[label]['page_size'] = page_size
     return layouts
 
 
@@ -10584,12 +10639,26 @@ def _print_v4168_opspace_regular_block(rec):
         qk_line += " status=diag_missing"
     log_message(qk_line)
 
+    v_backend = _opspace_backend_name(rec, v_prefixes)
+    v_logical_ops = _opspace_logical_ops(rec, v_prefixes)
+    v_physical_ops = _opspace_physical_ops(rec, v_prefixes)
     v_parts = [
         "  [opspace/v]",
-        f"backend={_opspace_backend_name(rec, v_prefixes)}",
+        f"backend={v_backend}",
         f"visible_regions={fmt_intlike(_opspace_metric(rec, v_prefixes, 'visible_regions'))}",
-        f"visible_ops={fmt_intlike(_opspace_logical_ops(rec, v_prefixes))}",
+        f"visible_ops={fmt_intlike(v_logical_ops)}",
     ]
+    if v_backend == 'paged_region_pool':
+        v_parts.extend([
+            f"physical_ops={fmt_intlike(v_physical_ops)}",
+            f"page_size={fmt_intlike(_opspace_metric(rec, v_prefixes, 'page_size'))}",
+            f"pages={fmt_intlike(_opspace_metric(rec, v_prefixes, 'used_pages'))}/"
+            f"{fmt_intlike(_opspace_metric(rec, v_prefixes, 'max_pages'))}",
+            f"fill={fmt_float(_opspace_metric(rec, v_prefixes, 'page_fill_mean'), 1)}/"
+            f"{fmt_intlike(_opspace_metric(rec, v_prefixes, 'page_fill_max'))}",
+            f"padding={fmt_pct(_opspace_metric(rec, v_prefixes, 'page_padding_frac'), 2)}",
+            f"page_overflow={fmt_intlike(_opspace_metric(rec, v_prefixes, 'page_overflow'))}",
+        ])
     if _opspace_has_metric(rec, v_prefixes, 'gate_mass_mean'):
         v_parts.append(
             f"gate_mass={fmt_float(_opspace_metric(rec, v_prefixes, 'gate_mass_mean'), 2)}")
@@ -13131,9 +13200,11 @@ def main():
                 'region_score_temperature': float(_layout.get(
                     'region_score_temperature', 0.25)),
             }
+            _backend = str(_pool.get(
+                'execution_backend',
+                'sparse_region_block' if _label == 'rst'
+                else 'dense')).lower()
             if _label == 'rst':
-                _backend = str(_pool.get(
-                    'execution_backend', 'sparse_region_block')).lower()
                 if _backend == 'sparse_region_block':
                     _pool.update({
                         'region_capacity_factor': float(_layout.get(
@@ -13141,10 +13212,10 @@ def main():
                         'spill_capacity': int(_layout.get(
                             'spill_capacity', 0)),
                     })
-                if _backend in ('paged_region_pool',
-                                'paged_region_pool_region_outer'):
-                    _pool['page_size'] = int(_layout.get(
-                        'page_size', 4096))
+            if (_label in ('v', 'rst')
+                    and _backend in ('paged_region_pool',
+                                     'paged_region_pool_region_outer')):
+                _pool['page_size'] = int(_layout.get('page_size', 4096))
             return _pool
 
         def _opspace_materialized_max_swaps(_label):
@@ -13775,7 +13846,9 @@ def main():
                     f"visible_blocks_per_region="
                     f"{int(_layout.get('visible_blocks_per_region', 0))} "
                     f"visible_ops={_visible_ops}")
-                if _label == 'rst':
+                if _backend in ('sparse_region_block',
+                                'paged_region_pool',
+                                'paged_region_pool_region_outer'):
                     _dense_ops = max(
                         int(_layout.get('global_operator_capacity', 1)), 1)
                     _line += (
@@ -13786,7 +13859,7 @@ def main():
                                     'paged_region_pool_region_outer'):
                         _line += (
                             f"page_size={int(_layout.get('page_size', 0))} ")
-                    else:
+                    elif _label == 'rst':
                         _line += (
                             f"region_capacity_factor="
                             f"{float(_layout.get('region_capacity_factor', 1.25))} "
@@ -14516,6 +14589,7 @@ def main():
             if not isinstance(layout, dict):
                 layout = {}
             return {
+                'opspace_pool_label': pool,
                 'operation_space_execution_backend': str(layout.get(
                     'execution_backend',
                     'sparse_region_block' if pool == 'rst'

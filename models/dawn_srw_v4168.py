@@ -2894,8 +2894,8 @@ def make_sharded_srw_paired_dense_minimal(mesh, max_chunk_size=2048,
             token_chunk_size=opspace_token_chunk_size)
     if execution_backend:
         raise ValueError(
-            "v4168 operation_space supports execution_backend='dense' for QK/V "
-            "and execution_backend='sparse_region_block' for RST only.")
+            "v4168 operation_space paired QK path only supports "
+            "execution_backend='dense'.")
     del opspace_token_chunk_size
     del dead_exposure_target
     _soft_gate_effective_active_eps = jnp.float32(
@@ -3977,10 +3977,35 @@ def _opspace_raise_page_overflow(page_overflow_count):
             "invariant was violated; silent fallback is disabled.")
 
 
+def _opspace_raise_page_no_drop_violation(
+        selected_request_count, processed_request_count, page_overflow_count):
+    selected = float(np.asarray(selected_request_count, dtype=np.float32))
+    processed = float(np.asarray(processed_request_count, dtype=np.float32))
+    overflow = float(np.asarray(page_overflow_count, dtype=np.float32))
+    if overflow > 0.0 or processed + 0.5 < selected:
+        raise RuntimeError(
+            "v4.1.6.8 operation_space paged_region_pool no-drop invariant "
+            "failed: "
+            f"selected_requests={selected:.0f}, "
+            f"processed_requests={processed:.0f}, "
+            f"page_overflow_count={overflow:.0f}. "
+            "Silent fallback is disabled.")
+
+
 def _opspace_fail_loud_on_page_overflow(page_overflow_count):
     if SPILL_OVERFLOW_FAIL_LOUD:
         jax.debug.callback(
             _opspace_raise_page_overflow,
+            jax.lax.stop_gradient(page_overflow_count))
+
+
+def _opspace_fail_loud_on_page_no_drop(
+        selected_request_count, processed_request_count, page_overflow_count):
+    if SPILL_OVERFLOW_FAIL_LOUD:
+        jax.debug.callback(
+            _opspace_raise_page_no_drop_violation,
+            jax.lax.stop_gradient(selected_request_count),
+            jax.lax.stop_gradient(processed_request_count),
             jax.lax.stop_gradient(page_overflow_count))
 
 
@@ -4520,8 +4545,9 @@ def _opspace_accumulate_rst_region_dense_block_masked_paged_pool(
                 flat_raw_out, flat_gate_mass, relu_gate_count_sum_local,
                 finite_acc)
 
+        compute_active_remat = jax.checkpoint(compute_active)
         carry = jax.lax.cond(
-            active_page[page_i], compute_active, lambda c: c, carry)
+            active_page[page_i], compute_active_remat, lambda c: c, carry)
         return carry, None
 
     init = (
@@ -5446,7 +5472,8 @@ def _opspace_tau_free_relu_region_block_paged_pool_core(
     selected_request_count = data_sum(global_selected_count)
     processed_request_count = data_sum(global_processed_count)
     page_overflow_count = data_sum(global_page_overflow_count)
-    _opspace_fail_loud_on_page_overflow(page_overflow_count)
+    _opspace_fail_loud_on_page_no_drop(
+        selected_request_count, processed_request_count, page_overflow_count)
     active_pages_total = data_sum(global_active_pages)
     page_fill_sum_total = data_sum(global_page_fill_sum)
     page_fill_mean = (
@@ -6545,6 +6572,7 @@ def make_sharded_srw_minimal(
         soft_gate_effective_active_eps=1.0e-6,
         admission_den_power=1.0,
         admission_den_grad_scale=1.0,
+        opspace_pool_label=None,
         operation_space_execution_backend=None,
         opspace_num_regions=32,
         opspace_blocks_per_region=2,
@@ -6571,6 +6599,7 @@ def make_sharded_srw_minimal(
         operation_space_execution_backend
         if operation_space_execution_backend is not None
         else '').lower()
+    pool_label = str(opspace_pool_label or '').strip().lower()
     if execution_backend == 'dense':
         return make_sharded_srw_tau_free_relu_region_block_dense_masked_minimal(
             mesh, max_chunk_size=max_chunk_size,
@@ -6603,6 +6632,10 @@ def make_sharded_srw_minimal(
                 opspace_load_smoothing_final_weight_frac),
             token_chunk_size=opspace_token_chunk_size)
     if execution_backend == 'sparse_region_block':
+        if pool_label and pool_label != 'rst':
+            raise ValueError(
+                "v4168 operation_space sparse_region_block is only "
+                f"supported for rst, got pool={pool_label!r}.")
         return make_sharded_srw_tau_free_relu_region_block_sparse_minimal(
             mesh, max_chunk_size=max_chunk_size,
             dead_exposure_target=dead_exposure_target,
@@ -6636,6 +6669,15 @@ def make_sharded_srw_minimal(
             load_smoothing_final_weight_frac=(
                 opspace_load_smoothing_final_weight_frac))
     if execution_backend in ('paged_region_pool', 'paged_region_pool_region_outer'):
+        if pool_label == 'qk':
+            raise ValueError(
+                "v4168 operation_space QK path only supports "
+                "execution_backend='dense'.")
+        if (pool_label == 'v'
+                and execution_backend == 'paged_region_pool_region_outer'):
+            raise ValueError(
+                "v4168 operation_space V path supports "
+                "execution_backend='dense' or 'paged_region_pool' only.")
         return make_sharded_srw_tau_free_relu_region_block_paged_pool_minimal(
             mesh, max_chunk_size=max_chunk_size,
             dead_exposure_target=dead_exposure_target,
@@ -6670,12 +6712,14 @@ def make_sharded_srw_minimal(
             region_outer=(execution_backend == 'paged_region_pool_region_outer'))
     if execution_backend:
         raise ValueError(
-            "v4168 operation_space supports execution_backend='dense' for QK/V "
+            "v4168 operation_space supports execution_backend='dense' for QK, "
+            "execution_backend in ('dense', 'paged_region_pool') for V, "
             "and execution_backend in ('sparse_region_block', "
             "'paged_region_pool', 'paged_region_pool_region_outer') for RST only.")
     raise ValueError(
         "v4.1.6.8 operation_space official path only supports "
-        "execution_backend='dense' for qk/v and "
+        "execution_backend='dense' for qk, "
+        "execution_backend in ('dense', 'paged_region_pool') for v, and "
         "execution_backend in ('sparse_region_block', "
         "'paged_region_pool', 'paged_region_pool_region_outer') for rst.")
 
