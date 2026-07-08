@@ -3642,10 +3642,16 @@ def _opspace_load_smoothing_weight(tokens, weight, warmup_tokens,
 
 def _opspace_normalize_load_smoothing_mode(mode):
     mode = str('neighbor' if mode is None else mode).strip().lower()
-    if mode not in ('neighbor', 'capacity'):
+    if mode in ('hard_capacity_geometry', 'hard_cap_geometry',
+                'hard_over_soft_geometry'):
         raise ValueError(
-            "operation_space_load_smoothing.mode must be 'neighbor' or "
-            f"'capacity', got {mode!r}.")
+            "operation_space_load_smoothing hard_capacity_geometry was "
+            "removed; use mode='barrier_capacity_geometry'.")
+    allowed = ('neighbor', 'capacity', 'barrier_capacity_geometry')
+    if mode not in allowed:
+        raise ValueError(
+            "operation_space_load_smoothing.mode must be one of "
+            f"{allowed}, got {mode!r}.")
     return mode
 
 
@@ -3736,6 +3742,82 @@ def _opspace_capacity_load_smoothing_loss(
     return weighted_loss, diag
 
 
+def _opspace_barrier_capacity_geometry_loss(
+        scores, *, hard_region_load, weight, load_temperature, alpha,
+        region_capacity, local_token_count, eps=1.0e-6):
+    """Capacity-barrier weighted soft score-geometry loss.
+
+    This loss does not alter forward route scores or selected regions.
+    hard_region_load is a stop-gradient measurement coefficient. Gradients
+    flow only through softmax(scores / load_temperature).
+    """
+    if (hard_region_load is None or region_capacity is None
+            or local_token_count is None):
+        raise ValueError(
+            "operation_space_load_smoothing.mode='barrier_capacity_geometry' "
+            "requires hard_region_load, region_capacity, and "
+            "local_token_count.")
+    scores = scores.astype(jnp.float32)
+    weight = jnp.asarray(weight, dtype=jnp.float32)
+    eps_f = jnp.asarray(eps, dtype=jnp.float32)
+    load_temperature = jnp.maximum(
+        jnp.asarray(load_temperature, dtype=jnp.float32), eps_f)
+    alpha = jnp.asarray(alpha, dtype=jnp.float32)
+
+    p = jax.nn.softmax(scores / load_temperature, axis=-1)
+    local_soft_sum = p.sum(axis=0)
+    local_hard_load = jnp.asarray(hard_region_load, dtype=jnp.float32)
+
+    global_soft_sum = jax.lax.pmean(
+        jax.lax.psum(local_soft_sum, 'data'), 'model')
+    global_hard_load = jax.lax.pmean(
+        jax.lax.psum(local_hard_load, 'data'), 'model')
+
+    local_tokens = jnp.asarray(local_token_count, dtype=jnp.float32)
+    global_tokens = jax.lax.pmean(
+        jax.lax.psum(local_tokens, 'data'), 'model')
+    data_axis_size = jax.lax.pmean(
+        jax.lax.psum(jnp.float32(1.0), 'data'), 'model')
+
+    effective_cap = (
+        alpha
+        * jnp.asarray(region_capacity, dtype=jnp.float32)
+        * data_axis_size)
+
+    cap_safe = jnp.maximum(effective_cap, jnp.float32(1.0))
+    token_safe = jnp.maximum(global_tokens, jnp.float32(1.0))
+
+    cap_util = global_hard_load / cap_safe
+    cap_util_clipped = jnp.clip(
+        cap_util, jnp.float32(0.0), jnp.float32(1.0) - eps_f)
+    barrier = -jnp.log1p(-cap_util_clipped)
+    pressure = jax.nn.relu(barrier - jnp.mean(barrier))
+    pressure = jax.lax.stop_gradient(pressure)
+
+    soft_frac = global_soft_sum / token_safe
+    cap_frac = effective_cap / token_safe
+    soft_ratio = soft_frac / jnp.maximum(cap_frac, eps_f)
+    raw_loss = jnp.mean(pressure * jnp.square(soft_ratio))
+    weighted_loss = weight * raw_loss
+
+    soft_load_max = jnp.max(soft_frac)
+    soft_load_mean = jnp.mean(soft_frac)
+    cap_frac_max = jnp.max(cap_frac)
+    cap_util_max = jnp.max(cap_util)
+    pressure_active_frac = jnp.mean((pressure > 0.0).astype(jnp.float32))
+    diag = jnp.asarray((
+        weighted_loss,
+        raw_loss,
+        soft_load_max,
+        soft_load_mean,
+        soft_load_max / jnp.maximum(soft_load_mean, eps_f),
+        cap_frac_max,
+        cap_util_max,
+        pressure_active_frac,
+    ), dtype=jnp.float32)
+    return weighted_loss, diag
+
+
 def _opspace_region_score_from_block_scores(
         block_scores, *, blocks_per_region,
         region_score_pooling='smoothmax', region_score_temperature=0.25):
@@ -3760,8 +3842,12 @@ def _opspace_load_smoothing_aux_from_scores(
         space_temperature=0.12, alpha=1.25,
         warmup_tokens=2.0e8, peak_tokens=1.0e9,
         final_weight_frac=1.0, mode='neighbor',
-        region_capacity=None, local_token_count=None):
+        region_capacity=None, local_token_count=None, hard_region_load=None):
     mode = _opspace_normalize_load_smoothing_mode(mode)
+    if mode == 'barrier_capacity_geometry' and float(block_weight) > 0.0:
+        raise ValueError(
+            "operation_space_load_smoothing.mode='barrier_capacity_geometry' "
+            "supports region_weight only; set block_weight=0.")
     if not bool(enabled):
         return (
             jnp.float32(0.0),
@@ -3779,7 +3865,8 @@ def _opspace_load_smoothing_aux_from_scores(
             load_temperature=load_temperature,
             space_temperature=space_temperature,
             alpha=alpha)
-    elif region_capacity is not None and local_token_count is not None:
+    elif mode == 'capacity' and (
+            region_capacity is not None and local_token_count is not None):
         region_loss, region_diag = _opspace_capacity_load_smoothing_loss(
             region_score_flat,
             weight=region_smoothing_weight,
@@ -3787,10 +3874,27 @@ def _opspace_load_smoothing_aux_from_scores(
             alpha=alpha,
             region_capacity=region_capacity,
             local_token_count=local_token_count)
-    elif float(region_weight) > 0.0:
+    elif mode == 'capacity' and float(region_weight) > 0.0:
         raise ValueError(
             "operation_space_load_smoothing.mode='capacity' requires an "
             "execution capacity; use it only for RST sparse_region_block or "
+            "set the pool region_weight to 0.")
+    elif mode == 'barrier_capacity_geometry' and (
+            hard_region_load is not None and region_capacity is not None
+            and local_token_count is not None):
+        region_loss, region_diag = _opspace_barrier_capacity_geometry_loss(
+            region_score_flat,
+            hard_region_load=hard_region_load,
+            weight=region_smoothing_weight,
+            load_temperature=load_temperature,
+            alpha=alpha,
+            region_capacity=region_capacity,
+            local_token_count=local_token_count)
+    elif mode == 'barrier_capacity_geometry' and float(region_weight) > 0.0:
+        raise ValueError(
+            "operation_space_load_smoothing.mode='barrier_capacity_geometry' "
+            "requires hard_region_load, region_capacity, and "
+            "local_token_count; use it only for RST sparse_region_block or "
             "set the pool region_weight to 0.")
     else:
         region_loss = jnp.float32(0.0)
@@ -4399,7 +4503,8 @@ def _opspace_tau_free_relu_region_block_sparse_core(
             peak_tokens=load_smoothing_peak_tokens,
             final_weight_frac=load_smoothing_final_weight_frac,
             region_capacity=region_capacity,
-            local_token_count=T))
+            local_token_count=T,
+            hard_region_load=admission['region_load']))
     load_smoothing_aux = jax.lax.pmean(
         jax.lax.pmean(load_smoothing_aux_local, 'data'), 'model')
     load_smoothing_diag = jax.lax.pmean(

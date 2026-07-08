@@ -1369,10 +1369,16 @@ def _v4168_normalize_operation_space_load_smoothing(load_smoothing,
             "mode, qk, v, rst, and load-smoothing schedule fields; remove: "
             f"{', '.join(extra)}")
     mode = str(load_smoothing.get('mode', 'neighbor')).strip().lower()
-    if mode not in ('neighbor', 'capacity'):
+    if mode in ('hard_capacity_geometry', 'hard_cap_geometry',
+                'hard_over_soft_geometry'):
+        raise ValueError(
+            "training.operation_space_load_smoothing hard_capacity_geometry "
+            "was removed; use mode='barrier_capacity_geometry'.")
+    allowed_modes = ('neighbor', 'capacity', 'barrier_capacity_geometry')
+    if mode not in allowed_modes:
         raise ValueError(
             "training.operation_space_load_smoothing.mode must be "
-            "'neighbor' or 'capacity', got "
+            f"one of {allowed_modes}, got "
             f"{load_smoothing.get('mode')!r}.")
     normalized = {
         'enabled': _cfg_bool(
@@ -9455,6 +9461,8 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'diversity_loss_raw': float(m.get('diversity_loss_raw', win_avgs['div'])),
         'diversity_loss_weighted': float(m.get(
             'diversity_loss_weighted', ctx['div_weight'] * win_avgs['div'])),
+        'opspace_load_smoothing_mode': str(ctx.get(
+            'opspace_load_smoothing_mode', 'neighbor')).strip().lower(),
         'aux_weighted': ctx['lb_weight'] * win_avgs['aux'],
         'tau_reg_weighted': ctx['tau_reg_weight'] * win_avgs['tau_reg'],
         'orth_weighted': ctx['orth_weight'] * win_avgs['orth'],
@@ -10555,6 +10563,27 @@ def _print_v4168_opspace_regular_block(rec):
         default=_opspace_metric(rec, rst_prefix, 'bucket_capacity'))
     region_load_mean = _opspace_metric(rec, rst_prefix, 'region_load_mean')
     region_load_max = _opspace_metric(rec, rst_prefix, 'region_load_max')
+    smooth_mode = str(
+        rec.get('opspace_load_smoothing_mode', 'neighbor')).strip().lower()
+    smooth_parts = [
+        f"smooth_mode={smooth_mode}",
+        f"smooth_loss={fmt_sci(_opspace_metric(rec, rst_prefix, 'load_smoothing_loss'))}",
+        f"smooth_raw={fmt_sci(_opspace_metric(rec, rst_prefix, 'load_smoothing_raw'))}",
+    ]
+    if smooth_mode == 'barrier_capacity_geometry':
+        smooth_parts.extend([
+            f"soft_load_max={_fmt_short_float(_opspace_metric(rec, rst_prefix, 'load_max'))}",
+            f"soft_load_mean={_fmt_short_float(_opspace_metric(rec, rst_prefix, 'load_mean'))}",
+            f"cap_frac={_fmt_short_float(_opspace_metric(rec, rst_prefix, 'smooth_load_max'))}",
+            f"cap_util_max={_fmt_short_float(_opspace_metric(rec, rst_prefix, 'spike_over_mean'))}",
+            f"pressure_frac={fmt_pct(_opspace_metric(rec, rst_prefix, 'spike_frac'), 2)}",
+        ])
+    else:
+        smooth_parts.extend([
+            f"load_max_mean={_fmt_short_float(_opspace_metric(rec, rst_prefix, 'load_max_over_mean'))}",
+            f"spike_frac={fmt_pct(_opspace_metric(rec, rst_prefix, 'spike_frac'), 2)}",
+        ])
+    smooth_text = " ".join(smooth_parts)
     log_message(
         "  [opspace/rst]"
         f" backend={_opspace_backend_name(rec, rst_prefix)}"
@@ -10580,10 +10609,7 @@ def _print_v4168_opspace_regular_block(rec):
         f" no_nan={fmt_intlike(_opspace_metric(rec, rst_prefix, 'no_nan'))}"
         f" gate_mass={fmt_float(_opspace_metric(rec, rst_prefix, 'gate_mass_mean'), 2)}"
         f" relu_active={fmt_float(_opspace_metric(rec, rst_prefix, 'relu_gate_count_mean'), 1)}"
-        f" smooth_loss={fmt_sci(_opspace_metric(rec, rst_prefix, 'load_smoothing_loss'))}"
-        f" smooth_raw={fmt_sci(_opspace_metric(rec, rst_prefix, 'load_smoothing_raw'))}"
-        f" load_max_mean={_fmt_short_float(_opspace_metric(rec, rst_prefix, 'load_max_over_mean'))}"
-        f" spike_frac={fmt_pct(_opspace_metric(rec, rst_prefix, 'spike_frac'), 2)}"
+        f" {smooth_text}"
     )
     for line in _opspace_warning_lines(rec):
         log_message(line)
@@ -15991,6 +16017,10 @@ def main():
                     # start_step_in_epoch).
                     _remaining = max(steps_per_epoch - epoch_step_counter, 0)
                     _eta = _s_per_it * _remaining
+                    _opspace_load_smoothing_ctx = training_config.get(
+                        'operation_space_load_smoothing', {})
+                    if not isinstance(_opspace_load_smoothing_ctx, dict):
+                        _opspace_load_smoothing_ctx = {}
                     ctx = {
                         'lb_weight': lb_weight,
                         'tau_reg_weight': tau_reg_weight,
@@ -16017,6 +16047,9 @@ def main():
                         'model_version': model_version,
                         'operation_space_enabled':
                             operation_space_tau_free_enabled,
+                        'opspace_load_smoothing_mode': str(
+                            _opspace_load_smoothing_ctx.get(
+                                'mode', 'neighbor')).strip().lower(),
                         'train_compute_accuracy': train_compute_accuracy,
                         'regular_console_level': regular_console_level,
                         'regular_console_host_timing':

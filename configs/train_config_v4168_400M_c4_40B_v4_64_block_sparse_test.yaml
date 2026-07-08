@@ -44,23 +44,24 @@ training:
 
   operation_space_load_smoothing:
     enabled: true
+    mode: barrier_capacity_geometry
+
     load_temperature: 0.1
-    space_temperature: 0.4
-    alpha: 1.25
+    alpha: 1.0
     warmup_tokens: 0
-    peak_tokens: 1000000000
+    peak_tokens: 1
     final_weight_frac: 1.0
 
     qk:
-      region_weight: 3.0e-4
+      region_weight: 0.0
       block_weight: 0.0
 
     v:
-      region_weight: 3.0e-4
+      region_weight: 0.0
       block_weight: 0.0
 
     rst:
-      region_weight: 3.0e-4
+      region_weight: 1.0e-3
       block_weight: 0.0
 
   operation_space:
