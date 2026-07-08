@@ -28,7 +28,7 @@ model:
   n_rst: 58896
 
 training:
-  batch_size: 448
+  batch_size: 384
   mesh_model: 4
   mesh_data: 8
   gradient_accumulation_steps: 1
