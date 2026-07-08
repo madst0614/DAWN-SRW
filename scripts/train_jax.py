@@ -10572,6 +10572,7 @@ def _print_v4168_opspace_regular_block(rec):
     ]
     if smooth_mode == 'barrier_capacity_geometry':
         smooth_parts.extend([
+            "pressure=exp_cap",
             f"soft_load_max={_fmt_short_float(_opspace_metric(rec, rst_prefix, 'load_max'))}",
             f"soft_load_mean={_fmt_short_float(_opspace_metric(rec, rst_prefix, 'load_mean'))}",
             f"cap_frac={_fmt_short_float(_opspace_metric(rec, rst_prefix, 'smooth_load_max'))}",

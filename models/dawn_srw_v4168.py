@@ -123,6 +123,9 @@ OPSPACE_RST_REGION_CAPACITY_ROUND_MULTIPLE = 1024
 OPSPACE_RST_BLOCK_CAPACITY_ROUND_MULTIPLE = 128
 SPILL_OVERFLOW_FAIL_LOUD = True
 OPSPACE_RST_SPILL_OVERFLOW_FAIL_LOUD = SPILL_OVERFLOW_FAIL_LOUD
+OPSPACE_CAP_PRESSURE_BETA = 4.0
+OPSPACE_CAP_PRESSURE_LOGIT_MIN = -8.0
+OPSPACE_CAP_PRESSURE_LOGIT_MAX = 8.0
 
 OPSPACE_FINAL_RUNTIME_DIAG_NAMES = (
     'enabled',
@@ -3788,10 +3791,18 @@ def _opspace_barrier_capacity_geometry_loss(
     token_safe = jnp.maximum(global_tokens, jnp.float32(1.0))
 
     cap_util = global_hard_load / cap_safe
-    cap_util_clipped = jnp.clip(
-        cap_util, jnp.float32(0.0), jnp.float32(1.0) - eps_f)
-    barrier = -jnp.log1p(-cap_util_clipped)
-    pressure = jax.nn.relu(barrier - jnp.mean(barrier))
+    pressure_logit = (
+        jnp.float32(OPSPACE_CAP_PRESSURE_BETA)
+        * (cap_util - jnp.float32(1.0)))
+    pressure_logit = jnp.clip(
+        pressure_logit,
+        jnp.float32(OPSPACE_CAP_PRESSURE_LOGIT_MIN),
+        jnp.float32(OPSPACE_CAP_PRESSURE_LOGIT_MAX))
+    pressure_raw = jnp.exp(pressure_logit)
+
+    # Relative global distribution pressure. This preserves the global-only
+    # interpretation and avoids forcing all regions when they are uniformly full.
+    pressure = jax.nn.relu(pressure_raw - jnp.mean(pressure_raw))
     pressure = jax.lax.stop_gradient(pressure)
 
     soft_frac = global_soft_sum / token_safe
@@ -3804,6 +3815,9 @@ def _opspace_barrier_capacity_geometry_loss(
     soft_load_mean = jnp.mean(soft_frac)
     cap_frac_max = jnp.max(cap_frac)
     cap_util_max = jnp.max(cap_util)
+    pressure_max = jnp.max(pressure)
+    pressure_mean = jnp.mean(pressure)
+    _ = (pressure_max, pressure_mean)
     pressure_active_frac = jnp.mean((pressure > 0.0).astype(jnp.float32))
     diag = jnp.asarray((
         weighted_loss,

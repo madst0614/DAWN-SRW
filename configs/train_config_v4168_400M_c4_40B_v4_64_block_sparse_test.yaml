@@ -61,7 +61,7 @@ training:
       block_weight: 0.0
 
     rst:
-      region_weight: 1.0e-3
+      region_weight: 3.0e-3
       block_weight: 0.0
 
   operation_space:
@@ -105,4 +105,4 @@ training:
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_region_block_test
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_400M_c4_40B_region_block_barrier_geometry_test
