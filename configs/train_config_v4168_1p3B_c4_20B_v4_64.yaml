@@ -28,7 +28,7 @@ model:
   n_rst: 58896
 
 training:
-  batch_size: 512
+  batch_size: 448
   mesh_model: 4
   mesh_data: 8
   gradient_accumulation_steps: 1
@@ -97,7 +97,7 @@ training:
         visible_blocks_per_region: 11
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
-        page_size: 8192
+        page_size: 4096
 
       rst:
         execution_backend: paged_region_pool
@@ -108,7 +108,7 @@ training:
         visible_blocks_per_region: 7
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
-        page_size: 8192
+        page_size: 4096
 
   checkpoint_interval: 400
   val_interval: 1000
