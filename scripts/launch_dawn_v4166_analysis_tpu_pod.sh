@@ -36,11 +36,20 @@ CHECKPOINT="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_400M_c4_40B_v4_64/r
 OUTPUT="gs://dawn-tpu-data-c4/analysis/v4166_400M_final"
 STAGES="eval,prune,geometry,usage,trace,ablation,report"
 ANALYSIS_ARGS=""
+MODE="analysis"
 WORKERS="auto"
 DETACH="1"
+DETACH_EXPLICIT="0"
 INSTALL_DEPS="1"
 TMUX_SESSION="train"
 REMOTE_LOG="~/train.log"
+DRY_RUN="0"
+OUTPUT_EXPLICIT="0"
+
+TRAIN_ANALYSIS_CONFIG="${DAWN_TRAIN_ANALYSIS_CONFIG:-configs/train_config_v4166_1p3B_c4_20B_v4_64.yaml}"
+TRAIN_ANALYSIS_CHECKPOINT_DIR="${DAWN_TRAIN_ANALYSIS_CHECKPOINT_DIR:-gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new}"
+TRAIN_ANALYSIS_MAX_BATCHES="${DAWN_TRAIN_ANALYSIS_MAX_BATCHES:-8}"
+TRAIN_ANALYSIS_PRUNE_EPS="${DAWN_TRAIN_ANALYSIS_PRUNE_EPS:-1e-6,1e-5,1e-4,1e-3}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -48,15 +57,18 @@ while [[ $# -gt 0 ]]; do
         --zone) ZONE="$2"; shift 2 ;;
         --project) PROJECT="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
+        --mode) MODE="$2"; shift 2 ;;
         --token) GH_TOKEN="$2"; shift 2 ;;
         --repo-url) REPO_URL="$2"; shift 2 ;;
         --checkpoint) CHECKPOINT="$2"; shift 2 ;;
-        --output) OUTPUT="$2"; shift 2 ;;
+        --checkpoint-dir) TRAIN_ANALYSIS_CHECKPOINT_DIR="$2"; shift 2 ;;
+        --output) OUTPUT="$2"; OUTPUT_EXPLICIT="1"; shift 2 ;;
         --stages) STAGES="$2"; shift 2 ;;
         --workers) WORKERS="$2"; shift 2 ;;
-        --foreground) DETACH="0"; shift ;;
-        --detach) DETACH="1"; shift ;;
+        --foreground) DETACH="0"; DETACH_EXPLICIT="1"; shift ;;
+        --detach) DETACH="1"; DETACH_EXPLICIT="1"; shift ;;
         --no-install) INSTALL_DEPS="0"; shift ;;
+        --dry-run) DRY_RUN="1"; shift ;;
         --from-scratch) ANALYSIS_ARGS="$ANALYSIS_ARGS --from-scratch"; shift ;;
         --retry-failed) ANALYSIS_ARGS="$ANALYSIS_ARGS --retry-failed"; shift ;;
         --fail-fast) ANALYSIS_ARGS="$ANALYSIS_ARGS --fail-fast"; shift ;;
@@ -64,7 +76,7 @@ while [[ $# -gt 0 ]]; do
         --mesh-model) ANALYSIS_ARGS="$ANALYSIS_ARGS --mesh-model $2"; shift 2 ;;
         --eval-max-tokens) ANALYSIS_ARGS="$ANALYSIS_ARGS --eval-max-tokens $2"; shift 2 ;;
         --eval-batch-size) ANALYSIS_ARGS="$ANALYSIS_ARGS --eval-batch-size $2"; shift 2 ;;
-        --prune-eps) ANALYSIS_ARGS="$ANALYSIS_ARGS --prune-eps $2"; shift 2 ;;
+        --prune-eps) TRAIN_ANALYSIS_PRUNE_EPS="$2"; ANALYSIS_ARGS="$ANALYSIS_ARGS --prune-eps $2"; shift 2 ;;
         --usage-max-sequences) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-max-sequences $2"; shift 2 ;;
         --usage-batch-size) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-batch-size $2"; shift 2 ;;
         --usage-seq-len) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-seq-len $2"; shift 2 ;;
@@ -73,7 +85,7 @@ while [[ $# -gt 0 ]]; do
         --ablation-batch-size) ANALYSIS_ARGS="$ANALYSIS_ARGS --ablation-batch-size $2"; shift 2 ;;
         --ablation-k-list) ANALYSIS_ARGS="$ANALYSIS_ARGS --ablation-k-list $2"; shift 2 ;;
         --ablation-strategies) ANALYSIS_ARGS="$ANALYSIS_ARGS --ablation-strategies $2"; shift 2 ;;
-        --max-jobs-per-stage) ANALYSIS_ARGS="$ANALYSIS_ARGS --max-jobs-per-stage $2"; shift 2 ;;
+        --max-jobs-per-stage) TRAIN_ANALYSIS_MAX_BATCHES="$2"; ANALYSIS_ARGS="$ANALYSIS_ARGS --max-jobs-per-stage $2"; shift 2 ;;
         --extra-arg) ANALYSIS_ARGS="$ANALYSIS_ARGS $2"; shift 2 ;;
         -h|--help)
             echo "Usage: $0 --tpu NAME [options]"
@@ -82,7 +94,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --tpu NAME"
             echo ""
             echo "Core:"
+            echo "  --mode MODE               analysis or train_analysis. Default: $MODE"
             echo "  --checkpoint PATH_OR_GS   Default: $CHECKPOINT"
+            echo "  --checkpoint-dir DIR      train_analysis base checkpoint dir. Default: $TRAIN_ANALYSIS_CHECKPOINT_DIR"
             echo "  --output PATH_OR_GS       Default: $OUTPUT"
             echo "  --stages CSV              Default: $STAGES"
             echo "  --branch BRANCH           Default: $BRANCH"
@@ -96,6 +110,7 @@ while [[ $# -gt 0 ]]; do
             echo "Execution:"
             echo "  --detach                  Run in tmux session train (default)"
             echo "  --foreground              Run foreground on the SSH command"
+            echo "  --dry-run                 Print resolved command without launching"
             echo "  --from-scratch            Disable analysis artifact resume"
             echo "  --retry-failed"
             echo "  --fail-fast"
@@ -117,6 +132,35 @@ if [[ -z "$TPU_NAME" ]]; then
     exit 1
 fi
 
+case "$MODE" in
+    analysis|full|full_analysis)
+        MODE="analysis"
+        ;;
+    train_analysis)
+        ;;
+    *)
+        echo "ERROR: unsupported --mode $MODE (expected analysis or train_analysis)" >&2
+        exit 1
+        ;;
+esac
+
+if [[ "$MODE" == "train_analysis" ]]; then
+    STAGES="train_analysis"
+    CHECKPOINT="$TRAIN_ANALYSIS_CHECKPOINT_DIR"
+    if [[ "$OUTPUT_EXPLICIT" == "0" ]]; then
+        OUTPUT="${TRAIN_ANALYSIS_CHECKPOINT_DIR%/}/side_analysis"
+    fi
+    if [[ "$DETACH_EXPLICIT" == "0" ]]; then
+        DETACH="0"
+    fi
+    if [[ "$TMUX_SESSION" == "train" ]]; then
+        TMUX_SESSION="train_analysis"
+    fi
+    if [[ "$REMOTE_LOG" == "~/train.log" ]]; then
+        REMOTE_LOG="~/train_analysis.log"
+    fi
+fi
+
 if [[ "$WORKERS" = "auto" ]]; then
     WORKERS="all"
 fi
@@ -132,20 +176,58 @@ if [[ -n "$GH_TOKEN" ]]; then
     REPO_URL_DISPLAY="${REPO_URL_DISPLAY/$GH_TOKEN/***}"
 fi
 
-echo "============================================"
-echo "Launching DAWN-SRW v4166 analysis on TPU"
-echo "  TPU:        $TPU_NAME"
-echo "  Zone:       $ZONE"
-echo "  Project:    $PROJECT"
-echo "  Branch:     $BRANCH"
-echo "  Repo:       $REPO_URL_DISPLAY"
-echo "  Workers:    $WORKERS"
-echo "  Detached:   $DETACH"
-echo "  Checkpoint: $CHECKPOINT"
-echo "  Output:     $OUTPUT"
-echo "  Stages:     $STAGES"
-echo "  Args:       ${ANALYSIS_ARGS:-<none>}"
-echo "============================================"
+COPY_CMD="bash scripts/launch_dawn_v4166_analysis_tpu_pod.sh --tpu $TPU_NAME --project $PROJECT --zone $ZONE --branch $BRANCH --mode $MODE"
+WATCH_REPEAT_CMD="watch -n 300 '$COPY_CMD'"
+WATCH_LOG_CMD="bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --log $REMOTE_LOG --target $TMUX_SESSION --summary"
+
+echo "============================================================"
+echo "DAWN-SRW v4166 analysis launcher"
+echo "============================================================"
+echo "Run:"
+echo "  mode            : $MODE"
+echo "  tpu             : $TPU_NAME"
+echo "  project         : $PROJECT"
+echo "  zone            : $ZONE"
+echo "  branch          : $BRANCH"
+echo "  repo            : $REPO_URL_DISPLAY"
+echo "  workers         : $WORKERS"
+echo "  detached        : $DETACH"
+echo "  tmux_session    : $TMUX_SESSION"
+echo "  remote_log      : $REMOTE_LOG"
+if [[ "$MODE" == "train_analysis" ]]; then
+    echo "  config          : $TRAIN_ANALYSIS_CONFIG"
+    echo "  checkpoint_dir  : $TRAIN_ANALYSIS_CHECKPOINT_DIR"
+    echo "  output          : $OUTPUT"
+    echo "  analysis_batches: $TRAIN_ANALYSIS_MAX_BATCHES"
+    echo "  prune_eps       : $TRAIN_ANALYSIS_PRUNE_EPS"
+else
+    echo "  checkpoint      : $CHECKPOINT"
+    echo "  output          : $OUTPUT"
+    echo "  stages          : $STAGES"
+    echo "  args            : ${ANALYSIS_ARGS:-<none>}"
+fi
+echo ""
+echo "Copy-paste:"
+echo "  $COPY_CMD"
+echo ""
+echo "Watch repeat:"
+echo "  $WATCH_REPEAT_CMD"
+echo ""
+echo "Watch logs:"
+echo "  $WATCH_LOG_CMD"
+echo "============================================================"
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    echo "Dry run: no TPU command will be sent."
+    if [[ "$MODE" == "train_analysis" ]]; then
+        echo "Remote Python:"
+        echo "  python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --config $TRAIN_ANALYSIS_CONFIG --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --init-distributed"
+    else
+        echo "Remote Python:"
+        echo "  python3 -u scripts/analyze_dawn_srw_v4166.py --checkpoint $CHECKPOINT --output $OUTPUT --stages $STAGES --init-distributed ${ANALYSIS_ARGS:-}"
+    fi
+    exit 0
+fi
 
 echo "Checking TPU status..."
 TPU_STATE="$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
@@ -206,6 +288,21 @@ for worker in "${TARGET_WORKERS[@]}"; do
     fi
 done
 
+if [[ "$MODE" == "train_analysis" ]]; then
+read -r -d '' CLEANUP_CMD <<'EOFCLEANUP' || true
+set -e
+ANALYSIS_PATTERN="[a]nalyze_dawn_srw_v4166"
+tmux kill-session -t train_analysis 2>/dev/null || true
+pkill -9 -f "${ANALYSIS_PATTERN}\\.py" || true
+sleep 2
+REMAINING="$(pgrep -af "${ANALYSIS_PATTERN}" || true)"
+if [ -n "$REMAINING" ]; then
+    echo "ERROR: DAWN analysis process remains after cleanup:" >&2
+    echo "$REMAINING" >&2
+    exit 1
+fi
+EOFCLEANUP
+else
 read -r -d '' CLEANUP_CMD <<'EOFCLEANUP' || true
 set -e
 ANALYSIS_PATTERN="[a]nalyze_dawn_srw_v4166"
@@ -225,6 +322,7 @@ if [ -n "$REMAINING" ]; then
     exit 1
 fi
 EOFCLEANUP
+fi
 
 cleanup_target_workers() {
     local failed=0
@@ -238,7 +336,11 @@ cleanup_target_workers() {
     return "$failed"
 }
 
-echo "Cleaning old train/analysis processes on target worker(s)..."
+if [[ "$MODE" == "train_analysis" ]]; then
+    echo "Cleaning old train_analysis processes on target worker(s)..."
+else
+    echo "Cleaning old train/analysis processes on target worker(s)..."
+fi
 if ! cleanup_target_workers; then
     echo "ERROR: cleanup verification failed. Aborting launch." >&2
     exit 1
@@ -252,20 +354,33 @@ CHECKPOINT='${CHECKPOINT}'
 OUTPUT='${OUTPUT}'
 STAGES='${STAGES}'
 ANALYSIS_ARGS='${ANALYSIS_ARGS}'
+MODE='${MODE}'
+TRAIN_ANALYSIS_CONFIG='${TRAIN_ANALYSIS_CONFIG}'
+TRAIN_ANALYSIS_CHECKPOINT_DIR='${TRAIN_ANALYSIS_CHECKPOINT_DIR}'
+TRAIN_ANALYSIS_MAX_BATCHES='${TRAIN_ANALYSIS_MAX_BATCHES}'
+TRAIN_ANALYSIS_PRUNE_EPS='${TRAIN_ANALYSIS_PRUNE_EPS}'
 DETACH='${DETACH}'
 INSTALL_DEPS='${INSTALL_DEPS}'
 TMUX_SESSION='${TMUX_SESSION}'
 REMOTE_LOG='${REMOTE_LOG}'
+REMOTE_LOG_PATH="\${REMOTE_LOG/#\\~/\$HOME}"
 WORK_DIR="\$HOME/dawn-spatial"
 
 echo "=== DAWN v4166 analysis worker startup ==="
 echo "HOSTNAME=\$(hostname)"
 echo "DATE=\$(date -Is)"
 echo "BRANCH=\$BRANCH"
+echo "MODE=\$MODE"
 echo "CHECKPOINT=\$CHECKPOINT"
 echo "OUTPUT=\$OUTPUT"
 echo "STAGES=\$STAGES"
 echo "ANALYSIS_ARGS=\$ANALYSIS_ARGS"
+if [ "\$MODE" = "train_analysis" ]; then
+    echo "TRAIN_ANALYSIS_CONFIG=\$TRAIN_ANALYSIS_CONFIG"
+    echo "TRAIN_ANALYSIS_CHECKPOINT_DIR=\$TRAIN_ANALYSIS_CHECKPOINT_DIR"
+    echo "TRAIN_ANALYSIS_MAX_BATCHES=\$TRAIN_ANALYSIS_MAX_BATCHES"
+    echo "TRAIN_ANALYSIS_PRUNE_EPS=\$TRAIN_ANALYSIS_PRUNE_EPS"
+fi
 
 if [ -d "\$WORK_DIR/.git" ]; then
     cd "\$WORK_DIR"
@@ -290,13 +405,26 @@ export JAX_TRACEBACK_FILTERING="\${JAX_TRACEBACK_FILTERING:-auto}"
 export JAX_LOG_COMPILES="\${JAX_LOG_COMPILES:-0}"
 export TF_CPP_MIN_LOG_LEVEL="\${TF_CPP_MIN_LOG_LEVEL:-2}"
 
-ANALYSIS_CMD=(
-    python3 -u scripts/analyze_dawn_srw_v4166.py
-    --checkpoint "\$CHECKPOINT"
-    --output "\$OUTPUT"
-    --stages "\$STAGES"
-    --init-distributed
-)
+if [ "\$MODE" = "train_analysis" ]; then
+    ANALYSIS_CMD=(
+        python3 -u scripts/analyze_dawn_srw_v4166.py
+        --train-analysis
+        --config "\$TRAIN_ANALYSIS_CONFIG"
+        --checkpoint-dir "\$TRAIN_ANALYSIS_CHECKPOINT_DIR"
+        --output "\$OUTPUT"
+        --train-analysis-max-batches "\$TRAIN_ANALYSIS_MAX_BATCHES"
+        --prune-eps "\$TRAIN_ANALYSIS_PRUNE_EPS"
+        --init-distributed
+    )
+else
+    ANALYSIS_CMD=(
+        python3 -u scripts/analyze_dawn_srw_v4166.py
+        --checkpoint "\$CHECKPOINT"
+        --output "\$OUTPUT"
+        --stages "\$STAGES"
+        --init-distributed
+    )
+fi
 if [ -n "\$ANALYSIS_ARGS" ]; then
     # shellcheck disable=SC2206
     EXTRA_ARGS=(\$ANALYSIS_ARGS)
@@ -309,11 +437,11 @@ if [ "\$DETACH" = "1" ]; then
     echo "[run] starting tmux session \$TMUX_SESSION"
     tmux kill-session -t "\$TMUX_SESSION" 2>/dev/null || true
     tmux new-session -d -s "\$TMUX_SESSION" \
-        "cd '\$WORK_DIR'; export PYTHONUNBUFFERED=1; export DAWN_ANALYSIS_INIT_DISTRIBUTED=1; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; { echo '=== TPU analysis process startup ==='; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"CMD: \$ANALYSIS_CMD_STR\"; \$ANALYSIS_CMD_STR; } 2>&1 | tee \$REMOTE_LOG; echo 'Analysis finished. Press enter to close.'; read"
-    echo "[run] detached in tmux session \$TMUX_SESSION, log=\$REMOTE_LOG"
+        "cd '\$WORK_DIR'; export PYTHONUNBUFFERED=1; export DAWN_ANALYSIS_INIT_DISTRIBUTED=1; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; { echo '=== TPU analysis process startup ==='; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"CMD: \$ANALYSIS_CMD_STR\"; \$ANALYSIS_CMD_STR; } 2>&1 | tee '\$REMOTE_LOG_PATH'; echo 'Analysis finished. Press enter to close.'; read"
+    echo "[run] detached in tmux session \$TMUX_SESSION, log=\$REMOTE_LOG_PATH"
 else
     echo "[run] foreground analysis"
-    "\${ANALYSIS_CMD[@]}" 2>&1 | tee "\${REMOTE_LOG/#\\~/$HOME}"
+    "\${ANALYSIS_CMD[@]}" 2>&1 | tee "\$REMOTE_LOG_PATH"
 fi
 EOFCMD
 
@@ -346,9 +474,45 @@ if [ "${#FAILED_WORKERS[@]}" -gt 0 ]; then
 fi
 
 echo ""
+if [[ "$MODE" == "train_analysis" ]]; then
+    SUMMARY_LOG=""
+    SUMMARY_WORKER=""
+    for worker in "${TARGET_WORKERS[@]}"; do
+        log_file="${LAUNCH_LOGS[$worker]}"
+        if grep -q "DAWN-SRW v4166 TRAIN ANALYSIS" "$log_file"; then
+            SUMMARY_LOG="$log_file"
+            SUMMARY_WORKER="$worker"
+            break
+        fi
+    done
+    echo "Train analysis complete."
+    if [[ -n "$SUMMARY_LOG" ]]; then
+        echo "  Summary worker : $SUMMARY_WORKER"
+        echo "  Summary log    : $SUMMARY_LOG"
+        echo ""
+        awk 'BEGIN{show=0} /^============================================================$/ {show=1} show {print}' "$SUMMARY_LOG"
+    else
+        echo "WARNING: train_analysis summary block was not found in local launch logs." >&2
+        echo "Local launch logs:"
+        for worker in "${TARGET_WORKERS[@]}"; do
+            echo "  worker $worker: ${LAUNCH_LOGS[$worker]}"
+        done
+    fi
+    echo ""
+    echo "Copy-paste:"
+    echo "  $COPY_CMD"
+    echo ""
+    echo "Watch repeat:"
+    echo "  $WATCH_REPEAT_CMD"
+    echo ""
+    echo "Watch logs:"
+    echo "  $WATCH_LOG_CMD"
+    exit 0
+fi
+
 echo "Launch request sent."
 echo "  tmux session: $TMUX_SESSION"
-echo "  Primary log: bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT"
+echo "  Primary log: $WATCH_LOG_CMD"
 echo "  Primary pane: bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --pane"
 echo "  Attach primary pane: bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --attach"
 echo "  Primary summary: bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --summary"

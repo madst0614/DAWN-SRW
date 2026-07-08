@@ -694,6 +694,59 @@ def create_ce_eval_step(model, sharded_fns=None, *, minimal_train: bool = True,
     return step
 
 
+def create_active_analysis_step(model, sharded_fns=None, *,
+                                total_training_steps: int = 1,
+                                cfg: Optional[Dict[str, Any]] = None):
+    """Trainer-matched full-stat analysis step for light side analysis."""
+    cfg = cfg or {}
+    t = cfg.get("training", {})
+    train = get_train()
+    soft_gate_t_start = float(t.get("soft_gate_t_start", 1.5))
+    soft_gate_t_final = float(t.get("soft_gate_t_final", 0.07))
+    soft_gate_t_hold_frac = float(t.get("soft_gate_t_hold_frac", 0.10))
+    soft_gate_t_anneal_end_frac = float(t.get("soft_gate_t_anneal_end_frac", 0.80))
+    soft_gate_schedule = str(t.get("soft_gate_schedule", "cosine"))
+    soft_gate_t_power = float(t.get("soft_gate_t_power", 4.0))
+    soft_gate_t_gompertz_center = float(t.get("soft_gate_t_gompertz_center", 0.25))
+    soft_gate_t_gompertz_steepness = float(t.get("soft_gate_t_gompertz_steepness", 8.0))
+    pool_schedules = train._training_soft_gate_pool_schedules(
+        t,
+        soft_gate_t_start,
+        soft_gate_t_final,
+        soft_gate_t_hold_frac,
+        soft_gate_t_anneal_end_frac,
+        soft_gate_schedule,
+        soft_gate_t_power,
+        soft_gate_t_gompertz_center,
+        soft_gate_t_gompertz_steepness,
+    )
+    return train.create_analysis_step(
+        model,
+        sharded_fns=sharded_fns,
+        total_training_steps=int(total_training_steps or 1),
+        soft_gate_schedule_active=True,
+        soft_gate_t_start=soft_gate_t_start,
+        soft_gate_t_final=soft_gate_t_final,
+        soft_gate_t_hold_frac=soft_gate_t_hold_frac,
+        soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
+        soft_gate_schedule=soft_gate_schedule,
+        soft_gate_t_power=soft_gate_t_power,
+        soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
+        soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
+        pool_specific_gate_t=True,
+        soft_gate_pool_schedules=pool_schedules,
+        boundary_power_schedule_active=True,
+        soft_gate_boundary_power_start=float(t.get("soft_gate_boundary_power_start", 3.0)),
+        soft_gate_boundary_power_mid=float(t.get("soft_gate_boundary_power_mid", 3.15)),
+        soft_gate_boundary_power_final=float(t.get("soft_gate_boundary_power_final", 4.0)),
+        soft_gate_boundary_power_start_frac=float(t.get("soft_gate_boundary_power_start_frac", 0.0)),
+        soft_gate_boundary_power_mid_frac=float(t.get("soft_gate_boundary_power_mid_frac", 0.800)),
+        soft_gate_boundary_power_final_frac=float(t.get("soft_gate_boundary_power_final_frac", 0.950)),
+        admission_den_power=float(t.get("admission_den_power", 1.0)),
+        ce_token_chunk_size=int(t.get("ce_token_chunk_size", 32768)),
+    )
+
+
 def load_eval_data(cfg: Dict[str, Any], max_length: int, batch_size: int,
                    host_id: int, n_hosts: int, max_tokens: Optional[int] = None):
     """Load validation data only, preserving train_jax's flat per-host batches."""
