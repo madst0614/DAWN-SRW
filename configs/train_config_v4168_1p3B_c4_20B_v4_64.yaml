@@ -1,0 +1,119 @@
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 20000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+  evict_train_shard_cache: true
+
+model:
+  model_version: spatial-r1-v4.1.6.8
+  vocab_size: 30522
+  logical_vocab_size: 30522
+
+  d_model: 4096
+  n_layers: 24
+  n_heads: 32
+  max_seq_len: 512
+  dropout: 0.0
+  router_dropout: 0.0
+  gradient_checkpointing: true
+
+  d_route: 384
+
+  n_qk: 7048
+  n_v: 21928
+  n_rst: 58896
+
+training:
+  batch_size: 512
+  mesh_model: 2
+  mesh_data: 16
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+
+  ce_token_chunk_size: 8192
+  train_compute_accuracy: false
+
+  n_chunks_qk: 1
+  n_chunks_v: 2
+  n_chunks_rst: 8
+
+  lr: 0.0002
+  warmup_ratio: 0.06
+  weight_decay: 0.1
+
+  router_proj_lr_mult: 1.0
+  router_proj_grad_clip: 2.0
+  op_key_lr_mult: 1.0
+  op_key_grad_clip: 2.0
+
+  opspace_gate_den_power: 0.5
+
+  operation_space_load_smoothing:
+    enabled: false
+    mode: barrier_capacity_geometry
+
+    load_temperature: 0.1
+    alpha: 1.0
+    warmup_tokens: 0
+    peak_tokens: 1
+    final_weight_frac: 1.0
+
+    qk:
+      region_weight: 0.0
+      block_weight: 0.0
+
+    v:
+      region_weight: 0.0
+      block_weight: 0.0
+
+    rst:
+      region_weight: 0.0
+      block_weight: 0.0
+
+  operation_space:
+    enabled: true
+
+    pools:
+      qk:
+        execution_backend: dense
+        num_regions: 8
+        visible_regions: 1
+        blocks_per_region: 10
+        operators_per_block: 96
+        visible_blocks_per_region: 3
+        region_score_pooling: smoothmax
+        region_score_temperature: 0.25
+
+      v:
+        execution_backend: paged_region_pool
+        num_regions: 8
+        visible_regions: 1
+        blocks_per_region: 11
+        operators_per_block: 256
+        visible_blocks_per_region: 6
+        region_score_pooling: smoothmax
+        region_score_temperature: 0.25
+        page_size: 4096
+
+      rst:
+        execution_backend: paged_region_pool
+        num_regions: 16
+        visible_regions: 1
+        blocks_per_region: 8
+        operators_per_block: 512
+        visible_blocks_per_region: 7
+        region_score_pooling: smoothmax
+        region_score_temperature: 0.25
+        page_size: 4096
+
+  checkpoint_interval: 400
+  val_interval: 1000
+  log_interval: 100
+  log_analysis_multiplier: 1000000
+  heavy_geometry_multiplier: 1000000
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4168_1p3B_c4_20B_v4_64_qk8_vpaged8_rstpaged16
