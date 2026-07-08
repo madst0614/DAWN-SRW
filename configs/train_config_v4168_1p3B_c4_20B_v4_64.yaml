@@ -13,7 +13,7 @@ model:
   vocab_size: 30522
   logical_vocab_size: 30522
 
-  d_model: 4096
+  d_model: 3840
   n_layers: 24
   n_heads: 32
   max_seq_len: 512
@@ -24,11 +24,11 @@ model:
   d_route: 256
 
   n_qk: 7048
-  n_v: 21928
-  n_rst: 58896
+  n_v: 26024
+  n_rst: 67088
 
 training:
-  batch_size: 448
+  batch_size: 512
   mesh_model: 4
   mesh_data: 8
   gradient_accumulation_steps: 1
@@ -92,27 +92,27 @@ training:
         execution_backend: paged_region_pool
         num_regions: 16
         visible_regions: 1
-        blocks_per_region: 11
+        blocks_per_region: 13
         operators_per_block: 128
-        visible_blocks_per_region: 11
+        visible_blocks_per_region: 13
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
-        page_size: 4096
+        page_size: 8192
 
       rst:
         execution_backend: paged_region_pool
-        num_regions: 16
+        num_regions: 20
         visible_regions: 1
-        blocks_per_region: 8
+        blocks_per_region: 7
         operators_per_block: 512
-        visible_blocks_per_region: 7
+        visible_blocks_per_region: 6
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
-        page_size: 4096
+        page_size: 8192
 
-  checkpoint_interval: 400
-  val_interval: 1000
-  log_interval: 100
+  checkpoint_interval: 1000
+  val_interval: 2000
+  log_interval: 200
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
