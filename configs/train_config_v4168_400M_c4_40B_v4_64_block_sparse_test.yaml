@@ -61,7 +61,7 @@ training:
       block_weight: 0.0
 
     rst:
-      region_weight: 3.0e-3
+      region_weight: 1.0e-2
       block_weight: 0.0
 
   operation_space:
