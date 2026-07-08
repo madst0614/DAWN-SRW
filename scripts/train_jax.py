@@ -10642,33 +10642,40 @@ def _print_v4168_opspace_regular_block(rec):
     v_backend = _opspace_backend_name(rec, v_prefixes)
     v_logical_ops = _opspace_logical_ops(rec, v_prefixes)
     v_physical_ops = _opspace_physical_ops(rec, v_prefixes)
-    v_parts = [
-        "  [opspace/v]",
-        f"backend={v_backend}",
-        f"visible_regions={fmt_intlike(_opspace_metric(rec, v_prefixes, 'visible_regions'))}",
-        f"visible_ops={fmt_intlike(v_logical_ops)}",
-    ]
+    v_logical_compute = _opspace_compute_frac(
+        rec, v_prefixes, 'logical_compute_frac_vs_dense', v_logical_ops)
+    v_physical_compute = _opspace_compute_frac(
+        rec, v_prefixes, 'physical_compute_frac_vs_dense', v_physical_ops)
+    v_line = (
+        "  [opspace/v]"
+        f" backend={v_backend}"
+        " mode=region_dense_block_masked"
+        f" regions={fmt_intlike(_opspace_metric(rec, v_prefixes, 'num_regions'))}"
+        f" visible_regions={fmt_intlike(_opspace_metric(rec, v_prefixes, 'visible_regions'))}"
+        f" blocks={fmt_intlike(_opspace_metric(rec, v_prefixes, 'blocks_per_region'))}"
+        f" visible_blocks={fmt_intlike(_opspace_metric(rec, v_prefixes, 'visible_blocks_per_region'))}"
+        f" ops/block={fmt_intlike(_opspace_metric(rec, v_prefixes, 'operators_per_block'))}"
+        f" semantic_ops={fmt_intlike(v_logical_ops)}"
+        f" physical_ops={fmt_intlike(v_physical_ops)}"
+        f" compute={fmt_pct(v_logical_compute, 2)}/{fmt_pct(v_physical_compute, 2)}")
     if v_backend == 'paged_region_pool':
-        v_parts.extend([
-            f"physical_ops={fmt_intlike(v_physical_ops)}",
-            f"page_size={fmt_intlike(_opspace_metric(rec, v_prefixes, 'page_size'))}",
-            f"pages={fmt_intlike(_opspace_metric(rec, v_prefixes, 'used_pages'))}/"
-            f"{fmt_intlike(_opspace_metric(rec, v_prefixes, 'max_pages'))}",
-            f"fill={fmt_float(_opspace_metric(rec, v_prefixes, 'page_fill_mean'), 1)}/"
-            f"{fmt_intlike(_opspace_metric(rec, v_prefixes, 'page_fill_max'))}",
-            f"padding={fmt_pct(_opspace_metric(rec, v_prefixes, 'page_padding_frac'), 2)}",
-            f"page_overflow={fmt_intlike(_opspace_metric(rec, v_prefixes, 'page_overflow'))}",
-        ])
-    if _opspace_has_metric(rec, v_prefixes, 'gate_mass_mean'):
-        v_parts.append(
-            f"gate_mass={fmt_float(_opspace_metric(rec, v_prefixes, 'gate_mass_mean'), 2)}")
-    if _opspace_has_metric(rec, v_prefixes, 'relu_gate_count_mean'):
-        v_parts.append(
-            f"relu_active={fmt_float(_opspace_metric(rec, v_prefixes, 'relu_gate_count_mean'), 1)}")
-    if _opspace_has_metric(rec, v_prefixes, 'no_nan'):
-        v_parts.append(
-            f"no_nan={fmt_intlike(_opspace_metric(rec, v_prefixes, 'no_nan'))}")
-    log_message(" ".join(v_parts))
+        v_line += (
+            f" page_size={fmt_intlike(_opspace_metric(rec, v_prefixes, 'page_size'))}"
+            f" pages={fmt_intlike(_opspace_metric(rec, v_prefixes, 'used_pages'))}/"
+            f"{fmt_intlike(_opspace_metric(rec, v_prefixes, 'max_pages'))}"
+            f" fill={fmt_float(_opspace_metric(rec, v_prefixes, 'page_fill_mean'), 1)}/"
+            f"{fmt_intlike(_opspace_metric(rec, v_prefixes, 'page_fill_max'))}"
+            f" padding={fmt_pct(_opspace_metric(rec, v_prefixes, 'page_padding_frac'), 2)}"
+            f" page_overflow={fmt_intlike(_opspace_metric(rec, v_prefixes, 'page_overflow'))}")
+    v_line += (
+        f" accept={fmt_float(_opspace_metric(rec, v_prefixes, 'primary_accept_frac'), 3)}"
+        f" processed={fmt_intlike(_opspace_metric(rec, v_prefixes, 'processed_requests'))}/"
+        f"{fmt_intlike(_opspace_metric(rec, v_prefixes, 'selected_requests'))}"
+        f" all={fmt_intlike(_opspace_metric(rec, v_prefixes, 'all_processed'))}"
+        f" no_nan={fmt_intlike(_opspace_metric(rec, v_prefixes, 'no_nan'))}"
+        f" gate_mass={fmt_float(_opspace_metric(rec, v_prefixes, 'gate_mass_mean'), 2)}"
+        f" relu_active={fmt_float(_opspace_metric(rec, v_prefixes, 'relu_gate_count_mean'), 1)}")
+    log_message(v_line)
 
     logical_ops = _opspace_logical_ops(rec, rst_prefix)
     physical_ops = _opspace_physical_ops(rec, rst_prefix)
