@@ -79,7 +79,7 @@ training:
         region_score_temperature: 0.25
 
       v:
-        execution_backend: paged_region_pool
+        execution_backend: dense
         num_regions: 4
         visible_regions: 1
         blocks_per_region: 12
@@ -87,7 +87,6 @@ training:
         visible_blocks_per_region: 6
         region_score_pooling: smoothmax
         region_score_temperature: 0.25
-        page_size: 4096
 
       rst:
         execution_backend: paged_region_pool
