@@ -4965,7 +4965,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         })
     _train_result_heavy_keys = frozenset(_heavy_keys)
 
-    @jax.jit
+    @partial(jax.jit, donate_argnums=(0, 1))
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
                    prev_op_key_snap, step):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
