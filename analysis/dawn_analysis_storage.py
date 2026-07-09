@@ -172,6 +172,58 @@ def _gcs_copy(src: str, dst: str) -> None:
     _tf_gfile().copy(src, dst, overwrite=True)
 
 
+def _gcs_bucket_blob(path: str) -> tuple[str, str]:
+    rest = str(path)[5:]
+    bucket, _, blob = rest.partition("/")
+    return bucket, blob
+
+
+def _set_gcs_object_metadata(path: str | os.PathLike[str],
+                             content_type: Optional[str] = None,
+                             content_disposition: Optional[str] = None) -> None:
+    path_s = str(path)
+    if not is_gcs_path(path_s) or (not content_type and not content_disposition):
+        return
+    attrs = {}
+    if content_type:
+        attrs["content_type"] = content_type
+    if content_disposition:
+        attrs["content_disposition"] = content_disposition
+    try:
+        fs = _get_gcs_fs()
+        if fs is not None and hasattr(fs, "setxattrs"):
+            fs.setxattrs(path_s, **attrs)
+            return
+    except Exception:
+        pass
+    try:
+        from google.cloud import storage
+
+        bucket_name, blob_name = _gcs_bucket_blob(path_s)
+        blob = storage.Client().bucket(bucket_name).blob(blob_name)
+        if content_type:
+            blob.content_type = content_type
+        if content_disposition:
+            blob.content_disposition = content_disposition
+        blob.patch()
+    except Exception:
+        pass
+
+
+def _text_content_type_for_path(path: str | os.PathLike[str]) -> str:
+    suffix = Path(str(path).rstrip("/\\")).suffix.lower()
+    return {
+        ".csv": "text/csv; charset=utf-8",
+        ".htm": "text/html; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".jsonl": "application/x-ndjson; charset=utf-8",
+        ".log": "text/plain; charset=utf-8",
+        ".md": "text/markdown; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+    }.get(suffix, "text/plain; charset=utf-8")
+
+
 def _json_default(obj: Any) -> Any:
     if obj is None or isinstance(obj, (str, int, bool)):
         return obj
@@ -224,7 +276,9 @@ def read_json(path: str | os.PathLike[str], default: Any = None) -> Any:
         return json.load(f)
 
 
-def write_bytes_atomic(path: str | os.PathLike[str], payload: bytes) -> str:
+def write_bytes_atomic(path: str | os.PathLike[str], payload: bytes,
+                       content_type: Optional[str] = None,
+                       content_disposition: Optional[str] = None) -> str:
     path_s = str(path)
     tmp = f"{path_s}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
     parent = dirname(path_s)
@@ -234,6 +288,7 @@ def write_bytes_atomic(path: str | os.PathLike[str], payload: bytes) -> str:
             with open_path(tmp, "wb") as f:
                 f.write(payload)
             _gcs_copy(tmp, path_s)
+            _set_gcs_object_metadata(path_s, content_type, content_disposition)
         finally:
             try:
                 remove_path(tmp)
@@ -250,8 +305,36 @@ def write_bytes_atomic(path: str | os.PathLike[str], payload: bytes) -> str:
     return path_s
 
 
-def write_text_atomic(path: str | os.PathLike[str], text: str) -> str:
-    return write_bytes_atomic(path, text.encode("utf-8"))
+def write_text_atomic(path: str | os.PathLike[str], text: str,
+                      content_type: Optional[str] = None,
+                      content_disposition: str = "inline") -> str:
+    return write_bytes_atomic(
+        path,
+        text.encode("utf-8"),
+        content_type=content_type or _text_content_type_for_path(path),
+        content_disposition=content_disposition,
+    )
+
+
+def read_text(path: str | os.PathLike[str], default: str = "") -> str:
+    if not exists(path):
+        return default
+    with open_path(path, "r") as f:
+        return f.read()
+
+
+def append_text(path: str | os.PathLike[str], text: str) -> str:
+    """Append text to local paths, or read+rewrite for GCS paths."""
+    path_s = str(path)
+    if is_gcs_path(path_s):
+        return write_text_atomic(path_s, read_text(path_s) + text)
+    p = Path(path_s)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    return path_s
 
 
 def write_json_atomic(path: str | os.PathLike[str], obj: Any) -> str:

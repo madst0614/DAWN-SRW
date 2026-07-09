@@ -53,6 +53,7 @@ from analysis.dawn_analysis_common import (
 from analysis.dawn_analysis_report import run_report_stage
 from analysis.dawn_analysis_storage import (
     AnalysisStore,
+    append_text,
     append_jsonl,
     exists,
     is_gcs_path,
@@ -1904,6 +1905,36 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def _train_analysis_history_entry(summary: Dict[str, Any], text: str) -> str:
+    run = summary.get("run", {})
+    progress = summary.get("progress", {})
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    header = [
+        "",
+        "#" * 60,
+        (
+            "TRAIN_ANALYSIS_HISTORY "
+            f"appended_at={timestamp} "
+            f"step={progress.get('step')} "
+            f"preset={summary.get('analysis_preset')} "
+            f"latest_path={run.get('latest_path')}"
+        ),
+        "#" * 60,
+    ]
+    return "\n".join(header) + "\n" + text.rstrip() + "\n"
+
+
+def _append_train_analysis_history(store: AnalysisStore, summary: Dict[str, Any],
+                                   text: str, warnings: List[str]) -> None:
+    try:
+        append_text(
+            store.path("train_analysis_history.txt"),
+            _train_analysis_history_entry(summary, text),
+        )
+    except Exception as exc:
+        warnings.append(f"history append failed: {type(exc).__name__}: {exc}")
+
+
 def _save_train_analysis(store: AnalysisStore, summary: Dict[str, Any],
                          text: str, scalar: Dict[str, Any],
                          warnings: List[str]) -> Tuple[AnalysisStore, str]:
@@ -1911,6 +1942,7 @@ def _save_train_analysis(store: AnalysisStore, summary: Dict[str, Any],
         write_text_atomic(store.path("train_analysis_latest.txt"), text + "\n")
         write_json_atomic(store.path("train_analysis_latest.json"), summary)
         append_jsonl(store.path("train_analysis.jsonl"), scalar)
+        _append_train_analysis_history(store, summary, text, warnings)
         return store, store.output_dir
     except Exception as exc:
         fallback = os.environ.get("DAWN_TRAIN_ANALYSIS_FALLBACK_OUTPUT", "runs/side_analysis")
@@ -1922,6 +1954,7 @@ def _save_train_analysis(store: AnalysisStore, summary: Dict[str, Any],
         write_text_atomic(store.path("train_analysis_latest.txt"), text + "\n")
         write_json_atomic(store.path("train_analysis_latest.json"), summary)
         append_jsonl(store.path("train_analysis.jsonl"), scalar)
+        _append_train_analysis_history(store, summary, text, warnings)
         return store, store.output_dir
 
 
@@ -2007,6 +2040,7 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     print("", flush=True)
     print(f"Saved: {join_path(saved_dir, 'train_analysis_latest.txt')}", flush=True)
     print(f"Saved: {join_path(saved_dir, 'train_analysis_latest.json')}", flush=True)
+    print(f"Saved: {join_path(saved_dir, 'train_analysis_history.txt')}", flush=True)
     print(f"Saved: {join_path(saved_dir, 'train_analysis.jsonl')}", flush=True)
     return 0
 

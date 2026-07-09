@@ -36,6 +36,20 @@ ITEM layer_selectivity: Layer selectivity
   ...
 ```
 
+Saved artifacts:
+
+`train_analysis_latest.txt`
+: overwritten with the newest human-readable summary.
+
+`train_analysis_history.txt`
+: append-only human-readable summaries, one block per analysis run.
+
+`train_analysis_latest.json`
+: overwritten with the newest full structured summary.
+
+`train_analysis.jsonl`
+: append-only scalar trend rows used by `Recent trend`.
+
 ## Commands
 
 List the available presets, aliases, and items:
