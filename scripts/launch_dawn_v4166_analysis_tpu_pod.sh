@@ -229,9 +229,6 @@ if [[ "$MODE" == "train_analysis" ]]; then
     if [[ "$TMUX_SESSION" == "train" ]]; then
         TMUX_SESSION="train_analysis"
     fi
-    if [[ "$REMOTE_LOG" == "~/train.log" ]]; then
-        REMOTE_LOG="~/train_analysis.log"
-    fi
 fi
 
 if [[ "$WORKERS" = "auto" ]]; then
