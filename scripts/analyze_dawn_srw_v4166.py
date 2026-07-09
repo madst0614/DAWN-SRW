@@ -887,7 +887,19 @@ def _run_prune_light(ctx: AnalysisContext, max_batches: int, eps_values: List[fl
             mass_sum += float(mass_retained)
             no_active_sum += float(no_active)
             row_count += 1
-            sec_sum += time.time() - t0
+            sec = time.time() - t0
+            sec_sum += sec
+            if ctx.is_primary:
+                log_every = max(1, int(getattr(ctx.args, "log_every_batches", 1) or 1))
+                if (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == local_max_batches:
+                    print(
+                        "TRAIN_ANALYSIS PRUNE "
+                        f"eps={eps:g} batch={batch_idx + 1:05d}/{local_max_batches:05d} "
+                        f"loss={_fmt_num(loss_f, 6)} "
+                        f"compute={_fmt_num(float(compute_frac), 4)} "
+                        f"sec={sec:.2f}",
+                        flush=True,
+                    )
         summary = {
             "eps": float(eps),
             "num_batches": row_count,

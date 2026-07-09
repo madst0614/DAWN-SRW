@@ -57,11 +57,15 @@ DRY_RUN="0"
 OUTPUT_EXPLICIT="0"
 MODE_EXPLICIT="0"
 CHECKPOINT_DIR_EXPLICIT="0"
+PRUNE_EPS_EXPLICIT="0"
 
 TRAIN_ANALYSIS_CONFIG="${DAWN_TRAIN_ANALYSIS_CONFIG:-}"
 TRAIN_ANALYSIS_CHECKPOINT_DIR="${DAWN_TRAIN_ANALYSIS_CHECKPOINT_DIR:-gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new}"
 TRAIN_ANALYSIS_MAX_BATCHES="${DAWN_TRAIN_ANALYSIS_MAX_BATCHES:-8}"
 TRAIN_ANALYSIS_PRUNE_EPS="${DAWN_TRAIN_ANALYSIS_PRUNE_EPS:-1e-6,1e-5,1e-4,1e-3}"
+if [[ -n "${DAWN_TRAIN_ANALYSIS_PRUNE_EPS+x}" ]]; then
+    PRUNE_EPS_EXPLICIT="1"
+fi
 
 normalize_gcs_arg() {
     local value="$1"
@@ -97,6 +101,9 @@ apply_preset() {
             fi
             if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
                 TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new"
+            fi
+            if [[ "$PRUNE_EPS_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_PRUNE_EPS="1e-2,1e-1"
             fi
             ;;
         *)
@@ -134,7 +141,7 @@ while [[ $# -gt 0 ]]; do
         --mesh-model) ANALYSIS_ARGS="$ANALYSIS_ARGS --mesh-model $2"; shift 2 ;;
         --eval-max-tokens) ANALYSIS_ARGS="$ANALYSIS_ARGS --eval-max-tokens $2"; shift 2 ;;
         --eval-batch-size) ANALYSIS_ARGS="$ANALYSIS_ARGS --eval-batch-size $2"; shift 2 ;;
-        --prune-eps) TRAIN_ANALYSIS_PRUNE_EPS="$2"; ANALYSIS_ARGS="$ANALYSIS_ARGS --prune-eps $2"; shift 2 ;;
+        --prune-eps) TRAIN_ANALYSIS_PRUNE_EPS="$2"; PRUNE_EPS_EXPLICIT="1"; shift 2 ;;
         --usage-max-sequences) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-max-sequences $2"; shift 2 ;;
         --usage-batch-size) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-batch-size $2"; shift 2 ;;
         --usage-seq-len) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-seq-len $2"; shift 2 ;;
