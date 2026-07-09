@@ -27,6 +27,30 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
         "summary": "LAYER_SELECTIVITY shows whether a pool is globally closed or layer-local, and why.",
         "requires": ("active",),
     },
+    "target_quantile_gap": {
+        "title": "Target quantile gap",
+        "measures": "score quantile needed for target/candidate admission versus current tau.",
+        "summary": "TARGET_QUANTILE_GAP shows how far tau sits above or below the target score boundary.",
+        "requires": ("active",),
+    },
+    "calibration_state": {
+        "title": "Calibration state",
+        "measures": "target, candidate, observed admission, admission error, tau, and calibration update availability.",
+        "summary": "CALIBRATION_STATE shows whether selection calibration is moving toward the requested candidate.",
+        "requires": ("active",),
+    },
+    "qk_split": {
+        "title": "Q/K split",
+        "measures": "separate Q and K active/effective fractions and per-layer split diagnostics.",
+        "summary": "QK_SPLIT separates Q from K so a thin QK path can be attributed to one side.",
+        "requires": ("active",),
+    },
+    "concentration_max": {
+        "title": "Concentration max",
+        "measures": "the layer with max top1 concentration for each pool, plus local active/effective values.",
+        "summary": "CONCENTRATION_MAX points to the layer responsible for max route concentration.",
+        "requires": ("active",),
+    },
     "prune_breakdown": {
         "title": "Pruned eval breakdown",
         "measures": "eps-wise loss delta, total compute, and pool-level compute/effective estimates.",
@@ -86,6 +110,10 @@ TRAIN_ANALYSIS_ITEM_ALIASES = {
 V4166_1B_ITEMS = (
     "target_ratio",
     "layer_selectivity",
+    "target_quantile_gap",
+    "calibration_state",
+    "qk_split",
+    "concentration_max",
     "prune_breakdown",
     "execution_profile",
     "prompt_trace",
@@ -99,6 +127,10 @@ TRAIN_ANALYSIS_PRESETS = {
     "qk_closed": (
         "target_ratio",
         "layer_selectivity",
+        "target_quantile_gap",
+        "calibration_state",
+        "qk_split",
+        "concentration_max",
         "prune_breakdown",
         "execution_profile",
         "decision_reason",
@@ -293,6 +325,130 @@ def _item_lines_layer_selectivity(summary: Dict[str, Any], fmt: TrainAnalysisFor
     return out
 
 
+def _item_lines_target_quantile_gap(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    active = summary["active_dynamics"]
+    rows = active.get("target_quantile_gap", [])
+    out = [
+        "  TARGET_QUANTILE_GAP:",
+        "  source=layer_score_quantile_approx",
+        "  pool target candidate q@target q@candidate tau gap_target gap_candidate",
+    ]
+    if not rows:
+        out.append("  n/a")
+    for row in rows:
+        out.append(
+            "  "
+            f"{str(row.get('pool', 'n/a')):<5} "
+            f"{fmt.num(row.get('target'), 3):<6} "
+            f"{fmt.num(row.get('candidate'), 3):<9} "
+            f"{fmt.num(row.get('score_q_target'), 4):<8} "
+            f"{fmt.num(row.get('score_q_candidate'), 4):<11} "
+            f"{fmt.num(row.get('tau'), 4):<7} "
+            f"{fmt.delta(row.get('gap_target'), 4):<10} "
+            f"{fmt.delta(row.get('gap_candidate'), 4)}"
+        )
+    return out
+
+
+def _item_lines_calibration_state(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    active = summary["active_dynamics"]
+    rows = active.get("calibration_state", [])
+    out = [
+        "  CALIBRATION_STATE:",
+        "  pool target candidate observed_adm error tau_before tau_after tau_delta clamp stopgrad mode",
+    ]
+    if not rows:
+        out.append("  n/a")
+    for row in rows:
+        out.append(
+            "  "
+            f"{str(row.get('pool', 'n/a')):<5} "
+            f"{fmt.num(row.get('target'), 3):<6} "
+            f"{fmt.num(row.get('candidate'), 3):<9} "
+            f"{fmt.num(row.get('observed_admission'), 3):<12} "
+            f"{fmt.delta(row.get('error'), 3):<7} "
+            f"{fmt.num(row.get('tau_before'), 4):<10} "
+            f"{fmt.num(row.get('tau_after'), 4):<9} "
+            f"{fmt.delta(row.get('tau_delta'), 4):<9} "
+            f"{str(row.get('clamp_hit', 'n/a')):<5} "
+            f"{str(row.get('stopgrad', 'n/a')):<8} "
+            f"{row.get('mode', 'n/a')}"
+        )
+    return out
+
+
+def _item_lines_qk_split(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    active = summary["active_dynamics"]
+    qk_split = active.get("qk_split", {})
+    split_summary = qk_split.get("summary", {})
+    out = [
+        "  QK_SPLIT_SUMMARY:",
+        "  side active_tau admission effective active_ops effective_ops eff_min eff_mean eff_max",
+    ]
+    for side in ("q", "k"):
+        row = split_summary.get(side, {})
+        out.append(
+            "  "
+            f"{side:<4} "
+            f"{fmt.num(row.get('active_tau'), 3):<10} "
+            f"{fmt.num(row.get('admission'), 3):<9} "
+            f"{fmt.num(row.get('effective'), 3):<9} "
+            f"{fmt.num(row.get('active_ops_mean'), 1):<10} "
+            f"{fmt.num(row.get('effective_ops_mean'), 1):<13} "
+            f"{fmt.num(row.get('eff_min'), 3):<7} "
+            f"{fmt.num(row.get('eff_mean'), 3):<8} "
+            f"{fmt.num(row.get('eff_max'), 3)}"
+        )
+    out.append(f"  q/k_effective_balance={fmt.num(split_summary.get('qk_effective_balance'), 3)}")
+    out.extend([
+        "  QK_SPLIT_LAYERS:",
+        "  lyr q_act q_adm q_eff q_ops | k_act k_adm k_eff k_ops | qk_eff",
+    ])
+    rows = qk_split.get("layers", [])
+    if not rows:
+        out.append("  n/a")
+    for row in rows:
+        out.append(
+            "  "
+            f"{int(row.get('layer', 0)):02d}  "
+            f"{fmt.num(row.get('q_active_tau'), 3):<5} "
+            f"{fmt.num(row.get('q_admission'), 3):<5} "
+            f"{fmt.num(row.get('q_effective'), 3):<5} "
+            f"{fmt.num(row.get('q_effective_ops'), 1):<5} | "
+            f"{fmt.num(row.get('k_active_tau'), 3):<5} "
+            f"{fmt.num(row.get('k_admission'), 3):<5} "
+            f"{fmt.num(row.get('k_effective'), 3):<5} "
+            f"{fmt.num(row.get('k_effective_ops'), 1):<5} | "
+            f"{fmt.num(row.get('qk_effective'), 3)}"
+        )
+    return out
+
+
+def _item_lines_concentration_max(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    active = summary["active_dynamics"]
+    rows = active.get("concentration_max", [])
+    out = [
+        "  CONCENTRATION_MAX:",
+        "  pool layer layer_top1 global_top1_max active effective active_ops effective_ops operator_id",
+    ]
+    if not rows:
+        out.append("  n/a")
+    for row in rows:
+        out.append(
+            "  "
+            f"{str(row.get('pool', 'n/a')):<5} "
+            f"{str(row.get('layer', 'n/a')):<5} "
+            f"{fmt.num(row.get('top1'), 3):<10} "
+            f"{fmt.num(row.get('global_top1_max'), 3):<15} "
+            f"{fmt.num(row.get('active'), 3):<6} "
+            f"{fmt.num(row.get('effective'), 3):<9} "
+            f"{fmt.num(row.get('active_ops'), 1):<10} "
+            f"{fmt.num(row.get('effective_ops'), 1):<13} "
+            f"{row.get('operator_id', 'n/a')}"
+        )
+    return out
+
+
 def _item_lines_prune_breakdown(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
     prune = summary["effective_prune"]
     baseline = prune.get("baseline") or {}
@@ -385,7 +541,7 @@ def _item_lines_prompt_trace(summary: Dict[str, Any], fmt: TrainAnalysisFormatte
         return ["  PROMPT_TRACE:", f"  status={trace.get('status', 'missing')} reason={trace.get('reason', 'n/a')}"]
     out = [
         "  PROMPT_TRACE:",
-        "  prompt_id       len q_act k_act v_act rst_act q_top1 k_top1 v_top1 rst_top1 rst/attn",
+        "  prompt_id       len q_frac k_frac v_frac rst_frac q_top1 k_top1 v_top1 rst_top1 rst/attn",
     ]
     rows = trace.get("prompts", [])
     if not rows:
@@ -397,10 +553,10 @@ def _item_lines_prompt_trace(summary: Dict[str, Any], fmt: TrainAnalysisFormatte
             "  "
             f"{str(row.get('prompt_id', 'n/a')):<15} "
             f"{str(row.get('length', 'n/a')):<3} "
-            f"{fmt.num(pools.get('q', {}).get('active_mean'), 1):<5} "
-            f"{fmt.num(pools.get('k', {}).get('active_mean'), 1):<5} "
-            f"{fmt.num(pools.get('v', {}).get('active_mean'), 1):<5} "
-            f"{fmt.num(pools.get('rst', {}).get('active_mean'), 1):<7} "
+            f"{fmt.num(pools.get('q', {}).get('active_frac_mean'), 3):<6} "
+            f"{fmt.num(pools.get('k', {}).get('active_frac_mean'), 3):<6} "
+            f"{fmt.num(pools.get('v', {}).get('active_frac_mean'), 3):<6} "
+            f"{fmt.num(pools.get('rst', {}).get('active_frac_mean'), 3):<8} "
             f"{fmt.num(pools.get('q', {}).get('top1_max'), 3):<6} "
             f"{fmt.num(pools.get('k', {}).get('top1_max'), 3):<6} "
             f"{fmt.num(pools.get('v', {}).get('top1_max'), 3):<6} "
@@ -416,7 +572,7 @@ def _item_lines_prompt_decision(summary: Dict[str, Any], fmt: TrainAnalysisForma
         return ["  PROMPT_DECISION:", f"  status={decision.get('status', 'missing')} reason={decision.get('reason', 'n/a')}"]
     out = [
         "  PROMPT_DECISION:",
-        "  prompt_id       status qk_act v_act rst_act rst_top1 rst/attn reason",
+        "  prompt_id       status qk_frac v_frac rst_frac rst_top1 rst/attn reason",
     ]
     rows = decision.get("rows", [])
     if not rows:
@@ -426,9 +582,9 @@ def _item_lines_prompt_decision(summary: Dict[str, Any], fmt: TrainAnalysisForma
             "  "
             f"{str(row.get('prompt_id', 'n/a')):<15} "
             f"{str(row.get('status', 'n/a')):<6} "
-            f"{fmt.num(row.get('qk_active_mean'), 1):<6} "
-            f"{fmt.num(row.get('v_active_mean'), 1):<5} "
-            f"{fmt.num(row.get('rst_active_mean'), 1):<7} "
+            f"{fmt.num(row.get('qk_active_frac'), 3):<7} "
+            f"{fmt.num(row.get('v_active_frac'), 3):<6} "
+            f"{fmt.num(row.get('rst_active_frac'), 3):<8} "
             f"{fmt.num(row.get('rst_top1_max'), 3):<8} "
             f"{fmt.num(row.get('rst_attn_norm_ratio'), 3):<7} "
             f"{row.get('reason', 'n/a')}"
@@ -468,6 +624,10 @@ def _item_lines_decision_reason(summary: Dict[str, Any], _fmt: TrainAnalysisForm
 TRAIN_ANALYSIS_ITEM_FORMATTERS = {
     "target_ratio": _item_lines_target_ratio,
     "layer_selectivity": _item_lines_layer_selectivity,
+    "target_quantile_gap": _item_lines_target_quantile_gap,
+    "calibration_state": _item_lines_calibration_state,
+    "qk_split": _item_lines_qk_split,
+    "concentration_max": _item_lines_concentration_max,
     "prune_breakdown": _item_lines_prune_breakdown,
     "execution_profile": _item_lines_execution_profile,
     "num_health": _item_lines_num_health,
@@ -517,6 +677,17 @@ def item_status(summary: Dict[str, Any], item: str) -> str:
         if active.get("per_layer_active", {}).get("layers") and active.get("select_distribution"):
             return "ready"
         return "partial" if active.get("per_layer_active") or active.get("select_distribution") else "missing"
+    if item == "target_quantile_gap":
+        return "ready" if active.get("target_quantile_gap") else "missing"
+    if item == "calibration_state":
+        return "ready" if active.get("calibration_state") else "missing"
+    if item == "qk_split":
+        qk_split = active.get("qk_split", {})
+        if qk_split.get("layers"):
+            return "ready"
+        return "partial" if qk_split.get("summary") else "missing"
+    if item == "concentration_max":
+        return "ready" if active.get("concentration_max") else "missing"
     if item == "prune_breakdown":
         return "ready" if (prune.get("baseline") or prune.get("eps")) else "missing"
     if item == "execution_profile":

@@ -560,6 +560,7 @@ if [ "\$INSTALL_DEPS" = "1" ]; then
     python3 -m pip install --upgrade pip -q
     python3 -m pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
     python3 -m pip install flax optax orbax-checkpoint==0.11.24 numpy pyyaml gcsfs transformers matplotlib -q
+    python3 -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('bert-base-uncased')" >/dev/null 2>&1 || true
 fi
 
 export PYTHONUNBUFFERED=1

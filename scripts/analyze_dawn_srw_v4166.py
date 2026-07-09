@@ -101,6 +101,10 @@ TRAIN_ANALYSIS_POOLS = {
     "v": "attn_v",
     "rst": "rst",
 }
+TRAIN_ANALYSIS_QK_SPLIT = {
+    "q": "attn_q",
+    "k": "attn_k",
+}
 REFERENCE_400M = {
     ("qk", "active_tau"): (0.045, 0.065),
     ("v", "active_tau"): (0.090, 0.120),
@@ -522,6 +526,34 @@ def _mean_lists(rows: List[Dict[str, Any]], key: str) -> Optional[List[float]]:
     return out
 
 
+def _mean_scalar_key(rows: List[Dict[str, Any]], key: str) -> Optional[float]:
+    vals = [_safe_float(row.get(key)) for row in rows]
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _quantile_from_summary(stats: Dict[str, Any], q: float) -> Optional[float]:
+    points = []
+    for q_i, key in ((0.0, "min"), (0.10, "p10"), (0.50, "p50"), (0.90, "p90"), (1.0, "max")):
+        value = _safe_float(stats.get(key))
+        if value is not None:
+            points.append((q_i, value))
+    if not points:
+        return None
+    q = min(1.0, max(0.0, float(q)))
+    points = sorted(points)
+    if q <= points[0][0]:
+        return points[0][1]
+    if q >= points[-1][0]:
+        return points[-1][1]
+    for (q0, v0), (q1, v1) in zip(points, points[1:]):
+        if q0 <= q <= q1:
+            span = max(q1 - q0, 1e-12)
+            frac = (q - q0) / span
+            return v0 * (1.0 - frac) + v1 * frac
+    return points[-1][1]
+
+
 def _fmt_num(value: Any, digits: int = 3) -> str:
     value_f = _safe_float(value)
     if value_f is None:
@@ -927,6 +959,132 @@ def _build_select_distribution(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+def _build_qk_split(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    pool_size = _pool_sizes(cfg).get("qk")
+    by_side: Dict[str, Dict[str, Any]] = {}
+    n_layers = int(cfg.get("model", {}).get("n_layers", 0) or 0)
+    for side, prefix in TRAIN_ANALYSIS_QK_SPLIT.items():
+        active_layer = _mean_lists(rows, f"per_layer_{prefix}_active_tau_frac")
+        admission_layer = _mean_lists(rows, f"per_layer_{prefix}_admission_active_eps_1e_2_frac")
+        effective_layer = _mean_lists(rows, f"per_layer_{prefix}_active_eps_1e_2_frac")
+        active_ops_layer = _mean_lists(rows, f"per_layer_{prefix}_active_n_mean")
+        if active_layer:
+            n_layers = max(n_layers, len(active_layer))
+        if admission_layer:
+            n_layers = max(n_layers, len(admission_layer))
+        if effective_layer:
+            n_layers = max(n_layers, len(effective_layer))
+        if active_ops_layer:
+            n_layers = max(n_layers, len(active_ops_layer))
+
+        effective_stats = _stat_summary(effective_layer)
+        effective_scalar = _mean_scalar_key(rows, f"{prefix}_active_eps_1e_2_frac")
+        if effective_scalar is None:
+            effective_scalar = effective_stats.get("mean")
+        active_ops = _mean_scalar_key(rows, f"{prefix}_active_n_mean")
+        effective_ops = effective_scalar * float(pool_size) if effective_scalar is not None and pool_size else None
+        by_side[side] = {
+            "active_layer": active_layer,
+            "admission_layer": admission_layer,
+            "effective_layer": effective_layer,
+            "active_ops_layer": active_ops_layer,
+            "summary": {
+                "active_tau": _mean_scalar_key(rows, f"{prefix}_active_tau_frac")
+                or _mean_scalar_key(rows, f"{prefix}_active"),
+                "admission": _mean_scalar_key(rows, f"{prefix}_admission_active_eps_1e_2_frac"),
+                "effective": effective_scalar,
+                "active_ops_mean": active_ops,
+                "effective_ops_mean": effective_ops,
+                "eff_min": effective_stats.get("min"),
+                "eff_p10": effective_stats.get("p10"),
+                "eff_mean": effective_stats.get("mean"),
+                "eff_p90": effective_stats.get("p90"),
+                "eff_max": effective_stats.get("max"),
+            },
+        }
+
+    q_eff = _safe_float(by_side.get("q", {}).get("summary", {}).get("effective"))
+    k_eff = _safe_float(by_side.get("k", {}).get("summary", {}).get("effective"))
+    balance = q_eff / k_eff if q_eff is not None and k_eff is not None and k_eff > 0.0 else None
+    qk_eff_layer = _mean_lists(rows, "per_layer_attn_qk_active_eps_1e_2_frac")
+    has_layer_data = any(
+        by_side.get(side, {}).get(key)
+        for side in ("q", "k")
+        for key in ("active_layer", "admission_layer", "effective_layer", "active_ops_layer")
+    )
+    layers = []
+    if has_layer_data:
+        for layer_idx in range(n_layers):
+            row = {"layer": layer_idx}
+            for side in ("q", "k"):
+                side_data = by_side.get(side, {})
+                for metric, values in (
+                    ("active_tau", side_data.get("active_layer")),
+                    ("admission", side_data.get("admission_layer")),
+                    ("effective", side_data.get("effective_layer")),
+                    ("active_ops", side_data.get("active_ops_layer")),
+                ):
+                    row[f"{side}_{metric}"] = values[layer_idx] if values and layer_idx < len(values) else None
+                effective = _safe_float(row.get(f"{side}_effective"))
+                row[f"{side}_effective_ops"] = (
+                    effective * float(pool_size) if effective is not None and pool_size else None
+                )
+            row["qk_effective"] = (
+                qk_eff_layer[layer_idx] if qk_eff_layer and layer_idx < len(qk_eff_layer) else None
+            )
+            layers.append(row)
+    return {
+        "summary": {
+            "q": by_side.get("q", {}).get("summary", {}),
+            "k": by_side.get("k", {}).get("summary", {}),
+            "qk_effective_balance": balance,
+            "pool_size": pool_size,
+        },
+        "layers": layers,
+    }
+
+
+def _build_concentration_max(active: Dict[str, Any]) -> List[Dict[str, Any]]:
+    layers = active.get("per_layer_active", {}).get("layers", [])
+    pools = active.get("pools", {})
+    out = []
+    for pool in ("qk", "v", "rst"):
+        best = None
+        best_top1 = None
+        for row in layers:
+            top1 = _safe_float(row.get(f"{pool}_top1"))
+            if top1 is None:
+                continue
+            if best_top1 is None or top1 > best_top1:
+                best = row
+                best_top1 = top1
+        if best is None:
+            out.append({
+                "pool": pool,
+                "layer": None,
+                "top1": None,
+                "global_top1_max": pools.get(pool, {}).get("top1_max"),
+                "active": None,
+                "effective": None,
+                "active_ops": None,
+                "effective_ops": None,
+                "operator_id": None,
+            })
+            continue
+        out.append({
+            "pool": pool,
+            "layer": best.get("layer"),
+            "top1": best_top1,
+            "global_top1_max": pools.get(pool, {}).get("top1_max"),
+            "active": best.get(f"{pool}_active_tau"),
+            "effective": best.get(f"{pool}_effective"),
+            "active_ops": best.get(f"{pool}_active_ops"),
+            "effective_ops": best.get(f"{pool}_effective_ops"),
+            "operator_id": None,
+        })
+    return out
+
+
 def _build_num_health(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     scalar_keys = (
         "residual_norm",
@@ -1024,6 +1182,21 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
             "selected_frac",
         ):
             wanted.add(f"per_layer_{prefix}_{metric}")
+    for prefix in TRAIN_ANALYSIS_QK_SPLIT.values():
+        wanted.update({
+            f"{prefix}_active",
+            f"{prefix}_active_tau_frac",
+            f"{prefix}_admission_active_eps_1e_2_frac",
+            f"{prefix}_active_eps_1e_2_frac",
+            f"{prefix}_active_n_mean",
+        })
+        for metric in (
+            "active_tau_frac",
+            "admission_active_eps_1e_2_frac",
+            "active_eps_1e_2_frac",
+            "active_n_mean",
+        ):
+            wanted.add(f"per_layer_{prefix}_{metric}")
     wanted.update({
         "residual_norm",
         "residual_norm_max",
@@ -1110,17 +1283,21 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
             "effective_ops_mean": mean_key(f"{prefix}_gate_eff_n"),
             "effective_ops_ratio": mean_key(f"{prefix}_gate_eff_ratio"),
         }
-    return {
+    per_layer_active = _build_per_layer_active(rows, ctx.config)
+    active = {
         "num_batches": len(rows),
         "valid_tokens": valid_total,
         "val_loss": loss_sum / valid_total if valid_total else None,
         "accuracy": correct_total / valid_total if valid_total else None,
         "sec": sum(float(row.get("sec") or 0.0) for row in rows),
         "pools": pools,
-        "per_layer_active": _build_per_layer_active(rows, ctx.config),
+        "per_layer_active": per_layer_active,
         "select_distribution": _build_select_distribution(rows),
+        "qk_split": _build_qk_split(rows, ctx.config),
         "num_health": _build_num_health(rows),
     }
+    active["concentration_max"] = _build_concentration_max(active)
+    return active
 
 
 def _run_prune_light(ctx: AnalysisContext, max_batches: int, eps_values: List[float]) -> Dict[str, Any]:
@@ -1202,9 +1379,13 @@ def _run_prune_light(ctx: AnalysisContext, max_batches: int, eps_values: List[fl
                     if active_n_f is not None and size:
                         pool_compute_sum[pool] += active_n_f / float(size)
                     eff_frac_f = _safe_float(eff_frac)
+                    eff_n_f = _safe_float(eff_n)
+                    if eff_n_f is not None and size:
+                        derived_eff_frac = eff_n_f / float(size)
+                        if eff_frac_f is None or (abs(eff_frac_f) < 1e-12 and derived_eff_frac > 0.0):
+                            eff_frac_f = derived_eff_frac
                     if eff_frac_f is not None:
                         pool_eff_sum[pool] += eff_frac_f
-                    eff_n_f = _safe_float(eff_n)
                     if eff_n_f is not None:
                         pool_eff_ops_sum[pool] += eff_n_f
                 pool_stats_count += 1
@@ -1413,6 +1594,84 @@ def _add_target_ratio(active: Dict[str, Any], selection: Dict[str, Any]) -> Dict
         })
     active["target_ratio"] = rows
     return active
+
+
+def _build_target_quantile_gap(active: Dict[str, Any], selection: Dict[str, Any]) -> List[Dict[str, Any]]:
+    targets = selection.get("active_target", {}) or {}
+    candidates = selection.get("candidate_now", {}) or {}
+    select_distribution = active.get("select_distribution", {}) or {}
+    rows = []
+    for pool in ("qk", "v", "rst"):
+        dist = select_distribution.get(pool, {})
+        score_summary = dist.get("score_layer", {}) or {}
+        tau_summary = dist.get("tau_layer", {}) or {}
+        target = _safe_float(targets.get(pool))
+        candidate = _safe_float(candidates.get(pool))
+        target_q = 1.0 - target if target is not None else None
+        candidate_q = 1.0 - candidate if candidate is not None else None
+        score_q_target = _quantile_from_summary(score_summary, target_q) if target_q is not None else None
+        score_q_candidate = (
+            _quantile_from_summary(score_summary, candidate_q) if candidate_q is not None else None
+        )
+        tau = _safe_float(tau_summary.get("p50"))
+        if tau is None:
+            tau = _safe_float(active.get("pools", {}).get(pool, {}).get("tau_mean"))
+        rows.append({
+            "pool": pool,
+            "target": target,
+            "candidate": candidate,
+            "target_quantile": target_q,
+            "candidate_quantile": candidate_q,
+            "score_q_target": score_q_target,
+            "score_q_candidate": score_q_candidate,
+            "tau": tau,
+            "gap_target": tau - score_q_target if tau is not None and score_q_target is not None else None,
+            "gap_candidate": tau - score_q_candidate if tau is not None and score_q_candidate is not None else None,
+            "source": "layer_score_quantile_approx",
+        })
+    return rows
+
+
+def _build_calibration_state(active: Dict[str, Any], selection: Dict[str, Any],
+                             cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    tcfg = cfg.get("training", {}) if isinstance(cfg.get("training", {}), dict) else {}
+    scfg = tcfg.get("selection_calibration", {})
+    scfg = scfg if isinstance(scfg, dict) else {}
+    enabled = bool(selection.get("enabled", scfg.get("enabled", False)))
+    tau_lr_mult = _safe_float(tcfg.get("tau_lr_mult"))
+    direct_tau_lr_mult = _safe_float(tcfg.get("direct_tau_lr_mult"))
+    if not enabled:
+        mode = "disabled"
+    elif (tau_lr_mult is not None and tau_lr_mult == 0.0) and (
+        direct_tau_lr_mult is None or direct_tau_lr_mult == 0.0
+    ):
+        mode = "enabled/static_tau_lr0"
+    else:
+        mode = "enabled/tau_trainable"
+    rows = []
+    targets = selection.get("active_target", {}) or {}
+    candidates = selection.get("candidate_now", {}) or {}
+    for pool in ("qk", "v", "rst"):
+        pdata = active.get("pools", {}).get(pool, {})
+        observed = _safe_float(pdata.get("admission"))
+        candidate = _safe_float(candidates.get(pool))
+        error = observed - candidate if observed is not None and candidate is not None else None
+        rows.append({
+            "pool": pool,
+            "target": _safe_float(targets.get(pool)),
+            "candidate": candidate,
+            "observed_admission": observed,
+            "error": error,
+            "tau_before": None,
+            "tau_after": pdata.get("tau_mean"),
+            "tau_delta": None,
+            "clamp_hit": "n/a",
+            "stopgrad": "n/a",
+            "tau_lr_mult": tau_lr_mult,
+            "direct_tau_lr_mult": direct_tau_lr_mult,
+            "mode": mode,
+        })
+    return rows
 
 
 def _decision_lines(active: Dict[str, Any], selection: Dict[str, Any], progress: Dict[str, Any]) -> List[str]:
@@ -1701,6 +1960,8 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     for pool, pdata in active.get("pools", {}).items():
         pdata["status"] = _active_status(pool, pdata.get("active_tau"), progress["tokens"], selection)
     active = _add_target_ratio(active, selection)
+    active["target_quantile_gap"] = _build_target_quantile_gap(active, selection)
+    active["calibration_state"] = _build_calibration_state(active, selection, ctx.config)
     if selection.get("enabled"):
         active_values = [
             active.get("pools", {}).get(pool, {}).get("active_tau")

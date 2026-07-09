@@ -73,6 +73,17 @@ def _safe_ratio(num: Optional[float], den: Optional[float]) -> Optional[float]:
     return float(num) / float(den)
 
 
+def _pool_sizes_from_config(cfg: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    mcfg = cfg.get("model", {})
+    n_rst = mcfg.get("n_rst", mcfg.get("n_know"))
+    return {
+        "q": int(mcfg["n_qk"]) if mcfg.get("n_qk") is not None else None,
+        "k": int(mcfg["n_qk"]) if mcfg.get("n_qk") is not None else None,
+        "v": int(mcfg["n_v"]) if mcfg.get("n_v") is not None else None,
+        "rst": int(n_rst) if n_rst is not None else None,
+    }
+
+
 def _log_float(value: Any) -> float:
     try:
         out = float(value)
@@ -112,7 +123,8 @@ def _load_trace_prompts(ctx: AnalysisContext, tokenizer: Any, seq_len: int,
     return prompts
 
 
-def _summarize_trace(trace_np: Dict[str, np.ndarray], actual_len: int) -> Dict[str, Any]:
+def _summarize_trace(trace_np: Dict[str, np.ndarray], actual_len: int,
+                     pool_sizes: Dict[str, Optional[int]]) -> Dict[str, Any]:
     pools: Dict[str, Dict[str, Any]] = {}
     for pool in TRACE_POOLS:
         active = np.asarray(trace_np[f"{pool}_active_count"])[:, 0, :actual_len]
@@ -120,8 +132,12 @@ def _summarize_trace(trace_np: Dict[str, np.ndarray], actual_len: int) -> Dict[s
         top1 = np.asarray(trace_np[f"{pool}_top1_frac"])[:, 0, :actual_len]
         layer_active = active.mean(axis=1) if active.size else np.asarray([])
         layer_top1 = top1.mean(axis=1) if top1.size else np.asarray([])
+        active_mean = _mean(active)
+        pool_size = pool_sizes.get(pool)
         pools[pool] = {
-            "active_mean": _mean(active),
+            "pool_size": pool_size,
+            "active_mean": active_mean,
+            "active_frac_mean": _safe_ratio(active_mean, float(pool_size)) if pool_size else None,
             "active_max": int(np.max(active)) if active.size else None,
             "mass_mean": _mean(mass),
             "top1_mean": _mean(top1),
@@ -169,6 +185,7 @@ def run_train_prompt_trace(ctx: AnalysisContext) -> Dict[str, Any]:
         return {"status": "empty", "prompts": []} if ctx.is_primary else {}
 
     trace_fn = jax.jit(lambda p, x: topk_trace_forward(p, ctx.model_cfg, x, topk=topk))
+    pool_sizes = _pool_sizes_from_config(ctx.config)
     rows = []
     started = time.time()
     for idx, prompt in enumerate(prompts):
@@ -178,7 +195,7 @@ def run_train_prompt_trace(ctx: AnalysisContext) -> Dict[str, Any]:
         trace_np = {key: np.asarray(value) for key, value in trace_host.items()}
         prompt_sec = time.time() - t0
         actual_len = int(prompt.get("length") or 0)
-        summary = _summarize_trace(trace_np, actual_len)
+        summary = _summarize_trace(trace_np, actual_len, pool_sizes)
         row = {
             "prompt_idx": idx,
             "prompt_id": prompt.get("prompt_id", f"prompt-{idx:06d}"),
@@ -211,6 +228,7 @@ def run_train_prompt_trace(ctx: AnalysisContext) -> Dict[str, Any]:
         "num_prompts": len(rows),
         "seq_len": seq_len,
         "topk": topk,
+        "pool_sizes": pool_sizes,
         "sec": time.time() - started,
         "prompts": rows,
     }
@@ -228,19 +246,19 @@ def build_train_prompt_decision(prompt_trace: Dict[str, Any]) -> Dict[str, Any]:
     for prompt in prompt_trace.get("prompts", []):
         summary = prompt.get("summary", {})
         pools = summary.get("pools", {})
-        q_act = pools.get("q", {}).get("active_mean")
-        k_act = pools.get("k", {}).get("active_mean")
-        v_act = pools.get("v", {}).get("active_mean")
-        rst_act = pools.get("rst", {}).get("active_mean")
-        qk_act = None
-        if q_act is not None and k_act is not None:
-            qk_act = (float(q_act) + float(k_act)) * 0.5
+        q_frac = pools.get("q", {}).get("active_frac_mean")
+        k_frac = pools.get("k", {}).get("active_frac_mean")
+        v_frac = pools.get("v", {}).get("active_frac_mean")
+        rst_frac = pools.get("rst", {}).get("active_frac_mean")
+        qk_frac = None
+        if q_frac is not None and k_frac is not None:
+            qk_frac = (float(q_frac) + float(k_frac)) * 0.5
         rst_top1 = pools.get("rst", {}).get("top1_max")
         q_top1 = pools.get("q", {}).get("top1_max")
         k_top1 = pools.get("k", {}).get("top1_max")
         ratio = summary.get("rst_attn_norm_ratio")
         flags = []
-        if qk_act is not None and v_act is not None and qk_act < max(1.0, float(v_act) * 0.25):
+        if qk_frac is not None and v_frac is not None and qk_frac < float(v_frac) * 0.50:
             flags.append("qk_route_thin_vs_v")
         if rst_top1 is not None and float(rst_top1) > 0.25:
             flags.append("rst_concentrated")
@@ -258,9 +276,9 @@ def build_train_prompt_decision(prompt_trace: Dict[str, Any]) -> Dict[str, Any]:
             "prompt_id": prompt.get("prompt_id"),
             "length": prompt.get("length"),
             "status": status,
-            "qk_active_mean": qk_act,
-            "v_active_mean": v_act,
-            "rst_active_mean": rst_act,
+            "qk_active_frac": qk_frac,
+            "v_active_frac": v_frac,
+            "rst_active_frac": rst_frac,
             "rst_top1_max": rst_top1,
             "rst_attn_norm_ratio": ratio,
             "reason": ",".join(flags) if flags else "balanced",
@@ -275,6 +293,16 @@ def build_train_prompt_decision(prompt_trace: Dict[str, Any]) -> Dict[str, Any]:
 
 def _generation_prompts() -> List[str]:
     return _env_list("DAWN_TRAIN_ANALYSIS_GENERATION_PROMPTS") or list(DEFAULT_GENERATION_PROMPTS)
+
+
+def _decode_ids(tokenizer: Any, ids: Sequence[int]) -> str:
+    ids = [int(x) for x in ids]
+    if tokenizer is not None:
+        try:
+            return tokenizer.decode(ids, skip_special_tokens=True)
+        except Exception:
+            pass
+    return "ids:" + " ".join(str(x) for x in ids)
 
 
 def _sample_token(logits: np.ndarray, temperature: float, top_k: int,
@@ -298,30 +326,32 @@ def _sample_token(logits: np.ndarray, temperature: float, top_k: int,
 def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
     args = ctx.args
     tokenizer = maybe_load_tokenizer(local_only=True)
-    if tokenizer is None:
-        if ctx.is_primary:
-            print("TRAIN_ANALYSIS GENERATION SKIP reason=tokenizer_unavailable", flush=True)
-            return {"status": "skipped", "reason": "tokenizer_unavailable", "samples": []}
-        return {}
-
     max_new = int(getattr(args, "train_analysis_generation_max_tokens", 24) or 24)
     temperature = float(getattr(args, "train_analysis_generation_temperature", 0.0) or 0.0)
     top_k = int(getattr(args, "train_analysis_generation_top_k", 50) or 50)
     max_prompts = int(getattr(args, "train_analysis_generation_max_prompts", 3) or 3)
-    prompts = _generation_prompts()[:max_prompts]
+    max_seq = int(ctx.model_cfg.get("max_seq_len", 512))
+    if tokenizer is not None:
+        prompts: List[Any] = _generation_prompts()[:max_prompts]
+    else:
+        prompts = _default_prompts(
+            ctx,
+            seq_len=min(128, max_seq),
+            max_prompts=max_prompts,
+        )
     if getattr(args, "max_jobs_per_stage", None) is not None:
         prompts = prompts[: int(args.max_jobs_per_stage)]
 
     if ctx.is_primary:
         print(
             "TRAIN_ANALYSIS GENERATION START "
-            f"prompts={len(prompts)} max_new={max_new} temp={temperature:g} top_k={top_k}",
+            f"prompts={len(prompts)} max_new={max_new} temp={temperature:g} top_k={top_k} "
+            f"tokenizer={'yes' if tokenizer is not None else 'no'}",
             flush=True,
         )
     if not prompts:
         return {"status": "empty", "samples": []} if ctx.is_primary else {}
 
-    max_seq = int(ctx.model_cfg.get("max_seq_len", 512))
     stop_ids = {
         int(x)
         for x in (getattr(tokenizer, "sep_token_id", None), getattr(tokenizer, "pad_token_id", None), getattr(tokenizer, "eos_token_id", None))
@@ -333,7 +363,14 @@ def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
     samples = []
     started = time.time()
     for idx, prompt in enumerate(prompts):
-        ids = tokenizer.encode(str(prompt), add_special_tokens=False)
+        if isinstance(prompt, dict):
+            prompt_text = prompt.get("text")
+            ids = [int(x) for x in prompt.get("token_ids", [])]
+            prompt_id = str(prompt.get("prompt_id", f"gen-{idx:06d}"))
+        else:
+            prompt_text = str(prompt)
+            ids = tokenizer.encode(str(prompt), add_special_tokens=False)
+            prompt_id = f"gen-{idx:06d}"
         ids = [int(x) for x in ids[: max(1, max_seq - 1)]]
         if not ids:
             continue
@@ -358,12 +395,14 @@ def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
             last_logits = np.asarray(jax.device_get(logits_d[0, :]))
         sec = time.time() - t0
         full_ids = ids + generated
-        full_text = tokenizer.decode(full_ids, skip_special_tokens=True)
-        continuation = tokenizer.decode(generated, skip_special_tokens=True)
+        full_text = _decode_ids(tokenizer, full_ids)
+        continuation = _decode_ids(tokenizer, generated)
         row = {
-            "prompt_id": f"gen-{idx:06d}",
-            "prompt": str(prompt),
+            "prompt_id": prompt_id,
+            "prompt": prompt_text,
+            "prompt_token_ids_head": ids[:32],
             "continuation": continuation,
+            "continuation_token_ids": generated,
             "full_text": full_text,
             "prompt_tokens": len(ids),
             "new_tokens": len(generated),
@@ -386,6 +425,8 @@ def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
     return {
         "status": "ready",
         "num_samples": len(samples),
+        "tokenizer": "bert-base-uncased" if tokenizer is not None else None,
+        "decode_mode": "text" if tokenizer is not None else "token_ids",
         "max_new_tokens": max_new,
         "temperature": temperature,
         "top_k": top_k,

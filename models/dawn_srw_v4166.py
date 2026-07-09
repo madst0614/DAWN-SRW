@@ -4796,6 +4796,22 @@ class DAWN_SRW_V4166(nn.Module):
                     attn_qk_select_diag_all, SELECT_POSITIVE_MARGIN_MEAN),
                 'per_layer_attn_qk_selected_frac': _select_layer(
                     attn_qk_select_diag_all, SELECT_SELECTED_FRAC),
+                'per_layer_attn_q_active_tau_frac': _sparsity_layer(
+                    attn_q_sparsity_diag_all, 'active_tau_frac'),
+                'per_layer_attn_q_admission_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_q_sparsity_diag_all, 'admission_active_eps_1e_2_frac'),
+                'per_layer_attn_q_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_q_sparsity_diag_all, 'active_eps_1e_2_frac'),
+                'per_layer_attn_q_active_n_mean': attn_split_core_all[
+                    :, ATTN_SPLIT_Q_ACTIVE_N_MEAN],
+                'per_layer_attn_k_active_tau_frac': _sparsity_layer(
+                    attn_k_sparsity_diag_all, 'active_tau_frac'),
+                'per_layer_attn_k_admission_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_k_sparsity_diag_all, 'admission_active_eps_1e_2_frac'),
+                'per_layer_attn_k_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_k_sparsity_diag_all, 'active_eps_1e_2_frac'),
+                'per_layer_attn_k_active_n_mean': attn_split_core_all[
+                    :, ATTN_SPLIT_K_ACTIVE_N_MEAN],
                 'per_layer_attn_v_active_tau_frac': _sparsity_layer(
                     attn_v_sparsity_diag_all, 'active_tau_frac'),
                 'per_layer_attn_v_admission_active_eps_1e_2_frac': _sparsity_layer(

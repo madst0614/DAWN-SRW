@@ -67,7 +67,8 @@ python3 -u scripts/analyze_dawn_srw_v4166.py \
 
 `qk_closed`
 : Default diagnosis preset for checking whether QK is closed and why.
-  Items: `target_ratio`, `layer_selectivity`, `prune_breakdown`,
+  Items: `target_ratio`, `layer_selectivity`, `target_quantile_gap`,
+  `calibration_state`, `qk_split`, `concentration_max`, `prune_breakdown`,
   `execution_profile`, `decision_reason`
 
 `compute`
@@ -90,15 +91,17 @@ python3 -u scripts/analyze_dawn_srw_v4166.py \
 
 `v4166_1b`
 : Default item preset selected by launcher `--preset v4166-1B`.
-  Items: `target_ratio`, `layer_selectivity`, `prune_breakdown`,
-  `execution_profile`, `prompt_trace`, `prompt_decision`,
-  `generation_samples`, `decision_reason`
+  Items: `target_ratio`, `layer_selectivity`, `target_quantile_gap`,
+  `calibration_state`, `qk_split`, `concentration_max`, `prune_breakdown`,
+  `execution_profile`, `prompt_trace`,
+  `prompt_decision`, `generation_samples`, `decision_reason`
 
 `deep`
 : Broad checkpoint-state, prompt-route, and sample-generation check.
-  Items: `target_ratio`, `layer_selectivity`, `prune_breakdown`,
-  `execution_profile`, `prompt_trace`, `prompt_decision`,
-  `generation_samples`, `decision_reason`
+  Items: `target_ratio`, `layer_selectivity`, `target_quantile_gap`,
+  `calibration_state`, `qk_split`, `concentration_max`, `prune_breakdown`,
+  `execution_profile`, `prompt_trace`,
+  `prompt_decision`, `generation_samples`, `decision_reason`
 
 `full`
 : Every canonical item in the pool.
@@ -174,6 +177,78 @@ SELECT_DIST:
   qk   ...
 ```
 
+### target_quantile_gap
+
+Measures the approximate score quantile needed to hit the configured active
+target and the current candidate target, then compares those score levels with
+the current tau. Use this when `SELECT_DIST` says score is below tau and you
+want the size of the boundary mismatch in one row.
+
+The current implementation uses layer-level score summaries, so the source is
+reported as `layer_score_quantile_approx`. If exact operator histograms are
+added later, the item id can stay the same.
+
+Summary example:
+
+```text
+TARGET_QUANTILE_GAP:
+  source=layer_score_quantile_approx
+  pool target candidate q@target q@candidate tau gap_target gap_candidate
+  qk   0.080  0.160     -0.0450  -0.0650     0.0715 +0.1165   +0.1365
+```
+
+### calibration_state
+
+Measures target, candidate, observed admission, admission error, tau, and
+whether dynamic tau updates are visible from the checkpoint/config. Use this
+when selection calibration is enabled but observed admission is not moving
+toward `candidate_now`.
+
+`tau_before`, `tau_delta`, `clamp`, and `stopgrad` remain `n/a` unless those
+values are emitted by the training/checkpoint path. This is intentional: `n/a`
+is safer than a misleading zero.
+
+Summary example:
+
+```text
+CALIBRATION_STATE:
+  pool target candidate observed_adm error tau_before tau_after tau_delta clamp stopgrad mode
+  qk   0.080  0.160     0.030        -0.130 n/a        0.0715    n/a       n/a   n/a      enabled/static_tau_lr0
+```
+
+### qk_split
+
+Separates Q and K sparse activity instead of reporting only merged QK. Use this
+when QK is thin and prompt traces suggest Q and K are behaving differently.
+
+Summary example:
+
+```text
+QK_SPLIT_SUMMARY:
+  side active_tau admission effective active_ops effective_ops eff_min eff_mean eff_max
+  q    ...
+  k    ...
+  q/k_effective_balance=...
+
+QK_SPLIT_LAYERS:
+  lyr q_act q_adm q_eff q_ops | k_act k_adm k_eff k_ops | qk_eff
+  00  ...
+```
+
+### concentration_max
+
+Finds the layer with the largest per-layer top1 concentration for each pool and
+prints the local active/effective context. Use this when `execution_profile`
+shows a high `top1_max` and you need to know which layer to inspect.
+
+Summary example:
+
+```text
+CONCENTRATION_MAX:
+  pool layer layer_top1 global_top1_max active effective active_ops effective_ops operator_id
+  rst  04    0.204      0.206           ...
+```
+
 ### prune_breakdown
 
 Measures eps-wise pruned eval loss delta, total compute, pool-level compute,
@@ -227,28 +302,30 @@ NUM_HEALTH:
 ### prompt_trace
 
 Measures v4166 prompt-token routing without generating text. It reuses the
-compact top-k trace path and reports q/k/v/rst active counts, gate mass, top1
-concentration, top operator ids, and attention/RST output norms.
+compact top-k trace path and reports pool-size-normalized q/k/v/rst active
+fractions, gate mass, top1 concentration, top operator ids, and attention/RST
+output norms.
 
 Summary example:
 
 ```text
 PROMPT_TRACE:
-  prompt_id       len q_act k_act v_act rst_act q_top1 k_top1 v_top1 rst_top1 rst/attn
+  prompt_id       len q_frac k_frac v_frac rst_frac q_top1 k_top1 v_top1 rst_top1 rst/attn
   text-000000     5   ...
 ```
 
 ### prompt_decision
 
 Derived from `prompt_trace`. It flags prompt-local route imbalance using qk/v/rst
-activity balance, selector concentration, and RST-vs-attention norm ratio. This
-is the lightweight v4166 replacement for older broad decision-probe scripts.
+pool-size-normalized activity balance, selector concentration, and
+RST-vs-attention norm ratio. This is the lightweight v4166 replacement for
+older broad decision-probe scripts.
 
 Summary example:
 
 ```text
 PROMPT_DECISION:
-  prompt_id       status qk_act v_act rst_act rst_top1 rst/attn reason
+  prompt_id       status qk_frac v_frac rst_frac rst_top1 rst/attn reason
   text-000000     ok     ...
 ```
 
@@ -256,7 +333,9 @@ PROMPT_DECISION:
 
 Uses the v4166 `prefill` and `decode_step` KV-cache inference API to generate a
 few short continuations. Defaults are intentionally small and deterministic:
-three prompts, greedy decoding, and 24 new tokens.
+three prompts, greedy decoding, and 24 new tokens. If the tokenizer is not
+available on the TPU worker, it falls back to validation token prompts and
+prints generated token ids instead of skipping the item.
 
 Summary example:
 
