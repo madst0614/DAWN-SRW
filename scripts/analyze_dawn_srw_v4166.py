@@ -329,7 +329,16 @@ def build_context(args: argparse.Namespace, stages: List[str], store: AnalysisSt
     checkpoint_metadata.update(restored_metadata or {})
     sharded_fns = create_or_reuse_sharded_fns(cfg, mesh, analysis=False)
     sharded_fns_analysis = create_or_reuse_sharded_fns(cfg, mesh, analysis=True)
-    model_cfg = model_cfg_from_config(cfg)
+    steps_per_epoch = int(checkpoint_metadata.get("steps_per_epoch") or 0)
+    num_epochs = int(cfg.get("training", {}).get("num_epochs") or 0)
+    grad_accum = max(1, int(cfg.get("training", {}).get("gradient_accumulation_steps", 1)))
+    planned_steps = (steps_per_epoch // grad_accum) * num_epochs if steps_per_epoch and num_epochs else 0
+    total_training_steps = int(planned_steps or checkpoint_metadata.get("global_step") or checkpoint_step or 1)
+    model_cfg = model_cfg_from_config(
+        cfg,
+        checkpoint_step=int(checkpoint_step),
+        total_training_steps=total_training_steps,
+    )
     n_params = count_params(params)
     info_lines = model.get_model_info() if hasattr(model, "get_model_info") else []
     model_info = {
@@ -338,6 +347,7 @@ def build_context(args: argparse.Namespace, stages: List[str], store: AnalysisSt
         "checkpoint_step": checkpoint_step,
         "checkpoint_path_resolved": checkpoint_dir,
         "mesh": {"data": int(mesh.shape["data"]), "model": int(mesh.shape["model"])},
+        "runtime_gate_state": model_cfg.get("runtime_gate_state"),
     }
     write_run_metadata(store, cfg, args, checkpoint_metadata, model_info)
     if store.is_primary:
@@ -349,11 +359,6 @@ def build_context(args: argparse.Namespace, stages: List[str], store: AnalysisSt
         )
         for line in info_lines:
             print("MODEL " + str(line), flush=True)
-    steps_per_epoch = int(checkpoint_metadata.get("steps_per_epoch") or 0)
-    num_epochs = int(cfg.get("training", {}).get("num_epochs") or 0)
-    grad_accum = max(1, int(cfg.get("training", {}).get("gradient_accumulation_steps", 1)))
-    planned_steps = (steps_per_epoch // grad_accum) * num_epochs if steps_per_epoch and num_epochs else 0
-    total_training_steps = int(planned_steps or checkpoint_metadata.get("global_step") or checkpoint_step or 1)
     return AnalysisContext(
         args=args,
         store=store,
@@ -830,7 +835,8 @@ def _total_steps_from_config(cfg: Dict[str, Any]) -> int:
     return max(1, int(tcfg.get("total_steps_for_restore", 1)))
 
 
-def _selection_status(cfg: Dict[str, Any], step: int, tokens: int) -> Dict[str, Any]:
+def _selection_status(cfg: Dict[str, Any], step: int, tokens: int,
+                      model_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     tcfg = cfg.get("training", {})
     scfg = tcfg.get("selection_calibration", {})
     if not isinstance(scfg, dict):
@@ -856,25 +862,7 @@ def _selection_status(cfg: Dict[str, Any], step: int, tokens: int) -> Dict[str, 
         f = final.get(pool)
         now[pool] = None if s is None or f is None else s + (f - s) * shrink_progress
 
-    total_steps = _total_steps_from_config(cfg)
-    frac = min(1.0, max(0.0, float(step) / max(1.0, float(total_steps))))
-    start_power = float(tcfg.get("soft_gate_boundary_power_start", 3.0))
-    mid_power = float(tcfg.get("soft_gate_boundary_power_mid", start_power))
-    final_power = float(tcfg.get("soft_gate_boundary_power_final", mid_power))
-    start_frac = float(tcfg.get("soft_gate_boundary_power_start_frac", 0.0))
-    mid_frac = float(tcfg.get("soft_gate_boundary_power_mid_frac", 0.8))
-    final_frac = float(tcfg.get("soft_gate_boundary_power_final_frac", 0.95))
-    eps = 1e-6
-    if frac < start_frac:
-        boundary_power = start_power
-    elif frac < mid_frac:
-        u = min(1.0, max(0.0, (frac - start_frac) / max(mid_frac - start_frac, eps)))
-        boundary_power = start_power + (mid_power - start_power) * (u * u)
-    elif frac < final_frac:
-        u = min(1.0, max(0.0, (frac - mid_frac) / max(final_frac - mid_frac, eps)))
-        boundary_power = mid_power + (final_power - mid_power) * u
-    else:
-        boundary_power = final_power
+    boundary_power = _safe_float((model_cfg or {}).get("soft_gate_boundary_power"))
 
     return {
         "enabled": bool(scfg.get("enabled", False)),
@@ -887,23 +875,6 @@ def _selection_status(cfg: Dict[str, Any], step: int, tokens: int) -> Dict[str, 
         "shrink_progress": shrink_progress,
         "soft_gate_boundary_power_now": boundary_power,
     }
-
-
-def _train_analysis_inference_model_cfg(ctx: AnalysisContext,
-                                        selection: Dict[str, Any]) -> Dict[str, Any]:
-    model_cfg = dict(ctx.model_cfg)
-    tcfg = ctx.config.get("training", {})
-    boundary_power = _safe_float(selection.get("soft_gate_boundary_power_now"))
-    if boundary_power is not None:
-        model_cfg["soft_gate_boundary_power"] = boundary_power
-    for key in ("admission_den_power", "soft_gate_effective_active_eps"):
-        value = _safe_float(tcfg.get(key))
-        if value is not None:
-            model_cfg[key] = value
-    temp = _safe_float(tcfg.get("soft_gate_t_final", tcfg.get("soft_gate_temperature")))
-    if temp is not None:
-        model_cfg["soft_gate_temperature"] = temp
-    return model_cfg
 
 
 def _pool_sizes(cfg: Dict[str, Any]) -> Dict[str, Optional[int]]:
@@ -2003,8 +1974,8 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     max_batches = max(1, int(args.train_analysis_max_batches or DEFAULT_TRAIN_ANALYSIS_BATCHES))
     eps_values = _parse_float_list(args.prune_eps or DEFAULT_TRAIN_ANALYSIS_PRUNE_EPS)
     progress = _progress_status(ctx, info)
-    selection = _selection_status(ctx.config, progress["step"], progress["tokens"])
-    ctx.model_cfg = _train_analysis_inference_model_cfg(ctx, selection)
+    selection = _selection_status(
+        ctx.config, progress["step"], progress["tokens"], ctx.model_cfg)
     active = _run_active_dynamics(ctx, max_batches) if "active" in required_sections else {}
     prune = _run_prune_light(ctx, max_batches, eps_values) if "prune" in required_sections else {}
     prompt_trace = run_train_prompt_trace(ctx) if "prompt_trace" in required_sections else {}

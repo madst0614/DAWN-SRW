@@ -484,10 +484,78 @@ def restore_params_and_cfg(config: Dict[str, Any], checkpoint_path: str,
         manager.close()
 
 
-def model_cfg_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _scalar_float(value: Any) -> float:
+    return float(np.asarray(jax.device_get(value)).reshape(()))
+
+
+def scheduled_gate_state_from_config(
+        cfg: Dict[str, Any],
+        checkpoint_step: int,
+        total_training_steps: int) -> Dict[str, Any]:
+    """Return trainer-matched runtime gate values for an analysis checkpoint."""
+    t = cfg.get("training", {})
+    train = get_train()
+    soft_gate_t_start = float(t.get("soft_gate_t_start", 1.5))
+    soft_gate_t_final = float(t.get("soft_gate_t_final", 0.07))
+    soft_gate_t_hold_frac = float(t.get("soft_gate_t_hold_frac", 0.10))
+    soft_gate_t_anneal_end_frac = float(t.get("soft_gate_t_anneal_end_frac", 0.80))
+    soft_gate_schedule = str(t.get(
+        "soft_gate_t_schedule",
+        t.get("soft_gate_schedule", "cosine")))
+    soft_gate_t_power = float(t.get("soft_gate_t_power", 4.0))
+    soft_gate_t_gompertz_center = float(t.get("soft_gate_t_gompertz_center", 0.25))
+    soft_gate_t_gompertz_steepness = float(
+        t.get("soft_gate_t_gompertz_steepness", 8.0))
+    pool_schedules = train._training_soft_gate_pool_schedules(
+        t,
+        soft_gate_t_start,
+        soft_gate_t_final,
+        soft_gate_t_hold_frac,
+        soft_gate_t_anneal_end_frac,
+        soft_gate_schedule,
+        soft_gate_t_power,
+        soft_gate_t_gompertz_center,
+        soft_gate_t_gompertz_steepness,
+    )
+    step = jnp.asarray(int(checkpoint_step), dtype=jnp.float32)
+    total = jnp.asarray(max(1, int(total_training_steps or 1)), dtype=jnp.float32)
+    qk_t = train._scheduled_from_config(step, total, pool_schedules["qk"])
+    v_t = train._scheduled_from_config(step, total, pool_schedules["v"])
+    rst_t = train._scheduled_from_config(step, total, pool_schedules["rst"])
+    boundary_power = train.scheduled_boundary_power_by_frac(
+        step,
+        total,
+        True,
+        float(t.get("soft_gate_boundary_power_start", 3.0)),
+        float(t.get("soft_gate_boundary_power_mid", 3.15)),
+        float(t.get("soft_gate_boundary_power_final", 4.0)),
+        float(t.get("soft_gate_boundary_power_mid_frac", 0.800)),
+        float(t.get("soft_gate_boundary_power_final_frac", 0.950)),
+        float(t.get("soft_gate_boundary_power_start_frac", 0.0)),
+    )
+    qk_t_f = _scalar_float(qk_t)
+    return {
+        "source": "train_jax_schedule",
+        "checkpoint_step": int(checkpoint_step),
+        "total_training_steps": int(total_training_steps or 1),
+        "soft_gate_temperature": qk_t_f,
+        "soft_gate_T": qk_t_f,
+        "soft_gate_T_qk": qk_t_f,
+        "soft_gate_T_v": _scalar_float(v_t),
+        "soft_gate_T_rst": _scalar_float(rst_t),
+        "soft_gate_boundary_power": _scalar_float(boundary_power),
+        "soft_gate_boundary_power_final": float(
+            t.get("soft_gate_boundary_power_final", 4.0)),
+    }
+
+
+def model_cfg_from_config(
+        cfg: Dict[str, Any],
+        checkpoint_step: Optional[int] = None,
+        total_training_steps: Optional[int] = None) -> Dict[str, Any]:
     m = cfg.get("model", {})
     t = cfg.get("training", {})
-    return {
+    model_cfg = {
         "model_version": m.get("model_version", V4166_MODEL_VERSION),
         "vocab_size": int(m.get("vocab_size", 30522)),
         "d_model": int(m.get("d_model", 384)),
@@ -505,6 +573,12 @@ def model_cfg_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "soft_gate_effective_active_eps": float(t.get("soft_gate_effective_active_eps", 1e-6)),
         "execution_prune_eps": float(m.get("execution_prune_eps", 0.0)),
     }
+    if checkpoint_step is not None and total_training_steps is not None:
+        gate_state = scheduled_gate_state_from_config(
+            cfg, int(checkpoint_step), int(total_training_steps))
+        model_cfg.update(gate_state)
+        model_cfg["runtime_gate_state"] = dict(gate_state)
+    return model_cfg
 
 
 def count_params(params: Any) -> int:
