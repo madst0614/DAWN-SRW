@@ -26,6 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import jax
+import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from analysis import ANALYSIS_VERSION
