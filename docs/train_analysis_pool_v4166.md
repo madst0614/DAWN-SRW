@@ -58,6 +58,19 @@ List the available presets, aliases, and items:
 python3 -u scripts/analyze_dawn_srw_v4166.py --list-train-analysis-items
 ```
 
+Prepare the public/operator datasets on a Google Cloud VM and mirror them into
+the default dataset folder:
+
+```bash
+python3 -u scripts/prepare_v4166_operator_datasets.py
+```
+
+Default dataset root:
+
+```text
+gs://dawn-tpu-data-c4/dataset/v4166_operator_analysis
+```
+
 Run with a preset:
 
 ```bash
@@ -102,6 +115,18 @@ python3 -u scripts/analyze_dawn_srw_v4166.py \
 `sample`
 : Short qualitative generation check.
   Items: `target_ratio`, `generation_samples`, `decision_reason`
+
+`operator_datasets`
+: Path-contract check for the mirrored public/operator datasets.
+  Items: `operator_dataset_manifest`
+
+`operator_analysis`
+: Dataset-backed operator-family experiment plan. It does not run the full
+  experiments by itself; it exposes the exact GCS paths and behavior metrics
+  that TPU-side RAVEL/IOI/BLiMP/LAMA/CounterFact/synthetic analyses should use.
+  Items: `operator_dataset_manifest`, `ravel_operator_disentanglement`,
+  `ioi_operator_circuit`, `blimp_operator_grammar`,
+  `lama_counterfact_factual_recall`, `synthetic_binding_sanity`
 
 `v4166_1b`
 : Default item preset selected by launcher `--preset v4166-1B`.
@@ -150,6 +175,30 @@ Old item ids still work, but they are canonicalized before execution and output:
 
 `samples`
 : alias for `generation_samples`
+
+`dataset_manifest`
+: alias for `operator_dataset_manifest`
+
+`operator_manifest`
+: alias for `operator_dataset_manifest`
+
+`ravel`
+: alias for `ravel_operator_disentanglement`
+
+`ioi`
+: alias for `ioi_operator_circuit`
+
+`blimp`
+: alias for `blimp_operator_grammar`
+
+`lama`
+: alias for `lama_counterfact_factual_recall`
+
+`counterfact`
+: alias for `lama_counterfact_factual_recall`
+
+`synthetic`
+: alias for `synthetic_binding_sanity`
 
 ## Items
 
@@ -365,6 +414,59 @@ GENERATION_SAMPLES:
     full     : ...
     first_top: ...
 ```
+
+### operator_dataset_manifest
+
+Reports the configured dataset root, the manifest path, and the per-dataset GCS
+roots prepared by `scripts/prepare_v4166_operator_datasets.py`.
+
+Default root:
+
+```text
+gs://dawn-tpu-data-c4/dataset/v4166_operator_analysis
+```
+
+Summary example:
+
+```text
+OPERATOR_DATASET_MANIFEST:
+  root     : gs://dawn-tpu-data-c4/dataset/v4166_operator_analysis
+  manifest : gs://dawn-tpu-data-c4/dataset/v4166_operator_analysis/manifest.json
+  prepare  : python3 -u scripts/prepare_v4166_operator_datasets.py
+  id          root
+  ravel       gs://dawn-tpu-data-c4/dataset/v4166_operator_analysis/ravel
+```
+
+### ravel_operator_disentanglement
+
+Dataset-backed plan for RAVEL attribute operator disentanglement. The prepared
+paths include the raw `data.tgz` plus HuggingFace parquet splits for
+`city_entity` and `city_prompt`. The intended behavior metric is answer logit
+margin over attribute-value distractors; the operator metric is same-attribute
+overlap and cross-attribute causal drop.
+
+### ioi_operator_circuit
+
+Generated IOI prompts for clean/corrupt name swaps. The intended behavior
+metric is correct indirect-object logit minus distractor subject logit, and the
+operator metric is clean/corrupt gate delta plus QK/V/RST causal drop.
+
+### blimp_operator_grammar
+
+Prepared BLiMP parquet files for all 67 phenomena. The intended behavior metric
+is good-sentence likelihood minus bad-sentence likelihood, grouped by
+phenomenon and critical token.
+
+### lama_counterfact_factual_recall
+
+Prepared LAMA `data.zip` and CounterFact JSON. The intended behavior metric is
+known-fact/rewrite object logit margin, with relation-specific QK/V/RST
+operator ablations.
+
+### synthetic_binding_sanity
+
+Generated controlled binding-retrieval examples. This is a sanity-check
+dataset for entity binding, attribute query, and residual write decomposition.
 
 ### decision_reason
 

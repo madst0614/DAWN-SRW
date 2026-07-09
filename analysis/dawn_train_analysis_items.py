@@ -11,6 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
+from analysis.dawn_operator_datasets import (
+    OPERATOR_ANALYSIS_ITEM_IDS,
+    OPERATOR_DATASET_SPECS,
+)
+
 
 DEFAULT_TRAIN_ANALYSIS_PRESET = "qk_closed"
 
@@ -87,6 +92,42 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
         "summary": "GENERATION_SAMPLES gives a quick qualitative read on the current checkpoint.",
         "requires": ("generation",),
     },
+    "operator_dataset_manifest": {
+        "title": "Operator dataset manifest",
+        "measures": "configured GCS dataset root, manifest path, per-dataset artifact paths, and observed public dataset sizes.",
+        "summary": "OPERATOR_DATASET_MANIFEST is the path contract for TPU-side operator-family experiments.",
+        "requires": ("operator_datasets",),
+    },
+    "ravel_operator_disentanglement": {
+        "title": "RAVEL operator disentanglement",
+        "measures": "attribute-specific gate signatures, same-attribute overlap, and cross-attribute causal drops.",
+        "summary": "RAVEL checks whether operation space is addressable by semantic attribute rather than entity memorization.",
+        "requires": ("operator_datasets",),
+    },
+    "ioi_operator_circuit": {
+        "title": "IOI operator circuit",
+        "measures": "clean/corrupt gate deltas and QK/V/RST causal drops for indirect-object identification.",
+        "summary": "IOI checks whether the known name circuit appears as selected RW operator families.",
+        "requires": ("operator_datasets",),
+    },
+    "blimp_operator_grammar": {
+        "title": "BLiMP operator grammar",
+        "measures": "minimal-pair likelihood margins and phenomenon-specific operator ablations.",
+        "summary": "BLiMP checks whether reusable grammar phenomena map to reusable operator families.",
+        "requires": ("operator_datasets",),
+    },
+    "lama_counterfact_factual_recall": {
+        "title": "LAMA/CounterFact factual recall",
+        "measures": "known-fact relation margins, true/new object margins, and relation-specific RST/QK/V causal drops.",
+        "summary": "LAMA/CounterFact checks whether factual recall is mediated by relation-specific residual-write operators.",
+        "requires": ("operator_datasets",),
+    },
+    "synthetic_binding_sanity": {
+        "title": "Synthetic binding sanity",
+        "measures": "controlled entity-attribute binding margins and operator family specificity.",
+        "summary": "Synthetic binding provides a small controlled sanity check for entity binding and retrieval writes.",
+        "requires": ("operator_datasets",),
+    },
     "decision_reason": {
         "title": "Decision reason",
         "measures": "explicit numeric guardrails behind the final keep/watch/change decision.",
@@ -105,6 +146,14 @@ TRAIN_ANALYSIS_ITEM_ALIASES = {
     "decision_probe": "prompt_decision",
     "generation": "generation_samples",
     "samples": "generation_samples",
+    "dataset_manifest": "operator_dataset_manifest",
+    "operator_manifest": "operator_dataset_manifest",
+    "ravel": "ravel_operator_disentanglement",
+    "ioi": "ioi_operator_circuit",
+    "blimp": "blimp_operator_grammar",
+    "lama": "lama_counterfact_factual_recall",
+    "counterfact": "lama_counterfact_factual_recall",
+    "synthetic": "synthetic_binding_sanity",
 }
 
 V4166_1B_ITEMS = (
@@ -139,6 +188,8 @@ TRAIN_ANALYSIS_PRESETS = {
     "health": ("target_ratio", "layer_selectivity", "num_health", "decision_reason"),
     "prompt_debug": ("target_ratio", "layer_selectivity", "prompt_trace", "prompt_decision", "decision_reason"),
     "sample": ("target_ratio", "generation_samples", "decision_reason"),
+    "operator_datasets": ("operator_dataset_manifest",),
+    "operator_analysis": OPERATOR_ANALYSIS_ITEM_IDS,
     "v4166_1b": V4166_1B_ITEMS,
     "deep": V4166_1B_ITEMS,
     "full": tuple(TRAIN_ANALYSIS_ITEM_DEFS.keys()),
@@ -149,6 +200,9 @@ TRAIN_ANALYSIS_PRESET_ALIASES = {
     "v4166-1p3b": "v4166_1b",
     "v4166-1p3b-c4-20b": "v4166_1b",
     "v4166-1p3b-c4-20b-v4-64": "v4166_1b",
+    "operator": "operator_analysis",
+    "operator-analysis": "operator_analysis",
+    "operator-datasets": "operator_datasets",
 }
 
 
@@ -649,6 +703,83 @@ def _item_lines_generation_samples(summary: Dict[str, Any], fmt: TrainAnalysisFo
     return out
 
 
+def _operator_dataset_block(summary: Dict[str, Any], dataset_id: str) -> List[str]:
+    datasets = summary.get("operator_analysis_datasets", {})
+    root = datasets.get("root", "n/a")
+    manifest = datasets.get("manifest", "n/a")
+    rows = datasets.get("datasets", {})
+    spec = rows.get(dataset_id, {})
+    if not spec:
+        return [
+            f"  dataset_root : {root}",
+            f"  manifest     : {manifest}",
+            f"  dataset      : {dataset_id} missing from configured registry",
+        ]
+    artifacts = spec.get("artifacts", {})
+    expected = spec.get("expected", {})
+    out = [
+        f"  dataset_root : {root}",
+        f"  manifest     : {manifest}",
+        f"  dataset      : {dataset_id}",
+        f"  title        : {spec.get('title', 'n/a')}",
+        f"  task_variable: {spec.get('task_variable', 'n/a')}",
+        f"  metric       : {spec.get('behavior_metric', 'n/a')}",
+        f"  operator_q   : {spec.get('operator_question', 'n/a')}",
+        f"  root         : {spec.get('root', 'n/a')}",
+    ]
+    if expected:
+        out.append(
+            "  expected     : "
+            + " ".join(f"{key}={value}" for key, value in sorted(expected.items()))
+        )
+    if artifacts:
+        out.append("  artifacts:")
+        for name, path in sorted(artifacts.items()):
+            out.append(f"    {name:<20} {path}")
+    return out
+
+
+def _item_lines_operator_dataset_manifest(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
+    datasets = summary.get("operator_analysis_datasets", {})
+    rows = datasets.get("datasets", {})
+    out = [
+        "  OPERATOR_DATASET_MANIFEST:",
+        f"  root     : {datasets.get('root', 'n/a')}",
+        f"  manifest : {datasets.get('manifest', 'n/a')}",
+        f"  prepare  : {datasets.get('prepare_command', 'n/a')}",
+        "  id          root",
+    ]
+    for dataset_id in OPERATOR_DATASET_SPECS:
+        row = rows.get(dataset_id, {})
+        out.append(f"  {dataset_id:<11} {row.get('root', 'n/a')}")
+    return out
+
+
+def _item_lines_ravel_operator_disentanglement(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
+    return ["  RAVEL_OPERATOR_DISENTANGLEMENT:"] + _operator_dataset_block(summary, "ravel")
+
+
+def _item_lines_ioi_operator_circuit(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
+    return ["  IOI_OPERATOR_CIRCUIT:"] + _operator_dataset_block(summary, "ioi")
+
+
+def _item_lines_blimp_operator_grammar(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
+    return ["  BLIMP_OPERATOR_GRAMMAR:"] + _operator_dataset_block(summary, "blimp")
+
+
+def _item_lines_lama_counterfact_factual_recall(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
+    return (
+        ["  LAMA_COUNTERFACT_FACTUAL_RECALL:"]
+        + _operator_dataset_block(summary, "lama")
+        + ["", "  COUNTERFACT:"]
+        + _operator_dataset_block(summary, "counterfact")
+    )
+
+
+def _item_lines_synthetic_binding_sanity(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
+    return ["  SYNTHETIC_BINDING_SANITY:"] + _operator_dataset_block(summary, "synthetic")
+
+
 def _item_lines_decision_reason(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
     return [f"  - {line_i}" for line_i in (summary.get("decision") or ["n/a"])]
 
@@ -666,6 +797,12 @@ TRAIN_ANALYSIS_ITEM_FORMATTERS = {
     "prompt_trace": _item_lines_prompt_trace,
     "prompt_decision": _item_lines_prompt_decision,
     "generation_samples": _item_lines_generation_samples,
+    "operator_dataset_manifest": _item_lines_operator_dataset_manifest,
+    "ravel_operator_disentanglement": _item_lines_ravel_operator_disentanglement,
+    "ioi_operator_circuit": _item_lines_ioi_operator_circuit,
+    "blimp_operator_grammar": _item_lines_blimp_operator_grammar,
+    "lama_counterfact_factual_recall": _item_lines_lama_counterfact_factual_recall,
+    "synthetic_binding_sanity": _item_lines_synthetic_binding_sanity,
     "decision_reason": _item_lines_decision_reason,
 }
 
@@ -735,6 +872,19 @@ def item_status(summary: Dict[str, Any], item: str) -> str:
     if item == "generation_samples":
         generation = summary.get("generation_samples", {})
         return str(generation.get("status") or "missing")
+    if item == "operator_dataset_manifest":
+        datasets = summary.get("operator_analysis_datasets", {})
+        return "ready" if datasets.get("manifest") and datasets.get("datasets") else "missing"
+    if item in OPERATOR_ANALYSIS_ITEM_IDS:
+        dataset_key = {
+            "ravel_operator_disentanglement": "ravel",
+            "ioi_operator_circuit": "ioi",
+            "blimp_operator_grammar": "blimp",
+            "lama_counterfact_factual_recall": "lama",
+            "synthetic_binding_sanity": "synthetic",
+        }.get(item)
+        datasets = summary.get("operator_analysis_datasets", {}).get("datasets", {})
+        return "ready" if dataset_key in datasets else "missing"
     if item == "decision_reason":
         return "ready" if summary.get("decision") else "missing"
     return "unknown"

@@ -64,6 +64,10 @@ from analysis.dawn_analysis_storage import (
     write_json_atomic,
     write_text_atomic,
 )
+from analysis.dawn_operator_datasets import (
+    DEFAULT_OPERATOR_DATASET_ROOT,
+    operator_dataset_summary,
+)
 from analysis.dawn_train_analysis_items import (
     DEFAULT_TRAIN_ANALYSIS_PRESET,
     TRAIN_ANALYSIS_PRESETS,
@@ -206,6 +210,11 @@ def parse_args() -> argparse.Namespace:
         "--list-train-analysis-items",
         action="store_true",
         help="Print train-analysis item/preset catalog and exit.",
+    )
+    p.add_argument(
+        "--operator-dataset-root",
+        default=os.environ.get("DAWN_OPERATOR_DATASET_ROOT", DEFAULT_OPERATOR_DATASET_ROOT),
+        help="Operator-analysis dataset root prepared by scripts/prepare_v4166_operator_datasets.py.",
     )
     p.add_argument(
         "--train-analysis-generation-max-prompts",
@@ -2019,6 +2028,7 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
         "prompt_trace": prompt_trace,
         "prompt_decision": prompt_decision,
         "generation_samples": generation_samples,
+        "operator_analysis_datasets": operator_dataset_summary(args.operator_dataset_root),
         "reference_400m": compare,
         "warnings": warnings,
     }
