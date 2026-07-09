@@ -58,6 +58,7 @@ OUTPUT_EXPLICIT="0"
 MODE_EXPLICIT="0"
 CHECKPOINT_DIR_EXPLICIT="0"
 PRUNE_EPS_EXPLICIT="0"
+REMOTE_LOG_EXPLICIT="0"
 
 TRAIN_ANALYSIS_CONFIG="${DAWN_TRAIN_ANALYSIS_CONFIG:-}"
 TRAIN_ANALYSIS_CHECKPOINT_DIR="${DAWN_TRAIN_ANALYSIS_CHECKPOINT_DIR:-gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new}"
@@ -132,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --workers) WORKERS="$2"; shift 2 ;;
         --foreground) DETACH="0"; DETACH_EXPLICIT="1"; shift ;;
         --detach) DETACH="1"; DETACH_EXPLICIT="1"; shift ;;
+        --log) REMOTE_LOG="$2"; REMOTE_LOG_EXPLICIT="1"; shift 2 ;;
         --no-install) INSTALL_DEPS="0"; shift ;;
         --dry-run) DRY_RUN="1"; shift ;;
         --from-scratch) ANALYSIS_ARGS="$ANALYSIS_ARGS --from-scratch"; shift ;;
@@ -168,6 +170,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --stages CSV              Default: $STAGES"
             echo "  --branch BRANCH           Default: $BRANCH"
             echo "  --repo-url URL            Default: $REPO_URL"
+            echo "  --log PATH                Remote log path. Default: ~/train.log"
             echo ""
             echo "TPU/GCP:"
             echo "  --zone ZONE               Default: $ZONE"
@@ -230,12 +233,6 @@ if [[ "$MODE" == "train_analysis" ]]; then
             OUTPUT="${TRAIN_ANALYSIS_CHECKPOINT_DIR%/}/side_analysis"
         fi
     fi
-    if [[ "$DETACH_EXPLICIT" == "0" ]]; then
-        DETACH="0"
-    fi
-    if [[ "$TMUX_SESSION" == "train" ]]; then
-        TMUX_SESSION="train_analysis"
-    fi
 fi
 
 if [[ "$WORKERS" = "auto" ]]; then
@@ -264,6 +261,9 @@ if [[ "$MODE" == "train_analysis" ]]; then
     fi
     if [[ "$OUTPUT_EXPLICIT" == "1" ]]; then
         COPY_CMD="$COPY_CMD --output $OUTPUT"
+    fi
+    if [[ "$REMOTE_LOG_EXPLICIT" == "1" ]]; then
+        COPY_CMD="$COPY_CMD --log $REMOTE_LOG"
     fi
 fi
 WATCH_REPEAT_CMD="watch -n 300 '$COPY_CMD'"
@@ -388,12 +388,23 @@ if [[ "$MODE" == "train_analysis" ]]; then
 read -r -d '' CLEANUP_CMD <<'EOFCLEANUP' || true
 set -e
 ANALYSIS_PATTERN="[a]nalyze_dawn_srw_v4166"
-tmux kill-session -t train_analysis 2>/dev/null || true
+TRAIN_JAX_PATTERN="[t]rain_jax"
+TRAIN_JAX_MINIMAL_PATTERN="[t]rain_jax_minimal"
+PYTHON_PATTERN="[p]ython3"
+PGREP_PATTERN="${ANALYSIS_PATTERN}|${TRAIN_JAX_PATTERN}|${TRAIN_JAX_MINIMAL_PATTERN}|${PYTHON_PATTERN} scripts"
+tmux kill-session -t train 2>/dev/null || true
+pkill -9 -f "${PYTHON_PATTERN} scripts/${ANALYSIS_PATTERN}\\.py" || true
+pkill -9 -f "${PYTHON_PATTERN} scripts/${TRAIN_JAX_PATTERN}\\.py" || true
+pkill -9 -f "${PYTHON_PATTERN} scripts/${TRAIN_JAX_MINIMAL_PATTERN}\\.py" || true
 pkill -9 -f "${ANALYSIS_PATTERN}\\.py" || true
-sleep 2
-REMAINING="$(pgrep -af "${ANALYSIS_PATTERN}" || true)"
+pkill -9 -f "${TRAIN_JAX_PATTERN}\\.py" || true
+pkill -9 -f "${TRAIN_JAX_MINIMAL_PATTERN}\\.py" || true
+sudo lsof /dev/accel* 2>/dev/null | grep -v PID | awk '{print $2}' | sort -u | xargs -r sudo kill -9 || true
+sleep 3
+pgrep -af "$PGREP_PATTERN" || true
+REMAINING="$(pgrep -af "$PGREP_PATTERN" || true)"
 if [ -n "$REMAINING" ]; then
-    echo "ERROR: DAWN analysis process remains after cleanup:" >&2
+    echo "ERROR: DAWN train/analysis process remains after cleanup:" >&2
     echo "$REMAINING" >&2
     exit 1
 fi
@@ -432,7 +443,7 @@ cleanup_target_workers() {
     return "$failed"
 }
 
-if [[ "$MODE" == "train_analysis" ]]; then
+if [[ "$MODE" == "train_analysis" && "$DETACH" == "0" ]]; then
     echo "Cleaning old train_analysis processes on target worker(s)..."
 else
     echo "Cleaning old train/analysis processes on target worker(s)..."
@@ -460,7 +471,7 @@ INSTALL_DEPS='${INSTALL_DEPS}'
 TMUX_SESSION='${TMUX_SESSION}'
 REMOTE_LOG='${REMOTE_LOG}'
 REMOTE_LOG_PATH="\${REMOTE_LOG/#\\~/\$HOME}"
-WORK_DIR="\$HOME/dawn-spatial"
+WORK_DIR="\$HOME/DAWN-SRW"
 
 echo "=== DAWN v4166 analysis worker startup ==="
 echo "HOSTNAME=\$(hostname)"
@@ -482,10 +493,12 @@ if [ -d "\$WORK_DIR/.git" ]; then
     cd "\$WORK_DIR"
     git fetch origin "\$BRANCH" --depth 1
     git checkout -B "\$BRANCH" FETCH_HEAD
+    echo "Repo updated to \$BRANCH"
 else
     rm -rf "\$WORK_DIR"
     git clone -b "\$BRANCH" --single-branch --depth 1 "\$REPO_URL" "\$WORK_DIR"
     cd "\$WORK_DIR"
+    echo "Repo cloned (branch: \$BRANCH)"
 fi
 
 if [ "\$INSTALL_DEPS" = "1" ]; then
@@ -534,7 +547,7 @@ cd "\$WORK_DIR"
 if [ "\$DETACH" = "1" ]; then
     echo "[run] starting tmux session \$TMUX_SESSION"
     tmux kill-session -t "\$TMUX_SESSION" 2>/dev/null || true
-    tmux new-session -d -s "\$TMUX_SESSION" \
+    tmux new-session -d -x 240 -y 60 -s "\$TMUX_SESSION" \
         "cd '\$WORK_DIR'; export PYTHONUNBUFFERED=1; export DAWN_ANALYSIS_INIT_DISTRIBUTED=1; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; { echo '=== TPU analysis process startup ==='; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"CMD: \$ANALYSIS_CMD_STR\"; \$ANALYSIS_CMD_STR; } 2>&1 | tee '\$REMOTE_LOG_PATH'; echo 'Analysis finished. Press enter to close.'; read"
     echo "[run] detached in tmux session \$TMUX_SESSION, log=\$REMOTE_LOG_PATH"
 else
@@ -572,7 +585,7 @@ if [ "${#FAILED_WORKERS[@]}" -gt 0 ]; then
 fi
 
 echo ""
-if [[ "$MODE" == "train_analysis" ]]; then
+if [[ "$MODE" == "train_analysis" && "$DETACH" == "0" ]]; then
     SUMMARY_LOG=""
     SUMMARY_WORKER=""
     for worker in "${TARGET_WORKERS[@]}"; do
@@ -608,13 +621,13 @@ if [[ "$MODE" == "train_analysis" ]]; then
     exit 0
 fi
 
-echo "Launch request sent."
-echo "  tmux session: $TMUX_SESSION"
-echo "  Primary log: $WATCH_LOG_CMD"
-echo "  Primary pane: bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --pane"
-echo "  Attach primary pane: bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --attach"
+echo "Launch complete. Analysis is running in tmux session '$TMUX_SESSION' on target workers."
+echo "  Primary log:     bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT"
+echo "  Primary pane:    bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --pane"
+echo "  Attach primary:  bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --attach"
 echo "  Primary summary: bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --summary"
-echo "  All hosts summary: bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --all --summary"
+echo "  All summary:     bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --all --summary"
 echo "  Literal worker 0 log: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/train.log'"
 echo "  Attach literal worker 0: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tmux attach -t train'"
+echo "  Kill:    gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=all --command='tmux kill-session -t train'"
 echo "  Your capture flow works on whichever worker you attach: tmux pipe-pane -t train 'cat >> ~/rebuttal_log.txt'"
