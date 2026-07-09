@@ -404,6 +404,24 @@ def _fmt_delta(value: Any, digits: int = 4) -> str:
     return f"{value_f:+.{digits}f}"
 
 
+def _fmt_pct(value: Any, digits: int = 1) -> str:
+    value_f = _safe_float(value)
+    if value_f is None:
+        return "n/a"
+    return f"{value_f * 100.0:.{digits}f}%"
+
+
+def _fmt_eps(value: Any) -> str:
+    value_f = _safe_float(value)
+    if value_f is None:
+        return "n/a"
+    if value_f == 0.0:
+        return "0"
+    if abs(value_f) < 1.0:
+        return f"{value_f:.0e}".replace("e-0", "e-").replace("e+0", "e+")
+    return f"{value_f:g}"
+
+
 def _fmt_tokens(value: Any) -> str:
     value_f = _safe_float(value)
     if value_f is None:
@@ -827,6 +845,7 @@ def _run_prune_light(ctx: AnalysisContext, max_batches: int, eps_values: List[fl
     eps_with_base = [0.0] + [eps for eps in eps_values if float(eps) != 0.0]
     summaries = []
     base_loss = None
+    baseline = None
     for eps in eps_with_base:
         loader = load_eval_data(
             ctx.config,
@@ -916,6 +935,7 @@ def _run_prune_light(ctx: AnalysisContext, max_batches: int, eps_values: List[fl
         }
         if float(eps) == 0.0:
             base_loss = summary["val_loss"]
+            baseline = summary
         if base_loss is not None and summary["val_loss"] is not None:
             summary["loss_delta"] = float(summary["val_loss"]) - float(base_loss)
         else:
@@ -934,6 +954,7 @@ def _run_prune_light(ctx: AnalysisContext, max_batches: int, eps_values: List[fl
         return {}
     return {
         "base_loss": base_loss,
+        "baseline": baseline,
         "eps": summaries,
     }
 
@@ -1069,11 +1090,19 @@ def _trend_rows(store: AnalysisStore, current: Dict[str, Any], warnings: List[st
 def _scalar_row(summary: Dict[str, Any]) -> Dict[str, Any]:
     active = summary.get("active_dynamics", {})
     pools = active.get("pools", {})
-    prune = summary.get("effective_prune", {}).get("eps", [])
+    prune_summary = summary.get("effective_prune", {})
+    prune = prune_summary.get("eps", [])
+    baseline = prune_summary.get("baseline", {})
     compute_1e4 = next(
         (row.get("compute_frac") for row in prune if math.isclose(float(row.get("eps", -1.0)), 1e-4)),
         None,
     )
+    best_prune = None
+    for prune_row in prune:
+        if _safe_float(prune_row.get("compute_frac")) is None:
+            continue
+        if best_prune is None or float(prune_row.get("compute_frac")) < float(best_prune.get("compute_frac")):
+            best_prune = prune_row
     progress = summary.get("progress", {})
     row = {
         "time": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
@@ -1081,6 +1110,11 @@ def _scalar_row(summary: Dict[str, Any]) -> Dict[str, Any]:
         "tokens": progress.get("tokens"),
         "val_loss": active.get("val_loss"),
         "compute_frac_1e_4": compute_1e4,
+        "pruned_eval_base_loss": baseline.get("val_loss", prune_summary.get("base_loss")),
+        "pruned_eval_base_compute_frac": baseline.get("compute_frac"),
+        "pruned_eval_best_eps": best_prune.get("eps") if best_prune else None,
+        "pruned_eval_best_compute_frac": best_prune.get("compute_frac") if best_prune else None,
+        "pruned_eval_best_loss_delta": best_prune.get("loss_delta") if best_prune else None,
     }
     for pool in ("qk", "v", "rst"):
         pdata = pools.get(pool, {})
@@ -1164,20 +1198,30 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
             f"{_fmt_num(pdata.get('gate_mass'), 3):<11} "
             f"{status}"
         )
+    baseline = prune.get("baseline") or {}
+    prune_rows = ([baseline] if baseline else []) + list(prune.get("eps", []))
+    base_compute = _safe_float(baseline.get("compute_frac"))
     out.extend([
         "",
-        "Effective prune:",
-        "  eps       compute_frac   loss/ce_delta   qk_eff   v_eff    rst_eff",
+        "Pruned eval:",
+        "  eps       val_loss   delta_ce   compute   saved_vs_base   gate_mass   no_active",
     ])
-    for row in prune.get("eps", []):
+    if not prune_rows:
+        out.append("  n/a")
+    for row in prune_rows:
+        compute = _safe_float(row.get("compute_frac"))
+        saved = None
+        if base_compute is not None and base_compute > 0.0 and compute is not None:
+            saved = (base_compute - compute) / base_compute
         out.append(
             "  "
-            f"{row.get('eps'):<9.0e} "
-            f"{_fmt_num(row.get('compute_frac'), 4):<14} "
-            f"{_fmt_delta(row.get('loss_delta'), 4):<15} "
-            f"{_fmt_num(row.get('qk_eff'), 3):<8} "
-            f"{_fmt_num(row.get('v_eff'), 3):<8} "
-            f"{_fmt_num(row.get('rst_eff'), 3)}"
+            f"{_fmt_eps(row.get('eps')):<9} "
+            f"{_fmt_num(row.get('val_loss'), 6):<10} "
+            f"{_fmt_delta(row.get('loss_delta'), 4):<10} "
+            f"{_fmt_num(row.get('compute_frac'), 4):<9} "
+            f"{_fmt_pct(saved, 1):<15} "
+            f"{_fmt_num(row.get('gate_mass_retained'), 3):<11} "
+            f"{_fmt_num(row.get('no_active_frac'), 3)}"
         )
     out.extend([
         "",
@@ -1190,7 +1234,7 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
         f"  rst effective: {compare.get('rst_effective', 'n/a')}",
         "",
         "Recent trend:",
-        "  step      tokens    qk_act  v_act   rst_act qk_eff  v_eff   rst_eff compute@1e-4",
+        "  step      tokens    qk_act  v_act   rst_act qk_eff  v_eff   rst_eff best_eps best_compute best_dce",
     ])
     if trend:
         for row in trend:
@@ -1204,7 +1248,9 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
                 f"{_fmt_num(row.get('qk_effective'), 3):<7} "
                 f"{_fmt_num(row.get('v_effective'), 3):<7} "
                 f"{_fmt_num(row.get('rst_effective'), 3):<7} "
-                f"{_fmt_num(row.get('compute_frac_1e_4'), 4)}"
+                f"{_fmt_eps(row.get('pruned_eval_best_eps')):<8} "
+                f"{_fmt_num(row.get('pruned_eval_best_compute_frac'), 4):<12} "
+                f"{_fmt_delta(row.get('pruned_eval_best_loss_delta'), 4)}"
             )
     else:
         out.append("  n/a")
