@@ -72,7 +72,7 @@ DEFAULT_CHECKPOINT = (
     "run_vspatial-r1-v4.1.6.6_20260622_212706_3201/"
     "checkpoints/000000076293"
 )
-DEFAULT_TRAIN_ANALYSIS_CONFIG = "configs/train_config_v4166_1p3B_c4_20B_v4_64.yaml"
+DEFAULT_TRAIN_ANALYSIS_CONFIG = None
 DEFAULT_TRAIN_ANALYSIS_CHECKPOINT_DIR = (
     "gs://dawn-tpu-data-c4/checkpoints/"
     "dawn_srw_v4166_1p3B_c4_20B_v4_64_new"
@@ -570,6 +570,10 @@ def _prepare_train_analysis_args(args: argparse.Namespace, warnings: List[str]) 
         or os.environ.get("DAWN_TRAIN_ANALYSIS_CONFIG")
         or DEFAULT_TRAIN_ANALYSIS_CONFIG
     )
+    if args.config is not None:
+        args.config = normalize_checkpoint_arg(args.config)
+    if args.output is not None:
+        args.output = normalize_checkpoint_arg(args.output)
     checkpoint_dir = (
         args.train_analysis_checkpoint_dir
         or os.environ.get("DAWN_TRAIN_ANALYSIS_CHECKPOINT_DIR")
@@ -578,6 +582,7 @@ def _prepare_train_analysis_args(args: argparse.Namespace, warnings: List[str]) 
     if checkpoint_dir is None and args.checkpoint is None:
         checkpoint_dir = DEFAULT_TRAIN_ANALYSIS_CHECKPOINT_DIR
     if checkpoint_dir is not None:
+        checkpoint_dir = normalize_checkpoint_arg(checkpoint_dir)
         info = _discover_latest_checkpoint(checkpoint_dir)
         args.checkpoint = join_path(info["checkpoints_dir"], str(info["latest_step"]))
         if args.output is None:
@@ -1228,7 +1233,8 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     if primary:
         print(
             "TRAIN_ANALYSIS START "
-            f"config={args.config} checkpoint_dir={info.get('configured_checkpoint_dir')} "
+            f"config={args.config or 'checkpoint full_config'} "
+            f"checkpoint_dir={info.get('configured_checkpoint_dir')} "
             f"output={store.output_dir}",
             flush=True,
         )
@@ -1255,7 +1261,7 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     compare = _compare_400m(active)
     summary = {
         "run": {
-            "config": args.config,
+            "config": args.config or "checkpoint full_config",
             "checkpoint_dir": info.get("configured_checkpoint_dir") or info.get("run_folder"),
             "latest_step": progress["step"],
             "latest_path": info.get("latest_path") or args.checkpoint,

@@ -15,6 +15,15 @@
 #     --output gs://dawn-tpu-data-c4/analysis/v4166_400M_final \
 #     --stages eval,prune,geometry,usage,trace,ablation,report
 #
+# Train-side checkpoint analysis preset:
+#   bash scripts/launch_dawn_v4166_analysis_tpu_pod.sh \
+#     --preset v4166-1B \
+#     --tpu spatial-400m \
+#     --project dawn-486218 \
+#     --zone us-central2-b \
+#     --branch codex/v4167-poc \
+#     --mode train
+#
 # If the TPU does not exist yet, create it separately, for example:
 #   gcloud compute tpus tpu-vm create dawn-400m-v4-64 \
 #     --zone=us-central2-b \
@@ -31,6 +40,7 @@ PROJECT="dawn-486218"
 BRANCH="main"
 GH_TOKEN=""
 REPO_URL="https://github.com/madst0614/DAWN-SRW.git"
+PRESET=""
 
 CHECKPOINT="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_400M_c4_40B_v4_64/run_vspatial-r1-v4.1.6.6_20260622_212706_3201/checkpoints/000000076293"
 OUTPUT="gs://dawn-tpu-data-c4/analysis/v4166_400M_final"
@@ -45,11 +55,57 @@ TMUX_SESSION="train"
 REMOTE_LOG="~/train.log"
 DRY_RUN="0"
 OUTPUT_EXPLICIT="0"
+MODE_EXPLICIT="0"
+CHECKPOINT_DIR_EXPLICIT="0"
 
-TRAIN_ANALYSIS_CONFIG="${DAWN_TRAIN_ANALYSIS_CONFIG:-configs/train_config_v4166_1p3B_c4_20B_v4_64.yaml}"
+TRAIN_ANALYSIS_CONFIG="${DAWN_TRAIN_ANALYSIS_CONFIG:-}"
 TRAIN_ANALYSIS_CHECKPOINT_DIR="${DAWN_TRAIN_ANALYSIS_CHECKPOINT_DIR:-gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new}"
 TRAIN_ANALYSIS_MAX_BATCHES="${DAWN_TRAIN_ANALYSIS_MAX_BATCHES:-8}"
 TRAIN_ANALYSIS_PRUNE_EPS="${DAWN_TRAIN_ANALYSIS_PRUNE_EPS:-1e-6,1e-5,1e-4,1e-3}"
+
+normalize_gcs_arg() {
+    local value="$1"
+    if [[ "$value" == dawn-tpu-data-c4/* ]]; then
+        printf 'gs://%s' "$value"
+    else
+        printf '%s' "$value"
+    fi
+}
+
+path_name() {
+    local value="${1%/}"
+    value="${value//\\//}"
+    printf '%s' "${value##*/}"
+}
+
+path_parent() {
+    local value="${1%/}"
+    value="${value//\\//}"
+    if [[ "$value" == */* ]]; then
+        printf '%s' "${value%/*}"
+    else
+        printf '.'
+    fi
+}
+
+apply_preset() {
+    local preset_lc="${1,,}"
+    case "$preset_lc" in
+        v4166-1b|v4166-1p3b|v4166-1p3b-c4-20b|v4166-1p3b-c4-20b-v4-64)
+            if [[ "$MODE_EXPLICIT" == "0" ]]; then
+                MODE="train_analysis"
+            fi
+            if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new"
+            fi
+            ;;
+        *)
+            echo "ERROR: unknown --preset $1" >&2
+            echo "Known presets: v4166-1B" >&2
+            exit 1
+            ;;
+    esac
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,12 +113,14 @@ while [[ $# -gt 0 ]]; do
         --zone) ZONE="$2"; shift 2 ;;
         --project) PROJECT="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
-        --mode) MODE="$2"; shift 2 ;;
+        --mode) MODE="$2"; MODE_EXPLICIT="1"; shift 2 ;;
+        --preset) PRESET="$2"; shift 2 ;;
         --token) GH_TOKEN="$2"; shift 2 ;;
         --repo-url) REPO_URL="$2"; shift 2 ;;
-        --checkpoint) CHECKPOINT="$2"; shift 2 ;;
-        --checkpoint-dir) TRAIN_ANALYSIS_CHECKPOINT_DIR="$2"; shift 2 ;;
-        --output) OUTPUT="$2"; OUTPUT_EXPLICIT="1"; shift 2 ;;
+        --config) TRAIN_ANALYSIS_CONFIG="$2"; shift 2 ;;
+        --checkpoint) CHECKPOINT="$(normalize_gcs_arg "$2")"; shift 2 ;;
+        --checkpoint-dir) TRAIN_ANALYSIS_CHECKPOINT_DIR="$(normalize_gcs_arg "$2")"; CHECKPOINT_DIR_EXPLICIT="1"; shift 2 ;;
+        --output) OUTPUT="$(normalize_gcs_arg "$2")"; OUTPUT_EXPLICIT="1"; shift 2 ;;
         --stages) STAGES="$2"; shift 2 ;;
         --workers) WORKERS="$2"; shift 2 ;;
         --foreground) DETACH="0"; DETACH_EXPLICIT="1"; shift ;;
@@ -94,7 +152,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --tpu NAME"
             echo ""
             echo "Core:"
-            echo "  --mode MODE               analysis or train_analysis. Default: $MODE"
+            echo "  --preset NAME             Known: v4166-1B"
+            echo "  --mode MODE               analysis, train, or train_analysis. Default: $MODE"
+            echo "  --config PATH             Optional train_analysis fallback config. Default: checkpoint full_config"
             echo "  --checkpoint PATH_OR_GS   Default: $CHECKPOINT"
             echo "  --checkpoint-dir DIR      train_analysis base checkpoint dir. Default: $TRAIN_ANALYSIS_CHECKPOINT_DIR"
             echo "  --output PATH_OR_GS       Default: $OUTPUT"
@@ -127,6 +187,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -n "$PRESET" ]]; then
+    apply_preset "$PRESET"
+fi
+
+CHECKPOINT="$(normalize_gcs_arg "$CHECKPOINT")"
+TRAIN_ANALYSIS_CHECKPOINT_DIR="$(normalize_gcs_arg "$TRAIN_ANALYSIS_CHECKPOINT_DIR")"
+OUTPUT="$(normalize_gcs_arg "$OUTPUT")"
+
 if [[ -z "$TPU_NAME" ]]; then
     echo "ERROR: --tpu required" >&2
     exit 1
@@ -136,10 +204,11 @@ case "$MODE" in
     analysis|full|full_analysis)
         MODE="analysis"
         ;;
-    train_analysis)
+    train|training|train_analysis)
+        MODE="train_analysis"
         ;;
     *)
-        echo "ERROR: unsupported --mode $MODE (expected analysis or train_analysis)" >&2
+        echo "ERROR: unsupported --mode $MODE (expected analysis, train, or train_analysis)" >&2
         exit 1
         ;;
 esac
@@ -148,7 +217,11 @@ if [[ "$MODE" == "train_analysis" ]]; then
     STAGES="train_analysis"
     CHECKPOINT="$TRAIN_ANALYSIS_CHECKPOINT_DIR"
     if [[ "$OUTPUT_EXPLICIT" == "0" ]]; then
-        OUTPUT="${TRAIN_ANALYSIS_CHECKPOINT_DIR%/}/side_analysis"
+        if [[ "$(path_name "$TRAIN_ANALYSIS_CHECKPOINT_DIR")" == "checkpoints" ]]; then
+            OUTPUT="$(path_parent "$TRAIN_ANALYSIS_CHECKPOINT_DIR")/side_analysis"
+        else
+            OUTPUT="${TRAIN_ANALYSIS_CHECKPOINT_DIR%/}/side_analysis"
+        fi
     fi
     if [[ "$DETACH_EXPLICIT" == "0" ]]; then
         DETACH="0"
@@ -177,6 +250,18 @@ if [[ -n "$GH_TOKEN" ]]; then
 fi
 
 COPY_CMD="bash scripts/launch_dawn_v4166_analysis_tpu_pod.sh --tpu $TPU_NAME --project $PROJECT --zone $ZONE --branch $BRANCH --mode $MODE"
+if [[ -n "$PRESET" ]]; then
+    COPY_CMD="$COPY_CMD --preset $PRESET"
+fi
+if [[ "$MODE" == "train_analysis" ]]; then
+    COPY_CMD="$COPY_CMD --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR"
+    if [[ -n "$TRAIN_ANALYSIS_CONFIG" ]]; then
+        COPY_CMD="$COPY_CMD --config $TRAIN_ANALYSIS_CONFIG"
+    fi
+    if [[ "$OUTPUT_EXPLICIT" == "1" ]]; then
+        COPY_CMD="$COPY_CMD --output $OUTPUT"
+    fi
+fi
 WATCH_REPEAT_CMD="watch -n 300 '$COPY_CMD'"
 WATCH_LOG_CMD="bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --log $REMOTE_LOG --target $TMUX_SESSION --summary"
 
@@ -190,12 +275,15 @@ echo "  project         : $PROJECT"
 echo "  zone            : $ZONE"
 echo "  branch          : $BRANCH"
 echo "  repo            : $REPO_URL_DISPLAY"
+if [[ -n "$PRESET" ]]; then
+    echo "  preset          : $PRESET"
+fi
 echo "  workers         : $WORKERS"
 echo "  detached        : $DETACH"
 echo "  tmux_session    : $TMUX_SESSION"
 echo "  remote_log      : $REMOTE_LOG"
 if [[ "$MODE" == "train_analysis" ]]; then
-    echo "  config          : $TRAIN_ANALYSIS_CONFIG"
+    echo "  config          : ${TRAIN_ANALYSIS_CONFIG:-checkpoint full_config}"
     echo "  checkpoint_dir  : $TRAIN_ANALYSIS_CHECKPOINT_DIR"
     echo "  output          : $OUTPUT"
     echo "  analysis_batches: $TRAIN_ANALYSIS_MAX_BATCHES"
@@ -221,7 +309,11 @@ if [[ "$DRY_RUN" == "1" ]]; then
     echo "Dry run: no TPU command will be sent."
     if [[ "$MODE" == "train_analysis" ]]; then
         echo "Remote Python:"
-        echo "  python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --config $TRAIN_ANALYSIS_CONFIG --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --init-distributed"
+        if [[ -n "$TRAIN_ANALYSIS_CONFIG" ]]; then
+            echo "  python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --config $TRAIN_ANALYSIS_CONFIG --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --init-distributed"
+        else
+            echo "  python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --init-distributed"
+        fi
     else
         echo "Remote Python:"
         echo "  python3 -u scripts/analyze_dawn_srw_v4166.py --checkpoint $CHECKPOINT --output $OUTPUT --stages $STAGES --init-distributed ${ANALYSIS_ARGS:-}"
@@ -376,7 +468,7 @@ echo "OUTPUT=\$OUTPUT"
 echo "STAGES=\$STAGES"
 echo "ANALYSIS_ARGS=\$ANALYSIS_ARGS"
 if [ "\$MODE" = "train_analysis" ]; then
-    echo "TRAIN_ANALYSIS_CONFIG=\$TRAIN_ANALYSIS_CONFIG"
+    echo "TRAIN_ANALYSIS_CONFIG=\${TRAIN_ANALYSIS_CONFIG:-checkpoint full_config}"
     echo "TRAIN_ANALYSIS_CHECKPOINT_DIR=\$TRAIN_ANALYSIS_CHECKPOINT_DIR"
     echo "TRAIN_ANALYSIS_MAX_BATCHES=\$TRAIN_ANALYSIS_MAX_BATCHES"
     echo "TRAIN_ANALYSIS_PRUNE_EPS=\$TRAIN_ANALYSIS_PRUNE_EPS"
@@ -409,13 +501,15 @@ if [ "\$MODE" = "train_analysis" ]; then
     ANALYSIS_CMD=(
         python3 -u scripts/analyze_dawn_srw_v4166.py
         --train-analysis
-        --config "\$TRAIN_ANALYSIS_CONFIG"
         --checkpoint-dir "\$TRAIN_ANALYSIS_CHECKPOINT_DIR"
         --output "\$OUTPUT"
         --train-analysis-max-batches "\$TRAIN_ANALYSIS_MAX_BATCHES"
         --prune-eps "\$TRAIN_ANALYSIS_PRUNE_EPS"
         --init-distributed
     )
+    if [ -n "\$TRAIN_ANALYSIS_CONFIG" ]; then
+        ANALYSIS_CMD+=(--config "\$TRAIN_ANALYSIS_CONFIG")
+    fi
 else
     ANALYSIS_CMD=(
         python3 -u scripts/analyze_dawn_srw_v4166.py
