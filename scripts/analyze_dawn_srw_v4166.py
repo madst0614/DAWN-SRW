@@ -216,13 +216,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--train-analysis-generation-max-tokens",
         type=int,
-        default=int(os.environ.get("DAWN_TRAIN_ANALYSIS_GENERATION_MAX_TOKENS", 24)),
+        default=int(os.environ.get("DAWN_TRAIN_ANALYSIS_GENERATION_MAX_TOKENS", 64)),
         help="Maximum new tokens per prompt for the generation_samples train-analysis item.",
     )
     p.add_argument(
         "--train-analysis-generation-temperature",
         type=float,
-        default=float(os.environ.get("DAWN_TRAIN_ANALYSIS_GENERATION_TEMPERATURE", 0.0)),
+        default=float(os.environ.get("DAWN_TRAIN_ANALYSIS_GENERATION_TEMPERATURE", 0.8)),
         help="Generation temperature for the generation_samples item. 0 means greedy.",
     )
     p.add_argument(
@@ -889,6 +889,23 @@ def _selection_status(cfg: Dict[str, Any], step: int, tokens: int) -> Dict[str, 
     }
 
 
+def _train_analysis_inference_model_cfg(ctx: AnalysisContext,
+                                        selection: Dict[str, Any]) -> Dict[str, Any]:
+    model_cfg = dict(ctx.model_cfg)
+    tcfg = ctx.config.get("training", {})
+    boundary_power = _safe_float(selection.get("soft_gate_boundary_power_now"))
+    if boundary_power is not None:
+        model_cfg["soft_gate_boundary_power"] = boundary_power
+    for key in ("admission_den_power", "soft_gate_effective_active_eps"):
+        value = _safe_float(tcfg.get(key))
+        if value is not None:
+            model_cfg[key] = value
+    temp = _safe_float(tcfg.get("soft_gate_t_final", tcfg.get("soft_gate_temperature")))
+    if temp is not None:
+        model_cfg["soft_gate_temperature"] = temp
+    return model_cfg
+
+
 def _pool_sizes(cfg: Dict[str, Any]) -> Dict[str, Optional[int]]:
     mcfg = cfg.get("model", {})
     n_rst = mcfg.get("n_rst", mcfg.get("n_know"))
@@ -910,6 +927,7 @@ def _build_per_layer_active(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -> 
             "admission": _mean_lists(rows, f"per_layer_{prefix}_admission_active_eps_1e_2_frac"),
             "effective": _mean_lists(rows, f"per_layer_{prefix}_active_eps_1e_2_frac"),
             "top1": _mean_lists(rows, f"per_layer_{prefix}_execution_top1_frac"),
+            "top1_max": _mean_lists(rows, f"per_layer_{prefix}_execution_top1_frac_max"),
             "active_ops": _mean_lists(rows, f"per_layer_{prefix}_active_n_mean"),
             "effective_ops": _mean_lists(rows, f"per_layer_{prefix}_gate_eff_n"),
             "gate_eff_ratio": _mean_lists(rows, f"per_layer_{prefix}_gate_eff_ratio"),
@@ -1051,19 +1069,22 @@ def _build_concentration_max(active: Dict[str, Any]) -> List[Dict[str, Any]]:
     out = []
     for pool in ("qk", "v", "rst"):
         best = None
-        best_top1 = None
+        best_top1_max = None
         for row in layers:
-            top1 = _safe_float(row.get(f"{pool}_top1"))
-            if top1 is None:
+            top1_max = _safe_float(row.get(f"{pool}_top1_max"))
+            if top1_max is None:
+                top1_max = _safe_float(row.get(f"{pool}_top1"))
+            if top1_max is None:
                 continue
-            if best_top1 is None or top1 > best_top1:
+            if best_top1_max is None or top1_max > best_top1_max:
                 best = row
-                best_top1 = top1
+                best_top1_max = top1_max
         if best is None:
             out.append({
                 "pool": pool,
                 "layer": None,
-                "top1": None,
+                "top1_mean": None,
+                "layer_top1_max": None,
                 "global_top1_max": pools.get(pool, {}).get("top1_max"),
                 "active": None,
                 "effective": None,
@@ -1075,7 +1096,8 @@ def _build_concentration_max(active: Dict[str, Any]) -> List[Dict[str, Any]]:
         out.append({
             "pool": pool,
             "layer": best.get("layer"),
-            "top1": best_top1,
+            "top1_mean": best.get(f"{pool}_top1"),
+            "layer_top1_max": best_top1_max,
             "global_top1_max": pools.get(pool, {}).get("top1_max"),
             "active": best.get(f"{pool}_active_tau"),
             "effective": best.get(f"{pool}_effective"),
@@ -1172,6 +1194,7 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
             "gate_eff_n",
             "gate_eff_ratio",
             "execution_top1_frac",
+            "execution_top1_frac_max",
             "rho_mean",
             "rho_std",
             "rho_max",
@@ -1975,10 +1998,13 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
             f"items={','.join(analysis_items)} "
             f"sections={','.join(required_sections)}",
             flush=True,
-        )
+    )
     ctx = build_context(args, ["train_analysis"], store)
     max_batches = max(1, int(args.train_analysis_max_batches or DEFAULT_TRAIN_ANALYSIS_BATCHES))
     eps_values = _parse_float_list(args.prune_eps or DEFAULT_TRAIN_ANALYSIS_PRUNE_EPS)
+    progress = _progress_status(ctx, info)
+    selection = _selection_status(ctx.config, progress["step"], progress["tokens"])
+    ctx.model_cfg = _train_analysis_inference_model_cfg(ctx, selection)
     active = _run_active_dynamics(ctx, max_batches) if "active" in required_sections else {}
     prune = _run_prune_light(ctx, max_batches, eps_values) if "prune" in required_sections else {}
     prompt_trace = run_train_prompt_trace(ctx) if "prompt_trace" in required_sections else {}
@@ -1988,8 +2014,6 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     if not ctx.is_primary:
         return 0
 
-    progress = _progress_status(ctx, info)
-    selection = _selection_status(ctx.config, progress["step"], progress["tokens"])
     for pool, pdata in active.get("pools", {}).items():
         pdata["status"] = _active_status(pool, pdata.get("active_tau"), progress["tokens"], selection)
     active = _add_target_ratio(active, selection)

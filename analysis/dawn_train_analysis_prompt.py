@@ -229,6 +229,12 @@ def run_train_prompt_trace(ctx: AnalysisContext) -> Dict[str, Any]:
         "seq_len": seq_len,
         "topk": topk,
         "pool_sizes": pool_sizes,
+        "inference_model_cfg": {
+            "soft_gate_boundary_power": ctx.model_cfg.get("soft_gate_boundary_power"),
+            "soft_gate_temperature": ctx.model_cfg.get("soft_gate_temperature"),
+            "admission_den_power": ctx.model_cfg.get("admission_den_power"),
+            "soft_gate_effective_active_eps": ctx.model_cfg.get("soft_gate_effective_active_eps"),
+        },
         "sec": time.time() - started,
         "prompts": rows,
     }
@@ -305,6 +311,58 @@ def _decode_ids(tokenizer: Any, ids: Sequence[int]) -> str:
     return "ids:" + " ".join(str(x) for x in ids)
 
 
+def _token_text(tokenizer: Any, token_id: int) -> str:
+    token_id = int(token_id)
+    if tokenizer is not None:
+        try:
+            return str(tokenizer.convert_ids_to_tokens([token_id])[0])
+        except Exception:
+            pass
+        try:
+            return tokenizer.decode([token_id], skip_special_tokens=False)
+        except Exception:
+            pass
+    return str(token_id)
+
+
+def _top_token_snapshot(logits: np.ndarray, tokenizer: Any, top_n: int = 8) -> List[Dict[str, Any]]:
+    logits = np.asarray(logits, dtype=np.float64)
+    if logits.size == 0:
+        return []
+    top_n = min(int(top_n), int(logits.shape[-1]))
+    top_idx = np.argpartition(logits, -top_n)[-top_n:]
+    top_idx = top_idx[np.argsort(logits[top_idx])[::-1]]
+    shifted = logits - np.nanmax(logits)
+    probs = np.exp(shifted)
+    probs = probs / max(float(np.sum(probs)), 1e-12)
+    return [
+        {
+            "id": int(idx),
+            "token": _token_text(tokenizer, int(idx)),
+            "logit": float(logits[idx]),
+            "prob": float(probs[idx]),
+        }
+        for idx in top_idx
+    ]
+
+
+def _dominant_token_summary(ids: Sequence[int], tokenizer: Any) -> Dict[str, Any]:
+    ids = [int(x) for x in ids]
+    if not ids:
+        return {"id": None, "token": None, "count": 0, "frac": None, "unique": 0}
+    counts: Dict[int, int] = {}
+    for token_id in ids:
+        counts[token_id] = counts.get(token_id, 0) + 1
+    token_id, count = max(counts.items(), key=lambda item: item[1])
+    return {
+        "id": int(token_id),
+        "token": _token_text(tokenizer, token_id),
+        "count": int(count),
+        "frac": float(count) / float(len(ids)),
+        "unique": len(counts),
+    }
+
+
 def _sample_token(logits: np.ndarray, temperature: float, top_k: int,
                   rng: np.random.Generator) -> int:
     logits = np.asarray(logits, dtype=np.float64)
@@ -326,8 +384,8 @@ def _sample_token(logits: np.ndarray, temperature: float, top_k: int,
 def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
     args = ctx.args
     tokenizer = maybe_load_tokenizer(local_only=True)
-    max_new = int(getattr(args, "train_analysis_generation_max_tokens", 24) or 24)
-    temperature = float(getattr(args, "train_analysis_generation_temperature", 0.0) or 0.0)
+    max_new = int(getattr(args, "train_analysis_generation_max_tokens", 64) or 64)
+    temperature = float(getattr(args, "train_analysis_generation_temperature", 0.8) or 0.0)
     top_k = int(getattr(args, "train_analysis_generation_top_k", 50) or 50)
     max_prompts = int(getattr(args, "train_analysis_generation_max_prompts", 3) or 3)
     max_seq = int(ctx.model_cfg.get("max_seq_len", 512))
@@ -374,10 +432,13 @@ def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
         ids = [int(x) for x in ids[: max(1, max_seq - 1)]]
         if not ids:
             continue
+        if prompt_text is None:
+            prompt_text = _decode_ids(tokenizer, ids)
         t0 = time.time()
         logits, c_k, c_v, c_len = jit_prefill(ctx.params, jnp.asarray([ids], dtype=jnp.int32))
         jax.block_until_ready(logits)
         last_logits = np.asarray(jax.device_get(logits[0, -1, :]))
+        first_step_top_tokens = _top_token_snapshot(last_logits, tokenizer)
         generated: List[int] = []
         for _ in range(min(max_new, max_seq - len(ids))):
             next_id = _sample_token(last_logits, temperature, top_k, rng)
@@ -397,12 +458,14 @@ def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
         full_ids = ids + generated
         full_text = _decode_ids(tokenizer, full_ids)
         continuation = _decode_ids(tokenizer, generated)
+        dominant = _dominant_token_summary(generated, tokenizer)
         row = {
             "prompt_id": prompt_id,
             "prompt": prompt_text,
             "prompt_token_ids_head": ids[:32],
             "continuation": continuation,
             "continuation_token_ids": generated,
+            "continuation_token_texts": [_token_text(tokenizer, token_id) for token_id in generated[:128]],
             "full_text": full_text,
             "prompt_tokens": len(ids),
             "new_tokens": len(generated),
@@ -410,13 +473,18 @@ def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
             "tokens_per_sec": (len(generated) / sec) if sec > 0 else None,
             "temperature": temperature,
             "top_k": top_k,
+            "first_step_top_tokens": first_step_top_tokens,
+            "dominant_generated_token": dominant,
         }
         samples.append(row)
         if ctx.is_primary:
+            dom = dominant.get("token")
+            dom_frac = dominant.get("frac")
+            dom_text = f" dom={dom}:{dom_frac:.2f}" if dom is not None and dom_frac is not None else ""
             print(
                 "TRAIN_ANALYSIS GENERATION "
                 f"sample={idx + 1:03d}/{len(prompts):03d} "
-                f"new_tokens={len(generated)} sec={sec:.2f}",
+                f"new_tokens={len(generated)} sec={sec:.2f}{dom_text}",
                 flush=True,
             )
 
@@ -430,6 +498,13 @@ def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
         "max_new_tokens": max_new,
         "temperature": temperature,
         "top_k": top_k,
+        "sampling_seed": 123,
+        "inference_model_cfg": {
+            "soft_gate_boundary_power": ctx.model_cfg.get("soft_gate_boundary_power"),
+            "soft_gate_temperature": ctx.model_cfg.get("soft_gate_temperature"),
+            "admission_den_power": ctx.model_cfg.get("admission_den_power"),
+            "soft_gate_effective_active_eps": ctx.model_cfg.get("soft_gate_effective_active_eps"),
+        },
         "sec": time.time() - started,
         "samples": samples,
     }

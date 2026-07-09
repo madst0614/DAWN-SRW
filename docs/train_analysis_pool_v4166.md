@@ -259,14 +259,14 @@ Summary example:
 
 ```text
 CONCENTRATION_MAX:
-  pool layer layer_top1 global_top1_max active effective active_ops effective_ops operator_id
-  rst  04    0.204      0.206           ...
+  pool layer layer_top1_max global_top1_max layer_top1_mean active effective active_ops effective_ops operator_id
+  rst  04    0.204          0.206           ...
 ```
 
 ### prune_breakdown
 
 Measures eps-wise pruned eval loss delta, total compute, pool-level compute,
-pool-level effective estimates, retained gate mass, and no-active fraction.
+pool-level effective estimates, raw gate-mass diagnostic, and no-active fraction.
 Use this when you want to see whether pruned eval is actually saving compute
 and which pool is responsible.
 
@@ -274,7 +274,7 @@ Summary example:
 
 ```text
 PRUNE_BREAKDOWN:
-  eps   val_loss delta_ce total qk_cmp v_cmp rst_cmp | qk_eff v_eff rst_eff saved gate_mass no_active
+  eps   val_loss delta_ce total qk_cmp v_cmp rst_cmp | qk_eff v_eff rst_eff saved gate_mass_raw no_active
   0     ...
   1e-2  ...
   1e-1  ...
@@ -324,6 +324,7 @@ Summary example:
 
 ```text
 PROMPT_TRACE:
+  boundary_power=3.000
   prompt_id       len q_frac k_frac v_frac rst_frac q_top1 k_top1 v_top1 rst_top1 rst/attn
   text-000000     5   ...
 ```
@@ -347,16 +348,22 @@ PROMPT_DECISION:
 
 Uses the v4166 `prefill` and `decode_step` KV-cache inference API to generate a
 few short continuations. Defaults are intentionally small and deterministic:
-three prompts, greedy decoding, and 24 new tokens. If the tokenizer is not
-available on the TPU worker, it falls back to validation token prompts and
-prints generated token ids instead of skipping the item.
+three prompts, seeded top-k sampling with temperature 0.8, and 64 new tokens.
+If the tokenizer is not available on the TPU worker, it falls back to validation
+token prompts and prints generated token ids instead of skipping the item.
+The summary prints the prompt, generated continuation, prompt+continuation, and
+the first-step top token distribution so punctuation loops are visible.
 
 Summary example:
 
 ```text
 GENERATION_SAMPLES:
-  prompt_id    new_tok tok/s continuation
-  gen-000000   24      ...
+  decode_mode=text max_new=64 temp=0.80 top_k=50 seed=123 boundary_power=3.000
+  gen-000000   new_tok=64  tok/s=...
+    prompt   : ...
+    generated: ...
+    full     : ...
+    first_top: ...
 ```
 
 ### decision_reason

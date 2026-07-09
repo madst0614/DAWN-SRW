@@ -4778,6 +4778,8 @@ class DAWN_SRW_V4166(nn.Module):
                     :, ATTN_SPLIT_QK_GATE_EFF_RATIO],
                 'per_layer_attn_qk_execution_top1_frac': attn_split_core_all[
                     :, ATTN_SPLIT_QK_TOP1_GATE_FRAC],
+                'per_layer_attn_qk_execution_top1_frac_max': attn_split_core_all[
+                    :, ATTN_SPLIT_QK_TOP1_GATE_FRAC_MAX],
                 'per_layer_attn_qk_rho_mean': _select_layer(
                     attn_qk_select_diag_all, SELECT_RHO_MEAN),
                 'per_layer_attn_qk_rho_std': _select_layer(
@@ -4830,6 +4832,8 @@ class DAWN_SRW_V4166(nn.Module):
                     :, ATTN_SPLIT_V_GATE_EFF_RATIO],
                 'per_layer_attn_v_execution_top1_frac': attn_split_core_all[
                     :, ATTN_SPLIT_V_TOP1_GATE_FRAC],
+                'per_layer_attn_v_execution_top1_frac_max': attn_split_core_all[
+                    :, ATTN_SPLIT_V_TOP1_GATE_FRAC_MAX],
                 'per_layer_attn_v_rho_mean': _select_layer(
                     attn_v_select_diag_all, SELECT_RHO_MEAN),
                 'per_layer_attn_v_rho_std': _select_layer(
@@ -4862,6 +4866,7 @@ class DAWN_SRW_V4166(nn.Module):
                 'per_layer_rst_gate_eff_n': rst_gate_eff_n_all,
                 'per_layer_rst_gate_eff_ratio': rst_gate_eff_ratio_all,
                 'per_layer_rst_execution_top1_frac': rst_top1_gate_frac_all,
+                'per_layer_rst_execution_top1_frac_max': rst_top1_gate_frac_max_all,
                 'per_layer_rst_rho_mean': rst_rho_mean_all,
                 'per_layer_rst_rho_std': rst_rho_std_all,
                 'per_layer_rst_rho_max': rst_rho_max_all,

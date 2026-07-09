@@ -429,7 +429,7 @@ def _item_lines_concentration_max(summary: Dict[str, Any], fmt: TrainAnalysisFor
     rows = active.get("concentration_max", [])
     out = [
         "  CONCENTRATION_MAX:",
-        "  pool layer layer_top1 global_top1_max active effective active_ops effective_ops operator_id",
+        "  pool layer layer_top1_max global_top1_max layer_top1_mean active effective active_ops effective_ops operator_id",
     ]
     if not rows:
         out.append("  n/a")
@@ -438,13 +438,14 @@ def _item_lines_concentration_max(summary: Dict[str, Any], fmt: TrainAnalysisFor
             "  "
             f"{str(row.get('pool', 'n/a')):<5} "
             f"{str(row.get('layer', 'n/a')):<5} "
-            f"{fmt.num(row.get('top1'), 3):<10} "
+            f"{fmt.num(row.get('layer_top1_max'), 3):<14} "
             f"{fmt.num(row.get('global_top1_max'), 3):<15} "
+            f"{fmt.num(row.get('top1_mean'), 3):<15} "
             f"{fmt.num(row.get('active'), 3):<6} "
             f"{fmt.num(row.get('effective'), 3):<9} "
             f"{fmt.num(row.get('active_ops'), 1):<10} "
             f"{fmt.num(row.get('effective_ops'), 1):<13} "
-            f"{row.get('operator_id', 'n/a')}"
+            f"{row.get('operator_id') or 'n/a'}"
         )
     return out
 
@@ -456,7 +457,7 @@ def _item_lines_prune_breakdown(summary: Dict[str, Any], fmt: TrainAnalysisForma
     base_compute = fmt.safe_float(baseline.get("compute_frac"))
     out = [
         "  PRUNE_BREAKDOWN:",
-        "  eps   val_loss delta_ce total qk_cmp v_cmp rst_cmp | qk_eff v_eff rst_eff saved gate_mass no_active",
+        "  eps   val_loss delta_ce total qk_cmp v_cmp rst_cmp | qk_eff v_eff rst_eff saved gate_mass_raw no_active",
     ]
     if not prune_rows:
         out.append("  n/a")
@@ -541,6 +542,7 @@ def _item_lines_prompt_trace(summary: Dict[str, Any], fmt: TrainAnalysisFormatte
         return ["  PROMPT_TRACE:", f"  status={trace.get('status', 'missing')} reason={trace.get('reason', 'n/a')}"]
     out = [
         "  PROMPT_TRACE:",
+        f"  boundary_power={fmt.num((trace.get('inference_model_cfg') or {}).get('soft_gate_boundary_power'), 3)}",
         "  prompt_id       len q_frac k_frac v_frac rst_frac q_top1 k_top1 v_top1 rst_top1 rst/attn",
     ]
     rows = trace.get("prompts", [])
@@ -592,28 +594,58 @@ def _item_lines_prompt_decision(summary: Dict[str, Any], fmt: TrainAnalysisForma
     return out
 
 
+def _compact_text(value: Any, max_chars: int = 320) -> str:
+    text = " ".join(str(value or "").replace("\n", " ").split())
+    if not text:
+        return "n/a"
+    if len(text) > max_chars:
+        return text[: max(0, max_chars - 3)] + "..."
+    return text
+
+
+def _top_token_line(tokens: List[Dict[str, Any]], fmt: TrainAnalysisFormatters) -> str:
+    parts = []
+    for row in tokens[:8]:
+        token = str(row.get("token", "n/a")).replace(" ", "_")
+        parts.append(
+            f"{token}#{row.get('id', 'n/a')}:{fmt.pct(row.get('prob'), 1)}"
+        )
+    return ", ".join(parts) if parts else "n/a"
+
+
 def _item_lines_generation_samples(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
     generation = summary.get("generation_samples", {})
     if generation.get("status") not in ("ready", "empty"):
         return ["  GENERATION_SAMPLES:", f"  status={generation.get('status', 'missing')} reason={generation.get('reason', 'n/a')}"]
     out = [
         "  GENERATION_SAMPLES:",
-        "  prompt_id    new_tok tok/s continuation",
+        (
+            "  "
+            f"decode_mode={generation.get('decode_mode', 'n/a')} "
+            f"max_new={generation.get('max_new_tokens', 'n/a')} "
+            f"temp={fmt.num(generation.get('temperature'), 2)} "
+            f"top_k={generation.get('top_k', 'n/a')} "
+            f"seed={generation.get('sampling_seed', 'n/a')} "
+            f"boundary_power={fmt.num((generation.get('inference_model_cfg') or {}).get('soft_gate_boundary_power'), 3)}"
+        ),
     ]
     rows = generation.get("samples", [])
     if not rows:
         out.append("  n/a")
     for row in rows:
-        continuation = str(row.get("continuation") or "").replace("\n", " ").strip()
-        if len(continuation) > 96:
-            continuation = continuation[:93] + "..."
+        dominant = row.get("dominant_generated_token", {}) or {}
         out.append(
             "  "
             f"{str(row.get('prompt_id', 'n/a')):<12} "
-            f"{str(row.get('new_tokens', 'n/a')):<7} "
-            f"{fmt.num(row.get('tokens_per_sec'), 1):<5} "
-            f"{continuation}"
+            f"new_tok={str(row.get('new_tokens', 'n/a')):<3} "
+            f"tok/s={fmt.num(row.get('tokens_per_sec'), 1):<5} "
+            f"unique={dominant.get('unique', 'n/a')} "
+            f"dom={dominant.get('token', 'n/a')}:{fmt.pct(dominant.get('frac'), 1)}"
         )
+        out.append(f"    prompt   : {_compact_text(row.get('prompt'), 220)}")
+        out.append(f"    generated: {_compact_text(row.get('continuation'), 360)}")
+        out.append(f"    full     : {_compact_text(row.get('full_text'), 420)}")
+        out.append(f"    first_top: {_top_token_line(row.get('first_step_top_tokens', []), fmt)}")
     return out
 
 
