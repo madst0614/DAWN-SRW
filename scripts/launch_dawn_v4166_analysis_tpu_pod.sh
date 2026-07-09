@@ -266,7 +266,6 @@ if [[ "$MODE" == "train_analysis" ]]; then
         COPY_CMD="$COPY_CMD --log $REMOTE_LOG"
     fi
 fi
-WATCH_REPEAT_CMD="watch -n 300 '$COPY_CMD'"
 WATCH_LOG_CMD="bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --log $REMOTE_LOG --target $TMUX_SESSION --summary"
 
 echo "============================================================"
@@ -301,9 +300,6 @@ fi
 echo ""
 echo "Copy-paste:"
 echo "  $COPY_CMD"
-echo ""
-echo "Watch repeat:"
-echo "  $WATCH_REPEAT_CMD"
 echo ""
 echo "Watch logs:"
 echo "  $WATCH_LOG_CMD"
@@ -544,11 +540,13 @@ fi
 ANALYSIS_CMD_STR=\$(printf "%q " "\${ANALYSIS_CMD[@]}")
 
 cd "\$WORK_DIR"
+mkdir -p "\$(dirname "\$REMOTE_LOG_PATH")"
+: > "\$REMOTE_LOG_PATH"
 if [ "\$DETACH" = "1" ]; then
     echo "[run] starting tmux session \$TMUX_SESSION"
     tmux kill-session -t "\$TMUX_SESSION" 2>/dev/null || true
     tmux new-session -d -x 240 -y 60 -s "\$TMUX_SESSION" \
-        "cd '\$WORK_DIR'; export PYTHONUNBUFFERED=1; export DAWN_ANALYSIS_INIT_DISTRIBUTED=1; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; { echo '=== TPU analysis process startup ==='; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"CMD: \$ANALYSIS_CMD_STR\"; \$ANALYSIS_CMD_STR; } 2>&1 | tee '\$REMOTE_LOG_PATH'; echo 'Analysis finished. Press enter to close.'; read"
+        "set -o pipefail; cd '\$WORK_DIR'; export PYTHONUNBUFFERED=1; export DAWN_ANALYSIS_INIT_DISTRIBUTED=1; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; { echo '=== TPU analysis process startup ==='; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"CMD: \$ANALYSIS_CMD_STR\"; \$ANALYSIS_CMD_STR; } 2>&1 | tee '\$REMOTE_LOG_PATH'; status=\$?; echo \"Analysis exited with status \$status\" | tee -a '\$REMOTE_LOG_PATH'; exit \$status"
     echo "[run] detached in tmux session \$TMUX_SESSION, log=\$REMOTE_LOG_PATH"
 else
     echo "[run] foreground analysis"
@@ -612,9 +610,6 @@ if [[ "$MODE" == "train_analysis" && "$DETACH" == "0" ]]; then
     echo ""
     echo "Copy-paste:"
     echo "  $COPY_CMD"
-    echo ""
-    echo "Watch repeat:"
-    echo "  $WATCH_REPEAT_CMD"
     echo ""
     echo "Watch logs:"
     echo "  $WATCH_LOG_CMD"
