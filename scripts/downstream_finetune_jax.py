@@ -8,7 +8,8 @@ Modes:
   --resume-from: resume a downstream run from checkpoint; params+optimizer+step restored
 
 Path resolution for both init/resume:
-  directory -> best_model.flax first -> latest checkpoint_step*.flax -> latest *.flax
+  downstream resume -> best_model.flax first -> latest checkpoint_step*.flax -> latest *.flax
+  pretrain init-from -> .flax as above, or latest committed Orbax run/checkpoints step
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ import random
 import re
 import sys
 import time
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -78,8 +80,17 @@ def step_num(path: str) -> int:
     return int(m.group(1)) if m else -1
 
 
-def resolve_checkpoint_path(path: Optional[str]) -> Optional[str]:
-    """Resolve file/dir checkpoint. Directories prefer best_model.flax."""
+@dataclass(frozen=True)
+class CheckpointRef:
+    kind: str
+    path: str
+    run_folder: Optional[str] = None
+    checkpoint_dir: Optional[str] = None
+    step: Optional[int] = None
+
+
+def resolve_flax_checkpoint_path(path: Optional[str]) -> Optional[str]:
+    """Resolve downstream Flax file/dir checkpoint. Directories prefer best_model.flax."""
     if not path:
         return None
     p = str(path)
@@ -102,6 +113,68 @@ def resolve_checkpoint_path(path: Optional[str]) -> Optional[str]:
         return any_files[-1]
 
     raise FileNotFoundError(f'No .flax checkpoint found in: {p}')
+
+
+def resolve_checkpoint_path(path: Optional[str]) -> Optional[str]:
+    return resolve_flax_checkpoint_path(path)
+
+
+def resolve_init_checkpoint_ref(path: Optional[str]) -> Optional[CheckpointRef]:
+    if not path:
+        return None
+    try:
+        flax_path = resolve_flax_checkpoint_path(path)
+        if flax_path:
+            return CheckpointRef(kind='flax', path=flax_path)
+    except FileNotFoundError:
+        if str(path).endswith('.flax'):
+            raise
+        pass
+
+    run_folder, step, found = tj._resolve_orbax_resume_from(path)
+    if found and step is not None:
+        checkpoint_dir = tj._join_path(run_folder, 'checkpoints')
+        return CheckpointRef(
+            kind='orbax',
+            path=tj._join_path(checkpoint_dir, str(int(step))),
+            run_folder=run_folder,
+            checkpoint_dir=checkpoint_dir,
+            step=int(step),
+        )
+    raise FileNotFoundError(
+        f'No downstream .flax checkpoint or committed Orbax checkpoint found in: {path}')
+
+
+def _truthy_env_or_cfg(value) -> Optional[bool]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ('1', 'true', 'yes', 'y', 'on'):
+        return True
+    if text in ('0', 'false', 'no', 'n', 'off'):
+        return False
+    if text in ('auto', ''):
+        return None
+    raise ValueError(f'Invalid boolean/auto value: {value!r}')
+
+
+def maybe_initialize_jax_distributed(cfg: Dict[str, Any]) -> None:
+    tcfg = cfg.get('training', {})
+    raw = tcfg.get(
+        'initialize_jax_distributed',
+        os.environ.get('DOWNSTREAM_JAX_DISTRIBUTED', 'auto'))
+    decision = _truthy_env_or_cfg(raw)
+    if decision is None:
+        tpu_env_keys = (
+            'TPU_NAME',
+            'CLOUD_TPU_TASK_ID',
+            'TPU_WORKER_ID',
+            'TPU_PROCESS_BOUNDS',
+            'TPU_CHIPS_PER_HOST_BOUNDS',
+        )
+        decision = any(os.environ.get(k) for k in tpu_env_keys)
+    if decision:
+        tj._maybe_initialize_jax_distributed()
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -446,7 +519,45 @@ def _summarize_param_key_mismatch(raw_params, target_params) -> str:
     return '\n'.join(lines)
 
 
-def restore_params_only(path: str, params):
+def restore_orbax_params_only(ref: CheckpointRef, params):
+    if ref.kind != 'orbax' or ref.checkpoint_dir is None or ref.step is None:
+        raise ValueError(f'Invalid Orbax checkpoint ref: {ref}')
+    tj._require_orbax_checkpoint_compat()
+    manager = tj._create_orbax_checkpoint_manager(
+        ref.checkpoint_dir,
+        create=False,
+        read_only=True,
+    )
+    try:
+        restored = manager.restore(
+            int(ref.step),
+            args=tj.ocp.args.Composite(
+                state=tj.ocp.args.StandardRestore(
+                    {'params': params},
+                    strict=False,
+                ),
+                metadata=tj.ocp.args.JsonRestore(),
+            ),
+        )
+    finally:
+        manager.close()
+    state = tj._composite_item(restored, 'state')
+    if not isinstance(state, dict) or 'params' not in state:
+        raise ValueError(f'Orbax checkpoint did not restore params: {ref.path}')
+    raw_params = _adapt_checkpoint_params_to_target(state['params'], params)
+    try:
+        restored_tree = serialization.from_state_dict(
+            {'params': params}, {'params': raw_params})
+    except ValueError as e:
+        detail = _summarize_param_key_mismatch(raw_params, params)
+        raise ValueError(
+            f'Failed to restore Orbax params from {ref.path}. '
+            f'Key summary after adapter:\n{detail}') from e
+    log(f'[ckpt] Orbax params-only loaded: {ref.path}')
+    return restored_tree['params']
+
+
+def restore_flax_params_only(path: str, params):
     import flax.serialization as serialization
     with tj._open_file(path, 'rb') as f:
         data = f.read()
@@ -463,6 +574,14 @@ def restore_params_only(path: str, params):
 
     log(f'[ckpt] params-only loaded: {path}')
     return restored['params']
+
+
+def restore_params_only(ref_or_path, params):
+    if isinstance(ref_or_path, CheckpointRef):
+        if ref_or_path.kind == 'orbax':
+            return restore_orbax_params_only(ref_or_path, params)
+        return restore_flax_params_only(ref_or_path.path, params)
+    return restore_flax_params_only(str(ref_or_path), params)
 
 
 def _host_numpy_leaf(x):
@@ -533,48 +652,217 @@ def make_optimizer(cfg: Dict[str, Any], total_steps: int):
     )
 
 
+def _factory_kwargs(factory, kwargs):
+    try:
+        sig = inspect.signature(factory)
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
+def _chunk_size_from_count(name: str, local_count: int, n_chunks: int) -> int:
+    n_chunks = max(1, int(n_chunks))
+    local_count = int(local_count)
+    if local_count <= 0:
+        raise ValueError(f'{name} local count must be > 0, got {local_count}')
+    return max(1, int(math.ceil(local_count / n_chunks)))
+
+
 def build_sharded_fns_if_needed(cfg: Dict[str, Any], mesh):
     version = cfg.get('model', {}).get('model_version', '')
     mesh_model = int(cfg.get('training', {}).get('mesh_model', 1))
-    if version != 'spatial-r1-v3.9.4' or mesh_model <= 1:
+    if tj._is_baseline_version(version):
+        if mesh_model <= 1:
+            return None
+        from models.baseline_transformer_jax import create_baseline_sharded_fns
+        return create_baseline_sharded_fns(mesh, cfg)
+
+    if version == 'spatial-r1-v3.9.4' and mesh_model > 1:
+        import models.legacy.dawn_spatial_v394_exp as dawn394
+        m = cfg['model']; tr = cfg.get('training', {})
+        n_know = int(m.get('n_know', 25200)) // mesh_model
+        n_qk = int(m.get('n_qk', 1580)) // mesh_model
+        n_v = int(m.get('n_v', 2600)) // mesh_model
+        ck = max(1, math.ceil(n_know / max(1, int(tr.get('n_chunks_know', 1)))))
+        cq = max(1, math.ceil(n_qk / max(1, int(tr.get('n_chunks_qk', 1)))))
+        cv = max(1, math.ceil(n_v / max(1, int(tr.get('n_chunks_v', 1)))))
+        single_chunk = max(ck, cv)
+        paired_chunk = cq
+        return (dawn394.make_sharded_srw(mesh, max_chunk_size=single_chunk),
+                dawn394.make_sharded_srw_paired(mesh, max_chunk_size=paired_chunk))
+
+    if not tj._is_active_srw_version(version):
         return None
-    import models.legacy.dawn_spatial_v394_exp as dawn394
+
+    entry = tj._model_registry_entry(version)
+    srw_module = __import__(entry['module'], fromlist=['make_sharded_srw'])
+    make_sharded_srw = srw_module.make_sharded_srw
+    make_sharded_srw_minimal = getattr(srw_module, 'make_sharded_srw_minimal', None)
+    make_sharded_srw_paired = getattr(srw_module, 'make_sharded_srw_paired', None)
+    make_sharded_srw_paired_minimal = getattr(
+        srw_module, 'make_sharded_srw_paired_minimal', None)
+    if make_sharded_srw_paired is None:
+        raise RuntimeError(f'{version} module is missing make_sharded_srw_paired.')
+
     m = cfg['model']; tr = cfg.get('training', {})
-    n_know = int(m.get('n_know', 25200)) // mesh_model
-    n_qk = int(m.get('n_qk', 1580)) // mesh_model
-    n_v = int(m.get('n_v', 2600)) // mesh_model
-    ck = max(1, math.ceil(n_know / max(1, int(tr.get('n_chunks_know', 1)))))
-    cq = max(1, math.ceil(n_qk / max(1, int(tr.get('n_chunks_qk', 1)))))
-    cv = max(1, math.ceil(n_v / max(1, int(tr.get('n_chunks_v', 1)))))
-    single_chunk = max(ck, cv)
-    paired_chunk = cq
-    return (dawn394.make_sharded_srw(mesh, max_chunk_size=single_chunk),
-            dawn394.make_sharded_srw_paired(mesh, max_chunk_size=paired_chunk))
+    for name in ('n_qk', 'n_v'):
+        if int(m[name]) % mesh_model != 0:
+            raise ValueError(
+                f'model.{name}={m[name]} must be divisible by mesh_model={mesh_model}.')
+    n_rst = int(m.get('n_rst', m.get('n_know', 25200)))
+    if n_rst % mesh_model != 0:
+        raise ValueError(
+            f'model.n_rst={n_rst} must be divisible by mesh_model={mesh_model}.')
+
+    nqk_local = int(m['n_qk']) // mesh_model
+    nv_local = int(m['n_v']) // mesh_model
+    nrst_local = n_rst // mesh_model
+    qk_chunk = _chunk_size_from_count(
+        'attn_qk', nqk_local, tr.get('n_chunks_qk', 1))
+    v_chunk = _chunk_size_from_count(
+        'attn_v', nv_local, tr.get('n_chunks_v', 1))
+    rst_chunk = _chunk_size_from_count(
+        'rst', nrst_local, tr.get('n_chunks_rst', tr.get('n_chunks_know', 1)))
+
+    base_kwargs = {'mesh': mesh}
+    base_kwargs.update(tj._v4164_sharded_kwargs(cfg))
+    single_v = make_sharded_srw(
+        max_chunk_size=v_chunk,
+        **_factory_kwargs(make_sharded_srw, base_kwargs))
+    single_rst = make_sharded_srw(
+        max_chunk_size=rst_chunk,
+        **_factory_kwargs(make_sharded_srw, base_kwargs))
+    paired_qk = make_sharded_srw_paired(
+        max_chunk_size=qk_chunk,
+        **_factory_kwargs(make_sharded_srw_paired, base_kwargs))
+
+    sharded_fns = {
+        'single': single_v,
+        'attn_v_single': single_v,
+        'rst_single': single_rst,
+        'paired': paired_qk,
+        'attn_qk_paired': paired_qk,
+    }
+    if make_sharded_srw_minimal is not None:
+        single_qk_min = make_sharded_srw_minimal(
+            max_chunk_size=qk_chunk,
+            **_factory_kwargs(make_sharded_srw_minimal, base_kwargs))
+        single_v_min = make_sharded_srw_minimal(
+            max_chunk_size=v_chunk,
+            **_factory_kwargs(make_sharded_srw_minimal, base_kwargs))
+        single_rst_min = make_sharded_srw_minimal(
+            max_chunk_size=rst_chunk,
+            **_factory_kwargs(make_sharded_srw_minimal, base_kwargs))
+        sharded_fns.update({
+            'attn_qk_single_minimal': single_qk_min,
+            'attn_v_single_minimal': single_v_min,
+            'rst_single_minimal': single_rst_min,
+        })
+    if make_sharded_srw_paired_minimal is not None:
+        paired_min = make_sharded_srw_paired_minimal(
+            max_chunk_size=qk_chunk,
+            **_factory_kwargs(make_sharded_srw_paired_minimal, base_kwargs))
+        sharded_fns['attn_qk_paired_minimal'] = paired_min
+
+    if (version in (tj.V4166_MODEL_VERSION, tj.V4168_MODEL_VERSION)
+            and mesh_model > 1
+            and m.get('logical_vocab_size') is not None
+            and m.get('vocab_size_padded') is not None):
+        from models.vocab_parallel import (
+            make_vocab_parallel_ce,
+            make_vocab_parallel_embedding,
+        )
+        logical_vocab = int(m['logical_vocab_size'])
+        padded_vocab = int(m['vocab_size_padded'])
+        if padded_vocab % mesh_model != 0:
+            raise ValueError(
+                f'model.vocab_size_padded={padded_vocab} must be divisible by mesh_model={mesh_model}.')
+        ce_chunk = int(tr.get('ce_token_chunk_size', 32768))
+        sharded_fns['vocab_parallel_embedding'] = make_vocab_parallel_embedding(
+            mesh, logical_vocab, padded_vocab)
+        sharded_fns['vocab_ce'] = make_vocab_parallel_ce(
+            mesh,
+            logical_vocab_size=logical_vocab,
+            vocab_size_padded=padded_vocab,
+            token_chunk_size=ce_chunk,
+            compute_accuracy=bool(tr.get('train_compute_accuracy', True)),
+            compute_logit_stats=False,
+        )
+    log(
+        f'[shard] {version} shard_map enabled mesh_model={mesh_model} '
+        f'chunks qk/v/rst={qk_chunk}/{v_chunk}/{rst_chunk}')
+    return sharded_fns
 
 
-def model_apply_train(model, params, input_ids, labels, attention_mask, dropout_key, sharded_fns):
+def _call_extra_kwargs(model, cfg, sharded_fns, deterministic: bool,
+                       compute_accuracy: bool):
     kwargs = {}
     if sharded_fns is not None:
         kwargs['sharded_fns'] = sharded_fns
+    if tj._model_accepts_analysis(model):
+        kwargs['analysis'] = False
+    model_version = str(getattr(
+        model, '__version__', getattr(type(model), '__version__', '')))
+    if (model_version in (tj.V4166_MODEL_VERSION, tj.V4168_MODEL_VERSION)
+            and tj._model_accepts_minimal_train(model)):
+        kwargs['minimal_train'] = True
+    tr = cfg.get('training', {})
+    if tj._model_accepts_soft_gate_schedule(model):
+        soft_t = float(tr.get(
+            'soft_gate_temperature',
+            tr.get('soft_gate_t_final', 0.07)))
+        kwargs['soft_gate_temperature'] = soft_t
+        kwargs['soft_gate_T_qk'] = float(tr.get('soft_gate_T_qk', soft_t))
+        kwargs['soft_gate_T_v'] = float(tr.get('soft_gate_T_v', soft_t))
+        kwargs['soft_gate_T_rst'] = float(tr.get('soft_gate_T_rst', soft_t))
+    if tj._model_accepts_soft_gate_t_final(model):
+        kwargs['soft_gate_t_final'] = float(tr.get('soft_gate_t_final', 0.07))
+    if tj._model_accepts_soft_gate_boundary_power(model):
+        boundary = float(tr.get(
+            'soft_gate_boundary_power',
+            tr.get('soft_gate_boundary_power_final', 4.0)))
+        kwargs['soft_gate_boundary_power'] = boundary
+        kwargs['soft_gate_boundary_power_final'] = float(
+            tr.get('soft_gate_boundary_power_final', boundary))
+    if tj._model_accepts_admission_den_power(model):
+        kwargs['admission_den_power'] = float(tr.get('admission_den_power', 1.0))
+    if tj._model_accepts_execution_prune_eps(model):
+        kwargs['execution_prune_eps'] = 0.0
+    if tj._model_accepts_ce_token_chunk_size(model):
+        kwargs['ce_token_chunk_size'] = int(tr.get('ce_token_chunk_size', 32768))
+    if tj._model_accepts_compute_accuracy(model):
+        kwargs['compute_accuracy'] = bool(compute_accuracy)
+    return kwargs
+
+
+def model_apply_train(model, cfg, params, input_ids, labels, attention_mask,
+                      dropout_key, sharded_fns, deterministic=False,
+                      compute_accuracy=True):
+    kwargs = _call_extra_kwargs(
+        model, cfg, sharded_fns, deterministic, compute_accuracy)
     return model.apply({'params': params}, input_ids, labels=labels,
-                       attention_mask=attention_mask, deterministic=False,
+                       attention_mask=attention_mask, deterministic=deterministic,
                        rngs={'dropout': dropout_key}, **kwargs)
 
 
-def model_apply_logits(model, params, input_ids, attention_mask, sharded_fns):
-    kwargs = {}
-    if sharded_fns is not None:
-        kwargs['sharded_fns'] = sharded_fns
+def model_apply_logits(model, cfg, params, input_ids, attention_mask, sharded_fns):
+    kwargs = _call_extra_kwargs(
+        model, cfg, sharded_fns, deterministic=True, compute_accuracy=False)
     return model.apply({'params': params}, input_ids, labels=None,
                        attention_mask=attention_mask, deterministic=True,
                        rngs={'dropout': jax.random.PRNGKey(0)}, **kwargs)['logits']
 
 
-def make_train_step(model, optimizer, sharded_fns, aux_weight: float, tau_weight: float):
+def make_train_step(model, cfg, optimizer, sharded_fns, aux_weight: float, tau_weight: float):
     @jax.jit
     def train_step(params, opt_state, input_ids, labels, attention_mask, dropout_key):
         def loss_fn(p):
-            out = model_apply_train(model, p, input_ids, labels, attention_mask, dropout_key, sharded_fns)
+            out = model_apply_train(
+                model, cfg, p, input_ids, labels, attention_mask,
+                dropout_key, sharded_fns, deterministic=False,
+                compute_accuracy=True)
             lm_loss = out['loss']
             aux_loss = out.get('aux_loss', jnp.float32(0.0))
             tau_reg = out.get('tau_reg', jnp.float32(0.0))
@@ -590,10 +878,22 @@ def make_train_step(model, optimizer, sharded_fns, aux_weight: float, tau_weight
     return train_step
 
 
-def make_score_step(model, sharded_fns):
+def make_score_step(model, cfg, sharded_fns, use_ce_scoring: bool):
     @jax.jit
     def score_step(params, input_ids, score_mask, attention_mask):
-        logits = model_apply_logits(model, params, input_ids, attention_mask, sharded_fns)
+        if use_ce_scoring:
+            labels = jnp.where(score_mask == 1, input_ids, -100)
+            out = model_apply_train(
+                model, cfg, params, input_ids, labels, attention_mask,
+                jax.random.PRNGKey(0), sharded_fns, deterministic=True,
+                compute_accuracy=False)
+            per_token_ce = out['per_token_ce']
+            mask = score_mask[:, 1:].astype(jnp.float32)
+            summed = (per_token_ce * mask).sum(axis=-1)
+            denom = jnp.maximum(mask.sum(axis=-1), 1.0)
+            return -summed / denom
+        logits = model_apply_logits(
+            model, cfg, params, input_ids, attention_mask, sharded_fns)
         logits = logits[:, :-1, :]
         target = input_ids[:, 1:]
         mask = score_mask[:, 1:].astype(jnp.float32)
@@ -678,6 +978,8 @@ def main():
     if args.init_from and args.resume_from:
         raise ValueError('Use only one of --init-from or --resume-from')
 
+    maybe_initialize_jax_distributed(cfg)
+
     cfg_resume = cfg.get('resume_from') or ds_cfg.get('resume_from')
     resume_from = args.resume_from or cfg_resume
     init_from = None if resume_from else (args.init_from or cfg.get('init_from') or ds_cfg.get('init_from'))
@@ -692,11 +994,14 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
     pad_id = ensure_pad_token(tokenizer)
 
+    tj._maybe_materialize_vocab_parallel_config(cfg)
+
     # Build model from the existing train_jax registry. No train_jax/model code is modified here.
     model = tj.build_model_from_config(cfg)
     model_version = cfg.get('model', {}).get('model_version', 'baseline')
-    is_baseline = model_version == 'baseline'
-    is_spatial = model_version in ('spatial-r1-v3.9.4', 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw')
+    use_ce_scoring = (
+        model_version in (tj.V4166_MODEL_VERSION, tj.V4168_MODEL_VERSION)
+        and int(cfg.get('training', {}).get('mesh_model', 1)) > 1)
 
     mcfg, tcfg = cfg.get('model', {}), cfg.get('training', {})
     max_seq_len = int(ds_cfg.get('max_seq_len', mcfg.get('max_seq_len', 512)))
@@ -710,6 +1015,26 @@ def main():
         raise ValueError(f'training.batch_size={batch_size} must be divisible by device_count={total_devices}')
     if eval_batch_size % total_devices != 0:
         raise ValueError(f'eval_batch_size={eval_batch_size} must be divisible by device_count={total_devices}')
+    mesh_model = int(tcfg.get('mesh_model', 1))
+    mesh_data = int(tcfg.get('mesh_data', 0)) or (total_devices // mesh_model)
+    if mesh_data * mesh_model != total_devices:
+        raise ValueError(
+            f'training.mesh_data({mesh_data}) * mesh_model({mesh_model}) '
+            f'must equal device_count={total_devices}')
+    if n_hosts > 1:
+        tj._assert_multihost_same_startup_context({
+            'trainer_script': 'scripts/downstream_finetune_jax.py',
+            'config_path': str(args.config),
+            'model_version': model_version,
+            'task': task,
+            'init_from': init_from,
+            'resume_from': resume_from,
+            'process_count': n_hosts,
+            'mesh_data': mesh_data,
+            'mesh_model': mesh_model,
+            'batch_size': batch_size,
+            'eval_batch_size': eval_batch_size,
+        })
 
     # Load downstream data, not C4.
     raw_train, raw_eval = load_raw_splits(ds_cfg, task)
@@ -771,23 +1096,27 @@ def main():
     params = variables['params']
 
     # Mesh/shard params.
-    mesh_model = int(tcfg.get('mesh_model', 1))
-    mesh_data = int(tcfg.get('mesh_data', 0)) or (total_devices // mesh_model)
     mesh = tj.create_mesh(mesh_data, mesh_model)
     data_sharding = NamedSharding(mesh, P('data', None))
-    param_shardings = tj.get_param_shardings(params, mesh, is_baseline=is_baseline)
+    param_shardings = tj.get_param_shardings(
+        params,
+        mesh,
+        model_version,
+        vocab_size_padded=cfg.get('model', {}).get('vocab_size_padded', None),
+    )
     params = tj.shard_params_to_mesh(params, param_shardings)
 
     sharded_fns = build_sharded_fns_if_needed(cfg, mesh)
 
     optimizer = make_optimizer(cfg, total_steps)
     opt_state = optimizer.init(params)
+    opt_state = tj._replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
 
     # Load params-only or resume full state.
     global_step = 0
     best_acc = -1.0
     if resume_from:
-        rp = resolve_checkpoint_path(resume_from)
+        rp = resolve_flax_checkpoint_path(resume_from)
         ckpt = tj.load_checkpoint(rp, params, opt_state)
         params = ckpt['params']; opt_state = ckpt['opt_state']
         global_step = int(ckpt.get('step', 0))
@@ -795,12 +1124,13 @@ def main():
         best_acc = float(-ckpt.get('best_val_loss', 1.0))
         log(f'[resume] loaded params+optimizer+step from: {rp} step={global_step}')
     elif init_from:
-        ip = resolve_checkpoint_path(init_from)
+        ip = resolve_init_checkpoint_ref(init_from)
         params = restore_params_only(ip, params)
         opt_state = optimizer.init(params)
+        opt_state = tj._replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
         global_step = 0
         best_acc = -1.0
-        log(f'[init] loaded params only from: {ip}; optimizer=fresh; step=0')
+        log(f'[init] loaded params only from: {ip.path}; optimizer=fresh; step=0')
     else:
         log('[init] no init-from: random-init downstream control')
 
@@ -818,9 +1148,9 @@ def main():
         write_json(join_path(run_dir, 'config.json'), cfg)
         write_text(metrics_csv_path, 'phase,step,loss,lm_loss,acc,grad_norm,tokens,eval_acc,total,best_acc,elapsed_sec\n')
 
-    train_step = make_train_step(model, optimizer, sharded_fns,
+    train_step = make_train_step(model, cfg, optimizer, sharded_fns,
                                  float(tcfg.get('aux_weight', 0.0)), float(tcfg.get('tau_weight', 0.0)))
-    score_step = make_score_step(model, sharded_fns)
+    score_step = make_score_step(model, cfg, sharded_fns, use_ce_scoring)
 
     def _sync_eval_decision(ev: Dict[str, Any], current_best: float):
         """Broadcast host0 eval accuracy and new-best decision to all hosts.

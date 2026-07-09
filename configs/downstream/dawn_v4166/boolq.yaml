@@ -1,0 +1,55 @@
+seed: 1
+tokenizer: bert-base-uncased
+training:
+  batch_size: 64
+  eval_batch_size: 64
+  num_epochs: 3
+  lr: 2.0e-05
+  weight_decay: 0.01
+  warmup_ratio: 0.06
+  min_lr_ratio: 0.1
+  max_grad_norm: 1.0
+  aux_weight: 0.0
+  tau_weight: 0.0
+  checkpoint_interval: 500
+  log_interval: 20
+  mesh_model: 2
+  mesh_data: 0
+  max_steps: 800
+  eval_interval: 100
+  ce_token_chunk_size: 8192
+  train_compute_accuracy: true
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  n_chunks_rst: 4
+  initialize_jax_distributed: true
+  soft_gate_t_final: 0.07
+  soft_gate_boundary_power_final: 4.0
+  admission_den_power: 0.5
+downstream:
+  source: hf
+  max_seq_len: 512
+  add_eos: false
+  task: boolq
+model:
+  model_version: spatial-r1-v4.1.6.6
+  vocab_size: 30522
+  d_model: 2304
+  n_layers: 18
+  n_heads: 36
+  max_seq_len: 512
+  dropout: 0.0
+  router_dropout: 0.0
+  gradient_checkpointing: true
+  d_route: 256
+  n_qk: 3798
+  n_v: 11824
+  n_rst: 31756
+  tau_init_min: -0.95
+  tau_init_max: 0.95
+  tau_init_mode: quantile_frac
+  tau_init_target_qk_frac: 0.10
+  tau_init_target_v_frac: 0.04
+  tau_init_target_rst_frac: 0.02
+checkpoint_dir: gs://dawn-tpu-data-c4/downstream_runs/dawn_srw_v4166_400M/boolq
+run_name: dawn_srw_v4166_400M_boolq

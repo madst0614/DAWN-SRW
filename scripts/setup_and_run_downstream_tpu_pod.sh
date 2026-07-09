@@ -20,7 +20,7 @@ cd "$WORK_DIR"
 echo "[1/4] Installing dependencies..."
 python3 -m pip install --upgrade pip -q
 python3 -m pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-python3 -m pip install -U flax optax numpy pyyaml gcsfs transformers sentencepiece fsspec huggingface_hub -q
+python3 -m pip install -U flax optax numpy pyyaml gcsfs transformers sentencepiece fsspec huggingface_hub "orbax-checkpoint==0.11.24" -q
 # Pin datasets/pyarrow to a compatible pair. New pyarrow removed PyExtensionType,
 # which older datasets imports at startup.
 python3 -m pip install --force-reinstall --no-cache-dir "pyarrow==20.0.0" "datasets==2.19.2" -q
@@ -54,6 +54,7 @@ export XLA_DUMP_DIR
 export JAX_TRACEBACK_FILTERING="${JAX_TRACEBACK_FILTERING:-auto}"
 export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-0}"
 export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-2}"
+export DOWNSTREAM_JAX_DISTRIBUTED="${DOWNSTREAM_JAX_DISTRIBUTED:-1}"
 if [ -z "${XLA_FLAGS:-}" ]; then
   export XLA_FLAGS="--xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
 else
@@ -76,6 +77,7 @@ tmux new-session -d -s train \
    export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; \
    export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; \
    export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; \
+   export DOWNSTREAM_JAX_DISTRIBUTED='$DOWNSTREAM_JAX_DISTRIBUTED'; \
    export XLA_FLAGS='$XLA_FLAGS'; \
    cd '$WORK_DIR'; \
    $CMD 2>&1 | tee ~/train.log; \
