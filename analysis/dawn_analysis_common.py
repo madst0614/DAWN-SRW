@@ -609,6 +609,7 @@ def _create_restore_optimizer(cfg: Dict[str, Any], params: Any):
 
 def create_ce_eval_step(model, sharded_fns=None, *, minimal_train: bool = True,
                         return_prune_stats: bool = False,
+                        return_pool_prune_stats: bool = False,
                         execution_prune_eps: float = 0.0,
                         total_training_steps: int = 1,
                         cfg: Optional[Dict[str, Any]] = None):
@@ -679,8 +680,9 @@ def create_ce_eval_step(model, sharded_fns=None, *, minimal_train: bool = True,
             _gate_den_min,
             no_active,
             unpruned_den,
+            *pool_stats,
         ) = ret
-        return (
+        base = (
             loss,
             correct,
             valid_count,
@@ -690,6 +692,9 @@ def create_ce_eval_step(model, sharded_fns=None, *, minimal_train: bool = True,
             no_active,
             unpruned_den,
         )
+        if return_pool_prune_stats:
+            return base + tuple(pool_stats)
+        return base
 
     return step
 

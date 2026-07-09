@@ -7327,6 +7327,15 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                     result.get('execution_prune_gate_den_min', jnp.float32(0.0)),
                     result.get('execution_prune_no_active_frac', jnp.float32(0.0)),
                     result.get('execution_prune_unpruned_gate_den_mean', jnp.float32(0.0)),
+                    result.get('attn_qk_active_n_mean', jnp.float32(0.0)),
+                    result.get('attn_v_active_n_mean', jnp.float32(0.0)),
+                    result.get('rst_active_n_mean', jnp.float32(0.0)),
+                    result.get('attn_qk_active_eps_1e_2_frac', jnp.float32(0.0)),
+                    result.get('attn_v_active_eps_1e_2_frac', jnp.float32(0.0)),
+                    result.get('rst_active_eps_1e_2_frac', jnp.float32(0.0)),
+                    result.get('attn_qk_gate_eff_n', jnp.float32(0.0)),
+                    result.get('attn_v_gate_eff_n', jnp.float32(0.0)),
+                    result.get('rst_gate_eff_n', jnp.float32(0.0)),
                 )
             return base_ret
         return result['loss'], result['correct'], result['valid_count']
@@ -7836,7 +7845,7 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
                  prune_compute_frac, prune_gate_mass_retained,
                  prune_gate_den_mean, prune_gate_den_min,
                  prune_no_active_frac,
-                 prune_unpruned_gate_den_mean) = eval_ret
+                 prune_unpruned_gate_den_mean, *_) = eval_ret
                 prune_compute_sum_jax = prune_compute_sum_jax + jnp.asarray(
                     prune_compute_frac, dtype=jnp.float32)
                 prune_mass_sum_jax = prune_mass_sum_jax + jnp.asarray(

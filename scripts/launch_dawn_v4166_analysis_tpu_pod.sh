@@ -22,7 +22,7 @@
 #     --project dawn-486218 \
 #     --zone us-central2-b \
 #     --branch codex/v4167-poc \
-#     --mode train
+#     --mode train_analysis
 #
 # If the TPU does not exist yet, create it separately, for example:
 #   gcloud compute tpus tpu-vm create dawn-400m-v4-64 \
@@ -59,13 +59,23 @@ MODE_EXPLICIT="0"
 CHECKPOINT_DIR_EXPLICIT="0"
 PRUNE_EPS_EXPLICIT="0"
 REMOTE_LOG_EXPLICIT="0"
+ANALYSIS_PRESET_EXPLICIT="0"
 
 TRAIN_ANALYSIS_CONFIG="${DAWN_TRAIN_ANALYSIS_CONFIG:-}"
 TRAIN_ANALYSIS_CHECKPOINT_DIR="${DAWN_TRAIN_ANALYSIS_CHECKPOINT_DIR:-gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new}"
 TRAIN_ANALYSIS_MAX_BATCHES="${DAWN_TRAIN_ANALYSIS_MAX_BATCHES:-8}"
-TRAIN_ANALYSIS_PRUNE_EPS="${DAWN_TRAIN_ANALYSIS_PRUNE_EPS:-1e-6,1e-5,1e-4,1e-3}"
+TRAIN_ANALYSIS_PRUNE_EPS="${DAWN_TRAIN_ANALYSIS_PRUNE_EPS:-1e-2,1e-1}"
+TRAIN_ANALYSIS_PRESET="${DAWN_TRAIN_ANALYSIS_PRESET:-qk_closed}"
+TRAIN_ANALYSIS_ITEMS="${DAWN_TRAIN_ANALYSIS_ITEMS:-}"
+TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS="${DAWN_TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS:-3}"
+TRAIN_ANALYSIS_GENERATION_MAX_TOKENS="${DAWN_TRAIN_ANALYSIS_GENERATION_MAX_TOKENS:-24}"
+TRAIN_ANALYSIS_GENERATION_TEMPERATURE="${DAWN_TRAIN_ANALYSIS_GENERATION_TEMPERATURE:-0}"
+TRAIN_ANALYSIS_GENERATION_TOP_K="${DAWN_TRAIN_ANALYSIS_GENERATION_TOP_K:-50}"
 if [[ -n "${DAWN_TRAIN_ANALYSIS_PRUNE_EPS+x}" ]]; then
     PRUNE_EPS_EXPLICIT="1"
+fi
+if [[ -n "${DAWN_TRAIN_ANALYSIS_PRESET+x}" ]]; then
+    ANALYSIS_PRESET_EXPLICIT="1"
 fi
 
 normalize_gcs_arg() {
@@ -106,6 +116,9 @@ apply_preset() {
             if [[ "$PRUNE_EPS_EXPLICIT" == "0" ]]; then
                 TRAIN_ANALYSIS_PRUNE_EPS="1e-2,1e-1"
             fi
+            if [[ "$ANALYSIS_PRESET_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_PRESET="v4166_1b"
+            fi
             ;;
         *)
             echo "ERROR: unknown --preset $1" >&2
@@ -144,6 +157,13 @@ while [[ $# -gt 0 ]]; do
         --eval-max-tokens) ANALYSIS_ARGS="$ANALYSIS_ARGS --eval-max-tokens $2"; shift 2 ;;
         --eval-batch-size) ANALYSIS_ARGS="$ANALYSIS_ARGS --eval-batch-size $2"; shift 2 ;;
         --prune-eps) TRAIN_ANALYSIS_PRUNE_EPS="$2"; PRUNE_EPS_EXPLICIT="1"; shift 2 ;;
+        --analysis-preset) TRAIN_ANALYSIS_PRESET="$2"; ANALYSIS_PRESET_EXPLICIT="1"; shift 2 ;;
+        --analysis-items) TRAIN_ANALYSIS_ITEMS="$2"; shift 2 ;;
+        --analysis-generation-max-prompts) TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS="$2"; shift 2 ;;
+        --analysis-generation-max-tokens) TRAIN_ANALYSIS_GENERATION_MAX_TOKENS="$2"; shift 2 ;;
+        --analysis-generation-temperature) TRAIN_ANALYSIS_GENERATION_TEMPERATURE="$2"; shift 2 ;;
+        --analysis-generation-top-k) TRAIN_ANALYSIS_GENERATION_TOP_K="$2"; shift 2 ;;
+        --list-analysis-items) ANALYSIS_ARGS="$ANALYSIS_ARGS --list-train-analysis-items"; shift ;;
         --usage-max-sequences) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-max-sequences $2"; shift 2 ;;
         --usage-batch-size) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-batch-size $2"; shift 2 ;;
         --usage-seq-len) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-seq-len $2"; shift 2 ;;
@@ -168,6 +188,13 @@ while [[ $# -gt 0 ]]; do
             echo "  --checkpoint-dir DIR      train_analysis base checkpoint dir. Default: $TRAIN_ANALYSIS_CHECKPOINT_DIR"
             echo "  --output PATH_OR_GS       Default: $OUTPUT"
             echo "  --stages CSV              Default: $STAGES"
+            echo "  --analysis-preset NAME    Train-analysis item preset. Default: $TRAIN_ANALYSIS_PRESET"
+            echo "  --analysis-items CSV      Override train-analysis items"
+            echo "  --analysis-generation-max-prompts N"
+            echo "  --analysis-generation-max-tokens N"
+            echo "  --analysis-generation-temperature F"
+            echo "  --analysis-generation-top-k N"
+            echo "  --list-analysis-items     Print train-analysis item catalog"
             echo "  --branch BRANCH           Default: $BRANCH"
             echo "  --repo-url URL            Default: $REPO_URL"
             echo "  --log PATH                Remote log path. Default: ~/train.log"
@@ -265,6 +292,16 @@ if [[ "$MODE" == "train_analysis" ]]; then
     if [[ "$REMOTE_LOG_EXPLICIT" == "1" ]]; then
         COPY_CMD="$COPY_CMD --log $REMOTE_LOG"
     fi
+    if [[ -n "$TRAIN_ANALYSIS_PRESET" ]]; then
+        COPY_CMD="$COPY_CMD --analysis-preset $TRAIN_ANALYSIS_PRESET"
+    fi
+    if [[ -n "$TRAIN_ANALYSIS_ITEMS" ]]; then
+        COPY_CMD="$COPY_CMD --analysis-items $TRAIN_ANALYSIS_ITEMS"
+    fi
+    COPY_CMD="$COPY_CMD --analysis-generation-max-prompts $TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS"
+    COPY_CMD="$COPY_CMD --analysis-generation-max-tokens $TRAIN_ANALYSIS_GENERATION_MAX_TOKENS"
+    COPY_CMD="$COPY_CMD --analysis-generation-temperature $TRAIN_ANALYSIS_GENERATION_TEMPERATURE"
+    COPY_CMD="$COPY_CMD --analysis-generation-top-k $TRAIN_ANALYSIS_GENERATION_TOP_K"
 fi
 WATCH_LOG_CMD="bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --log $REMOTE_LOG --target $TMUX_SESSION --summary"
 
@@ -291,6 +328,12 @@ if [[ "$MODE" == "train_analysis" ]]; then
     echo "  output          : $OUTPUT"
     echo "  analysis_batches: $TRAIN_ANALYSIS_MAX_BATCHES"
     echo "  prune_eps       : $TRAIN_ANALYSIS_PRUNE_EPS"
+    echo "  analysis_preset : $TRAIN_ANALYSIS_PRESET"
+    echo "  analysis_items  : ${TRAIN_ANALYSIS_ITEMS:-preset default}"
+    echo "  gen_max_prompts : $TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS"
+    echo "  gen_max_tokens  : $TRAIN_ANALYSIS_GENERATION_MAX_TOKENS"
+    echo "  gen_temperature : $TRAIN_ANALYSIS_GENERATION_TEMPERATURE"
+    echo "  gen_top_k       : $TRAIN_ANALYSIS_GENERATION_TOP_K"
 else
     echo "  checkpoint      : $CHECKPOINT"
     echo "  output          : $OUTPUT"
@@ -309,11 +352,14 @@ if [[ "$DRY_RUN" == "1" ]]; then
     echo "Dry run: no TPU command will be sent."
     if [[ "$MODE" == "train_analysis" ]]; then
         echo "Remote Python:"
+        DRY_RUN_ANALYSIS_CMD="python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --train-analysis-preset $TRAIN_ANALYSIS_PRESET --train-analysis-generation-max-prompts $TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS --train-analysis-generation-max-tokens $TRAIN_ANALYSIS_GENERATION_MAX_TOKENS --train-analysis-generation-temperature $TRAIN_ANALYSIS_GENERATION_TEMPERATURE --train-analysis-generation-top-k $TRAIN_ANALYSIS_GENERATION_TOP_K --init-distributed"
         if [[ -n "$TRAIN_ANALYSIS_CONFIG" ]]; then
-            echo "  python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --config $TRAIN_ANALYSIS_CONFIG --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --init-distributed"
-        else
-            echo "  python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --init-distributed"
+            DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --config $TRAIN_ANALYSIS_CONFIG"
         fi
+        if [[ -n "$TRAIN_ANALYSIS_ITEMS" ]]; then
+            DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --train-analysis-items $TRAIN_ANALYSIS_ITEMS"
+        fi
+        echo "  $DRY_RUN_ANALYSIS_CMD"
     else
         echo "Remote Python:"
         echo "  python3 -u scripts/analyze_dawn_srw_v4166.py --checkpoint $CHECKPOINT --output $OUTPUT --stages $STAGES --init-distributed ${ANALYSIS_ARGS:-}"
@@ -462,6 +508,12 @@ TRAIN_ANALYSIS_CONFIG='${TRAIN_ANALYSIS_CONFIG}'
 TRAIN_ANALYSIS_CHECKPOINT_DIR='${TRAIN_ANALYSIS_CHECKPOINT_DIR}'
 TRAIN_ANALYSIS_MAX_BATCHES='${TRAIN_ANALYSIS_MAX_BATCHES}'
 TRAIN_ANALYSIS_PRUNE_EPS='${TRAIN_ANALYSIS_PRUNE_EPS}'
+TRAIN_ANALYSIS_PRESET='${TRAIN_ANALYSIS_PRESET}'
+TRAIN_ANALYSIS_ITEMS='${TRAIN_ANALYSIS_ITEMS}'
+TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS='${TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS}'
+TRAIN_ANALYSIS_GENERATION_MAX_TOKENS='${TRAIN_ANALYSIS_GENERATION_MAX_TOKENS}'
+TRAIN_ANALYSIS_GENERATION_TEMPERATURE='${TRAIN_ANALYSIS_GENERATION_TEMPERATURE}'
+TRAIN_ANALYSIS_GENERATION_TOP_K='${TRAIN_ANALYSIS_GENERATION_TOP_K}'
 DETACH='${DETACH}'
 INSTALL_DEPS='${INSTALL_DEPS}'
 TMUX_SESSION='${TMUX_SESSION}'
@@ -483,6 +535,12 @@ if [ "\$MODE" = "train_analysis" ]; then
     echo "TRAIN_ANALYSIS_CHECKPOINT_DIR=\$TRAIN_ANALYSIS_CHECKPOINT_DIR"
     echo "TRAIN_ANALYSIS_MAX_BATCHES=\$TRAIN_ANALYSIS_MAX_BATCHES"
     echo "TRAIN_ANALYSIS_PRUNE_EPS=\$TRAIN_ANALYSIS_PRUNE_EPS"
+    echo "TRAIN_ANALYSIS_PRESET=\$TRAIN_ANALYSIS_PRESET"
+    echo "TRAIN_ANALYSIS_ITEMS=\${TRAIN_ANALYSIS_ITEMS:-preset default}"
+    echo "TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS=\$TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS"
+    echo "TRAIN_ANALYSIS_GENERATION_MAX_TOKENS=\$TRAIN_ANALYSIS_GENERATION_MAX_TOKENS"
+    echo "TRAIN_ANALYSIS_GENERATION_TEMPERATURE=\$TRAIN_ANALYSIS_GENERATION_TEMPERATURE"
+    echo "TRAIN_ANALYSIS_GENERATION_TOP_K=\$TRAIN_ANALYSIS_GENERATION_TOP_K"
 fi
 
 if [ -d "\$WORK_DIR/.git" ]; then
@@ -518,10 +576,18 @@ if [ "\$MODE" = "train_analysis" ]; then
         --output "\$OUTPUT"
         --train-analysis-max-batches "\$TRAIN_ANALYSIS_MAX_BATCHES"
         --prune-eps "\$TRAIN_ANALYSIS_PRUNE_EPS"
+        --train-analysis-preset "\$TRAIN_ANALYSIS_PRESET"
+        --train-analysis-generation-max-prompts "\$TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS"
+        --train-analysis-generation-max-tokens "\$TRAIN_ANALYSIS_GENERATION_MAX_TOKENS"
+        --train-analysis-generation-temperature "\$TRAIN_ANALYSIS_GENERATION_TEMPERATURE"
+        --train-analysis-generation-top-k "\$TRAIN_ANALYSIS_GENERATION_TOP_K"
         --init-distributed
     )
     if [ -n "\$TRAIN_ANALYSIS_CONFIG" ]; then
         ANALYSIS_CMD+=(--config "\$TRAIN_ANALYSIS_CONFIG")
+    fi
+    if [ -n "\$TRAIN_ANALYSIS_ITEMS" ]; then
+        ANALYSIS_CMD+=(--train-analysis-items "\$TRAIN_ANALYSIS_ITEMS")
     fi
 else
     ANALYSIS_CMD=(

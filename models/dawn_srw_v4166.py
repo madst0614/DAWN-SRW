@@ -4394,6 +4394,12 @@ class DAWN_SRW_V4166(nn.Module):
         def _sparsity_mean(diag_all, idx):
             return diag_all[:, idx].mean()
 
+        def _sparsity_layer(diag_all, name):
+            return diag_all[:, GATE_SPARSITY_DIAG_INDEX[name]]
+
+        def _select_layer(diag_all, idx):
+            return diag_all[:, idx]
+
         result = {
             'aux_loss': total_aux,
             'soft_gate_T': jnp.asarray(soft_gate_T_qk, dtype=jnp.float32),
@@ -4754,6 +4760,101 @@ class DAWN_SRW_V4166(nn.Module):
                 stacked['attn']['expand_O']['kernel'], axis=(-2, -1)).mean()
             _attn_logit_max_layer = jnp.argmax(attn_logit_max_all)
             result.update({
+                'per_layer_attn_qk_active_tau_frac': _sparsity_layer(
+                    attn_qk_sparsity_diag_all, 'active_tau_frac'),
+                'per_layer_attn_qk_admission_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_qk_sparsity_diag_all, 'admission_active_eps_1e_2_frac'),
+                'per_layer_attn_qk_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_qk_sparsity_diag_all, 'active_eps_1e_2_frac'),
+                'per_layer_attn_qk_mass_eps_1e_2': _sparsity_layer(
+                    attn_qk_sparsity_diag_all, 'mass_eps_1e_2'),
+                'per_layer_attn_qk_margin_band_pos': _sparsity_layer(
+                    attn_qk_sparsity_diag_all, 'margin_band_pos'),
+                'per_layer_attn_qk_active_n_mean': attn_split_core_all[
+                    :, ATTN_SPLIT_QK_ACTIVE_N_MEAN],
+                'per_layer_attn_qk_gate_eff_n': attn_split_core_all[
+                    :, ATTN_SPLIT_QK_GATE_EFF_N],
+                'per_layer_attn_qk_gate_eff_ratio': attn_split_core_all[
+                    :, ATTN_SPLIT_QK_GATE_EFF_RATIO],
+                'per_layer_attn_qk_execution_top1_frac': attn_split_core_all[
+                    :, ATTN_SPLIT_QK_TOP1_GATE_FRAC],
+                'per_layer_attn_qk_rho_mean': _select_layer(
+                    attn_qk_select_diag_all, SELECT_RHO_MEAN),
+                'per_layer_attn_qk_rho_std': _select_layer(
+                    attn_qk_select_diag_all, SELECT_RHO_STD),
+                'per_layer_attn_qk_rho_max': _select_layer(
+                    attn_qk_select_diag_all, SELECT_RHO_MAX),
+                'per_layer_attn_qk_tau_mean': _select_layer(
+                    attn_qk_select_diag_all, SELECT_TAU_MEAN),
+                'per_layer_attn_qk_tau_min': _select_layer(
+                    attn_qk_select_diag_all, SELECT_TAU_MIN),
+                'per_layer_attn_qk_tau_max': _select_layer(
+                    attn_qk_select_diag_all, SELECT_TAU_MAX),
+                'per_layer_attn_qk_selection_margin_mean': _select_layer(
+                    attn_qk_select_diag_all, SELECT_SELECTION_MARGIN_MEAN),
+                'per_layer_attn_qk_positive_margin_mean': _select_layer(
+                    attn_qk_select_diag_all, SELECT_POSITIVE_MARGIN_MEAN),
+                'per_layer_attn_qk_selected_frac': _select_layer(
+                    attn_qk_select_diag_all, SELECT_SELECTED_FRAC),
+                'per_layer_attn_v_active_tau_frac': _sparsity_layer(
+                    attn_v_sparsity_diag_all, 'active_tau_frac'),
+                'per_layer_attn_v_admission_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_v_sparsity_diag_all, 'admission_active_eps_1e_2_frac'),
+                'per_layer_attn_v_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_v_sparsity_diag_all, 'active_eps_1e_2_frac'),
+                'per_layer_attn_v_mass_eps_1e_2': _sparsity_layer(
+                    attn_v_sparsity_diag_all, 'mass_eps_1e_2'),
+                'per_layer_attn_v_margin_band_pos': _sparsity_layer(
+                    attn_v_sparsity_diag_all, 'margin_band_pos'),
+                'per_layer_attn_v_active_n_mean': attn_split_core_all[
+                    :, ATTN_SPLIT_V_ACTIVE_N_MEAN],
+                'per_layer_attn_v_gate_eff_n': attn_split_core_all[
+                    :, ATTN_SPLIT_V_GATE_EFF_N],
+                'per_layer_attn_v_gate_eff_ratio': attn_split_core_all[
+                    :, ATTN_SPLIT_V_GATE_EFF_RATIO],
+                'per_layer_attn_v_execution_top1_frac': attn_split_core_all[
+                    :, ATTN_SPLIT_V_TOP1_GATE_FRAC],
+                'per_layer_attn_v_rho_mean': _select_layer(
+                    attn_v_select_diag_all, SELECT_RHO_MEAN),
+                'per_layer_attn_v_rho_std': _select_layer(
+                    attn_v_select_diag_all, SELECT_RHO_STD),
+                'per_layer_attn_v_rho_max': _select_layer(
+                    attn_v_select_diag_all, SELECT_RHO_MAX),
+                'per_layer_attn_v_tau_mean': _select_layer(
+                    attn_v_select_diag_all, SELECT_TAU_MEAN),
+                'per_layer_attn_v_tau_min': _select_layer(
+                    attn_v_select_diag_all, SELECT_TAU_MIN),
+                'per_layer_attn_v_tau_max': _select_layer(
+                    attn_v_select_diag_all, SELECT_TAU_MAX),
+                'per_layer_attn_v_selection_margin_mean': _select_layer(
+                    attn_v_select_diag_all, SELECT_SELECTION_MARGIN_MEAN),
+                'per_layer_attn_v_positive_margin_mean': _select_layer(
+                    attn_v_select_diag_all, SELECT_POSITIVE_MARGIN_MEAN),
+                'per_layer_attn_v_selected_frac': _select_layer(
+                    attn_v_select_diag_all, SELECT_SELECTED_FRAC),
+                'per_layer_rst_active_tau_frac': _sparsity_layer(
+                    rst_sparsity_diag_all, 'active_tau_frac'),
+                'per_layer_rst_admission_active_eps_1e_2_frac': _sparsity_layer(
+                    rst_sparsity_diag_all, 'admission_active_eps_1e_2_frac'),
+                'per_layer_rst_active_eps_1e_2_frac': _sparsity_layer(
+                    rst_sparsity_diag_all, 'active_eps_1e_2_frac'),
+                'per_layer_rst_mass_eps_1e_2': _sparsity_layer(
+                    rst_sparsity_diag_all, 'mass_eps_1e_2'),
+                'per_layer_rst_margin_band_pos': _sparsity_layer(
+                    rst_sparsity_diag_all, 'margin_band_pos'),
+                'per_layer_rst_active_n_mean': rst_active_n_mean_all,
+                'per_layer_rst_gate_eff_n': rst_gate_eff_n_all,
+                'per_layer_rst_gate_eff_ratio': rst_gate_eff_ratio_all,
+                'per_layer_rst_execution_top1_frac': rst_top1_gate_frac_all,
+                'per_layer_rst_rho_mean': rst_rho_mean_all,
+                'per_layer_rst_rho_std': rst_rho_std_all,
+                'per_layer_rst_rho_max': rst_rho_max_all,
+                'per_layer_rst_tau_mean': rst_tau_mean_all,
+                'per_layer_rst_tau_min': rst_tau_floor_mean_all,
+                'per_layer_rst_tau_max': rst_tau_min_hit_frac_all,
+                'per_layer_rst_selection_margin_mean': rst_selection_margin_mean_all,
+                'per_layer_rst_positive_margin_mean': rst_positive_margin_mean_all,
+                'per_layer_rst_selected_frac': rst_selected_frac_all,
                 'rst_margin_band': rst_margin_band_all.mean(),
                 'attn_qk_margin_band': attn_qk_margin_band_all.mean(),
                 'attn_v_margin_band': attn_v_margin_band_all.mean(),

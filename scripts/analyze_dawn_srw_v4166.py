@@ -63,6 +63,22 @@ from analysis.dawn_analysis_storage import (
     write_json_atomic,
     write_text_atomic,
 )
+from analysis.dawn_train_analysis_items import (
+    DEFAULT_TRAIN_ANALYSIS_PRESET,
+    TRAIN_ANALYSIS_PRESETS,
+    TrainAnalysisFormatters,
+    emit_train_analysis_item_progress,
+    format_train_analysis_items,
+    parse_train_analysis_items,
+    selected_item_catalog,
+    train_analysis_catalog_text,
+    train_analysis_required_sections,
+)
+from analysis.dawn_train_analysis_prompt import (
+    build_train_prompt_decision,
+    run_train_generation_samples,
+    run_train_prompt_trace,
+)
 
 
 FULL_STAGE_ORDER = ["eval", "prune", "geometry", "usage", "trace", "ablation", "report"]
@@ -79,7 +95,7 @@ DEFAULT_TRAIN_ANALYSIS_CHECKPOINT_DIR = (
     "dawn_srw_v4166_1p3B_c4_20B_v4_64_new"
 )
 DEFAULT_TRAIN_ANALYSIS_BATCHES = 8
-DEFAULT_TRAIN_ANALYSIS_PRUNE_EPS = "1e-6,1e-5,1e-4,1e-3"
+DEFAULT_TRAIN_ANALYSIS_PRUNE_EPS = "1e-2,1e-1"
 TRAIN_ANALYSIS_POOLS = {
     "qk": "attn_qk",
     "v": "attn_v",
@@ -170,6 +186,45 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("DAWN_TRAIN_ANALYSIS_MAX_BATCHES", DEFAULT_TRAIN_ANALYSIS_BATCHES)),
         help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--train-analysis-preset",
+        default=os.environ.get("DAWN_TRAIN_ANALYSIS_PRESET", DEFAULT_TRAIN_ANALYSIS_PRESET),
+        help=f"Train-analysis item preset. Known: {','.join(TRAIN_ANALYSIS_PRESETS)}",
+    )
+    p.add_argument(
+        "--train-analysis-items",
+        default=os.environ.get("DAWN_TRAIN_ANALYSIS_ITEMS"),
+        help="Comma-separated train-analysis item ids. Overrides --train-analysis-preset. Use all for every item.",
+    )
+    p.add_argument(
+        "--list-train-analysis-items",
+        action="store_true",
+        help="Print train-analysis item/preset catalog and exit.",
+    )
+    p.add_argument(
+        "--train-analysis-generation-max-prompts",
+        type=int,
+        default=int(os.environ.get("DAWN_TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS", 3)),
+        help="Maximum prompts for the generation_samples train-analysis item.",
+    )
+    p.add_argument(
+        "--train-analysis-generation-max-tokens",
+        type=int,
+        default=int(os.environ.get("DAWN_TRAIN_ANALYSIS_GENERATION_MAX_TOKENS", 24)),
+        help="Maximum new tokens per prompt for the generation_samples train-analysis item.",
+    )
+    p.add_argument(
+        "--train-analysis-generation-temperature",
+        type=float,
+        default=float(os.environ.get("DAWN_TRAIN_ANALYSIS_GENERATION_TEMPERATURE", 0.0)),
+        help="Generation temperature for the generation_samples item. 0 means greedy.",
+    )
+    p.add_argument(
+        "--train-analysis-generation-top-k",
+        type=int,
+        default=int(os.environ.get("DAWN_TRAIN_ANALYSIS_GENERATION_TOP_K", 50)),
+        help="Top-k sampling cutoff for generation_samples when temperature > 0.",
     )
 
     p.add_argument("--enable-patching", action="store_true")
@@ -388,6 +443,83 @@ def _safe_float(value: Any) -> Optional[float]:
     except Exception:
         return None
     return out if math.isfinite(out) else None
+
+
+def _safe_float_list(value: Any) -> Optional[List[float]]:
+    if value is None:
+        return None
+    try:
+        value = jax.device_get(value)
+    except Exception:
+        pass
+    if isinstance(value, (list, tuple)):
+        vals = [_safe_float(v) for v in value]
+        vals = [v for v in vals if v is not None]
+        return vals if vals else None
+    try:
+        if hasattr(value, "shape") and getattr(value, "shape", ()) not in ((), None):
+            flat = value.reshape((-1,)).tolist()
+            vals = [_safe_float(v) for v in flat]
+            vals = [v for v in vals if v is not None]
+            return vals if vals else None
+    except Exception:
+        return None
+    value_f = _safe_float(value)
+    return [value_f] if value_f is not None else None
+
+
+def _safe_metric_value(value: Any) -> Any:
+    vals = _safe_float_list(value)
+    if vals is not None and len(vals) > 1:
+        return vals
+    return _safe_float(value)
+
+
+def _finite(values: Any) -> List[float]:
+    vals = _safe_float_list(values) or []
+    return [v for v in vals if math.isfinite(v)]
+
+
+def _quantile(values: Any, q: float) -> Optional[float]:
+    vals = sorted(_finite(values))
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return vals[0]
+    pos = max(0.0, min(1.0, float(q))) * (len(vals) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return vals[lo]
+    frac = pos - lo
+    return vals[lo] * (1.0 - frac) + vals[hi] * frac
+
+
+def _stat_summary(values: Any) -> Dict[str, Any]:
+    vals = _finite(values)
+    if not vals:
+        return {"min": None, "p10": None, "mean": None, "p50": None, "p90": None, "max": None}
+    return {
+        "min": min(vals),
+        "p10": _quantile(vals, 0.10),
+        "mean": sum(vals) / len(vals),
+        "p50": _quantile(vals, 0.50),
+        "p90": _quantile(vals, 0.90),
+        "max": max(vals),
+    }
+
+
+def _mean_lists(rows: List[Dict[str, Any]], key: str) -> Optional[List[float]]:
+    arrays = [_safe_float_list(row.get(key)) for row in rows]
+    arrays = [arr for arr in arrays if arr]
+    if not arrays:
+        return None
+    n = max(len(arr) for arr in arrays)
+    out = []
+    for idx in range(n):
+        vals = [arr[idx] for arr in arrays if idx < len(arr) and math.isfinite(arr[idx])]
+        out.append(sum(vals) / len(vals) if vals else None)
+    return out
 
 
 def _fmt_num(value: Any, digits: int = 3) -> str:
@@ -724,6 +856,110 @@ def _selection_status(cfg: Dict[str, Any], step: int, tokens: int) -> Dict[str, 
     }
 
 
+def _pool_sizes(cfg: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    mcfg = cfg.get("model", {})
+    n_rst = mcfg.get("n_rst", mcfg.get("n_know"))
+    return {
+        "qk": int(mcfg["n_qk"]) if mcfg.get("n_qk") is not None else None,
+        "v": int(mcfg["n_v"]) if mcfg.get("n_v") is not None else None,
+        "rst": int(n_rst) if n_rst is not None else None,
+    }
+
+
+def _build_per_layer_active(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"layers": [], "summary": {}}
+    pool_sizes = _pool_sizes(cfg)
+    by_pool: Dict[str, Dict[str, Optional[List[float]]]] = {}
+    n_layers = int(cfg.get("model", {}).get("n_layers", 0) or 0)
+    for pool, prefix in TRAIN_ANALYSIS_POOLS.items():
+        pdata = {
+            "active_tau": _mean_lists(rows, f"per_layer_{prefix}_active_tau_frac"),
+            "admission": _mean_lists(rows, f"per_layer_{prefix}_admission_active_eps_1e_2_frac"),
+            "effective": _mean_lists(rows, f"per_layer_{prefix}_active_eps_1e_2_frac"),
+            "top1": _mean_lists(rows, f"per_layer_{prefix}_execution_top1_frac"),
+            "active_ops": _mean_lists(rows, f"per_layer_{prefix}_active_n_mean"),
+            "effective_ops": _mean_lists(rows, f"per_layer_{prefix}_gate_eff_n"),
+            "gate_eff_ratio": _mean_lists(rows, f"per_layer_{prefix}_gate_eff_ratio"),
+        }
+        by_pool[pool] = pdata
+        for values in pdata.values():
+            if values:
+                n_layers = max(n_layers, len(values))
+        effective = pdata.get("effective") or []
+        pool_size = pool_sizes.get(pool)
+        stats = _stat_summary(effective)
+        dead_layers = sum(
+            1 for value in effective
+            if _safe_float(value) is not None and float(value) <= 1e-4
+        )
+        # Closed means materially below its own target. The target is filled later
+        # in _add_target_ratio after selection calibration is known.
+        out["summary"][pool] = {
+            **stats,
+            "dead_layers": dead_layers,
+            "closed_layers": None,
+            "pool_size": pool_size,
+        }
+    for layer_idx in range(n_layers):
+        layer = {"layer": layer_idx}
+        for pool, pdata in by_pool.items():
+            for metric, values in pdata.items():
+                layer[f"{pool}_{metric}"] = values[layer_idx] if values and layer_idx < len(values) else None
+        out["layers"].append(layer)
+    return out
+
+
+def _build_select_distribution(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for pool, prefix in TRAIN_ANALYSIS_POOLS.items():
+        score = _mean_lists(rows, f"per_layer_{prefix}_rho_mean")
+        tau = _mean_lists(rows, f"per_layer_{prefix}_tau_mean")
+        margin = _mean_lists(rows, f"per_layer_{prefix}_selection_margin_mean")
+        selected = _mean_lists(rows, f"per_layer_{prefix}_selected_frac")
+        out[pool] = {
+            "score_layer": _stat_summary(score),
+            "tau_layer": _stat_summary(tau),
+            "margin_layer": _stat_summary(margin),
+            "pos_margin_frac": _quantile(selected, 0.50),
+            "score_std_mean": _quantile(_mean_lists(rows, f"per_layer_{prefix}_rho_std"), 0.50),
+            "score_max": _quantile(_mean_lists(rows, f"per_layer_{prefix}_rho_max"), 0.90),
+        }
+    return out
+
+
+def _build_num_health(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    scalar_keys = (
+        "residual_norm",
+        "residual_norm_max",
+        "q_norm",
+        "k_norm",
+        "v_norm",
+        "attn_logit_mean",
+        "attn_logit_std",
+        "attn_logit_max",
+        "attn_softmax_top1_mean",
+        "attn_softmax_entropy_mean",
+        "attn_o_output_norm_mean",
+        "attn_o_output_norm_max",
+    )
+    health = {}
+    for key in scalar_keys:
+        vals = [row.get(key) for row in rows]
+        health[key] = _stat_summary(vals)
+    no_nan = True
+    for row in rows:
+        for value in row.values():
+            if isinstance(value, (list, tuple)):
+                vals = _safe_float_list(value) or []
+                no_nan = no_nan and all(math.isfinite(v) for v in vals)
+            else:
+                value_f = _safe_float(value)
+                if value_f is not None:
+                    no_nan = no_nan and math.isfinite(value_f)
+    health["no_nan"] = no_nan
+    return health
+
+
 def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, Any]:
     args = ctx.args
     batch_size = int(ctx.config["training"].get("batch_size", 1))
@@ -753,7 +989,9 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
             f"{prefix}_mass_eps_1e_2",
             f"{prefix}_execution_mass_sum",
             f"{prefix}_execution_top1_frac",
+            f"{prefix}_execution_top1_frac_max",
             f"{prefix}_top1_gate_frac",
+            f"{prefix}_top1_gate_frac_max",
             f"{prefix}_tau_mean",
             f"{prefix}_tau_min",
             f"{prefix}_tau_max",
@@ -761,7 +999,45 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
             f"{prefix}_score_std",
             f"{prefix}_rho_std",
             f"{prefix}_rho_max",
+            f"{prefix}_active_n_mean",
+            f"{prefix}_gate_eff_n",
+            f"{prefix}_gate_eff_ratio",
         })
+        for metric in (
+            "active_tau_frac",
+            "admission_active_eps_1e_2_frac",
+            "active_eps_1e_2_frac",
+            "mass_eps_1e_2",
+            "margin_band_pos",
+            "active_n_mean",
+            "gate_eff_n",
+            "gate_eff_ratio",
+            "execution_top1_frac",
+            "rho_mean",
+            "rho_std",
+            "rho_max",
+            "tau_mean",
+            "tau_min",
+            "tau_max",
+            "selection_margin_mean",
+            "positive_margin_mean",
+            "selected_frac",
+        ):
+            wanted.add(f"per_layer_{prefix}_{metric}")
+    wanted.update({
+        "residual_norm",
+        "residual_norm_max",
+        "q_norm",
+        "k_norm",
+        "v_norm",
+        "attn_logit_mean",
+        "attn_logit_std",
+        "attn_logit_max",
+        "attn_softmax_top1_mean",
+        "attn_softmax_entropy_mean",
+        "attn_o_output_norm_mean",
+        "attn_o_output_norm_max",
+    })
     rows: List[Dict[str, Any]] = []
     if ctx.is_primary:
         print(
@@ -778,7 +1054,7 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
         selected = {key: value for key, value in result.items() if key in wanted}
         jax.block_until_ready(jax.tree.leaves(selected))
         selected = jax.device_get(selected)
-        row = {key: _safe_float(value) for key, value in selected.items()}
+        row = {key: _safe_metric_value(value) for key, value in selected.items()}
         row["sec"] = time.time() - t0
         rows.append(row)
         if ctx.is_primary:
@@ -802,6 +1078,7 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
         return sum(vals) / len(vals) if vals else None
 
     pools = {}
+    pool_sizes = _pool_sizes(ctx.config)
     for pool, prefix in TRAIN_ANALYSIS_POOLS.items():
         active_tau = mean_key(f"{prefix}_active_tau_frac")
         admission = mean_key(f"{prefix}_admission_active_eps_1e_2_frac")
@@ -820,6 +1097,7 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
             "admission": admission,
             "effective": effective,
             "top1": top1,
+            "top1_max": mean_key(f"{prefix}_execution_top1_frac_max"),
             "tau_mean": mean_key(f"{prefix}_tau_mean"),
             "tau_min": mean_key(f"{prefix}_tau_min"),
             "tau_max": mean_key(f"{prefix}_tau_max"),
@@ -827,6 +1105,10 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
             "score_mean": mean_key(f"{prefix}_rho_mean"),
             "score_std": score_std,
             "score_p95": None,
+            "pool_size": pool_sizes.get(pool),
+            "active_ops_mean": mean_key(f"{prefix}_active_n_mean"),
+            "effective_ops_mean": mean_key(f"{prefix}_gate_eff_n"),
+            "effective_ops_ratio": mean_key(f"{prefix}_gate_eff_ratio"),
         }
     return {
         "num_batches": len(rows),
@@ -835,6 +1117,9 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
         "accuracy": correct_total / valid_total if valid_total else None,
         "sec": sum(float(row.get("sec") or 0.0) for row in rows),
         "pools": pools,
+        "per_layer_active": _build_per_layer_active(rows, ctx.config),
+        "select_distribution": _build_select_distribution(rows),
+        "num_health": _build_num_health(rows),
     }
 
 
@@ -861,6 +1146,7 @@ def _run_prune_light(ctx: AnalysisContext, max_batches: int, eps_values: List[fl
             ctx.sharded_fns,
             minimal_train=False,
             return_prune_stats=True,
+            return_pool_prune_stats=True,
             execution_prune_eps=float(eps),
             cfg=ctx.config,
             total_training_steps=ctx.total_training_steps,
@@ -879,6 +1165,11 @@ def _run_prune_light(ctx: AnalysisContext, max_batches: int, eps_values: List[fl
         no_active_sum = 0.0
         row_count = 0
         sec_sum = 0.0
+        pool_sizes = _pool_sizes(ctx.config)
+        pool_compute_sum = {pool: 0.0 for pool in TRAIN_ANALYSIS_POOLS}
+        pool_eff_sum = {pool: 0.0 for pool in TRAIN_ANALYSIS_POOLS}
+        pool_eff_ops_sum = {pool: 0.0 for pool in TRAIN_ANALYSIS_POOLS}
+        pool_stats_count = 0
         for batch_idx, (input_ids, attention_mask) in enumerate(loader):
             if batch_idx >= local_max_batches:
                 break
@@ -895,7 +1186,28 @@ def _run_prune_light(ctx: AnalysisContext, max_batches: int, eps_values: List[fl
                 _gate_den,
                 no_active,
                 _unpruned_den,
+                *pool_ret,
             ) = ret
+            if len(pool_ret) >= 9:
+                qk_active_n, v_active_n, rst_active_n = pool_ret[0:3]
+                qk_eff_frac, v_eff_frac, rst_eff_frac = pool_ret[3:6]
+                qk_eff_n, v_eff_n, rst_eff_n = pool_ret[6:9]
+                for pool, active_n, eff_frac, eff_n in (
+                    ("qk", qk_active_n, qk_eff_frac, qk_eff_n),
+                    ("v", v_active_n, v_eff_frac, v_eff_n),
+                    ("rst", rst_active_n, rst_eff_frac, rst_eff_n),
+                ):
+                    size = pool_sizes.get(pool)
+                    active_n_f = _safe_float(active_n)
+                    if active_n_f is not None and size:
+                        pool_compute_sum[pool] += active_n_f / float(size)
+                    eff_frac_f = _safe_float(eff_frac)
+                    if eff_frac_f is not None:
+                        pool_eff_sum[pool] += eff_frac_f
+                    eff_n_f = _safe_float(eff_n)
+                    if eff_n_f is not None:
+                        pool_eff_ops_sum[pool] += eff_n_f
+                pool_stats_count += 1
             loss_f = float(loss)
             valid_i = int(valid_i)
             correct_i = int(correct_i)
@@ -933,6 +1245,12 @@ def _run_prune_light(ctx: AnalysisContext, max_batches: int, eps_values: List[fl
             "v_eff": None,
             "rst_eff": None,
         }
+        if pool_stats_count:
+            for pool in TRAIN_ANALYSIS_POOLS:
+                summary[f"{pool}_compute"] = pool_compute_sum[pool] / pool_stats_count
+                summary[f"{pool}_eff"] = pool_eff_sum[pool] / pool_stats_count
+                summary[f"{pool}_eff_ops"] = pool_eff_ops_sum[pool] / pool_stats_count
+                summary[f"{pool}_pool_size"] = pool_sizes.get(pool)
         if float(eps) == 0.0:
             base_loss = summary["val_loss"]
             baseline = summary
@@ -1048,6 +1366,55 @@ def _compare_400m(active: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 
+def _add_target_ratio(active: Dict[str, Any], selection: Dict[str, Any]) -> Dict[str, Any]:
+    pools = active.get("pools", {})
+    targets = selection.get("active_target", {}) or {}
+    rows = []
+    per_layer_summary = active.get("per_layer_active", {}).get("summary", {})
+    for pool in ("qk", "v", "rst"):
+        pdata = pools.get(pool, {})
+        target = _safe_float(targets.get(pool))
+        effective = _safe_float(pdata.get("effective"))
+        ratio = None
+        if target is not None and target > 0.0 and effective is not None:
+            ratio = effective / target
+        status = "n/a"
+        if ratio is not None:
+            if ratio < 0.50:
+                status = "TOO_CLOSED"
+            elif ratio < 0.80:
+                status = "OK_LOW"
+            elif ratio > 2.50:
+                status = "OK_HIGH"
+            else:
+                status = "OK"
+        pdata["target"] = target
+        pdata["eff_target_ratio"] = ratio
+        pdata["target_ratio_status"] = status
+        layer_info = per_layer_summary.get(pool)
+        if layer_info is not None:
+            layer_effective = [
+                row.get(f"{pool}_effective")
+                for row in active.get("per_layer_active", {}).get("layers", [])
+            ]
+            if target is not None:
+                layer_info["closed_layers"] = sum(
+                    1 for value in layer_effective
+                    if _safe_float(value) is not None and float(value) < target * 0.50
+                )
+        rows.append({
+            "pool": pool,
+            "target": target,
+            "active_tau": pdata.get("active_tau"),
+            "admission": pdata.get("admission"),
+            "effective": effective,
+            "eff_target_ratio": ratio,
+            "status": status,
+        })
+    active["target_ratio"] = rows
+    return active
+
+
 def _decision_lines(active: Dict[str, Any], selection: Dict[str, Any], progress: Dict[str, Any]) -> List[str]:
     pools = active.get("pools", {})
     tokens = int(progress.get("tokens") or 0)
@@ -1069,10 +1436,29 @@ def _decision_lines(active: Dict[str, Any], selection: Dict[str, Any], progress:
     ]
     bad = [status for status in statuses if status not in ("OK", "n/a")]
     if bad:
+        reasons = []
+        for pool in ("qk", "v", "rst"):
+            pdata = pools.get(pool, {})
+            ratio = _safe_float(pdata.get("eff_target_ratio"))
+            admission = _safe_float(pdata.get("admission"))
+            status = pdata.get("status")
+            if status not in ("OK", "n/a", None):
+                reasons.append(
+                    f"{pool} {status}: eff/target={_fmt_num(ratio, 2)}, "
+                    f"admission={_fmt_num(admission, 3)}"
+                )
         lines.append("Current run needs attention: " + "; ".join(bad) + ".")
+        if reasons:
+            lines.append("Reason: " + "; ".join(reasons) + ".")
         lines.append("Compare against the next checkpoint before changing config unless the same status repeats.")
     else:
         lines.append("Keep current run: active dynamics are within current phase guardrails.")
+    top1_max = max(
+        (_safe_float(pools.get(pool, {}).get("top1_max")) or 0.0)
+        for pool in ("qk", "v", "rst")
+    )
+    if top1_max < 0.10:
+        lines.append(f"No obvious collapse: top1_max={_fmt_num(top1_max, 3)} < 0.100.")
     return lines
 
 
@@ -1120,6 +1506,13 @@ def _scalar_row(summary: Dict[str, Any]) -> Dict[str, Any]:
         pdata = pools.get(pool, {})
         row[f"{pool}_active_tau"] = pdata.get("active_tau")
         row[f"{pool}_effective"] = pdata.get("effective")
+        row[f"{pool}_eff_target_ratio"] = pdata.get("eff_target_ratio")
+        row[f"{pool}_closed_layers"] = (
+            active.get("per_layer_active", {})
+            .get("summary", {})
+            .get(pool, {})
+            .get("closed_layers")
+        )
     return row
 
 
@@ -1138,11 +1531,18 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
     progress = summary["progress"]
     selection = summary["selection_calibration"]
     active = summary["active_dynamics"]
-    prune = summary["effective_prune"]
     compare = summary["reference_400m"]
     trend = summary.get("recent_trend", [])
     warnings = summary.get("warnings", [])
     decision = summary.get("decision", [])
+    items = list(summary.get("analysis_items") or TRAIN_ANALYSIS_PRESETS["full"])
+    item_formatters = TrainAnalysisFormatters(
+        num=_fmt_num,
+        delta=_fmt_delta,
+        pct=_fmt_pct,
+        eps=_fmt_eps,
+        safe_float=_safe_float,
+    )
     out = [
         line,
         "DAWN-SRW v4166 TRAIN ANALYSIS",
@@ -1155,6 +1555,9 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
         f"  latest_modified : {run.get('latest_modified') or 'n/a'}",
         f"  analyzed_split  : val",
         f"  analysis_batches: {active.get('num_batches', run.get('analysis_batches'))}",
+        f"  analysis_preset : {summary.get('analysis_preset')}",
+        f"  analysis_items  : {','.join(summary.get('analysis_items') or [])}",
+        f"  required_sections: {','.join(summary.get('analysis_required_sections') or [])}",
         "",
         "Progress:",
         f"  step            : {progress.get('step')}",
@@ -1198,31 +1601,7 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
             f"{_fmt_num(pdata.get('gate_mass'), 3):<11} "
             f"{status}"
         )
-    baseline = prune.get("baseline") or {}
-    prune_rows = ([baseline] if baseline else []) + list(prune.get("eps", []))
-    base_compute = _safe_float(baseline.get("compute_frac"))
-    out.extend([
-        "",
-        "Pruned eval:",
-        "  eps       val_loss   delta_ce   compute   saved_vs_base   gate_mass   no_active",
-    ])
-    if not prune_rows:
-        out.append("  n/a")
-    for row in prune_rows:
-        compute = _safe_float(row.get("compute_frac"))
-        saved = None
-        if base_compute is not None and base_compute > 0.0 and compute is not None:
-            saved = (base_compute - compute) / base_compute
-        out.append(
-            "  "
-            f"{_fmt_eps(row.get('eps')):<9} "
-            f"{_fmt_num(row.get('val_loss'), 6):<10} "
-            f"{_fmt_delta(row.get('loss_delta'), 4):<10} "
-            f"{_fmt_num(row.get('compute_frac'), 4):<9} "
-            f"{_fmt_pct(saved, 1):<15} "
-            f"{_fmt_num(row.get('gate_mass_retained'), 3):<11} "
-            f"{_fmt_num(row.get('no_active_frac'), 3)}"
-        )
+    out.extend(format_train_analysis_items(summary, items, item_formatters))
     out.extend([
         "",
         "400M reference comparison:",
@@ -1254,8 +1633,9 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
             )
     else:
         out.append("  n/a")
-    out.extend(["", "Decision:"])
-    out.extend([f"  - {line_i}" for line_i in (decision or ["n/a"])])
+    if "decision_reason" not in items:
+        out.extend(["", "Decision:"])
+        out.extend([f"  - {line_i}" for line_i in (decision or ["n/a"])])
     out.extend(["", "Warnings:"])
     if warnings:
         out.extend([f"  - {warning}" for warning in warnings])
@@ -1270,6 +1650,7 @@ def _save_train_analysis(store: AnalysisStore, summary: Dict[str, Any],
                          warnings: List[str]) -> Tuple[AnalysisStore, str]:
     try:
         write_text_atomic(store.path("train_analysis_latest.txt"), text + "\n")
+        write_json_atomic(store.path("train_analysis_latest.json"), summary)
         append_jsonl(store.path("train_analysis.jsonl"), scalar)
         return store, store.output_dir
     except Exception as exc:
@@ -1280,12 +1661,15 @@ def _save_train_analysis(store: AnalysisStore, summary: Dict[str, Any],
         summary["warnings"] = warnings
         text = _format_train_analysis(summary)
         write_text_atomic(store.path("train_analysis_latest.txt"), text + "\n")
+        write_json_atomic(store.path("train_analysis_latest.json"), summary)
         append_jsonl(store.path("train_analysis.jsonl"), scalar)
         return store, store.output_dir
 
 
 def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     warnings: List[str] = []
+    analysis_items = parse_train_analysis_items(args.train_analysis_preset, args.train_analysis_items)
+    required_sections = train_analysis_required_sections(analysis_items)
     info = _prepare_train_analysis_args(args, warnings)
     store = _init_train_analysis_store(str(args.output), primary, warnings)
     set_default_store(store)
@@ -1294,14 +1678,20 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
             "TRAIN_ANALYSIS START "
             f"config={args.config or 'checkpoint full_config'} "
             f"checkpoint_dir={info.get('configured_checkpoint_dir')} "
-            f"output={store.output_dir}",
+            f"output={store.output_dir} "
+            f"preset={args.train_analysis_preset} "
+            f"items={','.join(analysis_items)} "
+            f"sections={','.join(required_sections)}",
             flush=True,
         )
     ctx = build_context(args, ["train_analysis"], store)
     max_batches = max(1, int(args.train_analysis_max_batches or DEFAULT_TRAIN_ANALYSIS_BATCHES))
     eps_values = _parse_float_list(args.prune_eps or DEFAULT_TRAIN_ANALYSIS_PRUNE_EPS)
-    active = _run_active_dynamics(ctx, max_batches)
-    prune = _run_prune_light(ctx, max_batches, eps_values)
+    active = _run_active_dynamics(ctx, max_batches) if "active" in required_sections else {}
+    prune = _run_prune_light(ctx, max_batches, eps_values) if "prune" in required_sections else {}
+    prompt_trace = run_train_prompt_trace(ctx) if "prompt_trace" in required_sections else {}
+    prompt_decision = build_train_prompt_decision(prompt_trace) if "prompt_trace" in required_sections and ctx.is_primary else {}
+    generation_samples = run_train_generation_samples(ctx) if "generation" in required_sections else {}
     sync_hosts("dawn-v4166-train-analysis-done")
     if not ctx.is_primary:
         return 0
@@ -1310,6 +1700,7 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     selection = _selection_status(ctx.config, progress["step"], progress["tokens"])
     for pool, pdata in active.get("pools", {}).items():
         pdata["status"] = _active_status(pool, pdata.get("active_tau"), progress["tokens"], selection)
+    active = _add_target_ratio(active, selection)
     if selection.get("enabled"):
         active_values = [
             active.get("pools", {}).get(pool, {}).get("active_tau")
@@ -1328,10 +1719,17 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
             "analysis_batches": max_batches,
             "output": store.output_dir,
         },
+        "analysis_preset": args.train_analysis_preset,
+        "analysis_items": analysis_items,
+        "analysis_item_catalog": selected_item_catalog(analysis_items),
+        "analysis_required_sections": required_sections,
         "progress": progress,
         "selection_calibration": selection,
         "active_dynamics": active,
         "effective_prune": prune,
+        "prompt_trace": prompt_trace,
+        "prompt_decision": prompt_decision,
+        "generation_samples": generation_samples,
         "reference_400m": compare,
         "warnings": warnings,
     }
@@ -1339,6 +1737,7 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     summary["recent_trend"] = _trend_rows(store, scalar, warnings)
     summary["decision"] = _decision_lines(active, selection, progress)
     summary["warnings"] = warnings
+    emit_train_analysis_item_progress(summary, analysis_items)
     text = _format_train_analysis(summary)
     store, saved_dir = _save_train_analysis(store, summary, text, scalar, warnings)
     summary["warnings"] = warnings
@@ -1346,12 +1745,16 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     print(text, flush=True)
     print("", flush=True)
     print(f"Saved: {join_path(saved_dir, 'train_analysis_latest.txt')}", flush=True)
+    print(f"Saved: {join_path(saved_dir, 'train_analysis_latest.json')}", flush=True)
     print(f"Saved: {join_path(saved_dir, 'train_analysis.jsonl')}", flush=True)
     return 0
 
 
 def main() -> int:
     args = parse_args()
+    if args.list_train_analysis_items:
+        print(train_analysis_catalog_text())
+        return 0
     if args.train_analysis:
         maybe_init_distributed(args, True)
         return run_train_analysis(args, is_primary_host())
