@@ -2381,7 +2381,8 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
                        P('model', None),
                        P('model', None),
                        P(), P(), P(), P(), P()),
-             out_specs=(P('data', None, None), P(), P(), P()),
+             out_specs=(P('data', None, None),
+                        P(), P(), P(), P(), P(), P(), P(), P(), P()),
              check_rep=False)
     def fused_gate_srw_minimal(x, h, op_key_local, raw_tau,
                                read_local, write_local,
@@ -2446,7 +2447,8 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
 
         @jax.checkpoint
         def gate_srw_step(carry, i):
-            raw_out, total_den_cost, total_active_count = carry
+            (raw_out, total_gate_mass, total_gate_sq,
+             total_gate_max, total_active_count) = carry
             s = i * cs
             op_key, rc, wc, valid_chunk = op_key_rw_chunk(s)
             valid_bsn = valid_chunk[None, None, :]
@@ -2457,34 +2459,66 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
             xr = x_bf @ rc.T
             a = execution_weight * xr.astype(jnp.float32)
             c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
-            chunk_den_cost = admission.sum(axis=-1, keepdims=True)
+            chunk_gate_mass = admission.sum(axis=-1, keepdims=True)
+            chunk_gate_sq = jnp.square(admission).sum(
+                axis=-1, keepdims=True)
+            chunk_gate_max = admission.max(axis=-1, keepdims=True)
             return (raw_out + c_out,
-                    total_den_cost + chunk_den_cost,
+                    total_gate_mass + chunk_gate_mass,
+                    total_gate_sq + chunk_gate_sq,
+                    jnp.maximum(total_gate_max, chunk_gate_max),
                     total_active_count + chunk_active_count), None
 
-        (raw_out, total_den_cost, total_active_count), _ = jax.lax.scan(
+        (raw_out, total_gate_mass, total_gate_sq,
+         total_gate_max, total_active_count), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, D), dtype=jnp.float32),
+             jnp.zeros((B, S, 1), dtype=jnp.float32),
+             jnp.zeros((B, S, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 1), dtype=jnp.float32)),
             jnp.arange(nc))
 
-        global_den_cost = jax.lax.psum(total_den_cost, 'model')
+        global_gate_mass = jax.lax.psum(total_gate_mass, 'model')
+        global_gate_sq = jax.lax.psum(total_gate_sq, 'model')
+        global_gate_max = jax.lax.pmax(
+            jax.lax.stop_gradient(total_gate_max), 'model')
         global_active_count = jax.lax.stop_gradient(
             jax.lax.psum(total_active_count, 'model'))
         global_operator_count = jax.lax.stop_gradient(
             jax.lax.psum(
                 valid_padded.astype(jnp.float32).sum(), 'model'))
+        gate_den = jnp.maximum(global_gate_mass, 1.0)
         active_n_mean = global_active_count.mean()
         active_frac = active_n_mean / jnp.maximum(global_operator_count, 1.0)
+        gate_mass_mean = global_gate_mass.mean()
+        gate_den_mean = gate_den.mean()
+        depth_active_mean = jnp.where(
+            global_active_count > 0.0,
+            global_gate_mass / jnp.maximum(global_active_count, 1.0),
+            0.0).mean()
+        gate_eff_n_mean = jnp.where(
+            global_gate_mass > 0.0,
+            jnp.square(global_gate_mass) / (global_gate_sq + 1.0e-8),
+            0.0).mean()
+        top1_gate_frac_mean = jnp.where(
+            global_gate_mass > 0.0,
+            global_gate_max / jnp.maximum(global_gate_mass, 1.0e-8),
+            0.0).mean()
+        den_floor_frac = (global_gate_mass < 1.0).astype(jnp.float32).mean()
         tau_mean = jax.lax.stop_gradient(tau).mean()
-        admission_den = jnp.maximum(global_den_cost, 1.0)
-        out = raw_out / admission_den
+        out = raw_out / gate_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
         return (
             out.astype(jnp.float32),
             jax.lax.stop_gradient(active_frac.astype(jnp.float32)),
             jax.lax.stop_gradient(active_n_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(gate_mass_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(gate_den_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(depth_active_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(gate_eff_n_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(top1_gate_frac_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(den_floor_frac.astype(jnp.float32)),
             jax.lax.stop_gradient(tau_mean.astype(jnp.float32)),
         )
 
@@ -2509,7 +2543,14 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
                        P('model', None),
                        P('model', None),
                        P(), P(), P(), P(), P()),
-             out_specs=(P('data', None, None, None), P(), P(), P(), P(), P(), P()),
+             out_specs=(P('data', None, None, None),
+                        P(), P(), P(), P(),
+                        P(), P(), P(), P(),
+                        P(), P(),
+                        P(), P(),
+                        P(), P(),
+                        P(), P(),
+                        P(), P()),
              check_rep=False)
     def fused_gate_srw_paired_minimal(x, h, op_key_local, raw_tau,
                                       read_local, write_local,
@@ -2577,7 +2618,8 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
 
         @jax.checkpoint
         def gate_srw_step(carry, i):
-            raw_out, total_den_cost, total_active_count = carry
+            (raw_out, total_gate_mass, total_gate_sq,
+             total_gate_max, total_active_count) = carry
             s = i * cs
             op_key, rc, wc, valid_chunk = op_key_rw_chunk(s)
             valid_bsrn = valid_chunk[None, None, None, :]
@@ -2591,33 +2633,73 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
                 'bsrn,nd->bsrd',
                 a.astype(jnp.bfloat16),
                 wc).astype(jnp.float32)
-            chunk_den_cost = admission.sum(axis=-1, keepdims=True)
+            chunk_gate_mass = admission.sum(axis=-1, keepdims=True)
+            chunk_gate_sq = jnp.square(admission).sum(
+                axis=-1, keepdims=True)
+            chunk_gate_max = admission.max(axis=-1, keepdims=True)
             return (raw_out + c_out,
-                    total_den_cost + chunk_den_cost,
+                    total_gate_mass + chunk_gate_mass,
+                    total_gate_sq + chunk_gate_sq,
+                    jnp.maximum(total_gate_max, chunk_gate_max),
                     total_active_count + chunk_active_count), None
 
-        (raw_out, total_den_cost, total_active_count), _ = jax.lax.scan(
+        (raw_out, total_gate_mass, total_gate_sq,
+         total_gate_max, total_active_count), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
+             jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
+             jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 2, 1), dtype=jnp.float32)),
             jnp.arange(nc))
 
-        global_den_cost = jax.lax.psum(total_den_cost, 'model')
+        global_gate_mass = jax.lax.psum(total_gate_mass, 'model')
+        global_gate_sq = jax.lax.psum(total_gate_sq, 'model')
+        global_gate_max = jax.lax.pmax(
+            jax.lax.stop_gradient(total_gate_max), 'model')
         global_active_count = jax.lax.stop_gradient(
             jax.lax.psum(total_active_count, 'model'))
         global_operator_count = jax.lax.stop_gradient(
             jax.lax.psum(
                 valid_padded.astype(jnp.float32).sum(), 'model'))
-        q_active_n_mean = global_active_count[:, :, 0, :].mean()
-        k_active_n_mean = global_active_count[:, :, 1, :].mean()
+
+        def route_mean(value, route_index):
+            return value[:, :, route_index, :].mean()
+
+        gate_den = jnp.maximum(global_gate_mass, 1.0)
+        depth_active = jnp.where(
+            global_active_count > 0.0,
+            global_gate_mass / jnp.maximum(global_active_count, 1.0),
+            0.0)
+        gate_eff_n = jnp.where(
+            global_gate_mass > 0.0,
+            jnp.square(global_gate_mass) / (global_gate_sq + 1.0e-8),
+            0.0)
+        top1_gate_frac = jnp.where(
+            global_gate_mass > 0.0,
+            global_gate_max / jnp.maximum(global_gate_mass, 1.0e-8),
+            0.0)
+        den_floor = (global_gate_mass < 1.0).astype(jnp.float32)
+        q_active_n_mean = route_mean(global_active_count, 0)
+        k_active_n_mean = route_mean(global_active_count, 1)
         q_active_frac = q_active_n_mean / jnp.maximum(global_operator_count, 1.0)
         k_active_frac = k_active_n_mean / jnp.maximum(global_operator_count, 1.0)
+        q_gate_mass_mean = route_mean(global_gate_mass, 0)
+        k_gate_mass_mean = route_mean(global_gate_mass, 1)
+        q_gate_den_mean = route_mean(gate_den, 0)
+        k_gate_den_mean = route_mean(gate_den, 1)
+        q_depth_active_mean = route_mean(depth_active, 0)
+        k_depth_active_mean = route_mean(depth_active, 1)
+        q_gate_eff_n_mean = route_mean(gate_eff_n, 0)
+        k_gate_eff_n_mean = route_mean(gate_eff_n, 1)
+        q_top1_gate_frac_mean = route_mean(top1_gate_frac, 0)
+        k_top1_gate_frac_mean = route_mean(top1_gate_frac, 1)
+        q_den_floor_frac = route_mean(den_floor, 0)
+        k_den_floor_frac = route_mean(den_floor, 1)
         tau_sg = jax.lax.stop_gradient(tau)
         q_tau_mean = tau_sg[:, :, 0, :].mean()
         k_tau_mean = tau_sg[:, :, 1, :].mean()
-        admission_den = jnp.maximum(global_den_cost, 1.0)
-        out = raw_out / admission_den
+        out = raw_out / gate_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
         return (
             out.astype(jnp.float32),
@@ -2625,6 +2707,18 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
             jax.lax.stop_gradient(k_active_frac.astype(jnp.float32)),
             jax.lax.stop_gradient(q_active_n_mean.astype(jnp.float32)),
             jax.lax.stop_gradient(k_active_n_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(q_gate_mass_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(k_gate_mass_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(q_gate_den_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(k_gate_den_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(q_depth_active_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(k_depth_active_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(q_gate_eff_n_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(k_gate_eff_n_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(q_top1_gate_frac_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(k_top1_gate_frac_mean.astype(jnp.float32)),
+            jax.lax.stop_gradient(q_den_floor_frac.astype(jnp.float32)),
+            jax.lax.stop_gradient(k_den_floor_frac.astype(jnp.float32)),
             jax.lax.stop_gradient(q_tau_mean.astype(jnp.float32)),
             jax.lax.stop_gradient(k_tau_mean.astype(jnp.float32)),
         )
@@ -2824,14 +2918,24 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     h_QK = jnp.stack([h_Q, h_K], axis=2)
     raw_tau_QK = jnp.stack(
         [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
-    (QK_out, q_active_frac, k_active_frac, q_active_n_mean,
-     k_active_n_mean, q_tau_mean, k_tau_mean) = fused_paired(
+    (QK_out,
+     q_active_frac, k_active_frac,
+     q_active_n_mean, k_active_n_mean,
+     q_gate_mass_mean, k_gate_mass_mean,
+     q_gate_den_mean, k_gate_den_mean,
+     q_depth_active_mean, k_depth_active_mean,
+     q_gate_eff_n_mean, k_gate_eff_n_mean,
+     q_top1_gate_frac_mean, k_top1_gate_frac_mean,
+     q_den_floor_frac, k_den_floor_frac,
+     q_tau_mean, k_tau_mean) = fused_paired(
         x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
         soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps)
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
-    (V, v_active_frac, v_active_n_mean, v_tau_mean) = fused_single_v(
+    (V, v_active_frac, v_active_n_mean, v_gate_mass_mean, v_gate_den_mean,
+     v_depth_active_mean, v_gate_eff_n_mean, v_top1_gate_frac_mean,
+     v_den_floor_frac, v_tau_mean) = fused_single_v(
         x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
         soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps)
@@ -2860,6 +2964,7 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     out = out @ expand_O_kernel
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
+    attn_out_norm = jnp.linalg.norm(out.astype(jnp.float32), axis=-1).mean()
     return (
         out,
         q_active_frac,
@@ -2868,9 +2973,28 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         q_active_n_mean,
         k_active_n_mean,
         v_active_n_mean,
+        q_gate_mass_mean,
+        k_gate_mass_mean,
+        v_gate_mass_mean,
+        q_gate_den_mean,
+        k_gate_den_mean,
+        v_gate_den_mean,
+        q_depth_active_mean,
+        k_depth_active_mean,
+        v_depth_active_mean,
+        q_gate_eff_n_mean,
+        k_gate_eff_n_mean,
+        v_gate_eff_n_mean,
+        q_top1_gate_frac_mean,
+        k_top1_gate_frac_mean,
+        v_top1_gate_frac_mean,
+        q_den_floor_frac,
+        k_den_floor_frac,
+        v_den_floor_frac,
         q_tau_mean,
         k_tau_mean,
         v_tau_mean,
+        jax.lax.stop_gradient(attn_out_norm.astype(jnp.float32)),
     )
 
 
@@ -2915,14 +3039,29 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
             sharded_fns.get('rst_single', sharded_fns['single']))
     else:
         fused_single, _ = sharded_fns
-    out, rst_active_frac, rst_active_n_mean, rst_tau_mean = fused_single(
+    (out, rst_active_frac, rst_active_n_mean, rst_gate_mass_mean,
+     rst_gate_den_mean, rst_depth_active_mean, rst_gate_eff_n_mean,
+     rst_top1_gate_frac_mean, rst_den_floor_frac, rst_tau_mean) = fused_single(
         x, h, rst_op_key, raw_tau, rst_read, rst_write,
         soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps)
     out = out * rst_scale
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
-    return out, rst_active_frac, rst_active_n_mean, rst_tau_mean
+    rst_out_norm = jnp.linalg.norm(out.astype(jnp.float32), axis=-1).mean()
+    return (
+        out,
+        rst_active_frac,
+        rst_active_n_mean,
+        rst_gate_mass_mean,
+        rst_gate_den_mean,
+        rst_depth_active_mean,
+        rst_gate_eff_n_mean,
+        rst_top1_gate_frac_mean,
+        rst_den_floor_frac,
+        rst_tau_mean,
+        jax.lax.stop_gradient(rst_out_norm.astype(jnp.float32)),
+    )
 
 
 def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
@@ -3898,7 +4037,17 @@ class DAWN_SRW_V4169(nn.Module):
                         x, bp['norm1']['scale'], bp['norm1']['bias'])
                     (attn_out, q_active_frac, k_active_frac, v_active_frac,
                      q_active_n_mean, k_active_n_mean, v_active_n_mean,
-                     q_tau_mean, k_tau_mean, v_tau_mean) = _attn_forward_minimal(
+                     q_gate_mass_mean, k_gate_mass_mean, v_gate_mass_mean,
+                     q_gate_den_mean, k_gate_den_mean, v_gate_den_mean,
+                     q_depth_active_mean, k_depth_active_mean,
+                     v_depth_active_mean,
+                     q_gate_eff_n_mean, k_gate_eff_n_mean,
+                     v_gate_eff_n_mean,
+                     q_top1_gate_frac_mean, k_top1_gate_frac_mean,
+                     v_top1_gate_frac_mean,
+                     q_den_floor_frac, k_den_floor_frac, v_den_floor_frac,
+                     q_tau_mean, k_tau_mean, v_tau_mean,
+                     attn_out_norm) = _attn_forward_minimal(
                         normed, pool_params, router_params,
                         bp['attn']['expand_O']['kernel'], rng_attn,
                         self.n_qk, self.n_v,
@@ -3919,7 +4068,10 @@ class DAWN_SRW_V4169(nn.Module):
                     normed = _layer_norm(
                         x, bp['norm2']['scale'], bp['norm2']['bias'])
                     (rst_out, rst_active_frac, rst_active_n_mean,
-                     rst_tau_mean) = _rst_forward_minimal(
+                     rst_gate_mass_mean, rst_gate_den_mean,
+                     rst_depth_active_mean, rst_gate_eff_n_mean,
+                     rst_top1_gate_frac_mean, rst_den_floor_frac,
+                     rst_tau_mean, rst_out_norm) = _rst_forward_minimal(
                         normed, pool_params, router_params, rng_rst,
                         self.router_dropout, self.dropout_rate,
                         deterministic,
@@ -3933,6 +4085,9 @@ class DAWN_SRW_V4169(nn.Module):
                         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
                         admission_den_power=admission_den_power,
                         execution_prune_eps=execution_prune_eps)
+                    x_next = x + rst_out
+                    residual_norm = jnp.linalg.norm(
+                        x_next.astype(jnp.float32), axis=-1).mean()
                     layer_stats = (
                         q_active_frac,
                         k_active_frac,
@@ -3942,12 +4097,40 @@ class DAWN_SRW_V4169(nn.Module):
                         k_active_n_mean,
                         v_active_n_mean,
                         rst_active_n_mean,
+                        q_gate_mass_mean,
+                        k_gate_mass_mean,
+                        v_gate_mass_mean,
+                        rst_gate_mass_mean,
+                        q_gate_den_mean,
+                        k_gate_den_mean,
+                        v_gate_den_mean,
+                        rst_gate_den_mean,
+                        q_depth_active_mean,
+                        k_depth_active_mean,
+                        v_depth_active_mean,
+                        rst_depth_active_mean,
+                        q_gate_eff_n_mean,
+                        k_gate_eff_n_mean,
+                        v_gate_eff_n_mean,
+                        rst_gate_eff_n_mean,
+                        q_top1_gate_frac_mean,
+                        k_top1_gate_frac_mean,
+                        v_top1_gate_frac_mean,
+                        rst_top1_gate_frac_mean,
+                        q_den_floor_frac,
+                        k_den_floor_frac,
+                        v_den_floor_frac,
+                        rst_den_floor_frac,
                         q_tau_mean,
                         k_tau_mean,
                         v_tau_mean,
                         rst_tau_mean,
+                        attn_out_norm,
+                        rst_out_norm,
+                        jax.lax.stop_gradient(
+                            residual_norm.astype(jnp.float32)),
                     )
-                    return x + rst_out, layer_stats
+                    return x_next, layer_stats
 
                 if self.gradient_checkpointing:
                     scan_body_minimal = jax.checkpoint(scan_body_minimal)
@@ -3960,12 +4143,38 @@ class DAWN_SRW_V4169(nn.Module):
                     scan_body_minimal, x, xs_minimal)
                 (q_active_all, k_active_all, v_active_all, rst_active_all,
                  q_active_n_all, k_active_n_all, v_active_n_all,
-                 rst_active_n_all, q_tau_all, k_tau_all, v_tau_all,
-                 rst_tau_all) = minimal_stats
+                 rst_active_n_all,
+                 q_gate_mass_all, k_gate_mass_all, v_gate_mass_all,
+                 rst_gate_mass_all,
+                 q_gate_den_all, k_gate_den_all, v_gate_den_all,
+                 rst_gate_den_all,
+                 q_depth_active_all, k_depth_active_all, v_depth_active_all,
+                 rst_depth_active_all,
+                 q_gate_eff_n_all, k_gate_eff_n_all, v_gate_eff_n_all,
+                 rst_gate_eff_n_all,
+                 q_top1_gate_frac_all, k_top1_gate_frac_all,
+                 v_top1_gate_frac_all, rst_top1_gate_frac_all,
+                 q_den_floor_all, k_den_floor_all, v_den_floor_all,
+                 rst_den_floor_all,
+                 q_tau_all, k_tau_all, v_tau_all, rst_tau_all,
+                 attn_out_norm_all, rst_out_norm_all,
+                 residual_norm_all) = minimal_stats
                 qk_active_all = jnp.float32(0.5) * (
                     q_active_all + k_active_all)
                 qk_active_n_all = jnp.float32(0.5) * (
                     q_active_n_all + k_active_n_all)
+                qk_gate_mass_all = jnp.float32(0.5) * (
+                    q_gate_mass_all + k_gate_mass_all)
+                qk_gate_den_all = jnp.float32(0.5) * (
+                    q_gate_den_all + k_gate_den_all)
+                qk_depth_active_all = jnp.float32(0.5) * (
+                    q_depth_active_all + k_depth_active_all)
+                qk_gate_eff_n_all = jnp.float32(0.5) * (
+                    q_gate_eff_n_all + k_gate_eff_n_all)
+                qk_top1_gate_frac_all = jnp.float32(0.5) * (
+                    q_top1_gate_frac_all + k_top1_gate_frac_all)
+                qk_den_floor_all = jnp.float32(0.5) * (
+                    q_den_floor_all + k_den_floor_all)
                 qk_tau_all = jnp.float32(0.5) * (q_tau_all + k_tau_all)
                 attn_tau_all = (
                     q_tau_all + k_tau_all + v_tau_all) / jnp.float32(3.0)
@@ -3986,6 +4195,9 @@ class DAWN_SRW_V4169(nn.Module):
                 (loss, per_token_ce, correct, valid_count,
                  logit_abs_max, logit_norm_mean, logit_mean,
                  logit_std, valid_mask) = _compute_vocab_ce(x)
+                def _sg_mean(value):
+                    return jax.lax.stop_gradient(value.mean())
+
                 return {
                     'loss': loss,
                     'correct': correct,
@@ -4037,6 +4249,38 @@ class DAWN_SRW_V4169(nn.Module):
                         v_active_n_all.mean()),
                     'rst_active_tau_count': jax.lax.stop_gradient(
                         rst_active_n_all.mean()),
+                    'attn_q_gate_mass': _sg_mean(q_gate_mass_all),
+                    'attn_k_gate_mass': _sg_mean(k_gate_mass_all),
+                    'attn_qk_gate_mass': _sg_mean(qk_gate_mass_all),
+                    'attn_v_gate_mass': _sg_mean(v_gate_mass_all),
+                    'rst_gate_mass': _sg_mean(rst_gate_mass_all),
+                    'attn_q_gate_den': _sg_mean(q_gate_den_all),
+                    'attn_k_gate_den': _sg_mean(k_gate_den_all),
+                    'attn_qk_gate_den': _sg_mean(qk_gate_den_all),
+                    'attn_v_gate_den': _sg_mean(v_gate_den_all),
+                    'rst_gate_den': _sg_mean(rst_gate_den_all),
+                    'attn_q_depth_active': _sg_mean(q_depth_active_all),
+                    'attn_k_depth_active': _sg_mean(k_depth_active_all),
+                    'attn_qk_depth_active': _sg_mean(qk_depth_active_all),
+                    'attn_v_depth_active': _sg_mean(v_depth_active_all),
+                    'rst_depth_active': _sg_mean(rst_depth_active_all),
+                    'attn_q_gate_eff_n': _sg_mean(q_gate_eff_n_all),
+                    'attn_k_gate_eff_n': _sg_mean(k_gate_eff_n_all),
+                    'attn_qk_gate_eff_n': _sg_mean(qk_gate_eff_n_all),
+                    'attn_v_gate_eff_n': _sg_mean(v_gate_eff_n_all),
+                    'rst_gate_eff_n': _sg_mean(rst_gate_eff_n_all),
+                    'attn_q_top1_gate_frac': _sg_mean(q_top1_gate_frac_all),
+                    'attn_k_top1_gate_frac': _sg_mean(k_top1_gate_frac_all),
+                    'attn_qk_top1_gate_frac': _sg_mean(
+                        qk_top1_gate_frac_all),
+                    'attn_v_top1_gate_frac': _sg_mean(
+                        v_top1_gate_frac_all),
+                    'rst_top1_gate_frac': _sg_mean(rst_top1_gate_frac_all),
+                    'attn_q_den_floor_frac': _sg_mean(q_den_floor_all),
+                    'attn_k_den_floor_frac': _sg_mean(k_den_floor_all),
+                    'attn_qk_den_floor_frac': _sg_mean(qk_den_floor_all),
+                    'attn_v_den_floor_frac': _sg_mean(v_den_floor_all),
+                    'rst_den_floor_frac': _sg_mean(rst_den_floor_all),
                     'attn_q_tau_mean': jax.lax.stop_gradient(
                         q_tau_all.mean()),
                     'attn_k_tau_mean': jax.lax.stop_gradient(
@@ -4049,6 +4293,9 @@ class DAWN_SRW_V4169(nn.Module):
                         rst_tau_all.mean()),
                     'attn_tau_mean': jax.lax.stop_gradient(
                         attn_tau_all.mean()),
+                    'attn_out_norm': _sg_mean(attn_out_norm_all),
+                    'rst_out_norm': _sg_mean(rst_out_norm_all),
+                    'residual_norm': _sg_mean(residual_norm_all),
                 }
 
             def scan_body(carry, xs):

@@ -542,6 +542,57 @@ V4164_SCALAR_METRIC_NAMES = (
     'rst_execution_top1_frac_max',
 )
 
+V4169_REGULAR_REQUIRED_METRIC_NAMES = (
+    'attn_q_active_tau_frac',
+    'attn_k_active_tau_frac',
+    'attn_qk_active_tau_frac',
+    'attn_v_active_tau_frac',
+    'rst_active_tau_frac',
+    'attn_q_active_tau_count',
+    'attn_k_active_tau_count',
+    'attn_qk_active_tau_count',
+    'attn_v_active_tau_count',
+    'rst_active_tau_count',
+    'attn_q_gate_mass',
+    'attn_k_gate_mass',
+    'attn_qk_gate_mass',
+    'attn_v_gate_mass',
+    'rst_gate_mass',
+    'attn_q_gate_den',
+    'attn_k_gate_den',
+    'attn_qk_gate_den',
+    'attn_v_gate_den',
+    'rst_gate_den',
+    'attn_q_depth_active',
+    'attn_k_depth_active',
+    'attn_qk_depth_active',
+    'attn_v_depth_active',
+    'rst_depth_active',
+    'attn_q_gate_eff_n',
+    'attn_k_gate_eff_n',
+    'attn_qk_gate_eff_n',
+    'attn_v_gate_eff_n',
+    'rst_gate_eff_n',
+    'attn_q_top1_gate_frac',
+    'attn_k_top1_gate_frac',
+    'attn_qk_top1_gate_frac',
+    'attn_v_top1_gate_frac',
+    'rst_top1_gate_frac',
+    'attn_q_den_floor_frac',
+    'attn_k_den_floor_frac',
+    'attn_qk_den_floor_frac',
+    'attn_v_den_floor_frac',
+    'rst_den_floor_frac',
+    'attn_q_tau_mean',
+    'attn_k_tau_mean',
+    'attn_qk_tau_mean',
+    'attn_v_tau_mean',
+    'rst_tau_mean',
+    'attn_out_norm',
+    'rst_out_norm',
+    'residual_norm',
+)
+
 UPDATE_CAP_GROUP_SPECS = (
     ('proj_attn', 'pA', 'update_cap_proj_attn_hit',
      'update_cap_proj_attn_ratio_pre', 'update_cap_proj_attn_scale',
@@ -5163,6 +5214,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 rngs={'dropout': dropout_key},
                 **extra_kw,
             )
+            if _is_v4169_model:
+                missing_regular = tuple(
+                    key for key in V4169_REGULAR_REQUIRED_METRIC_NAMES
+                    if key not in result)
+                if missing_regular:
+                    raise KeyError(
+                        "v4169 train result missing regular metrics: "
+                        + ", ".join(missing_regular))
             ce_loss = result['loss']
             aux_loss = result.get('aux_loss', jnp.float32(0.0))
             tau_reg = result.get('tau_reg', jnp.float32(0.0))
@@ -6829,6 +6888,34 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_active_tau_count': result.get(
                 'rst_active_tau_count',
                 result.get('rst_active_n_mean', jnp.float32(0.0))),
+            'attn_q_gate_mass': result.get('attn_q_gate_mass', jnp.float32(0.0)),
+            'attn_k_gate_mass': result.get('attn_k_gate_mass', jnp.float32(0.0)),
+            'attn_qk_gate_mass': result.get('attn_qk_gate_mass', jnp.float32(0.0)),
+            'attn_v_gate_mass': result.get('attn_v_gate_mass', jnp.float32(0.0)),
+            'rst_gate_mass': result.get('rst_gate_mass', jnp.float32(0.0)),
+            'attn_q_gate_den': result.get('attn_q_gate_den', jnp.float32(0.0)),
+            'attn_k_gate_den': result.get('attn_k_gate_den', jnp.float32(0.0)),
+            'attn_qk_gate_den': result.get('attn_qk_gate_den', jnp.float32(0.0)),
+            'attn_v_gate_den': result.get('attn_v_gate_den', jnp.float32(0.0)),
+            'rst_gate_den': result.get('rst_gate_den', jnp.float32(0.0)),
+            'attn_q_depth_active': result.get('attn_q_depth_active', jnp.float32(0.0)),
+            'attn_k_depth_active': result.get('attn_k_depth_active', jnp.float32(0.0)),
+            'attn_qk_depth_active': result.get('attn_qk_depth_active', jnp.float32(0.0)),
+            'attn_v_depth_active': result.get('attn_v_depth_active', jnp.float32(0.0)),
+            'rst_depth_active': result.get('rst_depth_active', jnp.float32(0.0)),
+            'attn_q_gate_eff_n': result.get('attn_q_gate_eff_n', jnp.float32(0.0)),
+            'attn_k_gate_eff_n': result.get('attn_k_gate_eff_n', jnp.float32(0.0)),
+            'attn_qk_gate_eff_n': result.get('attn_qk_gate_eff_n', jnp.float32(0.0)),
+            'attn_v_gate_eff_n': result.get('attn_v_gate_eff_n', jnp.float32(0.0)),
+            'attn_q_top1_gate_frac': result.get('attn_q_top1_gate_frac', jnp.float32(0.0)),
+            'attn_k_top1_gate_frac': result.get('attn_k_top1_gate_frac', jnp.float32(0.0)),
+            'attn_qk_top1_gate_frac': result.get('attn_qk_top1_gate_frac', jnp.float32(0.0)),
+            'attn_v_top1_gate_frac': result.get('attn_v_top1_gate_frac', jnp.float32(0.0)),
+            'attn_q_den_floor_frac': result.get('attn_q_den_floor_frac', jnp.float32(0.0)),
+            'attn_k_den_floor_frac': result.get('attn_k_den_floor_frac', jnp.float32(0.0)),
+            'attn_qk_den_floor_frac': result.get('attn_qk_den_floor_frac', jnp.float32(0.0)),
+            'attn_v_den_floor_frac': result.get('attn_v_den_floor_frac', jnp.float32(0.0)),
+            'rst_den_floor_frac': result.get('rst_den_floor_frac', jnp.float32(0.0)),
             'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
             'attn_qk_strong': result.get(
                 'attn_qk_strong',
@@ -10601,6 +10688,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'dev_neg_max': float(m.get('dev_neg_max', 0.0)),
         'timestamp': datetime.now().isoformat(),
     }
+    for _key in V4169_REGULAR_REQUIRED_METRIC_NAMES:
+        if _key in m:
+            rec[_key] = float(m[_key])
+    rec['_v4169_regular_missing_metrics'] = tuple(
+        _key for _key in V4169_REGULAR_REQUIRED_METRIC_NAMES
+        if _key not in m)
     rec['_active_tau_regular_available'] = any(
         key in m for key in (
             'q_active_tau_frac', 'k_active_tau_frac', 'qk_active_tau_frac',
@@ -11095,6 +11188,66 @@ def _print_cb1a_regular_block(rec):
     )
 
 
+def _required_v4169_metric(rec, name):
+    missing = set(rec.get('_v4169_regular_missing_metrics', ()) or ())
+    if name in missing or name not in rec:
+        raise KeyError(f"v4169 regular metric missing: {name}")
+    value = float(rec[name])
+    if not np.isfinite(value):
+        raise RuntimeError(
+            f"v4169 non-finite regular metric: {name}={value}")
+    return value
+
+
+def _fmt_v4169_active(rec, frac_key, count_key):
+    frac = _required_v4169_metric(rec, frac_key)
+    count = _required_v4169_metric(rec, count_key)
+    return f"{frac * 100.0:.2f}%({count:.1f})"
+
+
+def _fmt_v4169_gate(rec, prefix):
+    mass = _required_v4169_metric(rec, f'{prefix}_gate_mass')
+    den = _required_v4169_metric(rec, f'{prefix}_gate_den')
+    depth = _required_v4169_metric(rec, f'{prefix}_depth_active')
+    eff = _required_v4169_metric(rec, f'{prefix}_gate_eff_n')
+    top1 = _required_v4169_metric(rec, f'{prefix}_top1_gate_frac')
+    floor = _required_v4169_metric(rec, f'{prefix}_den_floor_frac')
+    return (
+        f"mass={mass:.2f} den={den:.2f} depth={depth:.5f} "
+        f"eff={eff:.1f} top1={top1:.4f} floor={floor * 100.0:.2f}%")
+
+
+def _print_v4169_regular_block(rec, ctx):
+    log_message(
+        "  active: "
+        f"q={_fmt_v4169_active(rec, 'attn_q_active_tau_frac', 'attn_q_active_tau_count')}"
+        f" k={_fmt_v4169_active(rec, 'attn_k_active_tau_frac', 'attn_k_active_tau_count')}"
+        f" qk={_fmt_v4169_active(rec, 'attn_qk_active_tau_frac', 'attn_qk_active_tau_count')}"
+        f" v={_fmt_v4169_active(rec, 'attn_v_active_tau_frac', 'attn_v_active_tau_count')}"
+        f" rst={_fmt_v4169_active(rec, 'rst_active_tau_frac', 'rst_active_tau_count')}"
+    )
+    log_message(f"  gate: qk[{_fmt_v4169_gate(rec, 'attn_qk')}]")
+    log_message(f"        v [{_fmt_v4169_gate(rec, 'attn_v')}]")
+    log_message(f"        rst[{_fmt_v4169_gate(rec, 'rst')}]")
+    log_message(
+        f"  tau: qk={_required_v4169_metric(rec, 'attn_qk_tau_mean'):+.4f}"
+        f" v={_required_v4169_metric(rec, 'attn_v_tau_mean'):+.4f}"
+        f" rst={_required_v4169_metric(rec, 'rst_tau_mean'):+.4f}"
+    )
+    log_message(
+        f"  norm: attn={_required_v4169_metric(rec, 'attn_out_norm'):.3f}"
+        f" rst={_required_v4169_metric(rec, 'rst_out_norm'):.3f}"
+        f" residual={_required_v4169_metric(rec, 'residual_norm'):.3f}"
+        f" | scale qk={float(rec.get('attn_qk_pool_scale', 0.0)):.3f}"
+        f" v={float(rec.get('attn_v_pool_scale', 0.0)):.3f}"
+        f" rst={float(rec.get('rst_pool_scale', 0.0)):.3f}"
+    )
+    log_message(
+        f"  time: {format_time(ctx['epoch_elapsed'])}<"
+        f"{format_time(ctx['eta'])}, {ctx['s_per_it']:.2f}s/it"
+    )
+
+
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4164 = _is_active_srw_version(ctx.get('model_version'))
@@ -11130,6 +11283,9 @@ def _print_regular_block(rec, ctx):
     if opspace_active:
         _print_v4168_opspace_regular_block(rec)
         _print_train_progress_line(rec, ctx)
+    if is_v4169 and not opspace_active:
+        _print_v4169_regular_block(rec, ctx)
+        return
     if is_v4164:
         if is_official_soft_direct_tau:
             if not opspace_active:
