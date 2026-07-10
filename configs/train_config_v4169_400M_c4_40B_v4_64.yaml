@@ -26,9 +26,9 @@ model:
   tau_init_mode: quantile_frac
   tau_init_min: -0.95
   tau_init_max: 0.95
-  tau_init_target_qk_frac: 0.08
-  tau_init_target_v_frac: 0.05
-  tau_init_target_rst_frac: 0.02
+  tau_init_target_qk_frac: 0.10
+  tau_init_target_v_frac: 0.08
+  tau_init_target_rst_frac: 0.035
 
 training:
   batch_size: 1024
