@@ -284,6 +284,11 @@ def _truthy_env_or_cfg(value) -> Optional[bool]:
     raise ValueError(f'Invalid boolean/auto value: {value!r}')
 
 
+def cfg_bool(value, default: bool) -> bool:
+    parsed = _truthy_env_or_cfg(value)
+    return bool(default) if parsed is None else bool(parsed)
+
+
 def maybe_initialize_jax_distributed(cfg: Dict[str, Any]) -> None:
     tcfg = cfg.get('training', {})
     raw = tcfg.get(
@@ -925,7 +930,9 @@ def build_sharded_fns_if_needed(cfg: Dict[str, Any], mesh):
             **_factory_kwargs(make_sharded_srw_paired_minimal, base_kwargs))
         sharded_fns['attn_qk_paired_minimal'] = paired_min
 
-    if (version in (tj.V4166_MODEL_VERSION, tj.V4168_MODEL_VERSION)
+    use_vocab_parallel = cfg_bool(tr.get('use_vocab_parallel'), True)
+    if (use_vocab_parallel
+            and version in (tj.V4166_MODEL_VERSION, tj.V4168_MODEL_VERSION)
             and mesh_model > 1
             and m.get('logical_vocab_size') is not None
             and m.get('vocab_size_padded') is not None):
@@ -964,10 +971,13 @@ def _call_extra_kwargs(model, cfg, sharded_fns, deterministic: bool,
         kwargs['analysis'] = False
     model_version = str(getattr(
         model, '__version__', getattr(type(model), '__version__', '')))
-    if (model_version in (tj.V4166_MODEL_VERSION, tj.V4168_MODEL_VERSION)
-            and tj._model_accepts_minimal_train(model)):
-        kwargs['minimal_train'] = True
     tr = cfg.get('training', {})
+    use_minimal_train = cfg_bool(
+        tr.get('use_minimal_train_path', tr.get('use_minimal_train')), True)
+    if (model_version in (tj.V4166_MODEL_VERSION, tj.V4168_MODEL_VERSION)
+            and tj._model_accepts_minimal_train(model)
+            and use_minimal_train):
+        kwargs['minimal_train'] = True
     if tj._model_accepts_soft_gate_schedule(model):
         soft_t = float(tr.get(
             'soft_gate_temperature',
@@ -1159,14 +1169,18 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
     pad_id = ensure_pad_token(tokenizer)
 
-    tj._maybe_materialize_vocab_parallel_config(cfg)
+    use_vocab_parallel = cfg_bool(
+        cfg.get('training', {}).get('use_vocab_parallel'), True)
+    if use_vocab_parallel:
+        tj._maybe_materialize_vocab_parallel_config(cfg)
 
     # Build model from the existing train_jax registry. No train_jax/model code is modified here.
     model = tj.build_model_from_config(cfg)
     model_version = cfg.get('model', {}).get('model_version', 'baseline')
     use_ce_scoring = (
         model_version in (tj.V4166_MODEL_VERSION, tj.V4168_MODEL_VERSION)
-        and int(cfg.get('training', {}).get('mesh_model', 1)) > 1)
+        and int(cfg.get('training', {}).get('mesh_model', 1)) > 1
+        and use_vocab_parallel)
 
     mcfg, tcfg = cfg.get('model', {}), cfg.get('training', {})
     max_seq_len = int(ds_cfg.get('max_seq_len', mcfg.get('max_seq_len', 512)))
@@ -1261,6 +1275,10 @@ def main():
         record(f'mesh_data={mesh_data} mesh_model={mesh_model}')
         record(f'batch={batch_size} eval_batch={eval_batch_size} max_seq_len={max_seq_len}')
         record(f'lr={tcfg.get("lr")} warmup_ratio={tcfg.get("warmup_ratio")} eval_interval={eval_every} log_interval={log_every}')
+        record(
+            f'use_vocab_parallel={str(use_vocab_parallel).lower()} '
+            f'use_minimal_train_path={str(cfg_bool(tcfg.get("use_minimal_train_path", tcfg.get("use_minimal_train")), True)).lower()} '
+            f'use_ce_scoring={str(use_ce_scoring).lower()}')
         record(f'downstream_source={ds_cfg.get("source", "hf")} hf_name={ds_cfg.get("hf_name", "<default>")} hf_config={ds_cfg.get("hf_config", "<default>")}')
         record(f'train_rows={len(train_rows)} eval_rows={len(eval_rows)} total_steps={total_steps}')
         record(f'init_from={init_from or "<none>"}')
@@ -1286,7 +1304,9 @@ def main():
         params,
         mesh,
         model_version,
-        vocab_size_padded=cfg.get('model', {}).get('vocab_size_padded', None),
+        vocab_size_padded=(
+            cfg.get('model', {}).get('vocab_size_padded', None)
+            if use_vocab_parallel else None),
     )
     params = tj.shard_params_to_mesh(params, param_shardings)
 

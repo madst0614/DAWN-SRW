@@ -32,6 +32,8 @@ downstream_suite:
     eval_interval: 100
     mesh_model: 2
     mesh_data: 0
+    use_vocab_parallel: false
+    use_minimal_train_path: false
     ce_token_chunk_size: 8192
     train_compute_accuracy: true
     n_chunks_qk: 1

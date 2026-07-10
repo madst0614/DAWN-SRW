@@ -1,0 +1,37 @@
+tokenizer: bert-base-uncased
+training:
+  batch_size: 64
+  eval_batch_size: 64
+  num_epochs: 3
+  lr: 2.0e-05
+  weight_decay: 0.01
+  warmup_ratio: 0.06
+  min_lr_ratio: 0.1
+  max_grad_norm: 1.0
+  aux_weight: 0.0
+  tau_weight: 0.0
+  log_interval: 20
+  max_steps: 800
+  eval_interval: 100
+  mesh_model: 2
+  mesh_data: 0
+  use_vocab_parallel: false
+  use_minimal_train_path: false
+  ce_token_chunk_size: 8192
+  train_compute_accuracy: true
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  n_chunks_rst: 4
+  initialize_jax_distributed: true
+downstream:
+  source: hf
+  max_seq_len: 512
+  add_eos: false
+  task: mnli
+init_from: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_400M_c4_40B_v4_64/run_vspatial-r1-v4.1.6.6_20260622_212706_3201
+checkpoint_dir: gs://dawn-tpu-data-c4/downstream_runs/dawn_srw_v4166_400M
+run_name: dawn_srw_v4166_400M_mnli
+suite:
+  source: configs\downstream\v4166_400M.yaml
+  name: dawn_srw_v4166_400M
+  task: mnli
