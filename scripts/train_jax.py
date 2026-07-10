@@ -6779,6 +6779,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'attn_k_active_n_mean',
                 result.get('attn_qk_active_n_mean',
                            result.get('attn_active_n_mean', jnp.float32(0.0)))),
+            'attn_qk_active_n_mean': result.get(
+                'attn_qk_active_n_mean',
+                jnp.float32(0.5) * (
+                    result.get(
+                        'attn_q_active_n_mean',
+                        result.get('attn_active_n_mean', jnp.float32(0.0)))
+                    + result.get(
+                        'attn_k_active_n_mean',
+                        result.get('attn_active_n_mean', jnp.float32(0.0))))),
+            'attn_v_active_n_mean': result.get(
+                'attn_v_active_n_mean', jnp.float32(0.0)),
             'attn_q_active': result.get(
                 'attn_q_active',
                 result.get('attn_qk_active', jnp.float32(0.0))),
@@ -6786,6 +6797,38 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'attn_k_active',
                 result.get('attn_qk_active', jnp.float32(0.0))),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
+            'attn_q_active_tau_frac': result.get(
+                'attn_q_active_tau_frac',
+                result.get('attn_q_active',
+                           result.get('attn_qk_active', jnp.float32(0.0)))),
+            'attn_k_active_tau_frac': result.get(
+                'attn_k_active_tau_frac',
+                result.get('attn_k_active',
+                           result.get('attn_qk_active', jnp.float32(0.0)))),
+            'attn_qk_active_tau_frac': result.get(
+                'attn_qk_active_tau_frac',
+                result.get('attn_qk_active', jnp.float32(0.0))),
+            'attn_v_active_tau_frac': result.get(
+                'attn_v_active_tau_frac',
+                result.get('attn_v_active', jnp.float32(0.0))),
+            'rst_active_tau_frac': result.get(
+                'rst_active_tau_frac',
+                result.get('rst_active', jnp.float32(0.0))),
+            'attn_q_active_tau_count': result.get(
+                'attn_q_active_tau_count',
+                result.get('attn_q_active_n_mean', jnp.float32(0.0))),
+            'attn_k_active_tau_count': result.get(
+                'attn_k_active_tau_count',
+                result.get('attn_k_active_n_mean', jnp.float32(0.0))),
+            'attn_qk_active_tau_count': result.get(
+                'attn_qk_active_tau_count',
+                result.get('attn_qk_active_n_mean', jnp.float32(0.0))),
+            'attn_v_active_tau_count': result.get(
+                'attn_v_active_tau_count',
+                result.get('attn_v_active_n_mean', jnp.float32(0.0))),
+            'rst_active_tau_count': result.get(
+                'rst_active_tau_count',
+                result.get('rst_active_n_mean', jnp.float32(0.0))),
             'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
             'attn_qk_strong': result.get(
                 'attn_qk_strong',
@@ -6814,6 +6857,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
             # tau structure.
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
+            'attn_q_tau_mean': result.get(
+                'attn_q_tau_mean',
+                result.get('attn_qk_tau_mean',
+                           result.get('attn_tau_mean', jnp.float32(0.0)))),
+            'attn_k_tau_mean': result.get(
+                'attn_k_tau_mean',
+                result.get('attn_qk_tau_mean',
+                           result.get('attn_tau_mean', jnp.float32(0.0)))),
+            'attn_qk_tau_mean': result.get(
+                'attn_qk_tau_mean',
+                result.get('attn_tau_mean', jnp.float32(0.0))),
+            'attn_v_tau_mean': result.get(
+                'attn_v_tau_mean',
+                result.get('attn_tau_mean', jnp.float32(0.0))),
             'rst_tau_mean': result.get('rst_tau_mean', jnp.float32(0.0)),
             'rst_score_mean': result.get('rst_score_mean', jnp.float32(0.0)),
             'attn_tau_abs_mean': result.get('attn_tau_abs_mean', jnp.float32(0.0)),
@@ -9287,6 +9344,15 @@ def _fmt_optional_pct_count(value, count):
     return f"{pct}({count:.2f})"
 
 
+def _fmt_active_tau_pct_count(value, count):
+    if value is None:
+        return "nan%"
+    pct = f"{100.0 * value:.2f}%"
+    if count is None:
+        return pct
+    return f"{pct}({count:.1f})"
+
+
 def _fmt_sparsity_mass(rec, pool, key):
     mass = float(rec.get(f'{pool}_{key}', 0.0) or 0.0)
     return f"{mass * 100:.2f}%"
@@ -9478,7 +9544,6 @@ def _print_active_tau_regular_line(rec):
             f" v={_fmt_active_label_pct_count(rec, 'v', 'pool')}"
             f" rst={_fmt_active_label_pct_count(rec, 'rst', 'pool')}"
         )
-        return
     explicit_keys = (
         'q_active_tau_frac', 'k_active_tau_frac', 'qk_active_tau_frac',
         'v_active_tau_frac', 'rst_active_tau_frac',
@@ -9508,12 +9573,24 @@ def _print_active_tau_regular_line(rec):
         qk = 0.5 * (q + k)
     if all(value is None for value in (q, k, qk, v, rst)):
         return
+    q_count = _active_tau_count_for_label(
+        rec, 'q', 'attn_q_active_tau_frac')
+    k_count = _active_tau_count_for_label(
+        rec, 'k', 'attn_k_active_tau_frac')
+    qk_count = _active_tau_count_for_label(
+        rec, 'qk', 'attn_qk_active_tau_frac')
+    if qk_count is None and q_count is not None and k_count is not None:
+        qk_count = 0.5 * (q_count + k_count)
+    v_count = _active_tau_count_for_label(
+        rec, 'v', 'attn_v_active_tau_frac')
+    rst_count = _active_tau_count_for_label(
+        rec, 'rst', 'rst_active_tau_frac')
     log_message(
-        f"  active_tau: q={_fmt_optional_pct(q)}"
-        f" k={_fmt_optional_pct(k)}"
-        f" qk={_fmt_optional_pct(qk)}"
-        f" v={_fmt_optional_pct(v)}"
-        f" rst={_fmt_optional_pct(rst)}"
+        f"  active_tau: q={_fmt_active_tau_pct_count(q, q_count)}"
+        f" k={_fmt_active_tau_pct_count(k, k_count)}"
+        f" qk={_fmt_active_tau_pct_count(qk, qk_count)}"
+        f" v={_fmt_active_tau_pct_count(v, v_count)}"
+        f" rst={_fmt_active_tau_pct_count(rst, rst_count)}"
     )
 
 
@@ -10320,6 +10397,16 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_soft_dead_frac_eps_1e_5': float(m.get('rst_soft_dead_frac_eps_1e_5', 0.0)),
         'rst_soft_dead_frac_eps_1e_4': float(m.get('rst_soft_dead_frac_eps_1e_4', 0.0)),
         'attn_tau_mean': float(m.get('attn_tau_mean', 0.0)),
+        'attn_q_tau_mean': float(m.get(
+            'attn_q_tau_mean',
+            m.get('attn_qk_tau_mean', m.get('attn_tau_mean', 0.0)))),
+        'attn_k_tau_mean': float(m.get(
+            'attn_k_tau_mean',
+            m.get('attn_qk_tau_mean', m.get('attn_tau_mean', 0.0)))),
+        'attn_qk_tau_mean': float(m.get(
+            'attn_qk_tau_mean', m.get('attn_tau_mean', 0.0))),
+        'attn_v_tau_mean': float(m.get(
+            'attn_v_tau_mean', m.get('attn_tau_mean', 0.0))),
         'rst_tau_mean': float(m.get('rst_tau_mean', 0.0)),
         'attn_score_mean': float(m.get('attn_score_mean', 0.0)),
         'rst_score_mean': float(m.get('rst_score_mean', 0.0)),
@@ -14232,6 +14319,7 @@ def main():
                 print("  gate = clip((rho - tau) / max(1 - tau, 1e-4), 0, 1)")
                 print("  execution_prune_eps: training=0.0; eval zeros gates below eps")
                 print("  denominator: max(sum(pruned_gate), 1.0) with live gradient")
+                print("[v4169] active definition: rho > tau (pre-prune angular visibility)")
                 print("[opspace] key=rw_derived query=rw_matched_product tau=calibrated_frozen gate=linear_angular_depth den=gate_sum")
                 print("tau policy: token-wise bounded DirectTau parameters")
                 print("tau init: fresh quantile calibration")
