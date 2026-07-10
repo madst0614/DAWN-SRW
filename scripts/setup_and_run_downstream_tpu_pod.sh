@@ -33,7 +33,7 @@ cd "$WORK_DIR"
 echo "[1/4] Installing dependencies..."
 python3 -m pip install --upgrade pip -q
 python3 -m pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-python3 -m pip install -U flax optax numpy pyyaml transformers sentencepiece huggingface_hub "orbax-checkpoint==0.11.24" -q
+python3 -m pip install -U flax optax numpy pyyaml transformers sentencepiece huggingface_hub google-cloud-storage "orbax-checkpoint==0.11.24" -q
 # Pin datasets/pyarrow to a compatible pair. New pyarrow removed PyExtensionType,
 # which older datasets imports at startup.  gcsfs and fsspec must be pinned as
 # a compatible pair, otherwise downstream GCS checkpoint I/O can fail later.

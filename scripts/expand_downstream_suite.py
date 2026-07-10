@@ -160,7 +160,7 @@ def build_task_config(
         output_root = suite.get("output_root") or suite.get("checkpoint_root")
         if not output_root:
             raise ValueError("downstream_suite must set output_root, checkpoint_root, or checkpoint_dir_template")
-        checkpoint_dir = f"{str(output_root).rstrip('/')}/{task}"
+        checkpoint_dir = str(output_root).rstrip("/")
     task_cfg["checkpoint_dir"] = checkpoint_dir
 
     if "run_name" in task_override:

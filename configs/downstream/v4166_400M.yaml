@@ -1,6 +1,5 @@
 downstream_suite:
   name: dawn_srw_v4166_400M
-  base_config: configs/train_config_v4166_400M_c4_40B_v4_64.yaml
   init_from: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_400M_c4_40B_v4_64/run_vspatial-r1-v4.1.6.6_20260622_212706_3201
   output_root: gs://dawn-tpu-data-c4/downstream_runs/dawn_srw_v4166_400M
   tasks:
@@ -39,11 +38,3 @@ downstream_suite:
     n_chunks_v: 1
     n_chunks_rst: 4
     initialize_jax_distributed: true
-    soft_gate_temperature: 0.07
-    soft_gate_T_qk: 0.07
-    soft_gate_T_v: 0.07
-    soft_gate_T_rst: 0.07
-    soft_gate_boundary_power: 4.0
-    soft_gate_t_final: 0.07
-    soft_gate_boundary_power_final: 4.0
-    admission_den_power: 0.5

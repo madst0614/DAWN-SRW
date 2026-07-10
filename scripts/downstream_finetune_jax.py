@@ -23,6 +23,7 @@ import re
 import sys
 import time
 import inspect
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -202,6 +203,74 @@ def resolve_downstream_orbax_resume_ref(path: Optional[str]) -> Optional[Checkpo
     return None
 
 
+def load_orbax_checkpoint_model_config(ref: Optional[CheckpointRef]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str]:
+    if ref is None or ref.kind != 'orbax' or ref.checkpoint_dir is None or ref.step is None:
+        return None, None, 'current_yaml'
+    metadata = tj._restore_orbax_metadata(ref.checkpoint_dir, int(ref.step))
+    full_config = metadata.get('full_config')
+    if not isinstance(full_config, dict):
+        full_config = {}
+    model_config = (
+        full_config.get('model')
+        if isinstance(full_config.get('model'), dict)
+        else metadata.get('model_config')
+    )
+    if not isinstance(model_config, dict) or not model_config:
+        raise ValueError(
+            f'Orbax checkpoint is missing model config metadata: {ref.path}')
+    source = (
+        'checkpoint full_config.model'
+        if isinstance(full_config.get('model'), dict)
+        else 'checkpoint metadata.model_config')
+    return deepcopy(model_config), deepcopy(full_config), source
+
+
+CHECKPOINT_RUNTIME_TRAINING_KEYS = (
+    'soft_gate_temperature',
+    'soft_gate_T_qk',
+    'soft_gate_T_v',
+    'soft_gate_T_rst',
+    'soft_gate_t_final',
+    'soft_gate_boundary_power',
+    'soft_gate_boundary_power_final',
+    'admission_den_power',
+    'opspace_gate_den_power',
+)
+
+
+def checkpoint_runtime_training_defaults(full_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(full_config, dict):
+        return {}
+    training = full_config.get('training', {})
+    if not isinstance(training, dict):
+        return {}
+    return {
+        key: deepcopy(training[key])
+        for key in CHECKPOINT_RUNTIME_TRAINING_KEYS
+        if key in training
+    }
+
+
+def apply_init_checkpoint_model_config(cfg: Dict[str, Any],
+                                       init_ref: Optional[CheckpointRef]) -> str:
+    model_config, full_config, source = load_orbax_checkpoint_model_config(init_ref)
+    if model_config is None:
+        if not isinstance(cfg.get('model'), dict) or not cfg.get('model'):
+            raise ValueError(
+                'Downstream config has no model section and init_from is not '
+                'an Orbax checkpoint with model metadata.')
+        return source
+    cfg['model'] = model_config
+    runtime_defaults = checkpoint_runtime_training_defaults(full_config)
+    if runtime_defaults:
+        training = cfg.setdefault('training', {})
+        for key, value in runtime_defaults.items():
+            training.setdefault(key, value)
+    if 'tokenizer' not in cfg and isinstance(full_config, dict) and 'tokenizer' in full_config:
+        cfg['tokenizer'] = deepcopy(full_config['tokenizer'])
+    return source
+
+
 def _truthy_env_or_cfg(value) -> Optional[bool]:
     if value is None:
         return None
@@ -242,6 +311,42 @@ def load_yaml(path: str) -> Dict[str, Any]:
 def write_text(path: str, text: str):
     with tj._open_file(path, 'w') as f:
         f.write(text)
+    set_text_gcs_metadata(path)
+
+
+def _gcs_bucket_blob(path: str) -> Tuple[str, str]:
+    rest = str(path)[5:]
+    bucket, _, blob = rest.partition('/')
+    return bucket, blob
+
+
+def set_text_gcs_metadata(path: str):
+    path_s = str(path)
+    if not path_s.startswith('gs://'):
+        return
+    content_type = 'text/plain; charset=utf-8'
+    content_disposition = 'inline'
+    try:
+        fs = tj._get_gcs_fs()
+        if fs is not None and hasattr(fs, 'setxattrs'):
+            fs.setxattrs(
+                path_s,
+                content_type=content_type,
+                content_disposition=content_disposition,
+            )
+            return
+    except Exception:
+        pass
+    try:
+        from google.cloud import storage
+
+        bucket_name, blob_name = _gcs_bucket_blob(path_s)
+        blob = storage.Client().bucket(bucket_name).blob(blob_name)
+        blob.content_type = content_type
+        blob.content_disposition = content_disposition
+        blob.patch()
+    except Exception:
+        pass
 
 
 def append_text(path: str, text: str):
@@ -1038,6 +1143,12 @@ def main():
     resume_from = args.resume_from or cfg_resume
     init_from = None if resume_from else (args.init_from or cfg.get('init_from') or ds_cfg.get('init_from'))
 
+    init_ref = resolve_init_checkpoint_ref(init_from) if init_from else None
+    resume_ref = resolve_downstream_orbax_resume_ref(resume_from) if resume_from else None
+    model_config_source = apply_init_checkpoint_model_config(
+        cfg, resume_ref if resume_ref is not None else init_ref)
+    ds_cfg = cfg.get('downstream', cfg.get('data', {}))
+
     seed = int(cfg.get('seed', 1))
     random.seed(seed + jax.process_index())
     np.random.seed(seed + jax.process_index())
@@ -1080,6 +1191,7 @@ def main():
             'trainer_script': 'scripts/downstream_finetune_jax.py',
             'config_path': str(args.config),
             'model_version': model_version,
+            'model_config_source': model_config_source,
             'task': task,
             'init_from': init_from,
             'resume_from': resume_from,
@@ -1111,7 +1223,6 @@ def main():
     # train_jax-style run directory: never write directly into a fixed run_name.
     # Host 0 creates the unique folder name and broadcasts it; otherwise each
     # worker would include its own PID and enter a different Orbax barrier.
-    resume_ref = resolve_downstream_orbax_resume_ref(resume_from) if resume_from else None
     legacy_resume_path = None
     if resume_from:
         if resume_ref is not None:
@@ -1144,10 +1255,16 @@ def main():
     if is_host0():
         record('=' * 60)
         record(f'Downstream fine-tune: model={model_version} task={task}')
+        record(f'Config: {args.config}')
+        record(f'model_config_source={model_config_source}')
         record(f'Hosts={n_hosts} devices={total_devices} local_devices={jax.local_device_count()} host_id={host}')
+        record(f'mesh_data={mesh_data} mesh_model={mesh_model}')
         record(f'batch={batch_size} eval_batch={eval_batch_size} max_seq_len={max_seq_len}')
+        record(f'lr={tcfg.get("lr")} warmup_ratio={tcfg.get("warmup_ratio")} eval_interval={eval_every} log_interval={log_every}')
+        record(f'downstream_source={ds_cfg.get("source", "hf")} hf_name={ds_cfg.get("hf_name", "<default>")} hf_config={ds_cfg.get("hf_config", "<default>")}')
         record(f'train_rows={len(train_rows)} eval_rows={len(eval_rows)} total_steps={total_steps}')
         record(f'init_from={init_from or "<none>"}')
+        record('init_policy=params_only_fresh_optimizer_step0')
         record(f'resume_from={resume_from or "<none>"}')
         record(f'run_name={run_name}')
         record(f'run_dir={run_dir}')
@@ -1195,7 +1312,9 @@ def main():
             best_acc = float(-ckpt.get('best_val_loss', 1.0))
             log(f'[resume] loaded legacy Flax params+optimizer+step from: {legacy_resume_path} step={global_step}')
     elif init_from:
-        ip = resolve_init_checkpoint_ref(init_from)
+        ip = init_ref
+        if ip is None:
+            raise RuntimeError('init_from is set but checkpoint ref was not resolved.')
         params = restore_params_only(ip, params, opt_state=opt_state, cfg=cfg, mesh=mesh, rng=key)
         opt_state = optimizer.init(params)
         opt_state = tj._replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
