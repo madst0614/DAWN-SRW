@@ -8,6 +8,19 @@ WORK_DIR="$HOME/dawn-spatial"
 
 IFS='|' read -r -a CONFIG_ARRAY <<< "$CONFIGS"
 
+resolve_config_path() {
+  local p="$1"
+  if [ -f "$p" ]; then
+    printf '%s\n' "$p"
+  elif [ -f "${p}.yaml" ]; then
+    printf '%s\n' "${p}.yaml"
+  elif [ -f "${p}.yml" ]; then
+    printf '%s\n' "${p}.yml"
+  else
+    printf '%s\n' "$p"
+  fi
+}
+
 echo "============================================"
 echo "Host $(hostname) — Setting up downstream TPU training"
 echo "  Branch:    $BRANCH"
@@ -20,10 +33,11 @@ cd "$WORK_DIR"
 echo "[1/4] Installing dependencies..."
 python3 -m pip install --upgrade pip -q
 python3 -m pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-python3 -m pip install -U flax optax numpy pyyaml gcsfs transformers sentencepiece fsspec huggingface_hub "orbax-checkpoint==0.11.24" -q
+python3 -m pip install -U flax optax numpy pyyaml transformers sentencepiece huggingface_hub "orbax-checkpoint==0.11.24" -q
 # Pin datasets/pyarrow to a compatible pair. New pyarrow removed PyExtensionType,
-# which older datasets imports at startup.
-python3 -m pip install --force-reinstall --no-cache-dir "pyarrow==20.0.0" "datasets==2.19.2" -q
+# which older datasets imports at startup.  gcsfs and fsspec must be pinned as
+# a compatible pair, otherwise downstream GCS checkpoint I/O can fail later.
+python3 -m pip install --force-reinstall --no-cache-dir "pyarrow==20.0.0" "datasets==2.19.2" "fsspec==2024.3.1" "gcsfs==2024.3.1" -q
 python3 - <<'PYCHK'
 import sys
 import datasets
@@ -38,9 +52,14 @@ PYCHK
 echo "[2/4] Verifying downstream files..."
 test -f scripts/downstream_finetune_jax.py || { echo "missing scripts/downstream_finetune_jax.py" >&2; exit 2; }
 test -f scripts/run_downstream_sequence.sh || { echo "missing scripts/run_downstream_sequence.sh" >&2; exit 2; }
+test -f scripts/expand_downstream_suite.py || { echo "missing scripts/expand_downstream_suite.py" >&2; exit 2; }
+RESOLVED_CONFIG_ARRAY=()
 for c in "${CONFIG_ARRAY[@]}"; do
-  test -f "$c" || { echo "missing config: $c" >&2; exit 2; }
+  rc="$(resolve_config_path "$c")"
+  test -f "$rc" || { echo "missing config: $c" >&2; exit 2; }
+  RESOLVED_CONFIG_ARRAY+=("$rc")
 done
+CONFIG_ARRAY=("${RESOLVED_CONFIG_ARRAY[@]}")
 
 echo "[3/4] Skipping standalone JAX TPU preflight."
 
