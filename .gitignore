@@ -50,6 +50,7 @@ htmlcov/
 *.pdf
 logs/
 outputs/
+.generated/
 
 # OS
 .DS_Store
