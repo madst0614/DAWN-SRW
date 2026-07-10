@@ -89,6 +89,12 @@ from models.dawn_srw_v4168 import (
     _raw_tau_init_from_cosine_tau as _v4168_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4168_tau_init_calibration_scores,
 )
+from models.dawn_srw_v4169 import (
+    DAWN_SRW_V4169,
+    _pool_operator_keys as _v4169_pool_operator_keys,
+    _raw_tau_init_from_cosine_tau as _v4169_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4169_tau_init_calibration_scores,
+)
 from models.baseline_transformer_jax import (
     VanillaTransformer,
     create_baseline_sharded_fns,
@@ -270,14 +276,16 @@ V4164_MODEL_VERSION = 'spatial-r1-v4.1.6.4'
 V4166_MODEL_VERSION = 'spatial-r1-v4.1.6.6'
 V4167_MODEL_VERSION = 'spatial-r1-v4.1.6.7'
 V4168_MODEL_VERSION = 'spatial-r1-v4.1.6.8'
+V4169_MODEL_VERSION = 'spatial-r1-v4.1.6.9'
 BASELINE_MODEL_VERSION = 'baseline-JAX'
 LEGACY_BASELINE_MODEL_VERSION = 'baseline'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (
     V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION,
-    V4168_MODEL_VERSION)
+    V4168_MODEL_VERSION, V4169_MODEL_VERSION)
 RW_KEY_SRW_MODEL_VERSIONS = (
-    V4166_MODEL_VERSION, V4167_MODEL_VERSION, V4168_MODEL_VERSION)
+    V4166_MODEL_VERSION, V4167_MODEL_VERSION, V4168_MODEL_VERSION,
+    V4169_MODEL_VERSION)
 FIXED_TAU_SRW_MODEL_VERSIONS = (V4167_MODEL_VERSION,)
 CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_SELECTION_CALIBRATION_SCORE_CHUNK_TOKENS = 2048
@@ -312,6 +320,12 @@ MODEL_REGISTRY = {
         'module': 'models.dawn_srw_v4168',
         'raw_tau_init_from_cosine_tau': _v4168_raw_tau_init_from_cosine_tau,
         'tau_init_calibration_scores': _v4168_tau_init_calibration_scores,
+    },
+    V4169_MODEL_VERSION: {
+        'class': DAWN_SRW_V4169,
+        'module': 'models.dawn_srw_v4169',
+        'raw_tau_init_from_cosine_tau': _v4169_raw_tau_init_from_cosine_tau,
+        'tau_init_calibration_scores': _v4169_tau_init_calibration_scores,
     },
 }
 
@@ -391,6 +405,8 @@ def _pool_operator_keys_for_version(version):
         return _v4167_pool_operator_keys
     if version == V4168_MODEL_VERSION:
         return _v4168_pool_operator_keys
+    if version == V4169_MODEL_VERSION:
+        return _v4169_pool_operator_keys
     raise ValueError(f"{version} does not expose RW-derived operator keys.")
 
 
@@ -853,6 +869,35 @@ ACTIVE_SRW_RESUME_REQUIRED_FIELDS = (
     ('training', 'soft_gate_effective_active_eps'),
 )
 
+V4169_RESUME_REQUIRED_FIELDS = (
+    ('model', 'model_version'),
+    ('model', 'd_model'),
+    ('model', 'n_layers'),
+    ('model', 'n_heads'),
+    ('model', 'max_seq_len'),
+    ('model', 'd_route'),
+    ('model', 'n_qk'),
+    ('model', 'n_v'),
+    ('model', 'n_rst'),
+    ('data', 'max_train_tokens'),
+    ('training', 'batch_size'),
+    ('training', 'num_epochs'),
+    ('training', 'mesh_model'),
+    ('training', 'mesh_data'),
+    ('training', 'gradient_accumulation_steps'),
+    ('training', 'lr'),
+    ('training', 'warmup_ratio'),
+    ('training', 'weight_decay'),
+    ('training', 'checkpoint_interval'),
+    ('training', 'val_interval'),
+    ('training', 'log_interval'),
+    ('training', 'log_analysis_multiplier'),
+    ('training', 'heavy_geometry_multiplier'),
+    ('training', 'n_chunks_qk'),
+    ('training', 'n_chunks_v'),
+    ('training', 'n_chunks_rst'),
+)
+
 V4168_OPSPACE_RESUME_REQUIRED_FIELDS = (
     ('model', 'model_version'),
     ('model', 'd_model'),
@@ -1051,6 +1096,54 @@ def _require_resume_materialized_fields(full_config):
             )
         return
 
+    if str(model_version) == V4169_MODEL_VERSION:
+        missing = _missing_config_paths(full_config, V4169_RESUME_REQUIRED_FIELDS)
+        if missing:
+            raise RuntimeError(
+                "Resume checkpoint full_config is missing required "
+                "materialized v4169 fields. Automatic config fallback is "
+                "disabled. Missing keys: " + ", ".join(missing)
+            )
+        forbidden_training_keys = (
+            'selection_calibration',
+            'selection_calibration_applied',
+            'soft_gate_boundary_power_start',
+            'soft_gate_boundary_power_final',
+            'admission_den_power',
+            'admission_den_grad_scale',
+            'tau_lr_mult',
+            'tau_grad_clip',
+            'orthogonality_weight',
+            'diversity_weight',
+            'load_balance_weight',
+            'tau_reg_weight',
+            'dead_penalty_weight',
+            'dead_penalty_qk_weight',
+            'dead_penalty_v_weight',
+            'dead_penalty_rst_weight',
+            'dead_penalty_weighted_clip',
+            'dead_exposure_target',
+            'inactive_aux_enabled',
+            'inactive_aux_start_frac',
+            'inactive_aux_full_frac',
+            'inactive_aux_schedule',
+        )
+        present = [
+            key for key in forbidden_training_keys
+            if key in training_cfg and training_cfg[key] is not None
+        ]
+        present.extend(
+            key for key in training_cfg
+            if key.startswith('cb1a_') or key.startswith('inactive_aux_')
+        )
+        present = sorted(set(present))
+        if present:
+            raise RuntimeError(
+                "Resume checkpoint full_config contains v4169-forbidden "
+                "training fields: " + ", ".join(present)
+            )
+        return
+
     missing = _missing_config_paths(
         full_config, ACTIVE_SRW_RESUME_REQUIRED_FIELDS)
     if missing:
@@ -1123,6 +1216,7 @@ def _maybe_materialize_vocab_parallel_config(cfg):
             V4166_MODEL_VERSION,
             V4167_MODEL_VERSION,
             V4168_MODEL_VERSION,
+            V4169_MODEL_VERSION,
             BASELINE_MODEL_VERSION,
             LEGACY_BASELINE_MODEL_VERSION):
         return
@@ -1140,11 +1234,15 @@ def _maybe_materialize_vocab_parallel_config(cfg):
             f"logical_vocab_size={logical_vocab_size}")
     cfg["model"]["logical_vocab_size"] = logical_vocab_size
     cfg["model"]["vocab_size_padded"] = padded
-    if model_version in (V4166_MODEL_VERSION, V4168_MODEL_VERSION):
+    if model_version in (
+            V4166_MODEL_VERSION, V4168_MODEL_VERSION, V4169_MODEL_VERSION):
         cfg["model"]["vocab_size"] = padded
         if jax.process_index() == 0:
-            _model_label = (
-                "V4166" if model_version == V4166_MODEL_VERSION else "V4168")
+            _model_label = {
+                V4166_MODEL_VERSION: "V4166",
+                V4168_MODEL_VERSION: "V4168",
+                V4169_MODEL_VERSION: "V4169",
+            }[model_version]
             print(
                 f"vocab_parallel: enabled model={_model_label} "
                 f"logical_vocab={logical_vocab_size} "
@@ -2161,7 +2259,7 @@ def _dawn_srw_kwargs(cfg):
                 kw['tau_init_attn_qk'] = 0.0
                 kw['tau_init_attn_v'] = 0.0
                 kw['tau_init_rst'] = 0.0
-    if str(version) == V4166_MODEL_VERSION:
+    if str(version) in (V4166_MODEL_VERSION, V4169_MODEL_VERSION):
         kw.update({
             'logical_vocab_size': m.get('logical_vocab_size', None),
             'vocab_size_padded': m.get('vocab_size_padded', None),
@@ -2194,6 +2292,14 @@ def _dawn_srw_kwargs(cfg):
 def _v4164_sharded_kwargs(cfg):
     """Fixed v4164 sharded SRW execution kwargs."""
     t = cfg['training']
+    version = str(cfg.get('model', {}).get('model_version', ''))
+    if version == V4169_MODEL_VERSION:
+        return dict(
+            dead_exposure_target=0.0,
+            soft_gate_effective_active_eps=1.0e-6,
+            admission_den_power=1.0,
+            admission_den_grad_scale=1.0,
+        )
     opspace_cfg = t.get('operation_space', {})
     operation_space_enabled = (
         str(cfg.get('model', {}).get('model_version', ''))
@@ -4867,8 +4973,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
+    _is_v4169_model = str(_model_version) == V4169_MODEL_VERSION
     _use_minimal_train_path = (
-        str(_model_version) in (V4166_MODEL_VERSION, V4168_MODEL_VERSION)
+        str(_model_version) in (
+            V4166_MODEL_VERSION, V4168_MODEL_VERSION, V4169_MODEL_VERSION)
         and _pass_minimal_train_kw)
     if jax.process_index() == 0:
         print(
@@ -4896,10 +5004,29 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _dead_weighted_clip = jnp.float32(0.0)
         _inactive_aux_norm_by_layers = True
         _inactive_aux_norm_by_layers_f = jnp.float32(1.0)
+    if _is_v4169_model:
+        _cb1a_enabled = False
+        _cb1a_weight = jnp.float32(0.0)
+        _cb1a_challenge_weight = jnp.float32(0.0)
+        _cb1a_prune_weight = jnp.float32(0.0)
+        _cb1a_qk_weight = jnp.float32(0.0)
+        _cb1a_v_weight = jnp.float32(0.0)
+        _cb1a_rst_weight = jnp.float32(0.0)
+        _inactive_aux_enabled = False
+        _inactive_aux_weight_q = jnp.float32(0.0)
+        _inactive_aux_weight_k = jnp.float32(0.0)
+        _inactive_aux_weight_v = jnp.float32(0.0)
+        _inactive_aux_weight_rst = jnp.float32(0.0)
+        _inactive_aux_weighted_clip = jnp.float32(0.0)
+        _dead_penalty_qk_weight = jnp.float32(0.0)
+        _dead_penalty_v_weight = jnp.float32(0.0)
+        _dead_penalty_rst_weight = jnp.float32(0.0)
+        _dead_weighted_clip = jnp.float32(0.0)
     _inactive_aux_requires_no_active_direct = False
 
     _soft_gate_runtime_enabled = bool(
-        soft_gate_schedule_active and _is_soft_direct_tau)
+        soft_gate_schedule_active and _is_soft_direct_tau
+        and not _is_v4169_model)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -4927,7 +5054,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
          else None),
         _soft_gate_pool_defaults)
     _boundary_power_schedule_active = bool(
-        boundary_power_schedule_active)
+        boundary_power_schedule_active and not _is_v4169_model)
     _soft_gate_boundary_power_start = jnp.float32(
         soft_gate_boundary_power_start)
     _soft_gate_boundary_power_mid = jnp.float32(
@@ -7208,12 +7335,14 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             f"{_ce_token_chunk_size}")
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
+    _is_v4169_model = str(_model_version) == V4169_MODEL_VERSION
     _use_minimal_train_path = (
-        str(_model_version) == V4168_MODEL_VERSION
+        str(_model_version) in (V4168_MODEL_VERSION, V4169_MODEL_VERSION)
         and _pass_minimal_train_kw)
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
-        and _is_active_srw_version(_model_version))
+        and _is_active_srw_version(_model_version)
+        and not _is_v4169_model)
     _is_boundary_power_model = _is_active_srw_version(_model_version)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
@@ -7242,7 +7371,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
          else None),
         _soft_gate_pool_defaults)
     _boundary_power_schedule_active = bool(
-        boundary_power_schedule_active)
+        boundary_power_schedule_active and not _is_v4169_model)
     _soft_gate_boundary_power_start = jnp.float32(
         soft_gate_boundary_power_start)
     _soft_gate_boundary_power_mid = jnp.float32(
@@ -7612,6 +7741,9 @@ def get_param_shardings(params, mesh, model_version=None,
                      or (version == V4168_MODEL_VERSION
                          and mesh_model > 1
                          and has_padded_vocab)
+                     or (version == V4169_MODEL_VERSION
+                         and mesh_model > 1
+                         and has_padded_vocab)
                      or _is_baseline_version(version))):
             return row_sharded
         if _is_baseline_version(version):
@@ -7654,6 +7786,10 @@ def get_param_shardings(params, mesh, model_version=None,
                 return row_sharded
         # NeuronPool params: shard N axis (first dim) on 'model'
         if 'neuron_pool' in path_str:
+            if (version == V4169_MODEL_VERSION
+                    and (leaf.endswith('_op_read_proj')
+                         or leaf.endswith('_op_write_proj'))):
+                return replicated
             if (is_stage_partitioned_pool
                     and (leaf.endswith('_stage')
                          or leaf.endswith('_local'))):
@@ -7725,6 +7861,30 @@ def _print_param_sharding_summary(param_shardings, model_version):
                     'neuron_pool/rst_write',
                     'neuron_pool/attn_qk_read',
                     'neuron_pool/attn_qk_write'):
+                interesting.append((ps, sharding))
+        elif version == V4169_MODEL_VERSION:
+            if ps in (
+                    'token_emb/embedding',
+                    'router/proj_attn/kernel',
+                    'router/proj_rst/kernel',
+                    'router/q_op_write_query_proj',
+                    'router/k_op_write_query_proj',
+                    'router/v_op_write_query_proj',
+                    'router/rst_op_write_query_proj',
+                    'router/raw_tau_attn/kernel',
+                    'router/raw_tau_rst/kernel',
+                    'neuron_pool/attn_qk_read',
+                    'neuron_pool/attn_qk_write',
+                    'neuron_pool/attn_v_read',
+                    'neuron_pool/attn_v_write',
+                    'neuron_pool/rst_read',
+                    'neuron_pool/rst_write',
+                    'neuron_pool/attn_qk_op_read_proj',
+                    'neuron_pool/attn_qk_op_write_proj',
+                    'neuron_pool/attn_v_op_read_proj',
+                    'neuron_pool/attn_v_op_write_proj',
+                    'neuron_pool/rst_op_read_proj',
+                    'neuron_pool/rst_op_write_proj'):
                 interesting.append((ps, sharding))
     if not interesting:
         return
@@ -10853,6 +11013,7 @@ def _print_regular_block(rec, ctx):
     is_v4164 = _is_active_srw_version(ctx.get('model_version'))
     is_v4166 = _is_rw_key_srw_version(ctx.get('model_version'))
     is_v4168 = str(ctx.get('model_version')) == V4168_MODEL_VERSION
+    is_v4169 = str(ctx.get('model_version')) == V4169_MODEL_VERSION
     is_official_soft_direct_tau = _is_active_srw_version(ctx.get('model_version'))
     official_soft_sparsity_compact = False
 
@@ -10929,7 +11090,7 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['rst_strong']*100:.1f}%"
         )
     if is_v4164:
-        _weight_label = 'admission'
+        _weight_label = 'gate' if is_v4169 else 'admission'
         _select_status = ""
         if not opspace_active:
             log_message(
@@ -10979,20 +11140,36 @@ def _print_regular_block(rec, ctx):
                 f" rst={rec['rst_pool_scale']:.3f}")
         if (_is_active_srw_version(ctx.get('model_version'))
                 and not opspace_active):
-            log_message(
-                f"  drive: "
-                f"qk[m={rec['attn_qk_drive_mean']:.5f}"
-                f" max={rec['attn_qk_drive_max']:.5f}] "
-                f"v[m={rec['attn_v_drive_mean']:.5f}"
-                f" max={rec['attn_v_drive_max']:.5f}] "
-                f"rst[m={rec['rst_drive_mean']:.5f}"
-                f" max={rec['rst_drive_max']:.5f}]"
-            )
-            log_message(
-                f"  admission_den: qk={rec['attn_qk_admission_den_sum']:.1f}"
-                f" v={rec['attn_v_admission_den_sum']:.1f}"
-                f" rst={rec['rst_admission_den_sum']:.1f}"
-            )
+            if is_v4169:
+                log_message(
+                    f"  angular_depth: "
+                    f"qk[m={rec['attn_qk_drive_mean']:.5f}"
+                    f" max={rec['attn_qk_drive_max']:.5f}] "
+                    f"v[m={rec['attn_v_drive_mean']:.5f}"
+                    f" max={rec['attn_v_drive_max']:.5f}] "
+                    f"rst[m={rec['rst_drive_mean']:.5f}"
+                    f" max={rec['rst_drive_max']:.5f}]"
+                )
+                log_message(
+                    f"  gate_den: qk={rec['attn_qk_admission_den_sum']:.1f}"
+                    f" v={rec['attn_v_admission_den_sum']:.1f}"
+                    f" rst={rec['rst_admission_den_sum']:.1f}"
+                )
+            else:
+                log_message(
+                    f"  drive: "
+                    f"qk[m={rec['attn_qk_drive_mean']:.5f}"
+                    f" max={rec['attn_qk_drive_max']:.5f}] "
+                    f"v[m={rec['attn_v_drive_mean']:.5f}"
+                    f" max={rec['attn_v_drive_max']:.5f}] "
+                    f"rst[m={rec['rst_drive_mean']:.5f}"
+                    f" max={rec['rst_drive_max']:.5f}]"
+                )
+                log_message(
+                    f"  admission_den: qk={rec['attn_qk_admission_den_sum']:.1f}"
+                    f" v={rec['attn_v_admission_den_sum']:.1f}"
+                    f" rst={rec['rst_admission_den_sum']:.1f}"
+                )
             log_message(
                 f"  execution_mass: qk={rec['attn_qk_execution_mass_sum']:.1f}"
                 f" v={rec['attn_v_execution_mass_sum']:.1f}"
@@ -11002,11 +11179,12 @@ def _print_regular_block(rec, ctx):
                 return (
                     f"{rec.get(f'{label}_{metric}_local', 0.0) * 100:.2f}%/"
                     f"{rec.get(f'{label}_{metric}_pool', 0.0) * 100:.2f}%")
-            log_message(
-                "  admission local/pool: "
-                f"qk={_lp('qk', 'admission')} "
-                f"v={_lp('v', 'admission')} "
-                f"rst={_lp('rst', 'admission')}")
+            if not is_v4169:
+                log_message(
+                    "  admission local/pool: "
+                    f"qk={_lp('qk', 'admission')} "
+                    f"v={_lp('v', 'admission')} "
+                    f"rst={_lp('rst', 'admission')}")
             log_message(
                 "  execution local/pool: "
                 f"qk={_lp('qk', 'execution')} "
@@ -12005,6 +12183,7 @@ def main():
         and bool(operation_space_repack_config.get(
             'operation_space_enabled', False))
     )
+    is_v4169_cfg = str(model_version_cfg) == V4169_MODEL_VERSION
     tau_init_cfg = (
         None
         if operation_space_tau_free_enabled
@@ -12014,7 +12193,7 @@ def main():
             else None))
     selection_calibration_cfg = (
         _operation_space_disabled_selection_calibration_config(cfg)
-        if operation_space_tau_free_enabled
+        if (operation_space_tau_free_enabled or is_v4169_cfg)
         else _selection_calibration_config(cfg, tau_init_cfg))
     if (selection_calibration_cfg.get('enabled', False)
             and not _is_active_srw_version(model_version_cfg)):
@@ -12225,6 +12404,26 @@ def main():
     route_emb_update_ratio_cap = tcfg.get('route_emb_update_ratio_cap', 0.0)
     tau_update_abs_cap = tcfg.get('tau_update_abs_cap', 0.0)
     scan_update_abs_cap = tcfg.get('scan_update_abs_cap', 0.0)
+    if is_v4169_cfg:
+        tau_lr_mult = 0.0
+        tau_grad_clip = 0.0
+        router_proj_lr_mult = 1.0
+        op_key_lr_mult = 1.0
+        router_proj_grad_clip = 2.0
+        op_key_grad_clip = 2.0
+        soft_gate_schedule_active = False
+        boundary_power_schedule_active = False
+        pool_specific_gate_t = False
+        admission_den_power = 1.0
+        admission_den_grad_scale = 1.0
+        soft_gate_effective_active_eps = 1.0e-6
+        inactive_aux_enabled = False
+        cb1a_enabled = False
+        div_weight = 0.0
+        lb_weight = 0.0
+        tau_reg_weight = 0.0
+        dead_penalty_weight = 0.0
+        current_admission_den_config_override = False
     ckpt_interval = int(tcfg.get('checkpoint_interval', 5000))
     checkpoint_keep_last = int(tcfg.get(
         'checkpoint_keep_last',
@@ -12505,6 +12704,7 @@ def main():
             and bool(operation_space_repack_config.get(
                 'operation_space_enabled', False))
         )
+        is_v4169_cfg = str(model_version_cfg) == V4169_MODEL_VERSION
         tau_init_cfg = (
             None
             if operation_space_tau_free_enabled
@@ -12514,7 +12714,7 @@ def main():
                 else None))
         selection_calibration_cfg = (
             _operation_space_disabled_selection_calibration_config(cfg)
-            if operation_space_tau_free_enabled
+            if (operation_space_tau_free_enabled or is_v4169_cfg)
             else _selection_calibration_config(cfg, tau_init_cfg))
         max_seq_len = cfg['model']['max_seq_len']
         training_log_append_on_resume = bool(tcfg.get(
@@ -12704,7 +12904,11 @@ def main():
                     'soft_gate_boundary_power_final_frac',
                     soft_gate_boundary_power_final_frac))
             if not current_admission_den_config_override:
-                if operation_space_tau_free_enabled:
+                if is_v4169_cfg:
+                    admission_den_power = 1.0
+                    admission_den_grad_scale = 1.0
+                    soft_gate_effective_active_eps = 1.0e-6
+                elif operation_space_tau_free_enabled:
                     admission_den_power = float(
                         saved_training_config['opspace_gate_den_power'])
                     admission_den_grad_scale = 1.0
@@ -12783,6 +12987,26 @@ def main():
                 'tau_update_abs_cap', tau_update_abs_cap)
             scan_update_abs_cap = saved_training_config.get(
                 'scan_update_abs_cap', scan_update_abs_cap)
+            if is_v4169_cfg:
+                tau_lr_mult = 0.0
+                tau_grad_clip = 0.0
+                router_proj_lr_mult = 1.0
+                op_key_lr_mult = 1.0
+                router_proj_grad_clip = 2.0
+                op_key_grad_clip = 2.0
+                soft_gate_schedule_active = False
+                boundary_power_schedule_active = False
+                pool_specific_gate_t = False
+                admission_den_power = 1.0
+                admission_den_grad_scale = 1.0
+                soft_gate_effective_active_eps = 1.0e-6
+                inactive_aux_enabled = False
+                cb1a_enabled = False
+                div_weight = 0.0
+                lb_weight = 0.0
+                tau_reg_weight = 0.0
+                dead_penalty_weight = 0.0
+                current_admission_den_config_override = False
             if not cli_args.oom_check:
                 run_oom_check = bool(saved_training_config.get(
                     'oom_check',
@@ -12938,6 +13162,57 @@ def main():
         soft_gate_schedule_active = True
         pool_specific_gate_t = True
         boundary_power_schedule_active = True
+    if is_v4169_cfg:
+        tau_lr_mult = 0.0
+        tau_grad_clip = 0.0
+        router_proj_lr_mult = 1.0
+        op_key_lr_mult = 1.0
+        router_proj_grad_clip = 2.0
+        op_key_grad_clip = 2.0
+        pool_weight_decay = 0.0
+        orth_weight = 0.0
+        div_weight = 0.0
+        lb_weight = 0.0
+        tau_reg_weight = 0.0
+        dead_penalty_weight = 0.0
+        dead_penalty_qk_weight = 0.0
+        dead_penalty_v_weight = 0.0
+        dead_penalty_rst_weight = 0.0
+        dead_exposure_target = 0.0
+        inactive_aux_enabled = False
+        inactive_aux_weight = 0.0
+        inactive_aux_weight_q = 0.0
+        inactive_aux_weight_k = 0.0
+        inactive_aux_weight_qk = 0.0
+        inactive_aux_weight_v = 0.0
+        inactive_aux_weight_rst = 0.0
+        inactive_aux_asymmetry = 0.0
+        inactive_aux_asymmetry_q = 0.0
+        inactive_aux_asymmetry_k = 0.0
+        inactive_aux_asymmetry_qk = 0.0
+        inactive_aux_asymmetry_v = 0.0
+        inactive_aux_asymmetry_rst = 0.0
+        inactive_aux_weighted_clip = 0.0
+        dead_penalty_weighted_clip = 0.0
+        cb1a_enabled = False
+        cb1a_weight = 0.0
+        cb1a_challenge_weight = 0.0
+        cb1a_prune_weight = 0.0
+        cb1a_qk_weight = 0.0
+        cb1a_v_weight = 0.0
+        cb1a_rst_weight = 0.0
+        cb1a_qk_challenge_weight = 0.0
+        cb1a_qk_prune_weight = 0.0
+        cb1a_v_challenge_weight = 0.0
+        cb1a_v_prune_weight = 0.0
+        cb1a_rst_challenge_weight = 0.0
+        cb1a_rst_prune_weight = 0.0
+        soft_gate_schedule_active = False
+        pool_specific_gate_t = False
+        boundary_power_schedule_active = False
+        admission_den_power = 1.0
+        admission_den_grad_scale = 1.0
+        soft_gate_effective_active_eps = 1.0e-6
 
     is_baseline = _is_baseline_version(model_version_cfg)
     if is_baseline:
@@ -13442,6 +13717,54 @@ def main():
                                                 'dead_penalty_weighted_clip'):
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
+    if is_v4169_cfg:
+        for _key in (
+                'pool_weight_decay',
+                'orthogonality_weight',
+                'diversity_weight',
+                'load_balance_weight',
+                'tau_reg_weight',
+                'dead_penalty_weight',
+                'dead_penalty_qk_weight',
+                'dead_penalty_v_weight',
+                'dead_penalty_rst_weight',
+                'dead_penalty_weighted_clip',
+                'dead_exposure_target',
+                'selection_calibration',
+                'selection_calibration_applied',
+                'selection_calibration_seen_tokens',
+                'selection_calibration_actual_batches',
+                'selection_calibration_histogram_bins',
+                'selection_calibration_tau_qk',
+                'selection_calibration_tau_v',
+                'selection_calibration_tau_rst',
+                'tau_lr_mult',
+                'tau_grad_clip',
+                'soft_gate_effective_active_eps',
+                'admission_den_power',
+                'admission_den_grad_scale',
+                'soft_gate_t_start',
+                'soft_gate_t_final',
+                'soft_gate_t_hold_frac',
+                'soft_gate_t_anneal_end_frac',
+                'soft_gate_t_schedule',
+                'soft_gate_schedule',
+                'soft_gate_t_power',
+                'soft_gate_t_gompertz_center',
+                'soft_gate_t_gompertz_steepness',
+                'soft_gate_boundary_power_start',
+                'soft_gate_boundary_power_mid',
+                'soft_gate_boundary_power_final',
+                'soft_gate_boundary_power_start_frac',
+                'soft_gate_boundary_power_mid_frac',
+                'soft_gate_boundary_power_final_frac'):
+            training_config.pop(_key, None)
+            cfg.setdefault('training', {}).pop(_key, None)
+        for _clean_key in list(training_config.keys()):
+            if (_clean_key.startswith('cb1a_')
+                    or _clean_key.startswith('inactive_aux_')):
+                training_config.pop(_clean_key, None)
+                cfg.setdefault('training', {}).pop(_clean_key, None)
     cfg.setdefault('training', {}).update(training_config)
 
     # ----------------------------------------------------------
@@ -13902,102 +14225,131 @@ def main():
                 f"router_dropout={cfg['model'].get('router_dropout', None)}")
             print("  Effective pruning: disabled for operation-space QK/V/RST")
         else:
-            print("  Tau parameterization: bounded sigmoid min/max")
-            print("  tau = -1 + 2 * sigmoid(raw_tau)")
-            print("  Boundary admission: one-sided generalized Gaussian")
-            print("  drive = softplus((rho-tau)/B) / softplus((1-tau)/B)")
-            print("  execution_weight = admission * drive")
-            print("  admission_den = max(sum(admission), 1.0) ** admission_den_power")
-            print(
-                "  admission_den_grad = admission_den_grad_scale * live_admission_den_grad "
-                "+ detached remainder")
-            print("  Boundary power:")
-            print(
-                f"    start={soft_gate_boundary_power_start} "
-                f"mid={soft_gate_boundary_power_mid} "
-                f"final={soft_gate_boundary_power_final} "
-                f"start_frac={soft_gate_boundary_power_start_frac} "
-                f"mid_frac={soft_gate_boundary_power_mid_frac} "
-                f"final_frac={soft_gate_boundary_power_final_frac}")
-            print("  Admission denominator:")
-            print(
-                f"    admission_den_power={admission_den_power} "
-                f"admission_den_grad_scale={admission_den_grad_scale}")
-            print(f"    pool_specific={pool_specific_gate_t} "
-                  f"effective_active_eps={soft_gate_effective_active_eps}")
-            _scale_label = 'B'
-            def _devband_summary(_cfg):
-                return (
-                    f"sort={_cfg['sort']} band={_cfg['band']} "
-                    f"mid={_cfg['mid']} late={_cfg['late']} "
-                    f"final={_cfg['final']} "
-                    f"sort_end_frac={_cfg['sort_end_frac']} "
-                    f"band_reach_frac={_cfg['band_reach_frac']} "
-                    f"formation_end_frac={_cfg['formation_end_frac']} "
-                    f"sharpen_end_frac={_cfg['sharpen_end_frac']} "
-                    f"formation_power={_cfg['formation_power']} "
-                    f"sharpen_power={_cfg['sharpen_power']}")
-            if pool_specific_gate_t:
-                for _pool in POOL_SCHEDULE_NAMES:
-                    _cfg = soft_gate_pool_schedules[_pool]
-                    _schedule_name = str(_cfg['schedule']).lower()
-                    if _schedule_name == 'developmental_band':
-                        print(
-                            f"    {_pool}: schedule={_cfg['schedule']} "
-                            f"{_devband_summary(_cfg)}")
-                    else:
-                        _shape_msg = (
-                            f"gompertz_center={_cfg['gompertz_center']} "
-                            f"gompertz_steepness={_cfg['gompertz_steepness']} "
-                            if _schedule_name == 'log_gompertz'
-                            else f"power={_cfg['power']} ")
-                        print(
-                            f"    {_pool}: {_scale_label}_start={_cfg['start']} "
-                            f"{_scale_label}_final={_cfg['final']} "
-                            f"hold_frac={_cfg['hold_frac']} "
-                            f"anneal_end_frac={_cfg['anneal_end_frac']} "
-                            f"schedule={_cfg['schedule']} {_shape_msg}")
+            if is_v4169_cfg:
+                print("  Tau parameterization: token-wise bounded DirectTau parameters")
+                print("  tau = -1 + 2 * sigmoid(raw_tau)")
+                print("  Gate: linear angular-depth from RW-matched cosine margin")
+                print("  gate = clip((rho - tau) / max(1 - tau, 1e-4), 0, 1)")
+                print("  execution_prune_eps: training=0.0; eval zeros gates below eps")
+                print("  denominator: max(sum(pruned_gate), 1.0) with live gradient")
+                print("[opspace] key=rw_derived query=rw_matched_product tau=calibrated_frozen gate=linear_angular_depth den=gate_sum")
+                print("tau policy: token-wise bounded DirectTau parameters")
+                print("tau init: fresh quantile calibration")
+                print("tau update: frozen by v4169 code policy (effective lr multiplier=0)")
+                print("  Effective pruning:")
+                print(
+                    f"    console={regular_console_level} "
+                    f"host_timing={regular_console_host_timing}")
+                print(
+                    f"    eval enabled={eval_effective_prune_enabled} "
+                    f"eps={eval_effective_prune_eps_list}")
+                if _is_active_srw_version(model_version_cfg):
+                    gate_msg = (
+                        f"  Gate ({cfg['model'].get('model_version')} canonical-rw-direct-tau): "
+                        f"tau_init_mode={tau_init_cfg['mode']} "
+                        f"tau_init_target_qk_frac={cfg['model'].get('tau_init_target_qk_frac', None)} "
+                        f"tau_init_target_v_frac={cfg['model'].get('tau_init_target_v_frac', None)} "
+                        f"tau_init_target_rst_frac={cfg['model'].get('tau_init_target_rst_frac', None)} "
+                        f"dropout={cfg['model'].get('dropout', None)} "
+                        f"router_dropout={cfg['model'].get('router_dropout', None)}")
+                    print(gate_msg)
             else:
-                if soft_gate_schedule.lower() == 'developmental_band':
-                    _cfg = soft_gate_pool_schedules['qk']
-                    print(f"    schedule={soft_gate_schedule} "
-                          f"{_devband_summary(_cfg)}")
+                print("  Tau parameterization: bounded sigmoid min/max")
+                print("  tau = -1 + 2 * sigmoid(raw_tau)")
+                print("  Boundary admission: one-sided generalized Gaussian")
+                print("  drive = softplus((rho-tau)/B) / softplus((1-tau)/B)")
+                print("  execution_weight = admission * drive")
+                print("  admission_den = max(sum(admission), 1.0) ** admission_den_power")
+                print(
+                    "  admission_den_grad = admission_den_grad_scale * live_admission_den_grad "
+                    "+ detached remainder")
+                print("  Boundary power:")
+                print(
+                    f"    start={soft_gate_boundary_power_start} "
+                    f"mid={soft_gate_boundary_power_mid} "
+                    f"final={soft_gate_boundary_power_final} "
+                    f"start_frac={soft_gate_boundary_power_start_frac} "
+                    f"mid_frac={soft_gate_boundary_power_mid_frac} "
+                    f"final_frac={soft_gate_boundary_power_final_frac}")
+                print("  Admission denominator:")
+                print(
+                    f"    admission_den_power={admission_den_power} "
+                    f"admission_den_grad_scale={admission_den_grad_scale}")
+                print(f"    pool_specific={pool_specific_gate_t} "
+                      f"effective_active_eps={soft_gate_effective_active_eps}")
+                _scale_label = 'B'
+                def _devband_summary(_cfg):
+                    return (
+                        f"sort={_cfg['sort']} band={_cfg['band']} "
+                        f"mid={_cfg['mid']} late={_cfg['late']} "
+                        f"final={_cfg['final']} "
+                        f"sort_end_frac={_cfg['sort_end_frac']} "
+                        f"band_reach_frac={_cfg['band_reach_frac']} "
+                        f"formation_end_frac={_cfg['formation_end_frac']} "
+                        f"sharpen_end_frac={_cfg['sharpen_end_frac']} "
+                        f"formation_power={_cfg['formation_power']} "
+                        f"sharpen_power={_cfg['sharpen_power']}")
+                if pool_specific_gate_t:
+                    for _pool in POOL_SCHEDULE_NAMES:
+                        _cfg = soft_gate_pool_schedules[_pool]
+                        _schedule_name = str(_cfg['schedule']).lower()
+                        if _schedule_name == 'developmental_band':
+                            print(
+                                f"    {_pool}: schedule={_cfg['schedule']} "
+                                f"{_devband_summary(_cfg)}")
+                        else:
+                            _shape_msg = (
+                                f"gompertz_center={_cfg['gompertz_center']} "
+                                f"gompertz_steepness={_cfg['gompertz_steepness']} "
+                                if _schedule_name == 'log_gompertz'
+                                else f"power={_cfg['power']} ")
+                            print(
+                                f"    {_pool}: {_scale_label}_start={_cfg['start']} "
+                                f"{_scale_label}_final={_cfg['final']} "
+                                f"hold_frac={_cfg['hold_frac']} "
+                                f"anneal_end_frac={_cfg['anneal_end_frac']} "
+                                f"schedule={_cfg['schedule']} {_shape_msg}")
                 else:
-                    _soft_gate_shape_msg = (
-                        f"gompertz_center={soft_gate_t_gompertz_center} "
-                        f"gompertz_steepness={soft_gate_t_gompertz_steepness} "
-                        if soft_gate_schedule.lower() == 'log_gompertz'
-                        else f"power={soft_gate_t_power} ")
-                    print(f"    {_scale_label}_start={soft_gate_t_start} "
-                          f"{_scale_label}_final={soft_gate_t_final} "
-                          f"hold_frac={soft_gate_t_hold_frac} "
-                          f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
-                          f"schedule={soft_gate_schedule} "
-                          f"{_soft_gate_shape_msg}")
-            print(f"  tau control: tau_lr_mult={tau_lr_mult}")
-            if ignored_tau_ce_grad_scale_keys:
-                print("  tau_ce_grad_scale config fields are ignored in "
-                      "v4164; tau movement is controlled by tau_lr_mult.")
-            print("  Effective pruning:")
-            print(
-                f"    console={regular_console_level} "
-                f"host_timing={regular_console_host_timing}")
-            print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
-            if _is_active_srw_version(model_version_cfg):
-                _gate_intensity_part = ""
-                gate_msg = (
-                    f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
-                    f"tau_init_mode={tau_init_cfg['mode']} "
-                    f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
-                    f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
-                    f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
-                    f"{_gate_intensity_part}"
-                    f"dropout={cfg['model'].get('dropout', None)} "
-                    f"router_dropout={cfg['model'].get('router_dropout', None)}"
-                )
-                print(gate_msg)
-            elif is_baseline:
-                print("  Baseline loss: CE only; SRW tau/selection disabled.")
+                    if soft_gate_schedule.lower() == 'developmental_band':
+                        _cfg = soft_gate_pool_schedules['qk']
+                        print(f"    schedule={soft_gate_schedule} "
+                              f"{_devband_summary(_cfg)}")
+                    else:
+                        _soft_gate_shape_msg = (
+                            f"gompertz_center={soft_gate_t_gompertz_center} "
+                            f"gompertz_steepness={soft_gate_t_gompertz_steepness} "
+                            if soft_gate_schedule.lower() == 'log_gompertz'
+                            else f"power={soft_gate_t_power} ")
+                        print(f"    {_scale_label}_start={soft_gate_t_start} "
+                              f"{_scale_label}_final={soft_gate_t_final} "
+                              f"hold_frac={soft_gate_t_hold_frac} "
+                              f"anneal_end_frac={soft_gate_t_anneal_end_frac} "
+                              f"schedule={soft_gate_schedule} "
+                              f"{_soft_gate_shape_msg}")
+                print(f"  tau control: tau_lr_mult={tau_lr_mult}")
+                if ignored_tau_ce_grad_scale_keys:
+                    print("  tau_ce_grad_scale config fields are ignored in "
+                          "v4164; tau movement is controlled by tau_lr_mult.")
+                print("  Effective pruning:")
+                print(
+                    f"    console={regular_console_level} "
+                    f"host_timing={regular_console_host_timing}")
+                print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
+                if _is_active_srw_version(model_version_cfg):
+                    _gate_intensity_part = ""
+                    gate_msg = (
+                        f"  Gate ({cfg['model'].get('model_version')} soft-annealed-direct-tau): "
+                        f"tau_init_mode={tau_init_cfg['mode']} "
+                        f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', None))} "
+                        f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', None))} "
+                        f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', None))} "
+                        f"{_gate_intensity_part}"
+                        f"dropout={cfg['model'].get('dropout', None)} "
+                        f"router_dropout={cfg['model'].get('router_dropout', None)}"
+                    )
+                    print(gate_msg)
+                elif is_baseline:
+                    print("  Baseline loss: CE only; SRW tau/selection disabled.")
 
     # ----------------------------------------------------------
     # Resume defaults. Orbax state restore runs after mesh sharding so
@@ -14819,6 +15171,7 @@ def main():
         _vocab_parallel_model = str(model_version_cfg) in (
             V4166_MODEL_VERSION,
             V4168_MODEL_VERSION,
+            V4169_MODEL_VERSION,
         )
         _vocab_parallel_enabled = False
         if (_vocab_parallel_model
@@ -14873,6 +15226,9 @@ def main():
             if (str(model_version_cfg) == V4166_MODEL_VERSION
                     and _vocab_parallel_enabled):
                 _extra_msg += "; v4166 TP extras=vocab_parallel_ce"
+            if (str(model_version_cfg) == V4169_MODEL_VERSION
+                    and _vocab_parallel_enabled):
+                _extra_msg += "; v4169 TP extras=vocab_parallel_ce"
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 _v4168_exec_mode = (
                     "operation_space_tau_free_relu"
