@@ -8,7 +8,7 @@ Modes:
   --resume-from: resume a downstream run from checkpoint; params+optimizer+step restored
 
 Path resolution for both init/resume:
-  downstream resume -> best_model.flax first -> latest checkpoint_step*.flax -> latest *.flax
+  downstream resume -> latest committed Orbax run/best_checkpoints step
   pretrain init-from -> .flax as above, or latest committed Orbax run/checkpoints step
 """
 from __future__ import annotations
@@ -36,7 +36,6 @@ import yaml
 import jax
 import jax.numpy as jnp
 import optax
-from flax import serialization
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.experimental.multihost_utils import process_allgather
 
@@ -90,7 +89,7 @@ class CheckpointRef:
 
 
 def resolve_flax_checkpoint_path(path: Optional[str]) -> Optional[str]:
-    """Resolve downstream Flax file/dir checkpoint. Directories prefer best_model.flax."""
+    """Resolve a legacy Flax file/dir checkpoint."""
     if not path:
         return None
     p = str(path)
@@ -143,6 +142,44 @@ def resolve_init_checkpoint_ref(path: Optional[str]) -> Optional[CheckpointRef]:
         )
     raise FileNotFoundError(
         f'No downstream .flax checkpoint or committed Orbax checkpoint found in: {path}')
+
+
+def resolve_downstream_orbax_resume_ref(path: Optional[str]) -> Optional[CheckpointRef]:
+    if not path:
+        return None
+    p = str(path).rstrip('/\\')
+    candidates = []
+    name = path_basename(p)
+    if name in ('best_checkpoints', 'checkpoints'):
+        candidates.append(p)
+    else:
+        candidates.extend([join_path(p, 'best_checkpoints'), join_path(p, 'checkpoints')])
+    for checkpoint_dir in candidates:
+        run_folder = checkpoint_dir.rsplit('/', 1)[0]
+        step = None
+        try:
+            paths = tj._list_files(checkpoint_dir, '*')
+            steps = [
+                tj._orbax_step_from_path_name(path_basename(x))
+                for x in paths
+            ]
+            steps = sorted(
+                s for s in steps
+                if s is not None and tj._orbax_step_is_committed(join_path(checkpoint_dir, str(int(s))))
+            )
+            if steps:
+                step = int(steps[-1])
+        except Exception:
+            step = None
+        if step is not None:
+            return CheckpointRef(
+                kind='orbax',
+                path=join_path(checkpoint_dir, str(int(step))),
+                run_folder=run_folder,
+                checkpoint_dir=checkpoint_dir,
+                step=int(step),
+            )
+    return None
 
 
 def _truthy_env_or_cfg(value) -> Optional[bool]:
@@ -544,7 +581,7 @@ def _summarize_param_key_mismatch(raw_params, target_params) -> str:
     return '\n'.join(lines)
 
 
-def restore_orbax_params_only(ref: CheckpointRef, params):
+def restore_orbax_params_only(ref: CheckpointRef, params, opt_state, cfg: Dict[str, Any], mesh, rng):
     if ref.kind != 'orbax' or ref.checkpoint_dir is None or ref.step is None:
         raise ValueError(f'Invalid Orbax checkpoint ref: {ref}')
     tj._require_orbax_checkpoint_compat()
@@ -557,29 +594,26 @@ def restore_orbax_params_only(ref: CheckpointRef, params):
         restored = manager.restore(
             int(ref.step),
             args=tj.ocp.args.Composite(
-                state=tj.ocp.args.StandardRestore(
-                    {'params': params},
-                    strict=False,
-                ),
+                state=tj.ocp.args.StandardRestore(),
                 metadata=tj.ocp.args.JsonRestore(),
             ),
         )
+        restored_state = tj._composite_item(restored, 'state')
     finally:
         manager.close()
-    state = tj._composite_item(restored, 'state')
-    if not isinstance(state, dict) or 'params' not in state:
+    if not isinstance(restored_state, dict) or 'params' not in restored_state:
         raise ValueError(f'Orbax checkpoint did not restore params: {ref.path}')
-    raw_params = _adapt_checkpoint_params_to_target(state['params'], params)
+    raw_params = _adapt_checkpoint_params_to_target(restored_state['params'], params)
     try:
-        restored_tree = serialization.from_state_dict(
-            {'params': params}, {'params': raw_params})
+        restored_params = tj._match_tree_to_template_on_mesh(
+            raw_params, params, mesh, name='params')
     except ValueError as e:
         detail = _summarize_param_key_mismatch(raw_params, params)
         raise ValueError(
             f'Failed to restore Orbax params from {ref.path}. '
             f'Key summary after adapter:\n{detail}') from e
     log(f'[ckpt] Orbax params-only loaded: {ref.path}')
-    return restored_tree['params']
+    return restored_params
 
 
 def restore_flax_params_only(path: str, params):
@@ -601,61 +635,92 @@ def restore_flax_params_only(path: str, params):
     return restored['params']
 
 
-def restore_params_only(ref_or_path, params):
+def restore_params_only(ref_or_path, params, opt_state=None, cfg=None, mesh=None, rng=None):
     if isinstance(ref_or_path, CheckpointRef):
         if ref_or_path.kind == 'orbax':
-            return restore_orbax_params_only(ref_or_path, params)
+            if opt_state is None or cfg is None or mesh is None or rng is None:
+                raise ValueError('Orbax params restore requires opt_state, cfg, mesh, and rng.')
+            return restore_orbax_params_only(ref_or_path, params, opt_state, cfg, mesh, rng)
         return restore_flax_params_only(ref_or_path.path, params)
     return restore_flax_params_only(str(ref_or_path), params)
 
 
-def _host_numpy_leaf(x):
-    """Materialize a possibly global-sharded JAX array on every host.
-
-    Flax serialization calls np.array(x). On multi-host TPU this fails when x is a
-    global jax.Array spanning non-addressable devices. process_allgather must be
-    called by all hosts, then host0 can serialize/write the resulting host arrays.
-    """
-    if isinstance(x, jax.Array):
-        try:
-            if getattr(x, 'is_fully_addressable', False):
-                return np.asarray(jax.device_get(x))
-        except Exception:
-            pass
-        return np.asarray(process_allgather(x, tiled=True))
-    return x
-
-
-def _materialize_for_checkpoint(tree):
-    return jax.tree_util.tree_map(_host_numpy_leaf, tree)
-
-
-def save_downstream_checkpoint(path: str, params, opt_state, step: int, best_metric: float, cfg: Dict[str, Any], extra=None):
-    # IMPORTANT: this function MUST be called by every host at the same program
-    # point.  It gathers sharded params/opt_state like train_jax; only host0
-    # writes the serialized bytes.
-    model_cfg = cfg.get('model', {})
+def downstream_training_config(cfg: Dict[str, Any], extra=None) -> Dict[str, Any]:
     train_cfg = dict(cfg.get('training', {}))
     train_cfg['downstream'] = cfg.get('downstream', {})
     if extra:
         train_cfg['extra'] = extra
+    return train_cfg
 
-    ckpt = {
-        'params': params,
-        'opt_state': opt_state,
-        'epoch': 0,
-        'step': step,
-        'step_in_epoch': 0,
-        'steps_per_epoch': 0,
-        'best_val_loss': -best_metric,
-        'config': model_cfg,
-        'training_config': train_cfg,
-    }
-    ckpt = _materialize_for_checkpoint(ckpt)
 
-    if is_host0():
-        bytes_data = serialization.to_bytes(ckpt)
-        tj._write_checkpoint_bytes(path, bytes_data)
+def save_downstream_best_orbax(manager, params, opt_state, rng, step: int,
+                               best_acc: float, cfg: Dict[str, Any],
+                               config_path: str, run_id: str, task: str):
+    training_config = downstream_training_config(cfg, {'task': task})
+    # Trainer Orbax uses best_val_loss as a lower-is-better metric.  Downstream
+    # best is accuracy, so store negative accuracy in that slot.
+    return tj.save_orbax_checkpoint(
+        manager,
+        params,
+        opt_state,
+        rng,
+        epoch=0,
+        global_step=int(step),
+        step_in_epoch=0,
+        steps_per_epoch=0,
+        best_val_loss=-float(best_acc),
+        model_config=cfg.get('model', {}),
+        training_config=training_config,
+        full_config=cfg,
+        raw_config=cfg,
+        config_path=config_path,
+        run_id=run_id,
+        checkpoint_kind='downstream_best',
+        val_loss=-float(best_acc),
+        wait=True,
+    )
+
+
+def restore_downstream_orbax_checkpoint(ref: CheckpointRef, target_params,
+                                        target_opt_state, cfg: Dict[str, Any],
+                                        mesh, rng):
+    if ref.kind != 'orbax' or ref.checkpoint_dir is None or ref.step is None:
+        raise ValueError(f'Invalid downstream Orbax checkpoint ref: {ref}')
+    target_state = tj._build_orbax_state(
+        target_params,
+        target_opt_state,
+        rng,
+        epoch=0,
+        global_step=0,
+        step_in_epoch=0,
+        steps_per_epoch=0,
+        best_val_loss=float('inf'),
+        training_config=downstream_training_config(cfg),
+        full_config=cfg,
+        model_config=cfg.get('model', {}),
+    )
+    manager = tj._create_orbax_checkpoint_manager(
+        ref.checkpoint_dir,
+        create=False,
+        read_only=True,
+    )
+    try:
+        restored_state, _ = tj._restore_orbax_state(
+            manager, int(ref.step), target_state)
+    finally:
+        manager.close()
+    if not isinstance(restored_state, dict) or 'params' not in restored_state:
+        raise ValueError(f'Orbax checkpoint did not restore state.params: {ref.path}')
+    params = tj._match_tree_to_template_on_mesh(
+        restored_state['params'], target_params, mesh, name='params')
+    opt_state = tj._match_tree_to_template_on_mesh(
+        restored_state['opt_state'], target_opt_state, mesh, name='opt_state')
+    global_step = int(np.asarray(jax.device_get(
+        restored_state.get('global_step', restored_state.get('step', 0)))).reshape(()))
+    best_val_loss = float(np.asarray(jax.device_get(
+        restored_state.get('best_val_loss', 1.0))).reshape(()))
+    restored_rng = np.asarray(restored_state.get('rng', np.asarray(jax.device_get(rng))), dtype=np.uint32).reshape((2,))
+    return params, opt_state, jnp.asarray(restored_rng, dtype=jnp.uint32), global_step, -best_val_loss
 
 
 # -----------------------------
@@ -1074,7 +1139,6 @@ def main():
     total_steps = int(max_steps_cfg) if max_steps_cfg else steps_per_epoch * num_epochs
     log_every = int(tcfg.get('log_interval', 20))
     eval_every = int(tcfg.get('eval_interval', 200))
-    save_every = int(tcfg.get('checkpoint_interval', 500))
 
     # Output/run dir.
     ckpt_root = cfg.get('checkpoint_dir') or ds_cfg.get('checkpoint_dir')
@@ -1083,8 +1147,14 @@ def main():
     # train_jax-style run directory: never write directly into a fixed run_name.
     # Treat cfg.run_name as a human-readable prefix only, then append timestamp+pid.
     # This prevents reruns from overwriting the same downstream folder.
+    resume_ref = resolve_downstream_orbax_resume_ref(resume_from) if resume_from else None
+    legacy_resume_path = None
     if resume_from:
-        run_dir = str(resume_from).rstrip('/')
+        if resume_ref is not None:
+            run_dir = str(resume_ref.run_folder).rstrip('/')
+        else:
+            legacy_resume_path = resolve_flax_checkpoint_path(resume_from)
+            run_dir = str(resume_from).rstrip('/')
         run_name = run_dir.rstrip('/').rsplit('/', 1)[-1]
     else:
         run_prefix = cfg.get('run_name') or f"{model_version}_{task}"
@@ -1136,21 +1206,25 @@ def main():
     optimizer = make_optimizer(cfg, total_steps)
     opt_state = optimizer.init(params)
     opt_state = tj._replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
+    rng = jax.random.PRNGKey(seed + 1000)
 
     # Load params-only or resume full state.
     global_step = 0
     best_acc = -1.0
     if resume_from:
-        rp = resolve_flax_checkpoint_path(resume_from)
-        ckpt = tj.load_checkpoint(rp, params, opt_state)
-        params = ckpt['params']; opt_state = ckpt['opt_state']
-        global_step = int(ckpt.get('step', 0))
-        # save_checkpoint stores best as -best_metric in best_val_loss.
-        best_acc = float(-ckpt.get('best_val_loss', 1.0))
-        log(f'[resume] loaded params+optimizer+step from: {rp} step={global_step}')
+        if resume_ref is not None:
+            params, opt_state, rng, global_step, best_acc = restore_downstream_orbax_checkpoint(
+                resume_ref, params, opt_state, cfg, mesh, rng)
+            log(f'[resume] loaded downstream Orbax state from: {resume_ref.path} step={global_step}')
+        else:
+            ckpt = tj.load_checkpoint(legacy_resume_path, params, opt_state)
+            params = ckpt['params']; opt_state = ckpt['opt_state']
+            global_step = int(ckpt.get('step', 0))
+            best_acc = float(-ckpt.get('best_val_loss', 1.0))
+            log(f'[resume] loaded legacy Flax params+optimizer+step from: {legacy_resume_path} step={global_step}')
     elif init_from:
         ip = resolve_init_checkpoint_ref(init_from)
-        params = restore_params_only(ip, params)
+        params = restore_params_only(ip, params, opt_state=opt_state, cfg=cfg, mesh=mesh, rng=key)
         opt_state = optimizer.init(params)
         opt_state = tj._replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
         global_step = 0
@@ -1158,6 +1232,14 @@ def main():
         log(f'[init] loaded params only from: {ip.path}; optimizer=fresh; step=0')
     else:
         log('[init] no init-from: random-init downstream control')
+
+    best_checkpoint_manager = tj._create_orbax_checkpoint_manager(
+        join_path(run_dir, 'best_checkpoints'),
+        checkpoint_interval=1,
+        keep_last=int(tcfg.get('best_checkpoint_keep_last', 1)),
+        create=True,
+        best_tracking=True,
+    )
 
     # Verify step consistency.
     if n_hosts > 1:
@@ -1181,8 +1263,8 @@ def main():
         """Broadcast host0 eval accuracy and new-best decision to all hosts.
 
         evaluate() materializes metrics only on host0, but checkpoint saving must
-        be entered by every host because save_downstream_checkpoint gathers
-        sharded params/opt_state using multi-host collectives.  This mirrors
+        be entered by every host because Orbax checkpointing uses multi-host
+        collectives for sharded params/opt_state.  This mirrors
         train_jax: all hosts participate in the gather, host0 writes bytes.
         """
         if is_host0():
@@ -1208,10 +1290,11 @@ def main():
         append_text(metrics_csv_path, f"eval,{global_step},,,,,,{ev_acc},{ev_total},{max(best_acc, ev_acc):.6f},0.0\n")
     if new_best:
         best_acc = ev_acc
-        save_downstream_checkpoint(join_path(run_dir, 'best_model.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
+        save_downstream_best_orbax(
+            best_checkpoint_manager, params, opt_state, rng, global_step,
+            best_acc, cfg, args.config, run_name, task)
 
     # Training.
-    rng = jax.random.PRNGKey(seed + 1000 + global_step)
     t0 = time.time()
     epoch = global_step // max(steps_per_epoch, 1)
     while global_step < total_steps:
@@ -1256,15 +1339,9 @@ def main():
                 append_text(metrics_csv_path, f"eval,{global_step},,,,,,{ev_acc},{ev_total},{max(best_acc, ev_acc):.6f},{time.time() - t0:.3f}\n")
             if new_best:
                 best_acc = ev_acc
-                save_downstream_checkpoint(join_path(run_dir, 'best_model.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
-
-        # Save periodic resume checkpoints only during training.
-        # Do NOT force a final full checkpoint at task end: on multi-host TPU
-        # that can leave non-host0 workers exiting/starting the next task while
-        # host0 is still writing a 4.7GB checkpoint, which stalls the sequence.
-        # best_model.flax is still saved whenever eval improves.
-        if save_every and save_every > 0 and (global_step % save_every == 0) and (global_step < total_steps):
-            save_downstream_checkpoint(join_path(run_dir, f'checkpoint_step{global_step}.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
+                save_downstream_best_orbax(
+                    best_checkpoint_manager, params, opt_state, rng,
+                    global_step, best_acc, cfg, args.config, run_name, task)
 
     if is_host0():
         final_msg = f'[done] task={task} best_acc={best_acc:.4f} step={global_step} run_dir={run_dir}'
@@ -1280,6 +1357,8 @@ def main():
         gathered_done = np.asarray(process_allgather(done)).reshape(-1)
         if not np.all(gathered_done == global_step):
             raise RuntimeError(f'end-of-task step mismatch across hosts: {gathered_done.tolist()}')
+    best_checkpoint_manager.wait_until_finished()
+    best_checkpoint_manager.close()
 
 
 if __name__ == '__main__':

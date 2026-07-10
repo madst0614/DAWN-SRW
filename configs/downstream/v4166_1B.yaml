@@ -28,7 +28,7 @@ downstream_suite:
     max_grad_norm: 1.0
     aux_weight: 0.0
     tau_weight: 0.0
-    checkpoint_interval: 500
+    best_checkpoint_keep_last: 1
     log_interval: 20
     max_steps: 800
     eval_interval: 100
