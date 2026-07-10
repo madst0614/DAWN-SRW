@@ -4419,6 +4419,14 @@ class DAWN_SRW_V4169(nn.Module):
         def _select_layer(diag_all, idx):
             return diag_all[:, idx]
 
+        def _attn_route_tau_mean(route_idx):
+            ndim = getattr(attn_tau_direct_all, 'ndim', 0)
+            if ndim >= 5:
+                return attn_tau_direct_all[..., route_idx, :].mean()
+            if ndim >= 4:
+                return attn_tau_direct_all[..., route_idx].mean()
+            return _select_mean(attn_qk_select_diag_all, SELECT_TAU_MEAN)
+
         result = {
             'aux_loss': total_aux,
             'soft_gate_T': jnp.asarray(soft_gate_T_qk, dtype=jnp.float32),
@@ -4489,8 +4497,8 @@ class DAWN_SRW_V4169(nn.Module):
             'rst_out_norm': rst_out_norm_all.mean(),
             'attn_out_norm': attn_out_norm_all.mean(),
             'attn_tau_mean': attn_tau_mean_all.mean(),
-            'attn_q_tau_mean': attn_tau_direct_all[:, :, :, 0, :].mean(),
-            'attn_k_tau_mean': attn_tau_direct_all[:, :, :, 1, :].mean(),
+            'attn_q_tau_mean': _attn_route_tau_mean(0),
+            'attn_k_tau_mean': _attn_route_tau_mean(1),
             'rst_tau_mean': rst_tau_mean_all.mean(),
             'attn_tau_abs_mean': attn_tau_abs_all.mean(),
             'rst_tau_abs_mean': rst_tau_abs_all.mean(),
