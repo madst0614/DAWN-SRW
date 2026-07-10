@@ -25,6 +25,7 @@ import inspect
 import hashlib
 import socket
 import warnings
+import gc
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -15129,6 +15130,18 @@ def main():
                     "  Restored checkpoint metadata kind="
                     f"{restored_metadata.get('checkpoint_kind', '<unknown>')}")
             print("  Restored training RNG from Orbax checkpoint.")
+        jax.block_until_ready((params, opt_state, rng))
+        del target_state
+        del restored_state
+        del target_params
+        del target_opt_state
+        gc.collect()
+        jax.clear_caches()
+        if is_host0:
+            print(
+                "  Resume restore cleanup: released Orbax target/restored "
+                "state trees before train_step JIT.",
+                flush=True)
     elif is_host0:
         print(f"  Orbax checkpoints: {_join(checkpoint_dir, 'checkpoints')}")
 
