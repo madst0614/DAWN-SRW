@@ -290,6 +290,18 @@ def hf_spec(task: str) -> Tuple[str, Optional[str], str, str]:
     raise ValueError(f'No HF spec for task={task}')
 
 
+def hf_name_candidates(name: str) -> List[str]:
+    """Return compatible HF dataset ids for old and new hub versions."""
+    aliases = {
+        'glue': 'nyu-mll/glue',
+        'super_glue': 'aps/super_glue',
+    }
+    alias = aliases.get(name)
+    if alias:
+        return [alias, name]
+    return [name]
+
+
 # -----------------------------
 # Data loading
 # -----------------------------
@@ -320,10 +332,23 @@ def load_raw_splits(data_cfg: Dict[str, Any], task: str):
         subset = data_cfg.get('hf_config', subset)
         train_split = data_cfg.get('train_split', train_split)
         eval_split = data_cfg.get('eval_split', eval_split)
-        log(f'[data] HF load_dataset({name!r}, {subset!r}) train={train_split} eval={eval_split}')
-        train = load_dataset(name, subset, split=train_split)
-        evals = load_dataset(name, subset, split=eval_split)
-        return train, evals
+        explicit_name = 'hf_name' in data_cfg
+        names = [name] if explicit_name else hf_name_candidates(name)
+        errors = []
+        for candidate in names:
+            try:
+                log(f'[data] HF load_dataset({candidate!r}, {subset!r}) train={train_split} eval={eval_split}')
+                train = load_dataset(candidate, subset, split=train_split)
+                evals = load_dataset(candidate, subset, split=eval_split)
+                return train, evals
+            except Exception as e:
+                errors.append(f'{candidate}: {type(e).__name__}: {e}')
+                if candidate == names[-1]:
+                    break
+                log(f'[data] HF load_dataset failed for {candidate!r}; retrying with {names[-1]!r}')
+        raise RuntimeError(
+            f'Failed to load HF dataset for task={task}. Attempts:\n'
+            + '\n'.join(errors))
     if source == 'jsonl':
         return load_jsonl(data_cfg['train_path']), load_jsonl(data_cfg['eval_path'])
     if source == 'tsv':
