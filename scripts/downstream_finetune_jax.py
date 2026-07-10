@@ -225,30 +225,119 @@ def load_orbax_checkpoint_model_config(ref: Optional[CheckpointRef]) -> Tuple[Op
     return deepcopy(model_config), deepcopy(full_config), source
 
 
-CHECKPOINT_RUNTIME_TRAINING_KEYS = (
-    'soft_gate_temperature',
-    'soft_gate_T_qk',
-    'soft_gate_T_v',
-    'soft_gate_T_rst',
-    'soft_gate_t_final',
-    'soft_gate_boundary_power',
-    'soft_gate_boundary_power_final',
-    'admission_den_power',
+CHECKPOINT_OPTIONAL_RUNTIME_TRAINING_KEYS = (
     'opspace_gate_den_power',
 )
 
+CHECKPOINT_STRICT_RUNTIME_MODEL_VERSIONS = (
+    tj.V4166_MODEL_VERSION,
+    tj.V4168_MODEL_VERSION,
+)
 
-def checkpoint_runtime_training_defaults(full_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+CHECKPOINT_POOL_FINAL_KEYS = {
+    'qk': 'soft_gate_t_qk_final',
+    'v': 'soft_gate_t_v_final',
+    'rst': 'soft_gate_t_rst_final',
+}
+
+CHECKPOINT_REQUIRED_RUNTIME_TRAINING_KEYS = (
+    'soft_gate_t_final',
+    'soft_gate_boundary_power_final',
+    'admission_den_power',
+    'admission_den_grad_scale',
+    'soft_gate_effective_active_eps',
+    'tau_lr_mult',
+)
+
+
+def _require_checkpoint_training_value(training: Dict[str, Any],
+                                       key: str,
+                                       ref_path: str):
+    if key not in training:
+        raise ValueError(
+            f'Checkpoint {ref_path} is missing full_config.training.{key}; '
+            'downstream refuses to use YAML/code fallback for calibrated '
+            'runtime values.')
+    return deepcopy(training[key])
+
+
+def _require_positive_float(value, key: str, ref_path: str) -> float:
+    out = float(value)
+    if not math.isfinite(out) or out <= 0.0:
+        raise ValueError(
+            f'Checkpoint {ref_path} has invalid full_config.training.{key}={value!r}; '
+            'expected a finite positive value.')
+    return out
+
+
+def _require_nonnegative_float(value, key: str, ref_path: str) -> float:
+    out = float(value)
+    if not math.isfinite(out) or out < 0.0:
+        raise ValueError(
+            f'Checkpoint {ref_path} has invalid full_config.training.{key}={value!r}; '
+            'expected a finite nonnegative value.')
+    return out
+
+
+def checkpoint_runtime_training_config(full_config: Optional[Dict[str, Any]],
+                                       model_config: Optional[Dict[str, Any]],
+                                       ref_path: str) -> Dict[str, Any]:
     if not isinstance(full_config, dict):
-        return {}
+        full_config = {}
     training = full_config.get('training', {})
+    version = str((model_config or {}).get('model_version', ''))
+    strict_runtime = version in CHECKPOINT_STRICT_RUNTIME_MODEL_VERSIONS
     if not isinstance(training, dict):
+        if strict_runtime:
+            raise ValueError(
+                f'Checkpoint {ref_path} is missing full_config.training; '
+                'cannot restore calibrated downstream runtime config.')
         return {}
-    return {
-        key: deepcopy(training[key])
-        for key in CHECKPOINT_RUNTIME_TRAINING_KEYS
-        if key in training
-    }
+    if not strict_runtime:
+        return {
+            key: deepcopy(training[key])
+            for key in CHECKPOINT_OPTIONAL_RUNTIME_TRAINING_KEYS
+            if key in training
+        }
+
+    runtime: Dict[str, Any] = {}
+    for pool, source_key in CHECKPOINT_POOL_FINAL_KEYS.items():
+        value = _require_checkpoint_training_value(training, source_key, ref_path)
+        runtime[source_key] = deepcopy(value)
+        runtime[f'soft_gate_T_{pool}'] = _require_positive_float(
+            value, source_key, ref_path)
+    runtime['soft_gate_temperature'] = runtime['soft_gate_T_qk']
+
+    for key in CHECKPOINT_REQUIRED_RUNTIME_TRAINING_KEYS:
+        runtime[key] = _require_checkpoint_training_value(training, key, ref_path)
+
+    boundary_final = _require_positive_float(
+        runtime['soft_gate_boundary_power_final'],
+        'soft_gate_boundary_power_final',
+        ref_path)
+    runtime['soft_gate_boundary_power_final'] = boundary_final
+    runtime['soft_gate_boundary_power'] = boundary_final
+
+    runtime['admission_den_power'] = _require_nonnegative_float(
+        runtime['admission_den_power'], 'admission_den_power', ref_path)
+    runtime['admission_den_grad_scale'] = _require_nonnegative_float(
+        runtime['admission_den_grad_scale'], 'admission_den_grad_scale', ref_path)
+    runtime['soft_gate_effective_active_eps'] = _require_positive_float(
+        runtime['soft_gate_effective_active_eps'],
+        'soft_gate_effective_active_eps',
+        ref_path)
+    runtime['tau_lr_mult'] = _require_nonnegative_float(
+        runtime['tau_lr_mult'], 'tau_lr_mult', ref_path)
+
+    for key in CHECKPOINT_OPTIONAL_RUNTIME_TRAINING_KEYS:
+        if key in training:
+            runtime[key] = deepcopy(training[key])
+    for key, value in training.items():
+        if (key.startswith('selection_calibration')
+                or key.startswith('soft_gate_t_')
+                or key.startswith('soft_gate_boundary_power_')):
+            runtime.setdefault(key, deepcopy(value))
+    return runtime
 
 
 def apply_init_checkpoint_model_config(cfg: Dict[str, Any],
@@ -261,11 +350,12 @@ def apply_init_checkpoint_model_config(cfg: Dict[str, Any],
                 'an Orbax checkpoint with model metadata.')
         return source
     cfg['model'] = model_config
-    runtime_defaults = checkpoint_runtime_training_defaults(full_config)
-    if runtime_defaults:
+    runtime_config = checkpoint_runtime_training_config(
+        full_config, model_config, init_ref.path if init_ref is not None else source)
+    if runtime_config:
         training = cfg.setdefault('training', {})
-        for key, value in runtime_defaults.items():
-            training.setdefault(key, value)
+        for key, value in runtime_config.items():
+            training[key] = value
     if 'tokenizer' not in cfg and isinstance(full_config, dict) and 'tokenizer' in full_config:
         cfg['tokenizer'] = deepcopy(full_config['tokenizer'])
     return source
@@ -816,6 +906,30 @@ def make_optimizer(cfg: Dict[str, Any], total_steps: int):
     )
 
 
+def _tree_path_to_str(path) -> str:
+    return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
+
+
+def _tree_path_has_part(path, *names: str) -> bool:
+    parts = tuple(part for part in _tree_path_to_str(path).split('/') if part)
+    return any(name in parts for name in names)
+
+
+def _is_tau_update_path(path) -> bool:
+    return _tree_path_has_part(
+        path,
+        'raw_tau',
+        'raw_tau_attn',
+        'raw_tau_attn_qk',
+        'raw_tau_attn_v',
+        'raw_tau_qk',
+        'raw_tau_v',
+        'raw_tau_rst',
+        'tau_attn',
+        'tau_rst',
+    )
+
+
 def _factory_kwargs(factory, kwargs):
     try:
         sig = inspect.signature(factory)
@@ -832,6 +946,41 @@ def _chunk_size_from_count(name: str, local_count: int, n_chunks: int) -> int:
     if local_count <= 0:
         raise ValueError(f'{name} local count must be > 0, got {local_count}')
     return max(1, int(math.ceil(local_count / n_chunks)))
+
+
+def _strict_checkpoint_runtime_required(version: str) -> bool:
+    return str(version) in CHECKPOINT_STRICT_RUNTIME_MODEL_VERSIONS
+
+
+def _require_training_runtime_value(cfg: Dict[str, Any], key: str, context: str):
+    training = cfg.get('training', {})
+    if not isinstance(training, dict) or key not in training:
+        raise ValueError(
+            f'training.{key} is required for {context}; downstream refuses '
+            'to use YAML/code fallback for checkpoint-calibrated runtime.')
+    return training[key]
+
+
+def _require_positive_training_float(cfg: Dict[str, Any],
+                                     key: str,
+                                     context: str) -> float:
+    value = _require_training_runtime_value(cfg, key, context)
+    out = float(value)
+    if not math.isfinite(out) or out <= 0.0:
+        raise ValueError(
+            f'training.{key} must be finite and > 0 for {context}, got {value!r}')
+    return out
+
+
+def _require_nonnegative_training_float(cfg: Dict[str, Any],
+                                        key: str,
+                                        context: str) -> float:
+    value = _require_training_runtime_value(cfg, key, context)
+    out = float(value)
+    if not math.isfinite(out) or out < 0.0:
+        raise ValueError(
+            f'training.{key} must be finite and >= 0 for {context}, got {value!r}')
+    return out
 
 
 def build_sharded_fns_if_needed(cfg: Dict[str, Any], mesh):
@@ -891,6 +1040,14 @@ def build_sharded_fns_if_needed(cfg: Dict[str, Any], mesh):
         'rst', nrst_local, tr.get('n_chunks_rst', tr.get('n_chunks_know', 1)))
 
     base_kwargs = {'mesh': mesh}
+    if _strict_checkpoint_runtime_required(version):
+        _require_nonnegative_training_float(
+            cfg, 'admission_den_power', f'{version} sharded SRW runtime')
+        _require_nonnegative_training_float(
+            cfg, 'admission_den_grad_scale', f'{version} sharded SRW runtime')
+        _require_positive_training_float(
+            cfg, 'soft_gate_effective_active_eps',
+            f'{version} sharded SRW runtime')
     base_kwargs.update(tj._v4164_sharded_kwargs(cfg))
     single_v = make_sharded_srw(
         max_chunk_size=v_chunk,
@@ -972,6 +1129,7 @@ def _call_extra_kwargs(model, cfg, sharded_fns, deterministic: bool,
     model_version = str(getattr(
         model, '__version__', getattr(type(model), '__version__', '')))
     tr = cfg.get('training', {})
+    strict_runtime = _strict_checkpoint_runtime_required(model_version)
     use_minimal_train = cfg_bool(
         tr.get('use_minimal_train_path', tr.get('use_minimal_train')), True)
     if (model_version in (tj.V4166_MODEL_VERSION, tj.V4168_MODEL_VERSION)
@@ -979,28 +1137,63 @@ def _call_extra_kwargs(model, cfg, sharded_fns, deterministic: bool,
             and use_minimal_train):
         kwargs['minimal_train'] = True
     if tj._model_accepts_soft_gate_schedule(model):
-        soft_t = float(tr.get(
-            'soft_gate_temperature',
-            tr.get('soft_gate_t_final', 0.07)))
-        kwargs['soft_gate_temperature'] = soft_t
-        kwargs['soft_gate_T_qk'] = float(tr.get('soft_gate_T_qk', soft_t))
-        kwargs['soft_gate_T_v'] = float(tr.get('soft_gate_T_v', soft_t))
-        kwargs['soft_gate_T_rst'] = float(tr.get('soft_gate_T_rst', soft_t))
+        if strict_runtime:
+            soft_t = _require_positive_training_float(
+                cfg, 'soft_gate_temperature', f'{model_version} forward')
+            kwargs['soft_gate_temperature'] = soft_t
+            kwargs['soft_gate_T_qk'] = _require_positive_training_float(
+                cfg, 'soft_gate_T_qk', f'{model_version} forward')
+            kwargs['soft_gate_T_v'] = _require_positive_training_float(
+                cfg, 'soft_gate_T_v', f'{model_version} forward')
+            kwargs['soft_gate_T_rst'] = _require_positive_training_float(
+                cfg, 'soft_gate_T_rst', f'{model_version} forward')
+        else:
+            soft_t = float(tr.get(
+                'soft_gate_temperature',
+                tr.get('soft_gate_t_final', 0.07)))
+            kwargs['soft_gate_temperature'] = soft_t
+            kwargs['soft_gate_T_qk'] = float(tr.get('soft_gate_T_qk', soft_t))
+            kwargs['soft_gate_T_v'] = float(tr.get('soft_gate_T_v', soft_t))
+            kwargs['soft_gate_T_rst'] = float(tr.get('soft_gate_T_rst', soft_t))
     if tj._model_accepts_soft_gate_t_final(model):
-        kwargs['soft_gate_t_final'] = float(tr.get('soft_gate_t_final', 0.07))
+        if strict_runtime:
+            kwargs['soft_gate_t_final'] = _require_positive_training_float(
+                cfg, 'soft_gate_t_final', f'{model_version} forward')
+        else:
+            kwargs['soft_gate_t_final'] = float(tr.get('soft_gate_t_final', 0.07))
     if tj._model_accepts_soft_gate_boundary_power(model):
-        boundary = float(tr.get(
-            'soft_gate_boundary_power',
-            tr.get('soft_gate_boundary_power_final', 4.0)))
-        kwargs['soft_gate_boundary_power'] = boundary
-        kwargs['soft_gate_boundary_power_final'] = float(
-            tr.get('soft_gate_boundary_power_final', boundary))
+        if strict_runtime:
+            kwargs['soft_gate_boundary_power'] = _require_positive_training_float(
+                cfg, 'soft_gate_boundary_power', f'{model_version} forward')
+            kwargs['soft_gate_boundary_power_final'] = (
+                _require_positive_training_float(
+                    cfg, 'soft_gate_boundary_power_final',
+                    f'{model_version} forward'))
+        else:
+            boundary = float(tr.get(
+                'soft_gate_boundary_power',
+                tr.get('soft_gate_boundary_power_final', 4.0)))
+            kwargs['soft_gate_boundary_power'] = boundary
+            kwargs['soft_gate_boundary_power_final'] = float(
+                tr.get('soft_gate_boundary_power_final', boundary))
     if tj._model_accepts_admission_den_power(model):
-        kwargs['admission_den_power'] = float(tr.get('admission_den_power', 1.0))
+        if strict_runtime:
+            kwargs['admission_den_power'] = _require_nonnegative_training_float(
+                cfg, 'admission_den_power', f'{model_version} forward')
+        else:
+            kwargs['admission_den_power'] = float(tr.get('admission_den_power', 1.0))
     if tj._model_accepts_execution_prune_eps(model):
         kwargs['execution_prune_eps'] = 0.0
     if tj._model_accepts_ce_token_chunk_size(model):
-        kwargs['ce_token_chunk_size'] = int(tr.get('ce_token_chunk_size', 32768))
+        if strict_runtime:
+            chunk_size = int(_require_training_runtime_value(
+                cfg, 'ce_token_chunk_size', f'{model_version} forward'))
+            if chunk_size <= 0:
+                raise ValueError(
+                    f'training.ce_token_chunk_size must be > 0, got {chunk_size}')
+            kwargs['ce_token_chunk_size'] = chunk_size
+        else:
+            kwargs['ce_token_chunk_size'] = int(tr.get('ce_token_chunk_size', 32768))
     if tj._model_accepts_compute_accuracy(model):
         kwargs['compute_accuracy'] = bool(compute_accuracy)
     return kwargs
@@ -1024,7 +1217,12 @@ def model_apply_logits(model, cfg, params, input_ids, attention_mask, sharded_fn
                        rngs={'dropout': jax.random.PRNGKey(0)}, **kwargs)['logits']
 
 
-def make_train_step(model, cfg, optimizer, sharded_fns, aux_weight: float, tau_weight: float):
+def make_train_step(model, cfg, optimizer, sharded_fns, aux_weight: float,
+                    tau_weight: float, tau_lr_mult: float = 1.0):
+    tau_lr_mult = float(tau_lr_mult)
+    if not math.isfinite(tau_lr_mult) or tau_lr_mult < 0.0:
+        raise ValueError(f'training.tau_lr_mult must be finite and >= 0, got {tau_lr_mult}')
+
     @jax.jit
     def train_step(params, opt_state, input_ids, labels, attention_mask, dropout_key):
         def loss_fn(p):
@@ -1041,8 +1239,18 @@ def make_train_step(model, cfg, optimizer, sharded_fns, aux_weight: float, tau_w
                            'valid_count': out['valid_count']}
         (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, new_opt = optimizer.update(grads, opt_state, params)
+        if tau_lr_mult != 1.0:
+            tau_mult = jnp.float32(tau_lr_mult)
+
+            def scale_tau_update(path, update):
+                if _is_tau_update_path(path):
+                    return update * tau_mult.astype(update.dtype)
+                return update
+
+            updates = jax.tree.map_with_path(scale_tau_update, updates)
         new_params = optax.apply_updates(params, updates)
         metrics['grad_norm'] = optax.global_norm(grads)
+        metrics['tau_lr_mult'] = jnp.float32(tau_lr_mult)
         return new_params, new_opt, metrics
     return train_step
 
@@ -1278,7 +1486,8 @@ def main():
         record(
             f'use_vocab_parallel={str(use_vocab_parallel).lower()} '
             f'use_minimal_train_path={str(cfg_bool(tcfg.get("use_minimal_train_path", tcfg.get("use_minimal_train")), True)).lower()} '
-            f'use_ce_scoring={str(use_ce_scoring).lower()}')
+            f'use_ce_scoring={str(use_ce_scoring).lower()} '
+            f'tau_lr_mult={float(tcfg.get("tau_lr_mult", 1.0)):.3f}')
         record(f'downstream_source={ds_cfg.get("source", "hf")} hf_name={ds_cfg.get("hf_name", "<default>")} hf_config={ds_cfg.get("hf_config", "<default>")}')
         record(f'train_rows={len(train_rows)} eval_rows={len(eval_rows)} total_steps={total_steps}')
         record(f'init_from={init_from or "<none>"}')
@@ -1352,8 +1561,11 @@ def main():
             raise RuntimeError(f'global_step mismatch across hosts: {all_steps.tolist()}')
         log(f'[verified] global_step={global_step} consistent across {n_hosts} hosts')
 
-    train_step = make_train_step(model, cfg, optimizer, sharded_fns,
-                                 float(tcfg.get('aux_weight', 0.0)), float(tcfg.get('tau_weight', 0.0)))
+    train_step = make_train_step(
+        model, cfg, optimizer, sharded_fns,
+        float(tcfg.get('aux_weight', 0.0)),
+        float(tcfg.get('tau_weight', 0.0)),
+        float(tcfg.get('tau_lr_mult', 1.0)))
     score_step = make_score_step(model, cfg, sharded_fns, use_ce_scoring)
 
     def _sync_eval_decision(ev: Dict[str, Any], current_best: float):
