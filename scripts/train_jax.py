@@ -16391,7 +16391,6 @@ def main():
                 traceback.print_exc()
 
         # Clear XLA compilation cache and free profiling memory
-        import gc
         gc.collect()
         jax.clear_caches()
 
