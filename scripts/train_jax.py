@@ -3790,13 +3790,16 @@ def _is_gcs(path):
     return str(path).startswith("gs://")
 
 
-def _open_file(path, mode="rb"):
+def _open_file(path, mode="rb", content_type=None):
     """Open a file for read/write, supporting GCS paths."""
     path_str = str(path)
     if _is_gcs(path_str):
         fs = _get_gcs_fs()
         if fs is not None:
-            return fs.open(path_str, mode)
+            kwargs = {}
+            if content_type and any(flag in mode for flag in ("w", "a", "x")):
+                kwargs["content_type"] = content_type
+            return fs.open(path_str, mode, **kwargs)
         try:
             import tensorflow as tf
             return tf.io.gfile.GFile(path_str, mode)
@@ -9163,9 +9166,10 @@ class GCSLogger:
     near-real-time visibility is worth it.
     """
 
-    def __init__(self, gcs_path, local_path, resume=False):
+    def __init__(self, gcs_path, local_path, resume=False, content_type=None):
         self.gcs_path = gcs_path
         self.local_path = local_path
+        self.content_type = content_type
         self._dirty = False
         if local_path:
             Path(local_path).parent.mkdir(parents=True, exist_ok=True)
@@ -9198,7 +9202,8 @@ class GCSLogger:
         try:
             with open(self.local_path, 'rb') as f:
                 data = f.read()
-            with _open_file(self.gcs_path, 'wb') as f:
+            with _open_file(self.gcs_path, 'wb',
+                            content_type=self.content_type) as f:
                 f.write(data)
             self._dirty = False
         except Exception as e:
@@ -9224,7 +9229,9 @@ def _setup_loggers(training_log_file, jsonl_log_file, resume=False):
 
     if _is_gcs(training_log_file):
         local_txt = str(tmpdir / Path(training_log_file).name)
-        _train_logger = GCSLogger(training_log_file, local_txt, resume=resume)
+        _train_logger = GCSLogger(
+            training_log_file, local_txt, resume=resume,
+            content_type='text/plain; charset=utf-8')
     else:
         _train_logger = GCSLogger(None, training_log_file, resume=resume)
 
