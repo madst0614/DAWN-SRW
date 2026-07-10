@@ -8,7 +8,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: spatial-r1-v4.1.6.6
+  model_version: spatial-r1-v4.1.6.9
   vocab_size: 30522
   d_model: 4096
   n_layers: 24
