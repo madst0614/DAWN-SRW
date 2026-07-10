@@ -28,7 +28,6 @@ downstream_suite:
     max_grad_norm: 1.0
     aux_weight: 0.0
     tau_weight: 0.0
-    best_checkpoint_keep_last: 1
     log_interval: 20
     max_steps: 800
     eval_interval: 100
@@ -40,6 +39,11 @@ downstream_suite:
     n_chunks_v: 2
     n_chunks_rst: 8
     initialize_jax_distributed: true
+    soft_gate_temperature: 0.07
+    soft_gate_T_qk: 0.07
+    soft_gate_T_v: 0.07
+    soft_gate_T_rst: 0.07
+    soft_gate_boundary_power: 4.0
     soft_gate_t_final: 0.07
     soft_gate_boundary_power_final: 4.0
     admission_den_power: 0.5

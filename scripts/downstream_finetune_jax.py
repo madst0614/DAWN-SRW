@@ -5,11 +5,11 @@ Does not modify or depend on C4 loaders. Uses task examples -> prompt + answer-t
 
 Modes:
   --init-from  : start each task from pretrained params only; optimizer fresh; step=0
-  --resume-from: resume a downstream run from checkpoint; params+optimizer+step restored
+  --resume-from: optionally read an existing downstream checkpoint; no checkpoint is written
 
 Path resolution for both init/resume:
-  downstream resume -> latest committed Orbax run/best_checkpoints step
   pretrain init-from -> .flax as above, or latest committed Orbax run/checkpoints step
+  downstream resume-from -> latest committed Orbax best_checkpoints/checkpoints step, read-only
 """
 from __future__ import annotations
 
@@ -251,34 +251,6 @@ def append_text(path: str, text: str):
         with tj._open_file(path, 'r') as f:
             old = f.read()
     write_text(path, old + text)
-
-
-def write_json(path: str, obj: Any):
-    write_text(path, json.dumps(obj, indent=2, ensure_ascii=False, default=str))
-
-
-def append_csv(path: str, row: Dict[str, Any], header: Sequence[str]):
-    # GCS append is awkward; write per-run CSV from stored rows instead.
-    exists = tj._file_exists(path)
-    if str(path).startswith('gs://'):
-        rows = []
-        if exists:
-            with tj._open_file(path, 'r') as f:
-                rows = list(csv.DictReader(f.read().splitlines()))
-        rows.append({k: row.get(k, '') for k in header})
-        out = []
-        import io
-        buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=list(header))
-        w.writeheader(); w.writerows(rows)
-        write_text(path, buf.getvalue())
-    else:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, 'a', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=list(header))
-            if not exists:
-                w.writeheader()
-            w.writerow(row)
 
 
 # -----------------------------
@@ -671,34 +643,6 @@ def downstream_training_config(cfg: Dict[str, Any], extra=None) -> Dict[str, Any
     if extra:
         train_cfg['extra'] = extra
     return train_cfg
-
-
-def save_downstream_best_orbax(manager, params, opt_state, rng, step: int,
-                               best_acc: float, cfg: Dict[str, Any],
-                               config_path: str, run_id: str, task: str):
-    training_config = downstream_training_config(cfg, {'task': task})
-    # Trainer Orbax uses best_val_loss as a lower-is-better metric.  Downstream
-    # best is accuracy, so store negative accuracy in that slot.
-    return tj.save_orbax_checkpoint(
-        manager,
-        params,
-        opt_state,
-        rng,
-        epoch=0,
-        global_step=int(step),
-        step_in_epoch=0,
-        steps_per_epoch=0,
-        best_val_loss=-float(best_acc),
-        model_config=cfg.get('model', {}),
-        training_config=training_config,
-        full_config=cfg,
-        raw_config=cfg,
-        config_path=config_path,
-        run_id=run_id,
-        checkpoint_kind='downstream_best',
-        val_loss=-float(best_acc),
-        wait=True,
-    )
 
 
 def restore_downstream_orbax_checkpoint(ref: CheckpointRef, target_params,
@@ -1190,9 +1134,7 @@ def main():
         if not run_dir:
             raise RuntimeError('Failed to broadcast downstream run_dir from host 0.')
         run_name = run_dir.rstrip('/').rsplit('/', 1)[-1]
-    train_log_path = join_path(run_dir, 'training_log.txt')
-    metrics_csv_path = join_path(run_dir, 'metrics.csv')
-    summary_path = join_path(run_dir, 'results_summary.txt')
+    train_log_path = join_path(run_dir, f"training_log_{time.strftime('%Y%m%d_%H%M%S')}.txt")
 
     def record(msg: str):
         if is_host0():
@@ -1207,7 +1149,10 @@ def main():
         record(f'train_rows={len(train_rows)} eval_rows={len(eval_rows)} total_steps={total_steps}')
         record(f'init_from={init_from or "<none>"}')
         record(f'resume_from={resume_from or "<none>"}')
+        record(f'run_name={run_name}')
         record(f'run_dir={run_dir}')
+        record(f'training_log={train_log_path}')
+        record('checkpoint_write=disabled')
         record('=' * 60)
 
     # Initialize params.
@@ -1260,14 +1205,6 @@ def main():
     else:
         log('[init] no init-from: random-init downstream control')
 
-    best_checkpoint_manager = tj._create_orbax_checkpoint_manager(
-        join_path(run_dir, 'best_checkpoints'),
-        checkpoint_interval=1,
-        keep_last=int(tcfg.get('best_checkpoint_keep_last', 1)),
-        create=True,
-        best_tracking=True,
-    )
-
     # Verify step consistency.
     if n_hosts > 1:
         local = np.array([global_step], dtype=np.int32)
@@ -1276,12 +1213,6 @@ def main():
             raise RuntimeError(f'global_step mismatch across hosts: {all_steps.tolist()}')
         log(f'[verified] global_step={global_step} consistent across {n_hosts} hosts')
 
-    # TrainJAX-style run metadata: config.json plus append-only text/csv logs.
-    # Do not write per-eval JSON files.
-    if is_host0():
-        write_json(join_path(run_dir, 'config.json'), cfg)
-        write_text(metrics_csv_path, 'phase,step,loss,lm_loss,acc,grad_norm,tokens,eval_acc,total,best_acc,elapsed_sec\n')
-
     train_step = make_train_step(model, cfg, optimizer, sharded_fns,
                                  float(tcfg.get('aux_weight', 0.0)), float(tcfg.get('tau_weight', 0.0)))
     score_step = make_score_step(model, cfg, sharded_fns, use_ce_scoring)
@@ -1289,10 +1220,8 @@ def main():
     def _sync_eval_decision(ev: Dict[str, Any], current_best: float):
         """Broadcast host0 eval accuracy and new-best decision to all hosts.
 
-        evaluate() materializes metrics only on host0, but checkpoint saving must
-        be entered by every host because Orbax checkpointing uses multi-host
-        collectives for sharded params/opt_state.  This mirrors
-        train_jax: all hosts participate in the gather, host0 writes bytes.
+        evaluate() materializes metrics only on host0, so every host enters
+        the same gather and then host0 writes the log record.
         """
         if is_host0():
             acc = float(ev.get('accuracy', 0.0))
@@ -1312,14 +1241,13 @@ def main():
     # Initial eval.
     ev = evaluate(params, score_step, eval_rows, eval_batch_size, max_seq_len, pad_id, data_sharding)
     new_best, ev_acc, ev_total = _sync_eval_decision(ev, best_acc)
-    if is_host0():
-        record(f"[eval] step={global_step} acc={ev_acc:.4f} total={ev_total}")
-        append_text(metrics_csv_path, f"eval,{global_step},,,,,,{ev_acc},{ev_total},{max(best_acc, ev_acc):.6f},0.0\n")
     if new_best:
         best_acc = ev_acc
-        save_downstream_best_orbax(
-            best_checkpoint_manager, params, opt_state, rng, global_step,
-            best_acc, cfg, args.config, run_name, task)
+    if is_host0():
+        record(
+            f"[eval] step={global_step} acc={ev_acc:.4f} "
+            f"total={ev_total} best_acc={best_acc:.4f} "
+            f"new_best={str(new_best).lower()}")
 
     # Training.
     t0 = time.time()
@@ -1355,37 +1283,43 @@ def main():
             if is_host0():
                 elapsed = time.time() - t0
                 tok = global_step * batch_size * max_seq_len
-                record(f"[train] step={global_step}/{total_steps} loss={float(m['lm_loss']):.4f} acc={float(m['acc']):.4f} grad={float(m['grad_norm']):.3f} tokens={tok} time={elapsed:.1f}s")
-                append_text(metrics_csv_path, f"train,{global_step},{float(m['loss']):.6f},{float(m['lm_loss']):.6f},{float(m['acc']):.6f},{float(m['grad_norm']):.6f},{tok},,,{best_acc:.6f},{elapsed:.3f}\n")
+                record(
+                    f"[train] step={global_step}/{total_steps} "
+                    f"loss={float(m['loss']):.4f} "
+                    f"lm_loss={float(m['lm_loss']):.4f} "
+                    f"acc={float(m['acc']):.4f} "
+                    f"grad_norm={float(m['grad_norm']):.3f} "
+                    f"tokens={tok} best_acc={best_acc:.4f} "
+                    f"elapsed_sec={elapsed:.1f}")
 
         if global_step % eval_every == 0 or global_step == total_steps:
             ev = evaluate(params, score_step, eval_rows, eval_batch_size, max_seq_len, pad_id, data_sharding)
             new_best, ev_acc, ev_total = _sync_eval_decision(ev, best_acc)
-            if is_host0():
-                record(f"[eval] step={global_step} acc={ev_acc:.4f} total={ev_total}")
-                append_text(metrics_csv_path, f"eval,{global_step},,,,,,{ev_acc},{ev_total},{max(best_acc, ev_acc):.6f},{time.time() - t0:.3f}\n")
             if new_best:
                 best_acc = ev_acc
-                save_downstream_best_orbax(
-                    best_checkpoint_manager, params, opt_state, rng,
-                    global_step, best_acc, cfg, args.config, run_name, task)
+            if is_host0():
+                record(
+                    f"[eval] step={global_step} acc={ev_acc:.4f} "
+                    f"total={ev_total} best_acc={best_acc:.4f} "
+                    f"new_best={str(new_best).lower()} "
+                    f"elapsed_sec={time.time() - t0:.1f}")
 
     if is_host0():
-        final_msg = f'[done] task={task} best_acc={best_acc:.4f} step={global_step} run_dir={run_dir}'
+        final_msg = (
+            f'[summary] task={task} best_acc={best_acc:.4f} '
+            f'step={global_step} run_dir={run_dir} '
+            f'training_log={train_log_path}')
         record(final_msg)
-        write_text(summary_path, final_msg + '\n')
 
     # Explicit end-of-task barrier.  The outer sequence script starts the next
     # Python process independently on each worker, so all hosts must leave this
     # task together.  Without this, fast non-host0 workers can start the next
-    # config while host0 is still writing logs/checkpoints, causing hangs.
+    # config while host0 is still writing the final log line, causing hangs.
     if n_hosts > 1:
         done = np.array([global_step], dtype=np.int32)
         gathered_done = np.asarray(process_allgather(done)).reshape(-1)
         if not np.all(gathered_done == global_step):
             raise RuntimeError(f'end-of-task step mismatch across hosts: {gathered_done.tolist()}')
-    best_checkpoint_manager.wait_until_finished()
-    best_checkpoint_manager.close()
 
 
 if __name__ == '__main__':
