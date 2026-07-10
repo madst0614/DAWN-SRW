@@ -66,6 +66,26 @@ def log(msg: str):
         print(msg, flush=True)
 
 
+def broadcast_str_from_host0(value: Optional[str], max_len: int = 1024) -> str:
+    """Broadcast a short UTF-8 string from process 0 to every host."""
+    if jax.process_count() <= 1:
+        return '' if value is None else str(value)
+    if is_host0():
+        encoded = ('' if value is None else str(value)).encode('utf-8')
+        if len(encoded) > max_len:
+            raise ValueError(f'Broadcast string too long: {len(encoded)} > {max_len}')
+        buf = np.zeros((max_len,), dtype=np.uint8)
+        buf[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+    else:
+        buf = np.zeros((max_len,), dtype=np.uint8)
+    gathered = np.asarray(process_allgather(buf))
+    if gathered.ndim == 1 and gathered.size >= max_len * jax.process_count():
+        host0_buf = gathered[:max_len]
+    else:
+        host0_buf = gathered[0]
+    return bytes(np.asarray(host0_buf, dtype=np.uint8)).rstrip(b'\x00').decode('utf-8')
+
+
 def join_path(base: str, name: str) -> str:
     return base.rstrip('/') + '/' + name
 
@@ -1145,8 +1165,8 @@ def main():
     if not ckpt_root:
         raise ValueError('Config must set checkpoint_dir')
     # train_jax-style run directory: never write directly into a fixed run_name.
-    # Treat cfg.run_name as a human-readable prefix only, then append timestamp+pid.
-    # This prevents reruns from overwriting the same downstream folder.
+    # Host 0 creates the unique folder name and broadcasts it; otherwise each
+    # worker would include its own PID and enter a different Orbax barrier.
     resume_ref = resolve_downstream_orbax_resume_ref(resume_from) if resume_from else None
     legacy_resume_path = None
     if resume_from:
@@ -1157,12 +1177,19 @@ def main():
             run_dir = str(resume_from).rstrip('/')
         run_name = run_dir.rstrip('/').rsplit('/', 1)[-1]
     else:
-        run_prefix = cfg.get('run_name') or f"{model_version}_{task}"
-        if not str(run_prefix).startswith('run_'):
-            run_name = f"run_v{run_prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+        if is_host0():
+            run_prefix = cfg.get('run_name') or f"{model_version}_{task}"
+            if not str(run_prefix).startswith('run_'):
+                host0_run_name = f"run_v{run_prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+            else:
+                host0_run_name = f"{run_prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+            host0_run_dir = join_path(ckpt_root, host0_run_name)
         else:
-            run_name = f"{run_prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-        run_dir = join_path(ckpt_root, run_name)
+            host0_run_dir = None
+        run_dir = broadcast_str_from_host0(host0_run_dir)
+        if not run_dir:
+            raise RuntimeError('Failed to broadcast downstream run_dir from host 0.')
+        run_name = run_dir.rstrip('/').rsplit('/', 1)[-1]
     train_log_path = join_path(run_dir, 'training_log.txt')
     metrics_csv_path = join_path(run_dir, 'metrics.csv')
     summary_path = join_path(run_dir, 'results_summary.txt')
