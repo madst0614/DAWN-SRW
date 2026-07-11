@@ -30,7 +30,7 @@ model:
   tau_init_max: 0.95
   tau_init_target_qk_frac: 0.20
   tau_init_target_v_frac: 0.10
-  tau_init_target_rst_frac: 0.025
+  tau_init_target_rst_frac: 0.02
 
 training:
   batch_size: 1024
@@ -44,6 +44,7 @@ training:
   n_chunks_rst: 4
 
   lr: 0.0003
+  tau_lr_mult: 0.001
   warmup_ratio: 0.08
   weight_decay: 0.1
 
@@ -59,4 +60,4 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4170_400M_c4_40B_v4_64
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4170_400M_c4_40B_v4_64_tau1e3

@@ -562,7 +562,7 @@ V4164_SCALAR_METRIC_NAMES = (
     'rst_execution_top1_frac_max',
 )
 
-V4169_REGULAR_REQUIRED_METRIC_NAMES = (
+LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES = (
     'attn_q_active_tau_frac',
     'attn_k_active_tau_frac',
     'attn_qk_active_tau_frac',
@@ -973,6 +973,7 @@ V4170_RESUME_REQUIRED_FIELDS = (
     *V4169_RESUME_REQUIRED_FIELDS,
     ('model', 'rw_role_read_dim'),
     ('model', 'rw_role_write_dim'),
+    ('training', 'tau_lr_mult'),
 )
 
 V4168_OPSPACE_RESUME_REQUIRED_FIELDS = (
@@ -1217,7 +1218,6 @@ def _require_resume_materialized_fields(full_config):
             'soft_gate_boundary_power_final',
             'admission_den_power',
             'admission_den_grad_scale',
-            'tau_lr_mult',
             'tau_grad_clip',
             'orthogonality_weight',
             'diversity_weight',
@@ -1238,6 +1238,9 @@ def _require_resume_materialized_fields(full_config):
             key for key in forbidden_training_keys
             if key in training_cfg and training_cfg[key] is not None
         ]
+        if (str(model_version) == V4169_MODEL_VERSION
+                and 'tau_lr_mult' in training_cfg):
+            present.append('tau_lr_mult')
         present.extend(
             key for key in training_cfg
             if key.startswith('cb1a_') or key.startswith('inactive_aux_')
@@ -2335,6 +2338,34 @@ def _validate_v4170_model_config(model_cfg):
             f"model.rw_role_read_dim={read_dim}, "
             f"model.rw_role_write_dim={write_dim}, "
             f"model.d_route={d_route}, product={product}")
+
+
+def _tau_lr_mult_for_model(training_cfg, model_version):
+    """Resolve the exact-version DirectTau post-Adam update policy."""
+    version = str(model_version)
+    if version == V4169_MODEL_VERSION:
+        if 'tau_lr_mult' in training_cfg:
+            raise ValueError(
+                f"training.tau_lr_mult is forbidden for {V4169_MODEL_VERSION}")
+        return 0.0
+    if version == V4170_MODEL_VERSION:
+        if 'tau_lr_mult' not in training_cfg:
+            raise ValueError(
+                f"training.tau_lr_mult is required for {V4170_MODEL_VERSION}")
+        raw_value = training_cfg['tau_lr_mult']
+        if isinstance(raw_value, bool):
+            raise ValueError(
+                "training.tau_lr_mult must be finite and in [0, 1]")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "training.tau_lr_mult must be finite and in [0, 1]") from exc
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(
+                "training.tau_lr_mult must be finite and in [0, 1]")
+        return value
+    return training_cfg.get('tau_lr_mult', 1.0)
 
 
 def _dawn_srw_kwargs(cfg):
@@ -5122,7 +5153,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
-    _is_v4169_model = (
+    _is_linear_direct_tau_model = (
         str(_model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     _use_minimal_train_path = (
         str(_model_version) in (
@@ -5155,7 +5186,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _dead_weighted_clip = jnp.float32(0.0)
         _inactive_aux_norm_by_layers = True
         _inactive_aux_norm_by_layers_f = jnp.float32(1.0)
-    if _is_v4169_model:
+    if _is_linear_direct_tau_model:
         _cb1a_enabled = False
         _cb1a_weight = jnp.float32(0.0)
         _cb1a_challenge_weight = jnp.float32(0.0)
@@ -5177,7 +5208,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active and _is_soft_direct_tau
-        and not _is_v4169_model)
+        and not _is_linear_direct_tau_model)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -5205,7 +5236,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
          else None),
         _soft_gate_pool_defaults)
     _boundary_power_schedule_active = bool(
-        boundary_power_schedule_active and not _is_v4169_model)
+        boundary_power_schedule_active and not _is_linear_direct_tau_model)
     _soft_gate_boundary_power_start = jnp.float32(
         soft_gate_boundary_power_start)
     _soft_gate_boundary_power_mid = jnp.float32(
@@ -5314,13 +5345,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 rngs={'dropout': dropout_key},
                 **extra_kw,
             )
-            if _is_v4169_model:
+            if _is_linear_direct_tau_model:
                 missing_regular = tuple(
-                    key for key in V4169_REGULAR_REQUIRED_METRIC_NAMES
+                    key for key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
                     if key not in result)
                 if missing_regular:
                     raise KeyError(
-                        "v4169 train result missing regular metrics: "
+                        "linear DirectTau train result missing regular metrics: "
                         + ", ".join(missing_regular))
             ce_loss = result['loss']
             aux_loss = result.get('aux_loss', jnp.float32(0.0))
@@ -6860,6 +6891,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_pos_emb': grad_pos_emb,
             'grad_router_proj_attn': grad_router_proj_attn,
             'grad_router_proj_rst': grad_router_proj_rst,
+            'tau_lr_mult': _tau_lr_mult,
             'grad_router_raw_tau_qk': grad_router_raw_tau_qk,
             'grad_router_raw_tau_v': grad_router_raw_tau_v,
             'grad_router_raw_tau_rst': grad_router_raw_tau_rst,
@@ -7595,7 +7627,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             f"{_ce_token_chunk_size}")
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
-    _is_v4169_model = (
+    _is_linear_direct_tau_model = (
         str(_model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     _use_minimal_train_path = (
         str(_model_version) in (
@@ -7604,7 +7636,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
         and _is_active_srw_version(_model_version)
-        and not _is_v4169_model)
+        and not _is_linear_direct_tau_model)
     _is_boundary_power_model = _is_active_srw_version(_model_version)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
@@ -7633,7 +7665,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
          else None),
         _soft_gate_pool_defaults)
     _boundary_power_schedule_active = bool(
-        boundary_power_schedule_active and not _is_v4169_model)
+        boundary_power_schedule_active and not _is_linear_direct_tau_model)
     _soft_gate_boundary_power_start = jnp.float32(
         soft_gate_boundary_power_start)
     _soft_gate_boundary_power_mid = jnp.float32(
@@ -10349,6 +10381,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'grad_pos_emb': float(m.get('grad_pos_emb', 0.0)),
         'grad_router_proj_attn': float(m.get('grad_router_proj_attn', 0.0)),
         'grad_router_proj_rst': float(m.get('grad_router_proj_rst', 0.0)),
+        'tau_lr_mult': float(m.get('tau_lr_mult', ctx.get('tau_lr_mult', 1.0))),
         'grad_router_raw_tau_qk': float(m.get('grad_router_raw_tau_qk', 0.0)),
         'grad_router_raw_tau_v': float(m.get('grad_router_raw_tau_v', 0.0)),
         'grad_router_raw_tau_rst': float(m.get('grad_router_raw_tau_rst', 0.0)),
@@ -10867,11 +10900,11 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'dev_neg_max': float(m.get('dev_neg_max', 0.0)),
         'timestamp': datetime.now().isoformat(),
     }
-    for _key in V4169_REGULAR_REQUIRED_METRIC_NAMES:
+    for _key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
-    rec['_v4169_regular_missing_metrics'] = tuple(
-        _key for _key in V4169_REGULAR_REQUIRED_METRIC_NAMES
+    rec['_linear_direct_tau_regular_missing_metrics'] = tuple(
+        _key for _key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
         if _key not in m)
     rec['_active_tau_regular_available'] = any(
         key in m for key in (
@@ -11367,56 +11400,64 @@ def _print_cb1a_regular_block(rec):
     )
 
 
-def _required_v4169_metric(rec, name):
-    missing = set(rec.get('_v4169_regular_missing_metrics', ()) or ())
+def _required_linear_direct_tau_metric(rec, name):
+    missing = set(
+        rec.get('_linear_direct_tau_regular_missing_metrics', ()) or ())
     if name in missing or name not in rec:
-        raise KeyError(f"v4169 regular metric missing: {name}")
+        raise KeyError(f"linear DirectTau regular metric missing: {name}")
     value = float(rec[name])
     if not np.isfinite(value):
         raise RuntimeError(
-            f"v4169 non-finite regular metric: {name}={value}")
+            f"linear DirectTau non-finite regular metric: {name}={value}")
     return value
 
 
-def _fmt_v4169_active(rec, frac_key, count_key):
-    frac = _required_v4169_metric(rec, frac_key)
-    count = _required_v4169_metric(rec, count_key)
+def _fmt_linear_direct_tau_active(rec, frac_key, count_key):
+    frac = _required_linear_direct_tau_metric(rec, frac_key)
+    count = _required_linear_direct_tau_metric(rec, count_key)
     return f"{frac * 100.0:.2f}%({count:.1f})"
 
 
-def _fmt_v4169_gate(rec, prefix):
-    mass = _required_v4169_metric(rec, f'{prefix}_gate_mass')
-    den = _required_v4169_metric(rec, f'{prefix}_gate_den')
-    depth = _required_v4169_metric(rec, f'{prefix}_depth_active')
-    eff = _required_v4169_metric(rec, f'{prefix}_gate_eff_n')
-    top1 = _required_v4169_metric(rec, f'{prefix}_top1_gate_frac')
-    floor = _required_v4169_metric(rec, f'{prefix}_den_floor_frac')
+def _fmt_linear_direct_tau_gate(rec, prefix):
+    mass = _required_linear_direct_tau_metric(rec, f'{prefix}_gate_mass')
+    den = _required_linear_direct_tau_metric(rec, f'{prefix}_gate_den')
+    depth = _required_linear_direct_tau_metric(rec, f'{prefix}_depth_active')
+    eff = _required_linear_direct_tau_metric(rec, f'{prefix}_gate_eff_n')
+    top1 = _required_linear_direct_tau_metric(rec, f'{prefix}_top1_gate_frac')
+    floor = _required_linear_direct_tau_metric(rec, f'{prefix}_den_floor_frac')
     return (
         f"mass={mass:.2f} den={den:.2f} depth={depth:.5f} "
         f"eff={eff:.1f} top1={top1:.4f} floor={floor * 100.0:.2f}%")
 
 
-def _print_v4169_regular_block(rec, ctx):
+def _print_linear_direct_tau_regular_block(rec, ctx):
     log_message(
         "  active: "
-        f"q={_fmt_v4169_active(rec, 'attn_q_active_tau_frac', 'attn_q_active_tau_count')}"
-        f" k={_fmt_v4169_active(rec, 'attn_k_active_tau_frac', 'attn_k_active_tau_count')}"
-        f" qk={_fmt_v4169_active(rec, 'attn_qk_active_tau_frac', 'attn_qk_active_tau_count')}"
-        f" v={_fmt_v4169_active(rec, 'attn_v_active_tau_frac', 'attn_v_active_tau_count')}"
-        f" rst={_fmt_v4169_active(rec, 'rst_active_tau_frac', 'rst_active_tau_count')}"
-    )
-    log_message(f"  gate: qk[{_fmt_v4169_gate(rec, 'attn_qk')}]")
-    log_message(f"        v [{_fmt_v4169_gate(rec, 'attn_v')}]")
-    log_message(f"        rst[{_fmt_v4169_gate(rec, 'rst')}]")
-    log_message(
-        f"  tau: qk={_required_v4169_metric(rec, 'attn_qk_tau_mean'):+.4f}"
-        f" v={_required_v4169_metric(rec, 'attn_v_tau_mean'):+.4f}"
-        f" rst={_required_v4169_metric(rec, 'rst_tau_mean'):+.4f}"
+        f"q={_fmt_linear_direct_tau_active(rec, 'attn_q_active_tau_frac', 'attn_q_active_tau_count')}"
+        f" k={_fmt_linear_direct_tau_active(rec, 'attn_k_active_tau_frac', 'attn_k_active_tau_count')}"
+        f" qk={_fmt_linear_direct_tau_active(rec, 'attn_qk_active_tau_frac', 'attn_qk_active_tau_count')}"
+        f" v={_fmt_linear_direct_tau_active(rec, 'attn_v_active_tau_frac', 'attn_v_active_tau_count')}"
+        f" rst={_fmt_linear_direct_tau_active(rec, 'rst_active_tau_frac', 'rst_active_tau_count')}"
     )
     log_message(
-        f"  norm: attn={_required_v4169_metric(rec, 'attn_out_norm'):.3f}"
-        f" rst={_required_v4169_metric(rec, 'rst_out_norm'):.3f}"
-        f" residual={_required_v4169_metric(rec, 'residual_norm'):.3f}"
+        f"  gate: qk[{_fmt_linear_direct_tau_gate(rec, 'attn_qk')}]")
+    log_message(
+        f"        v [{_fmt_linear_direct_tau_gate(rec, 'attn_v')}]")
+    log_message(
+        f"        rst[{_fmt_linear_direct_tau_gate(rec, 'rst')}]")
+    log_message(
+        f"  tau: q={_required_linear_direct_tau_metric(rec, 'attn_q_tau_mean'):+.6f}"
+        f" k={_required_linear_direct_tau_metric(rec, 'attn_k_tau_mean'):+.6f}"
+        f" qk={_required_linear_direct_tau_metric(rec, 'attn_qk_tau_mean'):+.6f}"
+    )
+    log_message(
+        f"       v={_required_linear_direct_tau_metric(rec, 'attn_v_tau_mean'):+.6f}"
+        f" rst={_required_linear_direct_tau_metric(rec, 'rst_tau_mean'):+.6f}"
+    )
+    log_message(
+        f"  norm: attn={_required_linear_direct_tau_metric(rec, 'attn_out_norm'):.3f}"
+        f" rst={_required_linear_direct_tau_metric(rec, 'rst_out_norm'):.3f}"
+        f" residual={_required_linear_direct_tau_metric(rec, 'residual_norm'):.3f}"
         f" | scale qk={float(rec.get('attn_qk_pool_scale', 0.0)):.3f}"
         f" v={float(rec.get('attn_v_pool_scale', 0.0)):.3f}"
         f" rst={float(rec.get('rst_pool_scale', 0.0)):.3f}"
@@ -11432,7 +11473,7 @@ def _print_regular_block(rec, ctx):
     is_v4164 = _is_active_srw_version(ctx.get('model_version'))
     is_v4166 = _is_rw_key_srw_version(ctx.get('model_version'))
     is_v4168 = str(ctx.get('model_version')) == V4168_MODEL_VERSION
-    is_v4169 = (
+    is_linear_direct_tau = (
         str(ctx.get('model_version'))
         in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     is_official_soft_direct_tau = _is_active_srw_version(ctx.get('model_version'))
@@ -11464,8 +11505,8 @@ def _print_regular_block(rec, ctx):
     if opspace_active:
         _print_v4168_opspace_regular_block(rec)
         _print_train_progress_line(rec, ctx)
-    if is_v4169 and not opspace_active:
-        _print_v4169_regular_block(rec, ctx)
+    if is_linear_direct_tau and not opspace_active:
+        _print_linear_direct_tau_regular_block(rec, ctx)
         return
     if is_v4164:
         if is_official_soft_direct_tau:
@@ -11514,7 +11555,7 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['rst_strong']*100:.1f}%"
         )
     if is_v4164:
-        _weight_label = 'gate' if is_v4169 else 'admission'
+        _weight_label = 'gate' if is_linear_direct_tau else 'admission'
         _select_status = ""
         if not opspace_active:
             log_message(
@@ -11564,7 +11605,7 @@ def _print_regular_block(rec, ctx):
                 f" rst={rec['rst_pool_scale']:.3f}")
         if (_is_active_srw_version(ctx.get('model_version'))
                 and not opspace_active):
-            if is_v4169:
+            if is_linear_direct_tau:
                 log_message(
                     f"  angular_depth: "
                     f"qk[m={rec['attn_qk_drive_mean']:.5f}"
@@ -11603,7 +11644,7 @@ def _print_regular_block(rec, ctx):
                 return (
                     f"{rec.get(f'{label}_{metric}_local', 0.0) * 100:.2f}%/"
                     f"{rec.get(f'{label}_{metric}_pool', 0.0) * 100:.2f}%")
-            if not is_v4169:
+            if not is_linear_direct_tau:
                 log_message(
                     "  admission local/pool: "
                     f"qk={_lp('qk', 'admission')} "
@@ -12607,7 +12648,9 @@ def main():
         and bool(operation_space_repack_config.get(
             'operation_space_enabled', False))
     )
-    is_v4169_cfg = (
+    is_v4169_cfg = str(model_version_cfg) == V4169_MODEL_VERSION
+    is_v4170_cfg = str(model_version_cfg) == V4170_MODEL_VERSION
+    is_linear_direct_tau_cfg = (
         str(model_version_cfg) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     tau_init_cfg = (
         None
@@ -12618,7 +12661,7 @@ def main():
             else None))
     selection_calibration_cfg = (
         _operation_space_disabled_selection_calibration_config(cfg)
-        if (operation_space_tau_free_enabled or is_v4169_cfg)
+        if (operation_space_tau_free_enabled or is_linear_direct_tau_cfg)
         else _selection_calibration_config(cfg, tau_init_cfg))
     if (selection_calibration_cfg.get('enabled', False)
             and not _is_active_srw_version(model_version_cfg)):
@@ -12814,7 +12857,7 @@ def main():
     cb1a_eps = 1.0e-8
     dead_penalty_weighted_clip = 0.0
     global_grad_clip = tcfg.get('global_grad_clip', 0.0)
-    tau_lr_mult = tcfg.get('tau_lr_mult', 1.0)
+    tau_lr_mult = _tau_lr_mult_for_model(tcfg, model_version_cfg)
     tau_grad_clip = tcfg.get('tau_grad_clip', 0.0)
     router_proj_lr_mult = tcfg.get('router_proj_lr_mult', 1.0)
     router_proj_grad_clip = tcfg.get('router_proj_grad_clip', 0.0)
@@ -12832,6 +12875,7 @@ def main():
     if is_v4169_cfg:
         tau_lr_mult = 0.0
         tau_grad_clip = 0.0
+    if is_linear_direct_tau_cfg:
         router_proj_lr_mult = 1.0
         op_key_lr_mult = 1.0
         router_proj_grad_clip = 2.0
@@ -13135,7 +13179,9 @@ def main():
             and bool(operation_space_repack_config.get(
                 'operation_space_enabled', False))
         )
-        is_v4169_cfg = (
+        is_v4169_cfg = str(model_version_cfg) == V4169_MODEL_VERSION
+        is_v4170_cfg = str(model_version_cfg) == V4170_MODEL_VERSION
+        is_linear_direct_tau_cfg = (
             str(model_version_cfg) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
         tau_init_cfg = (
             None
@@ -13146,7 +13192,7 @@ def main():
                 else None))
         selection_calibration_cfg = (
             _operation_space_disabled_selection_calibration_config(cfg)
-            if (operation_space_tau_free_enabled or is_v4169_cfg)
+            if (operation_space_tau_free_enabled or is_linear_direct_tau_cfg)
             else _selection_calibration_config(cfg, tau_init_cfg))
         max_seq_len = cfg['model']['max_seq_len']
         training_log_append_on_resume = bool(tcfg.get(
@@ -13336,7 +13382,7 @@ def main():
                     'soft_gate_boundary_power_final_frac',
                     soft_gate_boundary_power_final_frac))
             if not current_admission_den_config_override:
-                if is_v4169_cfg:
+                if is_linear_direct_tau_cfg:
                     admission_den_power = 1.0
                     admission_den_grad_scale = 1.0
                     soft_gate_effective_active_eps = 1.0e-6
@@ -13389,8 +13435,8 @@ def main():
             cb1a_rst_prune_weight = 0.0
             global_grad_clip = saved_training_config.get(
                 'global_grad_clip', global_grad_clip)
-            tau_lr_mult = saved_training_config.get(
-                'tau_lr_mult', tau_lr_mult)
+            tau_lr_mult = _tau_lr_mult_for_model(
+                saved_training_config, model_version_cfg)
             tau_grad_clip = saved_training_config.get(
                 'tau_grad_clip', tau_grad_clip)
             router_proj_lr_mult = saved_training_config.get(
@@ -13422,6 +13468,7 @@ def main():
             if is_v4169_cfg:
                 tau_lr_mult = 0.0
                 tau_grad_clip = 0.0
+            if is_linear_direct_tau_cfg:
                 router_proj_lr_mult = 1.0
                 op_key_lr_mult = 1.0
                 router_proj_grad_clip = 2.0
@@ -13597,6 +13644,7 @@ def main():
     if is_v4169_cfg:
         tau_lr_mult = 0.0
         tau_grad_clip = 0.0
+    if is_linear_direct_tau_cfg:
         router_proj_lr_mult = 1.0
         op_key_lr_mult = 1.0
         router_proj_grad_clip = 2.0
@@ -14149,7 +14197,7 @@ def main():
                                                 'dead_penalty_weighted_clip'):
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
-    if is_v4169_cfg:
+    if is_linear_direct_tau_cfg:
         for _key in (
                 'pool_weight_decay',
                 'orthogonality_weight',
@@ -14170,7 +14218,6 @@ def main():
                 'selection_calibration_tau_qk',
                 'selection_calibration_tau_v',
                 'selection_calibration_tau_rst',
-                'tau_lr_mult',
                 'tau_grad_clip',
                 'soft_gate_effective_active_eps',
                 'admission_den_power',
@@ -14192,6 +14239,9 @@ def main():
                 'soft_gate_boundary_power_final_frac'):
             training_config.pop(_key, None)
             cfg.setdefault('training', {}).pop(_key, None)
+        if is_v4169_cfg:
+            training_config.pop('tau_lr_mult', None)
+            cfg.setdefault('training', {}).pop('tau_lr_mult', None)
         for _clean_key in list(training_config.keys()):
             if (_clean_key.startswith('cb1a_')
                     or _clean_key.startswith('inactive_aux_')):
@@ -14676,7 +14726,7 @@ def main():
                 f"router_dropout={cfg['model'].get('router_dropout', None)}")
             print("  Effective pruning: disabled for operation-space QK/V/RST")
         else:
-            if is_v4169_cfg:
+            if is_linear_direct_tau_cfg:
                 _linear_family_label = (
                     "v4170" if str(model_version_cfg) == V4170_MODEL_VERSION
                     else "v4169")
@@ -14692,19 +14742,25 @@ def main():
                 print("  denominator: max(sum(pruned_gate), 1.0) with live gradient")
                 print(f"[{_linear_family_label}] active definition: rho > tau "
                       "(pre-prune angular visibility)")
-                if str(model_version_cfg) == V4170_MODEL_VERSION:
+                if is_v4170_cfg:
                     print("[opspace] key=rw_role_outer_relation "
                           "query=direct_state_projection "
-                          "tau=calibrated_frozen gate=linear_angular_depth "
-                          "den=gate_sum")
+                          "tau=calibrated_slow_learned_radius "
+                          "gate=linear_angular_depth "
+                          "den=gate_sum_live_gradient")
+                    print("tau policy: token-wise bounded DirectTau as local "
+                          "operation-space radius")
+                    print("tau init: fresh quantile calibration")
+                    print("tau update: CE-gradient post-Adam scaling")
+                    print(f"tau_lr_mult={tau_lr_mult}")
                 else:
                     print("[opspace] key=rw_derived query=rw_matched_product "
                           "tau=calibrated_frozen gate=linear_angular_depth "
-                          "den=gate_sum")
-                print("tau policy: token-wise bounded DirectTau parameters")
-                print("tau init: fresh quantile calibration")
-                print(f"tau update: frozen by {_linear_family_label} code "
-                      "policy (effective lr multiplier=0)")
+                          "den=gate_sum_live_gradient")
+                    print("tau policy: token-wise bounded DirectTau parameters")
+                    print("tau init: fresh quantile calibration")
+                    print("tau update: frozen by v4169 code policy")
+                    print("effective_tau_lr_mult=0.0")
                 print("  Effective pruning:")
                 print(
                     f"    console={regular_console_level} "
@@ -16689,6 +16745,10 @@ def main():
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
         log_message(f"Config: {config_path}")
         log_message(f"Parameters: {n_params:,}")
+        if str(model_version_cfg) == V4170_MODEL_VERSION:
+            log_message(
+                "Tau policy: learned local-radius DirectTau, post-Adam "
+                f"tau_lr_mult={tau_lr_mult}")
         if _is_rw_key_srw_version(model_version_cfg):
             if str(model_version_cfg) == V4170_MODEL_VERSION:
                 log_message(
