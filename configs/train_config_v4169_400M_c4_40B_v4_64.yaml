@@ -26,9 +26,9 @@ model:
   tau_init_mode: quantile_frac
   tau_init_min: -0.95
   tau_init_max: 0.95
-  tau_init_target_qk_frac: 0.10
-  tau_init_target_v_frac: 0.08
-  tau_init_target_rst_frac: 0.03
+  tau_init_target_qk_frac: 0.20
+  tau_init_target_v_frac: 0.10
+  tau_init_target_rst_frac: 0.025
 
 training:
   batch_size: 1024
@@ -57,4 +57,4 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4169_400M_c4_40B_v4_64
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4169_400M_c4_40B_v4_64_ver1
