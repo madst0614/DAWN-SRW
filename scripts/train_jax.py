@@ -613,6 +613,44 @@ LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES = (
     'residual_norm',
 )
 
+V4170_TAU_UPDATE_METRIC_NAMES = (
+    'tau_update_qk_max_abs',
+    'tau_update_v_max_abs',
+    'tau_update_rst_max_abs',
+)
+
+V4170_COMPACT_TRAIN_METRIC_NAMES = (
+    'total_loss',
+    'ce_loss',
+    'aux_loss',
+    'tau_reg',
+    'orth_loss',
+    'div_loss',
+    'correct',
+    'valid_count',
+    'grad_norm',
+    'tau_lr_mult',
+    *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
+    *V4170_TAU_UPDATE_METRIC_NAMES,
+)
+
+V4170_COMPACT_REGULAR_JSONL_REC_KEYS = (
+    'step', 'epoch',
+    'total_loss', 'ce_loss', 'aux_loss',
+    'accuracy', 'lr', 'grad_norm',
+    'steps_per_sec', 'elapsed',
+    *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
+    'tau_lr_mult',
+    *V4170_TAU_UPDATE_METRIC_NAMES,
+    'attn_qk_pool_scale', 'attn_v_pool_scale', 'rst_pool_scale',
+    'raw_step_time_window', 'timestamp',
+)
+
+V4170_COMPACT_REGULAR_JSONL_KEYS = (
+    *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
+    'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
+)
+
 UPDATE_CAP_GROUP_SPECS = (
     ('proj_attn', 'pA', 'update_cap_proj_attn_hit',
      'update_cap_proj_attn_ratio_pre', 'update_cap_proj_attn_scale',
@@ -2366,6 +2404,81 @@ def _tau_lr_mult_for_model(training_cfg, model_version):
                 "training.tau_lr_mult must be finite and in [0, 1]")
         return value
     return training_cfg.get('tau_lr_mult', 1.0)
+
+
+def _v4170_tau_update_max_abs(updates):
+    """Read final post-cap DirectTau updates without scanning the full tree."""
+    try:
+        router_updates = updates['router']
+        attn_updates = router_updates['raw_tau_attn']
+        rst_updates = router_updates['raw_tau_rst']
+        attn_kernel = attn_updates['kernel']
+        attn_bias = attn_updates['bias']
+        rst_kernel = rst_updates['kernel']
+        rst_bias = rst_updates['bias']
+    except (KeyError, TypeError) as exc:
+        raise KeyError(
+            "v4170 updates must contain router/raw_tau_attn/{kernel,bias} "
+            "and router/raw_tau_rst/{kernel,bias}") from exc
+
+    attn_shapes = (tuple(attn_kernel.shape), tuple(attn_bias.shape))
+    rst_shapes = (tuple(rst_kernel.shape), tuple(rst_bias.shape))
+    if (attn_kernel.ndim < 1 or attn_bias.ndim < 1
+            or attn_kernel.shape[-1] != 3
+            or attn_bias.shape[-1] != 3):
+        raise ValueError(
+            "v4170 raw_tau_attn update route axis must be Q/K/V with "
+            f"size 3; kernel/bias shapes={attn_shapes}")
+    if (rst_kernel.ndim < 1 or rst_bias.ndim < 1
+            or rst_kernel.shape[-1] != 1
+            or rst_bias.shape[-1] != 1):
+        raise ValueError(
+            "v4170 raw_tau_rst update route axis must have size 1; "
+            f"kernel/bias shapes={rst_shapes}")
+
+    def _max_abs_pair(kernel, bias):
+        return jnp.maximum(
+            jnp.max(jnp.abs(kernel.astype(jnp.float32))),
+            jnp.max(jnp.abs(bias.astype(jnp.float32))))
+
+    qk_max = _max_abs_pair(attn_kernel[..., :2], attn_bias[..., :2])
+    v_max = _max_abs_pair(attn_kernel[..., 2:3], attn_bias[..., 2:3])
+    rst_max = _max_abs_pair(rst_kernel, rst_bias)
+    return tuple(jax.lax.stop_gradient(value) for value in (
+        qk_max, v_max, rst_max))
+
+
+def _v4170_compact_train_metrics(
+        result, *, total_loss, ce_loss, aux_loss, tau_reg, orth_loss,
+        div_loss, grad_norm, tau_lr_mult, tau_update_qk_max_abs,
+        tau_update_v_max_abs, tau_update_rst_max_abs):
+    """Build the exact v4170 train-step payload with no fallback metrics."""
+    metrics = {
+        'total_loss': total_loss,
+        'ce_loss': ce_loss,
+        'aux_loss': aux_loss,
+        'tau_reg': tau_reg,
+        'orth_loss': orth_loss,
+        'div_loss': div_loss,
+        'correct': result['correct'],
+        'valid_count': result['valid_count'],
+        'grad_norm': grad_norm,
+        'tau_lr_mult': tau_lr_mult,
+    }
+    metrics.update({
+        key: result[key]
+        for key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
+    })
+    metrics.update({
+        'tau_update_qk_max_abs': tau_update_qk_max_abs,
+        'tau_update_v_max_abs': tau_update_v_max_abs,
+        'tau_update_rst_max_abs': tau_update_rst_max_abs,
+    })
+    if tuple(metrics.keys()) != V4170_COMPACT_TRAIN_METRIC_NAMES:
+        raise RuntimeError(
+            "v4170 compact train metric schema drift: "
+            f"actual={tuple(metrics.keys())}")
+    return metrics
 
 
 def _dawn_srw_kwargs(cfg):
@@ -5155,6 +5268,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_linear_direct_tau_model = (
         str(_model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
+    _is_v4170_model = str(_model_version) == V4170_MODEL_VERSION
     _use_minimal_train_path = (
         str(_model_version) in (
             V4166_MODEL_VERSION, V4168_MODEL_VERSION, V4169_MODEL_VERSION,
@@ -5255,6 +5369,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _inactive_aux_full_frac = jnp.float32(inactive_aux_full_frac)
     _inactive_aux_schedule = str(inactive_aux_schedule).lower()
     _compact_train_metrics = bool(compact_train_metrics)
+    _is_v4170_compact_train = _compact_train_metrics and _is_v4170_model
     _train_drift_diagnostics = not _compact_train_metrics
     _keep_train_layer_metrics = bool(keep_train_layer_metrics)
     _heavy_keys = {
@@ -5852,7 +5967,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 inactive_aux_schedule_scale=inactive_aux_schedule_scale,
             )
             result_payload = result
-            if _compact_train_metrics:
+            if _is_v4170_compact_train:
+                result_payload = {
+                    key: result[key]
+                    for key in (
+                        'correct', 'valid_count',
+                        *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES)
+                }
+            elif _compact_train_metrics:
                 result_payload = {
                     k: v for k, v in result.items()
                     if k not in _train_result_heavy_keys}
@@ -6104,15 +6226,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 jnp.minimum(1.0, clip_value / (group_norm + 1e-8)),
                 jnp.float32(1.0))
 
-        tau_grad_norm_raw = jnp.sqrt(_group_sq(grads, _is_tau_path) + 1e-12)
-        router_proj_grad_norm_raw = jnp.sqrt(
-            _group_sq(grads, _is_router_proj_path) + 1e-12)
-        router_scan_grad_norm_raw = jnp.sqrt(
-            _group_sq(grads, _is_router_scan_path) + 1e-12)
-        route_emb_grad_norm_raw = jnp.sqrt(
-            _group_sq(grads, _is_legacy_operator_key_path) + 1e-12)
-        op_key_grad_norm_raw = jnp.sqrt(
-            _group_sq(grads, _is_op_key_proj_path) + 1e-12)
+        def _clipped_group_norm(path_pred, clip_value):
+            if float(clip_value) <= 0.0:
+                return jnp.float32(0.0)
+            return jnp.sqrt(_group_sq(grads, path_pred) + 1e-12)
+
+        tau_grad_norm_raw = _clipped_group_norm(
+            _is_tau_path, tau_grad_clip)
+        router_proj_grad_norm_raw = _clipped_group_norm(
+            _is_router_proj_path, router_proj_grad_clip)
+        router_scan_grad_norm_raw = _clipped_group_norm(
+            _is_router_scan_path, router_scan_grad_clip)
+        route_emb_grad_norm_raw = _clipped_group_norm(
+            _is_legacy_operator_key_path, route_emb_grad_clip)
+        op_key_grad_norm_raw = _clipped_group_norm(
+            _is_op_key_proj_path, op_key_grad_clip)
 
         tau_clip_scale = _clip_scale(tau_grad_norm_raw, _tau_grad_clip)
         router_proj_clip_scale = _clip_scale(
@@ -6339,6 +6467,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             upd_scan_rst_scale = jnp.float32(1.0)
             upd_scan_rst_hit = jnp.float32(0.0)
 
+        if _is_v4170_model:
+            (tau_update_qk_max_abs,
+             tau_update_v_max_abs,
+             tau_update_rst_max_abs) = _v4170_tau_update_max_abs(updates)
+        else:
+            tau_update_qk_max_abs = jnp.float32(0.0)
+            tau_update_v_max_abs = jnp.float32(0.0)
+            tau_update_rst_max_abs = jnp.float32(0.0)
+
         new_params = optax.apply_updates(params, updates)
 
         def _tree_sq(tree):
@@ -6370,6 +6507,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return cur
 
         grad_norm = _tree_norm(grads)
+        if _is_v4170_compact_train:
+            metrics = _v4170_compact_train_metrics(
+                result,
+                total_loss=total_loss,
+                ce_loss=ce_loss,
+                aux_loss=aux_loss,
+                tau_reg=tau_reg,
+                orth_loss=orth_loss,
+                div_loss=div_loss,
+                grad_norm=grad_norm,
+                tau_lr_mult=_tau_lr_mult,
+                tau_update_qk_max_abs=tau_update_qk_max_abs,
+                tau_update_v_max_abs=tau_update_v_max_abs,
+                tau_update_rst_max_abs=tau_update_rst_max_abs)
+            return new_params, new_opt_state, metrics
         if float(global_grad_clip) > 0.0:
             grad_global_postclip = jnp.minimum(grad_norm, _global_grad_clip)
         else:
@@ -10906,6 +11058,14 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     rec['_linear_direct_tau_regular_missing_metrics'] = tuple(
         _key for _key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
         if _key not in m)
+    if str(ctx.get('model_version')) == V4170_MODEL_VERSION:
+        missing_tau_updates = tuple(
+            key for key in V4170_TAU_UPDATE_METRIC_NAMES if key not in m)
+        if missing_tau_updates:
+            raise KeyError(
+                "v4170 compact train result missing final tau updates: "
+                + ", ".join(missing_tau_updates))
+        rec.update({key: float(m[key]) for key in V4170_TAU_UPDATE_METRIC_NAMES})
     rec['_active_tau_regular_available'] = any(
         key in m for key in (
             'q_active_tau_frac', 'k_active_tau_frac', 'qk_active_tau_frac',
@@ -10989,6 +11149,31 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
                 or _key.startswith('opspace/')):
             rec[_key] = float(_value)
     return rec
+
+
+def _v4170_compact_regular_jsonl_record(rec, ctx):
+    """Whitelist the low-cost v4170 regular record without fake fallbacks."""
+    missing = tuple(
+        key for key in V4170_COMPACT_REGULAR_JSONL_REC_KEYS
+        if key not in rec)
+    if missing:
+        raise KeyError(
+            "v4170 regular JSONL source missing required keys: "
+            + ", ".join(missing))
+    out = {
+        key: rec[key] for key in V4170_COMPACT_REGULAR_JSONL_REC_KEYS}
+    out.update({
+        'progress': float(ctx['progress']),
+        'epoch_elapsed': float(ctx['epoch_elapsed']),
+        'eta': float(ctx['eta']),
+        's_per_it': float(ctx['s_per_it']),
+        'metric_scope': 'representative_data_shard',
+    })
+    if tuple(out.keys()) != V4170_COMPACT_REGULAR_JSONL_KEYS:
+        raise RuntimeError(
+            "v4170 regular JSONL schema drift: "
+            f"actual={tuple(out.keys())}")
+    return out
 
 
 def get_metric(metrics, *keys, default=None):
@@ -11454,6 +11639,13 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
         f"       v={_required_linear_direct_tau_metric(rec, 'attn_v_tau_mean'):+.6f}"
         f" rst={_required_linear_direct_tau_metric(rec, 'rst_tau_mean'):+.6f}"
     )
+    if str(ctx.get('model_version')) == V4170_MODEL_VERSION:
+        log_message(
+            f"  tau_update: qk={rec['tau_update_qk_max_abs']:.2e}"
+            f" v={rec['tau_update_v_max_abs']:.2e}"
+            f" rst={rec['tau_update_rst_max_abs']:.2e}"
+            f" mult={rec['tau_lr_mult']:.3e}"
+        )
     log_message(
         f"  norm: attn={_required_linear_direct_tau_metric(rec, 'attn_out_norm'):.3f}"
         f" rst={_required_linear_direct_tau_metric(rec, 'rst_out_norm'):.3f}"
@@ -17195,7 +17387,11 @@ def main():
                     rec['logging_time'] = 0.0
                     _print_regular_block(rec, ctx)
                     rec.pop('_active_tau_regular_available', None)
-                    log_jsonl({'type': 'train', **rec})
+                    regular_jsonl_rec = rec
+                    if str(model_version_cfg) == V4170_MODEL_VERSION:
+                        regular_jsonl_rec = (
+                            _v4170_compact_regular_jsonl_record(rec, ctx))
+                    log_jsonl({'type': 'train', **regular_jsonl_rec})
                     sync_logs()
                     _regular_logging_time = time.time() - _regular_logging_t0
                     rec['logging_time'] = float(_regular_logging_time)

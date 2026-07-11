@@ -1356,7 +1356,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         gate_eff_ratio = gate_eff_n / jnp.maximum(global_active_m, 1.0)
         top1_gate_frac = global_gate_max_m / jnp.maximum(
             global_weighted_cost_m, 1e-8)
-        tau_abs_mean = jax.lax.stop_gradient(tau).mean()
+        tau_abs_mean = jnp.abs(jax.lax.stop_gradient(tau)).mean()
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
         dead_count_out = jax.lax.stop_gradient(
             jax.lax.psum(total_dead_count, 'model'))
@@ -2240,7 +2240,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         gate_eff_ratio = gate_eff_n / jnp.maximum(global_active_m, 1.0)
         top1_gate_frac = global_gate_max_m / jnp.maximum(
             global_weighted_cost_m, 1e-8)
-        tau_abs_mean = jax.lax.stop_gradient(tau).mean()
+        tau_abs_mean = jnp.abs(jax.lax.stop_gradient(tau)).mean()
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
         dead_count_out = jax.lax.stop_gradient(
             jax.lax.psum(total_dead_count, 'model'))
@@ -4737,13 +4737,15 @@ class DAWN_SRW_V4170(nn.Module):
             'attn_q_tau_mean': _attn_route_tau_mean(0),
             'attn_k_tau_mean': _attn_route_tau_mean(1),
             'rst_tau_mean': rst_tau_mean_all.mean(),
-            'attn_tau_abs_mean': attn_tau_abs_all.mean(),
-            'rst_tau_abs_mean': rst_tau_abs_all.mean(),
+            'attn_tau_abs_mean': jnp.abs(attn_tau_direct_all).mean(),
+            'rst_tau_abs_mean': jnp.abs(rst_tau_direct_all).mean(),
             'attn_rho_mean': attn_rho_mean_all.mean(),
             'attn_rho_std': attn_rho_std_all.mean(),
             'attn_rho_max': attn_rho_max_all.max(),
-            'attn_tau_min': attn_tau_floor_mean_all.min(),
-            'attn_tau_max': attn_tau_min_hit_frac_all.max(),
+            'attn_tau_min': attn_tau_direct_all.min(),
+            'attn_tau_max': attn_tau_direct_all.max(),
+            'attn_tau_floor_mean': attn_tau_floor_mean_all.mean(),
+            'attn_tau_min_hit_frac': attn_tau_min_hit_frac_all.mean(),
             'attn_raw_tau_mean': attn_tau_direct_mean_all.mean(),
             'attn_raw_tau_min': attn_tau_direct_min_all.min(),
             'attn_raw_tau_max': attn_tau_direct_max_all.max(),
@@ -4805,8 +4807,10 @@ class DAWN_SRW_V4170(nn.Module):
             'rst_rho_mean': rst_rho_mean_all.mean(),
             'rst_rho_std': rst_rho_std_all.mean(),
             'rst_rho_max': rst_rho_max_all.max(),
-            'rst_tau_min': rst_tau_floor_mean_all.min(),
-            'rst_tau_max': rst_tau_min_hit_frac_all.max(),
+            'rst_tau_min': rst_tau_direct_all.min(),
+            'rst_tau_max': rst_tau_direct_all.max(),
+            'rst_tau_floor_mean': rst_tau_floor_mean_all.mean(),
+            'rst_tau_min_hit_frac': rst_tau_min_hit_frac_all.mean(),
             'rst_raw_tau_mean': rst_tau_direct_mean_all.mean(),
             'rst_raw_tau_min': rst_tau_direct_min_all.min(),
             'rst_raw_tau_max': rst_tau_direct_max_all.max(),
@@ -5156,8 +5160,12 @@ class DAWN_SRW_V4170(nn.Module):
                 'per_layer_rst_rho_std': rst_rho_std_all,
                 'per_layer_rst_rho_max': rst_rho_max_all,
                 'per_layer_rst_tau_mean': rst_tau_mean_all,
-                'per_layer_rst_tau_min': rst_tau_floor_mean_all,
-                'per_layer_rst_tau_max': rst_tau_min_hit_frac_all,
+                'per_layer_rst_tau_min': rst_tau_direct_all.reshape(
+                    (rst_tau_direct_all.shape[0], -1)).min(axis=1),
+                'per_layer_rst_tau_max': rst_tau_direct_all.reshape(
+                    (rst_tau_direct_all.shape[0], -1)).max(axis=1),
+                'per_layer_rst_tau_floor_mean': rst_tau_floor_mean_all,
+                'per_layer_rst_tau_min_hit_frac': rst_tau_min_hit_frac_all,
                 'per_layer_rst_selection_margin_mean': rst_selection_margin_mean_all,
                 'per_layer_rst_positive_margin_mean': rst_positive_margin_mean_all,
                 'per_layer_rst_selected_frac': rst_selected_frac_all,
