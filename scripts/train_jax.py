@@ -613,6 +613,8 @@ LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES = (
     'residual_norm',
 )
 
+# Compatibility keys: values are final post-cap raw_tau parameter updates,
+# not changes in the bounded token-wise tau values.
 V4170_TAU_UPDATE_METRIC_NAMES = (
     'tau_update_qk_max_abs',
     'tau_update_v_max_abs',
@@ -2407,7 +2409,7 @@ def _tau_lr_mult_for_model(training_cfg, model_version):
 
 
 def _v4170_tau_update_max_abs(updates):
-    """Read final post-cap DirectTau updates without scanning the full tree."""
+    """Read final post-cap raw_tau updates without scanning the full tree."""
     try:
         router_updates = updates['router']
         attn_updates = router_updates['raw_tau_attn']
@@ -2452,7 +2454,7 @@ def _v4170_compact_train_metrics(
         result, *, total_loss, ce_loss, aux_loss, tau_reg, orth_loss,
         div_loss, grad_norm, tau_lr_mult, tau_update_qk_max_abs,
         tau_update_v_max_abs, tau_update_rst_max_abs):
-    """Build the exact v4170 train-step payload with no fallback metrics."""
+    """Build the exact payload; tau_update_* are raw_tau parameter updates."""
     metrics = {
         'total_loss': total_loss,
         'ce_loss': ce_loss,
@@ -7268,7 +7270,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_raw_tau_mean': result.get('attn_raw_tau_mean', result.get('attn_tau_raw_mean', jnp.float32(0.0))),
             'attn_raw_tau_min': result.get('attn_raw_tau_min', result.get('attn_raw_tau_mean', result.get('attn_tau_raw_mean', jnp.float32(0.0)))),
             'attn_raw_tau_max': result.get('attn_raw_tau_max', result.get('attn_raw_tau_mean', result.get('attn_tau_raw_mean', jnp.float32(0.0)))),
-            'attn_tau_min': result.get('attn_tau_min', result.get('attn_tau_floor_mean', jnp.float32(0.0))),
+            'attn_tau_min': result.get('attn_tau_min', jnp.float32(0.0)),
             'attn_tau_max': result.get('attn_tau_max', jnp.float32(0.0)),
 
             'attn_selection_margin_mean': result.get('attn_selection_margin_mean', jnp.float32(0.0)),
@@ -7282,7 +7284,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_raw_tau_mean': result.get('rst_raw_tau_mean', result.get('rst_tau_raw_mean', jnp.float32(0.0))),
             'rst_raw_tau_min': result.get('rst_raw_tau_min', result.get('rst_raw_tau_mean', result.get('rst_tau_raw_mean', jnp.float32(0.0)))),
             'rst_raw_tau_max': result.get('rst_raw_tau_max', result.get('rst_raw_tau_mean', result.get('rst_tau_raw_mean', jnp.float32(0.0)))),
-            'rst_tau_min': result.get('rst_tau_min', result.get('rst_tau_floor_mean', jnp.float32(0.0))),
+            'rst_tau_min': result.get('rst_tau_min', jnp.float32(0.0)),
             'rst_tau_max': result.get('rst_tau_max', jnp.float32(0.0)),
 
             'rst_selection_margin_mean': result.get('rst_selection_margin_mean', jnp.float32(0.0)),
@@ -10887,7 +10889,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_raw_tau_max': float(m.get(
             'attn_raw_tau_max',
             m.get('attn_raw_tau_mean', m.get('attn_tau_raw_mean', 0.0)))),
-        'attn_tau_min': float(m.get('attn_tau_min', m.get('attn_tau_floor_mean', 0.0))),
+        'attn_tau_min': float(m.get('attn_tau_min', 0.0)),
         'attn_tau_max': float(m.get('attn_tau_max', 0.0)),
 
         'attn_selection_margin_mean': float(m.get('attn_selection_margin_mean', 0.0)),
@@ -10905,7 +10907,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_raw_tau_max': float(m.get(
             'rst_raw_tau_max',
             m.get('rst_raw_tau_mean', m.get('rst_tau_raw_mean', 0.0)))),
-        'rst_tau_min': float(m.get('rst_tau_min', m.get('rst_tau_floor_mean', 0.0))),
+        'rst_tau_min': float(m.get('rst_tau_min', 0.0)),
         'rst_tau_max': float(m.get('rst_tau_max', 0.0)),
 
         'rst_selection_margin_mean': float(m.get('rst_selection_margin_mean', 0.0)),
@@ -11641,7 +11643,7 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
     )
     if str(ctx.get('model_version')) == V4170_MODEL_VERSION:
         log_message(
-            f"  tau_update: qk={rec['tau_update_qk_max_abs']:.2e}"
+            f"  raw_tau_update: qk={rec['tau_update_qk_max_abs']:.2e}"
             f" v={rec['tau_update_v_max_abs']:.2e}"
             f" rst={rec['tau_update_rst_max_abs']:.2e}"
             f" mult={rec['tau_lr_mult']:.3e}"

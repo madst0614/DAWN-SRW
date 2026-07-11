@@ -1329,9 +1329,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         no_active_direct = jax.lax.stop_gradient(
             (global_selection_margin_max <= 0.0).astype(jnp.float32))
         tau_direct = tau
-        # Measurement path: detached copies for diagnostics / feedback refs.
-        # The forward denominator is already detached above; numerator paths
-        # through execution_weight remain live for SRW output gradients.
+        # Measurement path: the copies below are detached for diagnostics only.
+        # The forward denominator above intentionally remains live-gradient,
+        # and numerator paths through execution_weight also remain live.
         global_weighted_cost_m = jax.lax.stop_gradient(global_weighted_cost)
         global_gate_sq_m = jax.lax.stop_gradient(global_gate_sq)
         global_den_cost_m = jax.lax.stop_gradient(global_den_cost)
@@ -2208,9 +2208,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         no_active_direct = jax.lax.stop_gradient(
             (global_selection_margin_max <= 0.0).astype(jnp.float32))
         tau_direct = tau
-        # Measurement path: detached copies for diagnostics / feedback refs.
-        # The forward denominator is already detached above; numerator paths
-        # through execution_weight remain live for SRW output gradients.
+        # Measurement path: the copies below are detached for diagnostics only.
+        # The forward denominator above intentionally remains live-gradient,
+        # and numerator paths through execution_weight also remain live.
         global_weighted_cost_m = jax.lax.stop_gradient(global_weighted_cost)
         global_gate_sq_m = jax.lax.stop_gradient(global_gate_sq)
         global_den_cost_m = jax.lax.stop_gradient(global_den_cost)
@@ -4744,8 +4744,6 @@ class DAWN_SRW_V4170(nn.Module):
             'attn_rho_max': attn_rho_max_all.max(),
             'attn_tau_min': attn_tau_direct_all.min(),
             'attn_tau_max': attn_tau_direct_all.max(),
-            'attn_tau_floor_mean': attn_tau_floor_mean_all.mean(),
-            'attn_tau_min_hit_frac': attn_tau_min_hit_frac_all.mean(),
             'attn_raw_tau_mean': attn_tau_direct_mean_all.mean(),
             'attn_raw_tau_min': attn_tau_direct_min_all.min(),
             'attn_raw_tau_max': attn_tau_direct_max_all.max(),
@@ -4809,8 +4807,6 @@ class DAWN_SRW_V4170(nn.Module):
             'rst_rho_max': rst_rho_max_all.max(),
             'rst_tau_min': rst_tau_direct_all.min(),
             'rst_tau_max': rst_tau_direct_all.max(),
-            'rst_tau_floor_mean': rst_tau_floor_mean_all.mean(),
-            'rst_tau_min_hit_frac': rst_tau_min_hit_frac_all.mean(),
             'rst_raw_tau_mean': rst_tau_direct_mean_all.mean(),
             'rst_raw_tau_min': rst_tau_direct_min_all.min(),
             'rst_raw_tau_max': rst_tau_direct_max_all.max(),
