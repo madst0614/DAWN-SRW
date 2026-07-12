@@ -4,7 +4,6 @@ set -euo pipefail
 INIT_FROM=""
 CONFIGS=()
 EXPAND_OUTPUT_DIR=".generated/downstream_suites"
-RUN_STATE_FILE="${DOWNSTREAM_RUN_STATE_FILE:-/tmp/dawn_downstream_run_dir}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,29 +39,22 @@ for CFG in "${CONFIGS[@]}"; do
 done
 CONFIGS=("${EXPANDED_CONFIGS[@]}")
 
-# Each worker has its own local filesystem. The first JAX task broadcasts the
-# run directory and writes the same value to this worker-local state file; all
-# later tasks reuse it.
-rm -f -- "$RUN_STATE_FILE"
-
 i=0
 for CFG in "${CONFIGS[@]}"; do
   i=$((i + 1))
   echo "============================================================"
   echo "[sequence] START ${i}/${#CONFIGS[@]} config: $CFG"
   echo "[sequence] common init-from: ${INIT_FROM:-<none>}"
-  echo "[sequence] run state: $RUN_STATE_FILE"
+  echo "[sequence] policy: independent transfer from the same source checkpoint"
   echo "[sequence] time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
   echo "============================================================"
   if [[ -n "$INIT_FROM" ]]; then
     python3 scripts/downstream_finetune_jax.py \
       --config "$CFG" \
-      --init-from "$INIT_FROM" \
-      --sequence-run-state "$RUN_STATE_FILE"
+      --init-from "$INIT_FROM"
   else
     python3 scripts/downstream_finetune_jax.py \
-      --config "$CFG" \
-      --sequence-run-state "$RUN_STATE_FILE"
+      --config "$CFG"
   fi
   echo "============================================================"
   echo "[sequence] DONE ${i}/${#CONFIGS[@]} config: $CFG"

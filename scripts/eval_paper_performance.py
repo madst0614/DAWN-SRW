@@ -41,7 +41,6 @@ try:
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
     import scripts.train_jax as tj
-    from scripts.downstream_finetune_jax import _adapt_checkpoint_params_to_target
     from utils.data_jax import _build_dataset
     _JAX_IMPORT_ERROR = None
 except ModuleNotFoundError as exc:
@@ -54,7 +53,6 @@ except ModuleNotFoundError as exc:
     NamedSharding = None
     P = None
     tj = None
-    _adapt_checkpoint_params_to_target = None
     _build_dataset = None
     _JAX_IMPORT_ERROR = exc
 
@@ -368,7 +366,8 @@ def restore_params(checkpoint: str, target_params, model_version: str):
         if hasattr(tj, "_migrate_v4152_route_params"):
             raw = tj._migrate_v4152_route_params(raw, {"params": target_params})
     raw_params = raw.get("params", raw) if isinstance(raw, dict) else raw
-    raw_params = _adapt_checkpoint_params_to_target(raw_params, target_params)
+    raw_params = tj.adapt_checkpoint_params_to_target(
+        raw_params, target_params)
     params = serialization.from_state_dict(
         {"params": target_params}, {"params": raw_params})["params"]
     meta = {

@@ -41,7 +41,6 @@ from dawn_srw_common import (
     select_checkpoint,
 )
 import scripts.train_jax as tj
-from scripts.downstream_finetune_jax import _adapt_checkpoint_params_to_target
 
 
 DAWN_SRW_VERSIONS = {
@@ -221,7 +220,8 @@ def restore_params(checkpoint: str, target_params) -> Tuple[Any, Dict[str, Any]]
     with open_file(ckpt_file, "rb") as f:
         raw = serialization.msgpack_restore(f.read())
     raw_params = raw.get("params", raw) if isinstance(raw, dict) else raw
-    raw_params = _adapt_checkpoint_params_to_target(raw_params, target_params)
+    raw_params = tj.adapt_checkpoint_params_to_target(
+        raw_params, target_params)
     try:
         restored = serialization.from_state_dict({"params": target_params}, {"params": raw_params})["params"]
     except ValueError as exc:
@@ -329,7 +329,9 @@ def evaluate(
         else:
             batch = jnp.asarray(batch_np)
             mask = jnp.asarray(mask_np)
-        loss, correct, valid = eval_step(params, batch, mask)
+        labels = jnp.where(mask == 1, batch, -100)
+        loss, correct, valid = eval_step(
+            params, batch, labels, mask, jnp.int32(0))
         loss_f = float(jax.device_get(loss))
         correct_f = float(jax.device_get(correct))
         valid_f = float(jax.device_get(valid))

@@ -55,9 +55,10 @@ from importlib import metadata as importlib_metadata
 import yaml
 import numpy as np
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental.shard_map import shard_map
@@ -5133,7 +5134,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       keep_train_layer_metrics=False,
                       tokens_per_step=0,
                       ce_token_chunk_size=32768,
-                      train_compute_accuracy=True):
+                      train_compute_accuracy=True,
+                      runtime_state=None):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
 
     Creates the official v4164 train step and regular metric payload.
@@ -5256,6 +5258,30 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             "training.ce_token_chunk_size must be > 0, got "
             f"{_ce_token_chunk_size}")
     _train_compute_accuracy = bool(train_compute_accuracy)
+    _fixed_runtime = None
+    if runtime_state is not None:
+        if not isinstance(runtime_state, dict):
+            raise TypeError("runtime_state must be a dict or None")
+        required_runtime = (
+            'soft_gate_T_qk', 'soft_gate_T_v', 'soft_gate_T_rst',
+            'soft_gate_temperature', 'soft_gate_t_final',
+            'soft_gate_boundary_power',
+            'soft_gate_boundary_power_final', 'admission_den_power',
+        )
+        missing_runtime = [
+            key for key in required_runtime if key not in runtime_state
+        ]
+        if missing_runtime:
+            raise RuntimeError(
+                "source_final_constant runtime is missing required values: "
+                + ", ".join(missing_runtime))
+        _fixed_runtime = {
+            key: jnp.float32(runtime_state[key])
+            for key in required_runtime
+        }
+        if 'training_tokens' in runtime_state:
+            _fixed_runtime['training_tokens'] = jnp.float32(
+                runtime_state['training_tokens'])
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_soft_gate_schedule_kw = _model_accepts_soft_gate_schedule(model)
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
@@ -5392,9 +5418,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _train_result_heavy_keys = frozenset(_heavy_keys)
 
     @partial(jax.jit, donate_argnums=(0, 1))
-    def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
-                   prev_op_key_snap, step):
-        labels = jnp.where(attention_mask == 1, input_ids, -100)
+    def train_step(params, opt_state, input_ids, labels, attention_mask,
+                   dropout_key, prev_op_key_snap, step):
 
         def loss_fn(params):
             extra_kw = {}
@@ -5405,9 +5430,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             if _use_minimal_train_path:
                 extra_kw['minimal_train'] = True
             if _pass_training_tokens_kw:
-                extra_kw['training_tokens'] = (
-                    step.astype(jnp.float32) * _tokens_per_step)
-            if _soft_gate_runtime_enabled:
+                if _fixed_runtime is not None:
+                    if 'training_tokens' not in _fixed_runtime:
+                        raise RuntimeError(
+                            "source_final_constant runtime requires "
+                            "checkpoint terminal training_tokens for this model")
+                    extra_kw['training_tokens'] = _fixed_runtime[
+                        'training_tokens']
+                else:
+                    extra_kw['training_tokens'] = (
+                        step.astype(jnp.float32) * _tokens_per_step)
+            if _fixed_runtime is not None:
+                soft_gate_T_qk = _fixed_runtime['soft_gate_T_qk']
+                soft_gate_T_v = _fixed_runtime['soft_gate_T_v']
+                soft_gate_T_rst = _fixed_runtime['soft_gate_T_rst']
+                inactive_aux_schedule_scale = jnp.float32(1.0)
+            elif _soft_gate_runtime_enabled:
                 soft_gate_T_qk = _scheduled_from_config(
                     step, _total_training_steps, _soft_gate_pool_cfg['qk'])
                 soft_gate_T_v = _scheduled_from_config(
@@ -5423,29 +5461,42 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 soft_gate_T_v = jnp.float32(0.07)
                 soft_gate_T_rst = jnp.float32(0.07)
                 inactive_aux_schedule_scale = (step >= _warmup_steps).astype(jnp.float32)
-            boundary_power_p = scheduled_boundary_power_by_frac(
-                step, _total_training_steps,
-                _boundary_power_schedule_active and _is_boundary_power_model,
-                _soft_gate_boundary_power_start,
-                _soft_gate_boundary_power_mid,
-                _soft_gate_boundary_power_final,
-                _soft_gate_boundary_power_mid_frac,
-                _soft_gate_boundary_power_final_frac,
-                _soft_gate_boundary_power_start_frac)
+            boundary_power_p = (
+                _fixed_runtime['soft_gate_boundary_power']
+                if _fixed_runtime is not None
+                else scheduled_boundary_power_by_frac(
+                    step, _total_training_steps,
+                    _boundary_power_schedule_active
+                    and _is_boundary_power_model,
+                    _soft_gate_boundary_power_start,
+                    _soft_gate_boundary_power_mid,
+                    _soft_gate_boundary_power_final,
+                    _soft_gate_boundary_power_mid_frac,
+                    _soft_gate_boundary_power_final_frac,
+                    _soft_gate_boundary_power_start_frac))
             soft_gate_T = soft_gate_T_qk
-            if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
-                extra_kw['soft_gate_temperature'] = soft_gate_T_qk
+            if ((_fixed_runtime is not None or _soft_gate_runtime_enabled)
+                    and _pass_soft_gate_schedule_kw):
+                extra_kw['soft_gate_temperature'] = (
+                    _fixed_runtime['soft_gate_temperature']
+                    if _fixed_runtime is not None else soft_gate_T_qk)
                 extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
                 extra_kw['soft_gate_T_v'] = soft_gate_T_v
                 extra_kw['soft_gate_T_rst'] = soft_gate_T_rst
             if _pass_boundary_power_kw:
                 extra_kw['soft_gate_boundary_power'] = boundary_power_p
                 extra_kw['soft_gate_boundary_power_final'] = (
-                    _soft_gate_boundary_power_final)
+                    _fixed_runtime['soft_gate_boundary_power_final']
+                    if _fixed_runtime is not None
+                    else _soft_gate_boundary_power_final)
             if _pass_soft_gate_t_final_kw:
-                extra_kw['soft_gate_t_final'] = _soft_gate_t_final
+                extra_kw['soft_gate_t_final'] = (
+                    _fixed_runtime['soft_gate_t_final']
+                    if _fixed_runtime is not None else _soft_gate_t_final)
             if _pass_den_power_kw:
-                extra_kw['admission_den_power'] = _admission_den_power
+                extra_kw['admission_den_power'] = (
+                    _fixed_runtime['admission_den_power']
+                    if _fixed_runtime is not None else _admission_den_power)
             if _pass_execution_prune_kw:
                 # Training never execution-prunes; pruning is eval-sweep only.
                 extra_kw['execution_prune_eps'] = jnp.float32(0.0)
@@ -7756,7 +7807,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      soft_gate_boundary_power_mid_frac=0.800,
                      soft_gate_boundary_power_final_frac=0.950,
                      admission_den_power=1.0,
-                     ce_token_chunk_size=32768):
+                     ce_token_chunk_size=32768,
+                     runtime_state=None):
     """Create a jit-compiled evaluation step.
 
     Uses the SLIM forward (analysis=False). Eval normally needs only loss /
@@ -7833,10 +7885,28 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
     _admission_den_power = jnp.float32(admission_den_power)
+    _fixed_runtime = None
+    if runtime_state is not None:
+        required_runtime = (
+            'soft_gate_T_qk', 'soft_gate_T_v', 'soft_gate_T_rst',
+            'soft_gate_temperature', 'soft_gate_t_final',
+            'soft_gate_boundary_power',
+            'soft_gate_boundary_power_final', 'admission_den_power',
+        )
+        missing_runtime = [
+            key for key in required_runtime if key not in runtime_state
+        ]
+        if missing_runtime:
+            raise RuntimeError(
+                "source_final_constant runtime is missing required values: "
+                + ", ".join(missing_runtime))
+        _fixed_runtime = {
+            key: jnp.float32(runtime_state[key])
+            for key in required_runtime
+        }
 
     @jax.jit
-    def eval_step(params, input_ids, attention_mask, step):
-        labels = jnp.where(attention_mask == 1, input_ids, -100)
+    def eval_step(params, input_ids, labels, attention_mask, step):
         eval_rng = jax.random.PRNGKey(0)
         extra_kw = {}
         if sharded_fns is not None:
@@ -7845,32 +7915,57 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             extra_kw['analysis'] = False
         if _use_minimal_train_path:
             extra_kw['minimal_train'] = True
-        if _soft_gate_runtime_enabled and _pass_soft_gate_schedule_kw:
-            soft_gate_T_qk = _scheduled_from_config(
-                step, _total_training_steps, _soft_gate_pool_cfg['qk'])
-            extra_kw['soft_gate_temperature'] = soft_gate_T_qk
+        if ((_fixed_runtime is not None or _soft_gate_runtime_enabled)
+                and _pass_soft_gate_schedule_kw):
+            soft_gate_T_qk = (
+                _fixed_runtime['soft_gate_T_qk']
+                if _fixed_runtime is not None
+                else _scheduled_from_config(
+                    step, _total_training_steps,
+                    _soft_gate_pool_cfg['qk']))
+            extra_kw['soft_gate_temperature'] = (
+                _fixed_runtime['soft_gate_temperature']
+                if _fixed_runtime is not None else soft_gate_T_qk)
             extra_kw['soft_gate_T_qk'] = soft_gate_T_qk
-            extra_kw['soft_gate_T_v'] = _scheduled_from_config(
-                step, _total_training_steps, _soft_gate_pool_cfg['v'])
-            extra_kw['soft_gate_T_rst'] = _scheduled_from_config(
-                step, _total_training_steps, _soft_gate_pool_cfg['rst'])
+            extra_kw['soft_gate_T_v'] = (
+                _fixed_runtime['soft_gate_T_v']
+                if _fixed_runtime is not None
+                else _scheduled_from_config(
+                    step, _total_training_steps,
+                    _soft_gate_pool_cfg['v']))
+            extra_kw['soft_gate_T_rst'] = (
+                _fixed_runtime['soft_gate_T_rst']
+                if _fixed_runtime is not None
+                else _scheduled_from_config(
+                    step, _total_training_steps,
+                    _soft_gate_pool_cfg['rst']))
         if _pass_boundary_power_kw:
-            boundary_power_p = scheduled_boundary_power_by_frac(
-                step, _total_training_steps,
-                _boundary_power_schedule_active and _is_boundary_power_model,
-                _soft_gate_boundary_power_start,
-                _soft_gate_boundary_power_mid,
-                _soft_gate_boundary_power_final,
-                _soft_gate_boundary_power_mid_frac,
-                _soft_gate_boundary_power_final_frac,
-                _soft_gate_boundary_power_start_frac)
+            boundary_power_p = (
+                _fixed_runtime['soft_gate_boundary_power']
+                if _fixed_runtime is not None
+                else scheduled_boundary_power_by_frac(
+                    step, _total_training_steps,
+                    _boundary_power_schedule_active
+                    and _is_boundary_power_model,
+                    _soft_gate_boundary_power_start,
+                    _soft_gate_boundary_power_mid,
+                    _soft_gate_boundary_power_final,
+                    _soft_gate_boundary_power_mid_frac,
+                    _soft_gate_boundary_power_final_frac,
+                    _soft_gate_boundary_power_start_frac))
             extra_kw['soft_gate_boundary_power'] = boundary_power_p
             extra_kw['soft_gate_boundary_power_final'] = (
-                _soft_gate_boundary_power_final)
+                _fixed_runtime['soft_gate_boundary_power_final']
+                if _fixed_runtime is not None
+                else _soft_gate_boundary_power_final)
         if _pass_soft_gate_t_final_kw:
-            extra_kw['soft_gate_t_final'] = _soft_gate_t_final
+            extra_kw['soft_gate_t_final'] = (
+                _fixed_runtime['soft_gate_t_final']
+                if _fixed_runtime is not None else _soft_gate_t_final)
         if _pass_den_power_kw:
-            extra_kw['admission_den_power'] = _admission_den_power
+            extra_kw['admission_den_power'] = (
+                _fixed_runtime['admission_den_power']
+                if _fixed_runtime is not None else _admission_den_power)
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = _execution_prune_eps
         if _pass_ce_token_chunk_size_kw:
@@ -8501,9 +8596,12 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             input_ids = shard_to_mesh(input_ids, data_sharding_spec, gs)
             attention_mask = shard_to_mesh(attention_mask, data_sharding_spec, gs)
 
+        labels = jnp.where(attention_mask == 1, input_ids, -100)
+
         if return_dead_stats:
             eval_ret = eval_step_fn(
-                params, input_ids, attention_mask, jnp.int32(current_step))
+                params, input_ids, labels, attention_mask,
+                jnp.int32(current_step))
             if return_prune_stats:
                 (ce_loss, correct, valid_count,
                  attn_dead_count, rst_dead_count,
@@ -8539,7 +8637,8 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             dead_batches += 1
         else:
             ce_loss, correct, valid_count = eval_step_fn(
-                params, input_ids, attention_mask, jnp.int32(current_step))
+                params, input_ids, labels, attention_mask,
+                jnp.int32(current_step))
 
         total_loss_jax = total_loss_jax + ce_loss * valid_count.astype(jnp.float32)
         total_correct_jax = total_correct_jax + correct
@@ -12782,6 +12881,812 @@ def _print_geometry_block(geom):
 # Main
 # ============================================================
 
+@dataclass(frozen=True)
+class TransferCheckpoint:
+    source: str
+    run_folder: str
+    checkpoint_dir: str
+    checkpoint_path: str
+    step: int
+    metadata: Dict[str, Any]
+    full_config: Dict[str, Any]
+    runtime_state: Dict[str, Any]
+
+
+@dataclass
+class InitializedTrainingState:
+    policy: str
+    params: Any
+    opt_state: Any
+    rng: Any
+    phase_step: int
+    source_step: Optional[int] = None
+    source_checkpoint: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CanonicalOptimizerBundle:
+    optimizer: Any
+    schedule: Any
+    gradient_accumulation_steps: int
+    warmup_steps: int
+    total_optimizer_steps: int
+
+
+TRANSFER_TRAINING_OVERLAY_FIELDS = frozenset({
+    'batch_size', 'eval_batch_size', 'num_epochs', 'max_steps',
+    'lr', 'learning_rate', 'warmup_ratio', 'warmup_steps',
+    'weight_decay', 'pool_weight_decay', 'min_lr_ratio',
+    'gradient_accumulation_steps', 'global_grad_clip', 'max_grad_norm',
+    'eval_interval', 'val_interval', 'log_interval',
+    'mesh_data', 'mesh_model', 'n_chunks_qk', 'n_chunks_v',
+    'n_chunks_rst', 'n_chunks_know', 'max_chunk_size',
+    'ce_token_chunk_size', 'train_compute_accuracy',
+    'initialize_jax_distributed',
+})
+
+TRANSFER_TOP_LEVEL_OVERLAY_FIELDS = frozenset({
+    'downstream', 'task', 'seed', 'checkpoint_dir', 'run_name',
+})
+
+
+def initialize_distributed_runtime(cfg):
+    """Canonical distributed startup shared by all training frontends."""
+    enabled = cfg.get('training', {}).get('initialize_jax_distributed', None)
+    if enabled is False:
+        return
+    _maybe_initialize_jax_distributed()
+
+
+def _checkpoint_final_runtime(full_config, checkpoint_path):
+    training = full_config.get('training', {})
+    model = full_config.get('model', {})
+    version = str(model.get('model_version', ''))
+    if not isinstance(training, dict):
+        raise RuntimeError(
+            f"Transfer checkpoint {checkpoint_path} has invalid "
+            "full_config.training")
+
+    pool_final_keys = {
+        'qk': 'soft_gate_t_qk_final',
+        'v': 'soft_gate_t_v_final',
+        'rst': 'soft_gate_t_rst_final',
+    }
+    runtime = {}
+    if _is_active_srw_version(version):
+        required = (
+            *pool_final_keys.values(),
+            'soft_gate_t_final', 'soft_gate_boundary_power_final',
+            'admission_den_power', 'admission_den_grad_scale',
+            'soft_gate_effective_active_eps', 'tau_lr_mult',
+        )
+        missing = [key for key in required if key not in training]
+        if missing:
+            raise RuntimeError(
+                f"Transfer checkpoint {checkpoint_path} is missing "
+                "materialized final runtime values: " + ", ".join(missing))
+        for pool, key in pool_final_keys.items():
+            value = float(training[key])
+            if not math.isfinite(value) or value <= 0.0:
+                raise RuntimeError(
+                    f"Transfer checkpoint {checkpoint_path} has invalid "
+                    f"full_config.training.{key}={training[key]!r}")
+            runtime[f'soft_gate_T_{pool}'] = value
+        runtime['soft_gate_temperature'] = runtime['soft_gate_T_qk']
+        runtime['soft_gate_t_final'] = float(training['soft_gate_t_final'])
+        runtime['soft_gate_boundary_power'] = float(
+            training['soft_gate_boundary_power_final'])
+        runtime['soft_gate_boundary_power_final'] = float(
+            training['soft_gate_boundary_power_final'])
+        runtime['admission_den_power'] = float(training['admission_den_power'])
+        runtime['admission_den_grad_scale'] = float(
+            training['admission_den_grad_scale'])
+        runtime['soft_gate_effective_active_eps'] = float(
+            training['soft_gate_effective_active_eps'])
+        runtime['tau_lr_mult'] = float(training['tau_lr_mult'])
+    else:
+        runtime.update({
+            'soft_gate_T_qk': 0.07,
+            'soft_gate_T_v': 0.07,
+            'soft_gate_T_rst': 0.07,
+            'soft_gate_temperature': 0.07,
+            'soft_gate_t_final': 0.07,
+            'soft_gate_boundary_power': 1.0,
+            'soft_gate_boundary_power_final': 1.0,
+            'admission_den_power': 1.0,
+            'admission_den_grad_scale': 1.0,
+            'soft_gate_effective_active_eps': 1.0e-6,
+            'tau_lr_mult': 1.0,
+        })
+    for key in ('training_tokens', 'terminal_training_tokens'):
+        if key in training:
+            runtime['training_tokens'] = float(training[key])
+            break
+    return runtime
+
+
+def resolve_transfer_checkpoint(source):
+    """Resolve and validate one committed Orbax pretraining checkpoint."""
+    if not source:
+        raise ValueError("transfer requires --init-from/transfer-from")
+    run_folder, step, found = _resolve_orbax_resume_from(source)
+    if not found or step is None:
+        raise FileNotFoundError(
+            f"No committed Orbax pretraining checkpoint found: {source}")
+    checkpoint_dir = _join_path(run_folder, 'checkpoints')
+    checkpoint_path = None
+    for candidate in _list_files(checkpoint_dir, '*'):
+        if _orbax_step_from_path_name(_path_name(candidate)) == int(step):
+            checkpoint_path = candidate
+            break
+    if checkpoint_path is None:
+        raise FileNotFoundError(
+            f"Resolved Orbax step {step} is missing from {checkpoint_dir}")
+    if not _orbax_step_is_committed(checkpoint_path):
+        raise RuntimeError(
+            f"Transfer checkpoint is not committed: {checkpoint_path}")
+    metadata = _restore_orbax_metadata(checkpoint_dir, int(step))
+    full_config = metadata.get('full_config')
+    _require_resume_full_config(full_config)
+    _require_resume_materialized_fields(full_config)
+    runtime_state = _checkpoint_final_runtime(full_config, checkpoint_path)
+    return TransferCheckpoint(
+        source=str(source),
+        run_folder=str(run_folder),
+        checkpoint_dir=str(checkpoint_dir),
+        checkpoint_path=str(checkpoint_path),
+        step=int(step),
+        metadata=deepcopy(metadata),
+        full_config=deepcopy(full_config),
+        runtime_state=runtime_state,
+    )
+
+
+def build_effective_transfer_config(source_checkpoint, downstream_config):
+    """Overlay only fields owned by the transfer phase."""
+    cfg = deepcopy(source_checkpoint.full_config)
+    requested = deepcopy(downstream_config)
+    requested_training = requested.get('training', {})
+    if requested_training is None:
+        requested_training = {}
+    if not isinstance(requested_training, dict):
+        raise TypeError("downstream training config must be a mapping")
+    effective_training = deepcopy(cfg.get('training', {}))
+    for key in TRANSFER_TRAINING_OVERLAY_FIELDS:
+        if key in requested_training:
+            effective_training[key] = deepcopy(requested_training[key])
+    effective_training['tau_lr_mult'] = source_checkpoint.runtime_state[
+        'tau_lr_mult']
+    cfg['training'] = effective_training
+    for key in TRANSFER_TOP_LEVEL_OVERLAY_FIELDS:
+        if key in requested:
+            cfg[key] = deepcopy(requested[key])
+
+    source_tokenizer = source_checkpoint.full_config.get('tokenizer')
+    requested_tokenizer = requested.get('tokenizer')
+    if source_tokenizer is not None:
+        cfg['tokenizer'] = deepcopy(source_tokenizer)
+    elif requested_tokenizer is not None:
+        cfg['tokenizer'] = deepcopy(requested_tokenizer)
+    else:
+        raise RuntimeError(
+            "Transfer checkpoint has no tokenizer metadata and downstream "
+            "config does not explicitly provide tokenizer")
+    cfg['model'] = deepcopy(source_checkpoint.full_config['model'])
+    return cfg
+
+
+def create_canonical_optimizer(params, training_cfg, total_optimizer_steps,
+                               *, log_groups=False):
+    """Build the official AdamW/update pipeline used by every phase."""
+    total_optimizer_steps = max(1, int(total_optimizer_steps))
+    lr = float(training_cfg.get(
+        'lr', training_cfg.get('learning_rate', 6.5e-4)))
+    warmup_steps = int(training_cfg.get(
+        'warmup_steps',
+        total_optimizer_steps * float(training_cfg.get('warmup_ratio', 0.06))))
+    warmup_steps = max(0, min(warmup_steps, total_optimizer_steps))
+    end_ratio = float(training_cfg.get('min_lr_ratio', 0.1))
+    weight_decay = float(training_cfg.get('weight_decay', 0.1))
+    pool_weight_decay = float(training_cfg.get('pool_weight_decay', 0.0))
+    global_grad_clip = float(training_cfg.get(
+        'global_grad_clip', training_cfg.get('max_grad_norm', 0.0)))
+    grad_accum_steps = int(training_cfg.get(
+        'gradient_accumulation_steps', 1))
+    if grad_accum_steps <= 0:
+        raise ValueError("training.gradient_accumulation_steps must be > 0")
+
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=lr * 0.1,
+        peak_value=lr,
+        warmup_steps=warmup_steps,
+        decay_steps=total_optimizer_steps,
+        end_value=lr * end_ratio,
+    )
+    pool_names = (
+        'attn_qk_emb', 'attn_v_emb', 'rst_emb',
+        'attn_qk_op_read_proj', 'attn_qk_op_write_proj',
+        'attn_v_op_read_proj', 'attn_v_op_write_proj',
+        'rst_op_read_proj', 'rst_op_write_proj',
+        'qk_emb', 'v_emb', 'q_read', 'k_read',
+        'attn_qk_read', 'attn_v_read', 'rst_read',
+        'qk_read', 'v_read', 'q_write', 'k_write',
+        'attn_qk_write', 'attn_v_write', 'rst_write',
+        'qk_write', 'v_write',
+    )
+
+    def path_str(path):
+        return '/'.join(
+            str(p.key if hasattr(p, 'key') else p) for p in path)
+
+    def excluded(path):
+        leaf = path.rsplit('/', 1)[-1]
+        return (
+            leaf == 'bias'
+            or ('scale' in path and 'norm' in path.lower())
+            or path.endswith('_scale')
+            or path.endswith('/qk_scale')
+            or path.endswith('/v_scale')
+            or path.endswith('/rst_scale')
+            or path.endswith('/attn_qk_scale')
+            or path.endswith('/attn_v_scale'))
+
+    def base_mask(tree):
+        return jax.tree.map_with_path(
+            lambda path, _: (
+                not excluded(path_str(path))
+                and not any(name in path_str(path) for name in pool_names)),
+            tree)
+
+    def pool_mask(tree):
+        return jax.tree.map_with_path(
+            lambda path, _: (
+                not excluded(path_str(path))
+                and any(name in path_str(path) for name in pool_names)),
+            tree)
+
+    def no_param_mask(tree):
+        return jax.tree.map(lambda _: False, tree)
+
+    parts = [optax.masked(optax.set_to_zero(), mask=no_param_mask)]
+    parts.append(
+        optax.clip_by_global_norm(global_grad_clip)
+        if global_grad_clip > 0.0 else optax.scale(1.0))
+    parts.extend((
+        optax.scale_by_adam(b2=0.95),
+        optax.add_decayed_weights(weight_decay, mask=base_mask),
+        optax.add_decayed_weights(pool_weight_decay, mask=pool_mask),
+        optax.scale_by_learning_rate(schedule),
+        optax.masked(optax.set_to_zero(), mask=no_param_mask),
+    ))
+    base_optimizer = optax.chain(*parts)
+    optimizer = (
+        optax.MultiSteps(base_optimizer, every_k_schedule=grad_accum_steps)
+        if grad_accum_steps > 1 else base_optimizer)
+    if log_groups and jax.process_index() == 0:
+        base_count = sum(bool(x) for x in jax.tree.leaves(base_mask(params)))
+        pool_count = sum(bool(x) for x in jax.tree.leaves(pool_mask(params)))
+        print(
+            f"  WD groups: base ({weight_decay}) = {base_count} tensors, "
+            f"pool ({pool_weight_decay}) = {pool_count} tensors",
+            flush=True)
+    return CanonicalOptimizerBundle(
+        optimizer=optimizer,
+        schedule=schedule,
+        gradient_accumulation_steps=grad_accum_steps,
+        warmup_steps=warmup_steps,
+        total_optimizer_steps=total_optimizer_steps,
+    )
+
+
+def _factory_supported_kwargs(factory, kwargs):
+    signature = inspect.signature(factory)
+    if any(
+            p.kind == p.VAR_KEYWORD
+            for p in signature.parameters.values()):
+        return dict(kwargs)
+    return {key: value for key, value in kwargs.items()
+            if key in signature.parameters}
+
+
+def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
+                                analysis=False):
+    """Canonical model-version sharded function construction."""
+    model_cfg = cfg['model']
+    training_cfg = cfg.get('training', {})
+    version = str(model_cfg.get('model_version', ''))
+    mesh_model = int(training_cfg.get('mesh_model', 1))
+    if _is_baseline_version(version):
+        return (create_baseline_sharded_fns(mesh, cfg)
+                if mesh_model > 1 else None)
+    if not _is_active_srw_version(version):
+        return None
+    if (version == V4168_MODEL_VERSION
+            and bool(training_cfg.get('operation_space', {}).get(
+                'enabled', False))):
+        raise RuntimeError(
+            "Canonical transfer sharding for v4168 operation_space must use "
+            "the operation-space executor path; no dense fallback is allowed")
+
+    entry = _model_registry_entry(version)
+    module = __import__(entry['module'], fromlist=['make_sharded_srw'])
+    single_factory = module.make_sharded_srw
+    paired_factory = getattr(module, 'make_sharded_srw_paired', None)
+    if paired_factory is None:
+        raise RuntimeError(
+            f"{version} module is missing make_sharded_srw_paired")
+    for key in ('n_qk', 'n_v', 'n_rst'):
+        value = int(model_cfg.get(key, model_cfg.get('n_know', 0)))
+        if value <= 0 or value % mesh_model != 0:
+            raise ValueError(
+                f"model.{key}={value} must be positive and divisible by "
+                f"mesh_model={mesh_model}")
+    local_counts = {
+        'qk': int(model_cfg['n_qk']) // mesh_model,
+        'v': int(model_cfg['n_v']) // mesh_model,
+        'rst': int(model_cfg.get(
+            'n_rst', model_cfg.get('n_know'))) // mesh_model,
+    }
+    chunks = {
+        pool: max(1, math.ceil(
+            local_counts[pool] / max(1, int(training_cfg.get(
+                f'n_chunks_{pool}',
+                training_cfg.get('n_chunks_know', 1))))))
+        for pool in ('qk', 'v', 'rst')
+    }
+    base_kwargs = {'mesh': mesh, **_v4164_sharded_kwargs(cfg)}
+    if analysis and 'analysis' in inspect.signature(
+            single_factory).parameters:
+        base_kwargs['analysis'] = True
+    if training_cfg.get('max_chunk_size') is not None:
+        chunks = {
+            pool: int(training_cfg['max_chunk_size'])
+            for pool in ('qk', 'v', 'rst')
+        }
+    single_v = single_factory(
+        max_chunk_size=chunks['v'],
+        **_factory_supported_kwargs(single_factory, base_kwargs))
+    single_rst = single_factory(
+        max_chunk_size=chunks['rst'],
+        **_factory_supported_kwargs(single_factory, base_kwargs))
+    paired_qk = paired_factory(
+        max_chunk_size=chunks['qk'],
+        **_factory_supported_kwargs(paired_factory, base_kwargs))
+    sharded = {
+        'single': single_v,
+        'attn_v_single': single_v,
+        'rst_single': single_rst,
+        'paired': paired_qk,
+        'attn_qk_paired': paired_qk,
+    }
+    single_min = getattr(module, 'make_sharded_srw_minimal', None)
+    if single_min is not None:
+        for pool, name in (
+                ('qk', 'attn_qk_single_minimal'),
+                ('v', 'attn_v_single_minimal'),
+                ('rst', 'rst_single_minimal')):
+            sharded[name] = single_min(
+                max_chunk_size=chunks[pool],
+                **_factory_supported_kwargs(single_min, base_kwargs))
+    paired_min = getattr(module, 'make_sharded_srw_paired_minimal', None)
+    if paired_min is not None:
+        sharded['attn_qk_paired_minimal'] = paired_min(
+            max_chunk_size=chunks['qk'],
+            **_factory_supported_kwargs(paired_min, base_kwargs))
+    if version == V4167_MODEL_VERSION:
+        extra_factory = getattr(module, 'create_v4167_tp_sharded_fns', None)
+        if extra_factory is None:
+            raise RuntimeError(
+                "v4167 module is missing create_v4167_tp_sharded_fns")
+        sharded.update(extra_factory(mesh, cfg))
+
+    if (mesh_model > 1
+            and version in (V4166_MODEL_VERSION, V4168_MODEL_VERSION,
+                            V4169_MODEL_VERSION, V4170_MODEL_VERSION)):
+        for key in ('logical_vocab_size', 'vocab_size_padded'):
+            if key not in model_cfg:
+                raise RuntimeError(
+                    f"Checkpoint model config is missing model.{key} for "
+                    "canonical vocab-parallel execution")
+        from models.vocab_parallel import (
+            make_vocab_parallel_ce,
+            make_vocab_parallel_embedding,
+        )
+        logical_vocab = int(model_cfg['logical_vocab_size'])
+        padded_vocab = int(model_cfg['vocab_size_padded'])
+        if padded_vocab % mesh_model != 0:
+            raise ValueError(
+                "model.vocab_size_padded must be divisible by mesh_model")
+        sharded['vocab_parallel_embedding'] = make_vocab_parallel_embedding(
+            mesh, logical_vocab, padded_vocab)
+        sharded['vocab_ce'] = make_vocab_parallel_ce(
+            mesh,
+            logical_vocab_size=logical_vocab,
+            vocab_size_padded=padded_vocab,
+            token_chunk_size=int(training_cfg.get(
+                'ce_token_chunk_size', 32768)),
+            compute_accuracy=(
+                True if for_eval else bool(training_cfg.get(
+                    'train_compute_accuracy', True))),
+        )
+    return sharded
+
+
+def adapt_checkpoint_params_to_target(raw_params, target_params):
+    """Adapt legacy pool names for evaluation-only checkpoint readers."""
+    if not isinstance(raw_params, dict) or not isinstance(target_params, dict):
+        return raw_params
+    raw_pool = raw_params.get('neuron_pool', {})
+    target_pool = target_params.get('neuron_pool', {})
+    if not isinstance(raw_pool, dict) or not isinstance(target_pool, dict):
+        return raw_params
+    legacy_keys = {
+        'qk_emb', 'qk_read', 'qk_write', 'v_emb', 'v_read', 'v_write',
+        'know_emb', 'know_read', 'know_write',
+    }
+    modern_keys = {
+        'attn_qk_emb', 'attn_qk_read', 'attn_qk_write',
+        'attn_v_emb', 'attn_v_read', 'attn_v_write',
+        'rst_emb', 'rst_read', 'rst_write',
+    }
+    raw_keys = set(raw_pool)
+    target_keys = set(target_pool)
+    if (legacy_keys.issubset(target_keys)
+            and not legacy_keys.issubset(raw_keys)
+            and modern_keys.intersection(raw_keys)):
+        adapted = deepcopy(raw_params)
+        pool = adapted['neuron_pool']
+        for source, target in {
+                'attn_qk_emb': 'qk_emb',
+                'attn_qk_read': 'qk_read',
+                'attn_qk_write': 'qk_write',
+                'attn_v_emb': 'v_emb',
+                'attn_v_read': 'v_read',
+                'attn_v_write': 'v_write',
+                'rst_emb': 'know_emb',
+                'rst_read': 'know_read',
+                'rst_write': 'know_write',
+        }.items():
+            if source in pool and target not in pool:
+                pool[target] = pool[source]
+        router = adapted.get('router', {})
+        if isinstance(router, dict):
+            if 'proj_rst' in router and 'proj_know' not in router:
+                router['proj_know'] = router['proj_rst']
+            if 'tau_rst' in router and 'tau_know' not in router:
+                router['tau_know'] = router['tau_rst']
+        return adapted
+    if (modern_keys.issubset(target_keys)
+            and not modern_keys.issubset(raw_keys)
+            and legacy_keys.intersection(raw_keys)):
+        migrated = migrate_legacy_v4155_params({'params': raw_params})
+        if isinstance(migrated, dict) and 'params' in migrated:
+            return migrated['params']
+    return raw_params
+
+
+def restore_transfer_params(source_checkpoint, target_params, mesh):
+    """Restore only params from a committed Orbax pretraining state."""
+    _require_orbax_checkpoint_compat()
+    manager = _create_orbax_checkpoint_manager(
+        source_checkpoint.checkpoint_dir,
+        create=False,
+        read_only=True,
+    )
+    try:
+        restored = manager.restore(
+            int(source_checkpoint.step),
+            args=ocp.args.Composite(
+                state=ocp.args.PyTreeRestore(
+                    item={'params': target_params},
+                    partial_restore=True),
+            ),
+        )
+        restored_state = _composite_item(restored, 'state')
+    finally:
+        manager.close()
+    if not isinstance(restored_state, dict) or 'params' not in restored_state:
+        raise RuntimeError(
+            "Orbax partial restore did not return state.params from "
+            f"{source_checkpoint.checkpoint_path}")
+    return _match_tree_to_template_on_mesh(
+        restored_state['params'], target_params, mesh, name='params')
+
+
+def initialize_training_state(policy, params, optimizer, mesh, rng,
+                              *, source_checkpoint=None,
+                              resume_state=None):
+    """Apply one explicit scratch/resume/transfer initialization policy."""
+    policy = str(policy).lower()
+    if policy == 'scratch':
+        initialized_params = params
+        opt_state = optimizer.init(initialized_params)
+        phase_step = 0
+        source_step = None
+        source_path = None
+    elif policy == 'transfer':
+        if source_checkpoint is None:
+            raise ValueError("transfer policy requires source_checkpoint")
+        initialized_params = restore_transfer_params(
+            source_checkpoint, params, mesh)
+        opt_state = optimizer.init(initialized_params)
+        phase_step = 0
+        source_step = int(source_checkpoint.step)
+        source_path = source_checkpoint.checkpoint_path
+    elif policy == 'resume':
+        required = ('params', 'opt_state', 'rng', 'global_step')
+        if not isinstance(resume_state, dict):
+            raise ValueError("resume policy requires resume_state")
+        missing = [key for key in required if key not in resume_state]
+        if missing:
+            raise RuntimeError(
+                "resume state is missing required values: "
+                + ", ".join(missing))
+        initialized_params = resume_state['params']
+        opt_state = resume_state['opt_state']
+        rng = resume_state['rng']
+        phase_step = int(resume_state['global_step'])
+        source_step = phase_step
+        source_path = resume_state.get('source_checkpoint')
+    else:
+        raise ValueError(
+            f"Unknown initialization policy={policy!r}; expected "
+            "scratch, resume, or transfer")
+    opt_state = _replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
+    return InitializedTrainingState(
+        policy=policy,
+        params=initialized_params,
+        opt_state=opt_state,
+        rng=rng,
+        phase_step=phase_step,
+        source_step=source_step,
+        source_checkpoint=source_path,
+    )
+
+
+def create_canonical_train_step(model, optimizer, cfg, sharded_fns, mesh,
+                                total_training_steps, runtime_state=None):
+    """Configure the official train step from one materialized config."""
+    t = cfg.get('training', {})
+    m = cfg.get('model', {})
+    version = str(m.get('model_version', ''))
+    kwargs = {
+        'weight_decay': float(t.get('weight_decay', 0.0)),
+        'pool_weight_decay': float(t.get('pool_weight_decay', 0.0)),
+        'inactive_aux_warmup_steps': int(t.get(
+            'inactive_aux_warmup_steps', 0)),
+        'inactive_aux_lower_bound': float(t.get(
+            'inactive_aux_lower_bound', 0.0)),
+        'inactive_aux_upper_bound': float(t.get(
+            'inactive_aux_upper_bound', 0.0)),
+        'inactive_aux_bound_eps': float(t.get(
+            'inactive_aux_bound_eps', 0.0)),
+        'inactive_aux_dev_mode': str(t.get('inactive_aux_dev_mode', 'raw')),
+        'inactive_aux_ce_clip_std': float(t.get(
+            'inactive_aux_ce_clip_std', 0.0)),
+        'inactive_aux_z_clip': float(t.get('inactive_aux_z_clip', 0.0)),
+        'inactive_aux_z_tanh': bool(t.get('inactive_aux_z_tanh', False)),
+        'inactive_aux_weighted_clip': float(t.get(
+            'inactive_aux_weighted_clip', 0.0)),
+        'inactive_aux_normalize_by_layers': bool(t.get(
+            'inactive_aux_normalize_by_layers', True)),
+        'inactive_aux_asymmetry_q': float(t.get(
+            'inactive_aux_asymmetry_q', 0.0)),
+        'inactive_aux_asymmetry_k': float(t.get(
+            'inactive_aux_asymmetry_k', 0.0)),
+        'inactive_aux_asymmetry_v': float(t.get(
+            'inactive_aux_asymmetry_v', 0.0)),
+        'inactive_aux_asymmetry_rst': float(t.get(
+            'inactive_aux_asymmetry_rst', 0.0)),
+        'inactive_aux_enabled': bool(t.get('inactive_aux_enabled', False)),
+        'dead_penalty_qk_weight': float(t.get(
+            'dead_penalty_qk_weight', 0.0)),
+        'dead_penalty_v_weight': float(t.get(
+            'dead_penalty_v_weight', 0.0)),
+        'dead_penalty_rst_weight': float(t.get(
+            'dead_penalty_rst_weight', 0.0)),
+        'dead_penalty_weighted_clip': float(t.get(
+            'dead_penalty_weighted_clip', 0.0)),
+        'cb1a_enabled': bool(t.get('cb1a_enabled', False)),
+        'cb1a_weight': float(t.get('cb1a_weight', 0.0)),
+        'cb1a_challenge_weight': float(t.get(
+            'cb1a_challenge_weight', 0.0)),
+        'cb1a_prune_weight': float(t.get('cb1a_prune_weight', 0.0)),
+        'cb1a_qk_weight': float(t.get('cb1a_qk_weight', 0.0)),
+        'cb1a_v_weight': float(t.get('cb1a_v_weight', 0.0)),
+        'cb1a_rst_weight': float(t.get('cb1a_rst_weight', 0.0)),
+        'cb1a_qk_challenge_weight': float(t.get(
+            'cb1a_qk_challenge_weight', 0.0)),
+        'cb1a_qk_prune_weight': float(t.get(
+            'cb1a_qk_prune_weight', 0.0)),
+        'cb1a_v_challenge_weight': float(t.get(
+            'cb1a_v_challenge_weight', 0.0)),
+        'cb1a_v_prune_weight': float(t.get(
+            'cb1a_v_prune_weight', 0.0)),
+        'cb1a_rst_challenge_weight': float(t.get(
+            'cb1a_rst_challenge_weight', 0.0)),
+        'cb1a_rst_prune_weight': float(t.get(
+            'cb1a_rst_prune_weight', 0.0)),
+        'cb1a_ce_mode': str(t.get('cb1a_ce_mode', 'sigmoid_z')),
+        'cb1a_eps': float(t.get('cb1a_eps', 1.0e-8)),
+        'global_grad_clip': float(t.get(
+            'global_grad_clip', t.get('max_grad_norm', 0.0))),
+        'tau_lr_mult': float(t.get('tau_lr_mult', 1.0)),
+        'tau_grad_clip': float(t.get('tau_grad_clip', 0.0)),
+        'router_proj_lr_mult': float(t.get('router_proj_lr_mult', 1.0)),
+        'router_proj_grad_clip': float(t.get(
+            'router_proj_grad_clip', 0.0)),
+        'router_scan_lr_mult': float(t.get('router_scan_lr_mult', 1.0)),
+        'router_scan_grad_clip': float(t.get(
+            'router_scan_grad_clip', 0.0)),
+        'route_emb_lr_mult': float(t.get('route_emb_lr_mult', 1.0)),
+        'route_emb_grad_clip': float(t.get('route_emb_grad_clip', 0.0)),
+        'op_key_lr_mult': float(t.get(
+            'op_key_lr_mult', t.get('route_emb_lr_mult', 1.0))),
+        'op_key_grad_clip': float(t.get(
+            'op_key_grad_clip', t.get('route_emb_grad_clip', 0.0))),
+        'enable_control_update_caps': bool(t.get(
+            'enable_control_update_caps', False)),
+        'router_proj_update_ratio_cap': float(t.get(
+            'router_proj_update_ratio_cap', 0.0)),
+        'route_emb_update_ratio_cap': float(t.get(
+            'route_emb_update_ratio_cap', 0.0)),
+        'tau_update_abs_cap': float(t.get('tau_update_abs_cap', 0.0)),
+        'scan_update_abs_cap': float(t.get('scan_update_abs_cap', 0.0)),
+        'total_training_steps': int(total_training_steps),
+        'soft_gate_schedule_active': _is_active_srw_version(version),
+        'soft_gate_t_start': float(t.get('soft_gate_t_start', 1.5)),
+        'soft_gate_t_final': float(t.get('soft_gate_t_final', 0.07)),
+        'soft_gate_t_hold_frac': float(t.get('soft_gate_t_hold_frac', 0.10)),
+        'soft_gate_t_anneal_end_frac': float(t.get(
+            'soft_gate_t_anneal_end_frac', 0.80)),
+        'soft_gate_schedule': str(t.get(
+            'soft_gate_t_schedule', t.get('soft_gate_schedule', 'cosine'))),
+        'soft_gate_t_power': float(t.get('soft_gate_t_power', 4.0)),
+        'soft_gate_t_gompertz_center': float(t.get(
+            'soft_gate_t_gompertz_center', 0.25)),
+        'soft_gate_t_gompertz_steepness': float(t.get(
+            'soft_gate_t_gompertz_steepness', 8.0)),
+        'boundary_power_schedule_active': _is_active_srw_version(version),
+        'soft_gate_boundary_power_start': float(t.get(
+            'soft_gate_boundary_power_start', 3.0)),
+        'soft_gate_boundary_power_mid': float(t.get(
+            'soft_gate_boundary_power_mid', 3.15)),
+        'soft_gate_boundary_power_final': float(t.get(
+            'soft_gate_boundary_power_final', 4.0)),
+        'soft_gate_boundary_power_start_frac': float(t.get(
+            'soft_gate_boundary_power_start_frac', 0.0)),
+        'soft_gate_boundary_power_mid_frac': float(t.get(
+            'soft_gate_boundary_power_mid_frac', 0.8)),
+        'soft_gate_boundary_power_final_frac': float(t.get(
+            'soft_gate_boundary_power_final_frac', 0.95)),
+        'admission_den_power': float(t.get('admission_den_power', 1.0)),
+        'sharded_fns': sharded_fns,
+        'mesh': mesh,
+        'is_baseline': _is_baseline_version(version),
+        'compact_train_metrics': _is_active_srw_version(version),
+        'keep_train_layer_metrics': False,
+        'tokens_per_step': int(t.get('batch_size', 1)) * int(
+            m.get('max_seq_len', 1)),
+        'ce_token_chunk_size': int(t.get('ce_token_chunk_size', 32768)),
+        'train_compute_accuracy': bool(t.get(
+            'train_compute_accuracy', True)),
+        'runtime_state': runtime_state,
+    }
+    return create_train_step(
+        model,
+        optimizer,
+        float(t.get('orthogonality_weight', 0.0)),
+        float(t.get('diversity_weight', 0.0)),
+        float(t.get('load_balance_weight', 0.0)),
+        float(t.get('tau_reg_weight', 0.0)),
+        float(t.get('dead_penalty_weight', 0.0)),
+        float(t.get('inactive_aux_weight', 0.0)),
+        float(t.get('inactive_aux_asymmetry', 0.0)),
+        float(t.get('inactive_aux_weight_q', 0.0)),
+        float(t.get('inactive_aux_weight_k', 0.0)),
+        float(t.get('inactive_aux_weight_v', 0.0)),
+        float(t.get('inactive_aux_weight_rst', 0.0)),
+        int(m.get('rank', 64)),
+        int(m.get('knowledge_rank', 128)),
+        int(m.get('n_feature_qk', 56)),
+        int(m.get('n_restore_qk', 56)),
+        **kwargs,
+    )
+
+
+def _fixed_runtime_forward_kwargs(model, sharded_fns, runtime_state,
+                                  *, compute_accuracy):
+    if runtime_state is None:
+        raise RuntimeError(
+            "transfer model forward requires source_final_constant runtime")
+    kwargs = {}
+    if sharded_fns is not None:
+        kwargs['sharded_fns'] = sharded_fns
+    if _model_accepts_analysis(model):
+        kwargs['analysis'] = False
+    if _model_accepts_minimal_train(model):
+        kwargs['minimal_train'] = True
+    signature = inspect.signature(model.__call__).parameters
+    for key in (
+            'soft_gate_temperature', 'soft_gate_T_qk', 'soft_gate_T_v',
+            'soft_gate_T_rst', 'soft_gate_t_final',
+            'soft_gate_boundary_power', 'soft_gate_boundary_power_final',
+            'admission_den_power', 'training_tokens'):
+        if key in signature:
+            if key not in runtime_state:
+                raise RuntimeError(
+                    f"source_final_constant runtime is missing {key}")
+            kwargs[key] = runtime_state[key]
+    if _model_accepts_execution_prune_eps(model):
+        kwargs['execution_prune_eps'] = 0.0
+    if _model_accepts_ce_token_chunk_size(model):
+        kwargs['ce_token_chunk_size'] = int(
+            runtime_state.get('ce_token_chunk_size', 32768))
+    if _model_accepts_compute_accuracy(model):
+        kwargs['compute_accuracy'] = bool(compute_accuracy)
+    return kwargs
+
+
+def create_candidate_score_step(model, sharded_fns, runtime_state):
+    """Return answer-token mean NLL scoring on the canonical forward path."""
+    forward_kwargs = _fixed_runtime_forward_kwargs(
+        model, sharded_fns, runtime_state, compute_accuracy=False)
+
+    @jax.jit
+    def score_step(params, input_ids, labels, attention_mask):
+        result = model.apply(
+            {'params': params},
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            deterministic=True,
+            rngs={'dropout': jax.random.PRNGKey(0)},
+            **forward_kwargs,
+        )
+        if 'per_token_ce' not in result:
+            raise RuntimeError(
+                "Canonical candidate scoring requires per_token_ce from "
+                "the model forward")
+        mask = (labels[:, 1:] != -100).astype(jnp.float32)
+        token_ce = result['per_token_ce'].astype(jnp.float32)
+        return (token_ce * mask).sum(axis=-1) / jnp.maximum(
+            mask.sum(axis=-1), 1.0)
+
+    return score_step
+
+
+def require_finite_metrics(metrics, *, phase_step):
+    bad = []
+    for key, value in metrics.items():
+        if np.asarray(jax.device_get(value)).size == 1:
+            scalar = float(np.asarray(jax.device_get(value)).reshape(()))
+            if not math.isfinite(scalar):
+                bad.append(key)
+    if bad:
+        raise FloatingPointError(
+            f"Non-finite metrics at phase_step={phase_step}: "
+            + ", ".join(sorted(bad)))
+
+
+def reduce_scalar_metrics(metrics, *, reduction='mean'):
+    """Materialize and consistently aggregate scalar metrics across hosts."""
+    if reduction not in ('mean', 'sum'):
+        raise ValueError("reduction must be 'mean' or 'sum'")
+    reduced = {}
+    for key, value in metrics.items():
+        local = np.asarray(jax.device_get(value))
+        if local.size != 1:
+            raise ValueError(f"Metric {key!r} is not scalar: shape={local.shape}")
+        local = local.reshape((1,)).astype(np.float64)
+        gathered = (
+            np.asarray(process_allgather(local)).reshape(-1)
+            if jax.process_count() > 1 else local)
+        reduced[key] = float(
+            gathered.sum() if reduction == 'sum' else gathered.mean())
+    return reduced
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train DAWN-SRW v4164 (JAX/Flax, Multi-Device)')
     parser.add_argument('--config', type=str, required=True,
@@ -14613,146 +15518,28 @@ def main():
     # ----------------------------------------------------------
     # Optimizer (warmup + cosine decay + optional gradient accumulation)
     # ----------------------------------------------------------
-    grad_accum_steps = tcfg.get('gradient_accumulation_steps', 1)
-
     steps_per_epoch = len(train_loader)
     # Schedule counts optimizer steps (after accumulation), not micro-steps
+    grad_accum_steps = int(tcfg.get('gradient_accumulation_steps', 1))
     effective_steps_per_epoch = steps_per_epoch // grad_accum_steps
     total_steps = num_epochs * effective_steps_per_epoch
-    warmup_steps = int(total_steps * warmup_ratio)
-
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=lr * 0.1,
-        peak_value=lr,
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps,
-        end_value=lr * 0.1,
+    _optimizer_cfg = dict(tcfg)
+    _optimizer_cfg.update({
+        'lr': lr,
+        'warmup_ratio': warmup_ratio,
+        'weight_decay': weight_decay,
+        'pool_weight_decay': pool_weight_decay,
+        'global_grad_clip': global_grad_clip,
+    })
+    optimizer_bundle = create_canonical_optimizer(
+        params,
+        _optimizer_cfg,
+        total_steps,
+        log_groups=is_host0,
     )
-
-    # v4164 per-group WD: pool tensors (attn-qk/attn-v/RST emb/read/write) get
-    # pool_weight_decay; dense kernels get weight_decay. Bias / LayerNorm /
-    # learnable *_scale excluded from both groups.
-    #
-    # optax.adamw is chain(scale_by_adam, add_decayed_weights, scale_by_lr).
-    # To apply two different WDs we decompose it: one scale_by_adam, then
-    # two masked add_decayed_weights (base + pool -masks are disjoint so
-    # each param is touched at most once), then a single scale_by_lr.
-
-    _MODEL_VERSION = OFFICIAL_MODEL_VERSION
-    _FORWARD_UNIT_RW_VERSIONS = set()
-
-    _POOL_PARAM_NAMES = (
-        'attn_qk_emb', 'attn_v_emb', 'rst_emb',
-        'attn_qk_op_read_proj', 'attn_qk_op_write_proj',
-        'attn_v_op_read_proj', 'attn_v_op_write_proj',
-        'rst_op_read_proj', 'rst_op_write_proj',
-        'qk_emb', 'v_emb', 'rst_emb',
-        'q_read', 'k_read',
-        'attn_qk_read', 'attn_v_read', 'rst_read',
-        'qk_read', 'v_read', 'rst_read',
-        'q_write', 'k_write',
-        'attn_qk_write', 'attn_v_write', 'rst_write',
-        'qk_write', 'v_write', 'rst_write',
-    )
-    _RW_PARAM_NAMES = (
-        'q_read', 'k_read',
-        'attn_qk_read', 'attn_v_read', 'rst_read',
-        'qk_read', 'v_read', 'rst_read',
-        'q_write', 'k_write',
-        'attn_qk_write', 'attn_v_write', 'rst_write',
-        'qk_write', 'v_write', 'rst_write',
-    )
-
-    def _path_str(path):
-        return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
-
-    def _is_pool_param(path_str):
-        return any(name in path_str for name in _POOL_PARAM_NAMES)
-
-    def _is_rw_param(path_str):
-        return any(name in path_str for name in _RW_PARAM_NAMES)
-
-    def _is_excluded(path_str):
-        leaf = path_str.rsplit('/', 1)[-1]
-        if leaf == 'bias':
-            return True
-        if 'scale' in path_str and 'norm' in path_str.lower():
-            return True  # LayerNorm scale
-        if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
-           or path_str.endswith('/v_scale') or path_str.endswith('/rst_scale') \
-           or path_str.endswith('/attn_qk_scale') \
-           or path_str.endswith('/attn_v_scale') \
-           or path_str.endswith('/rst_scale'):
-            return True  # learnable output_scale
-        if _MODEL_VERSION in _FORWARD_UNIT_RW_VERSIONS and _is_rw_param(path_str):
-            return True  # forward-normalized read/write directions
-        return False
-
-    def _wd_mask_base(params):
-        def _f(path, _):
-            ps = _path_str(path)
-            if _is_excluded(ps):
-                return False
-            return not _is_pool_param(ps)
-        return jax.tree.map_with_path(_f, params)
-
-    def _wd_mask_pool(params):
-        def _f(path, _):
-            ps = _path_str(path)
-            if _is_excluded(ps):
-                return False
-            return _is_pool_param(ps)
-        return jax.tree.map_with_path(_f, params)
-
-    def _no_param_mask(params):
-        return jax.tree.map(lambda _: False, params)
-
-    optimizer_parts = [
-        optax.masked(optax.set_to_zero(), mask=_no_param_mask),
-    ]
-    if float(global_grad_clip) > 0.0:
-        optimizer_parts.append(optax.clip_by_global_norm(global_grad_clip))
-    else:
-        # Keep the global-clip opt_state slot for checkpoint resume stability,
-        # but make it an exact no-op unless config explicitly enables clipping.
-        optimizer_parts.append(optax.scale(1.0))
-    optimizer_parts.extend([
-        optax.scale_by_adam(b2=0.95),
-        optax.add_decayed_weights(weight_decay, mask=_wd_mask_base),
-        optax.add_decayed_weights(pool_weight_decay, mask=_wd_mask_pool),
-        optax.scale_by_learning_rate(schedule),
-        optax.masked(optax.set_to_zero(), mask=_no_param_mask),
-    ])
-    base_optimizer = optax.chain(*optimizer_parts)
-
-    if is_host0:
-        def _count_true(mask):
-            n = [0]
-            def _f(v):
-                if v:
-                    n[0] += 1
-                return v
-            jax.tree.map(_f, mask)
-            return n[0]
-        def _collect_pool_paths(mask):
-            out = []
-            def _f(path, v):
-                if v:
-                    out.append(_path_str(path))
-                return v
-            jax.tree.map_with_path(_f, mask)
-            return out
-        _base_mask = _wd_mask_base(params)
-        _pool_mask = _wd_mask_pool(params)
-        print(f"  WD groups: base ({weight_decay}) = {_count_true(_base_mask)} tensors, "
-              f"pool ({pool_weight_decay}) = {_count_true(_pool_mask)} tensors")
-        _pool_paths = _collect_pool_paths(_pool_mask)
-        if _pool_paths:
-            print(f"    pool params: {_pool_paths[:9]}")
-    if grad_accum_steps > 1:
-        optimizer = optax.MultiSteps(base_optimizer, every_k_schedule=grad_accum_steps)
-    else:
-        optimizer = base_optimizer
+    optimizer = optimizer_bundle.optimizer
+    schedule = optimizer_bundle.schedule
+    warmup_steps = optimizer_bundle.warmup_steps
 
     if is_host0:
         print(f"\nTraining config:")
@@ -15643,7 +16430,20 @@ def main():
                 f"  baseline-JAX shard_map enabled "
                 f"(mesh_model={mesh_model}; attention+ffn+vocab TP)",
                 flush=True)
-    elif _is_active_srw_version(model_version_cfg) and (
+    elif (_is_active_srw_version(model_version_cfg)
+          and str(model_version_cfg) != V4168_MODEL_VERSION
+          and (mesh_model > 1 or _force_sharded)):
+        _sharded_fns = build_canonical_sharded_fns(cfg, mesh)
+        _sharded_fns_eval = build_canonical_sharded_fns(
+            cfg, mesh, for_eval=True)
+        _sharded_fns_analysis = build_canonical_sharded_fns(
+            cfg, mesh, for_eval=True, analysis=True)
+        if is_host0:
+            print(
+                f"  canonical shard_map enabled "
+                f"(model={model_version_cfg}; mesh_model={mesh_model})",
+                flush=True)
+    elif (str(model_version_cfg) == V4168_MODEL_VERSION) and (
             mesh_model > 1 or _force_sharded):
         _srw_module_name = _model_registry_entry(model_version_cfg)['module']
         _v4164_module = __import__(_srw_module_name, fromlist=['make_sharded_srw'])
@@ -16389,6 +17189,7 @@ def main():
         dummy_mask = shard_to_mesh(
             jnp.ones((per_host_batch, max_seq_len), dtype=jnp.int32),
             data_sharding, global_shape)
+        dummy_labels = jnp.where(dummy_mask == 1, dummy_ids, -100)
         rng, dummy_step_rng = jax.random.split(rng)
 
         if drift_diagnostics_enabled:
@@ -16399,7 +17200,8 @@ def main():
         # First call: JIT compilation (slow)
         jit_start = time.time()
         _dp, _do, dummy_metrics = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng,
+            params, opt_state, dummy_ids, dummy_labels, dummy_mask,
+            dummy_step_rng,
             _dummy_op_key_snap, jnp.asarray(0, jnp.int32))
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
@@ -16416,7 +17218,8 @@ def main():
             rng, dummy_step_rng2 = jax.random.split(rng)
             step_start = time.time()
             _dp2, _do2, dummy_metrics2 = train_step_fn(
-                params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
+                params, opt_state, dummy_ids, dummy_labels, dummy_mask,
+                dummy_step_rng2,
                 _dummy_op_key_snap, jnp.asarray(0, jnp.int32))
             jax.block_until_ready(dummy_metrics2['total_loss'])
             step_time = time.time() - step_start
@@ -17100,10 +17903,12 @@ def main():
                 input_ids, data_sharding, (batch_size, max_seq_len))
             attention_mask = shard_to_mesh(
                 attention_mask, data_sharding, (batch_size, max_seq_len))
+            labels = jnp.where(attention_mask == 1, input_ids, -100)
 
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
-                input_ids, attention_mask, step_rng, _prev_op_key_snap,
+                input_ids, labels, attention_mask, step_rng,
+                _prev_op_key_snap,
                 jnp.asarray(global_step, jnp.int32))
 
             step_after_update = global_step + 1

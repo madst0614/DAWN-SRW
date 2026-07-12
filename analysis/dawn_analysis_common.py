@@ -739,7 +739,9 @@ def create_ce_eval_step(model, sharded_fns=None, *, minimal_train: bool = True,
     )
 
     def step(params, input_ids, attention_mask, current_step):
-        ret = eval_step(params, input_ids, attention_mask, current_step)
+        labels = jnp.where(attention_mask == 1, input_ids, -100)
+        ret = eval_step(
+            params, input_ids, labels, attention_mask, current_step)
         if not return_prune_stats:
             return ret
         (

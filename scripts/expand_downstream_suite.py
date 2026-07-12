@@ -138,12 +138,12 @@ def build_task_config(
         or suite.get("checkpoint")
     )
     resume_from = task_override.get("resume_from") or suite.get("resume_from")
-    if init_from and resume_from:
-        raise ValueError("Use only one of init_from/checkpoint or resume_from in a downstream suite")
+    if resume_from:
+        raise ValueError(
+            "Downstream resume_from has been removed; every task must transfer "
+            "independently from one committed pretraining checkpoint")
     if init_from:
         task_cfg["init_from"] = str(init_from)
-    if resume_from:
-        task_cfg["resume_from"] = str(resume_from)
 
     suite_name = str(suite.get("name") or suite_path.stem)
     values = {
