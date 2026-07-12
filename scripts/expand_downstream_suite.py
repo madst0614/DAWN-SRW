@@ -166,7 +166,7 @@ def build_task_config(
     if "run_name" in task_override:
         run_name = str(task_override["run_name"])
     else:
-        run_name_template = str(suite.get("run_name_template", "{name}_{task}"))
+        run_name_template = str(suite.get("run_name_template", "{name}"))
         run_name = render_template(run_name_template, values)
     task_cfg["run_name"] = run_name
 

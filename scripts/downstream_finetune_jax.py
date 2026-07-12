@@ -453,6 +453,28 @@ def append_text(path: str, text: str):
     write_text(path, old + text)
 
 
+def read_sequence_run_dir(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    if str(path).startswith('gs://'):
+        raise ValueError('--sequence-run-state must be a local path')
+    state_path = Path(path)
+    if not state_path.is_file():
+        return None
+    run_dir = state_path.read_text(encoding='utf-8').strip()
+    return run_dir or None
+
+
+def write_sequence_run_dir(path: Optional[str], run_dir: str) -> None:
+    if not path:
+        return
+    if str(path).startswith('gs://'):
+        raise ValueError('--sequence-run-state must be a local path')
+    state_path = Path(path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(str(run_dir).rstrip('/') + '\n', encoding='utf-8')
+
+
 # -----------------------------
 # Task prompts
 # -----------------------------
@@ -1344,6 +1366,7 @@ def main():
     ap.add_argument('--config', required=True)
     ap.add_argument('--init-from', default=None)
     ap.add_argument('--resume-from', default=None)
+    ap.add_argument('--sequence-run-state', default=None)
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -1442,11 +1465,25 @@ def main():
     ckpt_root = cfg.get('checkpoint_dir') or ds_cfg.get('checkpoint_dir')
     if not ckpt_root:
         raise ValueError('Config must set checkpoint_dir')
-    # train_jax-style run directory: never write directly into a fixed run_name.
-    # Host 0 creates the unique folder name and broadcasts it; otherwise each
-    # worker would include its own PID and enter a different Orbax barrier.
+    # A downstream sequence owns one run directory. The first task creates it,
+    # then every host stores the broadcast path locally so later task processes
+    # reuse the same directory and append to the same train.log.
     legacy_resume_path = None
-    if resume_from:
+    if is_host0():
+        sequence_run_dir = read_sequence_run_dir(args.sequence_run_state)
+    else:
+        sequence_run_dir = None
+    sequence_run_dir = broadcast_str_from_host0(sequence_run_dir)
+    if sequence_run_dir:
+        run_dir = sequence_run_dir.rstrip('/')
+        expected_prefix = ckpt_root.rstrip('/') + '/'
+        if not resume_from and not run_dir.startswith(expected_prefix):
+            raise ValueError(
+                f'Sequence run directory {run_dir!r} is outside '
+                f'checkpoint_dir {ckpt_root!r}. All configs in one sequence '
+                'must use the same checkpoint root.')
+        run_name = run_dir.rsplit('/', 1)[-1]
+    elif resume_from:
         if resume_ref is not None:
             run_dir = str(resume_ref.run_folder).rstrip('/')
         else:
@@ -1467,7 +1504,8 @@ def main():
         if not run_dir:
             raise RuntimeError('Failed to broadcast downstream run_dir from host 0.')
         run_name = run_dir.rstrip('/').rsplit('/', 1)[-1]
-    train_log_path = join_path(run_dir, f"training_log_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+    write_sequence_run_dir(args.sequence_run_state, run_dir)
+    train_log_path = join_path(run_dir, 'train.log')
 
     def record(msg: str):
         if is_host0():

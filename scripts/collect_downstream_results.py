@@ -24,16 +24,25 @@ def parse_kv_line(line):
     return values
 
 def parse_training_log(path):
-    summary = {}
-    last_eval = {}
+    results_by_task = {}
+    task_order = []
+    current_task = ''
+    last_eval_by_task = {}
     for line in read_text(path).splitlines():
-        if line.startswith('[eval]'):
-            last_eval = parse_kv_line(line)
+        if line.startswith('Downstream fine-tune:'):
+            current_task = parse_kv_line(line).get('task', current_task)
+        elif line.startswith('[eval]'):
+            if current_task:
+                last_eval_by_task[current_task] = parse_kv_line(line)
         elif line.startswith('[summary]'):
             summary = parse_kv_line(line)
-    values = dict(last_eval)
-    values.update(summary)
-    return values
+            task = summary.get('task', current_task)
+            values = dict(last_eval_by_task.get(task, {}))
+            values.update(summary)
+            if task not in results_by_task:
+                task_order.append(task)
+            results_by_task[task] = values
+    return [results_by_task[task] for task in task_order]
 
 def main():
     ap=argparse.ArgumentParser()
@@ -42,10 +51,14 @@ def main():
     args=ap.parse_args()
     rows=[]
     for root in args.root:
-        # New downstream runs keep train/eval/final summary in one training log.
+        # A sequence run appends every task to one <run>/train.log. Keep the
+        # timestamped patterns for older per-task runs.
         try:
             logs = (
-                tj._list_files(root, '*/*/training_log_*.txt')
+                tj._list_files(root, '*/*/train.log')
+                + tj._list_files(root, '*/train.log')
+                + tj._list_files(root, 'train.log')
+                + tj._list_files(root, '*/*/training_log_*.txt')
                 + tj._list_files(root, '*/training_log_*.txt')
                 + tj._list_files(root, 'training_log_*.txt')
             )
@@ -53,20 +66,20 @@ def main():
             logs = []
         for f in sorted(set(logs)):
             try:
-                vals = parse_training_log(f)
                 parts=f.rstrip('/').split('/')
-                # .../<task>/<run>/training_log_*.txt or .../<run>/training_log_*.txt
-                task=parts[-3] if len(parts)>=3 else ''
+                # .../<task>/<run>/training_log_*.txt or .../<run>/train.log
+                legacy_task=parts[-3] if len(parts)>=3 else ''
                 run=parts[-2] if len(parts)>=2 else ''
-                rows.append({
-                    'root': root,
-                    'task': vals.get('task', task),
-                    'run': run,
-                    'step': vals.get('step', ''),
-                    'accuracy': vals.get('best_acc', vals.get('acc', '')),
-                    'total': vals.get('total', ''),
-                    'path': f,
-                })
+                for vals in parse_training_log(f):
+                    rows.append({
+                        'root': root,
+                        'task': vals.get('task', legacy_task),
+                        'run': run,
+                        'step': vals.get('step', ''),
+                        'accuracy': vals.get('best_acc', vals.get('acc', '')),
+                        'total': vals.get('total', ''),
+                        'path': f,
+                    })
             except Exception as e:
                 print(f'WARN failed {f}: {e}', file=sys.stderr)
         # Backward-compatible fallback for old runs that wrote best_eval.json.
