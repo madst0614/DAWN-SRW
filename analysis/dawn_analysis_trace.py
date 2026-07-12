@@ -59,6 +59,14 @@ def _srw_with_topk(x, h, op_key, raw_tau, read, write, *,
             jnp.maximum(admission_mass, 1.0),
             jnp.asarray(admission_den_power, dtype=jnp.float32),
         )
+    elif hasattr(model_module, "DEFAULT_SRW_COMPOSITION_MODE"):
+        den = composition_den(
+            admission_mass,
+            admission_den_power,
+            kwargs.get(
+                "srw_composition_mode",
+                model_module.DEFAULT_SRW_COMPOSITION_MODE),
+        )
     else:
         den = composition_den(admission_mass, admission_den_power)
     out = (out.astype(jnp.float32) / den).astype(jnp.float32)

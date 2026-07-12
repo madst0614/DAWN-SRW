@@ -8,7 +8,7 @@ Implemented concepts:
 - independent learned live-gradient operator-address embeddings
 - direct state-to-operation queries
 - linear angular-depth gate after DirectTau
-- gate-sum normalized rank-1 RW composition
+- selectable linear-angular or spherical-energy rank-1 RW composition
 - tau movement controlled by optimizer-side tau_lr_mult
 - train-time effective gate statistics
 - validation-time execution pruning through execution_prune_eps
@@ -260,15 +260,16 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 
 
 # ================================================================
-# V4.1.6.9 canonical DirectTau gate in cosine space.
+# V4.1.7.1 canonical DirectTau selection and SRW composition.
 #
 #   rho              = cosine(q, learned operator embedding)
 #   raw_tau          = learned cosine-space reference
 #   tau              = -1 + 2 * sigmoid(raw_tau)
 #   margin           = rho - tau
-#   angular_depth    = clip(margin / max(1 - tau, 1e-4), 0, 1)
-#   execution_weight = angular_depth, optionally eval-pruned
-#   den              = max(sum(unpruned_admission), 1.0) ** den_power
+#   angular_amplitude = clip(margin / max(1 - tau, 1e-4), 0, 1)
+#   admission_weight  = amplitude or amplitude**2, selected by static mode
+#   execution_weight  = admission_weight, optionally eval-pruned
+#   den                = mode-specific function of unpruned admission mass
 # ================================================================
 
 DEFAULT_D_ROUTE = 64
@@ -277,6 +278,29 @@ MODEL_VERSION = "spatial-r1-v4.1.7.1"
 OPERATOR_KEY_MODE = "learned_operator_embedding"
 OPERATOR_QUERY_MODE = "direct_state_projection"
 DEFAULT_ADMISSION_DEN_POWER = 1.0
+DEFAULT_SRW_COMPOSITION_MODE = "linear_angular"
+SPHERICAL_ENERGY_DEN_EPS = 1.0e-6
+_V4171_SRW_COMPOSITION_MODES = frozenset((
+    DEFAULT_SRW_COMPOSITION_MODE,
+    "spherical_energy",
+))
+
+
+def _validate_v4171_srw_composition_mode(value, *, context="v4171"):
+    """Validate the static Python-side v4171 SRW composition selector."""
+    if isinstance(value, jax.core.Tracer):
+        raise ValueError(
+            f"{context} srw_composition_mode must be a static Python string; "
+            "v4171 does not support a traced or dynamic composition mode")
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{context} srw_composition_mode must be one of "
+            f"{sorted(_V4171_SRW_COMPOSITION_MODES)}, got {value!r}")
+    if value not in _V4171_SRW_COMPOSITION_MODES:
+        raise ValueError(
+            f"{context} unsupported srw_composition_mode={value!r}; "
+            f"expected one of {sorted(_V4171_SRW_COMPOSITION_MODES)}")
+    return value
 
 
 def _validate_v4171_admission_den_power(value, *, context="v4171"):
@@ -301,6 +325,20 @@ def _validate_v4171_admission_den_power(value, *, context="v4171"):
     return value
 
 
+def _validate_v4171_composition_settings(
+        srw_composition_mode, admission_den_power, *, context="v4171"):
+    mode = _validate_v4171_srw_composition_mode(
+        srw_composition_mode, context=context)
+    power = _validate_v4171_admission_den_power(
+        admission_den_power, context=context)
+    if mode == "spherical_energy" and power != 0.5:
+        raise ValueError(
+            f"{context} requires admission_den_power=0.5 when "
+            "srw_composition_mode='spherical_energy', "
+            f"got {power}")
+    return mode, power
+
+
 def _validate_v4171_admission_den_grad_scale(value, *, context="v4171"):
     if isinstance(value, jax.core.Tracer):
         raise ValueError(
@@ -316,17 +354,28 @@ def _validate_v4171_admission_den_grad_scale(value, *, context="v4171"):
     return value
 
 
-def _mark_v4171_srw_factory_output(fn, admission_den_power):
+def _mark_v4171_srw_factory_output(
+        fn, admission_den_power,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
+    srw_composition_mode, admission_den_power = (
+        _validate_v4171_composition_settings(
+            srw_composition_mode, admission_den_power,
+            context="v4171 sharded factory metadata"))
+    fn._v4171_srw_composition_mode = srw_composition_mode
     fn._v4171_admission_den_power = float(admission_den_power)
     fn._v4171_admission_den_grad_scale = 1.0
     return fn
 
 
-def _validate_v4171_sharded_fns(sharded_fns, expected_power):
+def _validate_v4171_sharded_fns(
+        sharded_fns, expected_power,
+        expected_mode=DEFAULT_SRW_COMPOSITION_MODE):
     if sharded_fns is None:
         return
     if not isinstance(sharded_fns, dict):
         raise ValueError("v4171 requires dict-style canonical sharded_fns")
+    expected_mode, expected_power = _validate_v4171_composition_settings(
+        expected_mode, expected_power, context="v4171 model/sharded closure")
     checked = set()
     for name in (
             'single', 'attn_v_single', 'rst_single', 'paired',
@@ -337,6 +386,18 @@ def _validate_v4171_sharded_fns(sharded_fns, expected_power):
         if fn is None or id(fn) in checked:
             continue
         checked.add(id(fn))
+        actual_mode = getattr(fn, '_v4171_srw_composition_mode', None)
+        if actual_mode is None:
+            raise ValueError(
+                f"v4171 sharded function {name!r} is missing canonical "
+                "srw_composition_mode metadata")
+        actual_mode = _validate_v4171_srw_composition_mode(
+            actual_mode, context=f"v4171 sharded_fns[{name!r}]")
+        if actual_mode != expected_mode:
+            raise ValueError(
+                "v4171 model/sharded closure srw_composition_mode mismatch: "
+                f"sharded_fns[{name!r}]={actual_mode!r}, "
+                f"model={expected_mode!r}")
         actual = getattr(fn, '_v4171_admission_den_power', None)
         if actual is None:
             raise ValueError(
@@ -414,11 +475,31 @@ def _pool_operator_keys(pool_params):
     return keys
 
 
-def _composition_den(admission_mass, admission_den_power):
+def _composition_den(
+        admission_mass, admission_den_power,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
     """Live-gradient canonical SRW composition denominator."""
+    # Mode/power compatibility is validated at config, model, and factory
+    # boundaries. Keep this numerical helper trace-safe because the already
+    # validated power is represented as a scalar JAX value in compiled paths.
+    srw_composition_mode = _validate_v4171_srw_composition_mode(
+        srw_composition_mode, context="v4171 composition denominator")
+    admission_mass = jnp.asarray(admission_mass, dtype=jnp.float32)
+    if srw_composition_mode == "spherical_energy":
+        return jnp.sqrt(jnp.maximum(
+            admission_mass,
+            jnp.float32(SPHERICAL_ENERGY_DEN_EPS ** 2)))
     return jnp.power(
-        jnp.maximum(jnp.asarray(admission_mass, dtype=jnp.float32), 1.0),
+        jnp.maximum(admission_mass, 1.0),
         jnp.asarray(admission_den_power, dtype=jnp.float32))
+
+
+def _composition_den_floor_mass(
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
+    mode = _validate_v4171_srw_composition_mode(
+        srw_composition_mode, context="v4171 composition denominator floor")
+    return (SPHERICAL_ENERGY_DEN_EPS ** 2
+            if mode == "spherical_energy" else 1.0)
 
 
 def _pool_params_with_operator_keys(pool_params):
@@ -623,30 +704,38 @@ def _boundary_gate_from_margin(margin, tau, boundary_power=None):
 def _compute_admission_drive(score, tau, boundary_scale,
                              boundary_power=2.0,
                              effective_active_eps=1.0e-6,
-                             execution_prune_eps=0.0):
-    """v4171 canonical linear angular-depth execution.
+                             execution_prune_eps=0.0,
+                             srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
+    """v4171 canonical angular selection and mode-specific composition.
 
     The historical tuple slots are kept for scan compatibility:
-    admission == angular_depth for legacy tuple compatibility,
-    execution_weight == pruned angular_depth.
+    selection margin, unpruned composition admission, linear angular
+    amplitude, pruned composition execution weight, and active mask.
     """
     del boundary_scale, boundary_power, effective_active_eps
+    srw_composition_mode = _validate_v4171_srw_composition_mode(
+        srw_composition_mode, context="v4171 admission drive")
     execution_prune_eps = jnp.asarray(execution_prune_eps, dtype=jnp.float32)
     score = jnp.clip(jnp.asarray(score, dtype=jnp.float32), -1.0, 1.0)
     tau = jnp.asarray(tau, dtype=jnp.float32)
-    margin = score - tau
-    angular_depth_unpruned = _linear_angular_depth_from_margin(margin, tau)
+    selection_margin = score - tau
+    angular_amplitude = _linear_angular_depth_from_margin(
+        selection_margin, tau)
+    admission_weight = (
+        angular_amplitude * angular_amplitude
+        if srw_composition_mode == "spherical_energy"
+        else angular_amplitude)
     execution_weight = jnp.where(
         execution_prune_eps > 0.0,
         jnp.where(
-            angular_depth_unpruned >= execution_prune_eps,
-            angular_depth_unpruned, 0.0),
-        angular_depth_unpruned)
-    active_mask = margin > jnp.float32(0.0)
+            admission_weight >= execution_prune_eps,
+            admission_weight, 0.0),
+        admission_weight)
+    active_mask = selection_margin > jnp.float32(0.0)
     return (
-        margin,
-        angular_depth_unpruned,
-        angular_depth_unpruned,
+        selection_margin,
+        admission_weight,
+        angular_amplitude,
         execution_weight,
         active_mask,
     )
@@ -659,18 +748,20 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                      dead_exposure_target=0.1,
                      soft_gate_effective_active_eps=1.0e-6,
                      admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                     admission_den_grad_scale=1.0):
+                     admission_den_grad_scale=1.0,
+                     srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
     """Create fused shard_map'd angular Select + SRW.
 
     Fast train path: one chunked pass computes rho, tau, gate, and SRW.
     Analysis path may compute rho distribution moments for diagnostics.
 
     v4171 canonical DirectTau execution:
-        rho              = cosine(q, learned operator embedding)
-        margin           = rho - tau
-        gate             = clip(margin / max(1 - tau, 1e-4), 0, 1)
-        execution_weight = gate, optionally eval-pruned
-        den              = max(sum(execution_weight), 1.0)
+        rho               = cosine(q, learned operator embedding)
+        margin            = rho - tau
+        angular_amplitude = clip(margin / max(1 - tau, 1e-4), 0, 1)
+        admission_weight  = mode-specific unpruned composition weight
+        execution_weight  = pruned admission_weight
+        den               = mode-specific unpruned-admission normalization
 
 
     `analysis=False` (default, train path): returns the SLIM tuple plus
@@ -694,11 +785,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _compute_sparsity_mass = True
     _compact_margin_bands = False
     _angular_strong_margin = jnp.float32(0.05)
-    admission_den_power = _validate_v4171_admission_den_power(
-        admission_den_power, context="make_sharded_srw")
+    srw_composition_mode, admission_den_power = (
+        _validate_v4171_composition_settings(
+            srw_composition_mode, admission_den_power,
+            context="make_sharded_srw"))
     _validate_v4171_admission_den_grad_scale(
         admission_den_grad_scale, context="make_sharded_srw")
     _admission_den_power = jnp.float32(admission_den_power)
+    _srw_composition_mode = srw_composition_mode
 
     # SLIM out_specs: train path.
     _slim_out_specs = (
@@ -871,29 +965,34 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             return jnp.square(positive_selection_margin)
 
         def angular_compose_parts(rho, valid_mask):
-            (selection_margin, admission, angular_depth, execution_weight,
+            (selection_margin, admission_weight, angular_amplitude,
+             execution_weight,
              active_mask) = _compute_admission_drive(
                 rho, tau, soft_gate_temperature,
                 boundary_power=soft_gate_boundary_power,
                 effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps)
+                execution_prune_eps=execution_prune_eps,
+                srw_composition_mode=_srw_composition_mode)
             strong_mask = selection_margin > _angular_strong_margin
             selection_margin = jnp.where(valid_mask, selection_margin, 0.0)
-            admission = jnp.where(valid_mask, admission, 0.0)
-            angular_depth = jnp.where(valid_mask, angular_depth, 0.0)
+            admission_weight = jnp.where(
+                valid_mask, admission_weight, 0.0)
+            angular_amplitude = jnp.where(
+                valid_mask, angular_amplitude, 0.0)
             execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
             active_mask = active_mask & valid_mask
             strong_mask = strong_mask & valid_mask
             return (
                 selection_margin,
-                admission,
-                angular_depth,
+                admission_weight,
+                angular_amplitude,
                 execution_weight,
                 active_mask,
                 strong_mask,
             )
 
-        def update_select_diag(carry, rho, selection_margin, positive_margin,
+        def update_select_diag(carry, rho, selection_margin,
+                               angular_amplitude,
                                valid_mask):
             (total_selected, total_selection_margin_sum,
              total_positive_margin_sum, total_positive_margin_max,
@@ -903,7 +1002,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 valid_mask, selection_margin, 0.0).sum()
             selection_margin_max = jnp.where(
                 valid_mask, selection_margin, diag_neg_inf)
-            positive_margin_valid = jnp.where(valid_mask, positive_margin, 0.0)
+            positive_margin_valid = jnp.where(
+                valid_mask, angular_amplitude, 0.0)
             return (
                 total_selected + selected.sum(axis=-1, keepdims=True),
                 total_selection_margin_sum + selection_margin_sum,
@@ -1169,25 +1269,27 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 rho_raw, rho_exposure = operator_relation(op_key)
                 rho = jnp.where(valid_bsn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsn, rho_raw, tau)
-                (selection_margin, admission, drive, execution_weight,
+                (selection_margin, admission_weight, angular_amplitude,
+                 execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(
                     rho_compute, valid_bsn)
                 select_diag_carry = update_select_diag(
-                    select_diag_carry, rho, selection_margin, admission,
+                    select_diag_carry, rho, selection_margin,
+                    angular_amplitude,
                     valid_bsn)
                 chunk_edge_margin_stat = edge_margin_stat_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
                 chunk_current_cost = (
-                    drive.sum(axis=-1, keepdims=True)
+                    angular_amplitude.sum(axis=-1, keepdims=True)
                     / jnp.maximum(valid_count, 1.0))
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission, execution_weight,
+                        selection_margin, admission_weight, execution_weight,
                         valid_bsn)
                 else:
                     chunk_sparsity = sparsity_carry0
-                chunk_int_max = drive.max()
+                chunk_int_max = angular_amplitude.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
@@ -1196,7 +1298,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
                 chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
-                chunk_den_cost = admission.sum(axis=-1, keepdims=True)
+                chunk_den_cost = admission_weight.sum(
+                    axis=-1, keepdims=True)
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_margin_band = jnp.zeros((B, S, 1), dtype=jnp.float32)
@@ -1209,7 +1312,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  chunk_exposure_sum, chunk_exposure_min,
                  chunk_exposure_max, chunk_weak_exposure_count,
                  chunk_soft_dead_1e4_count) = (
-                    soft_gate_exposure_parts(admission, valid_chunk))
+                    soft_gate_exposure_parts(admission_weight, valid_chunk))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
@@ -1281,25 +1384,27 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 rho_raw, rho_exposure = operator_relation(op_key)
                 rho = jnp.where(valid_bsn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsn, rho_raw, tau)
-                (selection_margin, admission, drive, execution_weight,
+                (selection_margin, admission_weight, angular_amplitude,
+                 execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(
                     rho_compute, valid_bsn)
                 select_diag_carry = update_select_diag(
-                    select_diag_carry, rho, selection_margin, admission,
+                    select_diag_carry, rho, selection_margin,
+                    angular_amplitude,
                     valid_bsn)
                 chunk_edge_margin_stat = edge_margin_stat_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
                 chunk_current_cost = (
-                    drive.sum(axis=-1, keepdims=True)
+                    angular_amplitude.sum(axis=-1, keepdims=True)
                     / jnp.maximum(valid_count, 1.0))
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission, execution_weight,
+                        selection_margin, admission_weight, execution_weight,
                         valid_bsn)
                 else:
                     chunk_sparsity = sparsity_carry0
-                chunk_int_max = drive.max()
+                chunk_int_max = angular_amplitude.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
@@ -1308,14 +1413,15 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
                 chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
-                chunk_den_cost = admission.sum(axis=-1, keepdims=True)
+                chunk_den_cost = admission_weight.sum(
+                    axis=-1, keepdims=True)
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 (chunk_dead_penalty, chunk_dead_count,
                  chunk_exposure_sum, chunk_exposure_min,
                  chunk_exposure_max, chunk_weak_exposure_count,
                  chunk_soft_dead_1e4_count) = (
-                    soft_gate_exposure_parts(admission, valid_chunk))
+                    soft_gate_exposure_parts(admission_weight, valid_chunk))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
@@ -1375,7 +1481,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             / jnp.float32(B * S * N_total))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         composition_den = _composition_den(
-            global_den_cost, _admission_den_power)
+            global_den_cost, _admission_den_power,
+            _srw_composition_mode)
         out = raw_out / composition_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
@@ -1529,7 +1636,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                )
 
     return _mark_v4171_srw_factory_output(
-        fused_gate_srw, admission_den_power)
+        fused_gate_srw, admission_den_power, _srw_composition_mode)
 
 
 def make_sharded_srw_paired(mesh, max_chunk_size=2048,
@@ -1537,7 +1644,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             dead_exposure_target=0.1,
                             soft_gate_effective_active_eps=1.0e-6,
                             admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                            admission_den_grad_scale=1.0):
+                            admission_den_grad_scale=1.0,
+                            srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
@@ -1564,11 +1672,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _compute_sparsity_mass = True
     _compact_margin_bands = False
     _angular_strong_margin = jnp.float32(0.05)
-    admission_den_power = _validate_v4171_admission_den_power(
-        admission_den_power, context="make_sharded_srw_paired")
+    srw_composition_mode, admission_den_power = (
+        _validate_v4171_composition_settings(
+            srw_composition_mode, admission_den_power,
+            context="make_sharded_srw_paired"))
     _validate_v4171_admission_den_grad_scale(
         admission_den_grad_scale, context="make_sharded_srw_paired")
     _admission_den_power = jnp.float32(admission_den_power)
+    _srw_composition_mode = srw_composition_mode
 
     _slim_out_specs = (
         P('data', None, None, None),  # out [B,S,2,D]
@@ -1752,29 +1863,34 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             return jnp.square(positive_selection_margin)
 
         def angular_compose_parts(rho, valid_mask):
-            (selection_margin, admission, angular_depth, execution_weight,
+            (selection_margin, admission_weight, angular_amplitude,
+             execution_weight,
              active_mask) = _compute_admission_drive(
                 rho, tau, soft_gate_temperature,
                 boundary_power=soft_gate_boundary_power,
                 effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps)
+                execution_prune_eps=execution_prune_eps,
+                srw_composition_mode=_srw_composition_mode)
             strong_mask = selection_margin > _angular_strong_margin
             selection_margin = jnp.where(valid_mask, selection_margin, 0.0)
-            admission = jnp.where(valid_mask, admission, 0.0)
-            angular_depth = jnp.where(valid_mask, angular_depth, 0.0)
+            admission_weight = jnp.where(
+                valid_mask, admission_weight, 0.0)
+            angular_amplitude = jnp.where(
+                valid_mask, angular_amplitude, 0.0)
             execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
             active_mask = active_mask & valid_mask
             strong_mask = strong_mask & valid_mask
             return (
                 selection_margin,
-                admission,
-                angular_depth,
+                admission_weight,
+                angular_amplitude,
                 execution_weight,
                 active_mask,
                 strong_mask,
             )
 
-        def update_select_diag(carry, rho, selection_margin, positive_margin,
+        def update_select_diag(carry, rho, selection_margin,
+                               angular_amplitude,
                                valid_mask):
             (total_selected, total_selection_margin_sum,
              total_positive_margin_sum, total_positive_margin_max,
@@ -1784,7 +1900,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 valid_mask, selection_margin, 0.0).sum()
             selection_margin_max = jnp.where(
                 valid_mask, selection_margin, diag_neg_inf)
-            positive_margin_valid = jnp.where(valid_mask, positive_margin, 0.0)
+            positive_margin_valid = jnp.where(
+                valid_mask, angular_amplitude, 0.0)
             return (
                 total_selected + selected.sum(axis=-1, keepdims=True),
                 total_selection_margin_sum + selection_margin_sum,
@@ -2052,25 +2169,27 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 rho_raw, rho_exposure = operator_relation(op_key)
                 rho = jnp.where(valid_bsrn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
-                (selection_margin, admission, drive, execution_weight,
+                (selection_margin, admission_weight, angular_amplitude,
+                 execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(
                     rho_compute, valid_bsrn)
                 select_diag_carry = update_select_diag(
-                    select_diag_carry, rho, selection_margin, admission,
+                    select_diag_carry, rho, selection_margin,
+                    angular_amplitude,
                     valid_bsrn)
                 chunk_edge_margin_stat = edge_margin_stat_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
                 chunk_current_cost = (
-                    drive.sum(axis=-1, keepdims=True)
+                    angular_amplitude.sum(axis=-1, keepdims=True)
                     / jnp.maximum(valid_count, 1.0))
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission, execution_weight,
+                        selection_margin, admission_weight, execution_weight,
                         valid_bsrn)
                 else:
                     chunk_sparsity = sparsity_carry0
-                chunk_int_max = drive.max()
+                chunk_int_max = angular_amplitude.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T  # [B,S,N]
                 xr_f = xr.astype(jnp.float32)
@@ -2079,7 +2198,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
                 chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
-                chunk_den_cost = admission.sum(axis=-1, keepdims=True)
+                chunk_den_cost = admission_weight.sum(
+                    axis=-1, keepdims=True)
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_margin_band = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
@@ -2092,7 +2212,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  chunk_exposure_sum, chunk_exposure_min,
                  chunk_exposure_max, chunk_weak_exposure_count,
                  chunk_soft_dead_1e4_count) = (
-                    soft_gate_exposure_parts(admission, valid_chunk))
+                    soft_gate_exposure_parts(admission_weight, valid_chunk))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
@@ -2165,25 +2285,27 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 rho_raw, rho_exposure = operator_relation(op_key)
                 rho = jnp.where(valid_bsrn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
-                (selection_margin, admission, drive, execution_weight,
+                (selection_margin, admission_weight, angular_amplitude,
+                 execution_weight,
                  active_mask, strong_mask) = angular_compose_parts(
                     rho_compute, valid_bsrn)
                 select_diag_carry = update_select_diag(
-                    select_diag_carry, rho, selection_margin, admission,
+                    select_diag_carry, rho, selection_margin,
+                    angular_amplitude,
                     valid_bsrn)
                 chunk_edge_margin_stat = edge_margin_stat_terms(rho).sum()
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
                 chunk_current_cost = (
-                    drive.sum(axis=-1, keepdims=True)
+                    angular_amplitude.sum(axis=-1, keepdims=True)
                     / jnp.maximum(valid_count, 1.0))
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission, execution_weight,
+                        selection_margin, admission_weight, execution_weight,
                         valid_bsrn)
                 else:
                     chunk_sparsity = sparsity_carry0
-                chunk_int_max = drive.max()
+                chunk_int_max = angular_amplitude.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
@@ -2192,14 +2314,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
                 chunk_gate_sq = jnp.square(execution_weight).sum(
                     axis=-1, keepdims=True)
-                chunk_den_cost = admission.sum(axis=-1, keepdims=True)
+                chunk_den_cost = admission_weight.sum(
+                    axis=-1, keepdims=True)
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 (chunk_dead_penalty, chunk_dead_count,
                  chunk_exposure_sum, chunk_exposure_min,
                  chunk_exposure_max, chunk_weak_exposure_count,
                  chunk_soft_dead_1e4_count) = (
-                    soft_gate_exposure_parts(admission, valid_chunk))
+                    soft_gate_exposure_parts(admission_weight, valid_chunk))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
@@ -2260,7 +2383,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             / jnp.float32(B * S * 2 * N_total))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         composition_den = _composition_den(
-            global_den_cost, _admission_den_power)
+            global_den_cost, _admission_den_power,
+            _srw_composition_mode)
         out = raw_out / composition_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
@@ -2426,20 +2550,26 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                )
 
     return _mark_v4171_srw_factory_output(
-        fused_gate_srw_paired, admission_den_power)
+        fused_gate_srw_paired, admission_den_power, _srw_composition_mode)
 
 
 def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
                              dead_exposure_target=0.1,
                              soft_gate_effective_active_eps=1.0e-6,
                              admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                             admission_den_grad_scale=1.0):
+                             admission_den_grad_scale=1.0,
+                             srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
     """Create a shard_map'd single-route SRW kernel plus active scalars."""
-    admission_den_power = _validate_v4171_admission_den_power(
-        admission_den_power, context="make_sharded_srw_minimal")
+    srw_composition_mode, admission_den_power = (
+        _validate_v4171_composition_settings(
+            srw_composition_mode, admission_den_power,
+            context="make_sharded_srw_minimal"))
     _validate_v4171_admission_den_grad_scale(
         admission_den_grad_scale, context="make_sharded_srw_minimal")
     _admission_den_power = jnp.float32(admission_den_power)
+    _srw_composition_mode = srw_composition_mode
+    _composition_floor_mass = jnp.float32(
+        _composition_den_floor_mass(_srw_composition_mode))
     del dead_exposure_target
     _soft_gate_effective_active_eps = jnp.float32(
         soft_gate_effective_active_eps)
@@ -2504,30 +2634,35 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
             return ec, rc, wc, vc
 
         def angular_compose_parts(rho, valid_mask):
-            margin, admission, _drive, execution_weight, _ = _compute_admission_drive(
+            (margin, admission, angular_amplitude, execution_weight,
+             _) = _compute_admission_drive(
                 rho, tau, soft_gate_temperature,
                 boundary_power=soft_gate_boundary_power,
                 effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps)
+                execution_prune_eps=execution_prune_eps,
+                srw_composition_mode=_srw_composition_mode)
             admission = jnp.where(valid_mask, admission, 0.0)
+            angular_amplitude = jnp.where(
+                valid_mask, angular_amplitude, 0.0)
             execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
             active_count = (
                 ((margin > jnp.float32(0.0)) & valid_mask)
                 .astype(jnp.float32)
                 .sum(axis=-1, keepdims=True))
-            return admission, execution_weight, active_count
+            return admission, angular_amplitude, execution_weight, active_count
 
         @jax.checkpoint
         def gate_srw_step(carry, i):
             (raw_out, total_gate_mass, total_gate_sq,
-             total_gate_max, total_active_count) = carry
+             total_gate_max, total_active_count,
+             total_angular_amplitude) = carry
             s = i * cs
             op_key, rc, wc, valid_chunk = op_key_rw_chunk(s)
             valid_bsn = valid_chunk[None, None, :]
             rho_raw = operator_relation(op_key)
             rho_compute = jnp.where(valid_bsn, rho_raw, tau)
-            admission, execution_weight, chunk_active_count = angular_compose_parts(
-                rho_compute, valid_bsn)
+            (admission, angular_amplitude, execution_weight,
+             chunk_active_count) = angular_compose_parts(rho_compute, valid_bsn)
             xr = x_bf @ rc.T
             a = execution_weight * xr.astype(jnp.float32)
             c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
@@ -2539,12 +2674,16 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
                     total_gate_mass + chunk_gate_mass,
                     total_gate_sq + chunk_gate_sq,
                     jnp.maximum(total_gate_max, chunk_gate_max),
-                    total_active_count + chunk_active_count), None
+                    total_active_count + chunk_active_count,
+                    total_angular_amplitude + angular_amplitude.sum(
+                        axis=-1, keepdims=True)), None
 
         (raw_out, total_gate_mass, total_gate_sq,
-         total_gate_max, total_active_count), _ = jax.lax.scan(
+         total_gate_max, total_active_count,
+         total_angular_amplitude), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, D), dtype=jnp.float32),
+             jnp.zeros((B, S, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 1), dtype=jnp.float32),
@@ -2557,17 +2696,21 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
             jax.lax.stop_gradient(total_gate_max), 'model')
         global_active_count = jax.lax.stop_gradient(
             jax.lax.psum(total_active_count, 'model'))
+        global_angular_amplitude = jax.lax.stop_gradient(
+            jax.lax.psum(total_angular_amplitude, 'model'))
         global_operator_count = jax.lax.stop_gradient(
             jax.lax.psum(
                 valid_padded.astype(jnp.float32).sum(), 'model'))
-        gate_den = _composition_den(global_gate_mass, _admission_den_power)
+        gate_den = _composition_den(
+            global_gate_mass, _admission_den_power,
+            _srw_composition_mode)
         active_n_mean = global_active_count.mean()
         active_frac = active_n_mean / jnp.maximum(global_operator_count, 1.0)
         gate_mass_mean = global_gate_mass.mean()
         gate_den_mean = gate_den.mean()
         depth_active_mean = jnp.where(
             global_active_count > 0.0,
-            global_gate_mass / jnp.maximum(global_active_count, 1.0),
+            global_angular_amplitude / jnp.maximum(global_active_count, 1.0),
             0.0).mean()
         gate_eff_n_mean = jnp.where(
             global_gate_mass > 0.0,
@@ -2577,7 +2720,11 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
             global_gate_mass > 0.0,
             global_gate_max / jnp.maximum(global_gate_mass, 1.0e-8),
             0.0).mean()
-        den_floor_frac = (global_gate_mass < 1.0).astype(jnp.float32).mean()
+        den_floor_frac = (
+            (global_gate_mass <= _composition_floor_mass)
+            if _srw_composition_mode == "spherical_energy"
+            else (global_gate_mass < _composition_floor_mass)
+        ).astype(jnp.float32).mean()
         tau_mean = jax.lax.stop_gradient(tau).mean()
         out = raw_out / gate_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
@@ -2610,20 +2757,26 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
         )
 
     return _mark_v4171_srw_factory_output(
-        fused_gate_srw_minimal, admission_den_power)
+        fused_gate_srw_minimal, admission_den_power, _srw_composition_mode)
 
 
 def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
                                     dead_exposure_target=0.1,
                                     soft_gate_effective_active_eps=1.0e-6,
                                     admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                                    admission_den_grad_scale=1.0):
+                                    admission_den_grad_scale=1.0,
+                                    srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
     """Create a shard_map'd Q/K SRW kernel plus per-route active scalars."""
-    admission_den_power = _validate_v4171_admission_den_power(
-        admission_den_power, context="make_sharded_srw_paired_minimal")
+    srw_composition_mode, admission_den_power = (
+        _validate_v4171_composition_settings(
+            srw_composition_mode, admission_den_power,
+            context="make_sharded_srw_paired_minimal"))
     _validate_v4171_admission_den_grad_scale(
         admission_den_grad_scale, context="make_sharded_srw_paired_minimal")
     _admission_den_power = jnp.float32(admission_den_power)
+    _srw_composition_mode = srw_composition_mode
+    _composition_floor_mass = jnp.float32(
+        _composition_den_floor_mass(_srw_composition_mode))
     del dead_exposure_target
     _soft_gate_effective_active_eps = jnp.float32(
         soft_gate_effective_active_eps)
@@ -2698,29 +2851,35 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
             return ec, rc, wc, vc
 
         def angular_compose_parts(rho, valid_mask):
-            margin, admission, _drive, execution_weight, _ = _compute_admission_drive(
+            (margin, admission, angular_amplitude, execution_weight,
+             _) = _compute_admission_drive(
                 rho, tau, soft_gate_temperature,
                 boundary_power=soft_gate_boundary_power,
                 effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps)
+                execution_prune_eps=execution_prune_eps,
+                srw_composition_mode=_srw_composition_mode)
             admission = jnp.where(valid_mask, admission, 0.0)
+            angular_amplitude = jnp.where(
+                valid_mask, angular_amplitude, 0.0)
             execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
             active_count = (
                 ((margin > jnp.float32(0.0)) & valid_mask)
                 .astype(jnp.float32)
                 .sum(axis=-1, keepdims=True))
-            return admission, execution_weight, active_count
+            return admission, angular_amplitude, execution_weight, active_count
 
         @jax.checkpoint
         def gate_srw_step(carry, i):
             (raw_out, total_gate_mass, total_gate_sq,
-             total_gate_max, total_active_count) = carry
+             total_gate_max, total_active_count,
+             total_angular_amplitude) = carry
             s = i * cs
             op_key, rc, wc, valid_chunk = op_key_rw_chunk(s)
             valid_bsrn = valid_chunk[None, None, None, :]
             rho_raw = operator_relation(op_key)
             rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
-            admission, execution_weight, chunk_active_count = angular_compose_parts(
+            (admission, angular_amplitude, execution_weight,
+             chunk_active_count) = angular_compose_parts(
                 rho_compute, valid_bsrn)
             xr = x_bf @ rc.T
             a = execution_weight * xr.astype(jnp.float32)[:, :, None, :]
@@ -2736,12 +2895,16 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
                     total_gate_mass + chunk_gate_mass,
                     total_gate_sq + chunk_gate_sq,
                     jnp.maximum(total_gate_max, chunk_gate_max),
-                    total_active_count + chunk_active_count), None
+                    total_active_count + chunk_active_count,
+                    total_angular_amplitude + angular_amplitude.sum(
+                        axis=-1, keepdims=True)), None
 
         (raw_out, total_gate_mass, total_gate_sq,
-         total_gate_max, total_active_count), _ = jax.lax.scan(
+         total_gate_max, total_active_count,
+         total_angular_amplitude), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
+             jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
@@ -2754,6 +2917,8 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
             jax.lax.stop_gradient(total_gate_max), 'model')
         global_active_count = jax.lax.stop_gradient(
             jax.lax.psum(total_active_count, 'model'))
+        global_angular_amplitude = jax.lax.stop_gradient(
+            jax.lax.psum(total_angular_amplitude, 'model'))
         global_operator_count = jax.lax.stop_gradient(
             jax.lax.psum(
                 valid_padded.astype(jnp.float32).sum(), 'model'))
@@ -2761,10 +2926,12 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
         def route_mean(value, route_index):
             return value[:, :, route_index, :].mean()
 
-        gate_den = _composition_den(global_gate_mass, _admission_den_power)
+        gate_den = _composition_den(
+            global_gate_mass, _admission_den_power,
+            _srw_composition_mode)
         depth_active = jnp.where(
             global_active_count > 0.0,
-            global_gate_mass / jnp.maximum(global_active_count, 1.0),
+            global_angular_amplitude / jnp.maximum(global_active_count, 1.0),
             0.0)
         gate_eff_n = jnp.where(
             global_gate_mass > 0.0,
@@ -2774,7 +2941,11 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
             global_gate_mass > 0.0,
             global_gate_max / jnp.maximum(global_gate_mass, 1.0e-8),
             0.0)
-        den_floor = (global_gate_mass < 1.0).astype(jnp.float32)
+        den_floor = (
+            (global_gate_mass <= _composition_floor_mass)
+            if _srw_composition_mode == "spherical_energy"
+            else (global_gate_mass < _composition_floor_mass)
+        ).astype(jnp.float32)
         q_active_n_mean = route_mean(global_active_count, 0)
         k_active_n_mean = route_mean(global_active_count, 1)
         q_active_frac = q_active_n_mean / jnp.maximum(global_operator_count, 1.0)
@@ -2844,7 +3015,8 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
         )
 
     return _mark_v4171_srw_factory_output(
-        fused_gate_srw_paired_minimal, admission_den_power)
+        fused_gate_srw_paired_minimal, admission_den_power,
+        _srw_composition_mode)
 
 
 # ================================================================
@@ -3814,6 +3986,7 @@ class DAWN_SRW_V4171(nn.Module):
 
     d_route: int = DEFAULT_D_ROUTE
     admission_den_power: float = DEFAULT_ADMISSION_DEN_POWER
+    srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE
     n_qk: int = 1580
     n_v: int = 2600
     n_rst: Optional[int] = None
@@ -3850,8 +4023,10 @@ class DAWN_SRW_V4171(nn.Module):
         return logical, embedding
 
     def setup(self):
-        _validate_v4171_admission_den_power(
-            self.admission_den_power, context="DAWN_SRW_V4171 constructor")
+        _validate_v4171_composition_settings(
+            self.srw_composition_mode,
+            self.admission_den_power,
+            context="DAWN_SRW_V4171 constructor")
         if int(self.d_route) <= 0:
             raise ValueError(
                 f"v4171 model.d_route must be > 0, got {self.d_route}")
@@ -3895,6 +4070,7 @@ class DAWN_SRW_V4171(nn.Module):
                  soft_gate_boundary_power=2.0,
                  soft_gate_boundary_power_final=4.0,
                  admission_den_power=None,
+                 srw_composition_mode=None,
                  execution_prune_eps=0.0,
                  minimal_train=False,
                  ce_token_chunk_size=32768,
@@ -3906,19 +4082,31 @@ class DAWN_SRW_V4171(nn.Module):
         such as distribution shape, selection diagnostics, entropy, tau stats,
         raw norms, and output-stability norms.
         """
-        model_admission_den_power = _validate_v4171_admission_den_power(
-            self.admission_den_power, context="DAWN_SRW_V4171 constructor")
-        runtime_admission_den_power = _validate_v4171_admission_den_power(
-            model_admission_den_power
-            if admission_den_power is None else admission_den_power,
-            context="DAWN_SRW_V4171 forward")
+        model_srw_composition_mode, model_admission_den_power = (
+            _validate_v4171_composition_settings(
+                self.srw_composition_mode,
+                self.admission_den_power,
+                context="DAWN_SRW_V4171 constructor"))
+        runtime_srw_composition_mode, runtime_admission_den_power = (
+            _validate_v4171_composition_settings(
+                model_srw_composition_mode
+                if srw_composition_mode is None else srw_composition_mode,
+                (model_admission_den_power
+                 if admission_den_power is None else admission_den_power),
+                context="DAWN_SRW_V4171 forward"))
+        if runtime_srw_composition_mode != model_srw_composition_mode:
+            raise ValueError(
+                "v4171 constructor/forward srw_composition_mode mismatch: "
+                f"model={model_srw_composition_mode!r}, "
+                f"runtime={runtime_srw_composition_mode!r}")
         if runtime_admission_den_power != model_admission_den_power:
             raise ValueError(
                 "v4171 constructor/forward admission_den_power mismatch: "
                 f"model={model_admission_den_power}, "
                 f"runtime={runtime_admission_den_power}")
         _validate_v4171_sharded_fns(
-            sharded_fns, model_admission_den_power)
+            sharded_fns, model_admission_den_power,
+            model_srw_composition_mode)
         admission_den_power = model_admission_den_power
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
@@ -5531,6 +5719,7 @@ class DAWN_SRW_V4171(nn.Module):
             'operator_key_mode': OPERATOR_KEY_MODE,
             'operator_query_mode': OPERATOR_QUERY_MODE,
             'admission_den_power': self.admission_den_power,
+            'srw_composition_mode': self.srw_composition_mode,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
         }
@@ -5542,6 +5731,30 @@ class DAWN_SRW_V4171(nn.Module):
         logical_vocab_size, embedding_vocab_size = self._vocab_sizes()
         qk_scale, v_scale, rst_scale = _pool_output_scales(
             self.d_model, self.n_layers)
+        mode, admission_den_power = _validate_v4171_composition_settings(
+            self.srw_composition_mode,
+            self.admission_den_power,
+            context="DAWN_SRW_V4171 model info")
+        composition_info = (
+            [
+                f"  mode={mode}",
+                "  angular_amplitude=linear_cap_depth",
+                "  admission_weight=amplitude^2",
+                "  total_energy=sum(unpruned_admission)",
+                "  den=sqrt(max(total_energy,1e-12))",
+                "  numerator=pruned_execution_energy",
+                "  live_den_gradient=true",
+            ]
+            if mode == "spherical_energy"
+            else [
+                f"  mode={mode}",
+                "  angular_amplitude=linear_cap_depth",
+                "  admission_weight=amplitude",
+                ("  den=max(sum(unpruned_admission),1)^"
+                 "admission_den_power"),
+                "  numerator=pruned_execution_weight",
+                "  live_den_gradient=true",
+            ])
         return [
             f"DAWN-SRW {self.__version__}",
             f"  d_model={self.d_model}, d_route={self.d_route}, "
@@ -5558,11 +5771,8 @@ class DAWN_SRW_V4171(nn.Module):
             "Execution:",
             "  full rank-1 read/write operator",
             "Composition:",
-            f"  admission_den_power={self.admission_den_power:g}",
-            "  den=max(sum(unpruned_admission),1)^admission_den_power",
-            "  numerator=execution_weight",
-            "  denominator_mass=unpruned_admission",
-            "  live_den_gradient=true",
+            *composition_info,
+            f"  admission_den_power={admission_den_power:g}",
             "  runtime_source=model.admission_den_power",
             "  Pool scales: fixed depth-scaled "
             f"(qk={float(qk_scale):.6g}, v={float(v_scale):.6g}, "
@@ -5608,15 +5818,19 @@ def _angular_execution_kwargs_from_model_cfg(model_cfg):
         raise ValueError(
             "v4171 checkpoint full_config.model is missing "
             "admission_den_power")
-    admission_den_power = _validate_v4171_admission_den_power(
-        model_cfg['admission_den_power'],
-        context="v4171 inference model config")
+    srw_composition_mode, admission_den_power = (
+        _validate_v4171_composition_settings(
+            model_cfg.get(
+                'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
+            model_cfg['admission_den_power'],
+            context="v4171 inference model config"))
     return {
         'soft_gate_temperature': float(
             model_cfg.get('soft_gate_temperature', 0.07)),
         'soft_gate_boundary_power': float(
             model_cfg.get('soft_gate_boundary_power', 4.0)),
         'admission_den_power': admission_den_power,
+        'srw_composition_mode': srw_composition_mode,
         'execution_prune_eps': float(model_cfg.get('execution_prune_eps', 0.0)),
         'soft_gate_effective_active_eps': float(
             model_cfg.get('soft_gate_effective_active_eps', 1.0e-6)),
@@ -5757,28 +5971,32 @@ def _angular_execution(h, op_key, raw_tau, raw_scan_offset=None,
                      soft_gate_temperature=0.07,
                      soft_gate_boundary_power=4.0,
                      execution_prune_eps=0.0,
-                     soft_gate_effective_active_eps=1.0e-6):
+                     soft_gate_effective_active_eps=1.0e-6,
+                     srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
     rho = _angular_relation(h, op_key)
     tau = _tau_from_param(raw_tau)
     return _compute_admission_drive(
         rho, tau, soft_gate_temperature,
         boundary_power=soft_gate_boundary_power,
         effective_active_eps=soft_gate_effective_active_eps,
-        execution_prune_eps=execution_prune_eps)
+        execution_prune_eps=execution_prune_eps,
+        srw_composition_mode=srw_composition_mode)
 
 
 def _angular_execution_weight(h, op_key, raw_tau, raw_scan_offset=None,
                   soft_gate_temperature=0.07,
                   soft_gate_boundary_power=4.0,
                   execution_prune_eps=0.0,
-                  soft_gate_effective_active_eps=1.0e-6):
+                  soft_gate_effective_active_eps=1.0e-6,
+                  srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
     """Canonical v4166 execution_weight for non-sharded inference helpers."""
     _, _, _, execution_weight, _ = _angular_execution(
         h, op_key, raw_tau, raw_scan_offset,
         soft_gate_temperature=soft_gate_temperature,
         soft_gate_boundary_power=soft_gate_boundary_power,
         execution_prune_eps=execution_prune_eps,
-        soft_gate_effective_active_eps=soft_gate_effective_active_eps)
+        soft_gate_effective_active_eps=soft_gate_effective_active_eps,
+        srw_composition_mode=srw_composition_mode)
     return execution_weight.astype(jnp.float32)
 
 
@@ -5804,7 +6022,9 @@ def _srw_inference(x, h, op_key, raw_tau, raw_scan_offset, w_read, w_write,
     a = execution_weight * xr
     raw_out = a @ w_n
     composition_den = _composition_den(
-        admission.sum(axis=-1, keepdims=True), admission_den_power)
+        admission.sum(axis=-1, keepdims=True), admission_den_power,
+        execution_kwargs.get(
+            'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE))
     out = raw_out.astype(jnp.float32) / composition_den
     return out.astype(jnp.float32)
 
@@ -5820,7 +6040,9 @@ def _srw_inference_with_gates(x, h, op_key, raw_tau, raw_scan_offset, w_read,
     _, admission, _, execution_weight, _ = _angular_execution(
         h, op_key, raw_tau, raw_scan_offset, **execution_kwargs)
     composition_den = _composition_den(
-        admission.sum(axis=-1, keepdims=True), admission_den_power)
+        admission.sum(axis=-1, keepdims=True), admission_den_power,
+        execution_kwargs.get(
+            'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE))
     execution_weight_norm = execution_weight / jnp.maximum(
         composition_den, 1e-8)
 
@@ -6407,7 +6629,9 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         a = execution_weight * xr
         out = a @ w_n
         composition_den = _composition_den(
-            admission.sum(axis=-1, keepdims=True), admission_den_power)
+            admission.sum(axis=-1, keepdims=True), admission_den_power,
+            execution_kwargs.get(
+                'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE))
         return (out.astype(jnp.float32) / composition_den).astype(jnp.float32)
 
     def forward_fn(input_ids):

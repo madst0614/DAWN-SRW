@@ -106,8 +106,11 @@ from models.dawn_srw_v4170 import (
 )
 from models.dawn_srw_v4171 import (
     DAWN_SRW_V4171,
+    DEFAULT_SRW_COMPOSITION_MODE,
     _validate_v4171_admission_den_power,
     _validate_v4171_admission_den_grad_scale,
+    _validate_v4171_composition_settings,
+    _validate_v4171_srw_composition_mode,
     _validate_v4171_sharded_fns,
     _pool_operator_keys as _v4171_pool_operator_keys,
     _query_geometry_diagnostics as _v4171_query_geometry_diagnostics,
@@ -1267,6 +1270,22 @@ def _validate_v4171_resume_compatibility(
             "model.admission_den_power "
             f"requested={requested_den_power}, checkpoint={checkpoint_den_power}. "
             "Automatic migration/fallback is disabled.")
+    requested_composition_mode = _validate_v4171_srw_composition_mode(
+        requested_model_cfg.get(
+            'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
+        context="v4171 requested full_config.model")
+    checkpoint_composition_mode = _validate_v4171_srw_composition_mode(
+        checkpoint_model_cfg.get(
+            'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
+        context="v4171 checkpoint full_config.model")
+    if requested_composition_mode != checkpoint_composition_mode:
+        raise RuntimeError(
+            "v4171 checkpoint model schema mismatch: "
+            "model.srw_composition_mode "
+            f"requested={requested_composition_mode!r}, "
+            f"checkpoint={checkpoint_composition_mode!r}. Automatic "
+            "resume-time composition changes are disabled; use params-only "
+            "initialization to change composition mode.")
     required = ('d_route', 'operator_key_mode', 'operator_query_mode')
     for field in required:
         requested = requested_model_cfg.get(field)
@@ -1294,18 +1313,38 @@ def _v4171_checkpoint_den_power(model_cfg, *, missing_message, context):
 
 def _v4171_static_runtime_den_power(model, value, *, context,
                                     sharded_fns=None):
-    runtime_value = _validate_v4171_admission_den_power(
-        value, context=context)
-    model_value = _validate_v4171_admission_den_power(
+    model_mode, model_value = _validate_v4171_composition_settings(
+        getattr(
+            model, 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
         getattr(model, 'admission_den_power', None),
-        context="v4171 model constructor",
-    )
+        context="v4171 model constructor")
+    _, runtime_value = _validate_v4171_composition_settings(
+        model_mode, value, context=context)
     if runtime_value != model_value:
         raise ValueError(
             f"{context} admission_den_power={runtime_value} does not match "
             f"v4171 model constructor admission_den_power={model_value}")
-    _validate_v4171_sharded_fns(sharded_fns, model_value)
+    _validate_v4171_sharded_fns(sharded_fns, model_value, model_mode)
     return runtime_value
+
+
+def _v4171_static_runtime_composition_mode(
+        model, value=None, *, context, sharded_fns=None):
+    model_mode, model_power = _validate_v4171_composition_settings(
+        getattr(
+            model, 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
+        getattr(model, 'admission_den_power', None),
+        context="v4171 model constructor")
+    runtime_mode = _validate_v4171_srw_composition_mode(
+        model_mode if value is None else value, context=context)
+    if runtime_mode != model_mode:
+        raise ValueError(
+            f"{context} srw_composition_mode={runtime_mode!r} does not match "
+            "v4171 model constructor "
+            f"srw_composition_mode={model_mode!r}")
+    _validate_v4171_sharded_fns(
+        sharded_fns, model_power, model_mode)
+    return runtime_mode
 
 
 def _require_resume_materialized_fields(full_config):
@@ -2527,8 +2566,12 @@ def _validate_v4171_model_config(model_cfg):
         raise ValueError(
             "v4171 learned operator embeddings do not accept obsolete model "
             "fields: " + ", ".join(obsolete))
-    den_power_value = _validate_v4171_admission_den_power(
-        den_power, context="v4171 model config")
+    composition_mode, den_power_value = (
+        _validate_v4171_composition_settings(
+            model_cfg.get(
+                'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
+            den_power,
+            context="v4171 model config"))
     mode = model_cfg.get(
         'operator_key_mode', 'learned_operator_embedding')
     if mode != 'learned_operator_embedding':
@@ -2544,6 +2587,7 @@ def _validate_v4171_model_config(model_cfg):
     model_cfg['operator_key_mode'] = mode
     model_cfg['operator_query_mode'] = query_mode
     model_cfg['admission_den_power'] = den_power_value
+    model_cfg['srw_composition_mode'] = composition_mode
 
 
 def _tau_lr_mult_for_model(training_cfg, model_version):
@@ -2729,6 +2773,7 @@ def _dawn_srw_kwargs(cfg):
     if str(version) == V4171_MODEL_VERSION:
         kw.update({
             'admission_den_power': m['admission_den_power'],
+            'srw_composition_mode': m['srw_composition_mode'],
         })
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
@@ -2766,6 +2811,7 @@ def _v4164_sharded_kwargs(cfg):
             soft_gate_effective_active_eps=1.0e-6,
             admission_den_power=float(cfg['model']['admission_den_power']),
             admission_den_grad_scale=1.0,
+            srw_composition_mode=cfg['model']['srw_composition_mode'],
         )
     if version in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS:
         return dict(
@@ -4590,6 +4636,16 @@ def _model_accepts_admission_den_power(model):
         return False
 
 
+def _model_accepts_srw_composition_mode(model):
+    """Return True if model.__call__ accepts static composition metadata."""
+    import inspect as _inspect
+    try:
+        return 'srw_composition_mode' in _inspect.signature(
+            model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _model_accepts_minimal_train(model):
     """Return True if model.__call__ accepts the minimal train path switch."""
     import inspect as _inspect
@@ -5482,12 +5538,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_v4171_model = str(_model_version) == V4171_MODEL_VERSION
+    _srw_composition_mode = None
     if _is_v4171_model:
         admission_den_power = _v4171_static_runtime_den_power(
             model, admission_den_power,
             context="v4171 train runtime",
             sharded_fns=sharded_fns,
         )
+        _srw_composition_mode = _v4171_static_runtime_composition_mode(
+            model,
+            context="v4171 train runtime",
+            sharded_fns=sharded_fns)
     _fixed_runtime = None
     if runtime_state is not None:
         if not isinstance(runtime_state, dict):
@@ -5519,6 +5580,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             if _is_v4171_model
             else jnp.float32(runtime_state['admission_den_power'])
         )
+        if _is_v4171_model:
+            _fixed_runtime['srw_composition_mode'] = (
+                _v4171_static_runtime_composition_mode(
+                    model,
+                    runtime_state.get(
+                        'srw_composition_mode',
+                        DEFAULT_SRW_COMPOSITION_MODE),
+                    context="v4171 source-final train runtime",
+                    sharded_fns=sharded_fns))
         if 'training_tokens' in runtime_state:
             _fixed_runtime['training_tokens'] = jnp.float32(
                 runtime_state['training_tokens'])
@@ -5528,6 +5598,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
+    _pass_composition_mode_kw = _model_accepts_srw_composition_mode(model)
     _pass_minimal_train_kw = _model_accepts_minimal_train(model)
     _pass_training_tokens_kw = _model_accepts_training_tokens(model)
     _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
@@ -5738,6 +5809,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 extra_kw['admission_den_power'] = (
                     _fixed_runtime['admission_den_power']
                     if _fixed_runtime is not None else _admission_den_power)
+            if _pass_composition_mode_kw and _is_v4171_model:
+                extra_kw['srw_composition_mode'] = (
+                    _fixed_runtime['srw_composition_mode']
+                    if _fixed_runtime is not None
+                    else _srw_composition_mode)
             if _pass_execution_prune_kw:
                 # Training never execution-prunes; pruning is eval-sweep only.
                 extra_kw['execution_prune_eps'] = jnp.float32(0.0)
@@ -8074,6 +8150,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
+    _pass_composition_mode_kw = _model_accepts_srw_composition_mode(model)
     _pass_minimal_train_kw = _model_accepts_minimal_train(model)
     _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
     _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
@@ -8087,12 +8164,17 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_v4171_model = str(_model_version) == V4171_MODEL_VERSION
+    _srw_composition_mode = None
     if _is_v4171_model:
         admission_den_power = _v4171_static_runtime_den_power(
             model, admission_den_power,
             context="v4171 eval runtime",
             sharded_fns=sharded_fns,
         )
+        _srw_composition_mode = _v4171_static_runtime_composition_mode(
+            model,
+            context="v4171 eval runtime",
+            sharded_fns=sharded_fns)
     _is_linear_direct_tau_model = (
         str(_model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     _use_minimal_train_path = (
@@ -8177,6 +8259,15 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             if _is_v4171_model
             else jnp.float32(runtime_state['admission_den_power'])
         )
+        if _is_v4171_model:
+            _fixed_runtime['srw_composition_mode'] = (
+                _v4171_static_runtime_composition_mode(
+                    model,
+                    runtime_state.get(
+                        'srw_composition_mode',
+                        DEFAULT_SRW_COMPOSITION_MODE),
+                    context="v4171 source-final eval runtime",
+                    sharded_fns=sharded_fns))
 
     @jax.jit
     def eval_step(params, input_ids, labels, attention_mask, step):
@@ -8239,6 +8330,11 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             extra_kw['admission_den_power'] = (
                 _fixed_runtime['admission_den_power']
                 if _fixed_runtime is not None else _admission_den_power)
+        if _pass_composition_mode_kw and _is_v4171_model:
+            extra_kw['srw_composition_mode'] = (
+                _fixed_runtime['srw_composition_mode']
+                if _fixed_runtime is not None
+                else _srw_composition_mode)
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = _execution_prune_eps
         if _pass_ce_token_chunk_size_kw:
@@ -8323,17 +8419,23 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
+    _pass_composition_mode_kw = _model_accepts_srw_composition_mode(model)
     _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
     _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_v4171_model = str(_model_version) == V4171_MODEL_VERSION
+    _srw_composition_mode = None
     if _is_v4171_model:
         admission_den_power = _v4171_static_runtime_den_power(
             model, admission_den_power,
             context="v4171 analysis runtime",
             sharded_fns=sharded_fns,
         )
+        _srw_composition_mode = _v4171_static_runtime_composition_mode(
+            model,
+            context="v4171 analysis runtime",
+            sharded_fns=sharded_fns)
     _ce_token_chunk_size = int(ce_token_chunk_size)
     if _ce_token_chunk_size <= 0:
         raise ValueError(
@@ -8427,6 +8529,8 @@ def create_analysis_step(model, sharded_fns=None,
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_den_power_kw:
             extra_kw['admission_den_power'] = _admission_den_power
+        if _pass_composition_mode_kw and _is_v4171_model:
+            extra_kw['srw_composition_mode'] = _srw_composition_mode
         if _pass_execution_prune_kw:
             extra_kw['execution_prune_eps'] = jnp.float32(0.0)
         if _pass_ce_token_chunk_size_kw:
@@ -13387,6 +13491,13 @@ def _checkpoint_final_runtime(full_config, checkpoint_path):
                     "admission_den_power"),
                 context="v4171 checkpoint full_config.model",
             )
+            runtime['srw_composition_mode'], runtime['admission_den_power'] = (
+                _validate_v4171_composition_settings(
+                    model.get(
+                        'srw_composition_mode',
+                        DEFAULT_SRW_COMPOSITION_MODE),
+                    runtime['admission_den_power'],
+                    context="v4171 checkpoint full_config.model"))
             runtime['admission_den_grad_scale'] = (
                 _validate_v4171_admission_den_grad_scale(
                     1.0, context="v4171 source-final runtime"))
@@ -13467,6 +13578,9 @@ def resolve_transfer_checkpoint(source):
         print(
             "  admission_den_power="
             f"{runtime_state['admission_den_power']}", flush=True)
+        print(
+            "  srw_composition_mode="
+            f"{runtime_state['srw_composition_mode']}", flush=True)
         print("  admission_den_grad_scale=1.0", flush=True)
         print("  source=full_config.model", flush=True)
     return TransferCheckpoint(
@@ -14062,12 +14176,19 @@ def _fixed_runtime_forward_kwargs(model, sharded_fns, runtime_state,
             context="v4171 source-final forward runtime",
             sharded_fns=sharded_fns,
         )
+        composition_mode = _v4171_static_runtime_composition_mode(
+            model,
+            runtime_state.get(
+                'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
+            context="v4171 source-final forward runtime",
+            sharded_fns=sharded_fns)
         _validate_v4171_admission_den_grad_scale(
             runtime_state.get('admission_den_grad_scale'),
             context="v4171 source-final forward runtime",
         )
     else:
         den_power = runtime_state.get('admission_den_power')
+        composition_mode = None
     kwargs = {}
     if sharded_fns is not None:
         kwargs['sharded_fns'] = sharded_fns
@@ -14080,14 +14201,16 @@ def _fixed_runtime_forward_kwargs(model, sharded_fns, runtime_state,
             'soft_gate_temperature', 'soft_gate_T_qk', 'soft_gate_T_v',
             'soft_gate_T_rst', 'soft_gate_t_final',
             'soft_gate_boundary_power', 'soft_gate_boundary_power_final',
-            'admission_den_power', 'training_tokens'):
+            'admission_den_power', 'srw_composition_mode',
+            'training_tokens'):
         if key in signature:
             if key not in runtime_state:
                 raise RuntimeError(
                     f"source_final_constant runtime is missing {key}")
             kwargs[key] = (
                 den_power if key == 'admission_den_power'
-                else runtime_state[key])
+                else (composition_mode if key == 'srw_composition_mode'
+                      else runtime_state[key]))
     if _model_accepts_execution_prune_eps(model):
         kwargs['execution_prune_eps'] = 0.0
     if _model_accepts_ce_token_chunk_size(model):
@@ -16115,13 +16238,22 @@ def main():
                 print("Execution:")
                 print("  full rank-1 read/write operator")
                 print("Composition:")
-                print(f"  admission_den_power={admission_den_power:g}")
-                print("  den=max(sum(unpruned_admission),1)"
-                      f"^{admission_den_power:g}")
-                print("  numerator=execution_weight")
-                print("  denominator_mass=unpruned_admission")
+                _composition_mode = cfg['model']['srw_composition_mode']
+                print(f"  mode={_composition_mode}")
+                print("  angular_amplitude=linear_cap_depth")
+                if _composition_mode == 'spherical_energy':
+                    print("  admission_weight=amplitude^2")
+                    print("  total_energy=sum(unpruned_admission)")
+                    print("  den=sqrt(max(total_energy,1e-12))")
+                    print("  numerator=pruned_execution_energy")
+                else:
+                    print("  admission_weight=amplitude")
+                    print("  den=max(sum(unpruned_admission),1)"
+                          "^admission_den_power")
+                    print("  numerator=pruned_execution_weight")
                 print("  live_den_gradient=true")
-                print("  runtime_source=model.admission_den_power")
+                print(f"  admission_den_power={admission_den_power:g}")
+                print("  runtime_source=model")
             elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 _read_role_dim = int(cfg['model']['rw_role_read_dim'])
                 _write_role_dim = int(cfg['model']['rw_role_write_dim'])
@@ -18283,12 +18415,25 @@ def main():
                     "Operator address: independent learned live-gradient "
                     "embeddings with direct state-to-operation queries; "
                     "execution remains full rank-1 RW")
-                log_message(
-                    f"Composition: admission_den_power={admission_den_power:g}; "
-                    "den=max(sum(unpruned_admission),1)"
-                    f"^{admission_den_power:g}; "
-                    "numerator=execution_weight; live_den_gradient=true; "
-                    "runtime_source=model.admission_den_power")
+                _composition_mode = cfg['model']['srw_composition_mode']
+                if _composition_mode == 'spherical_energy':
+                    log_message(
+                        "Composition: mode=spherical_energy; "
+                        "angular_amplitude=linear_cap_depth; "
+                        "admission_weight=amplitude^2; "
+                        "total_energy=sum(unpruned_admission); "
+                        "den=sqrt(max(total_energy,1e-12)); "
+                        "numerator=pruned_execution_energy; "
+                        "live_den_gradient=true; runtime_source=model")
+                else:
+                    log_message(
+                        "Composition: mode=linear_angular; "
+                        "angular_amplitude=linear_cap_depth; "
+                        "admission_weight=amplitude; "
+                        "den=max(sum(unpruned_admission),1)"
+                        f"^{admission_den_power:g}; "
+                        "numerator=pruned_execution_weight; "
+                        "live_den_gradient=true; runtime_source=model")
             elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 log_message(
                     "RW-key operator path: live-gradient compressed RW "

@@ -106,6 +106,14 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
         if composition_den is None:
             admission_den = jnp.power(
                 jnp.maximum(admission_mass, 1.0), admission_den_power)
+        elif hasattr(model_module, "DEFAULT_SRW_COMPOSITION_MODE"):
+            admission_den = composition_den(
+                admission_mass,
+                admission_den_power,
+                execution_kwargs.get(
+                    "srw_composition_mode",
+                    model_module.DEFAULT_SRW_COMPOSITION_MODE),
+            )
         else:
             admission_den = composition_den(
                 admission_mass, admission_den_power)
