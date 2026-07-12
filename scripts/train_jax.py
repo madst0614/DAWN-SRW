@@ -652,6 +652,47 @@ V4171_COMPOSITION_METRIC_NAMES = tuple(
         'raw_srw_out_norm', 'normalized_srw_out_norm',
         'pool_scaled_srw_out_norm'))
 
+V4171_GRAD_DIAG_METRIC_NAMES = (
+    'grad_raw_total',
+    'grad_raw_tau',
+    'grad_raw_tau_qk',
+    'grad_raw_tau_v',
+    'grad_raw_tau_rst',
+    'grad_raw_router',
+    'grad_raw_router_attn',
+    'grad_raw_router_rst',
+    'grad_raw_opkey',
+    'grad_raw_opkey_qk',
+    'grad_raw_opkey_v',
+    'grad_raw_opkey_rst',
+    'grad_raw_rw',
+    'grad_raw_rw_qk',
+    'grad_raw_rw_v',
+    'grad_raw_rw_rst',
+    'grad_raw_body',
+    'grad_raw_partition_rel_error',
+    'grad_control_total',
+    'grad_control_tau',
+    'grad_control_tau_qk',
+    'grad_control_tau_v',
+    'grad_control_tau_rst',
+    'grad_control_router',
+    'grad_control_opkey',
+    'grad_control_rw',
+    'grad_control_body',
+    'grad_control_partition_rel_error',
+    'update_final_total',
+    'update_final_tau',
+    'update_final_tau_qk',
+    'update_final_tau_v',
+    'update_final_tau_rst',
+    'update_final_router',
+    'update_final_opkey',
+    'update_final_rw',
+    'update_final_body',
+    'update_final_partition_rel_error',
+)
+
 V4170_COMPACT_TRAIN_METRIC_NAMES = (
     'total_loss',
     'ce_loss',
@@ -687,6 +728,7 @@ V4170_COMPACT_REGULAR_JSONL_KEYS = (
 V4171_COMPACT_REGULAR_JSONL_REC_KEYS = (
     *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
     *V4171_COMPOSITION_METRIC_NAMES,
+    *V4171_GRAD_DIAG_METRIC_NAMES,
 )
 V4171_COMPACT_REGULAR_JSONL_KEYS = (
     *V4171_COMPACT_REGULAR_JSONL_REC_KEYS,
@@ -2616,10 +2658,165 @@ def _v4170_tau_update_max_abs(updates):
         qk_max, v_max, rst_max))
 
 
+_V4171_PARTITION_SQ_NAMES = (
+    'total',
+    'tau', 'tau_qk', 'tau_v', 'tau_rst',
+    'router', 'router_attn', 'router_rst',
+    'opkey', 'opkey_qk', 'opkey_v', 'opkey_rst',
+    'rw', 'rw_qk', 'rw_v', 'rw_rst',
+    'body',
+)
+
+
+def _v4171_partition_squares(tree):
+    """Return mutually exclusive v4171 group squares using global arrays."""
+    zero = jnp.float32(0.0)
+
+    def _has_sequence(parts, sequence):
+        width = len(sequence)
+        return any(parts[i:i + width] == sequence
+                   for i in range(len(parts) - width + 1))
+
+    def _visit(path, leaf):
+        parts = tuple(str(p.key if hasattr(p, 'key') else p) for p in path)
+        x = leaf.astype(jnp.float32)
+        values = [zero] * len(_V4171_PARTITION_SQ_NAMES)
+
+        if _has_sequence(parts, ('router', 'raw_tau_attn')):
+            if x.ndim < 1 or x.shape[-1] != 3:
+                raise ValueError(
+                    "v4171 raw_tau_attn partition expects route axis size 3; "
+                    f"path={'/'.join(parts)} shape={tuple(x.shape)}")
+            qk_sq = jnp.sum(jnp.square(x[..., :2]))
+            v_sq = jnp.sum(jnp.square(x[..., 2:3]))
+            leaf_sq = qk_sq + v_sq
+            values[1] = leaf_sq
+            values[2] = qk_sq
+            values[3] = v_sq
+        elif _has_sequence(parts, ('router', 'raw_tau_rst')):
+            leaf_sq = jnp.sum(jnp.square(x))
+            values[1] = leaf_sq
+            values[4] = leaf_sq
+        elif _has_sequence(parts, ('router', 'proj_attn')):
+            leaf_sq = jnp.sum(jnp.square(x))
+            values[5] = leaf_sq
+            values[6] = leaf_sq
+        elif _has_sequence(parts, ('router', 'proj_rst')):
+            leaf_sq = jnp.sum(jnp.square(x))
+            values[5] = leaf_sq
+            values[7] = leaf_sq
+        elif _has_sequence(parts, ('neuron_pool', 'attn_qk_op_key')):
+            leaf_sq = jnp.sum(jnp.square(x))
+            values[8] = leaf_sq
+            values[9] = leaf_sq
+        elif _has_sequence(parts, ('neuron_pool', 'attn_v_op_key')):
+            leaf_sq = jnp.sum(jnp.square(x))
+            values[8] = leaf_sq
+            values[10] = leaf_sq
+        elif _has_sequence(parts, ('neuron_pool', 'rst_op_key')):
+            leaf_sq = jnp.sum(jnp.square(x))
+            values[8] = leaf_sq
+            values[11] = leaf_sq
+        elif (_has_sequence(parts, ('neuron_pool', 'attn_qk_read'))
+              or _has_sequence(parts, ('neuron_pool', 'attn_qk_write'))):
+            leaf_sq = jnp.sum(jnp.square(x))
+            values[12] = leaf_sq
+            values[13] = leaf_sq
+        elif (_has_sequence(parts, ('neuron_pool', 'attn_v_read'))
+              or _has_sequence(parts, ('neuron_pool', 'attn_v_write'))):
+            leaf_sq = jnp.sum(jnp.square(x))
+            values[12] = leaf_sq
+            values[14] = leaf_sq
+        elif (_has_sequence(parts, ('neuron_pool', 'rst_read'))
+              or _has_sequence(parts, ('neuron_pool', 'rst_write'))):
+            leaf_sq = jnp.sum(jnp.square(x))
+            values[12] = leaf_sq
+            values[15] = leaf_sq
+        else:
+            leaf_sq = jnp.sum(jnp.square(x))
+            values[16] = leaf_sq
+
+        values[0] = leaf_sq
+        return jnp.stack(values)
+
+    leaves = jax.tree.leaves(jax.tree.map_with_path(_visit, tree))
+    if not leaves:
+        totals = jnp.zeros(
+            (len(_V4171_PARTITION_SQ_NAMES),), dtype=jnp.float32)
+    else:
+        totals = sum(leaves, jnp.zeros_like(leaves[0]))
+    return dict(zip(_V4171_PARTITION_SQ_NAMES, totals))
+
+
+def _v4171_partition_metrics(
+        grads_raw, grads_control, final_updates, *, grad_control_total):
+    """Build canonical raw/control/final v4171 scalar diagnostics."""
+    raw = _v4171_partition_squares(grads_raw)
+    control = _v4171_partition_squares(grads_control)
+    final = _v4171_partition_squares(final_updates)
+
+    def _norm(squares, name):
+        return jnp.sqrt(squares[name] + jnp.float32(1e-12))
+
+    def _partition_error(squares):
+        grouped = (squares['tau'] + squares['router'] + squares['opkey']
+                   + squares['rw'] + squares['body'])
+        return jnp.abs(squares['total'] - grouped) / jnp.maximum(
+            squares['total'], jnp.float32(1e-12))
+
+    metrics = {
+        'grad_raw_total': _norm(raw, 'total'),
+        'grad_raw_tau': _norm(raw, 'tau'),
+        'grad_raw_tau_qk': _norm(raw, 'tau_qk'),
+        'grad_raw_tau_v': _norm(raw, 'tau_v'),
+        'grad_raw_tau_rst': _norm(raw, 'tau_rst'),
+        'grad_raw_router': _norm(raw, 'router'),
+        'grad_raw_router_attn': _norm(raw, 'router_attn'),
+        'grad_raw_router_rst': _norm(raw, 'router_rst'),
+        'grad_raw_opkey': _norm(raw, 'opkey'),
+        'grad_raw_opkey_qk': _norm(raw, 'opkey_qk'),
+        'grad_raw_opkey_v': _norm(raw, 'opkey_v'),
+        'grad_raw_opkey_rst': _norm(raw, 'opkey_rst'),
+        'grad_raw_rw': _norm(raw, 'rw'),
+        'grad_raw_rw_qk': _norm(raw, 'rw_qk'),
+        'grad_raw_rw_v': _norm(raw, 'rw_v'),
+        'grad_raw_rw_rst': _norm(raw, 'rw_rst'),
+        'grad_raw_body': _norm(raw, 'body'),
+        'grad_raw_partition_rel_error': _partition_error(raw),
+        # Reuse the existing scalar exactly: both are the post-control tree norm.
+        'grad_control_total': grad_control_total,
+        'grad_control_tau': _norm(control, 'tau'),
+        'grad_control_tau_qk': _norm(control, 'tau_qk'),
+        'grad_control_tau_v': _norm(control, 'tau_v'),
+        'grad_control_tau_rst': _norm(control, 'tau_rst'),
+        'grad_control_router': _norm(control, 'router'),
+        'grad_control_opkey': _norm(control, 'opkey'),
+        'grad_control_rw': _norm(control, 'rw'),
+        'grad_control_body': _norm(control, 'body'),
+        'grad_control_partition_rel_error': _partition_error(control),
+        'update_final_total': _norm(final, 'total'),
+        'update_final_tau': _norm(final, 'tau'),
+        'update_final_tau_qk': _norm(final, 'tau_qk'),
+        'update_final_tau_v': _norm(final, 'tau_v'),
+        'update_final_tau_rst': _norm(final, 'tau_rst'),
+        'update_final_router': _norm(final, 'router'),
+        'update_final_opkey': _norm(final, 'opkey'),
+        'update_final_rw': _norm(final, 'rw'),
+        'update_final_body': _norm(final, 'body'),
+        'update_final_partition_rel_error': _partition_error(final),
+    }
+    if tuple(metrics) != V4171_GRAD_DIAG_METRIC_NAMES:
+        raise RuntimeError(
+            "v4171 gradient diagnostic schema drift: "
+            f"actual={tuple(metrics)}")
+    return {key: jax.lax.stop_gradient(value) for key, value in metrics.items()}
+
+
 def _v4170_compact_train_metrics(
         result, *, total_loss, ce_loss, aux_loss, tau_reg, orth_loss,
         div_loss, grad_norm, tau_lr_mult, tau_update_qk_max_abs,
-        tau_update_v_max_abs, tau_update_rst_max_abs):
+        tau_update_v_max_abs, tau_update_rst_max_abs,
+        v4171_grad_diag=None):
     """Build the exact payload; tau_update_* are raw_tau parameter updates."""
     metrics = {
         'total_loss': total_loss,
@@ -2647,8 +2844,20 @@ def _v4170_compact_train_metrics(
     if is_v4171:
         metrics.update({
             key: result[key] for key in V4171_COMPOSITION_METRIC_NAMES})
+        if v4171_grad_diag is None:
+            raise KeyError("v4171 compact train metrics require grad diagnostics")
+        actual_grad_diag = tuple(v4171_grad_diag.keys())
+        if actual_grad_diag != V4171_GRAD_DIAG_METRIC_NAMES:
+            raise KeyError(
+                "v4171 compact grad diagnostic keys mismatch: "
+                f"actual={actual_grad_diag}")
+        metrics.update(v4171_grad_diag)
+    elif v4171_grad_diag is not None:
+        raise ValueError("v4171 grad diagnostics supplied to v4170 metrics")
     expected = (
-        V4170_COMPACT_TRAIN_METRIC_NAMES + V4171_COMPOSITION_METRIC_NAMES
+        V4170_COMPACT_TRAIN_METRIC_NAMES
+        + V4171_COMPOSITION_METRIC_NAMES
+        + V4171_GRAD_DIAG_METRIC_NAMES
         if is_v4171 else V4170_COMPACT_TRAIN_METRIC_NAMES)
     if tuple(metrics.keys()) != expected:
         raise RuntimeError(
@@ -6285,7 +6494,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         # XLA SPMD handles gradient all-reduce automatically
         # (loss computed on sharded data -gradients consistent across shards)
-        raw_grads_before_tau_stabilize = grads
+        grads_raw = grads
+        raw_grads_before_tau_stabilize = grads_raw
 
         def _pre_tree_sq(tree):
             leaves = jax.tree.leaves(tree)
@@ -6530,21 +6740,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 jnp.minimum(1.0, clip_value / (group_norm + 1e-8)),
                 jnp.float32(1.0))
 
-        def _clipped_group_norm(path_pred, clip_value):
-            if float(clip_value) <= 0.0:
-                return jnp.float32(0.0)
-            return jnp.sqrt(_group_sq(grads, path_pred) + 1e-12)
+        def _group_norm(tree, path_pred):
+            return jnp.sqrt(_group_sq(tree, path_pred) + 1e-12)
 
-        tau_grad_norm_raw = _clipped_group_norm(
-            _is_tau_path, tau_grad_clip)
-        router_proj_grad_norm_raw = _clipped_group_norm(
-            _is_router_proj_path, router_proj_grad_clip)
-        router_scan_grad_norm_raw = _clipped_group_norm(
-            _is_router_scan_path, router_scan_grad_clip)
-        route_emb_grad_norm_raw = _clipped_group_norm(
-            _is_legacy_operator_key_path, route_emb_grad_clip)
-        op_key_grad_norm_raw = _clipped_group_norm(
-            _is_op_key_proj_path, op_key_grad_clip)
+        tau_grad_norm_raw = _group_norm(grads_raw, _is_tau_path)
+        router_proj_grad_norm_raw = _group_norm(
+            grads_raw, _is_router_proj_path)
+        router_scan_grad_norm_raw = _group_norm(
+            grads_raw, _is_router_scan_path)
+        route_emb_grad_norm_raw = _group_norm(
+            grads_raw, _is_legacy_operator_key_path)
+        op_key_grad_norm_raw = _group_norm(
+            grads_raw, _is_op_key_proj_path)
 
         tau_clip_scale = _clip_scale(tau_grad_norm_raw, _tau_grad_clip)
         router_proj_clip_scale = _clip_scale(
@@ -6574,7 +6781,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 or float(op_key_grad_clip) > 0.0):
             grads = jax.tree.map_with_path(_clip_control_grad, grads)
 
-        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        grads_control = grads
+        updates, new_opt_state = optimizer.update(
+            grads_control, opt_state, params)
 
         def _scale_control_update(path, u):
             ps = _path_to_str(path)
@@ -6780,8 +6989,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             tau_update_v_max_abs = jnp.float32(0.0)
             tau_update_rst_max_abs = jnp.float32(0.0)
 
-        new_params = optax.apply_updates(params, updates)
-
         def _tree_sq(tree):
             leaves = jax.tree.leaves(tree)
             if not leaves:
@@ -6791,6 +6998,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         def _tree_norm(tree):
             return jnp.sqrt(_tree_sq(tree) + 1e-12)
+
+        grad_norm = _tree_norm(grads)
+        v4171_grad_diag = None
+        if _is_v4171_model and _is_v4170_compact_train:
+            # `updates` is the final post-Adam, post-multiplier, post-cap tree.
+            v4171_grad_diag = _v4171_partition_metrics(
+                grads_raw,
+                grads_control,
+                updates,
+                grad_control_total=grad_norm)
+
+        new_params = optax.apply_updates(params, updates)
 
         def _child_norm(tree, key):
             return _tree_norm(tree[key]) if key in tree else jnp.float32(0.0)
@@ -6810,7 +7029,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 cur = cur[key]
             return cur
 
-        grad_norm = _tree_norm(grads)
         if _is_v4170_compact_train:
             metrics = _v4170_compact_train_metrics(
                 result,
@@ -6824,7 +7042,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 tau_lr_mult=_tau_lr_mult,
                 tau_update_qk_max_abs=tau_update_qk_max_abs,
                 tau_update_v_max_abs=tau_update_v_max_abs,
-                tau_update_rst_max_abs=tau_update_rst_max_abs)
+                tau_update_rst_max_abs=tau_update_rst_max_abs,
+                v4171_grad_diag=v4171_grad_diag)
             return new_params, new_opt_state, metrics
         if float(global_grad_clip) > 0.0:
             grad_global_postclip = jnp.minimum(grad_norm, _global_grad_clip)
@@ -11534,6 +11753,15 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     for _key in V4171_COMPOSITION_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
+    if str(ctx.get('model_version')) == V4171_MODEL_VERSION:
+        missing_grad_diag = tuple(
+            key for key in V4171_GRAD_DIAG_METRIC_NAMES if key not in m)
+        if missing_grad_diag:
+            raise KeyError(
+                "v4171 compact train result missing grad diagnostics: "
+                + ", ".join(missing_grad_diag))
+        rec.update({
+            key: float(m[key]) for key in V4171_GRAD_DIAG_METRIC_NAMES})
     rec['_linear_direct_tau_regular_missing_metrics'] = tuple(
         _key for _key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
         if _key not in m)
@@ -12135,6 +12363,58 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
             f" rst={rec['tau_update_rst_max_abs']:.2e}"
             f" mult={rec['tau_lr_mult']:.3e}"
         )
+    if is_v4171:
+        log_message(
+            f"  grad/raw: total={rec['grad_raw_total']:.2f}"
+            f" tau={rec['grad_raw_tau']:.2f}"
+            f"[qk={rec['grad_raw_tau_qk']:.2f}"
+            f" v={rec['grad_raw_tau_v']:.2f}"
+            f" rst={rec['grad_raw_tau_rst']:.2f}]"
+            f" router={rec['grad_raw_router']:.2f}"
+            f" opkey={rec['grad_raw_opkey']:.2f}"
+            f"[qk={rec['grad_raw_opkey_qk']:.2f}"
+            f" v={rec['grad_raw_opkey_v']:.2f}"
+            f" rst={rec['grad_raw_opkey_rst']:.2f}]"
+            f" rw={rec['grad_raw_rw']:.2f}"
+            f" body={rec['grad_raw_body']:.2f}"
+            f" part_err={rec['grad_raw_partition_rel_error']:.1e}"
+        )
+        log_message(
+            f"  grad/control: total={rec['grad_control_total']:.2f}"
+            f" tau={rec['grad_control_tau']:.2f}"
+            f" router={rec['grad_control_router']:.2f}"
+            f" opkey={rec['grad_control_opkey']:.2f}"
+            f" rw={rec['grad_control_rw']:.2f}"
+            f" body={rec['grad_control_body']:.2f}"
+            f" part_err={rec['grad_control_partition_rel_error']:.1e}"
+        )
+        log_message(
+            f"  update/final: total={rec['update_final_total']:.2e}"
+            f" tau={rec['update_final_tau']:.2e}"
+            f"[qk={rec['update_final_tau_qk']:.2e}"
+            f" v={rec['update_final_tau_v']:.2e}"
+            f" rst={rec['update_final_tau_rst']:.2e}]"
+            f" router={rec['update_final_router']:.2e}"
+            f" opkey={rec['update_final_opkey']:.2e}"
+            f" rw={rec['update_final_rw']:.2e}"
+            f" body={rec['update_final_body']:.2e}"
+            f" part_err={rec['update_final_partition_rel_error']:.1e}"
+        )
+        partition_errors = {
+            'raw': float(rec['grad_raw_partition_rel_error']),
+            'control': float(rec['grad_control_partition_rel_error']),
+            'final': float(rec['update_final_partition_rel_error']),
+        }
+        bad_partition_errors = {
+            name: value for name, value in partition_errors.items()
+            if (not np.isfinite(value)) or value > 1e-4}
+        if bad_partition_errors:
+            detail = ' '.join(
+                f"{name}={value:.3e}"
+                for name, value in bad_partition_errors.items())
+            log_message(
+                "  WARNING v4171 gradient partition error exceeds 1e-4: "
+                + detail)
     norm_suffix = (
         f" | srw_scaled "
         f"qk={float(rec['attn_qk_pool_scaled_srw_out_norm']):.3f} "
