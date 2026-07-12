@@ -104,6 +104,14 @@ from models.dawn_srw_v4170 import (
     _raw_tau_init_from_cosine_tau as _v4170_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4170_tau_init_calibration_scores,
 )
+from models.dawn_srw_v4171 import (
+    DAWN_SRW_V4171,
+    RW_BILINEAR_RANK as V4171_RW_BILINEAR_RANK,
+    _pool_operator_keys as _v4171_pool_operator_keys,
+    _query_geometry_diagnostics as _v4171_query_geometry_diagnostics,
+    _raw_tau_init_from_cosine_tau as _v4171_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4171_tau_init_calibration_scores,
+)
 from models.baseline_transformer_jax import (
     VanillaTransformer,
     create_baseline_sharded_fns,
@@ -287,18 +295,20 @@ V4167_MODEL_VERSION = 'spatial-r1-v4.1.6.7'
 V4168_MODEL_VERSION = 'spatial-r1-v4.1.6.8'
 V4169_MODEL_VERSION = 'spatial-r1-v4.1.6.9'
 V4170_MODEL_VERSION = 'spatial-r1-v4.1.7.0'
+V4171_MODEL_VERSION = 'spatial-r1-v4.1.7.1'
 BASELINE_MODEL_VERSION = 'baseline-JAX'
 LEGACY_BASELINE_MODEL_VERSION = 'baseline'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (
     V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION,
-    V4168_MODEL_VERSION, V4169_MODEL_VERSION, V4170_MODEL_VERSION)
+    V4168_MODEL_VERSION, V4169_MODEL_VERSION, V4170_MODEL_VERSION,
+    V4171_MODEL_VERSION)
 RW_KEY_SRW_MODEL_VERSIONS = (
     V4166_MODEL_VERSION, V4167_MODEL_VERSION, V4168_MODEL_VERSION,
-    V4169_MODEL_VERSION, V4170_MODEL_VERSION)
+    V4169_MODEL_VERSION, V4170_MODEL_VERSION, V4171_MODEL_VERSION)
 V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS = (
-    V4169_MODEL_VERSION, V4170_MODEL_VERSION)
-DIRECT_STATE_QUERY_MODEL_VERSIONS = (V4170_MODEL_VERSION,)
+    V4169_MODEL_VERSION, V4170_MODEL_VERSION, V4171_MODEL_VERSION)
+DIRECT_STATE_QUERY_MODEL_VERSIONS = (V4170_MODEL_VERSION, V4171_MODEL_VERSION)
 FIXED_TAU_SRW_MODEL_VERSIONS = (V4167_MODEL_VERSION,)
 CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_SELECTION_CALIBRATION_SCORE_CHUNK_TOKENS = 2048
@@ -345,6 +355,12 @@ MODEL_REGISTRY = {
         'module': 'models.dawn_srw_v4170',
         'raw_tau_init_from_cosine_tau': _v4170_raw_tau_init_from_cosine_tau,
         'tau_init_calibration_scores': _v4170_tau_init_calibration_scores,
+    },
+    V4171_MODEL_VERSION: {
+        'class': DAWN_SRW_V4171,
+        'module': 'models.dawn_srw_v4171',
+        'raw_tau_init_from_cosine_tau': _v4171_raw_tau_init_from_cosine_tau,
+        'tau_init_calibration_scores': _v4171_tau_init_calibration_scores,
     },
 }
 
@@ -428,6 +444,8 @@ def _pool_operator_keys_for_version(version):
         return _v4169_pool_operator_keys
     if version == V4170_MODEL_VERSION:
         return _v4170_pool_operator_keys
+    if version == V4171_MODEL_VERSION:
+        return _v4171_pool_operator_keys
     raise ValueError(f"{version} does not expose RW-derived operator keys.")
 
 
@@ -622,6 +640,16 @@ V4170_TAU_UPDATE_METRIC_NAMES = (
     'tau_update_rst_max_abs',
 )
 
+V4171_COMPOSITION_METRIC_NAMES = tuple(
+    f'{pool}_{name}'
+    for pool in ('attn_qk', 'attn_v', 'rst')
+    for name in (
+        'admission_mass_mean', 'admission_mass_max',
+        'composition_den_mean', 'composition_den_min',
+        'composition_den_max', 'composition_den_floor_frac',
+        'raw_srw_out_norm', 'normalized_srw_out_norm',
+        'pool_scaled_srw_out_norm'))
+
 V4170_COMPACT_TRAIN_METRIC_NAMES = (
     'total_loss',
     'ce_loss',
@@ -651,6 +679,15 @@ V4170_COMPACT_REGULAR_JSONL_REC_KEYS = (
 
 V4170_COMPACT_REGULAR_JSONL_KEYS = (
     *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
+    'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
+)
+
+V4171_COMPACT_REGULAR_JSONL_REC_KEYS = (
+    *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
+    *V4171_COMPOSITION_METRIC_NAMES,
+)
+V4171_COMPACT_REGULAR_JSONL_KEYS = (
+    *V4171_COMPACT_REGULAR_JSONL_REC_KEYS,
     'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
 )
 
@@ -1017,6 +1054,13 @@ V4170_RESUME_REQUIRED_FIELDS = (
     ('training', 'tau_lr_mult'),
 )
 
+V4171_RESUME_REQUIRED_FIELDS = (
+    *V4170_RESUME_REQUIRED_FIELDS,
+    ('model', 'operator_key_mode'),
+    ('model', 'rw_bilinear_rank'),
+    ('model', 'admission_den_power'),
+)
+
 V4168_OPSPACE_RESUME_REQUIRED_FIELDS = (
     ('model', 'model_version'),
     ('model', 'd_model'),
@@ -1188,6 +1232,35 @@ def _validate_v4170_resume_compatibility(
                 "migration/fallback is disabled.")
 
 
+def _validate_v4171_resume_compatibility(
+        requested_model_cfg, checkpoint_model_cfg):
+    requested_version = str(requested_model_cfg.get('model_version', ''))
+    if requested_version != V4171_MODEL_VERSION:
+        return
+    checkpoint_version = str(checkpoint_model_cfg.get('model_version', ''))
+    if checkpoint_version != V4171_MODEL_VERSION:
+        raise RuntimeError(
+            "v4171 resume requires a v4171 checkpoint; automatic "
+            "migration, random initialization, and outer-key fallback are "
+            "disabled. "
+            f"requested={requested_version}, checkpoint={checkpoint_version}")
+    required = (
+        'd_route', 'rw_role_read_dim', 'rw_role_write_dim',
+        'operator_key_mode', 'rw_bilinear_rank', 'admission_den_power')
+    for field in required:
+        requested = requested_model_cfg.get(field)
+        if field == 'operator_key_mode' and requested is None:
+            requested = 'rw_generalized_bilinear_relation'
+        elif field == 'rw_bilinear_rank' and requested is None:
+            requested = V4171_RW_BILINEAR_RANK
+        checkpoint = checkpoint_model_cfg.get(field)
+        if requested != checkpoint:
+            raise RuntimeError(
+                "v4171 checkpoint model schema mismatch: "
+                f"model.{field} requested={requested}, checkpoint={checkpoint}. "
+                "Automatic migration/fallback is disabled.")
+
+
 def _require_resume_materialized_fields(full_config):
     model_version_missing = _missing_config_paths(
         full_config, (('model', 'model_version'),))
@@ -1242,9 +1315,11 @@ def _require_resume_materialized_fields(full_config):
 
     if str(model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS:
         required_fields = (
-            V4170_RESUME_REQUIRED_FIELDS
-            if str(model_version) == V4170_MODEL_VERSION
-            else V4169_RESUME_REQUIRED_FIELDS)
+            V4171_RESUME_REQUIRED_FIELDS
+            if str(model_version) == V4171_MODEL_VERSION
+            else (V4170_RESUME_REQUIRED_FIELDS
+                  if str(model_version) == V4170_MODEL_VERSION
+                  else V4169_RESUME_REQUIRED_FIELDS))
         missing = _missing_config_paths(full_config, required_fields)
         if missing:
             raise RuntimeError(
@@ -1368,6 +1443,7 @@ def _maybe_materialize_vocab_parallel_config(cfg):
             V4168_MODEL_VERSION,
             V4169_MODEL_VERSION,
             V4170_MODEL_VERSION,
+            V4171_MODEL_VERSION,
             BASELINE_MODEL_VERSION,
             LEGACY_BASELINE_MODEL_VERSION):
         return
@@ -1387,7 +1463,7 @@ def _maybe_materialize_vocab_parallel_config(cfg):
     cfg["model"]["vocab_size_padded"] = padded
     if model_version in (
             V4166_MODEL_VERSION, V4168_MODEL_VERSION, V4169_MODEL_VERSION,
-            V4170_MODEL_VERSION):
+            V4170_MODEL_VERSION, V4171_MODEL_VERSION):
         cfg["model"]["vocab_size"] = padded
         if jax.process_index() == 0:
             _model_label = {
@@ -1395,6 +1471,7 @@ def _maybe_materialize_vocab_parallel_config(cfg):
                 V4168_MODEL_VERSION: "V4168",
                 V4169_MODEL_VERSION: "V4169",
                 V4170_MODEL_VERSION: "V4170",
+                V4171_MODEL_VERSION: "V4171",
             }[model_version]
             print(
                 f"vocab_parallel: enabled model={_model_label} "
@@ -2381,6 +2458,48 @@ def _validate_v4170_model_config(model_cfg):
             f"model.d_route={d_route}, product={product}")
 
 
+def _validate_v4171_model_config(model_cfg):
+    read_dim = model_cfg.get('rw_role_read_dim')
+    write_dim = model_cfg.get('rw_role_write_dim')
+    d_route = model_cfg.get('d_route')
+    den_power = model_cfg.get('admission_den_power')
+    valid_dims = all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (read_dim, write_dim, d_route))
+    try:
+        den_power_value = float(den_power)
+    except (TypeError, ValueError):
+        den_power_value = float('nan')
+    if not valid_dims:
+        raise ValueError(
+            "Invalid v4171 operator address geometry: "
+            f"model.rw_role_read_dim={read_dim}, "
+            f"model.rw_role_write_dim={write_dim}, "
+            f"model.d_route={d_route}")
+    if V4171_RW_BILINEAR_RANK <= 0:
+        raise ValueError(
+            "v4171 canonical bilinear rank must be positive, got "
+            f"{V4171_RW_BILINEAR_RANK}")
+    if not math.isfinite(den_power_value) or den_power_value != 0.5:
+        raise ValueError(
+            "v4171 requires model.admission_den_power=0.5, got "
+            f"{den_power!r}")
+    mode = model_cfg.get(
+        'operator_key_mode', 'rw_generalized_bilinear_relation')
+    if mode != 'rw_generalized_bilinear_relation':
+        raise ValueError(
+            "v4171 requires model.operator_key_mode="
+            f"rw_generalized_bilinear_relation, got {mode!r}")
+    rank = model_cfg.get('rw_bilinear_rank', V4171_RW_BILINEAR_RANK)
+    if rank != V4171_RW_BILINEAR_RANK:
+        raise ValueError(
+            f"v4171 requires model.rw_bilinear_rank="
+            f"{V4171_RW_BILINEAR_RANK}, got {rank!r}")
+    model_cfg['operator_key_mode'] = mode
+    model_cfg['rw_bilinear_rank'] = V4171_RW_BILINEAR_RANK
+    model_cfg['admission_den_power'] = den_power_value
+
+
 def _tau_lr_mult_for_model(training_cfg, model_version):
     """Resolve the exact-version DirectTau post-Adam update policy."""
     version = str(model_version)
@@ -2389,10 +2508,10 @@ def _tau_lr_mult_for_model(training_cfg, model_version):
             raise ValueError(
                 f"training.tau_lr_mult is forbidden for {V4169_MODEL_VERSION}")
         return 0.0
-    if version == V4170_MODEL_VERSION:
+    if version in (V4170_MODEL_VERSION, V4171_MODEL_VERSION):
         if 'tau_lr_mult' not in training_cfg:
             raise ValueError(
-                f"training.tau_lr_mult is required for {V4170_MODEL_VERSION}")
+                f"training.tau_lr_mult is required for {version}")
         raw_value = training_cfg['tau_lr_mult']
         if isinstance(raw_value, bool):
             raise ValueError(
@@ -2477,7 +2596,15 @@ def _v4170_compact_train_metrics(
         'tau_update_v_max_abs': tau_update_v_max_abs,
         'tau_update_rst_max_abs': tau_update_rst_max_abs,
     })
-    if tuple(metrics.keys()) != V4170_COMPACT_TRAIN_METRIC_NAMES:
+    is_v4171 = all(
+        key in result for key in V4171_COMPOSITION_METRIC_NAMES)
+    if is_v4171:
+        metrics.update({
+            key: result[key] for key in V4171_COMPOSITION_METRIC_NAMES})
+    expected = (
+        V4170_COMPACT_TRAIN_METRIC_NAMES + V4171_COMPOSITION_METRIC_NAMES
+        if is_v4171 else V4170_COMPACT_TRAIN_METRIC_NAMES)
+    if tuple(metrics.keys()) != expected:
         raise RuntimeError(
             "v4170 compact train metric schema drift: "
             f"actual={tuple(metrics.keys())}")
@@ -2494,6 +2621,8 @@ def _dawn_srw_kwargs(cfg):
     t = cfg['training']
     if str(version) == V4170_MODEL_VERSION:
         _validate_v4170_model_config(m)
+    if str(version) == V4171_MODEL_VERSION:
+        _validate_v4171_model_config(m)
     if 'n_rst' not in m and 'n_know' not in m:
         raise ValueError("v4164 requires model.n_rst or model.n_know checkpoint alias.")
     kw['n_rst'] = m.get('n_rst', m.get('n_know'))
@@ -2540,7 +2669,8 @@ def _dawn_srw_kwargs(cfg):
                 kw['tau_init_attn_v'] = 0.0
                 kw['tau_init_rst'] = 0.0
     if str(version) in (
-            V4166_MODEL_VERSION, V4169_MODEL_VERSION, V4170_MODEL_VERSION):
+            V4166_MODEL_VERSION, V4169_MODEL_VERSION, V4170_MODEL_VERSION,
+            V4171_MODEL_VERSION):
         kw.update({
             'logical_vocab_size': m.get('logical_vocab_size', None),
             'vocab_size_padded': m.get('vocab_size_padded', None),
@@ -2549,6 +2679,12 @@ def _dawn_srw_kwargs(cfg):
         kw.update({
             'rw_role_read_dim': m['rw_role_read_dim'],
             'rw_role_write_dim': m['rw_role_write_dim'],
+        })
+    if str(version) == V4171_MODEL_VERSION:
+        kw.update({
+            'rw_role_read_dim': m['rw_role_read_dim'],
+            'rw_role_write_dim': m['rw_role_write_dim'],
+            'admission_den_power': m['admission_den_power'],
         })
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
@@ -2579,6 +2715,14 @@ def _v4164_sharded_kwargs(cfg):
     """Fixed v4164 sharded SRW execution kwargs."""
     t = cfg['training']
     version = str(cfg.get('model', {}).get('model_version', ''))
+    if version == V4171_MODEL_VERSION:
+        _validate_v4171_model_config(cfg['model'])
+        return dict(
+            dead_exposure_target=0.0,
+            soft_gate_effective_active_eps=1.0e-6,
+            admission_den_power=float(cfg['model']['admission_den_power']),
+            admission_den_grad_scale=1.0,
+        )
     if version in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS:
         return dict(
             dead_exposure_target=0.0,
@@ -4918,6 +5062,9 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     v4170_op_keys = (
         _v4170_pool_operator_keys(pool)
         if str(model_version) == V4170_MODEL_VERSION else None)
+    v4171_op_keys = (
+        _v4171_pool_operator_keys(pool)
+        if str(model_version) == V4171_MODEL_VERSION else None)
 
     def _diag_op_key(read, write, read_proj, write_proj, eps=1.0e-6):
         def _unit(x):
@@ -4962,7 +5109,9 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
                 op_write_key = 'attn_v_op_write_proj'
             if (read is not None and write is not None
                     and op_read_key in pool and op_write_key in pool):
-                if v4170_op_keys is not None:
+                if v4171_op_keys is not None:
+                    op_key = v4171_op_keys[f'{name}_op_key']
+                elif v4170_op_keys is not None:
                     op_key = v4170_op_keys[f'{name}_op_key']
                 else:
                     op_key = _diag_op_key(
@@ -5296,11 +5445,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_linear_direct_tau_model = (
         str(_model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
-    _is_v4170_model = str(_model_version) == V4170_MODEL_VERSION
+    _is_v4170_model = str(_model_version) in (
+        V4170_MODEL_VERSION, V4171_MODEL_VERSION)
+    _is_v4171_model = str(_model_version) == V4171_MODEL_VERSION
     _use_minimal_train_path = (
         str(_model_version) in (
             V4166_MODEL_VERSION, V4168_MODEL_VERSION, V4169_MODEL_VERSION,
-            V4170_MODEL_VERSION)
+            V4170_MODEL_VERSION, V4171_MODEL_VERSION)
         and _pass_minimal_train_kw)
     if jax.process_index() == 0:
         print(
@@ -6027,6 +6178,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                         'correct', 'valid_count',
                         *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES)
                 }
+                if _is_v4171_model:
+                    result_payload.update({
+                        key: result[key]
+                        for key in V4171_COMPOSITION_METRIC_NAMES})
             elif _compact_train_metrics:
                 result_payload = {
                     k: v for k, v in result.items()
@@ -6150,7 +6305,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/attn_v_op_read_proj' in ps)
                     or ('neuron_pool/attn_v_op_write_proj' in ps)
                     or ('neuron_pool/rst_op_read_proj' in ps)
-                    or ('neuron_pool/rst_op_write_proj' in ps))
+                    or ('neuron_pool/rst_op_write_proj' in ps)
+                    or ('neuron_pool/attn_qk_op_bilinear_' in ps)
+                    or ('neuron_pool/attn_v_op_bilinear_' in ps)
+                    or ('neuron_pool/rst_op_bilinear_' in ps))
 
         def _is_router_proj_attn_path(ps):
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
@@ -6170,19 +6328,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return (('neuron_pool/attn_qk_emb' in ps)
                     or ('neuron_pool/qk_emb' in ps)
                     or ('neuron_pool/attn_qk_op_read_proj' in ps)
-                    or ('neuron_pool/attn_qk_op_write_proj' in ps))
+                    or ('neuron_pool/attn_qk_op_write_proj' in ps)
+                    or ('neuron_pool/attn_qk_op_bilinear_' in ps))
 
         def _is_op_key_v_path(ps):
             return (('neuron_pool/attn_v_emb' in ps)
                     or ('neuron_pool/v_emb' in ps)
                     or ('neuron_pool/attn_v_op_read_proj' in ps)
-                    or ('neuron_pool/attn_v_op_write_proj' in ps))
+                    or ('neuron_pool/attn_v_op_write_proj' in ps)
+                    or ('neuron_pool/attn_v_op_bilinear_' in ps))
 
         def _is_op_key_rst_path(ps):
             return (('neuron_pool/rst_emb' in ps)
                     or ('neuron_pool/know_emb' in ps)
                     or ('neuron_pool/rst_op_read_proj' in ps)
-                    or ('neuron_pool/rst_op_write_proj' in ps))
+                    or ('neuron_pool/rst_op_write_proj' in ps)
+                    or ('neuron_pool/rst_op_bilinear_' in ps))
 
         def _is_tau_attn_path(ps):
             return (_is_tau_attn_bias_path(ps)
@@ -6778,6 +6939,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _cur_qk = _v4170_keys['attn_qk_op_key']
                 _cur_v = _v4170_keys['attn_v_op_key']
                 _cur_rst = _v4170_keys['rst_op_key']
+            elif str(_model_version) == V4171_MODEL_VERSION:
+                _v4171_keys = _v4171_pool_operator_keys(_pool)
+                _cur_qk = _v4171_keys['attn_qk_op_key']
+                _cur_v = _v4171_keys['attn_v_op_key']
+                _cur_rst = _v4171_keys['rst_op_key']
             elif ('attn_qk_read_global' in _pool
                     or 'attn_qk_read_shared' in _pool):
                 def _flat_partitioned_op_key(prefix):
@@ -7837,7 +8003,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         str(_model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     _use_minimal_train_path = (
         str(_model_version) in (
-            V4168_MODEL_VERSION, V4169_MODEL_VERSION, V4170_MODEL_VERSION)
+            V4168_MODEL_VERSION, V4169_MODEL_VERSION, V4170_MODEL_VERSION,
+            V4171_MODEL_VERSION)
         and _pass_minimal_train_kw)
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
@@ -8065,7 +8232,7 @@ def create_analysis_step(model, sharded_fns=None,
         getattr(model, '__version__', getattr(type(model), '__version__', '')))
     _is_v4170_model = str(
         getattr(model, '__version__', getattr(type(model), '__version__', ''))
-    ) == V4170_MODEL_VERSION
+    ) in (V4170_MODEL_VERSION, V4171_MODEL_VERSION)
     _total_training_steps = jnp.float32(max(1, int(total_training_steps or 1)))
     _soft_gate_t_start = jnp.float32(soft_gate_t_start)
     _soft_gate_t_final = jnp.float32(soft_gate_t_final)
@@ -8161,8 +8328,11 @@ def create_analysis_step(model, sharded_fns=None,
         result = dict(result)
         result.update(_pool_param_diagnostics(params, full=True, model=model))
         if _is_v4170_model:
-            result.update(_v4170_query_geometry_diagnostics(
-                params, input_ids, max_tokens=4096))
+            query_geometry = (
+                _v4171_query_geometry_diagnostics
+                if str(getattr(model, '__version__', '')) == V4171_MODEL_VERSION
+                else _v4170_query_geometry_diagnostics)
+            result.update(query_geometry(params, input_ids, max_tokens=4096))
         return result
 
     return analysis_step
@@ -8231,7 +8401,7 @@ def create_geometry_step(max_sample=512, model_version=None):
         pair_count = jnp.maximum(mask.sum(), 1)
         pair_values = jnp.where(mask, sim, 0.0)
         nn_cos = jnp.max(jnp.where(mask, sim, -1.0), axis=-1)
-        return {
+        result = {
             f'{prefix}_read_role_effective_rank': _effective_rank(read_role),
             f'{prefix}_write_role_effective_rank': _effective_rank(write_role),
             f'{prefix}_op_key_effective_rank': _effective_rank(op_key),
@@ -8244,6 +8414,42 @@ def create_geometry_step(max_sample=512, model_version=None):
             f'{prefix}_op_key_nn_cos_p95': jnp.quantile(nn_cos, 0.95),
             f'{prefix}_op_key_nn_cos_max': nn_cos.max(),
         }
+        result.update({
+            f'{prefix}_operator_key_effective_rank': result[
+                f'{prefix}_op_key_effective_rank'],
+            f'{prefix}_operator_key_nearest_neighbor_cos_mean': result[
+                f'{prefix}_op_key_nn_cos_mean'],
+            f'{prefix}_operator_key_nearest_neighbor_cos_p95': result[
+                f'{prefix}_op_key_nn_cos_p95'],
+            f'{prefix}_operator_key_nearest_neighbor_cos_max': result[
+                f'{prefix}_op_key_nn_cos_max'],
+        })
+        return result
+
+    def _v4171_bilinear_factor_geometry(
+            read, write, read_proj, write_proj, read_mix, write_mix, prefix):
+        def _unit(x):
+            x = jnp.asarray(x, dtype=jnp.float32)
+            return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-6)
+
+        stride = max(1, read.shape[0] // max_sample)
+        read_sample = read[::stride][:max_sample]
+        write_sample = write[::stride][:max_sample]
+        read_role = _unit(_unit(read_sample) @ read_proj)
+        write_role = _unit(_unit(write_sample) @ write_proj)
+        factor_rms = []
+        for factor in range(V4171_RW_BILINEAR_RANK):
+            read_view = read_role @ read_mix[factor]
+            write_view = write_role @ write_mix[factor]
+            contribution = read_view * write_view
+            factor_rms.append(jnp.sqrt(jnp.mean(jnp.square(contribution))))
+        rms = jnp.stack(factor_rms)
+        shares = rms / jnp.maximum(rms.sum(), 1.0e-8)
+        result = {}
+        for factor in range(V4171_RW_BILINEAR_RANK):
+            result[f'{prefix}_bilinear_factor_rms_{factor}'] = rms[factor]
+            result[f'{prefix}_bilinear_factor_share_{factor}'] = shares[factor]
+        return result
 
     @jax.jit
     def geometry_step(params):
@@ -8252,6 +8458,9 @@ def create_geometry_step(max_sample=512, model_version=None):
         v4170_keys = (
             _v4170_pool_operator_keys(pool)
             if str(model_version) == V4170_MODEL_VERSION else None)
+        v4171_keys = (
+            _v4171_pool_operator_keys(pool)
+            if str(model_version) == V4171_MODEL_VERSION else None)
         for name, emb_key, read_key, write_key, op_read_key, op_write_key in (
                 ('attn_qk', 'attn_qk_emb', 'attn_qk_read',
                  'attn_qk_write', 'attn_qk_op_read_proj',
@@ -8263,7 +8472,18 @@ def create_geometry_step(max_sample=512, model_version=None):
                  'rst_op_read_proj', 'rst_op_write_proj')):
             if (read_key in pool and write_key in pool
                     and op_read_key in pool and op_write_key in pool):
-                if v4170_keys is not None:
+                if v4171_keys is not None:
+                    op_key = v4171_keys[f'{name}_op_key']
+                    out.update(_v4170_relation_geometry(
+                        pool[read_key], pool[write_key],
+                        pool[op_read_key], pool[op_write_key],
+                        op_key, name))
+                    out.update(_v4171_bilinear_factor_geometry(
+                        pool[read_key], pool[write_key],
+                        pool[op_read_key], pool[op_write_key],
+                        pool[f'{name}_op_bilinear_read_mix'],
+                        pool[f'{name}_op_bilinear_write_mix'], name))
+                elif v4170_keys is not None:
                     op_key = v4170_keys[f'{name}_op_key']
                     out.update(_v4170_relation_geometry(
                         pool[read_key], pool[write_key],
@@ -8386,7 +8606,9 @@ def get_param_shardings(params, mesh, model_version=None,
         if 'neuron_pool' in path_str:
             if (version in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS
                     and (leaf.endswith('_op_read_proj')
-                         or leaf.endswith('_op_write_proj'))):
+                         or leaf.endswith('_op_write_proj')
+                         or leaf.endswith('_op_bilinear_read_mix')
+                         or leaf.endswith('_op_bilinear_write_mix'))):
                 return replicated
             if (is_stage_partitioned_pool
                     and (leaf.endswith('_stage')
@@ -9564,6 +9786,44 @@ def _match_tree_to_template_on_mesh(restored_tree, template_tree, mesh, *, name)
         raise RuntimeError(
             f"Failed to match restored {name} to target mesh/template."
         ) from exc
+
+
+def _validate_v4171_checkpoint_param_schema(restored_params, target_params):
+    """Fail loud with the exact parameter path and shapes before mesh put."""
+    def _leaves(tree):
+        return {
+            jax.tree_util.keystr(path): value
+            for path, value in jax.tree_util.tree_flatten_with_path(tree)[0]
+        }
+
+    restored = _leaves(restored_params)
+    target = _leaves(target_params)
+    missing = sorted(set(target) - set(restored))
+    unexpected = sorted(set(restored) - set(target))
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append("missing=" + ", ".join(
+                f"params{path} expected_shape={getattr(target[path], 'shape', None)}"
+                for path in missing))
+        if unexpected:
+            details.append("unexpected=" + ", ".join(
+                f"params{path} checkpoint_shape="
+                f"{getattr(restored[path], 'shape', None)}"
+                for path in unexpected))
+        raise RuntimeError(
+            "v4171 checkpoint parameter schema mismatch; automatic "
+            "outer fallback, random fill, and migration are disabled: "
+            + "; ".join(details))
+    for path in sorted(target):
+        restored_shape = tuple(getattr(restored[path], 'shape', ()))
+        target_shape = tuple(getattr(target[path], 'shape', ()))
+        if restored_shape != target_shape:
+            raise RuntimeError(
+                "v4171 checkpoint parameter shape mismatch: "
+                f"params{path} checkpoint_shape={restored_shape} "
+                f"expected_shape={target_shape}. Automatic migration/fallback "
+                "is disabled.")
 
 
 def _replicate_optimizer_state_scalars_to_mesh(opt_state, mesh):
@@ -11156,10 +11416,14 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     for _key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
+    for _key in V4171_COMPOSITION_METRIC_NAMES:
+        if _key in m:
+            rec[_key] = float(m[_key])
     rec['_linear_direct_tau_regular_missing_metrics'] = tuple(
         _key for _key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
         if _key not in m)
-    if str(ctx.get('model_version')) == V4170_MODEL_VERSION:
+    if str(ctx.get('model_version')) in (
+            V4170_MODEL_VERSION, V4171_MODEL_VERSION):
         missing_tau_updates = tuple(
             key for key in V4170_TAU_UPDATE_METRIC_NAMES if key not in m)
         if missing_tau_updates:
@@ -11254,15 +11518,22 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
 
 def _v4170_compact_regular_jsonl_record(rec, ctx):
     """Whitelist the low-cost v4170 regular record without fake fallbacks."""
+    is_v4171 = str(ctx.get('model_version')) == V4171_MODEL_VERSION
+    rec_keys = (
+        V4171_COMPACT_REGULAR_JSONL_REC_KEYS
+        if is_v4171 else V4170_COMPACT_REGULAR_JSONL_REC_KEYS)
+    output_keys = (
+        V4171_COMPACT_REGULAR_JSONL_KEYS
+        if is_v4171 else V4170_COMPACT_REGULAR_JSONL_KEYS)
     missing = tuple(
-        key for key in V4170_COMPACT_REGULAR_JSONL_REC_KEYS
+        key for key in rec_keys
         if key not in rec)
     if missing:
         raise KeyError(
             "v4170 regular JSONL source missing required keys: "
             + ", ".join(missing))
     out = {
-        key: rec[key] for key in V4170_COMPACT_REGULAR_JSONL_REC_KEYS}
+        key: rec[key] for key in rec_keys}
     out.update({
         'progress': float(ctx['progress']),
         'epoch_elapsed': float(ctx['epoch_elapsed']),
@@ -11270,7 +11541,7 @@ def _v4170_compact_regular_jsonl_record(rec, ctx):
         's_per_it': float(ctx['s_per_it']),
         'metric_scope': 'representative_data_shard',
     })
-    if tuple(out.keys()) != V4170_COMPACT_REGULAR_JSONL_KEYS:
+    if tuple(out.keys()) != output_keys:
         raise RuntimeError(
             "v4170 regular JSONL schema drift: "
             f"actual={tuple(out.keys())}")
@@ -11740,7 +12011,8 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
         f"       v={_required_linear_direct_tau_metric(rec, 'attn_v_tau_mean'):+.6f}"
         f" rst={_required_linear_direct_tau_metric(rec, 'rst_tau_mean'):+.6f}"
     )
-    if str(ctx.get('model_version')) == V4170_MODEL_VERSION:
+    if str(ctx.get('model_version')) in (
+            V4170_MODEL_VERSION, V4171_MODEL_VERSION):
         log_message(
             f"  raw_tau_update: qk={rec['tau_update_qk_max_abs']:.2e}"
             f" v={rec['tau_update_v_max_abs']:.2e}"
@@ -11755,6 +12027,19 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
         f" v={float(rec.get('attn_v_pool_scale', 0.0)):.3f}"
         f" rst={float(rec.get('rst_pool_scale', 0.0)):.3f}"
     )
+    if str(ctx.get('model_version')) == V4171_MODEL_VERSION:
+        for pool in ('attn_qk', 'attn_v', 'rst'):
+            log_message(
+                f"  compose/{pool}: admission="
+                f"{float(rec[f'{pool}_admission_mass_mean']):.3f}/"
+                f"{float(rec[f'{pool}_admission_mass_max']):.3f} "
+                f"den={float(rec[f'{pool}_composition_den_mean']):.3f}["
+                f"{float(rec[f'{pool}_composition_den_min']):.3f},"
+                f"{float(rec[f'{pool}_composition_den_max']):.3f}] "
+                f"floor={float(rec[f'{pool}_composition_den_floor_frac']) * 100.0:.2f}% "
+                f"out={float(rec[f'{pool}_raw_srw_out_norm']):.3f}/"
+                f"{float(rec[f'{pool}_normalized_srw_out_norm']):.3f}/"
+                f"{float(rec[f'{pool}_pool_scaled_srw_out_norm']):.3f}")
     log_message(
         f"  time: {format_time(ctx['epoch_elapsed'])}<"
         f"{format_time(ctx['eta'])}, {ctx['s_per_it']:.2f}s/it"
@@ -13282,7 +13567,8 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
 
     if (mesh_model > 1
             and version in (V4166_MODEL_VERSION, V4168_MODEL_VERSION,
-                            V4169_MODEL_VERSION, V4170_MODEL_VERSION)):
+                            V4169_MODEL_VERSION, V4170_MODEL_VERSION,
+                            V4171_MODEL_VERSION)):
         for key in ('logical_vocab_size', 'vocab_size_padded'):
             if key not in model_cfg:
                 raise RuntimeError(
@@ -13560,7 +13846,8 @@ def create_canonical_train_step(model, optimizer, cfg, sharded_fns, mesh,
             'soft_gate_boundary_power_mid_frac', 0.8)),
         'soft_gate_boundary_power_final_frac': float(t.get(
             'soft_gate_boundary_power_final_frac', 0.95)),
-        'admission_den_power': float(t.get('admission_den_power', 1.0)),
+        'admission_den_power': float(
+            m.get('admission_den_power', t.get('admission_den_power', 1.0))),
         'sharded_fns': sharded_fns,
         'mesh': mesh,
         'is_baseline': _is_baseline_version(version),
@@ -13749,6 +14036,7 @@ def main():
     )
     is_v4169_cfg = str(model_version_cfg) == V4169_MODEL_VERSION
     is_v4170_cfg = str(model_version_cfg) == V4170_MODEL_VERSION
+    is_v4171_cfg = str(model_version_cfg) == V4171_MODEL_VERSION
     is_linear_direct_tau_cfg = (
         str(model_version_cfg) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     tau_init_cfg = (
@@ -13871,6 +14159,12 @@ def main():
             'opspace_gate_den_power', 1.0))
         admission_den_grad_scale = 1.0
         admission_den_config_keys = ('opspace_gate_den_power',)
+    elif is_v4171_cfg:
+        _validate_v4171_model_config(cfg['model'])
+        soft_gate_effective_active_eps = 1.0e-6
+        admission_den_power = float(cfg['model']['admission_den_power'])
+        admission_den_grad_scale = 1.0
+        admission_den_config_keys = ()
     else:
         soft_gate_effective_active_eps = float(
             tcfg.get('soft_gate_effective_active_eps', 1.0e-6))
@@ -13982,7 +14276,8 @@ def main():
         soft_gate_schedule_active = False
         boundary_power_schedule_active = False
         pool_specific_gate_t = False
-        admission_den_power = 1.0
+        admission_den_power = (
+            0.5 if is_v4171_cfg else 1.0)
         admission_den_grad_scale = 1.0
         soft_gate_effective_active_eps = 1.0e-6
         inactive_aux_enabled = False
@@ -14249,6 +14544,8 @@ def main():
         checkpoint_model_cfg = checkpoint_full_config['model']
         _validate_v4170_resume_compatibility(
             requested_model_cfg, checkpoint_model_cfg)
+        _validate_v4171_resume_compatibility(
+            requested_model_cfg, checkpoint_model_cfg)
         saved_full_config = (
             _migrate_v4168_operation_space_full_config_for_clean_schema(
                 checkpoint_full_config))
@@ -14280,6 +14577,7 @@ def main():
         )
         is_v4169_cfg = str(model_version_cfg) == V4169_MODEL_VERSION
         is_v4170_cfg = str(model_version_cfg) == V4170_MODEL_VERSION
+        is_v4171_cfg = str(model_version_cfg) == V4171_MODEL_VERSION
         is_linear_direct_tau_cfg = (
             str(model_version_cfg) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
         tau_init_cfg = (
@@ -14482,7 +14780,9 @@ def main():
                     soft_gate_boundary_power_final_frac))
             if not current_admission_den_config_override:
                 if is_linear_direct_tau_cfg:
-                    admission_den_power = 1.0
+                    admission_den_power = (
+                        float(saved_model_config['admission_den_power'])
+                        if is_v4171_cfg else 1.0)
                     admission_den_grad_scale = 1.0
                     soft_gate_effective_active_eps = 1.0e-6
                 elif operation_space_tau_free_enabled:
@@ -14575,7 +14875,8 @@ def main():
                 soft_gate_schedule_active = False
                 boundary_power_schedule_active = False
                 pool_specific_gate_t = False
-                admission_den_power = 1.0
+                admission_den_power = (
+                    0.5 if is_v4171_cfg else 1.0)
                 admission_den_grad_scale = 1.0
                 soft_gate_effective_active_eps = 1.0e-6
                 inactive_aux_enabled = False
@@ -14789,7 +15090,8 @@ def main():
         soft_gate_schedule_active = False
         pool_specific_gate_t = False
         boundary_power_schedule_active = False
-        admission_den_power = 1.0
+        admission_den_power = (
+            0.5 if is_v4171_cfg else 1.0)
         admission_den_grad_scale = 1.0
         soft_gate_effective_active_eps = 1.0e-6
 
@@ -15613,7 +15915,24 @@ def main():
               f"router={cfg['model'].get('router_dropout', 0.0)}")
         print(f"  Module path: {_model_registry_entry(model_version_cfg)['module']}")
         if _is_rw_key_srw_version(model_version_cfg):
-            if str(model_version_cfg) == V4170_MODEL_VERSION:
+            if str(model_version_cfg) == V4171_MODEL_VERSION:
+                _read_role_dim = int(cfg['model']['rw_role_read_dim'])
+                _write_role_dim = int(cfg['model']['rw_role_write_dim'])
+                print(f"DAWN-SRW {V4171_MODEL_VERSION}")
+                print("Operator address:")
+                print("  mode=rw_generalized_bilinear_relation")
+                print(f"  read_role_dim={_read_role_dim}")
+                print(f"  write_role_dim={_write_role_dim}")
+                print(f"  bilinear_rank={V4171_RW_BILINEAR_RANK}")
+                print(f"  d_route={cfg['model']['d_route']}")
+                print("  full_rw_execution=true")
+                print("  joint_sign_invariant=true")
+                print("Composition:")
+                print("  den=max(sum(admission),1)^0.5")
+                print("  numerator=execution_weight")
+                print("  denominator_mass=unpruned_admission")
+                print("  live_den_gradient=true")
+            elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 _read_role_dim = int(cfg['model']['rw_role_read_dim'])
                 _write_role_dim = int(cfg['model']['rw_role_write_dim'])
                 _relation_product = _read_role_dim * _write_role_dim
@@ -15709,21 +16028,36 @@ def main():
         else:
             if is_linear_direct_tau_cfg:
                 _linear_family_label = (
-                    "v4170" if str(model_version_cfg) == V4170_MODEL_VERSION
-                    else "v4169")
+                    "v4171" if str(model_version_cfg) == V4171_MODEL_VERSION
+                    else ("v4170" if str(model_version_cfg) == V4170_MODEL_VERSION
+                          else "v4169"))
                 _margin_label = (
                     "direct state/relation cosine margin"
-                    if str(model_version_cfg) == V4170_MODEL_VERSION
+                    if str(model_version_cfg) in (
+                        V4170_MODEL_VERSION, V4171_MODEL_VERSION)
                     else "RW-matched cosine margin")
                 print("  Tau parameterization: token-wise bounded DirectTau parameters")
                 print("  tau = -1 + 2 * sigmoid(raw_tau)")
                 print(f"  Gate: linear angular-depth from {_margin_label}")
                 print("  gate = clip((rho - tau) / max(1 - tau, 1e-4), 0, 1)")
                 print("  execution_prune_eps: training=0.0; eval zeros gates below eps")
-                print("  denominator: max(sum(pruned_gate), 1.0) with live gradient")
+                print(
+                    "  denominator: max(sum(unpruned_admission), 1.0) "
+                    f"** {admission_den_power:g} with live gradient")
                 print(f"[{_linear_family_label}] active definition: rho > tau "
                       "(pre-prune angular visibility)")
-                if is_v4170_cfg:
+                if is_v4171_cfg:
+                    print("[opspace] key=rw_generalized_bilinear_relation "
+                          "query=direct_state_projection "
+                          "tau=calibrated_slow_learned_radius "
+                          "gate=linear_angular_depth "
+                          "den=unpruned_admission_pow_0p5_live_gradient")
+                    print("tau policy: token-wise bounded DirectTau as local "
+                          "operation-space radius")
+                    print("tau init: fresh quantile calibration")
+                    print("tau update: CE-gradient post-Adam scaling")
+                    print(f"tau_lr_mult={tau_lr_mult}")
+                elif is_v4170_cfg:
                     print("[opspace] key=rw_role_outer_relation "
                           "query=direct_state_projection "
                           "tau=calibrated_slow_learned_radius "
@@ -16303,6 +16637,9 @@ def main():
         )
         restored_state, restored_metadata = _restore_orbax_state(
             latest_checkpoint_manager, resume_step, target_state)
+        if str(model_version_cfg) == V4171_MODEL_VERSION:
+            _validate_v4171_checkpoint_param_schema(
+                restored_state['params'], target_params)
         params = _match_tree_to_template_on_mesh(
             restored_state['params'], target_params, mesh, name='params')
         opt_state = _match_tree_to_template_on_mesh(
@@ -16704,6 +17041,7 @@ def main():
             V4168_MODEL_VERSION,
             V4169_MODEL_VERSION,
             V4170_MODEL_VERSION,
+            V4171_MODEL_VERSION,
         )
         _vocab_parallel_enabled = False
         if (_vocab_parallel_model
@@ -16762,7 +17100,7 @@ def main():
                     in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS
                     and _vocab_parallel_enabled):
                 _extra_msg += (
-                    f"; {'v4170' if str(model_version_cfg) == V4170_MODEL_VERSION else 'v4169'} "
+                    f"; {('v4171' if str(model_version_cfg) == V4171_MODEL_VERSION else ('v4170' if str(model_version_cfg) == V4170_MODEL_VERSION else 'v4169'))} "
                     "TP extras=vocab_parallel_ce")
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 _v4168_exec_mode = (
@@ -17051,7 +17389,8 @@ def main():
         analysis_step_fn = None
     # No current-train-batch diagnostic forward.
     _geometry_default_sample = (
-        2048 if str(model_version_cfg) == V4170_MODEL_VERSION else 512)
+        2048 if str(model_version_cfg) in (
+            V4170_MODEL_VERSION, V4171_MODEL_VERSION) else 512)
     geometry_step_fn = None if is_baseline else create_geometry_step(
         max_sample=int(tcfg.get(
             'geometry_max_sample',
@@ -17080,8 +17419,11 @@ def main():
             }
 
         pool = p['neuron_pool']
-        if str(model_version_cfg) == V4170_MODEL_VERSION:
+        if str(model_version_cfg) in (
+                V4170_MODEL_VERSION, V4171_MODEL_VERSION):
             return _v4170_pool_operator_keys(pool)
+        if str(model_version_cfg) == V4171_MODEL_VERSION:
+            return _v4171_pool_operator_keys(pool)
         if ('attn_qk_read_global' in pool
                 or 'attn_qk_read_shared' in pool):
             def _flat_op_key(prefix):
@@ -17747,7 +18089,14 @@ def main():
                 "Tau policy: learned local-radius DirectTau, post-Adam "
                 f"tau_lr_mult={tau_lr_mult}")
         if _is_rw_key_srw_version(model_version_cfg):
-            if str(model_version_cfg) == V4170_MODEL_VERSION:
+            if str(model_version_cfg) == V4171_MODEL_VERSION:
+                log_message(
+                    "RW-key operator path: live-gradient generalized "
+                    "bilinear RW addresses, direct state-to-operation queries")
+                log_message(
+                    "Composition: den=max(sum(unpruned_admission),1)^0.5; "
+                    "numerator=execution_weight; live_den_gradient=true")
+            elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 log_message(
                     "RW-key operator path: live-gradient compressed RW "
                     "relation maps, direct state-to-operation queries")
@@ -18195,7 +18544,8 @@ def main():
                     _print_regular_block(rec, ctx)
                     rec.pop('_active_tau_regular_available', None)
                     regular_jsonl_rec = rec
-                    if str(model_version_cfg) == V4170_MODEL_VERSION:
+                    if str(model_version_cfg) in (
+                            V4170_MODEL_VERSION, V4171_MODEL_VERSION):
                         regular_jsonl_rec = (
                             _v4170_compact_regular_jsonl_record(rec, ctx))
                     log_jsonl({'type': 'train', **regular_jsonl_rec})
