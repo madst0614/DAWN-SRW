@@ -1,0 +1,64 @@
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 40000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: spatial-r1-v4.1.7.1
+  vocab_size: 30522
+  d_model: 2304
+  n_layers: 18
+  n_heads: 36
+  max_seq_len: 512
+  dropout: 0.0
+  router_dropout: 0.0
+  gradient_checkpointing: true
+
+  d_route: 256
+  srw_composition_mode: compact_heat_energy
+  admission_den_power: 0.5
+  heat_kernel_beta: 2.0
+  n_qk: 3798
+  n_v: 11824
+  n_rst: 30474
+
+  tau_init_mode: quantile_frac
+  tau_init_min: -0.95
+  tau_init_max: 0.95
+  tau_init_target_qk_frac: 0.20
+  tau_init_target_v_frac: 0.10
+  tau_init_target_rst_frac: 0.02
+
+training:
+  batch_size: 1024
+  mesh_model: 2
+  mesh_data: 16
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  n_chunks_rst: 4
+
+  lr: 0.0003
+  tau_lr_mult: 0.001
+  warmup_ratio: 0.08
+  weight_decay: 0.1
+
+  eval_effective_prune_enabled: false
+  eval_effective_prune_eps_list:
+    - 1.0e-06
+    - 1.0e-05
+    - 0.0001
+
+  checkpoint_interval: 500
+  val_interval: 1000
+  log_interval: 100
+  log_analysis_multiplier: 1000000
+  heavy_geometry_multiplier: 1000000
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_compact_heat_energy
