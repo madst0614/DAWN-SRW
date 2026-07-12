@@ -5,7 +5,7 @@ Official v4171 model path.
 
 Implemented concepts:
 - cosine-space tau reference with bounded sigmoid min/max mapping
-- generalized low-rank bilinear RW-derived live-gradient operator addresses
+- independent learned live-gradient operator-address embeddings
 - direct state-to-operation queries
 - linear angular-depth gate after DirectTau
 - gate-sum normalized rank-1 RW composition
@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import math
-from flax.core import FrozenDict, freeze, unfreeze
 from typing import Optional, Dict
 from functools import partial
 from jax.sharding import PartitionSpec as P
@@ -263,38 +262,42 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 # ================================================================
 # V4.1.6.9 canonical DirectTau gate in cosine space.
 #
-#   rho              = cosine(q, RW-derived operator key)
+#   rho              = cosine(q, learned operator embedding)
 #   raw_tau          = learned cosine-space reference
 #   tau              = -1 + 2 * sigmoid(raw_tau)
 #   margin           = rho - tau
 #   angular_depth    = clip(margin / max(1 - tau, 1e-4), 0, 1)
 #   execution_weight = angular_depth, optionally eval-pruned
-#   den              = max(sum(execution_weight), 1.0)
+#   den              = max(sum(unpruned_admission), 1.0) ** den_power
 # ================================================================
 
 DEFAULT_D_ROUTE = 64
 RW_FORWARD_NORM_EPS = 1e-6     # forward-only read/write direction floor
 MODEL_VERSION = "spatial-r1-v4.1.7.1"
-OPERATOR_KEY_MODE = "rw_generalized_bilinear_relation"
+OPERATOR_KEY_MODE = "learned_operator_embedding"
 OPERATOR_QUERY_MODE = "direct_state_projection"
-RW_BILINEAR_RANK = 4
-DEFAULT_ADMISSION_DEN_POWER = 0.5
+DEFAULT_ADMISSION_DEN_POWER = 1.0
 
 
 def _validate_v4171_admission_den_power(value, *, context="v4171"):
-    """Validate the static canonical composition policy before JAX tracing."""
+    """Validate a static, non-negative composition power before tracing."""
     if isinstance(value, jax.core.Tracer):
         raise ValueError(
             f"{context} admission_den_power must be a static Python scalar; "
             "v4171 does not support a traced or scheduled denominator power")
+    if isinstance(value, bool):
+        raise ValueError(
+            "v4171 admission_den_power must be numeric, not bool")
     try:
         value = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"v4171 requires admission_den_power=0.5, got {value!r}") from exc
-    if not math.isfinite(value) or value != DEFAULT_ADMISSION_DEN_POWER:
+            f"v4171 admission_den_power must be a finite non-negative "
+            f"scalar, got {value!r}") from exc
+    if not math.isfinite(value) or value < 0.0:
         raise ValueError(
-            f"v4171 requires admission_den_power=0.5, got {value}")
+            "v4171 admission_den_power must be finite and >= 0.0, "
+            f"got {value}")
     return value
 
 
@@ -370,91 +373,40 @@ def _forward_unit_direction(x):
                 + RW_FORWARD_NORM_EPS)
 
 
-def _rw_bilinear_operator_key(
-        read, write, read_role_proj, write_role_proj,
-        bilinear_read_mix, bilinear_write_mix, *, eps=1e-6):
-    """Live-gradient generalized low-rank bilinear RW address for v4171."""
-    eps = jnp.asarray(eps, dtype=jnp.float32)
-
-    if int(read.shape[-1]) != int(read_role_proj.shape[0]):
-        raise ValueError(
-            "v4171 read projection shape mismatch: "
-            f"read={read.shape}, read_role_proj={read_role_proj.shape}")
-    if int(write.shape[-1]) != int(write_role_proj.shape[0]):
-        raise ValueError(
-            "v4171 write projection shape mismatch: "
-            f"write={write.shape}, write_role_proj={write_role_proj.shape}")
-    if (bilinear_read_mix.ndim != 3
-            or int(bilinear_read_mix.shape[0]) != RW_BILINEAR_RANK
-            or int(bilinear_read_mix.shape[1]) != int(read_role_proj.shape[1])):
-        raise ValueError(
-            "v4171 bilinear read mix shape mismatch: expected "
-            f"[rank={RW_BILINEAR_RANK}, read_role_dim="
-            f"{read_role_proj.shape[1]}, d_route], got "
-            f"{bilinear_read_mix.shape}")
-    if (bilinear_write_mix.ndim != 3
-            or int(bilinear_write_mix.shape[0]) != RW_BILINEAR_RANK
-            or int(bilinear_write_mix.shape[1]) != int(write_role_proj.shape[1])):
-        raise ValueError(
-            "v4171 bilinear write mix shape mismatch: expected "
-            f"[rank={RW_BILINEAR_RANK}, write_role_dim="
-            f"{write_role_proj.shape[1]}, d_route], got "
-            f"{bilinear_write_mix.shape}")
-    if int(bilinear_read_mix.shape[2]) != int(bilinear_write_mix.shape[2]):
-        raise ValueError(
-            "v4171 bilinear route width mismatch: "
-            f"read_mix={bilinear_read_mix.shape}, "
-            f"write_mix={bilinear_write_mix.shape}")
-
-    def _unit(x):
-        return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
-
-    read_dir = _unit(read.astype(jnp.float32))
-    write_dir = _unit(write.astype(jnp.float32))
-
-    read_role = read_dir @ read_role_proj
-    write_role = write_dir @ write_role_proj
-
-    read_role = _unit(read_role.astype(jnp.float32))
-    write_role = _unit(write_role.astype(jnp.float32))
-
-    d_route = int(bilinear_read_mix.shape[-1])
-    op_key = jnp.zeros((read.shape[0], d_route), dtype=jnp.float32)
-    for factor in range(RW_BILINEAR_RANK):
-        read_view = read_role @ bilinear_read_mix[factor]
-        write_view = write_role @ bilinear_write_mix[factor]
-        op_key = op_key + read_view.astype(jnp.float32) * write_view.astype(
-            jnp.float32)
-    op_key = op_key * jnp.float32(1.0 / math.sqrt(RW_BILINEAR_RANK))
-    op_key = _unit(op_key.astype(jnp.float32))
-
-    return op_key.astype(jnp.float32)
-
-
 def _pool_operator_keys(pool_params):
-    return {
-        'attn_qk_op_key': _rw_bilinear_operator_key(
-            pool_params['attn_qk_read'],
-            pool_params['attn_qk_write'],
-            pool_params['attn_qk_op_read_proj'],
-            pool_params['attn_qk_op_write_proj'],
-            pool_params['attn_qk_op_bilinear_read_mix'],
-            pool_params['attn_qk_op_bilinear_write_mix']),
-        'attn_v_op_key': _rw_bilinear_operator_key(
-            pool_params['attn_v_read'],
-            pool_params['attn_v_write'],
-            pool_params['attn_v_op_read_proj'],
-            pool_params['attn_v_op_write_proj'],
-            pool_params['attn_v_op_bilinear_read_mix'],
-            pool_params['attn_v_op_bilinear_write_mix']),
-        'rst_op_key': _rw_bilinear_operator_key(
-            pool_params['rst_read'],
-            pool_params['rst_write'],
-            pool_params['rst_op_read_proj'],
-            pool_params['rst_op_write_proj'],
-            pool_params['rst_op_bilinear_read_mix'],
-            pool_params['rst_op_bilinear_write_mix']),
+    required = ('attn_qk_op_key', 'attn_v_op_key', 'rst_op_key')
+    missing = tuple(key for key in required if key not in pool_params)
+    if missing:
+        raise ValueError(
+            "v4171 neuron_pool is missing learned operator embeddings: "
+            + ", ".join(missing))
+    keys = {
+        'attn_qk_op_key': pool_params['attn_qk_op_key'],
+        'attn_v_op_key': pool_params['attn_v_op_key'],
+        'rst_op_key': pool_params['rst_op_key'],
     }
+    d_route = None
+    for prefix, read_key in (
+            ('attn_qk', 'attn_qk_read'),
+            ('attn_v', 'attn_v_read'),
+            ('rst', 'rst_read')):
+        op_key = keys[f'{prefix}_op_key']
+        expected_rows = int(pool_params[read_key].shape[0])
+        if op_key.ndim != 2 or int(op_key.shape[0]) != expected_rows:
+            raise ValueError(
+                f"v4171 {prefix}_op_key shape mismatch: expected "
+                f"[{expected_rows}, d_route], got {op_key.shape}")
+        if d_route is None:
+            d_route = int(op_key.shape[1])
+            if d_route <= 0:
+                raise ValueError(
+                    f"v4171 {prefix}_op_key must have d_route > 0, got "
+                    f"{op_key.shape}")
+        elif int(op_key.shape[1]) != d_route:
+            raise ValueError(
+                f"v4171 {prefix}_op_key route width mismatch: expected "
+                f"d_route={d_route}, got {op_key.shape}")
+    return keys
 
 
 def _composition_den(admission_mass, admission_den_power):
@@ -465,15 +417,12 @@ def _composition_den(admission_mass, admission_den_power):
 
 
 def _pool_params_with_operator_keys(pool_params):
-    """Attach per-forward shared op keys without recomputing in each layer."""
-    out = unfreeze(pool_params) if isinstance(pool_params, FrozenDict) else dict(pool_params)
-    out.update(_pool_operator_keys(pool_params))
-    return out
+    """Validate and return the pool, whose learned op keys are already stored."""
+    _pool_operator_keys(pool_params)
+    return pool_params
 
 
 def _ensure_pool_operator_keys(pool_params):
-    if 'attn_qk_op_key' in pool_params:
-        return pool_params
     return _pool_params_with_operator_keys(pool_params)
 
 
@@ -712,7 +661,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     Analysis path may compute rho distribution moments for diagnostics.
 
     v4171 canonical DirectTau execution:
-        rho              = cosine(q, RW-derived operator key)
+        rho              = cosine(q, learned operator embedding)
         margin           = rho - tau
         gate             = clip(margin / max(1 - tau, 1e-4), 0, 1)
         execution_weight = gate, optionally eval-pruned
@@ -853,7 +802,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 op_key_dir_bf, start, cs, axis=0)
 
         def operator_relation(op_key):
-            # Cosine between operator query and RW-derived operator key.
+            # Cosine between operator query and learned operator embedding.
             rho = (h_unit_bf @ op_key.T).astype(jnp.float32)
             rho_exposure = (
                 jax.lax.stop_gradient(h_unit_bf) @ op_key.T
@@ -1732,7 +1681,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 op_key_dir_bf, start, cs, axis=0)
 
         def operator_relation(op_key):
-            # Cosine between operator query and RW-derived operator key.
+            # Cosine between operator query and learned operator embedding.
             rho = jnp.einsum(
                 'bsrd,nd->bsrn', h_unit_bf, op_key).astype(jnp.float32)
             rho_exposure = jnp.einsum(
@@ -2894,7 +2843,7 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
 
 
 # ================================================================
-# 4. NeuronPool -- read/write directions + RW-derived operator keys
+# 4. NeuronPool -- RW execution directions + learned operator embeddings
 # ================================================================
 
 class NeuronPool(nn.Module):
@@ -2902,26 +2851,15 @@ class NeuronPool(nn.Module):
     n_v: int
     d_model: int
     d_route: int
-    rw_role_read_dim: int
-    rw_role_write_dim: int
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Checkpoint/config alias for rst pool size.
 
     def setup(self):
         dm = self.d_model
-        read_dim = int(self.rw_role_read_dim)
-        write_dim = int(self.rw_role_write_dim)
         d_route = int(self.d_route)
-        if d_route <= 0 or read_dim <= 0 or write_dim <= 0:
+        if d_route <= 0:
             raise ValueError(
-                "Invalid v4171 operator address geometry: "
-                f"model.rw_role_read_dim={read_dim}, "
-                f"model.rw_role_write_dim={write_dim}, "
-                f"model.d_route={d_route}, "
-                f"rw_bilinear_rank={RW_BILINEAR_RANK}")
-        if RW_BILINEAR_RANK <= 0:
-            raise ValueError(
-                f"v4171 RW_BILINEAR_RANK must be > 0, got {RW_BILINEAR_RANK}")
+                f"v4171 model.d_route must be > 0, got {d_route}")
         n_rst_eff = self.n_rst if self.n_rst is not None else self.n_know
         if n_rst_eff is None:
             raise ValueError("NeuronPool requires n_rst or n_know checkpoint alias.")
@@ -2938,36 +2876,14 @@ class NeuronPool(nn.Module):
         self.attn_v_write = self.param('attn_v_write', unit_norm_init(), (self.n_v, dm))
         self.rst_write = self.param('rst_write', unit_norm_init(), (n_rst_eff, dm))
 
-        read_proj_scale = math.sqrt(float(dm) / float(read_dim))
-        write_proj_scale = math.sqrt(float(dm) / float(write_dim))
-        read_proj_init = nn.initializers.orthogonal(scale=read_proj_scale)
-        write_proj_init = nn.initializers.orthogonal(scale=write_proj_scale)
-        self.attn_qk_op_read_proj = self.param(
-            'attn_qk_op_read_proj', read_proj_init, (dm, read_dim))
-        self.attn_qk_op_write_proj = self.param(
-            'attn_qk_op_write_proj', write_proj_init, (dm, write_dim))
-        self.attn_v_op_read_proj = self.param(
-            'attn_v_op_read_proj', read_proj_init, (dm, read_dim))
-        self.attn_v_op_write_proj = self.param(
-            'attn_v_op_write_proj', write_proj_init, (dm, write_dim))
-        self.rst_op_read_proj = self.param(
-            'rst_op_read_proj', read_proj_init, (dm, read_dim))
-        self.rst_op_write_proj = self.param(
-            'rst_op_write_proj', write_proj_init, (dm, write_dim))
-
-        read_mix_init = nn.initializers.variance_scaling(
-            1.0, 'fan_in', 'truncated_normal',
-            in_axis=1, out_axis=2, batch_axis=0)
-        write_mix_init = nn.initializers.variance_scaling(
-            1.0, 'fan_in', 'truncated_normal',
-            in_axis=1, out_axis=2, batch_axis=0)
-        for prefix in ('attn_qk', 'attn_v', 'rst'):
-            setattr(self, f'{prefix}_op_bilinear_read_mix', self.param(
-                f'{prefix}_op_bilinear_read_mix', read_mix_init,
-                (RW_BILINEAR_RANK, read_dim, d_route)))
-            setattr(self, f'{prefix}_op_bilinear_write_mix', self.param(
-                f'{prefix}_op_bilinear_write_mix', write_mix_init,
-                (RW_BILINEAR_RANK, write_dim, d_route)))
+        # Address parameters are independent from the RW execution vectors.
+        # Their raw norms remain unconstrained; selection uses unit directions.
+        self.attn_qk_op_key = self.param(
+            'attn_qk_op_key', unit_norm_init(), (self.n_qk, d_route))
+        self.attn_v_op_key = self.param(
+            'attn_v_op_key', unit_norm_init(), (self.n_v, d_route))
+        self.rst_op_key = self.param(
+            'rst_op_key', unit_norm_init(), (n_rst_eff, d_route))
 
         # No learned pool strength params; output strength is fixed by
         # sqrt(d_model / n_layers) in the forward path.
@@ -3314,7 +3230,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     v_read = pool_params['attn_v_read']
     v_write = pool_params['attn_v_write']
 
-    # RW-derived operator keys are passed into the sharded SRW closure.
+    # Learned operator embeddings are passed into the sharded SRW closure.
     # The closure forward-normalizes them for selection stability.
     qk_op_key_unit = qk_op_key
     v_op_key_unit = v_op_key
@@ -3725,7 +3641,7 @@ def _rst_forward(x, pool_params, router_params, rng,
         + router_params['proj_rst']['bias'])
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
 
-    # RW-derived operator keys are passed into the sharded SRW closure.
+    # Learned operator embeddings are passed into the sharded SRW closure.
     # The closure forward-normalizes them for selection stability.
     rst_op_key_unit = rst_op_key
     raw_tau = (
@@ -3878,7 +3794,7 @@ class DAWNBlock(nn.Module):
 # ================================================================
 
 class DAWN_SRW_V4171(nn.Module):
-    """DAWN-SRW v4.1.7.1 with generalized bilinear RW addresses."""
+    """DAWN-SRW v4.1.7.1 with learned operator-address embeddings."""
     __version__ = MODEL_VERSION
 
     vocab_size: int = 30000
@@ -3892,8 +3808,6 @@ class DAWN_SRW_V4171(nn.Module):
     vocab_size_padded: Optional[int] = None
 
     d_route: int = DEFAULT_D_ROUTE
-    rw_role_read_dim: Optional[int] = None
-    rw_role_write_dim: Optional[int] = None
     admission_den_power: float = DEFAULT_ADMISSION_DEN_POWER
     n_qk: int = 1580
     n_v: int = 2600
@@ -3933,20 +3847,9 @@ class DAWN_SRW_V4171(nn.Module):
     def setup(self):
         _validate_v4171_admission_den_power(
             self.admission_den_power, context="DAWN_SRW_V4171 constructor")
-        read_dim = self.rw_role_read_dim
-        write_dim = self.rw_role_write_dim
-        if (read_dim is None or write_dim is None
-                or int(read_dim) <= 0 or int(write_dim) <= 0
-                or int(self.d_route) <= 0):
+        if int(self.d_route) <= 0:
             raise ValueError(
-                "Invalid v4171 operator address geometry: "
-                f"model.rw_role_read_dim={read_dim}, "
-                f"model.rw_role_write_dim={write_dim}, "
-                f"model.d_route={self.d_route}, "
-                f"rw_bilinear_rank={RW_BILINEAR_RANK}")
-        if RW_BILINEAR_RANK <= 0:
-            raise ValueError(
-                f"v4171 RW_BILINEAR_RANK must be > 0, got {RW_BILINEAR_RANK}")
+                f"v4171 model.d_route must be > 0, got {self.d_route}")
         if self.d_model % self.n_heads != 0:
             raise ValueError(
                 f"d_model ({self.d_model}) must be divisible by "
@@ -3963,9 +3866,7 @@ class DAWN_SRW_V4171(nn.Module):
             self.n_know if self.n_know is not None else 25200)
         self.neuron_pool = NeuronPool(
             n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
-            d_model=self.d_model, d_route=self.d_route,
-            rw_role_read_dim=int(read_dim),
-            rw_role_write_dim=int(write_dim))
+            d_model=self.d_model, d_route=self.d_route)
         self.router = Router(
             d_model=self.d_model, d_route=self.d_route,
             n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
@@ -4236,18 +4137,9 @@ class DAWN_SRW_V4171(nn.Module):
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
             _ = self.neuron_pool.attn_qk_read  # triggers NeuronPool.setup
-            _ = self.neuron_pool.attn_qk_op_read_proj
-            _ = self.neuron_pool.attn_qk_op_write_proj
-            _ = self.neuron_pool.attn_v_op_read_proj
-            _ = self.neuron_pool.attn_v_op_write_proj
-            _ = self.neuron_pool.rst_op_read_proj
-            _ = self.neuron_pool.rst_op_write_proj
-            _ = self.neuron_pool.attn_qk_op_bilinear_read_mix
-            _ = self.neuron_pool.attn_qk_op_bilinear_write_mix
-            _ = self.neuron_pool.attn_v_op_bilinear_read_mix
-            _ = self.neuron_pool.attn_v_op_bilinear_write_mix
-            _ = self.neuron_pool.rst_op_bilinear_read_mix
-            _ = self.neuron_pool.rst_op_bilinear_write_mix
+            _ = self.neuron_pool.attn_qk_op_key
+            _ = self.neuron_pool.attn_v_op_key
+            _ = self.neuron_pool.rst_op_key
             _ = self.router.proj_attn(x)
             _ = self.router.proj_rst(x)
             _ = self.router.raw_tau_attn(x)
@@ -4583,9 +4475,6 @@ class DAWN_SRW_V4171(nn.Module):
                         attn_tau_all.mean()),
                     'attn_out_norm': _sg_mean(attn_out_norm_all),
                     'rst_out_norm': _sg_mean(rst_out_norm_all),
-                    'bilinear_rank': jnp.int32(RW_BILINEAR_RANK),
-                    'read_role_dim': jnp.int32(self.rw_role_read_dim),
-                    'write_role_dim': jnp.int32(self.rw_role_write_dim),
                     'd_route': jnp.int32(self.d_route),
                     'admission_den_power': jnp.float32(admission_den_power),
                     'attn_qk_admission_mass_mean': _sg_mean(qk_gate_mass_all),
@@ -5632,10 +5521,8 @@ class DAWN_SRW_V4171(nn.Module):
             'logical_vocab_size': logical_vocab_size,
             'vocab_size_padded': embedding_vocab_size,
             'd_route': self.d_route,
-            'rw_role_read_dim': self.rw_role_read_dim,
-            'rw_role_write_dim': self.rw_role_write_dim,
             'operator_key_mode': OPERATOR_KEY_MODE,
-            'rw_bilinear_rank': RW_BILINEAR_RANK,
+            'operator_query_mode': OPERATOR_QUERY_MODE,
             'admission_den_power': self.admission_den_power,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
@@ -5654,19 +5541,18 @@ class DAWN_SRW_V4171(nn.Module):
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             "Operator address:",
             f"  mode={OPERATOR_KEY_MODE}",
-            f"  read_role_dim={self.rw_role_read_dim}",
-            f"  write_role_dim={self.rw_role_write_dim}",
-            f"  bilinear_rank={RW_BILINEAR_RANK}",
             f"  d_route={self.d_route}",
+            "  independent_per_operator=true",
+            "  live_gradient=true",
             "  full_rw_execution=true",
-            "  joint_sign_invariant=true",
             f"  vocab logical/padded={logical_vocab_size}/{embedding_vocab_size}",
             f"  Attention-QK: {self.n_qk}, Attention-V: {self.n_v}, RST: {n_rst_eff}",
-            "  Selection: live-gradient generalized bilinear RW addresses with "
-            "direct state-to-operation queries",
+            "  Selection: cosine(direct state query, learned operator embedding)",
+            "Execution:",
+            "  full rank-1 read/write operator",
             "Composition:",
-            "  admission_den_power=0.5",
-            "  den=max(sum(unpruned_admission),1)^0.5",
+            f"  admission_den_power={self.admission_den_power:g}",
+            "  den=max(sum(unpruned_admission),1)^admission_den_power",
             "  numerator=execution_weight",
             "  denominator_mass=unpruned_admission",
             "  live_den_gradient=true",
@@ -5754,8 +5640,8 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
 
     The sample uses the first block's freshly initialized normalized route
     states and the shared v4171 router/pool parameters. Rho follows the
-    train path exactly: direct state projections against live-gradient
-    generalized low-rank bilinear RW-derived operator addresses.
+    train path exactly: direct state projections against independent learned
+    live-gradient operator-address embeddings.
     """
     max_tokens = int(max_tokens)
     if max_tokens <= 0:
@@ -5797,7 +5683,8 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
     def _selection_rho(h, op_key):
         q_unit = _forward_unit_direction(
             h.astype(jnp.float32)).astype(jnp.bfloat16)
-        op_key_unit = op_key.astype(jnp.bfloat16)
+        op_key_unit = _forward_unit_direction(
+            op_key.astype(jnp.float32)).astype(jnp.bfloat16)
         return (q_unit @ op_key_unit.T).astype(jnp.float32)
 
     pool = params['neuron_pool']

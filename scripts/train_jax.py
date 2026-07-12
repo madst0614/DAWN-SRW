@@ -106,7 +106,6 @@ from models.dawn_srw_v4170 import (
 )
 from models.dawn_srw_v4171 import (
     DAWN_SRW_V4171,
-    RW_BILINEAR_RANK as V4171_RW_BILINEAR_RANK,
     _validate_v4171_admission_den_power,
     _validate_v4171_admission_den_grad_scale,
     _validate_v4171_sharded_fns,
@@ -449,7 +448,7 @@ def _pool_operator_keys_for_version(version):
         return _v4170_pool_operator_keys
     if version == V4171_MODEL_VERSION:
         return _v4171_pool_operator_keys
-    raise ValueError(f"{version} does not expose RW-derived operator keys.")
+    raise ValueError(f"{version} does not expose operator keys.")
 
 
 def _model_registry_entry(version):
@@ -1058,9 +1057,10 @@ V4170_RESUME_REQUIRED_FIELDS = (
 )
 
 V4171_RESUME_REQUIRED_FIELDS = (
-    *V4170_RESUME_REQUIRED_FIELDS,
+    *V4169_RESUME_REQUIRED_FIELDS,
+    ('training', 'tau_lr_mult'),
     ('model', 'operator_key_mode'),
-    ('model', 'rw_bilinear_rank'),
+    ('model', 'operator_query_mode'),
     ('model', 'admission_den_power'),
 )
 
@@ -1267,15 +1267,13 @@ def _validate_v4171_resume_compatibility(
             "model.admission_den_power "
             f"requested={requested_den_power}, checkpoint={checkpoint_den_power}. "
             "Automatic migration/fallback is disabled.")
-    required = (
-        'd_route', 'rw_role_read_dim', 'rw_role_write_dim',
-        'operator_key_mode', 'rw_bilinear_rank')
+    required = ('d_route', 'operator_key_mode', 'operator_query_mode')
     for field in required:
         requested = requested_model_cfg.get(field)
         if field == 'operator_key_mode' and requested is None:
-            requested = 'rw_generalized_bilinear_relation'
-        elif field == 'rw_bilinear_rank' and requested is None:
-            requested = V4171_RW_BILINEAR_RANK
+            requested = 'learned_operator_embedding'
+        elif field == 'operator_query_mode' and requested is None:
+            requested = 'direct_state_projection'
         checkpoint = checkpoint_model_cfg.get(field)
         if requested != checkpoint:
             raise RuntimeError(
@@ -2516,38 +2514,35 @@ def _validate_v4170_model_config(model_cfg):
 
 
 def _validate_v4171_model_config(model_cfg):
-    read_dim = model_cfg.get('rw_role_read_dim')
-    write_dim = model_cfg.get('rw_role_write_dim')
     d_route = model_cfg.get('d_route')
     den_power = model_cfg.get('admission_den_power')
-    valid_dims = all(
-        isinstance(value, int) and not isinstance(value, bool) and value > 0
-        for value in (read_dim, write_dim, d_route))
-    if not valid_dims:
+    if (not isinstance(d_route, int) or isinstance(d_route, bool)
+            or d_route <= 0):
         raise ValueError(
-            "Invalid v4171 operator address geometry: "
-            f"model.rw_role_read_dim={read_dim}, "
-            f"model.rw_role_write_dim={write_dim}, "
-            f"model.d_route={d_route}")
-    if V4171_RW_BILINEAR_RANK <= 0:
+            f"v4171 model.d_route must be a positive integer, got {d_route!r}")
+    obsolete = tuple(
+        key for key in ('rw_role_read_dim', 'rw_role_write_dim')
+        if key in model_cfg)
+    if obsolete:
         raise ValueError(
-            "v4171 canonical bilinear rank must be positive, got "
-            f"{V4171_RW_BILINEAR_RANK}")
+            "v4171 learned operator embeddings do not accept obsolete model "
+            "fields: " + ", ".join(obsolete))
     den_power_value = _validate_v4171_admission_den_power(
         den_power, context="v4171 model config")
     mode = model_cfg.get(
-        'operator_key_mode', 'rw_generalized_bilinear_relation')
-    if mode != 'rw_generalized_bilinear_relation':
+        'operator_key_mode', 'learned_operator_embedding')
+    if mode != 'learned_operator_embedding':
         raise ValueError(
             "v4171 requires model.operator_key_mode="
-            f"rw_generalized_bilinear_relation, got {mode!r}")
-    rank = model_cfg.get('rw_bilinear_rank', V4171_RW_BILINEAR_RANK)
-    if rank != V4171_RW_BILINEAR_RANK:
+            f"learned_operator_embedding, got {mode!r}")
+    query_mode = model_cfg.get(
+        'operator_query_mode', 'direct_state_projection')
+    if query_mode != 'direct_state_projection':
         raise ValueError(
-            f"v4171 requires model.rw_bilinear_rank="
-            f"{V4171_RW_BILINEAR_RANK}, got {rank!r}")
+            "v4171 requires model.operator_query_mode="
+            f"direct_state_projection, got {query_mode!r}")
     model_cfg['operator_key_mode'] = mode
-    model_cfg['rw_bilinear_rank'] = V4171_RW_BILINEAR_RANK
+    model_cfg['operator_query_mode'] = query_mode
     model_cfg['admission_den_power'] = den_power_value
 
 
@@ -2733,8 +2728,6 @@ def _dawn_srw_kwargs(cfg):
         })
     if str(version) == V4171_MODEL_VERSION:
         kw.update({
-            'rw_role_read_dim': m['rw_role_read_dim'],
-            'rw_role_write_dim': m['rw_role_write_dim'],
             'admission_den_power': m['admission_den_power'],
         })
     if str(version) == V4167_MODEL_VERSION:
@@ -5148,8 +5141,12 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     for i, (name, emb_key, read_key, write_key, scale_key) in enumerate(specs):
         read = _flat_pool_tensor(name, 'read')
         write = _flat_pool_tensor(name, 'write')
-        if (_is_active_srw_version(model_version)
-                and _is_rw_key_srw_version(model_version)):
+        if v4171_op_keys is not None:
+            op_key = v4171_op_keys[f'{name}_op_key']
+            out.update(_row_norm_stats(
+                op_key, f'{name}_op_key_norm', full))
+        elif (_is_active_srw_version(model_version)
+              and _is_rw_key_srw_version(model_version)):
             op_read_key = f'{name}_op_read_proj'
             op_write_key = f'{name}_op_write_proj'
             if name == 'attn_qk':
@@ -5160,9 +5157,7 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
                 op_write_key = 'attn_v_op_write_proj'
             if (read is not None and write is not None
                     and op_read_key in pool and op_write_key in pool):
-                if v4171_op_keys is not None:
-                    op_key = v4171_op_keys[f'{name}_op_key']
-                elif v4170_op_keys is not None:
+                if v4170_op_keys is not None:
                     op_key = v4170_op_keys[f'{name}_op_key']
                 else:
                     op_key = _diag_op_key(
@@ -6369,15 +6364,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/know_emb' in ps))
 
         def _is_op_key_proj_path(ps):
-            return (('neuron_pool/attn_qk_op_read_proj' in ps)
+            return (('neuron_pool/attn_qk_op_key' in ps)
+                    or ('neuron_pool/attn_v_op_key' in ps)
+                    or ('neuron_pool/rst_op_key' in ps)
+                    or ('neuron_pool/attn_qk_op_read_proj' in ps)
                     or ('neuron_pool/attn_qk_op_write_proj' in ps)
                     or ('neuron_pool/attn_v_op_read_proj' in ps)
                     or ('neuron_pool/attn_v_op_write_proj' in ps)
                     or ('neuron_pool/rst_op_read_proj' in ps)
-                    or ('neuron_pool/rst_op_write_proj' in ps)
-                    or ('neuron_pool/attn_qk_op_bilinear_' in ps)
-                    or ('neuron_pool/attn_v_op_bilinear_' in ps)
-                    or ('neuron_pool/rst_op_bilinear_' in ps))
+                    or ('neuron_pool/rst_op_write_proj' in ps))
 
         def _is_router_proj_attn_path(ps):
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
@@ -6396,23 +6391,23 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _is_op_key_qk_path(ps):
             return (('neuron_pool/attn_qk_emb' in ps)
                     or ('neuron_pool/qk_emb' in ps)
+                    or ('neuron_pool/attn_qk_op_key' in ps)
                     or ('neuron_pool/attn_qk_op_read_proj' in ps)
-                    or ('neuron_pool/attn_qk_op_write_proj' in ps)
-                    or ('neuron_pool/attn_qk_op_bilinear_' in ps))
+                    or ('neuron_pool/attn_qk_op_write_proj' in ps))
 
         def _is_op_key_v_path(ps):
             return (('neuron_pool/attn_v_emb' in ps)
                     or ('neuron_pool/v_emb' in ps)
+                    or ('neuron_pool/attn_v_op_key' in ps)
                     or ('neuron_pool/attn_v_op_read_proj' in ps)
-                    or ('neuron_pool/attn_v_op_write_proj' in ps)
-                    or ('neuron_pool/attn_v_op_bilinear_' in ps))
+                    or ('neuron_pool/attn_v_op_write_proj' in ps))
 
         def _is_op_key_rst_path(ps):
             return (('neuron_pool/rst_emb' in ps)
                     or ('neuron_pool/know_emb' in ps)
+                    or ('neuron_pool/rst_op_key' in ps)
                     or ('neuron_pool/rst_op_read_proj' in ps)
-                    or ('neuron_pool/rst_op_write_proj' in ps)
-                    or ('neuron_pool/rst_op_bilinear_' in ps))
+                    or ('neuron_pool/rst_op_write_proj' in ps))
 
         def _is_tau_attn_path(ps):
             return (_is_tau_attn_bias_path(ps)
@@ -8525,30 +8520,34 @@ def create_geometry_step(max_sample=512, model_version=None):
         })
         return result
 
-    def _v4171_bilinear_factor_geometry(
-            read, write, read_proj, write_proj, read_mix, write_mix, prefix):
+    def _v4171_embedding_geometry(op_key, prefix):
         def _unit(x):
             x = jnp.asarray(x, dtype=jnp.float32)
             return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-6)
 
-        stride = max(1, read.shape[0] // max_sample)
-        read_sample = read[::stride][:max_sample]
-        write_sample = write[::stride][:max_sample]
-        read_role = _unit(_unit(read_sample) @ read_proj)
-        write_role = _unit(_unit(write_sample) @ write_proj)
-        factor_rms = []
-        for factor in range(V4171_RW_BILINEAR_RANK):
-            read_view = read_role @ read_mix[factor]
-            write_view = write_role @ write_mix[factor]
-            contribution = read_view * write_view
-            factor_rms.append(jnp.sqrt(jnp.mean(jnp.square(contribution))))
-        rms = jnp.stack(factor_rms)
-        shares = rms / jnp.maximum(rms.sum(), 1.0e-8)
-        result = {}
-        for factor in range(V4171_RW_BILINEAR_RANK):
-            result[f'{prefix}_bilinear_factor_rms_{factor}'] = rms[factor]
-            result[f'{prefix}_bilinear_factor_share_{factor}'] = shares[factor]
-        return result
+        stride = max(1, op_key.shape[0] // max_sample)
+        sample = _unit(op_key[::stride][:max_sample])
+        centered = sample - sample.mean(axis=0, keepdims=True)
+        singular = jnp.linalg.svd(
+            centered, full_matrices=False, compute_uv=False)
+        energy = jnp.sum(jnp.square(singular))
+        sim = sample @ sample.T
+        mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
+        pair_count = jnp.maximum(mask.sum(), 1)
+        pair_values = jnp.where(mask, sim, 0.0)
+        nn_cos = jnp.max(jnp.where(mask, sim, -1.0), axis=-1)
+        return {
+            f'{prefix}_operator_embedding_effective_rank': (
+                energy / (jnp.max(jnp.square(singular)) + 1e-8)),
+            f'{prefix}_operator_embedding_cos_mean': (
+                pair_values.sum() / pair_count),
+            f'{prefix}_operator_embedding_cos_abs_mean': (
+                jnp.abs(pair_values).sum() / pair_count),
+            f'{prefix}_operator_embedding_nn_cos_mean': nn_cos.mean(),
+            f'{prefix}_operator_embedding_nn_cos_p95': jnp.quantile(
+                nn_cos, 0.95),
+            f'{prefix}_operator_embedding_nn_cos_max': nn_cos.max(),
+        }
 
     @jax.jit
     def geometry_step(params):
@@ -8569,20 +8568,13 @@ def create_geometry_step(max_sample=512, model_version=None):
                  'attn_v_op_write_proj'),
                 ('rst', 'rst_emb', 'rst_read', 'rst_write',
                  'rst_op_read_proj', 'rst_op_write_proj')):
-            if (read_key in pool and write_key in pool
-                    and op_read_key in pool and op_write_key in pool):
-                if v4171_keys is not None:
-                    op_key = v4171_keys[f'{name}_op_key']
-                    out.update(_v4170_relation_geometry(
-                        pool[read_key], pool[write_key],
-                        pool[op_read_key], pool[op_write_key],
-                        op_key, name))
-                    out.update(_v4171_bilinear_factor_geometry(
-                        pool[read_key], pool[write_key],
-                        pool[op_read_key], pool[op_write_key],
-                        pool[f'{name}_op_bilinear_read_mix'],
-                        pool[f'{name}_op_bilinear_write_mix'], name))
-                elif v4170_keys is not None:
+            if v4171_keys is not None:
+                op_key = v4171_keys[f'{name}_op_key']
+                out.update(_v4171_embedding_geometry(op_key, name))
+                out.update(_geom_one(op_key, f'{name}_op_key'))
+            elif (read_key in pool and write_key in pool
+                  and op_read_key in pool and op_write_key in pool):
+                if v4170_keys is not None:
                     op_key = v4170_keys[f'{name}_op_key']
                     out.update(_v4170_relation_geometry(
                         pool[read_key], pool[write_key],
@@ -8705,9 +8697,7 @@ def get_param_shardings(params, mesh, model_version=None,
         if 'neuron_pool' in path_str:
             if (version in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS
                     and (leaf.endswith('_op_read_proj')
-                         or leaf.endswith('_op_write_proj')
-                         or leaf.endswith('_op_bilinear_read_mix')
-                         or leaf.endswith('_op_bilinear_write_mix'))):
+                         or leaf.endswith('_op_write_proj'))):
                 return replicated
             if (is_stage_partitioned_pool
                     and (leaf.endswith('_stage')
@@ -14447,7 +14437,8 @@ def main():
         boundary_power_schedule_active = False
         pool_specific_gate_t = False
         admission_den_power = (
-            0.5 if is_v4171_cfg else 1.0)
+            float(cfg['model']['admission_den_power'])
+            if is_v4171_cfg else 1.0)
         admission_den_grad_scale = 1.0
         soft_gate_effective_active_eps = 1.0e-6
         inactive_aux_enabled = False
@@ -15047,7 +15038,8 @@ def main():
                 boundary_power_schedule_active = False
                 pool_specific_gate_t = False
                 admission_den_power = (
-                    0.5 if is_v4171_cfg else 1.0)
+                    float(cfg['model']['admission_den_power'])
+                    if is_v4171_cfg else 1.0)
                 admission_den_grad_scale = 1.0
                 soft_gate_effective_active_eps = 1.0e-6
                 inactive_aux_enabled = False
@@ -15262,7 +15254,8 @@ def main():
         pool_specific_gate_t = False
         boundary_power_schedule_active = False
         admission_den_power = (
-            0.5 if is_v4171_cfg else 1.0)
+            float(cfg['model']['admission_den_power'])
+            if is_v4171_cfg else 1.0)
         admission_den_grad_scale = 1.0
         soft_gate_effective_active_eps = 1.0e-6
 
@@ -16087,20 +16080,21 @@ def main():
         print(f"  Module path: {_model_registry_entry(model_version_cfg)['module']}")
         if _is_rw_key_srw_version(model_version_cfg):
             if str(model_version_cfg) == V4171_MODEL_VERSION:
-                _read_role_dim = int(cfg['model']['rw_role_read_dim'])
-                _write_role_dim = int(cfg['model']['rw_role_write_dim'])
                 print(f"DAWN-SRW {V4171_MODEL_VERSION}")
                 print("Operator address:")
-                print("  mode=rw_generalized_bilinear_relation")
-                print(f"  read_role_dim={_read_role_dim}")
-                print(f"  write_role_dim={_write_role_dim}")
-                print(f"  bilinear_rank={V4171_RW_BILINEAR_RANK}")
+                print("  mode=learned_operator_embedding")
                 print(f"  d_route={cfg['model']['d_route']}")
+                print("  independent_per_operator=true")
+                print("  live_gradient=true")
                 print("  full_rw_execution=true")
-                print("  joint_sign_invariant=true")
+                print("Selection:")
+                print("  cosine(direct state query, learned operator embedding)")
+                print("Execution:")
+                print("  full rank-1 read/write operator")
                 print("Composition:")
-                print("  admission_den_power=0.5")
-                print("  den=max(sum(unpruned_admission),1)^0.5")
+                print(f"  admission_den_power={admission_den_power:g}")
+                print("  den=max(sum(unpruned_admission),1)"
+                      f"^{admission_den_power:g}")
                 print("  numerator=execution_weight")
                 print("  denominator_mass=unpruned_admission")
                 print("  live_den_gradient=true")
@@ -16220,11 +16214,11 @@ def main():
                 print(f"[{_linear_family_label}] active definition: rho > tau "
                       "(pre-prune angular visibility)")
                 if is_v4171_cfg:
-                    print("[opspace] key=rw_generalized_bilinear_relation "
+                    print("[opspace] key=learned_operator_embedding "
                           "query=direct_state_projection "
                           "tau=calibrated_slow_learned_radius "
                           "gate=linear_angular_depth "
-                          "den=unpruned_admission_pow_0p5_live_gradient")
+                          "den=unpruned_admission_pow_custom_live_gradient")
                     print("tau policy: token-wise bounded DirectTau as local "
                           "operation-space radius")
                     print("tau init: fresh quantile calibration")
@@ -17592,11 +17586,10 @@ def main():
             }
 
         pool = p['neuron_pool']
-        if str(model_version_cfg) in (
-                V4170_MODEL_VERSION, V4171_MODEL_VERSION):
-            return _v4170_pool_operator_keys(pool)
         if str(model_version_cfg) == V4171_MODEL_VERSION:
             return _v4171_pool_operator_keys(pool)
+        if str(model_version_cfg) == V4170_MODEL_VERSION:
+            return _v4170_pool_operator_keys(pool)
         if ('attn_qk_read_global' in pool
                 or 'attn_qk_read_shared' in pool):
             def _flat_op_key(prefix):
@@ -18264,11 +18257,13 @@ def main():
         if _is_rw_key_srw_version(model_version_cfg):
             if str(model_version_cfg) == V4171_MODEL_VERSION:
                 log_message(
-                    "RW-key operator path: live-gradient generalized "
-                    "bilinear RW addresses, direct state-to-operation queries")
+                    "Operator address: independent learned live-gradient "
+                    "embeddings with direct state-to-operation queries; "
+                    "execution remains full rank-1 RW")
                 log_message(
-                    "Composition: admission_den_power=0.5; "
-                    "den=max(sum(unpruned_admission),1)^0.5; "
+                    f"Composition: admission_den_power={admission_den_power:g}; "
+                    "den=max(sum(unpruned_admission),1)"
+                    f"^{admission_den_power:g}; "
                     "numerator=execution_weight; live_den_gradient=true; "
                     "runtime_source=model.admission_den_power")
             elif str(model_version_cfg) == V4170_MODEL_VERSION:

@@ -19,12 +19,10 @@ model:
   gradient_checkpointing: true
 
   d_route: 256
-  rw_role_read_dim: 64
-  rw_role_write_dim: 64
-  admission_den_power: 0.5
+  admission_den_power: 1.0
   n_qk: 3798
   n_v: 11824
-  n_rst: 31756
+  n_rst: 30474
 
   tau_init_mode: quantile_frac
   tau_init_min: -0.95
@@ -61,4 +59,4 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_tau1e3
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_emb_tau
