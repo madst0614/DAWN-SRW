@@ -391,11 +391,16 @@ def _pool_operator_keys(pool_params):
             ('attn_v', 'attn_v_read'),
             ('rst', 'rst_read')):
         op_key = keys[f'{prefix}_op_key']
-        expected_rows = int(pool_params[read_key].shape[0])
-        if op_key.ndim != 2 or int(op_key.shape[0]) != expected_rows:
+        if op_key.ndim != 2:
             raise ValueError(
-                f"v4171 {prefix}_op_key shape mismatch: expected "
-                f"[{expected_rows}, d_route], got {op_key.shape}")
+                f"v4171 {prefix}_op_key must have rank 2 [N, d_route], "
+                f"got {op_key.shape}")
+        if read_key in pool_params:
+            expected_rows = int(pool_params[read_key].shape[0])
+            if int(op_key.shape[0]) != expected_rows:
+                raise ValueError(
+                    f"v4171 {prefix}_op_key shape mismatch: expected "
+                    f"[{expected_rows}, d_route], got {op_key.shape}")
         if d_route is None:
             d_route = int(op_key.shape[1])
             if d_route <= 0:
@@ -3889,7 +3894,7 @@ class DAWN_SRW_V4171(nn.Module):
                  soft_gate_T_rst=None,
                  soft_gate_boundary_power=2.0,
                  soft_gate_boundary_power_final=4.0,
-                 admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+                 admission_den_power=None,
                  execution_prune_eps=0.0,
                  minimal_train=False,
                  ce_token_chunk_size=32768,
@@ -3901,10 +3906,12 @@ class DAWN_SRW_V4171(nn.Module):
         such as distribution shape, selection diagnostics, entropy, tau stats,
         raw norms, and output-stability norms.
         """
-        runtime_admission_den_power = _validate_v4171_admission_den_power(
-            admission_den_power, context="DAWN_SRW_V4171 forward")
         model_admission_den_power = _validate_v4171_admission_den_power(
             self.admission_den_power, context="DAWN_SRW_V4171 constructor")
+        runtime_admission_den_power = _validate_v4171_admission_den_power(
+            model_admission_den_power
+            if admission_den_power is None else admission_den_power,
+            context="DAWN_SRW_V4171 forward")
         if runtime_admission_den_power != model_admission_den_power:
             raise ValueError(
                 "v4171 constructor/forward admission_den_power mismatch: "

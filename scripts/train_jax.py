@@ -5222,10 +5222,13 @@ def _pool_update_diagnostics(params, grads):
             out[f'{name}_{short}_grad_norm'] = g_norm
             out[f'{name}_{short}_grad_ratio'] = g_norm / (p_norm + 1e-8)
     op_specs = (
+        ('attn_qk', 'op_key', 'attn_qk_op_key'),
         ('attn_qk', 'op_read_proj', 'attn_qk_op_read_proj'),
         ('attn_qk', 'op_write_proj', 'attn_qk_op_write_proj'),
+        ('attn_v', 'op_key', 'attn_v_op_key'),
         ('attn_v', 'op_read_proj', 'attn_v_op_read_proj'),
         ('attn_v', 'op_write_proj', 'attn_v_op_write_proj'),
+        ('rst', 'op_key', 'rst_op_key'),
         ('rst', 'op_read_proj', 'rst_op_read_proj'),
         ('rst', 'op_write_proj', 'rst_op_write_proj'),
     )
@@ -6835,7 +6838,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_router_scan_rst = _child_norm(_grouter, 'raw_scan_offset_rst')
         grad_pool_attn_qk_emb = _child_norm(_gpool, 'attn_qk_emb')
         grad_pool_attn_qk_op_key = (
-            _child_norm(_gpool, 'attn_qk_op_read_proj')
+            _child_norm(_gpool, 'attn_qk_op_key')
+            + _child_norm(_gpool, 'attn_qk_op_read_proj')
             + _child_norm(_gpool, 'attn_qk_op_write_proj'))
         grad_pool_attn_qk_read = _pool_partition_norm(
             _gpool, 'attn_qk', 'read')
@@ -6843,7 +6847,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             _gpool, 'attn_qk', 'write')
         grad_pool_attn_v_emb = _child_norm(_gpool, 'attn_v_emb')
         grad_pool_attn_v_op_key = (
-            _child_norm(_gpool, 'attn_v_op_read_proj')
+            _child_norm(_gpool, 'attn_v_op_key')
+            + _child_norm(_gpool, 'attn_v_op_read_proj')
             + _child_norm(_gpool, 'attn_v_op_write_proj'))
         grad_pool_attn_v_read = _pool_partition_norm(
             _gpool, 'attn_v', 'read')
@@ -6851,7 +6856,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             _gpool, 'attn_v', 'write')
         grad_pool_rst_emb = _child_norm(_gpool, 'rst_emb')
         grad_pool_rst_op_key = (
-            _child_norm(_gpool, 'rst_op_read_proj')
+            _child_norm(_gpool, 'rst_op_key')
+            + _child_norm(_gpool, 'rst_op_read_proj')
             + _child_norm(_gpool, 'rst_op_write_proj'))
         grad_pool_rst_read = _pool_partition_norm(_gpool, 'rst', 'read')
         grad_pool_rst_write = _pool_partition_norm(_gpool, 'rst', 'write')
@@ -8784,6 +8790,9 @@ def _print_param_sharding_summary(param_shardings, model_version):
                     'neuron_pool/attn_v_write',
                     'neuron_pool/rst_read',
                     'neuron_pool/rst_write',
+                    'neuron_pool/attn_qk_op_key',
+                    'neuron_pool/attn_v_op_key',
+                    'neuron_pool/rst_op_key',
                     'neuron_pool/attn_qk_op_read_proj',
                     'neuron_pool/attn_qk_op_write_proj',
                     'neuron_pool/attn_v_op_read_proj',
@@ -13522,6 +13531,7 @@ def create_canonical_optimizer(params, training_cfg, total_optimizer_steps,
     )
     pool_names = (
         'attn_qk_emb', 'attn_v_emb', 'rst_emb',
+        'attn_qk_op_key', 'attn_v_op_key', 'rst_op_key',
         'attn_qk_op_read_proj', 'attn_qk_op_write_proj',
         'attn_v_op_read_proj', 'attn_v_op_write_proj',
         'rst_op_read_proj', 'rst_op_write_proj',
