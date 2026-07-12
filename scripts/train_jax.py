@@ -107,6 +107,9 @@ from models.dawn_srw_v4170 import (
 from models.dawn_srw_v4171 import (
     DAWN_SRW_V4171,
     RW_BILINEAR_RANK as V4171_RW_BILINEAR_RANK,
+    _validate_v4171_admission_den_power,
+    _validate_v4171_admission_den_grad_scale,
+    _validate_v4171_sharded_fns,
     _pool_operator_keys as _v4171_pool_operator_keys,
     _query_geometry_diagnostics as _v4171_query_geometry_diagnostics,
     _raw_tau_init_from_cosine_tau as _v4171_raw_tau_init_from_cosine_tau,
@@ -1244,9 +1247,29 @@ def _validate_v4171_resume_compatibility(
             "migration, random initialization, and outer-key fallback are "
             "disabled. "
             f"requested={requested_version}, checkpoint={checkpoint_version}")
+    requested_den_power = _v4171_checkpoint_den_power(
+        requested_model_cfg,
+        missing_message=(
+            "v4171 requested full_config.model is missing "
+            "admission_den_power"),
+        context="v4171 requested full_config.model",
+    )
+    checkpoint_den_power = _v4171_checkpoint_den_power(
+        checkpoint_model_cfg,
+        missing_message=(
+            "v4171 checkpoint full_config.model is missing "
+            "admission_den_power"),
+        context="v4171 checkpoint full_config.model",
+    )
+    if requested_den_power != checkpoint_den_power:
+        raise RuntimeError(
+            "v4171 checkpoint model schema mismatch: "
+            "model.admission_den_power "
+            f"requested={requested_den_power}, checkpoint={checkpoint_den_power}. "
+            "Automatic migration/fallback is disabled.")
     required = (
         'd_route', 'rw_role_read_dim', 'rw_role_write_dim',
-        'operator_key_mode', 'rw_bilinear_rank', 'admission_den_power')
+        'operator_key_mode', 'rw_bilinear_rank')
     for field in required:
         requested = requested_model_cfg.get(field)
         if field == 'operator_key_mode' and requested is None:
@@ -1261,6 +1284,32 @@ def _validate_v4171_resume_compatibility(
                 "Automatic migration/fallback is disabled.")
 
 
+def _v4171_checkpoint_den_power(model_cfg, *, missing_message, context):
+    if not isinstance(model_cfg, dict) or 'admission_den_power' not in model_cfg:
+        raise RuntimeError(missing_message)
+    try:
+        return _validate_v4171_admission_den_power(
+            model_cfg['admission_den_power'], context=context)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _v4171_static_runtime_den_power(model, value, *, context,
+                                    sharded_fns=None):
+    runtime_value = _validate_v4171_admission_den_power(
+        value, context=context)
+    model_value = _validate_v4171_admission_den_power(
+        getattr(model, 'admission_den_power', None),
+        context="v4171 model constructor",
+    )
+    if runtime_value != model_value:
+        raise ValueError(
+            f"{context} admission_den_power={runtime_value} does not match "
+            f"v4171 model constructor admission_den_power={model_value}")
+    _validate_v4171_sharded_fns(sharded_fns, model_value)
+    return runtime_value
+
+
 def _require_resume_materialized_fields(full_config):
     model_version_missing = _missing_config_paths(
         full_config, (('model', 'model_version'),))
@@ -1273,6 +1322,14 @@ def _require_resume_materialized_fields(full_config):
     model_version = full_config['model']['model_version']
     if not _is_active_srw_version(model_version):
         return
+    if str(model_version) == V4171_MODEL_VERSION:
+        _v4171_checkpoint_den_power(
+            full_config.get('model'),
+            missing_message=(
+                "v4171 checkpoint full_config.model is missing "
+                "admission_den_power"),
+            context="v4171 checkpoint full_config.model",
+        )
     training_cfg = (
         full_config.get('training', {})
         if isinstance(full_config.get('training', {}), dict) else {})
@@ -2466,10 +2523,6 @@ def _validate_v4171_model_config(model_cfg):
     valid_dims = all(
         isinstance(value, int) and not isinstance(value, bool) and value > 0
         for value in (read_dim, write_dim, d_route))
-    try:
-        den_power_value = float(den_power)
-    except (TypeError, ValueError):
-        den_power_value = float('nan')
     if not valid_dims:
         raise ValueError(
             "Invalid v4171 operator address geometry: "
@@ -2480,10 +2533,8 @@ def _validate_v4171_model_config(model_cfg):
         raise ValueError(
             "v4171 canonical bilinear rank must be positive, got "
             f"{V4171_RW_BILINEAR_RANK}")
-    if not math.isfinite(den_power_value) or den_power_value != 0.5:
-        raise ValueError(
-            "v4171 requires model.admission_den_power=0.5, got "
-            f"{den_power!r}")
+    den_power_value = _validate_v4171_admission_den_power(
+        den_power, context="v4171 model config")
     mode = model_cfg.get(
         'operator_key_mode', 'rw_generalized_bilinear_relation')
     if mode != 'rw_generalized_bilinear_relation':
@@ -5407,6 +5458,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             "training.ce_token_chunk_size must be > 0, got "
             f"{_ce_token_chunk_size}")
     _train_compute_accuracy = bool(train_compute_accuracy)
+    _model_version = getattr(
+        model, '__version__', getattr(type(model), '__version__', ''))
+    _is_v4171_model = str(_model_version) == V4171_MODEL_VERSION
+    if _is_v4171_model:
+        admission_den_power = _v4171_static_runtime_den_power(
+            model, admission_den_power,
+            context="v4171 train runtime",
+            sharded_fns=sharded_fns,
+        )
     _fixed_runtime = None
     if runtime_state is not None:
         if not isinstance(runtime_state, dict):
@@ -5427,7 +5487,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _fixed_runtime = {
             key: jnp.float32(runtime_state[key])
             for key in required_runtime
+            if key != 'admission_den_power'
         }
+        _fixed_runtime['admission_den_power'] = (
+            _v4171_static_runtime_den_power(
+                model, runtime_state['admission_den_power'],
+                context="v4171 source-final train runtime",
+                sharded_fns=sharded_fns,
+            )
+            if _is_v4171_model
+            else jnp.float32(runtime_state['admission_den_power'])
+        )
         if 'training_tokens' in runtime_state:
             _fixed_runtime['training_tokens'] = jnp.float32(
                 runtime_state['training_tokens'])
@@ -5441,13 +5511,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_training_tokens_kw = _model_accepts_training_tokens(model)
     _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
     _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
-    _model_version = getattr(
-        model, '__version__', getattr(type(model), '__version__', ''))
     _is_linear_direct_tau_model = (
         str(_model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     _is_v4170_model = str(_model_version) in (
         V4170_MODEL_VERSION, V4171_MODEL_VERSION)
-    _is_v4171_model = str(_model_version) == V4171_MODEL_VERSION
     _use_minimal_train_path = (
         str(_model_version) in (
             V4166_MODEL_VERSION, V4168_MODEL_VERSION, V4169_MODEL_VERSION,
@@ -5542,7 +5609,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
-    _admission_den_power = jnp.float32(admission_den_power)
+    _admission_den_power = (
+        admission_den_power
+        if _is_v4171_model else jnp.float32(admission_den_power))
     _tokens_per_step = jnp.float32(max(0, int(tokens_per_step or 0)))
     _inactive_aux_start_frac = jnp.float32(inactive_aux_start_frac)
     _inactive_aux_full_frac = jnp.float32(inactive_aux_full_frac)
@@ -7999,6 +8068,13 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             f"{_ce_token_chunk_size}")
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
+    _is_v4171_model = str(_model_version) == V4171_MODEL_VERSION
+    if _is_v4171_model:
+        admission_den_power = _v4171_static_runtime_den_power(
+            model, admission_den_power,
+            context="v4171 eval runtime",
+            sharded_fns=sharded_fns,
+        )
     _is_linear_direct_tau_model = (
         str(_model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     _use_minimal_train_path = (
@@ -8051,7 +8127,9 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
-    _admission_den_power = jnp.float32(admission_den_power)
+    _admission_den_power = (
+        admission_den_power
+        if _is_v4171_model else jnp.float32(admission_den_power))
     _fixed_runtime = None
     if runtime_state is not None:
         required_runtime = (
@@ -8070,7 +8148,17 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         _fixed_runtime = {
             key: jnp.float32(runtime_state[key])
             for key in required_runtime
+            if key != 'admission_den_power'
         }
+        _fixed_runtime['admission_den_power'] = (
+            _v4171_static_runtime_den_power(
+                model, runtime_state['admission_den_power'],
+                context="v4171 source-final eval runtime",
+                sharded_fns=sharded_fns,
+            )
+            if _is_v4171_model
+            else jnp.float32(runtime_state['admission_den_power'])
+        )
 
     @jax.jit
     def eval_step(params, input_ids, labels, attention_mask, step):
@@ -8219,6 +8307,15 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_den_power_kw = _model_accepts_admission_den_power(model)
     _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
     _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
+    _model_version = getattr(
+        model, '__version__', getattr(type(model), '__version__', ''))
+    _is_v4171_model = str(_model_version) == V4171_MODEL_VERSION
+    if _is_v4171_model:
+        admission_den_power = _v4171_static_runtime_den_power(
+            model, admission_den_power,
+            context="v4171 analysis runtime",
+            sharded_fns=sharded_fns,
+        )
     _ce_token_chunk_size = int(ce_token_chunk_size)
     if _ce_token_chunk_size <= 0:
         raise ValueError(
@@ -8273,7 +8370,9 @@ def create_analysis_step(model, sharded_fns=None,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
-    _admission_den_power = jnp.float32(admission_den_power)
+    _admission_den_power = (
+        admission_den_power
+        if _is_v4171_model else jnp.float32(admission_den_power))
 
     @jax.jit
     def analysis_step(params, input_ids, attention_mask, step):
@@ -13226,6 +13325,10 @@ def initialize_distributed_runtime(cfg):
 def _checkpoint_final_runtime(full_config, checkpoint_path):
     training = full_config.get('training', {})
     model = full_config.get('model', {})
+    if not isinstance(model, dict):
+        raise RuntimeError(
+            f"Transfer checkpoint {checkpoint_path} has invalid "
+            "full_config.model")
     version = str(model.get('model_version', ''))
     if not isinstance(training, dict):
         raise RuntimeError(
@@ -13239,35 +13342,65 @@ def _checkpoint_final_runtime(full_config, checkpoint_path):
     }
     runtime = {}
     if _is_active_srw_version(version):
-        required = (
-            *pool_final_keys.values(),
-            'soft_gate_t_final', 'soft_gate_boundary_power_final',
-            'admission_den_power', 'admission_den_grad_scale',
-            'soft_gate_effective_active_eps', 'tau_lr_mult',
-        )
+        if version == V4171_MODEL_VERSION:
+            required = ['tau_lr_mult']
+        else:
+            required = [
+                *pool_final_keys.values(),
+                'soft_gate_t_final', 'soft_gate_boundary_power_final',
+                'soft_gate_effective_active_eps', 'tau_lr_mult',
+            ]
+            required.extend((
+                'admission_den_power', 'admission_den_grad_scale'))
         missing = [key for key in required if key not in training]
         if missing:
             raise RuntimeError(
                 f"Transfer checkpoint {checkpoint_path} is missing "
                 "materialized final runtime values: " + ", ".join(missing))
-        for pool, key in pool_final_keys.items():
-            value = float(training[key])
-            if not math.isfinite(value) or value <= 0.0:
-                raise RuntimeError(
-                    f"Transfer checkpoint {checkpoint_path} has invalid "
-                    f"full_config.training.{key}={training[key]!r}")
-            runtime[f'soft_gate_T_{pool}'] = value
-        runtime['soft_gate_temperature'] = runtime['soft_gate_T_qk']
-        runtime['soft_gate_t_final'] = float(training['soft_gate_t_final'])
-        runtime['soft_gate_boundary_power'] = float(
-            training['soft_gate_boundary_power_final'])
-        runtime['soft_gate_boundary_power_final'] = float(
-            training['soft_gate_boundary_power_final'])
-        runtime['admission_den_power'] = float(training['admission_den_power'])
-        runtime['admission_den_grad_scale'] = float(
-            training['admission_den_grad_scale'])
-        runtime['soft_gate_effective_active_eps'] = float(
-            training['soft_gate_effective_active_eps'])
+        if version == V4171_MODEL_VERSION:
+            runtime.update({
+                'soft_gate_T_qk': 0.07,
+                'soft_gate_T_v': 0.07,
+                'soft_gate_T_rst': 0.07,
+                'soft_gate_temperature': 0.07,
+                'soft_gate_t_final': 0.07,
+                'soft_gate_boundary_power': 4.0,
+                'soft_gate_boundary_power_final': 4.0,
+                'soft_gate_effective_active_eps': 1.0e-6,
+            })
+            runtime['admission_den_power'] = _v4171_checkpoint_den_power(
+                model,
+                missing_message=(
+                    "v4171 checkpoint full_config.model is missing "
+                    "admission_den_power"),
+                context="v4171 checkpoint full_config.model",
+            )
+            runtime['admission_den_grad_scale'] = (
+                _validate_v4171_admission_den_grad_scale(
+                    1.0, context="v4171 source-final runtime"))
+            runtime['admission_den_runtime_source'] = (
+                'full_config.model.admission_den_power')
+        else:
+            for pool, key in pool_final_keys.items():
+                value = float(training[key])
+                if not math.isfinite(value) or value <= 0.0:
+                    raise RuntimeError(
+                        f"Transfer checkpoint {checkpoint_path} has invalid "
+                        f"full_config.training.{key}={training[key]!r}")
+                runtime[f'soft_gate_T_{pool}'] = value
+            runtime['soft_gate_temperature'] = runtime['soft_gate_T_qk']
+            runtime['soft_gate_t_final'] = float(
+                training['soft_gate_t_final'])
+            runtime['soft_gate_boundary_power'] = float(
+                training['soft_gate_boundary_power_final'])
+            runtime['soft_gate_boundary_power_final'] = float(
+                training['soft_gate_boundary_power_final'])
+            runtime['admission_den_power'] = float(
+                training['admission_den_power'])
+            runtime['admission_den_grad_scale'] = float(
+                training['admission_den_grad_scale'])
+            runtime['soft_gate_effective_active_eps'] = float(
+                training['soft_gate_effective_active_eps'])
         runtime['tau_lr_mult'] = float(training['tau_lr_mult'])
     else:
         runtime.update({
@@ -13315,6 +13448,15 @@ def resolve_transfer_checkpoint(source):
     _require_resume_full_config(full_config)
     _require_resume_materialized_fields(full_config)
     runtime_state = _checkpoint_final_runtime(full_config, checkpoint_path)
+    if (str(full_config.get('model', {}).get('model_version', ''))
+            == V4171_MODEL_VERSION
+            and jax.process_index() == 0):
+        print("Source checkpoint runtime:", flush=True)
+        print(
+            "  admission_den_power="
+            f"{runtime_state['admission_den_power']}", flush=True)
+        print("  admission_den_grad_scale=1.0", flush=True)
+        print("  source=full_config.model", flush=True)
     return TransferCheckpoint(
         source=str(source),
         run_folder=str(run_folder),
@@ -13675,6 +13817,12 @@ def restore_transfer_params(source_checkpoint, target_params, mesh):
         raise RuntimeError(
             "Orbax partial restore did not return state.params from "
             f"{source_checkpoint.checkpoint_path}")
+    source_version = str(
+        source_checkpoint.full_config.get('model', {}).get(
+            'model_version', ''))
+    if source_version == V4171_MODEL_VERSION:
+        _validate_v4171_checkpoint_param_schema(
+            restored_state['params'], target_params)
     return _match_tree_to_template_on_mesh(
         restored_state['params'], target_params, mesh, name='params')
 
@@ -13846,8 +13994,14 @@ def create_canonical_train_step(model, optimizer, cfg, sharded_fns, mesh,
             'soft_gate_boundary_power_mid_frac', 0.8)),
         'soft_gate_boundary_power_final_frac': float(t.get(
             'soft_gate_boundary_power_final_frac', 0.95)),
-        'admission_den_power': float(
-            m.get('admission_den_power', t.get('admission_den_power', 1.0))),
+        'admission_den_power': (
+            _validate_v4171_admission_den_power(
+                m.get('admission_den_power'),
+                context="v4171 canonical train config",
+            )
+            if version == V4171_MODEL_VERSION
+            else float(m.get(
+                'admission_den_power', t.get('admission_den_power', 1.0)))),
         'sharded_fns': sharded_fns,
         'mesh': mesh,
         'is_baseline': _is_baseline_version(version),
@@ -13887,6 +14041,20 @@ def _fixed_runtime_forward_kwargs(model, sharded_fns, runtime_state,
     if runtime_state is None:
         raise RuntimeError(
             "transfer model forward requires source_final_constant runtime")
+    model_version = str(getattr(
+        model, '__version__', getattr(type(model), '__version__', '')))
+    if model_version == V4171_MODEL_VERSION:
+        den_power = _v4171_static_runtime_den_power(
+            model, runtime_state.get('admission_den_power'),
+            context="v4171 source-final forward runtime",
+            sharded_fns=sharded_fns,
+        )
+        _validate_v4171_admission_den_grad_scale(
+            runtime_state.get('admission_den_grad_scale'),
+            context="v4171 source-final forward runtime",
+        )
+    else:
+        den_power = runtime_state.get('admission_den_power')
     kwargs = {}
     if sharded_fns is not None:
         kwargs['sharded_fns'] = sharded_fns
@@ -13904,7 +14072,9 @@ def _fixed_runtime_forward_kwargs(model, sharded_fns, runtime_state,
             if key not in runtime_state:
                 raise RuntimeError(
                     f"source_final_constant runtime is missing {key}")
-            kwargs[key] = runtime_state[key]
+            kwargs[key] = (
+                den_power if key == 'admission_den_power'
+                else runtime_state[key])
     if _model_accepts_execution_prune_eps(model):
         kwargs['execution_prune_eps'] = 0.0
     if _model_accepts_ce_token_chunk_size(model):
@@ -14630,6 +14800,7 @@ def main():
                 'selection_calibration_applied', False)))
         selection_calibration_restore_required = bool(
             (not operation_space_tau_free_enabled)
+            and (not is_v4171_cfg)
             and (selection_calibration_cfg.get('enabled', False)
                  or checkpoint_selection_calibration_applied))
         if selection_calibration_restore_required:
@@ -15928,10 +16099,12 @@ def main():
                 print("  full_rw_execution=true")
                 print("  joint_sign_invariant=true")
                 print("Composition:")
-                print("  den=max(sum(admission),1)^0.5")
+                print("  admission_den_power=0.5")
+                print("  den=max(sum(unpruned_admission),1)^0.5")
                 print("  numerator=execution_weight")
                 print("  denominator_mass=unpruned_admission")
                 print("  live_den_gradient=true")
+                print("  runtime_source=model.admission_den_power")
             elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 _read_role_dim = int(cfg['model']['rw_role_read_dim'])
                 _write_role_dim = int(cfg['model']['rw_role_write_dim'])
@@ -18094,8 +18267,10 @@ def main():
                     "RW-key operator path: live-gradient generalized "
                     "bilinear RW addresses, direct state-to-operation queries")
                 log_message(
-                    "Composition: den=max(sum(unpruned_admission),1)^0.5; "
-                    "numerator=execution_weight; live_den_gradient=true")
+                    "Composition: admission_den_power=0.5; "
+                    "den=max(sum(unpruned_admission),1)^0.5; "
+                    "numerator=execution_weight; live_den_gradient=true; "
+                    "runtime_source=model.admission_den_power")
             elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 log_message(
                     "RW-key operator path: live-gradient compressed RW "

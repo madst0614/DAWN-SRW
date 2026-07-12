@@ -281,6 +281,70 @@ RW_BILINEAR_RANK = 4
 DEFAULT_ADMISSION_DEN_POWER = 0.5
 
 
+def _validate_v4171_admission_den_power(value, *, context="v4171"):
+    """Validate the static canonical composition policy before JAX tracing."""
+    if isinstance(value, jax.core.Tracer):
+        raise ValueError(
+            f"{context} admission_den_power must be a static Python scalar; "
+            "v4171 does not support a traced or scheduled denominator power")
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"v4171 requires admission_den_power=0.5, got {value!r}") from exc
+    if not math.isfinite(value) or value != DEFAULT_ADMISSION_DEN_POWER:
+        raise ValueError(
+            f"v4171 requires admission_den_power=0.5, got {value}")
+    return value
+
+
+def _validate_v4171_admission_den_grad_scale(value, *, context="v4171"):
+    if isinstance(value, jax.core.Tracer):
+        raise ValueError(
+            f"{context} admission_den_grad_scale must be a static Python scalar")
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"v4171 requires admission_den_grad_scale=1.0, got {value!r}") from exc
+    if not math.isfinite(value) or value != 1.0:
+        raise ValueError(
+            f"v4171 requires admission_den_grad_scale=1.0, got {value}")
+    return value
+
+
+def _mark_v4171_srw_factory_output(fn, admission_den_power):
+    fn._v4171_admission_den_power = float(admission_den_power)
+    fn._v4171_admission_den_grad_scale = 1.0
+    return fn
+
+
+def _validate_v4171_sharded_fns(sharded_fns, expected_power):
+    if sharded_fns is None:
+        return
+    if not isinstance(sharded_fns, dict):
+        raise ValueError("v4171 requires dict-style canonical sharded_fns")
+    checked = set()
+    for name in (
+            'single', 'attn_v_single', 'rst_single', 'paired',
+            'attn_qk_paired', 'attn_qk_single_minimal',
+            'attn_v_single_minimal', 'rst_single_minimal',
+            'attn_qk_paired_minimal'):
+        fn = sharded_fns.get(name)
+        if fn is None or id(fn) in checked:
+            continue
+        checked.add(id(fn))
+        actual = getattr(fn, '_v4171_admission_den_power', None)
+        if actual is None:
+            raise ValueError(
+                f"v4171 sharded function {name!r} is missing canonical "
+                "admission_den_power metadata")
+        if float(actual) != float(expected_power):
+            raise ValueError(
+                "v4171 closure/runtime admission_den_power mismatch: "
+                f"sharded_fns[{name!r}]={actual}, runtime={expected_power}")
+
+
 # ================================================================
 # 1. Helpers
 # ================================================================
@@ -676,8 +740,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _compute_sparsity_mass = True
     _compact_margin_bands = False
     _angular_strong_margin = jnp.float32(0.05)
+    admission_den_power = _validate_v4171_admission_den_power(
+        admission_den_power, context="make_sharded_srw")
+    _validate_v4171_admission_den_grad_scale(
+        admission_den_grad_scale, context="make_sharded_srw")
     _admission_den_power = jnp.float32(admission_den_power)
-    del admission_den_grad_scale
 
     # SLIM out_specs: train path.
     _slim_out_specs = (
@@ -1507,7 +1574,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 + (sparsity_diag_out,)
                )
 
-    return fused_gate_srw
+    return _mark_v4171_srw_factory_output(
+        fused_gate_srw, admission_den_power)
 
 
 def make_sharded_srw_paired(mesh, max_chunk_size=2048,
@@ -1542,8 +1610,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _compute_sparsity_mass = True
     _compact_margin_bands = False
     _angular_strong_margin = jnp.float32(0.05)
+    admission_den_power = _validate_v4171_admission_den_power(
+        admission_den_power, context="make_sharded_srw_paired")
+    _validate_v4171_admission_den_grad_scale(
+        admission_den_grad_scale, context="make_sharded_srw_paired")
     _admission_den_power = jnp.float32(admission_den_power)
-    del admission_den_grad_scale
 
     _slim_out_specs = (
         P('data', None, None, None),  # out [B,S,2,D]
@@ -2400,7 +2471,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 + (sparsity_diag_out,)
                )
 
-    return fused_gate_srw_paired
+    return _mark_v4171_srw_factory_output(
+        fused_gate_srw_paired, admission_den_power)
 
 
 def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
@@ -2409,8 +2481,12 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
                              admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
                              admission_den_grad_scale=1.0):
     """Create a shard_map'd single-route SRW kernel plus active scalars."""
+    admission_den_power = _validate_v4171_admission_den_power(
+        admission_den_power, context="make_sharded_srw_minimal")
+    _validate_v4171_admission_den_grad_scale(
+        admission_den_grad_scale, context="make_sharded_srw_minimal")
     _admission_den_power = jnp.float32(admission_den_power)
-    del dead_exposure_target, admission_den_grad_scale
+    del dead_exposure_target
     _soft_gate_effective_active_eps = jnp.float32(
         soft_gate_effective_active_eps)
 
@@ -2579,7 +2655,8 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
             jax.lax.stop_gradient(normalized_srw_out_norm.astype(jnp.float32)),
         )
 
-    return fused_gate_srw_minimal
+    return _mark_v4171_srw_factory_output(
+        fused_gate_srw_minimal, admission_den_power)
 
 
 def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
@@ -2588,8 +2665,12 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
                                     admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
                                     admission_den_grad_scale=1.0):
     """Create a shard_map'd Q/K SRW kernel plus per-route active scalars."""
+    admission_den_power = _validate_v4171_admission_den_power(
+        admission_den_power, context="make_sharded_srw_paired_minimal")
+    _validate_v4171_admission_den_grad_scale(
+        admission_den_grad_scale, context="make_sharded_srw_paired_minimal")
     _admission_den_power = jnp.float32(admission_den_power)
-    del dead_exposure_target, admission_den_grad_scale
+    del dead_exposure_target
     _soft_gate_effective_active_eps = jnp.float32(
         soft_gate_effective_active_eps)
 
@@ -2808,7 +2889,8 @@ def make_sharded_srw_paired_minimal(mesh, max_chunk_size=2048,
             jax.lax.stop_gradient(normalized_norm_by_route[1]),
         )
 
-    return fused_gate_srw_paired_minimal
+    return _mark_v4171_srw_factory_output(
+        fused_gate_srw_paired_minimal, admission_den_power)
 
 
 # ================================================================
@@ -3849,6 +3931,8 @@ class DAWN_SRW_V4171(nn.Module):
         return logical, embedding
 
     def setup(self):
+        _validate_v4171_admission_den_power(
+            self.admission_den_power, context="DAWN_SRW_V4171 constructor")
         read_dim = self.rw_role_read_dim
         write_dim = self.rw_role_write_dim
         if (read_dim is None or write_dim is None
@@ -3916,6 +4000,18 @@ class DAWN_SRW_V4171(nn.Module):
         such as distribution shape, selection diagnostics, entropy, tau stats,
         raw norms, and output-stability norms.
         """
+        runtime_admission_den_power = _validate_v4171_admission_den_power(
+            admission_den_power, context="DAWN_SRW_V4171 forward")
+        model_admission_den_power = _validate_v4171_admission_den_power(
+            self.admission_den_power, context="DAWN_SRW_V4171 constructor")
+        if runtime_admission_den_power != model_admission_den_power:
+            raise ValueError(
+                "v4171 constructor/forward admission_den_power mismatch: "
+                f"model={model_admission_den_power}, "
+                f"runtime={runtime_admission_den_power}")
+        _validate_v4171_sharded_fns(
+            sharded_fns, model_admission_den_power)
+        admission_den_power = model_admission_den_power
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
         soft_gate_T_qk = (
@@ -5569,10 +5665,12 @@ class DAWN_SRW_V4171(nn.Module):
             "  Selection: live-gradient generalized bilinear RW addresses with "
             "direct state-to-operation queries",
             "Composition:",
-            f"  den=max(sum(admission),1)^{self.admission_den_power:g}",
+            "  admission_den_power=0.5",
+            "  den=max(sum(unpruned_admission),1)^0.5",
             "  numerator=execution_weight",
             "  denominator_mass=unpruned_admission",
             "  live_den_gradient=true",
+            "  runtime_source=model.admission_den_power",
             "  Pool scales: fixed depth-scaled "
             f"(qk={float(qk_scale):.6g}, v={float(v_scale):.6g}, "
             f"rst={float(rst_scale):.6g})",
@@ -5613,13 +5711,19 @@ def _slice_logits_to_logical_vocab(logits, model_cfg):
 
 def _angular_execution_kwargs_from_model_cfg(model_cfg):
     """Extract v4171 canonical execution settings for inference."""
+    if 'admission_den_power' not in model_cfg:
+        raise ValueError(
+            "v4171 checkpoint full_config.model is missing "
+            "admission_den_power")
+    admission_den_power = _validate_v4171_admission_den_power(
+        model_cfg['admission_den_power'],
+        context="v4171 inference model config")
     return {
         'soft_gate_temperature': float(
             model_cfg.get('soft_gate_temperature', 0.07)),
         'soft_gate_boundary_power': float(
             model_cfg.get('soft_gate_boundary_power', 4.0)),
-        'admission_den_power': float(model_cfg.get(
-            'admission_den_power', DEFAULT_ADMISSION_DEN_POWER)),
+        'admission_den_power': admission_den_power,
         'execution_prune_eps': float(model_cfg.get('execution_prune_eps', 0.0)),
         'soft_gate_effective_active_eps': float(
             model_cfg.get('soft_gate_effective_active_eps', 1.0e-6)),
@@ -5786,8 +5890,8 @@ def _angular_execution_weight(h, op_key, raw_tau, raw_scan_offset=None,
 
 def _split_admission_den_kwargs(angular_execution_kwargs):
     execution_kwargs = dict(angular_execution_kwargs)
-    admission_den_power = jnp.float32(execution_kwargs.pop(
-        'admission_den_power', DEFAULT_ADMISSION_DEN_POWER))
+    admission_den_power = jnp.float32(
+        execution_kwargs.pop('admission_den_power'))
     return execution_kwargs, admission_den_power
 
 
