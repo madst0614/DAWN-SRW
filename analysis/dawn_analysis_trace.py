@@ -12,6 +12,7 @@ import numpy as np
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    analysis_model_module,
     format_duration,
     load_eval_data,
     maybe_load_tokenizer,
@@ -24,19 +25,17 @@ from analysis.dawn_analysis_storage import (
     write_npz_atomic,
 )
 
-from models import dawn_srw_v4166 as v4166
-
-
 TRACE_POOLS = ("q", "k", "v", "rst")
 
 
 def _srw_with_topk(x, h, op_key, raw_tau, read, write, *,
+                   model_module,
                    topk: int,
                    execution_kwargs: Dict[str, Any],
                    admission_den_power: float):
     kwargs = dict(execution_kwargs)
     kwargs.pop("admission_den_power", None)
-    _, admission, _, execution_weight, active_mask = v4166._angular_execution(
+    _, admission, _, execution_weight, active_mask = model_module._angular_execution(
         h,
         op_key,
         raw_tau,
@@ -49,14 +48,19 @@ def _srw_with_topk(x, h, op_key, raw_tau, read, write, *,
     active_count = active_mask.astype(jnp.int32).sum(axis=-1)
     top1_frac = top_val[..., 0] / jnp.maximum(mass, 1.0e-8)
 
-    r_n = v4166._forward_unit_direction(read.astype(jnp.float32))
-    w_n = v4166._forward_unit_direction(write.astype(jnp.float32))
+    r_n = model_module._forward_unit_direction(read.astype(jnp.float32))
+    w_n = model_module._forward_unit_direction(write.astype(jnp.float32))
     xr = x.astype(jnp.float32) @ r_n.T
     out = (execution_weight * xr) @ w_n
-    den = jnp.power(
-        jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0),
-        jnp.asarray(admission_den_power, dtype=jnp.float32),
-    )
+    admission_mass = admission.sum(axis=-1, keepdims=True)
+    composition_den = getattr(model_module, "_composition_den", None)
+    if composition_den is None:
+        den = jnp.power(
+            jnp.maximum(admission_mass, 1.0),
+            jnp.asarray(admission_den_power, dtype=jnp.float32),
+        )
+    else:
+        den = composition_den(admission_mass, admission_den_power)
     out = (out.astype(jnp.float32) / den).astype(jnp.float32)
     stats = {
         "top_idx": top_idx.astype(jnp.int32),
@@ -72,21 +76,22 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
                        topk: int = 8,
                        execution_prune_eps: Optional[float] = None):
     """Return compact top-k operator traces for a small fixed-shape batch."""
-    params = v4166._squeeze_params(params)
+    model_module = analysis_model_module(model_cfg)
+    params = model_module._squeeze_params(params)
     input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
     bsz, seq_len = input_ids.shape
     d_model = int(model_cfg["d_model"])
     n_layers = int(model_cfg["n_layers"])
     n_heads = int(model_cfg["n_heads"])
     d_head = d_model // n_heads
-    execution_kwargs = v4166._angular_execution_kwargs_from_model_cfg(model_cfg)
+    execution_kwargs = model_module._angular_execution_kwargs_from_model_cfg(model_cfg)
     if execution_prune_eps is not None:
         execution_kwargs["execution_prune_eps"] = float(execution_prune_eps)
     admission_den_power = float(execution_kwargs.get("admission_den_power", 1.0))
 
-    pool = v4166._pool_params_with_operator_keys(params["neuron_pool"])
+    pool = model_module._pool_params_with_operator_keys(params["neuron_pool"])
     router = params["router"]
-    qk_scale, v_scale, rst_scale = v4166._effective_pool_output_scales(
+    qk_scale, v_scale, rst_scale = model_module._effective_pool_output_scales(
         pool,
         d_model,
         n_layers,
@@ -104,16 +109,14 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
 
     for layer_idx in range(n_layers):
         bp = params[f"block_{layer_idx}"]
-        normed = v4166._layer_norm(x, bp["norm1"]["scale"], bp["norm1"]["bias"])
+        normed = model_module._layer_norm(x, bp["norm1"]["scale"], bp["norm1"]["bias"])
         h_all = normed @ router["proj_attn"]["kernel"] + router["proj_attn"]["bias"]
         h_q, h_k, h_v = jnp.split(h_all, 3, axis=-1)
-        h_q, h_k, h_v = v4166._read_write_attn_operator_queries(
-            router,
-            normed,
-            h_q,
-            h_k,
-            h_v,
-        )
+        query_adapter = getattr(
+            model_module, "_read_write_attn_operator_queries", None)
+        if query_adapter is not None:
+            h_q, h_k, h_v = query_adapter(
+                router, normed, h_q, h_k, h_v)
         tau_all = normed @ router["raw_tau_attn"]["kernel"] + router["raw_tau_attn"]["bias"]
         q, q_stats = _srw_with_topk(
             normed,
@@ -122,6 +125,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             tau_all[:, :, 0:1],
             pool["attn_qk_read"],
             pool["attn_qk_write"],
+            model_module=model_module,
             topk=topk,
             execution_kwargs=execution_kwargs,
             admission_den_power=admission_den_power,
@@ -133,6 +137,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             tau_all[:, :, 1:2],
             pool["attn_qk_read"],
             pool["attn_qk_write"],
+            model_module=model_module,
             topk=topk,
             execution_kwargs=execution_kwargs,
             admission_den_power=admission_den_power,
@@ -144,6 +149,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             tau_all[:, :, 2:3],
             pool["attn_v_read"],
             pool["attn_v_write"],
+            model_module=model_module,
             topk=topk,
             execution_kwargs=execution_kwargs,
             admission_den_power=admission_den_power,
@@ -164,9 +170,12 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
         attn_out_norm.append(jnp.linalg.norm(attn_out, axis=-1).mean())
         x = x + attn_out
 
-        normed = v4166._layer_norm(x, bp["norm2"]["scale"], bp["norm2"]["bias"])
+        normed = model_module._layer_norm(x, bp["norm2"]["scale"], bp["norm2"]["bias"])
         h_rst = normed @ router["proj_rst"]["kernel"] + router["proj_rst"]["bias"]
-        h_rst = v4166._read_write_rst_operator_query(router, normed, h_rst)
+        rst_query_adapter = getattr(
+            model_module, "_read_write_rst_operator_query", None)
+        if rst_query_adapter is not None:
+            h_rst = rst_query_adapter(router, normed, h_rst)
         tau_rst = normed @ router["raw_tau_rst"]["kernel"] + router["raw_tau_rst"]["bias"]
         rst, rst_stats = _srw_with_topk(
             normed,
@@ -175,6 +184,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             tau_rst,
             pool["rst_read"],
             pool["rst_write"],
+            model_module=model_module,
             topk=topk,
             execution_kwargs=execution_kwargs,
             admission_den_power=admission_den_power,

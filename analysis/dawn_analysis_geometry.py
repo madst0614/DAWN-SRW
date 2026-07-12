@@ -8,11 +8,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from analysis.dawn_analysis_common import AnalysisContext
+from analysis.dawn_analysis_common import AnalysisContext, analysis_model_module
 from analysis.dawn_analysis_storage import should_skip_job, write_json_atomic, write_npz_atomic
-
-from models import dawn_srw_v4166 as v4166
-
 
 POOL_SPECS = {
     "qk": ("Attention-QK", "attn_qk_op_key", "attn_qk_read", "attn_qk_write"),
@@ -40,8 +37,8 @@ def _jsonify_stats(obj):
     return obj
 
 
-def _norm_arrays(params):
-    pool = v4166._pool_params_with_operator_keys(params["neuron_pool"])
+def _norm_arrays(params, model_module):
+    pool = model_module._pool_params_with_operator_keys(params["neuron_pool"])
     out = {}
     for key, (_, op_key_key, read_key, write_key) in POOL_SPECS.items():
         out[f"{key}_op_key_norm"] = jnp.linalg.norm(pool[op_key_key], axis=-1)
@@ -50,8 +47,8 @@ def _norm_arrays(params):
     return out
 
 
-def _sample_cosines(params, max_sample: int):
-    pool = v4166._pool_params_with_operator_keys(params["neuron_pool"])
+def _sample_cosines(params, max_sample: int, model_module):
+    pool = model_module._pool_params_with_operator_keys(params["neuron_pool"])
     out = {}
     for key, (_, op_key_key, _, _) in POOL_SPECS.items():
         x = pool[op_key_key].astype(jnp.float32)
@@ -103,17 +100,24 @@ def run_geometry_stage(ctx: AnalysisContext) -> Dict[str, Any]:
     store.set_stage_status(stage, "running")
     store.mark_job_started(stage, "geometry")
     max_sample = int(args.geometry_max_sample)
+    model_module = analysis_model_module(ctx.model_cfg)
     store.log_event(stage, "start", message=f"GEOMETRY START max_sample={max_sample}", max_sample=max_sample)
 
-    health = _jsonify_stats(_to_host_tree(v4166.vectorized_neuron_health(ctx.params)))
-    weights = _jsonify_stats(_to_host_tree(v4166.vectorized_weight_analysis(ctx.params, max_sample=max_sample)))
+    health = _jsonify_stats(_to_host_tree(
+        model_module.vectorized_neuron_health(ctx.params)))
+    weights = _jsonify_stats(_to_host_tree(
+        model_module.vectorized_weight_analysis(
+            ctx.params, max_sample=max_sample)))
     norm_arrays_host = {
         k: np.asarray(v)
-        for k, v in _to_host_tree(_norm_arrays(ctx.params)).items()
+        for k, v in _to_host_tree(
+            _norm_arrays(ctx.params, model_module)).items()
     }
     cosine_host = {
         k: np.asarray(v)
-        for k, v in _to_host_tree(_sample_cosines(ctx.params, max_sample=max_sample)).items()
+        for k, v in _to_host_tree(_sample_cosines(
+            ctx.params, max_sample=max_sample,
+            model_module=model_module)).items()
     }
     hist_arrays = _build_histograms(norm_arrays_host, cosine_host)
 
@@ -167,4 +171,3 @@ def run_geometry_stage(ctx: AnalysisContext) -> Dict[str, Any]:
             )
         store.log_event(stage, "summary", message="GEOMETRY SUMMARY complete", **summary)
     return summary if ctx.is_primary else {}
-

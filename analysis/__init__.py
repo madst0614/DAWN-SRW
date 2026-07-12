@@ -1,4 +1,3 @@
-"""Resumable DAWN-SRW v4166 analysis pipeline."""
+"""Resumable DAWN-SRW analysis pipeline."""
 
-ANALYSIS_VERSION = "dawn-srw-v4166-analysis-0.1.0"
-
+ANALYSIS_VERSION = "dawn-srw-analysis-0.2.0"

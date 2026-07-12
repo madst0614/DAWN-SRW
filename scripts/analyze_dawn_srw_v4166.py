@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable DAWN-SRW v4166 analysis pipeline.
+"""Resumable DAWN-SRW v4166/v4171 analysis pipeline.
 
 Example:
   python scripts/analyze_dawn_srw_v4166.py \
@@ -32,10 +32,13 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from analysis import ANALYSIS_VERSION
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    V4166_MODEL_VERSION,
+    V4171_MODEL_VERSION,
     config_from_checkpoint_or_file,
     count_params,
     create_active_analysis_step,
     create_ce_eval_step,
+    create_composition_analysis_step,
     create_mesh_from_cfg,
     create_or_reuse_sharded_fns,
     get_train,
@@ -47,7 +50,7 @@ from analysis.dawn_analysis_common import (
     restore_params_and_cfg,
     shard_batch_to_mesh,
     sync_hosts,
-    verify_v4166_config,
+    verify_analysis_config,
     write_run_metadata,
 )
 from analysis.dawn_analysis_report import run_report_stage
@@ -110,6 +113,14 @@ TRAIN_ANALYSIS_QK_SPLIT = {
     "q": "attn_q",
     "k": "attn_k",
 }
+V4171_COMPOSITION_METRICS = (
+    "admission_mass_mean",
+    "admission_mass_max",
+    "composition_den_mean",
+    "composition_den_min",
+    "composition_den_max",
+    "composition_den_floor_frac",
+)
 REFERENCE_400M = {
     ("qk", "active_tau"): (0.045, 0.065),
     ("v", "active_tau"): (0.090, 0.120),
@@ -121,7 +132,8 @@ REFERENCE_400M = {
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Analyze DAWN-SRW spatial-r1-v4.1.6.6 checkpoints.")
+    p = argparse.ArgumentParser(
+        description="Analyze DAWN-SRW spatial-r1-v4.1.6.6/v4.1.7.1 checkpoints.")
     p.add_argument(
         "--config",
         default=None,
@@ -214,7 +226,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--operator-dataset-root",
         default=os.environ.get("DAWN_OPERATOR_DATASET_ROOT", DEFAULT_OPERATOR_DATASET_ROOT),
-        help="Operator-analysis dataset root prepared by scripts/prepare_v4166_operator_datasets.py.",
+        help="Operator-analysis dataset root prepared by the DAWN operator dataset workflow.",
     )
     p.add_argument(
         "--train-analysis-generation-max-prompts",
@@ -321,7 +333,7 @@ def build_context(args: argparse.Namespace, stages: List[str], store: AnalysisSt
     args.checkpoint = normalize_checkpoint_arg(args.checkpoint)
     checkpoint_dir, checkpoint_step, checkpoint_metadata = resolve_checkpoint(args.checkpoint)
     cfg = config_from_checkpoint_or_file(args.config, checkpoint_metadata)
-    verify_v4166_config(cfg)
+    verify_analysis_config(cfg)
     mesh = create_mesh_from_cfg(cfg, args)
     data_sharding = NamedSharding(mesh, P("data", None))
     store.log_event(
@@ -1121,7 +1133,12 @@ def _build_num_health(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return health
 
 
-def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, Any]:
+def _run_active_dynamics(
+    ctx: AnalysisContext,
+    max_batches: int,
+    *,
+    include_composition: bool = False,
+) -> Dict[str, Any]:
     args = ctx.args
     batch_size = int(ctx.config["training"].get("batch_size", 1))
     seq_len = int(ctx.config["model"].get("max_seq_len", 512))
@@ -1141,6 +1158,14 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
         cfg=ctx.config,
         total_training_steps=ctx.total_training_steps,
     )
+    composition_step_fn = None
+    if (
+        include_composition
+        and ctx.config.get("model", {}).get("model_version")
+        == V4171_MODEL_VERSION
+    ):
+        composition_step_fn = create_composition_analysis_step(
+            ctx.model, ctx.sharded_fns, cfg=ctx.config)
     wanted = {"loss", "correct", "valid_count", "aux_loss"}
     for prefix in TRAIN_ANALYSIS_POOLS.values():
         wanted.update({
@@ -1186,6 +1211,9 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
             "selected_frac",
         ):
             wanted.add(f"per_layer_{prefix}_{metric}")
+        for metric in V4171_COMPOSITION_METRICS:
+            wanted.add(f"{prefix}_{metric}")
+    wanted.add("admission_den_power")
     for prefix in TRAIN_ANALYSIS_QK_SPLIT.values():
         wanted.update({
             f"{prefix}_active",
@@ -1228,6 +1256,9 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
         t0 = time.time()
         mesh_ids, mesh_mask = shard_batch_to_mesh(input_ids, attention_mask, ctx.data_sharding)
         result = step_fn(ctx.params, mesh_ids, mesh_mask, jnp.int32(ctx.checkpoint_step or 0))
+        if composition_step_fn is not None:
+            result = dict(result)
+            result.update(composition_step_fn(ctx.params, mesh_ids, mesh_mask))
         selected = {key: value for key, value in result.items() if key in wanted}
         jax.block_until_ready(jax.tree.leaves(selected))
         selected = jax.device_get(selected)
@@ -1287,6 +1318,21 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
             "effective_ops_mean": mean_key(f"{prefix}_gate_eff_n"),
             "effective_ops_ratio": mean_key(f"{prefix}_gate_eff_ratio"),
         }
+    composition = {
+        "admission_den_power": mean_key("admission_den_power"),
+        "pools": {
+            pool: {
+                metric: mean_key(f"{prefix}_{metric}")
+                for metric in V4171_COMPOSITION_METRICS
+            }
+            for pool, prefix in TRAIN_ANALYSIS_POOLS.items()
+        },
+    }
+    composition["available"] = any(
+        value is not None
+        for pool in composition["pools"].values()
+        for value in pool.values()
+    )
     per_layer_active = _build_per_layer_active(rows, ctx.config)
     active = {
         "num_batches": len(rows),
@@ -1299,6 +1345,7 @@ def _run_active_dynamics(ctx: AnalysisContext, max_batches: int) -> Dict[str, An
         "select_distribution": _build_select_distribution(rows),
         "qk_split": _build_qk_split(rows, ctx.config),
         "num_health": _build_num_health(rows),
+        "composition_health": composition,
     }
     active["concentration_max"] = _build_concentration_max(active)
     return active
@@ -1808,9 +1855,10 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
     )
     out = [
         line,
-        "DAWN-SRW v4166 TRAIN ANALYSIS",
+        f"DAWN-SRW {run.get('model_version', 'unknown')} TRAIN ANALYSIS",
         line,
         "Run:",
+        f"  model_version   : {run.get('model_version')}",
         f"  config          : {run.get('config')}",
         f"  checkpoint_dir  : {run.get('checkpoint_dir')}",
         f"  latest_ckpt     : step {run.get('latest_step')}",
@@ -1867,7 +1915,9 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
     out.extend(format_train_analysis_items(summary, items, item_formatters))
     out.extend([
         "",
-        "400M reference comparison:",
+        f"{compare.get('label', '400M')} reference comparison:",
+        f"  status        : {compare.get('status', 'ready')}",
+        f"  reason        : {compare.get('reason', 'n/a')}",
         f"  qk active_tau: {compare.get('qk_active_tau', 'n/a')}",
         f"  v  active_tau: {compare.get('v_active_tau', 'n/a')}",
         f"  rst active_tau: {compare.get('rst_active_tau', 'n/a')}",
@@ -1980,17 +2030,30 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
             flush=True,
     )
     ctx = build_context(args, ["train_analysis"], store)
+    if ctx.is_primary:
+        print(
+            "TRAIN_ANALYSIS MODEL "
+            f"version={ctx.config.get('model', {}).get('model_version')} ",
+            flush=True,
+        )
     max_batches = max(1, int(args.train_analysis_max_batches or DEFAULT_TRAIN_ANALYSIS_BATCHES))
     eps_values = _parse_float_list(args.prune_eps or DEFAULT_TRAIN_ANALYSIS_PRUNE_EPS)
     progress = _progress_status(ctx, info)
     selection = _selection_status(
         ctx.config, progress["step"], progress["tokens"], ctx.model_cfg)
-    active = _run_active_dynamics(ctx, max_batches) if "active" in required_sections else {}
+    active = (
+        _run_active_dynamics(
+            ctx,
+            max_batches,
+            include_composition="composition_health" in analysis_items,
+        )
+        if "active" in required_sections else {}
+    )
     prune = _run_prune_light(ctx, max_batches, eps_values) if "prune" in required_sections else {}
     prompt_trace = run_train_prompt_trace(ctx) if "prompt_trace" in required_sections else {}
     prompt_decision = build_train_prompt_decision(prompt_trace) if "prompt_trace" in required_sections and ctx.is_primary else {}
     generation_samples = run_train_generation_samples(ctx) if "generation" in required_sections else {}
-    sync_hosts("dawn-v4166-train-analysis-done")
+    sync_hosts("dawn-srw-train-analysis-done")
     if not ctx.is_primary:
         return 0
 
@@ -2006,10 +2069,20 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
         ]
         if all(_safe_float(value) is None for value in active_values):
             warnings.append("selection_calibration is enabled but no active_tau metrics were observed.")
-    compare = _compare_400m(active)
+    model_version = ctx.config.get("model", {}).get("model_version")
+    if model_version == V4166_MODEL_VERSION:
+        compare = _compare_400m(active)
+        compare.update({"label": "v4166 400M", "status": "ready"})
+    else:
+        compare = {
+            "label": "v4166 400M",
+            "status": "not_applicable",
+            "reason": "reference ranges are calibrated for v4166, not v4171",
+        }
     summary = {
         "run": {
             "config": args.config or "checkpoint full_config",
+            "model_version": model_version,
             "checkpoint_dir": info.get("configured_checkpoint_dir") or info.get("run_folder"),
             "latest_step": progress["step"],
             "latest_path": info.get("latest_path") or args.checkpoint,

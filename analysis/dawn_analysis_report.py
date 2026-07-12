@@ -1,4 +1,4 @@
-"""Complete static report generation for DAWN-SRW v4166 analysis artifacts."""
+"""Complete static report generation for DAWN-SRW analysis artifacts."""
 
 from __future__ import annotations
 
@@ -656,13 +656,20 @@ def _build_report_data(store, args: Any, inventory: Dict[str, Any], errors: List
     ablation_rows = _ablation_rows(ablation if isinstance(ablation, dict) else {}, ablation_curve)
     max_cards = _as_int(getattr(args, "report_max_operator_cards", 100), 100)
     card_rows = _operator_card_rows(cards, ablation_rows, max_cards)
+    model_version = (
+        manifest.get("model_version")
+        or (config.get("model", {}) if isinstance(config, dict) else {}).get(
+            "model_version")
+        or "unknown"
+    )
+    model_label = f"DAWN-SRW {model_version}"
 
     perf_rows = []
     if eval_data:
         baseline_loss = _as_float(baseline_data.get("val_loss")) if baseline_data else float("nan")
         dawn_loss = _as_float(eval_data.get("val_loss"))
         perf_rows.append({
-            "model": "DAWN-SRW v4166",
+            "model": model_label,
             "checkpoint_step": eval_data.get("checkpoint_step", manifest.get("checkpoint_step")),
             "val_loss": dawn_loss,
             "delta_vs_baseline": dawn_loss - baseline_loss if math.isfinite(baseline_loss) and math.isfinite(dawn_loss) else "",
@@ -685,6 +692,8 @@ def _build_report_data(store, args: Any, inventory: Dict[str, Any], errors: List
 
     return {
         "generated_at": _utc_now(),
+        "model_version": model_version,
+        "model_label": model_label,
         "output_dir": store.output_dir,
         "manifest": manifest if isinstance(manifest, dict) else {},
         "model_info": model_info if isinstance(model_info, dict) else {},
@@ -1717,7 +1726,7 @@ def render_html_report(report_data, output_dir):
     appendix = _appendix_html(data, output_dir, from_page=False)
     body = f"""
 <header>
-  <h1>DAWN-SRW v4166 1.3B Analysis Report</h1>
+  <h1>{html.escape(data.get('model_label', 'DAWN-SRW'))} Analysis Report</h1>
   <p class="headline">Complete static report bundle generated from discovered analysis artifacts.</p>
   {_run_metadata_html(data)}
   {nav}
@@ -1732,7 +1741,10 @@ def render_html_report(report_data, output_dir):
   {appendix}
 </main>
 """
-    write_text_atomic(join_path(report_dir, "index.html"), _html_doc("DAWN-SRW v4166 Analysis Report", body))
+    write_text_atomic(
+        join_path(report_dir, "index.html"),
+        _html_doc(f"{data.get('model_label', 'DAWN-SRW')} Analysis Report", body),
+    )
 
     page_map = {
         "performance.html": "performance",
@@ -1874,7 +1886,7 @@ def _markdown_table(rows: Sequence[Dict[str, Any]], fields: Sequence[str], limit
 def _render_summary_md(data: Dict[str, Any], checklist: Dict[str, Any], sections: Sequence[Dict[str, Any]],
                        missing_notes: Sequence[str], output_dir: str) -> str:
     lines = [
-        "# DAWN-SRW v4166 1.3B Analysis Summary",
+        f"# {data.get('model_label', 'DAWN-SRW')} Analysis Summary",
         "",
         f"Generated: {data['generated_at']}",
         f"Output: `{data['output_dir']}`",
@@ -1908,7 +1920,7 @@ def _render_summary_md(data: Dict[str, Any], checklist: Dict[str, Any], sections
 def _render_full_md(data: Dict[str, Any], checklist: Dict[str, Any], sections: Sequence[Dict[str, Any]],
                     figures: Dict[str, Any], missing_notes: Sequence[str], output_dir: str) -> str:
     lines = [
-        "# DAWN-SRW v4166 1.3B Full Analysis Report",
+        f"# {data.get('model_label', 'DAWN-SRW')} Full Analysis Report",
         "",
         f"Generated: {data['generated_at']}",
         f"Output: `{data['output_dir']}`",

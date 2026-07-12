@@ -1,10 +1,10 @@
 #!/bin/bash
 # =============================================================================
-# TPU VM/Pod launcher for DAWN-SRW v4166 analysis
+# TPU VM/Pod launcher for DAWN-SRW v4166/v4171 analysis
 # =============================================================================
 # This script does not create a TPU.  It launches the analysis process on an
-# already-created TPU VM/Pod, on every worker, inside tmux session "train" so
-# existing tmux pipe-pane/capture-pane log workflows continue to work.
+# already-created TPU VM/Pod, on every worker, with a dedicated analysis tmux
+# session and log for train_analysis mode.
 #
 # Example:
 #   bash scripts/launch_dawn_v4166_analysis_tpu_pod.sh \
@@ -120,9 +120,31 @@ apply_preset() {
                 TRAIN_ANALYSIS_PRESET="v4166_1b"
             fi
             ;;
+        v4171-400m|v4171-400m-c4-40b|v4171-400m-c4-40b-v4-64)
+            if [[ "$MODE_EXPLICIT" == "0" ]]; then
+                MODE="train_analysis"
+            fi
+            if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_emb_tau"
+            fi
+            if [[ "$ANALYSIS_PRESET_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_PRESET="v4171"
+            fi
+            ;;
+        v4171-1p3b|v4171-1p3b-c4-20b|v4171-1p3b-c4-20b-v4-64)
+            if [[ "$MODE_EXPLICIT" == "0" ]]; then
+                MODE="train_analysis"
+            fi
+            if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_1p3B_c4_20B_v4_64_emb_tau"
+            fi
+            if [[ "$ANALYSIS_PRESET_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_PRESET="v4171"
+            fi
+            ;;
         *)
             echo "ERROR: unknown --preset $1" >&2
-            echo "Known presets: v4166-1B" >&2
+            echo "Known presets: v4166-1B, v4171-400M, v4171-1p3B" >&2
             exit 1
             ;;
     esac
@@ -181,7 +203,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --tpu NAME"
             echo ""
             echo "Core:"
-            echo "  --preset NAME             Known: v4166-1B"
+            echo "  --preset NAME             Known: v4166-1B, v4171-400M, v4171-1p3B"
             echo "  --mode MODE               analysis, train, or train_analysis. Default: $MODE"
             echo "  --config PATH             Optional train_analysis fallback config. Default: checkpoint full_config"
             echo "  --checkpoint PATH_OR_GS   Default: $CHECKPOINT"
@@ -205,7 +227,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --workers all|0|N         Default: all"
             echo ""
             echo "Execution:"
-            echo "  --detach                  Run in tmux session train (default)"
+            echo "  --detach                  Run in the mode-specific tmux session (default)"
             echo "  --foreground              Run foreground on the SSH command"
             echo "  --dry-run                 Print resolved command without launching"
             echo "  --from-scratch            Disable analysis artifact resume"
@@ -253,6 +275,10 @@ esac
 if [[ "$MODE" == "train_analysis" ]]; then
     STAGES="train_analysis"
     CHECKPOINT="$TRAIN_ANALYSIS_CHECKPOINT_DIR"
+    TMUX_SESSION="train_analysis"
+    if [[ "$REMOTE_LOG_EXPLICIT" == "0" ]]; then
+        REMOTE_LOG="~/train_analysis.log"
+    fi
     if [[ "$OUTPUT_EXPLICIT" == "0" ]]; then
         if [[ "$(path_name "$TRAIN_ANALYSIS_CHECKPOINT_DIR")" == "checkpoints" ]]; then
             OUTPUT="$(path_parent "$TRAIN_ANALYSIS_CHECKPOINT_DIR")/side_analysis"
@@ -306,7 +332,7 @@ fi
 WATCH_LOG_CMD="bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --log $REMOTE_LOG --target $TMUX_SESSION --summary"
 
 echo "============================================================"
-echo "DAWN-SRW v4166 analysis launcher"
+echo "DAWN-SRW v4166/v4171 analysis launcher"
 echo "============================================================"
 echo "Run:"
 echo "  mode            : $MODE"
@@ -521,7 +547,7 @@ REMOTE_LOG='${REMOTE_LOG}'
 REMOTE_LOG_PATH="\${REMOTE_LOG/#\\~/\$HOME}"
 WORK_DIR="\$HOME/DAWN-SRW"
 
-echo "=== DAWN v4166 analysis worker startup ==="
+echo "=== DAWN-SRW analysis worker startup ==="
 echo "HOSTNAME=\$(hostname)"
 echo "DATE=\$(date -Is)"
 echo "BRANCH=\$BRANCH"
@@ -626,7 +652,7 @@ LAUNCH_TS="$(date +%Y%m%d_%H%M%S)"
 declare -a LAUNCH_PIDS=()
 declare -a LAUNCH_LOGS=()
 for worker in "${TARGET_WORKERS[@]}"; do
-    log_file="launch_dawn_v4166_analysis_${TPU_NAME}_${LAUNCH_TS}_worker_${worker}.log"
+    log_file="launch_dawn_srw_analysis_${TPU_NAME}_${LAUNCH_TS}_worker_${worker}.log"
     LAUNCH_LOGS[$worker]="$log_file"
     echo "  Worker $worker launch starting (log: $log_file)"
     (
@@ -655,7 +681,7 @@ if [[ "$MODE" == "train_analysis" && "$DETACH" == "0" ]]; then
     SUMMARY_WORKER=""
     for worker in "${TARGET_WORKERS[@]}"; do
         log_file="${LAUNCH_LOGS[$worker]}"
-        if grep -q "DAWN-SRW v4166 TRAIN ANALYSIS" "$log_file"; then
+        if grep -q "DAWN-SRW .* TRAIN ANALYSIS" "$log_file"; then
             SUMMARY_LOG="$log_file"
             SUMMARY_WORKER="$worker"
             break

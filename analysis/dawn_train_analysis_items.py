@@ -74,10 +74,16 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
         "summary": "NUM_HEALTH catches scale drift before selector collapse shows up.",
         "requires": ("active",),
     },
+    "composition_health": {
+        "title": "Composition denominator health",
+        "measures": "v4171 admission mass, composition denominator range, floor fraction, and configured denominator power by pool.",
+        "summary": "COMPOSITION_HEALTH verifies that v4171 operator composition normalization is finite and not pinned to its floor.",
+        "requires": ("active",),
+    },
     "prompt_trace": {
         "title": "Prompt trace",
         "measures": "prompt token/layer q/k/v/rst active counts, gate mass, top1, top operator ids, and output norms.",
-        "summary": "PROMPT_TRACE shows v4166 route behavior on diagnostic prompts without generating new text.",
+        "summary": "PROMPT_TRACE shows version-matched route behavior on diagnostic prompts without generating new text.",
         "requires": ("prompt_trace",),
     },
     "prompt_decision": {
@@ -88,7 +94,7 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
     },
     "generation_samples": {
         "title": "Generation samples",
-        "measures": "v4166 KV-cache prompt continuations, generated token count, and decode throughput.",
+        "measures": "version-matched KV-cache prompt continuations, generated token count, and decode throughput.",
         "summary": "GENERATION_SAMPLES gives a quick qualitative read on the current checkpoint.",
         "requires": ("generation",),
     },
@@ -171,6 +177,8 @@ V4166_1B_ITEMS = (
     "decision_reason",
 )
 
+V4171_ITEMS = tuple(TRAIN_ANALYSIS_ITEM_DEFS.keys())
+
 TRAIN_ANALYSIS_PRESETS = {
     "minimal": ("target_ratio", "prune_breakdown", "decision_reason"),
     "qk_closed": (
@@ -185,12 +193,15 @@ TRAIN_ANALYSIS_PRESETS = {
         "decision_reason",
     ),
     "compute": ("target_ratio", "prune_breakdown", "execution_profile", "decision_reason"),
-    "health": ("target_ratio", "layer_selectivity", "num_health", "decision_reason"),
+    "health": (
+        "target_ratio", "layer_selectivity", "num_health",
+        "composition_health", "decision_reason"),
     "prompt_debug": ("target_ratio", "layer_selectivity", "prompt_trace", "prompt_decision", "decision_reason"),
     "sample": ("target_ratio", "generation_samples", "decision_reason"),
     "operator_datasets": ("operator_dataset_manifest",),
     "operator_analysis": OPERATOR_ANALYSIS_ITEM_IDS,
     "v4166_1b": V4166_1B_ITEMS,
+    "v4171": V4171_ITEMS,
     "deep": V4166_1B_ITEMS,
     "full": tuple(TRAIN_ANALYSIS_ITEM_DEFS.keys()),
 }
@@ -200,6 +211,10 @@ TRAIN_ANALYSIS_PRESET_ALIASES = {
     "v4166-1p3b": "v4166_1b",
     "v4166-1p3b-c4-20b": "v4166_1b",
     "v4166-1p3b-c4-20b-v4-64": "v4166_1b",
+    "v4171-400m": "v4171",
+    "v4171-1p3b": "v4171",
+    "v4171-400m-c4-40b-v4-64": "v4171",
+    "v4171-1p3b-c4-20b-v4-64": "v4171",
     "operator": "operator_analysis",
     "operator-analysis": "operator_analysis",
     "operator-datasets": "operator_datasets",
@@ -590,6 +605,38 @@ def _item_lines_num_health(summary: Dict[str, Any], fmt: TrainAnalysisFormatters
     return out
 
 
+def _item_lines_composition_health(
+    summary: Dict[str, Any], fmt: TrainAnalysisFormatters
+) -> List[str]:
+    composition = summary.get("active_dynamics", {}).get(
+        "composition_health", {})
+    model_version = summary.get("run", {}).get("model_version")
+    out = [
+        "  COMPOSITION_HEALTH:",
+        f"  model_version={model_version or 'unknown'} "
+        f"admission_den_power={fmt.num(composition.get('admission_den_power'), 3)}",
+    ]
+    if not composition.get("available"):
+        out.append("  not available for this model/checkpoint metric schema")
+        return out
+    out.extend([
+        "  pool  admission_mean admission_max den_mean den_min den_max floor_frac",
+    ])
+    for pool in ("qk", "v", "rst"):
+        row = composition.get("pools", {}).get(pool, {})
+        out.append(
+            "  "
+            f"{pool:<5} "
+            f"{fmt.num(row.get('admission_mass_mean'), 4):<14} "
+            f"{fmt.num(row.get('admission_mass_max'), 4):<13} "
+            f"{fmt.num(row.get('composition_den_mean'), 4):<8} "
+            f"{fmt.num(row.get('composition_den_min'), 4):<7} "
+            f"{fmt.num(row.get('composition_den_max'), 4):<7} "
+            f"{fmt.num(row.get('composition_den_floor_frac'), 4)}"
+        )
+    return out
+
+
 def _item_lines_prompt_trace(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
     trace = summary.get("prompt_trace", {})
     if trace.get("status") not in ("ready", "empty"):
@@ -794,6 +841,7 @@ TRAIN_ANALYSIS_ITEM_FORMATTERS = {
     "prune_breakdown": _item_lines_prune_breakdown,
     "execution_profile": _item_lines_execution_profile,
     "num_health": _item_lines_num_health,
+    "composition_health": _item_lines_composition_health,
     "prompt_trace": _item_lines_prompt_trace,
     "prompt_decision": _item_lines_prompt_decision,
     "generation_samples": _item_lines_generation_samples,
@@ -863,6 +911,12 @@ def item_status(summary: Dict[str, Any], item: str) -> str:
         return "ready" if active.get("pools") else "missing"
     if item == "num_health":
         return "ready" if active.get("num_health") else "missing"
+    if item == "composition_health":
+        composition = active.get("composition_health", {})
+        if composition.get("available"):
+            return "ready"
+        model_version = str(summary.get("run", {}).get("model_version", ""))
+        return "not_applicable" if model_version.endswith("4.1.6.6") else "missing"
     if item == "prompt_trace":
         trace = summary.get("prompt_trace", {})
         return str(trace.get("status") or "missing")

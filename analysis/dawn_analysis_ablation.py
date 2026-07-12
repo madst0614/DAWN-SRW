@@ -15,6 +15,7 @@ from jax.experimental.multihost_utils import process_allgather
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    analysis_model_module,
     format_duration,
     host_aligned_batch_size,
     load_eval_data,
@@ -27,8 +28,6 @@ from analysis.dawn_analysis_storage import (
     write_csv_atomic,
     write_json_atomic,
 )
-from models import dawn_srw_v4166 as v4166
-
 ABLATION_ANALYSIS_IMPL = "dynamic_mask_forward_v2"
 
 
@@ -82,17 +81,19 @@ def _loss_from_logits(logits, input_ids):
 
 
 def _build_dynamic_suppressed_forward(params, model_cfg):
-    params = v4166._squeeze_params(params)
+    model_module = analysis_model_module(model_cfg)
+    params = model_module._squeeze_params(params)
     params = jax.tree.map(jnp.asarray, params)
-    angular_execution_kwargs = v4166._angular_execution_kwargs_from_model_cfg(model_cfg)
+    angular_execution_kwargs = (
+        model_module._angular_execution_kwargs_from_model_cfg(model_cfg))
 
     def _srw_sup(x, h, op_key, tau_off, raw_scan_offset, w_read, w_write, mult):
-        r_n = v4166._forward_unit_direction(w_read.astype(jnp.float32))
-        w_n = v4166._forward_unit_direction(w_write.astype(jnp.float32))
-        execution_kwargs, admission_den_power = v4166._split_admission_den_kwargs(
+        r_n = model_module._forward_unit_direction(w_read.astype(jnp.float32))
+        w_n = model_module._forward_unit_direction(w_write.astype(jnp.float32))
+        execution_kwargs, admission_den_power = model_module._split_admission_den_kwargs(
             angular_execution_kwargs
         )
-        _, admission, _, execution_weight, _ = v4166._angular_execution(
+        _, admission, _, execution_weight, _ = model_module._angular_execution(
             h, op_key, tau_off, raw_scan_offset, **execution_kwargs
         )
         mult = jnp.asarray(mult, dtype=jnp.float32)
@@ -100,10 +101,14 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
         admission = admission * mult[None, None, :]
         xr = x.astype(jnp.float32) @ r_n.T
         out = (execution_weight * xr) @ w_n
-        admission_den = jnp.power(
-            jnp.maximum(admission.sum(axis=-1, keepdims=True), 1.0),
-            admission_den_power,
-        )
+        admission_mass = admission.sum(axis=-1, keepdims=True)
+        composition_den = getattr(model_module, "_composition_den", None)
+        if composition_den is None:
+            admission_den = jnp.power(
+                jnp.maximum(admission_mass, 1.0), admission_den_power)
+        else:
+            admission_den = composition_den(
+                admission_mass, admission_den_power)
         return (out.astype(jnp.float32) / admission_den).astype(jnp.float32)
 
     def forward_fn(input_ids, qk_mult, v_mult, rst_mult):
@@ -116,9 +121,9 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
         n_layers = int(model_cfg["n_layers"])
         n_heads = int(model_cfg["n_heads"])
         d_head = d_model // n_heads
-        pp = v4166._pool_params_with_operator_keys(params["neuron_pool"])
+        pp = model_module._pool_params_with_operator_keys(params["neuron_pool"])
         rp = params["router"]
-        qk_scale_eff, v_scale_eff, rst_scale_eff = v4166._effective_pool_output_scales(
+        qk_scale_eff, v_scale_eff, rst_scale_eff = model_module._effective_pool_output_scales(
             pp,
             d_model,
             n_layers,
@@ -132,16 +137,15 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
 
         for i in range(n_layers):
             bp = params[f"block_{i}"]
-            normed = v4166._layer_norm(x, bp["norm1"]["scale"], bp["norm1"]["bias"])
+            normed = model_module._layer_norm(
+                x, bp["norm1"]["scale"], bp["norm1"]["bias"])
             h_all = normed @ rp["proj_attn"]["kernel"] + rp["proj_attn"]["bias"]
             h_q, h_k, h_v = jnp.split(h_all, 3, axis=-1)
-            h_q, h_k, h_v = v4166._read_write_attn_operator_queries(
-                rp,
-                normed,
-                h_q,
-                h_k,
-                h_v,
-            )
+            query_adapter = getattr(
+                model_module, "_read_write_attn_operator_queries", None)
+            if query_adapter is not None:
+                h_q, h_k, h_v = query_adapter(
+                    rp, normed, h_q, h_k, h_v)
             tau_all = normed @ rp["raw_tau_attn"]["kernel"] + rp["raw_tau_attn"]["bias"]
             raw_scan_offset_all = jnp.zeros_like(tau_all)
 
@@ -191,9 +195,13 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
             attn_out = attn_out @ bp["attn"]["expand_O"]["kernel"]
             x = x + attn_out
 
-            normed = v4166._layer_norm(x, bp["norm2"]["scale"], bp["norm2"]["bias"])
+            normed = model_module._layer_norm(
+                x, bp["norm2"]["scale"], bp["norm2"]["bias"])
             h_rst = normed @ rp["proj_rst"]["kernel"] + rp["proj_rst"]["bias"]
-            h_rst = v4166._read_write_rst_operator_query(rp, normed, h_rst)
+            rst_query_adapter = getattr(
+                model_module, "_read_write_rst_operator_query", None)
+            if rst_query_adapter is not None:
+                h_rst = rst_query_adapter(rp, normed, h_rst)
             tau_rst = normed @ rp["raw_tau_rst"]["kernel"] + rp["raw_tau_rst"]["bias"]
             raw_scan_offset_rst = jnp.zeros_like(tau_rst)
             rst = _srw_sup(
@@ -209,7 +217,8 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
             x = x + rst * rst_scale_eff
 
         norm_p = params["norm"]
-        x = v4166._layer_norm(x, norm_p["scale"], norm_p["bias"])
+        x = model_module._layer_norm(
+            x, norm_p["scale"], norm_p["bias"])
         return x @ params["token_emb"]["embedding"].T
 
     return forward_fn

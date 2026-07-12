@@ -1,8 +1,9 @@
-"""Common model, checkpoint, mesh, and data helpers for v4166 analysis."""
+"""Common model, checkpoint, mesh, and data helpers for DAWN-SRW analysis."""
 
 from __future__ import annotations
 
 import hashlib
+import importlib
 import inspect
 import json
 import math
@@ -36,6 +37,11 @@ from analysis.dawn_analysis_storage import (
 )
 
 V4166_MODEL_VERSION = "spatial-r1-v4.1.6.6"
+V4171_MODEL_VERSION = "spatial-r1-v4.1.7.1"
+SUPPORTED_ANALYSIS_MODEL_VERSIONS = (
+    V4166_MODEL_VERSION,
+    V4171_MODEL_VERSION,
+)
 _TRAIN = None
 
 
@@ -173,18 +179,42 @@ def config_from_checkpoint_or_file(config_path: Optional[str],
     return load_analysis_config(config_path)
 
 
-def verify_v4166_config(cfg: Dict[str, Any]) -> None:
+def verify_analysis_config(cfg: Dict[str, Any]) -> None:
     version = cfg.get("model", {}).get("model_version")
-    if version != V4166_MODEL_VERSION:
+    if version not in SUPPORTED_ANALYSIS_MODEL_VERSIONS:
         raise ValueError(
-            f"Expected model.model_version={V4166_MODEL_VERSION}, got {version!r}"
+            "Unsupported analysis model.model_version="
+            f"{version!r}; supported={','.join(SUPPORTED_ANALYSIS_MODEL_VERSIONS)}"
         )
 
 
-def build_v4166_model(cfg: Dict[str, Any]):
-    verify_v4166_config(cfg)
+def verify_v4166_config(cfg: Dict[str, Any]) -> None:
+    """Backward-compatible name for the supported-version validator."""
+    verify_analysis_config(cfg)
+
+
+def analysis_model_module(model_cfg: Dict[str, Any]):
+    """Return the exact model module declared by an analysis config."""
+    version = model_cfg.get("model_version")
+    if version not in SUPPORTED_ANALYSIS_MODEL_VERSIONS:
+        raise ValueError(
+            "Unsupported analysis model.model_version="
+            f"{version!r}; supported={','.join(SUPPORTED_ANALYSIS_MODEL_VERSIONS)}"
+        )
+    train = get_train()
+    module_name = train._model_registry_entry(version)["module"]
+    return importlib.import_module(module_name)
+
+
+def build_analysis_model(cfg: Dict[str, Any]):
+    verify_analysis_config(cfg)
     train = get_train()
     return train.build_model_from_config(cfg)
+
+
+def build_v4166_model(cfg: Dict[str, Any]):
+    """Backward-compatible wrapper; dispatches v4166 and v4171 exactly."""
+    return build_analysis_model(cfg)
 
 
 def init_target_params(model: Any, cfg: Dict[str, Any]):
@@ -438,7 +468,7 @@ def shard_params_for_mesh(params: Any, cfg: Dict[str, Any], mesh):
 
 def restore_params_and_cfg(config: Dict[str, Any], checkpoint_path: str,
                            checkpoint_step: int, mesh) -> Tuple[Any, Dict[str, Any], Any]:
-    model = build_v4166_model(config)
+    model = build_analysis_model(config)
     target_params = init_target_params(model, config)
     target_params = shard_params_for_mesh(target_params, config, mesh)
     train = get_train()
@@ -569,16 +599,33 @@ def model_cfg_from_config(
         "n_know": int(m.get("n_know", m.get("n_rst", 25200))),
         "soft_gate_temperature": float(t.get("soft_gate_t_final", 0.07)),
         "soft_gate_boundary_power": float(t.get("soft_gate_boundary_power_final", 4.0)),
-        "admission_den_power": float(t.get("admission_den_power", 1.0)),
+        "admission_den_power": float(m.get(
+            "admission_den_power", t.get("admission_den_power", 1.0))),
         "soft_gate_effective_active_eps": float(t.get("soft_gate_effective_active_eps", 1e-6)),
         "execution_prune_eps": float(m.get("execution_prune_eps", 0.0)),
     }
+    for key in (
+        "logical_vocab_size",
+        "vocab_size_padded",
+        "operator_key_mode",
+        "operator_query_mode",
+    ):
+        if m.get(key) is not None:
+            model_cfg[key] = m[key]
     if checkpoint_step is not None and total_training_steps is not None:
         gate_state = scheduled_gate_state_from_config(
             cfg, int(checkpoint_step), int(total_training_steps))
         model_cfg.update(gate_state)
         model_cfg["runtime_gate_state"] = dict(gate_state)
     return model_cfg
+
+
+def admission_den_power_from_config(cfg: Dict[str, Any]) -> float:
+    """Resolve the model-owned v4171 value with legacy training fallback."""
+    model_cfg = cfg.get("model", {})
+    training_cfg = cfg.get("training", {})
+    return float(model_cfg.get(
+        "admission_den_power", training_cfg.get("admission_den_power", 1.0)))
 
 
 def count_params(params: Any) -> int:
@@ -615,6 +662,7 @@ def _create_restore_optimizer(cfg: Dict[str, Any], params: Any):
 
     pool_param_names = (
         "attn_qk_emb", "attn_v_emb", "rst_emb",
+        "attn_qk_op_key", "attn_v_op_key", "rst_op_key",
         "attn_qk_op_read_proj", "attn_qk_op_write_proj",
         "attn_v_op_read_proj", "attn_v_op_write_proj",
         "rst_op_read_proj", "rst_op_write_proj",
@@ -735,7 +783,7 @@ def create_ce_eval_step(model, sharded_fns=None, *, minimal_train: bool = True,
         soft_gate_boundary_power_start_frac=float(t.get("soft_gate_boundary_power_start_frac", 0.0)),
         soft_gate_boundary_power_mid_frac=float(t.get("soft_gate_boundary_power_mid_frac", 0.800)),
         soft_gate_boundary_power_final_frac=float(t.get("soft_gate_boundary_power_final_frac", 0.950)),
-        admission_den_power=float(t.get("admission_den_power", 1.0)),
+        admission_den_power=admission_den_power_from_config(cfg),
     )
 
     def step(params, input_ids, attention_mask, current_step):
@@ -823,9 +871,69 @@ def create_active_analysis_step(model, sharded_fns=None, *,
         soft_gate_boundary_power_start_frac=float(t.get("soft_gate_boundary_power_start_frac", 0.0)),
         soft_gate_boundary_power_mid_frac=float(t.get("soft_gate_boundary_power_mid_frac", 0.800)),
         soft_gate_boundary_power_final_frac=float(t.get("soft_gate_boundary_power_final_frac", 0.950)),
-        admission_den_power=float(t.get("admission_den_power", 1.0)),
+        admission_den_power=admission_den_power_from_config(cfg),
         ce_token_chunk_size=int(t.get("ce_token_chunk_size", 32768)),
     )
+
+
+def create_composition_analysis_step(
+        model, sharded_fns=None, *, cfg: Optional[Dict[str, Any]] = None):
+    """Return the v4171 minimal-path composition diagnostics step.
+
+    The trainer's full ``analysis=True`` path owns per-layer diagnostics, while
+    v4171's exact admission-mass/composition-denominator scalars are emitted by
+    its production minimal path. Run this only when the composition item is
+    selected so other analysis presets do not pay for a second forward.
+    """
+    cfg = cfg or {}
+    version = cfg.get("model", {}).get("model_version")
+    if version != V4171_MODEL_VERSION:
+        raise ValueError(
+            "Composition analysis is only defined for "
+            f"{V4171_MODEL_VERSION}, got {version!r}")
+    t = cfg.get("training", {})
+    admission_den_power = admission_den_power_from_config(cfg)
+    ce_token_chunk_size = int(t.get("ce_token_chunk_size", 32768))
+    soft_gate_temperature = float(t.get("soft_gate_t_final", 0.07))
+    soft_gate_boundary_power = float(
+        t.get("soft_gate_boundary_power_final", 4.0))
+
+    @jax.jit
+    def step(params, input_ids, attention_mask):
+        labels = jnp.where(attention_mask == 1, input_ids, -100)
+        result = model.apply(
+            {"params": params},
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            deterministic=True,
+            rngs={"dropout": jax.random.PRNGKey(0)},
+            sharded_fns=sharded_fns,
+            analysis=False,
+            minimal_train=True,
+            admission_den_power=admission_den_power,
+            soft_gate_temperature=soft_gate_temperature,
+            soft_gate_boundary_power=soft_gate_boundary_power,
+            soft_gate_boundary_power_final=soft_gate_boundary_power,
+            execution_prune_eps=jnp.float32(0.0),
+            ce_token_chunk_size=ce_token_chunk_size,
+            compute_accuracy=False,
+        )
+        keys = (
+            "admission_den_power",
+            *(
+                f"{pool}_{name}"
+                for pool in ("attn_qk", "attn_v", "rst")
+                for name in (
+                    "admission_mass_mean", "admission_mass_max",
+                    "composition_den_mean", "composition_den_min",
+                    "composition_den_max", "composition_den_floor_frac",
+                )
+            ),
+        )
+        return {key: result[key] for key in keys}
+
+    return step
 
 
 def load_eval_data(cfg: Dict[str, Any], max_length: int, batch_size: int,

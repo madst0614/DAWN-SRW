@@ -1,7 +1,7 @@
-"""v4166 prompt, trace, and generation helpers for train analysis.
+"""Prompt, trace, and generation helpers for DAWN-SRW train analysis.
 
 The train-analysis entry point owns orchestration. This module owns the
-v4166-specific prompt-side probes so the item registry can stay declarative and
+Version-dispatched prompt-side probes keep the item registry declarative and
 the main analyzer does not grow another block of prompt/generation code.
 """
 
@@ -16,7 +16,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from analysis.dawn_analysis_common import AnalysisContext, maybe_load_tokenizer
+from analysis.dawn_analysis_common import (
+    AnalysisContext,
+    analysis_model_module,
+    maybe_load_tokenizer,
+)
 from analysis.dawn_analysis_trace import (
     TRACE_POOLS,
     _default_prompts,
@@ -24,9 +28,6 @@ from analysis.dawn_analysis_trace import (
     _pad_or_trim,
     topk_trace_forward,
 )
-from models import dawn_srw_v4166 as v4166
-
-
 DEFAULT_TRACE_TEXT_PROMPTS = (
     "The capital of France is",
     "The largest planet in the solar system is",
@@ -419,8 +420,12 @@ def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
         for x in (getattr(tokenizer, "sep_token_id", None), getattr(tokenizer, "pad_token_id", None), getattr(tokenizer, "eos_token_id", None))
         if x is not None
     }
-    jit_prefill = jax.jit(lambda p, ids: v4166.prefill(p, ctx.model_cfg, ids))
-    jit_decode = jax.jit(lambda p, tok, c_k, c_v, c_len: v4166.decode_step(p, ctx.model_cfg, tok, c_k, c_v, c_len))
+    model_module = analysis_model_module(ctx.model_cfg)
+    jit_prefill = jax.jit(
+        lambda p, ids: model_module.prefill(p, ctx.model_cfg, ids))
+    jit_decode = jax.jit(
+        lambda p, tok, c_k, c_v, c_len: model_module.decode_step(
+            p, ctx.model_cfg, tok, c_k, c_v, c_len))
     rng = np.random.default_rng(123)
     samples = []
     started = time.time()
