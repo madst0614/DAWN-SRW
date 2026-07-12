@@ -5181,7 +5181,26 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     return out
 
 
-def _pool_update_diagnostics(params, grads):
+def _canonical_pool_op_key_grad_norms(pool_grads, model_version):
+    """Return version-canonical operator-key gradient norms by pool."""
+    def _norm(key):
+        return (_global_norm_array(pool_grads[key])
+                if key in pool_grads else jnp.float32(0.0))
+
+    if str(model_version) == V4171_MODEL_VERSION:
+        return {
+            'attn_qk': _norm('attn_qk_op_key'),
+            'attn_v': _norm('attn_v_op_key'),
+            'rst': _norm('rst_op_key'),
+        }
+    return {
+        prefix: _norm(f'{prefix}_op_read_proj')
+        + _norm(f'{prefix}_op_write_proj')
+        for prefix in ('attn_qk', 'attn_v', 'rst')
+    }
+
+
+def _pool_update_diagnostics(params, grads, model_version=None):
     """Approximate per-group update observability: grad_norm / param_norm."""
     pool_p = params.get('neuron_pool', {})
     pool_g = grads.get('neuron_pool', {})
@@ -5221,17 +5240,21 @@ def _pool_update_diagnostics(params, grads):
             out[f'{name}_{short}_param_norm'] = p_norm
             out[f'{name}_{short}_grad_norm'] = g_norm
             out[f'{name}_{short}_grad_ratio'] = g_norm / (p_norm + 1e-8)
-    op_specs = (
-        ('attn_qk', 'op_key', 'attn_qk_op_key'),
-        ('attn_qk', 'op_read_proj', 'attn_qk_op_read_proj'),
-        ('attn_qk', 'op_write_proj', 'attn_qk_op_write_proj'),
-        ('attn_v', 'op_key', 'attn_v_op_key'),
-        ('attn_v', 'op_read_proj', 'attn_v_op_read_proj'),
-        ('attn_v', 'op_write_proj', 'attn_v_op_write_proj'),
-        ('rst', 'op_key', 'rst_op_key'),
-        ('rst', 'op_read_proj', 'rst_op_read_proj'),
-        ('rst', 'op_write_proj', 'rst_op_write_proj'),
-    )
+    if str(model_version) == V4171_MODEL_VERSION:
+        op_specs = (
+            ('attn_qk', 'op_key', 'attn_qk_op_key'),
+            ('attn_v', 'op_key', 'attn_v_op_key'),
+            ('rst', 'op_key', 'rst_op_key'),
+        )
+    else:
+        op_specs = (
+            ('attn_qk', 'op_read_proj', 'attn_qk_op_read_proj'),
+            ('attn_qk', 'op_write_proj', 'attn_qk_op_write_proj'),
+            ('attn_v', 'op_read_proj', 'attn_v_op_read_proj'),
+            ('attn_v', 'op_write_proj', 'attn_v_op_write_proj'),
+            ('rst', 'op_read_proj', 'rst_op_read_proj'),
+            ('rst', 'op_write_proj', 'rst_op_write_proj'),
+        )
     for name, short, key in op_specs:
         p_norm = (_global_norm_array(pool_p[key])
                   if key in pool_p else jnp.float32(0.0))
@@ -6837,28 +6860,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_router_scan_attn = _child_norm(_grouter, 'raw_scan_offset_attn')
         grad_router_scan_rst = _child_norm(_grouter, 'raw_scan_offset_rst')
         grad_pool_attn_qk_emb = _child_norm(_gpool, 'attn_qk_emb')
-        grad_pool_attn_qk_op_key = (
-            _child_norm(_gpool, 'attn_qk_op_key')
-            + _child_norm(_gpool, 'attn_qk_op_read_proj')
-            + _child_norm(_gpool, 'attn_qk_op_write_proj'))
+        _pool_op_key_grad_norms = _canonical_pool_op_key_grad_norms(
+            _gpool, _model_version)
+        grad_pool_attn_qk_op_key = _pool_op_key_grad_norms['attn_qk']
         grad_pool_attn_qk_read = _pool_partition_norm(
             _gpool, 'attn_qk', 'read')
         grad_pool_attn_qk_write = _pool_partition_norm(
             _gpool, 'attn_qk', 'write')
         grad_pool_attn_v_emb = _child_norm(_gpool, 'attn_v_emb')
-        grad_pool_attn_v_op_key = (
-            _child_norm(_gpool, 'attn_v_op_key')
-            + _child_norm(_gpool, 'attn_v_op_read_proj')
-            + _child_norm(_gpool, 'attn_v_op_write_proj'))
+        grad_pool_attn_v_op_key = _pool_op_key_grad_norms['attn_v']
         grad_pool_attn_v_read = _pool_partition_norm(
             _gpool, 'attn_v', 'read')
         grad_pool_attn_v_write = _pool_partition_norm(
             _gpool, 'attn_v', 'write')
         grad_pool_rst_emb = _child_norm(_gpool, 'rst_emb')
-        grad_pool_rst_op_key = (
-            _child_norm(_gpool, 'rst_op_key')
-            + _child_norm(_gpool, 'rst_op_read_proj')
-            + _child_norm(_gpool, 'rst_op_write_proj'))
+        grad_pool_rst_op_key = _pool_op_key_grad_norms['rst']
         grad_pool_rst_read = _pool_partition_norm(_gpool, 'rst', 'read')
         grad_pool_rst_write = _pool_partition_norm(_gpool, 'rst', 'write')
         if False:
@@ -6977,7 +6993,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             normal_weight_decay_loss = jnp.float32(0.0)
         if False:
             pool_diag = _pool_param_diagnostics(params, full=False, model=model)
-            pool_update_diag = _pool_update_diagnostics(params, grads)
+            pool_update_diag = _pool_update_diagnostics(
+                params, grads, model_version=_model_version)
         else:
             pool_diag = {}
             pool_update_diag = {}
