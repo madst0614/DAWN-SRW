@@ -12086,6 +12086,7 @@ def _fmt_linear_direct_tau_gate(rec, prefix):
 
 
 def _print_linear_direct_tau_regular_block(rec, ctx):
+    is_v4171 = str(ctx.get('model_version')) == V4171_MODEL_VERSION
     log_message(
         "  active: "
         f"q={_fmt_linear_direct_tau_active(rec, 'attn_q_active_tau_frac', 'attn_q_active_tau_count')}"
@@ -12117,27 +12118,22 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
             f" rst={rec['tau_update_rst_max_abs']:.2e}"
             f" mult={rec['tau_lr_mult']:.3e}"
         )
-    log_message(
-        f"  norm: attn={_required_linear_direct_tau_metric(rec, 'attn_out_norm'):.3f}"
-        f" rst={_required_linear_direct_tau_metric(rec, 'rst_out_norm'):.3f}"
-        f" residual={_required_linear_direct_tau_metric(rec, 'residual_norm'):.3f}"
+    norm_suffix = (
+        f" | srw_scaled "
+        f"qk={float(rec['attn_qk_pool_scaled_srw_out_norm']):.3f} "
+        f"v={float(rec['attn_v_pool_scaled_srw_out_norm']):.3f} "
+        f"rst={float(rec['rst_pool_scaled_srw_out_norm']):.3f}"
+        if is_v4171 else
         f" | scale qk={float(rec.get('attn_qk_pool_scale', 0.0)):.3f}"
         f" v={float(rec.get('attn_v_pool_scale', 0.0)):.3f}"
         f" rst={float(rec.get('rst_pool_scale', 0.0)):.3f}"
     )
-    if str(ctx.get('model_version')) == V4171_MODEL_VERSION:
-        for pool in ('attn_qk', 'attn_v', 'rst'):
-            log_message(
-                f"  compose/{pool}: admission="
-                f"{float(rec[f'{pool}_admission_mass_mean']):.3f}/"
-                f"{float(rec[f'{pool}_admission_mass_max']):.3f} "
-                f"den={float(rec[f'{pool}_composition_den_mean']):.3f}["
-                f"{float(rec[f'{pool}_composition_den_min']):.3f},"
-                f"{float(rec[f'{pool}_composition_den_max']):.3f}] "
-                f"floor={float(rec[f'{pool}_composition_den_floor_frac']) * 100.0:.2f}% "
-                f"out={float(rec[f'{pool}_raw_srw_out_norm']):.3f}/"
-                f"{float(rec[f'{pool}_normalized_srw_out_norm']):.3f}/"
-                f"{float(rec[f'{pool}_pool_scaled_srw_out_norm']):.3f}")
+    log_message(
+        f"  norm: attn={_required_linear_direct_tau_metric(rec, 'attn_out_norm'):.3f}"
+        f" rst={_required_linear_direct_tau_metric(rec, 'rst_out_norm'):.3f}"
+        f" residual={_required_linear_direct_tau_metric(rec, 'residual_norm'):.3f}"
+        f"{norm_suffix}"
+    )
     log_message(
         f"  time: {format_time(ctx['epoch_elapsed'])}<"
         f"{format_time(ctx['eta'])}, {ctx['s_per_it']:.2f}s/it"
