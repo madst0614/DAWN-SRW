@@ -182,6 +182,41 @@ def _maybe_initialize_jax_distributed():
 _MULTIHOST_STARTUP_CONTEXT = {}
 
 
+def broadcast_str_from_host0(value, max_len=512):
+    """Broadcast a string (or None) from host 0 to every JAX process.
+
+    This must be called collectively on every host. Empty strings and None
+    decode to None. The all-gather fallback supports JAX versions that do not
+    expose broadcast_one_to_all.
+    """
+    if value is None:
+        value = ''
+    encoded = value.encode('utf-8')
+    if len(encoded) > max_len:
+        raise ValueError(
+            f"String too long for broadcast: {len(encoded)} > {max_len}")
+    buf = np.zeros(max_len, dtype=np.uint8)
+    if jax.process_index() == 0:
+        buf[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+
+    if _HAVE_BROADCAST:
+        broadcast_buf = np.asarray(_bcast_one_to_all(buf))
+    else:
+        gathered = np.asarray(process_allgather(buf))
+        # Shape can be (n_hosts, max_len) or flat (n_hosts * max_len,)
+        # depending on the JAX version; select host 0's slice either way.
+        if gathered.ndim == 1:
+            broadcast_buf = gathered[:max_len]
+        else:
+            broadcast_buf = gathered[0]
+    result = bytes(broadcast_buf).rstrip(b'\x00').decode('utf-8')
+    return result if result else None
+
+
+# Backward-compatible alias for callers that used the former private helper.
+_broadcast_str_from_host0 = broadcast_str_from_host0
+
+
 def _stable_short_hash(value):
     return hashlib.sha1(str(value).encode('utf-8')).hexdigest()[:8]
 
@@ -14776,38 +14811,6 @@ def main():
                 str(d) for d in p.iterdir()
                 if d.is_dir() and d.name.startswith('run_')
             ])
-
-    def _broadcast_str_from_host0(s, max_len=512):
-        """Broadcast a string (or None) from host 0 to all hosts.
-
-        Must be called collectively on every host. Each host passes its
-        local value; only host 0's value is adopted everywhere. Empty
-        string and None both encode as all-zero padding and decode back
-        to None. max_len caps the payload (GCS URLs usually fit well
-        under 512 bytes).
-        """
-        if s is None:
-            s = ''
-        encoded = s.encode('utf-8')
-        if len(encoded) > max_len:
-            raise ValueError(
-                f"Path too long for broadcast: {len(encoded)} > {max_len}")
-        buf = np.zeros(max_len, dtype=np.uint8)
-        if jax.process_index() == 0:
-            buf[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
-
-        if _HAVE_BROADCAST:
-            broadcast_buf = np.asarray(_bcast_one_to_all(buf))
-        else:
-            gathered = np.asarray(process_allgather(buf))
-            # Shape can be (n_hosts, max_len) or flat (n_hosts * max_len,)
-            # depending on JAX version -pick host 0's slice either way.
-            if gathered.ndim == 1:
-                broadcast_buf = gathered[:max_len]
-            else:
-                broadcast_buf = gathered[0]
-        result = bytes(broadcast_buf).rstrip(b'\x00').decode('utf-8')
-        return result if result else None
 
     # Auto-resume: find latest run folder with Orbax checkpoints
     # (unless --from-scratch). --resume-from takes priority.

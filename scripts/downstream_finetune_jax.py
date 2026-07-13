@@ -465,7 +465,7 @@ def create_run_dir(output_root: str, run_name: str, task: str) -> str:
             f"run_{run_name}_{task}_{suffix}")
     else:
         value = ''
-    return tj._broadcast_str_from_host0(value)
+    return tj.broadcast_str_from_host0(value)
 
 
 def main() -> None:
