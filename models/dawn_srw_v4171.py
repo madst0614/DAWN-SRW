@@ -8,7 +8,7 @@ Implemented concepts:
 - independent learned live-gradient operator-address embeddings
 - direct state-to-operation queries
 - linear angular-depth gate after DirectTau
-- selectable linear-angular, spherical-energy, or compact-heat-energy composition
+- selectable linear-angular, quadratic, or heat-energy composition
 - tau movement controlled by optimizer-side tau_lr_mult
 - train-time effective gate statistics
 - validation-time execution pruning through execution_prune_eps
@@ -280,12 +280,12 @@ OPERATOR_QUERY_MODE = "direct_state_projection"
 DEFAULT_ADMISSION_DEN_POWER = 1.0
 DEFAULT_SRW_COMPOSITION_MODE = "linear_angular"
 DEFAULT_HEAT_KERNEL_BETA = 2.0
-SPHERICAL_ENERGY_DEN_EPS = 1.0e-6
-COMPACT_HEAT_ENERGY_DEN_EPS = 1.0e-6
+QUADRATIC_DEN_EPS = 1.0e-6
+HEAT_ENERGY_DEN_EPS = 1.0e-6
 _V4171_SRW_COMPOSITION_MODES = frozenset((
     DEFAULT_SRW_COMPOSITION_MODE,
-    "spherical_energy",
-    "compact_heat_energy",
+    "quadratic",
+    "heat_energy",
 ))
 
 
@@ -358,11 +358,6 @@ def _validate_v4171_composition_settings(
         admission_den_power, context=context)
     beta = _validate_v4171_heat_kernel_beta(
         heat_kernel_beta, context=context)
-    if mode in ("spherical_energy", "compact_heat_energy") and power != 0.5:
-        raise ValueError(
-            f"{context} requires admission_den_power=0.5 when "
-            f"srw_composition_mode={mode!r}, "
-            f"got {power}")
     return mode, power, beta
 
 
@@ -530,17 +525,16 @@ def _composition_den(
     srw_composition_mode = _validate_v4171_srw_composition_mode(
         srw_composition_mode, context="v4171 composition denominator")
     admission_mass = jnp.asarray(admission_mass, dtype=jnp.float32)
-    if srw_composition_mode in (
-            "spherical_energy", "compact_heat_energy"):
+    if srw_composition_mode in ("quadratic", "heat_energy"):
         den_eps = (
-            COMPACT_HEAT_ENERGY_DEN_EPS
-            if srw_composition_mode == "compact_heat_energy"
-            else SPHERICAL_ENERGY_DEN_EPS)
-        return jnp.sqrt(jnp.maximum(
-            admission_mass,
-            jnp.float32(den_eps ** 2)))
+            HEAT_ENERGY_DEN_EPS
+            if srw_composition_mode == "heat_energy"
+            else QUADRATIC_DEN_EPS)
+        den_floor_mass = jnp.float32(den_eps ** 2)
+    else:
+        den_floor_mass = jnp.float32(1.0)
     return jnp.power(
-        jnp.maximum(admission_mass, 1.0),
+        jnp.maximum(admission_mass, den_floor_mass),
         jnp.asarray(admission_den_power, dtype=jnp.float32))
 
 
@@ -548,10 +542,10 @@ def _composition_den_floor_mass(
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
     mode = _validate_v4171_srw_composition_mode(
         srw_composition_mode, context="v4171 composition denominator floor")
-    if mode in ("spherical_energy", "compact_heat_energy"):
-        if mode == "compact_heat_energy":
-            return COMPACT_HEAT_ENERGY_DEN_EPS ** 2
-        return SPHERICAL_ENERGY_DEN_EPS ** 2
+    if mode in ("quadratic", "heat_energy"):
+        if mode == "heat_energy":
+            return HEAT_ENERGY_DEN_EPS ** 2
+        return QUADRATIC_DEN_EPS ** 2
     return 1.0
 
 
@@ -801,9 +795,9 @@ def _compute_admission_drive(score, tau, boundary_scale,
     selection_margin = score - tau
     angular_amplitude = _linear_angular_depth_from_margin(
         selection_margin, tau)
-    if srw_composition_mode == "spherical_energy":
+    if srw_composition_mode == "quadratic":
         admission_weight = angular_amplitude * angular_amplitude
-    elif srw_composition_mode == "compact_heat_energy":
+    elif srw_composition_mode == "heat_energy":
         heat_amplitude = _compact_heat_kernel_from_amplitude(
             angular_amplitude, heat_kernel_beta)
         admission_weight = heat_amplitude * heat_amplitude
@@ -5856,17 +5850,18 @@ class DAWN_SRW_V4171(nn.Module):
             self.admission_den_power,
             self.heat_kernel_beta,
             context="DAWN_SRW_V4171 model info"))
-        if mode == "spherical_energy":
+        if mode == "quadratic":
             composition_info = [
                 f"  mode={mode}",
                 "  angular_amplitude=linear_cap_depth",
                 "  admission_weight=amplitude^2",
-                "  total_energy=sum(unpruned_admission)",
-                "  den=sqrt(max(total_energy,1e-12))",
-                "  numerator=pruned_execution_energy",
+                "  total_weight=sum(unpruned_admission)",
+                ("  den=max(total_weight,1e-12)^"
+                 "admission_den_power"),
+                "  numerator=pruned_execution_weight",
                 "  live_den_gradient=true",
             ]
-        elif mode == "compact_heat_energy":
+        elif mode == "heat_energy":
             composition_info = [
                 f"  mode={mode}",
                 "  support=rho>tau",
@@ -5878,8 +5873,9 @@ class DAWN_SRW_V4171(nn.Module):
                 "  energy_weight=heat_amplitude^2",
                 "  total_energy=sum(unpruned_energy_weight)",
                 "  numerator=pruned_energy_weight",
-                "  denominator=sqrt(max(total_energy,1e-12))",
-                ("  beta_to_zero_limit=spherical_energy"),
+                ("  denominator=max(total_energy,1e-12)^"
+                 "admission_den_power"),
+                ("  beta_to_zero_limit=quadratic"),
                 "  live_den_gradient=true",
             ]
         else:

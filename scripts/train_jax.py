@@ -16363,12 +16363,13 @@ def main():
                 _composition_mode = cfg['model']['srw_composition_mode']
                 print(f"  mode={_composition_mode}")
                 print("  angular_amplitude=linear_cap_depth")
-                if _composition_mode == 'spherical_energy':
+                if _composition_mode == 'quadratic':
                     print("  admission_weight=amplitude^2")
-                    print("  total_energy=sum(unpruned_admission)")
-                    print("  den=sqrt(max(total_energy,1e-12))")
-                    print("  numerator=pruned_execution_energy")
-                elif _composition_mode == 'compact_heat_energy':
+                    print("  total_weight=sum(unpruned_admission)")
+                    print("  den=max(total_weight,1e-12)"
+                          "^admission_den_power")
+                    print("  numerator=pruned_execution_weight")
+                elif _composition_mode == 'heat_energy':
                     print("  support=rho>tau")
                     print("  cap_amplitude=clip((rho-tau)/"
                           "max(1-tau,1e-4),0,1)")
@@ -16379,8 +16380,9 @@ def main():
                     print("  energy_weight=heat_amplitude^2")
                     print("  total_energy=sum(unpruned_energy_weight)")
                     print("  numerator=pruned_energy_weight")
-                    print("  denominator=sqrt(max(total_energy,1e-12))")
-                    print("  beta_to_zero_limit=spherical_energy")
+                    print("  denominator=max(total_energy,1e-12)"
+                          "^admission_den_power")
+                    print("  beta_to_zero_limit=quadratic")
                 else:
                     print("  admission_weight=amplitude")
                     print("  den=max(sum(unpruned_admission),1)"
@@ -18554,18 +18556,19 @@ def main():
                     "embeddings with direct state-to-operation queries; "
                     "execution remains full rank-1 RW")
                 _composition_mode = cfg['model']['srw_composition_mode']
-                if _composition_mode == 'spherical_energy':
+                if _composition_mode == 'quadratic':
                     log_message(
-                        "Composition: mode=spherical_energy; "
+                        "Composition: mode=quadratic; "
                         "angular_amplitude=linear_cap_depth; "
                         "admission_weight=amplitude^2; "
-                        "total_energy=sum(unpruned_admission); "
-                        "den=sqrt(max(total_energy,1e-12)); "
-                        "numerator=pruned_execution_energy; "
+                        "total_weight=sum(unpruned_admission); "
+                        "den=max(total_weight,1e-12)"
+                        f"^{admission_den_power:g}; "
+                        "numerator=pruned_execution_weight; "
                         "live_den_gradient=true; runtime_source=model")
-                elif _composition_mode == 'compact_heat_energy':
+                elif _composition_mode == 'heat_energy':
                     log_message(
-                        "SRW composition: mode=compact_heat_energy; "
+                        "SRW composition: mode=heat_energy; "
                         "support=rho>tau; "
                         "cap_amplitude=clip((rho-tau)/"
                         "max(1-tau,1e-4),0,1); "
@@ -18575,8 +18578,9 @@ def main():
                         "energy_weight=heat_amplitude^2; "
                         "total_energy=sum(unpruned_energy_weight); "
                         "numerator=pruned_energy_weight; "
-                        "denominator=sqrt(max(total_energy,1e-12)); "
-                        "beta_to_zero_limit=spherical_energy; "
+                        "denominator=max(total_energy,1e-12)"
+                        f"^{admission_den_power:g}; "
+                        "beta_to_zero_limit=quadratic; "
                         "live_den_gradient=true; runtime_source=model")
                 else:
                     log_message(

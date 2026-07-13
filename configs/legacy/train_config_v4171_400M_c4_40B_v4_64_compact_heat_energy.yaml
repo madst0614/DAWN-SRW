@@ -19,7 +19,7 @@ model:
   gradient_checkpointing: true
 
   d_route: 256
-  srw_composition_mode: compact_heat_energy
+  srw_composition_mode: heat_energy
   admission_den_power: 0.5
   heat_kernel_beta: 2.0
   n_qk: 3798

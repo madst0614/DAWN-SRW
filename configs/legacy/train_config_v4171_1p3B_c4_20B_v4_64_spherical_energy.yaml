@@ -19,7 +19,7 @@ model:
   gradient_checkpointing: true
 
   d_route: 384
-  srw_composition_mode: spherical_energy
+  srw_composition_mode: quadratic
   admission_den_power: 0.5
   n_qk: 7048
   n_v: 21928
