@@ -12790,22 +12790,22 @@ def _print_regular_block(rec, ctx):
         )
     elif is_v4164 and not is_official_soft_direct_tau:
         log_message(
-            f"  emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
-            f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
-            f" qk[m={rec['attn_qk_emb_norm_mean']:.2f} s={rec['attn_qk_emb_norm_std']:.2f}"
-            f" min={rec['attn_qk_emb_norm_min']:.2f} max={rec['attn_qk_emb_norm_max']:.2f}]"
-            f" v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
-            f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
+            f"  emb_n rst[m={rec['rst_op_key_norm']:.2f} s={rec['rst_op_key_norm_std']:.2f}"
+            f" min={rec['rst_op_key_norm_min']:.2f} max={_fmt_optional_max('rst')}]"
+            f" qk[m={rec['attn_qk_op_key_norm_mean']:.2f} s={rec['attn_qk_op_key_norm_std']:.2f}"
+            f" min={rec['attn_qk_op_key_norm_min']:.2f} max={_fmt_optional_max('attn_qk')}]"
+            f" v[m={rec['attn_v_op_key_norm_mean']:.2f} s={rec['attn_v_op_key_norm_std']:.2f}"
+            f" min={rec['attn_v_op_key_norm_min']:.2f} max={_fmt_optional_max('attn_v')}]"
         )
     elif not is_v4164:
         log_message(
             f"  {route_std_label}[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
-            f" | emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
-            f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
-            f" attn_qk[m={rec['attn_qk_emb_norm_mean']:.2f} s={rec['attn_qk_emb_norm_std']:.2f}"
-            f" min={rec['attn_qk_emb_norm_min']:.2f} max={rec['attn_qk_emb_norm_max']:.2f}]"
-            f" attn_v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
-            f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
+            f" | emb_n rst[m={rec['rst_op_key_norm']:.2f} s={rec['rst_op_key_norm_std']:.2f}"
+            f" min={rec['rst_op_key_norm_min']:.2f} max={_fmt_optional_max('rst')}]"
+            f" attn_qk[m={rec['attn_qk_op_key_norm_mean']:.2f} s={rec['attn_qk_op_key_norm_std']:.2f}"
+            f" min={rec['attn_qk_op_key_norm_min']:.2f} max={_fmt_optional_max('attn_qk')}]"
+            f" attn_v[m={rec['attn_v_op_key_norm_mean']:.2f} s={rec['attn_v_op_key_norm_std']:.2f}"
+            f" min={rec['attn_v_op_key_norm_min']:.2f} max={_fmt_optional_max('attn_v')}]"
         )
     if not is_official_soft_direct_tau:
         log_message(
