@@ -1517,8 +1517,9 @@ def _target_intervention_forward(
     )
     token_selector = jax.nn.one_hot(
         target_position, seq_len, dtype=jnp.float32)[None, :, None]
-    target_attention_updates = []
-    target_rst_updates = []
+    block_params = [params[f"block_{index}"] for index in range(n_layers)]
+    stacked_block_params = jax.tree.map(
+        lambda *values: jnp.stack(values), *block_params)
 
     def srw(
         x_in: Any,
@@ -1528,12 +1529,12 @@ def _target_intervention_forward(
         read: Any,
         write: Any,
         suppress_mask: Any,
-        layer_index: int,
+        layer_index: Any,
         pool_code: int,
         gate_temperature: float,
     ):
         apply_here = (
-            (target_layer == int(layer_index))
+            (target_layer == layer_index)
             & (target_pool == int(pool_code)))
         if sharded_srw_fns is not None:
             return sharded_srw_fns[int(pool_code)](
@@ -1592,24 +1593,30 @@ def _target_intervention_forward(
         return (numerator.astype(jnp.float32) / den).astype(
             jnp.bfloat16).astype(jnp.float32)
 
-    for layer_index in range(n_layers):
-        bp = params[f"block_{layer_index}"]
+    def scan_layer(carry: Any, layer_inputs: Any):
+        x_in = carry
+        bp, layer_index = layer_inputs
         normed = model_module._layer_norm(
-            x, bp["norm1"]["scale"], bp["norm1"]["bias"])
-        queries = normed @ router["proj_attn"]["kernel"] + router["proj_attn"]["bias"]
+            x_in, bp["norm1"]["scale"], bp["norm1"]["bias"])
+        queries = (
+            normed @ router["proj_attn"]["kernel"]
+            + router["proj_attn"]["bias"])
         query_q, query_k, query_v = jnp.split(queries, 3, axis=-1)
         query_adapter = getattr(
             model_module, "_read_write_attn_operator_queries", None)
         if query_adapter is not None:
             query_q, query_k, query_v = query_adapter(
                 router, normed, query_q, query_k, query_v)
-        tau_all = normed @ router["raw_tau_attn"]["kernel"] + router["raw_tau_attn"]["bias"]
+        tau_all = (
+            normed @ router["raw_tau_attn"]["kernel"]
+            + router["raw_tau_attn"]["bias"])
+
         if sharded_srw_fns is not None and "qk_paired" in sharded_srw_fns:
             query_qk = jnp.stack((query_q, query_k), axis=2)
             tau_qk = jnp.stack(
                 (tau_all[:, :, 0:1], tau_all[:, :, 1:2]), axis=2)
             apply_qk = (
-                (target_layer == int(layer_index))
+                (target_layer == layer_index)
                 & ((target_pool == 0) | (target_pool == 1)))
 
             def intervention_qk(_: Any):
@@ -1648,16 +1655,19 @@ def _target_intervention_forward(
             k = qk[:, :, 1, :]
         else:
             q = srw(
-                normed, query_q, pool["attn_qk_op_key"], tau_all[:, :, 0:1],
-                pool["attn_qk_read"], pool["attn_qk_write"], suppress_qk,
+                normed, query_q, pool["attn_qk_op_key"],
+                tau_all[:, :, 0:1], pool["attn_qk_read"],
+                pool["attn_qk_write"], suppress_qk,
                 layer_index, 0, temperature_qk) * qk_scale
             k = srw(
-                normed, query_k, pool["attn_qk_op_key"], tau_all[:, :, 1:2],
-                pool["attn_qk_read"], pool["attn_qk_write"], suppress_qk,
+                normed, query_k, pool["attn_qk_op_key"],
+                tau_all[:, :, 1:2], pool["attn_qk_read"],
+                pool["attn_qk_write"], suppress_qk,
                 layer_index, 1, temperature_qk) * qk_scale
+
         if sharded_srw_fns is not None:
             apply_v = (
-                (target_layer == int(layer_index)) & (target_pool == 2))
+                (target_layer == layer_index) & (target_pool == 2))
 
             def intervention_v(_: Any):
                 return sharded_srw_fns[2](
@@ -1692,35 +1702,53 @@ def _target_intervention_forward(
             v = v * v_scale
         else:
             v = srw(
-                normed, query_v, pool["attn_v_op_key"], tau_all[:, :, 2:3],
-                pool["attn_v_read"], pool["attn_v_write"], suppress_v,
+                normed, query_v, pool["attn_v_op_key"],
+                tau_all[:, :, 2:3], pool["attn_v_read"],
+                pool["attn_v_write"], suppress_v,
                 layer_index, 2, temperature_v) * v_scale
-        q = q.reshape(bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
-        k = k.reshape(bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
-        v = v.reshape(bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
-        scores = jnp.einsum("bhsd,bhtd->bhst", q, k) / jnp.sqrt(jnp.float32(d_head))
-        causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
-        scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+
+        q = q.reshape(
+            bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
+        k = k.reshape(
+            bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
+        v = v.reshape(
+            bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
+        scores = (
+            jnp.einsum("bhsd,bhtd->bhst", q, k)
+            / jnp.sqrt(jnp.float32(d_head)))
+        causal = jnp.tril(jnp.ones(
+            (seq_len, seq_len), dtype=jnp.bool_))
+        scores = jnp.where(
+            causal, scores, jnp.finfo(scores.dtype).min)
         attention = jax.nn.softmax(scores, axis=-1)
-        delta_attention = jnp.einsum("bhst,bhtd->bhsd", attention, v)
+        delta_attention = jnp.einsum(
+            "bhst,bhtd->bhsd", attention, v)
         delta_attention = delta_attention.transpose(0, 2, 1, 3).reshape(
             bsz, seq_len, d_model)
-        delta_attention = delta_attention @ bp["attn"]["expand_O"]["kernel"]
-        target_attention_updates.append(
-            delta_attention[jnp.arange(bsz), target_position])
-        x = x + delta_attention
+        delta_attention = (
+            delta_attention @ bp["attn"]["expand_O"]["kernel"])
+        target_attention_update = jnp.take(
+            delta_attention, target_position, axis=1)
+        x_after_attention = x_in + delta_attention
 
         normed = model_module._layer_norm(
-            x, bp["norm2"]["scale"], bp["norm2"]["bias"])
-        query_rst = normed @ router["proj_rst"]["kernel"] + router["proj_rst"]["bias"]
+            x_after_attention,
+            bp["norm2"]["scale"],
+            bp["norm2"]["bias"],
+        )
+        query_rst = (
+            normed @ router["proj_rst"]["kernel"]
+            + router["proj_rst"]["bias"])
         rst_query_adapter = getattr(
             model_module, "_read_write_rst_operator_query", None)
         if rst_query_adapter is not None:
             query_rst = rst_query_adapter(router, normed, query_rst)
-        tau_rst = normed @ router["raw_tau_rst"]["kernel"] + router["raw_tau_rst"]["bias"]
+        tau_rst = (
+            normed @ router["raw_tau_rst"]["kernel"]
+            + router["raw_tau_rst"]["bias"])
         if sharded_srw_fns is not None:
             apply_rst = (
-                (target_layer == int(layer_index)) & (target_pool == 3))
+                (target_layer == layer_index) & (target_pool == 3))
 
             def intervention_rst(_: Any):
                 return sharded_srw_fns[3](
@@ -1758,8 +1786,19 @@ def _target_intervention_forward(
                 normed, query_rst, pool["rst_op_key"], tau_rst,
                 pool["rst_read"], pool["rst_write"], suppress_rst,
                 layer_index, 3, temperature_rst) * rst_scale
-        target_rst_updates.append(delta_rst[jnp.arange(bsz), target_position])
-        x = x + delta_rst
+        target_rst_update = jnp.take(
+            delta_rst, target_position, axis=1)
+        x_next = x_after_attention + delta_rst
+        return x_next, (target_attention_update, target_rst_update)
+
+    x, (target_attention_updates, target_rst_updates) = jax.lax.scan(
+        scan_layer,
+        x,
+        (
+            stacked_block_params,
+            jnp.arange(n_layers, dtype=jnp.int32),
+        ),
+    )
 
     residual = x
     norm = params["norm"]
@@ -1786,8 +1825,8 @@ def _target_intervention_forward(
         logits,
         residual,
         normalized_residual,
-        jnp.stack(target_attention_updates, axis=0),
-        jnp.stack(target_rst_updates, axis=0),
+        target_attention_updates,
+        target_rst_updates,
     )
 
 
