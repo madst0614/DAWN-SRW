@@ -1461,9 +1461,24 @@ def _target_intervention_forward(
 
     residual = x
     norm = params["norm"]
-    x = model_module._layer_norm(x, norm["scale"], norm["bias"])
+    # The production module's final ``nn.LayerNorm`` uses Flax's default
+    # fast variance, E[x^2] - E[x]^2.  The block-local v4171 helper uses the
+    # centered variance instead, so reusing it here diverges on TPU even when
+    # every SRW update is identical.
+    x_f32 = x.astype(jnp.float32)
+    final_mean = jnp.mean(x_f32, axis=-1, keepdims=True)
+    final_mean_sq = jnp.mean(
+        jnp.square(x_f32), axis=-1, keepdims=True)
+    final_var = jnp.maximum(
+        jnp.float32(0.0), final_mean_sq - jnp.square(final_mean))
+    x = (
+        (x_f32 - final_mean)
+        * jax.lax.rsqrt(final_var + jnp.float32(1.0e-6))
+        * norm["scale"]
+        + norm["bias"]
+    )
     normalized_residual = x
-    logits = x @ params["token_emb"]["embedding"].T
+    logits = jnp.dot(x, params["token_emb"]["embedding"].T)
     logits = model_module._slice_logits_to_logical_vocab(logits, model_cfg)
     return (
         logits,
