@@ -12,7 +12,6 @@ import argparse
 import csv
 import json
 import math
-import os
 import random
 import sys
 import time
@@ -64,10 +63,13 @@ def load_yaml(path: str) -> Dict[str, Any]:
     return data
 
 
-def write_text(path: str, text: str) -> None:
+TRAIN_LOG_CONTENT_TYPE = 'text/plain; charset=utf-8'
+
+
+def write_text(path: str, text: str, *, content_type=None) -> None:
     if not str(path).startswith('gs://'):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with tj._open_file(path, 'w') as handle:
+    with tj._open_file(path, 'w', content_type=content_type) as handle:
         handle.write(text)
 
 
@@ -76,7 +78,10 @@ def append_text(path: str, text: str) -> None:
     if tj._file_exists(path):
         with tj._open_file(path, 'r') as handle:
             previous = handle.read()
-    write_text(path, previous + text)
+    write_text(
+        path,
+        previous + text,
+        content_type=TRAIN_LOG_CONTENT_TYPE)
 
 
 @dataclass(frozen=True)
@@ -457,17 +462,6 @@ def evaluate(params, score_step, eval_rows, batch_size, max_seq_len,
     return {'accuracy': float(local_result[0]), 'total': int(local_result[1])}
 
 
-def create_run_dir(output_root: str, run_name: str, task: str) -> str:
-    if is_host0():
-        suffix = time.strftime('%Y%m%d_%H%M%S') + f'_{os.getpid()}'
-        value = join_path(
-            output_root,
-            f"run_{run_name}_{task}_{suffix}")
-    else:
-        value = ''
-    return tj.broadcast_str_from_host0(value)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=True)
@@ -564,27 +558,12 @@ def main() -> None:
     output_root = requested_cfg.get('checkpoint_dir')
     if not output_root:
         raise ValueError('Config must set checkpoint_dir as experiment output root')
-    run_name = str(requested_cfg.get('run_name') or model_cfg['model_version'])
-    run_dir = create_run_dir(output_root, run_name, task)
-    train_log_path = join_path(run_dir, 'train.log')
-    metrics_path = join_path(run_dir, 'metrics.jsonl')
-    effective_config_path = join_path(run_dir, 'effective_config.yaml')
+    train_log_path = join_path(output_root, 'train.log')
 
     def record(message: str) -> None:
         if is_host0():
             print(message, flush=True)
             append_text(train_log_path, message + '\n')
-
-    def metric_record(payload: Dict[str, Any]) -> None:
-        if is_host0():
-            append_text(
-                metrics_path,
-                json.dumps(payload, sort_keys=True) + '\n')
-
-    if is_host0():
-        write_text(
-            effective_config_path,
-            yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
 
     model = tj.build_model_from_config(cfg)
     init_key = jax.random.PRNGKey(seed)
@@ -672,13 +651,24 @@ def main() -> None:
         'max_seq_len': max_seq_len,
         'tokenizer': tok_name,
         'tau_lr_mult': runtime_state['tau_lr_mult'],
-        'soft_gate_T_qk': runtime_state['soft_gate_T_qk'],
-        'soft_gate_T_v': runtime_state['soft_gate_T_v'],
-        'soft_gate_T_rst': runtime_state['soft_gate_T_rst'],
-        'boundary_power': runtime_state['soft_gate_boundary_power'],
     }
-    record(' '.join(f'{key}={value}' for key, value in header.items()))
-    metric_record({'type': 'run_start', **header, 'run_dir': run_dir})
+    if str(model_cfg['model_version']) == tj.V4171_MODEL_VERSION:
+        header.update({
+            'srw_composition_mode': runtime_state['srw_composition_mode'],
+            'admission_den_power': runtime_state['admission_den_power'],
+            'heat_kernel_beta': runtime_state['heat_kernel_beta'],
+        })
+    else:
+        header.update({
+            'soft_gate_T_qk': runtime_state['soft_gate_T_qk'],
+            'soft_gate_T_v': runtime_state['soft_gate_T_v'],
+            'soft_gate_T_rst': runtime_state['soft_gate_T_rst'],
+            'boundary_power': runtime_state['soft_gate_boundary_power'],
+        })
+    record(
+        '\n' + '=' * 80 + '\n'
+        + 'Downstream fine-tune: '
+        + ' '.join(f'{key}={value}' for key, value in header.items()))
 
     initial_eval = evaluate(
         params, score_step, eval_rows, eval_batch_size, max_seq_len,
@@ -686,14 +676,9 @@ def main() -> None:
     best_seen_acc = initial_eval['accuracy']
     final_eval = initial_eval
     record(
-        f"[eval/initial] phase_step=0 acc={initial_eval['accuracy']:.6f} "
+        f"[eval] task={task} kind=initial step=0 "
+        f"acc={initial_eval['accuracy']:.6f} "
         f"total={initial_eval['total']} best_seen_acc={best_seen_acc:.6f}")
-    metric_record({
-        'type': 'eval_initial', 'phase_step': 0,
-        'accuracy': initial_eval['accuracy'],
-        'total': initial_eval['total'],
-        'best_seen_acc': best_seen_acc,
-    })
 
     start_time = time.time()
     while phase_step < total_steps:
@@ -740,16 +725,10 @@ def main() -> None:
             valid_count = int(round(reduced['valid_count']))
             elapsed = time.time() - start_time
             record(
-                f'[train] phase_step={phase_step}/{total_steps} '
+                f'[train] task={task} step={phase_step}/{total_steps} '
                 f'epoch={epoch} loss={loss:.6f} valid_tokens={valid_count} '
                 f'real_examples={int(example_valid.sum())} '
                 f'elapsed_sec={elapsed:.1f}')
-            metric_record({
-                'type': 'train', 'phase_step': phase_step, 'epoch': epoch,
-                'loss': loss, 'valid_tokens': valid_count,
-                'real_examples': int(example_valid.sum()),
-                'elapsed_sec': elapsed,
-            })
 
         if eval_interval > 0 and phase_step % eval_interval == 0:
             final_eval = evaluate(
@@ -757,32 +736,23 @@ def main() -> None:
                 pad_token_id, data_sharding)
             best_seen_acc = max(best_seen_acc, final_eval['accuracy'])
             record(
-                f"[eval/interval] phase_step={phase_step} "
+                f"[eval] task={task} kind=interval step={phase_step} "
                 f"acc={final_eval['accuracy']:.6f} "
                 f"total={final_eval['total']} "
                 f"best_seen_acc={best_seen_acc:.6f}")
-            metric_record({
-                'type': 'eval_interval', 'phase_step': phase_step,
-                'accuracy': final_eval['accuracy'],
-                'total': final_eval['total'],
-                'best_seen_acc': best_seen_acc,
-            })
 
     final_eval = evaluate(
         params, score_step, eval_rows, eval_batch_size, max_seq_len,
         pad_token_id, data_sharding)
     best_seen_acc = max(best_seen_acc, final_eval['accuracy'])
     record(
-        f"[eval/final] phase_step={phase_step} "
+        f"[eval] task={task} kind=final step={phase_step} "
         f"final_acc={final_eval['accuracy']:.6f} "
         f"best_seen_acc={best_seen_acc:.6f} total={final_eval['total']}")
-    metric_record({
-        'type': 'eval_final', 'phase_step': phase_step,
-        'final_acc': final_eval['accuracy'],
-        'best_seen_acc': best_seen_acc,
-        'total': final_eval['total'],
-        'checkpoint_write': 'disabled',
-    })
+    record(
+        f"[summary] task={task} step={phase_step} "
+        f"final_acc={final_eval['accuracy']:.6f} "
+        f"best_acc={best_seen_acc:.6f} total={final_eval['total']}")
 
     if jax.process_count() > 1:
         completed = np.asarray([phase_step], dtype=np.int64)
