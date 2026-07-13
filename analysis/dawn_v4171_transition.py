@@ -2123,14 +2123,15 @@ def run_causal_intervention(
             data_replicas,
             axis=0,
         )
+        input_ids_device = jax.device_put(
+            jnp.asarray(input_ids_np), ctx.data_sharding)
         target_position = int(record["target_token_index"])
         zeros_qk = np.zeros((pool_sizes["q"],), dtype=np.float32)
         zeros_v = np.zeros((pool_sizes["v"],), dtype=np.float32)
         zeros_rst = np.zeros((pool_sizes["rst"],), dtype=np.float32)
-        (baseline_logits, baseline_residual, _,
-         baseline_attention_updates, baseline_rst_updates) = jax.device_get(forward(
+        (baseline_logits, baseline_residual, _, _, _) = jax.device_get(forward(
             ctx.params,
-            jax.device_put(jnp.asarray(input_ids_np), ctx.data_sharding),
+            input_ids_device,
             jnp.int32(target_position),
             jnp.int32(-1),
             jnp.int32(-1),
@@ -2140,15 +2141,12 @@ def run_causal_intervention(
         ))
         baseline_logits = np.asarray(baseline_logits)
         baseline_residual = np.asarray(baseline_residual)
-        baseline_attention_updates = np.asarray(baseline_attention_updates)
-        baseline_rst_updates = np.asarray(baseline_rst_updates)
         length = int(prompt["length"])
         pred_pos = max(0, length - 1)
         continuation_ids = prompt.get("continuation_token_ids") or []
         target_token_id = int(continuation_ids[0]) if continuation_ids else None
-        base_logp = _log_softmax_np(baseline_logits[0, pred_pos])
-        base_logp_all = _log_softmax_np(baseline_logits[0, :length])
         baseline_ce = _sequence_ce(baseline_logits, prompt["token_ids"], length)
+        matched_baselines: Dict[Tuple[str, int], Tuple[np.ndarray, ...]] = {}
         for pool in TRACE_POOLS:
             for candidate in _intervention_candidates(record, pool):
                 if not candidate["candidate_valid"]:
@@ -2162,6 +2160,34 @@ def run_causal_intervention(
                         "canonical_unpruned_admission_denominator": True,
                     })
                     continue
+                layer = int(candidate["layer"])
+                control_key = (str(pool), layer)
+                if control_key not in matched_baselines:
+                    matched = jax.device_get(forward(
+                        ctx.params,
+                        input_ids_device,
+                        jnp.int32(target_position),
+                        jnp.int32(layer),
+                        jnp.int32(pool_codes[pool]),
+                        jnp.asarray(zeros_qk),
+                        jnp.asarray(zeros_v),
+                        jnp.asarray(zeros_rst),
+                    ))
+                    matched_baselines[control_key] = tuple(
+                        np.asarray(value) for value in matched)
+                (
+                    matched_logits,
+                    matched_residual,
+                    _,
+                    matched_attention_updates,
+                    matched_rst_updates,
+                ) = matched_baselines[control_key]
+                matched_logp = _log_softmax_np(
+                    matched_logits[0, pred_pos])
+                matched_logp_all = _log_softmax_np(
+                    matched_logits[0, :length])
+                matched_ce = _sequence_ce(
+                    matched_logits, prompt["token_ids"], length)
                 masks = {
                     "qk": zeros_qk.copy(),
                     "v": zeros_v.copy(),
@@ -2172,7 +2198,7 @@ def run_causal_intervention(
                 (logits, residual, _,
                  attention_updates, rst_updates) = jax.device_get(forward(
                     ctx.params,
-                    jax.device_put(jnp.asarray(input_ids_np), ctx.data_sharding),
+                    input_ids_device,
                     jnp.int32(target_position),
                     jnp.int32(candidate["layer"]),
                     jnp.int32(pool_codes[pool]),
@@ -2186,27 +2212,31 @@ def run_causal_intervention(
                 rst_updates = np.asarray(rst_updates)
                 logp = _log_softmax_np(logits[0, pred_pos])
                 logp_all = _log_softmax_np(logits[0, :length])
-                next_prob = np.exp(base_logp)
-                next_token_kl = float(np.sum(next_prob * (base_logp - logp)))
-                base_prob_all = np.exp(base_logp_all)
+                next_prob = np.exp(matched_logp)
+                next_token_kl = float(np.sum(
+                    next_prob * (matched_logp - logp)))
+                base_prob_all = np.exp(matched_logp_all)
                 full_output_kl = float(np.mean(np.sum(
-                    base_prob_all * (base_logp_all - logp_all), axis=-1)))
+                    base_prob_all * (matched_logp_all - logp_all), axis=-1)))
                 target_delta = (
-                    float(logp[target_token_id] - base_logp[target_token_id])
+                    float(logp[target_token_id] - matched_logp[target_token_id])
                     if target_token_id is not None and target_token_id < logp.shape[-1]
                     else None)
-                target_residual_base = baseline_residual[0, target_position]
+                target_residual_base = matched_residual[0, target_position]
                 target_residual_new = residual[0, target_position]
                 unrelated_pos = 0 if target_position != 0 else min(1, length - 1)
-                layer = int(candidate["layer"])
                 if pool == "rst":
-                    local_base = baseline_rst_updates[layer, 0]
+                    local_base = matched_rst_updates[layer, 0]
                     local_new = rst_updates[layer, 0]
                     local_kind = "rst_residual_update"
                 else:
-                    local_base = baseline_attention_updates[layer, 0]
+                    local_base = matched_attention_updates[layer, 0]
                     local_new = attention_updates[layer, 0]
                     local_kind = "attention_residual_update"
+                canonical_logit_diff = np.abs(
+                    matched_logits[:, :length].astype(np.float64)
+                    - baseline_logits[:, :length].astype(np.float64))
+                canonical_residual = baseline_residual[0, target_position]
                 row = {
                     "prompt_id": prompt["prompt_id"],
                     "phenomenon": prompt["phenomenon"],
@@ -2214,18 +2244,30 @@ def run_causal_intervention(
                     **candidate,
                     "intervention_type": "selection_gate_ablation_canonical_denominator",
                     "canonical_unpruned_admission_denominator": True,
+                    "effect_reference": "matched_zero_mask_same_kernel",
                     "removed_operator_count": 1,
                     "status": "ready",
-                    "baseline_ce": baseline_ce,
+                    "baseline_ce": matched_ce,
+                    "canonical_production_ce": baseline_ce,
                     "prompt_prefix_ce_delta": (
-                        None if baseline_ce is None else
-                        float(_sequence_ce(logits, prompt["token_ids"], length) - baseline_ce)),
+                        None if matched_ce is None else
+                        float(_sequence_ce(
+                            logits, prompt["token_ids"], length) - matched_ce)),
                     "target_continuation_token_id": target_token_id,
                     "target_logprob_delta": target_delta,
                     "next_token_kl": next_token_kl,
                     "full_output_kl": full_output_kl,
                     "top_prediction_changed": bool(
-                        int(np.argmax(base_logp)) != int(np.argmax(logp))),
+                        int(np.argmax(matched_logp)) != int(np.argmax(logp))),
+                    "zero_mask_vs_production_mean_logit_abs_diff": float(
+                        np.mean(canonical_logit_diff)),
+                    "zero_mask_vs_production_max_logit_abs_diff": float(
+                        np.max(canonical_logit_diff)),
+                    "zero_mask_vs_production_final_residual_cosine": _cosine(
+                        canonical_residual, target_residual_base),
+                    "zero_mask_vs_production_final_residual_relative_error": float(
+                        np.linalg.norm(target_residual_base - canonical_residual)
+                        / max(float(np.linalg.norm(canonical_residual)), 1.0e-12)),
                     "final_residual_cosine": _cosine(
                         target_residual_base, target_residual_new),
                     "final_residual_relative_error": float(
@@ -2239,10 +2281,11 @@ def run_causal_intervention(
                     "structurally_unaffected_past_position_control": {
                         "position": int(unrelated_pos),
                         "residual_relative_error": float(
-                        np.linalg.norm(
-                            residual[0, unrelated_pos] - baseline_residual[0, unrelated_pos])
-                        / max(float(np.linalg.norm(
-                            baseline_residual[0, unrelated_pos])), 1.0e-12)),
+                            np.linalg.norm(
+                                residual[0, unrelated_pos]
+                                - matched_residual[0, unrelated_pos])
+                            / max(float(np.linalg.norm(
+                                matched_residual[0, unrelated_pos])), 1.0e-12)),
                     },
                 }
                 result_rows.append(row)
@@ -2266,6 +2309,35 @@ def run_causal_intervention(
         if row["strategy"] in ("inactive_random", "active_random", "matched_control")
         and row.get("target_logprob_delta") is not None
     ]
+    unique_zero_mask_controls: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+    for row in valid_rows:
+        key = (
+            str(row["prompt_id"]),
+            str(row["pool"]),
+            int(row["layer"]),
+        )
+        unique_zero_mask_controls.setdefault(key, row)
+    zero_mask_control_rows = list(unique_zero_mask_controls.values())
+    zero_mask_control_summary = {
+        "n": len(zero_mask_control_rows),
+        "mean_logit_abs_diff_mean": (
+            float(np.mean([
+                float(row["zero_mask_vs_production_mean_logit_abs_diff"])
+                for row in zero_mask_control_rows
+            ])) if zero_mask_control_rows else None),
+        "mean_logit_abs_diff_max": (
+            max(float(row["zero_mask_vs_production_mean_logit_abs_diff"])
+                for row in zero_mask_control_rows)
+            if zero_mask_control_rows else None),
+        "max_logit_abs_diff_max": (
+            max(float(row["zero_mask_vs_production_max_logit_abs_diff"])
+                for row in zero_mask_control_rows)
+            if zero_mask_control_rows else None),
+        "final_residual_cosine_min": (
+            min(float(row["zero_mask_vs_production_final_residual_cosine"])
+                for row in zero_mask_control_rows)
+            if zero_mask_control_rows else None),
+    }
     def grouped(key: str, seed_offset: int) -> Dict[str, Any]:
         values = sorted({str(row[key]) for row in valid_rows})
         return {
@@ -2280,6 +2352,7 @@ def run_causal_intervention(
         "status": "ready" if valid_rows else "insufficient_evidence",
         "intervention_type": "selection_gate_ablation_canonical_denominator",
         "canonical_unpruned_admission_denominator": True,
+        "effect_reference": "matched_zero_mask_same_kernel",
         "num_prompts": len(primary),
         "prompt_selection": "one complete pair each: lexical_ambiguity, negation, subject_verb_agreement",
         "num_interventions": len(valid_rows),
@@ -2292,6 +2365,7 @@ def run_causal_intervention(
             }
         }.items())),
         "intervention_forward_parity": parity,
+        "zero_mask_kernel_control": zero_mask_control_summary,
         "effects": {
             "overall": _causal_effect_summary(valid_rows, intervention_seed),
             "by_strategy": grouped("strategy", 100),
