@@ -1440,7 +1440,30 @@ def _intervention_srw_fns(ctx: AnalysisContext) -> Dict[Any, Any]:
             "soft_gate_T_rst", cfg["soft_gate_temperature"])),
         **common,
     )
-    return {0: qk, 1: qk, 2: v, 3: rst, "qk_paired": qk_paired}
+    production = ctx.sharded_fns
+    if not isinstance(production, dict):
+        raise RuntimeError(
+            "v4171 causal intervention requires canonical dict-style "
+            "production sharded_fns")
+    production_keys = {
+        "production_qk_paired": "attn_qk_paired_minimal",
+        "production_v_single": "attn_v_single_minimal",
+        "production_rst_single": "rst_single_minimal",
+    }
+    missing = [
+        source for source in production_keys.values()
+        if production.get(source) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "v4171 causal intervention is missing canonical production "
+            f"kernels: {', '.join(sorted(missing))}")
+    result = {0: qk, 1: qk, 2: v, 3: rst, "qk_paired": qk_paired}
+    result.update({
+        target: production[source]
+        for target, source in production_keys.items()
+    })
+    return result
 
 
 def _target_intervention_forward(
@@ -1478,6 +1501,11 @@ def _target_intervention_forward(
         "soft_gate_T_v", execution_kwargs["soft_gate_temperature"]))
     temperature_rst = float(model_cfg.get(
         "soft_gate_T_rst", execution_kwargs["soft_gate_temperature"]))
+    temperature_final = float(model_cfg.get(
+        "soft_gate_t_final", execution_kwargs["soft_gate_temperature"]))
+    boundary_power = float(execution_kwargs["soft_gate_boundary_power"])
+    boundary_power_final = float(model_cfg.get(
+        "soft_gate_boundary_power_final", boundary_power))
     pool = model_module._pool_params_with_operator_keys(params["neuron_pool"])
     router = params["router"]
     qk_scale, v_scale, rst_scale = model_module._effective_pool_output_scales(
@@ -1580,18 +1608,42 @@ def _target_intervention_forward(
             query_qk = jnp.stack((query_q, query_k), axis=2)
             tau_qk = jnp.stack(
                 (tau_all[:, :, 0:1], tau_all[:, :, 1:2]), axis=2)
-            qk = sharded_srw_fns["qk_paired"](
-                normed,
-                query_qk,
-                pool["attn_qk_op_key"],
-                tau_qk,
-                pool["attn_qk_read"],
-                pool["attn_qk_write"],
-                suppress_qk,
-                target_position,
-                target_pool,
-                target_layer == int(layer_index),
-            ) * qk_scale
+            apply_qk = (
+                (target_layer == int(layer_index))
+                & ((target_pool == 0) | (target_pool == 1)))
+
+            def intervention_qk(_: Any):
+                return sharded_srw_fns["qk_paired"](
+                    normed,
+                    query_qk,
+                    pool["attn_qk_op_key"],
+                    tau_qk,
+                    pool["attn_qk_read"],
+                    pool["attn_qk_write"],
+                    suppress_qk,
+                    target_position,
+                    target_pool,
+                    jnp.bool_(True),
+                )
+
+            def production_qk(_: Any):
+                return sharded_srw_fns["production_qk_paired"](
+                    normed,
+                    query_qk,
+                    pool["attn_qk_op_key"],
+                    tau_qk,
+                    pool["attn_qk_read"],
+                    pool["attn_qk_write"],
+                    temperature_qk,
+                    temperature_final,
+                    boundary_power,
+                    boundary_power_final,
+                    jnp.float32(0.0),
+                )[0]
+
+            qk = jax.lax.cond(
+                apply_qk, intervention_qk, production_qk, operand=None)
+            qk = qk * qk_scale
             q = qk[:, :, 0, :]
             k = qk[:, :, 1, :]
         else:
@@ -1603,10 +1655,46 @@ def _target_intervention_forward(
                 normed, query_k, pool["attn_qk_op_key"], tau_all[:, :, 1:2],
                 pool["attn_qk_read"], pool["attn_qk_write"], suppress_qk,
                 layer_index, 1, temperature_qk) * qk_scale
-        v = srw(
-            normed, query_v, pool["attn_v_op_key"], tau_all[:, :, 2:3],
-            pool["attn_v_read"], pool["attn_v_write"], suppress_v,
-            layer_index, 2, temperature_v) * v_scale
+        if sharded_srw_fns is not None:
+            apply_v = (
+                (target_layer == int(layer_index)) & (target_pool == 2))
+
+            def intervention_v(_: Any):
+                return sharded_srw_fns[2](
+                    normed,
+                    query_v,
+                    pool["attn_v_op_key"],
+                    tau_all[:, :, 2:3],
+                    pool["attn_v_read"],
+                    pool["attn_v_write"],
+                    suppress_v,
+                    target_position,
+                    jnp.bool_(True),
+                )
+
+            def production_v(_: Any):
+                return sharded_srw_fns["production_v_single"](
+                    normed,
+                    query_v,
+                    pool["attn_v_op_key"],
+                    tau_all[:, :, 2:3],
+                    pool["attn_v_read"],
+                    pool["attn_v_write"],
+                    temperature_v,
+                    temperature_final,
+                    boundary_power,
+                    boundary_power_final,
+                    jnp.float32(0.0),
+                )[0]
+
+            v = jax.lax.cond(
+                apply_v, intervention_v, production_v, operand=None)
+            v = v * v_scale
+        else:
+            v = srw(
+                normed, query_v, pool["attn_v_op_key"], tau_all[:, :, 2:3],
+                pool["attn_v_read"], pool["attn_v_write"], suppress_v,
+                layer_index, 2, temperature_v) * v_scale
         q = q.reshape(bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
         k = k.reshape(bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
         v = v.reshape(bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1630,10 +1718,46 @@ def _target_intervention_forward(
         if rst_query_adapter is not None:
             query_rst = rst_query_adapter(router, normed, query_rst)
         tau_rst = normed @ router["raw_tau_rst"]["kernel"] + router["raw_tau_rst"]["bias"]
-        delta_rst = srw(
-            normed, query_rst, pool["rst_op_key"], tau_rst,
-            pool["rst_read"], pool["rst_write"], suppress_rst,
-            layer_index, 3, temperature_rst) * rst_scale
+        if sharded_srw_fns is not None:
+            apply_rst = (
+                (target_layer == int(layer_index)) & (target_pool == 3))
+
+            def intervention_rst(_: Any):
+                return sharded_srw_fns[3](
+                    normed,
+                    query_rst,
+                    pool["rst_op_key"],
+                    tau_rst,
+                    pool["rst_read"],
+                    pool["rst_write"],
+                    suppress_rst,
+                    target_position,
+                    jnp.bool_(True),
+                )
+
+            def production_rst(_: Any):
+                return sharded_srw_fns["production_rst_single"](
+                    normed,
+                    query_rst,
+                    pool["rst_op_key"],
+                    tau_rst,
+                    pool["rst_read"],
+                    pool["rst_write"],
+                    temperature_rst,
+                    temperature_final,
+                    boundary_power,
+                    boundary_power_final,
+                    jnp.float32(0.0),
+                )[0]
+
+            delta_rst = jax.lax.cond(
+                apply_rst, intervention_rst, production_rst, operand=None)
+            delta_rst = delta_rst * rst_scale
+        else:
+            delta_rst = srw(
+                normed, query_rst, pool["rst_op_key"], tau_rst,
+                pool["rst_read"], pool["rst_write"], suppress_rst,
+                layer_index, 3, temperature_rst) * rst_scale
         target_rst_updates.append(delta_rst[jnp.arange(bsz), target_position])
         x = x + delta_rst
 
