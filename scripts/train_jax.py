@@ -13774,6 +13774,11 @@ def build_effective_transfer_config(source_checkpoint, downstream_config):
             "Transfer checkpoint has no tokenizer metadata and downstream "
             "config does not explicitly provide tokenizer")
     cfg['model'] = deepcopy(source_checkpoint.full_config['model'])
+    # Pretraining materializes logical/padded vocab fields before model init.
+    # Older checkpoints may contain the pre-materialized model config, so the
+    # transfer frontend must perform the same canonical step before it builds
+    # the target parameter tree and vocab-parallel sharded functions.
+    _maybe_materialize_vocab_parallel_config(cfg)
     return cfg
 
 
