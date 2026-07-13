@@ -985,17 +985,24 @@ def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisF
     data = _v4171_item(summary, "causal_intervention")
     selected = data.get("selected_abs_target_logprob_delta", {})
     control = data.get("control_abs_target_logprob_delta", {})
-    parity = data.get("intervention_forward_parity", {})
+    diagnostic = data.get(
+        "intervention_forward_cross_graph_diagnostic",
+        data.get("intervention_forward_parity", {}),
+    )
+    zero_mask = data.get("zero_mask_kernel_control", {})
     out = [
         "  CAUSAL_INTERVENTION:",
         f"  status          : {data.get('status', 'missing')}",
         f"  type            : {data.get('intervention_type', 'n/a')}",
         f"  canonical_den   : {data.get('canonical_unpruned_admission_denominator', False)}",
+        f"  baseline        : {data.get('canonical_baseline_source', 'legacy')}",
+        f"  effect reference: {data.get('effect_reference', 'legacy')}",
         f"  prompts/jobs    : {data.get('num_prompts', 0)}/{data.get('num_interventions', 0)} skipped={data.get('num_skipped', 0)}",
-        "  INTERVENTION_FORWARD_PARITY:",
-        f"  parity status   : {parity.get('status', 'missing')}",
-        f"  parity CE/logit : ce={fmt.num(parity.get('ce_abs_diff'), 6)} mean={fmt.num(parity.get('mean_logit_abs_diff'), 6)} max={fmt.num(parity.get('max_logit_abs_diff'), 6)}",
-        f"  parity top1/res : top1={fmt.num(parity.get('top1_agreement'), 6)} residual_cos={fmt.num(parity.get('final_residual_cosine'), 8)}",
+        "  INTERVENTION_FORWARD_DIAGNOSTIC:",
+        f"  diagnostic      : status={diagnostic.get('status', 'missing')} blocking={diagnostic.get('blocking', 'legacy')} threshold_passed={diagnostic.get('threshold_passed', 'n/a')}",
+        f"  diagnostic CE/logit: ce={fmt.num(diagnostic.get('ce_abs_diff'), 6)} mean={fmt.num(diagnostic.get('mean_logit_abs_diff'), 6)} max={fmt.num(diagnostic.get('max_logit_abs_diff'), 6)}",
+        f"  diagnostic top1/res: top1={fmt.num(diagnostic.get('top1_agreement'), 6)} residual_cos={fmt.num(diagnostic.get('final_residual_cosine'), 8)}",
+        f"  zero-mask control: n={zero_mask.get('n', 0)} mean_logit_max={fmt.num(zero_mask.get('mean_logit_abs_diff_max'), 6)} residual_cos_min={fmt.num(zero_mask.get('final_residual_cosine_min'), 8)}",
         f"  selected effect : mean={fmt.num(selected.get('mean'), 5)} ci95={selected.get('ci95')} n={selected.get('n', 0)}",
         f"  control effect  : mean={fmt.num(control.get('mean'), 5)} ci95={control.get('ci95')} n={control.get('n', 0)}",
         f"  selected-control: {fmt.delta(data.get('selected_minus_control_effect'), 5)}",
