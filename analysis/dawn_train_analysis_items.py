@@ -892,7 +892,10 @@ def _item_lines_global_router_audit(summary: Dict[str, Any], _fmt: TrainAnalysis
 
 def _item_lines_trajectory_trace(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
     data = _v4171_item(summary, "trajectory_trace")
+    decoupling = _v4171_item(summary, "state_transition_decoupling")
+    pair_counts = decoupling.get("counts", {})
     captured = data.get("captured_mass", {})
+    captured_by_pool = data.get("captured_mass_by_pool", {})
     semantics = data.get("tensor_semantics", {})
     out = [
         "  TRAJECTORY_TRACE:",
@@ -903,6 +906,8 @@ def _item_lines_trajectory_trace(summary: Dict[str, Any], fmt: TrainAnalysisForm
         f"  span_aggregate  : {data.get('span_aggregation', 'n/a')}",
         f"  sparse_topk     : {data.get('trace_topk', 'n/a')}",
         f"  captured_mass   : mean={fmt.pct(captured.get('mean'), 2)} min={fmt.pct(captured.get('min'), 2)} p10={fmt.pct(captured.get('p10'), 2)}",
+        f"  valid_pair_rows : {fmt.pct(pair_counts.get('valid_pair_metric_row_fraction'), 2)}",
+        f"  excluded_lowcap : {pair_counts.get('excluded_low_capture_rows', 'n/a')}",
         f"  qkv_semantics   : {semantics.get('qkv', 'n/a')}",
         f"  attention_delta : {semantics.get('attention', 'n/a')}",
         f"  rst_delta       : {semantics.get('rst', 'n/a')}",
@@ -910,6 +915,11 @@ def _item_lines_trajectory_trace(summary: Dict[str, Any], fmt: TrainAnalysisForm
     ]
     if data.get("captured_mass_warning"):
         out.append(f"  warning         : {data['captured_mass_warning']}")
+    for pool in ("q", "k", "v", "rst"):
+        row = captured_by_pool.get(pool, {})
+        out.append(
+            f"  captured {pool:<3}    : mean={fmt.pct(row.get('mean'), 2)} "
+            f"min={fmt.pct(row.get('min'), 2)} p10={fmt.pct(row.get('p10'), 2)}")
     return out
 
 
@@ -919,20 +929,23 @@ def _item_lines_context_divergence(summary: Dict[str, Any], fmt: TrainAnalysisFo
         "  CONTEXT_DIVERGENCE:",
         f"  status     : {data.get('status', 'missing')}",
         f"  pair_count : {data.get('num_pairs', 0)}",
+        f"  significant: {data.get('num_significant_pool_pairs', 0)}",
+        f"  no_signal  : {data.get('num_no_significant_pool_pairs', 0)}",
         f"  gate_metric: {data.get('gate_metric', 'n/a')}",
-        "  pair/pool first max reconv state query gate delta captured_min",
+        "  significant pair/pool first max reconv reconv_layer evidence captured_min",
     ]
-    for row in (data.get("pairs") or [])[:16]:
+    for row in [
+        value for value in (data.get("pairs") or [])
+        if value.get("status") == "significant_divergence"
+    ][:16]:
         out.append(
             "  "
             f"{row.get('pair_id')}/{row.get('pool')} "
             f"{row.get('first_divergence_layer')} "
             f"{row.get('maximum_divergence_layer')} "
             f"{row.get('late_reconvergence')} "
-            f"{fmt.num(row.get('mean_state_similarity'), 3)} "
-            f"{fmt.num(row.get('mean_query_similarity'), 3)} "
-            f"{fmt.num(row.get('mean_gate_similarity'), 3)} "
-            f"{fmt.num(row.get('mean_delta_similarity'), 3)} "
+            f"{row.get('late_reconvergence_layer')} "
+            f"{fmt.num(row.get('maximum_divergence_evidence'), 4)} "
             f"{fmt.pct(row.get('min_captured_mass'), 1)}"
         )
     return out
@@ -942,15 +955,21 @@ def _item_lines_state_transition_decoupling(summary: Dict[str, Any], fmt: TrainA
     data = _v4171_item(summary, "state_transition_decoupling")
     actual = data.get("path_similarity", {})
     null = data.get("random_null_path_similarity", {})
+    counts = data.get("counts", {})
     out = [
         "  STATE_TRANSITION_DECOUPLING:",
         f"  status               : {data.get('status', 'missing')}",
         f"  state_low_q25        : {fmt.num(data.get('state_low_threshold_data_q25'), 4)}",
         f"  transition_high_null: {fmt.num(data.get('transition_high_threshold_random_null_q75'), 4)}",
         f"  quadrants            : {data.get('quadrants', {})}",
+        f"  quadrant unique pairs: {data.get('quadrant_unique_pairs', {})}",
         f"  path_similarity      : mean={fmt.num(actual.get('mean'), 4)} ci95={actual.get('ci95')} n={actual.get('n', 0)}",
         f"  random_null          : mean={fmt.num(null.get('mean'), 4)} ci95={null.get('ci95')} n={null.get('n', 0)}",
         f"  effect_vs_random     : {fmt.delta(data.get('path_similarity_effect_vs_random'), 4)}",
+        f"  pair counts          : actual={counts.get('actual_unique_pairs', 0)} null={counts.get('null_unique_pairs', 0)}",
+        f"  valid pool-pairs     : actual={counts.get('actual_valid_pool_pairs', 0)} null={counts.get('null_valid_pool_pairs', 0)}",
+        f"  excluded low-capture: {counts.get('excluded_low_capture_rows', 0)}",
+        f"  path definition      : {data.get('path_definition', 'n/a')}",
     ]
     for pool, row in (data.get("correlations") or {}).items():
         out.append(
@@ -966,17 +985,31 @@ def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisF
     data = _v4171_item(summary, "causal_intervention")
     selected = data.get("selected_abs_target_logprob_delta", {})
     control = data.get("control_abs_target_logprob_delta", {})
-    return [
+    parity = data.get("intervention_forward_parity", {})
+    out = [
         "  CAUSAL_INTERVENTION:",
         f"  status          : {data.get('status', 'missing')}",
         f"  type            : {data.get('intervention_type', 'n/a')}",
         f"  canonical_den   : {data.get('canonical_unpruned_admission_denominator', False)}",
-        f"  prompts/jobs    : {data.get('num_prompts', 0)}/{data.get('num_interventions', 0)}",
+        f"  prompts/jobs    : {data.get('num_prompts', 0)}/{data.get('num_interventions', 0)} skipped={data.get('num_skipped', 0)}",
+        "  INTERVENTION_FORWARD_PARITY:",
+        f"  parity status   : {parity.get('status', 'missing')}",
+        f"  parity CE/logit : ce={fmt.num(parity.get('ce_abs_diff'), 6)} mean={fmt.num(parity.get('mean_logit_abs_diff'), 6)} max={fmt.num(parity.get('max_logit_abs_diff'), 6)}",
+        f"  parity top1/res : top1={fmt.num(parity.get('top1_agreement'), 6)} residual_cos={fmt.num(parity.get('final_residual_cosine'), 8)}",
         f"  selected effect : mean={fmt.num(selected.get('mean'), 5)} ci95={selected.get('ci95')} n={selected.get('n', 0)}",
         f"  control effect  : mean={fmt.num(control.get('mean'), 5)} ci95={control.get('ci95')} n={control.get('n', 0)}",
         f"  selected-control: {fmt.delta(data.get('selected_minus_control_effect'), 5)}",
         f"  artifact        : {data.get('artifact', 'n/a')}",
     ]
+    effects = data.get("effects", {})
+    for group_name in ("by_strategy", "by_pool", "by_phenomenon"):
+        for key, row in (effects.get(group_name) or {}).items():
+            out.append(
+                f"  effect {group_name}/{key}: n={row.get('n', 0)} "
+                f"abs_dlogp={fmt.num(row.get('mean_abs_target_logprob_delta'), 5)} "
+                f"ci95={row.get('bootstrap_ci95')} kl={fmt.num(row.get('mean_kl'), 5)} "
+                f"top1_change={fmt.pct(row.get('top_prediction_changed_fraction'), 2)}")
+    return out
 
 
 def _item_lines_decision_reason(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:

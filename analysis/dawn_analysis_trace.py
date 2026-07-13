@@ -26,6 +26,20 @@ from analysis.dawn_analysis_storage import (
 )
 
 TRACE_POOLS = ("q", "k", "v", "rst")
+TRANSITION_CANDIDATE_STRATEGIES = (
+    "top_contribution",
+    "top_gate",
+    "inactive_random",
+    "active_random",
+    "matched_control",
+)
+TRANSITION_CANDIDATE_FIELDS = (
+    "candidate_ids",
+    "candidate_valid",
+    "candidate_execution",
+    "candidate_admission",
+    "candidate_abs_coefficient",
+)
 TRACE_FIELDS = (
     "top_idx",
     "top_val",
@@ -48,38 +62,61 @@ def _srw_with_topk(x, h, op_key, raw_tau, read, write, *,
                    model_module,
                    topk: int,
                    execution_kwargs: Dict[str, Any],
-                   admission_den_power: float):
+                   admission_den_power: float,
+                   target_positions=None,
+                   candidate_seed: int = 0):
     kwargs = dict(execution_kwargs)
     kwargs.pop("admission_den_power", None)
-    selection_margin, admission, _, execution_weight, active_mask = model_module._angular_execution(
-        h,
-        op_key,
-        raw_tau,
-        None,
-        **kwargs,
-    )
-    k = min(int(topk), int(execution_weight.shape[-1]))
-    top_val, top_idx = jax.lax.top_k(execution_weight.astype(jnp.float32), k)
-    mass = execution_weight.sum(axis=-1)
+    production_bfloat16 = (
+        str(getattr(model_module, "MODEL_VERSION", ""))
+        == "spatial-r1-v4.1.7.1")
+    if production_bfloat16:
+        h_route = model_module._forward_unit_direction(
+            h.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        op_key_route = model_module._forward_unit_direction(
+            op_key.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        rho = (h_route @ op_key_route.T).astype(jnp.float32)
+        tau = model_module._tau_from_param(raw_tau).astype(jnp.float32)
+        drive_kwargs = dict(kwargs)
+        temperature = drive_kwargs.pop("soft_gate_temperature")
+        boundary_power = drive_kwargs.pop("soft_gate_boundary_power")
+        effective_active_eps = drive_kwargs.pop(
+            "soft_gate_effective_active_eps")
+        (selection_margin, admission, _, execution_weight,
+         active_mask) = model_module._compute_admission_drive(
+            rho,
+            tau,
+            temperature,
+            boundary_power=boundary_power,
+            effective_active_eps=effective_active_eps,
+            **drive_kwargs,
+        )
+    else:
+        selection_margin, admission, _, execution_weight, active_mask = (
+            model_module._angular_execution(
+                h,
+                op_key,
+                raw_tau,
+                None,
+                **kwargs,
+            ))
+        tau = model_module._tau_from_param(raw_tau).astype(jnp.float32)
     admission_mass = admission.sum(axis=-1, keepdims=True)
-    active_count = active_mask.astype(jnp.int32).sum(axis=-1)
-    top1_frac = top_val[..., 0] / jnp.maximum(mass, 1.0e-8)
-    captured_mass = top_val.sum(axis=-1) / jnp.maximum(mass, 1.0e-8)
-    execution_prob = execution_weight / jnp.maximum(
-        mass[..., None], jnp.float32(1.0e-8))
-    effective_count = jnp.where(
-        mass > 0.0,
-        1.0 / jnp.maximum(
-            jnp.sum(execution_prob * execution_prob, axis=-1),
-            jnp.float32(1.0e-8)),
-        0.0,
-    )
-
-    r_n = model_module._forward_unit_direction(read.astype(jnp.float32))
-    w_n = model_module._forward_unit_direction(write.astype(jnp.float32))
-    xr = x.astype(jnp.float32) @ r_n.T
+    if production_bfloat16:
+        r_n = model_module._forward_unit_direction(
+            read.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        w_n = model_module._forward_unit_direction(
+            write.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        xr = x.astype(jnp.bfloat16) @ r_n.T
+    else:
+        r_n = model_module._forward_unit_direction(read.astype(jnp.float32))
+        w_n = model_module._forward_unit_direction(write.astype(jnp.float32))
+        xr = x.astype(jnp.float32) @ r_n.T
     coefficient = execution_weight * xr
-    out = coefficient @ w_n
+    out = (
+        (coefficient.astype(jnp.bfloat16) @ w_n).astype(jnp.float32)
+        if production_bfloat16 else
+        coefficient @ w_n)
     composition_den = getattr(model_module, "_composition_den", None)
     if composition_den is None:
         den = jnp.power(
@@ -97,37 +134,143 @@ def _srw_with_topk(x, h, op_key, raw_tau, read, write, *,
     else:
         den = composition_den(admission_mass, admission_den_power)
     out = (out.astype(jnp.float32) / den).astype(jnp.float32)
-    tau = model_module._tau_from_param(raw_tau).astype(jnp.float32)
+    if production_bfloat16:
+        out = out.astype(jnp.bfloat16).astype(jnp.float32)
     rho = (selection_margin + tau).astype(jnp.float32)
+    coefficient = (
+        coefficient / jnp.maximum(den, jnp.float32(1.0e-8))).astype(jnp.float32)
+
+    def target_value(value):
+        return value[
+            jnp.arange(value.shape[0], dtype=jnp.int32),
+            jnp.asarray(target_positions, dtype=jnp.int32),
+        ]
+
+    if target_positions is not None:
+        execution_stats = target_value(execution_weight.astype(jnp.float32))
+        admission_stats = target_value(admission.astype(jnp.float32))
+        active_stats = target_value(active_mask)
+        rho_stats = target_value(rho)
+        read_stats = target_value(xr.astype(jnp.float32))
+        coefficient_stats = target_value(coefficient)
+        tau_stats = target_value(tau)
+        query_stats = target_value(h.astype(jnp.float32))
+        update_stats = target_value(out)
+    else:
+        execution_stats = execution_weight.astype(jnp.float32)
+        admission_stats = admission.astype(jnp.float32)
+        active_stats = active_mask
+        rho_stats = rho
+        read_stats = xr.astype(jnp.float32)
+        coefficient_stats = coefficient
+        tau_stats = tau
+        query_stats = h.astype(jnp.float32)
+        update_stats = out
+
+    k = min(int(topk), int(execution_stats.shape[-1]))
+    top_val, top_idx = jax.lax.top_k(execution_stats, k)
+    mass = execution_stats.sum(axis=-1)
+    active_count = active_stats.astype(jnp.int32).sum(axis=-1)
+    top1_frac = top_val[..., 0] / jnp.maximum(mass, 1.0e-8)
+    captured_mass = top_val.sum(axis=-1) / jnp.maximum(mass, 1.0e-8)
+    execution_prob = execution_stats / jnp.maximum(
+        mass[..., None], jnp.float32(1.0e-8))
+    effective_count = jnp.where(
+        mass > 0.0,
+        1.0 / jnp.maximum(
+            jnp.sum(execution_prob * execution_prob, axis=-1),
+            jnp.float32(1.0e-8)),
+        0.0,
+    )
     stats = {
         "top_idx": top_idx.astype(jnp.int32),
         "top_val": top_val.astype(jnp.float32),
         "top_admission": jnp.take_along_axis(
-            admission.astype(jnp.float32), top_idx, axis=-1),
-        "top_rho": jnp.take_along_axis(rho, top_idx, axis=-1),
+            admission_stats, top_idx, axis=-1),
+        "top_rho": jnp.take_along_axis(rho_stats, top_idx, axis=-1),
         "top_read": jnp.take_along_axis(
-            xr.astype(jnp.float32), top_idx, axis=-1),
+            read_stats, top_idx, axis=-1),
         "top_coefficient": jnp.take_along_axis(
-            (coefficient / jnp.maximum(den, jnp.float32(1.0e-8))).astype(jnp.float32),
-            top_idx,
-            axis=-1,
-        ),
+            coefficient_stats, top_idx, axis=-1),
         "active_count": active_count.astype(jnp.int32),
         "effective_count": effective_count.astype(jnp.float32),
         "mass": mass.astype(jnp.float32),
         "top1_frac": top1_frac.astype(jnp.float32),
         "captured_mass": captured_mass.astype(jnp.float32),
-        "tau": jnp.squeeze(tau, axis=-1),
-        "query_norm": jnp.linalg.norm(h.astype(jnp.float32), axis=-1),
-        "update_norm": jnp.linalg.norm(out, axis=-1),
+        "tau": jnp.squeeze(tau_stats, axis=-1),
+        "query_norm": jnp.linalg.norm(query_stats, axis=-1),
+        "update_norm": jnp.linalg.norm(update_stats, axis=-1),
     }
+    if target_positions is not None:
+        abs_coefficient = jnp.abs(coefficient_stats)
+        selected_id = jnp.argmax(abs_coefficient, axis=-1).astype(jnp.int32)
+        top_gate_id = jnp.argmax(execution_stats, axis=-1).astype(jnp.int32)
+        operator_ids = jnp.arange(
+            execution_stats.shape[-1], dtype=jnp.uint32)
+        priority = (
+            operator_ids * jnp.uint32(1664525)
+            + jnp.uint32(int(candidate_seed) & 0xFFFFFFFF) * jnp.uint32(1013904223)
+        )
+        selected_mask = operator_ids[None, :] != selected_id[:, None].astype(jnp.uint32)
+        active_eligible = (execution_stats > 0.0) & selected_mask
+        inactive_eligible = (
+            ((admission_stats == 0.0) | (execution_stats == 0.0))
+            & selected_mask)
+
+        def prioritized_candidate(eligible):
+            valid = jnp.any(eligible, axis=-1)
+            chosen = jnp.argmin(
+                jnp.where(eligible, priority[None, :], jnp.uint32(0xFFFFFFFF)),
+                axis=-1,
+            ).astype(jnp.int32)
+            return jnp.where(valid, chosen, jnp.int32(-1)), valid
+
+        inactive_id, inactive_valid = prioritized_candidate(inactive_eligible)
+        active_id, active_valid = prioritized_candidate(active_eligible)
+        selected_abs = jnp.take_along_axis(
+            abs_coefficient, selected_id[:, None], axis=-1)
+        matched_distance = jnp.abs(abs_coefficient - selected_abs)
+        matched_valid = jnp.any(active_eligible, axis=-1)
+        matched_id = jnp.argmin(
+            jnp.where(active_eligible, matched_distance, jnp.float32(jnp.inf)),
+            axis=-1,
+        ).astype(jnp.int32)
+        matched_id = jnp.where(matched_valid, matched_id, jnp.int32(-1))
+        candidate_ids = jnp.stack(
+            (selected_id, top_gate_id, inactive_id, active_id, matched_id), axis=-1)
+        candidate_valid = jnp.stack(
+            (
+                jnp.ones_like(inactive_valid),
+                jnp.ones_like(inactive_valid),
+                inactive_valid,
+                active_valid,
+                matched_valid,
+            ),
+            axis=-1,
+        )
+        safe_ids = jnp.maximum(candidate_ids, 0)
+        stats.update({
+            "candidate_ids": candidate_ids,
+            "candidate_valid": candidate_valid,
+            "candidate_execution": jnp.take_along_axis(
+                execution_stats, safe_ids, axis=-1),
+            "candidate_admission": jnp.take_along_axis(
+                admission_stats, safe_ids, axis=-1),
+            "candidate_abs_coefficient": jnp.take_along_axis(
+                abs_coefficient, safe_ids, axis=-1),
+        })
     return out, stats
 
 
 def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
                        topk: int = 8,
+                       topk_qk: Optional[int] = None,
+                       topk_v: Optional[int] = None,
+                       topk_rst: Optional[int] = None,
                        execution_prune_eps: Optional[float] = None,
-                       target_positions=None):
+                       target_positions=None,
+                       candidate_seed: int = 0,
+                       sharded_srw_fns=None):
     """Return compact top-k operator traces for a small fixed-shape batch."""
     model_module = analysis_model_module(model_cfg)
     params = model_module._squeeze_params(params)
@@ -162,6 +305,9 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
     execution_qk = execution_for("soft_gate_T_qk")
     execution_v = execution_for("soft_gate_T_v")
     execution_rst = execution_for("soft_gate_T_rst")
+    topk_qk = int(topk if topk_qk is None else topk_qk)
+    topk_v = int(topk if topk_v is None else topk_v)
+    topk_rst = int(topk if topk_rst is None else topk_rst)
 
     pool = model_module._pool_params_with_operator_keys(params["neuron_pool"])
     router = params["router"]
@@ -237,9 +383,11 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             pool["attn_qk_read"],
             pool["attn_qk_write"],
             model_module=model_module,
-            topk=topk,
+            topk=topk_qk,
             execution_kwargs=execution_qk,
             admission_den_power=admission_den_power,
+            target_positions=target_positions,
+            candidate_seed=candidate_seed + layer_idx * 17,
         )
         k, k_stats = _srw_with_topk(
             normed,
@@ -249,9 +397,11 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             pool["attn_qk_read"],
             pool["attn_qk_write"],
             model_module=model_module,
-            topk=topk,
+            topk=topk_qk,
             execution_kwargs=execution_qk,
             admission_den_power=admission_den_power,
+            target_positions=target_positions,
+            candidate_seed=candidate_seed + layer_idx * 17 + 1,
         )
         v, v_stats = _srw_with_topk(
             normed,
@@ -261,10 +411,29 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             pool["attn_v_read"],
             pool["attn_v_write"],
             model_module=model_module,
-            topk=topk,
+            topk=topk_v,
             execution_kwargs=execution_v,
             admission_den_power=admission_den_power,
+            target_positions=target_positions,
+            candidate_seed=candidate_seed + layer_idx * 17 + 2,
         )
+        if sharded_srw_fns is not None:
+            trace_target = jnp.asarray(target_positions[0], dtype=jnp.int32)
+            q = sharded_srw_fns[0](
+                normed, h_q, pool["attn_qk_op_key"], tau_all[:, :, 0:1],
+                pool["attn_qk_read"], pool["attn_qk_write"],
+                jnp.zeros((pool["attn_qk_op_key"].shape[0],), jnp.float32),
+                trace_target, jnp.bool_(False))
+            k = sharded_srw_fns[1](
+                normed, h_k, pool["attn_qk_op_key"], tau_all[:, :, 1:2],
+                pool["attn_qk_read"], pool["attn_qk_write"],
+                jnp.zeros((pool["attn_qk_op_key"].shape[0],), jnp.float32),
+                trace_target, jnp.bool_(False))
+            v = sharded_srw_fns[2](
+                normed, h_v, pool["attn_v_op_key"], tau_all[:, :, 2:3],
+                pool["attn_v_read"], pool["attn_v_write"],
+                jnp.zeros((pool["attn_v_op_key"].shape[0],), jnp.float32),
+                trace_target, jnp.bool_(False))
         q = q * qk_scale
         k = k * qk_scale
         v = v * v_scale
@@ -274,6 +443,9 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             (v_stats, v_scale),
         ):
             stats["top_coefficient"] = stats["top_coefficient"] * scale
+            if "candidate_abs_coefficient" in stats:
+                stats["candidate_abs_coefficient"] = (
+                    stats["candidate_abs_coefficient"] * jnp.abs(scale))
             stats["update_norm"] = stats["update_norm"] * jnp.abs(scale)
         if target_vectors is not None:
             target_vectors["srw_feature_q"].append(target_value(q))
@@ -320,12 +492,24 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             pool["rst_read"],
             pool["rst_write"],
             model_module=model_module,
-            topk=topk,
+            topk=topk_rst,
             execution_kwargs=execution_rst,
             admission_den_power=admission_den_power,
+            target_positions=target_positions,
+            candidate_seed=candidate_seed + layer_idx * 17 + 3,
         )
+        if sharded_srw_fns is not None:
+            rst = sharded_srw_fns[3](
+                normed, h_rst, pool["rst_op_key"], tau_rst,
+                pool["rst_read"], pool["rst_write"],
+                jnp.zeros((pool["rst_op_key"].shape[0],), jnp.float32),
+                jnp.asarray(target_positions[0], dtype=jnp.int32),
+                jnp.bool_(False))
         rst = rst * rst_scale
         rst_stats["top_coefficient"] = rst_stats["top_coefficient"] * rst_scale
+        if "candidate_abs_coefficient" in rst_stats:
+            rst_stats["candidate_abs_coefficient"] = (
+                rst_stats["candidate_abs_coefficient"] * jnp.abs(rst_scale))
         rst_stats["update_norm"] = rst_stats["update_norm"] * jnp.abs(rst_scale)
         rst_out_norm.append(jnp.linalg.norm(rst, axis=-1).mean())
         if target_vectors is not None:
@@ -344,23 +528,23 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             ("rst", rst_stats),
         ):
             for field, value in stats.items():
-                traces[f"{prefix}_{field}"].append(value)
+                traces.setdefault(f"{prefix}_{field}", []).append(value)
 
     out = {key: jnp.stack(values, axis=0) for key, values in traces.items()}
-    if target_positions is not None:
-        out = {
-            key: jnp.stack(
-                [value[:, batch_i, target_positions[batch_i]]
-                 for batch_i in range(bsz)],
-                axis=1,
-            )
-            for key, value in out.items()
-        }
     out["attn_out_norm"] = jnp.stack(attn_out_norm)
     out["rst_out_norm"] = jnp.stack(rst_out_norm)
-    out["residual_before_norm"] = jnp.stack(residual_before_norm)
-    out["residual_after_attn_norm"] = jnp.stack(residual_after_attn_norm)
-    out["residual_after_rst_norm"] = jnp.stack(residual_after_rst_norm)
+    if target_positions is None:
+        out["residual_before_norm"] = jnp.stack(residual_before_norm)
+        out["residual_after_attn_norm"] = jnp.stack(residual_after_attn_norm)
+        out["residual_after_rst_norm"] = jnp.stack(residual_after_rst_norm)
+    else:
+        gather = lambda values: jnp.stack([
+            value[jnp.arange(bsz, dtype=jnp.int32), target_positions]
+            for value in values
+        ], axis=0)
+        out["residual_before_norm"] = gather(residual_before_norm)
+        out["residual_after_attn_norm"] = gather(residual_after_attn_norm)
+        out["residual_after_rst_norm"] = gather(residual_after_rst_norm)
     if target_vectors is not None:
         for key, values in target_vectors.items():
             out[key] = jnp.stack(values, axis=0)

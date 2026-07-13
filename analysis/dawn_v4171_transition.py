@@ -13,15 +13,19 @@ import math
 import re
 import time
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental.shard_map import shard_map
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    _chunk_sizes_for_cfg,
     analysis_model_module,
     maybe_load_tokenizer,
 )
@@ -32,7 +36,13 @@ from analysis.dawn_analysis_storage import (
     write_jsonl_atomic,
     write_npz_atomic,
 )
-from analysis.dawn_analysis_trace import TRACE_FIELDS, TRACE_POOLS, topk_trace_forward
+from analysis.dawn_analysis_trace import (
+    TRACE_FIELDS,
+    TRACE_POOLS,
+    TRANSITION_CANDIDATE_FIELDS,
+    TRANSITION_CANDIDATE_STRATEGIES,
+    topk_trace_forward,
+)
 
 
 V4171_MODEL_VERSION = "spatial-r1-v4.1.7.1"
@@ -46,6 +56,7 @@ CORE_TRANSITION_ITEMS = (
     "state_transition_decoupling",
     "causal_intervention",
 )
+PAIR_CAPTURE_THRESHOLD = 0.95
 
 
 def _safe_id(value: str) -> str:
@@ -149,6 +160,14 @@ def load_transition_prompt_rows(path: str) -> Tuple[List[Dict[str, Any]], str]:
         raise ValueError(
             "Every transition pair_id needs at least two rows; bad="
             + ",".join(bad_pairs))
+    by_pair: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_pair[str(row["pair_id"])].append(row)
+    for pair_id, pair_rows in by_pair.items():
+        texts = [str(row["text"]) for row in pair_rows]
+        if len(texts) != len(set(texts)):
+            raise ValueError(
+                f"Transition pair_id={pair_id!r} contains identical text rows")
     return rows, digest.hexdigest()
 
 
@@ -207,6 +226,22 @@ def _tokenize_transition_row(
         "continuation_token_ids": [int(v) for v in continuation_ids],
     })
     return out
+
+
+def _validate_tokenized_pairs(prompts: Sequence[Mapping[str, Any]]) -> None:
+    by_pair: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for prompt in prompts:
+        by_pair[str(prompt["pair_id"])].append(prompt)
+    for pair_id, pair_rows in by_pair.items():
+        for left_idx, left in enumerate(pair_rows):
+            for right in pair_rows[left_idx + 1:]:
+                if list(left["token_ids"]) == list(right["token_ids"]):
+                    raise ValueError(
+                        "Transition pair has identical tokenized inputs: "
+                        f"pair_id={pair_id} prompt_a={left['prompt_id']} "
+                        f"prompt_b={right['prompt_id']} "
+                        f"target_a={left['target_token_indices']} "
+                        f"target_b={right['target_token_indices']}")
 
 
 def _flatten_param_paths(tree: Any, prefix: Tuple[str, ...] = ()) -> List[str]:
@@ -289,7 +324,8 @@ def run_global_router_audit(ctx: AnalysisContext) -> Dict[str, Any]:
 def _trace_pool_arrays(trace: Mapping[str, np.ndarray], pool: str) -> Dict[str, np.ndarray]:
     return {
         field: np.asarray(trace[f"{pool}_{field}"])[:, 0]
-        for field in TRACE_FIELDS
+        for field in TRACE_FIELDS + TRANSITION_CANDIDATE_FIELDS
+        if f"{pool}_{field}" in trace
     }
 
 
@@ -431,11 +467,36 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
     if not getattr(tokenizer, "is_fast", False):
         raise RuntimeError("v4171 transition analysis requires a fast tokenizer with offsets")
     seq_len = int(getattr(args, "trace_seq_len", 128) or 128)
-    topk = int(getattr(args, "trace_topk", None) or 64)
+    topk_qk = int(getattr(args, "transition_topk_qk", 512) or 512)
+    topk_v = int(getattr(args, "transition_topk_v", 2048) or 2048)
+    topk_rst = int(getattr(args, "transition_topk_rst", 4096) or 4096)
     prompts = [_tokenize_transition_row(tokenizer, row, seq_len) for row in rows]
-    trace_fn = jax.jit(
-        lambda p, x, t: topk_trace_forward(
-            p, ctx.model_cfg, x, topk=topk, target_positions=t))
+    _validate_tokenized_pairs(prompts)
+    candidate_seed = int(ctx.config.get("seed", 0))
+    data_replicas = max(1, int(ctx.mesh.shape["data"]))
+    sharded_srw_fns = _intervention_srw_fns(ctx)
+
+    def trace_step(p, x, t):
+        trace = topk_trace_forward(
+            p,
+            ctx.model_cfg,
+            x,
+            topk_qk=topk_qk,
+            topk_v=topk_v,
+            topk_rst=topk_rst,
+            target_positions=t,
+            candidate_seed=candidate_seed,
+            sharded_srw_fns=sharded_srw_fns,
+        )
+        return jax.tree.map(
+            lambda value: (
+                value[:, :1]
+                if value.ndim >= 2 and value.shape[1] == data_replicas
+                else value),
+            trace,
+        )
+
+    trace_fn = jax.jit(trace_step)
     internal: List[Dict[str, Any]] = []
     jsonl_rows: List[Dict[str, Any]] = []
     npz_payload: Dict[str, np.ndarray] = {}
@@ -448,8 +509,16 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
     for prompt_idx, prompt in enumerate(prompts):
         prompt_records: List[Dict[str, Any]] = []
         for subtoken_idx, token_index in enumerate(prompt["target_token_indices"]):
-            input_ids = jnp.asarray(prompt["input_array"][None, :], dtype=jnp.int32)
-            target = jnp.asarray([int(token_index)], dtype=jnp.int32)
+            input_ids = jax.device_put(jnp.asarray(np.repeat(
+                prompt["input_array"][None, :],
+                data_replicas,
+                axis=0,
+            ), dtype=jnp.int32), ctx.data_sharding)
+            target = jax.device_put(
+                jnp.full(
+                    (data_replicas,), int(token_index), dtype=jnp.int32),
+                NamedSharding(ctx.mesh, P("data")),
+            )
             trace = jax.device_get(trace_fn(ctx.params, input_ids, target))
             record = _trace_internal_record(prompt, int(token_index), trace)
             internal.append(record)
@@ -479,33 +548,44 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
                 f"id={prompt['prompt_id']} tokens={prompt['target_token_indices']}",
                 flush=True,
             )
-    captured = []
+    captured_by_pool: Dict[str, List[float]] = {pool: [] for pool in TRACE_POOLS}
     for record in internal:
         for pool in TRACE_POOLS:
-            captured.extend(
+            captured_by_pool[pool].extend(
                 np.asarray(record["trace"][f"{pool}_captured_mass"])[:, 0].tolist())
+    captured = [value for values in captured_by_pool.values() for value in values]
+    captured_summary = {
+        pool: {
+            "mean": float(np.mean(values)) if values else None,
+            "min": float(np.min(values)) if values else None,
+            "p10": float(np.quantile(values, 0.10)) if values else None,
+        }
+        for pool, values in captured_by_pool.items()
+    }
     summary = {
         "status": "ready",
         "prompt_set": prompt_set,
         "prompt_set_hash": prompt_hash,
         "num_prompts": len(prompts),
         "num_target_subtokens": len(internal),
-        "trace_topk": topk,
+        "trace_topk": {"qk": topk_qk, "v": topk_v, "rst": topk_rst},
         "span_aggregation": "per-subtoken JSONL plus span_mean/span_last vectors in NPZ",
         "captured_mass": {
             "mean": float(np.mean(captured)) if captured else None,
             "min": float(np.min(captured)) if captured else None,
             "p10": float(np.quantile(captured, 0.10)) if captured else None,
         },
+        "captured_mass_by_pool": captured_summary,
+        "captured_mass_valid_threshold": 0.95,
         "sec": time.time() - started,
         "artifacts": {
             "trajectory_traces": ctx.store.path("trajectory_traces.jsonl"),
             "transition_trace_cache": ctx.store.path("transition_trace_cache.npz"),
         },
     }
-    if summary["captured_mass"]["min"] is not None and summary["captured_mass"]["min"] < 0.90:
+    if summary["captured_mass"]["min"] is not None and summary["captured_mass"]["min"] < 0.95:
         summary["captured_mass_warning"] = (
-            "Sparse metrics are approximate because at least one target trace captured <90% mass")
+            "Rows with either side below 95% captured mass are excluded from pair metrics")
     if ctx.is_primary:
         write_jsonl_atomic(ctx.store.path("trajectory_traces.jsonl"), jsonl_rows)
         write_npz_atomic(ctx.store.path("transition_trace_cache.npz"), **npz_payload)
@@ -536,7 +616,9 @@ def _sparse_similarity(
         a[int(idx)] += max(0.0, float(weight))
     for idx, weight in zip(np.asarray(ids_b).reshape(-1), np.asarray(weights_b).reshape(-1)):
         b[int(idx)] += max(0.0, float(weight))
-    keys = sorted(set(a) | set(b))
+    keys_a = set(a.keys())
+    keys_b = set(b.keys())
+    keys = sorted(keys_a | keys_b)
     if not keys:
         return {
             "gate_cosine": None,
@@ -544,15 +626,15 @@ def _sparse_similarity(
             "intersection": 0,
             "union": 0,
         }
-    va = np.asarray([a[key] for key in keys], dtype=np.float64)
-    vb = np.asarray([b[key] for key in keys], dtype=np.float64)
+    va = np.asarray([a.get(key, 0.0) for key in keys], dtype=np.float64)
+    vb = np.asarray([b.get(key, 0.0) for key in keys], dtype=np.float64)
     den = float(np.sum(np.maximum(va, vb)))
     return {
         "gate_cosine": _cosine(va, vb),
         "weighted_jaccard": (
             float(np.sum(np.minimum(va, vb)) / den) if den > 1.0e-12 else None),
-        "intersection": len(set(a) & set(b)),
-        "union": len(keys),
+        "intersection": len(keys_a & keys_b),
+        "union": len(keys_a | keys_b),
     }
 
 
@@ -603,8 +685,24 @@ def _pair_layer_rows(
             delta_rel = float(np.linalg.norm(update_a - update_b) / delta_den)
             captured_a = float(np.asarray(trace_a[f"{pool}_captured_mass"])[layer, 0])
             captured_b = float(np.asarray(trace_b[f"{pool}_captured_mass"])[layer, 0])
-            components = [value for value in (query_cos, sparse["gate_cosine"], delta_cos)
-                          if value is not None]
+            routing_similarity = sparse["weighted_jaccard"]
+            capture_valid = (
+                captured_a >= PAIR_CAPTURE_THRESHOLD
+                and captured_b >= PAIR_CAPTURE_THRESHOLD)
+            metric_valid = bool(
+                capture_valid
+                and routing_similarity is not None
+                and delta_cos is not None)
+            invalid_reason = None
+            if not capture_valid:
+                invalid_reason = "low_captured_mass"
+            elif routing_similarity is None:
+                invalid_reason = "missing_routing_similarity"
+            elif delta_cos is None:
+                invalid_reason = "missing_transition_similarity"
+            path_similarity = (
+                float(np.mean([routing_similarity, delta_cos]))
+                if metric_valid else None)
             rows.append({
                 "pair_id": str(prompt_a.get("pair_id")),
                 "prompt_a": str(prompt_a.get("prompt_id")),
@@ -618,20 +716,28 @@ def _pair_layer_rows(
                 "query_similarity": query_cos,
                 "gate_similarity": sparse["gate_cosine"],
                 "weighted_jaccard": sparse["weighted_jaccard"],
+                "routing_similarity": routing_similarity,
                 "active_intersection": sparse["intersection"],
                 "active_union": sparse["union"],
                 "delta_similarity": delta_cos,
+                "transition_similarity": delta_cos,
                 "delta_relative_error": delta_rel,
-                "trajectory_similarity": float(np.mean(components)) if components else None,
+                "path_similarity": path_similarity,
+                "trajectory_similarity": path_similarity,
                 "captured_mass_a": captured_a,
                 "captured_mass_b": captured_b,
+                "metric_valid": metric_valid,
+                "invalid_reason": invalid_reason,
                 "gate_similarity_exact": False,
                 "update_kind": update_kind[pool],
             })
     return rows
 
 
-def _context_divergence_summary(pair_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def _context_divergence_summary(
+    pair_rows: Sequence[Dict[str, Any]],
+    null_rows: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
     groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     contextual_relations = {
         "same_surface_different_function",
@@ -641,54 +747,147 @@ def _context_divergence_summary(pair_rows: Sequence[Dict[str, Any]]) -> Dict[str
         if row.get("is_random_null") or row.get("pair_type") not in contextual_relations:
             continue
         groups[(str(row["pair_id"]), str(row["pool"]))].append(row)
+    null_by_pool_layer: Dict[Tuple[str, int], List[float]] = defaultdict(list)
+    null_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in null_rows:
+        null_groups[(str(row["pair_id"]), str(row["pool"]))].append(row)
+    for rows in null_groups.values():
+        valid = sorted(
+            (row for row in rows if row.get("metric_valid")),
+            key=lambda row: int(row["layer"]),
+        )
+        early = [row for row in valid if int(row["layer"]) in (0, 1, 2)]
+        baseline = (
+            float(np.mean([float(row["routing_similarity"]) for row in early]))
+            if early else None)
+        if baseline is None:
+            continue
+        for row in valid:
+            null_by_pool_layer[(str(row["pool"]), int(row["layer"]))].append(
+                baseline - float(row["routing_similarity"]))
+
+    def consecutive_start(rows: Sequence[Dict[str, Any]], key: str) -> Optional[int]:
+        for left, right in zip(rows, rows[1:]):
+            if (
+                bool(left.get(key))
+                and bool(right.get(key))
+                and int(right["layer"]) == int(left["layer"]) + 1
+            ):
+                return int(left["layer"])
+        return None
+
     summaries = []
     for (pair_id, pool), rows in sorted(groups.items()):
         rows = sorted(rows, key=lambda row: int(row["layer"]))
-        sims = [row.get("weighted_jaccard") for row in rows]
-        threshold = _quantile(sims, 0.25)
-        diverged = [row for row in rows
-                    if threshold is not None and row.get("weighted_jaccard") is not None
-                    and float(row["weighted_jaccard"]) <= threshold]
-        first_layer = int(diverged[0]["layer"]) if diverged else None
-        max_row = min(
-            rows,
-            key=lambda row: float(row.get("weighted_jaccard")
-                                  if row.get("weighted_jaccard") is not None else 1.0),
-        ) if rows else None
-        late = rows[max(0, len(rows) * 2 // 3):]
-        reconverged = bool(
-            diverged and threshold is not None and any(
-                row.get("weighted_jaccard") is not None
-                and float(row["weighted_jaccard"]) > threshold
-                for row in late))
+        valid = [row for row in rows if row.get("metric_valid")]
+        early = [row for row in valid if int(row["layer"]) in (0, 1, 2)]
+        baseline = (
+            float(np.mean([float(row["routing_similarity"]) for row in early]))
+            if early else None)
+        evidence: List[Dict[str, Any]] = []
+        if baseline is not None:
+            for row in valid:
+                layer = int(row["layer"])
+                null_dist = null_by_pool_layer.get((pool, layer), [])
+                drop = baseline - float(row["routing_similarity"])
+                null_mean = (
+                    float(np.mean(null_dist)) if null_dist else None)
+                null_p95 = _quantile(null_dist, 0.95)
+                null_p75 = _quantile(null_dist, 0.75)
+                evidence.append({
+                    "layer": layer,
+                    "routing_similarity": float(row["routing_similarity"]),
+                    "actual_drop": drop,
+                    "null_mean": null_mean,
+                    "null_p95": null_p95,
+                    "null_p75": null_p75,
+                    "above_null_p95": (
+                        null_p95 is not None and drop > float(null_p95)),
+                    "below_null_p75": (
+                        null_p75 is not None and drop < float(null_p75)),
+                })
+        first_layer = consecutive_start(evidence, "above_null_p95")
+        supported = [
+            row for row in evidence if row.get("null_mean") is not None]
+        max_row = (
+            max(
+                supported,
+                key=lambda row: float(row["actual_drop"]) - float(row["null_mean"]),
+            )
+            if supported else None)
+        n_layers = max((int(row["layer"]) for row in rows), default=-1) + 1
+        late_start = max(
+            int(math.ceil(2.0 * n_layers / 3.0)),
+            (first_layer + 1) if first_layer is not None else n_layers,
+        )
+        late = [row for row in evidence if int(row["layer"]) >= late_start]
+        reconvergence_layer = (
+            consecutive_start(late, "below_null_p75")
+            if first_layer is not None else None)
+        evidence_status = (
+            "significant_divergence" if first_layer is not None else
+            "no_significant_divergence" if supported else
+            "insufficient_evidence"
+        )
         summaries.append({
             "pair_id": pair_id,
             "pool": pool,
-            "divergence_threshold_data_q25": threshold,
+            "status": evidence_status,
+            "early_routing_baseline_layers": [0, 1, 2],
+            "early_routing_baseline": baseline,
             "first_divergence_layer": first_layer,
             "maximum_divergence_layer": int(max_row["layer"]) if max_row else None,
-            "late_reconvergence": reconverged,
+            "maximum_divergence_evidence": (
+                float(max_row["actual_drop"] - max_row["null_mean"])
+                if max_row else None),
+            "late_reconvergence": reconvergence_layer is not None,
+            "late_reconvergence_layer": reconvergence_layer,
+            "null_rule": {
+                "first": "actual_drop_gt_null_p95_for_2_consecutive_valid_layers",
+                "maximum": "max_actual_drop_minus_null_mean",
+                "late_reconvergence": "actual_drop_lt_null_p75_for_2_consecutive_late_layers",
+            },
             "mean_state_similarity": _json_float(np.mean([
-                row["state_similarity"] for row in rows if row.get("state_similarity") is not None
-            ])) if rows else None,
+                row["state_similarity"] for row in valid if row.get("state_similarity") is not None
+            ])) if valid else None,
             "mean_query_similarity": _json_float(np.mean([
-                row["query_similarity"] for row in rows if row.get("query_similarity") is not None
-            ])) if rows else None,
+                row["query_similarity"] for row in valid if row.get("query_similarity") is not None
+            ])) if valid else None,
             "mean_gate_similarity": _json_float(np.mean([
-                row["gate_similarity"] for row in rows if row.get("gate_similarity") is not None
-            ])) if rows else None,
+                row["routing_similarity"] for row in valid if row.get("routing_similarity") is not None
+            ])) if valid else None,
             "mean_delta_similarity": _json_float(np.mean([
-                row["delta_similarity"] for row in rows if row.get("delta_similarity") is not None
-            ])) if rows else None,
+                row["transition_similarity"] for row in valid if row.get("transition_similarity") is not None
+            ])) if valid else None,
             "min_captured_mass": min(
                 min(float(row["captured_mass_a"]), float(row["captured_mass_b"]))
                 for row in rows),
+            "valid_layers": len(valid),
+            "excluded_low_captured_layers": sum(
+                row.get("invalid_reason") == "low_captured_mass" for row in rows),
+            "layer_evidence": evidence,
         })
+    statuses = {row["status"] for row in summaries}
+    valid_layer_count = sum(int(row["valid_layers"]) for row in summaries)
+    excluded_layer_count = sum(
+        int(row["excluded_low_captured_layers"]) for row in summaries)
+    overall_status = (
+        "insufficient_evidence" if valid_layer_count == 0 else
+        "partial" if excluded_layer_count > 0 else
+        "ready" if "significant_divergence" in statuses else
+        "no_significant_divergence"
+    )
     return {
-        "status": "ready" if summaries else "insufficient_evidence",
+        "status": overall_status,
         "pairs": summaries,
         "num_pairs": len({row["pair_id"] for row in summaries}),
-        "gate_metric": "sparse_topk_captured_mass_weighted",
+        "num_significant_pool_pairs": sum(
+            row["status"] == "significant_divergence" for row in summaries),
+        "num_no_significant_pool_pairs": sum(
+            row["status"] == "no_significant_divergence" for row in summaries),
+        "valid_layer_rows": valid_layer_count,
+        "excluded_low_capture_rows": excluded_layer_count,
+        "gate_metric": "sparse_topk_weighted_jaccard_capture_validated",
     }
 
 
@@ -707,20 +906,26 @@ def _state_transition_summary(
     def aggregate(groups: Mapping[Tuple[str, str], List[Dict[str, Any]]], is_null: bool):
         out = []
         for (pair_id, pool), rows in sorted(groups.items()):
+            valid_rows = [row for row in rows if row.get("metric_valid")]
+            if not valid_rows:
+                continue
             def mean_key(key: str) -> Optional[float]:
-                vals = [float(row[key]) for row in rows if row.get(key) is not None]
+                vals = [
+                    float(row[key]) for row in valid_rows
+                    if row.get(key) is not None]
                 return float(np.mean(vals)) if vals else None
             out.append({
                 "pair_id": pair_id,
-                "pair_type": rows[0].get("pair_type"),
-                "phenomenon": rows[0].get("phenomenon"),
+                "pair_type": valid_rows[0].get("pair_type"),
+                "phenomenon": valid_rows[0].get("phenomenon"),
                 "pool": pool,
                 "is_random_null": is_null,
+                "valid_layers": len(valid_rows),
                 "state_cos": mean_key("state_similarity"),
                 "query_cos": mean_key("query_similarity"),
-                "gate_sim": mean_key("gate_similarity"),
-                "delta_cos": mean_key("delta_similarity"),
-                "path_sim": mean_key("trajectory_similarity"),
+                "gate_sim": mean_key("routing_similarity"),
+                "delta_cos": mean_key("transition_similarity"),
+                "path_sim": mean_key("path_similarity"),
             })
         return out
 
@@ -770,20 +975,68 @@ def _state_transition_summary(
                 [row["gate_sim"] for row in pool_rows],
                 [row["delta_cos"] for row in pool_rows]),
         }
-    actual_paths = [float(row["path_sim"]) for row in rows if row.get("path_sim") is not None]
-    null_paths = [float(row["path_sim"]) for row in null if row.get("path_sim") is not None]
+    def unique_pair_paths(values: Sequence[Dict[str, Any]]) -> List[float]:
+        by_pair: Dict[str, List[float]] = defaultdict(list)
+        for row in values:
+            if row.get("path_sim") is not None:
+                by_pair[str(row["pair_id"])].append(float(row["path_sim"]))
+        return [float(np.mean(group)) for group in by_pair.values() if group]
+
+    actual_paths = unique_pair_paths(rows)
+    null_paths = unique_pair_paths(null)
     effect = (
         float(np.mean(actual_paths) - np.mean(null_paths))
         if actual_paths and null_paths else None)
+    quadrant_unique_pairs = {
+        quadrant: len({
+            str(row["pair_id"]) for row in rows
+            if row.get("quadrant") == quadrant
+        })
+        for quadrant in (
+            "low_state_high_transition", "high_state_low_transition",
+            "high_high", "low_low",
+        )
+    }
+    actual_unique = len({str(row["pair_id"]) for row in pair_rows})
+    null_unique = len({str(row["pair_id"]) for row in null_rows})
+    expected_actual_pool_pairs = actual_unique * len(TRACE_POOLS)
+    expected_null_pool_pairs = null_unique * len(TRACE_POOLS)
+    excluded_low_capture = sum(
+        row.get("invalid_reason") == "low_captured_mass"
+        for row in list(pair_rows) + list(null_rows))
+    status = (
+        "insufficient_evidence" if not rows else
+        "partial" if (
+            not null
+            or len(rows) < expected_actual_pool_pairs
+            or len(null) < expected_null_pool_pairs
+            or excluded_low_capture > 0
+        ) else
+        "ready"
+    )
     return {
-        "status": "ready" if rows else "insufficient_evidence",
+        "status": status,
         "state_low_threshold_data_q25": state_threshold,
         "transition_high_threshold_random_null_q75": transition_threshold,
         "quadrants": dict(quadrants),
+        "quadrant_unique_pairs": quadrant_unique_pairs,
         "correlations": correlations,
         "path_similarity_effect_vs_random": effect,
         "path_similarity": _bootstrap_mean_ci(actual_paths, seed),
         "random_null_path_similarity": _bootstrap_mean_ci(null_paths, seed + 1),
+        "counts": {
+            "actual_unique_pairs": actual_unique,
+            "null_unique_pairs": null_unique,
+            "actual_valid_pool_pairs": len(rows),
+            "null_valid_pool_pairs": len(null),
+            "actual_expected_pool_pairs": expected_actual_pool_pairs,
+            "null_expected_pool_pairs": expected_null_pool_pairs,
+            "valid_pair_metric_row_fraction": (
+                float(sum(row.get("metric_valid", False) for row in pair_rows))
+                / len(pair_rows) if pair_rows else None),
+            "excluded_low_capture_rows": excluded_low_capture,
+        },
+        "path_definition": "mean(routing_similarity, transition_similarity); query excluded",
         "rows": rows,
     }
 
@@ -804,21 +1057,41 @@ def build_pair_analyses(
     null_rows: List[Dict[str, Any]] = []
     if len(primary) >= 4:
         rng = np.random.default_rng(int(ctx.config.get("seed", 0)))
-        for idx, record_a in enumerate(primary):
+        used_prompt_combinations = set()
+        for pair_id, pair_records in sorted(by_pair.items()):
+            if len(pair_records) < 2:
+                continue
+            record_a = pair_records[int(rng.integers(0, len(pair_records)))]
+            prompt_a = record_a["prompt"]
             candidates = [
                 row for row in primary
-                if row["prompt"]["pair_id"] != record_a["prompt"]["pair_id"]
+                if row["prompt"]["pair_id"] != prompt_a["pair_id"]
+                and row["prompt"].get("control_group") != prompt_a.get("control_group")
+                and tuple(sorted((
+                    str(prompt_a["prompt_id"]),
+                    str(row["prompt"]["prompt_id"]),
+                ))) not in used_prompt_combinations
             ]
             if not candidates:
                 continue
-            length_a = int(record_a["prompt"]["length"])
+            preferred = [
+                row for row in candidates
+                if row["prompt"].get("phenomenon") != prompt_a.get("phenomenon")]
+            if preferred:
+                candidates = preferred
+            length_a = int(prompt_a["length"])
             length_deltas = np.asarray([
                 abs(int(row["prompt"]["length"]) - length_a)
                 for row in candidates
             ], dtype=np.int32)
             closest = np.flatnonzero(length_deltas == int(length_deltas.min()))
             record_b = candidates[int(rng.choice(closest))]
-            null_pair_id = f"random-null-{idx:04d}"
+            combination = tuple(sorted((
+                str(prompt_a["prompt_id"]),
+                str(record_b["prompt"]["prompt_id"]),
+            )))
+            used_prompt_combinations.add(combination)
+            null_pair_id = f"random-null-{pair_id}"
             rows = _pair_layer_rows(
                 record_a,
                 record_b,
@@ -828,7 +1101,7 @@ def build_pair_analyses(
             for row in rows:
                 row["pair_id"] = null_pair_id
             null_rows.extend(rows)
-    context = _context_divergence_summary(actual_rows)
+    context = _context_divergence_summary(actual_rows, null_rows)
     decoupling = _state_transition_summary(
         actual_rows,
         null_rows,
@@ -843,6 +1116,174 @@ def build_pair_analyses(
     return context, decoupling, csv_rows
 
 
+def _make_sharded_intervention_srw(
+    model_module: Any,
+    mesh: Any,
+    *,
+    max_chunk_size: int,
+    gate_temperature: float,
+    gate_boundary_power: float,
+    admission_den_power: float,
+    srw_composition_mode: str,
+    heat_kernel_beta: float,
+    effective_active_eps: float,
+):
+    """Production-matched shard-local SRW with one optional execution mask."""
+    admission_den_power = float(admission_den_power)
+    gate_temperature = float(gate_temperature)
+    gate_boundary_power = float(gate_boundary_power)
+    heat_kernel_beta = float(heat_kernel_beta)
+    effective_active_eps = float(effective_active_eps)
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(
+            P("data", None, None),
+            P("data", None, None),
+            P("model", None),
+            P("data", None, None),
+            P("model", None),
+            P("model", None),
+            P("model"),
+            P(),
+            P(),
+        ),
+        out_specs=P("data", None, None),
+        check_rep=False,
+    )
+    def sharded_srw(
+        x,
+        query,
+        op_key_local,
+        raw_tau,
+        read_local,
+        write_local,
+        suppress_local,
+        target_position,
+        apply_mask,
+    ):
+        n_local = int(op_key_local.shape[0])
+        chunk_size = min(int(max_chunk_size), n_local)
+        n_chunks = (n_local + chunk_size - 1) // chunk_size
+        n_pad = n_chunks * chunk_size
+        pad_n = n_pad - n_local
+        batch_size, seq_len, d_model = x.shape
+        x_bf = x.astype(jnp.bfloat16)
+        op_key = jnp.pad(op_key_local, ((0, pad_n), (0, 0)))
+        read = jnp.pad(read_local, ((0, pad_n), (0, 0)))
+        write = jnp.pad(write_local, ((0, pad_n), (0, 0)))
+        suppress = jnp.pad(suppress_local, ((0, pad_n),))
+        valid = jnp.arange(n_pad) < n_local
+        query_bf = model_module._forward_unit_direction(
+            query.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        op_key_bf = model_module._forward_unit_direction(
+            op_key.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        read_bf = model_module._forward_unit_direction(
+            read.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        write_bf = model_module._forward_unit_direction(
+            write.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        tau = model_module._tau_from_param(raw_tau)
+        token_selector = jax.nn.one_hot(
+            target_position, seq_len, dtype=jnp.float32)[None, :, None]
+
+        def step(carry, chunk_index):
+            raw_out, admission_mass = carry
+            start = chunk_index * chunk_size
+            key_chunk = jax.lax.dynamic_slice_in_dim(
+                op_key_bf, start, chunk_size, axis=0)
+            read_chunk = jax.lax.dynamic_slice_in_dim(
+                read_bf, start, chunk_size, axis=0)
+            write_chunk = jax.lax.dynamic_slice_in_dim(
+                write_bf, start, chunk_size, axis=0)
+            suppress_chunk = jax.lax.dynamic_slice_in_dim(
+                suppress, start, chunk_size, axis=0)
+            valid_chunk = jax.lax.dynamic_slice_in_dim(
+                valid, start, chunk_size, axis=0)
+            valid_bsn = valid_chunk[None, None, :]
+            rho_raw = (query_bf @ key_chunk.T).astype(jnp.float32)
+            rho = jnp.where(valid_bsn, rho_raw, tau)
+            _, admission, _, execution, _ = model_module._compute_admission_drive(
+                rho,
+                tau,
+                gate_temperature,
+                boundary_power=gate_boundary_power,
+                effective_active_eps=effective_active_eps,
+                execution_prune_eps=0.0,
+                srw_composition_mode=srw_composition_mode,
+                heat_kernel_beta=heat_kernel_beta,
+            )
+            admission = jnp.where(valid_bsn, admission, 0.0)
+            execution = jnp.where(valid_bsn, execution, 0.0)
+            keep = 1.0 - token_selector * suppress_chunk[None, None, :]
+            execution = jnp.where(apply_mask, execution * keep, execution)
+            response = x_bf @ read_chunk.T
+            coefficient = execution * response.astype(jnp.float32)
+            chunk_out = (
+                coefficient.astype(jnp.bfloat16) @ write_chunk).astype(jnp.float32)
+            return (
+                raw_out + chunk_out,
+                admission_mass + admission.sum(axis=-1, keepdims=True),
+            ), None
+
+        (raw_out, local_admission_mass), _ = jax.lax.scan(
+            step,
+            (
+                jnp.zeros(
+                    (batch_size, seq_len, d_model), dtype=jnp.float32),
+                jnp.zeros((batch_size, seq_len, 1), dtype=jnp.float32),
+            ),
+            jnp.arange(n_chunks),
+        )
+        global_admission_mass = jax.lax.psum(
+            local_admission_mass, "model")
+        den = model_module._composition_den(
+            global_admission_mass,
+            admission_den_power,
+            srw_composition_mode,
+        )
+        local_out = raw_out / den
+        return jax.lax.psum(
+            local_out.astype(jnp.bfloat16), "model").astype(jnp.float32)
+
+    return sharded_srw
+
+
+def _intervention_srw_fns(ctx: AnalysisContext) -> Dict[int, Any]:
+    model_module = analysis_model_module(ctx.model_cfg)
+    chunk_sizes = _chunk_sizes_for_cfg(ctx.config, ctx.mesh)
+    cfg = ctx.model_cfg
+    common = {
+        "model_module": model_module,
+        "mesh": ctx.mesh,
+        "gate_boundary_power": float(cfg["soft_gate_boundary_power"]),
+        "admission_den_power": float(cfg["admission_den_power"]),
+        "srw_composition_mode": str(cfg["srw_composition_mode"]),
+        "heat_kernel_beta": float(cfg["heat_kernel_beta"]),
+        "effective_active_eps": float(cfg.get(
+            "soft_gate_effective_active_eps", 1.0e-6)),
+    }
+    qk = _make_sharded_intervention_srw(
+        max_chunk_size=int(chunk_sizes["attn_qk"]),
+        gate_temperature=float(cfg.get(
+            "soft_gate_T_qk", cfg["soft_gate_temperature"])),
+        **common,
+    )
+    v = _make_sharded_intervention_srw(
+        max_chunk_size=int(chunk_sizes["attn_v"]),
+        gate_temperature=float(cfg.get(
+            "soft_gate_T_v", cfg["soft_gate_temperature"])),
+        **common,
+    )
+    rst = _make_sharded_intervention_srw(
+        max_chunk_size=int(chunk_sizes["rst"]),
+        gate_temperature=float(cfg.get(
+            "soft_gate_T_rst", cfg["soft_gate_temperature"])),
+        **common,
+    )
+    return {0: qk, 1: qk, 2: v, 3: rst}
+
+
 def _target_intervention_forward(
     params: Any,
     model_cfg: Dict[str, Any],
@@ -853,6 +1294,7 @@ def _target_intervention_forward(
     suppress_qk: Any,
     suppress_v: Any,
     suppress_rst: Any,
+    sharded_srw_fns: Optional[Mapping[int, Any]] = None,
 ):
     """Analysis-only token/layer ablation with the canonical unpruned denominator."""
     model_module = analysis_model_module(model_cfg)
@@ -868,6 +1310,7 @@ def _target_intervention_forward(
     d_head = d_model // n_heads
     execution_kwargs = model_module._angular_execution_kwargs_from_model_cfg(model_cfg)
     admission_den_power = float(execution_kwargs.pop("admission_den_power"))
+    execution_kwargs["execution_prune_eps"] = 0.0
     composition_mode = execution_kwargs.get(
         "srw_composition_mode", model_module.DEFAULT_SRW_COMPOSITION_MODE)
     temperature_qk = float(model_cfg.get(
@@ -902,21 +1345,56 @@ def _target_intervention_forward(
         pool_code: int,
         gate_temperature: float,
     ):
+        apply_here = (
+            (target_layer == int(layer_index))
+            & (target_pool == int(pool_code)))
+        if sharded_srw_fns is not None:
+            return sharded_srw_fns[int(pool_code)](
+                x_in,
+                query,
+                op_key,
+                raw_tau,
+                read,
+                write,
+                suppress_mask,
+                target_position,
+                apply_here,
+            )
         local_execution_kwargs = dict(execution_kwargs)
         local_execution_kwargs["soft_gate_temperature"] = float(gate_temperature)
-        _, admission, _, execution_weight, _ = model_module._angular_execution(
-            query, op_key, raw_tau, None, **local_execution_kwargs)
-        apply_here = (target_layer == int(layer_index)) & (target_pool == int(pool_code))
+        query_bf = model_module._forward_unit_direction(
+            query.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        op_key_bf = model_module._forward_unit_direction(
+            op_key.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        rho = (query_bf @ op_key_bf.T).astype(jnp.float32)
+        tau = model_module._tau_from_param(raw_tau)
+        drive_kwargs = dict(local_execution_kwargs)
+        drive_kwargs.pop("soft_gate_temperature", None)
+        boundary_power = drive_kwargs.pop("soft_gate_boundary_power")
+        effective_active_eps = drive_kwargs.pop(
+            "soft_gate_effective_active_eps")
+        _, admission, _, execution_weight, _ = model_module._compute_admission_drive(
+            rho,
+            tau,
+            float(gate_temperature),
+            boundary_power=boundary_power,
+            effective_active_eps=effective_active_eps,
+            **drive_kwargs,
+        )
         keep = 1.0 - token_selector * jnp.asarray(suppress_mask, dtype=jnp.float32)[None, None, :]
         execution_weight = jnp.where(
             apply_here,
             execution_weight * keep,
             execution_weight,
         )
-        read_n = model_module._forward_unit_direction(read.astype(jnp.float32))
-        write_n = model_module._forward_unit_direction(write.astype(jnp.float32))
-        response = x_in.astype(jnp.float32) @ read_n.T
-        numerator = (execution_weight * response) @ write_n
+        read_n = model_module._forward_unit_direction(
+            read.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        write_n = model_module._forward_unit_direction(
+            write.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        response = x_in.astype(jnp.bfloat16) @ read_n.T
+        numerator = (
+            (execution_weight * response.astype(jnp.float32))
+            .astype(jnp.bfloat16) @ write_n).astype(jnp.float32)
         # Important: admission is deliberately not masked.  This is the
         # canonical selection/gate ablation denominator requested for v4171.
         den = model_module._composition_den(
@@ -924,7 +1402,8 @@ def _target_intervention_forward(
             admission_den_power,
             composition_mode,
         )
-        return numerator.astype(jnp.float32) / den
+        return (numerator.astype(jnp.float32) / den).astype(
+            jnp.bfloat16).astype(jnp.float32)
 
     for layer_index in range(n_layers):
         bp = params[f"block_{layer_index}"]
@@ -932,6 +1411,11 @@ def _target_intervention_forward(
             x, bp["norm1"]["scale"], bp["norm1"]["bias"])
         queries = normed @ router["proj_attn"]["kernel"] + router["proj_attn"]["bias"]
         query_q, query_k, query_v = jnp.split(queries, 3, axis=-1)
+        query_adapter = getattr(
+            model_module, "_read_write_attn_operator_queries", None)
+        if query_adapter is not None:
+            query_q, query_k, query_v = query_adapter(
+                router, normed, query_q, query_k, query_v)
         tau_all = normed @ router["raw_tau_attn"]["kernel"] + router["raw_tau_attn"]["bias"]
         q = srw(
             normed, query_q, pool["attn_qk_op_key"], tau_all[:, :, 0:1],
@@ -963,6 +1447,10 @@ def _target_intervention_forward(
         normed = model_module._layer_norm(
             x, bp["norm2"]["scale"], bp["norm2"]["bias"])
         query_rst = normed @ router["proj_rst"]["kernel"] + router["proj_rst"]["bias"]
+        rst_query_adapter = getattr(
+            model_module, "_read_write_rst_operator_query", None)
+        if rst_query_adapter is not None:
+            query_rst = rst_query_adapter(router, normed, query_rst)
         tau_rst = normed @ router["raw_tau_rst"]["kernel"] + router["raw_tau_rst"]["bias"]
         delta_rst = srw(
             normed, query_rst, pool["rst_op_key"], tau_rst,
@@ -974,11 +1462,13 @@ def _target_intervention_forward(
     residual = x
     norm = params["norm"]
     x = model_module._layer_norm(x, norm["scale"], norm["bias"])
+    normalized_residual = x
     logits = x @ params["token_emb"]["embedding"].T
     logits = model_module._slice_logits_to_logical_vocab(logits, model_cfg)
     return (
         logits,
         residual,
+        normalized_residual,
         jnp.stack(target_attention_updates, axis=0),
         jnp.stack(target_rst_updates, axis=0),
     )
@@ -1001,69 +1491,267 @@ def _sequence_ce(logits: np.ndarray, token_ids: Sequence[int], length: int) -> O
 def _intervention_candidates(
     record: Dict[str, Any],
     pool: str,
-    pool_size: int,
-    seed: int,
 ) -> List[Dict[str, Any]]:
+    """Read exact on-device candidates captured before sparse top-k transfer."""
     trace = record["trace"]
-    coefficients = np.abs(np.asarray(trace[f"{pool}_top_coefficient"])[:, 0, :])
-    ids = np.asarray(trace[f"{pool}_top_idx"])[:, 0, :]
-    weights = np.asarray(trace[f"{pool}_top_val"])[:, 0, :]
-    flat = int(np.argmax(coefficients))
-    layer, rank = np.unravel_index(flat, coefficients.shape)
-    selected_id = int(ids[layer, rank])
-    gate_flat = int(np.argmax(weights))
-    gate_layer, gate_rank = np.unravel_index(gate_flat, weights.shape)
-    top_gate_id = int(ids[gate_layer, gate_rank])
-    active_ids = [int(value) for value in ids[layer].tolist()]
-    seed_material = (
-        f"{int(seed)}|{record['prompt']['prompt_id']}|{pool}".encode("utf-8"))
-    local_seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "little")
-    rng = np.random.default_rng(local_seed)
-    active_options = [value for value in active_ids if value != selected_id]
-    active_random = (
-        int(rng.choice(active_options)) if active_options else selected_id)
-    active_set = set(active_ids)
-    inactive_random = selected_id
-    for _ in range(64):
-        candidate = int(rng.integers(0, max(1, int(pool_size))))
-        if candidate not in active_set:
-            inactive_random = candidate
-            break
-    if inactive_random == selected_id:
-        inactive_random = next(
-            (value for value in range(int(pool_size)) if value not in active_set),
-            selected_id,
+    ids = np.asarray(trace[f"{pool}_candidate_ids"])[:, 0, :]
+    valid = np.asarray(trace[f"{pool}_candidate_valid"])[:, 0, :].astype(bool)
+    execution = np.asarray(trace[f"{pool}_candidate_execution"])[:, 0, :]
+    admission = np.asarray(trace[f"{pool}_candidate_admission"])[:, 0, :]
+    coefficient = np.asarray(
+        trace[f"{pool}_candidate_abs_coefficient"])[:, 0, :]
+    strategy_index = {
+        strategy: index
+        for index, strategy in enumerate(TRANSITION_CANDIDATE_STRATEGIES)
+    }
+    contribution_index = strategy_index["top_contribution"]
+    gate_index = strategy_index["top_gate"]
+    contribution_layer = int(np.argmax(coefficient[:, contribution_index]))
+    gate_layer = int(np.argmax(execution[:, gate_index]))
+    rows: List[Dict[str, Any]] = []
+    for strategy in TRANSITION_CANDIDATE_STRATEGIES:
+        index = strategy_index[strategy]
+        layer = gate_layer if strategy == "top_gate" else contribution_layer
+        candidate_valid = bool(valid[layer, index]) and int(ids[layer, index]) >= 0
+        row = {
+            "strategy": strategy,
+            "layer": layer,
+            "operator_id": int(ids[layer, index]),
+            "candidate_valid": candidate_valid,
+            "candidate_execution": float(execution[layer, index]),
+            "candidate_admission": float(admission[layer, index]),
+            "candidate_abs_coefficient": float(coefficient[layer, index]),
+            "candidate_source": "exact_on_device_full_operator_pool",
+        }
+        if not candidate_valid:
+            row["status"] = (
+                "skipped_no_inactive_candidate"
+                if strategy == "inactive_random" else
+                f"skipped_no_{strategy}_candidate"
+            )
+        rows.append(row)
+    return rows
+
+
+def _select_causal_records(
+    records: Sequence[Dict[str, Any]],
+    max_prompts: int,
+) -> List[Dict[str, Any]]:
+    """Select exactly one complete pair for each requested phenomenon."""
+    if int(max_prompts) < 6:
+        raise ValueError(
+            "causal_intervention requires --causal-max-prompts >= 6 for the "
+            "fixed ambiguity/negation/agreement stratification")
+    primary = _primary_records(records)
+    by_pair: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for record in primary:
+        by_pair[str(record["prompt"]["pair_id"])].append(record)
+    selected: List[Dict[str, Any]] = []
+    for phenomenon in (
+        "lexical_ambiguity", "negation", "subject_verb_agreement"):
+        pair_candidates = [
+            pair_records
+            for _, pair_records in sorted(by_pair.items())
+            if len(pair_records) >= 2
+            and all(
+                str(record["prompt"].get("phenomenon")) == phenomenon
+                for record in pair_records[:2])
+        ]
+        if not pair_candidates:
+            raise ValueError(
+                f"causal_intervention missing complete {phenomenon!r} pair")
+        selected.extend(sorted(
+            pair_candidates[0][:2],
+            key=lambda record: str(record["prompt"]["prompt_id"]),
+        ))
+    return selected
+
+
+def _production_logits_forward(ctx: AnalysisContext):
+    """Build the canonical minimal production forward with dense logits."""
+    sharded_fns = ctx.sharded_fns
+    if isinstance(sharded_fns, dict):
+        sharded_fns = {
+            key: value for key, value in sharded_fns.items()
+            if key not in {
+                "vocab_parallel_embedding", "vocab_ce", "vocab_eval_stats",
+                "vocab_argmax",
+            }
+        }
+    mcfg = ctx.model_cfg
+
+    @jax.jit
+    def forward(params, input_ids):
+        result, intermediates = ctx.model.apply(
+            {"params": params},
+            input_ids,
+            attention_mask=jnp.ones_like(input_ids),
+            deterministic=True,
+            rngs={"dropout": jax.random.PRNGKey(0)},
+            sharded_fns=sharded_fns,
+            analysis=False,
+            minimal_train=True,
+            soft_gate_temperature=float(mcfg["soft_gate_temperature"]),
+            soft_gate_t_final=float(mcfg.get(
+                "soft_gate_t_final", mcfg["soft_gate_temperature"])),
+            soft_gate_T_qk=float(mcfg.get(
+                "soft_gate_T_qk", mcfg["soft_gate_temperature"])),
+            soft_gate_T_v=float(mcfg.get(
+                "soft_gate_T_v", mcfg["soft_gate_temperature"])),
+            soft_gate_T_rst=float(mcfg.get(
+                "soft_gate_T_rst", mcfg["soft_gate_temperature"])),
+            soft_gate_boundary_power=float(mcfg["soft_gate_boundary_power"]),
+            soft_gate_boundary_power_final=float(mcfg.get(
+                "soft_gate_boundary_power_final",
+                mcfg["soft_gate_boundary_power"])),
+            admission_den_power=float(mcfg["admission_den_power"]),
+            srw_composition_mode=str(mcfg["srw_composition_mode"]),
+            heat_kernel_beta=float(mcfg["heat_kernel_beta"]),
+            execution_prune_eps=jnp.float32(0.0),
+            compute_accuracy=False,
+            capture_intermediates=(
+                lambda module, method: module.name == "norm"),
+            mutable=["intermediates"],
         )
-    target_magnitude = float(coefficients[layer, rank])
-    matched_options = [
-        (abs(float(coefficients[layer, idx]) - target_magnitude), int(ids[layer, idx]))
-        for idx in range(ids.shape[1]) if int(ids[layer, idx]) != selected_id
-    ]
-    matched_id = min(matched_options)[1] if matched_options else active_random
-    candidates = [
-        {"strategy": "top_contribution", "layer": int(layer), "operator_id": selected_id},
-        {"strategy": "top_gate", "layer": int(gate_layer), "operator_id": top_gate_id},
-        {"strategy": "inactive_random", "layer": int(layer), "operator_id": inactive_random},
-        {"strategy": "active_random", "layer": int(layer), "operator_id": active_random},
-        {"strategy": "matched_control", "layer": int(layer), "operator_id": matched_id},
-    ]
-    dedup = []
-    seen = set()
-    for row in candidates:
-        key = (row["strategy"], row["layer"], row["operator_id"])
-        if key not in seen:
-            seen.add(key)
-            dedup.append(row)
-    return dedup
+        final_normalized_residual = (
+            intermediates["intermediates"]["norm"]["__call__"][0])
+        return result["logits"][:1], final_normalized_residual[:1]
+
+    return forward
+
+
+def _intervention_forward_parity(
+    ctx: AnalysisContext,
+    records: Sequence[Dict[str, Any]],
+    intervention_forward: Any,
+    pool_sizes: Mapping[str, int],
+) -> Dict[str, Any]:
+    production_forward = _production_logits_forward(ctx)
+    zeros_qk = jnp.zeros((int(pool_sizes["q"]),), dtype=jnp.float32)
+    zeros_v = jnp.zeros((int(pool_sizes["v"]),), dtype=jnp.float32)
+    zeros_rst = jnp.zeros((int(pool_sizes["rst"]),), dtype=jnp.float32)
+    rows = []
+    for record in records:
+        prompt = record["prompt"]
+        data_replicas = max(1, int(ctx.mesh.shape["data"]))
+        input_ids = jax.device_put(jnp.asarray(np.repeat(
+            np.asarray(prompt["input_array"], dtype=np.int32)[None, :],
+            data_replicas,
+            axis=0,
+        )), ctx.data_sharding)
+        target_position = int(record["target_token_index"])
+        production_logits, production_residual = jax.device_get(
+            production_forward(ctx.params, input_ids))
+        (custom_logits, _, custom_normalized_residual,
+         _, _) = jax.device_get(
+            intervention_forward(
+                ctx.params,
+                input_ids,
+                jnp.int32(target_position),
+                jnp.int32(-1),
+                jnp.int32(-1),
+                zeros_qk,
+                zeros_v,
+                zeros_rst,
+            ))
+        custom_logits = np.asarray(custom_logits)
+        production_logits = np.asarray(production_logits)
+        production_residual = np.asarray(production_residual)
+        custom_normalized_residual = np.asarray(custom_normalized_residual)
+        length = int(prompt["length"])
+        prod_slice = production_logits[:, :length]
+        custom_slice = custom_logits[:, :length]
+        abs_diff = np.abs(prod_slice.astype(np.float64) - custom_slice.astype(np.float64))
+        prod_ce = _sequence_ce(production_logits, prompt["token_ids"], length)
+        custom_ce = _sequence_ce(custom_logits, prompt["token_ids"], length)
+        rows.append({
+            "prompt_id": prompt["prompt_id"],
+            "ce_abs_diff": (
+                abs(float(prod_ce) - float(custom_ce))
+                if prod_ce is not None and custom_ce is not None else None),
+            "mean_logit_abs_diff": float(np.mean(abs_diff)),
+            "max_logit_abs_diff": float(np.max(abs_diff)),
+            "top1_agreement": float(np.mean(
+                np.argmax(prod_slice, axis=-1)
+                == np.argmax(custom_slice, axis=-1))),
+            "final_residual_cosine": _cosine(
+                production_residual[0, target_position],
+                custom_normalized_residual[0, target_position]),
+            "residual_reference": (
+                "canonical_production_final_norm_output_vs_"
+                "custom_final_norm_output"),
+        })
+    thresholds = {
+        "ce_abs_diff_max": 5.0e-4,
+        "mean_logit_abs_diff_max": 5.0e-3,
+        "top1_agreement_min": 0.999,
+        "final_residual_cosine_min": 0.99999,
+    }
+    summary = {
+        "status": "ready",
+        "num_prompts": len(rows),
+        "ce_abs_diff": max(float(row["ce_abs_diff"]) for row in rows),
+        "mean_logit_abs_diff": float(np.mean([
+            float(row["mean_logit_abs_diff"]) for row in rows])),
+        "max_logit_abs_diff": max(
+            float(row["max_logit_abs_diff"]) for row in rows),
+        "top1_agreement": float(np.mean([
+            float(row["top1_agreement"]) for row in rows])),
+        "final_residual_cosine": min(
+            float(row["final_residual_cosine"]) for row in rows),
+        "thresholds": thresholds,
+        "rows": rows,
+    }
+    failed = (
+        summary["ce_abs_diff"] > thresholds["ce_abs_diff_max"]
+        or summary["mean_logit_abs_diff"] > thresholds["mean_logit_abs_diff_max"]
+        or summary["top1_agreement"] < thresholds["top1_agreement_min"]
+        or summary["final_residual_cosine"] < thresholds["final_residual_cosine_min"]
+    )
+    if failed:
+        summary["status"] = "failed"
+        if ctx.is_primary:
+            write_json_atomic(
+                ctx.store.path("intervention_forward_parity.json"), summary)
+        raise RuntimeError(
+            "INTERVENTION_FORWARD_PARITY failed: "
+            f"ce={summary['ce_abs_diff']:.6g} "
+            f"mean_logit={summary['mean_logit_abs_diff']:.6g} "
+            f"top1={summary['top1_agreement']:.6g} "
+            f"residual_cos={summary['final_residual_cosine']:.8f}")
+    if ctx.is_primary:
+        write_json_atomic(ctx.store.path("intervention_forward_parity.json"), summary)
+    return summary
+
+
+def _causal_effect_summary(
+    rows: Sequence[Dict[str, Any]], seed: int,
+) -> Dict[str, Any]:
+    valid = [
+        row for row in rows
+        if row.get("status") == "ready"
+        and row.get("target_logprob_delta") is not None]
+    abs_delta = [abs(float(row["target_logprob_delta"])) for row in valid]
+    effect = _bootstrap_mean_ci(abs_delta, seed)
+    return {
+        "n": len(valid),
+        "mean_abs_target_logprob_delta": effect["mean"],
+        "bootstrap_ci95": effect["ci95"],
+        "mean_kl": (
+            float(np.mean([float(row["full_output_kl"]) for row in valid]))
+            if valid else None),
+        "top_prediction_changed_fraction": (
+            float(np.mean([bool(row["top_prediction_changed"]) for row in valid]))
+            if valid else None),
+    }
 
 
 def run_causal_intervention(
     ctx: AnalysisContext,
     records: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    primary = _primary_records(records)
-    max_prompts = max(1, int(getattr(ctx.args, "causal_max_prompts", 2) or 2))
-    primary = primary[:max_prompts]
+    max_prompts = max(1, int(getattr(ctx.args, "causal_max_prompts", 6) or 6))
+    primary = _select_causal_records(records, max_prompts)
     mcfg = ctx.config.get("model", {})
     pool_sizes = {
         "q": int(mcfg.get("n_qk", 0)),
@@ -1072,23 +1760,60 @@ def run_causal_intervention(
         "rst": int(mcfg.get("n_rst", mcfg.get("n_know", 0))),
     }
     pool_codes = {"q": 0, "k": 1, "v": 2, "rst": 3}
-    forward = jax.jit(
-        lambda p, x, pos, layer, pool_code, mq, mv, mr: _target_intervention_forward(
-            p, ctx.model_cfg, x, pos, layer, pool_code, mq, mv, mr))
+    sharded_srw_fns = _intervention_srw_fns(ctx)
+
+    def intervention_step(p, x, pos, layer, pool_code, mq, mv, mr):
+        result = _target_intervention_forward(
+            p,
+            ctx.model_cfg,
+            x,
+            pos,
+            layer,
+            pool_code,
+            mq,
+            mv,
+            mr,
+            sharded_srw_fns=sharded_srw_fns,
+        )
+        return (
+            result[0][:1],
+            result[1][:1],
+            result[2][:1],
+            result[3][:, :1],
+            result[4][:, :1],
+        )
+
+    forward = jax.jit(intervention_step)
+    parity = _intervention_forward_parity(ctx, primary, forward, pool_sizes)
+    if ctx.is_primary:
+        print(
+            "INTERVENTION_FORWARD_PARITY "
+            f"status={parity['status']} ce_abs_diff={parity['ce_abs_diff']:.6g} "
+            f"mean_logit_abs_diff={parity['mean_logit_abs_diff']:.6g} "
+            f"max_logit_abs_diff={parity['max_logit_abs_diff']:.6g} "
+            f"top1_agreement={parity['top1_agreement']:.6f} "
+            f"final_residual_cosine={parity['final_residual_cosine']:.8f}",
+            flush=True,
+        )
     result_rows: List[Dict[str, Any]] = []
     intervention_seed = int(ctx.config.get("seed", 0))
     started = time.time()
     for prompt_idx, record in enumerate(primary):
         prompt = record["prompt"]
-        input_ids_np = np.asarray(prompt["input_array"], dtype=np.int32)[None, :]
+        data_replicas = max(1, int(ctx.mesh.shape["data"]))
+        input_ids_np = np.repeat(
+            np.asarray(prompt["input_array"], dtype=np.int32)[None, :],
+            data_replicas,
+            axis=0,
+        )
         target_position = int(record["target_token_index"])
         zeros_qk = np.zeros((pool_sizes["q"],), dtype=np.float32)
         zeros_v = np.zeros((pool_sizes["v"],), dtype=np.float32)
         zeros_rst = np.zeros((pool_sizes["rst"],), dtype=np.float32)
-        (baseline_logits, baseline_residual,
+        (baseline_logits, baseline_residual, _,
          baseline_attention_updates, baseline_rst_updates) = jax.device_get(forward(
             ctx.params,
-            jnp.asarray(input_ids_np),
+            jax.device_put(jnp.asarray(input_ids_np), ctx.data_sharding),
             jnp.int32(target_position),
             jnp.int32(-1),
             jnp.int32(-1),
@@ -1108,8 +1833,18 @@ def run_causal_intervention(
         base_logp_all = _log_softmax_np(baseline_logits[0, :length])
         baseline_ce = _sequence_ce(baseline_logits, prompt["token_ids"], length)
         for pool in TRACE_POOLS:
-            for candidate in _intervention_candidates(
-                record, pool, pool_sizes[pool], intervention_seed):
+            for candidate in _intervention_candidates(record, pool):
+                if not candidate["candidate_valid"]:
+                    result_rows.append({
+                        "prompt_id": prompt["prompt_id"],
+                        "phenomenon": prompt["phenomenon"],
+                        "pool": pool,
+                        **candidate,
+                        "intervention_type": (
+                            "selection_gate_ablation_canonical_denominator"),
+                        "canonical_unpruned_admission_denominator": True,
+                    })
+                    continue
                 masks = {
                     "qk": zeros_qk.copy(),
                     "v": zeros_v.copy(),
@@ -1117,10 +1852,10 @@ def run_causal_intervention(
                 }
                 mask_key = "qk" if pool in ("q", "k") else pool
                 masks[mask_key][int(candidate["operator_id"])] = 1.0
-                (logits, residual,
+                (logits, residual, _,
                  attention_updates, rst_updates) = jax.device_get(forward(
                     ctx.params,
-                    jnp.asarray(input_ids_np),
+                    jax.device_put(jnp.asarray(input_ids_np), ctx.data_sharding),
                     jnp.int32(target_position),
                     jnp.int32(candidate["layer"]),
                     jnp.int32(pool_codes[pool]),
@@ -1163,8 +1898,9 @@ def run_causal_intervention(
                     "intervention_type": "selection_gate_ablation_canonical_denominator",
                     "canonical_unpruned_admission_denominator": True,
                     "removed_operator_count": 1,
+                    "status": "ready",
                     "baseline_ce": baseline_ce,
-                    "validation_ce_delta": (
+                    "prompt_prefix_ce_delta": (
                         None if baseline_ce is None else
                         float(_sequence_ce(logits, prompt["token_ids"], length) - baseline_ce)),
                     "target_continuation_token_id": target_token_id,
@@ -1183,10 +1919,14 @@ def run_causal_intervention(
                     "layer_local_update_relative_error": float(
                         np.linalg.norm(local_new - local_base)
                         / max(float(np.linalg.norm(local_base)), 1.0e-12)),
-                    "unrelated_control_residual_relative_error": float(
+                    "structurally_unaffected_past_position_control": {
+                        "position": int(unrelated_pos),
+                        "residual_relative_error": float(
                         np.linalg.norm(
                             residual[0, unrelated_pos] - baseline_residual[0, unrelated_pos])
-                        / max(float(np.linalg.norm(baseline_residual[0, unrelated_pos])), 1.0e-12)),
+                        / max(float(np.linalg.norm(
+                            baseline_residual[0, unrelated_pos])), 1.0e-12)),
+                    },
                 }
                 result_rows.append(row)
         if ctx.is_primary:
@@ -1196,24 +1936,51 @@ def run_causal_intervention(
                 f"id={prompt['prompt_id']}",
                 flush=True,
             )
+    valid_rows = [row for row in result_rows if row.get("status") == "ready"]
     selected = [
         abs(float(row["target_logprob_delta"]))
-        for row in result_rows
+        for row in valid_rows
         if row["strategy"] in ("top_contribution", "top_gate")
         and row.get("target_logprob_delta") is not None
     ]
     controls = [
         abs(float(row["target_logprob_delta"]))
-        for row in result_rows
+        for row in valid_rows
         if row["strategy"] in ("inactive_random", "active_random", "matched_control")
         and row.get("target_logprob_delta") is not None
     ]
+    def grouped(key: str, seed_offset: int) -> Dict[str, Any]:
+        values = sorted({str(row[key]) for row in valid_rows})
+        return {
+            value: _causal_effect_summary(
+                [row for row in valid_rows if str(row[key]) == value],
+                intervention_seed + seed_offset + index,
+            )
+            for index, value in enumerate(values)
+        }
+
     summary = {
-        "status": "ready" if result_rows else "insufficient_evidence",
+        "status": "ready" if valid_rows else "insufficient_evidence",
         "intervention_type": "selection_gate_ablation_canonical_denominator",
         "canonical_unpruned_admission_denominator": True,
         "num_prompts": len(primary),
-        "num_interventions": len(result_rows),
+        "prompt_selection": "one complete pair each: lexical_ambiguity, negation, subject_verb_agreement",
+        "num_interventions": len(valid_rows),
+        "num_skipped": len(result_rows) - len(valid_rows),
+        "skip_status_counts": dict(sorted({
+            status: sum(row.get("status") == status for row in result_rows)
+            for status in {
+                str(row.get("status")) for row in result_rows
+                if row.get("status") != "ready"
+            }
+        }.items())),
+        "intervention_forward_parity": parity,
+        "effects": {
+            "overall": _causal_effect_summary(valid_rows, intervention_seed),
+            "by_strategy": grouped("strategy", 100),
+            "by_pool": grouped("pool", 200),
+            "by_phenomenon": grouped("phenomenon", 300),
+        },
         "selected_abs_target_logprob_delta": _bootstrap_mean_ci(
             selected, int(ctx.config.get("seed", 0))),
         "control_abs_target_logprob_delta": _bootstrap_mean_ci(
@@ -1224,7 +1991,6 @@ def run_causal_intervention(
         "artifact": ctx.store.path("interventions.jsonl"),
         "limitations": [
             "generation change is not executed in the core intervention item",
-            "address-RW permutation is not part of the core preset",
         ],
     }
     if ctx.is_primary:

@@ -245,9 +245,27 @@ def parse_args() -> argparse.Namespace:
         help="Optional deterministic cap for v4171 transition prompts.",
     )
     p.add_argument(
+        "--transition-topk-qk",
+        type=int,
+        default=int(os.environ.get("DAWN_V4171_TRANSITION_TOPK_QK", 512)),
+        help="Target-only sparse top-k for both Q and K transition traces.",
+    )
+    p.add_argument(
+        "--transition-topk-v",
+        type=int,
+        default=int(os.environ.get("DAWN_V4171_TRANSITION_TOPK_V", 2048)),
+        help="Target-only sparse top-k for V transition traces.",
+    )
+    p.add_argument(
+        "--transition-topk-rst",
+        type=int,
+        default=int(os.environ.get("DAWN_V4171_TRANSITION_TOPK_RST", 4096)),
+        help="Target-only sparse top-k for RST transition traces.",
+    )
+    p.add_argument(
         "--causal-max-prompts",
         type=int,
-        default=int(os.environ.get("DAWN_V4171_CAUSAL_MAX_PROMPTS", 2)),
+        default=int(os.environ.get("DAWN_V4171_CAUSAL_MAX_PROMPTS", 6)),
         help="Maximum controlled prompts used by the causal_intervention item.",
     )
     p.add_argument(
@@ -769,6 +787,27 @@ def _checkpoint_infos(checkpoints_dir: str) -> List[Dict[str, Any]]:
 def _discover_latest_checkpoint(checkpoint_dir: str) -> Dict[str, Any]:
     train = get_train()
     checkpoint_dir = str(checkpoint_dir).rstrip("/\\")
+    if _path_name(checkpoint_dir).isdigit():
+        checkpoints_dir, step, _ = resolve_checkpoint(checkpoint_dir)
+        if checkpoints_dir is None or step is None:
+            raise FileNotFoundError(
+                f"Could not resolve exact checkpoint {checkpoint_dir}")
+        run_folder = _path_parent(checkpoints_dir)
+        infos = _checkpoint_infos(checkpoints_dir)
+        exact = next(
+            (row for row in infos if int(row["step"]) == int(step)), None)
+        return {
+            "configured_checkpoint_dir": run_folder,
+            "run_folder": run_folder,
+            "checkpoints_dir": checkpoints_dir,
+            "latest_step": int(step),
+            "latest_path": (
+                exact.get("path") if exact else
+                join_path(checkpoints_dir, str(step))),
+            "latest_modified": exact.get("modified") if exact else None,
+            "checkpoint_infos": infos,
+            "selection": "exact_numeric_checkpoint",
+        }
     if _path_name(checkpoint_dir) == "checkpoints":
         candidates = [_path_parent(checkpoint_dir)]
         configured_base = _path_parent(checkpoint_dir)

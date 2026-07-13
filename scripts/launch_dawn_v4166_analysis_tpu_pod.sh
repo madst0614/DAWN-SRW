@@ -62,6 +62,12 @@ REMOTE_LOG_EXPLICIT="0"
 ANALYSIS_PRESET_EXPLICIT="0"
 APPEND_REMOTE_LOG="0"
 FAIL_ON_CONFLICT="0"
+SKIP_REPO_UPDATE="0"
+SYNC_LOCAL_ANALYSIS="0"
+TRANSITION_TOPK_QK="${DAWN_TRANSITION_TOPK_QK:-512}"
+TRANSITION_TOPK_V="${DAWN_TRANSITION_TOPK_V:-2048}"
+TRANSITION_TOPK_RST="${DAWN_TRANSITION_TOPK_RST:-4096}"
+CAUSAL_MAX_PROMPTS="${DAWN_CAUSAL_MAX_PROMPTS:-6}"
 
 TRAIN_ANALYSIS_CONFIG="${DAWN_TRAIN_ANALYSIS_CONFIG:-}"
 TRAIN_ANALYSIS_CHECKPOINT_DIR="${DAWN_TRAIN_ANALYSIS_CHECKPOINT_DIR:-gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new}"
@@ -127,10 +133,14 @@ apply_preset() {
                 MODE="train_analysis"
             fi
             if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
-                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_emb_tau/run_vspatial-r1-v4.1.7.1_20260712_172338_3201"
+                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_emb_tau/run_vspatial-r1-v4.1.7.1_20260712_172338_3201/checkpoints/000000016000"
             fi
             if [[ "$ANALYSIS_PRESET_EXPLICIT" == "0" ]]; then
                 TRAIN_ANALYSIS_PRESET="v4171_self_organization"
+            fi
+            if [[ "$OUTPUT_EXPLICIT" == "0" ]]; then
+                OUTPUT="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_emb_tau/run_vspatial-r1-v4.1.7.1_20260712_172338_3201/side_analysis/v4171_self_organization_v2"
+                OUTPUT_EXPLICIT="1"
             fi
             if [[ "$REMOTE_LOG_EXPLICIT" == "0" ]]; then
                 REMOTE_LOG="~/train.log"
@@ -178,6 +188,8 @@ while [[ $# -gt 0 ]]; do
         --detach) DETACH="1"; DETACH_EXPLICIT="1"; shift ;;
         --log) REMOTE_LOG="$2"; REMOTE_LOG_EXPLICIT="1"; shift 2 ;;
         --no-install) INSTALL_DEPS="0"; shift ;;
+        --skip-repo-update) SKIP_REPO_UPDATE="1"; shift ;;
+        --sync-local-analysis) SYNC_LOCAL_ANALYSIS="1"; shift ;;
         --dry-run) DRY_RUN="1"; shift ;;
         --from-scratch) ANALYSIS_ARGS="$ANALYSIS_ARGS --from-scratch"; shift ;;
         --retry-failed) ANALYSIS_ARGS="$ANALYSIS_ARGS --retry-failed"; shift ;;
@@ -193,6 +205,10 @@ while [[ $# -gt 0 ]]; do
         --analysis-generation-max-tokens) TRAIN_ANALYSIS_GENERATION_MAX_TOKENS="$2"; shift 2 ;;
         --analysis-generation-temperature) TRAIN_ANALYSIS_GENERATION_TEMPERATURE="$2"; shift 2 ;;
         --analysis-generation-top-k) TRAIN_ANALYSIS_GENERATION_TOP_K="$2"; shift 2 ;;
+        --transition-topk-qk) TRANSITION_TOPK_QK="$2"; shift 2 ;;
+        --transition-topk-v) TRANSITION_TOPK_V="$2"; shift 2 ;;
+        --transition-topk-rst) TRANSITION_TOPK_RST="$2"; shift 2 ;;
+        --causal-max-prompts) CAUSAL_MAX_PROMPTS="$2"; shift 2 ;;
         --list-analysis-items) ANALYSIS_ARGS="$ANALYSIS_ARGS --list-train-analysis-items"; shift ;;
         --usage-max-sequences) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-max-sequences $2"; shift 2 ;;
         --usage-batch-size) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-batch-size $2"; shift 2 ;;
@@ -224,6 +240,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --analysis-generation-max-tokens N"
             echo "  --analysis-generation-temperature F"
             echo "  --analysis-generation-top-k N"
+            echo "  --transition-topk-qk N    Default: $TRANSITION_TOPK_QK"
+            echo "  --transition-topk-v N     Default: $TRANSITION_TOPK_V"
+            echo "  --transition-topk-rst N   Default: $TRANSITION_TOPK_RST"
+            echo "  --causal-max-prompts N    Default: $CAUSAL_MAX_PROMPTS"
             echo "  --list-analysis-items     Print train-analysis item catalog"
             echo "  --branch BRANCH           Default: $BRANCH"
             echo "  --repo-url URL            Default: $REPO_URL"
@@ -238,6 +258,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --detach                  Run in the mode-specific tmux session (default)"
             echo "  --foreground              Run foreground on the SSH command"
             echo "  --dry-run                 Print resolved command without launching"
+            echo "  --skip-repo-update        Use an already-synced remote worktree"
+            echo "  --sync-local-analysis     Overlay the current uncommitted analysis files after repo update"
             echo "  --from-scratch            Disable analysis artifact resume"
             echo "  --retry-failed"
             echo "  --fail-fast"
@@ -336,6 +358,13 @@ if [[ "$MODE" == "train_analysis" ]]; then
     COPY_CMD="$COPY_CMD --analysis-generation-max-tokens $TRAIN_ANALYSIS_GENERATION_MAX_TOKENS"
     COPY_CMD="$COPY_CMD --analysis-generation-temperature $TRAIN_ANALYSIS_GENERATION_TEMPERATURE"
     COPY_CMD="$COPY_CMD --analysis-generation-top-k $TRAIN_ANALYSIS_GENERATION_TOP_K"
+    COPY_CMD="$COPY_CMD --transition-topk-qk $TRANSITION_TOPK_QK --transition-topk-v $TRANSITION_TOPK_V --transition-topk-rst $TRANSITION_TOPK_RST --causal-max-prompts $CAUSAL_MAX_PROMPTS"
+fi
+if [[ "$SKIP_REPO_UPDATE" == "1" ]]; then
+    COPY_CMD="$COPY_CMD --skip-repo-update"
+fi
+if [[ "$SYNC_LOCAL_ANALYSIS" == "1" ]]; then
+    COPY_CMD="$COPY_CMD --sync-local-analysis"
 fi
 WATCH_LOG_CMD="bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --log $REMOTE_LOG --target $TMUX_SESSION --summary"
 
@@ -369,6 +398,10 @@ if [[ "$MODE" == "train_analysis" ]]; then
     echo "  gen_max_tokens  : $TRAIN_ANALYSIS_GENERATION_MAX_TOKENS"
     echo "  gen_temperature : $TRAIN_ANALYSIS_GENERATION_TEMPERATURE"
     echo "  gen_top_k       : $TRAIN_ANALYSIS_GENERATION_TOP_K"
+    echo "  transition_topk : qk=$TRANSITION_TOPK_QK v=$TRANSITION_TOPK_V rst=$TRANSITION_TOPK_RST"
+    echo "  causal_prompts  : $CAUSAL_MAX_PROMPTS"
+    echo "  repo_update     : $([[ "$SKIP_REPO_UPDATE" == "1" ]] && echo skip || echo fetch)"
+    echo "  local_overlay   : $SYNC_LOCAL_ANALYSIS"
 else
     echo "  checkpoint      : $CHECKPOINT"
     echo "  output          : $OUTPUT"
@@ -387,7 +420,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
     echo "Dry run: no TPU command will be sent."
     if [[ "$MODE" == "train_analysis" ]]; then
         echo "Remote Python:"
-        DRY_RUN_ANALYSIS_CMD="python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --train-analysis-preset $TRAIN_ANALYSIS_PRESET --train-analysis-generation-max-prompts $TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS --train-analysis-generation-max-tokens $TRAIN_ANALYSIS_GENERATION_MAX_TOKENS --train-analysis-generation-temperature $TRAIN_ANALYSIS_GENERATION_TEMPERATURE --train-analysis-generation-top-k $TRAIN_ANALYSIS_GENERATION_TOP_K --init-distributed"
+        DRY_RUN_ANALYSIS_CMD="python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --train-analysis-preset $TRAIN_ANALYSIS_PRESET --train-analysis-generation-max-prompts $TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS --train-analysis-generation-max-tokens $TRAIN_ANALYSIS_GENERATION_MAX_TOKENS --train-analysis-generation-temperature $TRAIN_ANALYSIS_GENERATION_TEMPERATURE --train-analysis-generation-top-k $TRAIN_ANALYSIS_GENERATION_TOP_K --transition-topk-qk $TRANSITION_TOPK_QK --transition-topk-v $TRANSITION_TOPK_V --transition-topk-rst $TRANSITION_TOPK_RST --causal-max-prompts $CAUSAL_MAX_PROMPTS --init-distributed"
         if [[ -n "$TRAIN_ANALYSIS_CONFIG" ]]; then
             DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --config $TRAIN_ANALYSIS_CONFIG"
         fi
@@ -460,6 +493,27 @@ for worker in "${TARGET_WORKERS[@]}"; do
         exit 1
     fi
 done
+
+OVERLAY_ARCHIVE=""
+if [[ "$SYNC_LOCAL_ANALYSIS" == "1" ]]; then
+    OVERLAY_ARCHIVE="$(mktemp -t dawn_v4171_analysis_overlay_XXXXXX.tar.gz)"
+    trap '[[ -z "${OVERLAY_ARCHIVE:-}" ]] || rm -f "$OVERLAY_ARCHIVE"' EXIT
+    tar -czf "$OVERLAY_ARCHIVE" \
+        analysis/dawn_analysis_trace.py \
+        analysis/dawn_train_analysis_items.py \
+        analysis/dawn_v4171_transition.py \
+        analysis/prompts/v4171_transition_pairs.jsonl \
+        scripts/analyze_dawn_srw_v4166.py \
+        scripts/launch_dawn_v4166_analysis_tpu_pod.sh
+    echo "Syncing local analysis overlay to target worker(s)..."
+    for worker in "${TARGET_WORKERS[@]}"; do
+        gcloud compute tpus tpu-vm scp "$OVERLAY_ARCHIVE" \
+            "$TPU_NAME:~/dawn_v4171_analysis_overlay.tar.gz" \
+            --zone="$ZONE" \
+            --project="$PROJECT" \
+            --worker="$worker"
+    done
+fi
 
 if [[ "$FAIL_ON_CONFLICT" == "1" ]]; then
 read -r -d '' CLEANUP_CMD <<'EOFCLEANUP' || true
@@ -575,6 +629,12 @@ TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS='${TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS}'
 TRAIN_ANALYSIS_GENERATION_MAX_TOKENS='${TRAIN_ANALYSIS_GENERATION_MAX_TOKENS}'
 TRAIN_ANALYSIS_GENERATION_TEMPERATURE='${TRAIN_ANALYSIS_GENERATION_TEMPERATURE}'
 TRAIN_ANALYSIS_GENERATION_TOP_K='${TRAIN_ANALYSIS_GENERATION_TOP_K}'
+TRANSITION_TOPK_QK='${TRANSITION_TOPK_QK}'
+TRANSITION_TOPK_V='${TRANSITION_TOPK_V}'
+TRANSITION_TOPK_RST='${TRANSITION_TOPK_RST}'
+CAUSAL_MAX_PROMPTS='${CAUSAL_MAX_PROMPTS}'
+SKIP_REPO_UPDATE='${SKIP_REPO_UPDATE}'
+SYNC_LOCAL_ANALYSIS='${SYNC_LOCAL_ANALYSIS}'
 DETACH='${DETACH}'
 INSTALL_DEPS='${INSTALL_DEPS}'
 TMUX_SESSION='${TMUX_SESSION}'
@@ -606,7 +666,14 @@ if [ "\$MODE" = "train_analysis" ]; then
     echo "APPEND_REMOTE_LOG=\$APPEND_REMOTE_LOG"
 fi
 
-if [ -d "\$WORK_DIR/.git" ]; then
+if [ "\$SKIP_REPO_UPDATE" = "1" ]; then
+    if [ ! -d "\$WORK_DIR/.git" ]; then
+        echo "ERROR: --skip-repo-update requires \$WORK_DIR/.git" >&2
+        exit 1
+    fi
+    cd "\$WORK_DIR"
+    echo "Repo update skipped; using synced worktree"
+elif [ -d "\$WORK_DIR/.git" ]; then
     cd "\$WORK_DIR"
     git fetch origin "\$BRANCH" --depth 1
     git checkout -B "\$BRANCH" FETCH_HEAD
@@ -616,6 +683,17 @@ else
     git clone -b "\$BRANCH" --single-branch --depth 1 "\$REPO_URL" "\$WORK_DIR"
     cd "\$WORK_DIR"
     echo "Repo cloned (branch: \$BRANCH)"
+fi
+
+if [ "\$SYNC_LOCAL_ANALYSIS" = "1" ]; then
+    OVERLAY_PATH="\$HOME/dawn_v4171_analysis_overlay.tar.gz"
+    if [ ! -f "\$OVERLAY_PATH" ]; then
+        echo "ERROR: local analysis overlay missing: \$OVERLAY_PATH" >&2
+        exit 1
+    fi
+    tar -xzf "\$OVERLAY_PATH" -C "\$WORK_DIR"
+    rm -f "\$OVERLAY_PATH"
+    echo "Local analysis overlay applied"
 fi
 
 if [ "\$INSTALL_DEPS" = "1" ]; then
@@ -645,6 +723,10 @@ if [ "\$MODE" = "train_analysis" ]; then
         --train-analysis-generation-max-tokens "\$TRAIN_ANALYSIS_GENERATION_MAX_TOKENS"
         --train-analysis-generation-temperature "\$TRAIN_ANALYSIS_GENERATION_TEMPERATURE"
         --train-analysis-generation-top-k "\$TRAIN_ANALYSIS_GENERATION_TOP_K"
+        --transition-topk-qk "\$TRANSITION_TOPK_QK"
+        --transition-topk-v "\$TRANSITION_TOPK_V"
+        --transition-topk-rst "\$TRANSITION_TOPK_RST"
+        --causal-max-prompts "\$CAUSAL_MAX_PROMPTS"
         --init-distributed
     )
     if [ -n "\$TRAIN_ANALYSIS_CONFIG" ]; then
