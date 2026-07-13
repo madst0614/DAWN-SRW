@@ -357,3 +357,274 @@ def make_vocab_parallel_ce(
         )
 
     return vocab_parallel_ce
+
+
+def make_vocab_parallel_eval_stats(
+    mesh,
+    logical_vocab_size: int,
+    vocab_size_padded: int,
+    token_chunk_size: int = 32768,
+):
+    """Exact per-token NLL and greedy matches for read-only evaluation.
+
+    Unlike :func:`make_vocab_parallel_ce`, this function deliberately performs
+    no data-axis reduction.  The caller needs one score and one greedy decision
+    per example, so both outputs remain sharded over ``data``.  The model-axis
+    collectives are exact and padded vocabulary rows can never win argmax.
+    """
+    mesh_model = int(mesh.shape["model"])
+    logical_vocab_size = int(logical_vocab_size)
+    vocab_size_padded = int(vocab_size_padded)
+    token_chunk_size = int(token_chunk_size)
+    if logical_vocab_size <= 0:
+        raise ValueError(
+            f"logical_vocab_size must be > 0, got {logical_vocab_size}")
+    if token_chunk_size <= 0:
+        raise ValueError(
+            f"token_chunk_size must be > 0, got {token_chunk_size}")
+    if vocab_size_padded < logical_vocab_size:
+        raise ValueError(
+            f"vocab_size_padded={vocab_size_padded} must be >= "
+            f"logical_vocab_size={logical_vocab_size}")
+    if vocab_size_padded % mesh_model != 0:
+        raise ValueError(
+            f"vocab_size_padded={vocab_size_padded} must be divisible by "
+            f"mesh_model={mesh_model}")
+    vocab_per_shard = vocab_size_padded // mesh_model
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(
+            P("data", None, None),
+            P("model", None),
+            P("data", None),
+            P("data", None),
+        ),
+        out_specs=(P("data", None), P("data", None)),
+        check_rep=False,
+    )
+    def eval_stats(shift_x, embedding_local, shift_labels, valid_mask):
+        model_idx = jax.lax.axis_index("model")
+        vocab_start = model_idx * vocab_per_shard
+        local_vocab_ids = (
+            vocab_start
+            + jnp.arange(vocab_per_shard, dtype=jnp.int32))
+        valid_vocab = local_vocab_ids < logical_vocab_size
+        neg_inf = jnp.finfo(jnp.float32).min
+
+        batch, seq, width = shift_x.shape
+        n_tokens = batch * seq
+        flat_x = shift_x.reshape(n_tokens, width)
+        flat_labels = shift_labels.reshape(n_tokens).astype(jnp.int32)
+        flat_valid = valid_mask.reshape(n_tokens).astype(jnp.bool_)
+        pad = (-n_tokens) % token_chunk_size
+        flat_x = jnp.pad(flat_x, ((0, pad), (0, 0)))
+        flat_labels = jnp.pad(flat_labels, ((0, pad),), constant_values=0)
+        flat_valid = jnp.pad(
+            flat_valid, ((0, pad),), constant_values=False)
+        flat_x = flat_x.reshape(-1, token_chunk_size, width)
+        flat_labels = flat_labels.reshape(-1, token_chunk_size)
+        flat_valid = flat_valid.reshape(-1, token_chunk_size)
+
+        def chunk_step(carry, xs):
+            del carry
+            x_c, labels_c, valid_c = xs
+            local_logits = (x_c @ embedding_local.T).astype(jnp.float32)
+            local_logits = jnp.where(
+                valid_vocab[None, :], local_logits, neg_inf)
+
+            local_max = jnp.max(local_logits, axis=-1)
+            global_max = jax.lax.stop_gradient(
+                jax.lax.pmax(jax.lax.stop_gradient(local_max), "model"))
+            local_exp_sum = jnp.sum(
+                jnp.exp(local_logits - global_max[:, None]), axis=-1)
+            log_z = global_max + jnp.log(
+                jax.lax.psum(local_exp_sum, "model") + 1.0e-30)
+
+            safe_labels = jnp.where(valid_c, labels_c, 0)
+            in_local = (
+                (safe_labels >= vocab_start)
+                & (safe_labels < vocab_start + vocab_per_shard)
+                & (safe_labels < logical_vocab_size)
+                & valid_c)
+            local_idx = jnp.clip(
+                safe_labels - vocab_start, 0, vocab_per_shard - 1)
+            local_target = jnp.take_along_axis(
+                local_logits, local_idx[:, None], axis=-1).squeeze(-1)
+            target_logit = jax.lax.psum(
+                jnp.where(in_local, local_target, 0.0), "model")
+            token_ce = jnp.where(
+                valid_c, (log_z - target_logit).astype(jnp.float32), 0.0)
+
+            local_best_idx = jnp.argmax(local_logits, axis=-1)
+            local_best_score = jnp.max(local_logits, axis=-1)
+            global_best_score = jax.lax.stop_gradient(
+                jax.lax.pmax(
+                    jax.lax.stop_gradient(local_best_score), "model"))
+            sentinel = jnp.asarray(
+                logical_vocab_size + 1000000000, dtype=jnp.int32)
+            candidate_id = jnp.where(
+                local_best_score == global_best_score,
+                vocab_start + local_best_idx,
+                sentinel,
+            )
+            pred = jax.lax.pmin(candidate_id, "model")
+            token_correct = (pred == labels_c) & valid_c
+            return None, (token_ce, token_correct)
+
+        _, (ce_chunks, correct_chunks) = jax.lax.scan(
+            chunk_step, None, (flat_x, flat_labels, flat_valid))
+        per_token_ce = ce_chunks.reshape(-1)[:n_tokens].reshape(batch, seq)
+        per_token_correct = (
+            correct_chunks.reshape(-1)[:n_tokens].reshape(batch, seq))
+        return per_token_ce, per_token_correct
+
+    return eval_stats
+
+
+def make_vocab_parallel_argmax(
+    mesh,
+    logical_vocab_size: int,
+    vocab_size_padded: int,
+    token_chunk_size: int = 32768,
+):
+    """Return exact global-vocabulary argmax ids without gathering weights."""
+    mesh_model = int(mesh.shape["model"])
+    logical_vocab_size = int(logical_vocab_size)
+    vocab_size_padded = int(vocab_size_padded)
+    token_chunk_size = int(token_chunk_size)
+    if logical_vocab_size <= 0 or token_chunk_size <= 0:
+        raise ValueError("logical_vocab_size and token_chunk_size must be > 0")
+    if vocab_size_padded < logical_vocab_size:
+        raise ValueError("vocab_size_padded is smaller than logical_vocab_size")
+    if vocab_size_padded % mesh_model != 0:
+        raise ValueError("vocab_size_padded must be divisible by mesh_model")
+    vocab_per_shard = vocab_size_padded // mesh_model
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(P("data", None, None), P("model", None)),
+        out_specs=P("data", None),
+        check_rep=False,
+    )
+    def vocab_argmax(hidden, embedding_local):
+        model_idx = jax.lax.axis_index("model")
+        vocab_start = model_idx * vocab_per_shard
+        vocab_ids = vocab_start + jnp.arange(
+            vocab_per_shard, dtype=jnp.int32)
+        valid_vocab = vocab_ids < logical_vocab_size
+        neg_inf = jnp.finfo(jnp.float32).min
+        batch, seq, width = hidden.shape
+        n_tokens = batch * seq
+        flat = hidden.reshape(n_tokens, width)
+        pad = (-n_tokens) % token_chunk_size
+        flat = jnp.pad(flat, ((0, pad), (0, 0)))
+        flat = flat.reshape(-1, token_chunk_size, width)
+
+        def chunk_step(carry, x_c):
+            del carry
+            logits = (x_c @ embedding_local.T).astype(jnp.float32)
+            logits = jnp.where(valid_vocab[None, :], logits, neg_inf)
+            local_idx = jnp.argmax(logits, axis=-1)
+            local_score = jnp.max(logits, axis=-1)
+            global_score = jax.lax.stop_gradient(
+                jax.lax.pmax(jax.lax.stop_gradient(local_score), "model"))
+            sentinel = jnp.asarray(
+                logical_vocab_size + 1000000000, dtype=jnp.int32)
+            candidate = jnp.where(
+                local_score == global_score,
+                vocab_start + local_idx,
+                sentinel,
+            )
+            return None, jax.lax.pmin(candidate, "model")
+
+        _, chunks = jax.lax.scan(chunk_step, None, flat)
+        return chunks.reshape(-1)[:n_tokens].reshape(batch, seq)
+
+    return vocab_argmax
+
+
+def make_unsharded_eval_stats(
+    logical_vocab_size: int,
+    token_chunk_size: int = 32768,
+):
+    """Single-model-axis counterpart of ``make_vocab_parallel_eval_stats``."""
+    logical_vocab_size = int(logical_vocab_size)
+    token_chunk_size = int(token_chunk_size)
+    if logical_vocab_size <= 0 or token_chunk_size <= 0:
+        raise ValueError("logical_vocab_size and token_chunk_size must be > 0")
+
+    def eval_stats(shift_x, embedding, shift_labels, valid_mask):
+        batch, seq, width = shift_x.shape
+        n_tokens = batch * seq
+        flat_x = shift_x.reshape(n_tokens, width)
+        flat_labels = shift_labels.reshape(n_tokens).astype(jnp.int32)
+        flat_valid = valid_mask.reshape(n_tokens).astype(jnp.bool_)
+        pad = (-n_tokens) % token_chunk_size
+        flat_x = jnp.pad(flat_x, ((0, pad), (0, 0)))
+        flat_labels = jnp.pad(flat_labels, ((0, pad),), constant_values=0)
+        flat_valid = jnp.pad(
+            flat_valid, ((0, pad),), constant_values=False)
+        flat_x = flat_x.reshape(-1, token_chunk_size, width)
+        flat_labels = flat_labels.reshape(-1, token_chunk_size)
+        flat_valid = flat_valid.reshape(-1, token_chunk_size)
+        vocab_ids = jnp.arange(embedding.shape[0], dtype=jnp.int32)
+        valid_vocab = vocab_ids < logical_vocab_size
+        neg_inf = jnp.finfo(jnp.float32).min
+
+        def chunk_step(carry, xs):
+            del carry
+            x_c, labels_c, valid_c = xs
+            logits = (x_c @ embedding.T).astype(jnp.float32)
+            logits = jnp.where(valid_vocab[None, :], logits, neg_inf)
+            safe = jnp.where(valid_c, labels_c, 0)
+            target = jnp.take_along_axis(
+                logits, safe[:, None], axis=-1).squeeze(-1)
+            ce = jax.nn.logsumexp(logits, axis=-1) - target
+            ce = jnp.where(valid_c, ce.astype(jnp.float32), 0.0)
+            correct = (jnp.argmax(logits, axis=-1) == labels_c) & valid_c
+            return None, (ce, correct)
+
+        _, (ce_chunks, correct_chunks) = jax.lax.scan(
+            chunk_step, None, (flat_x, flat_labels, flat_valid))
+        return (
+            ce_chunks.reshape(-1)[:n_tokens].reshape(batch, seq),
+            correct_chunks.reshape(-1)[:n_tokens].reshape(batch, seq),
+        )
+
+    return eval_stats
+
+
+def make_unsharded_argmax(
+    logical_vocab_size: int,
+    token_chunk_size: int = 32768,
+):
+    """Single-model-axis exact argmax over a tied embedding table."""
+    logical_vocab_size = int(logical_vocab_size)
+    token_chunk_size = int(token_chunk_size)
+    if logical_vocab_size <= 0 or token_chunk_size <= 0:
+        raise ValueError("logical_vocab_size and token_chunk_size must be > 0")
+
+    def vocab_argmax(hidden, embedding):
+        batch, seq, width = hidden.shape
+        n_tokens = batch * seq
+        flat = hidden.reshape(n_tokens, width)
+        pad = (-n_tokens) % token_chunk_size
+        flat = jnp.pad(flat, ((0, pad), (0, 0)))
+        flat = flat.reshape(-1, token_chunk_size, width)
+        vocab_ids = jnp.arange(embedding.shape[0], dtype=jnp.int32)
+        valid_vocab = vocab_ids < logical_vocab_size
+        neg_inf = jnp.finfo(jnp.float32).min
+
+        def chunk_step(carry, x_c):
+            del carry
+            logits = (x_c @ embedding.T).astype(jnp.float32)
+            logits = jnp.where(valid_vocab[None, :], logits, neg_inf)
+            return None, jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+        _, chunks = jax.lax.scan(chunk_step, None, flat)
+        return chunks.reshape(-1)[:n_tokens].reshape(batch, seq)
+
+    return vocab_argmax

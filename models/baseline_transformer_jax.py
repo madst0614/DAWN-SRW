@@ -362,10 +362,21 @@ class VanillaTransformer(nn.Module):
             shift_labels = labels[:, 1:].astype(jnp.int32)
             valid_mask = (shift_labels != -100)
 
+            eval_stats = (
+                sharded_fns.get("vocab_eval_stats")
+                if isinstance(sharded_fns, dict) else None)
             vp_ce = (
                 sharded_fns.get("vocab_parallel_ce")
                 if isinstance(sharded_fns, dict) else None)
-            if vp_ce is not None:
+            if eval_stats is not None:
+                per_token_ce, per_token_correct = eval_stats(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)
+                valid_f = valid_mask.astype(jnp.float32)
+                valid_count = valid_mask.astype(jnp.int32).sum()
+                loss = (per_token_ce * valid_f).sum() / jnp.maximum(
+                    valid_count.astype(jnp.float32), 1.0)
+                correct = per_token_correct.astype(jnp.int32).sum()
+            elif vp_ce is not None:
                 loss, correct, valid_count = vp_ce(
                     shift_x, embedding_matrix, shift_labels, valid_mask)
             else:
@@ -395,13 +406,24 @@ class VanillaTransformer(nn.Module):
             result['loss'] = loss
             result['correct'] = correct
             result['valid_count'] = valid_count
+            if eval_stats is not None:
+                result['per_token_ce'] = per_token_ce
+                result['per_token_correct'] = per_token_correct
+                result['valid_mask'] = valid_mask
         else:
-            if vp_embed is not None:
+            vocab_argmax = (
+                sharded_fns.get("vocab_argmax")
+                if isinstance(sharded_fns, dict) else None)
+            if vocab_argmax is not None:
+                result['argmax_token_ids'] = vocab_argmax(
+                    x, self.token_emb.embedding)
+            elif vp_embed is not None:
                 raise NotImplementedError(
                     "Full logits are disabled on the vocab-parallel baseline "
                     "training path. Pass labels or run without sharded_fns.")
-            logits = self.token_emb.attend(x)
-            result['logits'] = logits
+            else:
+                logits = self.token_emb.attend(x)
+                result['logits'] = logits
 
         return result
 

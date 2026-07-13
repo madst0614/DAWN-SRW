@@ -4247,6 +4247,10 @@ class DAWN_SRW_V4171(nn.Module):
         emb_rng = self.make_rng('dropout')
         x = safe_dropout(x, self.dropout_rate, deterministic, emb_rng)
 
+        _eval_stats_enabled = (
+            isinstance(sharded_fns, dict)
+            and sharded_fns.get("vocab_eval_stats") is not None)
+
         def _compute_vocab_ce(final_x):
             _ce_token_chunk_size = int(ce_token_chunk_size)
             if _ce_token_chunk_size <= 0:
@@ -4259,12 +4263,29 @@ class DAWN_SRW_V4171(nn.Module):
             shift_labels = labels[:, 1:].astype(jnp.int32)
             valid_mask = shift_labels != -100
 
+            eval_stats = (
+                sharded_fns.get("vocab_eval_stats")
+                if isinstance(sharded_fns, dict)
+                else None
+            )
             vp_ce = (
                 sharded_fns.get("vocab_ce")
                 if isinstance(sharded_fns, dict)
                 else None
             )
-            if vp_ce is not None:
+            if eval_stats is not None:
+                per_token_ce, per_token_correct = eval_stats(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)
+                valid_f = valid_mask.astype(jnp.float32)
+                valid_count = valid_mask.astype(jnp.int32).sum()
+                loss = (per_token_ce * valid_f).sum() / jnp.maximum(
+                    valid_count.astype(jnp.float32), 1.0)
+                correct = per_token_correct.astype(jnp.int32).sum()
+                logit_abs_max = jnp.float32(0.0)
+                logit_norm_mean = jnp.float32(0.0)
+                logit_mean = jnp.float32(0.0)
+                logit_std = jnp.float32(0.0)
+            elif vp_ce is not None:
                 (
                     loss,
                     per_token_ce,
@@ -4296,6 +4317,9 @@ class DAWN_SRW_V4171(nn.Module):
                     compute_accuracy=_compute_accuracy,
                     logical_vocab_size=logical_vocab_size,
                 )
+                per_token_correct = None
+            if eval_stats is None and vp_ce is not None:
+                per_token_correct = None
             return (
                 loss,
                 per_token_ce,
@@ -4306,6 +4330,7 @@ class DAWN_SRW_V4171(nn.Module):
                 logit_mean,
                 logit_std,
                 valid_mask,
+                per_token_correct,
             )
 
         if self.is_initializing():
@@ -4665,6 +4690,13 @@ class DAWN_SRW_V4171(nn.Module):
                     q_tau_all + k_tau_all + v_tau_all) / jnp.float32(3.0)
                 x = self.norm(x)
                 if labels is None:
+                    vocab_argmax = (
+                        sharded_fns.get("vocab_argmax")
+                        if isinstance(sharded_fns, dict) else None)
+                    if vocab_argmax is not None:
+                        return {
+                            'argmax_token_ids': vocab_argmax(
+                                x, self.token_emb.embedding)}
                     if vp_embed is not None:
                         raise NotImplementedError(
                             "Full logits are disabled on the "
@@ -4679,7 +4711,8 @@ class DAWN_SRW_V4171(nn.Module):
 
                 (loss, per_token_ce, correct, valid_count,
                  logit_abs_max, logit_norm_mean, logit_mean,
-                 logit_std, valid_mask) = _compute_vocab_ce(x)
+                 logit_std, valid_mask,
+                 per_token_correct) = _compute_vocab_ce(x)
                 def _sg_mean(value):
                     return jax.lax.stop_gradient(value.mean())
 
@@ -4694,6 +4727,8 @@ class DAWN_SRW_V4171(nn.Module):
                     'per_token_ce': per_token_ce,
                     'valid_mask': valid_mask,
                     'aux_loss': jnp.float32(0.0),
+                    **({'per_token_correct': per_token_correct}
+                       if _eval_stats_enabled else {}),
                     'attn_q_active': jax.lax.stop_gradient(
                         q_active_all.mean()),
                     'attn_k_active': jax.lax.stop_gradient(
@@ -5793,7 +5828,7 @@ class DAWN_SRW_V4171(nn.Module):
         if labels is not None:
             (loss, per_token_ce, correct, valid_count,
              logit_abs_max, logit_norm_mean, logit_mean, logit_std,
-             valid_mask) = _compute_vocab_ce(x)
+             valid_mask, per_token_correct) = _compute_vocab_ce(x)
             result['loss'] = loss
             result['correct'] = correct
             result['valid_count'] = valid_count
@@ -5802,17 +5837,26 @@ class DAWN_SRW_V4171(nn.Module):
             result['logit_mean'] = logit_mean
             result['logit_std'] = logit_std
             result['per_token_ce'] = per_token_ce
+            if _eval_stats_enabled:
+                result['per_token_correct'] = per_token_correct
             result['valid_mask'] = valid_mask
         else:
-            if vp_embed is not None:
+            vocab_argmax = (
+                sharded_fns.get("vocab_argmax")
+                if isinstance(sharded_fns, dict) else None)
+            if vocab_argmax is not None:
+                result['argmax_token_ids'] = vocab_argmax(
+                    x, self.token_emb.embedding)
+            elif vp_embed is not None:
                 raise NotImplementedError(
                     "Full logits are disabled on the vocab-parallel v4166 "
                     "path. Pass labels or run without sharded_fns.")
-            logical_vocab_size, embedding_vocab_size = self._vocab_sizes()
-            logits = self.token_emb.attend(x)
-            if embedding_vocab_size != logical_vocab_size:
-                logits = logits[..., :logical_vocab_size]
-            result['logits'] = logits
+            else:
+                logical_vocab_size, embedding_vocab_size = self._vocab_sizes()
+                logits = self.token_emb.attend(x)
+                if embedding_vocab_size != logical_vocab_size:
+                    logits = logits[..., :logical_vocab_size]
+                result['logits'] = logits
 
         return result
 

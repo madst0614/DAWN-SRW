@@ -1,0 +1,11 @@
+# Reproducible evaluator dependencies. lm-eval must never float.
+lm-eval==0.4.2
+orbax-checkpoint==0.11.24
+transformers==4.40.2
+tokenizers==0.19.1
+huggingface-hub==0.23.0
+datasets==2.19.2
+pyarrow==20.0.0
+fsspec==2024.3.1
+gcsfs==2024.3.1
+pytest==8.2.2
