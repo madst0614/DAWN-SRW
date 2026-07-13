@@ -1249,7 +1249,159 @@ def _make_sharded_intervention_srw(
     return sharded_srw
 
 
-def _intervention_srw_fns(ctx: AnalysisContext) -> Dict[int, Any]:
+def _make_sharded_intervention_srw_paired(
+    model_module: Any,
+    mesh: Any,
+    *,
+    max_chunk_size: int,
+    gate_temperature: float,
+    gate_boundary_power: float,
+    admission_den_power: float,
+    srw_composition_mode: str,
+    heat_kernel_beta: float,
+    effective_active_eps: float,
+):
+    """Production-shaped paired Q/K SRW with route-selective suppression."""
+    admission_den_power = float(admission_den_power)
+    gate_temperature = float(gate_temperature)
+    gate_boundary_power = float(gate_boundary_power)
+    heat_kernel_beta = float(heat_kernel_beta)
+    effective_active_eps = float(effective_active_eps)
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(
+            P("data", None, None),
+            P("data", None, None, None),
+            P("model", None),
+            P("data", None, None, None),
+            P("model", None),
+            P("model", None),
+            P("model"),
+            P(),
+            P(),
+            P(),
+        ),
+        out_specs=P("data", None, None, None),
+        check_rep=False,
+    )
+    def sharded_srw_paired(
+        x,
+        query_qk,
+        op_key_local,
+        raw_tau_qk,
+        read_local,
+        write_local,
+        suppress_local,
+        target_position,
+        target_pool,
+        apply_layer,
+    ):
+        n_local = int(op_key_local.shape[0])
+        chunk_size = min(int(max_chunk_size), n_local)
+        n_chunks = (n_local + chunk_size - 1) // chunk_size
+        n_pad = n_chunks * chunk_size
+        pad_n = n_pad - n_local
+        batch_size, seq_len, _, d_model = (
+            query_qk.shape[0], query_qk.shape[1], query_qk.shape[2], x.shape[-1])
+        x_bf = x.astype(jnp.bfloat16)
+        op_key = jnp.pad(op_key_local, ((0, pad_n), (0, 0)))
+        read = jnp.pad(read_local, ((0, pad_n), (0, 0)))
+        write = jnp.pad(write_local, ((0, pad_n), (0, 0)))
+        suppress = jnp.pad(suppress_local, ((0, pad_n),))
+        valid = jnp.arange(n_pad) < n_local
+        query_bf = model_module._forward_unit_direction(
+            query_qk.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        op_key_bf = model_module._forward_unit_direction(
+            op_key.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        read_bf = model_module._forward_unit_direction(
+            read.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        write_bf = model_module._forward_unit_direction(
+            write.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        tau = model_module._tau_from_param(raw_tau_qk)
+        token_selector = jax.nn.one_hot(
+            target_position, seq_len, dtype=jnp.float32)[None, :, None, None]
+        route_selector = jax.nn.one_hot(
+            target_pool, 2, dtype=jnp.float32)[None, None, :, None]
+
+        @jax.checkpoint
+        def step(carry, chunk_index):
+            raw_out, admission_mass = carry
+            start = chunk_index * chunk_size
+            key_chunk = jax.lax.dynamic_slice_in_dim(
+                op_key_bf, start, chunk_size, axis=0)
+            read_chunk = jax.lax.dynamic_slice_in_dim(
+                read_bf, start, chunk_size, axis=0)
+            write_chunk = jax.lax.dynamic_slice_in_dim(
+                write_bf, start, chunk_size, axis=0)
+            suppress_chunk = jax.lax.dynamic_slice_in_dim(
+                suppress, start, chunk_size, axis=0)
+            valid_chunk = jax.lax.dynamic_slice_in_dim(
+                valid, start, chunk_size, axis=0)
+            valid_bsrn = valid_chunk[None, None, None, :]
+            rho_raw = jnp.einsum(
+                "bsrd,nd->bsrn", query_bf, key_chunk).astype(jnp.float32)
+            rho = jnp.where(valid_bsrn, rho_raw, tau)
+            _, admission, _, execution, _ = model_module._compute_admission_drive(
+                rho,
+                tau,
+                gate_temperature,
+                boundary_power=gate_boundary_power,
+                effective_active_eps=effective_active_eps,
+                execution_prune_eps=0.0,
+                srw_composition_mode=srw_composition_mode,
+                heat_kernel_beta=heat_kernel_beta,
+            )
+            admission = jnp.where(valid_bsrn, admission, 0.0)
+            execution = jnp.where(valid_bsrn, execution, 0.0)
+            keep = 1.0 - (
+                token_selector
+                * route_selector
+                * suppress_chunk[None, None, None, :])
+            execution = jnp.where(apply_layer, execution * keep, execution)
+            response = x_bf @ read_chunk.T
+            coefficient = (
+                execution * response.astype(jnp.float32)[:, :, None, :])
+            chunk_out = jnp.einsum(
+                "bsrn,nd->bsrd",
+                coefficient.astype(jnp.bfloat16),
+                write_chunk,
+            ).astype(jnp.float32)
+            return (
+                raw_out + chunk_out,
+                admission_mass + admission.sum(axis=-1, keepdims=True),
+            ), None
+
+        (raw_out, local_admission_mass), _ = jax.lax.scan(
+            step,
+            (
+                jnp.zeros(
+                    (batch_size, seq_len, 2, d_model), dtype=jnp.float32),
+                jnp.zeros(
+                    (batch_size, seq_len, 2, 1), dtype=jnp.float32),
+            ),
+            jnp.arange(n_chunks),
+        )
+        global_admission_mass = jax.lax.psum(
+            local_admission_mass, "model")
+        den = model_module._composition_den(
+            global_admission_mass,
+            admission_den_power,
+            srw_composition_mode,
+        )
+        local_out = raw_out / den
+        return jax.lax.psum(
+            local_out.astype(jnp.bfloat16), "model").astype(jnp.float32)
+
+    return sharded_srw_paired
+
+
+def _intervention_srw_fns(ctx: AnalysisContext) -> Dict[Any, Any]:
     model_module = analysis_model_module(ctx.model_cfg)
     chunk_sizes = _chunk_sizes_for_cfg(ctx.config, ctx.mesh)
     cfg = ctx.model_cfg
@@ -1260,10 +1412,17 @@ def _intervention_srw_fns(ctx: AnalysisContext) -> Dict[int, Any]:
         "admission_den_power": float(cfg["admission_den_power"]),
         "srw_composition_mode": str(cfg["srw_composition_mode"]),
         "heat_kernel_beta": float(cfg["heat_kernel_beta"]),
-        "effective_active_eps": float(cfg.get(
-            "soft_gate_effective_active_eps", 1.0e-6)),
+        # The canonical v4171 production factories fix this at 1e-6 even if
+        # an older training key remains in checkpoint metadata.
+        "effective_active_eps": 1.0e-6,
     }
     qk = _make_sharded_intervention_srw(
+        max_chunk_size=int(chunk_sizes["attn_qk"]),
+        gate_temperature=float(cfg.get(
+            "soft_gate_T_qk", cfg["soft_gate_temperature"])),
+        **common,
+    )
+    qk_paired = _make_sharded_intervention_srw_paired(
         max_chunk_size=int(chunk_sizes["attn_qk"]),
         gate_temperature=float(cfg.get(
             "soft_gate_T_qk", cfg["soft_gate_temperature"])),
@@ -1281,7 +1440,7 @@ def _intervention_srw_fns(ctx: AnalysisContext) -> Dict[int, Any]:
             "soft_gate_T_rst", cfg["soft_gate_temperature"])),
         **common,
     )
-    return {0: qk, 1: qk, 2: v, 3: rst}
+    return {0: qk, 1: qk, 2: v, 3: rst, "qk_paired": qk_paired}
 
 
 def _target_intervention_forward(
@@ -1294,7 +1453,7 @@ def _target_intervention_forward(
     suppress_qk: Any,
     suppress_v: Any,
     suppress_rst: Any,
-    sharded_srw_fns: Optional[Mapping[int, Any]] = None,
+    sharded_srw_fns: Optional[Mapping[Any, Any]] = None,
 ):
     """Analysis-only token/layer ablation with the canonical unpruned denominator."""
     model_module = analysis_model_module(model_cfg)
@@ -1417,14 +1576,33 @@ def _target_intervention_forward(
             query_q, query_k, query_v = query_adapter(
                 router, normed, query_q, query_k, query_v)
         tau_all = normed @ router["raw_tau_attn"]["kernel"] + router["raw_tau_attn"]["bias"]
-        q = srw(
-            normed, query_q, pool["attn_qk_op_key"], tau_all[:, :, 0:1],
-            pool["attn_qk_read"], pool["attn_qk_write"], suppress_qk,
-            layer_index, 0, temperature_qk) * qk_scale
-        k = srw(
-            normed, query_k, pool["attn_qk_op_key"], tau_all[:, :, 1:2],
-            pool["attn_qk_read"], pool["attn_qk_write"], suppress_qk,
-            layer_index, 1, temperature_qk) * qk_scale
+        if sharded_srw_fns is not None and "qk_paired" in sharded_srw_fns:
+            query_qk = jnp.stack((query_q, query_k), axis=2)
+            tau_qk = jnp.stack(
+                (tau_all[:, :, 0:1], tau_all[:, :, 1:2]), axis=2)
+            qk = sharded_srw_fns["qk_paired"](
+                normed,
+                query_qk,
+                pool["attn_qk_op_key"],
+                tau_qk,
+                pool["attn_qk_read"],
+                pool["attn_qk_write"],
+                suppress_qk,
+                target_position,
+                target_pool,
+                target_layer == int(layer_index),
+            ) * qk_scale
+            q = qk[:, :, 0, :]
+            k = qk[:, :, 1, :]
+        else:
+            q = srw(
+                normed, query_q, pool["attn_qk_op_key"], tau_all[:, :, 0:1],
+                pool["attn_qk_read"], pool["attn_qk_write"], suppress_qk,
+                layer_index, 0, temperature_qk) * qk_scale
+            k = srw(
+                normed, query_k, pool["attn_qk_op_key"], tau_all[:, :, 1:2],
+                pool["attn_qk_read"], pool["attn_qk_write"], suppress_qk,
+                layer_index, 1, temperature_qk) * qk_scale
         v = srw(
             normed, query_v, pool["attn_v_op_key"], tau_all[:, :, 2:3],
             pool["attn_v_read"], pool["attn_v_write"], suppress_v,
