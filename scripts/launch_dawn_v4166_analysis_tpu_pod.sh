@@ -60,6 +60,8 @@ CHECKPOINT_DIR_EXPLICIT="0"
 PRUNE_EPS_EXPLICIT="0"
 REMOTE_LOG_EXPLICIT="0"
 ANALYSIS_PRESET_EXPLICIT="0"
+APPEND_REMOTE_LOG="0"
+FAIL_ON_CONFLICT="0"
 
 TRAIN_ANALYSIS_CONFIG="${DAWN_TRAIN_ANALYSIS_CONFIG:-}"
 TRAIN_ANALYSIS_CHECKPOINT_DIR="${DAWN_TRAIN_ANALYSIS_CHECKPOINT_DIR:-gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new}"
@@ -125,11 +127,17 @@ apply_preset() {
                 MODE="train_analysis"
             fi
             if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
-                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_emb_tau"
+                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_emb_tau/run_vspatial-r1-v4.1.7.1_20260712_172338_3201"
             fi
             if [[ "$ANALYSIS_PRESET_EXPLICIT" == "0" ]]; then
-                TRAIN_ANALYSIS_PRESET="v4171"
+                TRAIN_ANALYSIS_PRESET="v4171_self_organization"
             fi
+            if [[ "$REMOTE_LOG_EXPLICIT" == "0" ]]; then
+                REMOTE_LOG="~/train.log"
+                REMOTE_LOG_EXPLICIT="1"
+            fi
+            APPEND_REMOTE_LOG="1"
+            FAIL_ON_CONFLICT="1"
             ;;
         v4171-1p3b|v4171-1p3b-c4-20b|v4171-1p3b-c4-20b-v4-64)
             if [[ "$MODE_EXPLICIT" == "0" ]]; then
@@ -348,6 +356,7 @@ echo "  workers         : $WORKERS"
 echo "  detached        : $DETACH"
 echo "  tmux_session    : $TMUX_SESSION"
 echo "  remote_log      : $REMOTE_LOG"
+echo "  append_log      : $APPEND_REMOTE_LOG"
 if [[ "$MODE" == "train_analysis" ]]; then
     echo "  config          : ${TRAIN_ANALYSIS_CONFIG:-checkpoint full_config}"
     echo "  checkpoint_dir  : $TRAIN_ANALYSIS_CHECKPOINT_DIR"
@@ -452,7 +461,27 @@ for worker in "${TARGET_WORKERS[@]}"; do
     fi
 done
 
-if [[ "$MODE" == "train_analysis" ]]; then
+if [[ "$FAIL_ON_CONFLICT" == "1" ]]; then
+read -r -d '' CLEANUP_CMD <<'EOFCLEANUP' || true
+set -e
+ANALYSIS_PATTERN="[a]nalyze_dawn_srw_v4166"
+TRAIN_JAX_PATTERN="[t]rain_jax"
+TRAIN_JAX_MINIMAL_PATTERN="[t]rain_jax_minimal"
+PGREP_PATTERN="${ANALYSIS_PATTERN}|${TRAIN_JAX_PATTERN}|${TRAIN_JAX_MINIMAL_PATTERN}"
+REMAINING="$(pgrep -af "$PGREP_PATTERN" || true)"
+if [ -n "$REMAINING" ]; then
+    echo "ERROR: conflicting DAWN train/analysis process already exists:" >&2
+    echo "$REMAINING" >&2
+    exit 1
+fi
+ACCEL_USERS="$(sudo lsof /dev/accel* 2>/dev/null | grep -v PID || true)"
+if [ -n "$ACCEL_USERS" ]; then
+    echo "ERROR: TPU accelerator is already in use; refusing to kill the owner:" >&2
+    echo "$ACCEL_USERS" >&2
+    exit 1
+fi
+EOFCLEANUP
+elif [[ "$MODE" == "train_analysis" ]]; then
 read -r -d '' CLEANUP_CMD <<'EOFCLEANUP' || true
 set -e
 ANALYSIS_PATTERN="[a]nalyze_dawn_srw_v4166"
@@ -502,7 +531,11 @@ fi
 cleanup_target_workers() {
     local failed=0
     for worker in "${TARGET_WORKERS[@]}"; do
-        echo "  Cleaning worker $worker..."
+        if [[ "$FAIL_ON_CONFLICT" == "1" ]]; then
+            echo "  Conflict preflight worker $worker..."
+        else
+            echo "  Cleaning worker $worker..."
+        fi
         if ! run_worker_command "$worker" "$CLEANUP_CMD"; then
             echo "ERROR: worker $worker cleanup failed." >&2
             failed=1
@@ -511,13 +544,15 @@ cleanup_target_workers() {
     return "$failed"
 }
 
-if [[ "$MODE" == "train_analysis" && "$DETACH" == "0" ]]; then
+if [[ "$FAIL_ON_CONFLICT" == "1" ]]; then
+    echo "Checking for conflicting train/analysis processes on target worker(s)..."
+elif [[ "$MODE" == "train_analysis" && "$DETACH" == "0" ]]; then
     echo "Cleaning old train_analysis processes on target worker(s)..."
 else
     echo "Cleaning old train/analysis processes on target worker(s)..."
 fi
 if ! cleanup_target_workers; then
-    echo "ERROR: cleanup verification failed. Aborting launch." >&2
+    echo "ERROR: process conflict/cleanup verification failed. Aborting launch." >&2
     exit 1
 fi
 
@@ -544,6 +579,7 @@ DETACH='${DETACH}'
 INSTALL_DEPS='${INSTALL_DEPS}'
 TMUX_SESSION='${TMUX_SESSION}'
 REMOTE_LOG='${REMOTE_LOG}'
+APPEND_REMOTE_LOG='${APPEND_REMOTE_LOG}'
 REMOTE_LOG_PATH="\${REMOTE_LOG/#\\~/\$HOME}"
 WORK_DIR="\$HOME/DAWN-SRW"
 
@@ -567,6 +603,7 @@ if [ "\$MODE" = "train_analysis" ]; then
     echo "TRAIN_ANALYSIS_GENERATION_MAX_TOKENS=\$TRAIN_ANALYSIS_GENERATION_MAX_TOKENS"
     echo "TRAIN_ANALYSIS_GENERATION_TEMPERATURE=\$TRAIN_ANALYSIS_GENERATION_TEMPERATURE"
     echo "TRAIN_ANALYSIS_GENERATION_TOP_K=\$TRAIN_ANALYSIS_GENERATION_TOP_K"
+    echo "APPEND_REMOTE_LOG=\$APPEND_REMOTE_LOG"
 fi
 
 if [ -d "\$WORK_DIR/.git" ]; then
@@ -634,16 +671,22 @@ ANALYSIS_CMD_STR=\$(printf "%q " "\${ANALYSIS_CMD[@]}")
 
 cd "\$WORK_DIR"
 mkdir -p "\$(dirname "\$REMOTE_LOG_PATH")"
-: > "\$REMOTE_LOG_PATH"
+TEE_MODE=""
+if [ "\$APPEND_REMOTE_LOG" = "1" ]; then
+    touch "\$REMOTE_LOG_PATH"
+    TEE_MODE="-a"
+else
+    : > "\$REMOTE_LOG_PATH"
+fi
 if [ "\$DETACH" = "1" ]; then
     echo "[run] starting tmux session \$TMUX_SESSION"
     tmux kill-session -t "\$TMUX_SESSION" 2>/dev/null || true
     tmux new-session -d -x 240 -y 60 -s "\$TMUX_SESSION" \
-        "cd '\$WORK_DIR'; export PYTHONUNBUFFERED=1; export DAWN_ANALYSIS_INIT_DISTRIBUTED=1; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; { echo '=== TPU analysis process startup ==='; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"CMD: \$ANALYSIS_CMD_STR\"; \$ANALYSIS_CMD_STR; } 2>&1 | tee '\$REMOTE_LOG_PATH'"
+        "cd '\$WORK_DIR'; export PYTHONUNBUFFERED=1; export DAWN_ANALYSIS_INIT_DISTRIBUTED=1; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; { echo '=== TPU analysis process startup ==='; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"CMD: \$ANALYSIS_CMD_STR\"; \$ANALYSIS_CMD_STR; } 2>&1 | tee \$TEE_MODE '\$REMOTE_LOG_PATH'"
     echo "[run] detached in tmux session \$TMUX_SESSION, log=\$REMOTE_LOG_PATH"
 else
     echo "[run] foreground analysis"
-    "\${ANALYSIS_CMD[@]}" 2>&1 | tee "\$REMOTE_LOG_PATH"
+    "\${ANALYSIS_CMD[@]}" 2>&1 | tee \$TEE_MODE "\$REMOTE_LOG_PATH"
 fi
 EOFCMD
 

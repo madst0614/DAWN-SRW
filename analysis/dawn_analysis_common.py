@@ -601,6 +601,9 @@ def model_cfg_from_config(
         "soft_gate_boundary_power": float(t.get("soft_gate_boundary_power_final", 4.0)),
         "admission_den_power": float(m.get(
             "admission_den_power", t.get("admission_den_power", 1.0))),
+        "srw_composition_mode": str(m.get(
+            "srw_composition_mode", "linear_angular")),
+        "heat_kernel_beta": float(m.get("heat_kernel_beta", 2.0)),
         "soft_gate_effective_active_eps": float(t.get("soft_gate_effective_active_eps", 1e-6)),
         "execution_prune_eps": float(m.get("execution_prune_eps", 0.0)),
     }

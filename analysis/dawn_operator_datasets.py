@@ -10,7 +10,10 @@ truth.
 from __future__ import annotations
 
 import os
+import json
 from typing import Any, Dict, Optional
+
+from analysis.dawn_analysis_storage import exists, open_path
 
 
 DEFAULT_OPERATOR_DATASET_ROOT = os.environ.get(
@@ -173,4 +176,74 @@ def operator_dataset_summary(root: Optional[str] = None) -> Dict[str, Any]:
         "manifest": operator_dataset_manifest_path(base),
         "prepare_command": "python3 -u scripts/prepare_v4166_operator_datasets.py",
         "datasets": operator_dataset_paths(base),
+    }
+
+
+def _operator_dataset_exists(path: str) -> bool:
+    try:
+        return bool(exists(path))
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise RuntimeError(
+            "Operator dataset preflight cannot access GCS because neither "
+            "gcsfs nor TensorFlow gfile is available in this environment: "
+            f"{path}"
+        ) from exc
+
+
+def load_operator_dataset_manifest(root: Optional[str] = None) -> Dict[str, Any]:
+    """Read and validate the prepared manifest through the shared local/GCS I/O layer."""
+    base = operator_dataset_root(root)
+    path = operator_dataset_manifest_path(base)
+    if not _operator_dataset_exists(path):
+        raise FileNotFoundError(f"Operator dataset manifest not found: {path}")
+    with open_path(path, "r") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Operator dataset manifest must be a mapping: {path}")
+    datasets = payload.get("datasets")
+    if not isinstance(datasets, dict):
+        raise ValueError(f"Operator dataset manifest missing datasets mapping: {path}")
+    unknown = sorted(set(datasets) - set(OPERATOR_DATASET_SPECS))
+    if unknown:
+        raise ValueError(
+            f"Operator dataset manifest has unknown dataset ids: {','.join(unknown)}")
+    return payload
+
+
+def operator_dataset_preflight(
+    root: Optional[str] = None,
+    *,
+    required_datasets: Optional[list[str]] = None,
+    verify_artifacts: bool = True,
+) -> Dict[str, Any]:
+    """Fail-loud preflight for prepared datasets actually consumed by an item."""
+    base = operator_dataset_root(root)
+    manifest = load_operator_dataset_manifest(base)
+    selected = list(required_datasets or manifest.get("datasets", {}).keys())
+    bad = [dataset_id for dataset_id in selected if dataset_id not in OPERATOR_DATASET_SPECS]
+    if bad:
+        raise ValueError(f"Unknown required operator datasets: {','.join(bad)}")
+    configured = operator_dataset_paths(base)
+    missing = []
+    checked = []
+    if verify_artifacts:
+        for dataset_id in selected:
+            for artifact, path in configured[dataset_id]["artifacts"].items():
+                checked.append(path)
+                if not _operator_dataset_exists(path):
+                    missing.append({
+                        "dataset": dataset_id,
+                        "artifact": artifact,
+                        "path": path,
+                    })
+    if missing:
+        raise FileNotFoundError(
+            "Prepared operator dataset artifacts are missing: "
+            + "; ".join(row["path"] for row in missing))
+    return {
+        "status": "ready",
+        "root": base,
+        "manifest": operator_dataset_manifest_path(base),
+        "datasets": selected,
+        "checked_artifacts": len(checked),
     }

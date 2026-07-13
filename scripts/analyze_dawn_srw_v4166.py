@@ -87,6 +87,10 @@ from analysis.dawn_train_analysis_prompt import (
     run_train_generation_samples,
     run_train_prompt_trace,
 )
+from analysis.dawn_v4171_transition import (
+    DEFAULT_TRANSITION_PROMPT_SET,
+    run_v4171_transition_items,
+)
 
 
 FULL_STAGE_ORDER = ["eval", "prune", "geometry", "usage", "trace", "ablation", "report"]
@@ -227,6 +231,24 @@ def parse_args() -> argparse.Namespace:
         "--operator-dataset-root",
         default=os.environ.get("DAWN_OPERATOR_DATASET_ROOT", DEFAULT_OPERATOR_DATASET_ROOT),
         help="Operator-analysis dataset root prepared by the DAWN operator dataset workflow.",
+    )
+    p.add_argument(
+        "--transition-prompt-set",
+        default=os.environ.get(
+            "DAWN_V4171_TRANSITION_PROMPT_SET", DEFAULT_TRANSITION_PROMPT_SET),
+        help="Controlled JSONL prompt pairs for v4171 transition items.",
+    )
+    p.add_argument(
+        "--transition-max-prompts",
+        type=int,
+        default=None,
+        help="Optional deterministic cap for v4171 transition prompts.",
+    )
+    p.add_argument(
+        "--causal-max-prompts",
+        type=int,
+        default=int(os.environ.get("DAWN_V4171_CAUSAL_MAX_PROMPTS", 2)),
+        help="Maximum controlled prompts used by the causal_intervention item.",
     )
     p.add_argument(
         "--train-analysis-generation-max-prompts",
@@ -2053,6 +2075,10 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     prompt_trace = run_train_prompt_trace(ctx) if "prompt_trace" in required_sections else {}
     prompt_decision = build_train_prompt_decision(prompt_trace) if "prompt_trace" in required_sections and ctx.is_primary else {}
     generation_samples = run_train_generation_samples(ctx) if "generation" in required_sections else {}
+    v4171_transition_analysis = (
+        run_v4171_transition_items(ctx, analysis_items)
+        if "v4171_transition" in required_sections else {}
+    )
     sync_hosts("dawn-srw-train-analysis-done")
     if not ctx.is_primary:
         return 0
@@ -2101,6 +2127,7 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
         "prompt_trace": prompt_trace,
         "prompt_decision": prompt_decision,
         "generation_samples": generation_samples,
+        "v4171_transition_analysis": v4171_transition_analysis,
         "operator_analysis_datasets": operator_dataset_summary(args.operator_dataset_root),
         "reference_400m": compare,
         "warnings": warnings,

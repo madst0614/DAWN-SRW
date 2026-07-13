@@ -134,6 +134,36 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
         "summary": "Synthetic binding provides a small controlled sanity check for entity binding and retrieval writes.",
         "requires": ("operator_datasets",),
     },
+    "global_router_audit": {
+        "title": "v4171 global router audit",
+        "measures": "restored router/pool parameter paths, hidden block-local routing parameters, sharing, geometry, and composition settings.",
+        "summary": "GLOBAL_ROUTER_AUDIT fails loudly if v4171 is not using one global router and one global operator pool tree.",
+        "requires": ("v4171_transition",),
+    },
+    "trajectory_trace": {
+        "title": "v4171 target-token trajectory trace",
+        "measures": "target-span residual/query trajectories, sparse operator ids, captured mass, read responses, coefficients, Q/K/V SRW features, and actual attention/RST residual updates.",
+        "summary": "TRAJECTORY_TRACE reuses one target-only transition cache and never returns the full gate tensor to the host.",
+        "requires": ("v4171_transition",),
+    },
+    "context_divergence": {
+        "title": "v4171 context divergence",
+        "measures": "same-surface pair state/query/sparse-gate/update similarity, first divergence, maximum divergence, and late reconvergence.",
+        "summary": "CONTEXT_DIVERGENCE identifies where controlled lexical-ambiguity pairs separate, with captured-mass-qualified gate metrics.",
+        "requires": ("v4171_transition",),
+    },
+    "state_transition_decoupling": {
+        "title": "v4171 state-transition decoupling",
+        "measures": "state/query/gate/delta/path similarity, data-quantile quadrants, random null percentiles, correlations, effect, and bootstrap interval.",
+        "summary": "STATE_TRANSITION_DECOUPLING tests whether distant representation states can share transition paths without using a fixed arbitrary threshold.",
+        "requires": ("v4171_transition",),
+    },
+    "causal_intervention": {
+        "title": "v4171 canonical causal intervention",
+        "measures": "target-token/layer/pool top-contribution, top-gate, active/inactive random, and matched-control ablations with CE, log-prob, KL, prediction, and residual effects.",
+        "summary": "CAUSAL_INTERVENTION masks execution only while preserving the canonical unpruned admission denominator.",
+        "requires": ("v4171_transition",),
+    },
     "decision_reason": {
         "title": "Decision reason",
         "measures": "explicit numeric guardrails behind the final keep/watch/change decision.",
@@ -177,7 +207,18 @@ V4166_1B_ITEMS = (
     "decision_reason",
 )
 
-V4171_ITEMS = tuple(TRAIN_ANALYSIS_ITEM_DEFS.keys())
+V4171_SELF_ORGANIZATION_ITEMS = (
+    "global_router_audit",
+    "trajectory_trace",
+    "context_divergence",
+    "state_transition_decoupling",
+    "causal_intervention",
+)
+
+V4171_ITEMS = tuple(
+    item for item in TRAIN_ANALYSIS_ITEM_DEFS
+    if item not in V4171_SELF_ORGANIZATION_ITEMS
+)
 
 TRAIN_ANALYSIS_PRESETS = {
     "minimal": ("target_ratio", "prune_breakdown", "decision_reason"),
@@ -202,8 +243,9 @@ TRAIN_ANALYSIS_PRESETS = {
     "operator_analysis": OPERATOR_ANALYSIS_ITEM_IDS,
     "v4166_1b": V4166_1B_ITEMS,
     "v4171": V4171_ITEMS,
+    "v4171_self_organization": V4171_SELF_ORGANIZATION_ITEMS,
     "deep": V4166_1B_ITEMS,
-    "full": tuple(TRAIN_ANALYSIS_ITEM_DEFS.keys()),
+    "full": V4171_ITEMS,
 }
 
 TRAIN_ANALYSIS_PRESET_ALIASES = {
@@ -827,6 +869,116 @@ def _item_lines_synthetic_binding_sanity(summary: Dict[str, Any], _fmt: TrainAna
     return ["  SYNTHETIC_BINDING_SANITY:"] + _operator_dataset_block(summary, "synthetic")
 
 
+def _v4171_item(summary: Dict[str, Any], item: str) -> Dict[str, Any]:
+    return dict((summary.get("v4171_transition_analysis") or {}).get(item) or {})
+
+
+def _item_lines_global_router_audit(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
+    data = _v4171_item(summary, "global_router_audit")
+    pools = data.get("pool_sizes", {})
+    return [
+        "  GLOBAL_ROUTER_AUDIT:",
+        f"  status                    : {data.get('status', 'missing')}",
+        f"  router_param_count        : {data.get('router_param_count', 'n/a')}",
+        f"  shared_across_layers      : {data.get('shared_across_layers', 'n/a')}",
+        f"  hidden_layer_router_params: {data.get('hidden_layer_router_params', [])}",
+        f"  operator_keys_shared      : {data.get('operator_keys_shared', 'n/a')}",
+        f"  operator_rw_shared        : {data.get('operator_rw_shared', 'n/a')}",
+        f"  pool_sizes                : qk={pools.get('qk')} v={pools.get('v')} rst={pools.get('rst')}",
+        f"  geometry                  : d_route={data.get('d_route')} d_model={data.get('d_model')} layers={data.get('n_layers')}",
+        f"  composition               : mode={data.get('composition_mode')} den_power={data.get('admission_den_power')}",
+    ]
+
+
+def _item_lines_trajectory_trace(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    data = _v4171_item(summary, "trajectory_trace")
+    captured = data.get("captured_mass", {})
+    semantics = data.get("tensor_semantics", {})
+    out = [
+        "  TRAJECTORY_TRACE:",
+        f"  status          : {data.get('status', 'missing')}",
+        f"  prompt_set      : {data.get('prompt_set', 'n/a')}",
+        f"  prompt_hash     : {data.get('prompt_set_hash', 'n/a')}",
+        f"  prompts/subtoken: {data.get('num_prompts', 0)}/{data.get('num_target_subtokens', 0)}",
+        f"  span_aggregate  : {data.get('span_aggregation', 'n/a')}",
+        f"  sparse_topk     : {data.get('trace_topk', 'n/a')}",
+        f"  captured_mass   : mean={fmt.pct(captured.get('mean'), 2)} min={fmt.pct(captured.get('min'), 2)} p10={fmt.pct(captured.get('p10'), 2)}",
+        f"  qkv_semantics   : {semantics.get('qkv', 'n/a')}",
+        f"  attention_delta : {semantics.get('attention', 'n/a')}",
+        f"  rst_delta       : {semantics.get('rst', 'n/a')}",
+        f"  artifact        : {(data.get('artifacts') or {}).get('trajectory_traces', 'n/a')}",
+    ]
+    if data.get("captured_mass_warning"):
+        out.append(f"  warning         : {data['captured_mass_warning']}")
+    return out
+
+
+def _item_lines_context_divergence(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    data = _v4171_item(summary, "context_divergence")
+    out = [
+        "  CONTEXT_DIVERGENCE:",
+        f"  status     : {data.get('status', 'missing')}",
+        f"  pair_count : {data.get('num_pairs', 0)}",
+        f"  gate_metric: {data.get('gate_metric', 'n/a')}",
+        "  pair/pool first max reconv state query gate delta captured_min",
+    ]
+    for row in (data.get("pairs") or [])[:16]:
+        out.append(
+            "  "
+            f"{row.get('pair_id')}/{row.get('pool')} "
+            f"{row.get('first_divergence_layer')} "
+            f"{row.get('maximum_divergence_layer')} "
+            f"{row.get('late_reconvergence')} "
+            f"{fmt.num(row.get('mean_state_similarity'), 3)} "
+            f"{fmt.num(row.get('mean_query_similarity'), 3)} "
+            f"{fmt.num(row.get('mean_gate_similarity'), 3)} "
+            f"{fmt.num(row.get('mean_delta_similarity'), 3)} "
+            f"{fmt.pct(row.get('min_captured_mass'), 1)}"
+        )
+    return out
+
+
+def _item_lines_state_transition_decoupling(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    data = _v4171_item(summary, "state_transition_decoupling")
+    actual = data.get("path_similarity", {})
+    null = data.get("random_null_path_similarity", {})
+    out = [
+        "  STATE_TRANSITION_DECOUPLING:",
+        f"  status               : {data.get('status', 'missing')}",
+        f"  state_low_q25        : {fmt.num(data.get('state_low_threshold_data_q25'), 4)}",
+        f"  transition_high_null: {fmt.num(data.get('transition_high_threshold_random_null_q75'), 4)}",
+        f"  quadrants            : {data.get('quadrants', {})}",
+        f"  path_similarity      : mean={fmt.num(actual.get('mean'), 4)} ci95={actual.get('ci95')} n={actual.get('n', 0)}",
+        f"  random_null          : mean={fmt.num(null.get('mean'), 4)} ci95={null.get('ci95')} n={null.get('n', 0)}",
+        f"  effect_vs_random     : {fmt.delta(data.get('path_similarity_effect_vs_random'), 4)}",
+    ]
+    for pool, row in (data.get("correlations") or {}).items():
+        out.append(
+            f"  corr {pool}: state-gate={fmt.num(row.get('corr_state_gate'), 3)} "
+            f"state-delta={fmt.num(row.get('corr_state_delta'), 3)} "
+            f"query-gate={fmt.num(row.get('corr_query_gate'), 3)} "
+            f"gate-delta={fmt.num(row.get('corr_gate_delta'), 3)}"
+        )
+    return out
+
+
+def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    data = _v4171_item(summary, "causal_intervention")
+    selected = data.get("selected_abs_target_logprob_delta", {})
+    control = data.get("control_abs_target_logprob_delta", {})
+    return [
+        "  CAUSAL_INTERVENTION:",
+        f"  status          : {data.get('status', 'missing')}",
+        f"  type            : {data.get('intervention_type', 'n/a')}",
+        f"  canonical_den   : {data.get('canonical_unpruned_admission_denominator', False)}",
+        f"  prompts/jobs    : {data.get('num_prompts', 0)}/{data.get('num_interventions', 0)}",
+        f"  selected effect : mean={fmt.num(selected.get('mean'), 5)} ci95={selected.get('ci95')} n={selected.get('n', 0)}",
+        f"  control effect  : mean={fmt.num(control.get('mean'), 5)} ci95={control.get('ci95')} n={control.get('n', 0)}",
+        f"  selected-control: {fmt.delta(data.get('selected_minus_control_effect'), 5)}",
+        f"  artifact        : {data.get('artifact', 'n/a')}",
+    ]
+
+
 def _item_lines_decision_reason(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
     return [f"  - {line_i}" for line_i in (summary.get("decision") or ["n/a"])]
 
@@ -851,6 +1003,11 @@ TRAIN_ANALYSIS_ITEM_FORMATTERS = {
     "blimp_operator_grammar": _item_lines_blimp_operator_grammar,
     "lama_counterfact_factual_recall": _item_lines_lama_counterfact_factual_recall,
     "synthetic_binding_sanity": _item_lines_synthetic_binding_sanity,
+    "global_router_audit": _item_lines_global_router_audit,
+    "trajectory_trace": _item_lines_trajectory_trace,
+    "context_divergence": _item_lines_context_divergence,
+    "state_transition_decoupling": _item_lines_state_transition_decoupling,
+    "causal_intervention": _item_lines_causal_intervention,
     "decision_reason": _item_lines_decision_reason,
 }
 
@@ -926,6 +1083,9 @@ def item_status(summary: Dict[str, Any], item: str) -> str:
     if item == "generation_samples":
         generation = summary.get("generation_samples", {})
         return str(generation.get("status") or "missing")
+    if item in V4171_SELF_ORGANIZATION_ITEMS:
+        data = (summary.get("v4171_transition_analysis") or {}).get(item, {})
+        return str(data.get("status") or "missing")
     if item == "operator_dataset_manifest":
         datasets = summary.get("operator_analysis_datasets", {})
         return "ready" if datasets.get("manifest") and datasets.get("datasets") else "missing"
