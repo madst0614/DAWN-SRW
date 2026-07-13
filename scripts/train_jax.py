@@ -13553,7 +13553,8 @@ class CanonicalOptimizerBundle:
 
 
 TRANSFER_TRAINING_OVERLAY_FIELDS = frozenset({
-    'batch_size', 'eval_batch_size', 'num_epochs', 'max_steps',
+    'batch_size', 'eval_batch_size', 'epochs', 'num_epochs', 'total_steps',
+    'max_steps',
     'lr', 'learning_rate', 'warmup_ratio', 'warmup_steps',
     'weight_decay', 'pool_weight_decay', 'min_lr_ratio',
     'gradient_accumulation_steps', 'global_grad_clip', 'max_grad_norm',
@@ -13691,23 +13692,9 @@ def _checkpoint_final_runtime(full_config, checkpoint_path):
     return runtime
 
 
-def resolve_transfer_checkpoint(source):
-    """Resolve and validate one committed Orbax pretraining checkpoint."""
-    if not source:
-        raise ValueError("transfer requires --init-from/transfer-from")
-    run_folder, step, found = _resolve_orbax_resume_from(source)
-    if not found or step is None:
-        raise FileNotFoundError(
-            f"No committed Orbax pretraining checkpoint found: {source}")
+def _materialize_transfer_checkpoint(source, run_folder, step,
+                                     checkpoint_path):
     checkpoint_dir = _join_path(run_folder, 'checkpoints')
-    checkpoint_path = None
-    for candidate in _list_files(checkpoint_dir, '*'):
-        if _orbax_step_from_path_name(_path_name(candidate)) == int(step):
-            checkpoint_path = candidate
-            break
-    if checkpoint_path is None:
-        raise FileNotFoundError(
-            f"Resolved Orbax step {step} is missing from {checkpoint_dir}")
     if not _orbax_step_is_committed(checkpoint_path):
         raise RuntimeError(
             f"Transfer checkpoint is not committed: {checkpoint_path}")
@@ -13741,6 +13728,45 @@ def resolve_transfer_checkpoint(source):
         full_config=deepcopy(full_config),
         runtime_state=runtime_state,
     )
+
+
+def load_pinned_transfer_checkpoint(source, expected_step=None):
+    """Load one concrete Orbax step without listing or selecting a latest step."""
+    if not source:
+        raise ValueError("pinned transfer requires a concrete checkpoint path")
+    checkpoint_path = str(source).strip().rstrip('/\\')
+    run_folder, step = _parse_orbax_resume_target(checkpoint_path)
+    if run_folder is None or step is None:
+        raise ValueError(
+            "Pinned transfer source must be run_folder/checkpoints/STEP: "
+            f"{source}")
+    if expected_step is not None and int(step) != int(expected_step):
+        raise RuntimeError(
+            "Pinned transfer source step mismatch: "
+            f"path_step={step} expected_step={expected_step}")
+    return _materialize_transfer_checkpoint(
+        checkpoint_path, run_folder, int(step), checkpoint_path)
+
+
+def resolve_transfer_checkpoint(source):
+    """Resolve and validate one committed Orbax pretraining checkpoint."""
+    if not source:
+        raise ValueError("transfer requires --init-from/transfer-from")
+    run_folder, step, found = _resolve_orbax_resume_from(source)
+    if not found or step is None:
+        raise FileNotFoundError(
+            f"No committed Orbax pretraining checkpoint found: {source}")
+    checkpoint_dir = _join_path(run_folder, 'checkpoints')
+    checkpoint_path = None
+    for candidate in _list_files(checkpoint_dir, '*'):
+        if _orbax_step_from_path_name(_path_name(candidate)) == int(step):
+            checkpoint_path = candidate
+            break
+    if checkpoint_path is None:
+        raise FileNotFoundError(
+            f"Resolved Orbax step {step} is missing from {checkpoint_dir}")
+    return _materialize_transfer_checkpoint(
+        source, run_folder, int(step), checkpoint_path)
 
 
 def build_effective_transfer_config(source_checkpoint, downstream_config):

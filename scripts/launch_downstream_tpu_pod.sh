@@ -59,7 +59,6 @@ require_remote_visible_file() {
 }
 
 RESOLVED_CONFIGS=()
-NEEDS_SUITE_SUPPORT="0"
 for CFG in "${CONFIGS[@]}"; do
   RESOLVED="$(resolve_local_config_path "$CFG")"
   if [ ! -f "$RESOLVED" ]; then
@@ -67,18 +66,16 @@ for CFG in "${CONFIGS[@]}"; do
     exit 1
   fi
   require_remote_visible_file "$RESOLVED"
-  if grep -Eq '^[[:space:]]*downstream_suite[[:space:]]*:' "$RESOLVED"; then
-    NEEDS_SUITE_SUPPORT="1"
-  fi
   RESOLVED_CONFIGS+=("$RESOLVED")
 done
 CONFIGS=("${RESOLVED_CONFIGS[@]}")
 
-if [[ "$NEEDS_SUITE_SUPPORT" = "1" ]]; then
-  require_remote_visible_file scripts/setup_and_run_downstream_tpu_pod.sh
-  require_remote_visible_file scripts/run_downstream_sequence.sh
-  require_remote_visible_file scripts/expand_downstream_suite.py
-fi
+# Every launch uses the setup/sequence/expansion path, including normal
+# per-task configs (the expander passes those through unchanged).
+require_remote_visible_file scripts/setup_and_run_downstream_tpu_pod.sh
+require_remote_visible_file scripts/run_downstream_sequence.sh
+require_remote_visible_file scripts/expand_downstream_suite.py
+require_remote_visible_file scripts/downstream_protocol.py
 
 if [[ -n "$GH_TOKEN" ]]; then
   REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/madst0614/dawn-spatial.git"

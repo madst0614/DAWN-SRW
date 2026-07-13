@@ -51,6 +51,43 @@ def main():
     args=ap.parse_args()
     rows=[]
     for root in args.root:
+        # Current protocol writes one structured result per task.  Prefer it
+        # over parsing human-readable logs so reported_acc is always the best
+        # seen validation accuracy rather than the final accuracy.
+        try:
+            result_files = (
+                tj._list_files(root, '*/*_result.json')
+                + tj._list_files(root, '*_result.json')
+            )
+        except Exception:
+            result_files = []
+        structured_tasks = set()
+        for f in sorted(set(result_files)):
+            try:
+                result = read_json(f)
+                task = result['task']
+                structured_tasks.add((root, task))
+                rows.append({
+                    'root': root,
+                    'task': task,
+                    'run': '',
+                    'source_step': result.get('source_checkpoint_step', ''),
+                    'steps': result.get('calculated_total_steps', ''),
+                    'epochs': result.get('effective_epochs', ''),
+                    'initial_acc': result.get('initial_acc', ''),
+                    'best_seen_acc': result.get('best_seen_acc', ''),
+                    'best_seen_step': result.get('best_seen_step', ''),
+                    'best_seen_epoch': result.get('best_seen_epoch', ''),
+                    'final_acc': result.get('final_acc', ''),
+                    'final_step': result.get('final_step', ''),
+                    'final_epoch': result.get('final_epoch', ''),
+                    'reported_acc': result.get('reported_acc', ''),
+                    'accuracy': result.get('reported_acc', ''),
+                    'total': result.get('eval_total', ''),
+                    'path': f,
+                })
+            except Exception as e:
+                print(f'WARN failed {f}: {e}', file=sys.stderr)
         # A sequence run appends every task to one <run>/train.log. Keep the
         # timestamped patterns for older per-task runs.
         try:
@@ -71,12 +108,32 @@ def main():
                 legacy_task=parts[-3] if len(parts)>=3 else ''
                 run=parts[-2] if len(parts)>=2 else ''
                 for vals in parse_training_log(f):
+                    task = vals.get('task', legacy_task)
+                    if (root, task) in structured_tasks:
+                        continue
                     rows.append({
                         'root': root,
-                        'task': vals.get('task', legacy_task),
+                        'task': task,
                         'run': run,
+                        'source_step': vals.get('source_step', ''),
+                        'steps': vals.get('step', ''),
+                        'epochs': vals.get('effective_epochs', ''),
+                        'initial_acc': vals.get('initial_acc', ''),
+                        'best_seen_acc': vals.get(
+                            'best_seen_acc', vals.get('best_acc', '')),
+                        'best_seen_step': vals.get('best_seen_step', ''),
+                        'best_seen_epoch': vals.get('best_seen_epoch', ''),
+                        'final_acc': vals.get('final_acc', ''),
+                        'final_step': vals.get('final_step', ''),
+                        'final_epoch': vals.get('final_epoch', ''),
+                        'reported_acc': vals.get(
+                            'reported_acc',
+                            vals.get('best_seen_acc', vals.get('best_acc', ''))),
                         'step': vals.get('step', ''),
-                        'accuracy': vals.get('best_acc', vals.get('acc', '')),
+                        'accuracy': vals.get(
+                            'reported_acc', vals.get(
+                                'best_seen_acc', vals.get(
+                                    'best_acc', vals.get('acc', '')))),
                         'total': vals.get('total', ''),
                         'path': f,
                     })
@@ -96,11 +153,17 @@ def main():
                 run=parts[-2] if len(parts)>=2 else ''
                 if (root, task, run) in seen_runs:
                     continue
+                if (root, task) in structured_tasks:
+                    continue
                 rows.append({'root':root,'task':task,'run':run,'step':ev.get('step',''),'accuracy':ev.get('accuracy',''),'total':ev.get('total',''),'path':f})
             except Exception as e:
                 print(f'WARN failed {f}: {e}', file=sys.stderr)
     with open(args.out,'w',newline='') as out:
-        w=csv.DictWriter(out, fieldnames=['root','task','run','step','accuracy','total','path'])
+        w=csv.DictWriter(out, fieldnames=[
+            'root','task','run','source_step','steps','epochs',
+            'initial_acc','best_seen_acc','best_seen_step','best_seen_epoch',
+            'final_acc','final_step','final_epoch','reported_acc',
+            'step','accuracy','total','path'], extrasaction='ignore')
         w.writeheader(); w.writerows(rows)
     print(f'wrote {args.out} rows={len(rows)}')
 if __name__=='__main__': main()

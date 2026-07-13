@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import random
@@ -30,6 +31,7 @@ from jax.experimental.multihost_utils import process_allgather
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 import scripts.train_jax as tj
+import scripts.downstream_protocol as downstream_protocol
 
 try:
     from datasets import load_dataset
@@ -466,6 +468,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=True)
     parser.add_argument('--init-from', '--transfer-from', dest='init_from')
+    parser.add_argument('--source-requested')
+    parser.add_argument('--expected-source-path')
+    parser.add_argument('--expected-source-step', type=int)
+    parser.add_argument('--result-json')
     args = parser.parse_args()
 
     requested_cfg = load_yaml(args.config)
@@ -478,6 +484,8 @@ def main() -> None:
     task = requested_downstream.get('task') or requested_cfg.get('task')
     if not task:
         raise ValueError('Config must set downstream.task')
+    requested_training_cfg = requested_cfg.get('training', {}) or {}
+    downstream_protocol.validate_schedule_config(task, requested_training_cfg)
     transfer_from = (
         args.init_from
         or requested_cfg.get('init_from')
@@ -487,7 +495,49 @@ def main() -> None:
             'Downstream is transfer-only and requires --init-from or config init_from')
 
     tj.initialize_distributed_runtime(requested_cfg)
-    source = tj.resolve_transfer_checkpoint(transfer_from)
+    if ((args.expected_source_path is None)
+            != (args.expected_source_step is None)):
+        raise ValueError(
+            '--expected-source-path and --expected-source-step must be set together')
+    if args.expected_source_path is not None:
+        if (downstream_protocol.normalize_checkpoint_path(transfer_from)
+                != downstream_protocol.normalize_checkpoint_path(
+                    args.expected_source_path)):
+            raise RuntimeError(
+                'Task received an init_from path different from the pinned '
+                'suite source')
+        source = tj.load_pinned_transfer_checkpoint(
+            args.expected_source_path, args.expected_source_step)
+    else:
+        source = tj.resolve_transfer_checkpoint(transfer_from)
+    expected_source_path = args.expected_source_path or source.checkpoint_path
+    expected_source_step = (
+        args.expected_source_step
+        if args.expected_source_step is not None else source.step)
+    downstream_protocol.verify_task_source(
+        source.checkpoint_path,
+        source.step,
+        expected_source_path,
+        expected_source_step)
+    source_digest = int.from_bytes(
+        hashlib.sha256(
+            downstream_protocol.normalize_checkpoint_path(
+                source.checkpoint_path).encode('utf-8')).digest()[:4],
+        byteorder='big',
+        signed=False) & 0x7fffffff
+    source_identity = np.asarray(
+        [int(source.step), source_digest], dtype=np.int32)
+    if jax.process_count() > 1:
+        all_source_identities = np.asarray(
+            process_allgather(source_identity)).reshape(-1, 2)
+        if not np.all(all_source_identities == source_identity):
+            raise RuntimeError(
+                'Source checkpoint mismatch across downstream hosts: '
+                f'{all_source_identities.tolist()}')
+    pinned_source = downstream_protocol.PinnedSource(
+        requested=(args.source_requested or transfer_from),
+        resolved=source.checkpoint_path,
+        step=int(source.step))
     cfg = tj.build_effective_transfer_config(source, requested_cfg)
     downstream_cfg = cfg.get('downstream', {})
     training_cfg = cfg.get('training', {})
@@ -544,16 +594,16 @@ def main() -> None:
             f'mesh_data({mesh_data}) * mesh_model({mesh_model}) must equal '
             f'device_count={total_devices}')
 
-    steps_per_epoch = math.ceil(len(train_rows) / batch_size)
-    num_epochs = int(training_cfg.get('num_epochs', 3))
-    max_steps = training_cfg.get('max_steps')
-    total_steps = int(max_steps) if max_steps is not None else (
-        num_epochs * steps_per_epoch)
-    if total_steps <= 0:
-        raise ValueError('Downstream total_steps must be > 0')
-    eval_interval = int(training_cfg.get(
-        'eval_interval', training_cfg.get('val_interval', 200)))
+    # Schedule ownership belongs to the downstream request, not to inherited
+    # pretraining fields such as the source run's num_epochs=1.
+    schedule = downstream_protocol.calculate_schedule(
+        task, len(train_rows), batch_size, requested_training_cfg)
+    steps_per_epoch = schedule.steps_per_epoch
+    total_steps = schedule.total_steps
+    eval_interval = schedule.eval_interval
     log_interval = int(training_cfg.get('log_interval', 20))
+    if log_interval <= 0:
+        raise ValueError('training.log_interval must be > 0')
 
     output_root = requested_cfg.get('checkpoint_dir')
     if not output_root:
@@ -632,8 +682,11 @@ def main() -> None:
 
     header = {
         'phase_type': 'transfer',
-        'source_checkpoint': source.checkpoint_path,
+        'source_checkpoint_requested': pinned_source.requested,
+        'source_checkpoint_resolved': pinned_source.resolved,
         'source_checkpoint_step': source.step,
+        'source_checkpoint_resolved_once': 'true',
+        'task_source_policy': 'pinned_same_checkpoint',
         'model_config_source': 'checkpoint.full_config.model',
         'params_source': 'source_checkpoint.params',
         'optimizer_policy': 'fresh',
@@ -645,8 +698,14 @@ def main() -> None:
         'train_rows': len(train_rows),
         'eval_rows': len(eval_rows),
         'steps_per_epoch': steps_per_epoch,
-        'total_steps': total_steps,
+        'requested_epochs': schedule.requested_epochs,
+        'calculated_total_steps': total_steps,
+        'expected_examples_seen': schedule.expected_examples_seen,
+        'effective_epochs': schedule.effective_epochs,
+        'schedule_source': schedule.schedule_source,
+        'eval_interval': eval_interval,
         'batch_size': batch_size,
+        'global_batch_size': batch_size,
         'eval_batch_size': eval_batch_size,
         'max_seq_len': max_seq_len,
         'tokenizer': tok_name,
@@ -674,9 +733,13 @@ def main() -> None:
         params, score_step, eval_rows, eval_batch_size, max_seq_len,
         pad_token_id, data_sharding)
     best_seen_acc = initial_eval['accuracy']
+    best_seen_step = 0
     final_eval = initial_eval
+    final_eval_step = None
+    evaluated_steps = {0}
     record(
         f"[eval] task={task} kind=initial step=0 "
+        f"epoch=0.000000 "
         f"acc={initial_eval['accuracy']:.6f} "
         f"total={initial_eval['total']} best_seen_acc={best_seen_acc:.6f}")
 
@@ -730,29 +793,60 @@ def main() -> None:
                 f'real_examples={int(example_valid.sum())} '
                 f'elapsed_sec={elapsed:.1f}')
 
-        if eval_interval > 0 and phase_step % eval_interval == 0:
+        eval_reasons = downstream_protocol.evaluation_reasons(
+            phase_step, schedule)
+        if eval_reasons and phase_step not in evaluated_steps:
             final_eval = evaluate(
                 params, score_step, eval_rows, eval_batch_size, max_seq_len,
                 pad_token_id, data_sharding)
-            best_seen_acc = max(best_seen_acc, final_eval['accuracy'])
+            evaluated_steps.add(phase_step)
+            if final_eval['accuracy'] > best_seen_acc:
+                best_seen_acc = final_eval['accuracy']
+                best_seen_step = phase_step
+            if phase_step == total_steps:
+                final_eval_step = phase_step
             record(
-                f"[eval] task={task} kind=interval step={phase_step} "
+                f"[eval] task={task} kind={'+'.join(eval_reasons)} "
+                f"step={phase_step} "
+                f"epoch={phase_step / steps_per_epoch:.6f} "
                 f"acc={final_eval['accuracy']:.6f} "
                 f"total={final_eval['total']} "
-                f"best_seen_acc={best_seen_acc:.6f}")
+                f"best_seen_acc={best_seen_acc:.6f} "
+                f"best_seen_step={best_seen_step}")
 
-    final_eval = evaluate(
-        params, score_step, eval_rows, eval_batch_size, max_seq_len,
-        pad_token_id, data_sharding)
-    best_seen_acc = max(best_seen_acc, final_eval['accuracy'])
+    if final_eval_step != total_steps or total_steps not in evaluated_steps:
+        raise RuntimeError(
+            'Final downstream evaluation was not executed at total_steps')
+    result = downstream_protocol.build_result(
+        task=task,
+        source=pinned_source,
+        schedule=schedule,
+        initial_acc=initial_eval['accuracy'],
+        best_seen_acc=best_seen_acc,
+        best_seen_step=best_seen_step,
+        final_acc=final_eval['accuracy'],
+        final_step=final_eval_step,
+        eval_total=final_eval['total'])
+    result_json = json.dumps(
+        result, indent=2, ensure_ascii=False, sort_keys=True) + '\n'
+    if is_host0():
+        write_text(
+            join_path(output_root, f'{task}_result.json'),
+            result_json,
+            content_type='application/json; charset=utf-8')
+    if args.result_json:
+        write_text(args.result_json, result_json)
     record(
-        f"[eval] task={task} kind=final step={phase_step} "
+        f"[summary] task={task} source_step={source.step} "
+        f"step={phase_step} effective_epochs={schedule.effective_epochs:.6f} "
+        f"initial_acc={initial_eval['accuracy']:.6f} "
+        f"best_seen_acc={best_seen_acc:.6f} "
+        f"best_seen_step={best_seen_step} "
+        f"best_seen_epoch={best_seen_step / steps_per_epoch:.6f} "
         f"final_acc={final_eval['accuracy']:.6f} "
-        f"best_seen_acc={best_seen_acc:.6f} total={final_eval['total']}")
-    record(
-        f"[summary] task={task} step={phase_step} "
-        f"final_acc={final_eval['accuracy']:.6f} "
-        f"best_acc={best_seen_acc:.6f} total={final_eval['total']}")
+        f"final_step={final_eval_step} "
+        f"final_epoch={final_eval_step / steps_per_epoch:.6f} "
+        f"reported_acc={best_seen_acc:.6f} total={final_eval['total']}")
 
     if jax.process_count() > 1:
         completed = np.asarray([phase_step], dtype=np.int64)

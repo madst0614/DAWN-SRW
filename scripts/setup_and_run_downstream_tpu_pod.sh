@@ -53,6 +53,7 @@ echo "[2/4] Verifying downstream files..."
 test -f scripts/downstream_finetune_jax.py || { echo "missing scripts/downstream_finetune_jax.py" >&2; exit 2; }
 test -f scripts/run_downstream_sequence.sh || { echo "missing scripts/run_downstream_sequence.sh" >&2; exit 2; }
 test -f scripts/expand_downstream_suite.py || { echo "missing scripts/expand_downstream_suite.py" >&2; exit 2; }
+test -f scripts/downstream_protocol.py || { echo "missing scripts/downstream_protocol.py" >&2; exit 2; }
 RESOLVED_CONFIG_ARRAY=()
 for c in "${CONFIG_ARRAY[@]}"; do
   rc="$(resolve_config_path "$c")"

@@ -19,7 +19,6 @@ downstream_suite:
   training:
     batch_size: 64
     eval_batch_size: 64
-    num_epochs: 3
     lr: 2.0e-05
     weight_decay: 0.01
     warmup_ratio: 0.06
@@ -28,8 +27,6 @@ downstream_suite:
     aux_weight: 0.0
     tau_weight: 0.0
     log_interval: 20
-    max_steps: 800
-    eval_interval: 100
     mesh_model: 2
     mesh_data: 0
     ce_token_chunk_size: 8192
