@@ -104,6 +104,36 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
         "summary": "OPERATOR_DATASET_MANIFEST is the path contract for TPU-side operator-family experiments.",
         "requires": ("operator_datasets",),
     },
+    "operator_behavior_eval": {
+        "title": "Operator behavior evaluation",
+        "measures": "Teacher-forced full-sequence and continuation margins, accuracy, known-correct subsets, and logical-example bootstrap intervals.",
+        "summary": "OPERATOR_BEHAVIOR_EVAL runs the restored production checkpoint on every selected prepared behavior row.",
+        "requires": ("operator_datasets",),
+    },
+    "operator_function_reuse": {
+        "title": "Operator function reuse",
+        "measures": "Same-function path similarity, length-matched random null, effect, and logical-pair bootstrap interval.",
+        "summary": "OPERATOR_FUNCTION_REUSE compares reusable transition paths with cross-function controls.",
+        "requires": ("operator_datasets",),
+    },
+    "operator_route_specificity": {
+        "title": "Operator route specificity",
+        "measures": "Within-group and between-group routing/transition overlap, captured mass, specificity gap, and enriched operators.",
+        "summary": "OPERATOR_ROUTE_SPECIFICITY reports only captured-mass-qualified route evidence.",
+        "requires": ("operator_datasets",),
+    },
+    "operator_causal_specificity": {
+        "title": "Operator causal specificity",
+        "measures": "Task-margin drop for selected, matched-active, active-random, inactive-random, and cross-function strategies.",
+        "summary": "OPERATOR_CAUSAL_SPECIFICITY uses production contribution subtraction and blocks on zero-vector parity.",
+        "requires": ("operator_datasets",),
+    },
+    "operator_analysis_summary": {
+        "title": "Operator analysis summary",
+        "measures": "Behavior competence, function reuse, route specificity, causal specificity, validity, and limitations.",
+        "summary": "OPERATOR_ANALYSIS_SUMMARY is the artifact-backed cross-dataset result.",
+        "requires": ("operator_datasets",),
+    },
     "ravel_operator_disentanglement": {
         "title": "RAVEL operator disentanglement",
         "measures": "attribute-specific gate signatures, same-attribute overlap, and cross-attribute causal drops.",
@@ -160,8 +190,8 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
     },
     "causal_intervention": {
         "title": "v4171 canonical causal intervention",
-        "measures": "target-token/layer/pool top-contribution, top-gate, active/inactive random, and matched-control ablations with CE, log-prob, KL, prediction, and residual effects.",
-        "summary": "CAUSAL_INTERVENTION masks execution only while preserving the canonical unpruned admission denominator.",
+        "measures": "target-token/layer/pool top-contribution, top-gate, active/inactive random, and matched-active contribution subtraction with CE, log-prob, KL, prediction, and residual effects.",
+        "summary": "CAUSAL_INTERVENTION subtracts a selected post-denominator production contribution and blocks on exact zero-vector parity.",
         "requires": ("v4171_transition",),
     },
     "decision_reason": {
@@ -218,6 +248,7 @@ V4171_SELF_ORGANIZATION_ITEMS = (
 V4171_ITEMS = tuple(
     item for item in TRAIN_ANALYSIS_ITEM_DEFS
     if item not in V4171_SELF_ORGANIZATION_ITEMS
+    and item not in OPERATOR_ANALYSIS_ITEM_IDS
 )
 
 TRAIN_ANALYSIS_PRESETS = {
@@ -241,6 +272,10 @@ TRAIN_ANALYSIS_PRESETS = {
     "sample": ("target_ratio", "generation_samples", "decision_reason"),
     "operator_datasets": ("operator_dataset_manifest",),
     "operator_analysis": OPERATOR_ANALYSIS_ITEM_IDS,
+    "v4171_operator_monitor": tuple(dict.fromkeys(
+        V4171_SELF_ORGANIZATION_ITEMS + OPERATOR_ANALYSIS_ITEM_IDS)),
+    "v4171_complete": tuple(dict.fromkeys(
+        V4171_ITEMS + V4171_SELF_ORGANIZATION_ITEMS + OPERATOR_ANALYSIS_ITEM_IDS)),
     "v4166_1b": V4166_1B_ITEMS,
     "v4171": V4171_ITEMS,
     "v4171_self_organization": V4171_SELF_ORGANIZATION_ITEMS,
@@ -793,34 +828,32 @@ def _item_lines_generation_samples(summary: Dict[str, Any], fmt: TrainAnalysisFo
 
 
 def _operator_dataset_block(summary: Dict[str, Any], dataset_id: str) -> List[str]:
-    datasets = summary.get("operator_analysis_datasets", {})
-    root = datasets.get("root", "n/a")
-    manifest = datasets.get("manifest", "n/a")
-    rows = datasets.get("datasets", {})
-    spec = rows.get(dataset_id, {})
+    analysis = summary.get("operator_analysis", {})
+    spec = (analysis.get("datasets") or {}).get(dataset_id, {})
     if not spec:
         return [
-            f"  dataset_root : {root}",
-            f"  manifest     : {manifest}",
-            f"  dataset      : {dataset_id} missing from configured registry",
+            f"  dataset      : {dataset_id}",
+            "  status       : missing_dataset",
         ]
-    artifacts = spec.get("artifacts", {})
-    expected = spec.get("expected", {})
+    behavior = spec.get("behavior", {})
+    route = spec.get("route", {})
+    causal = spec.get("causal", {})
     out = [
-        f"  dataset_root : {root}",
-        f"  manifest     : {manifest}",
         f"  dataset      : {dataset_id}",
-        f"  title        : {spec.get('title', 'n/a')}",
-        f"  task_variable: {spec.get('task_variable', 'n/a')}",
-        f"  metric       : {spec.get('behavior_metric', 'n/a')}",
-        f"  operator_q   : {spec.get('operator_question', 'n/a')}",
-        f"  root         : {spec.get('root', 'n/a')}",
+        f"  status       : {spec.get('status', 'missing')}",
+        ("  behavior     : "
+         f"n={behavior.get('n', 0)} accuracy={behavior.get('accuracy')} "
+         f"margin={behavior.get('mean_margin')} known={behavior.get('known_correct', 0)}"),
+        ("  route        : "
+         f"actual={route.get('actual_path_similarity')} "
+         f"null={route.get('random_null_path_similarity')} "
+         f"effect={route.get('effect_vs_null')} captured={route.get('captured_mass_mean')}"),
+        ("  causal       : "
+         f"jobs={causal.get('jobs', 0)} skipped={causal.get('skipped_jobs', 0)} "
+         f"effect={causal.get('selected_minus_control_effect')} "
+         f"parity={(causal.get('causal_parity') or {}).get('machine_exact')}"),
     ]
-    if expected:
-        out.append(
-            "  expected     : "
-            + " ".join(f"{key}={value}" for key, value in sorted(expected.items()))
-        )
+    artifacts = spec.get("artifacts", {})
     if artifacts:
         out.append("  artifacts:")
         for name, path in sorted(artifacts.items()):
@@ -829,18 +862,34 @@ def _operator_dataset_block(summary: Dict[str, Any], dataset_id: str) -> List[st
 
 
 def _item_lines_operator_dataset_manifest(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
-    datasets = summary.get("operator_analysis_datasets", {})
+    datasets = summary.get("operator_analysis", {}).get("dataset_manifest", {})
     rows = datasets.get("datasets", {})
     out = [
         "  OPERATOR_DATASET_MANIFEST:",
         f"  root     : {datasets.get('root', 'n/a')}",
         f"  manifest : {datasets.get('manifest', 'n/a')}",
-        f"  prepare  : {datasets.get('prepare_command', 'n/a')}",
-        "  id          root",
+        f"  status   : {datasets.get('status', 'missing')}",
+        f"  build_id : {datasets.get('build_id', 'n/a')}",
+        f"  schema   : {datasets.get('schema', 'n/a')} v{datasets.get('schema_version', 'n/a')}",
+        "  id          rows shards checksummed",
     ]
     for dataset_id in OPERATOR_DATASET_SPECS:
         row = rows.get(dataset_id, {})
-        out.append(f"  {dataset_id:<11} {row.get('root', 'n/a')}")
+        out.append(
+            f"  {dataset_id:<11} {str(row.get('rows', 'n/a')):<6} "
+            f"{str(row.get('shards', 'n/a')):<6} {row.get('checksummed_shards', 'n/a')}")
+    return out
+
+
+def _item_lines_operator_cross(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
+    analysis = summary.get("operator_analysis", {})
+    out = [
+        "  OPERATOR_ANALYSIS:",
+        f"  status={analysis.get('status', 'missing')} profile={analysis.get('profile', 'n/a')}",
+        f"  build={analysis.get('build_id', 'n/a')} config={analysis.get('config_hash', 'n/a')}",
+    ]
+    for dataset in sorted((analysis.get("datasets") or {})):
+        out.extend(_operator_dataset_block(summary, dataset)[1:4])
     return out
 
 
@@ -983,13 +1032,16 @@ def _item_lines_state_transition_decoupling(summary: Dict[str, Any], fmt: TrainA
 
 def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
     data = _v4171_item(summary, "causal_intervention")
-    selected = data.get("selected_abs_target_logprob_delta", {})
-    control = data.get("control_abs_target_logprob_delta", {})
-    diagnostic = data.get(
+    selected = data.get(
+        "selected_behavior_score_drop",
+        data.get("selected_abs_target_logprob_delta", {}))
+    control = data.get(
+        "control_behavior_score_drop",
+        data.get("control_abs_target_logprob_delta", {}))
+    diagnostic = data.get("zero_subtraction_parity") or data.get(
         "intervention_forward_cross_graph_diagnostic",
         data.get("intervention_forward_parity", {}),
     )
-    zero_mask = data.get("zero_mask_kernel_control", {})
     out = [
         "  CAUSAL_INTERVENTION:",
         f"  status          : {data.get('status', 'missing')}",
@@ -1002,7 +1054,6 @@ def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisF
         f"  diagnostic      : status={diagnostic.get('status', 'missing')} blocking={diagnostic.get('blocking', 'legacy')} threshold_passed={diagnostic.get('threshold_passed', 'n/a')}",
         f"  diagnostic CE/logit: ce={fmt.num(diagnostic.get('ce_abs_diff'), 6)} mean={fmt.num(diagnostic.get('mean_logit_abs_diff'), 6)} max={fmt.num(diagnostic.get('max_logit_abs_diff'), 6)}",
         f"  diagnostic top1/res: top1={fmt.num(diagnostic.get('top1_agreement'), 6)} residual_cos={fmt.num(diagnostic.get('final_residual_cosine'), 8)}",
-        f"  zero-mask control: n={zero_mask.get('n', 0)} mean_logit_max={fmt.num(zero_mask.get('mean_logit_abs_diff_max'), 6)} residual_cos_min={fmt.num(zero_mask.get('final_residual_cosine_min'), 8)}",
         f"  selected effect : mean={fmt.num(selected.get('mean'), 5)} ci95={selected.get('ci95')} n={selected.get('n', 0)}",
         f"  control effect  : mean={fmt.num(control.get('mean'), 5)} ci95={control.get('ci95')} n={control.get('n', 0)}",
         f"  selected-control: {fmt.delta(data.get('selected_minus_control_effect'), 5)}",
@@ -1038,6 +1089,11 @@ TRAIN_ANALYSIS_ITEM_FORMATTERS = {
     "prompt_decision": _item_lines_prompt_decision,
     "generation_samples": _item_lines_generation_samples,
     "operator_dataset_manifest": _item_lines_operator_dataset_manifest,
+    "operator_behavior_eval": _item_lines_operator_cross,
+    "operator_function_reuse": _item_lines_operator_cross,
+    "operator_route_specificity": _item_lines_operator_cross,
+    "operator_causal_specificity": _item_lines_operator_cross,
+    "operator_analysis_summary": _item_lines_operator_cross,
     "ravel_operator_disentanglement": _item_lines_ravel_operator_disentanglement,
     "ioi_operator_circuit": _item_lines_ioi_operator_circuit,
     "blimp_operator_grammar": _item_lines_blimp_operator_grammar,
@@ -1126,19 +1182,14 @@ def item_status(summary: Dict[str, Any], item: str) -> str:
     if item in V4171_SELF_ORGANIZATION_ITEMS:
         data = (summary.get("v4171_transition_analysis") or {}).get(item, {})
         return str(data.get("status") or "missing")
-    if item == "operator_dataset_manifest":
-        datasets = summary.get("operator_analysis_datasets", {})
-        return "ready" if datasets.get("manifest") and datasets.get("datasets") else "missing"
     if item in OPERATOR_ANALYSIS_ITEM_IDS:
-        dataset_key = {
-            "ravel_operator_disentanglement": "ravel",
-            "ioi_operator_circuit": "ioi",
-            "blimp_operator_grammar": "blimp",
-            "lama_counterfact_factual_recall": "lama",
-            "synthetic_binding_sanity": "synthetic",
-        }.get(item)
-        datasets = summary.get("operator_analysis_datasets", {}).get("datasets", {})
-        return "ready" if dataset_key in datasets else "missing"
+        result = (summary.get("operator_analysis", {}).get("items", {}) or {}).get(item, {})
+        status = str(result.get("status") or "missing_dataset")
+        allowed = {
+            "ready", "partial", "insufficient_evidence", "missing_dataset",
+            "failed", "unsupported",
+        }
+        return status if status in allowed else "failed"
     if item == "decision_reason":
         return "ready" if summary.get("decision") else "missing"
     return "unknown"

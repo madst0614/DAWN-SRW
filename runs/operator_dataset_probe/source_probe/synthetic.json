@@ -1,0 +1,995 @@
+{
+  "adapter_risks": [],
+  "dataset": "synthetic",
+  "downloaded_files": [],
+  "nested_key_paths": [
+    "attribute",
+    "context_a",
+    "context_b",
+    "controlled_change",
+    "correct_value",
+    "distractor_value",
+    "entity",
+    "family",
+    "negative_a",
+    "negative_b",
+    "pair_id",
+    "paired_entity",
+    "positive_a",
+    "positive_b"
+  ],
+  "observed_columns": [
+    "answer",
+    "attribute",
+    "entity",
+    "id",
+    "prompt",
+    "target_position",
+    "task_variable"
+  ],
+  "observed_files": [
+    "generated in memory"
+  ],
+  "observed_schema": {
+    "current": {
+      "answer": "str",
+      "attribute": "str",
+      "entity": "str",
+      "id": "str",
+      "prompt": "str",
+      "target_position": "str",
+      "task_variable": "str"
+    },
+    "pair_candidate": {
+      "attribute": "str",
+      "context_a": "str",
+      "context_b": "str",
+      "controlled_change": "str",
+      "correct_value": "str",
+      "distractor_value": "str",
+      "entity": "str",
+      "family": "str",
+      "negative_a": "str",
+      "negative_b": "str",
+      "pair_id": "str",
+      "paired_entity": "str",
+      "positive_a": "str",
+      "positive_b": "str"
+    }
+  },
+  "observed_splits": [
+    "generated"
+  ],
+  "pair_family_examples": [
+    {
+      "attribute": "color",
+      "context_a": "Carol is red. Frank is white. The color of Carol is",
+      "context_b": "Bob is red. Frank is white. The color of Bob is",
+      "controlled_change": "same_operation_different_entity",
+      "correct_value": "red",
+      "distractor_value": "white",
+      "entity": "Carol",
+      "family": "same_operation_different_entity",
+      "negative_a": "white",
+      "negative_b": "white",
+      "pair_id": "synthetic-pair-00",
+      "paired_entity": "Frank",
+      "positive_a": "red",
+      "positive_b": "red"
+    },
+    {
+      "attribute": "color_to_key",
+      "context_a": "Eve is blue. Carol is white. The color of Eve is",
+      "context_b": "Eve has key_07. Carol has key_02. Eve's key is",
+      "controlled_change": "same_entity_different_attribute",
+      "correct_value": "blue",
+      "distractor_value": "white",
+      "entity": "Eve",
+      "family": "same_entity_different_attribute",
+      "negative_a": "white",
+      "negative_b": "key_02",
+      "pair_id": "synthetic-pair-01",
+      "paired_entity": "Carol",
+      "positive_a": "blue",
+      "positive_b": "key_07"
+    },
+    {
+      "attribute": "color",
+      "context_a": "Frank is white. Grace is black. The color of Frank is",
+      "context_b": "Frank is orange. Grace is black. The color of Frank is",
+      "controlled_change": "attribute_swap",
+      "correct_value": "white",
+      "distractor_value": "black",
+      "entity": "Frank",
+      "family": "attribute_swap",
+      "negative_a": "black",
+      "negative_b": "black",
+      "pair_id": "synthetic-pair-02",
+      "paired_entity": "Grace",
+      "positive_a": "white",
+      "positive_b": "orange"
+    },
+    {
+      "attribute": "color",
+      "context_a": "Bob is purple. Carol is black. The color of Bob is",
+      "context_b": "Bob is purple. Carol is black. The color of Carol is",
+      "controlled_change": "entity_swap",
+      "correct_value": "purple",
+      "distractor_value": "black",
+      "entity": "Bob",
+      "family": "entity_swap",
+      "negative_a": "black",
+      "negative_b": "purple",
+      "pair_id": "synthetic-pair-03",
+      "paired_entity": "Carol",
+      "positive_a": "purple",
+      "positive_b": "black"
+    },
+    {
+      "attribute": "color",
+      "context_a": "Frank is black. Carol is purple. The color of Frank is",
+      "context_b": "Frank is black. Carol is red. The color of Frank is",
+      "controlled_change": "distractor_swap",
+      "correct_value": "black",
+      "distractor_value": "purple",
+      "entity": "Frank",
+      "family": "distractor_swap",
+      "negative_a": "purple",
+      "negative_b": "red",
+      "pair_id": "synthetic-pair-04",
+      "paired_entity": "Carol",
+      "positive_a": "black",
+      "positive_b": "black"
+    },
+    {
+      "attribute": "color",
+      "context_a": "Frank is green. Carol is yellow. The color of Frank is",
+      "context_b": "Carol is yellow. Frank is green. The color of Frank is",
+      "controlled_change": "order_permutation",
+      "correct_value": "green",
+      "distractor_value": "yellow",
+      "entity": "Frank",
+      "family": "order_permutation",
+      "negative_a": "yellow",
+      "negative_b": "yellow",
+      "pair_id": "synthetic-pair-05",
+      "paired_entity": "Carol",
+      "positive_a": "green",
+      "positive_b": "green"
+    },
+    {
+      "attribute": "color",
+      "context_a": "Grace is orange. Bob is blue. The color of Grace is",
+      "context_b": "Grace is orange. Bob is blue. Dave is black. The color of Grace is",
+      "controlled_change": "irrelevant_fact_addition",
+      "correct_value": "orange",
+      "distractor_value": "blue",
+      "entity": "Grace",
+      "family": "irrelevant_fact_addition",
+      "negative_a": "blue",
+      "negative_b": "blue",
+      "pair_id": "synthetic-pair-06",
+      "paired_entity": "Bob",
+      "positive_a": "orange",
+      "positive_b": "orange"
+    }
+  ],
+  "prepared_sample_count": 5,
+  "proposed_pair_types": [
+    "same_operation_different_entity",
+    "same_entity_different_attribute",
+    "attribute_swap",
+    "entity_swap",
+    "distractor_swap",
+    "order_permutation",
+    "irrelevant_fact_addition"
+  ],
+  "proposed_score_mode": "continuation_margin",
+  "proposed_trace_semantics": "last_context_token_prediction_state",
+  "raw_samples": [
+    {
+      "answer": "yellow",
+      "answer_token_ids": [
+        3756
+      ],
+      "attribute": "color",
+      "distractor_probe": "red",
+      "distractor_token_ids": [
+        2417
+      ],
+      "entity": "Frank",
+      "id": "synthetic-000000",
+      "prompt": "Frank is yellow. Alice is blue. Eve is red. The color of Frank is",
+      "target_position": "final_prediction_token",
+      "task_variable": "entity_attribute_binding"
+    },
+    {
+      "answer": "key_04",
+      "answer_token_ids": [
+        3145,
+        1035,
+        5840
+      ],
+      "attribute": "key",
+      "distractor_probe": "key_01",
+      "distractor_token_ids": [
+        3145,
+        1035,
+        5890
+      ],
+      "entity": "Grace",
+      "id": "synthetic-000001",
+      "prompt": "Heidi has key_02. Grace has key_04. Dave has key_03. Grace's key is",
+      "target_position": "final_prediction_token",
+      "task_variable": "entity_attribute_binding"
+    },
+    {
+      "answer": "purple",
+      "answer_token_ids": [
+        6379
+      ],
+      "attribute": "color",
+      "distractor_probe": "red",
+      "distractor_token_ids": [
+        2417
+      ],
+      "entity": "Grace",
+      "id": "synthetic-000002",
+      "prompt": "Frank is yellow. Dave is orange. Grace is purple. The color of Grace is",
+      "target_position": "final_prediction_token",
+      "task_variable": "entity_attribute_binding"
+    },
+    {
+      "answer": "key_07",
+      "answer_token_ids": [
+        3145,
+        1035,
+        5718
+      ],
+      "attribute": "key",
+      "distractor_probe": "key_01",
+      "distractor_token_ids": [
+        3145,
+        1035,
+        5890
+      ],
+      "entity": "Dave",
+      "id": "synthetic-000003",
+      "prompt": "Dave has key_07. Eve has key_05. Carol has key_02. Dave's key is",
+      "target_position": "final_prediction_token",
+      "task_variable": "entity_attribute_binding"
+    },
+    {
+      "answer": "purple",
+      "answer_token_ids": [
+        6379
+      ],
+      "attribute": "color",
+      "distractor_probe": "red",
+      "distractor_token_ids": [
+        2417
+      ],
+      "entity": "Eve",
+      "id": "synthetic-000004",
+      "prompt": "Alice is blue. Eve is purple. Heidi is white. The color of Eve is",
+      "target_position": "final_prediction_token",
+      "task_variable": "entity_attribute_binding"
+    },
+    {
+      "answer": "key_03",
+      "answer_token_ids": [
+        3145,
+        1035,
+        6021
+      ],
+      "attribute": "key",
+      "distractor_probe": "key_01",
+      "distractor_token_ids": [
+        3145,
+        1035,
+        5890
+      ],
+      "entity": "Heidi",
+      "id": "synthetic-000005",
+      "prompt": "Carol has key_01. Eve has key_05. Heidi has key_03. Heidi's key is",
+      "target_position": "final_prediction_token",
+      "task_variable": "entity_attribute_binding"
+    },
+    {
+      "answer": "black",
+      "answer_token_ids": [
+        2304
+      ],
+      "attribute": "color",
+      "distractor_probe": "red",
+      "distractor_token_ids": [
+        2417
+      ],
+      "entity": "Carol",
+      "id": "synthetic-000006",
+      "prompt": "Carol is black. Dave is red. Bob is purple. The color of Carol is",
+      "target_position": "final_prediction_token",
+      "task_variable": "entity_attribute_binding"
+    },
+    {
+      "answer": "key_01",
+      "answer_token_ids": [
+        3145,
+        1035,
+        5890
+      ],
+      "attribute": "key",
+      "distractor_probe": "key_02",
+      "distractor_token_ids": [
+        3145,
+        1035,
+        6185
+      ],
+      "entity": "Bob",
+      "id": "synthetic-000007",
+      "prompt": "Alice has key_08. Bob has key_01. Dave has key_02. Bob's key is",
+      "target_position": "final_prediction_token",
+      "task_variable": "entity_attribute_binding"
+    },
+    {
+      "answer": "yellow",
+      "answer_token_ids": [
+        3756
+      ],
+      "attribute": "color",
+      "distractor_probe": "red",
+      "distractor_token_ids": [
+        2417
+      ],
+      "entity": "Eve",
+      "id": "synthetic-000008",
+      "prompt": "Heidi is red. Bob is purple. Eve is yellow. The color of Eve is",
+      "target_position": "final_prediction_token",
+      "task_variable": "entity_attribute_binding"
+    },
+    {
+      "answer": "key_05",
+      "answer_token_ids": [
+        3145,
+        1035,
+        5709
+      ],
+      "attribute": "key",
+      "distractor_probe": "key_01",
+      "distractor_token_ids": [
+        3145,
+        1035,
+        5890
+      ],
+      "entity": "Bob",
+      "id": "synthetic-000009",
+      "prompt": "Bob has key_05. Heidi has key_08. Carol has key_01. Bob's key is",
+      "target_position": "final_prediction_token",
+      "task_variable": "entity_attribute_binding"
+    }
+  ],
+  "recommended_mapping": {
+    "context_ids_a/b": "controlled pair prompts",
+    "extension": "entity, paired_entity, attribute, controlled_change",
+    "group_id/phenomenon": "pair family",
+    "negative_ids_a/b": "same-attribute-domain matched distractor",
+    "positive_ids_a/b": "condition-specific correct value"
+  },
+  "row_count": {
+    "current_generated_probe": 10,
+    "pair_family_probe": 7
+  },
+  "source": {
+    "generator": "scripts.prepare_v4166_operator_datasets.generate_synthetic_rows"
+  },
+  "source_issues": [
+    "Current generator has independent rows and no distractor, pair_id, family, or controlled_change."
+  ],
+  "status": "ready_for_adapter",
+  "tokenization_samples": [
+    {
+      "token_ids": [
+        3145,
+        1035,
+        5890
+      ],
+      "tokens": [
+        "key",
+        "_",
+        "01"
+      ],
+      "value": "key_01"
+    },
+    {
+      "token_ids": [
+        3145,
+        1035,
+        6185
+      ],
+      "tokens": [
+        "key",
+        "_",
+        "02"
+      ],
+      "value": "key_02"
+    },
+    {
+      "token_ids": [
+        3145,
+        1035,
+        6021
+      ],
+      "tokens": [
+        "key",
+        "_",
+        "03"
+      ],
+      "value": "key_03"
+    },
+    {
+      "token_ids": [
+        3145,
+        1035,
+        5840
+      ],
+      "tokens": [
+        "key",
+        "_",
+        "04"
+      ],
+      "value": "key_04"
+    },
+    {
+      "token_ids": [
+        3145,
+        1035,
+        5709
+      ],
+      "tokens": [
+        "key",
+        "_",
+        "05"
+      ],
+      "value": "key_05"
+    },
+    {
+      "token_ids": [
+        3145,
+        1035,
+        5757
+      ],
+      "tokens": [
+        "key",
+        "_",
+        "06"
+      ],
+      "value": "key_06"
+    },
+    {
+      "token_ids": [
+        3145,
+        1035,
+        5718
+      ],
+      "tokens": [
+        "key",
+        "_",
+        "07"
+      ],
+      "value": "key_07"
+    },
+    {
+      "token_ids": [
+        3145,
+        1035,
+        5511
+      ],
+      "tokens": [
+        "key",
+        "_",
+        "08"
+      ],
+      "value": "key_08"
+    },
+    {
+      "token_ids": [
+        2417
+      ],
+      "tokens": [
+        "red"
+      ],
+      "value": "red"
+    },
+    {
+      "token_ids": [
+        2630
+      ],
+      "tokens": [
+        "blue"
+      ],
+      "value": "blue"
+    },
+    {
+      "token_ids": [
+        2665
+      ],
+      "tokens": [
+        "green"
+      ],
+      "value": "green"
+    },
+    {
+      "token_ids": [
+        3756
+      ],
+      "tokens": [
+        "yellow"
+      ],
+      "value": "yellow"
+    },
+    {
+      "token_ids": [
+        6379
+      ],
+      "tokens": [
+        "purple"
+      ],
+      "value": "purple"
+    },
+    {
+      "token_ids": [
+        2317
+      ],
+      "tokens": [
+        "white"
+      ],
+      "value": "white"
+    },
+    {
+      "token_ids": [
+        2304
+      ],
+      "tokens": [
+        "black"
+      ],
+      "value": "black"
+    },
+    {
+      "token_ids": [
+        4589
+      ],
+      "tokens": [
+        "orange"
+      ],
+      "value": "orange"
+    },
+    {
+      "context_a_decoded": "carol is red. frank is white. the color of carol is",
+      "context_a_tokens": [
+        8594,
+        2003,
+        2417,
+        1012,
+        3581,
+        2003,
+        2317,
+        1012,
+        1996,
+        3609,
+        1997,
+        8594,
+        2003
+      ],
+      "context_b_decoded": "bob is red. frank is white. the color of bob is",
+      "context_b_tokens": [
+        3960,
+        2003,
+        2417,
+        1012,
+        3581,
+        2003,
+        2317,
+        1012,
+        1996,
+        3609,
+        1997,
+        3960,
+        2003
+      ],
+      "dataset": "synthetic",
+      "example_id": "synthetic-00000",
+      "extension": {
+        "attribute": "color",
+        "controlled_change": "same_operation_different_entity",
+        "correct_value": "red",
+        "distractor_value": "white",
+        "entity": "Carol",
+        "family": "same_operation_different_entity",
+        "pair_id": "synthetic-pair-00",
+        "paired_entity": "Frank"
+      },
+      "group_id": "same_operation_different_entity",
+      "negative_a_tokens": [
+        2317
+      ],
+      "negative_b_tokens": [
+        2317
+      ],
+      "negative_text_a": "white",
+      "negative_text_b": "white",
+      "pair_id": "synthetic-pair-00",
+      "phenomenon": "same_operation_different_entity",
+      "positive_a_tokens": [
+        2417
+      ],
+      "positive_b_tokens": [
+        2417
+      ],
+      "positive_text_a": "red",
+      "positive_text_b": "red",
+      "relation": "same_operation_different_entity",
+      "score_mode": "continuation_margin",
+      "source_id": "synthetic-pair-00",
+      "split": "generated",
+      "teacher_forced_candidate_span_a": [
+        13,
+        14
+      ],
+      "teacher_forced_candidate_span_b": [
+        13,
+        14
+      ],
+      "text_a": "Carol is red. Frank is white. The color of Carol is",
+      "text_b": "Bob is red. Frank is white. The color of Bob is",
+      "trace_details": {},
+      "trace_semantics": "last_context_token_prediction_state",
+      "trace_token_a": "is",
+      "trace_token_b": "is",
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "eve is blue. carol is white. the color of eve is",
+      "context_a_tokens": [
+        6574,
+        2003,
+        2630,
+        1012,
+        8594,
+        2003,
+        2317,
+        1012,
+        1996,
+        3609,
+        1997,
+        6574,
+        2003
+      ],
+      "context_b_decoded": "eve has key _ 07. carol has key _ 02. eve ' s key is",
+      "context_b_tokens": [
+        6574,
+        2038,
+        3145,
+        1035,
+        5718,
+        1012,
+        8594,
+        2038,
+        3145,
+        1035,
+        6185,
+        1012,
+        6574,
+        1005,
+        1055,
+        3145,
+        2003
+      ],
+      "dataset": "synthetic",
+      "example_id": "synthetic-00001",
+      "extension": {
+        "attribute": "color_to_key",
+        "controlled_change": "same_entity_different_attribute",
+        "correct_value": "blue",
+        "distractor_value": "white",
+        "entity": "Eve",
+        "family": "same_entity_different_attribute",
+        "pair_id": "synthetic-pair-01",
+        "paired_entity": "Carol"
+      },
+      "group_id": "same_entity_different_attribute",
+      "negative_a_tokens": [
+        2317
+      ],
+      "negative_b_tokens": [
+        3145,
+        1035,
+        6185
+      ],
+      "negative_text_a": "white",
+      "negative_text_b": "key_02",
+      "pair_id": "synthetic-pair-01",
+      "phenomenon": "same_entity_different_attribute",
+      "positive_a_tokens": [
+        2630
+      ],
+      "positive_b_tokens": [
+        3145,
+        1035,
+        5718
+      ],
+      "positive_text_a": "blue",
+      "positive_text_b": "key_07",
+      "relation": "same_entity_different_attribute",
+      "score_mode": "continuation_margin",
+      "source_id": "synthetic-pair-01",
+      "split": "generated",
+      "teacher_forced_candidate_span_a": [
+        13,
+        14
+      ],
+      "teacher_forced_candidate_span_b": [
+        17,
+        20
+      ],
+      "text_a": "Eve is blue. Carol is white. The color of Eve is",
+      "text_b": "Eve has key_07. Carol has key_02. Eve's key is",
+      "trace_details": {},
+      "trace_semantics": "last_context_token_prediction_state",
+      "trace_token_a": "is",
+      "trace_token_b": "is",
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "frank is white. grace is black. the color of frank is",
+      "context_a_tokens": [
+        3581,
+        2003,
+        2317,
+        1012,
+        4519,
+        2003,
+        2304,
+        1012,
+        1996,
+        3609,
+        1997,
+        3581,
+        2003
+      ],
+      "context_b_decoded": "frank is orange. grace is black. the color of frank is",
+      "context_b_tokens": [
+        3581,
+        2003,
+        4589,
+        1012,
+        4519,
+        2003,
+        2304,
+        1012,
+        1996,
+        3609,
+        1997,
+        3581,
+        2003
+      ],
+      "dataset": "synthetic",
+      "example_id": "synthetic-00002",
+      "extension": {
+        "attribute": "color",
+        "controlled_change": "attribute_swap",
+        "correct_value": "white",
+        "distractor_value": "black",
+        "entity": "Frank",
+        "family": "attribute_swap",
+        "pair_id": "synthetic-pair-02",
+        "paired_entity": "Grace"
+      },
+      "group_id": "attribute_swap",
+      "negative_a_tokens": [
+        2304
+      ],
+      "negative_b_tokens": [
+        2304
+      ],
+      "negative_text_a": "black",
+      "negative_text_b": "black",
+      "pair_id": "synthetic-pair-02",
+      "phenomenon": "attribute_swap",
+      "positive_a_tokens": [
+        2317
+      ],
+      "positive_b_tokens": [
+        4589
+      ],
+      "positive_text_a": "white",
+      "positive_text_b": "orange",
+      "relation": "attribute_swap",
+      "score_mode": "continuation_margin",
+      "source_id": "synthetic-pair-02",
+      "split": "generated",
+      "teacher_forced_candidate_span_a": [
+        13,
+        14
+      ],
+      "teacher_forced_candidate_span_b": [
+        13,
+        14
+      ],
+      "text_a": "Frank is white. Grace is black. The color of Frank is",
+      "text_b": "Frank is orange. Grace is black. The color of Frank is",
+      "trace_details": {},
+      "trace_semantics": "last_context_token_prediction_state",
+      "trace_token_a": "is",
+      "trace_token_b": "is",
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "bob is purple. carol is black. the color of bob is",
+      "context_a_tokens": [
+        3960,
+        2003,
+        6379,
+        1012,
+        8594,
+        2003,
+        2304,
+        1012,
+        1996,
+        3609,
+        1997,
+        3960,
+        2003
+      ],
+      "context_b_decoded": "bob is purple. carol is black. the color of carol is",
+      "context_b_tokens": [
+        3960,
+        2003,
+        6379,
+        1012,
+        8594,
+        2003,
+        2304,
+        1012,
+        1996,
+        3609,
+        1997,
+        8594,
+        2003
+      ],
+      "dataset": "synthetic",
+      "example_id": "synthetic-00003",
+      "extension": {
+        "attribute": "color",
+        "controlled_change": "entity_swap",
+        "correct_value": "purple",
+        "distractor_value": "black",
+        "entity": "Bob",
+        "family": "entity_swap",
+        "pair_id": "synthetic-pair-03",
+        "paired_entity": "Carol"
+      },
+      "group_id": "entity_swap",
+      "negative_a_tokens": [
+        2304
+      ],
+      "negative_b_tokens": [
+        6379
+      ],
+      "negative_text_a": "black",
+      "negative_text_b": "purple",
+      "pair_id": "synthetic-pair-03",
+      "phenomenon": "entity_swap",
+      "positive_a_tokens": [
+        6379
+      ],
+      "positive_b_tokens": [
+        2304
+      ],
+      "positive_text_a": "purple",
+      "positive_text_b": "black",
+      "relation": "entity_swap",
+      "score_mode": "continuation_margin",
+      "source_id": "synthetic-pair-03",
+      "split": "generated",
+      "teacher_forced_candidate_span_a": [
+        13,
+        14
+      ],
+      "teacher_forced_candidate_span_b": [
+        13,
+        14
+      ],
+      "text_a": "Bob is purple. Carol is black. The color of Bob is",
+      "text_b": "Bob is purple. Carol is black. The color of Carol is",
+      "trace_details": {},
+      "trace_semantics": "last_context_token_prediction_state",
+      "trace_token_a": "is",
+      "trace_token_b": "is",
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "frank is black. carol is purple. the color of frank is",
+      "context_a_tokens": [
+        3581,
+        2003,
+        2304,
+        1012,
+        8594,
+        2003,
+        6379,
+        1012,
+        1996,
+        3609,
+        1997,
+        3581,
+        2003
+      ],
+      "context_b_decoded": "frank is black. carol is red. the color of frank is",
+      "context_b_tokens": [
+        3581,
+        2003,
+        2304,
+        1012,
+        8594,
+        2003,
+        2417,
+        1012,
+        1996,
+        3609,
+        1997,
+        3581,
+        2003
+      ],
+      "dataset": "synthetic",
+      "example_id": "synthetic-00004",
+      "extension": {
+        "attribute": "color",
+        "controlled_change": "distractor_swap",
+        "correct_value": "black",
+        "distractor_value": "purple",
+        "entity": "Frank",
+        "family": "distractor_swap",
+        "pair_id": "synthetic-pair-04",
+        "paired_entity": "Carol"
+      },
+      "group_id": "distractor_swap",
+      "negative_a_tokens": [
+        6379
+      ],
+      "negative_b_tokens": [
+        2417
+      ],
+      "negative_text_a": "purple",
+      "negative_text_b": "red",
+      "pair_id": "synthetic-pair-04",
+      "phenomenon": "distractor_swap",
+      "positive_a_tokens": [
+        2304
+      ],
+      "positive_b_tokens": [
+        2304
+      ],
+      "positive_text_a": "black",
+      "positive_text_b": "black",
+      "relation": "distractor_swap",
+      "score_mode": "continuation_margin",
+      "source_id": "synthetic-pair-04",
+      "split": "generated",
+      "teacher_forced_candidate_span_a": [
+        13,
+        14
+      ],
+      "teacher_forced_candidate_span_b": [
+        13,
+        14
+      ],
+      "text_a": "Frank is black. Carol is purple. The color of Frank is",
+      "text_b": "Frank is black. Carol is red. The color of Frank is",
+      "trace_details": {},
+      "trace_semantics": "last_context_token_prediction_state",
+      "trace_token_a": "is",
+      "trace_token_b": "is",
+      "validation_errors": []
+    }
+  ]
+}

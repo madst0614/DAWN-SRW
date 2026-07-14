@@ -395,7 +395,9 @@ def run_usage_stage(ctx: AnalysisContext) -> Dict[str, Any]:
     max_parts = len(loader)
     if args.max_jobs_per_stage is not None:
         max_parts = min(max_parts, int(args.max_jobs_per_stage))
-    trace_fn = jax.jit(lambda p, x: topk_trace_forward(p, ctx.model_cfg, x, topk=topk))
+    trace_fn = jax.jit(lambda p, x: topk_trace_forward(
+        p, ctx.model_cfg, x, topk=topk,
+        production_srw_fns=ctx.sharded_fns))
 
     store.log_event(
         stage,

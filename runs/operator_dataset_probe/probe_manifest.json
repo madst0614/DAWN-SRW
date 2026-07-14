@@ -1,0 +1,60 @@
+{
+  "artifacts": {
+    "dataset_mapping": "runs\\operator_dataset_probe\\dataset_mapping.json",
+    "errors": "runs\\operator_dataset_probe\\errors.jsonl",
+    "schema_recommendation": "runs\\operator_dataset_probe\\schema_recommendation.md",
+    "source_summary": "runs\\operator_dataset_probe\\source_probe_summary.md"
+  },
+  "created_at": "2026-07-14T00:33:27+00:00",
+  "dataset_status": {
+    "blimp": "ready_for_adapter",
+    "counterfact": "ready_for_adapter",
+    "ioi": "ready_for_adapter",
+    "lama": "ready_for_adapter",
+    "ravel": "ready_for_adapter",
+    "synthetic": "ready_for_adapter"
+  },
+  "error_count": 0,
+  "output_dir": "runs\\operator_dataset_probe",
+  "prepared_sample_counts": {
+    "blimp": 5,
+    "counterfact": 5,
+    "ioi": 5,
+    "lama": 5,
+    "ravel": 5,
+    "synthetic": 5
+  },
+  "raw_sample_counts": {
+    "blimp": 15,
+    "counterfact": 5,
+    "ioi": 10,
+    "lama": 30,
+    "ravel": 10,
+    "synthetic": 10
+  },
+  "schema": "dawn_operator_pair_v2_candidate",
+  "schema_version": 2,
+  "script": "scripts/probe_operator_analysis_datasets.py",
+  "selected_datasets": [
+    "ravel",
+    "blimp",
+    "lama",
+    "counterfact",
+    "ioi",
+    "synthetic"
+  ],
+  "tokenizer": {
+    "add_special_tokens": false,
+    "do_lower_case": true,
+    "is_fast": true,
+    "max_candidate_tokens": 16,
+    "max_seq_len": 512,
+    "pad_token_id": 0,
+    "tokenizer_class": "BertTokenizer",
+    "tokenizer_name": "bert-base-uncased",
+    "unk_token_id": 100,
+    "vocab_hash": "4d340ba6df0d188a0bc2fdae2f8f4279427ea92d4c2457be7ae8fa149027d0b4",
+    "vocab_size": 30522
+  },
+  "work_dir": "\\tmp\\dawn_operator_dataset_probe"
+}

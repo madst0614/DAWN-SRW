@@ -185,7 +185,9 @@ def run_train_prompt_trace(ctx: AnalysisContext) -> Dict[str, Any]:
     if not prompts:
         return {"status": "empty", "prompts": []} if ctx.is_primary else {}
 
-    trace_fn = jax.jit(lambda p, x: topk_trace_forward(p, ctx.model_cfg, x, topk=topk))
+    trace_fn = jax.jit(lambda p, x: topk_trace_forward(
+        p, ctx.model_cfg, x, topk=topk,
+        production_srw_fns=ctx.sharded_fns))
     pool_sizes = _pool_sizes_from_config(ctx.config)
     rows = []
     started = time.time()

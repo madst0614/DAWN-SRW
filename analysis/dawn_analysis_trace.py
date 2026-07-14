@@ -31,7 +31,7 @@ TRANSITION_CANDIDATE_STRATEGIES = (
     "top_gate",
     "inactive_random",
     "active_random",
-    "matched_control",
+    "matched_active",
 )
 TRANSITION_CANDIDATE_FIELDS = (
     "candidate_ids",
@@ -39,6 +39,7 @@ TRANSITION_CANDIDATE_FIELDS = (
     "candidate_execution",
     "candidate_admission",
     "candidate_abs_coefficient",
+    "candidate_coefficient",
 )
 TRACE_FIELDS = (
     "top_idx",
@@ -258,6 +259,8 @@ def _srw_with_topk(x, h, op_key, raw_tau, read, write, *,
                 admission_stats, safe_ids, axis=-1),
             "candidate_abs_coefficient": jnp.take_along_axis(
                 abs_coefficient, safe_ids, axis=-1),
+            "candidate_coefficient": jnp.take_along_axis(
+                coefficient_stats, safe_ids, axis=-1),
         })
     return out, stats
 
@@ -270,8 +273,12 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
                        execution_prune_eps: Optional[float] = None,
                        target_positions=None,
                        candidate_seed: int = 0,
-                       sharded_srw_fns=None):
-    """Return compact top-k operator traces for a small fixed-shape batch."""
+                       production_srw_fns=None):
+    """Return sparse side-car traces while advancing via production kernels.
+
+    For v4171, outputs reconstructed by :func:`_srw_with_topk` are
+    observation-only and are never used as model state.
+    """
     model_module = analysis_model_module(model_cfg)
     params = model_module._squeeze_params(params)
     input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
@@ -308,6 +315,16 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
     topk_qk = int(topk if topk_qk is None else topk_qk)
     topk_v = int(topk if topk_v is None else topk_v)
     topk_rst = int(topk if topk_rst is None else topk_rst)
+    is_v4171 = str(model_cfg.get("model_version", "")) == "spatial-r1-v4.1.7.1"
+    if is_v4171:
+        required = {
+            "attn_qk_paired_minimal", "attn_v_single_minimal",
+            "rst_single_minimal",
+        }
+        if not isinstance(production_srw_fns, dict) or required - set(production_srw_fns):
+            raise ValueError(
+                "v4171 production-only trace requires canonical minimal kernels: "
+                + ",".join(sorted(required)))
 
     pool = model_module._pool_params_with_operator_keys(params["neuron_pool"])
     router = params["router"]
@@ -417,23 +434,31 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             target_positions=target_positions,
             candidate_seed=candidate_seed + layer_idx * 17 + 2,
         )
-        if sharded_srw_fns is not None:
-            trace_target = jnp.asarray(target_positions[0], dtype=jnp.int32)
-            q = sharded_srw_fns[0](
-                normed, h_q, pool["attn_qk_op_key"], tau_all[:, :, 0:1],
+        if is_v4171:
+            h_qk = jnp.stack((h_q, h_k), axis=2)
+            tau_qk = jnp.stack(
+                (tau_all[:, :, 0:1], tau_all[:, :, 1:2]), axis=2)
+            qk = production_srw_fns["attn_qk_paired_minimal"](
+                normed, h_qk, pool["attn_qk_op_key"], tau_qk,
                 pool["attn_qk_read"], pool["attn_qk_write"],
-                jnp.zeros((pool["attn_qk_op_key"].shape[0],), jnp.float32),
-                trace_target, jnp.bool_(False))
-            k = sharded_srw_fns[1](
-                normed, h_k, pool["attn_qk_op_key"], tau_all[:, :, 1:2],
-                pool["attn_qk_read"], pool["attn_qk_write"],
-                jnp.zeros((pool["attn_qk_op_key"].shape[0],), jnp.float32),
-                trace_target, jnp.bool_(False))
-            v = sharded_srw_fns[2](
+                execution_qk["soft_gate_temperature"],
+                model_cfg.get("soft_gate_t_final", execution_qk["soft_gate_temperature"]),
+                execution_qk["soft_gate_boundary_power"],
+                model_cfg.get("soft_gate_boundary_power_final",
+                              execution_qk["soft_gate_boundary_power"]),
+                execution_qk.get("execution_prune_eps", 0.0),
+            )[0]
+            q, k = qk[:, :, 0, :], qk[:, :, 1, :]
+            v = production_srw_fns["attn_v_single_minimal"](
                 normed, h_v, pool["attn_v_op_key"], tau_all[:, :, 2:3],
                 pool["attn_v_read"], pool["attn_v_write"],
-                jnp.zeros((pool["attn_v_op_key"].shape[0],), jnp.float32),
-                trace_target, jnp.bool_(False))
+                execution_v["soft_gate_temperature"],
+                model_cfg.get("soft_gate_t_final", execution_v["soft_gate_temperature"]),
+                execution_v["soft_gate_boundary_power"],
+                model_cfg.get("soft_gate_boundary_power_final",
+                              execution_v["soft_gate_boundary_power"]),
+                execution_v.get("execution_prune_eps", 0.0),
+            )[0]
         q = q * qk_scale
         k = k * qk_scale
         v = v * v_scale
@@ -446,6 +471,9 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             if "candidate_abs_coefficient" in stats:
                 stats["candidate_abs_coefficient"] = (
                     stats["candidate_abs_coefficient"] * jnp.abs(scale))
+            if "candidate_coefficient" in stats:
+                stats["candidate_coefficient"] = (
+                    stats["candidate_coefficient"] * scale)
             stats["update_norm"] = stats["update_norm"] * jnp.abs(scale)
         if target_vectors is not None:
             target_vectors["srw_feature_q"].append(target_value(q))
@@ -498,18 +526,25 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             target_positions=target_positions,
             candidate_seed=candidate_seed + layer_idx * 17 + 3,
         )
-        if sharded_srw_fns is not None:
-            rst = sharded_srw_fns[3](
+        if is_v4171:
+            rst = production_srw_fns["rst_single_minimal"](
                 normed, h_rst, pool["rst_op_key"], tau_rst,
                 pool["rst_read"], pool["rst_write"],
-                jnp.zeros((pool["rst_op_key"].shape[0],), jnp.float32),
-                jnp.asarray(target_positions[0], dtype=jnp.int32),
-                jnp.bool_(False))
+                execution_rst["soft_gate_temperature"],
+                model_cfg.get("soft_gate_t_final", execution_rst["soft_gate_temperature"]),
+                execution_rst["soft_gate_boundary_power"],
+                model_cfg.get("soft_gate_boundary_power_final",
+                              execution_rst["soft_gate_boundary_power"]),
+                execution_rst.get("execution_prune_eps", 0.0),
+            )[0]
         rst = rst * rst_scale
         rst_stats["top_coefficient"] = rst_stats["top_coefficient"] * rst_scale
         if "candidate_abs_coefficient" in rst_stats:
             rst_stats["candidate_abs_coefficient"] = (
                 rst_stats["candidate_abs_coefficient"] * jnp.abs(rst_scale))
+        if "candidate_coefficient" in rst_stats:
+            rst_stats["candidate_coefficient"] = (
+                rst_stats["candidate_coefficient"] * rst_scale)
         rst_stats["update_norm"] = rst_stats["update_norm"] * jnp.abs(rst_scale)
         rst_out_norm.append(jnp.linalg.norm(rst, axis=-1).mean())
         if target_vectors is not None:
@@ -673,7 +708,9 @@ def run_trace_stage(ctx: AnalysisContext) -> Dict[str, Any]:
     )
 
     summaries = []
-    trace_fn = jax.jit(lambda p, x: topk_trace_forward(p, ctx.model_cfg, x, topk=topk))
+    trace_fn = jax.jit(lambda p, x: topk_trace_forward(
+        p, ctx.model_cfg, x, topk=topk,
+        production_srw_fns=ctx.sharded_fns))
     trace_t0 = time.time()
     for i, prompt in enumerate(prompts):
         json_path = store.path("trace", f"prompt-{i:06d}.json")

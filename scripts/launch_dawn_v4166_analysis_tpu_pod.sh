@@ -68,6 +68,17 @@ TRANSITION_TOPK_QK="${DAWN_TRANSITION_TOPK_QK:-512}"
 TRANSITION_TOPK_V="${DAWN_TRANSITION_TOPK_V:-2048}"
 TRANSITION_TOPK_RST="${DAWN_TRANSITION_TOPK_RST:-4096}"
 CAUSAL_MAX_PROMPTS="${DAWN_CAUSAL_MAX_PROMPTS:-6}"
+OPERATOR_DATASET_ROOT="${DAWN_OPERATOR_DATASET_ROOT:-gs://dawn-tpu-data-c4/dataset/v4171_operator_analysis_v2}"
+OPERATOR_ANALYSIS_PROFILE="${DAWN_OPERATOR_ANALYSIS_PROFILE:-monitor}"
+OPERATOR_DATASETS="${DAWN_OPERATOR_DATASETS:-all}"
+OPERATOR_CACHE_DIR="${DAWN_OPERATOR_CACHE_DIR:-/tmp/dawn_operator_analysis_cache}"
+OPERATOR_BEHAVIOR_MAX_EXAMPLES="${DAWN_OPERATOR_BEHAVIOR_MAX_EXAMPLES:-}"
+OPERATOR_TRACE_MAX_EXAMPLES="${DAWN_OPERATOR_TRACE_MAX_EXAMPLES:-}"
+OPERATOR_CAUSAL_MAX_EXAMPLES="${DAWN_OPERATOR_CAUSAL_MAX_EXAMPLES:-}"
+OPERATOR_TRACE_PER_GROUP="${DAWN_OPERATOR_TRACE_PER_GROUP:-}"
+OPERATOR_CAUSAL_PER_GROUP="${DAWN_OPERATOR_CAUSAL_PER_GROUP:-}"
+OPERATOR_ANALYSIS_RESUME="${DAWN_OPERATOR_ANALYSIS_RESUME:-1}"
+OPERATOR_ANALYSIS_SEED="${DAWN_OPERATOR_ANALYSIS_SEED:-4171}"
 
 TRAIN_ANALYSIS_CONFIG="${DAWN_TRAIN_ANALYSIS_CONFIG:-}"
 TRAIN_ANALYSIS_CHECKPOINT_DIR="${DAWN_TRAIN_ANALYSIS_CHECKPOINT_DIR:-gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4166_1p3B_c4_20B_v4_64_new}"
@@ -209,6 +220,18 @@ while [[ $# -gt 0 ]]; do
         --transition-topk-v) TRANSITION_TOPK_V="$2"; shift 2 ;;
         --transition-topk-rst) TRANSITION_TOPK_RST="$2"; shift 2 ;;
         --causal-max-prompts) CAUSAL_MAX_PROMPTS="$2"; shift 2 ;;
+        --operator-dataset-root) OPERATOR_DATASET_ROOT="$(normalize_gcs_arg "$2")"; shift 2 ;;
+        --operator-analysis-profile) OPERATOR_ANALYSIS_PROFILE="$2"; shift 2 ;;
+        --operator-datasets) OPERATOR_DATASETS="$2"; shift 2 ;;
+        --operator-cache-dir) OPERATOR_CACHE_DIR="$2"; shift 2 ;;
+        --operator-behavior-max-examples) OPERATOR_BEHAVIOR_MAX_EXAMPLES="$2"; shift 2 ;;
+        --operator-trace-max-examples) OPERATOR_TRACE_MAX_EXAMPLES="$2"; shift 2 ;;
+        --operator-causal-max-examples) OPERATOR_CAUSAL_MAX_EXAMPLES="$2"; shift 2 ;;
+        --operator-trace-per-group) OPERATOR_TRACE_PER_GROUP="$2"; shift 2 ;;
+        --operator-causal-per-group) OPERATOR_CAUSAL_PER_GROUP="$2"; shift 2 ;;
+        --operator-analysis-resume) OPERATOR_ANALYSIS_RESUME="1"; shift ;;
+        --no-operator-analysis-resume) OPERATOR_ANALYSIS_RESUME="0"; shift ;;
+        --operator-analysis-seed) OPERATOR_ANALYSIS_SEED="$2"; shift 2 ;;
         --list-analysis-items) ANALYSIS_ARGS="$ANALYSIS_ARGS --list-train-analysis-items"; shift ;;
         --usage-max-sequences) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-max-sequences $2"; shift 2 ;;
         --usage-batch-size) ANALYSIS_ARGS="$ANALYSIS_ARGS --usage-batch-size $2"; shift 2 ;;
@@ -244,6 +267,17 @@ while [[ $# -gt 0 ]]; do
             echo "  --transition-topk-v N     Default: $TRANSITION_TOPK_V"
             echo "  --transition-topk-rst N   Default: $TRANSITION_TOPK_RST"
             echo "  --causal-max-prompts N    Default: $CAUSAL_MAX_PROMPTS"
+            echo "  --operator-dataset-root PATH"
+            echo "  --operator-analysis-profile smoke|monitor|full"
+            echo "  --operator-datasets CSV   Default: $OPERATOR_DATASETS"
+            echo "  --operator-cache-dir PATH Default: $OPERATOR_CACHE_DIR"
+            echo "  --operator-behavior-max-examples N"
+            echo "  --operator-trace-max-examples N"
+            echo "  --operator-causal-max-examples N"
+            echo "  --operator-trace-per-group N"
+            echo "  --operator-causal-per-group N"
+            echo "  --operator-analysis-resume | --no-operator-analysis-resume"
+            echo "  --operator-analysis-seed N Default: $OPERATOR_ANALYSIS_SEED"
             echo "  --list-analysis-items     Print train-analysis item catalog"
             echo "  --branch BRANCH           Default: $BRANCH"
             echo "  --repo-url URL            Default: $REPO_URL"
@@ -283,6 +317,22 @@ fi
 CHECKPOINT="$(normalize_gcs_arg "$CHECKPOINT")"
 TRAIN_ANALYSIS_CHECKPOINT_DIR="$(normalize_gcs_arg "$TRAIN_ANALYSIS_CHECKPOINT_DIR")"
 OUTPUT="$(normalize_gcs_arg "$OUTPUT")"
+OPERATOR_DATASET_ROOT="$(normalize_gcs_arg "$OPERATOR_DATASET_ROOT")"
+
+case "$OPERATOR_ANALYSIS_PROFILE" in
+    smoke|monitor|full) ;;
+    *)
+        echo "ERROR: unsupported --operator-analysis-profile $OPERATOR_ANALYSIS_PROFILE" >&2
+        exit 1
+        ;;
+esac
+case "$OPERATOR_ANALYSIS_RESUME" in
+    0|1) ;;
+    *)
+        echo "ERROR: DAWN_OPERATOR_ANALYSIS_RESUME must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
 
 if [[ -z "$TPU_NAME" ]]; then
     echo "ERROR: --tpu required" >&2
@@ -359,6 +409,24 @@ if [[ "$MODE" == "train_analysis" ]]; then
     COPY_CMD="$COPY_CMD --analysis-generation-temperature $TRAIN_ANALYSIS_GENERATION_TEMPERATURE"
     COPY_CMD="$COPY_CMD --analysis-generation-top-k $TRAIN_ANALYSIS_GENERATION_TOP_K"
     COPY_CMD="$COPY_CMD --transition-topk-qk $TRANSITION_TOPK_QK --transition-topk-v $TRANSITION_TOPK_V --transition-topk-rst $TRANSITION_TOPK_RST --causal-max-prompts $CAUSAL_MAX_PROMPTS"
+    COPY_CMD="$COPY_CMD --operator-dataset-root $OPERATOR_DATASET_ROOT --operator-analysis-profile $OPERATOR_ANALYSIS_PROFILE --operator-datasets $OPERATOR_DATASETS --operator-cache-dir $OPERATOR_CACHE_DIR --operator-analysis-seed $OPERATOR_ANALYSIS_SEED"
+    if [[ "$OPERATOR_ANALYSIS_RESUME" == "1" ]]; then
+        COPY_CMD="$COPY_CMD --operator-analysis-resume"
+    else
+        COPY_CMD="$COPY_CMD --no-operator-analysis-resume"
+    fi
+    for _operator_pair in \
+        "operator-behavior-max-examples:$OPERATOR_BEHAVIOR_MAX_EXAMPLES" \
+        "operator-trace-max-examples:$OPERATOR_TRACE_MAX_EXAMPLES" \
+        "operator-causal-max-examples:$OPERATOR_CAUSAL_MAX_EXAMPLES" \
+        "operator-trace-per-group:$OPERATOR_TRACE_PER_GROUP" \
+        "operator-causal-per-group:$OPERATOR_CAUSAL_PER_GROUP"; do
+        _operator_name="${_operator_pair%%:*}"
+        _operator_value="${_operator_pair#*:}"
+        if [[ -n "$_operator_value" ]]; then
+            COPY_CMD="$COPY_CMD --$_operator_name $_operator_value"
+        fi
+    done
 fi
 if [[ "$SKIP_REPO_UPDATE" == "1" ]]; then
     COPY_CMD="$COPY_CMD --skip-repo-update"
@@ -400,6 +468,12 @@ if [[ "$MODE" == "train_analysis" ]]; then
     echo "  gen_top_k       : $TRAIN_ANALYSIS_GENERATION_TOP_K"
     echo "  transition_topk : qk=$TRANSITION_TOPK_QK v=$TRANSITION_TOPK_V rst=$TRANSITION_TOPK_RST"
     echo "  causal_prompts  : $CAUSAL_MAX_PROMPTS"
+    echo "  operator_data   : $OPERATOR_DATASET_ROOT"
+    echo "  operator_profile: $OPERATOR_ANALYSIS_PROFILE"
+    echo "  operator_sets   : $OPERATOR_DATASETS"
+    echo "  operator_cache  : $OPERATOR_CACHE_DIR"
+    echo "  operator_resume : $OPERATOR_ANALYSIS_RESUME seed=$OPERATOR_ANALYSIS_SEED"
+    echo "  operator_limits : behavior=${OPERATOR_BEHAVIOR_MAX_EXAMPLES:-profile} trace=${OPERATOR_TRACE_MAX_EXAMPLES:-profile} causal=${OPERATOR_CAUSAL_MAX_EXAMPLES:-profile}"
     echo "  repo_update     : $([[ "$SKIP_REPO_UPDATE" == "1" ]] && echo skip || echo fetch)"
     echo "  local_overlay   : $SYNC_LOCAL_ANALYSIS"
 else
@@ -420,7 +494,17 @@ if [[ "$DRY_RUN" == "1" ]]; then
     echo "Dry run: no TPU command will be sent."
     if [[ "$MODE" == "train_analysis" ]]; then
         echo "Remote Python:"
-        DRY_RUN_ANALYSIS_CMD="python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --train-analysis-preset $TRAIN_ANALYSIS_PRESET --train-analysis-generation-max-prompts $TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS --train-analysis-generation-max-tokens $TRAIN_ANALYSIS_GENERATION_MAX_TOKENS --train-analysis-generation-temperature $TRAIN_ANALYSIS_GENERATION_TEMPERATURE --train-analysis-generation-top-k $TRAIN_ANALYSIS_GENERATION_TOP_K --transition-topk-qk $TRANSITION_TOPK_QK --transition-topk-v $TRANSITION_TOPK_V --transition-topk-rst $TRANSITION_TOPK_RST --causal-max-prompts $CAUSAL_MAX_PROMPTS --init-distributed"
+        DRY_RUN_ANALYSIS_CMD="python3 -u scripts/analyze_dawn_srw_v4166.py --train-analysis --checkpoint-dir $TRAIN_ANALYSIS_CHECKPOINT_DIR --output $OUTPUT --train-analysis-max-batches $TRAIN_ANALYSIS_MAX_BATCHES --prune-eps $TRAIN_ANALYSIS_PRUNE_EPS --train-analysis-preset $TRAIN_ANALYSIS_PRESET --train-analysis-generation-max-prompts $TRAIN_ANALYSIS_GENERATION_MAX_PROMPTS --train-analysis-generation-max-tokens $TRAIN_ANALYSIS_GENERATION_MAX_TOKENS --train-analysis-generation-temperature $TRAIN_ANALYSIS_GENERATION_TEMPERATURE --train-analysis-generation-top-k $TRAIN_ANALYSIS_GENERATION_TOP_K --transition-topk-qk $TRANSITION_TOPK_QK --transition-topk-v $TRANSITION_TOPK_V --transition-topk-rst $TRANSITION_TOPK_RST --causal-max-prompts $CAUSAL_MAX_PROMPTS --operator-dataset-root $OPERATOR_DATASET_ROOT --operator-analysis-profile $OPERATOR_ANALYSIS_PROFILE --operator-datasets $OPERATOR_DATASETS --operator-cache-dir $OPERATOR_CACHE_DIR --operator-analysis-seed $OPERATOR_ANALYSIS_SEED --init-distributed"
+        if [[ "$OPERATOR_ANALYSIS_RESUME" == "1" ]]; then
+            DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --operator-analysis-resume"
+        else
+            DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --no-operator-analysis-resume"
+        fi
+        [[ -z "$OPERATOR_BEHAVIOR_MAX_EXAMPLES" ]] || DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --operator-behavior-max-examples $OPERATOR_BEHAVIOR_MAX_EXAMPLES"
+        [[ -z "$OPERATOR_TRACE_MAX_EXAMPLES" ]] || DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --operator-trace-max-examples $OPERATOR_TRACE_MAX_EXAMPLES"
+        [[ -z "$OPERATOR_CAUSAL_MAX_EXAMPLES" ]] || DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --operator-causal-max-examples $OPERATOR_CAUSAL_MAX_EXAMPLES"
+        [[ -z "$OPERATOR_TRACE_PER_GROUP" ]] || DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --operator-trace-per-group $OPERATOR_TRACE_PER_GROUP"
+        [[ -z "$OPERATOR_CAUSAL_PER_GROUP" ]] || DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --operator-causal-per-group $OPERATOR_CAUSAL_PER_GROUP"
         if [[ -n "$TRAIN_ANALYSIS_CONFIG" ]]; then
             DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --config $TRAIN_ANALYSIS_CONFIG"
         fi
@@ -500,9 +584,14 @@ if [[ "$SYNC_LOCAL_ANALYSIS" == "1" ]]; then
     trap '[[ -z "${OVERLAY_ARCHIVE:-}" ]] || rm -f "$OVERLAY_ARCHIVE"' EXIT
     tar -czf "$OVERLAY_ARCHIVE" \
         analysis/dawn_analysis_trace.py \
+        analysis/dawn_analysis_usage.py \
+        analysis/dawn_operator_analysis.py \
+        analysis/dawn_operator_datasets.py \
         analysis/dawn_train_analysis_items.py \
+        analysis/dawn_train_analysis_prompt.py \
         analysis/dawn_v4171_transition.py \
         analysis/prompts/v4171_transition_pairs.jsonl \
+        models/dawn_srw_v4171.py \
         scripts/analyze_dawn_srw_v4166.py \
         scripts/launch_dawn_v4166_analysis_tpu_pod.sh
     echo "Syncing local analysis overlay to target worker(s)..."
@@ -633,6 +722,17 @@ TRANSITION_TOPK_QK='${TRANSITION_TOPK_QK}'
 TRANSITION_TOPK_V='${TRANSITION_TOPK_V}'
 TRANSITION_TOPK_RST='${TRANSITION_TOPK_RST}'
 CAUSAL_MAX_PROMPTS='${CAUSAL_MAX_PROMPTS}'
+OPERATOR_DATASET_ROOT='${OPERATOR_DATASET_ROOT}'
+OPERATOR_ANALYSIS_PROFILE='${OPERATOR_ANALYSIS_PROFILE}'
+OPERATOR_DATASETS='${OPERATOR_DATASETS}'
+OPERATOR_CACHE_DIR='${OPERATOR_CACHE_DIR}'
+OPERATOR_BEHAVIOR_MAX_EXAMPLES='${OPERATOR_BEHAVIOR_MAX_EXAMPLES}'
+OPERATOR_TRACE_MAX_EXAMPLES='${OPERATOR_TRACE_MAX_EXAMPLES}'
+OPERATOR_CAUSAL_MAX_EXAMPLES='${OPERATOR_CAUSAL_MAX_EXAMPLES}'
+OPERATOR_TRACE_PER_GROUP='${OPERATOR_TRACE_PER_GROUP}'
+OPERATOR_CAUSAL_PER_GROUP='${OPERATOR_CAUSAL_PER_GROUP}'
+OPERATOR_ANALYSIS_RESUME='${OPERATOR_ANALYSIS_RESUME}'
+OPERATOR_ANALYSIS_SEED='${OPERATOR_ANALYSIS_SEED}'
 SKIP_REPO_UPDATE='${SKIP_REPO_UPDATE}'
 SYNC_LOCAL_ANALYSIS='${SYNC_LOCAL_ANALYSIS}'
 DETACH='${DETACH}'
@@ -663,6 +763,10 @@ if [ "\$MODE" = "train_analysis" ]; then
     echo "TRAIN_ANALYSIS_GENERATION_MAX_TOKENS=\$TRAIN_ANALYSIS_GENERATION_MAX_TOKENS"
     echo "TRAIN_ANALYSIS_GENERATION_TEMPERATURE=\$TRAIN_ANALYSIS_GENERATION_TEMPERATURE"
     echo "TRAIN_ANALYSIS_GENERATION_TOP_K=\$TRAIN_ANALYSIS_GENERATION_TOP_K"
+    echo "OPERATOR_DATASET_ROOT=\$OPERATOR_DATASET_ROOT"
+    echo "OPERATOR_ANALYSIS_PROFILE=\$OPERATOR_ANALYSIS_PROFILE"
+    echo "OPERATOR_DATASETS=\$OPERATOR_DATASETS"
+    echo "OPERATOR_ANALYSIS_RESUME=\$OPERATOR_ANALYSIS_RESUME"
     echo "APPEND_REMOTE_LOG=\$APPEND_REMOTE_LOG"
 fi
 
@@ -727,6 +831,11 @@ if [ "\$MODE" = "train_analysis" ]; then
         --transition-topk-v "\$TRANSITION_TOPK_V"
         --transition-topk-rst "\$TRANSITION_TOPK_RST"
         --causal-max-prompts "\$CAUSAL_MAX_PROMPTS"
+        --operator-dataset-root "\$OPERATOR_DATASET_ROOT"
+        --operator-analysis-profile "\$OPERATOR_ANALYSIS_PROFILE"
+        --operator-datasets "\$OPERATOR_DATASETS"
+        --operator-cache-dir "\$OPERATOR_CACHE_DIR"
+        --operator-analysis-seed "\$OPERATOR_ANALYSIS_SEED"
         --init-distributed
     )
     if [ -n "\$TRAIN_ANALYSIS_CONFIG" ]; then
@@ -735,6 +844,16 @@ if [ "\$MODE" = "train_analysis" ]; then
     if [ -n "\$TRAIN_ANALYSIS_ITEMS" ]; then
         ANALYSIS_CMD+=(--train-analysis-items "\$TRAIN_ANALYSIS_ITEMS")
     fi
+    if [ "\$OPERATOR_ANALYSIS_RESUME" = "1" ]; then
+        ANALYSIS_CMD+=(--operator-analysis-resume)
+    else
+        ANALYSIS_CMD+=(--no-operator-analysis-resume)
+    fi
+    [ -z "\$OPERATOR_BEHAVIOR_MAX_EXAMPLES" ] || ANALYSIS_CMD+=(--operator-behavior-max-examples "\$OPERATOR_BEHAVIOR_MAX_EXAMPLES")
+    [ -z "\$OPERATOR_TRACE_MAX_EXAMPLES" ] || ANALYSIS_CMD+=(--operator-trace-max-examples "\$OPERATOR_TRACE_MAX_EXAMPLES")
+    [ -z "\$OPERATOR_CAUSAL_MAX_EXAMPLES" ] || ANALYSIS_CMD+=(--operator-causal-max-examples "\$OPERATOR_CAUSAL_MAX_EXAMPLES")
+    [ -z "\$OPERATOR_TRACE_PER_GROUP" ] || ANALYSIS_CMD+=(--operator-trace-per-group "\$OPERATOR_TRACE_PER_GROUP")
+    [ -z "\$OPERATOR_CAUSAL_PER_GROUP" ] || ANALYSIS_CMD+=(--operator-causal-per-group "\$OPERATOR_CAUSAL_PER_GROUP")
 else
     ANALYSIS_CMD=(
         python3 -u scripts/analyze_dawn_srw_v4166.py

@@ -68,9 +68,10 @@ from analysis.dawn_analysis_storage import (
     write_text_atomic,
 )
 from analysis.dawn_operator_datasets import (
+    DEFAULT_OPERATOR_CACHE_DIR,
     DEFAULT_OPERATOR_DATASET_ROOT,
-    operator_dataset_summary,
 )
+from analysis.dawn_operator_analysis import run_operator_analysis
 from analysis.dawn_train_analysis_items import (
     DEFAULT_TRAIN_ANALYSIS_PRESET,
     TRAIN_ANALYSIS_PRESETS,
@@ -232,6 +233,26 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("DAWN_OPERATOR_DATASET_ROOT", DEFAULT_OPERATOR_DATASET_ROOT),
         help="Operator-analysis dataset root prepared by the DAWN operator dataset workflow.",
     )
+    p.add_argument(
+        "--operator-analysis-profile", choices=("smoke", "monitor", "full"),
+        default=os.environ.get("DAWN_OPERATOR_ANALYSIS_PROFILE", "monitor"))
+    p.add_argument(
+        "--operator-datasets", default=os.environ.get("DAWN_OPERATOR_DATASETS", "all"),
+        help="Comma-separated prepared dataset ids, or all.")
+    p.add_argument(
+        "--operator-cache-dir",
+        default=os.environ.get("DAWN_OPERATOR_CACHE_DIR", DEFAULT_OPERATOR_CACHE_DIR))
+    p.add_argument("--operator-behavior-max-examples", type=int, default=None)
+    p.add_argument("--operator-trace-max-examples", type=int, default=None)
+    p.add_argument("--operator-causal-max-examples", type=int, default=None)
+    p.add_argument("--operator-trace-per-group", type=int, default=None)
+    p.add_argument("--operator-causal-per-group", type=int, default=None)
+    p.add_argument(
+        "--operator-analysis-resume", action=argparse.BooleanOptionalAction,
+        default=True)
+    p.add_argument(
+        "--operator-analysis-seed", type=int,
+        default=int(os.environ.get("DAWN_OPERATOR_ANALYSIS_SEED", 4171)))
     p.add_argument(
         "--transition-prompt-set",
         default=os.environ.get(
@@ -2118,6 +2139,10 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
         run_v4171_transition_items(ctx, analysis_items)
         if "v4171_transition" in required_sections else {}
     )
+    operator_analysis = (
+        run_operator_analysis(ctx, analysis_items)
+        if "operator_datasets" in required_sections else {}
+    )
     sync_hosts("dawn-srw-train-analysis-done")
     if not ctx.is_primary:
         return 0
@@ -2167,7 +2192,12 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
         "prompt_decision": prompt_decision,
         "generation_samples": generation_samples,
         "v4171_transition_analysis": v4171_transition_analysis,
-        "operator_analysis_datasets": operator_dataset_summary(args.operator_dataset_root),
+        "operator_analysis": operator_analysis,
+        "operator_analysis_datasets": (
+            operator_analysis.get("dataset_manifest")
+            if operator_analysis else {
+                "status": "not_requested", "root": args.operator_dataset_root,
+            }),
         "reference_400m": compare,
         "warnings": warnings,
     }

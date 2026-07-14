@@ -1,0 +1,2064 @@
+{
+  "adapter_risks": [
+    {
+      "risk": "nontrivial suffix after [MASK]: ' color was used.'",
+      "row": {
+        "id": "56be4db0acb8001400a502f0_0",
+        "masked_sentences": [
+          "To emphasize the 50th anniversary of the Super Bowl the [MASK] color was used."
+        ],
+        "obj_label": "gold",
+        "sub_label": "Squad"
+      },
+      "source_file": "data/Squad/test.jsonl"
+    },
+    {
+      "risk": "nontrivial suffix after [MASK]: ' position for the Denver Broncos.'",
+      "row": {
+        "id": "56bf17653aeaaa14008c9513_0",
+        "masked_sentences": [
+          "Von Miller plays in [MASK] position for the Denver Broncos."
+        ],
+        "obj_label": "linebacker",
+        "sub_label": "Squad"
+      },
+      "source_file": "data/Squad/test.jsonl"
+    },
+    {
+      "risk": "nontrivial suffix after [MASK]: ') is an American politician who is a Democratic member of the Rhode Island House of Representatives .'",
+      "row": {
+        "evidences": [
+          {
+            "considered_sentences": [
+              "Peter F Martin (born 1941) is an American politician who is a Democratic member of the Rhode Island House of Representatives ."
+            ],
+            "snippet": "Peter F. Martin (born 1941) is an American politician who is a Democratic member of the Rhode Island House of Representatives. He has represented the 75th District Newport since 6 January 2009. He is currently serves on the House Committees on Judiciary, Municipal Government, and Veteran's Affairs. During his first term of office he served on the House Committees on Small Business and Separation of Powers & Government Oversight. In August 2010, Representative Martin was appointed as a Commissioner on the Atlantic States Marine Fisheries Commission",
+            "url": "http://en.wikipedia.org/wiki/Peter_F._Martin"
+          }
+        ],
+        "judgments": [
+          {
+            "judgment": "yes",
+            "rater": "18349444711114572460"
+          },
+          {
+            "judgment": "yes",
+            "rater": "17595829233063766365"
+          },
+          {
+            "judgment": "yes",
+            "rater": "4593294093459651288"
+          },
+          {
+            "judgment": "yes",
+            "rater": "7387074196865291426"
+          },
+          {
+            "judgment": "yes",
+            "rater": "17154471385681223613"
+          }
+        ],
+        "masked_sentences": [
+          "Peter F Martin (born [MASK]) is an American politician who is a Democratic member of the Rhode Island House of Representatives ."
+        ],
+        "obj": "1941",
+        "obj_aliases": [],
+        "obj_label": "1941",
+        "obj_w": null,
+        "pred": "/people/person/date_of_birth",
+        "sub": "/m/09gb0bw",
+        "sub_aliases": [],
+        "sub_label": "Peter F. Martin",
+        "sub_w": null,
+        "uuid": "18af2dac-21d3-4c42-aff5-c247f245e203"
+      },
+      "source_file": "data/Google_RE/date_of_birth_test.jsonl"
+    },
+    {
+      "risk": "nontrivial suffix after [MASK]: ') is a team handball player from Argentina .'",
+      "row": {
+        "evidences": [
+          {
+            "considered_sentences": [
+              "Maria Pilar Romero (born 22 May 1982) is a team handball player from Argentina ."
+            ],
+            "snippet": "Maria Pilar Romero (born 22 May 1982) is a team handball player from Argentina. She plays on the Argentine national team, and participated at the 2011 World Women's Handball Championship in Brazil.",
+            "url": "http://en.wikipedia.org/wiki/Maria_Pilar_Romero"
+          }
+        ],
+        "judgments": [
+          {
+            "judgment": "yes",
+            "rater": "14728826318420078902"
+          },
+          {
+            "judgment": "yes",
+            "rater": "7520160179218527648"
+          },
+          {
+            "judgment": "yes",
+            "rater": "3571030073219370006"
+          },
+          {
+            "judgment": "yes",
+            "rater": "17154471385681223613"
+          },
+          {
+            "judgment": "yes",
+            "rater": "14953915240951219400"
+          }
+        ],
+        "masked_sentences": [
+          "Maria Pilar Romero (born 22 May [MASK]) is a team handball player from Argentina ."
+        ],
+        "obj": "1982-05-22",
+        "obj_aliases": [],
+        "obj_label": "1982",
+        "obj_w": null,
+        "pred": "/people/person/date_of_birth",
+        "sub": "/m/0hrd6l2",
+        "sub_aliases": [
+          "Maria Pilar Romero"
+        ],
+        "sub_label": "Pilar Romero",
+        "sub_w": "Q7723827",
+        "uuid": "a6847930-759b-4100-adbc-3259f1169521"
+      },
+      "source_file": "data/Google_RE/date_of_birth_test.jsonl"
+    },
+    {
+      "risk": "masked sentence does not contain exactly one [MASK]",
+      "row": {
+        "evidences": [
+          {
+            "considered_sentences": [
+              "After the war John Starr opened a night-club in Hanley, Staffordshire, in partnership with the brothers Alfred and Henry Newton, SOE agents whom he had met during his training and also at the Avenue Foch .",
+              "He later returned to live in Paris, before moving to Switzerland, where he died in 1996 ."
+            ],
+            "snippet": "After the war John Starr opened a night-club in Hanley, Staffordshire, in partnership with the brothers Alfred and Henry Newton, SOE agents whom he had met during his training and also at the Avenue Foch. The Newton brothers had been in the Buchenwald concentration camp. He later returned to live in Paris, before moving to Switzerland, where he died in 1996.",
+            "url": "http://en.wikipedia.org/wiki/John_Renshaw_Starr"
+          }
+        ],
+        "judgments": [
+          {
+            "judgment": "yes",
+            "rater": "17966044108931836156"
+          },
+          {
+            "judgment": "yes",
+            "rater": "1406006087371975930"
+          },
+          {
+            "judgment": "yes",
+            "rater": "16676975657004889938"
+          },
+          {
+            "judgment": "yes",
+            "rater": "13855588585185268925"
+          },
+          {
+            "judgment": "yes",
+            "rater": "4185483665120273114"
+          }
+        ],
+        "masked_sentences": [
+          "After the war John Starr opened a night-club in Hanley, Staffordshire, in partnership with the brothers Alfred and Henry Newton, SOE agents whom he had met during his training and also at the Avenue Foch .",
+          "He later returned to live in Paris, before moving to [MASK], where he died in 1996 ."
+        ],
+        "obj": "/m/06mzp",
+        "obj_aliases": [
+          "Swiss Confederation",
+          "CH",
+          "SUI",
+          "Suisse",
+          "Schweiz",
+          "Svizzera",
+          "🇨🇭"
+        ],
+        "obj_label": "Switzerland",
+        "obj_w": "Q39",
+        "pred": "/people/deceased_person/place_of_death",
+        "sub": "/m/0205jm",
+        "sub_aliases": [],
+        "sub_label": "John Renshaw Starr",
+        "sub_w": "Q3182510",
+        "uuid": "61aad52c-4256-468a-a9ae-55e3fa4dc44e"
+      },
+      "source_file": "data/Google_RE/place_of_death_test.jsonl"
+    },
+    {
+      "risk": "nontrivial suffix after [MASK]: ' in 1551 .'",
+      "row": {
+        "evidences": [
+          {
+            "considered_sentences": [
+              "Arroyo died at Madrid in 1551 ."
+            ],
+            "snippet": "Diego de Arroyo, a miniature painter, who was born at Toledo in 1498, is supposed to have studied either in Italy or under an Italian master. His delicate miniature portraits gained him much renown, and the appointment of painter to Charles V. He also illuminated choir-books for the cathedral of Toledo. Arroyo died at Madrid in 1551.",
+            "url": "http://en.wikipedia.org/wiki/Diego_de_Arroyo"
+          }
+        ],
+        "judgments": [
+          {
+            "judgment": "yes",
+            "rater": "3633697795227880988"
+          },
+          {
+            "judgment": "yes",
+            "rater": "3422319225482654240"
+          },
+          {
+            "judgment": "yes",
+            "rater": "8841266254638695693"
+          },
+          {
+            "judgment": "skip",
+            "rater": "13855588585185268925"
+          },
+          {
+            "judgment": "yes",
+            "rater": "15683306407052553031"
+          }
+        ],
+        "masked_sentences": [
+          "Arroyo died at [MASK] in 1551 ."
+        ],
+        "obj": "/m/056_y",
+        "obj_aliases": [
+          "City of Madrid"
+        ],
+        "obj_label": "Madrid",
+        "obj_w": "Q2807",
+        "pred": "/people/deceased_person/place_of_death",
+        "sub": "/m/0c4031r",
+        "sub_aliases": [],
+        "sub_label": "Diego de Arroyo",
+        "sub_w": "Q5274857",
+        "uuid": "97483332-dd08-45d5-8181-a4438756c351"
+      },
+      "source_file": "data/Google_RE/place_of_death_test.jsonl"
+    },
+    {
+      "risk": "nontrivial suffix after [MASK]: ', Indiana .'",
+      "row": {
+        "evidences": [
+          {
+            "considered_sentences": [
+              "Murakowski died in 1985 at age 60 at his home in Hammond, Indiana ."
+            ],
+            "snippet": "Murakowski died in 1985 at age 60 at his home in Hammond, Indiana. He was survived by his wife, Lucille Murakowski, three sons, and three daughters.",
+            "url": "http://en.wikipedia.org/wiki/Art_Murakowski"
+          }
+        ],
+        "judgments": [
+          {
+            "judgment": "yes",
+            "rater": "14404876356854644346"
+          },
+          {
+            "judgment": "yes",
+            "rater": "16676975657004889938"
+          },
+          {
+            "judgment": "yes",
+            "rater": "14894151489932721675"
+          },
+          {
+            "judgment": "yes",
+            "rater": "17966044108931836156"
+          },
+          {
+            "judgment": "yes",
+            "rater": "4185483665120273114"
+          }
+        ],
+        "masked_sentences": [
+          "Murakowski died in 1985 at age 60 at his home in [MASK], Indiana ."
+        ],
+        "obj": "/m/0sn4f",
+        "obj_aliases": [
+          "Hammond, Indiana"
+        ],
+        "obj_label": "Hammond",
+        "obj_w": "Q856860",
+        "pred": "/people/deceased_person/place_of_death",
+        "sub": "/m/0bmf_6s",
+        "sub_aliases": [],
+        "sub_label": "Art Murakowski",
+        "sub_w": null,
+        "uuid": "9ed48bca-4f61-412f-80c2-42bd44a63d58"
+      },
+      "source_file": "data/Google_RE/place_of_death_test.jsonl"
+    },
+    {
+      "risk": "nontrivial suffix after [MASK]: 's until his death .'",
+      "row": {
+        "evidences": [
+          {
+            "considered_sentences": [
+              "Belissen remained in Marseilles until his death ."
+            ],
+            "snippet": "By 1722 Belissen settled in Marseille, where he succeeded Antoine Blanchard as maître de musique of the Abbey of St. Victor, which was then rapidly declining in importance--but he also secured a position directing the city's Académie de Concerts. Belissen remained in Marseilles until his death.",
+            "url": "http://en.wikipedia.org/wiki/Laurent_Belissen"
+          }
+        ],
+        "judgments": [
+          {
+            "judgment": "yes",
+            "rater": "3633697795227880988"
+          },
+          {
+            "judgment": "yes",
+            "rater": "18393280535210278125"
+          },
+          {
+            "judgment": "yes",
+            "rater": "8841266254638695693"
+          },
+          {
+            "judgment": "yes",
+            "rater": "13855588585185268925"
+          },
+          {
+            "judgment": "yes",
+            "rater": "15683306407052553031"
+          }
+        ],
+        "masked_sentences": [
+          "Belissen remained in [MASK]s until his death ."
+        ],
+        "obj": "/m/0jdtt",
+        "obj_aliases": [
+          "Bay of Marseille",
+          "Massaliotes",
+          "Massalia",
+          "Marsailles",
+          "Marseilles",
+          "Marsielles",
+          "Marsielle",
+          "City of Marseille",
+          "Marsaille",
+          "Marsiglia"
+        ],
+        "obj_label": "Marseille",
+        "obj_w": "Q23482",
+        "pred": "/people/deceased_person/place_of_death",
+        "sub": "/m/05tmcf",
+        "sub_aliases": [],
+        "sub_label": "Laurent Belissen",
+        "sub_w": "Q1808061",
+        "uuid": "10fb9157-33b5-4254-a27f-6abec0e5ce50"
+      },
+      "source_file": "data/Google_RE/place_of_death_test.jsonl"
+    }
+  ],
+  "dataset": "lama",
+  "downloaded_files": [
+    {
+      "bytes": 74619466,
+      "path": "\\tmp\\dawn_operator_dataset_probe\\downloads\\lama\\data.zip",
+      "reused": true,
+      "sha256": "70f8e520b9beafc5a05261c022c81d38c0e8a8f3594850872e5349bcdd2caf92",
+      "url": "https://dl.fbaipublicfiles.com/LAMA/data.zip"
+    }
+  ],
+  "nested_key_paths": [
+    "evidences",
+    "evidences[].considered_sentences",
+    "evidences[].masked_sentence",
+    "evidences[].obj_surface",
+    "evidences[].snippet",
+    "evidences[].sub_surface",
+    "evidences[].url",
+    "id",
+    "judgments",
+    "judgments[].judgment",
+    "judgments[].rater",
+    "masked_sentences",
+    "obj",
+    "obj_aliases",
+    "obj_label",
+    "obj_uri",
+    "obj_w",
+    "pred",
+    "predicate_id",
+    "source_category",
+    "source_file",
+    "sub",
+    "sub_aliases",
+    "sub_label",
+    "sub_uri",
+    "sub_w",
+    "uuid"
+  ],
+  "observed_columns": [
+    "evidences",
+    "id",
+    "judgments",
+    "masked_sentences",
+    "obj",
+    "obj_aliases",
+    "obj_label",
+    "obj_uri",
+    "obj_w",
+    "pred",
+    "predicate_id",
+    "source_category",
+    "source_file",
+    "sub",
+    "sub_aliases",
+    "sub_label",
+    "sub_uri",
+    "sub_w",
+    "uuid"
+  ],
+  "observed_files": [
+    "data/",
+    "data/Google_RE/",
+    "data/Google_RE/place_of_birth_test.jsonl",
+    "data/Google_RE/date_of_birth_test.jsonl",
+    "data/Google_RE/place_of_death_test.jsonl",
+    "data/Squad/",
+    "data/Squad/test.jsonl",
+    "data/relations.jsonl",
+    "data/ConceptNet/",
+    "data/ConceptNet/test.jsonl",
+    "data/TREx/",
+    "data/TREx/P740.jsonl",
+    "data/TREx/P108.jsonl",
+    "data/TREx/P190.jsonl",
+    "data/TREx/P27.jsonl",
+    "data/TREx/P1376.jsonl",
+    "data/TREx/P131.jsonl",
+    "data/TREx/P937.jsonl",
+    "data/TREx/P176.jsonl",
+    "data/TREx/P463.jsonl",
+    "data/TREx/P20.jsonl",
+    "data/TREx/P136.jsonl",
+    "data/TREx/P39.jsonl",
+    "data/TREx/P407.jsonl",
+    "data/TREx/P527.jsonl",
+    "data/TREx/P276.jsonl",
+    "data/TREx/P19.jsonl",
+    "data/TREx/P47.jsonl",
+    "data/TREx/P101.jsonl",
+    "data/TREx/P1303.jsonl",
+    "data/TREx/P17.jsonl",
+    "data/TREx/P127.jsonl",
+    "data/TREx/P103.jsonl",
+    "data/TREx/P31.jsonl",
+    "data/TREx/P159.jsonl",
+    "data/TREx/P530.jsonl",
+    "data/TREx/P495.jsonl",
+    "data/TREx/P37.jsonl",
+    "data/TREx/P138.jsonl",
+    "data/TREx/P361.jsonl",
+    "data/TREx/P140.jsonl",
+    "data/TREx/P1001.jsonl",
+    "data/TREx/P30.jsonl",
+    "data/TREx/P178.jsonl",
+    "data/TREx/P279.jsonl",
+    "data/TREx/P449.jsonl",
+    "data/TREx/P364.jsonl",
+    "data/TREx/P1412.jsonl",
+    "data/TREx/P264.jsonl",
+    "data/TREx/P36.jsonl",
+    "data/TREx/P106.jsonl",
+    "data/TREx/P413.jsonl"
+  ],
+  "observed_schema": {
+    "data/ConceptNet/test.jsonl": {
+      "masked_sentences": "list",
+      "obj": "str",
+      "obj_label": "str",
+      "pred": "str",
+      "sub": "str",
+      "uuid": "str"
+    },
+    "data/Google_RE/date_of_birth_test.jsonl": {
+      "evidences": "list",
+      "judgments": "list",
+      "masked_sentences": "list",
+      "obj": "str",
+      "obj_aliases": "list",
+      "obj_label": "str",
+      "obj_w": "NoneType",
+      "pred": "str",
+      "sub": "str",
+      "sub_aliases": "list",
+      "sub_label": "str",
+      "sub_w": "NoneType",
+      "uuid": "str"
+    },
+    "data/Google_RE/place_of_birth_test.jsonl": {
+      "evidences": "list",
+      "judgments": "list",
+      "masked_sentences": "list",
+      "obj": "str",
+      "obj_aliases": "list",
+      "obj_label": "str",
+      "obj_w": "str",
+      "pred": "str",
+      "sub": "str",
+      "sub_aliases": "list",
+      "sub_label": "str",
+      "sub_w": "NoneType",
+      "uuid": "str"
+    },
+    "data/Google_RE/place_of_death_test.jsonl": {
+      "evidences": "list",
+      "judgments": "list",
+      "masked_sentences": "list",
+      "obj": "str",
+      "obj_aliases": "list",
+      "obj_label": "str",
+      "obj_w": "str",
+      "pred": "str",
+      "sub": "str",
+      "sub_aliases": "list",
+      "sub_label": "str",
+      "sub_w": "str",
+      "uuid": "str"
+    },
+    "data/Squad/test.jsonl": {
+      "id": "str",
+      "masked_sentences": "list",
+      "obj_label": "str",
+      "sub_label": "str"
+    },
+    "data/TREx/P740.jsonl": {
+      "evidences": "list",
+      "obj_label": "str",
+      "obj_uri": "str",
+      "predicate_id": "str",
+      "sub_label": "str",
+      "sub_uri": "str",
+      "uuid": "str"
+    }
+  },
+  "observed_splits": [
+    "ConceptNet",
+    "Google_RE",
+    "Squad",
+    "TREx"
+  ],
+  "prepared_sample_count": 5,
+  "proposed_pair_types": [
+    "same_relation_different_subject"
+  ],
+  "proposed_score_mode": "continuation_margin",
+  "proposed_trace_semantics": "last_context_token_prediction_state",
+  "raw_samples": [
+    {
+      "evidences": [
+        {
+          "masked_sentence": "Pianos Become The Teeth is an American rock band from [MASK], formed in 2006.",
+          "obj_surface": "Baltimore, Maryland",
+          "sub_surface": "Pianos Become The Teeth"
+        },
+        {
+          "masked_sentence": "Pianos Become The Teeth is an American rock band from [MASK], formed in 2006.",
+          "obj_surface": "Baltimore, Maryland",
+          "sub_surface": "Pianos Become The Teeth"
+        }
+      ],
+      "obj_label": "Baltimore",
+      "obj_uri": "Q5092",
+      "predicate_id": "P740",
+      "source_category": "TREx",
+      "source_file": "data/TREx/P740.jsonl",
+      "sub_label": "Pianos Become the Teeth",
+      "sub_uri": "Q4046943",
+      "uuid": "a37257ae-4cbb-4309-a78a-623036c96797"
+    },
+    {
+      "evidences": [
+        {
+          "masked_sentence": "Barren Earth is a Finnish progressive death metal band from [MASK], and was formed in 2007.",
+          "obj_surface": "Helsinki",
+          "sub_surface": "Barren Earth"
+        },
+        {
+          "masked_sentence": "Barren Earth is a Finnish progressive death metal band from [MASK], and was formed in 2007.",
+          "obj_surface": "Helsinki",
+          "sub_surface": "Barren Earth"
+        }
+      ],
+      "obj_label": "Helsinki",
+      "obj_uri": "Q1757",
+      "predicate_id": "P740",
+      "source_category": "TREx",
+      "source_file": "data/TREx/P740.jsonl",
+      "sub_label": "Barren Earth",
+      "sub_uri": "Q808861",
+      "uuid": "bde94480-05d7-40fb-bfed-a944f9909157"
+    },
+    {
+      "evidences": [
+        {
+          "masked_sentence": "While ICE 3M trains operate the Paris-Frankfurt service (with the exception of trains 9553/9552, which operate with TGV Duplex equipment and are cross-crewed with both SNCF and DB staff), SNCF's TGV runs from [MASK] to Munich (via Stuttgart), with mixed crews on both trains.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "While ICE 3M trains operate the Paris-Frankfurt service (with the exception of trains 9553/9552, which operate with TGV Duplex equipment and are cross-crewed with both SNCF and DB staff), SNCF's TGV runs from [MASK] to Munich (via Stuttgart), with mixed crews on both trains.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Opened in 1901 by the Chemins de fer de [MASK] à Lyon et à la Méditerranée, it is part of the main SNCF network as far as Vallorcine.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Agde can be reached by TGV SNCF train direct from [MASK] or Lille whilst the closest airports are Béziers-Cap d'Agde en Languedoc, with direct budget airline services to the UK and Scandinavia, or Montpellier-Fréjorgues.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Services are provided by the SNCF under its branded TER Champagne Ardenne and TER Picardie networks to Châlons-en-Champagne, Dijon, Épernay, [MASK] and Strasbourg (TGV Est), Charleville-Mézières, Laon, Amiens and La Ferté-Milon.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "[MASK] Bercy is a railway station and terminus in Paris, France, operated by the SNCF.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Paris Bercy is a railway station and terminus in [MASK], operated by the SNCF.",
+          "obj_surface": "Paris, France",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Trains operated by SBB-CFF-FFS use Basel SBB to link Basel with destinations within Switzerland and Italy, as do Deutsche Bahn Intercity-Express (ICE) trains to and from Germany, Zürich and Interlaken, most SNCF TGV trains to and from [MASK], and some regional trains to and from Alsace.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Paris Nord (or the Gare du Nord, \"North Station\", [ɡaʁ dy nɔːʁ]) is one of the six large terminus stations of the SNCF mainline network for [MASK].",
+          "obj_surface": "Paris, France",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Paris Est (or Gare de l'Est, \"East station\" in English) is one of the six large SNCF termini in [MASK].",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "The station is served by [MASK]' express suburban rail system, the RER Line C and RER Line D. The train services are operated by SNCF.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "The station is served by Transilien line P (East [MASK]) and RER line E services operated by SNCF.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "The station is served by TGV (high speed) Bordeaux - [MASK] and Lille - Bordeaux, Intercités Bordeaux - Périgueux - Lyon and Bordeaux - Périgueux - Ussel (long distance) and TER (local) services operated by SNCF.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "There is an SNCF station in the town with trains running to Briançon and [MASK].",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "The locomotives were originally numbered E.1 to E.80 prior to the [MASK] and Orleans railway company's incorporation into the Société Nationale des Chemins de fer Français (SNCF) in 1937.",
+          "obj_surface": "Paris",
+          "sub_surface": "Société Nationale des Chemins de fer Français"
+        },
+        {
+          "masked_sentence": "The locomotives were originally numbered E.1 to E.80 prior to the [MASK] and Orleans railway company's incorporation into the Société Nationale des Chemins de fer Français (SNCF) in 1937.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "The class were built as part of an order for 200 locomotives of similar types and were initially used on the newly electrified [MASK] - Vierzon line before being displaced by the SNCF 2D2 5500 class.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "The locomotives were used on mixed trains on lines between [MASK] and Bordeaux, after incorporation into SNCF the locomotives were used for shunting duties.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "SNCF also runs Intercités de Nuit night trains to [MASK].",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Compagnie du PO (Paris-Orléans): 279 locomotives Compagnie du Midi: 40 locomotives Chemins de fer de [MASK] à Lyon et à la Méditerranée: 462 locomotivesNew construction PLM Rebuilds SNCF Rebuilds",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "She was built in 1987 by Chantiers du Nord et de la Mediterranee, Dunkirk (Yard No 325) for Societe Nationale des Chemin de Fer Francais (SNCF), [MASK] as a multi-purpose passenger and roll-on roll-off ferry for lorries and railway vehicles.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "One year before the creating of the TEE-network the French railway SNCF introduced three Trains d'affaires to link [MASK] with the industrial area in the North near the Belgian border.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "One year before the creating of the TEE-network the French railway SNCF introduced three Trains d'affaires to link [MASK] with the industrial area in the North near the Belgian border.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "One year before the creation of the TEE-network the French railway SNCF introduced three Trains d'affaires to link [MASK] with the industrial area of Nord, near the Belgian border.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "The Molière was an international train operated by SNCF, initially linking [MASK] and Düsseldorf.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "The station is served by Transilien line P (East [MASK]) services operated by SNCF.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Owned by Ferrocarriles de Cuba, it is operated by SNCF PBA coaches originally used in Europe between [MASK] and Amsterdam on the ex-Trans Europ Express (TEE) Étoile du Nord service.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "It linked London with Dover, where passengers took the ferry to Calais to join the Flèche d’Or of the Chemin de Fer du Nord and later SNCF which took them on to [MASK].",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Painted in the blue and white livery of Transilien, the brand name for the SNCF network around [MASK], these locomotives are the passenger equivalent of the freight-only SNCF Class BB 27000 and are equipped for push-pull operation on suburban passenger services in the Île-de-France region around Paris, working with refurbished VB2N double-deck carriages.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Painted in the blue and white livery of Transilien, the brand name for the SNCF network around Paris, these locomotives are the passenger equivalent of the freight-only SNCF Class BB 27000 and are equipped for push-pull operation on suburban passenger services in the Île-de-France region around [MASK], working with refurbished VB2N double-deck carriages.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Based in [MASK], Keolis is owned by the SNCF (French National Railways Corporation) at 70% and the Caisse de dépôt et placement du Québec which is translated as Quebec Deposit & Investment Fund (public pension plans in the province of Quebec) at 30%.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "SNCF decided instead to build the new high-speed line on a more direct route between [MASK] and Lille.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Following on the TGS prototype in 1967, SNCF introduced gas turbine propulsion with the ETG (Elément à Turbine à Gaz, or Gas Turbine Unit) turbotrains in [MASK] - Cherbourg service, in March 1970.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "The Syndicat des transports d'Île-de-France (STIF) is the transport organisation authority that controls the [MASK] public transport network and coordinates the different transport companies operating in Île-de-France, mainly the RATP, the SNCF and Optile.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "The Gare de Lyon rail accident occurred on 27 June 1988, when an SNCF commuter train headed inbound to [MASK]'s Gare de Lyon terminal crashed into a stationary outbound train, killing 56 and injuring 55.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "It is on the former main rail route between Brussels and [MASK], and it was the virtual tariff border between the French SNCF and Belgian Railways SNCB.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Transilien services from [MASK] – Est are part of the SNCF Gare de l'Est rail network, and marked \"P\".",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Transilien services from [MASK] – Nord are part of the SNCF Gare du Nord rail network.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        },
+        {
+          "masked_sentence": "Transilien services from [MASK] – Saint-Lazare are part of the SNCF Saint-Lazare rail network.",
+          "obj_surface": "Paris",
+          "sub_surface": "SNCF"
+        }
+      ],
+      "obj_label": "Paris",
+      "obj_uri": "Q90",
+      "predicate_id": "P740",
+      "source_category": "TREx",
+      "source_file": "data/TREx/P740.jsonl",
+      "sub_label": "SNCF",
+      "sub_uri": "Q13646",
+      "uuid": "afacd04c-bf64-4490-ae5d-9a35b8b24a75"
+    },
+    {
+      "evidences": [
+        {
+          "masked_sentence": "Starwood Capital Group is an American private investment firm headquartered in [MASK].",
+          "obj_surface": "Greenwich, Connecticut",
+          "sub_surface": "Starwood Capital Group"
+        },
+        {
+          "masked_sentence": "Starwood Capital Group is an American private investment firm headquartered in [MASK].",
+          "obj_surface": "Greenwich, Connecticut",
+          "sub_surface": "Starwood Capital Group"
+        }
+      ],
+      "obj_label": "Greenwich",
+      "obj_uri": "Q49202",
+      "predicate_id": "P740",
+      "source_category": "TREx",
+      "source_file": "data/TREx/P740.jsonl",
+      "sub_label": "Starwood Capital Group",
+      "sub_uri": "Q3497260",
+      "uuid": "7e9df2a1-62f3-426a-b4cb-6c0dfd726898"
+    },
+    {
+      "evidences": [
+        {
+          "masked_sentence": "Clap Your Hands Say Yeah (often abbreviated CYHSY) is the musical project of American indie rock musician Alec Ounsworth; based in [MASK] and founded in 2004.",
+          "obj_surface": "Philadelphia, Pennsylvania",
+          "sub_surface": "Clap Your Hands Say Yeah"
+        },
+        {
+          "masked_sentence": "Clap Your Hands Say Yeah (often abbreviated CYHSY) is the musical project of American indie rock musician Alec Ounsworth; based in [MASK] and founded in 2004.",
+          "obj_surface": "Philadelphia, Pennsylvania",
+          "sub_surface": "Clap Your Hands Say Yeah"
+        },
+        {
+          "masked_sentence": "Clap Your Hands Say Yeah (often abbreviated CYHSY) is the musical project of American indie rock musician Alec Ounsworth; based in [MASK] and founded in 2004.",
+          "obj_surface": "Philadelphia, Pennsylvania",
+          "sub_surface": "Clap Your Hands Say Yeah"
+        }
+      ],
+      "obj_label": "Philadelphia",
+      "obj_uri": "Q1345",
+      "predicate_id": "P740",
+      "source_category": "TREx",
+      "source_file": "data/TREx/P740.jsonl",
+      "sub_label": "Clap Your Hands Say Yeah",
+      "sub_uri": "Q684537",
+      "uuid": "6818df2b-6479-4f42-a265-628f7330c216"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Khatchig Mouradian is a journalist, writer and translator born in Lebanon ."
+          ],
+          "snippet": "Khatchig Mouradian is a journalist, writer and translator born in Lebanon. He was one of the junior editors of the Lebanese-Armenian daily newspaper Aztag from 2000 to 2007, when he moved to Boston and became the editor of the Armenian Weekly. Mouradian holds a B.S. in biology and has studied towards a graduate degree in clinical psychology. He is working towards a PhD in Genocide Studies at Clark University http://www.clarku.edu/departments/holocaust/phd/research.cfm.",
+          "url": "http://en.wikipedia.org/wiki/Khatchig_Mouradian"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "no",
+          "rater": "17082466750572480596"
+        },
+        {
+          "judgment": "yes",
+          "rater": "1014448455121957356"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16169597761094238409"
+        },
+        {
+          "judgment": "yes",
+          "rater": "11595942516201422884"
+        },
+        {
+          "judgment": "yes",
+          "rater": "2050861176556883424"
+        }
+      ],
+      "masked_sentences": [
+        "Khatchig Mouradian is a journalist, writer and translator born in [MASK] ."
+      ],
+      "obj": "/m/04hqz",
+      "obj_aliases": [
+        "Lebanese Republic",
+        "lb",
+        "Republic of Lebanon",
+        "🇱🇧"
+      ],
+      "obj_label": "Lebanon",
+      "obj_w": "Q822",
+      "pred": "/people/person/place_of_birth",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/place_of_birth_test.jsonl",
+      "sub": "/m/047fprg",
+      "sub_aliases": [],
+      "sub_label": "Khatchig Mouradian",
+      "sub_w": null,
+      "uuid": "9c68053f-0e3a-4db1-ab37-4e12d89b26d8"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Jacob Henry Studer (26 February 1840 Columbus, Ohio - 2 August 1904 New York City) was a printer, lithographer, painter, and popular ornithologist active in Columbus, Ohio from the 1860s to the 1880s ."
+          ],
+          "snippet": "Jacob Henry Studer (26 February 1840 Columbus, Ohio - 2 August 1904 New York City) was a printer, lithographer, painter, and popular ornithologist active in Columbus, Ohio from the 1860s to the 1880s. He was also author of a work entitled Columbus, Ohio; its History, Resources, and Progress (1873). He founded the Board of Trade of Columbus in 1872 (New York Times, 1904). Studer was active in the American Ornithologists' Union and the Ohio Society of New York. Later in his life, Studer resided in New York City (Haverstock, 2000; New York Times, 1904), apparently as early as 1887 (New York Times, 1887). He is best known as the author of Studer's Popular Ornithology. This work had several editions, published over the period 1874 to 1903 (Cornell University). It was illustrated with chromolithographs after paintings by Theodore Jasper. Studer died in his office (Manhattan Building, 96th 5th Avenue), where he also lived at the time. A son, James Studer, survived him (New York Times, 1904). Other members of his family predeceased him: Caroline Buss Studer (died 2 September 1871, age 30), daughters Mary Francisca and Anna Regina (both died April, 1876, ages 11 and 13), and another son John Bernard Studer (died 11 May 1901, age 32), according to the dedication page of the 1903 edition of Studer's Popular Ornithology.",
+          "url": "http://en.wikipedia.org/wiki/Jacob_Henry_Studer"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "11595942516201422884"
+        },
+        {
+          "judgment": "yes",
+          "rater": "2050861176556883424"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16651790297630307764"
+        },
+        {
+          "judgment": "yes",
+          "rater": "17082466750572480596"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16169597761094238409"
+        }
+      ],
+      "masked_sentences": [
+        "Jacob Henry Studer (26 February 1840 [MASK], Ohio - 2 August 1904 New York City) was a printer, lithographer, painter, and popular ornithologist active in [MASK], Ohio from the 1860s to the 1880s ."
+      ],
+      "obj": "/m/01smm",
+      "obj_aliases": [
+        "Columbus, Ohio",
+        "The Discovery City",
+        "Arch City",
+        "Indie Art Capital",
+        "Cowtown",
+        "The Biggest Small Town in America",
+        "Cbus"
+      ],
+      "obj_label": "Columbus",
+      "obj_w": "Q16567",
+      "pred": "/people/person/place_of_birth",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/place_of_birth_test.jsonl",
+      "sub": "/m/05s_n20",
+      "sub_aliases": [],
+      "sub_label": "Jacob Henry Studer",
+      "sub_w": null,
+      "uuid": "745040a0-6ebd-4542-bb73-1aa5b34e3042"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Born in Glasgow, Stephen became a welder's apprentice on leaving school ."
+          ],
+          "snippet": "Born in Glasgow, Stephen became a welder's apprentice on leaving school. He moved to London from Glasgow in 1952 at the age of 18, and worked as a waiter and also for London's first young male boutique, Vince Man Shop in Newburgh Street, central London .",
+          "url": "http://en.wikipedia.org/wiki/John_Stephen"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "2050861176556883424"
+        },
+        {
+          "judgment": "yes",
+          "rater": "4464315225392470006"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16651790297630307764"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16169597761094238409"
+        },
+        {
+          "judgment": "yes",
+          "rater": "11658533362118524115"
+        }
+      ],
+      "masked_sentences": [
+        "Born in [MASK], Stephen became a welder's apprentice on leaving school ."
+      ],
+      "obj": "/m/0hyxv",
+      "obj_aliases": [
+        "Glasgow, Scotland"
+      ],
+      "obj_label": "Glasgow",
+      "obj_w": "Q4093",
+      "pred": "/people/person/place_of_birth",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/place_of_birth_test.jsonl",
+      "sub": "/m/027xc_t",
+      "sub_aliases": [],
+      "sub_label": "John Stephen",
+      "sub_w": null,
+      "uuid": "7b889bbc-ad83-4a08-b8b5-72d1594a893c"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Georgina Willis is an award winning film director who was born in Australia and now lives in London ."
+          ],
+          "snippet": "Georgina Willis is an award winning film director who was born in Australia and now lives in London. Georgina's first feature, Watermark (2003), made its debut in the Cannes Film Festival. It was the first independent film to be included in Cannes. Her production company, Potoroo Films, is now based in London. Georgina Willis's and producer Kerry Rock's work became some of the most prominent at international festivals being shown at over eighty international festivals and receiving many awards for their work. Georgina has recently been accepted as a member of the Directors Guild of Great Britain.",
+          "url": "http://en.wikipedia.org/wiki/Georgina_Willis"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "17082466750572480596"
+        },
+        {
+          "judgment": "yes",
+          "rater": "5505751039176460562"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16169597761094238409"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16169597761094238409"
+        },
+        {
+          "judgment": "yes",
+          "rater": "11658533362118524115"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16651790297630307764"
+        }
+      ],
+      "masked_sentences": [
+        "Georgina Willis is an award winning film director who was born in [MASK] and now lives in London ."
+      ],
+      "obj": "/m/0chghy",
+      "obj_aliases": [
+        "Commonwealth of Australia",
+        "AU",
+        "AUS",
+        "au",
+        "British Colony of Australia",
+        "🇦🇺",
+        "Straya"
+      ],
+      "obj_label": "Australia",
+      "obj_w": "Q408",
+      "pred": "/people/person/place_of_birth",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/place_of_birth_test.jsonl",
+      "sub": "/m/02x3vxv",
+      "sub_aliases": [],
+      "sub_label": "Georgina Willis",
+      "sub_w": null,
+      "uuid": "ae0f9d49-7d2f-454e-af46-94c704ddd83f"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Corrsin was born on 3 April 1920 in Philadelphia, Pennsylvania ."
+          ],
+          "snippet": "Corrsin was born on 3 April 1920 in Philadelphia, Pennsylvania. He received his B.S. from the University of Pennsylvania in 1940. He entered the California Institute of Technology for his graduate studies and worked in the Guggenheim Aeronautical Laboratory under Theodore von Kármán. After receiving his M.S. degree in 1942, Corrsin joined the Ph.D. program under the supervision of Hans Liepmann and obtained the degree in 1947. His thesis work was on the flow of a turbulent jet and he was the first advisee of Liepmann. Corrsin joined the Department of Aeronautics at Johns Hopkins University in 1947 as an Assistant Professor. He became an Associate Professor in 1951 and then was named Professor of mechanical Engineering in 1955. He served as department chair of Mechanical Engineering from 1955 to 1960. He was at various times affiliated with the Departments of Biomedical Engineering, Chemical Engineering, and Mechanics and Materials Science. In 1979, he helped found the Department of Chemical Engineering. In 1981, he became the first Theophilus Halley Smoot Professor of Engineering at Johns Hopkins.",
+          "url": "http://en.wikipedia.org/wiki/Stanley_Corrsin"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "16169597761094238409"
+        },
+        {
+          "judgment": "yes",
+          "rater": "17082466750572480596"
+        },
+        {
+          "judgment": "yes",
+          "rater": "1014448455121957356"
+        },
+        {
+          "judgment": "yes",
+          "rater": "2050861176556883424"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16651790297630307764"
+        }
+      ],
+      "masked_sentences": [
+        "Corrsin was born on 3 April 1920 in [MASK], Pennsylvania ."
+      ],
+      "obj": "/m/0dclg",
+      "obj_aliases": [
+        "Philly",
+        "City of Brotherly Love",
+        "Cradle of Liberty",
+        "Philadelphia, Pennsylvania"
+      ],
+      "obj_label": "Philadelphia",
+      "obj_w": "Q1345",
+      "pred": "/people/person/place_of_birth",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/place_of_birth_test.jsonl",
+      "sub": "/m/0cn_13r",
+      "sub_aliases": [],
+      "sub_label": "Stanley Corrsin",
+      "sub_w": "Q7599544",
+      "uuid": "2edd4160-57ca-48ba-b0e2-f53e2e3c3d7d"
+    },
+    {
+      "masked_sentences": [
+        "One of the things you do when you are alive is [MASK]."
+      ],
+      "obj": "think",
+      "obj_label": "think",
+      "pred": "HasSubevent",
+      "source_category": "ConceptNet",
+      "source_file": "data/ConceptNet/test.jsonl",
+      "sub": "alive",
+      "uuid": "d4f11631dde8a43beda613ec845ff7d1"
+    },
+    {
+      "masked_sentences": [
+        "Something that might happen when you analyse something is [MASK]."
+      ],
+      "obj": "paralysis",
+      "obj_label": "paralysis",
+      "pred": "HasSubevent",
+      "source_category": "ConceptNet",
+      "source_file": "data/ConceptNet/test.jsonl",
+      "sub": "analyse",
+      "uuid": "4b0c94af3a9339e4e5a3f9cbc057fac8"
+    },
+    {
+      "masked_sentences": [
+        "Something that might happen while analysing something is [MASK]."
+      ],
+      "obj": "analysis",
+      "obj_label": "analysis",
+      "pred": "HasSubevent",
+      "source_category": "ConceptNet",
+      "source_file": "data/ConceptNet/test.jsonl",
+      "sub": "analysing",
+      "uuid": "63471b3167a6a8769d9f3748ca5d0e0e"
+    },
+    {
+      "masked_sentences": [
+        "Something that might happen while analysing something is [MASK]."
+      ],
+      "obj": "education",
+      "obj_label": "education",
+      "pred": "HasSubevent",
+      "source_category": "ConceptNet",
+      "source_file": "data/ConceptNet/test.jsonl",
+      "sub": "analysing",
+      "uuid": "67d690e232c0dcff0f1dab22037471bd"
+    },
+    {
+      "masked_sentences": [
+        "Something that might happen while analysing something is coming up with a new [MASK]."
+      ],
+      "obj": "idea",
+      "obj_label": "idea",
+      "pred": "HasSubevent",
+      "source_category": "ConceptNet",
+      "source_file": "data/ConceptNet/test.jsonl",
+      "sub": "analysing",
+      "uuid": "f36e54ad99a0353e5a51e0e3487c489d"
+    },
+    {
+      "id": "56be4db0acb8001400a502f0_0",
+      "masked_sentences": [
+        "To emphasize the 50th anniversary of the Super Bowl the [MASK] color was used."
+      ],
+      "obj_label": "gold",
+      "source_category": "Squad",
+      "source_file": "data/Squad/test.jsonl",
+      "sub_label": "Squad"
+    },
+    {
+      "id": "56bf17653aeaaa14008c9513_0",
+      "masked_sentences": [
+        "Von Miller plays in [MASK] position for the Denver Broncos."
+      ],
+      "obj_label": "linebacker",
+      "source_category": "Squad",
+      "source_file": "data/Squad/test.jsonl",
+      "sub_label": "Squad"
+    },
+    {
+      "id": "57273b69dd62a815002e99d8_0",
+      "masked_sentences": [
+        "The TGIF comedy Family Matters for the 1997-98 season was originally aired by [MASK]."
+      ],
+      "obj_label": "CBS",
+      "source_category": "Squad",
+      "source_file": "data/Squad/test.jsonl",
+      "sub_label": "Squad"
+    },
+    {
+      "id": "56bf3a223aeaaa14008c9576_0",
+      "masked_sentences": [
+        "Thomas Davis broke his [MASK] during the NFC Championship Game."
+      ],
+      "obj_label": "arm",
+      "source_category": "Squad",
+      "source_file": "data/Squad/test.jsonl",
+      "sub_label": "Squad"
+    },
+    {
+      "id": "56bf41013aeaaa14008c959b_0",
+      "masked_sentences": [
+        "The first choice in the NFL draft of 1998 was [MASK]."
+      ],
+      "obj_label": "Manning",
+      "source_category": "Squad",
+      "source_file": "data/Squad/test.jsonl",
+      "sub_label": "Squad"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Peter F Martin (born 1941) is an American politician who is a Democratic member of the Rhode Island House of Representatives ."
+          ],
+          "snippet": "Peter F. Martin (born 1941) is an American politician who is a Democratic member of the Rhode Island House of Representatives. He has represented the 75th District Newport since 6 January 2009. He is currently serves on the House Committees on Judiciary, Municipal Government, and Veteran's Affairs. During his first term of office he served on the House Committees on Small Business and Separation of Powers & Government Oversight. In August 2010, Representative Martin was appointed as a Commissioner on the Atlantic States Marine Fisheries Commission",
+          "url": "http://en.wikipedia.org/wiki/Peter_F._Martin"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "18349444711114572460"
+        },
+        {
+          "judgment": "yes",
+          "rater": "17595829233063766365"
+        },
+        {
+          "judgment": "yes",
+          "rater": "4593294093459651288"
+        },
+        {
+          "judgment": "yes",
+          "rater": "7387074196865291426"
+        },
+        {
+          "judgment": "yes",
+          "rater": "17154471385681223613"
+        }
+      ],
+      "masked_sentences": [
+        "Peter F Martin (born [MASK]) is an American politician who is a Democratic member of the Rhode Island House of Representatives ."
+      ],
+      "obj": "1941",
+      "obj_aliases": [],
+      "obj_label": "1941",
+      "obj_w": null,
+      "pred": "/people/person/date_of_birth",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/date_of_birth_test.jsonl",
+      "sub": "/m/09gb0bw",
+      "sub_aliases": [],
+      "sub_label": "Peter F. Martin",
+      "sub_w": null,
+      "uuid": "18af2dac-21d3-4c42-aff5-c247f245e203"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Maria Pilar Romero (born 22 May 1982) is a team handball player from Argentina ."
+          ],
+          "snippet": "Maria Pilar Romero (born 22 May 1982) is a team handball player from Argentina. She plays on the Argentine national team, and participated at the 2011 World Women's Handball Championship in Brazil.",
+          "url": "http://en.wikipedia.org/wiki/Maria_Pilar_Romero"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "14728826318420078902"
+        },
+        {
+          "judgment": "yes",
+          "rater": "7520160179218527648"
+        },
+        {
+          "judgment": "yes",
+          "rater": "3571030073219370006"
+        },
+        {
+          "judgment": "yes",
+          "rater": "17154471385681223613"
+        },
+        {
+          "judgment": "yes",
+          "rater": "14953915240951219400"
+        }
+      ],
+      "masked_sentences": [
+        "Maria Pilar Romero (born 22 May [MASK]) is a team handball player from Argentina ."
+      ],
+      "obj": "1982-05-22",
+      "obj_aliases": [],
+      "obj_label": "1982",
+      "obj_w": null,
+      "pred": "/people/person/date_of_birth",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/date_of_birth_test.jsonl",
+      "sub": "/m/0hrd6l2",
+      "sub_aliases": [
+        "Maria Pilar Romero"
+      ],
+      "sub_label": "Pilar Romero",
+      "sub_w": "Q7723827",
+      "uuid": "a6847930-759b-4100-adbc-3259f1169521"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Federico Falco is an Argentinian writer born in 1977 ."
+          ],
+          "snippet": "Federico Falco is an Argentinian writer born in 1977. He holds a BA in Communications from Blas Pascal University in Argentina and an MFA in Creative Writing in Spanish from New York University. He currently lives in New York City.",
+          "url": "http://en.wikipedia.org/wiki/Federico_Falco"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "18349444711114572460"
+        },
+        {
+          "judgment": "yes",
+          "rater": "7387074196865291426"
+        },
+        {
+          "judgment": "yes",
+          "rater": "10201641847309736017"
+        },
+        {
+          "judgment": "yes",
+          "rater": "7191959984199324932"
+        },
+        {
+          "judgment": "yes",
+          "rater": "17154471385681223613"
+        }
+      ],
+      "masked_sentences": [
+        "Federico Falco is an Argentinian writer born in [MASK] ."
+      ],
+      "obj": "1977",
+      "obj_aliases": [],
+      "obj_label": "1977",
+      "obj_w": null,
+      "pred": "/people/person/date_of_birth",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/date_of_birth_test.jsonl",
+      "sub": "/m/0gh6jxk",
+      "sub_aliases": [],
+      "sub_label": "Federico Falco",
+      "sub_w": "Q5440994",
+      "uuid": "08e34bc9-7898-4505-bb31-594959a88d2e"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Tan Jiexi (born December 2, 1988 in Shenzhen,China), is a Chinese singer-songwriter debuted in 2010 after wining the fourth place at the 2010 Happy Boy singing competition ."
+          ],
+          "snippet": "This is a Chinese name; the family name is Tan. Tan Jiexi (born December 2, 1988 in Shenzhen,China), is a Chinese singer-songwriter debuted in 2010 after wining the fourth place at the 2010 Happy Boy singing competition.",
+          "url": "http://en.wikipedia.org/wiki/Tan_Jiexi"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "3571030073219370006"
+        },
+        {
+          "judgment": "yes",
+          "rater": "7917053321523182674"
+        },
+        {
+          "judgment": "yes",
+          "rater": "13133868043235800488"
+        },
+        {
+          "judgment": "yes",
+          "rater": "17870819119207423173"
+        },
+        {
+          "judgment": "yes",
+          "rater": "10201641847309736017"
+        }
+      ],
+      "masked_sentences": [
+        "Tan Jiexi (born December 2, [MASK] in Shenzhen,China), is a Chinese singer-songwriter debuted in 2010 after wining the fourth place at the 2010 Happy Boy singing competition ."
+      ],
+      "obj": "1988-12-02",
+      "obj_aliases": [],
+      "obj_label": "1988",
+      "obj_w": null,
+      "pred": "/people/person/date_of_birth",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/date_of_birth_test.jsonl",
+      "sub": "/m/0hr1zl1",
+      "sub_aliases": [],
+      "sub_label": "Tan Jiexi",
+      "sub_w": null,
+      "uuid": "72ac7280-68c3-4247-82c9-0da6dca6628d"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "David Carrier (born 1944) is an American philosopher and art and culture critic ."
+          ],
+          "snippet": "David Carrier (born 1944) is an American philosopher and art and culture critic. He is a Champney Family Professor in the department of art and art history at Case Western Reserve University and was formerly a professor of philosophy at Carnegie Mellon University. He is the author of Principles of Art History Writing (Penn State University Press, 1991), The Aesthete in the City: The Philosophy and Practice of American Abstract Painting in the 1980s (Penn State University Press, 1994), High Art: Charles Baudelaire and the Origins of Modernist Painting (Penn State University Press, 1996), A World Art History and Its Objects (Penn State University Press, 2009), The Aesthetics of Comics (Penn State University Press, 2000), and Museum Skepticism: A History of the Display of Art in Public Galleries (Duke University Press, 2006), among others. He is a contributor to ArtForum, BOMB Magazine, and ArtUS.",
+          "url": "http://en.wikipedia.org/wiki/David_Carrier"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "18349444711114572460"
+        },
+        {
+          "judgment": "yes",
+          "rater": "3571030073219370006"
+        },
+        {
+          "judgment": "yes",
+          "rater": "3615053018572949242"
+        },
+        {
+          "judgment": "yes",
+          "rater": "13133868043235800488"
+        },
+        {
+          "judgment": "yes",
+          "rater": "17154471385681223613"
+        }
+      ],
+      "masked_sentences": [
+        "David Carrier (born [MASK]) is an American philosopher and art and culture critic ."
+      ],
+      "obj": "1944",
+      "obj_aliases": [],
+      "obj_label": "1944",
+      "obj_w": null,
+      "pred": "/people/person/date_of_birth",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/date_of_birth_test.jsonl",
+      "sub": "/m/0hr6_h4",
+      "sub_aliases": [],
+      "sub_label": "David Carrier",
+      "sub_w": null,
+      "uuid": "c8dfdccc-b02e-442c-b60e-85a460d71d23"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "After the war John Starr opened a night-club in Hanley, Staffordshire, in partnership with the brothers Alfred and Henry Newton, SOE agents whom he had met during his training and also at the Avenue Foch .",
+            "He later returned to live in Paris, before moving to Switzerland, where he died in 1996 ."
+          ],
+          "snippet": "After the war John Starr opened a night-club in Hanley, Staffordshire, in partnership with the brothers Alfred and Henry Newton, SOE agents whom he had met during his training and also at the Avenue Foch. The Newton brothers had been in the Buchenwald concentration camp. He later returned to live in Paris, before moving to Switzerland, where he died in 1996.",
+          "url": "http://en.wikipedia.org/wiki/John_Renshaw_Starr"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "17966044108931836156"
+        },
+        {
+          "judgment": "yes",
+          "rater": "1406006087371975930"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16676975657004889938"
+        },
+        {
+          "judgment": "yes",
+          "rater": "13855588585185268925"
+        },
+        {
+          "judgment": "yes",
+          "rater": "4185483665120273114"
+        }
+      ],
+      "masked_sentences": [
+        "After the war John Starr opened a night-club in Hanley, Staffordshire, in partnership with the brothers Alfred and Henry Newton, SOE agents whom he had met during his training and also at the Avenue Foch .",
+        "He later returned to live in Paris, before moving to [MASK], where he died in 1996 ."
+      ],
+      "obj": "/m/06mzp",
+      "obj_aliases": [
+        "Swiss Confederation",
+        "CH",
+        "SUI",
+        "Suisse",
+        "Schweiz",
+        "Svizzera",
+        "🇨🇭"
+      ],
+      "obj_label": "Switzerland",
+      "obj_w": "Q39",
+      "pred": "/people/deceased_person/place_of_death",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/place_of_death_test.jsonl",
+      "sub": "/m/0205jm",
+      "sub_aliases": [],
+      "sub_label": "John Renshaw Starr",
+      "sub_w": "Q3182510",
+      "uuid": "61aad52c-4256-468a-a9ae-55e3fa4dc44e"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Arroyo died at Madrid in 1551 ."
+          ],
+          "snippet": "Diego de Arroyo, a miniature painter, who was born at Toledo in 1498, is supposed to have studied either in Italy or under an Italian master. His delicate miniature portraits gained him much renown, and the appointment of painter to Charles V. He also illuminated choir-books for the cathedral of Toledo. Arroyo died at Madrid in 1551.",
+          "url": "http://en.wikipedia.org/wiki/Diego_de_Arroyo"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "3633697795227880988"
+        },
+        {
+          "judgment": "yes",
+          "rater": "3422319225482654240"
+        },
+        {
+          "judgment": "yes",
+          "rater": "8841266254638695693"
+        },
+        {
+          "judgment": "skip",
+          "rater": "13855588585185268925"
+        },
+        {
+          "judgment": "yes",
+          "rater": "15683306407052553031"
+        }
+      ],
+      "masked_sentences": [
+        "Arroyo died at [MASK] in 1551 ."
+      ],
+      "obj": "/m/056_y",
+      "obj_aliases": [
+        "City of Madrid"
+      ],
+      "obj_label": "Madrid",
+      "obj_w": "Q2807",
+      "pred": "/people/deceased_person/place_of_death",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/place_of_death_test.jsonl",
+      "sub": "/m/0c4031r",
+      "sub_aliases": [],
+      "sub_label": "Diego de Arroyo",
+      "sub_w": "Q5274857",
+      "uuid": "97483332-dd08-45d5-8181-a4438756c351"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Murakowski died in 1985 at age 60 at his home in Hammond, Indiana ."
+          ],
+          "snippet": "Murakowski died in 1985 at age 60 at his home in Hammond, Indiana. He was survived by his wife, Lucille Murakowski, three sons, and three daughters.",
+          "url": "http://en.wikipedia.org/wiki/Art_Murakowski"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "14404876356854644346"
+        },
+        {
+          "judgment": "yes",
+          "rater": "16676975657004889938"
+        },
+        {
+          "judgment": "yes",
+          "rater": "14894151489932721675"
+        },
+        {
+          "judgment": "yes",
+          "rater": "17966044108931836156"
+        },
+        {
+          "judgment": "yes",
+          "rater": "4185483665120273114"
+        }
+      ],
+      "masked_sentences": [
+        "Murakowski died in 1985 at age 60 at his home in [MASK], Indiana ."
+      ],
+      "obj": "/m/0sn4f",
+      "obj_aliases": [
+        "Hammond, Indiana"
+      ],
+      "obj_label": "Hammond",
+      "obj_w": "Q856860",
+      "pred": "/people/deceased_person/place_of_death",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/place_of_death_test.jsonl",
+      "sub": "/m/0bmf_6s",
+      "sub_aliases": [],
+      "sub_label": "Art Murakowski",
+      "sub_w": null,
+      "uuid": "9ed48bca-4f61-412f-80c2-42bd44a63d58"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Belissen remained in Marseilles until his death ."
+          ],
+          "snippet": "By 1722 Belissen settled in Marseille, where he succeeded Antoine Blanchard as maître de musique of the Abbey of St. Victor, which was then rapidly declining in importance--but he also secured a position directing the city's Académie de Concerts. Belissen remained in Marseilles until his death.",
+          "url": "http://en.wikipedia.org/wiki/Laurent_Belissen"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "3633697795227880988"
+        },
+        {
+          "judgment": "yes",
+          "rater": "18393280535210278125"
+        },
+        {
+          "judgment": "yes",
+          "rater": "8841266254638695693"
+        },
+        {
+          "judgment": "yes",
+          "rater": "13855588585185268925"
+        },
+        {
+          "judgment": "yes",
+          "rater": "15683306407052553031"
+        }
+      ],
+      "masked_sentences": [
+        "Belissen remained in [MASK]s until his death ."
+      ],
+      "obj": "/m/0jdtt",
+      "obj_aliases": [
+        "Bay of Marseille",
+        "Massaliotes",
+        "Massalia",
+        "Marsailles",
+        "Marseilles",
+        "Marsielles",
+        "Marsielle",
+        "City of Marseille",
+        "Marsaille",
+        "Marsiglia"
+      ],
+      "obj_label": "Marseille",
+      "obj_w": "Q23482",
+      "pred": "/people/deceased_person/place_of_death",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/place_of_death_test.jsonl",
+      "sub": "/m/05tmcf",
+      "sub_aliases": [],
+      "sub_label": "Laurent Belissen",
+      "sub_w": "Q1808061",
+      "uuid": "10fb9157-33b5-4254-a27f-6abec0e5ce50"
+    },
+    {
+      "evidences": [
+        {
+          "considered_sentences": [
+            "Tournély died at Paris ."
+          ],
+          "snippet": "Tournély was actively engaged in furthering the acceptance of this Constitution by the assembly of the French clergy, of which he was a consultor, and by the faculty of theology of which he was an influential member. When, after the death of Louis XIV (1715) and after the connivance of Cardinal Noailles, the Jansenists became masters of the faculty of theology, they expunged from its registers the Bull ``Unigenitus'' and expelled from its meetings Tournély and a score of his friends among the doctors (January 1716). It was only at the earnest intervention of the regent, the Duke of Orléans, that they were reinstated five years later (February 1721). Tournély died at Paris.",
+          "url": "http://en.wikipedia.org/wiki/Honor%C3%A9_Tourn%C3%A9ly"
+        }
+      ],
+      "judgments": [
+        {
+          "judgment": "yes",
+          "rater": "8841266254638695693"
+        },
+        {
+          "judgment": "yes",
+          "rater": "17366110017494150315"
+        },
+        {
+          "judgment": "yes",
+          "rater": "9080307652848457551"
+        },
+        {
+          "judgment": "yes",
+          "rater": "14404876356854644346"
+        },
+        {
+          "judgment": "yes",
+          "rater": "4185483665120273114"
+        }
+      ],
+      "masked_sentences": [
+        "Tournély died at [MASK] ."
+      ],
+      "obj": "/m/05qtj",
+      "obj_aliases": [
+        "City of Light",
+        "Paris, France"
+      ],
+      "obj_label": "Paris",
+      "obj_w": "Q90",
+      "pred": "/people/deceased_person/place_of_death",
+      "source_category": "Google_RE",
+      "source_file": "data/Google_RE/place_of_death_test.jsonl",
+      "sub": "/m/03qkk0z",
+      "sub_aliases": [
+        "Honore Tournely"
+      ],
+      "sub_label": "Honoré Tournély",
+      "sub_w": "Q3140264",
+      "uuid": "2bad5d83-437c-432b-a65d-d2aaedec8e9a"
+    }
+  ],
+  "recommended_mapping": {
+    "context_ids_a": "prefix before the single terminal [MASK] in masked_sentences[0]",
+    "negative_ids_a": "different object from the same relation",
+    "positive_ids_a": "obj_label or object",
+    "relation": "predicate_id, relation, or relation file stem",
+    "source_extension": "source category/file, original masked sentence, object id",
+    "subject": "sub_label or subject"
+  },
+  "row_count": {
+    "archive_entries": 52,
+    "note": "probe intentionally stops after enough rows; these are not full file counts",
+    "sampled_file_rows_read": {
+      "data/ConceptNet/test.jsonl": 29774,
+      "data/Google_RE/date_of_birth_test.jsonl": 1825,
+      "data/Google_RE/place_of_birth_test.jsonl": 2937,
+      "data/Google_RE/place_of_death_test.jsonl": 766,
+      "data/Squad/test.jsonl": 305,
+      "data/TREx/P740.jsonl": 936
+    }
+  },
+  "source": {
+    "archive": "https://dl.fbaipublicfiles.com/LAMA/data.zip"
+  },
+  "source_issues": [],
+  "status": "ready_for_adapter",
+  "tokenization_samples": [
+    {
+      "context_a_decoded": "pianos become the teeth was founded in",
+      "context_a_tokens": [
+        27864,
+        2468,
+        1996,
+        4091,
+        2001,
+        2631,
+        1999
+      ],
+      "context_b_decoded": "",
+      "context_b_tokens": [],
+      "dataset": "lama",
+      "example_id": "lama-P740-0",
+      "extension": {
+        "masked_sentence": "Pianos Become the Teeth was founded in [MASK] .",
+        "source_category": "TREx",
+        "source_file": "data/TREx/P740.jsonl",
+        "subject": "Pianos Become the Teeth",
+        "template": "[X] was founded in [Y] ."
+      },
+      "group_id": "P740",
+      "negative_a_tokens": [
+        12331
+      ],
+      "negative_b_tokens": [],
+      "negative_text_a": "Helsinki",
+      "negative_text_b": "",
+      "pair_id": "lama-P740-0",
+      "phenomenon": "factual_recall",
+      "positive_a_tokens": [
+        6222
+      ],
+      "positive_b_tokens": [],
+      "positive_text_a": "Baltimore",
+      "positive_text_b": "",
+      "relation": "P740",
+      "score_mode": "continuation_margin",
+      "source_id": "data/TREx/P740.jsonl:0",
+      "split": "TREx",
+      "teacher_forced_candidate_span_a": [
+        7,
+        8
+      ],
+      "teacher_forced_candidate_span_b": null,
+      "text_a": "Pianos Become the Teeth was founded in",
+      "text_b": "",
+      "trace_details": {},
+      "trace_semantics": "last_context_token_prediction_state",
+      "trace_token_a": "in",
+      "trace_token_b": null,
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "khatchig mouradian is a journalist, writer and translator born in",
+      "context_a_tokens": [
+        1047,
+        12707,
+        5428,
+        2290,
+        9587,
+        4648,
+        11692,
+        2003,
+        1037,
+        4988,
+        1010,
+        3213,
+        1998,
+        11403,
+        2141,
+        1999
+      ],
+      "context_b_decoded": "",
+      "context_b_tokens": [],
+      "dataset": "lama",
+      "example_id": "lama-place_of_birth_test-0",
+      "extension": {
+        "masked_sentence": "Khatchig Mouradian is a journalist, writer and translator born in [MASK] .",
+        "source_category": "Google_RE",
+        "source_file": "data/Google_RE/place_of_birth_test.jsonl",
+        "subject": "Khatchig Mouradian",
+        "template": null
+      },
+      "group_id": "place_of_birth_test",
+      "negative_a_tokens": [
+        8912
+      ],
+      "negative_b_tokens": [],
+      "negative_text_a": "Columbus",
+      "negative_text_b": "",
+      "pair_id": "lama-place_of_birth_test-0",
+      "phenomenon": "factual_recall",
+      "positive_a_tokens": [
+        8341
+      ],
+      "positive_b_tokens": [],
+      "positive_text_a": "Lebanon",
+      "positive_text_b": "",
+      "relation": "place_of_birth_test",
+      "score_mode": "continuation_margin",
+      "source_id": "data/Google_RE/place_of_birth_test.jsonl:0",
+      "split": "Google_RE",
+      "teacher_forced_candidate_span_a": [
+        16,
+        17
+      ],
+      "teacher_forced_candidate_span_b": null,
+      "text_a": "Khatchig Mouradian is a journalist, writer and translator born in",
+      "text_b": "",
+      "trace_details": {},
+      "trace_semantics": "last_context_token_prediction_state",
+      "trace_token_a": "in",
+      "trace_token_b": null,
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "the tgif comedy family matters for the 1997 - 98 season was originally aired by",
+      "context_a_tokens": [
+        1996,
+        1056,
+        5856,
+        2546,
+        4038,
+        2155,
+        5609,
+        2005,
+        1996,
+        2722,
+        1011,
+        5818,
+        2161,
+        2001,
+        2761,
+        4836,
+        2011
+      ],
+      "context_b_decoded": "",
+      "context_b_tokens": [],
+      "dataset": "lama",
+      "example_id": "lama-test-2",
+      "extension": {
+        "masked_sentence": "The TGIF comedy Family Matters for the 1997-98 season was originally aired by [MASK].",
+        "source_category": "Squad",
+        "source_file": "data/Squad/test.jsonl",
+        "subject": "Squad",
+        "template": null
+      },
+      "group_id": "test",
+      "negative_a_tokens": [
+        2751
+      ],
+      "negative_b_tokens": [],
+      "negative_text_a": "gold",
+      "negative_text_b": "",
+      "pair_id": "lama-test-2",
+      "phenomenon": "factual_recall",
+      "positive_a_tokens": [
+        6568
+      ],
+      "positive_b_tokens": [],
+      "positive_text_a": "CBS",
+      "positive_text_b": "",
+      "relation": "test",
+      "score_mode": "continuation_margin",
+      "source_id": "data/Squad/test.jsonl:2",
+      "split": "Squad",
+      "teacher_forced_candidate_span_a": [
+        17,
+        18
+      ],
+      "teacher_forced_candidate_span_b": null,
+      "text_a": "The TGIF comedy Family Matters for the 1997-98 season was originally aired by",
+      "text_b": "",
+      "trace_details": {},
+      "trace_semantics": "last_context_token_prediction_state",
+      "trace_token_a": "by",
+      "trace_token_b": null,
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "federico falco is an argentinian writer born in",
+      "context_a_tokens": [
+        20493,
+        6904,
+        22499,
+        2003,
+        2019,
+        23157,
+        15830,
+        3213,
+        2141,
+        1999
+      ],
+      "context_b_decoded": "",
+      "context_b_tokens": [],
+      "dataset": "lama",
+      "example_id": "lama-date_of_birth_test-2",
+      "extension": {
+        "masked_sentence": "Federico Falco is an Argentinian writer born in [MASK] .",
+        "source_category": "Google_RE",
+        "source_file": "data/Google_RE/date_of_birth_test.jsonl",
+        "subject": "Federico Falco",
+        "template": null
+      },
+      "group_id": "date_of_birth_test",
+      "negative_a_tokens": [
+        3874
+      ],
+      "negative_b_tokens": [],
+      "negative_text_a": "1941",
+      "negative_text_b": "",
+      "pair_id": "lama-date_of_birth_test-2",
+      "phenomenon": "factual_recall",
+      "positive_a_tokens": [
+        3355
+      ],
+      "positive_b_tokens": [],
+      "positive_text_a": "1977",
+      "positive_text_b": "",
+      "relation": "date_of_birth_test",
+      "score_mode": "continuation_margin",
+      "source_id": "data/Google_RE/date_of_birth_test.jsonl:2",
+      "split": "Google_RE",
+      "teacher_forced_candidate_span_a": [
+        10,
+        11
+      ],
+      "teacher_forced_candidate_span_b": null,
+      "text_a": "Federico Falco is an Argentinian writer born in",
+      "text_b": "",
+      "trace_details": {},
+      "trace_semantics": "last_context_token_prediction_state",
+      "trace_token_a": "in",
+      "trace_token_b": null,
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "tournely died at",
+      "context_a_tokens": [
+        2778,
+        11877,
+        2100,
+        2351,
+        2012
+      ],
+      "context_b_decoded": "",
+      "context_b_tokens": [],
+      "dataset": "lama",
+      "example_id": "lama-place_of_death_test-4",
+      "extension": {
+        "masked_sentence": "Tournély died at [MASK] .",
+        "source_category": "Google_RE",
+        "source_file": "data/Google_RE/place_of_death_test.jsonl",
+        "subject": "Honoré Tournély",
+        "template": null
+      },
+      "group_id": "place_of_death_test",
+      "negative_a_tokens": [
+        5288
+      ],
+      "negative_b_tokens": [],
+      "negative_text_a": "Switzerland",
+      "negative_text_b": "",
+      "pair_id": "lama-place_of_death_test-4",
+      "phenomenon": "factual_recall",
+      "positive_a_tokens": [
+        3000
+      ],
+      "positive_b_tokens": [],
+      "positive_text_a": "Paris",
+      "positive_text_b": "",
+      "relation": "place_of_death_test",
+      "score_mode": "continuation_margin",
+      "source_id": "data/Google_RE/place_of_death_test.jsonl:4",
+      "split": "Google_RE",
+      "teacher_forced_candidate_span_a": [
+        5,
+        6
+      ],
+      "teacher_forced_candidate_span_b": null,
+      "text_a": "Tournély died at",
+      "text_b": "",
+      "trace_details": {},
+      "trace_semantics": "last_context_token_prediction_state",
+      "trace_token_a": "at",
+      "trace_token_b": null,
+      "validation_errors": []
+    }
+  ]
+}

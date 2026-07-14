@@ -13,19 +13,16 @@ import math
 import re
 import time
 from collections import defaultdict
-from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.shard_map import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
-    _chunk_sizes_for_cfg,
     analysis_model_module,
     maybe_load_tokenizer,
 )
@@ -474,7 +471,6 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
     _validate_tokenized_pairs(prompts)
     candidate_seed = int(ctx.config.get("seed", 0))
     data_replicas = max(1, int(ctx.mesh.shape["data"]))
-    sharded_srw_fns = _intervention_srw_fns(ctx)
 
     def trace_step(p, x, t):
         trace = topk_trace_forward(
@@ -486,7 +482,7 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
             topk_rst=topk_rst,
             target_positions=t,
             candidate_seed=candidate_seed,
-            sharded_srw_fns=sharded_srw_fns,
+            production_srw_fns=ctx.sharded_fns,
         )
         return jax.tree.map(
             lambda value: (
@@ -1116,720 +1112,6 @@ def build_pair_analyses(
     return context, decoupling, csv_rows
 
 
-def _make_sharded_intervention_srw(
-    model_module: Any,
-    mesh: Any,
-    *,
-    max_chunk_size: int,
-    gate_temperature: float,
-    gate_boundary_power: float,
-    admission_den_power: float,
-    srw_composition_mode: str,
-    heat_kernel_beta: float,
-    effective_active_eps: float,
-):
-    """Production-matched shard-local SRW with one optional execution mask."""
-    admission_den_power = float(admission_den_power)
-    gate_temperature = float(gate_temperature)
-    gate_boundary_power = float(gate_boundary_power)
-    heat_kernel_beta = float(heat_kernel_beta)
-    effective_active_eps = float(effective_active_eps)
-
-    @partial(
-        shard_map,
-        mesh=mesh,
-        in_specs=(
-            P("data", None, None),
-            P("data", None, None),
-            P("model", None),
-            P("data", None, None),
-            P("model", None),
-            P("model", None),
-            P("model"),
-            P(),
-            P(),
-        ),
-        out_specs=P("data", None, None),
-        check_rep=False,
-    )
-    def sharded_srw(
-        x,
-        query,
-        op_key_local,
-        raw_tau,
-        read_local,
-        write_local,
-        suppress_local,
-        target_position,
-        apply_mask,
-    ):
-        n_local = int(op_key_local.shape[0])
-        chunk_size = min(int(max_chunk_size), n_local)
-        n_chunks = (n_local + chunk_size - 1) // chunk_size
-        n_pad = n_chunks * chunk_size
-        pad_n = n_pad - n_local
-        batch_size, seq_len, d_model = x.shape
-        x_bf = x.astype(jnp.bfloat16)
-        op_key = jnp.pad(op_key_local, ((0, pad_n), (0, 0)))
-        read = jnp.pad(read_local, ((0, pad_n), (0, 0)))
-        write = jnp.pad(write_local, ((0, pad_n), (0, 0)))
-        suppress = jnp.pad(suppress_local, ((0, pad_n),))
-        valid = jnp.arange(n_pad) < n_local
-        query_bf = model_module._forward_unit_direction(
-            query.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-        op_key_bf = model_module._forward_unit_direction(
-            op_key.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-        read_bf = model_module._forward_unit_direction(
-            read.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-        write_bf = model_module._forward_unit_direction(
-            write.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-        tau = model_module._tau_from_param(raw_tau)
-        token_selector = jax.nn.one_hot(
-            target_position, seq_len, dtype=jnp.float32)[None, :, None]
-
-        def step(carry, chunk_index):
-            raw_out, admission_mass = carry
-            start = chunk_index * chunk_size
-            key_chunk = jax.lax.dynamic_slice_in_dim(
-                op_key_bf, start, chunk_size, axis=0)
-            read_chunk = jax.lax.dynamic_slice_in_dim(
-                read_bf, start, chunk_size, axis=0)
-            write_chunk = jax.lax.dynamic_slice_in_dim(
-                write_bf, start, chunk_size, axis=0)
-            suppress_chunk = jax.lax.dynamic_slice_in_dim(
-                suppress, start, chunk_size, axis=0)
-            valid_chunk = jax.lax.dynamic_slice_in_dim(
-                valid, start, chunk_size, axis=0)
-            valid_bsn = valid_chunk[None, None, :]
-            rho_raw = (query_bf @ key_chunk.T).astype(jnp.float32)
-            rho = jnp.where(valid_bsn, rho_raw, tau)
-            _, admission, _, execution, _ = model_module._compute_admission_drive(
-                rho,
-                tau,
-                gate_temperature,
-                boundary_power=gate_boundary_power,
-                effective_active_eps=effective_active_eps,
-                execution_prune_eps=0.0,
-                srw_composition_mode=srw_composition_mode,
-                heat_kernel_beta=heat_kernel_beta,
-            )
-            admission = jnp.where(valid_bsn, admission, 0.0)
-            execution = jnp.where(valid_bsn, execution, 0.0)
-            keep = 1.0 - token_selector * suppress_chunk[None, None, :]
-            execution = jnp.where(apply_mask, execution * keep, execution)
-            response = x_bf @ read_chunk.T
-            coefficient = execution * response.astype(jnp.float32)
-            chunk_out = (
-                coefficient.astype(jnp.bfloat16) @ write_chunk).astype(jnp.float32)
-            return (
-                raw_out + chunk_out,
-                admission_mass + admission.sum(axis=-1, keepdims=True),
-            ), None
-
-        (raw_out, local_admission_mass), _ = jax.lax.scan(
-            step,
-            (
-                jnp.zeros(
-                    (batch_size, seq_len, d_model), dtype=jnp.float32),
-                jnp.zeros((batch_size, seq_len, 1), dtype=jnp.float32),
-            ),
-            jnp.arange(n_chunks),
-        )
-        global_admission_mass = jax.lax.psum(
-            local_admission_mass, "model")
-        den = model_module._composition_den(
-            global_admission_mass,
-            admission_den_power,
-            srw_composition_mode,
-        )
-        local_out = raw_out / den
-        return jax.lax.psum(
-            local_out.astype(jnp.bfloat16), "model").astype(jnp.float32)
-
-    return sharded_srw
-
-
-def _make_sharded_intervention_srw_paired(
-    model_module: Any,
-    mesh: Any,
-    *,
-    max_chunk_size: int,
-    gate_temperature: float,
-    gate_boundary_power: float,
-    admission_den_power: float,
-    srw_composition_mode: str,
-    heat_kernel_beta: float,
-    effective_active_eps: float,
-):
-    """Production-shaped paired Q/K SRW with route-selective suppression."""
-    admission_den_power = float(admission_den_power)
-    gate_temperature = float(gate_temperature)
-    gate_boundary_power = float(gate_boundary_power)
-    heat_kernel_beta = float(heat_kernel_beta)
-    effective_active_eps = float(effective_active_eps)
-
-    @partial(
-        shard_map,
-        mesh=mesh,
-        in_specs=(
-            P("data", None, None),
-            P("data", None, None, None),
-            P("model", None),
-            P("data", None, None, None),
-            P("model", None),
-            P("model", None),
-            P("model"),
-            P(),
-            P(),
-            P(),
-        ),
-        out_specs=P("data", None, None, None),
-        check_rep=False,
-    )
-    def sharded_srw_paired(
-        x,
-        query_qk,
-        op_key_local,
-        raw_tau_qk,
-        read_local,
-        write_local,
-        suppress_local,
-        target_position,
-        target_pool,
-        apply_layer,
-    ):
-        n_local = int(op_key_local.shape[0])
-        chunk_size = min(int(max_chunk_size), n_local)
-        n_chunks = (n_local + chunk_size - 1) // chunk_size
-        n_pad = n_chunks * chunk_size
-        pad_n = n_pad - n_local
-        batch_size, seq_len, _, d_model = (
-            query_qk.shape[0], query_qk.shape[1], query_qk.shape[2], x.shape[-1])
-        x_bf = x.astype(jnp.bfloat16)
-        op_key = jnp.pad(op_key_local, ((0, pad_n), (0, 0)))
-        read = jnp.pad(read_local, ((0, pad_n), (0, 0)))
-        write = jnp.pad(write_local, ((0, pad_n), (0, 0)))
-        suppress = jnp.pad(suppress_local, ((0, pad_n),))
-        valid = jnp.arange(n_pad) < n_local
-        query_bf = model_module._forward_unit_direction(
-            query_qk.astype(jnp.bfloat16).astype(jnp.float32)
-        ).astype(jnp.bfloat16)
-        op_key_bf = model_module._forward_unit_direction(
-            op_key.astype(jnp.bfloat16).astype(jnp.float32)
-        ).astype(jnp.bfloat16)
-        read_bf = model_module._forward_unit_direction(
-            read.astype(jnp.bfloat16).astype(jnp.float32)
-        ).astype(jnp.bfloat16)
-        write_bf = model_module._forward_unit_direction(
-            write.astype(jnp.bfloat16).astype(jnp.float32)
-        ).astype(jnp.bfloat16)
-        tau = model_module._tau_from_param(raw_tau_qk)
-        token_selector = jax.nn.one_hot(
-            target_position, seq_len, dtype=jnp.float32)[None, :, None, None]
-        route_selector = jax.nn.one_hot(
-            target_pool, 2, dtype=jnp.float32)[None, None, :, None]
-
-        @jax.checkpoint
-        def step(carry, chunk_index):
-            raw_out, admission_mass = carry
-            start = chunk_index * chunk_size
-            key_chunk = jax.lax.dynamic_slice_in_dim(
-                op_key_bf, start, chunk_size, axis=0)
-            read_chunk = jax.lax.dynamic_slice_in_dim(
-                read_bf, start, chunk_size, axis=0)
-            write_chunk = jax.lax.dynamic_slice_in_dim(
-                write_bf, start, chunk_size, axis=0)
-            suppress_chunk = jax.lax.dynamic_slice_in_dim(
-                suppress, start, chunk_size, axis=0)
-            valid_chunk = jax.lax.dynamic_slice_in_dim(
-                valid, start, chunk_size, axis=0)
-            valid_bsrn = valid_chunk[None, None, None, :]
-            rho_raw = jnp.einsum(
-                "bsrd,nd->bsrn", query_bf, key_chunk).astype(jnp.float32)
-            rho = jnp.where(valid_bsrn, rho_raw, tau)
-            _, admission, _, execution, _ = model_module._compute_admission_drive(
-                rho,
-                tau,
-                gate_temperature,
-                boundary_power=gate_boundary_power,
-                effective_active_eps=effective_active_eps,
-                execution_prune_eps=0.0,
-                srw_composition_mode=srw_composition_mode,
-                heat_kernel_beta=heat_kernel_beta,
-            )
-            admission = jnp.where(valid_bsrn, admission, 0.0)
-            execution = jnp.where(valid_bsrn, execution, 0.0)
-            keep = 1.0 - (
-                token_selector
-                * route_selector
-                * suppress_chunk[None, None, None, :])
-            execution = jnp.where(apply_layer, execution * keep, execution)
-            response = x_bf @ read_chunk.T
-            coefficient = (
-                execution * response.astype(jnp.float32)[:, :, None, :])
-            chunk_out = jnp.einsum(
-                "bsrn,nd->bsrd",
-                coefficient.astype(jnp.bfloat16),
-                write_chunk,
-            ).astype(jnp.float32)
-            return (
-                raw_out + chunk_out,
-                admission_mass + admission.sum(axis=-1, keepdims=True),
-            ), None
-
-        (raw_out, local_admission_mass), _ = jax.lax.scan(
-            step,
-            (
-                jnp.zeros(
-                    (batch_size, seq_len, 2, d_model), dtype=jnp.float32),
-                jnp.zeros(
-                    (batch_size, seq_len, 2, 1), dtype=jnp.float32),
-            ),
-            jnp.arange(n_chunks),
-        )
-        global_admission_mass = jax.lax.psum(
-            local_admission_mass, "model")
-        den = model_module._composition_den(
-            global_admission_mass,
-            admission_den_power,
-            srw_composition_mode,
-        )
-        local_out = raw_out / den
-        return jax.lax.psum(
-            local_out.astype(jnp.bfloat16), "model").astype(jnp.float32)
-
-    return sharded_srw_paired
-
-
-def _intervention_srw_fns(ctx: AnalysisContext) -> Dict[Any, Any]:
-    model_module = analysis_model_module(ctx.model_cfg)
-    chunk_sizes = _chunk_sizes_for_cfg(ctx.config, ctx.mesh)
-    cfg = ctx.model_cfg
-    common = {
-        "model_module": model_module,
-        "mesh": ctx.mesh,
-        "gate_boundary_power": float(cfg["soft_gate_boundary_power"]),
-        "admission_den_power": float(cfg["admission_den_power"]),
-        "srw_composition_mode": str(cfg["srw_composition_mode"]),
-        "heat_kernel_beta": float(cfg["heat_kernel_beta"]),
-        # The canonical v4171 production factories fix this at 1e-6 even if
-        # an older training key remains in checkpoint metadata.
-        "effective_active_eps": 1.0e-6,
-    }
-    qk = _make_sharded_intervention_srw(
-        max_chunk_size=int(chunk_sizes["attn_qk"]),
-        gate_temperature=float(cfg.get(
-            "soft_gate_T_qk", cfg["soft_gate_temperature"])),
-        **common,
-    )
-    qk_paired = _make_sharded_intervention_srw_paired(
-        max_chunk_size=int(chunk_sizes["attn_qk"]),
-        gate_temperature=float(cfg.get(
-            "soft_gate_T_qk", cfg["soft_gate_temperature"])),
-        **common,
-    )
-    v = _make_sharded_intervention_srw(
-        max_chunk_size=int(chunk_sizes["attn_v"]),
-        gate_temperature=float(cfg.get(
-            "soft_gate_T_v", cfg["soft_gate_temperature"])),
-        **common,
-    )
-    rst = _make_sharded_intervention_srw(
-        max_chunk_size=int(chunk_sizes["rst"]),
-        gate_temperature=float(cfg.get(
-            "soft_gate_T_rst", cfg["soft_gate_temperature"])),
-        **common,
-    )
-    production = ctx.sharded_fns
-    if not isinstance(production, dict):
-        raise RuntimeError(
-            "v4171 causal intervention requires canonical dict-style "
-            "production sharded_fns")
-    production_keys = {
-        "production_qk_paired": "attn_qk_paired_minimal",
-        "production_v_single": "attn_v_single_minimal",
-        "production_rst_single": "rst_single_minimal",
-    }
-    missing = [
-        source for source in production_keys.values()
-        if production.get(source) is None
-    ]
-    if missing:
-        raise RuntimeError(
-            "v4171 causal intervention is missing canonical production "
-            f"kernels: {', '.join(sorted(missing))}")
-    result = {0: qk, 1: qk, 2: v, 3: rst, "qk_paired": qk_paired}
-    result.update({
-        target: production[source]
-        for target, source in production_keys.items()
-    })
-    return result
-
-
-def _target_intervention_forward(
-    params: Any,
-    model_cfg: Dict[str, Any],
-    input_ids: Any,
-    target_position: Any,
-    target_layer: Any,
-    target_pool: Any,
-    suppress_qk: Any,
-    suppress_v: Any,
-    suppress_rst: Any,
-    sharded_srw_fns: Optional[Mapping[Any, Any]] = None,
-):
-    """Analysis-only token/layer ablation with the canonical unpruned denominator."""
-    model_module = analysis_model_module(model_cfg)
-    params = model_module._squeeze_params(params)
-    input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
-    target_position = jnp.asarray(target_position, dtype=jnp.int32)
-    target_layer = jnp.asarray(target_layer, dtype=jnp.int32)
-    target_pool = jnp.asarray(target_pool, dtype=jnp.int32)
-    bsz, seq_len = input_ids.shape
-    d_model = int(model_cfg["d_model"])
-    n_layers = int(model_cfg["n_layers"])
-    n_heads = int(model_cfg["n_heads"])
-    d_head = d_model // n_heads
-    execution_kwargs = model_module._angular_execution_kwargs_from_model_cfg(model_cfg)
-    admission_den_power = float(execution_kwargs.pop("admission_den_power"))
-    execution_kwargs["execution_prune_eps"] = 0.0
-    composition_mode = execution_kwargs.get(
-        "srw_composition_mode", model_module.DEFAULT_SRW_COMPOSITION_MODE)
-    temperature_qk = float(model_cfg.get(
-        "soft_gate_T_qk", execution_kwargs["soft_gate_temperature"]))
-    temperature_v = float(model_cfg.get(
-        "soft_gate_T_v", execution_kwargs["soft_gate_temperature"]))
-    temperature_rst = float(model_cfg.get(
-        "soft_gate_T_rst", execution_kwargs["soft_gate_temperature"]))
-    temperature_final = float(model_cfg.get(
-        "soft_gate_t_final", execution_kwargs["soft_gate_temperature"]))
-    boundary_power = float(execution_kwargs["soft_gate_boundary_power"])
-    boundary_power_final = float(model_cfg.get(
-        "soft_gate_boundary_power_final", boundary_power))
-    pool = model_module._pool_params_with_operator_keys(params["neuron_pool"])
-    router = params["router"]
-    qk_scale, v_scale, rst_scale = model_module._effective_pool_output_scales(
-        pool, d_model, n_layers)
-    positions = jnp.arange(seq_len)[None, :]
-    x = (
-        params["token_emb"]["embedding"][input_ids]
-        + params["pos_emb"]["embedding"][positions]
-    )
-    token_selector = jax.nn.one_hot(
-        target_position, seq_len, dtype=jnp.float32)[None, :, None]
-    block_params = [params[f"block_{index}"] for index in range(n_layers)]
-    stacked_block_params = jax.tree.map(
-        lambda *values: jnp.stack(values), *block_params)
-
-    def srw(
-        x_in: Any,
-        query: Any,
-        op_key: Any,
-        raw_tau: Any,
-        read: Any,
-        write: Any,
-        suppress_mask: Any,
-        layer_index: Any,
-        pool_code: int,
-        gate_temperature: float,
-    ):
-        apply_here = (
-            (target_layer == layer_index)
-            & (target_pool == int(pool_code)))
-        if sharded_srw_fns is not None:
-            return sharded_srw_fns[int(pool_code)](
-                x_in,
-                query,
-                op_key,
-                raw_tau,
-                read,
-                write,
-                suppress_mask,
-                target_position,
-                apply_here,
-            )
-        local_execution_kwargs = dict(execution_kwargs)
-        local_execution_kwargs["soft_gate_temperature"] = float(gate_temperature)
-        query_bf = model_module._forward_unit_direction(
-            query.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-        op_key_bf = model_module._forward_unit_direction(
-            op_key.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-        rho = (query_bf @ op_key_bf.T).astype(jnp.float32)
-        tau = model_module._tau_from_param(raw_tau)
-        drive_kwargs = dict(local_execution_kwargs)
-        drive_kwargs.pop("soft_gate_temperature", None)
-        boundary_power = drive_kwargs.pop("soft_gate_boundary_power")
-        effective_active_eps = drive_kwargs.pop(
-            "soft_gate_effective_active_eps")
-        _, admission, _, execution_weight, _ = model_module._compute_admission_drive(
-            rho,
-            tau,
-            float(gate_temperature),
-            boundary_power=boundary_power,
-            effective_active_eps=effective_active_eps,
-            **drive_kwargs,
-        )
-        keep = 1.0 - token_selector * jnp.asarray(suppress_mask, dtype=jnp.float32)[None, None, :]
-        execution_weight = jnp.where(
-            apply_here,
-            execution_weight * keep,
-            execution_weight,
-        )
-        read_n = model_module._forward_unit_direction(
-            read.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-        write_n = model_module._forward_unit_direction(
-            write.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-        response = x_in.astype(jnp.bfloat16) @ read_n.T
-        numerator = (
-            (execution_weight * response.astype(jnp.float32))
-            .astype(jnp.bfloat16) @ write_n).astype(jnp.float32)
-        # Important: admission is deliberately not masked.  This is the
-        # canonical selection/gate ablation denominator requested for v4171.
-        den = model_module._composition_den(
-            admission.sum(axis=-1, keepdims=True),
-            admission_den_power,
-            composition_mode,
-        )
-        return (numerator.astype(jnp.float32) / den).astype(
-            jnp.bfloat16).astype(jnp.float32)
-
-    def scan_layer(carry: Any, layer_inputs: Any):
-        x_in = carry
-        bp, layer_index = layer_inputs
-        normed = model_module._layer_norm(
-            x_in, bp["norm1"]["scale"], bp["norm1"]["bias"])
-        queries = (
-            normed @ router["proj_attn"]["kernel"]
-            + router["proj_attn"]["bias"])
-        query_q, query_k, query_v = jnp.split(queries, 3, axis=-1)
-        query_adapter = getattr(
-            model_module, "_read_write_attn_operator_queries", None)
-        if query_adapter is not None:
-            query_q, query_k, query_v = query_adapter(
-                router, normed, query_q, query_k, query_v)
-        tau_all = (
-            normed @ router["raw_tau_attn"]["kernel"]
-            + router["raw_tau_attn"]["bias"])
-
-        if sharded_srw_fns is not None and "qk_paired" in sharded_srw_fns:
-            query_qk = jnp.stack((query_q, query_k), axis=2)
-            tau_qk = jnp.stack(
-                (tau_all[:, :, 0:1], tau_all[:, :, 1:2]), axis=2)
-            apply_qk = (
-                (target_layer == layer_index)
-                & ((target_pool == 0) | (target_pool == 1)))
-
-            def intervention_qk(_: Any):
-                return sharded_srw_fns["qk_paired"](
-                    normed,
-                    query_qk,
-                    pool["attn_qk_op_key"],
-                    tau_qk,
-                    pool["attn_qk_read"],
-                    pool["attn_qk_write"],
-                    suppress_qk,
-                    target_position,
-                    target_pool,
-                    jnp.bool_(True),
-                )
-
-            def production_qk(_: Any):
-                return sharded_srw_fns["production_qk_paired"](
-                    normed,
-                    query_qk,
-                    pool["attn_qk_op_key"],
-                    tau_qk,
-                    pool["attn_qk_read"],
-                    pool["attn_qk_write"],
-                    temperature_qk,
-                    temperature_final,
-                    boundary_power,
-                    boundary_power_final,
-                    jnp.float32(0.0),
-                )[0]
-
-            qk = jax.lax.cond(
-                apply_qk, intervention_qk, production_qk, operand=None)
-            qk = qk * qk_scale
-            q = qk[:, :, 0, :]
-            k = qk[:, :, 1, :]
-        else:
-            q = srw(
-                normed, query_q, pool["attn_qk_op_key"],
-                tau_all[:, :, 0:1], pool["attn_qk_read"],
-                pool["attn_qk_write"], suppress_qk,
-                layer_index, 0, temperature_qk) * qk_scale
-            k = srw(
-                normed, query_k, pool["attn_qk_op_key"],
-                tau_all[:, :, 1:2], pool["attn_qk_read"],
-                pool["attn_qk_write"], suppress_qk,
-                layer_index, 1, temperature_qk) * qk_scale
-
-        if sharded_srw_fns is not None:
-            apply_v = (
-                (target_layer == layer_index) & (target_pool == 2))
-
-            def intervention_v(_: Any):
-                return sharded_srw_fns[2](
-                    normed,
-                    query_v,
-                    pool["attn_v_op_key"],
-                    tau_all[:, :, 2:3],
-                    pool["attn_v_read"],
-                    pool["attn_v_write"],
-                    suppress_v,
-                    target_position,
-                    jnp.bool_(True),
-                )
-
-            def production_v(_: Any):
-                return sharded_srw_fns["production_v_single"](
-                    normed,
-                    query_v,
-                    pool["attn_v_op_key"],
-                    tau_all[:, :, 2:3],
-                    pool["attn_v_read"],
-                    pool["attn_v_write"],
-                    temperature_v,
-                    temperature_final,
-                    boundary_power,
-                    boundary_power_final,
-                    jnp.float32(0.0),
-                )[0]
-
-            v = jax.lax.cond(
-                apply_v, intervention_v, production_v, operand=None)
-            v = v * v_scale
-        else:
-            v = srw(
-                normed, query_v, pool["attn_v_op_key"],
-                tau_all[:, :, 2:3], pool["attn_v_read"],
-                pool["attn_v_write"], suppress_v,
-                layer_index, 2, temperature_v) * v_scale
-
-        q = q.reshape(
-            bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
-        k = k.reshape(
-            bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
-        v = v.reshape(
-            bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
-        scores = (
-            jnp.einsum("bhsd,bhtd->bhst", q, k)
-            / jnp.sqrt(jnp.float32(d_head)))
-        causal = jnp.tril(jnp.ones(
-            (seq_len, seq_len), dtype=jnp.bool_))
-        scores = jnp.where(
-            causal, scores, jnp.finfo(scores.dtype).min)
-        attention = jax.nn.softmax(scores, axis=-1)
-        delta_attention = jnp.einsum(
-            "bhst,bhtd->bhsd", attention, v)
-        delta_attention = delta_attention.transpose(0, 2, 1, 3).reshape(
-            bsz, seq_len, d_model)
-        delta_attention = (
-            delta_attention @ bp["attn"]["expand_O"]["kernel"])
-        target_attention_update = jnp.take(
-            delta_attention, target_position, axis=1)
-        x_after_attention = x_in + delta_attention
-
-        normed = model_module._layer_norm(
-            x_after_attention,
-            bp["norm2"]["scale"],
-            bp["norm2"]["bias"],
-        )
-        query_rst = (
-            normed @ router["proj_rst"]["kernel"]
-            + router["proj_rst"]["bias"])
-        rst_query_adapter = getattr(
-            model_module, "_read_write_rst_operator_query", None)
-        if rst_query_adapter is not None:
-            query_rst = rst_query_adapter(router, normed, query_rst)
-        tau_rst = (
-            normed @ router["raw_tau_rst"]["kernel"]
-            + router["raw_tau_rst"]["bias"])
-        if sharded_srw_fns is not None:
-            apply_rst = (
-                (target_layer == layer_index) & (target_pool == 3))
-
-            def intervention_rst(_: Any):
-                return sharded_srw_fns[3](
-                    normed,
-                    query_rst,
-                    pool["rst_op_key"],
-                    tau_rst,
-                    pool["rst_read"],
-                    pool["rst_write"],
-                    suppress_rst,
-                    target_position,
-                    jnp.bool_(True),
-                )
-
-            def production_rst(_: Any):
-                return sharded_srw_fns["production_rst_single"](
-                    normed,
-                    query_rst,
-                    pool["rst_op_key"],
-                    tau_rst,
-                    pool["rst_read"],
-                    pool["rst_write"],
-                    temperature_rst,
-                    temperature_final,
-                    boundary_power,
-                    boundary_power_final,
-                    jnp.float32(0.0),
-                )[0]
-
-            delta_rst = jax.lax.cond(
-                apply_rst, intervention_rst, production_rst, operand=None)
-            delta_rst = delta_rst * rst_scale
-        else:
-            delta_rst = srw(
-                normed, query_rst, pool["rst_op_key"], tau_rst,
-                pool["rst_read"], pool["rst_write"], suppress_rst,
-                layer_index, 3, temperature_rst) * rst_scale
-        target_rst_update = jnp.take(
-            delta_rst, target_position, axis=1)
-        x_next = x_after_attention + delta_rst
-        return x_next, (target_attention_update, target_rst_update)
-
-    x, (target_attention_updates, target_rst_updates) = jax.lax.scan(
-        scan_layer,
-        x,
-        (
-            stacked_block_params,
-            jnp.arange(n_layers, dtype=jnp.int32),
-        ),
-    )
-
-    residual = x
-    norm = params["norm"]
-    # The production module's final ``nn.LayerNorm`` uses Flax's default
-    # fast variance, E[x^2] - E[x]^2.  The block-local v4171 helper uses the
-    # centered variance instead, so reusing it here diverges on TPU even when
-    # every SRW update is identical.
-    x_f32 = x.astype(jnp.float32)
-    final_mean = jnp.mean(x_f32, axis=-1, keepdims=True)
-    final_mean_sq = jnp.mean(
-        jnp.square(x_f32), axis=-1, keepdims=True)
-    final_var = jnp.maximum(
-        jnp.float32(0.0), final_mean_sq - jnp.square(final_mean))
-    x = (
-        (x_f32 - final_mean)
-        * jax.lax.rsqrt(final_var + jnp.float32(1.0e-6))
-        * norm["scale"]
-        + norm["bias"]
-    )
-    normalized_residual = x
-    logits = jnp.dot(x, params["token_emb"]["embedding"].T)
-    logits = model_module._slice_logits_to_logical_vocab(logits, model_cfg)
-    return (
-        logits,
-        residual,
-        normalized_residual,
-        target_attention_updates,
-        target_rst_updates,
-    )
-
-
 def _log_softmax_np(logits: np.ndarray) -> np.ndarray:
     logits = np.asarray(logits, dtype=np.float64)
     shifted = logits - np.max(logits, axis=-1, keepdims=True)
@@ -1856,6 +1138,8 @@ def _intervention_candidates(
     admission = np.asarray(trace[f"{pool}_candidate_admission"])[:, 0, :]
     coefficient = np.asarray(
         trace[f"{pool}_candidate_abs_coefficient"])[:, 0, :]
+    signed_coefficient = np.asarray(
+        trace[f"{pool}_candidate_coefficient"])[:, 0, :]
     strategy_index = {
         strategy: index
         for index, strategy in enumerate(TRANSITION_CANDIDATE_STRATEGIES)
@@ -1877,6 +1161,7 @@ def _intervention_candidates(
             "candidate_execution": float(execution[layer, index]),
             "candidate_admission": float(admission[layer, index]),
             "candidate_abs_coefficient": float(coefficient[layer, index]),
+            "candidate_coefficient": float(signed_coefficient[layer, index]),
             "candidate_source": "exact_on_device_full_operator_pool",
         }
         if not candidate_valid:
@@ -1938,7 +1223,7 @@ def _production_logits_forward(ctx: AnalysisContext):
 
     @jax.jit
     def forward(params, input_ids):
-        result, intermediates = ctx.model.apply(
+        result = ctx.model.apply(
             {"params": params},
             input_ids,
             attention_mask=jnp.ones_like(input_ids),
@@ -1963,31 +1248,99 @@ def _production_logits_forward(ctx: AnalysisContext):
             admission_den_power=float(mcfg["admission_den_power"]),
             srw_composition_mode=str(mcfg["srw_composition_mode"]),
             heat_kernel_beta=float(mcfg["heat_kernel_beta"]),
-            execution_prune_eps=jnp.float32(0.0),
+            execution_prune_eps=jnp.float32(
+                float(mcfg.get("execution_prune_eps", 0.0) or 0.0)),
             compute_accuracy=False,
-            capture_intermediates=(
-                lambda module, method: module.name == "norm"),
-            mutable=["intermediates"],
+            analysis_return_residual=True,
         )
-        final_normalized_residual = (
-            intermediates["intermediates"]["norm"]["__call__"][0])
-        return result["logits"][:1], final_normalized_residual[:1]
+        return result["logits"][:1], result["final_residual"][:1]
 
     return forward
+
+
+def _subtraction_logits_forward(ctx: AnalysisContext):
+    """Canonical production minimal forward plus the analysis-only hook."""
+    sharded_fns = ctx.sharded_fns
+    if isinstance(sharded_fns, dict):
+        sharded_fns = {
+            key: value for key, value in sharded_fns.items()
+            if key not in {
+                "vocab_parallel_embedding", "vocab_ce", "vocab_eval_stats",
+                "vocab_argmax",
+            }
+        }
+    mcfg = ctx.model_cfg
+
+    @jax.jit
+    def forward(params, input_ids, positions, layer, route, contribution):
+        result = ctx.model.apply(
+            {"params": params},
+            input_ids,
+            contribution,
+            layer,
+            positions,
+            route,
+            method=ctx.model.analysis_forward_with_operator_subtraction,
+            attention_mask=jnp.ones_like(input_ids),
+            intervention_enabled=True,
+            return_residual=True,
+            deterministic=True,
+            rngs={"dropout": jax.random.PRNGKey(0)},
+            sharded_fns=sharded_fns,
+            analysis=False,
+            soft_gate_temperature=float(mcfg["soft_gate_temperature"]),
+            soft_gate_t_final=float(mcfg.get(
+                "soft_gate_t_final", mcfg["soft_gate_temperature"])),
+            soft_gate_T_qk=float(mcfg.get(
+                "soft_gate_T_qk", mcfg["soft_gate_temperature"])),
+            soft_gate_T_v=float(mcfg.get(
+                "soft_gate_T_v", mcfg["soft_gate_temperature"])),
+            soft_gate_T_rst=float(mcfg.get(
+                "soft_gate_T_rst", mcfg["soft_gate_temperature"])),
+            soft_gate_boundary_power=float(mcfg["soft_gate_boundary_power"]),
+            soft_gate_boundary_power_final=float(mcfg.get(
+                "soft_gate_boundary_power_final",
+                mcfg["soft_gate_boundary_power"])),
+            admission_den_power=float(mcfg["admission_den_power"]),
+            srw_composition_mode=str(mcfg["srw_composition_mode"]),
+            heat_kernel_beta=float(mcfg["heat_kernel_beta"]),
+            execution_prune_eps=jnp.float32(
+                float(mcfg.get("execution_prune_eps", 0.0) or 0.0)),
+            compute_accuracy=False,
+        )
+        return result["logits"][:1], result["final_residual"][:1]
+
+    return forward
+
+
+def _operator_contribution_vector(
+    ctx: AnalysisContext, pool: str, operator_id: int, coefficient: float,
+):
+    model_module = analysis_model_module(ctx.model_cfg)
+    params = model_module._squeeze_params(ctx.params)
+    pool_params = model_module._pool_params_with_operator_keys(
+        params["neuron_pool"])
+    write_key = {
+        "q": "attn_qk_write", "k": "attn_qk_write",
+        "v": "attn_v_write", "rst": "rst_write",
+    }[pool]
+    write = pool_params[write_key][int(operator_id)]
+    direction = model_module._forward_unit_direction(
+        write.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+    return (jnp.asarray(coefficient, dtype=jnp.float32) * direction).astype(
+        jnp.float32)
 
 
 def _intervention_forward_parity(
     ctx: AnalysisContext,
     records: Sequence[Dict[str, Any]],
     intervention_forward: Any,
-    pool_sizes: Mapping[str, int],
     production_forward: Optional[Any] = None,
 ) -> Dict[str, Any]:
+    """Fail loudly unless a zero subtraction is machine-exact production."""
     if production_forward is None:
         production_forward = _production_logits_forward(ctx)
-    zeros_qk = jnp.zeros((int(pool_sizes["q"]),), dtype=jnp.float32)
-    zeros_v = jnp.zeros((int(pool_sizes["v"]),), dtype=jnp.float32)
-    zeros_rst = jnp.zeros((int(pool_sizes["rst"]),), dtype=jnp.float32)
+    zeros = jnp.zeros((int(ctx.model_cfg["d_model"]),), dtype=jnp.float32)
     rows = []
     for record in records:
         prompt = record["prompt"]
@@ -2000,57 +1353,48 @@ def _intervention_forward_parity(
         target_position = int(record["target_token_index"])
         production_logits, production_residual = jax.device_get(
             production_forward(ctx.params, input_ids))
-        (custom_logits, _, custom_normalized_residual,
-         _, _) = jax.device_get(
+        hooked_logits, hooked_residual = jax.device_get(
             intervention_forward(
                 ctx.params,
                 input_ids,
-                jnp.int32(target_position),
-                jnp.int32(-1),
-                jnp.int32(-1),
-                zeros_qk,
-                zeros_v,
-                zeros_rst,
+                jnp.full((input_ids.shape[0],), target_position, jnp.int32),
+                jnp.int32(0),
+                jnp.int32(0),
+                zeros,
             ))
-        custom_logits = np.asarray(custom_logits)
+        hooked_logits = np.asarray(hooked_logits)
         production_logits = np.asarray(production_logits)
         production_residual = np.asarray(production_residual)
-        custom_normalized_residual = np.asarray(custom_normalized_residual)
+        hooked_residual = np.asarray(hooked_residual)
         length = int(prompt["length"])
         prod_slice = production_logits[:, :length]
-        custom_slice = custom_logits[:, :length]
-        abs_diff = np.abs(prod_slice.astype(np.float64) - custom_slice.astype(np.float64))
+        hooked_slice = hooked_logits[:, :length]
+        abs_diff = np.abs(prod_slice.astype(np.float64) - hooked_slice.astype(np.float64))
         prod_ce = _sequence_ce(production_logits, prompt["token_ids"], length)
-        custom_ce = _sequence_ce(custom_logits, prompt["token_ids"], length)
+        hooked_ce = _sequence_ce(hooked_logits, prompt["token_ids"], length)
         rows.append({
             "prompt_id": prompt["prompt_id"],
             "ce_abs_diff": (
-                abs(float(prod_ce) - float(custom_ce))
-                if prod_ce is not None and custom_ce is not None else None),
+                abs(float(prod_ce) - float(hooked_ce))
+                if prod_ce is not None and hooked_ce is not None else None),
             "mean_logit_abs_diff": float(np.mean(abs_diff)),
             "max_logit_abs_diff": float(np.max(abs_diff)),
             "top1_agreement": float(np.mean(
                 np.argmax(prod_slice, axis=-1)
-                == np.argmax(custom_slice, axis=-1))),
+                == np.argmax(hooked_slice, axis=-1))),
             "final_residual_cosine": _cosine(
                 production_residual[0, target_position],
-                custom_normalized_residual[0, target_position]),
-            "residual_reference": (
-                "canonical_production_final_norm_output_vs_"
-                "custom_final_norm_output"),
+                hooked_residual[0, target_position]),
+            "logits_machine_exact": bool(np.array_equal(prod_slice, hooked_slice)),
+            "final_residual_machine_exact": bool(np.array_equal(
+                production_residual, hooked_residual)),
+            "residual_reference": "production_vs_zero_contribution_hook",
         })
-    thresholds = {
-        "ce_abs_diff_max": 5.0e-4,
-        "mean_logit_abs_diff_max": 5.0e-3,
-        "top1_agreement_min": 0.999,
-        "final_residual_cosine_min": 0.99999,
-    }
     summary = {
-        "status": "diagnostic_exact",
-        "blocking": False,
-        "purpose": (
-            "cross_graph_numeric_diagnostic_only; causal effects use a "
-            "matched zero-mask baseline from the same intervention graph"),
+        "status": "ready",
+        "blocking": True,
+        "intervention_type": "production_contribution_subtraction",
+        "purpose": "production normal forward vs zero contribution subtraction",
         "num_prompts": len(rows),
         "ce_abs_diff": max(float(row["ce_abs_diff"]) for row in rows),
         "mean_logit_abs_diff": float(np.mean([
@@ -2061,20 +1405,16 @@ def _intervention_forward_parity(
             float(row["top1_agreement"]) for row in rows])),
         "final_residual_cosine": min(
             float(row["final_residual_cosine"]) for row in rows),
-        "thresholds": thresholds,
+        "machine_exact": all(
+            row["logits_machine_exact"] and row["final_residual_machine_exact"]
+            and row["ce_abs_diff"] == 0.0 for row in rows),
         "rows": rows,
     }
-    failed = (
-        summary["ce_abs_diff"] > thresholds["ce_abs_diff_max"]
-        or summary["mean_logit_abs_diff"] > thresholds["mean_logit_abs_diff_max"]
-        or summary["top1_agreement"] < thresholds["top1_agreement_min"]
-        or summary["final_residual_cosine"] < thresholds["final_residual_cosine_min"]
-    )
-    if failed:
-        summary["status"] = "diagnostic_numeric_drift"
-    summary["threshold_passed"] = not failed
     if ctx.is_primary:
         write_json_atomic(ctx.store.path("intervention_forward_parity.json"), summary)
+    if not summary["machine_exact"]:
+        raise RuntimeError(
+            "production_contribution_subtraction zero-vector parity failed")
     return summary
 
 
@@ -2104,327 +1444,141 @@ def run_causal_intervention(
     ctx: AnalysisContext,
     records: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    """Subtract traced production contributions; never replace an SRW kernel."""
     max_prompts = max(1, int(getattr(ctx.args, "causal_max_prompts", 6) or 6))
     primary = _select_causal_records(records, max_prompts)
-    mcfg = ctx.config.get("model", {})
-    pool_sizes = {
-        "q": int(mcfg.get("n_qk", 0)),
-        "k": int(mcfg.get("n_qk", 0)),
-        "v": int(mcfg.get("n_v", 0)),
-        "rst": int(mcfg.get("n_rst", mcfg.get("n_know", 0))),
-    }
     pool_codes = {"q": 0, "k": 1, "v": 2, "rst": 3}
-    sharded_srw_fns = _intervention_srw_fns(ctx)
-
-    def intervention_step(p, x, pos, layer, pool_code, mq, mv, mr):
-        result = _target_intervention_forward(
-            p,
-            ctx.model_cfg,
-            x,
-            pos,
-            layer,
-            pool_code,
-            mq,
-            mv,
-            mr,
-            sharded_srw_fns=sharded_srw_fns,
-        )
-        return (
-            result[0][:1],
-            result[1][:1],
-            result[2][:1],
-            result[3][:, :1],
-            result[4][:, :1],
-        )
-
-    forward = jax.jit(intervention_step)
     production_forward = _production_logits_forward(ctx)
+    subtraction_forward = _subtraction_logits_forward(ctx)
     parity = _intervention_forward_parity(
-        ctx,
-        primary,
-        forward,
-        pool_sizes,
-        production_forward=production_forward,
-    )
+        ctx, primary, subtraction_forward,
+        production_forward=production_forward)
     if ctx.is_primary:
         print(
-            "INTERVENTION_FORWARD_DIAGNOSTIC "
-            f"status={parity['status']} ce_abs_diff={parity['ce_abs_diff']:.6g} "
-            f"mean_logit_abs_diff={parity['mean_logit_abs_diff']:.6g} "
-            f"max_logit_abs_diff={parity['max_logit_abs_diff']:.6g} "
-            f"top1_agreement={parity['top1_agreement']:.6f} "
-            f"final_residual_cosine={parity['final_residual_cosine']:.8f}",
+            "CONTRIBUTION_SUBTRACTION_PARITY "
+            f"status={parity['status']} machine_exact={parity['machine_exact']}",
             flush=True,
         )
+
     result_rows: List[Dict[str, Any]] = []
-    intervention_seed = int(ctx.config.get("seed", 0))
     started = time.time()
     for prompt_idx, record in enumerate(primary):
         prompt = record["prompt"]
         data_replicas = max(1, int(ctx.mesh.shape["data"]))
-        input_ids_np = np.repeat(
+        input_ids = jax.device_put(jnp.asarray(np.repeat(
             np.asarray(prompt["input_array"], dtype=np.int32)[None, :],
-            data_replicas,
-            axis=0,
-        )
-        input_ids_device = jax.device_put(
-            jnp.asarray(input_ids_np), ctx.data_sharding)
+            data_replicas, axis=0)), ctx.data_sharding)
         target_position = int(record["target_token_index"])
-        zeros_qk = np.zeros((pool_sizes["q"],), dtype=np.float32)
-        zeros_v = np.zeros((pool_sizes["v"],), dtype=np.float32)
-        zeros_rst = np.zeros((pool_sizes["rst"],), dtype=np.float32)
-        baseline_logits, baseline_normalized_residual = jax.device_get(
-            production_forward(ctx.params, input_ids_device))
+        positions = jnp.full(
+            (input_ids.shape[0],), target_position, dtype=jnp.int32)
+        baseline_logits, baseline_residual = jax.device_get(
+            production_forward(ctx.params, input_ids))
         baseline_logits = np.asarray(baseline_logits)
-        baseline_normalized_residual = np.asarray(
-            baseline_normalized_residual)
+        baseline_residual = np.asarray(baseline_residual)
         length = int(prompt["length"])
-        pred_pos = max(0, length - 1)
-        continuation_ids = prompt.get("continuation_token_ids") or []
-        target_token_id = int(continuation_ids[0]) if continuation_ids else None
-        baseline_ce = _sequence_ce(baseline_logits, prompt["token_ids"], length)
-        matched_baselines: Dict[Tuple[str, int], Tuple[np.ndarray, ...]] = {}
+        baseline_ce = _sequence_ce(
+            baseline_logits, prompt["token_ids"], length)
+        baseline_logp = _log_softmax_np(baseline_logits[0, :length])
         for pool in TRACE_POOLS:
             for candidate in _intervention_candidates(record, pool):
-                if not candidate["candidate_valid"]:
-                    result_rows.append({
-                        "prompt_id": prompt["prompt_id"],
-                        "phenomenon": prompt["phenomenon"],
-                        "pool": pool,
-                        **candidate,
-                        "intervention_type": (
-                            "selection_gate_ablation_canonical_denominator"),
-                        "canonical_unpruned_admission_denominator": True,
-                    })
-                    continue
-                layer = int(candidate["layer"])
-                control_key = (str(pool), layer)
-                if control_key not in matched_baselines:
-                    matched = jax.device_get(forward(
-                        ctx.params,
-                        input_ids_device,
-                        jnp.int32(target_position),
-                        jnp.int32(layer),
-                        jnp.int32(pool_codes[pool]),
-                        jnp.asarray(zeros_qk),
-                        jnp.asarray(zeros_v),
-                        jnp.asarray(zeros_rst),
-                    ))
-                    matched_baselines[control_key] = tuple(
-                        np.asarray(value) for value in matched)
-                (
-                    matched_logits,
-                    matched_residual,
-                    matched_normalized_residual,
-                    matched_attention_updates,
-                    matched_rst_updates,
-                ) = matched_baselines[control_key]
-                matched_logp = _log_softmax_np(
-                    matched_logits[0, pred_pos])
-                matched_logp_all = _log_softmax_np(
-                    matched_logits[0, :length])
-                matched_ce = _sequence_ce(
-                    matched_logits, prompt["token_ids"], length)
-                masks = {
-                    "qk": zeros_qk.copy(),
-                    "v": zeros_v.copy(),
-                    "rst": zeros_rst.copy(),
-                }
-                mask_key = "qk" if pool in ("q", "k") else pool
-                masks[mask_key][int(candidate["operator_id"])] = 1.0
-                (logits, residual, _,
-                 attention_updates, rst_updates) = jax.device_get(forward(
-                    ctx.params,
-                    input_ids_device,
-                    jnp.int32(target_position),
-                    jnp.int32(candidate["layer"]),
-                    jnp.int32(pool_codes[pool]),
-                    jnp.asarray(masks["qk"]),
-                    jnp.asarray(masks["v"]),
-                    jnp.asarray(masks["rst"]),
-                ))
-                logits = np.asarray(logits)
-                residual = np.asarray(residual)
-                attention_updates = np.asarray(attention_updates)
-                rst_updates = np.asarray(rst_updates)
-                logp = _log_softmax_np(logits[0, pred_pos])
-                logp_all = _log_softmax_np(logits[0, :length])
-                next_prob = np.exp(matched_logp)
-                next_token_kl = float(np.sum(
-                    next_prob * (matched_logp - logp)))
-                base_prob_all = np.exp(matched_logp_all)
-                full_output_kl = float(np.mean(np.sum(
-                    base_prob_all * (matched_logp_all - logp_all), axis=-1)))
-                target_delta = (
-                    float(logp[target_token_id] - matched_logp[target_token_id])
-                    if target_token_id is not None and target_token_id < logp.shape[-1]
-                    else None)
-                target_residual_base = matched_residual[0, target_position]
-                target_residual_new = residual[0, target_position]
-                unrelated_pos = 0 if target_position != 0 else min(1, length - 1)
-                if pool == "rst":
-                    local_base = matched_rst_updates[layer, 0]
-                    local_new = rst_updates[layer, 0]
-                    local_kind = "rst_residual_update"
-                else:
-                    local_base = matched_attention_updates[layer, 0]
-                    local_new = attention_updates[layer, 0]
-                    local_kind = "attention_residual_update"
-                canonical_logit_diff = np.abs(
-                    matched_logits[:, :length].astype(np.float64)
-                    - baseline_logits[:, :length].astype(np.float64))
-                canonical_residual = baseline_normalized_residual[
-                    0, target_position]
-                matched_control_residual = matched_normalized_residual[
-                    0, target_position]
-                row = {
+                common = {
                     "prompt_id": prompt["prompt_id"],
                     "phenomenon": prompt["phenomenon"],
                     "pool": pool,
                     **candidate,
-                    "intervention_type": "selection_gate_ablation_canonical_denominator",
+                    "intervention_type": "production_contribution_subtraction",
                     "canonical_unpruned_admission_denominator": True,
-                    "effect_reference": "matched_zero_mask_same_kernel",
-                    "removed_operator_count": 1,
-                    "status": "ready",
-                    "baseline_ce": matched_ce,
-                    "canonical_production_ce": baseline_ce,
-                    "prompt_prefix_ce_delta": (
-                        None if matched_ce is None else
-                        float(_sequence_ce(
-                            logits, prompt["token_ids"], length) - matched_ce)),
-                    "target_continuation_token_id": target_token_id,
-                    "target_logprob_delta": target_delta,
-                    "next_token_kl": next_token_kl,
-                    "full_output_kl": full_output_kl,
-                    "top_prediction_changed": bool(
-                        int(np.argmax(matched_logp)) != int(np.argmax(logp))),
-                    "zero_mask_vs_production_mean_logit_abs_diff": float(
-                        np.mean(canonical_logit_diff)),
-                    "zero_mask_vs_production_max_logit_abs_diff": float(
-                        np.max(canonical_logit_diff)),
-                    "zero_mask_vs_production_final_residual_cosine": _cosine(
-                        canonical_residual, matched_control_residual),
-                    "zero_mask_vs_production_final_residual_relative_error": float(
-                        np.linalg.norm(
-                            matched_control_residual - canonical_residual)
-                        / max(float(np.linalg.norm(canonical_residual)), 1.0e-12)),
-                    "final_residual_cosine": _cosine(
-                        target_residual_base, target_residual_new),
-                    "final_residual_relative_error": float(
-                        np.linalg.norm(target_residual_new - target_residual_base)
-                        / max(float(np.linalg.norm(target_residual_base)), 1.0e-12)),
-                    "layer_local_update_kind": local_kind,
-                    "layer_local_update_cosine": _cosine(local_base, local_new),
-                    "layer_local_update_relative_error": float(
-                        np.linalg.norm(local_new - local_base)
-                        / max(float(np.linalg.norm(local_base)), 1.0e-12)),
-                    "structurally_unaffected_past_position_control": {
-                        "position": int(unrelated_pos),
-                        "residual_relative_error": float(
-                            np.linalg.norm(
-                                residual[0, unrelated_pos]
-                                - matched_residual[0, unrelated_pos])
-                            / max(float(np.linalg.norm(
-                                matched_residual[0, unrelated_pos])), 1.0e-12)),
-                    },
+                    "effect_reference": "canonical_production_forward",
                 }
-                result_rows.append(row)
+                if not candidate["candidate_valid"]:
+                    result_rows.append(common)
+                    continue
+                contribution = _operator_contribution_vector(
+                    ctx, pool, int(candidate["operator_id"]),
+                    float(candidate["candidate_coefficient"]))
+                logits, residual = jax.device_get(subtraction_forward(
+                    ctx.params, input_ids, positions,
+                    jnp.int32(candidate["layer"]), jnp.int32(pool_codes[pool]),
+                    contribution))
+                logits = np.asarray(logits)
+                residual = np.asarray(residual)
+                after_ce = _sequence_ce(logits, prompt["token_ids"], length)
+                after_logp = _log_softmax_np(logits[0, :length])
+                base_prob = np.exp(baseline_logp)
+                full_output_kl = float(np.mean(np.sum(
+                    base_prob * (baseline_logp - after_logp), axis=-1)))
+                target_base = baseline_residual[0, target_position]
+                target_after = residual[0, target_position]
+                behavior_before = None if baseline_ce is None else -float(baseline_ce)
+                behavior_after = None if after_ce is None else -float(after_ce)
+                result_rows.append({
+                    **common,
+                    "status": "ready",
+                    "removed_operator_count": 1,
+                    "behavior_score_before": behavior_before,
+                    "behavior_score_after": behavior_after,
+                    "behavior_score_drop": (
+                        None if behavior_before is None or behavior_after is None
+                        else behavior_before - behavior_after),
+                    "target_logprob_delta": (
+                        None if behavior_before is None or behavior_after is None
+                        else behavior_after - behavior_before),
+                    "full_output_kl": full_output_kl,
+                    "next_token_kl": float(np.sum(
+                        base_prob[-1] * (baseline_logp[-1] - after_logp[-1]))),
+                    "top_prediction_changed": bool(
+                        np.argmax(baseline_logp[-1]) != np.argmax(after_logp[-1])),
+                    "final_residual_cosine": _cosine(target_base, target_after),
+                    "final_residual_relative_error": float(
+                        np.linalg.norm(target_after - target_base)
+                        / max(float(np.linalg.norm(target_base)), 1.0e-12)),
+                })
         if ctx.is_primary:
             print(
-                "CAUSAL_INTERVENTION "
+                "CAUSAL_CONTRIBUTION_SUBTRACTION "
                 f"prompt={prompt_idx + 1:02d}/{len(primary):02d} "
-                f"id={prompt['prompt_id']}",
-                flush=True,
-            )
+                f"id={prompt['prompt_id']}", flush=True)
+
     valid_rows = [row for row in result_rows if row.get("status") == "ready"]
-    selected = [
-        abs(float(row["target_logprob_delta"]))
-        for row in valid_rows
-        if row["strategy"] in ("top_contribution", "top_gate")
-        and row.get("target_logprob_delta") is not None
-    ]
-    controls = [
-        abs(float(row["target_logprob_delta"]))
-        for row in valid_rows
-        if row["strategy"] in ("inactive_random", "active_random", "matched_control")
-        and row.get("target_logprob_delta") is not None
-    ]
-    unique_zero_mask_controls: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
-    for row in valid_rows:
-        key = (
-            str(row["prompt_id"]),
-            str(row["pool"]),
-            int(row["layer"]),
-        )
-        unique_zero_mask_controls.setdefault(key, row)
-    zero_mask_control_rows = list(unique_zero_mask_controls.values())
-    zero_mask_control_summary = {
-        "n": len(zero_mask_control_rows),
-        "mean_logit_abs_diff_mean": (
-            float(np.mean([
-                float(row["zero_mask_vs_production_mean_logit_abs_diff"])
-                for row in zero_mask_control_rows
-            ])) if zero_mask_control_rows else None),
-        "mean_logit_abs_diff_max": (
-            max(float(row["zero_mask_vs_production_mean_logit_abs_diff"])
-                for row in zero_mask_control_rows)
-            if zero_mask_control_rows else None),
-        "max_logit_abs_diff_max": (
-            max(float(row["zero_mask_vs_production_max_logit_abs_diff"])
-                for row in zero_mask_control_rows)
-            if zero_mask_control_rows else None),
-        "final_residual_cosine_min": (
-            min(float(row["zero_mask_vs_production_final_residual_cosine"])
-                for row in zero_mask_control_rows)
-            if zero_mask_control_rows else None),
-    }
-    def grouped(key: str, seed_offset: int) -> Dict[str, Any]:
-        values = sorted({str(row[key]) for row in valid_rows})
+    seed = int(ctx.config.get("seed", 0))
+    def grouped(key: str, offset: int) -> Dict[str, Any]:
         return {
             value: _causal_effect_summary(
                 [row for row in valid_rows if str(row[key]) == value],
-                intervention_seed + seed_offset + index,
-            )
-            for index, value in enumerate(values)
+                seed + offset + index)
+            for index, value in enumerate(sorted({str(row[key]) for row in valid_rows}))
         }
-
+    selected = [
+        float(row["behavior_score_drop"]) for row in valid_rows
+        if row["strategy"] in ("top_contribution", "top_gate")
+        and row.get("behavior_score_drop") is not None]
+    controls = [
+        float(row["behavior_score_drop"]) for row in valid_rows
+        if row["strategy"] in ("inactive_random", "active_random", "matched_active")
+        and row.get("behavior_score_drop") is not None]
     summary = {
         "status": "ready" if valid_rows else "insufficient_evidence",
-        "intervention_type": "selection_gate_ablation_canonical_denominator",
+        "intervention_type": "production_contribution_subtraction",
         "canonical_unpruned_admission_denominator": True,
-        "canonical_baseline_source": (
-            "direct production model.apply minimal_train forward"),
-        "effect_reference": "matched_zero_mask_same_kernel",
+        "zero_subtraction_parity": parity,
         "num_prompts": len(primary),
-        "prompt_selection": "one complete pair each: lexical_ambiguity, negation, subject_verb_agreement",
         "num_interventions": len(valid_rows),
         "num_skipped": len(result_rows) - len(valid_rows),
-        "skip_status_counts": dict(sorted({
-            status: sum(row.get("status") == status for row in result_rows)
-            for status in {
-                str(row.get("status")) for row in result_rows
-                if row.get("status") != "ready"
-            }
-        }.items())),
-        "intervention_forward_cross_graph_diagnostic": parity,
-        "zero_mask_kernel_control": zero_mask_control_summary,
         "effects": {
-            "overall": _causal_effect_summary(valid_rows, intervention_seed),
+            "overall": _causal_effect_summary(valid_rows, seed),
             "by_strategy": grouped("strategy", 100),
             "by_pool": grouped("pool", 200),
             "by_phenomenon": grouped("phenomenon", 300),
         },
-        "selected_abs_target_logprob_delta": _bootstrap_mean_ci(
-            selected, int(ctx.config.get("seed", 0))),
-        "control_abs_target_logprob_delta": _bootstrap_mean_ci(
-            controls, int(ctx.config.get("seed", 0)) + 1),
+        "selected_behavior_score_drop": _bootstrap_mean_ci(selected, seed),
+        "control_behavior_score_drop": _bootstrap_mean_ci(controls, seed + 1),
         "selected_minus_control_effect": (
-            float(np.mean(selected) - np.mean(controls)) if selected and controls else None),
+            float(np.mean(selected) - np.mean(controls))
+            if selected and controls else None),
         "sec": time.time() - started,
         "artifact": ctx.store.path("interventions.jsonl"),
         "limitations": [
-            "generation change is not executed in the core intervention item",
+            "transition prompt item reports sequence-score effects; dataset items report task margins",
         ],
     }
     if ctx.is_primary:

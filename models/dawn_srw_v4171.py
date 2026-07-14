@@ -275,6 +275,7 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 DEFAULT_D_ROUTE = 64
 RW_FORWARD_NORM_EPS = 1e-6     # forward-only read/write direction floor
 MODEL_VERSION = "spatial-r1-v4.1.7.1"
+ANALYSIS_INTERVENTION_NAME = "production_contribution_subtraction"
 OPERATOR_KEY_MODE = "learned_operator_embedding"
 OPERATOR_QUERY_MODE = "direct_state_projection"
 DEFAULT_ADMISSION_DEN_POWER = 1.0
@@ -3232,6 +3233,31 @@ class Router(nn.Module):
 # 6. Pure functions for scan body
 # ================================================================
 
+def _analysis_subtract_contribution(
+        value, contribution, *, layer_index, target_layer,
+        target_positions, route_code, target_route, enabled):
+    """Subtract one already pool-scaled operator contribution from a route."""
+    contribution = jnp.asarray(contribution, dtype=value.dtype)
+    if contribution.ndim == 1:
+        contribution = jnp.broadcast_to(
+            contribution[None, :], (value.shape[0], contribution.shape[0]))
+    positions = jnp.asarray(target_positions, dtype=jnp.int32)
+    if positions.ndim == 0:
+        positions = jnp.broadcast_to(positions, (value.shape[0],))
+    position_mask = (
+        jnp.arange(value.shape[1], dtype=jnp.int32)[None, :]
+        == positions[:, None])[:, :, None]
+    selected = (
+        jnp.asarray(enabled, dtype=jnp.bool_)
+        & (jnp.asarray(layer_index, dtype=jnp.int32)
+           == jnp.asarray(target_layer, dtype=jnp.int32))
+        & (jnp.asarray(route_code, dtype=jnp.int32)
+           == jnp.asarray(target_route, dtype=jnp.int32)))
+    return jnp.where(
+        selected & position_mask,
+        value - contribution[:, None, :],
+        value)
+
 def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           n_qk, n_v,
                           n_heads, d_model, n_layers,
@@ -3244,7 +3270,13 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           soft_gate_boundary_power=2.0,
                           soft_gate_boundary_power_final=4.0,
                           admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                          execution_prune_eps=0.0):
+                          execution_prune_eps=0.0,
+                          analysis_contribution=None,
+                          analysis_layer_index=0,
+                          analysis_target_layer=-1,
+                          analysis_target_positions=0,
+                          analysis_target_route=-1,
+                          analysis_intervention_enabled=False):
     """Minimal v4166 attention path: SRW output, causal attention, O-proj."""
     del n_qk, n_v
     admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
@@ -3319,6 +3351,25 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps)
     V = V * v_scale
+    if analysis_contribution is not None:
+        Q = _analysis_subtract_contribution(
+            Q, analysis_contribution, layer_index=analysis_layer_index,
+            target_layer=analysis_target_layer,
+            target_positions=analysis_target_positions, route_code=0,
+            target_route=analysis_target_route,
+            enabled=analysis_intervention_enabled)
+        K = _analysis_subtract_contribution(
+            K, analysis_contribution, layer_index=analysis_layer_index,
+            target_layer=analysis_target_layer,
+            target_positions=analysis_target_positions, route_code=1,
+            target_route=analysis_target_route,
+            enabled=analysis_intervention_enabled)
+        V = _analysis_subtract_contribution(
+            V, analysis_contribution, layer_index=analysis_layer_index,
+            target_layer=analysis_target_layer,
+            target_positions=analysis_target_positions, route_code=2,
+            target_route=analysis_target_route,
+            enabled=analysis_intervention_enabled)
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -3409,7 +3460,13 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
                          soft_gate_boundary_power=2.0,
                          soft_gate_boundary_power_final=4.0,
                          admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                         execution_prune_eps=0.0):
+                         execution_prune_eps=0.0,
+                         analysis_contribution=None,
+                         analysis_layer_index=0,
+                         analysis_target_layer=-1,
+                         analysis_target_positions=0,
+                         analysis_target_route=-1,
+                         analysis_intervention_enabled=False):
     """Minimal v4166 RST path: one SRW output and residual dropout."""
     admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
     if d_model is None or n_layers is None:
@@ -3447,6 +3504,13 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps)
     out = out * rst_scale
+    if analysis_contribution is not None:
+        out = _analysis_subtract_contribution(
+            out, analysis_contribution, layer_index=analysis_layer_index,
+            target_layer=analysis_target_layer,
+            target_positions=analysis_target_positions, route_code=3,
+            target_route=analysis_target_route,
+            enabled=analysis_intervention_enabled)
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
     rst_out_norm = jnp.linalg.norm(out.astype(jnp.float32), axis=-1).mean()
@@ -4173,7 +4237,13 @@ class DAWN_SRW_V4171(nn.Module):
                  execution_prune_eps=0.0,
                  minimal_train=False,
                  ce_token_chunk_size=32768,
-                 compute_accuracy=True):
+                 compute_accuracy=True,
+                 analysis_contribution=None,
+                 analysis_target_layer=-1,
+                 analysis_target_positions=0,
+                 analysis_target_route=-1,
+                 analysis_intervention_enabled=False,
+                 analysis_return_residual=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -4499,6 +4569,7 @@ class DAWN_SRW_V4171(nn.Module):
                     x = carry
                     bp = xs['params']
                     rng = xs['rng']
+                    layer_index = xs['layer_index']
                     rng, rng_attn, rng_rst = jax.random.split(rng, 3)
 
                     normed = _layer_norm(
@@ -4538,7 +4609,14 @@ class DAWN_SRW_V4171(nn.Module):
                         soft_gate_boundary_power=soft_gate_boundary_power,
                         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
                         admission_den_power=admission_den_power,
-                        execution_prune_eps=execution_prune_eps)
+                        execution_prune_eps=execution_prune_eps,
+                        analysis_contribution=analysis_contribution,
+                        analysis_layer_index=layer_index,
+                        analysis_target_layer=analysis_target_layer,
+                        analysis_target_positions=analysis_target_positions,
+                        analysis_target_route=analysis_target_route,
+                        analysis_intervention_enabled=(
+                            analysis_intervention_enabled))
                     x = x + attn_out
 
                     normed = _layer_norm(
@@ -4564,7 +4642,14 @@ class DAWN_SRW_V4171(nn.Module):
                         soft_gate_boundary_power=soft_gate_boundary_power,
                         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
                         admission_den_power=admission_den_power,
-                        execution_prune_eps=execution_prune_eps)
+                        execution_prune_eps=execution_prune_eps,
+                        analysis_contribution=analysis_contribution,
+                        analysis_layer_index=layer_index,
+                        analysis_target_layer=analysis_target_layer,
+                        analysis_target_positions=analysis_target_positions,
+                        analysis_target_route=analysis_target_route,
+                        analysis_intervention_enabled=(
+                            analysis_intervention_enabled))
                     x_next = x + rst_out
                     residual_norm = jnp.linalg.norm(
                         x_next.astype(jnp.float32), axis=-1).mean()
@@ -4636,6 +4721,7 @@ class DAWN_SRW_V4171(nn.Module):
                 xs_minimal = {
                     'params': stacked,
                     'rng': layer_rngs,
+                    'layer_index': jnp.arange(self.n_layers, dtype=jnp.int32),
                 }
                 x, minimal_stats = jax.lax.scan(
                     scan_body_minimal, x, xs_minimal)
@@ -4694,9 +4780,12 @@ class DAWN_SRW_V4171(nn.Module):
                         sharded_fns.get("vocab_argmax")
                         if isinstance(sharded_fns, dict) else None)
                     if vocab_argmax is not None:
-                        return {
+                        output = {
                             'argmax_token_ids': vocab_argmax(
                                 x, self.token_emb.embedding)}
+                        if analysis_return_residual:
+                            output['final_residual'] = x
+                        return output
                     if vp_embed is not None:
                         raise NotImplementedError(
                             "Full logits are disabled on the "
@@ -4707,7 +4796,10 @@ class DAWN_SRW_V4171(nn.Module):
                     logits = self.token_emb.attend(x)
                     if embedding_vocab_size != logical_vocab_size:
                         logits = logits[..., :logical_vocab_size]
-                    return {'logits': logits}
+                    output = {'logits': logits}
+                    if analysis_return_residual:
+                        output['final_residual'] = x
+                    return output
 
                 (loss, per_token_ce, correct, valid_count,
                  logit_abs_max, logit_norm_mean, logit_mean,
@@ -4716,7 +4808,7 @@ class DAWN_SRW_V4171(nn.Module):
                 def _sg_mean(value):
                     return jax.lax.stop_gradient(value.mean())
 
-                return {
+                output = {
                     'loss': loss,
                     'correct': correct,
                     'valid_count': valid_count,
@@ -4868,6 +4960,9 @@ class DAWN_SRW_V4171(nn.Module):
                         rst_pool_scaled_srw_out_norm_all),
                     'residual_norm': _sg_mean(residual_norm_all),
                 }
+                if analysis_return_residual:
+                    output['final_residual'] = x
+                return output
 
             def scan_body(carry, xs):
                 x = carry
@@ -5858,7 +5953,34 @@ class DAWN_SRW_V4171(nn.Module):
                     logits = logits[..., :logical_vocab_size]
                 result['logits'] = logits
 
+        if analysis_return_residual:
+            result['final_residual'] = x
         return result
+
+    def analysis_forward_with_operator_subtraction(
+            self, input_ids, contribution_vector, target_layer,
+            target_positions, target_route, *, labels=None,
+            attention_mask=None, intervention_enabled=True,
+            return_residual=True, **production_kwargs):
+        """Run the canonical minimal path with one contribution subtraction.
+
+        ``contribution_vector`` must be the signed post-denominator,
+        pool-scaled production contribution reconstructed by the sparse trace.
+        A zero vector is therefore an exact no-op on the production feature.
+        """
+        return self(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            minimal_train=True,
+            analysis_contribution=contribution_vector,
+            analysis_target_layer=target_layer,
+            analysis_target_positions=target_positions,
+            analysis_target_route=target_route,
+            analysis_intervention_enabled=intervention_enabled,
+            analysis_return_residual=return_residual,
+            **production_kwargs,
+        )
 
     def get_config(self):
         n_rst_eff = self.n_rst if self.n_rst is not None else (

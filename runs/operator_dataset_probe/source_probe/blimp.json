@@ -1,0 +1,1531 @@
+{
+  "adapter_risks": [],
+  "dataset": "blimp",
+  "downloaded_files": [
+    {
+      "bytes": 39201,
+      "path": "\\tmp\\dawn_operator_dataset_probe\\downloads\\blimp\\hf\\anaphor_gender_agreement\\train-00000-of-00001.parquet",
+      "reused": true,
+      "sha256": "3c3f1d8d9e6aa071151e6455bf121c097ca4f7d9a0a7349ebfc9ec0e193c3472",
+      "url": "https://huggingface.co/datasets/nyu-mll/blimp/resolve/main/anaphor_gender_agreement/train-00000-of-00001.parquet"
+    },
+    {
+      "bytes": 49893,
+      "path": "\\tmp\\dawn_operator_dataset_probe\\downloads\\blimp\\hf\\determiner_noun_agreement_1\\train-00000-of-00001.parquet",
+      "reused": true,
+      "sha256": "eac75d95c9fa5a1e6e560918d8a2edf64e4c6e0fae8622a7389bbd5ec514727f",
+      "url": "https://huggingface.co/datasets/nyu-mll/blimp/resolve/main/determiner_noun_agreement_1/train-00000-of-00001.parquet"
+    },
+    {
+      "bytes": 62231,
+      "path": "\\tmp\\dawn_operator_dataset_probe\\downloads\\blimp\\hf\\adjunct_island\\train-00000-of-00001.parquet",
+      "reused": true,
+      "sha256": "094b1a6c4d8e88d2a193d25b6a8eaf6dc746158c14eec537802dd2b67f57847b",
+      "url": "https://huggingface.co/datasets/nyu-mll/blimp/resolve/main/adjunct_island/train-00000-of-00001.parquet"
+    }
+  ],
+  "nested_key_paths": [
+    "UID",
+    "field",
+    "lexically_identical",
+    "linguistics_term",
+    "one_prefix_method",
+    "pair_id",
+    "phenomenon",
+    "sentence_bad",
+    "sentence_good",
+    "simple_LM_method",
+    "source_path",
+    "tokenizer_probe",
+    "tokenizer_probe.bad_token_ids",
+    "tokenizer_probe.first_divergence_index",
+    "tokenizer_probe.good_token_ids",
+    "tokenizer_probe.longest_common_prefix_length",
+    "tokenizer_probe.trace_position",
+    "tokenizer_probe.trace_position_fallback",
+    "tokenizer_probe.trace_token",
+    "two_prefix_method"
+  ],
+  "observed_columns": [
+    "UID",
+    "field",
+    "lexically_identical",
+    "linguistics_term",
+    "one_prefix_method",
+    "pair_id",
+    "sentence_bad",
+    "sentence_good",
+    "simple_LM_method",
+    "two_prefix_method"
+  ],
+  "observed_files": [
+    "adjunct_island/train-00000-of-00001.parquet",
+    "anaphor_gender_agreement/train-00000-of-00001.parquet",
+    "anaphor_number_agreement/train-00000-of-00001.parquet",
+    "animate_subject_passive/train-00000-of-00001.parquet",
+    "animate_subject_trans/train-00000-of-00001.parquet",
+    "causative/train-00000-of-00001.parquet",
+    "complex_NP_island/train-00000-of-00001.parquet",
+    "coordinate_structure_constraint_complex_left_branch/train-00000-of-00001.parquet",
+    "coordinate_structure_constraint_object_extraction/train-00000-of-00001.parquet",
+    "determiner_noun_agreement_1/train-00000-of-00001.parquet",
+    "determiner_noun_agreement_2/train-00000-of-00001.parquet",
+    "determiner_noun_agreement_irregular_1/train-00000-of-00001.parquet",
+    "determiner_noun_agreement_irregular_2/train-00000-of-00001.parquet",
+    "determiner_noun_agreement_with_adj_2/train-00000-of-00001.parquet",
+    "determiner_noun_agreement_with_adj_irregular_1/train-00000-of-00001.parquet",
+    "determiner_noun_agreement_with_adj_irregular_2/train-00000-of-00001.parquet",
+    "determiner_noun_agreement_with_adjective_1/train-00000-of-00001.parquet",
+    "distractor_agreement_relational_noun/train-00000-of-00001.parquet",
+    "distractor_agreement_relative_clause/train-00000-of-00001.parquet",
+    "drop_argument/train-00000-of-00001.parquet",
+    "ellipsis_n_bar_1/train-00000-of-00001.parquet",
+    "ellipsis_n_bar_2/train-00000-of-00001.parquet",
+    "existential_there_object_raising/train-00000-of-00001.parquet",
+    "existential_there_quantifiers_1/train-00000-of-00001.parquet",
+    "existential_there_quantifiers_2/train-00000-of-00001.parquet",
+    "existential_there_subject_raising/train-00000-of-00001.parquet",
+    "expletive_it_object_raising/train-00000-of-00001.parquet",
+    "inchoative/train-00000-of-00001.parquet",
+    "intransitive/train-00000-of-00001.parquet",
+    "irregular_past_participle_adjectives/train-00000-of-00001.parquet",
+    "irregular_past_participle_verbs/train-00000-of-00001.parquet",
+    "irregular_plural_subject_verb_agreement_1/train-00000-of-00001.parquet",
+    "irregular_plural_subject_verb_agreement_2/train-00000-of-00001.parquet",
+    "left_branch_island_echo_question/train-00000-of-00001.parquet",
+    "left_branch_island_simple_question/train-00000-of-00001.parquet",
+    "matrix_question_npi_licensor_present/train-00000-of-00001.parquet",
+    "npi_present_1/train-00000-of-00001.parquet",
+    "npi_present_2/train-00000-of-00001.parquet",
+    "only_npi_licensor_present/train-00000-of-00001.parquet",
+    "only_npi_scope/train-00000-of-00001.parquet",
+    "passive_1/train-00000-of-00001.parquet",
+    "passive_2/train-00000-of-00001.parquet",
+    "principle_A_c_command/train-00000-of-00001.parquet",
+    "principle_A_case_1/train-00000-of-00001.parquet",
+    "principle_A_case_2/train-00000-of-00001.parquet",
+    "principle_A_domain_1/train-00000-of-00001.parquet",
+    "principle_A_domain_2/train-00000-of-00001.parquet",
+    "principle_A_domain_3/train-00000-of-00001.parquet",
+    "principle_A_reconstruction/train-00000-of-00001.parquet",
+    "regular_plural_subject_verb_agreement_1/train-00000-of-00001.parquet",
+    "regular_plural_subject_verb_agreement_2/train-00000-of-00001.parquet",
+    "sentential_negation_npi_licensor_present/train-00000-of-00001.parquet",
+    "sentential_negation_npi_scope/train-00000-of-00001.parquet",
+    "sentential_subject_island/train-00000-of-00001.parquet",
+    "superlative_quantifiers_1/train-00000-of-00001.parquet",
+    "superlative_quantifiers_2/train-00000-of-00001.parquet",
+    "tough_vs_raising_1/train-00000-of-00001.parquet",
+    "tough_vs_raising_2/train-00000-of-00001.parquet",
+    "transitive/train-00000-of-00001.parquet",
+    "wh_island/train-00000-of-00001.parquet",
+    "wh_questions_object_gap/train-00000-of-00001.parquet",
+    "wh_questions_subject_gap/train-00000-of-00001.parquet",
+    "wh_questions_subject_gap_long_distance/train-00000-of-00001.parquet",
+    "wh_vs_that_no_gap/train-00000-of-00001.parquet",
+    "wh_vs_that_no_gap_long_distance/train-00000-of-00001.parquet",
+    "wh_vs_that_with_gap/train-00000-of-00001.parquet",
+    "wh_vs_that_with_gap_long_distance/train-00000-of-00001.parquet"
+  ],
+  "observed_schema": {
+    "adjunct_island/train-00000-of-00001.parquet": {
+      "UID": "string",
+      "field": "string",
+      "lexically_identical": "bool",
+      "linguistics_term": "string",
+      "one_prefix_method": "bool",
+      "pair_id": "int32",
+      "sentence_bad": "string",
+      "sentence_good": "string",
+      "simple_LM_method": "bool",
+      "two_prefix_method": "bool"
+    },
+    "anaphor_gender_agreement/train-00000-of-00001.parquet": {
+      "UID": "string",
+      "field": "string",
+      "lexically_identical": "bool",
+      "linguistics_term": "string",
+      "one_prefix_method": "bool",
+      "pair_id": "int32",
+      "sentence_bad": "string",
+      "sentence_good": "string",
+      "simple_LM_method": "bool",
+      "two_prefix_method": "bool"
+    },
+    "determiner_noun_agreement_1/train-00000-of-00001.parquet": {
+      "UID": "string",
+      "field": "string",
+      "lexically_identical": "bool",
+      "linguistics_term": "string",
+      "one_prefix_method": "bool",
+      "pair_id": "int32",
+      "sentence_bad": "string",
+      "sentence_good": "string",
+      "simple_LM_method": "bool",
+      "two_prefix_method": "bool"
+    }
+  },
+  "observed_splits": [
+    "train"
+  ],
+  "prepared_sample_count": 5,
+  "proposed_pair_types": [
+    "good_bad_minimal_pair"
+  ],
+  "proposed_score_mode": "paired_sequence_logprob",
+  "proposed_trace_semantics": "pre_divergence_prediction_state",
+  "raw_samples": [
+    {
+      "UID": "anaphor_gender_agreement",
+      "field": "morphology",
+      "lexically_identical": false,
+      "linguistics_term": "anaphor_agreement",
+      "one_prefix_method": true,
+      "pair_id": 0,
+      "phenomenon": "anaphor_gender_agreement",
+      "sentence_bad": "Katherine can't help himself.",
+      "sentence_good": "Katherine can't help herself.",
+      "simple_LM_method": true,
+      "source_path": "anaphor_gender_agreement/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          9477,
+          2064,
+          1005,
+          1056,
+          2393,
+          2370,
+          1012
+        ],
+        "first_divergence_index": 5,
+        "good_token_ids": [
+          9477,
+          2064,
+          1005,
+          1056,
+          2393,
+          2841,
+          1012
+        ],
+        "longest_common_prefix_length": 5,
+        "trace_position": 4,
+        "trace_position_fallback": false,
+        "trace_token": "help"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "anaphor_gender_agreement",
+      "field": "morphology",
+      "lexically_identical": false,
+      "linguistics_term": "anaphor_agreement",
+      "one_prefix_method": true,
+      "pair_id": 1,
+      "phenomenon": "anaphor_gender_agreement",
+      "sentence_bad": "Karla could listen to himself.",
+      "sentence_good": "Karla could listen to herself.",
+      "simple_LM_method": true,
+      "source_path": "anaphor_gender_agreement/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          6382,
+          2050,
+          2071,
+          4952,
+          2000,
+          2370,
+          1012
+        ],
+        "first_divergence_index": 5,
+        "good_token_ids": [
+          6382,
+          2050,
+          2071,
+          4952,
+          2000,
+          2841,
+          1012
+        ],
+        "longest_common_prefix_length": 5,
+        "trace_position": 4,
+        "trace_position_fallback": false,
+        "trace_token": "to"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "anaphor_gender_agreement",
+      "field": "morphology",
+      "lexically_identical": false,
+      "linguistics_term": "anaphor_agreement",
+      "one_prefix_method": true,
+      "pair_id": 2,
+      "phenomenon": "anaphor_gender_agreement",
+      "sentence_bad": "Marie won't think about itself.",
+      "sentence_good": "Marie won't think about herself.",
+      "simple_LM_method": true,
+      "source_path": "anaphor_gender_agreement/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          5032,
+          2180,
+          1005,
+          1056,
+          2228,
+          2055,
+          2993,
+          1012
+        ],
+        "first_divergence_index": 6,
+        "good_token_ids": [
+          5032,
+          2180,
+          1005,
+          1056,
+          2228,
+          2055,
+          2841,
+          1012
+        ],
+        "longest_common_prefix_length": 6,
+        "trace_position": 5,
+        "trace_position_fallback": false,
+        "trace_token": "about"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "anaphor_gender_agreement",
+      "field": "morphology",
+      "lexically_identical": false,
+      "linguistics_term": "anaphor_agreement",
+      "one_prefix_method": true,
+      "pair_id": 3,
+      "phenomenon": "anaphor_gender_agreement",
+      "sentence_bad": "Mark hasn't discussed itself.",
+      "sentence_good": "Mark hasn't discussed himself.",
+      "simple_LM_method": true,
+      "source_path": "anaphor_gender_agreement/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          2928,
+          8440,
+          1005,
+          1056,
+          6936,
+          2993,
+          1012
+        ],
+        "first_divergence_index": 5,
+        "good_token_ids": [
+          2928,
+          8440,
+          1005,
+          1056,
+          6936,
+          2370,
+          1012
+        ],
+        "longest_common_prefix_length": 5,
+        "trace_position": 4,
+        "trace_position_fallback": false,
+        "trace_token": "discussed"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "anaphor_gender_agreement",
+      "field": "morphology",
+      "lexically_identical": false,
+      "linguistics_term": "anaphor_agreement",
+      "one_prefix_method": true,
+      "pair_id": 4,
+      "phenomenon": "anaphor_gender_agreement",
+      "sentence_bad": "Stephen impressed itself.",
+      "sentence_good": "Stephen impressed himself.",
+      "simple_LM_method": true,
+      "source_path": "anaphor_gender_agreement/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          4459,
+          7622,
+          2993,
+          1012
+        ],
+        "first_divergence_index": 2,
+        "good_token_ids": [
+          4459,
+          7622,
+          2370,
+          1012
+        ],
+        "longest_common_prefix_length": 2,
+        "trace_position": 1,
+        "trace_position_fallback": false,
+        "trace_token": "impressed"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "determiner_noun_agreement_1",
+      "field": "morphology",
+      "lexically_identical": true,
+      "linguistics_term": "determiner_noun_agreement",
+      "one_prefix_method": true,
+      "pair_id": 0,
+      "phenomenon": "determiner_noun_agreement_1",
+      "sentence_bad": "Raymond is selling this sketches.",
+      "sentence_good": "Raymond is selling this sketch.",
+      "simple_LM_method": true,
+      "source_path": "determiner_noun_agreement_1/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          7638,
+          2003,
+          4855,
+          2023,
+          12741,
+          1012
+        ],
+        "first_divergence_index": 4,
+        "good_token_ids": [
+          7638,
+          2003,
+          4855,
+          2023,
+          11080,
+          1012
+        ],
+        "longest_common_prefix_length": 4,
+        "trace_position": 3,
+        "trace_position_fallback": false,
+        "trace_token": "this"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "determiner_noun_agreement_1",
+      "field": "morphology",
+      "lexically_identical": true,
+      "linguistics_term": "determiner_noun_agreement",
+      "one_prefix_method": true,
+      "pair_id": 1,
+      "phenomenon": "determiner_noun_agreement_1",
+      "sentence_bad": "Craig explored that grocery stores.",
+      "sentence_good": "Craig explored that grocery store.",
+      "simple_LM_method": true,
+      "source_path": "determiner_noun_agreement_1/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          7010,
+          10641,
+          2008,
+          13025,
+          5324,
+          1012
+        ],
+        "first_divergence_index": 4,
+        "good_token_ids": [
+          7010,
+          10641,
+          2008,
+          13025,
+          3573,
+          1012
+        ],
+        "longest_common_prefix_length": 4,
+        "trace_position": 3,
+        "trace_position_fallback": false,
+        "trace_token": "grocery"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "determiner_noun_agreement_1",
+      "field": "morphology",
+      "lexically_identical": true,
+      "linguistics_term": "determiner_noun_agreement",
+      "one_prefix_method": true,
+      "pair_id": 2,
+      "phenomenon": "determiner_noun_agreement_1",
+      "sentence_bad": "Eva has scared these child.",
+      "sentence_good": "Eva has scared these children.",
+      "simple_LM_method": true,
+      "source_path": "determiner_noun_agreement_1/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          9345,
+          2038,
+          6015,
+          2122,
+          2775,
+          1012
+        ],
+        "first_divergence_index": 4,
+        "good_token_ids": [
+          9345,
+          2038,
+          6015,
+          2122,
+          2336,
+          1012
+        ],
+        "longest_common_prefix_length": 4,
+        "trace_position": 3,
+        "trace_position_fallback": false,
+        "trace_token": "these"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "determiner_noun_agreement_1",
+      "field": "morphology",
+      "lexically_identical": true,
+      "linguistics_term": "determiner_noun_agreement",
+      "one_prefix_method": true,
+      "pair_id": 3,
+      "phenomenon": "determiner_noun_agreement_1",
+      "sentence_bad": "Marcus would conceal that pamphlets.",
+      "sentence_good": "Marcus would conceal that pamphlet.",
+      "simple_LM_method": true,
+      "source_path": "determiner_noun_agreement_1/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          6647,
+          2052,
+          19819,
+          2008,
+          24752,
+          1012
+        ],
+        "first_divergence_index": 4,
+        "good_token_ids": [
+          6647,
+          2052,
+          19819,
+          2008,
+          19899,
+          1012
+        ],
+        "longest_common_prefix_length": 4,
+        "trace_position": 3,
+        "trace_position_fallback": false,
+        "trace_token": "that"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "determiner_noun_agreement_1",
+      "field": "morphology",
+      "lexically_identical": true,
+      "linguistics_term": "determiner_noun_agreement",
+      "one_prefix_method": true,
+      "pair_id": 4,
+      "phenomenon": "determiner_noun_agreement_1",
+      "sentence_bad": "Carmen hadn't shocked these customer.",
+      "sentence_good": "Carmen hadn't shocked these customers.",
+      "simple_LM_method": true,
+      "source_path": "determiner_noun_agreement_1/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          11425,
+          2910,
+          1005,
+          1056,
+          7135,
+          2122,
+          8013,
+          1012
+        ],
+        "first_divergence_index": 6,
+        "good_token_ids": [
+          11425,
+          2910,
+          1005,
+          1056,
+          7135,
+          2122,
+          6304,
+          1012
+        ],
+        "longest_common_prefix_length": 6,
+        "trace_position": 5,
+        "trace_position_fallback": false,
+        "trace_token": "these"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "adjunct_island",
+      "field": "syntax",
+      "lexically_identical": true,
+      "linguistics_term": "island_effects",
+      "one_prefix_method": false,
+      "pair_id": 0,
+      "phenomenon": "adjunct_island",
+      "sentence_bad": "Who should Derek hug Richard after shocking?",
+      "sentence_good": "Who should Derek hug after shocking Richard?",
+      "simple_LM_method": true,
+      "source_path": "adjunct_island/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          2040,
+          2323,
+          7256,
+          8549,
+          2957,
+          2044,
+          16880,
+          1029
+        ],
+        "first_divergence_index": 4,
+        "good_token_ids": [
+          2040,
+          2323,
+          7256,
+          8549,
+          2044,
+          16880,
+          2957,
+          1029
+        ],
+        "longest_common_prefix_length": 4,
+        "trace_position": 3,
+        "trace_position_fallback": false,
+        "trace_token": "hug"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "adjunct_island",
+      "field": "syntax",
+      "lexically_identical": true,
+      "linguistics_term": "island_effects",
+      "one_prefix_method": false,
+      "pair_id": 1,
+      "phenomenon": "adjunct_island",
+      "sentence_bad": "What had Theresa walked through that high school while talking about?",
+      "sentence_good": "What had Theresa walked through while talking about that high school?",
+      "simple_LM_method": true,
+      "source_path": "adjunct_island/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          2054,
+          2018,
+          14781,
+          2939,
+          2083,
+          2008,
+          2152,
+          2082,
+          2096,
+          3331,
+          2055,
+          1029
+        ],
+        "first_divergence_index": 5,
+        "good_token_ids": [
+          2054,
+          2018,
+          14781,
+          2939,
+          2083,
+          2096,
+          3331,
+          2055,
+          2008,
+          2152,
+          2082,
+          1029
+        ],
+        "longest_common_prefix_length": 5,
+        "trace_position": 4,
+        "trace_position_fallback": false,
+        "trace_token": "through"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "adjunct_island",
+      "field": "syntax",
+      "lexically_identical": true,
+      "linguistics_term": "island_effects",
+      "one_prefix_method": false,
+      "pair_id": 2,
+      "phenomenon": "adjunct_island",
+      "sentence_bad": "Who will Katherine discover Erin without hiring?",
+      "sentence_good": "Who will Katherine discover without hiring Erin?",
+      "simple_LM_method": true,
+      "source_path": "adjunct_island/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          2040,
+          2097,
+          9477,
+          7523,
+          11781,
+          2302,
+          14763,
+          1029
+        ],
+        "first_divergence_index": 4,
+        "good_token_ids": [
+          2040,
+          2097,
+          9477,
+          7523,
+          2302,
+          14763,
+          11781,
+          1029
+        ],
+        "longest_common_prefix_length": 4,
+        "trace_position": 3,
+        "trace_position_fallback": false,
+        "trace_token": "discover"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "adjunct_island",
+      "field": "syntax",
+      "lexically_identical": true,
+      "linguistics_term": "island_effects",
+      "one_prefix_method": false,
+      "pair_id": 3,
+      "phenomenon": "adjunct_island",
+      "sentence_bad": "Who has Colleen aggravated Judy before kissing?",
+      "sentence_good": "Who has Colleen aggravated before kissing Judy?",
+      "simple_LM_method": true,
+      "source_path": "adjunct_island/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          2040,
+          2038,
+          28385,
+          25817,
+          12120,
+          2077,
+          7618,
+          1029
+        ],
+        "first_divergence_index": 4,
+        "good_token_ids": [
+          2040,
+          2038,
+          28385,
+          25817,
+          2077,
+          7618,
+          12120,
+          1029
+        ],
+        "longest_common_prefix_length": 4,
+        "trace_position": 3,
+        "trace_position_fallback": false,
+        "trace_token": "aggravated"
+      },
+      "two_prefix_method": false
+    },
+    {
+      "UID": "adjunct_island",
+      "field": "syntax",
+      "lexically_identical": true,
+      "linguistics_term": "island_effects",
+      "one_prefix_method": false,
+      "pair_id": 4,
+      "phenomenon": "adjunct_island",
+      "sentence_bad": "What could a lot of cats break all convertibles while finding?",
+      "sentence_good": "What could a lot of cats break while finding all convertibles?",
+      "simple_LM_method": true,
+      "source_path": "adjunct_island/train-00000-of-00001.parquet",
+      "tokenizer_probe": {
+        "bad_token_ids": [
+          2054,
+          2071,
+          1037,
+          2843,
+          1997,
+          8870,
+          3338,
+          2035,
+          22840,
+          2015,
+          2096,
+          4531,
+          1029
+        ],
+        "first_divergence_index": 7,
+        "good_token_ids": [
+          2054,
+          2071,
+          1037,
+          2843,
+          1997,
+          8870,
+          3338,
+          2096,
+          4531,
+          2035,
+          22840,
+          2015,
+          1029
+        ],
+        "longest_common_prefix_length": 7,
+        "trace_position": 6,
+        "trace_position_fallback": false,
+        "trace_token": "break"
+      },
+      "two_prefix_method": false
+    }
+  ],
+  "recommended_mapping": {
+    "candidate_arrays": "unused (length 0)",
+    "context_ids_a": "sentence_good",
+    "context_ids_b": "sentence_bad",
+    "phenomenon/group_id": "parquet parent directory",
+    "source_id": "UID when present; otherwise phenomenon + row index",
+    "trace_position_a/b": "longest common prefix length - 1"
+  },
+  "row_count": {
+    "adjunct_island/train-00000-of-00001.parquet": 1000,
+    "anaphor_gender_agreement/train-00000-of-00001.parquet": 1000,
+    "determiner_noun_agreement_1/train-00000-of-00001.parquet": 1000
+  },
+  "source": {
+    "hf_tree": "https://huggingface.co/api/datasets/nyu-mll/blimp/tree/main?recursive=1"
+  },
+  "source_issues": [],
+  "status": "ready_for_adapter",
+  "tokenization_samples": [
+    {
+      "bad_token_ids": [
+        9477,
+        2064,
+        1005,
+        1056,
+        2393,
+        2370,
+        1012
+      ],
+      "first_divergence_index": 5,
+      "good_token_ids": [
+        9477,
+        2064,
+        1005,
+        1056,
+        2393,
+        2841,
+        1012
+      ],
+      "longest_common_prefix_length": 5,
+      "trace_position": 4,
+      "trace_position_fallback": false,
+      "trace_token": "help"
+    },
+    {
+      "bad_token_ids": [
+        6382,
+        2050,
+        2071,
+        4952,
+        2000,
+        2370,
+        1012
+      ],
+      "first_divergence_index": 5,
+      "good_token_ids": [
+        6382,
+        2050,
+        2071,
+        4952,
+        2000,
+        2841,
+        1012
+      ],
+      "longest_common_prefix_length": 5,
+      "trace_position": 4,
+      "trace_position_fallback": false,
+      "trace_token": "to"
+    },
+    {
+      "bad_token_ids": [
+        5032,
+        2180,
+        1005,
+        1056,
+        2228,
+        2055,
+        2993,
+        1012
+      ],
+      "first_divergence_index": 6,
+      "good_token_ids": [
+        5032,
+        2180,
+        1005,
+        1056,
+        2228,
+        2055,
+        2841,
+        1012
+      ],
+      "longest_common_prefix_length": 6,
+      "trace_position": 5,
+      "trace_position_fallback": false,
+      "trace_token": "about"
+    },
+    {
+      "bad_token_ids": [
+        2928,
+        8440,
+        1005,
+        1056,
+        6936,
+        2993,
+        1012
+      ],
+      "first_divergence_index": 5,
+      "good_token_ids": [
+        2928,
+        8440,
+        1005,
+        1056,
+        6936,
+        2370,
+        1012
+      ],
+      "longest_common_prefix_length": 5,
+      "trace_position": 4,
+      "trace_position_fallback": false,
+      "trace_token": "discussed"
+    },
+    {
+      "bad_token_ids": [
+        4459,
+        7622,
+        2993,
+        1012
+      ],
+      "first_divergence_index": 2,
+      "good_token_ids": [
+        4459,
+        7622,
+        2370,
+        1012
+      ],
+      "longest_common_prefix_length": 2,
+      "trace_position": 1,
+      "trace_position_fallback": false,
+      "trace_token": "impressed"
+    },
+    {
+      "bad_token_ids": [
+        7638,
+        2003,
+        4855,
+        2023,
+        12741,
+        1012
+      ],
+      "first_divergence_index": 4,
+      "good_token_ids": [
+        7638,
+        2003,
+        4855,
+        2023,
+        11080,
+        1012
+      ],
+      "longest_common_prefix_length": 4,
+      "trace_position": 3,
+      "trace_position_fallback": false,
+      "trace_token": "this"
+    },
+    {
+      "bad_token_ids": [
+        7010,
+        10641,
+        2008,
+        13025,
+        5324,
+        1012
+      ],
+      "first_divergence_index": 4,
+      "good_token_ids": [
+        7010,
+        10641,
+        2008,
+        13025,
+        3573,
+        1012
+      ],
+      "longest_common_prefix_length": 4,
+      "trace_position": 3,
+      "trace_position_fallback": false,
+      "trace_token": "grocery"
+    },
+    {
+      "bad_token_ids": [
+        9345,
+        2038,
+        6015,
+        2122,
+        2775,
+        1012
+      ],
+      "first_divergence_index": 4,
+      "good_token_ids": [
+        9345,
+        2038,
+        6015,
+        2122,
+        2336,
+        1012
+      ],
+      "longest_common_prefix_length": 4,
+      "trace_position": 3,
+      "trace_position_fallback": false,
+      "trace_token": "these"
+    },
+    {
+      "bad_token_ids": [
+        6647,
+        2052,
+        19819,
+        2008,
+        24752,
+        1012
+      ],
+      "first_divergence_index": 4,
+      "good_token_ids": [
+        6647,
+        2052,
+        19819,
+        2008,
+        19899,
+        1012
+      ],
+      "longest_common_prefix_length": 4,
+      "trace_position": 3,
+      "trace_position_fallback": false,
+      "trace_token": "that"
+    },
+    {
+      "bad_token_ids": [
+        11425,
+        2910,
+        1005,
+        1056,
+        7135,
+        2122,
+        8013,
+        1012
+      ],
+      "first_divergence_index": 6,
+      "good_token_ids": [
+        11425,
+        2910,
+        1005,
+        1056,
+        7135,
+        2122,
+        6304,
+        1012
+      ],
+      "longest_common_prefix_length": 6,
+      "trace_position": 5,
+      "trace_position_fallback": false,
+      "trace_token": "these"
+    },
+    {
+      "bad_token_ids": [
+        2040,
+        2323,
+        7256,
+        8549,
+        2957,
+        2044,
+        16880,
+        1029
+      ],
+      "first_divergence_index": 4,
+      "good_token_ids": [
+        2040,
+        2323,
+        7256,
+        8549,
+        2044,
+        16880,
+        2957,
+        1029
+      ],
+      "longest_common_prefix_length": 4,
+      "trace_position": 3,
+      "trace_position_fallback": false,
+      "trace_token": "hug"
+    },
+    {
+      "bad_token_ids": [
+        2054,
+        2018,
+        14781,
+        2939,
+        2083,
+        2008,
+        2152,
+        2082,
+        2096,
+        3331,
+        2055,
+        1029
+      ],
+      "first_divergence_index": 5,
+      "good_token_ids": [
+        2054,
+        2018,
+        14781,
+        2939,
+        2083,
+        2096,
+        3331,
+        2055,
+        2008,
+        2152,
+        2082,
+        1029
+      ],
+      "longest_common_prefix_length": 5,
+      "trace_position": 4,
+      "trace_position_fallback": false,
+      "trace_token": "through"
+    },
+    {
+      "bad_token_ids": [
+        2040,
+        2097,
+        9477,
+        7523,
+        11781,
+        2302,
+        14763,
+        1029
+      ],
+      "first_divergence_index": 4,
+      "good_token_ids": [
+        2040,
+        2097,
+        9477,
+        7523,
+        2302,
+        14763,
+        11781,
+        1029
+      ],
+      "longest_common_prefix_length": 4,
+      "trace_position": 3,
+      "trace_position_fallback": false,
+      "trace_token": "discover"
+    },
+    {
+      "bad_token_ids": [
+        2040,
+        2038,
+        28385,
+        25817,
+        12120,
+        2077,
+        7618,
+        1029
+      ],
+      "first_divergence_index": 4,
+      "good_token_ids": [
+        2040,
+        2038,
+        28385,
+        25817,
+        2077,
+        7618,
+        12120,
+        1029
+      ],
+      "longest_common_prefix_length": 4,
+      "trace_position": 3,
+      "trace_position_fallback": false,
+      "trace_token": "aggravated"
+    },
+    {
+      "bad_token_ids": [
+        2054,
+        2071,
+        1037,
+        2843,
+        1997,
+        8870,
+        3338,
+        2035,
+        22840,
+        2015,
+        2096,
+        4531,
+        1029
+      ],
+      "first_divergence_index": 7,
+      "good_token_ids": [
+        2054,
+        2071,
+        1037,
+        2843,
+        1997,
+        8870,
+        3338,
+        2096,
+        4531,
+        2035,
+        22840,
+        2015,
+        1029
+      ],
+      "longest_common_prefix_length": 7,
+      "trace_position": 6,
+      "trace_position_fallback": false,
+      "trace_token": "break"
+    },
+    {
+      "context_a_decoded": "katherine can ' t help herself.",
+      "context_a_tokens": [
+        9477,
+        2064,
+        1005,
+        1056,
+        2393,
+        2841,
+        1012
+      ],
+      "context_b_decoded": "katherine can ' t help himself.",
+      "context_b_tokens": [
+        9477,
+        2064,
+        1005,
+        1056,
+        2393,
+        2370,
+        1012
+      ],
+      "dataset": "blimp",
+      "example_id": "blimp-anaphor_gender_agreement",
+      "extension": {
+        "UID": "anaphor_gender_agreement",
+        "field": "morphology",
+        "lexically_identical": false,
+        "linguistics_term": "anaphor_agreement",
+        "one_prefix_method": true,
+        "pair_id": 0,
+        "simple_LM_method": true,
+        "two_prefix_method": false
+      },
+      "group_id": "anaphor_gender_agreement",
+      "negative_a_tokens": [],
+      "negative_b_tokens": [],
+      "negative_text_a": "",
+      "negative_text_b": "",
+      "pair_id": "blimp-anaphor_gender_agreement",
+      "phenomenon": "anaphor_gender_agreement",
+      "positive_a_tokens": [],
+      "positive_b_tokens": [],
+      "positive_text_a": "",
+      "positive_text_b": "",
+      "relation": "grammatical_minimal_pair",
+      "score_mode": "paired_sequence_logprob",
+      "source_id": "anaphor_gender_agreement",
+      "split": "train",
+      "teacher_forced_candidate_span_a": [
+        7,
+        7
+      ],
+      "teacher_forced_candidate_span_b": [
+        7,
+        7
+      ],
+      "text_a": "Katherine can't help herself.",
+      "text_b": "Katherine can't help himself.",
+      "trace_details": {
+        "first_divergence_index": 5,
+        "longest_common_prefix_length": 5,
+        "trace_position_fallback": false
+      },
+      "trace_semantics": "pre_divergence_prediction_state",
+      "trace_token_a": "help",
+      "trace_token_b": "help",
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "karla could listen to herself.",
+      "context_a_tokens": [
+        6382,
+        2050,
+        2071,
+        4952,
+        2000,
+        2841,
+        1012
+      ],
+      "context_b_decoded": "karla could listen to himself.",
+      "context_b_tokens": [
+        6382,
+        2050,
+        2071,
+        4952,
+        2000,
+        2370,
+        1012
+      ],
+      "dataset": "blimp",
+      "example_id": "blimp-anaphor_gender_agreement",
+      "extension": {
+        "UID": "anaphor_gender_agreement",
+        "field": "morphology",
+        "lexically_identical": false,
+        "linguistics_term": "anaphor_agreement",
+        "one_prefix_method": true,
+        "pair_id": 1,
+        "simple_LM_method": true,
+        "two_prefix_method": false
+      },
+      "group_id": "anaphor_gender_agreement",
+      "negative_a_tokens": [],
+      "negative_b_tokens": [],
+      "negative_text_a": "",
+      "negative_text_b": "",
+      "pair_id": "blimp-anaphor_gender_agreement",
+      "phenomenon": "anaphor_gender_agreement",
+      "positive_a_tokens": [],
+      "positive_b_tokens": [],
+      "positive_text_a": "",
+      "positive_text_b": "",
+      "relation": "grammatical_minimal_pair",
+      "score_mode": "paired_sequence_logprob",
+      "source_id": "anaphor_gender_agreement",
+      "split": "train",
+      "teacher_forced_candidate_span_a": [
+        7,
+        7
+      ],
+      "teacher_forced_candidate_span_b": [
+        7,
+        7
+      ],
+      "text_a": "Karla could listen to herself.",
+      "text_b": "Karla could listen to himself.",
+      "trace_details": {
+        "first_divergence_index": 5,
+        "longest_common_prefix_length": 5,
+        "trace_position_fallback": false
+      },
+      "trace_semantics": "pre_divergence_prediction_state",
+      "trace_token_a": "to",
+      "trace_token_b": "to",
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "marie won ' t think about herself.",
+      "context_a_tokens": [
+        5032,
+        2180,
+        1005,
+        1056,
+        2228,
+        2055,
+        2841,
+        1012
+      ],
+      "context_b_decoded": "marie won ' t think about itself.",
+      "context_b_tokens": [
+        5032,
+        2180,
+        1005,
+        1056,
+        2228,
+        2055,
+        2993,
+        1012
+      ],
+      "dataset": "blimp",
+      "example_id": "blimp-anaphor_gender_agreement",
+      "extension": {
+        "UID": "anaphor_gender_agreement",
+        "field": "morphology",
+        "lexically_identical": false,
+        "linguistics_term": "anaphor_agreement",
+        "one_prefix_method": true,
+        "pair_id": 2,
+        "simple_LM_method": true,
+        "two_prefix_method": false
+      },
+      "group_id": "anaphor_gender_agreement",
+      "negative_a_tokens": [],
+      "negative_b_tokens": [],
+      "negative_text_a": "",
+      "negative_text_b": "",
+      "pair_id": "blimp-anaphor_gender_agreement",
+      "phenomenon": "anaphor_gender_agreement",
+      "positive_a_tokens": [],
+      "positive_b_tokens": [],
+      "positive_text_a": "",
+      "positive_text_b": "",
+      "relation": "grammatical_minimal_pair",
+      "score_mode": "paired_sequence_logprob",
+      "source_id": "anaphor_gender_agreement",
+      "split": "train",
+      "teacher_forced_candidate_span_a": [
+        8,
+        8
+      ],
+      "teacher_forced_candidate_span_b": [
+        8,
+        8
+      ],
+      "text_a": "Marie won't think about herself.",
+      "text_b": "Marie won't think about itself.",
+      "trace_details": {
+        "first_divergence_index": 6,
+        "longest_common_prefix_length": 6,
+        "trace_position_fallback": false
+      },
+      "trace_semantics": "pre_divergence_prediction_state",
+      "trace_token_a": "about",
+      "trace_token_b": "about",
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "mark hasn ' t discussed himself.",
+      "context_a_tokens": [
+        2928,
+        8440,
+        1005,
+        1056,
+        6936,
+        2370,
+        1012
+      ],
+      "context_b_decoded": "mark hasn ' t discussed itself.",
+      "context_b_tokens": [
+        2928,
+        8440,
+        1005,
+        1056,
+        6936,
+        2993,
+        1012
+      ],
+      "dataset": "blimp",
+      "example_id": "blimp-anaphor_gender_agreement",
+      "extension": {
+        "UID": "anaphor_gender_agreement",
+        "field": "morphology",
+        "lexically_identical": false,
+        "linguistics_term": "anaphor_agreement",
+        "one_prefix_method": true,
+        "pair_id": 3,
+        "simple_LM_method": true,
+        "two_prefix_method": false
+      },
+      "group_id": "anaphor_gender_agreement",
+      "negative_a_tokens": [],
+      "negative_b_tokens": [],
+      "negative_text_a": "",
+      "negative_text_b": "",
+      "pair_id": "blimp-anaphor_gender_agreement",
+      "phenomenon": "anaphor_gender_agreement",
+      "positive_a_tokens": [],
+      "positive_b_tokens": [],
+      "positive_text_a": "",
+      "positive_text_b": "",
+      "relation": "grammatical_minimal_pair",
+      "score_mode": "paired_sequence_logprob",
+      "source_id": "anaphor_gender_agreement",
+      "split": "train",
+      "teacher_forced_candidate_span_a": [
+        7,
+        7
+      ],
+      "teacher_forced_candidate_span_b": [
+        7,
+        7
+      ],
+      "text_a": "Mark hasn't discussed himself.",
+      "text_b": "Mark hasn't discussed itself.",
+      "trace_details": {
+        "first_divergence_index": 5,
+        "longest_common_prefix_length": 5,
+        "trace_position_fallback": false
+      },
+      "trace_semantics": "pre_divergence_prediction_state",
+      "trace_token_a": "discussed",
+      "trace_token_b": "discussed",
+      "validation_errors": []
+    },
+    {
+      "context_a_decoded": "stephen impressed himself.",
+      "context_a_tokens": [
+        4459,
+        7622,
+        2370,
+        1012
+      ],
+      "context_b_decoded": "stephen impressed itself.",
+      "context_b_tokens": [
+        4459,
+        7622,
+        2993,
+        1012
+      ],
+      "dataset": "blimp",
+      "example_id": "blimp-anaphor_gender_agreement",
+      "extension": {
+        "UID": "anaphor_gender_agreement",
+        "field": "morphology",
+        "lexically_identical": false,
+        "linguistics_term": "anaphor_agreement",
+        "one_prefix_method": true,
+        "pair_id": 4,
+        "simple_LM_method": true,
+        "two_prefix_method": false
+      },
+      "group_id": "anaphor_gender_agreement",
+      "negative_a_tokens": [],
+      "negative_b_tokens": [],
+      "negative_text_a": "",
+      "negative_text_b": "",
+      "pair_id": "blimp-anaphor_gender_agreement",
+      "phenomenon": "anaphor_gender_agreement",
+      "positive_a_tokens": [],
+      "positive_b_tokens": [],
+      "positive_text_a": "",
+      "positive_text_b": "",
+      "relation": "grammatical_minimal_pair",
+      "score_mode": "paired_sequence_logprob",
+      "source_id": "anaphor_gender_agreement",
+      "split": "train",
+      "teacher_forced_candidate_span_a": [
+        4,
+        4
+      ],
+      "teacher_forced_candidate_span_b": [
+        4,
+        4
+      ],
+      "text_a": "Stephen impressed himself.",
+      "text_b": "Stephen impressed itself.",
+      "trace_details": {
+        "first_divergence_index": 2,
+        "longest_common_prefix_length": 2,
+        "trace_position_fallback": false
+      },
+      "trace_semantics": "pre_divergence_prediction_state",
+      "trace_token_a": "impressed",
+      "trace_token_b": "impressed",
+      "validation_errors": []
+    }
+  ]
+}
