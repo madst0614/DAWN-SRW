@@ -299,11 +299,23 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction, default=True,
         help="Retry only low-capture transition rows at cached larger top-k tiers.")
     p.add_argument(
+        "--transition-adaptive-final-topk-v", type=int, default=8192,
+        help="Maximum adaptive target-only V capture width.")
+    p.add_argument(
+        "--transition-adaptive-final-topk-rst", type=int, default=8192,
+        help="Maximum adaptive target-only RST capture width.")
+    p.add_argument(
         "--causal-max-prompts",
         type=int,
         default=int(os.environ.get("DAWN_V4171_CAUSAL_MAX_PROMPTS", 6)),
         help="Maximum controlled prompts used by the causal_intervention item.",
     )
+    p.add_argument(
+        "--rerouting-max-prompts", type=int, default=None,
+        help="Optional deterministic prompt cap for causal_rerouting_trace.")
+    p.add_argument(
+        "--causal-recovery-neutral-log-band", type=float, default=0.05,
+        help="Absolute log-relative-ratio band classified as approximately preserved.")
     p.add_argument(
         "--functional-graph-max-operators-qk", type=int, default=2048,
         help="Maximum deterministic QK candidates in the functional graph.")
@@ -325,6 +337,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--group-causal-max-prompts", type=int, default=None,
         help="Optional deterministic prompt cap for group interventions.")
+    p.add_argument(
+        "--group-random-match-draws", type=int, default=64,
+        help="Deterministic random-active draws used for contribution matching.")
+    p.add_argument(
+        "--group-contribution-match-max-relative-error", type=float, default=0.25,
+        help="Maximum accepted local-contribution mass mismatch for matched controls.")
     p.add_argument(
         "--train-analysis-generation-max-prompts",
         type=int,
@@ -1890,6 +1908,213 @@ def _decision_lines(active: Dict[str, Any], selection: Dict[str, Any], progress:
     return lines
 
 
+def _operator_family_decision(
+        analysis: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    causal = analysis.get("causal_intervention") or {}
+    parity = causal.get("zero_suppression_parity") or {}
+    canonical_zero_valid = bool(parity.get("machine_exact"))
+
+    ranking = analysis.get("causal_ranking_calibration") or {}
+    ranking_judgments = ranking.get("judgments") or {}
+    local_ranking = ranking_judgments.get("local_ranking_valid") or {}
+    local_evidence = local_ranking.get("evidence") or {}
+
+    recovery = analysis.get("causal_recovery_trace") or {}
+    compensation = recovery.get("downstream_compensation_dominant") or {}
+    compensation_evidence = compensation.get("evidence") or {}
+
+    rerouting = analysis.get("causal_rerouting_trace") or {}
+    path_dependence = rerouting.get("path_dependence_supported") or {}
+    path_evidence = path_dependence.get("evidence") or {}
+
+    groups = analysis.get("group_causal_intervention") or {}
+    redundancy = groups.get("functional_redundancy_supported") or {}
+    redundancy_evidence = redundancy.get("evidence") or {}
+    group_zero_parity = groups.get("zero_size_group_parity") or {}
+    canonical_valid = bool(
+        canonical_zero_valid and group_zero_parity.get("machine_exact"))
+
+    graph = analysis.get("operator_functional_graph") or {}
+    graph_pools = graph.get("pools") or {}
+    address_function = {
+        pool: _safe_float(row.get("address_function_spearman"))
+        for pool, row in graph_pools.items()
+    }
+    address_function = {
+        pool: value for pool, value in address_function.items()
+        if value is not None
+    }
+    mean_abs_alignment = (
+        sum(abs(value) for value in address_function.values())
+        / len(address_function) if address_function else None)
+    if mean_abs_alignment is None:
+        alignment_strength = "unavailable"
+    elif mean_abs_alignment < 0.20:
+        alignment_strength = "weak"
+    elif mean_abs_alignment < 0.50:
+        alignment_strength = "moderate"
+    else:
+        alignment_strength = "strong"
+    percolated_pools = {
+        pool: bool(row.get("percolated")) for pool, row in graph_pools.items()
+    }
+
+    capture_by_item: Dict[str, Any] = {}
+    for item in (
+            "trajectory_trace", "operator_functional_graph",
+            "causal_rerouting_trace"):
+        capture = (analysis.get(item) or {}).get("capture_reliability") or {}
+        if capture:
+            capture_by_item[item] = {
+                "total_observations": capture.get("total_observations", 0),
+                "qualified_observations": capture.get(
+                    "qualified_observations", 0),
+                "excluded_observations": capture.get(
+                    "excluded_observations", 0),
+                "remaining_low_capture_count": capture.get(
+                    "remaining_low_capture_count", 0),
+                "pools": capture.get("pools", {}),
+            }
+    remaining_low_capture_by_item = {
+        item: int(row.get("remaining_low_capture_count", 0) or 0)
+        for item, row in capture_by_item.items()
+    }
+    capture_supported = bool(capture_by_item) and not any(
+        remaining_low_capture_by_item.values())
+
+    judgments = {
+        "canonical_causal_path_valid": {
+            "supported": canonical_valid,
+            "evidence": {
+                "canonical_zero_suppression": parity,
+                "zero_size_group_suppression": group_zero_parity,
+            },
+        },
+        "local_operator_ranking_valid": {
+            "supported": bool(local_ranking.get("supported")),
+            "evidence": local_evidence,
+        },
+        "downstream_compensation_dominant": compensation,
+        "path_dependence_supported": path_dependence,
+        "functional_redundancy_supported": redundancy,
+        "address_function_alignment": {
+            "strength": alignment_strength,
+            "mean_abs_spearman": mean_abs_alignment,
+            "spearman_by_pool": address_function,
+            "strength_thresholds": {"weak_lt": 0.20, "moderate_lt": 0.50},
+        },
+        "functional_graph_percolated": {
+            "percolated": any(percolated_pools.values()),
+            "pools": percolated_pools,
+            "largest_component_fraction_by_pool": {
+                pool: row.get("largest_component_fraction")
+                for pool, row in graph_pools.items()
+            },
+        },
+        "capture_reliability": {
+            "supported": capture_supported,
+            "remaining_low_capture_count_by_item":
+                remaining_low_capture_by_item,
+            "items": capture_by_item,
+        },
+    }
+
+    local_ci = local_evidence.get("bootstrap_ci95") or [None, None]
+    paired = redundancy_evidence
+    lines = [
+        (
+            "Canonical suppression path "
+            f"{'passed' if canonical_valid else 'failed'} machine-exact zero parity "
+            f"(CE abs diff={_fmt_num(parity.get('ce_abs_diff'), 8)}, "
+            f"max logit abs diff={_fmt_num(parity.get('max_logit_abs_diff'), 8)}, "
+            f"final residual max abs diff={_fmt_num(parity.get('final_residual_max_abs_diff'), 8)}, "
+            f"zero-size group exact={group_zero_parity.get('machine_exact')}, "
+            f"group comparisons={group_zero_parity.get('num_comparisons', 0)})."
+        ),
+        (
+            "Local contribution ranking "
+            f"{'predicts' if local_ranking.get('supported') else 'does not establish'} "
+            "immediate causal importance "
+            f"(Spearman={_fmt_num(local_evidence.get('spearman'), 3)}, "
+            f"CI95={local_ci}, n={local_evidence.get('n', 0)})."
+        ),
+        (
+            "Relative recovery metrics "
+            f"{'support' if compensation.get('supported') else 'do not support'} "
+            "dominant downstream compensation "
+            f"(median ratio={_fmt_num(compensation_evidence.get('median_relative_delta_ratio'), 4)}, "
+            f"recovery={_fmt_pct(compensation_evidence.get('relative_recovery_fraction'), 2)}, "
+            f"amplification={_fmt_pct(compensation_evidence.get('relative_amplification_fraction'), 2)})."
+        ),
+        (
+            "Rerouting traces "
+            f"{'support' if path_dependence.get('supported') else 'do not support'} "
+            "path-dependent downstream computation "
+            f"(routing predicts final={path_evidence.get('routing_divergence_predicts_final_relative_effect')}, "
+            f"important reconvergence fraction={_fmt_pct(path_evidence.get('important_reconvergence_fraction'), 2)})."
+        ),
+        (
+            "Reciprocal functional neighborhoods "
+            f"{'outperform' if redundancy.get('supported') else 'do not establish an advantage over'} "
+            "contribution-matched random controls "
+            f"(paired n={paired.get('paired_n', 0)}, "
+            f"mean difference={_fmt_delta(paired.get('paired_mean_difference'), 5)}, "
+            f"CI95={paired.get('bootstrap_ci95')})."
+        ),
+        (
+            "Learned address and RW functional geometry are "
+            f"{alignment_strength}ly aligned "
+            f"(mean |Spearman|={_fmt_num(mean_abs_alignment, 3)}, by pool={address_function})."
+            if alignment_strength in ("weak", "moderate", "strong") else
+            "Learned address and RW functional geometry alignment is unavailable."
+        ),
+        (
+            "Connected-component family interpretation is "
+            f"{'disabled because the graph percolated' if any(percolated_pools.values()) else 'kept diagnostic-only'} "
+            f"(percolated by pool={percolated_pools})."
+        ),
+        (
+            "Sparse capture reliability "
+            f"{'passed' if capture_supported else 'is partial'} "
+            f"(remaining low-capture observations by item="
+            f"{remaining_low_capture_by_item})."
+        ),
+    ]
+    return judgments, lines
+
+
+def _append_v4171_analysis_warnings(
+        warnings: List[str], analysis: Dict[str, Any],
+        selected_items: List[str]) -> None:
+    for item in selected_items:
+        data = analysis.get(item) or {}
+        status = str(data.get("status", "not_requested"))
+        capture_warnings = data.get("capture_warnings_by_pool") or {}
+        if capture_warnings:
+            counts = ", ".join(
+                f"{pool}={count}" for pool, count in sorted(
+                    capture_warnings.items()))
+            warnings.append(
+                f"{item} low-capture observations by pool: {counts}; "
+                "affected path/profile conclusions remain partial.")
+        if status in ("partial", "failed"):
+            warnings.append(
+                f"{item} status={status}: "
+                f"{data.get('reason') or data.get('warning') or data.get('error') or 'inspect item limitations and artifacts'}")
+    graph = analysis.get("operator_functional_graph") or {}
+    for pool, row in (graph.get("pools") or {}).items():
+        if row.get("percolated"):
+            warnings.append(
+                f"operator_functional_graph {pool} connected components are "
+                "percolated and are not interpreted as functional families "
+                f"(largest fraction={_fmt_num(row.get('largest_component_fraction'), 4)}).")
+    group_warning = (analysis.get("group_causal_intervention") or {}).get(
+        "warning")
+    if group_warning:
+        warnings.append(f"group_causal_intervention: {group_warning}")
+    warnings[:] = list(dict.fromkeys(warnings))
+
+
 def _trend_rows(store: AnalysisStore, current: Dict[str, Any], warnings: List[str]) -> List[Dict[str, Any]]:
     path = store.path("train_analysis.jsonl")
     try:
@@ -1983,7 +2208,7 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
         f"  latest_path     : {run.get('latest_path')}",
         f"  latest_modified : {run.get('latest_modified') or 'n/a'}",
         f"  analyzed_split  : val",
-        f"  analysis_batches: {active.get('num_batches', run.get('analysis_batches'))}",
+        f"  analysis_batches: {run.get('analysis_batches') if active.get('status') == 'not_requested' else active.get('num_batches', run.get('analysis_batches'))}",
         f"  analysis_preset : {summary.get('analysis_preset')}",
         f"  analysis_items  : {','.join(summary.get('analysis_items') or [])}",
         f"  required_sections: {','.join(summary.get('analysis_required_sections') or [])}",
@@ -2013,23 +2238,30 @@ def _format_train_analysis(summary: Dict[str, Any]) -> str:
         _pool_targets_line("candidate_now", selection.get("candidate_now", {})),
         "",
         "Active dynamics:",
-        "  pool    active_tau   admission   effective   top1       tau_mean   gate_mass   status",
     ]
-    pools = active.get("pools", {})
-    for pool in ("qk", "v", "rst"):
-        pdata = pools.get(pool, {})
-        status = pdata.get("status", "n/a")
+    if active.get("status") == "not_requested":
+        out.extend([
+            "  status          : not_requested",
+            f"  reason          : {active.get('reason', 'not requested by preset')}",
+        ])
+    else:
         out.append(
-            "  "
-            f"{pool:<6} "
-            f"{_fmt_num(pdata.get('active_tau'), 3):<12} "
-            f"{_fmt_num(pdata.get('admission'), 3):<11} "
-            f"{_fmt_num(pdata.get('effective'), 3):<11} "
-            f"{_fmt_num(pdata.get('top1'), 3):<10} "
-            f"{_fmt_num(pdata.get('tau_mean'), 3):<10} "
-            f"{_fmt_num(pdata.get('gate_mass'), 3):<11} "
-            f"{status}"
-        )
+            "  pool    active_tau   admission   effective   top1       tau_mean   gate_mass   status")
+        pools = active.get("pools", {})
+        for pool in ("qk", "v", "rst"):
+            pdata = pools.get(pool, {})
+            status = pdata.get("status", "n/a")
+            out.append(
+                "  "
+                f"{pool:<6} "
+                f"{_fmt_num(pdata.get('active_tau'), 3):<12} "
+                f"{_fmt_num(pdata.get('admission'), 3):<11} "
+                f"{_fmt_num(pdata.get('effective'), 3):<11} "
+                f"{_fmt_num(pdata.get('top1'), 3):<10} "
+                f"{_fmt_num(pdata.get('tau_mean'), 3):<10} "
+                f"{_fmt_num(pdata.get('gate_mass'), 3):<11} "
+                f"{status}"
+            )
     out.extend(format_train_analysis_items(summary, items, item_formatters))
     out.extend([
         "",
@@ -2169,7 +2401,12 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
             max_batches,
             include_composition="composition_health" in analysis_items,
         )
-        if "active" in required_sections else {}
+        if "active" in required_sections else {
+            "status": "not_requested",
+            "reason": "active/tau metrics were not requested by this preset",
+            "pools": {},
+            "num_batches": 0,
+        }
     )
     prune = _run_prune_light(ctx, max_batches, eps_values) if "prune" in required_sections else {}
     prompt_trace = run_train_prompt_trace(ctx) if "prompt_trace" in required_sections else {}
@@ -2187,18 +2424,24 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     if not ctx.is_primary:
         return 0
 
-    for pool, pdata in active.get("pools", {}).items():
-        pdata["status"] = _active_status(pool, pdata.get("active_tau"), progress["tokens"], selection)
-    active = _add_target_ratio(active, selection)
-    active["target_quantile_gap"] = _build_target_quantile_gap(active, selection)
-    active["calibration_state"] = _build_calibration_state(active, selection, ctx.config)
-    if selection.get("enabled"):
+    if active.get("status") != "not_requested":
+        for pool, pdata in active.get("pools", {}).items():
+            pdata["status"] = _active_status(
+                pool, pdata.get("active_tau"), progress["tokens"], selection)
+        active = _add_target_ratio(active, selection)
+        active["target_quantile_gap"] = _build_target_quantile_gap(active, selection)
+        active["calibration_state"] = _build_calibration_state(
+            active, selection, ctx.config)
+    if selection.get("enabled") and active.get("status") != "not_requested":
         active_values = [
             active.get("pools", {}).get(pool, {}).get("active_tau")
             for pool in ("qk", "v", "rst")
         ]
         if all(_safe_float(value) is None for value in active_values):
             warnings.append("selection_calibration is enabled but no active_tau metrics were observed.")
+    if v4171_transition_analysis:
+        _append_v4171_analysis_warnings(
+            warnings, v4171_transition_analysis, list(analysis_items))
     model_version = ctx.config.get("model", {}).get("model_version")
     if model_version == V4166_MODEL_VERSION:
         compare = _compare_400m(active)
@@ -2209,6 +2452,12 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
             "status": "not_applicable",
             "reason": "reference ranges are calibrated for v4166, not v4171",
         }
+    operator_family_decision: Dict[str, Any] = {}
+    operator_family_decision_lines: List[str] = []
+    if args.train_analysis_preset == "v4171_operator_family":
+        (operator_family_decision,
+         operator_family_decision_lines) = _operator_family_decision(
+            v4171_transition_analysis)
     summary = {
         "run": {
             "config": args.config or "checkpoint full_config",
@@ -2232,6 +2481,7 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
         "prompt_decision": prompt_decision,
         "generation_samples": generation_samples,
         "v4171_transition_analysis": v4171_transition_analysis,
+        "operator_family_decision": operator_family_decision,
         "operator_analysis": operator_analysis,
         "operator_analysis_datasets": (
             operator_analysis.get("dataset_manifest")
@@ -2257,7 +2507,10 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     }
     scalar = _scalar_row(summary)
     summary["recent_trend"] = _trend_rows(store, scalar, warnings)
-    summary["decision"] = _decision_lines(active, selection, progress)
+    summary["decision"] = (
+        operator_family_decision_lines
+        if args.train_analysis_preset == "v4171_operator_family"
+        else _decision_lines(active, selection, progress))
     summary["warnings"] = warnings
     emit_train_analysis_item_progress(summary, analysis_items)
     text = _format_train_analysis(summary)
@@ -2275,6 +2528,8 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
 
 def main() -> int:
     args = parse_args()
+    if args.from_scratch:
+        args.resume = False
     if args.list_train_analysis_items:
         print(train_analysis_catalog_text())
         return 0
@@ -2295,8 +2550,6 @@ def main() -> int:
         run_v4171_parity_only_smoke(ctx)
         sync_hosts("dawn-srw-v4171-parity-only-done")
         return 0
-    if args.from_scratch:
-        args.resume = False
     if args.output is None:
         raise ValueError("--output is required unless --train-analysis is used.")
     stages = parse_stages(args.stages)

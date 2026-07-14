@@ -190,8 +190,14 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
     },
     "causal_intervention": {
         "title": "v4171 canonical causal intervention",
-        "measures": "target-token/layer/pool top-contribution, top-gate, active/inactive random, and matched-active contribution subtraction with CE, log-prob, KL, prediction, and residual effects.",
+        "measures": "target-token/layer/pool top-contribution, top-gate, active/inactive random, and matched-active contribution subtraction with sequence behavior, shifted next-token log-probability, KL, prediction, and residual effects.",
         "summary": "CAUSAL_INTERVENTION subtracts a selected post-denominator production contribution and blocks on exact zero-vector parity.",
+        "requires": ("v4171_transition",),
+    },
+    "causal_rerouting_trace": {
+        "title": "v4171 causal rerouting trace",
+        "measures": "Same-forward baseline/intervention residual, query, sparse routing, transition, attention-update, RST-update, divergence AUC, reconvergence, paired controls, and final causal effects.",
+        "summary": "CAUSAL REROUTING TRACE tests whether an operator intervention changes the downstream computation path without transferring full gate tensors to the host.",
         "requires": ("v4171_transition",),
     },
     "causal_recovery_trace": {
@@ -202,8 +208,8 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
     },
     "operator_functional_graph": {
         "title": "v4171 operator functional graph",
-        "measures": "Rank-1 RW functional similarity, address similarity, sparse activation/contribution profiles, nearest neighbors, and conservative mutual-neighbor families.",
-        "summary": "OPERATOR FUNCTIONAL GRAPH distinguishes reusable RW function from context-specialized addressing.",
+        "measures": "Rank-1 RW functional similarity, address similarity, sparse activation/contribution profiles, reciprocal seed-local neighborhoods, and separate transitive-component percolation diagnostics.",
+        "summary": "OPERATOR FUNCTIONAL GRAPH distinguishes reusable RW function from context-specialized addressing without treating percolated connected components as causal families.",
         "requires": ("v4171_transition",),
     },
     "group_causal_intervention": {
@@ -270,6 +276,7 @@ V4171_SELF_ORGANIZATION_ITEMS = (
 )
 
 V4171_OPERATOR_FAMILY_EXTRA_ITEMS = (
+    "causal_rerouting_trace",
     "causal_recovery_trace",
     "operator_functional_graph",
     "group_causal_intervention",
@@ -1076,12 +1083,8 @@ def _item_lines_state_transition_decoupling(summary: Dict[str, Any], fmt: TrainA
 
 def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
     data = _v4171_item(summary, "causal_intervention")
-    selected = data.get(
-        "selected_behavior_score_drop",
-        data.get("selected_abs_target_logprob_delta", {}))
-    control = data.get(
-        "control_behavior_score_drop",
-        data.get("control_abs_target_logprob_delta", {}))
+    selected = data.get("selected_behavior_score_drop", {})
+    control = data.get("control_behavior_score_drop", {})
     parity = data.get("zero_suppression_parity") or {}
     cross_graph = data.get("normal_production_cross_graph_audit") or {}
     out = [
@@ -1099,16 +1102,38 @@ def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisF
         f"  selected effect : mean={fmt.num(selected.get('mean'), 5)} ci95={selected.get('ci95')} n={selected.get('n', 0)}",
         f"  control effect  : mean={fmt.num(control.get('mean'), 5)} ci95={control.get('ci95')} n={control.get('n', 0)}",
         f"  selected-control: {fmt.delta(data.get('selected_minus_control_effect'), 5)}",
-        f"  artifact        : {data.get('artifact', 'n/a')}",
+        f"  metric semantics: {data.get('metric_semantics', {})}",
+        f"  artifacts       : {data.get('artifacts', {})}",
     ]
     effects = data.get("effects", {})
     for group_name in ("by_strategy", "by_pool", "by_phenomenon"):
         for key, row in (effects.get(group_name) or {}).items():
             out.append(
                 f"  effect {group_name}/{key}: n={row.get('n', 0)} "
-                f"abs_dlogp={fmt.num(row.get('mean_abs_target_logprob_delta'), 5)} "
-                f"ci95={row.get('bootstrap_ci95')} kl={fmt.num(row.get('mean_kl'), 5)} "
+                f"abs_seq={fmt.num(row.get('mean_abs_sequence_behavior_delta'), 5)} "
+                f"ci95={row.get('abs_sequence_behavior_delta_bootstrap_ci95')} "
+                f"target_next={fmt.num(row.get('mean_abs_target_next_token_logprob_delta'), 5)} "
+                f"kl={fmt.num(row.get('mean_sequence_distribution_kl'), 5)} "
                 f"top1_change={fmt.pct(row.get('top_prediction_changed_fraction'), 2)}")
+    return out
+
+
+def _item_lines_causal_rerouting_trace(
+        summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    data = _v4171_item(summary, "causal_rerouting_trace")
+    capture = data.get("capture_reliability") or {}
+    path = data.get("path_dependence_supported") or {}
+    out = [
+        "  CAUSAL REROUTING TRACE:",
+        f"  status          : {data.get('status', 'not_requested')}",
+        f"  prompts/jobs    : {data.get('num_prompts', 0)}/{data.get('num_interventions', 0)}",
+        f"  canonical/shared: {data.get('canonical_forward_shared')} full-gate-host={data.get('full_gate_tensor_host_transfer')}",
+        f"  capture         : total={capture.get('total_observations', 0)} qualified={capture.get('qualified_observations', 0)} excluded={capture.get('excluded_observations', 0)} low={capture.get('remaining_low_capture_count', 0)} pools={capture.get('pools', {})}",
+        f"  path dependence : supported={path.get('supported')} evidence={path.get('evidence', {})}",
+        f"  correlations    : {data.get('correlations', {})}",
+        f"  paired controls : {data.get('paired_strategy_comparisons', {})}",
+        f"  artifacts       : {data.get('artifacts', {})}",
+    ]
     return out
 
 
@@ -1120,8 +1145,11 @@ def _item_lines_causal_recovery_trace(summary: Dict[str, Any], fmt: TrainAnalysi
         f"  status          : {data.get('status', 'not_requested')}",
         f"  rows            : {overall.get('n', 0)}",
         f"  immediate/final : {fmt.num(overall.get('immediate_delta_mean'), 5)}/{fmt.num(overall.get('final_delta_mean'), 5)}",
-        f"  recovery ratio  : mean={fmt.num(overall.get('recovery_ratio_mean'), 4)} ci95={overall.get('recovery_ratio_ci95')}",
-        f"  recovery/amplify: {fmt.pct(overall.get('recovery_fraction'), 2)}/{fmt.pct(overall.get('amplification_fraction'), 2)}",
+        f"  relative ratio  : mean={fmt.num(overall.get('relative_delta_ratio_mean'), 4)} median={fmt.num(overall.get('relative_delta_ratio_median'), 4)} ci95={overall.get('relative_delta_ratio_bootstrap_ci95')}",
+        f"  relative log    : mean={fmt.num(overall.get('relative_delta_log_ratio_mean'), 4)} ci95={overall.get('relative_delta_log_ratio_bootstrap_ci95')}",
+        f"  absolute diag   : mean final/immediate delta={fmt.num(overall.get('absolute_delta_ratio_mean_diagnostic'), 4)}",
+        f"  recovery/neutral/amplify: {fmt.pct(overall.get('relative_recovery_fraction'), 2)}/{fmt.pct(overall.get('approximately_preserved_fraction'), 2)}/{fmt.pct(overall.get('relative_amplification_fraction'), 2)}",
+        f"  compensation    : {data.get('downstream_compensation_dominant', {})}",
         f"  classification  : {data.get('classification_basis', {})}",
         f"  artifacts       : {data.get('artifacts', {})}",
     ]
@@ -1137,7 +1165,9 @@ def _item_lines_operator_functional_graph(summary: Dict[str, Any], fmt: TrainAna
         out.append(
             f"  {pool}: candidates={row.get('candidate_operator_count', 0)} "
             f"coverage={fmt.pct(row.get('candidate_pool_coverage'), 2)} "
-            f"families={row.get('family_count', 0)} singleton={fmt.pct(row.get('singleton_fraction'), 2)} "
+            f"components={row.get('component_count', 0)} largest={fmt.pct(row.get('largest_component_fraction'), 2)} "
+            f"percolated={row.get('percolated')} edges={row.get('reciprocal_edge_count', 0)} "
+            f"local_degree={row.get('reciprocal_functional_degree', {})} "
             f"fHi/aLo={fmt.pct(row.get('function_high_address_low_fraction'), 2)} "
             f"rho(address,function)={fmt.num(row.get('address_function_spearman'), 3)}")
     return out
@@ -1145,18 +1175,25 @@ def _item_lines_operator_functional_graph(summary: Dict[str, Any], fmt: TrainAna
 
 def _item_lines_group_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
     data = _v4171_item(summary, "group_causal_intervention")
+    zero_parity = data.get("zero_size_group_parity") or {}
+    size_one = data.get("size_one_exact_invariant") or {}
     out = [
         "  GROUP CAUSAL INTERVENTION:",
         f"  status/width    : {data.get('status', 'not_requested')}/{data.get('fixed_width', 'n/a')}",
         f"  sizes           : {data.get('group_sizes', [])}",
-        f"  comparisons     : {data.get('comparisons', {})}",
+        f"  single cache    : key={data.get('single_effect_cache_key', [])} planned={data.get('planned_unique_member_single_count', 0)} reused/computed={data.get('computed_or_reused_member_single_count', 0)}",
+        f"  exact invariants: zero-size={zero_parity.get('machine_exact')} n={zero_parity.get('num_comparisons', 0)} size-one={size_one.get('machine_exact')} n={size_one.get('ready_row_count', 0)}",
+        f"  paired compare  : {data.get('paired_comparisons', {})}",
+        f"  paired dose     : {data.get('paired_dose_response', {})}",
+        f"  redundancy      : {data.get('functional_redundancy_supported', {})}",
         f"  artifacts       : {data.get('artifacts', {})}",
     ]
     for group_type, row in (data.get("by_group_type") or {}).items():
         out.append(
             f"  {group_type}: n={row.get('n', 0)} "
-            f"abs_effect={fmt.num(row.get('mean_abs_target_logprob_delta'), 5)} "
-            f"synergy={fmt.num(row.get('mean_synergy'), 5)}")
+            f"abs_seq={fmt.num(row.get('mean_abs_sequence_behavior_delta'), 5)} "
+            f"magnitude_synergy={fmt.num(row.get('mean_magnitude_synergy'), 5)} "
+            f"signed_residual={fmt.num(row.get('mean_signed_additivity_residual'), 5)}")
     return out
 
 
@@ -1205,6 +1242,7 @@ TRAIN_ANALYSIS_ITEM_FORMATTERS = {
     "context_divergence": _item_lines_context_divergence,
     "state_transition_decoupling": _item_lines_state_transition_decoupling,
     "causal_intervention": _item_lines_causal_intervention,
+    "causal_rerouting_trace": _item_lines_causal_rerouting_trace,
     "causal_recovery_trace": _item_lines_causal_recovery_trace,
     "operator_functional_graph": _item_lines_operator_functional_graph,
     "group_causal_intervention": _item_lines_group_causal_intervention,

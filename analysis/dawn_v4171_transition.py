@@ -44,6 +44,7 @@ from analysis.dawn_analysis_trace import (
     TRACE_POOLS,
     TRANSITION_CANDIDATE_FIELDS,
     TRANSITION_CANDIDATE_STRATEGIES,
+    _srw_with_topk,
     topk_trace_forward,
 )
 V4171_MODEL_VERSION = "spatial-r1-v4.1.7.1"
@@ -54,9 +55,9 @@ SUPPORTED_TRANSITION_MODEL_VERSIONS = frozenset({
 })
 OPERATOR_KEY_MODE_LEARNED = "learned_operator_embedding"
 OPERATOR_KEY_MODE_GENERALIZED_BILINEAR = "generalized_bilinear_rw"
-ANALYSIS_SCHEMA_VERSION = 2
+ANALYSIS_SCHEMA_VERSION = 3
 ANALYSIS_CODE_SCHEMA_HASH = hashlib.sha256(
-    b"v4171-operator-family-analysis-schema-2").hexdigest()
+    b"v4171-operator-family-analysis-schema-3-causal-rerouting").hexdigest()
 DEFAULT_TRANSITION_PROMPT_SET = str(
     Path(__file__).resolve().parent / "prompts" / "v4171_transition_pairs.jsonl"
 )
@@ -66,12 +67,14 @@ CORE_TRANSITION_ITEMS = (
     "context_divergence",
     "state_transition_decoupling",
     "causal_intervention",
+    "causal_rerouting_trace",
     "causal_recovery_trace",
     "operator_functional_graph",
     "group_causal_intervention",
     "causal_ranking_calibration",
 )
 ITEM_DEPENDENCIES = {
+    "causal_rerouting_trace": ("trajectory_trace", "causal_intervention"),
     "causal_recovery_trace": ("causal_intervention",),
     "operator_functional_graph": ("trajectory_trace",),
     "group_causal_intervention": (
@@ -79,7 +82,21 @@ ITEM_DEPENDENCIES = {
     "causal_ranking_calibration": (
         "causal_intervention", "causal_recovery_trace"),
 }
+SingleEffectKey = Tuple[str, str, int, int]
 PAIR_CAPTURE_THRESHOLD = 0.95
+DEFAULT_RECOVERY_NEUTRAL_LOG_BAND = 0.05
+DEFAULT_GROUP_RANDOM_MATCH_DRAWS = 64
+DEFAULT_GROUP_CONTRIBUTION_MATCH_MAX_RELATIVE_ERROR = 0.25
+
+
+def single_effect_key(
+        prompt_id: Any, route: Any, layer: Any,
+        operator_id: Any) -> SingleEffectKey:
+    """Canonical cache identity for one production-core suppression."""
+    return (
+        str(prompt_id), str(route), int(layer), int(operator_id))
+
+
 ADAPTIVE_CAPTURE_TIERS = {
     "qk": (512, 1024, 2048),
     "v": (2048, 4096, 8192),
@@ -198,6 +215,93 @@ def mutual_neighbor_families(
     return sorted((sorted(group) for group in groups.values()), key=lambda x: x[0])
 
 
+def reciprocal_neighbor_edges(
+        neighbor_ids: Mapping[int, Sequence[Any]],
+        minimum_similarity: float = -math.inf) -> List[Tuple[int, int]]:
+    """Return threshold-qualified reciprocal top-k edges without closure."""
+    scores: Dict[int, Dict[int, float]] = {}
+    for operator_id, values in neighbor_ids.items():
+        scores[int(operator_id)] = {
+            int(value.get("operator_id") if isinstance(value, Mapping) else value):
+                float(value.get("similarity", math.inf)
+                      if isinstance(value, Mapping) else math.inf)
+            for value in values
+        }
+    edges = []
+    for left in sorted(scores):
+        for right, left_score in scores[left].items():
+            if left >= right or right not in scores:
+                continue
+            right_score = scores[right].get(left)
+            if (right_score is not None
+                    and min(float(left_score), float(right_score))
+                    >= float(minimum_similarity)):
+                edges.append((left, right))
+    return edges
+
+
+def connected_components_from_edges(
+        nodes: Sequence[int], edges: Sequence[Tuple[int, int]]) -> List[List[int]]:
+    """Compute deterministic diagnostic components from an explicit edge set."""
+    adjacency: Dict[int, List[int]] = {
+        int(node): [] for node in sorted(set(int(value) for value in nodes))}
+    for left, right in edges:
+        left, right = int(left), int(right)
+        if left in adjacency and right in adjacency:
+            adjacency[left].append(right)
+            adjacency[right].append(left)
+    components: List[List[int]] = []
+    remaining = set(adjacency)
+    while remaining:
+        root = min(remaining)
+        stack = [root]
+        component: List[int] = []
+        remaining.remove(root)
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for neighbor in sorted(adjacency[node], reverse=True):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+        components.append(sorted(component))
+    return components
+
+
+def functional_percolation_summary(
+        nodes: Sequence[int], edges: Sequence[Tuple[int, int]]) -> Dict[str, Any]:
+    """Describe transitive closure strictly as a percolation diagnostic."""
+    unique_nodes = sorted(set(int(value) for value in nodes))
+    components = connected_components_from_edges(unique_nodes, edges)
+    sizes = [len(component) for component in components]
+    largest = max(sizes) if sizes else 0
+    largest_fraction = largest / len(unique_nodes) if unique_nodes else 0.0
+    possible_edges = len(unique_nodes) * (len(unique_nodes) - 1) / 2
+    return {
+        "components": components,
+        "component_count": len(components),
+        "largest_component_size": largest,
+        "largest_component_fraction": largest_fraction,
+        "singleton_component_fraction": (
+            float(np.mean(np.asarray(sizes) == 1)) if sizes else None),
+        "reciprocal_edge_count": len(edges),
+        "reciprocal_edge_density": (
+            len(edges) / possible_edges if possible_edges else 0.0),
+        "percolated": largest_fraction >= 0.5,
+    }
+
+
+def _numeric_distribution(values: Sequence[float]) -> Dict[str, Any]:
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "count": int(array.size),
+        "mean": float(np.mean(array)) if array.size else None,
+        "median": float(np.median(array)) if array.size else None,
+        "max": float(np.max(array)) if array.size else None,
+        "min": float(np.min(array)) if array.size else None,
+    }
+
+
 def _layer_vector(trace: Mapping[str, Any], key: str) -> np.ndarray:
     value = np.asarray(trace[key], dtype=np.float64)
     if value.ndim == 3:
@@ -242,8 +346,14 @@ def compute_causal_recovery_metrics(
     final_delta = float(np.linalg.norm(after_final - baseline_final))
     final_relative = float(
         final_delta / max(float(np.linalg.norm(baseline_final)), 1.0e-12))
-    denominator = max(immediate_delta, 1.0e-12)
-    remaining = per_norm / denominator
+    eps = 1.0e-12
+    absolute_delta_ratio = final_delta / max(immediate_delta, eps)
+    relative_delta_ratio = (
+        1.0 if immediate_relative <= eps and final_relative <= eps else
+        final_relative / max(immediate_relative, eps))
+    relative_delta_log_ratio = math.log(max(relative_delta_ratio, eps))
+    remaining = per_norm / max(immediate_delta, eps)
+    relative_remaining = per_relative / max(immediate_relative, eps)
     downstream = remaining[layer:]
     maximum_index = layer + int(np.argmax(downstream))
     minimum_index = layer + int(np.argmin(downstream))
@@ -264,18 +374,142 @@ def compute_causal_recovery_metrics(
         "per_layer_post_residual_cosine": per_cosine,
         "final_delta_norm": final_delta,
         "final_relative_delta": final_relative,
-        "recovery_ratio_final": final_delta / denominator,
+        "absolute_delta_ratio": absolute_delta_ratio,
+        "relative_delta_ratio": relative_delta_ratio,
+        "relative_delta_log_ratio": relative_delta_log_ratio,
+        "recovery_ratio_final": absolute_delta_ratio,
+        "recovery_ratio_final_deprecated_alias_for": "absolute_delta_ratio",
+        "per_layer_relative_delta_ratio": relative_remaining.tolist(),
+        "maximum_absolute_delta_ratio_diagnostic": float(
+            remaining[maximum_index]),
+        "maximum_absolute_delta_layer_diagnostic": maximum_index,
+        "minimum_absolute_delta_ratio_diagnostic": float(
+            remaining[minimum_index]),
+        "minimum_absolute_delta_layer_diagnostic": minimum_index,
+        "first_half_absolute_delta_layer_diagnostic": (
+            layer + int(half_indices[0]) if half_indices.size else None),
+        "non_monotonic_absolute_delta_path_diagnostic": bool(
+            downstream.size >= 3
+            and np.any(np.diff(downstream) < 0.0)
+            and np.any(np.diff(downstream) > 0.0)),
         "maximum_amplification_ratio": float(remaining[maximum_index]),
+        "maximum_amplification_ratio_deprecated_alias_for": (
+            "maximum_absolute_delta_ratio_diagnostic"),
         "maximum_amplification_layer": maximum_index,
+        "maximum_amplification_layer_deprecated_alias_for": (
+            "maximum_absolute_delta_layer_diagnostic"),
         "minimum_remaining_ratio": float(remaining[minimum_index]),
+        "minimum_remaining_ratio_deprecated_alias_for": (
+            "minimum_absolute_delta_ratio_diagnostic"),
         "minimum_remaining_layer": minimum_index,
+        "minimum_remaining_layer_deprecated_alias_for": (
+            "minimum_absolute_delta_layer_diagnostic"),
         "first_half_recovery_layer": (
             layer + int(half_indices[0]) if half_indices.size else None),
+        "first_half_recovery_layer_deprecated_alias_for": (
+            "first_half_absolute_delta_layer_diagnostic"),
         "final_logit_delta": final_logit_delta,
         "non_monotonic_path": bool(
             downstream.size >= 3
             and np.any(np.diff(downstream) < 0.0)
             and np.any(np.diff(downstream) > 0.0)),
+        "non_monotonic_path_deprecated_alias_for": (
+            "non_monotonic_absolute_delta_path_diagnostic"),
+    }
+
+
+def compute_causal_output_metrics(
+        baseline_logits: Any, intervention_logits: Any,
+        token_ids: Sequence[int], valid_length: int,
+        target_position: int) -> Dict[str, Any]:
+    """Return unambiguous sequence and shifted next-token causal metrics."""
+    baseline = np.asarray(baseline_logits, dtype=np.float64)
+    intervention = np.asarray(intervention_logits, dtype=np.float64)
+    if baseline.shape != intervention.shape or baseline.ndim != 3:
+        raise ValueError("causal logits must have matching [B,S,V] shapes")
+    length = min(int(valid_length), int(baseline.shape[1]), len(token_ids))
+    baseline_ce = _sequence_ce(baseline, token_ids, length)
+    intervention_ce = _sequence_ce(intervention, token_ids, length)
+    sequence_ce_delta = (
+        None if baseline_ce is None or intervention_ce is None
+        else float(intervention_ce - baseline_ce))
+    baseline_behavior = None if baseline_ce is None else -float(baseline_ce)
+    intervention_behavior = (
+        None if intervention_ce is None else -float(intervention_ce))
+    sequence_behavior_delta = (
+        None if baseline_behavior is None or intervention_behavior is None
+        else float(intervention_behavior - baseline_behavior))
+    sequence_behavior_drop = (
+        None if sequence_behavior_delta is None
+        else -float(sequence_behavior_delta))
+
+    baseline_logp = _log_softmax_np(baseline[0, :max(length, 1)])
+    intervention_logp = _log_softmax_np(intervention[0, :max(length, 1)])
+    prediction_position = int(target_position)
+    gold_position = prediction_position + 1
+    target_valid = (
+        prediction_position >= 0
+        and gold_position < length
+        and prediction_position < baseline_logp.shape[0])
+    gold_token_id = int(token_ids[gold_position]) if target_valid else None
+    if target_valid:
+        baseline_target_logprob = float(
+            baseline_logp[prediction_position, gold_token_id])
+        intervention_target_logprob = float(
+            intervention_logp[prediction_position, gold_token_id])
+        target_delta = float(
+            intervention_target_logprob - baseline_target_logprob)
+        target_prob = np.exp(baseline_logp[prediction_position])
+        target_kl = float(np.sum(target_prob * (
+            baseline_logp[prediction_position]
+            - intervention_logp[prediction_position])))
+        top_prediction_changed = bool(
+            np.argmax(baseline_logp[prediction_position])
+            != np.argmax(intervention_logp[prediction_position]))
+    else:
+        baseline_target_logprob = None
+        intervention_target_logprob = None
+        target_delta = None
+        target_kl = None
+        top_prediction_changed = None
+
+    if length >= 2:
+        sequence_base_prob = np.exp(baseline_logp[:length - 1])
+        full_output_kl = float(np.mean(np.sum(
+            sequence_base_prob * (
+                baseline_logp[:length - 1]
+                - intervention_logp[:length - 1]), axis=-1)))
+    else:
+        full_output_kl = None
+    return {
+        "baseline_sequence_ce": baseline_ce,
+        "intervention_sequence_ce": intervention_ce,
+        "sequence_ce_delta": sequence_ce_delta,
+        "baseline_sequence_behavior": baseline_behavior,
+        "intervention_sequence_behavior": intervention_behavior,
+        "sequence_behavior_delta": sequence_behavior_delta,
+        "sequence_mean_logprob_delta": sequence_behavior_delta,
+        "sequence_behavior_drop": sequence_behavior_drop,
+        "abs_sequence_behavior_delta": (
+            None if sequence_behavior_delta is None
+            else abs(float(sequence_behavior_delta))),
+        "target_prediction_position": (
+            prediction_position if target_valid else None),
+        "target_gold_position": gold_position if target_valid else None,
+        "target_gold_token_id": gold_token_id,
+        "baseline_target_next_token_logprob": baseline_target_logprob,
+        "intervention_target_next_token_logprob": intervention_target_logprob,
+        "target_next_token_logprob_delta": target_delta,
+        "abs_target_next_token_logprob_delta": (
+            None if target_delta is None else abs(float(target_delta))),
+        "target_distribution_kl": target_kl,
+        "full_output_kl": full_output_kl,
+        "top_prediction_changed": top_prediction_changed,
+        # Kept only so schema-aware readers can migrate old artifacts.  New
+        # summaries and rankings never consume this ambiguous name.
+        "target_logprob_delta": sequence_behavior_delta,
+        "target_logprob_delta_legacy": sequence_behavior_delta,
+        "legacy_target_logprob_metric": "sequence_behavior_delta",
     }
 
 
@@ -384,6 +618,14 @@ def _analysis_provenance(
             ctx.args, "transition_adaptive_capture", True)),
         "causal_max_prompts": int(getattr(
             ctx.args, "causal_max_prompts", 6) or 6),
+        "rerouting_max_prompts": int(getattr(
+            ctx.args, "rerouting_max_prompts", None)
+            or getattr(ctx.args, "causal_max_prompts", 6) or 6),
+        "causal_recovery_neutral_log_band": float(getattr(
+            ctx.args, "causal_recovery_neutral_log_band",
+            DEFAULT_RECOVERY_NEUTRAL_LOG_BAND)
+            if getattr(ctx.args, "causal_recovery_neutral_log_band", None)
+            is not None else DEFAULT_RECOVERY_NEUTRAL_LOG_BAND),
         "functional_graph_max_operators": {
             pool: int(getattr(
                 ctx.args, f"functional_graph_max_operators_{pool}", 2048)
@@ -398,6 +640,18 @@ def _analysis_provenance(
             ctx.args, "group_causal_max_width", 8) or 8),
         "group_causal_max_prompts": getattr(
             ctx.args, "group_causal_max_prompts", None),
+        "group_random_match_draws": int(getattr(
+            ctx.args, "group_random_match_draws",
+            DEFAULT_GROUP_RANDOM_MATCH_DRAWS)
+            or DEFAULT_GROUP_RANDOM_MATCH_DRAWS),
+        "group_contribution_match_max_relative_error": float(getattr(
+            ctx.args, "group_contribution_match_max_relative_error",
+            DEFAULT_GROUP_CONTRIBUTION_MATCH_MAX_RELATIVE_ERROR)
+            or DEFAULT_GROUP_CONTRIBUTION_MATCH_MAX_RELATIVE_ERROR),
+        "transition_adaptive_final_topk_v": int(getattr(
+            ctx.args, "transition_adaptive_final_topk_v", 8192) or 8192),
+        "transition_adaptive_final_topk_rst": int(getattr(
+            ctx.args, "transition_adaptive_final_topk_rst", 8192) or 8192),
     }
     analysis_config_hash = hashlib.sha256(json.dumps(
         analysis_config, sort_keys=True, separators=(",", ":")
@@ -483,6 +737,14 @@ def _load_resumable_summary(
     summary = read_json(path, {})
     if not isinstance(summary, dict) or not _resume_summary_matches(
             ctx, summary, prompt_hash):
+        if ctx.is_primary:
+            print(
+                "ANALYSIS_ARTIFACT_SCHEMA_MISMATCH "
+                f"artifact={filename} action=recompute_stage "
+                f"expected_schema={ANALYSIS_SCHEMA_VERSION} "
+                "hint=use --from-scratch to rebuild every stage",
+                flush=True,
+            )
         return None
     if any(key not in summary for key in required_keys):
         return None
@@ -1147,6 +1409,8 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
         }
         for pool, values in captured_by_pool.items()
     }
+    capture_reliability = _capture_reliability_summary(
+        internal, capture_threshold)
     summary = {
         "status": "partial" if remaining_low_capture_rows else "ready",
         "prompt_set": prompt_set,
@@ -1161,6 +1425,7 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
             "p10": float(np.quantile(captured, 0.10)) if captured else None,
         },
         "captured_mass_by_pool": captured_summary,
+        "capture_reliability": capture_reliability,
         "captured_mass_valid_threshold": capture_threshold,
         "adaptive_capture": {
             "enabled": adaptive_capture,
@@ -1186,6 +1451,11 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
             and summary["captured_mass"]["min"] < capture_threshold):
         summary["captured_mass_warning"] = (
             "Low-capture rows are marked partial and excluded from pair metrics")
+        summary["capture_warnings_by_pool"] = {
+            pool: int(row["remaining_low_capture_count"])
+            for pool, row in capture_reliability["pools"].items()
+            if int(row["remaining_low_capture_count"]) > 0
+        }
     if ctx.is_primary:
         write_jsonl_atomic(ctx.store.path("trajectory_traces.jsonl"), jsonl_rows)
         write_npz_atomic(ctx.store.path("transition_trace_cache.npz"), **npz_payload)
@@ -1840,6 +2110,65 @@ def _capture_tiers(first: int, pool: str) -> List[int]:
     return list(dict.fromkeys(tiers))
 
 
+def _capture_reliability_summary(
+        records: Sequence[Mapping[str, Any]], threshold: float,
+        *, start_layer_key: Optional[str] = None) -> Dict[str, Any]:
+    """Summarize qualified sparse observations without hiding exclusions."""
+    pools: Dict[str, Any] = {}
+    for pool in TRACE_POOLS:
+        before_values: List[float] = []
+        after_values: List[float] = []
+        retry_count = 0
+        recovered_count = 0
+        for record in records:
+            metadata = (record.get("capture") or {}).get(pool)
+            if not metadata:
+                continue
+            before = np.asarray(metadata["before"], dtype=np.float64).reshape(-1)
+            after = np.asarray(metadata["after"], dtype=np.float64).reshape(-1)
+            start = int(record.get(start_layer_key, 0)) if start_layer_key else 0
+            before = before[start:]
+            after = after[start:]
+            before_values.extend(before.tolist())
+            after_values.extend(after.tolist())
+            if int(metadata.get("retry_count", 0)) > 0:
+                retry_count += int(np.sum(before < float(threshold)))
+            recovered_count += int(np.sum(
+                (before < float(threshold)) & (after >= float(threshold))))
+        values = np.asarray(after_values, dtype=np.float64)
+        total = int(values.size)
+        qualified = int(np.sum(values >= float(threshold))) if total else 0
+        excluded = total - qualified
+        pools[pool] = {
+            "total_observations": total,
+            "qualified_observations": qualified,
+            "excluded_observations": excluded,
+            "qualification_fraction": qualified / total if total else None,
+            "captured_mass_mean": float(np.mean(values)) if total else None,
+            "captured_mass_min": float(np.min(values)) if total else None,
+            "captured_mass_p10": (
+                float(np.quantile(values, 0.10)) if total else None),
+            "adaptive_retry_count": retry_count,
+            "adaptive_recovered_count": recovered_count,
+            "remaining_low_capture_count": excluded,
+        }
+    remaining = sum(
+        int(row["remaining_low_capture_count"]) for row in pools.values())
+    total = sum(int(row["total_observations"]) for row in pools.values())
+    qualified = sum(
+        int(row["qualified_observations"]) for row in pools.values())
+    return {
+        "status": "partial" if remaining else "ready",
+        "qualification_threshold": float(threshold),
+        "pools": pools,
+        "total_observations": total,
+        "qualified_observations": qualified,
+        "excluded_observations": total - qualified,
+        "qualification_fraction": qualified / total if total else None,
+        "remaining_low_capture_count": remaining,
+    }
+
+
 def _decorate_capture_rows(
         record: Dict[str, Any], capture: Mapping[str, Mapping[str, Any]],
         threshold: float) -> None:
@@ -2148,6 +2477,191 @@ def _canonical_group_causal_trace_forward(ctx: AnalysisContext, max_width: int):
         )
 
     return forward
+
+
+def _rerouting_sparse_capture_forward(
+        ctx: AnalysisContext, topk_qk: int, topk_v: int, topk_rst: int):
+    """Build target-only sparse capture over states from the canonical forward."""
+    model_module = analysis_model_module(ctx.model_cfg)
+    execution_kwargs = model_module._angular_execution_kwargs_from_model_cfg(
+        ctx.model_cfg)
+    admission_den_power = float(execution_kwargs.get(
+        "admission_den_power", ctx.model_cfg.get("admission_den_power", 1.0)))
+
+    def route_execution(temperature_key: str) -> Dict[str, Any]:
+        out = dict(execution_kwargs)
+        value = ctx.model_cfg.get(temperature_key)
+        if value is not None:
+            out["soft_gate_temperature"] = float(value)
+        return out
+
+    execution = {
+        "q": route_execution("soft_gate_T_qk"),
+        "k": route_execution("soft_gate_T_qk"),
+        "v": route_execution("soft_gate_T_v"),
+        "rst": route_execution("soft_gate_T_rst"),
+    }
+    route_topk = {
+        "q": int(topk_qk), "k": int(topk_qk),
+        "v": int(topk_v), "rst": int(topk_rst),
+    }
+
+    @jax.jit
+    def capture(params, causal_trace):
+        pool = model_module._pool_params_with_operator_keys(
+            params["neuron_pool"])
+        qk_scale, v_scale, rst_scale = model_module._effective_pool_output_scales(
+            pool, int(ctx.model_cfg["d_model"]),
+            int(ctx.model_cfg["n_layers"]))
+        route_settings = {
+            "q": (
+                causal_trace["attention_router_input"],
+                causal_trace["query_q"], causal_trace["raw_tau_q"],
+                pool["attn_qk_op_key"], pool["attn_qk_read"],
+                pool["attn_qk_write"], qk_scale),
+            "k": (
+                causal_trace["attention_router_input"],
+                causal_trace["query_k"], causal_trace["raw_tau_k"],
+                pool["attn_qk_op_key"], pool["attn_qk_read"],
+                pool["attn_qk_write"], qk_scale),
+            "v": (
+                causal_trace["attention_router_input"],
+                causal_trace["query_v"], causal_trace["raw_tau_v"],
+                pool["attn_v_op_key"], pool["attn_v_read"],
+                pool["attn_v_write"], v_scale),
+            "rst": (
+                causal_trace["rst_router_input"],
+                causal_trace["query_rst"], causal_trace["raw_tau_rst"],
+                pool["rst_op_key"], pool["rst_read"], pool["rst_write"],
+                rst_scale),
+        }
+        result: Dict[str, Any] = {}
+        for route in TRACE_POOLS:
+            states, queries, raw_tau, keys, read, write, scale = route_settings[route]
+
+            def capture_layer(layer_values):
+                state, query, tau = layer_values
+                batch = state.shape[0]
+                _, stats = _srw_with_topk(
+                    state[:, None, :], query[:, None, :], keys,
+                    tau[:, None, :], read, write,
+                    model_module=model_module,
+                    topk=route_topk[route],
+                    execution_kwargs=execution[route],
+                    admission_den_power=admission_den_power,
+                    target_positions=jnp.zeros((batch,), dtype=jnp.int32),
+                    candidate_seed=0,
+                )
+                return {
+                    "top_operator_ids": stats["top_idx"],
+                    "top_execution_weights": stats["top_val"],
+                    "top_local_contributions": (
+                        stats["top_coefficient"] * scale),
+                    "top_admission_weights": stats["top_admission"],
+                    "captured_mass": stats["captured_mass"],
+                    "execution_mass": stats["mass"],
+                }
+
+            result[route] = jax.lax.map(
+                capture_layer, (states, queries, raw_tau))
+        return result
+
+    return capture
+
+
+def _adaptive_rerouting_capture(
+        ctx: AnalysisContext, causal_trace: Mapping[str, Any],
+        target_layer: int, capture_fns: Dict[Tuple[int, int, int], Any], *,
+        suppression_route: Optional[str] = None,
+        suppression_operator_id: Optional[int] = None,
+        ) -> Dict[str, Any]:
+    initial_topk = (
+        int(getattr(ctx.args, "transition_topk_qk", 512) or 512),
+        int(getattr(ctx.args, "transition_topk_v", 2048) or 2048),
+        int(getattr(ctx.args, "transition_topk_rst", 4096) or 4096),
+    )
+    threshold = float(getattr(
+        ctx.args, "transition_capture_threshold", PAIR_CAPTURE_THRESHOLD)
+        or PAIR_CAPTURE_THRESHOLD)
+    adaptive = bool(getattr(ctx.args, "transition_adaptive_capture", True))
+    final_topk = {
+        "qk": max(initial_topk[0], max(ADAPTIVE_CAPTURE_TIERS["qk"])),
+        "v": max(initial_topk[1], int(getattr(
+            ctx.args, "transition_adaptive_final_topk_v", 8192) or 8192)),
+        "rst": max(initial_topk[2], int(getattr(
+            ctx.args, "transition_adaptive_final_topk_rst", 8192) or 8192)),
+    }
+
+    def run(tops: Tuple[int, int, int]) -> Dict[str, Any]:
+        if tops not in capture_fns:
+            capture_fns[tops] = _rerouting_sparse_capture_forward(
+                ctx, *tops)
+        return jax.device_get(capture_fns[tops](ctx.params, causal_trace))
+
+    current_tops = list(initial_topk)
+    capture = run(initial_topk)
+    metadata: Dict[str, Dict[str, Any]] = {}
+    for route in TRACE_POOLS:
+        before = np.asarray(
+            capture[route]["captured_mass"], dtype=np.float64)[:, 0]
+        metadata[route] = {
+            "before": before.copy(), "after": before.copy(),
+            "topk": int(np.asarray(
+                capture[route]["top_operator_ids"]).shape[-1]),
+            "retry_count": 0,
+        }
+    if adaptive:
+        families = (("qk", ("q", "k"), 0), ("v", ("v",), 1),
+                    ("rst", ("rst",), 2))
+        for family, routes, index in families:
+            if all(np.all(metadata[route]["after"][int(target_layer):] >= threshold)
+                   for route in routes):
+                continue
+            if final_topk[family] <= current_tops[index]:
+                continue
+            current_tops[index] = int(final_topk[family])
+            retry = run(tuple(current_tops))
+            for route in routes:
+                old = np.asarray(metadata[route]["after"], dtype=np.float64)
+                new = np.asarray(
+                    retry[route]["captured_mass"], dtype=np.float64)[:, 0]
+                if np.any(new + 1.0e-7 < old):
+                    raise RuntimeError(
+                        "adaptive rerouting capture decreased captured mass")
+                capture[route] = retry[route]
+                metadata[route]["after"] = new
+                metadata[route]["topk"] = int(np.asarray(
+                    retry[route]["top_operator_ids"]).shape[-1])
+                metadata[route]["retry_count"] += 1
+    suppression_metadata: Dict[str, Any] = {"enabled": False}
+    if suppression_route is not None and suppression_operator_id is not None:
+        route = str(suppression_route)
+        if route not in TRACE_POOLS:
+            raise ValueError(f"unknown suppression route {route}")
+        operator_id = int(suppression_operator_id)
+        ids = np.asarray(capture[route]["top_operator_ids"])
+        local = np.asarray(
+            capture[route]["top_local_contributions"]).copy()
+        layer = int(target_layer)
+        selected = ids[layer] == operator_id
+        local[layer] = np.where(selected, 0.0, local[layer])
+        capture[route]["top_local_contributions"] = local
+        suppression_metadata = {
+            "enabled": True,
+            "route": route,
+            "layer": layer,
+            "operator_id": operator_id,
+            "captured_selected_occurrences_zeroed": int(np.sum(selected)),
+            "execution_weights_preserved": True,
+            "admission_weights_preserved": True,
+        }
+    return {
+        "trace": capture,
+        "capture": metadata,
+        "capture_threshold": threshold,
+        "target_layer": int(target_layer),
+        "suppression": suppression_metadata,
+    }
 
 
 def _canonical_causal_debug_forward(ctx: AnalysisContext):
@@ -2474,19 +2988,37 @@ def _causal_effect_summary(
     valid = [
         row for row in rows
         if row.get("status") == "ready"
-        and row.get("target_logprob_delta") is not None]
-    abs_delta = [abs(float(row["target_logprob_delta"])) for row in valid]
+        and row.get("abs_sequence_behavior_delta") is not None]
+    abs_delta = [float(row["abs_sequence_behavior_delta"]) for row in valid]
+    target_delta = [
+        float(row["abs_target_next_token_logprob_delta"])
+        for row in valid
+        if _json_float(row.get("abs_target_next_token_logprob_delta")) is not None]
     effect = _bootstrap_mean_ci(abs_delta, seed)
     return {
         "n": len(valid),
-        "mean_abs_target_logprob_delta": effect["mean"],
-        "bootstrap_ci95": effect["ci95"],
-        "mean_kl": (
-            float(np.mean([float(row["full_output_kl"]) for row in valid]))
-            if valid else None),
+        "mean_abs_sequence_behavior_delta": effect["mean"],
+        "abs_sequence_behavior_delta_bootstrap_ci95": effect["ci95"],
+        "mean_abs_target_next_token_logprob_delta": (
+            float(np.mean(target_delta)) if target_delta else None),
+        "mean_target_distribution_kl": (
+            float(np.mean([
+                float(row["target_distribution_kl"]) for row in valid
+                if _json_float(row.get("target_distribution_kl")) is not None]))
+            if any(_json_float(row.get("target_distribution_kl")) is not None
+                   for row in valid) else None),
+        "mean_sequence_distribution_kl": (
+            float(np.mean([
+                float(row["full_output_kl"]) for row in valid
+                if _json_float(row.get("full_output_kl")) is not None]))
+            if any(_json_float(row.get("full_output_kl")) is not None
+                   for row in valid) else None),
         "top_prediction_changed_fraction": (
-            float(np.mean([bool(row["top_prediction_changed"]) for row in valid]))
-            if valid else None),
+            float(np.mean([
+                bool(row["top_prediction_changed"]) for row in valid
+                if row.get("top_prediction_changed") is not None]))
+            if any(row.get("top_prediction_changed") is not None
+                   for row in valid) else None),
     }
 
 
@@ -2528,7 +3060,6 @@ def run_causal_intervention(
         length = int(prompt["length"])
         baseline_ce = _sequence_ce(
             baseline_logits, prompt["token_ids"], length)
-        baseline_logp = _log_softmax_np(baseline_logits[0, :length])
         for pool in TRACE_POOLS:
             for candidate in _intervention_candidates(record, pool):
                 common = {
@@ -2556,20 +3087,20 @@ def run_causal_intervention(
                     selected_operator_ids, jnp.bool_(True)))
                 logits = np.asarray(logits)
                 residual = np.asarray(residual)
-                after_ce = _sequence_ce(logits, prompt["token_ids"], length)
-                after_logp = _log_softmax_np(logits[0, :length])
-                base_prob = np.exp(baseline_logp)
-                full_output_kl = float(np.mean(np.sum(
-                    base_prob * (baseline_logp - after_logp), axis=-1)))
+                output_metrics = compute_causal_output_metrics(
+                    baseline_logits, logits, prompt["token_ids"], length,
+                    target_position)
                 target_base = baseline_residual[0, target_position]
                 target_after = residual[0, target_position]
-                behavior_before = None if baseline_ce is None else -float(baseline_ce)
-                behavior_after = None if after_ce is None else -float(after_ce)
                 inactive_exact_noop = None
                 if float(candidate["candidate_execution"]) == 0.0:
                     inactive_exact_noop = bool(
                         np.array_equal(baseline_logits, logits)
-                        and np.array_equal(baseline_residual, residual))
+                        and np.array_equal(baseline_residual, residual)
+                        and all(np.array_equal(
+                            np.asarray(baseline_trace[key]),
+                            np.asarray(intervention_trace[key]))
+                            for key in baseline_trace))
                     if not inactive_exact_noop:
                         raise RuntimeError(
                             "inactive operator suppression changed production output")
@@ -2589,19 +3120,14 @@ def run_causal_intervention(
                     **common,
                     "status": "ready",
                     "removed_operator_count": 1,
-                    "behavior_score_before": behavior_before,
-                    "behavior_score_after": behavior_after,
-                    "behavior_score_drop": (
-                        None if behavior_before is None or behavior_after is None
-                        else behavior_before - behavior_after),
-                    "target_logprob_delta": (
-                        None if behavior_before is None or behavior_after is None
-                        else behavior_after - behavior_before),
-                    "full_output_kl": full_output_kl,
-                    "next_token_kl": float(np.sum(
-                        base_prob[-1] * (baseline_logp[-1] - after_logp[-1]))),
-                    "top_prediction_changed": bool(
-                        np.argmax(baseline_logp[-1]) != np.argmax(after_logp[-1])),
+                    "behavior_score_before": output_metrics[
+                        "baseline_sequence_behavior"],
+                    "behavior_score_after": output_metrics[
+                        "intervention_sequence_behavior"],
+                    "behavior_score_drop": output_metrics[
+                        "sequence_behavior_drop"],
+                    **output_metrics,
+                    "next_token_kl": output_metrics["target_distribution_kl"],
                     "final_residual_cosine": _cosine(target_base, target_after),
                     "final_residual_relative_error": float(
                         np.linalg.norm(target_after - target_base)
@@ -2625,13 +3151,13 @@ def run_causal_intervention(
             for index, value in enumerate(sorted({str(row[key]) for row in valid_rows}))
         }
     selected = [
-        float(row["behavior_score_drop"]) for row in valid_rows
+        float(row["sequence_behavior_drop"]) for row in valid_rows
         if row["strategy"] in ("top_contribution", "top_gate")
-        and row.get("behavior_score_drop") is not None]
+        and row.get("sequence_behavior_drop") is not None]
     controls = [
-        float(row["behavior_score_drop"]) for row in valid_rows
+        float(row["sequence_behavior_drop"]) for row in valid_rows
         if row["strategy"] in ("inactive_random", "active_random", "matched_active")
-        and row.get("behavior_score_drop") is not None]
+        and row.get("sequence_behavior_drop") is not None]
     summary = {
         "status": "ready" if valid_rows else "partial",
         "intervention_type": "production_core_execution_suppression",
@@ -2658,7 +3184,18 @@ def run_causal_intervention(
             float(np.mean(selected) - np.mean(controls))
             if selected and controls else None),
         "sec": time.time() - started,
-        "artifact": ctx.store.path("interventions.jsonl"),
+        "metric_semantics": {
+            "primary": "abs_sequence_behavior_delta",
+            "sequence_behavior_delta": (
+                "intervention mean gold-token logprob minus baseline"),
+            "target_next_token": (
+                "gold token at target_position + 1 predicted by target_position"),
+            "legacy_target_logprob_metric": "sequence_behavior_delta",
+        },
+        "artifacts": {
+            "rows": ctx.store.path("interventions.jsonl"),
+            "summary": ctx.store.path("causal_intervention_summary.json"),
+        },
         "limitations": [
             "transition prompt item reports sequence-score effects; dataset items report task margins",
         ],
@@ -2670,50 +3207,747 @@ def run_causal_intervention(
     return summary
 
 
+def _sparse_signed_cosine(
+        ids_left: Any, values_left: Any,
+        ids_right: Any, values_right: Any) -> Optional[float]:
+    left: Dict[int, float] = defaultdict(float)
+    right: Dict[int, float] = defaultdict(float)
+    for operator_id, value in zip(
+            np.asarray(ids_left).reshape(-1),
+            np.asarray(values_left).reshape(-1)):
+        if int(operator_id) >= 0:
+            left[int(operator_id)] += float(value)
+    for operator_id, value in zip(
+            np.asarray(ids_right).reshape(-1),
+            np.asarray(values_right).reshape(-1)):
+        if int(operator_id) >= 0:
+            right[int(operator_id)] += float(value)
+    keys = sorted(set(left) | set(right))
+    if not keys:
+        return None
+    return _cosine(
+        [left.get(key, 0.0) for key in keys],
+        [right.get(key, 0.0) for key in keys])
+
+
+def _tree_machine_exact(left: Any, right: Any) -> bool:
+    left_leaves = jax.tree.leaves(left)
+    right_leaves = jax.tree.leaves(right)
+    return len(left_leaves) == len(right_leaves) and all(
+        np.array_equal(np.asarray(a), np.asarray(b))
+        for a, b in zip(left_leaves, right_leaves))
+
+
+def _rerouting_layer_rows(
+        baseline_trace: Mapping[str, Any],
+        intervention_trace: Mapping[str, Any],
+        baseline_capture: Mapping[str, Any],
+        intervention_capture: Mapping[str, Any], *, route: str,
+        target_layer: int) -> List[Dict[str, Any]]:
+    base_route = baseline_capture["trace"][route]
+    after_route = intervention_capture["trace"][route]
+    threshold = max(
+        float(baseline_capture["capture_threshold"]),
+        float(intervention_capture["capture_threshold"]))
+    query_key = f"query_{route}"
+    transition_key = f"route_transition_{route}"
+    route_input_key = (
+        "rst_router_input" if route == "rst" else "attention_router_input")
+    n_layers = int(np.asarray(
+        baseline_trace["post_layer_residual"]).shape[0])
+    rows: List[Dict[str, Any]] = []
+    for layer in range(int(target_layer), n_layers):
+        base_ids = np.asarray(base_route["top_operator_ids"])[layer, 0]
+        after_ids = np.asarray(after_route["top_operator_ids"])[layer, 0]
+        base_weights = np.asarray(
+            base_route["top_execution_weights"])[layer, 0]
+        after_weights = np.asarray(
+            after_route["top_execution_weights"])[layer, 0]
+        sparse = _sparse_similarity(
+            base_ids, base_weights, after_ids, after_weights)
+        base_active_ids = {
+            int(operator_id) for operator_id, weight
+            in zip(base_ids, base_weights) if float(weight) > 0.0}
+        after_active_ids = {
+            int(operator_id) for operator_id, weight
+            in zip(after_ids, after_weights) if float(weight) > 0.0}
+        active_union = base_active_ids | after_active_ids
+        base_capture = float(np.asarray(
+            baseline_capture["capture"][route]["after"])[layer])
+        after_capture = float(np.asarray(
+            intervention_capture["capture"][route]["after"])[layer])
+        capture_valid = (
+            base_capture >= threshold and after_capture >= threshold)
+        base_residual = np.asarray(
+            baseline_trace["post_layer_residual"])[layer, 0]
+        after_residual = np.asarray(
+            intervention_trace["post_layer_residual"])[layer, 0]
+        base_route_input = np.asarray(
+            baseline_trace[route_input_key])[layer, 0]
+        after_route_input = np.asarray(
+            intervention_trace[route_input_key])[layer, 0]
+        base_query = np.asarray(baseline_trace[query_key])[layer, 0]
+        after_query = np.asarray(intervention_trace[query_key])[layer, 0]
+        base_transition = np.asarray(
+            baseline_trace[transition_key])[layer, 0]
+        after_transition = np.asarray(
+            intervention_trace[transition_key])[layer, 0]
+        base_attention_update = np.asarray(
+            baseline_trace["attention_update"])[layer, 0]
+        after_attention_update = np.asarray(
+            intervention_trace["attention_update"])[layer, 0]
+        base_local = np.asarray(
+            base_route["top_local_contributions"])[layer, 0]
+        after_local = np.asarray(
+            after_route["top_local_contributions"])[layer, 0]
+        base_admission = np.asarray(
+            base_route["top_admission_weights"])[layer, 0]
+        after_admission = np.asarray(
+            after_route["top_admission_weights"])[layer, 0]
+        local_cosine = _sparse_signed_cosine(
+            base_ids, base_local, after_ids, after_local)
+        rows.append({
+            "route": route,
+            "layer": layer,
+            "status": "ready" if capture_valid else "partial",
+            "invalid_reason": None if capture_valid else "low_captured_mass",
+            "residual_cosine": _cosine(base_residual, after_residual),
+            "residual_relative_delta": float(np.linalg.norm(
+                after_residual - base_residual) / max(
+                    float(np.linalg.norm(base_residual)), 1.0e-12)),
+            "residual_metric_source": "post_layer_residual",
+            "route_input_residual_cosine": _cosine(
+                base_route_input, after_route_input),
+            "route_input_residual_relative_delta": float(np.linalg.norm(
+                after_route_input - base_route_input) / max(
+                    float(np.linalg.norm(base_route_input)), 1.0e-12)),
+            "query_cosine": _cosine(base_query, after_query),
+            "query_relative_delta": float(np.linalg.norm(
+                after_query - base_query) / max(
+                    float(np.linalg.norm(base_query)), 1.0e-12)),
+            "operator_topk_overlap": (
+                float(len(base_active_ids & after_active_ids)
+                      / len(active_union))
+                if capture_valid and active_union else None),
+            "operator_topk_overlap_definition": (
+                "jaccard_of_positive_execution_ids_within_captured_topk"),
+            "weighted_jaccard": (
+                sparse["weighted_jaccard"] if capture_valid else None),
+            "execution_weight_cosine": (
+                sparse["gate_cosine"] if capture_valid else None),
+            "local_contribution_cosine": (
+                local_cosine if capture_valid else None),
+            "transition_delta_cosine": _cosine(
+                base_transition, after_transition),
+            "transition_delta_relative_norm_difference": float(
+                np.linalg.norm(after_transition - base_transition) / max(
+                    float(np.linalg.norm(base_transition)), 1.0e-12)),
+            "post_attention_update_cosine": (
+                _cosine(base_attention_update, after_attention_update)
+                if route in ("q", "k", "v") else None),
+            "post_attention_update_relative_norm_difference": (
+                float(np.linalg.norm(
+                    after_attention_update - base_attention_update) / max(
+                        float(np.linalg.norm(base_attention_update)), 1.0e-12))
+                if route in ("q", "k", "v") else None),
+            "captured_mass_baseline": base_capture,
+            "captured_mass_intervention": after_capture,
+            "captured_mass_qualified": capture_valid,
+            "capture_topk_baseline": int(
+                baseline_capture["capture"][route]["topk"]),
+            "capture_topk_intervention": int(
+                intervention_capture["capture"][route]["topk"]),
+            "actual_route_transition_kind": (
+                "srw_feature_separate_from_post_attention_residual_update"
+                if route in ("q", "k", "v")
+                else "rst_post_denominator_residual_update"),
+            "baseline_route_input_residual": np.asarray(
+                base_route_input, dtype=np.float32).tolist(),
+            "intervention_route_input_residual": np.asarray(
+                after_route_input, dtype=np.float32).tolist(),
+            "baseline_post_layer_residual": np.asarray(
+                base_residual, dtype=np.float32).tolist(),
+            "intervention_post_layer_residual": np.asarray(
+                after_residual, dtype=np.float32).tolist(),
+            "baseline_route_query": np.asarray(
+                base_query, dtype=np.float32).tolist(),
+            "intervention_route_query": np.asarray(
+                after_query, dtype=np.float32).tolist(),
+            "baseline_top_operator_ids": np.asarray(
+                base_ids, dtype=np.int32).tolist(),
+            "intervention_top_operator_ids": np.asarray(
+                after_ids, dtype=np.int32).tolist(),
+            "baseline_top_execution_weights": np.asarray(
+                base_weights, dtype=np.float32).tolist(),
+            "intervention_top_execution_weights": np.asarray(
+                after_weights, dtype=np.float32).tolist(),
+            "baseline_top_admission_weights": np.asarray(
+                base_admission, dtype=np.float32).tolist(),
+            "intervention_top_admission_weights": np.asarray(
+                after_admission, dtype=np.float32).tolist(),
+            "baseline_top_local_contributions": np.asarray(
+                base_local, dtype=np.float32).tolist(),
+            "intervention_top_local_contributions": np.asarray(
+                after_local, dtype=np.float32).tolist(),
+            "baseline_route_transition_delta": np.asarray(
+                base_transition, dtype=np.float32).tolist(),
+            "intervention_route_transition_delta": np.asarray(
+                after_transition, dtype=np.float32).tolist(),
+            "baseline_post_attention_update": (
+                np.asarray(base_attention_update, dtype=np.float32).tolist()
+                if route in ("q", "k", "v") else None),
+            "intervention_post_attention_update": (
+                np.asarray(after_attention_update, dtype=np.float32).tolist()
+                if route in ("q", "k", "v") else None),
+        })
+    return rows
+
+
+def _aggregate_rerouting_layer_rows(
+        per_route_rows: Mapping[str, Sequence[Mapping[str, Any]]],
+        target_layer: int) -> List[Dict[str, Any]]:
+    """Aggregate continuous route metrics while preserving route-level rows."""
+    by_route_layer = {
+        route: {int(row["layer"]): row for row in rows}
+        for route, rows in per_route_rows.items()
+    }
+    all_layers = sorted({
+        layer for rows in by_route_layer.values() for layer in rows
+        if layer >= int(target_layer)})
+    mean_keys = (
+        "residual_cosine", "residual_relative_delta", "query_cosine",
+        "route_input_residual_cosine",
+        "route_input_residual_relative_delta",
+        "query_relative_delta", "operator_topk_overlap",
+        "weighted_jaccard", "execution_weight_cosine",
+        "local_contribution_cosine", "transition_delta_cosine",
+        "transition_delta_relative_norm_difference",
+        "post_attention_update_cosine",
+        "post_attention_update_relative_norm_difference",
+        "captured_mass_baseline", "captured_mass_intervention",
+    )
+    aggregate: List[Dict[str, Any]] = []
+    for layer in all_layers:
+        route_rows = {
+            route: rows[layer] for route, rows in by_route_layer.items()
+            if layer in rows}
+        values: Dict[str, Any] = {}
+        for key in mean_keys:
+            numeric = [
+                float(row[key]) for row in route_rows.values()
+                if _json_float(row.get(key)) is not None]
+            values[key] = float(np.mean(numeric)) if numeric else None
+        qualified_routes = [
+            route for route, row in route_rows.items()
+            if bool(row.get("captured_mass_qualified"))]
+        if len(qualified_routes) != len(TRACE_POOLS):
+            for key in (
+                    "operator_topk_overlap", "weighted_jaccard",
+                    "execution_weight_cosine", "local_contribution_cosine"):
+                values[key] = None
+        aggregate.append({
+            "layer": layer,
+            "status": (
+                "ready" if len(qualified_routes) == len(TRACE_POOLS)
+                else "partial"),
+            "qualified_route_count": len(qualified_routes),
+            "excluded_route_count": len(TRACE_POOLS) - len(qualified_routes),
+            "qualified_routes": qualified_routes,
+            **values,
+        })
+    return aggregate
+
+
+def _normalized_divergence_auc(
+        rows: Sequence[Mapping[str, Any]], similarity_key: str) -> Optional[float]:
+    points = [
+        (int(row["layer"]), 1.0 - float(row[similarity_key]))
+        for row in rows if _json_float(row.get(similarity_key)) is not None]
+    if not points:
+        return None
+    if len(points) == 1:
+        return float(points[0][1])
+    x = np.asarray([point[0] for point in points], dtype=np.float64)
+    y = np.asarray([point[1] for point in points], dtype=np.float64)
+    width = max(float(x[-1] - x[0]), 1.0)
+    return float(np.trapezoid(y, x) / width)
+
+
+def _rerouting_trajectory_metrics(
+        layer_rows: Sequence[Mapping[str, Any]], target_layer: int
+        ) -> Dict[str, Any]:
+    by_layer = {int(row["layer"]): row for row in layer_rows}
+    final_layer = max(by_layer) if by_layer else int(target_layer)
+    next_layer = min(int(target_layer) + 1, final_layer)
+    qualified = [
+        row for row in layer_rows
+        if _json_float(row.get("weighted_jaccard")) is not None]
+    minimum = (
+        min(qualified, key=lambda row: (
+            float(row["weighted_jaccard"]), int(row["layer"])))
+        if qualified else None)
+    return {
+        "target_layer_immediate_routing_similarity": (
+            by_layer.get(int(target_layer), {}).get("weighted_jaccard")),
+        "next_layer_routing_similarity": (
+            by_layer.get(next_layer, {}).get("weighted_jaccard")),
+        "final_layer_routing_similarity": (
+            by_layer.get(final_layer, {}).get("weighted_jaccard")),
+        "minimum_routing_similarity": (
+            minimum.get("weighted_jaccard") if minimum else None),
+        "minimum_routing_similarity_layer": (
+            int(minimum["layer"]) if minimum else None),
+        "cumulative_routing_divergence_auc": _normalized_divergence_auc(
+            layer_rows, "weighted_jaccard"),
+        "cumulative_query_divergence_auc": _normalized_divergence_auc(
+            layer_rows, "query_cosine"),
+        "cumulative_transition_divergence_auc": _normalized_divergence_auc(
+            layer_rows, "transition_delta_cosine"),
+        "operator_path_divergence_auc": _normalized_divergence_auc(
+            layer_rows, "local_contribution_cosine"),
+        "qualified_layer_count": len(qualified),
+        "excluded_low_capture_layer_count": len(layer_rows) - len(qualified),
+    }
+
+
+def _paired_strategy_inference(
+        rows: Sequence[Mapping[str, Any]], left: str, right: str,
+        metric: str, seed: int) -> Dict[str, Any]:
+    grouped: Dict[Tuple[str, str], Dict[str, List[float]]] = defaultdict(
+        lambda: defaultdict(list))
+    for row in rows:
+        value = _json_float(row.get(metric))
+        if value is None:
+            continue
+        grouped[(str(row.get("prompt_id")), str(row.get("pool")))][
+            str(row.get("strategy"))].append(float(value))
+    differences = [
+        float(np.mean(values[left]) - np.mean(values[right]))
+        for values in grouped.values()
+        if left in values and right in values]
+    bootstrap = _bootstrap_mean_ci(differences, seed)
+    if differences:
+        array = np.asarray(differences, dtype=np.float64)
+        observed = abs(float(np.mean(array)))
+        rng = np.random.default_rng(int(seed) + 1)
+        null = [abs(float(np.mean(
+            array * rng.choice((-1.0, 1.0), size=array.size))))
+            for _ in range(5000)]
+        p_value = float(
+            (1 + np.sum(np.asarray(null) >= observed)) / (len(null) + 1))
+    else:
+        p_value = None
+    return {
+        "left": left, "right": right, "metric": metric,
+        "paired_n": len(differences),
+        "paired_mean_difference": bootstrap["mean"],
+        "paired_median_difference": (
+            float(np.median(differences)) if differences else None),
+        "bootstrap_ci95": bootstrap["ci95"],
+        "paired_sign_win_rate": (
+            float(np.mean(np.asarray(differences) > 0.0))
+            if differences else None),
+        "sign_flip_two_sided_p": p_value,
+    }
+
+
+def run_causal_rerouting_trace(
+        ctx: AnalysisContext, records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Directly measure downstream route changes after canonical suppression."""
+    max_prompts = int(getattr(ctx.args, "rerouting_max_prompts", None)
+                      or getattr(ctx.args, "causal_max_prompts", 6) or 6)
+    primary = _select_causal_records(records, max(1, max_prompts))
+    pool_codes = {"q": 0, "k": 1, "v": 2, "rst": 3}
+    canonical_forward = _canonical_causal_trace_forward(ctx)
+    capture_fns: Dict[Tuple[int, int, int], Any] = {}
+    result_rows: List[Dict[str, Any]] = []
+    capture_records: List[Dict[str, Any]] = []
+    baseline_capture_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    started = time.time()
+    for prompt_index, record in enumerate(primary):
+        prompt = record["prompt"]
+        prompt_id = str(prompt["prompt_id"])
+        replicas = max(1, int(ctx.mesh.shape["data"]))
+        input_ids = jax.device_put(jnp.asarray(np.repeat(
+            np.asarray(prompt["input_array"], dtype=np.int32)[None, :],
+            replicas, axis=0)), ctx.data_sharding)
+        target_position = int(record["target_token_index"])
+        positions = jnp.full((replicas,), target_position, dtype=jnp.int32)
+        baseline = jax.device_get(canonical_forward(
+            ctx.params, input_ids, positions, jnp.int32(0), jnp.int32(0),
+            jnp.zeros((replicas,), dtype=jnp.int32), jnp.bool_(False)))
+        for route in TRACE_POOLS:
+            for candidate in _intervention_candidates(record, route):
+                common = {
+                    "prompt_id": prompt_id,
+                    "phenomenon": prompt["phenomenon"],
+                    "pool": route,
+                    **candidate,
+                    "target_position": target_position,
+                    "intervention_type": "production_core_execution_suppression",
+                    "canonical_forward_shared": True,
+                    "canonical_forward_difference_only": [
+                        "analysis_intervention_enabled", "selected_operator_id",
+                        "target_layer", "target_route", "target_position"],
+                }
+                if not candidate["candidate_valid"]:
+                    result_rows.append({**common, "status": "partial"})
+                    continue
+                layer = int(candidate["layer"])
+                capture_key = (prompt_id, layer)
+                if capture_key not in baseline_capture_cache:
+                    baseline_capture_cache[capture_key] = (
+                        _adaptive_rerouting_capture(
+                            ctx, baseline[3], layer, capture_fns))
+                baseline_capture = baseline_capture_cache[capture_key]
+                operator_id = _validate_global_operator_id(
+                    ctx, route, int(candidate["operator_id"]))
+                intervention = jax.device_get(canonical_forward(
+                    ctx.params, input_ids, positions, jnp.int32(layer),
+                    jnp.int32(pool_codes[route]),
+                    jnp.full((replicas,), operator_id, dtype=jnp.int32),
+                    jnp.bool_(True)))
+                intervention_capture = _adaptive_rerouting_capture(
+                    ctx, intervention[3], layer, capture_fns,
+                    suppression_route=route,
+                    suppression_operator_id=operator_id)
+                inactive_exact = None
+                if str(candidate["strategy"]) == "inactive_random":
+                    inactive_exact = bool(
+                        _tree_machine_exact(baseline, intervention)
+                        and _tree_machine_exact(
+                            baseline_capture["trace"],
+                            intervention_capture["trace"]))
+                    if not inactive_exact:
+                        raise RuntimeError(
+                            "inactive rerouting intervention is not an exact no-op")
+                per_route_rows = {
+                    observed_route: _rerouting_layer_rows(
+                        baseline[3], intervention[3], baseline_capture,
+                        intervention_capture, route=observed_route,
+                        target_layer=layer)
+                    for observed_route in TRACE_POOLS
+                }
+                per_route_trajectory = {
+                    observed_route: _rerouting_trajectory_metrics(
+                        rows, layer)
+                    for observed_route, rows in per_route_rows.items()
+                }
+                layer_rows = _aggregate_rerouting_layer_rows(
+                    per_route_rows, layer)
+                trajectory = _rerouting_trajectory_metrics(layer_rows, layer)
+                route_observation_count = sum(
+                    len(rows) for rows in per_route_rows.values())
+                qualified_route_observation_count = sum(
+                    row.get("status") == "ready"
+                    for rows in per_route_rows.values() for row in rows)
+                trajectory.update({
+                    "qualified_route_layer_observation_count": int(
+                        qualified_route_observation_count),
+                    "excluded_low_capture_route_layer_observation_count": int(
+                        route_observation_count
+                        - qualified_route_observation_count),
+                    "target_route_trajectory": per_route_trajectory[route],
+                    "per_route_trajectory": per_route_trajectory,
+                })
+                output_metrics = compute_causal_output_metrics(
+                    baseline[0], intervention[0], prompt["token_ids"],
+                    int(prompt["length"]), target_position)
+                recovery = compute_causal_recovery_metrics(
+                    baseline[3], intervention[3], route=route,
+                    target_layer=layer,
+                    baseline_final_residual=np.asarray(baseline[2])[
+                        0, target_position],
+                    intervention_final_residual=np.asarray(intervention[2])[
+                        0, target_position],
+                    baseline_logits=baseline[0], intervention_logits=intervention[0],
+                    target_position=target_position)
+                row_status = (
+                    "partial" if trajectory[
+                        "excluded_low_capture_route_layer_observation_count"]
+                    else "ready")
+                result_rows.append({
+                    **common,
+                    "status": row_status,
+                    "operator_id": operator_id,
+                    "inactive_machine_exact_noop": inactive_exact,
+                    "candidate_local_contribution": candidate.get(
+                        "sidecar_estimated_abs_post_denominator_coefficient"),
+                    **output_metrics,
+                    **recovery,
+                    **trajectory,
+                    "per_layer": layer_rows,
+                    "per_route": {
+                        observed_route: {
+                            "trajectory": per_route_trajectory[observed_route],
+                            "layers": rows,
+                        }
+                        for observed_route, rows in per_route_rows.items()
+                    },
+                    "sparse_capture_suppression": intervention_capture[
+                        "suppression"],
+                })
+                for role, captured in (
+                        ("baseline", baseline_capture),
+                        ("intervention", intervention_capture)):
+                    for observed_route in TRACE_POOLS:
+                        capture_records.append({
+                            "capture_role": role,
+                            "prompt_id": prompt_id,
+                            "intervention_pool": route,
+                            "pool": observed_route,
+                            "target_layer": layer,
+                            "capture": {
+                                observed_route:
+                                    captured["capture"][observed_route]},
+                        })
+        if ctx.is_primary:
+            print(
+                "CAUSAL_REROUTING_TRACE "
+                f"prompt={prompt_index + 1:02d}/{len(primary):02d} "
+                f"id={prompt_id}", flush=True)
+
+    control_quantile = 0.75
+    control_thresholds: Dict[str, Dict[str, Any]] = {}
+    for route in TRACE_POOLS:
+        values = [
+            float(row["final_layer_routing_similarity"])
+            for row in result_rows
+            if row.get("pool") == route
+            and row.get("strategy") == "active_random"
+            and _json_float(row.get("final_layer_routing_similarity")) is not None]
+        control_thresholds[route] = {
+            "active_random_quantile": control_quantile,
+            "active_random_sample_n": len(values),
+            "reconvergence_similarity_threshold": (
+                float(np.quantile(values, control_quantile)) if values else None),
+            "inactive_exact_similarity_anchor": 1.0,
+        }
+    for row in result_rows:
+        threshold = control_thresholds[str(row.get("pool"))].get(
+            "reconvergence_similarity_threshold")
+        minimum_layer = row.get("minimum_routing_similarity_layer")
+        if threshold is None or minimum_layer is None:
+            row["post_intervention_reconvergence"] = None
+            row["reconvergence_layer"] = None
+            continue
+        reconvergence_layers = [
+            int(layer_row["layer"]) for layer_row in row.get("per_layer", [])
+            if int(layer_row["layer"]) > int(minimum_layer)
+            and _json_float(layer_row.get("weighted_jaccard")) is not None
+            and float(layer_row["weighted_jaccard"]) >= float(threshold)]
+        row["post_intervention_reconvergence"] = bool(reconvergence_layers)
+        row["reconvergence_layer"] = (
+            min(reconvergence_layers) if reconvergence_layers else None)
+        row["reconvergence_control"] = control_thresholds[
+            str(row.get("pool"))]
+
+    inference_rows = [
+        row for row in result_rows
+        if row.get("strategy") != "inactive_random"]
+    seed = int(ctx.config.get("seed", 0))
+    correlations = {
+        "immediate_causal_delta_vs_routing_divergence_auc": _spearman_inference(
+            inference_rows, "immediate_delta_norm",
+            "cumulative_routing_divergence_auc", seed + 2001),
+        "routing_divergence_auc_vs_final_relative_residual_delta":
+            _spearman_inference(
+                inference_rows, "cumulative_routing_divergence_auc",
+                "final_relative_delta", seed + 2002),
+        "routing_divergence_auc_vs_sequence_behavior_effect":
+            _spearman_inference(
+                inference_rows, "cumulative_routing_divergence_auc",
+                "abs_sequence_behavior_delta", seed + 2003),
+        "query_divergence_auc_vs_operator_path_divergence_auc":
+            _spearman_inference(
+                inference_rows, "cumulative_query_divergence_auc",
+                "operator_path_divergence_auc", seed + 2004),
+        "local_contribution_vs_routing_divergence_auc": _spearman_inference(
+            inference_rows, "candidate_local_contribution",
+            "cumulative_routing_divergence_auc", seed + 2005),
+    }
+    strategy_pairs = (
+        ("top_gate", "active_random"),
+        ("top_contribution", "active_random"),
+        ("top_gate", "matched_active"),
+        ("top_contribution", "matched_active"),
+    )
+    paired = {
+        f"{left}_vs_{right}": _paired_strategy_inference(
+            result_rows, left, right, "cumulative_routing_divergence_auc",
+            seed + 2100 + index)
+        for index, (left, right) in enumerate(strategy_pairs)
+    }
+    inactive_rows = [
+        row for row in result_rows if row.get("strategy") == "inactive_random"
+        and row.get("candidate_valid")]
+    inactive_exact = bool(inactive_rows) and all(
+        row.get("inactive_machine_exact_noop") is True for row in inactive_rows)
+    important_comparisons = [
+        paired["top_gate_vs_active_random"],
+        paired["top_contribution_vs_active_random"],
+    ]
+    important_greater = all(
+        comparison.get("paired_mean_difference") is not None
+        and float(comparison["paired_mean_difference"]) > 0.0
+        for comparison in important_comparisons)
+    predictive_state = correlations[
+        "routing_divergence_auc_vs_final_relative_residual_delta"]
+    predictive_output = correlations[
+        "routing_divergence_auc_vs_sequence_behavior_effect"]
+    state_ci = predictive_state.get("bootstrap_ci95") or [None, None]
+    output_ci = predictive_output.get("bootstrap_ci95") or [None, None]
+    routing_predicts_final_state = bool(
+        state_ci[0] is not None and float(state_ci[0]) > 0.0)
+    routing_predicts_final_output = bool(
+        output_ci[0] is not None and float(output_ci[0]) > 0.0)
+    routing_predicts_final = bool(
+        routing_predicts_final_state or routing_predicts_final_output)
+    important_rows = [
+        row for row in result_rows
+        if row.get("strategy") in ("top_gate", "top_contribution")
+        and row.get("post_intervention_reconvergence") is not None]
+    reconvergence_fraction = (
+        float(np.mean([
+            bool(row["post_intervention_reconvergence"])
+            for row in important_rows])) if important_rows else None)
+    generally_not_reconverged = bool(
+        reconvergence_fraction is not None and reconvergence_fraction < 0.5)
+    supported = bool(
+        important_greater and routing_predicts_final and inactive_exact
+        and generally_not_reconverged)
+    capture_reliability = _capture_reliability_summary(
+        capture_records,
+        float(getattr(ctx.args, "transition_capture_threshold",
+                      PAIR_CAPTURE_THRESHOLD) or PAIR_CAPTURE_THRESHOLD),
+        start_layer_key="target_layer")
+    limitations: List[str] = []
+    if capture_reliability["remaining_low_capture_count"]:
+        limitations.append(
+            "Low-capture route/layer rows were excluded from sparse routing inference.")
+    if not supported:
+        limitations.append(
+            "The control-relative divergence, predictive, no-op, and "
+            "reconvergence evidence did not all agree.")
+    summary = {
+        "status": (
+            "partial" if capture_reliability["remaining_low_capture_count"]
+            else "ready"),
+        "num_prompts": len(primary),
+        "num_interventions": sum(
+            row.get("candidate_valid", False) for row in result_rows),
+        "canonical_forward_shared": True,
+        "full_gate_tensor_host_transfer": False,
+        "capture_reliability": capture_reliability,
+        "reconvergence_control_provenance": {
+            "method": "poolwise_active_random_empirical_quantile",
+            "thresholds": control_thresholds,
+            "inactive_exact_anchor": True,
+        },
+        "correlations": correlations,
+        "paired_strategy_comparisons": paired,
+        "inactive_random_exact_noop": {
+            "supported": inactive_exact,
+            "n": len(inactive_rows),
+        },
+        "path_dependence_supported": {
+            "supported": supported,
+            "evidence": {
+                "important_interventions_gt_active_random": important_greater,
+                "paired_strategy_comparisons": important_comparisons,
+                "routing_divergence_predicts_final_relative_effect":
+                    routing_predicts_final,
+                "routing_predicts_final_relative_state":
+                    routing_predicts_final_state,
+                "routing_predicts_sequence_behavior_effect":
+                    routing_predicts_final_output,
+                "routing_final_state_inference": predictive_state,
+                "routing_final_output_inference": predictive_output,
+                "inactive_intervention_exact_noop": inactive_exact,
+                "important_reconvergence_fraction": reconvergence_fraction,
+                "paths_do_not_generally_reconverge": generally_not_reconverged,
+            },
+            "limitations": limitations,
+        },
+        "artifacts": {
+            "rows": ctx.store.path("causal_rerouting_traces.jsonl"),
+            "summary": ctx.store.path("causal_rerouting_summary.json"),
+        },
+        "sec": time.time() - started,
+    }
+    if capture_reliability["remaining_low_capture_count"]:
+        summary["capture_warnings_by_pool"] = {
+            pool: int(row["remaining_low_capture_count"])
+            for pool, row in capture_reliability["pools"].items()
+            if int(row["remaining_low_capture_count"]) > 0
+        }
+    if ctx.is_primary:
+        write_jsonl_atomic(
+            ctx.store.path("causal_rerouting_traces.jsonl"), result_rows)
+        write_json_atomic(
+            ctx.store.path("causal_rerouting_summary.json"), summary)
+    summary["_rows"] = result_rows
+    return summary
+
+
 def _classify_recovery_rows(
-        rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        rows: Sequence[Dict[str, Any]], neutral_log_band: float) -> Dict[str, Any]:
     valid = [
         row for row in rows
         if row.get("status") == "ready"
-        and _json_float(row.get("immediate_delta_norm")) is not None
-        and _json_float(row.get("recovery_ratio_final")) is not None
+        and _json_float(row.get("relative_delta_log_ratio")) is not None
     ]
-    immediate = np.asarray([
-        float(row["immediate_delta_norm"]) for row in valid], dtype=np.float64)
-    ratios = np.asarray([
-        float(row["recovery_ratio_final"]) for row in valid], dtype=np.float64)
+    log_magnitude = np.asarray([
+        abs(float(row["relative_delta_log_ratio"])) for row in valid],
+        dtype=np.float64)
     basis = {
-        "immediate_q25": float(np.quantile(immediate, 0.25)) if valid else None,
-        "immediate_median": float(np.quantile(immediate, 0.50)) if valid else None,
-        "recovery_ratio_q25": float(np.quantile(ratios, 0.25)) if valid else None,
-        "recovery_ratio_median": float(np.quantile(ratios, 0.50)) if valid else None,
-        "recovery_ratio_q75": float(np.quantile(ratios, 0.75)) if valid else None,
-        "method": "observed_distribution_quantiles",
+        "semantic_boundary": "relative_delta_ratio == 1",
+        "neutral_log_band": float(neutral_log_band),
+        "neutral_definition": (
+            "abs(relative_delta_log_ratio) <= neutral_log_band"),
+        "exact_noop_convention": (
+            "both immediate and final relative deltas <= 1e-12 map to ratio 1"),
+        "intensity_abs_log_ratio_q25": (
+            float(np.quantile(log_magnitude, 0.25)) if valid else None),
+        "intensity_abs_log_ratio_median": (
+            float(np.quantile(log_magnitude, 0.50)) if valid else None),
+        "intensity_abs_log_ratio_q75": (
+            float(np.quantile(log_magnitude, 0.75)) if valid else None),
+        "quantile_role": "descriptive_intensity_only",
     }
     for row in valid:
-        immediate_value = float(row["immediate_delta_norm"])
-        ratio = float(row["recovery_ratio_final"])
-        if immediate_value <= float(basis["immediate_q25"]):
-            phenomenon = "immediate_small"
-        elif (immediate_value >= float(basis["immediate_median"])
-              and ratio <= float(basis["recovery_ratio_q25"])):
-            phenomenon = "downstream_recovery"
-        elif ratio >= float(basis["recovery_ratio_q75"]):
-            phenomenon = "downstream_amplification"
-        elif bool(row.get("non_monotonic_path")):
-            phenomenon = "non_monotonic"
-        else:
+        log_ratio = float(row["relative_delta_log_ratio"])
+        if abs(log_ratio) <= float(neutral_log_band):
             phenomenon = "approximately_preserved"
+        elif log_ratio < 0.0:
+            phenomenon = "relative_recovery"
+        else:
+            phenomenon = "relative_amplification"
         row["recovery_phenomenon"] = phenomenon
+        q25 = basis["intensity_abs_log_ratio_q25"]
+        q75 = basis["intensity_abs_log_ratio_q75"]
+        magnitude = abs(log_ratio)
+        row["recovery_intensity_bucket"] = (
+            "weak" if q25 is not None and magnitude <= float(q25) else
+            "strong" if q75 is not None and magnitude >= float(q75) else
+            "moderate")
     return basis
 
 
 def _recovery_group_summary(
         rows: Sequence[Mapping[str, Any]], seed: int) -> Dict[str, Any]:
     valid = [row for row in rows if row.get("status") == "ready"]
-    ratios = [
-        float(row["recovery_ratio_final"]) for row in valid
-        if _json_float(row.get("recovery_ratio_final")) is not None]
+    relative_ratios = [
+        float(row["relative_delta_ratio"]) for row in valid
+        if _json_float(row.get("relative_delta_ratio")) is not None]
+    relative_logs = [
+        float(row["relative_delta_log_ratio"]) for row in valid
+        if _json_float(row.get("relative_delta_log_ratio")) is not None]
+    absolute_ratios = [
+        float(row["absolute_delta_ratio"]) for row in valid
+        if _json_float(row.get("absolute_delta_ratio")) is not None]
+    ratio_ci = _bootstrap_mean_ci(relative_ratios, seed)
+    log_ci = _bootstrap_mean_ci(relative_logs, seed + 1)
     return {
         "n": len(valid),
         "immediate_delta_mean": (
@@ -2722,16 +3956,48 @@ def _recovery_group_summary(
         "final_delta_mean": (
             float(np.mean([float(row["final_delta_norm"]) for row in valid]))
             if valid else None),
-        "recovery_ratio_mean": float(np.mean(ratios)) if ratios else None,
-        "recovery_ratio_ci95": _bootstrap_mean_ci(ratios, seed)["ci95"],
-        "recovery_fraction": (
+        "relative_delta_ratio_mean": ratio_ci["mean"],
+        "relative_delta_ratio_median": (
+            float(np.median(relative_ratios)) if relative_ratios else None),
+        "relative_delta_ratio_bootstrap_ci95": ratio_ci["ci95"],
+        "relative_delta_log_ratio_mean": log_ci["mean"],
+        "relative_delta_log_ratio_bootstrap_ci95": log_ci["ci95"],
+        "fraction_relative_ratio_lt_1": (
+            float(np.mean(np.asarray(relative_ratios) < 1.0))
+            if relative_ratios else None),
+        "fraction_relative_ratio_gt_1": (
+            float(np.mean(np.asarray(relative_ratios) > 1.0))
+            if relative_ratios else None),
+        "fraction_final_relative_delta_lt_immediate_relative_delta": (
             float(np.mean([
-                row.get("recovery_phenomenon") == "downstream_recovery"
-                for row in valid])) if valid else None),
-        "amplification_fraction": (
+                float(row["final_relative_delta"])
+                < float(row["immediate_relative_delta"])
+                for row in valid
+                if _json_float(row.get("final_relative_delta")) is not None
+                and _json_float(row.get("immediate_relative_delta")) is not None]))
+            if any(
+                _json_float(row.get("final_relative_delta")) is not None
+                and _json_float(row.get("immediate_relative_delta")) is not None
+                for row in valid) else None),
+        "relative_recovery_fraction": (
             float(np.mean([
-                row.get("recovery_phenomenon") == "downstream_amplification"
+                row.get("recovery_phenomenon") == "relative_recovery"
                 for row in valid])) if valid else None),
+        "relative_amplification_fraction": (
+            float(np.mean([
+                row.get("recovery_phenomenon") == "relative_amplification"
+                for row in valid])) if valid else None),
+        "approximately_preserved_fraction": (
+            float(np.mean([
+                row.get("recovery_phenomenon") == "approximately_preserved"
+                for row in valid])) if valid else None),
+        "absolute_delta_ratio_mean_diagnostic": (
+            float(np.mean(absolute_ratios)) if absolute_ratios else None),
+        "immediate_delta_vs_final_relative_delta_spearman": (
+            spearman_correlation(
+                [float(row["immediate_delta_norm"]) for row in valid],
+                [float(row["final_relative_delta"]) for row in valid])
+            if len(valid) >= 2 else None),
     }
 
 
@@ -2739,7 +4005,14 @@ def run_causal_recovery_trace(
         ctx: AnalysisContext, rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Summarize traces returned by the canonical intervention forwards."""
     recovery_rows = [dict(row) for row in rows]
-    basis = _classify_recovery_rows(recovery_rows)
+    neutral_log_band = float(getattr(
+        ctx.args, "causal_recovery_neutral_log_band",
+        DEFAULT_RECOVERY_NEUTRAL_LOG_BAND)
+        if getattr(ctx.args, "causal_recovery_neutral_log_band", None)
+        is not None else DEFAULT_RECOVERY_NEUTRAL_LOG_BAND)
+    if neutral_log_band < 0.0:
+        raise ValueError("causal recovery neutral log band must be nonnegative")
+    basis = _classify_recovery_rows(recovery_rows, neutral_log_band)
     n_layers = max(1, int(ctx.model_cfg["n_layers"]))
     for row in recovery_rows:
         layer = int(row.get("layer", 0))
@@ -2759,16 +4032,73 @@ def run_causal_recovery_trace(
             for index, value in enumerate(values)
         }
 
+    overall = _recovery_group_summary(recovery_rows, seed)
+    paired_logs: List[float] = []
+    paired_rows: Dict[Tuple[str, str, int], Dict[str, List[float]]] = defaultdict(
+        lambda: defaultdict(list))
+    for row in recovery_rows:
+        value = _json_float(row.get("relative_delta_log_ratio"))
+        if row.get("status") != "ready" or value is None:
+            continue
+        key = (str(row.get("prompt_id")), str(row.get("pool")), int(row.get("layer", 0)))
+        paired_rows[key][str(row.get("strategy"))].append(float(value))
+    for strategies in paired_rows.values():
+        important = [
+            value for name in ("top_gate", "top_contribution")
+            for value in strategies.get(name, [])]
+        controls = [
+            value for name in ("active_random", "matched_active")
+            for value in strategies.get(name, [])]
+        if important and controls:
+            paired_logs.append(float(np.mean(important) - np.mean(controls)))
+    paired_summary = _bootstrap_mean_ci(paired_logs, seed + 901)
+    recovery_fraction = overall.get("relative_recovery_fraction")
+    amplification_fraction = overall.get("relative_amplification_fraction")
+    median_ratio = overall.get("relative_delta_ratio_median")
+    immediate_final_spearman = overall.get(
+        "immediate_delta_vs_final_relative_delta_spearman")
+    spearman_supports_compensation = bool(
+        immediate_final_spearman is not None
+        and float(immediate_final_spearman) <= 0.0)
+    compensation_supported = bool(
+        median_ratio is not None and float(median_ratio) < 1.0
+        and recovery_fraction is not None and amplification_fraction is not None
+        and float(recovery_fraction) > float(amplification_fraction)
+        and paired_summary["mean"] is not None
+        and float(paired_summary["mean"]) < 0.0
+        and spearman_supports_compensation)
     summary = {
         "status": "ready" if any(
             row.get("status") == "ready" for row in recovery_rows) else "partial",
         "classification_basis": basis,
-        "overall": _recovery_group_summary(recovery_rows, seed),
+        "overall": overall,
         "by_pool": grouped("pool", 100),
         "by_strategy": grouped("strategy", 200),
         "by_phenomenon": grouped("phenomenon", 300),
         "by_recovery_phenomenon": grouped("recovery_phenomenon", 350),
         "by_layer_bucket": grouped("layer_bucket", 400),
+        "important_strategies_vs_controls_paired_relative_log_ratio": {
+            "n": paired_summary["n"],
+            "mean_difference": paired_summary["mean"],
+            "bootstrap_ci95": paired_summary["ci95"],
+            "negative_means_more_relative_recovery_for_important_strategies": True,
+        },
+        "downstream_compensation_dominant": {
+            "supported": compensation_supported,
+            "evidence": {
+                "immediate_delta_vs_final_relative_delta_spearman":
+                    immediate_final_spearman,
+                "spearman_consistent_with_compensation":
+                    spearman_supports_compensation,
+                "relative_recovery_fraction": recovery_fraction,
+                "relative_amplification_fraction": amplification_fraction,
+                "median_relative_delta_ratio": median_ratio,
+                "important_vs_controls": paired_summary,
+            },
+            "limitations": [] if compensation_supported else [
+                "The immediate/final Spearman, relative recovery, paired-control, "
+                "and median-ratio evidence did not all agree."],
+        },
         "artifacts": {
             "rows": ctx.store.path("causal_recovery_traces.jsonl"),
             "summary": ctx.store.path("causal_recovery_summary.json"),
@@ -3106,10 +4436,14 @@ def run_operator_functional_graph(
     }
     seed = int(ctx.config.get("seed", 0))
     neighbor_rows: List[Dict[str, Any]] = []
-    family_rows: List[Dict[str, Any]] = []
+    local_group_rows: List[Dict[str, Any]] = []
+    component_rows: List[Dict[str, Any]] = []
     pool_summaries: Dict[str, Any] = {}
     graph_state: Dict[str, Any] = {
-        "neighbors": {}, "families": {}, "candidate_ids": {}}
+        "neighbors": {}, "local_groups": {}, "components": {},
+        "candidate_ids": {}}
+    capture_reliability = _capture_reliability_summary(
+        records, capture_threshold)
     model_version = str(ctx.model_cfg.get("model_version"))
     for pool_index, pool in enumerate(("qk", "v", "rst")):
         candidate_limit = min(limits[pool], pool_sizes[pool])
@@ -3220,56 +4554,106 @@ def run_operator_functional_graph(
         functional_map = {
             operator_id: parameter[operator_id]["functional"]
             for operator_id in candidates}
-        qualified_edges = set()
+        functional_threshold = float(thresholds["functional_high"])
+        reciprocal_edges = reciprocal_neighbor_edges(
+            functional_map, functional_threshold)
+        reciprocal_adjacency: Dict[int, List[int]] = {
+            int(operator_id): [] for operator_id in candidates}
+        for left, right in reciprocal_edges:
+            reciprocal_adjacency[left].append(right)
+            reciprocal_adjacency[right].append(left)
+        activation_score_maps = {
+            int(operator_id): {
+                int(row["operator_id"]): float(row["similarity"])
+                for row in activation_neighbors[operator_id]}
+            for operator_id in candidates}
+        activation_qualified_edges: List[Tuple[int, int]] = []
+        if activation_high is not None:
+            for left, right in reciprocal_edges:
+                left_score = activation_score_maps[left].get(right)
+                right_score = activation_score_maps[right].get(left)
+                if (left_score is not None and right_score is not None
+                        and min(left_score, right_score) >= float(activation_high)):
+                    activation_qualified_edges.append((left, right))
+        activation_adjacency: Dict[int, List[int]] = {
+            int(operator_id): [] for operator_id in candidates}
+        for left, right in activation_qualified_edges:
+            activation_adjacency[left].append(right)
+            activation_adjacency[right].append(left)
+
+        percolation = functional_percolation_summary(
+            candidates, reciprocal_edges)
+        components = percolation["components"]
+        component_by_operator: Dict[int, str] = {}
+        for component_index, members in enumerate(components):
+            component_id = f"{pool}_component_{component_index:05d}"
+            component_rows.append({
+                "pool": pool,
+                "component_id": component_id,
+                "members": members,
+                "size": len(members),
+                "interpretation": "percolation_diagnostic_only",
+                "causal_group_eligible": False,
+            })
+            for operator_id in members:
+                component_by_operator[operator_id] = component_id
+        graph_state["components"][pool] = component_by_operator
+        graph_state["neighbors"][pool] = {}
+        graph_state["local_groups"][pool] = {}
         for operator_id in candidates:
-            possible = {
-                int(row["operator_id"])
-                for row in parameter[operator_id]["functional"]
-            } | {
-                int(row["operator_id"])
-                for row in activation_neighbors[operator_id]
-            }
             functional_scores = {
                 int(row["operator_id"]): float(row["similarity"])
                 for row in parameter[operator_id]["functional"]}
-            activation_scores = {
-                int(row["operator_id"]): float(row["similarity"])
-                for row in activation_neighbors[operator_id]}
-            for other in possible:
-                if (functional_scores.get(other, -np.inf)
-                        >= float(thresholds.get("functional_high", np.inf))
-                        and activation_scores.get(other, -np.inf)
-                        >= float(activation_high if activation_high is not None else np.inf)):
-                    qualified_edges.add(tuple(sorted((operator_id, other))))
-        families = mutual_neighbor_families(
-            functional_map, sorted(qualified_edges))
-        family_by_operator = {}
-        for family_index, members in enumerate(families):
-            family_id = f"{pool}_family_{family_index:05d}"
-            family_rows.append({
-                "pool": pool, "family_id": family_id,
-                "members": members, "size": len(members),
-                "construction": "mutual_functional_or_function_activation_quantile",
-            })
-            for operator_id in members:
-                family_by_operator[operator_id] = family_id
-        graph_state["families"][pool] = family_by_operator
-        graph_state["neighbors"][pool] = {}
-        for operator_id in candidates:
+            reciprocal = sorted(
+                reciprocal_adjacency[operator_id],
+                key=lambda other: (-functional_scores.get(other, -np.inf), other))
+            reciprocal_activation = sorted(
+                activation_adjacency[operator_id],
+                key=lambda other: (
+                    -functional_scores.get(other, -np.inf), other))
+            local_groups = {
+                "reciprocal_functional_neighbors": [operator_id] + reciprocal,
+                "reciprocal_function_activation_neighbors": (
+                    [operator_id] + reciprocal_activation),
+                "address_neighbors": [operator_id] + [
+                    int(row["operator_id"])
+                    for row in parameter[operator_id]["address"]],
+                "coactivation_neighbors": [operator_id] + [
+                    int(row["operator_id"])
+                    for row in activation_neighbors[operator_id]],
+            }
+            local_group_row = {
+                "pool": pool,
+                "seed_operator_id": operator_id,
+                **local_groups,
+                "construction": "bounded_seed_local_no_transitive_closure",
+                "functional_high_threshold": functional_threshold,
+                "activation_high_threshold": activation_high,
+            }
+            local_group_rows.append(local_group_row)
+            graph_state["local_groups"][pool][operator_id] = local_groups
             row = {
                 "pool": pool,
                 "operator_id": operator_id,
-                "family_id": family_by_operator[operator_id],
+                "functional_family_legacy_component": component_by_operator[
+                    operator_id],
+                "functional_family_legacy_component_deprecated": True,
                 "top_functional_neighbors": parameter[operator_id]["functional"],
                 "top_address_neighbors": parameter[operator_id]["address"],
                 "top_activation_profile_neighbors": activation_neighbors[operator_id],
                 "top_contribution_profile_neighbors": contribution_neighbors[operator_id],
+                "reciprocal_functional_neighbors": reciprocal,
+                "reciprocal_function_activation_neighbors": reciprocal_activation,
                 "activation_observation_count": len(activation[operator_id]),
                 "contribution_observation_count": len(contribution[operator_id]),
             }
             neighbor_rows.append(row)
             graph_state["neighbors"][pool][operator_id] = row
-        sizes = [len(members) for members in families]
+        reciprocal_degrees = [
+            len(reciprocal_adjacency[operator_id]) for operator_id in candidates]
+        activation_degrees = [
+            len(activation_adjacency[operator_id]) for operator_id in candidates]
+        local_group_sizes = [1 + value for value in reciprocal_degrees]
         counts = classification.get("counts", {})
         classified_n = max(sum(counts.values()), 1)
         empirical_sample = sample_pairs[:50000]
@@ -3277,11 +4661,19 @@ def run_operator_functional_graph(
             "candidate_operator_count": len(candidates),
             "candidate_pool_coverage": len(candidates) / max(pool_sizes[pool], 1),
             **coverage,
-            "family_count": len(families),
-            "singleton_fraction": (
-                float(np.mean(np.asarray(sizes) == 1)) if sizes else None),
-            "family_size_mean": float(np.mean(sizes)) if sizes else None,
-            "family_size_max": max(sizes) if sizes else 0,
+            **{key: value for key, value in percolation.items()
+               if key != "components"},
+            "family_count": len(components),
+            "family_count_deprecated": True,
+            "family_count_replacement": "component_count",
+            "reciprocal_functional_degree": _numeric_distribution(
+                reciprocal_degrees),
+            "activation_qualified_degree": _numeric_distribution(
+                activation_degrees),
+            "seed_local_group_size_distribution": _numeric_distribution(
+                local_group_sizes),
+            "largest_transitive_component_fraction": percolation[
+                "largest_component_fraction"],
             "function_high_address_high_fraction": (
                 counts.get("function_high_address_high", 0) / classified_n),
             "function_high_address_low_fraction": (
@@ -3305,21 +4697,57 @@ def run_operator_functional_graph(
             "profile_neighbor_method": (
                 "sparse_signature_countsketch_shortlist_then_exact_cosine"),
         }
+        capture_routes = ("q", "k") if pool == "qk" else (pool,)
+        capture_rows = {
+            route: capture_reliability["pools"][route]
+            for route in capture_routes}
+        remaining_capture = sum(
+            int(row["remaining_low_capture_count"])
+            for row in capture_rows.values())
+        pool_summaries[pool].update({
+            "capture_reliability": capture_rows,
+            "profile_conclusion_status": (
+                "partial" if remaining_capture else "ready"),
+            "excluded_low_capture_observation_count": remaining_capture,
+        })
+        if percolation["percolated"]:
+            pool_summaries[pool]["warning"] = (
+                "connected components are percolated and are not interpreted "
+                "as functional families")
     summary = {
-        "status": "ready" if neighbor_rows else "partial",
+        "status": (
+            "ready" if neighbor_rows
+            and not capture_reliability["remaining_low_capture_count"]
+            else "partial"),
         "neighbor_k": neighbor_k,
         "pools": pool_summaries,
+        "capture_reliability": capture_reliability,
         "artifacts": {
             "neighbors": ctx.store.path("operator_functional_neighbors.jsonl"),
-            "families": ctx.store.path("operator_functional_families.jsonl"),
+            "local_groups": ctx.store.path(
+                "operator_functional_local_groups.jsonl"),
+            "percolation_components": ctx.store.path(
+                "operator_functional_percolation_components.jsonl"),
             "summary": ctx.store.path("operator_functional_graph_summary.json"),
         },
+        "connected_component_interpretation": "percolation_diagnostic_only",
+        "causal_group_construction": "bounded_seed_local_reciprocal_neighbors",
     }
+    if capture_reliability["remaining_low_capture_count"]:
+        summary["capture_warnings_by_pool"] = {
+            pool: int(row["remaining_low_capture_count"])
+            for pool, row in capture_reliability["pools"].items()
+            if int(row["remaining_low_capture_count"]) > 0
+        }
     if ctx.is_primary:
         write_jsonl_atomic(
             ctx.store.path("operator_functional_neighbors.jsonl"), neighbor_rows)
         write_jsonl_atomic(
-            ctx.store.path("operator_functional_families.jsonl"), family_rows)
+            ctx.store.path("operator_functional_local_groups.jsonl"),
+            local_group_rows)
+        write_jsonl_atomic(
+            ctx.store.path("operator_functional_percolation_components.jsonl"),
+            component_rows)
         write_json_atomic(
             ctx.store.path("operator_functional_graph_summary.json"), summary)
     summary["_graph_state"] = graph_state
@@ -3328,22 +4756,42 @@ def run_operator_functional_graph(
 
 def _load_functional_graph_state(ctx: AnalysisContext) -> Optional[Dict[str, Any]]:
     path = ctx.store.path("operator_functional_neighbors.jsonl")
-    if not exists(path):
+    local_path = ctx.store.path("operator_functional_local_groups.jsonl")
+    component_path = ctx.store.path(
+        "operator_functional_percolation_components.jsonl")
+    if not exists(path) or not exists(local_path) or not exists(component_path):
         return None
     rows = read_jsonl(path)
-    if not rows:
+    local_rows = read_jsonl(local_path)
+    component_rows = read_jsonl(component_path)
+    if not rows or not local_rows or not component_rows:
         return None
     state: Dict[str, Any] = {
         "neighbors": defaultdict(dict),
-        "families": defaultdict(dict),
+        "local_groups": defaultdict(dict),
+        "components": defaultdict(dict),
         "candidate_ids": defaultdict(list),
     }
     for row in rows:
         pool = str(row["pool"])
         operator_id = int(row["operator_id"])
         state["neighbors"][pool][operator_id] = row
-        state["families"][pool][operator_id] = row.get("family_id")
         state["candidate_ids"][pool].append(operator_id)
+    for row in local_rows:
+        pool = str(row["pool"])
+        operator_id = int(row["seed_operator_id"])
+        state["local_groups"][pool][operator_id] = {
+            name: [int(value) for value in row.get(name, [])]
+            for name in (
+                "reciprocal_functional_neighbors",
+                "reciprocal_function_activation_neighbors",
+                "address_neighbors", "coactivation_neighbors")
+        }
+    for row in component_rows:
+        pool = str(row["pool"])
+        component_id = str(row["component_id"])
+        for operator_id in row.get("members", []):
+            state["components"][pool][int(operator_id)] = component_id
     return {
         key: {pool: value for pool, value in mapping.items()}
         for key, mapping in state.items()
@@ -3363,88 +4811,326 @@ def _parse_group_sizes(value: Any, max_width: int) -> List[int]:
     return sizes
 
 
+def _stable_seed(base_seed: int, *parts: Any) -> int:
+    payload = "\x1f".join(str(value) for value in (base_seed,) + parts)
+    return int.from_bytes(
+        hashlib.sha256(payload.encode("utf-8")).digest()[:8], "little")
+
+
+def _record_local_contributions(
+        record: Mapping[str, Any], route: str, layer: int
+        ) -> Tuple[Dict[int, float], Dict[int, float], bool]:
+    trace = record["trace"]
+    ids = np.asarray(trace[f"{route}_top_idx"])[int(layer), 0, :]
+    execution = np.asarray(trace[f"{route}_top_val"])[int(layer), 0, :]
+    contributions = np.asarray(
+        trace[f"{route}_top_coefficient"])[int(layer), 0, :]
+    captured = float(np.asarray(
+        trace[f"{route}_captured_mass"])[int(layer), 0])
+    threshold = float(record.get("capture_threshold", PAIR_CAPTURE_THRESHOLD))
+    execution_by_id: Dict[int, float] = {}
+    contribution_by_id: Dict[int, float] = {}
+    for operator_id, weight, contribution in zip(ids, execution, contributions):
+        operator_id = int(operator_id)
+        if operator_id < 0:
+            continue
+        execution_by_id[operator_id] = float(weight)
+        contribution_by_id[operator_id] = float(contribution)
+    return execution_by_id, contribution_by_id, captured >= threshold
+
+
 def _group_candidates(
         graph_state: Mapping[str, Any], record: Mapping[str, Any],
         route: str, layer: int, seed_operator: int, group_type: str,
         requested_size: int, random_seed: int) -> Tuple[List[int], Dict[str, Any]]:
     graph_pool = "qk" if route in ("q", "k") else route
-    neighbors = graph_state["neighbors"][graph_pool].get(seed_operator, {})
-    metadata: Dict[str, Any] = {}
-    if group_type == "functional_family":
-        family_id = graph_state["families"][graph_pool].get(seed_operator)
-        same_family = {
-            operator_id for operator_id, candidate_family
-            in graph_state["families"][graph_pool].items()
-            if candidate_family == family_id and operator_id != seed_operator
-        }
+    local = graph_state["local_groups"][graph_pool].get(seed_operator, {})
+    execution, contributions, capture_valid = _record_local_contributions(
+        record, route, layer)
+    active_ids = {
+        operator_id for operator_id, value in execution.items() if value > 0.0}
+    metadata: Dict[str, Any] = {
+        "capture_threshold_pass": capture_valid,
+        "active_candidate_count": len(active_ids),
+    }
+    if group_type in (
+            "reciprocal_functional_neighbors",
+            "reciprocal_function_activation_neighbors",
+            "address_neighbors", "coactivation_neighbors"):
         ordered = [
-            int(row["operator_id"])
-            for row in neighbors.get("top_functional_neighbors", [])
-            if int(row["operator_id"]) in same_family]
-        ordered.extend(sorted(same_family - set(ordered)))
-        metadata["family_id"] = family_id
-    elif group_type == "address_neighbors":
-        ordered = [int(row["operator_id"])
-                   for row in neighbors.get("top_address_neighbors", [])]
-    elif group_type == "coactivation_neighbors":
-        ordered = [int(row["operator_id"])
-                   for row in neighbors.get(
-                       "top_activation_profile_neighbors", [])]
+            int(operator_id) for operator_id in local.get(group_type, [])[1:]
+            if int(operator_id) in active_ids]
     elif group_type == "random_active_size_matched":
-        trace = record["trace"]
-        ids = np.asarray(trace[f"{route}_top_idx"])[int(layer), 0, :]
-        weights = np.asarray(trace[f"{route}_top_val"])[int(layer), 0, :]
-        active = [(int(operator_id), float(weight))
-                  for operator_id, weight in zip(ids, weights)
-                  if int(operator_id) != int(seed_operator) and float(weight) > 0.0]
-        seed_weight = next((
-            float(weight) for operator_id, weight in zip(ids, weights)
-            if int(operator_id) == int(seed_operator)), 0.0)
-        magnitudes = np.asarray([weight for _, weight in active] + [seed_weight])
-        edges = np.quantile(magnitudes, [0.25, 0.50, 0.75]) if magnitudes.size else []
-        seed_bin = int(np.searchsorted(edges, seed_weight, side="right"))
-        matched = [item for item in active
-                   if int(np.searchsorted(edges, item[1], side="right")) == seed_bin]
+        candidates = sorted(
+            operator_id for operator_id in active_ids
+            if operator_id != int(seed_operator))
         rng = np.random.default_rng(int(random_seed))
-        if matched:
-            order = rng.permutation(len(matched))
-            ordered = [matched[index][0] for index in order]
-        else:
-            ordered = []
-        metadata.update({
-            "execution_magnitude_bin": seed_bin,
-            "execution_magnitude_bin_edges": [float(value) for value in edges],
-        })
+        ordered = [candidates[index] for index in rng.permutation(len(candidates))]
     else:
         raise ValueError(f"unknown group type {group_type}")
-    dedup = []
+    dedup: List[int] = []
     for operator_id in ordered:
         if operator_id != seed_operator and operator_id not in dedup:
             dedup.append(operator_id)
-    return [int(seed_operator)] + dedup[:max(0, int(requested_size) - 1)], metadata
+    group = [int(seed_operator)] + dedup[:max(0, int(requested_size) - 1)]
+    metadata["group_local_contribution_mass"] = float(sum(
+        abs(contributions.get(operator_id, 0.0)) for operator_id in group))
+    return group, metadata
+
+
+def _contribution_matched_random_group(
+        record: Mapping[str, Any], route: str, layer: int,
+        seed_operator: int, target_group: Sequence[int], requested_size: int,
+        random_seed: int, draws: int) -> Tuple[List[int], Dict[str, Any]]:
+    execution, contributions, capture_valid = _record_local_contributions(
+        record, route, layer)
+    active = sorted(
+        operator_id for operator_id, weight in execution.items()
+        if weight > 0.0 and operator_id != int(seed_operator))
+    target_mass = float(sum(
+        abs(contributions.get(int(operator_id), 0.0))
+        for operator_id in target_group))
+    metadata: Dict[str, Any] = {
+        "capture_threshold_pass": capture_valid,
+        "target_group_local_contribution_mass": target_mass,
+        "random_match_draws": int(draws),
+    }
+    needed = max(0, int(requested_size) - 1)
+    if needed > len(active):
+        metadata["random_group_local_contribution_mass"] = None
+        metadata["contribution_match_relative_error"] = None
+        return [int(seed_operator)], metadata
+    if needed == 0:
+        group = [int(seed_operator)]
+        random_mass = target_mass
+    else:
+        rng = np.random.default_rng(int(random_seed))
+        best: Optional[Tuple[float, Tuple[int, ...], float]] = None
+        for _ in range(max(1, int(draws))):
+            chosen = tuple(sorted(int(value) for value in rng.choice(
+                active, size=needed, replace=False).tolist()))
+            group_mass = float(abs(contributions.get(int(seed_operator), 0.0)) + sum(
+                abs(contributions.get(operator_id, 0.0))
+                for operator_id in chosen))
+            distance = abs(group_mass - target_mass)
+            candidate = (distance, chosen, group_mass)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
+        assert best is not None
+        group = [int(seed_operator)] + list(best[1])
+        random_mass = float(best[2])
+    relative_error = abs(random_mass - target_mass) / max(target_mass, 1.0e-12)
+    metadata.update({
+        "random_group_local_contribution_mass": random_mass,
+        "contribution_match_relative_error": relative_error,
+    })
+    return group, metadata
+
+
+GROUP_PAIRING_FIELDS = (
+    "prompt_id", "pool", "layer", "seed_operator_id", "seed_strategy",
+    "requested_group_size",
+)
+
+
+def _paired_group_comparison(
+        rows: Sequence[Mapping[str, Any]], left: str, right: str,
+        seed: int) -> Dict[str, Any]:
+    grouped: Dict[Tuple[Any, ...], Dict[str, List[float]]] = defaultdict(
+        lambda: defaultdict(list))
+    for row in rows:
+        if row.get("status") != "ready":
+            continue
+        value = _json_float(row.get("abs_sequence_behavior_delta"))
+        if value is None:
+            continue
+        group_type = str(row.get("group_type"))
+        if group_type == "random_active_contribution_matched":
+            if str(row.get("matched_target_group_type")) != left:
+                continue
+        elif group_type not in (left, right):
+            continue
+        key = tuple(row.get(field) for field in GROUP_PAIRING_FIELDS)
+        grouped[key][group_type].append(float(value))
+    differences = [
+        float(np.mean(values[left]) - np.mean(values[right]))
+        for values in grouped.values()
+        if left in values and right in values]
+    bootstrap = _bootstrap_mean_ci(differences, seed)
+    if differences:
+        observed = abs(float(np.mean(differences)))
+        array = np.asarray(differences, dtype=np.float64)
+        if len(differences) <= 20:
+            null = []
+            for mask in range(1 << len(differences)):
+                signs = np.asarray([
+                    1.0 if mask & (1 << index) else -1.0
+                    for index in range(len(differences))])
+                null.append(abs(float(np.mean(array * signs))))
+        else:
+            rng = np.random.default_rng(int(seed) + 17)
+            null = [abs(float(np.mean(array * rng.choice(
+                (-1.0, 1.0), size=array.size)))) for _ in range(10000)]
+        sign_flip_p = float(
+            (1 + np.sum(np.asarray(null) >= observed)) / (len(null) + 1))
+    else:
+        sign_flip_p = None
+    return {
+        "left": left,
+        "right": right,
+        "paired_n": len(differences),
+        "paired_mean_difference": bootstrap["mean"],
+        "paired_median_difference": (
+            float(np.median(differences)) if differences else None),
+        "bootstrap_ci95": bootstrap["ci95"],
+        "paired_sign_win_rate": (
+            float(np.mean(np.asarray(differences) > 0.0))
+            if differences else None),
+        "sign_flip_two_sided_p": sign_flip_p,
+        "metric": "abs_sequence_behavior_delta",
+    }
+
+
+def _paired_dose_response(
+        rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    grouped: Dict[Tuple[Any, ...], Dict[int, float]] = defaultdict(dict)
+    for row in rows:
+        value = _json_float(row.get("abs_sequence_behavior_delta"))
+        if row.get("status") != "ready" or value is None:
+            continue
+        key = (
+            row.get("prompt_id"), row.get("pool"), row.get("layer"),
+            row.get("seed_operator_id"), row.get("seed_strategy"),
+            row.get("group_type"), row.get("matched_target_group_type"),
+        )
+        grouped[key][int(row["requested_group_size"])] = float(value)
+    deltas: Dict[str, List[float]] = {
+        "2_minus_1": [], "4_minus_2": [], "8_minus_4": []}
+    monotonic: List[bool] = []
+    spearman: List[float] = []
+    peaks: Dict[str, int] = defaultdict(int)
+    for sizes in grouped.values():
+        for left, right in ((1, 2), (2, 4), (4, 8)):
+            if left in sizes and right in sizes:
+                deltas[f"{right}_minus_{left}"].append(
+                    sizes[right] - sizes[left])
+        ordered = sorted(sizes)
+        if len(ordered) >= 2:
+            values = [sizes[size] for size in ordered]
+            monotonic.append(all(
+                right >= left for left, right in zip(values, values[1:])))
+            rho = spearman_correlation(ordered, values)
+            if rho is not None:
+                spearman.append(float(rho))
+        if sizes:
+            peak = min(
+                (size for size, value in sizes.items()
+                 if value == max(sizes.values())), default=min(sizes))
+            peaks[str(peak)] += 1
+    return {
+        "paired_seed_count": len(grouped),
+        "paired_effect_delta_2_minus_1": _numeric_distribution(
+            deltas["2_minus_1"]),
+        "paired_effect_delta_4_minus_2": _numeric_distribution(
+            deltas["4_minus_2"]),
+        "paired_effect_delta_8_minus_4": _numeric_distribution(
+            deltas["8_minus_4"]),
+        "monotonic_nondecreasing_fraction": (
+            float(np.mean(monotonic)) if monotonic else None),
+        "per_seed_size_effect_spearman": _numeric_distribution(spearman),
+        "peak_effect_group_size_distribution": dict(sorted(peaks.items())),
+    }
+
+
+def compute_group_additivity_metrics(
+        group_effect: float, member_signed_effects: Sequence[float],
+        *, size_one: bool = False) -> Dict[str, Any]:
+    """Compute direction-preserving and magnitude-only group additivity."""
+    signed = [float(value) for value in member_signed_effects]
+    if not signed:
+        raise ValueError("group additivity requires every member single effect")
+    sum_abs = float(sum(abs(value) for value in signed))
+    sum_signed = float(sum(signed))
+    max_abs = float(max(abs(value) for value in signed))
+    effect = float(group_effect)
+    if size_one:
+        if len(signed) != 1 or effect != signed[0]:
+            raise ValueError(
+                "size-1 group effect must equal its cached single effect exactly")
+        magnitude_synergy = 0.0
+        signed_residual = 0.0
+        over_sum = 1.0
+        over_max = 1.0
+    else:
+        magnitude_synergy = abs(effect) - sum_abs
+        signed_residual = effect - sum_signed
+        over_sum = abs(effect) / sum_abs if sum_abs > 0.0 else None
+        over_max = abs(effect) / max_abs if max_abs > 0.0 else None
+    return {
+        "sum_single_abs_effect": sum_abs,
+        "sum_single_signed_effect": sum_signed,
+        "max_single_abs_effect": max_abs,
+        "magnitude_synergy": magnitude_synergy,
+        "signed_additivity_residual": signed_residual,
+        "group_effect_over_sum_single_abs_effect": over_sum,
+        "group_effect_over_max_single_abs_effect": over_max,
+    }
+
+
+def _resolve_group_member_singles(
+        single_effects: Mapping[SingleEffectKey, Mapping[str, Any]], *,
+        prompt_id: Any, route: Any, layer: Any,
+        operator_ids: Sequence[int]) -> Dict[str, Any]:
+    """Resolve every member through the canonical layer-aware cache key."""
+    keys = [
+        single_effect_key(prompt_id, route, layer, operator_id)
+        for operator_id in operator_ids]
+    rows = [single_effects.get(key) for key in keys]
+    missing_count = sum(row is None for row in rows)
+    return {
+        "keys": keys,
+        "rows": rows,
+        "all_member_singles_available": missing_count == 0,
+        "missing_member_single_count": missing_count,
+    }
 
 
 def _group_summary(rows: Sequence[Mapping[str, Any]], seed: int) -> Dict[str, Any]:
     valid = [row for row in rows if row.get("status") == "ready"]
-    effects = [abs(float(row["target_logprob_delta"])) for row in valid]
-    synergies = [float(row["synergy"]) for row in valid
-                 if _json_float(row.get("synergy")) is not None]
+    effects = [float(row["abs_sequence_behavior_delta"]) for row in valid
+               if _json_float(row.get("abs_sequence_behavior_delta")) is not None]
+    magnitude_synergies = [float(row["magnitude_synergy"]) for row in valid
+                           if _json_float(row.get("magnitude_synergy")) is not None]
+    signed_residuals = [float(row["signed_additivity_residual"]) for row in valid
+                        if _json_float(row.get("signed_additivity_residual")) is not None]
     effect_ci = _bootstrap_mean_ci(effects, seed)
-    synergy_ci = _bootstrap_mean_ci(synergies, seed + 1)
+    magnitude_ci = _bootstrap_mean_ci(magnitude_synergies, seed + 1)
+    signed_ci = _bootstrap_mean_ci(signed_residuals, seed + 2)
     return {
         "n": len(valid),
-        "mean_abs_target_logprob_delta": effect_ci["mean"],
-        "abs_target_logprob_delta_ci95": effect_ci["ci95"],
+        "mean_abs_sequence_behavior_delta": effect_ci["mean"],
+        "abs_sequence_behavior_delta_ci95": effect_ci["ci95"],
         "mean_full_output_kl": (
-            float(np.mean([float(row["full_output_kl"]) for row in valid]))
+            float(np.mean([
+                float(row["full_output_kl"]) for row in valid
+                if _json_float(row.get("full_output_kl")) is not None]))
+            if any(_json_float(row.get("full_output_kl")) is not None
+                   for row in valid) else None),
+        "mean_relative_delta_ratio": (
+            float(np.mean([
+                float(row["relative_delta_ratio"]) for row in valid]))
             if valid else None),
-        "mean_recovery_ratio_final": (
-            float(np.mean([float(row["recovery_ratio_final"]) for row in valid]))
-            if valid else None),
-        "mean_synergy": synergy_ci["mean"],
-        "synergy_ci95": synergy_ci["ci95"],
-        "superadditive_fraction": (
-            float(np.mean(np.asarray(synergies) > 0.0)) if synergies else None),
+        "mean_magnitude_synergy": magnitude_ci["mean"],
+        "magnitude_synergy_ci95": magnitude_ci["ci95"],
+        "mean_signed_additivity_residual": signed_ci["mean"],
+        "signed_additivity_residual_ci95": signed_ci["ci95"],
+        "magnitude_superadditive_fraction": (
+            float(np.mean(np.asarray(magnitude_synergies) > 0.0))
+            if magnitude_synergies else None),
+        "all_member_singles_available_fraction": (
+            float(np.mean([
+                bool(row.get("all_member_singles_available"))
+                for row in valid])) if valid else None),
     }
 
 
@@ -3455,6 +5141,15 @@ def run_group_causal_intervention(
     max_width = int(getattr(ctx.args, "group_causal_max_width", 8) or 8)
     sizes = _parse_group_sizes(
         getattr(ctx.args, "group_causal_sizes", "1,2,4,8"), max_width)
+    random_match_draws = int(getattr(
+        ctx.args, "group_random_match_draws",
+        DEFAULT_GROUP_RANDOM_MATCH_DRAWS) or DEFAULT_GROUP_RANDOM_MATCH_DRAWS)
+    max_match_error = float(getattr(
+        ctx.args, "group_contribution_match_max_relative_error",
+        DEFAULT_GROUP_CONTRIBUTION_MATCH_MAX_RELATIVE_ERROR)
+        or DEFAULT_GROUP_CONTRIBUTION_MATCH_MAX_RELATIVE_ERROR)
+    if random_match_draws <= 0 or max_match_error < 0.0:
+        raise ValueError("group random match settings must be positive")
     max_prompts = getattr(ctx.args, "group_causal_max_prompts", None)
     primary_records = _primary_records(records)
     if max_prompts is not None:
@@ -3462,152 +5157,343 @@ def run_group_causal_intervention(
     record_by_prompt = {
         str(record["prompt"]["prompt_id"]): record for record in primary_records}
     ready_causal = [row for row in causal_rows if row.get("status") == "ready"]
-    seeds: Dict[Tuple[str, str], Mapping[str, Any]] = {}
-    for strategy in ("top_contribution", "top_gate"):
-        for row in ready_causal:
-            key = (str(row["prompt_id"]), str(row["pool"]))
-            if str(row.get("strategy")) == strategy and key not in seeds:
-                seeds[key] = row
-    single_effects = {
-        (str(row["prompt_id"]), str(row["pool"]), int(row["operator_id"])):
-            abs(float(row["target_logprob_delta"]))
-        for row in ready_causal
-        if _json_float(row.get("target_logprob_delta")) is not None
-    }
+    seed_rows: Dict[Tuple[Any, ...], Mapping[str, Any]] = {}
+    for row in ready_causal:
+        if str(row.get("strategy")) not in ("top_contribution", "top_gate"):
+            continue
+        key = (
+            str(row["prompt_id"]), str(row["pool"]), int(row["layer"]),
+            int(row["operator_id"]), str(row["strategy"]))
+        if str(row["prompt_id"]) in record_by_prompt:
+            seed_rows.setdefault(key, row)
+
+    seed_value = int(ctx.config.get("seed", 0))
+    local_group_types = (
+        "reciprocal_functional_neighbors",
+        "reciprocal_function_activation_neighbors",
+        "address_neighbors", "coactivation_neighbors",
+        "random_active_size_matched",
+    )
+    plans: List[Dict[str, Any]] = []
+    for seed_index, (seed_key, seed_row) in enumerate(sorted(seed_rows.items())):
+        prompt_id, route, layer, seed_operator, seed_strategy = seed_key
+        record = record_by_prompt[prompt_id]
+        by_type_size: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for type_index, group_type in enumerate(local_group_types):
+            for size in sizes:
+                random_seed = _stable_seed(
+                    seed_value, "group", seed_index, type_index, size,
+                    prompt_id, route, layer, seed_operator, seed_strategy)
+                group, metadata = _group_candidates(
+                    graph_state, record, route, layer, seed_operator,
+                    group_type, size, random_seed)
+                plan = {
+                    "prompt_id": prompt_id,
+                    "phenomenon": record["prompt"]["phenomenon"],
+                    "pool": route,
+                    "layer": layer,
+                    "seed_operator_id": seed_operator,
+                    "seed_strategy": seed_strategy,
+                    "group_type": group_type,
+                    "requested_group_size": int(size),
+                    "group_operator_ids": group,
+                    "fixed_width": max_width,
+                    **metadata,
+                }
+                by_type_size[(group_type, int(size))] = plan
+                plans.append(plan)
+        for target_type in (
+                "reciprocal_functional_neighbors",
+                "reciprocal_function_activation_neighbors"):
+            for size in sizes:
+                target = by_type_size[(target_type, int(size))]
+                random_seed = _stable_seed(
+                    seed_value, "contribution_match", seed_index, size,
+                    target_type, prompt_id, route, layer, seed_operator,
+                    seed_strategy)
+                if len(target["group_operator_ids"]) == int(size):
+                    group, metadata = _contribution_matched_random_group(
+                        record, route, layer, seed_operator,
+                        target["group_operator_ids"], size, random_seed,
+                        random_match_draws)
+                else:
+                    group, metadata = [seed_operator], {
+                        "capture_threshold_pass": target.get(
+                            "capture_threshold_pass", False),
+                        "target_group_local_contribution_mass": None,
+                        "random_group_local_contribution_mass": None,
+                        "contribution_match_relative_error": None,
+                        "random_match_draws": random_match_draws,
+                    }
+                plans.append({
+                    "prompt_id": prompt_id,
+                    "phenomenon": record["prompt"]["phenomenon"],
+                    "pool": route,
+                    "layer": layer,
+                    "seed_operator_id": seed_operator,
+                    "seed_strategy": seed_strategy,
+                    "group_type": "random_active_contribution_matched",
+                    "matched_target_group_type": target_type,
+                    "requested_group_size": int(size),
+                    "group_operator_ids": group,
+                    "fixed_width": max_width,
+                    **metadata,
+                })
+
     forward = _canonical_group_causal_trace_forward(ctx, max_width)
     single_forward = _canonical_causal_trace_forward(ctx)
     pool_codes = {"q": 0, "k": 1, "v": 2, "rst": 3}
-    group_types = (
-        "functional_family", "address_neighbors",
-        "coactivation_neighbors", "random_active_size_matched")
-    result_rows: List[Dict[str, Any]] = []
-    baseline_cache: Dict[Tuple[str, str, int], Any] = {}
-    seed_value = int(ctx.config.get("seed", 0))
-    for seed_index, ((prompt_id, route), seed_row) in enumerate(sorted(seeds.items())):
-        record = record_by_prompt.get(prompt_id)
-        if record is None:
-            continue
+    runtime_cache: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+    zero_size_parity_rows: List[Dict[str, Any]] = []
+
+    def runtime_for(prompt_id: str, route: str, layer: int) -> Dict[str, Any]:
+        cache_key = (prompt_id, route, int(layer))
+        if cache_key in runtime_cache:
+            return runtime_cache[cache_key]
+        record = record_by_prompt[prompt_id]
         prompt = record["prompt"]
-        layer = int(seed_row["layer"])
         target_position = int(record["target_token_index"])
         replicas = max(1, int(ctx.mesh.shape["data"]))
         input_ids = jax.device_put(jnp.asarray(np.repeat(
             np.asarray(prompt["input_array"], dtype=np.int32)[None, :],
             replicas, axis=0)), ctx.data_sharding)
         positions = jnp.full((replicas,), target_position, dtype=jnp.int32)
-        cache_key = (prompt_id, route, layer)
-        if cache_key not in baseline_cache:
-            padded_empty = jnp.asarray(np.repeat(
-                pad_group_operator_ids([], max_width)[None, :],
-                replicas, axis=0))
-            group_baseline = jax.device_get(forward(
-                ctx.params, input_ids, positions, jnp.int32(layer),
-                jnp.int32(pool_codes[route]), padded_empty))
-            canonical_baseline = jax.device_get(single_forward(
-                ctx.params, input_ids, positions, jnp.int32(layer),
-                jnp.int32(pool_codes[route]),
-                jnp.zeros((replicas,), dtype=jnp.int32), jnp.bool_(False)))
-            if not all(np.array_equal(np.asarray(left), np.asarray(right))
-                       for left, right in zip(group_baseline[:3], canonical_baseline[:3])):
+        padded_empty = jnp.asarray(np.repeat(
+            pad_group_operator_ids([], max_width)[None, :], replicas, axis=0))
+        group_baseline = jax.device_get(forward(
+            ctx.params, input_ids, positions, jnp.int32(layer),
+            jnp.int32(pool_codes[route]), padded_empty))
+        canonical_baseline = jax.device_get(single_forward(
+            ctx.params, input_ids, positions, jnp.int32(layer),
+            jnp.int32(pool_codes[route]),
+            jnp.zeros((replicas,), dtype=jnp.int32), jnp.bool_(False)))
+        scalar_exact_fields = {
+            name: bool(np.array_equal(np.asarray(left), np.asarray(right)))
+            for name, left, right in zip(
+                ("logits", "per_token_ce", "final_residual"),
+                group_baseline[:3], canonical_baseline[:3])
+        }
+        scalar_exact = all(scalar_exact_fields.values())
+        trace_exact = all(np.array_equal(
+            np.asarray(group_baseline[3][key]),
+            np.asarray(canonical_baseline[3][key]))
+            for key in group_baseline[3])
+        zero_size_parity_rows.append({
+            "prompt_id": prompt_id,
+            "route": route,
+            "layer": int(layer),
+            **{f"{name}_machine_exact": value
+               for name, value in scalar_exact_fields.items()},
+            "causal_trace_machine_exact": trace_exact,
+        })
+        if not scalar_exact or not trace_exact:
+            raise RuntimeError(
+                "fixed-width size-zero group baseline failed machine-exact parity")
+        runtime_cache[cache_key] = {
+            "record": record,
+            "prompt": prompt,
+            "target_position": target_position,
+            "replicas": replicas,
+            "input_ids": input_ids,
+            "positions": positions,
+            "baseline": group_baseline,
+        }
+        return runtime_cache[cache_key]
+
+    metric_fields = (
+        "baseline_sequence_ce", "intervention_sequence_ce",
+        "sequence_ce_delta", "baseline_sequence_behavior",
+        "intervention_sequence_behavior", "sequence_behavior_delta",
+        "sequence_mean_logprob_delta", "sequence_behavior_drop",
+        "abs_sequence_behavior_delta", "target_prediction_position",
+        "target_gold_position", "target_gold_token_id",
+        "baseline_target_next_token_logprob",
+        "intervention_target_next_token_logprob",
+        "target_next_token_logprob_delta",
+        "abs_target_next_token_logprob_delta", "target_distribution_kl",
+        "full_output_kl", "top_prediction_changed", "target_logprob_delta",
+        "target_logprob_delta_legacy", "legacy_target_logprob_metric",
+    )
+    single_effects: Dict[SingleEffectKey, Dict[str, Any]] = {}
+    for row in ready_causal:
+        value = _json_float(row.get("sequence_behavior_delta"))
+        if value is None:
+            continue
+        key = single_effect_key(
+            row["prompt_id"], row["pool"], row["layer"], row["operator_id"])
+        cached = single_effects.get(key)
+        if cached is not None:
+            if float(cached["sequence_behavior_delta"]) != float(value):
                 raise RuntimeError(
-                    "fixed-width size-zero group baseline failed machine-exact parity")
-            baseline_cache[cache_key] = group_baseline
-        baseline = baseline_cache[cache_key]
+                    "duplicate causal single-effect cache key has "
+                    "non-identical canonical effects")
+            continue
+        single_effects[key] = {
+            "status": "ready",
+            "prompt_id": key[0], "route": key[1], "pool": key[1],
+            "layer": key[2],
+            "operator_id": key[3],
+            "single_effect_key": list(key),
+            "cache_source": "causal_intervention",
+            **{field: row.get(field) for field in metric_fields},
+        }
+
+    planned_single_keys = sorted({
+        single_effect_key(
+            plan["prompt_id"], plan["pool"], plan["layer"], operator_id)
+        for plan in plans
+        if len(plan["group_operator_ids"]) == int(plan["requested_group_size"])
+        and bool(plan.get("capture_threshold_pass"))
+        for operator_id in plan["group_operator_ids"]
+    })
+    for key in planned_single_keys:
+        if key in single_effects:
+            continue
+        prompt_id, route, layer, operator_id = key
+        runtime = runtime_for(prompt_id, route, layer)
+        after = jax.device_get(single_forward(
+            ctx.params, runtime["input_ids"], runtime["positions"],
+            jnp.int32(layer), jnp.int32(pool_codes[route]),
+            jnp.full((runtime["replicas"],), operator_id, dtype=jnp.int32),
+            jnp.bool_(True)))
+        metrics = compute_causal_output_metrics(
+            runtime["baseline"][0], after[0],
+            runtime["prompt"]["token_ids"], int(runtime["prompt"]["length"]),
+            int(runtime["target_position"]))
+        single_effects[key] = {
+            "status": "ready",
+            "prompt_id": prompt_id, "route": route, "pool": route,
+            "layer": layer,
+            "operator_id": operator_id,
+            "single_effect_key": list(key),
+            "cache_source": "group_member_canonical_single_forward",
+            **metrics,
+        }
+
+    single_rows = [single_effects[key] for key in planned_single_keys]
+    result_rows: List[Dict[str, Any]] = []
+    for plan in plans:
+        prompt_id = str(plan["prompt_id"])
+        route = str(plan["pool"])
+        layer = int(plan["layer"])
+        group = [int(value) for value in plan["group_operator_ids"]]
+        common = dict(plan)
+        common["single_effect_cache_key_fields"] = [
+            "prompt_id", "route", "layer", "operator_id"]
+        partial_reason = None
+        if not bool(plan.get("capture_threshold_pass")):
+            partial_reason = "low_captured_mass"
+        elif len(group) != int(plan["requested_group_size"]):
+            partial_reason = "insufficient_qualified_group_members"
+        elif (plan["group_type"] == "random_active_contribution_matched"
+              and (_json_float(plan.get("contribution_match_relative_error")) is None
+                   or float(plan["contribution_match_relative_error"])
+                   > max_match_error)):
+            partial_reason = "contribution_match_error_exceeds_limit"
+        if partial_reason is not None:
+            result_rows.append({
+                **common, "status": "partial", "reason": partial_reason,
+                "actual_group_size": len(group),
+                "all_member_singles_available": False,
+                "missing_member_single_count": max(
+                    0, int(plan["requested_group_size"]) - len(group)),
+            })
+            continue
+
+        runtime = runtime_for(prompt_id, route, layer)
+        baseline = runtime["baseline"]
         baseline_logits = np.asarray(baseline[0])
         baseline_residual = np.asarray(baseline[2])
         baseline_trace = baseline[3]
-        length = int(prompt["length"])
-        baseline_ce = _sequence_ce(
-            baseline_logits, prompt["token_ids"], length)
-        baseline_logp = _log_softmax_np(baseline_logits[0, :length])
-        for type_index, group_type in enumerate(group_types):
-            for size in sizes:
-                group, group_meta = _group_candidates(
-                    graph_state, record, route, layer,
-                    int(seed_row["operator_id"]), group_type, size,
-                    seed_value + seed_index * 100 + type_index * 10 + size)
-                common = {
-                    "prompt_id": prompt_id,
-                    "phenomenon": prompt["phenomenon"],
-                    "pool": route,
-                    "layer": layer,
-                    "seed_operator_id": int(seed_row["operator_id"]),
-                    "seed_strategy": seed_row["strategy"],
-                    "group_type": group_type,
-                    "requested_group_size": int(size),
-                    "group_operator_ids": group,
-                    "fixed_width": max_width,
-                    **group_meta,
-                }
-                if len(group) != int(size):
-                    result_rows.append({
-                        **common, "status": "partial",
-                        "reason": "insufficient_qualified_group_members",
-                        "actual_group_size": len(group),
-                    })
-                    continue
-                selected = np.repeat(
-                    pad_group_operator_ids(group, max_width)[None, :],
-                    replicas, axis=0)
-                after = jax.device_get(forward(
-                    ctx.params, input_ids, positions, jnp.int32(layer),
-                    jnp.int32(pool_codes[route]), jnp.asarray(selected)))
-                logits = np.asarray(after[0])
-                residual = np.asarray(after[2])
-                after_ce = _sequence_ce(logits, prompt["token_ids"], length)
-                after_logp = _log_softmax_np(logits[0, :length])
-                base_prob = np.exp(baseline_logp)
-                behavior_before = None if baseline_ce is None else -baseline_ce
-                behavior_after = None if after_ce is None else -after_ce
-                effect = (
-                    None if behavior_before is None or behavior_after is None
-                    else behavior_after - behavior_before)
-                member_effects = [
-                    single_effects.get((prompt_id, route, operator_id))
-                    for operator_id in group]
-                sum_single = (
-                    sum(float(value) for value in member_effects)
-                    if all(value is not None for value in member_effects) else None)
-                max_single = (
-                    max(float(value) for value in member_effects)
-                    if all(value is not None for value in member_effects) else None)
-                recovery = compute_causal_recovery_metrics(
-                    baseline_trace, after[3], route=route, target_layer=layer,
-                    baseline_final_residual=baseline_residual[0, target_position],
-                    intervention_final_residual=residual[0, target_position],
-                    baseline_logits=baseline_logits, intervention_logits=logits,
-                    target_position=target_position)
-                result_rows.append({
-                    **common,
-                    "status": "ready",
-                    "actual_group_size": len(group),
-                    "behavior_score_drop": (
-                        None if behavior_before is None or behavior_after is None
-                        else behavior_before - behavior_after),
-                    "target_logprob_delta": effect,
-                    "full_output_kl": float(np.mean(np.sum(
-                        base_prob * (baseline_logp - after_logp), axis=-1))),
-                    "next_token_kl": float(np.sum(
-                        base_prob[-1] * (baseline_logp[-1] - after_logp[-1]))),
-                    "top_prediction_changed": bool(
-                        np.argmax(baseline_logp[-1]) != np.argmax(after_logp[-1])),
-                    "final_residual_cosine": _cosine(
-                        baseline_residual[0, target_position],
-                        residual[0, target_position]),
-                    "single_member_abs_effects": member_effects,
-                    "sum_single_effect": sum_single,
-                    "max_single_effect": max_single,
-                    "synergy": (
-                        abs(float(effect)) - sum_single
-                        if effect is not None and sum_single is not None else None),
-                    "group_effect_over_sum_single_effect": (
-                        abs(float(effect)) / max(sum_single, 1.0e-12)
-                        if effect is not None and sum_single is not None else None),
-                    "group_effect_over_max_single_effect": (
-                        abs(float(effect)) / max(max_single, 1.0e-12)
-                        if effect is not None and max_single is not None else None),
-                    **recovery,
-                })
+        selected = np.repeat(
+            pad_group_operator_ids(group, max_width)[None, :],
+            runtime["replicas"], axis=0)
+        after = jax.device_get(forward(
+            ctx.params, runtime["input_ids"], runtime["positions"],
+            jnp.int32(layer), jnp.int32(pool_codes[route]),
+            jnp.asarray(selected)))
+        logits = np.asarray(after[0])
+        residual = np.asarray(after[2])
+        output_metrics = compute_causal_output_metrics(
+            baseline_logits, logits, runtime["prompt"]["token_ids"],
+            int(runtime["prompt"]["length"]), runtime["target_position"])
+        member_lookup = _resolve_group_member_singles(
+            single_effects, prompt_id=prompt_id, route=route, layer=layer,
+            operator_ids=group)
+        member_rows = member_lookup["rows"]
+        missing_count = int(member_lookup["missing_member_single_count"])
+        if missing_count:
+            result_rows.append({
+                **common, "status": "partial",
+                "reason": "missing_member_single_effect",
+                "actual_group_size": len(group),
+                "all_member_singles_available": False,
+                "missing_member_single_count": missing_count,
+            })
+            continue
+        signed_singles = [
+            float(row["sequence_behavior_delta"]) for row in member_rows
+            if row is not None]
+        abs_singles = [abs(value) for value in signed_singles]
+        group_effect = _json_float(output_metrics["sequence_behavior_delta"])
+        if group_effect is None:
+            raise RuntimeError("ready group intervention lacks sequence effect")
+        if len(group) == 1:
+            if group != [int(plan["seed_operator_id"])]:
+                raise RuntimeError("size-1 group is not exactly the seed operator")
+            cached_effect = signed_singles[0]
+            if float(group_effect) != float(cached_effect):
+                raise RuntimeError(
+                    "size-1 group effect differs from cached single effect")
+            group_effect = cached_effect
+        additivity = compute_group_additivity_metrics(
+            float(group_effect), signed_singles, size_one=len(group) == 1)
+        output_metrics.update({
+            "sequence_behavior_delta": group_effect,
+            "sequence_mean_logprob_delta": group_effect,
+            "sequence_behavior_drop": -float(group_effect),
+            "abs_sequence_behavior_delta": abs(float(group_effect)),
+            "target_logprob_delta": group_effect,
+            "target_logprob_delta_legacy": group_effect,
+        })
+        recovery = compute_causal_recovery_metrics(
+            baseline_trace, after[3], route=route, target_layer=layer,
+            baseline_final_residual=baseline_residual[
+                0, runtime["target_position"]],
+            intervention_final_residual=residual[
+                0, runtime["target_position"]],
+            baseline_logits=baseline_logits, intervention_logits=logits,
+            target_position=runtime["target_position"])
+        result_rows.append({
+            **common,
+            "status": "ready",
+            "actual_group_size": len(group),
+            **output_metrics,
+            "behavior_score_drop": output_metrics["sequence_behavior_drop"],
+            "next_token_kl": output_metrics["target_distribution_kl"],
+            "final_residual_cosine": _cosine(
+                baseline_residual[0, runtime["target_position"]],
+                residual[0, runtime["target_position"]]),
+            "single_member_signed_effects": signed_singles,
+            "single_member_abs_effects": abs_singles,
+            **additivity,
+            "all_member_singles_available": True,
+            "missing_member_single_count": 0,
+            "size_one_exact_invariant": len(group) != 1 or (
+                additivity["magnitude_synergy"] == 0.0
+                and additivity["signed_additivity_residual"] == 0.0
+                and additivity["group_effect_over_sum_single_abs_effect"] == 1.0
+                and additivity["group_effect_over_max_single_abs_effect"] == 1.0),
+            "synergy": additivity["magnitude_synergy"],
+            "synergy_deprecated_alias_for": "magnitude_synergy",
+            "sum_single_effect": additivity["sum_single_abs_effect"],
+            "sum_single_effect_deprecated_alias_for": "sum_single_abs_effect",
+            "group_effect_over_sum_single_effect": additivity[
+                "group_effect_over_sum_single_abs_effect"],
+            "group_effect_over_sum_single_effect_deprecated_alias_for": (
+                "group_effect_over_sum_single_abs_effect"),
+            **recovery,
+        })
     valid = [row for row in result_rows if row.get("status") == "ready"]
 
     def grouped(key: str, offset: int) -> Dict[str, Any]:
@@ -3620,41 +5506,108 @@ def run_group_causal_intervention(
         }
 
     by_type = grouped("group_type", 100)
-    def comparison(left: str, right: str) -> Dict[str, Any]:
-        left_value = (by_type.get(left) or {}).get(
-            "mean_abs_target_logprob_delta")
-        right_value = (by_type.get(right) or {}).get(
-            "mean_abs_target_logprob_delta")
-        return {
-            "left": left, "right": right,
-            "mean_effect_difference": (
-                float(left_value) - float(right_value)
-                if left_value is not None and right_value is not None else None),
-        }
+    comparisons = {
+        "reciprocal_functional_neighbors_vs_random_active_size_matched":
+            _paired_group_comparison(
+                valid, "reciprocal_functional_neighbors",
+                "random_active_size_matched", seed_value + 1001),
+        "reciprocal_functional_neighbors_vs_random_active_contribution_matched":
+            _paired_group_comparison(
+                valid, "reciprocal_functional_neighbors",
+                "random_active_contribution_matched", seed_value + 1002),
+        "reciprocal_function_activation_neighbors_vs_random_active_contribution_matched":
+            _paired_group_comparison(
+                valid, "reciprocal_function_activation_neighbors",
+                "random_active_contribution_matched", seed_value + 1003),
+        "address_neighbors_vs_reciprocal_functional_neighbors":
+            _paired_group_comparison(
+                valid, "address_neighbors",
+                "reciprocal_functional_neighbors", seed_value + 1004),
+        "coactivation_neighbors_vs_reciprocal_functional_neighbors":
+            _paired_group_comparison(
+                valid, "coactivation_neighbors",
+                "reciprocal_functional_neighbors", seed_value + 1005),
+    }
+    functional_control = comparisons[
+        "reciprocal_functional_neighbors_vs_random_active_contribution_matched"]
+    functional_ci = functional_control.get("bootstrap_ci95") or [None, None]
+    redundancy_supported = bool(
+        functional_control.get("paired_mean_difference") is not None
+        and float(functional_control["paired_mean_difference"]) > 0.0
+        and functional_ci[0] is not None and float(functional_ci[0]) > 0.0)
+    partial_rows = [row for row in result_rows if row.get("status") != "ready"]
+    high_match_error_count = sum(
+        row.get("reason") == "contribution_match_error_exceeds_limit"
+        for row in partial_rows)
+    partial_by_reason = {
+        reason: sum(row.get("reason") == reason for row in partial_rows)
+        for reason in sorted({str(row.get("reason")) for row in partial_rows})
+    }
+    partial_by_pool = {
+        pool: sum(str(row.get("pool")) == pool for row in partial_rows)
+        for pool in sorted({str(row.get("pool")) for row in partial_rows})
+    }
+    size_one_rows = [
+        row for row in valid if int(row.get("actual_group_size", 0)) == 1]
     summary = {
-        "status": "ready" if valid else "partial",
+        "status": "partial" if partial_rows or not valid else "ready",
         "fixed_width": max_width,
         "group_sizes": sizes,
+        "group_types": list(local_group_types) + [
+            "random_active_contribution_matched"],
+        "single_effect_cache_key": [
+            "prompt_id", "route", "layer", "operator_id"],
+        "planned_unique_member_single_count": len(planned_single_keys),
+        "computed_or_reused_member_single_count": len(single_rows),
+        "random_match_draws": random_match_draws,
+        "contribution_match_max_relative_error": max_match_error,
+        "zero_size_group_parity": {
+            "machine_exact": bool(zero_size_parity_rows) and all(
+                all(value for key, value in row.items()
+                    if key.endswith("_machine_exact"))
+                for row in zero_size_parity_rows),
+            "num_comparisons": len(zero_size_parity_rows),
+            "rows": zero_size_parity_rows,
+        },
+        "size_one_exact_invariant": {
+            "machine_exact": bool(size_one_rows) and all(
+                row.get("size_one_exact_invariant") is True
+                for row in size_one_rows),
+            "ready_row_count": len(size_one_rows),
+        },
         "by_pool": grouped("pool", 200),
         "by_group_type": by_type,
         "by_group_size": grouped("requested_group_size", 300),
         "by_phenomenon": grouped("phenomenon", 400),
-        "comparisons": {
-            "functional_family_vs_random_active_size_matched": comparison(
-                "functional_family", "random_active_size_matched"),
-            "address_neighbors_vs_functional_family": comparison(
-                "address_neighbors", "functional_family"),
-            "coactivation_neighbors_vs_functional_family": comparison(
-                "coactivation_neighbors", "functional_family"),
-            "group_size_dose_response": grouped("requested_group_size", 500),
-            "synergy_distribution": _group_summary(valid, seed_value + 600),
+        "paired_comparisons": comparisons,
+        "paired_dose_response": _paired_dose_response(valid),
+        "synergy_distribution": _group_summary(valid, seed_value + 600),
+        "functional_redundancy_supported": {
+            "supported": redundancy_supported,
+            "evidence": functional_control,
+            "limitations": [] if redundancy_supported else [
+                "Reciprocal functional groups did not have a positive paired "
+                "bootstrap interval over contribution-matched controls."],
         },
+        "partial_row_count": len(partial_rows),
+        "partial_rows_by_reason": partial_by_reason,
+        "partial_rows_by_pool": partial_by_pool,
+        "high_contribution_match_error_count": high_match_error_count,
         "artifacts": {
             "rows": ctx.store.path("group_interventions.jsonl"),
+            "member_singles": ctx.store.path(
+                "group_member_single_interventions.jsonl"),
             "summary": ctx.store.path("group_intervention_summary.json"),
         },
     }
+    if high_match_error_count:
+        summary["warning"] = (
+            f"{high_match_error_count} contribution-matched controls exceeded "
+            "the configured relative match error and remain partial")
     if ctx.is_primary:
+        write_jsonl_atomic(
+            ctx.store.path("group_member_single_interventions.jsonl"),
+            single_rows)
         write_jsonl_atomic(ctx.store.path("group_interventions.jsonl"), result_rows)
         write_json_atomic(ctx.store.path("group_intervention_summary.json"), summary)
     summary["_rows"] = result_rows
@@ -3665,10 +5618,10 @@ RANKING_CORRELATION_PAIRS = (
     ("candidate_gate", "candidate_local_contribution"),
     ("candidate_gate", "immediate_causal_delta"),
     ("candidate_local_contribution", "immediate_causal_delta"),
-    ("immediate_causal_delta", "final_residual_delta"),
-    ("immediate_causal_delta", "abs_target_logprob_delta"),
-    ("candidate_gate", "abs_target_logprob_delta"),
-    ("candidate_local_contribution", "abs_target_logprob_delta"),
+    ("immediate_causal_delta", "final_relative_residual_delta"),
+    ("immediate_causal_delta", "abs_sequence_behavior_delta"),
+    ("candidate_gate", "abs_sequence_behavior_delta"),
+    ("candidate_local_contribution", "abs_sequence_behavior_delta"),
 )
 
 
@@ -3724,7 +5677,8 @@ def _ranking_correlation_block(
 
 def run_causal_ranking_calibration(
         ctx: AnalysisContext, causal_rows: Sequence[Mapping[str, Any]],
-        group_summary: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        group_summary: Optional[Mapping[str, Any]] = None,
+        recovery_summary: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     rows = []
     for row in causal_rows:
         if row.get("status") != "ready":
@@ -3742,10 +5696,9 @@ def run_causal_ranking_calibration(
             "candidate_local_contribution": row.get(
                 "sidecar_estimated_abs_post_denominator_coefficient"),
             "immediate_causal_delta": row.get("immediate_delta_norm"),
-            "final_residual_delta": row.get("final_delta_norm"),
-            "abs_target_logprob_delta": (
-                abs(float(row["target_logprob_delta"]))
-                if _json_float(row.get("target_logprob_delta")) is not None else None),
+            "final_relative_residual_delta": row.get("final_relative_delta"),
+            "abs_sequence_behavior_delta": row.get(
+                "abs_sequence_behavior_delta"),
             "full_output_kl": row.get("full_output_kl"),
         })
     seed = int(ctx.config.get("seed", 0))
@@ -3769,7 +5722,8 @@ def run_causal_ranking_calibration(
         ("matched_active", "active_random"),
     )
     metric_keys = (
-        "abs_target_logprob_delta", "immediate_causal_delta", "full_output_kl")
+        "abs_sequence_behavior_delta", "immediate_causal_delta",
+        "full_output_kl")
     pairwise = {
         f"{left}_gt_{right}": {
             metric: pairwise_win_rate(rows, left, right, metric)
@@ -3781,28 +5735,26 @@ def run_causal_ranking_calibration(
     local = overall.get(
         "candidate_local_contribution_vs_immediate_causal_delta", {})
     immediate_final = overall.get(
-        "immediate_causal_delta_vs_abs_target_logprob_delta", {})
+        "immediate_causal_delta_vs_abs_sequence_behavior_delta", {})
     gate = overall.get("candidate_gate_vs_immediate_causal_delta", {})
     local_ci = local.get("bootstrap_ci95") or [None, None]
     final_ci = immediate_final.get("bootstrap_ci95") or [None, None]
     gate_ci = gate.get("bootstrap_ci95") or [None, None]
     group_summary = dict(group_summary or {})
-    type_summary = group_summary.get("by_group_type", {})
-    functional = type_summary.get("functional_family", {})
-    random_group = type_summary.get("random_active_size_matched", {})
-    functional_effect = functional.get("mean_abs_target_logprob_delta")
-    random_effect = random_group.get("mean_abs_target_logprob_delta")
-    synergy_ci = functional.get("synergy_ci95") or [None, None]
+    functional_redundancy = group_summary.get(
+        "functional_redundancy_supported", {})
+    recovery_summary = dict(recovery_summary or {})
+    downstream_compensation = recovery_summary.get(
+        "downstream_compensation_dominant", {})
     judgments = {
         "local_ranking_valid": {
             "supported": bool(local_ci[0] is not None and local_ci[0] > 0.0),
             "evidence": local,
         },
         "downstream_compensation_dominant": {
-            "supported": bool(
-                final_ci[0] is not None and final_ci[1] is not None
-                and final_ci[0] <= 0.0 <= final_ci[1]),
-            "evidence": immediate_final,
+            "supported": bool(downstream_compensation.get("supported")),
+            "evidence": downstream_compensation.get(
+                "evidence", immediate_final),
         },
         "gate_ranking_weak": {
             "supported": bool(
@@ -3813,15 +5765,9 @@ def run_causal_ranking_calibration(
                      or abs(float(local["spearman"])) > abs(float(gate["spearman"])))),
             "evidence": {"gate": gate, "local_contribution": local},
         },
-        "functional_redundancy_candidate": {
-            "supported": bool(
-                functional_effect is not None and random_effect is not None
-                and float(functional_effect) > float(random_effect)
-                and synergy_ci[0] is not None and synergy_ci[0] > 0.0),
-            "evidence": {
-                "functional_family": functional,
-                "random_active_size_matched": random_group,
-            },
+        "functional_redundancy_supported": {
+            "supported": bool(functional_redundancy.get("supported")),
+            "evidence": functional_redundancy.get("evidence", {}),
         },
     }
     summary = {
@@ -3854,7 +5800,13 @@ def _failed_analysis_item(item: str, exc: Exception) -> Dict[str, Any]:
     }
 
 
-def _dependency_failed_item(item: str, dependencies: Sequence[str]) -> Dict[str, Any]:
+def _dependency_failed_item(
+        item: str, dependencies: Sequence[str],
+        ctx: Optional[AnalysisContext] = None) -> Dict[str, Any]:
+    if ctx is not None and bool(getattr(ctx.args, "fail_fast", False)):
+        raise RuntimeError(
+            f"{item} dependencies did not produce reusable rows: "
+            f"{','.join(dependencies)}")
     return {
         "status": "failed",
         "error": "required dependency did not produce reusable ready/partial rows",
@@ -3869,6 +5821,8 @@ def run_v4171_transition_items(
 ) -> Dict[str, Any]:
     requested = set(items)
     execute = set(requested)
+    if "causal_rerouting_trace" in execute:
+        execute.update(("trajectory_trace", "causal_intervention"))
     if "causal_recovery_trace" in execute:
         execute.add("causal_intervention")
     if "operator_functional_graph" in execute:
@@ -3953,28 +5907,67 @@ def run_v4171_transition_items(
             except RuntimeError as exc:
                 if "parity" in str(exc).lower():
                     raise
+                if bool(getattr(ctx.args, "fail_fast", False)):
+                    raise
                 causal_summary = _failed_analysis_item(
                     "causal_intervention", exc)
             except Exception as exc:
+                if bool(getattr(ctx.args, "fail_fast", False)):
+                    raise
                 causal_summary = _failed_analysis_item(
                     "causal_intervention", exc)
         if "causal_intervention" in requested:
             result["causal_intervention"] = causal_summary
+    rerouting_summary: Dict[str, Any] = {}
+    if "causal_rerouting_trace" in selected:
+        rerouting_summary = _load_resumable_summary(
+            ctx, "causal_rerouting_summary.json", prompt_hash,
+            required_keys=("capture_reliability", "path_dependence_supported")) or {}
+        rerouting_path = ctx.store.path("causal_rerouting_traces.jsonl")
+        if rerouting_summary and not exists(rerouting_path):
+            rerouting_summary = {}
+        if not rerouting_summary:
+            if not causal_rows:
+                rerouting_summary = _dependency_failed_item(
+                    "causal_rerouting_trace", ("causal_intervention",), ctx)
+            else:
+                try:
+                    rerouting_summary = run_causal_rerouting_trace(ctx, records)
+                    rerouting_summary.pop("_rows", None)
+                except RuntimeError as exc:
+                    if "exact no-op" in str(exc).lower():
+                        raise
+                    if bool(getattr(ctx.args, "fail_fast", False)):
+                        raise
+                    rerouting_summary = _failed_analysis_item(
+                        "causal_rerouting_trace", exc)
+                except Exception as exc:
+                    if bool(getattr(ctx.args, "fail_fast", False)):
+                        raise
+                    rerouting_summary = _failed_analysis_item(
+                        "causal_rerouting_trace", exc)
+        if "causal_rerouting_trace" in requested:
+            result["causal_rerouting_trace"] = rerouting_summary
     recovery_summary: Dict[str, Any] = {}
     if "causal_recovery_trace" in selected:
         recovery_summary = _load_resumable_summary(
             ctx, "causal_recovery_summary.json", prompt_hash,
             required_keys=("overall", "classification_basis")) or {}
+        if recovery_summary and not exists(
+                ctx.store.path("causal_recovery_traces.jsonl")):
+            recovery_summary = {}
         if not recovery_summary:
             if not causal_rows:
                 recovery_summary = _dependency_failed_item(
-                    "causal_recovery_trace", ("causal_intervention",))
+                    "causal_recovery_trace", ("causal_intervention",), ctx)
             else:
                 try:
                     recovery_summary = run_causal_recovery_trace(
                         ctx, causal_rows)
                     recovery_summary.pop("_rows", None)
                 except Exception as exc:
+                    if bool(getattr(ctx.args, "fail_fast", False)):
+                        raise
                     recovery_summary = _failed_analysis_item(
                         "causal_recovery_trace", exc)
         if "causal_recovery_trace" in requested:
@@ -3995,6 +5988,8 @@ def run_v4171_transition_items(
                     ctx, records, causal_rows)
                 graph_state = dict(graph_summary.pop("_graph_state", {}))
             except Exception as exc:
+                if bool(getattr(ctx.args, "fail_fast", False)):
+                    raise
                 graph_summary = _failed_analysis_item(
                     "operator_functional_graph", exc)
         if "operator_functional_graph" in requested:
@@ -4003,7 +5998,13 @@ def run_v4171_transition_items(
     if "group_causal_intervention" in selected:
         group_summary = _load_resumable_summary(
             ctx, "group_intervention_summary.json", prompt_hash,
-            required_keys=("by_group_type", "group_sizes")) or {}
+            required_keys=(
+                "by_group_type", "group_sizes", "zero_size_group_parity",
+                "size_one_exact_invariant")) or {}
+        if group_summary and not all(exists(ctx.store.path(path)) for path in (
+                "group_interventions.jsonl",
+                "group_member_single_interventions.jsonl")):
+            group_summary = {}
         if not group_summary:
             if not causal_rows or not graph_state:
                 failed = []
@@ -4012,7 +6013,7 @@ def run_v4171_transition_items(
                 if not graph_state:
                     failed.append("operator_functional_graph")
                 group_summary = _dependency_failed_item(
-                    "group_causal_intervention", failed)
+                    "group_causal_intervention", failed, ctx)
             else:
                 try:
                     group_summary = run_group_causal_intervention(
@@ -4021,9 +6022,13 @@ def run_v4171_transition_items(
                 except RuntimeError as exc:
                     if "parity" in str(exc).lower():
                         raise
+                    if bool(getattr(ctx.args, "fail_fast", False)):
+                        raise
                     group_summary = _failed_analysis_item(
                         "group_causal_intervention", exc)
                 except Exception as exc:
+                    if bool(getattr(ctx.args, "fail_fast", False)):
+                        raise
                     group_summary = _failed_analysis_item(
                         "group_causal_intervention", exc)
         if "group_causal_intervention" in requested:
@@ -4032,15 +6037,20 @@ def run_v4171_transition_items(
         ranking = _load_resumable_summary(
             ctx, "causal_ranking_calibration.json", prompt_hash,
             required_keys=("correlations", "pairwise_win_rates"))
+        if ranking is not None and not exists(
+                ctx.store.path("causal_ranking_rows.csv")):
+            ranking = None
         if ranking is None:
             if not causal_rows:
                 ranking = _dependency_failed_item(
-                    "causal_ranking_calibration", ("causal_intervention",))
+                    "causal_ranking_calibration", ("causal_intervention",), ctx)
             else:
                 try:
                     ranking = run_causal_ranking_calibration(
-                        ctx, causal_rows, group_summary)
+                        ctx, causal_rows, group_summary, recovery_summary)
                 except Exception as exc:
+                    if bool(getattr(ctx.args, "fail_fast", False)):
+                        raise
                     ranking = _failed_analysis_item(
                         "causal_ranking_calibration", exc)
         if "causal_ranking_calibration" in requested:
@@ -4063,11 +6073,13 @@ def run_v4171_transition_items(
             value.update(provenance)
             value.setdefault("dependencies", list(ITEM_DEPENDENCIES.get(key, ())))
     for value in (
-            causal_summary, recovery_summary, graph_summary, group_summary):
+            causal_summary, rerouting_summary, recovery_summary,
+            graph_summary, group_summary):
         if value:
             value.update(provenance)
     for key, value in (
             ("causal_intervention", causal_summary),
+            ("causal_rerouting_trace", rerouting_summary),
             ("causal_recovery_trace", recovery_summary),
             ("operator_functional_graph", graph_summary),
             ("group_causal_intervention", group_summary)):
@@ -4101,6 +6113,7 @@ def run_v4171_transition_items(
             "context_divergence": "context_divergence.json",
             "state_transition_decoupling": "state_transition_decoupling.json",
             "causal_intervention": "causal_intervention_summary.json",
+            "causal_rerouting_trace": "causal_rerouting_summary.json",
             "causal_recovery_trace": "causal_recovery_summary.json",
             "operator_functional_graph": "operator_functional_graph_summary.json",
             "group_causal_intervention": "group_intervention_summary.json",
@@ -4115,6 +6128,7 @@ def run_v4171_transition_items(
             "state_transition_decoupling": result.get(
                 "state_transition_decoupling", {}),
             "causal_intervention": causal_summary,
+            "causal_rerouting_trace": rerouting_summary,
             "causal_recovery_trace": recovery_summary,
             "operator_functional_graph": graph_summary,
             "group_causal_intervention": group_summary,

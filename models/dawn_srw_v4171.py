@@ -3944,7 +3944,12 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         v_normalized_srw_out_norm * v_scale,
     )
     if parity_debug:
-        return result + ((q_debug, k_debug, v_debug, out),)
+        return result + ((
+            q_debug, k_debug, v_debug, out, x,
+            q_operator_query, k_operator_query, v_operator_query,
+            raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2],
+            raw_tau_all[:, :, 2:3],
+        ),)
     return result
 
 
@@ -4039,7 +4044,7 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         rst_normalized_srw_out_norm * rst_scale,
     )
     if parity_debug:
-        return result + ((out,),)
+        return result + ((out, x, operator_query, raw_tau),)
     return result
 
 
@@ -5119,6 +5124,7 @@ class DAWN_SRW_V4171(nn.Module):
 
                 def scan_body_minimal(carry, xs):
                     x = carry
+                    pre_layer_residual = x
                     bp = xs['params']
                     rng = xs['rng']
                     layer_index = xs['layer_index']
@@ -5281,15 +5287,41 @@ class DAWN_SRW_V4171(nn.Module):
                             residual_norm.astype(jnp.float32)),
                     )
                     if trace_minimal_layers:
-                        layer_stats += (
+                        trace_values = (
+                            pre_layer_residual,
                             attn_debug[0],
                             attn_debug[1],
                             attn_debug[2],
                             attn_debug[3],
+                            attn_debug[4],
+                            attn_debug[5],
+                            attn_debug[6],
+                            attn_debug[7],
+                            attn_debug[8],
+                            attn_debug[9],
+                            attn_debug[10],
                             post_attention_residual,
                             rst_debug[0],
+                            rst_debug[1],
+                            rst_debug[2],
+                            rst_debug[3],
                             x_next,
                         )
+                        if analysis_causal_trace and not analysis_parity_debug:
+                            trace_batch = jnp.arange(B, dtype=jnp.int32)
+                            trace_positions = jnp.clip(
+                                jnp.asarray(
+                                    analysis_target_positions,
+                                    dtype=jnp.int32),
+                                0, S - 1)
+
+                            def target_debug(value):
+                                return value[
+                                    trace_batch, trace_positions, :]
+
+                            trace_values = tuple(
+                                target_debug(value) for value in trace_values)
+                        layer_stats += trace_values
                     return x_next, layer_stats
 
                 if self.gradient_checkpointing:
@@ -5303,11 +5335,19 @@ class DAWN_SRW_V4171(nn.Module):
                 x, minimal_stats = jax.lax.scan(
                     scan_body_minimal, x, xs_minimal)
                 if trace_minimal_layers:
-                    minimal_values = minimal_stats[:-7]
-                    (parity_q_all, parity_k_all, parity_v_all,
+                    minimal_values = minimal_stats[:-18]
+                    (parity_pre_layer_residual_all,
+                     parity_q_all, parity_k_all, parity_v_all,
                      parity_attention_update_all,
+                     parity_attention_router_input_all,
+                     parity_query_q_all, parity_query_k_all,
+                     parity_query_v_all,
+                     parity_raw_tau_q_all, parity_raw_tau_k_all,
+                     parity_raw_tau_v_all,
                      parity_post_attention_residual_all, parity_rst_all,
-                     parity_post_layer_residual_all) = minimal_stats[-7:]
+                     parity_rst_router_input_all, parity_query_rst_all,
+                     parity_raw_tau_rst_all,
+                     parity_post_layer_residual_all) = minimal_stats[-18:]
                 else:
                     minimal_values = minimal_stats
                 (q_active_all, k_active_all, v_active_all, rst_active_all,
@@ -5367,16 +5407,36 @@ class DAWN_SRW_V4171(nn.Module):
                         0, S - 1)
 
                     def target_trace(value):
+                        if value.ndim == 3:
+                            return value
                         return value[:, trace_batch, trace_positions, :]
 
                     causal_trace = {
+                        'pre_layer_residual': target_trace(
+                            parity_pre_layer_residual_all),
+                        'attention_router_input': target_trace(
+                            parity_attention_router_input_all),
+                        'query_q': target_trace(parity_query_q_all),
+                        'query_k': target_trace(parity_query_k_all),
+                        'query_v': target_trace(parity_query_v_all),
+                        'raw_tau_q': target_trace(parity_raw_tau_q_all),
+                        'raw_tau_k': target_trace(parity_raw_tau_k_all),
+                        'raw_tau_v': target_trace(parity_raw_tau_v_all),
+                        'route_transition_q': target_trace(parity_q_all),
+                        'route_transition_k': target_trace(parity_k_all),
+                        'route_transition_v': target_trace(parity_v_all),
                         'post_attention_residual': target_trace(
                             parity_post_attention_residual_all),
-                        'post_layer_residual': target_trace(
-                            parity_post_layer_residual_all),
                         'attention_update': target_trace(
                             parity_attention_update_all),
+                        'rst_router_input': target_trace(
+                            parity_rst_router_input_all),
+                        'query_rst': target_trace(parity_query_rst_all),
+                        'raw_tau_rst': target_trace(parity_raw_tau_rst_all),
+                        'route_transition_rst': target_trace(parity_rst_all),
                         'rst_update': target_trace(parity_rst_all),
+                        'post_layer_residual': target_trace(
+                            parity_post_layer_residual_all),
                     }
                 x = self.norm(x)
                 if labels is None:
