@@ -185,101 +185,93 @@ def main() -> None:
         "rst_single_suppression_minimal": suppression_single,
         "attn_qk_paired_suppression_minimal": suppression_paired,
     }
-    production_kwargs = {
+    model_kwargs = {
         "deterministic": True,
         "rngs": {"dropout": jax.random.PRNGKey(9)},
         "sharded_fns": sharded_fns,
         "analysis": False,
         "minimal_train": True,
         "analysis_return_residual": True,
+        "analysis_return_logits": True,
         "compute_accuracy": False,
     }
-    production_model = model.apply(variables, input_ids, **production_kwargs)
-    analysis_kwargs = {
-        key: value for key, value in production_kwargs.items()
-        if key not in {"minimal_train", "analysis_return_residual"}
-    }
-    disabled_model = model.apply(
-        variables, input_ids, selected_zero, jnp.int32(0), positions,
-        jnp.int32(0), method=model.analysis_forward_with_operator_suppression,
-        apply_suppression=False, return_residual=True, **analysis_kwargs)
-    assert np.array_equal(
-        np.asarray(production_model["logits"]),
-        np.asarray(disabled_model["logits"]))
-    assert np.array_equal(
-        np.asarray(production_model["final_residual"]),
-        np.asarray(disabled_model["final_residual"]))
-    production_labeled = model.apply(
-        variables, input_ids, labels=input_ids,
-        analysis_return_logits=True, **production_kwargs)
-    disabled_labeled = model.apply(
-        variables, input_ids, selected_zero, jnp.int32(0), positions,
-        jnp.int32(0), labels=input_ids,
-        method=model.analysis_forward_with_operator_suppression,
-        apply_suppression=False, return_residual=True,
-        analysis_return_logits=True, **analysis_kwargs)
-    assert np.array_equal(
-        np.asarray(production_labeled["logits"]),
-        np.asarray(disabled_labeled["logits"]))
-    assert np.array_equal(
-        np.asarray(production_labeled["per_token_ce"]),
-        np.asarray(disabled_labeled["per_token_ce"]))
-    assert np.array_equal(
-        np.asarray(production_labeled["final_residual"]),
-        np.asarray(disabled_labeled["final_residual"]))
 
-    non_target_layer = model.apply(
-        variables, input_ids, selected_zero, jnp.int32(1), positions,
-        jnp.int32(0), labels=input_ids,
-        method=model.analysis_forward_with_operator_suppression,
-        apply_suppression=True, return_residual=True, **analysis_kwargs)
-    non_target_route = model.apply(
-        variables, input_ids, selected_zero, jnp.int32(0), positions,
-        jnp.int32(4), labels=input_ids,
-        method=model.analysis_forward_with_operator_suppression,
-        apply_suppression=True, return_residual=True, **analysis_kwargs)
-    non_target_layer_logits = model.apply(
-        variables, input_ids, selected_zero, jnp.int32(1), positions,
-        jnp.int32(0),
-        method=model.analysis_forward_with_operator_suppression,
-        apply_suppression=True, return_residual=True, **analysis_kwargs)
-    non_target_route_logits = model.apply(
-        variables, input_ids, selected_zero, jnp.int32(0), positions,
-        jnp.int32(4),
-        method=model.analysis_forward_with_operator_suppression,
-        apply_suppression=True, return_residual=True, **analysis_kwargs)
-    for noop in (non_target_layer_logits, non_target_route_logits):
-        assert np.array_equal(
-            np.asarray(production_model["logits"]),
-            np.asarray(noop["logits"]))
-        assert np.array_equal(
-            np.asarray(production_model["final_residual"]),
-            np.asarray(noop["final_residual"]))
-    for noop in (non_target_layer, non_target_route):
-        assert np.array_equal(
-            np.asarray(production_labeled["per_token_ce"]),
-            np.asarray(noop["per_token_ce"]))
-        assert np.array_equal(
-            np.asarray(production_labeled["final_residual"]),
-            np.asarray(noop["final_residual"]))
+    @jax.jit
+    def canonical_model_forward(
+            params, token_ids, target_positions, target_layer, target_route,
+            selected_operator_ids, apply_suppression):
+        result = model.apply(
+            params,
+            token_ids,
+            labels=token_ids,
+            analysis_contribution=selected_operator_ids,
+            analysis_target_layer=target_layer,
+            analysis_target_positions=target_positions,
+            analysis_target_route=target_route,
+            analysis_intervention_enabled=apply_suppression,
+            **model_kwargs,
+        )
+        return (result["logits"], result["per_token_ce"],
+                result["final_residual"])
+
+    neutral_positions = jnp.full((batch,), -1, dtype=jnp.int32)
+    neutral_operators = jnp.full((batch,), -1, dtype=jnp.int32)
+    canonical_baseline = canonical_model_forward(
+        variables, input_ids, neutral_positions, jnp.int32(-1),
+        jnp.int32(-1), neutral_operators, jnp.bool_(False))
+    repeated_baseline = canonical_model_forward(
+        variables, input_ids, neutral_positions, jnp.int32(-1),
+        jnp.int32(-1), neutral_operators, jnp.bool_(False))
+    disabled_model = canonical_model_forward(
+        variables, input_ids, positions, jnp.int32(0), jnp.int32(0),
+        selected_zero, jnp.bool_(False))
+    non_target_layer = canonical_model_forward(
+        variables, input_ids, positions, jnp.int32(1), jnp.int32(0),
+        selected_zero, jnp.bool_(True))
+    non_target_route = canonical_model_forward(
+        variables, input_ids, positions, jnp.int32(0), jnp.int32(4),
+        selected_zero, jnp.bool_(True))
+    inactive_operator = canonical_model_forward(
+        variables, input_ids, positions, jnp.int32(0), jnp.int32(0),
+        neutral_operators, jnp.bool_(True))
+    for noop in (
+            repeated_baseline, disabled_model, non_target_layer,
+            non_target_route, inactive_operator):
+        assert _all_exact(canonical_baseline, noop)
 
     changed_routes = []
     for route in range(4):
-        changed = model.apply(
-            variables, input_ids, selected_zero, jnp.int32(0), positions,
-            jnp.int32(route),
-            method=model.analysis_forward_with_operator_suppression,
-            apply_suppression=True, return_residual=True, **analysis_kwargs)
+        changed = canonical_model_forward(
+            variables, input_ids, positions, jnp.int32(0),
+            jnp.int32(route), selected_zero, jnp.bool_(True))
         changed_routes.append(not np.array_equal(
-            np.asarray(disabled_model["final_residual"]),
-            np.asarray(changed["final_residual"])))
+            np.asarray(disabled_model[2]), np.asarray(changed[2])))
         assert np.array_equal(
-            np.asarray(disabled_model["final_residual"][:, 0]),
-            np.asarray(changed["final_residual"][:, 0]))
+            np.asarray(disabled_model[2][:, 0]),
+            np.asarray(changed[2][:, 0]))
     assert all(changed_routes), changed_routes
+    debug_result = model.apply(
+        variables,
+        input_ids,
+        labels=input_ids,
+        analysis_contribution=neutral_operators,
+        analysis_target_layer=jnp.int32(-1),
+        analysis_target_positions=neutral_positions,
+        analysis_target_route=jnp.int32(-1),
+        analysis_intervention_enabled=jnp.bool_(False),
+        analysis_parity_debug=True,
+        **model_kwargs,
+    )
+    assert set(debug_result["parity_debug"]) == {
+        "q", "k", "v", "attention_update", "rst",
+        "post_layer_residual",
+    }
+    assert all(
+        value.shape[0] == model.n_layers
+        for value in debug_result["parity_debug"].values())
     print("PRODUCTION_CORE_INITIALIZED_MODEL_OK")
     print(
-        "PRODUCTION_CORE_ZERO_PARITY_OK machine_exact=True "
+        "CANONICAL_CAUSAL_ZERO_PARITY_OK machine_exact=True "
         "max_logit_abs_diff=0 ce_abs_diff=0 "
         "final_residual_max_abs_diff=0")
 

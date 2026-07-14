@@ -3549,38 +3549,30 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         fused_single_v = sharded_fns.get(
             'attn_v_single_minimal',
             sharded_fns.get('attn_v_single', sharded_fns['single']))
-        suppression_paired = None
-        suppression_single_v = None
-        if analysis_selected_operator_id is not None:
-            suppression_paired = sharded_fns[
-                'attn_qk_paired_suppression_minimal']
-            suppression_single_v = sharded_fns[
-                'attn_v_single_suppression_minimal']
     else:
         fused_single_v, fused_paired = sharded_fns
-        suppression_paired = None
-        suppression_single_v = None
+    canonical_paired = getattr(
+        fused_paired, '_v4171_canonical_shard_map_kernel', None)
+    canonical_single_v = getattr(
+        fused_single_v, '_v4171_canonical_shard_map_kernel', None)
+    if canonical_paired is None or canonical_single_v is None:
+        raise ValueError(
+            "minimal attention requires canonical v4171 shard-map kernels")
 
     h_QK = jnp.stack([h_Q, h_K], axis=2)
     raw_tau_QK = jnp.stack(
         [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
-    if analysis_selected_operator_id is None:
-        qk_result = fused_paired(
-            x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
-            soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps)
-    else:
-        apply_qk = (
-            jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
-            & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
-               == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
-            & (jnp.asarray(analysis_target_route, dtype=jnp.int32) < 2))
-        qk_result = suppression_paired(
-            x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
-            soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps,
-            analysis_selected_operator_id, analysis_target_positions,
-            apply_qk, analysis_target_route)
+    apply_qk = (
+        jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
+        & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
+           == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
+        & (jnp.asarray(analysis_target_route, dtype=jnp.int32) < 2))
+    qk_result = canonical_paired(
+        x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
+        soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
+        soft_gate_boundary_power_final, execution_prune_eps,
+        analysis_selected_operator_id, analysis_target_positions,
+        apply_qk, analysis_target_route)
     (QK_out,
      q_active_frac, k_active_frac,
      q_active_n_mean, k_active_n_mean,
@@ -3598,23 +3590,16 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
      q_normalized_srw_out_norm, k_normalized_srw_out_norm) = qk_result
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
-    if analysis_selected_operator_id is None:
-        v_result = fused_single_v(
-            x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
-            soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps)
-    else:
-        apply_v = (
-            jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
-            & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
-               == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
-            & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == 2))
-        v_result = suppression_single_v(
-            x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
-            soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps,
-            analysis_selected_operator_id, analysis_target_positions,
-            apply_v)
+    apply_v = (
+        jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
+        & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
+           == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
+        & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == 2))
+    v_result = canonical_single_v(
+        x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
+        soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
+        soft_gate_boundary_power_final, execution_prune_eps,
+        analysis_selected_operator_id, analysis_target_positions, apply_v)
     (V, v_active_frac, v_active_n_mean, v_gate_mass_mean, v_gate_den_mean,
      v_depth_active_mean, v_gate_eff_n_mean, v_top1_gate_frac_mean,
      v_den_floor_frac, v_tau_mean,
@@ -3751,30 +3736,24 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         fused_single = sharded_fns.get(
             'rst_single_minimal',
             sharded_fns.get('rst_single', sharded_fns['single']))
-        suppression_single = None
-        if analysis_selected_operator_id is not None:
-            suppression_single = sharded_fns['rst_single_suppression_minimal']
     else:
         fused_single, _ = sharded_fns
-        suppression_single = None
+    canonical_single = getattr(
+        fused_single, '_v4171_canonical_shard_map_kernel', None)
+    if canonical_single is None:
+        raise ValueError(
+            "minimal RST requires a canonical v4171 shard-map kernel")
 
-    if analysis_selected_operator_id is None:
-        rst_result = fused_single(
-            x, h, rst_op_key, raw_tau, rst_read, rst_write,
-            soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps)
-    else:
-        apply_rst = (
-            jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
-            & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
-               == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
-            & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == 3))
-        rst_result = suppression_single(
-            x, h, rst_op_key, raw_tau, rst_read, rst_write,
-            soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps,
-            analysis_selected_operator_id, analysis_target_positions,
-            apply_rst)
+    apply_rst = (
+        jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
+        & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
+           == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
+        & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == 3))
+    rst_result = canonical_single(
+        x, h, rst_op_key, raw_tau, rst_read, rst_write,
+        soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
+        soft_gate_boundary_power_final, execution_prune_eps,
+        analysis_selected_operator_id, analysis_target_positions, apply_rst)
     (out, rst_active_frac, rst_active_n_mean, rst_gate_mass_mean,
      rst_gate_den_mean, rst_depth_active_mean, rst_gate_eff_n_mean,
      rst_top1_gate_frac_mean, rst_den_floor_frac, rst_tau_mean,
@@ -4518,7 +4497,8 @@ class DAWN_SRW_V4171(nn.Module):
                  analysis_target_route=-1,
                  analysis_intervention_enabled=False,
                  analysis_return_residual=False,
-                 analysis_return_logits=False):
+                 analysis_return_logits=False,
+                 analysis_parity_debug=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -4577,6 +4557,34 @@ class DAWN_SRW_V4171(nn.Module):
         B, S = input_ids.shape
         if S > self.max_seq_len:
             raise ValueError(f"Sequence length {S} exceeds max_seq_len")
+
+        if minimal_train:
+            if analysis_contribution is None:
+                analysis_contribution = jnp.full(
+                    (B,), -1, dtype=jnp.int32)
+                analysis_target_positions = jnp.full(
+                    (B,), -1, dtype=jnp.int32)
+                analysis_target_layer = jnp.asarray(-1, dtype=jnp.int32)
+                analysis_target_route = jnp.asarray(-1, dtype=jnp.int32)
+                analysis_intervention_enabled = jnp.asarray(
+                    False, dtype=jnp.bool_)
+            else:
+                analysis_contribution = jnp.asarray(
+                    analysis_contribution, dtype=jnp.int32)
+                if analysis_contribution.ndim == 0:
+                    analysis_contribution = jnp.full(
+                        (B,), analysis_contribution, dtype=jnp.int32)
+                analysis_target_positions = jnp.asarray(
+                    analysis_target_positions, dtype=jnp.int32)
+                if analysis_target_positions.ndim == 0:
+                    analysis_target_positions = jnp.full(
+                        (B,), analysis_target_positions, dtype=jnp.int32)
+                analysis_target_layer = jnp.asarray(
+                    analysis_target_layer, dtype=jnp.int32)
+                analysis_target_route = jnp.asarray(
+                    analysis_target_route, dtype=jnp.int32)
+                analysis_intervention_enabled = jnp.asarray(
+                    analysis_intervention_enabled, dtype=jnp.bool_)
 
         positions = jnp.arange(S)[jnp.newaxis, :]
         vp_embed = (
@@ -4849,27 +4857,7 @@ class DAWN_SRW_V4171(nn.Module):
 
                     normed = _layer_norm(
                         x, bp['norm1']['scale'], bp['norm1']['bias'])
-                    (attn_out, q_active_frac, k_active_frac, v_active_frac,
-                     q_active_n_mean, k_active_n_mean, v_active_n_mean,
-                     q_gate_mass_mean, k_gate_mass_mean, v_gate_mass_mean,
-                     q_gate_den_mean, k_gate_den_mean, v_gate_den_mean,
-                     q_depth_active_mean, k_depth_active_mean,
-                     v_depth_active_mean,
-                     q_gate_eff_n_mean, k_gate_eff_n_mean,
-                     v_gate_eff_n_mean,
-                     q_top1_gate_frac_mean, k_top1_gate_frac_mean,
-                     v_top1_gate_frac_mean,
-                     q_den_floor_frac, k_den_floor_frac, v_den_floor_frac,
-                     q_tau_mean, k_tau_mean, v_tau_mean,
-                     attn_out_norm,
-                     qk_admission_mass_max, qk_composition_den_min,
-                     qk_composition_den_max, qk_raw_srw_out_norm,
-                     qk_normalized_srw_out_norm,
-                     qk_pool_scaled_srw_out_norm,
-                     v_admission_mass_max, v_composition_den_min,
-                     v_composition_den_max, v_raw_srw_out_norm,
-                     v_normalized_srw_out_norm,
-                     v_pool_scaled_srw_out_norm) = _attn_forward_minimal(
+                    attn_result = _attn_forward_minimal(
                         normed, pool_params, router_params,
                         bp['attn']['expand_O']['kernel'], rng_attn,
                         self.n_qk, self.n_v,
@@ -4891,20 +4879,39 @@ class DAWN_SRW_V4171(nn.Module):
                         analysis_target_positions=analysis_target_positions,
                         analysis_target_route=analysis_target_route,
                         analysis_intervention_enabled=(
-                            analysis_intervention_enabled))
+                            analysis_intervention_enabled),
+                        parity_debug=analysis_parity_debug)
+                    if analysis_parity_debug:
+                        attn_values = attn_result[:-1]
+                        attn_debug = attn_result[-1]
+                    else:
+                        attn_values = attn_result
+                    (attn_out, q_active_frac, k_active_frac, v_active_frac,
+                     q_active_n_mean, k_active_n_mean, v_active_n_mean,
+                     q_gate_mass_mean, k_gate_mass_mean, v_gate_mass_mean,
+                     q_gate_den_mean, k_gate_den_mean, v_gate_den_mean,
+                     q_depth_active_mean, k_depth_active_mean,
+                     v_depth_active_mean,
+                     q_gate_eff_n_mean, k_gate_eff_n_mean,
+                     v_gate_eff_n_mean,
+                     q_top1_gate_frac_mean, k_top1_gate_frac_mean,
+                     v_top1_gate_frac_mean,
+                     q_den_floor_frac, k_den_floor_frac, v_den_floor_frac,
+                     q_tau_mean, k_tau_mean, v_tau_mean,
+                     attn_out_norm,
+                     qk_admission_mass_max, qk_composition_den_min,
+                     qk_composition_den_max, qk_raw_srw_out_norm,
+                     qk_normalized_srw_out_norm,
+                     qk_pool_scaled_srw_out_norm,
+                     v_admission_mass_max, v_composition_den_min,
+                     v_composition_den_max, v_raw_srw_out_norm,
+                     v_normalized_srw_out_norm,
+                     v_pool_scaled_srw_out_norm) = attn_values
                     x = x + attn_out
 
                     normed = _layer_norm(
                         x, bp['norm2']['scale'], bp['norm2']['bias'])
-                    (rst_out, rst_active_frac, rst_active_n_mean,
-                     rst_gate_mass_mean, rst_gate_den_mean,
-                     rst_depth_active_mean, rst_gate_eff_n_mean,
-                     rst_top1_gate_frac_mean, rst_den_floor_frac,
-                     rst_tau_mean, rst_out_norm,
-                     rst_admission_mass_max, rst_composition_den_min,
-                     rst_composition_den_max, rst_raw_srw_out_norm,
-                     rst_normalized_srw_out_norm,
-                     rst_pool_scaled_srw_out_norm) = _rst_forward_minimal(
+                    rst_result = _rst_forward_minimal(
                         normed, pool_params, router_params, rng_rst,
                         self.router_dropout, self.dropout_rate,
                         deterministic,
@@ -4924,7 +4931,22 @@ class DAWN_SRW_V4171(nn.Module):
                         analysis_target_positions=analysis_target_positions,
                         analysis_target_route=analysis_target_route,
                         analysis_intervention_enabled=(
-                            analysis_intervention_enabled))
+                            analysis_intervention_enabled),
+                        parity_debug=analysis_parity_debug)
+                    if analysis_parity_debug:
+                        rst_values = rst_result[:-1]
+                        rst_debug = rst_result[-1]
+                    else:
+                        rst_values = rst_result
+                    (rst_out, rst_active_frac, rst_active_n_mean,
+                     rst_gate_mass_mean, rst_gate_den_mean,
+                     rst_depth_active_mean, rst_gate_eff_n_mean,
+                     rst_top1_gate_frac_mean, rst_den_floor_frac,
+                     rst_tau_mean, rst_out_norm,
+                     rst_admission_mass_max, rst_composition_den_min,
+                     rst_composition_den_max, rst_raw_srw_out_norm,
+                     rst_normalized_srw_out_norm,
+                     rst_pool_scaled_srw_out_norm) = rst_values
                     x_next = x + rst_out
                     residual_norm = jnp.linalg.norm(
                         x_next.astype(jnp.float32), axis=-1).mean()
@@ -4988,6 +5010,15 @@ class DAWN_SRW_V4171(nn.Module):
                         jax.lax.stop_gradient(
                             residual_norm.astype(jnp.float32)),
                     )
+                    if analysis_parity_debug:
+                        layer_stats += (
+                            attn_debug[0],
+                            attn_debug[1],
+                            attn_debug[2],
+                            attn_debug[3],
+                            rst_debug[0],
+                            x_next,
+                        )
                     return x_next, layer_stats
 
                 if self.gradient_checkpointing:
@@ -5000,6 +5031,13 @@ class DAWN_SRW_V4171(nn.Module):
                 }
                 x, minimal_stats = jax.lax.scan(
                     scan_body_minimal, x, xs_minimal)
+                if analysis_parity_debug:
+                    minimal_values = minimal_stats[:-6]
+                    (parity_q_all, parity_k_all, parity_v_all,
+                     parity_attention_update_all, parity_rst_all,
+                     parity_post_layer_residual_all) = minimal_stats[-6:]
+                else:
+                    minimal_values = minimal_stats
                 (q_active_all, k_active_all, v_active_all, rst_active_all,
                  q_active_n_all, k_active_n_all, v_active_n_all,
                  rst_active_n_all,
@@ -5029,7 +5067,7 @@ class DAWN_SRW_V4171(nn.Module):
                  rst_composition_den_min_all, rst_composition_den_max_all,
                  rst_raw_srw_out_norm_all, rst_normalized_srw_out_norm_all,
                  rst_pool_scaled_srw_out_norm_all,
-                 residual_norm_all) = minimal_stats
+                 residual_norm_all) = minimal_values
                 qk_active_all = jnp.float32(0.5) * (
                     q_active_all + k_active_all)
                 qk_active_n_all = jnp.float32(0.5) * (
@@ -5060,6 +5098,17 @@ class DAWN_SRW_V4171(nn.Module):
                                 x, self.token_emb.embedding)}
                         if analysis_return_residual:
                             output['final_residual'] = x
+                        if analysis_parity_debug:
+                            output['parity_debug'] = {
+                                'q': parity_q_all,
+                                'k': parity_k_all,
+                                'v': parity_v_all,
+                                'attention_update': (
+                                    parity_attention_update_all),
+                                'rst': parity_rst_all,
+                                'post_layer_residual': (
+                                    parity_post_layer_residual_all),
+                            }
                         return output
                     if vp_embed is not None:
                         raise NotImplementedError(
@@ -5074,6 +5123,16 @@ class DAWN_SRW_V4171(nn.Module):
                     output = {'logits': logits}
                     if analysis_return_residual:
                         output['final_residual'] = x
+                    if analysis_parity_debug:
+                        output['parity_debug'] = {
+                            'q': parity_q_all,
+                            'k': parity_k_all,
+                            'v': parity_v_all,
+                            'attention_update': parity_attention_update_all,
+                            'rst': parity_rst_all,
+                            'post_layer_residual': (
+                                parity_post_layer_residual_all),
+                        }
                     return output
 
                 (loss, per_token_ce, correct, valid_count,
@@ -5244,6 +5303,16 @@ class DAWN_SRW_V4171(nn.Module):
                     if embedding_vocab_size != logical_vocab_size:
                         logits = logits[..., :logical_vocab_size]
                     output['logits'] = logits
+                if analysis_parity_debug:
+                    output['parity_debug'] = {
+                        'q': parity_q_all,
+                        'k': parity_k_all,
+                        'v': parity_v_all,
+                        'attention_update': parity_attention_update_all,
+                        'rst': parity_rst_all,
+                        'post_layer_residual': (
+                            parity_post_layer_residual_all),
+                    }
                 return output
 
             def scan_body(carry, xs):
