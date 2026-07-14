@@ -28,12 +28,16 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-LOCAL_DEPS = PROJECT_ROOT / ".generated" / "operator_probe_deps"
+LOCAL_DEPS = Path(os.environ.get(
+    "DAWN_OPERATOR_DATASET_DEPS_DIR",
+    str(PROJECT_ROOT / ".generated" / "operator_probe_deps"),
+)).expanduser()
 for candidate in (PROJECT_ROOT, LOCAL_DEPS):
     if candidate.exists() and str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
 
 PREPARATION_DEPENDENCIES = (
+    # Repository-compatible, wheel-available versions for clean CPU hosts.
     "numpy==1.26.4",
     "pyarrow==20.0.0",
     "transformers==4.40.2",
