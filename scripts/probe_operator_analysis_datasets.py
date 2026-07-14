@@ -10,12 +10,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
 import tarfile
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from collections import Counter, defaultdict
@@ -31,11 +36,26 @@ for candidate in (PROJECT_ROOT, LOCAL_DEPS):
 
 RAVEL_TGZ_URL = "https://raw.githubusercontent.com/explanare/ravel/main/data.tgz"
 RAVEL_HF_TREE = "https://huggingface.co/api/datasets/hij/ravel/tree/main?recursive=1"
-RAVEL_HF_RESOLVE = "https://huggingface.co/datasets/hij/ravel/resolve/main"
+RAVEL_HF_REPO_ID = "hij/ravel"
 BLIMP_HF_TREE = "https://huggingface.co/api/datasets/nyu-mll/blimp/tree/main?recursive=1"
-BLIMP_HF_RESOLVE = "https://huggingface.co/datasets/nyu-mll/blimp/resolve/main"
+BLIMP_HF_REPO_ID = "nyu-mll/blimp"
 LAMA_ZIP_URL = "https://dl.fbaipublicfiles.com/LAMA/data.zip"
 COUNTERFACT_URL = "https://rome.baulab.info/data/dsets/counterfact.json"
+
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
+DOWNLOAD_HEADERS = {
+    "User-Agent": BROWSER_USER_AGENT,
+    "Accept": "application/octet-stream,application/json,text/plain,*/*",
+}
+RETRYABLE_HTTP_STATUSES = {403, 408, 429, 500, 502, 503, 504}
+MAX_DOWNLOAD_ATTEMPTS = 5
+CURL_FALLBACK_SOURCE_TYPES = {
+    "lama_zip", "counterfact_json", "ravel_raw_archive",
+}
 
 IOI_TEMPLATES = [
     "{name_a} and {name_b} went to the {place}. {name_a} gave a {object} to",
@@ -185,32 +205,429 @@ def nested_key_paths(value: Any, prefix: str = "") -> List[str]:
     return sorted(set(out))
 
 
-def download(url: str, path: Path, *, reuse: bool) -> Dict[str, Any]:
-    if reuse and path.exists() and path.stat().st_size:
-        return {
-            "path": str(path), "url": url, "bytes": path.stat().st_size,
-            "sha256": sha256_file(path), "reused": True,
-        }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".part")
-    request = urllib.request.Request(url, headers={"User-Agent": "DAWN-SRW-operator-probe/2"})
-    with urllib.request.urlopen(request, timeout=300) as response, temp.open("wb") as handle:
-        while True:
-            block = response.read(1024 * 1024)
-            if not block:
-                break
-            handle.write(block)
-    os.replace(temp, path)
+class DownloadError(RuntimeError):
+    """A source download failed after its retry/fallback policy was exhausted."""
+
+
+class DownloadValidationError(RuntimeError):
+    """A transfer completed but did not produce the expected source artifact."""
+
+
+def _temp_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".part")
+
+
+def _checksum_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".sha256")
+
+
+def _unlink_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _looks_like_html(path: Path) -> bool:
+    with path.open("rb") as handle:
+        head = handle.read(4096).lstrip().lower()
+    html_tokens = (b"<html", b"<head", b"<body", b"<title")
+    return (
+        head.startswith(b"<!doctype html")
+        or head.startswith(html_tokens)
+        or (head.startswith(b"<") and any(token in head for token in html_tokens))
+    )
+
+
+def validate_download(path: Path, source_type: str) -> None:
+    """Reject empty/error responses and verify the source's container format."""
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise DownloadValidationError("downloaded file is empty")
+    if _looks_like_html(path):
+        raise DownloadValidationError("downloaded file is an HTML response, not a dataset")
+    if source_type == "huggingface_parquet":
+        if path.stat().st_size < 8:
+            raise DownloadValidationError("parquet file is shorter than its magic bytes")
+        with path.open("rb") as handle:
+            leading_magic = handle.read(4)
+            handle.seek(-4, os.SEEK_END)
+            trailing_magic = handle.read(4)
+        if leading_magic != b"PAR1" or trailing_magic != b"PAR1":
+            raise DownloadValidationError("parquet magic bytes are missing")
+    elif source_type == "lama_zip":
+        try:
+            with zipfile.ZipFile(path) as archive:
+                if not archive.namelist():
+                    raise DownloadValidationError("LAMA zip archive has no entries")
+                bad_entry = archive.testzip()
+                if bad_entry is not None:
+                    raise DownloadValidationError(
+                        f"LAMA zip CRC check failed for {bad_entry}")
+        except zipfile.BadZipFile as exc:
+            raise DownloadValidationError(f"LAMA zip is unreadable: {exc}") from exc
+    elif source_type == "counterfact_json":
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                json.load(handle)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DownloadValidationError(f"CounterFact JSON is unreadable: {exc}") from exc
+    elif source_type == "ravel_raw_archive":
+        try:
+            with tarfile.open(path, "r:*") as archive:
+                if not archive.getmembers():
+                    raise DownloadValidationError("RAVEL raw archive has no entries")
+        except tarfile.TarError as exc:
+            raise DownloadValidationError(
+                f"RAVEL raw archive is unreadable: {exc}") from exc
+
+
+def _stored_checksum(path: Path) -> Optional[str]:
+    checksum_path = _checksum_path(path)
+    try:
+        checksum = checksum_path.read_text(encoding="ascii").strip().split()[0].lower()
+    except (FileNotFoundError, IndexError, OSError, UnicodeError):
+        return None
+    if re.fullmatch(r"[0-9a-f]{64}", checksum) is None:
+        return None
+    return checksum
+
+
+def _write_checksum(path: Path, checksum: str) -> None:
+    checksum_path = _checksum_path(path)
+    checksum_temp = checksum_path.with_suffix(checksum_path.suffix + ".part")
+    checksum_temp.write_text(f"{checksum}  {path.name}\n", encoding="ascii")
+    os.replace(checksum_temp, checksum_path)
+
+
+def _reusable_download(path: Path, source_type: str) -> Optional[str]:
+    expected = _stored_checksum(path)
+    if expected is None or not path.is_file():
+        return None
+    try:
+        validate_download(path, source_type)
+        actual = sha256_file(path)
+    except (OSError, DownloadValidationError):
+        return None
+    return actual if actual == expected else None
+
+
+def _download_row(
+    path: Path, url: str, checksum: str, *, reused: bool,
+    source_type: str, final_url: Optional[str] = None,
+    http_status: Optional[int] = None,
+) -> Dict[str, Any]:
     return {
-        "path": str(path), "url": url, "bytes": path.stat().st_size,
-        "sha256": sha256_file(path), "reused": False,
+        "path": str(path), "url": url, "final_url": final_url or url,
+        "http_status": http_status, "source_type": source_type,
+        "bytes": path.stat().st_size, "sha256": checksum, "reused": reused,
     }
 
 
-def read_url_json(url: str) -> Any:
-    request = urllib.request.Request(url, headers={"User-Agent": "DAWN-SRW-operator-probe/2"})
-    with urllib.request.urlopen(request, timeout=120) as response:
-        return json.loads(response.read().decode("utf-8"))
+def _failure(
+    *, dataset_id: str, source_type: str, original_url: str,
+    final_url: Optional[str], http_status: Optional[int], detail: str,
+) -> DownloadError:
+    message = (
+        f"download failed dataset={dataset_id} source_type={source_type} "
+        f"original_url={original_url} final_url={final_url or original_url} "
+        f"http_status={http_status if http_status is not None else 'unknown'}: {detail}"
+    )
+    print(f"[download-failed] {message}", file=sys.stderr, flush=True)
+    return DownloadError(message)
+
+
+def _exception_http_details(
+    exc: BaseException, original_url: str,
+    current_status: Optional[int] = None,
+) -> Tuple[Optional[int], str]:
+    status = getattr(exc, "code", current_status)
+    final_url = original_url
+    if isinstance(exc, urllib.error.HTTPError):
+        final_url = exc.geturl() or original_url
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", status)
+        final_url = getattr(response, "url", None) or final_url
+    return int(status) if status is not None else None, str(final_url)
+
+
+def _retry_delay(attempt: int) -> float:
+    return float(min(2 ** (attempt - 1), 30))
+
+
+def _should_retry(exc: BaseException, status: Optional[int]) -> bool:
+    if status in RETRYABLE_HTTP_STATUSES:
+        return True
+    if isinstance(exc, DownloadValidationError):
+        return False
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, (
+        urllib.error.URLError,
+        http.client.IncompleteRead,
+        ConnectionError,
+        TimeoutError,
+    )):
+        return True
+    return status is None
+
+
+def _log_retry(
+    *, dataset_id: str, source_type: str, attempt: int,
+    status: Optional[int], delay: float, exc: BaseException,
+) -> None:
+    print(
+        f"[download-retry] dataset={dataset_id} source_type={source_type} "
+        f"attempt={attempt}/{MAX_DOWNLOAD_ATTEMPTS} "
+        f"http_status={status if status is not None else 'unknown'} "
+        f"backoff_seconds={delay:g} error={type(exc).__name__}: {exc}",
+        file=sys.stderr, flush=True,
+    )
+
+
+def _curl_download(
+    url: str, temp: Path, *, dataset_id: str, source_type: str,
+) -> Tuple[str, int]:
+    curl = shutil.which("curl")
+    if curl is None:
+        raise FileNotFoundError("curl is not installed")
+    _unlink_if_exists(temp)
+    marker_status = "__DAWN_CURL_STATUS__="
+    marker_url = "__DAWN_CURL_URL__="
+    command = [
+        curl,
+        "--fail",
+        "--location",
+        "--retry", "5",
+        "--retry-delay", "2",
+        "--retry-all-errors",
+        "--connect-timeout", "30",
+        "--max-time", "1800",
+        "--user-agent", BROWSER_USER_AGENT,
+        "--header", f"Accept: {DOWNLOAD_HEADERS['Accept']}",
+        "--output", str(temp),
+        "--write-out", f"\n{marker_status}%{{http_code}}\n{marker_url}%{{url_effective}}\n",
+        url,
+    ]
+    print(
+        f"[download-fallback] dataset={dataset_id} source_type={source_type} tool=curl",
+        file=sys.stderr, flush=True,
+    )
+    try:
+        result = subprocess.run(
+            command, check=False, capture_output=True, text=True, timeout=1830)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _unlink_if_exists(temp)
+        raise RuntimeError(f"curl execution failed: {exc}") from exc
+    status_match = re.search(rf"(?m)^{re.escape(marker_status)}(\d+)$", result.stdout)
+    url_match = re.search(rf"(?m)^{re.escape(marker_url)}(.+)$", result.stdout)
+    status = int(status_match.group(1)) if status_match else 0
+    final_url = url_match.group(1).strip() if url_match else url
+    if result.returncode != 0:
+        _unlink_if_exists(temp)
+        stderr = result.stderr.strip()
+        raise RuntimeError(
+            f"curl exited with code {result.returncode}: {stderr or 'no stderr'} "
+            f"(final_url={final_url}, http_status={status or 'unknown'})")
+    return final_url, status
+
+
+def download(
+    url: str, path: Path, *, reuse: bool, dataset_id: str,
+    source_type: str, timeout: float = 300.0,
+) -> Dict[str, Any]:
+    """Download and validate a regular HTTP source with retries and curl-on-403."""
+    print(
+        f"[download] dataset={dataset_id} url={url} destination={path}",
+        flush=True,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = _temp_path(path)
+    _unlink_if_exists(temp)
+    if reuse:
+        checksum = _reusable_download(path, source_type)
+        if checksum is not None:
+            return _download_row(
+                path, url, checksum, reused=True, source_type=source_type)
+
+    last_exc: BaseException = RuntimeError("download did not start")
+    last_status: Optional[int] = None
+    last_final_url = url
+    for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+        request = urllib.request.Request(url, headers=DOWNLOAD_HEADERS)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                last_final_url = response.geturl() or url
+                last_status = int(response.getcode())
+                with temp.open("wb") as handle:
+                    while True:
+                        block = response.read(1024 * 1024)
+                        if not block:
+                            break
+                        handle.write(block)
+            validate_download(temp, source_type)
+            checksum = sha256_file(temp)
+            os.replace(temp, path)
+            _write_checksum(path, checksum)
+            return _download_row(
+                path, url, checksum, reused=False, source_type=source_type,
+                final_url=last_final_url, http_status=last_status)
+        except Exception as exc:
+            last_exc = exc
+            last_status, last_final_url = _exception_http_details(
+                exc, last_final_url, last_status)
+            _unlink_if_exists(temp)
+            retryable = _should_retry(exc, last_status)
+            if not retryable or attempt >= MAX_DOWNLOAD_ATTEMPTS:
+                break
+            delay = _retry_delay(attempt)
+            _log_retry(
+                dataset_id=dataset_id, source_type=source_type, attempt=attempt,
+                status=last_status, delay=delay, exc=exc)
+            time.sleep(delay)
+
+    if last_status == 403 and source_type in CURL_FALLBACK_SOURCE_TYPES:
+        curl_final_url: Optional[str] = None
+        curl_status: Optional[int] = None
+        try:
+            curl_final_url, curl_status = _curl_download(
+                url, temp, dataset_id=dataset_id, source_type=source_type)
+            validate_download(temp, source_type)
+            checksum = sha256_file(temp)
+            os.replace(temp, path)
+            _write_checksum(path, checksum)
+            return _download_row(
+                path, url, checksum, reused=False, source_type=source_type,
+                final_url=curl_final_url, http_status=curl_status)
+        except Exception as curl_exc:
+            _unlink_if_exists(temp)
+            detail = f"urllib error: {last_exc}; curl fallback error: {curl_exc}"
+            raise _failure(
+                dataset_id=dataset_id, source_type=source_type,
+                original_url=url, final_url=curl_final_url or last_final_url,
+                http_status=curl_status or last_status, detail=detail) from curl_exc
+
+    raise _failure(
+        dataset_id=dataset_id, source_type=source_type, original_url=url,
+        final_url=last_final_url, http_status=last_status,
+        detail=f"{type(last_exc).__name__}: {last_exc}") from last_exc
+
+
+def download_hf_dataset_file(
+    repo_id: str, filename: str, path: Path, *, reuse: bool,
+    dataset_id: str, timeout: float = 300.0,
+) -> Dict[str, Any]:
+    """Download a tree-discovered dataset file through huggingface_hub."""
+    source_type = "huggingface_parquet"
+    try:
+        from huggingface_hub import constants as hf_constants
+        from huggingface_hub import hf_hub_download, hf_hub_url
+    except ImportError as exc:
+        source_url = f"https://huggingface.co/datasets/{repo_id}"
+        print(
+            f"[download] dataset={dataset_id} url={source_url} destination={path}",
+            flush=True,
+        )
+        raise _failure(
+            dataset_id=dataset_id, source_type=source_type,
+            original_url=source_url, final_url=source_url, http_status=None,
+            detail="huggingface_hub is required for Hugging Face parquet downloads",
+        ) from exc
+
+    source_url = hf_hub_url(
+        repo_id=repo_id, filename=filename, repo_type="dataset")
+    print(
+        f"[download] dataset={dataset_id} url={source_url} destination={path}",
+        flush=True,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = _temp_path(path)
+    _unlink_if_exists(temp)
+    if reuse:
+        checksum = _reusable_download(path, source_type)
+        if checksum is not None:
+            return _download_row(
+                path, source_url, checksum, reused=True, source_type=source_type)
+
+    last_exc: BaseException = RuntimeError("Hugging Face download did not start")
+    last_status: Optional[int] = None
+    last_final_url = source_url
+    previous_timeout = hf_constants.HF_HUB_DOWNLOAD_TIMEOUT
+    hf_constants.HF_HUB_DOWNLOAD_TIMEOUT = timeout
+    try:
+        for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                cached_path = Path(hf_hub_download(
+                    repo_type="dataset",
+                    repo_id=repo_id,
+                    filename=filename,
+                    etag_timeout=min(float(timeout), 30.0),
+                ))
+                try:
+                    os.link(cached_path, temp)
+                except OSError:
+                    shutil.copy2(cached_path, temp)
+                validate_download(temp, source_type)
+                checksum = sha256_file(temp)
+                os.replace(temp, path)
+                _write_checksum(path, checksum)
+                return _download_row(
+                    path, source_url, checksum, reused=False,
+                    source_type=source_type, final_url=source_url,
+                    http_status=200)
+            except Exception as exc:
+                last_exc = exc
+                last_status, last_final_url = _exception_http_details(
+                    exc, source_url, last_status)
+                _unlink_if_exists(temp)
+                retryable = _should_retry(exc, last_status)
+                if not retryable or attempt >= MAX_DOWNLOAD_ATTEMPTS:
+                    break
+                delay = _retry_delay(attempt)
+                _log_retry(
+                    dataset_id=dataset_id, source_type=source_type,
+                    attempt=attempt, status=last_status, delay=delay, exc=exc)
+                time.sleep(delay)
+    finally:
+        hf_constants.HF_HUB_DOWNLOAD_TIMEOUT = previous_timeout
+
+    raise _failure(
+        dataset_id=dataset_id, source_type=source_type,
+        original_url=source_url, final_url=last_final_url,
+        http_status=last_status,
+        detail=f"{type(last_exc).__name__}: {last_exc}") from last_exc
+
+
+def read_url_json(
+    url: str, *, dataset_id: str = "unknown", source_type: str = "json_api",
+    timeout: float = 120.0,
+) -> Any:
+    last_exc: BaseException = RuntimeError("request did not start")
+    last_status: Optional[int] = None
+    last_final_url = url
+    for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+        request = urllib.request.Request(url, headers=DOWNLOAD_HEADERS)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                last_final_url = response.geturl() or url
+                last_status = int(response.getcode())
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            last_exc = exc
+            last_status, last_final_url = _exception_http_details(
+                exc, last_final_url, last_status)
+            retryable = _should_retry(exc, last_status)
+            if not retryable or attempt >= MAX_DOWNLOAD_ATTEMPTS:
+                break
+            delay = _retry_delay(attempt)
+            _log_retry(
+                dataset_id=dataset_id, source_type=source_type,
+                attempt=attempt, status=last_status, delay=delay, exc=exc)
+            time.sleep(delay)
+    raise _failure(
+        dataset_id=dataset_id, source_type=source_type,
+        original_url=url, final_url=last_final_url, http_status=last_status,
+        detail=f"{type(last_exc).__name__}: {last_exc}") from last_exc
 
 
 def parse_datasets(value: str) -> List[str]:
@@ -521,8 +938,16 @@ def read_parquet_rows(path: Path) -> List[Dict[str, Any]]:
     return json_safe(pq.read_table(path).to_pylist())
 
 
-def hf_parquet_tree(url: str) -> List[str]:
-    rows = read_url_json(url)
+def hf_parquet_tree(url: str, *, dataset_id: Optional[str] = None) -> List[str]:
+    if dataset_id is None:
+        if "/hij/ravel/" in url:
+            dataset_id = "ravel"
+        elif "/nyu-mll/blimp/" in url:
+            dataset_id = "blimp"
+        else:
+            dataset_id = "unknown"
+    rows = read_url_json(
+        url, dataset_id=dataset_id, source_type="huggingface_tree_api")
     return sorted(
         str(row["path"]) for row in rows
         if row.get("type") == "file" and str(row.get("path", "")).endswith(".parquet")
@@ -539,7 +964,7 @@ def _find_col(columns: Sequence[str], candidates: Sequence[str]) -> Optional[str
 
 def probe_ravel(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     probe = base_probe("ravel", {"hf_tree": RAVEL_HF_TREE, "raw_archive": RAVEL_TGZ_URL})
-    paths = hf_parquet_tree(RAVEL_HF_TREE)
+    paths = hf_parquet_tree(RAVEL_HF_TREE, dataset_id="ravel")
     selected = [
         path for path in paths
         if path.startswith("city_entity/") or path.startswith("city_prompt/")
@@ -550,7 +975,9 @@ def probe_ravel(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict
     all_samples: List[Dict[str, Any]] = []
     for rel in selected:
         local = cache / "ravel" / "hf" / rel
-        file_row = download(f"{RAVEL_HF_RESOLVE}/{rel}", local, reuse=args.reuse_downloads)
+        file_row = download_hf_dataset_file(
+            RAVEL_HF_REPO_ID, rel, local, reuse=args.reuse_downloads,
+            dataset_id="ravel")
         probe["downloaded_files"].append(file_row)
         info = inspect_parquet(local, args.sample_rows)
         info["source_path"] = rel
@@ -560,7 +987,9 @@ def probe_ravel(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict
         for row in info["samples"]:
             all_samples.append({"source_path": rel, "split": info["split"], **row})
     raw_local = cache / "ravel" / "raw" / "data.tgz"
-    raw_info = download(RAVEL_TGZ_URL, raw_local, reuse=args.reuse_downloads)
+    raw_info = download(
+        RAVEL_TGZ_URL, raw_local, reuse=args.reuse_downloads,
+        dataset_id="ravel", source_type="ravel_raw_archive")
     probe["downloaded_files"].append(raw_info)
     with tarfile.open(raw_local, "r:gz") as archive:
         names = archive.getnames()
@@ -713,7 +1142,7 @@ def _choose_blimp_paths(paths: Sequence[str], count: int = 3) -> List[str]:
 
 def probe_blimp(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     probe = base_probe("blimp", {"hf_tree": BLIMP_HF_TREE})
-    paths = hf_parquet_tree(BLIMP_HF_TREE)
+    paths = hf_parquet_tree(BLIMP_HF_TREE, dataset_id="blimp")
     selected = _choose_blimp_paths(paths)
     observed = []
     raw_samples = []
@@ -721,7 +1150,9 @@ def probe_blimp(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict
     schemas = []
     for rel in selected:
         local = cache / "blimp" / "hf" / rel
-        file_row = download(f"{BLIMP_HF_RESOLVE}/{rel}", local, reuse=args.reuse_downloads)
+        file_row = download_hf_dataset_file(
+            BLIMP_HF_REPO_ID, rel, local, reuse=args.reuse_downloads,
+            dataset_id="blimp")
         probe["downloaded_files"].append(file_row)
         info = inspect_parquet(local, args.sample_rows)
         info["source_path"] = rel
@@ -828,7 +1259,9 @@ def _lama_prefix(masked: str) -> Tuple[Optional[str], Optional[str]]:
 def probe_lama(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     probe = base_probe("lama", {"archive": LAMA_ZIP_URL})
     local = cache / "lama" / "data.zip"
-    probe["downloaded_files"].append(download(LAMA_ZIP_URL, local, reuse=args.reuse_downloads))
+    probe["downloaded_files"].append(download(
+        LAMA_ZIP_URL, local, reuse=args.reuse_downloads,
+        dataset_id="lama", source_type="lama_zip"))
     prepared = []
     raw_samples = []
     schemas: Dict[str, Any] = {}
@@ -942,7 +1375,9 @@ def probe_lama(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict[
 def probe_counterfact(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     probe = base_probe("counterfact", {"json": COUNTERFACT_URL})
     local = cache / "counterfact" / "counterfact.json"
-    probe["downloaded_files"].append(download(COUNTERFACT_URL, local, reuse=args.reuse_downloads))
+    probe["downloaded_files"].append(download(
+        COUNTERFACT_URL, local, reuse=args.reuse_downloads,
+        dataset_id="counterfact", source_type="counterfact_json"))
     rows = json.loads(local.read_text(encoding="utf-8"))
     if not isinstance(rows, list):
         raise RuntimeError("CounterFact top-level JSON is not a list")
@@ -1335,7 +1770,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", default="/tmp/dawn_operator_dataset_probe")
     parser.add_argument(
         "--reuse-downloads", action=argparse.BooleanOptionalAction, default=True,
-        help="Reuse nonempty cached downloads (default: true).")
+        help="Reuse cached downloads only after format and recorded SHA-256 validation.")
     parser.add_argument("--output-dir", default="runs/operator_dataset_probe")
     return parser.parse_args()
 

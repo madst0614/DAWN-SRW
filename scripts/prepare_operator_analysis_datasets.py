@@ -41,10 +41,13 @@ PREPARATION_DEPENDENCIES = (
     "numpy==1.26.4",
     "pyarrow==20.0.0",
     "transformers==4.40.2",
+    "huggingface-hub==0.23.0",
     "fsspec==2024.3.1",
     "gcsfs==2024.3.1",
 )
-PREPARATION_MODULES = ("numpy", "pyarrow", "transformers", "gcsfs")
+PREPARATION_MODULES = (
+    "numpy", "pyarrow", "transformers", "huggingface_hub", "gcsfs",
+)
 
 
 def bootstrap_preparation_dependencies() -> None:
@@ -211,33 +214,38 @@ def download_sources(args: argparse.Namespace, dataset: str) -> Dict[str, Any]:
     cache = Path(args.work_dir) / "downloads"
     rows: List[Dict[str, Any]] = []
     if dataset == "ravel":
-        paths = probe.hf_parquet_tree(probe.RAVEL_HF_TREE)
+        paths = probe.hf_parquet_tree(
+            probe.RAVEL_HF_TREE, dataset_id="ravel")
         selected = [p for p in paths if p.startswith(("city_entity/", "city_prompt/"))]
         if len(selected) != 6:
             raise RuntimeError(f"RAVEL contract expected 6 city parquet files, got {selected}")
         for rel in selected:
-            rows.append(probe.download(
-                f"{probe.RAVEL_HF_RESOLVE}/{rel}", cache / "ravel" / "hf" / rel,
-                reuse=args.reuse_downloads))
+            rows.append(probe.download_hf_dataset_file(
+                probe.RAVEL_HF_REPO_ID, rel, cache / "ravel" / "hf" / rel,
+                reuse=args.reuse_downloads, dataset_id="ravel"))
         rows.append(probe.download(
             probe.RAVEL_TGZ_URL, cache / "ravel" / "raw" / "data.tgz",
-            reuse=args.reuse_downloads))
+            reuse=args.reuse_downloads, dataset_id="ravel",
+            source_type="ravel_raw_archive"))
     elif dataset == "blimp":
-        paths = probe.hf_parquet_tree(probe.BLIMP_HF_TREE)
+        paths = probe.hf_parquet_tree(
+            probe.BLIMP_HF_TREE, dataset_id="blimp")
         if len(paths) != 67:
             raise RuntimeError(f"BLiMP contract expected 67 parquet files, got {len(paths)}")
         for rel in paths:
-            rows.append(probe.download(
-                f"{probe.BLIMP_HF_RESOLVE}/{rel}", cache / "blimp" / "hf" / rel,
-                reuse=args.reuse_downloads))
+            rows.append(probe.download_hf_dataset_file(
+                probe.BLIMP_HF_REPO_ID, rel, cache / "blimp" / "hf" / rel,
+                reuse=args.reuse_downloads, dataset_id="blimp"))
     elif dataset == "lama":
         rows.append(probe.download(
             probe.LAMA_ZIP_URL, cache / "lama" / "data.zip",
-            reuse=args.reuse_downloads))
+            reuse=args.reuse_downloads, dataset_id="lama",
+            source_type="lama_zip"))
     elif dataset == "counterfact":
         rows.append(probe.download(
             probe.COUNTERFACT_URL, cache / "counterfact" / "counterfact.json",
-            reuse=args.reuse_downloads))
+            reuse=args.reuse_downloads, dataset_id="counterfact",
+            source_type="counterfact_json"))
     return {"dataset": dataset, "files": rows}
 
 
