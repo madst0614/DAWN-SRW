@@ -90,6 +90,7 @@ from analysis.dawn_train_analysis_prompt import (
 )
 from analysis.dawn_v4171_transition import (
     DEFAULT_TRANSITION_PROMPT_SET,
+    run_v4171_parity_only_smoke,
     run_v4171_transition_items,
 )
 
@@ -258,6 +259,13 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get(
             "DAWN_V4171_TRANSITION_PROMPT_SET", DEFAULT_TRANSITION_PROMPT_SET),
         help="Controlled JSONL prompt pairs for v4171 transition items.",
+    )
+    p.add_argument(
+        "--v4171-parity-only",
+        action="store_true",
+        help=(
+            "Run blocking production-vs-suppression-disabled machine-exact "
+            "parity and exit before transition tracing."),
     )
     p.add_argument(
         "--transition-max-prompts",
@@ -2118,6 +2126,10 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
             f"version={ctx.config.get('model', {}).get('model_version')} ",
             flush=True,
         )
+    if args.v4171_parity_only:
+        run_v4171_parity_only_smoke(ctx)
+        sync_hosts("dawn-srw-v4171-parity-only-done")
+        return 0
     max_batches = max(1, int(args.train_analysis_max_batches or DEFAULT_TRAIN_ANALYSIS_BATCHES))
     eps_values = _parse_float_list(args.prune_eps or DEFAULT_TRAIN_ANALYSIS_PRUNE_EPS)
     progress = _progress_status(ctx, info)
@@ -2227,6 +2239,20 @@ def main() -> int:
     if args.train_analysis:
         maybe_init_distributed(args, True)
         return run_train_analysis(args, is_primary_host())
+    if args.v4171_parity_only:
+        if args.output is None:
+            raise ValueError("--output is required for --v4171-parity-only")
+        maybe_init_distributed(args, True)
+        primary = is_primary_host()
+        store = AnalysisStore(
+            args.output, is_primary=primary,
+            analysis_version=ANALYSIS_VERSION)
+        set_default_store(store)
+        store.ensure_layout()
+        ctx = build_context(args, ["train_analysis"], store)
+        run_v4171_parity_only_smoke(ctx)
+        sync_hosts("dawn-srw-v4171-parity-only-done")
+        return 0
     if args.from_scratch:
         args.resume = False
     if args.output is None:

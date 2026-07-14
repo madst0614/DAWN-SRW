@@ -451,6 +451,25 @@ def _validate_v4171_sharded_fns(
                 "v4171 model/sharded closure heat_kernel_beta mismatch: "
                 f"sharded_fns[{name!r}]={actual_beta}, "
                 f"model={expected_heat_kernel_beta}")
+    for production_name, suppression_name in (
+            ('attn_v_single_minimal',
+             'attn_v_single_suppression_minimal'),
+            ('rst_single_minimal', 'rst_single_suppression_minimal'),
+            ('attn_qk_paired_minimal',
+             'attn_qk_paired_suppression_minimal')):
+        production_fn = sharded_fns.get(production_name)
+        suppression_fn = sharded_fns.get(suppression_name)
+        if production_fn is None or suppression_fn is None:
+            continue
+        production_kernel = getattr(
+            production_fn, '_v4171_canonical_shard_map_kernel', None)
+        suppression_kernel = getattr(
+            suppression_fn, '_v4171_canonical_shard_map_kernel', None)
+        if production_kernel is None or production_kernel is not suppression_kernel:
+            raise ValueError(
+                "v4171 production/suppression wrappers must share one "
+                f"canonical shard-map kernel: {production_name!r} vs "
+                f"{suppression_name!r}")
 
 
 # ================================================================
@@ -2644,14 +2663,38 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         heat_kernel_beta)
 
 
+_V4171_MINIMAL_KERNEL_BUNDLES = {}
+
+
+def _v4171_minimal_bundle_key(
+        route_kind, mesh, max_chunk_size, dead_exposure_target,
+        soft_gate_effective_active_eps, admission_den_power,
+        admission_den_grad_scale, srw_composition_mode, heat_kernel_beta):
+    return (
+        str(route_kind), id(mesh), int(max_chunk_size),
+        float(dead_exposure_target), float(soft_gate_effective_active_eps),
+        float(admission_den_power), float(admission_den_grad_scale),
+        str(srw_composition_mode), float(heat_kernel_beta),
+    )
+
+
+def _cached_v4171_minimal_bundle(route_kind, builder, *factory_args):
+    key = _v4171_minimal_bundle_key(route_kind, *factory_args)
+    bundle = _V4171_MINIMAL_KERNEL_BUNDLES.get(key)
+    if bundle is None:
+        bundle = builder(*factory_args)
+        _V4171_MINIMAL_KERNEL_BUNDLES[key] = bundle
+    return bundle
+
+
 def _make_sharded_srw_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         admission_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
-        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA, *, suppression_enabled):
-    """Build production and analysis single-route kernels from one core."""
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    """Build both single-route wrappers around one canonical shard-map."""
     srw_composition_mode, admission_den_power, heat_kernel_beta = (
         _validate_v4171_composition_settings(
             srw_composition_mode, admission_den_power,
@@ -2672,24 +2715,22 @@ def _make_sharded_srw_minimal_impl(
             x, h, op_key_local, raw_tau, read_local, write_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, suppression=None):
+            execution_prune_eps, selected_global_operator_id,
+            target_positions, apply_suppression):
         del soft_gate_t_final, soft_gate_boundary_power_final
         N_local = op_key_local.shape[0]
-        if suppression is not None:
-            (selected_global_operator_id, target_positions,
-             apply_suppression) = suppression
-            selected_global_operator_id = jnp.asarray(
-                selected_global_operator_id, dtype=jnp.int32)
-            if selected_global_operator_id.ndim == 0:
-                selected_global_operator_id = jnp.broadcast_to(
-                    selected_global_operator_id, (x.shape[0],))
-            target_positions = jnp.asarray(target_positions, dtype=jnp.int32)
-            if target_positions.ndim == 0:
-                target_positions = jnp.broadcast_to(
-                    target_positions, (x.shape[0],))
-            global_start = (
-                jax.lax.axis_index('model').astype(jnp.int32)
-                * jnp.int32(N_local))
+        selected_global_operator_id = jnp.asarray(
+            selected_global_operator_id, dtype=jnp.int32)
+        if selected_global_operator_id.ndim == 0:
+            selected_global_operator_id = jnp.broadcast_to(
+                selected_global_operator_id, (x.shape[0],))
+        target_positions = jnp.asarray(target_positions, dtype=jnp.int32)
+        if target_positions.ndim == 0:
+            target_positions = jnp.broadcast_to(
+                target_positions, (x.shape[0],))
+        global_start = (
+            jax.lax.axis_index('model').astype(jnp.int32)
+            * jnp.int32(N_local))
         cs = min(int(max_chunk_size), int(N_local))
         nc = (int(N_local) + cs - 1) // cs
         N_pad = nc * cs
@@ -2760,21 +2801,21 @@ def _make_sharded_srw_minimal_impl(
             rho_compute = jnp.where(valid_bsn, rho_raw, tau)
             (admission, angular_amplitude, execution_weight,
              chunk_active_count) = angular_compose_parts(rho_compute, valid_bsn)
-            if suppression is not None:
-                global_ids = global_start + s + jnp.arange(cs, dtype=jnp.int32)
-                token_match = (
-                    jnp.arange(S, dtype=jnp.int32)[None, :, None]
-                    == target_positions[:, None, None])
-                operator_match = (
-                    global_ids[None, None, :]
-                    == selected_global_operator_id[:, None, None])
-                suppress_mask = (
-                    jnp.asarray(apply_suppression, dtype=jnp.bool_)
-                    & token_match & operator_match & valid_bsn)
-                execution_weight = jnp.where(
-                    suppress_mask, jnp.float32(0.0), execution_weight)
+            global_ids = global_start + s + jnp.arange(cs, dtype=jnp.int32)
+            token_match = (
+                jnp.arange(S, dtype=jnp.int32)[None, :, None]
+                == target_positions[:, None, None])
+            operator_match = (
+                global_ids[None, None, :]
+                == selected_global_operator_id[:, None, None])
+            route_match = jnp.bool_(True)
+            suppress_mask = (
+                jnp.asarray(apply_suppression, dtype=jnp.bool_)
+                & token_match & operator_match & route_match & valid_bsn)
+            execution_for_numerator = jnp.where(
+                suppress_mask, jnp.float32(0.0), execution_weight)
             xr = x_bf @ rc.T
-            a = execution_weight * xr.astype(jnp.float32)
+            a = execution_for_numerator * xr.astype(jnp.float32)
             c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
             chunk_gate_mass = admission.sum(axis=-1, keepdims=True)
             chunk_gate_sq = jnp.square(admission).sum(
@@ -2873,44 +2914,65 @@ def _make_sharded_srw_minimal_impl(
     out_specs = (
         P('data', None, None), P(), P(), P(), P(), P(), P(), P(), P(), P(),
         P(), P(), P(), P(), P())
-    if suppression_enabled:
-        @partial(
-            shard_map, mesh=mesh,
-            in_specs=common_in_specs + (P('data'), P('data'), P()),
-            out_specs=out_specs, check_rep=False)
-        def fused_gate_srw_suppression_minimal(
-                x, h, op_key_local, raw_tau, read_local, write_local,
-                soft_gate_temperature, soft_gate_t_final,
-                soft_gate_boundary_power, soft_gate_boundary_power_final,
-                execution_prune_eps, selected_global_operator_id,
-                target_positions, apply_suppression):
-            return _sharded_srw_minimal_core(
-                x, h, op_key_local, raw_tau, read_local, write_local,
-                soft_gate_temperature, soft_gate_t_final,
-                soft_gate_boundary_power, soft_gate_boundary_power_final,
-                execution_prune_eps,
-                suppression=(selected_global_operator_id, target_positions,
-                             apply_suppression))
+    @partial(
+        shard_map, mesh=mesh,
+        in_specs=common_in_specs + (P('data'), P('data'), P()),
+        out_specs=out_specs, check_rep=False)
+    def canonical_single_kernel(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, selected_global_operator_id,
+            target_positions, apply_suppression):
+        return _sharded_srw_minimal_core(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, selected_global_operator_id,
+            target_positions, apply_suppression)
 
-        kernel = fused_gate_srw_suppression_minimal
-    else:
-        @partial(
-            shard_map, mesh=mesh, in_specs=common_in_specs,
-            out_specs=out_specs, check_rep=False)
-        def fused_gate_srw_minimal(
-                x, h, op_key_local, raw_tau, read_local, write_local,
-                soft_gate_temperature, soft_gate_t_final,
-                soft_gate_boundary_power, soft_gate_boundary_power_final,
-                execution_prune_eps):
-            return _sharded_srw_minimal_core(
-                x, h, op_key_local, raw_tau, read_local, write_local,
-                soft_gate_temperature, soft_gate_t_final,
-                soft_gate_boundary_power, soft_gate_boundary_power_final,
-                execution_prune_eps, suppression=None)
+    def fused_gate_srw_minimal(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps):
+        batch_size = x.shape[0]
+        return canonical_single_kernel(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps,
+            jnp.full((batch_size,), -1, dtype=jnp.int32),
+            jnp.full((batch_size,), -1, dtype=jnp.int32),
+            jnp.bool_(False))
 
-        kernel = fused_gate_srw_minimal
-    return _mark_v4171_srw_factory_output(
-        kernel, admission_den_power, _srw_composition_mode, heat_kernel_beta)
+    def fused_gate_srw_suppression_minimal(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, selected_global_operator_id,
+            target_positions, apply_suppression):
+        return canonical_single_kernel(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, selected_global_operator_id,
+            target_positions, apply_suppression)
+
+    factory_token = object()
+    for wrapper in (
+            fused_gate_srw_minimal,
+            fused_gate_srw_suppression_minimal):
+        _mark_v4171_srw_factory_output(
+            wrapper, admission_den_power, _srw_composition_mode,
+            heat_kernel_beta)
+        wrapper._v4171_canonical_shard_map_kernel = canonical_single_kernel
+        wrapper._v4171_canonical_factory_token = factory_token
+    fused_gate_srw_minimal._v4171_suppression_wrapper = (
+        fused_gate_srw_suppression_minimal)
+    fused_gate_srw_suppression_minimal._v4171_production_wrapper = (
+        fused_gate_srw_minimal)
+    return fused_gate_srw_minimal, fused_gate_srw_suppression_minimal
 
 
 def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
@@ -2921,11 +2983,12 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
                              srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
                              heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the production single-route minimal SRW kernel."""
-    return _make_sharded_srw_minimal_impl(
+    return _cached_v4171_minimal_bundle(
+        "single", _make_sharded_srw_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
         soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode, heat_kernel_beta,
-        suppression_enabled=False)
+        admission_den_grad_scale, srw_composition_mode,
+        heat_kernel_beta)[0]
 
 
 def make_sharded_srw_suppression_minimal(
@@ -2936,11 +2999,12 @@ def make_sharded_srw_suppression_minimal(
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the analysis-only exact execution-suppression kernel."""
-    return _make_sharded_srw_minimal_impl(
+    return _cached_v4171_minimal_bundle(
+        "single", _make_sharded_srw_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
         soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode, heat_kernel_beta,
-        suppression_enabled=True)
+        admission_den_grad_scale, srw_composition_mode,
+        heat_kernel_beta)[1]
 
 
 def _make_sharded_srw_paired_minimal_impl(
@@ -2949,8 +3013,8 @@ def _make_sharded_srw_paired_minimal_impl(
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         admission_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
-        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA, *, suppression_enabled):
-    """Build production and analysis paired kernels from one core."""
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    """Build both paired-route wrappers around one canonical shard-map."""
     srw_composition_mode, admission_den_power, heat_kernel_beta = (
         _validate_v4171_composition_settings(
             srw_composition_mode, admission_den_power,
@@ -2971,24 +3035,22 @@ def _make_sharded_srw_paired_minimal_impl(
             x, h, op_key_local, raw_tau, read_local, write_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, suppression=None):
+            execution_prune_eps, selected_global_operator_id,
+            target_positions, apply_suppression, route_selector):
         del soft_gate_t_final, soft_gate_boundary_power_final
         N_local = op_key_local.shape[0]
-        if suppression is not None:
-            (selected_global_operator_id, target_positions,
-             apply_suppression, route_selector) = suppression
-            selected_global_operator_id = jnp.asarray(
-                selected_global_operator_id, dtype=jnp.int32)
-            if selected_global_operator_id.ndim == 0:
-                selected_global_operator_id = jnp.broadcast_to(
-                    selected_global_operator_id, (x.shape[0],))
-            target_positions = jnp.asarray(target_positions, dtype=jnp.int32)
-            if target_positions.ndim == 0:
-                target_positions = jnp.broadcast_to(
-                    target_positions, (x.shape[0],))
-            global_start = (
-                jax.lax.axis_index('model').astype(jnp.int32)
-                * jnp.int32(N_local))
+        selected_global_operator_id = jnp.asarray(
+            selected_global_operator_id, dtype=jnp.int32)
+        if selected_global_operator_id.ndim == 0:
+            selected_global_operator_id = jnp.broadcast_to(
+                selected_global_operator_id, (x.shape[0],))
+        target_positions = jnp.asarray(target_positions, dtype=jnp.int32)
+        if target_positions.ndim == 0:
+            target_positions = jnp.broadcast_to(
+                target_positions, (x.shape[0],))
+        global_start = (
+            jax.lax.axis_index('model').astype(jnp.int32)
+            * jnp.int32(N_local))
         cs = min(int(max_chunk_size), int(N_local))
         nc = (int(N_local) + cs - 1) // cs
         N_pad = nc * cs
@@ -3062,24 +3124,23 @@ def _make_sharded_srw_paired_minimal_impl(
             (admission, angular_amplitude, execution_weight,
              chunk_active_count) = angular_compose_parts(
                 rho_compute, valid_bsrn)
-            if suppression is not None:
-                global_ids = global_start + s + jnp.arange(cs, dtype=jnp.int32)
-                token_match = (
-                    jnp.arange(S, dtype=jnp.int32)[None, :, None, None]
-                    == target_positions[:, None, None, None])
-                operator_match = (
-                    global_ids[None, None, None, :]
-                    == selected_global_operator_id[:, None, None, None])
-                route_match = (
-                    jnp.arange(2, dtype=jnp.int32)[None, None, :, None]
-                    == jnp.asarray(route_selector, dtype=jnp.int32))
-                suppress_mask = (
-                    jnp.asarray(apply_suppression, dtype=jnp.bool_)
-                    & token_match & operator_match & route_match & valid_bsrn)
-                execution_weight = jnp.where(
-                    suppress_mask, jnp.float32(0.0), execution_weight)
+            global_ids = global_start + s + jnp.arange(cs, dtype=jnp.int32)
+            token_match = (
+                jnp.arange(S, dtype=jnp.int32)[None, :, None, None]
+                == target_positions[:, None, None, None])
+            operator_match = (
+                global_ids[None, None, None, :]
+                == selected_global_operator_id[:, None, None, None])
+            route_match = (
+                jnp.arange(2, dtype=jnp.int32)[None, None, :, None]
+                == jnp.asarray(route_selector, dtype=jnp.int32))
+            suppress_mask = (
+                jnp.asarray(apply_suppression, dtype=jnp.bool_)
+                & token_match & operator_match & route_match & valid_bsrn)
+            execution_for_numerator = jnp.where(
+                suppress_mask, jnp.float32(0.0), execution_weight)
             xr = x_bf @ rc.T
-            a = execution_weight * xr.astype(jnp.float32)[:, :, None, :]
+            a = execution_for_numerator * xr.astype(jnp.float32)[:, :, None, :]
             c_out = jnp.einsum(
                 'bsrn,nd->bsrd',
                 a.astype(jnp.bfloat16),
@@ -3219,44 +3280,66 @@ def _make_sharded_srw_paired_minimal_impl(
         P('data', None, None, None), P(), P(), P(), P(), P(), P(), P(), P(),
         P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(),
         P(), P(), P(), P(), P(), P(), P())
-    if suppression_enabled:
-        @partial(
-            shard_map, mesh=mesh,
-            in_specs=common_in_specs + (P('data'), P('data'), P(), P()),
-            out_specs=out_specs, check_rep=False)
-        def fused_gate_srw_paired_suppression_minimal(
-                x, h, op_key_local, raw_tau, read_local, write_local,
-                soft_gate_temperature, soft_gate_t_final,
-                soft_gate_boundary_power, soft_gate_boundary_power_final,
-                execution_prune_eps, selected_global_operator_id,
-                target_positions, apply_suppression, route_selector):
-            return _sharded_srw_paired_minimal_core(
-                x, h, op_key_local, raw_tau, read_local, write_local,
-                soft_gate_temperature, soft_gate_t_final,
-                soft_gate_boundary_power, soft_gate_boundary_power_final,
-                execution_prune_eps,
-                suppression=(selected_global_operator_id, target_positions,
-                             apply_suppression, route_selector))
+    @partial(
+        shard_map, mesh=mesh,
+        in_specs=common_in_specs + (P('data'), P('data'), P(), P()),
+        out_specs=out_specs, check_rep=False)
+    def canonical_paired_kernel(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, selected_global_operator_id,
+            target_positions, apply_suppression, route_selector):
+        return _sharded_srw_paired_minimal_core(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, selected_global_operator_id,
+            target_positions, apply_suppression, route_selector)
 
-        kernel = fused_gate_srw_paired_suppression_minimal
-    else:
-        @partial(
-            shard_map, mesh=mesh, in_specs=common_in_specs,
-            out_specs=out_specs, check_rep=False)
-        def fused_gate_srw_paired_minimal(
-                x, h, op_key_local, raw_tau, read_local, write_local,
-                soft_gate_temperature, soft_gate_t_final,
-                soft_gate_boundary_power, soft_gate_boundary_power_final,
-                execution_prune_eps):
-            return _sharded_srw_paired_minimal_core(
-                x, h, op_key_local, raw_tau, read_local, write_local,
-                soft_gate_temperature, soft_gate_t_final,
-                soft_gate_boundary_power, soft_gate_boundary_power_final,
-                execution_prune_eps, suppression=None)
+    def fused_gate_srw_paired_minimal(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps):
+        batch_size = x.shape[0]
+        return canonical_paired_kernel(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps,
+            jnp.full((batch_size,), -1, dtype=jnp.int32),
+            jnp.full((batch_size,), -1, dtype=jnp.int32),
+            jnp.bool_(False), jnp.int32(-1))
 
-        kernel = fused_gate_srw_paired_minimal
-    return _mark_v4171_srw_factory_output(
-        kernel, admission_den_power, _srw_composition_mode, heat_kernel_beta)
+    def fused_gate_srw_paired_suppression_minimal(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, selected_global_operator_id,
+            target_positions, apply_suppression, route_selector):
+        return canonical_paired_kernel(
+            x, h, op_key_local, raw_tau, read_local, write_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, selected_global_operator_id,
+            target_positions, apply_suppression, route_selector)
+
+    factory_token = object()
+    for wrapper in (
+            fused_gate_srw_paired_minimal,
+            fused_gate_srw_paired_suppression_minimal):
+        _mark_v4171_srw_factory_output(
+            wrapper, admission_den_power, _srw_composition_mode,
+            heat_kernel_beta)
+        wrapper._v4171_canonical_shard_map_kernel = canonical_paired_kernel
+        wrapper._v4171_canonical_factory_token = factory_token
+    fused_gate_srw_paired_minimal._v4171_suppression_wrapper = (
+        fused_gate_srw_paired_suppression_minimal)
+    fused_gate_srw_paired_suppression_minimal._v4171_production_wrapper = (
+        fused_gate_srw_paired_minimal)
+    return (fused_gate_srw_paired_minimal,
+            fused_gate_srw_paired_suppression_minimal)
 
 
 def make_sharded_srw_paired_minimal(
@@ -3267,11 +3350,12 @@ def make_sharded_srw_paired_minimal(
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the production paired Q/K minimal SRW kernel."""
-    return _make_sharded_srw_paired_minimal_impl(
+    return _cached_v4171_minimal_bundle(
+        "paired", _make_sharded_srw_paired_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
         soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode, heat_kernel_beta,
-        suppression_enabled=False)
+        admission_den_grad_scale, srw_composition_mode,
+        heat_kernel_beta)[0]
 
 
 def make_sharded_srw_paired_suppression_minimal(
@@ -3282,11 +3366,12 @@ def make_sharded_srw_paired_suppression_minimal(
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the analysis-only route-selective Q/K suppression kernel."""
-    return _make_sharded_srw_paired_minimal_impl(
+    return _cached_v4171_minimal_bundle(
+        "paired", _make_sharded_srw_paired_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
         soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode, heat_kernel_beta,
-        suppression_enabled=True)
+        admission_den_grad_scale, srw_composition_mode,
+        heat_kernel_beta)[1]
 
 
 # ================================================================
@@ -3424,7 +3509,8 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           analysis_target_layer=-1,
                           analysis_target_positions=0,
                           analysis_target_route=-1,
-                          analysis_intervention_enabled=False):
+                          analysis_intervention_enabled=False,
+                          parity_debug=False):
     """Minimal v4166 attention path: SRW output, causal attention, O-proj."""
     del n_qk, n_v
     admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
@@ -3478,32 +3564,23 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     h_QK = jnp.stack([h_Q, h_K], axis=2)
     raw_tau_QK = jnp.stack(
         [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
-    suppress_layer = (
-        jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
-        & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
-           == jnp.asarray(analysis_target_layer, dtype=jnp.int32)))
-    def production_qk(_):
-        return fused_paired(
+    if analysis_selected_operator_id is None:
+        qk_result = fused_paired(
             x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
             soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
             soft_gate_boundary_power_final, execution_prune_eps)
-
-    if analysis_selected_operator_id is None:
-        qk_result = production_qk(jnp.int32(0))
     else:
-        use_suppression_qk = (
-            suppress_layer
+        apply_qk = (
+            jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
+            & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
+               == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
             & (jnp.asarray(analysis_target_route, dtype=jnp.int32) < 2))
-        qk_result = jax.lax.cond(
-            use_suppression_qk,
-            lambda _: suppression_paired(
-                x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
-                soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
-                soft_gate_boundary_power_final, execution_prune_eps,
-                analysis_selected_operator_id, analysis_target_positions,
-                jnp.bool_(True), analysis_target_route),
-            production_qk,
-            jnp.int32(0))
+        qk_result = suppression_paired(
+            x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
+            soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
+            soft_gate_boundary_power_final, execution_prune_eps,
+            analysis_selected_operator_id, analysis_target_positions,
+            apply_qk, analysis_target_route)
     (QK_out,
      q_active_frac, k_active_frac,
      q_active_n_mean, k_active_n_mean,
@@ -3521,28 +3598,23 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
      q_normalized_srw_out_norm, k_normalized_srw_out_norm) = qk_result
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
-    def production_v(_):
-        return fused_single_v(
+    if analysis_selected_operator_id is None:
+        v_result = fused_single_v(
             x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
             soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
             soft_gate_boundary_power_final, execution_prune_eps)
-
-    if analysis_selected_operator_id is None:
-        v_result = production_v(jnp.int32(0))
     else:
-        use_suppression_v = (
-            suppress_layer
+        apply_v = (
+            jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
+            & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
+               == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
             & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == 2))
-        v_result = jax.lax.cond(
-            use_suppression_v,
-            lambda _: suppression_single_v(
-                x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
-                soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
-                soft_gate_boundary_power_final, execution_prune_eps,
-                analysis_selected_operator_id, analysis_target_positions,
-                jnp.bool_(True)),
-            production_v,
-            jnp.int32(0))
+        v_result = suppression_single_v(
+            x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
+            soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
+            soft_gate_boundary_power_final, execution_prune_eps,
+            analysis_selected_operator_id, analysis_target_positions,
+            apply_v)
     (V, v_active_frac, v_active_n_mean, v_gate_mass_mean, v_gate_den_mean,
      v_depth_active_mean, v_gate_eff_n_mean, v_top1_gate_frac_mean,
      v_den_floor_frac, v_tau_mean,
@@ -3550,6 +3622,9 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
      v_composition_den_max, v_raw_srw_out_norm,
      v_normalized_srw_out_norm) = v_result
     V = V * v_scale
+    q_debug = Q
+    k_debug = K
+    v_debug = V
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -3585,7 +3660,7 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         q_raw_srw_out_norm + k_raw_srw_out_norm)
     qk_normalized_srw_out_norm = jnp.float32(0.5) * (
         q_normalized_srw_out_norm + k_normalized_srw_out_norm)
-    return (
+    result = (
         out,
         q_active_frac,
         k_active_frac,
@@ -3628,6 +3703,9 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         v_normalized_srw_out_norm,
         v_normalized_srw_out_norm * v_scale,
     )
+    if parity_debug:
+        return result + ((q_debug, k_debug, v_debug, out),)
+    return result
 
 
 def _rst_forward_minimal(x, pool_params, router_params, rng,
@@ -3646,7 +3724,8 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
                          analysis_target_layer=-1,
                          analysis_target_positions=0,
                          analysis_target_route=-1,
-                         analysis_intervention_enabled=False):
+                         analysis_intervention_enabled=False,
+                         parity_debug=False):
     """Minimal v4166 RST path: one SRW output and residual dropout."""
     admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
     if d_model is None or n_layers is None:
@@ -3679,30 +3758,23 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         fused_single, _ = sharded_fns
         suppression_single = None
 
-    def production_rst(_):
-        return fused_single(
+    if analysis_selected_operator_id is None:
+        rst_result = fused_single(
             x, h, rst_op_key, raw_tau, rst_read, rst_write,
             soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
             soft_gate_boundary_power_final, execution_prune_eps)
-
-    if analysis_selected_operator_id is None:
-        rst_result = production_rst(jnp.int32(0))
     else:
-        use_suppression_rst = (
+        apply_rst = (
             jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
             & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
                == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
             & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == 3))
-        rst_result = jax.lax.cond(
-            use_suppression_rst,
-            lambda _: suppression_single(
-                x, h, rst_op_key, raw_tau, rst_read, rst_write,
-                soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
-                soft_gate_boundary_power_final, execution_prune_eps,
-                analysis_selected_operator_id, analysis_target_positions,
-                jnp.bool_(True)),
-            production_rst,
-            jnp.int32(0))
+        rst_result = suppression_single(
+            x, h, rst_op_key, raw_tau, rst_read, rst_write,
+            soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
+            soft_gate_boundary_power_final, execution_prune_eps,
+            analysis_selected_operator_id, analysis_target_positions,
+            apply_rst)
     (out, rst_active_frac, rst_active_n_mean, rst_gate_mass_mean,
      rst_gate_den_mean, rst_depth_active_mean, rst_gate_eff_n_mean,
      rst_top1_gate_frac_mean, rst_den_floor_frac, rst_tau_mean,
@@ -3713,7 +3785,7 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
     rst_out_norm = jnp.linalg.norm(out.astype(jnp.float32), axis=-1).mean()
-    return (
+    result = (
         out,
         rst_active_frac,
         rst_active_n_mean,
@@ -3732,6 +3804,9 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         rst_normalized_srw_out_norm,
         rst_normalized_srw_out_norm * rst_scale,
     )
+    if parity_debug:
+        return result + ((out,),)
+    return result
 
 
 def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
@@ -4442,7 +4517,8 @@ class DAWN_SRW_V4171(nn.Module):
                  analysis_target_positions=0,
                  analysis_target_route=-1,
                  analysis_intervention_enabled=False,
-                 analysis_return_residual=False):
+                 analysis_return_residual=False,
+                 analysis_return_logits=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -5161,6 +5237,13 @@ class DAWN_SRW_V4171(nn.Module):
                 }
                 if analysis_return_residual:
                     output['final_residual'] = x
+                if analysis_return_logits:
+                    logical_vocab_size, embedding_vocab_size = (
+                        self._vocab_sizes())
+                    logits = self.token_emb.attend(x)
+                    if embedding_vocab_size != logical_vocab_size:
+                        logits = logits[..., :logical_vocab_size]
+                    output['logits'] = logits
                 return output
 
             def scan_body(carry, xs):

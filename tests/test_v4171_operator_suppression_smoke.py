@@ -38,6 +38,19 @@ def main() -> None:
         mesh, max_chunk_size=2)
     suppression_paired = make_sharded_srw_paired_suppression_minimal(
         mesh, max_chunk_size=2)
+    assert (
+        production_single._v4171_canonical_shard_map_kernel
+        is suppression_single._v4171_canonical_shard_map_kernel)
+    assert (
+        production_single._v4171_canonical_factory_token
+        is suppression_single._v4171_canonical_factory_token)
+    assert (
+        production_paired._v4171_canonical_shard_map_kernel
+        is suppression_paired._v4171_canonical_shard_map_kernel)
+    assert (
+        production_paired._v4171_canonical_factory_token
+        is suppression_paired._v4171_canonical_factory_token)
+    print("PRODUCTION_CORE_CANONICAL_KERNEL_SHARED_OK")
 
     batch, seq, dim = 2, 3, 4
     x = jnp.asarray(np.tile(
@@ -57,11 +70,16 @@ def main() -> None:
 
     single_base = production_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args)
+    canonical_single = production_single._v4171_canonical_shard_map_kernel
+    single_neutral = canonical_single(
+        x, h_single, op_key, raw_tau, read, write, *scalar_args,
+        jnp.full((batch,), -1, dtype=jnp.int32),
+        jnp.full((batch,), -1, dtype=jnp.int32), jnp.bool_(False))
     single_disabled = suppression_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(False))
+    assert _all_exact(single_base, single_neutral)
     assert _all_exact(single_base, single_disabled)
-    print("PRODUCTION_CORE_ZERO_PARITY_OK")
 
     single_changed = suppression_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
@@ -100,10 +118,22 @@ def main() -> None:
     raw_tau_paired = jnp.zeros((batch, seq, 2, 1), dtype=jnp.float32)
     paired_base = production_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args)
+    canonical_paired = production_paired._v4171_canonical_shard_map_kernel
+    paired_neutral = canonical_paired(
+        x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
+        jnp.full((batch,), -1, dtype=jnp.int32),
+        jnp.full((batch,), -1, dtype=jnp.int32),
+        jnp.bool_(False), jnp.int32(-1))
     paired_disabled = suppression_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(False), jnp.int32(0))
+    assert _all_exact(paired_base, paired_neutral)
     assert _all_exact(paired_base, paired_disabled)
+
+    paired_non_target_route = suppression_paired(
+        x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
+        selected_zero, positions, jnp.bool_(True), jnp.int32(3))
+    assert _all_exact(paired_disabled, paired_non_target_route)
 
     q_changed = suppression_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
@@ -180,15 +210,58 @@ def main() -> None:
         np.asarray(production_model["final_residual"]),
         np.asarray(disabled_model["final_residual"]))
     production_labeled = model.apply(
-        variables, input_ids, labels=input_ids, **production_kwargs)
+        variables, input_ids, labels=input_ids,
+        analysis_return_logits=True, **production_kwargs)
     disabled_labeled = model.apply(
         variables, input_ids, selected_zero, jnp.int32(0), positions,
         jnp.int32(0), labels=input_ids,
         method=model.analysis_forward_with_operator_suppression,
-        apply_suppression=False, return_residual=True, **analysis_kwargs)
+        apply_suppression=False, return_residual=True,
+        analysis_return_logits=True, **analysis_kwargs)
+    assert np.array_equal(
+        np.asarray(production_labeled["logits"]),
+        np.asarray(disabled_labeled["logits"]))
     assert np.array_equal(
         np.asarray(production_labeled["per_token_ce"]),
         np.asarray(disabled_labeled["per_token_ce"]))
+    assert np.array_equal(
+        np.asarray(production_labeled["final_residual"]),
+        np.asarray(disabled_labeled["final_residual"]))
+
+    non_target_layer = model.apply(
+        variables, input_ids, selected_zero, jnp.int32(1), positions,
+        jnp.int32(0), labels=input_ids,
+        method=model.analysis_forward_with_operator_suppression,
+        apply_suppression=True, return_residual=True, **analysis_kwargs)
+    non_target_route = model.apply(
+        variables, input_ids, selected_zero, jnp.int32(0), positions,
+        jnp.int32(4), labels=input_ids,
+        method=model.analysis_forward_with_operator_suppression,
+        apply_suppression=True, return_residual=True, **analysis_kwargs)
+    non_target_layer_logits = model.apply(
+        variables, input_ids, selected_zero, jnp.int32(1), positions,
+        jnp.int32(0),
+        method=model.analysis_forward_with_operator_suppression,
+        apply_suppression=True, return_residual=True, **analysis_kwargs)
+    non_target_route_logits = model.apply(
+        variables, input_ids, selected_zero, jnp.int32(0), positions,
+        jnp.int32(4),
+        method=model.analysis_forward_with_operator_suppression,
+        apply_suppression=True, return_residual=True, **analysis_kwargs)
+    for noop in (non_target_layer_logits, non_target_route_logits):
+        assert np.array_equal(
+            np.asarray(production_model["logits"]),
+            np.asarray(noop["logits"]))
+        assert np.array_equal(
+            np.asarray(production_model["final_residual"]),
+            np.asarray(noop["final_residual"]))
+    for noop in (non_target_layer, non_target_route):
+        assert np.array_equal(
+            np.asarray(production_labeled["per_token_ce"]),
+            np.asarray(noop["per_token_ce"]))
+        assert np.array_equal(
+            np.asarray(production_labeled["final_residual"]),
+            np.asarray(noop["final_residual"]))
 
     changed_routes = []
     for route in range(4):
@@ -205,6 +278,10 @@ def main() -> None:
             np.asarray(changed["final_residual"][:, 0]))
     assert all(changed_routes), changed_routes
     print("PRODUCTION_CORE_INITIALIZED_MODEL_OK")
+    print(
+        "PRODUCTION_CORE_ZERO_PARITY_OK machine_exact=True "
+        "max_logit_abs_diff=0 ce_abs_diff=0 "
+        "final_residual_max_abs_diff=0")
 
 
 if __name__ == "__main__":

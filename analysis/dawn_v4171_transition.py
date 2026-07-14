@@ -39,6 +39,7 @@ from analysis.dawn_analysis_trace import (
     TRANSITION_CANDIDATE_STRATEGIES,
     topk_trace_forward,
 )
+from models import dawn_srw_v4171 as v4171_model
 
 
 V4171_MODEL_VERSION = "spatial-r1-v4.1.7.1"
@@ -1209,17 +1210,231 @@ def _select_causal_records(
     return selected
 
 
+def _dense_minimal_sharded_fns(ctx: AnalysisContext):
+    sharded_fns = ctx.sharded_fns
+    if not isinstance(sharded_fns, dict):
+        return sharded_fns
+    return {
+        key: value for key, value in sharded_fns.items()
+        if key not in {
+            "vocab_parallel_embedding", "vocab_ce", "vocab_eval_stats",
+            "vocab_argmax",
+        }
+    }
+
+
+def _parity_debug_prefix_forward(
+    ctx: AnalysisContext, layer_count: int, *, suppression_graph: bool,
+):
+    """Build a failure-only prefix rerun that stops at ``layer_count``."""
+    layer_count = int(layer_count)
+    if layer_count <= 0 or layer_count > int(ctx.model_cfg["n_layers"]):
+        raise ValueError(f"invalid parity debug layer_count={layer_count}")
+    sharded_fns = _dense_minimal_sharded_fns(ctx)
+    mcfg = ctx.model_cfg
+    d_model = int(mcfg["d_model"])
+    n_layers = int(mcfg["n_layers"])
+    n_heads = int(mcfg["n_heads"])
+    n_qk = int(mcfg["n_qk"])
+    n_v = int(mcfg["n_v"])
+    router_dropout = float(getattr(ctx.model, "router_dropout", 0.0))
+    dropout_rate = float(getattr(ctx.model, "dropout_rate", 0.0))
+    soft_gate_temperature = float(mcfg["soft_gate_temperature"])
+    soft_gate_t_final = float(mcfg.get(
+        "soft_gate_t_final", soft_gate_temperature))
+    soft_gate_t_qk = float(mcfg.get(
+        "soft_gate_T_qk", soft_gate_temperature))
+    soft_gate_t_v = float(mcfg.get(
+        "soft_gate_T_v", soft_gate_temperature))
+    soft_gate_t_rst = float(mcfg.get(
+        "soft_gate_T_rst", soft_gate_temperature))
+    boundary_power = float(mcfg["soft_gate_boundary_power"])
+    boundary_power_final = float(mcfg.get(
+        "soft_gate_boundary_power_final", boundary_power))
+    admission_den_power = float(mcfg["admission_den_power"])
+    execution_prune_eps = jnp.float32(
+        float(mcfg.get("execution_prune_eps", 0.0) or 0.0))
+
+    @jax.jit
+    def forward(params, input_ids, target_positions, selected_operator_ids):
+        params = v4171_model._squeeze_params(params)
+        input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
+        _, seq_len = input_ids.shape
+        token_positions = jnp.arange(seq_len)[None, :]
+        x = (
+            params["token_emb"]["embedding"][input_ids]
+            + params["pos_emb"]["embedding"][token_positions]
+        )
+        pool_params = v4171_model._pool_params_with_operator_keys(
+            params["neuron_pool"])
+        router_params = params["router"]
+        layer_rngs = jax.random.split(jax.random.PRNGKey(0), n_layers)
+        analysis_operator_ids = (
+            selected_operator_ids if suppression_graph else None)
+        for layer_index in range(layer_count):
+            bp = params[f"block_{layer_index}"]
+            _, rng_attn, rng_rst = jax.random.split(
+                layer_rngs[layer_index], 3)
+            normed = v4171_model._layer_norm(
+                x, bp["norm1"]["scale"], bp["norm1"]["bias"])
+            attn_ret = v4171_model._attn_forward_minimal(
+                normed, pool_params, router_params,
+                bp["attn"]["expand_O"]["kernel"], rng_attn,
+                n_qk, n_v, n_heads, d_model, n_layers,
+                router_dropout, dropout_rate, True, sharded_fns,
+                soft_gate_temperature=soft_gate_temperature,
+                soft_gate_t_final=soft_gate_t_final,
+                soft_gate_T_qk=soft_gate_t_qk,
+                soft_gate_T_v=soft_gate_t_v,
+                soft_gate_boundary_power=boundary_power,
+                soft_gate_boundary_power_final=boundary_power_final,
+                admission_den_power=admission_den_power,
+                execution_prune_eps=execution_prune_eps,
+                analysis_selected_operator_id=analysis_operator_ids,
+                analysis_layer_index=jnp.int32(layer_index),
+                analysis_target_layer=jnp.int32(0),
+                analysis_target_positions=target_positions,
+                analysis_target_route=jnp.int32(0),
+                analysis_intervention_enabled=jnp.bool_(False),
+                parity_debug=True,
+            )
+            attn_out = attn_ret[0]
+            q_out, k_out, v_out, attention_update = attn_ret[-1]
+            x = x + attn_out
+            normed = v4171_model._layer_norm(
+                x, bp["norm2"]["scale"], bp["norm2"]["bias"])
+            rst_ret = v4171_model._rst_forward_minimal(
+                normed, pool_params, router_params, rng_rst,
+                router_dropout, dropout_rate, True, sharded_fns,
+                d_model=d_model, n_layers=n_layers,
+                soft_gate_temperature=soft_gate_temperature,
+                soft_gate_t_final=soft_gate_t_final,
+                soft_gate_T_rst=soft_gate_t_rst,
+                soft_gate_boundary_power=boundary_power,
+                soft_gate_boundary_power_final=boundary_power_final,
+                admission_den_power=admission_den_power,
+                execution_prune_eps=execution_prune_eps,
+                analysis_selected_operator_id=analysis_operator_ids,
+                analysis_layer_index=jnp.int32(layer_index),
+                analysis_target_layer=jnp.int32(0),
+                analysis_target_positions=target_positions,
+                analysis_target_route=jnp.int32(0),
+                analysis_intervention_enabled=jnp.bool_(False),
+                parity_debug=True,
+            )
+            rst_out = rst_ret[-1][0]
+            x = x + rst_ret[0]
+        return {
+            "q": q_out,
+            "k": k_out,
+            "v": v_out,
+            "attention_update": attention_update,
+            "rst": rst_out,
+            "post_layer_residual": x,
+        }
+
+    return forward
+
+
+def _first_difference(left: np.ndarray, right: np.ndarray):
+    indices = np.argwhere(np.asarray(left) != np.asarray(right))
+    return tuple(int(value) for value in indices[0]) if indices.size else None
+
+
+def _max_abs_difference(left: np.ndarray, right: np.ndarray) -> float:
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    if not left.size:
+        return 0.0
+    return float(np.max(np.abs(left - right)))
+
+
+def _parity_failure_diagnostics(
+    ctx: AnalysisContext, input_ids, target_positions,
+    production_logits: np.ndarray, suppression_logits: np.ndarray,
+    production_residual: np.ndarray, suppression_residual: np.ndarray,
+) -> Dict[str, Any]:
+    """Rerun prefixes only until the first divergent layer is found."""
+    selected_operator_ids = jnp.zeros(
+        (input_ids.shape[0],), dtype=jnp.int32)
+    first_layer = None
+    production_debug = None
+    suppression_debug = None
+    layers_executed = 0
+    for layer_index in range(int(ctx.model_cfg["n_layers"])):
+        production_forward = _parity_debug_prefix_forward(
+            ctx, layer_index + 1, suppression_graph=False)
+        suppression_forward = _parity_debug_prefix_forward(
+            ctx, layer_index + 1, suppression_graph=True)
+        production_debug = jax.device_get(production_forward(
+            ctx.params, input_ids, target_positions, selected_operator_ids))
+        suppression_debug = jax.device_get(suppression_forward(
+            ctx.params, input_ids, target_positions, selected_operator_ids))
+        layers_executed = layer_index + 1
+        if any(
+                not np.array_equal(
+                    np.asarray(production_debug[key]),
+                    np.asarray(suppression_debug[key]))
+                for key in (
+                    "q", "k", "v", "attention_update", "rst",
+                    "post_layer_residual")):
+            first_layer = layer_index
+            break
+
+    debug_keys = ("q", "k", "v", "attention_update", "rst",
+                  "post_layer_residual")
+    differences = {
+        key: _max_abs_difference(
+            production_debug[key], suppression_debug[key])
+        for key in debug_keys
+    }
+    route_names = ("q", "k", "v", "rst")
+    first_route = next(
+        (route for route in route_names if differences[route] != 0.0),
+        "attention" if differences["attention_update"] != 0.0 else None,
+    )
+    residual_index = _first_difference(
+        production_debug["post_layer_residual"],
+        suppression_debug["post_layer_residual"])
+    component_index = None
+    for key in ("q", "k", "v", "attention_update", "rst"):
+        component_index = _first_difference(
+            production_debug[key], suppression_debug[key])
+        if component_index is not None:
+            break
+    if residual_index is None:
+        residual_index = component_index
+    if residual_index is None:
+        residual_index = _first_difference(
+            production_residual, suppression_residual)
+    logit_index = _first_difference(production_logits, suppression_logits)
+    route_indices = {"q": 0, "k": 1, "v": 2, "rst": 3}
+    return {
+        "first_differing_layer": first_layer,
+        "first_differing_route": first_route,
+        "first_differing_route_index": route_indices.get(first_route),
+        "first_differing_token": (
+            residual_index[-2] if residual_index is not None else
+            (logit_index[-2] if logit_index is not None else None)),
+        "first_differing_residual_dimension": (
+            residual_index[-1] if residual_index is not None else None),
+        "first_differing_vocab_index": (
+            logit_index[-1] if logit_index is not None else None),
+        "max_q_output_difference": differences["q"],
+        "max_k_output_difference": differences["k"],
+        "max_v_output_difference": differences["v"],
+        "max_attention_update_difference": differences["attention_update"],
+        "max_rst_output_difference": differences["rst"],
+        "max_post_layer_residual_difference": differences[
+            "post_layer_residual"],
+        "debug_rerun_layers_executed": layers_executed,
+        "debug_rerun_stopped_at_first_divergence": first_layer is not None,
+    }
+
+
 def _production_logits_forward(ctx: AnalysisContext):
     """Build the canonical minimal production forward with dense logits."""
-    sharded_fns = ctx.sharded_fns
-    if isinstance(sharded_fns, dict):
-        sharded_fns = {
-            key: value for key, value in sharded_fns.items()
-            if key not in {
-                "vocab_parallel_embedding", "vocab_ce", "vocab_eval_stats",
-                "vocab_argmax",
-            }
-        }
+    sharded_fns = _dense_minimal_sharded_fns(ctx)
     mcfg = ctx.model_cfg
 
     @jax.jit
@@ -1227,6 +1442,7 @@ def _production_logits_forward(ctx: AnalysisContext):
         result = ctx.model.apply(
             {"params": params},
             input_ids,
+            labels=input_ids,
             attention_mask=jnp.ones_like(input_ids),
             deterministic=True,
             rngs={"dropout": jax.random.PRNGKey(0)},
@@ -1253,23 +1469,17 @@ def _production_logits_forward(ctx: AnalysisContext):
                 float(mcfg.get("execution_prune_eps", 0.0) or 0.0)),
             compute_accuracy=False,
             analysis_return_residual=True,
+            analysis_return_logits=True,
         )
-        return result["logits"][:1], result["final_residual"][:1]
+        return (result["logits"][:1], result["per_token_ce"][:1],
+                result["final_residual"][:1])
 
     return forward
 
 
 def _suppression_logits_forward(ctx: AnalysisContext):
     """Production-core analysis forward with suppression on or off."""
-    sharded_fns = ctx.sharded_fns
-    if isinstance(sharded_fns, dict):
-        sharded_fns = {
-            key: value for key, value in sharded_fns.items()
-            if key not in {
-                "vocab_parallel_embedding", "vocab_ce", "vocab_eval_stats",
-                "vocab_argmax",
-            }
-        }
+    sharded_fns = _dense_minimal_sharded_fns(ctx)
     mcfg = ctx.model_cfg
 
     @jax.jit
@@ -1283,6 +1493,7 @@ def _suppression_logits_forward(ctx: AnalysisContext):
             layer,
             positions,
             route,
+            labels=input_ids,
             method=ctx.model.analysis_forward_with_operator_suppression,
             attention_mask=jnp.ones_like(input_ids),
             apply_suppression=apply_suppression,
@@ -1310,8 +1521,10 @@ def _suppression_logits_forward(ctx: AnalysisContext):
             execution_prune_eps=jnp.float32(
                 float(mcfg.get("execution_prune_eps", 0.0) or 0.0)),
             compute_accuracy=False,
+            analysis_return_logits=True,
         )
-        return result["logits"][:1], result["final_residual"][:1]
+        return (result["logits"][:1], result["per_token_ce"][:1],
+                result["final_residual"][:1])
 
     return forward
 
@@ -1340,6 +1553,7 @@ def _intervention_forward_parity(
     if production_forward is None:
         production_forward = _production_logits_forward(ctx)
     rows = []
+    first_failure = None
     for record in records:
         prompt = record["prompt"]
         data_replicas = max(1, int(ctx.mesh.shape["data"]))
@@ -1349,9 +1563,11 @@ def _intervention_forward_parity(
             axis=0,
         )), ctx.data_sharding)
         target_position = int(record["target_token_index"])
-        production_logits, production_residual = jax.device_get(
+        (production_logits, production_per_token_ce,
+         production_residual) = jax.device_get(
             production_forward(ctx.params, input_ids))
-        hooked_logits, hooked_residual = jax.device_get(
+        (hooked_logits, hooked_per_token_ce,
+         hooked_residual) = jax.device_get(
             intervention_forward(
                 ctx.params,
                 input_ids,
@@ -1371,11 +1587,20 @@ def _intervention_forward_parity(
         abs_diff = np.abs(prod_slice.astype(np.float64) - hooked_slice.astype(np.float64))
         prod_ce = _sequence_ce(production_logits, prompt["token_ids"], length)
         hooked_ce = _sequence_ce(hooked_logits, prompt["token_ids"], length)
-        rows.append({
+        prod_per_token_ce = np.asarray(
+            production_per_token_ce)[:, :max(0, length - 1)]
+        hooked_per_token_ce = np.asarray(
+            hooked_per_token_ce)[:, :max(0, length - 1)]
+        per_token_ce_abs_diff = np.abs(
+            prod_per_token_ce - hooked_per_token_ce)
+        row = {
             "prompt_id": prompt["prompt_id"],
             "ce_abs_diff": (
+                float(np.max(per_token_ce_abs_diff))
+                if per_token_ce_abs_diff.size else 0.0),
+            "sequence_ce_abs_diff": (
                 abs(float(prod_ce) - float(hooked_ce))
-                if prod_ce is not None and hooked_ce is not None else None),
+                if prod_ce is not None and hooked_ce is not None else 0.0),
             "mean_logit_abs_diff": float(np.mean(abs_diff)),
             "max_logit_abs_diff": float(np.max(abs_diff)),
             "top1_agreement": float(np.mean(
@@ -1385,10 +1610,28 @@ def _intervention_forward_parity(
                 production_residual[0, target_position],
                 hooked_residual[0, target_position]),
             "logits_machine_exact": bool(np.array_equal(prod_slice, hooked_slice)),
+            "per_token_ce_machine_exact": bool(np.array_equal(
+                prod_per_token_ce, hooked_per_token_ce)),
             "final_residual_machine_exact": bool(np.array_equal(
                 production_residual, hooked_residual)),
+            "final_residual_max_abs_diff": _max_abs_difference(
+                production_residual, hooked_residual),
             "residual_reference": "production_vs_disabled_suppression_core",
-        })
+        }
+        rows.append(row)
+        if first_failure is None and not (
+                row["logits_machine_exact"]
+                and row["per_token_ce_machine_exact"]
+                and row["final_residual_machine_exact"]):
+            first_failure = {
+                "input_ids": input_ids,
+                "target_positions": jnp.full(
+                    (input_ids.shape[0],), target_position, jnp.int32),
+                "production_logits": production_logits,
+                "suppression_logits": hooked_logits,
+                "production_residual": production_residual,
+                "suppression_residual": hooked_residual,
+            }
     summary = {
         "status": "ready",
         "blocking": True,
@@ -1400,21 +1643,84 @@ def _intervention_forward_parity(
             float(row["mean_logit_abs_diff"]) for row in rows])),
         "max_logit_abs_diff": max(
             float(row["max_logit_abs_diff"]) for row in rows),
+        "final_residual_max_abs_diff": max(
+            float(row["final_residual_max_abs_diff"]) for row in rows),
         "top1_agreement": float(np.mean([
             float(row["top1_agreement"]) for row in rows])),
         "final_residual_cosine": min(
             float(row["final_residual_cosine"]) for row in rows),
         "machine_exact": all(
-            row["logits_machine_exact"] and row["final_residual_machine_exact"]
-            and row["ce_abs_diff"] == 0.0 for row in rows),
+            row["logits_machine_exact"]
+            and row["per_token_ce_machine_exact"]
+            and row["final_residual_machine_exact"]
+            for row in rows),
         "rows": rows,
     }
+    if not summary["machine_exact"]:
+        summary.update(_parity_failure_diagnostics(
+            ctx,
+            first_failure["input_ids"],
+            first_failure["target_positions"],
+            first_failure["production_logits"],
+            first_failure["suppression_logits"],
+            first_failure["production_residual"],
+            first_failure["suppression_residual"],
+        ))
     if ctx.is_primary:
         write_json_atomic(ctx.store.path("intervention_forward_parity.json"), summary)
     if not summary["machine_exact"]:
         raise RuntimeError(
             "production-core zero-suppression parity failed")
     return summary
+
+
+def _print_parity_success(ctx: AnalysisContext, parity: Mapping[str, Any]) -> None:
+    if ctx.is_primary:
+        print(
+            "PRODUCTION_CORE_ZERO_PARITY_OK "
+            f"machine_exact={parity['machine_exact']} "
+            f"max_logit_abs_diff={parity['max_logit_abs_diff']:g} "
+            f"ce_abs_diff={parity['ce_abs_diff']:g} "
+            "final_residual_max_abs_diff="
+            f"{parity['final_residual_max_abs_diff']:g}",
+            flush=True,
+        )
+
+
+def run_v4171_parity_only_smoke(ctx: AnalysisContext) -> Dict[str, Any]:
+    """Run blocking machine-exact parity without building transition traces."""
+    if str(ctx.model_cfg.get("model_version")) != V4171_MODEL_VERSION:
+        raise ValueError(
+            "v4171 parity-only smoke requires model_version="
+            f"{V4171_MODEL_VERSION}")
+    args = ctx.args
+    prompt_set = str(
+        getattr(args, "transition_prompt_set", None)
+        or DEFAULT_TRANSITION_PROMPT_SET)
+    rows, _ = load_transition_prompt_rows(prompt_set)
+    max_prompts = getattr(args, "transition_max_prompts", None)
+    if max_prompts is None:
+        max_prompts = max(1, int(getattr(
+            args, "causal_max_prompts", 6) or 6))
+    rows = rows[:max(1, int(max_prompts))]
+    tokenizer = maybe_load_tokenizer(local_only=True)
+    if tokenizer is None or not getattr(tokenizer, "is_fast", False):
+        raise RuntimeError(
+            "v4171 parity-only smoke requires the cached bert-base-uncased "
+            "fast tokenizer")
+    seq_len = int(getattr(args, "trace_seq_len", 128) or 128)
+    prompts = [_tokenize_transition_row(tokenizer, row, seq_len) for row in rows]
+    _validate_tokenized_pairs(prompts)
+    records = [
+        {
+            "prompt": prompt,
+            "target_token_index": int(max(prompt["target_token_indices"])),
+        }
+        for prompt in prompts
+    ]
+    parity = _intervention_forward_parity(ctx, records)
+    _print_parity_success(ctx, parity)
+    return parity
 
 
 def _causal_effect_summary(
@@ -1452,12 +1758,7 @@ def run_causal_intervention(
     parity = _intervention_forward_parity(
         ctx, primary, suppression_forward,
         production_forward=production_forward)
-    if ctx.is_primary:
-        print(
-            "PRODUCTION_CORE_ZERO_PARITY_OK "
-            f"status={parity['status']} machine_exact={parity['machine_exact']}",
-            flush=True,
-        )
+    _print_parity_success(ctx, parity)
 
     result_rows: List[Dict[str, Any]] = []
     started = time.time()
@@ -1470,7 +1771,7 @@ def run_causal_intervention(
         target_position = int(record["target_token_index"])
         positions = jnp.full(
             (input_ids.shape[0],), target_position, dtype=jnp.int32)
-        baseline_logits, baseline_residual = jax.device_get(
+        baseline_logits, _, baseline_residual = jax.device_get(
             suppression_forward(
                 ctx.params, input_ids, positions, jnp.int32(0), jnp.int32(0),
                 jnp.zeros((input_ids.shape[0],), jnp.int32),
@@ -1501,7 +1802,7 @@ def run_causal_intervention(
                     ctx, pool, int(candidate["operator_id"]))
                 selected_operator_ids = jnp.full(
                     (input_ids.shape[0],), operator_id, jnp.int32)
-                logits, residual = jax.device_get(suppression_forward(
+                logits, _, residual = jax.device_get(suppression_forward(
                     ctx.params, input_ids, positions,
                     jnp.int32(candidate["layer"]), jnp.int32(pool_codes[pool]),
                     selected_operator_ids, jnp.bool_(True)))

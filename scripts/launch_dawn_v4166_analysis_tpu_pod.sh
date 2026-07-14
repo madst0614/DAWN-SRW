@@ -205,6 +205,7 @@ while [[ $# -gt 0 ]]; do
         --from-scratch) ANALYSIS_ARGS="$ANALYSIS_ARGS --from-scratch"; shift ;;
         --retry-failed) ANALYSIS_ARGS="$ANALYSIS_ARGS --retry-failed"; shift ;;
         --fail-fast) ANALYSIS_ARGS="$ANALYSIS_ARGS --fail-fast"; shift ;;
+        --parity-only) ANALYSIS_ARGS="$ANALYSIS_ARGS --v4171-parity-only"; shift ;;
         --mesh-data) ANALYSIS_ARGS="$ANALYSIS_ARGS --mesh-data $2"; shift 2 ;;
         --mesh-model) ANALYSIS_ARGS="$ANALYSIS_ARGS --mesh-model $2"; shift 2 ;;
         --eval-max-tokens) ANALYSIS_ARGS="$ANALYSIS_ARGS --eval-max-tokens $2"; shift 2 ;;
@@ -297,6 +298,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --from-scratch            Disable analysis artifact resume"
             echo "  --retry-failed"
             echo "  --fail-fast"
+            echo "  --parity-only             Run v4171 exact parity smoke and exit before traces"
             echo "  --mesh-data N"
             echo "  --mesh-model N"
             echo "  --max-jobs-per-stage N"
