@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import time
 import zipfile
@@ -25,13 +27,70 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-import numpy as np
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_DEPS = PROJECT_ROOT / ".generated" / "operator_probe_deps"
 for candidate in (PROJECT_ROOT, LOCAL_DEPS):
     if candidate.exists() and str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
+
+PREPARATION_DEPENDENCIES = (
+    "numpy==1.26.4",
+    "pyarrow==20.0.0",
+    "transformers==4.40.2",
+    "fsspec==2024.3.1",
+    "gcsfs==2024.3.1",
+)
+PREPARATION_MODULES = ("numpy", "pyarrow", "transformers", "gcsfs")
+
+
+def bootstrap_preparation_dependencies() -> None:
+    """Install dataset-only dependencies into an ignored repository cache."""
+    missing = [
+        module for module in PREPARATION_MODULES
+        if importlib.util.find_spec(module) is None
+    ]
+    if not missing:
+        return
+    install_command = [
+        sys.executable, "-m", "pip", "install",
+        "--disable-pip-version-check", "--upgrade", "--target",
+        str(LOCAL_DEPS), *PREPARATION_DEPENDENCIES,
+    ]
+    enabled = str(os.environ.get(
+        "DAWN_OPERATOR_DATASET_AUTO_INSTALL_DEPS", "1"
+    )).strip().lower() not in {"0", "false", "no"}
+    if not enabled:
+        raise RuntimeError(
+            "Missing operator dataset dependencies: " + ", ".join(missing)
+            + "\nRun: " + " ".join(install_command))
+    LOCAL_DEPS.mkdir(parents=True, exist_ok=True)
+    if str(LOCAL_DEPS) not in sys.path:
+        sys.path.insert(0, str(LOCAL_DEPS))
+    print(
+        "BOOTSTRAP OPERATOR DATASET DEPS: " + ",".join(missing)
+        + f" -> {LOCAL_DEPS}",
+        flush=True,
+    )
+    try:
+        subprocess.check_call(install_command)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "Failed to install operator dataset dependencies. Run manually: "
+            + " ".join(install_command)) from exc
+    importlib.invalidate_caches()
+    unresolved = [
+        module for module in PREPARATION_MODULES
+        if importlib.util.find_spec(module) is None
+    ]
+    if unresolved:
+        raise RuntimeError(
+            "Operator dataset dependency bootstrap completed but imports are "
+            "still missing: " + ", ".join(unresolved))
+
+
+bootstrap_preparation_dependencies()
+
+import numpy as np  # noqa: E402
 
 from analysis.dawn_analysis_storage import (  # noqa: E402
     exists,
