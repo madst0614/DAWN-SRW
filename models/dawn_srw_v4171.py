@@ -572,6 +572,32 @@ def _composition_den_floor_mass(
     return 1.0
 
 
+def analysis_operator_membership(global_operator_ids, selected_operator_ids):
+    """Build the analysis-only single/group suppression membership mask.
+
+    The existing single-id shape is ``[B]``.  Group analysis uses one static,
+    ``-1`` padded ``[B, M]`` shape for every requested group size.  This helper
+    changes only which execution numerators are zeroed; admission and every
+    production denominator/statistic remain untouched.
+    """
+    global_operator_ids = jnp.asarray(global_operator_ids, dtype=jnp.int32)
+    selected_operator_ids = jnp.asarray(
+        selected_operator_ids, dtype=jnp.int32)
+    if selected_operator_ids.ndim == 1:
+        return (
+            global_operator_ids[None, None, :]
+            == selected_operator_ids[:, None, None])
+    if selected_operator_ids.ndim == 2:
+        return jnp.any(
+            global_operator_ids[None, None, :, None]
+            == selected_operator_ids[:, None, None, :],
+            axis=-1,
+        )
+    raise ValueError(
+        "selected operator ids must have shape [B] or [B, M], got "
+        f"{selected_operator_ids.shape}")
+
+
 def _pool_params_with_operator_keys(pool_params):
     """Validate and return the pool, whose learned op keys are already stored."""
     _pool_operator_keys(pool_params)
@@ -2805,9 +2831,8 @@ def _make_sharded_srw_minimal_impl(
             token_match = (
                 jnp.arange(S, dtype=jnp.int32)[None, :, None]
                 == target_positions[:, None, None])
-            operator_match = (
-                global_ids[None, None, :]
-                == selected_global_operator_id[:, None, None])
+            operator_match = analysis_operator_membership(
+                global_ids, selected_global_operator_id)
             route_match = jnp.bool_(True)
             suppress_mask = (
                 jnp.asarray(apply_suppression, dtype=jnp.bool_)
@@ -3128,9 +3153,8 @@ def _make_sharded_srw_paired_minimal_impl(
             token_match = (
                 jnp.arange(S, dtype=jnp.int32)[None, :, None, None]
                 == target_positions[:, None, None, None])
-            operator_match = (
-                global_ids[None, None, None, :]
-                == selected_global_operator_id[:, None, None, None])
+            operator_match = analysis_operator_membership(
+                global_ids, selected_global_operator_id)[:, :, None, :]
             route_match = (
                 jnp.arange(2, dtype=jnp.int32)[None, None, :, None]
                 == jnp.asarray(route_selector, dtype=jnp.int32))
@@ -4498,7 +4522,8 @@ class DAWN_SRW_V4171(nn.Module):
                  analysis_intervention_enabled=False,
                  analysis_return_residual=False,
                  analysis_return_logits=False,
-                 analysis_parity_debug=False):
+                 analysis_parity_debug=False,
+                 analysis_causal_trace=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -4848,6 +4873,9 @@ class DAWN_SRW_V4171(nn.Module):
             layer_rngs = jax.random.split(base_rng, self.n_layers)
 
             if minimal_train:
+                trace_minimal_layers = bool(
+                    analysis_parity_debug or analysis_causal_trace)
+
                 def scan_body_minimal(carry, xs):
                     x = carry
                     bp = xs['params']
@@ -4880,8 +4908,8 @@ class DAWN_SRW_V4171(nn.Module):
                         analysis_target_route=analysis_target_route,
                         analysis_intervention_enabled=(
                             analysis_intervention_enabled),
-                        parity_debug=analysis_parity_debug)
-                    if analysis_parity_debug:
+                        parity_debug=trace_minimal_layers)
+                    if trace_minimal_layers:
                         attn_values = attn_result[:-1]
                         attn_debug = attn_result[-1]
                     else:
@@ -4908,6 +4936,7 @@ class DAWN_SRW_V4171(nn.Module):
                      v_normalized_srw_out_norm,
                      v_pool_scaled_srw_out_norm) = attn_values
                     x = x + attn_out
+                    post_attention_residual = x
 
                     normed = _layer_norm(
                         x, bp['norm2']['scale'], bp['norm2']['bias'])
@@ -4932,8 +4961,8 @@ class DAWN_SRW_V4171(nn.Module):
                         analysis_target_route=analysis_target_route,
                         analysis_intervention_enabled=(
                             analysis_intervention_enabled),
-                        parity_debug=analysis_parity_debug)
-                    if analysis_parity_debug:
+                        parity_debug=trace_minimal_layers)
+                    if trace_minimal_layers:
                         rst_values = rst_result[:-1]
                         rst_debug = rst_result[-1]
                     else:
@@ -5010,12 +5039,13 @@ class DAWN_SRW_V4171(nn.Module):
                         jax.lax.stop_gradient(
                             residual_norm.astype(jnp.float32)),
                     )
-                    if analysis_parity_debug:
+                    if trace_minimal_layers:
                         layer_stats += (
                             attn_debug[0],
                             attn_debug[1],
                             attn_debug[2],
                             attn_debug[3],
+                            post_attention_residual,
                             rst_debug[0],
                             x_next,
                         )
@@ -5031,11 +5061,12 @@ class DAWN_SRW_V4171(nn.Module):
                 }
                 x, minimal_stats = jax.lax.scan(
                     scan_body_minimal, x, xs_minimal)
-                if analysis_parity_debug:
-                    minimal_values = minimal_stats[:-6]
+                if trace_minimal_layers:
+                    minimal_values = minimal_stats[:-7]
                     (parity_q_all, parity_k_all, parity_v_all,
-                     parity_attention_update_all, parity_rst_all,
-                     parity_post_layer_residual_all) = minimal_stats[-6:]
+                     parity_attention_update_all,
+                     parity_post_attention_residual_all, parity_rst_all,
+                     parity_post_layer_residual_all) = minimal_stats[-7:]
                 else:
                     minimal_values = minimal_stats
                 (q_active_all, k_active_all, v_active_all, rst_active_all,
@@ -5087,6 +5118,25 @@ class DAWN_SRW_V4171(nn.Module):
                 qk_tau_all = jnp.float32(0.5) * (q_tau_all + k_tau_all)
                 attn_tau_all = (
                     q_tau_all + k_tau_all + v_tau_all) / jnp.float32(3.0)
+                if analysis_causal_trace:
+                    trace_batch = jnp.arange(B, dtype=jnp.int32)
+                    trace_positions = jnp.clip(
+                        jnp.asarray(
+                            analysis_target_positions, dtype=jnp.int32),
+                        0, S - 1)
+
+                    def target_trace(value):
+                        return value[:, trace_batch, trace_positions, :]
+
+                    causal_trace = {
+                        'post_attention_residual': target_trace(
+                            parity_post_attention_residual_all),
+                        'post_layer_residual': target_trace(
+                            parity_post_layer_residual_all),
+                        'attention_update': target_trace(
+                            parity_attention_update_all),
+                        'rst_update': target_trace(parity_rst_all),
+                    }
                 x = self.norm(x)
                 if labels is None:
                     vocab_argmax = (
@@ -5109,6 +5159,8 @@ class DAWN_SRW_V4171(nn.Module):
                                 'post_layer_residual': (
                                     parity_post_layer_residual_all),
                             }
+                        if analysis_causal_trace:
+                            output['causal_trace'] = causal_trace
                         return output
                     if vp_embed is not None:
                         raise NotImplementedError(
@@ -5133,6 +5185,8 @@ class DAWN_SRW_V4171(nn.Module):
                             'post_layer_residual': (
                                 parity_post_layer_residual_all),
                         }
+                    if analysis_causal_trace:
+                        output['causal_trace'] = causal_trace
                     return output
 
                 (loss, per_token_ce, correct, valid_count,
@@ -5313,6 +5367,8 @@ class DAWN_SRW_V4171(nn.Module):
                         'post_layer_residual': (
                             parity_post_layer_residual_all),
                     }
+                if analysis_causal_trace:
+                    output['causal_trace'] = causal_trace
                 return output
 
             def scan_body(carry, xs):
@@ -6325,6 +6381,38 @@ class DAWN_SRW_V4171(nn.Module):
             attention_mask=attention_mask,
             minimal_train=True,
             analysis_contribution=selected_global_operator_id,
+            analysis_target_layer=target_layer,
+            analysis_target_positions=target_positions,
+            analysis_target_route=route_selector,
+            analysis_intervention_enabled=apply_suppression,
+            analysis_return_residual=return_residual,
+            **production_kwargs,
+        )
+
+    def analysis_forward_with_operator_group_suppression(
+            self, input_ids, selected_global_operator_ids, target_layer,
+            target_positions, route_selector, *, labels=None,
+            attention_mask=None, apply_suppression=True,
+            return_residual=True, **production_kwargs):
+        """Suppress one fixed-width, ``-1`` padded operator-id group.
+
+        Every group size, including the all-``-1`` size-zero baseline, uses
+        the same ``[B, M]`` input shape and therefore the same compiled graph.
+        Q/K route selection and all production admission/denominator semantics
+        are identical to single-operator suppression.
+        """
+        selected_global_operator_ids = jnp.asarray(
+            selected_global_operator_ids, dtype=jnp.int32)
+        if selected_global_operator_ids.ndim != 2:
+            raise ValueError(
+                "group operator ids must have shape [B, M], got "
+                f"{selected_global_operator_ids.shape}")
+        return self(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            minimal_train=True,
+            analysis_contribution=selected_global_operator_ids,
             analysis_target_layer=target_layer,
             analysis_target_positions=target_positions,
             analysis_target_route=route_selector,

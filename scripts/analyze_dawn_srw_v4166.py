@@ -292,11 +292,39 @@ def parse_args() -> argparse.Namespace:
         help="Target-only sparse top-k for RST transition traces.",
     )
     p.add_argument(
+        "--transition-capture-threshold", type=float, default=0.95,
+        help="Minimum captured mass for qualified transition observations.")
+    p.add_argument(
+        "--transition-adaptive-capture",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="Retry only low-capture transition rows at cached larger top-k tiers.")
+    p.add_argument(
         "--causal-max-prompts",
         type=int,
         default=int(os.environ.get("DAWN_V4171_CAUSAL_MAX_PROMPTS", 6)),
         help="Maximum controlled prompts used by the causal_intervention item.",
     )
+    p.add_argument(
+        "--functional-graph-max-operators-qk", type=int, default=2048,
+        help="Maximum deterministic QK candidates in the functional graph.")
+    p.add_argument(
+        "--functional-graph-max-operators-v", type=int, default=2048,
+        help="Maximum deterministic V candidates in the functional graph.")
+    p.add_argument(
+        "--functional-graph-max-operators-rst", type=int, default=2048,
+        help="Maximum deterministic RST candidates in the functional graph.")
+    p.add_argument(
+        "--functional-graph-neighbor-k", type=int, default=16,
+        help="Top neighbors retained per operator and similarity view.")
+    p.add_argument(
+        "--group-causal-sizes", default="1,2,4,8",
+        help="Comma-separated group sizes evaluated in one fixed-width graph.")
+    p.add_argument(
+        "--group-causal-max-width", type=int, default=8,
+        help="Static padded operator-id width for every group intervention.")
+    p.add_argument(
+        "--group-causal-max-prompts", type=int, default=None,
+        help="Optional deterministic prompt cap for group interventions.")
     p.add_argument(
         "--train-analysis-generation-max-prompts",
         type=int,
@@ -2211,6 +2239,20 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
                 "status": "not_requested", "root": args.operator_dataset_root,
             }),
         "reference_400m": compare,
+        "causal_baseline": (
+            (v4171_transition_analysis.get("causal_intervention") or {}).get(
+                "causal_baseline", "canonical_suppression_disabled")
+            if model_version == "spatial-r1-v4.1.7.1" else None),
+        "effect_reference": (
+            (v4171_transition_analysis.get("causal_intervention") or {}).get(
+                "effect_reference", "canonical_suppression_disabled")
+            if model_version == "spatial-r1-v4.1.7.1" else None),
+        "canonical_parity_machine_exact": (
+            (v4171_transition_analysis.get("causal_intervention") or {}).get(
+                "canonical_parity_machine_exact")
+            if model_version == "spatial-r1-v4.1.7.1" else None),
+        "cross_graph_audit_blocking": (
+            False if model_version == "spatial-r1-v4.1.7.1" else None),
         "warnings": warnings,
     }
     scalar = _scalar_row(summary)

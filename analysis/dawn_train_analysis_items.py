@@ -194,6 +194,30 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
         "summary": "CAUSAL_INTERVENTION subtracts a selected post-denominator production contribution and blocks on exact zero-vector parity.",
         "requires": ("v4171_transition",),
     },
+    "causal_recovery_trace": {
+        "title": "v4171 causal recovery trace",
+        "measures": "Immediate target-state damage, downstream layer recovery/amplification, final residual/logit effects, and distribution-relative phenomena.",
+        "summary": "CAUSAL RECOVERY TRACE separates small immediate effects from downstream compensation and amplification.",
+        "requires": ("v4171_transition",),
+    },
+    "operator_functional_graph": {
+        "title": "v4171 operator functional graph",
+        "measures": "Rank-1 RW functional similarity, address similarity, sparse activation/contribution profiles, nearest neighbors, and conservative mutual-neighbor families.",
+        "summary": "OPERATOR FUNCTIONAL GRAPH distinguishes reusable RW function from context-specialized addressing.",
+        "requires": ("v4171_transition",),
+    },
+    "group_causal_intervention": {
+        "title": "v4171 group causal intervention",
+        "measures": "Fixed-width family/address/coactivation/random group suppression, dose response, recovery, and synergy against available single effects.",
+        "summary": "GROUP CAUSAL INTERVENTION tests whether weak single effects are explained by functional redundancy.",
+        "requires": ("v4171_transition",),
+    },
+    "causal_ranking_calibration": {
+        "title": "v4171 causal ranking calibration",
+        "measures": "Gate/contribution/immediate/final causal Spearman inference, strategy win rates, and bootstrap/permutation judgments.",
+        "summary": "CAUSAL RANKING CALIBRATION tests whether local gate and contribution rankings predict final causal importance.",
+        "requires": ("v4171_transition",),
+    },
     "decision_reason": {
         "title": "Decision reason",
         "measures": "explicit numeric guardrails behind the final keep/watch/change decision.",
@@ -245,9 +269,20 @@ V4171_SELF_ORGANIZATION_ITEMS = (
     "causal_intervention",
 )
 
+V4171_OPERATOR_FAMILY_EXTRA_ITEMS = (
+    "causal_recovery_trace",
+    "operator_functional_graph",
+    "group_causal_intervention",
+    "causal_ranking_calibration",
+)
+
+V4171_OPERATOR_FAMILY_ITEMS = (
+    V4171_SELF_ORGANIZATION_ITEMS + V4171_OPERATOR_FAMILY_EXTRA_ITEMS)
+
 V4171_ITEMS = tuple(
     item for item in TRAIN_ANALYSIS_ITEM_DEFS
     if item not in V4171_SELF_ORGANIZATION_ITEMS
+    and item not in V4171_OPERATOR_FAMILY_EXTRA_ITEMS
     and item not in OPERATOR_ANALYSIS_ITEM_IDS
 )
 
@@ -279,6 +314,8 @@ TRAIN_ANALYSIS_PRESETS = {
     "v4166_1b": V4166_1B_ITEMS,
     "v4171": V4171_ITEMS,
     "v4171_self_organization": V4171_SELF_ORGANIZATION_ITEMS,
+    "v4171_operator_family": V4171_OPERATOR_FAMILY_ITEMS,
+    "v4171_self_organization_extended": V4171_OPERATOR_FAMILY_ITEMS,
     "deep": V4166_1B_ITEMS,
     "full": V4171_ITEMS,
 }
@@ -969,6 +1006,13 @@ def _item_lines_trajectory_trace(summary: Dict[str, Any], fmt: TrainAnalysisForm
         out.append(
             f"  captured {pool:<3}    : mean={fmt.pct(row.get('mean'), 2)} "
             f"min={fmt.pct(row.get('min'), 2)} p10={fmt.pct(row.get('p10'), 2)}")
+    adaptive = data.get("adaptive_capture", {})
+    out.extend([
+        "  ADAPTIVE CAPTURE:",
+        f"  enabled/threshold: {adaptive.get('enabled', False)}/{fmt.num(adaptive.get('threshold'), 3)}",
+        f"  retry/recovered : {adaptive.get('retry_rows', 0)}/{adaptive.get('recovered_rows', 0)}",
+        f"  remaining low   : {adaptive.get('remaining_low_capture_rows', 0)}",
+    ])
     return out
 
 
@@ -1038,22 +1082,20 @@ def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisF
     control = data.get(
         "control_behavior_score_drop",
         data.get("control_abs_target_logprob_delta", {}))
-    diagnostic = data.get("zero_subtraction_parity") or data.get(
-        "intervention_forward_cross_graph_diagnostic",
-        data.get("intervention_forward_parity", {}),
-    )
+    parity = data.get("zero_suppression_parity") or {}
+    cross_graph = data.get("normal_production_cross_graph_audit") or {}
     out = [
         "  CAUSAL_INTERVENTION:",
         f"  status          : {data.get('status', 'missing')}",
         f"  type            : {data.get('intervention_type', 'n/a')}",
         f"  canonical_den   : {data.get('canonical_unpruned_admission_denominator', False)}",
-        f"  baseline        : {data.get('canonical_baseline_source', 'legacy')}",
-        f"  effect reference: {data.get('effect_reference', 'legacy')}",
+        f"  baseline        : {data.get('causal_baseline', 'canonical_suppression_disabled')}",
+        f"  effect reference: {data.get('effect_reference', 'canonical_suppression_disabled')}",
+        f"  parity           : machine_exact={parity.get('machine_exact')}",
+        f"  parity CE/logit  : ce={fmt.num(parity.get('ce_abs_diff'), 6)} mean={fmt.num(parity.get('mean_logit_abs_diff'), 6)} max={fmt.num(parity.get('max_logit_abs_diff'), 6)}",
+        f"  parity residual  : max_abs={fmt.num(parity.get('final_residual_max_abs_diff'), 6)}",
+        f"  cross graph audit: machine_exact={cross_graph.get('machine_exact')} blocking={cross_graph.get('blocking', False)}",
         f"  prompts/jobs    : {data.get('num_prompts', 0)}/{data.get('num_interventions', 0)} skipped={data.get('num_skipped', 0)}",
-        "  INTERVENTION_FORWARD_DIAGNOSTIC:",
-        f"  diagnostic      : status={diagnostic.get('status', 'missing')} blocking={diagnostic.get('blocking', 'legacy')} threshold_passed={diagnostic.get('threshold_passed', 'n/a')}",
-        f"  diagnostic CE/logit: ce={fmt.num(diagnostic.get('ce_abs_diff'), 6)} mean={fmt.num(diagnostic.get('mean_logit_abs_diff'), 6)} max={fmt.num(diagnostic.get('max_logit_abs_diff'), 6)}",
-        f"  diagnostic top1/res: top1={fmt.num(diagnostic.get('top1_agreement'), 6)} residual_cos={fmt.num(diagnostic.get('final_residual_cosine'), 8)}",
         f"  selected effect : mean={fmt.num(selected.get('mean'), 5)} ci95={selected.get('ci95')} n={selected.get('n', 0)}",
         f"  control effect  : mean={fmt.num(control.get('mean'), 5)} ci95={control.get('ci95')} n={control.get('n', 0)}",
         f"  selected-control: {fmt.delta(data.get('selected_minus_control_effect'), 5)}",
@@ -1068,6 +1110,65 @@ def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisF
                 f"ci95={row.get('bootstrap_ci95')} kl={fmt.num(row.get('mean_kl'), 5)} "
                 f"top1_change={fmt.pct(row.get('top_prediction_changed_fraction'), 2)}")
     return out
+
+
+def _item_lines_causal_recovery_trace(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    data = _v4171_item(summary, "causal_recovery_trace")
+    overall = data.get("overall", {})
+    return [
+        "  CAUSAL RECOVERY TRACE:",
+        f"  status          : {data.get('status', 'not_requested')}",
+        f"  rows            : {overall.get('n', 0)}",
+        f"  immediate/final : {fmt.num(overall.get('immediate_delta_mean'), 5)}/{fmt.num(overall.get('final_delta_mean'), 5)}",
+        f"  recovery ratio  : mean={fmt.num(overall.get('recovery_ratio_mean'), 4)} ci95={overall.get('recovery_ratio_ci95')}",
+        f"  recovery/amplify: {fmt.pct(overall.get('recovery_fraction'), 2)}/{fmt.pct(overall.get('amplification_fraction'), 2)}",
+        f"  classification  : {data.get('classification_basis', {})}",
+        f"  artifacts       : {data.get('artifacts', {})}",
+    ]
+
+
+def _item_lines_operator_functional_graph(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    data = _v4171_item(summary, "operator_functional_graph")
+    out = [
+        "  OPERATOR FUNCTIONAL GRAPH:",
+        f"  status/artifacts: {data.get('status', 'not_requested')} {data.get('artifacts', {})}",
+    ]
+    for pool, row in (data.get("pools") or {}).items():
+        out.append(
+            f"  {pool}: candidates={row.get('candidate_operator_count', 0)} "
+            f"coverage={fmt.pct(row.get('candidate_pool_coverage'), 2)} "
+            f"families={row.get('family_count', 0)} singleton={fmt.pct(row.get('singleton_fraction'), 2)} "
+            f"fHi/aLo={fmt.pct(row.get('function_high_address_low_fraction'), 2)} "
+            f"rho(address,function)={fmt.num(row.get('address_function_spearman'), 3)}")
+    return out
+
+
+def _item_lines_group_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
+    data = _v4171_item(summary, "group_causal_intervention")
+    out = [
+        "  GROUP CAUSAL INTERVENTION:",
+        f"  status/width    : {data.get('status', 'not_requested')}/{data.get('fixed_width', 'n/a')}",
+        f"  sizes           : {data.get('group_sizes', [])}",
+        f"  comparisons     : {data.get('comparisons', {})}",
+        f"  artifacts       : {data.get('artifacts', {})}",
+    ]
+    for group_type, row in (data.get("by_group_type") or {}).items():
+        out.append(
+            f"  {group_type}: n={row.get('n', 0)} "
+            f"abs_effect={fmt.num(row.get('mean_abs_target_logprob_delta'), 5)} "
+            f"synergy={fmt.num(row.get('mean_synergy'), 5)}")
+    return out
+
+
+def _item_lines_causal_ranking_calibration(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
+    data = _v4171_item(summary, "causal_ranking_calibration")
+    return [
+        "  CAUSAL RANKING CALIBRATION:",
+        f"  status/rows     : {data.get('status', 'not_requested')}/{data.get('row_count', 0)}",
+        f"  judgments       : {data.get('judgments', {})}",
+        f"  pairwise wins   : {data.get('pairwise_win_rates', {})}",
+        f"  artifacts       : {data.get('artifacts', {})}",
+    ]
 
 
 def _item_lines_decision_reason(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
@@ -1104,6 +1205,10 @@ TRAIN_ANALYSIS_ITEM_FORMATTERS = {
     "context_divergence": _item_lines_context_divergence,
     "state_transition_decoupling": _item_lines_state_transition_decoupling,
     "causal_intervention": _item_lines_causal_intervention,
+    "causal_recovery_trace": _item_lines_causal_recovery_trace,
+    "operator_functional_graph": _item_lines_operator_functional_graph,
+    "group_causal_intervention": _item_lines_group_causal_intervention,
+    "causal_ranking_calibration": _item_lines_causal_ranking_calibration,
     "decision_reason": _item_lines_decision_reason,
 }
 
@@ -1179,9 +1284,11 @@ def item_status(summary: Dict[str, Any], item: str) -> str:
     if item == "generation_samples":
         generation = summary.get("generation_samples", {})
         return str(generation.get("status") or "missing")
-    if item in V4171_SELF_ORGANIZATION_ITEMS:
+    if item in V4171_OPERATOR_FAMILY_ITEMS:
         data = (summary.get("v4171_transition_analysis") or {}).get(item, {})
-        return str(data.get("status") or "missing")
+        status = str(data.get("status") or "not_requested")
+        return status if status in {
+            "ready", "partial", "not_requested", "failed"} else "partial"
     if item in OPERATOR_ANALYSIS_ITEM_IDS:
         result = (summary.get("operator_analysis", {}).get("items", {}) or {}).get(item, {})
         status = str(result.get("status") or "missing_dataset")

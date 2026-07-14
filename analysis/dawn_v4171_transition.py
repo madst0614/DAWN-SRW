@@ -13,6 +13,7 @@ import math
 import re
 import time
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -23,10 +24,15 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    git_info,
     maybe_load_tokenizer,
 )
 from analysis.dawn_analysis_storage import (
+    exists,
     open_path,
+    read_json,
+    read_jsonl,
+    read_npz,
     write_csv_atomic,
     write_json_atomic,
     write_jsonl_atomic,
@@ -40,6 +46,9 @@ from analysis.dawn_analysis_trace import (
     topk_trace_forward,
 )
 V4171_MODEL_VERSION = "spatial-r1-v4.1.7.1"
+ANALYSIS_SCHEMA_VERSION = 2
+ANALYSIS_CODE_SCHEMA_HASH = hashlib.sha256(
+    b"v4171-operator-family-analysis-schema-2").hexdigest()
 DEFAULT_TRANSITION_PROMPT_SET = str(
     Path(__file__).resolve().parent / "prompts" / "v4171_transition_pairs.jsonl"
 )
@@ -49,8 +58,288 @@ CORE_TRANSITION_ITEMS = (
     "context_divergence",
     "state_transition_decoupling",
     "causal_intervention",
+    "causal_recovery_trace",
+    "operator_functional_graph",
+    "group_causal_intervention",
+    "causal_ranking_calibration",
 )
+ITEM_DEPENDENCIES = {
+    "causal_recovery_trace": ("causal_intervention",),
+    "operator_functional_graph": ("trajectory_trace",),
+    "group_causal_intervention": (
+        "operator_functional_graph", "causal_intervention"),
+    "causal_ranking_calibration": (
+        "causal_intervention", "causal_recovery_trace"),
+}
 PAIR_CAPTURE_THRESHOLD = 0.95
+ADAPTIVE_CAPTURE_TIERS = {
+    "qk": (512, 1024, 2048),
+    "v": (2048, 4096, 8192),
+    "rst": (4096, 8192),
+}
+
+
+def _unit_rows(values: Any) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64)
+    norms = np.linalg.norm(array, axis=-1, keepdims=True)
+    return array / np.maximum(norms, 1.0e-12)
+
+
+def rw_functional_similarity(
+        read_left: Any, write_left: Any,
+        read_right: Any, write_right: Any) -> np.ndarray:
+    """Frobenius cosine of normalized rank-1 read/write operators."""
+    read_cos = np.sum(
+        _unit_rows(read_left) * _unit_rows(read_right), axis=-1)
+    write_cos = np.sum(
+        _unit_rows(write_left) * _unit_rows(write_right), axis=-1)
+    return np.asarray(read_cos * write_cos)
+
+
+def classify_function_address_pairs(
+        functional_similarity: Sequence[float],
+        address_similarity: Sequence[float],
+        *, high_quantile: float = 0.90,
+        low_quantile: float = 0.50) -> Dict[str, Any]:
+    """Classify pair similarities with thresholds learned from observations."""
+    functional = np.asarray(functional_similarity, dtype=np.float64)
+    address = np.asarray(address_similarity, dtype=np.float64)
+    if functional.shape != address.shape:
+        raise ValueError("functional and address similarities must align")
+    valid = np.isfinite(functional) & np.isfinite(address)
+    if not np.any(valid):
+        return {
+            "thresholds": {}, "labels": [None] * int(functional.size),
+            "counts": {},
+        }
+    f_high = float(np.quantile(functional[valid], high_quantile))
+    f_low = float(np.quantile(functional[valid], low_quantile))
+    a_high = float(np.quantile(address[valid], high_quantile))
+    a_low = float(np.quantile(address[valid], low_quantile))
+    labels: List[Optional[str]] = []
+    counts: Dict[str, int] = defaultdict(int)
+    for f_value, a_value in zip(functional.ravel(), address.ravel()):
+        if not (math.isfinite(float(f_value)) and math.isfinite(float(a_value))):
+            labels.append(None)
+            continue
+        function_band = (
+            "high" if float(f_value) >= f_high else
+            "low" if float(f_value) <= f_low else None)
+        address_band = (
+            "high" if float(a_value) >= a_high else
+            "low" if float(a_value) <= a_low else None)
+        if function_band is None or address_band is None:
+            labels.append(None)
+            counts["mid_similarity_unclassified"] += 1
+            continue
+        label = (
+            f"function_{function_band}_address_{address_band}")
+        labels.append(label)
+        counts[label] += 1
+    return {
+        "thresholds": {
+            "high_quantile": float(high_quantile),
+            "low_quantile": float(low_quantile),
+            "functional_high": f_high,
+            "functional_low": f_low,
+            "address_high": a_high,
+            "address_low": a_low,
+        },
+        "labels": labels,
+        "counts": dict(counts),
+    }
+
+
+def mutual_neighbor_families(
+        neighbor_ids: Mapping[int, Sequence[Any]],
+        qualified_edges: Sequence[Tuple[int, int]] = ()) -> List[List[int]]:
+    """Build deterministic union-find components from conservative edges."""
+    nodes = sorted(int(node) for node in neighbor_ids)
+    parent = {node: node for node in nodes}
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: int, right: int) -> None:
+        if left not in parent or right not in parent:
+            return
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            low, high = sorted((root_left, root_right))
+            parent[high] = low
+
+    normalized = {
+        node: {
+            int(value.get("operator_id") if isinstance(value, Mapping) else value)
+            for value in values
+        }
+        for node, values in neighbor_ids.items()
+    }
+    for left in nodes:
+        for right in normalized.get(left, set()):
+            if right in normalized and left in normalized[right]:
+                union(left, right)
+    for left, right in qualified_edges:
+        union(int(left), int(right))
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for node in nodes:
+        groups[find(node)].append(node)
+    return sorted((sorted(group) for group in groups.values()), key=lambda x: x[0])
+
+
+def _layer_vector(trace: Mapping[str, Any], key: str) -> np.ndarray:
+    value = np.asarray(trace[key], dtype=np.float64)
+    if value.ndim == 3:
+        value = value[:, 0, :]
+    if value.ndim != 2:
+        raise ValueError(f"trace {key} must have shape [L,D] or [L,B,D]")
+    return value
+
+
+def compute_causal_recovery_metrics(
+        baseline_trace: Mapping[str, Any],
+        intervention_trace: Mapping[str, Any], *, route: str,
+        target_layer: int, baseline_final_residual: Any,
+        intervention_final_residual: Any, baseline_logits: Any,
+        intervention_logits: Any, target_position: int) -> Dict[str, Any]:
+    """Measure immediate damage and downstream recovery on target vectors."""
+    immediate_key = (
+        "post_layer_residual" if str(route) == "rst"
+        else "post_attention_residual")
+    baseline_immediate = _layer_vector(baseline_trace, immediate_key)
+    after_immediate = _layer_vector(intervention_trace, immediate_key)
+    baseline_post = _layer_vector(baseline_trace, "post_layer_residual")
+    after_post = _layer_vector(intervention_trace, "post_layer_residual")
+    layer = int(target_layer)
+    immediate_delta = float(np.linalg.norm(
+        after_immediate[layer] - baseline_immediate[layer]))
+    immediate_relative = float(
+        immediate_delta
+        / max(float(np.linalg.norm(baseline_immediate[layer])), 1.0e-12))
+    per_norm = np.linalg.norm(after_post - baseline_post, axis=-1)
+    per_relative = per_norm / np.maximum(
+        np.linalg.norm(baseline_post, axis=-1), 1.0e-12)
+    per_cosine = [
+        _cosine(baseline_post[index], after_post[index])
+        for index in range(baseline_post.shape[0])
+    ]
+    baseline_final = np.asarray(baseline_final_residual, dtype=np.float64)
+    after_final = np.asarray(intervention_final_residual, dtype=np.float64)
+    if baseline_final.ndim > 1:
+        baseline_final = baseline_final.reshape(-1, baseline_final.shape[-1])[0]
+        after_final = after_final.reshape(-1, after_final.shape[-1])[0]
+    final_delta = float(np.linalg.norm(after_final - baseline_final))
+    final_relative = float(
+        final_delta / max(float(np.linalg.norm(baseline_final)), 1.0e-12))
+    denominator = max(immediate_delta, 1.0e-12)
+    remaining = per_norm / denominator
+    downstream = remaining[layer:]
+    maximum_index = layer + int(np.argmax(downstream))
+    minimum_index = layer + int(np.argmin(downstream))
+    half_indices = np.flatnonzero(downstream <= 0.5)
+    base_logits = np.asarray(baseline_logits, dtype=np.float64)
+    after_logits = np.asarray(intervention_logits, dtype=np.float64)
+    if base_logits.ndim == 3:
+        base_logits = base_logits[0]
+        after_logits = after_logits[0]
+    final_logit_delta = float(np.linalg.norm(
+        after_logits[int(target_position)] - base_logits[int(target_position)]))
+    return {
+        "immediate_state": immediate_key,
+        "immediate_delta_norm": immediate_delta,
+        "immediate_relative_delta": immediate_relative,
+        "per_layer_post_residual_delta_norm": per_norm.tolist(),
+        "per_layer_post_residual_delta_relative": per_relative.tolist(),
+        "per_layer_post_residual_cosine": per_cosine,
+        "final_delta_norm": final_delta,
+        "final_relative_delta": final_relative,
+        "recovery_ratio_final": final_delta / denominator,
+        "maximum_amplification_ratio": float(remaining[maximum_index]),
+        "maximum_amplification_layer": maximum_index,
+        "minimum_remaining_ratio": float(remaining[minimum_index]),
+        "minimum_remaining_layer": minimum_index,
+        "first_half_recovery_layer": (
+            layer + int(half_indices[0]) if half_indices.size else None),
+        "final_logit_delta": final_logit_delta,
+        "non_monotonic_path": bool(
+            downstream.size >= 3
+            and np.any(np.diff(downstream) < 0.0)
+            and np.any(np.diff(downstream) > 0.0)),
+    }
+
+
+def pad_group_operator_ids(
+        operator_ids: Sequence[int], max_width: int) -> np.ndarray:
+    ids = [int(value) for value in operator_ids]
+    if int(max_width) <= 0 or len(ids) > int(max_width):
+        raise ValueError("operator group exceeds fixed max width")
+    if len(set(ids)) != len(ids) or any(value < 0 for value in ids):
+        raise ValueError("operator group ids must be unique nonnegative values")
+    out = np.full((int(max_width),), -1, dtype=np.int32)
+    out[:len(ids)] = ids
+    return out
+
+
+def group_operator_membership_mask(
+        global_operator_ids: Any, selected_operator_ids: Any) -> np.ndarray:
+    global_ids = np.asarray(global_operator_ids, dtype=np.int32)
+    selected = np.asarray(selected_operator_ids, dtype=np.int32)
+    if selected.ndim == 1:
+        selected = selected[None, :]
+    return np.any(
+        global_ids[None, :, None] == selected[:, None, :], axis=-1)
+
+
+def _rankdata(values: Sequence[float]) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+    start = 0
+    while start < values.size:
+        end = start + 1
+        while end < values.size and values[order[end]] == values[order[start]]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
+        start = end
+    return ranks
+
+
+def spearman_correlation(xs: Sequence[float], ys: Sequence[float]) -> Optional[float]:
+    left = np.asarray(xs, dtype=np.float64)
+    right = np.asarray(ys, dtype=np.float64)
+    valid = np.isfinite(left) & np.isfinite(right)
+    if int(np.sum(valid)) < 2:
+        return None
+    left_rank, right_rank = _rankdata(left[valid]), _rankdata(right[valid])
+    if np.std(left_rank) == 0.0 or np.std(right_rank) == 0.0:
+        return None
+    return float(np.corrcoef(left_rank, right_rank)[0, 1])
+
+
+def pairwise_win_rate(
+        rows: Sequence[Mapping[str, Any]], left_strategy: str,
+        right_strategy: str, value_key: str) -> Dict[str, Any]:
+    grouped: Dict[Tuple[str, str], Dict[str, List[float]]] = defaultdict(
+        lambda: defaultdict(list))
+    for row in rows:
+        value = _json_float(row.get(value_key))
+        if value is None:
+            continue
+        grouped[(str(row.get("prompt_id")), str(row.get("pool")))][
+            str(row.get("strategy"))].append(abs(value))
+    outcomes = []
+    for strategies in grouped.values():
+        if left_strategy in strategies and right_strategy in strategies:
+            outcomes.append(
+                float(np.mean(strategies[left_strategy]))
+                > float(np.mean(strategies[right_strategy])))
+    return {
+        "n": len(outcomes),
+        "win_rate": float(np.mean(outcomes)) if outcomes else None,
+    }
 
 
 def _safe_id(value: str) -> str:
@@ -63,6 +352,106 @@ def _json_float(value: Any) -> Optional[float]:
     except Exception:
         return None
     return out if math.isfinite(out) else None
+
+
+def _analysis_provenance(
+        ctx: AnalysisContext, prompt_hash: Optional[str],
+        parity: Optional[Mapping[str, Any]] = None,
+        cross_graph: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    git_commit = git_info().get("git_commit") or "unknown"
+    analysis_config = {
+        "transition_max_prompts": getattr(
+            ctx.args, "transition_max_prompts", None),
+        "trace_seq_len": int(getattr(ctx.args, "trace_seq_len", 128) or 128),
+        "transition_topk_qk": int(getattr(
+            ctx.args, "transition_topk_qk", 512) or 512),
+        "transition_topk_v": int(getattr(
+            ctx.args, "transition_topk_v", 2048) or 2048),
+        "transition_topk_rst": int(getattr(
+            ctx.args, "transition_topk_rst", 4096) or 4096),
+        "transition_capture_threshold": float(getattr(
+            ctx.args, "transition_capture_threshold", PAIR_CAPTURE_THRESHOLD)
+            or PAIR_CAPTURE_THRESHOLD),
+        "transition_adaptive_capture": bool(getattr(
+            ctx.args, "transition_adaptive_capture", True)),
+        "causal_max_prompts": int(getattr(
+            ctx.args, "causal_max_prompts", 6) or 6),
+        "functional_graph_max_operators": {
+            pool: int(getattr(
+                ctx.args, f"functional_graph_max_operators_{pool}", 2048)
+                or 2048)
+            for pool in ("qk", "v", "rst")
+        },
+        "functional_graph_neighbor_k": int(getattr(
+            ctx.args, "functional_graph_neighbor_k", 16) or 16),
+        "group_causal_sizes": str(getattr(
+            ctx.args, "group_causal_sizes", "1,2,4,8")),
+        "group_causal_max_width": int(getattr(
+            ctx.args, "group_causal_max_width", 8) or 8),
+        "group_causal_max_prompts": getattr(
+            ctx.args, "group_causal_max_prompts", None),
+    }
+    analysis_config_hash = hashlib.sha256(json.dumps(
+        analysis_config, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    return {
+        "model_version": str(ctx.model_cfg.get("model_version", "unknown")),
+        "checkpoint_step": ctx.checkpoint_step,
+        "checkpoint_path": ctx.checkpoint_path,
+        "git_commit": git_commit,
+        "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+        "code_schema_hash": ANALYSIS_CODE_SCHEMA_HASH,
+        "analysis_config": analysis_config,
+        "analysis_config_hash": analysis_config_hash,
+        "prompt_hash": prompt_hash,
+        "composition_mode": str(ctx.model_cfg.get("srw_composition_mode")),
+        "admission_den_power": _json_float(
+            ctx.model_cfg.get("admission_den_power")),
+        "d_route": int(ctx.model_cfg.get("d_route", 0)),
+        "pool_sizes": {
+            "qk": int(ctx.model_cfg.get("n_qk", 0)),
+            "v": int(ctx.model_cfg.get("n_v", 0)),
+            "rst": int(ctx.model_cfg.get(
+                "n_rst", ctx.model_cfg.get("n_know", 0))),
+        },
+        "canonical_parity_machine_exact": (
+            bool(parity.get("machine_exact")) if parity else None),
+        "cross_graph_audit_machine_exact": (
+            bool(cross_graph.get("machine_exact")) if cross_graph else None),
+    }
+
+
+def _resume_summary_matches(
+        ctx: AnalysisContext, summary: Mapping[str, Any],
+        prompt_hash: Optional[str]) -> bool:
+    expected = _analysis_provenance(ctx, prompt_hash)
+    exact_keys = (
+        "model_version", "checkpoint_step", "checkpoint_path",
+        "analysis_schema_version",
+        "code_schema_hash", "analysis_config_hash", "prompt_hash", "composition_mode",
+        "admission_den_power", "d_route", "pool_sizes",
+    )
+    return all(summary.get(key) == expected.get(key) for key in exact_keys)
+
+
+def _load_resumable_summary(
+        ctx: AnalysisContext, filename: str, prompt_hash: Optional[str],
+        *, required_keys: Sequence[str] = ()) -> Optional[Dict[str, Any]]:
+    if not bool(getattr(ctx.args, "resume", True)):
+        return None
+    path = ctx.store.path(filename)
+    if not exists(path):
+        return None
+    summary = read_json(path, {})
+    if not isinstance(summary, dict) or not _resume_summary_matches(
+            ctx, summary, prompt_hash):
+        return None
+    if any(key not in summary for key in required_keys):
+        return None
+    if str(summary.get("status")) not in ("ready", "partial"):
+        return None
+    summary["resumed"] = True
+    return summary
 
 
 def _cosine(a: Any, b: Any) -> Optional[float]:
@@ -464,32 +853,57 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
     topk_qk = int(getattr(args, "transition_topk_qk", 512) or 512)
     topk_v = int(getattr(args, "transition_topk_v", 2048) or 2048)
     topk_rst = int(getattr(args, "transition_topk_rst", 4096) or 4096)
+    capture_threshold = float(getattr(
+        args, "transition_capture_threshold", PAIR_CAPTURE_THRESHOLD)
+        or PAIR_CAPTURE_THRESHOLD)
+    adaptive_capture = bool(getattr(
+        args, "transition_adaptive_capture", True))
     prompts = [_tokenize_transition_row(tokenizer, row, seq_len) for row in rows]
     _validate_tokenized_pairs(prompts)
+    resumed_summary = _load_resumable_summary(
+        ctx, "transition_trace_summary.json", prompt_hash,
+        required_keys=("num_prompts", "captured_mass_by_pool"))
+    if resumed_summary is not None:
+        resumed_records = _load_transition_trace_records(
+            ctx, prompts, resumed_summary, capture_threshold)
+        if resumed_records is not None:
+            if ctx.is_primary:
+                print(
+                    "TRANSITION_TRACE RESUME "
+                    f"prompts={len(prompts)} schema={ANALYSIS_SCHEMA_VERSION}",
+                    flush=True)
+            return resumed_summary, resumed_records
     candidate_seed = int(ctx.config.get("seed", 0))
     data_replicas = max(1, int(ctx.mesh.shape["data"]))
 
-    def trace_step(p, x, t):
-        trace = topk_trace_forward(
-            p,
-            ctx.model_cfg,
-            x,
-            topk_qk=topk_qk,
-            topk_v=topk_v,
-            topk_rst=topk_rst,
-            target_positions=t,
-            candidate_seed=candidate_seed,
-            production_srw_fns=ctx.sharded_fns,
-        )
-        return jax.tree.map(
-            lambda value: (
-                value[:, :1]
-                if value.ndim >= 2 and value.shape[1] == data_replicas
-                else value),
-            trace,
-        )
+    trace_fns: Dict[Tuple[int, int, int], Any] = {}
 
-    trace_fn = jax.jit(trace_step)
+    def trace_function(tops: Tuple[int, int, int]):
+        if tops not in trace_fns:
+            qk_value, v_value, rst_value = tops
+
+            def trace_step(p, x, t):
+                trace = topk_trace_forward(
+                    p,
+                    ctx.model_cfg,
+                    x,
+                    topk_qk=qk_value,
+                    topk_v=v_value,
+                    topk_rst=rst_value,
+                    target_positions=t,
+                    candidate_seed=candidate_seed,
+                    production_srw_fns=ctx.sharded_fns,
+                )
+                return jax.tree.map(
+                    lambda value: (
+                        value[:, :1]
+                        if value.ndim >= 2 and value.shape[1] == data_replicas
+                        else value),
+                    trace,
+                )
+
+            trace_fns[tops] = jax.jit(trace_step)
+        return trace_fns[tops]
     internal: List[Dict[str, Any]] = []
     jsonl_rows: List[Dict[str, Any]] = []
     npz_payload: Dict[str, np.ndarray] = {}
@@ -512,8 +926,68 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
                     (data_replicas,), int(token_index), dtype=jnp.int32),
                 NamedSharding(ctx.mesh, P("data")),
             )
-            trace = jax.device_get(trace_fn(ctx.params, input_ids, target))
+            initial_tops = (topk_qk, topk_v, topk_rst)
+            trace = jax.device_get(
+                trace_function(initial_tops)(ctx.params, input_ids, target))
+            capture: Dict[str, Dict[str, Any]] = {}
+            for pool in TRACE_POOLS:
+                before = np.asarray(
+                    trace[f"{pool}_captured_mass"])[:, 0].astype(np.float64)
+                capture[pool] = {
+                    "topk": topk_qk if pool in ("q", "k") else (
+                        topk_v if pool == "v" else topk_rst),
+                    "retry_count": 0,
+                    "before": before.copy(),
+                    "after": before.copy(),
+                }
+            if adaptive_capture:
+                family_routes = {
+                    "qk": ("q", "k"), "v": ("v",), "rst": ("rst",),
+                }
+                current_tops = {
+                    "qk": topk_qk, "v": topk_v, "rst": topk_rst,
+                }
+                for family, routes in family_routes.items():
+                    if all(np.all(capture[route]["after"] >= capture_threshold)
+                           for route in routes):
+                        continue
+                    for next_topk in _capture_tiers(
+                            current_tops[family], family)[1:]:
+                        retry_tops = (
+                            next_topk if family == "qk" else current_tops["qk"],
+                            next_topk if family == "v" else current_tops["v"],
+                            next_topk if family == "rst" else current_tops["rst"],
+                        )
+                        retry = jax.device_get(
+                            trace_function(retry_tops)(
+                                ctx.params, input_ids, target))
+                        accepted = False
+                        for route in routes:
+                            old_capture = np.asarray(
+                                capture[route]["after"], dtype=np.float64)
+                            new_capture = np.asarray(
+                                retry[f"{route}_captured_mass"]
+                            )[:, 0].astype(np.float64)
+                            improves = bool(
+                                np.all(new_capture >= old_capture)
+                                and np.any(new_capture > old_capture))
+                            if not improves:
+                                continue
+                            for field in TRACE_FIELDS:
+                                key = f"{route}_{field}"
+                                trace[key] = retry[key]
+                            capture[route]["topk"] = int(next_topk)
+                            capture[route]["retry_count"] += 1
+                            capture[route]["after"] = new_capture
+                            accepted = True
+                        current_tops[family] = int(next_topk)
+                        if all(np.all(capture[route]["after"] >= capture_threshold)
+                               for route in routes):
+                            break
+                        if not accepted:
+                            break
             record = _trace_internal_record(prompt, int(token_index), trace)
+            _decorate_capture_rows(record, capture, capture_threshold)
             internal.append(record)
             prompt_records.append(record)
             for row in record["rows"]:
@@ -524,6 +998,18 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
                     subtoken_idx == len(prompt["target_token_indices"]) - 1)
                 jsonl_rows.append(row)
             prefix = f"p{prompt_idx:04d}_t{subtoken_idx:02d}"
+            for key, value in record["trace"].items():
+                npz_payload[f"{prefix}__trace__{key}"] = np.asarray(value)
+            for pool, metadata in record["capture"].items():
+                capture_prefix = f"{prefix}__capture__{pool}__"
+                npz_payload[f"{capture_prefix}before"] = np.asarray(
+                    metadata["before"])
+                npz_payload[f"{capture_prefix}after"] = np.asarray(
+                    metadata["after"])
+                npz_payload[f"{capture_prefix}topk"] = np.asarray(
+                    metadata["topk"], dtype=np.int32)
+                npz_payload[f"{capture_prefix}retry_count"] = np.asarray(
+                    metadata["retry_count"], dtype=np.int32)
             for key in vector_keys:
                 npz_payload[f"{prefix}_{key}"] = np.asarray(record["trace"][key])[:, 0]
         for key in vector_keys:
@@ -547,6 +1033,19 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
             captured_by_pool[pool].extend(
                 np.asarray(record["trace"][f"{pool}_captured_mass"])[:, 0].tolist())
     captured = [value for values in captured_by_pool.values() for value in values]
+    retry_rows = 0
+    recovered_rows = 0
+    remaining_low_capture_rows = 0
+    for record in internal:
+        for pool in TRACE_POOLS:
+            metadata = record["capture"][pool]
+            before = np.asarray(metadata["before"])
+            after = np.asarray(metadata["after"])
+            if int(metadata["retry_count"]) > 0:
+                retry_rows += int(np.sum(before < capture_threshold))
+            recovered_rows += int(np.sum(
+                (before < capture_threshold) & (after >= capture_threshold)))
+            remaining_low_capture_rows += int(np.sum(after < capture_threshold))
     captured_summary = {
         pool: {
             "mean": float(np.mean(values)) if values else None,
@@ -556,7 +1055,7 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
         for pool, values in captured_by_pool.items()
     }
     summary = {
-        "status": "ready",
+        "status": "partial" if remaining_low_capture_rows else "ready",
         "prompt_set": prompt_set,
         "prompt_set_hash": prompt_hash,
         "num_prompts": len(prompts),
@@ -569,16 +1068,31 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
             "p10": float(np.quantile(captured, 0.10)) if captured else None,
         },
         "captured_mass_by_pool": captured_summary,
-        "captured_mass_valid_threshold": 0.95,
+        "captured_mass_valid_threshold": capture_threshold,
+        "adaptive_capture": {
+            "enabled": adaptive_capture,
+            "threshold": capture_threshold,
+            "tiers": {
+                key: _capture_tiers(
+                    {"qk": topk_qk, "v": topk_v, "rst": topk_rst}[key],
+                    key)
+                for key in ("qk", "v", "rst")
+            },
+            "retry_rows": retry_rows,
+            "recovered_rows": recovered_rows,
+            "remaining_low_capture_rows": remaining_low_capture_rows,
+            "final_capture_by_pool": captured_summary,
+        },
         "sec": time.time() - started,
         "artifacts": {
             "trajectory_traces": ctx.store.path("trajectory_traces.jsonl"),
             "transition_trace_cache": ctx.store.path("transition_trace_cache.npz"),
         },
     }
-    if summary["captured_mass"]["min"] is not None and summary["captured_mass"]["min"] < 0.95:
+    if (summary["captured_mass"]["min"] is not None
+            and summary["captured_mass"]["min"] < capture_threshold):
         summary["captured_mass_warning"] = (
-            "Rows with either side below 95% captured mass are excluded from pair metrics")
+            "Low-capture rows are marked partial and excluded from pair metrics")
     if ctx.is_primary:
         write_jsonl_atomic(ctx.store.path("trajectory_traces.jsonl"), jsonl_rows)
         write_npz_atomic(ctx.store.path("transition_trace_cache.npz"), **npz_payload)
@@ -679,9 +1193,14 @@ def _pair_layer_rows(
             captured_a = float(np.asarray(trace_a[f"{pool}_captured_mass"])[layer, 0])
             captured_b = float(np.asarray(trace_b[f"{pool}_captured_mass"])[layer, 0])
             routing_similarity = sparse["weighted_jaccard"]
+            capture_threshold = max(
+                float(record_a.get(
+                    "capture_threshold", PAIR_CAPTURE_THRESHOLD)),
+                float(record_b.get(
+                    "capture_threshold", PAIR_CAPTURE_THRESHOLD)))
             capture_valid = (
-                captured_a >= PAIR_CAPTURE_THRESHOLD
-                and captured_b >= PAIR_CAPTURE_THRESHOLD)
+                captured_a >= capture_threshold
+                and captured_b >= capture_threshold)
             metric_valid = bool(
                 capture_valid
                 and routing_similarity is not None
@@ -1220,6 +1739,80 @@ def _dense_minimal_sharded_fns(ctx: AnalysisContext):
     }
 
 
+def _capture_tiers(first: int, pool: str) -> List[int]:
+    tiers = [int(first)]
+    tiers.extend(
+        value for value in ADAPTIVE_CAPTURE_TIERS[pool]
+        if int(value) > int(first))
+    return list(dict.fromkeys(tiers))
+
+
+def _decorate_capture_rows(
+        record: Dict[str, Any], capture: Mapping[str, Mapping[str, Any]],
+        threshold: float) -> None:
+    record["capture"] = capture
+    record["capture_threshold"] = float(threshold)
+    for layer, row in enumerate(record["rows"]):
+        for pool in TRACE_POOLS:
+            metadata = capture[pool]
+            row["pools"][pool].update({
+                "capture_topk_used": int(metadata["topk"]),
+                "capture_retry_count": int(metadata["retry_count"]),
+                "capture_threshold_pass": bool(
+                    float(metadata["after"][layer]) >= float(threshold)),
+                "capture_before": float(metadata["before"][layer]),
+                "capture_after": float(metadata["after"][layer]),
+            })
+        for field in (
+                "capture_topk_used", "capture_retry_count",
+                "capture_threshold_pass", "capture_before", "capture_after"):
+            row[field] = {
+                pool: row["pools"][pool][field] for pool in TRACE_POOLS}
+
+
+def _load_transition_trace_records(
+        ctx: AnalysisContext, prompts: Sequence[Dict[str, Any]],
+        summary: Mapping[str, Any], capture_threshold: float,
+        ) -> Optional[List[Dict[str, Any]]]:
+    path = ctx.store.path("transition_trace_cache.npz")
+    if not exists(path):
+        return None
+    payload = read_npz(path)
+    records: List[Dict[str, Any]] = []
+    for prompt_index, prompt in enumerate(prompts):
+        for subtoken_index, token_index in enumerate(prompt["target_token_indices"]):
+            prefix = f"p{prompt_index:04d}_t{subtoken_index:02d}"
+            trace_prefix = f"{prefix}__trace__"
+            trace = {
+                key[len(trace_prefix):]: value
+                for key, value in payload.items()
+                if key.startswith(trace_prefix)
+            }
+            if not trace:
+                return None
+            record = _trace_internal_record(prompt, int(token_index), trace)
+            capture: Dict[str, Dict[str, Any]] = {}
+            for pool in TRACE_POOLS:
+                capture_prefix = f"{prefix}__capture__{pool}__"
+                before = payload.get(f"{capture_prefix}before")
+                after = payload.get(f"{capture_prefix}after")
+                if before is None or after is None:
+                    after = np.asarray(trace[f"{pool}_captured_mass"])[:, 0]
+                    before = after.copy()
+                capture[pool] = {
+                    "topk": int(np.asarray(payload.get(
+                        f"{capture_prefix}topk",
+                        np.asarray(trace[f"{pool}_top_idx"]).shape[-1])).item()),
+                    "retry_count": int(np.asarray(payload.get(
+                        f"{capture_prefix}retry_count", 0)).item()),
+                    "before": np.asarray(before),
+                    "after": np.asarray(after),
+                }
+            _decorate_capture_rows(record, capture, capture_threshold)
+            records.append(record)
+    return records
+
+
 def _first_difference(left: np.ndarray, right: np.ndarray):
     indices = np.argwhere(np.asarray(left) != np.asarray(right))
     return tuple(int(value) for value in indices[0]) if indices.size else None
@@ -1396,6 +1989,70 @@ def _canonical_causal_logits_forward(ctx: AnalysisContext):
         )
         return (result["logits"][:1], result["per_token_ce"][:1],
                 result["final_residual"][:1])
+
+    return forward
+
+
+def _canonical_causal_trace_forward(ctx: AnalysisContext):
+    """Canonical causal executable returning target-only layer traces."""
+    forward_kwargs = _minimal_forward_kwargs(ctx)
+
+    @jax.jit
+    def forward(
+            params, input_ids, target_positions, target_layer, target_route,
+            selected_operator_ids, apply_suppression):
+        result = ctx.model.apply(
+            {"params": params},
+            input_ids,
+            labels=input_ids,
+            attention_mask=jnp.ones_like(input_ids),
+            analysis_contribution=selected_operator_ids,
+            analysis_target_layer=target_layer,
+            analysis_target_positions=target_positions,
+            analysis_target_route=target_route,
+            analysis_intervention_enabled=apply_suppression,
+            analysis_causal_trace=True,
+            **forward_kwargs,
+        )
+        return (
+            result["logits"][:1], result["per_token_ce"][:1],
+            result["final_residual"][:1],
+            jax.tree.map(lambda value: value[:, :1], result["causal_trace"]),
+        )
+
+    return forward
+
+
+def _canonical_group_causal_trace_forward(ctx: AnalysisContext, max_width: int):
+    """Fixed-width group executable shared by sizes 0/1/2/4/8."""
+    if int(max_width) <= 0:
+        raise ValueError("group causal max width must be positive")
+    forward_kwargs = _minimal_forward_kwargs(ctx)
+
+    @jax.jit
+    def forward(
+            params, input_ids, target_positions, target_layer, target_route,
+            selected_operator_ids):
+        if selected_operator_ids.shape[1] != int(max_width):
+            raise ValueError("group causal ids must use the configured width")
+        result = ctx.model.apply(
+            {"params": params},
+            input_ids,
+            labels=input_ids,
+            attention_mask=jnp.ones_like(input_ids),
+            analysis_contribution=selected_operator_ids,
+            analysis_target_layer=target_layer,
+            analysis_target_positions=target_positions,
+            analysis_target_route=target_route,
+            analysis_intervention_enabled=jnp.bool_(True),
+            analysis_causal_trace=True,
+            **forward_kwargs,
+        )
+        return (
+            result["logits"][:1], result["per_token_ce"][:1],
+            result["final_residual"][:1],
+            jax.tree.map(lambda value: value[:, :1], result["causal_trace"]),
+        )
 
     return forward
 
@@ -1676,7 +2333,7 @@ def run_v4171_parity_only_smoke(ctx: AnalysisContext) -> Dict[str, Any]:
     prompt_set = str(
         getattr(args, "transition_prompt_set", None)
         or DEFAULT_TRANSITION_PROMPT_SET)
-    rows, _ = load_transition_prompt_rows(prompt_set)
+    rows, prompt_hash = load_transition_prompt_rows(prompt_set)
     max_prompts = getattr(args, "transition_max_prompts", None)
     if max_prompts is None:
         max_prompts = max(1, int(getattr(
@@ -1698,9 +2355,21 @@ def run_v4171_parity_only_smoke(ctx: AnalysisContext) -> Dict[str, Any]:
         for prompt in prompts
     ]
     canonical_forward = _canonical_causal_logits_forward(ctx)
-    _normal_production_cross_graph_audit(ctx, records, canonical_forward)
+    cross_graph = _normal_production_cross_graph_audit(
+        ctx, records, canonical_forward)
     parity = _intervention_forward_parity(
         ctx, records, canonical_forward)
+    provenance = _analysis_provenance(
+        ctx, prompt_hash, parity, cross_graph)
+    parity.update(provenance)
+    cross_graph.update(provenance)
+    cross_graph["blocking"] = False
+    if ctx.is_primary:
+        write_json_atomic(
+            ctx.store.path("intervention_forward_parity.json"), parity)
+        write_json_atomic(
+            ctx.store.path("normal_production_vs_canonical_neutral.json"),
+            cross_graph)
     _print_parity_success(ctx, parity)
     return parity
 
@@ -1736,6 +2405,7 @@ def run_causal_intervention(
     primary = _select_causal_records(records, max_prompts)
     pool_codes = {"q": 0, "k": 1, "v": 2, "rst": 3}
     canonical_forward = _canonical_causal_logits_forward(ctx)
+    causal_trace_forward = _canonical_causal_trace_forward(ctx)
     cross_graph_audit = _normal_production_cross_graph_audit(
         ctx, primary, canonical_forward)
     parity = _intervention_forward_parity(
@@ -1753,8 +2423,9 @@ def run_causal_intervention(
         target_position = int(record["target_token_index"])
         positions = jnp.full(
             (input_ids.shape[0],), target_position, dtype=jnp.int32)
-        baseline_logits, _, baseline_residual = jax.device_get(
-            canonical_forward(
+        (baseline_logits, _, baseline_residual,
+         baseline_trace) = jax.device_get(
+            causal_trace_forward(
                 ctx.params, input_ids, positions, jnp.int32(0), jnp.int32(0),
                 jnp.zeros((input_ids.shape[0],), dtype=jnp.int32),
                 jnp.bool_(False)))
@@ -1784,7 +2455,8 @@ def run_causal_intervention(
                     ctx, pool, int(candidate["operator_id"]))
                 selected_operator_ids = jnp.full(
                     (input_ids.shape[0],), operator_id, jnp.int32)
-                logits, _, residual = jax.device_get(canonical_forward(
+                logits, _, residual, intervention_trace = jax.device_get(
+                    causal_trace_forward(
                     ctx.params, input_ids, positions,
                     jnp.int32(candidate["layer"]), jnp.int32(pool_codes[pool]),
                     selected_operator_ids, jnp.bool_(True)))
@@ -1807,6 +2479,18 @@ def run_causal_intervention(
                     if not inactive_exact_noop:
                         raise RuntimeError(
                             "inactive operator suppression changed production output")
+                recovery = compute_causal_recovery_metrics(
+                    baseline_trace,
+                    intervention_trace,
+                    route=pool,
+                    target_layer=int(candidate["layer"]),
+                    baseline_final_residual=baseline_residual[
+                        0, target_position],
+                    intervention_final_residual=residual[0, target_position],
+                    baseline_logits=baseline_logits,
+                    intervention_logits=logits,
+                    target_position=target_position,
+                )
                 result_rows.append({
                     **common,
                     "status": "ready",
@@ -1829,6 +2513,7 @@ def run_causal_intervention(
                         np.linalg.norm(target_after - target_base)
                         / max(float(np.linalg.norm(target_base)), 1.0e-12)),
                     "inactive_machine_exact_noop": inactive_exact_noop,
+                    **recovery,
                 })
         if ctx.is_primary:
             print(
@@ -1854,11 +2539,16 @@ def run_causal_intervention(
         if row["strategy"] in ("inactive_random", "active_random", "matched_active")
         and row.get("behavior_score_drop") is not None]
     summary = {
-        "status": "ready" if valid_rows else "insufficient_evidence",
+        "status": "ready" if valid_rows else "partial",
         "intervention_type": "production_core_execution_suppression",
         "canonical_unpruned_admission_denominator": True,
         "zero_suppression_parity": parity,
         "normal_production_cross_graph_audit": cross_graph_audit,
+        "causal_baseline": "canonical_suppression_disabled",
+        "canonical_baseline_source": "canonical_suppression_disabled",
+        "effect_reference": "canonical_suppression_disabled",
+        "canonical_parity_machine_exact": bool(parity["machine_exact"]),
+        "cross_graph_audit_blocking": False,
         "num_prompts": len(primary),
         "num_interventions": len(valid_rows),
         "num_skipped": len(result_rows) - len(valid_rows),
@@ -1882,20 +2572,1198 @@ def run_causal_intervention(
     if ctx.is_primary:
         write_jsonl_atomic(ctx.store.path("interventions.jsonl"), result_rows)
         write_json_atomic(ctx.store.path("causal_intervention_summary.json"), summary)
+    summary["_result_rows"] = result_rows
     return summary
+
+
+def _classify_recovery_rows(
+        rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    valid = [
+        row for row in rows
+        if row.get("status") == "ready"
+        and _json_float(row.get("immediate_delta_norm")) is not None
+        and _json_float(row.get("recovery_ratio_final")) is not None
+    ]
+    immediate = np.asarray([
+        float(row["immediate_delta_norm"]) for row in valid], dtype=np.float64)
+    ratios = np.asarray([
+        float(row["recovery_ratio_final"]) for row in valid], dtype=np.float64)
+    basis = {
+        "immediate_q25": float(np.quantile(immediate, 0.25)) if valid else None,
+        "immediate_median": float(np.quantile(immediate, 0.50)) if valid else None,
+        "recovery_ratio_q25": float(np.quantile(ratios, 0.25)) if valid else None,
+        "recovery_ratio_median": float(np.quantile(ratios, 0.50)) if valid else None,
+        "recovery_ratio_q75": float(np.quantile(ratios, 0.75)) if valid else None,
+        "method": "observed_distribution_quantiles",
+    }
+    for row in valid:
+        immediate_value = float(row["immediate_delta_norm"])
+        ratio = float(row["recovery_ratio_final"])
+        if immediate_value <= float(basis["immediate_q25"]):
+            phenomenon = "immediate_small"
+        elif (immediate_value >= float(basis["immediate_median"])
+              and ratio <= float(basis["recovery_ratio_q25"])):
+            phenomenon = "downstream_recovery"
+        elif ratio >= float(basis["recovery_ratio_q75"]):
+            phenomenon = "downstream_amplification"
+        elif bool(row.get("non_monotonic_path")):
+            phenomenon = "non_monotonic"
+        else:
+            phenomenon = "approximately_preserved"
+        row["recovery_phenomenon"] = phenomenon
+    return basis
+
+
+def _recovery_group_summary(
+        rows: Sequence[Mapping[str, Any]], seed: int) -> Dict[str, Any]:
+    valid = [row for row in rows if row.get("status") == "ready"]
+    ratios = [
+        float(row["recovery_ratio_final"]) for row in valid
+        if _json_float(row.get("recovery_ratio_final")) is not None]
+    return {
+        "n": len(valid),
+        "immediate_delta_mean": (
+            float(np.mean([float(row["immediate_delta_norm"]) for row in valid]))
+            if valid else None),
+        "final_delta_mean": (
+            float(np.mean([float(row["final_delta_norm"]) for row in valid]))
+            if valid else None),
+        "recovery_ratio_mean": float(np.mean(ratios)) if ratios else None,
+        "recovery_ratio_ci95": _bootstrap_mean_ci(ratios, seed)["ci95"],
+        "recovery_fraction": (
+            float(np.mean([
+                row.get("recovery_phenomenon") == "downstream_recovery"
+                for row in valid])) if valid else None),
+        "amplification_fraction": (
+            float(np.mean([
+                row.get("recovery_phenomenon") == "downstream_amplification"
+                for row in valid])) if valid else None),
+    }
+
+
+def run_causal_recovery_trace(
+        ctx: AnalysisContext, rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summarize traces returned by the canonical intervention forwards."""
+    recovery_rows = [dict(row) for row in rows]
+    basis = _classify_recovery_rows(recovery_rows)
+    n_layers = max(1, int(ctx.model_cfg["n_layers"]))
+    for row in recovery_rows:
+        layer = int(row.get("layer", 0))
+        row["layer_bucket"] = (
+            "early" if layer < n_layers / 3.0 else
+            "middle" if layer < 2.0 * n_layers / 3.0 else "late")
+    seed = int(ctx.config.get("seed", 0))
+
+    def grouped(key: str, offset: int) -> Dict[str, Any]:
+        values = sorted({
+            str(row.get(key)) for row in recovery_rows
+            if row.get(key) is not None})
+        return {
+            value: _recovery_group_summary(
+                [row for row in recovery_rows if str(row.get(key)) == value],
+                seed + offset + index)
+            for index, value in enumerate(values)
+        }
+
+    summary = {
+        "status": "ready" if any(
+            row.get("status") == "ready" for row in recovery_rows) else "partial",
+        "classification_basis": basis,
+        "overall": _recovery_group_summary(recovery_rows, seed),
+        "by_pool": grouped("pool", 100),
+        "by_strategy": grouped("strategy", 200),
+        "by_phenomenon": grouped("phenomenon", 300),
+        "by_recovery_phenomenon": grouped("recovery_phenomenon", 350),
+        "by_layer_bucket": grouped("layer_bucket", 400),
+        "artifacts": {
+            "rows": ctx.store.path("causal_recovery_traces.jsonl"),
+            "summary": ctx.store.path("causal_recovery_summary.json"),
+        },
+    }
+    if ctx.is_primary:
+        write_jsonl_atomic(
+            ctx.store.path("causal_recovery_traces.jsonl"), recovery_rows)
+        write_json_atomic(
+            ctx.store.path("causal_recovery_summary.json"), summary)
+    summary["_rows"] = recovery_rows
+    return summary
+
+
+def _pool_parameter_keys(pool: str) -> Tuple[str, str, str]:
+    prefix = {"qk": "attn_qk", "v": "attn_v", "rst": "rst"}[pool]
+    return f"{prefix}_op_key", f"{prefix}_read", f"{prefix}_write"
+
+
+def _candidate_pool_vectors(
+        ctx: AnalysisContext, pool: str, operator_ids: Sequence[int]
+        ) -> Dict[str, np.ndarray]:
+    """Gather only candidate embeddings and replicate the small result."""
+    address_key, read_key, write_key = _pool_parameter_keys(pool)
+    replicated = NamedSharding(ctx.mesh, P())
+    ids = jax.device_put(
+        jnp.asarray(operator_ids, dtype=jnp.int32), replicated)
+
+    @partial(jax.jit, out_shardings={
+        "address": replicated, "read": replicated, "write": replicated})
+    def select(params, selected):
+        pool_params = params["neuron_pool"]
+        return {
+            "address": pool_params[address_key][selected],
+            "read": pool_params[read_key][selected],
+            "write": pool_params[write_key][selected],
+        }
+
+    selected_host = _device_get_process_local_debug(select(ctx.params, ids))
+    return {key: np.asarray(value) for key, value in selected_host.items()}
+
+
+def _sparse_profile_cosine(
+        left: Mapping[int, float], right: Mapping[int, float]) -> float:
+    if not left or not right:
+        return 0.0
+    if len(left) > len(right):
+        left, right = right, left
+    dot = sum(float(value) * float(right.get(key, 0.0))
+              for key, value in left.items())
+    left_norm = math.sqrt(sum(float(value) ** 2 for value in left.values()))
+    right_norm = math.sqrt(sum(float(value) ** 2 for value in right.values()))
+    return float(dot / max(left_norm * right_norm, 1.0e-12))
+
+
+def _sparse_profile_neighbors(
+        signatures: Mapping[int, Mapping[int, float]],
+        operator_ids: Sequence[int], k: int) -> Dict[int, List[Dict[str, Any]]]:
+    """Shortlist with a sketch, then score sparse profiles exactly."""
+    ids = [int(value) for value in operator_ids]
+    n = len(ids)
+    sketch_dim = 64
+    sketch = np.zeros((n, sketch_dim), dtype=np.float32)
+    for index, operator_id in enumerate(ids):
+        for observation, value in signatures.get(operator_id, {}).items():
+            hashed = (int(observation) * 2654435761 + 1013904223) & 0xFFFFFFFF
+            bucket = hashed % sketch_dim
+            sign = 1.0 if (hashed & 0x80000000) else -1.0
+            sketch[index, bucket] += sign * float(value)
+    sketch /= np.maximum(
+        np.linalg.norm(sketch, axis=-1, keepdims=True), 1.0e-12)
+    shortlist_count = min(max(int(k) * 4, 64), max(0, n - 1))
+    shortlists: List[List[int]] = [[] for _ in ids]
+    if shortlist_count:
+        block = 128
+        for start in range(0, n, block):
+            end = min(n, start + block)
+            similarity = sketch[start:end] @ sketch.T
+            similarity[np.arange(end - start), np.arange(start, end)] = -np.inf
+            chosen = np.argpartition(
+                -similarity, shortlist_count - 1, axis=1)[:, :shortlist_count]
+            for local, row_indices in enumerate(chosen):
+                row_indices = row_indices[np.lexsort((
+                    np.asarray(ids)[row_indices],
+                    -similarity[local, row_indices]))]
+                shortlists[start + local] = row_indices.tolist()
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    for index, operator_id in enumerate(ids):
+        candidates = [ids[other] for other in shortlists[index]]
+        scored = [
+            {
+                "operator_id": other,
+                "similarity": _sparse_profile_cosine(
+                    signatures.get(operator_id, {}),
+                    signatures.get(other, {})),
+            }
+            for other in candidates
+        ]
+        scored.sort(key=lambda row: (-float(row["similarity"]), row["operator_id"]))
+        out[operator_id] = scored[:int(k)]
+    return out
+
+
+def _parameter_neighbors(
+        vectors: Mapping[str, np.ndarray], operator_ids: Sequence[int],
+        k: int, seed: int) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
+    ids = np.asarray(operator_ids, dtype=np.int64)
+    address = _unit_rows(vectors["address"])
+    read = _unit_rows(vectors["read"])
+    write = _unit_rows(vectors["write"])
+    n = int(ids.size)
+    result = {
+        int(operator_id): {
+            "functional": [], "address": [],
+        } for operator_id in ids
+    }
+    block = 128
+    neighbor_count = min(int(k), max(0, n - 1))
+    if neighbor_count:
+        n_blocks = (n + block - 1) // block
+        pad_rows = n_blocks * block - n
+
+        @jax.jit
+        def top_parameter_neighbors(address_all, read_all, write_all):
+            address_padded = jnp.pad(address_all, ((0, pad_rows), (0, 0)))
+            read_padded = jnp.pad(read_all, ((0, pad_rows), (0, 0)))
+            write_padded = jnp.pad(write_all, ((0, pad_rows), (0, 0)))
+            columns = jnp.arange(n, dtype=jnp.int32)[None, :]
+
+            def one_block(block_index):
+                start = block_index * block
+                address_block = jax.lax.dynamic_slice_in_dim(
+                    address_padded, start, block, axis=0)
+                read_block = jax.lax.dynamic_slice_in_dim(
+                    read_padded, start, block, axis=0)
+                write_block = jax.lax.dynamic_slice_in_dim(
+                    write_padded, start, block, axis=0)
+                functional = (
+                    (read_block @ read_all.T)
+                    * (write_block @ write_all.T))
+                address_cosine = address_block @ address_all.T
+                rows = start + jnp.arange(block, dtype=jnp.int32)[:, None]
+                self_mask = rows == columns
+                functional = jnp.where(self_mask, -jnp.inf, functional)
+                address_cosine = jnp.where(
+                    self_mask, -jnp.inf, address_cosine)
+                functional_values, functional_indices = jax.lax.top_k(
+                    functional, neighbor_count)
+                address_values, address_indices = jax.lax.top_k(
+                    address_cosine, neighbor_count)
+                return (functional_values, functional_indices,
+                        address_values, address_indices)
+
+            return jax.lax.map(
+                one_block, jnp.arange(n_blocks, dtype=jnp.int32))
+
+        (functional_values, functional_indices,
+         address_values, address_indices) = (
+            np.asarray(value).reshape(n_blocks * block, neighbor_count)[:n]
+            for value in jax.device_get(top_parameter_neighbors(
+                jnp.asarray(address, dtype=jnp.float32),
+                jnp.asarray(read, dtype=jnp.float32),
+                jnp.asarray(write, dtype=jnp.float32))))
+        for index, operator_id in enumerate(ids):
+            for name, values, indices in (
+                    ("functional", functional_values, functional_indices),
+                    ("address", address_values, address_indices)):
+                order = np.lexsort((ids[indices[index]], -values[index]))
+                rows = []
+                for offset in order:
+                    other = int(indices[index, offset])
+                    row = {
+                        "operator_id": int(ids[other]),
+                        "similarity": float(values[index, offset]),
+                    }
+                    if name == "functional":
+                        row.update({
+                            "read_cosine": float(np.dot(read[index], read[other])),
+                            "write_cosine": float(np.dot(write[index], write[other])),
+                        })
+                    rows.append(row)
+                result[int(operator_id)][name] = rows
+    pair_count = n * (n - 1) // 2
+    sample_count = min(pair_count, 100000)
+    rng = np.random.default_rng(int(seed))
+    sampled_pairs = set()
+    if pair_count <= sample_count:
+        sampled_pairs = {(left, right) for left in range(n)
+                         for right in range(left + 1, n)}
+    else:
+        while len(sampled_pairs) < sample_count:
+            left = int(rng.integers(0, n))
+            right = int(rng.integers(0, n - 1))
+            if right >= left:
+                right += 1
+            if left > right:
+                left, right = right, left
+            sampled_pairs.add((left, right))
+    pair_rows = []
+    for left, right in sorted(sampled_pairs):
+        pair_rows.append({
+            "left": int(ids[left]),
+            "right": int(ids[right]),
+            "functional": float(
+                np.dot(read[left], read[right])
+                * np.dot(write[left], write[right])),
+            "address": float(np.dot(address[left], address[right])),
+        })
+    return result, {
+        "pair_count": pair_count,
+        "sampled_pair_count": len(pair_rows),
+        "pairs": pair_rows,
+    }
+
+
+def _functional_candidate_universe(
+        records: Sequence[Dict[str, Any]], causal_rows: Sequence[Mapping[str, Any]],
+        pool: str, pool_size: int, max_operators: int, seed: int,
+        capture_threshold: float) -> Tuple[List[int], Dict[str, Any]]:
+    routes = ("q", "k") if pool == "qk" else (pool,)
+    frequency: Dict[int, int] = defaultdict(int)
+    qualified_observations = 0
+    for record in _primary_records(records):
+        trace = record["trace"]
+        for route in routes:
+            captures = np.asarray(trace[f"{route}_captured_mass"])[:, 0]
+            ids = np.asarray(trace[f"{route}_top_idx"])[:, 0, :]
+            for layer in range(ids.shape[0]):
+                if float(captures[layer]) < float(capture_threshold):
+                    continue
+                qualified_observations += 1
+                for operator_id in np.unique(ids[layer]):
+                    if int(operator_id) >= 0:
+                        frequency[int(operator_id)] += 1
+    causal_ids = sorted({
+        int(row["operator_id"]) for row in causal_rows
+        if row.get("candidate_valid") and (
+            str(row.get("pool")) in routes)
+    })
+    repeated = sorted(
+        (operator_id for operator_id, count in frequency.items() if count >= 2),
+        key=lambda operator_id: (-frequency[operator_id], operator_id))
+    selected: List[int] = []
+    for operator_id in causal_ids + repeated:
+        if operator_id not in selected and len(selected) < int(max_operators):
+            selected.append(operator_id)
+    rng = np.random.default_rng(int(seed))
+    for operator_id in rng.permutation(int(pool_size)).tolist():
+        if len(selected) >= int(max_operators):
+            break
+        if operator_id not in selected:
+            selected.append(int(operator_id))
+    selected.sort()
+    return selected, {
+        "qualified_observation_count": qualified_observations,
+        "trace_union_count": len(frequency),
+        "trace_union_coverage": len(frequency) / max(int(pool_size), 1),
+        "causal_candidate_count": len(causal_ids),
+    }
+
+
+def _functional_signatures(
+        records: Sequence[Dict[str, Any]], pool: str,
+        candidate_ids: Sequence[int], capture_threshold: float,
+        ) -> Tuple[Dict[int, Dict[int, float]], Dict[int, Dict[int, float]]]:
+    routes = ("q", "k") if pool == "qk" else (pool,)
+    candidates = set(int(value) for value in candidate_ids)
+    activation: Dict[int, Dict[int, float]] = defaultdict(dict)
+    contribution: Dict[int, Dict[int, float]] = defaultdict(dict)
+    observation = 0
+    for record in _primary_records(records):
+        trace = record["trace"]
+        for route in routes:
+            ids = np.asarray(trace[f"{route}_top_idx"])[:, 0, :]
+            execution = np.asarray(trace[f"{route}_top_val"])[:, 0, :]
+            coefficient = np.asarray(
+                trace[f"{route}_top_coefficient"])[:, 0, :]
+            captures = np.asarray(trace[f"{route}_captured_mass"])[:, 0]
+            for layer in range(ids.shape[0]):
+                if float(captures[layer]) >= float(capture_threshold):
+                    for operator_id, gate, local in zip(
+                            ids[layer], execution[layer], coefficient[layer]):
+                        operator_id = int(operator_id)
+                        if operator_id in candidates:
+                            activation[operator_id][observation] = float(gate)
+                            contribution[operator_id][observation] = abs(float(local))
+                observation += 1
+    for operator_id in candidates:
+        activation.setdefault(operator_id, {})
+        contribution.setdefault(operator_id, {})
+    return dict(activation), dict(contribution)
+
+
+def run_operator_functional_graph(
+        ctx: AnalysisContext, records: Sequence[Dict[str, Any]],
+        causal_rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    neighbor_k = max(1, int(getattr(
+        ctx.args, "functional_graph_neighbor_k", 16) or 16))
+    capture_threshold = float(getattr(
+        ctx.args, "transition_capture_threshold", PAIR_CAPTURE_THRESHOLD)
+        or PAIR_CAPTURE_THRESHOLD)
+    limits = {
+        "qk": int(getattr(ctx.args, "functional_graph_max_operators_qk", 2048) or 2048),
+        "v": int(getattr(ctx.args, "functional_graph_max_operators_v", 2048) or 2048),
+        "rst": int(getattr(ctx.args, "functional_graph_max_operators_rst", 2048) or 2048),
+    }
+    pool_sizes = {
+        "qk": int(ctx.model_cfg["n_qk"]),
+        "v": int(ctx.model_cfg["n_v"]),
+        "rst": int(ctx.model_cfg.get("n_rst", ctx.model_cfg.get("n_know"))),
+    }
+    seed = int(ctx.config.get("seed", 0))
+    neighbor_rows: List[Dict[str, Any]] = []
+    family_rows: List[Dict[str, Any]] = []
+    pool_summaries: Dict[str, Any] = {}
+    graph_state: Dict[str, Any] = {
+        "neighbors": {}, "families": {}, "candidate_ids": {}}
+    for pool_index, pool in enumerate(("qk", "v", "rst")):
+        candidates, coverage = _functional_candidate_universe(
+            records, causal_rows, pool, pool_sizes[pool],
+            min(limits[pool], pool_sizes[pool]), seed + pool_index,
+            capture_threshold)
+        graph_state["candidate_ids"][pool] = candidates
+        vectors = _candidate_pool_vectors(ctx, pool, candidates)
+        parameter, pair_sample = _parameter_neighbors(
+            vectors, candidates, neighbor_k, seed + 100 + pool_index)
+        activation, contribution = _functional_signatures(
+            records, pool, candidates, capture_threshold)
+        activation_neighbors = _sparse_profile_neighbors(
+            activation, candidates, neighbor_k)
+        contribution_neighbors = _sparse_profile_neighbors(
+            contribution, candidates, neighbor_k)
+        sample_pairs = pair_sample.pop("pairs")
+        for row in sample_pairs[:50000]:
+            row["activation"] = _sparse_profile_cosine(
+                activation.get(row["left"], {}), activation.get(row["right"], {}))
+        classification = classify_function_address_pairs(
+            [row["functional"] for row in sample_pairs],
+            [row["address"] for row in sample_pairs])
+        thresholds = classification.get("thresholds", {})
+        no_pair_threshold = float(np.nextafter(1.0, 2.0))
+        thresholds.setdefault("functional_high", no_pair_threshold)
+        thresholds.setdefault("functional_low", no_pair_threshold)
+        thresholds.setdefault("address_high", no_pair_threshold)
+        thresholds.setdefault("address_low", no_pair_threshold)
+        vector_index = {
+            int(operator_id): index
+            for index, operator_id in enumerate(candidates)}
+        address_unit = _unit_rows(vectors["address"])
+        read_unit = _unit_rows(vectors["read"])
+        write_unit = _unit_rows(vectors["write"])
+        for operator_id in candidates:
+            left_index = vector_index[operator_id]
+            for view in ("functional", "address"):
+                for neighbor in parameter[operator_id][view]:
+                    right_index = vector_index[int(neighbor["operator_id"])]
+                    functional_value = float(
+                        np.dot(read_unit[left_index], read_unit[right_index])
+                        * np.dot(write_unit[left_index], write_unit[right_index]))
+                    address_value = float(np.dot(
+                        address_unit[left_index], address_unit[right_index]))
+                    function_band = (
+                        "high" if functional_value >= float(
+                            thresholds["functional_high"]) else
+                        "low" if functional_value <= float(
+                            thresholds["functional_low"]) else None)
+                    address_band = (
+                        "high" if address_value >= float(
+                            thresholds["address_high"]) else
+                        "low" if address_value <= float(
+                            thresholds["address_low"]) else None)
+                    neighbor.update({
+                        "read_cosine": float(np.dot(
+                            read_unit[left_index], read_unit[right_index])),
+                        "write_cosine": float(np.dot(
+                            write_unit[left_index], write_unit[right_index])),
+                        "rw_functional_similarity": functional_value,
+                        "address_cosine": address_value,
+                        "family_relation": (
+                            f"function_{function_band}_address_{address_band}"
+                            if function_band and address_band
+                            else "mid_similarity_unclassified"),
+                    })
+            for profile_neighbors in (
+                    activation_neighbors, contribution_neighbors):
+                for neighbor in profile_neighbors[operator_id]:
+                    right_index = vector_index[int(neighbor["operator_id"])]
+                    read_value = float(np.dot(
+                        read_unit[left_index], read_unit[right_index]))
+                    write_value = float(np.dot(
+                        write_unit[left_index], write_unit[right_index]))
+                    functional_value = read_value * write_value
+                    address_value = float(np.dot(
+                        address_unit[left_index], address_unit[right_index]))
+                    function_band = (
+                        "high" if functional_value >= float(
+                            thresholds["functional_high"]) else
+                        "low" if functional_value <= float(
+                            thresholds["functional_low"]) else None)
+                    address_band = (
+                        "high" if address_value >= float(
+                            thresholds["address_high"]) else
+                        "low" if address_value <= float(
+                            thresholds["address_low"]) else None)
+                    neighbor.update({
+                        "read_cosine": read_value,
+                        "write_cosine": write_value,
+                        "rw_functional_similarity": functional_value,
+                        "address_cosine": address_value,
+                        "family_relation": (
+                            f"function_{function_band}_address_{address_band}"
+                            if function_band and address_band
+                            else "mid_similarity_unclassified"),
+                    })
+        activation_values = [row.get("activation", 0.0) for row in sample_pairs[:50000]]
+        activation_high = (
+            float(np.quantile(activation_values, 0.90))
+            if activation_values else None)
+        if activation_high is not None and activation_high <= 0.0:
+            activation_high = None
+        functional_map = {
+            operator_id: parameter[operator_id]["functional"]
+            for operator_id in candidates}
+        qualified_edges = set()
+        for operator_id in candidates:
+            possible = {
+                int(row["operator_id"])
+                for row in parameter[operator_id]["functional"]
+            } | {
+                int(row["operator_id"])
+                for row in activation_neighbors[operator_id]
+            }
+            functional_scores = {
+                int(row["operator_id"]): float(row["similarity"])
+                for row in parameter[operator_id]["functional"]}
+            activation_scores = {
+                int(row["operator_id"]): float(row["similarity"])
+                for row in activation_neighbors[operator_id]}
+            for other in possible:
+                if (functional_scores.get(other, -np.inf)
+                        >= float(thresholds.get("functional_high", np.inf))
+                        and activation_scores.get(other, -np.inf)
+                        >= float(activation_high if activation_high is not None else np.inf)):
+                    qualified_edges.add(tuple(sorted((operator_id, other))))
+        families = mutual_neighbor_families(
+            functional_map, sorted(qualified_edges))
+        family_by_operator = {}
+        for family_index, members in enumerate(families):
+            family_id = f"{pool}_family_{family_index:05d}"
+            family_rows.append({
+                "pool": pool, "family_id": family_id,
+                "members": members, "size": len(members),
+                "construction": "mutual_functional_or_function_activation_quantile",
+            })
+            for operator_id in members:
+                family_by_operator[operator_id] = family_id
+        graph_state["families"][pool] = family_by_operator
+        graph_state["neighbors"][pool] = {}
+        for operator_id in candidates:
+            row = {
+                "pool": pool,
+                "operator_id": operator_id,
+                "family_id": family_by_operator[operator_id],
+                "top_functional_neighbors": parameter[operator_id]["functional"],
+                "top_address_neighbors": parameter[operator_id]["address"],
+                "top_activation_profile_neighbors": activation_neighbors[operator_id],
+                "top_contribution_profile_neighbors": contribution_neighbors[operator_id],
+                "activation_observation_count": len(activation[operator_id]),
+                "contribution_observation_count": len(contribution[operator_id]),
+            }
+            neighbor_rows.append(row)
+            graph_state["neighbors"][pool][operator_id] = row
+        sizes = [len(members) for members in families]
+        counts = classification.get("counts", {})
+        classified_n = max(sum(counts.values()), 1)
+        empirical_sample = sample_pairs[:50000]
+        pool_summaries[pool] = {
+            "candidate_operator_count": len(candidates),
+            "candidate_pool_coverage": len(candidates) / max(pool_sizes[pool], 1),
+            **coverage,
+            "family_count": len(families),
+            "singleton_fraction": (
+                float(np.mean(np.asarray(sizes) == 1)) if sizes else None),
+            "family_size_mean": float(np.mean(sizes)) if sizes else None,
+            "family_size_max": max(sizes) if sizes else 0,
+            "function_high_address_high_fraction": (
+                counts.get("function_high_address_high", 0) / classified_n),
+            "function_high_address_low_fraction": (
+                counts.get("function_high_address_low", 0) / classified_n),
+            "function_low_address_high_fraction": (
+                counts.get("function_low_address_high", 0) / classified_n),
+            "address_function_spearman": spearman_correlation(
+                [row["address"] for row in sample_pairs],
+                [row["functional"] for row in sample_pairs]),
+            "address_activation_spearman": spearman_correlation(
+                [row["address"] for row in empirical_sample],
+                [row.get("activation", 0.0) for row in empirical_sample]),
+            "function_activation_spearman": spearman_correlation(
+                [row["functional"] for row in empirical_sample],
+                [row.get("activation", 0.0) for row in empirical_sample]),
+            "similarity_thresholds": {
+                **thresholds,
+                "activation_high": activation_high,
+            },
+            "pair_sampling": pair_sample,
+            "profile_neighbor_method": (
+                "sparse_signature_countsketch_shortlist_then_exact_cosine"),
+        }
+    summary = {
+        "status": "ready" if neighbor_rows else "partial",
+        "neighbor_k": neighbor_k,
+        "pools": pool_summaries,
+        "artifacts": {
+            "neighbors": ctx.store.path("operator_functional_neighbors.jsonl"),
+            "families": ctx.store.path("operator_functional_families.jsonl"),
+            "summary": ctx.store.path("operator_functional_graph_summary.json"),
+        },
+    }
+    if ctx.is_primary:
+        write_jsonl_atomic(
+            ctx.store.path("operator_functional_neighbors.jsonl"), neighbor_rows)
+        write_jsonl_atomic(
+            ctx.store.path("operator_functional_families.jsonl"), family_rows)
+        write_json_atomic(
+            ctx.store.path("operator_functional_graph_summary.json"), summary)
+    summary["_graph_state"] = graph_state
+    return summary
+
+
+def _load_functional_graph_state(ctx: AnalysisContext) -> Optional[Dict[str, Any]]:
+    path = ctx.store.path("operator_functional_neighbors.jsonl")
+    if not exists(path):
+        return None
+    rows = read_jsonl(path)
+    if not rows:
+        return None
+    state: Dict[str, Any] = {
+        "neighbors": defaultdict(dict),
+        "families": defaultdict(dict),
+        "candidate_ids": defaultdict(list),
+    }
+    for row in rows:
+        pool = str(row["pool"])
+        operator_id = int(row["operator_id"])
+        state["neighbors"][pool][operator_id] = row
+        state["families"][pool][operator_id] = row.get("family_id")
+        state["candidate_ids"][pool].append(operator_id)
+    return {
+        key: {pool: value for pool, value in mapping.items()}
+        for key, mapping in state.items()
+    }
+
+
+def _parse_group_sizes(value: Any, max_width: int) -> List[int]:
+    if isinstance(value, str):
+        sizes = [int(part.strip()) for part in value.split(",") if part.strip()]
+    elif value is None:
+        sizes = [1, 2, 4, 8]
+    else:
+        sizes = [int(item) for item in value]
+    sizes = sorted(set(sizes))
+    if not sizes or sizes[0] <= 0 or sizes[-1] > int(max_width):
+        raise ValueError("group causal sizes must be positive and <= max width")
+    return sizes
+
+
+def _group_candidates(
+        graph_state: Mapping[str, Any], record: Mapping[str, Any],
+        route: str, layer: int, seed_operator: int, group_type: str,
+        requested_size: int, random_seed: int) -> Tuple[List[int], Dict[str, Any]]:
+    graph_pool = "qk" if route in ("q", "k") else route
+    neighbors = graph_state["neighbors"][graph_pool].get(seed_operator, {})
+    metadata: Dict[str, Any] = {}
+    if group_type == "functional_family":
+        family_id = graph_state["families"][graph_pool].get(seed_operator)
+        same_family = {
+            operator_id for operator_id, candidate_family
+            in graph_state["families"][graph_pool].items()
+            if candidate_family == family_id and operator_id != seed_operator
+        }
+        ordered = [
+            int(row["operator_id"])
+            for row in neighbors.get("top_functional_neighbors", [])
+            if int(row["operator_id"]) in same_family]
+        ordered.extend(sorted(same_family - set(ordered)))
+        metadata["family_id"] = family_id
+    elif group_type == "address_neighbors":
+        ordered = [int(row["operator_id"])
+                   for row in neighbors.get("top_address_neighbors", [])]
+    elif group_type == "coactivation_neighbors":
+        ordered = [int(row["operator_id"])
+                   for row in neighbors.get(
+                       "top_activation_profile_neighbors", [])]
+    elif group_type == "random_active_size_matched":
+        trace = record["trace"]
+        ids = np.asarray(trace[f"{route}_top_idx"])[int(layer), 0, :]
+        weights = np.asarray(trace[f"{route}_top_val"])[int(layer), 0, :]
+        active = [(int(operator_id), float(weight))
+                  for operator_id, weight in zip(ids, weights)
+                  if int(operator_id) != int(seed_operator) and float(weight) > 0.0]
+        seed_weight = next((
+            float(weight) for operator_id, weight in zip(ids, weights)
+            if int(operator_id) == int(seed_operator)), 0.0)
+        magnitudes = np.asarray([weight for _, weight in active] + [seed_weight])
+        edges = np.quantile(magnitudes, [0.25, 0.50, 0.75]) if magnitudes.size else []
+        seed_bin = int(np.searchsorted(edges, seed_weight, side="right"))
+        matched = [item for item in active
+                   if int(np.searchsorted(edges, item[1], side="right")) == seed_bin]
+        rng = np.random.default_rng(int(random_seed))
+        if matched:
+            order = rng.permutation(len(matched))
+            ordered = [matched[index][0] for index in order]
+        else:
+            ordered = []
+        metadata.update({
+            "execution_magnitude_bin": seed_bin,
+            "execution_magnitude_bin_edges": [float(value) for value in edges],
+        })
+    else:
+        raise ValueError(f"unknown group type {group_type}")
+    dedup = []
+    for operator_id in ordered:
+        if operator_id != seed_operator and operator_id not in dedup:
+            dedup.append(operator_id)
+    return [int(seed_operator)] + dedup[:max(0, int(requested_size) - 1)], metadata
+
+
+def _group_summary(rows: Sequence[Mapping[str, Any]], seed: int) -> Dict[str, Any]:
+    valid = [row for row in rows if row.get("status") == "ready"]
+    effects = [abs(float(row["target_logprob_delta"])) for row in valid]
+    synergies = [float(row["synergy"]) for row in valid
+                 if _json_float(row.get("synergy")) is not None]
+    effect_ci = _bootstrap_mean_ci(effects, seed)
+    synergy_ci = _bootstrap_mean_ci(synergies, seed + 1)
+    return {
+        "n": len(valid),
+        "mean_abs_target_logprob_delta": effect_ci["mean"],
+        "abs_target_logprob_delta_ci95": effect_ci["ci95"],
+        "mean_full_output_kl": (
+            float(np.mean([float(row["full_output_kl"]) for row in valid]))
+            if valid else None),
+        "mean_recovery_ratio_final": (
+            float(np.mean([float(row["recovery_ratio_final"]) for row in valid]))
+            if valid else None),
+        "mean_synergy": synergy_ci["mean"],
+        "synergy_ci95": synergy_ci["ci95"],
+        "superadditive_fraction": (
+            float(np.mean(np.asarray(synergies) > 0.0)) if synergies else None),
+    }
+
+
+def run_group_causal_intervention(
+        ctx: AnalysisContext, records: Sequence[Dict[str, Any]],
+        causal_rows: Sequence[Mapping[str, Any]],
+        graph_state: Mapping[str, Any]) -> Dict[str, Any]:
+    max_width = int(getattr(ctx.args, "group_causal_max_width", 8) or 8)
+    sizes = _parse_group_sizes(
+        getattr(ctx.args, "group_causal_sizes", "1,2,4,8"), max_width)
+    max_prompts = getattr(ctx.args, "group_causal_max_prompts", None)
+    primary_records = _primary_records(records)
+    if max_prompts is not None:
+        primary_records = primary_records[:max(1, int(max_prompts))]
+    record_by_prompt = {
+        str(record["prompt"]["prompt_id"]): record for record in primary_records}
+    ready_causal = [row for row in causal_rows if row.get("status") == "ready"]
+    seeds: Dict[Tuple[str, str], Mapping[str, Any]] = {}
+    for strategy in ("top_contribution", "top_gate"):
+        for row in ready_causal:
+            key = (str(row["prompt_id"]), str(row["pool"]))
+            if str(row.get("strategy")) == strategy and key not in seeds:
+                seeds[key] = row
+    single_effects = {
+        (str(row["prompt_id"]), str(row["pool"]), int(row["operator_id"])):
+            abs(float(row["target_logprob_delta"]))
+        for row in ready_causal
+        if _json_float(row.get("target_logprob_delta")) is not None
+    }
+    forward = _canonical_group_causal_trace_forward(ctx, max_width)
+    single_forward = _canonical_causal_trace_forward(ctx)
+    pool_codes = {"q": 0, "k": 1, "v": 2, "rst": 3}
+    group_types = (
+        "functional_family", "address_neighbors",
+        "coactivation_neighbors", "random_active_size_matched")
+    result_rows: List[Dict[str, Any]] = []
+    baseline_cache: Dict[Tuple[str, str, int], Any] = {}
+    seed_value = int(ctx.config.get("seed", 0))
+    for seed_index, ((prompt_id, route), seed_row) in enumerate(sorted(seeds.items())):
+        record = record_by_prompt.get(prompt_id)
+        if record is None:
+            continue
+        prompt = record["prompt"]
+        layer = int(seed_row["layer"])
+        target_position = int(record["target_token_index"])
+        replicas = max(1, int(ctx.mesh.shape["data"]))
+        input_ids = jax.device_put(jnp.asarray(np.repeat(
+            np.asarray(prompt["input_array"], dtype=np.int32)[None, :],
+            replicas, axis=0)), ctx.data_sharding)
+        positions = jnp.full((replicas,), target_position, dtype=jnp.int32)
+        cache_key = (prompt_id, route, layer)
+        if cache_key not in baseline_cache:
+            padded_empty = jnp.asarray(np.repeat(
+                pad_group_operator_ids([], max_width)[None, :],
+                replicas, axis=0))
+            group_baseline = jax.device_get(forward(
+                ctx.params, input_ids, positions, jnp.int32(layer),
+                jnp.int32(pool_codes[route]), padded_empty))
+            canonical_baseline = jax.device_get(single_forward(
+                ctx.params, input_ids, positions, jnp.int32(layer),
+                jnp.int32(pool_codes[route]),
+                jnp.zeros((replicas,), dtype=jnp.int32), jnp.bool_(False)))
+            if not all(np.array_equal(np.asarray(left), np.asarray(right))
+                       for left, right in zip(group_baseline[:3], canonical_baseline[:3])):
+                raise RuntimeError(
+                    "fixed-width size-zero group baseline failed machine-exact parity")
+            baseline_cache[cache_key] = group_baseline
+        baseline = baseline_cache[cache_key]
+        baseline_logits = np.asarray(baseline[0])
+        baseline_residual = np.asarray(baseline[2])
+        baseline_trace = baseline[3]
+        length = int(prompt["length"])
+        baseline_ce = _sequence_ce(
+            baseline_logits, prompt["token_ids"], length)
+        baseline_logp = _log_softmax_np(baseline_logits[0, :length])
+        for type_index, group_type in enumerate(group_types):
+            for size in sizes:
+                group, group_meta = _group_candidates(
+                    graph_state, record, route, layer,
+                    int(seed_row["operator_id"]), group_type, size,
+                    seed_value + seed_index * 100 + type_index * 10 + size)
+                common = {
+                    "prompt_id": prompt_id,
+                    "phenomenon": prompt["phenomenon"],
+                    "pool": route,
+                    "layer": layer,
+                    "seed_operator_id": int(seed_row["operator_id"]),
+                    "seed_strategy": seed_row["strategy"],
+                    "group_type": group_type,
+                    "requested_group_size": int(size),
+                    "group_operator_ids": group,
+                    "fixed_width": max_width,
+                    **group_meta,
+                }
+                if len(group) != int(size):
+                    result_rows.append({
+                        **common, "status": "partial",
+                        "reason": "insufficient_qualified_group_members",
+                        "actual_group_size": len(group),
+                    })
+                    continue
+                selected = np.repeat(
+                    pad_group_operator_ids(group, max_width)[None, :],
+                    replicas, axis=0)
+                after = jax.device_get(forward(
+                    ctx.params, input_ids, positions, jnp.int32(layer),
+                    jnp.int32(pool_codes[route]), jnp.asarray(selected)))
+                logits = np.asarray(after[0])
+                residual = np.asarray(after[2])
+                after_ce = _sequence_ce(logits, prompt["token_ids"], length)
+                after_logp = _log_softmax_np(logits[0, :length])
+                base_prob = np.exp(baseline_logp)
+                behavior_before = None if baseline_ce is None else -baseline_ce
+                behavior_after = None if after_ce is None else -after_ce
+                effect = (
+                    None if behavior_before is None or behavior_after is None
+                    else behavior_after - behavior_before)
+                member_effects = [
+                    single_effects.get((prompt_id, route, operator_id))
+                    for operator_id in group]
+                sum_single = (
+                    sum(float(value) for value in member_effects)
+                    if all(value is not None for value in member_effects) else None)
+                max_single = (
+                    max(float(value) for value in member_effects)
+                    if all(value is not None for value in member_effects) else None)
+                recovery = compute_causal_recovery_metrics(
+                    baseline_trace, after[3], route=route, target_layer=layer,
+                    baseline_final_residual=baseline_residual[0, target_position],
+                    intervention_final_residual=residual[0, target_position],
+                    baseline_logits=baseline_logits, intervention_logits=logits,
+                    target_position=target_position)
+                result_rows.append({
+                    **common,
+                    "status": "ready",
+                    "actual_group_size": len(group),
+                    "behavior_score_drop": (
+                        None if behavior_before is None or behavior_after is None
+                        else behavior_before - behavior_after),
+                    "target_logprob_delta": effect,
+                    "full_output_kl": float(np.mean(np.sum(
+                        base_prob * (baseline_logp - after_logp), axis=-1))),
+                    "next_token_kl": float(np.sum(
+                        base_prob[-1] * (baseline_logp[-1] - after_logp[-1]))),
+                    "top_prediction_changed": bool(
+                        np.argmax(baseline_logp[-1]) != np.argmax(after_logp[-1])),
+                    "final_residual_cosine": _cosine(
+                        baseline_residual[0, target_position],
+                        residual[0, target_position]),
+                    "single_member_abs_effects": member_effects,
+                    "sum_single_effect": sum_single,
+                    "max_single_effect": max_single,
+                    "synergy": (
+                        abs(float(effect)) - sum_single
+                        if effect is not None and sum_single is not None else None),
+                    "group_effect_over_sum_single_effect": (
+                        abs(float(effect)) / max(sum_single, 1.0e-12)
+                        if effect is not None and sum_single is not None else None),
+                    "group_effect_over_max_single_effect": (
+                        abs(float(effect)) / max(max_single, 1.0e-12)
+                        if effect is not None and max_single is not None else None),
+                    **recovery,
+                })
+    valid = [row for row in result_rows if row.get("status") == "ready"]
+
+    def grouped(key: str, offset: int) -> Dict[str, Any]:
+        values = sorted({str(row[key]) for row in valid})
+        return {
+            value: _group_summary(
+                [row for row in valid if str(row[key]) == value],
+                seed_value + offset + index)
+            for index, value in enumerate(values)
+        }
+
+    by_type = grouped("group_type", 100)
+    def comparison(left: str, right: str) -> Dict[str, Any]:
+        left_value = (by_type.get(left) or {}).get(
+            "mean_abs_target_logprob_delta")
+        right_value = (by_type.get(right) or {}).get(
+            "mean_abs_target_logprob_delta")
+        return {
+            "left": left, "right": right,
+            "mean_effect_difference": (
+                float(left_value) - float(right_value)
+                if left_value is not None and right_value is not None else None),
+        }
+    summary = {
+        "status": "ready" if valid else "partial",
+        "fixed_width": max_width,
+        "group_sizes": sizes,
+        "by_pool": grouped("pool", 200),
+        "by_group_type": by_type,
+        "by_group_size": grouped("requested_group_size", 300),
+        "by_phenomenon": grouped("phenomenon", 400),
+        "comparisons": {
+            "functional_family_vs_random_active_size_matched": comparison(
+                "functional_family", "random_active_size_matched"),
+            "address_neighbors_vs_functional_family": comparison(
+                "address_neighbors", "functional_family"),
+            "coactivation_neighbors_vs_functional_family": comparison(
+                "coactivation_neighbors", "functional_family"),
+            "group_size_dose_response": grouped("requested_group_size", 500),
+            "synergy_distribution": _group_summary(valid, seed_value + 600),
+        },
+        "artifacts": {
+            "rows": ctx.store.path("group_interventions.jsonl"),
+            "summary": ctx.store.path("group_intervention_summary.json"),
+        },
+    }
+    if ctx.is_primary:
+        write_jsonl_atomic(ctx.store.path("group_interventions.jsonl"), result_rows)
+        write_json_atomic(ctx.store.path("group_intervention_summary.json"), summary)
+    summary["_rows"] = result_rows
+    return summary
+
+
+RANKING_CORRELATION_PAIRS = (
+    ("candidate_gate", "candidate_local_contribution"),
+    ("candidate_gate", "immediate_causal_delta"),
+    ("candidate_local_contribution", "immediate_causal_delta"),
+    ("immediate_causal_delta", "final_residual_delta"),
+    ("immediate_causal_delta", "abs_target_logprob_delta"),
+    ("candidate_gate", "abs_target_logprob_delta"),
+    ("candidate_local_contribution", "abs_target_logprob_delta"),
+)
+
+
+def _spearman_inference(
+        rows: Sequence[Mapping[str, Any]], left_key: str, right_key: str,
+        seed: int, draws: int = 500) -> Dict[str, Any]:
+    pairs = [
+        (float(row[left_key]), float(row[right_key]))
+        for row in rows
+        if _json_float(row.get(left_key)) is not None
+        and _json_float(row.get(right_key)) is not None
+    ]
+    if len(pairs) < 3:
+        return {"n": len(pairs), "spearman": None, "bootstrap_ci95": [None, None],
+                "permutation_two_sided_p": None}
+    left = np.asarray([pair[0] for pair in pairs])
+    right = np.asarray([pair[1] for pair in pairs])
+    observed = spearman_correlation(left, right)
+    rng = np.random.default_rng(int(seed))
+    bootstrap = []
+    permutation = []
+    for _ in range(int(draws)):
+        indices = rng.integers(0, len(pairs), size=len(pairs))
+        value = spearman_correlation(left[indices], right[indices])
+        if value is not None:
+            bootstrap.append(value)
+        null_value = spearman_correlation(left, rng.permutation(right))
+        if null_value is not None:
+            permutation.append(null_value)
+    return {
+        "n": len(pairs),
+        "spearman": observed,
+        "bootstrap_ci95": (
+            [float(np.quantile(bootstrap, 0.025)),
+             float(np.quantile(bootstrap, 0.975))]
+            if bootstrap else [None, None]),
+        "permutation_two_sided_p": (
+            float((1 + np.sum(np.abs(permutation) >= abs(float(observed))))
+                  / (len(permutation) + 1))
+            if permutation and observed is not None else None),
+        "inference": "bootstrap_ci95_and_permutation_null",
+    }
+
+
+def _ranking_correlation_block(
+        rows: Sequence[Mapping[str, Any]], seed: int) -> Dict[str, Any]:
+    return {
+        f"{left}_vs_{right}": _spearman_inference(
+            rows, left, right, seed + index)
+        for index, (left, right) in enumerate(RANKING_CORRELATION_PAIRS)
+    }
+
+
+def run_causal_ranking_calibration(
+        ctx: AnalysisContext, causal_rows: Sequence[Mapping[str, Any]],
+        group_summary: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    rows = []
+    for row in causal_rows:
+        if row.get("status") != "ready":
+            continue
+        rows.append({
+            "prompt_id": row.get("prompt_id"),
+            "phenomenon": row.get("phenomenon"),
+            "pool": row.get("pool"),
+            "strategy": row.get("strategy"),
+            "layer": row.get("layer"),
+            "operator_id": row.get("operator_id"),
+            "candidate_gate": row.get(
+                "candidate_admission", row.get("candidate_execution")),
+            "candidate_execution": row.get("candidate_execution"),
+            "candidate_local_contribution": row.get(
+                "sidecar_estimated_abs_post_denominator_coefficient"),
+            "immediate_causal_delta": row.get("immediate_delta_norm"),
+            "final_residual_delta": row.get("final_delta_norm"),
+            "abs_target_logprob_delta": (
+                abs(float(row["target_logprob_delta"]))
+                if _json_float(row.get("target_logprob_delta")) is not None else None),
+            "full_output_kl": row.get("full_output_kl"),
+        })
+    seed = int(ctx.config.get("seed", 0))
+    by_pool = {
+        pool: _ranking_correlation_block(
+            [row for row in rows if row["pool"] == pool], seed + 100 + index * 20)
+        for index, pool in enumerate(sorted({str(row["pool"]) for row in rows}))
+    }
+    by_phenomenon = {
+        phenomenon: _ranking_correlation_block(
+            [row for row in rows if row["phenomenon"] == phenomenon],
+            seed + 300 + index * 20)
+        for index, phenomenon in enumerate(sorted({
+            str(row["phenomenon"]) for row in rows}))
+    }
+    strategy_pairs = (
+        ("top_gate", "active_random"),
+        ("top_contribution", "active_random"),
+        ("top_gate", "matched_active"),
+        ("top_contribution", "matched_active"),
+        ("matched_active", "active_random"),
+    )
+    metric_keys = (
+        "abs_target_logprob_delta", "immediate_causal_delta", "full_output_kl")
+    pairwise = {
+        f"{left}_gt_{right}": {
+            metric: pairwise_win_rate(rows, left, right, metric)
+            for metric in metric_keys
+        }
+        for left, right in strategy_pairs
+    }
+    overall = _ranking_correlation_block(rows, seed)
+    local = overall.get(
+        "candidate_local_contribution_vs_immediate_causal_delta", {})
+    immediate_final = overall.get(
+        "immediate_causal_delta_vs_abs_target_logprob_delta", {})
+    gate = overall.get("candidate_gate_vs_immediate_causal_delta", {})
+    local_ci = local.get("bootstrap_ci95") or [None, None]
+    final_ci = immediate_final.get("bootstrap_ci95") or [None, None]
+    gate_ci = gate.get("bootstrap_ci95") or [None, None]
+    group_summary = dict(group_summary or {})
+    type_summary = group_summary.get("by_group_type", {})
+    functional = type_summary.get("functional_family", {})
+    random_group = type_summary.get("random_active_size_matched", {})
+    functional_effect = functional.get("mean_abs_target_logprob_delta")
+    random_effect = random_group.get("mean_abs_target_logprob_delta")
+    synergy_ci = functional.get("synergy_ci95") or [None, None]
+    judgments = {
+        "local_ranking_valid": {
+            "supported": bool(local_ci[0] is not None and local_ci[0] > 0.0),
+            "evidence": local,
+        },
+        "downstream_compensation_dominant": {
+            "supported": bool(
+                final_ci[0] is not None and final_ci[1] is not None
+                and final_ci[0] <= 0.0 <= final_ci[1]),
+            "evidence": immediate_final,
+        },
+        "gate_ranking_weak": {
+            "supported": bool(
+                gate_ci[0] is not None and gate_ci[1] is not None
+                and gate_ci[0] <= 0.0 <= gate_ci[1]
+                and _json_float(local.get("spearman")) is not None
+                and (_json_float(gate.get("spearman")) is None
+                     or abs(float(local["spearman"])) > abs(float(gate["spearman"])))),
+            "evidence": {"gate": gate, "local_contribution": local},
+        },
+        "functional_redundancy_candidate": {
+            "supported": bool(
+                functional_effect is not None and random_effect is not None
+                and float(functional_effect) > float(random_effect)
+                and synergy_ci[0] is not None and synergy_ci[0] > 0.0),
+            "evidence": {
+                "functional_family": functional,
+                "random_active_size_matched": random_group,
+            },
+        },
+    }
+    summary = {
+        "status": "ready" if rows else "partial",
+        "row_count": len(rows),
+        "correlations": {
+            "overall": overall,
+            "by_pool": by_pool,
+            "by_phenomenon": by_phenomenon,
+        },
+        "pairwise_win_rates": pairwise,
+        "judgments": judgments,
+        "artifacts": {
+            "summary": ctx.store.path("causal_ranking_calibration.json"),
+            "rows": ctx.store.path("causal_ranking_rows.csv"),
+        },
+    }
+    if ctx.is_primary:
+        write_csv_atomic(ctx.store.path("causal_ranking_rows.csv"), rows)
+        write_json_atomic(
+            ctx.store.path("causal_ranking_calibration.json"), summary)
+    return summary
+
+
+def _failed_analysis_item(item: str, exc: Exception) -> Dict[str, Any]:
+    return {
+        "status": "failed",
+        "error": f"{type(exc).__name__}: {exc}",
+        "dependencies": list(ITEM_DEPENDENCIES.get(item, ())),
+    }
+
+
+def _dependency_failed_item(item: str, dependencies: Sequence[str]) -> Dict[str, Any]:
+    return {
+        "status": "failed",
+        "error": "required dependency did not produce reusable ready/partial rows",
+        "failed_dependencies": list(dependencies),
+        "dependencies": list(ITEM_DEPENDENCIES.get(item, ())),
+    }
 
 
 def run_v4171_transition_items(
     ctx: AnalysisContext,
     items: Sequence[str],
 ) -> Dict[str, Any]:
-    selected = [item for item in CORE_TRANSITION_ITEMS if item in set(items)]
+    requested = set(items)
+    execute = set(requested)
+    if "causal_recovery_trace" in execute:
+        execute.add("causal_intervention")
+    if "operator_functional_graph" in execute:
+        execute.add("trajectory_trace")
+    if "group_causal_intervention" in execute:
+        execute.update((
+            "trajectory_trace", "causal_intervention",
+            "operator_functional_graph"))
+    if "causal_ranking_calibration" in execute:
+        execute.update(("causal_intervention", "causal_recovery_trace"))
+    selected = [item for item in CORE_TRANSITION_ITEMS if item in execute]
     if not selected:
         return {}
     if str(ctx.model_cfg.get("model_version")) != V4171_MODEL_VERSION:
         return {
             item: {
-                "status": "unsupported_for_v4171",
+                "status": "failed",
                 "reason": f"model_version={ctx.model_cfg.get('model_version')}",
             }
             for item in selected
@@ -1918,13 +3786,222 @@ def run_v4171_transition_items(
                 },
             }
     if any(item in selected for item in ("context_divergence", "state_transition_decoupling")):
-        context, decoupling, _ = build_pair_analyses(ctx, records)
+        prompt_hash_for_pairs = (result.get("transition_trace_cache") or {}).get(
+            "prompt_set_hash")
+        context = _load_resumable_summary(
+            ctx, "context_divergence.json", prompt_hash_for_pairs,
+            required_keys=("pairs",)) or {}
+        decoupling = _load_resumable_summary(
+            ctx, "state_transition_decoupling.json", prompt_hash_for_pairs,
+            required_keys=("path_similarity",)) or {}
+        needs_context = "context_divergence" in selected and not context
+        needs_decoupling = (
+            "state_transition_decoupling" in selected and not decoupling)
+        if needs_context or needs_decoupling:
+            computed_context, computed_decoupling, _ = build_pair_analyses(
+                ctx, records)
+            if not context:
+                context = computed_context
+            if not decoupling:
+                decoupling = computed_decoupling
         if "context_divergence" in selected:
             result["context_divergence"] = context
         if "state_transition_decoupling" in selected:
             result["state_transition_decoupling"] = decoupling
+    prompt_hash = (result.get("transition_trace_cache") or {}).get(
+        "prompt_set_hash")
+    causal_summary: Dict[str, Any] = {}
+    causal_rows: List[Dict[str, Any]] = []
     if "causal_intervention" in selected:
-        result["causal_intervention"] = run_causal_intervention(ctx, records)
+        resumed_causal = _load_resumable_summary(
+            ctx, "causal_intervention_summary.json", prompt_hash,
+            required_keys=("zero_suppression_parity", "effects"))
+        interventions_path = ctx.store.path("interventions.jsonl")
+        if (resumed_causal is not None
+                and bool((resumed_causal.get("zero_suppression_parity") or {}).get(
+                    "machine_exact"))
+                and exists(interventions_path)):
+            causal_summary = resumed_causal
+            causal_rows = read_jsonl(interventions_path)
+        else:
+            try:
+                causal_summary = run_causal_intervention(ctx, records)
+                causal_rows = list(causal_summary.pop("_result_rows", []))
+            except RuntimeError as exc:
+                if "parity" in str(exc).lower():
+                    raise
+                causal_summary = _failed_analysis_item(
+                    "causal_intervention", exc)
+            except Exception as exc:
+                causal_summary = _failed_analysis_item(
+                    "causal_intervention", exc)
+        if "causal_intervention" in requested:
+            result["causal_intervention"] = causal_summary
+    recovery_summary: Dict[str, Any] = {}
+    if "causal_recovery_trace" in selected:
+        recovery_summary = _load_resumable_summary(
+            ctx, "causal_recovery_summary.json", prompt_hash,
+            required_keys=("overall", "classification_basis")) or {}
+        if not recovery_summary:
+            if not causal_rows:
+                recovery_summary = _dependency_failed_item(
+                    "causal_recovery_trace", ("causal_intervention",))
+            else:
+                try:
+                    recovery_summary = run_causal_recovery_trace(
+                        ctx, causal_rows)
+                    recovery_summary.pop("_rows", None)
+                except Exception as exc:
+                    recovery_summary = _failed_analysis_item(
+                        "causal_recovery_trace", exc)
+        if "causal_recovery_trace" in requested:
+            result["causal_recovery_trace"] = recovery_summary
+    graph_summary: Dict[str, Any] = {}
+    graph_state: Dict[str, Any] = {}
+    if "operator_functional_graph" in selected:
+        graph_summary = _load_resumable_summary(
+            ctx, "operator_functional_graph_summary.json", prompt_hash,
+            required_keys=("pools", "neighbor_k")) or {}
+        if graph_summary:
+            graph_state = _load_functional_graph_state(ctx) or {}
+            if not graph_state:
+                graph_summary = {}
+        if not graph_summary:
+            try:
+                graph_summary = run_operator_functional_graph(
+                    ctx, records, causal_rows)
+                graph_state = dict(graph_summary.pop("_graph_state", {}))
+            except Exception as exc:
+                graph_summary = _failed_analysis_item(
+                    "operator_functional_graph", exc)
+        if "operator_functional_graph" in requested:
+            result["operator_functional_graph"] = graph_summary
+    group_summary: Dict[str, Any] = {}
+    if "group_causal_intervention" in selected:
+        group_summary = _load_resumable_summary(
+            ctx, "group_intervention_summary.json", prompt_hash,
+            required_keys=("by_group_type", "group_sizes")) or {}
+        if not group_summary:
+            if not causal_rows or not graph_state:
+                failed = []
+                if not causal_rows:
+                    failed.append("causal_intervention")
+                if not graph_state:
+                    failed.append("operator_functional_graph")
+                group_summary = _dependency_failed_item(
+                    "group_causal_intervention", failed)
+            else:
+                try:
+                    group_summary = run_group_causal_intervention(
+                        ctx, records, causal_rows, graph_state)
+                    group_summary.pop("_rows", None)
+                except RuntimeError as exc:
+                    if "parity" in str(exc).lower():
+                        raise
+                    group_summary = _failed_analysis_item(
+                        "group_causal_intervention", exc)
+                except Exception as exc:
+                    group_summary = _failed_analysis_item(
+                        "group_causal_intervention", exc)
+        if "group_causal_intervention" in requested:
+            result["group_causal_intervention"] = group_summary
+    if "causal_ranking_calibration" in selected:
+        ranking = _load_resumable_summary(
+            ctx, "causal_ranking_calibration.json", prompt_hash,
+            required_keys=("correlations", "pairwise_win_rates"))
+        if ranking is None:
+            if not causal_rows:
+                ranking = _dependency_failed_item(
+                    "causal_ranking_calibration", ("causal_intervention",))
+            else:
+                try:
+                    ranking = run_causal_ranking_calibration(
+                        ctx, causal_rows, group_summary)
+                except Exception as exc:
+                    ranking = _failed_analysis_item(
+                        "causal_ranking_calibration", exc)
+        if "causal_ranking_calibration" in requested:
+            result["causal_ranking_calibration"] = ranking
+
+    trace_summary = result.get("transition_trace_cache", {})
+    parity = causal_summary.get("zero_suppression_parity") or None
+    cross_graph = causal_summary.get(
+        "normal_production_cross_graph_audit") or None
+    provenance = _analysis_provenance(
+        ctx, trace_summary.get("prompt_set_hash"), parity, cross_graph)
+    for key, value in result.items():
+        if isinstance(value, dict):
+            if key != "transition_trace_cache":
+                status = str(value.get("status") or "partial")
+                if status not in ("ready", "partial", "not_requested", "failed"):
+                    value["raw_status"] = status
+                    value["status"] = (
+                        "failed" if status.startswith("unsupported") else "partial")
+            value.update(provenance)
+            value.setdefault("dependencies", list(ITEM_DEPENDENCIES.get(key, ())))
+    for value in (
+            causal_summary, recovery_summary, graph_summary, group_summary):
+        if value:
+            value.update(provenance)
+    for key, value in (
+            ("causal_intervention", causal_summary),
+            ("causal_recovery_trace", recovery_summary),
+            ("operator_functional_graph", graph_summary),
+            ("group_causal_intervention", group_summary)):
+        if value:
+            value.setdefault("dependencies", list(ITEM_DEPENDENCIES.get(key, ())))
+    if causal_summary:
+        causal_summary.update({
+            "causal_baseline": "canonical_suppression_disabled",
+            "effect_reference": "canonical_suppression_disabled",
+            "canonical_parity_machine_exact": (
+                bool(parity["machine_exact"]) if parity else None),
+            "cross_graph_audit_blocking": False,
+        })
+    if ctx.is_primary:
+        if parity:
+            parity_artifact = dict(parity)
+            parity_artifact.update(provenance)
+            write_json_atomic(
+                ctx.store.path("intervention_forward_parity.json"),
+                parity_artifact)
+        if cross_graph:
+            cross_graph_artifact = dict(cross_graph)
+            cross_graph_artifact.update(provenance)
+            cross_graph_artifact["blocking"] = False
+            write_json_atomic(
+                ctx.store.path("normal_production_vs_canonical_neutral.json"),
+                cross_graph_artifact)
+        summary_paths = {
+            "global_router_audit": "global_router_audit.json",
+            "trajectory_trace": "transition_trace_summary.json",
+            "context_divergence": "context_divergence.json",
+            "state_transition_decoupling": "state_transition_decoupling.json",
+            "causal_intervention": "causal_intervention_summary.json",
+            "causal_recovery_trace": "causal_recovery_summary.json",
+            "operator_functional_graph": "operator_functional_graph_summary.json",
+            "group_causal_intervention": "group_intervention_summary.json",
+            "causal_ranking_calibration": "causal_ranking_calibration.json",
+        }
+        dependency_summaries = {
+            "global_router_audit": result.get("global_router_audit", {}),
+            "trajectory_trace": (
+                result.get("trajectory_trace")
+                or result.get("transition_trace_cache", {})),
+            "context_divergence": result.get("context_divergence", {}),
+            "state_transition_decoupling": result.get(
+                "state_transition_decoupling", {}),
+            "causal_intervention": causal_summary,
+            "causal_recovery_trace": recovery_summary,
+            "operator_functional_graph": graph_summary,
+            "group_causal_intervention": group_summary,
+            "causal_ranking_calibration": result.get(
+                "causal_ranking_calibration", {}),
+        }
+        for item, path in summary_paths.items():
+            if dependency_summaries[item]:
+                write_json_atomic(
+                    ctx.store.path(path), dependency_summaries[item])
     if ctx.is_primary:
         metrics_rows = [
             {"item": item, **value}
