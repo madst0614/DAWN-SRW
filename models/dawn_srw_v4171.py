@@ -389,10 +389,10 @@ def _validate_v4171_admission_den_grad_scale(value, *, context="v4171"):
         value = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"v4171 requires admission_den_grad_scale=1.0, got {value!r}") from exc
+            f"v417x requires admission_den_grad_scale=1.0, got {value!r}") from exc
     if not math.isfinite(value) or value != 1.0:
         raise ValueError(
-            f"v4171 requires admission_den_grad_scale=1.0, got {value}")
+            f"v417x requires admission_den_grad_scale=1.0, got {value}")
     return value
 
 
@@ -419,7 +419,7 @@ def _validate_v4171_sharded_fns(
     if sharded_fns is None:
         return
     if not isinstance(sharded_fns, dict):
-        raise ValueError("v4171 requires dict-style canonical sharded_fns")
+        raise ValueError("v417x requires dict-style canonical sharded_fns")
     expected_mode, expected_power, expected_heat_kernel_beta = (
         _validate_v4171_composition_settings(
             expected_mode, expected_power, expected_heat_kernel_beta,
@@ -3709,7 +3709,7 @@ class Router(nn.Module):
         ]
         if missing_tau:
             raise ValueError(
-                "v4171 requires explicit cosine-space tau_init_attn_qk/v/rst; "
+                "v417x requires explicit cosine-space tau_init_attn_qk/v/rst; "
                 f"missing {', '.join(missing_tau)}.")
         qk_tau_init = float(self.tau_init_attn_qk)
         v_tau_init = float(self.tau_init_attn_v)
@@ -3766,7 +3766,7 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           analysis_target_route=-1,
                           analysis_intervention_enabled=False,
                           parity_debug=False):
-    """Minimal v4166 attention path: SRW output, causal attention, O-proj."""
+    """Canonical shared v417x minimal attention path."""
     del n_qk, n_v
     admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
     B, S, D = x.shape
@@ -3971,7 +3971,7 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
                          analysis_target_route=-1,
                          analysis_intervention_enabled=False,
                          parity_debug=False):
-    """Minimal v4166 RST path: one SRW output and residual dropout."""
+    """Canonical shared v417x minimal RST path."""
     admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
     if d_model is None or n_layers is None:
         raise ValueError(
@@ -4061,7 +4061,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   soft_gate_boundary_power_final=4.0,
                   admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
                   execution_prune_eps=0.0):
-    """v4166 sharded-only path. sharded_fns=(fused_single, fused_paired) required.
+    """Shared v417x sharded analysis path; canonical fused functions required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
     returns the SLIM tuple extended with observational ANALYSIS stats
@@ -4472,7 +4472,7 @@ def _rst_forward(x, pool_params, router_params, rng,
                   soft_gate_boundary_power_final=4.0,
                   admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
                   execution_prune_eps=0.0):
-    """v4166 sharded-only path. sharded_fns=(fused_single, fused_paired) required.
+    """Shared v417x sharded analysis path; canonical fused functions required.
 
     `analysis` see _attn_forward docstring.
     """

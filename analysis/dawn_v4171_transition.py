@@ -1,4 +1,4 @@
-"""Item-driven v4171 transition analysis built on the existing train-analysis path.
+"""Item-driven v417x transition analysis built on the existing train-analysis path.
 
 The module deliberately keeps model execution in analysis-only JITs.  It never
 changes training outputs or checkpoint structure, and it only transfers target
@@ -55,9 +55,9 @@ SUPPORTED_TRANSITION_MODEL_VERSIONS = frozenset({
 })
 OPERATOR_KEY_MODE_LEARNED = "learned_operator_embedding"
 OPERATOR_KEY_MODE_GENERALIZED_BILINEAR = "generalized_bilinear_rw"
-ANALYSIS_SCHEMA_VERSION = 3
+ANALYSIS_SCHEMA_VERSION = 4
 ANALYSIS_CODE_SCHEMA_HASH = hashlib.sha256(
-    b"v4171-operator-family-analysis-schema-3-causal-rerouting").hexdigest()
+    b"v417x-operator-family-analysis-schema-4-rerouting-inference").hexdigest()
 DEFAULT_TRANSITION_PROMPT_SET = str(
     Path(__file__).resolve().parent / "prompts" / "v4171_transition_pairs.jsonl"
 )
@@ -87,6 +87,9 @@ PAIR_CAPTURE_THRESHOLD = 0.95
 DEFAULT_RECOVERY_NEUTRAL_LOG_BAND = 0.05
 DEFAULT_GROUP_RANDOM_MATCH_DRAWS = 64
 DEFAULT_GROUP_CONTRIBUTION_MATCH_MAX_RELATIVE_ERROR = 0.25
+REROUTING_CONTROL_MIN_SAMPLES = 4
+REROUTING_DIVERGENCE_SIMILARITY_QUANTILE = 0.25
+REROUTING_RECONVERGENCE_SIMILARITY_QUANTILE = 0.75
 
 
 def single_effect_key(
@@ -738,9 +741,10 @@ def _load_resumable_summary(
     if not isinstance(summary, dict) or not _resume_summary_matches(
             ctx, summary, prompt_hash):
         if ctx.is_primary:
+            stage = Path(filename).stem.removesuffix("_summary")
             print(
                 "ANALYSIS_ARTIFACT_SCHEMA_MISMATCH "
-                f"artifact={filename} action=recompute_stage "
+                f"artifact={filename} stage={stage} action=recompute_stage "
                 f"expected_schema={ANALYSIS_SCHEMA_VERSION} "
                 "hint=use --from-scratch to rebuild every stage",
                 flush=True,
@@ -1201,9 +1205,9 @@ def run_transition_trace_cache(ctx: AnalysisContext) -> Tuple[Dict[str, Any], Li
     tokenizer = maybe_load_tokenizer(local_only=True)
     if tokenizer is None:
         raise RuntimeError(
-            "v4171 transition analysis requires the cached bert-base-uncased fast tokenizer")
+            "v417x transition analysis requires the cached bert-base-uncased fast tokenizer")
     if not getattr(tokenizer, "is_fast", False):
-        raise RuntimeError("v4171 transition analysis requires a fast tokenizer with offsets")
+        raise RuntimeError("v417x transition analysis requires a fast tokenizer with offsets")
     seq_len = int(getattr(args, "trace_seq_len", 128) or 128)
     topk_qk = int(getattr(args, "transition_topk_qk", 512) or 512)
     topk_v = int(getattr(args, "transition_topk_v", 2048) or 2048)
@@ -2950,7 +2954,7 @@ def run_v4171_parity_only_smoke(ctx: AnalysisContext) -> Dict[str, Any]:
     tokenizer = maybe_load_tokenizer(local_only=True)
     if tokenizer is None or not getattr(tokenizer, "is_fast", False):
         raise RuntimeError(
-            "v4171 parity-only smoke requires the cached bert-base-uncased "
+            "v417x parity-only smoke requires the cached bert-base-uncased "
             "fast tokenizer")
     seq_len = int(getattr(args, "trace_seq_len", 128) or 128)
     prompts = [_tokenize_transition_row(tokenizer, row, seq_len) for row in rows]
@@ -3551,6 +3555,254 @@ def _paired_strategy_inference(
     }
 
 
+def classify_paired_directional_evidence(
+        comparison: Mapping[str, Any]) -> Dict[str, Any]:
+    """Classify one paired directional comparison without a mean-only shortcut."""
+    paired_n = int(comparison.get("paired_n", 0) or 0)
+    mean = _json_float(comparison.get("paired_mean_difference"))
+    win_rate = _json_float(comparison.get("paired_sign_win_rate"))
+    p_value = _json_float(comparison.get("sign_flip_two_sided_p"))
+    ci = comparison.get("bootstrap_ci95") or [None, None]
+    ci_lower = _json_float(ci[0] if len(ci) >= 1 else None)
+    mean_positive = bool(mean is not None and mean > 0.0)
+    ci_excludes_zero = bool(ci_lower is not None and ci_lower > 0.0)
+    sign_flip_significant = bool(p_value is not None and p_value <= 0.05)
+    win_rate_positive = bool(win_rate is not None and win_rate > 0.5)
+
+    if paired_n < 4 or mean is None:
+        classification = "insufficient_evidence"
+    elif not mean_positive:
+        classification = "no_positive_evidence"
+    elif paired_n >= 6 and (
+            ci_excludes_zero or sign_flip_significant):
+        classification = "strong_positive"
+    elif win_rate_positive:
+        classification = "directional_positive"
+    else:
+        classification = "no_positive_evidence"
+    return {
+        "classification": classification,
+        "paired_n": paired_n,
+        "paired_mean_difference": mean,
+        "mean_positive": mean_positive,
+        "paired_sign_win_rate": win_rate,
+        "win_rate_positive": win_rate_positive,
+        "bootstrap_ci95": list(ci),
+        "ci_excludes_zero": ci_excludes_zero,
+        "sign_flip_two_sided_p": p_value,
+        "sign_flip_significant": sign_flip_significant,
+    }
+
+
+def _classify_important_intervention_control_evidence(
+        paired: Mapping[str, Mapping[str, Any]]) -> Dict[str, Any]:
+    names = (
+        "top_gate_vs_active_random",
+        "top_contribution_vs_active_random",
+    )
+    classified = {
+        name: classify_paired_directional_evidence(paired.get(name) or {})
+        for name in names
+    }
+    classes = [row["classification"] for row in classified.values()]
+    means = [row["paired_mean_difference"] for row in classified.values()]
+    has_strong = any(value == "strong_positive" for value in classes)
+    has_directional = any(
+        value == "directional_positive" for value in classes)
+    every_supports_or_nonnegative = all(
+        classification in ("strong_positive", "directional_positive")
+        or (mean is not None and float(mean) >= 0.0)
+        for classification, mean in zip(classes, means))
+    none_clearly_opposite = all(
+        mean is None or float(mean) >= 0.0 for mean in means)
+    if has_strong and every_supports_or_nonnegative:
+        aggregate = "strong"
+    elif not has_strong and has_directional and none_clearly_opposite:
+        aggregate = "directional"
+    else:
+        aggregate = "not_supported"
+    return {
+        **classified,
+        "aggregate_classification": aggregate,
+        "strong_requires": (
+            "at_least_one_strong_positive_and_other_directional_or_"
+            "nonnegative_mean"),
+        "directional_requires": (
+            "no_strong_at_least_one_directional_and_no_negative_mean"),
+    }
+
+
+def classify_predictive_correlation_evidence(
+        inference: Mapping[str, Any]) -> Dict[str, Any]:
+    """Classify positive Spearman evidence with explicit sample-size gates."""
+    n = int(inference.get("n", 0) or 0)
+    rho = _json_float(inference.get("rho", inference.get("spearman")))
+    ci = inference.get("bootstrap_ci95") or [None, None]
+    ci_lower = _json_float(ci[0] if len(ci) >= 1 else None)
+    rho_positive = bool(rho is not None and rho > 0.0)
+    ci_excludes_zero = bool(ci_lower is not None and ci_lower > 0.0)
+    if n >= 12 and rho_positive and ci_excludes_zero:
+        classification = "strong_predictive_evidence"
+    elif n >= 8 and rho_positive:
+        classification = "directional_predictive_evidence"
+    else:
+        classification = "no_predictive_evidence"
+    return {
+        "classification": classification,
+        "n": n,
+        "rho": rho,
+        "rho_positive": rho_positive,
+        "bootstrap_ci95": list(ci),
+        "ci_excludes_zero": ci_excludes_zero,
+    }
+
+
+def _classify_predictive_relation_evidence(
+        correlations: Mapping[str, Mapping[str, Any]]) -> Dict[str, Any]:
+    keys = {
+        "routing_divergence_auc_vs_final_relative_residual_delta":
+            "routing_divergence_auc_vs_final_relative_residual_delta",
+        "routing_divergence_auc_vs_abs_sequence_behavior_effect":
+            "routing_divergence_auc_vs_sequence_behavior_effect",
+    }
+    classified = {
+        output_name: classify_predictive_correlation_evidence(
+            correlations.get(source_name) or {})
+        for output_name, source_name in keys.items()
+    }
+    classes = [row["classification"] for row in classified.values()]
+    if "strong_predictive_evidence" in classes:
+        aggregate = "strong"
+    elif "directional_predictive_evidence" in classes:
+        aggregate = "directional"
+    else:
+        aggregate = "none"
+    return {
+        **classified,
+        "aggregate_classification": aggregate,
+    }
+
+
+def classify_rerouting_trajectory(
+        layer_rows: Sequence[Mapping[str, Any]],
+        divergence_threshold: Optional[float],
+        reconvergence_threshold: Optional[float]) -> Dict[str, Any]:
+    """Separate meaningful divergence from durable final reconvergence."""
+    qualified = sorted((
+        {
+            "layer": int(row["layer"]),
+            "similarity": float(row["weighted_jaccard"]),
+        }
+        for row in layer_rows
+        if _json_float(row.get("weighted_jaccard")) is not None
+    ), key=lambda row: row["layer"])
+    minimum = (
+        min(qualified, key=lambda row: (row["similarity"], row["layer"]))
+        if qualified else None)
+    minimum_layer = minimum["layer"] if minimum else None
+    after_minimum = (
+        [row for row in qualified if row["layer"] > int(minimum_layer)]
+        if minimum_layer is not None else [])
+    final_qualified = after_minimum[-1] if after_minimum else None
+    divergence_threshold = _json_float(divergence_threshold)
+    reconvergence_threshold = _json_float(reconvergence_threshold)
+
+    if divergence_threshold is None or minimum is None:
+        classification = "indeterminate"
+        meaningful_divergence = None
+    elif minimum["similarity"] >= divergence_threshold:
+        classification = "no_meaningful_divergence"
+        meaningful_divergence = False
+    elif not after_minimum:
+        classification = "diverged_not_reconverged"
+        meaningful_divergence = True
+    elif reconvergence_threshold is None:
+        classification = "indeterminate"
+        meaningful_divergence = None
+    elif final_qualified["similarity"] >= reconvergence_threshold:
+        classification = "diverged_then_reconverged"
+        meaningful_divergence = True
+    else:
+        classification = "diverged_not_reconverged"
+        meaningful_divergence = True
+    first_return = (
+        next((
+            row["layer"] for row in after_minimum
+            if row["similarity"] >= float(reconvergence_threshold)
+        ), None)
+        if meaningful_divergence is True
+        and reconvergence_threshold is not None else None)
+    return {
+        "routing_path_classification": classification,
+        "meaningful_divergence": meaningful_divergence,
+        "meaningful_divergence_threshold": divergence_threshold,
+        "minimum_routing_similarity": (
+            minimum["similarity"] if minimum else None),
+        "minimum_routing_similarity_layer": minimum_layer,
+        "reconvergence_threshold": reconvergence_threshold,
+        "first_threshold_return_layer": first_return,
+        "final_qualified_layer": (
+            final_qualified["layer"] if final_qualified else None),
+        "final_qualified_routing_similarity": (
+            final_qualified["similarity"] if final_qualified else None),
+        "layers_after_minimum": len(after_minimum),
+    }
+
+
+def classify_path_dependence_judgment(
+        *, inactive_exact_noop: bool,
+        important_control_classification: str,
+        predictive_classification: str,
+        meaningful_divergence_count: int,
+        nonreconvergence_fraction_among_diverged: Optional[float],
+        severe_capture_failure: bool = False) -> Dict[str, Any]:
+    """Apply the schema-4 supported/suggestive/not-supported decision tiers."""
+    nonreconvergence = _json_float(
+        nonreconvergence_fraction_among_diverged)
+    supported = bool(
+        inactive_exact_noop
+        and important_control_classification == "strong"
+        and predictive_classification == "strong"
+        and int(meaningful_divergence_count) >= 4
+        and nonreconvergence is not None
+        and nonreconvergence > 0.5
+        and not severe_capture_failure)
+    suggestive = bool(
+        not supported
+        and inactive_exact_noop
+        and important_control_classification in ("strong", "directional")
+        and predictive_classification in ("strong", "directional")
+        and int(meaningful_divergence_count) >= 2
+        and nonreconvergence is not None
+        and nonreconvergence >= 0.5
+        and not severe_capture_failure)
+    return {
+        "status": (
+            "supported" if supported
+            else "suggestive" if suggestive
+            else "not_supported"),
+        "supported": supported,
+        "suggestive": suggestive,
+    }
+
+
+def _empirical_distribution(values: Sequence[float]) -> Dict[str, Any]:
+    array = np.asarray(values, dtype=np.float64)
+    if not array.size:
+        return {
+            "n": 0, "minimum": None, "q25": None,
+            "median": None, "q75": None, "maximum": None,
+        }
+    return {
+        "n": int(array.size),
+        "minimum": float(np.min(array)),
+        "q25": float(np.quantile(array, 0.25)),
+        "median": float(np.quantile(array, 0.50)),
+        "q75": float(np.quantile(array, 0.75)),
+        "maximum": float(np.max(array)),
+    }
+
+
 def run_causal_rerouting_trace(
         ctx: AnalysisContext, records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Directly measure downstream route changes after canonical suppression."""
@@ -3707,40 +3959,66 @@ def run_causal_rerouting_trace(
                 f"prompt={prompt_index + 1:02d}/{len(primary):02d} "
                 f"id={prompt_id}", flush=True)
 
-    control_quantile = 0.75
     control_thresholds: Dict[str, Dict[str, Any]] = {}
     for route in TRACE_POOLS:
-        values = [
-            float(row["final_layer_routing_similarity"])
+        active_controls = [
+            row
             for row in result_rows
             if row.get("pool") == route
             and row.get("strategy") == "active_random"
-            and _json_float(row.get("final_layer_routing_similarity")) is not None]
+            and _json_float(row.get("minimum_routing_similarity")) is not None
+            and _json_float(row.get(
+                "final_layer_routing_similarity")) is not None]
+        minimum_values = [
+            float(row["minimum_routing_similarity"])
+            for row in active_controls]
+        final_values = [
+            float(row["final_layer_routing_similarity"])
+            for row in active_controls]
+        auc_values = [
+            float(row["cumulative_routing_divergence_auc"])
+            for row in active_controls
+            if _json_float(row.get(
+                "cumulative_routing_divergence_auc")) is not None]
+        sample_n = len(active_controls)
+        threshold_status = (
+            "ready" if sample_n >= REROUTING_CONTROL_MIN_SAMPLES
+            else "insufficient_control_samples")
         control_thresholds[route] = {
-            "active_random_quantile": control_quantile,
-            "active_random_sample_n": len(values),
+            "threshold_status": threshold_status,
+            "control_sample_n": sample_n,
+            "minimum_control_sample_n": REROUTING_CONTROL_MIN_SAMPLES,
+            "divergence_similarity_quantile":
+                REROUTING_DIVERGENCE_SIMILARITY_QUANTILE,
+            "reconvergence_similarity_quantile":
+                REROUTING_RECONVERGENCE_SIMILARITY_QUANTILE,
+            "meaningful_divergence_similarity_threshold": (
+                float(np.quantile(
+                    minimum_values,
+                    REROUTING_DIVERGENCE_SIMILARITY_QUANTILE))
+                if threshold_status == "ready" else None),
             "reconvergence_similarity_threshold": (
-                float(np.quantile(values, control_quantile)) if values else None),
+                float(np.quantile(
+                    final_values,
+                    REROUTING_RECONVERGENCE_SIMILARITY_QUANTILE))
+                if threshold_status == "ready" else None),
+            "minimum_routing_similarity_distribution":
+                _empirical_distribution(minimum_values),
+            "final_layer_routing_similarity_distribution":
+                _empirical_distribution(final_values),
+            "cumulative_routing_divergence_auc_distribution":
+                _empirical_distribution(auc_values),
             "inactive_exact_similarity_anchor": 1.0,
         }
     for row in result_rows:
-        threshold = control_thresholds[str(row.get("pool"))].get(
-            "reconvergence_similarity_threshold")
-        minimum_layer = row.get("minimum_routing_similarity_layer")
-        if threshold is None or minimum_layer is None:
-            row["post_intervention_reconvergence"] = None
-            row["reconvergence_layer"] = None
-            continue
-        reconvergence_layers = [
-            int(layer_row["layer"]) for layer_row in row.get("per_layer", [])
-            if int(layer_row["layer"]) > int(minimum_layer)
-            and _json_float(layer_row.get("weighted_jaccard")) is not None
-            and float(layer_row["weighted_jaccard"]) >= float(threshold)]
-        row["post_intervention_reconvergence"] = bool(reconvergence_layers)
-        row["reconvergence_layer"] = (
-            min(reconvergence_layers) if reconvergence_layers else None)
-        row["reconvergence_control"] = control_thresholds[
-            str(row.get("pool"))]
+        control = control_thresholds[str(row.get("pool"))]
+        trajectory_classification = classify_rerouting_trajectory(
+            row.get("per_layer", []),
+            control.get("meaningful_divergence_similarity_threshold"),
+            control.get("reconvergence_similarity_threshold"))
+        row.update(trajectory_classification)
+        row["control_threshold_status"] = control["threshold_status"]
+        row["control_sample_n"] = control["control_sample_n"]
 
     inference_rows = [
         row for row in result_rows
@@ -3778,57 +4056,101 @@ def run_causal_rerouting_trace(
             seed + 2100 + index)
         for index, (left, right) in enumerate(strategy_pairs)
     }
+    for comparison in paired.values():
+        comparison["directional_evidence"] = (
+            classify_paired_directional_evidence(comparison))
     inactive_rows = [
         row for row in result_rows if row.get("strategy") == "inactive_random"
         and row.get("candidate_valid")]
     inactive_exact = bool(inactive_rows) and all(
         row.get("inactive_machine_exact_noop") is True for row in inactive_rows)
-    important_comparisons = [
-        paired["top_gate_vs_active_random"],
-        paired["top_contribution_vs_active_random"],
-    ]
-    important_greater = all(
-        comparison.get("paired_mean_difference") is not None
-        and float(comparison["paired_mean_difference"]) > 0.0
-        for comparison in important_comparisons)
-    predictive_state = correlations[
-        "routing_divergence_auc_vs_final_relative_residual_delta"]
-    predictive_output = correlations[
-        "routing_divergence_auc_vs_sequence_behavior_effect"]
-    state_ci = predictive_state.get("bootstrap_ci95") or [None, None]
-    output_ci = predictive_output.get("bootstrap_ci95") or [None, None]
-    routing_predicts_final_state = bool(
-        state_ci[0] is not None and float(state_ci[0]) > 0.0)
-    routing_predicts_final_output = bool(
-        output_ci[0] is not None and float(output_ci[0]) > 0.0)
-    routing_predicts_final = bool(
-        routing_predicts_final_state or routing_predicts_final_output)
+    important_control_evidence = (
+        _classify_important_intervention_control_evidence(paired))
+    predictive_evidence = _classify_predictive_relation_evidence(correlations)
     important_rows = [
         row for row in result_rows
-        if row.get("strategy") in ("top_gate", "top_contribution")
-        and row.get("post_intervention_reconvergence") is not None]
-    reconvergence_fraction = (
-        float(np.mean([
-            bool(row["post_intervention_reconvergence"])
-            for row in important_rows])) if important_rows else None)
-    generally_not_reconverged = bool(
-        reconvergence_fraction is not None and reconvergence_fraction < 0.5)
-    supported = bool(
-        important_greater and routing_predicts_final and inactive_exact
-        and generally_not_reconverged)
+        if row.get("strategy") in ("top_gate", "top_contribution")]
+    classifiable_rows = [
+        row for row in important_rows
+        if row.get("routing_path_classification") != "indeterminate"]
+    meaningfully_diverged_rows = [
+        row for row in classifiable_rows
+        if row.get("routing_path_classification") in (
+            "diverged_then_reconverged", "diverged_not_reconverged")]
+    no_meaningful_divergence_rows = [
+        row for row in classifiable_rows
+        if row.get("routing_path_classification") ==
+        "no_meaningful_divergence"]
+    reconverged_rows = [
+        row for row in meaningfully_diverged_rows
+        if row.get("routing_path_classification") ==
+        "diverged_then_reconverged"]
+    nonreconverged_rows = [
+        row for row in meaningfully_diverged_rows
+        if row.get("routing_path_classification") ==
+        "diverged_not_reconverged"]
+    diverged_n = len(meaningfully_diverged_rows)
+    trajectory_classification = {
+        "important_row_count": len(important_rows),
+        "important_classifiable_row_count": len(classifiable_rows),
+        "important_meaningful_divergence_count": diverged_n,
+        "important_no_meaningful_divergence_count":
+            len(no_meaningful_divergence_rows),
+        "important_indeterminate_count": (
+            len(important_rows) - len(classifiable_rows)),
+        "meaningful_divergence_fraction": (
+            diverged_n / len(classifiable_rows) if classifiable_rows else None),
+        "diverged_then_reconverged_fraction": (
+            len(reconverged_rows) / diverged_n if diverged_n else None),
+        "diverged_not_reconverged_fraction": (
+            len(nonreconverged_rows) / diverged_n if diverged_n else None),
+        "nonreconvergence_fraction_among_diverged": (
+            len(nonreconverged_rows) / diverged_n if diverged_n else None),
+        "reconvergence_fraction_denominator":
+            "meaningfully_diverged_important_rows",
+    }
     capture_reliability = _capture_reliability_summary(
         capture_records,
         float(getattr(ctx.args, "transition_capture_threshold",
                       PAIR_CAPTURE_THRESHOLD) or PAIR_CAPTURE_THRESHOLD),
         start_layer_key="target_layer")
+    severe_capture_failure = bool(
+        int(capture_reliability.get("total_observations", 0) or 0) == 0
+        or any(
+            int(pool_summary.get("total_observations", 0) or 0) == 0
+            or int(pool_summary.get("qualified_observations", 0) or 0) == 0
+            for pool_summary in (
+                capture_reliability.get("pools") or {}).values()))
+    judgment = classify_path_dependence_judgment(
+        inactive_exact_noop=inactive_exact,
+        important_control_classification=important_control_evidence[
+            "aggregate_classification"],
+        predictive_classification=predictive_evidence[
+            "aggregate_classification"],
+        meaningful_divergence_count=diverged_n,
+        nonreconvergence_fraction_among_diverged=trajectory_classification[
+            "nonreconvergence_fraction_among_diverged"],
+        severe_capture_failure=severe_capture_failure)
     limitations: List[str] = []
     if capture_reliability["remaining_low_capture_count"]:
         limitations.append(
             "Low-capture route/layer rows were excluded from sparse routing inference.")
-    if not supported:
+    if severe_capture_failure:
         limitations.append(
-            "The control-relative divergence, predictive, no-op, and "
-            "reconvergence evidence did not all agree.")
+            "Severe sparse-capture failure left at least one route without "
+            "qualified observations.")
+    if important_control_evidence["aggregate_classification"] == "not_supported":
+        limitations.append(
+            "Important-vs-active-random evidence was neither strong nor directional.")
+    if predictive_evidence["aggregate_classification"] == "none":
+        limitations.append(
+            "Routing divergence did not meet directional predictive sample gates.")
+    if diverged_n < 2:
+        limitations.append(
+            "Fewer than two important rows were meaningfully divergent.")
+    if not inactive_exact:
+        limitations.append(
+            "Inactive intervention exact no-op evidence was unavailable.")
     summary = {
         "status": (
             "partial" if capture_reliability["remaining_low_capture_count"]
@@ -3839,33 +4161,46 @@ def run_causal_rerouting_trace(
         "canonical_forward_shared": True,
         "full_gate_tensor_host_transfer": False,
         "capture_reliability": capture_reliability,
-        "reconvergence_control_provenance": {
-            "method": "poolwise_active_random_empirical_quantile",
+        "routing_control_provenance": {
+            "method": "poolwise_active_random_empirical_quantiles",
+            "minimum_control_sample_n": REROUTING_CONTROL_MIN_SAMPLES,
+            "divergence": {
+                "metric": "minimum_routing_similarity",
+                "quantile": REROUTING_DIVERGENCE_SIMILARITY_QUANTILE,
+                "direction": "lower_means_more_divergent",
+                "boundary_rule": "strictly_less_than",
+            },
+            "reconvergence": {
+                "metric": "final_layer_routing_similarity",
+                "quantile": REROUTING_RECONVERGENCE_SIMILARITY_QUANTILE,
+                "direction": "higher_means_more_baseline_like",
+                "final_qualified_layer_required": True,
+            },
             "thresholds": control_thresholds,
             "inactive_exact_anchor": True,
         },
         "correlations": correlations,
+        "predictive_relation_evidence": predictive_evidence,
         "paired_strategy_comparisons": paired,
+        "important_intervention_control_evidence": important_control_evidence,
+        "trajectory_classification": trajectory_classification,
         "inactive_random_exact_noop": {
             "supported": inactive_exact,
             "n": len(inactive_rows),
         },
         "path_dependence_supported": {
-            "supported": supported,
+            **judgment,
             "evidence": {
-                "important_interventions_gt_active_random": important_greater,
-                "paired_strategy_comparisons": important_comparisons,
-                "routing_divergence_predicts_final_relative_effect":
-                    routing_predicts_final,
-                "routing_predicts_final_relative_state":
-                    routing_predicts_final_state,
-                "routing_predicts_sequence_behavior_effect":
-                    routing_predicts_final_output,
-                "routing_final_state_inference": predictive_state,
-                "routing_final_output_inference": predictive_output,
-                "inactive_intervention_exact_noop": inactive_exact,
-                "important_reconvergence_fraction": reconvergence_fraction,
-                "paths_do_not_generally_reconverge": generally_not_reconverged,
+                "important_vs_control": important_control_evidence,
+                "predictive_relation": predictive_evidence,
+                "inactive_exact_noop": inactive_exact,
+                "trajectory_classification": trajectory_classification,
+                "capture_reliability": {
+                    "status": capture_reliability.get("status"),
+                    "severe_failure": severe_capture_failure,
+                    "remaining_low_capture_count": capture_reliability.get(
+                        "remaining_low_capture_count", 0),
+                },
             },
             "limitations": limitations,
         },
@@ -5635,7 +5970,8 @@ def _spearman_inference(
         and _json_float(row.get(right_key)) is not None
     ]
     if len(pairs) < 3:
-        return {"n": len(pairs), "spearman": None, "bootstrap_ci95": [None, None],
+        return {"n": len(pairs), "rho": None, "spearman": None,
+                "bootstrap_ci95": [None, None],
                 "permutation_two_sided_p": None}
     left = np.asarray([pair[0] for pair in pairs])
     right = np.asarray([pair[1] for pair in pairs])
@@ -5653,6 +5989,7 @@ def _spearman_inference(
             permutation.append(null_value)
     return {
         "n": len(pairs),
+        "rho": observed,
         "spearman": observed,
         "bootstrap_ci95": (
             [float(np.quantile(bootstrap, 0.025)),
@@ -5922,7 +6259,11 @@ def run_v4171_transition_items(
     if "causal_rerouting_trace" in selected:
         rerouting_summary = _load_resumable_summary(
             ctx, "causal_rerouting_summary.json", prompt_hash,
-            required_keys=("capture_reliability", "path_dependence_supported")) or {}
+            required_keys=(
+                "capture_reliability", "path_dependence_supported",
+                "important_intervention_control_evidence",
+                "predictive_relation_evidence", "trajectory_classification",
+            )) or {}
         rerouting_path = ctx.store.path("causal_rerouting_traces.jsonl")
         if rerouting_summary and not exists(rerouting_path):
             rerouting_summary = {}

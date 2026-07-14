@@ -127,6 +127,107 @@ def test_generalized_key_has_live_gradients_for_rw_and_both_probes() -> None:
         assert np.all(np.isfinite(np.asarray(gradient)))
         assert float(jnp.linalg.norm(gradient)) > 0.0
 
+    from scripts import train_jax
+
+    diagnostics = train_jax._shared_probe_gradient_diagnostics(
+        {
+            "rw_key_read_probe": read_probe,
+            "rw_key_write_probe": write_probe,
+        },
+        {
+            "rw_key_read_probe": gradients[2],
+            "rw_key_write_probe": gradients[3],
+        },
+        train_jax.V4172_MODEL_VERSION,
+    )
+    read_grad = float(diagnostics["grad_pool_shared_read_probe"])
+    write_grad = float(diagnostics["grad_pool_shared_write_probe"])
+    combined_grad = float(diagnostics["grad_pool_shared_key_probe"])
+    assert read_grad > 0.0
+    assert write_grad > 0.0
+    assert combined_grad == pytest.approx(
+        np.sqrt(read_grad**2 + write_grad**2))
+    aliases = train_jax._canonical_pool_op_key_grad_norms(
+        {
+            "rw_key_read_probe": gradients[2],
+            "rw_key_write_probe": gradients[3],
+        },
+        train_jax.V4172_MODEL_VERSION,
+    )
+    assert float(aliases["attn_qk"]) == pytest.approx(combined_grad)
+    assert float(aliases["attn_v"]) == 0.0
+    assert float(aliases["rst"]) == 0.0
+
+    v4171_shared = train_jax._shared_probe_gradient_diagnostics(
+        {}, {}, train_jax.V4171_MODEL_VERSION)
+    assert all(float(value) == 0.0 for value in v4171_shared.values())
+    learned_gradients = {
+        "attn_qk_op_key": gradients[0],
+        "attn_v_op_key": gradients[1],
+        "rst_op_key": gradients[0],
+    }
+    learned_aliases = train_jax._canonical_pool_op_key_grad_norms(
+        learned_gradients, train_jax.V4171_MODEL_VERSION)
+    assert all(float(value) > 0.0 for value in learned_aliases.values())
+
+
+def test_compact_metrics_prefer_v4172_shared_probe_and_preserve_v4171() -> None:
+    from scripts import train_jax
+
+    zero = jnp.float32(0.0)
+    result = {
+        key: zero
+        for key in (
+            *train_jax.LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
+            *train_jax.V4171_COMPOSITION_METRIC_NAMES,
+        )
+    }
+    result.update({"correct": zero, "valid_count": jnp.float32(1.0)})
+    shared = {
+        key: jnp.float32(index + 1)
+        for index, key in enumerate(
+            train_jax.V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
+    }
+    v4172_metrics = {
+        **shared,
+        "grad_pool_attn_qk_op_key": shared["grad_pool_shared_key_probe"],
+        "grad_pool_attn_v_op_key": zero,
+        "grad_pool_rst_op_key": zero,
+    }
+
+    def compact(model_version, diagnostics):
+        return train_jax._v4170_compact_train_metrics(
+            result,
+            total_loss=zero,
+            ce_loss=zero,
+            aux_loss=zero,
+            tau_reg=zero,
+            orth_loss=zero,
+            div_loss=zero,
+            grad_norm=zero,
+            tau_lr_mult=zero,
+            tau_update_qk_max_abs=zero,
+            tau_update_v_max_abs=zero,
+            tau_update_rst_max_abs=zero,
+            model_version=model_version,
+            operator_key_gradient_metrics=diagnostics,
+        )
+
+    generalized = compact(train_jax.V4172_MODEL_VERSION, v4172_metrics)
+    assert generalized["grad_pool_shared_key_probe"] == shared[
+        "grad_pool_shared_key_probe"]
+    assert generalized["grad_pool_attn_qk_op_key"] == generalized[
+        "grad_pool_shared_key_probe"]
+    assert generalized["grad_pool_attn_v_op_key"] == 0.0
+    assert generalized["grad_pool_rst_op_key"] == 0.0
+
+    learned_shared = {key: zero for key in shared}
+    learned = compact(train_jax.V4171_MODEL_VERSION, learned_shared)
+    assert all(float(learned[key]) == 0.0 for key in learned_shared)
+    assert all(
+        key not in learned
+        for key in train_jax.V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES)
+
 
 def test_v4171_and_v4172_parameter_schemas_and_symbolic_tiny_count() -> None:
     input_ids = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
@@ -308,16 +409,54 @@ def test_v4171_v4172_cross_version_resume_fails_loud() -> None:
         train_jax._validate_v4171_resume_compatibility(v4171, v4172)
 
 
-def test_400m_symbolic_counts_match_spec() -> None:
+def test_v4172_400m_parameter_matched_count() -> None:
     expected = {
         "configs/train_config_v4171_400M_c4_40B_v4_64.yaml": 393_804_804,
-        "configs/train_config_v4172_400M_c4_40B_v4_64_same_pool.yaml": 383_183_876,
         "configs/train_config_v4172_400M_c4_40B_v4_64.yaml": 393_800_708,
     }
+    counts = {}
+    operator_counts = {}
+    loaded = {}
     for path, count in expected.items():
         with open(path, "r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle)
-        assert symbolic_parameter_count(config)["total"] == count
+        loaded[path] = config
+        counts[path] = symbolic_parameter_count(config)["total"]
+        operator_counts[path] = sum(
+            int(config["model"][key]) for key in ("n_qk", "n_v", "n_rst"))
+        assert counts[path] == count
+    v4171_path, v4172_path = tuple(expected)
+    assert counts[v4172_path] - counts[v4171_path] == -4096
+    assert abs(counts[v4172_path] - counts[v4171_path]) / counts[
+        v4171_path] < 2.0e-5
+    assert operator_counts[v4171_path] == 46_096
+    assert operator_counts[v4172_path] == 48_400
+    assert operator_counts[v4172_path] - operator_counts[v4171_path] == 2_304
+    model = loaded[v4172_path]["model"]
+    assert {
+        key: model[key]
+        for key in (
+            "model_version", "operator_key_mode", "operator_query_mode",
+            "d_model", "d_route", "n_layers", "n_heads", "n_qk", "n_v",
+            "n_rst", "admission_den_power", "srw_composition_mode",
+        )
+    } == {
+        "model_version": "spatial-r1-v4.1.7.2",
+        "operator_key_mode": "generalized_bilinear_rw",
+        "operator_query_mode": "direct_state_projection",
+        "d_model": 2304,
+        "d_route": 256,
+        "n_layers": 18,
+        "n_heads": 36,
+        "n_qk": 3988,
+        "n_v": 12414,
+        "n_rst": 31998,
+        "admission_den_power": 1.0,
+        "srw_composition_mode": "linear_angular",
+    }
+    assert loaded[v4172_path]["checkpoint_dir"] == (
+        "gs://dawn-tpu-data-c4/checkpoints/"
+        "dawn_srw_v4172_400M_c4_40B_v4_64")
 
 
 def test_v4172_analysis_candidate_address_and_router_provenance() -> None:

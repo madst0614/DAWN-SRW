@@ -288,7 +288,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
                        production_srw_fns=None):
     """Return sparse side-car traces while advancing via production kernels.
 
-    For v4171, outputs reconstructed by :func:`_srw_with_topk` are
+    For v417x, outputs reconstructed by :func:`_srw_with_topk` are
     observation-only and are never used as model state.
     """
     model_module = analysis_model_module(model_cfg)
@@ -338,7 +338,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
         }
         if not isinstance(production_srw_fns, dict) or required - set(production_srw_fns):
             raise ValueError(
-                "v4171 production-only trace requires canonical minimal kernels: "
+                "v417x production-only trace requires canonical minimal kernels: "
                 + ",".join(sorted(required)))
 
     pool = model_module._pool_params_with_operator_keys(params["neuron_pool"])

@@ -17,6 +17,8 @@ from analysis.dawn_v4171_transition import (
     _rerouting_layer_rows,
     _rerouting_trajectory_metrics,
     _tree_machine_exact,
+    classify_path_dependence_judgment,
+    classify_rerouting_trajectory,
 )
 from models.dawn_srw_v4171 import (
     DAWN_SRW_V4171,
@@ -223,3 +225,81 @@ def test_capture_reliability_reports_retries_recovery_and_exclusions() -> None:
         assert row["adaptive_recovered_count"] == 1
         assert row["remaining_low_capture_count"] == 1
         assert row["captured_mass_min"] == 0.90
+
+
+def test_rerouting_trajectory_separates_divergence_and_reconvergence() -> None:
+    def rows(similarities):
+        return [
+            {"layer": layer, "weighted_jaccard": similarity}
+            for layer, similarity in enumerate(similarities)
+        ]
+
+    no_divergence = classify_rerouting_trajectory(
+        rows([0.98, 0.97, 0.98]), 0.90, 0.90)
+    assert no_divergence["routing_path_classification"] == (
+        "no_meaningful_divergence")
+    assert no_divergence["meaningful_divergence"] is False
+    assert no_divergence["first_threshold_return_layer"] is None
+
+    reconverged = classify_rerouting_trajectory(
+        rows([0.70, 0.60, 0.92]), 0.80, 0.90)
+    assert reconverged["routing_path_classification"] == (
+        "diverged_then_reconverged")
+    assert reconverged["first_threshold_return_layer"] == 2
+    assert reconverged["final_qualified_layer"] == 2
+    assert reconverged["layers_after_minimum"] == 1
+
+    not_reconverged = classify_rerouting_trajectory(
+        rows([0.70, 0.60, 0.72]), 0.80, 0.90)
+    assert not_reconverged["routing_path_classification"] == (
+        "diverged_not_reconverged")
+
+    transient_return = classify_rerouting_trajectory(
+        rows([0.70, 0.60, 0.92, 0.80]), 0.80, 0.90)
+    assert transient_return["first_threshold_return_layer"] == 2
+    assert transient_return["final_qualified_layer"] == 3
+    assert transient_return["routing_path_classification"] == (
+        "diverged_not_reconverged")
+
+    final_minimum = classify_rerouting_trajectory(
+        rows([0.95, 0.70]), 0.80, None)
+    assert final_minimum["routing_path_classification"] == (
+        "diverged_not_reconverged")
+    assert final_minimum["layers_after_minimum"] == 0
+
+    insufficient = classify_rerouting_trajectory(
+        rows([0.70, 0.60, 0.92]), None, None)
+    assert insufficient["routing_path_classification"] == "indeterminate"
+
+
+def test_path_dependence_judgment_has_three_evidence_tiers() -> None:
+    supported = classify_path_dependence_judgment(
+        inactive_exact_noop=True,
+        important_control_classification="strong",
+        predictive_classification="strong",
+        meaningful_divergence_count=4,
+        nonreconvergence_fraction_among_diverged=0.75,
+    )
+    assert supported == {
+        "status": "supported", "supported": True, "suggestive": False}
+
+    suggestive = classify_path_dependence_judgment(
+        inactive_exact_noop=True,
+        important_control_classification="directional",
+        predictive_classification="directional",
+        meaningful_divergence_count=2,
+        nonreconvergence_fraction_among_diverged=0.5,
+    )
+    assert suggestive == {
+        "status": "suggestive", "supported": False, "suggestive": True}
+
+    not_supported = classify_path_dependence_judgment(
+        inactive_exact_noop=False,
+        important_control_classification="strong",
+        predictive_classification="strong",
+        meaningful_divergence_count=8,
+        nonreconvergence_fraction_among_diverged=1.0,
+    )
+    assert not_supported == {
+        "status": "not_supported", "supported": False,
+        "suggestive": False}

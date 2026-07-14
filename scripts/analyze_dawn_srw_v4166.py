@@ -1926,6 +1926,20 @@ def _operator_family_decision(
     rerouting = analysis.get("causal_rerouting_trace") or {}
     path_dependence = rerouting.get("path_dependence_supported") or {}
     path_evidence = path_dependence.get("evidence") or {}
+    path_status = path_dependence.get("status")
+    if path_status is None:
+        path_status = (
+            "supported" if path_dependence.get("supported")
+            else "not_supported")
+    important_path_evidence = (
+        rerouting.get("important_intervention_control_evidence")
+        or path_evidence.get("important_vs_control") or {})
+    predictive_path_evidence = (
+        rerouting.get("predictive_relation_evidence")
+        or path_evidence.get("predictive_relation") or {})
+    trajectory_path_evidence = (
+        rerouting.get("trajectory_classification")
+        or path_evidence.get("trajectory_classification") or {})
 
     groups = analysis.get("group_causal_intervention") or {}
     redundancy = groups.get("functional_redundancy_supported") or {}
@@ -2048,10 +2062,16 @@ def _operator_family_decision(
         ),
         (
             "Rerouting traces "
-            f"{'support' if path_dependence.get('supported') else 'do not support'} "
+            f"{('support' if path_status == 'supported' else 'suggest' if path_status == 'suggestive' else 'do not support')} "
             "path-dependent downstream computation "
-            f"(routing predicts final={path_evidence.get('routing_divergence_predicts_final_relative_effect')}, "
-            f"important reconvergence fraction={_fmt_pct(path_evidence.get('important_reconvergence_fraction'), 2)})."
+            f"(status={path_status}, "
+            "important-vs-control="
+            f"{important_path_evidence.get('aggregate_classification')}, "
+            f"predictive={predictive_path_evidence.get('aggregate_classification')}, "
+            "meaningfully diverged="
+            f"{trajectory_path_evidence.get('important_meaningful_divergence_count', 0)}, "
+            "nonreconvergence among diverged="
+            f"{_fmt_pct(trajectory_path_evidence.get('nonreconvergence_fraction_among_diverged'), 2)})."
         ),
         (
             "Reciprocal functional neighborhoods "

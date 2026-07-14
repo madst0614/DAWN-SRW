@@ -17,12 +17,16 @@ from analysis.dawn_train_analysis_items import (
     format_train_analysis_item,
 )
 from analysis.dawn_v4171_transition import (
+    _classify_important_intervention_control_evidence,
+    _classify_predictive_relation_evidence,
     _classify_recovery_rows,
     _paired_dose_response,
     _paired_group_comparison,
     _recovery_group_summary,
     _resolve_group_member_singles,
     classify_function_address_pairs,
+    classify_paired_directional_evidence,
+    classify_predictive_correlation_evidence,
     compute_causal_output_metrics,
     compute_causal_recovery_metrics,
     compute_group_additivity_metrics,
@@ -488,6 +492,75 @@ def test_ranking_correlation_and_pairwise_wins() -> None:
     assert result == {"n": 2, "win_rate": 0.5}
 
 
+def test_rerouting_paired_evidence_requires_sample_and_inference_support() -> None:
+    strong = {
+        "paired_n": 6,
+        "paired_mean_difference": 0.2,
+        "bootstrap_ci95": [0.01, 0.4],
+        "paired_sign_win_rate": 2.0 / 3.0,
+        "sign_flip_two_sided_p": 0.2,
+    }
+    directional = {
+        "paired_n": 4,
+        "paired_mean_difference": 0.1,
+        "bootstrap_ci95": [-0.1, 0.3],
+        "paired_sign_win_rate": 0.75,
+        "sign_flip_two_sided_p": 0.2,
+    }
+    zero = {
+        "paired_n": 8,
+        "paired_mean_difference": 0.0,
+        "bootstrap_ci95": [-0.1, 0.1],
+        "paired_sign_win_rate": 0.5,
+        "sign_flip_two_sided_p": 1.0,
+    }
+    insufficient = {
+        "paired_n": 3,
+        "paired_mean_difference": 0.2,
+        "bootstrap_ci95": [0.1, 0.3],
+        "paired_sign_win_rate": 1.0,
+        "sign_flip_two_sided_p": 0.01,
+    }
+    assert classify_paired_directional_evidence(strong)[
+        "classification"] == "strong_positive"
+    assert classify_paired_directional_evidence(directional)[
+        "classification"] == "directional_positive"
+    assert classify_paired_directional_evidence(zero)[
+        "classification"] == "no_positive_evidence"
+    assert classify_paired_directional_evidence(insufficient)[
+        "classification"] == "insufficient_evidence"
+
+    aggregate = _classify_important_intervention_control_evidence({
+        "top_gate_vs_active_random": strong,
+        "top_contribution_vs_active_random": zero,
+    })
+    assert aggregate["aggregate_classification"] == "strong"
+    opposed = _classify_important_intervention_control_evidence({
+        "top_gate_vs_active_random": strong,
+        "top_contribution_vs_active_random": {
+            **zero, "paired_mean_difference": -0.1},
+    })
+    assert opposed["aggregate_classification"] == "not_supported"
+
+
+def test_rerouting_predictive_evidence_uses_n_rho_and_ci() -> None:
+    strong = {"n": 12, "rho": 0.4, "bootstrap_ci95": [0.1, 0.7]}
+    directional = {"n": 8, "rho": 0.2, "bootstrap_ci95": [-0.2, 0.5]}
+    too_small = {"n": 7, "rho": 0.8, "bootstrap_ci95": [0.4, 0.9]}
+    assert classify_predictive_correlation_evidence(strong)[
+        "classification"] == "strong_predictive_evidence"
+    assert classify_predictive_correlation_evidence(directional)[
+        "classification"] == "directional_predictive_evidence"
+    assert classify_predictive_correlation_evidence(too_small)[
+        "classification"] == "no_predictive_evidence"
+
+    aggregate = _classify_predictive_relation_evidence({
+        "routing_divergence_auc_vs_final_relative_residual_delta": strong,
+        "routing_divergence_auc_vs_sequence_behavior_effect": directional,
+    })
+    assert aggregate["aggregate_classification"] == "strong"
+
+
 def test_operator_family_decision_replaces_unrequested_active_failure() -> None:
     capture = {
         "total_observations": 8, "qualified_observations": 8,
@@ -516,10 +589,18 @@ def test_operator_family_decision_replaces_unrequested_active_failure() -> None:
         }},
         "causal_rerouting_trace": {
             "capture_reliability": capture,
-            "path_dependence_supported": {"supported": True, "evidence": {
-                "routing_divergence_predicts_final_relative_effect": True,
-                "important_reconvergence_fraction": 0.2,
-            }},
+            "important_intervention_control_evidence": {
+                "aggregate_classification": "strong"},
+            "predictive_relation_evidence": {
+                "aggregate_classification": "strong"},
+            "trajectory_classification": {
+                "important_meaningful_divergence_count": 8,
+                "nonreconvergence_fraction_among_diverged": 0.8,
+            },
+            "path_dependence_supported": {
+                "status": "supported", "supported": True,
+                "suggestive": False, "evidence": {}, "limitations": [],
+            },
         },
         "trajectory_trace": {"capture_reliability": capture},
         "group_causal_intervention": {

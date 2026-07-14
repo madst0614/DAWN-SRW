@@ -719,6 +719,23 @@ V4171_COMPOSITION_METRIC_NAMES = (
             'pool_scaled_srw_out_norm')),
 )
 
+V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES = (
+    'grad_pool_shared_key_probe',
+    'grad_pool_shared_read_probe',
+    'grad_pool_shared_write_probe',
+    'param_pool_shared_key_probe',
+    'param_pool_shared_read_probe',
+    'param_pool_shared_write_probe',
+    'grad_ratio_pool_shared_read_probe',
+    'grad_ratio_pool_shared_write_probe',
+)
+
+V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES = (
+    'grad_pool_attn_qk_op_key',
+    'grad_pool_attn_v_op_key',
+    'grad_pool_rst_op_key',
+)
+
 V4170_COMPACT_TRAIN_METRIC_NAMES = (
     'total_loss',
     'ce_loss',
@@ -754,9 +771,18 @@ V4170_COMPACT_REGULAR_JSONL_KEYS = (
 V4171_COMPACT_REGULAR_JSONL_REC_KEYS = (
     *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
     *V4171_COMPOSITION_METRIC_NAMES,
+    *V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES,
 )
 V4171_COMPACT_REGULAR_JSONL_KEYS = (
     *V4171_COMPACT_REGULAR_JSONL_REC_KEYS,
+    'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
+)
+V4172_COMPACT_REGULAR_JSONL_REC_KEYS = (
+    *V4171_COMPACT_REGULAR_JSONL_REC_KEYS,
+    *V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES,
+)
+V4172_COMPACT_REGULAR_JSONL_KEYS = (
+    *V4172_COMPACT_REGULAR_JSONL_REC_KEYS,
     'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
 )
 
@@ -2791,7 +2817,8 @@ def _v4170_tau_update_max_abs(updates):
 def _v4170_compact_train_metrics(
         result, *, total_loss, ce_loss, aux_loss, tau_reg, orth_loss,
         div_loss, grad_norm, tau_lr_mult, tau_update_qk_max_abs,
-        tau_update_v_max_abs, tau_update_rst_max_abs):
+        tau_update_v_max_abs, tau_update_rst_max_abs,
+        model_version=None, operator_key_gradient_metrics=None):
     """Build the exact payload; tau_update_* are raw_tau parameter updates."""
     metrics = {
         'total_loss': total_loss,
@@ -2819,8 +2846,25 @@ def _v4170_compact_train_metrics(
     if is_v4171:
         metrics.update({
             key: result[key] for key in V4171_COMPOSITION_METRIC_NAMES})
+        if operator_key_gradient_metrics is None:
+            raise RuntimeError(
+                "v417x compact train metrics require operator-key gradient "
+                "diagnostics")
+        metrics.update({
+            key: operator_key_gradient_metrics[key]
+            for key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES})
+        if str(model_version) == V4172_MODEL_VERSION:
+            metrics.update({
+                key: operator_key_gradient_metrics[key]
+                for key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES})
+    v4172_alias_names = (
+        V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES
+        if str(model_version) == V4172_MODEL_VERSION else ())
     expected = (
-        V4170_COMPACT_TRAIN_METRIC_NAMES + V4171_COMPOSITION_METRIC_NAMES
+        V4170_COMPACT_TRAIN_METRIC_NAMES
+        + V4171_COMPOSITION_METRIC_NAMES
+        + V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES
+        + v4172_alias_names
         if is_v4171 else V4170_COMPACT_TRAIN_METRIC_NAMES)
     if tuple(metrics.keys()) != expected:
         raise RuntimeError(
@@ -5408,6 +5452,48 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     return out
 
 
+def _shared_probe_gradient_diagnostics(
+        pool_params, pool_grads, model_version):
+    """Return v4172 shared-probe norms without changing optimization state."""
+    zero = jnp.float32(0.0)
+    if str(model_version) != V4172_MODEL_VERSION:
+        return {
+            'grad_pool_shared_key_probe': zero,
+            'grad_pool_shared_read_probe': zero,
+            'grad_pool_shared_write_probe': zero,
+            'param_pool_shared_key_probe': zero,
+            'param_pool_shared_read_probe': zero,
+            'param_pool_shared_write_probe': zero,
+            'grad_ratio_pool_shared_read_probe': zero,
+            'grad_ratio_pool_shared_write_probe': zero,
+        }
+
+    def _norm(tree, key):
+        if key not in tree:
+            return zero
+        value = jnp.asarray(tree[key], dtype=jnp.float32)
+        return jax.lax.stop_gradient(jnp.linalg.norm(value))
+
+    grad_read = _norm(pool_grads, 'rw_key_read_probe')
+    grad_write = _norm(pool_grads, 'rw_key_write_probe')
+    param_read = _norm(pool_params, 'rw_key_read_probe')
+    param_write = _norm(pool_params, 'rw_key_write_probe')
+    grad_combined = jnp.sqrt(jnp.square(grad_read) + jnp.square(grad_write))
+    param_combined = jnp.sqrt(
+        jnp.square(param_read) + jnp.square(param_write))
+    return {
+        'grad_pool_shared_key_probe': grad_combined,
+        'grad_pool_shared_read_probe': grad_read,
+        'grad_pool_shared_write_probe': grad_write,
+        'param_pool_shared_key_probe': param_combined,
+        'param_pool_shared_read_probe': param_read,
+        'param_pool_shared_write_probe': param_write,
+        'grad_ratio_pool_shared_read_probe': grad_read / (param_read + 1e-8),
+        'grad_ratio_pool_shared_write_probe': (
+            grad_write / (param_write + 1e-8)),
+    }
+
+
 def _canonical_pool_op_key_grad_norms(pool_grads, model_version):
     """Return version-canonical operator-key gradient norms by pool."""
     def _norm(key):
@@ -5421,10 +5507,10 @@ def _canonical_pool_op_key_grad_norms(pool_grads, model_version):
             'rst': _norm('rst_op_key'),
         }
     if str(model_version) == V4172_MODEL_VERSION:
-        shared_probe_norm = (
-            _norm('rw_key_read_probe') + _norm('rw_key_write_probe'))
+        shared_probe_metrics = _shared_probe_gradient_diagnostics(
+            {}, pool_grads, model_version)
         return {
-            'attn_qk': shared_probe_norm,
+            'attn_qk': shared_probe_metrics['grad_pool_shared_key_probe'],
             'attn_v': jnp.float32(0.0),
             'rst': jnp.float32(0.0),
         }
@@ -7087,8 +7173,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 cur = cur[key]
             return cur
 
+        _gpool = grads.get('neuron_pool', {})
+        _ppool = params.get('neuron_pool', {})
+        _shared_probe_metrics = _shared_probe_gradient_diagnostics(
+            _ppool, _gpool, _model_version)
         grad_norm = _tree_norm(grads)
         if _is_v4170_compact_train:
+            compact_operator_key_metrics = dict(_shared_probe_metrics)
+            if str(_model_version) == V4172_MODEL_VERSION:
+                compact_operator_key_metrics.update({
+                    'grad_pool_attn_qk_op_key': _shared_probe_metrics[
+                        'grad_pool_shared_key_probe'],
+                    'grad_pool_attn_v_op_key': jnp.float32(0.0),
+                    'grad_pool_rst_op_key': jnp.float32(0.0),
+                })
             metrics = _v4170_compact_train_metrics(
                 result,
                 total_loss=total_loss,
@@ -7101,15 +7199,27 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 tau_lr_mult=_tau_lr_mult,
                 tau_update_qk_max_abs=tau_update_qk_max_abs,
                 tau_update_v_max_abs=tau_update_v_max_abs,
-                tau_update_rst_max_abs=tau_update_rst_max_abs)
+                tau_update_rst_max_abs=tau_update_rst_max_abs,
+                model_version=_model_version,
+                operator_key_gradient_metrics=
+                    compact_operator_key_metrics)
             return new_params, new_opt_state, metrics
+        _pool_op_key_grad_norms = (
+            {
+                'attn_qk': _shared_probe_metrics[
+                    'grad_pool_shared_key_probe'],
+                'attn_v': jnp.float32(0.0),
+                'rst': jnp.float32(0.0),
+            }
+            if str(_model_version) == V4172_MODEL_VERSION
+            else _canonical_pool_op_key_grad_norms(
+                _gpool, _model_version))
         if float(global_grad_clip) > 0.0:
             grad_global_postclip = jnp.minimum(grad_norm, _global_grad_clip)
         else:
             grad_global_postclip = grad_norm
 
         _grouter = grads.get('router', {})
-        _gpool = grads.get('neuron_pool', {})
         if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
             grad_router_proj_attn = _child_norm(_grouter, 'proj_attn')
             grad_router_proj_rst = _child_norm(_grouter, 'proj_rst')
@@ -7137,8 +7247,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_router_scan_attn = _child_norm(_grouter, 'raw_scan_offset_attn')
         grad_router_scan_rst = _child_norm(_grouter, 'raw_scan_offset_rst')
         grad_pool_attn_qk_emb = _child_norm(_gpool, 'attn_qk_emb')
-        _pool_op_key_grad_norms = _canonical_pool_op_key_grad_norms(
-            _gpool, _model_version)
         grad_pool_attn_qk_op_key = _pool_op_key_grad_norms['attn_qk']
         grad_pool_attn_qk_read = _pool_partition_norm(
             _gpool, 'attn_qk', 'read')
@@ -7249,7 +7357,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_pool_write = (
             grad_pool_attn_qk_write + grad_pool_attn_v_write
             + grad_pool_rst_write)
-        _ppool = params.get('neuron_pool', {})
         if False:
             pool_weight_decay_loss = jnp.float32(0.5 * pool_weight_decay) * (
                 _tree_sq(_path_tree(_ppool, 'attn_qk_emb'))
@@ -7634,6 +7741,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_router_tau_rst': grad_router_tau_rst,
             'grad_router_scan_attn': grad_router_scan_attn,
             'grad_router_scan_rst': grad_router_scan_rst,
+            **_shared_probe_metrics,
             'grad_pool_attn_qk_emb': grad_pool_attn_qk_emb,
             'grad_pool_attn_qk_op_key': grad_pool_attn_qk_op_key,
             'grad_pool_attn_qk_read': grad_pool_attn_qk_read,
@@ -11368,13 +11476,35 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'grad_router_tau_rst': float(m.get('grad_router_tau_rst', 0.0)),
         'grad_router_scan_attn': float(m.get('grad_router_scan_attn', 0.0)),
         'grad_router_scan_rst': float(m.get('grad_router_scan_rst', 0.0)),
+        'grad_pool_shared_key_probe': float(m.get(
+            'grad_pool_shared_key_probe', 0.0)),
+        'grad_pool_shared_read_probe': float(m.get(
+            'grad_pool_shared_read_probe', 0.0)),
+        'grad_pool_shared_write_probe': float(m.get(
+            'grad_pool_shared_write_probe', 0.0)),
+        'param_pool_shared_key_probe': float(m.get(
+            'param_pool_shared_key_probe', 0.0)),
+        'param_pool_shared_read_probe': float(m.get(
+            'param_pool_shared_read_probe', 0.0)),
+        'param_pool_shared_write_probe': float(m.get(
+            'param_pool_shared_write_probe', 0.0)),
+        'grad_ratio_pool_shared_read_probe': float(m.get(
+            'grad_ratio_pool_shared_read_probe', 0.0)),
+        'grad_ratio_pool_shared_write_probe': float(m.get(
+            'grad_ratio_pool_shared_write_probe', 0.0)),
         'grad_pool_attn_qk_emb': float(m.get('grad_pool_attn_qk_emb', 0.0)),
+        'grad_pool_attn_qk_op_key': float(m.get(
+            'grad_pool_attn_qk_op_key', 0.0)),
         'grad_pool_attn_qk_read': float(m.get('grad_pool_attn_qk_read', 0.0)),
         'grad_pool_attn_qk_write': float(m.get('grad_pool_attn_qk_write', 0.0)),
         'grad_pool_attn_v_emb': float(m.get('grad_pool_attn_v_emb', 0.0)),
+        'grad_pool_attn_v_op_key': float(m.get(
+            'grad_pool_attn_v_op_key', 0.0)),
         'grad_pool_attn_v_read': float(m.get('grad_pool_attn_v_read', 0.0)),
         'grad_pool_attn_v_write': float(m.get('grad_pool_attn_v_write', 0.0)),
         'grad_pool_rst_emb': float(m.get('grad_pool_rst_emb', 0.0)),
+        'grad_pool_rst_op_key': float(m.get(
+            'grad_pool_rst_op_key', 0.0)),
         'grad_pool_rst_read': float(m.get('grad_pool_rst_read', 0.0)),
         'grad_pool_rst_write': float(m.get('grad_pool_rst_write', 0.0)),
         'grad_pool_scales': float(m.get('grad_pool_scales', 0.0)),
@@ -11984,13 +12114,16 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
 
 def _v4170_compact_regular_jsonl_record(rec, ctx):
     """Whitelist the low-cost v4170 regular record without fake fallbacks."""
-    is_v417x = _is_v417x_version(ctx.get('model_version'))
-    rec_keys = (
-        V4171_COMPACT_REGULAR_JSONL_REC_KEYS
-        if is_v417x else V4170_COMPACT_REGULAR_JSONL_REC_KEYS)
-    output_keys = (
-        V4171_COMPACT_REGULAR_JSONL_KEYS
-        if is_v417x else V4170_COMPACT_REGULAR_JSONL_KEYS)
+    model_version = str(ctx.get('model_version'))
+    if model_version == V4172_MODEL_VERSION:
+        rec_keys = V4172_COMPACT_REGULAR_JSONL_REC_KEYS
+        output_keys = V4172_COMPACT_REGULAR_JSONL_KEYS
+    elif _is_v417x_version(model_version):
+        rec_keys = V4171_COMPACT_REGULAR_JSONL_REC_KEYS
+        output_keys = V4171_COMPACT_REGULAR_JSONL_KEYS
+    else:
+        rec_keys = V4170_COMPACT_REGULAR_JSONL_REC_KEYS
+        output_keys = V4170_COMPACT_REGULAR_JSONL_KEYS
     missing = tuple(
         key for key in rec_keys
         if key not in rec)
@@ -12542,6 +12675,13 @@ def _print_regular_block(rec, ctx):
         f"grad={rec['grad_norm']:.2f} | "
         f"acc={acc_text} lr={rec['lr']:.2e}"
     )
+    if str(ctx.get('model_version')) == V4172_MODEL_VERSION:
+        log_message(
+            "  key_probe_grad: "
+            f"shared={_g('grad_pool_shared_key_probe'):.3e} "
+            f"read={_g('grad_pool_shared_read_probe'):.3e} "
+            f"write={_g('grad_pool_shared_write_probe'):.3e}"
+        )
     if opspace_active:
         _print_v4168_opspace_regular_block(rec)
         _print_train_progress_line(rec, ctx)
@@ -13330,6 +13470,11 @@ def _build_analysis_record(base, metrics, ctx):
                                m.get(f'{_src}_{_part}_grad_ratio', 0.0)))
             rec[f'{_dst}_{_part}_grad_ratio'] = _val
             rec[f'{_dst}_{_part}_update_ratio'] = _lr * _val
+    for _key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES:
+        rec[_key] = float(m.get(_key, 0.0))
+    for _key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES:
+        if _key in m:
+            rec[_key] = float(m[_key])
     rec.pop('attn_den_cost', None)
     rec.pop('rst_den_cost', None)
     rec.update({
@@ -13378,6 +13523,14 @@ def _print_analysis_block(rec, ctx):
                 f" min={_g(f'{prefix}_min'):.2f}"
                 f" p95={_g(f'{prefix}_p95'):.2f} p99={_g(f'{prefix}_p99'):.2f}"
                 f" max={_g(f'{prefix}_max'):.2f}")
+
+    if str(ctx.get('model_version')) == V4172_MODEL_VERSION:
+        log_message(
+            "  key_probe_grad: "
+            f"shared={_g('grad_pool_shared_key_probe'):.3e} "
+            f"read={_g('grad_pool_shared_read_probe'):.3e} "
+            f"write={_g('grad_pool_shared_write_probe'):.3e}"
+        )
 
     log_message(
         f"  dist k[skew={rec['rst_score_skew']:+.2f} kurt={rec['rst_score_kurt']:.2f}"
@@ -16347,13 +16500,20 @@ def main():
         deterministic=True,
     )
     params = variables['params']
+    n_params = count_parameters(params)
+    symbolic_counts = (
+        _v417x_symbolic_parameter_count(cfg['model'])
+        if _is_v417x_version(model_version_cfg) else None)
+    if (symbolic_counts is not None
+            and int(symbolic_counts['total']) != int(n_params)):
+        raise RuntimeError(
+            "v417x symbolic/initialized parameter mismatch: "
+            f"expected={symbolic_counts['total']} actual={n_params}")
 
     if is_host0:
         print("=== model.init done ===", flush=True)
-        n_params = count_parameters(params)
         print(f"\nModel parameters: {n_params:,}")
         if _is_v417x_version(model_version_cfg):
-            symbolic_counts = _v417x_symbolic_parameter_count(cfg['model'])
             breakdown_labels = (
                 ('token embedding', 'token_embedding'),
                 ('position embedding', 'position_embedding'),
@@ -16368,10 +16528,6 @@ def main():
             print("Symbolic parameter breakdown:")
             for label, key in breakdown_labels:
                 print(f"  {label}: {symbolic_counts[key]:,}")
-            if int(symbolic_counts['total']) != int(n_params):
-                raise RuntimeError(
-                    "v417x symbolic/initialized parameter mismatch: "
-                    f"expected={symbolic_counts['total']} actual={n_params}")
 
             reference_cfg = deepcopy(cfg['model'])
             reference_cfg.update({
@@ -16399,6 +16555,11 @@ def main():
                   + ("shared_across_qk_v_rst"
                      if str(model_version_cfg) == V4172_MODEL_VERSION
                      else "not_applicable"))
+            if str(model_version_cfg) == V4172_MODEL_VERSION:
+                print(
+                    "v4172 legacy grad_pool_attn_qk_op_key is an alias for "
+                    "the shared QK/V/RST bilinear probe gradient.")
+                print("It is not a QK-only gradient.")
             print("Learned operator key table params: "
                   f"{symbolic_counts['learned_key_tables']}")
             print("Bilinear probe params: "
@@ -16407,6 +16568,42 @@ def main():
             print(f"Actual initialized params: {n_params}")
             print("Parameter-match delta vs v4171: "
                   f"{int(symbolic_counts['total']) - int(v4171_reference_total)}")
+            if (str(model_version_cfg) == V4172_MODEL_VERSION
+                    and official_400m_shape):
+                expected_reference_parameters = 393_804_804
+                expected_parameters = 393_800_708
+                reference_operator_count = sum(
+                    int(reference_cfg[key]) for key in (
+                        'n_qk', 'n_v', 'n_rst'))
+                current_operator_count = sum(int(cfg['model'][key]) for key in (
+                    'n_qk', 'n_v', 'n_rst'))
+                expected_operator_count = 48_400
+                policy_values = {
+                    'reference_parameters': int(v4171_reference_total),
+                    'expected_parameters': int(symbolic_counts['total']),
+                    'reference_operator_count': reference_operator_count,
+                    'current_operator_count': current_operator_count,
+                }
+                expected_policy_values = {
+                    'reference_parameters': expected_reference_parameters,
+                    'expected_parameters': expected_parameters,
+                    'reference_operator_count': 46_096,
+                    'current_operator_count': expected_operator_count,
+                }
+                if policy_values != expected_policy_values:
+                    raise RuntimeError(
+                        "v4172 official 400M parameter-match policy mismatch: "
+                        f"expected={expected_policy_values} actual={policy_values}")
+                print("Parameter comparison policy: total_parameter_matched")
+                print(f"Parameter match reference: {V4171_MODEL_VERSION}")
+                print(f"Reference parameters: {v4171_reference_total}")
+                print(f"Expected parameters: {symbolic_counts['total']}")
+                print("Parameter delta: "
+                      f"{int(symbolic_counts['total']) - int(v4171_reference_total)}")
+                print(f"Reference operator count: {reference_operator_count}")
+                print(f"Current operator count: {current_operator_count}")
+                print("Operator count delta: "
+                      f"{current_operator_count - reference_operator_count:+d}")
         for line in model.get_model_info():
             print(line)
         if str(model_version_cfg) == V4167_MODEL_VERSION:
@@ -19458,6 +19655,14 @@ def main():
                             for _pool in ('qk', 'v', 'know'):
                                 for _part in ('emb', 'read', 'write'):
                                     _key = f'{_pool}_{_part}_grad_ratio'
+                                    analysis_payload[_key] = metrics.get(
+                                        _key, jnp.float32(0.0))
+                            for _key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES:
+                                analysis_payload[_key] = metrics.get(
+                                    _key, jnp.float32(0.0))
+                            if str(model_version) == V4172_MODEL_VERSION:
+                                for _key in (
+                                        V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES):
                                     analysis_payload[_key] = metrics.get(
                                         _key, jnp.float32(0.0))
                             a_rec = _build_analysis_record(

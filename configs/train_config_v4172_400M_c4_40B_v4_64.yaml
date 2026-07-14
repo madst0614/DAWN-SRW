@@ -23,7 +23,7 @@ model:
   d_route: 256
   admission_den_power: 1.0
   srw_composition_mode: linear_angular
-  
+
   n_qk: 3988
   n_v: 12414
   n_rst: 31998

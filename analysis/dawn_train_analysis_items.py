@@ -1123,13 +1123,20 @@ def _item_lines_causal_rerouting_trace(
     data = _v4171_item(summary, "causal_rerouting_trace")
     capture = data.get("capture_reliability") or {}
     path = data.get("path_dependence_supported") or {}
+    important = data.get("important_intervention_control_evidence") or {}
+    predictive = data.get("predictive_relation_evidence") or {}
+    trajectory = data.get("trajectory_classification") or {}
     out = [
         "  CAUSAL REROUTING TRACE:",
         f"  status          : {data.get('status', 'not_requested')}",
         f"  prompts/jobs    : {data.get('num_prompts', 0)}/{data.get('num_interventions', 0)}",
         f"  canonical/shared: {data.get('canonical_forward_shared')} full-gate-host={data.get('full_gate_tensor_host_transfer')}",
         f"  capture         : total={capture.get('total_observations', 0)} qualified={capture.get('qualified_observations', 0)} excluded={capture.get('excluded_observations', 0)} low={capture.get('remaining_low_capture_count', 0)} pools={capture.get('pools', {})}",
-        f"  path dependence : supported={path.get('supported')} evidence={path.get('evidence', {})}",
+        f"  path dependence : status={path.get('status', 'not_supported')} supported={path.get('supported')} suggestive={path.get('suggestive')}",
+        f"  paired evidence : aggregate={important.get('aggregate_classification')} gate={important.get('top_gate_vs_active_random', {})} contribution={important.get('top_contribution_vs_active_random', {})}",
+        f"  predictive      : aggregate={predictive.get('aggregate_classification')} evidence={predictive}",
+        f"  trajectory      : {trajectory}",
+        f"  limitations     : {path.get('limitations', [])}",
         f"  correlations    : {data.get('correlations', {})}",
         f"  paired controls : {data.get('paired_strategy_comparisons', {})}",
         f"  artifacts       : {data.get('artifacts', {})}",
