@@ -181,7 +181,11 @@ def tokenizer_info(tokenizer, args: argparse.Namespace) -> Dict[str, Any]:
 
 def contract_info() -> Dict[str, Any]:
     root = PROJECT_ROOT / "runs" / "operator_dataset_probe"
-    out: Dict[str, Any] = {"root": str(root), "available": root.exists()}
+    out: Dict[str, Any] = {
+        "root": str(root),
+        "available": root.exists(),
+        "source_normalization": probe.SOURCE_NORMALIZATION_DESCRIPTION,
+    }
     for name in ("probe_manifest.json", "dataset_mapping.json", "schema_recommendation.md"):
         path = root / name
         if path.exists():
@@ -213,29 +217,50 @@ def stage_fixed_contract(build_root: Path) -> Dict[str, Any]:
 def download_sources(args: argparse.Namespace, dataset: str) -> Dict[str, Any]:
     cache = Path(args.work_dir) / "downloads"
     rows: List[Dict[str, Any]] = []
+    metadata: Dict[str, Any] = {"dataset": dataset}
     if dataset == "ravel":
-        paths = probe.hf_parquet_tree(
-            probe.RAVEL_HF_TREE, dataset_id="ravel")
-        selected = [p for p in paths if p.startswith(("city_entity/", "city_prompt/"))]
-        if len(selected) != 6:
-            raise RuntimeError(f"RAVEL contract expected 6 city parquet files, got {selected}")
-        for rel in selected:
-            rows.append(probe.download_hf_dataset_file(
-                probe.RAVEL_HF_REPO_ID, rel, cache / "ravel" / "hf" / rel,
-                reuse=args.reuse_downloads, dataset_id="ravel"))
-        rows.append(probe.download(
-            probe.RAVEL_TGZ_URL, cache / "ravel" / "raw" / "data.tgz",
+        archive_path = cache / "ravel" / "official" / "data.tgz"
+        archive_row = probe.download(
+            probe.RAVEL_TGZ_URL, archive_path,
             reuse=args.reuse_downloads, dataset_id="ravel",
-            source_type="ravel_raw_archive"))
+            source_type=probe.RAVEL_SOURCE_CONTRACT)
+        rows.append(archive_row)
+        entities, prompts, archive_names = probe.read_ravel_city_records(
+            archive_path, announce=True)
+        print("RAVEL source = official GitHub data.tgz", flush=True)
+        metadata.update({
+            "source_contract": probe.RAVEL_SOURCE_CONTRACT,
+            "canonical_url": probe.RAVEL_TGZ_URL,
+            "archive_sha256": archive_row["sha256"],
+            "normalization": probe.SOURCE_NORMALIZATION_DESCRIPTION,
+            "observed_archive_files": archive_names,
+            "normalized_record_counts": {
+                "entities": len(entities), "prompts": len(prompts),
+            },
+        })
     elif dataset == "blimp":
-        paths = probe.hf_parquet_tree(
-            probe.BLIMP_HF_TREE, dataset_id="blimp")
-        if len(paths) != 67:
-            raise RuntimeError(f"BLiMP contract expected 67 parquet files, got {len(paths)}")
-        for rel in paths:
-            rows.append(probe.download_hf_dataset_file(
-                probe.BLIMP_HF_REPO_ID, rel, cache / "blimp" / "hf" / rel,
-                reuse=args.reuse_downloads, dataset_id="blimp"))
+        archive_path = cache / "blimp" / "official" / "blimp-master.zip"
+        archive_row = probe.download(
+            probe.BLIMP_ZIP_URL, archive_path,
+            reuse=args.reuse_downloads, dataset_id="blimp",
+            source_type=probe.BLIMP_SOURCE_CONTRACT)
+        rows.append(archive_row)
+        members, row_counts, schemas = probe.blimp_archive_inventory(archive_path)
+        print("BLiMP source = official GitHub data/*.jsonl", flush=True)
+        print(f"BLiMP observed files = {len(members)}", flush=True)
+        metadata.update({
+            "source_contract": probe.BLIMP_SOURCE_CONTRACT,
+            "canonical_url": probe.BLIMP_ZIP_URL,
+            "archive_sha256": archive_row["sha256"],
+            "normalization": probe.SOURCE_NORMALIZATION_DESCRIPTION,
+            "observed_files": members,
+            "observed_file_count": len(members),
+            "observed_rows_per_file": row_counts,
+            "observed_total_rows": sum(row_counts.values()),
+            "observed_schema_variants": sorted({
+                tuple(schema) for schema in schemas.values()
+            }),
+        })
     elif dataset == "lama":
         rows.append(probe.download(
             probe.LAMA_ZIP_URL, cache / "lama" / "data.zip",
@@ -246,7 +271,8 @@ def download_sources(args: argparse.Namespace, dataset: str) -> Dict[str, Any]:
             probe.COUNTERFACT_URL, cache / "counterfact" / "counterfact.json",
             reuse=args.reuse_downloads, dataset_id="counterfact",
             source_type="counterfact_json"))
-    return {"dataset": dataset, "files": rows}
+    metadata["files"] = rows
+    return metadata
 
 
 def _row(
@@ -393,84 +419,143 @@ def iter_synthetic(tokenizer, args: argparse.Namespace) -> Iterator[Dict[str, An
 
 
 def iter_blimp(tokenizer, args: argparse.Namespace) -> Iterator[Dict[str, Any]]:
-    root = Path(args.work_dir) / "downloads" / "blimp" / "hf"
-    paths = probe.hf_parquet_tree(probe.BLIMP_HF_TREE)
+    archive_path = (
+        Path(args.work_dir) / "downloads" / "blimp" / "official" /
+        "blimp-master.zip"
+    )
+    paths, _, _ = probe.blimp_archive_inventory(archive_path)
     index = 0
-    expected_schema = {
-        "UID", "field", "lexically_identical", "linguistics_term",
-        "one_prefix_method", "pair_id", "sentence_bad", "sentence_good",
-        "simple_LM_method", "two_prefix_method",
-    }
-    for rel in paths:
-        rows = probe.read_parquet_rows(root / rel)
-        if rows and set(rows[0]) != expected_schema:
-            raise RuntimeError(f"BLiMP schema drift in {rel}: {sorted(rows[0])}")
-        phenomenon = rel.split("/", 1)[0]
-        for source in rows:
-            uid = str(source.get("UID") or phenomenon)
-            pair_index = source.get("pair_id", index)
-            yield _row(
-                tokenizer, args, index=index,
-                example_id=f"blimp-{phenomenon}-{pair_index}",
-                pair_id=f"blimp-{phenomenon}-{pair_index}", dataset="blimp",
-                split="train", phenomenon=phenomenon,
-                relation="grammatical_minimal_pair", group_id=phenomenon,
-                source_id=f"{uid}:{pair_index}", score_mode="paired_sequence_logprob",
-                trace_semantics="pre_divergence_prediction_state",
-                text_a=str(source["sentence_good"]), text_b=str(source["sentence_bad"]),
-                extension={"source_path": rel, **source},
-            )
-            index += 1
+    with zipfile.ZipFile(archive_path) as archive:
+        for rel in paths:
+            rows = probe.read_blimp_jsonl_rows(archive, rel)
+            phenomenon = Path(rel).stem
+            for source in rows:
+                uid = str(source.get("UID") or phenomenon)
+                pair_index = source.get("pair_id", index)
+                yield _row(
+                    tokenizer, args, index=index,
+                    example_id=f"blimp-{phenomenon}-{pair_index}",
+                    pair_id=f"blimp-{phenomenon}-{pair_index}", dataset="blimp",
+                    split="train", phenomenon=phenomenon,
+                    relation="grammatical_minimal_pair", group_id=phenomenon,
+                    source_id=f"{uid}:{pair_index}",
+                    score_mode="paired_sequence_logprob",
+                    trace_semantics="pre_divergence_prediction_state",
+                    text_a=str(source["sentence_good"]),
+                    text_b=str(source["sentence_bad"]),
+                    extension={"source_path": rel, **source},
+                )
+                index += 1
 
 
 def iter_ravel(tokenizer, args: argparse.Namespace) -> Iterator[Dict[str, Any]]:
-    root = Path(args.work_dir) / "downloads" / "ravel" / "hf"
+    archive_path = (
+        Path(args.work_dir) / "downloads" / "ravel" / "official" / "data.tgz"
+    )
+    all_entities, all_prompts, _ = probe.read_ravel_city_records(archive_path)
     index = 0
     families = (
         "same_attribute_different_entity", "same_entity_different_attribute",
         "same_attribute_different_prompt", "cross_attribute_control",
     )
     for split in ("train", "val", "test"):
-        entities = probe.read_parquet_rows(root / "city_entity" / f"{split}-00000-of-00001.parquet")
-        prompts = probe.read_parquet_rows(root / "city_prompt" / f"{split}-00000-of-00001.parquet")
-        if not entities or set(entities[0]) != {
-            "ID", "City", "Continent", "Country", "Language", "Latitude",
-            "Longitude", "Timezone", "URL",
-        }:
-            raise RuntimeError(f"RAVEL city_entity schema drift in {split}")
-        if not prompts or set(prompts[0]) != {"Template", "Attribute", "Source", "Entity"}:
-            raise RuntimeError(f"RAVEL city_prompt schema drift in {split}")
+        entities = [row for row in all_entities if row["split"] == split]
+        prompts = [row for row in all_prompts if row["split"] == split]
+        required_entity = {"ID", "City", *probe.RAVEL_ENTITY_ATTRIBUTES, "split"}
+        required_prompt = {"Template", "Attribute", "Source", "Entity", "split"}
+        if not entities or not required_entity.issubset(entities[0]):
+            raise RuntimeError(f"RAVEL normalized city_entity schema drift in {split}")
+        if not prompts or not required_prompt.issubset(prompts[0]):
+            raise RuntimeError(f"RAVEL normalized city_prompt schema drift in {split}")
         by_attr: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for row in prompts:
             attribute = str(row["Attribute"])
-            if attribute in entities[0] and str(row["Template"]).count("%s") == 1:
+            if (
+                attribute in entities[0]
+                and str(row["Template"]).count("%s") == 1
+            ):
                 by_attr[attribute].append(row)
-        attributes = sorted(attr for attr, values in by_attr.items() if values)
+        attributes = sorted(
+            attribute for attribute, values in by_attr.items()
+            if values and len({
+                str(entity.get(attribute)) for entity in entities
+                if entity.get(attribute) not in (None, "")
+            }) >= 2
+        )
         if len(attributes) < 2:
             raise RuntimeError(f"RAVEL has fewer than two joinable attributes in {split}")
+        entity_positions = {
+            str(entity["ID"]): position
+            for position, entity in enumerate(entities)
+        }
+
+        def has_value(entity: Mapping[str, Any], attribute: str) -> bool:
+            return entity.get(attribute) not in (None, "")
+
+        def other_entity(
+            base: Mapping[str, Any], attribute: str, *, different_value: bool,
+        ) -> Dict[str, Any]:
+            start = entity_positions[str(base["ID"])]
+            base_value = str(base.get(attribute, ""))
+            for offset in range(1, len(entities)):
+                other = entities[(start + offset) % len(entities)]
+                if not has_value(other, attribute):
+                    continue
+                if different_value and str(other[attribute]) == base_value:
+                    continue
+                return other
+            qualifier = "different value" if different_value else "different entity"
+            raise RuntimeError(
+                f"RAVEL lacks {qualifier} for {attribute} in split {split}")
+
+        def usable_attributes(
+            entity: Mapping[str, Any], *, two_prompts: bool = False,
+        ) -> List[str]:
+            return [
+                attribute for attribute in attributes
+                if has_value(entity, attribute)
+                and (not two_prompts or len(by_attr[attribute]) >= 2)
+            ]
+
         for local_index, entity_a in enumerate(entities):
             family = families[local_index % len(families)]
-            attr_a = attributes[local_index % len(attributes)]
+            candidates = usable_attributes(
+                entity_a, two_prompts=(family == "same_attribute_different_prompt"))
+            if not candidates:
+                continue
+            attr_a = candidates[local_index % len(candidates)]
             attr_b = attr_a
-            entity_b = entities[(local_index + 1) % len(entities)]
+            entity_b = other_entity(entity_a, attr_a, different_value=False)
             prompt_a = by_attr[attr_a][local_index % len(by_attr[attr_a])]
             prompt_b = prompt_a
-            if family in ("same_entity_different_attribute", "cross_attribute_control"):
-                attr_b = attributes[(attributes.index(attr_a) + 1) % len(attributes)]
-                prompt_b = by_attr[attr_b][local_index % len(by_attr[attr_b])]
             if family == "same_entity_different_attribute":
+                paired_attributes = [
+                    attribute for attribute in usable_attributes(entity_a)
+                    if attribute != attr_a
+                ]
+                if not paired_attributes:
+                    continue
+                attr_b = paired_attributes[local_index % len(paired_attributes)]
+                prompt_b = by_attr[attr_b][local_index % len(by_attr[attr_b])]
                 entity_b = entity_a
-            if family == "same_attribute_different_prompt":
+            elif family == "same_attribute_different_prompt":
                 entity_b = entity_a
                 prompt_b = by_attr[attr_a][(local_index + 1) % len(by_attr[attr_a])]
+            elif family == "cross_attribute_control":
+                paired_attributes = [
+                    attribute for attribute in attributes if attribute != attr_a
+                ]
+                attr_b = paired_attributes[local_index % len(paired_attributes)]
+                entity_b = other_entity(entity_a, attr_b, different_value=False)
+                prompt_b = by_attr[attr_b][local_index % len(by_attr[attr_b])]
 
-            def matched_negative(entity: Mapping[str, Any], attribute: str) -> str:
-                for offset in range(1, len(entities)):
-                    other = entities[(local_index + offset) % len(entities)]
-                    value = str(other.get(attribute, ""))
-                    if value and value != str(entity.get(attribute, "")):
-                        return value
-                raise RuntimeError(f"RAVEL lacks matched negative for {attribute}")
+            # A missing attribute value excludes this entity from this pair.
+            if not has_value(entity_a, attr_a) or not has_value(entity_b, attr_b):
+                continue
+            negative_entity_a = other_entity(
+                entity_a, attr_a, different_value=True)
+            negative_entity_b = other_entity(
+                entity_b, attr_b, different_value=True)
 
             context_a = str(prompt_a["Template"]) % str(entity_a["City"])
             context_b = str(prompt_b["Template"]) % str(entity_b["City"])
@@ -483,8 +568,10 @@ def iter_ravel(tokenizer, args: argparse.Namespace) -> Iterator[Dict[str, Any]]:
                 score_mode="continuation_margin",
                 trace_semantics="last_context_token_prediction_state",
                 text_a=context_a, text_b=context_b,
-                positive_a=str(entity_a[attr_a]), negative_a=matched_negative(entity_a, attr_a),
-                positive_b=str(entity_b[attr_b]), negative_b=matched_negative(entity_b, attr_b),
+                positive_a=str(entity_a[attr_a]),
+                negative_a=str(negative_entity_a[attr_a]),
+                positive_b=str(entity_b[attr_b]),
+                negative_b=str(negative_entity_b[attr_b]),
                 extension={
                     "family": family, "entity_a": entity_a, "entity_b": entity_b,
                     "attribute_a": attr_a, "attribute_b": attr_b,
@@ -628,6 +715,13 @@ def stage_source_contract(
         if not target.exists() or sha256_file(target) != str(row["sha256"]):
             shutil.copy2(source, target)
         staged.append(target.relative_to(dataset_root).as_posix())
+    if source_downloads.get("source_contract"):
+        target = raw_root / "source_contract.json"
+        write_json(target, {
+            key: value for key, value in source_downloads.items()
+            if key != "files"
+        })
+        staged.append(target.relative_to(dataset_root).as_posix())
     observed = PROJECT_ROOT / "runs" / "operator_dataset_probe" / "source_probe" / f"{dataset_id}.json"
     if observed.exists():
         target = raw_root / "observed_probe.json"
@@ -667,12 +761,13 @@ def count_contract_source_rows(dataset_id: str, args: argparse.Namespace) -> int
         return int(args.synthetic_examples)
     root = Path(args.work_dir) / "downloads" / dataset_id
     if dataset_id == "blimp":
-        return sum(len(probe.read_parquet_rows(root / "hf" / rel))
-                   for rel in probe.hf_parquet_tree(probe.BLIMP_HF_TREE))
+        _, row_counts, _ = probe.blimp_archive_inventory(
+            root / "official" / "blimp-master.zip")
+        return sum(row_counts.values())
     if dataset_id == "ravel":
-        return sum(len(probe.read_parquet_rows(
-            root / "hf" / "city_entity" / f"{split}-00000-of-00001.parquet"))
-            for split in ("train", "val", "test"))
+        entities, _, _ = probe.read_ravel_city_records(
+            root / "official" / "data.tgz")
+        return len(entities)
     if dataset_id == "counterfact":
         return len(json.loads((root / "counterfact.json").read_text(encoding="utf-8")))
     if dataset_id == "lama":
@@ -904,7 +999,10 @@ def prepare_one_dataset(
     manifest = {
         "schema": SCHEMA, "schema_version": SCHEMA_VERSION,
         "dataset": dataset_id, "source": source_downloads,
-        "source_version": "observed-probe-contract-2026-07-14",
+        "source_version": source_downloads.get(
+            "source_contract", "observed-probe-contract-2026-07-14"),
+        "source_contract": source_downloads.get("source_contract"),
+        "source_normalization": source_downloads.get("normalization"),
         "source_files": staged_sources,
         "rows_source": source_rows, "rows_prepared": prepared_rows,
         "rows_adapter_seen": adapter_rows,
@@ -917,6 +1015,11 @@ def prepare_one_dataset(
         "subsets": subsets, "subset_seed": SUBSET_SEED,
     }
     manifest["first_shard_validation"] = validate_local_shard(dataset_root, shards[0], args)
+    print(
+        f"{dataset_id.upper()} first shard validation passed "
+        f"rows={manifest['first_shard_validation']['rows']}",
+        flush=True,
+    )
     write_json(dataset_root / "manifest.json", manifest)
     return manifest
 
@@ -1103,10 +1206,15 @@ def main() -> int:
         "shard_size": args.shard_size,
         "subset_seed": SUBSET_SEED,
         "urls": {
-            "ravel": [probe.RAVEL_HF_TREE, probe.RAVEL_TGZ_URL],
-            "blimp": probe.BLIMP_HF_TREE, "lama": probe.LAMA_ZIP_URL,
+            "ravel": probe.RAVEL_TGZ_URL,
+            "blimp": probe.BLIMP_ZIP_URL, "lama": probe.LAMA_ZIP_URL,
             "counterfact": probe.COUNTERFACT_URL,
         },
+        "source_contracts": {
+            "ravel": probe.RAVEL_SOURCE_CONTRACT,
+            "blimp": probe.BLIMP_SOURCE_CONTRACT,
+        },
+        "source_normalization": probe.SOURCE_NORMALIZATION_DESCRIPTION,
     }
     source_hash = canonical_hash(source_config)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1176,6 +1284,12 @@ def main() -> int:
             f"prepared={dataset_manifests[dataset_id]['prepared_rows']} "
             f"dropped={dataset_manifests[dataset_id]['rows_dropped']} "
             f"shards={len(dataset_manifests[dataset_id]['shards'])}", flush=True)
+        if dataset_id == "ravel":
+            print(
+                f"RAVEL prepared rows = "
+                f"{dataset_manifests[dataset_id]['prepared_rows']} (> 0)",
+                flush=True,
+            )
     write_json(build_root / "tokenizer.json", token_info)
     write_json(build_root / "source_manifest.json", source_manifest)
     manifest = {
@@ -1228,6 +1342,8 @@ def main() -> int:
         print(
             f"  {dataset_id}: source={row['rows_source']} prepared={row['prepared_rows']} "
             f"dropped={row['rows_dropped']} shards={len(row['shards'])}")
+    if any(dataset_id in {"ravel", "blimp"} for dataset_id in selected):
+        print("  RAVEL/BLiMP HF/Xet dataset URL access = 0")
     if not args.keep_work_dir and not args.skip_upload and is_gcs_path(output_root):
         print(f"  staging retained for resumability: {build_root}")
     return 0

@@ -25,7 +25,7 @@ import urllib.request
 import zipfile
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -37,10 +37,36 @@ for candidate in (PROJECT_ROOT, LOCAL_DEPS):
 RAVEL_TGZ_URL = "https://raw.githubusercontent.com/explanare/ravel/main/data.tgz"
 RAVEL_HF_TREE = "https://huggingface.co/api/datasets/hij/ravel/tree/main?recursive=1"
 RAVEL_HF_REPO_ID = "hij/ravel"
+BLIMP_ZIP_URL = "https://github.com/alexwarstadt/blimp/archive/refs/heads/master.zip"
 BLIMP_HF_TREE = "https://huggingface.co/api/datasets/nyu-mll/blimp/tree/main?recursive=1"
 BLIMP_HF_REPO_ID = "nyu-mll/blimp"
 LAMA_ZIP_URL = "https://dl.fbaipublicfiles.com/LAMA/data.zip"
 COUNTERFACT_URL = "https://rome.baulab.info/data/dsets/counterfact.json"
+
+RAVEL_SOURCE_CONTRACT = "ravel_official_github_archive"
+BLIMP_SOURCE_CONTRACT = "blimp_official_github_jsonl"
+SOURCE_NORMALIZATION_DESCRIPTION = (
+    "The official GitHub records are normalized to the already probed "
+    "dawn_operator_pair_v2 semantic contract. The transport/source container "
+    "changed; the prepared schema and analysis semantics did not."
+)
+RAVEL_CITY_BASENAMES = (
+    "ravel_city_entity_attributes.json",
+    "ravel_city_attribute_to_prompts.json",
+    "ravel_city_entity_to_split.json",
+    "ravel_city_prompt_to_split.json",
+)
+RAVEL_ENTITY_ATTRIBUTES = (
+    "Continent", "Country", "Language", "Latitude", "Longitude", "Timezone",
+)
+BLIMP_CORE_FIELDS = {
+    "sentence_good", "sentence_bad", "UID", "pairID", "field",
+    "linguistics_term", "lexically_identical", "simple_LM_method",
+    "one_prefix_method", "two_prefix_method",
+}
+BLIMP_EXPECTED_FILES = 67
+BLIMP_EXPECTED_ROWS_PER_FILE = 1000
+BLIMP_EXPECTED_TOTAL_ROWS = 67000
 
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -54,7 +80,8 @@ DOWNLOAD_HEADERS = {
 RETRYABLE_HTTP_STATUSES = {403, 408, 429, 500, 502, 503, 504}
 MAX_DOWNLOAD_ATTEMPTS = 5
 CURL_FALLBACK_SOURCE_TYPES = {
-    "lama_zip", "counterfact_json", "ravel_raw_archive",
+    "lama_zip", "counterfact_json", RAVEL_SOURCE_CONTRACT,
+    BLIMP_SOURCE_CONTRACT,
 }
 
 IOI_TEMPLATES = [
@@ -254,31 +281,34 @@ def validate_download(path: Path, source_type: str) -> None:
             trailing_magic = handle.read(4)
         if leading_magic != b"PAR1" or trailing_magic != b"PAR1":
             raise DownloadValidationError("parquet magic bytes are missing")
-    elif source_type == "lama_zip":
+    elif source_type in {"lama_zip", BLIMP_SOURCE_CONTRACT}:
         try:
             with zipfile.ZipFile(path) as archive:
                 if not archive.namelist():
-                    raise DownloadValidationError("LAMA zip archive has no entries")
+                    raise DownloadValidationError(
+                        f"{source_type} zip archive has no entries")
                 bad_entry = archive.testzip()
                 if bad_entry is not None:
                     raise DownloadValidationError(
-                        f"LAMA zip CRC check failed for {bad_entry}")
+                        f"{source_type} zip CRC check failed for {bad_entry}")
         except zipfile.BadZipFile as exc:
-            raise DownloadValidationError(f"LAMA zip is unreadable: {exc}") from exc
+            raise DownloadValidationError(
+                f"{source_type} zip is unreadable: {exc}") from exc
     elif source_type == "counterfact_json":
         try:
             with path.open("r", encoding="utf-8") as handle:
                 json.load(handle)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise DownloadValidationError(f"CounterFact JSON is unreadable: {exc}") from exc
-    elif source_type == "ravel_raw_archive":
+    elif source_type == RAVEL_SOURCE_CONTRACT:
         try:
             with tarfile.open(path, "r:*") as archive:
                 if not archive.getmembers():
-                    raise DownloadValidationError("RAVEL raw archive has no entries")
+                    raise DownloadValidationError(
+                        "RAVEL official archive has no entries")
         except tarfile.TarError as exc:
             raise DownloadValidationError(
-                f"RAVEL raw archive is unreadable: {exc}") from exc
+                f"RAVEL official archive is unreadable: {exc}") from exc
 
 
 def _stored_checksum(path: Path) -> Optional[str]:
@@ -954,6 +984,193 @@ def hf_parquet_tree(url: str, *, dataset_id: Optional[str] = None) -> List[str]:
     )
 
 
+def ravel_archive_inventory(
+    path: Path, *, announce: bool = False,
+) -> Tuple[List[str], Dict[str, str]]:
+    """Return the full archive inventory and unique required city members."""
+    with tarfile.open(path, "r:gz") as archive:
+        names = archive.getnames()
+    if announce:
+        print("RAVEL archive contents:", flush=True)
+        for name in names:
+            print(f"  {name}", flush=True)
+    selected: Dict[str, str] = {}
+    for basename in RAVEL_CITY_BASENAMES:
+        matches = [
+            name for name in names
+            if PurePosixPath(name).name == basename
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "RAVEL official archive requires exactly one member with "
+                f"basename {basename!r}; observed={matches}")
+        selected[basename] = matches[0]
+    return names, selected
+
+
+def read_ravel_city_records(
+    path: Path, *, announce: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    """Normalize the four official city JSON files to the probed HF semantics."""
+    names, selected = ravel_archive_inventory(path, announce=announce)
+    values: Dict[str, Any] = {}
+    with tarfile.open(path, "r:gz") as archive:
+        for basename, member in selected.items():
+            handle = archive.extractfile(member)
+            if handle is None:
+                raise RuntimeError(f"RAVEL archive member is not a file: {member}")
+            values[basename] = json.load(handle)
+
+    entity_attributes = values["ravel_city_entity_attributes.json"]
+    attribute_prompts = values["ravel_city_attribute_to_prompts.json"]
+    entity_splits = values["ravel_city_entity_to_split.json"]
+    prompt_splits = values["ravel_city_prompt_to_split.json"]
+    for label, value in (
+        ("entity attributes", entity_attributes),
+        ("attribute prompts", attribute_prompts),
+        ("entity splits", entity_splits),
+        ("prompt splits", prompt_splits),
+    ):
+        if not isinstance(value, Mapping):
+            raise RuntimeError(
+                f"RAVEL {label} JSON must be an object, got {type(value).__name__}")
+
+    entities: List[Dict[str, Any]] = []
+    for index, (city_value, attributes_value) in enumerate(entity_attributes.items()):
+        city = str(city_value)
+        if not isinstance(attributes_value, Mapping):
+            raise RuntimeError(f"RAVEL attributes for {city!r} are not an object")
+        if city not in entity_splits:
+            raise RuntimeError(f"RAVEL entity split is missing for {city!r}")
+        split = str(entity_splits[city])
+        if split not in {"train", "val", "test"}:
+            raise RuntimeError(f"RAVEL entity {city!r} has invalid split {split!r}")
+        row: Dict[str, Any] = {
+            "ID": f"{index}-0",
+            "City": city,
+            **{attribute: attributes_value.get(attribute)
+               for attribute in RAVEL_ENTITY_ATTRIBUTES},
+            "split": split,
+        }
+        url = attributes_value.get("URL")
+        if url not in (None, ""):
+            row["URL"] = url
+        entities.append(row)
+    extra_entity_splits = set(map(str, entity_splits)) - {
+        str(city) for city in entity_attributes
+    }
+    if extra_entity_splits:
+        raise RuntimeError(
+            "RAVEL entity split JSON contains unknown entities: "
+            f"{sorted(extra_entity_splits)[:10]}")
+
+    prompts: List[Dict[str, Any]] = []
+    normalized_templates: List[str] = []
+    for attribute_value, templates_value in attribute_prompts.items():
+        attribute = str(attribute_value)
+        if not isinstance(templates_value, list):
+            raise RuntimeError(
+                f"RAVEL prompt list for {attribute!r} is not an array")
+        for template_value in templates_value:
+            template = str(template_value)
+            if template not in prompt_splits:
+                raise RuntimeError(
+                    f"RAVEL prompt split is missing for template {template!r}")
+            split = str(prompt_splits[template])
+            if split not in {"train", "val", "test"}:
+                raise RuntimeError(
+                    f"RAVEL prompt {template!r} has invalid split {split!r}")
+            prompts.append({
+                "Template": template,
+                "Attribute": attribute,
+                "Source": "RAVEL",
+                "Entity": "",
+                "split": split,
+            })
+            normalized_templates.append(template)
+    extra_prompt_splits = set(map(str, prompt_splits)) - set(normalized_templates)
+    if extra_prompt_splits:
+        raise RuntimeError(
+            "RAVEL prompt split JSON contains unknown templates: "
+            f"{sorted(extra_prompt_splits)[:10]}")
+    return entities, prompts, names
+
+
+def normalize_blimp_row(
+    source: Mapping[str, Any], *, member: str, line_number: int,
+) -> Dict[str, Any]:
+    missing = BLIMP_CORE_FIELDS - set(source)
+    if missing:
+        raise RuntimeError(
+            f"BLiMP schema drift in {member}:{line_number}; missing={sorted(missing)} "
+            f"observed={sorted(source)}")
+    row = dict(source)
+    pair_id = row.pop("pairID")
+    if isinstance(pair_id, str) and re.fullmatch(r"[0-9]+", pair_id):
+        pair_id = int(pair_id)
+    row["pair_id"] = pair_id
+    return row
+
+
+def read_blimp_jsonl_rows(
+    archive: zipfile.ZipFile, member: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with archive.open(member) as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                source = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"BLiMP JSONL is unreadable at {member}:{line_number}: {exc}") from exc
+            if not isinstance(source, Mapping):
+                raise RuntimeError(
+                    f"BLiMP row is not an object at {member}:{line_number}")
+            rows.append(normalize_blimp_row(
+                source, member=member, line_number=line_number))
+    return rows
+
+
+def blimp_archive_inventory(
+    path: Path,
+) -> Tuple[List[str], Dict[str, int], Dict[str, Dict[str, str]]]:
+    """Validate the complete official BLiMP data/*.jsonl contract."""
+    with zipfile.ZipFile(path) as archive:
+        members = sorted(
+            name for name in archive.namelist()
+            if (
+                len(PurePosixPath(name).parts) >= 2
+                and PurePosixPath(name).parts[-2] == "data"
+                and PurePosixPath(name).suffix == ".jsonl"
+            )
+        )
+        if len(members) != BLIMP_EXPECTED_FILES:
+            raise RuntimeError(
+                f"BLiMP official archive expected {BLIMP_EXPECTED_FILES} data/*.jsonl "
+                f"files, got {len(members)}: {members}")
+        row_counts: Dict[str, int] = {}
+        schemas: Dict[str, Dict[str, str]] = {}
+        for member in members:
+            rows = read_blimp_jsonl_rows(archive, member)
+            row_counts[member] = len(rows)
+            schemas[member] = (
+                {key: type(value).__name__ for key, value in rows[0].items()}
+                if rows else {}
+            )
+            if len(rows) != BLIMP_EXPECTED_ROWS_PER_FILE:
+                raise RuntimeError(
+                    f"BLiMP file {member} expected {BLIMP_EXPECTED_ROWS_PER_FILE} "
+                    f"rows, got {len(rows)}")
+    total = sum(row_counts.values())
+    if total != BLIMP_EXPECTED_TOTAL_ROWS:
+        raise RuntimeError(
+            f"BLiMP official archive expected {BLIMP_EXPECTED_TOTAL_ROWS} total "
+            f"rows, got {total}")
+    return members, row_counts, schemas
+
+
 def _find_col(columns: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
     lookup = {str(value).lower(): str(value) for value in columns}
     for candidate in candidates:
@@ -963,60 +1180,51 @@ def _find_col(columns: Sequence[str], candidates: Sequence[str]) -> Optional[str
 
 
 def probe_ravel(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    probe = base_probe("ravel", {"hf_tree": RAVEL_HF_TREE, "raw_archive": RAVEL_TGZ_URL})
-    paths = hf_parquet_tree(RAVEL_HF_TREE, dataset_id="ravel")
-    selected = [
-        path for path in paths
-        if path.startswith("city_entity/") or path.startswith("city_prompt/")
-    ]
-    if not selected:
-        raise RuntimeError("RAVEL HF tree has no city_entity/city_prompt parquet files")
-    observed = []
-    all_samples: List[Dict[str, Any]] = []
-    for rel in selected:
-        local = cache / "ravel" / "hf" / rel
-        file_row = download_hf_dataset_file(
-            RAVEL_HF_REPO_ID, rel, local, reuse=args.reuse_downloads,
-            dataset_id="ravel")
-        probe["downloaded_files"].append(file_row)
-        info = inspect_parquet(local, args.sample_rows)
-        info["source_path"] = rel
-        info["split"] = Path(rel).stem.split("-")[0]
-        info["kind"] = rel.split("/", 1)[0]
-        observed.append(info)
-        for row in info["samples"]:
-            all_samples.append({"source_path": rel, "split": info["split"], **row})
-    raw_local = cache / "ravel" / "raw" / "data.tgz"
-    raw_info = download(
-        RAVEL_TGZ_URL, raw_local, reuse=args.reuse_downloads,
-        dataset_id="ravel", source_type="ravel_raw_archive")
-    probe["downloaded_files"].append(raw_info)
-    with tarfile.open(raw_local, "r:gz") as archive:
-        names = archive.getnames()
-    probe["observed_files"] = [row["source_path"] for row in observed] + names
-    probe["observed_splits"] = sorted(set(row["split"] for row in observed))
+    source = {
+        "contract": RAVEL_SOURCE_CONTRACT,
+        "canonical_url": RAVEL_TGZ_URL,
+        "normalization": SOURCE_NORMALIZATION_DESCRIPTION,
+    }
+    probe = base_probe("ravel", source)
+    archive_path = cache / "ravel" / "official" / "data.tgz"
+    probe["downloaded_files"].append(download(
+        RAVEL_TGZ_URL, archive_path, reuse=args.reuse_downloads,
+        dataset_id="ravel", source_type=RAVEL_SOURCE_CONTRACT))
+    entity_rows_all, prompt_rows_all, names = read_ravel_city_records(
+        archive_path, announce=True)
+    probe["observed_files"] = names
+    probe["observed_splits"] = sorted({
+        str(row["split"]) for row in entity_rows_all + prompt_rows_all
+    })
+    observed_rows = {
+        f"normalized/city_entity/{split}": [
+            row for row in entity_rows_all if row["split"] == split
+        ]
+        for split in ("train", "val", "test")
+    }
+    observed_rows.update({
+        f"normalized/city_prompt/{split}": [
+            row for row in prompt_rows_all if row["split"] == split
+        ]
+        for split in ("train", "val", "test")
+    })
     probe["observed_schema"] = {
-        row["source_path"]: row["schema"] for row in observed
+        name: {key: type(value).__name__ for key, value in rows[0].items()}
+        for name, rows in observed_rows.items() if rows
     }
-    probe["observed_columns"] = sorted(set(
-        column for row in observed for column in row["columns"]))
+    probe["observed_columns"] = sorted({
+        key for rows in observed_rows.values() for row in rows[:1] for key in row
+    })
     probe["row_count"] = {
-        row["source_path"]: row["row_count"] for row in observed
+        name: len(rows) for name, rows in observed_rows.items()
     }
-    probe["raw_samples"] = all_samples[: max(args.sample_rows, 5)]
-    probe["nested_key_paths"] = sorted(set(
-        path for row in probe["raw_samples"] for path in nested_key_paths(row)))
-    train_entity_path = cache / "ravel" / "hf" / next(
-        path for path in selected if path.startswith("city_entity/train"))
-    train_prompt_path = cache / "ravel" / "hf" / next(
-        path for path in selected if path.startswith("city_prompt/train"))
-    entity_rows = read_parquet_rows(train_entity_path)
-    prompt_rows = read_parquet_rows(train_prompt_path)
+    entity_rows = observed_rows["normalized/city_entity/train"]
+    prompt_rows = observed_rows["normalized/city_prompt/train"]
     probe["raw_samples"] = [
-        {"source_path": "city_entity/train-00000-of-00001.parquet", "split": "train", **row}
+        {"source_path": "normalized/city_entity/train", **row}
         for row in entity_rows[: args.sample_rows]
     ] + [
-        {"source_path": "city_prompt/train-00000-of-00001.parquet", "split": "train", **row}
+        {"source_path": "normalized/city_prompt/train", **row}
         for row in prompt_rows[: args.sample_rows]
     ]
     probe["nested_key_paths"] = sorted(set(
@@ -1025,7 +1233,7 @@ def probe_ravel(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict
     required_entity = {"ID", "City"}
     required_prompt = {"Template", "Attribute", "Source", "Entity"}
     if not entity_rows or not prompt_rows:
-        raise RuntimeError("RAVEL train entity/prompt parquet is empty")
+        raise RuntimeError("RAVEL normalized train entity/prompt records are empty")
     missing_entity = required_entity - set(entity_rows[0])
     missing_prompt = required_prompt - set(prompt_rows[0])
     if missing_entity or missing_prompt:
@@ -1039,29 +1247,54 @@ def probe_ravel(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict
     prompts_by_attribute: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for row in usable_prompts:
         prompts_by_attribute[str(row["Attribute"])].append(row)
-    attributes = [
+    attributes = sorted(
         attribute for attribute, rows in prompts_by_attribute.items()
-        if rows and any(str(entity.get(attribute, "")) for entity in entity_rows)
-    ]
+        if rows and len({
+            str(entity.get(attribute)) for entity in entity_rows
+            if entity.get(attribute) not in (None, "")
+        }) >= 2
+    )
     if len(attributes) < 2:
         raise RuntimeError(
             f"RAVEL needs at least two joinable attributes, observed={attributes}")
 
-    def different_entity(base: Mapping[str, Any], attribute: str) -> Dict[str, Any]:
-        return next(
+    def different_entity(
+        base: Mapping[str, Any], attribute: str,
+        required_attributes: Sequence[str] = (),
+    ) -> Dict[str, Any]:
+        match = next((
             entity for entity in entity_rows
             if str(entity.get("ID")) != str(base.get("ID"))
-            and str(entity.get(attribute, ""))
-            and str(entity.get(attribute)) != str(base.get(attribute)))
+            and entity.get(attribute) not in (None, "")
+            and str(entity.get(attribute)) != str(base.get(attribute))
+            and all(entity.get(value) not in (None, "")
+                    for value in required_attributes)
+        ), None)
+        if match is None:
+            raise RuntimeError(
+                f"RAVEL lacks a same-domain negative for {attribute}")
+        return match
 
     def condition(entity: Mapping[str, Any], prompt: Mapping[str, Any]) -> Tuple[str, str]:
         template = str(prompt["Template"])
         return template % str(entity["City"]), str(entity[str(prompt["Attribute"])])
 
-    e1 = entity_rows[0]
-    attr1, attr2 = attributes[0], attributes[1]
-    e2 = different_entity(e1, attr1)
-    e3 = different_entity(e1, attr2)
+    attr1 = next((
+        attribute for attribute in attributes
+        if len(prompts_by_attribute[attribute]) >= 2
+    ), None)
+    if attr1 is None:
+        raise RuntimeError("RAVEL needs an attribute with at least two train prompts")
+    attr2 = next(attribute for attribute in attributes if attribute != attr1)
+    e1 = next((
+        entity for entity in entity_rows
+        if entity.get(attr1) not in (None, "")
+        and entity.get(attr2) not in (None, "")
+    ), None)
+    if e1 is None:
+        raise RuntimeError(f"RAVEL has no entity with both {attr1} and {attr2}")
+    e2 = different_entity(e1, attr1, (attr2,))
+    e3 = different_entity(e1, attr2, (attr1,))
     p1 = prompts_by_attribute[attr1][0]
     p1_alt = prompts_by_attribute[attr1][1]
     p2 = prompts_by_attribute[attr2][0]
@@ -1102,6 +1335,7 @@ def probe_ravel(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict
             },
         ))
     probe["status"] = "ready_for_adapter"
+    probe["source_issues"].append(SOURCE_NORMALIZATION_DESCRIPTION)
     probe["source_issues"].append(
         "RAVEL is normalized: city_entity supplies City and attribute values; city_prompt supplies Attribute and one-%s Template. Adapter must join them, not expect input/label columns.")
     probe["proposed_pair_types"] = [
@@ -1141,86 +1375,93 @@ def _choose_blimp_paths(paths: Sequence[str], count: int = 3) -> List[str]:
 
 
 def probe_blimp(args, tokenizer, cache: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    probe = base_probe("blimp", {"hf_tree": BLIMP_HF_TREE})
-    paths = hf_parquet_tree(BLIMP_HF_TREE, dataset_id="blimp")
+    source = {
+        "contract": BLIMP_SOURCE_CONTRACT,
+        "canonical_url": BLIMP_ZIP_URL,
+        "normalization": SOURCE_NORMALIZATION_DESCRIPTION,
+    }
+    probe = base_probe("blimp", source)
+    archive_path = cache / "blimp" / "official" / "blimp-master.zip"
+    probe["downloaded_files"].append(download(
+        BLIMP_ZIP_URL, archive_path, reuse=args.reuse_downloads,
+        dataset_id="blimp", source_type=BLIMP_SOURCE_CONTRACT))
+    paths, row_counts, archive_schemas = blimp_archive_inventory(archive_path)
     selected = _choose_blimp_paths(paths)
     observed = []
     raw_samples = []
     prepared = []
-    schemas = []
-    for rel in selected:
-        local = cache / "blimp" / "hf" / rel
-        file_row = download_hf_dataset_file(
-            BLIMP_HF_REPO_ID, rel, local, reuse=args.reuse_downloads,
-            dataset_id="blimp")
-        probe["downloaded_files"].append(file_row)
-        info = inspect_parquet(local, args.sample_rows)
-        info["source_path"] = rel
-        phenomenon = rel.split("/", 1)[0]
-        info["phenomenon"] = phenomenon
-        observed.append(info)
-        schemas.append(info["schema"])
-        good_col = _find_col(info["columns"], ("sentence_good", "good_sentence", "good"))
-        bad_col = _find_col(info["columns"], ("sentence_bad", "bad_sentence", "bad"))
-        if not good_col or not bad_col:
-            probe["source_issues"].append(f"{rel}: good/bad sentence columns not found")
-            continue
-        for row_index, row in enumerate(info["samples"]):
-            raw = {"source_path": rel, "phenomenon": phenomenon, **row}
-            raw_samples.append(raw)
-            good = str(row[good_col])
-            bad = str(row[bad_col])
-            good_ids = encode(tokenizer, good)
-            bad_ids = encode(tokenizer, bad)
-            trace_position, trace_meta = trace_for_pair(good_ids, bad_ids)
-            raw["tokenizer_probe"] = {
-                "good_token_ids": good_ids,
-                "bad_token_ids": bad_ids,
-                **trace_meta,
-                "trace_position": trace_position,
-                "trace_token": (
-                    tokenizer.convert_ids_to_tokens(good_ids[trace_position])
-                    if good_ids else None),
+    with zipfile.ZipFile(archive_path) as archive:
+        for rel in selected:
+            rows = read_blimp_jsonl_rows(archive, rel)
+            phenomenon = PurePosixPath(rel).stem
+            samples = rows[: args.sample_rows]
+            info = {
+                "source_path": rel,
+                "phenomenon": phenomenon,
+                "row_count": len(rows),
+                "columns": sorted(rows[0]) if rows else [],
+                "schema": archive_schemas[rel],
+                "samples": samples,
             }
-            if len(prepared) < args.sample_rows:
-                uid = row.get("UID") or row.get("uid") or f"{phenomenon}-{row_index}"
-                prepared.append(prepared_row(
-                    tokenizer, example_id=f"blimp-{uid}", pair_id=f"blimp-{uid}",
-                    dataset="blimp", split="train", phenomenon=phenomenon,
-                    relation="grammatical_minimal_pair", group_id=phenomenon,
-                    source_id=str(uid), score_mode="paired_sequence_logprob",
-                    trace_semantics="pre_divergence_prediction_state",
-                    text_a=good, text_b=bad, row_index=len(prepared),
-                    max_seq_len=args.max_seq_len,
-                    max_candidate_tokens=args.max_candidate_tokens,
-                    extension={key: value for key, value in row.items()
-                               if key not in (good_col, bad_col)},
-                ))
+            observed.append(info)
+            for row_index, row in enumerate(samples):
+                raw = {"source_path": rel, "phenomenon": phenomenon, **row}
+                raw_samples.append(raw)
+                good = str(row["sentence_good"])
+                bad = str(row["sentence_bad"])
+                good_ids = encode(tokenizer, good)
+                bad_ids = encode(tokenizer, bad)
+                trace_position, trace_meta = trace_for_pair(good_ids, bad_ids)
+                raw["tokenizer_probe"] = {
+                    "good_token_ids": good_ids,
+                    "bad_token_ids": bad_ids,
+                    **trace_meta,
+                    "trace_position": trace_position,
+                    "trace_token": (
+                        tokenizer.convert_ids_to_tokens(good_ids[trace_position])
+                        if good_ids else None),
+                }
+                if len(prepared) < args.sample_rows:
+                    uid = row.get("UID") or f"{phenomenon}-{row_index}"
+                    pair_index = row.get("pair_id", row_index)
+                    prepared.append(prepared_row(
+                        tokenizer,
+                        example_id=f"blimp-{phenomenon}-{pair_index}",
+                        pair_id=f"blimp-{phenomenon}-{pair_index}",
+                        dataset="blimp", split="train", phenomenon=phenomenon,
+                        relation="grammatical_minimal_pair", group_id=phenomenon,
+                        source_id=f"{uid}:{pair_index}",
+                        score_mode="paired_sequence_logprob",
+                        trace_semantics="pre_divergence_prediction_state",
+                        text_a=good, text_b=bad, row_index=len(prepared),
+                        max_seq_len=args.max_seq_len,
+                        max_candidate_tokens=args.max_candidate_tokens,
+                        extension={key: value for key, value in row.items()
+                                   if key not in ("sentence_good", "sentence_bad")},
+                    ))
     probe["observed_files"] = paths
     probe["observed_splits"] = ["train"]
-    probe["observed_schema"] = {
-        row["source_path"]: row["schema"] for row in observed
-    }
-    probe["observed_columns"] = sorted(set(
-        column for row in observed for column in row["columns"]))
-    probe["row_count"] = {row["source_path"]: row["row_count"] for row in observed}
+    probe["observed_schema"] = archive_schemas
+    probe["observed_columns"] = sorted({
+        column for schema in archive_schemas.values() for column in schema
+    })
+    probe["row_count"] = row_counts
     # Preserve samples from every inspected phenomenon rather than allowing
-    # the first parquet to hide cross-file schema or tokenization differences.
+    # the first JSONL file to hide cross-file schema or tokenization differences.
     probe["raw_samples"] = raw_samples
     probe["nested_key_paths"] = sorted(set(
         path for row in probe["raw_samples"] for path in nested_key_paths(row)))
     probe["tokenization_samples"] = [row["tokenizer_probe"] for row in raw_samples]
-    probe["status"] = (
-        "ready_for_adapter" if prepared and all(schema == schemas[0] for schema in schemas)
-        else "schema_inconsistent")
+    probe["status"] = "ready_for_adapter" if prepared else "empty"
+    probe["source_issues"].append(SOURCE_NORMALIZATION_DESCRIPTION)
     probe["proposed_pair_types"] = ["good_bad_minimal_pair"]
     probe["proposed_score_mode"] = "paired_sequence_logprob"
     probe["proposed_trace_semantics"] = "pre_divergence_prediction_state"
     probe["recommended_mapping"] = {
         "context_ids_a": "sentence_good",
         "context_ids_b": "sentence_bad",
-        "phenomenon/group_id": "parquet parent directory",
-        "source_id": "UID when present; otherwise phenomenon + row index",
+        "phenomenon/group_id": "official data/*.jsonl file stem",
+        "source_id": "UID + normalized pair_id",
         "trace_position_a/b": "longest common prefix length - 1",
         "candidate_arrays": "unused (length 0)",
     }
