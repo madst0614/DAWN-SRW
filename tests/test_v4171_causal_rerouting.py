@@ -7,9 +7,11 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import Mesh
 
 from analysis.dawn_v4171_transition import (
+    ADAPTIVE_CAPTURE_TIERS,
     TRACE_POOLS,
     _adaptive_rerouting_capture,
     _canonical_causal_trace_forward,
@@ -95,6 +97,141 @@ def _tiny_context():
         sharded_fns=sharded_fns,
         args=args,
     ), input_ids
+
+
+def _fake_sparse_route(weights, captured_mass, execution_mass=1.0):
+    values = np.asarray(weights, dtype=np.float64)
+    if values.ndim == 1:
+        values = values[None, :]
+    layers, topk = values.shape
+    captured = np.broadcast_to(
+        np.asarray(captured_mass, dtype=np.float64), (layers,))
+    mass = np.broadcast_to(
+        np.asarray(execution_mass, dtype=np.float64), (layers,))
+    ids = np.broadcast_to(
+        np.arange(topk, dtype=np.int32), (layers, topk))
+    expanded_values = values[:, None, :]
+    return {
+        "top_operator_ids": ids[:, None, :],
+        "top_execution_weights": expanded_values,
+        "top_local_contributions": np.zeros_like(expanded_values),
+        "top_admission_weights": np.zeros_like(expanded_values),
+        "captured_mass": captured[:, None],
+        "execution_mass": mass[:, None],
+    }
+
+
+def _fake_adaptive_capture_case(
+        retry_weights, *, retry_mass=1.0, adaptive=True):
+    initial_topk = (2, 2, 2)
+    retry_topk = (max(ADAPTIVE_CAPTURE_TIERS["qk"]), 2, 2)
+    retry_values = np.asarray(retry_weights, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        retry_captured_mass = (
+            retry_values.sum()
+            / np.maximum(np.asarray(retry_mass, dtype=np.float64), 1.0e-8))
+    initial = {
+        "q": _fake_sparse_route([0.45, 0.45001], 0.90001),
+        "k": _fake_sparse_route([0.45, 0.45001], 0.90001),
+        "v": _fake_sparse_route([1.0, 0.0], 1.0),
+        "rst": _fake_sparse_route([1.0, 0.0], 1.0),
+    }
+    retry = {
+        "q": _fake_sparse_route(
+            retry_weights, retry_captured_mass, execution_mass=retry_mass),
+        "k": _fake_sparse_route(
+            retry_weights, retry_captured_mass, execution_mass=retry_mass),
+        "v": initial["v"],
+        "rst": initial["rst"],
+    }
+    capture_fns = {
+        initial_topk: lambda _params, _trace: initial,
+        retry_topk: lambda _params, _trace: retry,
+    }
+    ctx = SimpleNamespace(
+        params=None,
+        args=SimpleNamespace(
+            transition_topk_qk=2,
+            transition_topk_v=2,
+            transition_topk_rst=2,
+            transition_capture_threshold=0.95,
+            transition_adaptive_capture=adaptive,
+            transition_adaptive_final_topk_v=2,
+            transition_adaptive_final_topk_rst=2,
+        ),
+    )
+    return ctx, capture_fns
+
+
+def test_adaptive_capture_uses_retry_prefix_for_monotonicity() -> None:
+    ctx, capture_fns = _fake_adaptive_capture_case(
+        [0.45, 0.44999, 0.07001])
+    captured = _adaptive_rerouting_capture(ctx, {}, 0, capture_fns)
+
+    for route in ("q", "k"):
+        metadata = captured["capture"][route]
+        np.testing.assert_allclose(metadata["initial_before_raw"], [0.90001])
+        np.testing.assert_allclose(
+            metadata["retry_reference_before"], [0.89999])
+        np.testing.assert_allclose(metadata["before"], [0.89999])
+        np.testing.assert_allclose(metadata["after"], [0.97000])
+        np.testing.assert_allclose(
+            metadata["cross_executable_drift"], [-0.00002])
+        assert metadata["cross_executable_drift_max_abs"] == pytest.approx(
+            0.00002)
+        assert metadata["cross_executable_drift_max_layer"] == 0
+        assert metadata["before_source"] == "retry_executable_prefix"
+        assert metadata["after_source"] == "retry_executable_full_topk"
+        assert metadata["retry_count"] == 1
+        assert np.all(metadata["before"] <= metadata["after"] + 1.0e-12)
+
+
+@pytest.mark.parametrize(
+    ("retry_weights", "retry_mass", "expected_reason"),
+    (
+        ([0.45, -1.0e-4, 0.52], 1.0,
+         "execution weight below negative tolerance"),
+        ([0.45, np.nan, 0.52], 1.0,
+         "nonfinite top execution weights"),
+        ([0.45, 0.44999, 0.07001], np.nan,
+         "nonfinite execution mass"),
+    ),
+)
+def test_adaptive_capture_rejects_invalid_retry_weights(
+        retry_weights, retry_mass, expected_reason) -> None:
+    ctx, capture_fns = _fake_adaptive_capture_case(
+        retry_weights, retry_mass=retry_mass)
+    with pytest.raises(RuntimeError) as exc_info:
+        _adaptive_rerouting_capture(ctx, {}, 0, capture_fns)
+
+    message = str(exc_info.value)
+    assert expected_reason in message
+    for field in (
+            "family: qk", "route: q", "layer: 0",
+            "initial top-k: 2", "retry top-k: 3",
+            "initial raw captured mass:",
+            "retry prefix captured mass:",
+            "retry full captured mass:",
+            "max negative execution weight:"):
+        assert field in message
+
+
+def test_adaptive_capture_without_retry_preserves_initial_provenance() -> None:
+    ctx, capture_fns = _fake_adaptive_capture_case(
+        [0.45, 0.44999, 0.07001], adaptive=False)
+    captured = _adaptive_rerouting_capture(ctx, {}, 0, capture_fns)
+
+    for route in TRACE_POOLS:
+        metadata = captured["capture"][route]
+        np.testing.assert_array_equal(
+            metadata["before"], metadata["initial_before_raw"])
+        np.testing.assert_array_equal(
+            metadata["after"], metadata["initial_before_raw"])
+        assert metadata["retry_reference_before"] is None
+        assert metadata["cross_executable_drift"] is None
+        assert metadata["before_source"] == "initial_executable"
+        assert metadata["after_source"] == "initial_executable"
+        assert metadata["retry_count"] == 0
 
 
 def test_inactive_is_exact_and_active_changes_target_only_rerouting() -> None:

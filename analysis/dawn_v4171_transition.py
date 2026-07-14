@@ -84,6 +84,8 @@ ITEM_DEPENDENCIES = {
 }
 SingleEffectKey = Tuple[str, str, int, int]
 PAIR_CAPTURE_THRESHOLD = 0.95
+ADAPTIVE_CAPTURE_NEGATIVE_WEIGHT_TOLERANCE = 1.0e-7
+ADAPTIVE_CAPTURE_MONOTONIC_TOLERANCE = 1.0e-12
 DEFAULT_RECOVERY_NEUTRAL_LOG_BAND = 0.05
 DEFAULT_GROUP_RANDOM_MATCH_DRAWS = 64
 DEFAULT_GROUP_CONTRIBUTION_MATCH_MAX_RELATIVE_ERROR = 0.25
@@ -2573,6 +2575,103 @@ def _rerouting_sparse_capture_forward(
     return capture
 
 
+def _retry_executable_capture_masses(
+        retry_route: Mapping[str, Any], *, family: str, route: str,
+        initial_topk: int, initial_before_raw: np.ndarray,
+        ) -> Tuple[np.ndarray, np.ndarray]:
+    """Recompute prefix/full coverage within one retry executable."""
+    retry_values = np.asarray(
+        retry_route["top_execution_weights"], dtype=np.float64)[:, 0, :]
+    retry_mass = np.asarray(
+        retry_route["execution_mass"], dtype=np.float64)[:, 0]
+    retry_topk = int(retry_values.shape[-1])
+    initial_before_raw = np.asarray(
+        initial_before_raw, dtype=np.float64).reshape(-1)
+
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        raw_den = np.maximum(retry_mass, 1.0e-8)
+        raw_prefix = (
+            retry_values[:, :int(initial_topk)].sum(axis=-1) / raw_den)
+        raw_full = retry_values.sum(axis=-1) / raw_den
+    most_negative = np.min(
+        np.where(
+            np.isfinite(retry_values) & (retry_values < 0.0),
+            retry_values,
+            0.0,
+        ),
+        axis=-1,
+    )
+
+    def fail(reason: str, layer: int, *,
+             prefix: np.ndarray = raw_prefix,
+             full: np.ndarray = raw_full) -> None:
+        raise RuntimeError(
+            "adaptive rerouting capture validation failed\n"
+            f"reason: {reason}\n"
+            f"family: {family}\n"
+            f"route: {route}\n"
+            f"layer: {int(layer)}\n"
+            f"initial top-k: {int(initial_topk)}\n"
+            f"retry top-k: {retry_topk}\n"
+            "initial raw captured mass: "
+            f"{float(initial_before_raw[layer])}\n"
+            "retry prefix captured mass: "
+            f"{float(prefix[layer])}\n"
+            "retry full captured mass: "
+            f"{float(full[layer])}\n"
+            "max negative execution weight: "
+            f"{float(most_negative[layer])}"
+        )
+
+    nonfinite_weights = ~np.all(np.isfinite(retry_values), axis=-1)
+    nonfinite_mass = ~np.isfinite(retry_mass)
+    meaningful_negative = np.any(
+        retry_values < -ADAPTIVE_CAPTURE_NEGATIVE_WEIGHT_TOLERANCE,
+        axis=-1,
+    )
+    invalid_input = nonfinite_weights | nonfinite_mass | meaningful_negative
+    if np.any(invalid_input):
+        layer = int(np.flatnonzero(invalid_input)[0])
+        reasons: List[str] = []
+        if bool(nonfinite_weights[layer]):
+            reasons.append("nonfinite top execution weights")
+        if bool(nonfinite_mass[layer]):
+            reasons.append("nonfinite execution mass")
+        if bool(meaningful_negative[layer]):
+            reasons.append(
+                "execution weight below negative tolerance "
+                f"{-ADAPTIVE_CAPTURE_NEGATIVE_WEIGHT_TOLERANCE}")
+        fail(", ".join(reasons), layer)
+
+    # Clamp only the host-side diagnostic copy.  The captured execution
+    # weights returned to callers remain untouched.
+    retry_values = np.maximum(retry_values, 0.0)
+    den = np.maximum(retry_mass, 1.0e-8)
+    retry_reference_before = (
+        retry_values[:, :int(initial_topk)].sum(axis=-1) / den)
+    retry_after = retry_values.sum(axis=-1) / den
+    nonfinite_capture = ~(
+        np.isfinite(retry_reference_before) & np.isfinite(retry_after))
+    if np.any(nonfinite_capture):
+        fail(
+            "nonfinite host-recomputed retry captured mass",
+            int(np.flatnonzero(nonfinite_capture)[0]),
+            prefix=retry_reference_before,
+            full=retry_after,
+        )
+    decreased = (
+        retry_after + ADAPTIVE_CAPTURE_MONOTONIC_TOLERANCE
+        < retry_reference_before)
+    if np.any(decreased):
+        fail(
+            "retry executable prefix/full monotonicity violation",
+            int(np.flatnonzero(decreased)[0]),
+            prefix=retry_reference_before,
+            full=retry_after,
+        )
+    return retry_reference_before, retry_after
+
+
 def _adaptive_rerouting_capture(
         ctx: AnalysisContext, causal_trace: Mapping[str, Any],
         target_layer: int, capture_fns: Dict[Tuple[int, int, int], Any], *,
@@ -2609,7 +2708,14 @@ def _adaptive_rerouting_capture(
         before = np.asarray(
             capture[route]["captured_mass"], dtype=np.float64)[:, 0]
         metadata[route] = {
+            "initial_before_raw": before.copy(),
+            "retry_reference_before": None,
             "before": before.copy(), "after": before.copy(),
+            "cross_executable_drift": None,
+            "cross_executable_drift_max_abs": None,
+            "cross_executable_drift_max_layer": None,
+            "before_source": "initial_executable",
+            "after_source": "initial_executable",
             "topk": int(np.asarray(
                 capture[route]["top_operator_ids"]).shape[-1]),
             "retry_count": 0,
@@ -2626,14 +2732,33 @@ def _adaptive_rerouting_capture(
             current_tops[index] = int(final_topk[family])
             retry = run(tuple(current_tops))
             for route in routes:
-                old = np.asarray(metadata[route]["after"], dtype=np.float64)
-                new = np.asarray(
-                    retry[route]["captured_mass"], dtype=np.float64)[:, 0]
-                if np.any(new + 1.0e-7 < old):
-                    raise RuntimeError(
-                        "adaptive rerouting capture decreased captured mass")
+                old_k = int(metadata[route]["topk"])
+                initial_before_raw = np.asarray(
+                    metadata[route]["initial_before_raw"], dtype=np.float64)
+                retry_reference_before, retry_after = (
+                    _retry_executable_capture_masses(
+                        retry[route],
+                        family=family,
+                        route=route,
+                        initial_topk=old_k,
+                        initial_before_raw=initial_before_raw,
+                    ))
+                cross_executable_drift = (
+                    retry_reference_before - initial_before_raw)
+                drift_abs = np.abs(cross_executable_drift)
                 capture[route] = retry[route]
-                metadata[route]["after"] = new
+                metadata[route].update({
+                    "retry_reference_before": retry_reference_before,
+                    "before": retry_reference_before,
+                    "after": retry_after,
+                    "cross_executable_drift": cross_executable_drift,
+                    "cross_executable_drift_max_abs": float(
+                        np.max(drift_abs)),
+                    "cross_executable_drift_max_layer": int(
+                        np.argmax(drift_abs)),
+                    "before_source": "retry_executable_prefix",
+                    "after_source": "retry_executable_full_topk",
+                })
                 metadata[route]["topk"] = int(np.asarray(
                     retry[route]["top_operator_ids"]).shape[-1])
                 metadata[route]["retry_count"] += 1
