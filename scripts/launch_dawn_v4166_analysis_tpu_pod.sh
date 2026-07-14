@@ -144,7 +144,7 @@ apply_preset() {
                 MODE="train_analysis"
             fi
             if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
-                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_emb_tau/run_vspatial-r1-v4.1.7.1_20260712_172338_3201/checkpoints/000000016000"
+                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_emb_tau/run_vspatial-r1-v4.1.7.1_20260712_172338_3201/checkpoints"
             fi
             if [[ "$ANALYSIS_PRESET_EXPLICIT" == "0" ]]; then
                 TRAIN_ANALYSIS_PRESET="v4171_self_organization"
