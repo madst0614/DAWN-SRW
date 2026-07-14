@@ -23,9 +23,9 @@ model:
   d_route: 256
   admission_den_power: 1.0
   srw_composition_mode: linear_angular
-  n_qk: 3988
-  n_v: 12414
-  n_rst: 31998
+  n_qk: 3798
+  n_v: 11824
+  n_rst: 30474
 
   tau_init_mode: quantile_frac
   tau_init_min: -0.95
@@ -62,4 +62,4 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_gbilinear
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64
