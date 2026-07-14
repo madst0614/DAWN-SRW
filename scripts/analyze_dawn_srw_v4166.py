@@ -33,7 +33,7 @@ from analysis import ANALYSIS_VERSION
 from analysis.dawn_analysis_common import (
     AnalysisContext,
     V4166_MODEL_VERSION,
-    V4171_MODEL_VERSION,
+    V417X_MODEL_VERSIONS,
     config_from_checkpoint_or_file,
     count_params,
     create_active_analysis_step,
@@ -1280,7 +1280,7 @@ def _run_active_dynamics(
     if (
         include_composition
         and ctx.config.get("model", {}).get("model_version")
-        == V4171_MODEL_VERSION
+        in V417X_MODEL_VERSIONS
     ):
         composition_step_fn = create_composition_analysis_step(
             ctx.model, ctx.sharded_fns, cfg=ctx.config)
@@ -2242,17 +2242,17 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
         "causal_baseline": (
             (v4171_transition_analysis.get("causal_intervention") or {}).get(
                 "causal_baseline", "canonical_suppression_disabled")
-            if model_version == "spatial-r1-v4.1.7.1" else None),
+            if model_version in V417X_MODEL_VERSIONS else None),
         "effect_reference": (
             (v4171_transition_analysis.get("causal_intervention") or {}).get(
                 "effect_reference", "canonical_suppression_disabled")
-            if model_version == "spatial-r1-v4.1.7.1" else None),
+            if model_version in V417X_MODEL_VERSIONS else None),
         "canonical_parity_machine_exact": (
             (v4171_transition_analysis.get("causal_intervention") or {}).get(
                 "canonical_parity_machine_exact")
-            if model_version == "spatial-r1-v4.1.7.1" else None),
+            if model_version in V417X_MODEL_VERSIONS else None),
         "cross_graph_audit_blocking": (
-            False if model_version == "spatial-r1-v4.1.7.1" else None),
+            False if model_version in V417X_MODEL_VERSIONS else None),
         "warnings": warnings,
     }
     scalar = _scalar_row(summary)

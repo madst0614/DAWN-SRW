@@ -1,11 +1,12 @@
 """
-DAWN-SRW v4.1.7.1 Canonical Generalized Bilinear RW-Relation SRW
+DAWN-SRW v4.1.7.x shared canonical SRW core
 
-Official v4171 model path.
+The v4171 learned-address model remains the default. The v4172 wrapper fixes
+the same core to live generalized coordinate-wise bilinear RW addresses.
 
 Implemented concepts:
 - cosine-space tau reference with bounded sigmoid min/max mapping
-- independent learned live-gradient operator-address embeddings
+- statically selected learned or generalized live-gradient operator addresses
 - direct state-to-operation queries
 - linear angular-depth gate after DirectTau
 - selectable linear-angular, quadratic, or heat-energy composition
@@ -262,7 +263,7 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 # ================================================================
 # V4.1.7.1 canonical DirectTau selection and SRW composition.
 #
-#   rho              = cosine(q, learned operator embedding)
+#   rho              = cosine(operator_query, operator_keys)
 #   raw_tau          = learned cosine-space reference
 #   tau              = -1 + 2 * sigmoid(raw_tau)
 #   margin           = rho - tau
@@ -276,7 +277,9 @@ DEFAULT_D_ROUTE = 64
 RW_FORWARD_NORM_EPS = 1e-6     # forward-only read/write direction floor
 MODEL_VERSION = "spatial-r1-v4.1.7.1"
 ANALYSIS_INTERVENTION_NAME = "production_core_execution_suppression"
-OPERATOR_KEY_MODE = "learned_operator_embedding"
+OPERATOR_KEY_MODE_LEARNED = "learned_operator_embedding"
+OPERATOR_KEY_MODE_GENERALIZED_BILINEAR = "generalized_bilinear_rw"
+OPERATOR_KEY_MODE = OPERATOR_KEY_MODE_LEARNED
 OPERATOR_QUERY_MODE = "direct_state_projection"
 DEFAULT_ADMISSION_DEN_POWER = 1.0
 DEFAULT_SRW_COMPOSITION_MODE = "linear_angular"
@@ -288,6 +291,22 @@ _V4171_SRW_COMPOSITION_MODES = frozenset((
     "quadratic",
     "heat_energy",
 ))
+_V417X_OPERATOR_KEY_MODES = frozenset((
+    OPERATOR_KEY_MODE_LEARNED,
+    OPERATOR_KEY_MODE_GENERALIZED_BILINEAR,
+))
+
+
+def _validate_operator_key_mode(value, *, context="v417x"):
+    """Validate the static Python-side operator-address selector."""
+    if isinstance(value, jax.core.Tracer):
+        raise ValueError(
+            f"{context} operator_key_mode must be a static Python string")
+    if not isinstance(value, str) or value not in _V417X_OPERATOR_KEY_MODES:
+        raise ValueError(
+            f"{context} unsupported operator_key_mode={value!r}; expected "
+            f"one of {sorted(_V417X_OPERATOR_KEY_MODES)}")
+    return value
 
 
 def _validate_v4171_srw_composition_mode(value, *, context="v4171"):
@@ -497,44 +516,233 @@ def _forward_unit_direction(x):
                 + RW_FORWARD_NORM_EPS)
 
 
-def _pool_operator_keys(pool_params):
-    required = ('attn_qk_op_key', 'attn_v_op_key', 'rst_op_key')
-    missing = tuple(key for key in required if key not in pool_params)
-    if missing:
+def _unit_direction_max_floor(x, eps=RW_FORWARD_NORM_EPS):
+    x = jnp.asarray(x, dtype=jnp.float32)
+    norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
+    return x / jnp.maximum(norm, jnp.asarray(eps, dtype=jnp.float32))
+
+
+def _generalized_bilinear_operator_key_components(
+        read_vectors, write_vectors, read_probes, write_probes,
+        eps=RW_FORWARD_NORM_EPS):
+    read_vectors = jnp.asarray(read_vectors, dtype=jnp.float32)
+    write_vectors = jnp.asarray(write_vectors, dtype=jnp.float32)
+    read_probes = jnp.asarray(read_probes, dtype=jnp.float32)
+    write_probes = jnp.asarray(write_probes, dtype=jnp.float32)
+    if (read_vectors.ndim != 2 or write_vectors.ndim != 2
+            or read_vectors.shape != write_vectors.shape):
         raise ValueError(
-            "v4171 neuron_pool is missing learned operator embeddings: "
-            + ", ".join(missing))
-    keys = {
-        'attn_qk_op_key': pool_params['attn_qk_op_key'],
-        'attn_v_op_key': pool_params['attn_v_op_key'],
-        'rst_op_key': pool_params['rst_op_key'],
+            "generalized bilinear read/write must have matching rank-2 "
+            f"[N, d_model] shapes, got read={read_vectors.shape}, "
+            f"write={write_vectors.shape}")
+    if read_probes.ndim != 2 or write_probes.ndim != 2:
+        raise ValueError(
+            "generalized bilinear probes must have rank 2 [d_model, d_route], "
+            f"got read_probes={read_probes.shape}, "
+            f"write_probes={write_probes.shape}")
+    expected_model = int(read_vectors.shape[1])
+    if (int(read_probes.shape[0]) != expected_model
+            or int(write_probes.shape[0]) != expected_model
+            or tuple(read_probes.shape) != tuple(write_probes.shape)):
+        raise ValueError(
+            "generalized bilinear probe shape mismatch: expected matching "
+            f"[{expected_model}, d_route], got read_probes={read_probes.shape}, "
+            f"write_probes={write_probes.shape}")
+    read_directions = _unit_direction_max_floor(read_vectors, eps)
+    write_directions = _unit_direction_max_floor(write_vectors, eps)
+    read_features = read_directions @ read_probes
+    write_features = write_directions @ write_probes
+    read_feature_directions = _unit_direction_max_floor(read_features, eps)
+    write_feature_directions = _unit_direction_max_floor(write_features, eps)
+    raw_operator_keys = read_feature_directions * write_feature_directions
+    operator_keys = _unit_direction_max_floor(raw_operator_keys, eps)
+    return operator_keys, read_features, write_features, raw_operator_keys
+
+
+def materialize_generalized_bilinear_operator_keys(
+        read_vectors, write_vectors, read_probes, write_probes,
+        eps=RW_FORWARD_NORM_EPS):
+    """Materialize live coordinate-wise bilinear RW addresses for one pool."""
+    operator_keys, _, _, _ = _generalized_bilinear_operator_key_components(
+        read_vectors, write_vectors, read_probes, write_probes, eps)
+    return operator_keys
+
+
+def generalized_bilinear_operator_key_diagnostics(
+        read_vectors, write_vectors, read_probes, write_probes,
+        eps=RW_FORWARD_NORM_EPS):
+    """Return lightweight generated-key diagnostics for analysis cadence."""
+    operator_keys, read_features, write_features, raw_operator_keys = (
+        _generalized_bilinear_operator_key_components(
+            read_vectors, write_vectors, read_probes, write_probes, eps))
+
+    def _norm_stats(value, prefix):
+        norms = jnp.linalg.norm(value, axis=-1)
+        return {
+            f'{prefix}_mean': norms.mean(),
+            f'{prefix}_min': norms.min(),
+            f'{prefix}_max': norms.max(),
+            f'{prefix}_std': norms.std(),
+        }
+
+    out = {}
+    out.update(_norm_stats(operator_keys, 'key_norm'))
+    out.update(_norm_stats(raw_operator_keys, 'raw_product_norm'))
+    out.update(_norm_stats(read_features, 'read_projected_norm'))
+    out.update(_norm_stats(write_features, 'write_projected_norm'))
+    return out
+
+
+def symbolic_parameter_count(model_cfg):
+    """Return the exact parameter breakdown for the shared v417x core."""
+    if (isinstance(model_cfg, dict) and 'model' in model_cfg
+            and isinstance(model_cfg['model'], dict)):
+        model_cfg = model_cfg['model']
+    if not isinstance(model_cfg, dict):
+        raise ValueError("symbolic parameter count requires a model config dict")
+
+    def _positive_int(name, fallback=None):
+        value = model_cfg.get(name, fallback)
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value <= 0):
+            raise ValueError(
+                f"model.{name} must be a positive integer, got {value!r}")
+        return int(value)
+
+    vocab_size = _positive_int(
+        'vocab_size_padded', model_cfg.get('vocab_size'))
+    max_seq_len = _positive_int('max_seq_len')
+    d_model = _positive_int('d_model')
+    d_route = _positive_int('d_route')
+    n_layers = _positive_int('n_layers')
+    n_qk = _positive_int('n_qk')
+    n_v = _positive_int('n_v')
+    n_rst = _positive_int('n_rst', model_cfg.get('n_know'))
+    operator_count = n_qk + n_v + n_rst
+    mode = _validate_operator_key_mode(
+        model_cfg.get('operator_key_mode', OPERATOR_KEY_MODE_LEARNED),
+        context="symbolic parameter count")
+    learned_keys = (
+        operator_count * d_route
+        if mode == OPERATOR_KEY_MODE_LEARNED else 0)
+    bilinear_probes = (
+        2 * d_model * d_route
+        if mode == OPERATOR_KEY_MODE_GENERALIZED_BILINEAR else 0)
+    counts = {
+        'token_embedding': vocab_size * d_model,
+        'position_embedding': max_seq_len * d_model,
+        'layer_stack': n_layers * (d_model * d_model + 4 * d_model),
+        'router': (
+            4 * d_model * d_route + 4 * d_route + 4 * d_model + 4),
+        'read_write_pools': 2 * operator_count * d_model,
+        'learned_key_tables': learned_keys,
+        'bilinear_probe_matrices': bilinear_probes,
+        'final_norm': 2 * d_model,
     }
+    counts['total'] = sum(counts.values())
+    return counts
+
+
+_LEARNED_OPERATOR_KEY_NAMES = (
+    'attn_qk_op_key', 'attn_v_op_key', 'rst_op_key')
+_BILINEAR_PROBE_NAMES = ('rw_key_read_probe', 'rw_key_write_probe')
+
+
+def _resolve_operator_key_mode(pool_params, operator_key_mode=None):
+    if operator_key_mode is not None:
+        return _validate_operator_key_mode(
+            operator_key_mode, context="v417x neuron_pool")
+    learned_present = tuple(
+        name for name in _LEARNED_OPERATOR_KEY_NAMES if name in pool_params)
+    probes_present = tuple(
+        name for name in _BILINEAR_PROBE_NAMES if name in pool_params)
+    if learned_present and probes_present:
+        raise ValueError(
+            "v417x neuron_pool mixes learned operator key tables with "
+            "generalized bilinear probes")
+    if learned_present:
+        return OPERATOR_KEY_MODE_LEARNED
+    if probes_present:
+        return OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
+    raise ValueError(
+        "v417x neuron_pool has neither learned operator key tables nor "
+        "generalized bilinear probes")
+
+
+def _pool_operator_keys(pool_params, operator_key_mode=None):
+    mode = _resolve_operator_key_mode(pool_params, operator_key_mode)
+    learned_present = tuple(
+        name for name in _LEARNED_OPERATOR_KEY_NAMES if name in pool_params)
+    probes_present = tuple(
+        name for name in _BILINEAR_PROBE_NAMES if name in pool_params)
+    if mode == OPERATOR_KEY_MODE_LEARNED:
+        if probes_present:
+            raise ValueError(
+                "learned_operator_embedding neuron_pool must not contain "
+                "generalized bilinear probes: " + ", ".join(probes_present))
+        missing = tuple(
+            key for key in _LEARNED_OPERATOR_KEY_NAMES if key not in pool_params)
+        if missing:
+            raise ValueError(
+                "v4171 neuron_pool is missing learned operator embeddings: "
+                + ", ".join(missing))
+        keys = {
+            name: pool_params[name] for name in _LEARNED_OPERATOR_KEY_NAMES
+        }
+    else:
+        if learned_present:
+            raise ValueError(
+                "generalized_bilinear_rw neuron_pool must not contain stored "
+                "operator key tables: " + ", ".join(learned_present))
+        missing = tuple(
+            key for key in _BILINEAR_PROBE_NAMES if key not in pool_params)
+        if missing:
+            raise ValueError(
+                "generalized_bilinear_rw neuron_pool is missing shared probes: "
+                + ", ".join(missing))
+        read_probe = pool_params['rw_key_read_probe']
+        write_probe = pool_params['rw_key_write_probe']
+        keys = {}
+        for prefix in ('attn_qk', 'attn_v', 'rst'):
+            read_name = f'{prefix}_read'
+            write_name = f'{prefix}_write'
+            missing_rw = tuple(
+                name for name in (read_name, write_name)
+                if name not in pool_params)
+            if missing_rw:
+                raise ValueError(
+                    "generalized_bilinear_rw neuron_pool is missing RW "
+                    "parameters: " + ", ".join(missing_rw))
+            keys[f'{prefix}_op_key'] = (
+                materialize_generalized_bilinear_operator_keys(
+                pool_params[read_name], pool_params[write_name],
+                read_probe, write_probe))
     d_route = None
     for prefix, read_key in (
             ('attn_qk', 'attn_qk_read'),
             ('attn_v', 'attn_v_read'),
             ('rst', 'rst_read')):
-        op_key = keys[f'{prefix}_op_key']
-        if op_key.ndim != 2:
+        operator_keys = keys[f'{prefix}_op_key']
+        if operator_keys.ndim != 2:
             raise ValueError(
-                f"v4171 {prefix}_op_key must have rank 2 [N, d_route], "
-                f"got {op_key.shape}")
+                f"v417x {prefix}_op_key must have rank 2 [N, d_route], "
+                f"got {operator_keys.shape}")
         if read_key in pool_params:
             expected_rows = int(pool_params[read_key].shape[0])
-            if int(op_key.shape[0]) != expected_rows:
+            if int(operator_keys.shape[0]) != expected_rows:
                 raise ValueError(
-                    f"v4171 {prefix}_op_key shape mismatch: expected "
-                    f"[{expected_rows}, d_route], got {op_key.shape}")
+                    f"v417x {prefix}_op_key shape mismatch: expected "
+                    f"[{expected_rows}, d_route], got {operator_keys.shape}")
         if d_route is None:
-            d_route = int(op_key.shape[1])
+            d_route = int(operator_keys.shape[1])
             if d_route <= 0:
                 raise ValueError(
-                    f"v4171 {prefix}_op_key must have d_route > 0, got "
-                    f"{op_key.shape}")
-        elif int(op_key.shape[1]) != d_route:
+                    f"v417x {prefix}_op_key must have d_route > 0, got "
+                    f"{operator_keys.shape}")
+        elif int(operator_keys.shape[1]) != d_route:
             raise ValueError(
-                f"v4171 {prefix}_op_key route width mismatch: expected "
-                f"d_route={d_route}, got {op_key.shape}")
+                f"v417x {prefix}_op_key route width mismatch: expected "
+                f"d_route={d_route}, got {operator_keys.shape}")
     return keys
 
 
@@ -598,13 +806,26 @@ def analysis_operator_membership(global_operator_ids, selected_operator_ids):
         f"{selected_operator_ids.shape}")
 
 
-def _pool_params_with_operator_keys(pool_params):
-    """Validate and return the pool, whose learned op keys are already stored."""
-    _pool_operator_keys(pool_params)
-    return pool_params
+def _pool_params_with_operator_keys(pool_params, operator_key_mode=None):
+    """Materialize live operator keys once before the layer scan."""
+    mode = _resolve_operator_key_mode(pool_params, operator_key_mode)
+    keys = _pool_operator_keys(pool_params, mode)
+    if mode == OPERATOR_KEY_MODE_LEARNED:
+        return pool_params
+    materialized = {
+        key: value for key, value in pool_params.items()
+        if key not in _BILINEAR_PROBE_NAMES
+    }
+    materialized.update(keys)
+    return materialized
 
 
 def _ensure_pool_operator_keys(pool_params):
+    # The top-level model forward has already validated/materialized this
+    # schema. Keep the layer scan free of repeated key-helper calls.
+    if (all(name in pool_params for name in _LEARNED_OPERATOR_KEY_NAMES)
+            and not any(name in pool_params for name in _BILINEAR_PROBE_NAMES)):
+        return pool_params
     return _pool_params_with_operator_keys(pool_params)
 
 
@@ -884,7 +1105,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     Analysis path may compute rho distribution moments for diagnostics.
 
     v4171 canonical DirectTau execution:
-        rho               = cosine(q, learned operator embedding)
+        rho               = cosine(operator_query, operator_keys)
         margin            = rho - tau
         angular_amplitude = clip(margin / max(1 - tau, 1e-4), 0, 1)
         admission_weight  = mode-specific unpruned composition weight
@@ -980,8 +1201,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _out_specs = _out_specs + _sparsity_diag_specs
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),    # x [B,S,D]
-                       P('data', None, None),    # h [B,S,d_route]
-                       P('model', None),          # op key [N_local,d_route]
+                       P('data', None, None),    # operator_query [B,S,d_route]
+                       P('model', None),          # operator keys [N_local,d_route]
                        P('data', None, None),    # raw_tau [B,S,1]
                        P('model', None),          # read [N_local, D]
                        P('model', None),          # write [N_local, D]
@@ -992,13 +1213,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                        P()),                      # execution_prune_eps scalar
              out_specs=_out_specs,
              check_rep=False)
-    def fused_gate_srw(x, h, op_key_local, raw_tau,
-                       read_local, write_local,
+    def fused_gate_srw(x, operator_query, operator_keys_local, raw_tau,
+                       read_vectors_local, write_vectors_local,
                        soft_gate_temperature, soft_gate_t_final,
                        soft_gate_boundary_power,
                        soft_gate_boundary_power_final,
                        execution_prune_eps):
-        N_local = op_key_local.shape[0]
+        N_local = operator_keys_local.shape[0]
         cs = min(int(max_chunk_size), int(N_local))
         nc = (int(N_local) + cs - 1) // cs
         N_pad = nc * cs
@@ -1006,15 +1227,15 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
 
         B, S, D = x.shape
         x_bf = x.astype(jnp.bfloat16)
-        op_key_padded = jnp.pad(op_key_local, ((0, pad_n), (0, 0)))
-        read_padded = jnp.pad(read_local, ((0, pad_n), (0, 0)))
-        write_padded = jnp.pad(write_local, ((0, pad_n), (0, 0)))
+        operator_keys_padded = jnp.pad(operator_keys_local, ((0, pad_n), (0, 0)))
+        read_padded = jnp.pad(read_vectors_local, ((0, pad_n), (0, 0)))
+        write_padded = jnp.pad(write_vectors_local, ((0, pad_n), (0, 0)))
         valid_padded = jnp.arange(N_pad) < N_local
-        h_unit_bf = _forward_unit_direction(
-            h.astype(jnp.bfloat16).astype(jnp.float32)
+        operator_query_unit_bf = _forward_unit_direction(
+            operator_query.astype(jnp.bfloat16).astype(jnp.float32)
         ).astype(jnp.bfloat16)
-        op_key_dir_bf = _forward_unit_direction(
-            op_key_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        operator_key_directions_bf = _forward_unit_direction(
+            operator_keys_padded.astype(jnp.bfloat16).astype(jnp.float32)
         ).astype(jnp.bfloat16)
         read_dir_bf = _forward_unit_direction(
             read_padded.astype(jnp.bfloat16).astype(jnp.float32)
@@ -1026,20 +1247,20 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         diag_neg_inf = jnp.float32(-1.0e30)
         diag_pos_inf = jnp.float32(1.0e30)
 
-        def op_key_chunk(start):
+        def operator_keys_chunk(start):
             return jax.lax.dynamic_slice_in_dim(
-                op_key_dir_bf, start, cs, axis=0)
+                operator_key_directions_bf, start, cs, axis=0)
 
-        def operator_relation(op_key):
-            # Cosine between operator query and learned operator embedding.
-            rho = (h_unit_bf @ op_key.T).astype(jnp.float32)
+        def operator_scores_from_keys(operator_keys):
+            # Cosine between the d_route operator query and operator keys.
+            rho = (operator_query_unit_bf @ operator_keys.T).astype(jnp.float32)
             rho_exposure = (
-                jax.lax.stop_gradient(h_unit_bf) @ op_key.T
+                jax.lax.stop_gradient(operator_query_unit_bf) @ operator_keys.T
             ).astype(jnp.float32)
             return rho, rho_exposure
 
-        def op_key_rw_chunk(start):
-            ec = op_key_chunk(start)
+        def operator_keys_rw_chunk(start):
+            ec = operator_keys_chunk(start)
             rc = jax.lax.dynamic_slice_in_dim(read_dir_bf, start, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_dir_bf, start, cs, axis=0)
             vc = jax.lax.dynamic_slice_in_dim(valid_padded, start, cs, axis=0)
@@ -1055,9 +1276,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             def stats_step(carry, i):
                 s_sum, sq_sum, cube_sum, quad_sum = carry
                 s = i * cs
-                op_key, _, _, valid_chunk = op_key_rw_chunk(s)
+                operator_keys, _, _, valid_chunk = operator_keys_rw_chunk(s)
                 valid_bsn = valid_chunk[None, None, :]
-                rho_raw, _ = operator_relation(op_key)
+                rho_raw, _ = operator_scores_from_keys(operator_keys)
                 rho = jnp.where(valid_bsn, rho_raw, 0.0)
                 s_sum = s_sum + rho.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (rho ** 2).sum(axis=-1, keepdims=True)
@@ -1394,10 +1615,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  total_edge_margin_stat,
                  sparsity_carry, select_diag_carry) = carry
                 s = i * cs
-                op_key, rc, wc, valid_chunk = op_key_rw_chunk(s)
+                operator_keys, rc, wc, valid_chunk = operator_keys_rw_chunk(s)
                 valid_bsn = valid_chunk[None, None, :]
                 valid_count = valid_chunk.astype(jnp.float32).sum()
-                rho_raw, rho_exposure = operator_relation(op_key)
+                rho_raw, rho_exposure = operator_scores_from_keys(operator_keys)
                 rho = jnp.where(valid_bsn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsn, rho_raw, tau)
                 (selection_margin, admission_weight, angular_amplitude,
@@ -1509,10 +1730,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  total_edge_margin_stat,
                  sparsity_carry, select_diag_carry) = carry
                 s = i * cs
-                op_key, rc, wc, valid_chunk = op_key_rw_chunk(s)
+                operator_keys, rc, wc, valid_chunk = operator_keys_rw_chunk(s)
                 valid_bsn = valid_chunk[None, None, :]
                 valid_count = valid_chunk.astype(jnp.float32).sum()
-                rho_raw, rho_exposure = operator_relation(op_key)
+                rho_raw, rho_exposure = operator_scores_from_keys(operator_keys)
                 rho = jnp.where(valid_bsn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsn, rho_raw, tau)
                 (selection_margin, admission_weight, angular_amplitude,
@@ -1779,16 +2000,16 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             admission_den_grad_scale=1.0,
                             srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
                             heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
+    """Fused attention_q+attention_k shard_map: two routes sharing same pool in one shard_map call.
 
-    h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
+    operator_query is [B,S,2,d_route] (q_operator_query, k_operator_query stacked on axis=2).
     raw_tau is [B,S,2,1].
     x @ read.T computed once (shared by both routes).
     Scores stats computed independently per route.
     Returns out [B,S,2,D], active [B,S,1], gate_max [B,S,1].
 
     v4171 canonical execution uses the same statically selected composition
-    kernel and unpruned-mass denominator as the single-route factory. Q and K
+    kernel and unpruned-mass denominator as the single-route factory. attention_q and attention_k
     accumulate and normalize their kernel masses independently.
     analysis: see make_sharded_srw docstring.
     """
@@ -1879,8 +2100,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _out_specs = _out_specs + _sparsity_diag_specs
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),        # x [B,S,D]
-                       P('data', None, None, None),  # h [B,S,2,d_route]
-                       P('model', None),              # op key [N_local,d_route]
+                       P('data', None, None, None),  # operator_query [B,S,2,d_route]
+                       P('model', None),              # operator keys [N_local,d_route]
                        P('data', None, None, None),  # raw_tau [B,S,2,1]
                        P('model', None),              # read [N_local, D]
                        P('model', None),              # write [N_local, D]
@@ -1891,30 +2112,30 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                        P()),                          # execution_prune_eps scalar
              out_specs=_out_specs,
              check_rep=False)
-    def fused_gate_srw_paired(x, h, op_key_local, raw_tau,
-                              read_local, write_local,
+    def fused_gate_srw_paired(x, operator_query, operator_keys_local, raw_tau,
+                              read_vectors_local, write_vectors_local,
                               soft_gate_temperature, soft_gate_t_final,
                               soft_gate_boundary_power,
                               soft_gate_boundary_power_final,
                               execution_prune_eps):
-        N_local = op_key_local.shape[0]
+        N_local = operator_keys_local.shape[0]
         cs = min(int(max_chunk_size), int(N_local))
         nc = (int(N_local) + cs - 1) // cs
         N_pad = nc * cs
         pad_n = N_pad - int(N_local)
 
         B, S, D = x.shape
-        # h: [B,S,2,d_route], raw_tau: [B,S,2,1]
+        # operator_query: [B,S,2,d_route], raw_tau: [B,S,2,1]
         x_bf = x.astype(jnp.bfloat16)
-        op_key_padded = jnp.pad(op_key_local, ((0, pad_n), (0, 0)))
-        read_padded = jnp.pad(read_local, ((0, pad_n), (0, 0)))
-        write_padded = jnp.pad(write_local, ((0, pad_n), (0, 0)))
+        operator_keys_padded = jnp.pad(operator_keys_local, ((0, pad_n), (0, 0)))
+        read_padded = jnp.pad(read_vectors_local, ((0, pad_n), (0, 0)))
+        write_padded = jnp.pad(write_vectors_local, ((0, pad_n), (0, 0)))
         valid_padded = jnp.arange(N_pad) < N_local
-        h_unit_bf = _forward_unit_direction(
-            h.astype(jnp.bfloat16).astype(jnp.float32)
+        operator_query_unit_bf = _forward_unit_direction(
+            operator_query.astype(jnp.bfloat16).astype(jnp.float32)
         ).astype(jnp.bfloat16)
-        op_key_dir_bf = _forward_unit_direction(
-            op_key_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        operator_key_directions_bf = _forward_unit_direction(
+            operator_keys_padded.astype(jnp.bfloat16).astype(jnp.float32)
         ).astype(jnp.bfloat16)
         read_dir_bf = _forward_unit_direction(
             read_padded.astype(jnp.bfloat16).astype(jnp.float32)
@@ -1926,22 +2147,22 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         diag_neg_inf = jnp.float32(-1.0e30)
         diag_pos_inf = jnp.float32(1.0e30)
 
-        def op_key_chunk(start):
+        def operator_keys_chunk(start):
             return jax.lax.dynamic_slice_in_dim(
-                op_key_dir_bf, start, cs, axis=0)
+                operator_key_directions_bf, start, cs, axis=0)
 
-        def operator_relation(op_key):
-            # Cosine between operator query and learned operator embedding.
+        def operator_scores_from_keys(operator_keys):
+            # Cosine between the d_route operator query and operator keys.
             rho = jnp.einsum(
-                'bsrd,nd->bsrn', h_unit_bf, op_key).astype(jnp.float32)
+                'bsrd,nd->bsrn', operator_query_unit_bf, operator_keys).astype(jnp.float32)
             rho_exposure = jnp.einsum(
                 'bsrd,nd->bsrn',
-                jax.lax.stop_gradient(h_unit_bf),
-                op_key).astype(jnp.float32)
+                jax.lax.stop_gradient(operator_query_unit_bf),
+                operator_keys).astype(jnp.float32)
             return rho, rho_exposure
 
-        def op_key_rw_chunk(start):
-            ec = op_key_chunk(start)
+        def operator_keys_rw_chunk(start):
+            ec = operator_keys_chunk(start)
             rc = jax.lax.dynamic_slice_in_dim(read_dir_bf, start, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_dir_bf, start, cs, axis=0)
             vc = jax.lax.dynamic_slice_in_dim(valid_padded, start, cs, axis=0)
@@ -1957,9 +2178,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             def stats_step(carry, i):
                 s_sum, sq_sum, cube_sum, quad_sum = carry
                 s = i * cs
-                op_key, _, _, valid_chunk = op_key_rw_chunk(s)
+                operator_keys, _, _, valid_chunk = operator_keys_rw_chunk(s)
                 valid_bsrn = valid_chunk[None, None, None, :]
-                rho_raw, _ = operator_relation(op_key)
+                rho_raw, _ = operator_scores_from_keys(operator_keys)
                 rho = jnp.where(valid_bsrn, rho_raw, 0.0)
                 s_sum = s_sum + rho.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (rho ** 2).sum(axis=-1, keepdims=True)
@@ -2298,10 +2519,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  total_edge_margin_stat,
                  sparsity_carry, select_diag_carry) = carry
                 s = i * cs
-                op_key, rc, wc, valid_chunk = op_key_rw_chunk(s)
+                operator_keys, rc, wc, valid_chunk = operator_keys_rw_chunk(s)
                 valid_bsrn = valid_chunk[None, None, None, :]
                 valid_count = valid_chunk.astype(jnp.float32).sum()
-                rho_raw, rho_exposure = operator_relation(op_key)
+                rho_raw, rho_exposure = operator_scores_from_keys(operator_keys)
                 rho = jnp.where(valid_bsrn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
                 (selection_margin, admission_weight, angular_amplitude,
@@ -2414,10 +2635,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  total_edge_margin_stat,
                  sparsity_carry, select_diag_carry) = carry
                 s = i * cs
-                op_key, rc, wc, valid_chunk = op_key_rw_chunk(s)
+                operator_keys, rc, wc, valid_chunk = operator_keys_rw_chunk(s)
                 valid_bsrn = valid_chunk[None, None, None, :]
                 valid_count = valid_chunk.astype(jnp.float32).sum()
-                rho_raw, rho_exposure = operator_relation(op_key)
+                rho_raw, rho_exposure = operator_scores_from_keys(operator_keys)
                 rho = jnp.where(valid_bsrn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
                 (selection_margin, admission_weight, angular_amplitude,
@@ -2738,13 +2959,13 @@ def _make_sharded_srw_minimal_impl(
         soft_gate_effective_active_eps)
 
     def _sharded_srw_minimal_core(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression):
         del soft_gate_t_final, soft_gate_boundary_power_final
-        N_local = op_key_local.shape[0]
+        N_local = operator_keys_local.shape[0]
         selected_global_operator_id = jnp.asarray(
             selected_global_operator_id, dtype=jnp.int32)
         if selected_global_operator_id.ndim == 0:
@@ -2764,15 +2985,15 @@ def _make_sharded_srw_minimal_impl(
 
         B, S, D = x.shape
         x_bf = x.astype(jnp.bfloat16)
-        op_key_padded = jnp.pad(op_key_local, ((0, pad_n), (0, 0)))
-        read_padded = jnp.pad(read_local, ((0, pad_n), (0, 0)))
-        write_padded = jnp.pad(write_local, ((0, pad_n), (0, 0)))
+        operator_keys_padded = jnp.pad(operator_keys_local, ((0, pad_n), (0, 0)))
+        read_padded = jnp.pad(read_vectors_local, ((0, pad_n), (0, 0)))
+        write_padded = jnp.pad(write_vectors_local, ((0, pad_n), (0, 0)))
         valid_padded = jnp.arange(N_pad) < N_local
-        h_unit_bf = _forward_unit_direction(
-            h.astype(jnp.bfloat16).astype(jnp.float32)
+        operator_query_unit_bf = _forward_unit_direction(
+            operator_query.astype(jnp.bfloat16).astype(jnp.float32)
         ).astype(jnp.bfloat16)
-        op_key_dir_bf = _forward_unit_direction(
-            op_key_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        operator_key_directions_bf = _forward_unit_direction(
+            operator_keys_padded.astype(jnp.bfloat16).astype(jnp.float32)
         ).astype(jnp.bfloat16)
         read_dir_bf = _forward_unit_direction(
             read_padded.astype(jnp.bfloat16).astype(jnp.float32)
@@ -2782,15 +3003,15 @@ def _make_sharded_srw_minimal_impl(
         ).astype(jnp.bfloat16)
         tau = _tau_from_param(raw_tau)
 
-        def op_key_chunk(start):
+        def operator_keys_chunk(start):
             return jax.lax.dynamic_slice_in_dim(
-                op_key_dir_bf, start, cs, axis=0)
+                operator_key_directions_bf, start, cs, axis=0)
 
-        def operator_relation(op_key):
-            return (h_unit_bf @ op_key.T).astype(jnp.float32)
+        def operator_scores_from_keys(operator_keys):
+            return (operator_query_unit_bf @ operator_keys.T).astype(jnp.float32)
 
-        def op_key_rw_chunk(start):
-            ec = op_key_chunk(start)
+        def operator_keys_rw_chunk(start):
+            ec = operator_keys_chunk(start)
             rc = jax.lax.dynamic_slice_in_dim(read_dir_bf, start, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_dir_bf, start, cs, axis=0)
             vc = jax.lax.dynamic_slice_in_dim(valid_padded, start, cs, axis=0)
@@ -2821,9 +3042,9 @@ def _make_sharded_srw_minimal_impl(
              total_gate_max, total_active_count,
              total_angular_amplitude) = carry
             s = i * cs
-            op_key, rc, wc, valid_chunk = op_key_rw_chunk(s)
+            operator_keys, rc, wc, valid_chunk = operator_keys_rw_chunk(s)
             valid_bsn = valid_chunk[None, None, :]
-            rho_raw = operator_relation(op_key)
+            rho_raw = operator_scores_from_keys(operator_keys)
             rho_compute = jnp.where(valid_bsn, rho_raw, tau)
             (admission, angular_amplitude, execution_weight,
              chunk_active_count) = angular_compose_parts(rho_compute, valid_bsn)
@@ -2944,26 +3165,26 @@ def _make_sharded_srw_minimal_impl(
         in_specs=common_in_specs + (P('data'), P('data'), P()),
         out_specs=out_specs, check_rep=False)
     def canonical_single_kernel(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression):
         return _sharded_srw_minimal_core(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression)
 
     def fused_gate_srw_minimal(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps):
         batch_size = x.shape[0]
         return canonical_single_kernel(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps,
@@ -2972,13 +3193,13 @@ def _make_sharded_srw_minimal_impl(
             jnp.bool_(False))
 
     def fused_gate_srw_suppression_minimal(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression):
         return canonical_single_kernel(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
@@ -3057,13 +3278,13 @@ def _make_sharded_srw_paired_minimal_impl(
         soft_gate_effective_active_eps)
 
     def _sharded_srw_paired_minimal_core(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression, route_selector):
         del soft_gate_t_final, soft_gate_boundary_power_final
-        N_local = op_key_local.shape[0]
+        N_local = operator_keys_local.shape[0]
         selected_global_operator_id = jnp.asarray(
             selected_global_operator_id, dtype=jnp.int32)
         if selected_global_operator_id.ndim == 0:
@@ -3081,18 +3302,18 @@ def _make_sharded_srw_paired_minimal_impl(
         N_pad = nc * cs
         pad_n = N_pad - int(N_local)
 
-        B, S, _, _ = h.shape
+        B, S, _, _ = operator_query.shape
         D = x.shape[-1]
         x_bf = x.astype(jnp.bfloat16)
-        op_key_padded = jnp.pad(op_key_local, ((0, pad_n), (0, 0)))
-        read_padded = jnp.pad(read_local, ((0, pad_n), (0, 0)))
-        write_padded = jnp.pad(write_local, ((0, pad_n), (0, 0)))
+        operator_keys_padded = jnp.pad(operator_keys_local, ((0, pad_n), (0, 0)))
+        read_padded = jnp.pad(read_vectors_local, ((0, pad_n), (0, 0)))
+        write_padded = jnp.pad(write_vectors_local, ((0, pad_n), (0, 0)))
         valid_padded = jnp.arange(N_pad) < N_local
-        h_unit_bf = _forward_unit_direction(
-            h.astype(jnp.bfloat16).astype(jnp.float32)
+        operator_query_unit_bf = _forward_unit_direction(
+            operator_query.astype(jnp.bfloat16).astype(jnp.float32)
         ).astype(jnp.bfloat16)
-        op_key_dir_bf = _forward_unit_direction(
-            op_key_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        operator_key_directions_bf = _forward_unit_direction(
+            operator_keys_padded.astype(jnp.bfloat16).astype(jnp.float32)
         ).astype(jnp.bfloat16)
         read_dir_bf = _forward_unit_direction(
             read_padded.astype(jnp.bfloat16).astype(jnp.float32)
@@ -3102,16 +3323,16 @@ def _make_sharded_srw_paired_minimal_impl(
         ).astype(jnp.bfloat16)
         tau = _tau_from_param(raw_tau)
 
-        def op_key_chunk(start):
+        def operator_keys_chunk(start):
             return jax.lax.dynamic_slice_in_dim(
-                op_key_dir_bf, start, cs, axis=0)
+                operator_key_directions_bf, start, cs, axis=0)
 
-        def operator_relation(op_key):
+        def operator_scores_from_keys(operator_keys):
             return jnp.einsum(
-                'bsrd,nd->bsrn', h_unit_bf, op_key).astype(jnp.float32)
+                'bsrd,nd->bsrn', operator_query_unit_bf, operator_keys).astype(jnp.float32)
 
-        def op_key_rw_chunk(start):
-            ec = op_key_chunk(start)
+        def operator_keys_rw_chunk(start):
+            ec = operator_keys_chunk(start)
             rc = jax.lax.dynamic_slice_in_dim(read_dir_bf, start, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_dir_bf, start, cs, axis=0)
             vc = jax.lax.dynamic_slice_in_dim(valid_padded, start, cs, axis=0)
@@ -3142,9 +3363,9 @@ def _make_sharded_srw_paired_minimal_impl(
              total_gate_max, total_active_count,
              total_angular_amplitude) = carry
             s = i * cs
-            op_key, rc, wc, valid_chunk = op_key_rw_chunk(s)
+            operator_keys, rc, wc, valid_chunk = operator_keys_rw_chunk(s)
             valid_bsrn = valid_chunk[None, None, None, :]
-            rho_raw = operator_relation(op_key)
+            rho_raw = operator_scores_from_keys(operator_keys)
             rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
             (admission, angular_amplitude, execution_weight,
              chunk_active_count) = angular_compose_parts(
@@ -3309,26 +3530,26 @@ def _make_sharded_srw_paired_minimal_impl(
         in_specs=common_in_specs + (P('data'), P('data'), P(), P()),
         out_specs=out_specs, check_rep=False)
     def canonical_paired_kernel(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression, route_selector):
         return _sharded_srw_paired_minimal_core(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression, route_selector)
 
     def fused_gate_srw_paired_minimal(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps):
         batch_size = x.shape[0]
         return canonical_paired_kernel(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps,
@@ -3337,13 +3558,13 @@ def _make_sharded_srw_paired_minimal_impl(
             jnp.bool_(False), jnp.int32(-1))
 
     def fused_gate_srw_paired_suppression_minimal(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression, route_selector):
         return canonical_paired_kernel(
-            x, h, op_key_local, raw_tau, read_local, write_local,
+            x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
@@ -3373,7 +3594,7 @@ def make_sharded_srw_paired_minimal(
         admission_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Create the production paired Q/K minimal SRW kernel."""
+    """Create the production paired attention_q/attention_k minimal SRW kernel."""
     return _cached_v4171_minimal_bundle(
         "paired", _make_sharded_srw_paired_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
@@ -3389,7 +3610,7 @@ def make_sharded_srw_paired_suppression_minimal(
         admission_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Create the analysis-only route-selective Q/K suppression kernel."""
+    """Create the analysis-only route-selective attention_q/attention_k suppression kernel."""
     return _cached_v4171_minimal_bundle(
         "paired", _make_sharded_srw_paired_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
@@ -3399,7 +3620,7 @@ def make_sharded_srw_paired_suppression_minimal(
 
 
 # ================================================================
-# 4. NeuronPool -- RW execution directions + learned operator embeddings
+# 4. NeuronPool -- RW execution directions + static address parameterization
 # ================================================================
 
 class NeuronPool(nn.Module):
@@ -3407,12 +3628,15 @@ class NeuronPool(nn.Module):
     n_v: int
     d_model: int
     d_route: int
+    operator_key_mode: str = OPERATOR_KEY_MODE_LEARNED
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Checkpoint/config alias for rst pool size.
 
     def setup(self):
         dm = self.d_model
         d_route = int(self.d_route)
+        operator_key_mode = _validate_operator_key_mode(
+            self.operator_key_mode, context="NeuronPool")
         if d_route <= 0:
             raise ValueError(
                 f"v4171 model.d_route must be > 0, got {d_route}")
@@ -3432,14 +3656,21 @@ class NeuronPool(nn.Module):
         self.attn_v_write = self.param('attn_v_write', unit_norm_init(), (self.n_v, dm))
         self.rst_write = self.param('rst_write', unit_norm_init(), (n_rst_eff, dm))
 
-        # Address parameters are independent from the RW execution vectors.
-        # Their raw norms remain unconstrained; selection uses unit directions.
-        self.attn_qk_op_key = self.param(
-            'attn_qk_op_key', unit_norm_init(), (self.n_qk, d_route))
-        self.attn_v_op_key = self.param(
-            'attn_v_op_key', unit_norm_init(), (self.n_v, d_route))
-        self.rst_op_key = self.param(
-            'rst_op_key', unit_norm_init(), (n_rst_eff, d_route))
+        if operator_key_mode == OPERATOR_KEY_MODE_LEARNED:
+            # Address parameters are independent from the RW execution vectors.
+            # Their raw norms remain unconstrained; selection uses directions.
+            self.attn_qk_op_key = self.param(
+                'attn_qk_op_key', unit_norm_init(), (self.n_qk, d_route))
+            self.attn_v_op_key = self.param(
+                'attn_v_op_key', unit_norm_init(), (self.n_v, d_route))
+            self.rst_operator_keys = self.param(
+                'rst_op_key', unit_norm_init(), (n_rst_eff, d_route))
+        else:
+            probe_init = nn.initializers.orthogonal(scale=1.0)
+            self.rw_key_read_probe = self.param(
+                'rw_key_read_probe', probe_init, (dm, d_route))
+            self.rw_key_write_probe = self.param(
+                'rw_key_write_probe', probe_init, (dm, d_route))
 
         # No learned pool strength params; output strength is fixed by
         # sqrt(d_model / n_layers) in the forward path.
@@ -3545,20 +3776,20 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         soft_gate_temperature if soft_gate_T_v is None else soft_gate_T_v)
     pool_params = _ensure_pool_operator_keys(pool_params)
 
-    qk_op_key = pool_params['attn_qk_op_key']
+    qk_operator_keys = pool_params['attn_qk_op_key']
     qk_read = pool_params['attn_qk_read']
     qk_write = pool_params['attn_qk_write']
-    v_op_key = pool_params['attn_v_op_key']
+    v_operator_keys = pool_params['attn_v_op_key']
     v_read = pool_params['attn_v_read']
     v_write = pool_params['attn_v_write']
 
     rng, rng_drop = jax.random.split(rng)
-    attn_h = (
+    attn_operator_queries = (
         x @ router_params['proj_attn']['kernel']
         + router_params['proj_attn']['bias'])
-    attn_h = safe_dropout(
-        attn_h, router_dropout, deterministic, rng_drop)
-    h_Q, h_K, h_V = jnp.split(attn_h, 3, axis=-1)
+    attn_operator_queries = safe_dropout(
+        attn_operator_queries, router_dropout, deterministic, rng_drop)
+    q_operator_query, k_operator_query, v_operator_query = jnp.split(attn_operator_queries, 3, axis=-1)
 
     raw_tau_all = (
         x @ router_params['raw_tau_attn']['kernel']
@@ -3583,7 +3814,7 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         raise ValueError(
             "minimal attention requires canonical v4171 shard-map kernels")
 
-    h_QK = jnp.stack([h_Q, h_K], axis=2)
+    qk_operator_queries = jnp.stack([q_operator_query, k_operator_query], axis=2)
     raw_tau_QK = jnp.stack(
         [raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
     apply_qk = (
@@ -3592,12 +3823,12 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
            == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
         & (jnp.asarray(analysis_target_route, dtype=jnp.int32) < 2))
     qk_result = canonical_paired(
-        x, h_QK, qk_op_key, raw_tau_QK, qk_read, qk_write,
+        x, qk_operator_queries, qk_operator_keys, raw_tau_QK, qk_read, qk_write,
         soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps,
         analysis_selected_operator_id, analysis_target_positions,
         apply_qk, analysis_target_route)
-    (QK_out,
+    (qk_state_transitions,
      q_active_frac, k_active_frac,
      q_active_n_mean, k_active_n_mean,
      q_gate_mass_mean, k_gate_mass_mean,
@@ -3612,48 +3843,48 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
      q_composition_den_max, k_composition_den_max,
      q_raw_srw_out_norm, k_raw_srw_out_norm,
      q_normalized_srw_out_norm, k_normalized_srw_out_norm) = qk_result
-    Q = QK_out[:, :, 0, :] * qk_scale
-    K = QK_out[:, :, 1, :] * qk_scale
+    attention_q = qk_state_transitions[:, :, 0, :] * qk_scale
+    attention_k = qk_state_transitions[:, :, 1, :] * qk_scale
     apply_v = (
         jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
         & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
            == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
         & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == 2))
     v_result = canonical_single_v(
-        x, h_V, v_op_key, raw_tau_all[:, :, 2:3], v_read, v_write,
+        x, v_operator_query, v_operator_keys, raw_tau_all[:, :, 2:3], v_read, v_write,
         soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps,
         analysis_selected_operator_id, analysis_target_positions, apply_v)
-    (V, v_active_frac, v_active_n_mean, v_gate_mass_mean, v_gate_den_mean,
+    (attention_v, v_active_frac, v_active_n_mean, v_gate_mass_mean, v_gate_den_mean,
      v_depth_active_mean, v_gate_eff_n_mean, v_top1_gate_frac_mean,
      v_den_floor_frac, v_tau_mean,
      v_admission_mass_max, v_composition_den_min,
      v_composition_den_max, v_raw_srw_out_norm,
      v_normalized_srw_out_norm) = v_result
-    V = V * v_scale
-    q_debug = Q
-    k_debug = K
-    v_debug = V
+    attention_v = attention_v * v_scale
+    q_debug = attention_q
+    k_debug = attention_k
+    v_debug = attention_v
 
     d_head = d_model // n_heads
-    Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-    K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-    V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    attention_q = attention_q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    attention_k = attention_k.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    attention_v = attention_v.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
 
     scale = jnp.sqrt(jnp.float32(d_head))
     rng, rng_attn_drop = jax.random.split(rng)
 
     @jax.checkpoint
-    def _attn_scores(Q, K, V, rng_drop):
-        attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+    def _attn_scores(attention_q, attention_k, attention_v, rng_drop):
+        attn_scores = jnp.einsum('bhsd,bhtd->bhst', attention_q, attention_k) / scale
         causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
         attn_scores = jnp.where(
             causal, attn_scores, jnp.finfo(attn_scores.dtype).min)
         attn_w = jax.nn.softmax(attn_scores, axis=-1)
         attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
-        return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+        return jnp.einsum('bhst,bhtd->bhsd', attn_w, attention_v)
 
-    out = _attn_scores(Q, K, V, rng_attn_drop)
+    out = _attn_scores(attention_q, attention_k, attention_v, rng_attn_drop)
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
     rng, rng_out = jax.random.split(rng)
@@ -3743,15 +3974,15 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
     soft_gate_T_rst = (
         soft_gate_temperature if soft_gate_T_rst is None else soft_gate_T_rst)
     pool_params = _ensure_pool_operator_keys(pool_params)
-    rst_op_key = pool_params['rst_op_key']
+    rst_operator_keys = pool_params['rst_op_key']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
 
     rng, rng_drop = jax.random.split(rng)
-    h = (
+    operator_query = (
         x @ router_params['proj_rst']['kernel']
         + router_params['proj_rst']['bias'])
-    h = safe_dropout(h, router_dropout, deterministic, rng_drop)
+    operator_query = safe_dropout(operator_query, router_dropout, deterministic, rng_drop)
     raw_tau = (
         x @ router_params['raw_tau_rst']['kernel']
         + router_params['raw_tau_rst']['bias'])
@@ -3774,7 +4005,7 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
            == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
         & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == 3))
     rst_result = canonical_single(
-        x, h, rst_op_key, raw_tau, rst_read, rst_write,
+        x, operator_query, rst_operator_keys, raw_tau, rst_read, rst_write,
         soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps,
         analysis_selected_operator_id, analysis_target_positions, apply_rst)
@@ -3837,25 +4068,25 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     soft_gate_T_v = (
         soft_gate_temperature if soft_gate_T_v is None else soft_gate_T_v)
     pool_params = _ensure_pool_operator_keys(pool_params)
-    qk_op_key = pool_params['attn_qk_op_key']
+    qk_operator_keys = pool_params['attn_qk_op_key']
     qk_read = pool_params['attn_qk_read']
     qk_write = pool_params['attn_qk_write']
-    v_op_key = pool_params['attn_v_op_key']
+    v_operator_keys = pool_params['attn_v_op_key']
     v_read = pool_params['attn_v_read']
     v_write = pool_params['attn_v_write']
 
     # Learned operator embeddings are passed into the sharded SRW closure.
     # The closure forward-normalizes them for selection stability.
-    qk_op_key_unit = qk_op_key
-    v_op_key_unit = v_op_key
+    qk_operator_keys_unit = qk_operator_keys
+    v_operator_keys_unit = v_operator_keys
 
     _qk_op_key_norms = jax.lax.stop_gradient(
-        jnp.linalg.norm(qk_op_key, axis=-1))
+        jnp.linalg.norm(qk_operator_keys, axis=-1))
     attn_qk_op_key_norm_mean = _qk_op_key_norms.mean()
     attn_qk_op_key_norm_min = _qk_op_key_norms.min()
     attn_qk_op_key_norm_std = _qk_op_key_norms.std()
     _v_op_key_norms = jax.lax.stop_gradient(
-        jnp.linalg.norm(v_op_key, axis=-1))
+        jnp.linalg.norm(v_operator_keys, axis=-1))
     attn_v_op_key_norm_mean = _v_op_key_norms.mean()
     attn_v_op_key_norm_min = _v_op_key_norms.min()
     attn_v_op_key_norm_std = _v_op_key_norms.std()
@@ -3865,12 +4096,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     rng, rng_drop = jax.random.split(rng)
     # Direct state-to-operation query projection.
-    attn_h = (
+    attn_operator_queries = (
         x @ router_params['proj_attn']['kernel']
         + router_params['proj_attn']['bias'])
-    attn_h = safe_dropout(
-        attn_h, router_dropout, deterministic, rng_drop)
-    h_Q, h_K, h_V = jnp.split(attn_h, 3, axis=-1)
+    attn_operator_queries = safe_dropout(
+        attn_operator_queries, router_dropout, deterministic, rng_drop)
+    q_operator_query, k_operator_query, v_operator_query = jnp.split(attn_operator_queries, 3, axis=-1)
 
     raw_tau_all = (
         x @ router_params['raw_tau_attn']['kernel']
@@ -3878,7 +4109,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     tau_all = _tau_from_param(raw_tau_all)
     if analysis:
         _tau_all_sg = jax.lax.stop_gradient(tau_all)
-        attn_tau_std = _tau_all_sg.std(axis=(0, 1))  # [3] Q/K/V
+        attn_tau_std = _tau_all_sg.std(axis=(0, 1))  # [3] attention_q/attention_k/attention_v
         attn_tau_kernel_norm = jnp.sqrt(
             jnp.sum(jax.lax.stop_gradient(router_params['raw_tau_attn']['kernel']) ** 2) + 1e-12)
 
@@ -3890,15 +4121,15 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         fused_single_v = sharded_fns.get('attn_v_single', sharded_fns.get('v_single', sharded_fns['single']))
     else:
         fused_single_v, fused_paired = sharded_fns
-    h_QK = jnp.stack([h_Q, h_K], axis=2)
+    qk_operator_queries = jnp.stack([q_operator_query, k_operator_query], axis=2)
     raw_tau_QK = jnp.stack([raw_tau_all[:, :, 0:1], raw_tau_all[:, :, 1:2]], axis=2)
-    qk_ret = fused_paired(x, h_QK, qk_op_key_unit, raw_tau_QK,
+    qk_ret = fused_paired(x, qk_operator_queries, qk_operator_keys_unit, raw_tau_QK,
                            qk_read, qk_write,
                            soft_gate_T_qk, soft_gate_t_final,
                            soft_gate_boundary_power,
                            soft_gate_boundary_power_final,
                            execution_prune_eps)
-    (QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
+    (qk_state_transitions, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
      qk_strong, qk_positive_margin_active, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
      qk_den_cost_mean, qk_selection_cost_mean, qk_current_cost_mean,
@@ -3914,21 +4145,21 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          qk_den_cost, qk_selection_cost, qk_current_cost,
          qk_kurt, qk_int_cap) = qk_ret[qk_offset:qk_offset + 11]
         qk_offset += 11
-        qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
+        qk_raw_norm = jnp.linalg.norm(qk_state_transitions, axis=-1).mean()
     qk_select_start = qk_offset
     qk_select_diag = qk_ret[qk_select_start:qk_select_start + SELECT_DIAG_COUNT]
     qk_exposure_start = qk_select_start + SELECT_DIAG_COUNT
     qk_exposure_diag = qk_ret[
         qk_exposure_start:qk_exposure_start + DEAD_EXPOSURE_DIAG_COUNT]
-    Q = QK_out[:, :, 0, :] * qk_scale
-    K = QK_out[:, :, 1, :] * qk_scale
-    v_ret = fused_single_v(x, h_V, v_op_key_unit, raw_tau_all[:, :, 2:3],
+    attention_q = qk_state_transitions[:, :, 0, :] * qk_scale
+    attention_k = qk_state_transitions[:, :, 1, :] * qk_scale
+    v_ret = fused_single_v(x, v_operator_query, v_operator_keys_unit, raw_tau_all[:, :, 2:3],
                            v_read, v_write,
                            soft_gate_T_v, soft_gate_t_final,
                            soft_gate_boundary_power,
                            soft_gate_boundary_power_final,
                            execution_prune_eps)
-    (V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
+    (attention_v, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
      v_strong, v_positive_margin_active, v_tau_abs,
      v_dead_pen, v_dead_cnt, v_int_max,
      v_den_cost_mean, v_selection_cost_mean, v_current_cost_mean,
@@ -3942,7 +4173,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          v_den_cost, v_selection_cost, v_current_cost,
          v_kurt, v_int_cap) = v_ret[v_offset:v_offset + 11]
         v_offset += 11
-        v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
+        v_raw_norm = jnp.linalg.norm(attention_v, axis=-1).mean()
     v_select_start = v_offset
     v_select_diag = v_ret[v_select_start:v_select_start + SELECT_DIAG_COUNT]
     v_exposure_start = v_select_start + SELECT_DIAG_COUNT
@@ -3955,18 +4186,18 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     qk_sparsity_diag = qk_route_sparsity_diag.mean(axis=0)
     v_sparsity_start = v_exposure_start + DEAD_EXPOSURE_DIAG_COUNT
     v_sparsity_diag = v_ret[v_sparsity_start]
-    V = V * v_scale
+    attention_v = attention_v * v_scale
 
     d_head = d_model // n_heads
-    Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-    K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-    V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    attention_q = attention_q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    attention_k = attention_k.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    attention_v = attention_v.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
 
     scale = jnp.sqrt(jnp.float32(d_head))
     rng, rng_attn_drop = jax.random.split(rng)
     @jax.checkpoint
-    def _attn_scores(Q, K, V, rng_drop):
-        attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+    def _attn_scores(attention_q, attention_k, attention_v, rng_drop):
+        attn_scores = jnp.einsum('bhsd,bhtd->bhst', attention_q, attention_k) / scale
         causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
         attn_scores = jnp.where(causal, attn_scores,
                                 jnp.finfo(attn_scores.dtype).min)
@@ -4015,7 +4246,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             softmax_entropy_mean = softmax_entropy.mean()
             softmax_entropy_min = softmax_entropy.min()
         attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
-        out_dbg = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+        out_dbg = jnp.einsum('bhst,bhtd->bhsd', attn_w, attention_v)
         if analysis:
             return (
                 out_dbg,
@@ -4028,9 +4259,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         return out_dbg
 
     if analysis:
-        q_norms_dbg = jnp.linalg.norm(Q, axis=-1)
-        k_norms_dbg = jnp.linalg.norm(K, axis=-1)
-        v_norms_dbg = jnp.linalg.norm(V, axis=-1)
+        q_norms_dbg = jnp.linalg.norm(attention_q, axis=-1)
+        k_norms_dbg = jnp.linalg.norm(attention_k, axis=-1)
+        v_norms_dbg = jnp.linalg.norm(attention_v, axis=-1)
     if analysis:
         q_norm = q_norms_dbg.mean()
         q_norm_std = q_norms_dbg.std()
@@ -4046,9 +4277,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          softmax_top1_mean, attn_softmax_top1_max,
          logit_gap_mean, logit_gap_max,
          softmax_entropy_mean, softmax_entropy_min) = _attn_scores(
-            Q, K, V, rng_attn_drop)
+            attention_q, attention_k, attention_v, rng_attn_drop)
     else:
-        out = _attn_scores(Q, K, V, rng_attn_drop)
+        out = _attn_scores(attention_q, attention_k, attention_v, rng_attn_drop)
     if analysis:
         o_input_norm = jnp.linalg.norm(out, axis=-1).mean()
         v_norm_max = v_norms_dbg.max()
@@ -4063,7 +4294,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     # Load-balance loss from gate distributions + tau regularization.
     tau_reg = jnp.maximum(tau_all, 0.0).mean() * 0.01
-    # Q/K share the qk pool, while V has its own pool.  Keep the historical
+    # attention_q/attention_k share the qk pool, while attention_v has its own pool.  Keep the historical
     # /3 scaling so the aux magnitude stays comparable to older runs.
     aux = (qk_lb + v_lb) / 3.0 + tau_reg
     attn_raw_gmax = jnp.maximum(qk_raw_gmax.mean(), v_raw_gmax.mean())
@@ -4245,19 +4476,19 @@ def _rst_forward(x, pool_params, router_params, rng,
         soft_gate_temperature
         if soft_gate_T_rst is None else soft_gate_T_rst)
     pool_params = _ensure_pool_operator_keys(pool_params)
-    rst_op_key = pool_params['rst_op_key']
+    rst_operator_keys = pool_params['rst_op_key']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
 
     rng, rng_drop = jax.random.split(rng)
-    h = (
+    operator_query = (
         x @ router_params['proj_rst']['kernel']
         + router_params['proj_rst']['bias'])
-    h = safe_dropout(h, router_dropout, deterministic, rng_drop)
+    operator_query = safe_dropout(operator_query, router_dropout, deterministic, rng_drop)
 
     # Learned operator embeddings are passed into the sharded SRW closure.
     # The closure forward-normalizes them for selection stability.
-    rst_op_key_unit = rst_op_key
+    rst_operator_keys_unit = rst_operator_keys
     raw_tau = (
         x @ router_params['raw_tau_rst']['kernel']
         + router_params['raw_tau_rst']['bias'])
@@ -4274,7 +4505,7 @@ def _rst_forward(x, pool_params, router_params, rng,
         fused_single = sharded_fns.get('rst_single', sharded_fns['single'])
     else:
         fused_single, _ = sharded_fns
-    rst_ret = fused_single(x, h, rst_op_key_unit, raw_tau,
+    rst_ret = fused_single(x, operator_query, rst_operator_keys_unit, raw_tau,
                             rst_read, rst_write,
                             soft_gate_T_rst, soft_gate_t_final,
                             soft_gate_boundary_power,
@@ -4312,7 +4543,7 @@ def _rst_forward(x, pool_params, router_params, rng,
     tau_reg = jnp.maximum(tau, 0.0).mean() * 0.01
     aux = lb_loss + tau_reg
     _rst_op_key_norms = jax.lax.stop_gradient(
-        jnp.linalg.norm(rst_op_key, axis=-1))
+        jnp.linalg.norm(rst_operator_keys, axis=-1))
     rst_op_key_norm = _rst_op_key_norms.mean()
     rst_op_key_norm_min = _rst_op_key_norms.min()
     rst_op_key_norm_std = _rst_op_key_norms.std()
@@ -4368,7 +4599,7 @@ class AttentionLayer(nn.Module):
     """Attention Layer container.
 
     The Attention Layer performs model decisions over the attention-qk and
-    attention-v pools to construct Q/K/V, then applies causal self-attention
+    attention-v pools to construct attention_q/attention_k/attention_v, then applies causal self-attention
     for relational state interaction. The real forward path is _attn_forward().
     """
     d_model: int
@@ -4422,6 +4653,7 @@ class DAWN_SRW_V4171(nn.Module):
     vocab_size_padded: Optional[int] = None
 
     d_route: int = DEFAULT_D_ROUTE
+    operator_key_mode: str = OPERATOR_KEY_MODE_LEARNED
     admission_den_power: float = DEFAULT_ADMISSION_DEN_POWER
     srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE
     heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA
@@ -4461,6 +4693,8 @@ class DAWN_SRW_V4171(nn.Module):
         return logical, embedding
 
     def setup(self):
+        operator_key_mode = _validate_operator_key_mode(
+            self.operator_key_mode, context="DAWN_SRW_V4171 constructor")
         _validate_v4171_composition_settings(
             self.srw_composition_mode,
             self.admission_den_power,
@@ -4485,7 +4719,8 @@ class DAWN_SRW_V4171(nn.Module):
             self.n_know if self.n_know is not None else 25200)
         self.neuron_pool = NeuronPool(
             n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
-            d_model=self.d_model, d_route=self.d_route)
+            d_model=self.d_model, d_route=self.d_route,
+            operator_key_mode=operator_key_mode)
         self.router = Router(
             d_model=self.d_model, d_route=self.d_route,
             n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
@@ -4531,6 +4766,8 @@ class DAWN_SRW_V4171(nn.Module):
         such as distribution shape, selection diagnostics, entropy, tau stats,
         raw norms, and output-stability norms.
         """
+        operator_key_mode = _validate_operator_key_mode(
+            self.operator_key_mode, context="DAWN_SRW_V4171 forward")
         (model_srw_composition_mode, model_admission_den_power,
          model_heat_kernel_beta) = (
             _validate_v4171_composition_settings(
@@ -4845,9 +5082,13 @@ class DAWN_SRW_V4171(nn.Module):
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
             _ = self.neuron_pool.attn_qk_read  # triggers NeuronPool.setup
-            _ = self.neuron_pool.attn_qk_op_key
-            _ = self.neuron_pool.attn_v_op_key
-            _ = self.neuron_pool.rst_op_key
+            if operator_key_mode == OPERATOR_KEY_MODE_LEARNED:
+                _ = self.neuron_pool.attn_qk_op_key
+                _ = self.neuron_pool.attn_v_op_key
+                _ = self.neuron_pool.rst_operator_keys
+            else:
+                _ = self.neuron_pool.rw_key_read_probe
+                _ = self.neuron_pool.rw_key_write_probe
             _ = self.router.proj_attn(x)
             _ = self.router.proj_rst(x)
             _ = self.router.raw_tau_attn(x)
@@ -4859,7 +5100,7 @@ class DAWN_SRW_V4171(nn.Module):
         else:
             all_params = self.variables['params']
             pool_params = _pool_params_with_operator_keys(
-                all_params['neuron_pool'])
+                all_params['neuron_pool'], operator_key_mode)
             router_params = all_params['router']
 
             _sharded = sharded_fns
@@ -6372,8 +6613,8 @@ class DAWN_SRW_V4171(nn.Module):
         """Suppress one execution numerator inside the production SRW core.
 
         Admission and its denominator remain unmodified.  Operator ids and
-        target positions are per-example arrays; ``route_selector`` is 0=Q,
-        1=K, 2=V, or 3=RST.
+        target positions are per-example arrays; ``route_selector`` is 0=attention_q,
+        1=attention_k, 2=attention_v, or 3=RST.
         """
         return self(
             input_ids,
@@ -6398,7 +6639,7 @@ class DAWN_SRW_V4171(nn.Module):
 
         Every group size, including the all-``-1`` size-zero baseline, uses
         the same ``[B, M]`` input shape and therefore the same compiled graph.
-        Q/K route selection and all production admission/denominator semantics
+        attention_q/attention_k route selection and all production admission/denominator semantics
         are identical to single-operator suppression.
         """
         selected_global_operator_ids = jnp.asarray(
@@ -6433,7 +6674,7 @@ class DAWN_SRW_V4171(nn.Module):
             'logical_vocab_size': logical_vocab_size,
             'vocab_size_padded': embedding_vocab_size,
             'd_route': self.d_route,
-            'operator_key_mode': OPERATOR_KEY_MODE,
+            'operator_key_mode': self.operator_key_mode,
             'operator_query_mode': OPERATOR_QUERY_MODE,
             'admission_den_power': self.admission_den_power,
             'srw_composition_mode': self.srw_composition_mode,
@@ -6498,14 +6739,18 @@ class DAWN_SRW_V4171(nn.Module):
             f"  d_model={self.d_model}, d_route={self.d_route}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             "Operator address:",
-            f"  mode={OPERATOR_KEY_MODE}",
+            f"  mode={self.operator_key_mode}",
             f"  d_route={self.d_route}",
-            "  independent_per_operator=true",
+            ("  independent_per_operator=true"
+             if self.operator_key_mode == OPERATOR_KEY_MODE_LEARNED
+             else "  probe_scope=shared_across_qk_v_rst"),
             "  live_gradient=true",
             "  full_rw_execution=true",
             f"  vocab logical/padded={logical_vocab_size}/{embedding_vocab_size}",
             f"  Attention-QK: {self.n_qk}, Attention-V: {self.n_v}, RST: {n_rst_eff}",
-            "  Selection: cosine(direct state query, learned operator embedding)",
+            ("  Selection: cosine(direct state query, learned operator embedding)"
+             if self.operator_key_mode == OPERATOR_KEY_MODE_LEARNED
+             else "  Selection: cosine(direct state query, live bilinear RW key)"),
             "Execution:",
             "  full rank-1 read/write operator",
             "Composition:",
@@ -6579,9 +6824,9 @@ def _angular_execution_kwargs_from_model_cfg(model_cfg):
     }
 
 
-def _query_geometry_stats(h, prefix, max_sample=4096):
-    h = _forward_unit_direction(h.astype(jnp.float32))
-    flat = h.reshape((-1, h.shape[-1]))
+def _query_geometry_stats(operator_query, prefix, max_sample=4096):
+    operator_query = _forward_unit_direction(operator_query.astype(jnp.float32))
+    flat = operator_query.reshape((-1, operator_query.shape[-1]))
     stride = max(1, flat.shape[0] // int(max_sample))
     sampled = flat[::stride][:int(max_sample)]
     norms = jnp.linalg.norm(sampled, axis=-1)
@@ -6635,31 +6880,31 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
     rst_x = _layer_norm(
         x, block0['norm2']['scale'], block0['norm2']['bias'])
     router = params['router']
-    attn_h = (
+    attn_operator_queries = (
         attn_x @ router['proj_attn']['kernel']
         + router['proj_attn']['bias'])
-    h_q, h_k, h_v = jnp.split(attn_h, 3, axis=-1)
-    h_rst = (
+    q_operator_query, k_operator_query, v_operator_query = jnp.split(attn_operator_queries, 3, axis=-1)
+    rst_operator_query = (
         rst_x @ router['proj_rst']['kernel']
         + router['proj_rst']['bias'])
 
-    def _selection_rho(h, op_key):
+    def _selection_rho(operator_query, operator_keys):
         q_unit = _forward_unit_direction(
-            h.astype(jnp.float32)).astype(jnp.bfloat16)
+            operator_query.astype(jnp.float32)).astype(jnp.bfloat16)
         op_key_unit = _forward_unit_direction(
-            op_key.astype(jnp.float32)).astype(jnp.bfloat16)
+            operator_keys.astype(jnp.float32)).astype(jnp.bfloat16)
         return (q_unit @ op_key_unit.T).astype(jnp.float32)
 
     pool = params['neuron_pool']
-    op_keys = _ensure_pool_operator_keys(pool)
-    qk_op_key = op_keys['attn_qk_op_key']
-    v_op_key = op_keys['attn_v_op_key']
-    rst_op_key = op_keys['rst_op_key']
+    operator_keys_by_pool = _ensure_pool_operator_keys(pool)
+    qk_operator_keys = operator_keys_by_pool['attn_qk_op_key']
+    v_operator_keys = operator_keys_by_pool['attn_v_op_key']
+    rst_operator_keys = operator_keys_by_pool['rst_op_key']
     return {
-        'q': _selection_rho(h_q, qk_op_key),
-        'k': _selection_rho(h_k, qk_op_key),
-        'v': _selection_rho(h_v, v_op_key),
-        'rst': _selection_rho(h_rst, rst_op_key),
+        'q': _selection_rho(q_operator_query, qk_operator_keys),
+        'k': _selection_rho(k_operator_query, qk_operator_keys),
+        'v': _selection_rho(v_operator_query, v_operator_keys),
+        'rst': _selection_rho(rst_operator_query, rst_operator_keys),
     }
 
 
@@ -6689,34 +6934,37 @@ def _query_geometry_diagnostics(params, input_ids, max_tokens=4096):
     rst_x = _layer_norm(
         x, block0['norm2']['scale'], block0['norm2']['bias'])
     router = params['router']
-    h_q, h_k, h_v = jnp.split(
+    q_operator_query, k_operator_query, v_operator_query = jnp.split(
         attn_x @ router['proj_attn']['kernel']
         + router['proj_attn']['bias'], 3, axis=-1)
-    h_rst = (
+    rst_operator_query = (
         rst_x @ router['proj_rst']['kernel']
         + router['proj_rst']['bias'])
     out = {}
-    out.update(_query_geometry_stats(h_q, 'q', max_tokens))
-    out.update(_query_geometry_stats(h_k, 'k', max_tokens))
-    out.update(_query_geometry_stats(h_v, 'v', max_tokens))
-    out.update(_query_geometry_stats(h_rst, 'rst', max_tokens))
+    out.update(_query_geometry_stats(q_operator_query, 'q', max_tokens))
+    out.update(_query_geometry_stats(k_operator_query, 'k', max_tokens))
+    out.update(_query_geometry_stats(v_operator_query, 'v', max_tokens))
+    out.update(_query_geometry_stats(rst_operator_query, 'rst', max_tokens))
     return out
 
 
-def _angular_relation(h, op_key):
-    q = _forward_unit_direction(h.astype(jnp.float32))
-    op_key = _forward_unit_direction(op_key.astype(jnp.float32))
-    return (q @ op_key.T).astype(jnp.float32)
+def _angular_relation(operator_query, operator_keys):
+    operator_query_direction = _forward_unit_direction(
+        operator_query.astype(jnp.float32))
+    operator_key_directions = _forward_unit_direction(
+        operator_keys.astype(jnp.float32))
+    return (operator_query_direction @ operator_key_directions.T).astype(
+        jnp.float32)
 
 
-def _angular_execution(h, op_key, raw_tau, raw_scan_offset=None,
+def _angular_execution(operator_query, operator_keys, raw_tau, raw_scan_offset=None,
                      soft_gate_temperature=0.07,
                      soft_gate_boundary_power=4.0,
                      execution_prune_eps=0.0,
                      soft_gate_effective_active_eps=1.0e-6,
                      srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
                      heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    rho = _angular_relation(h, op_key)
+    rho = _angular_relation(operator_query, operator_keys)
     tau = _tau_from_param(raw_tau)
     return _compute_admission_drive(
         rho, tau, soft_gate_temperature,
@@ -6727,7 +6975,7 @@ def _angular_execution(h, op_key, raw_tau, raw_scan_offset=None,
         heat_kernel_beta=heat_kernel_beta)
 
 
-def _angular_execution_weight(h, op_key, raw_tau, raw_scan_offset=None,
+def _angular_execution_weight(operator_query, operator_keys, raw_tau, raw_scan_offset=None,
                   soft_gate_temperature=0.07,
                   soft_gate_boundary_power=4.0,
                   execution_prune_eps=0.0,
@@ -6736,7 +6984,7 @@ def _angular_execution_weight(h, op_key, raw_tau, raw_scan_offset=None,
                   heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Canonical v4166 execution_weight for non-sharded inference helpers."""
     _, _, _, execution_weight, _ = _angular_execution(
-        h, op_key, raw_tau, raw_scan_offset,
+        operator_query, operator_keys, raw_tau, raw_scan_offset,
         soft_gate_temperature=soft_gate_temperature,
         soft_gate_boundary_power=soft_gate_boundary_power,
         execution_prune_eps=execution_prune_eps,
@@ -6753,38 +7001,44 @@ def _split_admission_den_kwargs(angular_execution_kwargs):
     return execution_kwargs, admission_den_power
 
 
-def _srw_inference(x, h, op_key, raw_tau, raw_scan_offset, w_read, w_write,
-                   **angular_execution_kwargs):
+def _srw_inference(
+        state, operator_query, operator_keys, raw_tau, raw_scan_offset,
+        read_vectors, write_vectors, **angular_execution_kwargs):
     """Non-chunked SRW for inference."""
-    # v4.1.6.6: inference selection uses op keys; execution uses RW dirs.
-    r_n = _forward_unit_direction(w_read.astype(jnp.float32))
-    w_n = _forward_unit_direction(w_write.astype(jnp.float32))
+    # Selection uses d_route operator keys; execution uses d_model RW dirs.
+    read_directions = _forward_unit_direction(
+        read_vectors.astype(jnp.float32))
+    write_directions = _forward_unit_direction(
+        write_vectors.astype(jnp.float32))
     execution_kwargs, admission_den_power = _split_admission_den_kwargs(
         angular_execution_kwargs)
     _, admission, _, execution_weight, _ = _angular_execution(
-        h, op_key, raw_tau, raw_scan_offset, **execution_kwargs)
+        operator_query, operator_keys, raw_tau, raw_scan_offset, **execution_kwargs)
 
-    xr = x.astype(jnp.float32) @ r_n.T
-    a = execution_weight * xr
-    raw_out = a @ w_n
+    read_activations = state.astype(jnp.float32) @ read_directions.T
+    weighted_read_activations = execution_weight * read_activations
+    raw_state_transition = weighted_read_activations @ write_directions
     composition_den = _composition_den(
         admission.sum(axis=-1, keepdims=True), admission_den_power,
         execution_kwargs.get(
             'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE))
-    out = raw_out.astype(jnp.float32) / composition_den
-    return out.astype(jnp.float32)
+    state_transition = raw_state_transition.astype(jnp.float32) / composition_den
+    return state_transition.astype(jnp.float32)
 
 
-def _srw_inference_with_gates(x, h, op_key, raw_tau, raw_scan_offset, w_read,
-                              w_write, **angular_execution_kwargs):
+def _srw_inference_with_gates(
+        state, operator_query, operator_keys, raw_tau, raw_scan_offset,
+        read_vectors, write_vectors, **angular_execution_kwargs):
     """Like _srw_inference but also returns gate and normalized gate."""
-    # v4.1.6.6: analysis selection uses op keys; execution uses RW dirs.
-    r_n = _forward_unit_direction(w_read.astype(jnp.float32))
-    w_n = _forward_unit_direction(w_write.astype(jnp.float32))
+    # Selection uses d_route operator keys; execution uses d_model RW dirs.
+    read_directions = _forward_unit_direction(
+        read_vectors.astype(jnp.float32))
+    write_directions = _forward_unit_direction(
+        write_vectors.astype(jnp.float32))
     execution_kwargs, admission_den_power = _split_admission_den_kwargs(
         angular_execution_kwargs)
     _, admission, _, execution_weight, _ = _angular_execution(
-        h, op_key, raw_tau, raw_scan_offset, **execution_kwargs)
+        operator_query, operator_keys, raw_tau, raw_scan_offset, **execution_kwargs)
     composition_den = _composition_den(
         admission.sum(axis=-1, keepdims=True), admission_den_power,
         execution_kwargs.get(
@@ -6792,11 +7046,12 @@ def _srw_inference_with_gates(x, h, op_key, raw_tau, raw_scan_offset, w_read,
     execution_weight_norm = execution_weight / jnp.maximum(
         composition_den, 1e-8)
 
-    xr = x.astype(jnp.float32) @ r_n.T
-    a = execution_weight * xr
-    raw_out = a @ w_n
-    out = raw_out.astype(jnp.float32) / composition_den
-    return out.astype(jnp.float32), execution_weight, execution_weight_norm
+    read_activations = state.astype(jnp.float32) @ read_directions.T
+    weighted_read_activations = execution_weight * read_activations
+    raw_state_transition = weighted_read_activations @ write_directions
+    state_transition = raw_state_transition.astype(jnp.float32) / composition_den
+    return (state_transition.astype(jnp.float32), execution_weight,
+            execution_weight_norm)
 
 
 
@@ -6811,37 +7066,37 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
     if angular_execution_kwargs is None:
         angular_execution_kwargs = {}
     pool_params = _ensure_pool_operator_keys(pool_params)
-    qk_norm = pool_params['attn_qk_op_key']
-    v_norm = pool_params['attn_v_op_key']
-    h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
-    h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+    qk_operator_keys = pool_params['attn_qk_op_key']
+    v_operator_keys = pool_params['attn_v_op_key']
+    attn_operator_queries = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+    q_operator_query, k_operator_query, v_operator_query = jnp.split(attn_operator_queries, 3, axis=-1)
     tau_all = x @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
     raw_scan_offset_all = jnp.zeros_like(tau_all)
 
-    Q = _srw_inference(x, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
+    attention_q = _srw_inference(x, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                        pool_params['attn_qk_read'], pool_params['attn_qk_write'],
                        **angular_execution_kwargs)
-    K_new = _srw_inference(x, h_K, qk_norm, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
+    attention_k_new = _srw_inference(x, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                            pool_params['attn_qk_read'], pool_params['attn_qk_write'],
                            **angular_execution_kwargs)
-    V_new = _srw_inference(x, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
+    attention_v_new = _srw_inference(x, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                            pool_params['attn_v_read'], pool_params['attn_v_write'],
                            **angular_execution_kwargs)
     _qk_s, _v_s, _ = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
-    Q = Q * _qk_s
-    K_new = K_new * _qk_s
-    V_new = V_new * _v_s
+    attention_q = attention_q * _qk_s
+    attention_k_new = attention_k_new * _qk_s
+    attention_v_new = attention_v_new * _v_s
 
-    Q = Q.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
-    K_new_h = K_new.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
-    V_new_h = V_new.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
+    attention_q = attention_q.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
+    attention_k_new_heads = attention_k_new.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
+    attention_v_new_heads = attention_v_new.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
 
-    cache_K = cache_K.at[:, :, cache_len, :].set(K_new_h[:, :, 0, :])
-    cache_V = cache_V.at[:, :, cache_len, :].set(V_new_h[:, :, 0, :])
+    cache_K = cache_K.at[:, :, cache_len, :].set(attention_k_new_heads[:, :, 0, :])
+    cache_V = cache_V.at[:, :, cache_len, :].set(attention_v_new_heads[:, :, 0, :])
 
     scale = jnp.sqrt(jnp.float32(d_head))
-    attn_scores = jnp.einsum('bhqd,bhkd->bhqk', Q, cache_K) / scale
+    attn_scores = jnp.einsum('bhqd,bhkd->bhqk', attention_q, cache_K) / scale
     pos_mask = jnp.arange(cache_K.shape[2]) < (cache_len + 1)
     attn_scores = jnp.where(pos_mask[None, None, None, :], attn_scores,
                             jnp.finfo(attn_scores.dtype).min)
@@ -6860,11 +7115,11 @@ def _rst_forward_inference(x, pool_params, router_params,
     if angular_execution_kwargs is None:
         angular_execution_kwargs = {}
     pool_params = _ensure_pool_operator_keys(pool_params)
-    rst_norm = pool_params['rst_op_key']
-    h = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
+    rst_operator_keys = pool_params['rst_op_key']
+    operator_query = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
     tau = x @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
     raw_scan_offset = jnp.zeros_like(tau)
-    out = _srw_inference(x, h, rst_norm, tau, raw_scan_offset,
+    out = _srw_inference(x, operator_query, rst_operator_keys, tau, raw_scan_offset,
                          pool_params['rst_read'], pool_params['rst_write'],
                          **angular_execution_kwargs)
     if d_model is None or n_layers is None:
@@ -6898,8 +7153,8 @@ def prefill(params, model_cfg, input_ids):
     positions = jnp.arange(S)[jnp.newaxis, :]
     x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
 
-    qk_norm = pool_params['attn_qk_op_key']
-    v_norm = pool_params['attn_v_op_key']
+    qk_operator_keys = pool_params['attn_qk_op_key']
+    v_operator_keys = pool_params['attn_v_op_key']
 
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
@@ -6913,39 +7168,45 @@ def prefill(params, model_cfg, input_ids):
         layer_idx = xs['layer_idx']
 
         normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
-        h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
-        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        attn_operator_queries = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+        q_operator_query, k_operator_query, v_operator_query = jnp.split(attn_operator_queries, 3, axis=-1)
         tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
         raw_scan_offset_all = jnp.zeros_like(tau_all)
 
-        Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
+        attention_q = _srw_inference(normed, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                            pool_params['attn_qk_read'], pool_params['attn_qk_write'],
                            **angular_execution_kwargs)
-        K_val = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
-                               pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                               **angular_execution_kwargs)
-        V_val = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
-                               pool_params['attn_v_read'], pool_params['attn_v_write'],
-                               **angular_execution_kwargs)
+        attention_k = _srw_inference(normed, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
+                                     pool_params['attn_qk_read'], pool_params['attn_qk_write'],
+                                     **angular_execution_kwargs)
+        attention_v = _srw_inference(normed, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
+                                     pool_params['attn_v_read'], pool_params['attn_v_write'],
+                                     **angular_execution_kwargs)
         _qk_s = qk_scale_eff
         _v_s = v_scale_eff
-        Q = Q * _qk_s
-        K_val = K_val * _qk_s
-        V_val = V_val * _v_s
+        attention_q = attention_q * _qk_s
+        attention_k = attention_k * _qk_s
+        attention_v = attention_v * _v_s
 
-        Q_h = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-        K_h = K_val.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-        V_h = V_val.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        attention_q_heads = attention_q.reshape(
+            B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        attention_k_heads = attention_k.reshape(
+            B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        attention_v_heads = attention_v.reshape(
+            B, S, n_heads, d_head).transpose(0, 2, 1, 3)
 
-        cK = cK.at[layer_idx, :, :, :S, :].set(K_h)
-        cV = cV.at[layer_idx, :, :, :S, :].set(V_h)
+        cK = cK.at[layer_idx, :, :, :S, :].set(attention_k_heads)
+        cV = cV.at[layer_idx, :, :, :S, :].set(attention_v_heads)
 
         scale = jnp.sqrt(jnp.float32(d_head))
-        scores = jnp.einsum('bhsd,bhtd->bhst', Q_h, K_h) / scale
+        scores = jnp.einsum(
+            'bhsd,bhtd->bhst', attention_q_heads,
+            attention_k_heads) / scale
         causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
         scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
         attn_w = jax.nn.softmax(scores, axis=-1)
-        attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, V_h)
+        attn_out = jnp.einsum(
+            'bhst,bhtd->bhsd', attn_w, attention_v_heads)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
         attn_out = attn_out @ bp['attn']['expand_O']['kernel']
         x = x + attn_out
@@ -7051,9 +7312,9 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     emb_matrix = jnp.asarray(params['token_emb']['embedding'])
     pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
 
-    qk_norm = pool_params['attn_qk_op_key']
-    v_norm = pool_params['attn_v_op_key']
-    rst_norm = pool_params['rst_op_key']
+    qk_operator_keys = pool_params['attn_qk_op_key']
+    v_operator_keys = pool_params['attn_v_op_key']
+    rst_operator_keys = pool_params['rst_op_key']
 
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
@@ -7065,46 +7326,52 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
 
         def layer_fn(x, bp):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
-            h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
-            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            attn_operator_queries = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+            q_operator_query, k_operator_query, v_operator_query = jnp.split(attn_operator_queries, 3, axis=-1)
             tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
             raw_scan_offset_all = jnp.zeros_like(tau_all)
 
-            Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
+            attention_q = _srw_inference(normed, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'],
                                **angular_execution_kwargs)
-            K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
+            attention_k = _srw_inference(normed, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'],
                                **angular_execution_kwargs)
-            V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
+            attention_v = _srw_inference(normed, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                                pool_params['attn_v_read'], pool_params['attn_v_write'],
                                **angular_execution_kwargs)
             _qk_s = qk_scale_eff
             _v_s = v_scale_eff
-            Q = Q * _qk_s
-            K = K * _qk_s
-            V = V * _v_s
+            attention_q = attention_q * _qk_s
+            attention_k = attention_k * _qk_s
+            attention_v = attention_v * _v_s
 
             d_head = d_model // n_heads
-            Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-            Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-            Vr = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            attention_q_heads = attention_q.reshape(
+                B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            attention_k_heads = attention_k.reshape(
+                B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            attention_v_heads = attention_v.reshape(
+                B, S, n_heads, d_head).transpose(0, 2, 1, 3)
 
             scale = jnp.sqrt(jnp.float32(d_head))
-            scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            scores = jnp.einsum(
+                'bhsd,bhtd->bhst', attention_q_heads,
+                attention_k_heads) / scale
             causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
             scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
             attn_w = jax.nn.softmax(scores, axis=-1)
-            attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+            attn_out = jnp.einsum(
+                'bhst,bhtd->bhsd', attn_w, attention_v_heads)
             attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
             attn_out = attn_out @ bp['attn']['expand_O']['kernel']
             x = x + attn_out
 
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
-            h_k = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
+            rst_operator_query = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
             tau_k = normed @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
             raw_scan_offset_k = jnp.zeros_like(tau_k)
-            rst_out = _srw_inference(normed, h_k, rst_norm, tau_k, raw_scan_offset_k,
+            rst_out = _srw_inference(normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k,
                                      pool_params['rst_read'], pool_params['rst_write'],
                                      **angular_execution_kwargs)
             x = x + rst_out * rst_scale_eff
@@ -7153,14 +7420,14 @@ def vectorized_neuron_health(params):
             ('Attention-QK', 'attn_qk_op_key', 'attn_qk_read', 'attn_qk_write'),
             ('Attention-V', 'attn_v_op_key', 'attn_v_read', 'attn_v_write'),
             ('RST', 'rst_op_key', 'rst_read', 'rst_write')]:
-        op_key = pool[op_key_key]
+        operator_keys = pool[op_key_key]
         read = pool[read_key]
         write = pool[write_key]
-        op_key_n = jnp.linalg.norm(op_key, axis=-1)
+        op_key_n = jnp.linalg.norm(operator_keys, axis=-1)
         read_n = jnp.linalg.norm(read, axis=-1)
         write_n = jnp.linalg.norm(write, axis=-1)
         results[pool_name] = {
-            'N': op_key.shape[0],
+            'N': operator_keys.shape[0],
             'op_key_mean': op_key_n.mean(),
             'op_key_std': op_key_n.std(),
             'op_key_dead': (op_key_n < 1e-6).sum(),
@@ -7183,13 +7450,13 @@ def vectorized_weight_analysis(params, max_sample=2048):
             ('Attention-QK', 'attn_qk_op_key'),
             ('Attention-V', 'attn_v_op_key'),
             ('RST', 'rst_op_key')]:
-        op_key = pool[op_key_key]
-        N, d = op_key.shape
+        operator_keys = pool[op_key_key]
+        N, d = operator_keys.shape
         if N > max_sample:
             idx = jnp.linspace(0, N - 1, max_sample, dtype=jnp.int32)
-            op_key_s = op_key[idx]
+            op_key_s = operator_keys[idx]
         else:
-            op_key_s = op_key
+            op_key_s = operator_keys
         norms = jnp.linalg.norm(op_key_s, axis=-1, keepdims=True) + 1e-8
         op_key_normed = op_key_s / norms
         n_s = op_key_normed.shape[0]
@@ -7246,9 +7513,9 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
     positions = jnp.arange(S)[jnp.newaxis, :]
     x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
 
-    qk_norm = pool_params['attn_qk_op_key']
-    v_norm = pool_params['attn_v_op_key']
-    rst_norm_w = pool_params['rst_op_key']
+    qk_operator_keys = pool_params['attn_qk_op_key']
+    v_operator_keys = pool_params['attn_v_op_key']
+    rst_operator_keys = pool_params['rst_op_key']
 
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
@@ -7260,50 +7527,56 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         bp = xs['params']
 
         normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
-        h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
-        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        attn_operator_queries = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+        q_operator_query, k_operator_query, v_operator_query = jnp.split(attn_operator_queries, 3, axis=-1)
         tau_all = normed @ router_params['raw_tau_attn']['kernel'] + router_params['raw_tau_attn']['bias']
         raw_scan_offset_all = jnp.zeros_like(tau_all)
 
-        Q, gate_Q_raw, gate_Q = _srw_inference_with_gates(
-            normed, h_Q, qk_norm, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
+        attention_q, gate_Q_raw, gate_Q = _srw_inference_with_gates(
+            normed, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
             pool_params['attn_qk_read'], pool_params['attn_qk_write'],
             **angular_execution_kwargs)
-        K, gate_K_raw, gate_K = _srw_inference_with_gates(
-            normed, h_K, qk_norm, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
+        attention_k, gate_K_raw, gate_K = _srw_inference_with_gates(
+            normed, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
             pool_params['attn_qk_read'], pool_params['attn_qk_write'],
             **angular_execution_kwargs)
-        V, gate_V_raw, gate_V = _srw_inference_with_gates(
-            normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
+        attention_v, gate_V_raw, gate_V = _srw_inference_with_gates(
+            normed, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
             pool_params['attn_v_read'], pool_params['attn_v_write'],
             **angular_execution_kwargs)
         _qk_s = qk_scale_eff
         _v_s = v_scale_eff
-        Q = Q * _qk_s
-        K = K * _qk_s
-        V = V * _v_s
+        attention_q = attention_q * _qk_s
+        attention_k = attention_k * _qk_s
+        attention_v = attention_v * _v_s
 
         d_head = d_model // n_heads
-        Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-        Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
-        Vr = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        attention_q_heads = attention_q.reshape(
+            B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        attention_k_heads = attention_k.reshape(
+            B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+        attention_v_heads = attention_v.reshape(
+            B, S, n_heads, d_head).transpose(0, 2, 1, 3)
         scale = jnp.sqrt(jnp.float32(d_head))
-        scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+        scores = jnp.einsum(
+            'bhsd,bhtd->bhst', attention_q_heads,
+            attention_k_heads) / scale
         causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
         scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
         attn_w = jax.nn.softmax(scores, axis=-1)
-        attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+        attn_out = jnp.einsum(
+            'bhst,bhtd->bhsd', attn_w, attention_v_heads)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
         attn_out = attn_out @ bp['attn']['expand_O']['kernel']
         attn_out_norm = jnp.linalg.norm(attn_out, axis=-1).mean()
         x = x + attn_out
 
         normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
-        h_k = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
+        rst_operator_query = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
         tau_k = normed @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
         raw_scan_offset_k = jnp.zeros_like(tau_k)
         rst_out, gate_RST_raw, gate_RST = _srw_inference_with_gates(
-            normed, h_k, rst_norm_w, tau_k, raw_scan_offset_k,
+            normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k,
             pool_params['rst_read'], pool_params['rst_write'],
             **angular_execution_kwargs)
         rst_out = rst_out * rst_scale_eff
@@ -7316,10 +7589,10 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
             'attn_out_norm': attn_out_norm,
             'rst_out_norm': rst_out_norm,
         }
-        info.update(_query_geometry_stats(h_Q, 'q'))
-        info.update(_query_geometry_stats(h_K, 'k'))
-        info.update(_query_geometry_stats(h_V, 'v'))
-        info.update(_query_geometry_stats(h_k, 'rst'))
+        info.update(_query_geometry_stats(q_operator_query, 'q'))
+        info.update(_query_geometry_stats(k_operator_query, 'k'))
+        info.update(_query_geometry_stats(v_operator_query, 'v'))
+        info.update(_query_geometry_stats(rst_operator_query, 'rst'))
         if _return_raw:
             info['gate_Q_raw'] = gate_Q_raw
             info['gate_K_raw'] = gate_K_raw
@@ -7359,26 +7632,31 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
     rst_mask = suppress_masks.get('rst', suppress_masks.get('know', None))
     rst_mult = jnp.where(rst_mask, 0.0, 1.0) if rst_mask is not None else None
 
-    def _srw_sup(x, h, op_key, tau_off, raw_scan_offset, w_read, w_write, mult):
+    def _srw_sup(
+            state, operator_query, operator_keys, tau_off, raw_scan_offset,
+            read_vectors, write_vectors, mult):
         """SRW with optional gate suppression."""
-        # v4.1.6.6: suppressed forward selects by op key and executes RW.
-        r_n = _forward_unit_direction(w_read.astype(jnp.float32))
-        w_n = _forward_unit_direction(w_write.astype(jnp.float32))
+        # Suppressed forward selects by d_route keys and executes d_model RW.
+        read_directions = _forward_unit_direction(
+            read_vectors.astype(jnp.float32))
+        write_directions = _forward_unit_direction(
+            write_vectors.astype(jnp.float32))
         execution_kwargs, admission_den_power = _split_admission_den_kwargs(
             angular_execution_kwargs)
         _, admission, _, execution_weight, _ = _angular_execution(
-            h, op_key, tau_off, raw_scan_offset, **execution_kwargs)
+            operator_query, operator_keys, tau_off, raw_scan_offset, **execution_kwargs)
         if mult is not None:
             execution_weight = execution_weight * mult[None, None, :]
             admission = admission * mult[None, None, :]
-        xr = x.astype(jnp.float32) @ r_n.T
-        a = execution_weight * xr
-        out = a @ w_n
+        read_activations = state.astype(jnp.float32) @ read_directions.T
+        weighted_read_activations = execution_weight * read_activations
+        state_transition = weighted_read_activations @ write_directions
         composition_den = _composition_den(
             admission.sum(axis=-1, keepdims=True), admission_den_power,
             execution_kwargs.get(
                 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE))
-        return (out.astype(jnp.float32) / composition_den).astype(jnp.float32)
+        return (state_transition.astype(jnp.float32) / composition_den).astype(
+            jnp.float32)
 
     def forward_fn(input_ids):
         B, S = input_ids.shape
@@ -7393,44 +7671,50 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
 
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
-        qk_n = pp['attn_qk_op_key']
-        v_n = pp['attn_v_op_key']
-        kn_n = pp['rst_op_key']
+        qk_operator_keys = pp['attn_qk_op_key']
+        v_operator_keys = pp['attn_v_op_key']
+        rst_operator_keys = pp['rst_op_key']
 
         for i in range(n_layers):
             bp = params[f'block_{i}']
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
-            h_all = normed @ rp['proj_attn']['kernel'] + rp['proj_attn']['bias']
-            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            attn_operator_queries = normed @ rp['proj_attn']['kernel'] + rp['proj_attn']['bias']
+            q_operator_query, k_operator_query, v_operator_query = jnp.split(attn_operator_queries, 3, axis=-1)
             tau_all = normed @ rp['raw_tau_attn']['kernel'] + rp['raw_tau_attn']['bias']
             raw_scan_offset_all = jnp.zeros_like(tau_all)
 
-            Q = _srw_sup(normed, h_Q, qk_n, tau_all[:,:,0:1], raw_scan_offset_all[:,:,0:1], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult)
-            K = _srw_sup(normed, h_K, qk_n, tau_all[:,:,1:2], raw_scan_offset_all[:,:,1:2], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult)
-            V = _srw_sup(normed, h_V, v_n, tau_all[:,:,2:3], raw_scan_offset_all[:,:,2:3], pp['attn_v_read'], pp['attn_v_write'], v_mult)
+            attention_q = _srw_sup(normed, q_operator_query, qk_operator_keys, tau_all[:,:,0:1], raw_scan_offset_all[:,:,0:1], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult)
+            attention_k = _srw_sup(normed, k_operator_query, qk_operator_keys, tau_all[:,:,1:2], raw_scan_offset_all[:,:,1:2], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult)
+            attention_v = _srw_sup(normed, v_operator_query, v_operator_keys, tau_all[:,:,2:3], raw_scan_offset_all[:,:,2:3], pp['attn_v_read'], pp['attn_v_write'], v_mult)
             _qk_s = qk_scale_eff
             _v_s = v_scale_eff
-            Q = Q * _qk_s
-            K = K * _qk_s
-            V = V * _v_s
+            attention_q = attention_q * _qk_s
+            attention_k = attention_k * _qk_s
+            attention_v = attention_v * _v_s
 
-            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            attention_q_heads = attention_q.reshape(
+                B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            attention_k_heads = attention_k.reshape(
+                B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            attention_v_heads = attention_v.reshape(
+                B, S, n_heads, d_head).transpose(0, 2, 1, 3)
             sc = jnp.sqrt(jnp.float32(d_head))
-            attn_s = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / sc
+            attn_s = jnp.einsum(
+                'bhsd,bhtd->bhst', attention_q_heads,
+                attention_k_heads) / sc
             causal = jnp.tril(jnp.ones((S,S), dtype=jnp.bool_))
             attn_s = jnp.where(causal, attn_s, jnp.finfo(attn_s.dtype).min)
             attn_w = jax.nn.softmax(attn_s, axis=-1)
-            attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+            attn_out = jnp.einsum(
+                'bhst,bhtd->bhsd', attn_w, attention_v_heads)
             attn_out = attn_out.transpose(0,2,1,3).reshape(B,S,d_model) @ bp['attn']['expand_O']['kernel']
             x = x + attn_out
 
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
-            h_k = normed @ rp['proj_rst']['kernel'] + rp['proj_rst']['bias']
+            rst_operator_query = normed @ rp['proj_rst']['kernel'] + rp['proj_rst']['bias']
             tau_k = normed @ rp['raw_tau_rst']['kernel'] + rp['raw_tau_rst']['bias']
             raw_scan_offset_k = jnp.zeros_like(tau_k)
-            x = x + _srw_sup(normed, h_k, kn_n, tau_k, raw_scan_offset_k, pp['rst_read'], pp['rst_write'], rst_mult) * rst_scale_eff
+            x = x + _srw_sup(normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k, pp['rst_read'], pp['rst_write'], rst_mult) * rst_scale_eff
 
         norm_p = params['norm']
         x = _layer_norm(x, norm_p['scale'], norm_p['bias'])

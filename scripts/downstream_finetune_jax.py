@@ -711,7 +711,7 @@ def main() -> None:
         'tokenizer': tok_name,
         'tau_lr_mult': runtime_state['tau_lr_mult'],
     }
-    if str(model_cfg['model_version']) == tj.V4171_MODEL_VERSION:
+    if tj._is_v417x_version(model_cfg['model_version']):
         header.update({
             'srw_composition_mode': runtime_state['srw_composition_mode'],
             'admission_den_power': runtime_state['admission_den_power'],

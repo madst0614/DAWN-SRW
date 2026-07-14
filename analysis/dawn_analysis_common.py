@@ -38,9 +38,11 @@ from analysis.dawn_analysis_storage import (
 
 V4166_MODEL_VERSION = "spatial-r1-v4.1.6.6"
 V4171_MODEL_VERSION = "spatial-r1-v4.1.7.1"
+V4172_MODEL_VERSION = "spatial-r1-v4.1.7.2"
+V417X_MODEL_VERSIONS = (V4171_MODEL_VERSION, V4172_MODEL_VERSION)
 SUPPORTED_ANALYSIS_MODEL_VERSIONS = (
     V4166_MODEL_VERSION,
-    V4171_MODEL_VERSION,
+    *V417X_MODEL_VERSIONS,
 )
 _TRAIN = None
 
@@ -213,7 +215,7 @@ def build_analysis_model(cfg: Dict[str, Any]):
 
 
 def build_v4166_model(cfg: Dict[str, Any]):
-    """Backward-compatible wrapper; dispatches v4166 and v4171 exactly."""
+    """Backward-compatible wrapper; dispatches supported versions exactly."""
     return build_analysis_model(cfg)
 
 
@@ -691,6 +693,7 @@ def _create_restore_optimizer(cfg: Dict[str, Any], params: Any):
     pool_param_names = (
         "attn_qk_emb", "attn_v_emb", "rst_emb",
         "attn_qk_op_key", "attn_v_op_key", "rst_op_key",
+        "rw_key_read_probe", "rw_key_write_probe",
         "attn_qk_op_read_proj", "attn_qk_op_write_proj",
         "attn_v_op_read_proj", "attn_v_op_write_proj",
         "rst_op_read_proj", "rst_op_write_proj",
@@ -915,10 +918,10 @@ def create_composition_analysis_step(
     """
     cfg = cfg or {}
     version = cfg.get("model", {}).get("model_version")
-    if version != V4171_MODEL_VERSION:
+    if version not in V417X_MODEL_VERSIONS:
         raise ValueError(
             "Composition analysis is only defined for "
-            f"{V4171_MODEL_VERSION}, got {version!r}")
+            f"{V417X_MODEL_VERSIONS}, got {version!r}")
     t = cfg.get("training", {})
     admission_den_power = admission_den_power_from_config(cfg)
     ce_token_chunk_size = int(t.get("ce_token_chunk_size", 32768))

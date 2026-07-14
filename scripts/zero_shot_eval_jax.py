@@ -375,8 +375,8 @@ def _restore_params_only(
     if json_safe(restored_metadata) != json_safe(metadata):
         raise RuntimeError("metadata changed between pinning and params restore")
     params = state["params"]
-    if str(metadata["full_config"]["model"].get("model_version")) == (
-            canonical.V4171_MODEL_VERSION):
+    if canonical._is_v417x_version(
+            metadata["full_config"]["model"].get("model_version")):
         canonical._validate_v4171_checkpoint_param_schema(
             params, target_params)
     jax.block_until_ready(params)

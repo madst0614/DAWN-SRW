@@ -24,6 +24,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    analysis_model_module,
     git_info,
     maybe_load_tokenizer,
 )
@@ -46,6 +47,13 @@ from analysis.dawn_analysis_trace import (
     topk_trace_forward,
 )
 V4171_MODEL_VERSION = "spatial-r1-v4.1.7.1"
+V4172_MODEL_VERSION = "spatial-r1-v4.1.7.2"
+SUPPORTED_TRANSITION_MODEL_VERSIONS = frozenset({
+    V4171_MODEL_VERSION,
+    V4172_MODEL_VERSION,
+})
+OPERATOR_KEY_MODE_LEARNED = "learned_operator_embedding"
+OPERATOR_KEY_MODE_GENERALIZED_BILINEAR = "generalized_bilinear_rw"
 ANALYSIS_SCHEMA_VERSION = 2
 ANALYSIS_CODE_SCHEMA_HASH = hashlib.sha256(
     b"v4171-operator-family-analysis-schema-2").hexdigest()
@@ -394,8 +402,22 @@ def _analysis_provenance(
     analysis_config_hash = hashlib.sha256(json.dumps(
         analysis_config, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")).hexdigest()
+    version = str(ctx.model_cfg.get("model_version", "unknown"))
+    operator_key_mode = str(ctx.model_cfg.get(
+        "operator_key_mode",
+        OPERATOR_KEY_MODE_LEARNED
+        if version == V4171_MODEL_VERSION
+        else OPERATOR_KEY_MODE_GENERALIZED_BILINEAR))
+    d_model = int(ctx.model_cfg.get("d_model", 0))
+    d_route = int(ctx.model_cfg.get("d_route", 0))
+    operator_count = sum((
+        int(ctx.model_cfg.get("n_qk", 0)),
+        int(ctx.model_cfg.get("n_v", 0)),
+        int(ctx.model_cfg.get(
+            "n_rst", ctx.model_cfg.get("n_know", 0))),
+    ))
     return {
-        "model_version": str(ctx.model_cfg.get("model_version", "unknown")),
+        "model_version": version,
         "checkpoint_step": ctx.checkpoint_step,
         "checkpoint_path": ctx.checkpoint_path,
         "git_commit": git_commit,
@@ -407,7 +429,20 @@ def _analysis_provenance(
         "composition_mode": str(ctx.model_cfg.get("srw_composition_mode")),
         "admission_den_power": _json_float(
             ctx.model_cfg.get("admission_den_power")),
-        "d_route": int(ctx.model_cfg.get("d_route", 0)),
+        "d_route": d_route,
+        "operator_key_mode": operator_key_mode,
+        "operator_key_probe_scope": (
+            "shared_across_qk_v_rst"
+            if operator_key_mode == OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
+            else "not_applicable"),
+        "operator_key_probe_parameter_count": (
+            2 * d_model * d_route
+            if operator_key_mode == OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
+            else 0),
+        "learned_operator_key_parameter_count": (
+            operator_count * d_route
+            if operator_key_mode == OPERATOR_KEY_MODE_LEARNED
+            else 0),
         "pool_sizes": {
             "qk": int(ctx.model_cfg.get("n_qk", 0)),
             "v": int(ctx.model_cfg.get("n_v", 0)),
@@ -430,6 +465,9 @@ def _resume_summary_matches(
         "analysis_schema_version",
         "code_schema_hash", "analysis_config_hash", "prompt_hash", "composition_mode",
         "admission_den_power", "d_route", "pool_sizes",
+        "operator_key_mode", "operator_key_probe_scope",
+        "operator_key_probe_parameter_count",
+        "learned_operator_key_parameter_count",
     )
     return all(summary.get(key) == expected.get(key) for key in exact_keys)
 
@@ -637,9 +675,10 @@ def _flatten_param_paths(tree: Any, prefix: Tuple[str, ...] = ()) -> List[str]:
 
 
 def run_global_router_audit(ctx: AnalysisContext) -> Dict[str, Any]:
-    if str(ctx.model_cfg.get("model_version")) != V4171_MODEL_VERSION:
+    version = str(ctx.model_cfg.get("model_version"))
+    if version not in SUPPORTED_TRANSITION_MODEL_VERSIONS:
         return {
-            "status": "unsupported_for_v4171",
+            "status": "unsupported_for_v417x",
             "reason": f"model_version={ctx.model_cfg.get('model_version')}",
         }
     paths = sorted(_flatten_param_paths(ctx.params))
@@ -656,23 +695,53 @@ def run_global_router_audit(ctx: AnalysisContext) -> Dict[str, Any]:
         "router/raw_tau_attn/kernel",
         "router/raw_tau_rst/kernel",
     )
-    required_pool = (
-        "neuron_pool/attn_qk_op_key",
+    required_rw = (
         "neuron_pool/attn_qk_read",
         "neuron_pool/attn_qk_write",
-        "neuron_pool/attn_v_op_key",
         "neuron_pool/attn_v_read",
         "neuron_pool/attn_v_write",
-        "neuron_pool/rst_op_key",
         "neuron_pool/rst_read",
         "neuron_pool/rst_write",
     )
+    if version == V4171_MODEL_VERSION:
+        required_pool = required_rw + (
+            "neuron_pool/attn_qk_op_key",
+            "neuron_pool/attn_v_op_key",
+            "neuron_pool/rst_op_key",
+        )
+        forbidden_pool = (
+            "neuron_pool/rw_key_read_probe",
+            "neuron_pool/rw_key_write_probe",
+        )
+        operator_key_mode = OPERATOR_KEY_MODE_LEARNED
+        operator_key_source = "stored_learned_tables"
+    else:
+        required_pool = required_rw + (
+            "neuron_pool/rw_key_read_probe",
+            "neuron_pool/rw_key_write_probe",
+        )
+        forbidden_pool = (
+            "neuron_pool/attn_qk_op_key",
+            "neuron_pool/attn_v_op_key",
+            "neuron_pool/rst_op_key",
+        )
+        operator_key_mode = OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
+        operator_key_source = "live_rw_plus_shared_probes"
     missing = [path for path in required_router + required_pool if path not in paths]
-    if hidden or missing:
+    forbidden_present = [path for path in forbidden_pool if path in paths]
+    if hidden or missing or forbidden_present:
         raise RuntimeError(
-            "v4171 global router audit failed: "
-            f"hidden_layer_router_params={hidden} missing={missing}")
+            "v417x global router audit failed: "
+            f"hidden_layer_router_params={hidden} missing={missing} "
+            f"forbidden_present={forbidden_present}")
     mcfg = ctx.config.get("model", {})
+    d_model = int(mcfg.get("d_model", 0))
+    d_route = int(mcfg.get("d_route", 0))
+    operator_count = sum((
+        int(mcfg.get("n_qk", 0)),
+        int(mcfg.get("n_v", 0)),
+        int(mcfg.get("n_rst", mcfg.get("n_know", 0))),
+    ))
     result = {
         "status": "ready",
         "router_param_paths": router_paths,
@@ -680,8 +749,32 @@ def run_global_router_audit(ctx: AnalysisContext) -> Dict[str, Any]:
         "shared_across_layers": True,
         "hidden_layer_router_params": hidden,
         "operator_pool_param_paths": pool_paths,
+        "operator_key_mode": operator_key_mode,
+        "operator_key_source": operator_key_source,
+        "learned_operator_key_tables": (
+            operator_key_mode == OPERATOR_KEY_MODE_LEARNED),
+        "shared_probe_matrices": (
+            operator_key_mode == OPERATOR_KEY_MODE_GENERALIZED_BILINEAR),
+        "probe_scope": (
+            "qk_v_rst_global"
+            if operator_key_mode == OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
+            else "not_applicable"),
+        "operator_keys_shared_across_layers": True,
+        "operator_rw_shared_across_layers": True,
         "operator_keys_shared": True,
         "operator_rw_shared": True,
+        "operator_key_probe_scope": (
+            "shared_across_qk_v_rst"
+            if operator_key_mode == OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
+            else "not_applicable"),
+        "operator_key_probe_parameter_count": (
+            2 * d_model * d_route
+            if operator_key_mode == OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
+            else 0),
+        "learned_operator_key_parameter_count": (
+            operator_count * d_route
+            if operator_key_mode == OPERATOR_KEY_MODE_LEARNED
+            else 0),
         "query_types": {
             "q": "LN1(residual)->global router/proj_attn slice 0",
             "k": "LN1(residual)->global router/proj_attn slice 1",
@@ -693,8 +786,8 @@ def run_global_router_audit(ctx: AnalysisContext) -> Dict[str, Any]:
             "v": int(mcfg.get("n_v", 0)),
             "rst": int(mcfg.get("n_rst", mcfg.get("n_know", 0))),
         },
-        "d_route": int(mcfg.get("d_route", 0)),
-        "d_model": int(mcfg.get("d_model", 0)),
+        "d_route": d_route,
+        "d_model": d_model,
         "n_layers": int(mcfg.get("n_layers", 0)),
         "composition_mode": str(mcfg.get("srw_composition_mode", "linear_angular")),
         "admission_den_power": float(mcfg.get("admission_den_power", 1.0)),
@@ -2325,10 +2418,11 @@ def _print_parity_success(ctx: AnalysisContext, parity: Mapping[str, Any]) -> No
 
 def run_v4171_parity_only_smoke(ctx: AnalysisContext) -> Dict[str, Any]:
     """Run blocking machine-exact parity without building transition traces."""
-    if str(ctx.model_cfg.get("model_version")) != V4171_MODEL_VERSION:
+    if str(ctx.model_cfg.get(
+            "model_version")) not in SUPPORTED_TRANSITION_MODEL_VERSIONS:
         raise ValueError(
-            "v4171 parity-only smoke requires model_version="
-            f"{V4171_MODEL_VERSION}")
+            "v417x parity-only smoke requires model_version in "
+            f"{sorted(SUPPORTED_TRANSITION_MODEL_VERSIONS)}")
     args = ctx.args
     prompt_set = str(
         getattr(args, "transition_prompt_set", None)
@@ -2697,21 +2791,45 @@ def _pool_parameter_keys(pool: str) -> Tuple[str, str, str]:
 def _candidate_pool_vectors(
         ctx: AnalysisContext, pool: str, operator_ids: Sequence[int]
         ) -> Dict[str, np.ndarray]:
-    """Gather only candidate embeddings and replicate the small result."""
+    """Gather candidate RW rows and materialize only candidate addresses."""
     address_key, read_key, write_key = _pool_parameter_keys(pool)
     replicated = NamedSharding(ctx.mesh, P())
     ids = jax.device_put(
         jnp.asarray(operator_ids, dtype=jnp.int32), replicated)
+    version = str(ctx.model_cfg.get("model_version"))
+    model_module = analysis_model_module(ctx.model_cfg)
 
-    @partial(jax.jit, out_shardings={
-        "address": replicated, "read": replicated, "write": replicated})
-    def select(params, selected):
-        pool_params = params["neuron_pool"]
-        return {
-            "address": pool_params[address_key][selected],
-            "read": pool_params[read_key][selected],
-            "write": pool_params[write_key][selected],
-        }
+    if version == V4171_MODEL_VERSION:
+        @partial(jax.jit, out_shardings={
+            "address": replicated, "read": replicated, "write": replicated})
+        def select(params, selected):
+            pool_params = params["neuron_pool"]
+            return {
+                "address": pool_params[address_key][selected],
+                "read": pool_params[read_key][selected],
+                "write": pool_params[write_key][selected],
+            }
+    elif version == V4172_MODEL_VERSION:
+        @partial(jax.jit, out_shardings={
+            "address": replicated, "read": replicated, "write": replicated})
+        def select(params, selected):
+            pool_params = params["neuron_pool"]
+            read_vectors = pool_params[read_key][selected]
+            write_vectors = pool_params[write_key][selected]
+            address = model_module.materialize_generalized_bilinear_operator_keys(
+                read_vectors,
+                write_vectors,
+                pool_params["rw_key_read_probe"],
+                pool_params["rw_key_write_probe"],
+            )
+            return {
+                "address": address,
+                "read": read_vectors,
+                "write": write_vectors,
+            }
+    else:
+        raise ValueError(
+            f"Unsupported transition model_version={version!r}")
 
     selected_host = _device_get_process_local_debug(select(ctx.params, ids))
     return {key: np.asarray(value) for key, value in selected_host.items()}
@@ -2992,10 +3110,14 @@ def run_operator_functional_graph(
     pool_summaries: Dict[str, Any] = {}
     graph_state: Dict[str, Any] = {
         "neighbors": {}, "families": {}, "candidate_ids": {}}
+    model_version = str(ctx.model_cfg.get("model_version"))
     for pool_index, pool in enumerate(("qk", "v", "rst")):
+        candidate_limit = min(limits[pool], pool_sizes[pool])
+        if model_version == V4172_MODEL_VERSION:
+            candidate_limit = min(candidate_limit, 2048)
         candidates, coverage = _functional_candidate_universe(
             records, causal_rows, pool, pool_sizes[pool],
-            min(limits[pool], pool_sizes[pool]), seed + pool_index,
+            candidate_limit, seed + pool_index,
             capture_threshold)
         graph_state["candidate_ids"][pool] = candidates
         vectors = _candidate_pool_vectors(ctx, pool, candidates)
@@ -3760,7 +3882,8 @@ def run_v4171_transition_items(
     selected = [item for item in CORE_TRANSITION_ITEMS if item in execute]
     if not selected:
         return {}
-    if str(ctx.model_cfg.get("model_version")) != V4171_MODEL_VERSION:
+    if str(ctx.model_cfg.get(
+            "model_version")) not in SUPPORTED_TRANSITION_MODEL_VERSIONS:
         return {
             item: {
                 "status": "failed",
