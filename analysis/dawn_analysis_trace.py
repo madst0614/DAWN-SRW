@@ -66,6 +66,8 @@ def _srw_with_topk(x, h, op_key, raw_tau, read, write, *,
                    admission_den_power: float,
                    target_positions=None,
                    candidate_seed: int = 0):
+    # This is an observational side-car.  Its coefficient estimates may rank
+    # candidates, but causal execution must use the production-core kernel.
     kwargs = dict(execution_kwargs)
     kwargs.pop("admission_den_power", None)
     production_bfloat16 = (

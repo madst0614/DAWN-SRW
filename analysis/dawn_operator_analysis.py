@@ -2,7 +2,7 @@
 
 The prepared-data contract lives in :mod:`analysis.dawn_operator_datasets`.
 This module performs production model forwards, target-only sparse traces,
-route comparisons, and production contribution-subtraction interventions.
+route comparisons, and production-core execution-suppression interventions.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ from analysis.dawn_operator_datasets import (
 
 
 ANALYSIS_VERSION = "dawn_operator_analysis_v2"
-INTERVENTION_TYPE = "production_contribution_subtraction"
+INTERVENTION_TYPE = "production_core_execution_suppression"
 CAPTURE_THRESHOLD = 0.95
 DATASET_ITEM = {
     "ioi": "ioi_operator_circuit",
@@ -78,7 +78,7 @@ OPERATOR_ITEMS = {
 
 
 class CausalParityError(RuntimeError):
-    """Zero-subtraction changed production output; causal evidence is invalid."""
+    """Production-core suppression invariants failed; evidence is invalid."""
 
 
 def _safe_id(value: Any) -> str:
@@ -1061,16 +1061,24 @@ def _make_causal_compare_step(ctx: AnalysisContext):
     kwargs = _runtime_kwargs(ctx, sharded)
 
     @jax.jit
-    def compare(params, input_ids, labels, positions, layer, route, contribution):
-        common = {**kwargs, "attention_mask": jnp.ones_like(input_ids), "analysis_return_residual": True}
-        baseline = ctx.model.apply({"params": params}, input_ids, **common)
+    def compare(
+            params, input_ids, labels, positions, layer, route,
+            selected_operator_ids, apply_suppression):
+        common = {
+            key: value for key, value in kwargs.items()
+            if key not in {"minimal_train", "attention_mask"}}
+        baseline = ctx.model.apply(
+            {"params": params}, input_ids, selected_operator_ids, layer,
+            positions, route,
+            method=ctx.model.analysis_forward_with_operator_suppression,
+            apply_suppression=False, return_residual=True,
+            **common, attention_mask=jnp.ones_like(input_ids))
         changed = ctx.model.apply(
-            {"params": params}, input_ids, contribution, layer, positions, route,
-            method=ctx.model.analysis_forward_with_operator_subtraction,
-            intervention_enabled=True, return_residual=True,
-            **{key: value for key, value in kwargs.items()
-               if key not in {"minimal_train", "attention_mask"}},
-            attention_mask=jnp.ones_like(input_ids))
+            {"params": params}, input_ids, selected_operator_ids, layer,
+            positions, route,
+            method=ctx.model.analysis_forward_with_operator_suppression,
+            apply_suppression=apply_suppression, return_residual=True,
+            **common, attention_mask=jnp.ones_like(input_ids))
         base_logits = baseline["logits"][:, :-1].astype(jnp.float32)
         new_logits = changed["logits"][:, :-1].astype(jnp.float32)
         shifted_labels = labels[:, 1:]
@@ -1103,19 +1111,25 @@ def _make_causal_score_step(ctx: AnalysisContext):
     kwargs = _runtime_kwargs(ctx, ctx.sharded_fns)
 
     @jax.jit
-    def score(params, input_ids, labels, positions, layer, route, contribution):
+    def score(
+            params, input_ids, labels, positions, layer, route,
+            selected_operator_ids, apply_suppression):
+        common = {
+            key: value for key, value in kwargs.items()
+            if key not in {"minimal_train", "attention_mask"}}
         normal = ctx.model.apply(
-            {"params": params}, input_ids, labels=labels,
-            analysis_return_residual=True,
-            **{**kwargs, "attention_mask": jnp.ones_like(input_ids)})
+            {"params": params}, input_ids, selected_operator_ids, layer,
+            positions, route, labels=labels,
+            method=ctx.model.analysis_forward_with_operator_suppression,
+            apply_suppression=False, return_residual=True,
+            **common, attention_mask=jnp.ones_like(input_ids))
         changed = ctx.model.apply(
-            {"params": params}, input_ids, contribution, layer, positions, route,
+            {"params": params}, input_ids, selected_operator_ids, layer,
+            positions, route,
             labels=labels,
-            method=ctx.model.analysis_forward_with_operator_subtraction,
-            intervention_enabled=True, return_residual=True,
-            **{key: value for key, value in kwargs.items()
-               if key not in {"minimal_train", "attention_mask"}},
-            attention_mask=jnp.ones_like(input_ids))
+            method=ctx.model.analysis_forward_with_operator_suppression,
+            apply_suppression=apply_suppression, return_residual=True,
+            **common, attention_mask=jnp.ones_like(input_ids))
         valid = normal["valid_mask"].astype(jnp.float32)
         before = (-normal["per_token_ce"] * valid).sum(axis=-1)
         after = (-changed["per_token_ce"] * valid).sum(axis=-1)
@@ -1125,7 +1139,11 @@ def _make_causal_score_step(ctx: AnalysisContext):
         relative_change = jnp.linalg.norm(
             residual_after - residual_before, axis=-1) / jnp.maximum(
                 jnp.linalg.norm(residual_before, axis=-1), 1.0e-12)
-        return before, after, relative_change
+        return (
+            before, after, relative_change,
+            jnp.all(normal["per_token_ce"] == changed["per_token_ce"]),
+            jnp.all(normal["final_residual"] == changed["final_residual"]),
+        )
 
     return score
 
@@ -1141,10 +1159,10 @@ def _make_parity_step(ctx: AnalysisContext):
             **{**kwargs, "attention_mask": jnp.ones_like(input_ids)})
         hooked = ctx.model.apply(
             {"params": params}, input_ids,
-            jnp.zeros((input_ids.shape[0], int(ctx.model_cfg["d_model"])), jnp.float32),
+            jnp.zeros((input_ids.shape[0],), jnp.int32),
             jnp.int32(0), positions, jnp.int32(0), labels=labels,
-            method=ctx.model.analysis_forward_with_operator_subtraction,
-            intervention_enabled=True, return_residual=True,
+            method=ctx.model.analysis_forward_with_operator_suppression,
+            apply_suppression=False, return_residual=True,
             **{key: value for key, value in kwargs.items()
                if key not in {"minimal_train", "attention_mask"}},
             attention_mask=jnp.ones_like(input_ids))
@@ -1170,10 +1188,10 @@ def _make_dense_parity_step(ctx: AnalysisContext):
             **{**kwargs, "attention_mask": jnp.ones_like(input_ids)})
         hooked = ctx.model.apply(
             {"params": params}, input_ids,
-            jnp.zeros((input_ids.shape[0], int(ctx.model_cfg["d_model"])), jnp.float32),
+            jnp.zeros((input_ids.shape[0],), jnp.int32),
             jnp.int32(0), positions, jnp.int32(0),
-            method=ctx.model.analysis_forward_with_operator_subtraction,
-            intervention_enabled=True, return_residual=True,
+            method=ctx.model.analysis_forward_with_operator_suppression,
+            apply_suppression=False, return_residual=True,
             **{key: value for key, value in kwargs.items()
                if key not in {"minimal_train", "attention_mask"}},
             attention_mask=jnp.ones_like(input_ids))
@@ -1190,15 +1208,18 @@ def _make_dense_parity_step(ctx: AnalysisContext):
     return parity
 
 
-def _operator_vector(ctx: AnalysisContext, pool: str, operator_id: int, coefficient: float) -> Any:
-    module = analysis_model_module(ctx.model_cfg)
-    params = module._squeeze_params(ctx.params)
-    pool_params = module._pool_params_with_operator_keys(params["neuron_pool"])
-    write_key = {"q": "attn_qk_write", "k": "attn_qk_write", "v": "attn_v_write", "rst": "rst_write"}[pool]
-    write = pool_params[write_key][int(operator_id)]
-    direction = module._forward_unit_direction(
-        write.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-    return (jnp.float32(coefficient) * direction).astype(jnp.float32)
+def _validate_global_operator_id(
+        ctx: AnalysisContext, pool: str, operator_id: int) -> int:
+    count_key = {"q": "n_qk", "k": "n_qk", "v": "n_v", "rst": "n_rst"}[pool]
+    count = ctx.model_cfg.get(count_key)
+    if count is None and pool == "rst":
+        count = ctx.model_cfg.get("n_know")
+    count = int(count)
+    operator_id = int(operator_id)
+    if operator_id < 0 or operator_id >= count:
+        raise ValueError(
+            f"global operator id {operator_id} is outside {pool} pool [0, {count})")
+    return operator_id
 
 
 def _candidate_rows(
@@ -1224,14 +1245,18 @@ def _candidate_rows(
             "operator_id": int(ids[layer, index]), "candidate_valid": is_valid,
             "execution": float(execution[layer, index]),
             "admission": float(admission[layer, index]),
-            "coefficient": float(signed[layer, index]),
-            "abs_coefficient": float(absolute[layer, index]),
+            "sidecar_estimated_post_denominator_coefficient": float(
+                signed[layer, index]),
+            "sidecar_estimated_abs_post_denominator_coefficient": float(
+                absolute[layer, index]),
             "skip_reason": None if is_valid else f"no_{strategy}_candidate",
         })
     cross_row = {
         "strategy": "cross_function_control", "layer": contribution_layer,
         "operator_id": -1, "candidate_valid": False, "execution": 0.0,
-        "admission": 0.0, "coefficient": 0.0, "abs_coefficient": 0.0,
+        "admission": 0.0,
+        "sidecar_estimated_post_denominator_coefficient": 0.0,
+        "sidecar_estimated_abs_post_denominator_coefficient": 0.0,
         "skip_reason": "no_cross_group_enriched_operator",
     }
     if cross_operator_id is not None:
@@ -1246,8 +1271,10 @@ def _candidate_rows(
                 "operator_id": int(cross_operator_id), "candidate_valid": True,
                 "execution": float(np.asarray(trace[f"{pool}_top_val"])[layer, condition, rank]),
                 "admission": float(np.asarray(trace[f"{pool}_top_admission"])[layer, condition, rank]),
-                "coefficient": float(coefficients[layer, rank]),
-                "abs_coefficient": abs(float(coefficients[layer, rank])),
+                "sidecar_estimated_post_denominator_coefficient": float(
+                    coefficients[layer, rank]),
+                "sidecar_estimated_abs_post_denominator_coefficient": abs(
+                    float(coefficients[layer, rank])),
                 "skip_reason": None,
             }
         else:
@@ -1384,7 +1411,7 @@ def _run_causal(
             cached_parity = dict(cached["causal_parity"])
             if not cached_parity.get("machine_exact"):
                 raise CausalParityError(
-                    "cached production contribution zero-subtraction parity failed")
+                    "cached production-core zero-suppression parity failed")
             if parity_summary.get("status") != "ready":
                 parity_summary = cached_parity
             jobs.extend(dict(value) for value in cached["jobs"])
@@ -1419,13 +1446,15 @@ def _run_causal(
                     "top1_agreement": float(dense_parity[2]),
                     "final_residual_max_abs_diff": float(parity_values[2]),
                     "intervention_type": INTERVENTION_TYPE,
+                    "baseline_path": "production_core_suppression_disabled",
+                    "intervention_path": "production_core_suppression_enabled",
                     "logit_check_path": (
                         "production minimal SRW path with dense vocab projection; "
                         "CE/residual check retains production vocab sharding"),
                 }
                 if not parity_summary["machine_exact"]:
                     raise CausalParityError(
-                        "production contribution zero-subtraction parity failed")
+                        "production-core zero-suppression parity failed")
             for pool in TRACE_POOLS:
                 selected_ids = {
                     int(value) for value in np.asarray(
@@ -1450,39 +1479,62 @@ def _run_causal(
                         "behavior_correct": bool(behavior_by_example.get(
                             example_id, {}).get("correct")),
                         "intervention_type": INTERVENTION_TYPE,
+                        "candidate_selection_source": "sidecar_trace",
+                        "intervention_execution_source": "production_core",
                         "canonical_unpruned_admission_denominator": True,
                         **candidate,
                     }
                     if not candidate["candidate_valid"]:
                         jobs.append({**base, "status": "skipped"})
                         continue
-                    vector = _operator_vector(
-                        ctx, pool, candidate["operator_id"], candidate["coefficient"])
-                    def evaluate(spec: Mapping[str, Any], enabled: bool) -> Tuple[float, float, float, float, float]:
+                    operator_id = _validate_global_operator_id(
+                        ctx, pool, candidate["operator_id"])
+                    route_code = {"q": 0, "k": 1, "v": 2, "rst": 3}[pool]
+                    selected_operator_ids = jax.device_put(
+                        jnp.full((data_replicas,), operator_id, jnp.int32),
+                        ctx.data_sharding)
+                    def evaluate(
+                            spec: Mapping[str, Any], enabled: bool,
+                    ) -> Tuple[float, float, float, float, float, bool, bool]:
                         x = np.repeat(spec["input_ids"][None, :], data_replicas, axis=0)
                         y = np.repeat(spec["labels"][None, :], data_replicas, axis=0)
-                        contribution = vector if enabled else jnp.zeros_like(vector)
                         exact = jax.device_get(score_exact(
                             ctx.params, jax.device_put(jnp.asarray(x), ctx.data_sharding),
                             jax.device_put(jnp.asarray(y), ctx.data_sharding),
                             jax.device_put(jnp.full((data_replicas,), positions[condition_index], jnp.int32), ctx.data_sharding),
-                            jnp.int32(candidate["layer"]), jnp.int32({"q": 0, "k": 1, "v": 2, "rst": 3}[pool]),
-                            contribution))
+                            jnp.int32(candidate["layer"]), jnp.int32(route_code),
+                            selected_operator_ids, jnp.bool_(enabled)))
                         dense = jax.device_get(compare(
                             ctx.params, jax.device_put(jnp.asarray(x), ctx.data_sharding),
                             jax.device_put(jnp.asarray(y), ctx.data_sharding),
                             jax.device_put(jnp.full((data_replicas,), positions[condition_index], jnp.int32), ctx.data_sharding),
-                            jnp.int32(candidate["layer"]), jnp.int32({"q": 0, "k": 1, "v": 2, "rst": 3}[pool]),
-                            contribution))
+                            jnp.int32(candidate["layer"]), jnp.int32(route_code),
+                            selected_operator_ids, jnp.bool_(enabled)))
                         return (
                             float(np.asarray(exact[0])[0]),
                             float(np.asarray(exact[1])[0]),
                             float(np.asarray(dense[2])[0]),
                             float(np.asarray(dense[3])[0]),
                             float(np.asarray(exact[2])[0]),
+                            bool(np.asarray(exact[3])),
+                            bool(np.asarray(exact[4])),
                         )
-                    pos_before, pos_after, pos_kl, pos_top, pos_rel = evaluate(positive, apply_positive)
-                    neg_before, neg_after, neg_kl, neg_top, neg_rel = evaluate(negative, apply_negative)
+                    (pos_before, pos_after, pos_kl, pos_top, pos_rel,
+                     pos_ce_exact, pos_residual_exact) = evaluate(
+                        positive, apply_positive)
+                    (neg_before, neg_after, neg_kl, neg_top, neg_rel,
+                     neg_ce_exact, neg_residual_exact) = evaluate(
+                        negative, apply_negative)
+                    if (
+                        float(candidate["execution"]) == 0.0
+                        and (
+                            (apply_positive
+                             and not (pos_ce_exact and pos_residual_exact))
+                            or (apply_negative
+                                and not (neg_ce_exact and neg_residual_exact)))
+                    ):
+                        raise CausalParityError(
+                            "inactive operator suppression changed production output")
                     margin_before = pos_before - neg_before
                     margin_after = pos_after - neg_after
                     jobs.append({
@@ -1498,6 +1550,10 @@ def _run_causal(
                             "device_aggregated_dense_logits; task margin uses exact production vocab path"),
                         "top_prediction_change_fraction": float(np.mean([pos_top, neg_top])),
                         "target_residual_relative_change": float(np.mean([pos_rel, neg_rel])),
+                        "positive_machine_exact_noop": (
+                            pos_ce_exact and pos_residual_exact),
+                        "negative_machine_exact_noop": (
+                            neg_ce_exact and neg_residual_exact),
                     })
         if ctx.is_primary:
             write_json_atomic(job_path, {

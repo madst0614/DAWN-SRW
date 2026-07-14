@@ -407,6 +407,10 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
     make_paired = getattr(mod, "make_sharded_srw_paired", None)
     make_single_min = getattr(mod, "make_sharded_srw_minimal", None)
     make_paired_min = getattr(mod, "make_sharded_srw_paired_minimal", None)
+    make_single_suppression_min = getattr(
+        mod, "make_sharded_srw_suppression_minimal", None)
+    make_paired_suppression_min = getattr(
+        mod, "make_sharded_srw_paired_suppression_minimal", None)
     make_paired_dense_min = getattr(
         mod, "make_sharded_srw_paired_dense_minimal", None)
 
@@ -448,6 +452,19 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
             max_chunk_size=chunk["rst"],
             **factory_kwargs(make_single_min, srw_pool_kwargs("rst")),
         )
+        if make_single_suppression_min is not None:
+            fns["attn_v_single_suppression_minimal"] = (
+                make_single_suppression_min(
+                    max_chunk_size=chunk["attn_v"],
+                    **factory_kwargs(
+                        make_single_suppression_min, srw_pool_kwargs("v")),
+                ))
+            fns["rst_single_suppression_minimal"] = (
+                make_single_suppression_min(
+                    max_chunk_size=chunk["rst"],
+                    **factory_kwargs(
+                        make_single_suppression_min, srw_pool_kwargs("rst")),
+                ))
     paired_min_factory = make_paired_min
     if opspace_enabled and make_paired_dense_min is not None:
         paired_min_factory = make_paired_dense_min
@@ -456,6 +473,14 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
             max_chunk_size=chunk["attn_qk"],
             **factory_kwargs(paired_min_factory, srw_pool_kwargs("qk")),
         )
+        if make_paired_suppression_min is not None:
+            fns["attn_qk_paired_suppression_minimal"] = (
+                make_paired_suppression_min(
+                    max_chunk_size=chunk["attn_qk"],
+                    **factory_kwargs(
+                        make_paired_suppression_min,
+                        srw_pool_kwargs("qk")),
+                ))
     return fns
 
 

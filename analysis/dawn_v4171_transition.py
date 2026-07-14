@@ -23,7 +23,6 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
-    analysis_model_module,
     maybe_load_tokenizer,
 )
 from analysis.dawn_analysis_storage import (
@@ -1160,9 +1159,11 @@ def _intervention_candidates(
             "candidate_valid": candidate_valid,
             "candidate_execution": float(execution[layer, index]),
             "candidate_admission": float(admission[layer, index]),
-            "candidate_abs_coefficient": float(coefficient[layer, index]),
-            "candidate_coefficient": float(signed_coefficient[layer, index]),
-            "candidate_source": "exact_on_device_full_operator_pool",
+            "sidecar_estimated_abs_post_denominator_coefficient": float(
+                coefficient[layer, index]),
+            "sidecar_estimated_post_denominator_coefficient": float(
+                signed_coefficient[layer, index]),
+            "candidate_source": "sidecar_trace",
         }
         if not candidate_valid:
             row["status"] = (
@@ -1258,8 +1259,8 @@ def _production_logits_forward(ctx: AnalysisContext):
     return forward
 
 
-def _subtraction_logits_forward(ctx: AnalysisContext):
-    """Canonical production minimal forward plus the analysis-only hook."""
+def _suppression_logits_forward(ctx: AnalysisContext):
+    """Production-core analysis forward with suppression on or off."""
     sharded_fns = ctx.sharded_fns
     if isinstance(sharded_fns, dict):
         sharded_fns = {
@@ -1272,17 +1273,19 @@ def _subtraction_logits_forward(ctx: AnalysisContext):
     mcfg = ctx.model_cfg
 
     @jax.jit
-    def forward(params, input_ids, positions, layer, route, contribution):
+    def forward(
+            params, input_ids, positions, layer, route,
+            selected_operator_ids, apply_suppression):
         result = ctx.model.apply(
             {"params": params},
             input_ids,
-            contribution,
+            selected_operator_ids,
             layer,
             positions,
             route,
-            method=ctx.model.analysis_forward_with_operator_subtraction,
+            method=ctx.model.analysis_forward_with_operator_suppression,
             attention_mask=jnp.ones_like(input_ids),
-            intervention_enabled=True,
+            apply_suppression=apply_suppression,
             return_residual=True,
             deterministic=True,
             rngs={"dropout": jax.random.PRNGKey(0)},
@@ -1313,22 +1316,18 @@ def _subtraction_logits_forward(ctx: AnalysisContext):
     return forward
 
 
-def _operator_contribution_vector(
-    ctx: AnalysisContext, pool: str, operator_id: int, coefficient: float,
-):
-    model_module = analysis_model_module(ctx.model_cfg)
-    params = model_module._squeeze_params(ctx.params)
-    pool_params = model_module._pool_params_with_operator_keys(
-        params["neuron_pool"])
-    write_key = {
-        "q": "attn_qk_write", "k": "attn_qk_write",
-        "v": "attn_v_write", "rst": "rst_write",
-    }[pool]
-    write = pool_params[write_key][int(operator_id)]
-    direction = model_module._forward_unit_direction(
-        write.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-    return (jnp.asarray(coefficient, dtype=jnp.float32) * direction).astype(
-        jnp.float32)
+def _validate_global_operator_id(
+        ctx: AnalysisContext, pool: str, operator_id: int) -> int:
+    count_key = {"q": "n_qk", "k": "n_qk", "v": "n_v", "rst": "n_rst"}[pool]
+    count = ctx.model_cfg.get(count_key)
+    if count is None and pool == "rst":
+        count = ctx.model_cfg.get("n_know")
+    count = int(count)
+    operator_id = int(operator_id)
+    if operator_id < 0 or operator_id >= count:
+        raise ValueError(
+            f"global operator id {operator_id} is outside {pool} pool [0, {count})")
+    return operator_id
 
 
 def _intervention_forward_parity(
@@ -1337,10 +1336,9 @@ def _intervention_forward_parity(
     intervention_forward: Any,
     production_forward: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Fail loudly unless a zero subtraction is machine-exact production."""
+    """Fail loudly unless disabled suppression is machine-exact production."""
     if production_forward is None:
         production_forward = _production_logits_forward(ctx)
-    zeros = jnp.zeros((int(ctx.model_cfg["d_model"]),), dtype=jnp.float32)
     rows = []
     for record in records:
         prompt = record["prompt"]
@@ -1360,7 +1358,8 @@ def _intervention_forward_parity(
                 jnp.full((input_ids.shape[0],), target_position, jnp.int32),
                 jnp.int32(0),
                 jnp.int32(0),
-                zeros,
+                jnp.zeros((input_ids.shape[0],), dtype=jnp.int32),
+                jnp.bool_(False),
             ))
         hooked_logits = np.asarray(hooked_logits)
         production_logits = np.asarray(production_logits)
@@ -1388,13 +1387,13 @@ def _intervention_forward_parity(
             "logits_machine_exact": bool(np.array_equal(prod_slice, hooked_slice)),
             "final_residual_machine_exact": bool(np.array_equal(
                 production_residual, hooked_residual)),
-            "residual_reference": "production_vs_zero_contribution_hook",
+            "residual_reference": "production_vs_disabled_suppression_core",
         })
     summary = {
         "status": "ready",
         "blocking": True,
-        "intervention_type": "production_contribution_subtraction",
-        "purpose": "production normal forward vs zero contribution subtraction",
+        "intervention_type": "production_core_execution_suppression",
+        "purpose": "production normal forward vs production-core suppression disabled",
         "num_prompts": len(rows),
         "ce_abs_diff": max(float(row["ce_abs_diff"]) for row in rows),
         "mean_logit_abs_diff": float(np.mean([
@@ -1414,7 +1413,7 @@ def _intervention_forward_parity(
         write_json_atomic(ctx.store.path("intervention_forward_parity.json"), summary)
     if not summary["machine_exact"]:
         raise RuntimeError(
-            "production_contribution_subtraction zero-vector parity failed")
+            "production-core zero-suppression parity failed")
     return summary
 
 
@@ -1444,18 +1443,18 @@ def run_causal_intervention(
     ctx: AnalysisContext,
     records: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Subtract traced production contributions; never replace an SRW kernel."""
+    """Suppress selected execution numerators in the shared production core."""
     max_prompts = max(1, int(getattr(ctx.args, "causal_max_prompts", 6) or 6))
     primary = _select_causal_records(records, max_prompts)
     pool_codes = {"q": 0, "k": 1, "v": 2, "rst": 3}
     production_forward = _production_logits_forward(ctx)
-    subtraction_forward = _subtraction_logits_forward(ctx)
+    suppression_forward = _suppression_logits_forward(ctx)
     parity = _intervention_forward_parity(
-        ctx, primary, subtraction_forward,
+        ctx, primary, suppression_forward,
         production_forward=production_forward)
     if ctx.is_primary:
         print(
-            "CONTRIBUTION_SUBTRACTION_PARITY "
+            "PRODUCTION_CORE_ZERO_PARITY_OK "
             f"status={parity['status']} machine_exact={parity['machine_exact']}",
             flush=True,
         )
@@ -1472,7 +1471,10 @@ def run_causal_intervention(
         positions = jnp.full(
             (input_ids.shape[0],), target_position, dtype=jnp.int32)
         baseline_logits, baseline_residual = jax.device_get(
-            production_forward(ctx.params, input_ids))
+            suppression_forward(
+                ctx.params, input_ids, positions, jnp.int32(0), jnp.int32(0),
+                jnp.zeros((input_ids.shape[0],), jnp.int32),
+                jnp.bool_(False)))
         baseline_logits = np.asarray(baseline_logits)
         baseline_residual = np.asarray(baseline_residual)
         length = int(prompt["length"])
@@ -1486,20 +1488,23 @@ def run_causal_intervention(
                     "phenomenon": prompt["phenomenon"],
                     "pool": pool,
                     **candidate,
-                    "intervention_type": "production_contribution_subtraction",
+                    "intervention_type": "production_core_execution_suppression",
+                    "candidate_selection_source": "sidecar_trace",
+                    "intervention_execution_source": "production_core",
                     "canonical_unpruned_admission_denominator": True,
-                    "effect_reference": "canonical_production_forward",
+                    "effect_reference": "production_core_suppression_disabled",
                 }
                 if not candidate["candidate_valid"]:
                     result_rows.append(common)
                     continue
-                contribution = _operator_contribution_vector(
-                    ctx, pool, int(candidate["operator_id"]),
-                    float(candidate["candidate_coefficient"]))
-                logits, residual = jax.device_get(subtraction_forward(
+                operator_id = _validate_global_operator_id(
+                    ctx, pool, int(candidate["operator_id"]))
+                selected_operator_ids = jnp.full(
+                    (input_ids.shape[0],), operator_id, jnp.int32)
+                logits, residual = jax.device_get(suppression_forward(
                     ctx.params, input_ids, positions,
                     jnp.int32(candidate["layer"]), jnp.int32(pool_codes[pool]),
-                    contribution))
+                    selected_operator_ids, jnp.bool_(True)))
                 logits = np.asarray(logits)
                 residual = np.asarray(residual)
                 after_ce = _sequence_ce(logits, prompt["token_ids"], length)
@@ -1511,6 +1516,14 @@ def run_causal_intervention(
                 target_after = residual[0, target_position]
                 behavior_before = None if baseline_ce is None else -float(baseline_ce)
                 behavior_after = None if after_ce is None else -float(after_ce)
+                inactive_exact_noop = None
+                if float(candidate["candidate_execution"]) == 0.0:
+                    inactive_exact_noop = bool(
+                        np.array_equal(baseline_logits, logits)
+                        and np.array_equal(baseline_residual, residual))
+                    if not inactive_exact_noop:
+                        raise RuntimeError(
+                            "inactive operator suppression changed production output")
                 result_rows.append({
                     **common,
                     "status": "ready",
@@ -1532,10 +1545,11 @@ def run_causal_intervention(
                     "final_residual_relative_error": float(
                         np.linalg.norm(target_after - target_base)
                         / max(float(np.linalg.norm(target_base)), 1.0e-12)),
+                    "inactive_machine_exact_noop": inactive_exact_noop,
                 })
         if ctx.is_primary:
             print(
-                "CAUSAL_CONTRIBUTION_SUBTRACTION "
+                "CAUSAL_PRODUCTION_CORE_SUPPRESSION "
                 f"prompt={prompt_idx + 1:02d}/{len(primary):02d} "
                 f"id={prompt['prompt_id']}", flush=True)
 
@@ -1558,9 +1572,9 @@ def run_causal_intervention(
         and row.get("behavior_score_drop") is not None]
     summary = {
         "status": "ready" if valid_rows else "insufficient_evidence",
-        "intervention_type": "production_contribution_subtraction",
+        "intervention_type": "production_core_execution_suppression",
         "canonical_unpruned_admission_denominator": True,
-        "zero_subtraction_parity": parity,
+        "zero_suppression_parity": parity,
         "num_prompts": len(primary),
         "num_interventions": len(valid_rows),
         "num_skipped": len(result_rows) - len(valid_rows),
