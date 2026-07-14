@@ -1349,6 +1349,19 @@ def _max_abs_difference(left: np.ndarray, right: np.ndarray) -> float:
     return float(np.max(np.abs(left - right)))
 
 
+def _device_get_process_local_debug(tree):
+    def get_leaf(value):
+        if isinstance(value, jax.Array) and not value.is_fully_addressable:
+            shards = value.addressable_shards
+            if not shards:
+                raise RuntimeError(
+                    "parity debug array has no process-local addressable shards")
+            return np.asarray(jax.device_get(shards[0].data))
+        return np.asarray(jax.device_get(value))
+
+    return jax.tree.map(get_leaf, tree)
+
+
 def _parity_failure_diagnostics(
     ctx: AnalysisContext, input_ids, target_positions,
     production_logits: np.ndarray, suppression_logits: np.ndarray,
@@ -1366,10 +1379,13 @@ def _parity_failure_diagnostics(
             ctx, layer_index + 1, suppression_graph=False)
         suppression_forward = _parity_debug_prefix_forward(
             ctx, layer_index + 1, suppression_graph=True)
-        production_debug = jax.device_get(production_forward(
-            ctx.params, input_ids, target_positions, selected_operator_ids))
-        suppression_debug = jax.device_get(suppression_forward(
-            ctx.params, input_ids, target_positions, selected_operator_ids))
+        production_global = production_forward(
+            ctx.params, input_ids, target_positions, selected_operator_ids)
+        suppression_global = suppression_forward(
+            ctx.params, input_ids, target_positions, selected_operator_ids)
+        production_debug = _device_get_process_local_debug(production_global)
+        suppression_debug = _device_get_process_local_debug(
+            suppression_global)
         layers_executed = layer_index + 1
         if any(
                 not np.array_equal(
@@ -1656,19 +1672,27 @@ def _intervention_forward_parity(
             for row in rows),
         "rows": rows,
     }
-    if not summary["machine_exact"]:
-        summary.update(_parity_failure_diagnostics(
-            ctx,
-            first_failure["input_ids"],
-            first_failure["target_positions"],
-            first_failure["production_logits"],
-            first_failure["suppression_logits"],
-            first_failure["production_residual"],
-            first_failure["suppression_residual"],
-        ))
     if ctx.is_primary:
         write_json_atomic(ctx.store.path("intervention_forward_parity.json"), summary)
     if not summary["machine_exact"]:
+        try:
+            summary.update(_parity_failure_diagnostics(
+                ctx,
+                first_failure["input_ids"],
+                first_failure["target_positions"],
+                first_failure["production_logits"],
+                first_failure["suppression_logits"],
+                first_failure["production_residual"],
+                first_failure["suppression_residual"],
+            ))
+            summary["failure_diagnostics_status"] = "ready"
+        except Exception as exc:
+            summary["failure_diagnostics_status"] = "failed"
+            summary["failure_diagnostics_error"] = (
+                f"{type(exc).__name__}: {exc}")
+        if ctx.is_primary:
+            write_json_atomic(
+                ctx.store.path("intervention_forward_parity.json"), summary)
         raise RuntimeError(
             "production-core zero-suppression parity failed")
     return summary
