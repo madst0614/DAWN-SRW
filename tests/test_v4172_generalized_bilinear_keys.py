@@ -659,6 +659,45 @@ def test_v4172_route_specific_factory_metadata_and_suppression_pairing() -> None
             expected_power_v=1.0, expected_power_rst=1.2)
 
 
+def test_v4172_canonical_builder_routes_pool_denominator_powers() -> None:
+    from scripts import train_jax
+
+    cfg = {
+        "model": {
+            "model_version": V4172_MODEL_VERSION,
+            "d_route": 4,
+            "n_qk": 4,
+            "n_v": 4,
+            "n_rst": 4,
+            "admission_den_power": 1.0,
+            "admission_den_power_qk": 0.5,
+            "admission_den_power_v": 1.0,
+            "admission_den_power_rst": 1.2,
+        },
+        "training": {
+            "mesh_model": 1,
+            "max_chunk_size": 2,
+        },
+    }
+    sharded = train_jax.build_canonical_sharded_fns(
+        cfg, _one_device_mesh())
+    expected = {
+        "attn_qk_paired": 0.5,
+        "attn_qk_single_minimal": 0.5,
+        "attn_qk_paired_minimal": 0.5,
+        "attn_v_single": 1.0,
+        "attn_v_single_minimal": 1.0,
+        "rst_single": 1.2,
+        "rst_single_minimal": 1.2,
+    }
+    for name, power in expected.items():
+        assert getattr(
+            sharded[name], "_v4171_admission_den_power") == power
+    _validate_v4171_sharded_fns(
+        sharded, 1.0, expected_power_qk=0.5,
+        expected_power_v=1.0, expected_power_rst=1.2)
+
+
 def test_v4172_pool_powers_preserve_parameter_schema_and_default_forward() -> None:
     from scripts import train_jax
 
