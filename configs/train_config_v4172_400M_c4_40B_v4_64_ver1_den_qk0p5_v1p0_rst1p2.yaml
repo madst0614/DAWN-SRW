@@ -35,7 +35,7 @@ model:
   tau_init_min: -0.95
   tau_init_max: 0.95
   tau_init_target_qk_frac: 0.05
-  tau_init_target_v_frac: 0.10
+  tau_init_target_v_frac: 0.05
   tau_init_target_rst_frac: 0.01
 
 training:
