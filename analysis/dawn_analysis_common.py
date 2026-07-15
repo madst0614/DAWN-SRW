@@ -395,6 +395,9 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
 
     def srw_pool_kwargs(pool):
         kwargs = dict(base_kwargs_for_analysis)
+        if train._is_v417x_version(version):
+            kwargs["admission_den_power"] = float(
+                cfg["model"][f"admission_den_power_{pool}"])
         if version == v4168_version:
             m_cfg = cfg.get("model", {})
             kwargs.update({
@@ -612,6 +615,8 @@ def model_cfg_from_config(
         total_training_steps: Optional[int] = None) -> Dict[str, Any]:
     m = cfg.get("model", {})
     t = cfg.get("training", {})
+    legacy_den_power = float(m.get(
+        "admission_den_power", t.get("admission_den_power", 1.0)))
     model_cfg = {
         "model_version": m.get("model_version", V4166_MODEL_VERSION),
         "vocab_size": int(m.get("vocab_size", 30522)),
@@ -626,8 +631,13 @@ def model_cfg_from_config(
         "n_know": int(m.get("n_know", m.get("n_rst", 25200))),
         "soft_gate_temperature": float(t.get("soft_gate_t_final", 0.07)),
         "soft_gate_boundary_power": float(t.get("soft_gate_boundary_power_final", 4.0)),
-        "admission_den_power": float(m.get(
-            "admission_den_power", t.get("admission_den_power", 1.0))),
+        "admission_den_power": legacy_den_power,
+        "admission_den_power_qk": float(m.get(
+            "admission_den_power_qk", legacy_den_power)),
+        "admission_den_power_v": float(m.get(
+            "admission_den_power_v", legacy_den_power)),
+        "admission_den_power_rst": float(m.get(
+            "admission_den_power_rst", legacy_den_power)),
         "srw_composition_mode": str(m.get(
             "srw_composition_mode", "linear_angular")),
         "heat_kernel_beta": float(m.get("heat_kernel_beta", 2.0)),
@@ -656,6 +666,19 @@ def admission_den_power_from_config(cfg: Dict[str, Any]) -> float:
     training_cfg = cfg.get("training", {})
     return float(model_cfg.get(
         "admission_den_power", training_cfg.get("admission_den_power", 1.0)))
+
+
+def admission_den_powers_from_config(
+        cfg: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    """Return legacy, QK, V, and RST powers with legacy fallback."""
+    model_cfg = cfg.get("model", {})
+    legacy = admission_den_power_from_config(cfg)
+    return (
+        legacy,
+        float(model_cfg.get("admission_den_power_qk", legacy)),
+        float(model_cfg.get("admission_den_power_v", legacy)),
+        float(model_cfg.get("admission_den_power_rst", legacy)),
+    )
 
 
 def count_params(params: Any) -> int:

@@ -1802,7 +1802,9 @@ def run_operator_analysis(ctx: AnalysisContext, items: Sequence[str]) -> Dict[st
                 "soft_gate_temperature", "soft_gate_t_final",
                 "soft_gate_T_qk", "soft_gate_T_v", "soft_gate_T_rst",
                 "soft_gate_boundary_power", "soft_gate_boundary_power_final",
-                "admission_den_power", "srw_composition_mode",
+                "admission_den_power", "admission_den_power_qk",
+                "admission_den_power_v", "admission_den_power_rst",
+                "srw_composition_mode",
                 "heat_kernel_beta", "execution_prune_eps",
             )
         },

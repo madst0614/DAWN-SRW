@@ -70,7 +70,10 @@ def _srw_with_topk(state, operator_query, operator_keys, raw_tau,
     # This is an observational side-car.  Its coefficient estimates may rank
     # candidates, but causal execution must use the production-core kernel.
     kwargs = dict(execution_kwargs)
-    kwargs.pop("admission_den_power", None)
+    for key in (
+            "admission_den_power", "admission_den_power_qk",
+            "admission_den_power_v", "admission_den_power_rst"):
+        kwargs.pop(key, None)
     production_bfloat16 = (
         str(getattr(model_module, "MODEL_VERSION", ""))
         in ("spatial-r1-v4.1.7.1", "spatial-r1-v4.1.7.2"))
@@ -313,6 +316,12 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
     if execution_prune_eps is not None:
         execution_kwargs["execution_prune_eps"] = float(execution_prune_eps)
     admission_den_power = float(execution_kwargs.get("admission_den_power", 1.0))
+    admission_den_power_qk = float(execution_kwargs.get(
+        "admission_den_power_qk", admission_den_power))
+    admission_den_power_v = float(execution_kwargs.get(
+        "admission_den_power_v", admission_den_power))
+    admission_den_power_rst = float(execution_kwargs.get(
+        "admission_den_power_rst", admission_den_power))
 
     def execution_for(temperature_key: str) -> Dict[str, Any]:
         out = dict(execution_kwargs)
@@ -426,7 +435,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             model_module=model_module,
             topk=topk_qk,
             execution_kwargs=execution_qk,
-            admission_den_power=admission_den_power,
+            admission_den_power=admission_den_power_qk,
             target_positions=target_positions,
             candidate_seed=candidate_seed + layer_idx * 17,
         )
@@ -440,7 +449,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             model_module=model_module,
             topk=topk_qk,
             execution_kwargs=execution_qk,
-            admission_den_power=admission_den_power,
+            admission_den_power=admission_den_power_qk,
             target_positions=target_positions,
             candidate_seed=candidate_seed + layer_idx * 17 + 1,
         )
@@ -454,7 +463,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             model_module=model_module,
             topk=topk_v,
             execution_kwargs=execution_v,
-            admission_den_power=admission_den_power,
+            admission_den_power=admission_den_power_v,
             target_positions=target_positions,
             candidate_seed=candidate_seed + layer_idx * 17 + 2,
         )
@@ -561,7 +570,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
             model_module=model_module,
             topk=topk_rst,
             execution_kwargs=execution_rst,
-            admission_den_power=admission_den_power,
+            admission_den_power=admission_den_power_rst,
             target_positions=target_positions,
             candidate_seed=candidate_seed + layer_idx * 17 + 3,
         )

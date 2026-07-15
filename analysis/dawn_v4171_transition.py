@@ -688,6 +688,18 @@ def _analysis_provenance(
         "composition_mode": str(ctx.model_cfg.get("srw_composition_mode")),
         "admission_den_power": _json_float(
             ctx.model_cfg.get("admission_den_power")),
+        "admission_den_power_qk": _json_float(
+            ctx.model_cfg.get(
+                "admission_den_power_qk",
+                ctx.model_cfg.get("admission_den_power"))),
+        "admission_den_power_v": _json_float(
+            ctx.model_cfg.get(
+                "admission_den_power_v",
+                ctx.model_cfg.get("admission_den_power"))),
+        "admission_den_power_rst": _json_float(
+            ctx.model_cfg.get(
+                "admission_den_power_rst",
+                ctx.model_cfg.get("admission_den_power"))),
         "d_route": d_route,
         "operator_key_mode": operator_key_mode,
         "operator_key_probe_scope": (
@@ -723,7 +735,9 @@ def _resume_summary_matches(
         "model_version", "checkpoint_step", "checkpoint_path",
         "analysis_schema_version",
         "code_schema_hash", "analysis_config_hash", "prompt_hash", "composition_mode",
-        "admission_den_power", "d_route", "pool_sizes",
+        "admission_den_power", "admission_den_power_qk",
+        "admission_den_power_v", "admission_den_power_rst",
+        "d_route", "pool_sizes",
         "operator_key_mode", "operator_key_probe_scope",
         "operator_key_probe_parameter_count",
         "learned_operator_key_parameter_count",
@@ -1059,6 +1073,12 @@ def run_global_router_audit(ctx: AnalysisContext) -> Dict[str, Any]:
         "n_layers": int(mcfg.get("n_layers", 0)),
         "composition_mode": str(mcfg.get("srw_composition_mode", "linear_angular")),
         "admission_den_power": float(mcfg.get("admission_den_power", 1.0)),
+        "admission_den_power_qk": float(mcfg.get(
+            "admission_den_power_qk", mcfg.get("admission_den_power", 1.0))),
+        "admission_den_power_v": float(mcfg.get(
+            "admission_den_power_v", mcfg.get("admission_den_power", 1.0))),
+        "admission_den_power_rst": float(mcfg.get(
+            "admission_den_power_rst", mcfg.get("admission_den_power", 1.0))),
     }
     if ctx.is_primary:
         write_json_atomic(ctx.store.path("global_router_audit.json"), result)
@@ -2493,6 +2513,11 @@ def _rerouting_sparse_capture_forward(
         ctx.model_cfg)
     admission_den_power = float(execution_kwargs.get(
         "admission_den_power", ctx.model_cfg.get("admission_den_power", 1.0)))
+    admission_den_powers = {
+        pool: float(execution_kwargs.get(
+            f"admission_den_power_{pool}", admission_den_power))
+        for pool in ("qk", "v", "rst")
+    }
 
     def route_execution(temperature_key: str) -> Dict[str, Any]:
         out = dict(execution_kwargs)
@@ -2554,7 +2579,8 @@ def _rerouting_sparse_capture_forward(
                     model_module=model_module,
                     topk=route_topk[route],
                     execution_kwargs=execution[route],
-                    admission_den_power=admission_den_power,
+                    admission_den_power=admission_den_powers[
+                        "qk" if route in ("q", "k") else route],
                     target_positions=jnp.zeros((batch,), dtype=jnp.int32),
                     candidate_seed=0,
                 )

@@ -106,6 +106,7 @@ from models.dawn_srw_v4170 import (
 )
 from models.dawn_srw_v4171 import (
     DAWN_SRW_V4171,
+    DEFAULT_ADMISSION_DEN_POWER,
     DEFAULT_HEAT_KERNEL_BETA,
     DEFAULT_SRW_COMPOSITION_MODE,
     OPERATOR_KEY_MODE_GENERALIZED_BILINEAR,
@@ -114,6 +115,7 @@ from models.dawn_srw_v4171 import (
     _validate_v4171_admission_den_grad_scale,
     _validate_v4171_composition_settings,
     _validate_v4171_heat_kernel_beta,
+    _resolve_v417x_admission_den_powers,
     _validate_v4171_srw_composition_mode,
     _validate_v4171_sharded_fns,
     _pool_operator_keys as _v4171_pool_operator_keys,
@@ -1341,26 +1343,39 @@ def _validate_v4171_resume_compatibility(
             "parameter conversion, and operator-key fallback are "
             "disabled. "
             f"requested={requested_version}, checkpoint={checkpoint_version}")
-    requested_den_power = _v4171_checkpoint_den_power(
+    requested_den_powers = _v4171_checkpoint_den_powers(
         requested_model_cfg,
         missing_message=(
             f"{requested_version} requested full_config.model is missing "
             "admission_den_power"),
         context=f"{requested_version} requested full_config.model",
     )
-    checkpoint_den_power = _v4171_checkpoint_den_power(
+    checkpoint_den_powers = _v4171_checkpoint_den_powers(
         checkpoint_model_cfg,
         missing_message=(
             f"{requested_version} checkpoint full_config.model is missing "
             "admission_den_power"),
         context=f"{requested_version} checkpoint full_config.model",
     )
+    requested_den_power = requested_den_powers[0]
+    checkpoint_den_power = checkpoint_den_powers[0]
     if requested_den_power != checkpoint_den_power:
         raise RuntimeError(
             f"{requested_version} checkpoint model schema mismatch: "
             "model.admission_den_power "
             f"requested={requested_den_power}, checkpoint={checkpoint_den_power}. "
             "Automatic migration/fallback is disabled.")
+    for pool, requested_pool_power, checkpoint_pool_power in zip(
+            ('qk', 'v', 'rst'), requested_den_powers[1:],
+            checkpoint_den_powers[1:]):
+        if requested_pool_power != checkpoint_pool_power:
+            raise RuntimeError(
+                f"{requested_version} checkpoint model schema mismatch: "
+                f"model.admission_den_power_{pool} "
+                f"requested={requested_pool_power}, "
+                f"checkpoint={checkpoint_pool_power}. Automatic "
+                "resume-time denominator changes are disabled; use "
+                "params-only initialization to change pool powers.")
     requested_composition_mode = _validate_v4171_srw_composition_mode(
         requested_model_cfg.get(
             'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
@@ -1420,6 +1435,20 @@ def _v4171_checkpoint_den_power(model_cfg, *, missing_message, context):
         raise RuntimeError(str(exc)) from exc
 
 
+def _v4171_checkpoint_den_powers(model_cfg, *, missing_message, context):
+    legacy = _v4171_checkpoint_den_power(
+        model_cfg, missing_message=missing_message, context=context)
+    try:
+        return _resolve_v417x_admission_den_powers(
+            legacy,
+            model_cfg.get('admission_den_power_qk'),
+            model_cfg.get('admission_den_power_v'),
+            model_cfg.get('admission_den_power_rst'),
+            context=context)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 def _v4171_checkpoint_heat_kernel_beta(model_cfg, *, context):
     value = (
         model_cfg.get('heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA)
@@ -1433,6 +1462,13 @@ def _v4171_checkpoint_heat_kernel_beta(model_cfg, *, context):
 
 def _v4171_static_runtime_den_power(model, value, *, context,
                                     sharded_fns=None):
+    (model_value, model_qk_power, model_v_power, model_rst_power) = (
+        _resolve_v417x_admission_den_powers(
+            getattr(model, 'admission_den_power', None),
+            getattr(model, 'admission_den_power_qk', None),
+            getattr(model, 'admission_den_power_v', None),
+            getattr(model, 'admission_den_power_rst', None),
+            context="v4171 model constructor"))
     model_mode, model_value, model_beta = _validate_v4171_composition_settings(
         getattr(
             model, 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
@@ -1446,12 +1482,22 @@ def _v4171_static_runtime_den_power(model, value, *, context,
             f"{context} admission_den_power={runtime_value} does not match "
             f"v4171 model constructor admission_den_power={model_value}")
     _validate_v4171_sharded_fns(
-        sharded_fns, model_value, model_mode, model_beta)
+        sharded_fns, model_value, model_mode, model_beta,
+        expected_power_qk=model_qk_power,
+        expected_power_v=model_v_power,
+        expected_power_rst=model_rst_power)
     return runtime_value
 
 
 def _v4171_static_runtime_composition_mode(
         model, value=None, *, context, sharded_fns=None):
+    (model_power, model_qk_power, model_v_power, model_rst_power) = (
+        _resolve_v417x_admission_den_powers(
+            getattr(model, 'admission_den_power', None),
+            getattr(model, 'admission_den_power_qk', None),
+            getattr(model, 'admission_den_power_v', None),
+            getattr(model, 'admission_den_power_rst', None),
+            context="v4171 model constructor"))
     model_mode, model_power, model_beta = _validate_v4171_composition_settings(
         getattr(
             model, 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
@@ -1466,12 +1512,22 @@ def _v4171_static_runtime_composition_mode(
             "v4171 model constructor "
             f"srw_composition_mode={model_mode!r}")
     _validate_v4171_sharded_fns(
-        sharded_fns, model_power, model_mode, model_beta)
+        sharded_fns, model_power, model_mode, model_beta,
+        expected_power_qk=model_qk_power,
+        expected_power_v=model_v_power,
+        expected_power_rst=model_rst_power)
     return runtime_mode
 
 
 def _v4171_static_runtime_heat_kernel_beta(
         model, value=None, *, context, sharded_fns=None):
+    (model_power, model_qk_power, model_v_power, model_rst_power) = (
+        _resolve_v417x_admission_den_powers(
+            getattr(model, 'admission_den_power', None),
+            getattr(model, 'admission_den_power_qk', None),
+            getattr(model, 'admission_den_power_v', None),
+            getattr(model, 'admission_den_power_rst', None),
+            context="v4171 model constructor"))
     model_mode, model_power, model_beta = _validate_v4171_composition_settings(
         getattr(
             model, 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
@@ -1485,7 +1541,10 @@ def _v4171_static_runtime_heat_kernel_beta(
             f"{context} heat_kernel_beta={runtime_beta} does not match "
             f"v4171 model constructor heat_kernel_beta={model_beta}")
     _validate_v4171_sharded_fns(
-        sharded_fns, model_power, model_mode, model_beta)
+        sharded_fns, model_power, model_mode, model_beta,
+        expected_power_qk=model_qk_power,
+        expected_power_v=model_v_power,
+        expected_power_rst=model_rst_power)
     return runtime_beta
 
 
@@ -2702,7 +2761,14 @@ def _validate_v4171_model_config(model_cfg):
         raise ValueError(
             f"v417x config validator does not support model_version={version!r}")
     d_route = model_cfg.get('d_route')
-    den_power = model_cfg.get('admission_den_power')
+    (den_power, den_power_qk, den_power_v, den_power_rst) = (
+        _resolve_v417x_admission_den_powers(
+            model_cfg.get(
+                'admission_den_power', DEFAULT_ADMISSION_DEN_POWER),
+            model_cfg.get('admission_den_power_qk'),
+            model_cfg.get('admission_den_power_v'),
+            model_cfg.get('admission_den_power_rst'),
+            context=f"{version} model config"))
     if (not isinstance(d_route, int) or isinstance(d_route, bool)
             or d_route <= 0):
         raise ValueError(
@@ -2740,6 +2806,9 @@ def _validate_v4171_model_config(model_cfg):
     model_cfg['operator_key_mode'] = mode
     model_cfg['operator_query_mode'] = query_mode
     model_cfg['admission_den_power'] = den_power_value
+    model_cfg['admission_den_power_qk'] = den_power_qk
+    model_cfg['admission_den_power_v'] = den_power_v
+    model_cfg['admission_den_power_rst'] = den_power_rst
     model_cfg['srw_composition_mode'] = composition_mode
     model_cfg['heat_kernel_beta'] = heat_kernel_beta
 
@@ -2946,6 +3015,9 @@ def _dawn_srw_kwargs(cfg):
         kw.update({
             'operator_key_mode': m['operator_key_mode'],
             'admission_den_power': m['admission_den_power'],
+            'admission_den_power_qk': m['admission_den_power_qk'],
+            'admission_den_power_v': m['admission_den_power_v'],
+            'admission_den_power_rst': m['admission_den_power_rst'],
             'srw_composition_mode': m['srw_composition_mode'],
             'heat_kernel_beta': m.get(
                 'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
@@ -13885,13 +13957,17 @@ def _checkpoint_final_runtime(full_config, checkpoint_path):
                 'soft_gate_boundary_power_final': 4.0,
                 'soft_gate_effective_active_eps': 1.0e-6,
             })
-            runtime['admission_den_power'] = _v4171_checkpoint_den_power(
+            den_powers = _v4171_checkpoint_den_powers(
                 model,
                 missing_message=(
                     "v4171 checkpoint full_config.model is missing "
                     "admission_den_power"),
                 context="v4171 checkpoint full_config.model",
             )
+            (runtime['admission_den_power'],
+             runtime['admission_den_power_qk'],
+             runtime['admission_den_power_v'],
+             runtime['admission_den_power_rst']) = den_powers
             (runtime['srw_composition_mode'],
              runtime['admission_den_power'],
              runtime['heat_kernel_beta']) = (
@@ -13969,8 +14045,10 @@ def _materialize_transfer_checkpoint(source, run_folder, step,
             and jax.process_index() == 0):
         print("Source checkpoint runtime:", flush=True)
         print(
-            "  admission_den_power="
-            f"{runtime_state['admission_den_power']}", flush=True)
+            "  den_power["
+            f"qk={runtime_state['admission_den_power_qk']} "
+            f"v={runtime_state['admission_den_power_v']} "
+            f"rst={runtime_state['admission_den_power_rst']}]", flush=True)
         print(
             "  srw_composition_mode="
             f"{runtime_state['srw_composition_mode']}", flush=True)
@@ -16791,11 +16869,17 @@ def main():
                           "^admission_den_power")
                     print("  numerator=pruned_execution_weight")
                 print("  live_den_gradient=true")
-                print(f"  admission_den_power={admission_den_power:g}")
+                print(
+                    "  den_power["
+                    f"qk={cfg['model']['admission_den_power_qk']:g} "
+                    f"v={cfg['model']['admission_den_power_v']:g} "
+                    f"rst={cfg['model']['admission_den_power_rst']:g}]")
                 print(
                     "  heat_kernel_beta="
                     f"{cfg['model']['heat_kernel_beta']:g}")
-                print("  runtime_source=model")
+                print(
+                    "  runtime_source="
+                    "model.pool_specific_with_legacy_fallback")
             elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 _read_role_dim = int(cfg['model']['rw_role_read_dim'])
                 _write_role_dim = int(cfg['model']['rw_role_write_dim'])
@@ -16905,9 +16989,17 @@ def main():
                 print(f"  Gate: linear angular-depth from {_margin_label}")
                 print("  gate = clip((rho - tau) / max(1 - tau, 1e-4), 0, 1)")
                 print("  execution_prune_eps: training=0.0; eval zeros gates below eps")
-                print(
-                    "  denominator: max(sum(unpruned_admission), 1.0) "
-                    f"** {admission_den_power:g} with live gradient")
+                if is_v417x_cfg:
+                    print(
+                        "  denominator: max(sum(unpruned_admission), 1.0) "
+                        "** pool_den_power with live gradient; den_power["
+                        f"qk={cfg['model']['admission_den_power_qk']:g} "
+                        f"v={cfg['model']['admission_den_power_v']:g} "
+                        f"rst={cfg['model']['admission_den_power_rst']:g}]")
+                else:
+                    print(
+                        "  denominator: max(sum(unpruned_admission), 1.0) "
+                        f"** {admission_den_power:g} with live gradient")
                 print(f"[{_linear_family_label}] active definition: rho > tau "
                       "(pre-prune angular visibility)")
                 if is_v417x_cfg:
@@ -17738,6 +17830,9 @@ def main():
 
         def _srw_pool_kwargs(pool):
             kwargs = dict(_srw_base_kwargs)
+            if _is_v417x_version(model_version_cfg):
+                kwargs['admission_den_power'] = float(
+                    cfg['model'][f'admission_den_power_{pool}'])
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 kwargs.update(_opspace_pool_kwargs(pool))
             return kwargs
@@ -19029,6 +19124,11 @@ def main():
                     "with direct state-to-operation queries; "
                     "execution remains full rank-1 RW")
                 _composition_mode = cfg['model']['srw_composition_mode']
+                _den_power_summary = (
+                    "den_power["
+                    f"qk={cfg['model']['admission_den_power_qk']:g} "
+                    f"v={cfg['model']['admission_den_power_v']:g} "
+                    f"rst={cfg['model']['admission_den_power_rst']:g}]")
                 if _composition_mode == 'quadratic':
                     log_message(
                         "Composition: mode=quadratic; "
@@ -19036,9 +19136,11 @@ def main():
                         "admission_weight=amplitude^2; "
                         "total_weight=sum(unpruned_admission); "
                         "den=max(total_weight,1e-12)"
-                        f"^{admission_den_power:g}; "
+                        "^pool_den_power; "
+                        f"{_den_power_summary}; "
                         "numerator=pruned_execution_weight; "
-                        "live_den_gradient=true; runtime_source=model")
+                        "live_den_gradient=true; runtime_source="
+                        "model.pool_specific_with_legacy_fallback")
                 elif _composition_mode == 'heat_energy':
                     log_message(
                         "SRW composition: mode=heat_energy; "
@@ -19052,18 +19154,22 @@ def main():
                         "total_energy=sum(unpruned_energy_weight); "
                         "numerator=pruned_energy_weight; "
                         "denominator=max(total_energy,1e-12)"
-                        f"^{admission_den_power:g}; "
+                        "^pool_den_power; "
+                        f"{_den_power_summary}; "
                         "beta_to_zero_limit=quadratic; "
-                        "live_den_gradient=true; runtime_source=model")
+                        "live_den_gradient=true; runtime_source="
+                        "model.pool_specific_with_legacy_fallback")
                 else:
                     log_message(
                         "Composition: mode=linear_angular; "
                         "angular_amplitude=linear_cap_depth; "
                         "admission_weight=amplitude; "
                         "den=max(sum(unpruned_admission),1)"
-                        f"^{admission_den_power:g}; "
+                        "^pool_den_power; "
+                        f"{_den_power_summary}; "
                         "numerator=pruned_execution_weight; "
-                        "live_den_gradient=true; runtime_source=model")
+                        "live_den_gradient=true; runtime_source="
+                        "model.pool_specific_with_legacy_fallback")
             elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 log_message(
                     "RW-key operator path: live-gradient compressed RW "

@@ -87,11 +87,13 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
     angular_execution_kwargs = (
         model_module._angular_execution_kwargs_from_model_cfg(model_cfg))
 
-    def _srw_sup(x, h, op_key, tau_off, raw_scan_offset, w_read, w_write, mult):
+    def _srw_sup(
+            x, h, op_key, tau_off, raw_scan_offset, w_read, w_write,
+            mult, admission_den_pool):
         r_n = model_module._forward_unit_direction(w_read.astype(jnp.float32))
         w_n = model_module._forward_unit_direction(w_write.astype(jnp.float32))
         execution_kwargs, admission_den_power = model_module._split_admission_den_kwargs(
-            angular_execution_kwargs
+            angular_execution_kwargs, admission_den_pool
         )
         _, admission, _, execution_weight, _ = model_module._angular_execution(
             h, op_key, tau_off, raw_scan_offset, **execution_kwargs
@@ -166,6 +168,7 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
                 pp["attn_qk_read"],
                 pp["attn_qk_write"],
                 qk_mult,
+                "qk",
             )
             k = _srw_sup(
                 normed,
@@ -176,6 +179,7 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
                 pp["attn_qk_read"],
                 pp["attn_qk_write"],
                 qk_mult,
+                "qk",
             )
             v = _srw_sup(
                 normed,
@@ -186,6 +190,7 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
                 pp["attn_v_read"],
                 pp["attn_v_write"],
                 v_mult,
+                "v",
             )
             q = q * qk_scale_eff
             k = k * qk_scale_eff
@@ -221,6 +226,7 @@ def _build_dynamic_suppressed_forward(params, model_cfg):
                 pp["rst_read"],
                 pp["rst_write"],
                 rst_mult,
+                "rst",
             )
             x = x + rst * rst_scale_eff
 

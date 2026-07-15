@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import math
+import numbers
 from typing import Optional, Dict
 from functools import partial
 from jax.sharding import PartitionSpec as P
@@ -334,18 +335,36 @@ def _validate_v4171_admission_den_power(value, *, context="v4171"):
             "v4171 does not support a traced or scheduled denominator power")
     if isinstance(value, bool):
         raise ValueError(
-            "v4171 admission_den_power must be numeric, not bool")
-    try:
-        value = float(value)
-    except (TypeError, ValueError) as exc:
+            f"{context} admission_den_power must be numeric, not bool")
+    if not isinstance(value, numbers.Real):
         raise ValueError(
-            f"v4171 admission_den_power must be a finite non-negative "
-            f"scalar, got {value!r}") from exc
+            f"{context} admission_den_power must be a static numeric Python "
+            f"scalar, got {value!r}")
+    value = float(value)
     if not math.isfinite(value) or value < 0.0:
         raise ValueError(
-            "v4171 admission_den_power must be finite and >= 0.0, "
+            f"{context} admission_den_power must be finite and >= 0.0, "
             f"got {value}")
     return value
+
+
+def _resolve_v417x_admission_den_powers(
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        admission_den_power_qk=None,
+        admission_den_power_v=None,
+        admission_den_power_rst=None, *, context="v417x"):
+    """Resolve validated legacy fallback plus QK/V/RST static powers."""
+    legacy = _validate_v4171_admission_den_power(
+        admission_den_power, context=f"{context}.admission_den_power")
+    resolved = []
+    for pool, value in (
+            ("qk", admission_den_power_qk),
+            ("v", admission_den_power_v),
+            ("rst", admission_den_power_rst)):
+        resolved.append(_validate_v4171_admission_den_power(
+            legacy if value is None else value,
+            context=f"{context}.admission_den_power_{pool}"))
+    return legacy, *resolved
 
 
 def _validate_v4171_heat_kernel_beta(value, *, context="v4171"):
@@ -415,7 +434,9 @@ def _mark_v4171_srw_factory_output(
 def _validate_v4171_sharded_fns(
         sharded_fns, expected_power,
         expected_mode=DEFAULT_SRW_COMPOSITION_MODE,
-        expected_heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+        expected_heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA, *,
+        expected_power_qk=None, expected_power_v=None,
+        expected_power_rst=None):
     if sharded_fns is None:
         return
     if not isinstance(sharded_fns, dict):
@@ -424,19 +445,30 @@ def _validate_v4171_sharded_fns(
         _validate_v4171_composition_settings(
             expected_mode, expected_power, expected_heat_kernel_beta,
             context="v4171 model/sharded closure"))
-    checked = set()
-    for name in (
-            'single', 'attn_v_single', 'rst_single', 'paired',
-            'attn_qk_paired', 'attn_qk_single_minimal',
-            'attn_v_single_minimal', 'rst_single_minimal',
-            'attn_qk_paired_minimal',
-            'attn_v_single_suppression_minimal',
-            'rst_single_suppression_minimal',
-            'attn_qk_paired_suppression_minimal'):
+    _, qk_power, v_power, rst_power = (
+        _resolve_v417x_admission_den_powers(
+            expected_power, expected_power_qk, expected_power_v,
+            expected_power_rst, context="v4171 model/sharded closure"))
+    wrapper_pools = {
+        'single': ('v', v_power),
+        'attn_v_single': ('v', v_power),
+        'v_single': ('v', v_power),
+        'attn_v_single_minimal': ('v', v_power),
+        'attn_v_single_suppression_minimal': ('v', v_power),
+        'rst_single': ('rst', rst_power),
+        'rst_single_minimal': ('rst', rst_power),
+        'rst_single_suppression_minimal': ('rst', rst_power),
+        'paired': ('qk', qk_power),
+        'attn_qk_paired': ('qk', qk_power),
+        'qk_paired': ('qk', qk_power),
+        'attn_qk_single_minimal': ('qk', qk_power),
+        'attn_qk_paired_minimal': ('qk', qk_power),
+        'attn_qk_paired_suppression_minimal': ('qk', qk_power),
+    }
+    for name, (pool, route_power) in wrapper_pools.items():
         fn = sharded_fns.get(name)
-        if fn is None or id(fn) in checked:
+        if fn is None:
             continue
-        checked.add(id(fn))
         actual_mode = getattr(fn, '_v4171_srw_composition_mode', None)
         if actual_mode is None:
             raise ValueError(
@@ -454,10 +486,11 @@ def _validate_v4171_sharded_fns(
             raise ValueError(
                 f"v4171 sharded function {name!r} is missing canonical "
                 "admission_den_power metadata")
-        if float(actual) != float(expected_power):
+        if float(actual) != float(route_power):
             raise ValueError(
-                "v4171 closure/runtime admission_den_power mismatch: "
-                f"sharded_fns[{name!r}]={actual}, runtime={expected_power}")
+                "v4171 closure/runtime admission_den_power mismatch for "
+                f"{pool} pool: sharded_fns[{name!r}]={actual}, "
+                f"runtime={route_power}")
         actual_beta = getattr(fn, '_v4171_heat_kernel_beta', None)
         if actual_beta is None:
             raise ValueError(
@@ -4660,6 +4693,9 @@ class DAWN_SRW_V4171(nn.Module):
     d_route: int = DEFAULT_D_ROUTE
     operator_key_mode: str = OPERATOR_KEY_MODE_LEARNED
     admission_den_power: float = DEFAULT_ADMISSION_DEN_POWER
+    admission_den_power_qk: Optional[float] = None
+    admission_den_power_v: Optional[float] = None
+    admission_den_power_rst: Optional[float] = None
     srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE
     heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA
     n_qk: int = 1580
@@ -4700,9 +4736,15 @@ class DAWN_SRW_V4171(nn.Module):
     def setup(self):
         operator_key_mode = _validate_operator_key_mode(
             self.operator_key_mode, context="DAWN_SRW_V4171 constructor")
+        legacy_power, _, _, _ = _resolve_v417x_admission_den_powers(
+            self.admission_den_power,
+            self.admission_den_power_qk,
+            self.admission_den_power_v,
+            self.admission_den_power_rst,
+            context="DAWN_SRW_V4171 constructor")
         _validate_v4171_composition_settings(
             self.srw_composition_mode,
-            self.admission_den_power,
+            legacy_power,
             self.heat_kernel_beta,
             context="DAWN_SRW_V4171 constructor")
         if int(self.d_route) <= 0:
@@ -4773,11 +4815,19 @@ class DAWN_SRW_V4171(nn.Module):
         """
         operator_key_mode = _validate_operator_key_mode(
             self.operator_key_mode, context="DAWN_SRW_V4171 forward")
+        (model_admission_den_power, model_admission_den_power_qk,
+         model_admission_den_power_v, model_admission_den_power_rst) = (
+            _resolve_v417x_admission_den_powers(
+                self.admission_den_power,
+                self.admission_den_power_qk,
+                self.admission_den_power_v,
+                self.admission_den_power_rst,
+                context="DAWN_SRW_V4171 constructor"))
         (model_srw_composition_mode, model_admission_den_power,
          model_heat_kernel_beta) = (
             _validate_v4171_composition_settings(
                 self.srw_composition_mode,
-                self.admission_den_power,
+                model_admission_den_power,
                 self.heat_kernel_beta,
                 context="DAWN_SRW_V4171 constructor"))
         (runtime_srw_composition_mode, runtime_admission_den_power,
@@ -4807,8 +4857,14 @@ class DAWN_SRW_V4171(nn.Module):
                 f"runtime={runtime_heat_kernel_beta}")
         _validate_v4171_sharded_fns(
             sharded_fns, model_admission_den_power,
-            model_srw_composition_mode, model_heat_kernel_beta)
+            model_srw_composition_mode, model_heat_kernel_beta,
+            expected_power_qk=model_admission_den_power_qk,
+            expected_power_v=model_admission_den_power_v,
+            expected_power_rst=model_admission_den_power_rst)
         admission_den_power = model_admission_den_power
+        admission_den_power_qk = model_admission_den_power_qk
+        admission_den_power_v = model_admission_den_power_v
+        admission_den_power_rst = model_admission_den_power_rst
         heat_kernel_beta = model_heat_kernel_beta
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
@@ -5146,7 +5202,7 @@ class DAWN_SRW_V4171(nn.Module):
                         soft_gate_T_v=soft_gate_T_v,
                         soft_gate_boundary_power=soft_gate_boundary_power,
                         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-                        admission_den_power=admission_den_power,
+                        admission_den_power=admission_den_power_qk,
                         execution_prune_eps=execution_prune_eps,
                         analysis_selected_operator_id=analysis_contribution,
                         analysis_layer_index=layer_index,
@@ -5199,7 +5255,7 @@ class DAWN_SRW_V4171(nn.Module):
                         soft_gate_T_rst=soft_gate_T_rst,
                         soft_gate_boundary_power=soft_gate_boundary_power,
                         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-                        admission_den_power=admission_den_power,
+                        admission_den_power=admission_den_power_rst,
                         execution_prune_eps=execution_prune_eps,
                         analysis_selected_operator_id=analysis_contribution,
                         analysis_layer_index=layer_index,
@@ -5695,7 +5751,7 @@ class DAWN_SRW_V4171(nn.Module):
                     soft_gate_T_v=soft_gate_T_v,
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-                    admission_den_power=admission_den_power,
+                    admission_den_power=admission_den_power_qk,
                     execution_prune_eps=execution_prune_eps)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
@@ -5762,7 +5818,7 @@ class DAWN_SRW_V4171(nn.Module):
                     soft_gate_T_rst=soft_gate_T_rst,
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-                    admission_den_power=admission_den_power,
+                    admission_den_power=admission_den_power_rst,
                     execution_prune_eps=execution_prune_eps)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_op_key_n, k_read_n, k_write_n, k_out_norm,
@@ -6726,6 +6782,13 @@ class DAWN_SRW_V4171(nn.Module):
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
         logical_vocab_size, embedding_vocab_size = self._vocab_sizes()
+        (legacy_power, qk_power, v_power, rst_power) = (
+            _resolve_v417x_admission_den_powers(
+                self.admission_den_power,
+                self.admission_den_power_qk,
+                self.admission_den_power_v,
+                self.admission_den_power_rst,
+                context="DAWN_SRW_V4171 config serialization"))
         cfg = {
             'model_version': self.__version__,
             'vocab_size': self.vocab_size, 'd_model': self.d_model,
@@ -6736,7 +6799,10 @@ class DAWN_SRW_V4171(nn.Module):
             'd_route': self.d_route,
             'operator_key_mode': self.operator_key_mode,
             'operator_query_mode': OPERATOR_QUERY_MODE,
-            'admission_den_power': self.admission_den_power,
+            'admission_den_power': legacy_power,
+            'admission_den_power_qk': qk_power,
+            'admission_den_power_v': v_power,
+            'admission_den_power_rst': rst_power,
             'srw_composition_mode': self.srw_composition_mode,
             'heat_kernel_beta': self.heat_kernel_beta,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
@@ -6750,6 +6816,13 @@ class DAWN_SRW_V4171(nn.Module):
         logical_vocab_size, embedding_vocab_size = self._vocab_sizes()
         qk_scale, v_scale, rst_scale = _pool_output_scales(
             self.d_model, self.n_layers)
+        (admission_den_power, qk_den_power, v_den_power,
+         rst_den_power) = _resolve_v417x_admission_den_powers(
+            self.admission_den_power,
+            self.admission_den_power_qk,
+            self.admission_den_power_v,
+            self.admission_den_power_rst,
+            context="DAWN_SRW_V4171 model info")
         mode, admission_den_power, heat_kernel_beta = (
             _validate_v4171_composition_settings(
             self.srw_composition_mode,
@@ -6815,7 +6888,9 @@ class DAWN_SRW_V4171(nn.Module):
             "  full rank-1 read/write operator",
             "Composition:",
             *composition_info,
-            f"  admission_den_power={admission_den_power:g}",
+            ("  den_power["
+             f"qk={qk_den_power:g} v={v_den_power:g} "
+             f"rst={rst_den_power:g}]"),
             f"  heat_kernel_beta={heat_kernel_beta:g}",
             "  runtime_source=model",
             "  Pool scales: fixed depth-scaled "
@@ -6858,16 +6933,21 @@ def _slice_logits_to_logical_vocab(logits, model_cfg):
 
 def _angular_execution_kwargs_from_model_cfg(model_cfg):
     """Extract v4171 canonical execution settings for inference."""
-    if 'admission_den_power' not in model_cfg:
-        raise ValueError(
-            "v4171 checkpoint full_config.model is missing "
-            "admission_den_power")
+    (admission_den_power, admission_den_power_qk,
+     admission_den_power_v, admission_den_power_rst) = (
+        _resolve_v417x_admission_den_powers(
+            model_cfg.get(
+                'admission_den_power', DEFAULT_ADMISSION_DEN_POWER),
+            model_cfg.get('admission_den_power_qk'),
+            model_cfg.get('admission_den_power_v'),
+            model_cfg.get('admission_den_power_rst'),
+            context="v417x inference model config"))
     (srw_composition_mode, admission_den_power,
      heat_kernel_beta) = (
         _validate_v4171_composition_settings(
             model_cfg.get(
                 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
-            model_cfg['admission_den_power'],
+            admission_den_power,
             model_cfg.get('heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
             context="v4171 inference model config"))
     return {
@@ -6876,6 +6956,9 @@ def _angular_execution_kwargs_from_model_cfg(model_cfg):
         'soft_gate_boundary_power': float(
             model_cfg.get('soft_gate_boundary_power', 4.0)),
         'admission_den_power': admission_den_power,
+        'admission_den_power_qk': admission_den_power_qk,
+        'admission_den_power_v': admission_den_power_v,
+        'admission_den_power_rst': admission_den_power_rst,
         'srw_composition_mode': srw_composition_mode,
         'heat_kernel_beta': heat_kernel_beta,
         'execution_prune_eps': float(model_cfg.get('execution_prune_eps', 0.0)),
@@ -7054,16 +7137,28 @@ def _angular_execution_weight(operator_query, operator_keys, raw_tau, raw_scan_o
     return execution_weight.astype(jnp.float32)
 
 
-def _split_admission_den_kwargs(angular_execution_kwargs):
+def _split_admission_den_kwargs(
+        angular_execution_kwargs, admission_den_pool=None):
     execution_kwargs = dict(angular_execution_kwargs)
+    legacy_power = execution_kwargs.pop(
+        'admission_den_power', DEFAULT_ADMISSION_DEN_POWER)
+    pool_powers = {
+        pool: execution_kwargs.pop(f'admission_den_power_{pool}', legacy_power)
+        for pool in ('qk', 'v', 'rst')
+    }
+    if admission_den_pool is not None and admission_den_pool not in pool_powers:
+        raise ValueError(
+            f"unsupported admission denominator pool {admission_den_pool!r}")
     admission_den_power = jnp.float32(
-        execution_kwargs.pop('admission_den_power'))
+        legacy_power if admission_den_pool is None
+        else pool_powers[admission_den_pool])
     return execution_kwargs, admission_den_power
 
 
 def _srw_inference(
         state, operator_query, operator_keys, raw_tau, raw_scan_offset,
-        read_vectors, write_vectors, **angular_execution_kwargs):
+        read_vectors, write_vectors, admission_den_pool=None,
+        **angular_execution_kwargs):
     """Non-chunked SRW for inference."""
     # Selection uses d_route operator keys; execution uses d_model RW dirs.
     read_directions = _forward_unit_direction(
@@ -7071,7 +7166,7 @@ def _srw_inference(
     write_directions = _forward_unit_direction(
         write_vectors.astype(jnp.float32))
     execution_kwargs, admission_den_power = _split_admission_den_kwargs(
-        angular_execution_kwargs)
+        angular_execution_kwargs, admission_den_pool)
     _, admission, _, execution_weight, _ = _angular_execution(
         operator_query, operator_keys, raw_tau, raw_scan_offset, **execution_kwargs)
 
@@ -7088,7 +7183,8 @@ def _srw_inference(
 
 def _srw_inference_with_gates(
         state, operator_query, operator_keys, raw_tau, raw_scan_offset,
-        read_vectors, write_vectors, **angular_execution_kwargs):
+        read_vectors, write_vectors, admission_den_pool=None,
+        **angular_execution_kwargs):
     """Like _srw_inference but also returns gate and normalized gate."""
     # Selection uses d_route operator keys; execution uses d_model RW dirs.
     read_directions = _forward_unit_direction(
@@ -7096,7 +7192,7 @@ def _srw_inference_with_gates(
     write_directions = _forward_unit_direction(
         write_vectors.astype(jnp.float32))
     execution_kwargs, admission_den_power = _split_admission_den_kwargs(
-        angular_execution_kwargs)
+        angular_execution_kwargs, admission_den_pool)
     _, admission, _, execution_weight, _ = _angular_execution(
         operator_query, operator_keys, raw_tau, raw_scan_offset, **execution_kwargs)
     composition_den = _composition_den(
@@ -7135,12 +7231,15 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
     attention_q = _srw_inference(x, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                        pool_params['attn_qk_read'], pool_params['attn_qk_write'],
+                       admission_den_pool='qk',
                        **angular_execution_kwargs)
     attention_k_new = _srw_inference(x, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                            pool_params['attn_qk_read'], pool_params['attn_qk_write'],
+                           admission_den_pool='qk',
                            **angular_execution_kwargs)
     attention_v_new = _srw_inference(x, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                            pool_params['attn_v_read'], pool_params['attn_v_write'],
+                           admission_den_pool='v',
                            **angular_execution_kwargs)
     _qk_s, _v_s, _ = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
@@ -7181,6 +7280,7 @@ def _rst_forward_inference(x, pool_params, router_params,
     raw_scan_offset = jnp.zeros_like(tau)
     out = _srw_inference(x, operator_query, rst_operator_keys, tau, raw_scan_offset,
                          pool_params['rst_read'], pool_params['rst_write'],
+                         admission_den_pool='rst',
                          **angular_execution_kwargs)
     if d_model is None or n_layers is None:
         raise ValueError(
@@ -7235,12 +7335,15 @@ def prefill(params, model_cfg, input_ids):
 
         attention_q = _srw_inference(normed, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                            pool_params['attn_qk_read'], pool_params['attn_qk_write'],
+                           admission_den_pool='qk',
                            **angular_execution_kwargs)
         attention_k = _srw_inference(normed, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                                      pool_params['attn_qk_read'], pool_params['attn_qk_write'],
+                                     admission_den_pool='qk',
                                      **angular_execution_kwargs)
         attention_v = _srw_inference(normed, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                                      pool_params['attn_v_read'], pool_params['attn_v_write'],
+                                     admission_den_pool='v',
                                      **angular_execution_kwargs)
         _qk_s = qk_scale_eff
         _v_s = v_scale_eff
@@ -7393,12 +7496,15 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
 
             attention_q = _srw_inference(normed, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'],
+                               admission_den_pool='qk',
                                **angular_execution_kwargs)
             attention_k = _srw_inference(normed, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'],
+                               admission_den_pool='qk',
                                **angular_execution_kwargs)
             attention_v = _srw_inference(normed, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                                pool_params['attn_v_read'], pool_params['attn_v_write'],
+                               admission_den_pool='v',
                                **angular_execution_kwargs)
             _qk_s = qk_scale_eff
             _v_s = v_scale_eff
@@ -7433,6 +7539,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             raw_scan_offset_k = jnp.zeros_like(tau_k)
             rst_out = _srw_inference(normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k,
                                      pool_params['rst_read'], pool_params['rst_write'],
+                                     admission_den_pool='rst',
                                      **angular_execution_kwargs)
             x = x + rst_out * rst_scale_eff
             return x, None
@@ -7595,14 +7702,17 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         attention_q, gate_Q_raw, gate_Q = _srw_inference_with_gates(
             normed, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
             pool_params['attn_qk_read'], pool_params['attn_qk_write'],
+            admission_den_pool='qk',
             **angular_execution_kwargs)
         attention_k, gate_K_raw, gate_K = _srw_inference_with_gates(
             normed, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
             pool_params['attn_qk_read'], pool_params['attn_qk_write'],
+            admission_den_pool='qk',
             **angular_execution_kwargs)
         attention_v, gate_V_raw, gate_V = _srw_inference_with_gates(
             normed, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
             pool_params['attn_v_read'], pool_params['attn_v_write'],
+            admission_den_pool='v',
             **angular_execution_kwargs)
         _qk_s = qk_scale_eff
         _v_s = v_scale_eff
@@ -7638,6 +7748,7 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         rst_out, gate_RST_raw, gate_RST = _srw_inference_with_gates(
             normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k,
             pool_params['rst_read'], pool_params['rst_write'],
+            admission_den_pool='rst',
             **angular_execution_kwargs)
         rst_out = rst_out * rst_scale_eff
         rst_out_norm = jnp.linalg.norm(rst_out, axis=-1).mean()
@@ -7694,7 +7805,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
 
     def _srw_sup(
             state, operator_query, operator_keys, tau_off, raw_scan_offset,
-            read_vectors, write_vectors, mult):
+            read_vectors, write_vectors, mult, admission_den_pool):
         """SRW with optional gate suppression."""
         # Suppressed forward selects by d_route keys and executes d_model RW.
         read_directions = _forward_unit_direction(
@@ -7702,7 +7813,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         write_directions = _forward_unit_direction(
             write_vectors.astype(jnp.float32))
         execution_kwargs, admission_den_power = _split_admission_den_kwargs(
-            angular_execution_kwargs)
+            angular_execution_kwargs, admission_den_pool)
         _, admission, _, execution_weight, _ = _angular_execution(
             operator_query, operator_keys, tau_off, raw_scan_offset, **execution_kwargs)
         if mult is not None:
@@ -7743,9 +7854,9 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             tau_all = normed @ rp['raw_tau_attn']['kernel'] + rp['raw_tau_attn']['bias']
             raw_scan_offset_all = jnp.zeros_like(tau_all)
 
-            attention_q = _srw_sup(normed, q_operator_query, qk_operator_keys, tau_all[:,:,0:1], raw_scan_offset_all[:,:,0:1], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult)
-            attention_k = _srw_sup(normed, k_operator_query, qk_operator_keys, tau_all[:,:,1:2], raw_scan_offset_all[:,:,1:2], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult)
-            attention_v = _srw_sup(normed, v_operator_query, v_operator_keys, tau_all[:,:,2:3], raw_scan_offset_all[:,:,2:3], pp['attn_v_read'], pp['attn_v_write'], v_mult)
+            attention_q = _srw_sup(normed, q_operator_query, qk_operator_keys, tau_all[:,:,0:1], raw_scan_offset_all[:,:,0:1], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult, 'qk')
+            attention_k = _srw_sup(normed, k_operator_query, qk_operator_keys, tau_all[:,:,1:2], raw_scan_offset_all[:,:,1:2], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult, 'qk')
+            attention_v = _srw_sup(normed, v_operator_query, v_operator_keys, tau_all[:,:,2:3], raw_scan_offset_all[:,:,2:3], pp['attn_v_read'], pp['attn_v_write'], v_mult, 'v')
             _qk_s = qk_scale_eff
             _v_s = v_scale_eff
             attention_q = attention_q * _qk_s
@@ -7774,7 +7885,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             rst_operator_query = normed @ rp['proj_rst']['kernel'] + rp['proj_rst']['bias']
             tau_k = normed @ rp['raw_tau_rst']['kernel'] + rp['raw_tau_rst']['bias']
             raw_scan_offset_k = jnp.zeros_like(tau_k)
-            x = x + _srw_sup(normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k, pp['rst_read'], pp['rst_write'], rst_mult) * rst_scale_eff
+            x = x + _srw_sup(normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k, pp['rst_read'], pp['rst_write'], rst_mult, 'rst') * rst_scale_eff
 
         norm_p = params['norm']
         x = _layer_norm(x, norm_p['scale'], norm_p['bias'])

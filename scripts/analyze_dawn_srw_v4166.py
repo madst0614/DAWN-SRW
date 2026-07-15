@@ -1454,8 +1454,16 @@ def _run_active_dynamics(
             "effective_ops_mean": mean_key(f"{prefix}_gate_eff_n"),
             "effective_ops_ratio": mean_key(f"{prefix}_gate_eff_ratio"),
         }
+    model_cfg = ctx.config.get("model", {})
+    legacy_den_power = float(model_cfg.get("admission_den_power", 1.0))
     composition = {
         "admission_den_power": mean_key("admission_den_power"),
+        "admission_den_power_qk": float(model_cfg.get(
+            "admission_den_power_qk", legacy_den_power)),
+        "admission_den_power_v": float(model_cfg.get(
+            "admission_den_power_v", legacy_den_power)),
+        "admission_den_power_rst": float(model_cfg.get(
+            "admission_den_power_rst", legacy_den_power)),
         "pools": {
             pool: {
                 metric: mean_key(f"{prefix}_{metric}")

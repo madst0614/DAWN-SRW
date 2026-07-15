@@ -735,7 +735,10 @@ def _item_lines_composition_health(
     out = [
         "  COMPOSITION_HEALTH:",
         f"  model_version={model_version or 'unknown'} "
-        f"admission_den_power={fmt.num(composition.get('admission_den_power'), 3)}",
+        "den_power["
+        f"qk={fmt.num(composition.get('admission_den_power_qk', composition.get('admission_den_power')), 3)} "
+        f"v={fmt.num(composition.get('admission_den_power_v', composition.get('admission_den_power')), 3)} "
+        f"rst={fmt.num(composition.get('admission_den_power_rst', composition.get('admission_den_power')), 3)}]",
     ]
     if not composition.get("available"):
         out.append("  not available for this model/checkpoint metric schema")
@@ -979,7 +982,11 @@ def _item_lines_global_router_audit(summary: Dict[str, Any], _fmt: TrainAnalysis
         f"  operator_rw_shared        : {data.get('operator_rw_shared', 'n/a')}",
         f"  pool_sizes                : qk={pools.get('qk')} v={pools.get('v')} rst={pools.get('rst')}",
         f"  geometry                  : d_route={data.get('d_route')} d_model={data.get('d_model')} layers={data.get('n_layers')}",
-        f"  composition               : mode={data.get('composition_mode')} den_power={data.get('admission_den_power')}",
+        "  composition               : "
+        f"mode={data.get('composition_mode')} den_power["
+        f"qk={data.get('admission_den_power_qk', data.get('admission_den_power'))} "
+        f"v={data.get('admission_den_power_v', data.get('admission_den_power'))} "
+        f"rst={data.get('admission_den_power_rst', data.get('admission_den_power'))}]",
     ]
 
 

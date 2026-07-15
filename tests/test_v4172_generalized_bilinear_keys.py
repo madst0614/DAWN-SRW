@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import yaml
-from jax.sharding import Mesh
+from jax.sharding import Mesh, PartitionSpec
 
 from analysis.dawn_v4171_transition import (
     V4172_MODEL_VERSION,
@@ -19,9 +19,15 @@ from models.dawn_srw_v4171 import (
     DAWN_SRW_V4171,
     OPERATOR_KEY_MODE_GENERALIZED_BILINEAR,
     OPERATOR_KEY_MODE_LEARNED,
+    _composition_den,
     _pool_operator_keys,
+    _resolve_v417x_admission_den_powers,
+    _split_admission_den_kwargs,
     _srw_inference,
+    _validate_v4171_sharded_fns,
+    make_sharded_srw,
     make_sharded_srw_minimal,
+    make_sharded_srw_paired,
     make_sharded_srw_paired_minimal,
     make_sharded_srw_paired_suppression_minimal,
     make_sharded_srw_suppression_minimal,
@@ -50,21 +56,44 @@ def _tiny_kwargs(n_layers: int = 1) -> dict:
     }
 
 
-def _runtime_fns(mesh: Mesh) -> dict:
-    single = make_sharded_srw_minimal(mesh, max_chunk_size=2)
-    paired = make_sharded_srw_paired_minimal(mesh, max_chunk_size=2)
-    single_suppression = make_sharded_srw_suppression_minimal(
-        mesh, max_chunk_size=2)
+def _runtime_fns(
+        mesh: Mesh, *, qk_power: float = 1.0, v_power: float = 1.0,
+        rst_power: float = 1.0, analysis: bool = False) -> dict:
+    single_v_full = make_sharded_srw(
+        mesh, max_chunk_size=2, analysis=analysis,
+        admission_den_power=v_power)
+    single_rst_full = make_sharded_srw(
+        mesh, max_chunk_size=2, analysis=analysis,
+        admission_den_power=rst_power)
+    paired_full = make_sharded_srw_paired(
+        mesh, max_chunk_size=2, analysis=analysis,
+        admission_den_power=qk_power)
+    single_qk = make_sharded_srw_minimal(
+        mesh, max_chunk_size=2, admission_den_power=qk_power)
+    single_v = make_sharded_srw_minimal(
+        mesh, max_chunk_size=2, admission_den_power=v_power)
+    single_rst = make_sharded_srw_minimal(
+        mesh, max_chunk_size=2, admission_den_power=rst_power)
+    paired = make_sharded_srw_paired_minimal(
+        mesh, max_chunk_size=2, admission_den_power=qk_power)
+    single_v_suppression = make_sharded_srw_suppression_minimal(
+        mesh, max_chunk_size=2, admission_den_power=v_power)
+    single_rst_suppression = make_sharded_srw_suppression_minimal(
+        mesh, max_chunk_size=2, admission_den_power=rst_power)
     paired_suppression = make_sharded_srw_paired_suppression_minimal(
-        mesh, max_chunk_size=2)
+        mesh, max_chunk_size=2, admission_den_power=qk_power)
     return {
-        "single": single,
-        "paired": paired,
-        "attn_v_single_minimal": single,
-        "rst_single_minimal": single,
+        "single": single_v_full,
+        "attn_v_single": single_v_full,
+        "rst_single": single_rst_full,
+        "paired": paired_full,
+        "attn_qk_paired": paired_full,
+        "attn_qk_single_minimal": single_qk,
+        "attn_v_single_minimal": single_v,
+        "rst_single_minimal": single_rst,
         "attn_qk_paired_minimal": paired,
-        "attn_v_single_suppression_minimal": single_suppression,
-        "rst_single_suppression_minimal": single_suppression,
+        "attn_v_single_suppression_minimal": single_v_suppression,
+        "rst_single_suppression_minimal": single_rst_suppression,
         "attn_qk_paired_suppression_minimal": paired_suppression,
     }
 
@@ -515,9 +544,237 @@ def test_v4172_probe_sharding_is_replicated_and_rw_axis_is_model_sharded() -> No
     shardings = train_jax.get_param_shardings(
         params, mesh, V4172_MODEL_VERSION)
     pool = shardings["neuron_pool"]
-    assert str(pool["rw_key_read_probe"].spec) == "PartitionSpec()"
-    assert str(pool["rw_key_write_probe"].spec) == "PartitionSpec()"
-    assert str(pool["attn_qk_read"].spec) == (
-        "PartitionSpec('model', None)")
-    assert str(pool["attn_qk_write"].spec) == (
-        "PartitionSpec('model', None)")
+    assert pool["rw_key_read_probe"].spec == PartitionSpec()
+    assert pool["rw_key_write_probe"].spec == PartitionSpec()
+    assert pool["attn_qk_read"].spec == PartitionSpec("model", None)
+    assert pool["attn_qk_write"].spec == PartitionSpec("model", None)
+
+
+def test_v4172_pool_den_power_fallback_and_validation() -> None:
+    from scripts import train_jax
+
+    base = {
+        "model_version": V4172_MODEL_VERSION,
+        "operator_key_mode": OPERATOR_KEY_MODE_GENERALIZED_BILINEAR,
+        "operator_query_mode": "direct_state_projection",
+        "d_route": 4,
+    }
+    cases = (
+        ({}, (1.0, 1.0, 1.0, 1.0)),
+        ({"admission_den_power": 0.8}, (0.8, 0.8, 0.8, 0.8)),
+        ({"admission_den_power": 0.8,
+          "admission_den_power_qk": 0.5}, (0.8, 0.5, 0.8, 0.8)),
+        ({"admission_den_power": 1.0,
+          "admission_den_power_qk": 0.5,
+          "admission_den_power_v": 1.0,
+          "admission_den_power_rst": 1.2}, (1.0, 0.5, 1.0, 1.2)),
+    )
+    for overrides, expected in cases:
+        model_cfg = {**base, **overrides}
+        train_jax._validate_v4171_model_config(model_cfg)
+        assert tuple(model_cfg[key] for key in (
+            "admission_den_power", "admission_den_power_qk",
+            "admission_den_power_v", "admission_den_power_rst",
+        )) == expected
+
+    invalid_values = (-0.1, np.nan, np.inf, True, "0.5", jnp.float32(0.5))
+    for pool in ("qk", "v", "rst"):
+        field = f"admission_den_power_{pool}"
+        for value in invalid_values:
+            with pytest.raises(ValueError, match=field):
+                train_jax._validate_v4171_model_config({
+                    **base,
+                    "admission_den_power": 1.0,
+                    field: value,
+                })
+
+    with pytest.raises(ValueError, match="admission_den_power_qk"):
+        jax.make_jaxpr(lambda value: _resolve_v417x_admission_den_powers(
+            1.0, value, 1.0, 1.0, context="traced config"))(
+                jnp.float32(0.5))
+
+
+def test_v4172_pool_denominator_math_and_qk_pairing() -> None:
+    kwargs = {
+        "admission_den_power": 0.8,
+        "admission_den_power_qk": 0.5,
+        "admission_den_power_v": 1.0,
+        "admission_den_power_rst": 1.2,
+        "srw_composition_mode": "linear_angular",
+    }
+    expected = {
+        "q": (9.0, 0.5),
+        "k": (16.0, 0.5),
+        "v": (3.0, 1.0),
+        "rst": (4.0, 1.2),
+    }
+    for route, (mass, power) in expected.items():
+        pool = "qk" if route in ("q", "k") else route
+        execution_kwargs, selected_power = _split_admission_den_kwargs(
+            kwargs, pool)
+        denominator = _composition_den(
+            jnp.float32(mass), selected_power,
+            execution_kwargs["srw_composition_mode"])
+        assert float(selected_power) == pytest.approx(power)
+        assert float(denominator) == pytest.approx(
+            max(mass, 1.0) ** power, rel=1.0e-6)
+
+
+def test_v4172_route_specific_factory_metadata_and_suppression_pairing() -> None:
+    mesh = _one_device_mesh()
+    fns = _runtime_fns(
+        mesh, qk_power=0.5, v_power=1.0, rst_power=1.2)
+    expected = {
+        "attn_qk_paired": 0.5,
+        "attn_qk_paired_minimal": 0.5,
+        "attn_qk_paired_suppression_minimal": 0.5,
+        "attn_v_single": 1.0,
+        "attn_v_single_minimal": 1.0,
+        "attn_v_single_suppression_minimal": 1.0,
+        "rst_single": 1.2,
+        "rst_single_minimal": 1.2,
+        "rst_single_suppression_minimal": 1.2,
+    }
+    for name, power in expected.items():
+        assert getattr(fns[name], "_v4171_admission_den_power") == power
+    assert fns["attn_v_single_minimal"] is not fns["rst_single_minimal"]
+    for production, suppression in (
+            ("attn_qk_paired_minimal",
+             "attn_qk_paired_suppression_minimal"),
+            ("attn_v_single_minimal",
+             "attn_v_single_suppression_minimal"),
+            ("rst_single_minimal", "rst_single_suppression_minimal")):
+        assert getattr(
+            fns[production], "_v4171_canonical_shard_map_kernel") is getattr(
+                fns[suppression], "_v4171_canonical_shard_map_kernel")
+
+    _validate_v4171_sharded_fns(
+        fns, 1.0, expected_power_qk=0.5,
+        expected_power_v=1.0, expected_power_rst=1.2)
+    wrong = dict(fns)
+    wrong["rst_single_minimal"] = fns["attn_v_single_minimal"]
+    with pytest.raises(ValueError, match="rst pool"):
+        _validate_v4171_sharded_fns(
+            wrong, 1.0, expected_power_qk=0.5,
+            expected_power_v=1.0, expected_power_rst=1.2)
+
+
+def test_v4172_pool_powers_preserve_parameter_schema_and_default_forward() -> None:
+    from scripts import train_jax
+
+    mesh = _one_device_mesh()
+    input_ids = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+    legacy_model = DAWN_SRW_V4172(
+        **_tiny_kwargs(), admission_den_power=1.0)
+    explicit_model = DAWN_SRW_V4172(
+        **_tiny_kwargs(), admission_den_power=1.0,
+        admission_den_power_qk=1.0,
+        admission_den_power_v=1.0,
+        admission_den_power_rst=1.0)
+    pool_model = DAWN_SRW_V4172(
+        **_tiny_kwargs(), admission_den_power=1.0,
+        admission_den_power_qk=0.5,
+        admission_den_power_v=1.0,
+        admission_den_power_rst=1.2)
+    rngs = {
+        "params": jax.random.PRNGKey(71),
+        "dropout": jax.random.PRNGKey(72),
+    }
+    legacy_vars = legacy_model.init(
+        rngs, input_ids, deterministic=True)
+    explicit_vars = explicit_model.init(
+        rngs, input_ids, deterministic=True)
+    pool_vars = pool_model.init(
+        rngs, input_ids, deterministic=True)
+    assert jax.tree.structure(legacy_vars["params"]) == jax.tree.structure(
+        pool_vars["params"])
+    for legacy, explicit, pool_specific in zip(
+            _tree_arrays(legacy_vars["params"]),
+            _tree_arrays(explicit_vars["params"]),
+            _tree_arrays(pool_vars["params"])):
+        np.testing.assert_array_equal(legacy, explicit)
+        np.testing.assert_array_equal(legacy, pool_specific)
+
+    apply_kwargs = {
+        "labels": input_ids,
+        "deterministic": True,
+        "rngs": {"dropout": jax.random.PRNGKey(73)},
+        "sharded_fns": _runtime_fns(mesh),
+        "analysis": False,
+        "minimal_train": True,
+        "compute_accuracy": False,
+    }
+    legacy_out = legacy_model.apply(legacy_vars, input_ids, **apply_kwargs)
+    explicit_out = explicit_model.apply(explicit_vars, input_ids, **apply_kwargs)
+    assert jax.tree.structure(legacy_out) == jax.tree.structure(explicit_out)
+    for legacy, explicit in zip(
+            _tree_arrays(legacy_out), _tree_arrays(explicit_out)):
+        np.testing.assert_array_equal(legacy, explicit)
+
+    pool_fns = _runtime_fns(
+        mesh, qk_power=0.5, v_power=1.0, rst_power=1.2)
+    pool_out = pool_model.apply(
+        pool_vars, input_ids, **{**apply_kwargs, "sharded_fns": pool_fns})
+    assert np.isfinite(float(pool_out["loss"]))
+    assert pool_model.get_config()["admission_den_power_rst"] == 1.2
+    zero_suppression_out = pool_model.apply(
+        pool_vars,
+        input_ids,
+        **{
+            **apply_kwargs,
+            "sharded_fns": pool_fns,
+            "analysis_contribution": jnp.full(
+                (1, 8), -1, dtype=jnp.int32),
+            "analysis_intervention_enabled": jnp.bool_(True),
+        },
+    )
+    for production, suppression in zip(
+            _tree_arrays(pool_out), _tree_arrays(zero_suppression_out)):
+        np.testing.assert_array_equal(production, suppression)
+
+    legacy_checkpoint_cfg = {
+        "model_version": V4172_MODEL_VERSION,
+        "d_route": 4,
+        "operator_key_mode": OPERATOR_KEY_MODE_GENERALIZED_BILINEAR,
+        "operator_query_mode": "direct_state_projection",
+        "admission_den_power": 1.0,
+    }
+    explicit_default_cfg = {
+        **legacy_checkpoint_cfg,
+        "admission_den_power_qk": 1.0,
+        "admission_den_power_v": 1.0,
+        "admission_den_power_rst": 1.0,
+    }
+    train_jax._validate_v4171_resume_compatibility(
+        explicit_default_cfg, legacy_checkpoint_cfg)
+    with pytest.raises(RuntimeError, match="admission_den_power_qk"):
+        train_jax._validate_v4171_resume_compatibility(
+            {**explicit_default_cfg, "admission_den_power_qk": 0.5},
+            legacy_checkpoint_cfg)
+
+
+def test_v4172_pool_power_experiment_config_only_changes_requested_fields() -> None:
+    base_path = "configs/train_config_v4172_400M_c4_40B_v4_64_ver1.yaml"
+    experiment_path = (
+        "configs/train_config_v4172_400M_c4_40B_v4_64_ver1_"
+        "den_qk0p5_v1p0_rst1p2.yaml")
+    with open(base_path, "r", encoding="utf-8") as handle:
+        base = yaml.safe_load(handle)
+    with open(experiment_path, "r", encoding="utf-8") as handle:
+        experiment = yaml.safe_load(handle)
+    expected_model = dict(base["model"])
+    expected_model.update({
+        "admission_den_power_qk": 0.5,
+        "admission_den_power_v": 1.0,
+        "admission_den_power_rst": 1.2,
+    })
+    assert experiment["model"] == expected_model
+    assert symbolic_parameter_count(experiment)["total"] == (
+        symbolic_parameter_count(base)["total"])
+    assert experiment["seed"] == base["seed"]
+    assert experiment["data"] == base["data"]
+    assert experiment["training"] == base["training"]
+    assert experiment["checkpoint_dir"] != base["checkpoint_dir"]
+    assert experiment["checkpoint_dir"].endswith(
+        "dawn_srw_v4172_400M_c4_40B_v4_64_ver1_"
+        "den_qk0p5_v1p0_rst1p2")

@@ -239,6 +239,12 @@ def run_train_prompt_trace(ctx: AnalysisContext) -> Dict[str, Any]:
             "soft_gate_T_v": ctx.model_cfg.get("soft_gate_T_v"),
             "soft_gate_T_rst": ctx.model_cfg.get("soft_gate_T_rst"),
             "admission_den_power": ctx.model_cfg.get("admission_den_power"),
+            "admission_den_power_qk": ctx.model_cfg.get(
+                "admission_den_power_qk"),
+            "admission_den_power_v": ctx.model_cfg.get(
+                "admission_den_power_v"),
+            "admission_den_power_rst": ctx.model_cfg.get(
+                "admission_den_power_rst"),
             "soft_gate_effective_active_eps": ctx.model_cfg.get("soft_gate_effective_active_eps"),
             "source": ctx.model_cfg.get("source"),
         },
@@ -517,6 +523,12 @@ def run_train_generation_samples(ctx: AnalysisContext) -> Dict[str, Any]:
             "soft_gate_T_v": ctx.model_cfg.get("soft_gate_T_v"),
             "soft_gate_T_rst": ctx.model_cfg.get("soft_gate_T_rst"),
             "admission_den_power": ctx.model_cfg.get("admission_den_power"),
+            "admission_den_power_qk": ctx.model_cfg.get(
+                "admission_den_power_qk"),
+            "admission_den_power_v": ctx.model_cfg.get(
+                "admission_den_power_v"),
+            "admission_den_power_rst": ctx.model_cfg.get(
+                "admission_den_power_rst"),
             "soft_gate_effective_active_eps": ctx.model_cfg.get("soft_gate_effective_active_eps"),
             "source": ctx.model_cfg.get("source"),
         },
