@@ -14311,6 +14311,14 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
     if analysis and 'analysis' in inspect.signature(
             single_factory).parameters:
         base_kwargs['analysis'] = True
+
+    def pool_kwargs(pool):
+        kwargs = dict(base_kwargs)
+        if _is_v417x_version(version):
+            kwargs['admission_den_power'] = float(
+                model_cfg[f'admission_den_power_{pool}'])
+        return kwargs
+
     if training_cfg.get('max_chunk_size') is not None:
         chunks = {
             pool: int(training_cfg['max_chunk_size'])
@@ -14318,13 +14326,13 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
         }
     single_v = single_factory(
         max_chunk_size=chunks['v'],
-        **_factory_supported_kwargs(single_factory, base_kwargs))
+        **_factory_supported_kwargs(single_factory, pool_kwargs('v')))
     single_rst = single_factory(
         max_chunk_size=chunks['rst'],
-        **_factory_supported_kwargs(single_factory, base_kwargs))
+        **_factory_supported_kwargs(single_factory, pool_kwargs('rst')))
     paired_qk = paired_factory(
         max_chunk_size=chunks['qk'],
-        **_factory_supported_kwargs(paired_factory, base_kwargs))
+        **_factory_supported_kwargs(paired_factory, pool_kwargs('qk')))
     sharded = {
         'single': single_v,
         'attn_v_single': single_v,
@@ -14340,12 +14348,12 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
                 ('rst', 'rst_single_minimal')):
             sharded[name] = single_min(
                 max_chunk_size=chunks[pool],
-                **_factory_supported_kwargs(single_min, base_kwargs))
+                **_factory_supported_kwargs(single_min, pool_kwargs(pool)))
     paired_min = getattr(module, 'make_sharded_srw_paired_minimal', None)
     if paired_min is not None:
         sharded['attn_qk_paired_minimal'] = paired_min(
             max_chunk_size=chunks['qk'],
-            **_factory_supported_kwargs(paired_min, base_kwargs))
+            **_factory_supported_kwargs(paired_min, pool_kwargs('qk')))
     if version == V4167_MODEL_VERSION:
         extra_factory = getattr(module, 'create_v4167_tp_sharded_fns', None)
         if extra_factory is None:
