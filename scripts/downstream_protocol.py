@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import json
 import math
+import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -60,6 +61,30 @@ class PinnedSource:
     requested: str
     resolved: str
     step: int
+
+
+DOWNSTREAM_RUN_ID_RE = re.compile(
+    r'^run_[0-9]{8}T[0-9]{6}Z_[0-9a-f]{8,32}$')
+
+
+def validate_downstream_run_id(run_id: str) -> str:
+    value = str(run_id).strip()
+    if not DOWNSTREAM_RUN_ID_RE.fullmatch(value):
+        raise ValueError(
+            'downstream run id must match '
+            'run_YYYYMMDDTHHMMSSZ_UUIDHEX, got '
+            f'{run_id!r}')
+    return value
+
+
+def downstream_output_run_root(model_root: str, source_step: int,
+                               run_id: str) -> str:
+    root = str(model_root).strip().rstrip('/\\')
+    if not root:
+        raise ValueError('downstream model output root must not be empty')
+    step = _positive_int(source_step, 'source checkpoint step')
+    run_id = validate_downstream_run_id(run_id)
+    return f'{root}/{step}/{run_id}'
 
 
 def _positive_int(value: Any, name: str) -> int:

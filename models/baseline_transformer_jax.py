@@ -11,6 +11,7 @@ from jax.sharding import PartitionSpec as P
 from models.vocab_parallel import (
     make_vocab_parallel_cross_entropy,
     make_vocab_parallel_embedding,
+    make_vocab_parallel_eval_stats,
     padded_vocab_size,
 )
 
@@ -115,7 +116,7 @@ def make_baseline_model_parallel_ffn(mesh, d_ff):
     return baseline_ffn
 
 
-def create_baseline_sharded_fns(mesh, cfg):
+def create_baseline_sharded_fns(mesh, cfg, *, for_eval=False):
     """Build optional tensor/vocab-parallel helpers for VanillaTransformer."""
     model_cfg = cfg.get("model", cfg)
     training_cfg = cfg.get("training", {})
@@ -144,7 +145,7 @@ def create_baseline_sharded_fns(mesh, cfg):
         "vocab_size_padded",
         padded_vocab_size(logical_vocab_size, mesh_model)))
 
-    return {
+    sharded = {
         "baseline_attention": make_baseline_model_parallel_attention(
             mesh, n_heads=n_heads, d_model=d_model),
         "baseline_ffn": make_baseline_model_parallel_ffn(mesh, d_ff=d_ff),
@@ -153,6 +154,15 @@ def create_baseline_sharded_fns(mesh, cfg):
         "vocab_parallel_ce": make_vocab_parallel_cross_entropy(
             mesh, logical_vocab_size, padded_vocab),
     }
+    if for_eval:
+        sharded["vocab_eval_stats"] = make_vocab_parallel_eval_stats(
+            mesh,
+            logical_vocab_size=logical_vocab_size,
+            vocab_size_padded=padded_vocab,
+            token_chunk_size=int(training_cfg.get(
+                "ce_token_chunk_size", 32768)),
+        )
+    return sharded
 
 
 class StandardAttention(nn.Module):

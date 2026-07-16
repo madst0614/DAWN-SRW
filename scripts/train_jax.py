@@ -14270,8 +14270,9 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
     version = str(model_cfg.get('model_version', ''))
     mesh_model = int(training_cfg.get('mesh_model', 1))
     if _is_baseline_version(version):
-        return (create_baseline_sharded_fns(mesh, cfg)
-                if mesh_model > 1 else None)
+        return (create_baseline_sharded_fns(
+                    mesh, cfg, for_eval=for_eval)
+                if mesh_model > 1 or for_eval else None)
     if not _is_active_srw_version(version):
         return None
     if (version == V4168_MODEL_VERSION

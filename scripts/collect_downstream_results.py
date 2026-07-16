@@ -56,7 +56,8 @@ def main():
         # seen validation accuracy rather than the final accuracy.
         try:
             result_files = (
-                tj._list_files(root, '*/*_result.json')
+                tj._list_files(root, '*/*/*_result.json')
+                + tj._list_files(root, '*/*_result.json')
                 + tj._list_files(root, '*_result.json')
             )
         except Exception:
@@ -66,11 +67,15 @@ def main():
             try:
                 result = read_json(f)
                 task = result['task']
+                parts = f.rstrip('/').split('/')
+                run = result.get(
+                    'downstream_run_id',
+                    parts[-2] if len(parts) >= 2 else '')
                 structured_tasks.add((root, task))
                 rows.append({
                     'root': root,
                     'task': task,
-                    'run': '',
+                    'run': run,
                     'source_step': result.get('source_checkpoint_step', ''),
                     'steps': result.get('calculated_total_steps', ''),
                     'epochs': result.get('effective_epochs', ''),

@@ -471,6 +471,7 @@ def main() -> None:
     parser.add_argument('--source-requested')
     parser.add_argument('--expected-source-path')
     parser.add_argument('--expected-source-step', type=int)
+    parser.add_argument('--run-id', required=True)
     parser.add_argument('--result-json')
     args = parser.parse_args()
 
@@ -605,9 +606,11 @@ def main() -> None:
     if log_interval <= 0:
         raise ValueError('training.log_interval must be > 0')
 
-    output_root = requested_cfg.get('checkpoint_dir')
-    if not output_root:
+    model_output_root = requested_cfg.get('checkpoint_dir')
+    if not model_output_root:
         raise ValueError('Config must set checkpoint_dir as experiment output root')
+    output_root = downstream_protocol.downstream_output_run_root(
+        model_output_root, source.step, args.run_id)
     train_log_path = join_path(output_root, 'train.log')
 
     def record(message: str) -> None:
@@ -685,6 +688,8 @@ def main() -> None:
         'source_checkpoint_requested': pinned_source.requested,
         'source_checkpoint_resolved': pinned_source.resolved,
         'source_checkpoint_step': source.step,
+        'downstream_run_id': args.run_id,
+        'output_run_root': output_root,
         'source_checkpoint_resolved_once': 'true',
         'task_source_policy': 'pinned_same_checkpoint',
         'model_config_source': 'checkpoint.full_config.model',
@@ -827,6 +832,10 @@ def main() -> None:
         final_acc=final_eval['accuracy'],
         final_step=final_eval_step,
         eval_total=final_eval['total'])
+    result.update({
+        'downstream_run_id': args.run_id,
+        'output_run_root': output_root,
+    })
     result_json = json.dumps(
         result, indent=2, ensure_ascii=False, sort_keys=True) + '\n'
     if is_host0():

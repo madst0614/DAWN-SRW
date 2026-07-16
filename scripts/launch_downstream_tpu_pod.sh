@@ -6,6 +6,7 @@ ZONE="us-central2-b"
 PROJECT="dawn-486218"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
 INIT_FROM=""
+DOWNSTREAM_RUN_ID=""
 GH_TOKEN=""
 CONFIGS=()
 
@@ -16,10 +17,11 @@ while [[ $# -gt 0 ]]; do
     --project) PROJECT="$2"; shift 2 ;;
     --branch) BRANCH="$2"; shift 2 ;;
     --init-from) INIT_FROM="$2"; shift 2 ;;
+    --run-id) DOWNSTREAM_RUN_ID="$2"; shift 2 ;;
     --config) CONFIGS+=("$2"); shift 2 ;;
     --token) GH_TOKEN="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 --tpu NAME [--branch BRANCH] [--init-from PRETRAIN_RUN_OR_CKPT] --config cfg_or_suite.yaml [--config cfg2.yaml ...]"
+      echo "Usage: $0 --tpu NAME [--branch BRANCH] [--init-from PRETRAIN_RUN_OR_CKPT] [--run-id RUN_ID] --config cfg_or_suite.yaml [--config cfg2.yaml ...]"
       echo ""
       echo "Each --config may be a normal per-task downstream YAML or a downstream_suite YAML."
       echo "If --init-from is omitted, a suite/task config may provide init_from."
@@ -30,6 +32,13 @@ done
 
 if [[ -z "$TPU_NAME" ]]; then echo "ERROR: --tpu required" >&2; exit 1; fi
 if [[ ${#CONFIGS[@]} -eq 0 ]]; then echo "ERROR: at least one --config required" >&2; exit 1; fi
+if [[ -z "$DOWNSTREAM_RUN_ID" ]]; then
+  DOWNSTREAM_RUN_ID="run_$(date -u '+%Y%m%dT%H%M%SZ')_$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+fi
+if [[ ! "$DOWNSTREAM_RUN_ID" =~ ^run_[0-9]{8}T[0-9]{6}Z_[0-9a-f]{8,32}$ ]]; then
+  echo "ERROR: invalid downstream run id: $DOWNSTREAM_RUN_ID" >&2
+  exit 1
+fi
 
 resolve_local_config_path() {
   local p="$1"
@@ -91,6 +100,7 @@ echo "  Zone:      $ZONE"
 echo "  Project:   $PROJECT"
 echo "  Branch:    $BRANCH"
 echo "  Init from: ${INIT_FROM:-<none>}"
+echo "  Run ID:    $DOWNSTREAM_RUN_ID"
 echo "  Configs:   ${CONFIGS[*]}"
 echo "============================================"
 
@@ -102,8 +112,9 @@ set -euo pipefail
 REPO_URL='${REPO_URL}'
 BRANCH='${BRANCH}'
 INIT_FROM='${INIT_FROM}'
+DOWNSTREAM_RUN_ID='${DOWNSTREAM_RUN_ID}'
 CONFIGS='${CONFIGS_JOINED}'
-export BRANCH INIT_FROM CONFIGS
+export BRANCH INIT_FROM DOWNSTREAM_RUN_ID CONFIGS
 
 if [ -d "\$HOME/dawn-spatial/.git" ]; then
   cd "\$HOME/dawn-spatial"

@@ -4,6 +4,7 @@ set -euo pipefail
 BRANCH="${BRANCH:?ERROR: BRANCH env var not set}"
 CONFIGS="${CONFIGS:?ERROR: CONFIGS env var not set}"
 INIT_FROM="${INIT_FROM:-}"
+DOWNSTREAM_RUN_ID="${DOWNSTREAM_RUN_ID:?ERROR: DOWNSTREAM_RUN_ID env var not set}"
 WORK_DIR="$HOME/dawn-spatial"
 
 IFS='|' read -r -a CONFIG_ARRAY <<< "$CONFIGS"
@@ -25,6 +26,7 @@ echo "============================================"
 echo "Host $(hostname) — Setting up downstream TPU training"
 echo "  Branch:    $BRANCH"
 echo "  Init from: ${INIT_FROM:-<none>}"
+echo "  Run ID:    $DOWNSTREAM_RUN_ID"
 echo "  Configs:   ${CONFIG_ARRAY[*]}"
 echo "============================================"
 
@@ -81,7 +83,7 @@ else
   export XLA_FLAGS="$XLA_FLAGS --xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
 fi
 
-CMD="bash scripts/run_downstream_sequence.sh"
+CMD="bash scripts/run_downstream_sequence.sh --run-id '$DOWNSTREAM_RUN_ID'"
 if [ -n "$INIT_FROM" ]; then
   CMD="$CMD --init-from '$INIT_FROM'"
 fi
@@ -98,6 +100,7 @@ tmux new-session -d -s train \
    export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; \
    export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; \
    export DOWNSTREAM_JAX_DISTRIBUTED='$DOWNSTREAM_JAX_DISTRIBUTED'; \
+   export DOWNSTREAM_RUN_ID='$DOWNSTREAM_RUN_ID'; \
    export XLA_FLAGS='$XLA_FLAGS'; \
    cd '$WORK_DIR'; \
    $CMD 2>&1 | tee ~/train.log; \

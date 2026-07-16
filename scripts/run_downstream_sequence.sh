@@ -2,6 +2,7 @@
 set -euo pipefail
 
 INIT_FROM=""
+RUN_ID="${DOWNSTREAM_RUN_ID:-}"
 CONFIGS=()
 EXPAND_OUTPUT_DIR=".generated/downstream_suites"
 RESULT_OUTPUT_DIR=".generated/downstream_results/sequence_$$"
@@ -9,10 +10,11 @@ RESULT_OUTPUT_DIR=".generated/downstream_results/sequence_$$"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --init-from) INIT_FROM="$2"; shift 2 ;;
+    --run-id) RUN_ID="$2"; shift 2 ;;
     --config) CONFIGS+=("$2"); shift 2 ;;
     --expand-output-dir) EXPAND_OUTPUT_DIR="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 [--init-from PRETRAIN_RUN_OR_CKPT] --config cfg_or_suite.yaml [--config cfg2.yaml ...]"
+      echo "Usage: $0 [--init-from PRETRAIN_RUN_OR_CKPT] [--run-id RUN_ID] --config cfg_or_suite.yaml [--config cfg2.yaml ...]"
       echo ""
       echo "Each --config may be either a normal per-task downstream YAML or a"
       echo "downstream_suite YAML expanded into one generated config per task."
@@ -47,6 +49,14 @@ fi
 for CFG in "${CONFIGS[@]}"; do
   PIN_COMMAND+=(--config "$CFG")
 done
+
+if [[ -z "$RUN_ID" ]]; then
+  RUN_ID="run_$(date -u '+%Y%m%dT%H%M%SZ')_$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+fi
+if [[ ! "$RUN_ID" =~ ^run_[0-9]{8}T[0-9]{6}Z_[0-9a-f]{8,32}$ ]]; then
+  echo "ERROR: invalid downstream run id: $RUN_ID" >&2
+  exit 1
+fi
 PIN_OUTPUT="$("${PIN_COMMAND[@]}")" || {
   echo "ERROR: failed to pin the downstream source checkpoint" >&2
   exit 1
@@ -65,6 +75,8 @@ echo "[sequence] SOURCE PINNED"
 echo "[sequence] source_checkpoint_requested=$SOURCE_REQUESTED"
 echo "[sequence] source_checkpoint_resolved=$SOURCE_RESOLVED"
 echo "[sequence] source_checkpoint_step=$SOURCE_STEP"
+echo "[sequence] downstream_run_id=$RUN_ID"
+echo "[sequence] output_layout=model/source_step/run_timestamp_uuid"
 echo "[sequence] source_checkpoint_resolved_once=true"
 echo "[sequence] task_source_policy=pinned_same_checkpoint"
 echo "============================================================"
@@ -87,6 +99,7 @@ for CFG in "${CONFIGS[@]}"; do
     --source-requested "$SOURCE_REQUESTED" \
     --expected-source-path "$SOURCE_RESOLVED" \
     --expected-source-step "$SOURCE_STEP" \
+    --run-id "$RUN_ID" \
     --result-json "$RESULT_FILE"
   if [[ ! -s "$RESULT_FILE" ]]; then
     echo "ERROR: task did not produce a result JSON: $RESULT_FILE" >&2
