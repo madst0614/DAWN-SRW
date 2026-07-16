@@ -1,6 +1,6 @@
 downstream_suite:
   name: baseline_400M
-  init_from: gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_32/run_vbaseline_20260322_185640_3201
+  init_from: gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_64/run_vbaseline-JAX_20260713_194029_3201
   output_root: gs://dawn-tpu-data-c4/downstream_runs/baseline_400M
   tasks:
     - sst2
@@ -25,7 +25,7 @@ downstream_suite:
     min_lr_ratio: 0.1
     max_grad_norm: 1.0
     log_interval: 20
-    mesh_model: 1
+    mesh_model: 2
     mesh_data: 0
     ce_token_chunk_size: 8192
     train_compute_accuracy: true
